@@ -16,6 +16,7 @@ import type {
   ScanProgressSnapshot,
   SearchHint,
   SearchHintResult,
+  SetupStatus,
   UserDto,
   UserItemDataDto,
   UserPolicy,
@@ -56,6 +57,8 @@ interface DemoScanState {
 }
 
 let activeDemoScan: DemoScanState | null = null
+let demoSetupCompleted = true
+let demoDefaultLanguage = 'zh-CN'
 
 const DEMO_TMDB_TRENDING_TMDB_IDS = new Set([
   '693134', // 沙丘 2
@@ -119,6 +122,8 @@ export function resetDemoStore(): void {
   store = createInitialDemoState()
   rankingsState = createInitialRankingsState()
   activeDemoScan = null
+  demoSetupCompleted = true
+  demoDefaultLanguage = 'zh-CN'
 }
 
 export function getDemoImageUrl(
@@ -305,6 +310,98 @@ export async function demoFetch<T>(
   const url = new URL(path.startsWith('/') ? path : `/${path}`, 'http://ambra.demo')
   const pathname = url.pathname
   const qs = url.searchParams
+
+  // ==================== 0. 首次运行初始化向导 ====================
+  if (pathname === '/api/setup/status' && method === 'GET') {
+    const status: SetupStatus = {
+      completed: demoSetupCompleted,
+      server_name: store.systemInfo.ServerName,
+      default_language: demoDefaultLanguage,
+      has_users: store.users.length > 0,
+      has_tmdb_key: true,
+    }
+    return status as T
+  }
+
+  if (pathname === '/api/setup/admin' && method === 'POST') {
+    const body = parseJsonBody(options)
+    const serverName = String(body.server_name || '').trim()
+    const language = String(body.language || '').trim()
+    const username = String(body.username || '').trim()
+    const password = String(body.password ?? '')
+
+    if (!username) {
+      throw new ApiError(400, '管理员用户名不能为空')
+    }
+    if (serverName) {
+      store.systemInfo.ServerName = serverName
+    }
+    if (language) {
+      demoDefaultLanguage = language
+    }
+
+    let rec = store.users.find((u) => u.user.Name.toLowerCase() === username.toLowerCase())
+    if (!rec) {
+      const id = `user-setup-${Date.now().toString(36)}`
+      const newUser: UserDto = {
+        Id: id,
+        Name: username,
+        ServerId: DEMO_SERVER_ID,
+        HasPassword: password.length > 0,
+        HasConfiguredPassword: password.length > 0,
+        PrimaryImageTag: 'demo-user',
+        LastActivityDate: new Date().toISOString(),
+        Policy: {
+          IsAdministrator: true,
+          IsDisabled: false,
+          EnableAllFolders: true,
+          EnabledFolders: [],
+          EnableMediaPlayback: true,
+          EnableAudioPlaybackTranscoding: true,
+          EnableVideoPlaybackTranscoding: true,
+          EnablePlaybackRemuxing: true,
+          EnableContentDeletion: true,
+          EnableContentDownloading: true,
+          EnableRemoteAccess: true,
+        },
+      }
+      rec = { user: newUser, password }
+      store.users.push(rec)
+      store.userAvatarById.set(id, makeAvatarDataUrl(username, ['#d97706', '#78350f']))
+    } else {
+      rec.password = password
+      rec.user.Policy = { ...rec.user.Policy, IsAdministrator: true, IsDisabled: false }
+    }
+
+    const token = `demo_tok_setup_${rec.user.Id}_${Date.now().toString(36)}`
+    pushActivity(`初始化向导创建管理员「${rec.user.Name}」`, 'UserCreated', '系统初始化', rec.user.Id)
+    const result: AuthenticationResult = {
+      User: { ...rec.user, Policy: { ...rec.user.Policy } },
+      AccessToken: token,
+      ServerId: DEMO_SERVER_ID,
+      SessionInfo: {
+        Id: `sess-${rec.user.Id}`,
+        DeviceId: 'dev-demo-web-01',
+      },
+    }
+    return result as T
+  }
+
+  if (pathname === '/api/setup/complete' && method === 'POST') {
+    const body = parseJsonBody(options)
+    const serverName = String(body.server_name || '').trim()
+    const tmdbLanguage = String(body.tmdb_language || '').trim()
+    if (serverName) {
+      store.systemInfo.ServerName = serverName
+    }
+    if (tmdbLanguage) {
+      demoDefaultLanguage = tmdbLanguage
+    }
+    demoSetupCompleted = true
+    store.systemInfo.StartupWizardCompleted = true
+    pushActivity('已完成服务器首次运行初始化向导', 'SetupCompleted')
+    return { completed: true } as T
+  }
 
   // ==================== 1. 系统与公开信息 ====================
   if (pathname === '/emby/System/Info/Public' && method === 'GET') {

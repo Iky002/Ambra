@@ -1,6 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react'
 import { api, clearAuth, getDeviceId, getStoredAuth, saveAuth } from '../api/client'
-import type { AuthSession, UserDto } from '../api/types'
+import type { AuthSession, AuthenticationResult, UserDto } from '../api/types'
 import { isDemoMode } from '../demo/demoMode'
 
 const DEMO_LOGGED_OUT_KEY = 'ambra_demo_logged_out'
@@ -11,6 +11,7 @@ interface AuthContextValue {
   isAdmin: boolean
   userLoading: boolean
   login: (username: string, password: string) => Promise<void>
+  applyAuthResult: (res: AuthenticationResult) => void
   logout: () => void
   refreshUser: () => Promise<void>
   switchDemoRole: (role: 'admin' | 'guest') => Promise<void>
@@ -65,8 +66,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, [])
 
-  const login = useCallback(async (username: string, password: string) => {
-    const res = await api.authenticateByName(username, password)
+  const applyAuthResult = useCallback((res: AuthenticationResult) => {
     const isAdminFlag = Boolean(res.User.Policy?.IsAdministrator)
     const session: AuthSession = {
       accessToken: res.AccessToken,
@@ -88,6 +88,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setUser(res.User)
     setUserLoading(false)
   }, [])
+
+  const login = useCallback(
+    async (username: string, password: string) => {
+      const res = await api.authenticateByName(username, password)
+      applyAuthResult(res)
+    },
+    [applyAuthResult],
+  )
 
   const switchDemoRole = useCallback(
     async (role: 'admin' | 'guest') => {
@@ -135,7 +143,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ auth, user, isAdmin, userLoading, login, logout, refreshUser, switchDemoRole }}
+      value={{
+        auth,
+        user,
+        isAdmin,
+        userLoading,
+        login,
+        applyAuthResult,
+        logout,
+        refreshUser,
+        switchDemoRole,
+      }}
     >
       {children}
     </AuthContext.Provider>
