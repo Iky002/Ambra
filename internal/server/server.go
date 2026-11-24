@@ -38,6 +38,7 @@ import (
 	"github.com/ambra-media/ambra/internal/core/dvr"
 	"github.com/ambra-media/ambra/internal/core/imaging"
 	"github.com/ambra-media/ambra/internal/core/playback"
+	"github.com/ambra-media/ambra/internal/core/rankings"
 	"github.com/ambra-media/ambra/internal/core/scanner"
 	"github.com/ambra-media/ambra/internal/core/scheduler"
 	"github.com/ambra-media/ambra/internal/core/session"
@@ -65,6 +66,7 @@ type Server struct {
 	Sessions     *session.Manager
 	Scanner      *scanner.Scanner
 	Scheduler    *scheduler.Manager
+	Rankings     *rankings.Service
 	Playback     *playback.Engine
 	Transcode    *transcode.Manager
 	DVR          *dvr.Recorder
@@ -111,6 +113,8 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	wsHub := ws.NewHub(authSvc, sessionMgr, bus)
 
 	sc := scanner.New(libRepo, registry, bus, cfg)
+	rankingsSvc := rankings.New(store, bus, rankings.Options{})
+	_ = rankingsSvc.LoadCache(ctx)
 	pb := playback.New(libRepo, registry, cfg)
 	imgSvc := imaging.New(libRepo).WithCacheDir(cfg.ImageCacheDir())
 	transcodeMgr := transcode.NewManager(cfg)
@@ -128,12 +132,32 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	taskMgr := scheduler.New(bus)
 	taskMgr.RegisterBuiltinTasks(
 		func(c context.Context) error {
-			_, err := sc.ScanAll(c)
-			return err
+			if _, err := sc.ScanAll(c); err != nil {
+				return err
+			}
+			_, _, _ = rankingsSvc.ApplyTagsToLibrary(c)
+			return nil
 		},
 		cfg.TranscodeTempDir(),
 		store.Writer,
 	)
+	dayTicks := int64(24 * 3600 * 10_000_000)
+	taskMgr.Register(scheduler.TaskDefinition{
+		ID:          "sync-rankings-top250",
+		Key:         "SyncRankings",
+		Name:        "同步豆瓣 Top 250 与 IMDb Top 250 榜单",
+		Category:    "Library",
+		Description: "定期拉取豆瓣 Top 250 与 IMDb Top 250 榜单缓存至后端，并为匹配影片自动追加榜单标签",
+		Triggers: []scheduler.TaskTriggerInfo{
+			{Type: "IntervalTrigger", IntervalTicks: &dayTicks},
+		},
+		Run: func(c context.Context, reportProgress func(float64)) error {
+			reportProgress(10)
+			_, err := rankingsSvc.SyncAndApply(c)
+			reportProgress(100)
+			return err
+		},
+	})
 
 	pluginAdminH := pluginadmin.New(registry, store)
 	_ = pluginAdminH.ApplySavedConfigs(ctx)
@@ -227,11 +251,15 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		UserIDFromCtx: userIDFromCtx,
 	})
 
-	// Phase 6: DLNA UPnP MediaServer
+	// Phase 6: DLNA UPnP MediaServer & Rankings Sync API
 	dlna.New(cfg, libRepo, store).RegisterRoutes(mediaMux, dlna.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
+	})
+	rankings.NewHandler(rankingsSvc).RegisterRoutes(mediaMux, rankings.AuthFuncs{
+		RequireAuth:  authMW.RequireAuth,
+		RequireAdmin: authMW.RequireAdmin,
 	})
 
 	// Emby 4.10.2.0 full 582-route compatibility routers (zero ServeMux conflicts)
@@ -301,6 +329,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		Sessions:     sessionMgr,
 		Scanner:      sc,
 		Scheduler:    taskMgr,
+		Rankings:     rankingsSvc,
 		Playback:     pb,
 		Transcode:    transcodeMgr,
 		DVR:          dvrRec,

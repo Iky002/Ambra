@@ -1,20 +1,30 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  AlertTriangle,
   Check,
   Film,
   Heart,
+  Image as ImageIcon,
   Layers,
   Loader2,
+  Pencil,
   Play,
+  RefreshCw,
+  ScanSearch,
+  Split,
   Star,
   Subtitles,
+  Trash2,
   User,
   Volume2,
 } from 'lucide-react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, getBackdropUrl, getFallbackImageUrl, getImageUrl } from '../api/client'
 import type { MediaSourceInfo } from '../api/types'
+import { IdentifyModal } from '../components/media/IdentifyModal'
+import { ImageManagerModal } from '../components/media/ImageManagerModal'
+import { MetadataEditorModal } from '../components/media/MetadataEditorModal'
 import { useAuth } from '../context/AuthContext'
 import {
   detectChineseVariant,
@@ -22,13 +32,31 @@ import {
   getAudioLabel,
   getSubtitleMeta,
 } from '../player/subtitleUtils'
+import { AdminModal, FeedbackBanner } from './admin/adminUtils'
 
 export function ItemDetailPage() {
   const { id } = useParams<{ id: string }>()
-  const { auth } = useAuth()
+  const { auth, isAdmin } = useAuth()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const userId = auth!.userId
+
+  // 管理员弹窗与反馈提示状态
+  const [editModalOpen, setEditModalOpen] = useState(false)
+  const [imageModalOpen, setImageModalOpen] = useState(false)
+  const [identifyModalOpen, setIdentifyModalOpen] = useState(false)
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
+  const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
+
+  const showToast = (type: 'success' | 'error', message: string) => {
+    setToast({ type, message })
+  }
+
+  useEffect(() => {
+    if (!toast) return
+    const timer = window.setTimeout(() => setToast(null), 4500)
+    return () => window.clearTimeout(timer)
+  }, [toast])
 
   const { data: item, isLoading } = useQuery({
     queryKey: ['item', userId, id],
@@ -130,6 +158,50 @@ export function ItemDetailPage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['item', userId, id] })
       queryClient.invalidateQueries({ queryKey: ['resumeItems', userId] })
+    },
+  })
+
+  const refreshMetadataMutation = useMutation({
+    mutationFn: () => api.refreshItemMetadata(item!.Id, false),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['item', userId, id] })
+      showToast('success', `已触发「${item!.Name}」的元数据刷新`)
+    },
+    onError: (err) => {
+      showToast('error', err instanceof Error ? err.message : '刷新元数据失败')
+    },
+  })
+
+  const splitVersionsMutation = useMutation({
+    mutationFn: () => api.splitItemVersions(item!.Id),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['item', userId, id] }),
+        queryClient.invalidateQueries({ queryKey: ['items'] }),
+        queryClient.invalidateQueries({ queryKey: ['latestItems'] }),
+      ])
+      showToast('success', `已拆分「${item!.Name}」的多版本为独立条目`)
+    },
+    onError: (err) => {
+      showToast('error', err instanceof Error ? err.message : '拆分多版本失败')
+    },
+  })
+
+  const deleteItemMutation = useMutation({
+    mutationFn: () => api.deleteItem(item!.Id),
+    onSuccess: async () => {
+      const targetPath = item?.ParentId ? `/library/${item.ParentId}` : '/'
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['items'] }),
+        queryClient.invalidateQueries({ queryKey: ['latestItems'] }),
+        queryClient.invalidateQueries({ queryKey: ['resumeItems'] }),
+      ])
+      setDeleteConfirmOpen(false)
+      navigate(targetPath, { replace: true })
+    },
+    onError: (err) => {
+      setDeleteConfirmOpen(false)
+      showToast('error', err instanceof Error ? err.message : '删除媒体失败')
     },
   })
 
@@ -261,9 +333,19 @@ export function ItemDetailPage() {
                 ))}
               </div>
 
-              {/* 技术徽章：4K / HDR / 简繁字幕 / ASS / PGS */}
-              {techBadges.length > 0 && (
+              {/* 榜单与技术徽章：豆瓣 Top250 / IMDb Top250 / 4K / HDR / 简繁字幕 / ASS / PGS */}
+              {(techBadges.length > 0 || (item.Tags && item.Tags.length > 0)) && (
                 <div className="flex flex-wrap items-center gap-2">
+                  {item.Tags?.some((t) => t === '豆瓣Top250' || t === '豆瓣 Top250') && (
+                    <span className="inline-flex items-center rounded-md border border-emerald-400/50 bg-gradient-to-r from-emerald-950/90 via-emerald-900/80 to-teal-950/90 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide text-emerald-200 shadow-[0_0_12px_rgba(16,185,129,0.2)]">
+                      豆瓣 Top250
+                    </span>
+                  )}
+                  {item.Tags?.some((t) => t === 'IMDb Top250' || t === 'IMDb Top 250') && (
+                    <span className="inline-flex items-center rounded-md border border-amber-400/55 bg-gradient-to-r from-amber-950/90 via-yellow-900/75 to-amber-950/90 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide text-amber-200 shadow-[0_0_12px_rgba(245,158,11,0.22)]">
+                      IMDb Top250
+                    </span>
+                  )}
                   {techBadges.map((b) => (
                     <span
                       key={b.label}
@@ -286,7 +368,7 @@ export function ItemDetailPage() {
                     <button
                       type="button"
                       onClick={() => handlePlay(item.Id, hasResume ? resumeTicks : 0)}
-                      className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all hover:bg-amber-400"
+                      className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all duration-200 hover:-translate-y-0.5 hover:bg-amber-400 active:scale-[0.97]"
                     >
                       <Play className="h-4 w-4 fill-current" />
                       <span>{hasResume ? '继续播放' : '立即播放'}</span>
@@ -295,7 +377,7 @@ export function ItemDetailPage() {
                       <button
                         type="button"
                         onClick={() => handlePlay(item.Id, 0)}
-                        className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-white/8 px-4 py-3 text-sm font-medium text-zinc-100 hover:bg-white/12"
+                        className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-white/8 px-4 py-3 text-sm font-medium text-zinc-100 transition-all duration-200 hover:-translate-y-0.5 hover:bg-white/12 active:scale-[0.97]"
                       >
                         从头播放
                       </button>
@@ -305,7 +387,7 @@ export function ItemDetailPage() {
                   <button
                     type="button"
                     onClick={() => handlePlay(episodes[0].Id, 0)}
-                    className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all hover:bg-amber-400"
+                    className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all duration-200 hover:-translate-y-0.5 hover:bg-amber-400 active:scale-[0.97]"
                   >
                     <Play className="h-4 w-4 fill-current" />
                     <span>播放第 1 集</span>
@@ -315,7 +397,7 @@ export function ItemDetailPage() {
                 <button
                   type="button"
                   onClick={() => favMutation.mutate()}
-                  className={`inline-flex items-center gap-2 rounded-xl border px-4 py-3 text-sm font-medium transition-all ${
+                  className={`inline-flex items-center gap-2 rounded-xl border px-4 py-3 text-sm font-medium transition-all duration-200 hover:-translate-y-0.5 active:scale-[0.97] ${
                     item.UserData?.IsFavorite
                       ? 'border-rose-500/50 bg-rose-500/15 text-rose-300'
                       : 'border-white/12 bg-white/[0.05] text-zinc-200 hover:bg-white/10'
@@ -330,7 +412,7 @@ export function ItemDetailPage() {
                 <button
                   type="button"
                   onClick={() => playedMutation.mutate()}
-                  className={`inline-flex items-center gap-2 rounded-xl border px-4 py-3 text-sm font-medium transition-all ${
+                  className={`inline-flex items-center gap-2 rounded-xl border px-4 py-3 text-sm font-medium transition-all duration-200 hover:-translate-y-0.5 active:scale-[0.97] ${
                     item.UserData?.Played
                       ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
                       : 'border-white/12 bg-white/[0.05] text-zinc-200 hover:bg-white/10'
@@ -340,6 +422,79 @@ export function ItemDetailPage() {
                   <span>{item.UserData?.Played ? '已观看' : '标记已看'}</span>
                 </button>
               </div>
+
+              {/* 管理员操作栏 */}
+              {isAdmin && (
+                <div className="space-y-3 pt-1">
+                  <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-amber-500/20 bg-zinc-950/65 p-2.5 backdrop-blur-md">
+                    <span className="px-2 text-[11px] font-semibold uppercase tracking-wider text-amber-400/90">
+                      管理员操作
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setEditModalOpen(true)}
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:bg-white/10 hover:text-amber-200"
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                      <span>编辑元数据</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setImageModalOpen(true)}
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:bg-white/10 hover:text-amber-200"
+                    >
+                      <ImageIcon className="h-3.5 w-3.5" />
+                      <span>编辑图片/海报</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setIdentifyModalOpen(true)}
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:bg-white/10 hover:text-amber-200"
+                    >
+                      <ScanSearch className="h-3.5 w-3.5" />
+                      <span>识别</span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={refreshMetadataMutation.isPending}
+                      onClick={() => refreshMetadataMutation.mutate()}
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:bg-white/10 hover:text-amber-200 disabled:opacity-50"
+                    >
+                      <RefreshCw
+                        className={`h-3.5 w-3.5 ${refreshMetadataMutation.isPending ? 'animate-spin' : ''}`}
+                      />
+                      <span>刷新元数据</span>
+                    </button>
+                    {mediaSources.length > 1 && (
+                      <button
+                        type="button"
+                        disabled={splitVersionsMutation.isPending}
+                        onClick={() => splitVersionsMutation.mutate()}
+                        className="inline-flex items-center gap-1.5 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-200 transition-colors hover:bg-amber-500/20 disabled:opacity-50"
+                      >
+                        <Split className="h-3.5 w-3.5" />
+                        <span>拆分多版本</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setDeleteConfirmOpen(true)}
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                      <span>删除媒体</span>
+                    </button>
+                  </div>
+
+                  {toast && (
+                    <FeedbackBanner
+                      message={toast.message}
+                      type={toast.type}
+                      onClose={() => setToast(null)}
+                    />
+                  )}
+                </div>
+              )}
 
               {/* 多版本、音轨、字幕选择器 */}
               {!isSeries && mediaSources.length > 0 && (
@@ -429,7 +584,7 @@ export function ItemDetailPage() {
       {/* 剧集：季 Tab 与分集列表 */}
       {isSeries && seasons.length > 0 && (
         <section className="mx-auto max-w-7xl space-y-5 px-4 pt-6 lg:px-8">
-          <div className="flex items-center gap-2 overflow-x-auto border-b border-white/10 pb-3">
+          <div className="no-scrollbar -mx-1 flex items-center gap-2 overflow-x-auto border-b border-white/10 px-1 pb-4 pt-2">
             {seasons.map((season) => {
               const active = season.Id === selectedSeasonId
               return (
@@ -437,10 +592,10 @@ export function ItemDetailPage() {
                   key={season.Id}
                   type="button"
                   onClick={() => setSelectedSeasonId(season.Id)}
-                  className={`shrink-0 rounded-xl px-4 py-2 text-sm font-medium transition-all ${
+                  className={`shrink-0 rounded-xl px-4 py-2 text-sm font-medium transition-all duration-200 active:scale-[0.97] ${
                     active
-                      ? 'bg-amber-500 text-zinc-950 shadow-md shadow-amber-500/20'
-                      : 'bg-white/[0.04] text-zinc-300 hover:bg-white/10'
+                      ? 'bg-amber-500 text-zinc-950 shadow-md shadow-amber-500/25'
+                      : 'bg-white/[0.04] text-zinc-300 hover:bg-white/10 hover:text-zinc-100'
                   }`}
                 >
                   {season.Name}
@@ -454,7 +609,7 @@ export function ItemDetailPage() {
               <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
             </div>
           ) : (
-            <div className="grid gap-4 md:grid-cols-2">
+            <div key={selectedSeasonId} className="animate-page-enter grid gap-4 md:grid-cols-2">
               {episodes.map((ep) => {
                 const epThumb = ep.ImageTags?.Primary
                   ? getImageUrl(ep.Id, 'Primary', { maxWidth: 480, tag: ep.ImageTags.Primary })
@@ -472,7 +627,7 @@ export function ItemDetailPage() {
                   <div
                     key={ep.Id}
                     onClick={() => handlePlay(ep.Id, ep.UserData?.PlaybackPositionTicks || 0)}
-                    className="group flex cursor-pointer gap-4 overflow-hidden rounded-2xl border border-white/8 bg-white/[0.03] p-3 transition-all hover:border-amber-400/40 hover:bg-white/[0.06]"
+                    className="group flex cursor-pointer gap-4 overflow-hidden rounded-2xl border border-white/8 bg-white/[0.03] p-3 transition-all duration-200 ease-out hover:translate-x-1 hover:border-amber-400/50 hover:bg-white/[0.06] hover:shadow-[0_8px_24px_rgba(0,0,0,0.4)]"
                   >
                     <div className="relative aspect-video w-40 shrink-0 overflow-hidden rounded-xl bg-zinc-900">
                       {epThumb ? (
@@ -532,7 +687,7 @@ export function ItemDetailPage() {
       {item.People && item.People.length > 0 && (
         <section className="mx-auto max-w-7xl space-y-4 px-4 pt-10 lg:px-8">
           <h2 className="text-lg font-semibold text-zinc-100">演职员</h2>
-          <div className="no-scrollbar flex gap-4 overflow-x-auto pb-2">
+          <div className="no-scrollbar -mx-1 flex gap-4 overflow-x-auto px-1 pb-4 pt-2">
             {item.People.slice(0, 16).map((person) => {
               const avatar = person.PrimaryImageTag
                 ? getImageUrl(person.Id, 'Primary', {
@@ -540,27 +695,97 @@ export function ItemDetailPage() {
                     tag: person.PrimaryImageTag,
                   })
                 : null
+              const avatarFallback = person.PrimaryImageTag
+                ? getFallbackImageUrl(person.Id, 'Primary')
+                : null
               return (
-                <div key={`${person.Id}-${person.Role}`} className="w-28 shrink-0 text-center">
-                  <div className="mx-auto flex h-24 w-24 items-center justify-center overflow-hidden rounded-full bg-zinc-900 ring-1 ring-white/10">
+                <div
+                  key={`${person.Id}-${person.Role}`}
+                  className="group w-28 shrink-0 text-center transition-transform duration-200 hover:-translate-y-0.5"
+                >
+                  <div className="mx-auto flex h-24 w-24 items-center justify-center overflow-hidden rounded-full border border-white/10 bg-zinc-900 transition-all duration-300 group-hover:border-amber-400/70 group-hover:shadow-[0_0_18px_rgba(245,158,11,0.22)]">
                     {avatar ? (
                       <img
                         src={avatar}
                         alt={person.Name}
                         loading="lazy"
-                        className="h-full w-full object-cover"
+                        onError={(e) => applyFallbackOrHide(e, avatarFallback)}
+                        className="h-full w-full object-cover object-top transition-transform duration-300 ease-out group-hover:scale-110"
                       />
                     ) : (
                       <User className="h-8 w-8 text-zinc-600" />
                     )}
                   </div>
-                  <p className="mt-2 truncate text-xs font-medium text-zinc-200">{person.Name}</p>
+                  <p className="mt-2 truncate text-xs font-medium text-zinc-200 transition-colors group-hover:text-amber-300">
+                    {person.Name}
+                  </p>
                   <p className="truncate text-[11px] text-zinc-500">{person.Role || person.Type}</p>
                 </div>
               )
             })}
           </div>
         </section>
+      )}
+
+      {/* 管理员弹窗组 */}
+      {isAdmin && (
+        <>
+          <MetadataEditorModal
+            open={editModalOpen}
+            item={item}
+            onClose={() => setEditModalOpen(false)}
+            onSaved={(msg) => showToast('success', msg)}
+          />
+          <ImageManagerModal
+            open={imageModalOpen}
+            item={item}
+            onClose={() => setImageModalOpen(false)}
+            onUpdated={(msg) => showToast('success', msg)}
+          />
+          <IdentifyModal
+            open={identifyModalOpen}
+            item={item}
+            onClose={() => setIdentifyModalOpen(false)}
+            onApplied={(msg) => showToast('success', msg)}
+          />
+          <AdminModal
+            open={deleteConfirmOpen}
+            title="确认删除媒体"
+            subtitle="此操作不可撤销"
+            maxWidthClass="max-w-md"
+            onClose={() => setDeleteConfirmOpen(false)}
+          >
+            <div className="space-y-5">
+              <div className="flex items-start gap-3 rounded-xl border border-red-500/25 bg-red-500/10 p-4 text-sm text-red-200">
+                <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-red-400" />
+                <div>
+                  <p className="font-semibold">确定要删除「{item.Name}」吗？</p>
+                  <p className="mt-1 text-xs leading-relaxed text-red-200/80">
+                    将从媒体库索引中移除该条目的元数据、图片与关联记录，删除后将返回上一级媒体库。
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center justify-end gap-3">
+                <button
+                  type="button"
+                  onClick={() => setDeleteConfirmOpen(false)}
+                  className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-sm font-medium text-zinc-300 hover:bg-white/10"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  disabled={deleteItemMutation.isPending}
+                  onClick={() => deleteItemMutation.mutate()}
+                  className="inline-flex items-center gap-2 rounded-xl bg-red-600 px-5 py-2 text-sm font-semibold text-white transition-colors hover:bg-red-500 disabled:opacity-60"
+                >
+                  {deleteItemMutation.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+                  <span>确认删除</span>
+                </button>
+              </div>
+            </div>
+          </AdminModal>
+        </>
       )}
     </div>
   )

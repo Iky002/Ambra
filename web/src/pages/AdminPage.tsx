@@ -6,6 +6,7 @@ import {
   Key,
   Puzzle,
   RefreshCw,
+  Sparkles,
   Users,
 } from 'lucide-react'
 import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
@@ -14,6 +15,7 @@ import { AmbraLogo } from '../components/AmbraLogo'
 import { DashboardTab } from './admin/DashboardTab'
 import { DevicesKeysTab } from './admin/DevicesKeysTab'
 import { LibrariesTab } from './admin/LibrariesTab'
+import { MetadataTab } from './admin/MetadataTab'
 import { PluginsTab } from './admin/PluginsTab'
 import { TasksLogsTab } from './admin/TasksLogsTab'
 import { UsersTab } from './admin/UsersTab'
@@ -37,6 +39,12 @@ const ADMIN_TABS = [
     label: '媒体库管理',
     desc: '挂载目录 · 扫描 · 删除',
     icon: FolderOpen,
+  },
+  {
+    path: 'metadata',
+    label: '元数据与榜单',
+    desc: '豆瓣/IMDb · 编辑 · 识别',
+    icon: Sparkles,
   },
   {
     path: 'devices',
@@ -110,7 +118,7 @@ export function AdminPage() {
       <div className="flex flex-col gap-6 xl:flex-row">
         {/* 左侧/顶部子导航 */}
         <aside className="shrink-0 xl:w-60">
-          <nav className="flex gap-2 overflow-x-auto pb-2 xl:flex-col xl:overflow-visible xl:pb-0">
+          <nav className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-4 pt-2 xl:mx-0 xl:flex-col xl:overflow-visible xl:p-0">
             {ADMIN_TABS.map((tab) => {
               const Icon = tab.icon
               return (
@@ -143,6 +151,7 @@ export function AdminPage() {
             <Route path="dashboard" element={<DashboardTab />} />
             <Route path="users" element={<UsersTab />} />
             <Route path="libraries" element={<LibrariesTab />} />
+            <Route path="metadata" element={<MetadataTab />} />
             <Route path="devices" element={<DevicesKeysTab />} />
             <Route path="plugins" element={<PluginsTab />} />
             <Route path="tasks" element={<TasksLogsTab />} />

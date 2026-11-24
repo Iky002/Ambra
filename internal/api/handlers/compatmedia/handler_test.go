@@ -477,15 +477,7 @@ func TestItemMetadataTagsRemoteSearchAndRelations(t *testing.T) {
 		t.Fatalf("remote search apply: %d", w.Code)
 	}
 
-	// Metadata reset & Refresh
-	if w := doReq(env.router, http.MethodPost, "/Items/Metadata/Reset?ItemIds=movie001", `{}`); w.Code != http.StatusNoContent {
-		t.Fatalf("metadata reset: %d", w.Code)
-	}
-	if w := doReq(env.router, http.MethodPost, "/Items/movie001/Refresh", `{}`); w.Code != http.StatusNoContent {
-		t.Fatalf("item refresh: %d", w.Code)
-	}
-
-	// Ancestors, File, DeleteInfo
+	// Ancestors, File, DeleteInfo (verify before async Refresh overwrites seeded ancestors)
 	w = doReq(env.router, http.MethodGet, "/Items/movie001/Ancestors", "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("ancestors: %d", w.Code)
@@ -505,6 +497,15 @@ func TestItemMetadataTagsRemoteSearchAndRelations(t *testing.T) {
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "movie.mkv") {
 		t.Fatalf("delete info failed: %d %s", w.Code, w.Body.String())
 	}
+
+	// Metadata reset & Refresh
+	if w := doReq(env.router, http.MethodPost, "/Items/Metadata/Reset?ItemIds=movie001", `{}`); w.Code != http.StatusNoContent {
+		t.Fatalf("metadata reset: %d", w.Code)
+	}
+	if w := doReq(env.router, http.MethodPost, "/Items/movie001/Refresh", `{}`); w.Code != http.StatusNoContent {
+		t.Fatalf("item refresh: %d", w.Code)
+	}
+	env.scanner.WaitIdle(ctx)
 
 	// Delete single & batch
 	if w := doReq(env.router, http.MethodDelete, "/Items/movie001", ""); w.Code != http.StatusNoContent {

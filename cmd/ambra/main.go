@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/core/rankings"
 	"github.com/ambra-media/ambra/internal/server"
 )
 
@@ -47,6 +48,9 @@ func main() {
 
 	if srv.SSDP != nil {
 		go func() { _ = srv.SSDP.Start(ctx) }()
+	}
+	if srv.Rankings != nil {
+		srv.Rankings.StartPeriodicSync(ctx, rankings.DefaultSyncInterval)
 	}
 
 	httpSrv := &http.Server{

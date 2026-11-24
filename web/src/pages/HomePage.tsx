@@ -68,11 +68,13 @@ function HorizontalRow({
         </div>
       </div>
 
-      <div
-        ref={scrollRef}
-        className="no-scrollbar flex gap-4 overflow-x-auto px-4 pb-2 lg:px-8"
-      >
-        {children}
+      <div className="px-4 lg:px-8">
+        <div
+          ref={scrollRef}
+          className="no-scrollbar -mx-1 flex gap-4 overflow-x-auto px-1 pb-4 pt-2"
+        >
+          {children}
+        </div>
       </div>
     </section>
   )
@@ -160,7 +162,7 @@ export function HomePage() {
                 }
                 setHeroImgFailed(true)
               }}
-              className="h-full w-full object-cover object-center transition-opacity duration-700"
+              className="animate-hero-fade h-full w-full object-cover object-center"
             />
           ) : (
             <div className="h-full w-full bg-gradient-to-br from-zinc-900 via-zinc-950 to-black" />
@@ -171,7 +173,7 @@ export function HomePage() {
           <div className="absolute inset-0 bg-gradient-to-t from-[#09090d] via-transparent to-black/30" />
 
           <div className="absolute inset-0 flex flex-col justify-end px-5 pb-10 lg:px-10 lg:pb-12">
-            <div className="max-w-2xl space-y-4">
+            <div key={activeHero.Id} className="animate-page-enter max-w-2xl space-y-4">
               <div className="flex flex-wrap items-center gap-2 text-xs font-medium">
                 <span className="rounded-md bg-amber-500/20 px-2 py-0.5 text-amber-300 ring-1 ring-amber-400/30">
                   精选推荐
@@ -215,14 +217,14 @@ export function HomePage() {
                         : `/play/${activeHero.Id}`,
                     )
                   }
-                  className="flex items-center gap-2 rounded-xl bg-amber-500 px-5 py-2.5 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/30 transition-all hover:bg-amber-400"
+                  className="flex items-center gap-2 rounded-xl bg-amber-500 px-5 py-2.5 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/30 transition-all duration-200 hover:-translate-y-0.5 hover:bg-amber-400 active:scale-[0.97]"
                 >
                   <Play className="h-4 w-4 fill-current" />
                   <span>{activeHero.Type === 'Series' ? '开始观看' : '立即播放'}</span>
                 </button>
                 <Link
                   to={`/item/${activeHero.Id}`}
-                  className="flex items-center gap-2 rounded-xl border border-white/15 bg-white/10 px-5 py-2.5 text-sm font-medium text-white backdrop-blur-md transition-all hover:bg-white/15"
+                  className="flex items-center gap-2 rounded-xl border border-white/15 bg-white/10 px-5 py-2.5 text-sm font-medium text-white backdrop-blur-md transition-all duration-200 hover:-translate-y-0.5 hover:bg-white/15 active:scale-[0.97]"
                 >
                   <Info className="h-4 w-4" />
                   <span>查看详情</span>
@@ -284,7 +286,7 @@ export function HomePage() {
                 <Link
                   key={view.Id}
                   to={`/library/${view.Id}`}
-                  className="group relative flex aspect-[16/9] items-end overflow-hidden rounded-2xl border border-white/10 bg-zinc-900/80 p-4 transition-all hover:border-amber-400/50 hover:shadow-xl hover:shadow-black/50"
+                  className="group relative flex aspect-[16/9] items-end overflow-hidden rounded-2xl border border-white/10 bg-zinc-900/80 p-4 transition-all duration-300 ease-out hover:-translate-y-1 hover:border-amber-400/65 hover:shadow-[0_14px_34px_rgba(0,0,0,0.55),0_0_24px_rgba(245,158,11,0.16)]"
                 >
                   {thumb ? (
                     <img
@@ -297,11 +299,11 @@ export function HomePage() {
                   )}
                   <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/30 to-transparent" />
                   <div className="relative z-10 flex items-center gap-2.5">
-                    <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-amber-500/20 text-amber-400 backdrop-blur-md">
+                    <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-amber-500/20 text-amber-400 backdrop-blur-md transition-transform duration-300 group-hover:scale-110 group-hover:bg-amber-500/30">
                       <Icon className="h-4 w-4" />
                     </div>
                     <div>
-                      <p className="text-sm font-semibold text-zinc-100 group-hover:text-amber-300">
+                      <p className="text-sm font-semibold text-zinc-100 transition-colors group-hover:text-amber-300">
                         {view.Name}
                       </p>
                     </div>
