@@ -77,6 +77,10 @@ export function MediaCard({
 
   const canDirectPlay =
     !selectable && (item.Type === 'Movie' || item.Type === 'Episode' || item.MediaType === 'Video')
+  const directPlayUrl =
+    showProgress && item.UserData?.PlaybackPositionTicks && item.UserData.PlaybackPositionTicks > 0
+      ? `/play/${item.Id}?startTicks=${item.UserData.PlaybackPositionTicks}`
+      : `/play/${item.Id}`
   const hasDoubanTop250 = Boolean(item.Tags?.some((t) => t === '豆瓣Top250' || t === '豆瓣 Top250'))
   const hasImdbTop250 = Boolean(item.Tags?.some((t) => t === 'IMDb Top250' || t === 'IMDb Top 250'))
   const hasTrending = Boolean(item.Tags?.some((t) => t.toLowerCase() === 'trending'))
@@ -133,7 +137,7 @@ export function MediaCard({
             onClick={(e) => {
               e.preventDefault()
               e.stopPropagation()
-              navigate(`/play/${item.Id}`)
+              navigate(directPlayUrl)
             }}
             className="absolute left-1/2 top-1/2 flex h-12 w-12 -translate-x-1/2 -translate-y-1/2 scale-75 items-center justify-center rounded-full bg-amber-500 text-zinc-950 opacity-0 shadow-lg shadow-amber-500/35 transition-all duration-300 ease-out hover:bg-amber-400 group-hover:scale-100 group-hover:opacity-100 active:scale-95"
           >

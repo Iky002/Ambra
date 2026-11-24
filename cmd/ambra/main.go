@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ambra-media/ambra/internal/api/handlers/logs"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/rankings"
 	"github.com/ambra-media/ambra/internal/server"
@@ -43,6 +44,10 @@ func main() {
 		cfg.WebDir = *webDir
 	}
 
+	logBridge := logs.NewMultiSlogHandler(os.Stdout, nil, logs.DailyLogFilePath(cfg.DataDir, time.Now().UTC()))
+	defer func() { _ = logBridge.Close() }()
+	slog.SetDefault(slog.New(logBridge))
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -52,6 +57,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer func() { _ = srv.Close() }()
+	logBridge.SetLogsHandler(srv.Logs)
 
 	if srv.SSDP != nil {
 		go func() { _ = srv.SSDP.Start(ctx) }()
