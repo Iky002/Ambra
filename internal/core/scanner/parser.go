@@ -19,6 +19,20 @@ var (
 		".webm": true,
 	}
 
+	audioExtensions = map[string]bool{
+		".mp3":  true,
+		".flac": true,
+		".m4a":  true,
+		".aac":  true,
+		".ogg":  true,
+		".opus": true,
+		".wav":  true,
+		".wma":  true,
+		".alac": true,
+		".ape":  true,
+		".dsf":  true,
+	}
+
 	subtitleExtensions = map[string]string{
 		".srt": "subrip",
 		".ass": "ass",
@@ -38,14 +52,23 @@ var (
 	reSeasonEpisode = regexp.MustCompile(`(?i)(?:^|[\s._\-\[\(])S(\d{1,2})[\s._\-]*E(\d{1,3})(?:[\s._\-\]\)]|$)`)
 	reAltEpisode    = regexp.MustCompile(`(?i)(?:^|[\s._\-])(\d{1,2})x(\d{1,3})(?:[\s._\-]|$)`)
 	reSeasonDir     = regexp.MustCompile(`(?i)^(?:season|s|第)\s*0*(\d{1,2})\s*(?:季)?$`)
-	reYearParens    = regexp.MustCompile(`[\(\[（]((?:19|20)\d{2})[\)\]）]`)
-	reYearBare      = regexp.MustCompile(`(?:^|[\s._\-])((?:19|20)\d{2})(?:$|[\s._\-])`)
-	reQualityNoise  = regexp.MustCompile(`(?i)\b(2160p|1080p|720p|480p|4k|uhd|hdr|hdr10|dv|bluray|blu-ray|bdrip|web-dl|webdl|webrip|remux|x264|x265|h264|h265|hevc|avc|aac|dts|ac3|atmos|truehd|flac|10bit)\b.*$`)
+	reYearParens     = regexp.MustCompile(`[\(\[（]((?:19|20)\d{2})[\)\]）]`)
+	reYearBare       = regexp.MustCompile(`(?:^|[\s._\-])((?:19|20)\d{2})(?:$|[\s._\-])`)
+	reQualityNoise   = regexp.MustCompile(`(?i)\b(2160p|1080p|720p|480p|4k|uhd|hdr|hdr10|dv|bluray|blu-ray|bdrip|web-dl|webdl|webrip|remux|x264|x265|h264|h265|hevc|avc|aac|dts|ac3|atmos|truehd|flac|10bit)\b.*$`)
+	reAudioDiscDir   = regexp.MustCompile(`(?i)^(?:disc|cd|disk)\s*0*(\d{1,2})$`)
+	reAudioDiscTrack = regexp.MustCompile(`^(\d{1,2})[-.](\d{1,3})(?:\s*[-._]\s*|\s+)(.*)$`)
+	reAudioTrack     = regexp.MustCompile(`^(\d{1,3})(?:\s*[-._]\s*|\s+)(.*)$`)
+	reAlbumYearLead  = regexp.MustCompile(`^(?:[\(\[（]((?:19|20)\d{2})[\)\]）]|((?:19|20)\d{2}))\s*[-._]?\s*(.+)$`)
 )
 
 // IsVideoFile reports whether the file extension is a supported video format.
 func IsVideoFile(path string) bool {
 	return videoExtensions[strings.ToLower(filepath.Ext(path))]
+}
+
+// IsAudioFile reports whether the file extension is a supported audio format.
+func IsAudioFile(path string) bool {
+	return audioExtensions[strings.ToLower(filepath.Ext(path))]
 }
 
 // IsStrmFile reports whether the file is a .strm file.
@@ -106,7 +129,7 @@ type ParsedEpisode struct {
 func ParseEpisodePath(rootDir, mediaPath string, forceTV bool) ParsedEpisode {
 	base := strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath))
 	var seasonNum, epNum int
-	var matched bool
+	var matched, isSpecialsDir bool
 	var epTitle string
 
 	if m := reSeasonEpisode.FindStringSubmatchIndex(base); m != nil {
@@ -133,12 +156,24 @@ func ParseEpisodePath(rootDir, mediaPath string, forceTV bool) ParsedEpisode {
 	seasonDir := ""
 	seriesDir := fileDir
 
-	// Check if immediate parent directory is a Season directory (e.g., "Season 01", "S01", "第1季")
+	// Check if immediate parent directory is a Season directory (e.g., "Season 01", "S01", "第1季", "Specials")
 	parentBase := filepath.Base(fileDir)
 	if m := reSeasonDir.FindStringSubmatch(parentBase); m != nil {
+		dirNum, _ := strconv.Atoi(m[1])
 		if !matched || seasonNum == 0 {
-			seasonNum, _ = strconv.Atoi(m[1])
+			seasonNum = dirNum
 		}
+		if dirNum == 0 {
+			isSpecialsDir = true
+		}
+		seasonDir = fileDir
+		seriesDir = filepath.Dir(fileDir)
+		matched = true
+	} else if strings.EqualFold(strings.TrimSpace(parentBase), "Specials") {
+		if !matched || seasonNum == 0 {
+			seasonNum = 0
+		}
+		isSpecialsDir = true
 		seasonDir = fileDir
 		seriesDir = filepath.Dir(fileDir)
 		matched = true
@@ -159,7 +194,7 @@ func ParseEpisodePath(rootDir, mediaPath string, forceTV bool) ParsedEpisode {
 	if seriesName == "" {
 		seriesName = filepath.Base(seriesDir)
 	}
-	if seasonNum == 0 {
+	if seasonNum == 0 && !isSpecialsDir {
 		seasonNum = 1
 	}
 	if epTitle == "" && epNum > 0 {
@@ -184,6 +219,136 @@ func cleanTitle(s string) string {
 	s = strings.Trim(s, " -_[]()（）")
 	fields := strings.Fields(s)
 	return strings.Join(fields, " ")
+}
+
+// ParsedAudio holds parsed artist, album, disc/track numbers, title, year, and directory paths for an audio file.
+type ParsedAudio struct {
+	Artist      string
+	Album       string
+	TrackNumber int
+	DiscNumber  int
+	Title       string
+	Year        int
+	ArtistDir   string
+	AlbumDir    string
+}
+
+// ParseAudioPath extracts audio metadata from a media path relative to a library root.
+// Supports:
+//   - root/Artist/Album (2023)/01 - Track Title.flac
+//   - root/Artist/Album/Disc 2/01 - Track.mp3
+//   - root/Artist/Album/1-02 Track.mp3
+//   - root/Album/03. Song.m4a
+//   - root/01 Song.mp3
+func ParseAudioPath(root, mediaPath string) ParsedAudio {
+	cleanRoot := filepath.Clean(root)
+	cleanMedia := filepath.Clean(mediaPath)
+
+	stem := strings.TrimSpace(strings.TrimSuffix(filepath.Base(cleanMedia), filepath.Ext(cleanMedia)))
+	discNum := 0
+	trackNum := 0
+	title := stem
+
+	if m := reAudioDiscTrack.FindStringSubmatch(stem); m != nil {
+		discNum, _ = strconv.Atoi(m[1])
+		trackNum, _ = strconv.Atoi(m[2])
+		title = cleanAudioTitle(m[3])
+	} else if m := reAudioTrack.FindStringSubmatch(stem); m != nil {
+		trackNum, _ = strconv.Atoi(m[1])
+		title = cleanAudioTitle(m[2])
+	} else {
+		title = cleanAudioTitle(stem)
+	}
+	if title == "" {
+		title = stem
+	}
+
+	var dirs []string
+	if rel, err := filepath.Rel(cleanRoot, cleanMedia); err == nil && rel != "" && !strings.HasPrefix(rel, "..") {
+		relDir := filepath.Dir(rel)
+		if relDir != "." && relDir != "" {
+			for _, seg := range strings.Split(filepath.ToSlash(relDir), "/") {
+				if seg != "" && seg != "." {
+					dirs = append(dirs, seg)
+				}
+			}
+		}
+	}
+
+	// Optional Disc/CD subdirectory (e.g. "Disc 1", "CD2")
+	if len(dirs) > 0 {
+		if m := reAudioDiscDir.FindStringSubmatch(strings.TrimSpace(dirs[len(dirs)-1])); m != nil {
+			if discNum == 0 {
+				discNum, _ = strconv.Atoi(m[1])
+			}
+			dirs = dirs[:len(dirs)-1]
+		}
+	}
+
+	var artist, album, artistDir, albumDir string
+	var year int
+
+	switch {
+	case len(dirs) >= 2:
+		artist = strings.TrimSpace(dirs[len(dirs)-2])
+		album, year = parseAlbumDirName(dirs[len(dirs)-1])
+		artistDir = filepath.Join(append([]string{cleanRoot}, dirs[:len(dirs)-1]...)...)
+		albumDir = filepath.Join(append([]string{cleanRoot}, dirs...)...)
+	case len(dirs) == 1:
+		album, year = parseAlbumDirName(dirs[0])
+		albumDir = filepath.Join(cleanRoot, dirs[0])
+	}
+
+	if discNum == 0 {
+		discNum = 1
+	}
+
+	return ParsedAudio{
+		Artist:      artist,
+		Album:       album,
+		TrackNumber: trackNum,
+		DiscNumber:  discNum,
+		Title:       title,
+		Year:        year,
+		ArtistDir:   artistDir,
+		AlbumDir:    albumDir,
+	}
+}
+
+func parseAlbumDirName(dirName string) (string, int) {
+	s := strings.TrimSpace(dirName)
+	year := 0
+
+	if m := reYearParens.FindStringSubmatchIndex(s); m != nil {
+		y, _ := strconv.Atoi(s[m[2]:m[3]])
+		year = y
+		before := strings.TrimSpace(s[:m[0]])
+		after := strings.TrimSpace(s[m[1]:])
+		if before != "" {
+			s = before
+		} else {
+			s = after
+		}
+	} else if m := reAlbumYearLead.FindStringSubmatch(s); m != nil {
+		ys := m[1]
+		if ys == "" {
+			ys = m[2]
+		}
+		year, _ = strconv.Atoi(ys)
+		s = strings.TrimSpace(m[3])
+	}
+
+	s = strings.Trim(s, " -_[]()（）")
+	if s == "" {
+		s = strings.TrimSpace(dirName)
+	}
+	return s, year
+}
+
+func cleanAudioTitle(s string) string {
+	s = strings.ReplaceAll(s, "_", " ")
+	s = strings.Trim(s, " -_")
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // SubtitleClassification holds normalized language, Chinese variant, and display title.

@@ -147,8 +147,10 @@ func (h *Handler) handleDismissReview(w http.ResponseWriter, r *http.Request) {
 }
 
 type lockFieldsRequest struct {
-	LockedFields []string `json:"LockedFields"`
-	Fields       []string `json:"fields"`
+	LockedFields  []string `json:"LockedFields"`
+	Fields        []string `json:"fields"`
+	LockData      *bool    `json:"LockData"`
+	SnakeLockData *bool    `json:"lock_data"`
 }
 
 func (h *Handler) handleLockFields(w http.ResponseWriter, r *http.Request) {
@@ -162,7 +164,11 @@ func (h *Handler) handleLockFields(w http.ResponseWriter, r *http.Request) {
 	if fields == nil {
 		fields = req.Fields
 	}
-	res, err := h.svc.SetLockedFields(r.Context(), id, fields)
+	lockData := req.LockData
+	if lockData == nil {
+		lockData = req.SnakeLockData
+	}
+	res, err := h.svc.SetLockState(r.Context(), id, fields, lockData)
 	if err != nil {
 		writeServiceError(w, err)
 		return

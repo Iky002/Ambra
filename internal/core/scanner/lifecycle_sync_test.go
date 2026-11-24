@@ -76,13 +76,10 @@ func TestScanPathDeletesStaleItemAndPublishesEvent(t *testing.T) {
 		t.Fatalf("initial ScanLibrary: %v", err)
 	}
 
-	var mu sync.Mutex
-	var cleanupEvents []eventbus.Event
+	cleanupCh := make(chan eventbus.Event, 4)
 	bus.Subscribe(eventbus.EventLibraryChanged, func(_ context.Context, ev eventbus.Event) {
 		if payload, ok := ev.Payload.(map[string]any); ok && payload["Phase"] == "cleanup" {
-			mu.Lock()
-			cleanupEvents = append(cleanupEvents, ev)
-			mu.Unlock()
+			cleanupCh <- ev
 		}
 	})
 
@@ -105,11 +102,10 @@ func TestScanPathDeletesStaleItemAndPublishesEvent(t *testing.T) {
 		t.Fatalf("expected pathB to remain in DB, got %v", err)
 	}
 
-	mu.Lock()
-	evCount := len(cleanupEvents)
-	mu.Unlock()
-	if evCount != 1 {
-		t.Fatalf("expected 1 cleanup EventLibraryChanged, got %d", evCount)
+	select {
+	case <-cleanupCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected 1 cleanup EventLibraryChanged, timed out")
 	}
 
 	// Re-scanning already-deleted path is a clean no-op.
@@ -278,4 +274,65 @@ func TestScannerCancelAllAndCancelLibrary(t *testing.T) {
 
 	// CancelLibrary on idle library is a safe no-op.
 	sc.CancelLibrary(lib.ID)
+}
+
+func TestScanLibrarySkipsPruneOnEmptyUnmountedRoot(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(tmp, "unmounted.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	repo := sqlite.NewLibraryRepo(store)
+	sc := New(repo, nil, nil, config.Default(tmp))
+	sc.SetProber(nil)
+
+	ctx := context.Background()
+	rootA := filepath.Join(tmp, "nas_a")
+	rootB := filepath.Join(tmp, "nas_b")
+	_ = os.MkdirAll(rootA, 0o755)
+	_ = os.MkdirAll(rootB, 0o755)
+
+	movieA := filepath.Join(rootA, "NASMovie (2020).mkv")
+	movieB1 := filepath.Join(rootB, "LocalKeep (2021).mkv")
+	movieB2 := filepath.Join(rootB, "LocalDelete (2022).mkv")
+	_ = os.WriteFile(movieA, []byte("nas"), 0o644)
+	_ = os.WriteFile(movieB1, []byte("keep"), 0o644)
+	_ = os.WriteFile(movieB2, []byte("del"), 0o644)
+
+	lib, err := repo.CreateLibrary(ctx, "MultiRoot", "movies", []string{rootA, rootB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := sc.ScanLibrary(ctx, lib.ID)
+	if err != nil || st.ItemsAdded != 3 {
+		t.Fatalf("initial scan: st=%+v err=%v", st, err)
+	}
+
+	// Simulate NAS unmount on rootA (mount point exists as empty dir) AND normal deletion of movieB2 in rootB.
+	if err := os.Remove(movieA); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(movieB2); err != nil {
+		t.Fatal(err)
+	}
+
+	st2, err := sc.ScanLibrary(ctx, lib.ID)
+	if err != nil {
+		t.Fatalf("rescan: %v", err)
+	}
+	// Only movieB2 should be pruned; movieA under empty rootA must be protected by circuit breaker!
+	if st2.ItemsDeleted != 1 {
+		t.Fatalf("expected ItemsDeleted=1 (only movieB2), got %+v", st2)
+	}
+	if _, err := repo.FindItemByMediaSourcePath(ctx, lib.ID, movieA); err != nil {
+		t.Fatalf("expected movieA under empty rootA to survive prune circuit breaker, got %v", err)
+	}
+	if _, err := repo.FindItemByMediaSourcePath(ctx, lib.ID, movieB1); err != nil {
+		t.Fatalf("expected movieB1 to survive, got %v", err)
+	}
+	if _, err := repo.FindItemByMediaSourcePath(ctx, lib.ID, movieB2); err == nil {
+		t.Fatal("expected movieB2 under non-empty rootB to be pruned")
+	}
 }

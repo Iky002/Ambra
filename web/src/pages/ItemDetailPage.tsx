@@ -3,15 +3,25 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
   Check,
+  CheckCircle2,
+  ChevronDown,
+  ChevronUp,
+  Disc3,
+  Download,
   Film,
   Flame,
+  FolderPlus,
   GitMerge,
   Heart,
   Image as ImageIcon,
   Layers,
+  ListVideo,
   Loader2,
+  Music,
+  Pause,
   Pencil,
   Play,
+  Plus,
   RefreshCw,
   ScanSearch,
   Split,
@@ -23,11 +33,14 @@ import {
 } from 'lucide-react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, getBackdropUrl, getFallbackImageUrl, getImageUrl } from '../api/client'
-import type { MediaSourceInfo } from '../api/types'
+import type { BaseItemDto, MediaSourceInfo } from '../api/types'
+import { formatAudioTime } from '../components/AudioPlayerBar'
+import { MediaCard } from '../components/MediaCard'
 import { IdentifyModal } from '../components/media/IdentifyModal'
 import { ImageManagerModal } from '../components/media/ImageManagerModal'
 import { MergeVersionsModal } from '../components/media/MergeVersionsModal'
 import { MetadataEditorModal } from '../components/media/MetadataEditorModal'
+import { useAudioPlayer } from '../context/AudioPlayerContext'
 import { useAuth } from '../context/AuthContext'
 import {
   detectChineseVariant,
@@ -39,17 +52,28 @@ import { AdminModal, FeedbackBanner } from './admin/adminUtils'
 
 export function ItemDetailPage() {
   const { id } = useParams<{ id: string }>()
-  const { auth, isAdmin } = useAuth()
+  const { auth, user, isAdmin } = useAuth()
+  const {
+    currentTrack,
+    isPlaying: isAudioPlaying,
+    playQueue,
+    playTrack,
+    togglePlay: toggleAudioPlay,
+  } = useAudioPlayer()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const userId = auth!.userId
 
-  // 管理员弹窗与反馈提示状态
+  // 管理员与交互弹窗状态
   const [editModalOpen, setEditModalOpen] = useState(false)
   const [imageModalOpen, setImageModalOpen] = useState(false)
   const [identifyModalOpen, setIdentifyModalOpen] = useState(false)
   const [mergeModalOpen, setMergeModalOpen] = useState(false)
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
+  const [addToColOpen, setAddToColOpen] = useState(false)
+  const [addToColTab, setAddToColTab] = useState<'BoxSet' | 'Playlist'>('BoxSet')
+  const [newColName, setNewColName] = useState('')
+  const [showAllCast, setShowAllCast] = useState(false)
   const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
 
   const showToast = (type: 'success' | 'error', message: string) => {
@@ -69,6 +93,51 @@ export function ItemDetailPage() {
   })
 
   const isSeries = item?.Type === 'Series'
+  const isMusicAlbum = item?.Type === 'MusicAlbum'
+  const isMusicArtist = item?.Type === 'MusicArtist'
+  const isAudio = item?.Type === 'Audio'
+
+  const { data: albumTracksData, isLoading: albumTracksLoading } = useQuery({
+    queryKey: ['albumTracks', id, userId],
+    queryFn: () =>
+      api.getItems(userId, {
+        parentId: id,
+        includeItemTypes: 'Audio',
+        sortBy: 'ParentIndexNumber,IndexNumber,SortName',
+        sortOrder: 'Ascending',
+        limit: 200,
+      }),
+    enabled: Boolean(id && isMusicAlbum),
+  })
+  const albumTracks = albumTracksData?.Items || []
+
+  const { data: artistAlbumsData, isLoading: artistAlbumsLoading } = useQuery({
+    queryKey: ['artistAlbums', id, userId],
+    queryFn: () =>
+      api.getItems(userId, {
+        parentId: id,
+        includeItemTypes: 'MusicAlbum',
+        sortBy: 'PremiereDate',
+        sortOrder: 'Descending',
+        limit: 100,
+      }),
+    enabled: Boolean(id && isMusicArtist),
+  })
+  const artistAlbums = artistAlbumsData?.Items || []
+
+  const { data: artistTracksData, isLoading: artistTracksLoading } = useQuery({
+    queryKey: ['artistTracks', id, userId],
+    queryFn: () =>
+      api.getItems(userId, {
+        parentId: id,
+        includeItemTypes: 'Audio',
+        sortBy: 'PlayCount',
+        sortOrder: 'Descending',
+        limit: 50,
+      }),
+    enabled: Boolean(id && isMusicArtist),
+  })
+  const artistTracks = artistTracksData?.Items || []
 
   const { data: seasonsData } = useQuery({
     queryKey: ['seasons', id, userId],
@@ -92,6 +161,51 @@ export function ItemDetailPage() {
   })
 
   const episodes = episodesData?.Items || []
+  const selectedSeason = seasons.find((s) => s.Id === selectedSeasonId) || null
+
+  // 剧集「下一集 / 继续观看」查询（用于主播放按钮精准续播）
+  const { data: nextUpData } = useQuery({
+    queryKey: ['nextUp', userId, id],
+    queryFn: () => api.getNextUp(userId, { seriesId: id!, limit: 1 }),
+    enabled: Boolean(id && isSeries),
+  })
+  const nextUpEpisode = nextUpData?.Items?.[0] || null
+
+  // 相似推荐查询
+  const { data: similarData } = useQuery({
+    queryKey: ['similarItems', id, userId],
+    queryFn: () => api.getSimilarItems(id!, userId, 12),
+    enabled: Boolean(id && item?.Id),
+    staleTime: 60_000,
+  })
+  const similarItems = similarData?.Items || []
+
+  // 加入合集 / 播放列表弹窗数据
+  const { data: boxSetsForModal } = useQuery({
+    queryKey: ['collections', userId, 'BoxSet'],
+    queryFn: () =>
+      api.getItems(userId, {
+        includeItemTypes: 'BoxSet',
+        recursive: true,
+        sortBy: 'SortName',
+        sortOrder: 'Ascending',
+        limit: 100,
+      }),
+    enabled: addToColOpen,
+  })
+
+  const { data: playlistsForModal } = useQuery({
+    queryKey: ['collections', userId, 'Playlist'],
+    queryFn: () =>
+      api.getItems(userId, {
+        includeItemTypes: 'Playlist',
+        recursive: true,
+        sortBy: 'SortName',
+        sortOrder: 'Ascending',
+        limit: 100,
+      }),
+    enabled: addToColOpen,
+  })
 
   // 多版本 / 音轨 / 字幕选择状态
   const mediaSources: MediaSourceInfo[] = item?.MediaSources || []
@@ -162,6 +276,102 @@ export function ItemDetailPage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['item', userId, id] })
       queryClient.invalidateQueries({ queryKey: ['resumeItems', userId] })
+    },
+  })
+
+  // 分集快速标记已看 / 收藏
+  const episodePlayedMutation = useMutation({
+    mutationFn: (ep: BaseItemDto) =>
+      api.togglePlayed(userId, ep.Id, Boolean(ep.UserData?.Played)),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['episodes', id, selectedSeasonId, userId] })
+      queryClient.invalidateQueries({ queryKey: ['nextUp', userId, id] })
+      queryClient.invalidateQueries({ queryKey: ['seasons', id, userId] })
+      queryClient.invalidateQueries({ queryKey: ['resumeItems', userId] })
+    },
+  })
+
+  const episodeFavMutation = useMutation({
+    mutationFn: (ep: BaseItemDto) =>
+      api.toggleFavorite(userId, ep.Id, Boolean(ep.UserData?.IsFavorite)),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['episodes', id, selectedSeasonId, userId] })
+      queryClient.invalidateQueries({ queryKey: ['favorites', userId] })
+    },
+  })
+
+  // 标记整季已看 / 未看
+  const seasonAllPlayed =
+    episodes.length > 0 && episodes.every((ep) => Boolean(ep.UserData?.Played))
+  const seasonPlayedCount = episodes.filter((ep) => Boolean(ep.UserData?.Played)).length
+
+  const seasonPlayedMutation = useMutation({
+    mutationFn: async () => {
+      if (!selectedSeason) return
+      const markAsUnplayed = seasonAllPlayed
+      const targets = episodes.filter((ep) => Boolean(ep.UserData?.Played) === markAsUnplayed)
+      await Promise.all([
+        api.togglePlayed(userId, selectedSeason.Id, markAsUnplayed).catch(() => undefined),
+        ...targets.map((ep) => api.togglePlayed(userId, ep.Id, markAsUnplayed)),
+      ])
+    },
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['episodes', id, selectedSeasonId, userId] }),
+        queryClient.invalidateQueries({ queryKey: ['seasons', id, userId] }),
+        queryClient.invalidateQueries({ queryKey: ['nextUp', userId, id] }),
+        queryClient.invalidateQueries({ queryKey: ['resumeItems', userId] }),
+      ])
+      showToast(
+        'success',
+        seasonAllPlayed
+          ? `已将「${selectedSeason?.Name}」标记为未看`
+          : `已将「${selectedSeason?.Name}」标记为已看`,
+      )
+    },
+    onError: (err) => {
+      showToast('error', err instanceof Error ? err.message : '更新本季观看状态失败')
+    },
+  })
+
+  // 加入已有合集 / 播放列表
+  const addToContainerMutation = useMutation({
+    mutationFn: async (target: { id: string; name: string; type: 'BoxSet' | 'Playlist' }) => {
+      if (target.type === 'Playlist') {
+        await api.addPlaylistItems(target.id, [item!.Id], userId)
+      } else {
+        await api.addCollectionItems(target.id, [item!.Id])
+      }
+      return target
+    },
+    onSuccess: async (target) => {
+      await queryClient.invalidateQueries({ queryKey: ['collections', userId] })
+      setAddToColOpen(false)
+      showToast('success', `已将「${item!.Name}」加入「${target.name}」`)
+    },
+    onError: (err) => {
+      showToast('error', err instanceof Error ? err.message : '加入失败')
+    },
+  })
+
+  // 新建合集 / 播放列表并立即加入当前条目
+  const createAndAddMutation = useMutation({
+    mutationFn: async () => {
+      const name = newColName.trim()
+      if (!name) throw new Error('请输入名称')
+      if (addToColTab === 'Playlist') {
+        return api.createPlaylist(name, userId, [item!.Id])
+      }
+      return api.createCollection(name, [item!.Id])
+    },
+    onSuccess: async (created) => {
+      setNewColName('')
+      setAddToColOpen(false)
+      await queryClient.invalidateQueries({ queryKey: ['collections', userId] })
+      showToast('success', `已创建「${created.Name}」并加入「${item!.Name}」`)
+    },
+    onError: (err) => {
+      showToast('error', err instanceof Error ? err.message : '创建并加入失败')
     },
   })
 
@@ -245,6 +455,48 @@ export function ItemDetailPage() {
 
   const resumeTicks = item.UserData?.PlaybackPositionTicks || 0
   const hasResume = resumeTicks > 10_000_000 * 15 // 超过 15 秒显示续播
+  const canDownload =
+    !isSeries &&
+    !isMusicAlbum &&
+    !isMusicArtist &&
+    (isAdmin || Boolean(user?.Policy?.EnableContentDownloading))
+
+  const buildFilterLink = (param: 'genre' | 'year' | 'tag', value: string) => {
+    if (item.ParentId && (item.Type === 'Movie' || item.Type === 'Series')) {
+      return `/library/${encodeURIComponent(item.ParentId)}?${param}=${encodeURIComponent(value)}`
+    }
+    return `/search?q=${encodeURIComponent(value)}`
+  }
+
+  const formatEpisodeCode = (ep: BaseItemDto) => {
+    if (ep.ParentIndexNumber != null && ep.IndexNumber != null) {
+      return `S${String(ep.ParentIndexNumber).padStart(2, '0')}E${String(ep.IndexNumber).padStart(2, '0')}`
+    }
+    if (ep.IndexNumber != null) {
+      return `第 ${ep.IndexNumber} 集`
+    }
+    return ep.Name
+  }
+
+  const primarySeriesTarget = nextUpEpisode || episodes[0] || null
+  const seriesPlayLabel = primarySeriesTarget
+    ? (primarySeriesTarget.UserData?.PlaybackPositionTicks || 0) > 10_000_000 * 15 ||
+      (primarySeriesTarget.IndexNumber != null && primarySeriesTarget.IndexNumber > 1) ||
+      (primarySeriesTarget.ParentIndexNumber != null && primarySeriesTarget.ParentIndexNumber > 1)
+      ? `继续播放 ${formatEpisodeCode(primarySeriesTarget)}`
+      : `播放 ${formatEpisodeCode(primarySeriesTarget)}`
+    : '播放第 1 集'
+
+  const customTags = (item.Tags || []).filter((t) => {
+    const lower = t.toLowerCase()
+    return (
+      lower !== 'trending' &&
+      t !== '豆瓣Top250' &&
+      t !== '豆瓣 Top250' &&
+      t !== 'IMDb Top250' &&
+      t !== 'IMDb Top 250'
+    )
+  })
 
   const handlePlay = (targetId = item.Id, startTicks = 0) => {
     const params = new URLSearchParams()
@@ -320,7 +572,15 @@ export function ItemDetailPage() {
                     {item.CommunityRating.toFixed(1)}
                   </span>
                 ) : null}
-                {item.ProductionYear && <span>{item.ProductionYear}</span>}
+                {item.ProductionYear && (
+                  <Link
+                    to={buildFilterLink('year', String(item.ProductionYear))}
+                    className="rounded-md px-1.5 py-0.5 transition-colors hover:bg-amber-500/15 hover:text-amber-300"
+                    title={`查看 ${item.ProductionYear} 年作品`}
+                  >
+                    {item.ProductionYear}
+                  </Link>
+                )}
                 {item.OfficialRating && (
                   <span className="rounded border border-white/20 px-1.5 py-0.5 text-xs">
                     {item.OfficialRating}
@@ -328,16 +588,18 @@ export function ItemDetailPage() {
                 )}
                 {item.RunTimeTicks && <span>{formatTicks(item.RunTimeTicks)}</span>}
                 {item.Genres?.map((g) => (
-                  <span
+                  <Link
                     key={g}
-                    className="rounded-full bg-white/8 px-2.5 py-0.5 text-xs text-zinc-300"
+                    to={buildFilterLink('genre', g)}
+                    className="rounded-full bg-white/8 px-2.5 py-0.5 text-xs text-zinc-300 transition-colors hover:bg-amber-500/20 hover:text-amber-200"
+                    title={`按流派「${g}」筛选`}
                   >
                     {g}
-                  </span>
+                  </Link>
                 ))}
               </div>
 
-              {/* 榜单与技术徽章：热门 / 豆瓣 Top250 / IMDb Top250 / 4K / HDR / 简繁字幕 / ASS / PGS */}
+              {/* 榜单与技术徽章：热门 / 豆瓣 Top250 / IMDb Top250 / 标签 / 4K / HDR / 简繁字幕 / ASS / PGS */}
               {(techBadges.length > 0 || (item.Tags && item.Tags.length > 0)) && (
                 <div className="flex flex-wrap items-center gap-2">
                   {item.Tags?.some((t) => t.toLowerCase() === 'trending') && (
@@ -350,15 +612,30 @@ export function ItemDetailPage() {
                     </Link>
                   )}
                   {item.Tags?.some((t) => t === '豆瓣Top250' || t === '豆瓣 Top250') && (
-                    <span className="inline-flex items-center rounded-md border border-emerald-400/50 bg-gradient-to-r from-emerald-950/90 via-emerald-900/80 to-teal-950/90 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide text-emerald-200 shadow-[0_0_12px_rgba(16,185,129,0.2)]">
+                    <Link
+                      to={buildFilterLink('tag', '豆瓣Top250')}
+                      className="inline-flex items-center rounded-md border border-emerald-400/50 bg-gradient-to-r from-emerald-950/90 via-emerald-900/80 to-teal-950/90 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide text-emerald-200 shadow-[0_0_12px_rgba(16,185,129,0.2)] transition-opacity hover:opacity-90"
+                    >
                       豆瓣 Top250
-                    </span>
+                    </Link>
                   )}
                   {item.Tags?.some((t) => t === 'IMDb Top250' || t === 'IMDb Top 250') && (
-                    <span className="inline-flex items-center rounded-md border border-amber-400/55 bg-gradient-to-r from-amber-950/90 via-yellow-900/75 to-amber-950/90 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide text-amber-200 shadow-[0_0_12px_rgba(245,158,11,0.22)]">
+                    <Link
+                      to={buildFilterLink('tag', 'IMDb Top250')}
+                      className="inline-flex items-center rounded-md border border-amber-400/55 bg-gradient-to-r from-amber-950/90 via-yellow-900/75 to-amber-950/90 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide text-amber-200 shadow-[0_0_12px_rgba(245,158,11,0.22)] transition-opacity hover:opacity-90"
+                    >
                       IMDb Top250
-                    </span>
+                    </Link>
                   )}
+                  {customTags.map((tag) => (
+                    <Link
+                      key={tag}
+                      to={buildFilterLink('tag', tag)}
+                      className="rounded-md bg-white/[0.06] px-2 py-0.5 text-[11px] font-medium text-zinc-300 ring-1 ring-white/10 transition-colors hover:bg-amber-500/20 hover:text-amber-200"
+                    >
+                      #{tag}
+                    </Link>
+                  ))}
                   {techBadges.map((b) => (
                     <span
                       key={b.label}
@@ -374,9 +651,39 @@ export function ItemDetailPage() {
                 </div>
               )}
 
-              {/* 播放 / 收藏 / 标已看按钮 */}
+              {/* 播放 / 收藏 / 标已看 / 加入合集 / 下载按钮 */}
               <div className="flex flex-wrap items-center gap-3 pt-1">
-                {!isSeries ? (
+                {isMusicAlbum ? (
+                  <button
+                    type="button"
+                    disabled={albumTracks.length === 0}
+                    onClick={() => playQueue(albumTracks, 0)}
+                    className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all duration-200 hover:-translate-y-0.5 hover:bg-amber-400 active:scale-[0.97] disabled:opacity-50"
+                  >
+                    <Play className="h-4 w-4 fill-current" />
+                    <span>播放全部</span>
+                  </button>
+                ) : isMusicArtist ? (
+                  artistTracks.length > 0 ? (
+                    <button
+                      type="button"
+                      onClick={() => playQueue(artistTracks, 0)}
+                      className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all duration-200 hover:-translate-y-0.5 hover:bg-amber-400 active:scale-[0.97]"
+                    >
+                      <Play className="h-4 w-4 fill-current" />
+                      <span>播放全部</span>
+                    </button>
+                  ) : null
+                ) : isAudio ? (
+                  <button
+                    type="button"
+                    onClick={() => playTrack(item)}
+                    className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all duration-200 hover:-translate-y-0.5 hover:bg-amber-400 active:scale-[0.97]"
+                  >
+                    <Play className="h-4 w-4 fill-current" />
+                    <span>立即播放</span>
+                  </button>
+                ) : !isSeries ? (
                   <>
                     <button
                       type="button"
@@ -396,14 +703,19 @@ export function ItemDetailPage() {
                       </button>
                     )}
                   </>
-                ) : episodes.length > 0 ? (
+                ) : primarySeriesTarget ? (
                   <button
                     type="button"
-                    onClick={() => handlePlay(episodes[0].Id, 0)}
+                    onClick={() =>
+                      handlePlay(
+                        primarySeriesTarget.Id,
+                        primarySeriesTarget.UserData?.PlaybackPositionTicks || 0,
+                      )
+                    }
                     className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all duration-200 hover:-translate-y-0.5 hover:bg-amber-400 active:scale-[0.97]"
                   >
                     <Play className="h-4 w-4 fill-current" />
-                    <span>播放第 1 集</span>
+                    <span>{seriesPlayLabel}</span>
                   </button>
                 ) : null}
 
@@ -434,7 +746,35 @@ export function ItemDetailPage() {
                   <Check className="h-4 w-4" />
                   <span>{item.UserData?.Played ? '已观看' : '标记已看'}</span>
                 </button>
+
+                <button
+                  type="button"
+                  onClick={() => setAddToColOpen(true)}
+                  className="inline-flex items-center gap-2 rounded-xl border border-white/12 bg-white/[0.05] px-4 py-3 text-sm font-medium text-zinc-200 transition-all duration-200 hover:-translate-y-0.5 hover:border-amber-400/40 hover:bg-white/10 hover:text-amber-200 active:scale-[0.97]"
+                >
+                  <FolderPlus className="h-4 w-4" />
+                  <span>加入合集 / 片单</span>
+                </button>
+
+                {canDownload && (
+                  <a
+                    href={api.getDownloadUrl(item.Id)}
+                    download
+                    className="inline-flex items-center gap-2 rounded-xl border border-white/12 bg-white/[0.05] px-4 py-3 text-sm font-medium text-zinc-200 transition-all duration-200 hover:-translate-y-0.5 hover:border-amber-400/40 hover:bg-white/10 hover:text-amber-200 active:scale-[0.97]"
+                  >
+                    <Download className="h-4 w-4" />
+                    <span>下载原文件</span>
+                  </a>
+                )}
               </div>
+
+              {toast && (
+                <FeedbackBanner
+                  message={toast.message}
+                  type={toast.type}
+                  onClose={() => setToast(null)}
+                />
+              )}
 
               {/* 管理员操作栏 */}
               {isAdmin && (
@@ -508,19 +848,11 @@ export function ItemDetailPage() {
                       <span>删除媒体</span>
                     </button>
                   </div>
-
-                  {toast && (
-                    <FeedbackBanner
-                      message={toast.message}
-                      type={toast.type}
-                      onClose={() => setToast(null)}
-                    />
-                  )}
                 </div>
               )}
 
               {/* 多版本、音轨、字幕选择器 */}
-              {!isSeries && mediaSources.length > 0 && (
+              {!isSeries && !isMusicAlbum && !isMusicArtist && !isAudio && mediaSources.length > 0 && (
                 <div className="grid gap-3 rounded-2xl border border-white/10 bg-zinc-950/70 p-4 backdrop-blur-md sm:grid-cols-3">
                   {mediaSources.length > 1 && (
                     <label className="block space-y-1.5">
@@ -604,7 +936,233 @@ export function ItemDetailPage() {
         </div>
       </div>
 
-      {/* 剧集：季 Tab 与分集列表 */}
+      {/* 音乐专辑：曲目列表 */}
+      {isMusicAlbum && (
+        <section
+          data-testid="album-tracklist"
+          className="mx-auto max-w-7xl space-y-4 px-4 pt-6 lg:px-8"
+        >
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <Disc3 className="h-5 w-5 text-amber-400" />
+              <h2 className="text-lg font-semibold text-zinc-100">
+                专辑曲目
+                <span className="ml-2 text-xs font-normal text-zinc-500">
+                  ({albumTracks.length} 首)
+                </span>
+              </h2>
+            </div>
+            {albumTracks.length > 0 && (
+              <button
+                type="button"
+                onClick={() => playQueue(albumTracks, 0)}
+                className="inline-flex items-center gap-1.5 rounded-xl border border-amber-500/35 bg-amber-500/15 px-3.5 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/25"
+              >
+                <Play className="h-3.5 w-3.5 fill-current" />
+                <span>顺序播放全部</span>
+              </button>
+            )}
+          </div>
+
+          {albumTracksLoading ? (
+            <div className="flex h-36 items-center justify-center">
+              <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
+            </div>
+          ) : albumTracks.length === 0 ? (
+            <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-12 text-center text-sm text-zinc-500">
+              当前专辑暂无音轨
+            </div>
+          ) : (
+            <div className="overflow-hidden rounded-2xl border border-white/8 bg-white/[0.02]">
+              <table className="w-full text-left text-sm">
+                <thead className="border-b border-white/8 text-[11px] uppercase tracking-wider text-zinc-500">
+                  <tr>
+                    <th className="w-14 px-4 py-3 text-center">#</th>
+                    <th className="px-3 py-3">曲目</th>
+                    <th className="hidden px-3 py-3 sm:table-cell">艺术家</th>
+                    <th className="w-24 px-4 py-3 text-right">时长</th>
+                    <th className="w-20 px-4 py-3 text-right">操作</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-white/5">
+                  {albumTracks.map((track, idx) => {
+                    const isActive = currentTrack?.Id === track.Id
+                    const artistLabel =
+                      track.Artists?.join(' / ') || track.AlbumArtist || item.AlbumArtist || '未知艺术家'
+                    return (
+                      <tr
+                        key={track.Id}
+                        onClick={() => {
+                          if (isActive) {
+                            toggleAudioPlay()
+                          } else {
+                            playQueue(albumTracks, idx)
+                          }
+                        }}
+                        className={`group cursor-pointer transition-colors ${
+                          isActive
+                            ? 'bg-amber-500/12 text-amber-300'
+                            : 'text-zinc-200 hover:bg-white/[0.04]'
+                        }`}
+                      >
+                        <td className="px-4 py-3 text-center text-xs tabular-nums text-zinc-500">
+                          {isActive ? (
+                            <span className="inline-flex items-center justify-center text-amber-400">
+                              <Music className="h-3.5 w-3.5 animate-pulse" />
+                            </span>
+                          ) : (
+                            track.IndexNumber ?? idx + 1
+                          )}
+                        </td>
+                        <td className="px-3 py-3">
+                          <div className="flex items-center gap-2">
+                            <span className="font-medium">{track.Name}</span>
+                            {isActive && (
+                              <span className="rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-300">
+                                {isAudioPlaying ? '正在播放' : '已暂停'}
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="hidden px-3 py-3 text-xs text-zinc-400 sm:table-cell">
+                          {artistLabel}
+                        </td>
+                        <td className="px-4 py-3 text-right text-xs tabular-nums text-zinc-400">
+                          {track.RunTimeTicks
+                            ? formatAudioTime(track.RunTimeTicks / 10_000_000)
+                            : '--:--'}
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          <button
+                            type="button"
+                            aria-label={isActive && isAudioPlaying ? `暂停 ${track.Name}` : `播放 ${track.Name}`}
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              if (isActive) {
+                                toggleAudioPlay()
+                              } else {
+                                playQueue(albumTracks, idx)
+                              }
+                            }}
+                            className={`inline-flex h-8 w-8 items-center justify-center rounded-full transition-colors ${
+                              isActive
+                                ? 'bg-amber-500 text-zinc-950'
+                                : 'bg-white/[0.06] text-zinc-200 hover:bg-amber-500 hover:text-zinc-950'
+                            }`}
+                          >
+                            {isActive && isAudioPlaying ? (
+                              <Pause className="h-3.5 w-3.5 fill-current" />
+                            ) : (
+                              <Play className="ml-0.5 h-3.5 w-3.5 fill-current" />
+                            )}
+                          </button>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* 音乐人：专辑与热门曲目 */}
+      {isMusicArtist && (
+        <section className="mx-auto max-w-7xl space-y-8 px-4 pt-6 lg:px-8">
+          <div className="space-y-4">
+            <h2 className="text-lg font-semibold text-zinc-100">
+              专辑
+              <span className="ml-2 text-xs font-normal text-zinc-500">
+                ({artistAlbums.length})
+              </span>
+            </h2>
+            {artistAlbumsLoading ? (
+              <div className="flex h-32 items-center justify-center">
+                <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
+              </div>
+            ) : artistAlbums.length === 0 ? (
+              <p className="text-sm text-zinc-500">暂无收录专辑</p>
+            ) : (
+              <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+                {artistAlbums.map((album) => (
+                  <MediaCard key={album.Id} item={album} />
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="space-y-4">
+            <h2 className="text-lg font-semibold text-zinc-100">
+              热门曲目
+              <span className="ml-2 text-xs font-normal text-zinc-500">
+                ({artistTracks.length})
+              </span>
+            </h2>
+            {artistTracksLoading ? (
+              <div className="flex h-32 items-center justify-center">
+                <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
+              </div>
+            ) : artistTracks.length === 0 ? (
+              <p className="text-sm text-zinc-500">暂无收录曲目</p>
+            ) : (
+              <div className="divide-y divide-white/5 overflow-hidden rounded-2xl border border-white/8 bg-white/[0.02]">
+                {artistTracks.map((track, idx) => {
+                  const isActive = currentTrack?.Id === track.Id
+                  return (
+                    <div
+                      key={track.Id}
+                      onClick={() =>
+                        isActive ? toggleAudioPlay() : playQueue(artistTracks, idx)
+                      }
+                      className={`flex cursor-pointer items-center justify-between gap-4 px-4 py-3 transition-colors ${
+                        isActive
+                          ? 'bg-amber-500/12 text-amber-300'
+                          : 'text-zinc-200 hover:bg-white/[0.04]'
+                      }`}
+                    >
+                      <div className="flex min-w-0 items-center gap-3">
+                        <span className="w-6 text-center text-xs text-zinc-500">{idx + 1}</span>
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-medium">{track.Name}</p>
+                          {track.Album && (
+                            <p className="truncate text-xs text-zinc-500">{track.Album}</p>
+                          )}
+                        </div>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-3">
+                        <span className="text-xs tabular-nums text-zinc-400">
+                          {track.RunTimeTicks
+                            ? formatAudioTime(track.RunTimeTicks / 10_000_000)
+                            : '--:--'}
+                        </span>
+                        <button
+                          type="button"
+                          aria-label={isActive && isAudioPlaying ? `暂停 ${track.Name}` : `播放 ${track.Name}`}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            if (isActive) toggleAudioPlay()
+                            else playQueue(artistTracks, idx)
+                          }}
+                          className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-white/[0.06] text-zinc-200 hover:bg-amber-500 hover:text-zinc-950"
+                        >
+                          {isActive && isAudioPlaying ? (
+                            <Pause className="h-3.5 w-3.5 fill-current" />
+                          ) : (
+                            <Play className="ml-0.5 h-3.5 w-3.5 fill-current" />
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+
+      {/* 剧集：季 Tab、当前季信息与分集列表 */}
       {isSeries && seasons.length > 0 && (
         <section className="mx-auto max-w-7xl space-y-5 px-4 pt-6 lg:px-8">
           <div className="no-scrollbar -mx-1 flex items-center gap-2 overflow-x-auto border-b border-white/10 px-1 pb-4 pt-2">
@@ -627,6 +1185,69 @@ export function ItemDetailPage() {
             })}
           </div>
 
+          {/* 当前选中季的海报、简介与整季已看操作 */}
+          {selectedSeason && (
+            <div className="flex flex-col gap-4 rounded-2xl border border-white/8 bg-white/[0.025] p-4 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex items-start gap-4">
+                {(selectedSeason.ImageTags?.Primary || poster) && (
+                  <img
+                    src={
+                      selectedSeason.ImageTags?.Primary
+                        ? getImageUrl(selectedSeason.Id, 'Primary', {
+                            maxWidth: 200,
+                            tag: selectedSeason.ImageTags.Primary,
+                          })
+                        : poster!
+                    }
+                    alt={selectedSeason.Name}
+                    onError={(e) =>
+                      applyFallbackOrHide(
+                        e,
+                        selectedSeason.ImageTags?.Primary
+                          ? getFallbackImageUrl(selectedSeason.Id, 'Primary')
+                          : posterFallback,
+                      )
+                    }
+                    className="h-24 w-16 shrink-0 rounded-xl object-cover ring-1 ring-white/10"
+                  />
+                )}
+                <div className="min-w-0 space-y-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h2 className="text-base font-semibold text-white">{selectedSeason.Name}</h2>
+                    <span className="rounded-full bg-white/10 px-2 py-0.5 text-[11px] text-zinc-300">
+                      共 {episodes.length} 集 · 已看 {seasonPlayedCount} 集
+                    </span>
+                  </div>
+                  {selectedSeason.Overview && (
+                    <p className="line-clamp-2 max-w-2xl text-xs leading-relaxed text-zinc-400">
+                      {selectedSeason.Overview}
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              {episodes.length > 0 && (
+                <button
+                  type="button"
+                  disabled={seasonPlayedMutation.isPending}
+                  onClick={() => seasonPlayedMutation.mutate()}
+                  className={`inline-flex shrink-0 items-center gap-1.5 self-start rounded-xl border px-3.5 py-2 text-xs font-medium transition-colors sm:self-center disabled:opacity-50 ${
+                    seasonAllPlayed
+                      ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
+                      : 'border-white/12 bg-white/[0.04] text-zinc-200 hover:bg-white/10'
+                  }`}
+                >
+                  {seasonPlayedMutation.isPending ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <CheckCircle2 className="h-3.5 w-3.5" />
+                  )}
+                  <span>{seasonAllPlayed ? '标记本季未看' : '标记本季已看'}</span>
+                </button>
+              )}
+            </div>
+          )}
+
           {episodesLoading ? (
             <div className="flex h-36 items-center justify-center">
               <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
@@ -645,6 +1266,8 @@ export function ItemDetailPage() {
                   (ep.UserData?.PlaybackPositionTicks && ep.RunTimeTicks
                     ? Math.min(100, (ep.UserData.PlaybackPositionTicks / ep.RunTimeTicks) * 100)
                     : 0)
+                const epPlayed = Boolean(ep.UserData?.Played)
+                const epFav = Boolean(ep.UserData?.IsFavorite)
 
                 return (
                   <div
@@ -665,12 +1288,20 @@ export function ItemDetailPage() {
                           <Film className="h-6 w-6" />
                         </div>
                       )}
+                      {epPlayed && (
+                        <div
+                          title="已观看"
+                          className="absolute right-1.5 top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-emerald-500 text-zinc-950 shadow-md"
+                        >
+                          <Check className="h-3 w-3 stroke-[3]" />
+                        </div>
+                      )}
                       <div className="absolute inset-0 flex items-center justify-center bg-black/40 opacity-0 transition-opacity group-hover:opacity-100">
                         <div className="flex h-10 w-10 items-center justify-center rounded-full bg-amber-500 text-zinc-950">
                           <Play className="ml-0.5 h-4 w-4 fill-current" />
                         </div>
                       </div>
-                      {epProgress > 0 && (
+                      {epProgress > 0 && !epPlayed && (
                         <div className="absolute inset-x-0 bottom-0 h-1 bg-black/60">
                           <div
                             className="h-full bg-amber-400"
@@ -680,23 +1311,61 @@ export function ItemDetailPage() {
                       )}
                     </div>
 
-                    <div className="min-w-0 flex-1 py-0.5">
-                      <div className="flex items-center justify-between gap-2">
-                        <p className="truncate text-sm font-semibold text-zinc-100 group-hover:text-amber-300">
-                          {ep.IndexNumber != null ? `${ep.IndexNumber}. ` : ''}
-                          {ep.Name}
-                        </p>
-                        {ep.RunTimeTicks && (
-                          <span className="shrink-0 text-xs text-zinc-500">
-                            {formatTicks(ep.RunTimeTicks)}
-                          </span>
+                    <div className="flex min-w-0 flex-1 flex-col justify-between py-0.5">
+                      <div>
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="truncate text-sm font-semibold text-zinc-100 group-hover:text-amber-300">
+                            {ep.IndexNumber != null ? `${ep.IndexNumber}. ` : ''}
+                            {ep.Name}
+                          </p>
+                          {ep.RunTimeTicks && (
+                            <span className="shrink-0 text-xs text-zinc-500">
+                              {formatTicks(ep.RunTimeTicks)}
+                            </span>
+                          )}
+                        </div>
+                        {ep.Overview && (
+                          <p className="mt-1.5 line-clamp-2 text-xs leading-relaxed text-zinc-400">
+                            {ep.Overview}
+                          </p>
                         )}
                       </div>
-                      {ep.Overview && (
-                        <p className="mt-1.5 line-clamp-2 text-xs leading-relaxed text-zinc-400">
-                          {ep.Overview}
-                        </p>
-                      )}
+
+                      <div className="mt-2 flex items-center justify-end gap-1.5">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            episodePlayedMutation.mutate(ep)
+                          }}
+                          title={epPlayed ? '标记为未看' : '标记为已看'}
+                          aria-label={epPlayed ? `取消 ${ep.Name} 已看` : `标记 ${ep.Name} 已看`}
+                          className={`inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] transition-colors ${
+                            epPlayed
+                              ? 'bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
+                              : 'bg-white/[0.04] text-zinc-400 hover:bg-white/10 hover:text-zinc-200'
+                          }`}
+                        >
+                          <Check className="h-3 w-3" />
+                          <span>{epPlayed ? '已看' : '标已看'}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            episodeFavMutation.mutate(ep)
+                          }}
+                          title={epFav ? '取消收藏' : '收藏本集'}
+                          aria-label={epFav ? `取消收藏 ${ep.Name}` : `收藏 ${ep.Name}`}
+                          className={`rounded-lg p-1.5 transition-colors ${
+                            epFav
+                              ? 'bg-rose-500/15 text-rose-400 hover:bg-rose-500/25'
+                              : 'bg-white/[0.04] text-zinc-400 hover:bg-white/10 hover:text-rose-300'
+                          }`}
+                        >
+                          <Heart className={`h-3 w-3 ${epFav ? 'fill-current' : ''}`} />
+                        </button>
+                      </div>
                     </div>
                   </div>
                 )
@@ -709,9 +1378,41 @@ export function ItemDetailPage() {
       {/* 演职员列表 */}
       {item.People && item.People.length > 0 && (
         <section className="mx-auto max-w-7xl space-y-4 px-4 pt-10 lg:px-8">
-          <h2 className="text-lg font-semibold text-zinc-100">演职员</h2>
-          <div className="no-scrollbar -mx-1 flex gap-4 overflow-x-auto px-1 pb-4 pt-2">
-            {item.People.slice(0, 16).map((person) => {
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="text-lg font-semibold text-zinc-100">
+              演职员
+              <span className="ml-2 text-xs font-normal text-zinc-500">
+                ({item.People.length})
+              </span>
+            </h2>
+            {item.People.length > 16 && (
+              <button
+                type="button"
+                onClick={() => setShowAllCast((prev) => !prev)}
+                className="inline-flex items-center gap-1 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-amber-400/40 hover:bg-white/10 hover:text-amber-200"
+              >
+                {showAllCast ? (
+                  <>
+                    <span>收起演职员</span>
+                    <ChevronUp className="h-3.5 w-3.5" />
+                  </>
+                ) : (
+                  <>
+                    <span>展开全部演职员 ({item.People.length})</span>
+                    <ChevronDown className="h-3.5 w-3.5" />
+                  </>
+                )}
+              </button>
+            )}
+          </div>
+          <div
+            className={
+              showAllCast
+                ? 'grid grid-cols-3 gap-4 sm:grid-cols-5 md:grid-cols-6 lg:grid-cols-8'
+                : 'no-scrollbar -mx-1 flex gap-4 overflow-x-auto px-1 pb-4 pt-2'
+            }
+          >
+            {(showAllCast ? item.People : item.People.slice(0, 16)).map((person) => {
               const avatar = person.PrimaryImageTag
                 ? getImageUrl(person.Id, 'Primary', {
                     maxWidth: 200,
@@ -750,6 +1451,117 @@ export function ItemDetailPage() {
           </div>
         </section>
       )}
+
+      {/* 相似推荐横向书架 */}
+      {similarItems.length > 0 && (
+        <section className="mx-auto max-w-7xl space-y-4 px-4 pt-10 lg:px-8">
+          <h2 className="text-lg font-semibold text-zinc-100">相似推荐</h2>
+          <div className="no-scrollbar -mx-1 flex gap-4 overflow-x-auto px-1 pb-4 pt-1">
+            {similarItems.map((sim) => (
+              <div key={sim.Id} className="w-36 shrink-0 sm:w-40 md:w-44">
+                <MediaCard item={sim} />
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* 加入合集 / 播放列表弹窗 */}
+      <AdminModal
+        open={addToColOpen}
+        title="加入合集 / 播放列表"
+        subtitle={`将「${item.Name}」添加到已有合集或新建片单`}
+        maxWidthClass="max-w-md"
+        onClose={() => setAddToColOpen(false)}
+      >
+        <div className="space-y-4">
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => setAddToColTab('BoxSet')}
+              className={`inline-flex flex-1 items-center justify-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-medium transition-colors ${
+                addToColTab === 'BoxSet'
+                  ? 'border-amber-400/50 bg-amber-500/15 text-amber-300'
+                  : 'border-white/10 bg-white/[0.03] text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              <Layers className="h-3.5 w-3.5" />
+              <span>合集 (BoxSet)</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setAddToColTab('Playlist')}
+              className={`inline-flex flex-1 items-center justify-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-medium transition-colors ${
+                addToColTab === 'Playlist'
+                  ? 'border-amber-400/50 bg-amber-500/15 text-amber-300'
+                  : 'border-white/10 bg-white/[0.03] text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              <ListVideo className="h-3.5 w-3.5" />
+              <span>播放列表</span>
+            </button>
+          </div>
+
+          <div className="max-h-56 space-y-1.5 overflow-y-auto">
+            {(addToColTab === 'BoxSet'
+              ? boxSetsForModal?.Items || []
+              : playlistsForModal?.Items || []
+            ).length === 0 ? (
+              <p className="rounded-xl border border-dashed border-white/10 py-6 text-center text-xs text-zinc-500">
+                暂无{addToColTab === 'BoxSet' ? '合集' : '播放列表'}，可在下方直接新建
+              </p>
+            ) : (
+              (addToColTab === 'BoxSet'
+                ? boxSetsForModal?.Items || []
+                : playlistsForModal?.Items || []
+              ).map((target) => (
+                <button
+                  key={target.Id}
+                  type="button"
+                  disabled={addToContainerMutation.isPending}
+                  onClick={() =>
+                    addToContainerMutation.mutate({
+                      id: target.Id,
+                      name: target.Name,
+                      type: addToColTab,
+                    })
+                  }
+                  className="flex w-full items-center justify-between rounded-xl border border-white/8 bg-white/[0.03] px-3.5 py-2.5 text-left text-xs text-zinc-200 transition-colors hover:border-amber-400/40 hover:bg-white/10"
+                >
+                  <span className="truncate font-medium">{target.Name}</span>
+                  <span className="shrink-0 text-[11px] text-amber-400">加入</span>
+                </button>
+              ))
+            )}
+          </div>
+
+          <form
+            onSubmit={(e) => {
+              e.preventDefault()
+              createAndAddMutation.mutate()
+            }}
+            className="flex items-center gap-2 border-t border-white/10 pt-3"
+          >
+            <input
+              type="text"
+              value={newColName}
+              onChange={(e) => setNewColName(e.target.value)}
+              placeholder={
+                addToColTab === 'BoxSet' ? '输入新合集名称并加入...' : '输入新播放列表名称并加入...'
+              }
+              className="flex-1 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2 text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
+            />
+            <button
+              type="submit"
+              disabled={createAndAddMutation.isPending || !newColName.trim()}
+              className="inline-flex items-center gap-1 rounded-xl bg-amber-500 px-3 py-2 text-xs font-semibold text-zinc-950 hover:bg-amber-400 disabled:opacity-50"
+            >
+              <Plus className="h-3.5 w-3.5" />
+              <span>新建并加入</span>
+            </button>
+          </form>
+        </div>
+      </AdminModal>
 
       {/* 管理员弹窗组 */}
       {isAdmin && (

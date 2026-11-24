@@ -22,11 +22,13 @@ import {
   X,
 } from 'lucide-react'
 import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
-import { api } from '../api/client'
+import { api, getUserImageUrl } from '../api/client'
 import type { BaseItemDto } from '../api/types'
+import { useAudioPlayer } from '../context/AudioPlayerContext'
 import { useAuth } from '../context/AuthContext'
 import { isDemoMode } from '../demo/demoMode'
 import { AmbraLogo } from './AmbraLogo'
+import { AudioPlayerBar } from './AudioPlayerBar'
 import { ScanProgressBar } from './ScanProgressBar'
 import { SearchModal } from './SearchModal'
 
@@ -39,15 +41,22 @@ function libraryIcon(view: BaseItemDto) {
 }
 
 export function Layout() {
-  const { auth, isAdmin, logout, switchDemoRole } = useAuth()
+  const { auth, user, isAdmin, logout, switchDemoRole } = useAuth()
+  const { currentTrack } = useAudioPlayer()
   const queryClient = useQueryClient()
   const navigate = useNavigate()
   const location = useLocation()
+  const outletKey = location.pathname.startsWith('/admin') ? '/admin' : location.pathname
   const [collapsed, setCollapsed] = useState(false)
   const [mobileOpen, setMobileOpen] = useState(false)
   const [searchOpen, setSearchOpen] = useState(false)
   const [switchingRole, setSwitchingRole] = useState(false)
+  const [avatarFailed, setAvatarFailed] = useState(false)
   const demoActive = isDemoMode()
+
+  useEffect(() => {
+    setAvatarFailed(false)
+  }, [user?.PrimaryImageTag, auth?.userId])
 
   const handleToggleDemoRole = async () => {
     setSwitchingRole(true)
@@ -202,9 +211,22 @@ export function Layout() {
       {/* 用户信息与退出 */}
       <div className="border-t border-white/8 p-3">
         <div className="flex items-center justify-between gap-2 rounded-xl bg-white/[0.03] px-2.5 py-2">
-          <div className="flex min-w-0 items-center gap-2.5">
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-amber-500/30 to-orange-500/20 text-xs font-bold text-amber-300 ring-1 ring-amber-400/30">
-              {(auth?.userName || 'U').slice(0, 1).toUpperCase()}
+          <Link
+            to="/profile"
+            title="个人中心"
+            className="flex min-w-0 flex-1 items-center gap-2.5 rounded-lg transition-colors hover:text-amber-300"
+          >
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded-full bg-gradient-to-br from-amber-500/30 to-orange-500/20 text-xs font-bold text-amber-300 ring-1 ring-amber-400/30">
+              {auth?.userId && user?.PrimaryImageTag && !avatarFailed ? (
+                <img
+                  src={getUserImageUrl(auth.userId, user.PrimaryImageTag)}
+                  alt={auth.userName}
+                  onError={() => setAvatarFailed(true)}
+                  className="h-full w-full object-cover"
+                />
+              ) : (
+                (auth?.userName || 'U').slice(0, 1).toUpperCase()
+              )}
             </div>
             {!collapsed && (
               <div className="min-w-0">
@@ -212,7 +234,7 @@ export function Layout() {
                 <p className="text-[11px] text-zinc-500">{isAdmin ? '管理员' : '普通成员'}</p>
               </div>
             )}
-          </div>
+          </Link>
           {!collapsed && (
             <button
               type="button"
@@ -325,13 +347,14 @@ export function Layout() {
           </div>
         </header>
 
-        <main className="flex-1 pb-16">
-          <div key={location.pathname} className="animate-page-enter">
+        <main className={`flex-1 ${currentTrack ? 'pb-32' : 'pb-16'}`}>
+          <div key={outletKey} className="animate-page-enter">
             <Outlet />
           </div>
         </main>
       </div>
 
+      <AudioPlayerBar />
       <SearchModal open={searchOpen} onClose={() => setSearchOpen(false)} />
     </div>
   )

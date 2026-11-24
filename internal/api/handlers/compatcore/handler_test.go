@@ -598,7 +598,9 @@ func TestHomeSectionsAndUserQueriesAndEdgeCases(t *testing.T) {
 
 func TestNilDepsFallback(t *testing.T) {
 	h := New(nil, nil, nil, nil, nil, nil)
-	r := h.BuildRouter(AuthFuncs{})
+	r := h.BuildRouter(AuthFuncs{
+		UserIDFromCtx: func(context.Context) string { return "u1" },
+	})
 
 	// Exercise in-memory KV fallback and nil repo safe branches
 	rec := doReq(t, r, "POST", "/UserSettings/u1", `{"a":1}`)

@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -215,7 +216,7 @@ func (s *Scanner) scanLibrary(ctx context.Context, libraryID string, asyncPhaseB
 	}
 
 	if !walkHadError && len(lib.Paths) > 0 && scanCtx.Err() == nil {
-		s.pruneDeletedLibraryItems(scanCtx, lib.ID, discovered, &stats)
+		s.pruneDeletedLibraryItems(scanCtx, lib, discovered, &stats)
 	}
 
 	s.publishLibraryChanged(scanCtx, lib.ID, stats, "discovery")
@@ -241,20 +242,62 @@ func (s *Scanner) scanLibrary(ctx context.Context, libraryID string, asyncPhaseB
 	return stats, nil
 }
 
-func (s *Scanner) pruneDeletedLibraryItems(ctx context.Context, libraryID string, discovered map[string]struct{}, stats *ScanStats) {
-	existingPaths, err := s.repo.ListLibraryItemPaths(ctx, libraryID)
-	if err != nil {
+func (s *Scanner) pruneDeletedLibraryItems(ctx context.Context, lib *sqlite.LibraryRecord, discovered map[string]struct{}, stats *ScanStats) {
+	if lib == nil {
 		return
 	}
+	existingPaths, err := s.repo.ListLibraryItemPaths(ctx, lib.ID)
+	if err != nil || len(existingPaths) == 0 {
+		return
+	}
+
+	// Circuit breaker for unmounted NAS / empty mount points:
+	// If a library root has existing DB items but os.ReadDir(root) returns 0 entries (or fails),
+	// skip pruning items under that root so a transient storage disconnect never wipes the DB.
+	skipRoots := make([]string, 0)
+	for _, r := range lib.Paths {
+		cr := filepath.Clean(strings.TrimSpace(r))
+		if cr == "" || cr == "." {
+			continue
+		}
+		hasDBItemsUnderRoot := false
+		for p := range existingPaths {
+			cp := filepath.Clean(p)
+			if cp == cr || strings.HasPrefix(cp, cr+string(filepath.Separator)) {
+				hasDBItemsUnderRoot = true
+				break
+			}
+		}
+		if !hasDBItemsUnderRoot {
+			continue
+		}
+		entries, readErr := os.ReadDir(cr)
+		if readErr != nil || len(entries) == 0 {
+			slog.Warn("skipping prune for empty library root (possible unmounted storage)", "library_id", lib.ID, "root", cr)
+			skipRoots = append(skipRoots, cr)
+		}
+	}
+
 	for p := range existingPaths {
 		if ctx.Err() != nil {
 			return
 		}
-		if _, ok := discovered[filepath.Clean(p)]; ok {
+		cp := filepath.Clean(p)
+		if _, ok := discovered[cp]; ok {
+			continue
+		}
+		skipped := false
+		for _, sr := range skipRoots {
+			if cp == sr || strings.HasPrefix(cp, sr+string(filepath.Separator)) {
+				skipped = true
+				break
+			}
+		}
+		if skipped {
 			continue
 		}
 		if _, statErr := os.Stat(p); os.IsNotExist(statErr) {
-			if deleted, delErr := s.repo.DeleteItemByPath(ctx, libraryID, p); delErr == nil && deleted {
+			if deleted, delErr := s.repo.DeleteItemByPath(ctx, lib.ID, p); delErr == nil && deleted {
 				stats.ItemsDeleted++
 			}
 		}
@@ -297,15 +340,17 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 	forceTV := strings.EqualFold(lib.CollectionType, "tvshows")
 	seriesCache := make(map[string]*sqlite.ItemRecord)
 	seasonCache := make(map[string]*sqlite.ItemRecord)
+	artistCache := make(map[string]*sqlite.ItemRecord)
+	albumCache := make(map[string]*sqlite.ItemRecord)
 	seenSeriesEnrich := make(map[string]struct{})
 
 	var tasks []enrichTask
 	if !info.IsDir() {
-		if !strings.HasPrefix(filepath.Base(cleanTarget), ".") && (IsVideoFile(cleanTarget) || IsStrmFile(cleanTarget)) {
+		if !strings.HasPrefix(filepath.Base(cleanTarget), ".") && (IsVideoFile(cleanTarget) || IsStrmFile(cleanTarget) || IsAudioFile(cleanTarget)) {
 			if err := s.waitIfPaused(ctx); err != nil {
 				return stats, err
 			}
-			itemTasks := s.processDiscoveredFile(ctx, lib, root, cleanTarget, forceTV, seriesCache, seasonCache, seenSeriesEnrich, &stats)
+			itemTasks := s.processDiscoveredFile(ctx, lib, root, cleanTarget, forceTV, seriesCache, seasonCache, artistCache, albumCache, seenSeriesEnrich, &stats)
 			tasks = append(tasks, itemTasks...)
 		}
 	} else {
@@ -365,6 +410,8 @@ func (s *Scanner) runPhaseAWithRoot(ctx context.Context, lib *sqlite.LibraryReco
 	forceTV := strings.EqualFold(lib.CollectionType, "tvshows")
 	seriesCache := make(map[string]*sqlite.ItemRecord)
 	seasonCache := make(map[string]*sqlite.ItemRecord)
+	artistCache := make(map[string]*sqlite.ItemRecord)
+	albumCache := make(map[string]*sqlite.ItemRecord)
 	seenSeriesEnrich := make(map[string]struct{})
 	policy := s.currentSymlinkPolicy()
 
@@ -389,14 +436,14 @@ func (s *Scanner) runPhaseAWithRoot(ctx context.Context, lib *sqlite.LibraryReco
 		if strings.HasPrefix(name, ".") {
 			return nil
 		}
-		if !IsVideoFile(path) && !IsStrmFile(path) {
+		if !IsVideoFile(path) && !IsStrmFile(path) && !IsAudioFile(path) {
 			return nil
 		}
 
 		if discovered != nil {
 			discovered[filepath.Clean(path)] = struct{}{}
 		}
-		itemTasks := s.processDiscoveredFile(ctx, lib, logicalRoot, path, forceTV, seriesCache, seasonCache, seenSeriesEnrich, stats)
+		itemTasks := s.processDiscoveredFile(ctx, lib, logicalRoot, path, forceTV, seriesCache, seasonCache, artistCache, albumCache, seenSeriesEnrich, stats)
 		tasks = append(tasks, itemTasks...)
 		return nil
 	})
@@ -415,23 +462,31 @@ func (s *Scanner) processDiscoveredFile(
 	lib *sqlite.LibraryRecord,
 	root, path string,
 	forceTV bool,
-	seriesCache, seasonCache map[string]*sqlite.ItemRecord,
+	seriesCache, seasonCache, artistCache, albumCache map[string]*sqlite.ItemRecord,
 	seenSeriesEnrich map[string]struct{},
 	stats *ScanStats,
 ) []enrichTask {
-	epInfo := ParseEpisodePath(root, path, forceTV)
 	var (
 		changed bool
 		tasks   []enrichTask
 		err     error
 	)
-	if epInfo.IsEpisode {
-		changed, tasks, err = s.indexEpisode(ctx, lib, epInfo, path, seriesCache, seasonCache, seenSeriesEnrich)
-	} else {
+	if IsAudioFile(path) {
 		var task *enrichTask
-		changed, task, err = s.indexMovie(ctx, lib, path)
+		changed, task, err = s.indexAudio(ctx, lib, root, path, artistCache, albumCache)
 		if task != nil {
 			tasks = append(tasks, *task)
+		}
+	} else {
+		epInfo := ParseEpisodePath(root, path, forceTV)
+		if epInfo.IsEpisode {
+			changed, tasks, err = s.indexEpisode(ctx, lib, epInfo, path, seriesCache, seasonCache, seenSeriesEnrich)
+		} else {
+			var task *enrichTask
+			changed, task, err = s.indexMovie(ctx, lib, path)
+			if task != nil {
+				tasks = append(tasks, *task)
+			}
 		}
 	}
 	if err != nil {

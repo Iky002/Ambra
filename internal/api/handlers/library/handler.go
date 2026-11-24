@@ -130,6 +130,20 @@ func (h *Handler) resolveUserID(r *http.Request, q httpx.Query) string {
 	return ""
 }
 
+// allowedLibrariesForRequest always evaluates library permissions against the authenticated
+// caller from context (preventing spoofed UserId query/path bypasses). Only when no caller
+// is in context (e.g. unit tests without auth middleware) does it fall back to fallbackUserID.
+func (h *Handler) allowedLibrariesForRequest(r *http.Request, fallbackUserID string) []string {
+	uid := ""
+	if h.auth.UserIDFromCtx != nil {
+		uid = guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+	}
+	if uid == "" {
+		uid = guid.Normalize(fallbackUserID)
+	}
+	return h.allowedLibrariesForUser(r.Context(), uid)
+}
+
 // allowedLibrariesForUser returns nil if the user has unrestricted access to all libraries,
 // or a non-nil slice of normalized library IDs (possibly empty) if restricted.
 func (h *Handler) allowedLibrariesForUser(ctx context.Context, userID string) []string {
@@ -168,7 +182,7 @@ func isLibraryAllowed(libID string, allowed []string) bool {
 func (h *Handler) handleUserViews(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
-	allowed := h.allowedLibrariesForUser(r.Context(), userID)
+	allowed := h.allowedLibrariesForRequest(r, userID)
 
 	libs, err := h.repo.ListLibraries(r.Context())
 	if err != nil {
@@ -266,7 +280,7 @@ func (h *Handler) handleQueryItems(w http.ResponseWriter, r *http.Request) {
 		ServerID:               h.serverID(),
 		UserID:                 userID,
 		ParentID:               q.Get("ParentId"),
-		AllowedLibraryIDs:      h.allowedLibrariesForUser(r.Context(), userID),
+		AllowedLibraryIDs:      h.allowedLibrariesForRequest(r, userID),
 		Recursive:              rec,
 		IncludeItemTypes:       q.List("IncludeItemTypes"),
 		ExcludeItemTypes:       q.List("ExcludeItemTypes"),
@@ -303,7 +317,7 @@ func (h *Handler) handleQueryItems(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleLatestItems(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
-	allowed := h.allowedLibrariesForUser(r.Context(), userID)
+	allowed := h.allowedLibrariesForRequest(r, userID)
 	items, err := h.repo.GetLatestItemsWithAllowedLibraries(
 		r.Context(),
 		h.serverID(),
@@ -325,7 +339,8 @@ func (h *Handler) handleLatestItems(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleResumeItems(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
-	items, total, err := h.repo.GetResumeItems(
+	allowed := h.allowedLibrariesForRequest(r, userID)
+	items, total, err := h.repo.GetResumeItemsWithAllowedLibraries(
 		r.Context(),
 		h.serverID(),
 		userID,
@@ -334,6 +349,7 @@ func (h *Handler) handleResumeItems(w http.ResponseWriter, r *http.Request) {
 		q.Int("StartIndex", 0),
 		q.Int("Limit", 20),
 		q.List("Fields"),
+		allowed,
 	)
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -349,7 +365,7 @@ func (h *Handler) handleGetItem(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
 	itemID := r.PathValue("Id")
-	allowed := h.allowedLibrariesForUser(r.Context(), userID)
+	allowed := h.allowedLibrariesForRequest(r, userID)
 	item, err := h.repo.GetItemByID(r.Context(), h.serverID(), userID, itemID)
 	if errors.Is(err, sqlite.ErrNotFound) {
 		if lib, libErr := h.repo.GetLibrary(r.Context(), itemID); libErr == nil && lib != nil {
@@ -391,14 +407,24 @@ func (h *Handler) handleShowSeasons(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	seriesID := r.PathValue("Id")
 	userID := h.resolveUserID(r, q)
+	allowed := h.allowedLibrariesForRequest(r, userID)
+	if allowed != nil {
+		if rec, recErr := h.repo.GetItemRecordByID(r.Context(), seriesID); recErr == nil && rec != nil && rec.LibraryID != "" {
+			if !isLibraryAllowed(rec.LibraryID, allowed) {
+				httpx.Error(w, http.StatusForbidden, "access denied")
+				return
+			}
+		}
+	}
 	items, total, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
-		ServerID:         h.serverID(),
-		UserID:           userID,
-		SeriesID:         seriesID,
-		IncludeItemTypes: []string{"Season"},
-		SortBy:           []string{"IndexNumber"},
-		SortOrder:        "Ascending",
-		Fields:           q.List("Fields"),
+		ServerID:          h.serverID(),
+		UserID:            userID,
+		SeriesID:          seriesID,
+		AllowedLibraryIDs: allowed,
+		IncludeItemTypes:  []string{"Season"},
+		SortBy:            []string{"IndexNumber"},
+		SortOrder:         "Ascending",
+		Fields:            q.List("Fields"),
 	})
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -414,17 +440,27 @@ func (h *Handler) handleShowEpisodes(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	seriesID := r.PathValue("Id")
 	userID := h.resolveUserID(r, q)
+	allowed := h.allowedLibrariesForRequest(r, userID)
+	if allowed != nil {
+		if rec, recErr := h.repo.GetItemRecordByID(r.Context(), seriesID); recErr == nil && rec != nil && rec.LibraryID != "" {
+			if !isLibraryAllowed(rec.LibraryID, allowed) {
+				httpx.Error(w, http.StatusForbidden, "access denied")
+				return
+			}
+		}
+	}
 	items, total, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
-		ServerID:         h.serverID(),
-		UserID:           userID,
-		SeriesID:         seriesID,
-		SeasonID:         q.Get("SeasonId"),
-		IncludeItemTypes: []string{"Episode"},
-		SortBy:           []string{"IndexNumber"},
-		SortOrder:        "Ascending",
-		StartIndex:       q.Int("StartIndex", 0),
-		Limit:            q.Int("Limit", 0),
-		Fields:           q.List("Fields"),
+		ServerID:          h.serverID(),
+		UserID:            userID,
+		SeriesID:          seriesID,
+		SeasonID:          q.Get("SeasonId"),
+		AllowedLibraryIDs: allowed,
+		IncludeItemTypes:  []string{"Episode"},
+		SortBy:            []string{"IndexNumber"},
+		SortOrder:         "Ascending",
+		StartIndex:        q.Int("StartIndex", 0),
+		Limit:             q.Int("Limit", 0),
+		Fields:            q.List("Fields"),
 	})
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -439,13 +475,14 @@ func (h *Handler) handleShowEpisodes(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleNextUp(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
-	items, total, err := h.repo.GetNextUpEpisodes(
+	items, total, err := h.repo.GetNextUpEpisodesWithAllowedLibraries(
 		r.Context(),
 		h.serverID(),
 		userID,
 		q.Get("SeriesId"),
 		q.Int("Limit", 20),
 		q.List("Fields"),
+		h.allowedLibrariesForRequest(r, userID),
 	)
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -463,7 +500,7 @@ func (h *Handler) handleSearchHints(w http.ResponseWriter, r *http.Request) {
 	hints, total, err := h.repo.SearchHints(r.Context(), sqlite.SearchHintFilter{
 		UserID:            userID,
 		ParentID:          q.Get("ParentId"),
-		AllowedLibraryIDs: h.allowedLibrariesForUser(r.Context(), userID),
+		AllowedLibraryIDs: h.allowedLibrariesForRequest(r, userID),
 		SearchTerm:        q.Get("SearchTerm"),
 		IncludeItemTypes:  q.List("IncludeItemTypes"),
 		Limit:             q.Int("Limit", 24),
@@ -544,6 +581,9 @@ type virtualFolderDTO struct {
 }
 
 func (h *Handler) handleListVirtualFolders(w http.ResponseWriter, r *http.Request) {
+	q := httpx.ParseQuery(r)
+	userID := h.resolveUserID(r, q)
+	allowed := h.allowedLibrariesForRequest(r, userID)
 	libs, err := h.repo.ListLibraries(r.Context())
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -551,6 +591,9 @@ func (h *Handler) handleListVirtualFolders(w http.ResponseWriter, r *http.Reques
 	}
 	out := make([]virtualFolderDTO, 0, len(libs))
 	for _, lib := range libs {
+		if !isLibraryAllowed(lib.ID, allowed) {
+			continue
+		}
 		out = append(out, virtualFolderDTO{
 			Name:           lib.Name,
 			Locations:      lib.Paths,

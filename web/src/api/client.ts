@@ -1,6 +1,7 @@
 import { isDemoMode } from '../demo/demoMode'
 import {
   demoFetch,
+  getDemoAudioUrl,
   getDemoFallbackImageUrl,
   getDemoImageUrl,
   getDemoUserImageUrl,
@@ -8,6 +9,7 @@ import {
 import type {
   ActivityLogEntry,
   ApiKeyInfo,
+  AudioLyricsResponse,
   AuthSession,
   AuthenticationResult,
   BaseItemDto,
@@ -219,6 +221,22 @@ export function getBackdropUrl(item: BaseItemDto, maxWidth = 1920): string | nul
   return null
 }
 
+export function getAudioStreamUrl(itemId: string): string {
+  if (!itemId) return ''
+  if (isDemoMode()) {
+    return getDemoAudioUrl(itemId)
+  }
+  const auth = getStoredAuth()
+  const params = new URLSearchParams({
+    Container: 'mp3,flac,aac,m4a,ogg,opus,wav',
+    AudioCodec: 'aac,mp3,flac,opus,vorbis',
+    MaxStreamingBitrate: '140000000',
+  })
+  if (auth?.userId) params.set('UserId', auth.userId)
+  if (auth?.accessToken) params.set('api_key', auth.accessToken)
+  return `/emby/Audio/${encodeURIComponent(itemId)}/universal?${params.toString()}`
+}
+
 // ==================== API Endpoints ====================
 
 export const api = {
@@ -241,6 +259,11 @@ export const api = {
       },
       false,
     ),
+
+  logout: () =>
+    embyFetch<void>('/emby/Sessions/Logout', {
+      method: 'POST',
+    }),
 
   getUserViews: (userId: string) =>
     embyFetch<QueryResult<BaseItemDto>>(`/emby/Users/${encodeURIComponent(userId)}/Views`),
@@ -281,6 +304,7 @@ export const api = {
       sortOrder?: 'Ascending' | 'Descending'
       filters?: string
       genres?: string
+      years?: string
       tags?: string
       personIds?: string
       person?: string
@@ -298,6 +322,7 @@ export const api = {
     if (params.sortOrder) q.set('SortOrder', params.sortOrder)
     if (params.filters) q.set('Filters', params.filters)
     if (params.genres) q.set('Genres', params.genres)
+    if (params.years) q.set('Years', params.years)
     if (params.tags) q.set('Tags', params.tags)
     if (params.personIds) q.set('PersonIds', params.personIds)
     if (params.person) q.set('Person', params.person)
@@ -322,6 +347,169 @@ export const api = {
     const qs = q.toString()
     return embyFetch<QueryResult<NameIdPair>>(`/emby/Tags${qs ? `?${qs}` : ''}`)
   },
+
+  getGenres: (params?: { userId?: string; parentId?: string }) => {
+    const q = new URLSearchParams()
+    if (params?.userId) q.set('UserId', params.userId)
+    if (params?.parentId) q.set('ParentId', params.parentId)
+    const qs = q.toString()
+    return embyFetch<QueryResult<NameIdPair>>(`/emby/Genres${qs ? `?${qs}` : ''}`)
+  },
+
+  getYears: (params?: { userId?: string; parentId?: string }) => {
+    const q = new URLSearchParams()
+    if (params?.userId) q.set('UserId', params.userId)
+    if (params?.parentId) q.set('ParentId', params.parentId)
+    const qs = q.toString()
+    return embyFetch<QueryResult<NameIdPair>>(`/emby/Years${qs ? `?${qs}` : ''}`)
+  },
+
+  getNextUp: (
+    userId: string,
+    options?: { seriesId?: string; limit?: number; parentId?: string },
+  ) => {
+    const q = new URLSearchParams({
+      UserId: userId,
+      Limit: String(options?.limit ?? 12),
+      Fields: 'Overview,PrimaryImageAspectRatio,MediaSources,UserData',
+    })
+    if (options?.seriesId) q.set('SeriesId', options.seriesId)
+    if (options?.parentId) q.set('ParentId', options.parentId)
+    return embyFetch<QueryResult<BaseItemDto>>(`/emby/Shows/NextUp?${q.toString()}`)
+  },
+
+  getSimilarItems: (itemId: string, userId: string, limit = 12) => {
+    const q = new URLSearchParams({
+      UserId: userId,
+      Limit: String(limit),
+      Fields: 'PrimaryImageAspectRatio,Overview,Genres,CommunityRating,ProductionYear',
+    })
+    return embyFetch<QueryResult<BaseItemDto>>(
+      `/emby/Items/${encodeURIComponent(itemId)}/Similar?${q.toString()}`,
+    )
+  },
+
+  getDownloadUrl: (itemId: string) =>
+    resolveApiUrl(`/emby/Items/${encodeURIComponent(itemId)}/Download`),
+
+  getAudioLyrics: (itemId: string) =>
+    embyFetch<AudioLyricsResponse | string>(
+      `/emby/Audio/${encodeURIComponent(itemId)}/Lyrics`,
+    ),
+
+  // ==================== Collections & Playlists CRUD ====================
+
+  createCollection: (name: string, ids: string[] = []) => {
+    const q = new URLSearchParams({ Name: name })
+    if (ids.length > 0) q.set('Ids', ids.join(','))
+    return embyFetch<{ Id: string; Name: string }>(`/emby/Collections?${q.toString()}`, {
+      method: 'POST',
+      body: JSON.stringify({ Name: name, Ids: ids }),
+    })
+  },
+
+  deleteCollection: (collectionId: string) =>
+    embyFetch<void>(`/emby/Collections/${encodeURIComponent(collectionId)}`, {
+      method: 'DELETE',
+    }),
+
+  getCollectionItems: (collectionId: string, userId?: string) => {
+    const q = new URLSearchParams({
+      Fields: 'PrimaryImageAspectRatio,Overview,Genres,CommunityRating,ProductionYear,UserData',
+    })
+    if (userId) q.set('UserId', userId)
+    return embyFetch<QueryResult<BaseItemDto>>(
+      `/emby/Collections/${encodeURIComponent(collectionId)}/Items?${q.toString()}`,
+    )
+  },
+
+  addCollectionItems: (collectionId: string, itemIds: string[]) => {
+    const q = new URLSearchParams({ Ids: itemIds.join(',') })
+    return embyFetch<void>(
+      `/emby/Collections/${encodeURIComponent(collectionId)}/Items?${q.toString()}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ Ids: itemIds }),
+      },
+    )
+  },
+
+  removeCollectionItems: (collectionId: string, itemIds: string[]) => {
+    const q = new URLSearchParams({ Ids: itemIds.join(',') })
+    return embyFetch<void>(
+      `/emby/Collections/${encodeURIComponent(collectionId)}/Items?${q.toString()}`,
+      {
+        method: 'DELETE',
+      },
+    )
+  },
+
+  createPlaylist: (name: string, userId: string, ids: string[] = [], mediaType = 'Video') =>
+    embyFetch<{ Id: string; Name: string }>('/emby/Playlists', {
+      method: 'POST',
+      body: JSON.stringify({
+        Name: name,
+        UserId: userId,
+        Ids: ids,
+        MediaType: mediaType,
+      }),
+    }),
+
+  deletePlaylist: (playlistId: string) =>
+    embyFetch<void>(`/emby/Playlists/${encodeURIComponent(playlistId)}`, {
+      method: 'DELETE',
+    }),
+
+  getPlaylistItems: (playlistId: string, userId?: string) => {
+    const q = new URLSearchParams({
+      Fields: 'PrimaryImageAspectRatio,Overview,Genres,CommunityRating,ProductionYear,UserData',
+    })
+    if (userId) q.set('UserId', userId)
+    return embyFetch<QueryResult<BaseItemDto>>(
+      `/emby/Playlists/${encodeURIComponent(playlistId)}/Items?${q.toString()}`,
+    )
+  },
+
+  addPlaylistItems: (playlistId: string, itemIds: string[], userId?: string) => {
+    const q = new URLSearchParams({ Ids: itemIds.join(',') })
+    if (userId) q.set('UserId', userId)
+    return embyFetch<void>(
+      `/emby/Playlists/${encodeURIComponent(playlistId)}/Items?${q.toString()}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ Ids: itemIds }),
+      },
+    )
+  },
+
+  removePlaylistItems: (playlistId: string, itemIds: string[]) => {
+    const q = new URLSearchParams({
+      EntryIds: itemIds.join(','),
+      Ids: itemIds.join(','),
+    })
+    return embyFetch<void>(
+      `/emby/Playlists/${encodeURIComponent(playlistId)}/Items?${q.toString()}`,
+      {
+        method: 'DELETE',
+      },
+    )
+  },
+
+  uploadUserImage: (userId: string, base64: string, contentType: string) => {
+    const cleanBase64 = base64.replace(/^data:[^;]+;base64,/, '')
+    return embyFetch<void>(`/emby/Users/${encodeURIComponent(userId)}/Images/Primary`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': contentType || 'image/jpeg',
+      },
+      body: cleanBase64,
+    })
+  },
+
+  deleteUserImage: (userId: string) =>
+    embyFetch<void>(`/emby/Users/${encodeURIComponent(userId)}/Images/Primary`, {
+      method: 'DELETE',
+    }),
 
   getItem: (userId: string, itemId: string) =>
     embyFetch<BaseItemDto>(
@@ -701,13 +889,17 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
-  refreshItemMetadata: (itemId: string, replaceAllMetadata = false) => {
+  refreshItemMetadata: (
+    itemId: string,
+    replaceAllMetadata = false,
+    replaceAllImages = false,
+  ) => {
     const q = new URLSearchParams({
       Recursive: 'true',
       MetadataRefreshMode: replaceAllMetadata ? 'FullRefresh' : 'Default',
-      ImageRefreshMode: replaceAllMetadata ? 'FullRefresh' : 'Default',
+      ImageRefreshMode: replaceAllImages ? 'FullRefresh' : 'Default',
       ReplaceAllMetadata: String(replaceAllMetadata),
-      ReplaceAllImages: 'false',
+      ReplaceAllImages: String(replaceAllImages),
     })
     return embyFetch<void>(
       `/emby/Items/${encodeURIComponent(itemId)}/Refresh?${q.toString()}`,

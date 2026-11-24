@@ -201,6 +201,12 @@ export interface BaseItemDto {
   SeriesId?: string
   SeasonId?: string
   SeasonName?: string
+  Album?: string
+  AlbumId?: string
+  AlbumArtist?: string
+  AlbumPrimaryImageTag?: string
+  Artists?: string[]
+  ArtistItems?: NameIdPair[]
   Studios?: NameIdPair[]
   People?: BaseItemPerson[]
   UserData?: UserItemDataDto
@@ -220,6 +226,22 @@ export interface MediaAttachmentInfo {
   FileName: string
   MimeType: string
   Url: string
+}
+
+export interface LyricLine {
+  Start?: number
+  Text: string
+}
+
+export interface AudioLyricsResponse {
+  Metadata?: {
+    Artist?: string
+    Album?: string
+    Title?: string
+    IsSynced?: boolean
+  }
+  Lyrics?: LyricLine[]
+  RawLrc?: string
 }
 
 export interface PlaybackInfoResponse {

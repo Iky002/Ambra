@@ -16,6 +16,7 @@ import (
 	"github.com/ambra-media/ambra/internal/core/imaging"
 	"github.com/ambra-media/ambra/internal/core/scanner"
 	"github.com/ambra-media/ambra/internal/core/transcode"
+	"github.com/ambra-media/ambra/internal/core/watcher"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
@@ -31,15 +32,17 @@ type AuthFuncs struct {
 // Handler implements the remaining Emby 4.10.2.0 media, item, metadata, image,
 // encoding, library, taxonomy, audio, and video compatibility endpoints.
 type Handler struct {
-	repo       *sqlite.LibraryRepo
-	scanner    *scanner.Scanner
-	imaging    *imaging.Service
-	registry   *plugins.Registry
-	store      *sqlite.Store
-	cfg        *config.Config
-	extractor  *transcode.Extractor
-	httpClient *http.Client
-	auth       AuthFuncs
+	repo         *sqlite.LibraryRepo
+	scanner      *scanner.Scanner
+	watcher      *watcher.Watcher
+	imaging      *imaging.Service
+	registry     *plugins.Registry
+	store        *sqlite.Store
+	cfg          *config.Config
+	extractor    *transcode.Extractor
+	transcodeMgr *transcode.Manager
+	httpClient   *http.Client
+	auth         AuthFuncs
 }
 
 // New creates a new compatmedia Handler.
@@ -62,9 +65,19 @@ func New(
 	}
 }
 
+// SetWatcher attaches a filesystem Watcher so library path edits and deletions dynamically update watches.
+func (h *Handler) SetWatcher(w *watcher.Watcher) {
+	h.watcher = w
+}
+
 // SetExtractor overrides the embedded subtitle & font extractor used by compatmedia endpoints.
 func (h *Handler) SetExtractor(ext *transcode.Extractor) {
 	h.extractor = ext
+}
+
+// SetTranscodeManager attaches a transcode Manager so ActiveEncodings/Delete stops active sessions.
+func (h *Handler) SetTranscodeManager(mgr *transcode.Manager) {
+	h.transcodeMgr = mgr
 }
 
 // SetHTTPClient overrides the HTTP client used for remote image downloading and proxying.
@@ -76,7 +89,7 @@ func (h *Handler) getHTTPClient() *http.Client {
 	if h.httpClient != nil {
 		return h.httpClient
 	}
-	return &http.Client{Timeout: 15 * time.Second}
+	return newSafeRemoteHTTPClient()
 }
 
 // BuildRouter builds an isolated chi.Router containing all 21 media-domain route prefixes

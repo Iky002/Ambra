@@ -31,6 +31,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       } catch {
         // 忽略存储异常
       }
+    } else if (getStoredAuth()?.accessToken) {
+      // 通知后端注销当前会话（fire-and-forget，忽略网络异常）
+      void api.logout().catch(() => undefined)
     }
     clearAuth()
     setAuth(null)

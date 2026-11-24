@@ -23,6 +23,7 @@ import type {
   UserPolicy,
   VirtualFolderInfo,
 } from '../api/types'
+import { makeDemoAudioDataUrl } from './demoMedia'
 import { createInitialDemoState, DEMO_SERVER_ID, type DemoState } from './mockData'
 import { makeAvatarDataUrl, makeLibraryThumbDataUrl, makePosterDataUrl } from './svgArt'
 
@@ -183,6 +184,10 @@ export function getDemoFallbackImageUrl(
   return getDemoImageUrl(itemId, type)
 }
 
+export function getDemoAudioUrl(_itemId: string): string {
+  return makeDemoAudioDataUrl()
+}
+
 export function getDemoUserImageUrl(userId: string): string {
   const existing = store.userAvatarById.get(userId)
   if (existing) return existing
@@ -297,6 +302,17 @@ function sortItems(items: BaseItemDto[], sortBy: string, sortOrder: string): Bas
     let cmp = 0
     if (primary === 'SortName' || primary === 'Name') {
       cmp = (a.SortName || a.Name).localeCompare(b.SortName || b.Name, 'zh-Hans-CN')
+    } else if (primary === 'ParentIndexNumber' || primary === 'IndexNumber') {
+      const discDiff = (a.ParentIndexNumber || 0) - (b.ParentIndexNumber || 0)
+      if (discDiff !== 0) {
+        cmp = discDiff
+      } else {
+        const trackDiff = (a.IndexNumber || 0) - (b.IndexNumber || 0)
+        cmp =
+          trackDiff !== 0
+            ? trackDiff
+            : (a.SortName || a.Name).localeCompare(b.SortName || b.Name, 'zh-Hans-CN')
+      }
     } else if (primary === 'CommunityRating') {
       cmp = (a.CommunityRating || 0) - (b.CommunityRating || 0)
     } else if (primary === 'PremiereDate' || primary === 'ProductionYear') {
@@ -518,6 +534,10 @@ export async function demoFetch<T>(
     return result as T
   }
 
+  if (pathname === '/emby/Sessions/Logout' && method === 'POST') {
+    return undefined as T
+  }
+
   // ==================== 3. 用户与权限管理 ====================
   if (pathname === '/emby/Users' && method === 'GET') {
     return store.users.map((u) => ({ ...u.user, Policy: { ...u.user.Policy } })) as T
@@ -592,6 +612,31 @@ export async function demoFetch<T>(
     return undefined as T
   }
 
+  const userImageMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Images\/Primary(?:\/0)?$/)
+  if (userImageMatch) {
+    const userId = decodeURIComponent(userImageMatch[1])
+    const rec = store.users.find((u) => u.user.Id === userId)
+    if (!rec) throw new ApiError(404, '用户不存在')
+    if (method === 'POST') {
+      const headers = new Headers(options?.headers || {})
+      const contentType = headers.get('Content-Type') || 'image/jpeg'
+      const rawBody = typeof options?.body === 'string' ? options.body : ''
+      const dataUrl = rawBody.startsWith('data:')
+        ? rawBody
+        : `data:${contentType};base64,${rawBody}`
+      store.userAvatarById.set(userId, dataUrl)
+      rec.user.PrimaryImageTag = `avatar-${Date.now().toString(36)}`
+      pushActivity(`用户「${rec.user.Name}」更新了个人头像`, 'UserImageUpdated')
+      return undefined as T
+    }
+    if (method === 'DELETE') {
+      store.userAvatarById.delete(userId)
+      delete rec.user.PrimaryImageTag
+      pushActivity(`用户「${rec.user.Name}」移除了个人头像`, 'UserImageDeleted')
+      return undefined as T
+    }
+  }
+
   // ==================== 4. 媒体视图 / 首页 / 列表 / 详情 ====================
   const userViewsMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Views$/)
   if (userViewsMatch && method === 'GET') {
@@ -661,6 +706,46 @@ export async function demoFetch<T>(
     return { Items: items, TotalRecordCount: items.length } as T
   }
 
+  if ((pathname === '/emby/Genres' || pathname === '/Genres') && method === 'GET') {
+    const parentId = qs.get('ParentId') || ''
+    const pool =
+      parentId && store.libraryItems.has(parentId)
+        ? (store.libraryItems.get(parentId) || [])
+            .map((id) => store.items.get(id))
+            .filter((it): it is BaseItemDto => Boolean(it))
+        : Array.from(store.items.values())
+
+    const genreSet = new Set<string>()
+    for (const it of pool) {
+      for (const g of it.Genres || []) {
+        if (g) genreSet.add(g)
+      }
+    }
+    const items = Array.from(genreSet)
+      .sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))
+      .map((name) => ({ Name: name, Id: `genre-${name}` }))
+    return { Items: items, TotalRecordCount: items.length } as T
+  }
+
+  if ((pathname === '/emby/Years' || pathname === '/Years') && method === 'GET') {
+    const parentId = qs.get('ParentId') || ''
+    const pool =
+      parentId && store.libraryItems.has(parentId)
+        ? (store.libraryItems.get(parentId) || [])
+            .map((id) => store.items.get(id))
+            .filter((it): it is BaseItemDto => Boolean(it))
+        : Array.from(store.items.values())
+
+    const yearSet = new Set<number>()
+    for (const it of pool) {
+      if (it.ProductionYear) yearSet.add(it.ProductionYear)
+    }
+    const items = Array.from(yearSet)
+      .sort((a, b) => b - a)
+      .map((y) => ({ Name: String(y), Id: `year-${y}` }))
+    return { Items: items, TotalRecordCount: items.length } as T
+  }
+
   const userItemsMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Items$/)
   const isGlobalItemsQuery = pathname === '/emby/Items' || pathname === '/Items'
   if ((userItemsMatch || isGlobalItemsQuery) && method === 'GET') {
@@ -673,6 +758,10 @@ export async function demoFetch<T>(
     const genresParam = (qs.get('Genres') || '')
       .split(/[|,]/)
       .map((s) => s.trim().toLowerCase())
+      .filter(Boolean)
+    const yearsParam = (qs.get('Years') || '')
+      .split(/[|,]/)
+      .map((s) => s.trim())
       .filter(Boolean)
     const tagsParam = (qs.get('Tags') || '')
       .split(/[|,]/)
@@ -716,6 +805,9 @@ export async function demoFetch<T>(
       pool = pool.filter((it) =>
         (it.Genres || []).some((g) => genresParam.includes(g.toLowerCase())),
       )
+    }
+    if (yearsParam.length > 0) {
+      pool = pool.filter((it) => it.ProductionYear != null && yearsParam.includes(String(it.ProductionYear)))
     }
     if (tagsParam.length > 0) {
       pool = pool.filter((it) =>
@@ -789,7 +881,151 @@ export async function demoFetch<T>(
     throw new ApiError(404, `未找到项目 ${itemId}`)
   }
 
-  // ==================== 5. 剧集季与分集 ====================
+  // ==================== 5. 剧集季、分集与 NextUp ====================
+  if (pathname === '/emby/Shows/NextUp' && method === 'GET') {
+    const seriesId = qs.get('SeriesId') || ''
+    const limit = Number(qs.get('Limit') || 12)
+    const targetSeriesIds = seriesId ? [seriesId] : Array.from(store.seasonsBySeries.keys())
+    const nextUpList: BaseItemDto[] = []
+    for (const sid of targetSeriesIds) {
+      const seasons = store.seasonsBySeries.get(sid) || []
+      const allEps = seasons.flatMap((s) => store.episodesBySeason.get(s.Id) || [])
+      const nextEp =
+        allEps.find((ep) => !ep.UserData?.Played && (ep.UserData?.PlaybackPositionTicks || 0) > 0) ||
+        allEps.find((ep) => !ep.UserData?.Played) ||
+        allEps[0]
+      if (nextEp) nextUpList.push(nextEp)
+    }
+    const sliced = nextUpList.slice(0, limit)
+    return { Items: sliced, TotalRecordCount: nextUpList.length } as T
+  }
+
+  const similarMatch = pathname.match(/^\/emby\/Items\/([^/]+)\/Similar$/)
+  if (similarMatch && method === 'GET') {
+    const itemId = decodeURIComponent(similarMatch[1])
+    const limit = Number(qs.get('Limit') || 12)
+    const source = store.items.get(itemId)
+    if (!source) return { Items: [], TotalRecordCount: 0 } as T
+    const srcGenres = new Set((source.Genres || []).map((g) => g.toLowerCase()))
+    const candidates = Array.from(store.items.values())
+      .filter((it) => it.Id !== itemId && it.Type === source.Type)
+      .map((it) => {
+        const overlap = (it.Genres || []).filter((g) => srcGenres.has(g.toLowerCase())).length
+        return { item: it, score: overlap * 10 + (it.CommunityRating || 0) }
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit)
+      .map((x) => x.item)
+    return { Items: candidates, TotalRecordCount: candidates.length } as T
+  }
+
+  // ==================== 5b. 合集 (Collections) & 播放列表 (Playlists) CRUD ====================
+  if (pathname === '/emby/Collections' && method === 'POST') {
+    const body = parseJsonBody(options)
+    const name = String(qs.get('Name') || body.Name || '').trim()
+    if (!name) throw new ApiError(400, '合集名称不能为空')
+    const idsRaw = qs.get('Ids') || (Array.isArray(body.Ids) ? body.Ids.join(',') : '')
+    const ids = idsRaw
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+    const id = `col-demo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+    const dto: BaseItemDto = {
+      Id: id,
+      Name: name,
+      SortName: name.toLowerCase(),
+      ServerId: DEMO_SERVER_ID,
+      Type: 'BoxSet',
+      IsFolder: true,
+      ChildCount: ids.length,
+      DateCreated: new Date().toISOString(),
+    }
+    store.items.set(id, dto)
+    store.libraryItems.set(id, Array.from(new Set(ids)))
+    pushActivity(`已创建合集「${name}」`, 'CollectionCreated')
+    return { Id: id, Name: name } as T
+  }
+
+  if (pathname === '/emby/Playlists' && method === 'POST') {
+    const body = parseJsonBody(options)
+    const name = String(qs.get('Name') || body.Name || '').trim()
+    if (!name) throw new ApiError(400, '播放列表名称不能为空')
+    const idsRaw = qs.get('Ids') || (Array.isArray(body.Ids) ? body.Ids.join(',') : '')
+    const ids = idsRaw
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+    const id = `pl-demo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+    const dto: BaseItemDto = {
+      Id: id,
+      Name: name,
+      SortName: name.toLowerCase(),
+      ServerId: DEMO_SERVER_ID,
+      Type: 'Playlist',
+      MediaType: String(body.MediaType || 'Video'),
+      IsFolder: true,
+      ChildCount: ids.length,
+      DateCreated: new Date().toISOString(),
+    }
+    store.items.set(id, dto)
+    store.libraryItems.set(id, Array.from(new Set(ids)))
+    pushActivity(`已创建播放列表「${name}」`, 'PlaylistCreated')
+    return { Id: id, Name: name } as T
+  }
+
+  const containerItemsMatch = pathname.match(/^\/emby\/(Collections|Playlists)\/([^/]+)\/Items$/)
+  if (containerItemsMatch) {
+    const containerId = decodeURIComponent(containerItemsMatch[2])
+    const container = store.items.get(containerId)
+    if (!container) throw new ApiError(404, '合集或播放列表不存在')
+    if (method === 'GET') {
+      const ids = store.libraryItems.get(containerId) || []
+      const items = ids
+        .map((mid) => store.items.get(mid))
+        .filter((it): it is BaseItemDto => Boolean(it))
+      return { Items: items, TotalRecordCount: items.length } as T
+    }
+    if (method === 'POST') {
+      const body = parseJsonBody(options)
+      const idsRaw = qs.get('Ids') || (Array.isArray(body.Ids) ? body.Ids.join(',') : '')
+      const toAdd = idsRaw
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+      const existing = store.libraryItems.get(containerId) || []
+      const merged = Array.from(new Set([...existing, ...toAdd]))
+      store.libraryItems.set(containerId, merged)
+      container.ChildCount = merged.length
+      return undefined as T
+    }
+    if (method === 'DELETE') {
+      const idsRaw = qs.get('EntryIds') || qs.get('Ids') || ''
+      const toRemove = new Set(
+        idsRaw
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean),
+      )
+      const existing = store.libraryItems.get(containerId) || []
+      const next = existing.filter((mid) => !toRemove.has(mid))
+      store.libraryItems.set(containerId, next)
+      container.ChildCount = next.length
+      return undefined as T
+    }
+  }
+
+  const deleteContainerMatch = pathname.match(/^\/emby\/(Collections|Playlists)\/([^/]+)$/)
+  if (deleteContainerMatch && method === 'DELETE') {
+    const containerId = decodeURIComponent(deleteContainerMatch[2])
+    const container = store.items.get(containerId)
+    if (container) {
+      store.items.delete(containerId)
+      store.libraryItems.delete(containerId)
+      pushActivity(`已删除「${container.Name}」`, 'ContainerDeleted')
+    }
+    return undefined as T
+  }
+
   const seasonsMatch = pathname.match(/^\/emby\/Shows\/([^/]+)\/Seasons$/)
   if (seasonsMatch && method === 'GET') {
     const seriesId = decodeURIComponent(seasonsMatch[1])
@@ -816,7 +1052,14 @@ export async function demoFetch<T>(
     const term = qs.get('SearchTerm') || ''
     const limit = Number(qs.get('Limit') || 20)
     const matched = Array.from(store.items.values())
-      .filter((it) => it.Type === 'Movie' || it.Type === 'Series' || it.Type === 'Episode')
+      .filter(
+        (it) =>
+          it.Type === 'Movie' ||
+          it.Type === 'Series' ||
+          it.Type === 'Episode' ||
+          it.Type === 'MusicAlbum' ||
+          it.Type === 'Audio',
+      )
       .filter((it) => matchesFuzzySearch(it, term))
       .slice(0, limit)
 
@@ -870,10 +1113,29 @@ export async function demoFetch<T>(
     } else {
       ud.PlayedPercentage = 0
     }
+    if (item.Type === 'Season') {
+      const eps = store.episodesBySeason.get(itemId) || []
+      for (const ep of eps) {
+        const epUd = ensureUserData(ep)
+        epUd.Played = ud.Played
+        epUd.PlayedPercentage = ud.Played ? 100 : 0
+        if (ud.Played) epUd.PlaybackPositionTicks = 0
+      }
+    }
     return { ...ud } as T
   }
 
-  // ==================== 8. PlaybackInfo & 播放状态上报 ====================
+  // ==================== 8. PlaybackInfo、音频歌词 & 播放状态上报 ====================
+  const audioLyricsMatch = pathname.match(/^\/emby\/Audio\/([^/]+)\/Lyrics$/)
+  if (audioLyricsMatch && method === 'GET') {
+    const itemId = decodeURIComponent(audioLyricsMatch[1])
+    const lyrics = store.lyricsByItemId.get(itemId)
+    if (lyrics) {
+      return lyrics as T
+    }
+    return { Metadata: { IsSynced: false }, Lyrics: [] } as T
+  }
+
   const playbackMatch = pathname.match(/^\/emby\/Items\/([^/]+)\/PlaybackInfo$/)
   if (playbackMatch && method === 'POST') {
     const itemId = decodeURIComponent(playbackMatch[1])

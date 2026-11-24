@@ -118,6 +118,14 @@ func NewUserRepo(store *Store) *UserRepo {
 	return &UserRepo{store: store}
 }
 
+// Store returns the underlying SQLite store.
+func (r *UserRepo) Store() *Store {
+	if r == nil {
+		return nil
+	}
+	return r.store
+}
+
 func (r *UserRepo) CountUsers(ctx context.Context) (int, error) {
 	var count int
 	err := r.store.Reader.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&count)

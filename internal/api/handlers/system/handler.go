@@ -166,8 +166,10 @@ func (h *Handler) UpdateConfiguration(w http.ResponseWriter, r *http.Request) {
 		h.cfg.TMDBLanguage = strings.TrimSpace(v)
 		tmdbChanged = true
 	}
+	strmChanged := false
 	if v, ok := body["EnableSTRM302"].(bool); ok {
 		h.cfg.EnableSTRM302 = v
+		strmChanged = true
 	}
 	if v, ok := body["PlayedThreshold"].(float64); ok && v > 0 && v <= 1 {
 		h.cfg.PlayedThreshold = v
@@ -178,6 +180,9 @@ func (h *Handler) UpdateConfiguration(w http.ResponseWriter, r *http.Request) {
 	}
 	if tmdbChanged {
 		h.syncTMDBPlugin()
+	}
+	if strmChanged {
+		h.syncSTRMPlugin()
 	}
 	httpx.NoContent(w)
 }

@@ -298,11 +298,23 @@ func (h *Handler) handleDeleteVirtualFolder(w http.ResponseWriter, r *http.Reque
 	}
 	if id := nonEmpty(q.Get("id"), body.Id); id != "" {
 		_ = h.repo.DeleteLibrary(r.Context(), id)
+		if h.watcher != nil {
+			_ = h.watcher.UnwatchLibrary(guid.Normalize(id))
+		}
 		httpx.NoContent(w)
 		return
 	}
 	if name := nonEmpty(q.Get("name"), body.Name); name != "" {
+		var watchID string
+		if h.watcher != nil {
+			if lib, err := h.findLibraryByIDOrName(r, "", name); err == nil && lib != nil {
+				watchID = lib.ID
+			}
+		}
 		_ = h.repo.DeleteLibraryByName(r.Context(), name)
+		if h.watcher != nil && watchID != "" {
+			_ = h.watcher.UnwatchLibrary(watchID)
+		}
 		httpx.NoContent(w)
 		return
 	}
@@ -399,9 +411,13 @@ func (h *Handler) handleAddVirtualFolderPath(w http.ResponseWriter, r *http.Requ
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if _, err := h.repo.AddLibraryPath(r.Context(), lib.ID, pathVal); err != nil {
+	updated, err := h.repo.AddLibraryPath(r.Context(), lib.ID, pathVal)
+	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if h.watcher != nil && updated != nil {
+		_ = h.watcher.WatchLibrary(updated.ID, updated.Paths)
 	}
 	httpx.NoContent(w)
 }
@@ -423,7 +439,9 @@ func (h *Handler) handleUpdateVirtualFolderPath(w http.ResponseWriter, r *http.R
 		return
 	}
 	if lib, err := h.findLibraryByIDOrName(r, body.Id, body.Name); err == nil && body.PathInfo.Path != "" {
-		_, _ = h.repo.AddLibraryPath(r.Context(), lib.ID, body.PathInfo.Path)
+		if updated, addErr := h.repo.AddLibraryPath(r.Context(), lib.ID, body.PathInfo.Path); addErr == nil && h.watcher != nil && updated != nil {
+			_ = h.watcher.WatchLibrary(updated.ID, updated.Paths)
+		}
 	}
 	httpx.NoContent(w)
 }
@@ -463,6 +481,13 @@ func (h *Handler) handleDeleteVirtualFolderPath(w http.ResponseWriter, r *http.R
 	if err := h.saveLibraryPaths(r, lib.ID, filtered); err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if h.watcher != nil {
+		if len(filtered) == 0 {
+			_ = h.watcher.UnwatchLibrary(lib.ID)
+		} else {
+			_ = h.watcher.WatchLibrary(lib.ID, filtered)
+		}
 	}
 	httpx.NoContent(w)
 }

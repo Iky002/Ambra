@@ -1,6 +1,7 @@
 import type {
   ActivityLogEntry,
   ApiKeyInfo,
+  AudioLyricsResponse,
   BaseItemDto,
   BaseItemPerson,
   DeviceInfo,
@@ -134,6 +135,7 @@ export interface DemoState {
   items: Map<string, BaseItemDto>
   seasonsBySeries: Map<string, BaseItemDto[]>
   episodesBySeason: Map<string, BaseItemDto[]>
+  lyricsByItemId: Map<string, AudioLyricsResponse>
   artById: Map<string, DemoArtMeta>
   userAvatarById: Map<string, string>
   sessions: SessionInfo[]
@@ -362,6 +364,12 @@ export function createInitialDemoState(): DemoState {
       CollectionType: 'movies',
       Locations: ['/mnt/nas/4k-remux', '/mnt/nas/dolby-vision'],
     },
+    {
+      ItemId: 'lib-music',
+      Name: '无损音乐',
+      CollectionType: 'music',
+      Locations: ['/data/music'],
+    },
   ]
 
   artById.set('lib-movies', {
@@ -392,11 +400,24 @@ export function createInitialDemoState(): DemoState {
       '#fb923c',
     ]),
   })
+  artById.set('lib-music', {
+    poster: makeLibraryThumbDataUrl('无损音乐', 'HI-RES FLAC · OST', [
+      '#1e1b4b',
+      '#4c1d95',
+      '#f59e0b',
+    ]),
+    backdrop: makeLibraryThumbDataUrl('无损音乐', 'HI-RES FLAC · OST', [
+      '#1e1b4b',
+      '#4c1d95',
+      '#f59e0b',
+    ]),
+  })
 
   // ==================== 2. 影片与剧集 ====================
   const items = new Map<string, BaseItemDto>()
   const seasonsBySeries = new Map<string, BaseItemDto[]>()
   const episodesBySeason = new Map<string, BaseItemDto[]>()
+  const lyricsByItemId = new Map<string, AudioLyricsResponse>()
 
   const registerItem = (
     item: BaseItemDto,
@@ -1984,6 +2005,297 @@ export function createInitialDemoState(): DemoState {
     TMDB_MEDIA_ART['item-shawshank-redemption'],
   )
 
+  // ==================== 4b. 无损音乐专辑、音轨与同步 LRC 歌词 ====================
+  const SEC_TICKS = 10_000_000
+
+  registerItem(
+    {
+      Id: 'album-interstellar-ost',
+      Name: '星际穿越 原声大碟',
+      OriginalTitle: 'Interstellar (Original Motion Picture Soundtrack)',
+      SortName: 'xingjichuanyue interstellar ost hans zimmer',
+      ServerId: DEMO_SERVER_ID,
+      Type: 'MusicAlbum',
+      MediaType: 'Audio',
+      IsFolder: true,
+      ParentId: 'lib-music',
+      AlbumArtist: 'Hans Zimmer',
+      Artists: ['Hans Zimmer'],
+      ProductionYear: 2014,
+      DateCreated: isoAgo(30),
+      CommunityRating: 9.6,
+      Genres: ['电影原声', '古典', '氛围电子'],
+      Tags: ['Hi-Res FLAC', '原声典藏'],
+      Overview:
+        '汉斯·季默为克里斯托弗·诺兰科幻史诗《星际穿越》创作的配乐专辑，以伦敦圣殿教堂的管风琴与弦乐交织出浩瀚深邃的宇宙孤独感与父女羁绊。',
+      ChildCount: 4,
+      ImageTags: { Primary: 'demo-p' },
+      BackdropImageTags: ['demo-b'],
+      PrimaryImageAspectRatio: 1,
+      UserData: {
+        PlaybackPositionTicks: 0,
+        PlayCount: 3,
+        IsFavorite: true,
+        Played: false,
+      },
+    },
+    ['#0c1e35', '#1e3a5f', '#f59e0b'],
+    'FLAC 24bit',
+    TMDB_MEDIA_ART['item-interstellar'],
+  )
+
+  const interstellarTracks: Array<{
+    id: string
+    index: number
+    name: string
+    durationSec: number
+    lyrics: Array<[number, string]>
+  }> = [
+    {
+      id: 'track-interstellar-1',
+      index: 1,
+      name: 'Dreaming of the Crash',
+      durationSec: 235,
+      lyrics: [
+        [0, '♪ 序章 · 尘埃风暴与远方星海 ♪'],
+        [3.5, '管风琴低音缓缓铺陈，呼啸的风声掠过玉米田'],
+        [7.5, '遥望天际，记忆与未知在静默中交错'],
+        [11.5, '钢琴单音落下，如同跨越光年的回响'],
+        [15.5, '我们曾仰望星空，思考我们在宇宙中的位置'],
+      ],
+    },
+    {
+      id: 'track-interstellar-2',
+      index: 2,
+      name: 'Cornfield Chase',
+      durationSec: 126,
+      lyrics: [
+        [0, '♪ 玉米田追逐 · Cornfield Chase ♪'],
+        [3.0, '清脆的琶音如星辰脉动般层层递进'],
+        [6.8, '管风琴与弦乐渐强，驱车穿越无垠田野'],
+        [10.8, '心跳与节拍共振，奔向地平线尽头的梦想'],
+        [15.0, '不要温和地走进那个良夜，向群星出发'],
+      ],
+    },
+    {
+      id: 'track-interstellar-3',
+      index: 3,
+      name: 'Stay',
+      durationSec: 392,
+      lyrics: [
+        [0, '♪ 留下来 · S.T.A.Y. ♪'],
+        [3.5, '滴答作响的时钟，衡量着引力井中的岁月'],
+        [8.0, '唯有爱能够超越时间与维度的阻隔'],
+        [12.5, '书架背后的摩斯密码，诉说着未曾熄灭的承诺'],
+        [16.5, '无论相隔多少光年，我终会回到你身边'],
+      ],
+    },
+    {
+      id: 'track-interstellar-4',
+      index: 4,
+      name: 'No Time for Caution',
+      durationSec: 246,
+      lyrics: [
+        [0, '♪ 无暇顾忌 · 对接永恒号 ♪'],
+        [3.2, '“这不可能。” —— “不，这是必须的。”'],
+        [7.2, '管风琴全音栓轰鸣，飞船与空间站高速同频旋转'],
+        [11.5, '重力拉扯到极限，弦乐如潮水般席卷而来'],
+        [15.8, '对接锁定！穿越卡冈图雅黑洞视界'],
+      ],
+    },
+  ]
+
+  for (const t of interstellarTracks) {
+    registerItem(
+      {
+        Id: t.id,
+        Name: t.name,
+        SortName: `${String(t.index).padStart(2, '0')} ${t.name.toLowerCase()}`,
+        ServerId: DEMO_SERVER_ID,
+        Type: 'Audio',
+        MediaType: 'Audio',
+        ParentId: 'album-interstellar-ost',
+        AlbumId: 'album-interstellar-ost',
+        Album: '星际穿越 原声大碟',
+        AlbumArtist: 'Hans Zimmer',
+        Artists: ['Hans Zimmer'],
+        ParentIndexNumber: 1,
+        IndexNumber: t.index,
+        ProductionYear: 2014,
+        DateCreated: isoAgo(30 - t.index),
+        RunTimeTicks: t.durationSec * SEC_TICKS,
+        Genres: ['电影原声', '古典'],
+        ImageTags: { Primary: 'demo-p' },
+        AlbumPrimaryImageTag: 'demo-p',
+        UserData: {
+          PlaybackPositionTicks: 0,
+          PlayCount: 1,
+          IsFavorite: t.index === 2,
+          Played: false,
+        },
+      },
+      ['#0c1e35', '#1e3a5f', '#f59e0b'],
+      'FLAC',
+      TMDB_MEDIA_ART['item-interstellar'],
+    )
+    lyricsByItemId.set(t.id, {
+      Metadata: {
+        Artist: 'Hans Zimmer',
+        Album: '星际穿越 原声大碟',
+        Title: t.name,
+        IsSynced: true,
+      },
+      Lyrics: t.lyrics.map(([sec, text]) => ({
+        Start: Math.round(sec * SEC_TICKS),
+        Text: text,
+      })),
+    })
+  }
+
+  registerItem(
+    {
+      Id: 'album-spirited-away-ost',
+      Name: '千与千寻 电影原声',
+      OriginalTitle: 'Spirited Away (Original Soundtrack)',
+      SortName: 'qianyuqianxun spirited away ost 久石让',
+      ServerId: DEMO_SERVER_ID,
+      Type: 'MusicAlbum',
+      MediaType: 'Audio',
+      IsFolder: true,
+      ParentId: 'lib-music',
+      AlbumArtist: '久石让',
+      Artists: ['久石让'],
+      ProductionYear: 2001,
+      DateCreated: isoAgo(45),
+      CommunityRating: 9.7,
+      Genres: ['电影原声', '动漫', '钢琴'],
+      Tags: ['Hi-Res FLAC', '吉卜力'],
+      Overview:
+        '久石让为宫崎骏动画杰作《千与千寻》谱写的全套原声配乐，清澈温柔的钢琴旋律与新日本爱乐乐团的宏大弦乐勾勒出奇幻而治愈的神隐世界。',
+      ChildCount: 4,
+      ImageTags: { Primary: 'demo-p' },
+      BackdropImageTags: ['demo-b'],
+      PrimaryImageAspectRatio: 1,
+      UserData: {
+        PlaybackPositionTicks: 0,
+        PlayCount: 4,
+        IsFavorite: true,
+        Played: false,
+      },
+    },
+    ['#1e1b4b', '#312e81', '#38bdf8'],
+    'FLAC 24bit',
+    TMDB_MEDIA_ART['item-spirited-away'],
+  )
+
+  const spiritedTracks: Array<{
+    id: string
+    index: number
+    name: string
+    durationSec: number
+    lyrics: Array<[number, string]>
+  }> = [
+    {
+      id: 'track-spirited-1',
+      index: 1,
+      name: '那个夏天 (One Summer\'s Day)',
+      durationSec: 189,
+      lyrics: [
+        [0, '♪ 那个夏天 · あの夏へ ♪'],
+        [3.2, '微风轻拂盛夏午后，钢琴声如溪水般澄澈'],
+        [7.5, '穿过幽暗的隧道，未知的奇幻之旅悄然启程'],
+        [11.8, '每一个音符都藏着童年的勇气与温柔'],
+        [16.0, '回望来时路，夏日的光影永远定格在心间'],
+      ],
+    },
+    {
+      id: 'track-spirited-2',
+      index: 2,
+      name: '重逢 (Reprise)',
+      durationSec: 293,
+      lyrics: [
+        [0, '♪ 重逢 · ふたたび ♪'],
+        [3.5, '夜空之下，白龙掠过星光与云海'],
+        [8.0, '曾经遗忘的名字，在风中重新被唤起'],
+        [12.2, '弦乐徐徐升腾，温暖包裹着彼此的回忆'],
+        [16.4, '不要回头，沿着光亮一直向前走'],
+      ],
+    },
+    {
+      id: 'track-spirited-3',
+      index: 3,
+      name: '第六车站 (The Sixth Station)',
+      durationSec: 218,
+      lyrics: [
+        [0, '♪ 第六车站 · 海上列车 ♪'],
+        [3.5, '列车滑过平静如镜的水面，晚霞染红天际'],
+        [7.8, '窗外孤岛与剪影静静掠过，时间仿佛静止'],
+        [12.0, '孤单却并不恐惧，因为心中怀揣着牵挂'],
+        [16.2, '抵达沼底之前，倾听海风与铁轨的轻语'],
+      ],
+    },
+    {
+      id: 'track-spirited-4',
+      index: 4,
+      name: '永远同在 (Always With Me)',
+      durationSec: 215,
+      lyrics: [
+        [0, '♪ 永远同在 · いつも何度でも ♪'],
+        [3.0, '呼唤着内心深处的某处声音'],
+        [7.0, '总是想要做一场令人心动的梦'],
+        [11.2, '即使悲伤多得数不清，前方一定还能与你相遇'],
+        [15.5, '无论多少次，都依然怀抱希望微笑前行'],
+      ],
+    },
+  ]
+
+  for (const t of spiritedTracks) {
+    registerItem(
+      {
+        Id: t.id,
+        Name: t.name,
+        SortName: `${String(t.index).padStart(2, '0')} ${t.name.toLowerCase()}`,
+        ServerId: DEMO_SERVER_ID,
+        Type: 'Audio',
+        MediaType: 'Audio',
+        ParentId: 'album-spirited-away-ost',
+        AlbumId: 'album-spirited-away-ost',
+        Album: '千与千寻 电影原声',
+        AlbumArtist: '久石让',
+        Artists: ['久石让'],
+        ParentIndexNumber: 1,
+        IndexNumber: t.index,
+        ProductionYear: 2001,
+        DateCreated: isoAgo(45 - t.index),
+        RunTimeTicks: t.durationSec * SEC_TICKS,
+        Genres: ['电影原声', '动漫', '钢琴'],
+        ImageTags: { Primary: 'demo-p' },
+        AlbumPrimaryImageTag: 'demo-p',
+        UserData: {
+          PlaybackPositionTicks: 0,
+          PlayCount: 2,
+          IsFavorite: t.index === 1 || t.index === 4,
+          Played: false,
+        },
+      },
+      ['#1e1b4b', '#312e81', '#38bdf8'],
+      'FLAC',
+      TMDB_MEDIA_ART['item-spirited-away'],
+    )
+    lyricsByItemId.set(t.id, {
+      Metadata: {
+        Artist: '久石让',
+        Album: '千与千寻 电影原声',
+        Title: t.name,
+        IsSynced: true,
+      },
+      Lyrics: t.lyrics.map(([sec, text]) => ({
+        Start: Math.round(sec * SEC_TICKS),
+        Text: text,
+      })),
+    })
+  }
+
   // 媒体库与合集包含关系
   const libraryItems = new Map<string, string[]>([
     [
@@ -2054,6 +2366,18 @@ export function createInitialDemoState(): DemoState {
         'item-forrest-gump',
         'item-spirited-away',
       ],
+    ],
+    [
+      'lib-music',
+      ['album-interstellar-ost', 'album-spirited-away-ost'],
+    ],
+    [
+      'album-interstellar-ost',
+      interstellarTracks.map((t) => t.id),
+    ],
+    [
+      'album-spirited-away-ost',
+      spiritedTracks.map((t) => t.id),
     ],
   ])
 
@@ -2471,6 +2795,7 @@ export function createInitialDemoState(): DemoState {
     items,
     seasonsBySeries,
     episodesBySeason,
+    lyricsByItemId,
     artById,
     userAvatarById,
     sessions,

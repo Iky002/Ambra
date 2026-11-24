@@ -15,6 +15,8 @@ import {
   RotateCcw,
   RotateCw,
   Settings,
+  SkipBack,
+  SkipForward,
   SlidersHorizontal,
   Subtitles,
   Volume2,
@@ -29,6 +31,7 @@ import { useAuth } from '../context/AuthContext'
 import { isDemoMode } from '../demo/demoMode'
 import { AssJassubRenderer } from '../player/assRenderer'
 import { PgsCanvasRenderer } from '../player/pgsRenderer'
+import { loadPlaybackPrefs } from '../player/playbackPrefs'
 import {
   DEFAULT_SUBTITLE_PREFS,
   formatSubtitleOffset,
@@ -139,6 +142,7 @@ export function PlayerPage() {
   const [playerError, setPlayerError] = useState<string | null>(null)
   const [subtitleError, setSubtitleError] = useState<string | null>(null)
   const [playMethod, setPlayMethod] = useState<PlayMethodMode>('DirectPlay')
+  const [nextUpCountdown, setNextUpCountdown] = useState<number | null>(null)
 
   // 客户端 WASM 解复用偏好与运行态
   const [preferWasmRemux, setPreferWasmRemuxState] = useState<boolean>(() => getPreferWasmRemux())
@@ -164,6 +168,7 @@ export function PlayerPage() {
   useEffect(() => {
     initialSeekDoneRef.current = false
     initializedSubSourceIdRef.current = null
+    setNextUpCountdown(null)
   }, [id])
 
   // 切换视频或音轨时重置强制回退状态
@@ -193,6 +198,38 @@ export function PlayerPage() {
     queryFn: () => api.getItem(userId, id!),
     enabled: Boolean(id),
   })
+
+  // 剧集分集列表：用于上一集 / 下一集快捷切换与播放完毕自动连播倒计时
+  const { data: seasonEpisodesData } = useQuery({
+    queryKey: ['episodes', item?.SeriesId, item?.SeasonId || '', userId],
+    queryFn: () => api.getEpisodes(item!.SeriesId!, item!.SeasonId || '', userId),
+    enabled: Boolean(item?.Type === 'Episode' && item.SeriesId),
+    staleTime: 60_000,
+  })
+
+  const seasonEpisodes = seasonEpisodesData?.Items || []
+  const currentEpisodeIdx = useMemo(
+    () => seasonEpisodes.findIndex((ep) => ep.Id === id),
+    [seasonEpisodes, id],
+  )
+  const prevEpisode = currentEpisodeIdx > 0 ? seasonEpisodes[currentEpisodeIdx - 1] : null
+  const nextEpisode =
+    currentEpisodeIdx >= 0 && currentEpisodeIdx + 1 < seasonEpisodes.length
+      ? seasonEpisodes[currentEpisodeIdx + 1]
+      : null
+
+  useEffect(() => {
+    if (nextUpCountdown === null || !nextEpisode) return
+    if (nextUpCountdown <= 0) {
+      setNextUpCountdown(null)
+      navigate(`/play/${nextEpisode.Id}`, { replace: true })
+      return
+    }
+    const timer = window.setTimeout(() => {
+      setNextUpCountdown((c) => (c === null ? null : c - 1))
+    }, 1000)
+    return () => window.clearTimeout(timer)
+  }, [nextUpCountdown, nextEpisode, navigate])
 
   const {
     data: playbackInfo,
@@ -826,6 +863,7 @@ export function PlayerPage() {
     playMethod,
     mediaSourceId: activeSource?.Id,
     playSessionId: playbackInfo?.PlaySessionId,
+    effectiveStartTicks,
   })
   playbackMetaRef.current = {
     audioIndex,
@@ -833,6 +871,7 @@ export function PlayerPage() {
     playMethod,
     mediaSourceId: activeSource?.Id,
     playSessionId: playbackInfo?.PlaySessionId,
+    effectiveStartTicks,
   }
 
   // 上报播放状态 (/emby/Sessions/Playing, Progress, Stopped)
@@ -845,8 +884,17 @@ export function PlayerPage() {
         playMethod: latestPlayMethod,
         mediaSourceId: latestMediaSourceId,
         playSessionId: latestPlaySessionId,
+        effectiveStartTicks: latestStartTicks,
       } = playbackMetaRef.current
-      const posTicks = Math.floor(videoRef.current.currentTime * 10_000_000)
+      let posTicks = Math.floor(videoRef.current.currentTime * 10_000_000)
+      if (
+        type === 'stop' &&
+        !initialSeekDoneRef.current &&
+        latestStartTicks > 0 &&
+        videoRef.current.currentTime < 1
+      ) {
+        posTicks = latestStartTicks
+      }
       const base = {
         ItemId: id,
         MediaSourceId: latestMediaSourceId,
@@ -906,9 +954,15 @@ export function PlayerPage() {
       const storedAuth = getStoredAuth()
       const token = storedAuth?.accessToken
       if (!token) return
-      const { mediaSourceId: latestMediaSourceId, playSessionId: latestPlaySessionId } =
-        playbackMetaRef.current
-      const posTicks = Math.floor(videoRef.current.currentTime * 10_000_000)
+      const {
+        mediaSourceId: latestMediaSourceId,
+        playSessionId: latestPlaySessionId,
+        effectiveStartTicks: latestStartTicks,
+      } = playbackMetaRef.current
+      let posTicks = Math.floor(videoRef.current.currentTime * 10_000_000)
+      if (!initialSeekDoneRef.current && latestStartTicks > 0 && videoRef.current.currentTime < 1) {
+        posTicks = latestStartTicks
+      }
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
         Accept: 'application/json',
@@ -1009,6 +1063,19 @@ export function PlayerPage() {
     pokeOsd()
   }, [audioStreams, audioIndex, pokeOsd])
 
+  const toggleMute = useCallback(() => {
+    const v = videoRef.current
+    if (!v) return
+    const nextMuted = !v.muted && !muted
+    if (!nextMuted && v.volume === 0) {
+      v.volume = 0.5
+      setVolume(0.5)
+    }
+    v.muted = nextMuted
+    setMuted(nextMuted)
+    pokeOsd()
+  }, [muted, pokeOsd])
+
   // 监听全屏状态变化
   useEffect(() => {
     const onFsChange = () => {
@@ -1019,7 +1086,7 @@ export function PlayerPage() {
     return () => document.removeEventListener('fullscreenchange', onFsChange)
   }, [])
 
-  // 全局快捷键：Space / 左右 / 上下 / F / C / A / I / Esc
+  // 全局快捷键：Space / 左右 / 上下 / M / F / C / A / I / Esc
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
@@ -1036,8 +1103,9 @@ export function PlayerPage() {
       } else if (e.key === 'ArrowUp') {
         e.preventDefault()
         if (videoRef.current) {
-          const next = Math.min(1, videoRef.current.volume + 0.1)
+          const next = Math.min(1, Number((videoRef.current.volume + 0.1).toFixed(2)))
           videoRef.current.volume = next
+          videoRef.current.muted = false
           setVolume(next)
           setMuted(false)
         }
@@ -1045,11 +1113,16 @@ export function PlayerPage() {
       } else if (e.key === 'ArrowDown') {
         e.preventDefault()
         if (videoRef.current) {
-          const next = Math.max(0, videoRef.current.volume - 0.1)
+          const next = Math.max(0, Number((videoRef.current.volume - 0.1).toFixed(2)))
           videoRef.current.volume = next
+          videoRef.current.muted = next === 0
           setVolume(next)
+          setMuted(next === 0)
         }
         pokeOsd()
+      } else if (key === 'm') {
+        e.preventDefault()
+        toggleMute()
       } else if (key === 'f') {
         e.preventDefault()
         toggleFullscreen()
@@ -1072,7 +1145,17 @@ export function PlayerPage() {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [togglePlay, seekBy, toggleFullscreen, cycleSubtitle, cycleAudio, activePanel, navigate, pokeOsd])
+  }, [
+    togglePlay,
+    seekBy,
+    toggleMute,
+    toggleFullscreen,
+    cycleSubtitle,
+    cycleAudio,
+    activePanel,
+    navigate,
+    pokeOsd,
+  ])
 
   // 计算当前时间（叠加时间轴偏移）生效的 WebVTT/SRT 字幕文本
   const activeVttText = useMemo(() => {
@@ -1135,6 +1218,14 @@ export function PlayerPage() {
           setCurrentTime(v.currentTime)
           if (v.buffered.length > 0) {
             setBufferedEnd(v.buffered.end(v.buffered.length - 1))
+          }
+        }}
+        onEnded={() => {
+          setPlaying(false)
+          setOsdVisible(true)
+          reportState('stop')
+          if (nextEpisode && loadPlaybackPrefs().autoPlayNextEpisode) {
+            setNextUpCountdown(8)
           }
         }}
         onError={() => {
@@ -1292,6 +1383,53 @@ export function PlayerPage() {
               className="mt-5 rounded-xl bg-amber-500 px-5 py-2 text-xs font-semibold text-zinc-950 hover:bg-amber-400"
             >
               返回上一页
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* 自动连播下一集 8 秒倒计时浮层 */}
+      {nextUpCountdown !== null && nextEpisode && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          className="absolute bottom-28 right-6 z-30 w-80 max-w-[calc(100vw-3rem)] rounded-2xl border border-amber-500/35 bg-zinc-950/92 p-4 shadow-2xl backdrop-blur-xl"
+        >
+          <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-400">
+            即将播放下一集
+          </p>
+          <p className="mt-1 truncate text-sm font-semibold text-white">
+            {nextEpisode.ParentIndexNumber != null && nextEpisode.IndexNumber != null
+              ? `S${String(nextEpisode.ParentIndexNumber).padStart(2, '0')}E${String(nextEpisode.IndexNumber).padStart(2, '0')} `
+              : nextEpisode.IndexNumber != null
+                ? `第 ${nextEpisode.IndexNumber} 集 `
+                : ''}
+            {nextEpisode.Name}
+          </p>
+          <p className="mt-1 text-xs text-zinc-400">{nextUpCountdown} 秒后自动播放</p>
+          <div className="mt-3 h-1 w-full overflow-hidden rounded-full bg-white/10">
+            <div
+              className="h-full bg-amber-400 transition-all duration-1000 ease-linear"
+              style={{ width: `${Math.max(0, Math.min(100, ((8 - nextUpCountdown) / 8) * 100))}%` }}
+            />
+          </div>
+          <div className="mt-3.5 flex items-center justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => setNextUpCountdown(null)}
+              className="rounded-xl border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-medium text-zinc-200 transition-colors hover:bg-white/15"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setNextUpCountdown(null)
+                navigate(`/play/${nextEpisode.Id}`, { replace: true })
+              }}
+              className="inline-flex items-center gap-1 rounded-xl bg-amber-500 px-3.5 py-1.5 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400"
+            >
+              <Play className="h-3.5 w-3.5 fill-current" />
+              <span>立即播放</span>
             </button>
           </div>
         </div>
@@ -1476,6 +1614,18 @@ export function PlayerPage() {
         <div className="flex items-center justify-between gap-3">
           {/* 左侧控制 */}
           <div className="flex items-center gap-2 sm:gap-3">
+            {prevEpisode && (
+              <button
+                type="button"
+                onClick={() => navigate(`/play/${prevEpisode.Id}`, { replace: true })}
+                className="rounded-lg p-2 text-zinc-200 hover:bg-white/10"
+                title={`上一集：${prevEpisode.Name}`}
+                aria-label="上一集"
+              >
+                <SkipBack className="h-4 w-4" />
+              </button>
+            )}
+
             <button
               type="button"
               onClick={togglePlay}
@@ -1488,6 +1638,18 @@ export function PlayerPage() {
                 <Play className="ml-0.5 h-5 w-5 fill-current" />
               )}
             </button>
+
+            {nextEpisode && (
+              <button
+                type="button"
+                onClick={() => navigate(`/play/${nextEpisode.Id}`, { replace: true })}
+                className="rounded-lg p-2 text-zinc-200 hover:bg-white/10"
+                title={`下一集：${nextEpisode.Name}`}
+                aria-label="下一集"
+              >
+                <SkipForward className="h-4 w-4" />
+              </button>
+            )}
 
             <button
               type="button"
@@ -1510,12 +1672,9 @@ export function PlayerPage() {
             <div className="hidden items-center gap-2 sm:flex">
               <button
                 type="button"
-                onClick={() => {
-                  if (!videoRef.current) return
-                  const next = !muted
-                  videoRef.current.muted = next
-                  setMuted(next)
-                }}
+                onClick={toggleMute}
+                title="静音/取消静音 (M)"
+                aria-label={muted || volume === 0 ? '取消静音' : '静音'}
                 className="rounded-lg p-2 text-zinc-200 hover:bg-white/10"
               >
                 {muted || volume === 0 ? (

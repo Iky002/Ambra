@@ -29,14 +29,19 @@ type LibraryRecord struct {
 
 // ItemExtra is stored as JSON in items.extra_json.
 type ItemExtra struct {
-	Overview       string            `json:"overview,omitempty"`
-	Taglines       []string          `json:"taglines,omitempty"`
-	ProviderIDs    map[string]string `json:"provider_ids,omitempty"`
-	SeriesName     string            `json:"series_name,omitempty"`
-	SeasonName     string            `json:"season_name,omitempty"`
-	CollectionType string            `json:"collection_type,omitempty"`
-	LockedFields   []string          `json:"LockedFields,omitempty"`
-	LockData       bool              `json:"LockData,omitempty"`
+	Overview                string            `json:"overview,omitempty"`
+	Taglines                []string          `json:"taglines,omitempty"`
+	ProviderIDs             map[string]string `json:"provider_ids,omitempty"`
+	SeriesName              string            `json:"series_name,omitempty"`
+	SeasonName              string            `json:"season_name,omitempty"`
+	Album                   string            `json:"album,omitempty"`
+	AlbumID                 string            `json:"album_id,omitempty"`
+	AlbumArtist             string            `json:"album_artist,omitempty"`
+	Artists                 []string          `json:"artists,omitempty"`
+	PrimaryImageAspectRatio *float64          `json:"primary_image_aspect_ratio,omitempty"`
+	CollectionType          string            `json:"collection_type,omitempty"`
+	LockedFields            []string          `json:"LockedFields,omitempty"`
+	LockData                bool              `json:"LockData,omitempty"`
 }
 
 // ItemRecord represents a row in the items table.
@@ -1143,54 +1148,108 @@ func (r *LibraryRepo) GetLatestItemsWithAllowedLibraries(ctx context.Context, se
 }
 
 func (r *LibraryRepo) GetResumeItems(ctx context.Context, serverID, userID, parentID string, includeTypes []string, startIndex, limit int, fields []string) ([]dto.BaseItemDto, int, error) {
+	return r.GetResumeItemsWithAllowedLibraries(ctx, serverID, userID, parentID, includeTypes, startIndex, limit, fields, nil)
+}
+
+func (r *LibraryRepo) GetResumeItemsWithAllowedLibraries(ctx context.Context, serverID, userID, parentID string, includeTypes []string, startIndex, limit int, fields []string, allowedLibraryIDs []string) ([]dto.BaseItemDto, int, error) {
 	if limit <= 0 {
 		limit = 20
 	}
 	isResumable := true
 	return r.QueryItems(ctx, ItemFilter{
-		ServerID:         serverID,
-		UserID:           userID,
-		ParentID:         parentID,
-		Recursive:        parentID != "",
-		IncludeItemTypes: includeTypes,
-		IsResumable:      &isResumable,
-		SortBy:           []string{"DatePlayed"},
-		SortOrder:        "Descending",
-		StartIndex:       startIndex,
-		Limit:            limit,
-		Fields:           fields,
+		ServerID:          serverID,
+		UserID:            userID,
+		ParentID:          parentID,
+		AllowedLibraryIDs: allowedLibraryIDs,
+		Recursive:         parentID != "",
+		IncludeItemTypes:  includeTypes,
+		IsResumable:       &isResumable,
+		SortBy:            []string{"DatePlayed"},
+		SortOrder:         "Descending",
+		StartIndex:        startIndex,
+		Limit:             limit,
+		Fields:            fields,
 	})
 }
 
 func (r *LibraryRepo) GetNextUpEpisodes(ctx context.Context, serverID, userID, seriesID string, limit int, fields []string) ([]dto.BaseItemDto, int, error) {
+	return r.GetNextUpEpisodesWithAllowedLibraries(ctx, serverID, userID, seriesID, limit, fields, nil)
+}
+
+func (r *LibraryRepo) GetNextUpEpisodesWithAllowedLibraries(ctx context.Context, serverID, userID, seriesID string, limit int, fields []string, allowedLibraryIDs []string) ([]dto.BaseItemDto, int, error) {
+	if allowedLibraryIDs != nil && len(allowedLibraryIDs) == 0 {
+		return []dto.BaseItemDto{}, 0, nil
+	}
 	if limit <= 0 {
 		limit = 20
 	}
 	userID = guid.Normalize(userID)
 	seriesID = guid.Normalize(seriesID)
 
-	// Pick the first unplayed episode per series (ordered by season, episode)
-	args := []any{userID}
-	seriesCond := ""
+	// Deduplicate per series BEFORE applying LIMIT, picking the earliest unplayed episode
+	// per series and prioritizing series the user has already started watching.
+	args := []any{userID, userID}
+	var extraCond strings.Builder
 	if seriesID != "" {
-		seriesCond = " AND i.series_id = ?"
+		extraCond.WriteString(" AND i.series_id = ?")
 		args = append(args, seriesID)
+	}
+	if len(allowedLibraryIDs) > 0 {
+		ph := make([]string, len(allowedLibraryIDs))
+		for idx, lid := range allowedLibraryIDs {
+			ph[idx] = "?"
+			args = append(args, guid.Normalize(lid))
+		}
+		extraCond.WriteString(" AND i.library_id IN (" + strings.Join(ph, ",") + ")")
 	}
 	args = append(args, limit)
 
 	querySQL := `
-		SELECT i.id, i.library_id, i.parent_id, i.series_id, i.season_id,
-		       i.type, i.media_type, i.is_folder, i.is_strm,
-		       i.name, i.original_title, i.sort_name,
-		       i.index_number, i.parent_index_number, i.production_year,
-		       i.premiere_date, i.end_date, i.community_rating, i.critic_rating, i.official_rating,
-		       i.runtime_ticks, i.container, i.path, i.file_size, i.file_mtime,
-		       i.etag, i.extra_json, i.date_created, i.date_modified,
-		       COALESCE(u.played, 0), COALESCE(u.play_count, 0), COALESCE(u.playback_position_ticks, 0), COALESCE(u.is_favorite, 0), u.last_played_date
-		FROM items i
-		LEFT JOIN user_item_data u ON u.item_id = i.id AND u.user_id = ?
-		WHERE i.type = 'Episode' AND COALESCE(u.played, 0) = 0` + seriesCond + `
-		ORDER BY i.series_id, COALESCE(i.parent_index_number, 0) ASC, COALESCE(i.index_number, 0) ASC
+		WITH series_activity AS (
+			SELECT e.series_id,
+			       MAX(COALESCE(ue.last_played_date, '')) AS last_played
+			FROM items e
+			INNER JOIN user_item_data ue ON ue.item_id = e.id AND ue.user_id = ?
+			WHERE e.type = 'Episode'
+			  AND COALESCE(e.series_id, '') != ''
+			  AND (COALESCE(ue.played, 0) = 1 OR COALESCE(ue.playback_position_ticks, 0) > 0)
+			GROUP BY e.series_id
+		),
+		ranked AS (
+			SELECT i.id, i.library_id, i.parent_id, i.series_id, i.season_id,
+			       i.type, i.media_type, i.is_folder, i.is_strm,
+			       i.name, i.original_title, i.sort_name,
+			       i.index_number, i.parent_index_number, i.production_year,
+			       i.premiere_date, i.end_date, i.community_rating, i.critic_rating, i.official_rating,
+			       i.runtime_ticks, i.container, i.path, i.file_size, i.file_mtime,
+			       i.etag, i.extra_json, i.date_created, i.date_modified,
+			       COALESCE(u.played, 0) AS u_played,
+			       COALESCE(u.play_count, 0) AS u_play_count,
+			       COALESCE(u.playback_position_ticks, 0) AS u_pos,
+			       COALESCE(u.is_favorite, 0) AS u_fav,
+			       u.last_played_date AS u_last_played,
+			       CASE WHEN sa.series_id IS NOT NULL THEN 1 ELSE 0 END AS is_started,
+			       COALESCE(sa.last_played, '') AS series_last_played,
+			       ROW_NUMBER() OVER (
+			           PARTITION BY CASE WHEN COALESCE(i.series_id, '') != '' THEN i.series_id ELSE i.id END
+			           ORDER BY COALESCE(i.parent_index_number, 0) ASC, COALESCE(i.index_number, 0) ASC, i.id ASC
+			       ) AS rn
+			FROM items i
+			LEFT JOIN user_item_data u ON u.item_id = i.id AND u.user_id = ?
+			LEFT JOIN series_activity sa ON sa.series_id = i.series_id
+			WHERE i.type = 'Episode' AND COALESCE(u.played, 0) = 0` + extraCond.String() + `
+		)
+		SELECT id, library_id, parent_id, series_id, season_id,
+		       type, media_type, is_folder, is_strm,
+		       name, original_title, sort_name,
+		       index_number, parent_index_number, production_year,
+		       premiere_date, end_date, community_rating, critic_rating, official_rating,
+		       runtime_ticks, container, path, file_size, file_mtime,
+		       etag, extra_json, date_created, date_modified,
+		       u_played, u_play_count, u_pos, u_fav, u_last_played
+		FROM ranked
+		WHERE rn = 1
+		ORDER BY is_started DESC, series_last_played DESC, date_created DESC, series_id ASC
 		LIMIT ?`
 
 	rows, err := r.store.Reader.QueryContext(ctx, querySQL, args...)
@@ -1201,17 +1260,10 @@ func (r *LibraryRepo) GetNextUpEpisodes(ctx context.Context, serverID, userID, s
 
 	var recs []ItemRecord
 	var uds []*dto.UserItemDataDto
-	seenSeries := make(map[string]struct{})
 	for rows.Next() {
 		rec, ud, err := scanItemRow(rows, true)
 		if err != nil {
 			return nil, 0, err
-		}
-		if rec.SeriesID != "" {
-			if _, ok := seenSeries[rec.SeriesID]; ok {
-				continue
-			}
-			seenSeries[rec.SeriesID] = struct{}{}
 		}
 		recs = append(recs, rec)
 		uds = append(uds, ud)
@@ -1848,11 +1900,16 @@ func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []
 			Type:              rec.Type,
 			MediaType:         rec.MediaType,
 			CollectionType:    rec.Extra.CollectionType,
-			SeriesId:          rec.SeriesID,
-			SeriesName:        rec.Extra.SeriesName,
-			SeasonId:          rec.SeasonID,
-			SeasonName:        rec.Extra.SeasonName,
-			UserData:          uds[i],
+			SeriesId:                rec.SeriesID,
+			SeriesName:              rec.Extra.SeriesName,
+			SeasonId:                rec.SeasonID,
+			SeasonName:              rec.Extra.SeasonName,
+			Album:                   rec.Extra.Album,
+			AlbumId:                 rec.Extra.AlbumID,
+			AlbumArtist:             rec.Extra.AlbumArtist,
+			Artists:                 rec.Extra.Artists,
+			PrimaryImageAspectRatio: rec.Extra.PrimaryImageAspectRatio,
+			UserData:                uds[i],
 			ImageTags:         map[string]string{},
 			BackdropImageTags: []string{},
 			LocationType:      "FileSystem",

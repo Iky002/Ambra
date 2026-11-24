@@ -29,6 +29,9 @@ type multiLogSink struct {
 	stdout      io.Writer
 	logsHandler *Handler
 	logFilePath string
+	logDir      string
+	currentDate string
+	rotatable   bool
 	file        *os.File
 }
 
@@ -42,15 +45,39 @@ type MultiSlogHandler struct {
 	groups []string
 }
 
+func parseDailyLogDate(logFilePath string) (string, bool) {
+	base := filepath.Base(logFilePath)
+	if !strings.HasPrefix(base, "ambra-") || !strings.HasSuffix(base, ".log") {
+		return "", false
+	}
+	datePart := strings.TrimSuffix(strings.TrimPrefix(base, "ambra-"), ".log")
+	if len(datePart) != len("2006-01-02") {
+		return "", false
+	}
+	if _, err := time.Parse("2006-01-02", datePart); err != nil {
+		return "", false
+	}
+	return datePart, true
+}
+
 // NewMultiSlogHandler creates a slog.Handler fanning out records to stdout, logsHandler, and logFilePath.
 // Any of the three destinations may be nil/empty to disable that sink.
 func NewMultiSlogHandler(stdout io.Writer, logsHandler *Handler, logFilePath string) *MultiSlogHandler {
+	cleanPath := strings.TrimSpace(logFilePath)
+	sink := &multiLogSink{
+		stdout:      stdout,
+		logsHandler: logsHandler,
+		logFilePath: cleanPath,
+	}
+	if cleanPath != "" {
+		sink.logDir = filepath.Dir(cleanPath)
+		if datePart, ok := parseDailyLogDate(cleanPath); ok {
+			sink.rotatable = true
+			sink.currentDate = datePart
+		}
+	}
 	return &MultiSlogHandler{
-		sink: &multiLogSink{
-			stdout:      stdout,
-			logsHandler: logsHandler,
-			logFilePath: strings.TrimSpace(logFilePath),
-		},
+		sink:  sink,
 		level: slog.LevelInfo,
 	}
 }
@@ -103,6 +130,19 @@ func (h *MultiSlogHandler) Handle(_ context.Context, r slog.Record) error {
 		h.sink.logsHandler.AppendRuntimeLog(line)
 	}
 	if h.sink.logFilePath != "" {
+		recTime := r.Time
+		if recTime.IsZero() {
+			recTime = time.Now().UTC()
+		}
+		recDate := recTime.UTC().Format("2006-01-02")
+		if h.sink.rotatable && recDate != h.sink.currentDate {
+			if h.sink.file != nil {
+				_ = h.sink.file.Close()
+				h.sink.file = nil
+			}
+			h.sink.currentDate = recDate
+			h.sink.logFilePath = filepath.Join(h.sink.logDir, fmt.Sprintf("ambra-%s.log", recDate))
+		}
 		if h.sink.file == nil {
 			if err := os.MkdirAll(filepath.Dir(h.sink.logFilePath), 0o755); err != nil {
 				return err
