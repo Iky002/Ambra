@@ -85,6 +85,8 @@ export function matchesFuzzySearch(item: BaseItemDto, rawTerm: string): boolean 
     item.SeriesName,
     item.ProductionYear ? String(item.ProductionYear) : '',
     ...(item.Genres || []),
+    ...(item.Tags || []),
+    ...(item.Studios?.map((s) => s.Name) || []),
     ...(item.People?.map((p) => p.Name) || []),
   ]
     .filter(Boolean)
@@ -393,14 +395,44 @@ export async function demoFetch<T>(
     return sortItems(list, 'DateCreated', 'Descending').slice(0, limit) as T
   }
 
+  if ((pathname === '/emby/Tags' || pathname === '/Tags') && method === 'GET') {
+    const parentId = qs.get('ParentId') || ''
+    const pool =
+      parentId && store.libraryItems.has(parentId)
+        ? (store.libraryItems.get(parentId) || [])
+            .map((id) => store.items.get(id))
+            .filter((it): it is BaseItemDto => Boolean(it))
+        : Array.from(store.items.values())
+
+    const tagSet = new Set<string>()
+    for (const it of pool) {
+      for (const t of it.Tags || []) {
+        if (t) tagSet.add(t)
+      }
+    }
+    const items = Array.from(tagSet)
+      .sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))
+      .map((name) => ({ Name: name, Id: `tag-${name}` }))
+    return { Items: items, TotalRecordCount: items.length } as T
+  }
+
   const userItemsMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Items$/)
-  if (userItemsMatch && method === 'GET') {
+  const isGlobalItemsQuery = pathname === '/emby/Items' || pathname === '/Items'
+  if ((userItemsMatch || isGlobalItemsQuery) && method === 'GET') {
     const parentId = qs.get('ParentId') || ''
     const includeTypesRaw = qs.get('IncludeItemTypes') || ''
     const includeTypes = includeTypesRaw
       ? new Set(includeTypesRaw.split(',').map((s) => s.trim()))
       : null
     const filters = (qs.get('Filters') || '').split(',').filter(Boolean)
+    const genresParam = (qs.get('Genres') || '')
+      .split(/[|,]/)
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean)
+    const tagsParam = (qs.get('Tags') || '')
+      .split(/[|,]/)
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean)
     const searchTerm = qs.get('SearchTerm') || ''
     const sortBy = qs.get('SortBy') || 'DateCreated'
     const sortOrder = qs.get('SortOrder') || 'Descending'
@@ -429,6 +461,16 @@ export async function demoFetch<T>(
     }
     if (filters.includes('IsUnplayed')) {
       pool = pool.filter((it) => !it.UserData?.Played)
+    }
+    if (genresParam.length > 0) {
+      pool = pool.filter((it) =>
+        (it.Genres || []).some((g) => genresParam.includes(g.toLowerCase())),
+      )
+    }
+    if (tagsParam.length > 0) {
+      pool = pool.filter((it) =>
+        (it.Tags || []).some((t) => tagsParam.includes(t.toLowerCase())),
+      )
     }
     if (searchTerm) {
       pool = pool.filter((it) => matchesFuzzySearch(it, searchTerm))

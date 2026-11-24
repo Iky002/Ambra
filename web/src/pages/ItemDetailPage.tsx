@@ -261,9 +261,19 @@ export function ItemDetailPage() {
                 ))}
               </div>
 
-              {/* 技术徽章：4K / HDR / 简繁字幕 / ASS / PGS */}
-              {techBadges.length > 0 && (
+              {/* 榜单与技术徽章：豆瓣 Top250 / IMDb Top250 / 4K / HDR / 简繁字幕 / ASS / PGS */}
+              {(techBadges.length > 0 || (item.Tags && item.Tags.length > 0)) && (
                 <div className="flex flex-wrap items-center gap-2">
+                  {item.Tags?.some((t) => t === '豆瓣Top250' || t === '豆瓣 Top250') && (
+                    <span className="inline-flex items-center rounded-md border border-emerald-400/50 bg-gradient-to-r from-emerald-950/90 via-emerald-900/80 to-teal-950/90 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide text-emerald-200 shadow-[0_0_12px_rgba(16,185,129,0.2)]">
+                      豆瓣 Top250
+                    </span>
+                  )}
+                  {item.Tags?.some((t) => t === 'IMDb Top250' || t === 'IMDb Top 250') && (
+                    <span className="inline-flex items-center rounded-md border border-amber-400/55 bg-gradient-to-r from-amber-950/90 via-yellow-900/75 to-amber-950/90 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide text-amber-200 shadow-[0_0_12px_rgba(245,158,11,0.22)]">
+                      IMDb Top250
+                    </span>
+                  )}
                   {techBadges.map((b) => (
                     <span
                       key={b.label}
@@ -286,7 +296,7 @@ export function ItemDetailPage() {
                     <button
                       type="button"
                       onClick={() => handlePlay(item.Id, hasResume ? resumeTicks : 0)}
-                      className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all hover:bg-amber-400"
+                      className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all duration-200 hover:-translate-y-0.5 hover:bg-amber-400 active:scale-[0.97]"
                     >
                       <Play className="h-4 w-4 fill-current" />
                       <span>{hasResume ? '继续播放' : '立即播放'}</span>
@@ -295,7 +305,7 @@ export function ItemDetailPage() {
                       <button
                         type="button"
                         onClick={() => handlePlay(item.Id, 0)}
-                        className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-white/8 px-4 py-3 text-sm font-medium text-zinc-100 hover:bg-white/12"
+                        className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-white/8 px-4 py-3 text-sm font-medium text-zinc-100 transition-all duration-200 hover:-translate-y-0.5 hover:bg-white/12 active:scale-[0.97]"
                       >
                         从头播放
                       </button>
@@ -305,7 +315,7 @@ export function ItemDetailPage() {
                   <button
                     type="button"
                     onClick={() => handlePlay(episodes[0].Id, 0)}
-                    className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all hover:bg-amber-400"
+                    className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all duration-200 hover:-translate-y-0.5 hover:bg-amber-400 active:scale-[0.97]"
                   >
                     <Play className="h-4 w-4 fill-current" />
                     <span>播放第 1 集</span>
@@ -315,7 +325,7 @@ export function ItemDetailPage() {
                 <button
                   type="button"
                   onClick={() => favMutation.mutate()}
-                  className={`inline-flex items-center gap-2 rounded-xl border px-4 py-3 text-sm font-medium transition-all ${
+                  className={`inline-flex items-center gap-2 rounded-xl border px-4 py-3 text-sm font-medium transition-all duration-200 hover:-translate-y-0.5 active:scale-[0.97] ${
                     item.UserData?.IsFavorite
                       ? 'border-rose-500/50 bg-rose-500/15 text-rose-300'
                       : 'border-white/12 bg-white/[0.05] text-zinc-200 hover:bg-white/10'
@@ -330,7 +340,7 @@ export function ItemDetailPage() {
                 <button
                   type="button"
                   onClick={() => playedMutation.mutate()}
-                  className={`inline-flex items-center gap-2 rounded-xl border px-4 py-3 text-sm font-medium transition-all ${
+                  className={`inline-flex items-center gap-2 rounded-xl border px-4 py-3 text-sm font-medium transition-all duration-200 hover:-translate-y-0.5 active:scale-[0.97] ${
                     item.UserData?.Played
                       ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
                       : 'border-white/12 bg-white/[0.05] text-zinc-200 hover:bg-white/10'
@@ -429,7 +439,7 @@ export function ItemDetailPage() {
       {/* 剧集：季 Tab 与分集列表 */}
       {isSeries && seasons.length > 0 && (
         <section className="mx-auto max-w-7xl space-y-5 px-4 pt-6 lg:px-8">
-          <div className="flex items-center gap-2 overflow-x-auto border-b border-white/10 pb-3">
+          <div className="no-scrollbar -mx-1 flex items-center gap-2 overflow-x-auto border-b border-white/10 px-1 pb-4 pt-2">
             {seasons.map((season) => {
               const active = season.Id === selectedSeasonId
               return (
@@ -437,10 +447,10 @@ export function ItemDetailPage() {
                   key={season.Id}
                   type="button"
                   onClick={() => setSelectedSeasonId(season.Id)}
-                  className={`shrink-0 rounded-xl px-4 py-2 text-sm font-medium transition-all ${
+                  className={`shrink-0 rounded-xl px-4 py-2 text-sm font-medium transition-all duration-200 active:scale-[0.97] ${
                     active
-                      ? 'bg-amber-500 text-zinc-950 shadow-md shadow-amber-500/20'
-                      : 'bg-white/[0.04] text-zinc-300 hover:bg-white/10'
+                      ? 'bg-amber-500 text-zinc-950 shadow-md shadow-amber-500/25'
+                      : 'bg-white/[0.04] text-zinc-300 hover:bg-white/10 hover:text-zinc-100'
                   }`}
                 >
                   {season.Name}
@@ -454,7 +464,7 @@ export function ItemDetailPage() {
               <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
             </div>
           ) : (
-            <div className="grid gap-4 md:grid-cols-2">
+            <div key={selectedSeasonId} className="animate-page-enter grid gap-4 md:grid-cols-2">
               {episodes.map((ep) => {
                 const epThumb = ep.ImageTags?.Primary
                   ? getImageUrl(ep.Id, 'Primary', { maxWidth: 480, tag: ep.ImageTags.Primary })
@@ -472,7 +482,7 @@ export function ItemDetailPage() {
                   <div
                     key={ep.Id}
                     onClick={() => handlePlay(ep.Id, ep.UserData?.PlaybackPositionTicks || 0)}
-                    className="group flex cursor-pointer gap-4 overflow-hidden rounded-2xl border border-white/8 bg-white/[0.03] p-3 transition-all hover:border-amber-400/40 hover:bg-white/[0.06]"
+                    className="group flex cursor-pointer gap-4 overflow-hidden rounded-2xl border border-white/8 bg-white/[0.03] p-3 transition-all duration-200 ease-out hover:translate-x-1 hover:border-amber-400/50 hover:bg-white/[0.06] hover:shadow-[0_8px_24px_rgba(0,0,0,0.4)]"
                   >
                     <div className="relative aspect-video w-40 shrink-0 overflow-hidden rounded-xl bg-zinc-900">
                       {epThumb ? (
@@ -532,7 +542,7 @@ export function ItemDetailPage() {
       {item.People && item.People.length > 0 && (
         <section className="mx-auto max-w-7xl space-y-4 px-4 pt-10 lg:px-8">
           <h2 className="text-lg font-semibold text-zinc-100">演职员</h2>
-          <div className="no-scrollbar flex gap-4 overflow-x-auto pb-2">
+          <div className="no-scrollbar -mx-1 flex gap-4 overflow-x-auto px-1 pb-4 pt-2">
             {item.People.slice(0, 16).map((person) => {
               const avatar = person.PrimaryImageTag
                 ? getImageUrl(person.Id, 'Primary', {
@@ -540,21 +550,30 @@ export function ItemDetailPage() {
                     tag: person.PrimaryImageTag,
                   })
                 : null
+              const avatarFallback = person.PrimaryImageTag
+                ? getFallbackImageUrl(person.Id, 'Primary')
+                : null
               return (
-                <div key={`${person.Id}-${person.Role}`} className="w-28 shrink-0 text-center">
-                  <div className="mx-auto flex h-24 w-24 items-center justify-center overflow-hidden rounded-full bg-zinc-900 ring-1 ring-white/10">
+                <div
+                  key={`${person.Id}-${person.Role}`}
+                  className="group w-28 shrink-0 text-center transition-transform duration-200 hover:-translate-y-0.5"
+                >
+                  <div className="mx-auto flex h-24 w-24 items-center justify-center overflow-hidden rounded-full border border-white/10 bg-zinc-900 transition-all duration-300 group-hover:border-amber-400/70 group-hover:shadow-[0_0_18px_rgba(245,158,11,0.22)]">
                     {avatar ? (
                       <img
                         src={avatar}
                         alt={person.Name}
                         loading="lazy"
-                        className="h-full w-full object-cover"
+                        onError={(e) => applyFallbackOrHide(e, avatarFallback)}
+                        className="h-full w-full object-cover object-top transition-transform duration-300 ease-out group-hover:scale-110"
                       />
                     ) : (
                       <User className="h-8 w-8 text-zinc-600" />
                     )}
                   </div>
-                  <p className="mt-2 truncate text-xs font-medium text-zinc-200">{person.Name}</p>
+                  <p className="mt-2 truncate text-xs font-medium text-zinc-200 transition-colors group-hover:text-amber-300">
+                    {person.Name}
+                  </p>
                   <p className="truncate text-[11px] text-zinc-500">{person.Role || person.Type}</p>
                 </div>
               )

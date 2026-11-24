@@ -68,9 +68,60 @@ describe('Demo Mock 引擎 - Serverless 完整闭环测试', () => {
     expect(libThumb.startsWith('data:image/svg+xml;charset=utf-8,')).toBe(true)
     expect(avatar.startsWith('data:image/svg+xml;charset=utf-8,')).toBe(true)
 
+    // 演职员头像使用真实 TMDB w185 URL，并提供离线 SVG 回退
+    const actorAvatar = getImageUrl('p-tim-robbins', 'Primary')
+    const actorFallback = getFallbackImageUrl('p-tim-robbins', 'Primary')
+    expect(actorAvatar.startsWith('https://image.tmdb.org/t/p/w185/')).toBe(true)
+    expect(actorFallback?.startsWith('data:image/svg+xml;charset=utf-8,')).toBe(true)
+
     // data: URL 不应被 resolveApiUrl 篡改
     expect(resolveApiUrl(libThumb)).toBe(libThumb)
     expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('扩充 5 部经典 Top 250 电影（总计 14 部影片/剧集）并支持 GET /Tags 与 Tags 筛选', async () => {
+    const authRes = await loginAsDemo('admin')
+    const uid = authRes.User.Id
+
+    const allTitles = await api.getItems(uid, {
+      includeItemTypes: 'Movie,Series',
+      limit: 50,
+    })
+    expect(allTitles.TotalRecordCount).toBe(14)
+
+    const names = allTitles.Items.map((i) => i.Name)
+    expect(names).toEqual(
+      expect.arrayContaining([
+        '肖申克的救赎',
+        '教父',
+        '蝙蝠侠：黑暗骑士',
+        '霸王别姬',
+        '阿甘正传',
+      ]),
+    )
+
+    // GET /emby/Tags 返回榜单标签
+    const tagsRes = await api.getTags({ userId: uid })
+    const tagNames = tagsRes.Items.map((t) => t.Name)
+    expect(tagNames).toContain('豆瓣Top250')
+    expect(tagNames).toContain('IMDb Top250')
+
+    // GET /Items?Tags=豆瓣Top250 与 IMDb Top250 筛选生效
+    const doubanItems = await api.getItems(uid, {
+      includeItemTypes: 'Movie',
+      tags: '豆瓣Top250',
+    })
+    expect(doubanItems.TotalRecordCount).toBeGreaterThanOrEqual(9)
+    expect(doubanItems.Items.some((i) => i.Name === '霸王别姬')).toBe(true)
+    expect(doubanItems.Items.some((i) => i.Name === '肖申克的救赎')).toBe(true)
+
+    const imdbItems = await api.getItems(uid, {
+      includeItemTypes: 'Movie',
+      tags: 'IMDb Top250',
+    })
+    expect(imdbItems.TotalRecordCount).toBeGreaterThanOrEqual(9)
+    expect(imdbItems.Items.some((i) => i.Name === '教父')).toBe(true)
+    expect(imdbItems.Items.some((i) => i.Name === '霸王别姬')).toBe(false)
   })
 
   it('登录（admin/guest）、首页媒体库视图、继续观看与最新添加数据完整', async () => {

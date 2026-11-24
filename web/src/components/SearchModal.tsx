@@ -93,7 +93,7 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
       onClick={onClose}
     >
       <div
-        className="w-full max-w-2xl overflow-hidden rounded-2xl border border-white/12 bg-zinc-950/95 shadow-2xl shadow-black/80"
+        className="animate-modal-enter w-full max-w-2xl overflow-hidden rounded-2xl border border-white/12 bg-zinc-950/95 shadow-2xl shadow-black/80"
         onClick={(e) => e.stopPropagation()}
         onKeyDown={handleKeyDown}
       >

@@ -110,7 +110,7 @@ export function AdminPage() {
       <div className="flex flex-col gap-6 xl:flex-row">
         {/* 左侧/顶部子导航 */}
         <aside className="shrink-0 xl:w-60">
-          <nav className="flex gap-2 overflow-x-auto pb-2 xl:flex-col xl:overflow-visible xl:pb-0">
+          <nav className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-4 pt-2 xl:mx-0 xl:flex-col xl:overflow-visible xl:p-0">
             {ADMIN_TABS.map((tab) => {
               const Icon = tab.icon
               return (
