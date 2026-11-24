@@ -13,6 +13,7 @@ import type {
   BaseItemDto,
   DeviceInfo,
   FileSystemEntry,
+  NameIdPair,
   PlaybackInfoResponse,
   PluginInfo,
   PublicSystemInfo,
@@ -268,6 +269,7 @@ export const api = {
       sortOrder?: 'Ascending' | 'Descending'
       filters?: string
       genres?: string
+      tags?: string
       startIndex?: number
       limit?: number
       recursive?: boolean
@@ -282,6 +284,7 @@ export const api = {
     if (params.sortOrder) q.set('SortOrder', params.sortOrder)
     if (params.filters) q.set('Filters', params.filters)
     if (params.genres) q.set('Genres', params.genres)
+    if (params.tags) q.set('Tags', params.tags)
     if (params.startIndex !== undefined) q.set('StartIndex', String(params.startIndex))
     if (params.limit !== undefined) q.set('Limit', String(params.limit))
     if (params.recursive !== false) q.set('Recursive', 'true')
@@ -289,11 +292,19 @@ export const api = {
     q.set(
       'Fields',
       params.fields ??
-        'PrimaryImageAspectRatio,Overview,MediaSources,Genres,CommunityRating,ProductionYear,DateCreated',
+        'PrimaryImageAspectRatio,Overview,MediaSources,Genres,Tags,Studios,ProviderIds,CommunityRating,ProductionYear,DateCreated',
     )
     return embyFetch<QueryResult<BaseItemDto>>(
       `/emby/Users/${encodeURIComponent(userId)}/Items?${q.toString()}`,
     )
+  },
+
+  getTags: (params?: { userId?: string; parentId?: string }) => {
+    const q = new URLSearchParams()
+    if (params?.userId) q.set('UserId', params.userId)
+    if (params?.parentId) q.set('ParentId', params.parentId)
+    const qs = q.toString()
+    return embyFetch<QueryResult<NameIdPair>>(`/emby/Tags${qs ? `?${qs}` : ''}`)
   },
 
   getItem: (userId: string, itemId: string) =>

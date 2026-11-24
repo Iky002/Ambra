@@ -312,7 +312,9 @@ export function Layout() {
         </header>
 
         <main className="flex-1 pb-16">
-          <Outlet />
+          <div key={location.pathname} className="animate-page-enter">
+            <Outlet />
+          </div>
         </main>
       </div>
 

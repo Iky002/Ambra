@@ -78,3 +78,57 @@ input[type="range"].ambra-range::-webkit-slider-thumb {
 input[type="range"].ambra-range:hover::-webkit-slider-thumb {
   transform: scale(1.2);
 }
+
+/* 现代交互动效关键帧 */
+@keyframes pageEnter {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes modalEnter {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes heroFadeIn {
+  from {
+    opacity: 0;
+    transform: scale(1.03);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.animate-page-enter {
+  animation: pageEnter 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.animate-modal-enter {
+  animation: modalEnter 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.animate-hero-fade {
+  animation: heroFadeIn 500ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-page-enter,
+  .animate-modal-enter,
+  .animate-hero-fade {
+    animation: none !important;
+  }
+}

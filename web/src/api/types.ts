@@ -169,6 +169,8 @@ export interface BaseItemDto {
   OfficialRating?: string
   Overview?: string
   Taglines?: string[]
+  Tags?: string[]
+  TagItems?: NameIdPair[]
   Genres?: string[]
   GenreItems?: NameIdPair[]
   CommunityRating?: number
