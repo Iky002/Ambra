@@ -355,6 +355,7 @@ func (s *Scanner) indexEpisode(
 	seriesCache map[string]*sqlite.ItemRecord,
 	seasonCache map[string]*sqlite.ItemRecord,
 	seenSeriesEnrich map[string]struct{},
+	seenSeriesExtras map[string]struct{},
 ) (bool, []enrichTask, error) {
 	info, err := os.Stat(mediaPath)
 	if err != nil {
@@ -375,6 +376,20 @@ func (s *Scanner) indexEpisode(
 	existing, err := s.repo.FindItemByMediaSourcePath(ctx, lib.ID, mediaPath)
 	if err == nil && existing != nil {
 		if s.isMediaSourceUnchanged(ctx, existing, mediaPath, size, mtime) {
+			if existing.SeriesID != "" {
+				if _, checked := seenSeriesExtras[existing.SeriesID]; !checked {
+					seenSeriesExtras[existing.SeriesID] = struct{}{}
+					if seriesRec, sErr := s.repo.GetItemRecordByID(ctx, existing.SeriesID); sErr == nil && seriesRec != nil {
+						seriesDir := strings.TrimSpace(seriesRec.Path)
+						if seriesDir == "" {
+							seriesDir = epInfo.SeriesDir
+						}
+						if seriesDir != "" {
+							s.scanAndIndexExtras(ctx, lib, seriesRec, seriesDir, "")
+						}
+					}
+				}
+			}
 			if needOnline {
 				var backfillTasks []enrichTask
 				if existing.SeriesID != "" {
@@ -504,6 +519,9 @@ func (s *Scanner) indexEpisode(
 	seriesRec, seriesTask, err := s.ensureSeries(ctx, lib, epInfo, seriesCache, seenSeriesEnrich)
 	if err != nil {
 		return false, nil, err
+	}
+	if seriesRec != nil {
+		seenSeriesExtras[seriesRec.ID] = struct{}{}
 	}
 	if seriesTask != nil {
 		tasks = append(tasks, *seriesTask)

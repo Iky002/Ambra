@@ -11,7 +11,9 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/ambra-media/ambra/internal/api/handlers/livetv"
 	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/core/dvr"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -72,12 +74,28 @@ type compatExtState struct {
 
 // Handler implements extended Emby 4.10.2.0 compatibility routes for LiveTv, Sync, and Notifications.
 type Handler struct {
-	store *sqlite.Store
-	cfg   *config.Config
-	auth  AuthFuncs
+	store  *sqlite.Store
+	cfg    *config.Config
+	auth   AuthFuncs
+	liveTV *livetv.Handler
+	dvrRec *dvr.Recorder
 
 	mu    sync.RWMutex
 	state compatExtState
+}
+
+// SetLiveTV wires the primary Live TV handler for real channel stream proxying.
+func (h *Handler) SetLiveTV(lt *livetv.Handler) {
+	h.mu.Lock()
+	h.liveTV = lt
+	h.mu.Unlock()
+}
+
+// SetDVR wires the DVR recorder for recordings directory validation and timer cancellation.
+func (h *Handler) SetDVR(r *dvr.Recorder) {
+	h.mu.Lock()
+	h.dvrRec = r
+	h.mu.Unlock()
 }
 
 // New constructs a compatext Handler and loads persisted state from SQLite when store is non-nil.

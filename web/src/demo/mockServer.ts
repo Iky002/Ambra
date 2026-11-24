@@ -31,7 +31,7 @@ import type {
   UserPolicy,
   VirtualFolderInfo,
 } from '../api/types'
-import { makeDemoAudioDataUrl } from './demoMedia'
+import { DEMO_VIDEO_DATA_URL, makeDemoAudioDataUrl } from './demoMedia'
 import { createInitialDemoState, DEMO_SERVER_ID, type DemoState } from './mockData'
 import { makeAvatarDataUrl, makeLibraryThumbDataUrl, makePosterDataUrl } from './svgArt'
 
@@ -709,6 +709,34 @@ export async function demoFetch<T>(
 
   if (pathname === '/emby/Sessions/Logout' && method === 'POST') {
     return undefined as T
+  }
+
+  // 忘记密码 & PIN 重置（Demo 模式：绝不将 PIN 写入文件名）
+  if (pathname === '/emby/Users/ForgotPassword' && method === 'POST') {
+    const body = parseJsonBody(options)
+    const entered = String(body.EnteredUsername || '').trim()
+    pushActivity(
+      `收到账号「${entered || 'admin'}」的密码重置请求`,
+      'ForgotPasswordRequested',
+    )
+    return {
+      Action: 'PinCode',
+      PinFile: '/demo-data/passwordreset-demo01.txt',
+      PinExpirationDate: new Date(Date.now() + 30 * 60_000).toISOString(),
+    } as T
+  }
+
+  if (pathname === '/emby/Users/ForgotPassword/Pin' && method === 'POST') {
+    const body = parseJsonBody(options)
+    const pin = String(body.Pin || '').trim()
+    if (pin !== '123456' && !/^\d{6}$/.test(pin)) {
+      throw new ApiError(400, 'PIN 验证码无效，请输入 6 位数字（Demo 可使用 123456）')
+    }
+    pushActivity('已通过 PIN 码完成密码重置（Demo 模式）', 'ForgotPasswordReset')
+    return {
+      Success: true,
+      UsersReset: ['admin'],
+    } as T
   }
 
   // ==================== 3. 用户与权限管理 ====================
@@ -2324,6 +2352,122 @@ export async function demoFetch<T>(
     return { Items: sliced, TotalRecordCount: demoLiveTvChannels.length } as T
   }
 
+  const liveTvStreamMatch = pathname.match(/^\/emby\/LiveTv\/Channels\/([^/]+)\/Stream$/)
+  if (liveTvStreamMatch && method === 'GET') {
+    const channelId = decodeURIComponent(liveTvStreamMatch[1])
+    const channel = demoLiveTvChannels.find((ch) => ch.Id === channelId)
+    if (!channel) {
+      throw new ApiError(404, `频道「${channelId}」不存在`)
+    }
+    return {
+      ChannelId: channel.Id,
+      Name: channel.Name,
+      StreamUrl: DEMO_VIDEO_DATA_URL,
+      MimeType: 'video/mp4',
+    } as T
+  }
+
+  if (pathname === '/emby/LiveTv/Programs' && method === 'GET') {
+    const nowMs = Date.now()
+    const halfHour = 30 * 60_000
+    const oneHour = 60 * 60_000
+    const channelIdsParam = qs.get('ChannelIds')
+    const filterSet = channelIdsParam
+      ? new Set(
+          channelIdsParam
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean),
+        )
+      : null
+    const limit = Number(qs.get('Limit') || 100)
+
+    const epgTemplates: Record<
+      string,
+      Array<{ name: string; overview: string; offsetStart: number; offsetEnd: number }>
+    > = {
+      'ch-demo-01': [
+        {
+          name: '新闻联播',
+          overview: '每日晚间权威时政与国际要闻播报。',
+          offsetStart: -halfHour,
+          offsetEnd: halfHour,
+        },
+        {
+          name: '焦点访谈',
+          overview: '深度聚焦社会热点与民生话题。',
+          offsetStart: halfHour,
+          offsetEnd: halfHour + oneHour,
+        },
+        {
+          name: '黄金档剧场',
+          overview: '精品国产剧连播。',
+          offsetStart: halfHour + oneHour,
+          offsetEnd: halfHour + 2 * oneHour,
+        },
+      ],
+      'ch-demo-02': [
+        {
+          name: '佳片有约：经典科幻之夜',
+          overview: '深度影评导赏与高分科幻经典展映。',
+          offsetStart: -halfHour,
+          offsetEnd: oneHour,
+        },
+        {
+          name: '中国电影报道',
+          overview: '聚焦院线新片动态与幕后花絮。',
+          offsetStart: oneHour,
+          offsetEnd: 2 * oneHour,
+        },
+      ],
+      'ch-demo-03': [
+        {
+          name: '4K HDR 自然纪录片：蔚蓝星球',
+          overview: '超高清 60fps 实拍深海与极地奇观。',
+          offsetStart: -halfHour,
+          offsetEnd: oneHour,
+        },
+        {
+          name: '杜比视界演示片合集',
+          overview: '高动态范围色彩与声场测试节目。',
+          offsetStart: oneHour,
+          offsetEnd: 2 * oneHour,
+        },
+      ],
+    }
+
+    const allPrograms = demoLiveTvChannels.flatMap((ch) => {
+      const templates = epgTemplates[ch.Id] || [
+        {
+          name: `${ch.Name} 实时节目`,
+          overview: `${ch.Name} 正在播出的高清直播内容。`,
+          offsetStart: -halfHour,
+          offsetEnd: halfHour,
+        },
+        {
+          name: `${ch.Name} 精彩预告`,
+          overview: '下一时段精选节目即将开始。',
+          offsetStart: halfHour,
+          offsetEnd: halfHour + oneHour,
+        },
+      ]
+      return templates.map((tpl, idx) => ({
+        Id: `prog-${ch.Id}-${idx + 1}`,
+        ChannelId: ch.Id,
+        Name: tpl.name,
+        Overview: tpl.overview,
+        StartDate: new Date(nowMs + tpl.offsetStart).toISOString(),
+        EndDate: new Date(nowMs + tpl.offsetEnd).toISOString(),
+      }))
+    })
+
+    const filtered = filterSet
+      ? allPrograms.filter((p) => filterSet.has(p.ChannelId))
+      : allPrograms
+    const sliced = filtered.slice(0, limit)
+    return { Items: sliced, TotalRecordCount: filtered.length } as T
+  }
+
   if (pathname === '/emby/LiveTv/TunerHosts') {
     if (method === 'GET') {
       return demoTunerHosts.map((h) => ({ ...h })) as T
@@ -2661,6 +2805,27 @@ export async function demoFetch<T>(
     item.Etag = `etag-${Date.now().toString(36)}`
     pushActivity(`已将远端识别结果应用于「${item.Name}」`, 'ItemIdentified')
     return undefined as T
+  }
+
+  const itemThemeSongsMatch = pathname.match(/^\/emby\/Items\/([^/]+)\/ThemeSongs$/)
+  if (itemThemeSongsMatch && method === 'GET') {
+    const itemId = decodeURIComponent(itemThemeSongsMatch[1])
+    const item = store.items.get(itemId)
+    if (!item) {
+      return { Items: [], TotalRecordCount: 0 } as T
+    }
+    const themeSong: BaseItemDto = {
+      Id: `theme-${item.Id}`,
+      Name: `${item.Name} — 原声主题曲`,
+      ServerId: DEMO_SERVER_ID,
+      Type: 'Audio',
+      MediaType: 'Audio',
+      Album: `${item.Name} (Original Soundtrack)`,
+      Artists: ['Ambra Demo Orchestra'],
+      RunTimeTicks: 200_000_000,
+      ParentId: item.Id,
+    }
+    return { Items: [themeSong], TotalRecordCount: 1 } as T
   }
 
   const itemRefreshMatch = pathname.match(/^\/emby\/Items\/([^/]+)\/Refresh$/)

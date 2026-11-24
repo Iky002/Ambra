@@ -202,6 +202,10 @@ export function HealthAndAuditTab() {
   const [creatingBackup, setCreatingBackup] = useState(false)
   const [restoreTarget, setRestoreTarget] = useState<BackupFileInfo | null>(null)
   const [restoringBackup, setRestoringBackup] = useState(false)
+  const [backupFeedback, setBackupFeedback] = useState<{
+    type: 'success' | 'error'
+    message: string
+  } | null>(null)
 
   const fetchBackupInfo = useCallback(async () => {
     setBackupLoading(true)
@@ -209,7 +213,7 @@ export function HealthAndAuditTab() {
       const data = await api.getBackupInfo()
       setBackupInfo(data)
     } catch (err) {
-      setFeedback({
+      setBackupFeedback({
         type: 'error',
         message: err instanceof Error ? err.message : '获取数据库备份列表失败',
       })
@@ -266,16 +270,16 @@ export function HealthAndAuditTab() {
 
   const handleCreateBackup = async () => {
     setCreatingBackup(true)
-    setFeedback(null)
+    setBackupFeedback(null)
     try {
       const created = await api.createBackup()
-      setFeedback({
+      setBackupFeedback({
         type: 'success',
         message: `已创建数据库备份「${created.Name}」（${formatBytes(created.Size)}）`,
       })
       await fetchBackupInfo()
     } catch (err) {
-      setFeedback({
+      setBackupFeedback({
         type: 'error',
         message: err instanceof Error ? err.message : '创建数据库备份失败',
       })
@@ -287,17 +291,17 @@ export function HealthAndAuditTab() {
   const handleConfirmRestore = async () => {
     if (!restoreTarget) return
     setRestoringBackup(true)
-    setFeedback(null)
+    setBackupFeedback(null)
     try {
       const res = await api.restoreBackup(restoreTarget.Name)
       setRestoreTarget(null)
-      setFeedback({
+      setBackupFeedback({
         type: 'success',
         message: `已暂存恢复文件「${res.BackupName}」至 ${res.StagedPath || 'ambra.db.restore'}，将在下次重启服务器后生效`,
       })
       await fetchBackupInfo()
     } catch (err) {
-      setFeedback({
+      setBackupFeedback({
         type: 'error',
         message: err instanceof Error ? err.message : '恢复数据库备份失败',
       })
@@ -991,7 +995,7 @@ export function HealthAndAuditTab() {
         )}
       </section>
       {/* 区块 4：数据库备份与恢复 */}
-      <section className="space-y-4">
+      <section data-testid="backup-restore-section" className="space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="flex items-center gap-2 text-base font-semibold text-zinc-100">
@@ -1028,7 +1032,19 @@ export function HealthAndAuditTab() {
           </div>
         </div>
 
-        <div className="overflow-hidden rounded-2xl border border-white/8 bg-white/[0.02]">
+        <div
+          data-testid="backup-restore-card"
+          className="overflow-hidden rounded-2xl border border-white/8 bg-white/[0.02]"
+        >
+          {backupFeedback && (
+            <div className="border-b border-white/8 px-4 py-3">
+              <FeedbackBanner
+                message={backupFeedback.message}
+                type={backupFeedback.type}
+                onClose={() => setBackupFeedback(null)}
+              />
+            </div>
+          )}
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/8 px-4 py-3 text-xs">
             <div className="flex items-center gap-2 text-zinc-400">
               <HardDrive className="h-3.5 w-3.5 text-amber-400" />
