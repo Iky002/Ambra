@@ -1,0 +1,107 @@
+import React, { createContext, useCallback, useContext, useEffect, useState } from 'react'
+import { api, clearAuth, getDeviceId, getStoredAuth, saveAuth } from '../api/client'
+import type { AuthSession, UserDto } from '../api/types'
+
+interface AuthContextValue {
+  auth: AuthSession | null
+  user: UserDto | null
+  isAdmin: boolean
+  userLoading: boolean
+  login: (username: string, password: string) => Promise<void>
+  logout: () => void
+  refreshUser: () => Promise<void>
+}
+
+const AuthContext = createContext<AuthContextValue | null>(null)
+
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [auth, setAuth] = useState<AuthSession | null>(() => getStoredAuth())
+  const [user, setUser] = useState<UserDto | null>(null)
+  const [userLoading, setUserLoading] = useState<boolean>(() => Boolean(getStoredAuth()))
+
+  const logout = useCallback(() => {
+    clearAuth()
+    setAuth(null)
+    setUser(null)
+    setUserLoading(false)
+  }, [])
+
+  const refreshUser = useCallback(async () => {
+    const current = getStoredAuth()
+    if (!current?.userId) {
+      setUser(null)
+      setUserLoading(false)
+      return
+    }
+    setUserLoading(true)
+    try {
+      const freshUser = await api.getUser(current.userId)
+      setUser(freshUser)
+      const freshIsAdmin = Boolean(freshUser.Policy?.IsAdministrator)
+      if (current.isAdmin !== freshIsAdmin || current.userName !== freshUser.Name) {
+        const updated: AuthSession = {
+          ...current,
+          userName: freshUser.Name,
+          isAdmin: freshIsAdmin,
+        }
+        saveAuth(updated)
+        setAuth(updated)
+      }
+    } catch {
+      // 如果因 401 失效，embyFetch 会触发 ambra:unauthorized 事件清空 auth
+    } finally {
+      setUserLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (auth?.userId) {
+      void refreshUser()
+    } else {
+      setUser(null)
+      setUserLoading(false)
+    }
+  }, [auth?.userId, refreshUser])
+
+  useEffect(() => {
+    const onUnauthorized = () => {
+      setAuth(null)
+      setUser(null)
+      setUserLoading(false)
+    }
+    window.addEventListener('ambra:unauthorized', onUnauthorized)
+    return () => window.removeEventListener('ambra:unauthorized', onUnauthorized)
+  }, [])
+
+  const login = useCallback(async (username: string, password: string) => {
+    const res = await api.authenticateByName(username, password)
+    const isAdminFlag = Boolean(res.User.Policy?.IsAdministrator)
+    const session: AuthSession = {
+      accessToken: res.AccessToken,
+      userId: res.User.Id,
+      serverId: res.ServerId || res.User.ServerId || '',
+      userName: res.User.Name,
+      isAdmin: isAdminFlag,
+      deviceId: getDeviceId(),
+    }
+    saveAuth(session)
+    setAuth(session)
+    setUser(res.User)
+    setUserLoading(false)
+  }, [])
+
+  // 严格以当前用户 Policy.IsAdministrator 为准；用户资料尚未加载完时回退至登录会话中的 isAdmin
+  const isAdmin = user ? Boolean(user.Policy?.IsAdministrator) : Boolean(auth?.isAdmin)
+
+  return (
+    <AuthContext.Provider value={{ auth, user, isAdmin, userLoading, login, logout, refreshUser }}>
+      {children}
+    </AuthContext.Provider>
+  )
+}
+
+export function useAuth(): AuthContextValue {
+  const ctx = useContext(AuthContext)
+  if (!ctx) throw new Error('useAuth 必须在 AuthProvider 内部使用')
+  return ctx
+}

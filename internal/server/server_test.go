@@ -1,0 +1,120 @@
+package server
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/ambra-media/ambra/internal/config"
+)
+
+func TestServerLifecycleAndRoutes(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg, err := config.Load(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Place an external plugin manifest to exercise ext.Loader integration
+	extDir := filepath.Join(dataDir, "plugins", "demo-ext")
+	if err := os.MkdirAll(extDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `{"Id":"demo-ext","Name":"Demo External","Version":"1.0.0","Endpoint":"http://127.0.0.1:19999","Enabled":true,"Priority":50,"Kinds":["metadata"]}`
+	if err := os.WriteFile(filepath.Join(extDir, "manifest.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("server.New failed: %v", err)
+	}
+	defer func() {
+		if err := srv.Close(); err != nil {
+			t.Fatalf("server.Close failed: %v", err)
+		}
+	}()
+
+	if len(srv.PluginLoader.Loaded()) != 1 {
+		t.Fatalf("expected 1 external plugin loaded, got %d", len(srv.PluginLoader.Loaded()))
+	}
+
+	// Root redirect -> /web/
+	rec := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/web/" {
+		t.Fatalf("expected 302 to /web/, got %d %q", rec.Code, rec.Header().Get("Location"))
+	}
+
+	// Root favicon
+	rec = httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/favicon.ico", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "<svg") {
+		t.Fatalf("expected SVG favicon, got %d", rec.Code)
+	}
+
+	// Web index and SPA fallback
+	rec = httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/web/", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "<html") {
+		t.Fatalf("expected embedded index.html, got %d", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/web/nonexistent-spa-route", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "<html") {
+		t.Fatalf("expected SPA fallback to index.html, got %d", rec.Code)
+	}
+
+	// Public Phase 4-6 routes via delegated mediaMux
+	for _, p := range []string{"/openapi.json", "/robots.txt", "/Dlna/test-uuid/description.xml"} {
+		rec = httptest.NewRecorder()
+		srv.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, p, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 on %s, got %d", p, rec.Code)
+		}
+	}
+
+	// Trigger builtin RefreshLibrary task callback via scheduler
+	tasks := srv.Scheduler.List(true)
+	if len(tasks) == 0 {
+		t.Fatalf("expected builtin scheduled tasks")
+	}
+	if err := srv.Scheduler.Run(tasks[0].Id); err != nil {
+		t.Fatalf("expected Run builtin task to succeed, got %v", err)
+	}
+}
+
+func TestBuildWebHandlerExternalDir(t *testing.T) {
+	extWeb := t.TempDir()
+	if err := os.WriteFile(filepath.Join(extWeb, "index.html"), []byte("<html>custom-web</html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(extWeb, "app.js"), []byte("console.log(1)"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := buildWebHandler(extWeb)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/app.js", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "console.log") {
+		t.Fatalf("expected external app.js, got %d %q", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/unknown", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "custom-web") {
+		t.Fatalf("expected external SPA fallback, got %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestServerNewInvalidPath(t *testing.T) {
+	cfg := config.Default("/nonexistent-readonly-path-ambra/should-fail")
+	if _, err := New(context.Background(), cfg); err == nil {
+		t.Fatalf("expected error opening invalid db path")
+	}
+}
