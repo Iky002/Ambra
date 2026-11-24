@@ -79,7 +79,7 @@ describe('Demo Mock 引擎 - Serverless 完整闭环测试', () => {
     expect(fetchSpy).not.toHaveBeenCalled()
   })
 
-  it('扩充 5 部经典 Top 250 电影（总计 14 部影片/剧集）并支持 GET /Tags 与 Tags 筛选', async () => {
+  it('扩充经典 Top 250 与实时热门作品（总计 20 部影片/剧集）并支持 GET /Tags 与 Tags 筛选', async () => {
     const authRes = await loginAsDemo('admin')
     const uid = authRes.User.Id
 
@@ -87,7 +87,7 @@ describe('Demo Mock 引擎 - Serverless 完整闭环测试', () => {
       includeItemTypes: 'Movie,Series',
       limit: 50,
     })
-    expect(allTitles.TotalRecordCount).toBe(14)
+    expect(allTitles.TotalRecordCount).toBe(20)
 
     const names = allTitles.Items.map((i) => i.Name)
     expect(names).toEqual(
@@ -97,6 +97,12 @@ describe('Demo Mock 引擎 - Serverless 完整闭环测试', () => {
         '蝙蝠侠：黑暗骑士',
         '霸王别姬',
         '阿甘正传',
+        '周处除三害',
+        '头脑特工队 2',
+        '机器人之梦',
+        '幕府将军',
+        '繁花',
+        '漫长的季节',
       ]),
     )
 
@@ -105,6 +111,30 @@ describe('Demo Mock 引擎 - Serverless 完整闭环测试', () => {
     const tagNames = tagsRes.Items.map((t) => t.Name)
     expect(tagNames).toContain('豆瓣Top250')
     expect(tagNames).toContain('IMDb Top250')
+    expect(tagNames).toContain('TMDB热门')
+    expect(tagNames).toContain('豆瓣热门电影')
+    expect(tagNames).toContain('豆瓣热门剧集')
+
+    // 验证 StartIndex & Limit 服务端分页准确生效
+    const page1 = await api.getItems(uid, {
+      includeItemTypes: 'Movie,Series',
+      sortBy: 'DateCreated',
+      sortOrder: 'Descending',
+      startIndex: 0,
+      limit: 8,
+    })
+    const page2 = await api.getItems(uid, {
+      includeItemTypes: 'Movie,Series',
+      sortBy: 'DateCreated',
+      sortOrder: 'Descending',
+      startIndex: 8,
+      limit: 8,
+    })
+    expect(page1.TotalRecordCount).toBe(20)
+    expect(page1.Items).toHaveLength(8)
+    expect(page2.TotalRecordCount).toBe(20)
+    expect(page2.Items).toHaveLength(8)
+    expect(page1.Items[0].Id).not.toBe(page2.Items[0].Id)
 
     // GET /Items?Tags=豆瓣Top250 与 IMDb Top250 筛选生效
     const doubanItems = await api.getItems(uid, {
@@ -393,22 +423,46 @@ describe('Demo Mock 引擎 - Serverless 完整闭环测试', () => {
     const authRes = await loginAsDemo('admin')
     const uid = authRes.User.Id
 
-    // 1. TMDB Trending 榜单状态与 Tags=Trending 过滤
+    // 1. TMDB Trending & 豆瓣热门电影/剧集榜单状态与 Tags 过滤
     const rankings = await api.getRankingsSummary()
     expect(rankings.tmdb_trending).toBeDefined()
     expect(rankings.tmdb_trending?.count).toBeGreaterThan(0)
+    expect(rankings.douban_trending_movie).toBeDefined()
+    expect(rankings.douban_trending_movie?.count).toBe(50)
+    expect(rankings.douban_trending_tv).toBeDefined()
+    expect(rankings.douban_trending_tv?.count).toBe(50)
 
     const trendingItems = await api.getItems(uid, {
-      tags: 'Trending',
+      tags: 'TMDB热门',
       includeItemTypes: 'Movie,Series',
       limit: 50,
     })
-    expect(trendingItems.TotalRecordCount).toBeGreaterThanOrEqual(4)
+    expect(trendingItems.TotalRecordCount).toBeGreaterThanOrEqual(6)
     expect(trendingItems.Items.some((i) => i.Id === 'item-dune-2')).toBe(true)
-    expect(trendingItems.Items.some((i) => i.Id === 'item-three-body')).toBe(true)
+    expect(trendingItems.Items.some((i) => i.Id === 'item-shogun')).toBe(true)
+
+    const doubanHotMovies = await api.getItems(uid, {
+      tags: '豆瓣热门电影',
+      includeItemTypes: 'Movie',
+      limit: 50,
+    })
+    expect(doubanHotMovies.TotalRecordCount).toBeGreaterThanOrEqual(4)
+    expect(doubanHotMovies.Items.some((i) => i.Name === '周处除三害')).toBe(true)
+    expect(doubanHotMovies.Items.some((i) => i.Name === '机器人之梦')).toBe(true)
+
+    const doubanHotTv = await api.getItems(uid, {
+      tags: '豆瓣热门剧集',
+      includeItemTypes: 'Series',
+      limit: 50,
+    })
+    expect(doubanHotTv.TotalRecordCount).toBeGreaterThanOrEqual(4)
+    expect(doubanHotTv.Items.some((i) => i.Name === '漫长的季节')).toBe(true)
+    expect(doubanHotTv.Items.some((i) => i.Name === '繁花')).toBe(true)
 
     const refreshRes = await api.refreshRankings()
     expect(refreshRes.tmdb_trending_count).toBeGreaterThan(0)
+    expect(refreshRes.douban_trending_movie_count).toBe(50)
+    expect(refreshRes.douban_trending_tv_count).toBe(50)
 
     // 2. Person 演职员合成 DTO 与 PersonIds / Person 过滤
     const nolan = await api.getItem(uid, 'p-nolan')

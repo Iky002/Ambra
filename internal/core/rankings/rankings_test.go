@@ -338,6 +338,22 @@ func TestCachePersistenceFailureRetentionAndMatching(t *testing.T) {
 				{Rank: 1, Title: "沙丘2", OriginalTitle: "Dune: Part Two", Year: 2024, MediaType: "movie", TMDBID: "693134", Rating: 8.2},
 			}, SourceTMDBTrendingAPI, nil
 		},
+		DoubanTrendingMovieFetcher: func(ctx context.Context) ([]ChartEntry, string, error) {
+			if failFetches.Load() {
+				return nil, "", http.ErrHandlerTimeout
+			}
+			return []ChartEntry{
+				{Rank: 1, Title: "好东西", OriginalTitle: "Her Story", Year: 2024, MediaType: "movie", DoubanID: "36779837", Rating: 9.1},
+			}, SourceDoubanTrendingMovieAPI, nil
+		},
+		DoubanTrendingTVFetcher: func(ctx context.Context) ([]ChartEntry, string, error) {
+			if failFetches.Load() {
+				return nil, "", http.ErrHandlerTimeout
+			}
+			return []ChartEntry{
+				{Rank: 1, Title: "山花烂漫时", OriginalTitle: "She and Her Girls", Year: 2024, MediaType: "tv", DoubanID: "35503073", Rating: 9.6},
+			}, SourceDoubanTrendingTVAPI, nil
+		},
 	}
 	svc := New(store, nil, opts)
 	ctx := context.Background()
@@ -347,7 +363,8 @@ func TestCachePersistenceFailureRetentionAndMatching(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SyncAndApply failed: %v", err)
 	}
-	if summary.DoubanCount != 3 || summary.IMDbCount != 2 || summary.TMDBTrendingCount != 1 {
+	if summary.DoubanCount != 3 || summary.IMDbCount != 2 || summary.TMDBTrendingCount != 1 ||
+		summary.DoubanTrendingMovieCount != 1 || summary.DoubanTrendingTVCount != 1 {
 		t.Fatalf("unexpected counts: %+v", summary)
 	}
 
@@ -357,10 +374,12 @@ func TestCachePersistenceFailureRetentionAndMatching(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when all sources fail")
 	}
-	if failSummary.DoubanError == "" || failSummary.IMDbError == "" || failSummary.TMDBTrendingError == "" {
+	if failSummary.DoubanError == "" || failSummary.IMDbError == "" || failSummary.TMDBTrendingError == "" ||
+		failSummary.DoubanTrendingMovieError == "" || failSummary.DoubanTrendingTVError == "" {
 		t.Fatalf("expected all errors populated: %+v", failSummary)
 	}
-	if failSummary.DoubanCount != 3 || failSummary.IMDbCount != 2 || failSummary.TMDBTrendingCount != 1 {
+	if failSummary.DoubanCount != 3 || failSummary.IMDbCount != 2 || failSummary.TMDBTrendingCount != 1 ||
+		failSummary.DoubanTrendingMovieCount != 1 || failSummary.DoubanTrendingTVCount != 1 {
 		t.Fatalf("expected old cache preserved on failure, got %+v", failSummary)
 	}
 
@@ -484,13 +503,23 @@ func TestApplyTagsToLibraryNonDestructiveIdempotentAndEvent(t *testing.T) {
 				{Rank: 1, Title: "绝命毒师", OriginalTitle: "Breaking Bad", Year: 2008, MediaType: "tv", TMDBID: "1396"},
 			}, SourceTMDBTrendingAPI, nil
 		},
+		DoubanTrendingMovieFetcher: func(ctx context.Context) ([]ChartEntry, string, error) {
+			return []ChartEntry{
+				{Rank: 1, Title: "好东西", Year: 2024, MediaType: "movie", DoubanID: "36779837"},
+			}, SourceDoubanTrendingMovieAPI, nil
+		},
+		DoubanTrendingTVFetcher: func(ctx context.Context) ([]ChartEntry, string, error) {
+			return []ChartEntry{
+				{Rank: 1, Title: "山花烂漫时", Year: 2024, MediaType: "tv", DoubanID: "35503073"},
+			}, SourceDoubanTrendingTVAPI, nil
+		},
 	})
 	summary, err := svc.SyncAndApply(ctx)
 	if err != nil {
 		t.Fatalf("SyncAndApply: %v", err)
 	}
-	if summary.MatchedItems != 2 || summary.TagsAdded != 4 {
-		t.Fatalf("expected matched=2, tagsAdded=4, got %+v", summary)
+	if summary.MatchedItems != 2 || summary.TagsAdded != 5 {
+		t.Fatalf("expected matched=2, tagsAdded=5, got %+v", summary)
 	}
 
 	// Verify user custom tags were preserved alongside new ranking tags.
@@ -500,7 +529,7 @@ func TestApplyTagsToLibraryNonDestructiveIdempotentAndEvent(t *testing.T) {
 		t.Fatalf("movie1 tags = %q, want %q", strings.Join(m1Tags, ","), wantM1)
 	}
 	s1Tags := getItemTags(t, store, series1.ID)
-	wantS1 := TagIMDbTop250 + "," + TagTMDBTrending
+	wantS1 := TagIMDbTop250 + "," + TagTMDBTrendingSpecific + "," + TagTMDBTrending
 	if strings.Join(s1Tags, ",") != wantS1 {
 		t.Fatalf("series1 tags = %v, want %q", s1Tags, wantS1)
 	}
@@ -553,10 +582,12 @@ func TestStartPeriodicSyncAndGracefulShutdown(t *testing.T) {
 	defer feedSrv.Close()
 
 	svc := New(store, nil, Options{
-		DoubanURL:    feedSrv.URL,
-		IMDbURL:      feedSrv.URL,
-		InitialDelay: 10 * time.Millisecond,
-		SyncInterval: 35 * time.Millisecond,
+		DoubanURL:              feedSrv.URL,
+		IMDbURL:                feedSrv.URL,
+		DoubanTrendingMovieURL: feedSrv.URL,
+		DoubanTrendingTVURL:    feedSrv.URL,
+		InitialDelay:           10 * time.Millisecond,
+		SyncInterval:           35 * time.Millisecond,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -606,7 +637,12 @@ func TestHTTPHandlersAuthAndResponses(t *testing.T) {
 	}))
 	defer feedSrv.Close()
 
-	svc := New(store, nil, Options{DoubanURL: feedSrv.URL, IMDbURL: feedSrv.URL})
+	svc := New(store, nil, Options{
+		DoubanURL:              feedSrv.URL,
+		IMDbURL:                feedSrv.URL,
+		DoubanTrendingMovieURL: feedSrv.URL,
+		DoubanTrendingTVURL:    feedSrv.URL,
+	})
 	h := NewHandler(svc)
 
 	mux := http.NewServeMux()
@@ -1011,10 +1047,12 @@ func TestTMDBTrendingPersistenceAutoTaggingAndEndpoint(t *testing.T) {
 
 	// Even when Douban & IMDb fail, live TMDB Trending succeeds -> SyncAndApply succeeds.
 	svc := New(store, nil, Options{
-		DoubanURL:           failSrv.URL,
-		IMDbURL:             failSrv.URL,
-		TMDBAPIKey:          "live-key",
-		TMDBTrendingBaseURL: tmdbSrv.URL,
+		DoubanURL:              failSrv.URL,
+		IMDbURL:                failSrv.URL,
+		TMDBAPIKey:             "live-key",
+		TMDBTrendingBaseURL:    tmdbSrv.URL,
+		DoubanTrendingMovieURL: failSrv.URL,
+		DoubanTrendingTVURL:    failSrv.URL,
 	})
 
 	// Before sync, TrendingEntries returns empty non-nil slice.
@@ -1027,15 +1065,19 @@ func TestTMDBTrendingPersistenceAutoTaggingAndEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected SyncAndApply to succeed when live TMDB trending succeeds: %v", err)
 	}
-	if sum.TMDBTrendingCount != 2 || sum.MatchedItems != 2 || sum.TagsAdded != 2 {
+	// movie ("沙丘2"/tmdb=693134) matches both TMDB Trending and built-in Douban Trending Movie -> Trending, TMDB热门, 豆瓣热门电影 (3 tags)
+	// series ("鱿鱼游戏"/tmdb=93405) matches both TMDB Trending and built-in Douban Trending TV -> Trending, TMDB热门, 豆瓣热门剧集 (3 tags)
+	if sum.TMDBTrendingCount != 2 || sum.MatchedItems != 2 || sum.TagsAdded != 6 {
 		t.Fatalf("unexpected summary: %+v", sum)
 	}
 
-	if tags := getItemTags(t, store, movie.ID); strings.Join(tags, ",") != TagTMDBTrending {
-		t.Fatalf("movie tags = %v, want [%s]", tags, TagTMDBTrending)
+	wantMovieTags := TagTMDBTrendingSpecific + "," + TagTMDBTrending + "," + TagDoubanTrendingMovie
+	if tags := getItemTags(t, store, movie.ID); strings.Join(tags, ",") != wantMovieTags {
+		t.Fatalf("movie tags = %v, want %q", tags, wantMovieTags)
 	}
-	if tags := getItemTags(t, store, series.ID); strings.Join(tags, ",") != TagTMDBTrending {
-		t.Fatalf("series tags = %v, want [%s]", tags, TagTMDBTrending)
+	wantSeriesTags := TagTMDBTrendingSpecific + "," + TagTMDBTrending + "," + TagDoubanTrendingTV
+	if tags := getItemTags(t, store, series.ID); strings.Join(tags, ",") != wantSeriesTags {
+		t.Fatalf("series tags = %v, want %q", tags, wantSeriesTags)
 	}
 
 	// Reload from SQLite in a fresh service and test GET /System/Rankings/Trending.
@@ -1089,6 +1131,337 @@ func TestTMDBTrendingPersistenceAutoTaggingAndEndpoint(t *testing.T) {
 	}
 	if err := New(store, nil, Options{}).LoadCache(ctx); err == nil {
 		t.Fatal("expected LoadCache error on corrupted TMDB trending JSON")
+	}
+}
+
+func TestFetchDoubanTrendingMovieAndTVAndFallbacks(t *testing.T) {
+	t.Setenv(EnvDoubanTrendingMovieURL, "")
+	t.Setenv(EnvDoubanTrendingTVURL, "")
+
+	var sawMovieReferer, sawTVReferer atomic.Bool
+	movieSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("User-Agent") == "" {
+			t.Errorf("expected User-Agent header")
+		}
+		if r.Header.Get("Referer") == "https://movie.douban.com/" {
+			sawMovieReferer.Store(true)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"subjects":[
+			{"id":"34780991","title":"哪吒之魔童闹海","rate":"8.5","url":"https://movie.douban.com/subject/34780991/"},
+			{"id":"34780991","title":"哪吒之魔童闹海","rate":"8.5"},
+			{"id":"","title":"好东西 &amp; 朋友","rate":"9.1","url":"https://movie.douban.com/subject/36779837/"},
+			{"id":"","title":""}
+		]}`))
+	}))
+	defer movieSrv.Close()
+
+	tvSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Referer") == "https://movie.douban.com/" {
+			sawTVReferer.Store(true)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"subjects":[
+			{"id":"35503073","title":"山花烂漫时","rate":"9.6","url":"https://movie.douban.com/subject/35503073/"},
+			{"id":"35490167","title":"我的阿勒泰","rate":"8.9","url":"https://movie.douban.com/subject/35490167/"}
+		]}`))
+	}))
+	defer tvSrv.Close()
+
+	ctx := context.Background()
+
+	// 1. Live JSON fetch via Options URLs
+	f := NewFetcher(Options{
+		DoubanTrendingMovieURL: movieSrv.URL,
+		DoubanTrendingTVURL:    tvSrv.URL,
+	})
+	mSnap, err := f.FetchDoubanTrendingMovie(ctx)
+	if err != nil {
+		t.Fatalf("FetchDoubanTrendingMovie failed: %v", err)
+	}
+	if !sawMovieReferer.Load() {
+		t.Fatal("expected Referer header for douban movie request")
+	}
+	if mSnap.Chart != ChartDoubanTrendingMovie || mSnap.Source != SourceDoubanTrendingMovieAPI || mSnap.Count != 2 {
+		t.Fatalf("unexpected movie snap: %+v", mSnap)
+	}
+	if mSnap.Entries[0].DoubanID != "34780991" || mSnap.Entries[0].Title != "哪吒之魔童闹海" ||
+		mSnap.Entries[0].Rating != 8.5 || mSnap.Entries[0].MediaType != "movie" || mSnap.Entries[0].Rank != 1 {
+		t.Fatalf("unexpected movie entry[0]: %+v", mSnap.Entries[0])
+	}
+	if mSnap.Entries[1].DoubanID != "36779837" || mSnap.Entries[1].Title != "好东西 & 朋友" || mSnap.Entries[1].Rank != 2 {
+		t.Fatalf("unexpected movie entry[1]: %+v", mSnap.Entries[1])
+	}
+
+	tvSnap, err := f.FetchDoubanTrendingTV(ctx)
+	if err != nil {
+		t.Fatalf("FetchDoubanTrendingTV failed: %v", err)
+	}
+	if !sawTVReferer.Load() {
+		t.Fatal("expected Referer header for douban tv request")
+	}
+	if tvSnap.Chart != ChartDoubanTrendingTV || tvSnap.Source != SourceDoubanTrendingTVAPI || tvSnap.Count != 2 {
+		t.Fatalf("unexpected tv snap: %+v", tvSnap)
+	}
+	if tvSnap.Entries[0].DoubanID != "35503073" || tvSnap.Entries[0].MediaType != "tv" || tvSnap.Entries[0].Rating != 9.6 {
+		t.Fatalf("unexpected tv entry[0]: %+v", tvSnap.Entries[0])
+	}
+
+	// 2. Env var and default URL resolution
+	t.Setenv(EnvDoubanTrendingMovieURL, movieSrv.URL)
+	t.Setenv(EnvDoubanTrendingTVURL, tvSrv.URL)
+	fEnv := NewFetcher(Options{})
+	if fEnv.resolveDoubanTrendingMovieURL() != movieSrv.URL || fEnv.resolveDoubanTrendingTVURL() != tvSrv.URL {
+		t.Fatalf("unexpected env URLs: %s / %s", fEnv.resolveDoubanTrendingMovieURL(), fEnv.resolveDoubanTrendingTVURL())
+	}
+	t.Setenv(EnvDoubanTrendingMovieURL, "")
+	t.Setenv(EnvDoubanTrendingTVURL, "")
+	if fEnv.resolveDoubanTrendingMovieURL() != DefaultDoubanTrendingMovieURL ||
+		fEnv.resolveDoubanTrendingTVURL() != DefaultDoubanTrendingTVURL {
+		t.Fatalf("unexpected default URLs: %s / %s", fEnv.resolveDoubanTrendingMovieURL(), fEnv.resolveDoubanTrendingTVURL())
+	}
+
+	// 3. Fallbacks on HTTP 403/503, empty subjects, invalid JSON, and invalid URL
+	err403Srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer err403Srv.Close()
+
+	emptySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"subjects":[]}`))
+	}))
+	defer emptySrv.Close()
+
+	badJSONSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`<html>blocked by anti-bot</html>`))
+	}))
+	defer badJSONSrv.Close()
+
+	for name, targetURL := range map[string]string{
+		"http403":    err403Srv.URL,
+		"empty":      emptySrv.URL,
+		"badJSON":    badJSONSrv.URL,
+		"invalidURL": "://bad-url",
+	} {
+		fbM, err := NewFetcher(Options{DoubanTrendingMovieURL: targetURL}).FetchDoubanTrendingMovie(ctx)
+		if err != nil || fbM.Source != SourceDoubanTrendingMovieBuiltin || fbM.Count < 15 {
+			t.Fatalf("%s movie fallback unexpected: snap=%+v err=%v", name, fbM, err)
+		}
+		fbTV, err := NewFetcher(Options{DoubanTrendingTVURL: targetURL}).FetchDoubanTrendingTV(ctx)
+		if err != nil || fbTV.Source != SourceDoubanTrendingTVBuiltin || fbTV.Count < 15 {
+			t.Fatalf("%s tv fallback unexpected: snap=%+v err=%v", name, fbTV, err)
+		}
+	}
+
+	// 4. Custom fetchers with blank source default and error path
+	customM, err := NewFetcher(Options{
+		DoubanTrendingMovieFetcher: func(ctx context.Context) ([]ChartEntry, string, error) {
+			return []ChartEntry{{Rank: 1, Title: "Custom Movie", MediaType: "movie", DoubanID: "1"}}, "", nil
+		},
+		DoubanTrendingTVFetcher: func(ctx context.Context) ([]ChartEntry, string, error) {
+			return []ChartEntry{{Rank: 1, Title: "Custom TV", MediaType: "tv", DoubanID: "2"}}, "", nil
+		},
+	}).FetchDoubanTrendingMovie(ctx)
+	if err != nil || customM.Source != SourceDoubanTrendingMovieAPI || customM.Count != 1 {
+		t.Fatalf("unexpected custom movie snap: %+v err=%v", customM, err)
+	}
+	customTV, err := NewFetcher(Options{
+		DoubanTrendingTVFetcher: func(ctx context.Context) ([]ChartEntry, string, error) {
+			return []ChartEntry{{Rank: 1, Title: "Custom TV", MediaType: "tv", DoubanID: "2"}}, "", nil
+		},
+	}).FetchDoubanTrendingTV(ctx)
+	if err != nil || customTV.Source != SourceDoubanTrendingTVAPI || customTV.Count != 1 {
+		t.Fatalf("unexpected custom tv snap: %+v err=%v", customTV, err)
+	}
+	if _, err := NewFetcher(Options{
+		DoubanTrendingMovieFetcher: func(ctx context.Context) ([]ChartEntry, string, error) {
+			return nil, "", http.ErrHandlerTimeout
+		},
+	}).FetchDoubanTrendingMovie(ctx); err == nil {
+		t.Fatal("expected error from failing custom movie fetcher")
+	}
+	if _, err := NewFetcher(Options{
+		DoubanTrendingTVFetcher: func(ctx context.Context) ([]ChartEntry, string, error) {
+			return nil, "", http.ErrHandlerTimeout
+		},
+	}).FetchDoubanTrendingTV(ctx); err == nil {
+		t.Fatal("expected error from failing custom tv fetcher")
+	}
+}
+
+func TestDoubanTrendingPersistenceTypedAutoTaggingAndEndpoints(t *testing.T) {
+	t.Setenv(EnvTMDBAPIKey, "")
+	t.Setenv(EnvTMDBAPIKeyFallback, "")
+
+	store := openTestStore(t)
+	repo := sqlite.NewLibraryRepo(store)
+	ctx := context.Background()
+
+	lib, err := repo.CreateLibrary(ctx, "Media", "mixed", []string{"/media"})
+	if err != nil {
+		t.Fatalf("CreateLibrary: %v", err)
+	}
+
+	y2024 := 2024
+	// Movie matching BOTH TMDB Trending and Douban Trending Movie
+	movieBoth := &sqlite.ItemRecord{
+		LibraryID:      lib.ID,
+		Type:           "Movie",
+		Name:           "沙丘2",
+		OriginalTitle:  "Dune: Part Two",
+		ProductionYear: &y2024,
+		Extra:          sqlite.ItemExtra{ProviderIDs: map[string]string{"tmdb": "693134", "douban": "35651362"}},
+	}
+	// Movie matching ONLY Douban Trending Movie (also shares title with a TV entry to verify type isolation)
+	movieOnlyDouban := &sqlite.ItemRecord{
+		LibraryID:      lib.ID,
+		Type:           "Movie",
+		Name:           "同名作品",
+		ProductionYear: &y2024,
+		Extra:          sqlite.ItemExtra{ProviderIDs: map[string]string{"douban": "111111"}},
+	}
+	// Series matching ONLY Douban Trending TV (shares title "同名作品" with movieOnlyDouban)
+	seriesOnlyDouban := &sqlite.ItemRecord{
+		LibraryID:      lib.ID,
+		Type:           "Series",
+		Name:           "同名作品",
+		ProductionYear: &y2024,
+		Extra:          sqlite.ItemExtra{ProviderIDs: map[string]string{"douban": "222222"}},
+	}
+	for _, item := range []*sqlite.ItemRecord{movieBoth, movieOnlyDouban, seriesOnlyDouban} {
+		if err := repo.UpsertItem(ctx, item); err != nil {
+			t.Fatalf("UpsertItem %s: %v", item.Name, err)
+		}
+	}
+
+	failSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer failSrv.Close()
+
+	doubanMovieSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"subjects":[
+			{"id":"35651362","title":"沙丘2","rate":"8.2"},
+			{"id":"111111","title":"同名作品","rate":"8.0"}
+		]}`))
+	}))
+	defer doubanMovieSrv.Close()
+
+	doubanTVSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"subjects":[
+			{"id":"222222","title":"同名作品","rate":"8.8"}
+		]}`))
+	}))
+	defer doubanTVSrv.Close()
+
+	svc := New(store, nil, Options{
+		DoubanURL:              failSrv.URL,
+		IMDbURL:                failSrv.URL,
+		DoubanTrendingMovieURL: doubanMovieSrv.URL,
+		DoubanTrendingTVURL:    doubanTVSrv.URL,
+		TMDBTrendingFetcher: func(ctx context.Context) ([]ChartEntry, string, error) {
+			return []ChartEntry{
+				{Rank: 1, Title: "沙丘2", OriginalTitle: "Dune: Part Two", Year: 2024, MediaType: "movie", TMDBID: "693134"},
+			}, SourceTMDBTrendingAPI, nil
+		},
+	})
+
+	sum, err := svc.SyncAndApply(ctx)
+	if err != nil {
+		t.Fatalf("SyncAndApply failed: %v", err)
+	}
+	if sum.DoubanTrendingMovieCount != 2 || sum.DoubanTrendingTVCount != 1 || sum.TMDBTrendingCount != 1 {
+		t.Fatalf("unexpected counts: %+v", sum)
+	}
+	if sum.MatchedItems != 3 || sum.TagsAdded != 7 {
+		t.Fatalf("expected matched=3, tagsAdded=7, got %+v", sum)
+	}
+
+	// movieBoth: TMDB热门, Trending, 豆瓣热门电影 (Trending deduplicated!)
+	gotBoth := strings.Join(getItemTags(t, store, movieBoth.ID), ",")
+	wantBoth := TagTMDBTrendingSpecific + "," + TagTMDBTrending + "," + TagDoubanTrendingMovie
+	if gotBoth != wantBoth {
+		t.Fatalf("movieBoth tags = %q, want %q", gotBoth, wantBoth)
+	}
+
+	// movieOnlyDouban: Trending, 豆瓣热门电影 (must NOT receive 豆瓣热门剧集)
+	gotMovie := strings.Join(getItemTags(t, store, movieOnlyDouban.ID), ",")
+	wantMovie := TagTMDBTrending + "," + TagDoubanTrendingMovie
+	if gotMovie != wantMovie {
+		t.Fatalf("movieOnlyDouban tags = %q, want %q", gotMovie, wantMovie)
+	}
+
+	// seriesOnlyDouban: Trending, 豆瓣热门剧集 (must NOT receive 豆瓣热门电影)
+	gotSeries := strings.Join(getItemTags(t, store, seriesOnlyDouban.ID), ",")
+	wantSeries := TagTMDBTrending + "," + TagDoubanTrendingTV
+	if gotSeries != wantSeries {
+		t.Fatalf("seriesOnlyDouban tags = %q, want %q", gotSeries, wantSeries)
+	}
+
+	// Reload from SQLite in a fresh service instance
+	svc2 := New(store, nil, Options{})
+	if err := svc2.LoadCache(ctx); err != nil {
+		t.Fatalf("LoadCache: %v", err)
+	}
+
+	// Unspecified type MatchTagsForItem matches both movie & tv charts for "同名作品"
+	untypedTags := svc2.MatchTagsForItem("同名作品", "", 2024, nil)
+	wantUntyped := strings.Join([]string{TagTMDBTrending, TagDoubanTrendingMovie, TagDoubanTrendingTV}, ",")
+	if strings.Join(untypedTags, ",") != wantUntyped {
+		t.Fatalf("untyped MatchTagsForItem = %v, want %q", untypedTags, wantUntyped)
+	}
+
+	// Verify GET /System/Rankings?includeEntries=true and GET /System/Rankings/Trending
+	mux := http.NewServeMux()
+	NewHandler(svc2).RegisterRoutes(mux, AuthFuncs{})
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/System/Rankings?includeEntries=true", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /System/Rankings status=%d", rec.Code)
+	}
+	var st StatusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil {
+		t.Fatalf("decode StatusResponse: %v", err)
+	}
+	if st.DoubanTrendingMovie.Chart != ChartDoubanTrendingMovie || st.DoubanTrendingMovie.Count != 2 || len(st.DoubanTrendingMovie.Entries) != 2 {
+		t.Fatalf("unexpected DoubanTrendingMovie in StatusResponse: %+v", st.DoubanTrendingMovie)
+	}
+	if st.DoubanTrendingTV.Chart != ChartDoubanTrendingTV || st.DoubanTrendingTV.Count != 1 || len(st.DoubanTrendingTV.Entries) != 1 {
+		t.Fatalf("unexpected DoubanTrendingTV in StatusResponse: %+v", st.DoubanTrendingTV)
+	}
+
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/System/Rankings/Trending", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /System/Rankings/Trending status=%d", rec.Code)
+	}
+	var tr TrendingResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &tr); err != nil {
+		t.Fatalf("decode TrendingResponse: %v", err)
+	}
+	if tr.Status.Chart != ChartTMDBTrending || len(tr.Entries) != 1 ||
+		tr.TMDB.Count != 1 || len(tr.TMDB.Entries) != 1 ||
+		tr.DoubanMovie.Count != 2 || len(tr.DoubanMovie.Entries) != 2 ||
+		tr.DoubanTV.Count != 1 || len(tr.DoubanTV.Entries) != 1 {
+		t.Fatalf("unexpected TrendingResponse: %+v", tr)
+	}
+
+	// Corrupted Douban trending movie / TV caches in SQLite -> LoadCache returns error
+	for _, key := range []string{ConfigKeyDoubanTrendingMovie, ConfigKeyDoubanTrendingTV} {
+		corruptStore := openTestStore(t)
+		if _, err := corruptStore.Writer.Exec(
+			`INSERT INTO server_config (key, value_json, updated_at) VALUES (?, ?, ?)`,
+			key, "{corrupted", time.Now().Unix(),
+		); err != nil {
+			t.Fatalf("seed corrupt %s: %v", key, err)
+		}
+		if err := New(corruptStore, nil, Options{}).LoadCache(ctx); err == nil {
+			t.Fatalf("expected LoadCache error on corrupted %s", key)
+		}
 	}
 }
 

@@ -694,7 +694,7 @@ export function createInitialDemoState(): DemoState {
       CommunityRating: 8.3,
       RunTimeTicks: 2 * HOUR_TICKS + 53 * MIN_TICKS,
       Genres: ['科幻', '动作', '剧情'],
-      Tags: ['Trending'],
+      Tags: ['Trending', 'TMDB热门', '豆瓣热门电影'],
       ProviderIds: { Tmdb: '842675', Imdb: 'tt22050754' },
       Studios: [{ Id: 'st-cfgc', Name: '中国电影股份有限公司' }],
       Overview:
@@ -807,7 +807,7 @@ export function createInitialDemoState(): DemoState {
       CommunityRating: 9.4,
       RunTimeTicks: 2 * HOUR_TICKS + 49 * MIN_TICKS,
       Genres: ['冒险', '剧情', '科幻'],
-      Tags: ['豆瓣Top250', 'IMDb Top250', 'Trending'],
+      Tags: ['豆瓣Top250', 'IMDb Top250', 'Trending', 'TMDB热门'],
       ProviderIds: { Tmdb: '157336', Imdb: 'tt0816692' },
       Studios: [
         { Id: 'st-paramount', Name: 'Paramount Pictures' },
@@ -865,7 +865,7 @@ export function createInitialDemoState(): DemoState {
       CommunityRating: 8.6,
       RunTimeTicks: 2 * HOUR_TICKS + 46 * MIN_TICKS,
       Genres: ['科幻', '冒险'],
-      Tags: ['IMDb Top250', 'Trending'],
+      Tags: ['IMDb Top250', 'Trending', 'TMDB热门', '豆瓣热门电影'],
       ProviderIds: { Tmdb: '693134', Imdb: 'tt15239678' },
       Studios: [
         { Id: 'st-legendary', Name: 'Legendary Pictures' },
@@ -921,7 +921,7 @@ export function createInitialDemoState(): DemoState {
       CommunityRating: 8.8,
       RunTimeTicks: 3 * HOUR_TICKS + 1 * MIN_TICKS,
       Genres: ['剧情', '历史', '战争'],
-      Tags: ['豆瓣Top250', 'IMDb Top250', 'Trending'],
+      Tags: ['豆瓣Top250', 'IMDb Top250', 'Trending', 'TMDB热门', '豆瓣热门电影'],
       ProviderIds: { Tmdb: '872585', Imdb: 'tt15398776' },
       Studios: [
         { Id: 'st-universal', Name: 'Universal Pictures' },
@@ -1083,7 +1083,7 @@ export function createInitialDemoState(): DemoState {
       OfficialRating: 'TV-14',
       CommunityRating: 8.7,
       Genres: ['科幻', '悬疑', '剧情'],
-      Tags: ['Trending'],
+      Tags: ['Trending', 'TMDB热门', '豆瓣热门剧集'],
       ProviderIds: { Tmdb: '204541', Imdb: 'tt20242042' },
       Studios: [{ Id: 'st-tencent', Name: '企鹅影视 / 灵河文化' }],
       Overview:
@@ -1272,7 +1272,7 @@ export function createInitialDemoState(): DemoState {
       OfficialRating: 'TV-MA',
       CommunityRating: 9.6,
       Genres: ['动画', '动作冒险', '奇幻'],
-      Tags: ['Trending'],
+      Tags: ['Trending', 'TMDB热门', '豆瓣热门剧集'],
       ProviderIds: { Tmdb: '1429', Imdb: 'tt2560140' },
       Studios: [
         { Id: 'st-wit', Name: 'Wit Studio' },
@@ -1418,6 +1418,499 @@ export function createInitialDemoState(): DemoState {
     )
   }
 
+  // ==================== 4.2 热门趋势电影（TMDB热门 / 豆瓣热门电影） ====================
+  registerItem(
+    {
+      Id: 'item-the-pig-the-snake-and-the-pigeon',
+      Name: '周处除三害',
+      OriginalTitle: 'The Pig, the Snake and the Pigeon',
+      SortName: 'zhouchuchusanhai the pig the snake and the pigeon',
+      ServerId: DEMO_SERVER_ID,
+      Type: 'Movie',
+      MediaType: 'Video',
+      ParentId: 'lib-movies',
+      ProductionYear: 2023,
+      PremiereDate: '2023-10-06T00:00:00.000Z',
+      DateCreated: isoAgo(12),
+      OfficialRating: 'R',
+      CommunityRating: 8.1,
+      RunTimeTicks: 2 * HOUR_TICKS + 14 * MIN_TICKS,
+      Genres: ['动作', '犯罪', '剧情'],
+      Tags: ['Trending', '豆瓣热门电影', 'TMDB热门'],
+      ProviderIds: { Tmdb: '1152014', Imdb: 'tt29319990' },
+      Studios: [{ Id: 'st-one-cool', Name: '一种态度电影股份有限公司' }],
+      Overview:
+        '通缉犯陈桂林生命将尽，却发现自己在通缉榜上只排名第三。他决心查出前两名通缉犯的下落，并将他们一一除掉，以为自己能像古人“周处除三害”一样留名青史，却在追猎途中一步步逼近荒诞与人性的深渊。',
+      People: makePeople(
+        [
+          { id: 'p-wong-ching-po', name: '黄精甫', role: '导演 / 编剧', type: 'Director', palette: ['#7f1d1d', '#450a0a'] },
+          { id: 'p-ethan-ruan', name: '阮经天', role: '陈桂林', type: 'Actor', palette: ['#b45309', '#451a03'] },
+          { id: 'p-ben-yuen', name: '袁富华', role: '香港仔', type: 'Actor', palette: ['#3f3f46', '#18181b'] },
+          { id: 'p-chen-yi-wen', name: '陈以文', role: '林禄和 / 尊者', type: 'Actor', palette: ['#0f766e', '#042f2e'] },
+        ],
+        artById,
+      ),
+      MediaSources: makeMediaSources('item-the-pig-the-snake-and-the-pigeon', '周处除三害', {
+        resolution: '4K',
+        videoRange: 'HDR10',
+        codec: 'hevc',
+        runTimeTicks: 2 * HOUR_TICKS + 14 * MIN_TICKS,
+        multiVersion: true,
+        hasPgs: true,
+      }),
+      ImageTags: { Primary: 'demo-p' },
+      BackdropImageTags: ['demo-b'],
+      PrimaryImageAspectRatio: 0.667,
+      UserData: {
+        PlaybackPositionTicks: 0,
+        PlayCount: 1,
+        IsFavorite: true,
+        Played: false,
+      },
+    },
+    ['#450a0a', '#991b1b', '#f59e0b'],
+    '4K HDR10',
+  )
+
+  registerItem(
+    {
+      Id: 'item-inside-out-2',
+      Name: '头脑特工队 2',
+      OriginalTitle: 'Inside Out 2',
+      SortName: 'tounaotegongdui 2 inside out 2',
+      ServerId: DEMO_SERVER_ID,
+      Type: 'Movie',
+      MediaType: 'Video',
+      ParentId: 'lib-movies',
+      ProductionYear: 2024,
+      PremiereDate: '2024-06-14T00:00:00.000Z',
+      DateCreated: isoAgo(16),
+      OfficialRating: 'PG',
+      CommunityRating: 8.4,
+      RunTimeTicks: 1 * HOUR_TICKS + 36 * MIN_TICKS,
+      Genres: ['动画', '喜剧', '家庭', '冒险'],
+      Tags: ['Trending', 'TMDB热门', '豆瓣热门电影'],
+      ProviderIds: { Tmdb: '1022789', Imdb: 'tt22022452' },
+      Studios: [{ Id: 'st-pixar', Name: 'Pixar Animation Studios' }],
+      Overview:
+        '刚步入青春期的少女莱莉大脑总部迎来突然拆迁，原本合作无间的乐乐、忧忧、怒怒、怕怕与厌厌措手不及——焦虑“焦焦”带着羡慕、尴尬和无聊等全新情绪强势进驻，莱莉的内心世界即将掀起一场成长风暴。',
+      People: makePeople(
+        [
+          { id: 'p-kelsey-mann', name: '凯尔西·曼', role: '导演', type: 'Director', palette: ['#c2410c', '#431407'] },
+          { id: 'p-amy-poehler', name: '艾米·波勒', role: '乐乐（配音）', type: 'Actor', palette: ['#ca8a04', '#422006'] },
+          { id: 'p-maya-hawke', name: '玛雅·霍克', role: '焦焦（配音）', type: 'Actor', palette: ['#ea580c', '#431407'] },
+          { id: 'p-kensington-tallman', name: '肯辛顿·托尔曼', role: '莱莉（配音）', type: 'Actor', palette: ['#0284c7', '#082f49'] },
+        ],
+        artById,
+      ),
+      MediaSources: makeMediaSources('item-inside-out-2', '头脑特工队 2', {
+        resolution: '4K',
+        videoRange: 'Dolby Vision',
+        codec: 'hevc',
+        runTimeTicks: 1 * HOUR_TICKS + 36 * MIN_TICKS,
+        multiVersion: true,
+        hasPgs: true,
+      }),
+      ImageTags: { Primary: 'demo-p' },
+      BackdropImageTags: ['demo-b'],
+      PrimaryImageAspectRatio: 0.667,
+      UserData: {
+        PlaybackPositionTicks: 0,
+        PlayCount: 0,
+        IsFavorite: false,
+        Played: false,
+      },
+    },
+    ['#1e1b4b', '#c2410c', '#fbbf24'],
+    '4K DV · ATMOS',
+  )
+
+  registerItem(
+    {
+      Id: 'item-robot-dreams',
+      Name: '机器人之梦',
+      OriginalTitle: 'Robot Dreams',
+      SortName: 'jiqirenzhimeng robot dreams',
+      ServerId: DEMO_SERVER_ID,
+      Type: 'Movie',
+      MediaType: 'Video',
+      ParentId: 'lib-movies',
+      ProductionYear: 2023,
+      PremiereDate: '2023-12-06T00:00:00.000Z',
+      DateCreated: isoAgo(26),
+      OfficialRating: 'PG',
+      CommunityRating: 9.1,
+      RunTimeTicks: 1 * HOUR_TICKS + 42 * MIN_TICKS,
+      Genres: ['动画', '剧情', '音乐'],
+      Tags: ['Trending', '豆瓣热门电影'],
+      ProviderIds: { Tmdb: '838240', Imdb: 'tt13429870' },
+      Studios: [{ Id: 'st-arcadia', Name: 'Arcadia Motion Pictures' }],
+      Overview:
+        '1980年代的纽约曼哈顿，一只孤独的小狗网购了一台机器人作伴。他们在夏日街头跳舞、滑冰、分享热狗，成为形影不离的挚友。然而海滩一日游后的意外锈蚀将两人分隔两地，四季轮转之间，他们在各自的梦境里一次次重逢与学会告别。',
+      People: makePeople(
+        [
+          { id: 'p-pablo-berger', name: '巴勃罗·贝格尔', role: '导演 / 编剧', type: 'Director', palette: ['#0369a1', '#082f49'] },
+          { id: 'p-sara-varon', name: '萨拉·瓦伦', role: '原著漫画', type: 'Writer', palette: ['#0f766e', '#042f2e'] },
+        ],
+        artById,
+      ),
+      MediaSources: makeMediaSources('item-robot-dreams', '机器人之梦', {
+        resolution: '1080P',
+        videoRange: 'SDR',
+        codec: 'hevc',
+        runTimeTicks: 1 * HOUR_TICKS + 42 * MIN_TICKS,
+      }),
+      ImageTags: { Primary: 'demo-p' },
+      BackdropImageTags: ['demo-b'],
+      PrimaryImageAspectRatio: 0.667,
+      UserData: {
+        PlaybackPositionTicks: 0,
+        PlayCount: 1,
+        IsFavorite: true,
+        Played: true,
+      },
+    },
+    ['#0c4a6e', '#0284c7', '#fbbf24'],
+    '1080P · BluRay',
+  )
+
+  // ==================== 4.3 热门趋势剧集（TMDB热门 / 豆瓣热门剧集） ====================
+  registerItem(
+    {
+      Id: 'item-shogun',
+      Name: '幕府将军',
+      OriginalTitle: 'Shōgun',
+      SortName: 'mufujiangjun shogun',
+      ServerId: DEMO_SERVER_ID,
+      Type: 'Series',
+      ParentId: 'lib-tvshows',
+      ProductionYear: 2024,
+      PremiereDate: '2024-02-27T00:00:00.000Z',
+      DateCreated: isoAgo(14),
+      OfficialRating: 'TV-MA',
+      CommunityRating: 8.8,
+      Genres: ['剧情', '历史', '战争'],
+      Tags: ['Trending', 'TMDB热门', '豆瓣热门剧集'],
+      ProviderIds: { Tmdb: '126308', Imdb: 'tt2788316' },
+      Studios: [{ Id: 'st-fx', Name: 'FX Productions' }],
+      Overview:
+        '1600年日本战国时代风云际会，五大老之间暗流涌动。孤立无援的领主吉井虎永在遭遇同僚围剿之际，意外迎来一艘搁浅的欧洲商船与英国领航员约翰·布莱克索恩。通晓西学的贵族女子户田鞠子居中翻译，三人的命运在权谋、信仰与荣耀的博弈中紧密纠缠。',
+      People: makePeople(
+        [
+          { id: 'p-hiroyuki-sanada', name: '真田广之', role: '吉井虎永', type: 'Actor', palette: ['#7c2d12', '#27100b'] },
+          { id: 'p-cosmo-jarvis', name: '柯斯莫·贾维斯', role: '约翰·布莱克索恩', type: 'Actor', palette: ['#1e3a8a', '#172554'] },
+          { id: 'p-anna-sawai', name: '泽井杏奈', role: '户田鞠子', type: 'Actor', palette: ['#881337', '#4c0519'] },
+        ],
+        artById,
+      ),
+      ImageTags: { Primary: 'demo-p' },
+      BackdropImageTags: ['demo-b'],
+      PrimaryImageAspectRatio: 0.667,
+      ChildCount: 1,
+      UserData: {
+        PlaybackPositionTicks: 0,
+        PlayCount: 0,
+        IsFavorite: true,
+        Played: false,
+        UnplayedItemCount: 2,
+      },
+    },
+    ['#1c1917', '#7c2d12', '#d97706'],
+    '4K DV · 1 季',
+  )
+
+  const shogunS1: BaseItemDto = {
+    Id: 'season-shogun-1',
+    Name: '第 1 季',
+    ServerId: DEMO_SERVER_ID,
+    Type: 'Season',
+    SeriesId: 'item-shogun',
+    SeriesName: '幕府将军',
+    IndexNumber: 1,
+    ProductionYear: 2024,
+    ImageTags: { Primary: 'demo-p' },
+  }
+  seasonsBySeries.set('item-shogun', [shogunS1])
+  registerItem(shogunS1, ['#1c1917', '#7c2d12', '#d97706'], 'S01')
+
+  const shogunS1Eps: BaseItemDto[] = [
+    {
+      Id: 'ep-shogun-s1e1',
+      Name: '按针',
+      ServerId: DEMO_SERVER_ID,
+      Type: 'Episode',
+      MediaType: 'Video',
+      SeriesId: 'item-shogun',
+      SeriesName: '幕府将军',
+      SeasonId: 'season-shogun-1',
+      SeasonName: shogunS1.Name,
+      ParentIndexNumber: 1,
+      IndexNumber: 1,
+      RunTimeTicks: 69 * MIN_TICKS,
+      Overview: '一艘神秘的欧洲商船漂流至伊豆渔村，英国领航员布莱克索恩被卷入五大老的权力漩涡。',
+      MediaSources: makeMediaSources('ep-shogun-s1e1', '幕府将军 S01E01 按针', {
+        resolution: '4K',
+        videoRange: 'Dolby Vision',
+        codec: 'hevc',
+        runTimeTicks: 69 * MIN_TICKS,
+      }),
+      ImageTags: { Primary: 'demo-p' },
+      UserData: { PlaybackPositionTicks: 0, PlayCount: 0, IsFavorite: false, Played: false },
+    },
+    {
+      Id: 'ep-shogun-s1e2',
+      Name: '二主之仆',
+      ServerId: DEMO_SERVER_ID,
+      Type: 'Episode',
+      MediaType: 'Video',
+      SeriesId: 'item-shogun',
+      SeriesName: '幕府将军',
+      SeasonId: 'season-shogun-1',
+      SeasonName: shogunS1.Name,
+      ParentIndexNumber: 1,
+      IndexNumber: 2,
+      RunTimeTicks: 60 * MIN_TICKS,
+      Overview: '布莱克索恩在大阪城面见吉井虎永，围绕葡萄牙商路与宗教势力的秘密浮出水面。',
+      MediaSources: makeMediaSources('ep-shogun-s1e2', '幕府将军 S01E02 二主之仆', {
+        resolution: '4K',
+        videoRange: 'Dolby Vision',
+        codec: 'hevc',
+        runTimeTicks: 60 * MIN_TICKS,
+      }),
+      ImageTags: { Primary: 'demo-p' },
+      UserData: { PlaybackPositionTicks: 0, PlayCount: 0, IsFavorite: false, Played: false },
+    },
+  ]
+  episodesBySeason.set('season-shogun-1', shogunS1Eps)
+  for (const ep of shogunS1Eps) {
+    registerItem(ep, ['#1c1917', '#7c2d12', '#d97706'], `S0${ep.ParentIndexNumber}E0${ep.IndexNumber}`)
+  }
+
+  registerItem(
+    {
+      Id: 'item-blossoms-shanghai',
+      Name: '繁花',
+      OriginalTitle: '繁花',
+      SortName: 'fanhua blossoms shanghai',
+      ServerId: DEMO_SERVER_ID,
+      Type: 'Series',
+      ParentId: 'lib-tvshows',
+      ProductionYear: 2023,
+      PremiereDate: '2023-12-27T00:00:00.000Z',
+      DateCreated: isoAgo(20),
+      OfficialRating: 'TV-14',
+      CommunityRating: 8.7,
+      Genres: ['剧情', '年代', '商战'],
+      Tags: ['Trending', '豆瓣热门剧集'],
+      ProviderIds: { Tmdb: '126506', Imdb: 'tt14330184' },
+      Studios: [{ Id: 'st-jet-tone', Name: '泽东电影 / 腾讯视频' }],
+      Overview:
+        '九十年代初的上海黄河路灯火辉煌、商机涌动。年轻的阿宝在爷叔指点与夜东京玲子、外滩27号汪小姐的扶持下，凭外贸与股市搏杀蜕变为叱咤风云的“宝总”。当神秘女老板李李携至真园强势入局，一场关乎情义与时代的沪上风云缓缓展开。',
+      People: makePeople(
+        [
+          { id: 'p-wong-kar-wai', name: '王家卫', role: '总导演 / 监制', type: 'Director', palette: ['#78350f', '#451a03'] },
+          { id: 'p-hu-ge', name: '胡歌', role: '阿宝 / 宝总', type: 'Actor', palette: ['#b45309', '#451a03'] },
+          { id: 'p-ma-yili', name: '马伊琍', role: '玲子', type: 'Actor', palette: ['#9f1239', '#4c0519'] },
+          { id: 'p-tang-yan', name: '唐嫣', role: '汪小姐', type: 'Actor', palette: ['#c2410c', '#431407'] },
+          { id: 'p-xin-zhilei', name: '辛芷蕾', role: '李李', type: 'Actor', palette: ['#7e22ce', '#3b0764'] },
+        ],
+        artById,
+      ),
+      ImageTags: { Primary: 'demo-p' },
+      BackdropImageTags: ['demo-b'],
+      PrimaryImageAspectRatio: 0.667,
+      ChildCount: 1,
+      UserData: {
+        PlaybackPositionTicks: 0,
+        PlayCount: 0,
+        IsFavorite: true,
+        Played: false,
+        UnplayedItemCount: 2,
+      },
+    },
+    ['#451a03', '#9a3412', '#fbbf24'],
+    '4K HDR · 沪语/国语',
+  )
+
+  const blossomsS1: BaseItemDto = {
+    Id: 'season-blossoms-1',
+    Name: '第 1 季',
+    ServerId: DEMO_SERVER_ID,
+    Type: 'Season',
+    SeriesId: 'item-blossoms-shanghai',
+    SeriesName: '繁花',
+    IndexNumber: 1,
+    ProductionYear: 2023,
+    ImageTags: { Primary: 'demo-p' },
+  }
+  seasonsBySeries.set('item-blossoms-shanghai', [blossomsS1])
+  registerItem(blossomsS1, ['#451a03', '#9a3412', '#fbbf24'], 'S01')
+
+  const blossomsS1Eps: BaseItemDto[] = [
+    {
+      Id: 'ep-blossoms-s1e1',
+      Name: '和平饭店与黄河路',
+      ServerId: DEMO_SERVER_ID,
+      Type: 'Episode',
+      MediaType: 'Video',
+      SeriesId: 'item-blossoms-shanghai',
+      SeriesName: '繁花',
+      SeasonId: 'season-blossoms-1',
+      SeasonName: blossomsS1.Name,
+      ParentIndexNumber: 1,
+      IndexNumber: 1,
+      RunTimeTicks: 48 * MIN_TICKS,
+      Overview: '1992年跨年夜，一场车祸震动上海滩，爷叔与阿宝早年在和平饭店起家的往事随之揭开。',
+      MediaSources: makeMediaSources('ep-blossoms-s1e1', '繁花 S01E01 和平饭店与黄河路', {
+        resolution: '4K',
+        videoRange: 'HDR10',
+        codec: 'hevc',
+        runTimeTicks: 48 * MIN_TICKS,
+      }),
+      ImageTags: { Primary: 'demo-p' },
+      UserData: { PlaybackPositionTicks: 0, PlayCount: 0, IsFavorite: false, Played: false },
+    },
+    {
+      Id: 'ep-blossoms-s1e2',
+      Name: '至真园开业',
+      ServerId: DEMO_SERVER_ID,
+      Type: 'Episode',
+      MediaType: 'Video',
+      SeriesId: 'item-blossoms-shanghai',
+      SeriesName: '繁花',
+      SeasonId: 'season-blossoms-1',
+      SeasonName: blossomsS1.Name,
+      ParentIndexNumber: 1,
+      IndexNumber: 2,
+      RunTimeTicks: 46 * MIN_TICKS,
+      Overview: '李李携至真园空降黄河路，向宝总发出请柬，三羊牌外贸大单暗藏博弈。',
+      MediaSources: makeMediaSources('ep-blossoms-s1e2', '繁花 S01E02 至真园开业', {
+        resolution: '4K',
+        videoRange: 'HDR10',
+        codec: 'hevc',
+        runTimeTicks: 46 * MIN_TICKS,
+      }),
+      ImageTags: { Primary: 'demo-p' },
+      UserData: { PlaybackPositionTicks: 0, PlayCount: 0, IsFavorite: false, Played: false },
+    },
+  ]
+  episodesBySeason.set('season-blossoms-1', blossomsS1Eps)
+  for (const ep of blossomsS1Eps) {
+    registerItem(ep, ['#451a03', '#9a3412', '#fbbf24'], `S0${ep.ParentIndexNumber}E0${ep.IndexNumber}`)
+  }
+
+  registerItem(
+    {
+      Id: 'item-the-long-season',
+      Name: '漫长的季节',
+      OriginalTitle: '漫长的季节',
+      SortName: 'manchangdejijie the long season',
+      ServerId: DEMO_SERVER_ID,
+      Type: 'Series',
+      ParentId: 'lib-tvshows',
+      ProductionYear: 2023,
+      PremiereDate: '2023-04-22T00:00:00.000Z',
+      DateCreated: isoAgo(28),
+      OfficialRating: 'TV-14',
+      CommunityRating: 9.4,
+      Genres: ['悬疑', '剧情', '家庭'],
+      Tags: ['Trending', '豆瓣热门剧集'],
+      ProviderIds: { Tmdb: '224937', Imdb: 'tt27564844' },
+      Studios: [{ Id: 'st-tencent-x', Name: '腾讯视频 X 剧场' }],
+      Overview:
+        '东北小城桦林，一桩跨越近二十年的碎尸悬案再次泛起涟漪。出租车司机王响、妹夫龚彪与退休刑警马德胜三位老人重聚查案，三条时间线在金黄玉米地与老工业厂区的秋风中交错，折射出一代普通人在时代洪流里的命运与释怀。',
+      People: makePeople(
+        [
+          { id: 'p-xin-shuang', name: '辛爽', role: '导演', type: 'Director', palette: ['#a16207', '#422006'] },
+          { id: 'p-fan-wei', name: '范伟', role: '王响', type: 'Actor', palette: ['#b45309', '#451a03'] },
+          { id: 'p-qin-hao', name: '秦昊', role: '龚彪', type: 'Actor', palette: ['#0f766e', '#042f2e'] },
+          { id: 'p-chen-minghao', name: '陈明昊', role: '马德胜', type: 'Actor', palette: ['#3f3f46', '#18181b'] },
+        ],
+        artById,
+      ),
+      ImageTags: { Primary: 'demo-p' },
+      BackdropImageTags: ['demo-b'],
+      PrimaryImageAspectRatio: 0.667,
+      ChildCount: 1,
+      UserData: {
+        PlaybackPositionTicks: 0,
+        PlayCount: 1,
+        IsFavorite: true,
+        Played: false,
+        UnplayedItemCount: 1,
+      },
+    },
+    ['#422006', '#a16207', '#facc15'],
+    '4K HDR · 豆瓣 9.4',
+  )
+
+  const longSeasonS1: BaseItemDto = {
+    Id: 'season-long-season-1',
+    Name: '第 1 季',
+    ServerId: DEMO_SERVER_ID,
+    Type: 'Season',
+    SeriesId: 'item-the-long-season',
+    SeriesName: '漫长的季节',
+    IndexNumber: 1,
+    ProductionYear: 2023,
+    ImageTags: { Primary: 'demo-p' },
+  }
+  seasonsBySeries.set('item-the-long-season', [longSeasonS1])
+  registerItem(longSeasonS1, ['#422006', '#a16207', '#facc15'], 'S01')
+
+  const longSeasonS1Eps: BaseItemDto[] = [
+    {
+      Id: 'ep-long-season-s1e1',
+      Name: '打响指',
+      ServerId: DEMO_SERVER_ID,
+      Type: 'Episode',
+      MediaType: 'Video',
+      SeriesId: 'item-the-long-season',
+      SeriesName: '漫长的季节',
+      SeasonId: 'season-long-season-1',
+      SeasonName: longSeasonS1.Name,
+      ParentIndexNumber: 1,
+      IndexNumber: 1,
+      RunTimeTicks: 62 * MIN_TICKS,
+      Overview: '2016年秋，龚彪新买的出租车遭遇套牌肇事，王响在追查套牌车途中撞见了熟悉又陌生的身影。',
+      MediaSources: makeMediaSources('ep-long-season-s1e1', '漫长的季节 S01E01 打响指', {
+        resolution: '4K',
+        videoRange: 'HDR10',
+        codec: 'hevc',
+        runTimeTicks: 62 * MIN_TICKS,
+      }),
+      ImageTags: { Primary: 'demo-p' },
+      UserData: { PlaybackPositionTicks: 0, PlayCount: 1, IsFavorite: true, Played: true },
+    },
+    {
+      Id: 'ep-long-season-s1e2',
+      Name: '桦钢往事',
+      ServerId: DEMO_SERVER_ID,
+      Type: 'Episode',
+      MediaType: 'Video',
+      SeriesId: 'item-the-long-season',
+      SeriesName: '漫长的季节',
+      SeasonId: 'season-long-season-1',
+      SeasonName: longSeasonS1.Name,
+      ParentIndexNumber: 1,
+      IndexNumber: 2,
+      RunTimeTicks: 65 * MIN_TICKS,
+      Overview: '1997年的桦林钢铁厂正值改制风暴，火车司机王响意外卷入厂区碎尸案的调查。',
+      MediaSources: makeMediaSources('ep-long-season-s1e2', '漫长的季节 S01E02 桦钢往事', {
+        resolution: '4K',
+        videoRange: 'HDR10',
+        codec: 'hevc',
+        runTimeTicks: 65 * MIN_TICKS,
+      }),
+      ImageTags: { Primary: 'demo-p' },
+      UserData: { PlaybackPositionTicks: 0, PlayCount: 0, IsFavorite: false, Played: false },
+    },
+  ]
+  episodesBySeason.set('season-long-season-1', longSeasonS1Eps)
+  for (const ep of longSeasonS1Eps) {
+    registerItem(ep, ['#422006', '#a16207', '#facc15'], `S0${ep.ParentIndexNumber}E0${ep.IndexNumber}`)
+  }
+
   // ==================== 4.5 媒体合集 (BoxSet) ====================
   registerItem(
     {
@@ -1484,9 +1977,21 @@ export function createInitialDemoState(): DemoState {
         'item-interstellar',
         'item-spirited-away',
         'item-blade-runner-2049',
+        'item-the-pig-the-snake-and-the-pigeon',
+        'item-inside-out-2',
+        'item-robot-dreams',
       ],
     ],
-    ['lib-tvshows', ['item-three-body', 'item-aot']],
+    [
+      'lib-tvshows',
+      [
+        'item-three-body',
+        'item-aot',
+        'item-shogun',
+        'item-blossoms-shanghai',
+        'item-the-long-season',
+      ],
+    ],
     [
       'lib-4k',
       [
@@ -1501,6 +2006,8 @@ export function createInitialDemoState(): DemoState {
         'item-inception',
         'item-oppenheimer',
         'item-blade-runner-2049',
+        'item-the-pig-the-snake-and-the-pigeon',
+        'item-inside-out-2',
       ],
     ],
     [

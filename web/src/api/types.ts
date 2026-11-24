@@ -426,6 +426,8 @@ export interface RankingsSummary {
   douban_top250: RankingsChartSnapshot
   imdb_top250: RankingsChartSnapshot
   tmdb_trending?: RankingsChartSnapshot
+  douban_trending_movie?: RankingChartStatus
+  douban_trending_tv?: RankingChartStatus
 }
 
 export interface RankingsRefreshResult {
@@ -435,6 +437,10 @@ export interface RankingsRefreshResult {
   imdb_error?: string
   tmdb_trending_count?: number
   tmdb_trending_error?: string
+  douban_trending_movie_count?: number
+  douban_trending_movie_error?: string
+  douban_trending_tv_count?: number
+  douban_trending_tv_error?: string
   matched_items: number
   tags_added: number
   synced_at: string

@@ -50,11 +50,7 @@ func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleTrending(w http.ResponseWriter, r *http.Request) {
-	entries, status := h.svc.TrendingEntries(r.Context())
-	httpx.JSON(w, http.StatusOK, TrendingResponse{
-		Status:  status,
-		Entries: entries,
-	})
+	httpx.JSON(w, http.StatusOK, h.svc.Trending(r.Context()))
 }
 
 func (h *Handler) handleRefresh(w http.ResponseWriter, r *http.Request) {
