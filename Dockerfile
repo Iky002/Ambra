@@ -1,35 +1,39 @@
 # syntax=docker/dockerfile:1
 
 # ==============================================================================
-# Stage 1: Build embedded React Web UI (web/dist)
+# Stage 1: Build embedded React Web UI (web/dist) on native BUILDPLATFORM
 # ==============================================================================
-FROM node:24-alpine AS web-builder
+FROM --platform=$BUILDPLATFORM node:24-alpine AS web-builder
 
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
-RUN npm ci
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci
 COPY web/ ./
 RUN npm run build
 
 # ==============================================================================
-# Stage 2: Build pure-Go Ambra binary (CGO_ENABLED=0)
+# Stage 2: Cross-compile pure-Go Ambra binary natively on BUILDPLATFORM (CGO_ENABLED=0)
 # ==============================================================================
-FROM golang:1.26-bookworm AS go-builder
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS go-builder
 
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
-ARG AMBRA_VERSION=v0.5.0
+ARG TARGETOS
+ARG TARGETARCH
+ARG AMBRA_VERSION=v0.5.2
 
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
 COPY web/embed.go ./web/embed.go
 COPY --from=web-builder /src/web/dist ./web/dist
 
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -trimpath -ldflags="-s -w -X github.com/ambra-media/ambra/internal/config.AmbraVersion=${AMBRA_VERSION}" -o /out/ambra ./cmd/ambra
 
 # ==============================================================================

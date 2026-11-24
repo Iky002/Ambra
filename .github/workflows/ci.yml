@@ -102,4 +102,4 @@ jobs:
           target: ${{ matrix.target }}
           push: false
           cache-from: type=gha,scope=${{ matrix.target }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=min,scope=${{ matrix.target }}

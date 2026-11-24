@@ -39,6 +39,7 @@ jobs:
 
       - name: Cross-compile Lite single-file binaries (without FFmpeg)
         run: |
+          set -euo pipefail
           mkdir -p dist/lite dist/full
           AMBRA_VERSION="${{ inputs.tag != '' && inputs.tag || github.ref_name }}"
           TARGETS=(
@@ -47,11 +48,18 @@ jobs:
             "darwin/arm64/ambra-lite-darwin-arm64"
             "windows/amd64/ambra-lite-windows-amd64.exe"
           )
+          pids=()
           for entry in "${TARGETS[@]}"; do
             IFS='/' read -r GOOS GOARCH BIN_NAME <<< "${entry}"
-            echo "Building ${BIN_NAME} (${GOOS}/${GOARCH}, version=${AMBRA_VERSION})..."
-            CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" \
-              go build -trimpath -ldflags="-s -w -X github.com/ambra-media/ambra/internal/config.AmbraVersion=${AMBRA_VERSION}" -o "dist/lite/${BIN_NAME}" ./cmd/ambra
+            (
+              echo "Building ${BIN_NAME} (${GOOS}/${GOARCH}, version=${AMBRA_VERSION})..."
+              CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" \
+                go build -trimpath -ldflags="-s -w -X github.com/ambra-media/ambra/internal/config.AmbraVersion=${AMBRA_VERSION}" -o "dist/lite/${BIN_NAME}" ./cmd/ambra
+            ) &
+            pids+=($!)
+          done
+          for pid in "${pids[@]}"; do
+            wait "${pid}"
           done
 
       - name: Bundle Full packages WITH static FFmpeg & FFprobe
@@ -89,32 +97,45 @@ jobs:
             fi
           }
 
-          # Linux amd64 & arm64 + Windows amd64 from BtbN/FFmpeg-Builds (GPL static builds)
+          bundle_macos() {
+            local stage="${WORK}/darwin-arm64"
+            mkdir -p "${stage}/pkg"
+            echo "Downloading FFmpeg for darwin-arm64..."
+            cp "dist/lite/ambra-lite-darwin-arm64" "${stage}/pkg/ambra"
+            curl -fsSL -o "${stage}/ffmpeg.zip" "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip"
+            curl -fsSL -o "${stage}/ffprobe.zip" "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffprobe.zip"
+            unzip -q "${stage}/ffmpeg.zip" -d "${stage}/pkg"
+            unzip -q "${stage}/ffprobe.zip" -d "${stage}/pkg"
+            chmod +x "${stage}/pkg/ambra" "${stage}/pkg/ffmpeg" "${stage}/pkg/ffprobe"
+            tar -czf "${GITHUB_WORKSPACE}/dist/full/ambra-full-darwin-arm64.tar.gz" -C "${stage}/pkg" .
+          }
+
+          # Run all 4 platform FFmpeg downloads & packaging in parallel
+          pids=()
           bundle_btbn "linux-amd64" \
             "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz" \
             "dist/lite/ambra-lite-linux-amd64" \
-            "ambra-full-linux-amd64.tar.gz" "0"
+            "ambra-full-linux-amd64.tar.gz" "0" &
+          pids+=($!)
 
           bundle_btbn "linux-arm64" \
             "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz" \
             "dist/lite/ambra-lite-linux-arm64" \
-            "ambra-full-linux-arm64.tar.gz" "0"
+            "ambra-full-linux-arm64.tar.gz" "0" &
+          pids+=($!)
 
           bundle_btbn "windows-amd64" \
             "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" \
             "dist/lite/ambra-lite-windows-amd64.exe" \
-            "ambra-full-windows-amd64.zip" "1"
+            "ambra-full-windows-amd64.zip" "1" &
+          pids+=($!)
 
-          # macOS arm64 static ffmpeg + ffprobe (Martin Riedl / evermeet static builds)
-          STAGE_MAC="${WORK}/darwin-arm64"
-          mkdir -p "${STAGE_MAC}/pkg"
-          cp "dist/lite/ambra-lite-darwin-arm64" "${STAGE_MAC}/pkg/ambra"
-          curl -fsSL -o "${STAGE_MAC}/ffmpeg.zip" "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip"
-          curl -fsSL -o "${STAGE_MAC}/ffprobe.zip" "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffprobe.zip"
-          unzip -q "${STAGE_MAC}/ffmpeg.zip" -d "${STAGE_MAC}/pkg"
-          unzip -q "${STAGE_MAC}/ffprobe.zip" -d "${STAGE_MAC}/pkg"
-          chmod +x "${STAGE_MAC}/pkg/ambra" "${STAGE_MAC}/pkg/ffmpeg" "${STAGE_MAC}/pkg/ffprobe"
-          tar -czf "${GITHUB_WORKSPACE}/dist/full/ambra-full-darwin-arm64.tar.gz" -C "${STAGE_MAC}/pkg" .
+          bundle_macos &
+          pids+=($!)
+
+          for pid in "${pids[@]}"; do
+            wait "${pid}"
+          done
 
       - name: Consolidate artifacts & generate SHA256SUMS
         run: |
@@ -204,4 +225,4 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.variant }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=min,scope=${{ matrix.variant }}
