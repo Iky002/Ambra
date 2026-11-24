@@ -76,6 +76,14 @@ func TestOnlineChineseTitleOverwriteAndLocks(t *testing.T) {
 	online := &zhMockOnlineProvider{
 		id: "ambra.builtin.tmdb",
 		fetchFn: func(_ context.Context, q plugins.MediaQuery) (*plugins.MetadataResult, error) {
+			if strings.Contains(strings.ToLower(q.Title), "reloaded") {
+				return &plugins.MetadataResult{
+					Name:          "黑客帝国2：重装上阵",
+					OriginalTitle: "The Matrix Reloaded",
+					Year:          2003,
+					ProviderIDs:   map[string]string{"Tmdb": "604"},
+				}, nil
+			}
 			return &plugins.MetadataResult{
 				Name:            "黑客帝国",
 				OriginalTitle:   "The Matrix",
@@ -404,6 +412,11 @@ func TestRescanUnchangedBackfillsMissingPosterAndTitle(t *testing.T) {
 					Name:        "绝命毒师",
 					PosterURL:   srv.URL + "/bb.jpg",
 					ProviderIDs: map[string]string{"Tmdb": "1396"},
+				}, nil
+			case "Season":
+				return &plugins.MetadataResult{
+					Name:      "第 1 季",
+					PosterURL: srv.URL + "/bb_s01.jpg",
 				}, nil
 			case "Episode":
 				return &plugins.MetadataResult{

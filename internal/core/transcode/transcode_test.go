@@ -189,6 +189,60 @@ func TestBuildFFmpegArgsDirectStreamVsTranscode(t *testing.T) {
 	}
 }
 
+func TestBuildFFmpegArgsHTTPInputFlags(t *testing.T) {
+	caps := BuildHWCapabilities(nil, map[string]bool{"libx264": true}, "linux")
+
+	// Local file should NOT have HTTP reconnect/user_agent flags
+	localArgs := BuildFFmpegArgs(SessionParams{
+		InputPath:  "/media/local.mkv",
+		VideoCodec: "copy",
+		AudioCodec: "aac",
+	}, 0, "/tmp/out", caps)
+	localJoined := strings.Join(localArgs, " ")
+	for _, forbidden := range []string{"-reconnect", "-rw_timeout", "-user_agent"} {
+		if strings.Contains(localJoined, forbidden) {
+			t.Fatalf("local input should not include %s, got: %s", forbidden, localJoined)
+		}
+	}
+
+	// Remote HTTP/HTTPS inputs MUST prepend resilient HTTP flags before -i
+	for _, remoteURL := range []string{
+		"https://alist.example.com/d/movie.mkv",
+		"http://192.168.1.10:5244/d/movie.mp4",
+	} {
+		args := BuildFFmpegArgs(SessionParams{
+			InputPath:  remoteURL,
+			VideoCodec: "copy",
+			AudioCodec: "aac",
+		}, 0, "/tmp/out", caps)
+
+		idxInput := slices.Index(args, "-i")
+		idxReconnect := slices.Index(args, "-reconnect")
+		idxReconnectStreamed := slices.Index(args, "-reconnect_streamed")
+		idxDelay := slices.Index(args, "-reconnect_delay_max")
+		idxTimeout := slices.Index(args, "-rw_timeout")
+		idxUA := slices.Index(args, "-user_agent")
+
+		if idxInput < 0 {
+			t.Fatalf("missing -i in args: %v", args)
+		}
+		for name, idx := range map[string]int{
+			"-reconnect":           idxReconnect,
+			"-reconnect_streamed":  idxReconnectStreamed,
+			"-reconnect_delay_max": idxDelay,
+			"-rw_timeout":          idxTimeout,
+			"-user_agent":          idxUA,
+		} {
+			if idx < 0 || idx >= idxInput {
+				t.Fatalf("expected %s before -i (idx=%d, -i=%d) for %s: %v", name, idx, idxInput, remoteURL, args)
+			}
+		}
+		if args[idxUA+1] != defaultHTTPUserAgent {
+			t.Fatalf("unexpected user_agent value: %q", args[idxUA+1])
+		}
+	}
+}
+
 func TestManagerLifecycleAndActiveEncodings(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfg := config.Default(tmpDir)

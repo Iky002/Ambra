@@ -122,21 +122,52 @@ func (h *Handler) handleUserViews(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]dto.BaseItemDto, 0, len(libs))
 	for _, lib := range libs {
-		items = append(items, dto.BaseItemDto{
-			Id:                lib.ID,
-			Name:              lib.Name,
-			ServerId:          h.serverID(),
-			Type:              "CollectionFolder",
-			CollectionType:    lib.CollectionType,
-			IsFolder:          true,
-			ImageTags:         map[string]string{},
-			BackdropImageTags: []string{},
-		})
+		items = append(items, h.libraryToViewDto(r.Context(), lib))
 	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            items,
 		TotalRecordCount: len(items),
 	})
+}
+
+func (h *Handler) libraryToViewDto(ctx context.Context, lib sqlite.LibraryRecord) dto.BaseItemDto {
+	imageTags := map[string]string{}
+	if img, err := h.repo.GetImageByItemAndType(ctx, lib.ID, "Primary", 0); err == nil && img != nil && img.Tag != "" {
+		imageTags["Primary"] = img.Tag
+	}
+	if imageTags["Primary"] == "" {
+		if children, _, err := h.repo.QueryItems(ctx, sqlite.ItemFilter{
+			LibraryID:        lib.ID,
+			IncludeItemTypes: []string{"Movie", "Series", "MusicAlbum", "Video"},
+			Recursive:        true,
+			Limit:            12,
+		}); err == nil {
+			for _, it := range children {
+				if len(it.BackdropImageTags) > 0 && it.BackdropImageTags[0] != "" {
+					imageTags["Primary"] = it.BackdropImageTags[0]
+					break
+				}
+			}
+			if imageTags["Primary"] == "" {
+				for _, it := range children {
+					if tag := it.ImageTags["Primary"]; tag != "" {
+						imageTags["Primary"] = tag
+						break
+					}
+				}
+			}
+		}
+	}
+	return dto.BaseItemDto{
+		Id:                lib.ID,
+		Name:              lib.Name,
+		ServerId:          h.serverID(),
+		Type:              "CollectionFolder",
+		CollectionType:    lib.CollectionType,
+		IsFolder:          true,
+		ImageTags:         imageTags,
+		BackdropImageTags: []string{},
+	}
 }
 
 func (h *Handler) handleQueryItems(w http.ResponseWriter, r *http.Request) {
@@ -259,6 +290,10 @@ func (h *Handler) handleGetItem(w http.ResponseWriter, r *http.Request) {
 	itemID := r.PathValue("Id")
 	item, err := h.repo.GetItemByID(r.Context(), h.serverID(), userID, itemID)
 	if errors.Is(err, sqlite.ErrNotFound) {
+		if lib, libErr := h.repo.GetLibrary(r.Context(), itemID); libErr == nil && lib != nil {
+			httpx.JSON(w, http.StatusOK, h.libraryToViewDto(r.Context(), *lib))
+			return
+		}
 		httpx.Error(w, http.StatusNotFound, "item not found")
 		return
 	}

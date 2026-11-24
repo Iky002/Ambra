@@ -633,17 +633,24 @@ func (h *Handler) handleGetTaxonomyByName(kind, dtoType string) http.HandlerFunc
 func (h *Handler) handleGetPersonByName(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "Name")
 	if h.store != nil {
-		var id, foundName string
-		err := h.store.Reader.QueryRowContext(r.Context(),
-			`SELECT id, name FROM people WHERE LOWER(name) = LOWER(?) LIMIT 1`, name,
-		).Scan(&id, &foundName)
+		var id, foundName, primaryTag string
+		err := h.store.Reader.QueryRowContext(r.Context(), `
+			SELECT p.id, p.name, COALESCE(img.tag, '')
+			FROM people p
+			LEFT JOIN item_images img ON img.item_id = p.id AND LOWER(img.image_type) = 'primary' AND img.image_index = 0
+			WHERE LOWER(p.name) = LOWER(?) LIMIT 1`, name,
+		).Scan(&id, &foundName, &primaryTag)
 		if err == nil {
+			imageTags := map[string]string{}
+			if primaryTag != "" {
+				imageTags["Primary"] = primaryTag
+			}
 			httpx.JSON(w, http.StatusOK, dto.BaseItemDto{
 				Id:                id,
 				Name:              foundName,
 				ServerId:          h.serverID(),
 				Type:              "Person",
-				ImageTags:         map[string]string{},
+				ImageTags:         imageTags,
 				BackdropImageTags: []string{},
 			})
 			return

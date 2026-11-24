@@ -1,6 +1,7 @@
-import { useState } from 'react'
+import { Component, useState, type ErrorInfo, type ReactNode } from 'react'
 import {
   Activity,
+  AlertTriangle,
   ArrowRightLeft,
   CalendarClock,
   FolderOpen,
@@ -11,7 +12,7 @@ import {
   Sparkles,
   Users,
 } from 'lucide-react'
-import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
+import { NavLink, Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { api } from '../api/client'
 import { AmbraLogo } from '../components/AmbraLogo'
 import { DashboardTab } from './admin/DashboardTab'
@@ -82,7 +83,61 @@ const ADMIN_TABS = [
   },
 ] as const
 
+interface AdminTabErrorBoundaryProps {
+  children: ReactNode
+}
+
+interface AdminTabErrorBoundaryState {
+  hasError: boolean
+  errorMessage: string
+}
+
+class AdminTabErrorBoundary extends Component<
+  AdminTabErrorBoundaryProps,
+  AdminTabErrorBoundaryState
+> {
+  state: AdminTabErrorBoundaryState = {
+    hasError: false,
+    errorMessage: '',
+  }
+
+  static getDerivedStateFromError(error: Error): AdminTabErrorBoundaryState {
+    return {
+      hasError: true,
+      errorMessage: error?.message || '页面渲染发生未知错误',
+    }
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('[AdminTabErrorBoundary]', error, info)
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="flex min-h-[280px] flex-col items-center justify-center rounded-2xl border border-red-500/25 bg-red-500/[0.04] p-6 text-center">
+          <AlertTriangle className="mb-3 h-8 w-8 text-red-400" />
+          <h3 className="text-sm font-semibold text-zinc-100">当前管理面板加载异常</h3>
+          <p className="mt-1.5 max-w-md text-xs leading-relaxed text-zinc-400">
+            {this.state.errorMessage}
+          </p>
+          <button
+            type="button"
+            onClick={() => this.setState({ hasError: false, errorMessage: '' })}
+            className="mt-4 inline-flex items-center gap-1.5 rounded-xl border border-white/15 bg-white/8 px-4 py-2 text-xs font-medium text-zinc-200 transition-colors hover:bg-white/15"
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
+            <span>重试加载</span>
+          </button>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+
 export function AdminPage() {
+  const location = useLocation()
   const [scanning, setScanning] = useState(false)
   const [scanFeedback, setScanFeedback] = useState<{
     type: 'success' | 'error'
@@ -162,19 +217,21 @@ export function AdminPage() {
 
         {/* 右侧面板内容 */}
         <div className="min-w-0 flex-1 rounded-2xl border border-white/8 bg-white/[0.015] p-4 sm:p-6">
-          <Routes>
-            <Route index element={<Navigate to="dashboard" replace />} />
-            <Route path="dashboard" element={<DashboardTab />} />
-            <Route path="users" element={<UsersTab />} />
-            <Route path="libraries" element={<LibrariesTab />} />
-            <Route path="metadata" element={<MetadataTab />} />
-            <Route path="devices" element={<DevicesKeysTab />} />
-            <Route path="plugins" element={<PluginsTab />} />
-            <Route path="tasks" element={<TasksLogsTab />} />
-            <Route path="health" element={<HealthAndAuditTab />} />
-            <Route path="migration" element={<MigrationTab />} />
-            <Route path="*" element={<Navigate to="dashboard" replace />} />
-          </Routes>
+          <AdminTabErrorBoundary key={location.pathname}>
+            <Routes>
+              <Route index element={<Navigate to="dashboard" replace />} />
+              <Route path="dashboard" element={<DashboardTab />} />
+              <Route path="users" element={<UsersTab />} />
+              <Route path="libraries" element={<LibrariesTab />} />
+              <Route path="metadata" element={<MetadataTab />} />
+              <Route path="devices" element={<DevicesKeysTab />} />
+              <Route path="plugins" element={<PluginsTab />} />
+              <Route path="tasks" element={<TasksLogsTab />} />
+              <Route path="health" element={<HealthAndAuditTab />} />
+              <Route path="migration" element={<MigrationTab />} />
+              <Route path="*" element={<Navigate to="dashboard" replace />} />
+            </Routes>
+          </AdminTabErrorBoundary>
         </div>
       </div>
     </div>

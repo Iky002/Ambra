@@ -137,3 +137,108 @@ func TestLibraryHandlerRoutes(t *testing.T) {
 		t.Fatalf("expected 200 for admin with nil scanner, got %d", rec.Code)
 	}
 }
+
+func TestLibraryViewsAndGetItemAutoCoverTag(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(tmp, "lib_cover.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	repo := sqlite.NewLibraryRepo(store)
+	cfg := config.Default(tmp)
+	mux := http.NewServeMux()
+	h := New(repo, nil, cfg)
+	h.RegisterRoutes(mux, AuthFuncs{})
+
+	ctx := context.Background()
+	lib, err := repo.CreateLibrary(ctx, "电影", "movies", []string{tmp})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	getViewTag := func() string {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Users/u1/Views", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /Users/u1/Views status=%d", rec.Code)
+		}
+		var res dto.QueryResult[dto.BaseItemDto]
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+			t.Fatal(err)
+		}
+		if len(res.Items) != 1 {
+			t.Fatalf("expected 1 view, got %d", len(res.Items))
+		}
+		return res.Items[0].ImageTags["Primary"]
+	}
+
+	// 1. Empty library -> no Primary image tag
+	if tag := getViewTag(); tag != "" {
+		t.Fatalf("expected empty Primary tag for empty library, got %q", tag)
+	}
+
+	// 2. Child movie with Primary image -> library gets Primary tag
+	movie := &sqlite.ItemRecord{
+		LibraryID: lib.ID,
+		ParentID:  lib.ID,
+		Type:      "Movie",
+		Name:      "Movie A",
+		Path:      filepath.Join(tmp, "a.mkv"),
+	}
+	if err := repo.UpsertItem(ctx, movie); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceItemImages(ctx, movie.ID, []sqlite.ImageRecord{{
+		ItemID:     movie.ID,
+		ImageType:  "Primary",
+		ImageIndex: 0,
+		Path:       filepath.Join(tmp, "poster.jpg"),
+		Tag:        "child-primary-tag",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if tag := getViewTag(); tag != "child-primary-tag" {
+		t.Fatalf("expected child-primary-tag, got %q", tag)
+	}
+
+	// 3. Child movie also has Backdrop -> Backdrop tag preferred
+	if err := repo.ReplaceItemImages(ctx, movie.ID, []sqlite.ImageRecord{
+		{ItemID: movie.ID, ImageType: "Primary", ImageIndex: 0, Path: filepath.Join(tmp, "poster.jpg"), Tag: "child-primary-tag"},
+		{ItemID: movie.ID, ImageType: "Backdrop", ImageIndex: 0, Path: filepath.Join(tmp, "backdrop.jpg"), Tag: "child-backdrop-tag"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if tag := getViewTag(); tag != "child-backdrop-tag" {
+		t.Fatalf("expected child-backdrop-tag, got %q", tag)
+	}
+
+	// 4. GET /Items/{libraryId} also returns CollectionFolder with ImageTags["Primary"]
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Items/"+lib.ID, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /Items/{libID} status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var libDto dto.BaseItemDto
+	if err := json.Unmarshal(rec.Body.Bytes(), &libDto); err != nil {
+		t.Fatal(err)
+	}
+	if libDto.Type != "CollectionFolder" || libDto.ImageTags["Primary"] != "child-backdrop-tag" {
+		t.Fatalf("unexpected library DTO from GetItem: %+v", libDto)
+	}
+
+	// 5. Explicit Primary image on library overrides child fallback
+	if err := repo.ReplaceItemImages(ctx, lib.ID, []sqlite.ImageRecord{{
+		ItemID:     lib.ID,
+		ImageType:  "Primary",
+		ImageIndex: 0,
+		Path:       filepath.Join(tmp, "lib.jpg"),
+		Tag:        "explicit-lib-tag",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if tag := getViewTag(); tag != "explicit-lib-tag" {
+		t.Fatalf("expected explicit-lib-tag, got %q", tag)
+	}
+}

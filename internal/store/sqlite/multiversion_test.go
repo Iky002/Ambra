@@ -326,3 +326,108 @@ func TestMergeAndSplitItemVersions(t *testing.T) {
 		t.Fatalf("expected ErrNotFound splitting missing item, got %v", err)
 	}
 }
+
+func TestPersonImagesMigrationAndFindItemsByProviderID(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "migrate_v2.db")
+
+	// Simulate an older DB where item_images still has REFERENCES items(id) and only migration v1 ran.
+	s1, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s1.Writer.ExecContext(ctx, `
+		DROP TABLE item_images;
+		CREATE TABLE item_images (
+			item_id     TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+			image_type  TEXT NOT NULL,
+			image_index INTEGER NOT NULL DEFAULT 0,
+			path        TEXT NOT NULL,
+			tag         TEXT NOT NULL,
+			width       INTEGER,
+			height      INTEGER,
+			blurhash    TEXT,
+			PRIMARY KEY (item_id, image_type, image_index)
+		);
+		DELETE FROM schema_migrations WHERE version = 2;
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = s1.Close()
+
+	// Reopen should run migration v2 and allow storing person_id in item_images without FK error.
+	s2, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen for migration v2 failed: %v", err)
+	}
+	defer s2.Close()
+
+	repo := NewLibraryRepo(s2)
+	lib, err := repo.CreateLibrary(ctx, "Movies", "movies", []string{"/movies"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m1 := &ItemRecord{
+		LibraryID: lib.ID,
+		ParentID:  lib.ID,
+		Type:      "Movie",
+		Name:      "Dune 4K",
+		Path:      "/movies/4k/dune.mkv",
+		Extra:     ItemExtra{ProviderIDs: map[string]string{"tmdb": "438631"}},
+	}
+	m2 := &ItemRecord{
+		LibraryID: lib.ID,
+		ParentID:  lib.ID,
+		Type:      "Movie",
+		Name:      "Dune 1080p",
+		Path:      "/movies/1080p/dune.mkv",
+		Extra:     ItemExtra{ProviderIDs: map[string]string{"Tmdb": "438631"}},
+	}
+	if err := repo.UpsertItem(ctx, m1); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpsertItem(ctx, m2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Empty key/value returns nil
+	if empty, err := repo.FindItemsByProviderID(ctx, lib.ID, "Movie", "", "438631"); err != nil || len(empty) != 0 {
+		t.Fatalf("expected empty result for blank provider key, got %v err=%v", empty, err)
+	}
+
+	matches, err := repo.FindItemsByProviderID(ctx, lib.ID, "Movie", "Tmdb", "438631")
+	if err != nil || len(matches) != 2 {
+		t.Fatalf("expected 2 matches by TMDB ID, got %d err=%v", len(matches), err)
+	}
+
+	if err := repo.ReplaceItemPeople(ctx, m1.ID, []PersonInput{
+		{Name: "Timothee Chalamet", Role: "Paul", Type: "Actor"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	people, err := repo.GetPeopleByItemID(ctx, m1.ID)
+	if err != nil || len(people) != 1 {
+		t.Fatalf("GetPeopleByItemID failed: %v err=%v", people, err)
+	}
+	if err := repo.UpsertImage(ctx, &ImageRecord{
+		ItemID:     people[0].Id,
+		ImageType:  "Primary",
+		ImageIndex: 0,
+		Path:       "/tmp/timothee.jpg",
+		Tag:        "tag123",
+	}); err != nil {
+		t.Fatalf("UpsertImage for person failed after migration v2: %v", err)
+	}
+
+	peopleAfter, err := repo.GetPeopleByItemID(ctx, m1.ID)
+	if err != nil || len(peopleAfter) != 1 || peopleAfter[0].PrimaryImageTag != "tag123" {
+		t.Fatalf("expected PrimaryImageTag='tag123', got %+v err=%v", peopleAfter, err)
+	}
+	taxPersons, total, err := repo.ListTaxonomies(ctx, "srv", "person", "", 0, 10)
+	if err != nil || total != 1 || taxPersons[0].ImageTags["Primary"] != "tag123" {
+		t.Fatalf("expected taxonomy person ImageTags[Primary]='tag123', got %+v err=%v", taxPersons, err)
+	}
+}

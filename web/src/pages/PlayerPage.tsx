@@ -66,7 +66,21 @@ import {
 } from '../player/wasmRemuxer'
 
 type ActivePanel = 'none' | 'subtitle' | 'subtitlePrefs' | 'audio' | 'speed' | 'settings'
-type PlayMethodMode = 'DirectPlay' | 'Stream MKV (MSE)' | 'Client WASM Remux' | 'Server HLS'
+type PlayMethodMode =
+  | 'DirectPlay'
+  | 'Proxy Direct'
+  | 'Stream MKV (MSE)'
+  | 'Client WASM Remux'
+  | 'Server HLS'
+
+function isStrmSource(source?: MediaSourceInfo): boolean {
+  if (!source) return false
+  if (source.IsRemote) return true
+  if ((source.Container || '').trim().toLowerCase() === 'strm') return true
+  if ((source.Protocol || '').trim().toLowerCase() === 'http') return true
+  if ((source.Path || '').trim().toLowerCase().endsWith('.strm')) return true
+  return false
+}
 
 interface WasmProgressState {
   stage: WasmRemuxStage
@@ -125,6 +139,7 @@ export function PlayerPage() {
 
   // 客户端 WASM 解复用偏好与运行态
   const [preferWasmRemux, setPreferWasmRemuxState] = useState<boolean>(() => getPreferWasmRemux())
+  const [useProxyDirect, setUseProxyDirect] = useState(false)
   const [forceServerHls, setForceServerHls] = useState(false)
   const [wasmProgress, setWasmProgress] = useState<WasmProgressState | null>(null)
   const [wasmFallbackNotice, setWasmFallbackNotice] = useState<string | null>(null)
@@ -135,6 +150,7 @@ export function PlayerPage() {
     setPreferWasmRemuxState((prev) => {
       const next = !prev
       setPreferWasmRemux(next)
+      setUseProxyDirect(false)
       setForceServerHls(false)
       setWasmFallbackNotice(null)
       return next
@@ -143,6 +159,7 @@ export function PlayerPage() {
 
   // 切换视频或音轨时重置强制回退状态
   useEffect(() => {
+    setUseProxyDirect(false)
     setForceServerHls(false)
     setWasmFallbackNotice(null)
   }, [id, selectedSourceId, audioIndex])
@@ -244,10 +261,18 @@ export function PlayerPage() {
       `/emby/Videos/${encodeURIComponent(id)}/stream?${staticParams.toString()}`,
     )
 
+    const proxyParams = new URLSearchParams(staticParams)
+    proxyParams.set('proxy', '1')
+    const proxyDirectUrl = resolveApiUrl(
+      `/emby/Videos/${encodeURIComponent(id)}/stream?${proxyParams.toString()}`,
+    )
+
     const directUrl =
       activeSource.DirectStreamUrl && !activeSource.DirectStreamUrl.includes('.m3u8')
         ? resolveApiUrl(activeSource.DirectStreamUrl)
         : staticDirectUrl
+
+    const isStrm = isStrmSource(activeSource)
 
     const hlsParams = new URLSearchParams({
       MediaSourceId: activeSource.Id,
@@ -275,7 +300,23 @@ export function PlayerPage() {
       return {
         strategy: 'hls' as const,
         directUrl,
+        proxyDirectUrl,
         hlsUrl,
+        isStrm,
+        requiresRemux,
+        withinWasmThreshold,
+        skipReason: null as string | null,
+      }
+    }
+
+    // 0. STRM 直连失败后，先尝试服务端反代直出 (&proxy=1，支持 Range)
+    if (useProxyDirect && isStrm) {
+      return {
+        strategy: 'proxy-direct' as const,
+        directUrl,
+        proxyDirectUrl,
+        hlsUrl,
+        isStrm,
         requiresRemux,
         withinWasmThreshold,
         skipReason: null as string | null,
@@ -287,7 +328,9 @@ export function PlayerPage() {
       return {
         strategy: 'direct' as const,
         directUrl,
+        proxyDirectUrl,
         hlsUrl,
+        isStrm,
         requiresRemux,
         withinWasmThreshold,
         skipReason: null as string | null,
@@ -299,7 +342,9 @@ export function PlayerPage() {
       return {
         strategy: 'stream-mkv' as const,
         directUrl,
+        proxyDirectUrl,
         hlsUrl,
+        isStrm,
         requiresRemux,
         withinWasmThreshold,
         skipReason: null as string | null,
@@ -316,7 +361,9 @@ export function PlayerPage() {
       return {
         strategy: 'wasm' as const,
         directUrl,
+        proxyDirectUrl,
         hlsUrl,
+        isStrm,
         requiresRemux,
         withinWasmThreshold,
         skipReason: null as string | null,
@@ -338,7 +385,9 @@ export function PlayerPage() {
     return {
       strategy: 'hls' as const,
       directUrl,
+      proxyDirectUrl,
       hlsUrl,
+      isStrm,
       requiresRemux,
       withinWasmThreshold,
       skipReason,
@@ -351,6 +400,7 @@ export function PlayerPage() {
     videoStream?.Codec,
     activeAudioStream?.Codec,
     preferWasmRemux,
+    useProxyDirect,
     forceServerHls,
   ])
 
@@ -367,7 +417,7 @@ export function PlayerPage() {
     setWasmProgress(null)
     if (streamPlan.skipReason) {
       setWasmFallbackNotice(streamPlan.skipReason)
-    } else if (!forceServerHls) {
+    } else if (!forceServerHls && !useProxyDirect) {
       setWasmFallbackNotice(null)
     }
 
@@ -524,6 +574,10 @@ export function PlayerPage() {
       setPlayMethod('DirectPlay')
       video.src = streamPlan.directUrl
       video.addEventListener('loadedmetadata', startPlayback, { once: true })
+    } else if (streamPlan.strategy === 'proxy-direct') {
+      setPlayMethod('Proxy Direct')
+      video.src = streamPlan.proxyDirectUrl
+      video.addEventListener('loadedmetadata', startPlayback, { once: true })
     } else if (streamPlan.strategy === 'hls') {
       mountServerHls(streamPlan.hlsUrl)
     } else if (streamPlan.strategy === 'stream-mkv') {
@@ -580,6 +634,7 @@ export function PlayerPage() {
     activeSource?.Size,
     activeSource?.Container,
     initialStartTicks,
+    useProxyDirect,
     forceServerHls,
     preferWasmRemux,
   ])
@@ -732,7 +787,12 @@ export function PlayerPage() {
         VolumeLevel: Math.round(videoRef.current.volume * 100),
         AudioStreamIndex: audioIndex,
         SubtitleStreamIndex: subtitleIndex,
-        PlayMethod: playMethod === 'Server HLS' ? 'Transcode' : 'DirectPlay',
+        PlayMethod:
+          playMethod === 'Server HLS'
+            ? 'Transcode'
+            : playMethod === 'Proxy Direct'
+              ? 'DirectStream'
+              : 'DirectPlay',
       }
       if (type === 'start') {
         void api.reportPlaying(full)
@@ -946,14 +1006,28 @@ export function PlayerPage() {
           }
         }}
         onError={() => {
-          // 若当前为 DirectPlay / Stream MKV (MSE) / Client WASM Remux 解码失败，自动无感回退服务端 HLS
+          // 1) STRM 源直连失败（如 302 跨域/Referer 限制或浏览器拒绝外链）时，优先尝试服务端代理直出 (&proxy=1)
+          if (
+            playMethod === 'DirectPlay' &&
+            !useProxyDirect &&
+            !forceServerHls &&
+            streamPlan?.isStrm &&
+            streamPlan?.proxyDirectUrl
+          ) {
+            setWasmFallbackNotice('STRM 直连失败，正在切换服务端代理直出 (&proxy=1)...')
+            setUseProxyDirect(true)
+            return
+          }
+          // 2) 若当前为 DirectPlay / Proxy Direct / Stream MKV (MSE) / Client WASM Remux 解码失败，自动无感回退服务端 HLS
           if (playMethod !== 'Server HLS' && !forceServerHls && streamPlan?.hlsUrl) {
             setWasmFallbackNotice(
-              playMethod === 'Stream MKV (MSE)'
-                ? '流式 MKV (MSE) 解码异常，已自动回退服务端 HLS'
-                : playMethod === 'Client WASM Remux'
-                  ? '客户端转封装流解码异常，已自动回退服务端 HLS'
-                  : '浏览器原生直连解码失败，已自动回退服务端 HLS',
+              playMethod === 'Proxy Direct'
+                ? '服务端代理直出解码失败，已自动回退服务端 HLS'
+                : playMethod === 'Stream MKV (MSE)'
+                  ? '流式 MKV (MSE) 解码异常，已自动回退服务端 HLS'
+                  : playMethod === 'Client WASM Remux'
+                    ? '客户端转封装流解码异常，已自动回退服务端 HLS'
+                    : '浏览器原生直连解码失败，已自动回退服务端 HLS',
             )
             setForceServerHls(true)
             return
@@ -1734,11 +1808,13 @@ function PlayMethodBadge({ method }: { method: PlayMethodMode }) {
   const styleClass =
     method === 'DirectPlay'
       ? 'border-emerald-400/35 bg-emerald-500/20 text-emerald-300'
-      : method === 'Stream MKV (MSE)'
-        ? 'border-violet-400/40 bg-violet-500/20 text-violet-200'
-        : method === 'Client WASM Remux'
-          ? 'border-amber-400/40 bg-amber-500/20 text-amber-300'
-          : 'border-sky-400/35 bg-sky-500/20 text-sky-300'
+      : method === 'Proxy Direct'
+        ? 'border-teal-400/35 bg-teal-500/20 text-teal-300'
+        : method === 'Stream MKV (MSE)'
+          ? 'border-violet-400/40 bg-violet-500/20 text-violet-200'
+          : method === 'Client WASM Remux'
+            ? 'border-amber-400/40 bg-amber-500/20 text-amber-300'
+            : 'border-sky-400/35 bg-sky-500/20 text-sky-300'
 
   return (
     <span
