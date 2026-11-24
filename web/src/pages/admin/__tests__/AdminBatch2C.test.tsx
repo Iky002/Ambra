@@ -85,7 +85,7 @@ describe('Audit Batch 2C — Admin Settings, Plugins, Image URL & Scan Controls'
 
     expect(await screen.findByText('已保存服务器常规设置')).toBeInTheDocument()
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['publicSystemInfo'] })
-    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['systemInfo'] })
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['admin', 'systemInfo'] })
   })
 
   it('PluginsTab 优先读取小写实时字段 enabled/priority 并在保存时同步写入大小写字段', async () => {

@@ -493,6 +493,13 @@ export function createInitialDemoState(): DemoState {
         multiVersion: true,
         hasPgs: true,
       }),
+      Chapters: [
+        { StartPositionTicks: 0, Name: '序幕：1947 年的审判' },
+        { StartPositionTicks: 18 * MIN_TICKS, Name: '初入肖申克监狱' },
+        { StartPositionTicks: 52 * MIN_TICKS, Name: '屋顶啤酒与图书馆' },
+        { StartPositionTicks: 96 * MIN_TICKS, Name: '莫扎特的歌声' },
+        { StartPositionTicks: 122 * MIN_TICKS, Name: '暴雨夜的救赎' },
+      ],
       ImageTags: { Primary: 'demo-p' },
       BackdropImageTags: ['demo-b'],
       PrimaryImageAspectRatio: 0.667,
@@ -547,6 +554,13 @@ export function createInitialDemoState(): DemoState {
         multiVersion: true,
         hasPgs: true,
       }),
+      Chapters: [
+        { StartPositionTicks: 0, Name: '柯里昂家族的婚礼' },
+        { StartPositionTicks: 35 * MIN_TICKS, Name: '好莱坞的马头警告' },
+        { StartPositionTicks: 78 * MIN_TICKS, Name: '街头遇刺与迈克尔的抉择' },
+        { StartPositionTicks: 118 * MIN_TICKS, Name: '西西里流亡岁月' },
+        { StartPositionTicks: 152 * MIN_TICKS, Name: '教堂洗礼与清算' },
+      ],
       ImageTags: { Primary: 'demo-p' },
       BackdropImageTags: ['demo-b'],
       PrimaryImageAspectRatio: 0.667,
@@ -2641,6 +2655,7 @@ export function createInitialDemoState(): DemoState {
       Description: '增量扫描本地与 NAS 挂载目录，自动匹配 TMDB 元数据与中文简繁字幕。',
       State: 'Idle',
       CurrentProgressPercentage: 100,
+      Triggers: [{ Type: 'DailyTrigger', TimeOfDayTicks: 3 * HOUR_TICKS }],
       LastExecutionResult: {
         Status: 'Completed',
         StartTimeUtc: isoAgo(125),
@@ -2655,6 +2670,7 @@ export function createInitialDemoState(): DemoState {
       Description: '清理超过 7 天的临时 HLS 切片与缩略图缓存文件，释放磁盘空间。',
       State: 'Idle',
       CurrentProgressPercentage: 100,
+      Triggers: [{ Type: 'IntervalTrigger', IntervalTicks: 12 * HOUR_TICKS }],
       LastExecutionResult: {
         Status: 'Completed',
         StartTimeUtc: isoAgo(720),

@@ -5,6 +5,10 @@ import type {
   BaseItemDto,
   ItemImageInfo,
   LibraryScanProgress,
+  LiveTvChannelInfo,
+  LiveTvInfo,
+  LiveTvListingProviderInfo,
+  LiveTvTunerHostInfo,
   PlaybackInfoResponse,
   PublicSystemInfo,
   QueryResult,
@@ -18,6 +22,7 @@ import type {
   SearchHintResult,
   ServerConfiguration,
   SetupStatus,
+  TaskTriggerInfo,
   UserDto,
   UserItemDataDto,
   UserPolicy,
@@ -165,6 +170,61 @@ function createInitialServerConfig(): ServerConfiguration {
 
 let demoServerConfig: ServerConfiguration = createInitialServerConfig()
 
+function createInitialTunerHosts(): LiveTvTunerHostInfo[] {
+  return [
+    {
+      Id: 'tuner-demo-01',
+      Type: 'm3u',
+      FriendlyName: 'IPTV 高清演示源',
+      Url: 'https://demo.ambra.local/iptv-hd.m3u',
+      TunerCount: 4,
+    },
+  ]
+}
+
+function createInitialListingProviders(): LiveTvListingProviderInfo[] {
+  return [
+    {
+      Id: 'epg-demo-01',
+      Type: 'xmltv',
+      Path: 'https://demo.ambra.local/epg.xml',
+    },
+  ]
+}
+
+function createInitialLiveTvChannels(): LiveTvChannelInfo[] {
+  return [
+    {
+      Id: 'ch-demo-01',
+      Name: 'CCTV-1 综合高清',
+      Number: '1',
+      ChannelType: 'TV',
+      Type: 'TvChannel',
+      StreamUrl: 'https://demo.ambra.local/live/cctv1.m3u8',
+    },
+    {
+      Id: 'ch-demo-02',
+      Name: 'CCTV-6 电影频道',
+      Number: '6',
+      ChannelType: 'TV',
+      Type: 'TvChannel',
+      StreamUrl: 'https://demo.ambra.local/live/cctv6.m3u8',
+    },
+    {
+      Id: 'ch-demo-03',
+      Name: '4K 超高清测试台',
+      Number: '401',
+      ChannelType: 'TV',
+      Type: 'TvChannel',
+      StreamUrl: 'https://demo.ambra.local/live/uhd4k.m3u8',
+    },
+  ]
+}
+
+let demoTunerHosts: LiveTvTunerHostInfo[] = createInitialTunerHosts()
+let demoListingProviders: LiveTvListingProviderInfo[] = createInitialListingProviders()
+let demoLiveTvChannels: LiveTvChannelInfo[] = createInitialLiveTvChannels()
+
 const DEMO_TMDB_TRENDING_TMDB_IDS = new Set([
   '693134', // 沙丘 2
   '872585', // 奥本海默
@@ -232,6 +292,9 @@ export function resetDemoStore(): void {
   demoServerConfig = createInitialServerConfig()
   demoOrphans = createInitialDemoOrphans()
   demoReviews = createInitialDemoReviews()
+  demoTunerHosts = createInitialTunerHosts()
+  demoListingProviders = createInitialListingProviders()
+  demoLiveTvChannels = createInitialLiveTvChannels()
 }
 
 export function getDemoImageUrl(
@@ -860,6 +923,9 @@ export async function demoFetch<T>(
       .filter(Boolean)
     const personParam = (qs.get('Person') || '').trim().toLowerCase()
     const searchTerm = qs.get('SearchTerm') || ''
+    const nameStartsWith = (qs.get('NameStartsWith') || '').trim().toLowerCase()
+    const nameStartsWithOrGreater = (qs.get('NameStartsWithOrGreater') || '').trim().toLowerCase()
+    const nameLessThan = (qs.get('NameLessThan') || '').trim().toLowerCase()
     const sortBy = qs.get('SortBy') || 'DateCreated'
     const sortOrder = qs.get('SortOrder') || 'Descending'
     const startIndex = Number(qs.get('StartIndex') || 0)
@@ -913,6 +979,25 @@ export async function demoFetch<T>(
     }
     if (searchTerm) {
       pool = pool.filter((it) => matchesFuzzySearch(it, searchTerm))
+    }
+    if (nameStartsWith) {
+      pool = pool.filter((it) => {
+        const sortKey = (it.SortName || it.Name).trim().toLowerCase()
+        const nameKey = it.Name.trim().toLowerCase()
+        return sortKey.startsWith(nameStartsWith) || nameKey.startsWith(nameStartsWith)
+      })
+    }
+    if (nameStartsWithOrGreater) {
+      pool = pool.filter((it) => {
+        const sortKey = (it.SortName || it.Name).trim().toLowerCase()
+        return sortKey >= nameStartsWithOrGreater
+      })
+    }
+    if (nameLessThan) {
+      pool = pool.filter((it) => {
+        const sortKey = (it.SortName || it.Name).trim().toLowerCase()
+        return sortKey.length > 0 && sortKey < nameLessThan
+      })
     }
 
     const sorted = sortItems(pool, sortBy, sortOrder)
@@ -1197,7 +1282,23 @@ export async function demoFetch<T>(
     return res as T
   }
 
-  // ==================== 7. 收藏 / 已看写入 ====================
+  // ==================== 7. 收藏 / 已看 / 从继续观看移除 ====================
+  const hideResumeMatch = pathname.match(
+    /^\/emby\/Users\/([^/]+)\/Items\/([^/]+)\/HideFromResume$/,
+  )
+  if (hideResumeMatch && method === 'POST') {
+    const itemId = decodeURIComponent(hideResumeMatch[2])
+    const item = store.items.get(itemId)
+    if (!item) throw new ApiError(404, '项目不存在')
+    const ud = ensureUserData(item)
+    const hide = qs.get('Hide') !== 'false'
+    if (hide) {
+      ud.PlaybackPositionTicks = 0
+      ud.PlayedPercentage = 0
+    }
+    return { ...ud } as T
+  }
+
   const favMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/FavoriteItems\/([^/]+)$/)
   if (favMatch && (method === 'POST' || method === 'DELETE')) {
     const itemId = decodeURIComponent(favMatch[2])
@@ -1945,9 +2046,53 @@ export async function demoFetch<T>(
     return [...entries] as T
   }
 
-  // ==================== 10. 会话、活动日志、设备与 API Key ====================
+  // ==================== 10. 会话、远程控制、活动日志、设备与 API Key ====================
   if (pathname === '/emby/Sessions' && method === 'GET') {
     return [...store.sessions] as T
+  }
+
+  const sessionPlaystateMatch = pathname.match(/^\/emby\/Sessions\/([^/]+)\/Playing\/([^/]+)$/)
+  if (sessionPlaystateMatch && method === 'POST') {
+    const sessionId = decodeURIComponent(sessionPlaystateMatch[1])
+    const command = decodeURIComponent(sessionPlaystateMatch[2])
+    const sess = store.sessions.find((s) => s.Id === sessionId)
+    if (!sess) throw new ApiError(404, '会话不存在')
+    const cmdLower = command.toLowerCase()
+    if (cmdLower === 'stop') {
+      sess.NowPlayingItem = undefined
+      sess.PlayState = undefined
+    } else if (sess.PlayState) {
+      if (cmdLower === 'pause') {
+        sess.PlayState.IsPaused = true
+      } else if (cmdLower === 'unpause') {
+        sess.PlayState.IsPaused = false
+      } else if (cmdLower === 'playpause') {
+        sess.PlayState.IsPaused = !sess.PlayState.IsPaused
+      }
+    }
+    sess.LastActivityDate = new Date().toISOString()
+    pushActivity(
+      `已向会话「${sess.DeviceName || sess.Id}」发送远程指令：${command}`,
+      'SessionRemoteControl',
+    )
+    return undefined as T
+  }
+
+  const sessionMessageMatch = pathname.match(/^\/emby\/Sessions\/([^/]+)\/Message$/)
+  if (sessionMessageMatch && method === 'POST') {
+    const sessionId = decodeURIComponent(sessionMessageMatch[1])
+    const sess = store.sessions.find((s) => s.Id === sessionId)
+    if (!sess) throw new ApiError(404, '会话不存在')
+    const body = parseJsonBody(options)
+    const header = String(body.Header || '系统通知')
+    const text = String(body.Text || '')
+    sess.LastActivityDate = new Date().toISOString()
+    pushActivity(
+      `已向会话「${sess.DeviceName || sess.Id}」发送消息：${header}`,
+      'SessionMessageSent',
+      text,
+    )
+    return undefined as T
   }
 
   if (pathname === '/emby/System/ActivityLog/Entries' && method === 'GET') {
@@ -2033,9 +2178,110 @@ export async function demoFetch<T>(
     }
   }
 
-  // ==================== 12. 计划任务与服务器日志 ====================
+  // ==================== 12. 计划任务、触发规则、Live TV 与服务器日志 ====================
   if (pathname === '/emby/ScheduledTasks' && method === 'GET') {
-    return store.scheduledTasks.map((t) => ({ ...t })) as T
+    return store.scheduledTasks.map((t) => ({
+      ...t,
+      Triggers: t.Triggers ? t.Triggers.map((tr) => ({ ...tr })) : [],
+    })) as T
+  }
+
+  const taskTriggersMatch = pathname.match(/^\/emby\/ScheduledTasks\/([^/]+)\/Triggers$/)
+  if (taskTriggersMatch && method === 'POST') {
+    const taskId = decodeURIComponent(taskTriggersMatch[1])
+    const task = store.scheduledTasks.find((t) => t.Id === taskId)
+    if (!task) throw new ApiError(404, '计划任务不存在')
+    let parsedTriggers: TaskTriggerInfo[] = []
+    if (typeof options.body === 'string') {
+      try {
+        const raw = JSON.parse(options.body)
+        if (Array.isArray(raw)) {
+          parsedTriggers = raw as TaskTriggerInfo[]
+        }
+      } catch {
+        parsedTriggers = []
+      }
+    }
+    task.Triggers = parsedTriggers
+    pushActivity(
+      `已更新计划任务「${task.Name}」的触发规则（${parsedTriggers.length} 条）`,
+      'ScheduledTaskTriggersUpdated',
+    )
+    return undefined as T
+  }
+
+  // Live TV (M3U Tuner Hosts / XMLTV EPG / Channels)
+  if (pathname === '/emby/LiveTv/Info' && method === 'GET') {
+    const info: LiveTvInfo = {
+      IsEnabled: true,
+      Services: [{ Name: 'Ambra M3U / XMLTV', Status: 'Ok' }],
+      EnabledUsers: store.users.map((u) => u.user.Id),
+    }
+    return info as T
+  }
+
+  if (pathname === '/emby/LiveTv/Channels' && method === 'GET') {
+    const limit = Number(qs.get('Limit') || 100)
+    const sliced = demoLiveTvChannels.slice(0, limit)
+    return { Items: sliced, TotalRecordCount: demoLiveTvChannels.length } as T
+  }
+
+  if (pathname === '/emby/LiveTv/TunerHosts') {
+    if (method === 'GET') {
+      return demoTunerHosts.map((h) => ({ ...h })) as T
+    }
+    if (method === 'POST') {
+      const body = parseJsonBody(options)
+      const urlVal = String(body.Url || '').trim()
+      if (!urlVal) throw new ApiError(400, 'M3U 地址不能为空')
+      const created: LiveTvTunerHostInfo = {
+        Id: `tuner-demo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`,
+        Type: String(body.Type || 'm3u'),
+        FriendlyName: String(body.FriendlyName || '').trim() || 'M3U 直播源',
+        Url: urlVal,
+        TunerCount: typeof body.TunerCount === 'number' ? body.TunerCount : 4,
+      }
+      demoTunerHosts.push(created)
+      pushActivity(`已添加 Live TV 直播源「${created.FriendlyName}」`, 'LiveTvTunerAdded', urlVal)
+      return { ...created } as T
+    }
+    if (method === 'DELETE') {
+      const id = qs.get('id') || ''
+      const idx = demoTunerHosts.findIndex((h) => h.Id === id)
+      if (idx >= 0) {
+        const [removed] = demoTunerHosts.splice(idx, 1)
+        pushActivity(`已删除 Live TV 直播源「${removed.FriendlyName || id}」`, 'LiveTvTunerDeleted')
+      }
+      return undefined as T
+    }
+  }
+
+  if (pathname === '/emby/LiveTv/ListingProviders') {
+    if (method === 'GET') {
+      return demoListingProviders.map((p) => ({ ...p })) as T
+    }
+    if (method === 'POST') {
+      const body = parseJsonBody(options)
+      const pathVal = String(body.Path || '').trim()
+      if (!pathVal) throw new ApiError(400, 'EPG 路径不能为空')
+      const created: LiveTvListingProviderInfo = {
+        Id: `epg-demo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`,
+        Type: String(body.Type || 'xmltv'),
+        Path: pathVal,
+      }
+      demoListingProviders.push(created)
+      pushActivity(`已添加 XMLTV EPG 节目单来源`, 'LiveTvEpgAdded', pathVal)
+      return { ...created } as T
+    }
+    if (method === 'DELETE') {
+      const id = qs.get('id') || ''
+      const idx = demoListingProviders.findIndex((p) => p.Id === id)
+      if (idx >= 0) {
+        demoListingProviders.splice(idx, 1)
+        pushActivity(`已删除 XMLTV EPG 节目单来源`, 'LiveTvEpgDeleted')
+      }
+      return undefined as T
+    }
   }
 
   const runTaskMatch = pathname.match(/^\/emby\/ScheduledTasks\/Running\/([^/]+)$/)
@@ -2531,6 +2777,55 @@ export async function demoFetch<T>(
       item.ImageTags = { ...(item.ImageTags || {}), Primary: nextTag }
     }
     pushActivity(`已上传「${item.Name}」的 ${imgType} 图片`, 'ItemImageUploaded')
+    return undefined as T
+  }
+
+  const uploadSubtitleMatch = pathname.match(/^\/emby\/Videos\/([^/]+)\/Subtitles$/)
+  if (uploadSubtitleMatch && method === 'POST') {
+    const itemId = decodeURIComponent(uploadSubtitleMatch[1])
+    const item = store.items.get(itemId)
+    if (!item) throw new ApiError(404, '项目不存在')
+    const body = parseJsonBody(options)
+    const language = String(body.Language || 'chi').trim() || 'chi'
+    const format = String(body.Format || 'srt').trim().toLowerCase() || 'srt'
+    const isForced = Boolean(body.IsForced)
+    const src = item.MediaSources?.[0]
+    if (src) {
+      const streams = src.MediaStreams || []
+      const nextIdx = streams.reduce((max, s) => Math.max(max, s.Index), -1) + 1
+      streams.push({
+        Type: 'Subtitle',
+        Index: nextIdx,
+        Codec: format,
+        Language: language,
+        DisplayLanguage: language,
+        Title: `外挂上传字幕 (${language.toUpperCase()} · ${format.toUpperCase()})`,
+        DisplayTitle: `${language.toUpperCase()} (${format.toUpperCase()})`,
+        IsForced: isForced,
+        IsExternal: true,
+        DeliveryMethod: 'External',
+        DeliveryUrl: `data:text/plain;charset=utf-8,${encodeURIComponent(String(body.Data || ''))}`,
+      })
+      src.MediaStreams = streams
+    }
+    pushActivity(`已为「${item.Name}」上传外挂字幕 (${format.toUpperCase()})`, 'SubtitleUploaded')
+    return undefined as T
+  }
+
+  const deleteSubtitleMatch = pathname.match(/^\/emby\/Videos\/([^/]+)\/Subtitles\/(\d+)$/)
+  if (deleteSubtitleMatch && method === 'DELETE') {
+    const itemId = decodeURIComponent(deleteSubtitleMatch[1])
+    const subIdx = Number(deleteSubtitleMatch[2])
+    const item = store.items.get(itemId)
+    if (!item) throw new ApiError(404, '项目不存在')
+    for (const src of item.MediaSources || []) {
+      if (src.MediaStreams) {
+        src.MediaStreams = src.MediaStreams.filter(
+          (s) => !(s.Type === 'Subtitle' && s.Index === subIdx),
+        )
+      }
+    }
+    pushActivity(`已删除「${item.Name}」的外挂字幕 #${subIdx}`, 'SubtitleDeleted')
     return undefined as T
   }
 

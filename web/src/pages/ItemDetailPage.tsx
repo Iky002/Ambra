@@ -2,10 +2,12 @@ import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
+  Bookmark,
   Check,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
+  Copy,
   Disc3,
   Download,
   Film,
@@ -14,6 +16,7 @@ import {
   GitMerge,
   Heart,
   Image as ImageIcon,
+  Info,
   Layers,
   ListVideo,
   Loader2,
@@ -28,6 +31,7 @@ import {
   Star,
   Subtitles,
   Trash2,
+  Upload,
   User,
   Volume2,
 } from 'lucide-react'
@@ -49,11 +53,34 @@ import {
 } from '../player/playbackPrefs'
 import {
   detectChineseVariant,
+  formatSeconds,
   formatTicks,
   getAudioLabel,
   getSubtitleMeta,
 } from '../player/subtitleUtils'
+import { formatBytes } from '../player/wasmRemuxer'
 import { AdminModal, FeedbackBanner } from './admin/adminUtils'
+
+function formatBitrate(bitrate?: number): string {
+  if (!bitrate || !Number.isFinite(bitrate) || bitrate <= 0) return '-'
+  if (bitrate >= 1_000_000) {
+    return `${(bitrate / 1_000_000).toFixed(2)} Mbps`
+  }
+  return `${Math.round(bitrate / 1_000)} kbps`
+}
+
+function readFileAsBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const result = typeof reader.result === 'string' ? reader.result : ''
+      const base64 = result.includes(',') ? result.slice(result.indexOf(',') + 1) : result
+      resolve(base64)
+    }
+    reader.onerror = () => reject(new Error('读取字幕文件失败'))
+    reader.readAsDataURL(file)
+  })
+}
 
 export function ItemDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -79,6 +106,13 @@ export function ItemDetailPage() {
   const [addToColTab, setAddToColTab] = useState<'BoxSet' | 'Playlist'>('BoxSet')
   const [newColName, setNewColName] = useState('')
   const [showAllCast, setShowAllCast] = useState(false)
+  const [mediaInfoExpanded, setMediaInfoExpanded] = useState(true)
+  const [pathCopied, setPathCopied] = useState(false)
+  const [subModalOpen, setSubModalOpen] = useState(false)
+  const [subFile, setSubFile] = useState<File | null>(null)
+  const [subLang, setSubLang] = useState('chi')
+  const [subForced, setSubForced] = useState(false)
+  const [subError, setSubError] = useState<string | null>(null)
   const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
 
   const showToast = (type: 'success' | 'error', message: string) => {
@@ -298,7 +332,51 @@ export function ItemDetailPage() {
     mutationFn: () => api.togglePlayed(userId, item!.Id, Boolean(item!.UserData?.Played)),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['item', userId, id] })
-      queryClient.invalidateQueries({ queryKey: ['resumeItems', userId] })
+      queryClient.invalidateQueries({ queryKey: ['seasons'] })
+      queryClient.invalidateQueries({ queryKey: ['episodes'] })
+      queryClient.invalidateQueries({ queryKey: ['nextUp'] })
+      queryClient.invalidateQueries({ queryKey: ['resumeItems'] })
+    },
+  })
+
+  const uploadSubtitleMutation = useMutation({
+    mutationFn: async () => {
+      if (!item || !subFile) throw new Error('请选择要上传的字幕文件')
+      const extMatch = subFile.name.toLowerCase().match(/\.([a-z0-9]+)$/)
+      const format = extMatch ? extMatch[1] : 'srt'
+      const data = await readFileAsBase64(subFile)
+      await api.uploadSubtitle(item.Id, {
+        Language: subLang,
+        Format: format,
+        IsForced: subForced,
+        Data: data,
+      })
+    },
+    onSuccess: async () => {
+      setSubFile(null)
+      setSubForced(false)
+      setSubError(null)
+      await queryClient.invalidateQueries({ queryKey: ['item'] })
+      showToast('success', '外挂字幕上传成功')
+    },
+    onError: (err) => {
+      const msg = err instanceof Error ? err.message : '上传字幕失败'
+      setSubError(msg)
+      showToast('error', msg)
+    },
+  })
+
+  const deleteSubtitleMutation = useMutation({
+    mutationFn: (streamIndex: number) => api.deleteSubtitle(item!.Id, streamIndex),
+    onSuccess: async () => {
+      setSubError(null)
+      await queryClient.invalidateQueries({ queryKey: ['item'] })
+      showToast('success', '已删除外挂字幕')
+    },
+    onError: (err) => {
+      const msg = err instanceof Error ? err.message : '删除字幕失败'
+      setSubError(msg)
+      showToast('error', msg)
     },
   })
 
@@ -981,12 +1059,29 @@ export function ItemDetailPage() {
                     </select>
                   </label>
 
-                  <label className="block space-y-1.5">
-                    <span className="flex items-center gap-1.5 text-xs font-medium text-zinc-400">
-                      <Subtitles className="h-3.5 w-3.5 text-amber-400" />
-                      字幕 ({subtitleStreams.length})
-                    </span>
+                  <div className="block space-y-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <label
+                        htmlFor="detail-subtitle-select"
+                        className="flex items-center gap-1.5 text-xs font-medium text-zinc-400"
+                      >
+                        <Subtitles className="h-3.5 w-3.5 text-amber-400" />
+                        字幕 ({subtitleStreams.length})
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSubError(null)
+                          setSubModalOpen(true)
+                        }}
+                        className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[11px] font-medium text-amber-300 transition-colors hover:border-amber-400/40 hover:bg-amber-500/15"
+                      >
+                        <Upload className="h-3 w-3" />
+                        <span>管理字幕</span>
+                      </button>
+                    </div>
                     <select
+                      id="detail-subtitle-select"
                       value={selectedSubIdx ?? -1}
                       onChange={(e) => {
                         const v = Number(e.target.value)
@@ -1004,7 +1099,7 @@ export function ItemDetailPage() {
                         )
                       })}
                     </select>
-                  </label>
+                  </div>
                 </div>
               )}
 
@@ -1533,6 +1628,223 @@ export function ItemDetailPage() {
         </section>
       )}
 
+      {/* 视频章节横向条 */}
+      {item.Chapters && item.Chapters.length > 0 && (
+        <section className="mx-auto max-w-7xl space-y-4 px-4 pt-10 lg:px-8">
+          <div className="flex items-center gap-2">
+            <Bookmark className="h-4 w-4 text-amber-400" />
+            <h2 className="text-lg font-semibold text-zinc-100">
+              章节
+              <span className="ml-2 text-xs font-normal text-zinc-500">
+                ({item.Chapters.length})
+              </span>
+            </h2>
+          </div>
+          <div className="no-scrollbar -mx-1 flex gap-3 overflow-x-auto px-1 pb-2 pt-1">
+            {item.Chapters.map((chapter, idx) => {
+              const startSec = chapter.StartPositionTicks / 10_000_000
+              return (
+                <button
+                  key={`${chapter.StartPositionTicks}-${idx}`}
+                  type="button"
+                  onClick={() =>
+                    navigate(`/play/${item.Id}?startTicks=${chapter.StartPositionTicks}`)
+                  }
+                  className="group flex w-48 shrink-0 flex-col justify-between rounded-2xl border border-white/8 bg-white/[0.03] p-3.5 text-left transition-all duration-200 hover:-translate-y-0.5 hover:border-amber-400/50 hover:bg-white/[0.06]"
+                >
+                  <span className="line-clamp-2 text-xs font-semibold text-zinc-100 group-hover:text-amber-300">
+                    {chapter.Name || `章节 ${idx + 1}`}
+                  </span>
+                  <span className="mt-2 inline-flex items-center gap-1 font-mono text-[11px] text-zinc-400">
+                    <Play className="h-3 w-3 text-amber-400" />
+                    {formatSeconds(startSec)}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+        </section>
+      )}
+
+      {/* Emby 风格「媒体信息」技术面板 */}
+      {!isSeries && !isMusicAlbum && !isMusicArtist && activeSource && (
+        <section className="mx-auto max-w-7xl space-y-4 px-4 pt-10 lg:px-8">
+          <div className="overflow-hidden rounded-2xl border border-white/10 bg-zinc-950/70 backdrop-blur-md">
+            <button
+              type="button"
+              onClick={() => setMediaInfoExpanded((prev) => !prev)}
+              aria-expanded={mediaInfoExpanded}
+              className="flex w-full items-center justify-between gap-3 px-5 py-4 text-left transition-colors hover:bg-white/[0.03]"
+            >
+              <div className="flex items-center gap-2">
+                <Info className="h-4 w-4 text-amber-400" />
+                <h2 className="text-base font-semibold text-zinc-100">媒体信息</h2>
+              </div>
+              {mediaInfoExpanded ? (
+                <ChevronUp className="h-4 w-4 text-zinc-400" />
+              ) : (
+                <ChevronDown className="h-4 w-4 text-zinc-400" />
+              )}
+            </button>
+
+            {mediaInfoExpanded && (
+              <div className="space-y-5 border-t border-white/8 px-5 py-4">
+                {/* 文件路径与基础参数 */}
+                <div className="space-y-3">
+                  {activeSource.Path && (
+                    <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/8 bg-white/[0.025] px-3.5 py-2.5">
+                      <div className="min-w-0 flex-1">
+                        <span className="block text-[11px] text-zinc-500">文件路径</span>
+                        <code className="block truncate font-mono text-xs text-zinc-200">
+                          {activeSource.Path}
+                        </code>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void navigator.clipboard?.writeText(activeSource.Path!)
+                          setPathCopied(true)
+                          window.setTimeout(() => setPathCopied(false), 2000)
+                        }}
+                        className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-white/10 bg-white/[0.05] px-2.5 py-1.5 text-[11px] font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:bg-white/10 hover:text-amber-200"
+                      >
+                        {pathCopied ? (
+                          <>
+                            <Check className="h-3 w-3 text-emerald-400" />
+                            <span>已复制</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="h-3 w-3" />
+                            <span>复制路径</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                    <div className="rounded-xl border border-white/8 bg-white/[0.02] px-3.5 py-2.5">
+                      <span className="block text-[11px] text-zinc-500">容器格式</span>
+                      <span className="mt-0.5 block font-mono text-xs font-semibold text-zinc-100">
+                        {(activeSource.Container || '-').toUpperCase()}
+                      </span>
+                    </div>
+                    <div className="rounded-xl border border-white/8 bg-white/[0.02] px-3.5 py-2.5">
+                      <span className="block text-[11px] text-zinc-500">文件大小</span>
+                      <span className="mt-0.5 block font-mono text-xs font-semibold text-zinc-100">
+                        {activeSource.Size ? formatBytes(activeSource.Size) : '-'}
+                      </span>
+                    </div>
+                    <div className="rounded-xl border border-white/8 bg-white/[0.02] px-3.5 py-2.5">
+                      <span className="block text-[11px] text-zinc-500">总码率</span>
+                      <span className="mt-0.5 block font-mono text-xs font-semibold text-zinc-100">
+                        {formatBitrate(activeSource.Bitrate)}
+                      </span>
+                    </div>
+                    <div className="rounded-xl border border-white/8 bg-white/[0.02] px-3.5 py-2.5">
+                      <span className="block text-[11px] text-zinc-500">时长</span>
+                      <span className="mt-0.5 block font-mono text-xs font-semibold text-zinc-100">
+                        {activeSource.RunTimeTicks || item.RunTimeTicks
+                          ? formatTicks(activeSource.RunTimeTicks || item.RunTimeTicks)
+                          : '-'}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 视频 / 音频 / 字幕流列表 */}
+                {streams.length > 0 && (
+                  <div className="overflow-x-auto rounded-xl border border-white/8">
+                    <table className="w-full text-left text-xs">
+                      <thead className="border-b border-white/8 bg-white/[0.02] text-[11px] text-zinc-500">
+                        <tr>
+                          <th className="px-3.5 py-2.5">轨道类型</th>
+                          <th className="px-3.5 py-2.5">编码</th>
+                          <th className="px-3.5 py-2.5">规格 / 语言</th>
+                          <th className="px-3.5 py-2.5">码率</th>
+                          <th className="px-3.5 py-2.5">标记</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-white/5 text-zinc-200">
+                        {streams.map((s) => {
+                          const typeLabel =
+                            s.Type === 'Video'
+                              ? '视频'
+                              : s.Type === 'Audio'
+                                ? '音频'
+                                : s.Type === 'Subtitle'
+                                  ? '字幕'
+                                  : s.Type
+                          const specParts: string[] = []
+                          if (s.Type === 'Video') {
+                            if (s.Width && s.Height) specParts.push(`${s.Width}×${s.Height}`)
+                            if (s.VideoRange) specParts.push(s.VideoRange)
+                          } else if (s.Type === 'Audio') {
+                            if (s.Channels) specParts.push(`${s.Channels}ch`)
+                            if (s.DisplayLanguage || s.Language) {
+                              specParts.push(s.DisplayLanguage || s.Language || '')
+                            }
+                            if (s.Title) specParts.push(s.Title)
+                          } else if (s.Type === 'Subtitle') {
+                            if (s.DisplayTitle || s.Title) {
+                              specParts.push(s.DisplayTitle || s.Title || '')
+                            }
+                            if (s.DisplayLanguage || s.Language) {
+                              specParts.push(s.DisplayLanguage || s.Language || '')
+                            }
+                          }
+                          return (
+                            <tr key={`${s.Type}-${s.Index}`} className="hover:bg-white/[0.02]">
+                              <td className="whitespace-nowrap px-3.5 py-2.5 font-medium text-zinc-300">
+                                {typeLabel} #{s.Index}
+                              </td>
+                              <td className="whitespace-nowrap px-3.5 py-2.5 font-mono text-zinc-100">
+                                {(s.Codec || '-').toUpperCase()}
+                              </td>
+                              <td className="px-3.5 py-2.5 text-zinc-300">
+                                {specParts.filter(Boolean).join(' · ') || '-'}
+                              </td>
+                              <td className="whitespace-nowrap px-3.5 py-2.5 font-mono text-zinc-400">
+                                {formatBitrate(s.BitRate)}
+                              </td>
+                              <td className="px-3.5 py-2.5">
+                                <div className="flex flex-wrap items-center gap-1">
+                                  {s.IsDefault && (
+                                    <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300">
+                                      默认
+                                    </span>
+                                  )}
+                                  {s.IsForced && (
+                                    <span className="rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-medium text-sky-300">
+                                      强制
+                                    </span>
+                                  )}
+                                  {s.IsExternal && (
+                                    <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300">
+                                      外挂
+                                    </span>
+                                  )}
+                                  {s.Type === 'Subtitle' && !s.IsExternal && (
+                                    <span className="rounded bg-white/8 px-1.5 py-0.5 text-[10px] text-zinc-400">
+                                      内封
+                                    </span>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+
       {/* 相似推荐横向书架 */}
       {similarItems.length > 0 && (
         <section className="mx-auto max-w-7xl space-y-4 px-4 pt-10 lg:px-8">
@@ -1640,6 +1952,159 @@ export function ItemDetailPage() {
               <Plus className="h-3.5 w-3.5" />
               <span>新建并加入</span>
             </button>
+          </form>
+        </div>
+      </AdminModal>
+
+      {/* 外挂字幕管理弹窗（查看 / 删除外挂 / 上传新字幕） */}
+      <AdminModal
+        open={subModalOpen}
+        title="管理字幕"
+        subtitle={`管理「${item.Name}」的内封与外挂字幕轨道`}
+        maxWidthClass="max-w-lg"
+        onClose={() => setSubModalOpen(false)}
+      >
+        <div className="space-y-5">
+          {subError && (
+            <FeedbackBanner message={subError} type="error" onClose={() => setSubError(null)} />
+          )}
+
+          {/* 当前字幕轨道列表 */}
+          <div className="space-y-2">
+            <h3 className="text-xs font-semibold text-zinc-300">
+              当前字幕轨道 ({subtitleStreams.length})
+            </h3>
+            {subtitleStreams.length === 0 ? (
+              <p className="rounded-xl border border-dashed border-white/10 py-5 text-center text-xs text-zinc-500">
+                暂无字幕轨道，可在下方上传外挂字幕
+              </p>
+            ) : (
+              <div className="max-h-56 space-y-1.5 overflow-y-auto">
+                {subtitleStreams.map((s) => {
+                  const meta = getSubtitleMeta(s)
+                  return (
+                    <div
+                      key={s.Index}
+                      className="flex items-center justify-between gap-3 rounded-xl border border-white/8 bg-white/[0.03] px-3 py-2.5 text-xs"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="truncate font-medium text-zinc-100">
+                            {meta.displayLabel}
+                          </span>
+                          <span
+                            className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                              s.IsExternal
+                                ? 'bg-emerald-500/15 text-emerald-300'
+                                : 'bg-white/10 text-zinc-400'
+                            }`}
+                          >
+                            {s.IsExternal ? '外挂' : '内封'}
+                          </span>
+                          {s.IsForced && (
+                            <span className="shrink-0 rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-medium text-sky-300">
+                              强制
+                            </span>
+                          )}
+                        </div>
+                        <p className="mt-0.5 truncate text-[11px] text-zinc-500">
+                          轨道 #{s.Index} · {(s.Codec || '-').toUpperCase()}
+                          {s.Language ? ` · ${s.Language}` : ''}
+                        </p>
+                      </div>
+                      {s.IsExternal && (
+                        <button
+                          type="button"
+                          disabled={deleteSubtitleMutation.isPending}
+                          onClick={() => deleteSubtitleMutation.mutate(s.Index)}
+                          className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-red-500/30 bg-red-500/10 px-2.5 py-1 text-[11px] font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
+                        >
+                          <Trash2 className="h-3 w-3" />
+                          <span>删除</span>
+                        </button>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* 上传外挂字幕 */}
+          <form
+            onSubmit={(e) => {
+              e.preventDefault()
+              uploadSubtitleMutation.mutate()
+            }}
+            className="space-y-3 border-t border-white/10 pt-4"
+          >
+            <h3 className="text-xs font-semibold text-zinc-300">上传外挂字幕</h3>
+
+            <label className="block space-y-1.5">
+              <span className="block text-[11px] text-zinc-400">
+                选择字幕文件 (.srt, .ass, .ssa, .vtt, .sub)
+              </span>
+              <input
+                type="file"
+                accept=".srt,.ass,.ssa,.vtt,.sub"
+                aria-label="选择字幕文件"
+                onChange={(e) => {
+                  setSubFile(e.target.files?.[0] || null)
+                  setSubError(null)
+                }}
+                className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-200 file:mr-3 file:rounded-lg file:border-0 file:bg-amber-500/20 file:px-2.5 file:py-1 file:text-xs file:font-medium file:text-amber-300 hover:file:bg-amber-500/30"
+              />
+            </label>
+
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <label className="block space-y-1.5">
+                <span className="block text-[11px] text-zinc-400">字幕语言</span>
+                <select
+                  aria-label="字幕语言"
+                  value={subLang}
+                  onChange={(e) => setSubLang(e.target.value)}
+                  className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
+                >
+                  <option value="chi">中文 (chi)</option>
+                  <option value="chs">简体中文 (chs)</option>
+                  <option value="cht">繁體中文 (cht)</option>
+                  <option value="eng">English (eng)</option>
+                  <option value="jpn">日本語 (jpn)</option>
+                </select>
+              </label>
+
+              <label className="flex items-center gap-2 self-end rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-zinc-200">
+                <input
+                  type="checkbox"
+                  checked={subForced}
+                  onChange={(e) => setSubForced(e.target.checked)}
+                  className="h-3.5 w-3.5 accent-amber-500"
+                />
+                <span>强制字幕 (Forced)</span>
+              </label>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setSubModalOpen(false)}
+                className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10"
+              >
+                关闭
+              </button>
+              <button
+                type="submit"
+                disabled={!subFile || uploadSubtitleMutation.isPending}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-50"
+              >
+                {uploadSubtitleMutation.isPending ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Upload className="h-3.5 w-3.5" />
+                )}
+                <span>上传字幕</span>
+              </button>
+            </div>
           </form>
         </div>
       </AdminModal>

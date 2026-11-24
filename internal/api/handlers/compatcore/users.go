@@ -248,18 +248,30 @@ func (h *Handler) queryUsers(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) getUserPrefixes(w http.ResponseWriter, r *http.Request) {
 	seen := map[string]bool{}
 	if h.userRepo != nil {
-		if list, err := h.userRepo.ListUsers(r.Context()); err == nil {
-			for _, u := range list {
-				runes := []rune(strings.TrimSpace(u.Name))
-				if len(runes) == 0 {
-					continue
-				}
-				ch := unicode.ToUpper(runes[0])
-				if unicode.IsLetter(ch) {
-					seen[string(ch)] = true
-				} else {
-					seen["#"] = true
-				}
+		var list []*sqlite.UserRecord
+		if h.isCallerAdmin(r) {
+			if all, err := h.userRepo.ListUsers(r.Context()); err == nil {
+				list = all
+			}
+		} else if callerID := h.resolveUserID(r, ""); callerID != "" {
+			if u, err := h.userRepo.GetUserByID(r.Context(), callerID); err == nil && u != nil {
+				list = []*sqlite.UserRecord{u}
+			}
+		} else {
+			if all, err := h.userRepo.ListUsers(r.Context()); err == nil {
+				list = all
+			}
+		}
+		for _, u := range list {
+			runes := []rune(strings.TrimSpace(u.Name))
+			if len(runes) == 0 {
+				continue
+			}
+			ch := unicode.ToUpper(runes[0])
+			if unicode.IsLetter(ch) {
+				seen[string(ch)] = true
+			} else {
+				seen["#"] = true
 			}
 		}
 	}

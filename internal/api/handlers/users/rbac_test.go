@@ -107,7 +107,20 @@ func TestSessionsDevicesAndDisplayPreferencesRBAC(t *testing.T) {
 		t.Fatalf("admin should see all devices, got %d", adminDevices.TotalRecordCount)
 	}
 
-	// 3. POST /DisplayPreferences/{Id}: non-admin cannot overwrite another user's prefs -> 403
+	// 3. GET /DisplayPreferences/{Id}: non-admin cannot read another user's prefs -> 403
+	if rec := doReq(guestAuth.AccessToken, http.MethodGet, "/DisplayPreferences/usersettings?userId="+admin.ID, ""); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-admin reading admin DisplayPreferences, got %d", rec.Code)
+	}
+	// Self read -> 200
+	if rec := doReq(guestAuth.AccessToken, http.MethodGet, "/DisplayPreferences/usersettings?userId="+guest.ID, ""); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for self DisplayPreferences read, got %d", rec.Code)
+	}
+	// Admin reading guest -> 200
+	if rec := doReq(adminAuth.AccessToken, http.MethodGet, "/DisplayPreferences/usersettings?userId="+guest.ID, ""); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for admin DisplayPreferences read, got %d", rec.Code)
+	}
+
+	// 4. POST /DisplayPreferences/{Id}: non-admin cannot overwrite another user's prefs -> 403
 	if rec := doReq(guestAuth.AccessToken, http.MethodPost, "/DisplayPreferences/usersettings?userId="+admin.ID, `{"SortBy":"DateCreated"}`); rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for non-admin overwriting admin DisplayPreferences, got %d", rec.Code)
 	}

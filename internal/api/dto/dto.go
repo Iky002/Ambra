@@ -206,6 +206,12 @@ type NameIdPair struct {
 	Id   string `json:"Id"`
 }
 
+type ChapterInfo struct {
+	StartPositionTicks int64  `json:"StartPositionTicks"`
+	Name               string `json:"Name,omitempty"`
+	ImageTag           string `json:"ImageTag,omitempty"`
+}
+
 // BaseItemDto is the central Emby media representation.
 type BaseItemDto struct {
 	Name                    string            `json:"Name"`
@@ -221,6 +227,7 @@ type BaseItemDto struct {
 	OfficialRating          string            `json:"OfficialRating,omitempty"`
 	Overview                string            `json:"Overview,omitempty"`
 	Taglines                []string          `json:"Taglines,omitempty"`
+	Tags                    []string          `json:"Tags,omitempty"`
 	Genres                  []string          `json:"Genres,omitempty"`
 	GenreItems              []NameIdPair      `json:"GenreItems,omitempty"`
 	CommunityRating         *float64          `json:"CommunityRating,omitempty"`
@@ -236,8 +243,11 @@ type BaseItemDto struct {
 	CollectionType          string            `json:"CollectionType,omitempty"`
 	SeriesName              string            `json:"SeriesName,omitempty"`
 	SeriesId                string            `json:"SeriesId,omitempty"`
+	SeriesPrimaryImageTag   string            `json:"SeriesPrimaryImageTag,omitempty"`
 	SeasonId                string            `json:"SeasonId,omitempty"`
 	SeasonName              string            `json:"SeasonName,omitempty"`
+	ParentBackdropItemId    string            `json:"ParentBackdropItemId,omitempty"`
+	ParentBackdropImageTags []string          `json:"ParentBackdropImageTags,omitempty"`
 	Album                   string            `json:"Album,omitempty"`
 	AlbumId                 string            `json:"AlbumId,omitempty"`
 	AlbumArtist             string            `json:"AlbumArtist,omitempty"`
@@ -247,7 +257,9 @@ type BaseItemDto struct {
 	UserData                *UserItemDataDto  `json:"UserData,omitempty"`
 	ChildCount              *int              `json:"ChildCount,omitempty"`
 	RecursiveItemCount      *int              `json:"RecursiveItemCount,omitempty"`
+	Chapters                []ChapterInfo     `json:"Chapters,omitempty"`
 	MediaSources            []MediaSourceInfo `json:"MediaSources,omitempty"`
+	MediaStreams            []MediaStream     `json:"MediaStreams,omitempty"`
 	ImageTags               map[string]string `json:"ImageTags"`
 	BackdropImageTags       []string          `json:"BackdropImageTags"`
 	PrimaryImageAspectRatio *float64          `json:"PrimaryImageAspectRatio,omitempty"`

@@ -2,17 +2,48 @@ import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   CalendarClock,
+  Clock,
   FileText,
   Loader2,
   Play,
+  Plus,
   RefreshCw,
+  Save,
   Search,
   Square,
   Terminal,
+  Trash2,
 } from 'lucide-react'
 import { api } from '../../api/client'
-import type { ScheduledTaskInfo, ServerLogFile } from '../../api/types'
-import { FeedbackBanner, formatBytes, formatDateTime } from './adminUtils'
+import type { ScheduledTaskInfo, ServerLogFile, TaskTriggerInfo } from '../../api/types'
+import { AdminModal, FeedbackBanner, formatBytes, formatDateTime } from './adminUtils'
+
+const TICKS_PER_MINUTE = 60 * 10_000_000
+const TICKS_PER_HOUR = 3600 * 10_000_000
+
+function formatTriggerLabel(trigger: TaskTriggerInfo): string {
+  if (trigger.Type === 'StartupTrigger') {
+    return '服务器启动时触发'
+  }
+  if (trigger.Type === 'DailyTrigger') {
+    const totalMins = Math.round((trigger.TimeOfDayTicks ?? 0) / TICKS_PER_MINUTE)
+    const hh = String(Math.floor(totalMins / 60) % 24).padStart(2, '0')
+    const mm = String(totalMins % 60).padStart(2, '0')
+    return `每日 ${hh}:${mm} 执行`
+  }
+  if (trigger.Type === 'IntervalTrigger') {
+    const hours = (trigger.IntervalTicks ?? 0) / TICKS_PER_HOUR
+    if (hours >= 1 && Number.isInteger(hours)) {
+      return `每隔 ${hours} 小时执行`
+    }
+    const mins = Math.max(1, Math.round((trigger.IntervalTicks ?? 0) / TICKS_PER_MINUTE))
+    return `每隔 ${mins} 分钟执行`
+  }
+  if (trigger.Type === 'WeeklyTrigger') {
+    return `每周 ${trigger.DayOfWeek || 'Sunday'} 执行`
+  }
+  return trigger.Type
+}
 
 export function TasksLogsTab() {
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
@@ -23,6 +54,16 @@ export function TasksLogsTab() {
   const [selectedLog, setSelectedLog] = useState<string | null>(null)
   const [logFilter, setLogFilter] = useState('')
 
+  // 触发规则弹窗状态
+  const [editingTriggersTask, setEditingTriggersTask] = useState<ScheduledTaskInfo | null>(null)
+  const [draftTriggers, setDraftTriggers] = useState<TaskTriggerInfo[]>([])
+  const [newTriggerType, setNewTriggerType] = useState<
+    'DailyTrigger' | 'IntervalTrigger' | 'StartupTrigger'
+  >('DailyTrigger')
+  const [newDailyTime, setNewDailyTime] = useState('03:00')
+  const [newIntervalHours, setNewIntervalHours] = useState(6)
+  const [savingTriggers, setSavingTriggers] = useState(false)
+
   const {
     data: rawTasks,
     isLoading: tasksLoading,
@@ -31,6 +72,11 @@ export function TasksLogsTab() {
   } = useQuery({
     queryKey: ['admin', 'scheduledTasks'],
     queryFn: () => api.getScheduledTasks(),
+    refetchInterval: (query) =>
+      Array.isArray(query.state.data) &&
+      query.state.data.some((t) => t.State?.toLowerCase() === 'running')
+        ? 2000
+        : false,
   })
 
   const tasks: ScheduledTaskInfo[] = Array.isArray(rawTasks) ? rawTasks : []
@@ -98,6 +144,58 @@ export function TasksLogsTab() {
       })
     } finally {
       setStoppingTaskId(null)
+    }
+  }
+
+  const handleOpenTriggers = (task: ScheduledTaskInfo) => {
+    setEditingTriggersTask(task)
+    setDraftTriggers(Array.isArray(task.Triggers) ? task.Triggers.map((t) => ({ ...t })) : [])
+    setNewTriggerType('DailyTrigger')
+    setNewDailyTime('03:00')
+    setNewIntervalHours(6)
+  }
+
+  const handleAddTrigger = () => {
+    let next: TaskTriggerInfo
+    if (newTriggerType === 'DailyTrigger') {
+      const [hhRaw, mmRaw] = newDailyTime.split(':')
+      const hh = Math.min(23, Math.max(0, Number(hhRaw) || 0))
+      const mm = Math.min(59, Math.max(0, Number(mmRaw) || 0))
+      next = {
+        Type: 'DailyTrigger',
+        TimeOfDayTicks: (hh * 60 + mm) * TICKS_PER_MINUTE,
+      }
+    } else if (newTriggerType === 'IntervalTrigger') {
+      const hours = Math.max(1, Number(newIntervalHours) || 1)
+      next = {
+        Type: 'IntervalTrigger',
+        IntervalTicks: hours * TICKS_PER_HOUR,
+      }
+    } else {
+      next = { Type: 'StartupTrigger' }
+    }
+    setDraftTriggers((prev) => [...prev, next])
+  }
+
+  const handleSaveTriggers = async () => {
+    if (!editingTriggersTask) return
+    setSavingTriggers(true)
+    setFeedback(null)
+    try {
+      await api.updateTaskTriggers(editingTriggersTask.Id, draftTriggers)
+      setFeedback({
+        type: 'success',
+        message: `已更新计划任务「${editingTriggersTask.Name}」的触发规则`,
+      })
+      setEditingTriggersTask(null)
+      void refetchTasks()
+    } catch (err) {
+      setFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : '保存触发规则失败',
+      })
+    } finally {
+      setSavingTriggers(false)
     }
   }
 
@@ -215,6 +313,14 @@ export function TasksLogsTab() {
                     </span>
 
                     <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => handleOpenTriggers(task)}
+                        className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-amber-400/40 hover:text-amber-300"
+                      >
+                        <Clock className="h-3.5 w-3.5" />
+                        <span>触发规则</span>
+                      </button>
                       {isRunning && (
                         <button
                           type="button"
@@ -375,6 +481,140 @@ export function TasksLogsTab() {
           </div>
         </div>
       </section>
+
+      {/* 触发规则管理弹窗 */}
+      <AdminModal
+        open={Boolean(editingTriggersTask)}
+        title={`触发规则 · ${editingTriggersTask?.Name || ''}`}
+        subtitle="配置计划任务的定时、间隔或启动触发规则"
+        maxWidthClass="max-w-lg"
+        onClose={() => setEditingTriggersTask(null)}
+      >
+        <div className="space-y-5">
+          {/* 已有触发规则列表 */}
+          <div className="space-y-2">
+            <p className="text-xs font-medium text-zinc-400">
+              当前规则 ({draftTriggers.length})
+            </p>
+            {draftTriggers.length === 0 ? (
+              <div className="rounded-xl border border-white/8 bg-white/[0.02] py-5 text-center text-xs text-zinc-500">
+                暂无自动触发规则（仅手动运行）
+              </div>
+            ) : (
+              <div className="divide-y divide-white/6 overflow-hidden rounded-xl border border-white/8 bg-white/[0.02]">
+                {draftTriggers.map((trigger, idx) => (
+                  <div
+                    key={`${trigger.Type}-${idx}`}
+                    className="flex items-center justify-between gap-3 px-3.5 py-2.5 text-xs"
+                  >
+                    <div className="flex items-center gap-2 text-zinc-200">
+                      <Clock className="h-3.5 w-3.5 text-amber-400" />
+                      <span>{formatTriggerLabel(trigger)}</span>
+                    </div>
+                    <button
+                      type="button"
+                      aria-label={`删除规则 ${idx + 1}`}
+                      onClick={() =>
+                        setDraftTriggers((prev) => prev.filter((_, i) => i !== idx))
+                      }
+                      className="rounded-lg p-1 text-zinc-400 transition-colors hover:bg-red-500/15 hover:text-red-300"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* 新增触发规则 */}
+          <div className="space-y-3 rounded-xl border border-white/8 bg-white/[0.02] p-3.5">
+            <p className="text-xs font-medium text-zinc-300">添加触发规则</p>
+            <div className="grid gap-3 sm:grid-cols-12">
+              <div className="sm:col-span-5">
+                <select
+                  aria-label="触发类型"
+                  value={newTriggerType}
+                  onChange={(e) =>
+                    setNewTriggerType(
+                      e.target.value as 'DailyTrigger' | 'IntervalTrigger' | 'StartupTrigger',
+                    )
+                  }
+                  className="w-full rounded-lg border border-white/10 bg-[#181822] px-2.5 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/60"
+                >
+                  <option value="DailyTrigger">每日定时 (Daily)</option>
+                  <option value="IntervalTrigger">固定间隔 (Interval)</option>
+                  <option value="StartupTrigger">启动时触发 (Startup)</option>
+                </select>
+              </div>
+
+              <div className="sm:col-span-4">
+                {newTriggerType === 'DailyTrigger' ? (
+                  <input
+                    aria-label="每日执行时间"
+                    type="time"
+                    value={newDailyTime}
+                    onChange={(e) => setNewDailyTime(e.target.value)}
+                    className="w-full rounded-lg border border-white/10 bg-zinc-900/90 px-2.5 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/60"
+                  />
+                ) : newTriggerType === 'IntervalTrigger' ? (
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      aria-label="间隔小时数"
+                      type="number"
+                      min={1}
+                      max={168}
+                      value={newIntervalHours}
+                      onChange={(e) => setNewIntervalHours(Number(e.target.value))}
+                      className="w-full rounded-lg border border-white/10 bg-zinc-900/90 px-2.5 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/60"
+                    />
+                    <span className="shrink-0 text-xs text-zinc-400">小时</span>
+                  </div>
+                ) : (
+                  <div className="flex h-full items-center text-xs text-zinc-500">
+                    服务启动自动运行
+                  </div>
+                )}
+              </div>
+
+              <div className="sm:col-span-3">
+                <button
+                  type="button"
+                  onClick={handleAddTrigger}
+                  className="inline-flex w-full items-center justify-center gap-1 rounded-lg border border-amber-500/35 bg-amber-500/15 px-3 py-2 text-xs font-semibold text-amber-300 transition-colors hover:bg-amber-500/25"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  <span>添加</span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* 底部保存/取消 */}
+          <div className="flex justify-end gap-2 pt-2">
+            <button
+              type="button"
+              onClick={() => setEditingTriggersTask(null)}
+              className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              disabled={savingTriggers}
+              onClick={handleSaveTriggers}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-60"
+            >
+              {savingTriggers ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Save className="h-3.5 w-3.5" />
+              )}
+              <span>保存规则</span>
+            </button>
+          </div>
+        </div>
+      </AdminModal>
     </div>
   )
 }

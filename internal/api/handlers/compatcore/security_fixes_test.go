@@ -145,6 +145,27 @@ func TestUserPrivilegeEscalationAndIDORBlocked(t *testing.T) {
 		t.Fatalf("expected admin /Users/Query to return all users, got %d", adminUsers.TotalRecordCount)
 	}
 
+	// 5b. GET /Users/Prefix returns only caller's own username prefix for non-admin, all prefixes for admin
+	pGuest := doAuthReq(guestAuth.AccessToken, http.MethodGet, "/Users/Prefix", "")
+	if pGuest.Code != http.StatusOK {
+		t.Fatalf("guest GET /Users/Prefix status=%d", pGuest.Code)
+	}
+	var guestPrefixes []map[string]string
+	_ = json.Unmarshal(pGuest.Body.Bytes(), &guestPrefixes)
+	if len(guestPrefixes) != 1 || guestPrefixes[0]["Name"] != "#" {
+		t.Fatalf("expected non-admin /Users/Prefix to return only own prefix '#', got %+v", guestPrefixes)
+	}
+
+	pAdmin := doAuthReq(adminAuth.AccessToken, http.MethodGet, "/Users/Prefix", "")
+	if pAdmin.Code != http.StatusOK {
+		t.Fatalf("admin GET /Users/Prefix status=%d", pAdmin.Code)
+	}
+	var adminPrefixes []map[string]string
+	_ = json.Unmarshal(pAdmin.Body.Bytes(), &adminPrefixes)
+	if len(adminPrefixes) < 2 {
+		t.Fatalf("expected admin /Users/Prefix to return all prefixes, got %+v", adminPrefixes)
+	}
+
 	// 6. Admin updating another user's Policy -> 204
 	rec = doAuthReq(adminAuth.AccessToken, http.MethodPost, "/Users/"+env.user2.ID,
 		`{"Policy":{"IsAdministrator":false,"EnableAllFolders":true}}`)

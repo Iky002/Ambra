@@ -182,8 +182,45 @@ func TestBuildSessionParamsSubtitleBurnIn(t *testing.T) {
 
 	r2 := httptest.NewRequest(http.MethodGet, "/Videos/item1/master.m3u8?SubtitleStreamIndex=4&SubtitleMethod=Encode", nil)
 	p2 := h.buildSessionParams(r2, item, src, httpx.ParseQuery(r2))
-	if p2.SubtitleCodec != "pgssub" || p2.SubtitlePath != "" {
+	if p2.SubtitleCodec != "pgssub" || p2.SubtitlePath != "" || p2.SubtitleRelativeIndex != 0 {
 		t.Fatalf("unexpected embedded subtitle params: %+v", p2)
+	}
+}
+
+func TestBuildSessionParamsSubtitleRelativeIndexAndBitrate(t *testing.T) {
+	h := New(nil, nil, nil)
+	item := &sqlite.ItemRecord{ID: "item1", Path: "/media/movie.mkv"}
+	src := &sqlite.MediaSourceRecord{
+		ID:   "ms1",
+		Path: "/media/movie.mkv",
+		Streams: []sqlite.MediaStreamRecord{
+			{StreamIndex: 0, StreamType: "Video", Codec: "h264"},
+			{StreamIndex: 1, StreamType: "Audio", Codec: "aac"},
+			{StreamIndex: 2, StreamType: "Audio", Codec: "ac3"},
+			{StreamIndex: 3, StreamType: "Subtitle", Codec: "srt", IsExternal: true, Path: "/media/movie.en.srt"},
+			{StreamIndex: 4, StreamType: "Subtitle", Codec: "srt", IsExternal: false},
+			{StreamIndex: 5, StreamType: "Subtitle", Codec: "ass", IsExternal: false},
+		},
+	}
+
+	// Embedded subtitle at global index 4 is 0-th embedded subtitle (external index 3 is skipped).
+	r0 := httptest.NewRequest(http.MethodGet, "/Videos/item1/master.m3u8?SubtitleStreamIndex=4&SubtitleMethod=Encode&MaxStreamingBitrate=2000000", nil)
+	p0 := h.buildSessionParams(r0, item, src, httpx.ParseQuery(r0))
+	if p0.SubtitleRelativeIndex != 0 {
+		t.Fatalf("SubtitleRelativeIndex for stream 4 = %d, want 0", p0.SubtitleRelativeIndex)
+	}
+	if p0.VideoBitrate != 2_000_000-192_000 {
+		t.Fatalf("VideoBitrate = %d, want %d", p0.VideoBitrate, 2_000_000-192_000)
+	}
+
+	// Embedded subtitle at global index 5 is 1-st embedded subtitle.
+	r1 := httptest.NewRequest(http.MethodGet, "/Videos/item1/master.m3u8?SubtitleStreamIndex=5&SubtitleMethod=Encode&MaxStreamingBitrate=300000", nil)
+	p1 := h.buildSessionParams(r1, item, src, httpx.ParseQuery(r1))
+	if p1.SubtitleRelativeIndex != 1 {
+		t.Fatalf("SubtitleRelativeIndex for stream 5 = %d, want 1", p1.SubtitleRelativeIndex)
+	}
+	if p1.VideoBitrate != 256_000 {
+		t.Fatalf("VideoBitrate floor = %d, want 256000", p1.VideoBitrate)
 	}
 }
 

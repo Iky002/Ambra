@@ -8,6 +8,7 @@ import {
   HeartPulse,
   Key,
   Puzzle,
+  Radio,
   RefreshCw,
   SlidersHorizontal,
   Sparkles,
@@ -20,6 +21,7 @@ import { DashboardTab } from './admin/DashboardTab'
 import { DevicesKeysTab } from './admin/DevicesKeysTab'
 import { HealthAndAuditTab } from './admin/HealthAndAuditTab'
 import { LibrariesTab } from './admin/LibrariesTab'
+import { LiveTvTab } from './admin/LiveTvTab'
 import { MetadataTab } from './admin/MetadataTab'
 import { MigrationTab } from './admin/MigrationTab'
 import { PluginsTab } from './admin/PluginsTab'
@@ -76,6 +78,12 @@ const ADMIN_TABS = [
     label: '任务与日志',
     desc: '计划任务 · 服务器日志',
     icon: CalendarClock,
+  },
+  {
+    path: 'livetv',
+    label: '电视直播',
+    desc: 'M3U 源 · XMLTV · 频道',
+    icon: Radio,
   },
   {
     path: 'health',
@@ -266,6 +274,7 @@ export function AdminPage() {
               <Route path="devices" element={<DevicesKeysTab />} />
               <Route path="plugins" element={<PluginsTab />} />
               <Route path="tasks" element={<TasksLogsTab />} />
+              <Route path="livetv" element={<LiveTvTab />} />
               <Route path="health" element={<HealthAndAuditTab />} />
               <Route path="migration" element={<MigrationTab />} />
               <Route path="*" element={<Navigate to="dashboard" replace />} />
