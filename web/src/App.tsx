@@ -3,6 +3,7 @@ import { ShieldAlert } from 'lucide-react'
 import { HashRouter, Link, Navigate, Route, Routes } from 'react-router-dom'
 import { api } from './api/client'
 import { Layout } from './components/Layout'
+import { ScrollToTop } from './components/ScrollToTop'
 import { AudioPlayerProvider } from './context/AudioPlayerContext'
 import { AuthProvider, useAuth } from './context/AuthContext'
 import { isDemoMode } from './demo/demoMode'
@@ -151,6 +152,7 @@ export default function App() {
       <AuthProvider>
         <AudioPlayerProvider>
           <HashRouter>
+            <ScrollToTop />
             <AppRoutes />
           </HashRouter>
         </AudioPlayerProvider>
