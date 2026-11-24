@@ -35,15 +35,20 @@ var (
 	reIMDbID        = regexp.MustCompile(`(?i)\b(tt\d{5,10})\b`)
 )
 
-// Fetcher downloads and parses Douban Top 250, IMDb Top 250, and TMDB Trending charts.
+// Fetcher downloads and parses Douban Top 250, IMDb Top 250, TMDB Trending,
+// and Douban Trending Movie/TV charts.
 type Fetcher struct {
-	httpClient          *http.Client
-	doubanURL           string
-	imdbURL             string
-	tmdbAPIKey          string
-	tmdbBaseURL         string
-	tmdbTrendingFetcher func(ctx context.Context) ([]ChartEntry, string, error)
-	userAgent           string
+	httpClient                 *http.Client
+	doubanURL                  string
+	imdbURL                    string
+	tmdbAPIKey                 string
+	tmdbBaseURL                string
+	tmdbTrendingFetcher        func(ctx context.Context) ([]ChartEntry, string, error)
+	doubanTrendingMovieURL     string
+	doubanTrendingTVURL        string
+	doubanTrendingMovieFetcher func(ctx context.Context) ([]ChartEntry, string, error)
+	doubanTrendingTVFetcher    func(ctx context.Context) ([]ChartEntry, string, error)
+	userAgent                  string
 }
 
 // NewFetcher creates a Fetcher with sensible defaults.
@@ -57,13 +62,17 @@ func NewFetcher(opts Options) *Fetcher {
 		ua = defaultUserAgent
 	}
 	return &Fetcher{
-		httpClient:          client,
-		doubanURL:           strings.TrimSpace(opts.DoubanURL),
-		imdbURL:             strings.TrimSpace(opts.IMDbURL),
-		tmdbAPIKey:          strings.TrimSpace(opts.TMDBAPIKey),
-		tmdbBaseURL:         strings.TrimRight(strings.TrimSpace(opts.TMDBTrendingBaseURL), "/"),
-		tmdbTrendingFetcher: opts.TMDBTrendingFetcher,
-		userAgent:           ua,
+		httpClient:                 client,
+		doubanURL:                  strings.TrimSpace(opts.DoubanURL),
+		imdbURL:                    strings.TrimSpace(opts.IMDbURL),
+		tmdbAPIKey:                 strings.TrimSpace(opts.TMDBAPIKey),
+		tmdbBaseURL:                strings.TrimRight(strings.TrimSpace(opts.TMDBTrendingBaseURL), "/"),
+		tmdbTrendingFetcher:        opts.TMDBTrendingFetcher,
+		doubanTrendingMovieURL:     strings.TrimSpace(opts.DoubanTrendingMovieURL),
+		doubanTrendingTVURL:        strings.TrimSpace(opts.DoubanTrendingTVURL),
+		doubanTrendingMovieFetcher: opts.DoubanTrendingMovieFetcher,
+		doubanTrendingTVFetcher:    opts.DoubanTrendingTVFetcher,
+		userAgent:                  ua,
 	}
 }
 
@@ -105,6 +114,26 @@ func (f *Fetcher) resolveTMDBBaseURL() string {
 		return v
 	}
 	return DefaultTMDBBaseURL
+}
+
+func (f *Fetcher) resolveDoubanTrendingMovieURL() string {
+	if f.doubanTrendingMovieURL != "" {
+		return f.doubanTrendingMovieURL
+	}
+	if v := strings.TrimSpace(os.Getenv(EnvDoubanTrendingMovieURL)); v != "" {
+		return v
+	}
+	return DefaultDoubanTrendingMovieURL
+}
+
+func (f *Fetcher) resolveDoubanTrendingTVURL() string {
+	if f.doubanTrendingTVURL != "" {
+		return f.doubanTrendingTVURL
+	}
+	if v := strings.TrimSpace(os.Getenv(EnvDoubanTrendingTVURL)); v != "" {
+		return v
+	}
+	return DefaultDoubanTrendingTVURL
 }
 
 // FetchDoubanTop250 fetches the Douban Top 250 chart from a custom JSON feed
@@ -446,6 +475,223 @@ func builtinTMDBTrendingEntries() []ChartEntry {
 		{Rank: 24, Title: "绝命毒师", OriginalTitle: "Breaking Bad", Year: 2008, Rating: 8.9, MediaType: "tv", TMDBID: "1396"},
 		{Rank: 25, Title: "权力的游戏", OriginalTitle: "Game of Thrones", Year: 2011, Rating: 8.4, MediaType: "tv", TMDBID: "1399"},
 		{Rank: 26, Title: "进击的巨人", OriginalTitle: "Attack on Titan", Year: 2013, Rating: 8.7, MediaType: "tv", TMDBID: "1429"},
+	}
+}
+
+type doubanTrendingPayload struct {
+	Subjects []struct {
+		ID    string `json:"id"`
+		Title string `json:"title"`
+		Rate  string `json:"rate"`
+		URL   string `json:"url"`
+	} `json:"subjects"`
+}
+
+// FetchDoubanTrendingMovie fetches Douban's trending movies chart from search_subjects JSON.
+// On network failure, anti-bot blocking, or empty results, it falls back to a curated built-in snapshot.
+func (f *Fetcher) FetchDoubanTrendingMovie(ctx context.Context) (*ChartSnapshot, error) {
+	if f.doubanTrendingMovieFetcher != nil {
+		entries, source, err := f.doubanTrendingMovieFetcher(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("fetch douban trending movie: %w", err)
+		}
+		if strings.TrimSpace(source) == "" {
+			source = SourceDoubanTrendingMovieAPI
+		}
+		return &ChartSnapshot{
+			Chart:     ChartDoubanTrendingMovie,
+			Source:    source,
+			UpdatedAt: time.Now().UTC(),
+			Count:     len(entries),
+			Entries:   entries,
+		}, nil
+	}
+	return f.fetchDoubanTrending(
+		ctx,
+		f.resolveDoubanTrendingMovieURL(),
+		ChartDoubanTrendingMovie,
+		"movie",
+		SourceDoubanTrendingMovieAPI,
+		builtinDoubanTrendingMovieSnapshot,
+	), nil
+}
+
+// FetchDoubanTrendingTV fetches Douban's trending TV series chart from search_subjects JSON.
+// On network failure, anti-bot blocking, or empty results, it falls back to a curated built-in snapshot.
+func (f *Fetcher) FetchDoubanTrendingTV(ctx context.Context) (*ChartSnapshot, error) {
+	if f.doubanTrendingTVFetcher != nil {
+		entries, source, err := f.doubanTrendingTVFetcher(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("fetch douban trending tv: %w", err)
+		}
+		if strings.TrimSpace(source) == "" {
+			source = SourceDoubanTrendingTVAPI
+		}
+		return &ChartSnapshot{
+			Chart:     ChartDoubanTrendingTV,
+			Source:    source,
+			UpdatedAt: time.Now().UTC(),
+			Count:     len(entries),
+			Entries:   entries,
+		}, nil
+	}
+	return f.fetchDoubanTrending(
+		ctx,
+		f.resolveDoubanTrendingTVURL(),
+		ChartDoubanTrendingTV,
+		"tv",
+		SourceDoubanTrendingTVAPI,
+		builtinDoubanTrendingTVSnapshot,
+	), nil
+}
+
+func (f *Fetcher) fetchDoubanTrending(
+	ctx context.Context,
+	targetURL string,
+	chart string,
+	mediaType string,
+	apiSource string,
+	fallback func() *ChartSnapshot,
+) *ChartSnapshot {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return fallback()
+	}
+	req.Header.Set("User-Agent", f.userAgent)
+	req.Header.Set("Referer", "https://movie.douban.com/")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+
+	resp, err := f.httpClient.Do(req)
+	if err != nil {
+		return fallback()
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fallback()
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if err != nil {
+		return fallback()
+	}
+
+	var payload doubanTrendingPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return fallback()
+	}
+
+	seen := make(map[string]struct{}, len(payload.Subjects))
+	entries := make([]ChartEntry, 0, len(payload.Subjects))
+	for _, subj := range payload.Subjects {
+		title := strings.TrimSpace(html.UnescapeString(subj.Title))
+		doubanID := strings.TrimSpace(subj.ID)
+		if doubanID == "" && subj.URL != "" {
+			if m := reDoubanSubject.FindStringSubmatch(subj.URL); len(m) > 1 {
+				doubanID = m[1]
+			}
+		}
+		if title == "" && doubanID == "" {
+			continue
+		}
+		rating, _ := strconv.ParseFloat(strings.TrimSpace(subj.Rate), 64)
+		entry := ChartEntry{
+			Title:     title,
+			Rating:    rating,
+			MediaType: mediaType,
+			DoubanID:  doubanID,
+		}
+		key := entryDedupKey(entry)
+		if key == "" {
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		entry.Rank = len(entries) + 1
+		entries = append(entries, entry)
+	}
+
+	if len(entries) == 0 {
+		return fallback()
+	}
+
+	return &ChartSnapshot{
+		Chart:     chart,
+		Source:    apiSource,
+		UpdatedAt: time.Now().UTC(),
+		Count:     len(entries),
+		Entries:   entries,
+	}
+}
+
+func builtinDoubanTrendingMovieSnapshot() *ChartSnapshot {
+	entries := builtinDoubanTrendingMovieEntries()
+	return &ChartSnapshot{
+		Chart:     ChartDoubanTrendingMovie,
+		Source:    SourceDoubanTrendingMovieBuiltin,
+		UpdatedAt: time.Now().UTC(),
+		Count:     len(entries),
+		Entries:   entries,
+	}
+}
+
+func builtinDoubanTrendingMovieEntries() []ChartEntry {
+	return []ChartEntry{
+		{Rank: 1, Title: "哪吒之魔童闹海", OriginalTitle: "Ne Zha 2", Year: 2025, Rating: 8.5, MediaType: "movie", DoubanID: "34780991", TMDBID: "980477"},
+		{Rank: 2, Title: "好东西", OriginalTitle: "Her Story", Year: 2024, Rating: 9.1, MediaType: "movie", DoubanID: "36779837", TMDBID: "1231574"},
+		{Rank: 3, Title: "破·地狱", OriginalTitle: "The Last Dance", Year: 2024, Rating: 8.4, MediaType: "movie", DoubanID: "36712987", TMDBID: "1247019"},
+		{Rank: 4, Title: "沙丘2", OriginalTitle: "Dune: Part Two", Year: 2024, Rating: 8.2, MediaType: "movie", DoubanID: "35651362", TMDBID: "693134"},
+		{Rank: 5, Title: "荒野机器人", OriginalTitle: "The Wild Robot", Year: 2024, Rating: 8.1, MediaType: "movie", DoubanID: "36580597", TMDBID: "1184918"},
+		{Rank: 6, Title: "出走的决心", OriginalTitle: "Like a Rolling Stone", Year: 2024, Rating: 8.8, MediaType: "movie", DoubanID: "36445098", TMDBID: "1312806"},
+		{Rank: 7, Title: "九龙城寨之围城", OriginalTitle: "Twilight of the Warriors: Walled In", Year: 2024, Rating: 7.3, MediaType: "movie", DoubanID: "35295960", TMDBID: "923667"},
+		{Rank: 8, Title: "周处除三害", OriginalTitle: "The Pig, the Snake and the Pigeon", Year: 2023, Rating: 8.1, MediaType: "movie", DoubanID: "36151692", TMDBID: "1046090"},
+		{Rank: 9, Title: "奥本海默", OriginalTitle: "Oppenheimer", Year: 2023, Rating: 8.8, MediaType: "movie", DoubanID: "35593344", TMDBID: "872585"},
+		{Rank: 10, Title: "抓娃娃", OriginalTitle: "Successor", Year: 2024, Rating: 7.3, MediaType: "movie", DoubanID: "36438475", TMDBID: "1255350"},
+		{Rank: 11, Title: "头脑特工队2", OriginalTitle: "Inside Out 2", Year: 2024, Rating: 8.4, MediaType: "movie", DoubanID: "36087474", TMDBID: "1022789"},
+		{Rank: 12, Title: "坠落的审判", OriginalTitle: "Anatomy of a Fall", Year: 2023, Rating: 8.7, MediaType: "movie", DoubanID: "35633650", TMDBID: "915935"},
+		{Rank: 13, Title: "流浪地球2", OriginalTitle: "The Wandering Earth II", Year: 2023, Rating: 8.3, MediaType: "movie", DoubanID: "35267208", TMDBID: "842675"},
+		{Rank: 14, Title: "长安三万里", OriginalTitle: "Chang An", Year: 2023, Rating: 8.3, MediaType: "movie", DoubanID: "36035676", TMDBID: "1108427"},
+		{Rank: 15, Title: "封神第一部：朝歌风云", OriginalTitle: "Creation of the Gods I: Kingdom of Storms", Year: 2023, Rating: 7.8, MediaType: "movie", DoubanID: "10604086", TMDBID: "856289"},
+		{Rank: 16, Title: "热辣滚烫", OriginalTitle: "YOLO", Year: 2024, Rating: 7.5, MediaType: "movie", DoubanID: "36081094", TMDBID: "1087388"},
+		{Rank: 17, Title: "飞驰人生2", OriginalTitle: "Pegasus 2", Year: 2024, Rating: 7.6, MediaType: "movie", DoubanID: "36369452", TMDBID: "1154864"},
+		{Rank: 18, Title: "第二十条", OriginalTitle: "Article 20", Year: 2024, Rating: 7.5, MediaType: "movie", DoubanID: "36208094", TMDBID: "1156483"},
+	}
+}
+
+func builtinDoubanTrendingTVSnapshot() *ChartSnapshot {
+	entries := builtinDoubanTrendingTVEntries()
+	return &ChartSnapshot{
+		Chart:     ChartDoubanTrendingTV,
+		Source:    SourceDoubanTrendingTVBuiltin,
+		UpdatedAt: time.Now().UTC(),
+		Count:     len(entries),
+		Entries:   entries,
+	}
+}
+
+func builtinDoubanTrendingTVEntries() []ChartEntry {
+	return []ChartEntry{
+		{Rank: 1, Title: "山花烂漫时", OriginalTitle: "She and Her Girls", Year: 2024, Rating: 9.6, MediaType: "tv", DoubanID: "35503073", TMDBID: "270778"},
+		{Rank: 2, Title: "我的阿勒泰", OriginalTitle: "To the Wonder", Year: 2024, Rating: 8.9, MediaType: "tv", DoubanID: "35490167", TMDBID: "253905"},
+		{Rank: 3, Title: "漫长的季节", OriginalTitle: "The Long Season", Year: 2023, Rating: 9.4, MediaType: "tv", DoubanID: "35426925", TMDBID: "225171"},
+		{Rank: 4, Title: "繁花", OriginalTitle: "Blossoms Shanghai", Year: 2023, Rating: 8.7, MediaType: "tv", DoubanID: "34874432", TMDBID: "114410"},
+		{Rank: 5, Title: "庆余年 第二季", OriginalTitle: "Joy of Life 2", Year: 2024, Rating: 7.3, MediaType: "tv", DoubanID: "34937650", TMDBID: "95922"},
+		{Rank: 6, Title: "唐朝诡事录之西行", OriginalTitle: "Strange Tales of Tang Dynasty II", Year: 2024, Rating: 8.6, MediaType: "tv", DoubanID: "36165752", TMDBID: "209551"},
+		{Rank: 7, Title: "三体", OriginalTitle: "Three-Body", Year: 2023, Rating: 8.7, MediaType: "tv", DoubanID: "26647087", TMDBID: "106449"},
+		{Rank: 8, Title: "狂飙", OriginalTitle: "The Knockout", Year: 2023, Rating: 8.5, MediaType: "tv", DoubanID: "35465232", TMDBID: "218145"},
+		{Rank: 9, Title: "边水往事", OriginalTitle: "Escape from the Trilateral Slopes", Year: 2024, Rating: 7.9, MediaType: "tv", DoubanID: "35743125", TMDBID: "261677"},
+		{Rank: 10, Title: "玫瑰的故事", OriginalTitle: "The Tale of Rose", Year: 2024, Rating: 7.4, MediaType: "tv", DoubanID: "36163414", TMDBID: "228095"},
+		{Rank: 11, Title: "永夜星河", OriginalTitle: "Love Game in Eastern Fantasy", Year: 2024, Rating: 7.5, MediaType: "tv", DoubanID: "35733555", TMDBID: "232098"},
+		{Rank: 12, Title: "九重紫", OriginalTitle: "Blossom", Year: 2024, Rating: 7.8, MediaType: "tv", DoubanID: "36283119", TMDBID: "248358"},
+		{Rank: 13, Title: "人生切割术", OriginalTitle: "Severance", Year: 2022, Rating: 9.1, MediaType: "tv", DoubanID: "34890502", TMDBID: "95396"},
+		{Rank: 14, Title: "幕府将军", OriginalTitle: "Shōgun", Year: 2024, Rating: 8.1, MediaType: "tv", DoubanID: "30290915", TMDBID: "126308"},
+		{Rank: 15, Title: "鱿鱼游戏", OriginalTitle: "Squid Game", Year: 2021, Rating: 7.7, MediaType: "tv", DoubanID: "34812928", TMDBID: "93405"},
+		{Rank: 16, Title: "双城之战", OriginalTitle: "Arcane", Year: 2021, Rating: 9.0, MediaType: "tv", DoubanID: "34867871", TMDBID: "94605"},
+		{Rank: 17, Title: "葬送的芙莉莲", OriginalTitle: "Frieren: Beyond Journey's End", Year: 2023, Rating: 9.5, MediaType: "tv", DoubanID: "36087424", TMDBID: "209867"},
+		{Rank: 18, Title: "小巷人家", OriginalTitle: "Romance in the Alley", Year: 2024, Rating: 8.3, MediaType: "tv", DoubanID: "36328496", TMDBID: "259373"},
 	}
 }
 

@@ -121,13 +121,17 @@ type Service struct {
 	fetcher *Fetcher
 	opts    Options
 
-	mu              sync.RWMutex
-	douban          *ChartSnapshot
-	doubanIdx       *chartIndex
-	imdb            *ChartSnapshot
-	imdbIdx         *chartIndex
-	tmdbTrending    *ChartSnapshot
-	tmdbTrendingIdx *chartIndex
+	mu                     sync.RWMutex
+	douban                 *ChartSnapshot
+	doubanIdx              *chartIndex
+	imdb                   *ChartSnapshot
+	imdbIdx                *chartIndex
+	tmdbTrending           *ChartSnapshot
+	tmdbTrendingIdx        *chartIndex
+	doubanTrendingMovie    *ChartSnapshot
+	doubanTrendingMovieIdx *chartIndex
+	doubanTrendingTV       *ChartSnapshot
+	doubanTrendingTVIdx    *chartIndex
 
 	syncMu  sync.Mutex
 	started atomic.Bool
@@ -166,6 +170,14 @@ func (s *Service) LoadCache(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	doubanMovieSnap, err := s.loadSnapshot(ctx, ConfigKeyDoubanTrendingMovie)
+	if err != nil {
+		return err
+	}
+	doubanTVSnap, err := s.loadSnapshot(ctx, ConfigKeyDoubanTrendingTV)
+	if err != nil {
+		return err
+	}
 
 	s.mu.Lock()
 	if doubanSnap != nil {
@@ -179,6 +191,14 @@ func (s *Service) LoadCache(ctx context.Context) error {
 	if tmdbSnap != nil {
 		s.tmdbTrending = tmdbSnap
 		s.tmdbTrendingIdx = buildChartIndex(tmdbSnap.Entries)
+	}
+	if doubanMovieSnap != nil {
+		s.doubanTrendingMovie = doubanMovieSnap
+		s.doubanTrendingMovieIdx = buildChartIndex(doubanMovieSnap.Entries)
+	}
+	if doubanTVSnap != nil {
+		s.doubanTrendingTV = doubanTVSnap
+		s.doubanTrendingTVIdx = buildChartIndex(doubanTVSnap.Entries)
 	}
 	s.mu.Unlock()
 	return nil
@@ -220,29 +240,44 @@ func (s *Service) saveSnapshot(ctx context.Context, key string, snap *ChartSnaps
 	return err
 }
 
-// Status returns the current cached Douban Top 250, IMDb Top 250, and TMDB Trending snapshots.
+// Status returns the current cached ranking chart snapshots.
 func (s *Service) Status(includeEntries bool) StatusResponse {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	return StatusResponse{
-		DoubanTop250: copySnapshot(ChartDoubanTop250, s.douban, includeEntries),
-		IMDbTop250:   copySnapshot(ChartIMDbTop250, s.imdb, includeEntries),
-		TMDBTrending: copySnapshot(ChartTMDBTrending, s.tmdbTrending, includeEntries),
+		DoubanTop250:        copySnapshot(ChartDoubanTop250, s.douban, includeEntries),
+		IMDbTop250:          copySnapshot(ChartIMDbTop250, s.imdb, includeEntries),
+		TMDBTrending:        copySnapshot(ChartTMDBTrending, s.tmdbTrending, includeEntries),
+		DoubanTrendingMovie: copySnapshot(ChartDoubanTrendingMovie, s.doubanTrendingMovie, includeEntries),
+		DoubanTrendingTV:    copySnapshot(ChartDoubanTrendingTV, s.doubanTrendingTV, includeEntries),
 	}
 }
 
-// TrendingEntries returns the cached TMDB Trending entries and metadata status.
-func (s *Service) TrendingEntries(_ context.Context) ([]ChartEntry, ChartSnapshot) {
+// Trending returns the full TrendingResponse containing both legacy TMDB fields
+// and grouped snapshots for TMDB, Douban Trending Movies, and Douban Trending TV.
+func (s *Service) Trending(_ context.Context) TrendingResponse {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	status := copySnapshot(ChartTMDBTrending, s.tmdbTrending, false)
-	if s.tmdbTrending == nil || len(s.tmdbTrending.Entries) == 0 {
-		return []ChartEntry{}, status
+	entries := []ChartEntry{}
+	if s.tmdbTrending != nil && len(s.tmdbTrending.Entries) > 0 {
+		entries = append([]ChartEntry(nil), s.tmdbTrending.Entries...)
 	}
-	entries := append([]ChartEntry(nil), s.tmdbTrending.Entries...)
-	return entries, status
+	return TrendingResponse{
+		Status:      status,
+		Entries:     entries,
+		TMDB:        copySnapshot(ChartTMDBTrending, s.tmdbTrending, true),
+		DoubanMovie: copySnapshot(ChartDoubanTrendingMovie, s.doubanTrendingMovie, true),
+		DoubanTV:    copySnapshot(ChartDoubanTrendingTV, s.doubanTrendingTV, true),
+	}
+}
+
+// TrendingEntries returns the cached TMDB Trending entries and metadata status.
+func (s *Service) TrendingEntries(ctx context.Context) ([]ChartEntry, ChartSnapshot) {
+	resp := s.Trending(ctx)
+	return resp.Entries, resp.Status
 }
 
 func copySnapshot(chart string, snap *ChartSnapshot, includeEntries bool) ChartSnapshot {
@@ -264,17 +299,38 @@ func copySnapshot(chart string, snap *ChartSnapshot, includeEntries bool) ChartS
 	return out
 }
 
-// MatchTagsForItem returns the ranking tags that match the given item metadata.
+// MatchTagsForItem returns the ranking tags that match the given item metadata
+// without restricting by media type.
 func (s *Service) MatchTagsForItem(name, originalTitle string, year int, providerIDs map[string]string) []string {
+	return s.MatchTagsForTypedItem("", name, originalTitle, year, providerIDs)
+}
+
+// MatchTagsForTypedItem returns the ranking tags that match the given item metadata,
+// applying media-type filtering for Douban Trending Movies (Movie) and TV (Series).
+func (s *Service) MatchTagsForTypedItem(itemType, name, originalTitle string, year int, providerIDs map[string]string) []string {
 	imdbID, doubanID, tmdbID := extractProviderIDs(providerIDs)
+
+	itemTypeNorm := strings.ToLower(strings.TrimSpace(itemType))
+	allowMovie := itemTypeNorm == "" || itemTypeNorm == "movie"
+	allowTV := itemTypeNorm == "" || itemTypeNorm == "series" || itemTypeNorm == "tv"
 
 	s.mu.RLock()
 	dIdx := s.doubanIdx
 	iIdx := s.imdbIdx
 	tIdx := s.tmdbTrendingIdx
+	dmIdx := s.doubanTrendingMovieIdx
+	dtIdx := s.doubanTrendingTVIdx
 	s.mu.RUnlock()
 
 	var tags []string
+	hasTrending := false
+	addTrending := func() {
+		if !hasTrending {
+			hasTrending = true
+			tags = append(tags, TagTMDBTrending)
+		}
+	}
+
 	if dIdx != nil && dIdx.match(name, originalTitle, year, imdbID, doubanID, tmdbID) {
 		tags = append(tags, TagDoubanTop250)
 	}
@@ -282,7 +338,16 @@ func (s *Service) MatchTagsForItem(name, originalTitle string, year int, provide
 		tags = append(tags, TagIMDbTop250)
 	}
 	if tIdx != nil && tIdx.match(name, originalTitle, year, imdbID, doubanID, tmdbID) {
-		tags = append(tags, TagTMDBTrending)
+		addTrending()
+		tags = append(tags, TagTMDBTrendingSpecific)
+	}
+	if allowMovie && dmIdx != nil && dmIdx.match(name, originalTitle, year, imdbID, doubanID, tmdbID) {
+		addTrending()
+		tags = append(tags, TagDoubanTrendingMovie)
+	}
+	if allowTV && dtIdx != nil && dtIdx.match(name, originalTitle, year, imdbID, doubanID, tmdbID) {
+		addTrending()
+		tags = append(tags, TagDoubanTrendingTV)
 	}
 	return tags
 }
@@ -318,7 +383,7 @@ func (s *Service) ApplyTagsToLibrary(ctx context.Context) (matchedItems int, tag
 	}
 
 	rows, err := s.store.Reader.QueryContext(ctx, `
-		SELECT id, name, COALESCE(original_title, ''), COALESCE(production_year, 0), COALESCE(extra_json, '{}')
+		SELECT id, type, name, COALESCE(original_title, ''), COALESCE(production_year, 0), COALESCE(extra_json, '{}')
 		FROM items
 		WHERE type IN ('Movie', 'Series')`)
 	if err != nil {
@@ -327,9 +392,9 @@ func (s *Service) ApplyTagsToLibrary(ctx context.Context) (matchedItems int, tag
 
 	var plans []itemTagPlan
 	for rows.Next() {
-		var id, name, originalTitle, extraJSON string
+		var id, itemType, name, originalTitle, extraJSON string
 		var year int
-		if err := rows.Scan(&id, &name, &originalTitle, &year, &extraJSON); err != nil {
+		if err := rows.Scan(&id, &itemType, &name, &originalTitle, &year, &extraJSON); err != nil {
 			rows.Close()
 			return 0, 0, fmt.Errorf("scan library item: %w", err)
 		}
@@ -337,7 +402,7 @@ func (s *Service) ApplyTagsToLibrary(ctx context.Context) (matchedItems int, tag
 		if extraJSON != "" && extraJSON != "{}" {
 			_ = json.Unmarshal([]byte(extraJSON), &extra)
 		}
-		tags := s.MatchTagsForItem(name, originalTitle, year, extra.ProviderIDs)
+		tags := s.MatchTagsForTypedItem(itemType, name, originalTitle, year, extra.ProviderIDs)
 		if len(tags) > 0 {
 			plans = append(plans, itemTagPlan{itemID: id, tags: tags})
 		}
@@ -418,17 +483,19 @@ func (s *Service) ApplyTagsToLibrary(ctx context.Context) (matchedItems int, tag
 	return matchedItems, tagsAdded, nil
 }
 
-// SyncAndApply fetches Douban Top 250, IMDb Top 250, and TMDB Trending sequentially
-// (preserving existing caches on individual fetch failures), persists updated snapshots,
-// and applies matching tags to the library.
+// SyncAndApply fetches Douban Top 250, IMDb Top 250, TMDB Trending, Douban Trending Movies,
+// and Douban Trending TV sequentially (preserving existing caches on individual fetch failures),
+// persists updated snapshots, and applies matching tags to the library.
 func (s *Service) SyncAndApply(ctx context.Context) (SyncSummary, error) {
 	s.syncMu.Lock()
 	defer s.syncMu.Unlock()
 
 	summary := SyncSummary{SyncedAt: time.Now().UTC()}
 
-	var doubanErr, imdbErr, tmdbErr error
+	var doubanErr, imdbErr, tmdbErr, doubanMovieErr, doubanTVErr error
 	tmdbLiveSucceeded := false
+	doubanMovieLiveSucceeded := false
+	doubanTVLiveSucceeded := false
 
 	if snap, err := s.fetcher.FetchDoubanTop250(ctx); err != nil {
 		doubanErr = err
@@ -472,6 +539,38 @@ func (s *Service) SyncAndApply(ctx context.Context) (SyncSummary, error) {
 		s.mu.Unlock()
 	}
 
+	if snap, err := s.fetcher.FetchDoubanTrendingMovie(ctx); err != nil {
+		doubanMovieErr = err
+		summary.DoubanTrendingMovieError = err.Error()
+	} else {
+		if err := s.saveSnapshot(ctx, ConfigKeyDoubanTrendingMovie, snap); err != nil {
+			return summary, fmt.Errorf("save douban trending movie cache: %w", err)
+		}
+		if snap.Source != SourceDoubanTrendingMovieBuiltin {
+			doubanMovieLiveSucceeded = true
+		}
+		s.mu.Lock()
+		s.doubanTrendingMovie = snap
+		s.doubanTrendingMovieIdx = buildChartIndex(snap.Entries)
+		s.mu.Unlock()
+	}
+
+	if snap, err := s.fetcher.FetchDoubanTrendingTV(ctx); err != nil {
+		doubanTVErr = err
+		summary.DoubanTrendingTVError = err.Error()
+	} else {
+		if err := s.saveSnapshot(ctx, ConfigKeyDoubanTrendingTV, snap); err != nil {
+			return summary, fmt.Errorf("save douban trending tv cache: %w", err)
+		}
+		if snap.Source != SourceDoubanTrendingTVBuiltin {
+			doubanTVLiveSucceeded = true
+		}
+		s.mu.Lock()
+		s.doubanTrendingTV = snap
+		s.doubanTrendingTVIdx = buildChartIndex(snap.Entries)
+		s.mu.Unlock()
+	}
+
 	s.mu.RLock()
 	if s.douban != nil {
 		summary.DoubanCount = len(s.douban.Entries)
@@ -482,6 +581,12 @@ func (s *Service) SyncAndApply(ctx context.Context) (SyncSummary, error) {
 	if s.tmdbTrending != nil {
 		summary.TMDBTrendingCount = len(s.tmdbTrending.Entries)
 	}
+	if s.doubanTrendingMovie != nil {
+		summary.DoubanTrendingMovieCount = len(s.doubanTrendingMovie.Entries)
+	}
+	if s.doubanTrendingTV != nil {
+		summary.DoubanTrendingTVCount = len(s.doubanTrendingTV.Entries)
+	}
 	s.mu.RUnlock()
 
 	matched, added, applyErr := s.ApplyTagsToLibrary(ctx)
@@ -491,11 +596,21 @@ func (s *Service) SyncAndApply(ctx context.Context) (SyncSummary, error) {
 	summary.MatchedItems = matched
 	summary.TagsAdded = added
 
-	if doubanErr != nil && imdbErr != nil && !tmdbLiveSucceeded {
-		if tmdbErr != nil {
-			return summary, fmt.Errorf("all chart fetches failed: douban=%v; imdb=%v; tmdb_trending=%v", doubanErr, imdbErr, tmdbErr)
+	if doubanErr != nil && imdbErr != nil && !tmdbLiveSucceeded && !doubanMovieLiveSucceeded && !doubanTVLiveSucceeded {
+		parts := []string{
+			fmt.Sprintf("douban=%v", doubanErr),
+			fmt.Sprintf("imdb=%v", imdbErr),
 		}
-		return summary, fmt.Errorf("all chart fetches failed: douban=%v; imdb=%v", doubanErr, imdbErr)
+		if tmdbErr != nil {
+			parts = append(parts, fmt.Sprintf("tmdb_trending=%v", tmdbErr))
+		}
+		if doubanMovieErr != nil {
+			parts = append(parts, fmt.Sprintf("douban_trending_movie=%v", doubanMovieErr))
+		}
+		if doubanTVErr != nil {
+			parts = append(parts, fmt.Sprintf("douban_trending_tv=%v", doubanTVErr))
+		}
+		return summary, fmt.Errorf("all chart fetches failed: %s", strings.Join(parts, "; "))
 	}
 	return summary, nil
 }
@@ -555,6 +670,12 @@ func (s *Service) needsInitialSync(interval time.Duration) bool {
 		return true
 	}
 	if s.tmdbTrending == nil || len(s.tmdbTrending.Entries) == 0 || now.Sub(s.tmdbTrending.UpdatedAt) >= interval {
+		return true
+	}
+	if s.doubanTrendingMovie == nil || len(s.doubanTrendingMovie.Entries) == 0 || now.Sub(s.doubanTrendingMovie.UpdatedAt) >= interval {
+		return true
+	}
+	if s.doubanTrendingTV == nil || len(s.doubanTrendingTV.Entries) == 0 || now.Sub(s.doubanTrendingTV.UpdatedAt) >= interval {
 		return true
 	}
 	return false

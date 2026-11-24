@@ -218,7 +218,7 @@ describe('管理员媒体管理组件与页面集成测试', () => {
       </QueryClientProvider>,
     )
 
-    expect(await screen.findByText('豆瓣 Top 250 / IMDb Top 250 榜单缓存')).toBeInTheDocument()
+    expect(await screen.findByText('影史 Top 250 与热门榜单缓存')).toBeInTheDocument()
     expect(await screen.findByText('肖申克的救赎')).toBeInTheDocument()
 
     // 触发榜单同步
