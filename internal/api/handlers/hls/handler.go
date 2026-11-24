@@ -16,6 +16,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
@@ -121,6 +122,7 @@ func (h *Handler) handleMasterPlaylist(w http.ResponseWriter, r *http.Request) {
 		bw = 4_000_000
 	}
 
+	token := resolveRequestToken(r, q)
 	m3u8 := transcode.BuildMasterPlaylist(transcode.PlaylistParams{
 		ItemID:           item.ID,
 		DurationTicks:    resolveRuntimeTicks(item, src),
@@ -131,8 +133,8 @@ func (h *Handler) handleMasterPlaylist(w http.ResponseWriter, r *http.Request) {
 		Height:           height,
 		VideoCodec:       params.VideoCodec,
 		AudioCodec:       params.AudioCodec,
-		Query:            preserveQuery(r.URL.Query()),
-		Subtitles:        extractTextSubtitles(item, src, q.Get("api_key")),
+		Query:            preserveQueryWithToken(r.URL.Query(), token),
+		Subtitles:        extractTextSubtitles(item, src, token),
 	})
 
 	w.Header().Set("Content-Type", "application/x-mpegURL; charset=utf-8")
@@ -160,13 +162,14 @@ func (h *Handler) handleMediaPlaylist(w http.ResponseWriter, r *http.Request) {
 		_, _ = h.mgr.RegisterSession(params)
 	}
 
+	token := resolveRequestToken(r, q)
 	m3u8 := transcode.BuildMediaPlaylist(transcode.PlaylistParams{
 		ItemID:           item.ID,
 		PlaylistID:       "main",
 		DurationTicks:    resolveRuntimeTicks(item, src),
 		SegmentDuration:  params.SegmentDuration,
 		SegmentContainer: params.SegmentContainer,
-		Query:            preserveQuery(r.URL.Query()),
+		Query:            preserveQueryWithToken(r.URL.Query(), token),
 	})
 
 	w.Header().Set("Content-Type", "application/x-mpegURL; charset=utf-8")
@@ -194,18 +197,15 @@ func (h *Handler) handleSubtitlePlaylist(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if msID == "" {
-		if src != nil && src.ID != "" {
-			msID = src.ID
-		} else {
-			msID = item.ID
-		}
+	if !hasTextSubtitleStream(src, idx) {
+		httpx.Error(w, http.StatusNotFound, "subtitle stream not found")
+		return
 	}
 
-	vttURI := fmt.Sprintf("/Videos/%s/%s/Subtitles/%d/Stream.vtt", item.ID, msID, idx)
+	vttURI := "Stream.vtt"
 	q := httpx.ParseQuery(r)
-	if apiKey := q.Get("api_key"); apiKey != "" {
-		vttURI += "?api_key=" + url.QueryEscape(apiKey)
+	if token := resolveRequestToken(r, q); token != "" {
+		vttURI += "?api_key=" + url.QueryEscape(token)
 	}
 
 	durSec := float64(resolveRuntimeTicks(item, src)) / float64(transcode.TicksPerSecond)
@@ -215,6 +215,18 @@ func (h *Handler) handleSubtitlePlaylist(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(m3u8))
+}
+
+func hasTextSubtitleStream(src *sqlite.MediaSourceRecord, idx int) bool {
+	if src == nil {
+		return false
+	}
+	for _, st := range src.Streams {
+		if st.StreamIndex == idx && strings.EqualFold(st.StreamType, "Subtitle") && isTextSubtitleCodec(st.Codec) {
+			return true
+		}
+	}
+	return false
 }
 
 func extractTextSubtitles(item *sqlite.ItemRecord, src *sqlite.MediaSourceRecord, apiKey string) []transcode.SubtitleTrackInfo {
@@ -230,7 +242,7 @@ func extractTextSubtitles(item *sqlite.ItemRecord, src *sqlite.MediaSourceRecord
 		if !strings.EqualFold(st.StreamType, "Subtitle") || !isTextSubtitleCodec(st.Codec) {
 			continue
 		}
-		uri := fmt.Sprintf("/Videos/%s/%s/Subtitles/%d/subtitles.m3u8", item.ID, msID, st.StreamIndex)
+		uri := fmt.Sprintf("%s/Subtitles/%d/subtitles.m3u8", msID, st.StreamIndex)
 		if apiKey != "" {
 			uri += "?api_key=" + url.QueryEscape(apiKey)
 		}
@@ -255,7 +267,7 @@ func extractTextSubtitles(item *sqlite.ItemRecord, src *sqlite.MediaSourceRecord
 
 func isTextSubtitleCodec(codec string) bool {
 	switch strings.ToLower(strings.TrimSpace(codec)) {
-	case "vtt", "webvtt", "srt", "subrip", "ass", "ssa":
+	case "vtt", "webvtt", "srt", "subrip", "ass", "ssa", "mov_text", "tx3g":
 		return true
 	default:
 		return false
@@ -635,6 +647,35 @@ func preserveQuery(raw url.Values) url.Values {
 	return out
 }
 
+func preserveQueryWithToken(raw url.Values, token string) url.Values {
+	out := preserveQuery(raw)
+	if token == "" {
+		return out
+	}
+	for k, v := range out {
+		if strings.EqualFold(k, "api_key") && len(v) > 0 && strings.TrimSpace(v[0]) != "" {
+			return out
+		}
+	}
+	out.Set("api_key", token)
+	return out
+}
+
+func resolveRequestToken(r *http.Request, q httpx.Query) string {
+	if tok := strings.TrimSpace(q.Get("api_key")); tok != "" {
+		return tok
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil {
+		if tok := strings.TrimSpace(ac.Token); tok != "" {
+			return tok
+		}
+	}
+	if tok := strings.TrimSpace(middleware.ExtractClientInfo(r).Token); tok != "" {
+		return tok
+	}
+	return ""
+}
+
 func readFirstLineURL(strmPath string) string {
 	f, err := os.Open(strmPath)
 	if err != nil {
@@ -646,7 +687,16 @@ func readFirstLineURL(strmPath string) string {
 		line := strings.TrimPrefix(sc.Text(), "\uFEFF")
 		line = strings.TrimSpace(line)
 		if line != "" && !strings.HasPrefix(line, "#") {
-			return strings.ReplaceAll(line, " ", "%20")
+			candidate := strings.ReplaceAll(line, " ", "%20")
+			u, err := url.Parse(candidate)
+			if err != nil || u.Host == "" {
+				return ""
+			}
+			scheme := strings.ToLower(u.Scheme)
+			if scheme != "http" && scheme != "https" {
+				return ""
+			}
+			return candidate
 		}
 	}
 	return ""

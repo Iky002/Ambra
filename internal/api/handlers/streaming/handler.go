@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/core/imaging"
 	"github.com/ambra-media/ambra/internal/core/playback"
 	"github.com/ambra-media/ambra/internal/core/transcode"
@@ -33,6 +34,7 @@ type AuthFuncs struct {
 
 type Handler struct {
 	repo       *sqlite.LibraryRepo
+	userRepo   *sqlite.UserRepo
 	engine     *playback.Engine
 	imaging    *imaging.Service
 	extractor  *transcode.Extractor
@@ -56,6 +58,55 @@ func New(repo *sqlite.LibraryRepo, engine *playback.Engine, img *imaging.Service
 // SetExtractor configures the embedded subtitle extractor used when a requested subtitle stream is not external.
 func (h *Handler) SetExtractor(ext *transcode.Extractor) {
 	h.extractor = ext
+}
+
+// SetUserRepo attaches a UserRepo for per-user library access control on playback/streaming/download/subtitles.
+func (h *Handler) SetUserRepo(userRepo *sqlite.UserRepo) {
+	h.userRepo = userRepo
+}
+
+// CanAccessLibrary returns true if userID is permitted to access libraryID.
+func (h *Handler) CanAccessLibrary(ctx context.Context, userID, libraryID string) bool {
+	if h.userRepo == nil || userID == "" || libraryID == "" {
+		return true
+	}
+	u, err := h.userRepo.GetUserByID(ctx, guid.Normalize(userID))
+	if err != nil || u == nil {
+		return true
+	}
+	if u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableAllFolders {
+		return true
+	}
+	normLib := guid.Normalize(libraryID)
+	for _, fid := range u.Policy.EnabledFolders {
+		if guid.Normalize(fid) == normLib {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) canAccessItem(r *http.Request, itemID string) bool {
+	if h.userRepo == nil || h.repo == nil {
+		return true
+	}
+	var callerID string
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.IsAdmin() {
+			return true
+		}
+		callerID = guid.Normalize(ac.UserID())
+	} else if h.auth.UserIDFromCtx != nil {
+		callerID = guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+	}
+	if callerID == "" {
+		return true
+	}
+	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
+	if err != nil || rec == nil || rec.LibraryID == "" {
+		return true
+	}
+	return h.CanAccessLibrary(r.Context(), callerID, rec.LibraryID)
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
@@ -87,6 +138,10 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 
 func (h *Handler) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 	itemID := r.PathValue("Id")
+	if !h.canAccessItem(r, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	q := httpx.ParseQuery(r)
 
 	var req playback.PlaybackInfoRequest
@@ -144,6 +199,10 @@ func (h *Handler) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) serveMediaFile(w http.ResponseWriter, r *http.Request, asAttachment bool) {
 	itemID := guid.Normalize(r.PathValue("Id"))
+	if !h.canAccessItem(r, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	mediaSourceID := guid.Normalize(q.Get("MediaSourceId"))
 
@@ -235,6 +294,10 @@ func (h *Handler) resolveMediaPath(ctx context.Context, itemID, mediaSourceID st
 
 func (h *Handler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(r.PathValue("Id"))
+	if !h.canAccessItem(r, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	msID := guid.Normalize(r.PathValue("MediaSourceId"))
 	streamIdx, err := strconv.Atoi(r.PathValue("Index"))
 	if err != nil {

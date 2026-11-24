@@ -103,7 +103,6 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 	r.Post("/Users/ForgotPassword", h.forgotPassword)
 	r.Post("/Users/ForgotPassword/Pin", h.forgotPasswordPin)
 	r.Post("/Users/{Id}/Authenticate", h.authenticateUserByID)
-	r.Get("/Connect/Exchange", h.connectExchange)
 	r.Get("/Plugins/{Id}/Thumb", h.getPluginThumb)
 	r.Get("/Users/{Id}/Images/{Type}", h.getUserImage)
 	r.Get("/Users/{Id}/Images/{Type}/{Index}", h.getUserImage)
@@ -116,6 +115,9 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 
 		// /Auth
 		pr.Get("/Auth/Providers", h.getAuthProviders)
+
+		// /Connect
+		pr.Get("/Connect/Exchange", h.connectExchange)
 
 		// /Devices
 		pr.Get("/Devices/Info", h.getDeviceInfo)

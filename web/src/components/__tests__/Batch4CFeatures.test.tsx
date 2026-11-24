@@ -1,17 +1,17 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { saveAuth } from '../../api/client'
 import type { BaseItemDto } from '../../api/types'
 import { AudioPlayerProvider, useAudioPlayer } from '../../context/AudioPlayerContext'
-import { AuthProvider } from '../../context/AuthContext'
+import { AuthProvider, useAuth } from '../../context/AuthContext'
 import { setDemoModeOverride } from '../../demo/demoMode'
 import { resetDemoStore } from '../../demo/mockServer'
 import { AdminPage } from '../../pages/AdminPage'
 import { ItemDetailPage } from '../../pages/ItemDetailPage'
-import { AudioPlayerBar } from '../AudioPlayerBar'
+import { AudioPlayerBar, normalizeLyricsResponse, parseLrcText } from '../AudioPlayerBar'
 import { Layout } from '../Layout'
 
 function renderWithAppProviders(ui: React.ReactNode, initialEntries: string[]) {
@@ -185,5 +185,106 @@ describe('Batch 4C Web UI 功能测试 (Admin Tab 滚动保持 + 全局音乐播
     const playerBar = await screen.findByTestId('audio-player-bar')
     expect(playerBar).toBeInTheDocument()
     expect(screen.getByText('正在播放')).toBeInTheDocument()
+  })
+
+  it('Stream C (P0-5/P1-13/P2-16): 歌词解析支持 offset/三位分钟/空行间奏、Emby ticks，抽屉互斥、错误态与退出登录清空队列', async () => {
+    // 1) LRC 解析：支持 [offset:±ms]、三位分钟与空文本时间戳
+    const lrcLines = parseLrcText(
+      '[offset:500]\n[00:10.00]第一句\n[01:05.00]\n[105:30.25]超长音频歌词',
+    )
+    expect(lrcLines).toEqual([
+      { timeSec: 9.5, text: '第一句' },
+      { timeSec: 64.5, text: '' },
+      { timeSec: 105 * 60 + 30.25 - 0.5, text: '超长音频歌词' },
+    ])
+
+    // 2) Emby LyricLine.Start 严格按 100ns ticks 换算
+    const tickLines = normalizeLyricsResponse({
+      Lyrics: [
+        { Start: 50_000, Text: '片头极早歌词' },
+        { Start: 150_000_000, Text: '第 15 秒' },
+      ],
+    })
+    expect(tickLines[0].timeSec).toBeCloseTo(0.005, 6)
+    expect(tickLines[1].timeSec).toBe(15)
+
+    // 3) 播放失败时 isPlaying 为 false 并展示内联错误提示条；抽屉互斥；退出登录清空队列
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockRejectedValueOnce(new Error('Autoplay blocked'))
+
+    function LogoutButton() {
+      const { logout } = useAuth()
+      return (
+        <button type="button" onClick={logout}>
+          模拟退出登录
+        </button>
+      )
+    }
+
+    const user = userEvent.setup()
+    const testTracks: BaseItemDto[] = [
+      {
+        Id: 'track-interstellar-1',
+        Name: 'Dreaming of the Crash',
+        Type: 'Audio',
+        MediaType: 'Audio',
+        RunTimeTicks: 235 * 10_000_000,
+      },
+    ]
+
+    const { container } = renderWithAppProviders(
+      <Routes>
+        <Route
+          path="/"
+          element={
+            <>
+              <AudioTriggerHarness tracks={testTracks} />
+              <LogoutButton />
+              <Layout />
+            </>
+          }
+        >
+          <Route index element={<div>首页内容</div>} />
+        </Route>
+      </Routes>,
+      ['/'],
+    )
+
+    await user.click(screen.getByRole('button', { name: '启动测试播放队列' }))
+
+    // play() 拒绝 -> 显示错误条且播放按钮应为「播放」（isPlaying=false）
+    expect(await screen.findByTestId('audio-playback-error')).toHaveTextContent('Autoplay blocked')
+    expect(screen.getByRole('button', { name: '播放' })).toBeInTheDocument()
+
+    // Layout <main> 底部留白扩展为 pb-40 lg:pb-32
+    const mainEl = container.querySelector('main')
+    expect(mainEl?.className).toContain('pb-40')
+    expect(mainEl?.className).toContain('lg:pb-32')
+
+    // 关闭错误提示
+    await user.click(screen.getByRole('button', { name: '关闭错误提示' }))
+    expect(screen.queryByTestId('audio-playback-error')).not.toBeInTheDocument()
+
+    // <audio onError> 触发时显示错误条
+    const audioEl = container.querySelector('audio') as HTMLAudioElement
+    fireEvent.error(audioEl)
+    expect(await screen.findByTestId('audio-playback-error')).toBeInTheDocument()
+
+    // 歌词抽屉与播放队列互斥打开，且队列删除按钮在触屏下可见 (opacity-70)
+    await user.click(screen.getByRole('button', { name: '同步歌词' }))
+    expect(await screen.findByTestId('lyrics-drawer')).toBeInTheDocument()
+    expect(screen.queryByTestId('queue-popover')).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: '播放队列' }))
+    expect(await screen.findByTestId('queue-popover')).toBeInTheDocument()
+    expect(screen.queryByTestId('lyrics-drawer')).not.toBeInTheDocument()
+    const removeBtn = screen.getByRole('button', { name: '从队列移除 Dreaming of the Crash' })
+    expect(removeBtn.className).toContain('opacity-70')
+    expect(removeBtn.className).toContain('sm:opacity-0')
+
+    // 退出登录后全局音乐播放器自动停止并清空队列
+    await user.click(screen.getByRole('button', { name: '模拟退出登录' }))
+    await waitFor(() => {
+      expect(screen.queryByTestId('audio-player-bar')).not.toBeInTheDocument()
+    })
   })
 })

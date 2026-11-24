@@ -923,11 +923,11 @@ func (s *Scanner) buildMediaSource(item *sqlite.ItemRecord, mediaPath string, si
 			container = probeRes.Container
 		}
 		streams = make([]sqlite.MediaStreamRecord, 0, len(probeRes.Streams))
-		for i, ps := range probeRes.Streams {
+		for _, ps := range probeRes.Streams {
 			streams = append(streams, sqlite.MediaStreamRecord{
 				MediaSourceID: msID,
 				ItemID:        item.ID,
-				StreamIndex:   i,
+				StreamIndex:   ps.Index,
 				StreamType:    ps.StreamType,
 				Codec:         ps.Codec,
 				Language:      ps.Language,
@@ -1001,9 +1001,15 @@ func (s *Scanner) buildMediaSource(item *sqlite.ItemRecord, mediaPath string, si
 		}
 	}
 
-	// Scan companion external subtitles in the same directory for video items; stream_index continues after embedded streams.
+	// Scan companion external subtitles in the same directory for video items; stream_index continues after max embedded stream index.
 	if !strings.EqualFold(item.MediaType, "Audio") && !strings.EqualFold(item.Type, "Audio") {
-		extSubs := discoverExternalSubtitles(mediaPath, msID, item.ID, len(streams))
+		nextIdx := 0
+		for _, st := range streams {
+			if st.StreamIndex >= nextIdx {
+				nextIdx = st.StreamIndex + 1
+			}
+		}
+		extSubs := discoverExternalSubtitles(mediaPath, msID, item.ID, nextIdx)
 		streams = append(streams, extSubs...)
 	}
 

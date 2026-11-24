@@ -146,24 +146,33 @@ func (h *Handler) handleUploadItemImage(w http.ResponseWriter, r *http.Request) 
 	}
 
 	ext := imageExtForData(data, r.Header.Get("Content-Type"))
-	baseDir := os.TempDir()
-	if h.cfg != nil && h.cfg.DataDir != "" {
-		baseDir = filepath.Join(h.cfg.DataDir, "metadata", "images", itemID)
-	} else {
-		baseDir = filepath.Join(baseDir, "ambra-images", itemID)
+	var filePath string
+	if h.scanner != nil && idx == 0 {
+		if localPath, saved, localErr := h.scanner.SaveItemLocalImage(r.Context(), itemID, imageType, ext, data); localErr == nil && saved && localPath != "" {
+			filePath = localPath
+		}
 	}
-	if err := os.MkdirAll(baseDir, 0o755); err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	filePath, err := safeImageFilePath(baseDir, imageType, idx, ext)
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid image path")
-		return
-	}
-	if err := os.WriteFile(filePath, data, 0o644); err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
-		return
+	if filePath == "" {
+		baseDir := os.TempDir()
+		if h.cfg != nil && h.cfg.DataDir != "" {
+			baseDir = filepath.Join(h.cfg.DataDir, "metadata", "images", itemID)
+		} else {
+			baseDir = filepath.Join(baseDir, "ambra-images", itemID)
+		}
+		if err := os.MkdirAll(baseDir, 0o755); err != nil {
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		var err error
+		filePath, err = safeImageFilePath(baseDir, imageType, idx, ext)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid image path")
+			return
+		}
+		if err := os.WriteFile(filePath, data, 0o644); err != nil {
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 
 	width, height := 0, 0
@@ -550,25 +559,33 @@ func (h *Handler) downloadAndSaveItemImage(ctx context.Context, itemID, imageTyp
 	}
 
 	ext := imageExtForData(data, ct)
-	baseDir := filepath.Join(os.TempDir(), "ambra-images", itemID)
-	if h.cfg != nil && strings.TrimSpace(h.cfg.DataDir) != "" {
-		baseDir = filepath.Join(h.cfg.DataDir, "metadata", "images", itemID)
+	var filePath string
+	if h.scanner != nil && idx == 0 {
+		if localPath, saved, localErr := h.scanner.SaveItemLocalImage(ctx, itemID, safeType, ext, data); localErr == nil && saved && localPath != "" {
+			filePath = localPath
+		}
 	}
-	if err := os.MkdirAll(baseDir, 0o755); err != nil {
-		return err
-	}
+	if filePath == "" {
+		baseDir := filepath.Join(os.TempDir(), "ambra-images", itemID)
+		if h.cfg != nil && strings.TrimSpace(h.cfg.DataDir) != "" {
+			baseDir = filepath.Join(h.cfg.DataDir, "metadata", "images", itemID)
+		}
+		if err := os.MkdirAll(baseDir, 0o755); err != nil {
+			return err
+		}
 
-	filePath, err := safeImageFilePath(baseDir, safeType, idx, ext)
-	if err != nil {
-		return err
-	}
-	tmpPath := filePath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, filePath); err != nil {
-		_ = os.Remove(tmpPath)
-		return err
+		filePath, err = safeImageFilePath(baseDir, safeType, idx, ext)
+		if err != nil {
+			return err
+		}
+		tmpPath := filePath + ".tmp"
+		if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+			return err
+		}
+		if err := os.Rename(tmpPath, filePath); err != nil {
+			_ = os.Remove(tmpPath)
+			return err
+		}
 	}
 
 	width, height := 0, 0

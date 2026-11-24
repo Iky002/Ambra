@@ -1443,24 +1443,51 @@ func (r *LibraryRepo) SearchHints(ctx context.Context, f SearchHintFilter) ([]dt
 
 // ListTaxonomies lists Genres, Studios, Persons, or Years as BaseItemDto.
 func (r *LibraryRepo) ListTaxonomies(ctx context.Context, serverID, kind, parentID string, startIndex, limit int) ([]dto.BaseItemDto, int, error) {
+	return r.ListTaxonomiesWithAllowedLibraries(ctx, serverID, kind, parentID, startIndex, limit, nil)
+}
+
+// ListTaxonomiesWithAllowedLibraries lists Genres, Studios, Persons, or Years scoped to allowedLibraryIDs.
+// When allowedLibraryIDs is nil, all libraries are included; when non-nil and empty, an empty result is returned.
+func (r *LibraryRepo) ListTaxonomiesWithAllowedLibraries(ctx context.Context, serverID, kind, parentID string, startIndex, limit int, allowedLibraryIDs []string) ([]dto.BaseItemDto, int, error) {
 	if limit <= 0 {
 		limit = 200
 	}
+	if allowedLibraryIDs != nil && len(allowedLibraryIDs) == 0 {
+		return []dto.BaseItemDto{}, 0, nil
+	}
 	parentID = guid.Normalize(parentID)
+
+	libInClause := func(col string) (string, []any) {
+		if len(allowedLibraryIDs) == 0 {
+			return "", nil
+		}
+		ph := make([]string, len(allowedLibraryIDs))
+		vals := make([]any, len(allowedLibraryIDs))
+		for i, id := range allowedLibraryIDs {
+			ph[i] = "?"
+			vals[i] = guid.Normalize(id)
+		}
+		return col + " IN (" + strings.Join(ph, ",") + ")", vals
+	}
 
 	switch strings.ToLower(kind) {
 	case "year", "years":
 		var (
 			args       []any
 			parentJoin string
+			libWhere   string
 		)
 		if parentID != "" {
 			parentJoin = `INNER JOIN item_ancestors anc ON anc.descendant_id = i.id AND anc.ancestor_id = ?`
 			args = append(args, parentID)
 		}
+		if clause, vals := libInClause("i.library_id"); clause != "" {
+			libWhere = " AND " + clause
+			args = append(args, vals...)
+		}
 		rows, err := r.store.Reader.QueryContext(ctx,
 			`SELECT DISTINCT i.production_year FROM items i `+parentJoin+`
-			 WHERE i.production_year IS NOT NULL ORDER BY i.production_year DESC`, args...)
+			 WHERE i.production_year IS NOT NULL`+libWhere+` ORDER BY i.production_year DESC`, args...)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -1489,13 +1516,20 @@ func (r *LibraryRepo) ListTaxonomies(ctx context.Context, serverID, kind, parent
 			args  []any
 			where string
 		)
-		if parentID != "" {
-			where = `WHERE EXISTS (
-				SELECT 1 FROM item_people ip
-				JOIN item_ancestors anc ON anc.descendant_id = ip.item_id
-				WHERE ip.person_id = p.id AND anc.ancestor_id = ?
-			)`
-			args = append(args, parentID)
+		if parentID != "" || len(allowedLibraryIDs) > 0 {
+			var joins, conds []string
+			conds = append(conds, "ip.person_id = p.id")
+			if parentID != "" {
+				joins = append(joins, "JOIN item_ancestors anc ON anc.descendant_id = ip.item_id")
+				conds = append(conds, "anc.ancestor_id = ?")
+				args = append(args, parentID)
+			}
+			if clause, vals := libInClause("i.library_id"); clause != "" {
+				joins = append(joins, "JOIN items i ON i.id = ip.item_id")
+				conds = append(conds, clause)
+				args = append(args, vals...)
+			}
+			where = `WHERE EXISTS (SELECT 1 FROM item_people ip ` + strings.Join(joins, " ") + ` WHERE ` + strings.Join(conds, " AND ") + `)`
 		}
 		var total int
 		if err := r.store.Reader.QueryRowContext(ctx, `SELECT COUNT(*) FROM people p `+where, args...).Scan(&total); err != nil {
@@ -1547,13 +1581,20 @@ func (r *LibraryRepo) ListTaxonomies(ctx context.Context, serverID, kind, parent
 			args  = []any{taxKind}
 			extra string
 		)
-		if parentID != "" {
-			extra = ` AND EXISTS (
-				SELECT 1 FROM item_taxonomies it
-				JOIN item_ancestors anc ON anc.descendant_id = it.item_id
-				WHERE it.taxonomy_id = t.id AND anc.ancestor_id = ?
-			)`
-			args = append(args, parentID)
+		if parentID != "" || len(allowedLibraryIDs) > 0 {
+			var joins, conds []string
+			conds = append(conds, "it.taxonomy_id = t.id")
+			if parentID != "" {
+				joins = append(joins, "JOIN item_ancestors anc ON anc.descendant_id = it.item_id")
+				conds = append(conds, "anc.ancestor_id = ?")
+				args = append(args, parentID)
+			}
+			if clause, vals := libInClause("i.library_id"); clause != "" {
+				joins = append(joins, "JOIN items i ON i.id = it.item_id")
+				conds = append(conds, clause)
+				args = append(args, vals...)
+			}
+			extra = ` AND EXISTS (SELECT 1 FROM item_taxonomies it ` + strings.Join(joins, " ") + ` WHERE ` + strings.Join(conds, " AND ") + `)`
 		}
 		var total int
 		if err := r.store.Reader.QueryRowContext(ctx, `SELECT COUNT(*) FROM taxonomies t WHERE t.kind = ?`+extra, args...).Scan(&total); err != nil {
@@ -1590,7 +1631,28 @@ func (r *LibraryRepo) ListTaxonomies(ctx context.Context, serverID, kind, parent
 }
 
 func (r *LibraryRepo) GetItemCounts(ctx context.Context) (*ItemCounts, error) {
-	rows, err := r.store.Reader.QueryContext(ctx, `SELECT type, COUNT(*) FROM items GROUP BY type`)
+	return r.GetItemCountsWithAllowedLibraries(ctx, nil)
+}
+
+// GetItemCountsWithAllowedLibraries counts items grouped by type, optionally restricted to allowedLibraryIDs.
+func (r *LibraryRepo) GetItemCountsWithAllowedLibraries(ctx context.Context, allowedLibraryIDs []string) (*ItemCounts, error) {
+	if allowedLibraryIDs != nil && len(allowedLibraryIDs) == 0 {
+		return &ItemCounts{}, nil
+	}
+	query := `SELECT type, COUNT(*) FROM items`
+	var args []any
+	if len(allowedLibraryIDs) > 0 {
+		ph := make([]string, len(allowedLibraryIDs))
+		args = make([]any, len(allowedLibraryIDs))
+		for i, id := range allowedLibraryIDs {
+			ph[i] = "?"
+			args[i] = guid.Normalize(id)
+		}
+		query += ` WHERE library_id IN (` + strings.Join(ph, ",") + `)`
+	}
+	query += ` GROUP BY type`
+
+	rows, err := r.store.Reader.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2053,6 +2115,36 @@ func (r *LibraryRepo) loadTaxonomiesBatch(ctx context.Context, itemIDs []string)
 		}
 	}
 	return genres, studios, rows.Err()
+}
+
+// GetTaxonomiesByItemID returns persisted genre, studio, and tag names for itemID.
+func (r *LibraryRepo) GetTaxonomiesByItemID(ctx context.Context, itemID string) (genres, studios, tags []string, err error) {
+	itemID = guid.Normalize(itemID)
+	rows, err := r.store.Reader.QueryContext(ctx, `
+		SELECT t.kind, t.name
+		FROM item_taxonomies it
+		JOIN taxonomies t ON t.id = it.taxonomy_id
+		WHERE it.item_id = ?
+		ORDER BY t.sort_name ASC`, itemID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var kind, name string
+		if err := rows.Scan(&kind, &name); err != nil {
+			return nil, nil, nil, err
+		}
+		switch strings.ToLower(kind) {
+		case "genre":
+			genres = append(genres, name)
+		case "studio":
+			studios = append(studios, name)
+		case "tag":
+			tags = append(tags, name)
+		}
+	}
+	return genres, studios, tags, rows.Err()
 }
 
 // GetPeopleByItemID returns all people associated with itemID (including PrimaryImageTag if present).

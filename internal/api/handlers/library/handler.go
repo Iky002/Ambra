@@ -11,6 +11,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/scanner"
 	"github.com/ambra-media/ambra/internal/core/watcher"
@@ -395,7 +396,10 @@ func (h *Handler) handleGetItem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleItemCounts(w http.ResponseWriter, r *http.Request) {
-	counts, err := h.repo.GetItemCounts(r.Context())
+	q := httpx.ParseQuery(r)
+	userID := h.resolveUserID(r, q)
+	allowed := h.allowedLibrariesForRequest(r, userID)
+	counts, err := h.repo.GetItemCountsWithAllowedLibraries(r.Context(), allowed)
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
@@ -518,13 +522,16 @@ func (h *Handler) handleSearchHints(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleTaxonomies(kind string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := httpx.ParseQuery(r)
-		items, total, err := h.repo.ListTaxonomies(
+		userID := h.resolveUserID(r, q)
+		allowed := h.allowedLibrariesForRequest(r, userID)
+		items, total, err := h.repo.ListTaxonomiesWithAllowedLibraries(
 			r.Context(),
 			h.serverID(),
 			kind,
 			q.Get("ParentId"),
 			q.Int("StartIndex", 0),
 			q.Int("Limit", 200),
+			allowed,
 		)
 		if err != nil {
 			httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -537,7 +544,34 @@ func (h *Handler) handleTaxonomies(kind string) http.HandlerFunc {
 	}
 }
 
+func (h *Handler) canModifyUser(r *http.Request, targetUserID string) bool {
+	targetID := guid.Normalize(targetUserID)
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		return ac.IsAdmin() || (targetID != "" && guid.Normalize(ac.UserID()) == targetID)
+	}
+	if h.auth.UserIDFromCtx != nil {
+		callerID := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if callerID != "" {
+			if callerID == targetID {
+				return true
+			}
+			if h.userRepo != nil {
+				if u, err := h.userRepo.GetUserByID(r.Context(), callerID); err == nil && u != nil {
+					return u.IsAdmin || u.Policy.IsAdministrator
+				}
+			}
+			return false
+		}
+	}
+	// Unit tests without auth middleware or UserIDFromCtx
+	return true
+}
+
 func (h *Handler) handleMarkPlayed(w http.ResponseWriter, r *http.Request) {
+	if !h.canModifyUser(r, r.PathValue("UserId")) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	ud, err := h.repo.MarkPlayed(r.Context(), r.PathValue("UserId"), r.PathValue("Id"))
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -547,6 +581,10 @@ func (h *Handler) handleMarkPlayed(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleMarkUnplayed(w http.ResponseWriter, r *http.Request) {
+	if !h.canModifyUser(r, r.PathValue("UserId")) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	ud, err := h.repo.MarkUnplayed(r.Context(), r.PathValue("UserId"), r.PathValue("Id"))
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -556,6 +594,10 @@ func (h *Handler) handleMarkUnplayed(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleMarkFavorite(w http.ResponseWriter, r *http.Request) {
+	if !h.canModifyUser(r, r.PathValue("UserId")) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	ud, err := h.repo.MarkFavorite(r.Context(), r.PathValue("UserId"), r.PathValue("Id"))
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -565,6 +607,10 @@ func (h *Handler) handleMarkFavorite(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleUnmarkFavorite(w http.ResponseWriter, r *http.Request) {
+	if !h.canModifyUser(r, r.PathValue("UserId")) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	ud, err := h.repo.UnmarkFavorite(r.Context(), r.PathValue("UserId"), r.PathValue("Id"))
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())

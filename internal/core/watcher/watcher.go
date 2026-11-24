@@ -222,7 +222,7 @@ func (w *Watcher) handleEvent(ev fsnotify.Event) {
 
 	cleanPath := filepath.Clean(ev.Name)
 	base := filepath.Base(cleanPath)
-	if strings.HasPrefix(base, ".") {
+	if strings.HasPrefix(base, ".") || isTempFileName(base) {
 		return
 	}
 
@@ -249,6 +249,14 @@ func (w *Watcher) handleEvent(ev fsnotify.Event) {
 
 	w.scheduleDebounceLocked(libID, cleanPath)
 	w.mu.Unlock()
+}
+
+func isTempFileName(base string) bool {
+	lower := strings.ToLower(base)
+	return strings.HasSuffix(lower, ".tmp") ||
+		strings.HasSuffix(lower, ".part") ||
+		strings.HasSuffix(lower, ".crdownload") ||
+		strings.HasSuffix(lower, "~")
 }
 
 func (w *Watcher) lookupLibraryLocked(path string) string {

@@ -18,6 +18,9 @@ func (s *Scanner) RefreshItem(ctx context.Context, itemID string, replaceMetadat
 	if err != nil {
 		return err
 	}
+	if rec.Extra.LockData {
+		return nil
+	}
 
 	q := plugins.MediaQuery{
 		ItemType:      rec.Type,

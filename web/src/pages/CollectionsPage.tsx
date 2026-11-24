@@ -1,11 +1,14 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  ArrowDown,
   ArrowLeft,
+  ArrowUp,
   Layers,
   Library,
   ListVideo,
   Loader2,
+  Play,
   Plus,
   Trash2,
   X,
@@ -14,6 +17,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api } from '../api/client'
 import type { BaseItemDto } from '../api/types'
 import { MediaCard } from '../components/MediaCard'
+import { useAudioPlayer } from '../context/AudioPlayerContext'
 import { useAuth } from '../context/AuthContext'
 import { AdminModal, FeedbackBanner } from './admin/adminUtils'
 
@@ -22,6 +26,7 @@ type CollectionTab = 'BoxSet' | 'Playlist'
 export function CollectionsPage() {
   const { id: selectedId } = useParams<{ id: string }>()
   const { auth } = useAuth()
+  const { playQueue } = useAudioPlayer()
   const userId = auth!.userId
   const navigate = useNavigate()
   const queryClient = useQueryClient()
@@ -152,6 +157,22 @@ export function CollectionsPage() {
     },
   })
 
+  const moveMemberMutation = useMutation({
+    mutationFn: async ({ itemId, newIndex }: { itemId: string; newIndex: number }) => {
+      if (!selectedId || !isSelectedPlaylist) return
+      await api.movePlaylistItem(selectedId, itemId, newIndex)
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['collectionItems', selectedId] })
+    },
+    onError: (err) => {
+      setFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : '调整排序失败',
+      })
+    },
+  })
+
   const openCreateModal = (type: CollectionTab) => {
     setCreateType(type)
     setNewName('')
@@ -193,14 +214,41 @@ export function CollectionsPage() {
           </div>
 
           {selectedContainer && (
-            <button
-              type="button"
-              onClick={() => setDeleteTarget(selectedContainer)}
-              className="inline-flex items-center gap-1.5 self-start rounded-xl border border-red-500/30 bg-red-500/10 px-3.5 py-2 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20"
-            >
-              <Trash2 className="h-3.5 w-3.5" />
-              <span>删除{isSelectedPlaylist ? '播放列表' : '合集'}</span>
-            </button>
+            <div className="flex flex-wrap items-center gap-2 self-start">
+              {isSelectedPlaylist && members.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const audioItems = members.filter((m) => m.Type === 'Audio')
+                    if (
+                      audioItems.length > 0 &&
+                      (selectedContainer.MediaType === 'Audio' ||
+                        audioItems.length === members.length ||
+                        members[0]?.Type === 'Audio')
+                    ) {
+                      playQueue(audioItems, 0)
+                      return
+                    }
+                    const firstVideo = members.find((m) => m.Type !== 'Audio') || members[0]
+                    if (firstVideo) {
+                      navigate(`/play/${encodeURIComponent(firstVideo.Id)}`)
+                    }
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-3.5 py-2 text-xs font-semibold text-zinc-950 shadow-md shadow-amber-500/20 transition-colors hover:bg-amber-400"
+                >
+                  <Play className="h-3.5 w-3.5 fill-current" />
+                  <span>播放全部</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setDeleteTarget(selectedContainer)}
+                className="inline-flex items-center gap-1.5 rounded-xl border border-red-500/30 bg-red-500/10 px-3.5 py-2 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                <span>删除{isSelectedPlaylist ? '播放列表' : '合集'}</span>
+              </button>
+            </div>
           )}
         </div>
 
@@ -225,9 +273,41 @@ export function CollectionsPage() {
           </div>
         ) : (
           <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
-            {members.map((member) => (
+            {members.map((member, idx) => (
               <div key={member.Id} className="group/member relative">
                 <MediaCard item={member} />
+                {isSelectedPlaylist && members.length > 1 && (
+                  <div className="absolute left-2 top-2 z-20 flex items-center gap-1 opacity-0 transition-opacity group-hover/member:opacity-100 focus-within:opacity-100">
+                    <button
+                      type="button"
+                      disabled={idx === 0 || moveMemberMutation.isPending}
+                      onClick={(e) => {
+                        e.preventDefault()
+                        e.stopPropagation()
+                        moveMemberMutation.mutate({ itemId: member.Id, newIndex: idx - 1 })
+                      }}
+                      title="上移"
+                      aria-label={`上移 ${member.Name}`}
+                      className="flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-200 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-amber-500 hover:text-zinc-950 disabled:opacity-35"
+                    >
+                      <ArrowUp className="h-3.5 w-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      disabled={idx === members.length - 1 || moveMemberMutation.isPending}
+                      onClick={(e) => {
+                        e.preventDefault()
+                        e.stopPropagation()
+                        moveMemberMutation.mutate({ itemId: member.Id, newIndex: idx + 1 })
+                      }}
+                      title="下移"
+                      aria-label={`下移 ${member.Name}`}
+                      className="flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-200 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-amber-500 hover:text-zinc-950 disabled:opacity-35"
+                    >
+                      <ArrowDown className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                )}
                 <button
                   type="button"
                   disabled={removeMemberMutation.isPending}

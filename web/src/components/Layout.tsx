@@ -347,7 +347,7 @@ export function Layout() {
           </div>
         </header>
 
-        <main className={`flex-1 ${currentTrack ? 'pb-32' : 'pb-16'}`}>
+        <main className={`flex-1 ${currentTrack ? 'pb-40 lg:pb-32' : 'pb-16'}`}>
           <div key={outletKey} className="animate-page-enter">
             <Outlet />
           </div>

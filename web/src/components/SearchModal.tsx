@@ -63,8 +63,17 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
   if (!open) return null
 
   const handleSelect = (hint: SearchHint) => {
+    const targetId = hint.ItemId || hint.Id
     onClose()
-    navigate(`/item/${hint.ItemId || hint.Id}`)
+    if (hint.Type === 'Person') {
+      navigate(`/person/${encodeURIComponent(targetId)}?name=${encodeURIComponent(hint.Name)}`)
+      return
+    }
+    if (hint.Type === 'BoxSet' || hint.Type === 'Playlist') {
+      navigate(`/collections/${encodeURIComponent(targetId)}`)
+      return
+    }
+    navigate(`/item/${encodeURIComponent(targetId)}`)
   }
 
   const handleKeyDown = (e: React.KeyboardEvent) => {

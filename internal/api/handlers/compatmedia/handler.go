@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/imaging"
 	"github.com/ambra-media/ambra/internal/core/scanner"
@@ -33,6 +34,7 @@ type AuthFuncs struct {
 // encoding, library, taxonomy, audio, and video compatibility endpoints.
 type Handler struct {
 	repo         *sqlite.LibraryRepo
+	userRepo     *sqlite.UserRepo
 	scanner      *scanner.Scanner
 	watcher      *watcher.Watcher
 	imaging      *imaging.Service
@@ -68,6 +70,11 @@ func New(
 // SetWatcher attaches a filesystem Watcher so library path edits and deletions dynamically update watches.
 func (h *Handler) SetWatcher(w *watcher.Watcher) {
 	h.watcher = w
+}
+
+// SetUserRepo attaches a UserRepo for per-user library access control.
+func (h *Handler) SetUserRepo(userRepo *sqlite.UserRepo) {
+	h.userRepo = userRepo
 }
 
 // SetExtractor overrides the embedded subtitle & font extractor used by compatmedia endpoints.
@@ -142,7 +149,7 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 	// --- /Collections (3 routes) ---
 	r.Get("/Collections/{Id}/Missing", authFn(h.handleCollectionMissing))
 	r.Get("/Collections/{Id}/ProviderItems", authFn(h.handleCollectionProviderItems))
-	r.Post("/Collections/{Id}/Items/Delete", authFn(h.handleContainerItemsDelete))
+	r.Post("/Collections/{Id}/Items/Delete", adminFn(h.handleContainerItemsDelete))
 
 	// --- /Encoding (11 routes) ---
 	r.Get("/Encoding/ToneMapOptions", adminFn(h.handleGetToneMapOptions))
@@ -339,6 +346,61 @@ func (h *Handler) resolveUserID(r *http.Request, q httpx.Query) string {
 		return guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
 	}
 	return ""
+}
+
+// allowedLibrariesForRequest returns nil if the caller has unrestricted access to all libraries,
+// or a non-nil slice of normalized library IDs (possibly empty) if restricted.
+func (h *Handler) allowedLibrariesForRequest(r *http.Request, fallbackUserID string) []string {
+	if h.userRepo == nil {
+		return nil
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.IsAdmin() {
+			return nil
+		}
+		return h.allowedLibrariesForUser(r.Context(), guid.Normalize(ac.UserID()))
+	}
+	uid := ""
+	if h.auth.UserIDFromCtx != nil {
+		uid = guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+	}
+	if uid == "" {
+		uid = guid.Normalize(fallbackUserID)
+	}
+	return h.allowedLibrariesForUser(r.Context(), uid)
+}
+
+func (h *Handler) allowedLibrariesForUser(ctx context.Context, userID string) []string {
+	if h.userRepo == nil || userID == "" {
+		return nil
+	}
+	u, err := h.userRepo.GetUserByID(ctx, userID)
+	if err != nil || u == nil {
+		return nil
+	}
+	if u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableAllFolders {
+		return nil
+	}
+	allowed := make([]string, 0, len(u.Policy.EnabledFolders))
+	for _, fid := range u.Policy.EnabledFolders {
+		if norm := guid.Normalize(fid); norm != "" {
+			allowed = append(allowed, norm)
+		}
+	}
+	return allowed
+}
+
+func isLibraryAllowed(libID string, allowed []string) bool {
+	if allowed == nil {
+		return true
+	}
+	norm := guid.Normalize(libID)
+	for _, id := range allowed {
+		if id == norm {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) getConfigJSON(ctx context.Context, key string, dst any) (bool, error) {
