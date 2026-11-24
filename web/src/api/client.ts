@@ -13,11 +13,17 @@ import type {
   BaseItemDto,
   DeviceInfo,
   FileSystemEntry,
+  ItemImageInfo,
+  ItemMetadataUpdatePayload,
   NameIdPair,
   PlaybackInfoResponse,
   PluginInfo,
   PublicSystemInfo,
   QueryResult,
+  RankingsRefreshResult,
+  RankingsSummary,
+  RemoteImageResult,
+  RemoteSearchResult,
   ScheduledTaskInfo,
   SearchHintResult,
   ServerLogFile,
@@ -619,5 +625,151 @@ export const api = {
   getServerLogContent: (name: string) =>
     embyFetch<string>(`/emby/System/Logs/${encodeURIComponent(name)}`, {
       headers: { Accept: 'text/plain, application/json' },
+    }),
+
+  // ==================== Media Metadata, Images & Rankings Admin APIs ====================
+
+  updateItemMetadata: (itemId: string, payload: ItemMetadataUpdatePayload) =>
+    embyFetch<void>(`/emby/Items/${encodeURIComponent(itemId)}`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  refreshItemMetadata: (itemId: string, replaceAllMetadata = false) => {
+    const q = new URLSearchParams({
+      Recursive: 'true',
+      MetadataRefreshMode: replaceAllMetadata ? 'FullRefresh' : 'Default',
+      ImageRefreshMode: replaceAllMetadata ? 'FullRefresh' : 'Default',
+      ReplaceAllMetadata: String(replaceAllMetadata),
+      ReplaceAllImages: 'false',
+    })
+    return embyFetch<void>(
+      `/emby/Items/${encodeURIComponent(itemId)}/Refresh?${q.toString()}`,
+      { method: 'POST' },
+    )
+  },
+
+  deleteItem: (itemId: string) =>
+    embyFetch<void>(`/emby/Items/${encodeURIComponent(itemId)}`, {
+      method: 'DELETE',
+    }),
+
+  splitItemVersions: (itemId: string) =>
+    embyFetch<void>(`/emby/Videos/${encodeURIComponent(itemId)}/AlternateSources`, {
+      method: 'DELETE',
+    }),
+
+  mergeItemVersions: (itemIds: string[]) =>
+    embyFetch<void>(
+      `/emby/Videos/MergeVersions?Ids=${encodeURIComponent(itemIds.join(','))}`,
+      { method: 'POST' },
+    ),
+
+  remoteSearch: (
+    itemType: 'Movie' | 'Series',
+    query: { Name?: string; Year?: number; ProviderIds?: Record<string, string> },
+  ) =>
+    embyFetch<RemoteSearchResult[]>(`/emby/Items/RemoteSearch/${itemType}`, {
+      method: 'POST',
+      body: JSON.stringify({
+        SearchInfo: {
+          Name: query.Name || undefined,
+          Year: query.Year || undefined,
+          ProviderIds: query.ProviderIds || undefined,
+        },
+      }),
+    }),
+
+  applyRemoteSearch: (
+    itemId: string,
+    result: RemoteSearchResult,
+    replaceAllImages = true,
+  ) => {
+    const q = new URLSearchParams({
+      ReplaceAllImages: String(replaceAllImages),
+    })
+    return embyFetch<void>(
+      `/emby/Items/RemoteSearch/Apply/${encodeURIComponent(itemId)}?${q.toString()}`,
+      {
+        method: 'POST',
+        body: JSON.stringify(result),
+      },
+    )
+  },
+
+  getItemImages: (itemId: string) =>
+    embyFetch<ItemImageInfo[]>(`/emby/Items/${encodeURIComponent(itemId)}/Images`),
+
+  getRemoteImages: (itemId: string, type?: 'Primary' | 'Backdrop') => {
+    const q = new URLSearchParams()
+    if (type) q.set('Type', type)
+    const qs = q.toString()
+    return embyFetch<RemoteImageResult>(
+      `/emby/Items/${encodeURIComponent(itemId)}/RemoteImages${qs ? `?${qs}` : ''}`,
+    )
+  },
+
+  downloadRemoteImage: (
+    itemId: string,
+    type: 'Primary' | 'Backdrop' | string,
+    imageUrl: string,
+  ) => {
+    const q = new URLSearchParams({
+      Type: type,
+      ImageUrl: imageUrl,
+    })
+    return embyFetch<void>(
+      `/emby/Items/${encodeURIComponent(itemId)}/RemoteImages/Download?${q.toString()}`,
+      { method: 'POST' },
+    )
+  },
+
+  uploadItemImage: (
+    itemId: string,
+    type: 'Primary' | 'Backdrop' | string,
+    base64: string,
+    contentType: string,
+  ) => {
+    const cleanBase64 = base64.replace(/^data:[^;]+;base64,/, '')
+    return embyFetch<void>(
+      `/emby/Items/${encodeURIComponent(itemId)}/Images/${encodeURIComponent(type)}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': contentType || 'image/jpeg',
+        },
+        body: cleanBase64,
+      },
+    )
+  },
+
+  setItemImageByUrl: (
+    itemId: string,
+    type: 'Primary' | 'Backdrop' | string,
+    url: string,
+  ) =>
+    embyFetch<void>(
+      `/emby/Items/${encodeURIComponent(itemId)}/Images/${encodeURIComponent(type)}/Url`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ Url: url }),
+      },
+    ),
+
+  deleteItemImage: (
+    itemId: string,
+    type: 'Primary' | 'Backdrop' | string,
+    index = 0,
+  ) =>
+    embyFetch<void>(
+      `/emby/Items/${encodeURIComponent(itemId)}/Images/${encodeURIComponent(type)}/${index}`,
+      { method: 'DELETE' },
+    ),
+
+  getRankings: () => embyFetch<RankingsSummary>('/emby/System/Rankings'),
+
+  refreshRankings: () =>
+    embyFetch<RankingsRefreshResult>('/emby/System/Rankings/Refresh', {
+      method: 'POST',
     }),
 }

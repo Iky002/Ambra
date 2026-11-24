@@ -292,4 +292,100 @@ describe('Demo Mock 引擎 - Serverless 完整闭环测试', () => {
     clearAuth()
     await expect(api.getSystemInfo()).rejects.toMatchObject({ status: 401 })
   })
+
+  it('管理员媒体管理闭环：元数据编辑、图片替换/上传/删除、远端识别、多版本拆分、删除与榜单刷新', async () => {
+    const authRes = await loginAsDemo('admin')
+    const uid = authRes.User.Id
+
+    // 1. 元数据编辑与刷新
+    await api.updateItemMetadata('item-wandering-earth-2', {
+      Name: '流浪地球 2（重映版）',
+      OriginalTitle: 'The Wandering Earth II',
+      ProductionYear: 2023,
+      CommunityRating: 8.8,
+      OfficialRating: 'PG-13',
+      Overview: '更新后的剧情简介内容',
+      Genres: ['科幻', '灾难'],
+      Tags: ['豆瓣Top250', '国产科幻'],
+      ProviderIds: { Tmdb: '842675', Imdb: 'tt22050754', Douban: '35267208' },
+    })
+    const edited = await api.getItem(uid, 'item-wandering-earth-2')
+    expect(edited.Name).toBe('流浪地球 2（重映版）')
+    expect(edited.CommunityRating).toBe(8.8)
+    expect(edited.Genres).toEqual(['科幻', '灾难'])
+    expect(edited.Tags).toContain('豆瓣Top250')
+    expect(edited.ProviderIds?.Douban).toBe('35267208')
+
+    await expect(api.refreshItemMetadata('item-wandering-earth-2', true)).resolves.toBeUndefined()
+
+    // 2. 图片管理：查询、远端下载替换、Base64 上传、URL 替换、删除
+    const initialImgs = await api.getItemImages('item-wandering-earth-2')
+    expect(initialImgs.some((i) => i.ImageType === 'Primary')).toBe(true)
+    expect(initialImgs.some((i) => i.ImageType === 'Backdrop')).toBe(true)
+
+    const remoteImgs = await api.getRemoteImages('item-wandering-earth-2', 'Primary')
+    expect(remoteImgs.Images.length).toBeGreaterThan(1)
+    const candidateUrl = remoteImgs.Images[1].Url
+    await api.downloadRemoteImage('item-wandering-earth-2', 'Primary', candidateUrl)
+    expect(getImageUrl('item-wandering-earth-2', 'Primary')).toBe(candidateUrl)
+
+    const fakeBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
+    await api.uploadItemImage('item-wandering-earth-2', 'Backdrop', fakeBase64, 'image/png')
+    expect(getImageUrl('item-wandering-earth-2', 'Backdrop')).toBe(
+      `data:image/png;base64,${fakeBase64}`,
+    )
+
+    const customUrl = 'https://image.tmdb.org/t/p/w500/oYuLEt3zVCKq57qu2F8dT7NIa6f.jpg'
+    await api.setItemImageByUrl('item-wandering-earth-2', 'Primary', customUrl)
+    expect(getImageUrl('item-wandering-earth-2', 'Primary')).toBe(customUrl)
+
+    await api.deleteItemImage('item-wandering-earth-2', 'Backdrop', 0)
+    const afterDeleteImgs = await api.getItemImages('item-wandering-earth-2')
+    expect(afterDeleteImgs.some((i) => i.ImageType === 'Backdrop')).toBe(false)
+
+    // 3. 远端识别（Identify）与应用
+    const candidates = await api.remoteSearch('Movie', { Name: '盗梦空间', Year: 2010 })
+    expect(candidates.length).toBeGreaterThan(0)
+    expect(candidates[0].Name).toBe('盗梦空间')
+    await api.applyRemoteSearch('item-wandering-earth-2', candidates[0], true)
+    const identified = await api.getItem(uid, 'item-wandering-earth-2')
+    expect(identified.Name).toBe('盗梦空间')
+    expect(identified.ProductionYear).toBe(2010)
+    expect(identified.ProviderIds?.Tmdb).toBe('27205')
+
+    // 4. 多版本拆分与合并
+    const beforeSplit = await api.getItem(uid, 'item-shawshank-redemption')
+    expect(beforeSplit.MediaSources?.length).toBe(2)
+    const beforeTotal = (await api.getItems(uid, { includeItemTypes: 'Movie', limit: 50 }))
+      .TotalRecordCount
+
+    await api.splitItemVersions('item-shawshank-redemption')
+    const afterSplit = await api.getItem(uid, 'item-shawshank-redemption')
+    expect(afterSplit.MediaSources?.length).toBe(1)
+    const afterMovies = await api.getItems(uid, { includeItemTypes: 'Movie', limit: 50 })
+    expect(afterMovies.TotalRecordCount).toBe(beforeTotal + 1)
+
+    const splitChild = afterMovies.Items.find((m) => m.Id.startsWith('item-shawshank-redemption-split-'))
+    expect(splitChild).toBeDefined()
+    await api.mergeItemVersions(['item-shawshank-redemption', splitChild!.Id])
+    const afterMerge = await api.getItem(uid, 'item-shawshank-redemption')
+    expect(afterMerge.MediaSources?.length).toBe(2)
+
+    // 5. 榜单查询与刷新自动打标
+    await api.updateItemMetadata('item-shawshank-redemption', { Tags: [] })
+    const rankingsBefore = await api.getRankings()
+    expect(rankingsBefore.douban_top250.count).toBe(250)
+    expect(rankingsBefore.imdb_top250.count).toBe(250)
+
+    const refreshRes = await api.refreshRankings()
+    expect(refreshRes.matched_items).toBeGreaterThanOrEqual(8)
+    expect(refreshRes.tags_added).toBeGreaterThanOrEqual(2)
+    const retagged = await api.getItem(uid, 'item-shawshank-redemption')
+    expect(retagged.Tags).toContain('豆瓣Top250')
+    expect(retagged.Tags).toContain('IMDb Top250')
+
+    // 6. 删除媒体
+    await api.deleteItem('item-wandering-earth-2')
+    await expect(api.getItem(uid, 'item-wandering-earth-2')).rejects.toMatchObject({ status: 404 })
+  })
 })

@@ -351,3 +351,79 @@ export interface AuthSession {
   isAdmin: boolean
   deviceId: string
 }
+
+export interface ItemMetadataUpdatePayload {
+  Name?: string
+  OriginalTitle?: string
+  SortName?: string
+  ProductionYear?: number
+  CommunityRating?: number
+  OfficialRating?: string
+  Overview?: string
+  Genres?: string[]
+  Tags?: string[]
+  ProviderIds?: Record<string, string>
+}
+
+export interface ItemImageInfo {
+  ImageType: string
+  ImageIndex?: number
+  Path?: string
+  Filename?: string
+  Height?: number
+  Width?: number
+  Size?: number
+  ImageTag?: string
+}
+
+export interface RemoteImageInfo {
+  ProviderName?: string
+  Url: string
+  ThumbnailUrl?: string
+  Height?: number
+  Width?: number
+  CommunityRating?: number
+  VoteCount?: number
+  Language?: string
+  Type: 'Primary' | 'Backdrop' | string
+  RatingType?: string
+}
+
+export interface RemoteImageResult {
+  Images: RemoteImageInfo[]
+  TotalRecordCount: number
+  Providers: string[]
+}
+
+export interface RemoteSearchResult {
+  Name: string
+  ProductionYear?: number
+  PremiereDate?: string
+  ImageUrl?: string
+  BackdropUrl?: string
+  SearchProviderName?: string
+  Overview?: string
+  ProviderIds?: Record<string, string>
+}
+
+export interface RankingsChartSnapshot {
+  chart: string
+  source: string
+  updated_at: string
+  count: number
+}
+
+export interface RankingsSummary {
+  douban_top250: RankingsChartSnapshot
+  imdb_top250: RankingsChartSnapshot
+}
+
+export interface RankingsRefreshResult {
+  douban_count: number
+  douban_error?: string
+  imdb_count: number
+  imdb_error?: string
+  matched_items: number
+  tags_added: number
+  synced_at: string
+}
