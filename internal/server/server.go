@@ -188,7 +188,15 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	pluginAdminH := pluginadmin.New(registry, store)
 	_ = pluginAdminH.ApplySavedConfigs(ctx)
 
-	systemHandler := system.NewHandler(cfg, userRepo, registry)
+	systemHandler := system.NewHandler(cfg, userRepo, registry).WithSetupDeps(system.SetupDeps{
+		Auth: authSvc,
+		TriggerScan: func(c context.Context) {
+			_, _ = sc.ScanAll(c)
+		},
+		SyncRankings: func(c context.Context) {
+			_, _ = rankingsSvc.SyncAndApply(c)
+		},
+	})
 	usersHandler := users.NewHandler(authSvc, userRepo, sessionMgr, wsHub, cfg)
 
 	userIDFromCtx := func(c context.Context) string {
@@ -338,6 +346,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 
 	wsHub.RegisterRoutes(r)
 	system.RegisterRoutes(r, authMW, systemHandler)
+	system.RegisterSetupRoutes(r, authMW, systemHandler)
 	users.RegisterRoutes(r, authMW, usersHandler)
 
 	// Serve Ambra vector favicon at root

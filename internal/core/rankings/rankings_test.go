@@ -1475,6 +1475,7 @@ func (fn roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 
 func TestFetchIMDbTop250BuiltinFallbackAndHeaders(t *testing.T) {
 	t.Setenv(EnvIMDb250URL, "")
+	t.Setenv(EnvIMDb250MirrorURL, "")
 	ctx := context.Background()
 
 	cases := []struct {
@@ -1484,17 +1485,16 @@ func TestFetchIMDbTop250BuiltinFallbackAndHeaders(t *testing.T) {
 		{
 			name: "aws-waf-202",
 			transport: func(r *http.Request) (*http.Response, error) {
-				if r.URL.String() != DefaultIMDbTop250URL {
-					t.Errorf("unexpected URL: %s", r.URL.String())
-				}
-				if r.Header.Get("User-Agent") == "" {
-					t.Errorf("expected User-Agent header")
-				}
-				if r.Header.Get("Accept") == "" {
-					t.Errorf("expected Accept header")
-				}
-				if r.Header.Get("Accept-Language") != "en-US,en;q=0.9" {
-					t.Errorf("expected Accept-Language en-US,en;q=0.9, got %q", r.Header.Get("Accept-Language"))
+				if r.URL.String() == DefaultIMDbTop250URL {
+					if r.Header.Get("User-Agent") == "" {
+						t.Errorf("expected User-Agent header")
+					}
+					if r.Header.Get("Accept") == "" {
+						t.Errorf("expected Accept header")
+					}
+					if r.Header.Get("Accept-Language") != "en-US,en;q=0.9" {
+						t.Errorf("expected Accept-Language en-US,en;q=0.9, got %q", r.Header.Get("Accept-Language"))
+					}
 				}
 				return &http.Response{
 					StatusCode: http.StatusAccepted,
@@ -1698,6 +1698,221 @@ func TestSyncAndApplyIMDbFallbackAndLivePreservation(t *testing.T) {
 	st3 := svc.Status(false)
 	if st3.IMDbTop250.Source != DefaultIMDbTop250URL || sum3.IMDbCount != 1 {
 		t.Fatalf("expected existing live IMDb snapshot preserved, got status=%+v sum=%+v", st3.IMDbTop250, sum3)
+	}
+}
+
+func TestFetchIMDbTop250ThreeTierFallbackChain(t *testing.T) {
+	t.Setenv(EnvIMDb250URL, "")
+	t.Setenv(EnvIMDb250MirrorURL, "")
+	ctx := context.Background()
+
+	mirrorPayload := `[
+		{
+			"@type": "Movie",
+			"url": "/title/tt0111161/",
+			"name": "The Shawshank Redemption",
+			"alternateName": "肖申克的救赎",
+			"datePublished": "1994-10-14",
+			"aggregateRating": {"ratingValue": 9.3}
+		},
+		{
+			"@type": "Movie",
+			"url": "https://www.imdb.com/title/TT0068646/",
+			"name": "The Godfather &amp; Family",
+			"datePublished": "1972-03-24",
+			"aggregateRating": {"ratingValue": "9.2"}
+		},
+		{
+			"@type": "Movie",
+			"url": "/title/tt0111161/",
+			"name": "Duplicate Shawshank",
+			"datePublished": "1994-10-14",
+			"aggregateRating": {"ratingValue": 9.3}
+		}
+	]`
+
+	wafSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`<html><body>AWS WAF</body></html>`))
+	}))
+	defer wafSrv.Close()
+
+	mirror1FailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer mirror1FailSrv.Close()
+
+	mirrorBadJSONSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{corrupted`))
+	}))
+	defer mirrorBadJSONSrv.Close()
+
+	mirrorOKSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(mirrorPayload))
+	}))
+	defer mirrorOKSrv.Close()
+
+	// 1. Tier 1 fails (HTTP 202 WAF) -> Tier 2 mirror succeeds (schema.org JSON array).
+	t.Run("tier1-202-tier2-mirror-success", func(t *testing.T) {
+		f := NewFetcher(Options{
+			IMDbURL:        wafSrv.URL,
+			IMDbMirrorURLs: []string{mirrorOKSrv.URL},
+		})
+		snap, err := f.FetchIMDbTop250(ctx)
+		if err != nil {
+			t.Fatalf("FetchIMDbTop250 failed: %v", err)
+		}
+		if snap.Chart != ChartIMDbTop250 || snap.Source != SourceIMDbTop250Mirror {
+			t.Fatalf("expected SourceIMDbTop250Mirror, got %+v", snap)
+		}
+		if snap.Count != 2 || len(snap.Entries) != 2 {
+			t.Fatalf("expected 2 deduplicated entries, got count=%d len=%d", snap.Count, len(snap.Entries))
+		}
+		e0 := snap.Entries[0]
+		if e0.Rank != 1 || e0.IMDbID != "tt0111161" || e0.Title != "The Shawshank Redemption" ||
+			e0.OriginalTitle != "肖申克的救赎" || e0.Year != 1994 || e0.Rating != 9.3 {
+			t.Fatalf("unexpected entry[0]: %+v", e0)
+		}
+		e1 := snap.Entries[1]
+		if e1.Rank != 2 || e1.IMDbID != "tt0068646" || e1.Title != "The Godfather & Family" ||
+			e1.Year != 1972 || e1.Rating != 9.2 {
+			t.Fatalf("unexpected entry[1]: %+v", e1)
+		}
+	})
+
+	// 2. Tier 1 fails -> Mirror 1 fails (503) & Mirror 2 returns bad JSON -> Mirror 3 succeeds.
+	t.Run("tier1-fail-mirror1-503-mirror2-success", func(t *testing.T) {
+		f := NewFetcher(Options{
+			IMDbURL:        wafSrv.URL,
+			IMDbMirrorURLs: []string{mirror1FailSrv.URL, mirrorBadJSONSrv.URL, mirrorOKSrv.URL},
+		})
+		snap, err := f.FetchIMDbTop250(ctx)
+		if err != nil {
+			t.Fatalf("FetchIMDbTop250 failed: %v", err)
+		}
+		if snap.Source != SourceIMDbTop250Mirror || snap.Count != 2 {
+			t.Fatalf("expected mirror fallback to succeed on second working mirror, got %+v", snap)
+		}
+	})
+
+	// 3. Tier 1 fails -> All mirrors fail -> Tier 3 builtin fallback succeeds.
+	t.Run("tier1-fail-all-mirrors-fail-tier3-builtin", func(t *testing.T) {
+		f := NewFetcher(Options{
+			IMDbURL:        wafSrv.URL,
+			IMDbMirrorURLs: []string{mirror1FailSrv.URL, mirrorBadJSONSrv.URL},
+		})
+		snap, err := f.FetchIMDbTop250(ctx)
+		if err != nil {
+			t.Fatalf("FetchIMDbTop250 failed: %v", err)
+		}
+		if snap.Chart != ChartIMDbTop250 || snap.Source != SourceIMDbTop250Builtin || snap.Count < 100 {
+			t.Fatalf("expected Tier 3 builtin fallback, got chart=%q source=%q count=%d", snap.Chart, snap.Source, snap.Count)
+		}
+	})
+
+	// 4. Env var AMBRA_IMDB250_MIRROR_URL (comma-separated) works with default IMDb URL.
+	t.Run("env-var-mirror-urls", func(t *testing.T) {
+		t.Setenv(EnvIMDb250MirrorURL, mirror1FailSrv.URL+", "+mirrorOKSrv.URL)
+		f := NewFetcher(Options{IMDbURL: wafSrv.URL})
+		snap, err := f.FetchIMDbTop250(ctx)
+		if err != nil {
+			t.Fatalf("FetchIMDbTop250 via env mirror failed: %v", err)
+		}
+		if snap.Source != SourceIMDbTop250Mirror || snap.Count != 2 {
+			t.Fatalf("expected mirror snapshot via env var, got %+v", snap)
+		}
+	})
+
+	// 5. Default IMDb URL blocked (202) -> default mirror URL succeeds via custom RoundTripper.
+	t.Run("default-url-falls-back-to-default-mirror", func(t *testing.T) {
+		var sawDefaultMirror atomic.Bool
+		client := &http.Client{
+			Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.URL.String() == DefaultIMDbTop250URL {
+					return &http.Response{
+						StatusCode: http.StatusAccepted,
+						Header:     http.Header{"Content-Type": []string{"text/html"}},
+						Body:       io.NopCloser(strings.NewReader("waf")),
+					}, nil
+				}
+				if r.URL.String() == DefaultIMDbTop250MirrorURLs[0] {
+					sawDefaultMirror.Store(true)
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(mirrorPayload)),
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusNotFound,
+					Header:     http.Header{},
+					Body:       io.NopCloser(strings.NewReader("not found")),
+				}, nil
+			}),
+		}
+		f := NewFetcher(Options{HTTPClient: client})
+		snap, err := f.FetchIMDbTop250(ctx)
+		if err != nil {
+			t.Fatalf("FetchIMDbTop250 failed: %v", err)
+		}
+		if !sawDefaultMirror.Load() {
+			t.Fatal("expected request to first default IMDb mirror URL")
+		}
+		if snap.Source != SourceIMDbTop250Mirror || snap.Count != 2 {
+			t.Fatalf("unexpected snapshot: %+v", snap)
+		}
+	})
+}
+
+func TestParseIMDbMirrorJSONEdgeCases(t *testing.T) {
+	// Empty payload
+	if _, err := parseIMDbMirrorJSON(nil); err == nil {
+		t.Fatal("expected error for empty payload")
+	}
+	// Non-JSON payload
+	if _, err := parseIMDbMirrorJSON([]byte(`<html>not json</html>`)); err == nil {
+		t.Fatal("expected error for non-JSON payload")
+	}
+	// Invalid JSON array / object
+	if _, err := parseIMDbMirrorJSON([]byte(`[invalid`)); err == nil {
+		t.Fatal("expected error for invalid JSON array")
+	}
+	if _, err := parseIMDbMirrorJSON([]byte(`{invalid`)); err == nil {
+		t.Fatal("expected error for invalid JSON object")
+	}
+	// Missing IMDb IDs -> 0 valid entries -> error
+	if _, err := parseIMDbMirrorJSON([]byte(`[{"name":"No ID Movie","datePublished":"2020-01-01"}]`)); err == nil {
+		t.Fatal("expected error when all entries lack IMDb ID")
+	}
+
+	// {"items":[...]} with ChartEntry-style fields, missing IMDb IDs, and duplicates
+	itemsPayload := `{"items":[
+		{"id":"tt0468569","title":"The Dark Knight","original_title":"The Dark Knight","year":2008,"rating":9.0,"tmdb_id":"155"},
+		{"title":"Missing ID","year":2000},
+		{"imdb_id":"TT0468569","title":"Duplicate Dark Knight","year":2008},
+		{"imdb_id":"tt0137523","title":"Fight Club","year":1999,"rating":"8.8"}
+	]}`
+	entries, err := parseIMDbMirrorJSON([]byte(itemsPayload))
+	if err != nil {
+		t.Fatalf("parseIMDbMirrorJSON items failed: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 valid deduplicated entries, got %d: %+v", len(entries), entries)
+	}
+	if entries[0].Rank != 1 || entries[0].IMDbID != "tt0468569" || entries[0].Year != 2008 || entries[0].Rating != 9.0 || entries[0].TMDBID != "155" {
+		t.Fatalf("unexpected entry[0]: %+v", entries[0])
+	}
+	if entries[1].Rank != 2 || entries[1].IMDbID != "tt0137523" || entries[1].Title != "Fight Club" || entries[1].Rating != 8.8 {
+		t.Fatalf("unexpected entry[1]: %+v", entries[1])
+	}
+
+	// {"entries":[...]} wrapper
+	entriesPayload := `{"entries":[{"url":"/title/tt0109830/","name":"Forrest Gump","datePublished":"1994-07-06","aggregateRating":{"ratingValue":8.8}}]}`
+	entries2, err := parseIMDbMirrorJSON([]byte(entriesPayload))
+	if err != nil || len(entries2) != 1 || entries2[0].IMDbID != "tt0109830" || entries2[0].Year != 1994 || entries2[0].Rating != 8.8 {
+		t.Fatalf("unexpected entries wrapper parse: err=%v entries=%+v", err, entries2)
 	}
 }
 

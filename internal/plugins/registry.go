@@ -108,6 +108,13 @@ func (r *Registry) Register(p Plugin) {
 	r.plugins[p.Manifest().ID] = p
 }
 
+func (r *Registry) Get(id string) (Plugin, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	p, ok := r.plugins[id]
+	return p, ok
+}
+
 func (r *Registry) List() []Manifest {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
