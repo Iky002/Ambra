@@ -15,7 +15,10 @@ import (
 	"github.com/ambra-media/ambra/internal/core/auth"
 )
 
-const tmdbPluginID = "ambra.builtin.tmdb"
+const (
+	tmdbPluginID = "ambra.builtin.tmdb"
+	strmPluginID = "ambra.builtin.strm"
+)
 
 // SetupDeps holds optional dependencies used by the Setup Wizard endpoints.
 type SetupDeps struct {
@@ -68,6 +71,17 @@ func (h *Handler) syncTMDBPlugin() {
 		_ = p.Configure(map[string]any{
 			"api_key":  h.cfg.TMDBApiKey,
 			"language": h.cfg.TMDBLanguage,
+		})
+	}
+}
+
+func (h *Handler) syncSTRMPlugin() {
+	if h.registry == nil || h.cfg == nil {
+		return
+	}
+	if p, ok := h.registry.Get(strmPluginID); ok {
+		_ = p.Configure(map[string]any{
+			"enable_302": h.cfg.EnableSTRM302,
 		})
 	}
 }
@@ -132,6 +146,7 @@ func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 	if tmdbLangChanged {
 		h.syncTMDBPlugin()
+	h.syncSTRMPlugin()
 	}
 
 	ctx := r.Context()
@@ -206,6 +221,7 @@ func (h *Handler) CompleteSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.syncTMDBPlugin()
+	h.syncSTRMPlugin()
 
 	if req.TriggerScan && h.setup.TriggerScan != nil {
 		go h.setup.TriggerScan(context.Background())

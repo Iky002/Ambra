@@ -57,6 +57,7 @@ type EnqueueAuditInput struct {
 type LockedFieldsResult struct {
 	ItemID       string   `json:"ItemId"`
 	LockedFields []string `json:"LockedFields"`
+	LockData     bool     `json:"LockData"`
 }
 
 // NFOWriteResult summarizes the result of an atomic NFO writeback.

@@ -106,7 +106,7 @@ type ParsedEpisode struct {
 func ParseEpisodePath(rootDir, mediaPath string, forceTV bool) ParsedEpisode {
 	base := strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath))
 	var seasonNum, epNum int
-	var matched bool
+	var matched, isSpecialsDir bool
 	var epTitle string
 
 	if m := reSeasonEpisode.FindStringSubmatchIndex(base); m != nil {
@@ -133,12 +133,24 @@ func ParseEpisodePath(rootDir, mediaPath string, forceTV bool) ParsedEpisode {
 	seasonDir := ""
 	seriesDir := fileDir
 
-	// Check if immediate parent directory is a Season directory (e.g., "Season 01", "S01", "第1季")
+	// Check if immediate parent directory is a Season directory (e.g., "Season 01", "S01", "第1季", "Specials")
 	parentBase := filepath.Base(fileDir)
 	if m := reSeasonDir.FindStringSubmatch(parentBase); m != nil {
+		dirNum, _ := strconv.Atoi(m[1])
 		if !matched || seasonNum == 0 {
-			seasonNum, _ = strconv.Atoi(m[1])
+			seasonNum = dirNum
 		}
+		if dirNum == 0 {
+			isSpecialsDir = true
+		}
+		seasonDir = fileDir
+		seriesDir = filepath.Dir(fileDir)
+		matched = true
+	} else if strings.EqualFold(strings.TrimSpace(parentBase), "Specials") {
+		if !matched || seasonNum == 0 {
+			seasonNum = 0
+		}
+		isSpecialsDir = true
 		seasonDir = fileDir
 		seriesDir = filepath.Dir(fileDir)
 		matched = true
@@ -159,7 +171,7 @@ func ParseEpisodePath(rootDir, mediaPath string, forceTV bool) ParsedEpisode {
 	if seriesName == "" {
 		seriesName = filepath.Base(seriesDir)
 	}
-	if seasonNum == 0 {
+	if seasonNum == 0 && !isSpecialsDir {
 		seasonNum = 1
 	}
 	if epTitle == "" && epNum > 0 {

@@ -16,6 +16,7 @@ import (
 	"github.com/ambra-media/ambra/internal/core/imaging"
 	"github.com/ambra-media/ambra/internal/core/scanner"
 	"github.com/ambra-media/ambra/internal/core/transcode"
+	"github.com/ambra-media/ambra/internal/core/watcher"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
@@ -33,6 +34,7 @@ type AuthFuncs struct {
 type Handler struct {
 	repo       *sqlite.LibraryRepo
 	scanner    *scanner.Scanner
+	watcher    *watcher.Watcher
 	imaging    *imaging.Service
 	registry   *plugins.Registry
 	store      *sqlite.Store
@@ -62,6 +64,11 @@ func New(
 	}
 }
 
+// SetWatcher attaches a filesystem Watcher so library path edits and deletions dynamically update watches.
+func (h *Handler) SetWatcher(w *watcher.Watcher) {
+	h.watcher = w
+}
+
 // SetExtractor overrides the embedded subtitle & font extractor used by compatmedia endpoints.
 func (h *Handler) SetExtractor(ext *transcode.Extractor) {
 	h.extractor = ext
@@ -76,7 +83,7 @@ func (h *Handler) getHTTPClient() *http.Client {
 	if h.httpClient != nil {
 		return h.httpClient
 	}
-	return &http.Client{Timeout: 15 * time.Second}
+	return newSafeRemoteHTTPClient()
 }
 
 // BuildRouter builds an isolated chi.Router containing all 21 media-domain route prefixes

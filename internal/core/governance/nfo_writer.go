@@ -39,12 +39,17 @@ type nfoDocument struct {
 // SetLockedFields stores the list of protected metadata fields in items.extra_json
 // under the "LockedFields" key so future rescans do not overwrite them.
 func (s *Service) SetLockedFields(ctx context.Context, itemID string, fields []string) (*LockedFieldsResult, error) {
+	cleaned := normalizeLockedFields(fields)
+	return s.SetLockState(ctx, itemID, cleaned, nil)
+}
+
+// SetLockState updates LockedFields (when fields != nil) and/or global LockData (when lockData != nil)
+// in items.extra_json so future rescans respect both field-level and whole-item metadata locks.
+func (s *Service) SetLockState(ctx context.Context, itemID string, fields []string, lockData *bool) (*LockedFieldsResult, error) {
 	itemID = guid.Normalize(itemID)
 	if itemID == "" {
 		return nil, fmt.Errorf("%w: item id is required", ErrInvalidArgument)
 	}
-
-	cleaned := normalizeLockedFields(fields)
 
 	var extraRaw string
 	err := s.store.Reader.QueryRowContext(ctx,
@@ -58,7 +63,23 @@ func (s *Service) SetLockedFields(ctx context.Context, itemID string, fields []s
 	}
 
 	extra := decodeExtraMap(extraRaw)
-	extra["LockedFields"] = cleaned
+	var currentFields []string
+	if fields != nil {
+		currentFields = normalizeLockedFields(fields)
+		extra["LockedFields"] = currentFields
+	} else {
+		currentFields = extractLockedFields(extra)
+		if lockData == nil {
+			currentFields = []string{}
+			extra["LockedFields"] = currentFields
+		}
+	}
+
+	currentLockData := extractLockData(extra)
+	if lockData != nil {
+		currentLockData = *lockData
+		extra["LockData"] = currentLockData
+	}
 
 	encoded, err := json.Marshal(extra)
 	if err != nil {
@@ -75,8 +96,18 @@ func (s *Service) SetLockedFields(ctx context.Context, itemID string, fields []s
 
 	return &LockedFieldsResult{
 		ItemID:       itemID,
-		LockedFields: cleaned,
+		LockedFields: currentFields,
+		LockData:     currentLockData,
 	}, nil
+}
+
+func extractLockData(extra map[string]any) bool {
+	if raw, ok := extra["LockData"]; ok {
+		if b, ok := raw.(bool); ok {
+			return b
+		}
+	}
+	return false
 }
 
 // GetLockedFields reads the locked metadata fields stored in items.extra_json.

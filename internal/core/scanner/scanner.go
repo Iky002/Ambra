@@ -780,8 +780,17 @@ func (s *Scanner) ensureSeason(
 	if rec, ok := cache[key]; ok {
 		return rec, nil, nil
 	}
+	seriesDir := epInfo.SeriesDir
+	if seriesDir == "" {
+		seriesDir = series.Path
+	}
 	if existingByNum, err := s.repo.FindSeasonByNumber(ctx, series.ID, epInfo.SeasonNumber); err == nil && existingByNum != nil {
 		cache[key] = existingByNum
+		if s.isMissingPrimaryImage(ctx, existingByNum.ID) {
+			if imgs := discoverSeasonImages(existingByNum.ID, epInfo.SeasonNumber, epInfo.SeasonDir, seriesDir); len(imgs) > 0 {
+				_ = s.repo.ReplaceItemImages(ctx, existingByNum.ID, imgs)
+			}
+		}
 		var task *enrichTask
 		if s.hasOnlineMetadataProviders() && s.isMissingPrimaryImage(ctx, existingByNum.ID) {
 			task = s.maybeBuildSeasonEnrichTask(lib.ID, series, existingByNum, epInfo.SeasonNumber, seenEnrich)
@@ -796,6 +805,11 @@ func (s *Scanner) ensureSeason(
 	existing, err := s.repo.FindItemByPath(ctx, lib.ID, seasonPath)
 	if err == nil && existing != nil {
 		cache[key] = existing
+		if s.isMissingPrimaryImage(ctx, existing.ID) {
+			if imgs := discoverSeasonImages(existing.ID, epInfo.SeasonNumber, epInfo.SeasonDir, seriesDir); len(imgs) > 0 {
+				_ = s.repo.ReplaceItemImages(ctx, existing.ID, imgs)
+			}
+		}
 		var task *enrichTask
 		if s.hasOnlineMetadataProviders() && s.isMissingPrimaryImage(ctx, existing.ID) {
 			task = s.maybeBuildSeasonEnrichTask(lib.ID, series, existing, epInfo.SeasonNumber, seenEnrich)
@@ -833,11 +847,9 @@ func (s *Scanner) ensureSeason(
 	}); err != nil {
 		return nil, nil, err
 	}
-	if epInfo.SeasonDir != "" {
-		imgs := discoverLocalImages(rec.ID, "", epInfo.SeasonDir, false)
-		if len(imgs) > 0 {
-			_ = s.repo.ReplaceItemImages(ctx, rec.ID, imgs)
-		}
+	imgs := discoverSeasonImages(rec.ID, epInfo.SeasonNumber, epInfo.SeasonDir, seriesDir)
+	if len(imgs) > 0 {
+		_ = s.repo.ReplaceItemImages(ctx, rec.ID, imgs)
 	}
 	cache[key] = rec
 
@@ -1236,6 +1248,83 @@ func discoverLocalImages(itemID, mediaPath, dir string, episodeOnly bool) []sqli
 			addImg("Logo", fullPath)
 		case stem == "thumb" || stem == "landscape" || (mediaStem != "" && stem == mediaStem+"-thumb"):
 			addImg("Thumb", fullPath)
+		}
+	}
+	return out
+}
+
+// discoverSeasonImages scans both the season subfolder (if distinct from seriesDir)
+// and the parent Series directory for Kodi/Emby season artwork naming conventions:
+// season{NN}-poster.*, season-specials-poster.*, season{NN}-fanart.*, etc.
+func discoverSeasonImages(itemID string, seasonNum int, seasonDir, seriesDir string) []sqlite.ImageRecord {
+	var out []sqlite.ImageRecord
+	seenType := make(map[string]int)
+
+	if seasonDir != "" && filepath.Clean(seasonDir) != filepath.Clean(seriesDir) {
+		for _, img := range discoverLocalImages(itemID, "", seasonDir, false) {
+			out = append(out, img)
+			if img.ImageIndex+1 > seenType[img.ImageType] {
+				seenType[img.ImageType] = img.ImageIndex + 1
+			}
+		}
+	}
+
+	if seriesDir == "" {
+		return out
+	}
+	entries, err := os.ReadDir(seriesDir)
+	if err != nil {
+		return out
+	}
+
+	addImg := func(imgType, fullPath string) {
+		info, err := os.Stat(fullPath)
+		if err != nil {
+			return
+		}
+		idx := seenType[imgType]
+		if imgType != "Backdrop" && idx > 0 {
+			return
+		}
+		seenType[imgType] = idx + 1
+		out = append(out, sqlite.ImageRecord{
+			ItemID:     itemID,
+			ImageType:  imgType,
+			ImageIndex: idx,
+			Path:       fullPath,
+			Tag:        computeEtag(fullPath, info.Size(), info.ModTime().Unix()),
+		})
+	}
+
+	var prefixes []string
+	if seasonNum == 0 {
+		prefixes = []string{"season-specials", "season00", "season0"}
+	} else {
+		padded := fmt.Sprintf("season%02d", seasonNum)
+		unpadded := fmt.Sprintf("season%d", seasonNum)
+		prefixes = []string{padded}
+		if unpadded != padded {
+			prefixes = append(prefixes, unpadded)
+		}
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !IsImageFile(entry.Name()) {
+			continue
+		}
+		stem := strings.ToLower(strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name())))
+		fullPath := filepath.Join(seriesDir, entry.Name())
+		for _, pfx := range prefixes {
+			switch stem {
+			case pfx + "-poster":
+				addImg("Primary", fullPath)
+			case pfx + "-fanart", pfx + "-backdrop":
+				addImg("Backdrop", fullPath)
+			case pfx + "-landscape", pfx + "-thumb":
+				addImg("Thumb", fullPath)
+			case pfx + "-banner":
+				addImg("Banner", fullPath)
+			}
 		}
 	}
 	return out
