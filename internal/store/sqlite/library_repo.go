@@ -27,6 +27,33 @@ type LibraryRecord struct {
 	UpdatedAt      int64
 }
 
+// ParseLibraryOptions parses a library's options_json into a map and applies
+// defaults (SaveLocalMetadata defaults to true when omitted).
+func ParseLibraryOptions(raw string) map[string]any {
+	opts := make(map[string]any)
+	raw = strings.TrimSpace(raw)
+	if raw != "" && raw != "{}" {
+		_ = json.Unmarshal([]byte(raw), &opts)
+	}
+	if _, ok := opts["SaveLocalMetadata"]; !ok {
+		opts["SaveLocalMetadata"] = true
+	}
+	return opts
+}
+
+// SaveLocalMetadataEnabled reports whether scraped NFO and artwork should be
+// saved alongside media files for this library (defaults to true).
+func (l *LibraryRecord) SaveLocalMetadataEnabled() bool {
+	if l == nil {
+		return true
+	}
+	opts := ParseLibraryOptions(l.OptionsJSON)
+	if v, ok := opts["SaveLocalMetadata"].(bool); ok {
+		return v
+	}
+	return true
+}
+
 // ItemExtra is stored as JSON in items.extra_json.
 type ItemExtra struct {
 	Overview                string            `json:"overview,omitempty"`
@@ -241,7 +268,7 @@ func (r *LibraryRepo) CreateLibrary(ctx context.Context, name, collectionType st
 		Name:           name,
 		CollectionType: collectionType,
 		Paths:          paths,
-		OptionsJSON:    "{}",
+		OptionsJSON:    `{"SaveLocalMetadata":true}`,
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}
@@ -304,6 +331,35 @@ func (r *LibraryRepo) GetLibrary(ctx context.Context, id string) (*LibraryRecord
 		rec.Paths = []string{}
 	}
 	return &rec, nil
+}
+
+// UpdateLibraryOptions merges opts into the library's existing options_json and persists it.
+func (r *LibraryRepo) UpdateLibraryOptions(ctx context.Context, id string, opts map[string]any) (*LibraryRecord, error) {
+	lib, err := r.GetLibrary(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	merged := ParseLibraryOptions(lib.OptionsJSON)
+	for k, v := range opts {
+		merged[k] = v
+	}
+	if _, ok := merged["SaveLocalMetadata"]; !ok {
+		merged["SaveLocalMetadata"] = true
+	}
+	raw, err := json.Marshal(merged)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().Unix()
+	if _, err := r.store.Writer.ExecContext(ctx,
+		`UPDATE libraries SET options_json = ?, updated_at = ? WHERE id = ?`,
+		string(raw), now, lib.ID,
+	); err != nil {
+		return nil, err
+	}
+	lib.OptionsJSON = string(raw)
+	lib.UpdatedAt = now
+	return lib, nil
 }
 
 func (r *LibraryRepo) DeleteLibrary(ctx context.Context, id string) error {

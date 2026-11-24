@@ -574,10 +574,11 @@ func (h *Handler) handleUnmarkFavorite(w http.ResponseWriter, r *http.Request) {
 }
 
 type virtualFolderDTO struct {
-	Name           string   `json:"Name"`
-	Locations      []string `json:"Locations"`
-	CollectionType string   `json:"CollectionType"`
-	ItemId         string   `json:"ItemId"`
+	Name           string         `json:"Name"`
+	Locations      []string       `json:"Locations"`
+	CollectionType string         `json:"CollectionType"`
+	ItemId         string         `json:"ItemId"`
+	LibraryOptions map[string]any `json:"LibraryOptions,omitempty"`
 }
 
 func (h *Handler) handleListVirtualFolders(w http.ResponseWriter, r *http.Request) {
@@ -599,6 +600,7 @@ func (h *Handler) handleListVirtualFolders(w http.ResponseWriter, r *http.Reques
 			Locations:      lib.Paths,
 			CollectionType: lib.CollectionType,
 			ItemId:         lib.ID,
+			LibraryOptions: sqlite.ParseLibraryOptions(lib.OptionsJSON),
 		})
 	}
 	httpx.JSON(w, http.StatusOK, out)
@@ -607,14 +609,10 @@ func (h *Handler) handleListVirtualFolders(w http.ResponseWriter, r *http.Reques
 func (h *Handler) handleCreateVirtualFolder(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	var body struct {
-		Name           string   `json:"Name"`
-		CollectionType string   `json:"CollectionType"`
-		Paths          []string `json:"Paths"`
-		LibraryOptions struct {
-			PathInfos []struct {
-				Path string `json:"Path"`
-			} `json:"PathInfos"`
-		} `json:"LibraryOptions"`
+		Name           string         `json:"Name"`
+		CollectionType string         `json:"CollectionType"`
+		Paths          []string       `json:"Paths"`
+		LibraryOptions map[string]any `json:"LibraryOptions"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 
@@ -634,10 +632,16 @@ func (h *Handler) handleCreateVirtualFolder(w http.ResponseWriter, r *http.Reque
 	if len(paths) == 0 {
 		paths = body.Paths
 	}
-	if len(paths) == 0 {
-		for _, pi := range body.LibraryOptions.PathInfos {
-			if p := strings.TrimSpace(pi.Path); p != "" {
-				paths = append(paths, p)
+	if len(paths) == 0 && body.LibraryOptions != nil {
+		if rawInfos, ok := body.LibraryOptions["PathInfos"].([]any); ok {
+			for _, entry := range rawInfos {
+				if m, ok := entry.(map[string]any); ok {
+					if p, ok := m["Path"].(string); ok {
+						if trimmed := strings.TrimSpace(p); trimmed != "" {
+							paths = append(paths, trimmed)
+						}
+					}
+				}
 			}
 		}
 	}
@@ -646,6 +650,20 @@ func (h *Handler) handleCreateVirtualFolder(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if len(body.LibraryOptions) > 0 {
+		optsToSave := make(map[string]any, len(body.LibraryOptions))
+		for k, v := range body.LibraryOptions {
+			if k == "PathInfos" {
+				continue
+			}
+			optsToSave[k] = v
+		}
+		if len(optsToSave) > 0 {
+			if updated, optErr := h.repo.UpdateLibraryOptions(r.Context(), lib.ID, optsToSave); optErr == nil && updated != nil {
+				lib = updated
+			}
+		}
 	}
 	if h.watcher != nil {
 		_ = h.watcher.WatchLibrary(lib.ID, lib.Paths)
@@ -658,6 +676,7 @@ func (h *Handler) handleCreateVirtualFolder(w http.ResponseWriter, r *http.Reque
 		Locations:      lib.Paths,
 		CollectionType: lib.CollectionType,
 		ItemId:         lib.ID,
+		LibraryOptions: sqlite.ParseLibraryOptions(lib.OptionsJSON),
 	})
 }
 
