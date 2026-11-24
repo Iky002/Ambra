@@ -5,14 +5,20 @@ import { useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
 import type { BaseItemDto } from '../api/types'
 import { MediaCard } from '../components/MediaCard'
+import { QueryErrorState } from '../components/QueryErrorState'
 import { useAuth } from '../context/AuthContext'
 
-type SearchTypeFilter = 'all' | 'Movie' | 'Series' | 'Person' | 'BoxSet'
+type SearchTypeFilter = 'all' | 'Movie' | 'Series' | 'Music' | 'Person' | 'BoxSet'
 
 const TYPE_PILLS: Array<{ id: SearchTypeFilter; label: string; includeItemTypes: string }> = [
-  { id: 'all', label: '全部', includeItemTypes: 'Movie,Series,Episode,BoxSet,Person' },
+  {
+    id: 'all',
+    label: '全部',
+    includeItemTypes: 'Movie,Series,Episode,BoxSet,Person,MusicArtist,MusicAlbum,Audio,Playlist',
+  },
   { id: 'Movie', label: '电影', includeItemTypes: 'Movie' },
   { id: 'Series', label: '剧集', includeItemTypes: 'Series,Episode' },
+  { id: 'Music', label: '音乐', includeItemTypes: 'MusicAlbum,MusicArtist,Audio' },
   { id: 'Person', label: '演职员', includeItemTypes: 'Person' },
   { id: 'BoxSet', label: '合集', includeItemTypes: 'BoxSet' },
 ]
@@ -30,25 +36,35 @@ function resolveSearchItemLink(item: BaseItemDto): string | undefined {
 export function SearchPage() {
   const { auth } = useAuth()
   const [searchParams, setSearchParams] = useSearchParams()
-  const [input, setInput] = useState(searchParams.get('q') || '')
-  const [debounced, setDebounced] = useState(input)
+  const urlQuery = searchParams.get('q') || ''
+  const [input, setInput] = useState(urlQuery)
+  const [debounced, setDebounced] = useState(urlQuery.trim())
   const [typeFilter, setTypeFilter] = useState<SearchTypeFilter>('all')
+
+  // 同步外部 URL ?q= 变化（例如在 /search 页通过 ⌘K 触发新搜索）
+  useEffect(() => {
+    setInput(urlQuery)
+    setDebounced(urlQuery.trim())
+  }, [urlQuery])
 
   useEffect(() => {
     const t = window.setTimeout(() => {
-      setDebounced(input.trim())
-      if (input.trim()) {
-        setSearchParams({ q: input.trim() }, { replace: true })
-      } else {
-        setSearchParams({}, { replace: true })
+      const trimmed = input.trim()
+      setDebounced(trimmed)
+      if (trimmed !== urlQuery) {
+        if (trimmed) {
+          setSearchParams({ q: trimmed }, { replace: true })
+        } else {
+          setSearchParams({}, { replace: true })
+        }
       }
     }, 250)
     return () => window.clearTimeout(t)
-  }, [input, setSearchParams])
+  }, [input, urlQuery, setSearchParams])
 
   const activePill = TYPE_PILLS.find((p) => p.id === typeFilter) || TYPE_PILLS[0]
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['searchItems', auth?.userId, debounced, activePill.includeItemTypes],
     queryFn: () =>
       api.getItems(auth!.userId, {
@@ -107,6 +123,13 @@ export function SearchPage() {
         <div className="flex h-48 items-center justify-center">
           <Loader2 className="h-7 w-7 animate-spin text-amber-400" />
         </div>
+      ) : isError ? (
+        <QueryErrorState
+          compact
+          title="搜索请求失败"
+          error={error}
+          onRetry={() => void refetch()}
+        />
       ) : items.length === 0 ? (
         <div className="rounded-2xl border border-white/6 bg-white/[0.02] py-16 text-center text-sm text-zinc-500">
           未找到与 “{debounced}” 相关的结果

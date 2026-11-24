@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
@@ -51,9 +52,10 @@ type LyricDto struct {
 
 // Handler serves audio direct streams, universal audio streaming/transcoding, and lyrics.
 type Handler struct {
-	repo *sqlite.LibraryRepo
-	cfg  *config.Config
-	auth AuthFuncs
+	repo     *sqlite.LibraryRepo
+	userRepo *sqlite.UserRepo
+	cfg      *config.Config
+	auth     AuthFuncs
 }
 
 // New constructs an Audio API handler.
@@ -62,6 +64,55 @@ func New(repo *sqlite.LibraryRepo, cfg *config.Config) *Handler {
 		repo: repo,
 		cfg:  cfg,
 	}
+}
+
+// SetUserRepo attaches a UserRepo for per-user library access control on audio streams and lyrics.
+func (h *Handler) SetUserRepo(userRepo *sqlite.UserRepo) {
+	h.userRepo = userRepo
+}
+
+// CanAccessLibrary returns true if userID is permitted to access libraryID.
+func (h *Handler) CanAccessLibrary(ctx context.Context, userID, libraryID string) bool {
+	if h.userRepo == nil || userID == "" || libraryID == "" {
+		return true
+	}
+	u, err := h.userRepo.GetUserByID(ctx, guid.Normalize(userID))
+	if err != nil || u == nil {
+		return true
+	}
+	if u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableAllFolders {
+		return true
+	}
+	normLib := guid.Normalize(libraryID)
+	for _, fid := range u.Policy.EnabledFolders {
+		if guid.Normalize(fid) == normLib {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) canAccessItem(r *http.Request, itemID string) bool {
+	if h.userRepo == nil || h.repo == nil {
+		return true
+	}
+	var callerID string
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.IsAdmin() {
+			return true
+		}
+		callerID = guid.Normalize(ac.UserID())
+	} else if h.auth.UserIDFromCtx != nil {
+		callerID = guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+	}
+	if callerID == "" {
+		return true
+	}
+	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
+	if err != nil || rec == nil || rec.LibraryID == "" {
+		return true
+	}
+	return h.CanAccessLibrary(r.Context(), callerID, rec.LibraryID)
 }
 
 // RegisterRoutes mounts all /Audio/* endpoints on mux.
@@ -97,6 +148,10 @@ func (h *Handler) handleAudioFile(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleDirectStream(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(r.PathValue("Id"))
+	if !h.canAccessItem(r, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	mediaPath, _, err := h.resolveAudioPath(r.Context(), itemID, q.Get("MediaSourceId"))
 	if errors.Is(err, sqlite.ErrNotFound) {
@@ -112,6 +167,10 @@ func (h *Handler) handleDirectStream(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleUniversal(w http.ResponseWriter, r *http.Request, urlExt string) {
 	itemID := guid.Normalize(r.PathValue("Id"))
+	if !h.canAccessItem(r, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	mediaPath, srcBitrate, err := h.resolveAudioPath(r.Context(), itemID, q.Get("MediaSourceId"))
 	if errors.Is(err, sqlite.ErrNotFound) {
@@ -206,6 +265,10 @@ func (h *Handler) streamTranscodeAudio(w http.ResponseWriter, r *http.Request, m
 
 func (h *Handler) handleLyrics(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(r.PathValue("Id"))
+	if !h.canAccessItem(r, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	mediaPath, _, err := h.resolveAudioPath(r.Context(), itemID, q.Get("MediaSourceId"))
 	if errors.Is(err, sqlite.ErrNotFound) {

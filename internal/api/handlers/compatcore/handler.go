@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/ws"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/session"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
@@ -42,6 +43,11 @@ type remoteCommandRecord struct {
 	At        time.Time
 }
 
+// WSSender pushes Emby WebSocket messages to connected devices.
+type WSSender interface {
+	SendToDevice(deviceID string, msg ws.Message)
+}
+
 // Handler implements the Emby 4.10.2.0 compatibility routes for users, sessions,
 // devices, auth, system, plugins, and operational endpoints.
 type Handler struct {
@@ -51,6 +57,7 @@ type Handler struct {
 	libRepo  *sqlite.LibraryRepo
 	sessions *session.Manager
 	registry *plugins.Registry
+	wsHub    WSSender
 	auth     AuthFuncs
 
 	mu                sync.RWMutex
@@ -84,6 +91,11 @@ func New(
 	}
 }
 
+// SetWSHub attaches a WebSocket hub for forwarding remote control commands to target devices.
+func (h *Handler) SetWSHub(hub WSSender) {
+	h.wsHub = hub
+}
+
 // BuildRouter builds a chi.Router containing all 16 compatibility prefixes.
 func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 	h.auth = auth
@@ -103,7 +115,6 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 	r.Post("/Users/ForgotPassword", h.forgotPassword)
 	r.Post("/Users/ForgotPassword/Pin", h.forgotPasswordPin)
 	r.Post("/Users/{Id}/Authenticate", h.authenticateUserByID)
-	r.Get("/Connect/Exchange", h.connectExchange)
 	r.Get("/Plugins/{Id}/Thumb", h.getPluginThumb)
 	r.Get("/Users/{Id}/Images/{Type}", h.getUserImage)
 	r.Get("/Users/{Id}/Images/{Type}/{Index}", h.getUserImage)
@@ -116,6 +127,9 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 
 		// /Auth
 		pr.Get("/Auth/Providers", h.getAuthProviders)
+
+		// /Connect
+		pr.Get("/Connect/Exchange", h.connectExchange)
 
 		// /Devices
 		pr.Get("/Devices/Info", h.getDeviceInfo)

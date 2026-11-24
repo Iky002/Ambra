@@ -43,6 +43,11 @@ import { MetadataEditorModal } from '../components/media/MetadataEditorModal'
 import { useAudioPlayer } from '../context/AudioPlayerContext'
 import { useAuth } from '../context/AuthContext'
 import {
+  loadPlaybackPrefs,
+  pickPreferredAudioIndex,
+  pickPreferredSubtitleIndex,
+} from '../player/playbackPrefs'
+import {
   detectChineseVariant,
   formatTicks,
   getAudioLabel,
@@ -86,7 +91,7 @@ export function ItemDetailPage() {
     return () => window.clearTimeout(timer)
   }, [toast])
 
-  const { data: item, isLoading } = useQuery({
+  const { data: item, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['item', userId, id],
     queryFn: () => api.getItem(userId, id!),
     enabled: Boolean(id),
@@ -146,7 +151,11 @@ export function ItemDetailPage() {
   })
 
   const seasons = seasonsData?.Items || []
-  const [selectedSeasonId, setSelectedSeasonId] = useState<string>('')
+  const [selectedSeasonId, setSelectedSeasonId] = useState<string | undefined>(undefined)
+
+  useEffect(() => {
+    setSelectedSeasonId(undefined)
+  }, [id])
 
   useEffect(() => {
     if (seasons.length > 0 && !seasons.some((s) => s.Id === selectedSeasonId)) {
@@ -156,7 +165,7 @@ export function ItemDetailPage() {
 
   const { data: episodesData, isLoading: episodesLoading } = useQuery({
     queryKey: ['episodes', id, selectedSeasonId, userId],
-    queryFn: () => api.getEpisodes(id!, selectedSeasonId, userId),
+    queryFn: () => api.getEpisodes(id!, selectedSeasonId!, userId),
     enabled: Boolean(id && isSeries && selectedSeasonId),
   })
 
@@ -216,9 +225,23 @@ export function ItemDetailPage() {
   useEffect(() => {
     if (mediaSources.length > 0) {
       const first = mediaSources[0]
+      const prefs = loadPlaybackPrefs()
+      const firstStreams = first.MediaStreams || []
       setSelectedSourceId(first.Id)
-      setSelectedAudioIdx(first.DefaultAudioStreamIndex)
-      setSelectedSubIdx(first.DefaultSubtitleStreamIndex)
+      setSelectedAudioIdx(
+        pickPreferredAudioIndex(
+          firstStreams.filter((s) => s.Type === 'Audio'),
+          prefs.preferredAudioLang,
+          first.DefaultAudioStreamIndex,
+        ),
+      )
+      setSelectedSubIdx(
+        pickPreferredSubtitleIndex(
+          firstStreams.filter((s) => s.Type === 'Subtitle'),
+          prefs.preferredSubtitleLang,
+          first.DefaultSubtitleStreamIndex,
+        ),
+      )
     }
   }, [item?.Id, mediaSources.length])
 
@@ -360,7 +383,10 @@ export function ItemDetailPage() {
       const name = newColName.trim()
       if (!name) throw new Error('请输入名称')
       if (addToColTab === 'Playlist') {
-        return api.createPlaylist(name, userId, [item!.Id])
+        const mediaType = ['Audio', 'MusicAlbum', 'MusicArtist'].includes(item!.Type)
+          ? 'Audio'
+          : 'Video'
+        return api.createPlaylist(name, userId, [item!.Id], mediaType)
       }
       return api.createCollection(name, [item!.Id])
     },
@@ -419,10 +445,43 @@ export function ItemDetailPage() {
     },
   })
 
-  if (isLoading || !item) {
+  if (isLoading) {
     return (
       <div className="flex h-[60vh] items-center justify-center">
         <Loader2 className="h-8 w-8 animate-spin text-amber-400" />
+      </div>
+    )
+  }
+
+  if (isError || !item) {
+    const errorMsg =
+      error instanceof Error && error.message ? error.message : '未找到该媒体项目或加载失败'
+    return (
+      <div className="flex min-h-[60vh] items-center justify-center px-4">
+        <div className="w-full max-w-md rounded-2xl border border-white/10 bg-zinc-950/90 p-8 text-center shadow-2xl">
+          <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-red-500/15 text-red-400 ring-1 ring-red-500/30">
+            <AlertTriangle className="h-6 w-6" />
+          </div>
+          <h2 className="text-lg font-semibold text-white">无法加载媒体详情</h2>
+          <p className="mt-2 text-sm text-zinc-400">{errorMsg}</p>
+          <div className="mt-6 flex items-center justify-center gap-3">
+            <button
+              type="button"
+              onClick={() => void refetch()}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-5 py-2.5 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              <span>重试</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => navigate('/')}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-white/12 bg-white/[0.05] px-5 py-2.5 text-xs font-medium text-zinc-200 transition-colors hover:bg-white/10"
+            >
+              <span>返回首页</span>
+            </button>
+          </div>
+        </div>
       </div>
     )
   }
@@ -503,7 +562,11 @@ export function ItemDetailPage() {
     if (targetId === item.Id) {
       if (activeSource?.Id) params.set('mediaSourceId', activeSource.Id)
       if (selectedAudioIdx !== undefined) params.set('audio', String(selectedAudioIdx))
-      if (selectedSubIdx !== undefined) params.set('subtitle', String(selectedSubIdx))
+      if (selectedSubIdx !== undefined) {
+        params.set('subtitle', String(selectedSubIdx))
+      } else if (subtitleStreams.length > 0) {
+        params.set('subtitle', 'off')
+      }
     }
     if (startTicks > 0) params.set('startTicks', String(startTicks))
     const qs = params.toString()
@@ -864,9 +927,27 @@ export function ItemDetailPage() {
                         value={activeSource?.Id || ''}
                         onChange={(e) => {
                           const next = mediaSources.find((s) => s.Id === e.target.value)
+                          const prefs = loadPlaybackPrefs()
+                          const nextStreams = next?.MediaStreams || []
                           setSelectedSourceId(e.target.value)
-                          setSelectedAudioIdx(next?.DefaultAudioStreamIndex)
-                          setSelectedSubIdx(next?.DefaultSubtitleStreamIndex)
+                          setSelectedAudioIdx(
+                            next
+                              ? pickPreferredAudioIndex(
+                                  nextStreams.filter((s) => s.Type === 'Audio'),
+                                  prefs.preferredAudioLang,
+                                  next.DefaultAudioStreamIndex,
+                                )
+                              : undefined,
+                          )
+                          setSelectedSubIdx(
+                            next
+                              ? pickPreferredSubtitleIndex(
+                                  nextStreams.filter((s) => s.Type === 'Subtitle'),
+                                  prefs.preferredSubtitleLang,
+                                  next.DefaultSubtitleStreamIndex,
+                                )
+                              : undefined,
+                          )
                         }}
                         className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
                       >

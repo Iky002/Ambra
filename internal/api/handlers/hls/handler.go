@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
@@ -32,16 +34,18 @@ type AuthFuncs struct {
 type liveStreamEntry struct {
 	LiveStreamID  string
 	PlaySessionID string
+	UserID        string
 	ItemID        string
 	MediaSource   dto.MediaSourceInfo
 }
 
 // Handler serves dynamic HLS playlists/segments, encoding capabilities/defaults, and LiveStreams APIs.
 type Handler struct {
-	repo *sqlite.LibraryRepo
-	mgr  *transcode.Manager
-	cfg  *config.Config
-	auth AuthFuncs
+	repo     *sqlite.LibraryRepo
+	userRepo *sqlite.UserRepo
+	mgr      *transcode.Manager
+	cfg      *config.Config
+	auth     AuthFuncs
 
 	liveMu      sync.RWMutex
 	liveStreams map[string]*liveStreamEntry
@@ -55,6 +59,53 @@ func New(repo *sqlite.LibraryRepo, mgr *transcode.Manager, cfg *config.Config) *
 		cfg:         cfg,
 		liveStreams: make(map[string]*liveStreamEntry),
 	}
+}
+
+// SetUserRepo attaches a UserRepo for per-user library access control and ownership checks.
+func (h *Handler) SetUserRepo(r *sqlite.UserRepo) {
+	h.userRepo = r
+}
+
+func (h *Handler) callerIdentity(r *http.Request) (userID string, isAdmin bool) {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		return guid.Normalize(ac.UserID()), ac.IsAdmin()
+	}
+	if h.auth.UserIDFromCtx != nil {
+		uid := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if uid != "" {
+			if h.userRepo != nil {
+				if u, err := h.userRepo.GetUserByID(r.Context(), uid); err == nil && u != nil {
+					return uid, u.IsAdmin || u.Policy.IsAdministrator
+				}
+			}
+			return uid, false
+		}
+	}
+	return "", false
+}
+
+func (h *Handler) canAccessItem(r *http.Request, item *sqlite.ItemRecord) bool {
+	if item == nil || h.userRepo == nil {
+		return true
+	}
+	uid, isAdmin := h.callerIdentity(r)
+	if isAdmin || uid == "" {
+		return true
+	}
+	u, err := h.userRepo.GetUserByID(r.Context(), uid)
+	if err != nil || u == nil {
+		return true
+	}
+	if u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableAllFolders {
+		return true
+	}
+	normLib := guid.Normalize(item.LibraryID)
+	for _, fid := range u.Policy.EnabledFolders {
+		if guid.Normalize(fid) == normLib {
+			return true
+		}
+	}
+	return false
 }
 
 // RegisterRoutes mounts all HLS, ActiveEncodings, Encoding, and LiveStreams endpoints on mux.
@@ -103,8 +154,12 @@ func (h *Handler) handleMasterPlaylist(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if !h.canAccessItem(r, item) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 
-	params := h.buildSessionParams(item, src, q)
+	params := h.buildSessionParams(r, item, src, q)
 	if h.mgr != nil {
 		_, _ = h.mgr.RegisterSession(params)
 	}
@@ -121,6 +176,7 @@ func (h *Handler) handleMasterPlaylist(w http.ResponseWriter, r *http.Request) {
 		bw = 4_000_000
 	}
 
+	token := resolveRequestToken(r, q)
 	m3u8 := transcode.BuildMasterPlaylist(transcode.PlaylistParams{
 		ItemID:           item.ID,
 		DurationTicks:    resolveRuntimeTicks(item, src),
@@ -131,8 +187,8 @@ func (h *Handler) handleMasterPlaylist(w http.ResponseWriter, r *http.Request) {
 		Height:           height,
 		VideoCodec:       params.VideoCodec,
 		AudioCodec:       params.AudioCodec,
-		Query:            preserveQuery(r.URL.Query()),
-		Subtitles:        extractTextSubtitles(item, src, q.Get("api_key")),
+		Query:            preserveQueryWithToken(r.URL.Query(), token),
+		Subtitles:        extractTextSubtitles(item, src, token),
 	})
 
 	w.Header().Set("Content-Type", "application/x-mpegURL; charset=utf-8")
@@ -154,19 +210,24 @@ func (h *Handler) handleMediaPlaylist(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if !h.canAccessItem(r, item) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 
-	params := h.buildSessionParams(item, src, q)
+	params := h.buildSessionParams(r, item, src, q)
 	if h.mgr != nil {
 		_, _ = h.mgr.RegisterSession(params)
 	}
 
+	token := resolveRequestToken(r, q)
 	m3u8 := transcode.BuildMediaPlaylist(transcode.PlaylistParams{
 		ItemID:           item.ID,
 		PlaylistID:       "main",
 		DurationTicks:    resolveRuntimeTicks(item, src),
 		SegmentDuration:  params.SegmentDuration,
 		SegmentContainer: params.SegmentContainer,
-		Query:            preserveQuery(r.URL.Query()),
+		Query:            preserveQueryWithToken(r.URL.Query(), token),
 	})
 
 	w.Header().Set("Content-Type", "application/x-mpegURL; charset=utf-8")
@@ -193,19 +254,20 @@ func (h *Handler) handleSubtitlePlaylist(w http.ResponseWriter, r *http.Request)
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
-	if msID == "" {
-		if src != nil && src.ID != "" {
-			msID = src.ID
-		} else {
-			msID = item.ID
-		}
+	if !h.canAccessItem(r, item) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
 	}
 
-	vttURI := fmt.Sprintf("/Videos/%s/%s/Subtitles/%d/Stream.vtt", item.ID, msID, idx)
+	if !hasTextSubtitleStream(src, idx) {
+		httpx.Error(w, http.StatusNotFound, "subtitle stream not found")
+		return
+	}
+
+	vttURI := "Stream.vtt"
 	q := httpx.ParseQuery(r)
-	if apiKey := q.Get("api_key"); apiKey != "" {
-		vttURI += "?api_key=" + url.QueryEscape(apiKey)
+	if token := resolveRequestToken(r, q); token != "" {
+		vttURI += "?api_key=" + url.QueryEscape(token)
 	}
 
 	durSec := float64(resolveRuntimeTicks(item, src)) / float64(transcode.TicksPerSecond)
@@ -215,6 +277,18 @@ func (h *Handler) handleSubtitlePlaylist(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(m3u8))
+}
+
+func hasTextSubtitleStream(src *sqlite.MediaSourceRecord, idx int) bool {
+	if src == nil {
+		return false
+	}
+	for _, st := range src.Streams {
+		if st.StreamIndex == idx && strings.EqualFold(st.StreamType, "Subtitle") && isTextSubtitleCodec(st.Codec) {
+			return true
+		}
+	}
+	return false
 }
 
 func extractTextSubtitles(item *sqlite.ItemRecord, src *sqlite.MediaSourceRecord, apiKey string) []transcode.SubtitleTrackInfo {
@@ -230,7 +304,7 @@ func extractTextSubtitles(item *sqlite.ItemRecord, src *sqlite.MediaSourceRecord
 		if !strings.EqualFold(st.StreamType, "Subtitle") || !isTextSubtitleCodec(st.Codec) {
 			continue
 		}
-		uri := fmt.Sprintf("/Videos/%s/%s/Subtitles/%d/subtitles.m3u8", item.ID, msID, st.StreamIndex)
+		uri := fmt.Sprintf("%s/Subtitles/%d/subtitles.m3u8", msID, st.StreamIndex)
 		if apiKey != "" {
 			uri += "?api_key=" + url.QueryEscape(apiKey)
 		}
@@ -255,7 +329,7 @@ func extractTextSubtitles(item *sqlite.ItemRecord, src *sqlite.MediaSourceRecord
 
 func isTextSubtitleCodec(codec string) bool {
 	switch strings.ToLower(strings.TrimSpace(codec)) {
-	case "vtt", "webvtt", "srt", "subrip", "ass", "ssa":
+	case "vtt", "webvtt", "srt", "subrip", "ass", "ssa", "mov_text", "tx3g":
 		return true
 	default:
 		return false
@@ -291,8 +365,12 @@ func (h *Handler) handleSegment(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if !h.canAccessItem(r, item) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 
-	params := h.buildSessionParams(item, src, q)
+	params := h.buildSessionParams(r, item, src, q)
 	params.SegmentContainer = ext
 
 	segPath, err := h.mgr.GetSegment(r.Context(), params, segIdx)
@@ -318,8 +396,9 @@ func (h *Handler) handleDeleteActiveEncodings(w http.ResponseWriter, r *http.Req
 	q := httpx.ParseQuery(r)
 	deviceID := q.Get("DeviceId")
 	playSessionID := q.Get("PlaySessionId")
+	callerUserID, isAdmin := h.callerIdentity(r)
 	if h.mgr != nil {
-		h.mgr.StopByDevice(deviceID, playSessionID)
+		h.mgr.StopByDeviceForUser(deviceID, playSessionID, callerUserID, isAdmin)
 	}
 	httpx.NoContent(w)
 }
@@ -418,9 +497,14 @@ func (h *Handler) handleLiveStreamOpen(w http.ResponseWriter, r *http.Request) {
 
 	liveID := guid.New()
 	var msDTO dto.MediaSourceInfo
+	callerUserID, _ := h.callerIdentity(r)
 
 	if req.ItemId != "" && h.repo != nil {
 		item, src, err := h.resolveItemAndSource(r.Context(), guid.Normalize(req.ItemId), req.MediaSourceId)
+		if err == nil && item != nil && !h.canAccessItem(r, item) {
+			httpx.Error(w, http.StatusForbidden, "access denied")
+			return
+		}
 		if err == nil && src != nil {
 			msDTO = sqlite.MediaSourceRecordsToDTO([]sqlite.MediaSourceRecord{*src})[0]
 			msDTO.Type = "Default"
@@ -463,6 +547,7 @@ func (h *Handler) handleLiveStreamOpen(w http.ResponseWriter, r *http.Request) {
 	h.liveStreams[liveID] = &liveStreamEntry{
 		LiveStreamID:  liveID,
 		PlaySessionID: req.PlaySessionId,
+		UserID:        callerUserID,
 		ItemID:        guid.Normalize(req.ItemId),
 		MediaSource:   msDTO,
 	}
@@ -487,17 +572,23 @@ func (h *Handler) handleLiveStreamClose(w http.ResponseWriter, r *http.Request) 
 		liveID = req.LiveStreamId
 	}
 
+	callerUserID, isAdmin := h.callerIdentity(r)
 	var playSessionID string
 	if liveID != "" {
 		h.liveMu.Lock()
 		if entry, ok := h.liveStreams[liveID]; ok {
+			if !isAdmin && entry.UserID != "" && entry.UserID != callerUserID {
+				h.liveMu.Unlock()
+				httpx.Error(w, http.StatusForbidden, "access denied")
+				return
+			}
 			playSessionID = entry.PlaySessionID
 			delete(h.liveStreams, liveID)
 		}
 		h.liveMu.Unlock()
 	}
 	if h.mgr != nil && playSessionID != "" {
-		h.mgr.StopByDevice("", playSessionID)
+		h.mgr.StopByDeviceForUser("", playSessionID, callerUserID, isAdmin)
 	}
 	httpx.NoContent(w)
 }
@@ -516,6 +607,11 @@ func (h *Handler) handleLiveStreamMediaInfo(w http.ResponseWriter, r *http.Reque
 	h.liveMu.RUnlock()
 	if !ok {
 		httpx.Error(w, http.StatusNotFound, "live stream not found")
+		return
+	}
+	callerUserID, isAdmin := h.callerIdentity(r)
+	if !isAdmin && entry.UserID != "" && entry.UserID != callerUserID {
+		httpx.Error(w, http.StatusForbidden, "access denied")
 		return
 	}
 	httpx.JSON(w, http.StatusOK, liveStreamOpenResponse{MediaSource: entry.MediaSource})
@@ -547,7 +643,7 @@ func (h *Handler) resolveItemAndSource(ctx context.Context, itemID, mediaSourceI
 	return item, nil, nil
 }
 
-func (h *Handler) buildSessionParams(item *sqlite.ItemRecord, src *sqlite.MediaSourceRecord, q httpx.Query) transcode.SessionParams {
+func (h *Handler) buildSessionParams(r *http.Request, item *sqlite.ItemRecord, src *sqlite.MediaSourceRecord, q httpx.Query) transcode.SessionParams {
 	inputPath := item.Path
 	msID := item.ID
 	if src != nil {
@@ -584,24 +680,51 @@ func (h *Handler) buildSessionParams(item *sqlite.ItemRecord, src *sqlite.MediaS
 		}
 	}
 
+	var subIdx *int
+	if q.Has("SubtitleStreamIndex") {
+		v := q.Int("SubtitleStreamIndex", -1)
+		if v >= 0 {
+			subIdx = &v
+		}
+	}
+	subMethod := strings.TrimSpace(q.Get("SubtitleMethod"))
+	var subCodec, subPath string
+	if subIdx != nil && src != nil {
+		for _, st := range src.Streams {
+			if st.StreamIndex == *subIdx && strings.EqualFold(st.StreamType, "Subtitle") {
+				subCodec = st.Codec
+				if st.IsExternal && strings.TrimSpace(st.Path) != "" {
+					subPath = st.Path
+				}
+				break
+			}
+		}
+	}
+
+	callerUserID, _ := h.callerIdentity(r)
 	runtimeTicks := resolveRuntimeTicks(item, src)
 	return transcode.SessionParams{
-		PlaySessionID:    q.Get("PlaySessionId"),
-		DeviceID:         q.Get("DeviceId"),
-		ItemID:           item.ID,
-		MediaSourceID:    msID,
-		InputPath:        inputPath,
-		VideoCodec:       q.Get("VideoCodec"),
-		AudioCodec:       q.Get("AudioCodec"),
-		VideoBitrate:     videoBitrate,
-		AudioBitrate:     audioBitrate,
-		AudioChannels:    q.Int("TranscodingMaxAudioChannels", 2),
-		MaxWidth:         q.Int("MaxWidth", 0),
-		MaxHeight:        q.Int("MaxHeight", 0),
-		AudioStreamIndex: audioIdx,
-		SegmentDuration:  segDur,
-		SegmentContainer: q.Get("SegmentContainer"),
-		DurationSec:      float64(runtimeTicks) / float64(transcode.TicksPerSecond),
+		PlaySessionID:       q.Get("PlaySessionId"),
+		DeviceID:            q.Get("DeviceId"),
+		UserID:              callerUserID,
+		ItemID:              item.ID,
+		MediaSourceID:       msID,
+		InputPath:           inputPath,
+		VideoCodec:          q.Get("VideoCodec"),
+		AudioCodec:          q.Get("AudioCodec"),
+		VideoBitrate:        videoBitrate,
+		AudioBitrate:        audioBitrate,
+		AudioChannels:       q.Int("TranscodingMaxAudioChannels", 2),
+		MaxWidth:            q.Int("MaxWidth", 0),
+		MaxHeight:           q.Int("MaxHeight", 0),
+		AudioStreamIndex:    audioIdx,
+		SubtitleStreamIndex: subIdx,
+		SubtitleMethod:      subMethod,
+		SubtitleCodec:       subCodec,
+		SubtitlePath:        subPath,
+		SegmentDuration:     segDur,
+		SegmentContainer:    q.Get("SegmentContainer"),
+		DurationSec:         float64(runtimeTicks) / float64(transcode.TicksPerSecond),
 	}
 }
 
@@ -635,6 +758,35 @@ func preserveQuery(raw url.Values) url.Values {
 	return out
 }
 
+func preserveQueryWithToken(raw url.Values, token string) url.Values {
+	out := preserveQuery(raw)
+	if token == "" {
+		return out
+	}
+	for k, v := range out {
+		if strings.EqualFold(k, "api_key") && len(v) > 0 && strings.TrimSpace(v[0]) != "" {
+			return out
+		}
+	}
+	out.Set("api_key", token)
+	return out
+}
+
+func resolveRequestToken(r *http.Request, q httpx.Query) string {
+	if tok := strings.TrimSpace(q.Get("api_key")); tok != "" {
+		return tok
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil {
+		if tok := strings.TrimSpace(ac.Token); tok != "" {
+			return tok
+		}
+	}
+	if tok := strings.TrimSpace(middleware.ExtractClientInfo(r).Token); tok != "" {
+		return tok
+	}
+	return ""
+}
+
 func readFirstLineURL(strmPath string) string {
 	f, err := os.Open(strmPath)
 	if err != nil {
@@ -646,10 +798,39 @@ func readFirstLineURL(strmPath string) string {
 		line := strings.TrimPrefix(sc.Text(), "\uFEFF")
 		line = strings.TrimSpace(line)
 		if line != "" && !strings.HasPrefix(line, "#") {
-			return strings.ReplaceAll(line, " ", "%20")
+			candidate := strings.ReplaceAll(line, " ", "%20")
+			u, err := url.Parse(candidate)
+			if err != nil || u.Host == "" {
+				return ""
+			}
+			scheme := strings.ToLower(u.Scheme)
+			if scheme != "http" && scheme != "https" {
+				return ""
+			}
+			if isBlockedStrmHost(u.Hostname()) {
+				return ""
+			}
+			return candidate
 		}
 	}
 	return ""
+}
+
+func isBlockedStrmHost(host string) bool {
+	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if h == "" {
+		return true
+	}
+	if h == "metadata.google.internal" || h == "metadata" || h == "instance-data" {
+		return true
+	}
+	if addr, err := netip.ParseAddr(h); err == nil {
+		addr = addr.Unmap()
+		if addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() {
+			return true
+		}
+	}
+	return false
 }
 
 func passthrough(next http.Handler) http.Handler { return next }

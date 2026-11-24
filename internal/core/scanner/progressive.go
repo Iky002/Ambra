@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -607,17 +608,39 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 	if task.NeedProbe {
 		s.updateEnrichCurrent(task.LibraryID, itemLabel, "探测媒体流信息")
 		probeRes = s.probeMedia(ctx, task.MediaPath, task.IsStrm)
-		if probeRes != nil && len(probeRes.Streams) > 0 {
+		if probeRes != nil && (len(probeRes.Streams) > 0 || len(probeRes.Tags) > 0 || probeRes.HasAttachedPic) {
 			rec, err := s.repo.GetItemRecordByID(ctx, task.ItemID)
 			if err == nil && rec != nil {
-				ms := s.buildMediaSource(rec, task.MediaPath, task.Size, task.Mtime, task.IsStrm, task.Container, probeRes)
-				if err := s.repo.UpsertMediaSourceAndStreams(ctx, rec.ID, ms); err == nil {
-					updated = true
+				if len(probeRes.Streams) > 0 {
+					ms := s.buildMediaSource(rec, task.MediaPath, task.Size, task.Mtime, task.IsStrm, task.Container, probeRes)
+					if err := s.repo.UpsertMediaSourceAndStreams(ctx, rec.ID, ms); err == nil {
+						updated = true
+					}
 				}
+				recDirty := false
 				if !task.IsAltMediaSource && probeRes.RuntimeTicks > 0 {
 					rt := probeRes.RuntimeTicks
 					rec.RuntimeTicks = &rt
+					recDirty = true
+				}
+				isAudio := strings.EqualFold(rec.Type, "Audio") || strings.EqualFold(rec.MediaType, "Audio")
+				if !task.IsAltMediaSource && isAudio && len(probeRes.Tags) > 0 {
+					if applyAudioProbeTags(rec, probeRes.Tags) {
+						recDirty = true
+					}
+				}
+				if recDirty {
 					if err := s.repo.UpsertItem(ctx, rec); err == nil {
+						updated = true
+						if isAudio {
+							artistStr := strings.Join(rec.Extra.Artists, " ")
+							titleTokens := TokenizeForFTS(rec.Name, rec.Extra.Album, artistStr)
+							_ = s.repo.UpsertSearchFTS(ctx, rec.ID, rec.Name, titleTokens, "", "", artistStr)
+						}
+					}
+				}
+				if !task.IsAltMediaSource && !task.IsStrm && isAudio && probeRes.HasAttachedPic {
+					if s.extractAudioAttachedPic(ctx, rec, task.MediaPath) {
 						updated = true
 					}
 				}
@@ -626,6 +649,10 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 	}
 
 	if task.NeedOnlineMeta && !task.IsAltMediaSource {
+		existingRec, err := s.repo.GetItemRecordByID(ctx, task.ItemID)
+		if err == nil && existingRec != nil && existingRec.Extra.LockData {
+			return updated
+		}
 		s.updateEnrichCurrent(task.LibraryID, itemLabel, "刮削元数据与下载海报")
 		if (strings.EqualFold(task.ItemType, "Season") || strings.EqualFold(task.ItemType, "Episode")) &&
 			task.ParentSeriesID != "" && getProviderID(task.Query.ProviderIDs, "tmdb") == "" {
@@ -646,7 +673,7 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 		onlineMeta := s.fetchMetadataFiltered(ctx, task.Query, false)
 		if onlineMeta != nil {
 			rec, err := s.repo.GetItemRecordByID(ctx, task.ItemID)
-			if err == nil && rec != nil {
+			if err == nil && rec != nil && !rec.Extra.LockData {
 				applyOnlineMetadataToItem(rec, onlineMeta, task.HasLocalTitle)
 				if err := s.repo.UpsertItem(ctx, rec); err == nil {
 					mergedAway := false
@@ -654,9 +681,10 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 						mergedAway = s.tryAutoMergeMovieByProviderID(ctx, rec)
 					}
 					if !mergedAway {
-						s.persistMetaRelationsAndFTS(ctx, rec, onlineMeta)
+						relMeta := filterLockedRelations(rec, onlineMeta)
+						s.persistMetaRelationsAndFTS(ctx, rec, relMeta)
 						s.downloadAndSaveRemoteImages(ctx, rec, onlineMeta)
-						s.saveLocalNFOIfEnabled(ctx, rec, onlineMeta, false)
+						s.saveLocalNFOIfEnabled(ctx, rec, relMeta, false)
 					}
 					updated = true
 				}
@@ -665,6 +693,100 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 	}
 
 	return updated
+}
+
+func (s *Scanner) extractAudioAttachedPic(ctx context.Context, rec *sqlite.ItemRecord, mediaPath string) bool {
+	if rec == nil || strings.TrimSpace(mediaPath) == "" || s.repo == nil {
+		return false
+	}
+
+	needTrackImg := s.isMissingPrimaryImage(ctx, rec.ID)
+	var albumRec *sqlite.ItemRecord
+	albumID := strings.TrimSpace(rec.Extra.AlbumID)
+	if albumID == "" {
+		albumID = strings.TrimSpace(rec.ParentID)
+	}
+	if albumID != "" {
+		if parent, err := s.repo.GetItemRecordByID(ctx, albumID); err == nil && parent != nil && strings.EqualFold(parent.Type, "MusicAlbum") {
+			albumRec = parent
+		}
+	}
+	needAlbumImg := albumRec != nil && s.isMissingPrimaryImage(ctx, albumRec.ID)
+	if !needTrackImg && !needAlbumImg {
+		return false
+	}
+
+	var destPath string
+	if needAlbumImg && albumRec != nil {
+		if lib, saveLocal := s.shouldSaveLocalMetadata(ctx, albumRec.LibraryID); saveLocal {
+			if localPath, ok := s.resolveLocalImagePath(ctx, lib, albumRec, "Primary", ".jpg"); ok && localPath != "" {
+				destPath = localPath
+			}
+		}
+		if destPath == "" && !needTrackImg {
+			destPath = filepath.Join(s.imageStorageDir(), albumRec.ID, "primary.jpg")
+		}
+	}
+	if destPath == "" {
+		destPath = filepath.Join(s.imageStorageDir(), rec.ID, "primary.jpg")
+	}
+
+	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+		return false
+	}
+
+	ffmpegPath := "ffmpeg"
+	if s.cfg != nil && strings.TrimSpace(s.cfg.FFmpegPath) != "" {
+		ffmpegPath = s.cfg.FFmpegPath
+	}
+
+	extractCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(
+		extractCtx,
+		ffmpegPath,
+		"-hide_banner",
+		"-loglevel", "error",
+		"-y",
+		"-i", mediaPath,
+		"-map", "0:v:0",
+		"-frames:v", "1",
+		destPath,
+	)
+	if err := cmd.Run(); err != nil {
+		return false
+	}
+	info, err := os.Stat(destPath)
+	if err != nil || info.IsDir() || info.Size() == 0 {
+		return false
+	}
+
+	tag := computeEtag(destPath, info.Size(), info.ModTime().Unix())
+	saved := false
+	if needTrackImg {
+		if err := s.repo.UpsertImage(ctx, &sqlite.ImageRecord{
+			ItemID:     rec.ID,
+			ImageType:  "Primary",
+			ImageIndex: 0,
+			Path:       destPath,
+			Tag:        tag,
+		}); err == nil {
+			saved = true
+		}
+	}
+	if needAlbumImg && albumRec != nil {
+		if err := s.repo.UpsertImage(ctx, &sqlite.ImageRecord{
+			ItemID:     albumRec.ID,
+			ImageType:  "Primary",
+			ImageIndex: 0,
+			Path:       destPath,
+			Tag:        tag,
+		}); err == nil {
+			saved = true
+		}
+	}
+	return saved
 }
 
 func (s *Scanner) tryAutoMergeMovieByProviderID(ctx context.Context, rec *sqlite.ItemRecord) bool {
@@ -787,7 +909,7 @@ func isFieldLocked(rec *sqlite.ItemRecord, field string) bool {
 
 // applyOnlineMetadataToItem applies online metadata fields while respecting local NFO titles and locked fields.
 func applyOnlineMetadataToItem(rec *sqlite.ItemRecord, meta *plugins.MetadataResult, hasLocalTitle bool) {
-	if rec == nil || meta == nil {
+	if rec == nil || meta == nil || rec.Extra.LockData {
 		return
 	}
 	if meta.Name != "" && !hasLocalTitle && !isFieldLocked(rec, "Name") {

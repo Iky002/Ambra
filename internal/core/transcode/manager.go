@@ -26,22 +26,27 @@ const (
 
 // SessionParams holds all parameters required to run a dynamic HLS FFmpeg transcode session.
 type SessionParams struct {
-	PlaySessionID    string
-	DeviceID         string
-	ItemID           string
-	MediaSourceID    string
-	InputPath        string
-	VideoCodec       string // "copy" for DirectStream, "h264"/"hevc" for Transcode
-	AudioCodec       string // "copy" or "aac" (default)
-	VideoBitrate     int    // bits/sec (e.g. 4000000)
-	AudioBitrate     int    // bits/sec (e.g. 192000)
-	AudioChannels    int    // default 2
-	MaxWidth         int
-	MaxHeight        int
-	AudioStreamIndex *int
-	SegmentDuration  int    // seconds, default 6
-	SegmentContainer string // "ts" (default), "mp4", "m4s"
-	DurationSec      float64
+	PlaySessionID       string
+	DeviceID            string
+	UserID              string
+	ItemID              string
+	MediaSourceID       string
+	InputPath           string
+	VideoCodec          string // "copy" for DirectStream, "h264"/"hevc" for Transcode
+	AudioCodec          string // "copy" or "aac" (default)
+	VideoBitrate        int    // bits/sec (e.g. 4000000)
+	AudioBitrate        int    // bits/sec (e.g. 192000)
+	AudioChannels       int    // default 2
+	MaxWidth            int
+	MaxHeight           int
+	AudioStreamIndex    *int
+	SubtitleStreamIndex *int
+	SubtitleMethod      string // "Encode" for burn-in
+	SubtitleCodec       string // e.g. "ass", "srt", "pgssub", "dvd_subtitle"
+	SubtitlePath        string // external subtitle path when IsExternal
+	SegmentDuration     int    // seconds, default 6
+	SegmentContainer    string // "ts" (default), "mp4", "m4s"
+	DurationSec         float64
 }
 
 func (p *SessionParams) normalize() {
@@ -93,10 +98,20 @@ func BuildFFmpegArgs(params SessionParams, startSeg int, outDir string, caps *HW
 		"-y",
 	}
 
-	isVideoCopy := strings.EqualFold(params.VideoCodec, "copy")
+	burnIn := strings.EqualFold(strings.TrimSpace(params.SubtitleMethod), "Encode") &&
+		(strings.TrimSpace(params.SubtitlePath) != "" || (params.SubtitleStreamIndex != nil && *params.SubtitleStreamIndex >= 0))
+	isBitmapSub := burnIn && isBitmapSubtitleCodec(params.SubtitleCodec) &&
+		strings.TrimSpace(params.SubtitlePath) == "" &&
+		params.SubtitleStreamIndex != nil && *params.SubtitleStreamIndex >= 0
+
+	isVideoCopy := strings.EqualFold(params.VideoCodec, "copy") && !burnIn
 	var encoder string
 	if !isVideoCopy {
-		encoder = caps.SelectVideoEncoder(params.VideoCodec)
+		vCodec := params.VideoCodec
+		if strings.EqualFold(vCodec, "copy") {
+			vCodec = "h264"
+		}
+		encoder = caps.SelectVideoEncoder(vCodec)
 		if strings.HasSuffix(encoder, "_vaapi") {
 			vaapiDev := "/dev/dri/renderD128"
 			if caps != nil && caps.VAAPIDevice != "" {
@@ -124,23 +139,16 @@ func BuildFFmpegArgs(params SessionParams, startSeg int, outDir string, caps *HW
 
 	args = append(args, "-i", params.InputPath)
 
-	// Stream mapping: first video stream + selected (or first) audio stream; disable subtitle burn-in by default
-	args = append(args, "-map", "0:v:0")
-	if params.AudioStreamIndex != nil && *params.AudioStreamIndex >= 0 {
-		args = append(args, "-map", fmt.Sprintf("0:%d?", *params.AudioStreamIndex))
-	} else {
-		args = append(args, "-map", "0:a:0?")
-	}
-	args = append(args, "-sn")
-
-	// Video encoding: DirectStream (-c:v copy) vs Transcode
-	if isVideoCopy {
-		args = append(args, "-c:v", "copy")
-	} else {
-		args = append(args, "-c:v", encoder)
-
-		// Optional scaling filter + VAAPI hardware upload filter
-		var vfParts []string
+	// Build video filter parts for scaling and VAAPI hardware upload (also used with burn-in).
+	var vfParts []string
+	if !isVideoCopy {
+		if burnIn && !isBitmapSub {
+			if subPath := strings.TrimSpace(params.SubtitlePath); subPath != "" {
+				vfParts = append(vfParts, fmt.Sprintf("subtitles='%s'", escapeFFmpegFilterPath(subPath)))
+			} else if params.SubtitleStreamIndex != nil && *params.SubtitleStreamIndex >= 0 {
+				vfParts = append(vfParts, fmt.Sprintf("subtitles='%s':si=%d", escapeFFmpegFilterPath(params.InputPath), *params.SubtitleStreamIndex))
+			}
+		}
 		if params.MaxWidth > 0 || params.MaxHeight > 0 {
 			w := params.MaxWidth
 			h := params.MaxHeight
@@ -155,7 +163,33 @@ func BuildFFmpegArgs(params SessionParams, startSeg int, outDir string, caps *HW
 		if strings.HasSuffix(encoder, "_vaapi") {
 			vfParts = append(vfParts, "format=nv12,hwupload")
 		}
+	}
+
+	// Stream mapping: video (or bitmap subtitle overlay) + selected (or first) audio stream; disable muxed subtitle tracks.
+	if isBitmapSub {
+		filterGraph := fmt.Sprintf("[0:v:0][0:%d]overlay", *params.SubtitleStreamIndex)
 		if len(vfParts) > 0 {
+			filterGraph += "," + strings.Join(vfParts, ",")
+		}
+		filterGraph += "[v]"
+		args = append(args, "-filter_complex", filterGraph, "-map", "[v]")
+	} else {
+		args = append(args, "-map", "0:v:0")
+	}
+	if params.AudioStreamIndex != nil && *params.AudioStreamIndex >= 0 {
+		args = append(args, "-map", fmt.Sprintf("0:%d?", *params.AudioStreamIndex))
+	} else {
+		args = append(args, "-map", "0:a:0?")
+	}
+	args = append(args, "-sn")
+
+	// Video encoding: DirectStream (-c:v copy) vs Transcode
+	if isVideoCopy {
+		args = append(args, "-c:v", "copy")
+	} else {
+		args = append(args, "-c:v", encoder)
+
+		if !isBitmapSub && len(vfParts) > 0 {
 			args = append(args, "-vf", strings.Join(vfParts, ","))
 		}
 
@@ -378,8 +412,16 @@ func (m *Manager) RegisterSession(params SessionParams) (*SessionSnapshot, error
 // StopByDevice stops and cleans up all active transcoding sessions matching playSessionID or deviceID.
 // Returns the number of sessions stopped.
 func (m *Manager) StopByDevice(deviceID, playSessionID string) int {
+	return m.StopByDeviceForUser(deviceID, playSessionID, "", true)
+}
+
+// StopByDeviceForUser stops and cleans up active transcoding sessions matching playSessionID or deviceID
+// that are owned by callerUserID (or any matching session if isAdmin is true or the session has no owner).
+// Returns the number of sessions stopped.
+func (m *Manager) StopByDeviceForUser(deviceID, playSessionID, callerUserID string, isAdmin bool) int {
 	deviceID = strings.TrimSpace(deviceID)
 	playSessionID = strings.TrimSpace(playSessionID)
+	callerUserID = strings.TrimSpace(callerUserID)
 	if deviceID == "" && playSessionID == "" {
 		return 0
 	}
@@ -393,10 +435,15 @@ func (m *Manager) StopByDevice(deviceID, playSessionID string) int {
 		} else if deviceID != "" && sess.params.DeviceID == deviceID {
 			match = true
 		}
-		if match {
-			toStop = append(toStop, sess)
-			delete(m.sessions, key)
+		if !match {
+			continue
 		}
+		owner := strings.TrimSpace(sess.params.UserID)
+		if !isAdmin && owner != "" && owner != callerUserID {
+			continue
+		}
+		toStop = append(toStop, sess)
+		delete(m.sessions, key)
 	}
 	m.mu.Unlock()
 
@@ -739,6 +786,26 @@ func (s *transcodeSession) destroy() {
 func isHTTPInput(inputPath string) bool {
 	lower := strings.ToLower(strings.TrimSpace(inputPath))
 	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
+}
+
+func isBitmapSubtitleCodec(codec string) bool {
+	switch strings.ToLower(strings.TrimSpace(codec)) {
+	case "pgssub", "pgs", "sup", "hdmv_pgs_subtitle", "dvd_subtitle", "dvdsub", "vobsub", "dvb_subtitle", "dvbsub":
+		return true
+	default:
+		return false
+	}
+}
+
+func escapeFFmpegFilterPath(p string) string {
+	r := strings.NewReplacer(
+		`\`, `\\`,
+		`:`, `\:`,
+		`'`, `\'`,
+		`[`, `\[`,
+		`]`, `\]`,
+	)
+	return r.Replace(p)
 }
 
 func fileReady(path string) bool {

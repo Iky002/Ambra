@@ -64,6 +64,91 @@ let activeDemoScan: DemoScanState | null = null
 let demoSetupCompleted = true
 let demoDefaultLanguage = 'zh-CN'
 
+interface DemoOrphanItem {
+  Id: string
+  Name: string
+  Type: string
+  LibraryId: string
+  Path: string
+  Year?: number
+  IsStrm: boolean
+}
+
+interface DemoScrapeCandidate {
+  ProviderId: string
+  ProviderName?: string
+  Title: string
+  OriginalTitle?: string
+  Year?: number
+  Overview?: string
+  Rating?: number
+  PosterUrl?: string
+  Confidence: number
+  Genres?: string[]
+  Tags?: string[]
+}
+
+interface DemoScrapeAuditItem {
+  Id: string
+  ItemId: string
+  ItemName: string
+  ItemType: string
+  Path: string
+  Confidence: number
+  Candidates: DemoScrapeCandidate[]
+  Status: 'pending' | 'approved' | 'dismissed'
+  CreatedAt: number
+  UpdatedAt: number
+}
+
+function createInitialDemoOrphans(): DemoOrphanItem[] {
+  return [
+    {
+      Id: 'orphan-demo-01',
+      Name: '失落的测试样片 (磁盘已移除)',
+      Type: 'Movie',
+      LibraryId: 'lib-movies',
+      Path: '/media/movies/Archived/Lost.Sample.2021.mkv',
+      Year: 2021,
+      IsStrm: false,
+    },
+  ]
+}
+
+function createInitialDemoReviews(): DemoScrapeAuditItem[] {
+  const nowSec = Math.floor(Date.now() / 1000)
+  return [
+    {
+      Id: 'audit-demo-01',
+      ItemId: 'item-dune-2',
+      ItemName: 'Dune.Part.Two.2024.2160p.REMUX.mkv',
+      ItemType: 'Movie',
+      Path: '/media/movies/Dune.Part.Two.2024.2160p.REMUX.mkv',
+      Confidence: 0.68,
+      Status: 'pending',
+      CreatedAt: nowSec - 3600,
+      UpdatedAt: nowSec - 3600,
+      Candidates: [
+        {
+          ProviderId: '693134',
+          ProviderName: 'TheMovieDb',
+          Title: '沙丘 2',
+          OriginalTitle: 'Dune: Part Two',
+          Year: 2024,
+          Overview: '保罗·厄崔迪与契妮和弗雷曼人联手，踏上复仇与宿命之战。',
+          Rating: 8.6,
+          Confidence: 0.96,
+          Genres: ['科幻', '冒险'],
+          Tags: ['TMDB热门'],
+        },
+      ],
+    },
+  ]
+}
+
+let demoOrphans: DemoOrphanItem[] = createInitialDemoOrphans()
+let demoReviews: DemoScrapeAuditItem[] = createInitialDemoReviews()
+
 function createInitialServerConfig(): ServerConfiguration {
   return {
     ServerName: store.systemInfo.ServerName,
@@ -145,6 +230,8 @@ export function resetDemoStore(): void {
   demoSetupCompleted = true
   demoDefaultLanguage = 'zh-CN'
   demoServerConfig = createInitialServerConfig()
+  demoOrphans = createInitialDemoOrphans()
+  demoReviews = createInitialDemoReviews()
 }
 
 export function getDemoImageUrl(
@@ -973,6 +1060,29 @@ export async function demoFetch<T>(
     return { Id: id, Name: name } as T
   }
 
+  const movePlaylistItemMatch = pathname.match(
+    /^\/(?:emby\/)?Playlists\/([^/]+)\/Items\/([^/]+)\/Move\/(-?\d+)$/,
+  )
+  if (movePlaylistItemMatch && method === 'POST') {
+    const playlistId = decodeURIComponent(movePlaylistItemMatch[1])
+    const itemId = decodeURIComponent(movePlaylistItemMatch[2])
+    const newIndexRaw = Number(movePlaylistItemMatch[3])
+    const container = store.items.get(playlistId)
+    if (!container || container.Type !== 'Playlist') {
+      throw new ApiError(404, '播放列表不存在')
+    }
+    const list = [...(store.libraryItems.get(playlistId) || [])]
+    const fromIdx = list.indexOf(itemId)
+    if (fromIdx < 0) {
+      throw new ApiError(404, '播放列表中不存在该项目')
+    }
+    const clampedIndex = Math.max(0, Math.min(list.length - 1, newIndexRaw))
+    list.splice(fromIdx, 1)
+    list.splice(clampedIndex, 0, itemId)
+    store.libraryItems.set(playlistId, list)
+    return undefined as T
+  }
+
   const containerItemsMatch = pathname.match(/^\/emby\/(Collections|Playlists)\/([^/]+)\/Items$/)
   if (containerItemsMatch) {
     const containerId = decodeURIComponent(containerItemsMatch[2])
@@ -1324,7 +1434,314 @@ export async function demoFetch<T>(
     return undefined as T
   }
 
-  const govLockMatch = pathname.match(/^\/api\/admin\/governance\/items\/([^/]+)\/lock$/)
+  // ==================== 9b. 系统健康诊断与媒体库治理 (Governance) ====================
+  if (pathname === '/api/admin/health' && method === 'GET') {
+    const allItems = Array.from(store.items.values())
+    const movieCount = allItems.filter((i) => i.Type === 'Movie').length
+    const seriesCount = allItems.filter((i) => i.Type === 'Series').length
+    const episodeCount = allItems.filter((i) => i.Type === 'Episode').length
+    const pendingAudits = demoReviews.filter((r) => r.Status === 'pending').length
+    const totalDisk = 2 * 1024 * 1024 * 1024 * 1024 // 2 TB
+    const freeDisk = Math.floor(totalDisk * 0.62)
+    return {
+      CollectedAt: Math.floor(Date.now() / 1000),
+      Status: 'healthy',
+      GoVersion: 'go1.24.0 (Demo)',
+      NumCpu: 8,
+      NumGoroutine: 42,
+      Memory: {
+        AllocBytes: 96 * 1024 * 1024,
+        TotalAllocBytes: 512 * 1024 * 1024,
+        SysBytes: 184 * 1024 * 1024,
+        HeapInuseBytes: 112 * 1024 * 1024,
+        NumGC: 28,
+      },
+      Database: {
+        DbPath: '/data/ambra.db',
+        DbBytes: 24 * 1024 * 1024,
+        WalBytes: 4 * 1024 * 1024,
+        ShmBytes: 32 * 1024,
+        TotalBytes: 28 * 1024 * 1024 + 32 * 1024,
+      },
+      Cache: {
+        ImagesBytes: 186 * 1024 * 1024,
+        SubtitlesBytes: 12 * 1024 * 1024,
+        TranscodeBytes: 0,
+        TotalBytes: 198 * 1024 * 1024,
+      },
+      Disk: {
+        Path: '/data',
+        TotalBytes: totalDisk,
+        FreeBytes: freeDisk,
+        AvailableBytes: freeDisk,
+        UsedPercent: 38.0,
+      },
+      Library: {
+        TotalItems: allItems.length,
+        MovieCount: movieCount,
+        SeriesCount: seriesCount,
+        EpisodeCount: episodeCount,
+        UserCount: store.users.length,
+        PendingAudits: pendingAudits,
+      },
+      Scheduler: {
+        TotalTasks: store.scheduledTasks.length,
+        ActiveTasks: activeDemoScan ? 1 : 0,
+        BudgetInUse: activeDemoScan ? 2 : 0,
+        BudgetCapacity: 8,
+        BudgetUsagePct: activeDemoScan ? 25 : 0,
+      },
+    } as T
+  }
+
+  if (pathname === '/api/admin/governance/storage' && method === 'GET') {
+    const librariesBreakdown = store.libraries.map((lib) => {
+      const ids = store.libraryItems.get(lib.ItemId) || []
+      let totalSize = 0
+      for (const id of ids) {
+        const it = store.items.get(id)
+        for (const src of it?.MediaSources || []) {
+          totalSize += src.Size || 0
+        }
+      }
+      return {
+        LibraryId: lib.ItemId,
+        LibraryName: lib.Name,
+        CollectionType: lib.CollectionType || 'mixed',
+        ItemCount: ids.length,
+        TotalBytes: totalSize,
+      }
+    })
+    const totalMediaBytes = librariesBreakdown.reduce((acc, l) => acc + l.TotalBytes, 0)
+    return {
+      GeneratedAt: Math.floor(Date.now() / 1000),
+      TotalMediaBytes: totalMediaBytes,
+      CacheBytes: 198 * 1024 * 1024,
+      DatabaseBytes: 28 * 1024 * 1024,
+      Libraries: librariesBreakdown,
+    } as T
+  }
+
+  if (pathname === '/api/admin/governance/duplicates' && method === 'GET') {
+    const byKey = new Map<string, BaseItemDto[]>()
+    for (const it of store.items.values()) {
+      if (it.Type !== 'Movie' && it.Type !== 'Series') continue
+      const key = it.ProviderIds?.Tmdb
+        ? `${it.Type}:tmdb:${it.ProviderIds.Tmdb}`
+        : `${it.Type}:name:${it.Name.toLowerCase()}`
+      const list = byKey.get(key) || []
+      list.push(it)
+      byKey.set(key, list)
+    }
+    const groups = Array.from(byKey.entries())
+      .filter(([, list]) => list.length > 1)
+      .map(([key, list]) => ({
+        GroupKey: key,
+        Name: list[0].Name,
+        Type: list[0].Type,
+        Items: list.map((it) => ({
+          Id: it.Id,
+          Name: it.Name,
+          Path: it.Path || '',
+          Year: it.ProductionYear,
+          MediaSourceCount: it.MediaSources?.length || 0,
+        })),
+      }))
+    return {
+      Groups: groups,
+      TotalGroups: groups.length,
+    } as T
+  }
+
+  if (pathname === '/api/admin/governance/duplicates/merge' && method === 'POST') {
+    const body = parseJsonBody(options)
+    const rawIds = Array.isArray(body.ItemIds)
+      ? body.ItemIds
+      : Array.isArray(body.item_ids)
+        ? body.item_ids
+        : Array.isArray(body.Ids)
+          ? body.Ids
+          : []
+    const ids = rawIds.map((x) => String(x).trim()).filter(Boolean)
+    if (ids.length < 2) {
+      throw new ApiError(400, '至少需要选择 2 个重复条目进行合并')
+    }
+    const primaryId = String(body.PrimaryItemId || body.primary_item_id || ids[0]).trim()
+    const primary = store.items.get(primaryId)
+    if (!primary) throw new ApiError(404, '主条目不存在')
+    const mergedSources = [...(primary.MediaSources || [])]
+    const removedIds: string[] = []
+    for (const otherId of ids) {
+      if (otherId === primaryId) continue
+      const other = store.items.get(otherId)
+      if (!other) continue
+      if (other.MediaSources) mergedSources.push(...other.MediaSources)
+      store.items.delete(otherId)
+      removedIds.push(otherId)
+      for (const [libId, libIds] of store.libraryItems.entries()) {
+        store.libraryItems.set(
+          libId,
+          libIds.filter((id) => id !== otherId),
+        )
+      }
+    }
+    primary.MediaSources = mergedSources
+    pushActivity(`已合并 ${removedIds.length + 1} 个重复条目至「${primary.Name}」`, 'DuplicatesMerged')
+    return {
+      PrimaryItemId: primaryId,
+      MergedCount: removedIds.length + 1,
+      RemovedIds: removedIds,
+    } as T
+  }
+
+  if (pathname === '/api/admin/governance/audit' && method === 'GET') {
+    const allItems = Array.from(store.items.values()).filter(
+      (it) => it.Type === 'Movie' || it.Type === 'Series',
+    )
+    const missingPosters: DemoOrphanItem[] = []
+    const missingTmdb: DemoOrphanItem[] = []
+    for (const it of allItems) {
+      if (!it.ImageTags?.Primary) {
+        missingPosters.push({
+          Id: it.Id,
+          Name: it.Name,
+          Type: it.Type,
+          LibraryId: it.ParentId || '',
+          Path: it.Path || '',
+          Year: it.ProductionYear,
+          IsStrm: Boolean(it.Path?.toLowerCase().endsWith('.strm')),
+        })
+      }
+      if (!it.ProviderIds?.Tmdb) {
+        missingTmdb.push({
+          Id: it.Id,
+          Name: it.Name,
+          Type: it.Type,
+          LibraryId: it.ParentId || '',
+          Path: it.Path || '',
+          Year: it.ProductionYear,
+          IsStrm: Boolean(it.Path?.toLowerCase().endsWith('.strm')),
+        })
+      }
+    }
+    return {
+      ScannedAt: Math.floor(Date.now() / 1000),
+      TotalChecked: allItems.length,
+      MissingPosters: missingPosters,
+      MissingTmdb: missingTmdb,
+      OrphanItems: [...demoOrphans],
+    } as T
+  }
+
+  if (pathname === '/api/admin/governance/orphans/cleanup' && method === 'POST') {
+    const body = parseJsonBody(options)
+    const rawIds = Array.isArray(body.ItemIds)
+      ? body.ItemIds
+      : Array.isArray(body.item_ids)
+        ? body.item_ids
+        : []
+    const ids = rawIds.map((x) => String(x).trim()).filter(Boolean)
+    if (ids.length === 0) {
+      throw new ApiError(400, 'ItemIds must not be empty')
+    }
+    const idSet = new Set(ids)
+    const deletedIds: string[] = []
+    demoOrphans = demoOrphans.filter((o) => {
+      if (idSet.has(o.Id)) {
+        deletedIds.push(o.Id)
+        return false
+      }
+      return true
+    })
+    for (const id of ids) {
+      if (store.items.has(id) && !deletedIds.includes(id)) {
+        store.items.delete(id)
+        deletedIds.push(id)
+      }
+    }
+    pushActivity(`已清理 ${deletedIds.length} 条磁盘孤立记录`, 'OrphansCleaned')
+    return {
+      Requested: ids.length,
+      Deleted: deletedIds.length,
+      DeletedIds: deletedIds,
+    } as T
+  }
+
+  if (pathname === '/api/admin/governance/review' && method === 'GET') {
+    const status = (qs.get('status') || 'pending').toLowerCase()
+    const filtered =
+      status === 'all'
+        ? demoReviews
+        : demoReviews.filter((r) => r.Status.toLowerCase() === status)
+    return {
+      Items: filtered.map((r) => ({ ...r, Candidates: [...r.Candidates] })),
+      TotalRecordCount: filtered.length,
+    } as T
+  }
+
+  const govReviewApproveMatch = pathname.match(
+    /^\/api\/admin\/governance\/review\/([^/]+)\/approve$/,
+  )
+  if (govReviewApproveMatch && method === 'POST') {
+    const reviewId = decodeURIComponent(govReviewApproveMatch[1])
+    const audit = demoReviews.find((r) => r.Id === reviewId)
+    if (!audit) throw new ApiError(404, '审校记录不存在')
+    const body = parseJsonBody(options)
+    const cand = body.Candidate as DemoScrapeCandidate | undefined
+    const lockFields = Array.isArray(body.LockFields)
+      ? body.LockFields.map((f) => String(f)).filter(Boolean)
+      : []
+    const targetItem = store.items.get(audit.ItemId)
+    if (targetItem && cand) {
+      if (cand.Title) targetItem.Name = cand.Title
+      if (cand.OriginalTitle) targetItem.OriginalTitle = cand.OriginalTitle
+      if (cand.Year) targetItem.ProductionYear = cand.Year
+      if (cand.Overview) targetItem.Overview = cand.Overview
+      if (cand.ProviderId) {
+        targetItem.ProviderIds = { ...(targetItem.ProviderIds || {}), Tmdb: cand.ProviderId }
+      }
+      if (lockFields.length > 0) {
+        targetItem.LockedFields = Array.from(
+          new Set([...(targetItem.LockedFields || []), ...lockFields]),
+        )
+      }
+    }
+    audit.Status = 'approved'
+    audit.UpdatedAt = Math.floor(Date.now() / 1000)
+    pushActivity(`已通过审校项「${audit.ItemName}」`, 'ScrapeReviewApproved')
+    return { ...audit } as T
+  }
+
+  const govReviewDismissMatch = pathname.match(
+    /^\/api\/admin\/governance\/review\/([^/]+)\/dismiss$/,
+  )
+  if (govReviewDismissMatch && method === 'POST') {
+    const reviewId = decodeURIComponent(govReviewDismissMatch[1])
+    const audit = demoReviews.find((r) => r.Id === reviewId)
+    if (!audit) throw new ApiError(404, '审校记录不存在')
+    audit.Status = 'dismissed'
+    audit.UpdatedAt = Math.floor(Date.now() / 1000)
+    pushActivity(`已忽略审校项「${audit.ItemName}」`, 'ScrapeReviewDismissed')
+    return { ...audit } as T
+  }
+
+  const govLockMatch = pathname.match(/^\/api\/admin\/governance\/items\/([^/]+)\/locks?$/)
+  if (govLockMatch && method === 'GET') {
+    const itemId = decodeURIComponent(govLockMatch[1])
+    const item = store.items.get(itemId)
+    if (!item) throw new ApiError(404, '项目不存在')
+    const fields = [...(item.LockedFields || [])]
+    const lockAll = Boolean(item.LockData)
+    return {
+      ItemId: itemId,
+      LockedFields: fields,
+      LockData: lockAll,
+      item_id: itemId,
+      locked_fields: fields,
+      lock_data: lockAll,
+    } as T
+  }
+
   if (govLockMatch && method === 'POST') {
     const itemId = decodeURIComponent(govLockMatch[1])
     const item = store.items.get(itemId)
@@ -1340,7 +1757,14 @@ export async function demoFetch<T>(
     item.LockedFields = fields
     item.LockData = lockAll
     pushActivity(`已更新「${item.Name}」的元数据锁定配置`, 'ItemFieldsLocked')
-    return { item_id: itemId, locked_fields: fields, lock_data: lockAll } as T
+    return {
+      ItemId: itemId,
+      LockedFields: fields,
+      LockData: lockAll,
+      item_id: itemId,
+      locked_fields: fields,
+      lock_data: lockAll,
+    } as T
   }
 
   const govNfoMatch = pathname.match(/^\/api\/admin\/governance\/items\/([^/]+)\/nfo$/)
@@ -1348,11 +1772,21 @@ export async function demoFetch<T>(
     const itemId = decodeURIComponent(govNfoMatch[1])
     const item = store.items.get(itemId)
     if (!item) throw new ApiError(404, '项目不存在')
+    const rootTag =
+      item.Type === 'Series' ? 'tvshow' : item.Type === 'Episode' ? 'episodedetails' : 'movie'
     const nfoPath = item.Path
       ? item.Path.replace(/\.[^/.]+$/, '.nfo')
-      : `/media/${item.Name}/movie.nfo`
+      : `/media/${item.Name}/${rootTag}.nfo`
     pushActivity(`已原子回写「${item.Name}」的 NFO 文件`, 'ItemNfoWritten', nfoPath)
-    return { item_id: itemId, path: nfoPath, written: true } as T
+    return {
+      ItemId: itemId,
+      NfoPath: nfoPath,
+      RootTag: rootTag,
+      BytesSize: 1280,
+      item_id: itemId,
+      path: nfoPath,
+      written: true,
+    } as T
   }
 
   if (pathname === '/emby/Library/Refresh' && method === 'POST') {
@@ -1414,8 +1848,9 @@ export async function demoFetch<T>(
     }
     if (method === 'DELETE') {
       const name = String(qs.get('Name') || qs.get('name') || '').trim()
+      const id = String(qs.get('Id') || qs.get('id') || '').trim()
       const targetPath = String(qs.get('Path') || qs.get('path') || '').trim()
-      const lib = store.libraries.find((l) => l.Name === name)
+      const lib = store.libraries.find((l) => (id && l.ItemId === id) || (name && l.Name === name))
       if (!lib) throw new ApiError(404, '媒体库不存在')
       lib.Locations = (lib.Locations || []).filter((p) => p !== targetPath)
       pushActivity(`从媒体库「${lib.Name}」移除路径`, 'LibraryPathRemoved', targetPath)

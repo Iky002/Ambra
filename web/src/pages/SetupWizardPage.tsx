@@ -106,6 +106,7 @@ export function SetupWizardPage() {
   const [libName, setLibName] = useState('')
   const [libType, setLibType] = useState('movies')
   const [libPath, setLibPath] = useState('')
+  const [saveLocalMetadata, setSaveLocalMetadata] = useState(true)
   const [addingLibrary, setAddingLibrary] = useState(false)
   const [libraryFeedback, setLibraryFeedback] = useState('')
 
@@ -242,6 +243,7 @@ export function SetupWizardPage() {
         CollectionType: libType,
         Paths: [trimmedPath],
         refreshLibrary: false,
+        saveLocalMetadata,
       })
       setAddedLibraries((prev) => [
         ...prev,
@@ -708,6 +710,13 @@ export function SetupWizardPage() {
                     </button>
                   </div>
                 </div>
+
+                <ToggleSwitch
+                  checked={saveLocalMetadata}
+                  onChange={setSaveLocalMetadata}
+                  label="保存元数据与图片到媒体文件夹"
+                  description="刮削完成后自动将 .nfo 与 poster.jpg / fanart.jpg 保存到媒体同目录（兼容 Emby / Kodi）"
+                />
 
                 <div className="flex justify-end">
                   <button

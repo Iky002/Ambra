@@ -27,11 +27,16 @@ import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { api, buildEmbyAuthHeader, getStoredAuth, resolveApiUrl } from '../api/client'
 import type { MediaSourceInfo, MediaStream } from '../api/types'
 import { AmbraLogo } from '../components/AmbraLogo'
+import { useAudioPlayer } from '../context/AudioPlayerContext'
 import { useAuth } from '../context/AuthContext'
 import { isDemoMode } from '../demo/demoMode'
 import { AssJassubRenderer } from '../player/assRenderer'
 import { PgsCanvasRenderer } from '../player/pgsRenderer'
-import { loadPlaybackPrefs } from '../player/playbackPrefs'
+import {
+  loadPlaybackPrefs,
+  pickPreferredAudioIndex,
+  pickPreferredSubtitleIndex,
+} from '../player/playbackPrefs'
 import {
   DEFAULT_SUBTITLE_PREFS,
   formatSubtitleOffset,
@@ -97,13 +102,27 @@ export function PlayerPage() {
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
   const { auth } = useAuth()
+  const audioPlayer = useAudioPlayer()
   const userId = auth!.userId
+
+  // 进入视频播放页时自动暂停全局音乐播放器，避免音视频同时出声
+  const audioPlayerRef = useRef(audioPlayer)
+  audioPlayerRef.current = audioPlayer
+  useEffect(() => {
+    if (audioPlayerRef.current.isPlaying) {
+      audioPlayerRef.current.pause()
+    }
+  }, [])
 
   const initialMediaSourceId = searchParams.get('mediaSourceId') || undefined
   const initialAudio = searchParams.get('audio') ? Number(searchParams.get('audio')) : undefined
-  const initialSubtitle = searchParams.get('subtitle')
-    ? Number(searchParams.get('subtitle'))
-    : undefined
+  const rawInitialSubtitle = searchParams.get('subtitle')
+  const initialSubtitle =
+    rawInitialSubtitle &&
+    rawInitialSubtitle !== 'off' &&
+    Number.isFinite(Number(rawInitialSubtitle))
+      ? Number(rawInitialSubtitle)
+      : undefined
   const initialStartTicks = searchParams.get('startTicks')
     ? Number(searchParams.get('startTicks'))
     : 0
@@ -120,12 +139,20 @@ export function PlayerPage() {
   const pgsRendererRef = useRef<PgsCanvasRenderer | null>(null)
   const hideOsdTimerRef = useRef<number | null>(null)
   const initialSeekDoneRef = useRef(false)
+  const initializedAudioSourceIdRef = useRef<string | null>(null)
   const initializedSubSourceIdRef = useRef<string | null>(null)
   const lastSeekReportRef = useRef(0)
+  const resumeSecRef = useRef<number | null>(null)
+  const hlsRecoveryCountRef = useRef(0)
+  const searchParamsRef = useRef(searchParams)
+  searchParamsRef.current = searchParams
+  const prevIdRef = useRef<string | undefined>(id)
 
   const [selectedSourceId, setSelectedSourceId] = useState<string | undefined>(initialMediaSourceId)
   const [audioIndex, setAudioIndex] = useState<number | undefined>(initialAudio)
   const [subtitleIndex, setSubtitleIndex] = useState<number | undefined>(initialSubtitle)
+  const [episodeIdSynced, setEpisodeIdSynced] = useState<string | undefined>(id)
+  const [retryNonce, setRetryNonce] = useState(0)
 
   const [playing, setPlaying] = useState(false)
   const [buffering, setBuffering] = useState(true)
@@ -135,6 +162,8 @@ export function PlayerPage() {
   const [volume, setVolume] = useState(1)
   const [muted, setMuted] = useState(false)
   const [playbackRate, setPlaybackRate] = useState(1)
+  const playbackRateRef = useRef(playbackRate)
+  playbackRateRef.current = playbackRate
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [osdVisible, setOsdVisible] = useState(true)
   const [activePanel, setActivePanel] = useState<ActivePanel>('none')
@@ -143,6 +172,13 @@ export function PlayerPage() {
   const [subtitleError, setSubtitleError] = useState<string | null>(null)
   const [playMethod, setPlayMethod] = useState<PlayMethodMode>('DirectPlay')
   const [nextUpCountdown, setNextUpCountdown] = useState<number | null>(null)
+
+  const captureResumePosition = useCallback(() => {
+    const v = videoRef.current
+    if (v && Number.isFinite(v.currentTime) && v.currentTime > 0) {
+      resumeSecRef.current = v.currentTime
+    }
+  }, [])
 
   // 客户端 WASM 解复用偏好与运行态
   const [preferWasmRemux, setPreferWasmRemuxState] = useState<boolean>(() => getPreferWasmRemux())
@@ -154,6 +190,7 @@ export function PlayerPage() {
   const sabSupported = useMemo(() => hasSharedArrayBufferSupport(), [])
 
   const togglePreferWasmRemux = useCallback(() => {
+    captureResumePosition()
     setPreferWasmRemuxState((prev) => {
       const next = !prev
       setPreferWasmRemux(next)
@@ -162,13 +199,42 @@ export function PlayerPage() {
       setWasmFallbackNotice(null)
       return next
     })
-  }, [])
+  }, [captureResumePosition])
 
-  // 切换视频条目时重置初始化起播定位与默认字幕初始化标记
+  // 切换视频条目（上一集 / 下一集 / 自动连播）时彻底重置源、轨道、进度、错误与回退状态
   useEffect(() => {
     initialSeekDoneRef.current = false
+    initializedAudioSourceIdRef.current = null
     initializedSubSourceIdRef.current = null
+    resumeSecRef.current = null
+    hlsRecoveryCountRef.current = 0
     setNextUpCountdown(null)
+
+    if (prevIdRef.current !== id) {
+      prevIdRef.current = id
+      const sp = searchParamsRef.current
+      const nextSourceId = sp.get('mediaSourceId') || undefined
+      const nextAudio = sp.get('audio') ? Number(sp.get('audio')) : undefined
+      const nextSubRaw = sp.get('subtitle')
+      const nextSubtitle =
+        nextSubRaw && nextSubRaw !== 'off' && Number.isFinite(Number(nextSubRaw))
+          ? Number(nextSubRaw)
+          : undefined
+      setSelectedSourceId(nextSourceId)
+      setAudioIndex(nextAudio)
+      setSubtitleIndex(nextSubtitle)
+      setPlayerError(null)
+      setSubtitleError(null)
+      setCurrentTime(0)
+      setDuration(0)
+      setBufferedEnd(0)
+      setTextCues([])
+      setUseProxyDirect(false)
+      setForceServerHls(false)
+      setWasmFallbackNotice(null)
+      setBuffering(true)
+      setEpisodeIdSynced(id)
+    }
   }, [id])
 
   // 切换视频或音轨时重置强制回退状态
@@ -213,10 +279,30 @@ export function PlayerPage() {
     [seasonEpisodes, id],
   )
   const prevEpisode = currentEpisodeIdx > 0 ? seasonEpisodes[currentEpisodeIdx - 1] : null
-  const nextEpisode =
+  const nextInSeasonEpisode =
     currentEpisodeIdx >= 0 && currentEpisodeIdx + 1 < seasonEpisodes.length
       ? seasonEpisodes[currentEpisodeIdx + 1]
       : null
+
+  // 当前季最后一集时，通过 NextUp 查询跨季下一集
+  const isLastInSeason =
+    Boolean(item?.Type === 'Episode' && item.SeriesId) &&
+    currentEpisodeIdx >= 0 &&
+    currentEpisodeIdx === seasonEpisodes.length - 1
+
+  const { data: crossSeasonNextUpData } = useQuery({
+    queryKey: ['nextUp', userId, item?.SeriesId, id],
+    queryFn: () => api.getNextUp(userId, { seriesId: item!.SeriesId!, limit: 2 }),
+    enabled: isLastInSeason,
+    staleTime: 60_000,
+  })
+
+  const crossSeasonNextEpisode = useMemo(() => {
+    if (!isLastInSeason || !crossSeasonNextUpData?.Items?.length) return null
+    return crossSeasonNextUpData.Items.find((ep) => ep.Id !== item?.Id) || null
+  }, [isLastInSeason, crossSeasonNextUpData, item?.Id])
+
+  const nextEpisode = nextInSeasonEpisode || crossSeasonNextEpisode
 
   useEffect(() => {
     if (nextUpCountdown === null || !nextEpisode) return
@@ -235,6 +321,7 @@ export function PlayerPage() {
     data: playbackInfo,
     isLoading: infoLoading,
     error: infoError,
+    refetch: refetchPlaybackInfo,
   } = useQuery({
     queryKey: ['playbackInfo', id, userId, selectedSourceId, audioIndex],
     queryFn: () =>
@@ -262,20 +349,49 @@ export function PlayerPage() {
   const audioStreams = streams.filter((s) => s.Type === 'Audio')
   const subtitleStreams = streams.filter((s) => s.Type === 'Subtitle')
 
-  // 初始化默认音轨与字幕轨（每个媒体源仅初始化一次默认字幕，避免用户关闭字幕后回弹）
+  // 初始化默认音轨与字幕轨（优先用户偏好语言，其次服务端默认；每个媒体源仅初始化一次，避免用户关闭字幕后回弹）
   useEffect(() => {
-    if (!activeSource) return
+    if (!activeSource || episodeIdSynced !== id) return
     if (selectedSourceId === undefined) setSelectedSourceId(activeSource.Id)
-    if (audioIndex === undefined && activeSource.DefaultAudioStreamIndex !== undefined) {
-      setAudioIndex(activeSource.DefaultAudioStreamIndex)
+    const prefs = loadPlaybackPrefs()
+    if (initializedAudioSourceIdRef.current !== activeSource.Id) {
+      initializedAudioSourceIdRef.current = activeSource.Id
+      if (audioIndex === undefined) {
+        const pickedAudio = pickPreferredAudioIndex(
+          audioStreams,
+          prefs.preferredAudioLang,
+          activeSource.DefaultAudioStreamIndex,
+        )
+        if (pickedAudio !== undefined) {
+          setAudioIndex(pickedAudio)
+        }
+      }
     }
     if (initializedSubSourceIdRef.current !== activeSource.Id) {
       initializedSubSourceIdRef.current = activeSource.Id
-      if (subtitleIndex === undefined && activeSource.DefaultSubtitleStreamIndex !== undefined) {
-        setSubtitleIndex(activeSource.DefaultSubtitleStreamIndex)
+      if (searchParamsRef.current.get('subtitle') === 'off') {
+        setSubtitleIndex(undefined)
+      } else if (subtitleIndex === undefined) {
+        const pickedSub = pickPreferredSubtitleIndex(
+          subtitleStreams,
+          prefs.preferredSubtitleLang,
+          activeSource.DefaultSubtitleStreamIndex,
+        )
+        if (pickedSub !== undefined) {
+          setSubtitleIndex(pickedSub)
+        }
       }
     }
-  }, [activeSource, selectedSourceId, audioIndex, subtitleIndex])
+  }, [
+    activeSource,
+    episodeIdSynced,
+    id,
+    selectedSourceId,
+    audioIndex,
+    subtitleIndex,
+    audioStreams,
+    subtitleStreams,
+  ])
 
   // 计算生效的起播位置（优先 URL startTicks，否则从 item.UserData.PlaybackPositionTicks 自动续播）
   const effectiveStartTicks = useMemo(() => {
@@ -526,13 +642,26 @@ export function PlayerPage() {
 
     const startPlayback = () => {
       if (cancelled) return
-      const targetStartTicks = effectiveStartTicksRef.current
-      if (!initialSeekDoneRef.current && targetStartTicks > 0) {
-        const startSec = targetStartTicks / 10_000_000
-        if (Number.isFinite(startSec) && startSec > 0) {
-          video.currentTime = startSec
-        }
+      if (
+        resumeSecRef.current !== null &&
+        Number.isFinite(resumeSecRef.current) &&
+        resumeSecRef.current > 0
+      ) {
+        video.currentTime = resumeSecRef.current
+        resumeSecRef.current = null
         initialSeekDoneRef.current = true
+      } else {
+        const targetStartTicks = effectiveStartTicksRef.current
+        if (!initialSeekDoneRef.current && targetStartTicks > 0) {
+          const startSec = targetStartTicks / 10_000_000
+          if (Number.isFinite(startSec) && startSec > 0) {
+            video.currentTime = startSec
+          }
+          initialSeekDoneRef.current = true
+        }
+      }
+      if (Number.isFinite(playbackRateRef.current) && playbackRateRef.current > 0) {
+        video.playbackRate = playbackRateRef.current
       }
       video.play().catch(() => {
         // 浏览器自动播放策略阻止时保持暂停状态让用户点击
@@ -555,6 +684,7 @@ export function PlayerPage() {
       setPlayMethod('Server HLS')
       setWasmProgress(null)
       setBuffering(true)
+      hlsRecoveryCountRef.current = 0
 
       if (hlsRef.current) {
         hlsRef.current.destroy()
@@ -571,9 +701,21 @@ export function PlayerPage() {
         hls.attachMedia(video)
         hls.on(Hls.Events.MANIFEST_PARSED, startPlayback)
         hls.on(Hls.Events.ERROR, (_evt, data) => {
-          if (data.fatal && !cancelled) {
-            setPlayerError(`HLS 播放错误: ${data.details}`)
+          if (!data.fatal || cancelled) return
+          if (hlsRecoveryCountRef.current < 2) {
+            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+              hlsRecoveryCountRef.current += 1
+              hls.startLoad()
+              return
+            }
+            if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+              hlsRecoveryCountRef.current += 1
+              hls.recoverMediaError()
+              return
+            }
           }
+          setBuffering(false)
+          setPlayerError(`HLS 播放错误: ${data.details}`)
         })
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = url
@@ -728,6 +870,7 @@ export function PlayerPage() {
     useProxyDirect,
     forceServerHls,
     preferWasmRemux,
+    retryNonce,
   ])
 
   // 构建外挂字幕直出 URL
@@ -1059,9 +1202,21 @@ export function PlayerPage() {
     if (audioStreams.length <= 1) return
     const curPos = audioStreams.findIndex((a) => a.Index === audioIndex)
     const next = audioStreams[(curPos + 1) % audioStreams.length]
+    captureResumePosition()
     setAudioIndex(next.Index)
     pokeOsd()
-  }, [audioStreams, audioIndex, pokeOsd])
+  }, [audioStreams, audioIndex, captureResumePosition, pokeOsd])
+
+  const handleRetryPlayback = useCallback(() => {
+    captureResumePosition()
+    hlsRecoveryCountRef.current = 0
+    setPlayerError(null)
+    setBuffering(true)
+    setRetryNonce((n) => n + 1)
+    if (infoError) {
+      void refetchPlaybackInfo()
+    }
+  }, [captureResumePosition, infoError, refetchPlaybackInfo])
 
   const toggleMute = useCallback(() => {
     const v = videoRef.current
@@ -1237,12 +1392,14 @@ export function PlayerPage() {
             streamPlan?.isStrm &&
             streamPlan?.proxyDirectUrl
           ) {
+            captureResumePosition()
             setWasmFallbackNotice('STRM 直连失败，正在切换服务端代理直出 (&proxy=1)...')
             setUseProxyDirect(true)
             return
           }
           // 2) 若当前为 DirectPlay / Proxy Direct / Stream MKV (MSE) / Client WASM Remux 解码失败，自动无感回退服务端 HLS
           if (playMethod !== 'Server HLS' && !forceServerHls && streamPlan?.hlsUrl) {
+            captureResumePosition()
             setWasmFallbackNotice(
               playMethod === 'Proxy Direct'
                 ? '服务端代理直出解码失败，已自动回退服务端 HLS'
@@ -1341,6 +1498,7 @@ export function PlayerPage() {
               <button
                 type="button"
                 onClick={() => {
+                  captureResumePosition()
                   setWasmFallbackNotice('已手动切换至服务端 HLS')
                   setForceServerHls(true)
                 }}
@@ -1377,13 +1535,22 @@ export function PlayerPage() {
             <p className="mt-2 text-xs text-zinc-400">
               {playerError || (infoError instanceof Error ? infoError.message : '获取播放信息失败')}
             </p>
-            <button
-              type="button"
-              onClick={() => navigate(-1)}
-              className="mt-5 rounded-xl bg-amber-500 px-5 py-2 text-xs font-semibold text-zinc-950 hover:bg-amber-400"
-            >
-              返回上一页
-            </button>
+            <div className="mt-5 flex items-center justify-center gap-3">
+              <button
+                type="button"
+                onClick={handleRetryPlayback}
+                className="rounded-xl bg-amber-500 px-5 py-2 text-xs font-semibold text-zinc-950 hover:bg-amber-400"
+              >
+                重试播放
+              </button>
+              <button
+                type="button"
+                onClick={() => navigate(-1)}
+                className="rounded-xl border border-white/15 bg-white/10 px-5 py-2 text-xs font-semibold text-zinc-100 hover:bg-white/20"
+              >
+                返回上一页
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -1738,6 +1905,7 @@ export function PlayerPage() {
                           key={a.Index}
                           type="button"
                           onClick={() => {
+                            captureResumePosition()
                             setAudioIndex(a.Index)
                             setActivePanel('none')
                           }}

@@ -18,6 +18,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/core/playback"
 	"github.com/ambra-media/ambra/internal/core/scanner"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
@@ -29,11 +30,11 @@ import (
 
 type itemUpdateRequest struct {
 	Name              string            `json:"Name"`
-	OriginalTitle     string            `json:"OriginalTitle"`
+	OriginalTitle     *string           `json:"OriginalTitle"`
 	SortName          string            `json:"SortName"`
-	Overview          string            `json:"Overview"`
+	Overview          *string           `json:"Overview"`
 	Taglines          []string          `json:"Taglines"`
-	OfficialRating    string            `json:"OfficialRating"`
+	OfficialRating    *string           `json:"OfficialRating"`
 	CommunityRating   *float64          `json:"CommunityRating"`
 	CriticRating      *float64          `json:"CriticRating"`
 	ProductionYear    *int              `json:"ProductionYear"`
@@ -44,6 +45,8 @@ type itemUpdateRequest struct {
 	Tags              []string          `json:"Tags"`
 	Studios           []dto.NameIdPair  `json:"Studios"`
 	ProviderIds       map[string]string `json:"ProviderIds"`
+	LockData          *bool             `json:"LockData"`
+	LockedFields      []string          `json:"LockedFields"`
 }
 
 func (h *Handler) handleUpdateItem(w http.ResponseWriter, r *http.Request) {
@@ -73,20 +76,20 @@ func (h *Handler) handleUpdateItem(w http.ResponseWriter, r *http.Request) {
 			rec.SortName = strings.ToLower(s)
 		}
 	}
-	if req.OriginalTitle != "" {
-		rec.OriginalTitle = req.OriginalTitle
+	if req.OriginalTitle != nil {
+		rec.OriginalTitle = *req.OriginalTitle
 	}
 	if req.SortName != "" {
 		rec.SortName = req.SortName
 	}
-	if req.Overview != "" {
-		rec.Extra.Overview = req.Overview
+	if req.Overview != nil {
+		rec.Extra.Overview = *req.Overview
 	}
 	if req.Taglines != nil {
 		rec.Extra.Taglines = req.Taglines
 	}
-	if req.OfficialRating != "" {
-		rec.OfficialRating = req.OfficialRating
+	if req.OfficialRating != nil {
+		rec.OfficialRating = *req.OfficialRating
 	}
 	if req.CommunityRating != nil {
 		rec.CommunityRating = req.CommunityRating
@@ -110,6 +113,12 @@ func (h *Handler) handleUpdateItem(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ProviderIds != nil {
 		rec.Extra.ProviderIDs = req.ProviderIds
+	}
+	if req.LockData != nil {
+		rec.Extra.LockData = *req.LockData
+	}
+	if req.LockedFields != nil {
+		rec.Extra.LockedFields = req.LockedFields
 	}
 	rec.DateModified = time.Now().Unix()
 	rec.Etag = guid.New()[:16]
@@ -146,6 +155,9 @@ func (h *Handler) handleUpdateItem(w http.ResponseWriter, r *http.Request) {
 	titleTokens := scanner.TokenizeForFTS(rec.Name, rec.OriginalTitle, rec.Extra.SeriesName)
 	peopleTokens := scanner.TokenizeForFTS(peopleNames...)
 	_ = h.repo.UpsertSearchFTS(r.Context(), rec.ID, titleRaw, titleTokens, "", "", peopleTokens)
+	if h.scanner != nil {
+		_ = h.scanner.SaveItemLocalNFO(r.Context(), rec.ID, true)
+	}
 	httpx.NoContent(w)
 }
 
@@ -567,6 +579,43 @@ func (h *Handler) handleItemAncestors(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, ancestors)
 }
 
+func (h *Handler) canAccessItem(r *http.Request, item *sqlite.ItemRecord) bool {
+	if item == nil {
+		return true
+	}
+	allowed := h.allowedLibrariesForRequest(r, "")
+	return isLibraryAllowed(item.LibraryID, allowed)
+}
+
+func (h *Handler) canAccessItemID(r *http.Request, itemID string) bool {
+	if h.userRepo == nil || h.repo == nil || itemID == "" {
+		return true
+	}
+	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
+	if err != nil || rec == nil {
+		return true
+	}
+	return h.canAccessItem(r, rec)
+}
+
+func (h *Handler) callerIdentity(r *http.Request) (userID string, isAdmin bool) {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		return guid.Normalize(ac.UserID()), ac.IsAdmin()
+	}
+	if h.auth.UserIDFromCtx != nil {
+		uid := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if uid != "" {
+			if h.userRepo != nil {
+				if u, err := h.userRepo.GetUserByID(r.Context(), uid); err == nil && u != nil {
+					return uid, u.IsAdmin || u.Policy.IsAdministrator
+				}
+			}
+			return uid, false
+		}
+	}
+	return "", false
+}
+
 func (h *Handler) handleItemFile(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
@@ -576,6 +625,10 @@ func (h *Handler) handleItemFile(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !h.canAccessItem(r, rec) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
 		return
 	}
 	if _, err := os.Stat(rec.Path); err != nil {
@@ -708,6 +761,10 @@ func (h *Handler) handleProviderSubtitleDownload(w http.ResponseWriter, _ *http.
 func (h *Handler) handleSubtitleStream(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	mediaSourceID := guid.Normalize(chi.URLParam(r, "MediaSourceId"))
+	if !h.canAccessItemID(r, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	idx, err := strconv.Atoi(chi.URLParam(r, "Index"))
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid subtitle index")
@@ -856,6 +913,10 @@ func (h *Handler) resolveMediaSourcePath(ctx context.Context, itemID, mediaSourc
 func (h *Handler) handleListVideoAttachments(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	mediaSourceID := guid.Normalize(chi.URLParam(r, "MediaSourceId"))
+	if !h.canAccessItemID(r, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	mediaPath := h.resolveMediaSourcePath(r.Context(), itemID, mediaSourceID)
 	if mediaPath == "" || h.extractor == nil {
 		httpx.JSON(w, http.StatusOK, []videoAttachmentDTO{})
@@ -882,6 +943,10 @@ func (h *Handler) handleListVideoAttachments(w http.ResponseWriter, r *http.Requ
 func (h *Handler) handleVideoAttachmentStream(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	mediaSourceID := guid.Normalize(chi.URLParam(r, "MediaSourceId"))
+	if !h.canAccessItemID(r, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	idx, err := strconv.Atoi(chi.URLParam(r, "Index"))
 	if err != nil || idx < 0 {
 		httpx.Error(w, http.StatusBadRequest, "invalid attachment index")
@@ -938,8 +1003,9 @@ func (h *Handler) handleDeleteActiveEncodings(w http.ResponseWriter, r *http.Req
 	q := httpx.ParseQuery(r)
 	deviceID := q.Get("DeviceId")
 	playSessionID := q.Get("PlaySessionId")
+	callerUserID, isAdmin := h.callerIdentity(r)
 	if h.transcodeMgr != nil {
-		h.transcodeMgr.StopByDevice(deviceID, playSessionID)
+		h.transcodeMgr.StopByDeviceForUser(deviceID, playSessionID, callerUserID, isAdmin)
 	}
 	httpx.NoContent(w)
 }

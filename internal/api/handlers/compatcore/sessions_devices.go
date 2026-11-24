@@ -11,6 +11,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/middleware"
+	"github.com/ambra-media/ambra/internal/api/ws"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 )
 
@@ -46,18 +47,70 @@ func (h *Handler) getSessionPlayQueue(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) authorizeSessionTarget(r *http.Request, sid string) (dto.SessionInfo, bool, bool) {
+	if h.sessions == nil || sid == "" {
+		return dto.SessionInfo{}, false, true
+	}
+	target, ok := h.sessions.GetSession(sid)
+	if !ok {
+		return dto.SessionInfo{}, false, true
+	}
+	if target.UserId != "" {
+		if ac, hasAuth := middleware.AuthFromContext(r.Context()); hasAuth && ac != nil {
+			if !ac.IsAdmin() && guid.Normalize(ac.UserID()) != guid.Normalize(target.UserId) {
+				return target, true, false
+			}
+		} else if h.auth.UserIDFromCtx != nil {
+			callerID := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+			if callerID != "" && callerID != guid.Normalize(target.UserId) && !h.isCallerAdmin(r) {
+				return target, true, false
+			}
+		}
+	}
+	return target, true, true
+}
+
+func (h *Handler) pushSessionWS(target dto.SessionInfo, found bool, msgType string, data any) {
+	if !found || h.wsHub == nil || target.DeviceId == "" {
+		return
+	}
+	h.wsHub.SendToDevice(target.DeviceId, ws.Message{
+		MessageType: msgType,
+		Data:        data,
+	})
+}
+
 func (h *Handler) postSessionViewing(w http.ResponseWriter, r *http.Request) {
 	sid := chi.URLParam(r, "Id")
+	target, found, allowed := h.authorizeSessionTarget(r, sid)
+	if !allowed {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	q := httpx.ParseQuery(r)
-	h.recordRemoteCommand(sid, "Viewing", q.Get("ItemType"), map[string]any{
+	payload := map[string]any{
 		"ItemId":   q.Get("ItemId"),
 		"ItemName": q.Get("ItemName"),
+	}
+	h.recordRemoteCommand(sid, "Viewing", q.Get("ItemType"), payload)
+	h.pushSessionWS(target, found, "GeneralCommand", map[string]any{
+		"Name": "DisplayContent",
+		"Arguments": map[string]any{
+			"ItemId":   q.Get("ItemId"),
+			"ItemName": q.Get("ItemName"),
+			"ItemType": q.Get("ItemType"),
+		},
 	})
 	httpx.NoContent(w)
 }
 
 func (h *Handler) postSessionPlaying(w http.ResponseWriter, r *http.Request) {
 	sid := chi.URLParam(r, "Id")
+	target, found, allowed := h.authorizeSessionTarget(r, sid)
+	if !allowed {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	var body map[string]any
 	_ = decodeOptionalJSON(r, &body)
@@ -71,27 +124,58 @@ func (h *Handler) postSessionPlaying(w http.ResponseWriter, r *http.Request) {
 		body["PlayCommand"] = cmd
 	}
 	h.recordRemoteCommand(sid, "Playing", q.Get("PlayCommand"), body)
+	h.pushSessionWS(target, found, "Play", body)
 	httpx.NoContent(w)
 }
 
 func (h *Handler) postSessionPlayingCommand(w http.ResponseWriter, r *http.Request) {
 	sid := chi.URLParam(r, "Id")
+	target, found, allowed := h.authorizeSessionTarget(r, sid)
+	if !allowed {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	cmd := chi.URLParam(r, "Command")
 	var body map[string]any
 	_ = decodeOptionalJSON(r, &body)
 	h.recordRemoteCommand(sid, "PlayingCommand", cmd, body)
+	wsPayload := map[string]any{
+		"Command": cmd,
+	}
+	for k, v := range body {
+		wsPayload[k] = v
+	}
+	if seek := httpx.ParseQuery(r).Get("SeekPositionTicks"); seek != "" {
+		if _, exists := wsPayload["SeekPositionTicks"]; !exists {
+			wsPayload["SeekPositionTicks"] = seek
+		}
+	}
+	h.pushSessionWS(target, found, "Playstate", wsPayload)
 	httpx.NoContent(w)
 }
 
 func (h *Handler) postSessionSystemCommand(w http.ResponseWriter, r *http.Request) {
 	sid := chi.URLParam(r, "Id")
+	target, found, allowed := h.authorizeSessionTarget(r, sid)
+	if !allowed {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	cmd := chi.URLParam(r, "Command")
 	h.recordRemoteCommand(sid, "SystemCommand", cmd, nil)
+	h.pushSessionWS(target, found, "GeneralCommand", map[string]any{
+		"Name": cmd,
+	})
 	httpx.NoContent(w)
 }
 
 func (h *Handler) postSessionCommand(w http.ResponseWriter, r *http.Request) {
 	sid := chi.URLParam(r, "Id")
+	target, found, allowed := h.authorizeSessionTarget(r, sid)
+	if !allowed {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	cmd := chi.URLParam(r, "Command")
 	var body map[string]any
 	_ = decodeOptionalJSON(r, &body)
@@ -101,11 +185,24 @@ func (h *Handler) postSessionCommand(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	h.recordRemoteCommand(sid, "GeneralCommand", cmd, body)
+	wsPayload := map[string]any{}
+	for k, v := range body {
+		wsPayload[k] = v
+	}
+	if cmd != "" {
+		wsPayload["Name"] = cmd
+	}
+	h.pushSessionWS(target, found, "GeneralCommand", wsPayload)
 	httpx.NoContent(w)
 }
 
 func (h *Handler) postSessionMessage(w http.ResponseWriter, r *http.Request) {
 	sid := chi.URLParam(r, "Id")
+	target, found, allowed := h.authorizeSessionTarget(r, sid)
+	if !allowed {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	var body map[string]any
 	_ = decodeOptionalJSON(r, &body)
@@ -119,6 +216,10 @@ func (h *Handler) postSessionMessage(w http.ResponseWriter, r *http.Request) {
 		body["Text"] = txt
 	}
 	h.recordRemoteCommand(sid, "Message", "DisplayMessage", body)
+	h.pushSessionWS(target, found, "GeneralCommand", map[string]any{
+		"Name":      "DisplayMessage",
+		"Arguments": body,
+	})
 	httpx.NoContent(w)
 }
 
@@ -283,11 +384,6 @@ func (h *Handler) connectExchange(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	connectUserID := strings.TrimSpace(q.Get("ConnectUserId"))
 	localUserID := h.resolveUserID(r, "")
-	if localUserID == "" && h.userRepo != nil {
-		if users, err := h.userRepo.ListUsers(r.Context()); err == nil && len(users) > 0 {
-			localUserID = users[0].ID
-		}
-	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"LocalUserId":   localUserID,
 		"AccessToken":   guid.New(),

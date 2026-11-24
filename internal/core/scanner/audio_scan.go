@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -388,4 +389,101 @@ func defaultAudioCodecForContainer(container string) string {
 		}
 		return "aac"
 	}
+}
+
+// applyAudioProbeTags enriches an Audio ItemRecord's Name, Album, Artists, AlbumArtist,
+// ProductionYear, and track/disc numbers from embedded ID3/Vorbis/FLAC format tags.
+func applyAudioProbeTags(rec *sqlite.ItemRecord, tags map[string]string) bool {
+	if rec == nil || len(tags) == 0 || rec.Extra.LockData {
+		return false
+	}
+	changed := false
+
+	if title := tagValue(tags, "title"); title != "" && !isFieldLocked(rec, "Name") {
+		if rec.Name != title {
+			rec.Name = title
+			if rec.IndexNumber != nil && *rec.IndexNumber > 0 {
+				dn := 0
+				if rec.ParentIndexNumber != nil {
+					dn = *rec.ParentIndexNumber
+				}
+				rec.SortName = fmt.Sprintf("%02d-%04d-%s", dn, *rec.IndexNumber, strings.ToLower(title))
+			} else {
+				rec.SortName = strings.ToLower(title)
+			}
+			changed = true
+		}
+	}
+
+	if album := tagValue(tags, "album"); album != "" {
+		if rec.Extra.Album != album {
+			rec.Extra.Album = album
+			changed = true
+		}
+	}
+
+	if artistRaw := tagValue(tags, "artist"); artistRaw != "" {
+		var artists []string
+		for _, part := range strings.FieldsFunc(artistRaw, func(r rune) bool { return r == ';' || r == '/' }) {
+			if s := strings.TrimSpace(part); s != "" {
+				artists = append(artists, s)
+			}
+		}
+		if len(artists) > 0 {
+			rec.Extra.Artists = artists
+			if rec.Extra.AlbumArtist == "" {
+				rec.Extra.AlbumArtist = artists[0]
+			}
+			changed = true
+		}
+	}
+
+	if albumArtist := tagValue(tags, "album_artist"); albumArtist != "" {
+		if rec.Extra.AlbumArtist != albumArtist {
+			rec.Extra.AlbumArtist = albumArtist
+			changed = true
+		}
+	} else if albumArtist := tagValue(tags, "albumartist"); albumArtist != "" {
+		if rec.Extra.AlbumArtist != albumArtist {
+			rec.Extra.AlbumArtist = albumArtist
+			changed = true
+		}
+	}
+
+	if !isFieldLocked(rec, "ProductionYear") {
+		rawDate := tagValue(tags, "date")
+		if rawDate == "" {
+			rawDate = tagValue(tags, "year")
+		}
+		if len(rawDate) >= 4 {
+			if yr, err := strconv.Atoi(rawDate[:4]); err == nil && yr >= 1900 && yr <= 2100 {
+				if rec.ProductionYear == nil || *rec.ProductionYear != yr {
+					rec.ProductionYear = &yr
+					changed = true
+				}
+			}
+		}
+	}
+
+	if rec.IndexNumber == nil {
+		if rawTrack := tagValue(tags, "track"); rawTrack != "" {
+			numPart := strings.SplitN(rawTrack, "/", 2)[0]
+			if tn, err := strconv.Atoi(strings.TrimSpace(numPart)); err == nil && tn > 0 {
+				rec.IndexNumber = &tn
+				changed = true
+			}
+		}
+	}
+
+	if rec.ParentIndexNumber == nil {
+		if rawDisc := tagValue(tags, "disc"); rawDisc != "" {
+			numPart := strings.SplitN(rawDisc, "/", 2)[0]
+			if dn, err := strconv.Atoi(strings.TrimSpace(numPart)); err == nil && dn > 0 {
+				rec.ParentIndexNumber = &dn
+				changed = true
+			}
+		}
+	}
+
+	return changed
 }

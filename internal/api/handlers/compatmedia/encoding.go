@@ -190,6 +190,8 @@ func (h *Handler) handlePhysicalPaths(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleSelectableMediaFolders(w http.ResponseWriter, r *http.Request) {
+	q := httpx.ParseQuery(r)
+	allowed := h.allowedLibrariesForRequest(r, h.resolveUserID(r, q))
 	libs, err := h.repo.ListLibraries(r.Context())
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -197,6 +199,9 @@ func (h *Handler) handleSelectableMediaFolders(w http.ResponseWriter, r *http.Re
 	}
 	out := make([]map[string]any, 0, len(libs))
 	for _, lib := range libs {
+		if !isLibraryAllowed(lib.ID, allowed) {
+			continue
+		}
 		subFolders := make([]map[string]any, 0, len(lib.Paths))
 		for _, p := range lib.Paths {
 			subFolders = append(subFolders, map[string]any{"Name": p, "Path": p})
@@ -211,6 +216,8 @@ func (h *Handler) handleSelectableMediaFolders(w http.ResponseWriter, r *http.Re
 }
 
 func (h *Handler) handleMediaFolders(w http.ResponseWriter, r *http.Request) {
+	q := httpx.ParseQuery(r)
+	allowed := h.allowedLibrariesForRequest(r, h.resolveUserID(r, q))
 	libs, err := h.repo.ListLibraries(r.Context())
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -218,6 +225,9 @@ func (h *Handler) handleMediaFolders(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]dto.BaseItemDto, 0, len(libs))
 	for _, lib := range libs {
+		if !isLibraryAllowed(lib.ID, allowed) {
+			continue
+		}
 		items = append(items, dto.BaseItemDto{
 			Id:                lib.ID,
 			Name:              lib.Name,
@@ -252,10 +262,18 @@ type virtualFolderInfo struct {
 
 func (h *Handler) handleQueryVirtualFolders(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
-	libs, err := h.repo.ListLibraries(r.Context())
+	allowed := h.allowedLibrariesForRequest(r, h.resolveUserID(r, q))
+	allLibs, err := h.repo.ListLibraries(r.Context())
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	libs := make([]sqlite.LibraryRecord, 0, len(allLibs))
+	for _, lib := range allLibs {
+		if !isLibraryAllowed(lib.ID, allowed) {
+			continue
+		}
+		libs = append(libs, lib)
 	}
 	total := len(libs)
 	start := q.Int("StartIndex", 0)

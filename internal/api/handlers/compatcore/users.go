@@ -198,12 +198,25 @@ func (h *Handler) queryUsers(w http.ResponseWriter, r *http.Request) {
 
 	var all []*sqlite.UserRecord
 	if h.userRepo != nil {
-		list, err := h.userRepo.ListUsers(r.Context())
-		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, "failed to query users")
-			return
+		if h.isCallerAdmin(r) {
+			list, err := h.userRepo.ListUsers(r.Context())
+			if err != nil {
+				httpx.Error(w, http.StatusInternalServerError, "failed to query users")
+				return
+			}
+			all = list
+		} else if callerID := h.resolveUserID(r, ""); callerID != "" {
+			if u, err := h.userRepo.GetUserByID(r.Context(), callerID); err == nil && u != nil {
+				all = []*sqlite.UserRecord{u}
+			}
+		} else {
+			list, err := h.userRepo.ListUsers(r.Context())
+			if err != nil {
+				httpx.Error(w, http.StatusInternalServerError, "failed to query users")
+				return
+			}
+			all = list
 		}
-		all = list
 	}
 
 	filtered := make([]dto.UserDto, 0, len(all))
@@ -386,6 +399,10 @@ func (h *Handler) copyUserData(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) deleteUserTrackSelections(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "Id")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	trackType := strings.ToLower(strings.TrimSpace(chi.URLParam(r, "TrackType")))
 	if h.store != nil && h.store.Writer != nil && uid != "" {
 		switch trackType {
@@ -402,12 +419,20 @@ func (h *Handler) deleteUserTrackSelections(w http.ResponseWriter, r *http.Reque
 
 func (h *Handler) deleteUserRecentlySearched(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "Id")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	_ = h.deleteKV(r.Context(), "user_searched_items:"+uid)
 	httpx.NoContent(w)
 }
 
 func (h *Handler) postUserSearchedItems(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	var payload map[string]any
 	_ = decodeOptionalJSON(r, &payload)
 	key := "user_searched_items:" + uid
@@ -435,6 +460,10 @@ func (h *Handler) getUserTypedSettings(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) postUserTypedSettings(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	settingKey := strings.TrimSpace(chi.URLParam(r, "Key"))
 	body := map[string]any{}
 	if err := decodeOptionalJSON(r, &body); err != nil {
@@ -474,6 +503,10 @@ func (h *Handler) getUserHomeSections(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) postUserHomeSections(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	var sec homeSection
 	if err := decodeOptionalJSON(r, &sec); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -508,6 +541,10 @@ func (h *Handler) postUserHomeSections(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) deleteUserHomeSections(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	ids := q.List("Ids")
 	var body struct {
@@ -538,6 +575,10 @@ func (h *Handler) deleteUserHomeSections(w http.ResponseWriter, r *http.Request)
 
 func (h *Handler) moveUserHomeSection(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	var body struct {
 		Id       string `json:"Id"`
@@ -675,6 +716,10 @@ func (h *Handler) getUserItemSpecialFeatures(w http.ResponseWriter, r *http.Requ
 
 func (h *Handler) deleteUserFavoriteItem(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	if h.libRepo != nil && uid != "" && itemID != "" {
 		if ud, err := h.libRepo.UnmarkFavorite(r.Context(), uid, itemID); err == nil && ud != nil {
@@ -687,6 +732,10 @@ func (h *Handler) deleteUserFavoriteItem(w http.ResponseWriter, r *http.Request)
 
 func (h *Handler) postUserItemRating(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	q := httpx.ParseQuery(r)
 	likes := q.Bool("Likes")
@@ -707,6 +756,10 @@ func (h *Handler) postUserItemRating(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) deleteUserItemRating(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	_ = h.deleteKV(r.Context(), fmt.Sprintf("user_rating:%s:%s", uid, itemID))
 
@@ -721,6 +774,10 @@ func (h *Handler) deleteUserItemRating(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) postUserItemHideFromResume(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	q := httpx.ParseQuery(r)
 	hide := true
@@ -780,6 +837,10 @@ func (h *Handler) postUserItemUserData(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) deleteUserPlayedItem(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	if h.libRepo != nil && uid != "" && itemID != "" {
 		if ud, err := h.libRepo.MarkUnplayed(r.Context(), uid, itemID); err == nil && ud != nil {
@@ -792,6 +853,10 @@ func (h *Handler) deleteUserPlayedItem(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) postUserPlayingItemStart(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	q := httpx.ParseQuery(r)
 	if h.sessions != nil && h.userRepo != nil && uid != "" {
@@ -812,6 +877,10 @@ func (h *Handler) postUserPlayingItemStart(w http.ResponseWriter, r *http.Reques
 
 func (h *Handler) postUserPlayingItemProgress(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	q := httpx.ParseQuery(r)
 	if h.sessions != nil && h.userRepo != nil && uid != "" {
@@ -837,6 +906,10 @@ func (h *Handler) postUserPlayingItemProgress(w http.ResponseWriter, r *http.Req
 
 func (h *Handler) deleteUserPlayingItem(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	q := httpx.ParseQuery(r)
 	if h.sessions != nil && h.userRepo != nil && uid != "" {
@@ -1012,6 +1085,10 @@ func (h *Handler) deleteUserImage(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) postUserConnectLink(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "Id")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	connectUser := q.Get("ConnectUsername")
 	var body struct {
@@ -1035,6 +1112,10 @@ func (h *Handler) postUserConnectLink(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) deleteUserConnectLink(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "Id")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	_ = h.deleteKV(r.Context(), "user_connect_link:"+uid)
 	httpx.NoContent(w)
 }

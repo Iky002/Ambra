@@ -15,6 +15,7 @@ import {
 import { api } from '../api/client'
 import type { BaseItemDto, RankingChartStatus } from '../api/types'
 import { MediaCard } from '../components/MediaCard'
+import { QueryErrorState } from '../components/QueryErrorState'
 import { useAuth } from '../context/AuthContext'
 import { FeedbackBanner, formatDateTime, formatRelativeTime } from './admin/adminUtils'
 
@@ -94,6 +95,9 @@ interface TrendingSectionProps {
   items: BaseItemDto[]
   total: number
   isLoading: boolean
+  isError?: boolean
+  error?: unknown
+  onRetry?: () => void
   isAdmin: boolean
   fallbackNotice?: boolean
   onViewAll?: () => void
@@ -110,6 +114,9 @@ function TrendingSection({
   items,
   total,
   isLoading,
+  isError,
+  error,
+  onRetry,
   isAdmin,
   fallbackNotice,
   onViewAll,
@@ -183,6 +190,13 @@ function TrendingSection({
         <div className="flex h-44 items-center justify-center">
           <Loader2 className={`h-6 w-6 animate-spin ${styles.spinner}`} />
         </div>
+      ) : isError ? (
+        <QueryErrorState
+          compact
+          title={`无法加载${title}`}
+          error={error}
+          onRetry={onRetry}
+        />
       ) : items.length === 0 ? (
         <div className="rounded-2xl border border-dashed border-white/12 bg-black/20 px-6 py-10 text-center">
           <p className="text-sm font-medium text-zinc-300">该榜单暂未匹配到库内作品</p>
@@ -242,10 +256,11 @@ export function TrendingPage() {
     placeholderData: (prev) => prev,
   })
 
-  // 当 TMDB热门 暂无数据时，优雅回退至旧版 Trending 标签
+  // 当 TMDB热门 暂无数据时，优雅回退至旧版 Trending 标签（仅在非错误态时触发回退）
   const needTmdbFallback =
     (isOverview || viewMode === 'tmdb') &&
     !tmdbQuery.isLoading &&
+    !tmdbQuery.isError &&
     (tmdbQuery.data?.Items?.length ?? 0) === 0
 
   const tmdbFallbackQuery = useQuery({
@@ -340,6 +355,12 @@ export function TrendingPage() {
     ? (tmdbFallbackQuery.data?.TotalRecordCount ?? tmdbItems.length)
     : (tmdbQuery.data?.TotalRecordCount ?? tmdbItems.length)
   const tmdbLoading = tmdbQuery.isLoading || (needTmdbFallback && tmdbFallbackQuery.isLoading)
+  const tmdbIsError = tmdbQuery.isError || (needTmdbFallback && tmdbFallbackQuery.isError)
+  const tmdbError = tmdbQuery.error || tmdbFallbackQuery.error
+  const retryTmdb = () => {
+    void tmdbQuery.refetch()
+    if (needTmdbFallback) void tmdbFallbackQuery.refetch()
+  }
 
   const doubanMovieItems = doubanMovieQuery.data?.Items || []
   const doubanMovieTotal = doubanMovieQuery.data?.TotalRecordCount ?? doubanMovieItems.length
@@ -517,6 +538,9 @@ export function TrendingPage() {
             items={tmdbItems}
             total={tmdbTotal}
             isLoading={tmdbLoading}
+            isError={tmdbIsError}
+            error={tmdbError}
+            onRetry={retryTmdb}
             isAdmin={isAdmin}
             fallbackNotice={usingTmdbFallback}
             onViewAll={() => setViewMode('tmdb')}
@@ -532,6 +556,9 @@ export function TrendingPage() {
             items={doubanMovieItems}
             total={doubanMovieTotal}
             isLoading={doubanMovieQuery.isLoading}
+            isError={doubanMovieQuery.isError}
+            error={doubanMovieQuery.error}
+            onRetry={() => void doubanMovieQuery.refetch()}
             isAdmin={isAdmin}
             onViewAll={() => setViewMode('douban_movie')}
           />
@@ -546,6 +573,9 @@ export function TrendingPage() {
             items={doubanTvItems}
             total={doubanTvTotal}
             isLoading={doubanTvQuery.isLoading}
+            isError={doubanTvQuery.isError}
+            error={doubanTvQuery.error}
+            onRetry={() => void doubanTvQuery.refetch()}
             isAdmin={isAdmin}
             onViewAll={() => setViewMode('douban_tv')}
           />
@@ -561,6 +591,9 @@ export function TrendingPage() {
           items={tmdbItems}
           total={tmdbTotal}
           isLoading={tmdbLoading}
+          isError={tmdbIsError}
+          error={tmdbError}
+          onRetry={retryTmdb}
           isAdmin={isAdmin}
           fallbackNotice={usingTmdbFallback}
           headerExtra={tmdbSubFilterControl}
@@ -576,6 +609,9 @@ export function TrendingPage() {
           items={doubanMovieItems}
           total={doubanMovieTotal}
           isLoading={doubanMovieQuery.isLoading}
+          isError={doubanMovieQuery.isError}
+          error={doubanMovieQuery.error}
+          onRetry={() => void doubanMovieQuery.refetch()}
           isAdmin={isAdmin}
         />
       ) : (
@@ -589,6 +625,9 @@ export function TrendingPage() {
           items={doubanTvItems}
           total={doubanTvTotal}
           isLoading={doubanTvQuery.isLoading}
+          isError={doubanTvQuery.isError}
+          error={doubanTvQuery.error}
+          onRetry={() => void doubanTvQuery.refetch()}
           isAdmin={isAdmin}
         />
       )}

@@ -348,3 +348,124 @@ func TestSpoofedUserIDCannotBypassEnabledFolders(t *testing.T) {
 		t.Fatalf("allowed ShowEpisodes on seriesA expected 200, got %d", rec.Code)
 	}
 }
+
+func TestPlayedFavoriteIDORAndCountsTaxonomiesScoping(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(tmp, "idor.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	repo := sqlite.NewLibraryRepo(store)
+	userRepo := sqlite.NewUserRepo(store)
+	cfg := config.Default(tmp)
+	ctx := context.Background()
+
+	libA, _ := repo.CreateLibrary(ctx, "LibA", "movies", []string{filepath.Join(tmp, "a")})
+	libB, _ := repo.CreateLibrary(ctx, "LibB", "movies", []string{filepath.Join(tmp, "b")})
+
+	y2020 := 2020
+	y2025 := 2025
+	movieA := &sqlite.ItemRecord{
+		ID: guid.New(), LibraryID: libA.ID, ParentID: libA.ID,
+		Type: "Movie", MediaType: "Video", Name: "Alpha", SortName: "alpha",
+		ProductionYear: &y2020,
+	}
+	movieB := &sqlite.ItemRecord{
+		ID: guid.New(), LibraryID: libB.ID, ParentID: libB.ID,
+		Type: "Movie", MediaType: "Video", Name: "Beta", SortName: "beta",
+		ProductionYear: &y2025,
+	}
+	_ = repo.UpsertItem(ctx, movieA)
+	_ = repo.UpsertItem(ctx, movieB)
+	_ = repo.ReplaceItemTaxonomies(ctx, movieA.ID, "genre", []string{"Action"})
+	_ = repo.ReplaceItemTaxonomies(ctx, movieB.ID, "genre", []string{"SecretGenre"})
+	_ = repo.ReplaceItemTaxonomies(ctx, movieA.ID, "studio", []string{"StudioA"})
+	_ = repo.ReplaceItemTaxonomies(ctx, movieB.ID, "studio", []string{"StudioB"})
+
+	adminUser := &sqlite.UserRecord{
+		ID: guid.New(), Name: "admin", IsAdmin: true,
+		Policy: sqlite.DefaultUserPolicy(true), Config: sqlite.DefaultUserConfig(),
+	}
+	_ = userRepo.CreateUser(ctx, adminUser)
+
+	restrictedPolicy := sqlite.DefaultUserPolicy(false)
+	restrictedPolicy.EnableAllFolders = false
+	restrictedPolicy.EnabledFolders = []string{libA.ID}
+	restrictedUser := &sqlite.UserRecord{
+		ID: guid.New(), Name: "restricted",
+		Policy: restrictedPolicy, Config: sqlite.DefaultUserConfig(),
+	}
+	_ = userRepo.CreateUser(ctx, restrictedUser)
+
+	mux := http.NewServeMux()
+	h := New(repo, nil, cfg)
+	h.SetUserRepo(userRepo)
+	h.RegisterRoutes(mux, AuthFuncs{
+		UserIDFromCtx: func(context.Context) string { return restrictedUser.ID },
+	})
+
+	do := func(method, path string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(method, path, nil))
+		return rec
+	}
+
+	// 1. IDOR on PlayedItems and FavoriteItems targeting adminUser -> 403
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPost, "/Users/" + adminUser.ID + "/PlayedItems/" + movieA.ID},
+		{http.MethodDelete, "/Users/" + adminUser.ID + "/PlayedItems/" + movieA.ID},
+		{http.MethodPost, "/Users/" + adminUser.ID + "/FavoriteItems/" + movieA.ID},
+		{http.MethodDelete, "/Users/" + adminUser.ID + "/FavoriteItems/" + movieA.ID},
+	} {
+		if rec := do(tc.method, tc.path); rec.Code != http.StatusForbidden {
+			t.Fatalf("%s %s expected 403, got %d", tc.method, tc.path, rec.Code)
+		}
+	}
+
+	// 2. Self on PlayedItems and FavoriteItems -> 200
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPost, "/Users/" + restrictedUser.ID + "/PlayedItems/" + movieA.ID},
+		{http.MethodDelete, "/Users/" + restrictedUser.ID + "/PlayedItems/" + movieA.ID},
+		{http.MethodPost, "/Users/" + restrictedUser.ID + "/FavoriteItems/" + movieA.ID},
+		{http.MethodDelete, "/Users/" + restrictedUser.ID + "/FavoriteItems/" + movieA.ID},
+	} {
+		if rec := do(tc.method, tc.path); rec.Code != http.StatusOK {
+			t.Fatalf("self %s %s expected 200, got %d", tc.method, tc.path, rec.Code)
+		}
+	}
+
+	// 3. /Items/Counts only counts libA (1 movie, not 2)
+	rec := do(http.MethodGet, "/Items/Counts")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("counts status=%d", rec.Code)
+	}
+	var counts sqlite.ItemCounts
+	_ = json.Unmarshal(rec.Body.Bytes(), &counts)
+	if counts.MovieCount != 1 {
+		t.Fatalf("expected restricted MovieCount=1, got %d", counts.MovieCount)
+	}
+
+	// 4. /Genres, /Studios, /Years only include libA metadata
+	rec = do(http.MethodGet, "/Genres")
+	var genres dto.QueryResult[dto.BaseItemDto]
+	_ = json.Unmarshal(rec.Body.Bytes(), &genres)
+	if genres.TotalRecordCount != 1 || genres.Items[0].Name != "Action" {
+		t.Fatalf("expected only Action genre, got %+v", genres)
+	}
+
+	rec = do(http.MethodGet, "/Studios")
+	var studios dto.QueryResult[dto.BaseItemDto]
+	_ = json.Unmarshal(rec.Body.Bytes(), &studios)
+	if studios.TotalRecordCount != 1 || studios.Items[0].Name != "StudioA" {
+		t.Fatalf("expected only StudioA, got %+v", studios)
+	}
+
+	rec = do(http.MethodGet, "/Years")
+	var years dto.QueryResult[dto.BaseItemDto]
+	_ = json.Unmarshal(rec.Body.Bytes(), &years)
+	if years.TotalRecordCount != 1 || years.Items[0].Name != "2020" {
+		t.Fatalf("expected only year 2020, got %+v", years)
+	}
+}

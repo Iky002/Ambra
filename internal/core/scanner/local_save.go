@@ -136,6 +136,28 @@ func (s *Scanner) resolveLocalImagePath(ctx context.Context, lib *sqlite.Library
 			}
 		}
 
+	case "musicartist":
+		dir = itemPath
+		switch imgType {
+		case "Primary":
+			filename = "folder" + ext
+		case "Backdrop":
+			filename = "fanart" + ext
+		default:
+			return "", false
+		}
+
+	case "musicalbum":
+		dir = itemPath
+		switch imgType {
+		case "Primary":
+			filename = "cover" + ext
+		case "Backdrop":
+			filename = "fanart" + ext
+		default:
+			return "", false
+		}
+
 	default:
 		return "", false
 	}
@@ -264,6 +286,53 @@ func (s *Scanner) saveLocalNFOIfEnabled(ctx context.Context, rec *sqlite.ItemRec
 	if rec == nil || rec.Extra.LockData {
 		return
 	}
+	s.writeLocalNFO(ctx, rec, meta, forceReplace)
+}
+
+// SaveItemLocalNFO writes/updates the local .nfo file for an item when its library
+// has SaveLocalMetadata enabled. Used by metadata editor endpoints after manual edits.
+func (s *Scanner) SaveItemLocalNFO(ctx context.Context, itemID string, forceReplace bool) error {
+	if s == nil || s.repo == nil {
+		return nil
+	}
+	rec, err := s.repo.GetItemRecordByID(ctx, itemID)
+	if err != nil {
+		return err
+	}
+	s.writeLocalNFO(ctx, rec, nil, forceReplace)
+	return nil
+}
+
+// SaveItemLocalImage writes an image to the item's media folder when its library has
+// SaveLocalMetadata enabled and a local artwork convention applies.
+// Returns (savedPath, true, nil) when saved locally, or ("", false, nil) when caller
+// should fall back to DataDir/metadata/images.
+func (s *Scanner) SaveItemLocalImage(ctx context.Context, itemID, imgType, ext string, data []byte) (string, bool, error) {
+	if s == nil || s.repo == nil || len(data) == 0 {
+		return "", false, nil
+	}
+	rec, err := s.repo.GetItemRecordByID(ctx, itemID)
+	if err != nil {
+		return "", false, err
+	}
+	lib, enabled := s.shouldSaveLocalMetadata(ctx, rec.LibraryID)
+	if !enabled {
+		return "", false, nil
+	}
+	localPath, ok := s.resolveLocalImagePath(ctx, lib, rec, imgType, ext)
+	if !ok || localPath == "" {
+		return "", false, nil
+	}
+	if err := writeFileAtomic(localPath, data); err != nil {
+		return "", false, err
+	}
+	return localPath, true, nil
+}
+
+func (s *Scanner) writeLocalNFO(ctx context.Context, rec *sqlite.ItemRecord, meta *plugins.MetadataResult, forceReplace bool) {
+	if rec == nil {
+		return
+	}
 	_, enabled := s.shouldSaveLocalMetadata(ctx, rec.LibraryID)
 	if !enabled {
 		return
@@ -280,7 +349,8 @@ func (s *Scanner) saveLocalNFOIfEnabled(ctx context.Context, rec *sqlite.ItemRec
 		}
 	}
 
-	doc := buildLocalNFODocument(rootTag, rec, meta)
+	mergedMeta := s.mergePersistedRelationsForNFO(ctx, rec.ID, meta)
+	doc := buildLocalNFODocument(rootTag, rec, mergedMeta)
 	body, err := xml.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		slog.Warn("marshal local nfo failed", "item_id", rec.ID, "error", err)
@@ -292,6 +362,41 @@ func (s *Scanner) saveLocalNFOIfEnabled(ctx context.Context, rec *sqlite.ItemRec
 	if err := writeFileAtomic(nfoPath, payload); err != nil {
 		slog.Warn("write local nfo failed", "item_id", rec.ID, "path", nfoPath, "error", err)
 	}
+}
+
+// mergePersistedRelationsForNFO loads persisted Genres/Studios/Tags/People from SQLite
+// (falling back to meta if DB has none) so locked relations are never wiped when rewriting .nfo.
+func (s *Scanner) mergePersistedRelationsForNFO(ctx context.Context, itemID string, meta *plugins.MetadataResult) *plugins.MetadataResult {
+	out := &plugins.MetadataResult{}
+	if meta != nil {
+		*out = *meta
+	}
+	if s.repo == nil || itemID == "" {
+		return out
+	}
+	if genres, studios, tags, err := s.repo.GetTaxonomiesByItemID(ctx, itemID); err == nil {
+		if len(genres) > 0 {
+			out.Genres = genres
+		}
+		if len(studios) > 0 {
+			out.Studios = studios
+		}
+		if len(tags) > 0 {
+			out.Tags = tags
+		}
+	}
+	if people, err := s.repo.GetPeopleByItemID(ctx, itemID); err == nil && len(people) > 0 {
+		credits := make([]plugins.PersonCredit, 0, len(people))
+		for _, p := range people {
+			credits = append(credits, plugins.PersonCredit{
+				Name: p.Name,
+				Role: p.Role,
+				Type: p.Type,
+			})
+		}
+		out.People = credits
+	}
+	return out
 }
 
 func (s *Scanner) resolveLocalNFOTarget(ctx context.Context, rec *sqlite.ItemRecord) (rootTag string, nfoPath string, ok bool) {
@@ -345,6 +450,18 @@ func (s *Scanner) resolveLocalNFOTarget(ctx context.Context, rec *sqlite.ItemRec
 			return "", "", false
 		}
 		return "movie", replacePathExtWithNFO(itemPath), true
+
+	case "musicartist":
+		if !isExistingDirPath(itemPath) {
+			return "", "", false
+		}
+		return "artist", filepath.Join(itemPath, "artist.nfo"), true
+
+	case "musicalbum":
+		if !isExistingDirPath(itemPath) {
+			return "", "", false
+		}
+		return "album", filepath.Join(itemPath, "album.nfo"), true
 
 	default:
 		return "", "", false

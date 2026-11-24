@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   api,
   clearAuth,
+  embyFetch,
   getFallbackImageUrl,
   getImageUrl,
   getUserImageUrl,
@@ -499,5 +500,99 @@ describe('Demo Mock 引擎 - Serverless 完整闭环测试', () => {
     })
     expect(boxSetChildren.TotalRecordCount).toBe(5)
     expect(boxSetChildren.Items.some((i) => i.Id === 'item-dune-2')).toBe(true)
+  })
+
+  it('P0-6 & P2-17: Demo Mock 完整支持系统健康诊断、媒体治理 (audit/storage/duplicates/locks/nfo/review) 与播放列表排序', async () => {
+    const authRes = await loginAsDemo('admin')
+    const uid = authRes.User.Id
+
+    // 1. GET /api/admin/health
+    const health = await embyFetch<{
+      Status: string
+      Library: { TotalItems: number; UserCount: number; PendingAudits: number }
+      Disk: { TotalBytes: number }
+    }>('/api/admin/health')
+    expect(health.Status).toBe('healthy')
+    expect(health.Library.TotalItems).toBeGreaterThan(0)
+    expect(health.Library.UserCount).toBeGreaterThanOrEqual(2)
+    expect(health.Disk.TotalBytes).toBeGreaterThan(0)
+
+    // 2. GET /api/admin/governance/storage
+    const storage = await embyFetch<{
+      TotalMediaBytes: number
+      Libraries: Array<{ LibraryId: string; ItemCount: number }>
+    }>('/api/admin/governance/storage')
+    expect(storage.Libraries.length).toBeGreaterThanOrEqual(4)
+    expect(storage.TotalMediaBytes).toBeGreaterThanOrEqual(0)
+
+    // 3. GET /api/admin/governance/audit & POST /api/admin/governance/orphans/cleanup
+    const auditBefore = await embyFetch<{
+      TotalChecked: number
+      OrphanItems: Array<{ Id: string }>
+    }>('/api/admin/governance/audit')
+    expect(auditBefore.TotalChecked).toBeGreaterThan(0)
+    expect(auditBefore.OrphanItems.length).toBe(1)
+
+    const cleanupRes = await embyFetch<{ Deleted: number; DeletedIds: string[] }>(
+      '/api/admin/governance/orphans/cleanup',
+      {
+        method: 'POST',
+        body: JSON.stringify({ ItemIds: [auditBefore.OrphanItems[0].Id] }),
+      },
+    )
+    expect(cleanupRes.Deleted).toBe(1)
+    const auditAfter = await embyFetch<{ OrphanItems: Array<{ Id: string }> }>(
+      '/api/admin/governance/audit',
+    )
+    expect(auditAfter.OrphanItems).toHaveLength(0)
+
+    // 4. GET /api/admin/governance/review & approve/dismiss
+    const reviews = await embyFetch<{ Items: Array<{ Id: string; Status: string }> }>(
+      '/api/admin/governance/review?status=pending',
+    )
+    expect(reviews.Items.length).toBeGreaterThanOrEqual(1)
+    const dismissed = await embyFetch<{ Status: string }>(
+      `/api/admin/governance/review/${encodeURIComponent(reviews.Items[0].Id)}/dismiss`,
+      { method: 'POST' },
+    )
+    expect(dismissed.Status).toBe('dismissed')
+
+    // 5. GET/POST /api/admin/governance/items/{Id}/locks & /nfo
+    await embyFetch('/api/admin/governance/items/item-dune-2/locks', {
+      method: 'POST',
+      body: JSON.stringify({ LockedFields: ['Name', 'Overview'], LockData: false }),
+    })
+    const lockState = await embyFetch<{ LockedFields: string[]; LockData: boolean }>(
+      '/api/admin/governance/items/item-dune-2/locks',
+    )
+    expect(lockState.LockedFields).toEqual(['Name', 'Overview'])
+    expect(lockState.LockData).toBe(false)
+
+    const nfoRes = await api.writeItemNfo('item-dune-2')
+    expect(nfoRes.NfoPath).toBeTruthy()
+    expect(nfoRes.RootTag).toBe('movie')
+
+    // 6. GET /api/admin/governance/duplicates & POST /merge
+    await api.splitItemVersions('item-shawshank-redemption')
+    const dupes = await embyFetch<{
+      Groups: Array<{ Items: Array<{ Id: string }> }>
+      TotalGroups: number
+    }>('/api/admin/governance/duplicates')
+    expect(dupes.TotalGroups).toBeGreaterThanOrEqual(1)
+    const dupeIds = dupes.Groups[0].Items.map((i) => i.Id)
+    const mergeRes = await embyFetch<{ MergedCount: number }>(
+      '/api/admin/governance/duplicates/merge',
+      {
+        method: 'POST',
+        body: JSON.stringify({ ItemIds: dupeIds }),
+      },
+    )
+    expect(mergeRes.MergedCount).toBe(dupeIds.length)
+
+    // 7. Playlist move reorder
+    const pl = await api.createPlaylist('测试片单', uid, ['item-dune-2', 'item-oppenheimer'], 'Video')
+    await api.movePlaylistItem(pl.Id, 'item-oppenheimer', 0)
+    const plItems = await api.getPlaylistItems(pl.Id, uid)
+    expect(plItems.Items.map((i) => i.Id)).toEqual(['item-oppenheimer', 'item-dune-2'])
   })
 })

@@ -175,6 +175,7 @@ export function MetadataEditorModal({
         : lockedFields
       await api.lockItemFields(item.Id, fieldsToSave, lockData)
       await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['item'] }),
         queryClient.invalidateQueries({ queryKey: ['item', item.Id] }),
         queryClient.invalidateQueries({ queryKey: ['admin-metadata-items'] }),
       ])
@@ -200,9 +201,10 @@ export function MetadataEditorModal({
     setGovFeedback(null)
     try {
       const res = await api.writeItemNfo(item.Id)
+      const nfoPath = res?.NfoPath || res?.path
       setGovFeedback({
         type: 'success',
-        message: res?.path ? `已原子回写 NFO：${res.path}` : `已成功回写「${item.Name}」的 .nfo 文件`,
+        message: nfoPath ? `已原子回写 NFO：${nfoPath}` : `已成功回写「${item.Name}」的 .nfo 文件`,
       })
     } catch (err) {
       setGovFeedback({
