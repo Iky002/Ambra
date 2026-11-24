@@ -277,6 +277,8 @@ export const api = {
       filters?: string
       genres?: string
       tags?: string
+      personIds?: string
+      person?: string
       startIndex?: number
       limit?: number
       recursive?: boolean
@@ -292,6 +294,8 @@ export const api = {
     if (params.filters) q.set('Filters', params.filters)
     if (params.genres) q.set('Genres', params.genres)
     if (params.tags) q.set('Tags', params.tags)
+    if (params.personIds) q.set('PersonIds', params.personIds)
+    if (params.person) q.set('Person', params.person)
     if (params.startIndex !== undefined) q.set('StartIndex', String(params.startIndex))
     if (params.limit !== undefined) q.set('Limit', String(params.limit))
     if (params.recursive !== false) q.set('Recursive', 'true')
@@ -777,6 +781,8 @@ export const api = {
     ),
 
   getRankings: () => embyFetch<RankingsSummary>('/emby/System/Rankings'),
+
+  getRankingsSummary: () => embyFetch<RankingsSummary>('/emby/System/Rankings'),
 
   refreshRankings: () =>
     embyFetch<RankingsRefreshResult>('/emby/System/Rankings/Refresh', {

@@ -4,13 +4,16 @@ import { HashRouter, Link, Navigate, Route, Routes } from 'react-router-dom'
 import { Layout } from './components/Layout'
 import { AuthProvider, useAuth } from './context/AuthContext'
 import { AdminPage } from './pages/AdminPage'
+import { CollectionsPage } from './pages/CollectionsPage'
 import { FavoritesPage } from './pages/FavoritesPage'
 import { HomePage } from './pages/HomePage'
 import { ItemDetailPage } from './pages/ItemDetailPage'
 import { LibraryPage } from './pages/LibraryPage'
 import { LoginPage } from './pages/LoginPage'
+import { PersonDetailPage } from './pages/PersonDetailPage'
 import { PlayerPage } from './pages/PlayerPage'
 import { SearchPage } from './pages/SearchPage'
+import { TrendingPage } from './pages/TrendingPage'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -86,6 +89,9 @@ function AppRoutes() {
         }
       >
         <Route index element={<HomePage />} />
+        <Route path="trending" element={<TrendingPage />} />
+        <Route path="collections" element={<CollectionsPage />} />
+        <Route path="person/:id" element={<PersonDetailPage />} />
         <Route path="library/:id" element={<LibraryPage />} />
         <Route path="item/:id" element={<ItemDetailPage />} />
         <Route path="favorites" element={<FavoritesPage />} />

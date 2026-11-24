@@ -35,12 +35,15 @@ var (
 	reIMDbID        = regexp.MustCompile(`(?i)\b(tt\d{5,10})\b`)
 )
 
-// Fetcher downloads and parses Douban Top 250 and IMDb Top 250 charts.
+// Fetcher downloads and parses Douban Top 250, IMDb Top 250, and TMDB Trending charts.
 type Fetcher struct {
-	httpClient *http.Client
-	doubanURL  string
-	imdbURL    string
-	userAgent  string
+	httpClient          *http.Client
+	doubanURL           string
+	imdbURL             string
+	tmdbAPIKey          string
+	tmdbBaseURL         string
+	tmdbTrendingFetcher func(ctx context.Context) ([]ChartEntry, string, error)
+	userAgent           string
 }
 
 // NewFetcher creates a Fetcher with sensible defaults.
@@ -54,10 +57,13 @@ func NewFetcher(opts Options) *Fetcher {
 		ua = defaultUserAgent
 	}
 	return &Fetcher{
-		httpClient: client,
-		doubanURL:  strings.TrimSpace(opts.DoubanURL),
-		imdbURL:    strings.TrimSpace(opts.IMDbURL),
-		userAgent:  ua,
+		httpClient:          client,
+		doubanURL:           strings.TrimSpace(opts.DoubanURL),
+		imdbURL:             strings.TrimSpace(opts.IMDbURL),
+		tmdbAPIKey:          strings.TrimSpace(opts.TMDBAPIKey),
+		tmdbBaseURL:         strings.TrimRight(strings.TrimSpace(opts.TMDBTrendingBaseURL), "/"),
+		tmdbTrendingFetcher: opts.TMDBTrendingFetcher,
+		userAgent:           ua,
 	}
 }
 
@@ -79,6 +85,26 @@ func (f *Fetcher) resolveIMDbURL() string {
 		return v
 	}
 	return DefaultIMDbTop250URL
+}
+
+func (f *Fetcher) resolveTMDBAPIKey() string {
+	if f.tmdbAPIKey != "" {
+		return f.tmdbAPIKey
+	}
+	if v := strings.TrimSpace(os.Getenv(EnvTMDBAPIKey)); v != "" {
+		return v
+	}
+	return strings.TrimSpace(os.Getenv(EnvTMDBAPIKeyFallback))
+}
+
+func (f *Fetcher) resolveTMDBBaseURL() string {
+	if f.tmdbBaseURL != "" {
+		return f.tmdbBaseURL
+	}
+	if v := strings.TrimRight(strings.TrimSpace(os.Getenv(EnvTMDBTrendingURL)), "/"); v != "" {
+		return v
+	}
+	return DefaultTMDBBaseURL
 }
 
 // FetchDoubanTop250 fetches the Douban Top 250 chart from a custom JSON feed
@@ -208,6 +234,219 @@ func (f *Fetcher) FetchIMDbTop250(ctx context.Context) (*ChartSnapshot, error) {
 		Count:     len(entries),
 		Entries:   entries,
 	}, nil
+}
+
+// FetchTMDBTrending fetches weekly trending movies and TV shows from TMDB v3 API.
+// When no API key is configured or TMDB API is unreachable, it gracefully falls
+// back to a curated built-in snapshot so rankings sync never fails solely due to TMDB.
+func (f *Fetcher) FetchTMDBTrending(ctx context.Context) (*ChartSnapshot, error) {
+	if f.tmdbTrendingFetcher != nil {
+		entries, source, err := f.tmdbTrendingFetcher(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("fetch tmdb trending: %w", err)
+		}
+		if strings.TrimSpace(source) == "" {
+			source = SourceTMDBTrendingAPI
+		}
+		return &ChartSnapshot{
+			Chart:     ChartTMDBTrending,
+			Source:    source,
+			UpdatedAt: time.Now().UTC(),
+			Count:     len(entries),
+			Entries:   entries,
+		}, nil
+	}
+
+	apiKey := f.resolveTMDBAPIKey()
+	if apiKey == "" {
+		return builtinTMDBTrendingSnapshot(), nil
+	}
+
+	baseURL := f.resolveTMDBBaseURL()
+	movies, movieErr := f.fetchTMDBTrendingPage(ctx, baseURL, "/trending/movie/week", "movie", apiKey)
+	tvShows, tvErr := f.fetchTMDBTrendingPage(ctx, baseURL, "/trending/tv/week", "tv", apiKey)
+
+	if movieErr != nil && tvErr != nil {
+		return builtinTMDBTrendingSnapshot(), nil
+	}
+
+	merged := mergeTMDBTrending(movies, tvShows)
+	if len(merged) == 0 {
+		return builtinTMDBTrendingSnapshot(), nil
+	}
+
+	return &ChartSnapshot{
+		Chart:     ChartTMDBTrending,
+		Source:    SourceTMDBTrendingAPI,
+		UpdatedAt: time.Now().UTC(),
+		Count:     len(merged),
+		Entries:   merged,
+	}, nil
+}
+
+type tmdbTrendingPayload struct {
+	Results []struct {
+		ID            int     `json:"id"`
+		Title         string  `json:"title"`
+		OriginalTitle string  `json:"original_title"`
+		Name          string  `json:"name"`
+		OriginalName  string  `json:"original_name"`
+		ReleaseDate   string  `json:"release_date"`
+		FirstAirDate  string  `json:"first_air_date"`
+		Overview      string  `json:"overview"`
+		VoteAverage   float64 `json:"vote_average"`
+		MediaType     string  `json:"media_type"`
+	} `json:"results"`
+}
+
+func isTMDBBearerToken(apiKey string) bool {
+	return strings.HasPrefix(apiKey, "eyJ") || strings.Count(apiKey, ".") == 2
+}
+
+func (f *Fetcher) fetchTMDBTrendingPage(ctx context.Context, baseURL, endpoint, defaultMediaType, apiKey string) ([]ChartEntry, error) {
+	params := url.Values{}
+	params.Set("language", "zh-CN")
+	params.Set("page", "1")
+	useBearer := isTMDBBearerToken(apiKey)
+	if !useBearer {
+		params.Set("api_key", apiKey)
+	}
+
+	reqURL := baseURL + endpoint + "?" + params.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", f.userAgent)
+	req.Header.Set("Accept", "application/json")
+	if useBearer {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+
+	resp, err := f.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("tmdb trending %s status %d", endpoint, resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if err != nil {
+		return nil, err
+	}
+
+	var payload tmdbTrendingPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, fmt.Errorf("parse tmdb trending %s: %w", endpoint, err)
+	}
+
+	entries := make([]ChartEntry, 0, len(payload.Results))
+	for _, r := range payload.Results {
+		title := strings.TrimSpace(r.Title)
+		if title == "" {
+			title = strings.TrimSpace(r.Name)
+		}
+		origTitle := strings.TrimSpace(r.OriginalTitle)
+		if origTitle == "" {
+			origTitle = strings.TrimSpace(r.OriginalName)
+		}
+		if title == "" && origTitle == "" && r.ID <= 0 {
+			continue
+		}
+		mediaType := strings.TrimSpace(r.MediaType)
+		if mediaType == "" {
+			mediaType = defaultMediaType
+		}
+		dateStr := r.ReleaseDate
+		if dateStr == "" {
+			dateStr = r.FirstAirDate
+		}
+		year := 0
+		if len(dateStr) >= 4 {
+			year, _ = strconv.Atoi(dateStr[:4])
+		}
+		tmdbID := ""
+		if r.ID > 0 {
+			tmdbID = strconv.Itoa(r.ID)
+		}
+		entries = append(entries, ChartEntry{
+			Title:         title,
+			OriginalTitle: origTitle,
+			Year:          year,
+			Rating:        r.VoteAverage,
+			MediaType:     mediaType,
+			Overview:      strings.TrimSpace(r.Overview),
+			TMDBID:        tmdbID,
+		})
+	}
+	return entries, nil
+}
+
+func mergeTMDBTrending(movies, tvShows []ChartEntry) []ChartEntry {
+	seen := make(map[string]struct{}, len(movies)+len(tvShows))
+	out := make([]ChartEntry, 0, len(movies)+len(tvShows))
+	appendUnique := func(list []ChartEntry) {
+		for _, e := range list {
+			key := entryDedupKey(e)
+			if key == "" {
+				continue
+			}
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			e.Rank = len(out) + 1
+			out = append(out, e)
+		}
+	}
+	appendUnique(movies)
+	appendUnique(tvShows)
+	return out
+}
+
+func builtinTMDBTrendingSnapshot() *ChartSnapshot {
+	entries := builtinTMDBTrendingEntries()
+	return &ChartSnapshot{
+		Chart:     ChartTMDBTrending,
+		Source:    SourceTMDBTrendingBuiltin,
+		UpdatedAt: time.Now().UTC(),
+		Count:     len(entries),
+		Entries:   entries,
+	}
+}
+
+func builtinTMDBTrendingEntries() []ChartEntry {
+	return []ChartEntry{
+		{Rank: 1, Title: "沙丘2", OriginalTitle: "Dune: Part Two", Year: 2024, Rating: 8.2, MediaType: "movie", TMDBID: "693134"},
+		{Rank: 2, Title: "奥本海默", OriginalTitle: "Oppenheimer", Year: 2023, Rating: 8.1, MediaType: "movie", TMDBID: "872585"},
+		{Rank: 3, Title: "死侍与金刚狼", OriginalTitle: "Deadpool & Wolverine", Year: 2024, Rating: 7.7, MediaType: "movie", TMDBID: "533535"},
+		{Rank: 4, Title: "头脑特工队2", OriginalTitle: "Inside Out 2", Year: 2024, Rating: 7.6, MediaType: "movie", TMDBID: "1022789"},
+		{Rank: 5, Title: "荒野机器人", OriginalTitle: "The Wild Robot", Year: 2024, Rating: 8.4, MediaType: "movie", TMDBID: "1184918"},
+		{Rank: 6, Title: "哪吒之魔童闹海", OriginalTitle: "Ne Zha 2", Year: 2025, Rating: 8.1, MediaType: "movie", TMDBID: "980477"},
+		{Rank: 7, Title: "流浪地球2", OriginalTitle: "The Wandering Earth II", Year: 2023, Rating: 7.6, MediaType: "movie", TMDBID: "842675"},
+		{Rank: 8, Title: "蜘蛛侠：纵横宇宙", OriginalTitle: "Spider-Man: Across the Spider-Verse", Year: 2023, Rating: 8.4, MediaType: "movie", TMDBID: "569094"},
+		{Rank: 9, Title: "瞬息全宇宙", OriginalTitle: "Everything Everywhere All at Once", Year: 2022, Rating: 7.8, MediaType: "movie", TMDBID: "545611"},
+		{Rank: 10, Title: "星际穿越", OriginalTitle: "Interstellar", Year: 2014, Rating: 8.4, MediaType: "movie", TMDBID: "157336"},
+		{Rank: 11, Title: "盗梦空间", OriginalTitle: "Inception", Year: 2010, Rating: 8.4, MediaType: "movie", TMDBID: "27205"},
+		{Rank: 12, Title: "蝙蝠侠：黑暗骑士", OriginalTitle: "The Dark Knight", Year: 2008, Rating: 8.5, MediaType: "movie", TMDBID: "155"},
+		{Rank: 13, Title: "肖申克的救赎", OriginalTitle: "The Shawshank Redemption", Year: 1994, Rating: 8.7, MediaType: "movie", TMDBID: "278"},
+		{Rank: 14, Title: "千与千寻", OriginalTitle: "Spirited Away", Year: 2001, Rating: 8.5, MediaType: "movie", TMDBID: "129"},
+		{Rank: 15, Title: "阿凡达：水之道", OriginalTitle: "Avatar: The Way of Water", Year: 2022, Rating: 7.6, MediaType: "movie", TMDBID: "76600"},
+		{Rank: 16, Title: "鱿鱼游戏", OriginalTitle: "Squid Game", Year: 2021, Rating: 7.8, MediaType: "tv", TMDBID: "93405"},
+		{Rank: 17, Title: "怪奇物语", OriginalTitle: "Stranger Things", Year: 2016, Rating: 8.6, MediaType: "tv", TMDBID: "66732"},
+		{Rank: 18, Title: "人生切割术", OriginalTitle: "Severance", Year: 2022, Rating: 8.4, MediaType: "tv", TMDBID: "95396"},
+		{Rank: 19, Title: "最后生还者", OriginalTitle: "The Last of Us", Year: 2023, Rating: 8.6, MediaType: "tv", TMDBID: "100088"},
+		{Rank: 20, Title: "双城之战", OriginalTitle: "Arcane", Year: 2021, Rating: 8.7, MediaType: "tv", TMDBID: "94605"},
+		{Rank: 21, Title: "幕府将军", OriginalTitle: "Shōgun", Year: 2024, Rating: 8.5, MediaType: "tv", TMDBID: "126308"},
+		{Rank: 22, Title: "辐射", OriginalTitle: "Fallout", Year: 2024, Rating: 8.3, MediaType: "tv", TMDBID: "106379"},
+		{Rank: 23, Title: "三体", OriginalTitle: "3 Body Problem", Year: 2024, Rating: 7.5, MediaType: "tv", TMDBID: "108545"},
+		{Rank: 24, Title: "绝命毒师", OriginalTitle: "Breaking Bad", Year: 2008, Rating: 8.9, MediaType: "tv", TMDBID: "1396"},
+		{Rank: 25, Title: "权力的游戏", OriginalTitle: "Game of Thrones", Year: 2011, Rating: 8.4, MediaType: "tv", TMDBID: "1399"},
+		{Rank: 26, Title: "进击的巨人", OriginalTitle: "Attack on Titan", Year: 2013, Rating: 8.7, MediaType: "tv", TMDBID: "1429"},
+	}
 }
 
 func (f *Fetcher) doGet(ctx context.Context, rawURL string) ([]byte, string, error) {
@@ -509,6 +748,9 @@ func entryDedupKey(e ChartEntry) string {
 		return "imdb:" + strings.ToLower(e.IMDbID)
 	}
 	if e.TMDBID != "" {
+		if e.MediaType != "" {
+			return "tmdb:" + strings.ToLower(e.MediaType) + ":" + e.TMDBID
+		}
 		return "tmdb:" + e.TMDBID
 	}
 	norm := NormalizeTitle(e.Title)

@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   Award,
   Film,
+  Flame,
   Image as ImageIcon,
   Layers,
   Loader2,
@@ -69,7 +70,7 @@ export function MetadataTab() {
   const items = itemsData?.Items || []
 
   const availableTags = useMemo(() => {
-    const set = new Set<string>(['豆瓣Top250', 'IMDb Top250'])
+    const set = new Set<string>(['Trending', '豆瓣Top250', 'IMDb Top250'])
     for (const t of tagsData?.Items || []) {
       if (t.Name) set.add(t.Name)
     }
@@ -81,13 +82,16 @@ export function MetadataTab() {
     onSuccess: async (res) => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['rankings'] }),
+        queryClient.invalidateQueries({ queryKey: ['trendingItems'] }),
         queryClient.invalidateQueries({ queryKey: ['admin-metadata-items'] }),
         queryClient.invalidateQueries({ queryKey: ['items'] }),
         queryClient.invalidateQueries({ queryKey: ['tags'] }),
       ])
+      const trendPart =
+        res.tmdb_trending_count !== undefined ? ` / TMDB Trending (${res.tmdb_trending_count} 条)` : ''
       setFeedback({
         type: 'success',
-        message: `榜单同步完成：豆瓣 Top250 (${res.douban_count} 条) / IMDb Top250 (${res.imdb_count} 条)，命中 ${res.matched_items} 部媒体，新增打标 ${res.tags_added} 次`,
+        message: `榜单同步完成：豆瓣 Top250 (${res.douban_count} 条) / IMDb Top250 (${res.imdb_count} 条)${trendPart}，命中 ${res.matched_items} 部媒体，新增打标 ${res.tags_added} 次`,
       })
     },
     onError: (err) => {
@@ -170,7 +174,7 @@ export function MetadataTab() {
           </button>
         </div>
 
-        <div className="grid gap-4 md:grid-cols-2">
+        <div className="grid gap-4 md:grid-cols-3">
           {/* 豆瓣 Top 250 卡片 */}
           <div className="rounded-2xl border border-emerald-500/25 bg-gradient-to-br from-emerald-950/35 via-zinc-950/80 to-zinc-950/90 p-5">
             <div className="flex items-start justify-between gap-3">
@@ -226,6 +230,38 @@ export function MetadataTab() {
                   title={formatDateTime(rankings?.imdb_top250.updated_at)}
                 >
                   {formatRelativeTime(rankings?.imdb_top250.updated_at)}
+                </span>
+              </p>
+            </div>
+          </div>
+
+          {/* TMDB Trending 热门榜卡片 */}
+          <div className="rounded-2xl border border-orange-500/25 bg-gradient-to-br from-orange-950/35 via-zinc-950/80 to-zinc-950/90 p-5">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <span className="inline-flex items-center gap-1 rounded-md border border-orange-400/45 bg-orange-500/15 px-2.5 py-0.5 text-[11px] font-semibold text-orange-200">
+                  <Flame className="h-3 w-3 text-orange-400" />
+                  <span>TMDB Trending</span>
+                </span>
+                <p className="mt-2 text-2xl font-bold text-white">
+                  {rankingsLoading ? '...' : rankings?.tmdb_trending?.count ?? 0}
+                  <span className="ml-1.5 text-xs font-normal text-zinc-400">部缓存条目</span>
+                </p>
+              </div>
+              <Flame className="h-5 w-5 text-orange-400/80" />
+            </div>
+            <div className="mt-3 space-y-1 text-xs text-zinc-400">
+              <p className="truncate">
+                来源：
+                <span className="text-zinc-300">{rankings?.tmdb_trending?.source || 'TMDB 热门榜'}</span>
+              </p>
+              <p>
+                更新时间：
+                <span
+                  className="text-zinc-300"
+                  title={formatDateTime(rankings?.tmdb_trending?.updated_at)}
+                >
+                  {formatRelativeTime(rankings?.tmdb_trending?.updated_at)}
                 </span>
               </p>
             </div>
@@ -368,6 +404,12 @@ export function MetadataTab() {
                         {item.OriginalTitle && item.OriginalTitle !== item.Name && (
                           <span className="truncate text-[11px] text-zinc-500">
                             {item.OriginalTitle}
+                          </span>
+                        )}
+                        {item.Tags?.some((t) => t.toLowerCase() === 'trending') && (
+                          <span className="inline-flex items-center gap-0.5 rounded border border-orange-400/45 bg-orange-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-orange-200">
+                            <Flame className="h-2.5 w-2.5 text-orange-400" />
+                            <span>热门</span>
                           </span>
                         )}
                         {item.Tags?.includes('豆瓣Top250') && (

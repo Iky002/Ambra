@@ -5,9 +5,11 @@ import {
   ChevronRight,
   Clapperboard,
   Film,
+  Flame,
   FolderHeart,
   Heart,
   Home,
+  Library,
   LogOut,
   Menu,
   Music,
@@ -136,6 +138,14 @@ export function Layout() {
           <NavLink to="/" end className={navLinkClass} title="首页">
             <Home className="h-4 w-4 shrink-0" />
             {!collapsed && <span>首页</span>}
+          </NavLink>
+          <NavLink to="/trending" className={navLinkClass} title="热门">
+            <Flame className="h-4 w-4 shrink-0" />
+            {!collapsed && <span>热门</span>}
+          </NavLink>
+          <NavLink to="/collections" className={navLinkClass} title="合集">
+            <Library className="h-4 w-4 shrink-0" />
+            {!collapsed && <span>合集</span>}
           </NavLink>
           <NavLink to="/favorites" className={navLinkClass} title="我的收藏">
             <Heart className="h-4 w-4 shrink-0" />

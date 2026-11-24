@@ -182,6 +182,7 @@ func (h *Handler) handleQueryItems(w http.ResponseWriter, r *http.Request) {
 		Studios:                q.List("Studios"),
 		Tags:                   q.List("Tags"),
 		PersonIDs:              q.List("PersonIds"),
+		Persons:                q.List("Person"),
 		Years:                  years,
 		IsPlayed:               isPlayed,
 		IsUnplayed:             isUnplayed,

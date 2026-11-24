@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Check, Film, Play, Star } from 'lucide-react'
+import { Check, Film, Flame, Play, Star } from 'lucide-react'
 import { Link, useNavigate } from 'react-router-dom'
 import { getFallbackImageUrl, getImageUrl } from '../api/client'
 import type { BaseItemDto } from '../api/types'
@@ -9,6 +9,10 @@ interface MediaCardProps {
   variant?: 'poster' | 'landscape'
   showProgress?: boolean
   className?: string
+  selectable?: boolean
+  selected?: boolean
+  onToggleSelect?: (item: BaseItemDto) => void
+  linkTo?: string
 }
 
 export function MediaCard({
@@ -16,9 +20,14 @@ export function MediaCard({
   variant = 'poster',
   showProgress = false,
   className = '',
+  selectable = false,
+  selected = false,
+  onToggleSelect,
+  linkTo,
 }: MediaCardProps) {
   const navigate = useNavigate()
   const isLandscape = variant === 'landscape'
+  const targetUrl = linkTo ?? `/item/${item.Id}`
 
   let imgUrl = ''
   let fallbackUrl: string | null = null
@@ -66,18 +75,31 @@ export function MediaCard({
           ? '剧集'
           : ''
 
-  const canDirectPlay = item.Type === 'Movie' || item.Type === 'Episode' || item.MediaType === 'Video'
+  const canDirectPlay =
+    !selectable && (item.Type === 'Movie' || item.Type === 'Episode' || item.MediaType === 'Video')
   const hasDoubanTop250 = Boolean(item.Tags?.some((t) => t === '豆瓣Top250' || t === '豆瓣 Top250'))
   const hasImdbTop250 = Boolean(item.Tags?.some((t) => t === 'IMDb Top250' || t === 'IMDb Top 250'))
+  const hasTrending = Boolean(item.Tags?.some((t) => t.toLowerCase() === 'trending'))
   const hasProgressBar = (showProgress || progress > 0) && progress > 0
+
+  const handleCardClick = (e: React.MouseEvent) => {
+    if (selectable) {
+      e.preventDefault()
+      onToggleSelect?.(item)
+    }
+  }
 
   return (
     <div className={`group relative flex flex-col ${className}`}>
       <Link
-        to={`/item/${item.Id}`}
-        className={`relative block overflow-hidden rounded-xl border border-white/10 bg-zinc-900/90 transition-all duration-300 ease-out group-hover:-translate-y-1 group-hover:border-amber-400/75 group-hover:shadow-[0_14px_34px_rgba(0,0,0,0.65),0_0_20px_rgba(245,158,11,0.16)] ${
-          isLandscape ? 'aspect-video' : 'aspect-[2/3]'
-        }`}
+        to={targetUrl}
+        onClick={handleCardClick}
+        aria-pressed={selectable ? selected : undefined}
+        className={`relative block overflow-hidden rounded-xl border bg-zinc-900/90 transition-all duration-300 ease-out ${
+          selected
+            ? 'border-amber-400 ring-2 ring-amber-400/90 shadow-[0_0_24px_rgba(245,158,11,0.32)]'
+            : 'border-white/10 group-hover:-translate-y-1 group-hover:border-amber-400/75 group-hover:shadow-[0_14px_34px_rgba(0,0,0,0.65),0_0_20px_rgba(245,158,11,0.16)]'
+        } ${isLandscape ? 'aspect-video' : 'aspect-[2/3]'}`}
       >
         {imgUrl && !imgFailed ? (
           <img
@@ -127,8 +149,19 @@ export function MediaCard({
           </div>
         ) : null}
 
-        {/* 右上角已看/未看数量 */}
-        {item.UserData?.Played ? (
+        {/* 右上角选择复选框或已看/未看数量 */}
+        {selectable ? (
+          <div
+            aria-label={selected ? '已选中' : '未选中'}
+            className={`absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-full border-2 shadow-md transition-all ${
+              selected
+                ? 'border-amber-300 bg-amber-400 text-zinc-950 scale-105'
+                : 'border-white/70 bg-black/55 text-transparent backdrop-blur-sm'
+            }`}
+          >
+            <Check className="h-4 w-4 stroke-[3]" />
+          </div>
+        ) : item.UserData?.Played ? (
           <div
             title="已观看"
             className="absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-full bg-emerald-500/90 text-zinc-950 shadow-md"
@@ -141,13 +174,19 @@ export function MediaCard({
           </div>
         ) : null}
 
-        {/* 左下角殿堂级榜单徽章（豆瓣 Top250 / IMDb Top250） */}
-        {(hasDoubanTop250 || hasImdbTop250) && (
+        {/* 左下角榜单与热门徽章（热门 / 豆瓣 Top250 / IMDb Top250） */}
+        {(hasTrending || hasDoubanTop250 || hasImdbTop250) && (
           <div
             className={`pointer-events-none absolute left-2 right-2 flex flex-wrap items-center gap-1 ${
               hasProgressBar ? 'bottom-3' : 'bottom-2'
             }`}
           >
+            {hasTrending && (
+              <span className="inline-flex items-center gap-0.5 rounded-md border border-orange-400/55 bg-gradient-to-r from-orange-950/90 via-amber-900/85 to-orange-950/90 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-orange-200 shadow-[0_2px_8px_rgba(0,0,0,0.45)] backdrop-blur-md">
+                <Flame className="h-2.5 w-2.5 text-orange-400" />
+                <span>热门</span>
+              </span>
+            )}
             {hasDoubanTop250 && (
               <span className="inline-flex items-center rounded-md border border-emerald-400/50 bg-gradient-to-r from-emerald-950/90 via-emerald-900/85 to-teal-950/90 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-emerald-200 shadow-[0_2px_8px_rgba(0,0,0,0.45)] backdrop-blur-md">
                 豆瓣 Top250
@@ -174,7 +213,8 @@ export function MediaCard({
 
       <div className="mt-2.5 px-0.5">
         <Link
-          to={`/item/${item.Id}`}
+          to={targetUrl}
+          onClick={handleCardClick}
           className="block truncate text-sm font-medium text-zinc-100 transition-colors group-hover:text-amber-400"
           title={item.Name}
         >
