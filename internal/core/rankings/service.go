@@ -121,11 +121,13 @@ type Service struct {
 	fetcher *Fetcher
 	opts    Options
 
-	mu        sync.RWMutex
-	douban    *ChartSnapshot
-	doubanIdx *chartIndex
-	imdb      *ChartSnapshot
-	imdbIdx   *chartIndex
+	mu              sync.RWMutex
+	douban          *ChartSnapshot
+	doubanIdx       *chartIndex
+	imdb            *ChartSnapshot
+	imdbIdx         *chartIndex
+	tmdbTrending    *ChartSnapshot
+	tmdbTrendingIdx *chartIndex
 
 	syncMu  sync.Mutex
 	started atomic.Bool
@@ -160,6 +162,10 @@ func (s *Service) LoadCache(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	tmdbSnap, err := s.loadSnapshot(ctx, ConfigKeyTMDBTrending)
+	if err != nil {
+		return err
+	}
 
 	s.mu.Lock()
 	if doubanSnap != nil {
@@ -169,6 +175,10 @@ func (s *Service) LoadCache(ctx context.Context) error {
 	if imdbSnap != nil {
 		s.imdb = imdbSnap
 		s.imdbIdx = buildChartIndex(imdbSnap.Entries)
+	}
+	if tmdbSnap != nil {
+		s.tmdbTrending = tmdbSnap
+		s.tmdbTrendingIdx = buildChartIndex(tmdbSnap.Entries)
 	}
 	s.mu.Unlock()
 	return nil
@@ -210,7 +220,7 @@ func (s *Service) saveSnapshot(ctx context.Context, key string, snap *ChartSnaps
 	return err
 }
 
-// Status returns the current cached Douban Top 250 and IMDb Top 250 snapshots.
+// Status returns the current cached Douban Top 250, IMDb Top 250, and TMDB Trending snapshots.
 func (s *Service) Status(includeEntries bool) StatusResponse {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -218,7 +228,21 @@ func (s *Service) Status(includeEntries bool) StatusResponse {
 	return StatusResponse{
 		DoubanTop250: copySnapshot(ChartDoubanTop250, s.douban, includeEntries),
 		IMDbTop250:   copySnapshot(ChartIMDbTop250, s.imdb, includeEntries),
+		TMDBTrending: copySnapshot(ChartTMDBTrending, s.tmdbTrending, includeEntries),
 	}
+}
+
+// TrendingEntries returns the cached TMDB Trending entries and metadata status.
+func (s *Service) TrendingEntries(_ context.Context) ([]ChartEntry, ChartSnapshot) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	status := copySnapshot(ChartTMDBTrending, s.tmdbTrending, false)
+	if s.tmdbTrending == nil || len(s.tmdbTrending.Entries) == 0 {
+		return []ChartEntry{}, status
+	}
+	entries := append([]ChartEntry(nil), s.tmdbTrending.Entries...)
+	return entries, status
 }
 
 func copySnapshot(chart string, snap *ChartSnapshot, includeEntries bool) ChartSnapshot {
@@ -247,6 +271,7 @@ func (s *Service) MatchTagsForItem(name, originalTitle string, year int, provide
 	s.mu.RLock()
 	dIdx := s.doubanIdx
 	iIdx := s.imdbIdx
+	tIdx := s.tmdbTrendingIdx
 	s.mu.RUnlock()
 
 	var tags []string
@@ -255,6 +280,9 @@ func (s *Service) MatchTagsForItem(name, originalTitle string, year int, provide
 	}
 	if iIdx != nil && iIdx.match(name, originalTitle, year, imdbID, doubanID, tmdbID) {
 		tags = append(tags, TagIMDbTop250)
+	}
+	if tIdx != nil && tIdx.match(name, originalTitle, year, imdbID, doubanID, tmdbID) {
+		tags = append(tags, TagTMDBTrending)
 	}
 	return tags
 }
@@ -390,16 +418,17 @@ func (s *Service) ApplyTagsToLibrary(ctx context.Context) (matchedItems int, tag
 	return matchedItems, tagsAdded, nil
 }
 
-// SyncAndApply fetches Douban Top 250 and IMDb Top 250 sequentially (preserving
-// existing caches on individual fetch failures), persists updated snapshots, and
-// applies matching tags to the library.
+// SyncAndApply fetches Douban Top 250, IMDb Top 250, and TMDB Trending sequentially
+// (preserving existing caches on individual fetch failures), persists updated snapshots,
+// and applies matching tags to the library.
 func (s *Service) SyncAndApply(ctx context.Context) (SyncSummary, error) {
 	s.syncMu.Lock()
 	defer s.syncMu.Unlock()
 
 	summary := SyncSummary{SyncedAt: time.Now().UTC()}
 
-	var doubanErr, imdbErr error
+	var doubanErr, imdbErr, tmdbErr error
+	tmdbLiveSucceeded := false
 
 	if snap, err := s.fetcher.FetchDoubanTop250(ctx); err != nil {
 		doubanErr = err
@@ -427,12 +456,31 @@ func (s *Service) SyncAndApply(ctx context.Context) (SyncSummary, error) {
 		s.mu.Unlock()
 	}
 
+	if snap, err := s.fetcher.FetchTMDBTrending(ctx); err != nil {
+		tmdbErr = err
+		summary.TMDBTrendingError = err.Error()
+	} else {
+		if err := s.saveSnapshot(ctx, ConfigKeyTMDBTrending, snap); err != nil {
+			return summary, fmt.Errorf("save tmdb trending cache: %w", err)
+		}
+		if snap.Source != SourceTMDBTrendingBuiltin {
+			tmdbLiveSucceeded = true
+		}
+		s.mu.Lock()
+		s.tmdbTrending = snap
+		s.tmdbTrendingIdx = buildChartIndex(snap.Entries)
+		s.mu.Unlock()
+	}
+
 	s.mu.RLock()
 	if s.douban != nil {
 		summary.DoubanCount = len(s.douban.Entries)
 	}
 	if s.imdb != nil {
 		summary.IMDbCount = len(s.imdb.Entries)
+	}
+	if s.tmdbTrending != nil {
+		summary.TMDBTrendingCount = len(s.tmdbTrending.Entries)
 	}
 	s.mu.RUnlock()
 
@@ -443,7 +491,10 @@ func (s *Service) SyncAndApply(ctx context.Context) (SyncSummary, error) {
 	summary.MatchedItems = matched
 	summary.TagsAdded = added
 
-	if doubanErr != nil && imdbErr != nil {
+	if doubanErr != nil && imdbErr != nil && !tmdbLiveSucceeded {
+		if tmdbErr != nil {
+			return summary, fmt.Errorf("all chart fetches failed: douban=%v; imdb=%v; tmdb_trending=%v", doubanErr, imdbErr, tmdbErr)
+		}
 		return summary, fmt.Errorf("all chart fetches failed: douban=%v; imdb=%v", doubanErr, imdbErr)
 	}
 	return summary, nil
@@ -501,6 +552,9 @@ func (s *Service) needsInitialSync(interval time.Duration) bool {
 		return true
 	}
 	if s.imdb == nil || len(s.imdb.Entries) == 0 || now.Sub(s.imdb.UpdatedAt) >= interval {
+		return true
+	}
+	if s.tmdbTrending == nil || len(s.tmdbTrending.Entries) == 0 || now.Sub(s.tmdbTrending.UpdatedAt) >= interval {
 		return true
 	}
 	return false

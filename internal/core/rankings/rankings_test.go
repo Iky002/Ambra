@@ -327,7 +327,18 @@ func TestCachePersistenceFailureRetentionAndMatching(t *testing.T) {
 	}))
 	defer imdbSrv.Close()
 
-	opts := Options{DoubanURL: doubanSrv.URL, IMDbURL: imdbSrv.URL}
+	opts := Options{
+		DoubanURL: doubanSrv.URL,
+		IMDbURL:   imdbSrv.URL,
+		TMDBTrendingFetcher: func(ctx context.Context) ([]ChartEntry, string, error) {
+			if failFetches.Load() {
+				return nil, "", http.ErrHandlerTimeout
+			}
+			return []ChartEntry{
+				{Rank: 1, Title: "沙丘2", OriginalTitle: "Dune: Part Two", Year: 2024, MediaType: "movie", TMDBID: "693134", Rating: 8.2},
+			}, SourceTMDBTrendingAPI, nil
+		},
+	}
 	svc := New(store, nil, opts)
 	ctx := context.Background()
 
@@ -336,7 +347,7 @@ func TestCachePersistenceFailureRetentionAndMatching(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SyncAndApply failed: %v", err)
 	}
-	if summary.DoubanCount != 3 || summary.IMDbCount != 2 {
+	if summary.DoubanCount != 3 || summary.IMDbCount != 2 || summary.TMDBTrendingCount != 1 {
 		t.Fatalf("unexpected counts: %+v", summary)
 	}
 
@@ -344,12 +355,12 @@ func TestCachePersistenceFailureRetentionAndMatching(t *testing.T) {
 	failFetches.Store(true)
 	failSummary, err := svc.SyncAndApply(ctx)
 	if err == nil {
-		t.Fatal("expected error when both sources fail")
+		t.Fatal("expected error when all sources fail")
 	}
-	if failSummary.DoubanError == "" || failSummary.IMDbError == "" {
-		t.Fatalf("expected both errors populated: %+v", failSummary)
+	if failSummary.DoubanError == "" || failSummary.IMDbError == "" || failSummary.TMDBTrendingError == "" {
+		t.Fatalf("expected all errors populated: %+v", failSummary)
 	}
-	if failSummary.DoubanCount != 3 || failSummary.IMDbCount != 2 {
+	if failSummary.DoubanCount != 3 || failSummary.IMDbCount != 2 || failSummary.TMDBTrendingCount != 1 {
 		t.Fatalf("expected old cache preserved on failure, got %+v", failSummary)
 	}
 
@@ -465,13 +476,21 @@ func TestApplyTagsToLibraryNonDestructiveIdempotentAndEvent(t *testing.T) {
 	}))
 	defer imdbSrv.Close()
 
-	svc := New(store, bus, Options{DoubanURL: doubanSrv.URL, IMDbURL: imdbSrv.URL})
+	svc := New(store, bus, Options{
+		DoubanURL: doubanSrv.URL,
+		IMDbURL:   imdbSrv.URL,
+		TMDBTrendingFetcher: func(ctx context.Context) ([]ChartEntry, string, error) {
+			return []ChartEntry{
+				{Rank: 1, Title: "绝命毒师", OriginalTitle: "Breaking Bad", Year: 2008, MediaType: "tv", TMDBID: "1396"},
+			}, SourceTMDBTrendingAPI, nil
+		},
+	})
 	summary, err := svc.SyncAndApply(ctx)
 	if err != nil {
 		t.Fatalf("SyncAndApply: %v", err)
 	}
-	if summary.MatchedItems != 2 || summary.TagsAdded != 3 {
-		t.Fatalf("expected matched=2, tagsAdded=3, got %+v", summary)
+	if summary.MatchedItems != 2 || summary.TagsAdded != 4 {
+		t.Fatalf("expected matched=2, tagsAdded=4, got %+v", summary)
 	}
 
 	// Verify user custom tags were preserved alongside new ranking tags.
@@ -481,8 +500,9 @@ func TestApplyTagsToLibraryNonDestructiveIdempotentAndEvent(t *testing.T) {
 		t.Fatalf("movie1 tags = %q, want %q", strings.Join(m1Tags, ","), wantM1)
 	}
 	s1Tags := getItemTags(t, store, series1.ID)
-	if strings.Join(s1Tags, ",") != TagIMDbTop250 {
-		t.Fatalf("series1 tags = %v, want [%s]", s1Tags, TagIMDbTop250)
+	wantS1 := TagIMDbTop250 + "," + TagTMDBTrending
+	if strings.Join(s1Tags, ",") != wantS1 {
+		t.Fatalf("series1 tags = %v, want %q", s1Tags, wantS1)
 	}
 	if epTags := getItemTags(t, store, episode1.ID); len(epTags) != 0 {
 		t.Fatalf("episode should not be tagged, got %v", epTags)
@@ -761,6 +781,314 @@ func TestEdgeCasesAndCoverage(t *testing.T) {
 	}
 	if delaySvc.started.Load() {
 		t.Fatal("expected periodic sync to stop during initial delay on cancel")
+	}
+}
+
+func TestFetchTMDBTrendingAPIKeyAndBearer(t *testing.T) {
+	t.Setenv(EnvTMDBAPIKey, "")
+	t.Setenv(EnvTMDBAPIKeyFallback, "")
+	t.Setenv(EnvTMDBTrendingURL, "")
+
+	var sawBearer atomic.Bool
+	var sawAPIKey atomic.Bool
+	var failTV atomic.Bool
+
+	tmdbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+			sawBearer.Store(true)
+			if r.URL.Query().Get("api_key") != "" {
+				t.Errorf("did not expect api_key query param with Bearer token")
+			}
+		} else if r.URL.Query().Get("api_key") == "test-v3-key" {
+			sawAPIKey.Store(true)
+		} else {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Query().Get("language") != "zh-CN" {
+			t.Errorf("expected language=zh-CN, got %q", r.URL.Query().Get("language"))
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/trending/movie/week":
+			_, _ = w.Write([]byte(`{"results":[
+				{"id":693134,"title":"沙丘2","original_title":"Dune: Part Two","release_date":"2024-02-27","overview":"沙漠史诗","vote_average":8.2},
+				{"id":693134,"title":"沙丘2","original_title":"Dune: Part Two","release_date":"2024-02-27","vote_average":8.2},
+				{"id":0,"title":""}
+			]}`))
+		case "/trending/tv/week":
+			if failTV.Load() {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_, _ = w.Write([]byte(`{"results":[
+				{"id":93405,"name":"鱿鱼游戏","original_name":"오징어 게임","first_air_date":"2021-09-17","overview":"生存游戏","vote_average":7.8,"media_type":"tv"}
+			]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer tmdbSrv.Close()
+
+	// 1. Standard v3 api_key query parameter
+	f := NewFetcher(Options{
+		TMDBAPIKey:          "test-v3-key",
+		TMDBTrendingBaseURL: tmdbSrv.URL + "/",
+	})
+	snap, err := f.FetchTMDBTrending(context.Background())
+	if err != nil {
+		t.Fatalf("FetchTMDBTrending (api_key) failed: %v", err)
+	}
+	if !sawAPIKey.Load() {
+		t.Fatal("expected api_key query param to be sent")
+	}
+	if snap.Chart != ChartTMDBTrending || snap.Source != SourceTMDBTrendingAPI || snap.Count != 2 {
+		t.Fatalf("unexpected snapshot: %+v", snap)
+	}
+	if snap.Entries[0].TMDBID != "693134" || snap.Entries[0].MediaType != "movie" || snap.Entries[0].Year != 2024 || snap.Entries[0].Rank != 1 || snap.Entries[0].Overview != "沙漠史诗" {
+		t.Fatalf("unexpected movie entry: %+v", snap.Entries[0])
+	}
+	if snap.Entries[1].TMDBID != "93405" || snap.Entries[1].MediaType != "tv" || snap.Entries[1].Year != 2021 || snap.Entries[1].Rank != 2 {
+		t.Fatalf("unexpected tv entry: %+v", snap.Entries[1])
+	}
+
+	// 2. Bearer JWT token via env vars + partial failure (TV fails, movie succeeds)
+	failTV.Store(true)
+	t.Setenv(EnvTMDBAPIKeyFallback, "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.sig")
+	t.Setenv(EnvTMDBTrendingURL, tmdbSrv.URL)
+	fEnv := NewFetcher(Options{})
+	snap2, err := fEnv.FetchTMDBTrending(context.Background())
+	if err != nil {
+		t.Fatalf("FetchTMDBTrending (bearer) failed: %v", err)
+	}
+	if !sawBearer.Load() {
+		t.Fatal("expected Authorization: Bearer header")
+	}
+	if snap2.Source != SourceTMDBTrendingAPI || snap2.Count != 1 {
+		t.Fatalf("expected 1 movie entry on partial tv failure, got %+v", snap2)
+	}
+
+	// 3. AMBRA_TMDB_API_KEY env var & default URL resolution
+	t.Setenv(EnvTMDBAPIKey, "ambra-env-key")
+	t.Setenv(EnvTMDBTrendingURL, "")
+	fDef := NewFetcher(Options{})
+	if fDef.resolveTMDBAPIKey() != "ambra-env-key" {
+		t.Fatalf("expected ambra-env-key, got %q", fDef.resolveTMDBAPIKey())
+	}
+	if fDef.resolveTMDBBaseURL() != DefaultTMDBBaseURL {
+		t.Fatalf("expected default TMDB base URL, got %q", fDef.resolveTMDBBaseURL())
+	}
+}
+
+func TestFetchTMDBTrendingFallbacksAndCustomFetcher(t *testing.T) {
+	t.Setenv(EnvTMDBAPIKey, "")
+	t.Setenv(EnvTMDBAPIKeyFallback, "")
+	t.Setenv(EnvTMDBTrendingURL, "")
+
+	ctx := context.Background()
+
+	// 1. No API key -> built-in curated fallback
+	snap, err := NewFetcher(Options{}).FetchTMDBTrending(ctx)
+	if err != nil {
+		t.Fatalf("no-key fallback failed: %v", err)
+	}
+	if snap.Source != SourceTMDBTrendingBuiltin || snap.Count < 20 {
+		t.Fatalf("expected builtin fallback with >=20 entries, got source=%q count=%d", snap.Source, snap.Count)
+	}
+	var hasMovie, hasTV bool
+	for _, e := range snap.Entries {
+		if e.MediaType == "movie" {
+			hasMovie = true
+		}
+		if e.MediaType == "tv" {
+			hasTV = true
+		}
+	}
+	if !hasMovie || !hasTV {
+		t.Fatalf("expected builtin fallback to contain both movies and tv shows")
+	}
+
+	// 2. API key configured, but TMDB API returns 503 -> graceful fallback
+	errSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer errSrv.Close()
+	snapErr, err := NewFetcher(Options{TMDBAPIKey: "k", TMDBTrendingBaseURL: errSrv.URL}).FetchTMDBTrending(ctx)
+	if err != nil || snapErr.Source != SourceTMDBTrendingBuiltin {
+		t.Fatalf("expected graceful fallback on 503, got snap=%+v err=%v", snapErr, err)
+	}
+
+	// 3. API key configured, but TMDB API returns empty results -> graceful fallback
+	emptySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[]}`))
+	}))
+	defer emptySrv.Close()
+	snapEmpty, err := NewFetcher(Options{TMDBAPIKey: "k", TMDBTrendingBaseURL: emptySrv.URL}).FetchTMDBTrending(ctx)
+	if err != nil || snapEmpty.Source != SourceTMDBTrendingBuiltin {
+		t.Fatalf("expected graceful fallback on empty results, got snap=%+v err=%v", snapEmpty, err)
+	}
+
+	// 4. Invalid JSON from TMDB -> graceful fallback
+	badJSONSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{bad json`))
+	}))
+	defer badJSONSrv.Close()
+	snapBad, err := NewFetcher(Options{TMDBAPIKey: "k", TMDBTrendingBaseURL: badJSONSrv.URL}).FetchTMDBTrending(ctx)
+	if err != nil || snapBad.Source != SourceTMDBTrendingBuiltin {
+		t.Fatalf("expected graceful fallback on invalid json, got snap=%+v err=%v", snapBad, err)
+	}
+
+	// 5. Custom TMDBTrendingFetcher with empty source defaults to SourceTMDBTrendingAPI
+	customSnap, err := NewFetcher(Options{
+		TMDBTrendingFetcher: func(ctx context.Context) ([]ChartEntry, string, error) {
+			return []ChartEntry{{Rank: 1, Title: "Custom", MediaType: "movie", TMDBID: "1"}}, "", nil
+		},
+	}).FetchTMDBTrending(ctx)
+	if err != nil || customSnap.Source != SourceTMDBTrendingAPI || customSnap.Count != 1 {
+		t.Fatalf("unexpected custom fetcher snap: %+v err=%v", customSnap, err)
+	}
+
+	// 6. entryDedupKey distinguishes movie vs tv TMDB IDs
+	if entryDedupKey(ChartEntry{TMDBID: "100", MediaType: "movie"}) == entryDedupKey(ChartEntry{TMDBID: "100", MediaType: "tv"}) {
+		t.Fatal("expected distinct dedup keys for movie and tv with same TMDB ID")
+	}
+}
+
+func TestTMDBTrendingPersistenceAutoTaggingAndEndpoint(t *testing.T) {
+	t.Setenv(EnvTMDBAPIKey, "")
+	t.Setenv(EnvTMDBAPIKeyFallback, "")
+
+	store := openTestStore(t)
+	repo := sqlite.NewLibraryRepo(store)
+	ctx := context.Background()
+
+	lib, err := repo.CreateLibrary(ctx, "Media", "mixed", []string{"/media"})
+	if err != nil {
+		t.Fatalf("CreateLibrary: %v", err)
+	}
+	y2024 := 2024
+	y2021 := 2021
+	movie := &sqlite.ItemRecord{
+		LibraryID:      lib.ID,
+		Type:           "Movie",
+		Name:           "Dune 2",
+		ProductionYear: &y2024,
+		Extra:          sqlite.ItemExtra{ProviderIDs: map[string]string{"tmdb": "693134"}},
+	}
+	if err := repo.UpsertItem(ctx, movie); err != nil {
+		t.Fatalf("UpsertItem movie: %v", err)
+	}
+	series := &sqlite.ItemRecord{
+		LibraryID:      lib.ID,
+		Type:           "Series",
+		Name:           "鱿鱼游戏",
+		OriginalTitle:  "Squid Game",
+		ProductionYear: &y2021,
+	}
+	if err := repo.UpsertItem(ctx, series); err != nil {
+		t.Fatalf("UpsertItem series: %v", err)
+	}
+
+	failSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer failSrv.Close()
+
+	tmdbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/trending/movie/week":
+			_, _ = w.Write([]byte(`{"results":[{"id":693134,"title":"沙丘2","original_title":"Dune: Part Two","release_date":"2024-02-27","vote_average":8.2}]}`))
+		case "/trending/tv/week":
+			_, _ = w.Write([]byte(`{"results":[{"id":93405,"name":"鱿鱼游戏","original_name":"Squid Game","first_air_date":"2021-09-17","vote_average":7.8}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer tmdbSrv.Close()
+
+	// Even when Douban & IMDb fail, live TMDB Trending succeeds -> SyncAndApply succeeds.
+	svc := New(store, nil, Options{
+		DoubanURL:           failSrv.URL,
+		IMDbURL:             failSrv.URL,
+		TMDBAPIKey:          "live-key",
+		TMDBTrendingBaseURL: tmdbSrv.URL,
+	})
+
+	// Before sync, TrendingEntries returns empty non-nil slice.
+	preEntries, preStatus := svc.TrendingEntries(ctx)
+	if preEntries == nil || len(preEntries) != 0 || preStatus.Chart != ChartTMDBTrending {
+		t.Fatalf("unexpected pre-sync trending: entries=%v status=%+v", preEntries, preStatus)
+	}
+
+	sum, err := svc.SyncAndApply(ctx)
+	if err != nil {
+		t.Fatalf("expected SyncAndApply to succeed when live TMDB trending succeeds: %v", err)
+	}
+	if sum.TMDBTrendingCount != 2 || sum.MatchedItems != 2 || sum.TagsAdded != 2 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+
+	if tags := getItemTags(t, store, movie.ID); strings.Join(tags, ",") != TagTMDBTrending {
+		t.Fatalf("movie tags = %v, want [%s]", tags, TagTMDBTrending)
+	}
+	if tags := getItemTags(t, store, series.ID); strings.Join(tags, ",") != TagTMDBTrending {
+		t.Fatalf("series tags = %v, want [%s]", tags, TagTMDBTrending)
+	}
+
+	// Reload from SQLite in a fresh service and test GET /System/Rankings/Trending.
+	svc2 := New(store, nil, Options{})
+	if err := svc2.LoadCache(ctx); err != nil {
+		t.Fatalf("LoadCache: %v", err)
+	}
+	mux := http.NewServeMux()
+	NewHandler(svc2).RegisterRoutes(mux, AuthFuncs{
+		RequireAuth: func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("X-Auth") == "" {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				next.ServeHTTP(w, r)
+			})
+		},
+	})
+
+	// Unauthenticated -> 401
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/System/Rankings/Trending", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+
+	// Authenticated -> 200 with status + entries
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/System/Rankings/Trending", nil)
+	req.Header.Set("X-Auth", "user")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp TrendingResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode trending response: %v", err)
+	}
+	if resp.Status.Chart != ChartTMDBTrending || resp.Status.Source != SourceTMDBTrendingAPI || resp.Status.Count != 2 || len(resp.Entries) != 2 {
+		t.Fatalf("unexpected trending response: %+v", resp)
+	}
+
+	// Corrupted TMDB trending cache in SQLite -> LoadCache returns error.
+	_, err = store.Writer.Exec(
+		`INSERT OR REPLACE INTO server_config (key, value_json, updated_at) VALUES (?, ?, ?)`,
+		ConfigKeyTMDBTrending, "{corrupted", time.Now().Unix(),
+	)
+	if err != nil {
+		t.Fatalf("seed corrupt tmdb config: %v", err)
+	}
+	if err := New(store, nil, Options{}).LoadCache(ctx); err == nil {
+		t.Fatal("expected LoadCache error on corrupted TMDB trending JSON")
 	}
 }
 

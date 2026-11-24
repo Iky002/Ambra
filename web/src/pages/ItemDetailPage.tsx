@@ -4,6 +4,8 @@ import {
   AlertTriangle,
   Check,
   Film,
+  Flame,
+  GitMerge,
   Heart,
   Image as ImageIcon,
   Layers,
@@ -24,6 +26,7 @@ import { api, getBackdropUrl, getFallbackImageUrl, getImageUrl } from '../api/cl
 import type { MediaSourceInfo } from '../api/types'
 import { IdentifyModal } from '../components/media/IdentifyModal'
 import { ImageManagerModal } from '../components/media/ImageManagerModal'
+import { MergeVersionsModal } from '../components/media/MergeVersionsModal'
 import { MetadataEditorModal } from '../components/media/MetadataEditorModal'
 import { useAuth } from '../context/AuthContext'
 import {
@@ -45,6 +48,7 @@ export function ItemDetailPage() {
   const [editModalOpen, setEditModalOpen] = useState(false)
   const [imageModalOpen, setImageModalOpen] = useState(false)
   const [identifyModalOpen, setIdentifyModalOpen] = useState(false)
+  const [mergeModalOpen, setMergeModalOpen] = useState(false)
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
   const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
 
@@ -333,9 +337,18 @@ export function ItemDetailPage() {
                 ))}
               </div>
 
-              {/* 榜单与技术徽章：豆瓣 Top250 / IMDb Top250 / 4K / HDR / 简繁字幕 / ASS / PGS */}
+              {/* 榜单与技术徽章：热门 / 豆瓣 Top250 / IMDb Top250 / 4K / HDR / 简繁字幕 / ASS / PGS */}
               {(techBadges.length > 0 || (item.Tags && item.Tags.length > 0)) && (
                 <div className="flex flex-wrap items-center gap-2">
+                  {item.Tags?.some((t) => t.toLowerCase() === 'trending') && (
+                    <Link
+                      to="/trending"
+                      className="inline-flex items-center gap-1 rounded-md border border-orange-400/55 bg-gradient-to-r from-orange-950/90 via-amber-900/80 to-orange-950/90 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide text-orange-200 shadow-[0_0_12px_rgba(249,115,22,0.22)] transition-opacity hover:opacity-90"
+                    >
+                      <Flame className="h-3 w-3 text-orange-400" />
+                      <span>热门趋势</span>
+                    </Link>
+                  )}
                   {item.Tags?.some((t) => t === '豆瓣Top250' || t === '豆瓣 Top250') && (
                     <span className="inline-flex items-center rounded-md border border-emerald-400/50 bg-gradient-to-r from-emerald-950/90 via-emerald-900/80 to-teal-950/90 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide text-emerald-200 shadow-[0_0_12px_rgba(16,185,129,0.2)]">
                       豆瓣 Top250
@@ -465,6 +478,16 @@ export function ItemDetailPage() {
                       />
                       <span>刷新元数据</span>
                     </button>
+                    {(item.Type === 'Movie' || item.Type === 'Video') && (
+                      <button
+                        type="button"
+                        onClick={() => setMergeModalOpen(true)}
+                        className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:bg-white/10 hover:text-amber-200"
+                      >
+                        <GitMerge className="h-3.5 w-3.5" />
+                        <span>合并版本</span>
+                      </button>
+                    )}
                     {mediaSources.length > 1 && (
                       <button
                         type="button"
@@ -699,8 +722,9 @@ export function ItemDetailPage() {
                 ? getFallbackImageUrl(person.Id, 'Primary')
                 : null
               return (
-                <div
+                <Link
                   key={`${person.Id}-${person.Role}`}
+                  to={`/person/${encodeURIComponent(person.Id || person.Name)}?name=${encodeURIComponent(person.Name)}`}
                   className="group w-28 shrink-0 text-center transition-transform duration-200 hover:-translate-y-0.5"
                 >
                   <div className="mx-auto flex h-24 w-24 items-center justify-center overflow-hidden rounded-full border border-white/10 bg-zinc-900 transition-all duration-300 group-hover:border-amber-400/70 group-hover:shadow-[0_0_18px_rgba(245,158,11,0.22)]">
@@ -720,7 +744,7 @@ export function ItemDetailPage() {
                     {person.Name}
                   </p>
                   <p className="truncate text-[11px] text-zinc-500">{person.Role || person.Type}</p>
-                </div>
+                </Link>
               )
             })}
           </div>
@@ -747,6 +771,12 @@ export function ItemDetailPage() {
             item={item}
             onClose={() => setIdentifyModalOpen(false)}
             onApplied={(msg) => showToast('success', msg)}
+          />
+          <MergeVersionsModal
+            open={mergeModalOpen}
+            item={item}
+            onClose={() => setMergeModalOpen(false)}
+            onMerged={(msg) => showToast('success', msg)}
           />
           <AdminModal
             open={deleteConfirmOpen}

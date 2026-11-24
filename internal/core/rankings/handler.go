@@ -36,6 +36,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	}
 
 	mux.Handle("GET /System/Rankings", wrapAuth(http.HandlerFunc(h.handleStatus)))
+	mux.Handle("GET /System/Rankings/Trending", wrapAuth(http.HandlerFunc(h.handleTrending)))
 	mux.Handle("POST /System/Rankings/Refresh", wrapAdmin(http.HandlerFunc(h.handleRefresh)))
 }
 
@@ -46,6 +47,14 @@ func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
 		includeEntries = *b
 	}
 	httpx.JSON(w, http.StatusOK, h.svc.Status(includeEntries))
+}
+
+func (h *Handler) handleTrending(w http.ResponseWriter, r *http.Request) {
+	entries, status := h.svc.TrendingEntries(r.Context())
+	httpx.JSON(w, http.StatusOK, TrendingResponse{
+		Status:  status,
+		Entries: entries,
+	})
 }
 
 func (h *Handler) handleRefresh(w http.ResponseWriter, r *http.Request) {

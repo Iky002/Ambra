@@ -694,6 +694,7 @@ export function createInitialDemoState(): DemoState {
       CommunityRating: 8.3,
       RunTimeTicks: 2 * HOUR_TICKS + 53 * MIN_TICKS,
       Genres: ['科幻', '动作', '剧情'],
+      Tags: ['Trending'],
       ProviderIds: { Tmdb: '842675', Imdb: 'tt22050754' },
       Studios: [{ Id: 'st-cfgc', Name: '中国电影股份有限公司' }],
       Overview:
@@ -806,7 +807,7 @@ export function createInitialDemoState(): DemoState {
       CommunityRating: 9.4,
       RunTimeTicks: 2 * HOUR_TICKS + 49 * MIN_TICKS,
       Genres: ['冒险', '剧情', '科幻'],
-      Tags: ['豆瓣Top250', 'IMDb Top250'],
+      Tags: ['豆瓣Top250', 'IMDb Top250', 'Trending'],
       ProviderIds: { Tmdb: '157336', Imdb: 'tt0816692' },
       Studios: [
         { Id: 'st-paramount', Name: 'Paramount Pictures' },
@@ -864,7 +865,7 @@ export function createInitialDemoState(): DemoState {
       CommunityRating: 8.6,
       RunTimeTicks: 2 * HOUR_TICKS + 46 * MIN_TICKS,
       Genres: ['科幻', '冒险'],
-      Tags: ['IMDb Top250'],
+      Tags: ['IMDb Top250', 'Trending'],
       ProviderIds: { Tmdb: '693134', Imdb: 'tt15239678' },
       Studios: [
         { Id: 'st-legendary', Name: 'Legendary Pictures' },
@@ -920,7 +921,7 @@ export function createInitialDemoState(): DemoState {
       CommunityRating: 8.8,
       RunTimeTicks: 3 * HOUR_TICKS + 1 * MIN_TICKS,
       Genres: ['剧情', '历史', '战争'],
-      Tags: ['豆瓣Top250', 'IMDb Top250'],
+      Tags: ['豆瓣Top250', 'IMDb Top250', 'Trending'],
       ProviderIds: { Tmdb: '872585', Imdb: 'tt15398776' },
       Studios: [
         { Id: 'st-universal', Name: 'Universal Pictures' },
@@ -1082,6 +1083,7 @@ export function createInitialDemoState(): DemoState {
       OfficialRating: 'TV-14',
       CommunityRating: 8.7,
       Genres: ['科幻', '悬疑', '剧情'],
+      Tags: ['Trending'],
       ProviderIds: { Tmdb: '204541', Imdb: 'tt20242042' },
       Studios: [{ Id: 'st-tencent', Name: '企鹅影视 / 灵河文化' }],
       Overview:
@@ -1270,6 +1272,7 @@ export function createInitialDemoState(): DemoState {
       OfficialRating: 'TV-MA',
       CommunityRating: 9.6,
       Genres: ['动画', '动作冒险', '奇幻'],
+      Tags: ['Trending'],
       ProviderIds: { Tmdb: '1429', Imdb: 'tt2560140' },
       Studios: [
         { Id: 'st-wit', Name: 'Wit Studio' },
@@ -1415,7 +1418,56 @@ export function createInitialDemoState(): DemoState {
     )
   }
 
-  // 媒体库包含关系
+  // ==================== 4.5 媒体合集 (BoxSet) ====================
+  registerItem(
+    {
+      Id: 'boxset-scifi-epics',
+      Name: '科幻史诗合集',
+      OriginalTitle: 'Sci-Fi Epics Collection',
+      SortName: 'kehuanshishiheji sci-fi epics',
+      ServerId: DEMO_SERVER_ID,
+      Type: 'BoxSet',
+      IsFolder: true,
+      DateCreated: isoAgo(10),
+      CommunityRating: 9.0,
+      Genres: ['科幻', '冒险'],
+      Overview:
+        '精选宇宙探索、赛博朋克与硬核科幻里程碑佳作，涵盖《沙丘 2》《星际穿越》《流浪地球 2》《银翼杀手 2049》与《盗梦空间》。',
+      ChildCount: 5,
+      ImageTags: { Primary: 'demo-p' },
+      BackdropImageTags: ['demo-b'],
+      PrimaryImageAspectRatio: 0.667,
+    },
+    ['#0c1e35', '#1e3a5f', '#f59e0b'],
+    '5 部合集',
+    TMDB_MEDIA_ART['item-interstellar'],
+  )
+
+  registerItem(
+    {
+      Id: 'boxset-top250-classics',
+      Name: '豆瓣/IMDb 经典必看',
+      OriginalTitle: 'Top 250 Classics Collection',
+      SortName: 'douban imdb jingdianbikan top 250 classics',
+      ServerId: DEMO_SERVER_ID,
+      Type: 'BoxSet',
+      IsFolder: true,
+      DateCreated: isoAgo(12),
+      CommunityRating: 9.5,
+      Genres: ['剧情', '犯罪', '经典'],
+      Overview:
+        '横跨影史数十载的殿堂级神作合集，收录豆瓣与 IMDb Top 250 高分口碑影片，4K HDR 修复典藏。',
+      ChildCount: 6,
+      ImageTags: { Primary: 'demo-p' },
+      BackdropImageTags: ['demo-b'],
+      PrimaryImageAspectRatio: 0.667,
+    },
+    ['#1c1917', '#451a03', '#f59e0b'],
+    '6 部合集',
+    TMDB_MEDIA_ART['item-shawshank-redemption'],
+  )
+
+  // 媒体库与合集包含关系
   const libraryItems = new Map<string, string[]>([
     [
       'lib-movies',
@@ -1449,6 +1501,27 @@ export function createInitialDemoState(): DemoState {
         'item-inception',
         'item-oppenheimer',
         'item-blade-runner-2049',
+      ],
+    ],
+    [
+      'boxset-scifi-epics',
+      [
+        'item-dune-2',
+        'item-interstellar',
+        'item-wandering-earth-2',
+        'item-blade-runner-2049',
+        'item-inception',
+      ],
+    ],
+    [
+      'boxset-top250-classics',
+      [
+        'item-shawshank-redemption',
+        'item-the-godfather',
+        'item-the-dark-knight',
+        'item-farewell-my-concubine',
+        'item-forrest-gump',
+        'item-spirited-away',
       ],
     ],
   ])

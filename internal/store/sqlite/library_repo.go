@@ -168,6 +168,7 @@ type ItemFilter struct {
 	Studios                []string
 	Tags                   []string
 	PersonIDs              []string
+	Persons                []string
 	Years                  []int
 	IsPlayed               *bool
 	IsUnplayed             *bool
@@ -903,6 +904,18 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 		}
 		where = append(where, fmt.Sprintf(`EXISTS (
 			SELECT 1 FROM item_people ip WHERE ip.item_id = i.id AND ip.person_id IN (%s)
+		)`, strings.Join(ph, ",")))
+	}
+	if len(f.Persons) > 0 {
+		ph := make([]string, len(f.Persons))
+		for idx, p := range f.Persons {
+			ph[idx] = "?"
+			args = append(args, p)
+		}
+		where = append(where, fmt.Sprintf(`EXISTS (
+			SELECT 1 FROM item_people ip
+			JOIN people p ON p.id = ip.person_id
+			WHERE ip.item_id = i.id AND p.name IN (%s)
 		)`, strings.Join(ph, ",")))
 	}
 
