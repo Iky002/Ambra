@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { CalendarDays, Loader2, Plus, Radio, RefreshCw, Trash2, Tv } from 'lucide-react'
+import { CalendarDays, Loader2, Play, Plus, Radio, RefreshCw, Trash2, Tv } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import { api } from '../../api/client'
 import { FeedbackBanner } from './adminUtils'
 
@@ -450,6 +451,13 @@ export function LiveTvTab() {
                     {ch.StreamUrl ? ` · ${ch.StreamUrl}` : ''}
                   </p>
                 </div>
+                <Link
+                  to={`/livetv?channel=${encodeURIComponent(ch.Id)}`}
+                  className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-amber-500/35 bg-amber-500/10 px-2.5 py-1 text-[11px] font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
+                >
+                  <Play className="h-3 w-3" />
+                  <span>观看</span>
+                </Link>
               </div>
             ))}
           </div>

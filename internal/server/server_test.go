@@ -234,3 +234,91 @@ func TestApplyPendingDatabaseRestore(t *testing.T) {
 		t.Fatalf("expected restored user in booted server DB, got u=%+v err=%v", u, err)
 	}
 }
+
+func TestServerLiveTVAndDVRWiring(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg, err := config.Load(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("server.New failed: %v", err)
+	}
+	defer func() {
+		if err := srv.Close(); err != nil {
+			t.Fatalf("server.Close failed: %v", err)
+		}
+	}()
+
+	if srv.LiveTV == nil || srv.DVR == nil {
+		t.Fatalf("expected srv.LiveTV and srv.DVR to be wired")
+	}
+
+	// Unauthenticated channel stream request must return 401
+	rec := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/any/Stream", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on unauthenticated /LiveTv/Channels/{Id}/Stream, got %d", rec.Code)
+	}
+
+	// Create an API key (admin-capable token) to test authenticated Live TV proxy end-to-end
+	apiKey, err := srv.Auth.CreateAPIKey(context.Background(), "livetv-test")
+	if err != nil {
+		t.Fatalf("CreateAPIKey: %v", err)
+	}
+	token := apiKey.Token
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp2t")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("E2E_LIVE_STREAM"))
+	}))
+	defer upstream.Close()
+
+	// Add channel via /LiveTv/TunerHosts
+	m3uBody := `{"Type":"m3u","M3UContent":"#EXTM3U\n#EXTINF:-1,E2E Channel\n` + upstream.URL + `/live.ts\n"}`
+	req := httptest.NewRequest(http.MethodPost, "/LiveTv/TunerHosts", strings.NewReader(m3uBody))
+	req.Header.Set("X-Emby-Token", token)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /LiveTv/TunerHosts: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Query channel ID
+	req = httptest.NewRequest(http.MethodGet, "/LiveTv/Channels", nil)
+	req.Header.Set("X-Emby-Token", token)
+	rec = httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "E2E Channel") {
+		t.Fatalf("GET /LiveTv/Channels: %d %s", rec.Code, rec.Body.String())
+	}
+	// Extract channel ID from response
+	idx := strings.Index(rec.Body.String(), `"Id":"`)
+	if idx < 0 {
+		t.Fatalf("missing Id in channels response: %s", rec.Body.String())
+	}
+	rest := rec.Body.String()[idx+len(`"Id":"`):]
+	chID := rest[:strings.Index(rest, `"`)]
+
+	// Proxy via primary route /LiveTv/Channels/{Id}/Stream
+	req = httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream", nil)
+	req.Header.Set("X-Emby-Token", token)
+	rec = httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "E2E_LIVE_STREAM" {
+		t.Fatalf("primary stream proxy: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	// Proxy via compat route /LiveTv/LiveStreamFiles/{Id}/stream.ts
+	req = httptest.NewRequest(http.MethodGet, "/LiveTv/LiveStreamFiles/"+chID+"/stream.ts", nil)
+	req.Header.Set("X-Emby-Token", token)
+	rec = httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "E2E_LIVE_STREAM" {
+		t.Fatalf("compat stream proxy: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+}

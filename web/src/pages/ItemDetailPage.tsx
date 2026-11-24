@@ -18,13 +18,11 @@ import {
   Image as ImageIcon,
   Info,
   Layers,
-  ListVideo,
   Loader2,
   Music,
   Pause,
   Pencil,
   Play,
-  Plus,
   RefreshCw,
   ScanSearch,
   Split,
@@ -34,10 +32,12 @@ import {
   Upload,
   User,
   Volume2,
+  VolumeX,
 } from 'lucide-react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import {
   api,
+  getAudioStreamUrl,
   getBackdropUrl,
   getChapterImageUrl,
   getFallbackImageUrl,
@@ -46,6 +46,7 @@ import {
 import type { BaseItemDto, MediaSourceInfo } from '../api/types'
 import { formatAudioTime } from '../components/AudioPlayerBar'
 import { MediaCard } from '../components/MediaCard'
+import { AddToCollectionModal } from '../components/media/AddToCollectionModal'
 import { IdentifyModal } from '../components/media/IdentifyModal'
 import { ImageManagerModal } from '../components/media/ImageManagerModal'
 import { MergeVersionsModal } from '../components/media/MergeVersionsModal'
@@ -96,6 +97,7 @@ export function ItemDetailPage() {
     isPlaying: isAudioPlaying,
     playQueue,
     playTrack,
+    pause: pauseGlobalAudio,
     togglePlay: toggleAudioPlay,
   } = useAudioPlayer()
   const navigate = useNavigate()
@@ -109,8 +111,6 @@ export function ItemDetailPage() {
   const [mergeModalOpen, setMergeModalOpen] = useState(false)
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
   const [addToColOpen, setAddToColOpen] = useState(false)
-  const [addToColTab, setAddToColTab] = useState<'BoxSet' | 'Playlist'>('BoxSet')
-  const [newColName, setNewColName] = useState('')
   const [showAllCast, setShowAllCast] = useState(false)
   const [mediaInfoExpanded, setMediaInfoExpanded] = useState(true)
   const [pathCopied, setPathCopied] = useState(false)
@@ -120,6 +120,9 @@ export function ItemDetailPage() {
   const [subForced, setSubForced] = useState(false)
   const [subError, setSubError] = useState<string | null>(null)
   const subFileInputRef = useRef<HTMLInputElement>(null)
+  const themeAudioRef = useRef<HTMLAudioElement | null>(null)
+  const activeThemeAudioRef = useRef<HTMLAudioElement | null>(null)
+  const [themeSongPlaying, setThemeSongPlaying] = useState(false)
   const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
 
   const showToast = (type: 'success' | 'error', message: string) => {
@@ -250,32 +253,29 @@ export function ItemDetailPage() {
   })
   const specialFeatures = Array.isArray(specialFeaturesData) ? specialFeaturesData : []
 
-  // 加入合集 / 播放列表弹窗数据
-  const { data: boxSetsForModal } = useQuery({
-    queryKey: ['collections', userId, 'BoxSet'],
-    queryFn: () =>
-      api.getItems(userId, {
-        includeItemTypes: 'BoxSet',
-        recursive: true,
-        sortBy: 'SortName',
-        sortOrder: 'Ascending',
-        limit: 100,
-      }),
-    enabled: addToColOpen,
+  // 主题曲查询（仅 Movie / Series，出错静默忽略）
+  const supportsThemeSongs = item?.Type === 'Movie' || item?.Type === 'Series'
+  const { data: themeSongsData } = useQuery({
+    queryKey: ['themeSongs', id],
+    queryFn: () => api.getThemeSongs(item!.Id).catch(() => ({ Items: [], TotalRecordCount: 0 })),
+    enabled: Boolean(id && item?.Id && supportsThemeSongs),
+    staleTime: 60_000,
   })
+  const themeSongs = themeSongsData?.Items || []
 
-  const { data: playlistsForModal } = useQuery({
-    queryKey: ['collections', userId, 'Playlist'],
-    queryFn: () =>
-      api.getItems(userId, {
-        includeItemTypes: 'Playlist',
-        recursive: true,
-        sortBy: 'SortName',
-        sortOrder: 'Ascending',
-        limit: 100,
-      }),
-    enabled: addToColOpen,
-  })
+  // 离开详情页或切换条目时自动停止并清理主题曲播放
+  useEffect(() => {
+    return () => {
+      const audio = activeThemeAudioRef.current || themeAudioRef.current
+      if (audio) {
+        audio.pause()
+        audio.currentTime = 0
+        audio.removeAttribute('src')
+      }
+      activeThemeAudioRef.current = null
+      setThemeSongPlaying(false)
+    }
+  }, [id])
 
   // 多版本 / 音轨 / 字幕选择状态
   const mediaSources: MediaSourceInfo[] = item?.MediaSources || []
@@ -470,50 +470,6 @@ export function ItemDetailPage() {
     },
   })
 
-  // 加入已有合集 / 播放列表
-  const addToContainerMutation = useMutation({
-    mutationFn: async (target: { id: string; name: string; type: 'BoxSet' | 'Playlist' }) => {
-      if (target.type === 'Playlist') {
-        await api.addPlaylistItems(target.id, [item!.Id], userId)
-      } else {
-        await api.addCollectionItems(target.id, [item!.Id])
-      }
-      return target
-    },
-    onSuccess: async (target) => {
-      await queryClient.invalidateQueries({ queryKey: ['collections', userId] })
-      setAddToColOpen(false)
-      showToast('success', `已将「${item!.Name}」加入「${target.name}」`)
-    },
-    onError: (err) => {
-      showToast('error', err instanceof Error ? err.message : '加入失败')
-    },
-  })
-
-  // 新建合集 / 播放列表并立即加入当前条目
-  const createAndAddMutation = useMutation({
-    mutationFn: async () => {
-      const name = newColName.trim()
-      if (!name) throw new Error('请输入名称')
-      if (addToColTab === 'Playlist') {
-        const mediaType = ['Audio', 'MusicAlbum', 'MusicArtist'].includes(item!.Type)
-          ? 'Audio'
-          : 'Video'
-        return api.createPlaylist(name, userId, [item!.Id], mediaType)
-      }
-      return api.createCollection(name, [item!.Id])
-    },
-    onSuccess: async (created) => {
-      setNewColName('')
-      setAddToColOpen(false)
-      await queryClient.invalidateQueries({ queryKey: ['collections', userId] })
-      showToast('success', `已创建「${created.Name}」并加入「${item!.Name}」`)
-    },
-    onError: (err) => {
-      showToast('error', err instanceof Error ? err.message : '创建并加入失败')
-    },
-  })
-
   const refreshMetadataMutation = useMutation({
     mutationFn: () => api.refreshItemMetadata(item!.Id, false),
     onSuccess: async () => {
@@ -670,7 +626,50 @@ export function ItemDetailPage() {
     )
   })
 
+  const stopThemeSong = () => {
+    const audio = activeThemeAudioRef.current || themeAudioRef.current
+    if (audio) {
+      audio.pause()
+      audio.currentTime = 0
+      audio.removeAttribute('src')
+    }
+    activeThemeAudioRef.current = null
+    setThemeSongPlaying(false)
+  }
+
+  const handleToggleThemeSong = () => {
+    const firstTheme = themeSongs[0]
+    const audio = themeAudioRef.current
+    if (!firstTheme || !audio) return
+
+    if (themeSongPlaying) {
+      stopThemeSong()
+      return
+    }
+
+    if (isAudioPlaying) {
+      pauseGlobalAudio()
+    }
+
+    activeThemeAudioRef.current = audio
+    audio.src = getAudioStreamUrl(firstTheme.Id)
+    audio.volume = 0.35
+    audio.loop = true
+    const playPromise = audio.play()
+    if (playPromise && typeof playPromise.then === 'function') {
+      playPromise
+        .then(() => setThemeSongPlaying(true))
+        .catch(() => {
+          activeThemeAudioRef.current = null
+          setThemeSongPlaying(false)
+        })
+    } else {
+      setThemeSongPlaying(true)
+    }
+  }
+
   const handlePlay = (targetId = item.Id, startTicks = 0) => {
+    stopThemeSong()
     const params = new URLSearchParams()
     if (startTicks > 0) params.set('startTicks', String(startTicks))
     if (targetId === item.Id) {
@@ -931,6 +930,25 @@ export function ItemDetailPage() {
                   >
                     <Film className="h-4 w-4" />
                     <span>预告片</span>
+                  </button>
+                )}
+
+                {themeSongs.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleToggleThemeSong}
+                    className={`inline-flex items-center gap-2 rounded-xl border px-4 py-3 text-sm font-medium transition-all duration-200 hover:-translate-y-0.5 active:scale-[0.97] ${
+                      themeSongPlaying
+                        ? 'border-amber-400/50 bg-amber-500/15 text-amber-300'
+                        : 'border-white/12 bg-white/[0.05] text-zinc-200 hover:border-amber-400/40 hover:bg-white/10 hover:text-amber-200'
+                    }`}
+                  >
+                    {themeSongPlaying ? (
+                      <VolumeX className="h-4 w-4" />
+                    ) : (
+                      <Music className="h-4 w-4" />
+                    )}
+                    <span>{themeSongPlaying ? '停止主题曲' : '播放主题曲'}</span>
                   </button>
                 )}
 
@@ -2022,102 +2040,22 @@ export function ItemDetailPage() {
         </section>
       )}
 
-      {/* 加入合集 / 播放列表弹窗 */}
-      <AdminModal
+      {/* 本地主题曲播放器（仅用于当前详情页，卸载自动停止） */}
+      <audio
+        ref={themeAudioRef}
+        className="hidden"
+        onEnded={() => setThemeSongPlaying(false)}
+      />
+
+      {/* 加入合集 / 播放列表弹窗（复用公共组件） */}
+      <AddToCollectionModal
         open={addToColOpen}
-        title="加入合集 / 播放列表"
-        subtitle={`将「${item.Name}」添加到已有合集或新建片单`}
-        maxWidthClass="max-w-md"
+        itemIds={[item.Id]}
+        itemLabel={item.Name}
+        mediaType={['Audio', 'MusicAlbum', 'MusicArtist'].includes(item.Type) ? 'Audio' : 'Video'}
         onClose={() => setAddToColOpen(false)}
-      >
-        <div className="space-y-4">
-          <div className="flex gap-2">
-            <button
-              type="button"
-              onClick={() => setAddToColTab('BoxSet')}
-              className={`inline-flex flex-1 items-center justify-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-medium transition-colors ${
-                addToColTab === 'BoxSet'
-                  ? 'border-amber-400/50 bg-amber-500/15 text-amber-300'
-                  : 'border-white/10 bg-white/[0.03] text-zinc-400 hover:text-zinc-200'
-              }`}
-            >
-              <Layers className="h-3.5 w-3.5" />
-              <span>合集 (BoxSet)</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => setAddToColTab('Playlist')}
-              className={`inline-flex flex-1 items-center justify-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-medium transition-colors ${
-                addToColTab === 'Playlist'
-                  ? 'border-amber-400/50 bg-amber-500/15 text-amber-300'
-                  : 'border-white/10 bg-white/[0.03] text-zinc-400 hover:text-zinc-200'
-              }`}
-            >
-              <ListVideo className="h-3.5 w-3.5" />
-              <span>播放列表</span>
-            </button>
-          </div>
-
-          <div className="max-h-56 space-y-1.5 overflow-y-auto">
-            {(addToColTab === 'BoxSet'
-              ? boxSetsForModal?.Items || []
-              : playlistsForModal?.Items || []
-            ).length === 0 ? (
-              <p className="rounded-xl border border-dashed border-white/10 py-6 text-center text-xs text-zinc-500">
-                暂无{addToColTab === 'BoxSet' ? '合集' : '播放列表'}，可在下方直接新建
-              </p>
-            ) : (
-              (addToColTab === 'BoxSet'
-                ? boxSetsForModal?.Items || []
-                : playlistsForModal?.Items || []
-              ).map((target) => (
-                <button
-                  key={target.Id}
-                  type="button"
-                  disabled={addToContainerMutation.isPending}
-                  onClick={() =>
-                    addToContainerMutation.mutate({
-                      id: target.Id,
-                      name: target.Name,
-                      type: addToColTab,
-                    })
-                  }
-                  className="flex w-full items-center justify-between rounded-xl border border-white/8 bg-white/[0.03] px-3.5 py-2.5 text-left text-xs text-zinc-200 transition-colors hover:border-amber-400/40 hover:bg-white/10"
-                >
-                  <span className="truncate font-medium">{target.Name}</span>
-                  <span className="shrink-0 text-[11px] text-amber-400">加入</span>
-                </button>
-              ))
-            )}
-          </div>
-
-          <form
-            onSubmit={(e) => {
-              e.preventDefault()
-              createAndAddMutation.mutate()
-            }}
-            className="flex items-center gap-2 border-t border-white/10 pt-3"
-          >
-            <input
-              type="text"
-              value={newColName}
-              onChange={(e) => setNewColName(e.target.value)}
-              placeholder={
-                addToColTab === 'BoxSet' ? '输入新合集名称并加入...' : '输入新播放列表名称并加入...'
-              }
-              className="flex-1 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2 text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
-            />
-            <button
-              type="submit"
-              disabled={createAndAddMutation.isPending || !newColName.trim()}
-              className="inline-flex items-center gap-1 rounded-xl bg-amber-500 px-3 py-2 text-xs font-semibold text-zinc-950 hover:bg-amber-400 disabled:opacity-50"
-            >
-              <Plus className="h-3.5 w-3.5" />
-              <span>新建并加入</span>
-            </button>
-          </form>
-        </div>
-      </AdminModal>
+        onSuccess={(msg) => showToast('success', msg)}
+      />
 
       {/* 外挂字幕管理弹窗（仅管理员：查看 / 删除外挂 / 上传新字幕） */}
       {isAdmin && (

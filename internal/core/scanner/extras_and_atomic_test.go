@@ -217,3 +217,204 @@ func TestScanLocalTrailersSpecialFeaturesAndThemeSongs(t *testing.T) {
 		t.Fatalf("expected 1 series deleted scene, got %+v err=%v", tvDeleted, err)
 	}
 }
+
+func TestScanPathSkipsSingleExtraFile(t *testing.T) {
+	tmp := t.TempDir()
+	st, err := sqlite.Open(filepath.Join(tmp, "scanpath_extra.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	repo := sqlite.NewLibraryRepo(st)
+	ctx := context.Background()
+
+	movieRoot := filepath.Join(tmp, "movies")
+	movieDir := filepath.Join(movieRoot, "Dune (2021)")
+	trailerDir := filepath.Join(movieDir, "trailers")
+	if err := os.MkdirAll(trailerDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	trailerPath := filepath.Join(trailerDir, "Official Trailer.mp4")
+	siblingExtra := filepath.Join(movieDir, "Dune (2021)-featurette.mkv")
+	themeAudio := filepath.Join(movieDir, "theme.mp3")
+	for _, p := range []string{trailerPath, siblingExtra, themeAudio} {
+		if err := os.WriteFile(p, []byte("fake"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	movLib, err := repo.CreateLibrary(ctx, "Movies", "movies", []string{movieRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := New(repo, plugins.NewRegistry(), nil, config.Default(tmp))
+	sc.SetProber(NewDisabledProber())
+
+	for _, p := range []string{trailerPath, siblingExtra, themeAudio} {
+		stats, err := sc.ScanPath(ctx, movLib.ID, p)
+		if err != nil {
+			t.Fatalf("ScanPath(%s): %v", p, err)
+		}
+		if stats.ItemsAdded != 0 {
+			t.Fatalf("ScanPath(%s) added %d items, want 0", p, stats.ItemsAdded)
+		}
+	}
+
+	items, total, err := repo.QueryItems(ctx, sqlite.ItemFilter{ServerID: "srv1", LibraryID: movLib.ID})
+	if err != nil || total != 0 || len(items) != 0 {
+		t.Fatalf("expected 0 standalone movies on poster wall, got total=%d items=%+v err=%v", total, items, err)
+	}
+}
+
+func TestFlatMovieRootSkipsSharedExtraSubdirs(t *testing.T) {
+	tmp := t.TempDir()
+	st, err := sqlite.Open(filepath.Join(tmp, "flat_extras.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	repo := sqlite.NewLibraryRepo(st)
+	ctx := context.Background()
+
+	movieRoot := filepath.Join(tmp, "movies")
+	if err := os.MkdirAll(filepath.Join(movieRoot, "trailers"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(movieRoot, "extras"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite := func(p string) {
+		t.Helper()
+		if err := os.WriteFile(p, []byte("fake"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustWrite(filepath.Join(movieRoot, "Alpha (2020).mkv"))
+	mustWrite(filepath.Join(movieRoot, "Alpha (2020)-trailer.mp4"))
+	mustWrite(filepath.Join(movieRoot, "Beta (2021).mkv"))
+	mustWrite(filepath.Join(movieRoot, "trailers", "SharedRootTrailer.mp4"))
+	mustWrite(filepath.Join(movieRoot, "extras", "SharedRootExtra.mkv"))
+
+	movLib, err := repo.CreateLibrary(ctx, "Movies", "movies", []string{movieRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := New(repo, plugins.NewRegistry(), nil, config.Default(tmp))
+	sc.SetProber(NewDisabledProber())
+
+	if _, err := sc.ScanLibrary(ctx, movLib.ID); err != nil {
+		t.Fatalf("ScanLibrary: %v", err)
+	}
+
+	items, total, err := repo.QueryItems(ctx, sqlite.ItemFilter{ServerID: "srv1", LibraryID: movLib.ID})
+	if err != nil || total != 2 {
+		t.Fatalf("expected 2 movies, got total=%d err=%v", total, err)
+	}
+	byName := map[string]string{}
+	for _, it := range items {
+		byName[it.Name] = it.Id
+	}
+
+	alphaTrailers, err := repo.GetItemExtras(ctx, "srv1", "", byName["Alpha"], []string{"Trailer"})
+	if err != nil || len(alphaTrailers) != 1 {
+		t.Fatalf("expected Alpha to have only its stem-prefixed trailer, got %+v err=%v", alphaTrailers, err)
+	}
+	alphaClips, err := repo.GetItemExtras(ctx, "srv1", "", byName["Alpha"], []string{"Clip"})
+	if err != nil || len(alphaClips) != 0 {
+		t.Fatalf("expected Alpha to NOT steal root extras/, got %+v err=%v", alphaClips, err)
+	}
+	betaTrailers, err := repo.GetItemExtras(ctx, "srv1", "", byName["Beta"], []string{"Trailer"})
+	if err != nil || len(betaTrailers) != 0 {
+		t.Fatalf("expected Beta to have 0 trailers, got %+v err=%v", betaTrailers, err)
+	}
+}
+
+func TestExtraItemProbingAndSeriesFastPathExtras(t *testing.T) {
+	tmp := t.TempDir()
+	st, err := sqlite.Open(filepath.Join(tmp, "probe_fastpath.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	repo := sqlite.NewLibraryRepo(st)
+	ctx := context.Background()
+
+	// Create a fake ffprobe script returning deterministic duration (120s) + video/audio streams.
+	fakeFFprobe := filepath.Join(tmp, "fake-ffprobe.sh")
+	script := `#!/bin/sh
+cat <<'EOF'
+{
+  "format": {"format_name": "mov,mp4", "duration": "120.0", "bit_rate": "5000000", "size": "12345"},
+  "streams": [
+    {"index": 0, "codec_type": "video", "codec_name": "hevc", "width": 1920, "height": 1080},
+    {"index": 1, "codec_type": "audio", "codec_name": "eac3", "channels": 6, "sample_rate": "48000"}
+  ]
+}
+EOF
+`
+	if err := os.WriteFile(fakeFFprobe, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	tvRoot := filepath.Join(tmp, "tv")
+	seriesDir := filepath.Join(tvRoot, "Silo (2023)")
+	seasonDir := filepath.Join(seriesDir, "Season 01")
+	if err := os.MkdirAll(seasonDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	epPath := filepath.Join(seasonDir, "Silo S01E01.mkv")
+	if err := os.WriteFile(epPath, []byte("episode-1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tvLib, err := repo.CreateLibrary(ctx, "TV", "tvshows", []string{tvRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := New(repo, plugins.NewRegistry(), nil, config.Default(tmp))
+	sc.SetProber(NewProber(fakeFFprobe))
+
+	// First scan: no extras yet.
+	if _, err := sc.ScanLibrary(ctx, tvLib.ID); err != nil {
+		t.Fatalf("first ScanLibrary: %v", err)
+	}
+
+	seriesItems, _, err := repo.QueryItems(ctx, sqlite.ItemFilter{
+		ServerID:         "srv1",
+		LibraryID:        tvLib.ID,
+		IncludeItemTypes: []string{"Series"},
+	})
+	if err != nil || len(seriesItems) != 1 {
+		t.Fatalf("expected 1 series, got %+v err=%v", seriesItems, err)
+	}
+	seriesID := seriesItems[0].Id
+
+	// Now add a trailer under the series dir WITHOUT touching the episode file (exercises indexEpisode fast path).
+	trailerDir := filepath.Join(seriesDir, "trailers")
+	if err := os.MkdirAll(trailerDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(trailerDir, "Season 1 Trailer.mp4"), []byte("trailer-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second scan: episode is unchanged, yet series extras MUST be discovered and probed!
+	if _, err := sc.ScanLibrary(ctx, tvLib.ID); err != nil {
+		t.Fatalf("second ScanLibrary: %v", err)
+	}
+
+	trailers, err := repo.GetItemExtras(ctx, "srv1", "", seriesID, []string{"Trailer"})
+	if err != nil || len(trailers) != 1 {
+		t.Fatalf("expected 1 series trailer after fast-path rescan, got %+v err=%v", trailers, err)
+	}
+	const wantTicks int64 = 120 * 10_000_000
+	if trailers[0].RunTimeTicks == nil || *trailers[0].RunTimeTicks != wantTicks {
+		t.Fatalf("expected probed RunTimeTicks=%d on extra, got %v", wantTicks, trailers[0].RunTimeTicks)
+	}
+	if len(trailers[0].MediaSources) != 1 || len(trailers[0].MediaSources[0].MediaStreams) != 2 {
+		t.Fatalf("expected 1 MediaSource with 2 probed MediaStreams, got %+v", trailers[0].MediaSources)
+	}
+	if trailers[0].MediaSources[0].MediaStreams[0].Codec != "hevc" {
+		t.Fatalf("expected probed video codec hevc, got %q", trailers[0].MediaSources[0].MediaStreams[0].Codec)
+	}
+}

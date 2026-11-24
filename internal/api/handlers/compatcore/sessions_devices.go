@@ -3,6 +3,7 @@ package compatcore
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -145,9 +146,11 @@ func (h *Handler) postSessionPlayingCommand(w http.ResponseWriter, r *http.Reque
 	for k, v := range body {
 		wsPayload[k] = v
 	}
-	if seek := httpx.ParseQuery(r).Get("SeekPositionTicks"); seek != "" {
+	if seek := strings.TrimSpace(httpx.ParseQuery(r).Get("SeekPositionTicks")); seek != "" {
 		if _, exists := wsPayload["SeekPositionTicks"]; !exists {
-			wsPayload["SeekPositionTicks"] = seek
+			if ticks, err := strconv.ParseInt(seek, 10, 64); err == nil {
+				wsPayload["SeekPositionTicks"] = ticks
+			}
 		}
 	}
 	h.pushSessionWS(target, found, "Playstate", wsPayload)

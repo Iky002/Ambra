@@ -1248,6 +1248,54 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ Name: name }),
     }),
+
+  // ==================== v0.9.1 Theme Songs, ForgotPassword & Live TV Stream ====================
+
+  getThemeSongs: (itemId: string, inheritFromParent = true) =>
+    embyFetch<QueryResult<BaseItemDto>>(
+      `/emby/Items/${encodeURIComponent(itemId)}/ThemeSongs?InheritFromParent=${inheritFromParent}`,
+    ),
+
+  forgotPassword: (enteredUsername: string) =>
+    embyFetch<{ Action?: string; PinFile?: string; PinExpirationDate?: string }>(
+      '/emby/Users/ForgotPassword',
+      {
+        method: 'POST',
+        body: JSON.stringify({ EnteredUsername: enteredUsername }),
+      },
+      false,
+    ),
+
+  forgotPasswordPin: (pin: string) =>
+    embyFetch<{ Success: boolean; UsersReset?: string[] }>(
+      '/emby/Users/ForgotPassword/Pin',
+      {
+        method: 'POST',
+        body: JSON.stringify({ Pin: pin }),
+      },
+      false,
+    ),
+
+  getLiveTvPrograms: (channelIds?: string[], limit = 100) => {
+    const q = new URLSearchParams({ Limit: String(limit) })
+    if (channelIds && channelIds.length > 0) {
+      q.set('ChannelIds', channelIds.join(','))
+    }
+    return embyFetch<
+      QueryResult<{
+        Id: string
+        ChannelId: string
+        Name: string
+        Overview?: string
+        StartDate?: string
+        EndDate?: string
+      }>
+    >(`/emby/LiveTv/Programs?${q.toString()}`)
+  },
+}
+
+export function getLiveTvChannelStreamUrl(channelId: string): string {
+  return resolveApiUrl(`/emby/LiveTv/Channels/${encodeURIComponent(channelId)}/Stream`)
 }
 
 export function getChapterImageUrl(

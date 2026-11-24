@@ -1333,8 +1333,16 @@ export function PlayerPage() {
           handleExit()
           break
         case 'Seek': {
-          if (typeof cmd.SeekPositionTicks === 'number' && Number.isFinite(cmd.SeekPositionTicks)) {
-            const targetSec = Math.max(0, cmd.SeekPositionTicks / 10_000_000)
+          const rawTicks = cmd.SeekPositionTicks
+          const ticks = Number(rawTicks)
+          if (
+            rawTicks !== undefined &&
+            rawTicks !== null &&
+            rawTicks !== '' &&
+            Number.isFinite(ticks) &&
+            ticks >= 0
+          ) {
+            const targetSec = ticks / 10_000_000
             if (v) {
               v.currentTime = targetSec
               setCurrentTime(targetSec)

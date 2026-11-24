@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/core/dvr"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
@@ -168,7 +170,9 @@ type Handler struct {
 	store            *sqlite.Store
 	cfg              *config.Config
 	httpClient       *http.Client
+	streamClient     *http.Client
 	customHTTPClient bool
+	recorder         *dvr.Recorder
 	auth             AuthFuncs
 
 	mu    sync.RWMutex
@@ -177,12 +181,129 @@ type Handler struct {
 
 func New(store *sqlite.Store, cfg *config.Config) *Handler {
 	h := &Handler{
-		store:      store,
-		cfg:        cfg,
-		httpClient: netutil.NewSafeHTTPClient(15*time.Second, false),
+		store:        store,
+		cfg:          cfg,
+		httpClient:   netutil.NewSafeHTTPClient(15*time.Second, false),
+		streamClient: netutil.NewSafeHTTPClient(0, true),
 	}
 	h.loadState(context.Background())
 	return h
+}
+
+// SetRecorder attaches a DVR recorder for timer cancellation and recording cleanup.
+func (h *Handler) SetRecorder(r *dvr.Recorder) {
+	h.mu.Lock()
+	h.recorder = r
+	h.mu.Unlock()
+}
+
+// GetChannelByID returns a copy of the channel with the given ID if it exists.
+func (h *Handler) GetChannelByID(id string) (*ChannelInfo, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for i := range h.state.Channels {
+		if h.state.Channels[i].Id == id {
+			ch := h.state.Channels[i]
+			return &ch, true
+		}
+	}
+	return nil, false
+}
+
+// DueRecordingJobs scans pending ("New") timers whose padded window includes now,
+// validates their channel stream URLs, transitions them to "InProgress", persists state,
+// and returns the resulting DVR recording jobs.
+func (h *Handler) DueRecordingJobs(ctx context.Context) ([]dvr.RecordingJob, error) {
+	now := time.Now().UTC()
+
+	type candidate struct {
+		timerID     string
+		channelName string
+		programName string
+		streamURL   string
+		duration    time.Duration
+	}
+
+	h.mu.RLock()
+	chByID := make(map[string]ChannelInfo, len(h.state.Channels))
+	for _, ch := range h.state.Channels {
+		chByID[ch.Id] = ch
+	}
+	var candidates []candidate
+	for _, t := range h.state.Timers {
+		if t.Status != "New" {
+			continue
+		}
+		windowStart := t.StartDate.Add(-time.Duration(t.PrePaddingSeconds) * time.Second)
+		windowEnd := t.EndDate.Add(time.Duration(t.PostPaddingSeconds) * time.Second)
+		if now.Before(windowStart) || !now.Before(windowEnd) {
+			continue
+		}
+		ch, ok := chByID[t.ChannelId]
+		if !ok {
+			continue
+		}
+		streamURL := strings.TrimSpace(ch.StreamUrl)
+		if streamURL == "" {
+			continue
+		}
+		chName := t.ChannelName
+		if chName == "" {
+			chName = ch.Name
+		}
+		candidates = append(candidates, candidate{
+			timerID:     t.Id,
+			channelName: chName,
+			programName: t.Name,
+			streamURL:   streamURL,
+			duration:    windowEnd.Sub(now),
+		})
+	}
+	h.mu.RUnlock()
+
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	valid := make(map[string]candidate, len(candidates))
+	for _, c := range candidates {
+		if err := netutil.ValidateRemoteURL(c.streamURL, true); err != nil {
+			continue
+		}
+		valid[c.timerID] = c
+	}
+	if len(valid) == 0 {
+		return nil, nil
+	}
+
+	h.mu.Lock()
+	jobs := make([]dvr.RecordingJob, 0, len(valid))
+	changed := false
+	for i := range h.state.Timers {
+		t := &h.state.Timers[i]
+		if t.Status != "New" {
+			continue
+		}
+		c, ok := valid[t.Id]
+		if !ok {
+			continue
+		}
+		t.Status = "InProgress"
+		changed = true
+		jobs = append(jobs, dvr.RecordingJob{
+			TimerID:     c.timerID,
+			ChannelName: c.channelName,
+			ProgramName: c.programName,
+			StreamURL:   c.streamURL,
+			Duration:    c.duration,
+		})
+	}
+	if changed {
+		h.saveStateLocked(ctx)
+	}
+	h.mu.Unlock()
+
+	return jobs, nil
 }
 
 // SetHTTPClient overrides the HTTP client used for remote M3U playlist fetching (primarily for testing).
@@ -236,6 +357,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	handleAuth("GET /LiveTv/Info", h.handleInfo)
 	handleAuth("GET /LiveTv/Channels", h.handleListChannels)
 	handleAuth("GET /LiveTv/Channels/{Id}", h.handleGetChannel)
+	handleAuth("GET /LiveTv/Channels/{Id}/Stream", h.handleStreamChannel)
 	handleAuth("GET /LiveTv/Programs", h.handleListPrograms)
 	handleAuth("POST /LiveTv/Programs", h.handleQueryProgramsPost)
 	handleAuth("GET /LiveTv/Programs/Recommended", h.handleRecommendedPrograms)
@@ -336,15 +458,84 @@ func (h *Handler) handleListChannels(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleGetChannel(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	for _, ch := range h.state.Channels {
-		if ch.Id == id {
-			httpx.JSON(w, http.StatusOK, ch)
+	ch, ok := h.GetChannelByID(id)
+	if !ok {
+		httpx.Error(w, http.StatusNotFound, "channel not found")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, ch)
+}
+
+func (h *Handler) handleStreamChannel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("Id")
+	ch, ok := h.GetChannelByID(id)
+	if !ok {
+		httpx.Error(w, http.StatusNotFound, "channel not found")
+		return
+	}
+	h.ProxyStreamURL(w, r, ch.StreamUrl)
+}
+
+type flushWriter struct {
+	w http.ResponseWriter
+	f http.Flusher
+}
+
+func (fw flushWriter) Write(p []byte) (int, error) {
+	n, err := fw.w.Write(p)
+	if fw.f != nil && n > 0 {
+		fw.f.Flush()
+	}
+	return n, err
+}
+
+// ProxyStreamURL validates streamURL (allowing private LAN IPTV tuners while blocking
+// metadata/link-local/non-HTTP URLs) and proxies the upstream live stream bound to r.Context().
+func (h *Handler) ProxyStreamURL(w http.ResponseWriter, r *http.Request, streamURL string) {
+	trimmed := strings.TrimSpace(streamURL)
+	if err := netutil.ValidateRemoteURL(trimmed, true); err != nil {
+		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("unsafe channel stream url: %v", err))
+		return
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, trimmed, nil)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("invalid channel stream url: %v", err))
+		return
+	}
+
+	client := h.streamClient
+	if client == nil {
+		client = netutil.NewSafeHTTPClient(0, true)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		if r.Context().Err() != nil {
 			return
 		}
+		httpx.Error(w, http.StatusBadGateway, fmt.Sprintf("upstream stream error: %v", err))
+		return
 	}
-	httpx.Error(w, http.StatusNotFound, "channel not found")
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		httpx.Error(w, http.StatusBadGateway, fmt.Sprintf("upstream stream returned status %d", resp.StatusCode))
+		return
+	}
+
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" {
+		ct = "video/mp2t"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Cache-Control", "no-cache, no-store")
+	w.WriteHeader(http.StatusOK)
+
+	var dst io.Writer = w
+	if f, ok := w.(http.Flusher); ok {
+		dst = flushWriter{w: w, f: f}
+	}
+	_, _ = io.Copy(dst, resp.Body)
 }
 
 func (h *Handler) handleListPrograms(w http.ResponseWriter, r *http.Request) {
@@ -489,10 +680,45 @@ func (h *Handler) handleDeleteRecording(w http.ResponseWriter, r *http.Request) 
 		httpx.Error(w, http.StatusNotFound, "recording not found")
 		return
 	}
+	recPath := strings.TrimSpace(h.state.Recordings[idx].Path)
+	recorder := h.recorder
 	h.state.Recordings = append(h.state.Recordings[:idx], h.state.Recordings[idx+1:]...)
 	h.saveStateLocked(r.Context())
 	h.mu.Unlock()
+
+	if recorder != nil && recPath != "" {
+		if resolvedFile, ok := resolvePathWithinDir(recorder.RecordingsDir(), recPath); ok {
+			if err := os.Remove(resolvedFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+				// Best-effort file cleanup; recording record has already been removed.
+				_ = err
+			}
+		}
+	}
 	httpx.NoContent(w)
+}
+
+func resolvePathWithinDir(dir, target string) (string, bool) {
+	dir = strings.TrimSpace(dir)
+	target = strings.TrimSpace(target)
+	if dir == "" || target == "" {
+		return "", false
+	}
+	resolvedDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", false
+	}
+	resolvedDir = filepath.Clean(resolvedDir)
+
+	resolvedTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		return "", false
+	}
+	resolvedTarget = filepath.Clean(resolvedTarget)
+
+	if resolvedTarget == resolvedDir || !isPathWithinRoot(resolvedDir, resolvedTarget) {
+		return "", false
+	}
+	return resolvedTarget, true
 }
 
 func (h *Handler) handleRecordingFolders(w http.ResponseWriter, r *http.Request) {
@@ -609,9 +835,13 @@ func (h *Handler) handleDeleteTimer(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	for i, t := range h.state.Timers {
 		if t.Id == id {
+			recorder := h.recorder
 			h.state.Timers = append(h.state.Timers[:i], h.state.Timers[i+1:]...)
 			h.saveStateLocked(r.Context())
 			h.mu.Unlock()
+			if recorder != nil {
+				_ = recorder.CancelRecording(id)
+			}
 			httpx.NoContent(w)
 			return
 		}

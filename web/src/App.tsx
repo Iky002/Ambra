@@ -14,6 +14,7 @@ import { FavoritesPage } from './pages/FavoritesPage'
 import { HomePage } from './pages/HomePage'
 import { ItemDetailPage } from './pages/ItemDetailPage'
 import { LibraryPage } from './pages/LibraryPage'
+import { LiveTvPage } from './pages/LiveTvPage'
 import { LoginPage } from './pages/LoginPage'
 import { PersonDetailPage } from './pages/PersonDetailPage'
 import { PlayerPage } from './pages/PlayerPage'
@@ -131,6 +132,7 @@ function AppRoutes() {
         <Route path="library/:id" element={<LibraryPage />} />
         <Route path="item/:id" element={<ItemDetailPage />} />
         <Route path="favorites" element={<FavoritesPage />} />
+        <Route path="livetv" element={<LiveTvPage />} />
         <Route path="search" element={<SearchPage />} />
         <Route path="profile" element={<ProfilePage />} />
         <Route

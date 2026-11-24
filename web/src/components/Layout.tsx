@@ -13,6 +13,7 @@ import {
   LogOut,
   Menu,
   Music,
+  Radio,
   Search,
   Settings,
   ShieldCheck,
@@ -73,6 +74,14 @@ export function Layout() {
     queryFn: () => api.getUserViews(auth!.userId),
     enabled: Boolean(auth?.userId),
     staleTime: 60_000,
+  })
+
+  const { data: liveTvInfo } = useQuery({
+    queryKey: ['liveTvInfo'],
+    queryFn: () => api.getLiveTvInfo().catch(() => null),
+    enabled: Boolean(auth?.userId),
+    staleTime: 60_000,
+    retry: false,
   })
 
   const views = viewsData?.Items || []
@@ -161,6 +170,12 @@ export function Layout() {
             <Heart className="h-4 w-4 shrink-0" />
             {!collapsed && <span>我的收藏</span>}
           </NavLink>
+          {liveTvInfo?.IsEnabled && (
+            <NavLink to="/livetv" className={navLinkClass} title="电视直播">
+              <Radio className="h-4 w-4 shrink-0" />
+              {!collapsed && <span>电视直播</span>}
+            </NavLink>
+          )}
           <NavLink to="/search" className={navLinkClass} title="探索与搜索">
             <Search className="h-4 w-4 shrink-0" />
             {!collapsed && <span>探索搜索</span>}

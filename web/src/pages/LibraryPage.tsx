@@ -129,6 +129,11 @@ export function LibraryPage() {
     setBatchFeedback(null)
   }, [id])
 
+  // 切换任何筛选条件或音乐子标签时清空已选集合，避免隐藏项被误包含进批量操作
+  useEffect(() => {
+    setSelectedIds(new Set())
+  }, [musicSubTab, statusFilter, genreFilter, yearFilter, tagFilter, letterFilter])
+
   const updateUrlParam = (key: 'genre' | 'year' | 'tag' | 'letter', value: string) => {
     const next = new URLSearchParams(searchParams)
     if (value) {
@@ -679,7 +684,7 @@ export function LibraryPage() {
           aria-label="批量操作栏"
           data-testid="batch-action-bar"
           className={`fixed left-1/2 z-40 flex max-w-[calc(100vw-2rem)] -translate-x-1/2 flex-wrap items-center gap-2 rounded-2xl border border-amber-400/35 bg-zinc-950/92 px-4 py-2.5 text-xs text-zinc-100 shadow-[0_12px_40px_rgba(0,0,0,0.75)] backdrop-blur-xl transition-all ${
-            currentTrack ? 'bottom-24' : 'bottom-6'
+            currentTrack ? 'bottom-40 lg:bottom-24' : 'bottom-6'
           }`}
         >
           <span className="font-semibold text-amber-300">已选 {selectedIds.size} 项</span>

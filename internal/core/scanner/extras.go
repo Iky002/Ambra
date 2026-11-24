@@ -168,6 +168,9 @@ func (s *Scanner) scanAndIndexExtras(ctx context.Context, lib *sqlite.LibraryRec
 		}
 		fullPath := filepath.Join(cleanParentDir, name)
 		if entry.IsDir() {
+			if !dedicatedDir {
+				continue
+			}
 			if _, ok := extraSubdirTypes[strings.ToLower(strings.TrimSpace(name))]; !ok {
 				continue
 			}
@@ -238,6 +241,11 @@ func (s *Scanner) upsertExtraItem(ctx context.Context, lib *sqlite.LibraryRecord
 		itemID = existing.ID
 	}
 
+	var probeRes *ProbeResult
+	if !isStrm {
+		probeRes = s.probeMedia(ctx, extraPath, false)
+	}
+
 	name := cleanExtraDisplayName(extraPath)
 	rec := &sqlite.ItemRecord{
 		ID:        itemID,
@@ -258,6 +266,10 @@ func (s *Scanner) upsertExtraItem(ctx context.Context, lib *sqlite.LibraryRecord
 			ExtraType: extraType,
 		},
 	}
+	if probeRes != nil && probeRes.RuntimeTicks > 0 {
+		rt := probeRes.RuntimeTicks
+		rec.RuntimeTicks = &rt
+	}
 
 	if err := s.repo.UpsertItem(ctx, rec); err != nil {
 		return
@@ -266,6 +278,6 @@ func (s *Scanner) upsertExtraItem(ctx context.Context, lib *sqlite.LibraryRecord
 		{AncestorID: parent.ID, Depth: 1},
 		{AncestorID: lib.ID, Depth: 2},
 	})
-	ms := s.buildMediaSource(rec, extraPath, size, mtime, isStrm, container, nil)
+	ms := s.buildMediaSource(rec, extraPath, size, mtime, isStrm, container, probeRes)
 	_ = s.repo.UpsertMediaSourceAndStreams(ctx, rec.ID, ms)
 }

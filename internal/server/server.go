@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -82,11 +83,15 @@ type Server struct {
 	Playback     *playback.Engine
 	Transcode    *transcode.Manager
 	DVR          *dvr.Recorder
+	LiveTV       *livetv.Handler
 	SSDP         *ssdp.Broadcaster
 	Imaging      *imaging.Service
 	Logs         *logs.Handler
 	WSHub        *ws.Hub
 	Handler      http.Handler
+
+	dvrCancel context.CancelFunc
+	dvrDone   chan struct{}
 }
 
 func New(ctx context.Context, cfg *config.Config) (*Server, error) {
@@ -285,7 +290,9 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	})
 
 	// Phase 4 & 5: LiveTV, Sync, Notifications, Startup, Packages, Webhooks, BackupRestore, OpenAPI, GenericUI, Parties, Connect
-	livetv.New(store, cfg).RegisterRoutes(mediaMux, livetv.AuthFuncs{
+	livetvH := livetv.New(store, cfg)
+	livetvH.SetRecorder(dvrRec)
+	livetvH.RegisterRoutes(mediaMux, livetv.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
@@ -356,7 +363,10 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
 	})
-	compatExtH := compatext.New(store, cfg).BuildRouter(compatext.AuthFuncs{
+	compatExtSvc := compatext.New(store, cfg)
+	compatExtSvc.SetLiveTV(livetvH)
+	compatExtSvc.SetDVR(dvrRec)
+	compatExtH := compatExtSvc.BuildRouter(compatext.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
@@ -403,6 +413,13 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	r.NotFound(fallbackHandler.ServeHTTP)
 	r.MethodNotAllowed(fallbackHandler.ServeHTTP)
 
+	dvrCtx, dvrCancel := context.WithCancel(ctx)
+	dvrDone := make(chan struct{})
+	go func() {
+		defer close(dvrDone)
+		dvrRec.SchedulerLoop(dvrCtx, 15*time.Second, livetvH.DueRecordingJobs)
+	}()
+
 	return &Server{
 		Config:       cfg,
 		Store:        store,
@@ -422,11 +439,14 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		Playback:     pb,
 		Transcode:    transcodeMgr,
 		DVR:          dvrRec,
+		LiveTV:       livetvH,
 		SSDP:         ssdpB,
 		Imaging:      imgSvc,
 		Logs:         logsH,
 		WSHub:        wsHub,
 		Handler:      r,
+		dvrCancel:    dvrCancel,
+		dvrDone:      dvrDone,
 	}, nil
 }
 
@@ -499,6 +519,12 @@ func applyPendingDatabaseRestore(dataDir, dbPath string) error {
 func (s *Server) Close() error {
 	if s.Watcher != nil {
 		_ = s.Watcher.Close()
+	}
+	if s.dvrCancel != nil {
+		s.dvrCancel()
+	}
+	if s.dvrDone != nil {
+		<-s.dvrDone
 	}
 	if s.DVR != nil {
 		_ = s.DVR.Close()

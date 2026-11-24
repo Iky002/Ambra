@@ -11,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ambra-media/ambra/internal/api/handlers/livetv"
 	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/core/dvr"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -222,8 +224,12 @@ func TestSQLitePersistenceAndSharedState(t *testing.T) {
 		UserIDFromCtx: func(ctx context.Context) string { return "u-1" },
 	})
 
-	// Create real temp media files for recording stream and sync file serving
-	recFile := filepath.Join(tmpDir, "rec1.ts")
+	// Create real temp media files for recording stream (inside recordingsDir) and sync file serving
+	recordingsDir := filepath.Join(tmpDir, "recordings")
+	if err := os.MkdirAll(recordingsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recFile := filepath.Join(recordingsDir, "rec1.ts")
 	if err := os.WriteFile(recFile, []byte("REC_STREAM_DATA"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -473,5 +479,100 @@ func TestSQLitePersistenceAndSharedState(t *testing.T) {
 	router2.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/Notifications/Services/Configured", nil))
 	if strings.Contains(w.Body.String(), created.Id) {
 		t.Fatalf("deleted notification still present: %s", w.Body.String())
+	}
+}
+
+func TestLiveStreamFileProxyAndRecordingPathTraversal(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(tmpDir, "compatext-stream.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp2t")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("PROXIED_COMPAT_LIVE_STREAM"))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{ServerID: "srv-stream", DataDir: tmpDir}
+	lt := livetv.New(store, cfg)
+	ltMux := http.NewServeMux()
+	lt.RegisterRoutes(ltMux, livetv.AuthFuncs{})
+
+	// Import one channel into livetv
+	body := `{"Type":"m3u","M3UContent":"#EXTM3U\n#EXTINF:-1,Compat Live\n` + upstream.URL + `/stream.ts\n"}`
+	ltRec := httptest.NewRecorder()
+	ltMux.ServeHTTP(ltRec, httptest.NewRequest(http.MethodPost, "/LiveTv/TunerHosts", strings.NewReader(body)))
+	if ltRec.Code != http.StatusOK {
+		t.Fatalf("seed livetv channel: %d %s", ltRec.Code, ltRec.Body.String())
+	}
+	chListRec := httptest.NewRecorder()
+	ltMux.ServeHTTP(chListRec, httptest.NewRequest(http.MethodGet, "/LiveTv/Channels", nil))
+	var chResp struct {
+		Items []livetv.ChannelInfo `json:"Items"`
+	}
+	_ = json.Unmarshal(chListRec.Body.Bytes(), &chResp)
+	if len(chResp.Items) != 1 {
+		t.Fatalf("expected 1 channel, got %d", len(chResp.Items))
+	}
+	chID := chResp.Items[0].Id
+
+	dvrRec := dvr.NewRecorder(dvr.Options{DataDir: tmpDir})
+	defer func() { _ = dvrRec.Close() }()
+
+	h := New(store, cfg)
+	h.SetLiveTV(lt)
+	h.SetDVR(dvrRec)
+	router := h.BuildRouter(AuthFuncs{})
+
+	// 1. LiveStreamFiles with known channel proxies real upstream stream
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/LiveTv/LiveStreamFiles/"+chID+"/stream.ts", nil))
+	if w.Code != http.StatusOK || w.Body.String() != "PROXIED_COMPAT_LIVE_STREAM" {
+		t.Fatalf("expected proxied live stream, got %d %q", w.Code, w.Body.String())
+	}
+
+	// 2. LiveStreamFiles with unknown ID falls back to MPEG-TS null packet
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/LiveTv/LiveStreamFiles/unknown-id/stream.ts", nil))
+	if w.Code != http.StatusOK || len(w.Body.Bytes()) != len(tsNullPacket) {
+		t.Fatalf("expected null packet fallback, got %d len=%d", w.Code, len(w.Body.Bytes()))
+	}
+
+	// 3. LiveRecordings path traversal & symlink escape blocked with 403
+	if err := os.MkdirAll(dvrRec.RecordingsDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outsideFile := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outsideFile, []byte("SECRET_DATA"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	symlinkEscape := filepath.Join(dvrRec.RecordingsDir(), "escape.ts")
+	if err := os.Symlink(outsideFile, symlinkEscape); err != nil {
+		t.Fatal(err)
+	}
+	validFile := filepath.Join(dvrRec.RecordingsDir(), "ok.ts")
+	if err := os.WriteFile(validFile, []byte("VALID_REC"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	lt.AddRecording(context.Background(), livetv.RecordingInfo{Id: "rec-valid", Name: "Valid", Path: validFile})
+	lt.AddRecording(context.Background(), livetv.RecordingInfo{Id: "rec-outside", Name: "Outside", Path: outsideFile})
+	lt.AddRecording(context.Background(), livetv.RecordingInfo{Id: "rec-symlink", Name: "Symlink", Path: symlinkEscape})
+
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/LiveTv/LiveRecordings/rec-valid/stream", nil))
+	if w.Code != http.StatusOK || w.Body.String() != "VALID_REC" {
+		t.Fatalf("valid recording: code=%d body=%q", w.Code, w.Body.String())
+	}
+	for _, id := range []string{"rec-outside", "rec-symlink"} {
+		w = httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/LiveTv/LiveRecordings/"+id+"/stream", nil))
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 for %s, got %d body=%q", id, w.Code, w.Body.String())
+		}
 	}
 }
