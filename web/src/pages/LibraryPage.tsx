@@ -1,14 +1,18 @@
 import { useEffect, useMemo, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowDownWideNarrow,
   ArrowUpNarrowWide,
   Calendar,
   Check,
+  CheckSquare,
   Clock,
   Disc3,
+  Eye,
+  EyeOff,
   Film,
   Filter,
+  FolderPlus,
   LayoutGrid,
   List,
   Loader2,
@@ -18,14 +22,18 @@ import {
   Star,
   Tag,
   Tags,
+  X,
 } from 'lucide-react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { api, getFallbackImageUrl, getImageUrl } from '../api/client'
 import type { BaseItemDto } from '../api/types'
 import { MediaCard } from '../components/MediaCard'
+import { AddToCollectionModal } from '../components/media/AddToCollectionModal'
 import { QueryErrorState } from '../components/QueryErrorState'
+import { useAudioPlayer } from '../context/AudioPlayerContext'
 import { useAuth } from '../context/AuthContext'
 import { formatTicks } from '../player/subtitleUtils'
+import { FeedbackBanner } from './admin/adminUtils'
 
 const SORT_OPTIONS = [
   { value: 'DateCreated', label: '添加时间' },
@@ -69,18 +77,30 @@ export function LibraryPage() {
   const { id } = useParams<{ id: string }>()
   const [searchParams, setSearchParams] = useSearchParams()
   const { auth } = useAuth()
+  const { currentTrack } = useAudioPlayer()
+  const queryClient = useQueryClient()
   const userId = auth!.userId
 
   const [sortBy, setSortBy] = useState('DateCreated')
   const [sortOrder, setSortOrder] = useState<'Ascending' | 'Descending'>('Descending')
   const [statusFilter, setStatusFilter] = useState('')
-  const [letterFilter, setLetterFilter] = useState('')
+  const [letterFilter, setLetterFilter] = useState(() => searchParams.get('letter') || '')
   const [viewMode, setViewMode] = useState<LibraryViewMode>(() => readStoredViewMode())
   const [genreFilter, setGenreFilter] = useState(() => searchParams.get('genre') || '')
   const [yearFilter, setYearFilter] = useState(() => searchParams.get('year') || '')
   const [tagFilter, setTagFilter] = useState(() => searchParams.get('tag') || '')
   const [musicSubTab, setMusicSubTab] = useState<MusicSubTab>('MusicAlbum')
   const [page, setPage] = useState(0)
+
+  // 多选批量操作状态
+  const [selectMode, setSelectMode] = useState(false)
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [batchBusy, setBatchBusy] = useState(false)
+  const [batchFeedback, setBatchFeedback] = useState<{
+    type: 'success' | 'error'
+    message: string
+  } | null>(null)
+  const [collectionModalOpen, setCollectionModalOpen] = useState(false)
 
   const handleSetViewMode = (mode: LibraryViewMode) => {
     setViewMode(mode)
@@ -91,11 +111,12 @@ export function LibraryPage() {
     }
   }
 
-  // 响应 URL query 参数变化（例如从详情页点击流派/年份/标签跳转）
+  // 响应 URL query 参数变化（例如从详情页点击流派/年份/标签跳转或字母筛选）
   useEffect(() => {
     setGenreFilter(searchParams.get('genre') || '')
     setYearFilter(searchParams.get('year') || '')
     setTagFilter(searchParams.get('tag') || '')
+    setLetterFilter(searchParams.get('letter') || '')
     setPage(0)
   }, [id, searchParams])
 
@@ -103,9 +124,12 @@ export function LibraryPage() {
     setMusicSubTab('MusicAlbum')
     setStatusFilter('')
     setLetterFilter('')
+    setSelectMode(false)
+    setSelectedIds(new Set())
+    setBatchFeedback(null)
   }, [id])
 
-  const updateUrlParam = (key: 'genre' | 'year' | 'tag', value: string) => {
+  const updateUrlParam = (key: 'genre' | 'year' | 'tag' | 'letter', value: string) => {
     const next = new URLSearchParams(searchParams)
     if (value) {
       next.set(key, value)
@@ -224,8 +248,80 @@ export function LibraryPage() {
     setPage(0)
   }
 
+  const handleToggleSelectMode = () => {
+    setSelectMode((prev) => {
+      if (prev) {
+        setSelectedIds(new Set())
+      }
+      return !prev
+    })
+  }
+
+  const toggleSelectItem = (item: BaseItemDto) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(item.Id)) {
+        next.delete(item.Id)
+      } else {
+        next.add(item.Id)
+      }
+      return next
+    })
+  }
+
+  const handleSelectAllPage = () => {
+    setSelectedIds(new Set(items.map((i) => i.Id)))
+  }
+
+  const handleClearSelection = () => {
+    setSelectedIds(new Set())
+  }
+
+  const handleBatchPlayed = async (markAsPlayed: boolean) => {
+    const ids = Array.from(selectedIds)
+    if (ids.length === 0) return
+    setBatchBusy(true)
+    setBatchFeedback(null)
+    try {
+      const results = await Promise.allSettled(
+        ids.map((itemId) => api.togglePlayed(userId, itemId, !markAsPlayed)),
+      )
+      const succeeded = results.filter((r) => r.status === 'fulfilled').length
+      const failed = results.length - succeeded
+
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['libraryItems'] }),
+        queryClient.invalidateQueries({ queryKey: ['resumeItems'] }),
+        queryClient.invalidateQueries({ queryKey: ['nextUp'] }),
+        queryClient.invalidateQueries({ queryKey: ['collections'] }),
+      ])
+
+      const actionLabel = markAsPlayed ? '已看' : '未看'
+      if (failed === 0) {
+        setBatchFeedback({
+          type: 'success',
+          message: `已将 ${succeeded} 项标记为${actionLabel}`,
+        })
+        setSelectedIds(new Set())
+      } else {
+        setBatchFeedback({
+          type: 'error',
+          message: `批量标记${actionLabel}完成：成功 ${succeeded} 项，失败 ${failed} 项`,
+        })
+      }
+    } finally {
+      setBatchBusy(false)
+    }
+  }
+
   return (
-    <div className="space-y-6 px-4 pt-6 lg:px-8">
+    <div className="space-y-6 px-4 pt-6 pb-24 lg:px-8">
+      <FeedbackBanner
+        message={batchFeedback?.message}
+        type={batchFeedback?.type}
+        onClose={() => setBatchFeedback(null)}
+      />
+
       {/* 头部标题与多维筛选栏 */}
       <div className="flex flex-col gap-4 border-b border-white/8 pb-5 xl:flex-row xl:items-center xl:justify-between">
         <div>
@@ -405,6 +501,21 @@ export function LibraryPage() {
             </button>
           </div>
 
+          {/* 多选批量操作开关 */}
+          <button
+            type="button"
+            aria-pressed={selectMode}
+            onClick={handleToggleSelectMode}
+            className={`flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-medium transition-colors ${
+              selectMode
+                ? 'border-amber-400/70 bg-amber-500 text-zinc-950 shadow-sm'
+                : 'border-white/10 bg-white/[0.04] text-zinc-200 hover:bg-white/10'
+            }`}
+          >
+            <CheckSquare className="h-3.5 w-3.5" />
+            <span>多选</span>
+          </button>
+
           {hasActiveFilters && (
             <button
               type="button"
@@ -434,7 +545,7 @@ export function LibraryPage() {
               aria-pressed={active}
               onClick={() => {
                 setLetterFilter(value)
-                setPage(0)
+                updateUrlParam('letter', value)
               }}
               className={`shrink-0 rounded-lg px-2 py-1 text-xs font-medium transition-colors ${
                 active
@@ -504,7 +615,13 @@ export function LibraryPage() {
           className="divide-y divide-white/6 overflow-hidden rounded-2xl border border-white/8 bg-white/[0.02]"
         >
           {items.map((item) => (
-            <LibraryListRow key={item.Id} item={item} />
+            <LibraryListRow
+              key={item.Id}
+              item={item}
+              selectable={selectMode}
+              selected={selectedIds.has(item.Id)}
+              onToggleSelect={toggleSelectItem}
+            />
           ))}
         </div>
       ) : (
@@ -513,7 +630,13 @@ export function LibraryPage() {
           className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7"
         >
           {items.map((item) => (
-            <MediaCard key={item.Id} item={item} />
+            <MediaCard
+              key={item.Id}
+              item={item}
+              selectable={selectMode}
+              selected={selectedIds.has(item.Id)}
+              onToggleSelect={toggleSelectItem}
+            />
           ))}
         </div>
       )}
@@ -548,11 +671,109 @@ export function LibraryPage() {
           </button>
         </div>
       )}
+
+      {/* 悬浮底部多选批量操作栏 */}
+      {selectMode && (
+        <div
+          role="region"
+          aria-label="批量操作栏"
+          data-testid="batch-action-bar"
+          className={`fixed left-1/2 z-40 flex max-w-[calc(100vw-2rem)] -translate-x-1/2 flex-wrap items-center gap-2 rounded-2xl border border-amber-400/35 bg-zinc-950/92 px-4 py-2.5 text-xs text-zinc-100 shadow-[0_12px_40px_rgba(0,0,0,0.75)] backdrop-blur-xl transition-all ${
+            currentTrack ? 'bottom-24' : 'bottom-6'
+          }`}
+        >
+          <span className="font-semibold text-amber-300">已选 {selectedIds.size} 项</span>
+          <span className="h-4 w-px bg-white/15" />
+
+          <button
+            type="button"
+            onClick={handleSelectAllPage}
+            disabled={items.length === 0 || batchBusy}
+            className="rounded-lg border border-white/10 bg-white/[0.05] px-2.5 py-1.5 font-medium text-zinc-200 transition-colors hover:bg-white/10 disabled:opacity-40"
+          >
+            全选本页
+          </button>
+          <button
+            type="button"
+            onClick={handleClearSelection}
+            disabled={selectedIds.size === 0 || batchBusy}
+            className="rounded-lg border border-white/10 bg-white/[0.05] px-2.5 py-1.5 font-medium text-zinc-200 transition-colors hover:bg-white/10 disabled:opacity-40"
+          >
+            清空
+          </button>
+
+          <span className="h-4 w-px bg-white/15" />
+
+          <button
+            type="button"
+            onClick={() => void handleBatchPlayed(true)}
+            disabled={selectedIds.size === 0 || batchBusy}
+            className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/35 bg-emerald-500/15 px-2.5 py-1.5 font-medium text-emerald-300 transition-colors hover:bg-emerald-500/25 disabled:opacity-40"
+          >
+            {batchBusy ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Eye className="h-3.5 w-3.5" />
+            )}
+            <span>标记已看</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => void handleBatchPlayed(false)}
+            disabled={selectedIds.size === 0 || batchBusy}
+            className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.05] px-2.5 py-1.5 font-medium text-zinc-200 transition-colors hover:bg-white/10 disabled:opacity-40"
+          >
+            <EyeOff className="h-3.5 w-3.5" />
+            <span>标记未看</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setCollectionModalOpen(true)}
+            disabled={selectedIds.size === 0 || batchBusy}
+            className="inline-flex items-center gap-1 rounded-lg bg-amber-500 px-3 py-1.5 font-semibold text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-40"
+          >
+            <FolderPlus className="h-3.5 w-3.5" />
+            <span>加入合集/片单</span>
+          </button>
+
+          <button
+            type="button"
+            aria-label="退出多选"
+            title="退出多选"
+            onClick={handleToggleSelectMode}
+            className="ml-1 rounded-lg p-1.5 text-zinc-400 transition-colors hover:bg-white/10 hover:text-zinc-100"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+
+      <AddToCollectionModal
+        open={collectionModalOpen}
+        itemIds={Array.from(selectedIds)}
+        itemLabel={`已选的 ${selectedIds.size} 个媒体项`}
+        mediaType={isMusicLibrary ? 'Audio' : 'Video'}
+        onClose={() => setCollectionModalOpen(false)}
+        onSuccess={(msg) => {
+          setBatchFeedback({ type: 'success', message: msg })
+          setSelectedIds(new Set())
+        }}
+      />
     </div>
   )
 }
 
-function LibraryListRow({ item }: { item: BaseItemDto }) {
+function LibraryListRow({
+  item,
+  selectable = false,
+  selected = false,
+  onToggleSelect,
+}: {
+  item: BaseItemDto
+  selectable?: boolean
+  selected?: boolean
+  onToggleSelect?: (item: BaseItemDto) => void
+}) {
   const isMusicItem =
     item.Type === 'Audio' || item.Type === 'MusicAlbum' || item.Type === 'MusicArtist'
   const imgUrl = item.ImageTags?.Primary
@@ -567,11 +788,38 @@ function LibraryListRow({ item }: { item: BaseItemDto }) {
       : null
   const [imgFailed, setImgFailed] = useState(false)
 
+  useEffect(() => {
+    setImgFailed(false)
+  }, [imgUrl])
+
+  const handleClick = (e: React.MouseEvent) => {
+    if (selectable) {
+      e.preventDefault()
+      onToggleSelect?.(item)
+    }
+  }
+
   return (
     <Link
       to={`/item/${item.Id}`}
-      className="group flex items-center gap-4 px-4 py-3 transition-colors hover:bg-white/[0.04]"
+      onClick={handleClick}
+      aria-pressed={selectable ? selected : undefined}
+      className={`group flex items-center gap-4 px-4 py-3 transition-colors ${
+        selected ? 'bg-amber-500/10' : 'hover:bg-white/[0.04]'
+      }`}
     >
+      {selectable && (
+        <div
+          aria-label={selected ? '已选中' : '未选中'}
+          className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-colors ${
+            selected
+              ? 'border-amber-400 bg-amber-400 text-zinc-950'
+              : 'border-white/30 bg-zinc-900 text-transparent'
+          }`}
+        >
+          <Check className="h-3.5 w-3.5 stroke-[3]" />
+        </div>
+      )}
       <div className="h-14 w-10 shrink-0 overflow-hidden rounded-lg border border-white/10 bg-zinc-900">
         {imgUrl && !imgFailed ? (
           <img

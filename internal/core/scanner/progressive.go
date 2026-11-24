@@ -440,6 +440,14 @@ func (s *Scanner) runPhaseAWithRoot(ctx context.Context, lib *sqlite.LibraryReco
 		if !IsVideoFile(path) && !IsStrmFile(path) && !IsAudioFile(path) {
 			return nil
 		}
+		if !strings.EqualFold(lib.CollectionType, "music") {
+			if _, isExtra := ClassifyExtraFile(logicalRoot, path); isExtra {
+				if discovered != nil {
+					discovered[filepath.Clean(path)] = struct{}{}
+				}
+				return nil
+			}
+		}
 
 		if discovered != nil {
 			discovered[filepath.Clean(path)] = struct{}{}

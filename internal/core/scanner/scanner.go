@@ -153,6 +153,7 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 	existing, err := s.repo.FindItemByMediaSourcePath(ctx, lib.ID, mediaPath)
 	if err == nil && existing != nil {
 		if s.isMediaSourceUnchanged(ctx, existing, mediaPath, size, mtime) {
+			s.scanAndIndexExtras(ctx, lib, existing, filepath.Dir(mediaPath), strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath)))
 			if needOnline && s.isMissingPrimaryImage(ctx, existing.ID) {
 				var year int
 				if existing.ProductionYear != nil {
@@ -316,6 +317,9 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 
 	// Taxonomies, People & FTS5
 	s.persistMetaRelationsAndFTS(ctx, rec, meta)
+
+	// Local Trailers, Special Features & Theme Songs
+	s.scanAndIndexExtras(ctx, lib, rec, filepath.Dir(mediaPath), strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath)))
 
 	hasLocalTitle := meta != nil && strings.TrimSpace(meta.Name) != ""
 
@@ -648,6 +652,7 @@ func (s *Scanner) ensureSeries(
 	existing, err := s.repo.FindItemByPath(ctx, lib.ID, epInfo.SeriesDir)
 	if err == nil && existing != nil {
 		cache[epInfo.SeriesDir] = existing
+		s.scanAndIndexExtras(ctx, lib, existing, epInfo.SeriesDir, "")
 		var backfillTask *enrichTask
 		if s.hasOnlineMetadataProviders() && s.isMissingPrimaryImage(ctx, existing.ID) {
 			if _, dup := seenEnrich[existing.ID]; !dup {
@@ -741,6 +746,7 @@ func (s *Scanner) ensureSeries(
 		s.downloadAndSaveRemoteImages(ctx, rec, meta)
 	}
 	s.persistMetaRelationsAndFTS(ctx, rec, meta)
+	s.scanAndIndexExtras(ctx, lib, rec, epInfo.SeriesDir, "")
 
 	cache[epInfo.SeriesDir] = rec
 

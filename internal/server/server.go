@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -348,6 +349,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		UserIDFromCtx: userIDFromCtx,
 	})
 	compatCoreSvc := compatcore.New(cfg, store, userRepo, libRepo, sessionMgr, registry)
+	compatCoreSvc.SetAuthService(authSvc)
 	compatCoreSvc.SetWSHub(wsHub)
 	compatCoreH := compatCoreSvc.BuildRouter(compatcore.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
@@ -443,6 +445,20 @@ func applyPendingDatabaseRestore(dataDir, dbPath string) error {
 	}
 	if !info.Mode().IsRegular() || info.Size() == 0 {
 		slog.Warn("ignoring invalid or empty pending database restore file", "path", restorePath, "size", info.Size())
+		return nil
+	}
+
+	const sqliteMagicHeader = "SQLite format 3\x00"
+	rf, err := os.Open(restorePath)
+	if err != nil {
+		slog.Warn("failed to open pending database restore file for header validation", "path", restorePath, "error", err)
+		return nil
+	}
+	var magic [16]byte
+	_, readErr := io.ReadFull(rf, magic[:])
+	_ = rf.Close()
+	if readErr != nil || string(magic[:]) != sqliteMagicHeader {
+		slog.Warn("ignoring pending database restore with invalid SQLite magic header", "path", restorePath, "error", readErr)
 		return nil
 	}
 

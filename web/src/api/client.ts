@@ -12,6 +12,9 @@ import type {
   AudioLyricsResponse,
   AuthSession,
   AuthenticationResult,
+  BackupFileInfo,
+  BackupInfoResponse,
+  BackupRestoreResult,
   BaseItemDto,
   DeviceInfo,
   FileSystemEntry,
@@ -1220,4 +1223,45 @@ export const api = {
     embyFetch<void>(`/emby/LiveTv/ListingProviders?id=${encodeURIComponent(id)}`, {
       method: 'DELETE',
     }),
+
+  // ==================== v0.9.0 Backup & Extras APIs ====================
+
+  getLocalTrailers: (userId: string, itemId: string) =>
+    embyFetch<BaseItemDto[]>(
+      `/emby/Users/${encodeURIComponent(userId)}/Items/${encodeURIComponent(itemId)}/LocalTrailers`,
+    ),
+
+  getSpecialFeatures: (userId: string, itemId: string) =>
+    embyFetch<BaseItemDto[]>(
+      `/emby/Users/${encodeURIComponent(userId)}/Items/${encodeURIComponent(itemId)}/SpecialFeatures`,
+    ),
+
+  getBackupInfo: () => embyFetch<BackupInfoResponse>('/emby/BackupRestore/BackupInfo'),
+
+  createBackup: () =>
+    embyFetch<BackupFileInfo>('/emby/BackupRestore/Backup', {
+      method: 'POST',
+    }),
+
+  restoreBackup: (name: string) =>
+    embyFetch<BackupRestoreResult>('/emby/BackupRestore/Restore', {
+      method: 'POST',
+      body: JSON.stringify({ Name: name }),
+    }),
+}
+
+export function getChapterImageUrl(
+  itemId: string,
+  chapterIndex: number,
+  tag?: string,
+  maxWidth = 480,
+): string {
+  if (isDemoMode()) {
+    return getDemoImageUrl(itemId, 'Backdrop')
+  }
+  const q = new URLSearchParams({ maxWidth: String(maxWidth), quality: '85' })
+  if (tag) q.set('tag', tag)
+  return resolveApiUrl(
+    `/emby/Items/${encodeURIComponent(itemId)}/Images/Chapter/${chapterIndex}?${q.toString()}`,
+  )
 }

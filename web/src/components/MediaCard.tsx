@@ -188,7 +188,7 @@ export function MediaCard({
             <Check className="h-4 w-4 stroke-[3]" />
           </div>
         ) : onMarkPlayed || onHideFromResume ? (
-          <div className="absolute right-2 top-2 z-10 flex items-center gap-1 opacity-0 transition-opacity duration-200 focus-within:opacity-100 group-hover:opacity-100">
+          <div className="absolute right-2 top-2 z-10 flex items-center gap-1 opacity-100 sm:opacity-0 sm:pointer-events-none sm:group-hover:opacity-100 sm:group-hover:pointer-events-auto sm:focus-within:opacity-100 sm:focus-within:pointer-events-auto transition-opacity duration-200">
             {onMarkPlayed && (
               <button
                 type="button"

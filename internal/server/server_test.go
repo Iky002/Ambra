@@ -179,6 +179,19 @@ func TestApplyPendingDatabaseRestore(t *testing.T) {
 		t.Fatalf("expected original db untouched, got %q", string(got))
 	}
 
+	// 2b. Non-SQLite restore file (invalid magic header) -> ignored, existing DB untouched
+	if err := os.WriteFile(restorePath, []byte("not-a-valid-sqlite-database-file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyPendingDatabaseRestore(dataDir, dbPath); err != nil {
+		t.Fatalf("expected invalid magic restore to be ignored, got %v", err)
+	}
+	got, _ = os.ReadFile(dbPath)
+	if string(got) != "original-db" {
+		t.Fatalf("expected original db untouched after invalid magic restore, got %q", string(got))
+	}
+	_ = os.Remove(restorePath)
+
 	// 3. Valid SQLite DB staged at ambra.db.restore -> removes -wal/-shm, backs up old DB, promotes restore, boots cleanly
 	seedStore, err := sqlite.Open(restorePath)
 	if err != nil {

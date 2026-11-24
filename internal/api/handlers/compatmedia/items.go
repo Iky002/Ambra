@@ -688,29 +688,119 @@ func (h *Handler) handleEmptyQueryResult(w http.ResponseWriter, _ *http.Request)
 	})
 }
 
-func (h *Handler) handleEmptyItemArray(w http.ResponseWriter, _ *http.Request) {
-	httpx.JSON(w, http.StatusOK, []dto.BaseItemDto{})
+var specialFeatureExtraTypes = []string{
+	"Clip", "Featurette", "BehindTheScenes", "DeletedScene", "Interview", "Scene", "Short", "Extra",
 }
 
-func (h *Handler) handleThemeMediaResult(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleLocalTrailers(w http.ResponseWriter, r *http.Request) {
+	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	if !h.canAccessItemID(r, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
+	if h.repo == nil || itemID == "" {
+		httpx.JSON(w, http.StatusOK, []dto.BaseItemDto{})
+		return
+	}
+	q := httpx.ParseQuery(r)
+	items, err := h.repo.GetItemExtras(r.Context(), h.serverID(), h.resolveUserID(r, q), itemID, []string{"Trailer"})
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	httpx.JSON(w, http.StatusOK, items)
+}
+
+func (h *Handler) handleSpecialFeatures(w http.ResponseWriter, r *http.Request) {
+	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	if !h.canAccessItemID(r, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
+	if h.repo == nil || itemID == "" {
+		httpx.JSON(w, http.StatusOK, []dto.BaseItemDto{})
+		return
+	}
+	q := httpx.ParseQuery(r)
+	items, err := h.repo.GetItemExtras(r.Context(), h.serverID(), h.resolveUserID(r, q), itemID, specialFeatureExtraTypes)
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	httpx.JSON(w, http.StatusOK, items)
+}
+
+func (h *Handler) handleThemeSongs(w http.ResponseWriter, r *http.Request) {
+	h.serveThemeMediaByTypes(w, r, []string{"ThemeSong"})
+}
+
+func (h *Handler) handleThemeVideos(w http.ResponseWriter, r *http.Request) {
+	h.serveThemeMediaByTypes(w, r, []string{"ThemeVideo"})
+}
+
+func (h *Handler) serveThemeMediaByTypes(w http.ResponseWriter, r *http.Request, extraTypes []string) {
+	ownerID := guid.Normalize(chi.URLParam(r, "Id"))
+	if !h.canAccessItemID(r, ownerID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
+	items := []dto.BaseItemDto{}
+	if h.repo != nil && ownerID != "" {
+		q := httpx.ParseQuery(r)
+		var err error
+		items, err = h.repo.GetItemExtras(r.Context(), h.serverID(), h.resolveUserID(r, q), ownerID, extraTypes)
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
-		"Items":            []dto.BaseItemDto{},
-		"TotalRecordCount": 0,
-		"OwnerId":          guid.Normalize(chi.URLParam(r, "Id")),
+		"Items":            items,
+		"TotalRecordCount": len(items),
+		"OwnerId":          ownerID,
 	})
 }
 
 func (h *Handler) handleAllThemeMedia(w http.ResponseWriter, r *http.Request) {
 	ownerID := guid.Normalize(chi.URLParam(r, "Id"))
-	empty := map[string]any{
-		"Items":            []dto.BaseItemDto{},
-		"TotalRecordCount": 0,
-		"OwnerId":          ownerID,
+	if !h.canAccessItemID(r, ownerID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
+	themeSongs := []dto.BaseItemDto{}
+	themeVideos := []dto.BaseItemDto{}
+	if h.repo != nil && ownerID != "" {
+		q := httpx.ParseQuery(r)
+		userID := h.resolveUserID(r, q)
+		allThemes, err := h.repo.GetItemExtras(r.Context(), h.serverID(), userID, ownerID, []string{"ThemeSong", "ThemeVideo"})
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		for _, it := range allThemes {
+			if strings.EqualFold(it.ExtraType, "ThemeSong") {
+				themeSongs = append(themeSongs, it)
+			} else if strings.EqualFold(it.ExtraType, "ThemeVideo") {
+				themeVideos = append(themeVideos, it)
+			}
+		}
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
-		"ThemeVideosResult": empty,
-		"ThemeSongsResult":  empty,
-		"SoundtrackSongsResult": empty,
+		"ThemeVideosResult": map[string]any{
+			"Items":            themeVideos,
+			"TotalRecordCount": len(themeVideos),
+			"OwnerId":          ownerID,
+		},
+		"ThemeSongsResult": map[string]any{
+			"Items":            themeSongs,
+			"TotalRecordCount": len(themeSongs),
+			"OwnerId":          ownerID,
+		},
+		"SoundtrackSongsResult": map[string]any{
+			"Items":            []dto.BaseItemDto{},
+			"TotalRecordCount": 0,
+			"OwnerId":          ownerID,
+		},
 	})
 }
 
@@ -902,13 +992,6 @@ func (h *Handler) handleUploadSubtitle(w http.ResponseWriter, r *http.Request) {
 			mediaSourceID = itemID
 		}
 
-		var maxIdx int
-		_ = h.store.Reader.QueryRowContext(r.Context(),
-			`SELECT COALESCE(MAX(stream_index), -1) FROM item_media_streams WHERE item_id = ?`,
-			itemID,
-		).Scan(&maxIdx)
-		nextIdx := maxIdx + 1
-
 		cls := scanner.ClassifySubtitle(filepath.Base(destPath), format)
 		streamLang := lang
 		if cls.Language != "" && cls.Language != "und" {
@@ -919,16 +1002,47 @@ func (h *Handler) handleUploadSubtitle(w http.ResponseWriter, r *http.Request) {
 			isForcedInt = 1
 		}
 
-		if _, err := h.store.Writer.ExecContext(r.Context(), `
-			INSERT INTO item_media_streams (
-				media_source_id, item_id, stream_index, stream_type, codec, language, sub_variant,
-				display_title, title, width, height, video_range, audio_layout, channels,
-				sample_rate, bitrate, is_default, is_forced, is_external, path
-			) VALUES (?, ?, ?, 'Subtitle', ?, ?, ?, ?, ?, 0, 0, NULL, NULL, 0, 0, 0, 0, ?, 1, ?)`,
-			mediaSourceID, itemID, nextIdx, format, streamLang, cls.SubVariant,
-			cls.DisplayTitle, filepath.Base(destPath), isForcedInt, destPath,
-		); err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+		var existingIdx int
+		qErr := h.store.Reader.QueryRowContext(r.Context(), `
+			SELECT stream_index FROM item_media_streams
+			WHERE media_source_id = ? AND path = ? AND LOWER(stream_type) = 'subtitle' AND is_external = 1
+			LIMIT 1`,
+			mediaSourceID, destPath,
+		).Scan(&existingIdx)
+
+		if qErr == nil {
+			if _, err := h.store.Writer.ExecContext(r.Context(), `
+				UPDATE item_media_streams
+				SET codec = ?, language = ?, sub_variant = ?, display_title = ?, title = ?, is_forced = ?
+				WHERE media_source_id = ? AND stream_index = ? AND path = ?`,
+				format, streamLang, cls.SubVariant, cls.DisplayTitle, filepath.Base(destPath), isForcedInt,
+				mediaSourceID, existingIdx, destPath,
+			); err != nil {
+				httpx.Error(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		} else if errors.Is(qErr, sql.ErrNoRows) {
+			var maxIdx int
+			_ = h.store.Reader.QueryRowContext(r.Context(),
+				`SELECT COALESCE(MAX(stream_index), -1) FROM item_media_streams WHERE item_id = ?`,
+				itemID,
+			).Scan(&maxIdx)
+			nextIdx := maxIdx + 1
+
+			if _, err := h.store.Writer.ExecContext(r.Context(), `
+				INSERT INTO item_media_streams (
+					media_source_id, item_id, stream_index, stream_type, codec, language, sub_variant,
+					display_title, title, width, height, video_range, audio_layout, channels,
+					sample_rate, bitrate, is_default, is_forced, is_external, path
+				) VALUES (?, ?, ?, 'Subtitle', ?, ?, ?, ?, ?, 0, 0, NULL, NULL, 0, 0, 0, 0, ?, 1, ?)`,
+				mediaSourceID, itemID, nextIdx, format, streamLang, cls.SubVariant,
+				cls.DisplayTitle, filepath.Base(destPath), isForcedInt, destPath,
+			); err != nil {
+				httpx.Error(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		} else {
+			httpx.Error(w, http.StatusInternalServerError, qErr.Error())
 			return
 		}
 	}

@@ -61,7 +61,8 @@ func (h *Handler) forgotPassword(w http.ResponseWriter, r *http.Request) {
 	pinBytes := make([]byte, 3)
 	_, _ = rand.Read(pinBytes)
 	pin := strings.ToUpper(hex.EncodeToString(pinBytes))
-	expiresAt := time.Now().UTC().Add(30 * time.Minute)
+	now := time.Now().UTC()
+	expiresAt := now.Add(30 * time.Minute)
 
 	uid := ""
 	uname := strings.TrimSpace(body.EnteredUsername)
@@ -72,18 +73,39 @@ func (h *Handler) forgotPassword(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	h.mu.Lock()
-	h.forgotPins[pin] = forgotPinEntry{
-		UserID:    uid,
-		UserName:  uname,
-		Pin:       pin,
-		ExpiresAt: expiresAt,
-	}
-	h.mu.Unlock()
-
 	pinFile := ""
 	if h.cfg != nil && h.cfg.DataDir != "" {
 		pinFile = filepath.Join(h.cfg.DataDir, "passwordreset-"+pin+".txt")
+	}
+
+	var expiredFiles []string
+	h.mu.Lock()
+	for k, existing := range h.forgotPins {
+		if !now.Before(existing.ExpiresAt) {
+			if existing.PinFile != "" {
+				expiredFiles = append(expiredFiles, existing.PinFile)
+			}
+			delete(h.forgotPins, k)
+		}
+	}
+	if uid != "" {
+		h.forgotPins[pin] = forgotPinEntry{
+			UserID:    uid,
+			UserName:  uname,
+			Pin:       pin,
+			PinFile:   pinFile,
+			ExpiresAt: expiresAt,
+		}
+	}
+	h.mu.Unlock()
+
+	for _, f := range expiredFiles {
+		_ = os.Remove(f)
+	}
+
+	if uid != "" && pinFile != "" {
+		content := fmt.Sprintf("Ambra Password Reset PIN\nUser: %s\nPIN: %s\nExpiresAt: %s\n", uname, pin, expiresAt.Format(time.RFC3339))
+		_ = os.WriteFile(pinFile, []byte(content), 0o600)
 	}
 
 	httpx.JSON(w, http.StatusOK, map[string]any{
@@ -100,19 +122,73 @@ func (h *Handler) forgotPasswordPin(w http.ResponseWriter, r *http.Request) {
 	_ = decodeOptionalJSON(r, &body)
 	pin := strings.ToUpper(strings.TrimSpace(body.Pin))
 
-	var resetUsers []string
-	success := false
+	now := time.Now().UTC()
+	var (
+		matched      *forgotPinEntry
+		filesToClean []string
+	)
+
 	h.mu.Lock()
-	if entry, ok := h.forgotPins[pin]; ok && time.Now().UTC().Before(entry.ExpiresAt) {
-		delete(h.forgotPins, pin)
-		success = true
-		if entry.UserName != "" {
-			resetUsers = append(resetUsers, entry.UserName)
+	// Prune expired entries first.
+	for k, e := range h.forgotPins {
+		if !now.Before(e.ExpiresAt) {
+			if e.PinFile != "" {
+				filesToClean = append(filesToClean, e.PinFile)
+			}
+			delete(h.forgotPins, k)
+		}
+	}
+	if pin != "" {
+		if entry, ok := h.forgotPins[pin]; ok && entry.UserID != "" {
+			cp := entry
+			matched = &cp
+			delete(h.forgotPins, pin)
+			if entry.PinFile != "" {
+				filesToClean = append(filesToClean, entry.PinFile)
+			}
+		} else {
+			// Rate-limit wrong attempts: increment attempts on active PINs and invalidate at limit.
+			for k, e := range h.forgotPins {
+				e.Attempts++
+				if e.Attempts >= forgotPinMaxAttempts {
+					if e.PinFile != "" {
+						filesToClean = append(filesToClean, e.PinFile)
+					}
+					delete(h.forgotPins, k)
+				} else {
+					h.forgotPins[k] = e
+				}
+			}
 		}
 	}
 	h.mu.Unlock()
-	if resetUsers == nil {
-		resetUsers = []string{}
+
+	for _, f := range filesToClean {
+		_ = os.Remove(f)
+	}
+
+	resetUsers := []string{}
+	success := false
+	if matched != nil {
+		if h.authSvc != nil {
+			if err := h.authSvc.ChangePassword(r.Context(), matched.UserID, "", "", true); err != nil {
+				httpx.Error(w, http.StatusInternalServerError, "failed to reset password")
+				return
+			}
+		}
+		if h.userRepo != nil {
+			_ = h.userRepo.DeleteTokensByUser(r.Context(), matched.UserID)
+			_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+				Name:     fmt.Sprintf("Password reset via PIN for %s", matched.UserName),
+				Type:     "UserPasswordChanged",
+				UserID:   matched.UserID,
+				Severity: "Info",
+			})
+		}
+		success = true
+		if matched.UserName != "" {
+			resetUsers = append(resetUsers, matched.UserName)
+		}
 	}
 
 	httpx.JSON(w, http.StatusOK, map[string]any{

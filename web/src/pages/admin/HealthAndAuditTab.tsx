@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Activity,
   AlertTriangle,
+  Archive,
   Check,
   CheckCircle2,
   Cpu,
@@ -12,14 +13,16 @@ import {
   Loader2,
   Lock,
   RefreshCw,
+  RotateCcw,
   SearchCheck,
   ShieldAlert,
   Sparkles,
   Trash2,
   XCircle,
 } from 'lucide-react'
-import { embyFetch } from '../../api/client'
-import { FeedbackBanner, formatBytes, formatDateTime } from './adminUtils'
+import { api, embyFetch } from '../../api/client'
+import type { BackupFileInfo, BackupInfoResponse } from '../../api/types'
+import { AdminModal, FeedbackBanner, formatBytes, formatDateTime } from './adminUtils'
 
 interface MemoryHealth {
   AllocBytes: number
@@ -193,6 +196,28 @@ export function HealthAndAuditTab() {
   const [lockFields, setLockFields] = useState<string[]>(DEFAULT_LOCK_FIELDS)
   const [actingReviewId, setActingReviewId] = useState<string | null>(null)
 
+  // 4. Database backup & restore state
+  const [backupInfo, setBackupInfo] = useState<BackupInfoResponse | null>(null)
+  const [backupLoading, setBackupLoading] = useState(true)
+  const [creatingBackup, setCreatingBackup] = useState(false)
+  const [restoreTarget, setRestoreTarget] = useState<BackupFileInfo | null>(null)
+  const [restoringBackup, setRestoringBackup] = useState(false)
+
+  const fetchBackupInfo = useCallback(async () => {
+    setBackupLoading(true)
+    try {
+      const data = await api.getBackupInfo()
+      setBackupInfo(data)
+    } catch (err) {
+      setFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : '获取数据库备份列表失败',
+      })
+    } finally {
+      setBackupLoading(false)
+    }
+  }, [])
+
   const fetchHealth = useCallback(async (isManual = false) => {
     if (isManual) {
       setHealthRefreshing(true)
@@ -232,11 +257,54 @@ export function HealthAndAuditTab() {
 
   useEffect(() => {
     void fetchHealth(false)
-  }, [fetchHealth])
+    void fetchBackupInfo()
+  }, [fetchHealth, fetchBackupInfo])
 
   useEffect(() => {
     void fetchReviews(reviewStatus)
   }, [fetchReviews, reviewStatus])
+
+  const handleCreateBackup = async () => {
+    setCreatingBackup(true)
+    setFeedback(null)
+    try {
+      const created = await api.createBackup()
+      setFeedback({
+        type: 'success',
+        message: `已创建数据库备份「${created.Name}」（${formatBytes(created.Size)}）`,
+      })
+      await fetchBackupInfo()
+    } catch (err) {
+      setFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : '创建数据库备份失败',
+      })
+    } finally {
+      setCreatingBackup(false)
+    }
+  }
+
+  const handleConfirmRestore = async () => {
+    if (!restoreTarget) return
+    setRestoringBackup(true)
+    setFeedback(null)
+    try {
+      const res = await api.restoreBackup(restoreTarget.Name)
+      setRestoreTarget(null)
+      setFeedback({
+        type: 'success',
+        message: `已暂存恢复文件「${res.BackupName}」至 ${res.StagedPath || 'ambra.db.restore'}，将在下次重启服务器后生效`,
+      })
+      await fetchBackupInfo()
+    } catch (err) {
+      setFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : '恢复数据库备份失败',
+      })
+    } finally {
+      setRestoringBackup(false)
+    }
+  }
 
   const handleRunAudit = async () => {
     setAuditRunning(true)
@@ -922,6 +990,152 @@ export function HealthAndAuditTab() {
           </div>
         )}
       </section>
+      {/* 区块 4：数据库备份与恢复 */}
+      <section className="space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="flex items-center gap-2 text-base font-semibold text-zinc-100">
+              <Archive className="h-4 w-4 text-amber-400" />
+              <span>数据库备份与恢复</span>
+            </h2>
+            <p className="mt-1 text-xs text-zinc-400">
+              在线创建 SQLite 数据库热备份快照，或从历史备份文件暂存恢复（重启后生效）
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void fetchBackupInfo()}
+              disabled={backupLoading}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-amber-400/40 hover:text-amber-300 disabled:opacity-50"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${backupLoading ? 'animate-spin' : ''}`} />
+              <span>刷新</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleCreateBackup()}
+              disabled={creatingBackup}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3.5 py-1.5 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-50"
+            >
+              {creatingBackup ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Database className="h-3.5 w-3.5" />
+              )}
+              <span>{creatingBackup ? '创建备份中...' : '立即创建备份'}</span>
+            </button>
+          </div>
+        </div>
+
+        <div className="overflow-hidden rounded-2xl border border-white/8 bg-white/[0.02]">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/8 px-4 py-3 text-xs">
+            <div className="flex items-center gap-2 text-zinc-400">
+              <HardDrive className="h-3.5 w-3.5 text-amber-400" />
+              <span>备份目录：</span>
+              <span className="font-mono text-zinc-200">
+                {backupInfo?.BackupDirectory || '-'}
+              </span>
+            </div>
+            <span className="font-mono text-[11px] text-zinc-500">
+              共 {backupInfo?.Backups?.length ?? 0} 个备份文件
+            </span>
+          </div>
+
+          {backupLoading ? (
+            <div className="flex h-28 items-center justify-center">
+              <Loader2 className="h-5 w-5 animate-spin text-amber-400" />
+            </div>
+          ) : !backupInfo?.Backups || backupInfo.Backups.length === 0 ? (
+            <div className="py-10 text-center text-xs text-zinc-500">
+              暂无数据库备份文件，点击右上角「立即创建备份」生成首个快照
+            </div>
+          ) : (
+            <div className="divide-y divide-white/6">
+              {backupInfo.Backups.map((backup) => (
+                <div
+                  key={backup.Name}
+                  className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 text-xs hover:bg-white/[0.03]"
+                >
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate font-mono text-sm font-medium text-zinc-100">
+                      {backup.Name}
+                    </p>
+                    <p className="mt-0.5 text-[11px] text-zinc-400">
+                      大小 {formatBytes(backup.Size)} · 创建于 {formatDateTime(backup.DateCreated)}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setRestoreTarget(backup)}
+                    className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
+                  >
+                    <RotateCcw className="h-3.5 w-3.5" />
+                    <span>恢复此备份</span>
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </section>
+
+      <AdminModal
+        open={Boolean(restoreTarget)}
+        title="确认恢复数据库备份"
+        subtitle={restoreTarget ? `目标快照：${restoreTarget.Name}` : undefined}
+        maxWidthClass="max-w-md"
+        onClose={() => {
+          if (!restoringBackup) setRestoreTarget(null)
+        }}
+      >
+        <div className="space-y-4">
+          <div className="flex items-start gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3.5 text-xs leading-relaxed text-amber-200">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+            <div>
+              <p className="font-semibold text-amber-100">即将暂存数据库恢复文件</p>
+              <p className="mt-1 text-amber-200/85">
+                此操作会将所选备份暂存为 <code className="font-mono text-amber-100">ambra.db.restore</code>
+                ，并在<strong>下次重启服务器</strong>时自动覆盖当前数据库。请确认已了解风险后再继续。
+              </p>
+            </div>
+          </div>
+
+          {restoreTarget && (
+            <div className="rounded-xl border border-white/8 bg-white/[0.03] px-3.5 py-2.5 text-xs text-zinc-400">
+              <p className="font-mono text-zinc-200">{restoreTarget.Name}</p>
+              <p className="mt-1">
+                大小：{formatBytes(restoreTarget.Size)} · 创建时间：
+                {formatDateTime(restoreTarget.DateCreated)}
+              </p>
+            </div>
+          )}
+
+          <div className="flex justify-end gap-2 pt-2">
+            <button
+              type="button"
+              disabled={restoringBackup}
+              onClick={() => setRestoreTarget(null)}
+              className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10 disabled:opacity-50"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              disabled={restoringBackup}
+              onClick={() => void handleConfirmRestore()}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-60"
+            >
+              {restoringBackup ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <RotateCcw className="h-3.5 w-3.5" />
+              )}
+              <span>确认恢复</span>
+            </button>
+          </div>
+        </div>
+      </AdminModal>
     </div>
   )
 }

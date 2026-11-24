@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
@@ -36,7 +36,13 @@ import {
   Volume2,
 } from 'lucide-react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { api, getBackdropUrl, getFallbackImageUrl, getImageUrl } from '../api/client'
+import {
+  api,
+  getBackdropUrl,
+  getChapterImageUrl,
+  getFallbackImageUrl,
+  getImageUrl,
+} from '../api/client'
 import type { BaseItemDto, MediaSourceInfo } from '../api/types'
 import { formatAudioTime } from '../components/AudioPlayerBar'
 import { MediaCard } from '../components/MediaCard'
@@ -113,6 +119,7 @@ export function ItemDetailPage() {
   const [subLang, setSubLang] = useState('chi')
   const [subForced, setSubForced] = useState(false)
   const [subError, setSubError] = useState<string | null>(null)
+  const subFileInputRef = useRef<HTMLInputElement>(null)
   const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
 
   const showToast = (type: 'success' | 'error', message: string) => {
@@ -222,6 +229,26 @@ export function ItemDetailPage() {
     staleTime: 60_000,
   })
   const similarItems = similarData?.Items || []
+
+  // 本地预告片与花絮/特别收录（仅 Movie / Series / Video）
+  const supportsExtras =
+    item?.Type === 'Movie' || item?.Type === 'Series' || item?.Type === 'Video'
+
+  const { data: localTrailersData } = useQuery({
+    queryKey: ['localTrailers', userId, id],
+    queryFn: () => api.getLocalTrailers(userId, item!.Id).catch(() => []),
+    enabled: Boolean(id && item?.Id && supportsExtras),
+    staleTime: 60_000,
+  })
+  const localTrailers = Array.isArray(localTrailersData) ? localTrailersData : []
+
+  const { data: specialFeaturesData } = useQuery({
+    queryKey: ['specialFeatures', userId, id],
+    queryFn: () => api.getSpecialFeatures(userId, item!.Id).catch(() => []),
+    enabled: Boolean(id && item?.Id && supportsExtras),
+    staleTime: 60_000,
+  })
+  const specialFeatures = Array.isArray(specialFeaturesData) ? specialFeaturesData : []
 
   // 加入合集 / 播放列表弹窗数据
   const { data: boxSetsForModal } = useQuery({
@@ -356,6 +383,9 @@ export function ItemDetailPage() {
       setSubFile(null)
       setSubForced(false)
       setSubError(null)
+      if (subFileInputRef.current) {
+        subFileInputRef.current.value = ''
+      }
       await queryClient.invalidateQueries({ queryKey: ['item'] })
       showToast('success', '外挂字幕上传成功')
     },
@@ -368,8 +398,11 @@ export function ItemDetailPage() {
 
   const deleteSubtitleMutation = useMutation({
     mutationFn: (streamIndex: number) => api.deleteSubtitle(item!.Id, streamIndex),
-    onSuccess: async () => {
+    onSuccess: async (_data, deletedIndex) => {
       setSubError(null)
+      if (selectedSubIdx === deletedIndex) {
+        setSelectedSubIdx(undefined)
+      }
       await queryClient.invalidateQueries({ queryKey: ['item'] })
       showToast('success', '已删除外挂字幕')
     },
@@ -385,6 +418,7 @@ export function ItemDetailPage() {
     mutationFn: (ep: BaseItemDto) =>
       api.togglePlayed(userId, ep.Id, Boolean(ep.UserData?.Played)),
     onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['item', userId, id] })
       queryClient.invalidateQueries({ queryKey: ['episodes', id, selectedSeasonId, userId] })
       queryClient.invalidateQueries({ queryKey: ['nextUp', userId, id] })
       queryClient.invalidateQueries({ queryKey: ['seasons', id, userId] })
@@ -418,6 +452,7 @@ export function ItemDetailPage() {
     },
     onSuccess: async () => {
       await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['item', userId, id] }),
         queryClient.invalidateQueries({ queryKey: ['episodes', id, selectedSeasonId, userId] }),
         queryClient.invalidateQueries({ queryKey: ['seasons', id, userId] }),
         queryClient.invalidateQueries({ queryKey: ['nextUp', userId, id] }),
@@ -637,6 +672,7 @@ export function ItemDetailPage() {
 
   const handlePlay = (targetId = item.Id, startTicks = 0) => {
     const params = new URLSearchParams()
+    if (startTicks > 0) params.set('startTicks', String(startTicks))
     if (targetId === item.Id) {
       if (activeSource?.Id) params.set('mediaSourceId', activeSource.Id)
       if (selectedAudioIdx !== undefined) params.set('audio', String(selectedAudioIdx))
@@ -646,9 +682,36 @@ export function ItemDetailPage() {
         params.set('subtitle', 'off')
       }
     }
-    if (startTicks > 0) params.set('startTicks', String(startTicks))
     const qs = params.toString()
     navigate(`/play/${targetId}${qs ? `?${qs}` : ''}`)
+  }
+
+  const handleCopyPath = async (text: string) => {
+    let copied = false
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text)
+        copied = true
+      } else {
+        const ta = document.createElement('textarea')
+        ta.value = text
+        ta.setAttribute('readonly', '')
+        ta.style.position = 'fixed'
+        ta.style.opacity = '0'
+        document.body.appendChild(ta)
+        ta.select()
+        copied = document.execCommand('copy')
+        document.body.removeChild(ta)
+      }
+    } catch {
+      copied = false
+    }
+    if (copied) {
+      setPathCopied(true)
+      window.setTimeout(() => setPathCopied(false), 2000)
+    } else {
+      showToast('error', '复制文件路径失败，请手动复制')
+    }
   }
 
   return (
@@ -860,6 +923,17 @@ export function ItemDetailPage() {
                   </button>
                 ) : null}
 
+                {localTrailers.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => navigate(`/play/${localTrailers[0].Id}`)}
+                    className="inline-flex items-center gap-2 rounded-xl border border-amber-400/35 bg-amber-500/12 px-4 py-3 text-sm font-medium text-amber-200 transition-all duration-200 hover:-translate-y-0.5 hover:border-amber-400/60 hover:bg-amber-500/20 active:scale-[0.97]"
+                  >
+                    <Film className="h-4 w-4" />
+                    <span>预告片</span>
+                  </button>
+                )}
+
                 <button
                   type="button"
                   onClick={() => favMutation.mutate()}
@@ -1068,17 +1142,19 @@ export function ItemDetailPage() {
                         <Subtitles className="h-3.5 w-3.5 text-amber-400" />
                         字幕 ({subtitleStreams.length})
                       </label>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setSubError(null)
-                          setSubModalOpen(true)
-                        }}
-                        className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[11px] font-medium text-amber-300 transition-colors hover:border-amber-400/40 hover:bg-amber-500/15"
-                      >
-                        <Upload className="h-3 w-3" />
-                        <span>管理字幕</span>
-                      </button>
+                      {isAdmin && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSubError(null)
+                            setSubModalOpen(true)
+                          }}
+                          className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[11px] font-medium text-amber-300 transition-colors hover:border-amber-400/40 hover:bg-amber-500/15"
+                        >
+                          <Upload className="h-3 w-3" />
+                          <span>管理字幕</span>
+                        </button>
+                      )}
                     </div>
                     <select
                       id="detail-subtitle-select"
@@ -1643,22 +1719,113 @@ export function ItemDetailPage() {
           <div className="no-scrollbar -mx-1 flex gap-3 overflow-x-auto px-1 pb-2 pt-1">
             {item.Chapters.map((chapter, idx) => {
               const startSec = chapter.StartPositionTicks / 10_000_000
+              const chapterThumbUrl = chapter.ImageTag
+                ? getChapterImageUrl(item.Id, idx, chapter.ImageTag)
+                : null
               return (
                 <button
                   key={`${chapter.StartPositionTicks}-${idx}`}
                   type="button"
-                  onClick={() =>
-                    navigate(`/play/${item.Id}?startTicks=${chapter.StartPositionTicks}`)
-                  }
-                  className="group flex w-48 shrink-0 flex-col justify-between rounded-2xl border border-white/8 bg-white/[0.03] p-3.5 text-left transition-all duration-200 hover:-translate-y-0.5 hover:border-amber-400/50 hover:bg-white/[0.06]"
+                  onClick={() => handlePlay(item.Id, chapter.StartPositionTicks)}
+                  className="group flex w-52 shrink-0 flex-col justify-between overflow-hidden rounded-2xl border border-white/8 bg-white/[0.03] text-left transition-all duration-200 hover:-translate-y-0.5 hover:border-amber-400/50 hover:bg-white/[0.06]"
                 >
-                  <span className="line-clamp-2 text-xs font-semibold text-zinc-100 group-hover:text-amber-300">
-                    {chapter.Name || `章节 ${idx + 1}`}
-                  </span>
-                  <span className="mt-2 inline-flex items-center gap-1 font-mono text-[11px] text-zinc-400">
-                    <Play className="h-3 w-3 text-amber-400" />
-                    {formatSeconds(startSec)}
-                  </span>
+                  {chapterThumbUrl && (
+                    <div className="relative aspect-video w-full overflow-hidden bg-zinc-900">
+                      <div className="absolute inset-0 flex items-center justify-center text-zinc-600">
+                        <Film className="h-6 w-6 opacity-50" />
+                      </div>
+                      <img
+                        src={chapterThumbUrl}
+                        alt={chapter.Name || `章节 ${idx + 1}`}
+                        loading="lazy"
+                        onError={(e) => {
+                          e.currentTarget.style.display = 'none'
+                        }}
+                        className="relative z-10 h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+                      />
+                    </div>
+                  )}
+                  <div className="flex flex-1 flex-col justify-between p-3.5">
+                    <span className="line-clamp-2 text-xs font-semibold text-zinc-100 group-hover:text-amber-300">
+                      {chapter.Name || `章节 ${idx + 1}`}
+                    </span>
+                    <span className="mt-2 inline-flex items-center gap-1 font-mono text-[11px] text-zinc-400">
+                      <Play className="h-3 w-3 text-amber-400" />
+                      {formatSeconds(startSec)}
+                    </span>
+                  </div>
+                </button>
+              )
+            })}
+          </div>
+        </section>
+      )}
+
+      {/* 花絮与特别收录（16:9 横向卡片条） */}
+      {specialFeatures.length > 0 && (
+        <section className="mx-auto max-w-7xl space-y-4 px-4 pt-10 lg:px-8">
+          <div className="flex items-center gap-2">
+            <Film className="h-4 w-4 text-amber-400" />
+            <h2 className="text-lg font-semibold text-zinc-100">
+              花絮与特别收录
+              <span className="ml-2 text-xs font-normal text-zinc-500">
+                ({specialFeatures.length})
+              </span>
+            </h2>
+          </div>
+          <div className="no-scrollbar -mx-1 flex gap-4 overflow-x-auto px-1 pb-2 pt-1">
+            {specialFeatures.map((extra) => {
+              const extraThumb = extra.ImageTags?.Primary
+                ? getImageUrl(extra.Id, 'Primary', {
+                    maxWidth: 480,
+                    tag: extra.ImageTags.Primary,
+                  })
+                : extra.BackdropImageTags?.length
+                  ? getImageUrl(extra.Id, 'Backdrop', {
+                      maxWidth: 480,
+                      tag: extra.BackdropImageTags[0],
+                    })
+                  : backdrop
+              const extraFallback = extra.ImageTags?.Primary
+                ? getFallbackImageUrl(extra.Id, 'Primary')
+                : backdropFallback
+              return (
+                <button
+                  key={extra.Id}
+                  type="button"
+                  onClick={() => navigate(`/play/${extra.Id}`)}
+                  className="group flex w-64 shrink-0 flex-col overflow-hidden rounded-2xl border border-white/8 bg-white/[0.03] text-left transition-all duration-200 hover:-translate-y-0.5 hover:border-amber-400/50 hover:bg-white/[0.06]"
+                >
+                  <div className="relative aspect-video w-full overflow-hidden bg-zinc-900">
+                    {extraThumb ? (
+                      <img
+                        src={extraThumb}
+                        alt={extra.Name}
+                        loading="lazy"
+                        onError={(e) => applyFallbackOrHide(e, extraFallback)}
+                        className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+                      />
+                    ) : (
+                      <div className="flex h-full w-full items-center justify-center text-zinc-600">
+                        <Film className="h-7 w-7 opacity-50" />
+                      </div>
+                    )}
+                    <div className="absolute inset-0 flex items-center justify-center bg-black/35 opacity-0 transition-opacity group-hover:opacity-100">
+                      <div className="flex h-10 w-10 items-center justify-center rounded-full bg-amber-500 text-zinc-950 shadow-lg">
+                        <Play className="ml-0.5 h-4 w-4 fill-current" />
+                      </div>
+                    </div>
+                    {extra.RunTimeTicks ? (
+                      <span className="absolute bottom-2 right-2 rounded-md bg-black/75 px-1.5 py-0.5 font-mono text-[10px] text-zinc-200 backdrop-blur-sm">
+                        {formatTicks(extra.RunTimeTicks)}
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="p-3">
+                    <p className="line-clamp-2 text-xs font-semibold text-zinc-100 group-hover:text-amber-300">
+                      {extra.Name}
+                    </p>
+                  </div>
                 </button>
               )
             })}
@@ -1701,11 +1868,7 @@ export function ItemDetailPage() {
                       </div>
                       <button
                         type="button"
-                        onClick={() => {
-                          void navigator.clipboard?.writeText(activeSource.Path!)
-                          setPathCopied(true)
-                          window.setTimeout(() => setPathCopied(false), 2000)
-                        }}
+                        onClick={() => void handleCopyPath(activeSource.Path!)}
                         className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-white/10 bg-white/[0.05] px-2.5 py-1.5 text-[11px] font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:bg-white/10 hover:text-amber-200"
                       >
                         {pathCopied ? (
@@ -1956,158 +2119,161 @@ export function ItemDetailPage() {
         </div>
       </AdminModal>
 
-      {/* 外挂字幕管理弹窗（查看 / 删除外挂 / 上传新字幕） */}
-      <AdminModal
-        open={subModalOpen}
-        title="管理字幕"
-        subtitle={`管理「${item.Name}」的内封与外挂字幕轨道`}
-        maxWidthClass="max-w-lg"
-        onClose={() => setSubModalOpen(false)}
-      >
-        <div className="space-y-5">
-          {subError && (
-            <FeedbackBanner message={subError} type="error" onClose={() => setSubError(null)} />
-          )}
-
-          {/* 当前字幕轨道列表 */}
-          <div className="space-y-2">
-            <h3 className="text-xs font-semibold text-zinc-300">
-              当前字幕轨道 ({subtitleStreams.length})
-            </h3>
-            {subtitleStreams.length === 0 ? (
-              <p className="rounded-xl border border-dashed border-white/10 py-5 text-center text-xs text-zinc-500">
-                暂无字幕轨道，可在下方上传外挂字幕
-              </p>
-            ) : (
-              <div className="max-h-56 space-y-1.5 overflow-y-auto">
-                {subtitleStreams.map((s) => {
-                  const meta = getSubtitleMeta(s)
-                  return (
-                    <div
-                      key={s.Index}
-                      className="flex items-center justify-between gap-3 rounded-xl border border-white/8 bg-white/[0.03] px-3 py-2.5 text-xs"
-                    >
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2">
-                          <span className="truncate font-medium text-zinc-100">
-                            {meta.displayLabel}
-                          </span>
-                          <span
-                            className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                              s.IsExternal
-                                ? 'bg-emerald-500/15 text-emerald-300'
-                                : 'bg-white/10 text-zinc-400'
-                            }`}
-                          >
-                            {s.IsExternal ? '外挂' : '内封'}
-                          </span>
-                          {s.IsForced && (
-                            <span className="shrink-0 rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-medium text-sky-300">
-                              强制
-                            </span>
-                          )}
-                        </div>
-                        <p className="mt-0.5 truncate text-[11px] text-zinc-500">
-                          轨道 #{s.Index} · {(s.Codec || '-').toUpperCase()}
-                          {s.Language ? ` · ${s.Language}` : ''}
-                        </p>
-                      </div>
-                      {s.IsExternal && (
-                        <button
-                          type="button"
-                          disabled={deleteSubtitleMutation.isPending}
-                          onClick={() => deleteSubtitleMutation.mutate(s.Index)}
-                          className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-red-500/30 bg-red-500/10 px-2.5 py-1 text-[11px] font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
-                        >
-                          <Trash2 className="h-3 w-3" />
-                          <span>删除</span>
-                        </button>
-                      )}
-                    </div>
-                  )
-                })}
-              </div>
+      {/* 外挂字幕管理弹窗（仅管理员：查看 / 删除外挂 / 上传新字幕） */}
+      {isAdmin && (
+        <AdminModal
+          open={subModalOpen}
+          title="管理字幕"
+          subtitle={`管理「${item.Name}」的内封与外挂字幕轨道`}
+          maxWidthClass="max-w-lg"
+          onClose={() => setSubModalOpen(false)}
+        >
+          <div className="space-y-5">
+            {subError && (
+              <FeedbackBanner message={subError} type="error" onClose={() => setSubError(null)} />
             )}
-          </div>
 
-          {/* 上传外挂字幕 */}
-          <form
-            onSubmit={(e) => {
-              e.preventDefault()
-              uploadSubtitleMutation.mutate()
-            }}
-            className="space-y-3 border-t border-white/10 pt-4"
-          >
-            <h3 className="text-xs font-semibold text-zinc-300">上传外挂字幕</h3>
+            {/* 当前字幕轨道列表 */}
+            <div className="space-y-2">
+              <h3 className="text-xs font-semibold text-zinc-300">
+                当前字幕轨道 ({subtitleStreams.length})
+              </h3>
+              {subtitleStreams.length === 0 ? (
+                <p className="rounded-xl border border-dashed border-white/10 py-5 text-center text-xs text-zinc-500">
+                  暂无字幕轨道，可在下方上传外挂字幕
+                </p>
+              ) : (
+                <div className="max-h-56 space-y-1.5 overflow-y-auto">
+                  {subtitleStreams.map((s) => {
+                    const meta = getSubtitleMeta(s)
+                    return (
+                      <div
+                        key={s.Index}
+                        className="flex items-center justify-between gap-3 rounded-xl border border-white/8 bg-white/[0.03] px-3 py-2.5 text-xs"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="truncate font-medium text-zinc-100">
+                              {meta.displayLabel}
+                            </span>
+                            <span
+                              className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                                s.IsExternal
+                                  ? 'bg-emerald-500/15 text-emerald-300'
+                                  : 'bg-white/10 text-zinc-400'
+                              }`}
+                            >
+                              {s.IsExternal ? '外挂' : '内封'}
+                            </span>
+                            {s.IsForced && (
+                              <span className="shrink-0 rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-medium text-sky-300">
+                                强制
+                              </span>
+                            )}
+                          </div>
+                          <p className="mt-0.5 truncate text-[11px] text-zinc-500">
+                            轨道 #{s.Index} · {(s.Codec || '-').toUpperCase()}
+                            {s.Language ? ` · ${s.Language}` : ''}
+                          </p>
+                        </div>
+                        {isAdmin && s.IsExternal && (
+                          <button
+                            type="button"
+                            disabled={deleteSubtitleMutation.isPending}
+                            onClick={() => deleteSubtitleMutation.mutate(s.Index)}
+                            className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-red-500/30 bg-red-500/10 px-2.5 py-1 text-[11px] font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                            <span>删除</span>
+                          </button>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
 
-            <label className="block space-y-1.5">
-              <span className="block text-[11px] text-zinc-400">
-                选择字幕文件 (.srt, .ass, .ssa, .vtt, .sub)
-              </span>
-              <input
-                type="file"
-                accept=".srt,.ass,.ssa,.vtt,.sub"
-                aria-label="选择字幕文件"
-                onChange={(e) => {
-                  setSubFile(e.target.files?.[0] || null)
-                  setSubError(null)
-                }}
-                className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-200 file:mr-3 file:rounded-lg file:border-0 file:bg-amber-500/20 file:px-2.5 file:py-1 file:text-xs file:font-medium file:text-amber-300 hover:file:bg-amber-500/30"
-              />
-            </label>
+            {/* 上传外挂字幕 */}
+            <form
+              onSubmit={(e) => {
+                e.preventDefault()
+                uploadSubtitleMutation.mutate()
+              }}
+              className="space-y-3 border-t border-white/10 pt-4"
+            >
+              <h3 className="text-xs font-semibold text-zinc-300">上传外挂字幕</h3>
 
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <label className="block space-y-1.5">
-                <span className="block text-[11px] text-zinc-400">字幕语言</span>
-                <select
-                  aria-label="字幕语言"
-                  value={subLang}
-                  onChange={(e) => setSubLang(e.target.value)}
-                  className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
-                >
-                  <option value="chi">中文 (chi)</option>
-                  <option value="chs">简体中文 (chs)</option>
-                  <option value="cht">繁體中文 (cht)</option>
-                  <option value="eng">English (eng)</option>
-                  <option value="jpn">日本語 (jpn)</option>
-                </select>
-              </label>
-
-              <label className="flex items-center gap-2 self-end rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-zinc-200">
+                <span className="block text-[11px] text-zinc-400">
+                  选择字幕文件 (.srt, .ass, .ssa, .vtt, .sub)
+                </span>
                 <input
-                  type="checkbox"
-                  checked={subForced}
-                  onChange={(e) => setSubForced(e.target.checked)}
-                  className="h-3.5 w-3.5 accent-amber-500"
+                  ref={subFileInputRef}
+                  type="file"
+                  accept=".srt,.ass,.ssa,.vtt,.sub"
+                  aria-label="选择字幕文件"
+                  onChange={(e) => {
+                    setSubFile(e.target.files?.[0] || null)
+                    setSubError(null)
+                  }}
+                  className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-200 file:mr-3 file:rounded-lg file:border-0 file:bg-amber-500/20 file:px-2.5 file:py-1 file:text-xs file:font-medium file:text-amber-300 hover:file:bg-amber-500/30"
                 />
-                <span>强制字幕 (Forced)</span>
               </label>
-            </div>
 
-            <div className="flex items-center justify-end gap-2 pt-1">
-              <button
-                type="button"
-                onClick={() => setSubModalOpen(false)}
-                className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10"
-              >
-                关闭
-              </button>
-              <button
-                type="submit"
-                disabled={!subFile || uploadSubtitleMutation.isPending}
-                className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-50"
-              >
-                {uploadSubtitleMutation.isPending ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Upload className="h-3.5 w-3.5" />
-                )}
-                <span>上传字幕</span>
-              </button>
-            </div>
-          </form>
-        </div>
-      </AdminModal>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <label className="block space-y-1.5">
+                  <span className="block text-[11px] text-zinc-400">字幕语言</span>
+                  <select
+                    aria-label="字幕语言"
+                    value={subLang}
+                    onChange={(e) => setSubLang(e.target.value)}
+                    className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
+                  >
+                    <option value="chi">中文 (chi)</option>
+                    <option value="chs">简体中文 (chs)</option>
+                    <option value="cht">繁體中文 (cht)</option>
+                    <option value="eng">English (eng)</option>
+                    <option value="jpn">日本語 (jpn)</option>
+                  </select>
+                </label>
+
+                <label className="flex items-center gap-2 self-end rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-zinc-200">
+                  <input
+                    type="checkbox"
+                    checked={subForced}
+                    onChange={(e) => setSubForced(e.target.checked)}
+                    className="h-3.5 w-3.5 accent-amber-500"
+                  />
+                  <span>强制字幕 (Forced)</span>
+                </label>
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setSubModalOpen(false)}
+                  className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10"
+                >
+                  关闭
+                </button>
+                <button
+                  type="submit"
+                  disabled={!subFile || uploadSubtitleMutation.isPending}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-50"
+                >
+                  {uploadSubtitleMutation.isPending ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Upload className="h-3.5 w-3.5" />
+                  )}
+                  <span>上传字幕</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </AdminModal>
+      )}
 
       {/* 管理员弹窗组 */}
       {isAdmin && (
