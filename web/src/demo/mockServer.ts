@@ -1423,9 +1423,35 @@ export async function demoFetch<T>(
     }
   }
 
+  if (pathname === '/emby/Library/VirtualFolders/LibraryOptions' && method === 'POST') {
+    const body = parseJsonBody(options)
+    const id = String(body.Id || qs.get('id') || '').trim()
+    const lib = store.libraries.find((l) => l.ItemId === id)
+    if (!lib) throw new ApiError(404, '未找到对应媒体库')
+    const incoming = (body.LibraryOptions || {}) as Record<string, unknown>
+    lib.LibraryOptions = {
+      SaveLocalMetadata: true,
+      ...(lib.LibraryOptions || {}),
+      ...incoming,
+    }
+    pushActivity(
+      `更新媒体库「${lib.Name}」元数据选项`,
+      'LibraryOptionsUpdated',
+      `保存本地 NFO/图片：${lib.LibraryOptions.SaveLocalMetadata === false ? '关闭' : '开启'}`,
+    )
+    return undefined as T
+  }
+
   if (pathname === '/emby/Library/VirtualFolders') {
     if (method === 'GET') {
-      return store.libraries.map((l) => ({ ...l, Locations: [...(l.Locations || [])] })) as T
+      return store.libraries.map((l) => ({
+        ...l,
+        Locations: [...(l.Locations || [])],
+        LibraryOptions: {
+          SaveLocalMetadata: true,
+          ...(l.LibraryOptions || {}),
+        },
+      })) as T
     }
     if (method === 'POST') {
       const body = parseJsonBody(options)
@@ -1435,11 +1461,18 @@ export async function demoFetch<T>(
         ? body.Paths.map((p) => String(p))
         : []
       if (!name) throw new ApiError(400, '媒体库名称不能为空')
+      const incomingOpts = (body.LibraryOptions || {}) as Record<string, unknown>
       const newLib: VirtualFolderInfo = {
         ItemId: `lib-demo-${Date.now().toString(36)}`,
         Name: name,
         CollectionType: collectionType,
         Locations: paths,
+        LibraryOptions: {
+          SaveLocalMetadata:
+            typeof incomingOpts.SaveLocalMetadata === 'boolean'
+              ? incomingOpts.SaveLocalMetadata
+              : true,
+        },
       }
       store.libraries.push(newLib)
       store.libraryItems.set(newLib.ItemId, [])

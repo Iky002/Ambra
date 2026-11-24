@@ -656,6 +656,7 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 					if !mergedAway {
 						s.persistMetaRelationsAndFTS(ctx, rec, onlineMeta)
 						s.downloadAndSaveRemoteImages(ctx, rec, onlineMeta)
+						s.saveLocalNFOIfEnabled(ctx, rec, onlineMeta, false)
 					}
 					updated = true
 				}

@@ -328,11 +328,17 @@ export interface ActivityLogEntry {
   Severity: string
 }
 
+export interface VirtualFolderLibraryOptions {
+  SaveLocalMetadata?: boolean
+  [key: string]: unknown
+}
+
 export interface VirtualFolderInfo {
   Name: string
   Locations?: string[]
   CollectionType?: string
   ItemId: string
+  LibraryOptions?: VirtualFolderLibraryOptions
 }
 
 export interface FileSystemEntry {

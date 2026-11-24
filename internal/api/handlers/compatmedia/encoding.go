@@ -271,14 +271,12 @@ func (h *Handler) handleQueryVirtualFolders(w http.ResponseWriter, r *http.Reque
 
 	items := make([]virtualFolderInfo, 0, len(libs))
 	for _, lib := range libs {
-		var opts map[string]any
-		_ = json.Unmarshal([]byte(lib.OptionsJSON), &opts)
 		items = append(items, virtualFolderInfo{
 			Name:           lib.Name,
 			Locations:      lib.Paths,
 			CollectionType: lib.CollectionType,
 			ItemId:         lib.ID,
-			LibraryOptions: opts,
+			LibraryOptions: sqlite.ParseLibraryOptions(lib.OptionsJSON),
 		})
 	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[virtualFolderInfo]{
@@ -500,11 +498,11 @@ func (h *Handler) handleUpdateVirtualFolderOptions(w http.ResponseWriter, r *htt
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 	}
-	if body.Id != "" && body.LibraryOptions != nil && h.store != nil {
-		raw, _ := json.Marshal(body.LibraryOptions)
-		_, _ = h.store.Writer.ExecContext(r.Context(),
-			`UPDATE libraries SET options_json = ?, updated_at = ? WHERE id = ?`,
-			string(raw), time.Now().Unix(), guid.Normalize(body.Id))
+	if body.Id != "" && body.LibraryOptions != nil && h.repo != nil {
+		if _, err := h.repo.UpdateLibraryOptions(r.Context(), body.Id, body.LibraryOptions); err != nil && !errors.Is(err, sqlite.ErrNotFound) {
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	httpx.NoContent(w)
 }

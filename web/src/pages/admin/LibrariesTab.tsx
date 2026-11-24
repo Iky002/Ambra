@@ -57,6 +57,7 @@ export function LibrariesTab() {
   const [paths, setPaths] = useState<string[]>([])
   const [manualPath, setManualPath] = useState('')
   const [refreshAfterCreate, setRefreshAfterCreate] = useState(true)
+  const [saveLocalMetadata, setSaveLocalMetadata] = useState(true)
   const [creating, setCreating] = useState(false)
 
   // 服务器目录浏览器状态
@@ -67,6 +68,8 @@ export function LibrariesTab() {
   const [editTarget, setEditTarget] = useState<VirtualFolderInfo | null>(null)
   const [editName, setEditName] = useState('')
   const [editLocations, setEditLocations] = useState<string[]>([])
+  const [editSaveLocalMetadata, setEditSaveLocalMetadata] = useState(true)
+  const [savingOptions, setSavingOptions] = useState(false)
   const [editNewPath, setEditNewPath] = useState('')
   const [editShowBrowser, setEditShowBrowser] = useState(false)
   const [editBrowsePath, setEditBrowsePath] = useState('')
@@ -156,6 +159,7 @@ export function LibrariesTab() {
         CollectionType: libType,
         Paths: finalPaths,
         refreshLibrary: refreshAfterCreate,
+        saveLocalMetadata,
       })
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['admin', 'virtualFolders'] }),
@@ -170,6 +174,7 @@ export function LibrariesTab() {
       setLibType('movies')
       setPaths([])
       setManualPath('')
+      setSaveLocalMetadata(true)
       setShowBrowser(false)
       setBrowsePath('')
     } catch (err) {
@@ -186,10 +191,41 @@ export function LibrariesTab() {
     setEditTarget(lib)
     setEditName(lib.Name)
     setEditLocations([...(lib.Locations || [])])
+    setEditSaveLocalMetadata(lib.LibraryOptions?.SaveLocalMetadata ?? true)
     setEditNewPath('')
     setEditShowBrowser(false)
     setEditBrowsePath('')
     setFeedback(null)
+  }
+
+  const handleToggleEditSaveLocal = async (next: boolean) => {
+    if (!editTarget || savingOptions) return
+    setEditSaveLocalMetadata(next)
+    setSavingOptions(true)
+    setFeedback(null)
+    try {
+      const nextOptions = {
+        ...(editTarget.LibraryOptions || {}),
+        SaveLocalMetadata: next,
+      }
+      await api.updateVirtualFolderOptions(editTarget.ItemId, nextOptions)
+      setEditTarget({ ...editTarget, LibraryOptions: nextOptions })
+      await queryClient.invalidateQueries({ queryKey: ['admin', 'virtualFolders'] })
+      setFeedback({
+        type: 'success',
+        message: next
+          ? `已开启「${editTarget.Name}」的本地 NFO 与图片保存`
+          : `已关闭「${editTarget.Name}」的本地 NFO 与图片保存`,
+      })
+    } catch (err) {
+      setEditSaveLocalMetadata(!next)
+      setFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : '更新媒体库选项失败',
+      })
+    } finally {
+      setSavingOptions(false)
+    }
   }
 
   const handleRename = async (e: React.FormEvent) => {
@@ -358,11 +394,18 @@ export function LibrariesTab() {
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
                     <h3 className="truncate text-sm font-semibold text-zinc-100">{lib.Name}</h3>
-                    <span className="mt-1 inline-block rounded bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-amber-300">
-                      {COLLECTION_TYPES.find((t) => t.value === lib.CollectionType)?.label ||
-                        lib.CollectionType ||
-                        'mixed'}
-                    </span>
+                    <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                      <span className="inline-block rounded bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-amber-300">
+                        {COLLECTION_TYPES.find((t) => t.value === lib.CollectionType)?.label ||
+                          lib.CollectionType ||
+                          'mixed'}
+                      </span>
+                      {(lib.LibraryOptions?.SaveLocalMetadata ?? true) && (
+                        <span className="inline-block rounded bg-emerald-500/12 px-2 py-0.5 text-[10px] font-medium text-emerald-300">
+                          本地 NFO / 图片
+                        </span>
+                      )}
+                    </div>
                   </div>
                   <span className="shrink-0 font-mono text-[10px] text-zinc-500">
                     {lib.ItemId?.slice(0, 8)}
@@ -624,6 +667,13 @@ export function LibrariesTab() {
           </div>
 
           <ToggleSwitch
+            checked={saveLocalMetadata}
+            onChange={setSaveLocalMetadata}
+            label="保存元数据与图片到媒体文件夹"
+            description="刮削完成后自动将 .nfo 与 poster.jpg / fanart.jpg 保存到媒体同目录（兼容 Emby / Kodi）"
+          />
+
+          <ToggleSwitch
             checked={refreshAfterCreate}
             onChange={setRefreshAfterCreate}
             label="创建后立即触发扫描"
@@ -857,6 +907,17 @@ export function LibrariesTab() {
                 </div>
               </div>
             )}
+          </div>
+
+          {/* 刮削与元数据选项 */}
+          <div className="space-y-2.5 border-t border-white/8 pt-4">
+            <label className="block text-xs font-medium text-zinc-400">元数据与刮削选项</label>
+            <ToggleSwitch
+              checked={editSaveLocalMetadata}
+              onChange={(next) => void handleToggleEditSaveLocal(next)}
+              label="保存元数据与图片到媒体文件夹"
+              description="刮削完成后自动将 .nfo 与 poster.jpg / fanart.jpg 保存到媒体同目录（兼容 Emby / Kodi）"
+            />
           </div>
 
           <div className="flex justify-end border-t border-white/8 pt-3">
