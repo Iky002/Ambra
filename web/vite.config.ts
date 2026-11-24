@@ -6,7 +6,7 @@ export default defineConfig({
   base: './',
   plugins: [react(), tailwindcss()],
   optimizeDeps: {
-    exclude: ['jassub'],
+    exclude: ['jassub', '@ffmpeg/ffmpeg', '@ffmpeg/util'],
   },
   build: {
     outDir: 'dist',

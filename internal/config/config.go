@@ -6,8 +6,11 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/ambra-media/ambra/internal/core/ffmpegbin"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 )
+
+var executablePathFn = os.Executable
 
 const (
 	ServerVersion = "4.10.2.0"
@@ -53,6 +56,7 @@ func Load(dataDir string) (*Config, error) {
 	cfg := Default(dataDir)
 	for _, sub := range []string{
 		"",
+		"bin",
 		"config",
 		"cache/images",
 		"cache/subtitles",
@@ -83,7 +87,7 @@ func Load(dataDir string) (*Config, error) {
 		return nil, err
 	}
 
-	// Environment variable overrides
+	// Environment variable overrides (highest priority)
 	if v := os.Getenv("AMBRA_HTTP_ADDR"); v != "" {
 		cfg.HTTPAddr = v
 	}
@@ -93,6 +97,18 @@ func Load(dataDir string) (*Config, error) {
 	if v := os.Getenv("AMBRA_TMDB_API_KEY"); v != "" {
 		cfg.TMDBApiKey = v
 	}
+
+	// Resolve ffmpeg/ffprobe paths via ffmpegbin manager:
+	// env override > custom config path > embedded binary > sibling dir > <DataDir>/bin > PATH.
+	exePath, _ := executablePathFn()
+	cfg.FFmpegPath, cfg.FFprobePath = ffmpegbin.Resolve(ffmpegbin.ResolveOptions{
+		DataDir:        cfg.DataDir,
+		ConfigFFmpeg:   cfg.FFmpegPath,
+		ConfigFFprobe:  cfg.FFprobePath,
+		EnvFFmpeg:      os.Getenv("AMBRA_FFMPEG_PATH"),
+		EnvFFprobe:     os.Getenv("AMBRA_FFPROBE_PATH"),
+		ExecutablePath: exePath,
+	})
 	return cfg, nil
 }
 

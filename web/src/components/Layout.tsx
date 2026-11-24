@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ChevronLeft,
   ChevronRight,
@@ -13,13 +13,17 @@ import {
   Music,
   Search,
   Settings,
+  ShieldCheck,
+  Sparkles,
   Tv,
+  UserCheck,
   X,
 } from 'lucide-react'
 import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { api } from '../api/client'
 import type { BaseItemDto } from '../api/types'
 import { useAuth } from '../context/AuthContext'
+import { isDemoMode } from '../demo/demoMode'
 import { AmbraLogo } from './AmbraLogo'
 import { SearchModal } from './SearchModal'
 
@@ -32,12 +36,25 @@ function libraryIcon(view: BaseItemDto) {
 }
 
 export function Layout() {
-  const { auth, isAdmin, logout } = useAuth()
+  const { auth, isAdmin, logout, switchDemoRole } = useAuth()
+  const queryClient = useQueryClient()
   const navigate = useNavigate()
   const location = useLocation()
   const [collapsed, setCollapsed] = useState(false)
   const [mobileOpen, setMobileOpen] = useState(false)
   const [searchOpen, setSearchOpen] = useState(false)
+  const [switchingRole, setSwitchingRole] = useState(false)
+  const demoActive = isDemoMode()
+
+  const handleToggleDemoRole = async () => {
+    setSwitchingRole(true)
+    try {
+      await switchDemoRole(isAdmin ? 'guest' : 'admin')
+      await queryClient.invalidateQueries()
+    } finally {
+      setSwitchingRole(false)
+    }
+  }
 
   const { data: viewsData } = useQuery({
     queryKey: ['userViews', auth?.userId],
@@ -215,6 +232,37 @@ export function Layout() {
 
       {/* 主内容区 */}
       <div className="flex min-w-0 flex-1 flex-col">
+        {/* Serverless Demo 顶部克制提示条（仅 Demo 模式渲染） */}
+        {demoActive && (
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-amber-500/20 bg-gradient-to-r from-amber-500/12 via-orange-500/8 to-amber-500/12 px-4 py-1.5 text-xs text-amber-200/95 lg:px-8">
+            <div className="flex items-center gap-2">
+              <Sparkles className="h-3.5 w-3.5 shrink-0 text-amber-400" />
+              <span>
+                <strong className="font-semibold text-amber-300">Serverless Demo 模式</strong>
+                <span className="hidden sm:inline">（纯前端内存模拟，无需后端 · 所有读写即时生效）</span>
+              </span>
+            </div>
+            <button
+              type="button"
+              disabled={switchingRole}
+              onClick={() => void handleToggleDemoRole()}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-amber-400/35 bg-amber-500/15 px-2.5 py-1 text-[11px] font-medium text-amber-200 transition-colors hover:bg-amber-500/25 disabled:opacity-50"
+            >
+              {isAdmin ? (
+                <>
+                  <ShieldCheck className="h-3.5 w-3.5 text-amber-300" />
+                  <span>管理员视角 · 切换普通用户体验 RBAC</span>
+                </>
+              ) : (
+                <>
+                  <UserCheck className="h-3.5 w-3.5 text-sky-300" />
+                  <span>普通用户视角 · 切回管理员控制台</span>
+                </>
+              )}
+            </button>
+          </div>
+        )}
+
         {/* 顶部毛玻璃导航条 */}
         <header className="sticky top-0 z-30 flex h-16 items-center justify-between gap-4 border-b border-white/6 bg-[#09090d]/75 px-4 backdrop-blur-xl lg:px-8">
           <div className="flex items-center gap-3">

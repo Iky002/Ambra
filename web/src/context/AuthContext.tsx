@@ -1,6 +1,9 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react'
 import { api, clearAuth, getDeviceId, getStoredAuth, saveAuth } from '../api/client'
 import type { AuthSession, UserDto } from '../api/types'
+import { isDemoMode } from '../demo/demoMode'
+
+const DEMO_LOGGED_OUT_KEY = 'ambra_demo_logged_out'
 
 interface AuthContextValue {
   auth: AuthSession | null
@@ -10,6 +13,7 @@ interface AuthContextValue {
   login: (username: string, password: string) => Promise<void>
   logout: () => void
   refreshUser: () => Promise<void>
+  switchDemoRole: (role: 'admin' | 'guest') => Promise<void>
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null)
@@ -20,6 +24,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [userLoading, setUserLoading] = useState<boolean>(() => Boolean(getStoredAuth()))
 
   const logout = useCallback(() => {
+    if (isDemoMode()) {
+      try {
+        sessionStorage.setItem(DEMO_LOGGED_OUT_KEY, '1')
+      } catch {
+        // 忽略存储异常
+      }
+    }
     clearAuth()
     setAuth(null)
     setUser(null)
@@ -54,6 +65,52 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, [])
 
+  const login = useCallback(async (username: string, password: string) => {
+    const res = await api.authenticateByName(username, password)
+    const isAdminFlag = Boolean(res.User.Policy?.IsAdministrator)
+    const session: AuthSession = {
+      accessToken: res.AccessToken,
+      userId: res.User.Id,
+      serverId: res.ServerId || res.User.ServerId || '',
+      userName: res.User.Name,
+      isAdmin: isAdminFlag,
+      deviceId: getDeviceId(),
+    }
+    if (isDemoMode()) {
+      try {
+        sessionStorage.removeItem(DEMO_LOGGED_OUT_KEY)
+      } catch {
+        // 忽略存储异常
+      }
+    }
+    saveAuth(session)
+    setAuth(session)
+    setUser(res.User)
+    setUserLoading(false)
+  }, [])
+
+  const switchDemoRole = useCallback(
+    async (role: 'admin' | 'guest') => {
+      if (!isDemoMode()) return
+      await login(role, '')
+    },
+    [login],
+  )
+
+  // Demo 模式下首次访问（未手动退出过）自动以演示管理员 admin 登录，开箱即享完整影院体验
+  useEffect(() => {
+    if (!isDemoMode() || auth?.userId) return
+    let manuallyLoggedOut = false
+    try {
+      manuallyLoggedOut = sessionStorage.getItem(DEMO_LOGGED_OUT_KEY) === '1'
+    } catch {
+      manuallyLoggedOut = false
+    }
+    if (!manuallyLoggedOut) {
+      void login('admin', '')
+    }
+  }, [auth?.userId, login])
+
   useEffect(() => {
     if (auth?.userId) {
       void refreshUser()
@@ -73,28 +130,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => window.removeEventListener('ambra:unauthorized', onUnauthorized)
   }, [])
 
-  const login = useCallback(async (username: string, password: string) => {
-    const res = await api.authenticateByName(username, password)
-    const isAdminFlag = Boolean(res.User.Policy?.IsAdministrator)
-    const session: AuthSession = {
-      accessToken: res.AccessToken,
-      userId: res.User.Id,
-      serverId: res.ServerId || res.User.ServerId || '',
-      userName: res.User.Name,
-      isAdmin: isAdminFlag,
-      deviceId: getDeviceId(),
-    }
-    saveAuth(session)
-    setAuth(session)
-    setUser(res.User)
-    setUserLoading(false)
-  }, [])
-
   // 严格以当前用户 Policy.IsAdministrator 为准；用户资料尚未加载完时回退至登录会话中的 isAdmin
   const isAdmin = user ? Boolean(user.Policy?.IsAdministrator) : Boolean(auth?.isAdmin)
 
   return (
-    <AuthContext.Provider value={{ auth, user, isAdmin, userLoading, login, logout, refreshUser }}>
+    <AuthContext.Provider
+      value={{ auth, user, isAdmin, userLoading, login, logout, refreshUser, switchDemoRole }}
+    >
       {children}
     </AuthContext.Provider>
   )

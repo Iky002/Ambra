@@ -19,7 +19,7 @@ type CodecInfo struct {
 	Direction              string   `json:"Direction"`      // Encoder / Decoder
 	FrameworkCodec         string   `json:"FrameworkCodec"`
 	IsHardwareCodec        bool     `json:"IsHardwareCodec"`
-	SecondaryFramework     string   `json:"SecondaryFramework,omitempty"` // VideoToolbox / VAAPI / QSV / NVENC
+	SecondaryFramework     string   `json:"SecondaryFramework,omitempty"` // VideoToolbox / NVENC / QSV / VAAPI / AMF
 	TonemapFilter          string   `json:"TonemapFilter,omitempty"`
 	SupportedColorFormats  []string `json:"SupportedColorFormats,omitempty"`
 	MinWidth               int      `json:"MinWidth,omitempty"`
@@ -225,6 +225,14 @@ var hwCandidates = []hwCandidate{
 		hevcEnc:   "hevc_vaapi",
 		tonemap:   "tonemap_vaapi=format=nv12:matrix=bt709:primaries=bt709:transfer=bt709",
 	},
+	{
+		accel:     "d3d11va",
+		framework: "AMF",
+		h264Enc:   "h264_amf",
+		hevcEnc:   "hevc_amf",
+		tonemap:   "zscale=t=linear:npl=100,tonemap=hable,zscale=p=bt709:t=bt709:m=bt709,format=yuv420p",
+		onlyOS:    "windows",
+	},
 }
 
 // BuildHWCapabilities constructs HWCapabilities and Emby CodecInfo entries from parsed FFmpeg outputs.
@@ -254,7 +262,9 @@ func BuildHWCapabilities(accels []string, encoders map[string]bool, goos string)
 		if cand.onlyOS != "" && cand.onlyOS != goos {
 			continue
 		}
-		hasAccel := accelSet[cand.accel] || (cand.accel == "cuda" && accelSet["nvdec"])
+		hasAccel := accelSet[cand.accel] ||
+			(cand.accel == "cuda" && accelSet["nvdec"]) ||
+			(cand.framework == "AMF" && (accelSet["amf"] || accelSet["dxva2"]))
 		hasH264 := encoders[cand.h264Enc]
 		hasHEVC := encoders[cand.hevcEnc]
 

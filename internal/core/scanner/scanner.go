@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -35,19 +36,30 @@ type Scanner struct {
 	registry *plugins.Registry
 	bus      *eventbus.Bus
 	cfg      *config.Config
+	prober   *Prober
 
 	mu       sync.Mutex
 	scanning map[string]bool
 }
 
 func New(repo *sqlite.LibraryRepo, registry *plugins.Registry, bus *eventbus.Bus, cfg *config.Config) *Scanner {
+	ffprobePath := "ffprobe"
+	if cfg != nil && cfg.FFprobePath != "" {
+		ffprobePath = cfg.FFprobePath
+	}
 	return &Scanner{
 		repo:     repo,
 		registry: registry,
 		bus:      bus,
 		cfg:      cfg,
+		prober:   NewProber(ffprobePath),
 		scanning: make(map[string]bool),
 	}
+}
+
+// SetProber replaces the media prober (pass nil or NewDisabledProber() to disable probing).
+func (s *Scanner) SetProber(p *Prober) {
+	s.prober = p
 }
 
 // ScanAll scans all configured libraries sequentially.
@@ -176,9 +188,25 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 	mtime := info.ModTime().Unix()
 	size := info.Size()
 
-	existing, err := s.repo.FindItemByPath(ctx, lib.ID, mediaPath)
-	if err == nil && existing != nil && existing.FileMtime != nil && *existing.FileMtime == mtime && existing.FileSize != nil && *existing.FileSize == size {
-		return false, nil
+	isStrm := IsStrmFile(mediaPath)
+	container := strings.TrimPrefix(strings.ToLower(filepath.Ext(mediaPath)), ".")
+	if isStrm {
+		container = "strm"
+	}
+
+	existing, err := s.repo.FindItemByMediaSourcePath(ctx, lib.ID, mediaPath)
+	if err == nil && existing != nil {
+		if s.isMediaSourceUnchanged(ctx, existing, mediaPath, size, mtime) {
+			return false, nil
+		}
+		if existing.Path != mediaPath {
+			probeRes := s.probeMedia(ctx, mediaPath, isStrm)
+			ms := s.buildMediaSource(existing, mediaPath, size, mtime, isStrm, container, probeRes)
+			if err := s.repo.UpsertMediaSourceAndStreams(ctx, existing.ID, ms); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
 	}
 
 	parsed := ParseMovieName(mediaPath)
@@ -195,16 +223,38 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 		Language: s.language(),
 	})
 
+	// Auto-merge into existing movie if this is a new file matching an existing item by TMDB/IMDB ID or same-dir title.
+	if existing == nil {
+		var mergeTarget *sqlite.ItemRecord
+		if meta != nil && len(meta.ProviderIDs) > 0 {
+			if tmdbID := getProviderID(meta.ProviderIDs, "Tmdb"); tmdbID != "" {
+				mergeTarget, _ = s.repo.FindItemByProviderID(ctx, lib.ID, "Movie", "Tmdb", tmdbID)
+			}
+			if mergeTarget == nil {
+				if imdbID := getProviderID(meta.ProviderIDs, "Imdb"); imdbID != "" {
+					mergeTarget, _ = s.repo.FindItemByProviderID(ctx, lib.ID, "Movie", "Imdb", imdbID)
+				}
+			}
+		}
+		if mergeTarget == nil {
+			mergeTarget, _ = s.repo.FindMovieInDirByBaseTitle(ctx, lib.ID, filepath.Dir(mediaPath), title)
+		}
+		if mergeTarget != nil {
+			probeRes := s.probeMedia(ctx, mediaPath, isStrm)
+			ms := s.buildMediaSource(mergeTarget, mediaPath, size, mtime, isStrm, container, probeRes)
+			if err := s.repo.UpsertMediaSourceAndStreams(ctx, mergeTarget.ID, ms); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+	}
+
 	itemID := guid.New()
 	if existing != nil {
 		itemID = existing.ID
 	}
 
-	isStrm := IsStrmFile(mediaPath)
-	container := strings.TrimPrefix(strings.ToLower(filepath.Ext(mediaPath)), ".")
-	if isStrm {
-		container = "strm"
-	}
+	probeRes := s.probeMedia(ctx, mediaPath, isStrm)
 
 	rec := &sqlite.ItemRecord{
 		ID:        itemID,
@@ -222,6 +272,10 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 		FileMtime: &mtime,
 		Etag:      computeEtag(mediaPath, size, mtime),
 	}
+	if probeRes != nil && probeRes.RuntimeTicks > 0 {
+		rt := probeRes.RuntimeTicks
+		rec.RuntimeTicks = &rt
+	}
 	if parsed.Year > 0 {
 		y := parsed.Year
 		rec.ProductionYear = &y
@@ -237,9 +291,9 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 		return false, err
 	}
 
-	// MediaSource + external subtitles
-	ms := s.buildMediaSource(rec, mediaPath, size, isStrm, container)
-	if err := s.repo.ReplaceMediaSourcesAndStreams(ctx, rec.ID, []sqlite.MediaSourceRecord{ms}); err != nil {
+	// MediaSource + probed embedded streams + external subtitles (preserving any merged alternate versions)
+	ms := s.buildMediaSource(rec, mediaPath, size, mtime, isStrm, container, probeRes)
+	if err := s.repo.UpsertMediaSourceAndStreams(ctx, rec.ID, ms); err != nil {
 		return false, err
 	}
 
@@ -269,9 +323,25 @@ func (s *Scanner) indexEpisode(
 	mtime := info.ModTime().Unix()
 	size := info.Size()
 
-	existing, err := s.repo.FindItemByPath(ctx, lib.ID, mediaPath)
-	if err == nil && existing != nil && existing.FileMtime != nil && *existing.FileMtime == mtime && existing.FileSize != nil && *existing.FileSize == size {
-		return false, nil
+	isStrm := IsStrmFile(mediaPath)
+	container := strings.TrimPrefix(strings.ToLower(filepath.Ext(mediaPath)), ".")
+	if isStrm {
+		container = "strm"
+	}
+
+	existing, err := s.repo.FindItemByMediaSourcePath(ctx, lib.ID, mediaPath)
+	if err == nil && existing != nil {
+		if s.isMediaSourceUnchanged(ctx, existing, mediaPath, size, mtime) {
+			return false, nil
+		}
+		if existing.Path != mediaPath {
+			probeRes := s.probeMedia(ctx, mediaPath, isStrm)
+			ms := s.buildMediaSource(existing, mediaPath, size, mtime, isStrm, container, probeRes)
+			if err := s.repo.UpsertMediaSourceAndStreams(ctx, existing.ID, ms); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
 	}
 
 	// 1. Ensure Series
@@ -284,6 +354,18 @@ func (s *Scanner) indexEpisode(
 	seasonRec, err := s.ensureSeason(ctx, lib, seriesRec, epInfo, seasonCache)
 	if err != nil {
 		return false, err
+	}
+
+	// Auto-merge into existing episode if same Series + SeasonNumber + EpisodeNumber already exists.
+	if existing == nil {
+		if mergeTarget, err := s.repo.FindEpisodeByNumber(ctx, seriesRec.ID, epInfo.SeasonNumber, epInfo.EpisodeNumber); err == nil && mergeTarget != nil {
+			probeRes := s.probeMedia(ctx, mediaPath, isStrm)
+			ms := s.buildMediaSource(mergeTarget, mediaPath, size, mtime, isStrm, container, probeRes)
+			if err := s.repo.UpsertMediaSourceAndStreams(ctx, mergeTarget.ID, ms); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
 	}
 
 	// 3. Upsert Episode
@@ -302,11 +384,7 @@ func (s *Scanner) indexEpisode(
 		itemID = existing.ID
 	}
 
-	isStrm := IsStrmFile(mediaPath)
-	container := strings.TrimPrefix(strings.ToLower(filepath.Ext(mediaPath)), ".")
-	if isStrm {
-		container = "strm"
-	}
+	probeRes := s.probeMedia(ctx, mediaPath, isStrm)
 
 	epNum := epInfo.EpisodeNumber
 	seasonNum := epInfo.SeasonNumber
@@ -339,6 +417,10 @@ func (s *Scanner) indexEpisode(
 			SeasonName: seasonRec.Name,
 		},
 	}
+	if probeRes != nil && probeRes.RuntimeTicks > 0 {
+		rt := probeRes.RuntimeTicks
+		rec.RuntimeTicks = &rt
+	}
 	applyMetadataToItem(rec, meta)
 
 	if err := s.repo.UpsertItem(ctx, rec); err != nil {
@@ -352,8 +434,8 @@ func (s *Scanner) indexEpisode(
 		return false, err
 	}
 
-	ms := s.buildMediaSource(rec, mediaPath, size, isStrm, container)
-	if err := s.repo.ReplaceMediaSourcesAndStreams(ctx, rec.ID, []sqlite.MediaSourceRecord{ms}); err != nil {
+	ms := s.buildMediaSource(rec, mediaPath, size, mtime, isStrm, container, probeRes)
+	if err := s.repo.UpsertMediaSourceAndStreams(ctx, rec.ID, ms); err != nil {
 		return false, err
 	}
 
@@ -386,6 +468,23 @@ func (s *Scanner) ensureSeries(ctx context.Context, lib *sqlite.LibraryRecord, e
 		Path:     epInfo.SeriesDir,
 		Language: s.language(),
 	})
+
+	// Cross-directory auto-merge for Series sharing the same TMDB/IMDB ID.
+	if meta != nil && len(meta.ProviderIDs) > 0 {
+		var matched *sqlite.ItemRecord
+		if tmdbID := getProviderID(meta.ProviderIDs, "Tmdb"); tmdbID != "" {
+			matched, _ = s.repo.FindItemByProviderID(ctx, lib.ID, "Series", "Tmdb", tmdbID)
+		}
+		if matched == nil {
+			if imdbID := getProviderID(meta.ProviderIDs, "Imdb"); imdbID != "" {
+				matched, _ = s.repo.FindItemByProviderID(ctx, lib.ID, "Series", "Imdb", imdbID)
+			}
+		}
+		if matched != nil {
+			cache[epInfo.SeriesDir] = matched
+			return matched, nil
+		}
+	}
 
 	rec := &sqlite.ItemRecord{
 		ID:        guid.New(),
@@ -427,6 +526,10 @@ func (s *Scanner) ensureSeason(ctx context.Context, lib *sqlite.LibraryRecord, s
 	key := fmt.Sprintf("%s#%d", series.ID, epInfo.SeasonNumber)
 	if rec, ok := cache[key]; ok {
 		return rec, nil
+	}
+	if existingByNum, err := s.repo.FindSeasonByNumber(ctx, series.ID, epInfo.SeasonNumber); err == nil && existingByNum != nil {
+		cache[key] = existingByNum
+		return existingByNum, nil
 	}
 	seasonPath := epInfo.SeasonDir
 	if seasonPath == "" {
@@ -479,68 +582,262 @@ func (s *Scanner) ensureSeason(ctx context.Context, lib *sqlite.LibraryRecord, s
 	return rec, nil
 }
 
-func (s *Scanner) buildMediaSource(item *sqlite.ItemRecord, mediaPath string, size int64, isStrm bool, container string) sqlite.MediaSourceRecord {
+func (s *Scanner) probeMedia(ctx context.Context, mediaPath string, isStrm bool) *ProbeResult {
+	// Never probe .strm files during scan to avoid triggering cloud-drive rate limits or bans.
+	if isStrm || s.prober == nil {
+		return nil
+	}
+	res, err := s.prober.Probe(ctx, mediaPath)
+	if err != nil || res == nil {
+		return nil
+	}
+	return res
+}
+
+func (s *Scanner) buildMediaSource(item *sqlite.ItemRecord, mediaPath string, size, mtime int64, isStrm bool, container string, probeRes *ProbeResult) sqlite.MediaSourceRecord {
 	msID := guid.New()
 	proto := "File"
 	if isStrm {
 		proto = "Http"
 	}
 
-	// Default synthetic Video & Audio streams (when ffprobe is not executed)
-	videoCodec := "h264"
-	if container == "webm" {
-		videoCodec = "vp9"
-	}
-	audioCodec := "aac"
-	if container == "mkv" {
-		audioCodec = "ac3"
+	var streams []sqlite.MediaStreamRecord
+	var bitrate int
+	var runtimeTicks int64
+
+	if probeRes != nil && len(probeRes.Streams) > 0 {
+		runtimeTicks = probeRes.RuntimeTicks
+		bitrate = probeRes.Bitrate
+		if size == 0 && probeRes.Size > 0 {
+			size = probeRes.Size
+		}
+		if container == "" && probeRes.Container != "" {
+			container = probeRes.Container
+		}
+		streams = make([]sqlite.MediaStreamRecord, 0, len(probeRes.Streams))
+		for i, ps := range probeRes.Streams {
+			streams = append(streams, sqlite.MediaStreamRecord{
+				MediaSourceID: msID,
+				ItemID:        item.ID,
+				StreamIndex:   i,
+				StreamType:    ps.StreamType,
+				Codec:         ps.Codec,
+				Language:      ps.Language,
+				SubVariant:    ps.SubVariant,
+				DisplayTitle:  ps.DisplayTitle,
+				Title:         ps.Title,
+				Width:         ps.Width,
+				Height:        ps.Height,
+				VideoRange:    ps.VideoRange,
+				AudioLayout:   ps.AudioLayout,
+				Channels:      ps.Channels,
+				SampleRate:    ps.SampleRate,
+				Bitrate:       ps.Bitrate,
+				IsDefault:     ps.IsDefault,
+				IsForced:      ps.IsForced,
+				IsExternal:    false,
+			})
+		}
+	} else {
+		// Default synthetic Video & Audio streams (when ffprobe is not executed or gracefully degraded)
+		videoCodec := "h264"
+		if container == "webm" {
+			videoCodec = "vp9"
+		}
+		audioCodec := "aac"
+		if container == "mkv" {
+			audioCodec = "ac3"
+		}
+
+		streams = []sqlite.MediaStreamRecord{
+			{
+				MediaSourceID: msID,
+				ItemID:        item.ID,
+				StreamIndex:   0,
+				StreamType:    "Video",
+				Codec:         videoCodec,
+				DisplayTitle:  strings.ToUpper(videoCodec),
+				Width:         1920,
+				Height:        1080,
+				VideoRange:    "SDR",
+				IsDefault:     true,
+			},
+			{
+				MediaSourceID: msID,
+				ItemID:        item.ID,
+				StreamIndex:   1,
+				StreamType:    "Audio",
+				Codec:         audioCodec,
+				Language:      "und",
+				DisplayTitle:  strings.ToUpper(audioCodec) + " Stereo",
+				Channels:      2,
+				SampleRate:    48000,
+				IsDefault:     true,
+			},
+		}
 	}
 
-	streams := []sqlite.MediaStreamRecord{
-		{
-			MediaSourceID: msID,
-			ItemID:        item.ID,
-			StreamIndex:   0,
-			StreamType:    "Video",
-			Codec:         videoCodec,
-			DisplayTitle:  strings.ToUpper(videoCodec),
-			Width:         1920,
-			Height:        1080,
-			VideoRange:    "SDR",
-			IsDefault:     true,
-		},
-		{
-			MediaSourceID: msID,
-			ItemID:        item.ID,
-			StreamIndex:   1,
-			StreamType:    "Audio",
-			Codec:         audioCodec,
-			Language:      "und",
-			DisplayTitle:  strings.ToUpper(audioCodec) + " Stereo",
-			Channels:      2,
-			SampleRate:    48000,
-			IsDefault:     true,
-		},
-	}
-
-	// Scan companion external subtitles in the same directory
+	// Scan companion external subtitles in the same directory; stream_index continues after embedded streams.
 	extSubs := discoverExternalSubtitles(mediaPath, msID, item.ID, len(streams))
 	streams = append(streams, extSubs...)
+
+	extraJSON := fmt.Sprintf(`{"file_mtime":%d}`, mtime)
 
 	return sqlite.MediaSourceRecord{
 		ID:                   msID,
 		ItemID:               item.ID,
-		Name:                 strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath)),
+		Name:                 buildVersionDisplayName(mediaPath, container, isStrm, probeRes),
 		Path:                 mediaPath,
 		Protocol:             proto,
 		Container:            container,
 		Size:                 size,
+		Bitrate:              bitrate,
+		RuntimeTicks:         runtimeTicks,
 		IsRemote:             isStrm,
 		SupportsDirectPlay:   true,
 		SupportsDirectStream: true,
 		SupportsTranscoding:  true,
+		ExtraJSON:            extraJSON,
 		Streams:              streams,
 	}
+}
+
+func (s *Scanner) isMediaSourceUnchanged(ctx context.Context, existing *sqlite.ItemRecord, mediaPath string, size, mtime int64) bool {
+	if existing.Path == mediaPath {
+		return existing.FileMtime != nil && *existing.FileMtime == mtime && existing.FileSize != nil && *existing.FileSize == size
+	}
+	sources, err := s.repo.GetMediaSourcesByItemID(ctx, existing.ID)
+	if err != nil {
+		return false
+	}
+	for _, src := range sources {
+		if src.Path != mediaPath {
+			continue
+		}
+		if src.Size != size {
+			return false
+		}
+		var meta struct {
+			FileMtime int64 `json:"file_mtime"`
+		}
+		if src.ExtraJSON != "" && json.Unmarshal([]byte(src.ExtraJSON), &meta) == nil && meta.FileMtime > 0 {
+			return meta.FileMtime == mtime
+		}
+		return true
+	}
+	return false
+}
+
+func getProviderID(ids map[string]string, key string) string {
+	if len(ids) == 0 {
+		return ""
+	}
+	if v := strings.TrimSpace(ids[key]); v != "" {
+		return v
+	}
+	for k, v := range ids {
+		if strings.EqualFold(k, key) {
+			if tv := strings.TrimSpace(v); tv != "" {
+				return tv
+			}
+		}
+	}
+	return ""
+}
+
+func buildVersionDisplayName(mediaPath, container string, isStrm bool, probeRes *ProbeResult) string {
+	stem := strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath))
+	lower := strings.ToLower(stem)
+
+	var resLabel, rangeLabel string
+	if probeRes != nil {
+		for _, st := range probeRes.Streams {
+			if !strings.EqualFold(st.StreamType, "Video") {
+				continue
+			}
+			switch {
+			case st.Height >= 2100:
+				resLabel = "2160p"
+			case st.Height >= 1000:
+				resLabel = "1080p"
+			case st.Height >= 700:
+				resLabel = "720p"
+			case st.Height >= 480:
+				resLabel = "480p"
+			}
+			vr := strings.ToUpper(strings.TrimSpace(st.VideoRange))
+			switch {
+			case strings.Contains(vr, "DOVI") || strings.Contains(vr, "DOLBY"):
+				rangeLabel = "DolbyVision"
+			case vr != "" && vr != "SDR":
+				rangeLabel = vr
+			}
+			break
+		}
+	}
+
+	if resLabel == "" {
+		switch {
+		case containsToken(lower, "2160p") || containsToken(lower, "4k") || containsToken(lower, "uhd"):
+			resLabel = "2160p"
+		case containsToken(lower, "1080p"):
+			resLabel = "1080p"
+		case containsToken(lower, "720p"):
+			resLabel = "720p"
+		case containsToken(lower, "480p"):
+			resLabel = "480p"
+		}
+	}
+
+	if rangeLabel == "" {
+		switch {
+		case containsToken(lower, "dv") || containsToken(lower, "dovi") || strings.Contains(lower, "dolbyvision") || strings.Contains(lower, "dolby.vision"):
+			rangeLabel = "DolbyVision"
+		case strings.Contains(lower, "hdr10+"):
+			rangeLabel = "HDR10+"
+		case containsToken(lower, "hdr10"):
+			rangeLabel = "HDR10"
+		case containsToken(lower, "hdr"):
+			rangeLabel = "HDR"
+		}
+	}
+
+	formatLabel := strings.ToUpper(container)
+	if isStrm {
+		formatLabel = "STRM"
+	}
+
+	var specParts []string
+	if resLabel != "" {
+		specParts = append(specParts, resLabel)
+	}
+	if rangeLabel != "" {
+		specParts = append(specParts, rangeLabel)
+	}
+
+	if len(specParts) > 0 {
+		label := strings.Join(specParts, " ")
+		if formatLabel != "" {
+			return label + " · " + formatLabel
+		}
+		return label
+	}
+
+	// Fallback to trailing " - <tag>" suffix (Emby/Jellyfin multi-version convention)
+	if idx := strings.LastIndex(stem, " - "); idx >= 0 {
+		tag := strings.TrimSpace(stem[idx+3:])
+		if tag != "" {
+			if formatLabel != "" {
+				return tag + " · " + formatLabel
+			}
+			return tag
+		}
+	}
+
+	if formatLabel != "" && stem != "" {
+		return stem + " · " + formatLabel
+	}
+	return stem
 }
 
 func discoverExternalSubtitles(mediaPath, mediaSourceID, itemID string, startIndex int) []sqlite.MediaStreamRecord {

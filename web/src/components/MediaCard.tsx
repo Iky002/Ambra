@@ -1,6 +1,7 @@
+import { useEffect, useState } from 'react'
 import { Check, Film, Play, Star } from 'lucide-react'
 import { Link, useNavigate } from 'react-router-dom'
-import { getImageUrl } from '../api/client'
+import { getFallbackImageUrl, getImageUrl } from '../api/client'
 import type { BaseItemDto } from '../api/types'
 
 interface MediaCardProps {
@@ -20,23 +21,35 @@ export function MediaCard({
   const isLandscape = variant === 'landscape'
 
   let imgUrl = ''
+  let fallbackUrl: string | null = null
   if (isLandscape) {
     if (item.BackdropImageTags?.length) {
       imgUrl = getImageUrl(item.Id, 'Backdrop', { maxWidth: 640, tag: item.BackdropImageTags[0] })
+      fallbackUrl = getFallbackImageUrl(item.Id, 'Backdrop')
     } else if (item.ImageTags?.Thumb) {
       imgUrl = getImageUrl(item.Id, 'Thumb', { maxWidth: 640, tag: item.ImageTags.Thumb })
+      fallbackUrl = getFallbackImageUrl(item.Id, 'Thumb')
     } else if (item.ImageTags?.Primary) {
       imgUrl = getImageUrl(item.Id, 'Primary', { maxWidth: 640, tag: item.ImageTags.Primary })
+      fallbackUrl = getFallbackImageUrl(item.Id, 'Primary')
     } else if (item.SeriesId) {
       imgUrl = getImageUrl(item.SeriesId, 'Backdrop', { maxWidth: 640 })
+      fallbackUrl = getFallbackImageUrl(item.SeriesId, 'Backdrop')
     }
   } else {
     if (item.ImageTags?.Primary) {
       imgUrl = getImageUrl(item.Id, 'Primary', { maxWidth: 420, tag: item.ImageTags.Primary })
+      fallbackUrl = getFallbackImageUrl(item.Id, 'Primary')
     } else if (item.SeriesId) {
       imgUrl = getImageUrl(item.SeriesId, 'Primary', { maxWidth: 420 })
+      fallbackUrl = getFallbackImageUrl(item.SeriesId, 'Primary')
     }
   }
+
+  const [imgFailed, setImgFailed] = useState(false)
+  useEffect(() => {
+    setImgFailed(false)
+  }, [imgUrl])
 
   const progress =
     item.UserData?.PlayedPercentage ??
@@ -63,11 +76,20 @@ export function MediaCard({
           isLandscape ? 'aspect-video' : 'aspect-[2/3]'
         }`}
       >
-        {imgUrl ? (
+        {imgUrl && !imgFailed ? (
           <img
             src={imgUrl}
             alt={item.Name}
             loading="lazy"
+            onError={(e) => {
+              const el = e.currentTarget
+              if (fallbackUrl && !el.dataset.fallbackApplied && el.src !== fallbackUrl) {
+                el.dataset.fallbackApplied = '1'
+                el.src = fallbackUrl
+                return
+              }
+              setImgFailed(true)
+            }}
             className="h-full w-full object-cover transition-transform duration-500 ease-out group-hover:scale-105"
           />
         ) : (

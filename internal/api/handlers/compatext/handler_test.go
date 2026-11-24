@@ -1,0 +1,477 @@
+package compatext
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/store/sqlite"
+)
+
+type routeSpec struct {
+	method string
+	path   string
+	admin  bool
+	body   string
+}
+
+// all59Routes lists all 59 missing Emby 4.10.2.0 routes across /LiveTv (42), /Sync (12), and /Notifications (5).
+var all59Routes = []routeSpec{
+	// /LiveTv - LiveStreamFiles (11)
+	{http.MethodGet, "/LiveTv/LiveStreamFiles/nonexistent-item-id/stream.mp4", false, ""},
+	{http.MethodGet, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/master.m3u8", false, ""},
+	{http.MethodHead, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/master.m3u8", false, ""},
+	{http.MethodGet, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/master_local.m3u8", false, ""},
+	{http.MethodHead, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/master_local.m3u8", false, ""},
+	{http.MethodGet, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/live.m3u8", false, ""},
+	{http.MethodHead, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/live.m3u8", false, ""},
+	{http.MethodGet, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/live_local.m3u8", false, ""},
+	{http.MethodHead, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/live_local.m3u8", false, ""},
+	{http.MethodGet, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/0", false, ""},
+	{http.MethodHead, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/0", false, ""},
+
+	// /LiveTv - LiveRecordings (7)
+	{http.MethodGet, "/LiveTv/LiveRecordings/nonexistent-item-id/stream", false, ""},
+	{http.MethodGet, "/LiveTv/LiveRecordings/nonexistent-item-id/hls/master.m3u8", false, ""},
+	{http.MethodHead, "/LiveTv/LiveRecordings/nonexistent-item-id/hls/master.m3u8", false, ""},
+	{http.MethodGet, "/LiveTv/LiveRecordings/nonexistent-item-id/hls/0", false, ""},
+	{http.MethodHead, "/LiveTv/LiveRecordings/nonexistent-item-id/hls/0", false, ""},
+	{http.MethodGet, "/LiveTv/LiveRecordings/nonexistent-item-id/hls/live.m3u8", false, ""},
+	{http.MethodHead, "/LiveTv/LiveRecordings/nonexistent-item-id/hls/live.m3u8", false, ""},
+
+	// /LiveTv - Service (24)
+	{http.MethodGet, "/LiveTv/AvailableRecordingOptions", false, ""},
+	{http.MethodGet, "/LiveTv/EPG", false, ""},
+	{http.MethodGet, "/LiveTv/Manage/Channels", true, ""},
+	{http.MethodPost, "/LiveTv/Manage/Channels/ch-1/Disabled", true, `{"Disabled":true}`},
+	{http.MethodPost, "/LiveTv/Manage/Channels/ch-1/SortIndex", true, `{"NewIndex":2}`},
+	{http.MethodGet, "/LiveTv/Folder", false, ""},
+	{http.MethodPost, "/LiveTv/Tuners/tuner-1/Reset", true, `{}`},
+	{http.MethodGet, "/LiveTv/ChannelTags", false, ""},
+	{http.MethodGet, "/LiveTv/ChannelTags/Prefixes", false, ""},
+	{http.MethodPost, "/LiveTv/Recordings/rec-1/Delete", true, `{}`},
+	{http.MethodPost, "/LiveTv/Timers/timer-1/Delete", false, `{}`},
+	{http.MethodPost, "/LiveTv/SeriesTimers/st-1/Delete", false, `{}`},
+	{http.MethodGet, "/LiveTv/TunerHosts", true, ""},
+	{http.MethodGet, "/LiveTv/TunerHosts/Default/m3u", true, ""},
+	{http.MethodPost, "/LiveTv/TunerHosts/Delete", true, `{"Id":"th-1"}`},
+	{http.MethodGet, "/LiveTv/ListingProviders/Default", false, ""},
+	{http.MethodGet, "/LiveTv/ListingProviders/Available", true, ""},
+	{http.MethodGet, "/LiveTv/ListingProviders", true, ""},
+	{http.MethodPost, "/LiveTv/ListingProviders/Delete", true, `{"Id":"lp-1"}`},
+	{http.MethodGet, "/LiveTv/ListingProviders/Lineups", true, ""},
+	{http.MethodGet, "/LiveTv/ChannelMappingOptions", true, ""},
+	{http.MethodPost, "/LiveTv/ChannelMappings", true, `{"ProviderId":"lp-1","TunerChannelId":"ch-1","ProviderChannelId":"epg-1"}`},
+	{http.MethodGet, "/LiveTv/Tuners/Discvover", false, ""},
+	{http.MethodGet, "/LiveTv/Tuners/Discover", false, ""},
+
+	// /Sync (12)
+	{http.MethodPost, "/Sync/Jobs/job-1/Delete", false, `{}`},
+	{http.MethodPost, "/Sync/item-1/Status", false, `{}`},
+	{http.MethodPost, "/Sync/JobItems/ji-1/MarkForRemoval", false, `{}`},
+	{http.MethodPost, "/Sync/JobItems/ji-1/UnmarkForRemoval", false, `{}`},
+	{http.MethodPost, "/Sync/JobItems/ji-1/Delete", false, `{}`},
+	{http.MethodPost, "/Sync/Items/Cancel", false, `{}`},
+	{http.MethodPost, "/Sync/target-1/Items/Delete", false, `{}`},
+	{http.MethodDelete, "/Sync/target-1/Items", false, ""},
+	{http.MethodHead, "/Sync/JobItems/ji-1/File", false, ""},
+	{http.MethodGet, "/Sync/JobItems/ji-1/File", false, ""},
+	{http.MethodGet, "/Sync/JobItems/ji-1/AdditionalFiles", false, ""},
+	{http.MethodPost, "/Sync/OfflineActions", false, `{}`},
+
+	// /Notifications (5)
+	{http.MethodGet, "/Notifications/Services/Configured", false, ""},
+	{http.MethodPost, "/Notifications/Services/Configured", false, `{"Name":"Webhook","Enabled":true}`},
+	{http.MethodGet, "/Notifications/Services/Defaults", false, ""},
+	{http.MethodPost, "/Notifications/Services/Test", false, `{}`},
+	{http.MethodDelete, "/Notifications/Services/Configured?Id=nonexistent", false, ""},
+}
+
+func makeAuthFuncs() AuthFuncs {
+	return AuthFuncs{
+		RequireAuth: func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("X-Test-Role") == "" {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				next.ServeHTTP(w, r)
+			})
+		},
+		RequireAdmin: func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				role := r.Header.Get("X-Test-Role")
+				if role == "" {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				if role != "admin" {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				next.ServeHTTP(w, r)
+			})
+		},
+		UserIDFromCtx: func(ctx context.Context) string {
+			return "user-ctx-1"
+		},
+	}
+}
+
+func TestAll59RoutesAndAuth(t *testing.T) {
+	if len(all59Routes) != 59 {
+		t.Fatalf("expected 59 routes, got %d", len(all59Routes))
+	}
+
+	h := New(nil, &config.Config{ServerID: "srv-1", DataDir: t.TempDir()})
+	router := h.BuildRouter(makeAuthFuncs())
+
+	for _, rt := range all59Routes {
+		// 1. Unauthenticated -> 401
+		req := httptest.NewRequest(rt.method, rt.path, strings.NewReader(rt.body))
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("%s %s without auth: got %d, want 401", rt.method, rt.path, w.Code)
+		}
+
+		// 2. Non-admin user -> 403 for admin routes, 2xx for auth routes
+		req = httptest.NewRequest(rt.method, rt.path, strings.NewReader(rt.body))
+		req.Header.Set("X-Test-Role", "user")
+		w = httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if rt.admin {
+			if w.Code != http.StatusForbidden {
+				t.Errorf("%s %s as user: got %d, want 403", rt.method, rt.path, w.Code)
+			}
+		} else {
+			if w.Code < 200 || w.Code >= 300 {
+				t.Errorf("%s %s as user: got %d, want 2xx (body=%q)", rt.method, rt.path, w.Code, w.Body.String())
+			}
+		}
+
+		// 3. Admin user -> 2xx for all routes
+		req = httptest.NewRequest(rt.method, rt.path, strings.NewReader(rt.body))
+		req.Header.Set("X-Test-Role", "admin")
+		w = httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code < 200 || w.Code >= 300 {
+			t.Errorf("%s %s as admin: got %d, want 2xx (body=%q)", rt.method, rt.path, w.Code, w.Body.String())
+		}
+		if rt.method == http.MethodHead && w.Body.Len() != 0 {
+			t.Errorf("%s %s HEAD returned non-empty body (%d bytes)", rt.method, rt.path, w.Body.Len())
+		}
+	}
+}
+
+func TestNilStoreAndNilAuthFallback(t *testing.T) {
+	h := New(nil, nil)
+	if h.serverID() != "" {
+		t.Fatalf("expected empty serverID with nil cfg, got %q", h.serverID())
+	}
+	router := h.BuildRouter(AuthFuncs{})
+
+	req := httptest.NewRequest(http.MethodGet, "/LiveTv/Folder", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 with passthrough auth, got %d", w.Code)
+	}
+
+	// Verify various container content types and .m4s / .vtt branches
+	for _, tc := range []struct {
+		path   string
+		wantCT string
+	}{
+		{"/LiveTv/LiveStreamFiles/s1/stream.mp4", "video/mp4"},
+		{"/LiveTv/LiveStreamFiles/s1/stream.ts", "video/mp2t"},
+		{"/LiveTv/LiveStreamFiles/s1/stream.mkv", "video/x-matroska"},
+		{"/LiveTv/LiveStreamFiles/s1/stream.webm", "video/webm"},
+		{"/LiveTv/LiveStreamFiles/s1/stream.m3u8", "application/vnd.apple.mpegurl"},
+		{"/LiveTv/LiveStreamFiles/s1/stream.bin", "application/octet-stream"},
+		{"/LiveTv/LiveStreamFiles/s1/hls/seg0.m4s", "video/iso.segment"},
+		{"/LiveTv/LiveStreamFiles/s1/hls/seg0.ts", "video/mp2t"},
+		{"/Sync/JobItems/ji1/AdditionalFiles?Name=sub.vtt", "text/vtt"},
+	} {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Header().Get("Content-Type"), tc.wantCT) {
+			t.Errorf("GET %s: code=%d ct=%q want ct containing %q", tc.path, rec.Code, rec.Header().Get("Content-Type"), tc.wantCT)
+		}
+	}
+}
+
+func TestSQLitePersistenceAndSharedState(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(tmpDir, "compatext.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+
+	cfg := &config.Config{ServerID: "srv-test", DataDir: tmpDir}
+	h := New(store, cfg)
+	router := h.BuildRouter(AuthFuncs{
+		UserIDFromCtx: func(ctx context.Context) string { return "u-1" },
+	})
+
+	// Create real temp media files for recording stream and sync file serving
+	recFile := filepath.Join(tmpDir, "rec1.ts")
+	if err := os.WriteFile(recFile, []byte("REC_STREAM_DATA"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	syncFile := filepath.Join(tmpDir, "sync1.mp4")
+	if err := os.WriteFile(syncFile, []byte("SYNC_FILE_DATA"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed shared livetv:state and sync:state in SQLite server_config
+	ctx := context.Background()
+	now := time.Now().UTC()
+	h.writeConfigJSON(ctx, liveTVConfigKey, sharedLiveTVState{
+		Channels: []liveTVChannel{
+			{Id: "ch-1", Name: "News HD", Number: "1", GroupTitle: "News"},
+			{Id: "ch-2", Name: "Sports HD", Number: "2", GroupTitle: "Sports"},
+			{Id: "ch-3", Name: "NoGroup", Number: "3", GroupTitle: ""},
+		},
+		Programs: []liveTVProgram{
+			{Id: "p-1", Name: "Evening News", ChannelId: "ch-1", StartDate: now, EndDate: now.Add(time.Hour)},
+			{Id: "p-2", Name: "Football", ChannelId: "ch-2", StartDate: now, EndDate: now.Add(time.Hour)},
+		},
+		Recordings: []liveTVRecording{
+			{Id: "rec-1", Name: "Rec 1", Path: recFile, Status: "Completed"},
+			{Id: "rec-2", Name: "Rec 2", Status: "Completed"},
+		},
+		Timers:       []json.RawMessage{json.RawMessage(`{"Id":"t-1"}`), json.RawMessage(`{"Id":"t-2"}`)},
+		SeriesTimers: []json.RawMessage{json.RawMessage(`{"Id":"st-1"}`), json.RawMessage(`{"Id":"st-2"}`)},
+		TunerHosts: []liveTVTunerHost{
+			{Id: "th-1", Type: "m3u", FriendlyName: "My M3U"},
+			{Id: "th-2", Type: "hdhomerun", FriendlyName: "HDHR"},
+		},
+		ListingProviders: []liveTVListingProvider{
+			{Id: "lp-1", Type: "xmltv", Path: "/epg.xml"},
+			{Id: "lp-2", Type: "schedulesdirect"},
+		},
+	})
+	h.writeConfigJSON(ctx, syncConfigKey, sharedSyncState{
+		Jobs: []sharedSyncJob{
+			{Id: "j-1", TargetId: "dev-1", Name: "Job 1", Status: "Queued"},
+			{Id: "j-2", TargetId: "dev-2", Name: "Job 2", Status: "Queued"},
+		},
+		JobItems: []sharedSyncJobItem{
+			{Id: "ji-1", JobId: "j-1", ItemId: "item-1", TargetId: "dev-1", Status: "Queued", OutputPath: syncFile},
+			{Id: "ji-2", JobId: "j-2", ItemId: "item-2", TargetId: "dev-2", Status: "Queued"},
+			{Id: "ji-3", JobId: "j-2", ItemId: "item-3", TargetId: "dev-2", Status: "Queued"},
+		},
+	})
+
+	// 1. LiveRecording stream reads real file
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/LiveTv/LiveRecordings/rec-1/stream", nil))
+	if w.Code != http.StatusOK || w.Body.String() != "REC_STREAM_DATA" {
+		t.Fatalf("recording stream: code=%d body=%q", w.Code, w.Body.String())
+	}
+
+	// 2. EPG filter by ChannelIds + pagination
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/LiveTv/EPG?ChannelIds=ch-1&StartIndex=-1&Limit=1", nil))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "Evening News") || strings.Contains(w.Body.String(), "Football") {
+		t.Fatalf("EPG filter failed: %d %s", w.Code, w.Body.String())
+	}
+
+	// 3. Channel management: disable ch-1 via query, sort index ch-2 via query & body
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/LiveTv/Manage/Channels/ch-1/Disabled?Disabled=true", nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("disable channel: %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/LiveTv/Manage/Channels/ch-2/SortIndex?SortIndex=0", nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("sortindex query: %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/LiveTv/Manage/Channels/ch-1/SortIndex", strings.NewReader(`{"SortIndex":5}`)))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("sortindex body: %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/LiveTv/Manage/Channels/ch-3/SortIndex?NewIndex=1", nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("sortindex NewIndex: %d", w.Code)
+	}
+
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/LiveTv/Manage/Channels?StartIndex=0&Limit=10", nil))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"Disabled":true`) {
+		t.Fatalf("manage channels: %d %s", w.Code, w.Body.String())
+	}
+
+	// 4. ChannelTags & Prefixes
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/LiveTv/ChannelTags", nil))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "News") || !strings.Contains(w.Body.String(), "Sports") {
+		t.Fatalf("channel tags: %d %s", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/LiveTv/ChannelTags/Prefixes", nil))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"Name":"N"`) {
+		t.Fatalf("channel tag prefixes: %d %s", w.Code, w.Body.String())
+	}
+
+	// 5. ChannelMappings create & update & read
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/LiveTv/ChannelMappings", strings.NewReader(`{"ProviderId":"lp-1","TunerChannelId":"ch-1","ProviderChannelId":"epg-1"}`)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("create mapping: %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/LiveTv/ChannelMappings", strings.NewReader(`{"ProviderId":"lp-1","TunerChannelId":"ch-1","ProviderChannelId":"epg-2"}`)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("update mapping: %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/LiveTv/ChannelMappingOptions?ProviderId=lp-1", nil))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "epg-2") {
+		t.Fatalf("mapping options: %d %s", w.Code, w.Body.String())
+	}
+
+	// 6. Delete Recording, Timer, SeriesTimer, TunerHost, ListingProvider
+	for _, p := range []string{
+		"/LiveTv/Recordings/rec-2/Delete",
+		"/LiveTv/Timers/t-1/Delete",
+		"/LiveTv/SeriesTimers/st-1/Delete",
+		"/LiveTv/TunerHosts/Delete?Id=th-2",
+		"/LiveTv/ListingProviders/Delete?Id=lp-2",
+	} {
+		w = httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, p, nil))
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("POST %s: %d", p, w.Code)
+		}
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/LiveTv/TunerHosts", nil))
+	if strings.Contains(w.Body.String(), "th-2") || !strings.Contains(w.Body.String(), "th-1") {
+		t.Fatalf("tuner hosts after delete: %s", w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/LiveTv/ListingProviders", nil))
+	if strings.Contains(w.Body.String(), "lp-2") || !strings.Contains(w.Body.String(), "lp-1") {
+		t.Fatalf("listing providers after delete: %s", w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/LiveTv/Tuners/Discover", nil))
+	if !strings.Contains(w.Body.String(), "th-1") {
+		t.Fatalf("discover tuners: %s", w.Body.String())
+	}
+
+	// 7. Sync shared state operations
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/Sync/item-1/Status", strings.NewReader(`{"TargetId":"dev-1"}`)))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"SyncJobItemId":"ji-1"`) {
+		t.Fatalf("sync status: %d %s", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/Sync/JobItems/ji-1/File", nil))
+	if w.Code != http.StatusOK || w.Body.String() != "SYNC_FILE_DATA" {
+		t.Fatalf("sync job item file: %d %q", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/Sync/JobItems/ji-1/MarkForRemoval", nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("mark removal: %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/Sync/JobItems/ji-1/UnmarkForRemoval", nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("unmark removal: %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/Sync/Items/Cancel", strings.NewReader(`{"TargetId":"dev-2","ItemIds":["item-2"]}`)))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("cancel sync items: %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/Sync/JobItems/ji-3/Delete", nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("delete sync job item: %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/Sync/Jobs/j-1/Delete", nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("delete sync job: %d", w.Code)
+	}
+
+	// OfflineActions: array and single object
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/Sync/OfflineActions", strings.NewReader(`[{"ItemId":"item-1","Type":"Played"}]`)))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("offline actions array: %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/Sync/OfflineActions", strings.NewReader(`{"ItemId":"item-2","Type":"Favorite"}`)))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("offline actions single: %d", w.Code)
+	}
+
+	// 8. Notifications CRUD + invalid payload + filter + reload persistence
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/Notifications/Services/Configured", strings.NewReader(`{invalid`)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on invalid json, got %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/Notifications/Services/Configured", strings.NewReader(`{"Enabled":true}`)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("create notification service: %d", w.Code)
+	}
+	var created NotificationServiceConfig
+	if err := json.NewDecoder(w.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Id == "" || created.UserId != "u-1" {
+		t.Fatalf("unexpected created notification: %+v", created)
+	}
+	// Update same ID
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/Notifications/Services/Configured",
+		strings.NewReader(`{"Id":"`+created.Id+`","Name":"Updated Webhook","Enabled":false}`)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("update notification service: %d", w.Code)
+	}
+	// Filter by another UserId -> empty
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/Notifications/Services/Configured?UserId=other-user", nil))
+	if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != "[]" {
+		t.Fatalf("expected empty list for other user, got %d %s", w.Code, w.Body.String())
+	}
+
+	// Reload handler from SQLite and verify persisted state survives restart
+	h2 := New(store, cfg)
+	router2 := h2.BuildRouter(AuthFuncs{})
+	w = httptest.NewRecorder()
+	router2.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/Notifications/Services/Configured?UserId=u-1", nil))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "Updated Webhook") {
+		t.Fatalf("reloaded notification state missing: %d %s", w.Code, w.Body.String())
+	}
+
+	// Delete configured notification
+	w = httptest.NewRecorder()
+	router2.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/Notifications/Services/Configured?Id="+created.Id, nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("delete notification service: %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	router2.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/Notifications/Services/Configured", nil))
+	if strings.Contains(w.Body.String(), created.Id) {
+		t.Fatalf("deleted notification still present: %s", w.Body.String())
+	}
+}

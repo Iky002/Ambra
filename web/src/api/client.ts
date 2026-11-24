@@ -1,3 +1,10 @@
+import { isDemoMode } from '../demo/demoMode'
+import {
+  demoFetch,
+  getDemoFallbackImageUrl,
+  getDemoImageUrl,
+  getDemoUserImageUrl,
+} from '../demo/mockServer'
 import type {
   ActivityLogEntry,
   ApiKeyInfo,
@@ -80,6 +87,12 @@ export async function embyFetch<T>(
   options: RequestInit = {},
   requireAuth = true,
 ): Promise<T> {
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`
+
+  if (isDemoMode()) {
+    return demoFetch<T>(normalizedPath, options, requireAuth)
+  }
+
   const auth = getStoredAuth()
   const headers = new Headers(options.headers || {})
 
@@ -96,7 +109,6 @@ export async function embyFetch<T>(
     throw new ApiError(401, '未登录或登录已过期')
   }
 
-  const normalizedPath = path.startsWith('/') ? path : `/${path}`
   const res = await fetch(normalizedPath, {
     ...options,
     headers,
@@ -126,6 +138,9 @@ export async function embyFetch<T>(
 
 export function resolveApiUrl(urlOrPath: string): string {
   if (!urlOrPath) return ''
+  if (/^(data|blob):/i.test(urlOrPath)) {
+    return urlOrPath
+  }
   const auth = getStoredAuth()
   const token = auth?.accessToken
   const hasProtocol = /^https?:\/\//i.test(urlOrPath)
@@ -148,6 +163,9 @@ export function getImageUrl(
   options?: { maxWidth?: number; maxHeight?: number; tag?: string; quality?: number },
 ): string {
   if (!itemId) return ''
+  if (isDemoMode()) {
+    return getDemoImageUrl(itemId, type)
+  }
   const params = new URLSearchParams()
   if (options?.maxWidth) params.set('maxWidth', String(options.maxWidth))
   if (options?.maxHeight) params.set('maxHeight', String(options.maxHeight))
@@ -158,7 +176,18 @@ export function getImageUrl(
   return `/emby/Items/${encodeURIComponent(itemId)}/Images/${type}?${params.toString()}`
 }
 
+export function getFallbackImageUrl(
+  itemId: string,
+  type: 'Primary' | 'Backdrop' | 'Thumb' | 'Logo' | 'Banner' = 'Primary',
+): string | null {
+  if (!itemId || !isDemoMode()) return null
+  return getDemoFallbackImageUrl(itemId, type)
+}
+
 export function getUserImageUrl(userId: string, tag?: string): string {
+  if (isDemoMode()) {
+    return getDemoUserImageUrl(userId)
+  }
   const params = new URLSearchParams({ maxWidth: '200', quality: '90' })
   if (tag) params.set('tag', tag)
   return `/emby/Users/${encodeURIComponent(userId)}/Images/Primary?${params.toString()}`

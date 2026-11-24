@@ -79,6 +79,18 @@ func TestServerLifecycleAndRoutes(t *testing.T) {
 		}
 	}
 
+	// Compat chi router delegation & fallback 404
+	rec = httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Auth/Providers", nil))
+	if rec.Code != http.StatusOK && rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected compat router match on /Auth/Providers, got %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/definitely-nonexistent-endpoint-xyz", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 on unknown endpoint, got %d", rec.Code)
+	}
+
 	// Trigger builtin RefreshLibrary task callback via scheduler
 	tasks := srv.Scheduler.List(true)
 	if len(tasks) == 0 {

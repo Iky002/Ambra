@@ -3,6 +3,9 @@ package streaming
 import (
 	"bytes"
 	"context"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -197,5 +200,102 @@ func TestStreamingHandlerExtraBranches(t *testing.T) {
 		if rec.Code != http.StatusInternalServerError {
 			t.Errorf("closed DB GET %s expected 500, got %d", path, rec.Code)
 		}
+	}
+}
+
+func TestStreamingHandlerImageResizeAnd304(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(tmp, "stream_img.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	repo := sqlite.NewLibraryRepo(store)
+	reg := plugins.NewRegistry()
+	cfg := config.Default(tmp)
+	engine := playback.New(repo, reg, cfg)
+	imgSvc := imaging.New(repo).WithCacheDir(filepath.Join(tmp, "imgcache"))
+
+	mux := http.NewServeMux()
+	h := New(repo, engine, imgSvc)
+	h.RegisterRoutes(mux, AuthFuncs{})
+
+	ctx := context.Background()
+	itemID := guid.New()
+	_ = repo.UpsertItem(ctx, &sqlite.ItemRecord{
+		ID: itemID, LibraryID: "lib1", Type: "Movie", Name: "Resize Movie",
+	})
+
+	// Generate a real 200x100 JPEG poster
+	img := image.NewNRGBA(image.Rect(0, 0, 200, 100))
+	for y := 0; y < 100; y++ {
+		for x := 0; x < 200; x++ {
+			img.SetNRGBA(x, y, color.NRGBA{R: uint8(x), G: uint8(y * 2), B: 100, A: 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 90}); err != nil {
+		t.Fatal(err)
+	}
+	posterPath := filepath.Join(tmp, "poster_real.jpg")
+	_ = os.WriteFile(posterPath, buf.Bytes(), 0o644)
+
+	_ = repo.ReplaceItemImages(ctx, itemID, []sqlite.ImageRecord{
+		{ItemID: itemID, ImageType: "Primary", ImageIndex: 0, Path: posterPath, Tag: "realtag"},
+	})
+
+	// 1. Dynamic resize via ?maxWidth=100&quality=75
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Primary?maxWidth=100&quality=75", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for resized image, got %d", rec.Code)
+	}
+	if rec.Header().Get("Content-Type") != "image/jpeg" {
+		t.Fatalf("expected image/jpeg, got %s", rec.Header().Get("Content-Type"))
+	}
+	etag := rec.Header().Get("ETag")
+	if !strings.HasPrefix(etag, `"realtag-`) {
+		t.Fatalf("expected strong ETag with resize hash, got %s", etag)
+	}
+	decoded, _, err := image.Decode(bytes.NewReader(rec.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("failed to decode resized response: %v", err)
+	}
+	if decoded.Bounds().Dx() != 100 || decoded.Bounds().Dy() != 50 {
+		t.Fatalf("expected 100x50 resized image, got %dx%d", decoded.Bounds().Dx(), decoded.Bounds().Dy())
+	}
+
+	// 2. If-None-Match with returned ETag -> 304 Not Modified
+	req304 := httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Primary?maxWidth=100&quality=75", nil)
+	req304.Header.Set("If-None-Match", etag)
+	rec304 := httptest.NewRecorder()
+	mux.ServeHTTP(rec304, req304)
+	if rec304.Code != http.StatusNotModified || rec304.Body.Len() != 0 {
+		t.Fatalf("expected 304 Not Modified, got code=%d len=%d", rec304.Code, rec304.Body.Len())
+	}
+
+	// 3. Fill center crop + PNG format -> 60x60 PNG with distinct ETag
+	recFill := httptest.NewRecorder()
+	mux.ServeHTTP(recFill, httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Primary?fillWidth=60&fillHeight=60&format=png", nil))
+	if recFill.Code != http.StatusOK || recFill.Header().Get("Content-Type") != "image/png" {
+		t.Fatalf("expected 200 image/png for fill crop, got code=%d ct=%s", recFill.Code, recFill.Header().Get("Content-Type"))
+	}
+	if recFill.Header().Get("ETag") == etag {
+		t.Fatalf("expected distinct ETag for different resize options")
+	}
+	decFill, _, err := image.Decode(bytes.NewReader(recFill.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("failed to decode fill png: %v", err)
+	}
+	if decFill.Bounds().Dx() != 60 || decFill.Bounds().Dy() != 60 {
+		t.Fatalf("expected 60x60 fill image, got %dx%d", decFill.Bounds().Dx(), decFill.Bounds().Dy())
+	}
+
+	// 4. Original image (no query params) -> passthrough bytes & original ETag
+	recOrig := httptest.NewRecorder()
+	mux.ServeHTTP(recOrig, httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Primary", nil))
+	if recOrig.Code != http.StatusOK || recOrig.Header().Get("ETag") != `"realtag"` || !bytes.Equal(recOrig.Body.Bytes(), buf.Bytes()) {
+		t.Fatalf("expected original passthrough image")
 	}
 }

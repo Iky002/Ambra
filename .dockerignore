@@ -1,0 +1,36 @@
+# Version control & OS metadata
+.git
+.gitignore
+.DS_Store
+Thumbs.db
+
+# IDE & editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build artifacts, runtime data & test outputs
+bin/
+dist/
+data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.out
+*.test
+coverage.*
+
+# Local web dependencies & build artifacts (rebuilt in Stage 1)
+web/node_modules/
+web/dist/*
+!web/dist/.gitkeep
+web/.vite/
+
+# Documentation & tests not required in container build
+docs/
+tests/
+README.md
+docker-compose.yml
+Makefile

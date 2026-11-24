@@ -5,6 +5,7 @@ import {
   Activity,
   AlertTriangle,
   ArrowLeft,
+  Cpu,
   Gauge,
   Loader2,
   Maximize,
@@ -13,13 +14,14 @@ import {
   Play,
   RotateCcw,
   RotateCw,
+  Settings,
   Subtitles,
   Volume2,
   VolumeX,
   X,
 } from 'lucide-react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { api, resolveApiUrl } from '../api/client'
+import { api, buildEmbyAuthHeader, getStoredAuth, resolveApiUrl } from '../api/client'
 import type { MediaSourceInfo, MediaStream } from '../api/types'
 import { AmbraLogo } from '../components/AmbraLogo'
 import { useAuth } from '../context/AuthContext'
@@ -33,8 +35,27 @@ import {
   parseVttOrSrt,
   type TextSubtitleCue,
 } from '../player/subtitleUtils'
+import {
+  canUseWasmRemux,
+  DEFAULT_WASM_MAX_BYTES,
+  formatBytes,
+  getPreferWasmRemux,
+  hasSharedArrayBufferSupport,
+  needsClientRemux,
+  setPreferWasmRemux,
+  WasmRemuxer,
+  WasmRemuxFallbackError,
+  type WasmRemuxStage,
+} from '../player/wasmRemuxer'
 
-type ActivePanel = 'none' | 'subtitle' | 'audio' | 'speed'
+type ActivePanel = 'none' | 'subtitle' | 'audio' | 'speed' | 'settings'
+type PlayMethodMode = 'DirectPlay' | 'Client WASM Remux' | 'Server HLS'
+
+interface WasmProgressState {
+  stage: WasmRemuxStage
+  percent: number
+  detail: string
+}
 
 export function PlayerPage() {
   const { id } = useParams<{ id: string }>()
@@ -58,6 +79,7 @@ export function PlayerPage() {
   const pgsCanvasRef = useRef<HTMLCanvasElement>(null)
 
   const hlsRef = useRef<Hls | null>(null)
+  const wasmRemuxerRef = useRef<WasmRemuxer | null>(null)
   const assRendererRef = useRef<AssJassubRenderer | null>(null)
   const pgsRendererRef = useRef<PgsCanvasRenderer | null>(null)
   const hideOsdTimerRef = useRef<number | null>(null)
@@ -81,9 +103,31 @@ export function PlayerPage() {
   const [showStats, setShowStats] = useState(false)
   const [playerError, setPlayerError] = useState<string | null>(null)
   const [subtitleError, setSubtitleError] = useState<string | null>(null)
-  const [playMethod, setPlayMethod] = useState<'DirectPlay' | 'DirectStream' | 'HLS Transcode'>(
-    'DirectPlay',
-  )
+  const [playMethod, setPlayMethod] = useState<PlayMethodMode>('DirectPlay')
+
+  // 客户端 WASM 解复用偏好与运行态
+  const [preferWasmRemux, setPreferWasmRemuxState] = useState<boolean>(() => getPreferWasmRemux())
+  const [forceServerHls, setForceServerHls] = useState(false)
+  const [wasmProgress, setWasmProgress] = useState<WasmProgressState | null>(null)
+  const [wasmFallbackNotice, setWasmFallbackNotice] = useState<string | null>(null)
+  const wasmSupported = useMemo(() => canUseWasmRemux(), [])
+  const sabSupported = useMemo(() => hasSharedArrayBufferSupport(), [])
+
+  const togglePreferWasmRemux = useCallback(() => {
+    setPreferWasmRemuxState((prev) => {
+      const next = !prev
+      setPreferWasmRemux(next)
+      setForceServerHls(false)
+      setWasmFallbackNotice(null)
+      return next
+    })
+  }, [])
+
+  // 切换视频或音轨时重置强制回退状态
+  useEffect(() => {
+    setForceServerHls(false)
+    setWasmFallbackNotice(null)
+  }, [id, selectedSourceId, audioIndex])
 
   // WebVTT / SRT 文本字幕状态
   const [textCues, setTextCues] = useState<TextSubtitleCue[]>([])
@@ -151,54 +195,142 @@ export function PlayerPage() {
     [audioStreams, audioIndex],
   )
 
-  // 计算视频流 URL（优先 DirectPlay，否则 HLS）
-  const streamDescriptor = useMemo(() => {
+  // 五级播放策略规划：
+  // 1) 原生兼容容器 (mp4/m4v/webm/mov) 且音轨原生兼容 -> DirectPlay
+  // 2) 非原生容器 (mkv/ts/avi/flv 等) 或 AC3/EAC3/DTS 音轨：
+  //    - 若开启客户端 WASM 解复用 + 浏览器支持 + 文件体积在安全阈值内 (<= 150MB) -> Client WASM Remux
+  //    - 否则 / 超时 / 超阈值 / 出错 -> 自动无感回退服务端 HLS (master.m3u8)
+  // 3) 字幕始终走客户端 JASSUB / PGS Canvas / WebVTT，绝不因字幕触发转码
+  const streamPlan = useMemo(() => {
     if (!activeSource || !id) return null
 
-    if (activeSource.SupportsDirectPlay !== false && activeSource.DirectStreamUrl) {
-      return {
-        url: resolveApiUrl(activeSource.DirectStreamUrl),
-        isHls: activeSource.DirectStreamUrl.includes('.m3u8'),
-        method: 'DirectPlay' as const,
-      }
-    }
-
-    if (activeSource.TranscodingUrl) {
-      return {
-        url: resolveApiUrl(activeSource.TranscodingUrl),
-        isHls: activeSource.TranscodingUrl.includes('.m3u8'),
-        method: 'HLS Transcode' as const,
-      }
-    }
-
-    // 标准 Emby DirectPlay 静态直连 URL 回退
-    const params = new URLSearchParams({
+    const staticParams = new URLSearchParams({
       Static: 'true',
       MediaSourceId: activeSource.Id,
     })
-    if (audioIndex !== undefined) params.set('AudioStreamIndex', String(audioIndex))
-    return {
-      url: resolveApiUrl(`/emby/Videos/${encodeURIComponent(id)}/stream?${params.toString()}`),
-      isHls: false,
-      method: 'DirectPlay' as const,
-    }
-  }, [activeSource, id, audioIndex])
+    if (audioIndex !== undefined) staticParams.set('AudioStreamIndex', String(audioIndex))
+    const staticDirectUrl = resolveApiUrl(
+      `/emby/Videos/${encodeURIComponent(id)}/stream?${staticParams.toString()}`,
+    )
 
-  // 挂载视频流 (Native DirectPlay / HLS.js)
+    const directUrl =
+      activeSource.DirectStreamUrl && !activeSource.DirectStreamUrl.includes('.m3u8')
+        ? resolveApiUrl(activeSource.DirectStreamUrl)
+        : staticDirectUrl
+
+    const hlsParams = new URLSearchParams({
+      MediaSourceId: activeSource.Id,
+    })
+    if (playbackInfo?.PlaySessionId) hlsParams.set('PlaySessionId', playbackInfo.PlaySessionId)
+    if (audioIndex !== undefined) hlsParams.set('AudioStreamIndex', String(audioIndex))
+    const fallbackMasterHlsUrl = resolveApiUrl(
+      `/emby/Videos/${encodeURIComponent(id)}/master.m3u8?${hlsParams.toString()}`,
+    )
+
+    const hlsUrl = activeSource.TranscodingUrl
+      ? resolveApiUrl(activeSource.TranscodingUrl)
+      : activeSource.DirectStreamUrl?.includes('.m3u8')
+        ? resolveApiUrl(activeSource.DirectStreamUrl)
+        : fallbackMasterHlsUrl
+
+    const requiresRemux = needsClientRemux(activeSource.Container, activeAudioStream?.Codec)
+    const sizeBytes = activeSource.Size
+    const withinWasmThreshold = sizeBytes === undefined || sizeBytes <= DEFAULT_WASM_MAX_BYTES
+
+    if (forceServerHls) {
+      return {
+        strategy: 'hls' as const,
+        directUrl,
+        hlsUrl,
+        requiresRemux,
+        skipReason: null as string | null,
+      }
+    }
+
+    // 1. 原生兼容容器 + 原生兼容音轨 -> DirectPlay
+    if (!requiresRemux && activeSource.SupportsDirectPlay !== false) {
+      return {
+        strategy: 'direct' as const,
+        directUrl,
+        hlsUrl,
+        requiresRemux,
+        skipReason: null as string | null,
+      }
+    }
+
+    // 2. 非原生容器 / 非原生音轨 -> 优先尝试客户端 WASM 解复用转封装
+    if (
+      requiresRemux &&
+      preferWasmRemux &&
+      canUseWasmRemux({ enabled: preferWasmRemux }) &&
+      withinWasmThreshold
+    ) {
+      return {
+        strategy: 'wasm' as const,
+        directUrl,
+        hlsUrl,
+        requiresRemux,
+        skipReason: null as string | null,
+      }
+    }
+
+    // 3. 回退服务端 HLS master.m3u8，并记录回退原因供统计面板展示
+    let skipReason: string | null = null
+    if (requiresRemux) {
+      if (!preferWasmRemux) {
+        skipReason = '已关闭客户端 WASM 解复用开关'
+      } else if (!canUseWasmRemux()) {
+        skipReason = '当前浏览器不支持 WebAssembly / Web Worker'
+      } else if (!withinWasmThreshold && sizeBytes !== undefined) {
+        skipReason = `文件体积 ${formatBytes(sizeBytes)} 超过 WASM 阈值 (${formatBytes(DEFAULT_WASM_MAX_BYTES)})`
+      }
+    }
+
+    return {
+      strategy: 'hls' as const,
+      directUrl,
+      hlsUrl,
+      requiresRemux,
+      skipReason,
+    }
+  }, [
+    activeSource,
+    id,
+    audioIndex,
+    playbackInfo?.PlaySessionId,
+    activeAudioStream?.Codec,
+    preferWasmRemux,
+    forceServerHls,
+  ])
+
+  // 挂载视频流 (DirectPlay / Client WASM Remux / Server HLS 自动降级)
   useEffect(() => {
     const video = videoRef.current
-    if (!video || !streamDescriptor) return
+    if (!video || !streamPlan) return
+
+    let cancelled = false
+    const abortController = new AbortController()
 
     setPlayerError(null)
     setBuffering(true)
-    setPlayMethod(streamDescriptor.method)
+    setWasmProgress(null)
+    if (streamPlan.skipReason) {
+      setWasmFallbackNotice(streamPlan.skipReason)
+    } else if (!forceServerHls) {
+      setWasmFallbackNotice(null)
+    }
 
     if (hlsRef.current) {
       hlsRef.current.destroy()
       hlsRef.current = null
     }
+    if (wasmRemuxerRef.current) {
+      wasmRemuxerRef.current.dispose()
+      wasmRemuxerRef.current = null
+    }
 
     const startPlayback = () => {
+      if (cancelled) return
       if (!initialSeekDoneRef.current && initialStartTicks > 0) {
         const startSec = initialStartTicks / 10_000_000
         if (Number.isFinite(startSec) && startSec > 0) {
@@ -211,39 +343,129 @@ export function PlayerPage() {
       })
     }
 
-    if (streamDescriptor.isHls) {
+    const mountServerHls = (url: string) => {
+      if (cancelled) return
+      setPlayMethod('Server HLS')
+      setWasmProgress(null)
+      setBuffering(true)
+
+      if (hlsRef.current) {
+        hlsRef.current.destroy()
+        hlsRef.current = null
+      }
+
       if (Hls.isSupported()) {
         const hls = new Hls({
           enableWorker: true,
           lowLatencyMode: false,
         })
         hlsRef.current = hls
-        hls.loadSource(streamDescriptor.url)
+        hls.loadSource(url)
         hls.attachMedia(video)
         hls.on(Hls.Events.MANIFEST_PARSED, startPlayback)
         hls.on(Hls.Events.ERROR, (_evt, data) => {
-          if (data.fatal) {
+          if (data.fatal && !cancelled) {
             setPlayerError(`HLS 播放错误: ${data.details}`)
           }
         })
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-        video.src = streamDescriptor.url
+        video.src = url
         video.addEventListener('loadedmetadata', startPlayback, { once: true })
       } else {
         setPlayerError('当前浏览器不支持 HLS 流播放')
       }
-    } else {
-      video.src = streamDescriptor.url
+    }
+
+    if (streamPlan.strategy === 'direct') {
+      setPlayMethod('DirectPlay')
+      video.src = streamPlan.directUrl
       video.addEventListener('loadedmetadata', startPlayback, { once: true })
+    } else if (streamPlan.strategy === 'hls') {
+      mountServerHls(streamPlan.hlsUrl)
+    } else {
+      // Client WASM Remux 路径：失败/超阈值/超时时自动无感回退服务端 HLS
+      setPlayMethod('Client WASM Remux')
+      setWasmProgress({
+        stage: 'fetch',
+        percent: 0,
+        detail: '正在准备客户端 WASM 零重编码转封装...',
+      })
+
+      const remuxer = new WasmRemuxer()
+      wasmRemuxerRef.current = remuxer
+
+      const storedAuth = getStoredAuth()
+      const authHeaders: Record<string, string> = {
+        'X-Emby-Authorization': buildEmbyAuthHeader(storedAuth?.accessToken),
+      }
+      if (storedAuth?.accessToken) {
+        authHeaders['X-Emby-Token'] = storedAuth.accessToken
+      }
+
+      void remuxer
+        .remuxToMP4(streamPlan.directUrl, authHeaders, {
+          maxBytes: DEFAULT_WASM_MAX_BYTES,
+          knownSizeBytes: activeSource?.Size,
+          container: activeSource?.Container,
+          signal: abortController.signal,
+          onProgress: (stage, percent, detail) => {
+            if (cancelled) return
+            setWasmProgress({
+              stage,
+              percent,
+              detail:
+                detail ||
+                (stage === 'fetch'
+                  ? `正在拉取媒体流 (${percent}%)...`
+                  : stage === 'init'
+                    ? '正在初始化 FFmpeg WASM 引擎...'
+                    : stage === 'remux'
+                      ? `视频零重编码转封装中 (${percent}%)...`
+                      : '转封装完成'),
+            })
+          },
+        })
+        .then((result) => {
+          if (cancelled) {
+            remuxer.revokeUrl(result.url)
+            return
+          }
+          setWasmProgress(null)
+          setPlayMethod('Client WASM Remux')
+          video.src = result.url
+          video.addEventListener('loadedmetadata', startPlayback, { once: true })
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return
+          const reasonMsg =
+            err instanceof WasmRemuxFallbackError
+              ? err.message
+              : err instanceof Error
+                ? err.message
+                : '客户端 WASM 转封装失败'
+          // 清理 WASM 内存后无感回退服务端 HLS master.m3u8
+          remuxer.dispose()
+          if (wasmRemuxerRef.current === remuxer) {
+            wasmRemuxerRef.current = null
+          }
+          setWasmFallbackNotice(`${reasonMsg}，已自动切换服务端 HLS`)
+          mountServerHls(streamPlan.hlsUrl)
+        })
     }
 
     return () => {
+      cancelled = true
+      abortController.abort()
       if (hlsRef.current) {
         hlsRef.current.destroy()
         hlsRef.current = null
       }
+      if (wasmRemuxerRef.current) {
+        wasmRemuxerRef.current.dispose()
+        wasmRemuxerRef.current = null
+      }
     }
-  }, [streamDescriptor, initialStartTicks])
+  }, [streamPlan, activeSource?.Size, activeSource?.Container, initialStartTicks, forceServerHls])
 
   // 构建外挂字幕直出 URL
   const resolveSubtitleUrl = useCallback(
@@ -368,7 +590,7 @@ export function PlayerPage() {
         VolumeLevel: Math.round(videoRef.current.volume * 100),
         AudioStreamIndex: audioIndex,
         SubtitleStreamIndex: subtitleIndex,
-        PlayMethod: playMethod === 'HLS Transcode' ? 'Transcode' : 'DirectPlay',
+        PlayMethod: playMethod === 'Server HLS' ? 'Transcode' : 'DirectPlay',
       }
       if (type === 'start') {
         void api.reportPlaying(full)
@@ -581,6 +803,16 @@ export function PlayerPage() {
           }
         }}
         onError={() => {
+          // 若当前为 DirectPlay 或 Client WASM Remux 解码失败，自动无感回退服务端 HLS
+          if (playMethod !== 'Server HLS' && !forceServerHls && streamPlan?.hlsUrl) {
+            setWasmFallbackNotice(
+              playMethod === 'Client WASM Remux'
+                ? '客户端转封装流解码异常，已自动回退服务端 HLS'
+                : '浏览器原生直连解码失败，已自动回退服务端 HLS',
+            )
+            setForceServerHls(true)
+            return
+          }
           setBuffering(false)
           setPlayerError('视频流解码或加载失败，请检查媒体格式或网络连接')
         }}
@@ -612,8 +844,66 @@ export function PlayerPage() {
         </div>
       )}
 
+      {/* 客户端 WASM 零重编码转封装品牌进度浮层 */}
+      {wasmProgress && !playerError && !infoError && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          className="absolute inset-0 z-15 flex items-center justify-center bg-black/55 px-4 backdrop-blur-sm"
+        >
+          <div className="w-full max-w-md rounded-2xl border border-amber-500/30 bg-zinc-950/90 p-6 shadow-2xl backdrop-blur-xl">
+            <div className="flex items-center gap-3.5">
+              <div className="relative flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-amber-500/15 ring-1 ring-amber-400/30">
+                <AmbraLogo size={30} className="animate-pulse" />
+                <Cpu className="absolute -bottom-1 -right-1 h-4 w-4 rounded-full bg-zinc-950 p-0.5 text-amber-400" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-sm font-semibold text-white">
+                    {wasmProgress.stage === 'fetch'
+                      ? '拉取媒体流'
+                      : wasmProgress.stage === 'init'
+                        ? '启动 WASM 解复用引擎'
+                        : wasmProgress.stage === 'remux'
+                          ? '客户端零重编码转封装'
+                          : '转封装完成'}
+                  </span>
+                  <span className="font-mono text-xs font-semibold text-amber-300">
+                    {wasmProgress.percent}%
+                  </span>
+                </div>
+                <p className="mt-0.5 truncate text-xs text-zinc-400">{wasmProgress.detail}</p>
+              </div>
+            </div>
+
+            <div className="mt-4 h-2 w-full overflow-hidden rounded-full bg-white/10">
+              <div
+                className="h-full rounded-full bg-gradient-to-r from-amber-500 via-orange-400 to-amber-300 transition-all duration-300"
+                style={{ width: `${Math.max(4, wasmProgress.percent)}%` }}
+              />
+            </div>
+
+            <div className="mt-3.5 flex items-center justify-between text-[11px] text-zinc-400">
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-400" />
+                视频直通 (-c:v copy) · 减少服务端负载
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  setWasmFallbackNotice('已手动切换至服务端 HLS')
+                  setForceServerHls(true)
+                }}
+                className="rounded-lg border border-white/15 bg-white/5 px-2.5 py-1 text-[11px] font-medium text-zinc-200 transition-colors hover:bg-white/15"
+              >
+                改用服务端 HLS
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 缓冲或初始化加载指示 */}
-      {(infoLoading || buffering) && !playerError && !infoError && (
+      {(infoLoading || buffering) && !wasmProgress && !playerError && !infoError && (
         <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
           <div className="flex flex-col items-center gap-3 rounded-2xl border border-amber-500/20 bg-black/70 px-6 py-5 shadow-2xl backdrop-blur-md">
             <div className="relative flex items-center justify-center">
@@ -647,11 +937,11 @@ export function PlayerPage() {
         </div>
       )}
 
-      {/* 播放统计浮层 (Stats for Nerds) */}
+      {/* 播放统计浮层 (Stats for Nerds, 快捷键 I) */}
       {showStats && (
         <div
           onClick={(e) => e.stopPropagation()}
-          className="absolute left-5 top-20 z-30 w-80 rounded-2xl border border-white/15 bg-black/80 p-4 text-xs text-zinc-200 shadow-2xl backdrop-blur-xl"
+          className="absolute left-5 top-20 z-30 w-88 rounded-2xl border border-white/15 bg-black/85 p-4 text-xs text-zinc-200 shadow-2xl backdrop-blur-xl"
         >
           <div className="mb-3 flex items-center justify-between border-b border-white/10 pb-2">
             <span className="flex items-center gap-1.5 font-semibold text-amber-400">
@@ -666,9 +956,32 @@ export function PlayerPage() {
               <X className="h-3.5 w-3.5" />
             </button>
           </div>
-          <dl className="space-y-1.5 font-mono text-[11px]">
-            <StatRow label="播放模式" value={playMethod} highlight />
+          <dl className="space-y-2 font-mono text-[11px]">
+            <div className="flex items-center justify-between gap-3">
+              <dt className="text-zinc-400">播放模式</dt>
+              <dd>
+                <PlayMethodBadge method={playMethod} />
+              </dd>
+            </div>
+            <StatRow
+              label="WASM 解复用"
+              value={
+                playMethod === 'Client WASM Remux'
+                  ? '已启用（单线程兼容）'
+                  : !wasmSupported
+                    ? '浏览器不支持'
+                    : !preferWasmRemux
+                      ? '已关闭'
+                      : wasmFallbackNotice
+                        ? '已自动降级'
+                        : '待命（当前直连）'
+              }
+              highlight={playMethod === 'Client WASM Remux'}
+            />
             <StatRow label="容器格式" value={(activeSource?.Container || '-').toUpperCase()} />
+            {activeSource?.Size !== undefined && activeSource.Size > 0 && (
+              <StatRow label="文件体积" value={formatBytes(activeSource.Size)} />
+            )}
             <StatRow
               label="视频编码"
               value={
@@ -694,6 +1007,11 @@ export function PlayerPage() {
               label="缓冲进度"
               value={`${formatSeconds(bufferedEnd)} / ${formatSeconds(duration)}`}
             />
+            {wasmFallbackNotice && (
+              <p className="rounded-lg border border-sky-400/20 bg-sky-500/10 px-2.5 py-1.5 font-sans text-[11px] leading-relaxed text-sky-200">
+                降级说明：{wasmFallbackNotice}
+              </p>
+            )}
             {subtitleError && (
               <p className="pt-1 text-[11px] text-rose-400">字幕异常: {subtitleError}</p>
             )}
@@ -723,9 +1041,7 @@ export function PlayerPage() {
               {item?.Name || '正在播放'}
             </h1>
             <div className="mt-0.5 flex items-center gap-2 text-[11px] text-zinc-300">
-              <span className="rounded bg-amber-500/25 px-1.5 py-0.5 font-medium text-amber-300">
-                {playMethod}
-              </span>
+              <PlayMethodBadge method={playMethod} />
               {activeSubtitleMeta.engine !== 'none' && (
                 <span className="rounded bg-white/10 px-1.5 py-0.5 text-zinc-200">
                   字幕: {activeSubtitleMeta.engineLabel}
@@ -1010,6 +1326,70 @@ export function PlayerPage() {
               )}
             </div>
 
+            {/* 播放器设置 */}
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setActivePanel((p) => (p === 'settings' ? 'none' : 'settings'))}
+                className={`rounded-xl p-2 transition-colors ${
+                  activePanel === 'settings'
+                    ? 'bg-amber-500 text-zinc-950'
+                    : 'bg-white/10 text-zinc-200 hover:bg-white/20'
+                }`}
+                title="播放器设置"
+              >
+                <Settings className="h-4 w-4" />
+              </button>
+
+              {activePanel === 'settings' && (
+                <div className="absolute bottom-12 right-0 z-30 w-80 overflow-hidden rounded-2xl border border-white/15 bg-zinc-950/95 p-3 shadow-2xl backdrop-blur-xl">
+                  <p className="mb-2 text-[11px] font-semibold text-zinc-400">播放内核设置</p>
+
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={preferWasmRemux}
+                    onClick={togglePreferWasmRemux}
+                    disabled={!wasmSupported}
+                    className="flex w-full items-start justify-between gap-3 rounded-xl bg-white/5 p-2.5 text-left transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <div className="min-w-0">
+                      <div className="text-xs font-medium text-zinc-100">
+                        优先客户端 WASM 解复用（减少服务端转码）
+                      </div>
+                      <p className="mt-1 text-[11px] leading-relaxed text-zinc-400">
+                        {wasmSupported
+                          ? `对 MKV / TS / AC3 等格式优先在浏览器零重编码转封装，超出 ${formatBytes(DEFAULT_WASM_MAX_BYTES)} 或异常时自动回退服务端 HLS。`
+                          : '当前浏览器不支持 WebAssembly 或 Web Worker。'}
+                      </p>
+                    </div>
+                    <span
+                      className={`mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full p-0.5 transition-colors ${
+                        preferWasmRemux && wasmSupported ? 'bg-amber-500' : 'bg-zinc-700'
+                      }`}
+                    >
+                      <span
+                        className={`h-4 w-4 rounded-full bg-white shadow transition-transform ${
+                          preferWasmRemux && wasmSupported ? 'translate-x-4' : 'translate-x-0'
+                        }`}
+                      />
+                    </span>
+                  </button>
+
+                  <div className="mt-2.5 flex items-center justify-between rounded-xl border border-white/8 bg-black/40 px-2.5 py-2 text-[11px] text-zinc-400">
+                    <span>运行环境</span>
+                    <span className="font-mono text-zinc-300">
+                      {!wasmSupported
+                        ? 'WASM 不可用'
+                        : sabSupported
+                          ? 'WASM 就绪 (COI)'
+                          : '单线程兼容 (HTTP 局域网)'}
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+
             {/* 全屏 */}
             <button
               type="button"
@@ -1023,6 +1403,24 @@ export function PlayerPage() {
         </div>
       </div>
     </div>
+  )
+}
+
+function PlayMethodBadge({ method }: { method: PlayMethodMode }) {
+  const styleClass =
+    method === 'DirectPlay'
+      ? 'border-emerald-400/35 bg-emerald-500/20 text-emerald-300'
+      : method === 'Client WASM Remux'
+        ? 'border-amber-400/40 bg-amber-500/20 text-amber-300'
+        : 'border-sky-400/35 bg-sky-500/20 text-sky-300'
+
+  return (
+    <span
+      className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 font-mono text-[11px] font-semibold ${styleClass}`}
+    >
+      {method === 'Client WASM Remux' && <Cpu className="h-3 w-3" />}
+      {method}
+    </span>
   )
 }
 

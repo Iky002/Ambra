@@ -1,5 +1,6 @@
 # Binaries & Go build/test artifacts
 /bin/
+/dist/
 *.exe
 *.exe~
 *.dll
@@ -20,6 +21,7 @@ coverage.*
 /web/node_modules/
 /web/dist/*
 !/web/dist/.gitkeep
+/web/dist-demo/
 /web/.vite/
 *.tsbuildinfo
 npm-debug.log*

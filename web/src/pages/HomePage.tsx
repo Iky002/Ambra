@@ -12,7 +12,7 @@ import {
   Tv,
 } from 'lucide-react'
 import { Link, useNavigate } from 'react-router-dom'
-import { api, getBackdropUrl, getImageUrl } from '../api/client'
+import { api, getBackdropUrl, getFallbackImageUrl, getImageUrl } from '../api/client'
 import type { BaseItemDto } from '../api/types'
 import { MediaCard } from '../components/MediaCard'
 import { useAuth } from '../context/AuthContext'
@@ -128,17 +128,38 @@ export function HomePage() {
 
   const activeHero: BaseItemDto | undefined = heroItems[heroIdx % Math.max(1, heroItems.length)]
   const heroBackdrop = activeHero ? getBackdropUrl(activeHero, 1920) : null
+  const heroFallbackBackdrop = activeHero
+    ? getFallbackImageUrl(activeHero.Id, 'Backdrop')
+    : null
+  const [heroImgFailed, setHeroImgFailed] = useState(false)
+
+  useEffect(() => {
+    setHeroImgFailed(false)
+  }, [activeHero?.Id, heroBackdrop])
 
   return (
     <div className="space-y-10">
       {/* 全宽轮播 Hero Banner */}
       {activeHero ? (
         <section className="relative h-[54vh] min-h-[380px] max-h-[560px] w-full overflow-hidden">
-          {heroBackdrop ? (
+          {heroBackdrop && !heroImgFailed ? (
             <img
               key={activeHero.Id}
               src={heroBackdrop}
               alt={activeHero.Name}
+              onError={(e) => {
+                const el = e.currentTarget
+                if (
+                  heroFallbackBackdrop &&
+                  !el.dataset.fallbackApplied &&
+                  el.src !== heroFallbackBackdrop
+                ) {
+                  el.dataset.fallbackApplied = '1'
+                  el.src = heroFallbackBackdrop
+                  return
+                }
+                setHeroImgFailed(true)
+              }}
               className="h-full w-full object-cover object-center transition-opacity duration-700"
             />
           ) : (

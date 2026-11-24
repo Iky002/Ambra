@@ -1,0 +1,5822 @@
+[
+  {
+    "Path": "/System/ActivityLog/Entries",
+    "Verbs": "GET",
+    "Summary": "Gets activity log entries",
+    "ServiceName": "ActivityLogService",
+    "Assembly": "Emby.ActivityLog",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Branding/Configuration",
+    "Verbs": "GET",
+    "Summary": "Gets branding configuration",
+    "ServiceName": "BrandingService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Branding/Css",
+    "Verbs": "GET",
+    "Summary": "Gets custom css",
+    "ServiceName": "BrandingService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Branding/Css.css",
+    "Verbs": "GET",
+    "Summary": "Gets custom css",
+    "ServiceName": "BrandingService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Channels",
+    "Verbs": "GET",
+    "Summary": "Gets available channels",
+    "ServiceName": "ChannelService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Channels/{Id}/Items",
+    "Verbs": "GET",
+    "Summary": "Gets channel items",
+    "ServiceName": "ChannelService",
+    "Assembly": "Emby.Api",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Channels/Items/Latest",
+    "Verbs": "GET",
+    "Summary": "Gets channel items",
+    "ServiceName": "ChannelService",
+    "Assembly": "Emby.Api",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/System/Configuration",
+    "Verbs": "GET",
+    "Summary": "Gets application configuration",
+    "ServiceName": "ConfigurationService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/System/Configuration",
+    "Verbs": "POST",
+    "Summary": "Updates application configuration",
+    "ServiceName": "ConfigurationService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/System/Configuration/Partial",
+    "Verbs": "POST",
+    "Summary": "Updates application configuration",
+    "ServiceName": "ConfigurationService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/System/Configuration/{Key}",
+    "Verbs": "GET",
+    "Summary": "Gets a named configuration",
+    "ServiceName": "ConfigurationService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/System/Configuration/{Key}",
+    "Verbs": "POST",
+    "Summary": "Updates named configuration",
+    "ServiceName": "ConfigurationService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/DisplayPreferences/{DisplayPreferencesId}",
+    "Verbs": "POST",
+    "Summary": "Updates a user's display preferences for an item",
+    "ServiceName": "DisplayPreferencesService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/DisplayPreferences/{Id}",
+    "Verbs": "GET",
+    "Summary": "Gets a user's display preferences for an item",
+    "ServiceName": "DisplayPreferencesService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/UserSettings/{UserId}",
+    "Verbs": "POST",
+    "Summary": "Updates a user's display preferences for an item",
+    "ServiceName": "DisplayPreferencesService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/UserSettings/{UserId}/Partial",
+    "Verbs": "POST",
+    "Summary": "Updates a user's display preferences for an item",
+    "ServiceName": "DisplayPreferencesService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/UserSettings/{UserId}",
+    "Verbs": "GET",
+    "Summary": "Gets user settings",
+    "ServiceName": "DisplayPreferencesService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Environment/DirectoryContents",
+    "Verbs": "GET",
+    "Summary": "Gets the contents of a given directory in the file system",
+    "ServiceName": "EnvironmentService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Environment/DirectoryContents",
+    "Verbs": "POST",
+    "Summary": "Gets the contents of a given directory in the file system",
+    "ServiceName": "EnvironmentService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Environment/ValidatePath",
+    "Verbs": "POST",
+    "Summary": "Gets the contents of a given directory in the file system",
+    "ServiceName": "EnvironmentService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Environment/NetworkShares",
+    "Verbs": "GET",
+    "Summary": "Gets shares from a network device",
+    "ServiceName": "EnvironmentService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Environment/Drives",
+    "Verbs": "GET",
+    "Summary": "Gets available drives from the server's file system",
+    "ServiceName": "EnvironmentService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Environment/NetworkDevices",
+    "Verbs": "GET",
+    "Summary": "Gets a list of devices on the network",
+    "ServiceName": "EnvironmentService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Environment/ParentPath",
+    "Verbs": "GET",
+    "Summary": "Gets the parent path of a given path",
+    "ServiceName": "EnvironmentService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Environment/DefaultDirectoryBrowser",
+    "Verbs": "GET",
+    "Summary": "Gets the parent path of a given path",
+    "ServiceName": "EnvironmentService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Features",
+    "Verbs": "GET",
+    "Summary": "Gets a list of installed features",
+    "ServiceName": "FeatureService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "admin"
+  },
+  {
+    "Path": "/Items/{Id}/ExternalIdInfos",
+    "Verbs": "GET",
+    "Summary": "Gets external id infos for an item",
+    "ServiceName": "ItemLookupService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Items/RemoteSearch/Movie",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "ItemLookupService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/RemoteSearch/Trailer",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "ItemLookupService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/RemoteSearch/MusicVideo",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "ItemLookupService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/RemoteSearch/Series",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "ItemLookupService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/RemoteSearch/Game",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "ItemLookupService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/RemoteSearch/BoxSet",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "ItemLookupService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/RemoteSearch/MusicArtist",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "ItemLookupService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/RemoteSearch/MusicAlbum",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "ItemLookupService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/RemoteSearch/Person",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "ItemLookupService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Items/RemoteSearch/Book",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "ItemLookupService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/RemoteSearch/Image",
+    "Verbs": "GET",
+    "Summary": "Gets a remote image",
+    "ServiceName": "ItemLookupService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Items/RemoteSearch/Apply/{Id}",
+    "Verbs": "POST",
+    "Summary": "Applies search criteria to an item and refreshes metadata",
+    "ServiceName": "ItemLookupService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Items/Metadata/Reset",
+    "Verbs": "POST",
+    "Summary": "Resets metadata for one or more items",
+    "ServiceName": "ItemLookupService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Items/{Id}/Refresh",
+    "Verbs": "POST",
+    "Summary": "Refreshes metadata for an item",
+    "ServiceName": "ItemRefreshService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{ItemId}",
+    "Verbs": "POST",
+    "Summary": "Updates an item",
+    "ServiceName": "ItemUpdateService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{ItemId}/MetadataEditor",
+    "Verbs": "GET",
+    "Summary": "Gets metadata editor info for an item",
+    "ServiceName": "ItemUpdateService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Localization/Cultures",
+    "Verbs": "GET",
+    "Summary": "Gets known cultures",
+    "ServiceName": "LocalizationService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Localization/Countries",
+    "Verbs": "GET",
+    "Summary": "Gets known countries",
+    "ServiceName": "LocalizationService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Localization/ParentalRatings",
+    "Verbs": "GET",
+    "Summary": "Gets known parental ratings",
+    "ServiceName": "LocalizationService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Localization/Options",
+    "Verbs": "GET",
+    "Summary": "Gets localization options",
+    "ServiceName": "LocalizationService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Packages/{Name}",
+    "Verbs": "GET",
+    "Summary": "Gets a package, by name or assembly guid",
+    "ServiceName": "PackageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Packages",
+    "Verbs": "GET",
+    "Summary": "Gets available packages",
+    "ServiceName": "PackageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Packages/Updates",
+    "Verbs": "GET",
+    "Summary": "Gets available package updates for currently installed packages",
+    "ServiceName": "PackageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Packages/Installed/{Name}",
+    "Verbs": "POST",
+    "Summary": "Installs a package",
+    "ServiceName": "PackageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Packages/Installing/{Id}",
+    "Verbs": "DELETE",
+    "Summary": "Cancels a package installation",
+    "ServiceName": "PackageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Packages/Installing/{Id}/Delete",
+    "Verbs": "POST",
+    "Summary": "Cancels a package installation",
+    "ServiceName": "PackageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Playlists",
+    "Verbs": "POST",
+    "Summary": "Creates a new playlist",
+    "ServiceName": "PlaylistService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Playlists/{Id}/Items",
+    "Verbs": "POST",
+    "Summary": "Adds items to a playlist",
+    "ServiceName": "PlaylistService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Playlists/{Id}/AddToPlaylistInfo",
+    "Verbs": "GET",
+    "Summary": "Gets add to playlist info",
+    "ServiceName": "PlaylistService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Playlists/{Id}/Items/{ItemId}/Move/{NewIndex}",
+    "Verbs": "POST",
+    "Summary": "Moves a playlist item",
+    "ServiceName": "PlaylistService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Playlists/{Id}/Items/Delete",
+    "Verbs": "POST",
+    "Summary": "Removes items from a playlist",
+    "ServiceName": "PlaylistService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Playlists/{Id}/Items",
+    "Verbs": "DELETE",
+    "Summary": "Removes items from a playlist",
+    "ServiceName": "PlaylistService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Playlists/{Id}/Items",
+    "Verbs": "GET",
+    "Summary": "Gets the original items of a playlist",
+    "ServiceName": "PlaylistService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Plugins",
+    "Verbs": "GET",
+    "Summary": "Gets a list of currently installed plugins",
+    "ServiceName": "PluginService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Plugins/{Id}/Thumb",
+    "Verbs": "GET",
+    "Summary": "Gets a plugin thumb image",
+    "ServiceName": "PluginService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Plugins/{Id}",
+    "Verbs": "DELETE",
+    "Summary": "Uninstalls a plugin",
+    "ServiceName": "PluginService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Plugins/{Id}/Delete",
+    "Verbs": "POST",
+    "Summary": "Uninstalls a plugin",
+    "ServiceName": "PluginService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Plugins/{Id}/Configuration",
+    "Verbs": "GET",
+    "Summary": "Gets a plugin's configuration",
+    "ServiceName": "PluginService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Plugins/{Id}/Configuration",
+    "Verbs": "POST",
+    "Summary": "Updates a plugin's configuration",
+    "ServiceName": "PluginService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Plugins/SecurityInfo",
+    "Verbs": "GET",
+    "Summary": "Gets plugin registration information",
+    "ServiceName": "PluginService",
+    "Assembly": "Emby.Api",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Plugins/SecurityInfo",
+    "Verbs": "POST",
+    "Summary": "Updates plugin registration information",
+    "ServiceName": "PluginService",
+    "Assembly": "Emby.Api",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Plugins/RegistrationRecords/{Name}",
+    "Verbs": "GET",
+    "Summary": "Gets registration status for a feature",
+    "ServiceName": "PluginService",
+    "Assembly": "Emby.Api",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Registrations/{Name}",
+    "Verbs": "GET",
+    "Summary": "Gets registration status for a feature",
+    "ServiceName": "PluginService",
+    "Assembly": "Emby.Api",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Appstore/Register",
+    "Verbs": "POST",
+    "Summary": "Registers an appstore sale",
+    "ServiceName": "PluginService",
+    "Assembly": "Emby.Api",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Startup/Complete",
+    "Verbs": "POST",
+    "Summary": "Reports that the startup wizard has been completed",
+    "ServiceName": "StartupWizardService",
+    "Assembly": "Emby.Api",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Startup/Configuration",
+    "Verbs": "GET",
+    "Summary": "Gets initial server configuration",
+    "ServiceName": "StartupWizardService",
+    "Assembly": "Emby.Api",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Startup/Configuration",
+    "Verbs": "POST",
+    "Summary": "Updates initial server configuration",
+    "ServiceName": "StartupWizardService",
+    "Assembly": "Emby.Api",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Startup/RemoteAccess",
+    "Verbs": "POST",
+    "Summary": "Updates initial server configuration",
+    "ServiceName": "StartupWizardService",
+    "Assembly": "Emby.Api",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Startup/User",
+    "Verbs": "GET",
+    "Summary": "Gets initial user info",
+    "ServiceName": "StartupWizardService",
+    "Assembly": "Emby.Api",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Startup/User",
+    "Verbs": "POST",
+    "Summary": "Updates initial user info",
+    "ServiceName": "StartupWizardService",
+    "Assembly": "Emby.Api",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Users/{UserId}/Suggestions",
+    "Verbs": "GET",
+    "Summary": "Gets items based on a query.",
+    "ServiceName": "SuggestionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Shows/NextUp",
+    "Verbs": "GET",
+    "Summary": "Gets a list of next up episodes",
+    "ServiceName": "TvShowsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Shows/Missing",
+    "Verbs": "GET",
+    "Summary": "Gets a list of missing episodes",
+    "ServiceName": "TvShowsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Shows/Upcoming",
+    "Verbs": "GET",
+    "Summary": "Gets a list of upcoming episodes",
+    "ServiceName": "TvShowsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Shows/{Id}/Episodes",
+    "Verbs": "GET",
+    "Summary": "Gets episodes for a tv season",
+    "ServiceName": "TvShowsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Shows/{Id}/Seasons",
+    "Verbs": "GET",
+    "Summary": "Gets seasons for a tv series",
+    "ServiceName": "TvShowsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users",
+    "Verbs": "GET",
+    "Summary": "Gets a list of users",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": "admin"
+  },
+  {
+    "Path": "/Users/Query",
+    "Verbs": "GET",
+    "Summary": "Gets a list of users",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "admin"
+  },
+  {
+    "Path": "/Users/Prefixes",
+    "Verbs": "GET",
+    "Summary": "Gets a list of users",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "admin"
+  },
+  {
+    "Path": "/Users/ItemAccess",
+    "Verbs": "GET",
+    "Summary": "Gets a list of users",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/CopyData",
+    "Verbs": "POST",
+    "Summary": "Copies data from one user to another",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Users/CopyDataOptions",
+    "Verbs": "GET",
+    "Summary": "Gets copy data options",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Users/Public",
+    "Verbs": "GET",
+    "Summary": "Gets a list of publicly visible users for display on a login screen.",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{Id}",
+    "Verbs": "GET",
+    "Summary": "Gets a user by Id",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{Id}",
+    "Verbs": "DELETE",
+    "Summary": "Deletes a user",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Users/{Id}/Delete",
+    "Verbs": "POST",
+    "Summary": "Deletes a user",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Users/{Id}/TrackSelections/{TrackType}",
+    "Verbs": "DELETE",
+    "Summary": "Clears audio or subtitle track selections for a user",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{Id}/TrackSelections/{TrackType}/Delete",
+    "Verbs": "POST",
+    "Summary": "Clears audio or subtitle track selections for a user",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{Id}/RecentlySearched",
+    "Verbs": "DELETE",
+    "Summary": "Clears recently searched",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{Id}/RecentlySearched/Delete",
+    "Verbs": "POST",
+    "Summary": "Clears recently searched",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{Id}/Authenticate",
+    "Verbs": "POST",
+    "Summary": "Authenticates a user",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/AuthenticateByName",
+    "Verbs": "POST",
+    "Summary": "Authenticates a user",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{Id}/Password",
+    "Verbs": "POST",
+    "Summary": "Updates a user's password",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{Id}",
+    "Verbs": "POST",
+    "Summary": "Updates a user",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{Id}/Policy",
+    "Verbs": "POST",
+    "Summary": "Updates a user policy",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "admin"
+  },
+  {
+    "Path": "/Users/{Id}/Configuration",
+    "Verbs": "POST",
+    "Summary": "Updates a user configuration",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{Id}/Configuration/Partial",
+    "Verbs": "POST",
+    "Summary": "Updates a user configuration",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/New",
+    "Verbs": "POST",
+    "Summary": "Creates a user",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Users/ForgotPassword",
+    "Verbs": "POST",
+    "Summary": "Initiates the forgot password process for a local user",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/ForgotPassword/Pin",
+    "Verbs": "POST",
+    "Summary": "Redeems a forgot password pin",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/TypedSettings/{Key}",
+    "Verbs": "GET",
+    "Summary": "Gets a typed user setting",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/TypedSettings/{Key}",
+    "Verbs": "POST",
+    "Summary": "Updates a typed user setting",
+    "ServiceName": "UserService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/AlternateSources",
+    "Verbs": "DELETE",
+    "Summary": "Removes alternate video sources.",
+    "ServiceName": "VideosService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Videos/{Id}/AlternateSources/Delete",
+    "Verbs": "POST",
+    "Summary": "Removes alternate video sources.",
+    "ServiceName": "VideosService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Videos/MergeVersions",
+    "Verbs": "POST",
+    "Summary": "Merges videos into a single record",
+    "ServiceName": "VideosService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Artists",
+    "Verbs": "GET",
+    "Summary": "Gets all artists from a given item, folder, or the entire library",
+    "ServiceName": "ArtistsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Artists/AlbumArtists",
+    "Verbs": "GET",
+    "Summary": "Gets all album artists from a given item, folder, or the entire library",
+    "ServiceName": "ArtistsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Artists/{Name}",
+    "Verbs": "GET",
+    "Summary": "Gets an artist, by name",
+    "ServiceName": "ArtistsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/HomeSections",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "ContentService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/HomeSections/Delete",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "ContentService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/HomeSections",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "ContentService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/HomeSections/Move",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "ContentService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/Sections/{SectionId}/Items",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "ContentService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/GameGenres",
+    "Verbs": "GET",
+    "Summary": "Gets all Game genres from a given item, folder, or the entire library",
+    "ServiceName": "GameGenresService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/GameGenres/{Name}",
+    "Verbs": "GET",
+    "Summary": "Gets a Game genre, by name",
+    "ServiceName": "GameGenresService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Genres",
+    "Verbs": "GET",
+    "Summary": "Gets all genres from a given item, folder, or the entire library",
+    "ServiceName": "GenresService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Genres/{Name}",
+    "Verbs": "GET",
+    "Summary": "Gets a genre, by name",
+    "ServiceName": "GenresService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items",
+    "Verbs": "GET",
+    "Summary": "Gets items based on a query.",
+    "ServiceName": "ItemsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/Items",
+    "Verbs": "GET",
+    "Summary": "Gets items based on a query.",
+    "ServiceName": "ItemsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/Items/Resume",
+    "Verbs": "GET",
+    "Summary": "Gets items based on a query.",
+    "ServiceName": "ItemsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/MusicGenres",
+    "Verbs": "GET",
+    "Summary": "Gets all music genres from a given item, folder, or the entire library",
+    "ServiceName": "MusicGenresService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/MusicGenres/{Name}",
+    "Verbs": "GET",
+    "Summary": "Gets a music genre, by name",
+    "ServiceName": "MusicGenresService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/OfficialRatings",
+    "Verbs": "GET",
+    "Summary": "Gets items based on a query.",
+    "ServiceName": "OfficialRatingService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Persons",
+    "Verbs": "GET",
+    "Summary": "Gets all persons from a given item, folder, or the entire library",
+    "ServiceName": "PersonsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Persons/{Id}/Credits",
+    "Verbs": "GET",
+    "Summary": "Gets credits for a person",
+    "ServiceName": "PersonsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Persons/{Name}",
+    "Verbs": "GET",
+    "Summary": "Gets a person, by name",
+    "ServiceName": "PersonsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Studios",
+    "Verbs": "GET",
+    "Summary": "Gets all studios from a given item, folder, or the entire library",
+    "ServiceName": "StudiosService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Studios/{Name}",
+    "Verbs": "GET",
+    "Summary": "Gets a studio, by name",
+    "ServiceName": "StudiosService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Tags",
+    "Verbs": "GET",
+    "Summary": "Gets items based on a query.",
+    "ServiceName": "TagService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/Tags/Add",
+    "Verbs": "POST",
+    "Summary": "Adds new tags to an item",
+    "ServiceName": "TagService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/Tags/Delete",
+    "Verbs": "POST",
+    "Summary": "Removes tags from an item",
+    "ServiceName": "TagService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Containers",
+    "Verbs": "GET",
+    "Summary": "Gets items based on a query.",
+    "ServiceName": "TagService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/ItemTypes",
+    "Verbs": "GET",
+    "Summary": "Gets items based on a query.",
+    "ServiceName": "TagService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/Prefixes",
+    "Verbs": "GET",
+    "Summary": "Gets items based on a query.",
+    "ServiceName": "TagService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Artists/Prefixes",
+    "Verbs": "GET",
+    "Summary": "Gets items based on a query.",
+    "ServiceName": "TagService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Years",
+    "Verbs": "GET",
+    "Summary": "Gets items based on a query.",
+    "ServiceName": "TagService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/AudioCodecs",
+    "Verbs": "GET",
+    "Summary": "Gets items based on a query.",
+    "ServiceName": "TagService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/AudioLayouts",
+    "Verbs": "GET",
+    "Summary": "Gets items based on a query.",
+    "ServiceName": "TagService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/StreamLanguages",
+    "Verbs": "GET",
+    "Summary": "Gets items based on a query.",
+    "ServiceName": "TagService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/ExtendedVideoTypes",
+    "Verbs": "GET",
+    "Summary": "Gets items based on a query.",
+    "ServiceName": "TagService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/VideoCodecs",
+    "Verbs": "GET",
+    "Summary": "Gets items based on a query.",
+    "ServiceName": "TagService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/SubtitleCodecs",
+    "Verbs": "GET",
+    "Summary": "Gets items based on a query.",
+    "ServiceName": "TagService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/Items/{Id}",
+    "Verbs": "GET",
+    "Summary": "Gets an item from a user's library",
+    "ServiceName": "UserLibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/Programs/{Id}",
+    "Verbs": "GET",
+    "Summary": "Gets a live tv program",
+    "ServiceName": "UserLibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/Items/Root",
+    "Verbs": "GET",
+    "Summary": "Gets the root folder from a user's library",
+    "ServiceName": "UserLibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/Items/{Id}/Intros",
+    "Verbs": "GET",
+    "Summary": "Gets intros to play before the main media item plays",
+    "ServiceName": "UserLibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/SearchedItems/",
+    "Verbs": "POST",
+    "Summary": "Marks an item as a favorite",
+    "ServiceName": "UserLibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/FavoriteItems/{Id}",
+    "Verbs": "POST",
+    "Summary": "Marks an item as a favorite",
+    "ServiceName": "UserLibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/FavoriteItems/{Id}",
+    "Verbs": "DELETE",
+    "Summary": "Unmarks an item as a favorite",
+    "ServiceName": "UserLibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/FavoriteItems/{Id}/Delete",
+    "Verbs": "POST",
+    "Summary": "Unmarks an item as a favorite",
+    "ServiceName": "UserLibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/Items/{Id}/Rating/Delete",
+    "Verbs": "POST",
+    "Summary": "Deletes a user's saved personal rating for an item",
+    "ServiceName": "UserLibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/Items/{Id}/Rating",
+    "Verbs": "DELETE",
+    "Summary": "Deletes a user's saved personal rating for an item",
+    "ServiceName": "UserLibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/Items/{Id}/Rating",
+    "Verbs": "POST",
+    "Summary": "Updates a user's rating for an item",
+    "ServiceName": "UserLibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/Items/{Id}/HideFromResume",
+    "Verbs": "POST",
+    "Summary": "Updates a user's hide from resume for an item",
+    "ServiceName": "UserLibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/Items/{Id}/LocalTrailers",
+    "Verbs": "GET",
+    "Summary": "Gets local trailers for an item",
+    "ServiceName": "UserLibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/Items/{Id}/SpecialFeatures",
+    "Verbs": "GET",
+    "Summary": "Gets special features for an item",
+    "ServiceName": "UserLibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/Items/Latest",
+    "Verbs": "GET",
+    "Summary": "Gets latest media",
+    "ServiceName": "UserLibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/AdditionalParts",
+    "Verbs": "GET",
+    "Summary": "Gets additional parts for a video.",
+    "ServiceName": "UserLibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/MakePublic",
+    "Verbs": "POST",
+    "Summary": "Makes an item public to all users",
+    "ServiceName": "UserLibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/MakePrivate",
+    "Verbs": "POST",
+    "Summary": "Makes an item private",
+    "ServiceName": "UserLibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/Access",
+    "Verbs": "POST",
+    "Summary": "Updates user item access",
+    "ServiceName": "UserLibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/Shared/Leave",
+    "Verbs": "POST",
+    "Summary": "Leaves a shared item",
+    "ServiceName": "UserLibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/Views",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "UserViewsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/GroupingOptions",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "UserViewsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/System/Info",
+    "Verbs": "GET",
+    "Summary": "Gets information about the server",
+    "ServiceName": "SystemService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/System/Info/Public",
+    "Verbs": "GET",
+    "Summary": "Gets public information about the server",
+    "ServiceName": "SystemService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/System/Ping",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "SystemService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/System/Ping",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "SystemService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/System/Ping",
+    "Verbs": "HEAD",
+    "Summary": "",
+    "ServiceName": "SystemService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/System/Restart",
+    "Verbs": "POST",
+    "Summary": "Restarts the application, if needed",
+    "ServiceName": "SystemService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/System/Shutdown",
+    "Verbs": "POST",
+    "Summary": "Shuts down the application",
+    "ServiceName": "SystemService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/System/Logs",
+    "Verbs": "GET",
+    "Summary": "Gets a list of available server log files",
+    "ServiceName": "SystemService",
+    "Assembly": "Emby.Api",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/System/Logs/Query",
+    "Verbs": "GET",
+    "Summary": "Gets a list of available server log files",
+    "ServiceName": "SystemService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/System/Endpoint",
+    "Verbs": "GET",
+    "Summary": "Gets information about the request endpoint",
+    "ServiceName": "SystemService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/System/Logs/Log",
+    "Verbs": "GET",
+    "Summary": "Gets a log file",
+    "ServiceName": "SystemService",
+    "Assembly": "Emby.Api",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/System/Logs/{Name}",
+    "Verbs": "GET",
+    "Summary": "Gets a log file",
+    "ServiceName": "SystemService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/System/Logs/{Name}/Lines",
+    "Verbs": "GET",
+    "Summary": "Gets a log file",
+    "ServiceName": "SystemService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/System/WakeOnLanInfo",
+    "Verbs": "GET",
+    "Summary": "Gets wake on lan information",
+    "ServiceName": "SystemService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/System/ReleaseNotes/Versions",
+    "Verbs": "GET",
+    "Summary": "Gets release notes",
+    "ServiceName": "SystemService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/System/ReleaseNotes",
+    "Verbs": "GET",
+    "Summary": "Gets release notes",
+    "ServiceName": "SystemService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/Subtitles/{Index}",
+    "Verbs": "DELETE",
+    "Summary": "Deletes an external subtitle file",
+    "ServiceName": "SubtitleService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "ManageSubtitles"
+  },
+  {
+    "Path": "/Items/{Id}/Subtitles/{Index}",
+    "Verbs": "DELETE",
+    "Summary": "Deletes an external subtitle file",
+    "ServiceName": "SubtitleService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "ManageSubtitles"
+  },
+  {
+    "Path": "/Videos/{Id}/Subtitles/{Index}/Delete",
+    "Verbs": "POST",
+    "Summary": "Deletes an external subtitle file",
+    "ServiceName": "SubtitleService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "ManageSubtitles"
+  },
+  {
+    "Path": "/Items/{Id}/Subtitles/{Index}/Delete",
+    "Verbs": "POST",
+    "Summary": "Deletes an external subtitle file",
+    "ServiceName": "SubtitleService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "ManageSubtitles"
+  },
+  {
+    "Path": "/Items/{Id}/RemoteSearch/Subtitles/{Language}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "SubtitleService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/RemoteSearch/Subtitles/{SubtitleId}",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "SubtitleService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "DownloadSubtitles"
+  },
+  {
+    "Path": "/Providers/Subtitles/Subtitles/{Id}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "SubtitleService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/{MediaSourceId}/Subtitles/{Index}/Stream.{Format}",
+    "Verbs": "GET",
+    "Summary": "Gets subtitles in a specified format.",
+    "ServiceName": "SubtitleService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/{MediaSourceId}/Subtitles/{Index}/{StartPositionTicks}/Stream.{Format}",
+    "Verbs": "GET",
+    "Summary": "Gets subtitles in a specified format.",
+    "ServiceName": "SubtitleService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/{MediaSourceId}/Subtitles/{Index}/Stream.{Format}",
+    "Verbs": "GET",
+    "Summary": "Gets subtitles in a specified format.",
+    "ServiceName": "SubtitleService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/{MediaSourceId}/Subtitles/{Index}/{StartPositionTicks}/Stream.{Format}",
+    "Verbs": "GET",
+    "Summary": "Gets subtitles in a specified format.",
+    "ServiceName": "SubtitleService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/{MediaSourceId}/Subtitles/{Index}/Stream.{Format}",
+    "Verbs": "HEAD",
+    "Summary": "Gets subtitles in a specified format.",
+    "ServiceName": "SubtitleService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/{MediaSourceId}/Subtitles/{Index}/{StartPositionTicks}/Stream.{Format}",
+    "Verbs": "HEAD",
+    "Summary": "Gets subtitles in a specified format.",
+    "ServiceName": "SubtitleService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/{MediaSourceId}/Subtitles/{Index}/Stream.{Format}",
+    "Verbs": "HEAD",
+    "Summary": "Gets subtitles in a specified format.",
+    "ServiceName": "SubtitleService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/{MediaSourceId}/Subtitles/{Index}/{StartPositionTicks}/Stream.{Format}",
+    "Verbs": "HEAD",
+    "Summary": "Gets subtitles in a specified format.",
+    "ServiceName": "SubtitleService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/{MediaSourceId}/Attachments/{Index}/Stream",
+    "Verbs": "GET",
+    "Summary": "Gets subtitles in a specified format.",
+    "ServiceName": "SubtitleService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Parties",
+    "Verbs": "GET",
+    "Summary": "Gets a list of active parties",
+    "ServiceName": "PartyService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Parties/Leave",
+    "Verbs": "POST",
+    "Summary": "Leaves a party",
+    "ServiceName": "PartyService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Parties/{Id}/Join",
+    "Verbs": "POST",
+    "Summary": "Joins a party",
+    "ServiceName": "PartyService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Parties",
+    "Verbs": "POST",
+    "Summary": "Creates a party",
+    "ServiceName": "PartyService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Parties/Info",
+    "Verbs": "GET",
+    "Summary": "Gets info about the session's current party",
+    "ServiceName": "PartyService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Parties/Messages",
+    "Verbs": "GET",
+    "Summary": "Gets party messages",
+    "ServiceName": "PartyService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Parties/Messages",
+    "Verbs": "POST",
+    "Summary": "Posts a message to the party",
+    "ServiceName": "PartyService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sessions",
+    "Verbs": "GET",
+    "Summary": "Gets a list of sessions",
+    "ServiceName": "SessionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sessions/PlayQueue",
+    "Verbs": "GET",
+    "Summary": "Gets a the current play queue from a session",
+    "ServiceName": "SessionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sessions/{Id}/Viewing",
+    "Verbs": "POST",
+    "Summary": "Instructs a session to browse to an item or view",
+    "ServiceName": "SessionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sessions/{Id}/Playing",
+    "Verbs": "POST",
+    "Summary": "Instructs a session to play an item",
+    "ServiceName": "SessionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sessions/{Id}/Playing/{Command}",
+    "Verbs": "POST",
+    "Summary": "Issues a playstate command to a client",
+    "ServiceName": "SessionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sessions/{Id}/System/{Command}",
+    "Verbs": "POST",
+    "Summary": "Issues a system command to a client",
+    "ServiceName": "SessionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sessions/{Id}/Command/{Command}",
+    "Verbs": "POST",
+    "Summary": "Issues a system command to a client",
+    "ServiceName": "SessionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sessions/{Id}/Command",
+    "Verbs": "POST",
+    "Summary": "Issues a system command to a client",
+    "ServiceName": "SessionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sessions/{Id}/Message",
+    "Verbs": "POST",
+    "Summary": "Issues a command to a client to display a message to the user",
+    "ServiceName": "SessionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sessions/{Id}/Users/{UserId}",
+    "Verbs": "POST",
+    "Summary": "Adds an additional user to a session",
+    "ServiceName": "SessionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sessions/{Id}/Users/{UserId}",
+    "Verbs": "DELETE",
+    "Summary": "Removes an additional user from a session",
+    "ServiceName": "SessionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sessions/{Id}/Users/{UserId}/Delete",
+    "Verbs": "POST",
+    "Summary": "Removes an additional user from a session",
+    "ServiceName": "SessionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sessions/Capabilities",
+    "Verbs": "POST",
+    "Summary": "Updates capabilities for a device",
+    "ServiceName": "SessionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sessions/Capabilities/Full",
+    "Verbs": "POST",
+    "Summary": "Updates capabilities for a device",
+    "ServiceName": "SessionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sessions/Logout",
+    "Verbs": "POST",
+    "Summary": "Reports that a session has ended",
+    "ServiceName": "SessionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Auth/Keys",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "SessionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Auth/Providers",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "SessionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Auth/Keys/{Key}",
+    "Verbs": "DELETE",
+    "Summary": "",
+    "ServiceName": "SessionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Auth/Keys/{Key}/Delete",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "SessionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Auth/Keys",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "SessionsService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/ScheduledTasks/{Id}",
+    "Verbs": "GET",
+    "Summary": "Gets a scheduled task, by Id",
+    "ServiceName": "ScheduledTaskService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/ScheduledTasks",
+    "Verbs": "GET",
+    "Summary": "Gets scheduled tasks",
+    "ServiceName": "ScheduledTaskService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/ScheduledTasks/Running/{Id}",
+    "Verbs": "POST",
+    "Summary": "Starts a scheduled task",
+    "ServiceName": "ScheduledTaskService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/ScheduledTasks/Running/{Id}",
+    "Verbs": "DELETE",
+    "Summary": "Stops a scheduled task",
+    "ServiceName": "ScheduledTaskService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/ScheduledTasks/Running/{Id}/Delete",
+    "Verbs": "POST",
+    "Summary": "Stops a scheduled task",
+    "ServiceName": "ScheduledTaskService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/ScheduledTasks/{Id}/Triggers",
+    "Verbs": "POST",
+    "Summary": "Updates the triggers for a scheduled task",
+    "ServiceName": "ScheduledTaskService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Search/Hints",
+    "Verbs": "GET",
+    "Summary": "Gets search hints based on a search term",
+    "ServiceName": "SearchService",
+    "Assembly": "Emby.Api",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/MusicGenres/{Name}/InstantMix",
+    "Verbs": "GET",
+    "Summary": "Creates an instant playlist based on a music genre",
+    "ServiceName": "InstantMixService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Songs/{Id}/InstantMix",
+    "Verbs": "GET",
+    "Summary": "Creates an instant playlist based on a given song",
+    "ServiceName": "InstantMixService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Artists/InstantMix",
+    "Verbs": "GET",
+    "Summary": "Creates an instant playlist based on a given artist",
+    "ServiceName": "InstantMixService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Albums/{Id}/InstantMix",
+    "Verbs": "GET",
+    "Summary": "Creates an instant playlist based on a given album",
+    "ServiceName": "InstantMixService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/MusicGenres/InstantMix",
+    "Verbs": "GET",
+    "Summary": "Creates an instant playlist based on a music genre",
+    "ServiceName": "InstantMixService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Playlists/{Id}/InstantMix",
+    "Verbs": "GET",
+    "Summary": "Creates an instant playlist based on a given playlist",
+    "ServiceName": "InstantMixService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/InstantMix",
+    "Verbs": "GET",
+    "Summary": "Creates an instant playlist based on a given item",
+    "ServiceName": "InstantMixService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/AudioBooks/NextUp",
+    "Verbs": "GET",
+    "Summary": "Gets a list of next up episodes",
+    "ServiceName": "InstantMixService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Collections",
+    "Verbs": "POST",
+    "Summary": "Creates a new collection",
+    "ServiceName": "CollectionService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Collections/{Id}/Missing",
+    "Verbs": "GET",
+    "Summary": "Gets a list of missing items",
+    "ServiceName": "CollectionService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Collections/{Id}/ProviderItems",
+    "Verbs": "GET",
+    "Summary": "Gets a list of missing items",
+    "ServiceName": "CollectionService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Collections/{Id}/Items",
+    "Verbs": "POST",
+    "Summary": "Adds items to a collection",
+    "ServiceName": "CollectionService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Collections/{Id}/Items/Delete",
+    "Verbs": "POST",
+    "Summary": "Removes items from a collection",
+    "ServiceName": "CollectionService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Collections/{Id}/Items",
+    "Verbs": "DELETE",
+    "Summary": "Removes items from a collection",
+    "ServiceName": "CollectionService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Movies/Recommendations",
+    "Verbs": "GET",
+    "Summary": "Gets movie recommendations",
+    "ServiceName": "MoviesService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Trailers",
+    "Verbs": "GET",
+    "Summary": "Finds movies and trailers similar to a given trailer.",
+    "ServiceName": "TrailersService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/CriticReviews",
+    "Verbs": "GET",
+    "Summary": "Gets critic reviews for an item",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/ThemeSongs",
+    "Verbs": "GET",
+    "Summary": "Gets theme songs for an item",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/ThemeVideos",
+    "Verbs": "GET",
+    "Summary": "Gets theme videos for an item",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/ThemeMedia",
+    "Verbs": "GET",
+    "Summary": "Gets theme videos and songs for an item",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/Intros",
+    "Verbs": "GET",
+    "Summary": "Gets info to debug intros",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Library/Refresh",
+    "Verbs": "POST",
+    "Summary": "Starts a library scan",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Items/{Id}/Delete",
+    "Verbs": "POST",
+    "Summary": "Deletes an item from the library and file system",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}",
+    "Verbs": "DELETE",
+    "Summary": "Deletes an item from the library and file system",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/Delete",
+    "Verbs": "POST",
+    "Summary": "Deletes an item from the library and file system",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items",
+    "Verbs": "DELETE",
+    "Summary": "Deletes an item from the library and file system",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/Counts",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/Ancestors",
+    "Verbs": "GET",
+    "Summary": "Gets all parents of an item",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Library/PhysicalPaths",
+    "Verbs": "GET",
+    "Summary": "Gets a list of physical paths from virtual folders",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Library/SelectableMediaFolders",
+    "Verbs": "GET",
+    "Summary": "Gets all user media folders.",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Library/MediaFolders",
+    "Verbs": "GET",
+    "Summary": "Gets all user media folders.",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Library/Series/Added",
+    "Verbs": "POST",
+    "Summary": "Deprecated. Use /Library/Media/Updated",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Library/Series/Updated",
+    "Verbs": "POST",
+    "Summary": "Deprecated. Use /Library/Media/Updated",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Library/Movies/Added",
+    "Verbs": "POST",
+    "Summary": "Deprecated. Use /Library/Media/Updated",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Library/Movies/Updated",
+    "Verbs": "POST",
+    "Summary": "Deprecated. Use /Library/Media/Updated",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Library/Media/Updated",
+    "Verbs": "POST",
+    "Summary": "Reports that new movies have been added by an external source",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/Download",
+    "Verbs": "GET",
+    "Summary": "Downloads item media",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "download"
+  },
+  {
+    "Path": "/Items/{Id}/File",
+    "Verbs": "GET",
+    "Summary": "Gets the original file of an item",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Games/{Id}/Similar",
+    "Verbs": "GET",
+    "Summary": "Finds games similar to a given game.",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Artists/{Id}/Similar",
+    "Verbs": "GET",
+    "Summary": "Finds albums similar to a given album.",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/Similar",
+    "Verbs": "GET",
+    "Summary": "Gets similar items",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Albums/{Id}/Similar",
+    "Verbs": "GET",
+    "Summary": "Finds albums similar to a given album.",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Shows/{Id}/Similar",
+    "Verbs": "GET",
+    "Summary": "Finds tv shows similar to a given one.",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Movies/{Id}/Similar",
+    "Verbs": "GET",
+    "Summary": "Finds movies and trailers similar to a given movie.",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Trailers/{Id}/Similar",
+    "Verbs": "GET",
+    "Summary": "Finds movies and trailers similar to a given trailer.",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Libraries/AvailableOptions",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/DeleteInfo",
+    "Verbs": "GET",
+    "Summary": "Gets delete info for an item",
+    "ServiceName": "LibraryService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Library/VirtualFolders",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "LibraryStructureService",
+    "Assembly": "Emby.Api",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Library/VirtualFolders/Query",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "LibraryStructureService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Library/VirtualFolders",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "LibraryStructureService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Library/VirtualFolders",
+    "Verbs": "DELETE",
+    "Summary": "",
+    "ServiceName": "LibraryStructureService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Library/VirtualFolders/Delete",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "LibraryStructureService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Library/VirtualFolders/Name",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "LibraryStructureService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Library/VirtualFolders/Paths",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "LibraryStructureService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Library/VirtualFolders/Paths/Update",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "LibraryStructureService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Library/VirtualFolders/Paths",
+    "Verbs": "DELETE",
+    "Summary": "",
+    "ServiceName": "LibraryStructureService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Library/VirtualFolders/Paths/Delete",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "LibraryStructureService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Library/VirtualFolders/LibraryOptions",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "LibraryStructureService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Items/{Id}/Images",
+    "Verbs": "GET",
+    "Summary": "Gets information about an item's images",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/Images/{Type}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/Images/{Type}/{Index}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/Images/{Type}",
+    "Verbs": "HEAD",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/Images/{Type}/{Index}",
+    "Verbs": "HEAD",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/Images/{Type}/{Index}/{Tag}/{Format}/{MaxWidth}/{MaxHeight}/{PercentPlayed}/{UnPlayedCount}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/Images/{Type}/{Index}/{Tag}/{Format}/{MaxWidth}/{MaxHeight}/{PercentPlayed}/{UnPlayedCount}",
+    "Verbs": "HEAD",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/Images/{Type}/{Index}/Index",
+    "Verbs": "POST",
+    "Summary": "Updates the index for an item image",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "admin"
+  },
+  {
+    "Path": "/Items/{Id}/Images/{Type}/{Index}/Url",
+    "Verbs": "POST",
+    "Summary": "Updates the index for an item image",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "admin"
+  },
+  {
+    "Path": "/Artists/{Name}/Images/{Type}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Artists/{Name}/Images/{Type}/{Index}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Genres/{Name}/Images/{Type}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Genres/{Name}/Images/{Type}/{Index}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/GameGenres/{Name}/Images/{Type}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/GameGenres/{Name}/Images/{Type}/{Index}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/MusicGenres/{Name}/Images/{Type}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/MusicGenres/{Name}/Images/{Type}/{Index}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Persons/{Name}/Images/{Type}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Persons/{Name}/Images/{Type}/{Index}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Studios/{Name}/Images/{Type}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Studios/{Name}/Images/{Type}/{Index}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Artists/{Name}/Images/{Type}",
+    "Verbs": "HEAD",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Artists/{Name}/Images/{Type}/{Index}",
+    "Verbs": "HEAD",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Genres/{Name}/Images/{Type}",
+    "Verbs": "HEAD",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Genres/{Name}/Images/{Type}/{Index}",
+    "Verbs": "HEAD",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/GameGenres/{Name}/Images/{Type}",
+    "Verbs": "HEAD",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/GameGenres/{Name}/Images/{Type}/{Index}",
+    "Verbs": "HEAD",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/MusicGenres/{Name}/Images/{Type}",
+    "Verbs": "HEAD",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/MusicGenres/{Name}/Images/{Type}/{Index}",
+    "Verbs": "HEAD",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Persons/{Name}/Images/{Type}",
+    "Verbs": "HEAD",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Persons/{Name}/Images/{Type}/{Index}",
+    "Verbs": "HEAD",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Studios/{Name}/Images/{Type}",
+    "Verbs": "HEAD",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Studios/{Name}/Images/{Type}/{Index}",
+    "Verbs": "HEAD",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{Id}/Images/{Type}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{Id}/Images/{Type}/{Index}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{Id}/Images/{Type}",
+    "Verbs": "HEAD",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{Id}/Images/{Type}/{Index}",
+    "Verbs": "HEAD",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/Images/{Type}",
+    "Verbs": "DELETE",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "admin"
+  },
+  {
+    "Path": "/Items/{Id}/Images/{Type}/{Index}",
+    "Verbs": "DELETE",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "admin"
+  },
+  {
+    "Path": "/Items/{Id}/Images/{Type}/Delete",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "admin"
+  },
+  {
+    "Path": "/Items/{Id}/Images/{Type}/{Index}/Delete",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "admin"
+  },
+  {
+    "Path": "/Users/{Id}/Images/{Type}",
+    "Verbs": "DELETE",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{Id}/Images/{Type}/{Index}",
+    "Verbs": "DELETE",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{Id}/Images/{Type}/Delete",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{Id}/Images/{Type}/{Index}/Delete",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{Id}/Images/{Type}",
+    "Verbs": "POST",
+    "Summary": "Uploads an image for an item, must be base64 encoded.",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{Id}/Images/{Type}/{Index}",
+    "Verbs": "POST",
+    "Summary": "Uploads an image for an item, must be base64 encoded.",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/Images/{Type}",
+    "Verbs": "POST",
+    "Summary": "Uploads an image for an item, must be base64 encoded.",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "admin"
+  },
+  {
+    "Path": "/Items/{Id}/Images/{Type}/{Index}",
+    "Verbs": "POST",
+    "Summary": "Uploads an image for an item, must be base64 encoded.",
+    "ServiceName": "ImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "admin"
+  },
+  {
+    "Path": "/Items/{Id}/RemoteImages",
+    "Verbs": "GET",
+    "Summary": "Gets available remote images for an item",
+    "ServiceName": "RemoteImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/RemoteImages/Providers",
+    "Verbs": "GET",
+    "Summary": "Gets available remote image providers for an item",
+    "ServiceName": "RemoteImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/RemoteImages/Download",
+    "Verbs": "POST",
+    "Summary": "Downloads a remote image for an item",
+    "ServiceName": "RemoteImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Images/Remote",
+    "Verbs": "GET",
+    "Summary": "Gets a remote image",
+    "ServiceName": "RemoteImageService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Devices",
+    "Verbs": "GET",
+    "Summary": "Gets all devices",
+    "ServiceName": "DeviceService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Devices/Info",
+    "Verbs": "GET",
+    "Summary": "Gets info for a device",
+    "ServiceName": "DeviceService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Devices/Options",
+    "Verbs": "GET",
+    "Summary": "Gets options for a device",
+    "ServiceName": "DeviceService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Devices/Delete",
+    "Verbs": "POST",
+    "Summary": "Deletes a device",
+    "ServiceName": "DeviceService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Devices",
+    "Verbs": "DELETE",
+    "Summary": "Deletes a device",
+    "ServiceName": "DeviceService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Devices/CameraUploads",
+    "Verbs": "GET",
+    "Summary": "Gets camera upload history for a device",
+    "ServiceName": "DeviceService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Devices/CameraUploads",
+    "Verbs": "POST",
+    "Summary": "Uploads content",
+    "ServiceName": "DeviceService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "cameraupload"
+  },
+  {
+    "Path": "/Devices/Options",
+    "Verbs": "POST",
+    "Summary": "Updates device options",
+    "ServiceName": "DeviceService",
+    "Assembly": "Emby.Api",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/LiveTv/LiveStreamFiles/{Id}/stream.{Container}",
+    "Verbs": "GET",
+    "Summary": "Gets a live tv channel",
+    "ServiceName": "LiveStreamService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/LiveStreamFiles/{Id}/hls/master.m3u8",
+    "Verbs": "GET",
+    "Summary": "Gets a live tv channel",
+    "ServiceName": "LiveStreamService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/LiveStreamFiles/{Id}/hls/master.m3u8",
+    "Verbs": "HEAD",
+    "Summary": "Gets a live tv channel",
+    "ServiceName": "LiveStreamService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/LiveStreamFiles/{Id}/hls/master_local.m3u8",
+    "Verbs": "GET",
+    "Summary": "Gets a live tv channel",
+    "ServiceName": "LiveStreamService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/LiveStreamFiles/{Id}/hls/master_local.m3u8",
+    "Verbs": "HEAD",
+    "Summary": "Gets a live tv channel",
+    "ServiceName": "LiveStreamService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/LiveStreamFiles/{Id}/hls/live.m3u8",
+    "Verbs": "GET",
+    "Summary": "Gets a live tv channel",
+    "ServiceName": "LiveStreamService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/LiveStreamFiles/{Id}/hls/live.m3u8",
+    "Verbs": "HEAD",
+    "Summary": "Gets a live tv channel",
+    "ServiceName": "LiveStreamService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/LiveStreamFiles/{Id}/hls/live_local.m3u8",
+    "Verbs": "GET",
+    "Summary": "Gets a live tv channel",
+    "ServiceName": "LiveStreamService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/LiveStreamFiles/{Id}/hls/live_local.m3u8",
+    "Verbs": "HEAD",
+    "Summary": "Gets a live tv channel",
+    "ServiceName": "LiveStreamService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/LiveStreamFiles/{Id}/hls/{Segment}",
+    "Verbs": "GET",
+    "Summary": "Gets a live tv channel",
+    "ServiceName": "LiveStreamService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/LiveStreamFiles/{Id}/hls/{Segment}",
+    "Verbs": "HEAD",
+    "Summary": "Gets a live tv channel",
+    "ServiceName": "LiveStreamService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/LiveRecordings/{Id}/stream",
+    "Verbs": "GET",
+    "Summary": "Gets a live tv channel",
+    "ServiceName": "LiveStreamService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/LiveRecordings/{Id}/hls/master.m3u8",
+    "Verbs": "GET",
+    "Summary": "Gets a live recording",
+    "ServiceName": "LiveStreamService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/LiveRecordings/{Id}/hls/master.m3u8",
+    "Verbs": "HEAD",
+    "Summary": "Gets a live recording",
+    "ServiceName": "LiveStreamService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/LiveRecordings/{Id}/hls/{Segment}",
+    "Verbs": "GET",
+    "Summary": "Gets a live recording",
+    "ServiceName": "LiveStreamService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/LiveRecordings/{Id}/hls/{Segment}",
+    "Verbs": "HEAD",
+    "Summary": "Gets a live recording",
+    "ServiceName": "LiveStreamService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/LiveRecordings/{Id}/hls/live.m3u8",
+    "Verbs": "GET",
+    "Summary": "Gets a live recording",
+    "ServiceName": "LiveStreamService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/LiveRecordings/{Id}/hls/live.m3u8",
+    "Verbs": "HEAD",
+    "Summary": "Gets a live recording",
+    "ServiceName": "LiveStreamService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/Info",
+    "Verbs": "GET",
+    "Summary": "Gets available live tv services.",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/AvailableRecordingOptions",
+    "Verbs": "GET",
+    "Summary": "Gets available recording options",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "managelivetv"
+  },
+  {
+    "Path": "/LiveTv/EPG",
+    "Verbs": "GET",
+    "Summary": "Gets the epg.",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/Channels",
+    "Verbs": "GET",
+    "Summary": "Gets available live tv channels.",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/Manage/Channels",
+    "Verbs": "GET",
+    "Summary": "Gets the channel management list",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/LiveTv/Manage/Channels/{Id}/Disabled",
+    "Verbs": "POST",
+    "Summary": "Sets a channel disabled or not",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/LiveTv/Manage/Channels/{Id}/SortIndex",
+    "Verbs": "POST",
+    "Summary": "Sets a channel sort index",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/LiveTv/Channels/{Id}",
+    "Verbs": "GET",
+    "Summary": "Gets a live tv channel",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/Recordings",
+    "Verbs": "GET",
+    "Summary": "Gets live tv recordings",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/Recordings/Series",
+    "Verbs": "GET",
+    "Summary": "Gets live tv recordings",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/Recordings/Groups",
+    "Verbs": "GET",
+    "Summary": "Gets live tv recording groups",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/Recordings/Folders",
+    "Verbs": "GET",
+    "Summary": "Gets recording folders",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/Folder",
+    "Verbs": "GET",
+    "Summary": "Gets the top level live tv folder",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/Recordings/{Id}",
+    "Verbs": "GET",
+    "Summary": "Gets a live tv recording",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/Tuners/{Id}/Reset",
+    "Verbs": "POST",
+    "Summary": "Resets a tv tuner",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/LiveTv/Timers/{Id}",
+    "Verbs": "GET",
+    "Summary": "Gets a live tv timer",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/Timers/Defaults",
+    "Verbs": "GET",
+    "Summary": "Gets default values for a new timer",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/Timers",
+    "Verbs": "GET",
+    "Summary": "Gets live tv timers",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/ChannelTags",
+    "Verbs": "GET",
+    "Summary": "Gets live tv channel tags",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/ChannelTags/Prefixes",
+    "Verbs": "GET",
+    "Summary": "Gets live tv channel tag prefixes",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/Programs",
+    "Verbs": "GET,POST",
+    "Summary": "Gets available live tv epgs..",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/Programs/Recommended",
+    "Verbs": "GET",
+    "Summary": "Gets available live tv epgs..",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/Recordings/{Id}",
+    "Verbs": "DELETE",
+    "Summary": "Deletes a live tv recording",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "managelivetv"
+  },
+  {
+    "Path": "/LiveTv/Recordings/{Id}/Delete",
+    "Verbs": "POST",
+    "Summary": "Deletes a live tv recording",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "managelivetv"
+  },
+  {
+    "Path": "/LiveTv/Timers/{Id}",
+    "Verbs": "DELETE",
+    "Summary": "Cancels a live tv timer",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "managelivetv"
+  },
+  {
+    "Path": "/LiveTv/Timers/{Id}/Delete",
+    "Verbs": "POST",
+    "Summary": "Cancels a live tv timer",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "managelivetv"
+  },
+  {
+    "Path": "/LiveTv/Timers/{Id}",
+    "Verbs": "POST",
+    "Summary": "Updates a live tv timer",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "managelivetv"
+  },
+  {
+    "Path": "/LiveTv/Timers",
+    "Verbs": "POST",
+    "Summary": "Creates a live tv timer",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "managelivetv"
+  },
+  {
+    "Path": "/LiveTv/SeriesTimers/{Id}",
+    "Verbs": "GET",
+    "Summary": "Gets a live tv series timer",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/SeriesTimers",
+    "Verbs": "GET",
+    "Summary": "Gets live tv series timers",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/SeriesTimers/{Id}",
+    "Verbs": "DELETE",
+    "Summary": "Cancels a live tv series timer",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "managelivetv"
+  },
+  {
+    "Path": "/LiveTv/SeriesTimers/{Id}/Delete",
+    "Verbs": "POST",
+    "Summary": "Cancels a live tv series timer",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "managelivetv"
+  },
+  {
+    "Path": "/LiveTv/SeriesTimers/{Id}",
+    "Verbs": "POST",
+    "Summary": "Updates a live tv series timer",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "managelivetv"
+  },
+  {
+    "Path": "/LiveTv/SeriesTimers",
+    "Verbs": "POST",
+    "Summary": "Creates a live tv series timer",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "managelivetv"
+  },
+  {
+    "Path": "/LiveTv/GuideInfo",
+    "Verbs": "GET",
+    "Summary": "Gets guide info",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/TunerHosts",
+    "Verbs": "GET",
+    "Summary": "Gets tuner hosts",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/LiveTv/TunerHosts/Default/{Type}",
+    "Verbs": "GET",
+    "Summary": "Gets tuner hosts",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/LiveTv/TunerHosts",
+    "Verbs": "POST",
+    "Summary": "Adds a tuner host",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/LiveTv/TunerHosts",
+    "Verbs": "DELETE",
+    "Summary": "Deletes a tuner host",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/LiveTv/TunerHosts/Delete",
+    "Verbs": "POST",
+    "Summary": "Deletes a tuner host",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/LiveTv/ListingProviders/Default",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/ListingProviders/Available",
+    "Verbs": "GET",
+    "Summary": "Gets listing provider",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/LiveTv/ListingProviders",
+    "Verbs": "GET",
+    "Summary": "Gets current listing providers",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/LiveTv/ListingProviders",
+    "Verbs": "POST",
+    "Summary": "Adds a listing provider",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/LiveTv/ListingProviders",
+    "Verbs": "DELETE",
+    "Summary": "Deletes a listing provider",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/LiveTv/ListingProviders/Delete",
+    "Verbs": "POST",
+    "Summary": "Deletes a listing provider",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/LiveTv/ListingProviders/Lineups",
+    "Verbs": "GET",
+    "Summary": "Gets available lineups",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/LiveTv/ChannelMappingOptions",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/LiveTv/ChannelMappings",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/LiveTv/TunerHosts/Types",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/Tuners/Discvover",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveTv/Tuners/Discover",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "LiveTvService",
+    "Assembly": "Emby.LiveTV",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Notifications/{UserId}",
+    "Verbs": "GET",
+    "Summary": "Gets notifications",
+    "ServiceName": "NotificationsService",
+    "Assembly": "Emby.Notifications",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Notifications/{UserId}/Summary",
+    "Verbs": "GET",
+    "Summary": "Gets a notification summary for a user",
+    "ServiceName": "NotificationsService",
+    "Assembly": "Emby.Notifications",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Notifications/Types",
+    "Verbs": "GET",
+    "Summary": "Gets notification types",
+    "ServiceName": "NotificationsService",
+    "Assembly": "Emby.Notifications",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Notifications/Admin",
+    "Verbs": "POST",
+    "Summary": "Sends a notification to all admin users",
+    "ServiceName": "NotificationsService",
+    "Assembly": "Emby.Notifications",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Notifications/{UserId}/Read",
+    "Verbs": "POST",
+    "Summary": "Marks notifications as read",
+    "ServiceName": "NotificationsService",
+    "Assembly": "Emby.Notifications",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Notifications/{UserId}/Unread",
+    "Verbs": "POST",
+    "Summary": "Marks notifications as unread",
+    "ServiceName": "NotificationsService",
+    "Assembly": "Emby.Notifications",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Notifications/Tokens",
+    "Verbs": "GET",
+    "Summary": "Gets all available tokens",
+    "ServiceName": "NotificationsService",
+    "Assembly": "Emby.Notifications",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Notifications/Services/Configured",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "UserNotificationsService",
+    "Assembly": "Emby.Notifications",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Notifications/Services/Configured",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "UserNotificationsService",
+    "Assembly": "Emby.Notifications",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Notifications/Services/Defaults",
+    "Verbs": "GET",
+    "Summary": "Gets default notification info",
+    "ServiceName": "UserNotificationsService",
+    "Assembly": "Emby.Notifications",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Notifications/Services/Test",
+    "Verbs": "POST",
+    "Summary": "Sends a test notification",
+    "ServiceName": "UserNotificationsService",
+    "Assembly": "Emby.Notifications",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Notifications/Services/Configured",
+    "Verbs": "DELETE",
+    "Summary": "",
+    "ServiceName": "UserNotificationsService",
+    "Assembly": "Emby.Notifications",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Notifications/Services",
+    "Verbs": "GET",
+    "Summary": "Gets notification types",
+    "ServiceName": "UserNotificationsService",
+    "Assembly": "Emby.Notifications",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{Id}/Connect/Link",
+    "Verbs": "POST",
+    "Summary": "Creates a Connect link for a user",
+    "ServiceName": "ConnectService",
+    "Assembly": "Emby.Server.Connect",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Users/{Id}/Connect/Link",
+    "Verbs": "DELETE",
+    "Summary": "Removes a Connect link for a user",
+    "ServiceName": "ConnectService",
+    "Assembly": "Emby.Server.Connect",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Users/{Id}/Connect/Link/Delete",
+    "Verbs": "POST",
+    "Summary": "Removes a Connect link for a user",
+    "ServiceName": "ConnectService",
+    "Assembly": "Emby.Server.Connect",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Connect/Pending",
+    "Verbs": "GET",
+    "Summary": "Creates a Connect link for a user",
+    "ServiceName": "ConnectService",
+    "Assembly": "Emby.Server.Connect",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Connect/Exchange",
+    "Verbs": "GET",
+    "Summary": "Gets the corresponding local user from a connect user id",
+    "ServiceName": "ConnectService",
+    "Assembly": "Emby.Server.Connect",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/swagger",
+    "Verbs": "GET",
+    "Summary": "Gets the swagger specifications",
+    "ServiceName": "OpenApiService",
+    "Assembly": "Emby.Server.Implementations",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/swagger.json",
+    "Verbs": "GET",
+    "Summary": "Gets the swagger specifications",
+    "ServiceName": "OpenApiService",
+    "Assembly": "Emby.Server.Implementations",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/openapi",
+    "Verbs": "GET",
+    "Summary": "Gets the OpenAPI 3 specifications",
+    "ServiceName": "OpenApiService",
+    "Assembly": "Emby.Server.Implementations",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/openapi.json",
+    "Verbs": "GET",
+    "Summary": "Gets OpenAPI 3 specifications",
+    "ServiceName": "OpenApiService",
+    "Assembly": "Emby.Server.Implementations",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/index.bif",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "BifService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/thumbnails",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "BifService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/ThumbnailSet",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "BifService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Encoding/CodecInformation/Video",
+    "Verbs": "GET",
+    "Summary": "Gets details about available video encoders and decoders",
+    "ServiceName": "EncodingInfoService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "admin"
+  },
+  {
+    "Path": "/Encoding/CodecConfiguration/Defaults",
+    "Verbs": "GET",
+    "Summary": "Gets default codec configurations",
+    "ServiceName": "EncodingInfoService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "admin"
+  },
+  {
+    "Path": "/Encoding/ToneMapOptions",
+    "Verbs": "GET",
+    "Summary": "Gets available tone mapping options",
+    "ServiceName": "EncodingInfoService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "admin"
+  },
+  {
+    "Path": "/Items/{Id}/PlaybackInfo",
+    "Verbs": "GET",
+    "Summary": "Gets live playback media info for an item",
+    "ServiceName": "MediaInfoService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/{Id}/PlaybackInfo",
+    "Verbs": "POST",
+    "Summary": "Gets live playback media info for an item",
+    "ServiceName": "MediaInfoService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveStreams/Open",
+    "Verbs": "POST",
+    "Summary": "Opens a media source",
+    "ServiceName": "MediaInfoService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveStreams/Close",
+    "Verbs": "POST",
+    "Summary": "Closes a media source",
+    "ServiceName": "MediaInfoService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/LiveStreams/MediaInfo",
+    "Verbs": "POST",
+    "Summary": "Gets media info for a live stream",
+    "ServiceName": "MediaInfoService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Playback/BitrateTest",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "MediaInfoService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/PlayedItems/{Id}",
+    "Verbs": "POST",
+    "Summary": "Marks an item as played",
+    "ServiceName": "PlaystateService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/Items/{ItemId}/UserData",
+    "Verbs": "POST",
+    "Summary": "Updates userdata for an item",
+    "ServiceName": "PlaystateService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/PlayedItems/{Id}",
+    "Verbs": "DELETE",
+    "Summary": "Marks an item as unplayed",
+    "ServiceName": "PlaystateService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/PlayedItems/{Id}/Delete",
+    "Verbs": "POST",
+    "Summary": "Marks an item as unplayed",
+    "ServiceName": "PlaystateService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sessions/Playing",
+    "Verbs": "POST",
+    "Summary": "Reports playback has started within a session",
+    "ServiceName": "PlaystateService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sessions/Playing/Progress",
+    "Verbs": "POST",
+    "Summary": "Reports playback progress within a session",
+    "ServiceName": "PlaystateService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sessions/Playing/Ping",
+    "Verbs": "POST",
+    "Summary": "Pings a playback session",
+    "ServiceName": "PlaystateService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sessions/Playing/Stopped",
+    "Verbs": "POST",
+    "Summary": "Reports playback has stopped within a session",
+    "ServiceName": "PlaystateService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/PlayingItems/{Id}",
+    "Verbs": "POST",
+    "Summary": "Reports that a user has begun playing an item",
+    "ServiceName": "PlaystateService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/PlayingItems/{Id}/Progress",
+    "Verbs": "POST",
+    "Summary": "Reports a user's playback progress",
+    "ServiceName": "PlaystateService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/PlayingItems/{Id}",
+    "Verbs": "DELETE",
+    "Summary": "Reports that a user has stopped playing an item",
+    "ServiceName": "PlaystateService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Users/{UserId}/PlayingItems/{Id}/Delete",
+    "Verbs": "POST",
+    "Summary": "Reports that a user has stopped playing an item",
+    "ServiceName": "PlaystateService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Audio/{Id}/universal.{Container}",
+    "Verbs": "GET",
+    "Summary": "Gets an audio stream",
+    "ServiceName": "UniversalAudioService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Audio/{Id}/universal",
+    "Verbs": "GET",
+    "Summary": "Gets an audio stream",
+    "ServiceName": "UniversalAudioService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Audio/{Id}/universal.{Container}",
+    "Verbs": "HEAD",
+    "Summary": "Gets an audio stream",
+    "ServiceName": "UniversalAudioService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Audio/{Id}/universal",
+    "Verbs": "HEAD",
+    "Summary": "Gets an audio stream",
+    "ServiceName": "UniversalAudioService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Encoding/FullToneMapOptions",
+    "Verbs": "GET",
+    "Summary": "Gets the tone mapping options",
+    "ServiceName": "ToneMapOptionsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Encoding/PublicToneMapOptions",
+    "Verbs": "GET",
+    "Summary": "Gets the tone mapping options",
+    "ServiceName": "ToneMapOptionsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Encoding/FullToneMapOptions",
+    "Verbs": "POST",
+    "Summary": "Updates the tone mapping options",
+    "ServiceName": "ToneMapOptionsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Encoding/PublicToneMapOptions",
+    "Verbs": "POST",
+    "Summary": "Updates the tone mapping options",
+    "ServiceName": "ToneMapOptionsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Encoding/SubtitleOptions",
+    "Verbs": "GET",
+    "Summary": "Gets the subtitle options",
+    "ServiceName": "SubtitleOptionsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Encoding/SubtitleOptions",
+    "Verbs": "POST",
+    "Summary": "Updates the subtitle options",
+    "ServiceName": "SubtitleOptionsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Audio/{Id}/stream.{Container}",
+    "Verbs": "GET",
+    "Summary": "Gets an audio stream",
+    "ServiceName": "AudioService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Audio/{Id}/stream",
+    "Verbs": "GET",
+    "Summary": "Gets an audio stream",
+    "ServiceName": "AudioService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Audio/{Id}/stream.{Container}",
+    "Verbs": "HEAD",
+    "Summary": "Gets an audio stream",
+    "ServiceName": "AudioService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Audio/{Id}/stream",
+    "Verbs": "HEAD",
+    "Summary": "Gets an audio stream",
+    "ServiceName": "AudioService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Audio/{Id}/{StreamFileName}",
+    "Verbs": "GET",
+    "Summary": "Gets an audio stream",
+    "ServiceName": "AudioService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Audio/{Id}/{StreamFileName}",
+    "Verbs": "HEAD",
+    "Summary": "Gets an audio stream",
+    "ServiceName": "AudioService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/stream.{Container}",
+    "Verbs": "GET",
+    "Summary": "Gets a video stream",
+    "ServiceName": "VideoService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/stream",
+    "Verbs": "GET",
+    "Summary": "Gets a video stream",
+    "ServiceName": "VideoService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/stream.{Container}",
+    "Verbs": "HEAD",
+    "Summary": "Gets a video stream",
+    "ServiceName": "VideoService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/stream",
+    "Verbs": "HEAD",
+    "Summary": "Gets a video stream",
+    "ServiceName": "VideoService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/{StreamFileName}",
+    "Verbs": "GET",
+    "Summary": "Gets a video stream",
+    "ServiceName": "VideoService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/{StreamFileName}",
+    "Verbs": "HEAD",
+    "Summary": "Gets a video stream",
+    "ServiceName": "VideoService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Items/File",
+    "Verbs": "GET",
+    "Summary": "Gets the original file of an item",
+    "ServiceName": "VideoService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/master.m3u8",
+    "Verbs": "GET",
+    "Summary": "Gets a video stream using HTTP live streaming.",
+    "ServiceName": "DynamicHlsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/master.m3u8",
+    "Verbs": "HEAD",
+    "Summary": "Gets a video stream using HTTP live streaming.",
+    "ServiceName": "DynamicHlsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Audio/{Id}/master.m3u8",
+    "Verbs": "GET",
+    "Summary": "Gets an audio stream using HTTP live streaming.",
+    "ServiceName": "DynamicHlsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Audio/{Id}/master.m3u8",
+    "Verbs": "HEAD",
+    "Summary": "Gets an audio stream using HTTP live streaming.",
+    "ServiceName": "DynamicHlsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/live.m3u8",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "DynamicHlsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Audio/{Id}/live.m3u8",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "DynamicHlsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/main.m3u8",
+    "Verbs": "GET",
+    "Summary": "Gets a video stream using HTTP live streaming.",
+    "ServiceName": "DynamicHlsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Audio/{Id}/main.m3u8",
+    "Verbs": "GET",
+    "Summary": "Gets an audio stream using HTTP live streaming.",
+    "ServiceName": "DynamicHlsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/live_subtitles.m3u8",
+    "Verbs": "GET",
+    "Summary": "Gets an HLS subtitle playlist.",
+    "ServiceName": "",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/subtitles.m3u8",
+    "Verbs": "GET",
+    "Summary": "Gets an HLS subtitle playlist.",
+    "ServiceName": "DynamicHlsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/hls1/{PlaylistId}/{SegmentId}.{SegmentContainer}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "DynamicHlsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/hls1/{PlaylistId}/{SegmentId}.{SegmentContainer}",
+    "Verbs": "HEAD",
+    "Summary": "",
+    "ServiceName": "DynamicHlsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Audio/{Id}/hls1/{PlaylistId}/{SegmentId}.{SegmentContainer}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "DynamicHlsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Audio/{Id}/hls1/{PlaylistId}/{SegmentId}.{SegmentContainer}",
+    "Verbs": "HEAD",
+    "Summary": "",
+    "ServiceName": "DynamicHlsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/ActiveEncodings",
+    "Verbs": "DELETE",
+    "Summary": "",
+    "ServiceName": "HlsSegmentService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/ActiveEncodings/Delete",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "HlsSegmentService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Videos/{Id}/hls/{PlaylistId}/{SegmentId}.{SegmentContainer}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "VideoHlsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Audio/{Id}/hls/{PlaylistId}/{SegmentId}.{SegmentContainer}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "VideoHlsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Encoding/FfmpegOptions",
+    "Verbs": "GET",
+    "Summary": "Gets the ffmpeg options",
+    "ServiceName": "FfmpegOptionsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Encoding/FfmpegOptions",
+    "Verbs": "POST",
+    "Summary": "Updates the ffmpeg options",
+    "ServiceName": "FfmpegOptionsService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Encoding/CodecParameters",
+    "Verbs": "GET",
+    "Summary": "Gets the parameters for a specified codec.",
+    "ServiceName": "CodecParameterService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Encoding/CodecParameters",
+    "Verbs": "POST",
+    "Summary": "Updates the parameters for a specified codec.",
+    "ServiceName": "CodecParameterService",
+    "Assembly": "Emby.Server.MediaEncoding",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Sync/Jobs/{Id}",
+    "Verbs": "DELETE",
+    "Summary": "Cancels a sync job.",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/Jobs/{Id}/Delete",
+    "Verbs": "POST",
+    "Summary": "Cancels a sync job.",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/Jobs/{Id}",
+    "Verbs": "GET",
+    "Summary": "Gets a sync job.",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/Jobs/{Id}",
+    "Verbs": "POST",
+    "Summary": "Updates a sync job.",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/{ItemId}/Status",
+    "Verbs": "POST",
+    "Summary": "Gets sync status for an item.",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/JobItems",
+    "Verbs": "GET",
+    "Summary": "Gets sync job items.",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/JobItems/{Id}/Enable",
+    "Verbs": "POST",
+    "Summary": "Enables a cancelled or queued sync job item",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/JobItems/{Id}/MarkForRemoval",
+    "Verbs": "POST",
+    "Summary": "Marks a job item for removal",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/JobItems/{Id}/UnmarkForRemoval",
+    "Verbs": "POST",
+    "Summary": "Unmarks a job item for removal",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/JobItems/{Id}",
+    "Verbs": "DELETE",
+    "Summary": "Cancels a sync job item",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/JobItems/{Id}/Delete",
+    "Verbs": "POST",
+    "Summary": "Cancels a sync job item",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/Items/Cancel",
+    "Verbs": "POST",
+    "Summary": "Cancels items from a sync target",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/{TargetId}/Items/Delete",
+    "Verbs": "POST",
+    "Summary": "Cancels items from a sync target",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/{TargetId}/Items",
+    "Verbs": "DELETE",
+    "Summary": "Cancels items from a sync target",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/Jobs",
+    "Verbs": "GET",
+    "Summary": "Gets sync jobs.",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/Jobs",
+    "Verbs": "POST",
+    "Summary": "Gets sync jobs.",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/Targets",
+    "Verbs": "GET",
+    "Summary": "Gets a list of available sync targets.",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/Options",
+    "Verbs": "GET",
+    "Summary": "Gets a list of available sync targets.",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/JobItems/{Id}/Transferred",
+    "Verbs": "POST",
+    "Summary": "Reports that a sync job item has successfully been transferred.",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/JobItems/{Id}/File",
+    "Verbs": "HEAD",
+    "Summary": "Gets a sync job item file",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/JobItems/{Id}/File",
+    "Verbs": "GET",
+    "Summary": "Gets a sync job item file",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/JobItems/{Id}/AdditionalFiles",
+    "Verbs": "GET",
+    "Summary": "Gets a sync job item file",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/OfflineActions",
+    "Verbs": "POST",
+    "Summary": "Reports an action that occurred while offline.",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/Items/Ready",
+    "Verbs": "GET",
+    "Summary": "Gets ready to download sync items.",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/Sync/Data",
+    "Verbs": "POST",
+    "Summary": "Syncs data between device and server",
+    "ServiceName": "SyncService",
+    "Assembly": "Emby.Server.Sync",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/web/ConfigurationPages",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "WebAppService",
+    "Assembly": "Emby.Web",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": ""
+  },
+  {
+    "Path": "/web/ConfigurationPage",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "WebAppService",
+    "Assembly": "Emby.Web",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/web/strings",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "WebAppService",
+    "Assembly": "Emby.Web",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/web/stringset",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "WebAppService",
+    "Assembly": "Emby.Web",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/robots.txt",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "WebAppService",
+    "Assembly": "Emby.Web",
+    "IsHidden": true,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/web/{ResourceName*}",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "WebAppService",
+    "Assembly": "Emby.Web",
+    "IsHidden": true,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/favicon.ico",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "WebAppService",
+    "Assembly": "Emby.Web",
+    "IsHidden": true,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/UI/View",
+    "Verbs": "GET",
+    "Summary": "Gets UI view data",
+    "ServiceName": "GenericUIApiService",
+    "Assembly": "Emby.Web.GenericUI",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "admin"
+  },
+  {
+    "Path": "/UI/Command",
+    "Verbs": "POST",
+    "Summary": "Execute a command in the context of tv setup",
+    "ServiceName": "GenericUIApiService",
+    "Assembly": "Emby.Web.GenericUI",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "admin"
+  },
+  {
+    "Path": "/Dlna/{UuId}/description.xml",
+    "Verbs": "GET",
+    "Summary": "Gets dlna server info",
+    "ServiceName": "DlnaServerService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Dlna/{UuId}/description",
+    "Verbs": "GET",
+    "Summary": "Gets dlna server info",
+    "ServiceName": "DlnaServerService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Dlna/{UuId}/description.xml",
+    "Verbs": "HEAD",
+    "Summary": "Gets dlna server info",
+    "ServiceName": "DlnaServerService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Dlna/{UuId}/description",
+    "Verbs": "HEAD",
+    "Summary": "Gets dlna server info",
+    "ServiceName": "DlnaServerService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Dlna/{UuId}/contentdirectory/contentdirectory.xml",
+    "Verbs": "GET",
+    "Summary": "Gets dlna content directory xml",
+    "ServiceName": "DlnaServerService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Dlna/{UuId}/contentdirectory/contentdirectory",
+    "Verbs": "GET",
+    "Summary": "Gets dlna content directory xml",
+    "ServiceName": "DlnaServerService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Dlna/{UuId}/contentdirectory/contentdirectory.xml",
+    "Verbs": "HEAD",
+    "Summary": "Gets dlna content directory xml",
+    "ServiceName": "DlnaServerService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Dlna/{UuId}/contentdirectory/contentdirectory",
+    "Verbs": "HEAD",
+    "Summary": "Gets dlna content directory xml",
+    "ServiceName": "DlnaServerService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Dlna/{UuId}/connectionmanager/connectionmanager.xml",
+    "Verbs": "GET",
+    "Summary": "Gets dlna connection manager xml",
+    "ServiceName": "DlnaServerService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Dlna/{UuId}/connectionmanager/connectionmanager",
+    "Verbs": "GET",
+    "Summary": "Gets dlna connection manager xml",
+    "ServiceName": "DlnaServerService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Dlna/{UuId}/connectionmanager/connectionmanager.xml",
+    "Verbs": "HEAD",
+    "Summary": "Gets dlna connection manager xml",
+    "ServiceName": "DlnaServerService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Dlna/{UuId}/connectionmanager/connectionmanager",
+    "Verbs": "HEAD",
+    "Summary": "Gets dlna connection manager xml",
+    "ServiceName": "DlnaServerService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Dlna/{UuId}/contentdirectory/control",
+    "Verbs": "POST",
+    "Summary": "Processes a control request",
+    "ServiceName": "DlnaServerService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Dlna/{UuId}/connectionmanager/control",
+    "Verbs": "POST",
+    "Summary": "Processes a control request",
+    "ServiceName": "DlnaServerService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Dlna/{UuId}/contentdirectory/events",
+    "Verbs": "SUBSCRIBE",
+    "Summary": "Processes an event subscription request",
+    "ServiceName": "",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Dlna/{UuId}/contentdirectory/events",
+    "Verbs": "UNSUBSCRIBE",
+    "Summary": "Processes an event subscription request",
+    "ServiceName": "",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Dlna/{UuId}/connectionmanager/events",
+    "Verbs": "SUBSCRIBE",
+    "Summary": "Processes an event subscription request",
+    "ServiceName": "",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Dlna/{UuId}/connectionmanager/events",
+    "Verbs": "UNSUBSCRIBE",
+    "Summary": "Processes an event subscription request",
+    "ServiceName": "",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Dlna/{UuId}/icons/{Filename}",
+    "Verbs": "GET",
+    "Summary": "Gets a server icon",
+    "ServiceName": "DlnaServerService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Dlna/icons/{Filename}",
+    "Verbs": "GET",
+    "Summary": "Gets a server icon",
+    "ServiceName": "DlnaServerService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Dlna/ProfileInfos",
+    "Verbs": "GET",
+    "Summary": "Gets a list of profiles",
+    "ServiceName": "DlnaService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Dlna/Profiles/{Id}",
+    "Verbs": "DELETE",
+    "Summary": "Deletes a profile",
+    "ServiceName": "DlnaService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Dlna/Profiles/Default",
+    "Verbs": "GET",
+    "Summary": "Gets the default profile",
+    "ServiceName": "DlnaService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Dlna/Profiles/{Id}",
+    "Verbs": "GET",
+    "Summary": "Gets a single profile",
+    "ServiceName": "DlnaService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Dlna/Profiles/{Id}",
+    "Verbs": "POST",
+    "Summary": "Updates a profile",
+    "ServiceName": "DlnaService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Dlna/Profiles",
+    "Verbs": "POST",
+    "Summary": "Creates a profile",
+    "ServiceName": "DlnaService",
+    "Assembly": "Emby.Dlna",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/Webhooks/Test",
+    "Verbs": "POST",
+    "Summary": "Receives a notification request, for testing only",
+    "ServiceName": "NotificationsApi",
+    "Assembly": "Emby.Webhooks",
+    "IsHidden": true,
+    "AuthRequired": false,
+    "Roles": ""
+  },
+  {
+    "Path": "/Webhooks/Sample",
+    "Verbs": "GET",
+    "Summary": "Gets a notification sample request body",
+    "ServiceName": "NotificationsApi",
+    "Assembly": "Emby.Webhooks",
+    "IsHidden": true,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/BackupRestore/Restore",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "BackupApi",
+    "Assembly": "MBBackup",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/BackupRestore/RestoreData",
+    "Verbs": "POST",
+    "Summary": "",
+    "ServiceName": "BackupApi",
+    "Assembly": "MBBackup",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  },
+  {
+    "Path": "/BackupRestore/BackupInfo",
+    "Verbs": "GET",
+    "Summary": "",
+    "ServiceName": "BackupApi",
+    "Assembly": "MBBackup",
+    "IsHidden": false,
+    "AuthRequired": true,
+    "Roles": "Admin"
+  }
+]

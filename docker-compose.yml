@@ -1,0 +1,53 @@
+services:
+  ambra:
+    # Full 完整版（默认，内置 ffmpeg + ffprobe）：target: runtime-full 或镜像 tag :latest / :full
+    # Lite 轻量版（不内置 ffmpeg，~35MB Alpine，适合 STRM/302 或自挂载 ffmpeg）：target: runtime-lite 或镜像 tag :lite
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime-full
+    image: ghcr.io/iky002/ambra:latest
+    container_name: ambra
+    restart: unless-stopped
+    ports:
+      - "8096:8096/tcp"   # HTTP / Web UI / Emby API
+      - "1900:1900/udp"   # DLNA / SSDP 局域网发现
+    volumes:
+      - ./data:/data      # 数据库、配置、元数据、图片与字幕缓存
+      # 挂载本地媒体库（建议只读 :ro）
+      # - /path/to/movies:/media/movies:ro
+      # - /path/to/tv:/media/tv:ro
+      # - /path/to/music:/media/music:ro
+    environment:
+      TZ: Asia/Shanghai
+      AMBRA_HTTP_ADDR: ":8096"
+      AMBRA_FFMPEG_PATH: "/usr/bin/ffmpeg"
+      AMBRA_FFPROBE_PATH: "/usr/bin/ffprobe"
+      # 可选：TMDB API Key（用于刮削影视元数据与海报）
+      # AMBRA_TMDB_API_KEY: "your_tmdb_api_key"
+      # 可选：外部 Web UI 目录覆盖内嵌前端
+      # AMBRA_WEB_DIR: "/web"
+    # ==========================================================================
+    # 硬件加速转码配置（按需取消注释）
+    # ==========================================================================
+    # Intel QSV / AMD VAAPI（Linux 宿主机）：
+    # devices:
+    #   - /dev/dri:/dev/dri
+    # group_add:
+    #   - "video"
+    #   - "render"
+    #
+    # NVIDIA NVENC（需宿主机安装 nvidia-container-toolkit）：
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu, video]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8096/System/Ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

@@ -14,6 +14,9 @@ import (
 	"github.com/ambra-media/ambra/internal/api/handlers/audio"
 	"github.com/ambra-media/ambra/internal/api/handlers/catalog"
 	"github.com/ambra-media/ambra/internal/api/handlers/collections"
+	"github.com/ambra-media/ambra/internal/api/handlers/compatcore"
+	"github.com/ambra-media/ambra/internal/api/handlers/compatext"
+	"github.com/ambra-media/ambra/internal/api/handlers/compatmedia"
 	"github.com/ambra-media/ambra/internal/api/handlers/dlna"
 	"github.com/ambra-media/ambra/internal/api/handlers/environment"
 	"github.com/ambra-media/ambra/internal/api/handlers/hls"
@@ -32,11 +35,13 @@ import (
 	"github.com/ambra-media/ambra/internal/api/ws"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/auth"
+	"github.com/ambra-media/ambra/internal/core/dvr"
 	"github.com/ambra-media/ambra/internal/core/imaging"
 	"github.com/ambra-media/ambra/internal/core/playback"
 	"github.com/ambra-media/ambra/internal/core/scanner"
 	"github.com/ambra-media/ambra/internal/core/scheduler"
 	"github.com/ambra-media/ambra/internal/core/session"
+	"github.com/ambra-media/ambra/internal/core/ssdp"
 	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/plugins"
@@ -44,6 +49,7 @@ import (
 	"github.com/ambra-media/ambra/internal/plugins/nfo"
 	"github.com/ambra-media/ambra/internal/plugins/strm"
 	"github.com/ambra-media/ambra/internal/plugins/tmdb"
+	"github.com/ambra-media/ambra/internal/plugins/wasmhost"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 	"github.com/ambra-media/ambra/web"
 )
@@ -54,12 +60,15 @@ type Server struct {
 	Bus          *eventbus.Bus
 	Registry     *plugins.Registry
 	PluginLoader *ext.Loader
+	WasmHost     *wasmhost.Host
 	Auth         *auth.Service
 	Sessions     *session.Manager
 	Scanner      *scanner.Scanner
 	Scheduler    *scheduler.Manager
 	Playback     *playback.Engine
 	Transcode    *transcode.Manager
+	DVR          *dvr.Recorder
+	SSDP         *ssdp.Broadcaster
 	Imaging      *imaging.Service
 	WSHub        *ws.Hub
 	Handler      http.Handler
@@ -78,9 +87,15 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	registry.Register(tmdb.New(cfg.TMDBApiKey, cfg.TMDBLanguage))
 	registry.Register(strm.New(cfg.EnableSTRM302))
 
-	// Discover external manifest-based HTTP plugins in data/plugins/*
+	// Discover external HTTP & WASM (wazero) plugins in data/plugins/*
+	pluginsDir := filepath.Join(cfg.DataDir, "plugins")
 	extLoader := ext.NewLoader()
-	_, _ = extLoader.LoadFromDir(filepath.Join(cfg.DataDir, "plugins"), registry)
+	_, _ = extLoader.LoadFromDir(pluginsDir, registry)
+
+	wHost, err := wasmhost.NewHost(ctx)
+	if err == nil {
+		_, _ = wHost.LoadFromDir(ctx, pluginsDir, registry)
+	}
 
 	userRepo := sqlite.NewUserRepo(store)
 	libRepo := sqlite.NewLibraryRepo(store)
@@ -97,8 +112,18 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 
 	sc := scanner.New(libRepo, registry, bus, cfg)
 	pb := playback.New(libRepo, registry, cfg)
-	imgSvc := imaging.New(libRepo)
+	imgSvc := imaging.New(libRepo).WithCacheDir(cfg.ImageCacheDir())
 	transcodeMgr := transcode.NewManager(cfg)
+	dvrRec := dvr.NewRecorder(dvr.Options{
+		DataDir:    cfg.DataDir,
+		FFmpegPath: cfg.FFmpegPath,
+		Bus:        bus,
+	})
+	ssdpB := ssdp.NewBroadcaster(ssdp.Config{
+		ServerID:      cfg.ServerID,
+		ServerName:    cfg.ServerName,
+		ServerVersion: config.ServerVersion,
+	})
 
 	taskMgr := scheduler.New(bus)
 	taskMgr.RegisterBuiltinTasks(
@@ -209,6 +234,25 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		UserIDFromCtx: userIDFromCtx,
 	})
 
+	// Emby 4.10.2.0 full 582-route compatibility routers (zero ServeMux conflicts)
+	compatMediaH := compatmedia.New(libRepo, sc, imgSvc, registry, store, cfg).BuildRouter(compatmedia.AuthFuncs{
+		RequireAuth:   authMW.RequireAuth,
+		RequireAdmin:  authMW.RequireAdmin,
+		UserIDFromCtx: userIDFromCtx,
+	})
+	compatCoreH := compatcore.New(cfg, store, userRepo, libRepo, sessionMgr, registry).BuildRouter(compatcore.AuthFuncs{
+		RequireAuth:   authMW.RequireAuth,
+		RequireAdmin:  authMW.RequireAdmin,
+		UserIDFromCtx: userIDFromCtx,
+	})
+	compatExtH := compatext.New(store, cfg).BuildRouter(compatext.AuthFuncs{
+		RequireAuth:   authMW.RequireAuth,
+		RequireAdmin:  authMW.RequireAdmin,
+		UserIDFromCtx: userIDFromCtx,
+	})
+
+	fallbackHandler := dispatchMuxAndCompat(mediaMux, compatMediaH, compatCoreH, compatExtH)
+
 	// Web client static file server (embedded dist or external WebDir override)
 	webHandler := buildWebHandler(cfg.WebDir)
 
@@ -242,9 +286,9 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	r.Handle("/web", http.RedirectHandler("/web/", http.StatusMovedPermanently))
 	r.Handle("/web/*", http.StripPrefix("/web/", webHandler))
 
-	// Delegate all library, streaming, Phase 2-6 API routes to mediaMux
-	r.NotFound(mediaMux.ServeHTTP)
-	r.MethodNotAllowed(mediaMux.ServeHTTP)
+	// Delegate all library, streaming, Phase 2-6 & full 582-route compat APIs
+	r.NotFound(fallbackHandler.ServeHTTP)
+	r.MethodNotAllowed(fallbackHandler.ServeHTTP)
 
 	return &Server{
 		Config:       cfg,
@@ -252,12 +296,15 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		Bus:          bus,
 		Registry:     registry,
 		PluginLoader: extLoader,
+		WasmHost:     wHost,
 		Auth:         authSvc,
 		Sessions:     sessionMgr,
 		Scanner:      sc,
 		Scheduler:    taskMgr,
 		Playback:     pb,
 		Transcode:    transcodeMgr,
+		DVR:          dvrRec,
+		SSDP:         ssdpB,
 		Imaging:      imgSvc,
 		WSHub:        wsHub,
 		Handler:      r,
@@ -265,13 +312,44 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 }
 
 func (s *Server) Close() error {
+	if s.DVR != nil {
+		_ = s.DVR.Close()
+	}
 	if s.Transcode != nil {
 		s.Transcode.Close()
+	}
+	if s.WasmHost != nil {
+		_ = s.WasmHost.Close(context.Background())
 	}
 	if s.Store != nil {
 		return s.Store.Close()
 	}
 	return nil
+}
+
+func dispatchMuxAndCompat(mux *http.ServeMux, routers ...http.Handler) http.Handler {
+	chiRouters := make([]chi.Router, 0, len(routers))
+	for _, h := range routers {
+		if cr, ok := h.(chi.Router); ok {
+			chiRouters = append(chiRouters, cr)
+		}
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 1. Prefer exact pattern match on primary mediaMux
+		if _, pattern := mux.Handler(r); pattern != "" {
+			mux.ServeHTTP(w, r)
+			return
+		}
+		// 2. Match against chi compat routers with clean route context
+		for _, cr := range chiRouters {
+			rctx := chi.NewRouteContext()
+			if cr.Match(rctx, r.Method, r.URL.Path) {
+				cr.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, rctx)))
+				return
+			}
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 func buildWebHandler(webDir string) http.Handler {

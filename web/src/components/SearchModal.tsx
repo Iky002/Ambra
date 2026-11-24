@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Film, Loader2, Search, Tv, X } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
-import { api, getImageUrl } from '../api/client'
+import { api, getFallbackImageUrl, getImageUrl } from '../api/client'
 import type { SearchHint } from '../api/types'
 import { useAuth } from '../context/AuthContext'
 
@@ -133,6 +133,9 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
                 const img = hint.PrimaryImageTag
                   ? getImageUrl(id, 'Primary', { maxWidth: 120, tag: hint.PrimaryImageTag })
                   : ''
+                const fallbackImg = hint.PrimaryImageTag
+                  ? getFallbackImageUrl(id, 'Primary')
+                  : null
                 const isActive = idx === activeIndex
                 return (
                   <button
@@ -146,7 +149,24 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
                   >
                     <div className="flex h-14 w-10 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-zinc-900 ring-1 ring-white/10">
                       {img ? (
-                        <img src={img} alt={hint.Name} className="h-full w-full object-cover" />
+                        <img
+                          src={img}
+                          alt={hint.Name}
+                          onError={(e) => {
+                            const el = e.currentTarget
+                            if (
+                              fallbackImg &&
+                              !el.dataset.fallbackApplied &&
+                              el.src !== fallbackImg
+                            ) {
+                              el.dataset.fallbackApplied = '1'
+                              el.src = fallbackImg
+                              return
+                            }
+                            el.style.display = 'none'
+                          }}
+                          className="h-full w-full object-cover"
+                        />
                       ) : hint.Type === 'Series' || hint.Type === 'Episode' ? (
                         <Tv className="h-4 w-4 text-zinc-500" />
                       ) : (

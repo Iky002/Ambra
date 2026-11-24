@@ -113,6 +113,21 @@ func TestHWAccelAndDetectorExtra(t *testing.T) {
 	if nvCaps.PreferredH264Encoder != "h264_nvenc" || nvCaps.PreferredHEVCEncoder != "hevc_nvenc" {
 		t.Fatalf("expected nvdec to enable nvenc, got %+v", nvCaps)
 	}
+	// Windows AMD AMF hardware encoders (d3d11va / dxva2 / amf)
+	for _, accel := range []string{"d3d11va", "dxva2", "amf"} {
+		amfCaps := BuildHWCapabilities([]string{accel}, map[string]bool{"h264_amf": true, "hevc_amf": true, "libx264": true}, "windows")
+		if amfCaps.PreferredHWAccel != "d3d11va" || amfCaps.PreferredH264Encoder != "h264_amf" || amfCaps.PreferredHEVCEncoder != "hevc_amf" {
+			t.Fatalf("expected Windows AMF for accel %q, got %+v", accel, amfCaps)
+		}
+		if amfCaps.SelectVideoEncoder("h264") != "h264_amf" || amfCaps.SelectVideoEncoder("hevc") != "hevc_amf" {
+			t.Fatalf("expected SelectVideoEncoder to return AMF encoders")
+		}
+	}
+	// AMF should not be selected on non-Windows platforms
+	linuxAMF := BuildHWCapabilities([]string{"d3d11va"}, map[string]bool{"h264_amf": true, "hevc_amf": true}, "linux")
+	if linuxAMF.PreferredH264Encoder != "libx264" || linuxAMF.PreferredHEVCEncoder != "libx265" {
+		t.Fatalf("expected AMF ignored on linux, got %+v", linuxAMF)
+	}
 	if emptyCaps := BuildHWCapabilities(nil, nil, "linux"); len(emptyCaps.Codecs) != 2 {
 		t.Fatalf("expected 2 software fallback codecs, got %d", len(emptyCaps.Codecs))
 	}

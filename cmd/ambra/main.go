@@ -45,6 +45,10 @@ func main() {
 	}
 	defer func() { _ = srv.Close() }()
 
+	if srv.SSDP != nil {
+		go func() { _ = srv.SSDP.Start(ctx) }()
+	}
+
 	httpSrv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           srv.Handler,

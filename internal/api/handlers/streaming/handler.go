@@ -268,7 +268,18 @@ func (h *Handler) handleImage(w http.ResponseWriter, r *http.Request) {
 			idx = n
 		}
 	}
-	err := h.imaging.ServeHTTP(w, r, itemID, imgType, idx)
+	q := httpx.ParseQuery(r)
+	opts := imaging.Options{
+		MaxWidth:   q.Int("maxWidth", 0),
+		MaxHeight:  q.Int("maxHeight", 0),
+		Width:      q.Int("width", 0),
+		Height:     q.Int("height", 0),
+		FillWidth:  q.Int("fillWidth", 0),
+		FillHeight: q.Int("fillHeight", 0),
+		Quality:    q.Int("quality", 0),
+		Format:     q.Get("format"),
+	}
+	err := h.imaging.ServeHTTPWithOptions(w, r, itemID, imgType, idx, opts)
 	if errors.Is(err, sqlite.ErrNotFound) || os.IsNotExist(err) {
 		httpx.Error(w, http.StatusNotFound, "image not found")
 		return

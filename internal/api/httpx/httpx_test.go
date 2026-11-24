@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"sort"
 	"testing"
 )
 
@@ -104,9 +105,11 @@ func TestParseQuery(t *testing.T) {
 		t.Fatalf("Bool(missing) = %v, want nil", *b)
 	}
 
-	// List
-	gotList := q.List("TYPES")
+	// List (sort both slices since map iteration across mixed-case keys is unordered)
+	gotList := append([]string(nil), q.List("TYPES")...)
 	wantList := []string{"Movie", "Series", "Episode", "Audio"}
+	sort.Strings(gotList)
+	sort.Strings(wantList)
 	if !reflect.DeepEqual(gotList, wantList) {
 		t.Fatalf("List(TYPES) = %#v, want %#v", gotList, wantList)
 	}

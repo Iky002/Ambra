@@ -13,7 +13,7 @@ import {
   Volume2,
 } from 'lucide-react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { api, getBackdropUrl, getImageUrl } from '../api/client'
+import { api, getBackdropUrl, getFallbackImageUrl, getImageUrl } from '../api/client'
 import type { MediaSourceInfo } from '../api/types'
 import { useAuth } from '../context/AuthContext'
 import {
@@ -142,11 +142,30 @@ export function ItemDetailPage() {
   }
 
   const backdrop = getBackdropUrl(item, 1920)
+  const backdropFallback = getFallbackImageUrl(item.Id, 'Backdrop')
   const poster = item.ImageTags?.Primary
     ? getImageUrl(item.Id, 'Primary', { maxWidth: 500, tag: item.ImageTags.Primary })
     : item.SeriesId
       ? getImageUrl(item.SeriesId, 'Primary', { maxWidth: 500 })
       : null
+  const posterFallback = item.ImageTags?.Primary
+    ? getFallbackImageUrl(item.Id, 'Primary')
+    : item.SeriesId
+      ? getFallbackImageUrl(item.SeriesId, 'Primary')
+      : null
+
+  const applyFallbackOrHide = (
+    e: React.SyntheticEvent<HTMLImageElement>,
+    fallback: string | null,
+  ) => {
+    const el = e.currentTarget
+    if (fallback && !el.dataset.fallbackApplied && el.src !== fallback) {
+      el.dataset.fallbackApplied = '1'
+      el.src = fallback
+      return
+    }
+    el.style.display = 'none'
+  }
 
   const resumeTicks = item.UserData?.PlaybackPositionTicks || 0
   const hasResume = resumeTicks > 10_000_000 * 15 // 超过 15 秒显示续播
@@ -171,6 +190,7 @@ export function ItemDetailPage() {
           <img
             src={backdrop}
             alt={item.Name}
+            onError={(e) => applyFallbackOrHide(e, backdropFallback)}
             className="absolute inset-0 h-full w-full object-cover object-top opacity-45"
           />
         ) : (
@@ -184,7 +204,12 @@ export function ItemDetailPage() {
             {/* 海报 */}
             <div className="w-44 shrink-0 self-start overflow-hidden rounded-2xl bg-zinc-900 shadow-2xl shadow-black/80 ring-1 ring-white/15 sm:w-52 md:w-60">
               {poster ? (
-                <img src={poster} alt={item.Name} className="aspect-[2/3] w-full object-cover" />
+                <img
+                  src={poster}
+                  alt={item.Name}
+                  onError={(e) => applyFallbackOrHide(e, posterFallback)}
+                  className="aspect-[2/3] w-full object-cover"
+                />
               ) : (
                 <div className="flex aspect-[2/3] items-center justify-center text-zinc-600">
                   <Film className="h-14 w-14 opacity-40" />
@@ -434,6 +459,9 @@ export function ItemDetailPage() {
                 const epThumb = ep.ImageTags?.Primary
                   ? getImageUrl(ep.Id, 'Primary', { maxWidth: 480, tag: ep.ImageTags.Primary })
                   : backdrop
+                const epFallback = ep.ImageTags?.Primary
+                  ? getFallbackImageUrl(ep.Id, 'Primary')
+                  : backdropFallback
                 const epProgress =
                   ep.UserData?.PlayedPercentage ??
                   (ep.UserData?.PlaybackPositionTicks && ep.RunTimeTicks
@@ -451,6 +479,7 @@ export function ItemDetailPage() {
                         <img
                           src={epThumb}
                           alt={ep.Name}
+                          onError={(e) => applyFallbackOrHide(e, epFallback)}
                           className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
                         />
                       ) : (

@@ -129,3 +129,108 @@ func TestLoadEmptyServerIDAndErrors(t *testing.T) {
 		t.Fatal("expected error when dataDir is a file")
 	}
 }
+
+func TestFFmpegEnvOverridesAndSiblingAutoDetect(t *testing.T) {
+	origExec := executablePathFn
+	t.Cleanup(func() { executablePathFn = origExec })
+
+	binDir := t.TempDir()
+	fakeExe := filepath.Join(binDir, "ambra")
+	executablePathFn = func() (string, error) { return fakeExe, nil }
+
+	// 1. No sibling binaries -> falls back to default names
+	dataDir := t.TempDir()
+	cfg, err := Load(dataDir)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if cfg.FFmpegPath != "ffmpeg" || cfg.FFprobePath != "ffprobe" {
+		t.Fatalf("expected default ffmpeg/ffprobe, got %q / %q", cfg.FFmpegPath, cfg.FFprobePath)
+	}
+
+	// 2. Sibling ffmpeg/ffprobe next to executable -> auto-detected
+	siblingFFmpeg := filepath.Join(binDir, "ffmpeg")
+	siblingFFprobe := filepath.Join(binDir, "ffprobe")
+	if err := os.WriteFile(siblingFFmpeg, []byte("bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(siblingFFprobe, []byte("bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgDetected, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatalf("Load with sibling binaries failed: %v", err)
+	}
+	if cfgDetected.FFmpegPath != siblingFFmpeg || cfgDetected.FFprobePath != siblingFFprobe {
+		t.Fatalf("expected sibling binaries %q / %q, got %q / %q",
+			siblingFFmpeg, siblingFFprobe, cfgDetected.FFmpegPath, cfgDetected.FFprobePath)
+	}
+
+	// 3. Env overrides take precedence over sibling auto-detect
+	t.Setenv("AMBRA_FFMPEG_PATH", "/custom/bin/ffmpeg")
+	t.Setenv("AMBRA_FFPROBE_PATH", "/custom/bin/ffprobe")
+	cfgEnv, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatalf("Load with ffmpeg env override failed: %v", err)
+	}
+	if cfgEnv.FFmpegPath != "/custom/bin/ffmpeg" || cfgEnv.FFprobePath != "/custom/bin/ffprobe" {
+		t.Fatalf("expected env overrides, got %q / %q", cfgEnv.FFmpegPath, cfgEnv.FFprobePath)
+	}
+
+	// 4. Explicit custom path in config is preserved over sibling auto-detect
+	customDataDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(customDataDir, "config"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(customDataDir, "config", "ambra.json"),
+		[]byte(`{"ffmpeg_path":"/opt/ffmpeg","ffprobe_path":"/opt/ffprobe"}`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AMBRA_FFMPEG_PATH", "")
+	t.Setenv("AMBRA_FFPROBE_PATH", "")
+	cfgCustom, err := Load(customDataDir)
+	if err != nil {
+		t.Fatalf("Load with custom config paths failed: %v", err)
+	}
+	if cfgCustom.FFmpegPath != "/opt/ffmpeg" || cfgCustom.FFprobePath != "/opt/ffprobe" {
+		t.Fatalf("expected custom paths preserved, got %q / %q", cfgCustom.FFmpegPath, cfgCustom.FFprobePath)
+	}
+
+	// 5. Managed <DataDir>/bin/ binaries are detected when no sibling exists
+	emptyExeDir := t.TempDir()
+	executablePathFn = func() (string, error) { return filepath.Join(emptyExeDir, "ambra"), nil }
+	managedDataDir := t.TempDir()
+	managedBinDir := filepath.Join(managedDataDir, "bin")
+	if err := os.MkdirAll(managedBinDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	managedFFmpeg := filepath.Join(managedBinDir, "ffmpeg")
+	managedFFprobe := filepath.Join(managedBinDir, "ffprobe")
+	if err := os.WriteFile(managedFFmpeg, []byte("bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(managedFFprobe, []byte("bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgManaged, err := Load(managedDataDir)
+	if err != nil {
+		t.Fatalf("Load with managed bin failed: %v", err)
+	}
+	if cfgManaged.FFmpegPath != managedFFmpeg || cfgManaged.FFprobePath != managedFFprobe {
+		t.Fatalf("expected managed bin %q / %q, got %q / %q",
+			managedFFmpeg, managedFFprobe, cfgManaged.FFmpegPath, cfgManaged.FFprobePath)
+	}
+
+	// 6. executablePathFn failure falls back cleanly to default names
+	executablePathFn = func() (string, error) { return "", os.ErrNotExist }
+	cfgFallback, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatalf("Load with executable error failed: %v", err)
+	}
+	if cfgFallback.FFmpegPath != "ffmpeg" || cfgFallback.FFprobePath != "ffprobe" {
+		t.Fatalf("expected fallback to default names, got %q / %q", cfgFallback.FFmpegPath, cfgFallback.FFprobePath)
+	}
+}

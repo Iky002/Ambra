@@ -1,10 +1,21 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { AlertCircle, ArrowRight, Loader2, Lock, Server, User } from 'lucide-react'
+import {
+  AlertCircle,
+  ArrowRight,
+  Loader2,
+  Lock,
+  Server,
+  ShieldCheck,
+  Sparkles,
+  User,
+  UserCheck,
+} from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { api, getUserImageUrl } from '../api/client'
 import { AmbraLogo } from '../components/AmbraLogo'
 import { useAuth } from '../context/AuthContext'
+import { isDemoMode } from '../demo/demoMode'
 
 export function LoginPage() {
   const { login } = useAuth()
@@ -13,6 +24,20 @@ export function LoginPage() {
   const [password, setPassword] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
+  const demoActive = isDemoMode()
+
+  const handleDemoQuickLogin = async (role: 'admin' | 'guest') => {
+    setError('')
+    setSubmitting(true)
+    try {
+      await login(role, '')
+      navigate('/', { replace: true })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Demo 一键登录失败')
+    } finally {
+      setSubmitting(false)
+    }
+  }
 
   const { data: sysInfo } = useQuery({
     queryKey: ['publicSystemInfo'],
@@ -171,6 +196,36 @@ export function LoginPage() {
             </button>
           </div>
         </form>
+
+        {/* Serverless Demo 一键登录面板（仅 Demo 模式渲染） */}
+        {demoActive && (
+          <div className="mt-4 rounded-2xl border border-amber-500/25 bg-amber-500/[0.06] p-4 backdrop-blur-xl">
+            <div className="mb-3 flex items-center gap-1.5 text-xs font-semibold text-amber-300">
+              <Sparkles className="h-3.5 w-3.5" />
+              <span>Serverless Demo 一键体验（无需密码）</span>
+            </div>
+            <div className="grid grid-cols-2 gap-2.5">
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={() => void handleDemoQuickLogin('admin')}
+                className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-amber-500/20 px-3 py-2 text-xs font-semibold text-amber-200 ring-1 ring-amber-400/35 transition-colors hover:bg-amber-500/30 disabled:opacity-50"
+              >
+                <ShieldCheck className="h-3.5 w-3.5" />
+                <span>管理员 (admin)</span>
+              </button>
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={() => void handleDemoQuickLogin('guest')}
+                className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-white/[0.06] px-3 py-2 text-xs font-medium text-zinc-200 ring-1 ring-white/12 transition-colors hover:bg-white/12 disabled:opacity-50"
+              >
+                <UserCheck className="h-3.5 w-3.5" />
+                <span>普通用户 (guest)</span>
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )
