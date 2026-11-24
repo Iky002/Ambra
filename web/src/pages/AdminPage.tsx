@@ -9,6 +9,7 @@ import {
   Key,
   Puzzle,
   RefreshCw,
+  SlidersHorizontal,
   Sparkles,
   Users,
 } from 'lucide-react'
@@ -22,6 +23,7 @@ import { LibrariesTab } from './admin/LibrariesTab'
 import { MetadataTab } from './admin/MetadataTab'
 import { MigrationTab } from './admin/MigrationTab'
 import { PluginsTab } from './admin/PluginsTab'
+import { SettingsTab } from './admin/SettingsTab'
 import { TasksLogsTab } from './admin/TasksLogsTab'
 import { UsersTab } from './admin/UsersTab'
 import { FeedbackBanner } from './admin/adminUtils'
@@ -32,6 +34,12 @@ const ADMIN_TABS = [
     label: '概览与监控',
     desc: '状态 · 会话 · 活动日志',
     icon: Activity,
+  },
+  {
+    path: 'settings',
+    label: '常规设置',
+    desc: '名称 · TMDB · 302 · 阈值',
+    icon: SlidersHorizontal,
   },
   {
     path: 'users',
@@ -221,6 +229,7 @@ export function AdminPage() {
             <Routes>
               <Route index element={<Navigate to="dashboard" replace />} />
               <Route path="dashboard" element={<DashboardTab />} />
+              <Route path="settings" element={<SettingsTab />} />
               <Route path="users" element={<UsersTab />} />
               <Route path="libraries" element={<LibrariesTab />} />
               <Route path="metadata" element={<MetadataTab />} />

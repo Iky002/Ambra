@@ -578,7 +578,17 @@ func TestImagesUploadServeAndTaxonomyImages(t *testing.T) {
 	if w := doReq(env.router, http.MethodPost, "/Items/imgitem1/Images/Backdrop/0/Index?newIndex=1", `{}`); w.Code != http.StatusNoContent {
 		t.Fatalf("update image index: %d", w.Code)
 	}
-	if w := doReq(env.router, http.MethodPost, "/Items/imgitem1/Images/Primary/0/Url", `{"Url":"https://example.com/a.jpg"}`); w.Code != http.StatusNoContent {
+	imgSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/a.png" {
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(pngBytes)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer imgSrv.Close()
+	env.handler.SetHTTPClient(imgSrv.Client())
+	if w := doReq(env.router, http.MethodPost, "/Items/imgitem1/Images/Primary/0/Url", `{"Url":"`+imgSrv.URL+`/a.png"}`); w.Code != http.StatusNoContent {
 		t.Fatalf("set image url: %d", w.Code)
 	}
 
@@ -591,7 +601,7 @@ func TestImagesUploadServeAndTaxonomyImages(t *testing.T) {
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "MockTMDb") {
 		t.Fatalf("remote image providers: %d %s", w.Code, w.Body.String())
 	}
-	w = doReq(env.router, http.MethodGet, "/Images/Remote?imageUrl=https://example.com/a.jpg", "")
+	w = doReq(env.router, http.MethodGet, "/Images/Remote?imageUrl="+imgSrv.URL+"/missing.jpg", "")
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("remote image proxy expected 404, got %d", w.Code)
 	}

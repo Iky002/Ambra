@@ -28,6 +28,7 @@ import type {
   ScanProgressSnapshot,
   ScheduledTaskInfo,
   SearchHintResult,
+  ServerConfiguration,
   ServerLogFile,
   SessionInfo,
   SetupAdminRequest,
@@ -585,6 +586,41 @@ export const api = {
     })
   },
 
+  renameVirtualFolder: (name: string, newName: string) => {
+    const q = new URLSearchParams({
+      Name: name,
+      NewName: newName,
+    })
+    return embyFetch<void>(`/emby/Library/VirtualFolders/Name?${q.toString()}`, {
+      method: 'POST',
+      body: JSON.stringify({ Name: name, NewName: newName }),
+    })
+  },
+
+  addVirtualFolderPath: (name: string, path: string, refreshLibrary = false) =>
+    embyFetch<void>('/emby/Library/VirtualFolders/Paths', {
+      method: 'POST',
+      body: JSON.stringify({ Name: name, Path: path, RefreshLibrary: refreshLibrary }),
+    }),
+
+  removeVirtualFolderPath: (name: string, path: string) => {
+    const q = new URLSearchParams({
+      Name: name,
+      Path: path,
+    })
+    return embyFetch<void>(`/emby/Library/VirtualFolders/Paths?${q.toString()}`, {
+      method: 'DELETE',
+    })
+  },
+
+  getServerConfig: () => embyFetch<ServerConfiguration>('/emby/System/Configuration'),
+
+  updateServerConfig: (cfg: Partial<ServerConfiguration>) =>
+    embyFetch<void>('/emby/System/Configuration', {
+      method: 'POST',
+      body: JSON.stringify(cfg),
+    }),
+
   getDrives: () => embyFetch<FileSystemEntry[]>('/emby/Environment/Drives'),
 
   getDirectoryContents: (path: string, includeDirectories = true, includeFiles = false) => {
@@ -636,6 +672,11 @@ export const api = {
   runScheduledTask: (taskId: string) =>
     embyFetch<void>(`/emby/ScheduledTasks/Running/${encodeURIComponent(taskId)}`, {
       method: 'POST',
+    }),
+
+  stopScheduledTask: (taskId: string) =>
+    embyFetch<void>(`/emby/ScheduledTasks/Running/${encodeURIComponent(taskId)}`, {
+      method: 'DELETE',
     }),
 
   getServerLogs: async (): Promise<ServerLogFile[]> => {
@@ -774,7 +815,7 @@ export const api = {
     url: string,
   ) =>
     embyFetch<void>(
-      `/emby/Items/${encodeURIComponent(itemId)}/Images/${encodeURIComponent(type)}/Url`,
+      `/emby/Items/${encodeURIComponent(itemId)}/Images/${encodeURIComponent(type)}/0/Url`,
       {
         method: 'POST',
         body: JSON.stringify({ Url: url }),
@@ -801,6 +842,43 @@ export const api = {
     }),
 
   getScanProgress: () => embyFetch<ScanProgressSnapshot>('/api/admin/scanner/progress'),
+
+  pauseScan: () =>
+    embyFetch<void>('/api/admin/scanner/pause', {
+      method: 'POST',
+    }),
+
+  resumeScan: () =>
+    embyFetch<void>('/api/admin/scanner/resume', {
+      method: 'POST',
+    }),
+
+  cancelScan: () =>
+    embyFetch<void>('/api/admin/scanner/cancel', {
+      method: 'POST',
+    }),
+
+  lockItemFields: (itemId: string, fields: string[], lockData: boolean) =>
+    embyFetch<{ item_id?: string; locked_fields?: string[]; lock_data?: boolean }>(
+      `/api/admin/governance/items/${encodeURIComponent(itemId)}/lock`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          LockedFields: fields,
+          fields,
+          LockData: lockData,
+          lock_data: lockData,
+        }),
+      },
+    ),
+
+  writeItemNfo: (itemId: string) =>
+    embyFetch<{ item_id?: string; path?: string; written?: boolean }>(
+      `/api/admin/governance/items/${encodeURIComponent(itemId)}/nfo`,
+      {
+        method: 'POST',
+      },
+    ),
 
   // ==================== First-Run Setup Wizard APIs ====================
 

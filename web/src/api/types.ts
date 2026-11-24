@@ -12,6 +12,18 @@ export interface PublicSystemInfo {
   Id: string
 }
 
+export interface ServerConfiguration {
+  ServerName: string
+  IsStartupWizardCompleted?: boolean
+  TMDBApiKey?: string
+  TMDBLanguage?: string
+  EnableSTRM302?: boolean
+  PlayedThreshold?: number
+  PreferredMetadataLanguage?: string
+  MetadataCountryCode?: string
+  UICulture?: string
+}
+
 export interface SystemInfo extends PublicSystemInfo {
   OperatingSystem?: string
   OperatingSystemDisplayName?: string
@@ -199,6 +211,8 @@ export interface BaseItemDto {
   BackdropImageTags?: string[]
   PrimaryImageAspectRatio?: number
   LocationType?: string
+  LockedFields?: string[]
+  LockData?: boolean
 }
 
 export interface MediaAttachmentInfo {
@@ -466,6 +480,7 @@ export interface LibraryScanProgress {
 
 export interface ScanProgressSnapshot {
   running: boolean
+  paused?: boolean
   phase: 'idle' | 'discovering' | 'enriching' | string
   library_id?: string
   library_name?: string

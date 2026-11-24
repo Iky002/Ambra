@@ -3,16 +3,21 @@ package compatmedia
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
+	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -23,8 +28,18 @@ import (
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/core/imaging"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/plugins/tmdb"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
+
+const (
+	maxRemoteImageDownloadBytes = 15 * 1024 * 1024
+	remoteImageUserAgent        = "Ambra-Media-Server/1.0"
+)
+
+type remoteImageFetcher interface {
+	FetchImages(ctx context.Context, itemType, tmdbID string) ([]tmdb.RemoteImageCandidate, error)
+}
 
 type imageInfoDTO struct {
 	ImageType  string `json:"ImageType"`
@@ -252,20 +267,104 @@ func (h *Handler) handleUpdateImageIndex(w http.ResponseWriter, r *http.Request)
 func (h *Handler) handleSetImageURL(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	imageType := chi.URLParam(r, "Type")
-	idx, _ := strconv.Atoi(chi.URLParam(r, "Index"))
-	var body map[string]any
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
+	if imageType == "" {
+		imageType = "Primary"
 	}
-	_ = h.setConfigJSON(r.Context(), "image_url_"+itemID+"_"+strings.ToLower(imageType)+"_"+strconv.Itoa(idx), body)
+	idx := 0
+	if rawIdx := chi.URLParam(r, "Index"); rawIdx != "" {
+		idx, _ = strconv.Atoi(rawIdx)
+	}
+
+	q := httpx.ParseQuery(r)
+	rawURL := nonEmpty(q.Get("Url"), q.Get("ImageUrl"))
+	if r.Body != nil {
+		var body struct {
+			Url      string `json:"Url"`
+			ImageUrl string `json:"ImageUrl"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+			rawURL = nonEmpty(rawURL, body.Url, body.ImageUrl)
+		}
+	}
+	if !isValidHTTPURL(rawURL) {
+		httpx.Error(w, http.StatusBadRequest, "valid http/https image url is required")
+		return
+	}
+	if _, err := h.repo.GetItemRecordByID(r.Context(), itemID); errors.Is(err, sqlite.ErrNotFound) {
+		httpx.Error(w, http.StatusNotFound, "item not found")
+		return
+	} else if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if err := h.downloadAndSaveItemImage(r.Context(), itemID, imageType, idx, rawURL); err != nil {
+		httpx.Error(w, http.StatusBadGateway, err.Error())
+		return
+	}
 	httpx.NoContent(w)
 }
 
-func (h *Handler) handleRemoteImages(w http.ResponseWriter, _ *http.Request) {
+func (h *Handler) handleRemoteImages(w http.ResponseWriter, r *http.Request) {
+	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	q := httpx.ParseQuery(r)
+	filterType := strings.TrimSpace(q.Get("Type"))
+	startIndex := q.Int("StartIndex", 0)
+	limit := q.Int("Limit", 0)
+
 	providers := h.listImageProviderNames()
+	images := make([]tmdb.RemoteImageCandidate, 0)
+
+	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		httpx.Error(w, http.StatusNotFound, "item not found")
+		return
+	}
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	tmdbID := lookupProviderID(rec.Extra.ProviderIDs, "tmdb")
+	hasTMDBProvider := false
+	if h.registry != nil && tmdbID != "" {
+		for _, p := range h.registry.MetadataProviders() {
+			fetcher, ok := p.(remoteImageFetcher)
+			if !ok {
+				continue
+			}
+			hasTMDBProvider = true
+			cands, fErr := fetcher.FetchImages(r.Context(), rec.Type, tmdbID)
+			if fErr != nil {
+				continue
+			}
+			for _, c := range cands {
+				if filterType != "" && !strings.EqualFold(c.Type, filterType) {
+					continue
+				}
+				images = append(images, c)
+			}
+		}
+	}
+	if hasTMDBProvider {
+		providers = ensureProviderName(providers, "TheMovieDb")
+	}
+
+	total := len(images)
+	if startIndex > 0 {
+		if startIndex >= len(images) {
+			images = []tmdb.RemoteImageCandidate{}
+		} else {
+			images = images[startIndex:]
+		}
+	}
+	if limit > 0 && len(images) > limit {
+		images = images[:limit]
+	}
+
 	httpx.JSON(w, http.StatusOK, map[string]any{
-		"Images":           []any{},
-		"TotalRecordCount": 0,
+		"Images":           images,
+		"TotalRecordCount": total,
 		"Providers":        providers,
 	})
 }
@@ -300,17 +399,211 @@ func (h *Handler) listImageProviderNames() []string {
 	return names
 }
 
-func (h *Handler) handleDownloadRemoteImage(w http.ResponseWriter, _ *http.Request) {
+func (h *Handler) handleDownloadRemoteImage(w http.ResponseWriter, r *http.Request) {
+	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	q := httpx.ParseQuery(r)
+	imageType := strings.TrimSpace(q.Get("Type"))
+	imageURL := nonEmpty(q.Get("ImageUrl"), q.Get("Url"))
+
+	if r.Body != nil {
+		var body struct {
+			Type     string `json:"Type"`
+			ImageUrl string `json:"ImageUrl"`
+			Url      string `json:"Url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+			imageType = nonEmpty(imageType, body.Type)
+			imageURL = nonEmpty(imageURL, body.ImageUrl, body.Url)
+		}
+	}
+	if imageType == "" {
+		imageType = "Primary"
+	}
+	if !isValidHTTPURL(imageURL) {
+		httpx.Error(w, http.StatusBadRequest, "valid http/https ImageUrl is required")
+		return
+	}
+	if _, err := h.repo.GetItemRecordByID(r.Context(), itemID); errors.Is(err, sqlite.ErrNotFound) {
+		httpx.Error(w, http.StatusNotFound, "item not found")
+		return
+	} else if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if err := h.downloadAndSaveItemImage(r.Context(), itemID, imageType, 0, imageURL); err != nil {
+		httpx.Error(w, http.StatusBadGateway, err.Error())
+		return
+	}
 	httpx.NoContent(w)
 }
 
 func (h *Handler) handleRemoteImageProxy(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
-	if q.Get("imageUrl") == "" {
-		httpx.Error(w, http.StatusBadRequest, "imageUrl is required")
+	rawURL := strings.TrimSpace(q.Get("imageUrl"))
+	if !isValidHTTPURL(rawURL) {
+		httpx.Error(w, http.StatusBadRequest, "valid http/https imageUrl is required")
 		return
 	}
-	httpx.Error(w, http.StatusNotFound, "remote image not cached")
+	parsed, _ := url.Parse(rawURL)
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, rawURL, nil)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid imageUrl")
+		return
+	}
+	req.Header.Set("User-Agent", remoteImageUserAgent)
+
+	resp, err := h.getHTTPClient().Do(req)
+	if err != nil {
+		httpx.Error(w, http.StatusBadGateway, "failed to fetch remote image")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		httpx.Error(w, http.StatusNotFound, "remote image not found")
+		return
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxRemoteImageDownloadBytes+1))
+	if err != nil || len(data) == 0 || len(data) > maxRemoteImageDownloadBytes {
+		httpx.Error(w, http.StatusBadGateway, "invalid remote image payload")
+		return
+	}
+
+	ct := normalizeContentType(resp.Header.Get("Content-Type"))
+	detected := normalizeContentType(http.DetectContentType(data))
+	isTMDBHost := parsed != nil && (strings.EqualFold(parsed.Hostname(), "image.tmdb.org") || strings.HasSuffix(strings.ToLower(parsed.Hostname()), ".tmdb.org"))
+	if !isTMDBHost && !strings.HasPrefix(ct, "image/") && !strings.HasPrefix(detected, "image/") {
+		httpx.Error(w, http.StatusBadRequest, "remote resource is not an image")
+		return
+	}
+	if !strings.HasPrefix(ct, "image/") {
+		if strings.HasPrefix(detected, "image/") {
+			ct = detected
+		} else {
+			ct = "image/jpeg"
+		}
+	}
+
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+func (h *Handler) downloadAndSaveItemImage(ctx context.Context, itemID, imageType string, idx int, rawURL string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", remoteImageUserAgent)
+
+	resp, err := h.getHTTPClient().Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("remote image returned status %d", resp.StatusCode)
+	}
+
+	ct := normalizeContentType(resp.Header.Get("Content-Type"))
+	if strings.HasPrefix(ct, "text/") || strings.Contains(ct, "json") || strings.Contains(ct, "xml") {
+		return fmt.Errorf("remote image has non-image content-type %q", ct)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxRemoteImageDownloadBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(data) == 0 {
+		return errors.New("remote image is empty")
+	}
+	if len(data) > maxRemoteImageDownloadBytes {
+		return errors.New("remote image exceeds 15MB limit")
+	}
+
+	ext := imageExtForData(data, ct)
+	baseDir := filepath.Join(os.TempDir(), "ambra-images", itemID)
+	if h.cfg != nil && strings.TrimSpace(h.cfg.DataDir) != "" {
+		baseDir = filepath.Join(h.cfg.DataDir, "metadata", "images", itemID)
+	}
+	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+		return err
+	}
+
+	filePath := filepath.Join(baseDir, strings.ToLower(imageType)+"_"+strconv.Itoa(idx)+ext)
+	tmpPath := filePath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, filePath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+
+	width, height := 0, 0
+	if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
+		width, height = cfg.Width, cfg.Height
+	}
+	sum := sha256.Sum256(data)
+	tag := hex.EncodeToString(sum[:8])
+
+	return h.repo.UpsertImage(ctx, &sqlite.ImageRecord{
+		ItemID:     itemID,
+		ImageType:  imageType,
+		ImageIndex: idx,
+		Path:       filePath,
+		Tag:        tag,
+		Width:      width,
+		Height:     height,
+	})
+}
+
+func isValidHTTPURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	return scheme == "http" || scheme == "https"
+}
+
+func normalizeContentType(ct string) string {
+	ct = strings.ToLower(strings.TrimSpace(ct))
+	if mt, _, err := mime.ParseMediaType(ct); err == nil {
+		return mt
+	}
+	return ct
+}
+
+func lookupProviderID(ids map[string]string, key string) string {
+	if len(ids) == 0 {
+		return ""
+	}
+	if v := strings.TrimSpace(ids[key]); v != "" {
+		return v
+	}
+	for k, v := range ids {
+		if strings.EqualFold(k, key) {
+			if tv := strings.TrimSpace(v); tv != "" {
+				return tv
+			}
+		}
+	}
+	return ""
+}
+
+func ensureProviderName(names []string, target string) []string {
+	for _, n := range names {
+		if strings.EqualFold(n, target) {
+			return names
+		}
+	}
+	return append(names, target)
 }
 
 // handleEntityImage serves GET/HEAD /{Artists|Genres|MusicGenres|GameGenres|Persons|Studios}/{Name}/Images/{Type}[/{Index}].

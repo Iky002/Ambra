@@ -17,7 +17,24 @@ const (
 	defaultBaseURL             = "https://api.themoviedb.org/3"
 	defaultImageBaseURL        = "https://image.tmdb.org/t/p/original"
 	defaultProfileImageBaseURL = "https://image.tmdb.org/t/p/w185"
+	defaultPosterThumbBaseURL  = "https://image.tmdb.org/t/p/w342"
+	defaultBackdropThumbURL    = "https://image.tmdb.org/t/p/w500"
+	maxSearchCandidates        = 10
 )
+
+// RemoteImageCandidate represents a single remote artwork candidate from TMDB.
+type RemoteImageCandidate struct {
+	ProviderName    string  `json:"ProviderName"`
+	Url             string  `json:"Url"`
+	ThumbnailUrl    string  `json:"ThumbnailUrl,omitempty"`
+	Width           int     `json:"Width,omitempty"`
+	Height          int     `json:"Height,omitempty"`
+	Language        string  `json:"Language,omitempty"`
+	VoteAverage     float64 `json:"VoteAverage,omitempty"`
+	CommunityRating float64 `json:"CommunityRating,omitempty"`
+	VoteCount       int     `json:"VoteCount,omitempty"`
+	Type            string  `json:"Type"`
+}
 
 // Provider implements plugins.MetadataProvider using TMDB v3 REST API.
 type Provider struct {
@@ -446,6 +463,196 @@ func (p *Provider) fetchEpisode(ctx context.Context, q plugins.MediaQuery, lang 
 		res.PosterURL = p.imageBaseURL + ep.StillPath
 	}
 	return res, nil
+}
+
+// SearchCandidates searches TMDB /search/movie or /search/tv and returns up to 10 candidates.
+func (p *Provider) SearchCandidates(ctx context.Context, itemType, query string, year int, lang string) ([]plugins.MetadataResult, error) {
+	if p.apiKey == "" || strings.TrimSpace(query) == "" {
+		return nil, nil
+	}
+	if lang == "" {
+		lang = p.language
+	}
+
+	isSeries := strings.EqualFold(itemType, "series") || strings.EqualFold(itemType, "tv")
+	params := url.Values{}
+	params.Set("api_key", p.apiKey)
+	params.Set("language", lang)
+	params.Set("query", strings.TrimSpace(query))
+
+	if isSeries {
+		if year > 0 {
+			params.Set("first_air_date_year", strconv.Itoa(year))
+		}
+		var sr struct {
+			Results []struct {
+				ID           int     `json:"id"`
+				Name         string  `json:"name"`
+				OriginalName string  `json:"original_name"`
+				Overview     string  `json:"overview"`
+				FirstAirDate string  `json:"first_air_date"`
+				VoteAverage  float64 `json:"vote_average"`
+				PosterPath   string  `json:"poster_path"`
+				BackdropPath string  `json:"backdrop_path"`
+			} `json:"results"`
+		}
+		if err := p.getJSON(ctx, "/search/tv", params, &sr); err != nil {
+			return nil, err
+		}
+		limit := len(sr.Results)
+		if limit > maxSearchCandidates {
+			limit = maxSearchCandidates
+		}
+		out := make([]plugins.MetadataResult, 0, limit)
+		for _, item := range sr.Results[:limit] {
+			mr := plugins.MetadataResult{
+				Name:            item.Name,
+				OriginalTitle:   item.OriginalName,
+				Overview:        item.Overview,
+				PremiereDate:    item.FirstAirDate,
+				CommunityRating: item.VoteAverage,
+				ProviderIDs:     map[string]string{"tmdb": strconv.Itoa(item.ID)},
+			}
+			if len(item.FirstAirDate) >= 4 {
+				if y, err := strconv.Atoi(item.FirstAirDate[:4]); err == nil {
+					mr.Year = y
+				}
+			}
+			if item.PosterPath != "" {
+				mr.PosterURL = p.imageBaseURL + item.PosterPath
+			}
+			if item.BackdropPath != "" {
+				mr.BackdropURL = p.imageBaseURL + item.BackdropPath
+			}
+			out = append(out, mr)
+		}
+		return out, nil
+	}
+
+	if year > 0 {
+		params.Set("year", strconv.Itoa(year))
+	}
+	var sr struct {
+		Results []struct {
+			ID            int     `json:"id"`
+			Title         string  `json:"title"`
+			OriginalTitle string  `json:"original_title"`
+			Overview      string  `json:"overview"`
+			ReleaseDate   string  `json:"release_date"`
+			VoteAverage   float64 `json:"vote_average"`
+			PosterPath    string  `json:"poster_path"`
+			BackdropPath  string  `json:"backdrop_path"`
+		} `json:"results"`
+	}
+	if err := p.getJSON(ctx, "/search/movie", params, &sr); err != nil {
+		return nil, err
+	}
+	limit := len(sr.Results)
+	if limit > maxSearchCandidates {
+		limit = maxSearchCandidates
+	}
+	out := make([]plugins.MetadataResult, 0, limit)
+	for _, item := range sr.Results[:limit] {
+		mr := plugins.MetadataResult{
+			Name:            item.Title,
+			OriginalTitle:   item.OriginalTitle,
+			Overview:        item.Overview,
+			PremiereDate:    item.ReleaseDate,
+			CommunityRating: item.VoteAverage,
+			ProviderIDs:     map[string]string{"tmdb": strconv.Itoa(item.ID)},
+		}
+		if len(item.ReleaseDate) >= 4 {
+			if y, err := strconv.Atoi(item.ReleaseDate[:4]); err == nil {
+				mr.Year = y
+			}
+		}
+		if item.PosterPath != "" {
+			mr.PosterURL = p.imageBaseURL + item.PosterPath
+		}
+		if item.BackdropPath != "" {
+			mr.BackdropURL = p.imageBaseURL + item.BackdropPath
+		}
+		out = append(out, mr)
+	}
+	return out, nil
+}
+
+// FetchImages queries TMDB /movie/{id}/images or /tv/{id}/images and returns Primary and Backdrop candidates.
+func (p *Provider) FetchImages(ctx context.Context, itemType, tmdbID string) ([]RemoteImageCandidate, error) {
+	tmdbID = strings.TrimSpace(tmdbID)
+	if p.apiKey == "" || tmdbID == "" {
+		return nil, nil
+	}
+	endpoint := "/movie/" + url.PathEscape(tmdbID) + "/images"
+	if strings.EqualFold(itemType, "series") || strings.EqualFold(itemType, "tv") {
+		endpoint = "/tv/" + url.PathEscape(tmdbID) + "/images"
+	}
+	params := url.Values{}
+	params.Set("api_key", p.apiKey)
+	params.Set("include_image_language", "zh,en,null")
+
+	type tmdbImageEntry struct {
+		FilePath    string  `json:"file_path"`
+		Width       int     `json:"width"`
+		Height      int     `json:"height"`
+		ISO6391     string  `json:"iso_639_1"`
+		VoteAverage float64 `json:"vote_average"`
+		VoteCount   int     `json:"vote_count"`
+	}
+	var resp struct {
+		Posters   []tmdbImageEntry `json:"posters"`
+		Backdrops []tmdbImageEntry `json:"backdrops"`
+	}
+	if err := p.getJSON(ctx, endpoint, params, &resp); err != nil {
+		return nil, err
+	}
+
+	thumbURL := func(imgType, filePath string) string {
+		if p.imageBaseURL != defaultImageBaseURL {
+			return p.imageBaseURL + filePath
+		}
+		if imgType == "Backdrop" {
+			return defaultBackdropThumbURL + filePath
+		}
+		return defaultPosterThumbBaseURL + filePath
+	}
+
+	out := make([]RemoteImageCandidate, 0, len(resp.Posters)+len(resp.Backdrops))
+	for _, img := range resp.Posters {
+		if img.FilePath == "" {
+			continue
+		}
+		out = append(out, RemoteImageCandidate{
+			ProviderName:    "TheMovieDb",
+			Url:             p.imageBaseURL + img.FilePath,
+			ThumbnailUrl:    thumbURL("Primary", img.FilePath),
+			Width:           img.Width,
+			Height:          img.Height,
+			Language:        img.ISO6391,
+			VoteAverage:     img.VoteAverage,
+			CommunityRating: img.VoteAverage,
+			VoteCount:       img.VoteCount,
+			Type:            "Primary",
+		})
+	}
+	for _, img := range resp.Backdrops {
+		if img.FilePath == "" {
+			continue
+		}
+		out = append(out, RemoteImageCandidate{
+			ProviderName:    "TheMovieDb",
+			Url:             p.imageBaseURL + img.FilePath,
+			ThumbnailUrl:    thumbURL("Backdrop", img.FilePath),
+			Width:           img.Width,
+			Height:          img.Height,
+			Language:        img.ISO6391,
+			VoteAverage:     img.VoteAverage,
+			CommunityRating: img.VoteAverage,
+			VoteCount:       img.VoteCount,
+			Type:            "Backdrop",
+		})
+	}
+	return out, nil
 }
 
 func (p *Provider) getJSON(ctx context.Context, endpoint string, params url.Values, dst any) error {

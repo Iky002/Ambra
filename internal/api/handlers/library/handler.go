@@ -13,6 +13,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/scanner"
+	"github.com/ambra-media/ambra/internal/core/watcher"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
@@ -28,6 +29,7 @@ type Handler struct {
 	repo     *sqlite.LibraryRepo
 	userRepo *sqlite.UserRepo
 	scanner  *scanner.Scanner
+	watcher  *watcher.Watcher
 	cfg      *config.Config
 	auth     AuthFuncs
 }
@@ -43,6 +45,11 @@ func New(repo *sqlite.LibraryRepo, sc *scanner.Scanner, cfg *config.Config) *Han
 // SetUserRepo attaches a UserRepo for per-user library access control (Policy.EnableAllFolders / EnabledFolders).
 func (h *Handler) SetUserRepo(userRepo *sqlite.UserRepo) {
 	h.userRepo = userRepo
+}
+
+// SetWatcher attaches a filesystem Watcher so library creation/deletion dynamically updates watches.
+func (h *Handler) SetWatcher(w *watcher.Watcher) {
+	h.watcher = w
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
@@ -98,6 +105,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	handleAdmin("POST /Library/Refresh", h.handleRefreshLibrary)
 	handleAdmin("POST /Library/Media/Updated", h.handleMediaUpdated)
 	handleAdmin("GET /api/admin/scanner/progress", h.handleScannerProgress)
+	handleAdmin("POST /api/admin/scanner/pause", h.handleScannerPause)
+	handleAdmin("POST /api/admin/scanner/resume", h.handleScannerResume)
+	handleAdmin("POST /api/admin/scanner/cancel", h.handleScannerCancel)
 }
 
 func (h *Handler) serverID() string {
@@ -594,6 +604,9 @@ func (h *Handler) handleCreateVirtualFolder(w http.ResponseWriter, r *http.Reque
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if h.watcher != nil {
+		_ = h.watcher.WatchLibrary(lib.ID, lib.Paths)
+	}
 	if h.scanner != nil && q.Bool("refreshLibrary") != nil && *q.Bool("refreshLibrary") {
 		h.scanner.ScanLibraryAsync(lib.ID)
 	}
@@ -612,13 +625,30 @@ func (h *Handler) handleDeleteVirtualFolder(w http.ResponseWriter, r *http.Reque
 			httpx.Error(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if h.watcher != nil {
+			_ = h.watcher.UnwatchLibrary(guid.Normalize(id))
+		}
 		httpx.NoContent(w)
 		return
 	}
 	if name := q.Get("name"); name != "" {
+		var watchID string
+		if h.watcher != nil {
+			if libs, err := h.repo.ListLibraries(r.Context()); err == nil {
+				for _, lib := range libs {
+					if lib.Name == name {
+						watchID = lib.ID
+						break
+					}
+				}
+			}
+		}
 		if err := h.repo.DeleteLibraryByName(r.Context(), name); err != nil && !errors.Is(err, sqlite.ErrNotFound) {
 			httpx.Error(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if h.watcher != nil && watchID != "" {
+			_ = h.watcher.UnwatchLibrary(watchID)
 		}
 		httpx.NoContent(w)
 		return
@@ -641,7 +671,7 @@ func (h *Handler) handleMediaUpdated(w http.ResponseWriter, r *http.Request) {
 	httpx.NoContent(w)
 }
 
-func (h *Handler) handleScannerProgress(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) writeScannerProgress(w http.ResponseWriter) {
 	if h.scanner == nil {
 		httpx.JSON(w, http.StatusOK, scanner.ScanProgressSnapshot{
 			Running:   false,
@@ -651,6 +681,31 @@ func (h *Handler) handleScannerProgress(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	httpx.JSON(w, http.StatusOK, h.scanner.Progress())
+}
+
+func (h *Handler) handleScannerProgress(w http.ResponseWriter, r *http.Request) {
+	h.writeScannerProgress(w)
+}
+
+func (h *Handler) handleScannerPause(w http.ResponseWriter, r *http.Request) {
+	if h.scanner != nil {
+		h.scanner.Pause()
+	}
+	h.writeScannerProgress(w)
+}
+
+func (h *Handler) handleScannerResume(w http.ResponseWriter, r *http.Request) {
+	if h.scanner != nil {
+		h.scanner.Resume()
+	}
+	h.writeScannerProgress(w)
+}
+
+func (h *Handler) handleScannerCancel(w http.ResponseWriter, r *http.Request) {
+	if h.scanner != nil {
+		h.scanner.CancelAll()
+	}
+	h.writeScannerProgress(w)
 }
 
 func passthrough(next http.Handler) http.Handler { return next }

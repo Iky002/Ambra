@@ -113,6 +113,28 @@ func (s *Scanner) waitIfPaused(ctx context.Context) error {
 	}
 }
 
+// SetOnScanComplete registers a callback invoked after Phase A/B finishes when items were added or updated.
+func (s *Scanner) SetOnScanComplete(fn func(ctx context.Context, libraryID string, stats ScanStats)) {
+	s.mu.Lock()
+	s.onScanComplete = fn
+	s.mu.Unlock()
+}
+
+func (s *Scanner) notifyScanComplete(ctx context.Context, libraryID string, stats ScanStats) {
+	if ctx.Err() != nil {
+		return
+	}
+	if stats.ItemsAdded == 0 && stats.ItemsUpdated == 0 {
+		return
+	}
+	s.mu.Lock()
+	fn := s.onScanComplete
+	s.mu.Unlock()
+	if fn != nil {
+		fn(ctx, libraryID, stats)
+	}
+}
+
 // CancelScan cancels an in-progress scan (Phase A or Phase B) for libraryID.
 func (s *Scanner) CancelScan(libraryID string) {
 	libraryID = guid.Normalize(libraryID)
@@ -122,6 +144,28 @@ func (s *Scanner) CancelScan(libraryID string) {
 	if cancel != nil {
 		cancel()
 	}
+}
+
+// CancelLibrary cancels an in-progress scan for libraryID.
+func (s *Scanner) CancelLibrary(libraryID string) {
+	s.CancelScan(libraryID)
+}
+
+// CancelAll cancels all in-progress library scans and clears paused state.
+func (s *Scanner) CancelAll() {
+	s.mu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(s.cancels))
+	for _, cancel := range s.cancels {
+		if cancel != nil {
+			cancels = append(cancels, cancel)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+	s.Resume()
 }
 
 // ScanLibraryProgressive runs Phase A (fast discovery + local NFO/images/subtitles)
@@ -163,15 +207,21 @@ func (s *Scanner) scanLibrary(ctx context.Context, libraryID string, asyncPhaseB
 
 	s.startLibraryProgress(lib.ID, lib.Name)
 
-	tasks, err := s.runPhaseA(scanCtx, lib, lib.Paths, &stats)
+	discovered := make(map[string]struct{})
+	tasks, walkHadError, err := s.runPhaseA(scanCtx, lib, lib.Paths, discovered, &stats)
 	if err != nil {
 		releaseScan()
 		return stats, err
 	}
 
+	if !walkHadError && len(lib.Paths) > 0 && scanCtx.Err() == nil {
+		s.pruneDeletedLibraryItems(scanCtx, lib.ID, discovered, &stats)
+	}
+
 	s.publishLibraryChanged(scanCtx, lib.ID, stats, "discovery")
 
 	if len(tasks) == 0 {
+		s.notifyScanComplete(scanCtx, lib.ID, stats)
 		releaseScan()
 		return stats, nil
 	}
@@ -179,14 +229,36 @@ func (s *Scanner) scanLibrary(ctx context.Context, libraryID string, asyncPhaseB
 	if asyncPhaseB {
 		go func() {
 			defer releaseScan()
-			s.runPhaseB(scanCtx, lib.ID, tasks)
+			stats.ItemsUpdated += s.runPhaseB(scanCtx, lib.ID, tasks)
+			s.notifyScanComplete(scanCtx, lib.ID, stats)
 		}()
 		return stats, nil
 	}
 
 	defer releaseScan()
-	s.runPhaseB(scanCtx, lib.ID, tasks)
+	stats.ItemsUpdated += s.runPhaseB(scanCtx, lib.ID, tasks)
+	s.notifyScanComplete(scanCtx, lib.ID, stats)
 	return stats, nil
+}
+
+func (s *Scanner) pruneDeletedLibraryItems(ctx context.Context, libraryID string, discovered map[string]struct{}, stats *ScanStats) {
+	existingPaths, err := s.repo.ListLibraryItemPaths(ctx, libraryID)
+	if err != nil {
+		return
+	}
+	for p := range existingPaths {
+		if ctx.Err() != nil {
+			return
+		}
+		if _, ok := discovered[filepath.Clean(p)]; ok {
+			continue
+		}
+		if _, statErr := os.Stat(p); os.IsNotExist(statErr) {
+			if deleted, delErr := s.repo.DeleteItemByPath(ctx, libraryID, p); delErr == nil && deleted {
+				stats.ItemsDeleted++
+			}
+		}
+	}
 }
 
 // ScanPath performs an incremental scan of a single file or subdirectory within libraryID.
@@ -208,6 +280,14 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 	info, err := os.Stat(cleanTarget)
 	if err != nil {
 		if os.IsNotExist(err) {
+			deleted, delErr := s.repo.DeleteItemByPath(ctx, lib.ID, cleanTarget)
+			if delErr != nil {
+				return stats, delErr
+			}
+			if deleted {
+				stats.ItemsDeleted++
+				s.publishLibraryChanged(ctx, lib.ID, stats, "cleanup")
+			}
 			return stats, nil
 		}
 		return stats, err
@@ -229,7 +309,7 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 			tasks = append(tasks, itemTasks...)
 		}
 	} else {
-		dirTasks, err := s.runPhaseAWithRoot(ctx, lib, root, cleanTarget, &stats)
+		dirTasks, _, err := s.runPhaseAWithRoot(ctx, lib, root, cleanTarget, nil, &stats)
 		if err != nil {
 			return stats, err
 		}
@@ -240,8 +320,9 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 		s.publishLibraryChanged(ctx, lib.ID, stats, "discovery")
 	}
 	if len(tasks) > 0 {
-		s.runPhaseB(ctx, lib.ID, tasks)
+		stats.ItemsUpdated += s.runPhaseB(ctx, lib.ID, tasks)
 	}
+	s.notifyScanComplete(ctx, lib.ID, stats)
 	return stats, nil
 }
 
@@ -260,23 +341,27 @@ func findContainingRoot(roots []string, target string) string {
 	return filepath.Dir(cleanTarget)
 }
 
-func (s *Scanner) runPhaseA(ctx context.Context, lib *sqlite.LibraryRecord, roots []string, stats *ScanStats) ([]enrichTask, error) {
+func (s *Scanner) runPhaseA(ctx context.Context, lib *sqlite.LibraryRecord, roots []string, discovered map[string]struct{}, stats *ScanStats) ([]enrichTask, bool, error) {
 	var allTasks []enrichTask
+	walkHadError := false
 	for _, root := range roots {
 		root = strings.TrimSpace(root)
 		if root == "" {
 			continue
 		}
-		tasks, err := s.runPhaseAWithRoot(ctx, lib, root, root, stats)
+		tasks, hadErr, err := s.runPhaseAWithRoot(ctx, lib, root, root, discovered, stats)
 		if err != nil {
-			return allTasks, err
+			return allTasks, true, err
+		}
+		if hadErr {
+			walkHadError = true
 		}
 		allTasks = append(allTasks, tasks...)
 	}
-	return allTasks, nil
+	return allTasks, walkHadError, nil
 }
 
-func (s *Scanner) runPhaseAWithRoot(ctx context.Context, lib *sqlite.LibraryRecord, logicalRoot, walkRoot string, stats *ScanStats) ([]enrichTask, error) {
+func (s *Scanner) runPhaseAWithRoot(ctx context.Context, lib *sqlite.LibraryRecord, logicalRoot, walkRoot string, discovered map[string]struct{}, stats *ScanStats) ([]enrichTask, bool, error) {
 	forceTV := strings.EqualFold(lib.CollectionType, "tvshows")
 	seriesCache := make(map[string]*sqlite.ItemRecord)
 	seasonCache := make(map[string]*sqlite.ItemRecord)
@@ -308,17 +393,21 @@ func (s *Scanner) runPhaseAWithRoot(ctx context.Context, lib *sqlite.LibraryReco
 			return nil
 		}
 
+		if discovered != nil {
+			discovered[filepath.Clean(path)] = struct{}{}
+		}
 		itemTasks := s.processDiscoveredFile(ctx, lib, logicalRoot, path, forceTV, seriesCache, seasonCache, seenSeriesEnrich, stats)
 		tasks = append(tasks, itemTasks...)
 		return nil
 	})
 	if walkErr != nil {
 		if ctx.Err() != nil {
-			return tasks, ctx.Err()
+			return tasks, true, ctx.Err()
 		}
 		stats.Errors++
+		return tasks, true, nil
 	}
-	return tasks, nil
+	return tasks, false, nil
 }
 
 func (s *Scanner) processDiscoveredFile(
@@ -360,9 +449,9 @@ func (s *Scanner) processDiscoveredFile(
 	return tasks
 }
 
-func (s *Scanner) runPhaseB(ctx context.Context, libraryID string, tasks []enrichTask) {
+func (s *Scanner) runPhaseB(ctx context.Context, libraryID string, tasks []enrichTask) int {
 	if len(tasks) == 0 {
-		return
+		return 0
 	}
 
 	s.startEnrichPhase(libraryID, len(tasks))
@@ -387,12 +476,14 @@ func (s *Scanner) runPhaseB(ctx context.Context, libraryID string, tasks []enric
 		s.runEnrichWave(ctx, libraryID, pool, wave2, &enriched)
 	}
 
-	if n := int(enriched.Load()); n > 0 {
+	n := int(enriched.Load())
+	if n > 0 {
 		s.publishLibraryChanged(ctx, libraryID, ScanStats{
 			LibraryID:    libraryID,
 			ItemsUpdated: n,
 		}, "enrichment")
 	}
+	return n
 }
 
 func (s *Scanner) runEnrichWave(ctx context.Context, libraryID string, pool *budget.Pool, tasks []enrichTask, enriched *atomic.Int64) {
@@ -562,6 +653,7 @@ func (s *Scanner) publishLibraryChanged(ctx context.Context, libraryID string, s
 			"LibraryId":    libraryID,
 			"ItemsAdded":   stats.ItemsAdded,
 			"ItemsUpdated": stats.ItemsUpdated,
+			"ItemsDeleted": stats.ItemsDeleted,
 			"Phase":        phase,
 		},
 	})

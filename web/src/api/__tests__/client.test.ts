@@ -314,7 +314,7 @@ describe('api/client - 管理控制台全部 API 方法', () => {
       'GET /emby/Items/item-1/RemoteImages?Type=Primary',
       'POST /emby/Items/item-1/RemoteImages/Download?Type=Primary&ImageUrl=https%3A%2F%2Fimg.test%2Fa.jpg',
       'POST /emby/Items/item-1/Images/Primary',
-      'POST /emby/Items/item-1/Images/Backdrop/Url',
+      'POST /emby/Items/item-1/Images/Backdrop/0/Url',
       'DELETE /emby/Items/item-1/Images/Primary/0',
       'GET /emby/System/Rankings',
       'POST /emby/System/Rankings/Refresh',
