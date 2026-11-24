@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Check, Film, Flame, Music, Play, Star } from 'lucide-react'
+import { Check, Film, Flame, Music, Play, Star, X } from 'lucide-react'
 import { Link, useNavigate } from 'react-router-dom'
 import { getFallbackImageUrl, getImageUrl } from '../api/client'
 import type { BaseItemDto } from '../api/types'
@@ -13,6 +13,8 @@ interface MediaCardProps {
   selectable?: boolean
   selected?: boolean
   onToggleSelect?: (item: BaseItemDto) => void
+  onMarkPlayed?: (item: BaseItemDto) => void
+  onHideFromResume?: (item: BaseItemDto) => void
   linkTo?: string
 }
 
@@ -24,6 +26,8 @@ export function MediaCard({
   selectable = false,
   selected = false,
   onToggleSelect,
+  onMarkPlayed,
+  onHideFromResume,
   linkTo,
 }: MediaCardProps) {
   const navigate = useNavigate()
@@ -171,7 +175,7 @@ export function MediaCard({
           </div>
         ) : null}
 
-        {/* 右上角选择复选框或已看/未看数量 */}
+        {/* 右上角选择复选框、快捷操作或已看/未看数量 */}
         {selectable ? (
           <div
             aria-label={selected ? '已选中' : '未选中'}
@@ -182,6 +186,39 @@ export function MediaCard({
             }`}
           >
             <Check className="h-4 w-4 stroke-[3]" />
+          </div>
+        ) : onMarkPlayed || onHideFromResume ? (
+          <div className="absolute right-2 top-2 z-10 flex items-center gap-1 opacity-0 transition-opacity duration-200 focus-within:opacity-100 group-hover:opacity-100">
+            {onMarkPlayed && (
+              <button
+                type="button"
+                title="标记已看"
+                aria-label="标记已看"
+                onClick={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  onMarkPlayed(item)
+                }}
+                className="flex h-7 w-7 items-center justify-center rounded-full border border-white/15 bg-black/75 text-zinc-200 shadow-md backdrop-blur-md transition-colors hover:border-emerald-400/60 hover:bg-emerald-500 hover:text-zinc-950"
+              >
+                <Check className="h-3.5 w-3.5 stroke-[2.5]" />
+              </button>
+            )}
+            {onHideFromResume && (
+              <button
+                type="button"
+                title="从继续观看移除"
+                aria-label="从继续观看移除"
+                onClick={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  onHideFromResume(item)
+                }}
+                className="flex h-7 w-7 items-center justify-center rounded-full border border-white/15 bg-black/75 text-zinc-200 shadow-md backdrop-blur-md transition-colors hover:border-red-400/60 hover:bg-red-500 hover:text-white"
+              >
+                <X className="h-3.5 w-3.5 stroke-[2.5]" />
+              </button>
+            )}
           </div>
         ) : item.UserData?.Played ? (
           <div

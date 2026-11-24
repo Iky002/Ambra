@@ -168,6 +168,53 @@ export interface NameIdPair {
   Id: string
 }
 
+export interface ChapterInfo {
+  StartPositionTicks: number
+  Name?: string
+  ImageTag?: string
+}
+
+export interface LiveTvTunerHostInfo {
+  Id?: string
+  Url: string
+  Type?: string
+  FriendlyName?: string
+  UserAgent?: string
+  ImportFavoritesOnly?: boolean
+  TunerCount?: number
+}
+
+export interface LiveTvListingProviderInfo {
+  Id?: string
+  Type?: string
+  Path: string
+  UserAgent?: string
+}
+
+export interface LiveTvChannelInfo {
+  Id: string
+  Name: string
+  Number?: string
+  ChannelType?: string
+  Type?: string
+  ImageUrl?: string
+  StreamUrl?: string
+}
+
+export interface LiveTvInfo {
+  Services?: Array<{ Name?: string; Status?: string }>
+  IsEnabled?: boolean
+  EnabledUsers?: string[]
+}
+
+export interface TaskTriggerInfo {
+  Type: 'DailyTrigger' | 'IntervalTrigger' | 'StartupTrigger' | 'WeeklyTrigger' | string
+  TimeOfDayTicks?: number
+  IntervalTicks?: number
+  DayOfWeek?: string
+  MaxRuntimeTicks?: number
+}
+
 export interface BaseItemDto {
   Name: string
   OriginalTitle?: string
@@ -213,6 +260,11 @@ export interface BaseItemDto {
   ChildCount?: number
   RecursiveItemCount?: number
   MediaSources?: MediaSourceInfo[]
+  MediaStreams?: MediaStream[]
+  Chapters?: ChapterInfo[]
+  SeriesPrimaryImageTag?: string
+  ParentBackdropItemId?: string
+  ParentBackdropImageTags?: string[]
   ImageTags?: Record<string, string>
   BackdropImageTags?: string[]
   PrimaryImageAspectRatio?: number
@@ -384,6 +436,7 @@ export interface ScheduledTaskInfo {
   Key?: string
   CurrentProgressPercentage?: number
   LastExecutionResult?: ScheduledTaskExecutionResult
+  Triggers?: TaskTriggerInfo[]
 }
 
 export interface ServerLogFile {

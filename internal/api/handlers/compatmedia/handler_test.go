@@ -757,6 +757,7 @@ func TestEncodingLibraryTaxonomiesSubtitlesAndContainers(t *testing.T) {
 	}
 
 	// Subtitles stream serving & deletion
+	_, _ = env.repo.AddLibraryPath(ctx, lib.ID, env.tmpDir)
 	subPath := filepath.Join(env.tmpDir, "sub.vtt")
 	_ = os.WriteFile(subPath, []byte("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\n"), 0o644)
 	_ = env.repo.ReplaceMediaSourcesAndStreams(ctx, "m1", []sqlite.MediaSourceRecord{

@@ -56,6 +56,8 @@ type PlaybackInfoRequest struct {
 	UserID              string         `json:"UserId"`
 	MediaSourceID       string         `json:"MediaSourceId"`
 	MaxStreamingBitrate int            `json:"MaxStreamingBitrate"`
+	MaxWidth            int            `json:"MaxWidth"`
+	MaxHeight           int            `json:"MaxHeight"`
 	StartTimeTicks      int64          `json:"StartTimeTicks"`
 	AudioStreamIndex    *int           `json:"AudioStreamIndex"`
 	SubtitleStreamIndex *int           `json:"SubtitleStreamIndex"`
@@ -292,7 +294,8 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 		msDTO.SupportsDirectPlay = false
 		msDTO.SupportsDirectStream = true
 		msDTO.SupportsTranscoding = true
-		msDTO.TranscodingUrl = fmt.Sprintf("/Videos/%s/master.m3u8?MediaSourceId=%s&PlaySessionId=%s&VideoCodec=copy&AudioCodec=aac", item.ID, msDTO.Id, sessionID)
+		baseURL := fmt.Sprintf("/Videos/%s/master.m3u8?MediaSourceId=%s&PlaySessionId=%s&VideoCodec=copy&AudioCodec=aac", item.ID, msDTO.Id, sessionID)
+		msDTO.TranscodingUrl = appendTranscodeQueryParams(baseURL, req, maxBitrate)
 		return msDTO, DecisionDetail{
 			MediaSourceID: msDTO.Id,
 			PlayMethod:    PlayMethodDirectStream,
@@ -304,10 +307,8 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 	msDTO.SupportsDirectPlay = false
 	msDTO.SupportsDirectStream = false
 	msDTO.SupportsTranscoding = true
-	transcodingURL := fmt.Sprintf("/Videos/%s/master.m3u8?MediaSourceId=%s&PlaySessionId=%s&VideoCodec=h264&AudioCodec=aac", item.ID, msDTO.Id, sessionID)
-	if req.AudioStreamIndex != nil && *req.AudioStreamIndex >= 0 {
-		transcodingURL += fmt.Sprintf("&AudioStreamIndex=%d", *req.AudioStreamIndex)
-	}
+	baseURL := fmt.Sprintf("/Videos/%s/master.m3u8?MediaSourceId=%s&PlaySessionId=%s&VideoCodec=h264&AudioCodec=aac", item.ID, msDTO.Id, sessionID)
+	transcodingURL := appendTranscodeQueryParams(baseURL, req, maxBitrate)
 	if subtitleNeedsBurnIn && selectedSub != nil {
 		transcodingURL += fmt.Sprintf("&SubtitleStreamIndex=%d&SubtitleMethod=Encode", selectedSub.Index)
 	}
@@ -321,6 +322,31 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 		PlayMethod:    PlayMethodTranscode,
 		Reason:        reason,
 	}
+}
+
+func appendTranscodeQueryParams(baseURL string, req PlaybackInfoRequest, maxBitrate int) string {
+	const (
+		defaultAudioBitrate = 192_000
+		minVideoBitrate     = 256_000
+	)
+	out := baseURL
+	if req.AudioStreamIndex != nil && *req.AudioStreamIndex >= 0 {
+		out += fmt.Sprintf("&AudioStreamIndex=%d", *req.AudioStreamIndex)
+	}
+	if maxBitrate > 0 {
+		videoBitrate := maxBitrate - defaultAudioBitrate
+		if videoBitrate < minVideoBitrate {
+			videoBitrate = minVideoBitrate
+		}
+		out += fmt.Sprintf("&VideoBitrate=%d", videoBitrate)
+	}
+	if req.MaxWidth > 0 {
+		out += fmt.Sprintf("&MaxWidth=%d", req.MaxWidth)
+	}
+	if req.MaxHeight > 0 {
+		out += fmt.Sprintf("&MaxHeight=%d", req.MaxHeight)
+	}
+	return out
 }
 
 func checkAudioProfileCompatibility(container, audioCodec string, profile *DeviceProfile) (containerOK, audioOK bool) {

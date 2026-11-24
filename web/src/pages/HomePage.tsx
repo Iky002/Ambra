@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { useQueries, useQuery } from '@tanstack/react-query'
+import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ChevronLeft,
   ChevronRight,
@@ -84,8 +84,35 @@ function HorizontalRow({
 export function HomePage() {
   const { auth } = useAuth()
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
   const userId = auth!.userId
   const [heroIdx, setHeroIdx] = useState(0)
+
+  const invalidateHomeProgress = async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['resumeItems'] }),
+      queryClient.invalidateQueries({ queryKey: ['nextUp'] }),
+      queryClient.invalidateQueries({ queryKey: ['latestItems'] }),
+    ])
+  }
+
+  const handleMarkPlayed = async (item: BaseItemDto) => {
+    try {
+      await api.togglePlayed(userId, item.Id, false)
+      await invalidateHomeProgress()
+    } catch {
+      // ignore error in quick action
+    }
+  }
+
+  const handleHideFromResume = async (item: BaseItemDto) => {
+    try {
+      await api.hideFromResume(userId, item.Id, true)
+      await invalidateHomeProgress()
+    } catch {
+      // ignore error in quick action
+    }
+  }
 
   const {
     data: viewsData,
@@ -366,6 +393,8 @@ export function HomePage() {
               item={item}
               variant="landscape"
               showProgress
+              onMarkPlayed={handleMarkPlayed}
+              onHideFromResume={handleHideFromResume}
               className="w-64 shrink-0 sm:w-72"
             />
           ))}

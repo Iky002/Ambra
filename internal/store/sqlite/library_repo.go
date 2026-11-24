@@ -54,6 +54,12 @@ func (l *LibraryRecord) SaveLocalMetadataEnabled() bool {
 	return true
 }
 
+// ChapterRecord represents a video chapter persisted inside ItemExtra.
+type ChapterRecord struct {
+	StartPositionTicks int64  `json:"start_position_ticks"`
+	Name               string `json:"name,omitempty"`
+}
+
 // ItemExtra is stored as JSON in items.extra_json.
 type ItemExtra struct {
 	Overview                string            `json:"overview,omitempty"`
@@ -67,6 +73,7 @@ type ItemExtra struct {
 	Artists                 []string          `json:"artists,omitempty"`
 	PrimaryImageAspectRatio *float64          `json:"primary_image_aspect_ratio,omitempty"`
 	CollectionType          string            `json:"collection_type,omitempty"`
+	Chapters                []ChapterRecord   `json:"chapters,omitempty"`
 	LockedFields            []string          `json:"LockedFields,omitempty"`
 	LockData                bool              `json:"LockData,omitempty"`
 }
@@ -207,10 +214,13 @@ type ItemFilter struct {
 	Years                  []int
 	IsPlayed               *bool
 	IsUnplayed             *bool
-	IsFavorite             *bool
-	IsResumable            *bool
-	SearchTerm             string
-	SortBy                 []string
+	IsFavorite              *bool
+	IsResumable             *bool
+	SearchTerm              string
+	NameStartsWith          string
+	NameStartsWithOrGreater string
+	NameLessThan            string
+	SortBy                  []string
 	SortOrder              string
 	StartIndex             int
 	Limit                  int
@@ -899,6 +909,19 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 		where = append(where, `item_search_fts MATCH ?`)
 		args = append(args, ftsExpr)
 	}
+	if prefix := strings.TrimSpace(f.NameStartsWith); prefix != "" {
+		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(strings.ToLower(prefix))
+		where = append(where, `lower(i.sort_name) LIKE ? ESCAPE '\'`)
+		args = append(args, escaped+"%")
+	}
+	if gte := strings.TrimSpace(f.NameStartsWithOrGreater); gte != "" {
+		where = append(where, `lower(i.sort_name) >= lower(?)`)
+		args = append(args, gte)
+	}
+	if lt := strings.TrimSpace(f.NameLessThan); lt != "" {
+		where = append(where, `lower(i.sort_name) < lower(?)`)
+		args = append(args, lt)
+	}
 
 	if f.LibraryID != "" {
 		where = append(where, `i.library_id = ?`)
@@ -1096,7 +1119,7 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 	if !countEnabled {
 		total = len(recs)
 	}
-	dtos, err := r.hydrateDTOs(ctx, recs, userDataList, f.ServerID, f.Fields, false)
+	dtos, err := r.hydrateDTOs(ctx, recs, userDataList, f.ServerID, userID, f.Fields, false)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1152,7 +1175,7 @@ func (r *LibraryRepo) GetItemByID(ctx context.Context, serverID, userID, itemID 
 	if err != nil {
 		return nil, err
 	}
-	dtos, err := r.hydrateDTOs(ctx, []ItemRecord{rec}, []*dto.UserItemDataDto{ud}, serverID, nil, true)
+	dtos, err := r.hydrateDTOs(ctx, []ItemRecord{rec}, []*dto.UserItemDataDto{ud}, serverID, userID, nil, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1327,7 +1350,7 @@ func (r *LibraryRepo) GetNextUpEpisodesWithAllowedLibraries(ctx context.Context,
 	if err := rows.Err(); err != nil {
 		return nil, 0, err
 	}
-	dtos, err := r.hydrateDTOs(ctx, recs, uds, serverID, fields, false)
+	dtos, err := r.hydrateDTOs(ctx, recs, uds, serverID, userID, fields, false)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1726,21 +1749,95 @@ func (r *LibraryRepo) GetUserItemData(ctx context.Context, userID, itemID string
 	return ud, nil
 }
 
+func (r *LibraryRepo) collectCascadeItemIDs(ctx context.Context, tx *sql.Tx, itemID string) ([]string, error) {
+	ids := []string{itemID}
+	var itemType string
+	err := tx.QueryRowContext(ctx, `SELECT type FROM items WHERE id = ?`, itemID).Scan(&itemType)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ids, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var rows *sql.Rows
+	switch strings.ToLower(itemType) {
+	case "series":
+		rows, err = tx.QueryContext(ctx, `SELECT id FROM items WHERE series_id = ? OR parent_id = ?`, itemID, itemID)
+	case "season":
+		rows, err = tx.QueryContext(ctx, `SELECT id FROM items WHERE season_id = ? OR parent_id = ?`, itemID, itemID)
+	case "musicalbum":
+		rows, err = tx.QueryContext(ctx, `SELECT id FROM items WHERE parent_id = ?`, itemID)
+	case "boxset":
+		rows, err = tx.QueryContext(ctx,
+			`SELECT item_id FROM item_collections WHERE container_id = ?
+			 UNION
+			 SELECT id FROM items WHERE parent_id = ?`,
+			itemID, itemID,
+		)
+	default:
+		return ids, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	seen := map[string]struct{}{itemID: {}}
+	for rows.Next() {
+		var childID string
+		if err := rows.Scan(&childID); err != nil {
+			return nil, err
+		}
+		if childID == "" {
+			continue
+		}
+		if _, ok := seen[childID]; !ok {
+			seen[childID] = struct{}{}
+			ids = append(ids, childID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
 func (r *LibraryRepo) MarkPlayed(ctx context.Context, userID, itemID string) (*dto.UserItemDataDto, error) {
 	userID = guid.Normalize(userID)
 	itemID = guid.Normalize(itemID)
 	now := time.Now().Unix()
-	_, err := r.store.Writer.ExecContext(ctx, `
+
+	tx, err := r.store.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	targetIDs, err := r.collectCascadeItemIDs(ctx, tx, itemID)
+	if err != nil {
+		return nil, err
+	}
+
+	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO user_item_data (user_id, item_id, played, play_count, playback_position_ticks, last_played_date)
 		VALUES (?, ?, 1, 1, 0, ?)
 		ON CONFLICT(user_id, item_id) DO UPDATE SET
 			played = 1,
 			play_count = CASE WHEN user_item_data.play_count < 1 THEN 1 ELSE user_item_data.play_count + 1 END,
 			playback_position_ticks = 0,
-			last_played_date = excluded.last_played_date`,
-		userID, itemID, now,
-	)
+			last_played_date = excluded.last_played_date`)
 	if err != nil {
+		return nil, err
+	}
+	defer stmt.Close()
+
+	for _, tid := range targetIDs {
+		if _, err := stmt.ExecContext(ctx, userID, tid, now); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return r.GetUserItemData(ctx, userID, itemID)
@@ -1749,15 +1846,35 @@ func (r *LibraryRepo) MarkPlayed(ctx context.Context, userID, itemID string) (*d
 func (r *LibraryRepo) MarkUnplayed(ctx context.Context, userID, itemID string) (*dto.UserItemDataDto, error) {
 	userID = guid.Normalize(userID)
 	itemID = guid.Normalize(itemID)
-	_, err := r.store.Writer.ExecContext(ctx, `
+
+	tx, err := r.store.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	targetIDs, err := r.collectCascadeItemIDs(ctx, tx, itemID)
+	if err != nil {
+		return nil, err
+	}
+
+	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO user_item_data (user_id, item_id, played, play_count, playback_position_ticks)
 		VALUES (?, ?, 0, 0, 0)
 		ON CONFLICT(user_id, item_id) DO UPDATE SET
 			played = 0,
-			playback_position_ticks = 0`,
-		userID, itemID,
-	)
+			playback_position_ticks = 0`)
 	if err != nil {
+		return nil, err
+	}
+	defer stmt.Close()
+
+	for _, tid := range targetIDs {
+		if _, err := stmt.ExecContext(ctx, userID, tid); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return r.GetUserItemData(ctx, userID, itemID)
@@ -1952,7 +2069,129 @@ func (r *LibraryRepo) loadImageTagsBatch(ctx context.Context, itemIDs []string) 
 	return out, rows.Err()
 }
 
-func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []*dto.UserItemDataDto, serverID string, fields []string, fullDetail bool) ([]dto.BaseItemDto, error) {
+type containerPlayStats struct {
+	childCount     int
+	recursiveCount int
+	unplayedCount  int
+}
+
+func (r *LibraryRepo) loadSeriesSeasonStatsBatch(ctx context.Context, userID string, seriesIDs, seasonIDs []string) (map[string]*containerPlayStats, error) {
+	out := make(map[string]*containerPlayStats, len(seriesIDs)+len(seasonIDs))
+	if len(seriesIDs) > 0 {
+		ph := make([]string, len(seriesIDs))
+		args := make([]any, len(seriesIDs))
+		for i, id := range seriesIDs {
+			ph[i] = "?"
+			args[i] = id
+			out[id] = &containerPlayStats{}
+		}
+		inClause := strings.Join(ph, ",")
+
+		// Direct season count per series
+		sRows, err := r.store.Reader.QueryContext(ctx,
+			`SELECT series_id, COUNT(*) FROM items WHERE type = 'Season' AND series_id IN (`+inClause+`) GROUP BY series_id`,
+			args...,
+		)
+		if err != nil {
+			return nil, err
+		}
+		for sRows.Next() {
+			var sid string
+			var cnt int
+			if err := sRows.Scan(&sid, &cnt); err != nil {
+				sRows.Close()
+				return nil, err
+			}
+			if st := out[sid]; st != nil {
+				st.childCount = cnt
+			}
+		}
+		if err := sRows.Err(); err != nil {
+			sRows.Close()
+			return nil, err
+		}
+		sRows.Close()
+
+		// Episode total & unplayed count per series
+		epArgs := make([]any, 0, len(seriesIDs)+1)
+		epArgs = append(epArgs, userID)
+		epArgs = append(epArgs, args...)
+		epRows, err := r.store.Reader.QueryContext(ctx,
+			`SELECT i.series_id, COUNT(*), SUM(CASE WHEN COALESCE(u.played, 0) = 0 THEN 1 ELSE 0 END)
+			 FROM items i
+			 LEFT JOIN user_item_data u ON u.item_id = i.id AND u.user_id = ?
+			 WHERE i.type = 'Episode' AND i.series_id IN (`+inClause+`)
+			 GROUP BY i.series_id`,
+			epArgs...,
+		)
+		if err != nil {
+			return nil, err
+		}
+		for epRows.Next() {
+			var sid string
+			var total, unplayed int
+			if err := epRows.Scan(&sid, &total, &unplayed); err != nil {
+				epRows.Close()
+				return nil, err
+			}
+			if st := out[sid]; st != nil {
+				st.recursiveCount = total
+				st.unplayedCount = unplayed
+			}
+		}
+		if err := epRows.Err(); err != nil {
+			epRows.Close()
+			return nil, err
+		}
+		epRows.Close()
+	}
+
+	if len(seasonIDs) > 0 {
+		ph := make([]string, len(seasonIDs))
+		epArgs := make([]any, 0, len(seasonIDs)+1)
+		epArgs = append(epArgs, userID)
+		for i, id := range seasonIDs {
+			ph[i] = "?"
+			epArgs = append(epArgs, id)
+			out[id] = &containerPlayStats{}
+		}
+		inClause := strings.Join(ph, ",")
+
+		epRows, err := r.store.Reader.QueryContext(ctx,
+			`SELECT i.season_id, COUNT(*), SUM(CASE WHEN COALESCE(u.played, 0) = 0 THEN 1 ELSE 0 END)
+			 FROM items i
+			 LEFT JOIN user_item_data u ON u.item_id = i.id AND u.user_id = ?
+			 WHERE i.type = 'Episode' AND i.season_id IN (`+inClause+`)
+			 GROUP BY i.season_id`,
+			epArgs...,
+		)
+		if err != nil {
+			return nil, err
+		}
+		for epRows.Next() {
+			var sid string
+			var total, unplayed int
+			if err := epRows.Scan(&sid, &total, &unplayed); err != nil {
+				epRows.Close()
+				return nil, err
+			}
+			if st := out[sid]; st != nil {
+				st.childCount = total
+				st.recursiveCount = total
+				st.unplayedCount = unplayed
+			}
+		}
+		if err := epRows.Err(); err != nil {
+			epRows.Close()
+			return nil, err
+		}
+		epRows.Close()
+	}
+
+	return out, nil
+}
+
+func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []*dto.UserItemDataDto, serverID, userID string, fields []string, fullDetail bool) ([]dto.BaseItemDto, error) {
 	if len(recs) == 0 {
 		return []dto.BaseItemDto{}, nil
 	}
@@ -1966,22 +2205,57 @@ func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []
 	wantGenres := fullDetail || fieldSet["genres"]
 	wantStudios := fullDetail || fieldSet["studios"]
 	wantPeople := fullDetail || fieldSet["people"]
-	wantMediaSources := fullDetail || fieldSet["mediasources"]
+	wantMediaSources := fullDetail || fieldSet["mediasources"] || fieldSet["mediastreams"]
 
 	ids := make([]string, len(recs))
+	imgIDSet := make(map[string]struct{}, len(recs)*2)
+	imgIDs := make([]string, 0, len(recs)*2)
+	var seriesIDs, seasonIDs []string
+
 	for i, rec := range recs {
 		ids[i] = rec.ID
+		if _, ok := imgIDSet[rec.ID]; !ok {
+			imgIDSet[rec.ID] = struct{}{}
+			imgIDs = append(imgIDs, rec.ID)
+		}
+		switch strings.ToLower(rec.Type) {
+		case "series":
+			seriesIDs = append(seriesIDs, rec.ID)
+		case "season":
+			seasonIDs = append(seasonIDs, rec.ID)
+			parentRef := rec.SeriesID
+			if parentRef == "" {
+				parentRef = rec.ParentID
+			}
+			if parentRef != "" {
+				if _, ok := imgIDSet[parentRef]; !ok {
+					imgIDSet[parentRef] = struct{}{}
+					imgIDs = append(imgIDs, parentRef)
+				}
+			}
+		case "episode":
+			if rec.SeriesID != "" {
+				if _, ok := imgIDSet[rec.SeriesID]; !ok {
+					imgIDSet[rec.SeriesID] = struct{}{}
+					imgIDs = append(imgIDs, rec.SeriesID)
+				}
+			}
+		}
 	}
 
-	imgMap, err := r.loadImageTagsBatch(ctx, ids)
+	imgMap, err := r.loadImageTagsBatch(ctx, imgIDs)
 	if err != nil {
 		return nil, err
 	}
 
-	var genresMap map[string][]dto.NameIdPair
-	var studiosMap map[string][]dto.NameIdPair
-	if wantGenres || wantStudios {
-		genresMap, studiosMap, err = r.loadTaxonomiesBatch(ctx, ids)
+	genresMap, studiosMap, tagsMap, err := r.loadTaxonomiesBatch(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+
+	var statsMap map[string]*containerPlayStats
+	if len(seriesIDs) > 0 || len(seasonIDs) > 0 {
+		statsMap, err = r.loadSeriesSeasonStatsBatch(ctx, userID, seriesIDs, seasonIDs)
 		if err != nil {
 			return nil, err
 		}
@@ -1999,25 +2273,25 @@ func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []
 	for i, rec := range recs {
 		created := time.Unix(rec.DateCreated, 0).UTC()
 		d := dto.BaseItemDto{
-			Name:              rec.Name,
-			OriginalTitle:     rec.OriginalTitle,
-			ServerId:          serverID,
-			Id:                rec.ID,
-			Etag:              rec.Etag,
-			DateCreated:       &created,
-			Container:         rec.Container,
-			SortName:          rec.SortName,
-			OfficialRating:    rec.OfficialRating,
-			CommunityRating:   rec.CommunityRating,
-			RunTimeTicks:      rec.RuntimeTicks,
-			ProductionYear:    rec.ProductionYear,
-			IndexNumber:       rec.IndexNumber,
-			ParentIndexNumber: rec.ParentIndexNumber,
-			IsFolder:          rec.IsFolder,
-			ParentId:          rec.ParentID,
-			Type:              rec.Type,
-			MediaType:         rec.MediaType,
-			CollectionType:    rec.Extra.CollectionType,
+			Name:                    rec.Name,
+			OriginalTitle:           rec.OriginalTitle,
+			ServerId:                serverID,
+			Id:                      rec.ID,
+			Etag:                    rec.Etag,
+			DateCreated:             &created,
+			Container:               rec.Container,
+			SortName:                rec.SortName,
+			OfficialRating:          rec.OfficialRating,
+			CommunityRating:         rec.CommunityRating,
+			RunTimeTicks:            rec.RuntimeTicks,
+			ProductionYear:          rec.ProductionYear,
+			IndexNumber:             rec.IndexNumber,
+			ParentIndexNumber:       rec.ParentIndexNumber,
+			IsFolder:                rec.IsFolder,
+			ParentId:                rec.ParentID,
+			Type:                    rec.Type,
+			MediaType:               rec.MediaType,
+			CollectionType:          rec.Extra.CollectionType,
 			SeriesId:                rec.SeriesID,
 			SeriesName:              rec.Extra.SeriesName,
 			SeasonId:                rec.SeasonID,
@@ -2028,9 +2302,9 @@ func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []
 			Artists:                 rec.Extra.Artists,
 			PrimaryImageAspectRatio: rec.Extra.PrimaryImageAspectRatio,
 			UserData:                uds[i],
-			ImageTags:         map[string]string{},
-			BackdropImageTags: []string{},
-			LocationType:      "FileSystem",
+			ImageTags:               map[string]string{},
+			BackdropImageTags:       []string{},
+			LocationType:            "FileSystem",
 		}
 		if rec.PremiereDate != nil && *rec.PremiereDate > 0 {
 			pt := time.Unix(*rec.PremiereDate, 0).UTC()
@@ -2046,11 +2320,58 @@ func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []
 		if wantProviderIDs && len(rec.Extra.ProviderIDs) > 0 {
 			d.ProviderIds = rec.Extra.ProviderIDs
 		}
+		if len(rec.Extra.Chapters) > 0 {
+			chapters := make([]dto.ChapterInfo, len(rec.Extra.Chapters))
+			for idx, ch := range rec.Extra.Chapters {
+				chapters[idx] = dto.ChapterInfo{
+					StartPositionTicks: ch.StartPositionTicks,
+					Name:               ch.Name,
+				}
+			}
+			d.Chapters = chapters
+		}
 		if img, ok := imgMap[rec.ID]; ok {
 			d.ImageTags = img.allTags
 			if len(img.backdrops) > 0 {
 				d.BackdropImageTags = img.backdrops
 			}
+		}
+		if strings.EqualFold(rec.Type, "Season") || strings.EqualFold(rec.Type, "Episode") {
+			parentRef := rec.SeriesID
+			if parentRef == "" && strings.EqualFold(rec.Type, "Season") {
+				parentRef = rec.ParentID
+			}
+			if parentRef != "" {
+				if pImg, ok := imgMap[parentRef]; ok {
+					if pImg.primary != "" {
+						d.SeriesPrimaryImageTag = pImg.primary
+					}
+					if len(pImg.backdrops) > 0 {
+						d.ParentBackdropItemId = parentRef
+						d.ParentBackdropImageTags = pImg.backdrops
+					}
+				}
+			}
+		}
+		if st, ok := statsMap[rec.ID]; ok && st != nil {
+			cc := st.childCount
+			rc := st.recursiveCount
+			d.ChildCount = &cc
+			d.RecursiveItemCount = &rc
+			if userID != "" {
+				if d.UserData == nil {
+					d.UserData = &dto.UserItemDataDto{Key: rec.ID}
+				}
+				unplayed := st.unplayedCount
+				d.UserData.UnplayedItemCount = &unplayed
+				if st.recursiveCount > 0 {
+					pct := float64(st.recursiveCount-st.unplayedCount) * 100.0 / float64(st.recursiveCount)
+					d.UserData.PlayedPercentage = &pct
+				}
+			}
+		}
+		if ts := tagsMap[rec.ID]; len(ts) > 0 {
+			d.Tags = ts
 		}
 		if wantGenres {
 			if gs := genresMap[rec.ID]; len(gs) > 0 {
@@ -2075,6 +2396,9 @@ func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []
 			srcs, err := r.GetMediaSourcesByItemID(ctx, rec.ID)
 			if err == nil && len(srcs) > 0 {
 				d.MediaSources = MediaSourceRecordsToDTO(srcs)
+				if len(d.MediaSources) > 0 && len(d.MediaSources[0].MediaStreams) > 0 {
+					d.MediaStreams = d.MediaSources[0].MediaStreams
+				}
 			}
 		}
 		dtos[i] = d
@@ -2082,9 +2406,13 @@ func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []
 	return dtos, nil
 }
 
-func (r *LibraryRepo) loadTaxonomiesBatch(ctx context.Context, itemIDs []string) (map[string][]dto.NameIdPair, map[string][]dto.NameIdPair, error) {
+func (r *LibraryRepo) loadTaxonomiesBatch(ctx context.Context, itemIDs []string) (map[string][]dto.NameIdPair, map[string][]dto.NameIdPair, map[string][]string, error) {
 	genres := make(map[string][]dto.NameIdPair)
 	studios := make(map[string][]dto.NameIdPair)
+	tags := make(map[string][]string)
+	if len(itemIDs) == 0 {
+		return genres, studios, tags, nil
+	}
 	ph := make([]string, len(itemIDs))
 	args := make([]any, len(itemIDs))
 	for i, id := range itemIDs {
@@ -2098,23 +2426,25 @@ func (r *LibraryRepo) loadTaxonomiesBatch(ctx context.Context, itemIDs []string)
 		WHERE it.item_id IN (`+strings.Join(ph, ",")+`)
 		ORDER BY t.sort_name ASC`, args...)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var itemID, kind, id, name string
 		if err := rows.Scan(&itemID, &kind, &id, &name); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		pair := dto.NameIdPair{Id: id, Name: name}
-		switch kind {
+		switch strings.ToLower(kind) {
 		case "genre":
 			genres[itemID] = append(genres[itemID], pair)
 		case "studio":
 			studios[itemID] = append(studios[itemID], pair)
+		case "tag":
+			tags[itemID] = append(tags[itemID], name)
 		}
 	}
-	return genres, studios, rows.Err()
+	return genres, studios, tags, rows.Err()
 }
 
 // GetTaxonomiesByItemID returns persisted genre, studio, and tag names for itemID.

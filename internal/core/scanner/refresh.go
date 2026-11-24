@@ -87,6 +87,9 @@ func (s *Scanner) RefreshItem(ctx context.Context, itemID string, replaceMetadat
 	s.persistMetaRelationsAndFTS(ctx, rec, relMeta)
 	s.downloadAndSaveRemoteImagesForce(ctx, rec, meta, replaceImages)
 	s.saveLocalNFOIfEnabled(ctx, rec, relMeta, replaceMetadata)
+	if strings.EqualFold(rec.Type, "Movie") && meta.Collection != nil {
+		s.ensureAutoBoxSet(ctx, rec, meta.Collection)
+	}
 
 	return nil
 }

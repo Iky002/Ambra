@@ -69,7 +69,7 @@ export function SettingsTab() {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['admin', 'serverConfig'] }),
         queryClient.invalidateQueries({ queryKey: ['publicSystemInfo'] }),
-        queryClient.invalidateQueries({ queryKey: ['systemInfo'] }),
+        queryClient.invalidateQueries({ queryKey: ['admin', 'systemInfo'] }),
       ])
       setFeedback({ type: 'success', message: '已保存服务器常规设置' })
     } catch (err) {
