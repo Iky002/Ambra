@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -927,6 +928,155 @@ func TestEdgeCasesForHighCoverage(t *testing.T) {
 	nilRouter := nilH.BuildRouter(AuthFuncs{})
 	if w := doReq(nilRouter, http.MethodGet, "/Items/missfile1/Images/Primary/0/t/jpg/100/100/0/0", ""); w.Code != http.StatusNotFound {
 		t.Fatalf("nil imaging service expected 404, got %d", w.Code)
+	}
+}
+
+func TestVideoFontAttachments(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+
+	// Verify fontContentType mapping across supported font formats.
+	cases := map[string]string{
+		"a.ttf":   "font/ttf",
+		"b.OTF":   "font/otf",
+		"c.woff2": "font/woff2",
+		"d.woff":  "font/woff",
+		"e.ttc":   "font/collection",
+		"f.bin":   "application/octet-stream",
+	}
+	for name, want := range cases {
+		if got := fontContentType(name); got != want {
+			t.Fatalf("fontContentType(%q) = %q, want %q", name, got, want)
+		}
+	}
+
+	// Empty list for missing item, 400 for invalid index, 404 for missing item stream.
+	if w := doReq(env.router, http.MethodGet, "/Videos/noitem/noms/Attachments", ""); w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != "[]" {
+		t.Fatalf("missing item attachments expected 200 [], got %d %s", w.Code, w.Body.String())
+	}
+	if w := doReq(env.router, http.MethodGet, "/Videos/noitem/noms/Attachments/bad", ""); w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid index expected 400, got %d", w.Code)
+	}
+	if w := doReq(env.router, http.MethodGet, "/Videos/noitem/noms/Attachments/0", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("missing item attachment stream expected 404, got %d", w.Code)
+	}
+
+	lib, err := env.repo.CreateLibrary(ctx, "Anime", "movies", []string{env.tmpDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fontBytes := []byte("\x00\x01\x00\x00test-embedded-truetype-font-payload-1234567890")
+	fontFile := filepath.Join(env.tmpDir, "AmbraTestFont.ttf")
+	if err := os.WriteFile(fontFile, fontBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mkvPath := filepath.Join(env.tmpDir, "with_font.mkv")
+	if ffmpegBin, err := exec.LookPath("ffmpeg"); err == nil {
+		cmd := exec.Command(
+			ffmpegBin,
+			"-hide_banner", "-loglevel", "error", "-y",
+			"-f", "lavfi", "-i", "color=c=black:s=16x16:d=0.1",
+			"-c:v", "mpeg4",
+			"-attach", fontFile,
+			"-metadata:s:t", "mimetype=application/x-truetype-font",
+			mkvPath,
+		)
+		if out, runErr := cmd.CombinedOutput(); runErr != nil {
+			t.Fatalf("ffmpeg create mkv with font failed: %v (%s)", runErr, string(out))
+		}
+	} else {
+		// Fallback when ffmpeg is unavailable: pre-populate extractor font cache directory.
+		if err := os.WriteFile(mkvPath, []byte("mkv"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		fontCacheDir := filepath.Join(env.cfg.SubtitleCacheDir(), "fonts", "anime001_ms001")
+		if err := os.MkdirAll(fontCacheDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(fontCacheDir, "AmbraTestFont.ttf"), fontBytes, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(fontCacheDir, ".extracted"), []byte("ok"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	item := &sqlite.ItemRecord{
+		ID:        "anime001",
+		LibraryID: lib.ID,
+		Type:      "Movie",
+		MediaType: "Video",
+		Name:      "Anime With Embedded Font",
+		Path:      mkvPath,
+	}
+	if err := env.repo.UpsertItem(ctx, item); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.repo.ReplaceMediaSourcesAndStreams(ctx, item.ID, []sqlite.MediaSourceRecord{
+		{ID: "ms001", ItemID: item.ID, Name: "main", Path: mkvPath},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. GET /Videos/{Id}/{MediaSourceId}/Attachments
+	w := doReq(env.router, http.MethodGet, "/Videos/anime001/ms001/Attachments", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("list attachments expected 200, got %d (%s)", w.Code, w.Body.String())
+	}
+	var list []videoAttachmentDTO
+	if err := json.NewDecoder(w.Body).Decode(&list); err != nil {
+		t.Fatalf("decode attachments list: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 font attachment, got %d (%+v)", len(list), list)
+	}
+	if list[0].Index != 0 || list[0].FileName != "AmbraTestFont.ttf" || list[0].MimeType != "font/ttf" || list[0].Url != "/Videos/anime001/ms001/Attachments/0" {
+		t.Fatalf("unexpected attachment item: %+v", list[0])
+	}
+
+	// 2. GET /Videos/{Id}/{MediaSourceId}/Attachments/0
+	w = doReq(env.router, http.MethodGet, "/Videos/anime001/ms001/Attachments/0", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("get attachment 0 expected 200, got %d (%s)", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "font/ttf" {
+		t.Fatalf("expected Content-Type font/ttf, got %q", ct)
+	}
+	if cc := w.Header().Get("Cache-Control"); cc != "public, max-age=31536000, immutable" {
+		t.Fatalf("expected immutable Cache-Control, got %q", cc)
+	}
+	etag := w.Header().Get("ETag")
+	if etag == "" {
+		t.Fatalf("expected non-empty ETag header")
+	}
+	if !bytes.Equal(w.Body.Bytes(), fontBytes) {
+		t.Fatalf("font payload mismatch: got %d bytes, want %d bytes", w.Body.Len(), len(fontBytes))
+	}
+
+	// 3. Conditional GET with matching ETag -> 304 Not Modified
+	req304 := httptest.NewRequest(http.MethodGet, "/Videos/anime001/ms001/Attachments/0", nil)
+	req304.Header.Set("If-None-Match", etag)
+	w304 := httptest.NewRecorder()
+	env.router.ServeHTTP(w304, req304)
+	if w304.Code != http.StatusNotModified {
+		t.Fatalf("expected 304 Not Modified for matching ETag, got %d", w304.Code)
+	}
+
+	// 4. HEAD /Videos/{Id}/{MediaSourceId}/Attachments/0 & /Stream alias
+	wHead := doReq(env.router, http.MethodHead, "/Videos/anime001/ms001/Attachments/0", "")
+	if wHead.Code != http.StatusOK || wHead.Body.Len() != 0 {
+		t.Fatalf("HEAD attachment expected 200 empty body, got %d len=%d", wHead.Code, wHead.Body.Len())
+	}
+	wStream := doReq(env.router, http.MethodGet, "/Videos/anime001/ms001/Attachments/0/Stream", "")
+	if wStream.Code != http.StatusOK || !bytes.Equal(wStream.Body.Bytes(), fontBytes) {
+		t.Fatalf("GET attachment /Stream alias failed: %d", wStream.Code)
+	}
+
+	// 5. Out-of-range index -> 404
+	if w := doReq(env.router, http.MethodGet, "/Videos/anime001/ms001/Attachments/9", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("out-of-range attachment index expected 404, got %d", w.Code)
 	}
 }
 

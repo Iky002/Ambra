@@ -30,6 +30,10 @@ func TestEmbyPrefixAndCase(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("web-ui"))
 	})
+	r.Get("/api/admin/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ambra-api"))
+	})
 
 	cases := []struct {
 		path string
@@ -41,6 +45,7 @@ func TestEmbyPrefixAndCase(t *testing.T) {
 		{"/EMBY/SYSTEM/INFO/PUBLIC", "public-info"},
 		{"/emby/users/AbC123Def/items", "uid:AbC123Def"},
 		{"/web/index.html", "web-ui"},
+		{"/api/admin/health", "ambra-api"},
 	}
 
 	for _, tc := range cases {

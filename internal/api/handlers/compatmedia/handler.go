@@ -15,6 +15,7 @@ import (
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/imaging"
 	"github.com/ambra-media/ambra/internal/core/scanner"
+	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
@@ -30,13 +31,14 @@ type AuthFuncs struct {
 // Handler implements the remaining Emby 4.10.2.0 media, item, metadata, image,
 // encoding, library, taxonomy, audio, and video compatibility endpoints.
 type Handler struct {
-	repo     *sqlite.LibraryRepo
-	scanner  *scanner.Scanner
-	imaging  *imaging.Service
-	registry *plugins.Registry
-	store    *sqlite.Store
-	cfg      *config.Config
-	auth     AuthFuncs
+	repo      *sqlite.LibraryRepo
+	scanner   *scanner.Scanner
+	imaging   *imaging.Service
+	registry  *plugins.Registry
+	store     *sqlite.Store
+	cfg       *config.Config
+	extractor *transcode.Extractor
+	auth      AuthFuncs
 }
 
 // New creates a new compatmedia Handler.
@@ -49,12 +51,13 @@ func New(
 	cfg *config.Config,
 ) *Handler {
 	return &Handler{
-		repo:     repo,
-		scanner:  sc,
-		imaging:  img,
-		registry: reg,
-		store:    store,
-		cfg:      cfg,
+		repo:      repo,
+		scanner:   sc,
+		imaging:   img,
+		registry:  reg,
+		store:     store,
+		cfg:       cfg,
+		extractor: transcode.NewExtractor(cfg),
 	}
 }
 
@@ -275,7 +278,11 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 	r.Post("/Videos/{Id}/Subtitles/{Index}/Delete", adminFn(h.handleDeleteSubtitle))
 	r.Get("/Videos/{Id}/{MediaSourceId}/Subtitles/{Index}/{StartPositionTicks}/{StreamFile}", authFn(h.handleSubtitleStream))
 	r.Head("/Videos/{Id}/{MediaSourceId}/Subtitles/{Index}/{StartPositionTicks}/{StreamFile}", authFn(h.handleSubtitleStream))
+	r.Get("/Videos/{Id}/{MediaSourceId}/Attachments", authFn(h.handleListVideoAttachments))
+	r.Get("/Videos/{Id}/{MediaSourceId}/Attachments/{Index}", authFn(h.handleVideoAttachmentStream))
+	r.Head("/Videos/{Id}/{MediaSourceId}/Attachments/{Index}", authFn(h.handleVideoAttachmentStream))
 	r.Get("/Videos/{Id}/{MediaSourceId}/Attachments/{Index}/Stream", authFn(h.handleVideoAttachmentStream))
+	r.Head("/Videos/{Id}/{MediaSourceId}/Attachments/{Index}/Stream", authFn(h.handleVideoAttachmentStream))
 	r.Post("/Videos/ActiveEncodings/Delete", authFn(h.handleDeleteActiveEncodings))
 	r.Get("/Videos/{Id}/hls/{PlaylistId}/{Segment}", authFn(h.handleVideoHlsSegment))
 
