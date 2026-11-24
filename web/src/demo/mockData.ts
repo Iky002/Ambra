@@ -100,6 +100,30 @@ const TMDB_MEDIA_ART = {
     poster: `${TMDB_POSTER_BASE}/hTP1DtLGFamjfu8WqjnuQdP1n4i.jpg`,
     backdrop: `${TMDB_BACKDROP_BASE}/rqbCbjB19amtOtFQbb3K2lgm2zv.jpg`,
   },
+  'item-the-pig-the-snake-and-the-pigeon': {
+    poster: `${TMDB_POSTER_BASE}/eNvuf4PHepy0nlXfludjGCJGG59.jpg`,
+    backdrop: `${TMDB_BACKDROP_BASE}/cu5Qk2QHxOyyMrD3Bq93DxgmJer.jpg`,
+  },
+  'item-inside-out-2': {
+    poster: `${TMDB_POSTER_BASE}/vpnVM9B6NMmQpWeZvzLvDESb2QY.jpg`,
+    backdrop: `${TMDB_BACKDROP_BASE}/stKGOm8UyhuLPR9sZLjs5AkmncA.jpg`,
+  },
+  'item-robot-dreams': {
+    poster: `${TMDB_POSTER_BASE}/pr4kRAXsQE97CpHv3s5L0cW9w38.jpg`,
+    backdrop: `${TMDB_BACKDROP_BASE}/hIeEpk2w1dnC9ly9ZJwwbunH2Cx.jpg`,
+  },
+  'item-shogun': {
+    poster: `${TMDB_POSTER_BASE}/7O4iVfOMQmdCSxhOg1WnzG1AgYT.jpg`,
+    backdrop: `${TMDB_BACKDROP_BASE}/bwSmgmd90hCWwqOKQYTEraeOZhJ.jpg`,
+  },
+  'item-blossoms-shanghai': {
+    poster: `${TMDB_POSTER_BASE}/pcL4VKmit4MI9QEzquRm5h4RrNw.jpg`,
+    backdrop: '',
+  },
+  'item-the-long-season': {
+    poster: `${TMDB_POSTER_BASE}/tJLiKDYdfMskFkJXV1HnaQAdpGf.jpg`,
+    backdrop: `${TMDB_BACKDROP_BASE}/mYKFUpNjwtsqm9DWGnXlCJhEj0q.jpg`,
+  },
 } as const
 
 export interface DemoState {
@@ -1437,7 +1461,7 @@ export function createInitialDemoState(): DemoState {
       RunTimeTicks: 2 * HOUR_TICKS + 14 * MIN_TICKS,
       Genres: ['动作', '犯罪', '剧情'],
       Tags: ['Trending', '豆瓣热门电影', 'TMDB热门'],
-      ProviderIds: { Tmdb: '1152014', Imdb: 'tt29319990' },
+      ProviderIds: { Tmdb: '1046090', Imdb: 'tt29319990' },
       Studios: [{ Id: 'st-one-cool', Name: '一种态度电影股份有限公司' }],
       Overview:
         '通缉犯陈桂林生命将尽，却发现自己在通缉榜上只排名第三。他决心查出前两名通缉犯的下落，并将他们一一除掉，以为自己能像古人“周处除三害”一样留名青史，却在追猎途中一步步逼近荒诞与人性的深渊。',
