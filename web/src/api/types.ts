@@ -7,6 +7,7 @@ export interface PublicSystemInfo {
   LocalAddress?: string
   ServerName: string
   Version: string
+  AmbraVersion?: string
   ProductName?: string
   Id: string
 }
@@ -480,4 +481,29 @@ export interface ScanProgressSnapshot {
   started_at?: string
   updated_at: string
   libraries?: LibraryScanProgress[]
+}
+
+export interface SetupStatus {
+  completed: boolean
+  server_name: string
+  default_language: string
+  has_users: boolean
+  has_tmdb_key: boolean
+}
+
+export interface SetupAdminRequest {
+  server_name?: string
+  language?: string
+  country?: string
+  username: string
+  password: string
+}
+
+export interface SetupCompleteRequest {
+  server_name?: string
+  tmdb_api_key?: string
+  tmdb_language?: string
+  enable_strm_302?: boolean
+  trigger_scan?: boolean
+  sync_rankings?: boolean
 }

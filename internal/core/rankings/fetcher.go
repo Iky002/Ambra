@@ -41,6 +41,7 @@ type Fetcher struct {
 	httpClient                 *http.Client
 	doubanURL                  string
 	imdbURL                    string
+	imdbMirrorURLs             []string
 	tmdbAPIKey                 string
 	tmdbBaseURL                string
 	tmdbTrendingFetcher        func(ctx context.Context) ([]ChartEntry, string, error)
@@ -61,10 +62,17 @@ func NewFetcher(opts Options) *Fetcher {
 	if ua == "" {
 		ua = defaultUserAgent
 	}
+	var mirrorURLs []string
+	for _, u := range opts.IMDbMirrorURLs {
+		if trimmed := strings.TrimSpace(u); trimmed != "" {
+			mirrorURLs = append(mirrorURLs, trimmed)
+		}
+	}
 	return &Fetcher{
 		httpClient:                 client,
 		doubanURL:                  strings.TrimSpace(opts.DoubanURL),
 		imdbURL:                    strings.TrimSpace(opts.IMDbURL),
+		imdbMirrorURLs:             mirrorURLs,
 		tmdbAPIKey:                 strings.TrimSpace(opts.TMDBAPIKey),
 		tmdbBaseURL:                strings.TrimRight(strings.TrimSpace(opts.TMDBTrendingBaseURL), "/"),
 		tmdbTrendingFetcher:        opts.TMDBTrendingFetcher,
@@ -94,6 +102,25 @@ func (f *Fetcher) resolveIMDbURL() string {
 		return v
 	}
 	return DefaultIMDbTop250URL
+}
+
+func (f *Fetcher) resolveIMDbMirrorURLs() ([]string, bool) {
+	if len(f.imdbMirrorURLs) > 0 {
+		return f.imdbMirrorURLs, true
+	}
+	if raw := strings.TrimSpace(os.Getenv(EnvIMDb250MirrorURL)); raw != "" {
+		parts := strings.Split(raw, ",")
+		urls := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if trimmed := strings.TrimSpace(p); trimmed != "" {
+				urls = append(urls, trimmed)
+			}
+		}
+		if len(urls) > 0 {
+			return urls, true
+		}
+	}
+	return DefaultIMDbTop250MirrorURLs, false
 }
 
 func (f *Fetcher) resolveTMDBAPIKey() string {
@@ -230,19 +257,30 @@ func (f *Fetcher) FetchDoubanTop250(ctx context.Context) (*ChartSnapshot, error)
 	}, nil
 }
 
-// FetchIMDbTop250 fetches the IMDb Top 250 chart from a custom JSON feed
-// or from the IMDb Top 250 HTML page's embedded JSON-LD ItemList.
-// When using the default IMDb URL and IMDb blocks server-side scraping
-// (e.g. HTTP 202 AWS WAF challenge, non-200 status, network error, or stripped
-// HTML without JSON-LD), it gracefully falls back to a curated built-in snapshot.
+// FetchIMDbTop250 fetches the IMDb Top 250 chart using a 3-tier fallback chain:
+//  1. Tier 1 (Primary): Official IMDb chart URL (or custom JSON/HTML feed).
+//  2. Tier 2 (Public Mirrors): Public 250-item JSON mirrors (jsDelivr / GitHub Raw,
+//     configurable via AMBRA_IMDB250_MIRROR_URL or Options.IMDbMirrorURLs).
+//  3. Tier 3 (Offline Fallback): Curated built-in snapshot.
+//
+// If the caller explicitly overrides IMDbURL without configuring IMDbMirrorURLs,
+// Tier 1 errors are returned directly so custom-URL failures are not masked.
 func (f *Fetcher) FetchIMDbTop250(ctx context.Context) (*ChartSnapshot, error) {
 	targetURL := f.resolveIMDbURL()
-	useFallback := targetURL == DefaultIMDbTop250URL
+	mirrorURLs, customMirrors := f.resolveIMDbMirrorURLs()
+	useFallback := targetURL == DefaultIMDbTop250URL || customMirrors
+
+	fallback := func() *ChartSnapshot {
+		if snap := f.fetchIMDbFromMirrors(ctx, mirrorURLs); snap != nil {
+			return snap
+		}
+		return builtinIMDbTop250Snapshot()
+	}
 
 	body, contentType, err := f.doGetIMDb(ctx, targetURL)
 	if err != nil {
 		if useFallback {
-			return builtinIMDbTop250Snapshot(), nil
+			return fallback(), nil
 		}
 		return nil, fmt.Errorf("fetch imdb top250: %w", err)
 	}
@@ -252,7 +290,7 @@ func (f *Fetcher) FetchIMDbTop250(ctx context.Context) (*ChartSnapshot, error) {
 		entries, err = parseJSONEntries(body, maxChartEntries)
 		if err != nil {
 			if useFallback {
-				return builtinIMDbTop250Snapshot(), nil
+				return fallback(), nil
 			}
 			return nil, fmt.Errorf("parse imdb json: %w", err)
 		}
@@ -260,7 +298,7 @@ func (f *Fetcher) FetchIMDbTop250(ctx context.Context) (*ChartSnapshot, error) {
 		entries, err = parseIMDbTop250HTML(body)
 		if err != nil {
 			if useFallback {
-				return builtinIMDbTop250Snapshot(), nil
+				return fallback(), nil
 			}
 			return nil, fmt.Errorf("parse imdb html: %w", err)
 		}
@@ -268,7 +306,7 @@ func (f *Fetcher) FetchIMDbTop250(ctx context.Context) (*ChartSnapshot, error) {
 
 	if len(entries) == 0 {
 		if useFallback {
-			return builtinIMDbTop250Snapshot(), nil
+			return fallback(), nil
 		}
 		return nil, errors.New("imdb top250 returned 0 entries")
 	}
@@ -280,6 +318,30 @@ func (f *Fetcher) FetchIMDbTop250(ctx context.Context) (*ChartSnapshot, error) {
 		Count:     len(entries),
 		Entries:   entries,
 	}, nil
+}
+
+func (f *Fetcher) fetchIMDbFromMirrors(ctx context.Context, mirrorURLs []string) *ChartSnapshot {
+	for _, mirrorURL := range mirrorURLs {
+		if ctx.Err() != nil {
+			break
+		}
+		body, _, err := f.doGetWithHeaders(ctx, mirrorURL, "application/json, text/plain;q=0.9, */*;q=0.8", "en-US,en;q=0.9", true)
+		if err != nil {
+			continue
+		}
+		entries, err := parseIMDbMirrorJSON(body)
+		if err != nil || len(entries) == 0 {
+			continue
+		}
+		return &ChartSnapshot{
+			Chart:     ChartIMDbTop250,
+			Source:    SourceIMDbTop250Mirror,
+			UpdatedAt: time.Now().UTC(),
+			Count:     len(entries),
+			Entries:   entries,
+		}
+	}
+	return nil
 }
 
 // FetchTMDBTrending fetches weekly trending movies and TV shows from TMDB v3 API.
@@ -982,6 +1044,115 @@ func parseIMDbTop250HTML(body []byte) ([]ChartEntry, error) {
 	}
 
 	return nil, errors.New("no ItemList found in application/ld+json blocks")
+}
+
+type imdbMirrorItem struct {
+	URL             string `json:"url"`
+	Name            string `json:"name"`
+	AlternateName   string `json:"alternateName"`
+	DatePublished   string `json:"datePublished"`
+	AggregateRating *struct {
+		RatingValue any `json:"ratingValue"`
+	} `json:"aggregateRating"`
+
+	ID            string `json:"id"`
+	IMDbID        string `json:"imdb_id"`
+	TMDBID        string `json:"tmdb_id"`
+	Title         string `json:"title"`
+	OriginalTitle string `json:"original_title"`
+	Year          int    `json:"year"`
+	Rating        any    `json:"rating"`
+}
+
+func parseIMDbMirrorJSON(body []byte) ([]ChartEntry, error) {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return nil, errors.New("empty imdb mirror json payload")
+	}
+
+	var rawItems []imdbMirrorItem
+	switch trimmed[0] {
+	case '[':
+		if err := json.Unmarshal(trimmed, &rawItems); err != nil {
+			return nil, err
+		}
+	case '{':
+		var wrapper struct {
+			Items   []imdbMirrorItem `json:"items"`
+			Entries []imdbMirrorItem `json:"entries"`
+		}
+		if err := json.Unmarshal(trimmed, &wrapper); err != nil {
+			return nil, err
+		}
+		if len(wrapper.Items) > 0 {
+			rawItems = wrapper.Items
+		} else {
+			rawItems = wrapper.Entries
+		}
+	default:
+		return nil, errors.New("invalid imdb mirror json payload")
+	}
+
+	seen := make(map[string]struct{}, min(len(rawItems), maxChartEntries))
+	entries := make([]ChartEntry, 0, min(len(rawItems), maxChartEntries))
+	for _, item := range rawItems {
+		imdbID := extractIMDbID(item.IMDbID)
+		if imdbID == "" {
+			imdbID = extractIMDbID(item.ID)
+		}
+		if imdbID == "" {
+			imdbID = extractIMDbID(item.URL)
+		}
+		if imdbID == "" {
+			continue
+		}
+		if _, dup := seen[imdbID]; dup {
+			continue
+		}
+
+		title := strings.TrimSpace(html.UnescapeString(item.Name))
+		if title == "" {
+			title = strings.TrimSpace(html.UnescapeString(item.Title))
+		}
+		origTitle := strings.TrimSpace(html.UnescapeString(item.AlternateName))
+		if origTitle == "" {
+			origTitle = strings.TrimSpace(html.UnescapeString(item.OriginalTitle))
+		}
+
+		year := item.Year
+		if year <= 0 && item.DatePublished != "" {
+			if ym := reYear4.FindStringSubmatch(item.DatePublished); len(ym) > 1 {
+				year, _ = strconv.Atoi(ym[1])
+			}
+		}
+
+		var rating float64
+		if item.AggregateRating != nil {
+			rating = parseAnyFloat(item.AggregateRating.RatingValue)
+		}
+		if rating == 0 && item.Rating != nil {
+			rating = parseAnyFloat(item.Rating)
+		}
+
+		seen[imdbID] = struct{}{}
+		entries = append(entries, ChartEntry{
+			Rank:          len(entries) + 1,
+			Title:         title,
+			OriginalTitle: origTitle,
+			Year:          year,
+			Rating:        rating,
+			IMDbID:        imdbID,
+			TMDBID:        strings.TrimSpace(item.TMDBID),
+		})
+		if len(entries) >= maxChartEntries {
+			break
+		}
+	}
+
+	if len(entries) == 0 {
+		return nil, errors.New("imdb mirror json returned 0 valid entries")
+	}
+	return entries, nil
 }
 
 func extractIMDbID(raw string) string {

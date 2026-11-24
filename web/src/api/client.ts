@@ -30,6 +30,9 @@ import type {
   SearchHintResult,
   ServerLogFile,
   SessionInfo,
+  SetupAdminRequest,
+  SetupCompleteRequest,
+  SetupStatus,
   SystemInfo,
   UserDto,
   UserItemDataDto,
@@ -791,4 +794,28 @@ export const api = {
     }),
 
   getScanProgress: () => embyFetch<ScanProgressSnapshot>('/api/admin/scanner/progress'),
+
+  // ==================== First-Run Setup Wizard APIs ====================
+
+  getSetupStatus: () => embyFetch<SetupStatus>('/api/setup/status', {}, false),
+
+  setupAdmin: (req: SetupAdminRequest) =>
+    embyFetch<AuthenticationResult>(
+      '/api/setup/admin',
+      {
+        method: 'POST',
+        body: JSON.stringify(req),
+      },
+      false,
+    ),
+
+  completeSetup: (req: SetupCompleteRequest) =>
+    embyFetch<{ completed: boolean }>(
+      '/api/setup/complete',
+      {
+        method: 'POST',
+        body: JSON.stringify(req),
+      },
+      true,
+    ),
 }

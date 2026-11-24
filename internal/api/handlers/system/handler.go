@@ -26,6 +26,7 @@ type Handler struct {
 	cfg      *config.Config
 	userRepo *sqlite.UserRepo
 	registry *plugins.Registry
+	setup    SetupDeps
 }
 
 func NewHandler(cfg *config.Config, userRepo *sqlite.UserRepo, registry *plugins.Registry) *Handler {
@@ -34,6 +35,11 @@ func NewHandler(cfg *config.Config, userRepo *sqlite.UserRepo, registry *plugins
 		userRepo: userRepo,
 		registry: registry,
 	}
+}
+
+func (h *Handler) WithSetupDeps(deps SetupDeps) *Handler {
+	h.setup = deps
+	return h
 }
 
 func RegisterRoutes(r chi.Router, authMW *middleware.Auth, h *Handler) {
@@ -151,11 +157,14 @@ func (h *Handler) UpdateConfiguration(w http.ResponseWriter, r *http.Request) {
 	if v, ok := body["IsStartupWizardCompleted"].(bool); ok {
 		h.cfg.IsStartupWizardCompleted = v
 	}
+	tmdbChanged := false
 	if v, ok := body["TMDBApiKey"].(string); ok {
 		h.cfg.TMDBApiKey = strings.TrimSpace(v)
+		tmdbChanged = true
 	}
 	if v, ok := body["TMDBLanguage"].(string); ok && strings.TrimSpace(v) != "" {
 		h.cfg.TMDBLanguage = strings.TrimSpace(v)
+		tmdbChanged = true
 	}
 	if v, ok := body["EnableSTRM302"].(bool); ok {
 		h.cfg.EnableSTRM302 = v
@@ -166,6 +175,9 @@ func (h *Handler) UpdateConfiguration(w http.ResponseWriter, r *http.Request) {
 	if err := h.cfg.Save(); err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to save configuration")
 		return
+	}
+	if tmdbChanged {
+		h.syncTMDBPlugin()
 	}
 	httpx.NoContent(w)
 }
@@ -445,6 +457,7 @@ func (h *Handler) buildPublicInfo(r *http.Request) dto.PublicSystemInfo {
 		LocalAddress: scheme + "://" + host,
 		ServerName:   h.cfg.ServerName,
 		Version:      config.ServerVersion,
+		AmbraVersion: config.AmbraVersion,
 		ProductName:  config.ProductName,
 		Id:           h.cfg.ServerID,
 	}

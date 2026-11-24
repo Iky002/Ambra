@@ -28,6 +28,7 @@ const (
 
 	EnvDouban250URL           = "AMBRA_DOUBAN250_URL"
 	EnvIMDb250URL             = "AMBRA_IMDB250_URL"
+	EnvIMDb250MirrorURL       = "AMBRA_IMDB250_MIRROR_URL"
 	EnvTMDBAPIKey             = "AMBRA_TMDB_API_KEY"
 	EnvTMDBAPIKeyFallback     = "TMDB_API_KEY"
 	EnvTMDBTrendingURL        = "AMBRA_TMDB_TRENDING_URL"
@@ -40,6 +41,7 @@ const (
 	DefaultDoubanTrendingMovieURL = "https://movie.douban.com/j/search_subjects?type=movie&tag=%E7%83%AD%E9%97%A8&sort=recommend&page_limit=50&page_start=0"
 	DefaultDoubanTrendingTVURL    = "https://movie.douban.com/j/search_subjects?type=tv&tag=%E7%83%AD%E9%97%A8&sort=recommend&page_limit=50&page_start=0"
 
+	SourceIMDbTop250Mirror           = "imdb-top250-mirror"
 	SourceIMDbTop250Builtin          = "imdb-top250-builtin-fallback"
 	SourceTMDBTrendingAPI            = "tmdb-api-trending-week"
 	SourceTMDBTrendingBuiltin        = "tmdb-trending-builtin-fallback"
@@ -52,6 +54,13 @@ const (
 	DefaultInitialDelay = 5 * time.Second
 	DefaultHTTPTimeout  = 20 * time.Second
 )
+
+// DefaultIMDbTop250MirrorURLs are public 250-item JSON mirrors used as Tier 2
+// fallback when the primary IMDb Top 250 chart URL is blocked or unavailable.
+var DefaultIMDbTop250MirrorURLs = []string{
+	"https://cdn.jsdelivr.net/gh/movie-monk-b0t/top250@master/top250.json",
+	"https://raw.githubusercontent.com/movie-monk-b0t/top250/master/top250.json",
+}
 
 // ChartEntry represents a single movie or series entry in a ranking chart.
 type ChartEntry struct {
@@ -116,6 +125,7 @@ type Options struct {
 	HTTPClient                 *http.Client
 	DoubanURL                  string
 	IMDbURL                    string
+	IMDbMirrorURLs             []string
 	TMDBAPIKey                 string
 	TMDBTrendingBaseURL        string
 	TMDBTrendingFetcher        func(ctx context.Context) ([]ChartEntry, string, error)

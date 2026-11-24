@@ -11,7 +11,7 @@ import {
   User,
   UserCheck,
 } from 'lucide-react'
-import { useNavigate } from 'react-router-dom'
+import { Navigate, useNavigate } from 'react-router-dom'
 import { api, getUserImageUrl } from '../api/client'
 import { AmbraLogo } from '../components/AmbraLogo'
 import { useAuth } from '../context/AuthContext'
@@ -39,6 +39,13 @@ export function LoginPage() {
     }
   }
 
+  const { data: setupStatus } = useQuery({
+    queryKey: ['setupStatus'],
+    queryFn: () => api.getSetupStatus(),
+    enabled: !demoActive,
+    retry: false,
+  })
+
   const { data: sysInfo } = useQuery({
     queryKey: ['publicSystemInfo'],
     queryFn: () => api.getPublicSystemInfo(),
@@ -50,6 +57,10 @@ export function LoginPage() {
     queryFn: () => api.getPublicUsers(),
     retry: 1,
   })
+
+  if (!demoActive && setupStatus && setupStatus.completed === false) {
+    return <Navigate to="/setup" replace />
+  }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -87,7 +98,8 @@ export function LoginPage() {
           <p className="mt-1.5 flex items-center justify-center gap-1.5 text-xs text-zinc-400">
             <Server className="h-3.5 w-3.5 text-amber-400/80" />
             <span>
-              {sysInfo?.ProductName || 'Ambra'} {sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.1'}
+              {sysInfo?.ProductName || 'Ambra'}{' '}
+              {sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.5.0')}
             </span>
           </p>
         </div>

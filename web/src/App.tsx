@@ -1,8 +1,10 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query'
 import { ShieldAlert } from 'lucide-react'
 import { HashRouter, Link, Navigate, Route, Routes } from 'react-router-dom'
+import { api } from './api/client'
 import { Layout } from './components/Layout'
 import { AuthProvider, useAuth } from './context/AuthContext'
+import { isDemoMode } from './demo/demoMode'
 import { AdminPage } from './pages/AdminPage'
 import { CollectionsPage } from './pages/CollectionsPage'
 import { FavoritesPage } from './pages/FavoritesPage'
@@ -13,6 +15,7 @@ import { LoginPage } from './pages/LoginPage'
 import { PersonDetailPage } from './pages/PersonDetailPage'
 import { PlayerPage } from './pages/PlayerPage'
 import { SearchPage } from './pages/SearchPage'
+import { SetupWizardPage } from './pages/SetupWizardPage'
 import { TrendingPage } from './pages/TrendingPage'
 
 const queryClient = new QueryClient({
@@ -24,10 +27,16 @@ const queryClient = new QueryClient({
   },
 })
 
-function RequireAuth({ children }: { children: React.ReactNode }) {
+function RequireAuth({
+  children,
+  needsSetup = false,
+}: {
+  children: React.ReactNode
+  needsSetup?: boolean
+}) {
   const { auth } = useAuth()
   if (!auth) {
-    return <Navigate to="/login" replace />
+    return <Navigate to={needsSetup ? '/setup' : '/login'} replace />
   }
   return <>{children}</>
 }
@@ -68,14 +77,36 @@ function RequireAdmin({ children }: { children: React.ReactNode }) {
 
 function AppRoutes() {
   const { auth } = useAuth()
+  const demoActive = isDemoMode()
+
+  const { data: setupStatus } = useQuery({
+    queryKey: ['setupStatus'],
+    queryFn: () => api.getSetupStatus(),
+    enabled: !auth && !demoActive,
+    retry: false,
+  })
+
+  const needsSetup = !demoActive && setupStatus?.completed === false
 
   return (
     <Routes>
-      <Route path="/login" element={auth ? <Navigate to="/" replace /> : <LoginPage />} />
+      <Route path="/setup" element={<SetupWizardPage />} />
+      <Route
+        path="/login"
+        element={
+          auth ? (
+            <Navigate to="/" replace />
+          ) : needsSetup ? (
+            <Navigate to="/setup" replace />
+          ) : (
+            <LoginPage />
+          )
+        }
+      />
       <Route
         path="/play/:id"
         element={
-          <RequireAuth>
+          <RequireAuth needsSetup={needsSetup}>
             <PlayerPage />
           </RequireAuth>
         }
@@ -83,7 +114,7 @@ function AppRoutes() {
       <Route
         path="/"
         element={
-          <RequireAuth>
+          <RequireAuth needsSetup={needsSetup}>
             <Layout />
           </RequireAuth>
         }
