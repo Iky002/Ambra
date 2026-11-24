@@ -56,6 +56,13 @@ type PersonCredit struct {
 	ImageURL string
 }
 
+type CollectionMeta struct {
+	ID          string
+	Name        string
+	PosterURL   string
+	BackdropURL string
+}
+
 type MetadataResult struct {
 	Name            string
 	OriginalTitle   string
@@ -73,6 +80,7 @@ type MetadataResult struct {
 	PosterURL       string
 	BackdropURL     string
 	LogoURL         string
+	Collection      *CollectionMeta
 }
 
 type MetadataProvider interface {

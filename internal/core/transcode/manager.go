@@ -39,11 +39,12 @@ type SessionParams struct {
 	AudioChannels       int    // default 2
 	MaxWidth            int
 	MaxHeight           int
-	AudioStreamIndex    *int
-	SubtitleStreamIndex *int
-	SubtitleMethod      string // "Encode" for burn-in
-	SubtitleCodec       string // e.g. "ass", "srt", "pgssub", "dvd_subtitle"
-	SubtitlePath        string // external subtitle path when IsExternal
+	AudioStreamIndex      *int
+	SubtitleStreamIndex   *int
+	SubtitleRelativeIndex int    // 0-based index among embedded subtitle streams (for FFmpeg subtitles filter :si=)
+	SubtitleMethod        string // "Encode" for burn-in
+	SubtitleCodec         string // e.g. "ass", "srt", "pgssub", "dvd_subtitle"
+	SubtitlePath          string // external subtitle path when IsExternal
 	SegmentDuration     int    // seconds, default 6
 	SegmentContainer    string // "ts" (default), "mp4", "m4s"
 	DurationSec         float64
@@ -146,19 +147,20 @@ func BuildFFmpegArgs(params SessionParams, startSeg int, outDir string, caps *HW
 			if subPath := strings.TrimSpace(params.SubtitlePath); subPath != "" {
 				vfParts = append(vfParts, fmt.Sprintf("subtitles='%s'", escapeFFmpegFilterPath(subPath)))
 			} else if params.SubtitleStreamIndex != nil && *params.SubtitleStreamIndex >= 0 {
-				vfParts = append(vfParts, fmt.Sprintf("subtitles='%s':si=%d", escapeFFmpegFilterPath(params.InputPath), *params.SubtitleStreamIndex))
+				si := params.SubtitleRelativeIndex
+				if si < 0 {
+					si = 0
+				}
+				vfParts = append(vfParts, fmt.Sprintf("subtitles='%s':si=%d", escapeFFmpegFilterPath(params.InputPath), si))
 			}
 		}
-		if params.MaxWidth > 0 || params.MaxHeight > 0 {
-			w := params.MaxWidth
-			h := params.MaxHeight
-			if w <= 0 {
-				w = -2
-			}
-			if h <= 0 {
-				h = -2
-			}
-			vfParts = append(vfParts, fmt.Sprintf("scale='min(%d,iw)':'min(%d,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2", w, h))
+		switch {
+		case params.MaxWidth > 0 && params.MaxHeight > 0:
+			vfParts = append(vfParts, fmt.Sprintf("scale='min(%d,iw)':'min(%d,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2", params.MaxWidth, params.MaxHeight))
+		case params.MaxWidth > 0:
+			vfParts = append(vfParts, fmt.Sprintf("scale='min(%d,iw)':-2", params.MaxWidth))
+		case params.MaxHeight > 0:
+			vfParts = append(vfParts, fmt.Sprintf("scale=-2:'min(%d,ih)'", params.MaxHeight))
 		}
 		if strings.HasSuffix(encoder, "_vaapi") {
 			vfParts = append(vfParts, "format=nv12,hwupload")

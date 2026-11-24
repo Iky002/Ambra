@@ -5,12 +5,15 @@ import {
   Activity,
   AlertTriangle,
   ArrowLeft,
+  Bookmark,
   Cpu,
   Gauge,
+  HelpCircle,
   Loader2,
   Maximize,
   Minimize,
   Pause,
+  PictureInPicture2,
   Play,
   RotateCcw,
   RotateCw,
@@ -18,6 +21,7 @@ import {
   SkipBack,
   SkipForward,
   SlidersHorizontal,
+  Sparkles,
   Subtitles,
   Volume2,
   VolumeX,
@@ -74,13 +78,74 @@ import {
   type WasmRemuxStage,
 } from '../player/wasmRemuxer'
 
-type ActivePanel = 'none' | 'subtitle' | 'subtitlePrefs' | 'audio' | 'speed' | 'settings'
+type ActivePanel =
+  | 'none'
+  | 'subtitle'
+  | 'subtitlePrefs'
+  | 'audio'
+  | 'quality'
+  | 'chapters'
+  | 'speed'
+  | 'settings'
 type PlayMethodMode =
   | 'DirectPlay'
   | 'Proxy Direct'
   | 'Stream MKV (MSE)'
   | 'Client WASM Remux'
   | 'Server HLS'
+
+type QualityPresetId = 'auto' | '1080p8' | '720p4' | '480p1.5'
+
+interface QualityPreset {
+  id: QualityPresetId
+  label: string
+  shortLabel: string
+  maxBitrate?: number
+  maxWidth?: number
+  maxHeight?: number
+}
+
+const QUALITY_PRESETS: QualityPreset[] = [
+  { id: 'auto', label: '原画直连', shortLabel: '原画' },
+  {
+    id: '1080p8',
+    label: '1080p · 8 Mbps',
+    shortLabel: '1080p',
+    maxBitrate: 8_000_000,
+    maxWidth: 1920,
+    maxHeight: 1080,
+  },
+  {
+    id: '720p4',
+    label: '720p · 4 Mbps',
+    shortLabel: '720p',
+    maxBitrate: 4_000_000,
+    maxWidth: 1280,
+    maxHeight: 720,
+  },
+  {
+    id: '480p1.5',
+    label: '480p · 1.5 Mbps',
+    shortLabel: '480p',
+    maxBitrate: 1_500_000,
+    maxWidth: 854,
+    maxHeight: 480,
+  },
+]
+
+const KEYBOARD_SHORTCUTS: Array<{ keys: string; desc: string }> = [
+  { keys: 'Space', desc: '播放 / 暂停' },
+  { keys: '← / →', desc: '快退 / 快进 10 秒' },
+  { keys: '↑ / ↓', desc: '音量增 / 减 10%' },
+  { keys: 'M', desc: '静音 / 取消静音' },
+  { keys: 'F', desc: '全屏 / 退出全屏' },
+  { keys: 'P', desc: '画中画 (PiP)' },
+  { keys: 'C', desc: '切换字幕' },
+  { keys: 'A', desc: '切换音轨' },
+  { keys: 'I', desc: '播放统计信息' },
+  { keys: '?', desc: '显示 / 隐藏快捷键说明' },
+  { keys: 'Esc', desc: '关闭面板 / 退出播放' },
+]
 
 function isStrmSource(source?: MediaSourceInfo): boolean {
   if (!source) return false
@@ -149,8 +214,11 @@ export function PlayerPage() {
   const prevIdRef = useRef<string | undefined>(id)
 
   const [selectedSourceId, setSelectedSourceId] = useState<string | undefined>(initialMediaSourceId)
+  const [querySourceId, setQuerySourceId] = useState<string | undefined>(initialMediaSourceId)
   const [audioIndex, setAudioIndex] = useState<number | undefined>(initialAudio)
+  const [queryAudioIndex, setQueryAudioIndex] = useState<number | undefined>(initialAudio)
   const [subtitleIndex, setSubtitleIndex] = useState<number | undefined>(initialSubtitle)
+  const [qualityPreset, setQualityPreset] = useState<QualityPresetId>('auto')
   const [episodeIdSynced, setEpisodeIdSynced] = useState<string | undefined>(id)
   const [retryNonce, setRetryNonce] = useState(0)
 
@@ -165,9 +233,11 @@ export function PlayerPage() {
   const playbackRateRef = useRef(playbackRate)
   playbackRateRef.current = playbackRate
   const [isFullscreen, setIsFullscreen] = useState(false)
+  const [isPip, setIsPip] = useState(false)
   const [osdVisible, setOsdVisible] = useState(true)
   const [activePanel, setActivePanel] = useState<ActivePanel>('none')
   const [showStats, setShowStats] = useState(false)
+  const [showShortcuts, setShowShortcuts] = useState(false)
   const [playerError, setPlayerError] = useState<string | null>(null)
   const [subtitleError, setSubtitleError] = useState<string | null>(null)
   const [playMethod, setPlayMethod] = useState<PlayMethodMode>('DirectPlay')
@@ -221,8 +291,12 @@ export function PlayerPage() {
           ? Number(nextSubRaw)
           : undefined
       setSelectedSourceId(nextSourceId)
+      setQuerySourceId(nextSourceId)
       setAudioIndex(nextAudio)
+      setQueryAudioIndex(nextAudio)
       setSubtitleIndex(nextSubtitle)
+      setQualityPreset('auto')
+      setShowShortcuts(false)
       setPlayerError(null)
       setSubtitleError(null)
       setCurrentTime(0)
@@ -323,11 +397,11 @@ export function PlayerPage() {
     error: infoError,
     refetch: refetchPlaybackInfo,
   } = useQuery({
-    queryKey: ['playbackInfo', id, userId, selectedSourceId, audioIndex],
+    queryKey: ['playbackInfo', id, userId, querySourceId, queryAudioIndex],
     queryFn: () =>
       api.getPlaybackInfo(id!, userId, {
-        mediaSourceId: selectedSourceId,
-        audioStreamIndex: audioIndex,
+        mediaSourceId: querySourceId,
+        audioStreamIndex: queryAudioIndex,
         subtitleStreamIndex: subtitleIndex,
         startTimeTicks: initialStartTicks,
       }),
@@ -364,6 +438,9 @@ export function PlayerPage() {
         )
         if (pickedAudio !== undefined) {
           setAudioIndex(pickedAudio)
+          if (pickedAudio !== activeSource.DefaultAudioStreamIndex) {
+            setQueryAudioIndex(pickedAudio)
+          }
         }
       }
     }
@@ -480,20 +557,32 @@ export function PlayerPage() {
 
     const isStrm = isStrmSource(activeSource)
 
+    const activeQuality = QUALITY_PRESETS.find((q) => q.id === qualityPreset) || QUALITY_PRESETS[0]
+
     const hlsParams = new URLSearchParams({
       MediaSourceId: activeSource.Id,
     })
     if (playbackInfo?.PlaySessionId) hlsParams.set('PlaySessionId', playbackInfo.PlaySessionId)
     if (audioIndex !== undefined) hlsParams.set('AudioStreamIndex', String(audioIndex))
+    if (qualityPreset !== 'auto') {
+      if (activeQuality.maxBitrate) {
+        hlsParams.set('MaxStreamingBitrate', String(activeQuality.maxBitrate))
+      }
+      if (activeQuality.maxWidth) hlsParams.set('MaxWidth', String(activeQuality.maxWidth))
+      if (activeQuality.maxHeight) hlsParams.set('MaxHeight', String(activeQuality.maxHeight))
+    }
     const fallbackMasterHlsUrl = resolveApiUrl(
       `/emby/Videos/${encodeURIComponent(id)}/master.m3u8?${hlsParams.toString()}`,
     )
 
-    const hlsUrl = activeSource.TranscodingUrl
-      ? resolveApiUrl(activeSource.TranscodingUrl)
-      : activeSource.DirectStreamUrl?.includes('.m3u8')
-        ? resolveApiUrl(activeSource.DirectStreamUrl)
-        : fallbackMasterHlsUrl
+    const hlsUrl =
+      qualityPreset !== 'auto'
+        ? fallbackMasterHlsUrl
+        : activeSource.TranscodingUrl
+          ? resolveApiUrl(activeSource.TranscodingUrl)
+          : activeSource.DirectStreamUrl?.includes('.m3u8')
+            ? resolveApiUrl(activeSource.DirectStreamUrl)
+            : fallbackMasterHlsUrl
 
     const requiresRemux = needsClientRemux(activeSource.Container, activeAudioStream?.Codec)
     const sizeBytes = activeSource.Size
@@ -502,7 +591,7 @@ export function PlayerPage() {
       isMkvContainer(activeSource.Container) &&
       canStreamMkvRemux(videoStream?.Codec, activeAudioStream?.Codec, activeSource.Container)
 
-    if (forceServerHls) {
+    if (qualityPreset !== 'auto' || forceServerHls) {
       return {
         strategy: 'hls' as const,
         directUrl,
@@ -608,6 +697,7 @@ export function PlayerPage() {
     preferWasmRemux,
     useProxyDirect,
     forceServerHls,
+    qualityPreset,
   ])
 
   // 挂载视频流 (DirectPlay / Stream MKV (MSE) / Client WASM Remux / Server HLS 自动降级)
@@ -1198,12 +1288,77 @@ export function PlayerPage() {
     pokeOsd()
   }, [subtitleStreams, subtitleIndex, pokeOsd])
 
+  const handleExit = useCallback(() => {
+    if (window.history.length > 1) {
+      navigate(-1)
+    } else {
+      navigate(item?.Id ? `/item/${item.Id}` : '/', { replace: true })
+    }
+  }, [navigate, item?.Id])
+
+  const pipSupported = typeof document !== 'undefined' && 'pictureInPictureEnabled' in document
+
+  const togglePip = useCallback(() => {
+    const v = videoRef.current
+    if (!v || typeof document === 'undefined' || !('pictureInPictureEnabled' in document)) return
+    if (document.pictureInPictureElement) {
+      document.exitPictureInPicture?.().catch(() => undefined)
+    } else {
+      v.requestPictureInPicture?.().catch(() => undefined)
+    }
+    pokeOsd()
+  }, [pokeOsd])
+
+  const handleSelectQuality = useCallback(
+    (presetId: QualityPresetId) => {
+      if (presetId !== qualityPreset) {
+        captureResumePosition()
+        setQualityPreset(presetId)
+        if (presetId === 'auto') {
+          setForceServerHls(false)
+        }
+      }
+      setActivePanel('none')
+      pokeOsd()
+    },
+    [qualityPreset, captureResumePosition, pokeOsd],
+  )
+
+  const chapters = item?.Chapters || []
+  const activeChapterIdx = useMemo(() => {
+    if (chapters.length === 0) return -1
+    let idx = -1
+    for (let i = 0; i < chapters.length; i++) {
+      const startSec = chapters[i].StartPositionTicks / 10_000_000
+      if (currentTime >= startSec - 0.5) {
+        idx = i
+      }
+    }
+    return idx
+  }, [chapters, currentTime])
+
+  const seekToChapter = useCallback(
+    (startTicks: number) => {
+      const v = videoRef.current
+      const targetSec = Math.max(0, startTicks / 10_000_000)
+      if (v && Number.isFinite(targetSec)) {
+        v.currentTime = targetSec
+        setCurrentTime(targetSec)
+        reportState('progress', 'timeupdate')
+      }
+      setActivePanel('none')
+      pokeOsd()
+    },
+    [pokeOsd, reportState],
+  )
+
   const cycleAudio = useCallback(() => {
     if (audioStreams.length <= 1) return
     const curPos = audioStreams.findIndex((a) => a.Index === audioIndex)
     const next = audioStreams[(curPos + 1) % audioStreams.length]
     captureResumePosition()
     setAudioIndex(next.Index)
+    setQueryAudioIndex(next.Index)
     pokeOsd()
   }, [audioStreams, audioIndex, captureResumePosition, pokeOsd])
 
@@ -1231,7 +1386,7 @@ export function PlayerPage() {
     pokeOsd()
   }, [muted, pokeOsd])
 
-  // 监听全屏状态变化
+  // 监听全屏与画中画状态变化
   useEffect(() => {
     const onFsChange = () => {
       setIsFullscreen(Boolean(document.fullscreenElement))
@@ -1241,10 +1396,31 @@ export function PlayerPage() {
     return () => document.removeEventListener('fullscreenchange', onFsChange)
   }, [])
 
-  // 全局快捷键：Space / 左右 / 上下 / M / F / C / A / I / Esc
+  useEffect(() => {
+    const v = videoRef.current
+    if (!v) return
+    const onEnterPip = () => setIsPip(true)
+    const onLeavePip = () => setIsPip(false)
+    v.addEventListener('enterpictureinpicture', onEnterPip)
+    v.addEventListener('leavepictureinpicture', onLeavePip)
+    return () => {
+      v.removeEventListener('enterpictureinpicture', onEnterPip)
+      v.removeEventListener('leavepictureinpicture', onLeavePip)
+    }
+  }, [])
+
+  // 全局快捷键：Space / 左右 / 上下 / M / F / P / C / A / I / ? / Esc
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
+      if (e.ctrlKey || e.metaKey || e.altKey) return
+      if (
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement ||
+        e.target instanceof HTMLSelectElement ||
+        (e.target instanceof HTMLElement && e.target.isContentEditable)
+      ) {
+        return
+      }
       const key = e.key.toLowerCase()
       if (e.code === 'Space') {
         e.preventDefault()
@@ -1281,6 +1457,9 @@ export function PlayerPage() {
       } else if (key === 'f') {
         e.preventDefault()
         toggleFullscreen()
+      } else if (key === 'p') {
+        e.preventDefault()
+        togglePip()
       } else if (key === 'c') {
         e.preventDefault()
         cycleSubtitle()
@@ -1290,11 +1469,16 @@ export function PlayerPage() {
       } else if (key === 'i') {
         e.preventDefault()
         setShowStats((s) => !s)
+      } else if (e.key === '?') {
+        e.preventDefault()
+        setShowShortcuts((s) => !s)
       } else if (e.key === 'Escape') {
-        if (activePanel !== 'none') {
+        if (showShortcuts) {
+          setShowShortcuts(false)
+        } else if (activePanel !== 'none') {
           setActivePanel('none')
         } else if (!document.fullscreenElement) {
-          navigate(-1)
+          handleExit()
         }
       }
     }
@@ -1305,10 +1489,12 @@ export function PlayerPage() {
     seekBy,
     toggleMute,
     toggleFullscreen,
+    togglePip,
     cycleSubtitle,
     cycleAudio,
+    showShortcuts,
     activePanel,
-    navigate,
+    handleExit,
     pokeOsd,
   ])
 
@@ -1545,7 +1731,7 @@ export function PlayerPage() {
               </button>
               <button
                 type="button"
-                onClick={() => navigate(-1)}
+                onClick={handleExit}
                 className="rounded-xl border border-white/15 bg-white/10 px-5 py-2 text-xs font-semibold text-zinc-100 hover:bg-white/20"
               >
                 返回上一页
@@ -1692,6 +1878,47 @@ export function PlayerPage() {
         </div>
       )}
 
+      {/* 快捷键说明浮层 (快捷键 ?) */}
+      {showShortcuts && (
+        <div
+          onClick={() => setShowShortcuts(false)}
+          className="absolute inset-0 z-30 flex items-center justify-center bg-black/60 px-4 backdrop-blur-sm"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-md rounded-2xl border border-white/15 bg-zinc-950/90 p-5 text-xs text-zinc-200 shadow-2xl backdrop-blur-xl"
+          >
+            <div className="mb-3 flex items-center justify-between border-b border-white/10 pb-2.5">
+              <span className="flex items-center gap-1.5 text-sm font-semibold text-amber-400">
+                <HelpCircle className="h-4 w-4" />
+                快捷键说明
+              </span>
+              <button
+                type="button"
+                onClick={() => setShowShortcuts(false)}
+                aria-label="关闭快捷键说明"
+                className="rounded-lg p-1 text-zinc-400 hover:bg-white/10 hover:text-white"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <dl className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              {KEYBOARD_SHORTCUTS.map((sc) => (
+                <div
+                  key={sc.keys}
+                  className="flex items-center justify-between gap-2 rounded-xl border border-white/8 bg-white/[0.03] px-3 py-2"
+                >
+                  <dt className="text-zinc-300">{sc.desc}</dt>
+                  <dd className="shrink-0 rounded-md border border-white/15 bg-white/10 px-1.5 py-0.5 font-mono text-[11px] font-semibold text-amber-300">
+                    {sc.keys}
+                  </dd>
+                </div>
+              ))}
+            </dl>
+          </div>
+        </div>
+      )}
+
       {/* 顶部 OSD 导航栏 */}
       <div
         onClick={(e) => e.stopPropagation()}
@@ -1702,7 +1929,7 @@ export function PlayerPage() {
         <div className="flex min-w-0 items-center gap-3">
           <button
             type="button"
-            onClick={() => navigate(-1)}
+            onClick={handleExit}
             className="flex h-10 w-10 items-center justify-center rounded-xl bg-white/10 text-white backdrop-blur-md transition-colors hover:bg-white/20"
             title="返回"
           >
@@ -1724,19 +1951,36 @@ export function PlayerPage() {
           </div>
         </div>
 
-        <button
-          type="button"
-          onClick={() => setShowStats((s) => !s)}
-          className={`flex items-center gap-1.5 rounded-xl px-3 py-2 text-xs font-medium backdrop-blur-md transition-colors ${
-            showStats
-              ? 'bg-amber-500 text-zinc-950'
-              : 'bg-white/10 text-zinc-200 hover:bg-white/20'
-          }`}
-          title="播放统计 (快捷键 I)"
-        >
-          <Activity className="h-4 w-4" />
-          <span className="hidden sm:inline">统计</span>
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setShowShortcuts((s) => !s)}
+            className={`flex items-center gap-1.5 rounded-xl px-2.5 py-2 text-xs font-medium backdrop-blur-md transition-colors ${
+              showShortcuts
+                ? 'bg-amber-500 text-zinc-950'
+                : 'bg-white/10 text-zinc-200 hover:bg-white/20'
+            }`}
+            title="快捷键说明 (?)"
+            aria-label="快捷键说明"
+          >
+            <HelpCircle className="h-4 w-4" />
+            <span className="hidden sm:inline">?</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setShowStats((s) => !s)}
+            className={`flex items-center gap-1.5 rounded-xl px-3 py-2 text-xs font-medium backdrop-blur-md transition-colors ${
+              showStats
+                ? 'bg-amber-500 text-zinc-950'
+                : 'bg-white/10 text-zinc-200 hover:bg-white/20'
+            }`}
+            title="播放统计 (快捷键 I)"
+          >
+            <Activity className="h-4 w-4" />
+            <span className="hidden sm:inline">统计</span>
+          </button>
+        </div>
       </div>
 
       {/* 底部 OSD 播放控制栏 */}
@@ -1757,6 +2001,22 @@ export function PlayerPage() {
               className="absolute inset-y-0 left-0 bg-gradient-to-r from-amber-500 to-orange-400"
               style={{ width: `${progressPct}%` }}
             />
+            {chapters.length > 0 &&
+              duration > 0 &&
+              chapters.map((ch, idx) => {
+                const startSec = ch.StartPositionTicks / 10_000_000
+                if (!Number.isFinite(startSec) || startSec < 0 || startSec > duration) return null
+                const pct = (startSec / duration) * 100
+                return (
+                  <span
+                    key={`${ch.StartPositionTicks}-${idx}`}
+                    data-testid="chapter-marker"
+                    title={`${ch.Name || `章节 ${idx + 1}`} (${formatSeconds(startSec)})`}
+                    className="pointer-events-none absolute inset-y-0 z-10 w-0.5 bg-white/75"
+                    style={{ left: `${pct}%` }}
+                  />
+                )
+              })}
           </div>
           <input
             type="range"
@@ -1875,8 +2135,104 @@ export function PlayerPage() {
             </span>
           </div>
 
-          {/* 右侧控制：音轨 / 字幕 / 倍速 / 全屏 */}
+          {/* 右侧控制：章节 / 画质 / 音轨 / 字幕 / 倍速 / 画中画 / 全屏 */}
           <div className="relative flex items-center gap-1.5 sm:gap-2">
+            {/* 章节列表 */}
+            {chapters.length > 0 && (
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setActivePanel((p) => (p === 'chapters' ? 'none' : 'chapters'))}
+                  className={`flex items-center gap-1.5 rounded-xl px-3 py-2 text-xs font-medium transition-colors ${
+                    activePanel === 'chapters'
+                      ? 'bg-amber-500 text-zinc-950'
+                      : 'bg-white/10 text-zinc-200 hover:bg-white/20'
+                  }`}
+                  title="章节列表"
+                >
+                  <Bookmark className="h-4 w-4" />
+                  <span className="hidden md:inline">章节</span>
+                </button>
+
+                {activePanel === 'chapters' && (
+                  <div className="absolute bottom-12 right-0 z-30 w-72 overflow-hidden rounded-2xl border border-white/15 bg-zinc-950/95 p-2 shadow-2xl backdrop-blur-xl">
+                    <p className="px-2.5 py-1.5 text-[11px] font-semibold text-zinc-400">
+                      章节 ({chapters.length})
+                    </p>
+                    <div className="max-h-64 space-y-1 overflow-y-auto">
+                      {chapters.map((ch, idx) => {
+                        const startSec = ch.StartPositionTicks / 10_000_000
+                        const isActive = idx === activeChapterIdx
+                        return (
+                          <button
+                            key={`${ch.StartPositionTicks}-${idx}`}
+                            type="button"
+                            onClick={() => seekToChapter(ch.StartPositionTicks)}
+                            className={`flex w-full items-center justify-between gap-2 rounded-xl px-2.5 py-2 text-left text-xs transition-colors ${
+                              isActive
+                                ? 'bg-amber-500/20 font-semibold text-amber-300'
+                                : 'text-zinc-200 hover:bg-white/8'
+                            }`}
+                          >
+                            <span className="truncate">{ch.Name || `章节 ${idx + 1}`}</span>
+                            <span className="shrink-0 font-mono text-[11px] text-zinc-400">
+                              {formatSeconds(startSec)}
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* 画质 / 码率切换 */}
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setActivePanel((p) => (p === 'quality' ? 'none' : 'quality'))}
+                className={`flex items-center gap-1.5 rounded-xl px-2.5 py-2 text-xs font-medium transition-colors ${
+                  activePanel === 'quality'
+                    ? 'bg-amber-500 text-zinc-950'
+                    : qualityPreset !== 'auto'
+                      ? 'bg-amber-500/20 text-amber-300 ring-1 ring-amber-400/40'
+                      : 'bg-white/10 text-zinc-200 hover:bg-white/20'
+                }`}
+                title="切换画质"
+              >
+                <Sparkles className="h-4 w-4" />
+                <span>
+                  {(QUALITY_PRESETS.find((q) => q.id === qualityPreset) || QUALITY_PRESETS[0])
+                    .shortLabel}
+                </span>
+              </button>
+
+              {activePanel === 'quality' && (
+                <div className="absolute bottom-12 right-0 z-30 w-52 overflow-hidden rounded-2xl border border-white/15 bg-zinc-950/95 p-2 shadow-2xl backdrop-blur-xl">
+                  <p className="px-2.5 py-1.5 text-[11px] font-semibold text-zinc-400">
+                    画质 / 码率限制
+                  </p>
+                  <div className="space-y-1">
+                    {QUALITY_PRESETS.map((preset) => (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        onClick={() => handleSelectQuality(preset.id)}
+                        className={`flex w-full items-center justify-between rounded-xl px-2.5 py-2 text-left text-xs transition-colors ${
+                          qualityPreset === preset.id
+                            ? 'bg-amber-500/20 font-semibold text-amber-300'
+                            : 'text-zinc-200 hover:bg-white/8'
+                        }`}
+                      >
+                        <span>{preset.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
             {/* 音轨切换 */}
             {audioStreams.length > 0 && (
               <div className="relative">
@@ -1907,6 +2263,7 @@ export function PlayerPage() {
                           onClick={() => {
                             captureResumePosition()
                             setAudioIndex(a.Index)
+                            setQueryAudioIndex(a.Index)
                             setActivePanel('none')
                           }}
                           className={`flex w-full items-center justify-between rounded-xl px-2.5 py-2 text-left text-xs transition-colors ${
@@ -2250,6 +2607,23 @@ export function PlayerPage() {
                 </div>
               )}
             </div>
+
+            {/* 画中画 (PiP) */}
+            {pipSupported && (
+              <button
+                type="button"
+                onClick={togglePip}
+                className={`rounded-xl p-2 transition-colors ${
+                  isPip
+                    ? 'bg-amber-500 text-zinc-950'
+                    : 'bg-white/10 text-zinc-200 hover:bg-white/20'
+                }`}
+                title="画中画 (P)"
+                aria-label="画中画"
+              >
+                <PictureInPicture2 className="h-4 w-4" />
+              </button>
+            )}
 
             {/* 全屏 */}
             <button

@@ -36,6 +36,12 @@ type ProbedStream struct {
 	IsExternal   bool
 }
 
+// ProbedChapter holds a normalized video chapter discovered by ffprobe.
+type ProbedChapter struct {
+	StartPositionTicks int64
+	Name               string
+}
+
 // ProbeResult holds the parsed container-level and stream-level media metadata from ffprobe.
 type ProbeResult struct {
 	Container      string
@@ -44,6 +50,7 @@ type ProbeResult struct {
 	Size           int64
 	Tags           map[string]string
 	Streams        []ProbedStream
+	Chapters       []ProbedChapter
 	HasAttachedPic bool
 }
 
@@ -104,6 +111,7 @@ func (p *Prober) Probe(ctx context.Context, filePath string) (*ProbeResult, erro
 		"-print_format", "json",
 		"-show_format",
 		"-show_streams",
+		"-show_chapters",
 		filePath,
 	)
 	out, err := cmd.Output()
@@ -114,8 +122,18 @@ func (p *Prober) Probe(ctx context.Context, filePath string) (*ProbeResult, erro
 }
 
 type ffprobeOutput struct {
-	Format  *ffprobeFormat  `json:"format"`
-	Streams []ffprobeStream `json:"streams"`
+	Format   *ffprobeFormat   `json:"format"`
+	Streams  []ffprobeStream  `json:"streams"`
+	Chapters []ffprobeChapter `json:"chapters"`
+}
+
+type ffprobeChapter struct {
+	ID        int               `json:"id"`
+	TimeBase  string            `json:"time_base"`
+	Start     int64             `json:"start"`
+	StartTime string            `json:"start_time"`
+	EndTime   string            `json:"end_time"`
+	Tags      map[string]string `json:"tags"`
 }
 
 type ffprobeFormat struct {
@@ -268,6 +286,32 @@ func ParseFFprobeJSON(raw []byte) (*ProbeResult, error) {
 
 	if res.RuntimeTicks == 0 && maxStreamDur > 0 {
 		res.RuntimeTicks = ticks.FromSeconds(maxStreamDur)
+	}
+
+	if len(payload.Chapters) > 0 {
+		chapters := make([]ProbedChapter, 0, len(payload.Chapters))
+		for idx, ch := range payload.Chapters {
+			var startSec float64
+			if s, err := strconv.ParseFloat(strings.TrimSpace(ch.StartTime), 64); err == nil && s >= 0 {
+				startSec = s
+			} else if ch.Start > 0 && strings.Contains(ch.TimeBase, "/") {
+				parts := strings.SplitN(ch.TimeBase, "/", 2)
+				num, err1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+				den, err2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+				if err1 == nil && err2 == nil && den > 0 {
+					startSec = float64(ch.Start) * num / den
+				}
+			}
+			name := tagValue(ch.Tags, "title")
+			if name == "" {
+				name = fmt.Sprintf("Chapter %d", idx+1)
+			}
+			chapters = append(chapters, ProbedChapter{
+				StartPositionTicks: ticks.FromSeconds(startSec),
+				Name:               name,
+			})
+		}
+		res.Chapters = chapters
 	}
 	return res, nil
 }

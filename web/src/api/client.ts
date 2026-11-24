@@ -17,6 +17,10 @@ import type {
   FileSystemEntry,
   ItemImageInfo,
   ItemMetadataUpdatePayload,
+  LiveTvChannelInfo,
+  LiveTvInfo,
+  LiveTvListingProviderInfo,
+  LiveTvTunerHostInfo,
   MediaAttachmentInfo,
   NameIdPair,
   PlaybackInfoResponse,
@@ -37,6 +41,7 @@ import type {
   SetupCompleteRequest,
   SetupStatus,
   SystemInfo,
+  TaskTriggerInfo,
   UserDto,
   UserItemDataDto,
   UserPolicy,
@@ -312,6 +317,9 @@ export const api = {
       limit?: number
       recursive?: boolean
       searchTerm?: string
+      nameStartsWith?: string
+      nameStartsWithOrGreater?: string
+      nameLessThan?: string
       fields?: string
     } = {},
   ) => {
@@ -330,6 +338,10 @@ export const api = {
     if (params.limit !== undefined) q.set('Limit', String(params.limit))
     if (params.recursive !== false) q.set('Recursive', 'true')
     if (params.searchTerm) q.set('SearchTerm', params.searchTerm)
+    if (params.nameStartsWith) q.set('NameStartsWith', params.nameStartsWith)
+    if (params.nameStartsWithOrGreater)
+      q.set('NameStartsWithOrGreater', params.nameStartsWithOrGreater)
+    if (params.nameLessThan) q.set('NameLessThan', params.nameLessThan)
     q.set(
       'Fields',
       params.fields ??
@@ -1126,4 +1138,86 @@ export const api = {
       },
       true,
     ),
+
+  // ==================== v0.8.0 Emby Parity APIs ====================
+
+  hideFromResume: (userId: string, itemId: string, hide = true) =>
+    embyFetch<UserItemDataDto>(
+      `/emby/Users/${encodeURIComponent(userId)}/Items/${encodeURIComponent(itemId)}/HideFromResume?Hide=${hide}`,
+      { method: 'POST' },
+    ),
+
+  uploadSubtitle: (
+    itemId: string,
+    payload: { Language: string; Format: string; IsForced?: boolean; Data: string },
+  ) =>
+    embyFetch<void>(`/emby/Videos/${encodeURIComponent(itemId)}/Subtitles`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  deleteSubtitle: (itemId: string, index: number) =>
+    embyFetch<void>(`/emby/Videos/${encodeURIComponent(itemId)}/Subtitles/${index}`, {
+      method: 'DELETE',
+    }),
+
+  sendSessionPlaystateCommand: (
+    sessionId: string,
+    command: 'Pause' | 'Unpause' | 'PlayPause' | 'Stop' | string,
+  ) =>
+    embyFetch<void>(
+      `/emby/Sessions/${encodeURIComponent(sessionId)}/Playing/${encodeURIComponent(command)}`,
+      { method: 'POST' },
+    ),
+
+  sendSessionMessage: (
+    sessionId: string,
+    payload: { Header: string; Text: string; TimeoutMs?: number },
+  ) =>
+    embyFetch<void>(`/emby/Sessions/${encodeURIComponent(sessionId)}/Message`, {
+      method: 'POST',
+      body: JSON.stringify({
+        Header: payload.Header,
+        Text: payload.Text,
+        TimeoutMs: payload.TimeoutMs ?? 5000,
+      }),
+    }),
+
+  updateTaskTriggers: (taskId: string, triggers: TaskTriggerInfo[]) =>
+    embyFetch<void>(`/emby/ScheduledTasks/${encodeURIComponent(taskId)}/Triggers`, {
+      method: 'POST',
+      body: JSON.stringify(triggers),
+    }),
+
+  getLiveTvInfo: () => embyFetch<LiveTvInfo>('/emby/LiveTv/Info'),
+
+  getLiveTvChannels: (limit = 100) =>
+    embyFetch<QueryResult<LiveTvChannelInfo>>(`/emby/LiveTv/Channels?Limit=${limit}`),
+
+  getTunerHosts: () => embyFetch<LiveTvTunerHostInfo[]>('/emby/LiveTv/TunerHosts'),
+
+  addTunerHost: (host: LiveTvTunerHostInfo) =>
+    embyFetch<LiveTvTunerHostInfo>('/emby/LiveTv/TunerHosts', {
+      method: 'POST',
+      body: JSON.stringify(host),
+    }),
+
+  deleteTunerHost: (id: string) =>
+    embyFetch<void>(`/emby/LiveTv/TunerHosts?id=${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+
+  getListingProviders: () =>
+    embyFetch<LiveTvListingProviderInfo[]>('/emby/LiveTv/ListingProviders'),
+
+  addListingProvider: (provider: LiveTvListingProviderInfo) =>
+    embyFetch<LiveTvListingProviderInfo>('/emby/LiveTv/ListingProviders', {
+      method: 'POST',
+      body: JSON.stringify(provider),
+    }),
+
+  deleteListingProvider: (id: string) =>
+    embyFetch<void>(`/emby/LiveTv/ListingProviders?id=${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
 }

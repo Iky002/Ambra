@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -88,6 +89,9 @@ type Server struct {
 }
 
 func New(ctx context.Context, cfg *config.Config) (*Server, error) {
+	if err := applyPendingDatabaseRestore(cfg.DataDir, cfg.DBPath()); err != nil {
+		return nil, fmt.Errorf("apply pending database restore: %w", err)
+	}
 	store, err := sqlite.Open(cfg.DBPath())
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
@@ -422,6 +426,58 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		WSHub:        wsHub,
 		Handler:      r,
 	}, nil
+}
+
+func applyPendingDatabaseRestore(dataDir, dbPath string) error {
+	if strings.TrimSpace(dataDir) == "" || strings.TrimSpace(dbPath) == "" {
+		return nil
+	}
+	restorePath := filepath.Join(dataDir, "ambra.db.restore")
+	info, err := os.Stat(restorePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		slog.Warn("failed to stat pending database restore file", "path", restorePath, "error", err)
+		return fmt.Errorf("stat pending restore %s: %w", restorePath, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() == 0 {
+		slog.Warn("ignoring invalid or empty pending database restore file", "path", restorePath, "size", info.Size())
+		return nil
+	}
+
+	for _, suffix := range []string{"-wal", "-shm"} {
+		sidecar := dbPath + suffix
+		if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
+			slog.Warn("failed to remove stale sqlite sidecar before restore", "path", sidecar, "error", err)
+			return fmt.Errorf("remove stale sidecar %s: %w", sidecar, err)
+		}
+	}
+
+	backupPath := dbPath + ".pre-restore.bak"
+	hadExistingDB := false
+	if _, err := os.Stat(dbPath); err == nil {
+		hadExistingDB = true
+		_ = os.Remove(backupPath)
+		if err := os.Rename(dbPath, backupPath); err != nil {
+			slog.Warn("failed to back up existing database before restore", "dbPath", dbPath, "backupPath", backupPath, "error", err)
+			return fmt.Errorf("backup existing db: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		slog.Warn("failed to stat existing database before restore", "dbPath", dbPath, "error", err)
+		return fmt.Errorf("stat existing db: %w", err)
+	}
+
+	if err := os.Rename(restorePath, dbPath); err != nil {
+		slog.Warn("failed to promote pending database restore", "restorePath", restorePath, "dbPath", dbPath, "error", err)
+		if hadExistingDB {
+			_ = os.Rename(backupPath, dbPath)
+		}
+		return fmt.Errorf("promote restore db: %w", err)
+	}
+
+	slog.Info("applied pending database restore", "restorePath", restorePath, "dbPath", dbPath, "backupCreated", hadExistingDB, "backupPath", backupPath)
+	return nil
 }
 
 func (s *Server) Close() error {

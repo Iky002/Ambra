@@ -5,22 +5,39 @@ import {
   Cpu,
   HardDrive,
   Loader2,
+  MessageSquare,
   MonitorPlay,
   Pause,
   Play,
   Radio,
   RefreshCw,
+  Send,
   Server,
   ShieldCheck,
+  Square,
   Terminal,
 } from 'lucide-react'
 import { api } from '../../api/client'
 import type { SessionInfo } from '../../api/types'
 import { ScanProgressBar } from '../../components/ScanProgressBar'
-import { formatDateTime, formatRelativeTime, formatTicks } from './adminUtils'
+import {
+  AdminModal,
+  FeedbackBanner,
+  formatDateTime,
+  formatRelativeTime,
+  formatTicks,
+} from './adminUtils'
 
 export function DashboardTab() {
   const [autoRefresh, setAutoRefresh] = useState(true)
+  const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
+    null,
+  )
+  const [busySessionId, setBusySessionId] = useState<string | null>(null)
+  const [messageTarget, setMessageTarget] = useState<SessionInfo | null>(null)
+  const [msgHeader, setMsgHeader] = useState('系统通知')
+  const [msgText, setMsgText] = useState('')
+  const [sendingMsg, setSendingMsg] = useState(false)
 
   const { data: sysInfo, isLoading: sysLoading } = useQuery({
     queryKey: ['admin', 'systemInfo'],
@@ -52,8 +69,70 @@ export function DashboardTab() {
   const activityItems = activityData?.Items || []
   const playingCount = sessions.filter((s) => Boolean(s.NowPlayingItem)).length
 
+  const handleRemoteCommand = async (session: SessionInfo, command: 'PlayPause' | 'Stop') => {
+    setBusySessionId(session.Id)
+    setFeedback(null)
+    const label = session.DeviceName || session.UserName || session.Id
+    try {
+      await api.sendSessionPlaystateCommand(session.Id, command)
+      setFeedback({
+        type: 'success',
+        message: `已向「${label}」发送${command === 'Stop' ? '停止播放' : '暂停/继续'}指令`,
+      })
+      void refetchSessions()
+    } catch (err) {
+      setFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : '发送远程控制指令失败',
+      })
+    } finally {
+      setBusySessionId(null)
+    }
+  }
+
+  const handleOpenMessage = (session: SessionInfo) => {
+    setMessageTarget(session)
+    setMsgHeader('系统通知')
+    setMsgText('')
+  }
+
+  const handleSendMessage = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!messageTarget) return
+    const trimmedText = msgText.trim()
+    if (!trimmedText) {
+      setFeedback({ type: 'error', message: '消息内容不能为空' })
+      return
+    }
+    setSendingMsg(true)
+    setFeedback(null)
+    const label = messageTarget.DeviceName || messageTarget.UserName || messageTarget.Id
+    try {
+      await api.sendSessionMessage(messageTarget.Id, {
+        Header: msgHeader.trim() || '系统通知',
+        Text: trimmedText,
+      })
+      setFeedback({ type: 'success', message: `已向「${label}」发送弹窗消息` })
+      setMessageTarget(null)
+      setMsgText('')
+    } catch (err) {
+      setFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : '发送消息失败',
+      })
+    } finally {
+      setSendingMsg(false)
+    }
+  }
+
   return (
     <div className="space-y-8">
+      <FeedbackBanner
+        message={feedback?.message}
+        type={feedback?.type}
+        onClose={() => setFeedback(null)}
+      />
+
       {/* 实时媒体库扫描与刮削进度（仅扫描中或刚完成时展示） */}
       <ScanProgressBar variant="card" />
 
@@ -184,7 +263,13 @@ export function DashboardTab() {
         ) : (
           <div className="grid gap-4 lg:grid-cols-2">
             {sessions.map((session) => (
-              <SessionCard key={session.Id || session.DeviceId} session={session} />
+              <SessionCard
+                key={session.Id || session.DeviceId}
+                session={session}
+                busy={busySessionId === session.Id}
+                onRemoteCommand={handleRemoteCommand}
+                onOpenMessage={handleOpenMessage}
+              />
             ))}
           </div>
         )}
@@ -249,6 +334,69 @@ export function DashboardTab() {
           </div>
         )}
       </section>
+
+      <AdminModal
+        open={Boolean(messageTarget)}
+        title={`向会话发送消息`}
+        subtitle={
+          messageTarget
+            ? `${messageTarget.UserName || '未知用户'} · ${messageTarget.DeviceName || messageTarget.DeviceId || messageTarget.Id}`
+            : undefined
+        }
+        maxWidthClass="max-w-md"
+        onClose={() => setMessageTarget(null)}
+      >
+        <form onSubmit={handleSendMessage} className="space-y-4">
+          <div>
+            <label htmlFor="session-msg-header" className="mb-1.5 block text-xs text-zinc-400">
+              消息标题 (Header)
+            </label>
+            <input
+              id="session-msg-header"
+              type="text"
+              value={msgHeader}
+              onChange={(e) => setMsgHeader(e.target.value)}
+              placeholder="系统通知"
+              className="w-full rounded-xl border border-white/10 bg-zinc-900/90 px-3.5 py-2 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
+            />
+          </div>
+          <div>
+            <label htmlFor="session-msg-text" className="mb-1.5 block text-xs text-zinc-400">
+              消息正文 (Text) *
+            </label>
+            <textarea
+              id="session-msg-text"
+              rows={3}
+              required
+              value={msgText}
+              onChange={(e) => setMsgText(e.target.value)}
+              placeholder="输入要推送到客户端屏幕的提示内容..."
+              className="w-full rounded-xl border border-white/10 bg-zinc-900/90 px-3.5 py-2 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
+            />
+          </div>
+          <div className="flex justify-end gap-2 pt-2">
+            <button
+              type="button"
+              onClick={() => setMessageTarget(null)}
+              className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10"
+            >
+              取消
+            </button>
+            <button
+              type="submit"
+              disabled={sendingMsg}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-60"
+            >
+              {sendingMsg ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Send className="h-3.5 w-3.5" />
+              )}
+              <span>发送消息</span>
+            </button>
+          </div>
+        </form>
+      </AdminModal>
     </div>
   )
 }
@@ -282,7 +430,17 @@ function StatusTile({
   )
 }
 
-function SessionCard({ session }: { session: SessionInfo }) {
+function SessionCard({
+  session,
+  busy = false,
+  onRemoteCommand,
+  onOpenMessage,
+}: {
+  session: SessionInfo
+  busy?: boolean
+  onRemoteCommand: (session: SessionInfo, command: 'PlayPause' | 'Stop') => void
+  onOpenMessage: (session: SessionInfo) => void
+}) {
   const item = session.NowPlayingItem
   const posTicks = session.PlayState?.PositionTicks ?? 0
   const runTicks = item?.RunTimeTicks ?? 0
@@ -354,6 +512,37 @@ function SessionCard({ session }: { session: SessionInfo }) {
           <span>当前空闲在线</span>
         </div>
       )}
+
+      {/* 远程控制操作栏 */}
+      <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-white/6 pt-3">
+        <button
+          type="button"
+          disabled={busy || !item}
+          onClick={() => onRemoteCommand(session, 'PlayPause')}
+          className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-[11px] font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:text-amber-300 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          {isPaused ? <Play className="h-3 w-3" /> : <Pause className="h-3 w-3" />}
+          <span>暂停/继续</span>
+        </button>
+        <button
+          type="button"
+          disabled={busy || !item}
+          onClick={() => onRemoteCommand(session, 'Stop')}
+          className="inline-flex items-center gap-1 rounded-lg border border-red-500/25 bg-red-500/10 px-2.5 py-1 text-[11px] font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          <Square className="h-3 w-3 fill-current" />
+          <span>停止</span>
+        </button>
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => onOpenMessage(session)}
+          className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-[11px] font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:text-amber-300 disabled:opacity-40"
+        >
+          <MessageSquare className="h-3 w-3" />
+          <span>发消息</span>
+        </button>
+      </div>
     </div>
   )
 }

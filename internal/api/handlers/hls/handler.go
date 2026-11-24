@@ -666,11 +666,19 @@ func (h *Handler) buildSessionParams(r *http.Request, item *sqlite.ItemRecord, s
 		segDur = transcode.DefaultSegmentDuration
 	}
 
+	audioBitrate := q.Int("AudioBitrate", 192_000)
+	if audioBitrate <= 0 {
+		audioBitrate = 192_000
+	}
 	videoBitrate := q.Int("VideoBitrate", 0)
 	if videoBitrate <= 0 {
-		videoBitrate = q.Int("MaxStreamingBitrate", 0)
+		if maxStreamingBitrate := q.Int("MaxStreamingBitrate", 0); maxStreamingBitrate > 0 {
+			videoBitrate = maxStreamingBitrate - audioBitrate
+			if videoBitrate < 256_000 {
+				videoBitrate = 256_000
+			}
+		}
 	}
-	audioBitrate := q.Int("AudioBitrate", 192_000)
 
 	var audioIdx *int
 	if q.Has("AudioStreamIndex") {
@@ -689,14 +697,24 @@ func (h *Handler) buildSessionParams(r *http.Request, item *sqlite.ItemRecord, s
 	}
 	subMethod := strings.TrimSpace(q.Get("SubtitleMethod"))
 	var subCodec, subPath string
+	subRelIdx := 0
 	if subIdx != nil && src != nil {
+		embeddedSubIdx := 0
 		for _, st := range src.Streams {
-			if st.StreamIndex == *subIdx && strings.EqualFold(st.StreamType, "Subtitle") {
+			if !strings.EqualFold(st.StreamType, "Subtitle") {
+				continue
+			}
+			if st.StreamIndex == *subIdx {
 				subCodec = st.Codec
 				if st.IsExternal && strings.TrimSpace(st.Path) != "" {
 					subPath = st.Path
+				} else {
+					subRelIdx = embeddedSubIdx
 				}
 				break
+			}
+			if !st.IsExternal {
+				embeddedSubIdx++
 			}
 		}
 	}
@@ -704,27 +722,28 @@ func (h *Handler) buildSessionParams(r *http.Request, item *sqlite.ItemRecord, s
 	callerUserID, _ := h.callerIdentity(r)
 	runtimeTicks := resolveRuntimeTicks(item, src)
 	return transcode.SessionParams{
-		PlaySessionID:       q.Get("PlaySessionId"),
-		DeviceID:            q.Get("DeviceId"),
-		UserID:              callerUserID,
-		ItemID:              item.ID,
-		MediaSourceID:       msID,
-		InputPath:           inputPath,
-		VideoCodec:          q.Get("VideoCodec"),
-		AudioCodec:          q.Get("AudioCodec"),
-		VideoBitrate:        videoBitrate,
-		AudioBitrate:        audioBitrate,
-		AudioChannels:       q.Int("TranscodingMaxAudioChannels", 2),
-		MaxWidth:            q.Int("MaxWidth", 0),
-		MaxHeight:           q.Int("MaxHeight", 0),
-		AudioStreamIndex:    audioIdx,
-		SubtitleStreamIndex: subIdx,
-		SubtitleMethod:      subMethod,
-		SubtitleCodec:       subCodec,
-		SubtitlePath:        subPath,
-		SegmentDuration:     segDur,
-		SegmentContainer:    q.Get("SegmentContainer"),
-		DurationSec:         float64(runtimeTicks) / float64(transcode.TicksPerSecond),
+		PlaySessionID:         q.Get("PlaySessionId"),
+		DeviceID:              q.Get("DeviceId"),
+		UserID:                callerUserID,
+		ItemID:                item.ID,
+		MediaSourceID:         msID,
+		InputPath:             inputPath,
+		VideoCodec:            q.Get("VideoCodec"),
+		AudioCodec:            q.Get("AudioCodec"),
+		VideoBitrate:          videoBitrate,
+		AudioBitrate:          audioBitrate,
+		AudioChannels:         q.Int("TranscodingMaxAudioChannels", 2),
+		MaxWidth:              q.Int("MaxWidth", 0),
+		MaxHeight:             q.Int("MaxHeight", 0),
+		AudioStreamIndex:      audioIdx,
+		SubtitleStreamIndex:   subIdx,
+		SubtitleRelativeIndex: subRelIdx,
+		SubtitleMethod:        subMethod,
+		SubtitleCodec:         subCodec,
+		SubtitlePath:          subPath,
+		SegmentDuration:       segDur,
+		SegmentContainer:      q.Get("SegmentContainer"),
+		DurationSec:           float64(runtimeTicks) / float64(transcode.TicksPerSecond),
 	}
 }
 

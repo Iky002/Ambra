@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -728,18 +730,268 @@ func (h *Handler) handleItemThumbnailSet(w http.ResponseWriter, _ *http.Request)
 
 // --- Subtitles, Videos & Audio HLS ---
 
+const maxSubtitleUploadBytes = 5 * 1024 * 1024 // 5MB
+
+var allowedSubtitleFormats = map[string]bool{
+	"srt": true,
+	"ass": true,
+	"ssa": true,
+	"vtt": true,
+	"sub": true,
+}
+
+func sanitizeSubtitleLang(raw string) string {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	var b strings.Builder
+	for _, r := range raw {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "und"
+	}
+	return b.String()
+}
+
+func resolvePathForContainment(p string) string {
+	clean := filepath.Clean(strings.TrimSpace(p))
+	if clean == "" || clean == "." {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+		return filepath.Clean(resolved)
+	}
+	// If the target file does not exist yet, resolve its parent directory.
+	dir := filepath.Dir(clean)
+	if resolvedDir, err := filepath.EvalSymlinks(dir); err == nil {
+		return filepath.Join(filepath.Clean(resolvedDir), filepath.Base(clean))
+	}
+	return clean
+}
+
+func (h *Handler) isPathWithinLibraryRoots(ctx context.Context, targetPath string) bool {
+	if h.repo == nil {
+		return false
+	}
+	target := resolvePathForContainment(targetPath)
+	if target == "" {
+		return false
+	}
+	libs, err := h.repo.ListLibraries(ctx)
+	if err != nil {
+		return false
+	}
+	for _, lib := range libs {
+		for _, rootPath := range lib.Paths {
+			root := resolvePathForContainment(rootPath)
+			if root == "" {
+				continue
+			}
+			rel, err := filepath.Rel(root, target)
+			if err != nil {
+				continue
+			}
+			if rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (h *Handler) handleUploadSubtitle(w http.ResponseWriter, r *http.Request) {
+	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	if itemID == "" {
+		httpx.Error(w, http.StatusBadRequest, "item id is required")
+		return
+	}
+	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		httpx.Error(w, http.StatusNotFound, "item not found")
+		return
+	}
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !h.canAccessItem(r, rec) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
+
+	var req struct {
+		Language string `json:"Language"`
+		Format   string `json:"Format"`
+		IsForced bool   `json:"IsForced"`
+		Data     string `json:"Data"`
+	}
+	if r.Body == nil {
+		httpx.Error(w, http.StatusBadRequest, "request body is required")
+		return
+	}
+	// Limit JSON payload (~8MB accommodates 5MB base64-encoded subtitle + JSON envelope)
+	dec := json.NewDecoder(io.LimitReader(r.Body, 8*1024*1024))
+	if err := dec.Decode(&req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+
+	format := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(req.Format)), ".")
+	if !allowedSubtitleFormats[format] {
+		httpx.Error(w, http.StatusBadRequest, "unsupported subtitle format")
+		return
+	}
+
+	rawData := strings.TrimSpace(req.Data)
+	if rawData == "" {
+		httpx.Error(w, http.StatusBadRequest, "subtitle data is required")
+		return
+	}
+	decoded, err := base64.StdEncoding.DecodeString(rawData)
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(rawData)
+	}
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid base64 subtitle data")
+		return
+	}
+	if len(decoded) == 0 {
+		httpx.Error(w, http.StatusBadRequest, "subtitle data is empty")
+		return
+	}
+	if len(decoded) > maxSubtitleUploadBytes {
+		httpx.Error(w, http.StatusRequestEntityTooLarge, "subtitle exceeds 5MB limit")
+		return
+	}
+
+	mediaPath := h.resolveMediaSourcePath(r.Context(), itemID, "")
+	if strings.TrimSpace(mediaPath) == "" {
+		httpx.Error(w, http.StatusBadRequest, "item has no media file path")
+		return
+	}
+
+	lang := sanitizeSubtitleLang(req.Language)
+	videoDir := filepath.Dir(mediaPath)
+	videoBase := strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath))
+	destPath := filepath.Join(videoDir, fmt.Sprintf("%s.%s.%s", videoBase, lang, format))
+
+	if !h.isPathWithinLibraryRoots(r.Context(), destPath) {
+		httpx.Error(w, http.StatusForbidden, "target subtitle path is outside configured library roots")
+		return
+	}
+
+	tmpPath := destPath + ".tmp." + guid.New()[:8]
+	if err := os.WriteFile(tmpPath, decoded, 0o644); err != nil {
+		httpx.Error(w, http.StatusInternalServerError, fmt.Sprintf("write subtitle: %v", err))
+		return
+	}
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		_ = os.Remove(tmpPath)
+		httpx.Error(w, http.StatusInternalServerError, fmt.Sprintf("save subtitle: %v", err))
+		return
+	}
+
+	if h.store != nil {
+		var mediaSourceID string
+		_ = h.store.Reader.QueryRowContext(r.Context(),
+			`SELECT id FROM item_media_sources WHERE item_id = ? ORDER BY rowid ASC LIMIT 1`,
+			itemID,
+		).Scan(&mediaSourceID)
+		if mediaSourceID == "" {
+			mediaSourceID = itemID
+		}
+
+		var maxIdx int
+		_ = h.store.Reader.QueryRowContext(r.Context(),
+			`SELECT COALESCE(MAX(stream_index), -1) FROM item_media_streams WHERE item_id = ?`,
+			itemID,
+		).Scan(&maxIdx)
+		nextIdx := maxIdx + 1
+
+		cls := scanner.ClassifySubtitle(filepath.Base(destPath), format)
+		streamLang := lang
+		if cls.Language != "" && cls.Language != "und" {
+			streamLang = cls.Language
+		}
+		isForcedInt := 0
+		if req.IsForced || cls.IsForced {
+			isForcedInt = 1
+		}
+
+		if _, err := h.store.Writer.ExecContext(r.Context(), `
+			INSERT INTO item_media_streams (
+				media_source_id, item_id, stream_index, stream_type, codec, language, sub_variant,
+				display_title, title, width, height, video_range, audio_layout, channels,
+				sample_rate, bitrate, is_default, is_forced, is_external, path
+			) VALUES (?, ?, ?, 'Subtitle', ?, ?, ?, ?, ?, 0, 0, NULL, NULL, 0, 0, 0, 0, ?, 1, ?)`,
+			mediaSourceID, itemID, nextIdx, format, streamLang, cls.SubVariant,
+			cls.DisplayTitle, filepath.Base(destPath), isForcedInt, destPath,
+		); err != nil {
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+
+	httpx.NoContent(w)
+}
+
 func (h *Handler) handleDeleteSubtitle(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	if !h.canAccessItemID(r, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	idx, err := strconv.Atoi(chi.URLParam(r, "Index"))
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid subtitle index")
 		return
 	}
-	if h.store != nil {
-		_, _ = h.store.Writer.ExecContext(r.Context(),
-			`DELETE FROM item_media_streams WHERE item_id = ? AND stream_index = ? AND LOWER(stream_type) = 'subtitle'`,
-			itemID, idx,
-		)
+	if h.store == nil {
+		httpx.Error(w, http.StatusNotFound, "subtitle stream not found")
+		return
+	}
+
+	var (
+		subPath    sql.NullString
+		isExternal int
+	)
+	err = h.store.Reader.QueryRowContext(r.Context(), `
+		SELECT path, is_external FROM item_media_streams
+		WHERE item_id = ? AND stream_index = ? AND LOWER(stream_type) = 'subtitle'
+		LIMIT 1`, itemID, idx,
+	).Scan(&subPath, &isExternal)
+	if errors.Is(err, sql.ErrNoRows) {
+		httpx.Error(w, http.StatusNotFound, "subtitle stream not found")
+		return
+	}
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if isExternal == 0 {
+		httpx.Error(w, http.StatusBadRequest, "cannot delete embedded subtitle stream")
+		return
+	}
+
+	cleanPath := strings.TrimSpace(subPath.String)
+	if cleanPath != "" {
+		if !h.isPathWithinLibraryRoots(r.Context(), cleanPath) {
+			httpx.Error(w, http.StatusForbidden, "subtitle path outside configured library roots")
+			return
+		}
+		if err := os.Remove(cleanPath); err != nil && !os.IsNotExist(err) {
+			httpx.Error(w, http.StatusInternalServerError, fmt.Sprintf("delete subtitle file: %v", err))
+			return
+		}
+	}
+
+	if _, err := h.store.Writer.ExecContext(r.Context(),
+		`DELETE FROM item_media_streams WHERE item_id = ? AND stream_index = ? AND LOWER(stream_type) = 'subtitle' AND is_external = 1`,
+		itemID, idx,
+	); err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 	httpx.NoContent(w)
 }

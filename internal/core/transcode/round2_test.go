@@ -106,22 +106,23 @@ func TestBuildFFmpegArgsSubtitleBurnIn(t *testing.T) {
 		}
 	})
 
-	t.Run("embedded text subtitle uses input si", func(t *testing.T) {
-		subIdx := 2
+	t.Run("embedded text subtitle uses relative si not global stream index", func(t *testing.T) {
+		subIdx := 5
 		args := BuildFFmpegArgs(SessionParams{
-			InputPath:           "/media/anime.mkv",
-			VideoCodec:          "h264",
-			AudioCodec:          "aac",
-			SubtitleStreamIndex: &subIdx,
-			SubtitleMethod:      "Encode",
-			SubtitleCodec:       "srt",
+			InputPath:             "/media/anime.mkv",
+			VideoCodec:            "h264",
+			AudioCodec:            "aac",
+			SubtitleStreamIndex:   &subIdx,
+			SubtitleRelativeIndex: 1,
+			SubtitleMethod:        "Encode",
+			SubtitleCodec:         "srt",
 		}, 0, "/tmp/out", SoftwareOnlyCapabilities())
 
 		vfIdx := indexOf(args, "-vf")
 		if vfIdx < 0 || vfIdx+1 >= len(args) {
 			t.Fatalf("expected -vf in args: %v", args)
 		}
-		want := "subtitles='/media/anime.mkv':si=2"
+		want := "subtitles='/media/anime.mkv':si=1"
 		if args[vfIdx+1] != want {
 			t.Fatalf("got -vf %q, want %q", args[vfIdx+1], want)
 		}
@@ -161,6 +162,52 @@ func TestBuildFFmpegArgsSubtitleBurnIn(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestBuildFFmpegArgsScaleFilter(t *testing.T) {
+	cases := []struct {
+		name      string
+		maxWidth  int
+		maxHeight int
+		wantVF    string
+	}{
+		{
+			name:      "both width and height",
+			maxWidth:  1280,
+			maxHeight: 720,
+			wantVF:    "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+		},
+		{
+			name:     "width only",
+			maxWidth: 1280,
+			wantVF:   "scale='min(1280,iw)':-2",
+		},
+		{
+			name:      "height only",
+			maxHeight: 720,
+			wantVF:    "scale=-2:'min(720,ih)'",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := BuildFFmpegArgs(SessionParams{
+				InputPath:  "/media/movie.mkv",
+				VideoCodec: "h264",
+				AudioCodec: "aac",
+				MaxWidth:   tc.maxWidth,
+				MaxHeight:  tc.maxHeight,
+			}, 0, "/tmp/out", SoftwareOnlyCapabilities())
+
+			vfIdx := indexOf(args, "-vf")
+			if vfIdx < 0 || vfIdx+1 >= len(args) {
+				t.Fatalf("expected -vf flag in args: %v", args)
+			}
+			if args[vfIdx+1] != tc.wantVF {
+				t.Fatalf("got -vf %q, want %q", args[vfIdx+1], tc.wantVF)
+			}
+		})
+	}
 }
 
 func indexOf(slice []string, target string) int {

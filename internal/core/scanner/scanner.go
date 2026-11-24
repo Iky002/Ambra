@@ -1441,6 +1441,10 @@ func mergeMetadata(dst, src *plugins.MetadataResult) {
 	if dst.LogoURL == "" {
 		dst.LogoURL = src.LogoURL
 	}
+	if dst.Collection == nil && src.Collection != nil {
+		cp := *src.Collection
+		dst.Collection = &cp
+	}
 }
 
 func applyMetadataToItem(rec *sqlite.ItemRecord, meta *plugins.MetadataResult) {

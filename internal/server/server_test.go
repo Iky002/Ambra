@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
 func TestServerLifecycleAndRoutes(t *testing.T) {
@@ -146,5 +147,77 @@ func TestServerNewInvalidPath(t *testing.T) {
 	cfg := config.Default("/nonexistent-readonly-path-ambra/should-fail")
 	if _, err := New(context.Background(), cfg); err == nil {
 		t.Fatalf("expected error opening invalid db path")
+	}
+}
+
+func TestApplyPendingDatabaseRestore(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg, err := config.Load(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath := cfg.DBPath()
+
+	// 1. No pending restore -> no-op
+	if err := applyPendingDatabaseRestore(dataDir, dbPath); err != nil {
+		t.Fatalf("expected no-op without restore file, got %v", err)
+	}
+
+	// 2. Empty restore file -> ignored, existing DB untouched
+	if err := os.WriteFile(dbPath, []byte("original-db"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	restorePath := filepath.Join(dataDir, "ambra.db.restore")
+	if err := os.WriteFile(restorePath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyPendingDatabaseRestore(dataDir, dbPath); err != nil {
+		t.Fatalf("expected empty restore to be ignored, got %v", err)
+	}
+	got, _ := os.ReadFile(dbPath)
+	if string(got) != "original-db" {
+		t.Fatalf("expected original db untouched, got %q", string(got))
+	}
+
+	// 3. Valid SQLite DB staged at ambra.db.restore -> removes -wal/-shm, backs up old DB, promotes restore, boots cleanly
+	seedStore, err := sqlite.Open(restorePath)
+	if err != nil {
+		t.Fatalf("create seed restore db: %v", err)
+	}
+	seedRepo := sqlite.NewUserRepo(seedStore)
+	if err := seedRepo.CreateUser(context.Background(), &sqlite.UserRecord{
+		ID:      "restoreduser1",
+		Name:    "restored-admin",
+		IsAdmin: true,
+		Policy:  sqlite.DefaultUserPolicy(true),
+		Config:  sqlite.DefaultUserConfig(),
+	}); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	if err := seedStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create stale -wal and -shm sidecars for dbPath
+	_ = os.WriteFile(dbPath+"-wal", []byte("stale-wal"), 0o644)
+	_ = os.WriteFile(dbPath+"-shm", []byte("stale-shm"), 0o644)
+
+	srv, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("server.New with pending restore failed: %v", err)
+	}
+	defer srv.Close()
+
+	if _, err := os.Stat(restorePath); !os.IsNotExist(err) {
+		t.Fatalf("expected ambra.db.restore to be consumed, stat err=%v", err)
+	}
+	bakData, err := os.ReadFile(dbPath + ".pre-restore.bak")
+	if err != nil || string(bakData) != "original-db" {
+		t.Fatalf("expected backup of original db, err=%v data=%q", err, string(bakData))
+	}
+	userRepo := sqlite.NewUserRepo(srv.Store)
+	u, err := userRepo.GetUserByID(context.Background(), "restoreduser1")
+	if err != nil || u == nil || u.Name != "restored-admin" {
+		t.Fatalf("expected restored user in booted server DB, got u=%+v err=%v", u, err)
 	}
 }

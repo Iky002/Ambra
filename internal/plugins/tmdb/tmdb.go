@@ -205,6 +205,12 @@ func (p *Provider) fetchMovie(ctx context.Context, q plugins.MediaQuery, lang st
 		ExternalIDs struct {
 			IMDbID string `json:"imdb_id"`
 		} `json:"external_ids"`
+		BelongsToCollection *struct {
+			ID           int    `json:"id"`
+			Name         string `json:"name"`
+			PosterPath   string `json:"poster_path"`
+			BackdropPath string `json:"backdrop_path"`
+		} `json:"belongs_to_collection"`
 	}
 	if err := p.getJSON(ctx, "/movie/"+tmdbID, params, &detail); err != nil {
 		return nil, err
@@ -218,6 +224,19 @@ func (p *Provider) fetchMovie(ctx context.Context, q plugins.MediaQuery, lang st
 		PremiereDate:    detail.ReleaseDate,
 		CommunityRating: detail.VoteAverage,
 		ProviderIDs:     map[string]string{"tmdb": strconv.Itoa(detail.ID)},
+	}
+	if detail.BelongsToCollection != nil && detail.BelongsToCollection.ID > 0 && strings.TrimSpace(detail.BelongsToCollection.Name) != "" {
+		col := &plugins.CollectionMeta{
+			ID:   strconv.Itoa(detail.BelongsToCollection.ID),
+			Name: strings.TrimSpace(detail.BelongsToCollection.Name),
+		}
+		if detail.BelongsToCollection.PosterPath != "" {
+			col.PosterURL = p.imageBaseURL + detail.BelongsToCollection.PosterPath
+		}
+		if detail.BelongsToCollection.BackdropPath != "" {
+			col.BackdropURL = p.imageBaseURL + detail.BelongsToCollection.BackdropPath
+		}
+		res.Collection = col
 	}
 	if len(detail.ReleaseDate) >= 4 {
 		if y, err := strconv.Atoi(detail.ReleaseDate[:4]); err == nil {

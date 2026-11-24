@@ -608,7 +608,7 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 	if task.NeedProbe {
 		s.updateEnrichCurrent(task.LibraryID, itemLabel, "探测媒体流信息")
 		probeRes = s.probeMedia(ctx, task.MediaPath, task.IsStrm)
-		if probeRes != nil && (len(probeRes.Streams) > 0 || len(probeRes.Tags) > 0 || probeRes.HasAttachedPic) {
+		if probeRes != nil && (len(probeRes.Streams) > 0 || len(probeRes.Tags) > 0 || probeRes.HasAttachedPic || len(probeRes.Chapters) > 0) {
 			rec, err := s.repo.GetItemRecordByID(ctx, task.ItemID)
 			if err == nil && rec != nil {
 				if len(probeRes.Streams) > 0 {
@@ -621,6 +621,17 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 				if !task.IsAltMediaSource && probeRes.RuntimeTicks > 0 {
 					rt := probeRes.RuntimeTicks
 					rec.RuntimeTicks = &rt
+					recDirty = true
+				}
+				if !task.IsAltMediaSource && len(probeRes.Chapters) > 0 {
+					chapters := make([]sqlite.ChapterRecord, len(probeRes.Chapters))
+					for idx, ch := range probeRes.Chapters {
+						chapters[idx] = sqlite.ChapterRecord{
+							StartPositionTicks: ch.StartPositionTicks,
+							Name:               ch.Name,
+						}
+					}
+					rec.Extra.Chapters = chapters
 					recDirty = true
 				}
 				isAudio := strings.EqualFold(rec.Type, "Audio") || strings.EqualFold(rec.MediaType, "Audio")
@@ -685,6 +696,9 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 						s.persistMetaRelationsAndFTS(ctx, rec, relMeta)
 						s.downloadAndSaveRemoteImages(ctx, rec, onlineMeta)
 						s.saveLocalNFOIfEnabled(ctx, rec, relMeta, false)
+						if strings.EqualFold(rec.Type, "Movie") && onlineMeta.Collection != nil {
+							s.ensureAutoBoxSet(ctx, rec, onlineMeta.Collection)
+						}
 					}
 					updated = true
 				}
@@ -819,6 +833,56 @@ func (s *Scanner) tryAutoMergeMovieByProviderID(ctx context.Context, rec *sqlite
 		return false
 	}
 	return primaryID != rec.ID
+}
+
+func (s *Scanner) ensureAutoBoxSet(ctx context.Context, movie *sqlite.ItemRecord, col *plugins.CollectionMeta) {
+	if movie == nil || col == nil || s.repo == nil {
+		return
+	}
+	colID := strings.TrimSpace(col.ID)
+	colName := strings.TrimSpace(col.Name)
+	if colID == "" || colName == "" {
+		return
+	}
+
+	var boxSet *sqlite.ItemRecord
+	s.mergeMu.Lock()
+	matches, err := s.repo.FindItemsByProviderID(ctx, "collections", "BoxSet", "Tmdb", colID)
+	if err == nil && len(matches) > 0 {
+		boxSet = matches[0]
+	} else if err == nil {
+		now := time.Now().Unix()
+		rec := &sqlite.ItemRecord{
+			ID:           guid.New(),
+			LibraryID:    "collections",
+			Type:         "BoxSet",
+			IsFolder:     true,
+			Name:         colName,
+			SortName:     strings.ToLower(colName),
+			Etag:         guid.New()[:16],
+			Extra:        sqlite.ItemExtra{ProviderIDs: map[string]string{"Tmdb": colID}},
+			DateCreated:  now,
+			DateModified: now,
+		}
+		if upsertErr := s.repo.UpsertItem(ctx, rec); upsertErr == nil {
+			_ = s.repo.UpsertSearchFTS(ctx, rec.ID, rec.Name, TokenizeForFTS(rec.Name), "", "", "")
+			boxSet = rec
+		}
+	}
+	if boxSet != nil {
+		_, _ = s.repo.AddItemsToContainer(ctx, boxSet.ID, []string{movie.ID}, true)
+	}
+	s.mergeMu.Unlock()
+
+	if boxSet == nil {
+		return
+	}
+	if col.PosterURL != "" {
+		s.downloadAndSaveRemoteImage(ctx, boxSet.ID, "Primary", col.PosterURL)
+	}
+	if col.BackdropURL != "" {
+		s.downloadAndSaveRemoteImage(ctx, boxSet.ID, "Backdrop", col.BackdropURL)
+	}
 }
 
 func (s *Scanner) publishLibraryChanged(ctx context.Context, libraryID string, stats ScanStats, phase string) {

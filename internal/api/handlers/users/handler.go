@@ -569,11 +569,19 @@ func (h *Handler) GetDisplayPreferences(w http.ResponseWriter, r *http.Request) 
 	id := chi.URLParam(r, "Id")
 	q := httpx.ParseQuery(r)
 	userID := guid.Normalize(q.Get("userId"))
+	callerID := ""
+	if ac != nil {
+		callerID = guid.Normalize(ac.UserID())
+	}
 	if userID == "" {
-		userID = guid.Normalize(ac.UserID())
+		userID = callerID
+	}
+	if ac != nil && !ac.IsAdmin() && userID != "" && userID != callerID {
+		httpx.Error(w, http.StatusForbidden, "Forbidden")
+		return
 	}
 	client := q.Get("client")
-	if client == "" {
+	if client == "" && ac != nil {
 		client = ac.Client.Client
 	}
 	if client == "" {

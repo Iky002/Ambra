@@ -626,7 +626,7 @@ func (r *LibraryRepo) GetContainerItems(ctx context.Context, serverID, userID, c
 		return nil, 0, err
 	}
 
-	baseDTOs, err := r.hydrateDTOs(ctx, recs, uds, serverID, fields, false)
+	baseDTOs, err := r.hydrateDTOs(ctx, recs, uds, serverID, userID, fields, false)
 	if err != nil {
 		return nil, 0, err
 	}

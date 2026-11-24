@@ -4,20 +4,28 @@ import {
   ArrowDownWideNarrow,
   ArrowUpNarrowWide,
   Calendar,
+  Check,
+  Clock,
   Disc3,
+  Film,
   Filter,
+  LayoutGrid,
+  List,
   Loader2,
   Mic2,
   Music,
   RotateCcw,
+  Star,
   Tag,
   Tags,
 } from 'lucide-react'
-import { useParams, useSearchParams } from 'react-router-dom'
-import { api } from '../api/client'
+import { Link, useParams, useSearchParams } from 'react-router-dom'
+import { api, getFallbackImageUrl, getImageUrl } from '../api/client'
+import type { BaseItemDto } from '../api/types'
 import { MediaCard } from '../components/MediaCard'
 import { QueryErrorState } from '../components/QueryErrorState'
 import { useAuth } from '../context/AuthContext'
+import { formatTicks } from '../player/subtitleUtils'
 
 const SORT_OPTIONS = [
   { value: 'DateCreated', label: '添加时间' },
@@ -43,6 +51,19 @@ const MUSIC_SUB_TABS: Array<{ id: MusicSubTab; label: string; icon: typeof Disc3
 ]
 
 const PAGE_SIZE = 36
+const VIEW_MODE_STORAGE_KEY = 'ambra_library_view_mode'
+const ALPHABET_LETTERS = ['全部', '#', ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('')] as const
+
+type LibraryViewMode = 'grid' | 'list'
+
+function readStoredViewMode(): LibraryViewMode {
+  try {
+    const saved = localStorage.getItem(VIEW_MODE_STORAGE_KEY)
+    return saved === 'list' ? 'list' : 'grid'
+  } catch {
+    return 'grid'
+  }
+}
 
 export function LibraryPage() {
   const { id } = useParams<{ id: string }>()
@@ -53,11 +74,22 @@ export function LibraryPage() {
   const [sortBy, setSortBy] = useState('DateCreated')
   const [sortOrder, setSortOrder] = useState<'Ascending' | 'Descending'>('Descending')
   const [statusFilter, setStatusFilter] = useState('')
+  const [letterFilter, setLetterFilter] = useState('')
+  const [viewMode, setViewMode] = useState<LibraryViewMode>(() => readStoredViewMode())
   const [genreFilter, setGenreFilter] = useState(() => searchParams.get('genre') || '')
   const [yearFilter, setYearFilter] = useState(() => searchParams.get('year') || '')
   const [tagFilter, setTagFilter] = useState(() => searchParams.get('tag') || '')
   const [musicSubTab, setMusicSubTab] = useState<MusicSubTab>('MusicAlbum')
   const [page, setPage] = useState(0)
+
+  const handleSetViewMode = (mode: LibraryViewMode) => {
+    setViewMode(mode)
+    try {
+      localStorage.setItem(VIEW_MODE_STORAGE_KEY, mode)
+    } catch {
+      // ignore storage errors
+    }
+  }
 
   // 响应 URL query 参数变化（例如从详情页点击流派/年份/标签跳转）
   useEffect(() => {
@@ -69,6 +101,8 @@ export function LibraryPage() {
 
   useEffect(() => {
     setMusicSubTab('MusicAlbum')
+    setStatusFilter('')
+    setLetterFilter('')
   }, [id])
 
   const updateUrlParam = (key: 'genre' | 'year' | 'tag', value: string) => {
@@ -147,6 +181,7 @@ export function LibraryPage() {
       sortBy,
       sortOrder,
       statusFilter,
+      letterFilter,
       genreFilter,
       yearFilter,
       tagFilter,
@@ -162,6 +197,9 @@ export function LibraryPage() {
         genres: genreFilter || undefined,
         years: yearFilter || undefined,
         tags: tagFilter || undefined,
+        nameLessThan: letterFilter === '#' ? 'a' : undefined,
+        nameStartsWith:
+          letterFilter && letterFilter !== '#' ? letterFilter.toLowerCase() : undefined,
         startIndex: page * PAGE_SIZE,
         limit: PAGE_SIZE,
       }),
@@ -172,10 +210,13 @@ export function LibraryPage() {
   const items = data?.Items || []
   const total = data?.TotalRecordCount || 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
-  const hasActiveFilters = Boolean(statusFilter || genreFilter || yearFilter || tagFilter)
+  const hasActiveFilters = Boolean(
+    statusFilter || letterFilter || genreFilter || yearFilter || tagFilter,
+  )
 
   const handleResetFilters = () => {
     setStatusFilter('')
+    setLetterFilter('')
     setGenreFilter('')
     setYearFilter('')
     setTagFilter('')
@@ -328,6 +369,42 @@ export function LibraryPage() {
             )}
           </button>
 
+          {/* 网格/列表视图切换 */}
+          <div
+            role="group"
+            aria-label="视图切换"
+            className="inline-flex items-center rounded-xl border border-white/10 bg-white/[0.04] p-0.5"
+          >
+            <button
+              type="button"
+              aria-label="网格视图"
+              aria-pressed={viewMode === 'grid'}
+              title="网格视图"
+              onClick={() => handleSetViewMode('grid')}
+              className={`rounded-lg p-1.5 transition-colors ${
+                viewMode === 'grid'
+                  ? 'bg-amber-500 text-zinc-950 shadow-sm'
+                  : 'text-zinc-400 hover:text-zinc-100'
+              }`}
+            >
+              <LayoutGrid className="h-3.5 w-3.5" />
+            </button>
+            <button
+              type="button"
+              aria-label="列表视图"
+              aria-pressed={viewMode === 'list'}
+              title="列表视图"
+              onClick={() => handleSetViewMode('list')}
+              className={`rounded-lg p-1.5 transition-colors ${
+                viewMode === 'list'
+                  ? 'bg-amber-500 text-zinc-950 shadow-sm'
+                  : 'text-zinc-400 hover:text-zinc-100'
+              }`}
+            >
+              <List className="h-3.5 w-3.5" />
+            </button>
+          </div>
+
           {hasActiveFilters && (
             <button
               type="button"
@@ -339,6 +416,36 @@ export function LibraryPage() {
             </button>
           )}
         </div>
+      </div>
+
+      {/* 字母快速索引条 */}
+      <div
+        role="navigation"
+        aria-label="字母索引"
+        className="no-scrollbar flex items-center gap-1 overflow-x-auto pb-1"
+      >
+        {ALPHABET_LETTERS.map((letter) => {
+          const value = letter === '全部' ? '' : letter
+          const active = letterFilter === value
+          return (
+            <button
+              key={letter}
+              type="button"
+              aria-pressed={active}
+              onClick={() => {
+                setLetterFilter(value)
+                setPage(0)
+              }}
+              className={`shrink-0 rounded-lg px-2 py-1 text-xs font-medium transition-colors ${
+                active
+                  ? 'bg-amber-500 text-zinc-950 shadow-sm'
+                  : 'border border-white/8 bg-white/[0.03] text-zinc-400 hover:border-white/15 hover:text-zinc-100'
+              }`}
+            >
+              {letter}
+            </button>
+          )
+        })}
       </div>
 
       {/* 音乐库子标签：专辑 / 艺术家 / 曲目 */}
@@ -391,8 +498,20 @@ export function LibraryPage() {
         <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-20 text-center text-sm text-zinc-500">
           当前筛选条件下没有找到媒体项目
         </div>
+      ) : viewMode === 'list' ? (
+        <div
+          data-testid="library-list-view"
+          className="divide-y divide-white/6 overflow-hidden rounded-2xl border border-white/8 bg-white/[0.02]"
+        >
+          {items.map((item) => (
+            <LibraryListRow key={item.Id} item={item} />
+          ))}
+        </div>
       ) : (
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7">
+        <div
+          data-testid="library-grid-view"
+          className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7"
+        >
           {items.map((item) => (
             <MediaCard key={item.Id} item={item} />
           ))}
@@ -430,5 +549,96 @@ export function LibraryPage() {
         </div>
       )}
     </div>
+  )
+}
+
+function LibraryListRow({ item }: { item: BaseItemDto }) {
+  const isMusicItem =
+    item.Type === 'Audio' || item.Type === 'MusicAlbum' || item.Type === 'MusicArtist'
+  const imgUrl = item.ImageTags?.Primary
+    ? getImageUrl(item.Id, 'Primary', { maxWidth: 160, tag: item.ImageTags.Primary })
+    : item.SeriesId
+      ? getImageUrl(item.SeriesId, 'Primary', { maxWidth: 160 })
+      : ''
+  const fallbackUrl = item.ImageTags?.Primary
+    ? getFallbackImageUrl(item.Id, 'Primary')
+    : item.SeriesId
+      ? getFallbackImageUrl(item.SeriesId, 'Primary')
+      : null
+  const [imgFailed, setImgFailed] = useState(false)
+
+  return (
+    <Link
+      to={`/item/${item.Id}`}
+      className="group flex items-center gap-4 px-4 py-3 transition-colors hover:bg-white/[0.04]"
+    >
+      <div className="h-14 w-10 shrink-0 overflow-hidden rounded-lg border border-white/10 bg-zinc-900">
+        {imgUrl && !imgFailed ? (
+          <img
+            src={imgUrl}
+            alt={item.Name}
+            loading="lazy"
+            onError={(e) => {
+              const el = e.currentTarget
+              if (fallbackUrl && !el.dataset.fallbackApplied && el.src !== fallbackUrl) {
+                el.dataset.fallbackApplied = '1'
+                el.src = fallbackUrl
+                return
+              }
+              setImgFailed(true)
+            }}
+            className="h-full w-full object-cover"
+          />
+        ) : (
+          <div className="flex h-full w-full items-center justify-center text-zinc-600">
+            {isMusicItem ? <Music className="h-4 w-4" /> : <Film className="h-4 w-4" />}
+          </div>
+        )}
+      </div>
+
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <p className="truncate text-sm font-semibold text-zinc-100 transition-colors group-hover:text-amber-400">
+            {item.Name}
+          </p>
+          {item.UserData?.Played && (
+            <span
+              title="已观看"
+              className="inline-flex shrink-0 items-center gap-0.5 rounded-full bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-300 ring-1 ring-emerald-500/35"
+            >
+              <Check className="h-2.5 w-2.5 stroke-[3]" />
+              <span>已看</span>
+            </span>
+          )}
+        </div>
+        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-400">
+          {item.ProductionYear && <span>{item.ProductionYear}</span>}
+          {item.CommunityRating ? (
+            <span className="inline-flex items-center gap-1 text-amber-400">
+              <Star className="h-3 w-3 fill-amber-400" />
+              <span>{item.CommunityRating.toFixed(1)}</span>
+            </span>
+          ) : null}
+          {item.RunTimeTicks ? (
+            <span className="inline-flex items-center gap-1 text-zinc-400">
+              <Clock className="h-3 w-3" />
+              <span>{formatTicks(item.RunTimeTicks)}</span>
+            </span>
+          ) : null}
+          {item.Genres && item.Genres.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1">
+              {item.Genres.slice(0, 3).map((g) => (
+                <span
+                  key={g}
+                  className="rounded bg-white/[0.06] px-1.5 py-0.5 text-[10px] text-zinc-300"
+                >
+                  {g}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </Link>
   )
 }
