@@ -233,4 +233,52 @@ describe('管理员媒体管理组件与页面集成测试', () => {
       expect(screen.queryByText('肖申克的救赎')).not.toBeInTheDocument()
     })
   })
+
+  it('P0-4: ItemDetailPage 当条目不存在或加载失败时展示错误提示卡片（含重试与返回首页）而非无限加载', async () => {
+    const user = userEvent.setup()
+    await loginDemoRole('admin')
+
+    render(
+      <QueryClientProvider client={createTestQueryClient()}>
+        <AuthProvider>
+          <MemoryRouter initialEntries={['/item/non-existent-item-999']}>
+            <Routes>
+              <Route path="/item/:id" element={<ItemDetailPage />} />
+              <Route path="/" element={<div>Ambra 影院首页</div>} />
+            </Routes>
+          </MemoryRouter>
+        </AuthProvider>
+      </QueryClientProvider>,
+    )
+
+    expect(await screen.findByText('无法加载媒体详情')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /重试/i })).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: /返回首页/i }))
+    expect(await screen.findByText('Ambra 影院首页')).toBeInTheDocument()
+  })
+
+  it('P1-7 & P1-8: MetadataEditorModal 正确显示 NfoPath 且保存锁定时失效 item 查询缓存', async () => {
+    const user = userEvent.setup()
+    const authRes = await loginDemoRole('admin')
+    const item = await api.getItem(authRes.User.Id, 'item-wandering-earth-2')
+    const qc = createTestQueryClient()
+    const invalidateSpy = vi.spyOn(qc, 'invalidateQueries')
+
+    render(
+      <QueryClientProvider client={qc}>
+        <MetadataEditorModal open item={item} onClose={() => {}} />
+      </QueryClientProvider>,
+    )
+
+    // 1. 触发原子回写 .nfo，验证返回 NfoPath 被正确展示
+    await user.click(screen.getByRole('button', { name: /原子回写 \.nfo/i }))
+    expect(await screen.findByText(/已原子回写 NFO：.*\.nfo/)).toBeInTheDocument()
+
+    // 2. 触发保存锁定配置，验证 invalidateQueries 包含 ['item']
+    await user.click(screen.getByRole('button', { name: /片名 \(Name\)/i }))
+    await user.click(screen.getByRole('button', { name: /保存锁定配置/i }))
+    expect(await screen.findByText(/已保存字段锁定/)).toBeInTheDocument()
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['item'] })
+  })
 })

@@ -607,18 +607,34 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 	if task.NeedProbe {
 		s.updateEnrichCurrent(task.LibraryID, itemLabel, "探测媒体流信息")
 		probeRes = s.probeMedia(ctx, task.MediaPath, task.IsStrm)
-		if probeRes != nil && len(probeRes.Streams) > 0 {
+		if probeRes != nil && (len(probeRes.Streams) > 0 || len(probeRes.Tags) > 0) {
 			rec, err := s.repo.GetItemRecordByID(ctx, task.ItemID)
 			if err == nil && rec != nil {
-				ms := s.buildMediaSource(rec, task.MediaPath, task.Size, task.Mtime, task.IsStrm, task.Container, probeRes)
-				if err := s.repo.UpsertMediaSourceAndStreams(ctx, rec.ID, ms); err == nil {
-					updated = true
+				if len(probeRes.Streams) > 0 {
+					ms := s.buildMediaSource(rec, task.MediaPath, task.Size, task.Mtime, task.IsStrm, task.Container, probeRes)
+					if err := s.repo.UpsertMediaSourceAndStreams(ctx, rec.ID, ms); err == nil {
+						updated = true
+					}
 				}
+				recDirty := false
 				if !task.IsAltMediaSource && probeRes.RuntimeTicks > 0 {
 					rt := probeRes.RuntimeTicks
 					rec.RuntimeTicks = &rt
+					recDirty = true
+				}
+				if !task.IsAltMediaSource && (strings.EqualFold(rec.Type, "Audio") || strings.EqualFold(rec.MediaType, "Audio")) && len(probeRes.Tags) > 0 {
+					if applyAudioProbeTags(rec, probeRes.Tags) {
+						recDirty = true
+					}
+				}
+				if recDirty {
 					if err := s.repo.UpsertItem(ctx, rec); err == nil {
 						updated = true
+						if strings.EqualFold(rec.Type, "Audio") || strings.EqualFold(rec.MediaType, "Audio") {
+							artistStr := strings.Join(rec.Extra.Artists, " ")
+							titleTokens := TokenizeForFTS(rec.Name, rec.Extra.Album, artistStr)
+							_ = s.repo.UpsertSearchFTS(ctx, rec.ID, rec.Name, titleTokens, "", "", artistStr)
+						}
 					}
 				}
 			}
@@ -626,6 +642,10 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 	}
 
 	if task.NeedOnlineMeta && !task.IsAltMediaSource {
+		existingRec, err := s.repo.GetItemRecordByID(ctx, task.ItemID)
+		if err == nil && existingRec != nil && existingRec.Extra.LockData {
+			return updated
+		}
 		s.updateEnrichCurrent(task.LibraryID, itemLabel, "刮削元数据与下载海报")
 		if (strings.EqualFold(task.ItemType, "Season") || strings.EqualFold(task.ItemType, "Episode")) &&
 			task.ParentSeriesID != "" && getProviderID(task.Query.ProviderIDs, "tmdb") == "" {
@@ -646,7 +666,7 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 		onlineMeta := s.fetchMetadataFiltered(ctx, task.Query, false)
 		if onlineMeta != nil {
 			rec, err := s.repo.GetItemRecordByID(ctx, task.ItemID)
-			if err == nil && rec != nil {
+			if err == nil && rec != nil && !rec.Extra.LockData {
 				applyOnlineMetadataToItem(rec, onlineMeta, task.HasLocalTitle)
 				if err := s.repo.UpsertItem(ctx, rec); err == nil {
 					mergedAway := false
@@ -654,9 +674,10 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 						mergedAway = s.tryAutoMergeMovieByProviderID(ctx, rec)
 					}
 					if !mergedAway {
-						s.persistMetaRelationsAndFTS(ctx, rec, onlineMeta)
+						relMeta := filterLockedRelations(rec, onlineMeta)
+						s.persistMetaRelationsAndFTS(ctx, rec, relMeta)
 						s.downloadAndSaveRemoteImages(ctx, rec, onlineMeta)
-						s.saveLocalNFOIfEnabled(ctx, rec, onlineMeta, false)
+						s.saveLocalNFOIfEnabled(ctx, rec, relMeta, false)
 					}
 					updated = true
 				}
@@ -787,7 +808,7 @@ func isFieldLocked(rec *sqlite.ItemRecord, field string) bool {
 
 // applyOnlineMetadataToItem applies online metadata fields while respecting local NFO titles and locked fields.
 func applyOnlineMetadataToItem(rec *sqlite.ItemRecord, meta *plugins.MetadataResult, hasLocalTitle bool) {
-	if rec == nil || meta == nil {
+	if rec == nil || meta == nil || rec.Extra.LockData {
 		return
 	}
 	if meta.Name != "" && !hasLocalTitle && !isFieldLocked(rec, "Name") {

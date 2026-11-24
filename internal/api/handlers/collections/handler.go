@@ -10,6 +10,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
@@ -43,28 +44,35 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	if wrapAuth == nil {
 		wrapAuth = passthrough
 	}
+	wrapAdmin := auth.RequireAdmin
+	if wrapAdmin == nil {
+		wrapAdmin = wrapAuth
+	}
 
 	handleAuth := func(pattern string, fn http.HandlerFunc) {
 		mux.Handle(pattern, wrapAuth(fn))
 	}
+	handleAdmin := func(pattern string, fn http.HandlerFunc) {
+		mux.Handle(pattern, wrapAdmin(fn))
+	}
 
-	// Collections (6 endpoints)
+	// Collections (6 endpoints) — write/delete routes require Admin
 	handleAuth("GET /Collections", h.handleListCollections)
-	handleAuth("POST /Collections", h.handleCreateCollection)
+	handleAdmin("POST /Collections", h.handleCreateCollection)
 	handleAuth("GET /Collections/{Id}/Items", h.handleGetContainerItems)
-	handleAuth("POST /Collections/{Id}/Items", h.handleAddCollectionItems)
-	handleAuth("DELETE /Collections/{Id}/Items", h.handleRemoveContainerItems)
-	handleAuth("DELETE /Collections/{Id}", h.handleDeleteContainer)
+	handleAdmin("POST /Collections/{Id}/Items", h.handleAddCollectionItems)
+	handleAdmin("DELETE /Collections/{Id}/Items", h.handleRemoveCollectionItems)
+	handleAdmin("DELETE /Collections/{Id}", h.handleDeleteCollection)
 
-	// Playlists (8 endpoints)
+	// Playlists (8 endpoints) — write/delete routes enforce Admin or owner
 	handleAuth("GET /Playlists", h.handleListPlaylists)
 	handleAuth("POST /Playlists", h.handleCreatePlaylist)
 	handleAuth("GET /Playlists/{Id}/Items", h.handleGetContainerItems)
 	handleAuth("POST /Playlists/{Id}/Items", h.handleAddPlaylistItems)
-	handleAuth("DELETE /Playlists/{Id}/Items", h.handleRemoveContainerItems)
+	handleAuth("DELETE /Playlists/{Id}/Items", h.handleRemovePlaylistItems)
 	handleAuth("POST /Playlists/{Id}/Items/{ItemId}/Move/{NewIndex}", h.handleMovePlaylistItem)
 	handleAuth("GET /Playlists/{Id}/InstantMix", h.handlePlaylistInstantMix)
-	handleAuth("DELETE /Playlists/{Id}", h.handleDeleteContainer)
+	handleAuth("DELETE /Playlists/{Id}", h.handleDeletePlaylist)
 }
 
 func (h *Handler) serverID() string {
@@ -146,7 +154,23 @@ func (h *Handler) handleCreateCollection(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *Handler) handleAddCollectionItems(w http.ResponseWriter, r *http.Request) {
+	containerID := r.PathValue("Id")
+	if _, ok := h.requireContainer(w, r, containerID, "BoxSet", false); !ok {
+		return
+	}
 	h.addItemsToContainer(w, r, true)
+}
+
+func (h *Handler) handleRemoveCollectionItems(w http.ResponseWriter, r *http.Request) {
+	containerID := r.PathValue("Id")
+	if _, ok := h.requireContainer(w, r, containerID, "BoxSet", false); !ok {
+		return
+	}
+	h.handleRemoveContainerItems(w, r)
+}
+
+func (h *Handler) handleDeleteCollection(w http.ResponseWriter, r *http.Request) {
+	h.handleDeleteContainer(w, r, "BoxSet", false)
 }
 
 // --- Playlists ---
@@ -198,9 +222,24 @@ func (h *Handler) handleCreatePlaylist(w http.ResponseWriter, r *http.Request) {
 	if mediaType == "" {
 		mediaType = body.MediaType
 	}
-	userID := h.resolveUserID(r, q)
-	if userID == "" {
-		userID = body.UserId
+	requestedUserID := guid.Normalize(q.Get("UserId"))
+	if requestedUserID == "" {
+		requestedUserID = guid.Normalize(body.UserId)
+	}
+	userID := requestedUserID
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		callerID := guid.Normalize(ac.UserID())
+		if !ac.IsAdmin() {
+			if requestedUserID != "" && requestedUserID != callerID {
+				httpx.Error(w, http.StatusForbidden, "forbidden")
+				return
+			}
+			userID = callerID
+		} else if userID == "" {
+			userID = callerID
+		}
+	} else if userID == "" && h.auth.UserIDFromCtx != nil {
+		userID = guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
 	}
 	ids := q.List("Ids")
 	if len(ids) == 0 {
@@ -216,7 +255,23 @@ func (h *Handler) handleCreatePlaylist(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleAddPlaylistItems(w http.ResponseWriter, r *http.Request) {
+	containerID := r.PathValue("Id")
+	if _, ok := h.requireContainer(w, r, containerID, "Playlist", true); !ok {
+		return
+	}
 	h.addItemsToContainer(w, r, false)
+}
+
+func (h *Handler) handleRemovePlaylistItems(w http.ResponseWriter, r *http.Request) {
+	containerID := r.PathValue("Id")
+	if _, ok := h.requireContainer(w, r, containerID, "Playlist", true); !ok {
+		return
+	}
+	h.handleRemoveContainerItems(w, r)
+}
+
+func (h *Handler) handleDeletePlaylist(w http.ResponseWriter, r *http.Request) {
+	h.handleDeleteContainer(w, r, "Playlist", true)
 }
 
 func (h *Handler) handleMovePlaylistItem(w http.ResponseWriter, r *http.Request) {
@@ -227,6 +282,9 @@ func (h *Handler) handleMovePlaylistItem(w http.ResponseWriter, r *http.Request)
 	newIndex, err := strconv.Atoi(newIndexStr)
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid NewIndex")
+		return
+	}
+	if _, ok := h.requireContainer(w, r, playlistID, "Playlist", true); !ok {
 		return
 	}
 	if err := h.repo.MoveContainerItem(r.Context(), playlistID, itemID, newIndex); err != nil {
@@ -330,8 +388,51 @@ func (h *Handler) handleRemoveContainerItems(w http.ResponseWriter, r *http.Requ
 	httpx.NoContent(w)
 }
 
-func (h *Handler) handleDeleteContainer(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) canModifyPlaylist(r *http.Request, rec *sqlite.ItemRecord) bool {
+	ownerID := guid.Normalize(rec.ParentID)
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.IsAdmin() {
+			return true
+		}
+		callerID := guid.Normalize(ac.UserID())
+		return callerID != "" && ownerID != "" && callerID == ownerID
+	}
+	if h.auth.UserIDFromCtx != nil {
+		callerID := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if callerID != "" {
+			return ownerID != "" && callerID == ownerID
+		}
+	}
+	// Unit tests without auth context
+	return true
+}
+
+func (h *Handler) requireContainer(w http.ResponseWriter, r *http.Request, containerID, expectedType string, checkOwner bool) (*sqlite.ItemRecord, bool) {
+	rec, err := h.repo.GetItemRecordByID(r.Context(), containerID)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		httpx.Error(w, http.StatusNotFound, "container not found")
+		return nil, false
+	}
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return nil, false
+	}
+	if !strings.EqualFold(rec.Type, expectedType) {
+		httpx.Error(w, http.StatusNotFound, "container not found")
+		return nil, false
+	}
+	if checkOwner && !h.canModifyPlaylist(r, rec) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return nil, false
+	}
+	return rec, true
+}
+
+func (h *Handler) handleDeleteContainer(w http.ResponseWriter, r *http.Request, expectedType string, checkOwner bool) {
 	containerID := r.PathValue("Id")
+	if _, ok := h.requireContainer(w, r, containerID, expectedType, checkOwner); !ok {
+		return
+	}
 	if err := h.repo.DeleteItem(r.Context(), containerID); err != nil {
 		if errors.Is(err, sqlite.ErrNotFound) {
 			httpx.Error(w, http.StatusNotFound, "container not found")

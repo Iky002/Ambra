@@ -3,6 +3,7 @@ package compatcore
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/core/auth"
 )
@@ -83,6 +85,25 @@ func TestUserPrivilegeEscalationAndIDORBlocked(t *testing.T) {
 		{http.MethodPost, "/UserSettings/" + env.admin.ID, `{"theme":"hacked"}`},
 		{http.MethodPost, "/UserSettings/" + env.admin.ID + "/Partial", `{"lang":"en"}`},
 		{http.MethodPost, "/Users/" + env.admin.ID + "/Items/" + env.itemID + "/UserData", `{"Played":true}`},
+		{http.MethodDelete, "/Users/" + env.admin.ID + "/TrackSelections/audio", ``},
+		{http.MethodPost, "/Users/" + env.admin.ID + "/TrackSelections/subtitle/Delete", ``},
+		{http.MethodDelete, "/Users/" + env.admin.ID + "/RecentlySearched", ``},
+		{http.MethodPost, "/Users/" + env.admin.ID + "/RecentlySearched/Delete", ``},
+		{http.MethodPost, "/Users/" + env.admin.ID + "/SearchedItems", `{"Name":"x"}`},
+		{http.MethodPost, "/Users/" + env.admin.ID + "/TypedSettings/theme", `{"k":"v"}`},
+		{http.MethodPost, "/Users/" + env.admin.ID + "/HomeSections", `{"Name":"hacked"}`},
+		{http.MethodPost, "/Users/" + env.admin.ID + "/HomeSections/Delete", `{"Ids":["resume"]}`},
+		{http.MethodPost, "/Users/" + env.admin.ID + "/HomeSections/Move", `{"Id":"resume","NewIndex":0}`},
+		{http.MethodPost, "/Users/" + env.admin.ID + "/FavoriteItems/" + env.itemID + "/Delete", ``},
+		{http.MethodPost, "/Users/" + env.admin.ID + "/Items/" + env.itemID + "/Rating?Likes=true", ``},
+		{http.MethodDelete, "/Users/" + env.admin.ID + "/Items/" + env.itemID + "/Rating", ``},
+		{http.MethodPost, "/Users/" + env.admin.ID + "/Items/" + env.itemID + "/Rating/Delete", ``},
+		{http.MethodPost, "/Users/" + env.admin.ID + "/Items/" + env.itemID + "/HideFromResume", ``},
+		{http.MethodPost, "/Users/" + env.admin.ID + "/PlayedItems/" + env.itemID + "/Delete", ``},
+		{http.MethodPost, "/Users/" + env.admin.ID + "/PlayingItems/" + env.itemID, ``},
+		{http.MethodPost, "/Users/" + env.admin.ID + "/PlayingItems/" + env.itemID + "/Progress", ``},
+		{http.MethodDelete, "/Users/" + env.admin.ID + "/PlayingItems/" + env.itemID, ``},
+		{http.MethodPost, "/Users/" + env.admin.ID + "/PlayingItems/" + env.itemID + "/Delete", ``},
 	}
 	for _, tc := range idorCases {
 		res := doAuthReq(guestAuth.AccessToken, tc.method, tc.path, tc.body)
@@ -91,7 +112,39 @@ func TestUserPrivilegeEscalationAndIDORBlocked(t *testing.T) {
 		}
 	}
 
-	// 4. Admin updating another user's Policy -> 204
+	// 4. GET /Connect/Exchange requires auth (401 without token) and returns caller's own ID (not users[0])
+	if rec := doAuthReq("", http.MethodGet, "/Connect/Exchange?ConnectUserId=c1", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated GET /Connect/Exchange, got %d", rec.Code)
+	}
+	exRec := doAuthReq(guestAuth.AccessToken, http.MethodGet, "/Connect/Exchange?ConnectUserId=c1", "")
+	if exRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for authenticated GET /Connect/Exchange, got %d", exRec.Code)
+	}
+	var exBody map[string]any
+	_ = json.Unmarshal(exRec.Body.Bytes(), &exBody)
+	if exBody["LocalUserId"] != env.user2.ID {
+		t.Fatalf("expected LocalUserId=%s, got %v", env.user2.ID, exBody["LocalUserId"])
+	}
+
+	// 5. GET /Users/Query returns only caller's own record for non-admin, all users for admin
+	qGuest := doAuthReq(guestAuth.AccessToken, http.MethodGet, "/Users/Query", "")
+	if qGuest.Code != http.StatusOK {
+		t.Fatalf("guest GET /Users/Query status=%d", qGuest.Code)
+	}
+	var guestUsers dto.QueryResult[dto.UserDto]
+	_ = json.Unmarshal(qGuest.Body.Bytes(), &guestUsers)
+	if guestUsers.TotalRecordCount != 1 || guestUsers.Items[0].Id != env.user2.ID {
+		t.Fatalf("expected non-admin /Users/Query to return only self, got %+v", guestUsers)
+	}
+
+	qAdmin := doAuthReq(adminAuth.AccessToken, http.MethodGet, "/Users/Query", "")
+	var adminUsers dto.QueryResult[dto.UserDto]
+	_ = json.Unmarshal(qAdmin.Body.Bytes(), &adminUsers)
+	if adminUsers.TotalRecordCount < 2 {
+		t.Fatalf("expected admin /Users/Query to return all users, got %d", adminUsers.TotalRecordCount)
+	}
+
+	// 6. Admin updating another user's Policy -> 204
 	rec = doAuthReq(adminAuth.AccessToken, http.MethodPost, "/Users/"+env.user2.ID,
 		`{"Policy":{"IsAdministrator":false,"EnableAllFolders":true}}`)
 	if rec.Code != http.StatusNoContent {

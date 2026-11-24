@@ -10,6 +10,7 @@ import {
 } from 'react'
 import { getAudioStreamUrl } from '../api/client'
 import type { BaseItemDto } from '../api/types'
+import { useAuth } from './AuthContext'
 
 export type RepeatMode = 'off' | 'all' | 'one'
 
@@ -24,9 +25,11 @@ export interface AudioPlayerContextValue {
   muted: boolean
   repeatMode: RepeatMode
   shuffle: boolean
+  playbackError: string | null
   playTrack: (track: BaseItemDto, queue?: BaseItemDto[]) => void
   playQueue: (tracks: BaseItemDto[], startIndex?: number) => void
   togglePlay: () => void
+  pause: () => void
   next: () => void
   prev: () => void
   seek: (sec: number) => void
@@ -36,6 +39,7 @@ export interface AudioPlayerContextValue {
   toggleShuffle: () => void
   selectTrackAt: (index: number) => void
   removeFromQueue: (index: number) => void
+  clearError: () => void
   close: () => void
 }
 
@@ -52,9 +56,11 @@ const DEFAULT_AUDIO_CONTEXT: AudioPlayerContextValue = {
   muted: false,
   repeatMode: 'off',
   shuffle: false,
+  playbackError: null,
   playTrack: NOOP,
   playQueue: NOOP,
   togglePlay: NOOP,
+  pause: NOOP,
   next: NOOP,
   prev: NOOP,
   seek: NOOP,
@@ -64,12 +70,15 @@ const DEFAULT_AUDIO_CONTEXT: AudioPlayerContextValue = {
   toggleShuffle: NOOP,
   selectTrackAt: NOOP,
   removeFromQueue: NOOP,
+  clearError: NOOP,
   close: NOOP,
 }
 
 const AudioPlayerContext = createContext<AudioPlayerContextValue>(DEFAULT_AUDIO_CONTEXT)
 
 export function AudioPlayerProvider({ children }: { children: ReactNode }) {
+  const { auth } = useAuth()
+  const authUserId = auth?.userId ?? null
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const [queue, setQueue] = useState<BaseItemDto[]>([])
   const [currentIndex, setCurrentIndex] = useState<number>(-1)
@@ -80,6 +89,11 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
   const [muted, setMuted] = useState<boolean>(false)
   const [repeatMode, setRepeatMode] = useState<RepeatMode>('off')
   const [shuffle, setShuffle] = useState<boolean>(false)
+  const [playbackError, setPlaybackError] = useState<string | null>(null)
+
+  const clearError = useCallback(() => {
+    setPlaybackError(null)
+  }, [])
 
   // 用 ref 保存最新状态供原生 <audio> ended 事件读取
   const stateRef = useRef({
@@ -109,6 +123,7 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
       setIsPlaying(false)
       setCurrentTime(0)
       setDuration(0)
+      setPlaybackError(null)
       return
     }
 
@@ -117,14 +132,22 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
     audio.currentTime = 0
     setCurrentTime(0)
     setDuration(currentTrackFallbackDuration)
+    setPlaybackError(null)
 
     const playPromise = audio.play()
     if (playPromise && typeof playPromise.then === 'function') {
       playPromise
-        .then(() => setIsPlaying(true))
-        .catch(() => {
-          // 浏览器自动播放限制或测试环境回退
+        .then(() => {
           setIsPlaying(true)
+          setPlaybackError(null)
+        })
+        .catch((err: unknown) => {
+          setIsPlaying(false)
+          const msg =
+            err instanceof Error && err.message
+              ? `音频播放失败：${err.message}`
+              : '音频播放被拦截或加载失败，请点击重试'
+          setPlaybackError(msg)
         })
     } else {
       setIsPlaying(true)
@@ -203,9 +226,24 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
       if (audio) {
         audio.currentTime = 0
         setCurrentTime(0)
-        void audio.play().catch(() => undefined)
+        setPlaybackError(null)
+        const p = audio.play()
+        if (p && typeof p.then === 'function') {
+          p.then(() => {
+            setIsPlaying(true)
+            setPlaybackError(null)
+          }).catch((err: unknown) => {
+            setIsPlaying(false)
+            setPlaybackError(
+              err instanceof Error && err.message
+                ? `音频播放失败：${err.message}`
+                : '音频播放被拦截或加载失败，请点击重试',
+            )
+          })
+        } else {
+          setIsPlaying(true)
+        }
       }
-      setIsPlaying(true)
     }
   }, [])
 
@@ -221,6 +259,14 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
     [playQueue],
   )
 
+  const pause = useCallback(() => {
+    const audio = audioRef.current
+    if (audio) {
+      audio.pause()
+    }
+    setIsPlaying(false)
+  }, [])
+
   const togglePlay = useCallback(() => {
     const audio = audioRef.current
     if (!audio || stateRef.current.currentIndex < 0) return
@@ -228,9 +274,20 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
       audio.pause()
       setIsPlaying(false)
     } else {
+      setPlaybackError(null)
       const p = audio.play()
       if (p && typeof p.then === 'function') {
-        p.then(() => setIsPlaying(true)).catch(() => setIsPlaying(true))
+        p.then(() => {
+          setIsPlaying(true)
+          setPlaybackError(null)
+        }).catch((err: unknown) => {
+          setIsPlaying(false)
+          setPlaybackError(
+            err instanceof Error && err.message
+              ? `音频播放失败：${err.message}`
+              : '音频播放被拦截或加载失败，请点击重试',
+          )
+        })
       } else {
         setIsPlaying(true)
       }
@@ -306,7 +363,18 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
     setIsPlaying(false)
     setCurrentTime(0)
     setDuration(0)
+    setPlaybackError(null)
   }, [])
+
+  // 用户退出登录或切换账号时停止播放并清空队列
+  const prevUserIdRef = useRef<string | null>(authUserId)
+  useEffect(() => {
+    const prevUserId = prevUserIdRef.current
+    prevUserIdRef.current = authUserId
+    if (prevUserId !== authUserId && (!authUserId || prevUserId !== null)) {
+      close()
+    }
+  }, [authUserId, close])
 
   const handleEnded = useCallback(() => {
     const { repeatMode: rep } = stateRef.current
@@ -314,8 +382,23 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
     if (rep === 'one' && audio) {
       audio.currentTime = 0
       setCurrentTime(0)
-      void audio.play().catch(() => undefined)
-      setIsPlaying(true)
+      setPlaybackError(null)
+      const p = audio.play()
+      if (p && typeof p.then === 'function') {
+        p.then(() => {
+          setIsPlaying(true)
+          setPlaybackError(null)
+        }).catch((err: unknown) => {
+          setIsPlaying(false)
+          setPlaybackError(
+            err instanceof Error && err.message
+              ? `音频播放失败：${err.message}`
+              : '音频播放被拦截或加载失败，请点击重试',
+          )
+        })
+      } else {
+        setIsPlaying(true)
+      }
       return
     }
     next()
@@ -333,9 +416,11 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
       muted,
       repeatMode,
       shuffle,
+      playbackError,
       playTrack,
       playQueue,
       togglePlay,
+      pause,
       next,
       prev,
       seek,
@@ -345,6 +430,7 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
       toggleShuffle,
       selectTrackAt,
       removeFromQueue,
+      clearError,
       close,
     }),
     [
@@ -358,9 +444,11 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
       muted,
       repeatMode,
       shuffle,
+      playbackError,
       playTrack,
       playQueue,
       togglePlay,
+      pause,
       next,
       prev,
       seek,
@@ -370,6 +458,7 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
       toggleShuffle,
       selectTrackAt,
       removeFromQueue,
+      clearError,
       close,
     ],
   )
@@ -396,8 +485,15 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
             setDuration(d)
           }
         }}
-        onPlay={() => setIsPlaying(true)}
+        onPlay={() => {
+          setIsPlaying(true)
+          setPlaybackError(null)
+        }}
         onPause={() => setIsPlaying(false)}
+        onError={() => {
+          setIsPlaying(false)
+          setPlaybackError('音频流加载失败，请检查网络连接或点击重试')
+        }}
         onEnded={handleEnded}
       />
     </AudioPlayerContext.Provider>

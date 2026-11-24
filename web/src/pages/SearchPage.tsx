@@ -7,12 +7,17 @@ import type { BaseItemDto } from '../api/types'
 import { MediaCard } from '../components/MediaCard'
 import { useAuth } from '../context/AuthContext'
 
-type SearchTypeFilter = 'all' | 'Movie' | 'Series' | 'Person' | 'BoxSet'
+type SearchTypeFilter = 'all' | 'Movie' | 'Series' | 'Music' | 'Person' | 'BoxSet'
 
 const TYPE_PILLS: Array<{ id: SearchTypeFilter; label: string; includeItemTypes: string }> = [
-  { id: 'all', label: '全部', includeItemTypes: 'Movie,Series,Episode,BoxSet,Person' },
+  {
+    id: 'all',
+    label: '全部',
+    includeItemTypes: 'Movie,Series,Episode,BoxSet,Person,MusicArtist,MusicAlbum,Audio,Playlist',
+  },
   { id: 'Movie', label: '电影', includeItemTypes: 'Movie' },
   { id: 'Series', label: '剧集', includeItemTypes: 'Series,Episode' },
+  { id: 'Music', label: '音乐', includeItemTypes: 'MusicAlbum,MusicArtist,Audio' },
   { id: 'Person', label: '演职员', includeItemTypes: 'Person' },
   { id: 'BoxSet', label: '合集', includeItemTypes: 'BoxSet' },
 ]

@@ -33,7 +33,7 @@ import {
 } from 'lucide-react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, getBackdropUrl, getFallbackImageUrl, getImageUrl } from '../api/client'
-import type { BaseItemDto, MediaSourceInfo } from '../api/types'
+import type { BaseItemDto, MediaSourceInfo, MediaStream } from '../api/types'
 import { formatAudioTime } from '../components/AudioPlayerBar'
 import { MediaCard } from '../components/MediaCard'
 import { IdentifyModal } from '../components/media/IdentifyModal'
@@ -42,6 +42,7 @@ import { MergeVersionsModal } from '../components/media/MergeVersionsModal'
 import { MetadataEditorModal } from '../components/media/MetadataEditorModal'
 import { useAudioPlayer } from '../context/AudioPlayerContext'
 import { useAuth } from '../context/AuthContext'
+import { loadPlaybackPrefs } from '../player/playbackPrefs'
 import {
   detectChineseVariant,
   formatTicks,
@@ -49,6 +50,64 @@ import {
   getSubtitleMeta,
 } from '../player/subtitleUtils'
 import { AdminModal, FeedbackBanner } from './admin/adminUtils'
+
+function matchesPreferredLang(stream: MediaStream, pref: string): boolean {
+  const normalized = pref.trim().toLowerCase()
+  if (!normalized) return false
+  const haystack = [stream.Language, stream.DisplayTitle, stream.Title]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase()
+
+  if (normalized === 'zh' || normalized === 'chi' || normalized === 'zho') {
+    return (
+      Boolean(detectChineseVariant(stream)) ||
+      /\b(zh|chi|zho|chs|cht|cmn|yue)\b/.test(haystack) ||
+      /中文|国语|國語|普通话|粤语|粵語|简体|繁體|繁体/.test(haystack)
+    )
+  }
+  if (normalized === 'zh-cn' || normalized === 'chs' || normalized === 'sc') {
+    return detectChineseVariant(stream) === '简体' || /\b(zh-cn|chs|sc)\b|简体|简中/.test(haystack)
+  }
+  if (normalized === 'zh-tw' || normalized === 'zh-hk' || normalized === 'cht' || normalized === 'tc') {
+    return detectChineseVariant(stream) === '繁体' || /\b(zh-tw|zh-hk|cht|tc)\b|繁体|繁體|繁中/.test(haystack)
+  }
+  if (normalized === 'en' || normalized === 'eng') {
+    return /\b(en|eng)\b|english|英语|英文/.test(haystack)
+  }
+  if (normalized === 'ja' || normalized === 'jpn') {
+    return /\b(ja|jpn|jp)\b|japanese|日语|日文/.test(haystack)
+  }
+  return haystack.includes(normalized)
+}
+
+function resolvePreferredTracks(source?: MediaSourceInfo): {
+  audioIdx: number | undefined
+  subIdx: number | undefined
+} {
+  if (!source) return { audioIdx: undefined, subIdx: undefined }
+  const prefs = loadPlaybackPrefs()
+  const allStreams = source.MediaStreams || []
+  const audios = allStreams.filter((s) => s.Type === 'Audio')
+  const subs = allStreams.filter((s) => s.Type === 'Subtitle')
+
+  let audioIdx = source.DefaultAudioStreamIndex
+  if (prefs.preferredAudioLang) {
+    const matchedAudio = audios.find((s) => matchesPreferredLang(s, prefs.preferredAudioLang))
+    if (matchedAudio) audioIdx = matchedAudio.Index
+  }
+
+  let subIdx = source.DefaultSubtitleStreamIndex
+  const prefSub = prefs.preferredSubtitleLang.trim().toLowerCase()
+  if (prefSub === 'off' || prefSub === 'none') {
+    subIdx = undefined
+  } else if (prefSub) {
+    const matchedSub = subs.find((s) => matchesPreferredLang(s, prefSub))
+    if (matchedSub) subIdx = matchedSub.Index
+  }
+
+  return { audioIdx, subIdx }
+}
 
 export function ItemDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -86,7 +145,7 @@ export function ItemDetailPage() {
     return () => window.clearTimeout(timer)
   }, [toast])
 
-  const { data: item, isLoading } = useQuery({
+  const { data: item, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['item', userId, id],
     queryFn: () => api.getItem(userId, id!),
     enabled: Boolean(id),
@@ -146,7 +205,11 @@ export function ItemDetailPage() {
   })
 
   const seasons = seasonsData?.Items || []
-  const [selectedSeasonId, setSelectedSeasonId] = useState<string>('')
+  const [selectedSeasonId, setSelectedSeasonId] = useState<string | undefined>(undefined)
+
+  useEffect(() => {
+    setSelectedSeasonId(undefined)
+  }, [id])
 
   useEffect(() => {
     if (seasons.length > 0 && !seasons.some((s) => s.Id === selectedSeasonId)) {
@@ -156,7 +219,7 @@ export function ItemDetailPage() {
 
   const { data: episodesData, isLoading: episodesLoading } = useQuery({
     queryKey: ['episodes', id, selectedSeasonId, userId],
-    queryFn: () => api.getEpisodes(id!, selectedSeasonId, userId),
+    queryFn: () => api.getEpisodes(id!, selectedSeasonId!, userId),
     enabled: Boolean(id && isSeries && selectedSeasonId),
   })
 
@@ -216,9 +279,10 @@ export function ItemDetailPage() {
   useEffect(() => {
     if (mediaSources.length > 0) {
       const first = mediaSources[0]
+      const { audioIdx, subIdx } = resolvePreferredTracks(first)
       setSelectedSourceId(first.Id)
-      setSelectedAudioIdx(first.DefaultAudioStreamIndex)
-      setSelectedSubIdx(first.DefaultSubtitleStreamIndex)
+      setSelectedAudioIdx(audioIdx)
+      setSelectedSubIdx(subIdx)
     }
   }, [item?.Id, mediaSources.length])
 
@@ -360,7 +424,10 @@ export function ItemDetailPage() {
       const name = newColName.trim()
       if (!name) throw new Error('请输入名称')
       if (addToColTab === 'Playlist') {
-        return api.createPlaylist(name, userId, [item!.Id])
+        const mediaType = ['Audio', 'MusicAlbum', 'MusicArtist'].includes(item!.Type)
+          ? 'Audio'
+          : 'Video'
+        return api.createPlaylist(name, userId, [item!.Id], mediaType)
       }
       return api.createCollection(name, [item!.Id])
     },
@@ -419,10 +486,43 @@ export function ItemDetailPage() {
     },
   })
 
-  if (isLoading || !item) {
+  if (isLoading) {
     return (
       <div className="flex h-[60vh] items-center justify-center">
         <Loader2 className="h-8 w-8 animate-spin text-amber-400" />
+      </div>
+    )
+  }
+
+  if (isError || !item) {
+    const errorMsg =
+      error instanceof Error && error.message ? error.message : '未找到该媒体项目或加载失败'
+    return (
+      <div className="flex min-h-[60vh] items-center justify-center px-4">
+        <div className="w-full max-w-md rounded-2xl border border-white/10 bg-zinc-950/90 p-8 text-center shadow-2xl">
+          <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-red-500/15 text-red-400 ring-1 ring-red-500/30">
+            <AlertTriangle className="h-6 w-6" />
+          </div>
+          <h2 className="text-lg font-semibold text-white">无法加载媒体详情</h2>
+          <p className="mt-2 text-sm text-zinc-400">{errorMsg}</p>
+          <div className="mt-6 flex items-center justify-center gap-3">
+            <button
+              type="button"
+              onClick={() => void refetch()}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-5 py-2.5 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              <span>重试</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => navigate('/')}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-white/12 bg-white/[0.05] px-5 py-2.5 text-xs font-medium text-zinc-200 transition-colors hover:bg-white/10"
+            >
+              <span>返回首页</span>
+            </button>
+          </div>
+        </div>
       </div>
     )
   }
@@ -864,9 +964,10 @@ export function ItemDetailPage() {
                         value={activeSource?.Id || ''}
                         onChange={(e) => {
                           const next = mediaSources.find((s) => s.Id === e.target.value)
+                          const { audioIdx, subIdx } = resolvePreferredTracks(next)
                           setSelectedSourceId(e.target.value)
-                          setSelectedAudioIdx(next?.DefaultAudioStreamIndex)
-                          setSelectedSubIdx(next?.DefaultSubtitleStreamIndex)
+                          setSelectedAudioIdx(audioIdx)
+                          setSelectedSubIdx(subIdx)
                         }}
                         className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
                       >

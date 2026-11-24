@@ -241,7 +241,7 @@ export function LibrariesTab() {
     setRenaming(true)
     setFeedback(null)
     try {
-      await api.renameVirtualFolder(editTarget.Name, nextName)
+      await api.renameVirtualFolder(editTarget.Name, nextName, editTarget.ItemId)
       setEditTarget({ ...editTarget, Name: nextName })
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['admin', 'virtualFolders'] }),
@@ -270,7 +270,7 @@ export function LibrariesTab() {
     setPathBusy(`add:${cleaned}`)
     setFeedback(null)
     try {
-      await api.addVirtualFolderPath(editTarget.Name, cleaned)
+      await api.addVirtualFolderPath(editTarget.Name, cleaned, false, editTarget.ItemId)
       setEditLocations((prev) => (prev.includes(cleaned) ? prev : [...prev, cleaned]))
       setEditNewPath('')
       await queryClient.invalidateQueries({ queryKey: ['admin', 'virtualFolders'] })
@@ -290,7 +290,7 @@ export function LibrariesTab() {
     setPathBusy(`remove:${loc}`)
     setFeedback(null)
     try {
-      await api.removeVirtualFolderPath(editTarget.Name, loc)
+      await api.removeVirtualFolderPath(editTarget.Name, loc, editTarget.ItemId)
       setEditLocations((prev) => prev.filter((item) => item !== loc))
       await queryClient.invalidateQueries({ queryKey: ['admin', 'virtualFolders'] })
       setFeedback({ type: 'success', message: `已从「${editTarget.Name}」移除路径 ${loc}` })
@@ -479,6 +479,11 @@ export function LibrariesTab() {
         onClose={() => setCreateOpen(false)}
       >
         <form onSubmit={handleCreate} className="space-y-4">
+          <FeedbackBanner
+            message={feedback?.message}
+            type={feedback?.type}
+            onClose={() => setFeedback(null)}
+          />
           <div className="grid gap-4 sm:grid-cols-2">
             <div>
               <label className="mb-1.5 block text-xs font-medium text-zinc-400">媒体库名称 *</label>
@@ -709,6 +714,11 @@ export function LibrariesTab() {
         onClose={() => setEditTarget(null)}
       >
         <div className="space-y-5">
+          <FeedbackBanner
+            message={feedback?.message}
+            type={feedback?.type}
+            onClose={() => setFeedback(null)}
+          />
           {/* 重命名表单 */}
           <form onSubmit={handleRename} className="space-y-2">
             <label className="block text-xs font-medium text-zinc-400">媒体库名称</label>

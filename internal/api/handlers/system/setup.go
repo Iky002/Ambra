@@ -146,8 +146,8 @@ func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 	if tmdbLangChanged {
 		h.syncTMDBPlugin()
-	h.syncSTRMPlugin()
 	}
+	h.syncSTRMPlugin()
 
 	ctx := r.Context()
 	if _, err := h.setup.Auth.CreateUser(ctx, username, req.Password, true); err != nil {

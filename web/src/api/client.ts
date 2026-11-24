@@ -495,6 +495,14 @@ export const api = {
     )
   },
 
+  movePlaylistItem: (playlistId: string, itemId: string, newIndex: number) =>
+    embyFetch<void>(
+      `/emby/Playlists/${encodeURIComponent(playlistId)}/Items/${encodeURIComponent(itemId)}/Move/${newIndex}`,
+      {
+        method: 'POST',
+      },
+    ),
+
   uploadUserImage: (userId: string, base64: string, contentType: string) => {
     const cleanBase64 = base64.replace(/^data:[^;]+;base64,/, '')
     return embyFetch<void>(`/emby/Users/${encodeURIComponent(userId)}/Images/Primary`, {
@@ -785,28 +793,35 @@ export const api = {
     })
   },
 
-  renameVirtualFolder: (name: string, newName: string) => {
+  renameVirtualFolder: (name: string, newName: string, id?: string) => {
     const q = new URLSearchParams({
       Name: name,
       NewName: newName,
     })
+    if (id) q.set('Id', id)
     return embyFetch<void>(`/emby/Library/VirtualFolders/Name?${q.toString()}`, {
       method: 'POST',
-      body: JSON.stringify({ Name: name, NewName: newName }),
+      body: JSON.stringify({ Name: name, NewName: newName, ...(id ? { Id: id } : {}) }),
     })
   },
 
-  addVirtualFolderPath: (name: string, path: string, refreshLibrary = false) =>
+  addVirtualFolderPath: (name: string, path: string, refreshLibrary = false, id?: string) =>
     embyFetch<void>('/emby/Library/VirtualFolders/Paths', {
       method: 'POST',
-      body: JSON.stringify({ Name: name, Path: path, RefreshLibrary: refreshLibrary }),
+      body: JSON.stringify({
+        Name: name,
+        Path: path,
+        RefreshLibrary: refreshLibrary,
+        ...(id ? { Id: id } : {}),
+      }),
     }),
 
-  removeVirtualFolderPath: (name: string, path: string) => {
+  removeVirtualFolderPath: (name: string, path: string, id?: string) => {
     const q = new URLSearchParams({
       Name: name,
       Path: path,
     })
+    if (id) q.set('Id', id)
     return embyFetch<void>(`/emby/Library/VirtualFolders/Paths?${q.toString()}`, {
       method: 'DELETE',
     })
@@ -1076,12 +1091,17 @@ export const api = {
     ),
 
   writeItemNfo: (itemId: string) =>
-    embyFetch<{ item_id?: string; path?: string; written?: boolean }>(
-      `/api/admin/governance/items/${encodeURIComponent(itemId)}/nfo`,
-      {
-        method: 'POST',
-      },
-    ),
+    embyFetch<{
+      ItemId?: string
+      NfoPath?: string
+      RootTag?: string
+      BytesSize?: number
+      item_id?: string
+      path?: string
+      written?: boolean
+    }>(`/api/admin/governance/items/${encodeURIComponent(itemId)}/nfo`, {
+      method: 'POST',
+    }),
 
   // ==================== First-Run Setup Wizard APIs ====================
 

@@ -41,4 +41,19 @@ func TestReadFirstLineURL(t *testing.T) {
 	if got := readFirstLineURL(filepath.Join(tmp, "missing.strm")); got != "" {
 		t.Fatalf("expected empty string for missing file, got %q", got)
 	}
+
+	// Disallowed schemes (file://, concat:, pipe:, bare path) -> ""
+	for _, bad := range []string{
+		"file:///etc/passwd",
+		"concat:/tmp/a.mp4|/tmp/b.mp4",
+		"pipe:0",
+		"/etc/passwd",
+		"ftp://example.com/movie.mkv",
+	} {
+		p := filepath.Join(tmp, "bad.strm")
+		_ = os.WriteFile(p, []byte(bad+"\n"), 0o644)
+		if got := readFirstLineURL(p); got != "" {
+			t.Fatalf("readFirstLineURL(%q) = %q, want empty string", bad, got)
+		}
+	}
 }

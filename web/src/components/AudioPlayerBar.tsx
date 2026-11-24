@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
+  AlertCircle,
   FileText,
   ListMusic,
   Loader2,
@@ -9,6 +10,7 @@ import {
   Play,
   Repeat,
   Repeat1,
+  RotateCw,
   Shuffle,
   SkipBack,
   SkipForward,
@@ -37,11 +39,22 @@ export function formatAudioTime(seconds: number): string {
 
 export function parseLrcText(raw: string): ParsedLyricLine[] {
   const lines: ParsedLyricLine[] = []
-  const timeTagRegex = /\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]/g
+  const timeTagRegex = /\[(\d{1,3}):(\d{2})(?:\.(\d{1,3}))?\]/g
+  const offsetRegex = /^\[offset:\s*([+-]?\d+)\s*\]$/i
+  let offsetMs = 0
 
   for (const rawLine of raw.split(/\r?\n/)) {
     const trimmed = rawLine.trim()
     if (!trimmed) continue
+
+    const offsetMatch = trimmed.match(offsetRegex)
+    if (offsetMatch) {
+      const parsed = Number(offsetMatch[1])
+      if (Number.isFinite(parsed)) {
+        offsetMs = parsed
+      }
+      continue
+    }
 
     const matches = Array.from(trimmed.matchAll(timeTagRegex))
     const text = trimmed.replace(timeTagRegex, '').trim()
@@ -52,9 +65,9 @@ export function parseLrcText(raw: string): ParsedLyricLine[] {
         const sec = Number(m[2])
         const msRaw = m[3] || '0'
         const frac = Number(msRaw) / Math.pow(10, msRaw.length)
-        if (text) {
-          lines.push({ timeSec: min * 60 + sec + frac, text })
-        }
+        // LRC 标准：[offset:+ms] 使歌词提前显示（时间戳减去 offsetMs/1000）
+        const adjustedSec = Math.max(0, min * 60 + sec + frac - offsetMs / 1000)
+        lines.push({ timeSec: adjustedSec, text })
       }
     } else if (!/^\[[a-zA-Z]+:.*\]$/.test(trimmed)) {
       lines.push({ timeSec: null, text: trimmed })
@@ -80,15 +93,15 @@ export function normalizeLyricsResponse(
     return parseLrcText(data.RawLrc)
   }
   if (Array.isArray(data.Lyrics) && data.Lyrics.length > 0) {
-    return data.Lyrics.filter((line) => Boolean(line?.Text?.trim())).map((line) => ({
-      // Emby/Jellyfin 的 Start 字段为 100ns ticks（10_000_000 = 1秒），兼容小数值秒数
+    return data.Lyrics.filter(
+      (line) => line != null && (Boolean(line.Text?.trim()) || line.Start != null),
+    ).map((line) => ({
+      // Emby/Jellyfin 的 Start 字段始终为 100ns ticks（10_000_000 = 1 秒）
       timeSec:
-        line.Start != null
-          ? line.Start >= 100_000
-            ? line.Start / 10_000_000
-            : line.Start
+        typeof line.Start === 'number' && Number.isFinite(line.Start)
+          ? line.Start / 10_000_000
           : null,
-      text: line.Text.trim(),
+      text: (line.Text || '').trim(),
     }))
   }
   return []
@@ -132,6 +145,7 @@ export function AudioPlayerBar() {
     muted,
     repeatMode,
     shuffle,
+    playbackError,
     togglePlay,
     next,
     prev,
@@ -142,6 +156,7 @@ export function AudioPlayerBar() {
     toggleShuffle,
     selectTrackAt,
     removeFromQueue,
+    clearError,
     close,
   } = useAudioPlayer()
 
@@ -260,7 +275,7 @@ export function AudioPlayerBar() {
                           : 'text-sm text-zinc-400 hover:bg-white/[0.04] hover:text-zinc-200'
                       } ${line.timeSec != null ? 'cursor-pointer' : 'cursor-default'}`}
                     >
-                      {line.text}
+                      {line.text || '···'}
                     </button>
                   )
                 })
@@ -328,13 +343,48 @@ export function AudioPlayerBar() {
                     type="button"
                     onClick={() => removeFromQueue(idx)}
                     aria-label={`从队列移除 ${track.Name}`}
-                    className="rounded-md p-1 text-zinc-500 opacity-0 transition-opacity hover:bg-red-500/15 hover:text-red-400 group-hover:opacity-100"
+                    className="rounded-md p-1 text-zinc-500 opacity-70 transition-opacity hover:bg-red-500/15 hover:text-red-400 sm:opacity-0 sm:group-hover:opacity-100"
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>
                 </div>
               )
             })}
+          </div>
+        </div>
+      )}
+
+      {/* 音频播放错误提示条 */}
+      {playbackError && (
+        <div
+          data-testid="audio-playback-error"
+          role="alert"
+          className="flex items-center justify-between gap-3 border-b border-red-500/25 bg-red-500/12 px-4 py-1.5 text-xs text-red-200 lg:px-6"
+        >
+          <div className="flex min-w-0 items-center gap-2">
+            <AlertCircle className="h-3.5 w-3.5 shrink-0 text-red-400" />
+            <span className="truncate">{playbackError}</span>
+          </div>
+          <div className="flex shrink-0 items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => {
+                clearError()
+                togglePlay()
+              }}
+              className="inline-flex items-center gap-1 rounded-md bg-red-500/20 px-2 py-0.5 text-[11px] font-medium text-red-100 transition-colors hover:bg-red-500/35"
+            >
+              <RotateCw className="h-3 w-3" />
+              <span>重试</span>
+            </button>
+            <button
+              type="button"
+              onClick={clearError}
+              aria-label="关闭错误提示"
+              className="rounded-md p-0.5 text-red-300 transition-colors hover:bg-red-500/20 hover:text-red-100"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
           </div>
         </div>
       )}
@@ -464,7 +514,13 @@ export function AudioPlayerBar() {
         <div className="flex items-center gap-1.5 lg:w-72 lg:justify-end">
           <button
             type="button"
-            onClick={() => setLyricsOpen((v) => !v)}
+            onClick={() => {
+              setLyricsOpen((v) => {
+                const nextOpen = !v
+                if (nextOpen) setQueueOpen(false)
+                return nextOpen
+              })
+            }}
             aria-label="同步歌词"
             title="同步歌词"
             className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors ${
@@ -479,7 +535,13 @@ export function AudioPlayerBar() {
 
           <button
             type="button"
-            onClick={() => setQueueOpen((v) => !v)}
+            onClick={() => {
+              setQueueOpen((v) => {
+                const nextOpen = !v
+                if (nextOpen) setLyricsOpen(false)
+                return nextOpen
+              })
+            }}
             aria-label="播放队列"
             title="播放队列"
             className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors ${

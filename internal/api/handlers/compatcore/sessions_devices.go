@@ -283,11 +283,6 @@ func (h *Handler) connectExchange(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	connectUserID := strings.TrimSpace(q.Get("ConnectUserId"))
 	localUserID := h.resolveUserID(r, "")
-	if localUserID == "" && h.userRepo != nil {
-		if users, err := h.userRepo.ListUsers(r.Context()); err == nil && len(users) > 0 {
-			localUserID = users[0].ID
-		}
-	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"LocalUserId":   localUserID,
 		"AccessToken":   guid.New(),

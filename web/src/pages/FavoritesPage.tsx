@@ -13,7 +13,7 @@ export function FavoritesPage() {
     queryFn: () =>
       api.getItems(userId, {
         filters: 'IsFavorite',
-        includeItemTypes: 'Movie,Series,Episode',
+        includeItemTypes: 'Movie,Series,Episode,MusicAlbum,MusicArtist,Audio',
         sortBy: 'SortName',
         sortOrder: 'Ascending',
         limit: 100,

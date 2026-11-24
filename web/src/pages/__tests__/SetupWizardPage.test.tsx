@@ -180,10 +180,21 @@ describe('SetupWizardPage - 首次运行 4 步初始化向导', () => {
 
     expect((screen.getByLabelText('服务器目录路径') as HTMLInputElement).value).toBe('/media/movies')
 
+    // 验证 Step 3 本地元数据保存开关默认开启并可透传至 createVirtualFolder
+    expect(screen.getByText('保存元数据与图片到媒体文件夹')).toBeInTheDocument()
+
     // 添加媒体库
     await user.click(screen.getByRole('button', { name: /添加此媒体库/i }))
     expect(await screen.findByText('已添加媒体库「4K 电影」')).toBeInTheDocument()
     expect(screen.getByText('已添加的媒体库（1）')).toBeInTheDocument()
+
+    const createLibCall = fetchSpy.mock.calls.find(
+      ([u, init]) =>
+        String(u).startsWith('/emby/Library/VirtualFolders') &&
+        (init?.method || 'GET').toUpperCase() === 'POST',
+    )
+    expect(createLibCall).toBeDefined()
+    expect(JSON.parse(String(createLibCall?.[1]?.body)).LibraryOptions.SaveLocalMetadata).toBe(true)
 
     // 进入第 4 步
     await user.click(screen.getByRole('button', { name: /下一步：刮削设置/i }))

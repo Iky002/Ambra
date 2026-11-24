@@ -391,6 +391,13 @@ func (h *Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
 		httpx.JSON(w, http.StatusOK, []dto.SessionInfo{})
 		return
 	}
+	ac, _ := middleware.AuthFromContext(r.Context())
+	isAdmin := ac == nil || ac.IsAdmin()
+	callerID := ""
+	if ac != nil {
+		callerID = guid.Normalize(ac.UserID())
+	}
+
 	q := httpx.ParseQuery(r)
 	deviceID := q.Get("DeviceId")
 	userID := guid.Normalize(q.Get("ControllableByUserId"))
@@ -398,6 +405,9 @@ func (h *Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
 	all := h.sessionMgr.ListSessions()
 	out := make([]dto.SessionInfo, 0, len(all))
 	for _, s := range all {
+		if !isAdmin && guid.Normalize(s.UserId) != callerID {
+			continue
+		}
 		if deviceID != "" && s.DeviceId != deviceID {
 			continue
 		}
@@ -484,6 +494,13 @@ type DeviceInfoDto struct {
 }
 
 func (h *Handler) ListDevices(w http.ResponseWriter, r *http.Request) {
+	ac, _ := middleware.AuthFromContext(r.Context())
+	isAdmin := ac == nil || ac.IsAdmin()
+	callerID := ""
+	if ac != nil {
+		callerID = guid.Normalize(ac.UserID())
+	}
+
 	devices, err := h.userRepo.ListDevices(r.Context())
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to list devices")
@@ -491,6 +508,9 @@ func (h *Handler) ListDevices(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]DeviceInfoDto, 0, len(devices))
 	for _, d := range devices {
+		if !isAdmin && guid.Normalize(d.LastUserID) != callerID {
+			continue
+		}
 		items = append(items, DeviceInfoDto{
 			Name:             d.Name,
 			Id:               d.ID,
@@ -592,6 +612,10 @@ func (h *Handler) UpdateDisplayPreferences(w http.ResponseWriter, r *http.Reques
 	userID := guid.Normalize(q.Get("userId"))
 	if userID == "" {
 		userID = guid.Normalize(ac.UserID())
+	}
+	if ac != nil && !ac.IsAdmin() && userID != guid.Normalize(ac.UserID()) {
+		httpx.Error(w, http.StatusForbidden, "Forbidden")
+		return
 	}
 	client := q.Get("client")
 	if client == "" {

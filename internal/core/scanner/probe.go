@@ -42,6 +42,7 @@ type ProbeResult struct {
 	RuntimeTicks int64
 	Bitrate      int
 	Size         int64
+	Tags         map[string]string
 	Streams      []ProbedStream
 }
 
@@ -117,10 +118,11 @@ type ffprobeOutput struct {
 }
 
 type ffprobeFormat struct {
-	FormatName string `json:"format_name"`
-	Duration   string `json:"duration"`
-	Size       string `json:"size"`
-	BitRate    string `json:"bit_rate"`
+	FormatName string            `json:"format_name"`
+	Duration   string            `json:"duration"`
+	Size       string            `json:"size"`
+	BitRate    string            `json:"bit_rate"`
+	Tags       map[string]string `json:"tags"`
 }
 
 type ffprobeStream struct {
@@ -172,10 +174,15 @@ func ParseFFprobeJSON(raw []byte) (*ProbeResult, error) {
 		if sz, err := strconv.ParseInt(strings.TrimSpace(payload.Format.Size), 10, 64); err == nil && sz > 0 {
 			res.Size = sz
 		}
+		if len(payload.Format.Tags) > 0 {
+			res.Tags = make(map[string]string, len(payload.Format.Tags))
+			for k, v := range payload.Format.Tags {
+				res.Tags[k] = strings.TrimSpace(v)
+			}
+		}
 	}
 
 	var maxStreamDur float64
-	streamIdx := 0
 	for _, st := range payload.Streams {
 		if sec, err := strconv.ParseFloat(strings.TrimSpace(st.Duration), 64); err == nil && sec > maxStreamDur {
 			maxStreamDur = sec
@@ -193,7 +200,7 @@ func ParseFFprobeJSON(raw []byte) (*ProbeResult, error) {
 			vRange := detectVideoRange(st)
 			br := parseStreamBitrate(st)
 			res.Streams = append(res.Streams, ProbedStream{
-				Index:        streamIdx,
+				Index:        st.Index,
 				StreamType:   "Video",
 				Codec:        codec,
 				Title:        tagValue(st.Tags, "title"),
@@ -205,7 +212,6 @@ func ParseFFprobeJSON(raw []byte) (*ProbeResult, error) {
 				IsDefault:    st.Disposition["default"] == 1,
 				IsExternal:   false,
 			})
-			streamIdx++
 
 		case "audio":
 			lang := strings.ToLower(tagValue(st.Tags, "language"))
@@ -217,7 +223,7 @@ func ParseFFprobeJSON(raw []byte) (*ProbeResult, error) {
 			sr, _ := strconv.Atoi(strings.TrimSpace(st.SampleRate))
 			br := parseStreamBitrate(st)
 			res.Streams = append(res.Streams, ProbedStream{
-				Index:        streamIdx,
+				Index:        st.Index,
 				StreamType:   "Audio",
 				Codec:        codec,
 				Language:     lang,
@@ -230,7 +236,6 @@ func ParseFFprobeJSON(raw []byte) (*ProbeResult, error) {
 				IsDefault:    st.Disposition["default"] == 1,
 				IsExternal:   false,
 			})
-			streamIdx++
 
 		case "subtitle":
 			rawLang := strings.ToLower(tagValue(st.Tags, "language"))
@@ -245,7 +250,7 @@ func ParseFFprobeJSON(raw []byte) (*ProbeResult, error) {
 			displayTitle := toEmbeddedSubtitleTitle(cls.DisplayTitle)
 
 			res.Streams = append(res.Streams, ProbedStream{
-				Index:        streamIdx,
+				Index:        st.Index,
 				StreamType:   "Subtitle",
 				Codec:        cls.Codec,
 				Language:     lang,
@@ -256,7 +261,6 @@ func ParseFFprobeJSON(raw []byte) (*ProbeResult, error) {
 				IsForced:     st.Disposition["forced"] == 1 || cls.IsForced,
 				IsExternal:   false,
 			})
-			streamIdx++
 		}
 	}
 

@@ -4,8 +4,11 @@ import {
   ArrowDownWideNarrow,
   ArrowUpNarrowWide,
   Calendar,
+  Disc3,
   Filter,
   Loader2,
+  Mic2,
+  Music,
   RotateCcw,
   Tag,
   Tags,
@@ -30,6 +33,14 @@ const FILTER_OPTIONS = [
   { value: 'IsFavorite', label: '仅看收藏' },
 ]
 
+type MusicSubTab = 'MusicAlbum' | 'MusicArtist' | 'Audio'
+
+const MUSIC_SUB_TABS: Array<{ id: MusicSubTab; label: string; icon: typeof Disc3 }> = [
+  { id: 'MusicAlbum', label: '专辑', icon: Disc3 },
+  { id: 'MusicArtist', label: '艺术家', icon: Mic2 },
+  { id: 'Audio', label: '曲目', icon: Music },
+]
+
 const PAGE_SIZE = 36
 
 export function LibraryPage() {
@@ -44,6 +55,7 @@ export function LibraryPage() {
   const [genreFilter, setGenreFilter] = useState(() => searchParams.get('genre') || '')
   const [yearFilter, setYearFilter] = useState(() => searchParams.get('year') || '')
   const [tagFilter, setTagFilter] = useState(() => searchParams.get('tag') || '')
+  const [musicSubTab, setMusicSubTab] = useState<MusicSubTab>('MusicAlbum')
   const [page, setPage] = useState(0)
 
   // 响应 URL query 参数变化（例如从详情页点击流派/年份/标签跳转）
@@ -53,6 +65,10 @@ export function LibraryPage() {
     setTagFilter(searchParams.get('tag') || '')
     setPage(0)
   }, [id, searchParams])
+
+  useEffect(() => {
+    setMusicSubTab('MusicAlbum')
+  }, [id])
 
   const updateUrlParam = (key: 'genre' | 'year' | 'tag', value: string) => {
     const next = new URLSearchParams(searchParams)
@@ -65,7 +81,7 @@ export function LibraryPage() {
     setPage(0)
   }
 
-  const { data: libraryInfo } = useQuery({
+  const { data: libraryInfo, isFetched: libraryInfoFetched } = useQuery({
     queryKey: ['item', userId, id],
     queryFn: () => api.getItem(userId, id!),
     enabled: Boolean(id),
@@ -118,7 +134,7 @@ export function LibraryPage() {
 
   const isMusicLibrary = (libraryInfo?.CollectionType || '').toLowerCase() === 'music'
   const includeItemTypes = isMusicLibrary
-    ? 'MusicArtist,MusicAlbum,Audio'
+    ? musicSubTab
     : 'Movie,Series,MusicAlbum,Video'
 
   const { data, isLoading, isFetching } = useQuery({
@@ -148,7 +164,7 @@ export function LibraryPage() {
         startIndex: page * PAGE_SIZE,
         limit: PAGE_SIZE,
       }),
-    enabled: Boolean(id),
+    enabled: Boolean(id && (libraryInfo || libraryInfoFetched)),
     placeholderData: (prev) => prev,
   })
 
@@ -323,6 +339,40 @@ export function LibraryPage() {
           )}
         </div>
       </div>
+
+      {/* 音乐库子标签：专辑 / 艺术家 / 曲目 */}
+      {isMusicLibrary && (
+        <div
+          role="tablist"
+          aria-label="音乐库分类"
+          className="inline-flex items-center gap-1 rounded-xl border border-white/10 bg-zinc-950/80 p-1"
+        >
+          {MUSIC_SUB_TABS.map((tab) => {
+            const Icon = tab.icon
+            const active = musicSubTab === tab.id
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                role="tab"
+                aria-selected={active}
+                onClick={() => {
+                  setMusicSubTab(tab.id)
+                  setPage(0)
+                }}
+                className={`inline-flex items-center gap-1.5 rounded-lg px-3.5 py-2 text-xs font-medium transition-colors ${
+                  active
+                    ? 'bg-amber-500 text-zinc-950 shadow-sm'
+                    : 'text-zinc-400 hover:bg-white/[0.05] hover:text-zinc-100'
+                }`}
+              >
+                <Icon className="h-3.5 w-3.5" />
+                <span>{tab.label}</span>
+              </button>
+            )
+          })}
+        </div>
+      )}
 
       {/* 海报墙网格 */}
       {isLoading ? (

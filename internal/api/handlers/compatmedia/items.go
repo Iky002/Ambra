@@ -29,11 +29,11 @@ import (
 
 type itemUpdateRequest struct {
 	Name              string            `json:"Name"`
-	OriginalTitle     string            `json:"OriginalTitle"`
+	OriginalTitle     *string           `json:"OriginalTitle"`
 	SortName          string            `json:"SortName"`
-	Overview          string            `json:"Overview"`
+	Overview          *string           `json:"Overview"`
 	Taglines          []string          `json:"Taglines"`
-	OfficialRating    string            `json:"OfficialRating"`
+	OfficialRating    *string           `json:"OfficialRating"`
 	CommunityRating   *float64          `json:"CommunityRating"`
 	CriticRating      *float64          `json:"CriticRating"`
 	ProductionYear    *int              `json:"ProductionYear"`
@@ -44,6 +44,8 @@ type itemUpdateRequest struct {
 	Tags              []string          `json:"Tags"`
 	Studios           []dto.NameIdPair  `json:"Studios"`
 	ProviderIds       map[string]string `json:"ProviderIds"`
+	LockData          *bool             `json:"LockData"`
+	LockedFields      []string          `json:"LockedFields"`
 }
 
 func (h *Handler) handleUpdateItem(w http.ResponseWriter, r *http.Request) {
@@ -73,20 +75,20 @@ func (h *Handler) handleUpdateItem(w http.ResponseWriter, r *http.Request) {
 			rec.SortName = strings.ToLower(s)
 		}
 	}
-	if req.OriginalTitle != "" {
-		rec.OriginalTitle = req.OriginalTitle
+	if req.OriginalTitle != nil {
+		rec.OriginalTitle = *req.OriginalTitle
 	}
 	if req.SortName != "" {
 		rec.SortName = req.SortName
 	}
-	if req.Overview != "" {
-		rec.Extra.Overview = req.Overview
+	if req.Overview != nil {
+		rec.Extra.Overview = *req.Overview
 	}
 	if req.Taglines != nil {
 		rec.Extra.Taglines = req.Taglines
 	}
-	if req.OfficialRating != "" {
-		rec.OfficialRating = req.OfficialRating
+	if req.OfficialRating != nil {
+		rec.OfficialRating = *req.OfficialRating
 	}
 	if req.CommunityRating != nil {
 		rec.CommunityRating = req.CommunityRating
@@ -110,6 +112,12 @@ func (h *Handler) handleUpdateItem(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ProviderIds != nil {
 		rec.Extra.ProviderIDs = req.ProviderIds
+	}
+	if req.LockData != nil {
+		rec.Extra.LockData = *req.LockData
+	}
+	if req.LockedFields != nil {
+		rec.Extra.LockedFields = req.LockedFields
 	}
 	rec.DateModified = time.Now().Unix()
 	rec.Etag = guid.New()[:16]
@@ -146,6 +154,9 @@ func (h *Handler) handleUpdateItem(w http.ResponseWriter, r *http.Request) {
 	titleTokens := scanner.TokenizeForFTS(rec.Name, rec.OriginalTitle, rec.Extra.SeriesName)
 	peopleTokens := scanner.TokenizeForFTS(peopleNames...)
 	_ = h.repo.UpsertSearchFTS(r.Context(), rec.ID, titleRaw, titleTokens, "", "", peopleTokens)
+	if h.scanner != nil {
+		_ = h.scanner.SaveItemLocalNFO(r.Context(), rec.ID, true)
+	}
 	httpx.NoContent(w)
 }
 

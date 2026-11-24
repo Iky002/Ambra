@@ -155,6 +155,7 @@ func (e *Engine) Decide(ctx context.Context, itemID string, req PlaybackInfoRequ
 func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sqlite.MediaSourceRecord, req PlaybackInfoRequest, sessionID string) (dto.MediaSourceInfo, DecisionDetail) {
 	msDTO := sqlite.MediaSourceRecordsToDTO([]sqlite.MediaSourceRecord{src})[0]
 	msDTO.Type = "Default"
+	isAudio := strings.EqualFold(item.Type, "Audio") || strings.EqualFold(item.MediaType, "Audio")
 
 	// Find default audio & subtitle indices and extract primary video/audio/subtitle codecs
 	var videoCodec, audioCodec string
@@ -211,7 +212,11 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 			msDTO.SupportsDirectPlay = true
 			msDTO.SupportsDirectStream = true
 			msDTO.SupportsTranscoding = false
-			msDTO.DirectStreamUrl = fmt.Sprintf("/Videos/%s/stream?Static=true&MediaSourceId=%s&PlaySessionId=%s", item.ID, msDTO.Id, sessionID)
+			if isAudio {
+				msDTO.DirectStreamUrl = fmt.Sprintf("/Audio/%s/stream?Static=true&MediaSourceId=%s&PlaySessionId=%s", item.ID, msDTO.Id, sessionID)
+			} else {
+				msDTO.DirectStreamUrl = fmt.Sprintf("/Videos/%s/stream?Static=true&MediaSourceId=%s&PlaySessionId=%s", item.ID, msDTO.Id, sessionID)
+			}
 			return msDTO, DecisionDetail{
 				MediaSourceID: msDTO.Id,
 				PlayMethod:    PlayMethodSTRM302,
@@ -229,6 +234,30 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 		maxBitrate = req.DeviceProfile.MaxStreamingBitrate
 	}
 	bitrateOK := maxBitrate <= 0 || src.Bitrate <= 0 || src.Bitrate <= maxBitrate
+
+	if isAudio {
+		containerOK, audioOK := checkAudioProfileCompatibility(src.Container, audioCodec, req.DeviceProfile)
+		if allowDirectPlay && bitrateOK && containerOK && audioOK {
+			msDTO.SupportsDirectPlay = true
+			msDTO.SupportsDirectStream = true
+			msDTO.SupportsTranscoding = true
+			msDTO.DirectStreamUrl = fmt.Sprintf("/Audio/%s/stream?Static=true&MediaSourceId=%s&PlaySessionId=%s", item.ID, msDTO.Id, sessionID)
+			return msDTO, DecisionDetail{
+				MediaSourceID: msDTO.Id,
+				PlayMethod:    PlayMethodDirectPlay,
+				Reason:        "Native audio direct play",
+			}
+		}
+		msDTO.SupportsDirectPlay = false
+		msDTO.SupportsDirectStream = false
+		msDTO.SupportsTranscoding = true
+		msDTO.TranscodingUrl = fmt.Sprintf("/Audio/%s/universal?MediaSourceId=%s&AudioCodec=aac&PlaySessionId=%s", item.ID, msDTO.Id, sessionID)
+		return msDTO, DecisionDetail{
+			MediaSourceID: msDTO.Id,
+			PlayMethod:    PlayMethodTranscode,
+			Reason:        "Server audio transcode",
+		}
+	}
 
 	containerOK, videoOK, audioOK := checkProfileCompatibility(src.Container, videoCodec, audioCodec, req.DeviceProfile)
 
@@ -285,6 +314,32 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 		PlayMethod:    PlayMethodTranscode,
 		Reason:        reason,
 	}
+}
+
+func checkAudioProfileCompatibility(container, audioCodec string, profile *DeviceProfile) (containerOK, audioOK bool) {
+	if profile == nil || len(profile.DirectPlayProfiles) == 0 {
+		return true, true
+	}
+	container = strings.ToLower(container)
+	audioCodec = strings.ToLower(audioCodec)
+
+	for _, dp := range profile.DirectPlayProfiles {
+		if dp.Type != "" && !strings.EqualFold(dp.Type, "Audio") {
+			continue
+		}
+		cMatch := dp.Container == "" || csvContains(dp.Container, container)
+		aMatch := dp.AudioCodec == "" || audioCodec == "" || csvContains(dp.AudioCodec, audioCodec)
+		if cMatch && aMatch {
+			return true, true
+		}
+		if cMatch {
+			containerOK = true
+		}
+		if aMatch {
+			audioOK = true
+		}
+	}
+	return containerOK, audioOK
 }
 
 func checkProfileCompatibility(container, videoCodec, audioCodec string, profile *DeviceProfile) (containerOK, videoOK, audioOK bool) {
