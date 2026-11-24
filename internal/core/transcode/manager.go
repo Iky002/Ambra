@@ -93,6 +93,19 @@ func BuildFFmpegArgs(params SessionParams, startSeg int, outDir string, caps *HW
 		"-y",
 	}
 
+	isVideoCopy := strings.EqualFold(params.VideoCodec, "copy")
+	var encoder string
+	if !isVideoCopy {
+		encoder = caps.SelectVideoEncoder(params.VideoCodec)
+		if strings.HasSuffix(encoder, "_vaapi") {
+			vaapiDev := "/dev/dri/renderD128"
+			if caps != nil && caps.VAAPIDevice != "" {
+				vaapiDev = caps.VAAPIDevice
+			}
+			args = append(args, "-vaapi_device", vaapiDev)
+		}
+	}
+
 	// Fast input seek when starting from a non-zero segment
 	if startSec > 0 {
 		args = append(args, "-ss", strconv.Itoa(startSec))
@@ -121,14 +134,13 @@ func BuildFFmpegArgs(params SessionParams, startSeg int, outDir string, caps *HW
 	args = append(args, "-sn")
 
 	// Video encoding: DirectStream (-c:v copy) vs Transcode
-	isVideoCopy := strings.EqualFold(params.VideoCodec, "copy")
 	if isVideoCopy {
 		args = append(args, "-c:v", "copy")
 	} else {
-		encoder := caps.SelectVideoEncoder(params.VideoCodec)
 		args = append(args, "-c:v", encoder)
 
-		// Optional scaling filter
+		// Optional scaling filter + VAAPI hardware upload filter
+		var vfParts []string
 		if params.MaxWidth > 0 || params.MaxHeight > 0 {
 			w := params.MaxWidth
 			h := params.MaxHeight
@@ -138,7 +150,13 @@ func BuildFFmpegArgs(params SessionParams, startSeg int, outDir string, caps *HW
 			if h <= 0 {
 				h = -2
 			}
-			args = append(args, "-vf", fmt.Sprintf("scale='min(%d,iw)':'min(%d,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2", w, h))
+			vfParts = append(vfParts, fmt.Sprintf("scale='min(%d,iw)':'min(%d,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2", w, h))
+		}
+		if strings.HasSuffix(encoder, "_vaapi") {
+			vfParts = append(vfParts, "format=nv12,hwupload")
+		}
+		if len(vfParts) > 0 {
+			args = append(args, "-vf", strings.Join(vfParts, ","))
 		}
 
 		// Pixel format & encoder presets
@@ -458,15 +476,17 @@ type transcodeSession struct {
 	params     SessionParams
 	workDir    string
 
-	mu         sync.Mutex
-	cmd        *exec.Cmd
-	cancel     context.CancelFunc
-	doneCh     chan struct{}
-	lastErr    error
-	stderrBuf  *bytes.Buffer
-	startSeg   int
-	running    bool
-	lastAccess time.Time
+	mu            sync.Mutex
+	cmd           *exec.Cmd
+	cancel        context.CancelFunc
+	doneCh        chan struct{}
+	lastErr       error
+	stderrBuf     *bytes.Buffer
+	startSeg      int
+	running       bool
+	usingHW       bool
+	forceSoftware bool
+	lastAccess    time.Time
 }
 
 func (s *transcodeSession) touch() {
@@ -565,6 +585,7 @@ func (s *transcodeSession) getSegment(ctx context.Context, segIndex int, getCaps
 	ticker := time.NewTicker(defaultPollInterval)
 	defer ticker.Stop()
 
+	retriedSoftware := false
 	for {
 		if fileReady(targetPath) {
 			s.touch()
@@ -585,6 +606,19 @@ func (s *transcodeSession) getSegment(ctx context.Context, segIndex int, getCaps
 				errMsg = strings.TrimSpace(s.stderrBuf.String())
 			}
 			procErr := s.lastErr
+			wasHW := s.usingHW
+			if procErr != nil && wasHW && !retriedSoftware {
+				retriedSoftware = true
+				s.forceSoftware = true
+				s.stopProcessLocked()
+				if err := s.startProcessLocked(segIndex, SoftwareOnlyCapabilities()); err != nil {
+					s.mu.Unlock()
+					return "", err
+				}
+				doneCh = s.doneCh
+				s.mu.Unlock()
+				continue
+			}
 			s.mu.Unlock()
 			if procErr != nil {
 				return "", fmt.Errorf("ffmpeg exited before producing segment %d: %w (%s)", segIndex, procErr, errMsg)
@@ -594,6 +628,13 @@ func (s *transcodeSession) getSegment(ctx context.Context, segIndex int, getCaps
 			s.touch()
 		}
 	}
+}
+
+func isHardwareEncoder(enc string) bool {
+	if enc == "" || strings.EqualFold(enc, "copy") {
+		return false
+	}
+	return !strings.HasPrefix(strings.ToLower(enc), "libx")
 }
 
 func (s *transcodeSession) startProcessLocked(startSeg int, caps *HWCapabilities) error {
@@ -609,7 +650,13 @@ func (s *transcodeSession) startProcessLocked(startSeg int, caps *HWCapabilities
 		}
 	}
 
-	args := BuildFFmpegArgs(s.params, startSeg, s.workDir, caps)
+	effectiveCaps := caps
+	if s.forceSoftware {
+		effectiveCaps = SoftwareOnlyCapabilities()
+	}
+	usingHW := !strings.EqualFold(s.params.VideoCodec, "copy") && isHardwareEncoder(effectiveCaps.SelectVideoEncoder(s.params.VideoCodec))
+
+	args := BuildFFmpegArgs(s.params, startSeg, s.workDir, effectiveCaps)
 	procCtx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(procCtx, s.ffmpegPath, args...)
 
@@ -628,6 +675,7 @@ func (s *transcodeSession) startProcessLocked(startSeg int, caps *HWCapabilities
 	s.stderrBuf = stderrBuf
 	s.startSeg = startSeg
 	s.running = true
+	s.usingHW = usingHW
 	s.lastErr = nil
 	s.lastAccess = time.Now()
 

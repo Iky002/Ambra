@@ -61,6 +61,11 @@ func New(
 	}
 }
 
+// SetExtractor overrides the embedded subtitle & font extractor used by compatmedia endpoints.
+func (h *Handler) SetExtractor(ext *transcode.Extractor) {
+	h.extractor = ext
+}
+
 // BuildRouter builds an isolated chi.Router containing all 21 media-domain route prefixes
 // with zero ServeMux wildcard conflicts.
 func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {

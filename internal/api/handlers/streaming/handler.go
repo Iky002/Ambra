@@ -17,6 +17,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/core/imaging"
 	"github.com/ambra-media/ambra/internal/core/playback"
+	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
@@ -34,6 +35,7 @@ type Handler struct {
 	repo       *sqlite.LibraryRepo
 	engine     *playback.Engine
 	imaging    *imaging.Service
+	extractor  *transcode.Extractor
 	httpClient *http.Client
 	auth       AuthFuncs
 }
@@ -49,6 +51,11 @@ func New(repo *sqlite.LibraryRepo, engine *playback.Engine, img *imaging.Service
 			},
 		},
 	}
+}
+
+// SetExtractor configures the embedded subtitle extractor used when a requested subtitle stream is not external.
+func (h *Handler) SetExtractor(ext *transcode.Extractor) {
+	h.extractor = ext
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
@@ -246,17 +253,58 @@ func (h *Handler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	var subPath string
+	var (
+		foundStream sqlite.MediaStreamRecord
+		found       bool
+		sourceID    string
+		sourcePath  string
+	)
 	for _, s := range sources {
 		if msID != "" && guid.Normalize(s.ID) != msID {
 			continue
 		}
 		for _, st := range s.Streams {
-			if st.StreamType == "Subtitle" && st.StreamIndex == streamIdx {
-				subPath = st.Path
+			if strings.EqualFold(st.StreamType, "Subtitle") && st.StreamIndex == streamIdx {
+				foundStream = st
+				found = true
+				sourceID = s.ID
+				sourcePath = s.Path
 				break
 			}
 		}
+		if found {
+			break
+		}
+	}
+	if !found {
+		httpx.Error(w, http.StatusNotFound, "subtitle stream not found")
+		return
+	}
+
+	subPath := foundStream.Path
+	if !foundStream.IsExternal && subPath == "" {
+		if h.extractor == nil {
+			httpx.Error(w, http.StatusNotFound, "subtitle stream not found")
+			return
+		}
+		mediaPath := sourcePath
+		if mediaPath == "" {
+			mediaPath, _ = h.resolveMediaPath(r.Context(), itemID, sourceID)
+		}
+		if mediaPath == "" {
+			httpx.Error(w, http.StatusNotFound, "media file not found for subtitle extraction")
+			return
+		}
+		extractExt := targetFormat
+		if extractExt == "" {
+			extractExt = foundStream.Codec
+		}
+		extractedPath, err := h.extractor.ExtractSubtitle(r.Context(), mediaPath, itemID, sourceID, foundStream.StreamIndex, extractExt)
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		subPath = extractedPath
 	}
 	if subPath == "" {
 		httpx.Error(w, http.StatusNotFound, "subtitle stream not found")

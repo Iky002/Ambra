@@ -14,6 +14,7 @@ import (
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/imaging"
 	"github.com/ambra-media/ambra/internal/core/playback"
+	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/plugins/strm"
@@ -312,5 +313,120 @@ func TestStreamingLibraryCoverFallback(t *testing.T) {
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Items/"+lib.ID+"/Images/Primary", nil))
 	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), backdropBytes) {
 		t.Fatalf("expected 200 Backdrop fallback, got code=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestStreamingEmbeddedSubtitleExtractionAndVTT(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(tmp, "embsub.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// Create a fake ffmpeg executable that writes extracted subtitle content to its last argument
+	fakeFFmpeg := filepath.Join(tmp, "fake-ffmpeg.sh")
+	script := `#!/bin/sh
+out=""
+for arg in "$@"; do out="$arg"; done
+case "$out" in
+  *fail_item*)
+    echo "simulated ffmpeg error" >&2
+    exit 1
+    ;;
+  *.vtt)
+    printf 'WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nEmbedded VTT Line\n' > "$out"
+    ;;
+  *.ass)
+    printf '[Script Info]\nTitle: Test\n[Events]\nDialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,Embedded ASS Line\n' > "$out"
+    ;;
+  *)
+    printf '1\n00:00:01,000 --> 00:00:03,000\nEmbedded SRT Line\n' > "$out"
+    ;;
+esac
+`
+	if err := os.WriteFile(fakeFFmpeg, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	repo := sqlite.NewLibraryRepo(store)
+	cfg := config.Default(tmp)
+	cfg.FFmpegPath = fakeFFmpeg
+	engine := playback.New(repo, plugins.NewRegistry(), cfg)
+	imgSvc := imaging.New(repo)
+
+	mux := http.NewServeMux()
+	h := New(repo, engine, imgSvc)
+	h.RegisterRoutes(mux, AuthFuncs{})
+
+	ctx := context.Background()
+	mkvPath := filepath.Join(tmp, "movie.mkv")
+	_ = os.WriteFile(mkvPath, []byte("fake-mkv"), 0o644)
+
+	itemID := guid.New()
+	msID := guid.New()
+	_ = repo.UpsertItem(ctx, &sqlite.ItemRecord{
+		ID:        itemID,
+		LibraryID: "lib1",
+		Type:      "Movie",
+		Name:      "Embedded Sub Movie",
+		Container: "mkv",
+		Path:      mkvPath,
+	})
+	_ = repo.ReplaceMediaSourcesAndStreams(ctx, itemID, []sqlite.MediaSourceRecord{{
+		ID:        msID,
+		ItemID:    itemID,
+		Name:      "Embedded Sub Movie",
+		Path:      mkvPath,
+		Container: "mkv",
+		Streams: []sqlite.MediaStreamRecord{
+			{MediaSourceID: msID, ItemID: itemID, StreamIndex: 2, StreamType: "Subtitle", Codec: "subrip", IsExternal: false, Path: ""},
+		},
+	}})
+
+	// 1. Without extractor configured -> 404
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Videos/"+itemID+"/"+msID+"/Subtitles/2/Stream.vtt", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 when extractor is nil, got %d", rec.Code)
+	}
+
+	// 2. Wire extractor -> VTT, ASS, and JS JSON conversion all succeed
+	h.SetExtractor(transcode.NewExtractor(cfg))
+
+	recVTT := httptest.NewRecorder()
+	mux.ServeHTTP(recVTT, httptest.NewRequest(http.MethodGet, "/Videos/"+itemID+"/"+msID+"/Subtitles/2/Stream.vtt", nil))
+	if recVTT.Code != http.StatusOK || !strings.Contains(recVTT.Body.String(), "Embedded VTT Line") || !strings.HasPrefix(recVTT.Header().Get("Content-Type"), "text/vtt") {
+		t.Fatalf("expected 200 VTT, got code=%d ct=%q body=%q", recVTT.Code, recVTT.Header().Get("Content-Type"), recVTT.Body.String())
+	}
+
+	recASS := httptest.NewRecorder()
+	mux.ServeHTTP(recASS, httptest.NewRequest(http.MethodGet, "/Videos/"+itemID+"/"+msID+"/Subtitles/2/Stream.ass", nil))
+	if recASS.Code != http.StatusOK || !strings.Contains(recASS.Body.String(), "Embedded ASS Line") || !strings.HasPrefix(recASS.Header().Get("Content-Type"), "text/x-ssa") {
+		t.Fatalf("expected 200 ASS, got code=%d ct=%q body=%q", recASS.Code, recASS.Header().Get("Content-Type"), recASS.Body.String())
+	}
+
+	recJS := httptest.NewRecorder()
+	mux.ServeHTTP(recJS, httptest.NewRequest(http.MethodGet, "/Videos/"+itemID+"/"+msID+"/Subtitles/2/Stream.js", nil))
+	if recJS.Code != http.StatusOK || !strings.Contains(recJS.Body.String(), "Embedded SRT Line") || !strings.HasPrefix(recJS.Header().Get("Content-Type"), "application/json") {
+		t.Fatalf("expected 200 JS JSON, got code=%d ct=%q body=%q", recJS.Code, recJS.Header().Get("Content-Type"), recJS.Body.String())
+	}
+
+	// 3. Extraction error -> 500
+	failID := "fail_item_01"
+	failMS := "ms_fail_01"
+	_ = repo.UpsertItem(ctx, &sqlite.ItemRecord{
+		ID: failID, LibraryID: "lib1", Type: "Movie", Name: "Fail", Container: "mkv", Path: mkvPath,
+	})
+	_ = repo.ReplaceMediaSourcesAndStreams(ctx, failID, []sqlite.MediaSourceRecord{{
+		ID: failMS, ItemID: failID, Name: "Fail", Path: mkvPath, Container: "mkv",
+		Streams: []sqlite.MediaStreamRecord{
+			{MediaSourceID: failMS, ItemID: failID, StreamIndex: 2, StreamType: "Subtitle", Codec: "subrip", IsExternal: false, Path: ""},
+		},
+	}})
+	recErr := httptest.NewRecorder()
+	mux.ServeHTTP(recErr, httptest.NewRequest(http.MethodGet, "/Videos/"+failID+"/"+failMS+"/Subtitles/2/Stream.vtt", nil))
+	if recErr.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 on ffmpeg failure, got %d", recErr.Code)
 	}
 }

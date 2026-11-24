@@ -54,7 +54,20 @@ qsv
 		t.Fatalf("expected hevc_videotoolbox on darwin, got %s", macCaps.PreferredHEVCEncoder)
 	}
 
-	// Linux should skip videotoolbox and prefer nvenc > qsv > vaapi
+	// Linux should skip videotoolbox and prefer nvenc > qsv > vaapi when devices exist
+	origCheck := checkFileFn
+	checkFileFn = func(pattern string) []string {
+		switch pattern {
+		case "/dev/nvidia0":
+			return []string{"/dev/nvidia0"}
+		case "/dev/dri/renderD*":
+			return []string{"/dev/dri/renderD128"}
+		default:
+			return nil
+		}
+	}
+	defer func() { checkFileFn = origCheck }()
+
 	linuxCaps := BuildHWCapabilities([]string{"cuda", "vaapi"}, encs, "linux")
 	if linuxCaps.PreferredH264Encoder != "h264_nvenc" {
 		t.Fatalf("expected h264_nvenc on linux with cuda, got %s", linuxCaps.PreferredH264Encoder)
@@ -372,5 +385,142 @@ func TestRealFFmpegProbeTranscodeAndSubtitleExtract(t *testing.T) {
 	rawSub, err := os.ReadFile(subOut)
 	if err != nil || !strings.Contains(string(rawSub), "Hello Ambra") {
 		t.Fatalf("unexpected extracted subtitle content: %q err=%v", string(rawSub), err)
+	}
+}
+
+func TestLinuxHWDeviceVerificationAndVAAPIArgs(t *testing.T) {
+	origCheck := checkFileFn
+	defer func() { checkFileFn = origCheck }()
+
+	encs := map[string]bool{
+		"h264_nvenc": true,
+		"hevc_nvenc": true,
+		"h264_qsv":   true,
+		"h264_vaapi": true,
+		"hevc_vaapi": true,
+		"libx264":    true,
+		"libx265":    true,
+	}
+
+	// 1. No /dev/dri and no /dev/nvidia* -> clean software fallback
+	checkFileFn = func(string) []string { return nil }
+	noDevCaps := BuildHWCapabilities([]string{"cuda", "qsv", "vaapi"}, encs, "linux")
+	if noDevCaps.PreferredH264Encoder != "libx264" || noDevCaps.PreferredHEVCEncoder != "libx265" || noDevCaps.PreferredHWAccel != "" {
+		t.Fatalf("expected software fallback when no Linux devices exist, got %+v", noDevCaps)
+	}
+
+	// 2. Only /dev/dri/renderD129 present -> VAAPI enabled with VAAPIDevice set
+	checkFileFn = func(pattern string) []string {
+		if pattern == "/dev/dri/renderD*" {
+			return []string{"/dev/dri/renderD129"}
+		}
+		return nil
+	}
+	vaapiCaps := BuildHWCapabilities([]string{"cuda", "vaapi"}, encs, "linux")
+	if vaapiCaps.PreferredH264Encoder != "h264_vaapi" || vaapiCaps.VAAPIDevice != "/dev/dri/renderD129" {
+		t.Fatalf("expected h264_vaapi on /dev/dri/renderD129, got enc=%s dev=%s", vaapiCaps.PreferredH264Encoder, vaapiCaps.VAAPIDevice)
+	}
+
+	// Verify BuildFFmpegArgs emits -vaapi_device before -i and format=nv12,hwupload filter
+	vaapiArgs := BuildFFmpegArgs(SessionParams{
+		InputPath: "/media/video.mkv",
+		VideoCodec: "h264",
+		AudioCodec: "aac",
+		MaxWidth:   1280,
+		MaxHeight:  720,
+	}, 0, "/tmp/vaapi-out", vaapiCaps)
+	vaapiJoined := strings.Join(vaapiArgs, " ")
+	idxDev := slices.Index(vaapiArgs, "-vaapi_device")
+	idxIn := slices.Index(vaapiArgs, "-i")
+	if idxDev < 0 || idxDev >= idxIn || vaapiArgs[idxDev+1] != "/dev/dri/renderD129" {
+		t.Fatalf("expected -vaapi_device /dev/dri/renderD129 before -i, got: %s", vaapiJoined)
+	}
+	if !strings.Contains(vaapiJoined, "format=nv12,hwupload") || !strings.Contains(vaapiJoined, "scale=") {
+		t.Fatalf("expected scale + format=nv12,hwupload in -vf, got: %s", vaapiJoined)
+	}
+
+	// VAAPI without scaling still adds -vf format=nv12,hwupload and defaults device to /dev/dri/renderD128
+	vaapiNoScale := BuildFFmpegArgs(SessionParams{
+		InputPath:  "/media/video.mkv",
+		VideoCodec: "hevc",
+	}, 0, "/tmp/vaapi-out2", &HWCapabilities{PreferredHEVCEncoder: "hevc_vaapi"})
+	noScaleJoined := strings.Join(vaapiNoScale, " ")
+	if !strings.Contains(noScaleJoined, "-vaapi_device /dev/dri/renderD128") || !strings.Contains(noScaleJoined, "-vf format=nv12,hwupload") {
+		t.Fatalf("expected default vaapi device and hwupload filter, got: %s", noScaleJoined)
+	}
+
+	// SoftwareOnlyCapabilities helper
+	sw := SoftwareOnlyCapabilities()
+	if sw.PreferredH264Encoder != "libx264" || sw.PreferredHEVCEncoder != "libx265" || !sw.FFmpegAvailable {
+		t.Fatalf("unexpected SoftwareOnlyCapabilities: %+v", sw)
+	}
+}
+
+func TestTranscodeHardwareFailureFallsBackToSoftwareLibx264(t *testing.T) {
+	tmpDir := t.TempDir()
+	fakeFFmpeg := filepath.Join(tmpDir, "fake-ffmpeg-fallback.sh")
+	callsLog := filepath.Join(tmpDir, "calls.log")
+
+	// Script fails immediately for any non-libx264 encoder, succeeds and writes seg_0.ts for libx264
+	script := `#!/bin/sh
+echo "$*" >> "` + callsLog + `"
+encoder=""
+segpattern=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-c:v" ]; then encoder="$arg"; fi
+  if [ "$prev" = "-hls_segment_filename" ]; then segpattern="$arg"; fi
+  prev="$arg"
+done
+if [ "$encoder" != "libx264" ]; then
+  echo "hardware encoder $encoder failed: device busy" >&2
+  exit 1
+fi
+seg0=$(echo "$segpattern" | sed 's/%d/0/')
+printf 'FAKE_TS_SEGMENT_DATA' > "$seg0"
+exit 0
+`
+	if err := os.WriteFile(fakeFFmpeg, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Default(tmpDir)
+	cfg.FFmpegPath = fakeFFmpeg
+	hwCaps := &HWCapabilities{
+		FFmpegAvailable:      true,
+		Platform:             "linux",
+		PreferredHWAccel:     "vaapi",
+		PreferredH264Encoder: "h264_vaapi",
+		VAAPIDevice:          "/dev/dri/renderD128",
+	}
+	mgr := NewManager(cfg, WithCapabilities(hwCaps))
+	defer mgr.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	segPath, err := mgr.GetSegment(ctx, SessionParams{
+		PlaySessionID: "hw-fallback-sess",
+		DeviceID:      "dev-hw",
+		ItemID:        "item-hw",
+		InputPath:     "/media/movie.mkv",
+		VideoCodec:    "h264",
+		AudioCodec:    "aac",
+	}, 0)
+	if err != nil {
+		t.Fatalf("expected automatic software fallback to succeed, got error: %v", err)
+	}
+	data, err := os.ReadFile(segPath)
+	if err != nil || string(data) != "FAKE_TS_SEGMENT_DATA" {
+		t.Fatalf("unexpected segment data: %q err=%v", string(data), err)
+	}
+
+	callsBytes, err := os.ReadFile(callsLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := string(callsBytes)
+	if !strings.Contains(calls, "-c:v h264_vaapi") || !strings.Contains(calls, "-c:v libx264") {
+		t.Fatalf("expected first attempt with h264_vaapi and retry with libx264, got:\n%s", calls)
 	}
 }

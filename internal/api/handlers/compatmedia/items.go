@@ -18,6 +18,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/core/playback"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
@@ -630,32 +631,81 @@ func (h *Handler) handleSubtitleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	format := strings.TrimPrefix(streamFile, "stream.")
 
-	var subPath string
-	if h.store != nil {
-		var p sql.NullString
-		err := h.store.Reader.QueryRowContext(r.Context(), `
-			SELECT path FROM item_media_streams
-			WHERE item_id = ? AND stream_index = ? AND LOWER(stream_type) = 'subtitle'
-			  AND (? = '' OR media_source_id = ?)
-			LIMIT 1`, itemID, idx, mediaSourceID, mediaSourceID).Scan(&p)
-		if err == nil && p.Valid {
-			subPath = p.String
-		}
+	var startTicks int64
+	if rawTicks := chi.URLParam(r, "StartPositionTicks"); rawTicks != "" {
+		startTicks, _ = strconv.ParseInt(rawTicks, 10, 64)
+	} else {
+		startTicks = httpx.ParseQuery(r).Int64("StartPositionTicks", 0)
 	}
 
-	if subPath != "" {
-		if data, err := os.ReadFile(subPath); err == nil {
-			ct := subtitleContentType(format)
-			w.Header().Set("Content-Type", ct)
-			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-			w.WriteHeader(http.StatusOK)
-			if r.Method != http.MethodHead {
-				_, _ = w.Write(data)
-			}
+	if h.store == nil {
+		httpx.Error(w, http.StatusNotFound, "subtitle stream not found")
+		return
+	}
+	var (
+		p          sql.NullString
+		isExternal int
+		codec      sql.NullString
+		rowMSID    sql.NullString
+	)
+	err = h.store.Reader.QueryRowContext(r.Context(), `
+		SELECT path, is_external, codec, media_source_id FROM item_media_streams
+		WHERE item_id = ? AND stream_index = ? AND LOWER(stream_type) = 'subtitle'
+		  AND (? = '' OR media_source_id = ?)
+		LIMIT 1`, itemID, idx, mediaSourceID, mediaSourceID).Scan(&p, &isExternal, &codec, &rowMSID)
+	if err != nil {
+		httpx.Error(w, http.StatusNotFound, "subtitle stream not found")
+		return
+	}
+
+	subPath := p.String
+	effectiveMSID := mediaSourceID
+	if effectiveMSID == "" && rowMSID.Valid {
+		effectiveMSID = rowMSID.String
+	}
+
+	if isExternal == 0 && subPath == "" {
+		if h.extractor == nil {
+			httpx.Error(w, http.StatusNotFound, "subtitle stream not found")
 			return
 		}
+		mediaPath := h.resolveMediaSourcePath(r.Context(), itemID, effectiveMSID)
+		if mediaPath == "" {
+			httpx.Error(w, http.StatusNotFound, "media file not found for subtitle extraction")
+			return
+		}
+		extractExt := format
+		if extractExt == "" {
+			extractExt = codec.String
+		}
+		extractedPath, err := h.extractor.ExtractSubtitle(r.Context(), mediaPath, itemID, effectiveMSID, idx, extractExt)
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		subPath = extractedPath
 	}
-	httpx.Error(w, http.StatusNotFound, "subtitle stream not found")
+	if subPath == "" {
+		httpx.Error(w, http.StatusNotFound, "subtitle stream not found")
+		return
+	}
+
+	ct, data, err := playback.ServeSubtitle(subPath, format, startTicks)
+	if err != nil {
+		if os.IsNotExist(err) {
+			httpx.Error(w, http.StatusNotFound, "subtitle file missing")
+			return
+		}
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(data)
+	}
 }
 
 func subtitleContentType(format string) string {

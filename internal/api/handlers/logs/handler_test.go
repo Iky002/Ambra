@@ -1,13 +1,16 @@
 package logs
 
 import (
+	"bytes"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/config"
@@ -79,5 +82,73 @@ func TestLogsHandlerAndTraversalProtection(t *testing.T) {
 		if rec.Code == http.StatusOK {
 			t.Fatalf("expected traversal attempt %q to be rejected, got 200: %s", bad, rec.Body.String())
 		}
+	}
+}
+
+func TestMultiSlogHandlerBridgeAndFilePersistence(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := config.Default(tmp)
+	h := New(cfg)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, AuthFuncs{})
+
+	fixedDay := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	logFilePath := DailyLogFilePath(tmp, fixedDay)
+	if !strings.HasSuffix(logFilePath, filepath.Join("logs", "ambra-2026-11-24.log")) {
+		t.Fatalf("unexpected daily log path: %s", logFilePath)
+	}
+	if DailyLogFilePath("", fixedDay) != "" {
+		t.Fatalf("expected empty daily log path for empty dataDir")
+	}
+
+	var stdoutBuf bytes.Buffer
+	bridge := NewMultiSlogHandler(&stdoutBuf, nil, logFilePath).WithLevel(slog.LevelDebug)
+	bridge.SetLogsHandler(h)
+	defer func() { _ = bridge.Close() }()
+
+	logger := slog.New(bridge).With("component", "transcode").WithGroup("req")
+	logger.Info("server started", "addr", ":8096", "note", "hello world")
+	logger.Warn("fallback engaged", "encoder", "libx264")
+	logger.Debug("trace detail", "id", 42)
+
+	// 1. Verify stdout output formatting
+	outStr := stdoutBuf.String()
+	if !strings.Contains(outStr, "[INFO] server started") ||
+		!strings.Contains(outStr, "req.component=transcode") ||
+		!strings.Contains(outStr, `req.note="hello world"`) ||
+		!strings.Contains(outStr, "[WARN] fallback engaged req.component=transcode req.encoder=libx264") ||
+		!strings.Contains(outStr, "[DEBUG] trace detail") {
+		t.Fatalf("unexpected formatted stdout log:\n%s", outStr)
+	}
+
+	// 2. Verify GET /System/Logs lists ambra-2026-11-24.log and GET /System/Logs/{Name} serves it
+	recList := httptest.NewRecorder()
+	mux.ServeHTTP(recList, httptest.NewRequest(http.MethodGet, "/System/Logs", nil))
+	var list []LogFileDto
+	_ = json.Unmarshal(recList.Body.Bytes(), &list)
+	if len(list) != 1 || list[0].Name != "ambra-2026-11-24.log" {
+		t.Fatalf("expected ambra-2026-11-24.log in /System/Logs, got %+v", list)
+	}
+
+	recFile := httptest.NewRecorder()
+	mux.ServeHTTP(recFile, httptest.NewRequest(http.MethodGet, "/System/Logs/ambra-2026-11-24.log", nil))
+	if recFile.Code != http.StatusOK || !strings.Contains(recFile.Body.String(), "server started") || !strings.Contains(recFile.Body.String(), "fallback engaged") {
+		t.Fatalf("expected persisted log content, got code=%d body=%q", recFile.Code, recFile.Body.String())
+	}
+
+	// 3. Verify in-memory runtime buffer also received the bridged lines
+	h.mu.RLock()
+	joinedMem := strings.Join(h.runtimeLines, "\n")
+	h.mu.RUnlock()
+	if !strings.Contains(joinedMem, "server started") || !strings.Contains(joinedMem, "fallback engaged") {
+		t.Fatalf("expected in-memory runtimeLines to receive bridged logs, got:\n%s", joinedMem)
+	}
+
+	// 4. Close is idempotent
+	if err := bridge.Close(); err != nil {
+		t.Fatalf("first Close failed: %v", err)
+	}
+	if err := bridge.Close(); err != nil {
+		t.Fatalf("second Close failed: %v", err)
 	}
 }

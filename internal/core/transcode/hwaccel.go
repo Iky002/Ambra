@@ -3,12 +3,34 @@ package transcode
 import (
 	"bytes"
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 )
+
+// checkFileFn verifies whether a hardware device path or glob pattern exists on the host.
+// It returns sorted matching paths when found, or nil otherwise. Injectable for unit tests.
+var checkFileFn = defaultCheckFile
+
+func defaultCheckFile(pattern string) []string {
+	if strings.ContainsAny(pattern, "*?[") {
+		matches, err := filepath.Glob(pattern)
+		if err != nil || len(matches) == 0 {
+			return nil
+		}
+		sort.Strings(matches)
+		return matches
+	}
+	if _, err := os.Stat(pattern); err == nil {
+		return []string{pattern}
+	}
+	return nil
+}
 
 // CodecInfo mirrors Emby's /Encoding/CodecInformation/Video entry structure.
 type CodecInfo struct {
@@ -31,15 +53,24 @@ type CodecInfo struct {
 
 // HWCapabilities summarizes detected FFmpeg hardware acceleration and encoder capabilities.
 type HWCapabilities struct {
-	FFmpegAvailable      bool              `json:"FFmpegAvailable"`
-	Platform             string            `json:"Platform"`
-	AvailableHWAccels    []string          `json:"AvailableHWAccels"`
-	AvailableEncoders    map[string]bool   `json:"AvailableEncoders"`
-	PreferredHWAccel     string            `json:"PreferredHWAccel"`
-	PreferredH264Encoder string            `json:"PreferredH264Encoder"`
-	PreferredHEVCEncoder string            `json:"PreferredHEVCEncoder"`
-	Codecs               []CodecInfo       `json:"Codecs"`
-	ProbedAt             time.Time         `json:"ProbedAt"`
+	FFmpegAvailable      bool            `json:"FFmpegAvailable"`
+	Platform             string          `json:"Platform"`
+	AvailableHWAccels    []string        `json:"AvailableHWAccels"`
+	AvailableEncoders    map[string]bool `json:"AvailableEncoders"`
+	PreferredHWAccel     string          `json:"PreferredHWAccel"`
+	PreferredH264Encoder string          `json:"PreferredH264Encoder"`
+	PreferredHEVCEncoder string          `json:"PreferredHEVCEncoder"`
+	VAAPIDevice          string          `json:"VAAPIDevice,omitempty"`
+	Codecs               []CodecInfo     `json:"Codecs"`
+	ProbedAt             time.Time       `json:"ProbedAt"`
+}
+
+// SoftwareOnlyCapabilities returns a software-only HWCapabilities (libx264 / libx265)
+// used as a safe fallback when hardware encoders are unavailable or fail at runtime.
+func SoftwareOnlyCapabilities() *HWCapabilities {
+	caps := BuildHWCapabilities(nil, map[string]bool{"libx264": true, "libx265": true}, runtime.GOOS)
+	caps.FFmpegAvailable = true
+	return caps
 }
 
 // SelectVideoEncoder chooses the best available encoder for the requested target codec ("h264" or "hevc").
@@ -261,6 +292,22 @@ func BuildHWCapabilities(accels []string, encoders map[string]bool, goos string)
 	for _, cand := range hwCandidates {
 		if cand.onlyOS != "" && cand.onlyOS != goos {
 			continue
+		}
+		if goos == "linux" {
+			switch cand.accel {
+			case "vaapi", "qsv":
+				nodes := checkFileFn("/dev/dri/renderD*")
+				if len(nodes) == 0 {
+					continue
+				}
+				if caps.VAAPIDevice == "" {
+					caps.VAAPIDevice = nodes[0]
+				}
+			case "cuda":
+				if len(checkFileFn("/dev/nvidia0")) == 0 && len(checkFileFn("/dev/nvidiactl")) == 0 {
+					continue
+				}
+			}
 		}
 		hasAccel := accelSet[cand.accel] ||
 			(cand.accel == "cuda" && accelSet["nvdec"]) ||

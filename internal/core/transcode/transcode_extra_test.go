@@ -108,7 +108,15 @@ func TestHWAccelAndDetectorExtra(t *testing.T) {
 	if !encs["srt"] || len(encs) != 1 {
 		t.Fatalf("unexpected parsed encoders: %v", encs)
 	}
-	// BuildHWCapabilities with nil encoders and nvdec alias
+	// BuildHWCapabilities with nil encoders and nvdec alias (with simulated NVIDIA device)
+	origCheck := checkFileFn
+	checkFileFn = func(pattern string) []string {
+		if pattern == "/dev/nvidiactl" {
+			return []string{"/dev/nvidiactl"}
+		}
+		return nil
+	}
+	defer func() { checkFileFn = origCheck }()
 	nvCaps := BuildHWCapabilities([]string{"nvdec"}, map[string]bool{"h264_nvenc": true, "hevc_nvenc": true}, "linux")
 	if nvCaps.PreferredH264Encoder != "h264_nvenc" || nvCaps.PreferredHEVCEncoder != "hevc_nvenc" {
 		t.Fatalf("expected nvdec to enable nvenc, got %+v", nvCaps)
