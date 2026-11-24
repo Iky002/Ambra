@@ -340,15 +340,17 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 	forceTV := strings.EqualFold(lib.CollectionType, "tvshows")
 	seriesCache := make(map[string]*sqlite.ItemRecord)
 	seasonCache := make(map[string]*sqlite.ItemRecord)
+	artistCache := make(map[string]*sqlite.ItemRecord)
+	albumCache := make(map[string]*sqlite.ItemRecord)
 	seenSeriesEnrich := make(map[string]struct{})
 
 	var tasks []enrichTask
 	if !info.IsDir() {
-		if !strings.HasPrefix(filepath.Base(cleanTarget), ".") && (IsVideoFile(cleanTarget) || IsStrmFile(cleanTarget)) {
+		if !strings.HasPrefix(filepath.Base(cleanTarget), ".") && (IsVideoFile(cleanTarget) || IsStrmFile(cleanTarget) || IsAudioFile(cleanTarget)) {
 			if err := s.waitIfPaused(ctx); err != nil {
 				return stats, err
 			}
-			itemTasks := s.processDiscoveredFile(ctx, lib, root, cleanTarget, forceTV, seriesCache, seasonCache, seenSeriesEnrich, &stats)
+			itemTasks := s.processDiscoveredFile(ctx, lib, root, cleanTarget, forceTV, seriesCache, seasonCache, artistCache, albumCache, seenSeriesEnrich, &stats)
 			tasks = append(tasks, itemTasks...)
 		}
 	} else {
@@ -408,6 +410,8 @@ func (s *Scanner) runPhaseAWithRoot(ctx context.Context, lib *sqlite.LibraryReco
 	forceTV := strings.EqualFold(lib.CollectionType, "tvshows")
 	seriesCache := make(map[string]*sqlite.ItemRecord)
 	seasonCache := make(map[string]*sqlite.ItemRecord)
+	artistCache := make(map[string]*sqlite.ItemRecord)
+	albumCache := make(map[string]*sqlite.ItemRecord)
 	seenSeriesEnrich := make(map[string]struct{})
 	policy := s.currentSymlinkPolicy()
 
@@ -432,14 +436,14 @@ func (s *Scanner) runPhaseAWithRoot(ctx context.Context, lib *sqlite.LibraryReco
 		if strings.HasPrefix(name, ".") {
 			return nil
 		}
-		if !IsVideoFile(path) && !IsStrmFile(path) {
+		if !IsVideoFile(path) && !IsStrmFile(path) && !IsAudioFile(path) {
 			return nil
 		}
 
 		if discovered != nil {
 			discovered[filepath.Clean(path)] = struct{}{}
 		}
-		itemTasks := s.processDiscoveredFile(ctx, lib, logicalRoot, path, forceTV, seriesCache, seasonCache, seenSeriesEnrich, stats)
+		itemTasks := s.processDiscoveredFile(ctx, lib, logicalRoot, path, forceTV, seriesCache, seasonCache, artistCache, albumCache, seenSeriesEnrich, stats)
 		tasks = append(tasks, itemTasks...)
 		return nil
 	})
@@ -458,23 +462,31 @@ func (s *Scanner) processDiscoveredFile(
 	lib *sqlite.LibraryRecord,
 	root, path string,
 	forceTV bool,
-	seriesCache, seasonCache map[string]*sqlite.ItemRecord,
+	seriesCache, seasonCache, artistCache, albumCache map[string]*sqlite.ItemRecord,
 	seenSeriesEnrich map[string]struct{},
 	stats *ScanStats,
 ) []enrichTask {
-	epInfo := ParseEpisodePath(root, path, forceTV)
 	var (
 		changed bool
 		tasks   []enrichTask
 		err     error
 	)
-	if epInfo.IsEpisode {
-		changed, tasks, err = s.indexEpisode(ctx, lib, epInfo, path, seriesCache, seasonCache, seenSeriesEnrich)
-	} else {
+	if IsAudioFile(path) {
 		var task *enrichTask
-		changed, task, err = s.indexMovie(ctx, lib, path)
+		changed, task, err = s.indexAudio(ctx, lib, root, path, artistCache, albumCache)
 		if task != nil {
 			tasks = append(tasks, *task)
+		}
+	} else {
+		epInfo := ParseEpisodePath(root, path, forceTV)
+		if epInfo.IsEpisode {
+			changed, tasks, err = s.indexEpisode(ctx, lib, epInfo, path, seriesCache, seasonCache, seenSeriesEnrich)
+		} else {
+			var task *enrichTask
+			changed, task, err = s.indexMovie(ctx, lib, path)
+			if task != nil {
+				tasks = append(tasks, *task)
+			}
 		}
 	}
 	if err != nil {

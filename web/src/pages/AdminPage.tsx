@@ -1,4 +1,4 @@
-import { Component, useState, type ErrorInfo, type ReactNode } from 'react'
+import { Component, useEffect, useRef, useState, type ErrorInfo, type ReactNode } from 'react'
 import {
   Activity,
   AlertTriangle,
@@ -146,11 +146,34 @@ class AdminTabErrorBoundary extends Component<
 
 export function AdminPage() {
   const location = useLocation()
+  const navRef = useRef<HTMLElement | null>(null)
+  const savedScrollLeftRef = useRef<number>(0)
   const [scanning, setScanning] = useState(false)
   const [scanFeedback, setScanFeedback] = useState<{
     type: 'success' | 'error'
     message: string
   } | null>(null)
+
+  useEffect(() => {
+    const nav = navRef.current
+    if (!nav) return
+
+    // 保持切换子标签前的横向滚动位置，防止回弹至 0
+    if (savedScrollLeftRef.current > 0 && nav.scrollLeft === 0) {
+      nav.scrollLeft = savedScrollLeftRef.current
+    }
+
+    const activeEl = nav.querySelector('a[aria-current="page"]') as HTMLElement | null
+    if (!activeEl) return
+
+    const navRect = nav.getBoundingClientRect()
+    const elRect = activeEl.getBoundingClientRect()
+    const hasVisibleBox = navRect.width > 0 && elRect.width > 0
+    const isClipped = hasVisibleBox && (elRect.left < navRect.left || elRect.right > navRect.right)
+    if (isClipped && typeof activeEl.scrollIntoView === 'function') {
+      activeEl.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' })
+    }
+  }, [location.pathname])
 
   const handleGlobalScan = async () => {
     setScanning(true)
@@ -197,7 +220,14 @@ export function AdminPage() {
       <div className="flex flex-col gap-6 xl:flex-row">
         {/* 左侧/顶部子导航 */}
         <aside className="shrink-0 xl:w-60">
-          <nav className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-4 pt-2 xl:mx-0 xl:flex-col xl:overflow-visible xl:p-0">
+          <nav
+            ref={navRef}
+            data-testid="admin-tab-nav"
+            onScroll={(e) => {
+              savedScrollLeftRef.current = e.currentTarget.scrollLeft
+            }}
+            className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-4 pt-2 xl:mx-0 xl:flex-col xl:overflow-visible xl:p-0"
+          >
             {ADMIN_TABS.map((tab) => {
               const Icon = tab.icon
               return (

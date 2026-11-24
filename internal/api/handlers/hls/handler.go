@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -72,6 +74,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	mux.Handle("GET /Videos/{Id}/main.m3u8", wrapAuth(http.HandlerFunc(h.handleMediaPlaylist)))
 	mux.Handle("GET /Videos/{Id}/live.m3u8", wrapAuth(http.HandlerFunc(h.handleMediaPlaylist)))
 	mux.Handle("GET /Videos/{Id}/hls1/{PlaylistId}/{Segment}", wrapAuth(http.HandlerFunc(h.handleSegment)))
+	mux.Handle("GET /Videos/{Id}/{MediaSourceId}/Subtitles/{Index}/subtitles.m3u8", wrapAuth(http.HandlerFunc(h.handleSubtitlePlaylist)))
 
 	// Active Encodings Management
 	mux.Handle("DELETE /Videos/ActiveEncodings", wrapAuth(http.HandlerFunc(h.handleDeleteActiveEncodings)))
@@ -129,6 +132,7 @@ func (h *Handler) handleMasterPlaylist(w http.ResponseWriter, r *http.Request) {
 		VideoCodec:       params.VideoCodec,
 		AudioCodec:       params.AudioCodec,
 		Query:            preserveQuery(r.URL.Query()),
+		Subtitles:        extractTextSubtitles(item, src, q.Get("api_key")),
 	})
 
 	w.Header().Set("Content-Type", "application/x-mpegURL; charset=utf-8")
@@ -169,6 +173,93 @@ func (h *Handler) handleMediaPlaylist(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(m3u8))
+}
+
+func (h *Handler) handleSubtitlePlaylist(w http.ResponseWriter, r *http.Request) {
+	itemID := guid.Normalize(r.PathValue("Id"))
+	msID := guid.Normalize(r.PathValue("MediaSourceId"))
+	idx, err := strconv.Atoi(r.PathValue("Index"))
+	if err != nil || idx < 0 {
+		httpx.Error(w, http.StatusBadRequest, "invalid subtitle index")
+		return
+	}
+
+	item, src, err := h.resolveItemAndSource(r.Context(), itemID, msID)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		httpx.Error(w, http.StatusNotFound, "media item not found")
+		return
+	}
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if msID == "" {
+		if src != nil && src.ID != "" {
+			msID = src.ID
+		} else {
+			msID = item.ID
+		}
+	}
+
+	vttURI := fmt.Sprintf("/Videos/%s/%s/Subtitles/%d/Stream.vtt", item.ID, msID, idx)
+	q := httpx.ParseQuery(r)
+	if apiKey := q.Get("api_key"); apiKey != "" {
+		vttURI += "?api_key=" + url.QueryEscape(apiKey)
+	}
+
+	durSec := float64(resolveRuntimeTicks(item, src)) / float64(transcode.TicksPerSecond)
+	m3u8 := transcode.BuildSubtitlePlaylist(durSec, vttURI)
+
+	w.Header().Set("Content-Type", "application/x-mpegURL; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(m3u8))
+}
+
+func extractTextSubtitles(item *sqlite.ItemRecord, src *sqlite.MediaSourceRecord, apiKey string) []transcode.SubtitleTrackInfo {
+	if item == nil || src == nil || len(src.Streams) == 0 {
+		return nil
+	}
+	msID := src.ID
+	if msID == "" {
+		msID = item.ID
+	}
+	var out []transcode.SubtitleTrackInfo
+	for _, st := range src.Streams {
+		if !strings.EqualFold(st.StreamType, "Subtitle") || !isTextSubtitleCodec(st.Codec) {
+			continue
+		}
+		uri := fmt.Sprintf("/Videos/%s/%s/Subtitles/%d/subtitles.m3u8", item.ID, msID, st.StreamIndex)
+		if apiKey != "" {
+			uri += "?api_key=" + url.QueryEscape(apiKey)
+		}
+		title := strings.TrimSpace(st.DisplayTitle)
+		if title == "" {
+			title = strings.TrimSpace(st.Title)
+		}
+		if title == "" {
+			title = strings.TrimSpace(st.Language)
+		}
+		out = append(out, transcode.SubtitleTrackInfo{
+			Index:     st.StreamIndex,
+			Language:  st.Language,
+			Title:     title,
+			IsDefault: st.IsDefault,
+			IsForced:  st.IsForced,
+			URI:       uri,
+		})
+	}
+	return out
+}
+
+func isTextSubtitleCodec(codec string) bool {
+	switch strings.ToLower(strings.TrimSpace(codec)) {
+	case "vtt", "webvtt", "srt", "subrip", "ass", "ssa":
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *Handler) handleSegment(w http.ResponseWriter, r *http.Request) {

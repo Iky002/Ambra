@@ -29,14 +29,19 @@ type LibraryRecord struct {
 
 // ItemExtra is stored as JSON in items.extra_json.
 type ItemExtra struct {
-	Overview       string            `json:"overview,omitempty"`
-	Taglines       []string          `json:"taglines,omitempty"`
-	ProviderIDs    map[string]string `json:"provider_ids,omitempty"`
-	SeriesName     string            `json:"series_name,omitempty"`
-	SeasonName     string            `json:"season_name,omitempty"`
-	CollectionType string            `json:"collection_type,omitempty"`
-	LockedFields   []string          `json:"LockedFields,omitempty"`
-	LockData       bool              `json:"LockData,omitempty"`
+	Overview                string            `json:"overview,omitempty"`
+	Taglines                []string          `json:"taglines,omitempty"`
+	ProviderIDs             map[string]string `json:"provider_ids,omitempty"`
+	SeriesName              string            `json:"series_name,omitempty"`
+	SeasonName              string            `json:"season_name,omitempty"`
+	Album                   string            `json:"album,omitempty"`
+	AlbumID                 string            `json:"album_id,omitempty"`
+	AlbumArtist             string            `json:"album_artist,omitempty"`
+	Artists                 []string          `json:"artists,omitempty"`
+	PrimaryImageAspectRatio *float64          `json:"primary_image_aspect_ratio,omitempty"`
+	CollectionType          string            `json:"collection_type,omitempty"`
+	LockedFields            []string          `json:"LockedFields,omitempty"`
+	LockData                bool              `json:"LockData,omitempty"`
 }
 
 // ItemRecord represents a row in the items table.
@@ -1895,11 +1900,16 @@ func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []
 			Type:              rec.Type,
 			MediaType:         rec.MediaType,
 			CollectionType:    rec.Extra.CollectionType,
-			SeriesId:          rec.SeriesID,
-			SeriesName:        rec.Extra.SeriesName,
-			SeasonId:          rec.SeasonID,
-			SeasonName:        rec.Extra.SeasonName,
-			UserData:          uds[i],
+			SeriesId:                rec.SeriesID,
+			SeriesName:              rec.Extra.SeriesName,
+			SeasonId:                rec.SeasonID,
+			SeasonName:              rec.Extra.SeasonName,
+			Album:                   rec.Extra.Album,
+			AlbumId:                 rec.Extra.AlbumID,
+			AlbumArtist:             rec.Extra.AlbumArtist,
+			Artists:                 rec.Extra.Artists,
+			PrimaryImageAspectRatio: rec.Extra.PrimaryImageAspectRatio,
+			UserData:                uds[i],
 			ImageTags:         map[string]string{},
 			BackdropImageTags: []string{},
 			LocationType:      "FileSystem",

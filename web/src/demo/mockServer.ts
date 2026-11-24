@@ -23,6 +23,7 @@ import type {
   UserPolicy,
   VirtualFolderInfo,
 } from '../api/types'
+import { makeDemoAudioDataUrl } from './demoMedia'
 import { createInitialDemoState, DEMO_SERVER_ID, type DemoState } from './mockData'
 import { makeAvatarDataUrl, makeLibraryThumbDataUrl, makePosterDataUrl } from './svgArt'
 
@@ -183,6 +184,10 @@ export function getDemoFallbackImageUrl(
   return getDemoImageUrl(itemId, type)
 }
 
+export function getDemoAudioUrl(_itemId: string): string {
+  return makeDemoAudioDataUrl()
+}
+
 export function getDemoUserImageUrl(userId: string): string {
   const existing = store.userAvatarById.get(userId)
   if (existing) return existing
@@ -297,6 +302,17 @@ function sortItems(items: BaseItemDto[], sortBy: string, sortOrder: string): Bas
     let cmp = 0
     if (primary === 'SortName' || primary === 'Name') {
       cmp = (a.SortName || a.Name).localeCompare(b.SortName || b.Name, 'zh-Hans-CN')
+    } else if (primary === 'ParentIndexNumber' || primary === 'IndexNumber') {
+      const discDiff = (a.ParentIndexNumber || 0) - (b.ParentIndexNumber || 0)
+      if (discDiff !== 0) {
+        cmp = discDiff
+      } else {
+        const trackDiff = (a.IndexNumber || 0) - (b.IndexNumber || 0)
+        cmp =
+          trackDiff !== 0
+            ? trackDiff
+            : (a.SortName || a.Name).localeCompare(b.SortName || b.Name, 'zh-Hans-CN')
+      }
     } else if (primary === 'CommunityRating') {
       cmp = (a.CommunityRating || 0) - (b.CommunityRating || 0)
     } else if (primary === 'PremiereDate' || primary === 'ProductionYear') {
@@ -1036,7 +1052,14 @@ export async function demoFetch<T>(
     const term = qs.get('SearchTerm') || ''
     const limit = Number(qs.get('Limit') || 20)
     const matched = Array.from(store.items.values())
-      .filter((it) => it.Type === 'Movie' || it.Type === 'Series' || it.Type === 'Episode')
+      .filter(
+        (it) =>
+          it.Type === 'Movie' ||
+          it.Type === 'Series' ||
+          it.Type === 'Episode' ||
+          it.Type === 'MusicAlbum' ||
+          it.Type === 'Audio',
+      )
       .filter((it) => matchesFuzzySearch(it, term))
       .slice(0, limit)
 
@@ -1102,7 +1125,17 @@ export async function demoFetch<T>(
     return { ...ud } as T
   }
 
-  // ==================== 8. PlaybackInfo & 播放状态上报 ====================
+  // ==================== 8. PlaybackInfo、音频歌词 & 播放状态上报 ====================
+  const audioLyricsMatch = pathname.match(/^\/emby\/Audio\/([^/]+)\/Lyrics$/)
+  if (audioLyricsMatch && method === 'GET') {
+    const itemId = decodeURIComponent(audioLyricsMatch[1])
+    const lyrics = store.lyricsByItemId.get(itemId)
+    if (lyrics) {
+      return lyrics as T
+    }
+    return { Metadata: { IsSynced: false }, Lyrics: [] } as T
+  }
+
   const playbackMatch = pathname.match(/^\/emby\/Items\/([^/]+)\/PlaybackInfo$/)
   if (playbackMatch && method === 'POST') {
     const itemId = decodeURIComponent(playbackMatch[1])

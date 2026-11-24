@@ -946,6 +946,22 @@ func (s *Scanner) buildMediaSource(item *sqlite.ItemRecord, mediaPath string, si
 				IsExternal:    false,
 			})
 		}
+	} else if strings.EqualFold(item.MediaType, "Audio") || strings.EqualFold(item.Type, "Audio") {
+		audioCodec := defaultAudioCodecForContainer(container)
+		streams = []sqlite.MediaStreamRecord{
+			{
+				MediaSourceID: msID,
+				ItemID:        item.ID,
+				StreamIndex:   0,
+				StreamType:    "Audio",
+				Codec:         audioCodec,
+				Language:      "und",
+				DisplayTitle:  strings.ToUpper(audioCodec) + " Stereo",
+				Channels:      2,
+				SampleRate:    44100,
+				IsDefault:     true,
+			},
+		}
 	} else {
 		// Default synthetic Video & Audio streams (when ffprobe is not executed or gracefully degraded)
 		videoCodec := "h264"
@@ -985,9 +1001,11 @@ func (s *Scanner) buildMediaSource(item *sqlite.ItemRecord, mediaPath string, si
 		}
 	}
 
-	// Scan companion external subtitles in the same directory; stream_index continues after embedded streams.
-	extSubs := discoverExternalSubtitles(mediaPath, msID, item.ID, len(streams))
-	streams = append(streams, extSubs...)
+	// Scan companion external subtitles in the same directory for video items; stream_index continues after embedded streams.
+	if !strings.EqualFold(item.MediaType, "Audio") && !strings.EqualFold(item.Type, "Audio") {
+		extSubs := discoverExternalSubtitles(mediaPath, msID, item.ID, len(streams))
+		streams = append(streams, extSubs...)
+	}
 
 	extraJSON := fmt.Sprintf(`{"file_mtime":%d}`, mtime)
 

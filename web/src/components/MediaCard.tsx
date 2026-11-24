@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
-import { Check, Film, Flame, Play, Star } from 'lucide-react'
+import { Check, Film, Flame, Music, Play, Star } from 'lucide-react'
 import { Link, useNavigate } from 'react-router-dom'
 import { getFallbackImageUrl, getImageUrl } from '../api/client'
 import type { BaseItemDto } from '../api/types'
+import { useAudioPlayer } from '../context/AudioPlayerContext'
 
 interface MediaCardProps {
   item: BaseItemDto
@@ -26,7 +27,10 @@ export function MediaCard({
   linkTo,
 }: MediaCardProps) {
   const navigate = useNavigate()
+  const { playTrack } = useAudioPlayer()
   const isLandscape = variant === 'landscape'
+  const isMusicItem =
+    item.Type === 'Audio' || item.Type === 'MusicAlbum' || item.Type === 'MusicArtist'
   const targetUrl = linkTo ?? `/item/${item.Id}`
 
   let imgUrl = ''
@@ -69,14 +73,20 @@ export function MediaCard({
   const subtitle =
     item.Type === 'Episode' && item.SeriesName
       ? `${item.SeriesName}${item.ParentIndexNumber != null ? ` · S${item.ParentIndexNumber}` : ''}${item.IndexNumber != null ? `E${item.IndexNumber}` : ''}`
-      : item.ProductionYear
-        ? String(item.ProductionYear)
-        : item.Type === 'Series'
-          ? '剧集'
-          : ''
+      : isMusicItem && (item.AlbumArtist || item.Artists?.[0] || item.Album)
+        ? [item.AlbumArtist || item.Artists?.[0], item.ProductionYear ? String(item.ProductionYear) : '']
+            .filter(Boolean)
+            .join(' · ')
+        : item.ProductionYear
+          ? String(item.ProductionYear)
+          : item.Type === 'Series'
+            ? '剧集'
+            : ''
 
+  const isAudioItem = item.Type === 'Audio'
   const canDirectPlay =
-    !selectable && (item.Type === 'Movie' || item.Type === 'Episode' || item.MediaType === 'Video')
+    !selectable &&
+    (isAudioItem || item.Type === 'Movie' || item.Type === 'Episode' || item.MediaType === 'Video')
   const directPlayUrl =
     showProgress && item.UserData?.PlaybackPositionTicks && item.UserData.PlaybackPositionTicks > 0
       ? `/play/${item.Id}?startTicks=${item.UserData.PlaybackPositionTicks}`
@@ -123,7 +133,11 @@ export function MediaCard({
           />
         ) : (
           <div className="flex h-full w-full flex-col items-center justify-center bg-gradient-to-br from-zinc-800 to-zinc-950 text-zinc-600">
-            <Film className="h-10 w-10 opacity-40" />
+            {isMusicItem ? (
+              <Music className="h-10 w-10 opacity-40" />
+            ) : (
+              <Film className="h-10 w-10 opacity-40" />
+            )}
           </div>
         )}
 
@@ -137,7 +151,11 @@ export function MediaCard({
             onClick={(e) => {
               e.preventDefault()
               e.stopPropagation()
-              navigate(directPlayUrl)
+              if (isAudioItem) {
+                playTrack(item)
+              } else {
+                navigate(directPlayUrl)
+              }
             }}
             className="absolute left-1/2 top-1/2 flex h-12 w-12 -translate-x-1/2 -translate-y-1/2 scale-75 items-center justify-center rounded-full bg-amber-500 text-zinc-950 opacity-0 shadow-lg shadow-amber-500/35 transition-all duration-300 ease-out hover:bg-amber-400 group-hover:scale-100 group-hover:opacity-100 active:scale-95"
           >

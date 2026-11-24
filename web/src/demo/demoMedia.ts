@@ -60,3 +60,72 @@ export function makeDemoAssDataUrl(title: string): string {
   ].join('\n')
   return `data:text/plain;charset=utf-8,${encodeURIComponent(ass)}`
 }
+
+let cachedDemoAudioDataUrl: string | null = null
+
+/**
+ * 生成 100% 离线可播放的 20 秒柔和氛围音频 WAV Data URL（8kHz 8-bit Mono），
+ * 供 Serverless Demo 全局音乐播放器与同步歌词演示使用。
+ */
+export function makeDemoAudioDataUrl(): string {
+  if (cachedDemoAudioDataUrl) {
+    return cachedDemoAudioDataUrl
+  }
+  const sampleRate = 8000
+  const durationSec = 20
+  const numSamples = sampleRate * durationSec
+  const dataSize = numSamples
+  const buffer = new Uint8Array(44 + dataSize)
+  const view = new DataView(buffer.buffer)
+
+  const writeStr = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) {
+      buffer[offset + i] = str.charCodeAt(i)
+    }
+  }
+
+  writeStr(0, 'RIFF')
+  view.setUint32(4, 36 + dataSize, true)
+  writeStr(8, 'WAVE')
+  writeStr(12, 'fmt ')
+  view.setUint32(16, 16, true) // PCM chunk size
+  view.setUint16(20, 1, true) // AudioFormat = PCM
+  view.setUint16(22, 1, true) // NumChannels = 1
+  view.setUint32(24, sampleRate, true)
+  view.setUint32(28, sampleRate, true) // ByteRate
+  view.setUint16(32, 1, true) // BlockAlign
+  view.setUint16(34, 8, true) // BitsPerSample
+  writeStr(36, 'data')
+  view.setUint32(40, dataSize, true)
+
+  // 柔和的四和弦进行（Am - F - C - G），每 5 秒平滑过渡
+  const chords = [
+    [220.0, 261.63, 329.63],
+    [174.61, 220.0, 261.63],
+    [261.63, 329.63, 392.0],
+    [196.0, 246.94, 293.66],
+  ]
+
+  for (let i = 0; i < numSamples; i++) {
+    const t = i / sampleRate
+    const chordIdx = Math.min(chords.length - 1, Math.floor(t / 5))
+    const chord = chords[chordIdx]
+    const localT = t % 5
+    const env = Math.min(1, localT / 0.4) * Math.min(1, (5 - localT) / 0.4)
+    let sample = 0
+    for (const freq of chord) {
+      sample += Math.sin(2 * Math.PI * freq * t)
+    }
+    const normalized = (sample / chord.length) * 0.18 * env
+    buffer[44 + i] = Math.max(0, Math.min(255, Math.round(128 + normalized * 127)))
+  }
+
+  let binary = ''
+  const chunkSize = 0x8000
+  for (let i = 0; i < buffer.length; i += chunkSize) {
+    binary += String.fromCharCode(...buffer.subarray(i, i + chunkSize))
+  }
+  const b64 = btoa(binary)
+  cachedDemoAudioDataUrl = `data:audio/wav;base64,${b64}`
+  return cachedDemoAudioDataUrl
+}

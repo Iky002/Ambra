@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronUp,
+  Disc3,
   Download,
   Film,
   Flame,
@@ -16,6 +17,8 @@ import {
   Layers,
   ListVideo,
   Loader2,
+  Music,
+  Pause,
   Pencil,
   Play,
   Plus,
@@ -31,11 +34,13 @@ import {
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, getBackdropUrl, getFallbackImageUrl, getImageUrl } from '../api/client'
 import type { BaseItemDto, MediaSourceInfo } from '../api/types'
+import { formatAudioTime } from '../components/AudioPlayerBar'
 import { MediaCard } from '../components/MediaCard'
 import { IdentifyModal } from '../components/media/IdentifyModal'
 import { ImageManagerModal } from '../components/media/ImageManagerModal'
 import { MergeVersionsModal } from '../components/media/MergeVersionsModal'
 import { MetadataEditorModal } from '../components/media/MetadataEditorModal'
+import { useAudioPlayer } from '../context/AudioPlayerContext'
 import { useAuth } from '../context/AuthContext'
 import {
   detectChineseVariant,
@@ -48,6 +53,13 @@ import { AdminModal, FeedbackBanner } from './admin/adminUtils'
 export function ItemDetailPage() {
   const { id } = useParams<{ id: string }>()
   const { auth, user, isAdmin } = useAuth()
+  const {
+    currentTrack,
+    isPlaying: isAudioPlaying,
+    playQueue,
+    playTrack,
+    togglePlay: toggleAudioPlay,
+  } = useAudioPlayer()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const userId = auth!.userId
@@ -81,6 +93,51 @@ export function ItemDetailPage() {
   })
 
   const isSeries = item?.Type === 'Series'
+  const isMusicAlbum = item?.Type === 'MusicAlbum'
+  const isMusicArtist = item?.Type === 'MusicArtist'
+  const isAudio = item?.Type === 'Audio'
+
+  const { data: albumTracksData, isLoading: albumTracksLoading } = useQuery({
+    queryKey: ['albumTracks', id, userId],
+    queryFn: () =>
+      api.getItems(userId, {
+        parentId: id,
+        includeItemTypes: 'Audio',
+        sortBy: 'ParentIndexNumber,IndexNumber,SortName',
+        sortOrder: 'Ascending',
+        limit: 200,
+      }),
+    enabled: Boolean(id && isMusicAlbum),
+  })
+  const albumTracks = albumTracksData?.Items || []
+
+  const { data: artistAlbumsData, isLoading: artistAlbumsLoading } = useQuery({
+    queryKey: ['artistAlbums', id, userId],
+    queryFn: () =>
+      api.getItems(userId, {
+        parentId: id,
+        includeItemTypes: 'MusicAlbum',
+        sortBy: 'PremiereDate',
+        sortOrder: 'Descending',
+        limit: 100,
+      }),
+    enabled: Boolean(id && isMusicArtist),
+  })
+  const artistAlbums = artistAlbumsData?.Items || []
+
+  const { data: artistTracksData, isLoading: artistTracksLoading } = useQuery({
+    queryKey: ['artistTracks', id, userId],
+    queryFn: () =>
+      api.getItems(userId, {
+        parentId: id,
+        includeItemTypes: 'Audio',
+        sortBy: 'PlayCount',
+        sortOrder: 'Descending',
+        limit: 50,
+      }),
+    enabled: Boolean(id && isMusicArtist),
+  })
+  const artistTracks = artistTracksData?.Items || []
 
   const { data: seasonsData } = useQuery({
     queryKey: ['seasons', id, userId],
@@ -398,7 +455,11 @@ export function ItemDetailPage() {
 
   const resumeTicks = item.UserData?.PlaybackPositionTicks || 0
   const hasResume = resumeTicks > 10_000_000 * 15 // 超过 15 秒显示续播
-  const canDownload = !isSeries && (isAdmin || Boolean(user?.Policy?.EnableContentDownloading))
+  const canDownload =
+    !isSeries &&
+    !isMusicAlbum &&
+    !isMusicArtist &&
+    (isAdmin || Boolean(user?.Policy?.EnableContentDownloading))
 
   const buildFilterLink = (param: 'genre' | 'year' | 'tag', value: string) => {
     if (item.ParentId && (item.Type === 'Movie' || item.Type === 'Series')) {
@@ -592,7 +653,37 @@ export function ItemDetailPage() {
 
               {/* 播放 / 收藏 / 标已看 / 加入合集 / 下载按钮 */}
               <div className="flex flex-wrap items-center gap-3 pt-1">
-                {!isSeries ? (
+                {isMusicAlbum ? (
+                  <button
+                    type="button"
+                    disabled={albumTracks.length === 0}
+                    onClick={() => playQueue(albumTracks, 0)}
+                    className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all duration-200 hover:-translate-y-0.5 hover:bg-amber-400 active:scale-[0.97] disabled:opacity-50"
+                  >
+                    <Play className="h-4 w-4 fill-current" />
+                    <span>播放全部</span>
+                  </button>
+                ) : isMusicArtist ? (
+                  artistTracks.length > 0 ? (
+                    <button
+                      type="button"
+                      onClick={() => playQueue(artistTracks, 0)}
+                      className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all duration-200 hover:-translate-y-0.5 hover:bg-amber-400 active:scale-[0.97]"
+                    >
+                      <Play className="h-4 w-4 fill-current" />
+                      <span>播放全部</span>
+                    </button>
+                  ) : null
+                ) : isAudio ? (
+                  <button
+                    type="button"
+                    onClick={() => playTrack(item)}
+                    className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all duration-200 hover:-translate-y-0.5 hover:bg-amber-400 active:scale-[0.97]"
+                  >
+                    <Play className="h-4 w-4 fill-current" />
+                    <span>立即播放</span>
+                  </button>
+                ) : !isSeries ? (
                   <>
                     <button
                       type="button"
@@ -761,7 +852,7 @@ export function ItemDetailPage() {
               )}
 
               {/* 多版本、音轨、字幕选择器 */}
-              {!isSeries && mediaSources.length > 0 && (
+              {!isSeries && !isMusicAlbum && !isMusicArtist && !isAudio && mediaSources.length > 0 && (
                 <div className="grid gap-3 rounded-2xl border border-white/10 bg-zinc-950/70 p-4 backdrop-blur-md sm:grid-cols-3">
                   {mediaSources.length > 1 && (
                     <label className="block space-y-1.5">
@@ -844,6 +935,232 @@ export function ItemDetailPage() {
           </div>
         </div>
       </div>
+
+      {/* 音乐专辑：曲目列表 */}
+      {isMusicAlbum && (
+        <section
+          data-testid="album-tracklist"
+          className="mx-auto max-w-7xl space-y-4 px-4 pt-6 lg:px-8"
+        >
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <Disc3 className="h-5 w-5 text-amber-400" />
+              <h2 className="text-lg font-semibold text-zinc-100">
+                专辑曲目
+                <span className="ml-2 text-xs font-normal text-zinc-500">
+                  ({albumTracks.length} 首)
+                </span>
+              </h2>
+            </div>
+            {albumTracks.length > 0 && (
+              <button
+                type="button"
+                onClick={() => playQueue(albumTracks, 0)}
+                className="inline-flex items-center gap-1.5 rounded-xl border border-amber-500/35 bg-amber-500/15 px-3.5 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/25"
+              >
+                <Play className="h-3.5 w-3.5 fill-current" />
+                <span>顺序播放全部</span>
+              </button>
+            )}
+          </div>
+
+          {albumTracksLoading ? (
+            <div className="flex h-36 items-center justify-center">
+              <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
+            </div>
+          ) : albumTracks.length === 0 ? (
+            <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-12 text-center text-sm text-zinc-500">
+              当前专辑暂无音轨
+            </div>
+          ) : (
+            <div className="overflow-hidden rounded-2xl border border-white/8 bg-white/[0.02]">
+              <table className="w-full text-left text-sm">
+                <thead className="border-b border-white/8 text-[11px] uppercase tracking-wider text-zinc-500">
+                  <tr>
+                    <th className="w-14 px-4 py-3 text-center">#</th>
+                    <th className="px-3 py-3">曲目</th>
+                    <th className="hidden px-3 py-3 sm:table-cell">艺术家</th>
+                    <th className="w-24 px-4 py-3 text-right">时长</th>
+                    <th className="w-20 px-4 py-3 text-right">操作</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-white/5">
+                  {albumTracks.map((track, idx) => {
+                    const isActive = currentTrack?.Id === track.Id
+                    const artistLabel =
+                      track.Artists?.join(' / ') || track.AlbumArtist || item.AlbumArtist || '未知艺术家'
+                    return (
+                      <tr
+                        key={track.Id}
+                        onClick={() => {
+                          if (isActive) {
+                            toggleAudioPlay()
+                          } else {
+                            playQueue(albumTracks, idx)
+                          }
+                        }}
+                        className={`group cursor-pointer transition-colors ${
+                          isActive
+                            ? 'bg-amber-500/12 text-amber-300'
+                            : 'text-zinc-200 hover:bg-white/[0.04]'
+                        }`}
+                      >
+                        <td className="px-4 py-3 text-center text-xs tabular-nums text-zinc-500">
+                          {isActive ? (
+                            <span className="inline-flex items-center justify-center text-amber-400">
+                              <Music className="h-3.5 w-3.5 animate-pulse" />
+                            </span>
+                          ) : (
+                            track.IndexNumber ?? idx + 1
+                          )}
+                        </td>
+                        <td className="px-3 py-3">
+                          <div className="flex items-center gap-2">
+                            <span className="font-medium">{track.Name}</span>
+                            {isActive && (
+                              <span className="rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-300">
+                                {isAudioPlaying ? '正在播放' : '已暂停'}
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="hidden px-3 py-3 text-xs text-zinc-400 sm:table-cell">
+                          {artistLabel}
+                        </td>
+                        <td className="px-4 py-3 text-right text-xs tabular-nums text-zinc-400">
+                          {track.RunTimeTicks
+                            ? formatAudioTime(track.RunTimeTicks / 10_000_000)
+                            : '--:--'}
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          <button
+                            type="button"
+                            aria-label={isActive && isAudioPlaying ? `暂停 ${track.Name}` : `播放 ${track.Name}`}
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              if (isActive) {
+                                toggleAudioPlay()
+                              } else {
+                                playQueue(albumTracks, idx)
+                              }
+                            }}
+                            className={`inline-flex h-8 w-8 items-center justify-center rounded-full transition-colors ${
+                              isActive
+                                ? 'bg-amber-500 text-zinc-950'
+                                : 'bg-white/[0.06] text-zinc-200 hover:bg-amber-500 hover:text-zinc-950'
+                            }`}
+                          >
+                            {isActive && isAudioPlaying ? (
+                              <Pause className="h-3.5 w-3.5 fill-current" />
+                            ) : (
+                              <Play className="ml-0.5 h-3.5 w-3.5 fill-current" />
+                            )}
+                          </button>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* 音乐人：专辑与热门曲目 */}
+      {isMusicArtist && (
+        <section className="mx-auto max-w-7xl space-y-8 px-4 pt-6 lg:px-8">
+          <div className="space-y-4">
+            <h2 className="text-lg font-semibold text-zinc-100">
+              专辑
+              <span className="ml-2 text-xs font-normal text-zinc-500">
+                ({artistAlbums.length})
+              </span>
+            </h2>
+            {artistAlbumsLoading ? (
+              <div className="flex h-32 items-center justify-center">
+                <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
+              </div>
+            ) : artistAlbums.length === 0 ? (
+              <p className="text-sm text-zinc-500">暂无收录专辑</p>
+            ) : (
+              <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+                {artistAlbums.map((album) => (
+                  <MediaCard key={album.Id} item={album} />
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="space-y-4">
+            <h2 className="text-lg font-semibold text-zinc-100">
+              热门曲目
+              <span className="ml-2 text-xs font-normal text-zinc-500">
+                ({artistTracks.length})
+              </span>
+            </h2>
+            {artistTracksLoading ? (
+              <div className="flex h-32 items-center justify-center">
+                <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
+              </div>
+            ) : artistTracks.length === 0 ? (
+              <p className="text-sm text-zinc-500">暂无收录曲目</p>
+            ) : (
+              <div className="divide-y divide-white/5 overflow-hidden rounded-2xl border border-white/8 bg-white/[0.02]">
+                {artistTracks.map((track, idx) => {
+                  const isActive = currentTrack?.Id === track.Id
+                  return (
+                    <div
+                      key={track.Id}
+                      onClick={() =>
+                        isActive ? toggleAudioPlay() : playQueue(artistTracks, idx)
+                      }
+                      className={`flex cursor-pointer items-center justify-between gap-4 px-4 py-3 transition-colors ${
+                        isActive
+                          ? 'bg-amber-500/12 text-amber-300'
+                          : 'text-zinc-200 hover:bg-white/[0.04]'
+                      }`}
+                    >
+                      <div className="flex min-w-0 items-center gap-3">
+                        <span className="w-6 text-center text-xs text-zinc-500">{idx + 1}</span>
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-medium">{track.Name}</p>
+                          {track.Album && (
+                            <p className="truncate text-xs text-zinc-500">{track.Album}</p>
+                          )}
+                        </div>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-3">
+                        <span className="text-xs tabular-nums text-zinc-400">
+                          {track.RunTimeTicks
+                            ? formatAudioTime(track.RunTimeTicks / 10_000_000)
+                            : '--:--'}
+                        </span>
+                        <button
+                          type="button"
+                          aria-label={isActive && isAudioPlaying ? `暂停 ${track.Name}` : `播放 ${track.Name}`}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            if (isActive) toggleAudioPlay()
+                            else playQueue(artistTracks, idx)
+                          }}
+                          className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-white/[0.06] text-zinc-200 hover:bg-amber-500 hover:text-zinc-950"
+                        >
+                          {isActive && isAudioPlaying ? (
+                            <Pause className="h-3.5 w-3.5 fill-current" />
+                          ) : (
+                            <Play className="ml-0.5 h-3.5 w-3.5 fill-current" />
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        </section>
+      )}
 
       {/* 剧集：季 Tab、当前季信息与分集列表 */}
       {isSeries && seasons.length > 0 && (

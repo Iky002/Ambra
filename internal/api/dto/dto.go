@@ -238,6 +238,10 @@ type BaseItemDto struct {
 	SeriesId                string            `json:"SeriesId,omitempty"`
 	SeasonId                string            `json:"SeasonId,omitempty"`
 	SeasonName              string            `json:"SeasonName,omitempty"`
+	Album                   string            `json:"Album,omitempty"`
+	AlbumId                 string            `json:"AlbumId,omitempty"`
+	AlbumArtist             string            `json:"AlbumArtist,omitempty"`
+	Artists                 []string          `json:"Artists,omitempty"`
 	Studios                 []NameIdPair      `json:"Studios,omitempty"`
 	People                  []BaseItemPerson  `json:"People,omitempty"`
 	UserData                *UserItemDataDto  `json:"UserData,omitempty"`

@@ -24,9 +24,11 @@ import {
 import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { api, getUserImageUrl } from '../api/client'
 import type { BaseItemDto } from '../api/types'
+import { useAudioPlayer } from '../context/AudioPlayerContext'
 import { useAuth } from '../context/AuthContext'
 import { isDemoMode } from '../demo/demoMode'
 import { AmbraLogo } from './AmbraLogo'
+import { AudioPlayerBar } from './AudioPlayerBar'
 import { ScanProgressBar } from './ScanProgressBar'
 import { SearchModal } from './SearchModal'
 
@@ -40,9 +42,11 @@ function libraryIcon(view: BaseItemDto) {
 
 export function Layout() {
   const { auth, user, isAdmin, logout, switchDemoRole } = useAuth()
+  const { currentTrack } = useAudioPlayer()
   const queryClient = useQueryClient()
   const navigate = useNavigate()
   const location = useLocation()
+  const outletKey = location.pathname.startsWith('/admin') ? '/admin' : location.pathname
   const [collapsed, setCollapsed] = useState(false)
   const [mobileOpen, setMobileOpen] = useState(false)
   const [searchOpen, setSearchOpen] = useState(false)
@@ -343,13 +347,14 @@ export function Layout() {
           </div>
         </header>
 
-        <main className="flex-1 pb-16">
-          <div key={location.pathname} className="animate-page-enter">
+        <main className={`flex-1 ${currentTrack ? 'pb-32' : 'pb-16'}`}>
+          <div key={outletKey} className="animate-page-enter">
             <Outlet />
           </div>
         </main>
       </div>
 
+      <AudioPlayerBar />
       <SearchModal open={searchOpen} onClose={() => setSearchOpen(false)} />
     </div>
   )

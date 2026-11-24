@@ -116,11 +116,17 @@ export function LibraryPage() {
     return list
   }, [tagsData, tagFilter])
 
+  const isMusicLibrary = (libraryInfo?.CollectionType || '').toLowerCase() === 'music'
+  const includeItemTypes = isMusicLibrary
+    ? 'MusicArtist,MusicAlbum,Audio'
+    : 'Movie,Series,MusicAlbum,Video'
+
   const { data, isLoading, isFetching } = useQuery({
     queryKey: [
       'libraryItems',
       userId,
       id,
+      includeItemTypes,
       sortBy,
       sortOrder,
       statusFilter,
@@ -132,7 +138,7 @@ export function LibraryPage() {
     queryFn: () =>
       api.getItems(userId, {
         parentId: id,
-        includeItemTypes: 'Movie,Series,MusicAlbum,Video',
+        includeItemTypes,
         sortBy,
         sortOrder,
         filters: statusFilter || undefined,

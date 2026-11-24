@@ -597,9 +597,9 @@ func TestStartPeriodicSyncAndGracefulShutdown(t *testing.T) {
 	// Duplicate call should be a no-op while running.
 	svc.StartPeriodicSync(ctx, 35*time.Millisecond)
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if hits.Load() >= 4 { // at least initial sync (2 hits) + 1 periodic tick (2 hits)
+		if hits.Load() >= 4 && !svc.needsInitialSync(24*time.Hour) { // at least initial sync + 1 periodic tick & cache populated
 			break
 		}
 		time.Sleep(15 * time.Millisecond)

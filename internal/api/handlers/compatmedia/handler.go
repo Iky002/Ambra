@@ -32,16 +32,17 @@ type AuthFuncs struct {
 // Handler implements the remaining Emby 4.10.2.0 media, item, metadata, image,
 // encoding, library, taxonomy, audio, and video compatibility endpoints.
 type Handler struct {
-	repo       *sqlite.LibraryRepo
-	scanner    *scanner.Scanner
-	watcher    *watcher.Watcher
-	imaging    *imaging.Service
-	registry   *plugins.Registry
-	store      *sqlite.Store
-	cfg        *config.Config
-	extractor  *transcode.Extractor
-	httpClient *http.Client
-	auth       AuthFuncs
+	repo         *sqlite.LibraryRepo
+	scanner      *scanner.Scanner
+	watcher      *watcher.Watcher
+	imaging      *imaging.Service
+	registry     *plugins.Registry
+	store        *sqlite.Store
+	cfg          *config.Config
+	extractor    *transcode.Extractor
+	transcodeMgr *transcode.Manager
+	httpClient   *http.Client
+	auth         AuthFuncs
 }
 
 // New creates a new compatmedia Handler.
@@ -72,6 +73,11 @@ func (h *Handler) SetWatcher(w *watcher.Watcher) {
 // SetExtractor overrides the embedded subtitle & font extractor used by compatmedia endpoints.
 func (h *Handler) SetExtractor(ext *transcode.Extractor) {
 	h.extractor = ext
+}
+
+// SetTranscodeManager attaches a transcode Manager so ActiveEncodings/Delete stops active sessions.
+func (h *Handler) SetTranscodeManager(mgr *transcode.Manager) {
+	h.transcodeMgr = mgr
 }
 
 // SetHTTPClient overrides the HTTP client used for remote image downloading and proxying.

@@ -15,6 +15,16 @@ const (
 	DefaultSegmentDuration = 6
 )
 
+// SubtitleTrackInfo describes a WebVTT subtitle track exposed in an HLS master playlist.
+type SubtitleTrackInfo struct {
+	Index     int
+	Language  string
+	Title     string
+	IsDefault bool
+	IsForced  bool
+	URI       string
+}
+
 // PlaylistParams configures virtual HLS master/media playlist generation.
 type PlaylistParams struct {
 	ItemID           string
@@ -29,6 +39,7 @@ type PlaylistParams struct {
 	VideoCodec       string
 	AudioCodec       string
 	Query            url.Values // preserved query parameters for child playlist / segment URLs
+	Subtitles        []SubtitleTrackInfo
 }
 
 // SegmentDurations computes the exact segment count N = ceil(D / S) and per-segment durations.
@@ -76,12 +87,44 @@ func BuildMasterPlaylist(p PlaylistParams) string {
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n")
 	b.WriteString("#EXT-X-VERSION:3\n")
+	for _, sub := range p.Subtitles {
+		name := strings.TrimSpace(sub.Title)
+		if name == "" {
+			name = strings.TrimSpace(sub.Language)
+		}
+		if name == "" {
+			name = fmt.Sprintf("Track %d", sub.Index)
+		}
+		lang := strings.TrimSpace(sub.Language)
+		if lang == "" {
+			lang = "und"
+		}
+		defVal := "NO"
+		if sub.IsDefault {
+			defVal = "YES"
+		}
+		forcedVal := "NO"
+		if sub.IsForced {
+			forcedVal = "YES"
+		}
+		b.WriteString(fmt.Sprintf(
+			"#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"%s\",LANGUAGE=\"%s\",DEFAULT=%s,AUTOSELECT=YES,FORCED=%s,URI=\"%s\"\n",
+			sanitizeHLSAttr(name),
+			sanitizeHLSAttr(lang),
+			defVal,
+			forcedVal,
+			sanitizeHLSAttr(sub.URI),
+		))
+	}
 	b.WriteString(fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d", bw))
 	if p.Width > 0 && p.Height > 0 {
 		b.WriteString(fmt.Sprintf(",RESOLUTION=%dx%d", p.Width, p.Height))
 	}
 	if codecs != "" {
 		b.WriteString(fmt.Sprintf(",CODECS=\"%s\"", codecs))
+	}
+	if len(p.Subtitles) > 0 {
+		b.WriteString(",SUBTITLES=\"subs\"")
 	}
 	b.WriteByte('\n')
 
@@ -92,6 +135,36 @@ func BuildMasterPlaylist(p PlaylistParams) string {
 	b.WriteString(target)
 	b.WriteByte('\n')
 	return b.String()
+}
+
+// BuildSubtitlePlaylist generates a valid VOD WebVTT HLS subtitle playlist.
+func BuildSubtitlePlaylist(durationSec float64, vttURI string) string {
+	if durationSec <= 0 {
+		durationSec = float64(DefaultSegmentDuration)
+	}
+	targetDur := int(math.Ceil(durationSec))
+	if targetDur < 1 {
+		targetDur = 1
+	}
+
+	var b strings.Builder
+	b.WriteString("#EXTM3U\n")
+	b.WriteString("#EXT-X-VERSION:3\n")
+	b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", targetDur))
+	b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
+	b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
+	b.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", durationSec))
+	b.WriteString(vttURI)
+	b.WriteByte('\n')
+	b.WriteString("#EXT-X-ENDLIST\n")
+	return b.String()
+}
+
+func sanitizeHLSAttr(s string) string {
+	s = strings.ReplaceAll(s, `"`, `'`)
+	s = strings.ReplaceAll(s, "\r", "")
+	s = strings.ReplaceAll(s, "\n", "")
+	return s
 }
 
 // BuildMediaPlaylist generates a complete virtual VOD M3U8 playlist (#EXT-X-ENDLIST)
