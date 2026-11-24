@@ -235,6 +235,7 @@ var canonicalSegments = map[string]string{
 	"public": "Public",
 	"publictonemapoptions": "PublicToneMapOptions",
 	"query": "Query",
+	"rankings": "Rankings",
 	"rating": "Rating",
 	"read": "Read",
 	"ready": "Ready",
