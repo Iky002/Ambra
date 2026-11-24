@@ -15,6 +15,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/ws"
 	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/core/auth"
 	"github.com/ambra-media/ambra/internal/core/session"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/plugins"
@@ -28,11 +29,15 @@ type AuthFuncs struct {
 	UserIDFromCtx func(context.Context) string
 }
 
+const forgotPinMaxAttempts = 5
+
 type forgotPinEntry struct {
 	UserID    string
 	UserName  string
 	Pin       string
+	PinFile   string
 	ExpiresAt time.Time
+	Attempts  int
 }
 
 type remoteCommandRecord struct {
@@ -57,6 +62,7 @@ type Handler struct {
 	libRepo  *sqlite.LibraryRepo
 	sessions *session.Manager
 	registry *plugins.Registry
+	authSvc  *auth.Service
 	wsHub    WSSender
 	auth     AuthFuncs
 
@@ -94,6 +100,11 @@ func New(
 // SetWSHub attaches a WebSocket hub for forwarding remote control commands to target devices.
 func (h *Handler) SetWSHub(hub WSSender) {
 	h.wsHub = hub
+}
+
+// SetAuthService attaches the authentication service for password reset flows.
+func (h *Handler) SetAuthService(a *auth.Service) {
+	h.authSvc = a
 }
 
 // BuildRouter builds a chi.Router containing all 16 compatibility prefixes.

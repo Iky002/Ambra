@@ -2,6 +2,9 @@ import { ApiError, getStoredAuth } from '../api/client'
 import type {
   ApiKeyInfo,
   AuthenticationResult,
+  BackupFileInfo,
+  BackupInfoResponse,
+  BackupRestoreResult,
   BaseItemDto,
   ItemImageInfo,
   LibraryScanProgress,
@@ -225,6 +228,25 @@ let demoTunerHosts: LiveTvTunerHostInfo[] = createInitialTunerHosts()
 let demoListingProviders: LiveTvListingProviderInfo[] = createInitialListingProviders()
 let demoLiveTvChannels: LiveTvChannelInfo[] = createInitialLiveTvChannels()
 
+function createInitialDemoBackups(): BackupFileInfo[] {
+  return [
+    {
+      Name: 'ambra-backup-20261124-030000.db',
+      Path: '/data/backups/ambra-backup-20261124-030000.db',
+      Size: 2_621_440,
+      DateCreated: new Date(Date.now() - 8 * 3600_000).toISOString(),
+    },
+    {
+      Name: 'ambra-backup-20261123-030000.db',
+      Path: '/data/backups/ambra-backup-20261123-030000.db',
+      Size: 2_490_368,
+      DateCreated: new Date(Date.now() - 32 * 3600_000).toISOString(),
+    },
+  ]
+}
+
+let demoBackups: BackupFileInfo[] = createInitialDemoBackups()
+
 const DEMO_TMDB_TRENDING_TMDB_IDS = new Set([
   '693134', // 沙丘 2
   '872585', // 奥本海默
@@ -295,6 +317,7 @@ export function resetDemoStore(): void {
   demoTunerHosts = createInitialTunerHosts()
   demoListingProviders = createInitialListingProviders()
   demoLiveTvChannels = createInitialLiveTvChannels()
+  demoBackups = createInitialDemoBackups()
 }
 
 export function getDemoImageUrl(
@@ -1324,16 +1347,60 @@ export async function demoFetch<T>(
     } else {
       ud.PlayedPercentage = 0
     }
-    if (item.Type === 'Season') {
+    if (item.Type === 'Series') {
+      const seasons = store.seasonsBySeries.get(itemId) || []
+      let totalEps = 0
+      for (const season of seasons) {
+        const sUd = ensureUserData(season)
+        sUd.Played = ud.Played
+        sUd.PlayedPercentage = ud.Played ? 100 : 0
+        if (ud.Played) sUd.PlaybackPositionTicks = 0
+        const eps = store.episodesBySeason.get(season.Id) || []
+        totalEps += eps.length
+        sUd.UnplayedItemCount = ud.Played ? 0 : eps.length
+        for (const ep of eps) {
+          const epUd = ensureUserData(ep)
+          epUd.Played = ud.Played
+          epUd.PlayedPercentage = ud.Played ? 100 : 0
+          if (ud.Played) {
+            epUd.PlayCount = Math.max(1, epUd.PlayCount + 1)
+            epUd.PlaybackPositionTicks = 0
+            epUd.LastPlayedDate = ud.LastPlayedDate
+          }
+        }
+      }
+      ud.UnplayedItemCount = ud.Played ? 0 : totalEps
+    } else if (item.Type === 'Season') {
       const eps = store.episodesBySeason.get(itemId) || []
       for (const ep of eps) {
         const epUd = ensureUserData(ep)
         epUd.Played = ud.Played
         epUd.PlayedPercentage = ud.Played ? 100 : 0
-        if (ud.Played) epUd.PlaybackPositionTicks = 0
+        if (ud.Played) {
+          epUd.PlayCount = Math.max(1, epUd.PlayCount + 1)
+          epUd.PlaybackPositionTicks = 0
+          epUd.LastPlayedDate = ud.LastPlayedDate
+        }
       }
+      ud.UnplayedItemCount = ud.Played ? 0 : eps.length
     }
     return { ...ud } as T
+  }
+
+  const localTrailersMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Items\/([^/]+)\/LocalTrailers$/)
+  if (localTrailersMatch && method === 'GET') {
+    const itemId = decodeURIComponent(localTrailersMatch[2])
+    const trailers = store.localTrailersByItemId.get(itemId) || []
+    return trailers.map((t) => ({ ...t })) as T
+  }
+
+  const specialFeaturesMatch = pathname.match(
+    /^\/emby\/Users\/([^/]+)\/Items\/([^/]+)\/SpecialFeatures$/,
+  )
+  if (specialFeaturesMatch && method === 'GET') {
+    const itemId = decodeURIComponent(specialFeaturesMatch[2])
+    const extras = store.specialFeaturesByItemId.get(itemId) || []
+    return extras.map((e) => ({ ...e })) as T
   }
 
   // ==================== 8. PlaybackInfo、音频歌词 & 播放状态上报 ====================
@@ -2075,6 +2142,19 @@ export async function demoFetch<T>(
       `已向会话「${sess.DeviceName || sess.Id}」发送远程指令：${command}`,
       'SessionRemoteControl',
     )
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('ambra:ws-mock', {
+          detail: {
+            MessageType: 'Playstate',
+            Data: {
+              Command: command,
+              SessionId: sessionId,
+            },
+          },
+        }),
+      )
+    }
     return undefined as T
   }
 
@@ -2086,12 +2166,30 @@ export async function demoFetch<T>(
     const body = parseJsonBody(options)
     const header = String(body.Header || '系统通知')
     const text = String(body.Text || '')
+    const timeoutMs = Number(body.TimeoutMs ?? 5000)
     sess.LastActivityDate = new Date().toISOString()
     pushActivity(
       `已向会话「${sess.DeviceName || sess.Id}」发送消息：${header}`,
       'SessionMessageSent',
       text,
     )
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('ambra:ws-mock', {
+          detail: {
+            MessageType: 'GeneralCommand',
+            Data: {
+              Name: 'DisplayMessage',
+              Arguments: {
+                Header: header,
+                Text: text,
+                TimeoutMs: String(timeoutMs),
+              },
+            },
+          },
+        }),
+      )
+    }
     return undefined as T
   }
 
@@ -2804,7 +2902,7 @@ export async function demoFetch<T>(
         IsForced: isForced,
         IsExternal: true,
         DeliveryMethod: 'External',
-        DeliveryUrl: `data:text/plain;charset=utf-8,${encodeURIComponent(String(body.Data || ''))}`,
+        DeliveryUrl: `data:text/plain;base64,${String(body.Data || '')}`,
       })
       src.MediaStreams = streams
     }
@@ -2974,6 +3072,47 @@ export async function demoFetch<T>(
       pushActivity(`已删除媒体「${item.Name}」`, 'ItemDeleted')
     }
     return undefined as T
+  }
+
+  // ==================== 14.5 数据库备份与恢复 (BackupRestore) ====================
+  if (pathname === '/emby/BackupRestore/BackupInfo' && method === 'GET') {
+    const res: BackupInfoResponse = {
+      BackupDirectory: '/data/backups',
+      Backups: demoBackups.map((b) => ({ ...b })),
+    }
+    return res as T
+  }
+
+  if (pathname === '/emby/BackupRestore/Backup' && method === 'POST') {
+    const now = new Date()
+    const pad = (n: number) => String(n).padStart(2, '0')
+    const stamp = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}-${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}`
+    const name = `ambra-backup-${stamp}-${Math.random().toString(36).slice(2, 5)}.db`
+    const created: BackupFileInfo = {
+      Name: name,
+      Path: `/data/backups/${name}`,
+      Size: 2_684_354,
+      DateCreated: now.toISOString(),
+    }
+    demoBackups.unshift(created)
+    pushActivity(`已创建数据库热备份「${name}」`, 'BackupCreated')
+    return { ...created } as T
+  }
+
+  if (pathname === '/emby/BackupRestore/Restore' && method === 'POST') {
+    const body = parseJsonBody(options)
+    const name = String(body.Name || '').trim()
+    if (!name) throw new ApiError(400, '请指定要恢复的备份文件名')
+    const exists = demoBackups.find((b) => b.Name === name)
+    if (!exists) throw new ApiError(404, `备份文件「${name}」不存在`)
+    pushActivity(`已暂存数据库备份恢复「${name}」（重启后生效）`, 'BackupRestoreStaged')
+    const res: BackupRestoreResult = {
+      Restored: true,
+      BackupName: name,
+      StagedPath: '/data/ambra.db.restore',
+      RequiresRestart: true,
+    }
+    return res as T
   }
 
   // ==================== 15. 单用户查询/删除（放在更具体路由之后） ====================

@@ -33,6 +33,7 @@ import type { MediaSourceInfo, MediaStream } from '../api/types'
 import { AmbraLogo } from '../components/AmbraLogo'
 import { useAudioPlayer } from '../context/AudioPlayerContext'
 import { useAuth } from '../context/AuthContext'
+import { useWebSocket } from '../context/WebSocketContext'
 import { isDemoMode } from '../demo/demoMode'
 import { AssJassubRenderer } from '../player/assRenderer'
 import { PgsCanvasRenderer } from '../player/pgsRenderer'
@@ -167,6 +168,7 @@ export function PlayerPage() {
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
   const { auth } = useAuth()
+  const { subscribePlaystate } = useWebSocket()
   const audioPlayer = useAudioPlayer()
   const userId = auth!.userId
 
@@ -1289,25 +1291,64 @@ export function PlayerPage() {
   }, [subtitleStreams, subtitleIndex, pokeOsd])
 
   const handleExit = useCallback(() => {
-    if (window.history.length > 1) {
+    const historyIdx = (window.history.state as { idx?: number } | null)?.idx ?? 0
+    if (historyIdx > 0) {
       navigate(-1)
     } else {
       navigate(item?.Id ? `/item/${item.Id}` : '/', { replace: true })
     }
   }, [navigate, item?.Id])
 
-  const pipSupported = typeof document !== 'undefined' && 'pictureInPictureEnabled' in document
+  const pipSupported = Boolean(typeof document !== 'undefined' && document.pictureInPictureEnabled)
 
   const togglePip = useCallback(() => {
     const v = videoRef.current
-    if (!v || typeof document === 'undefined' || !('pictureInPictureEnabled' in document)) return
+    if (!v || !pipSupported) return
     if (document.pictureInPictureElement) {
       document.exitPictureInPicture?.().catch(() => undefined)
-    } else {
-      v.requestPictureInPicture?.().catch(() => undefined)
+    } else if (typeof v.requestPictureInPicture === 'function') {
+      v.requestPictureInPicture().catch(() => undefined)
     }
     pokeOsd()
-  }, [pokeOsd])
+  }, [pipSupported, pokeOsd])
+
+  // 订阅 WebSocket 远端播控指令 (Pause / Unpause / PlayPause / Stop / Seek)
+  useEffect(() => {
+    return subscribePlaystate((cmd) => {
+      const v = videoRef.current
+      switch (cmd.Command) {
+        case 'Pause':
+          v?.pause()
+          pokeOsd()
+          break
+        case 'Unpause':
+          v?.play().catch(() => undefined)
+          pokeOsd()
+          break
+        case 'PlayPause':
+          togglePlay()
+          break
+        case 'Stop':
+          reportState('stop')
+          handleExit()
+          break
+        case 'Seek': {
+          if (typeof cmd.SeekPositionTicks === 'number' && Number.isFinite(cmd.SeekPositionTicks)) {
+            const targetSec = Math.max(0, cmd.SeekPositionTicks / 10_000_000)
+            if (v) {
+              v.currentTime = targetSec
+              setCurrentTime(targetSec)
+              reportState('progress', 'timeupdate')
+            }
+            pokeOsd()
+          }
+          break
+        }
+        default:
+          break
+      }
+    })
+  }, [subscribePlaystate, togglePlay, reportState, handleExit, pokeOsd])
 
   const handleSelectQuality = useCallback(
     (presetId: QualityPresetId) => {
@@ -1419,6 +1460,13 @@ export function PlayerPage() {
         e.target instanceof HTMLSelectElement ||
         (e.target instanceof HTMLElement && e.target.isContentEditable)
       ) {
+        return
+      }
+      if (showShortcuts) {
+        if (e.key === 'Escape' || e.key === '?') {
+          e.preventDefault()
+          setShowShortcuts(false)
+        }
         return
       }
       const key = e.key.toLowerCase()

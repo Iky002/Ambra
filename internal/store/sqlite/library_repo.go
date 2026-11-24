@@ -2,7 +2,9 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha1"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +15,8 @@ import (
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 )
+
+const sqliteInChunkSize = 400
 
 var ErrNotFound = errors.New("not found")
 
@@ -73,6 +77,7 @@ type ItemExtra struct {
 	Artists                 []string          `json:"artists,omitempty"`
 	PrimaryImageAspectRatio *float64          `json:"primary_image_aspect_ratio,omitempty"`
 	CollectionType          string            `json:"collection_type,omitempty"`
+	ExtraType               string            `json:"extra_type,omitempty"`
 	Chapters                []ChapterRecord   `json:"chapters,omitempty"`
 	LockedFields            []string          `json:"LockedFields,omitempty"`
 	LockData                bool              `json:"LockData,omitempty"`
@@ -896,6 +901,9 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 		args  []any
 	)
 
+	// Exclude local extras (trailers, special features, theme songs/videos) from normal library/poster-wall queries.
+	where = append(where, `COALESCE(json_extract(i.extra_json, '$.extra_type'), '') = ''`)
+
 	userID := guid.Normalize(f.UserID)
 	if userID != "" {
 		joins = append(joins, `LEFT JOIN user_item_data u ON u.item_id = i.id AND u.user_id = ?`)
@@ -1375,6 +1383,9 @@ func (r *LibraryRepo) SearchHints(ctx context.Context, f SearchHintFilter) ([]dt
 		where []string
 		args  []any
 	)
+
+	// Exclude local extras (trailers, special features, theme songs/videos) from normal library/poster-wall queries.
+	where = append(where, `COALESCE(json_extract(i.extra_json, '$.extra_type'), '') = ''`)
 	joins = append(joins, `INNER JOIN item_search_fts fts ON fts.item_id = i.id`)
 	where = append(where, `item_search_fts MATCH ?`)
 	args = append(args, ftsExpr)
@@ -1662,7 +1673,7 @@ func (r *LibraryRepo) GetItemCountsWithAllowedLibraries(ctx context.Context, all
 	if allowedLibraryIDs != nil && len(allowedLibraryIDs) == 0 {
 		return &ItemCounts{}, nil
 	}
-	query := `SELECT type, COUNT(*) FROM items`
+	query := `SELECT type, COUNT(*) FROM items WHERE COALESCE(json_extract(extra_json, '$.extra_type'), '') = ''`
 	var args []any
 	if len(allowedLibraryIDs) > 0 {
 		ph := make([]string, len(allowedLibraryIDs))
@@ -1671,7 +1682,7 @@ func (r *LibraryRepo) GetItemCountsWithAllowedLibraries(ctx context.Context, all
 			ph[i] = "?"
 			args[i] = guid.Normalize(id)
 		}
-		query += ` WHERE library_id IN (` + strings.Join(ph, ",") + `)`
+		query += ` AND library_id IN (` + strings.Join(ph, ",") + `)`
 	}
 	query += ` GROUP BY type`
 
@@ -1750,55 +1761,78 @@ func (r *LibraryRepo) GetUserItemData(ctx context.Context, userID, itemID string
 }
 
 func (r *LibraryRepo) collectCascadeItemIDs(ctx context.Context, tx *sql.Tx, itemID string) ([]string, error) {
-	ids := []string{itemID}
-	var itemType string
-	err := tx.QueryRowContext(ctx, `SELECT type FROM items WHERE id = ?`, itemID).Scan(&itemType)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ids, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	var rows *sql.Rows
-	switch strings.ToLower(itemType) {
-	case "series":
-		rows, err = tx.QueryContext(ctx, `SELECT id FROM items WHERE series_id = ? OR parent_id = ?`, itemID, itemID)
-	case "season":
-		rows, err = tx.QueryContext(ctx, `SELECT id FROM items WHERE season_id = ? OR parent_id = ?`, itemID, itemID)
-	case "musicalbum":
-		rows, err = tx.QueryContext(ctx, `SELECT id FROM items WHERE parent_id = ?`, itemID)
-	case "boxset":
-		rows, err = tx.QueryContext(ctx,
-			`SELECT item_id FROM item_collections WHERE container_id = ?
-			 UNION
-			 SELECT id FROM items WHERE parent_id = ?`,
-			itemID, itemID,
-		)
-	default:
-		return ids, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
 	seen := map[string]struct{}{itemID: {}}
-	for rows.Next() {
-		var childID string
-		if err := rows.Scan(&childID); err != nil {
-			return nil, err
-		}
-		if childID == "" {
+	ids := []string{itemID}
+	queue := []string{itemID}
+
+	for len(queue) > 0 {
+		curID := queue[0]
+		queue = queue[1:]
+
+		var itemType string
+		err := tx.QueryRowContext(ctx, `SELECT type FROM items WHERE id = ?`, curID).Scan(&itemType)
+		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
-		if _, ok := seen[childID]; !ok {
-			seen[childID] = struct{}{}
-			ids = append(ids, childID)
+		if err != nil {
+			return nil, err
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+
+		var rows *sql.Rows
+		switch strings.ToLower(itemType) {
+		case "series":
+			rows, err = tx.QueryContext(ctx,
+				`SELECT id FROM items WHERE (series_id = ? OR parent_id = ?) AND COALESCE(json_extract(extra_json, '$.extra_type'), '') = ''`,
+				curID, curID,
+			)
+		case "season":
+			rows, err = tx.QueryContext(ctx,
+				`SELECT id FROM items WHERE (season_id = ? OR parent_id = ?) AND COALESCE(json_extract(extra_json, '$.extra_type'), '') = ''`,
+				curID, curID,
+			)
+		case "musicalbum":
+			rows, err = tx.QueryContext(ctx,
+				`SELECT id FROM items WHERE parent_id = ? AND COALESCE(json_extract(extra_json, '$.extra_type'), '') = ''`,
+				curID,
+			)
+		case "boxset":
+			rows, err = tx.QueryContext(ctx,
+				`SELECT item_id FROM item_collections WHERE container_id = ?
+				 UNION
+				 SELECT id FROM items WHERE parent_id = ? AND COALESCE(json_extract(extra_json, '$.extra_type'), '') = ''`,
+				curID, curID,
+			)
+		default:
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		var children []string
+		for rows.Next() {
+			var childID string
+			if err := rows.Scan(&childID); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if childID != "" {
+				children = append(children, childID)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+
+		for _, childID := range children {
+			if _, ok := seen[childID]; !ok {
+				seen[childID] = struct{}{}
+				ids = append(ids, childID)
+				queue = append(queue, childID)
+			}
+		}
 	}
 	return ids, nil
 }
@@ -1824,7 +1858,7 @@ func (r *LibraryRepo) MarkPlayed(ctx context.Context, userID, itemID string) (*d
 		VALUES (?, ?, 1, 1, 0, ?)
 		ON CONFLICT(user_id, item_id) DO UPDATE SET
 			played = 1,
-			play_count = CASE WHEN user_item_data.play_count < 1 THEN 1 ELSE user_item_data.play_count + 1 END,
+			play_count = CASE WHEN user_item_data.played = 1 THEN user_item_data.play_count ELSE user_item_data.play_count + 1 END,
 			playback_position_ticks = 0,
 			last_played_date = excluded.last_played_date`)
 	if err != nil {
@@ -2017,7 +2051,92 @@ func (r *LibraryRepo) GetImageByItemAndType(ctx context.Context, itemID, imageTy
 	return &rec, nil
 }
 
+// --- Local Extras ---
+
+// GetItemExtras returns child extra items (trailers, special features, theme songs/videos)
+// belonging to parentID, optionally filtered by extraTypes (case-insensitive).
+func (r *LibraryRepo) GetItemExtras(ctx context.Context, serverID, userID, parentID string, extraTypes []string) ([]dto.BaseItemDto, error) {
+	parentID = guid.Normalize(parentID)
+	userID = guid.Normalize(userID)
+	if parentID == "" {
+		return []dto.BaseItemDto{}, nil
+	}
+
+	var (
+		joins string
+		args  []any
+	)
+	selectCols := `
+		i.id, i.library_id, i.parent_id, i.series_id, i.season_id,
+		i.type, i.media_type, i.is_folder, i.is_strm,
+		i.name, i.original_title, i.sort_name,
+		i.index_number, i.parent_index_number, i.production_year,
+		i.premiere_date, i.end_date, i.community_rating, i.critic_rating, i.official_rating,
+		i.runtime_ticks, i.container, i.path, i.file_size, i.file_mtime,
+		i.etag, i.extra_json, i.date_created, i.date_modified`
+	if userID != "" {
+		joins = `LEFT JOIN user_item_data u ON u.item_id = i.id AND u.user_id = ?`
+		selectCols += `, COALESCE(u.played, 0), COALESCE(u.play_count, 0), COALESCE(u.playback_position_ticks, 0), COALESCE(u.is_favorite, 0), u.last_played_date`
+		args = append(args, userID)
+	}
+
+	where := []string{
+		`i.parent_id = ?`,
+		`COALESCE(json_extract(i.extra_json, '$.extra_type'), '') != ''`,
+	}
+	args = append(args, parentID)
+
+	if len(extraTypes) > 0 {
+		ph := make([]string, len(extraTypes))
+		for idx, et := range extraTypes {
+			ph[idx] = "?"
+			args = append(args, strings.ToLower(strings.TrimSpace(et)))
+		}
+		where = append(where, `LOWER(COALESCE(json_extract(i.extra_json, '$.extra_type'), '')) IN (`+strings.Join(ph, ",")+`)`)
+	}
+
+	querySQL := `SELECT ` + selectCols + ` FROM items i ` + joins + ` WHERE ` + strings.Join(where, " AND ") + ` ORDER BY i.sort_name ASC`
+	rows, err := r.store.Reader.QueryContext(ctx, querySQL, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get item extras: %w", err)
+	}
+	defer rows.Close()
+
+	var recs []ItemRecord
+	var uds []*dto.UserItemDataDto
+	for rows.Next() {
+		rec, ud, err := scanItemRow(rows, userID != "")
+		if err != nil {
+			return nil, err
+		}
+		recs = append(recs, rec)
+		uds = append(uds, ud)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(recs) == 0 {
+		return []dto.BaseItemDto{}, nil
+	}
+	return r.hydrateDTOs(ctx, recs, uds, serverID, userID, []string{"MediaSources", "MediaStreams", "Path"}, true)
+}
+
 // --- Hydration & Internal Helpers ---
+
+func chunkStrings(items []string, size int) [][]string {
+	if size <= 0 || len(items) == 0 {
+		return nil
+	}
+	chunks := make([][]string, 0, (len(items)+size-1)/size)
+	for start := 0; start < len(items); start += size {
+		end := start + size
+		if end > len(items) {
+			end = len(items)
+		}
+		chunks = append(chunks, items[start:end])
+	}
+	return chunks
+}
 
 type imageTagsSummary struct {
 	primary   string
@@ -2030,43 +2149,105 @@ func (r *LibraryRepo) loadImageTagsBatch(ctx context.Context, itemIDs []string) 
 	if len(itemIDs) == 0 {
 		return out, nil
 	}
-	ph := make([]string, len(itemIDs))
-	args := make([]any, len(itemIDs))
-	for i, id := range itemIDs {
-		ph[i] = "?"
-		args[i] = id
-	}
-	rows, err := r.store.Reader.QueryContext(ctx,
-		`SELECT item_id, image_type, image_index, tag FROM item_images WHERE item_id IN (`+strings.Join(ph, ",")+`) ORDER BY image_index ASC`,
-		args...,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var itemID, imgType, tag string
-		var idx int
-		if err := rows.Scan(&itemID, &imgType, &idx, &tag); err != nil {
+	for _, chunk := range chunkStrings(itemIDs, sqliteInChunkSize) {
+		ph := make([]string, len(chunk))
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			ph[i] = "?"
+			args[i] = id
+		}
+		rows, err := r.store.Reader.QueryContext(ctx,
+			`SELECT item_id, image_type, image_index, tag FROM item_images WHERE item_id IN (`+strings.Join(ph, ",")+`) ORDER BY image_index ASC`,
+			args...,
+		)
+		if err != nil {
 			return nil, err
 		}
-		sum := out[itemID]
-		if sum == nil {
-			sum = &imageTagsSummary{allTags: make(map[string]string)}
-			out[itemID] = sum
-		}
-		if strings.EqualFold(imgType, "Backdrop") {
-			sum.backdrops = append(sum.backdrops, tag)
-		} else {
-			if idx == 0 {
-				sum.allTags[imgType] = tag
+		for rows.Next() {
+			var itemID, imgType, tag string
+			var idx int
+			if err := rows.Scan(&itemID, &imgType, &idx, &tag); err != nil {
+				rows.Close()
+				return nil, err
 			}
-			if strings.EqualFold(imgType, "Primary") && idx == 0 {
-				sum.primary = tag
+			sum := out[itemID]
+			if sum == nil {
+				sum = &imageTagsSummary{allTags: make(map[string]string)}
+				out[itemID] = sum
+			}
+			if strings.EqualFold(imgType, "Backdrop") {
+				sum.backdrops = append(sum.backdrops, tag)
+			} else {
+				if idx == 0 {
+					sum.allTags[imgType] = tag
+				}
+				if strings.EqualFold(imgType, "Primary") && idx == 0 {
+					sum.primary = tag
+				}
 			}
 		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
 	}
-	return out, rows.Err()
+	return out, nil
+}
+
+type extraCounts struct {
+	trailers int
+	specials int
+}
+
+func (r *LibraryRepo) loadExtrasCountsBatch(ctx context.Context, parentIDs []string) (map[string]*extraCounts, error) {
+	out := make(map[string]*extraCounts)
+	for _, chunk := range chunkStrings(parentIDs, sqliteInChunkSize) {
+		ph := make([]string, len(chunk))
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			ph[i] = "?"
+			args[i] = id
+		}
+		rows, err := r.store.Reader.QueryContext(ctx, `
+			SELECT parent_id, LOWER(COALESCE(json_extract(extra_json, '$.extra_type'), '')), COUNT(*)
+			FROM items
+			WHERE parent_id IN (`+strings.Join(ph, ",")+`)
+			  AND COALESCE(json_extract(extra_json, '$.extra_type'), '') != ''
+			GROUP BY parent_id, LOWER(COALESCE(json_extract(extra_json, '$.extra_type'), ''))`,
+			args...,
+		)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var pid, et string
+			var cnt int
+			if err := rows.Scan(&pid, &et, &cnt); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			ec := out[pid]
+			if ec == nil {
+				ec = &extraCounts{}
+				out[pid] = ec
+			}
+			switch et {
+			case "trailer":
+				ec.trailers += cnt
+			case "themesong", "themevideo":
+				// Theme media are counted separately from trailers/special features.
+			default:
+				ec.specials += cnt
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	return out, nil
 }
 
 type containerPlayStats struct {
@@ -2077,10 +2258,10 @@ type containerPlayStats struct {
 
 func (r *LibraryRepo) loadSeriesSeasonStatsBatch(ctx context.Context, userID string, seriesIDs, seasonIDs []string) (map[string]*containerPlayStats, error) {
 	out := make(map[string]*containerPlayStats, len(seriesIDs)+len(seasonIDs))
-	if len(seriesIDs) > 0 {
-		ph := make([]string, len(seriesIDs))
-		args := make([]any, len(seriesIDs))
-		for i, id := range seriesIDs {
+	for _, chunk := range chunkStrings(seriesIDs, sqliteInChunkSize) {
+		ph := make([]string, len(chunk))
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
 			ph[i] = "?"
 			args[i] = id
 			out[id] = &containerPlayStats{}
@@ -2113,7 +2294,7 @@ func (r *LibraryRepo) loadSeriesSeasonStatsBatch(ctx context.Context, userID str
 		sRows.Close()
 
 		// Episode total & unplayed count per series
-		epArgs := make([]any, 0, len(seriesIDs)+1)
+		epArgs := make([]any, 0, len(chunk)+1)
 		epArgs = append(epArgs, userID)
 		epArgs = append(epArgs, args...)
 		epRows, err := r.store.Reader.QueryContext(ctx,
@@ -2146,11 +2327,11 @@ func (r *LibraryRepo) loadSeriesSeasonStatsBatch(ctx context.Context, userID str
 		epRows.Close()
 	}
 
-	if len(seasonIDs) > 0 {
-		ph := make([]string, len(seasonIDs))
-		epArgs := make([]any, 0, len(seasonIDs)+1)
+	for _, chunk := range chunkStrings(seasonIDs, sqliteInChunkSize) {
+		ph := make([]string, len(chunk))
+		epArgs := make([]any, 0, len(chunk)+1)
 		epArgs = append(epArgs, userID)
-		for i, id := range seasonIDs {
+		for i, id := range chunk {
 			ph[i] = "?"
 			epArgs = append(epArgs, id)
 			out[id] = &containerPlayStats{}
@@ -2269,6 +2450,14 @@ func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []
 		}
 	}
 
+	var extrasMap map[string]*extraCounts
+	if fullDetail {
+		extrasMap, err = r.loadExtrasCountsBatch(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	dtos := make([]dto.BaseItemDto, len(recs))
 	for i, rec := range recs {
 		created := time.Unix(rec.DateCreated, 0).UTC()
@@ -2291,6 +2480,7 @@ func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []
 			ParentId:                rec.ParentID,
 			Type:                    rec.Type,
 			MediaType:               rec.MediaType,
+			ExtraType:               rec.Extra.ExtraType,
 			CollectionType:          rec.Extra.CollectionType,
 			SeriesId:                rec.SeriesID,
 			SeriesName:              rec.Extra.SeriesName,
@@ -2305,6 +2495,10 @@ func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []
 			ImageTags:               map[string]string{},
 			BackdropImageTags:       []string{},
 			LocationType:            "FileSystem",
+		}
+		if ec, ok := extrasMap[rec.ID]; ok && ec != nil {
+			d.LocalTrailerCount = ec.trailers
+			d.SpecialFeatureCount = ec.specials
 		}
 		if rec.PremiereDate != nil && *rec.PremiereDate > 0 {
 			pt := time.Unix(*rec.PremiereDate, 0).UTC()
@@ -2322,10 +2516,16 @@ func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []
 		}
 		if len(rec.Extra.Chapters) > 0 {
 			chapters := make([]dto.ChapterInfo, len(rec.Extra.Chapters))
+			tagSeed := rec.Etag
+			if tagSeed == "" {
+				tagSeed = rec.ID
+			}
 			for idx, ch := range rec.Extra.Chapters {
+				sum := sha1.Sum([]byte(fmt.Sprintf("%s:%d", tagSeed, idx)))
 				chapters[idx] = dto.ChapterInfo{
 					StartPositionTicks: ch.StartPositionTicks,
 					Name:               ch.Name,
+					ImageTag:           hex.EncodeToString(sum[:])[:12],
 				}
 			}
 			d.Chapters = chapters
@@ -2413,38 +2613,45 @@ func (r *LibraryRepo) loadTaxonomiesBatch(ctx context.Context, itemIDs []string)
 	if len(itemIDs) == 0 {
 		return genres, studios, tags, nil
 	}
-	ph := make([]string, len(itemIDs))
-	args := make([]any, len(itemIDs))
-	for i, id := range itemIDs {
-		ph[i] = "?"
-		args[i] = id
-	}
-	rows, err := r.store.Reader.QueryContext(ctx, `
-		SELECT it.item_id, t.kind, t.id, t.name
-		FROM item_taxonomies it
-		JOIN taxonomies t ON t.id = it.taxonomy_id
-		WHERE it.item_id IN (`+strings.Join(ph, ",")+`)
-		ORDER BY t.sort_name ASC`, args...)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var itemID, kind, id, name string
-		if err := rows.Scan(&itemID, &kind, &id, &name); err != nil {
+	for _, chunk := range chunkStrings(itemIDs, sqliteInChunkSize) {
+		ph := make([]string, len(chunk))
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			ph[i] = "?"
+			args[i] = id
+		}
+		rows, err := r.store.Reader.QueryContext(ctx, `
+			SELECT it.item_id, t.kind, t.id, t.name
+			FROM item_taxonomies it
+			JOIN taxonomies t ON t.id = it.taxonomy_id
+			WHERE it.item_id IN (`+strings.Join(ph, ",")+`)
+			ORDER BY t.sort_name ASC`, args...)
+		if err != nil {
 			return nil, nil, nil, err
 		}
-		pair := dto.NameIdPair{Id: id, Name: name}
-		switch strings.ToLower(kind) {
-		case "genre":
-			genres[itemID] = append(genres[itemID], pair)
-		case "studio":
-			studios[itemID] = append(studios[itemID], pair)
-		case "tag":
-			tags[itemID] = append(tags[itemID], name)
+		for rows.Next() {
+			var itemID, kind, id, name string
+			if err := rows.Scan(&itemID, &kind, &id, &name); err != nil {
+				rows.Close()
+				return nil, nil, nil, err
+			}
+			pair := dto.NameIdPair{Id: id, Name: name}
+			switch strings.ToLower(kind) {
+			case "genre":
+				genres[itemID] = append(genres[itemID], pair)
+			case "studio":
+				studios[itemID] = append(studios[itemID], pair)
+			case "tag":
+				tags[itemID] = append(tags[itemID], name)
+			}
 		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, nil, nil, err
+		}
+		rows.Close()
 	}
-	return genres, studios, tags, rows.Err()
+	return genres, studios, tags, nil
 }
 
 // GetTaxonomiesByItemID returns persisted genre, studio, and tag names for itemID.
@@ -2489,38 +2696,48 @@ func (r *LibraryRepo) GetPeopleByItemID(ctx context.Context, itemID string) ([]d
 
 func (r *LibraryRepo) loadPeopleBatch(ctx context.Context, itemIDs []string) (map[string][]dto.BaseItemPerson, error) {
 	out := make(map[string][]dto.BaseItemPerson)
-	ph := make([]string, len(itemIDs))
-	args := make([]any, len(itemIDs))
-	for i, id := range itemIDs {
-		ph[i] = "?"
-		args[i] = id
+	if len(itemIDs) == 0 {
+		return out, nil
 	}
-	rows, err := r.store.Reader.QueryContext(ctx, `
-		SELECT ip.item_id, p.id, p.name, ip.role, ip.person_type, COALESCE(img.tag, '')
-		FROM item_people ip
-		JOIN people p ON p.id = ip.person_id
-		LEFT JOIN item_images img ON img.item_id = p.id AND LOWER(img.image_type) = 'primary' AND img.image_index = 0
-		WHERE ip.item_id IN (`+strings.Join(ph, ",")+`)
-		ORDER BY ip.sort_order ASC`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var itemID, id, name, pType, primaryTag string
-		var role sql.NullString
-		if err := rows.Scan(&itemID, &id, &name, &role, &pType, &primaryTag); err != nil {
+	for _, chunk := range chunkStrings(itemIDs, sqliteInChunkSize) {
+		ph := make([]string, len(chunk))
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			ph[i] = "?"
+			args[i] = id
+		}
+		rows, err := r.store.Reader.QueryContext(ctx, `
+			SELECT ip.item_id, p.id, p.name, ip.role, ip.person_type, COALESCE(img.tag, '')
+			FROM item_people ip
+			JOIN people p ON p.id = ip.person_id
+			LEFT JOIN item_images img ON img.item_id = p.id AND LOWER(img.image_type) = 'primary' AND img.image_index = 0
+			WHERE ip.item_id IN (`+strings.Join(ph, ",")+`)
+			ORDER BY ip.sort_order ASC`, args...)
+		if err != nil {
 			return nil, err
 		}
-		out[itemID] = append(out[itemID], dto.BaseItemPerson{
-			Id:              id,
-			Name:            name,
-			Role:            role.String,
-			Type:            pType,
-			PrimaryImageTag: primaryTag,
-		})
+		for rows.Next() {
+			var itemID, id, name, pType, primaryTag string
+			var role sql.NullString
+			if err := rows.Scan(&itemID, &id, &name, &role, &pType, &primaryTag); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out[itemID] = append(out[itemID], dto.BaseItemPerson{
+				Id:              id,
+				Name:            name,
+				Role:            role.String,
+				Type:            pType,
+				PrimaryImageTag: primaryTag,
+			})
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // MediaSourceRecordsToDTO converts MediaSourceRecord slices into Emby DTOs.

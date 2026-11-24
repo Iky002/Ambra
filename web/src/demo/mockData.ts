@@ -135,6 +135,8 @@ export interface DemoState {
   items: Map<string, BaseItemDto>
   seasonsBySeries: Map<string, BaseItemDto[]>
   episodesBySeason: Map<string, BaseItemDto[]>
+  localTrailersByItemId: Map<string, BaseItemDto[]>
+  specialFeaturesByItemId: Map<string, BaseItemDto[]>
   lyricsByItemId: Map<string, AudioLyricsResponse>
   artById: Map<string, DemoArtMeta>
   userAvatarById: Map<string, string>
@@ -417,6 +419,8 @@ export function createInitialDemoState(): DemoState {
   const items = new Map<string, BaseItemDto>()
   const seasonsBySeries = new Map<string, BaseItemDto[]>()
   const episodesBySeason = new Map<string, BaseItemDto[]>()
+  const localTrailersByItemId = new Map<string, BaseItemDto[]>()
+  const specialFeaturesByItemId = new Map<string, BaseItemDto[]>()
   const lyricsByItemId = new Map<string, AudioLyricsResponse>()
 
   const registerItem = (
@@ -514,6 +518,66 @@ export function createInitialDemoState(): DemoState {
     ['#1e293b', '#334155', '#f59e0b'],
     '4K HDR10',
   )
+
+  // 肖申克的救赎：本地预告片与花絮特辑
+  const shawshankTrailer: BaseItemDto = {
+    Id: 'trailer-shawshank-01',
+    Name: '肖申克的救赎 · 官方 4K 预告片',
+    OriginalTitle: 'The Shawshank Redemption - Official Trailer',
+    ServerId: DEMO_SERVER_ID,
+    Type: 'Trailer',
+    MediaType: 'Video',
+    ParentId: 'item-shawshank-redemption',
+    ProductionYear: 1994,
+    RunTimeTicks: 2 * MIN_TICKS + 18 * 10_000_000,
+    Overview: '4K 修复版官方剧场预告片。',
+    MediaSources: makeMediaSources('trailer-shawshank-01', '肖申克的救赎 预告片', {
+      resolution: '4K',
+      videoRange: 'HDR10',
+      codec: 'hevc',
+      runTimeTicks: 2 * MIN_TICKS + 18 * 10_000_000,
+    }),
+    ImageTags: { Primary: 'demo-p' },
+    BackdropImageTags: ['demo-b'],
+    PrimaryImageAspectRatio: 1.778,
+  }
+  const shawshankFeaturette: BaseItemDto = {
+    Id: 'extra-shawshank-01',
+    Name: '希望是美好的事物：幕后制作特辑',
+    OriginalTitle: 'Hope Springs Eternal: A Look Back at The Shawshank Redemption',
+    ServerId: DEMO_SERVER_ID,
+    Type: 'Extra',
+    MediaType: 'Video',
+    ParentId: 'item-shawshank-redemption',
+    ProductionYear: 2004,
+    RunTimeTicks: 18 * MIN_TICKS,
+    Overview: '导演弗兰克·德拉邦特与主演蒂姆·罗宾斯、摩根·弗里曼回顾经典幕后故事。',
+    MediaSources: makeMediaSources('extra-shawshank-01', '肖申克的救赎 幕后特辑', {
+      resolution: '1080P',
+      videoRange: 'SDR',
+      codec: 'h264',
+      runTimeTicks: 18 * MIN_TICKS,
+    }),
+    ImageTags: { Primary: 'demo-p' },
+    BackdropImageTags: ['demo-b'],
+    PrimaryImageAspectRatio: 1.778,
+  }
+  registerItem(
+    shawshankTrailer,
+    ['#1e293b', '#334155', '#f59e0b'],
+    '4K TRAILER',
+    TMDB_MEDIA_ART['item-shawshank-redemption'],
+  )
+  registerItem(
+    shawshankFeaturette,
+    ['#1e293b', '#334155', '#f59e0b'],
+    'FEATURETTE',
+    TMDB_MEDIA_ART['item-shawshank-redemption'],
+  )
+  localTrailersByItemId.set('item-shawshank-redemption', [shawshankTrailer])
+  localTrailersByItemId.set('item-shawshank', [shawshankTrailer])
+  specialFeaturesByItemId.set('item-shawshank-redemption', [shawshankFeaturette])
+  specialFeaturesByItemId.set('item-shawshank', [shawshankFeaturette])
 
   registerItem(
     {
@@ -2811,6 +2875,8 @@ export function createInitialDemoState(): DemoState {
     items,
     seasonsBySeries,
     episodesBySeason,
+    localTrailersByItemId,
+    specialFeaturesByItemId,
     lyricsByItemId,
     artById,
     userAvatarById,

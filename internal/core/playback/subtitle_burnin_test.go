@@ -128,12 +128,12 @@ func TestDecideTranscodingURLParamsDirectStreamAndTranscode(t *testing.T) {
 	eng := New(repo, plugins.NewRegistry(), config.Default(tmp))
 	audioIdx := 2
 
-	// Tier 4 DirectStream (h264 OK, mkv/dts not direct-playable, bitrate OK)
+	// Tier 4 DirectStream (h264 OK, mkv/dts not direct-playable, bitrate & resolution OK)
 	respDS, detDS, err := eng.Decide(ctx, itemID, PlaybackInfoRequest{
 		AudioStreamIndex:    &audioIdx,
 		MaxStreamingBitrate: 10_000_000,
-		MaxWidth:            1280,
-		MaxHeight:           720,
+		MaxWidth:            1920,
+		MaxHeight:           1080,
 		DeviceProfile: &DeviceProfile{
 			Name: "WebBrowser",
 			DirectPlayProfiles: []DirectPlayProfile{
@@ -152,8 +152,8 @@ func TestDecideTranscodingURLParamsDirectStreamAndTranscode(t *testing.T) {
 		"VideoCodec=copy",
 		"AudioStreamIndex=2",
 		"VideoBitrate=9808000",
-		"MaxWidth=1280",
-		"MaxHeight=720",
+		"MaxWidth=1920",
+		"MaxHeight=1080",
 	} {
 		if !strings.Contains(dsURL, want) {
 			t.Fatalf("DirectStream TranscodingUrl %q missing %q", dsURL, want)
