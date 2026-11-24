@@ -64,6 +64,8 @@ func (s *Scanner) downloadAndSaveRemoteImagesForce(ctx context.Context, rec *sql
 		return false
 	}
 
+	lib, saveLocal := s.shouldSaveLocalMetadata(ctx, rec.LibraryID)
+
 	artworks := []struct {
 		imgType string
 		rawURL  string
@@ -75,12 +77,73 @@ func (s *Scanner) downloadAndSaveRemoteImagesForce(ctx context.Context, rec *sql
 
 	var savedAny bool
 	for _, art := range artworks {
-		if s.downloadAndSaveRemoteImageForce(ctx, rec.ID, art.imgType, art.rawURL, forceReplace) {
+		if s.downloadAndSaveItemRemoteImage(ctx, lib, rec, saveLocal, art.imgType, art.rawURL, forceReplace) {
 			savedAny = true
 		}
 	}
 
 	return savedAny
+}
+
+func (s *Scanner) downloadAndSaveItemRemoteImage(
+	ctx context.Context,
+	lib *sqlite.LibraryRecord,
+	rec *sqlite.ItemRecord,
+	saveLocal bool,
+	imgType, rawURL string,
+	forceReplace bool,
+) bool {
+	rawURL = strings.TrimSpace(rawURL)
+	if rec == nil || rec.ID == "" || !isHTTPURL(rawURL) {
+		return false
+	}
+
+	if !forceReplace {
+		if existing, err := s.repo.GetImageByItemAndType(ctx, rec.ID, imgType, 0); err == nil && existing != nil && existing.Path != "" {
+			if info, statErr := os.Stat(existing.Path); statErr == nil && info.Size() > 0 {
+				return false
+			}
+		}
+	}
+
+	data, contentType, ok := fetchRemoteImage(ctx, s.getHTTPClient(), rawURL)
+	if !ok {
+		return false
+	}
+
+	ext := detectImageExtension(contentType, rawURL)
+	destPath := ""
+	if saveLocal {
+		if localPath, canLocal := s.resolveLocalImagePath(ctx, lib, rec, imgType, ext); canLocal {
+			if err := writeFileAtomic(localPath, data); err == nil {
+				destPath = localPath
+			}
+		}
+	}
+
+	if destPath == "" {
+		destDir := filepath.Join(s.imageStorageDir(), rec.ID)
+		if err := os.MkdirAll(destDir, 0o755); err != nil {
+			return false
+		}
+		destPath = filepath.Join(destDir, strings.ToLower(imgType)+ext)
+		if err := writeFileAtomic(destPath, data); err != nil {
+			return false
+		}
+	}
+
+	sum := sha256.Sum256(data)
+	tag := hex.EncodeToString(sum[:8])
+	if err := s.repo.UpsertImage(ctx, &sqlite.ImageRecord{
+		ItemID:     rec.ID,
+		ImageType:  imgType,
+		ImageIndex: 0,
+		Path:       destPath,
+		Tag:        tag,
+	}); err == nil {
+		return true
+	}
+	return false
 }
 
 func (s *Scanner) downloadAndSaveRemoteImage(ctx context.Context, targetID, imgType, rawURL string) bool {

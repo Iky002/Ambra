@@ -746,6 +746,7 @@ export const api = {
     CollectionType: string
     Paths: string[]
     refreshLibrary?: boolean
+    saveLocalMetadata?: boolean
   }) => {
     const q = new URLSearchParams({
       name: payload.Name,
@@ -760,10 +761,20 @@ export const api = {
         Paths: payload.Paths,
         LibraryOptions: {
           PathInfos: payload.Paths.map((p) => ({ Path: p })),
+          SaveLocalMetadata: payload.saveLocalMetadata ?? true,
         },
       }),
     })
   },
+
+  updateVirtualFolderOptions: (id: string, libraryOptions: Record<string, unknown>) =>
+    embyFetch<void>('/emby/Library/VirtualFolders/LibraryOptions', {
+      method: 'POST',
+      body: JSON.stringify({
+        Id: id,
+        LibraryOptions: libraryOptions,
+      }),
+    }),
 
   deleteVirtualFolder: (params: { name?: string; id?: string }) => {
     const q = new URLSearchParams()

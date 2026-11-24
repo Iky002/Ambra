@@ -83,6 +83,7 @@ func (s *Scanner) RefreshItem(ctx context.Context, itemID string, replaceMetadat
 	relMeta := filterLockedRelations(rec, meta)
 	s.persistMetaRelationsAndFTS(ctx, rec, relMeta)
 	s.downloadAndSaveRemoteImagesForce(ctx, rec, meta, replaceImages)
+	s.saveLocalNFOIfEnabled(ctx, rec, relMeta, replaceMetadata)
 
 	return nil
 }
