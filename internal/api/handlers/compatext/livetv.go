@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -191,6 +192,16 @@ func (h *Handler) registerLiveTVRoutes(r chi.Router, wrapAuth, wrapAdmin func(ht
 }
 
 func (h *Handler) handleLiveStreamFile(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "Id")
+	h.mu.RLock()
+	lt := h.liveTV
+	h.mu.RUnlock()
+	if lt != nil {
+		if ch, ok := lt.GetChannelByID(id); ok && strings.TrimSpace(ch.StreamUrl) != "" {
+			lt.ProxyStreamURL(w, r, ch.StreamUrl)
+			return
+		}
+	}
 	container := strings.ToLower(chi.URLParam(r, "Container"))
 	w.Header().Set("Content-Type", containerContentType(container))
 	w.Header().Set("Content-Length", strconv.Itoa(len(tsNullPacket)))
@@ -203,8 +214,13 @@ func (h *Handler) handleLiveRecordingStream(w http.ResponseWriter, r *http.Reque
 	var st sharedLiveTVState
 	if h.readConfigJSON(r.Context(), liveTVConfigKey, &st) {
 		for _, rec := range st.Recordings {
-			if rec.Id == id && rec.Path != "" {
-				http.ServeFile(w, r, rec.Path)
+			if rec.Id == id && strings.TrimSpace(rec.Path) != "" {
+				resolved, ok := h.resolveRecordingPath(rec.Path)
+				if !ok {
+					httpx.Error(w, http.StatusForbidden, "recording path is outside recordings directory")
+					return
+				}
+				http.ServeFile(w, r, resolved)
 				return
 			}
 		}
@@ -213,6 +229,47 @@ func (h *Handler) handleLiveRecordingStream(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Content-Length", strconv.Itoa(len(tsNullPacket)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(tsNullPacket)
+}
+
+func (h *Handler) recordingsDir() string {
+	h.mu.RLock()
+	rec := h.dvrRec
+	h.mu.RUnlock()
+	if rec != nil && strings.TrimSpace(rec.RecordingsDir()) != "" {
+		return rec.RecordingsDir()
+	}
+	if h.cfg != nil && strings.TrimSpace(h.cfg.DataDir) != "" {
+		return filepath.Join(h.cfg.DataDir, "recordings")
+	}
+	return ""
+}
+
+func (h *Handler) resolveRecordingPath(target string) (string, bool) {
+	baseDir := strings.TrimSpace(h.recordingsDir())
+	target = strings.TrimSpace(target)
+	if baseDir == "" || target == "" {
+		return "", false
+	}
+	resolvedDir, err := filepath.EvalSymlinks(baseDir)
+	if err != nil {
+		return "", false
+	}
+	resolvedDir = filepath.Clean(resolvedDir)
+
+	resolvedTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		return "", false
+	}
+	resolvedTarget = filepath.Clean(resolvedTarget)
+
+	rel, err := filepath.Rel(resolvedDir, resolvedTarget)
+	if err != nil {
+		return "", false
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", false
+	}
+	return resolvedTarget, true
 }
 
 func (h *Handler) handleHLSMaster(headOnly bool) http.HandlerFunc {
@@ -477,16 +534,24 @@ func (h *Handler) handleChannelTagPrefixes(w http.ResponseWriter, r *http.Reques
 
 func (h *Handler) handleDeleteRecordingPost(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "Id")
+	var removedPaths []string
 	var st sharedLiveTVState
 	if h.readConfigJSON(r.Context(), liveTVConfigKey, &st) {
 		filtered := make([]liveTVRecording, 0, len(st.Recordings))
 		for _, rec := range st.Recordings {
 			if rec.Id != id {
 				filtered = append(filtered, rec)
+			} else if strings.TrimSpace(rec.Path) != "" {
+				removedPaths = append(removedPaths, rec.Path)
 			}
 		}
 		st.Recordings = filtered
 		h.writeConfigJSON(r.Context(), liveTVConfigKey, st)
+	}
+	for _, p := range removedPaths {
+		if resolved, ok := h.resolveRecordingPath(p); ok {
+			_ = os.Remove(resolved)
+		}
 	}
 	httpx.NoContent(w)
 }
@@ -497,6 +562,12 @@ func (h *Handler) handleDeleteTimerPost(w http.ResponseWriter, r *http.Request) 
 	if h.readConfigJSON(r.Context(), liveTVConfigKey, &st) {
 		st.Timers = filterRawByID(st.Timers, id)
 		h.writeConfigJSON(r.Context(), liveTVConfigKey, st)
+	}
+	h.mu.RLock()
+	rec := h.dvrRec
+	h.mu.RUnlock()
+	if rec != nil {
+		_ = rec.CancelRecording(id)
 	}
 	httpx.NoContent(w)
 }

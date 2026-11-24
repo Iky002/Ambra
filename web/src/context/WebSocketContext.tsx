@@ -1,4 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { Bell, X } from 'lucide-react'
 import { getDeviceId } from '../api/client'
 import { isDemoMode } from '../demo/demoMode'
@@ -6,7 +7,7 @@ import { useAuth } from './AuthContext'
 
 export interface PlaystateCommand {
   Command: 'Pause' | 'Unpause' | 'PlayPause' | 'Stop' | 'Seek' | string
-  SeekPositionTicks?: number
+  SeekPositionTicks?: number | string
   ControllingUserId?: string
 }
 
@@ -44,14 +45,61 @@ const MAX_RECONNECT_DELAY_MS = 30_000
 const KEEPALIVE_INTERVAL_MS = 30_000
 const DEFAULT_TOAST_TIMEOUT_MS = 5_000
 const MAX_VISIBLE_TOASTS = 5
+const INVALIDATE_DEBOUNCE_MS = 350
+
+const USER_DATA_CHANGED_KEYS = [
+  'resumeItems',
+  'nextUp',
+  'favorites',
+  'episodes',
+  'seasons',
+  'libraryItems',
+  'item',
+] as const
+
+const LIBRARY_CHANGED_KEYS = [
+  'latestItems',
+  'libraryItems',
+  'userViews',
+  'collections',
+] as const
 
 export function WebSocketProvider({ children }: { children: React.ReactNode }) {
   const { auth } = useAuth()
+  const queryClient = useQueryClient()
   const [connected, setConnected] = useState(false)
   const [toasts, setToasts] = useState<ToastNotification[]>([])
 
   const playstateListenersRef = useRef<Set<(cmd: PlaystateCommand) => void>>(new Set())
   const toastTimersRef = useRef<Map<string, number>>(new Map())
+  const pendingInvalidationsRef = useRef<Set<string>>(new Set())
+  const invalidateTimerRef = useRef<number | null>(null)
+
+  const clearPendingInvalidations = useCallback(() => {
+    if (invalidateTimerRef.current !== null) {
+      window.clearTimeout(invalidateTimerRef.current)
+      invalidateTimerRef.current = null
+    }
+    pendingInvalidationsRef.current.clear()
+  }, [])
+
+  const scheduleInvalidations = useCallback(
+    (keys: readonly string[]) => {
+      keys.forEach((key) => pendingInvalidationsRef.current.add(key))
+      if (invalidateTimerRef.current !== null) {
+        window.clearTimeout(invalidateTimerRef.current)
+      }
+      invalidateTimerRef.current = window.setTimeout(() => {
+        invalidateTimerRef.current = null
+        const keysToFlush = Array.from(pendingInvalidationsRef.current)
+        pendingInvalidationsRef.current.clear()
+        keysToFlush.forEach((key) => {
+          void queryClient.invalidateQueries({ queryKey: [key] })
+        })
+      }, INVALIDATE_DEBOUNCE_MS)
+    },
+    [queryClient],
+  )
 
   const dismissToast = useCallback((id: string) => {
     const timer = toastTimersRef.current.get(id)
@@ -101,8 +149,9 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
     return () => {
       timers.forEach((timer) => window.clearTimeout(timer))
       timers.clear()
+      clearPendingInvalidations()
     }
-  }, [])
+  }, [clearPendingInvalidations])
 
   const handleIncomingPayload = useCallback(
     (raw: unknown) => {
@@ -146,9 +195,13 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
             }
           })
         }
+      } else if (envelope.MessageType === 'UserDataChanged') {
+        scheduleInvalidations(USER_DATA_CHANGED_KEYS)
+      } else if (envelope.MessageType === 'LibraryChanged') {
+        scheduleInvalidations(LIBRARY_CHANGED_KEYS)
       }
     },
-    [pushToast],
+    [pushToast, scheduleInvalidations],
   )
 
   const subscribePlaystate = useCallback((cb: (cmd: PlaystateCommand) => void) => {
@@ -261,6 +314,7 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
       disposed = true
       clearReconnect()
       clearKeepAlive()
+      clearPendingInvalidations()
       if (ws) {
         ws.onopen = null
         ws.onmessage = null
@@ -275,7 +329,7 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
       }
       setConnected(false)
     }
-  }, [auth?.accessToken, auth?.deviceId, handleIncomingPayload])
+  }, [auth?.accessToken, auth?.deviceId, handleIncomingPayload, clearPendingInvalidations])
 
   const value = useMemo<WebSocketContextValue>(
     () => ({

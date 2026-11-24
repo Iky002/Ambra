@@ -111,11 +111,54 @@ func (h *Handler) handleServeItemImageFull(w http.ResponseWriter, r *http.Reques
 	}
 	if err := h.imaging.ServeHTTPWithOptions(w, r, itemID, imageType, idx, opts); err != nil {
 		if errors.Is(err, sqlite.ErrNotFound) || os.IsNotExist(err) {
+			if strings.EqualFold(imageType, "Chapter") && h.tryExtractAndServeChapterImage(w, r, itemID, idx, opts) {
+				return
+			}
 			httpx.Error(w, http.StatusNotFound, "image not found")
 			return
 		}
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 	}
+}
+
+func (h *Handler) tryExtractAndServeChapterImage(w http.ResponseWriter, r *http.Request, itemID string, idx int, opts imaging.Options) bool {
+	if h.extractor == nil || h.repo == nil || idx < 0 {
+		return false
+	}
+	normID := guid.Normalize(itemID)
+	rec, err := h.repo.GetItemRecordByID(r.Context(), normID)
+	if err != nil || rec == nil || idx >= len(rec.Extra.Chapters) {
+		return false
+	}
+	mediaPath, err := h.resolveItemMediaPath(r.Context(), normID, rec)
+	if err != nil || strings.TrimSpace(mediaPath) == "" {
+		return false
+	}
+	startTicks := rec.Extra.Chapters[idx].StartPositionTicks
+	thumbPath, err := h.extractor.ExtractChapterThumbnail(r.Context(), mediaPath, normID, idx, startTicks)
+	if err != nil || thumbPath == "" {
+		return false
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("chapter:%s:%d:%d", normID, idx, startTicks)))
+	tag := hex.EncodeToString(sum[:8])
+	_ = h.repo.UpsertImage(r.Context(), &sqlite.ImageRecord{
+		ItemID:     normID,
+		ImageType:  "Chapter",
+		ImageIndex: idx,
+		Path:       thumbPath,
+		Tag:        tag,
+	})
+	return h.imaging.ServeHTTPWithOptions(w, r, normID, "Chapter", idx, opts) == nil
+}
+
+func (h *Handler) resolveItemMediaPath(ctx context.Context, itemID string, rec *sqlite.ItemRecord) (string, error) {
+	if sources, err := h.repo.GetMediaSourcesByItemID(ctx, itemID); err == nil && len(sources) > 0 && strings.TrimSpace(sources[0].Path) != "" {
+		return sources[0].Path, nil
+	}
+	if rec != nil && strings.TrimSpace(rec.Path) != "" {
+		return rec.Path, nil
+	}
+	return "", sqlite.ErrNotFound
 }
 
 func (h *Handler) handleUploadItemImage(w http.ResponseWriter, r *http.Request) {

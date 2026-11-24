@@ -66,7 +66,21 @@ func TestForgotPasswordPinRealResetAndRateLimit(t *testing.T) {
 		t.Fatalf("expected expired pin file to be pruned, stat err=%v", err)
 	}
 
-	// Verify PIN file exists on disk with 0600 permissions and contains the PIN.
+	// Verify PIN file exists on disk with 0600 permissions, filename does NOT leak PIN,
+	// and file content contains the PIN.
+	env.handler.mu.RLock()
+	var firstPin string
+	for k := range env.handler.forgotPins {
+		firstPin = k
+		break
+	}
+	env.handler.mu.RUnlock()
+	if firstPin == "" {
+		t.Fatal("expected active generated PIN")
+	}
+	if strings.Contains(strings.ToUpper(fpResp.PinFile), strings.ToUpper(firstPin)) {
+		t.Fatalf("security regression: PinFile %q must NOT contain PIN %q", fpResp.PinFile, firstPin)
+	}
 	info, err := os.Stat(fpResp.PinFile)
 	if err != nil {
 		t.Fatalf("expected PIN file on disk at %s: %v", fpResp.PinFile, err)
@@ -75,7 +89,7 @@ func TestForgotPasswordPinRealResetAndRateLimit(t *testing.T) {
 		t.Fatalf("expected PIN file mode 0600, got %o", perm)
 	}
 	content, _ := os.ReadFile(fpResp.PinFile)
-	if !strings.Contains(string(content), "User: admin") {
+	if !strings.Contains(string(content), "User: admin") || !strings.Contains(string(content), "PIN: "+firstPin) {
 		t.Fatalf("unexpected PIN file content: %q", string(content))
 	}
 
@@ -122,6 +136,9 @@ func TestForgotPasswordPinRealResetAndRateLimit(t *testing.T) {
 	env.handler.mu.RUnlock()
 	if validPin == "" {
 		t.Fatal("expected generated valid PIN")
+	}
+	if strings.Contains(strings.ToUpper(fpResp2.PinFile), strings.ToUpper(validPin)) {
+		t.Fatalf("security regression: second PinFile %q must NOT contain PIN %q", fpResp2.PinFile, validPin)
 	}
 
 	redeemRec := doReq(t, env.router, "POST", "/Users/ForgotPassword/Pin", `{"Pin":"`+validPin+`"}`)

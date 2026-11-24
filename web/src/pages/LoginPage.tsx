@@ -3,6 +3,8 @@ import { useQuery } from '@tanstack/react-query'
 import {
   AlertCircle,
   ArrowRight,
+  CheckCircle2,
+  KeyRound,
   Loader2,
   Lock,
   Server,
@@ -10,6 +12,7 @@ import {
   Sparkles,
   User,
   UserCheck,
+  X,
 } from 'lucide-react'
 import { Navigate, useNavigate } from 'react-router-dom'
 import { api, getUserImageUrl } from '../api/client'
@@ -24,7 +27,85 @@ export function LoginPage() {
   const [password, setPassword] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
+  const [resetSuccessMessage, setResetSuccessMessage] = useState('')
+
+  // 忘记密码 / PIN 重置两步弹窗状态
+  const [forgotOpen, setForgotOpen] = useState(false)
+  const [forgotStep, setForgotStep] = useState<1 | 2>(1)
+  const [forgotUsername, setForgotUsername] = useState('')
+  const [forgotPinFile, setForgotPinFile] = useState('')
+  const [forgotPinExpiration, setForgotPinExpiration] = useState('')
+  const [forgotPin, setForgotPin] = useState('')
+  const [forgotLoading, setForgotLoading] = useState(false)
+  const [forgotError, setForgotError] = useState('')
+
   const demoActive = isDemoMode()
+
+  const openForgotModal = () => {
+    setForgotUsername(username.trim())
+    setForgotPinFile('')
+    setForgotPinExpiration('')
+    setForgotPin('')
+    setForgotError('')
+    setForgotStep(1)
+    setForgotOpen(true)
+  }
+
+  const closeForgotModal = () => {
+    setForgotOpen(false)
+    setForgotError('')
+    setForgotLoading(false)
+  }
+
+  const handleForgotStep1 = async (e: React.FormEvent) => {
+    e.preventDefault()
+    const targetUser = forgotUsername.trim()
+    if (!targetUser) {
+      setForgotError('请输入需要重置密码的用户名')
+      return
+    }
+    setForgotError('')
+    setForgotLoading(true)
+    try {
+      const res = await api.forgotPassword(targetUser)
+      setForgotPinFile(res?.PinFile || '')
+      setForgotPinExpiration(res?.PinExpirationDate || '')
+      setForgotStep(2)
+    } catch (err) {
+      setForgotError(err instanceof Error ? err.message : '发起密码重置失败，请稍后重试')
+    } finally {
+      setForgotLoading(false)
+    }
+  }
+
+  const handleForgotStep2 = async (e: React.FormEvent) => {
+    e.preventDefault()
+    const trimmedPin = forgotPin.trim()
+    if (!trimmedPin) {
+      setForgotError('请输入 6 位重置 PIN 码')
+      return
+    }
+    setForgotError('')
+    setForgotLoading(true)
+    try {
+      const res = await api.forgotPasswordPin(trimmedPin)
+      if (!res?.Success) {
+        setForgotError('PIN 码无效或已过期，请重新检查后输入')
+        return
+      }
+      if (forgotUsername.trim()) {
+        setUsername(forgotUsername.trim())
+      }
+      setPassword('')
+      setError('')
+      setResetSuccessMessage('密码已重置，请使用空密码或新密码登录')
+      closeForgotModal()
+    } catch (err) {
+      setForgotError(err instanceof Error ? err.message : '验证 PIN 码失败，请检查后重试')
+    } finally {
+      setForgotLoading(false)
+    }
+  }
 
   const handleDemoQuickLogin = async (role: 'admin' | 'guest') => {
     setError('')
@@ -99,7 +180,7 @@ export function LoginPage() {
             <Server className="h-3.5 w-3.5 text-amber-400/80" />
             <span>
               {sysInfo?.ProductName || 'Ambra'}{' '}
-              {sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.5.0')}
+              {sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.9.1')}
             </span>
           </p>
         </div>
@@ -182,6 +263,13 @@ export function LoginPage() {
               </div>
             </div>
 
+            {resetSuccessMessage && (
+              <div className="flex items-start gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-2.5 text-xs text-emerald-300">
+                <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>{resetSuccessMessage}</span>
+              </div>
+            )}
+
             {error && (
               <div className="flex items-start gap-2 rounded-xl border border-red-500/30 bg-red-500/10 px-3.5 py-2.5 text-xs text-red-300">
                 <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
@@ -208,6 +296,18 @@ export function LoginPage() {
             </button>
           </div>
         </form>
+
+        {/* 忘记密码入口 */}
+        <div className="mt-4 text-center">
+          <button
+            type="button"
+            onClick={openForgotModal}
+            className="inline-flex items-center gap-1.5 text-xs font-medium text-zinc-400 transition-colors hover:text-amber-300"
+          >
+            <KeyRound className="h-3.5 w-3.5" />
+            <span>忘记密码？</span>
+          </button>
+        </div>
 
         {/* Serverless Demo 一键登录面板（仅 Demo 模式渲染） */}
         {demoActive && (
@@ -239,6 +339,146 @@ export function LoginPage() {
           </div>
         )}
       </div>
+
+      {/* 忘记密码两步重置弹窗 */}
+      {forgotOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="forgot-password-title"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
+          onClick={closeForgotModal}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-md rounded-2xl border border-white/10 bg-zinc-950 p-6 shadow-2xl"
+          >
+            <div className="mb-4 flex items-start justify-between gap-3">
+              <div>
+                <h2 id="forgot-password-title" className="text-base font-semibold text-zinc-50">
+                  找回密码（第 {forgotStep} / 2 步）
+                </h2>
+                <p className="mt-1 text-xs text-zinc-400">
+                  {forgotStep === 1
+                    ? '输入用户名后，服务器将在数据目录生成一次性重置 PIN 文件'
+                    : '请在服务器数据目录查看重置 PIN 文件，并在下方输入 6 位 PIN 码'}
+                </p>
+              </div>
+              <button
+                type="button"
+                aria-label="关闭找回密码弹窗"
+                onClick={closeForgotModal}
+                className="rounded-lg p-1 text-zinc-400 transition-colors hover:bg-white/10 hover:text-zinc-100"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {forgotError && (
+              <div className="mb-4 flex items-start gap-2 rounded-xl border border-red-500/30 bg-red-500/10 px-3.5 py-2.5 text-xs text-red-300">
+                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>{forgotError}</span>
+              </div>
+            )}
+
+            {forgotStep === 1 ? (
+              <form onSubmit={handleForgotStep1} className="space-y-4">
+                <div>
+                  <label
+                    htmlFor="forgot-username-input"
+                    className="mb-1.5 block text-xs font-medium text-zinc-400"
+                  >
+                    用户名
+                  </label>
+                  <input
+                    id="forgot-username-input"
+                    type="text"
+                    value={forgotUsername}
+                    onChange={(e) => setForgotUsername(e.target.value)}
+                    placeholder="输入需要重置密码的用户名"
+                    autoFocus
+                    className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-amber-400/60"
+                  />
+                </div>
+                <div className="flex items-center justify-end gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={closeForgotModal}
+                    className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10"
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={forgotLoading}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-60"
+                  >
+                    {forgotLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                    <span>下一步</span>
+                  </button>
+                </div>
+              </form>
+            ) : (
+              <form onSubmit={handleForgotStep2} className="space-y-4">
+                <div className="space-y-1.5 rounded-xl border border-amber-500/25 bg-amber-500/[0.07] p-3.5 text-xs text-amber-200">
+                  <p className="font-medium">请在服务器数据目录查看重置 PIN 文件</p>
+                  {forgotPinFile && (
+                    <code className="block break-all rounded-lg bg-black/40 px-2.5 py-1.5 font-mono text-[11px] text-amber-300">
+                      {forgotPinFile}
+                    </code>
+                  )}
+                  {forgotPinExpiration && (
+                    <p className="text-[11px] text-amber-200/75">
+                      有效期至：{forgotPinExpiration}
+                    </p>
+                  )}
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="forgot-pin-input"
+                    className="mb-1.5 block text-xs font-medium text-zinc-400"
+                  >
+                    6 位重置 PIN 码
+                  </label>
+                  <input
+                    id="forgot-pin-input"
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={12}
+                    value={forgotPin}
+                    onChange={(e) => setForgotPin(e.target.value)}
+                    placeholder="输入 6 位 PIN 码"
+                    autoFocus
+                    className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5 font-mono text-sm tracking-widest text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-amber-400/60"
+                  />
+                </div>
+
+                <div className="flex items-center justify-between gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setForgotStep(1)
+                      setForgotError('')
+                    }}
+                    className="rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10"
+                  >
+                    返回上一步
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={forgotLoading}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-60"
+                  >
+                    {forgotLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                    <span>验证并重置密码</span>
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

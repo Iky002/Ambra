@@ -1,6 +1,7 @@
 package compatcore
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -75,7 +76,7 @@ func (h *Handler) forgotPassword(w http.ResponseWriter, r *http.Request) {
 
 	pinFile := ""
 	if h.cfg != nil && h.cfg.DataDir != "" {
-		pinFile = filepath.Join(h.cfg.DataDir, "passwordreset-"+pin+".txt")
+		pinFile = filepath.Join(h.cfg.DataDir, "passwordreset-"+guid.New()[:12]+".txt")
 	}
 
 	var expiredFiles []string
@@ -792,12 +793,101 @@ func (h *Handler) getUserItemIntros(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+var specialFeatureExtraTypes = []string{
+	"Clip", "Featurette", "BehindTheScenes", "DeletedScene", "Interview", "Scene", "Short", "Extra",
+}
+
+func (h *Handler) allowedLibrariesForRequest(r *http.Request, fallbackUserID string) []string {
+	if h.userRepo == nil {
+		return nil
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.IsAdmin() {
+			return nil
+		}
+		return h.allowedLibrariesForUser(r.Context(), guid.Normalize(ac.UserID()))
+	}
+	uid := ""
+	if h.auth.UserIDFromCtx != nil {
+		uid = guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+	}
+	if uid == "" {
+		uid = guid.Normalize(fallbackUserID)
+	}
+	return h.allowedLibrariesForUser(r.Context(), uid)
+}
+
+func (h *Handler) allowedLibrariesForUser(ctx context.Context, userID string) []string {
+	if h.userRepo == nil || userID == "" {
+		return nil
+	}
+	u, err := h.userRepo.GetUserByID(ctx, userID)
+	if err != nil || u == nil {
+		return nil
+	}
+	if u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableAllFolders {
+		return nil
+	}
+	allowed := make([]string, 0, len(u.Policy.EnabledFolders))
+	for _, fid := range u.Policy.EnabledFolders {
+		if norm := guid.Normalize(fid); norm != "" {
+			allowed = append(allowed, norm)
+		}
+	}
+	return allowed
+}
+
+func isLibraryAllowed(libID string, allowed []string) bool {
+	if allowed == nil {
+		return true
+	}
+	norm := guid.Normalize(libID)
+	for _, id := range allowed {
+		if id == norm {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) serveUserItemExtras(w http.ResponseWriter, r *http.Request, extraTypes []string) {
+	uid := h.resolveUserID(r, "UserId")
+	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	if h.libRepo == nil || itemID == "" {
+		httpx.JSON(w, http.StatusOK, []dto.BaseItemDto{})
+		return
+	}
+	rec, err := h.libRepo.GetItemRecordByID(r.Context(), itemID)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		writeJSONError(w, r, http.StatusNotFound, "item not found")
+		return
+	}
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	allowed := h.allowedLibrariesForRequest(r, uid)
+	if !isLibraryAllowed(rec.LibraryID, allowed) {
+		writeJSONError(w, r, http.StatusForbidden, "access denied")
+		return
+	}
+	items, err := h.libRepo.GetItemExtras(r.Context(), h.serverID(), uid, itemID, extraTypes)
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if items == nil {
+		items = []dto.BaseItemDto{}
+	}
+	httpx.JSON(w, http.StatusOK, items)
+}
+
 func (h *Handler) getUserItemLocalTrailers(w http.ResponseWriter, r *http.Request) {
-	httpx.JSON(w, http.StatusOK, []dto.BaseItemDto{})
+	h.serveUserItemExtras(w, r, []string{"Trailer"})
 }
 
 func (h *Handler) getUserItemSpecialFeatures(w http.ResponseWriter, r *http.Request) {
-	httpx.JSON(w, http.StatusOK, []dto.BaseItemDto{})
+	h.serveUserItemExtras(w, r, specialFeatureExtraTypes)
 }
 
 // --- User Item Data / Rating / Favorite / Played / PlayingItems ---
