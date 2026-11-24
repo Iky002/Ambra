@@ -44,13 +44,26 @@ func (r *LibraryRepo) FindItemByMediaSourcePath(ctx context.Context, libraryID, 
 	return rec, err
 }
 
-// FindItemByProviderID finds an existing item (e.g. Movie or Series) within the same library
+// FindItemByProviderID finds the oldest existing item (e.g. Movie or Series) within the same library
 // matching the given external provider key/value (case-insensitive key matching for Tmdb/tmdb, Imdb/imdb, etc.).
 func (r *LibraryRepo) FindItemByProviderID(ctx context.Context, libraryID, itemType, providerKey, providerVal string) (*ItemRecord, error) {
+	items, err := r.FindItemsByProviderID(ctx, libraryID, itemType, providerKey, providerVal)
+	if err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return nil, ErrNotFound
+	}
+	return items[0], nil
+}
+
+// FindItemsByProviderID returns all items within the same library matching the given external provider
+// key/value ordered by date_created ASC, id ASC (oldest/primary first).
+func (r *LibraryRepo) FindItemsByProviderID(ctx context.Context, libraryID, itemType, providerKey, providerVal string) ([]*ItemRecord, error) {
 	providerKey = strings.TrimSpace(providerKey)
 	providerVal = strings.TrimSpace(providerVal)
 	if providerKey == "" || providerVal == "" {
-		return nil, ErrNotFound
+		return nil, nil
 	}
 	libID := guid.Normalize(libraryID)
 
@@ -78,15 +91,23 @@ func (r *LibraryRepo) FindItemByProviderID(ctx context.Context, libraryID, itemT
 		 FROM items i
 		 WHERE i.library_id = ?` + typeClause + `
 		   AND (` + strings.Join(conds, " OR ") + `)
-		 ORDER BY i.date_created ASC, i.id ASC
-		 LIMIT 1`
+		 ORDER BY i.date_created ASC, i.id ASC`
 
-	row := r.store.Reader.QueryRowContext(ctx, query, args...)
-	rec, err := scanItemRecord(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
+	rows, err := r.store.Reader.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
 	}
-	return rec, err
+	defer rows.Close()
+
+	var out []*ItemRecord
+	for rows.Next() {
+		rec, err := scanItemRecord(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
 }
 
 func providerKeyVariants(key string) []string {
@@ -366,6 +387,9 @@ func (r *LibraryRepo) MergeItemVersions(ctx context.Context, itemIDs []string) (
 		}
 
 		if _, err := tx.ExecContext(ctx, `DELETE FROM item_search_fts WHERE item_id = ?`, otherID); err != nil {
+			return "", 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM item_images WHERE item_id = ?`, otherID); err != nil {
 			return "", 0, err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM item_ancestors WHERE ancestor_id = ? OR descendant_id = ?`, otherID, otherID); err != nil {

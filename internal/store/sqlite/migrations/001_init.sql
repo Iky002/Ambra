@@ -112,7 +112,7 @@ CREATE TABLE IF NOT EXISTS item_media_streams (
 CREATE INDEX IF NOT EXISTS idx_streams_item_type ON item_media_streams(item_id, stream_type);
 
 CREATE TABLE IF NOT EXISTS item_images (
-    item_id     TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    item_id     TEXT NOT NULL,
     image_type  TEXT NOT NULL,
     image_index INTEGER NOT NULL DEFAULT 0,
     path        TEXT NOT NULL,

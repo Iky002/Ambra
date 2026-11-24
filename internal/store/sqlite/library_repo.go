@@ -310,6 +310,9 @@ func (r *LibraryRepo) DeleteLibrary(ctx context.Context, id string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM item_search_fts WHERE item_id IN (SELECT id FROM items WHERE library_id = ?)`, id); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM item_images WHERE item_id IN (SELECT id FROM items WHERE library_id = ?)`, id); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM item_ancestors WHERE ancestor_id = ? OR descendant_id IN (SELECT id FROM items WHERE library_id = ?)`, id, id); err != nil {
 		return err
 	}
@@ -1362,16 +1365,23 @@ func (r *LibraryRepo) ListTaxonomies(ctx context.Context, serverID, kind, parent
 		}
 		args = append(args, limit, max(0, startIndex))
 		rows, err := r.store.Reader.QueryContext(ctx,
-			`SELECT p.id, p.name, p.sort_name FROM people p `+where+` ORDER BY p.sort_name ASC LIMIT ? OFFSET ?`, args...)
+			`SELECT p.id, p.name, p.sort_name, COALESCE(img.tag, '')
+			 FROM people p
+			 LEFT JOIN item_images img ON img.item_id = p.id AND LOWER(img.image_type) = 'primary' AND img.image_index = 0
+			 `+where+` ORDER BY p.sort_name ASC LIMIT ? OFFSET ?`, args...)
 		if err != nil {
 			return nil, 0, err
 		}
 		defer rows.Close()
 		var out []dto.BaseItemDto
 		for rows.Next() {
-			var id, name, sortName string
-			if err := rows.Scan(&id, &name, &sortName); err != nil {
+			var id, name, sortName, primaryTag string
+			if err := rows.Scan(&id, &name, &sortName, &primaryTag); err != nil {
 				return nil, 0, err
+			}
+			imageTags := map[string]string{}
+			if primaryTag != "" {
+				imageTags["Primary"] = primaryTag
 			}
 			out = append(out, dto.BaseItemDto{
 				Id:                id,
@@ -1379,7 +1389,7 @@ func (r *LibraryRepo) ListTaxonomies(ctx context.Context, serverID, kind, parent
 				SortName:          sortName,
 				ServerId:          serverID,
 				Type:              "Person",
-				ImageTags:         map[string]string{},
+				ImageTags:         imageTags,
 				BackdropImageTags: []string{},
 			})
 		}
@@ -1902,6 +1912,16 @@ func (r *LibraryRepo) loadTaxonomiesBatch(ctx context.Context, itemIDs []string)
 	return genres, studios, rows.Err()
 }
 
+// GetPeopleByItemID returns all people associated with itemID (including PrimaryImageTag if present).
+func (r *LibraryRepo) GetPeopleByItemID(ctx context.Context, itemID string) ([]dto.BaseItemPerson, error) {
+	itemID = guid.Normalize(itemID)
+	m, err := r.loadPeopleBatch(ctx, []string{itemID})
+	if err != nil {
+		return nil, err
+	}
+	return m[itemID], nil
+}
+
 func (r *LibraryRepo) loadPeopleBatch(ctx context.Context, itemIDs []string) (map[string][]dto.BaseItemPerson, error) {
 	out := make(map[string][]dto.BaseItemPerson)
 	ph := make([]string, len(itemIDs))
@@ -1911,9 +1931,10 @@ func (r *LibraryRepo) loadPeopleBatch(ctx context.Context, itemIDs []string) (ma
 		args[i] = id
 	}
 	rows, err := r.store.Reader.QueryContext(ctx, `
-		SELECT ip.item_id, p.id, p.name, ip.role, ip.person_type
+		SELECT ip.item_id, p.id, p.name, ip.role, ip.person_type, COALESCE(img.tag, '')
 		FROM item_people ip
 		JOIN people p ON p.id = ip.person_id
+		LEFT JOIN item_images img ON img.item_id = p.id AND LOWER(img.image_type) = 'primary' AND img.image_index = 0
 		WHERE ip.item_id IN (`+strings.Join(ph, ",")+`)
 		ORDER BY ip.sort_order ASC`, args...)
 	if err != nil {
@@ -1921,16 +1942,17 @@ func (r *LibraryRepo) loadPeopleBatch(ctx context.Context, itemIDs []string) (ma
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var itemID, id, name, pType string
+		var itemID, id, name, pType, primaryTag string
 		var role sql.NullString
-		if err := rows.Scan(&itemID, &id, &name, &role, &pType); err != nil {
+		if err := rows.Scan(&itemID, &id, &name, &role, &pType, &primaryTag); err != nil {
 			return nil, err
 		}
 		out[itemID] = append(out[itemID], dto.BaseItemPerson{
-			Id:   id,
-			Name: name,
-			Role: role.String,
-			Type: pType,
+			Id:              id,
+			Name:            name,
+			Role:            role.String,
+			Type:            pType,
+			PrimaryImageTag: primaryTag,
 		})
 	}
 	return out, rows.Err()

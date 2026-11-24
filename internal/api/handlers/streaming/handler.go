@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/core/imaging"
@@ -17,6 +20,8 @@ import (
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
+
+const defaultBrowserUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 // AuthFuncs decouples route registration from the concrete middleware package.
 type AuthFuncs struct {
@@ -26,10 +31,11 @@ type AuthFuncs struct {
 }
 
 type Handler struct {
-	repo    *sqlite.LibraryRepo
-	engine  *playback.Engine
-	imaging *imaging.Service
-	auth    AuthFuncs
+	repo       *sqlite.LibraryRepo
+	engine     *playback.Engine
+	imaging    *imaging.Service
+	httpClient *http.Client
+	auth       AuthFuncs
 }
 
 func New(repo *sqlite.LibraryRepo, engine *playback.Engine, img *imaging.Service) *Handler {
@@ -37,6 +43,11 @@ func New(repo *sqlite.LibraryRepo, engine *playback.Engine, img *imaging.Service
 		repo:    repo,
 		engine:  engine,
 		imaging: img,
+		httpClient: &http.Client{
+			Transport: &http.Transport{
+				ResponseHeaderTimeout: 30 * time.Second,
+			},
+		},
 	}
 }
 
@@ -140,20 +151,30 @@ func (h *Handler) serveMediaFile(w http.ResponseWriter, r *http.Request, asAttac
 	}
 
 	// Check STRM 302 resolution first
+	forceProxy := false
+	if b := q.Bool("proxy"); b != nil && *b {
+		forceProxy = true
+	}
 	if strings.EqualFold(filepath.Ext(mediaPath), ".strm") {
 		resolved, err := h.engine.ResolveStream(r.Context(), mediaPath)
 		if err != nil {
 			httpx.Error(w, http.StatusBadGateway, "failed to resolve strm: "+err.Error())
 			return
 		}
-		if resolved != nil && resolved.Is302 && resolved.URL != "" {
-			w.Header().Set("Cache-Control", "no-store")
-			http.Redirect(w, r, resolved.URL, http.StatusFound)
-			return
-		}
 		if resolved != nil && resolved.URL != "" {
+			if resolved.Is302 && !forceProxy {
+				w.Header().Set("Cache-Control", "no-store")
+				http.Redirect(w, r, resolved.URL, http.StatusFound)
+				return
+			}
 			mediaPath = resolved.URL
 		}
+	}
+
+	// Reverse-proxy remote HTTP(S) streams (e.g. non-302 STRM or explicit proxy=1/true)
+	if isHTTPURL(mediaPath) {
+		h.proxyRemoteMedia(w, r, mediaPath, asAttachment)
+		return
 	}
 
 	f, err := os.Open(mediaPath)
@@ -281,6 +302,9 @@ func (h *Handler) handleImage(w http.ResponseWriter, r *http.Request) {
 	}
 	err := h.imaging.ServeHTTPWithOptions(w, r, itemID, imgType, idx, opts)
 	if errors.Is(err, sqlite.ErrNotFound) || os.IsNotExist(err) {
+		if h.tryServeLibraryCover(w, r, itemID, opts) {
+			return
+		}
 		httpx.Error(w, http.StatusNotFound, "image not found")
 		return
 	}
@@ -288,6 +312,93 @@ func (h *Handler) handleImage(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+}
+
+func (h *Handler) tryServeLibraryCover(w http.ResponseWriter, r *http.Request, libraryID string, opts imaging.Options) bool {
+	lib, err := h.repo.GetLibrary(r.Context(), libraryID)
+	if err != nil || lib == nil {
+		return false
+	}
+	children, _, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
+		LibraryID:        lib.ID,
+		IncludeItemTypes: []string{"Movie", "Series", "MusicAlbum", "Video"},
+		Recursive:        true,
+		Limit:            12,
+	})
+	if err != nil || len(children) == 0 {
+		return false
+	}
+	for _, it := range children {
+		if len(it.BackdropImageTags) > 0 {
+			if err := h.imaging.ServeHTTPWithOptions(w, r, it.Id, "Backdrop", 0, opts); err == nil {
+				return true
+			}
+		}
+	}
+	for _, it := range children {
+		if it.ImageTags["Primary"] != "" {
+			if err := h.imaging.ServeHTTPWithOptions(w, r, it.Id, "Primary", 0, opts); err == nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (h *Handler) proxyRemoteMedia(w http.ResponseWriter, r *http.Request, targetURL string, asAttachment bool) {
+	upReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, nil)
+	if err != nil {
+		httpx.Error(w, http.StatusBadGateway, "invalid upstream stream url: "+err.Error())
+		return
+	}
+	if rng := r.Header.Get("Range"); rng != "" {
+		upReq.Header.Set("Range", rng)
+	}
+	if ifRange := r.Header.Get("If-Range"); ifRange != "" {
+		upReq.Header.Set("If-Range", ifRange)
+	}
+	ua := r.Header.Get("User-Agent")
+	if ua == "" {
+		ua = defaultBrowserUA
+	}
+	upReq.Header.Set("User-Agent", ua)
+
+	resp, err := h.httpClient.Do(upReq)
+	if err != nil {
+		httpx.Error(w, http.StatusBadGateway, "upstream stream error: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	for _, hdr := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"} {
+		if val := resp.Header.Get(hdr); val != "" {
+			w.Header().Set(hdr, val)
+		}
+	}
+	if w.Header().Get("Content-Type") == "" {
+		if u, parseErr := url.Parse(targetURL); parseErr == nil {
+			w.Header().Set("Content-Type", videoContentType(u.Path))
+		}
+	}
+	if asAttachment {
+		filename := "media"
+		if u, parseErr := url.Parse(targetURL); parseErr == nil {
+			if base := filepath.Base(u.Path); base != "" && base != "." && base != "/" {
+				filename = base
+			}
+		}
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	}
+
+	w.WriteHeader(resp.StatusCode)
+	if r.Method != http.MethodHead {
+		_, _ = io.Copy(w, resp.Body)
+	}
+}
+
+func isHTTPURL(s string) bool {
+	lower := strings.ToLower(strings.TrimSpace(s))
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
 }
 
 func videoContentType(path string) string {

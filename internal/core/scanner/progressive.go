@@ -20,6 +20,7 @@ type enrichTask struct {
 	ItemID           string
 	LibraryID        string
 	ItemType         string
+	ParentSeriesID   string
 	MediaPath        string
 	Size             int64
 	Mtime            int64
@@ -366,7 +367,38 @@ func (s *Scanner) runPhaseB(ctx context.Context, libraryID string, tasks []enric
 
 	s.startEnrichPhase(libraryID, len(tasks))
 
+	var wave1, wave2 []enrichTask
+	for _, t := range tasks {
+		if strings.EqualFold(t.ItemType, "Season") || strings.EqualFold(t.ItemType, "Episode") {
+			wave2 = append(wave2, t)
+		} else {
+			wave1 = append(wave1, t)
+		}
+	}
+
 	pool := s.budgetPool()
+	var enriched atomic.Int64
+
+	// Wave 1: Series and Movie tasks (populates parent Series TMDB IDs in SQLite).
+	s.runEnrichWave(ctx, libraryID, pool, wave1, &enriched)
+
+	// Wave 2: Season and Episode tasks (can read parent Series TMDB IDs from SQLite).
+	if ctx.Err() == nil {
+		s.runEnrichWave(ctx, libraryID, pool, wave2, &enriched)
+	}
+
+	if n := int(enriched.Load()); n > 0 {
+		s.publishLibraryChanged(ctx, libraryID, ScanStats{
+			LibraryID:    libraryID,
+			ItemsUpdated: n,
+		}, "enrichment")
+	}
+}
+
+func (s *Scanner) runEnrichWave(ctx context.Context, libraryID string, pool *budget.Pool, tasks []enrichTask, enriched *atomic.Int64) {
+	if len(tasks) == 0 {
+		return
+	}
 	workers := int(pool.Capacity())
 	if workers < 1 {
 		workers = 1
@@ -381,9 +413,7 @@ func (s *Scanner) runPhaseB(ctx context.Context, libraryID string, tasks []enric
 	}
 	close(taskCh)
 
-	var enriched atomic.Int64
 	var wg sync.WaitGroup
-
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
@@ -410,13 +440,6 @@ func (s *Scanner) runPhaseB(ctx context.Context, libraryID string, tasks []enric
 		}()
 	}
 	wg.Wait()
-
-	if n := int(enriched.Load()); n > 0 {
-		s.publishLibraryChanged(ctx, libraryID, ScanStats{
-			LibraryID:    libraryID,
-			ItemsUpdated: n,
-		}, "enrichment")
-	}
 }
 
 func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
@@ -458,14 +481,36 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 
 	if task.NeedOnlineMeta && !task.IsAltMediaSource {
 		s.updateEnrichCurrent(task.LibraryID, itemLabel, "刮削元数据与下载海报")
+		if (strings.EqualFold(task.ItemType, "Season") || strings.EqualFold(task.ItemType, "Episode")) &&
+			task.ParentSeriesID != "" && getProviderID(task.Query.ProviderIDs, "tmdb") == "" {
+			if parent, err := s.repo.GetItemRecordByID(ctx, task.ParentSeriesID); err == nil && parent != nil && len(parent.Extra.ProviderIDs) > 0 {
+				ids := cloneStringMap(task.Query.ProviderIDs)
+				if ids == nil {
+					ids = make(map[string]string, len(parent.Extra.ProviderIDs)+1)
+				}
+				for k, v := range parent.Extra.ProviderIDs {
+					ids[k] = v
+				}
+				if tmdbID := getProviderID(parent.Extra.ProviderIDs, "tmdb"); tmdbID != "" {
+					ids["tmdb"] = tmdbID
+				}
+				task.Query.ProviderIDs = ids
+			}
+		}
 		onlineMeta := s.fetchMetadataFiltered(ctx, task.Query, false)
 		if onlineMeta != nil {
 			rec, err := s.repo.GetItemRecordByID(ctx, task.ItemID)
 			if err == nil && rec != nil {
 				applyOnlineMetadataToItem(rec, onlineMeta, task.HasLocalTitle)
 				if err := s.repo.UpsertItem(ctx, rec); err == nil {
-					s.persistMetaRelationsAndFTS(ctx, rec, onlineMeta)
-					s.downloadAndSaveRemoteImages(ctx, rec, onlineMeta)
+					mergedAway := false
+					if strings.EqualFold(rec.Type, "Movie") && !rec.Extra.LockData {
+						mergedAway = s.tryAutoMergeMovieByProviderID(ctx, rec)
+					}
+					if !mergedAway {
+						s.persistMetaRelationsAndFTS(ctx, rec, onlineMeta)
+						s.downloadAndSaveRemoteImages(ctx, rec, onlineMeta)
+					}
 					updated = true
 				}
 			}
@@ -473,6 +518,38 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 	}
 
 	return updated
+}
+
+func (s *Scanner) tryAutoMergeMovieByProviderID(ctx context.Context, rec *sqlite.ItemRecord) bool {
+	tmdbID := getProviderID(rec.Extra.ProviderIDs, "Tmdb")
+	if tmdbID == "" {
+		return false
+	}
+	s.mergeMu.Lock()
+	defer s.mergeMu.Unlock()
+
+	matches, err := s.repo.FindItemsByProviderID(ctx, rec.LibraryID, "Movie", "Tmdb", tmdbID)
+	if err != nil || len(matches) < 2 {
+		return false
+	}
+
+	ids := make([]string, 0, len(matches))
+	ids = append(ids, matches[0].ID)
+	for _, m := range matches[1:] {
+		if m.Extra.LockData {
+			continue
+		}
+		ids = append(ids, m.ID)
+	}
+	if len(ids) < 2 {
+		return false
+	}
+
+	primaryID, mergedCount, err := s.repo.MergeItemVersions(ctx, ids)
+	if err != nil || mergedCount == 0 {
+		return false
+	}
+	return primaryID != rec.ID
 }
 
 func (s *Scanner) publishLibraryChanged(ctx context.Context, libraryID string, stats ScanStats, phase string) {

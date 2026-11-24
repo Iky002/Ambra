@@ -70,50 +70,55 @@ func (s *Scanner) downloadAndSaveRemoteImages(ctx context.Context, rec *sqlite.I
 	}
 
 	var savedAny bool
-	client := s.getHTTPClient()
-
 	for _, art := range artworks {
-		rawURL := strings.TrimSpace(art.rawURL)
-		if !isHTTPURL(rawURL) {
-			continue
-		}
-
-		if existing, err := s.repo.GetImageByItemAndType(ctx, rec.ID, art.imgType, 0); err == nil && existing != nil && existing.Path != "" {
-			if info, statErr := os.Stat(existing.Path); statErr == nil && info.Size() > 0 {
-				continue
-			}
-		}
-
-		data, contentType, ok := fetchRemoteImage(ctx, client, rawURL)
-		if !ok {
-			continue
-		}
-
-		ext := detectImageExtension(contentType, rawURL)
-		destDir := filepath.Join(s.imageStorageDir(), rec.ID)
-		if err := os.MkdirAll(destDir, 0o755); err != nil {
-			continue
-		}
-
-		destPath := filepath.Join(destDir, strings.ToLower(art.imgType)+ext)
-		if err := writeFileAtomic(destPath, data); err != nil {
-			continue
-		}
-
-		sum := sha256.Sum256(data)
-		tag := hex.EncodeToString(sum[:8])
-		if err := s.repo.UpsertImage(ctx, &sqlite.ImageRecord{
-			ItemID:     rec.ID,
-			ImageType:  art.imgType,
-			ImageIndex: 0,
-			Path:       destPath,
-			Tag:        tag,
-		}); err == nil {
+		if s.downloadAndSaveRemoteImage(ctx, rec.ID, art.imgType, art.rawURL) {
 			savedAny = true
 		}
 	}
 
 	return savedAny
+}
+
+func (s *Scanner) downloadAndSaveRemoteImage(ctx context.Context, targetID, imgType, rawURL string) bool {
+	rawURL = strings.TrimSpace(rawURL)
+	if targetID == "" || !isHTTPURL(rawURL) {
+		return false
+	}
+
+	if existing, err := s.repo.GetImageByItemAndType(ctx, targetID, imgType, 0); err == nil && existing != nil && existing.Path != "" {
+		if info, statErr := os.Stat(existing.Path); statErr == nil && info.Size() > 0 {
+			return false
+		}
+	}
+
+	data, contentType, ok := fetchRemoteImage(ctx, s.getHTTPClient(), rawURL)
+	if !ok {
+		return false
+	}
+
+	ext := detectImageExtension(contentType, rawURL)
+	destDir := filepath.Join(s.imageStorageDir(), targetID)
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return false
+	}
+
+	destPath := filepath.Join(destDir, strings.ToLower(imgType)+ext)
+	if err := writeFileAtomic(destPath, data); err != nil {
+		return false
+	}
+
+	sum := sha256.Sum256(data)
+	tag := hex.EncodeToString(sum[:8])
+	if err := s.repo.UpsertImage(ctx, &sqlite.ImageRecord{
+		ItemID:     targetID,
+		ImageType:  imgType,
+		ImageIndex: 0,
+		Path:       destPath,
+		Tag:        tag,
+	}); err == nil {
+		return true
+	}
+	return false
 }
 
 func isHTTPURL(raw string) bool {
