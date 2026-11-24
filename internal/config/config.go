@@ -17,6 +17,9 @@ const (
 	ProductName   = "Ambra"
 )
 
+// AmbraVersion is the Ambra application release version (overridden at build time via -ldflags).
+var AmbraVersion = "v0.5.0"
+
 type Config struct {
 	mu sync.RWMutex
 

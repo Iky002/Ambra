@@ -13,6 +13,7 @@ type PublicSystemInfo struct {
 	LocalAddress string `json:"LocalAddress"`
 	ServerName   string `json:"ServerName"`
 	Version      string `json:"Version"`
+	AmbraVersion string `json:"AmbraVersion,omitempty"`
 	ProductName  string `json:"ProductName"`
 	Id           string `json:"Id"`
 }

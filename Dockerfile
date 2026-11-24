@@ -18,6 +18,7 @@ FROM golang:1.26-bookworm AS go-builder
 
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
+ARG AMBRA_VERSION=v0.5.0
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -29,7 +30,7 @@ COPY web/embed.go ./web/embed.go
 COPY --from=web-builder /src/web/dist ./web/dist
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /out/ambra ./cmd/ambra
+    go build -trimpath -ldflags="-s -w -X github.com/ambra-media/ambra/internal/config.AmbraVersion=${AMBRA_VERSION}" -o /out/ambra ./cmd/ambra
 
 # ==============================================================================
 # Stage 3A: Ultra-lightweight runtime WITHOUT FFmpeg/FFprobe (target: runtime-lite)

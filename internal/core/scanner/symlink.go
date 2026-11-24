@@ -2,10 +2,8 @@ package scanner
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
 )
 
 // SymlinkPolicy controls how WalkSafe handles symbolic links during directory traversal.
@@ -136,10 +134,8 @@ func walkDirSafe(dir string, symlinkDepth int, policy SymlinkPolicy, visited map
 // dirIdentity returns a unique identifier for a directory based on its (Dev, Ino)
 // on Unix systems, falling back to EvalSymlinks real path when Stat_t is unavailable.
 func dirIdentity(path string, info os.FileInfo) string {
-	if info != nil {
-		if st, ok := info.Sys().(*syscall.Stat_t); ok && st != nil {
-			return fmt.Sprintf("ino:%d:%d", st.Dev, st.Ino)
-		}
+	if id, ok := dirInodeIdentity(info); ok {
+		return id
 	}
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		return "path:" + filepath.Clean(resolved)

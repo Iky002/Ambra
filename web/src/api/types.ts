@@ -7,6 +7,7 @@ export interface PublicSystemInfo {
   LocalAddress?: string
   ServerName: string
   Version: string
+  AmbraVersion?: string
   ProductName?: string
   Id: string
 }

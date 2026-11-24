@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -19,7 +20,13 @@ func main() {
 	dataDir := flag.String("data", "./data", "Ambra data directory")
 	httpAddr := flag.String("addr", "", "HTTP listen address (overrides config, e.g. :8096)")
 	webDir := flag.String("web", "", "External web UI directory (overrides embedded web UI)")
+	showVersion := flag.Bool("version", false, "Print Ambra version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("Ambra %s (Emby compat %s)\n", config.AmbraVersion, config.ServerVersion)
+		return
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
@@ -64,9 +71,10 @@ func main() {
 
 	go func() {
 		slog.Info("Ambra Media Server started",
+			"ambra_version", config.AmbraVersion,
+			"emby_compat_version", config.ServerVersion,
 			"addr", cfg.HTTPAddr,
 			"web_ui", "http://localhost"+cfg.HTTPAddr+"/web/",
-			"emby_compat_version", config.ServerVersion,
 			"server_id", cfg.ServerID,
 		)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
