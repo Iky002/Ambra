@@ -457,6 +457,7 @@ func (h *Handler) buildPublicInfo(r *http.Request) dto.PublicSystemInfo {
 		LocalAddress: scheme + "://" + host,
 		ServerName:   h.cfg.ServerName,
 		Version:      config.ServerVersion,
+		AmbraVersion: config.AmbraVersion,
 		ProductName:  config.ProductName,
 		Id:           h.cfg.ServerID,
 	}

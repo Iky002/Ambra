@@ -8,7 +8,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -373,8 +372,8 @@ func collectDirsSafe(root string, visited map[string]struct{}, out *[]string) {
 }
 
 func dirKey(path string, info os.FileInfo) string {
-	if st, ok := info.Sys().(*syscall.Stat_t); ok && st != nil {
-		return fmt.Sprintf("ino:%d:%d", st.Dev, st.Ino)
+	if key, ok := dirInodeKey(info); ok {
+		return key
 	}
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		return "path:" + filepath.Clean(resolved)

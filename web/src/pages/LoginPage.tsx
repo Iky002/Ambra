@@ -98,7 +98,8 @@ export function LoginPage() {
           <p className="mt-1.5 flex items-center justify-center gap-1.5 text-xs text-zinc-400">
             <Server className="h-3.5 w-3.5 text-amber-400/80" />
             <span>
-              {sysInfo?.ProductName || 'Ambra'} {sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.1'}
+              {sysInfo?.ProductName || 'Ambra'}{' '}
+              {sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.5.0')}
             </span>
           </p>
         </div>

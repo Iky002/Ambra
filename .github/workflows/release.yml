@@ -40,6 +40,7 @@ jobs:
       - name: Cross-compile Lite single-file binaries (without FFmpeg)
         run: |
           mkdir -p dist/lite dist/full
+          AMBRA_VERSION="${{ inputs.tag != '' && inputs.tag || github.ref_name }}"
           TARGETS=(
             "linux/amd64/ambra-lite-linux-amd64"
             "linux/arm64/ambra-lite-linux-arm64"
@@ -48,9 +49,9 @@ jobs:
           )
           for entry in "${TARGETS[@]}"; do
             IFS='/' read -r GOOS GOARCH BIN_NAME <<< "${entry}"
-            echo "Building ${BIN_NAME} (${GOOS}/${GOARCH})..."
+            echo "Building ${BIN_NAME} (${GOOS}/${GOARCH}, version=${AMBRA_VERSION})..."
             CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" \
-              go build -trimpath -ldflags="-s -w" -o "dist/lite/${BIN_NAME}" ./cmd/ambra
+              go build -trimpath -ldflags="-s -w -X github.com/ambra-media/ambra/internal/config.AmbraVersion=${AMBRA_VERSION}" -o "dist/lite/${BIN_NAME}" ./cmd/ambra
           done
 
       - name: Bundle Full packages WITH static FFmpeg & FFprobe
@@ -197,6 +198,8 @@ jobs:
           file: ./Dockerfile
           target: ${{ matrix.target }}
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            AMBRA_VERSION=${{ inputs.tag != '' && inputs.tag || github.ref_name }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
