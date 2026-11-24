@@ -86,7 +86,8 @@ func TestLibraryHandlerAllEndpointsExtra(t *testing.T) {
 	var vf virtualFolderDTO
 	_ = json.Unmarshal(rec.Body.Bytes(), &vf)
 
-	// Synchronous scan to ensure items exist
+	// Wait for async refreshLibrary scan to finish, then ensure items exist via sync scan
+	sc.WaitIdle(ctx)
 	if _, err := sc.ScanLibrary(ctx, vf.ItemId); err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +178,7 @@ func TestLibraryHandlerAllEndpointsExtra(t *testing.T) {
 		}
 	}
 
-	// Refresh & Media Updated
+	// Refresh & Media Updated (wait for async scans to finish before deleting/closing DB)
 	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/Library/Refresh?ParentId="+vf.ItemId, nil))
 	if rec.Code != http.StatusNoContent {
@@ -188,7 +189,8 @@ func TestLibraryHandlerAllEndpointsExtra(t *testing.T) {
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("POST /Library/Media/Updated status=%d", rec.Code)
 	}
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+	sc.WaitIdle(ctx)
 
 	// DELETE /Library/VirtualFolders: missing param (400), by name (204), by id (204)
 	rec = httptest.NewRecorder()
