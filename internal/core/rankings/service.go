@@ -493,6 +493,7 @@ func (s *Service) SyncAndApply(ctx context.Context) (SyncSummary, error) {
 	summary := SyncSummary{SyncedAt: time.Now().UTC()}
 
 	var doubanErr, imdbErr, tmdbErr, doubanMovieErr, doubanTVErr error
+	imdbLiveSucceeded := false
 	tmdbLiveSucceeded := false
 	doubanMovieLiveSucceeded := false
 	doubanTVLiveSucceeded := false
@@ -514,13 +515,21 @@ func (s *Service) SyncAndApply(ctx context.Context) (SyncSummary, error) {
 		imdbErr = err
 		summary.IMDbError = err.Error()
 	} else {
-		if err := s.saveSnapshot(ctx, ConfigKeyIMDbTop250, snap); err != nil {
-			return summary, fmt.Errorf("save imdb cache: %w", err)
+		if snap.Source != SourceIMDbTop250Builtin {
+			imdbLiveSucceeded = true
 		}
-		s.mu.Lock()
-		s.imdb = snap
-		s.imdbIdx = buildChartIndex(snap.Entries)
-		s.mu.Unlock()
+		s.mu.RLock()
+		hasLiveIMDb := s.imdb != nil && len(s.imdb.Entries) > 0 && s.imdb.Source != SourceIMDbTop250Builtin
+		s.mu.RUnlock()
+		if imdbLiveSucceeded || !hasLiveIMDb {
+			if err := s.saveSnapshot(ctx, ConfigKeyIMDbTop250, snap); err != nil {
+				return summary, fmt.Errorf("save imdb cache: %w", err)
+			}
+			s.mu.Lock()
+			s.imdb = snap
+			s.imdbIdx = buildChartIndex(snap.Entries)
+			s.mu.Unlock()
+		}
 	}
 
 	if snap, err := s.fetcher.FetchTMDBTrending(ctx); err != nil {
@@ -596,10 +605,12 @@ func (s *Service) SyncAndApply(ctx context.Context) (SyncSummary, error) {
 	summary.MatchedItems = matched
 	summary.TagsAdded = added
 
-	if doubanErr != nil && imdbErr != nil && !tmdbLiveSucceeded && !doubanMovieLiveSucceeded && !doubanTVLiveSucceeded {
+	if doubanErr != nil && !imdbLiveSucceeded && !tmdbLiveSucceeded && !doubanMovieLiveSucceeded && !doubanTVLiveSucceeded {
 		parts := []string{
 			fmt.Sprintf("douban=%v", doubanErr),
-			fmt.Sprintf("imdb=%v", imdbErr),
+		}
+		if imdbErr != nil {
+			parts = append(parts, fmt.Sprintf("imdb=%v", imdbErr))
 		}
 		if tmdbErr != nil {
 			parts = append(parts, fmt.Sprintf("tmdb_trending=%v", tmdbErr))

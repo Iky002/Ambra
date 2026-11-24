@@ -95,4 +95,45 @@ func TestLibraryHandlerRoutes(t *testing.T) {
 	if counts.MovieCount != 1 {
 		t.Fatalf("expected MovieCount=1, got %+v", counts)
 	}
+
+	// GET /api/admin/scanner/progress
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/admin/scanner/progress", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/admin/scanner/progress failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var prog scanner.ScanProgressSnapshot
+	if err := json.Unmarshal(rec.Body.Bytes(), &prog); err != nil {
+		t.Fatalf("unmarshal progress: %v", err)
+	}
+	if prog.Running || prog.Phase != "idle" {
+		t.Fatalf("expected idle progress snapshot, got %+v", prog)
+	}
+
+	// Verify RequireAdmin protection and nil scanner fallback
+	adminMux := http.NewServeMux()
+	hNilScanner := New(repo, nil, cfg)
+	hNilScanner.RegisterRoutes(adminMux, AuthFuncs{
+		RequireAdmin: func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("X-Admin") != "1" {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				next.ServeHTTP(w, r)
+			})
+		},
+	})
+	rec = httptest.NewRecorder()
+	adminMux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/admin/scanner/progress", nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-admin, got %d", rec.Code)
+	}
+	reqAdmin := httptest.NewRequest(http.MethodGet, "/api/admin/scanner/progress", nil)
+	reqAdmin.Header.Set("X-Admin", "1")
+	rec = httptest.NewRecorder()
+	adminMux.ServeHTTP(rec, reqAdmin)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for admin with nil scanner, got %d", rec.Code)
+	}
 }

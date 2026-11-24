@@ -16,6 +16,7 @@ import {
 } from 'lucide-react'
 import { api } from '../../api/client'
 import type { SessionInfo } from '../../api/types'
+import { ScanProgressBar } from '../../components/ScanProgressBar'
 import { formatDateTime, formatRelativeTime, formatTicks } from './adminUtils'
 
 export function DashboardTab() {
@@ -53,6 +54,9 @@ export function DashboardTab() {
 
   return (
     <div className="space-y-8">
+      {/* 实时媒体库扫描与刮削进度（仅扫描中或刚完成时展示） */}
+      <ScanProgressBar variant="card" />
+
       {/* 服务器状态卡片 */}
       <section className="space-y-4">
         <div className="flex items-center justify-between gap-3">

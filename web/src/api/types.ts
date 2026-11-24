@@ -445,3 +445,39 @@ export interface RankingsRefreshResult {
   tags_added: number
   synced_at: string
 }
+
+export interface LibraryScanProgress {
+  library_id: string
+  library_name: string
+  phase: 'discovering' | 'enriching' | 'completed' | string
+  total: number
+  processed: number
+  added: number
+  updated: number
+  skipped: number
+  failed: number
+  current_item: string
+  current_action: string
+  percentage: number
+  started_at: string
+  updated_at: string
+}
+
+export interface ScanProgressSnapshot {
+  running: boolean
+  phase: 'idle' | 'discovering' | 'enriching' | string
+  library_id?: string
+  library_name?: string
+  total: number
+  processed: number
+  added: number
+  updated: number
+  skipped: number
+  failed: number
+  current_item?: string
+  current_action?: string
+  percentage: number
+  started_at?: string
+  updated_at: string
+  libraries?: LibraryScanProgress[]
+}

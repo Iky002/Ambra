@@ -232,10 +232,18 @@ func (f *Fetcher) FetchDoubanTop250(ctx context.Context) (*ChartSnapshot, error)
 
 // FetchIMDbTop250 fetches the IMDb Top 250 chart from a custom JSON feed
 // or from the IMDb Top 250 HTML page's embedded JSON-LD ItemList.
+// When using the default IMDb URL and IMDb blocks server-side scraping
+// (e.g. HTTP 202 AWS WAF challenge, non-200 status, network error, or stripped
+// HTML without JSON-LD), it gracefully falls back to a curated built-in snapshot.
 func (f *Fetcher) FetchIMDbTop250(ctx context.Context) (*ChartSnapshot, error) {
 	targetURL := f.resolveIMDbURL()
-	body, contentType, err := f.doGet(ctx, targetURL)
+	useFallback := targetURL == DefaultIMDbTop250URL
+
+	body, contentType, err := f.doGetIMDb(ctx, targetURL)
 	if err != nil {
+		if useFallback {
+			return builtinIMDbTop250Snapshot(), nil
+		}
 		return nil, fmt.Errorf("fetch imdb top250: %w", err)
 	}
 
@@ -243,16 +251,25 @@ func (f *Fetcher) FetchIMDbTop250(ctx context.Context) (*ChartSnapshot, error) {
 	if isJSONPayload(contentType, body) {
 		entries, err = parseJSONEntries(body, maxChartEntries)
 		if err != nil {
+			if useFallback {
+				return builtinIMDbTop250Snapshot(), nil
+			}
 			return nil, fmt.Errorf("parse imdb json: %w", err)
 		}
 	} else {
 		entries, err = parseIMDbTop250HTML(body)
 		if err != nil {
+			if useFallback {
+				return builtinIMDbTop250Snapshot(), nil
+			}
 			return nil, fmt.Errorf("parse imdb html: %w", err)
 		}
 	}
 
 	if len(entries) == 0 {
+		if useFallback {
+			return builtinIMDbTop250Snapshot(), nil
+		}
 		return nil, errors.New("imdb top250 returned 0 entries")
 	}
 
@@ -696,13 +713,21 @@ func builtinDoubanTrendingTVEntries() []ChartEntry {
 }
 
 func (f *Fetcher) doGet(ctx context.Context, rawURL string) ([]byte, string, error) {
+	return f.doGetWithHeaders(ctx, rawURL, "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8", "zh-CN,zh;q=0.9,en;q=0.8", false)
+}
+
+func (f *Fetcher) doGetIMDb(ctx context.Context, rawURL string) ([]byte, string, error) {
+	return f.doGetWithHeaders(ctx, rawURL, "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7", "en-US,en;q=0.9", true)
+}
+
+func (f *Fetcher) doGetWithHeaders(ctx context.Context, rawURL, accept, acceptLang string, strict200 bool) ([]byte, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, "", err
 	}
 	req.Header.Set("User-Agent", f.userAgent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	req.Header.Set("Accept", accept)
+	req.Header.Set("Accept-Language", acceptLang)
 
 	resp, err := f.httpClient.Do(req)
 	if err != nil {
@@ -710,7 +735,11 @@ func (f *Fetcher) doGet(ctx context.Context, rawURL string) ([]byte, string, err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if strict200 {
+		if resp.StatusCode != http.StatusOK {
+			return nil, resp.Header.Get("Content-Type"), fmt.Errorf("unexpected HTTP status %d", resp.StatusCode)
+		}
+	} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, resp.Header.Get("Content-Type"), fmt.Errorf("unexpected HTTP status %d", resp.StatusCode)
 	}
 

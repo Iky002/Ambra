@@ -3,6 +3,8 @@ package rankings
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -1462,6 +1464,240 @@ func TestDoubanTrendingPersistenceTypedAutoTaggingAndEndpoints(t *testing.T) {
 		if err := New(corruptStore, nil, Options{}).LoadCache(ctx); err == nil {
 			t.Fatalf("expected LoadCache error on corrupted %s", key)
 		}
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return fn(r)
+}
+
+func TestFetchIMDbTop250BuiltinFallbackAndHeaders(t *testing.T) {
+	t.Setenv(EnvIMDb250URL, "")
+	ctx := context.Background()
+
+	cases := []struct {
+		name      string
+		transport roundTripFunc
+	}{
+		{
+			name: "aws-waf-202",
+			transport: func(r *http.Request) (*http.Response, error) {
+				if r.URL.String() != DefaultIMDbTop250URL {
+					t.Errorf("unexpected URL: %s", r.URL.String())
+				}
+				if r.Header.Get("User-Agent") == "" {
+					t.Errorf("expected User-Agent header")
+				}
+				if r.Header.Get("Accept") == "" {
+					t.Errorf("expected Accept header")
+				}
+				if r.Header.Get("Accept-Language") != "en-US,en;q=0.9" {
+					t.Errorf("expected Accept-Language en-US,en;q=0.9, got %q", r.Header.Get("Accept-Language"))
+				}
+				return &http.Response{
+					StatusCode: http.StatusAccepted,
+					Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+					Body:       io.NopCloser(strings.NewReader(`<html><body><script src="challenge.js"></script></body></html>`)),
+				}, nil
+			},
+		},
+		{
+			name: "http-403",
+			transport: func(r *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusForbidden,
+					Header:     http.Header{},
+					Body:       io.NopCloser(strings.NewReader("forbidden")),
+				}, nil
+			},
+		},
+		{
+			name: "stripped-html-no-jsonld",
+			transport: func(r *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"text/html"}},
+					Body:       io.NopCloser(strings.NewReader(`<html><body>IMDb Top 250</body></html>`)),
+				}, nil
+			},
+		},
+		{
+			name: "invalid-json",
+			transport: func(r *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{bad json`)),
+				}, nil
+			},
+		},
+		{
+			name: "empty-json",
+			transport: func(r *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`[]`)),
+				}, nil
+			},
+		},
+		{
+			name: "network-error",
+			transport: func(r *http.Request) (*http.Response, error) {
+				return nil, errors.New("dial tcp: i/o timeout")
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &http.Client{Transport: tc.transport}
+			f := NewFetcher(Options{HTTPClient: client})
+			snap, err := f.FetchIMDbTop250(ctx)
+			if err != nil {
+				t.Fatalf("FetchIMDbTop250(%s) returned error: %v", tc.name, err)
+			}
+			if snap.Chart != ChartIMDbTop250 || snap.Source != SourceIMDbTop250Builtin {
+				t.Fatalf("unexpected chart/source: %+v", snap)
+			}
+			if snap.UpdatedAt.IsZero() {
+				t.Fatal("expected non-zero UpdatedAt on fallback snapshot")
+			}
+			if snap.Count < 100 || len(snap.Entries) != snap.Count {
+				t.Fatalf("expected >=100 fallback entries, got count=%d len=%d", snap.Count, len(snap.Entries))
+			}
+
+			seenIMDb := make(map[string]struct{}, len(snap.Entries))
+			for i, e := range snap.Entries {
+				if e.Rank != i+1 {
+					t.Fatalf("entry[%d] rank=%d, want %d", i, e.Rank, i+1)
+				}
+				if e.Title == "" || e.OriginalTitle == "" || e.Year <= 1900 || e.Rating <= 0 {
+					t.Fatalf("entry[%d] incomplete metadata: %+v", i, e)
+				}
+				if !reIMDbID.MatchString(e.IMDbID) {
+					t.Fatalf("entry[%d] invalid IMDbID: %q", i, e.IMDbID)
+				}
+				if _, dup := seenIMDb[e.IMDbID]; dup {
+					t.Fatalf("duplicate IMDbID in fallback: %q", e.IMDbID)
+				}
+				seenIMDb[e.IMDbID] = struct{}{}
+			}
+		})
+	}
+
+	// Custom IMDbURL returning HTTP 202 must still return an error (no silent masking).
+	wafSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer wafSrv.Close()
+	if _, err := NewFetcher(Options{IMDbURL: wafSrv.URL}).FetchIMDbTop250(ctx); err == nil {
+		t.Fatal("expected error for custom IMDbURL returning HTTP 202")
+	}
+}
+
+func TestSyncAndApplyIMDbFallbackAndLivePreservation(t *testing.T) {
+	t.Setenv(EnvIMDb250URL, "")
+	t.Setenv(EnvTMDBAPIKey, "")
+	t.Setenv(EnvTMDBAPIKeyFallback, "")
+
+	store := openTestStore(t)
+	repo := sqlite.NewLibraryRepo(store)
+	ctx := context.Background()
+
+	lib, err := repo.CreateLibrary(ctx, "Movies", "movies", []string{"/movies"})
+	if err != nil {
+		t.Fatalf("CreateLibrary: %v", err)
+	}
+	y1994 := 1994
+	movie := &sqlite.ItemRecord{
+		LibraryID:      lib.ID,
+		Type:           "Movie",
+		Name:           "肖申克的救赎",
+		OriginalTitle:  "The Shawshank Redemption",
+		ProductionYear: &y1994,
+		Extra:          sqlite.ItemExtra{ProviderIDs: map[string]string{"imdb": "tt0111161"}},
+	}
+	if err := repo.UpsertItem(ctx, movie); err != nil {
+		t.Fatalf("UpsertItem: %v", err)
+	}
+
+	var imdbLive atomic.Bool
+	client := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			switch {
+			case strings.HasPrefix(r.URL.String(), DefaultIMDbTop250URL):
+				if imdbLive.Load() {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"application/json"}},
+						Body: io.NopCloser(strings.NewReader(`[
+							{"rank":1,"title":"The Shawshank Redemption","year":1994,"imdb_id":"tt0111161"}
+						]`)),
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusAccepted,
+					Header:     http.Header{"Content-Type": []string{"text/html"}},
+					Body:       io.NopCloser(strings.NewReader(`<html><body>AWS WAF</body></html>`)),
+				}, nil
+			case strings.HasPrefix(r.URL.String(), DefaultDoubanTop250URL):
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`[{"rank":1,"title":"肖申克的救赎","year":1994,"douban_id":"1292052"}]`)),
+				}, nil
+			default:
+				return &http.Response{
+					StatusCode: http.StatusForbidden,
+					Header:     http.Header{},
+					Body:       io.NopCloser(strings.NewReader("blocked")),
+				}, nil
+			}
+		}),
+	}
+
+	svc := New(store, nil, Options{HTTPClient: client})
+
+	// 1. IMDb returns 202 WAF -> falls back to built-in snapshot, persists to SQLite, tags library.
+	sum, err := svc.SyncAndApply(ctx)
+	if err != nil {
+		t.Fatalf("SyncAndApply with IMDb WAF fallback failed: %v", err)
+	}
+	if sum.IMDbError != "" || sum.IMDbCount < 100 {
+		t.Fatalf("expected IMDb fallback populated without error, got %+v", sum)
+	}
+	st := svc.Status(false)
+	if st.IMDbTop250.Source != SourceIMDbTop250Builtin || st.IMDbTop250.UpdatedAt.IsZero() || st.IMDbTop250.Count != sum.IMDbCount {
+		t.Fatalf("unexpected IMDb status after fallback: %+v", st.IMDbTop250)
+	}
+	tags := getItemTags(t, store, movie.ID)
+	if !strings.Contains(strings.Join(tags, ","), TagIMDbTop250) {
+		t.Fatalf("expected %q tag on movie, got %v", TagIMDbTop250, tags)
+	}
+
+	// 2. Live IMDb succeeds -> replaces builtin fallback with live snapshot.
+	imdbLive.Store(true)
+	sum2, err := svc.SyncAndApply(ctx)
+	if err != nil {
+		t.Fatalf("SyncAndApply live IMDb failed: %v", err)
+	}
+	st2 := svc.Status(false)
+	if st2.IMDbTop250.Source != DefaultIMDbTop250URL || sum2.IMDbCount != 1 {
+		t.Fatalf("expected live IMDb snapshot, got status=%+v sum=%+v", st2.IMDbTop250, sum2)
+	}
+
+	// 3. Subsequent IMDb 202 WAF -> preserves existing live snapshot rather than downgrading.
+	imdbLive.Store(false)
+	sum3, err := svc.SyncAndApply(ctx)
+	if err != nil {
+		t.Fatalf("SyncAndApply after live IMDb failed: %v", err)
+	}
+	st3 := svc.Status(false)
+	if st3.IMDbTop250.Source != DefaultIMDbTop250URL || sum3.IMDbCount != 1 {
+		t.Fatalf("expected existing live IMDb snapshot preserved, got status=%+v sum=%+v", st3.IMDbTop250, sum3)
 	}
 }
 
