@@ -279,4 +279,45 @@ describe('api/client - 管理控制台全部 API 方法', () => {
       'GET /emby/System/Logs/server.log',
     ])
   })
+
+  it('覆盖元数据编辑、图片管理、远端识别、多版本拆分合并与榜单管理全部端点', async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(async () => mockJsonResponse({}, 200))
+
+    await api.updateItemMetadata('item-1', { Name: '测试影片' })
+    await api.refreshItemMetadata('item-1', true)
+    await api.deleteItem('item-1')
+    await api.splitItemVersions('item-1')
+    await api.mergeItemVersions(['item-1', 'item-2'])
+    await api.remoteSearch('Movie', { Name: '盗梦空间', Year: 2010 })
+    await api.applyRemoteSearch('item-1', { Name: '盗梦空间' }, true)
+    await api.getItemImages('item-1')
+    await api.getRemoteImages('item-1', 'Primary')
+    await api.downloadRemoteImage('item-1', 'Primary', 'https://img.test/a.jpg')
+    await api.uploadItemImage('item-1', 'Primary', 'data:image/png;base64,AAAA', 'image/png')
+    await api.setItemImageByUrl('item-1', 'Backdrop', 'https://img.test/b.jpg')
+    await api.deleteItemImage('item-1', 'Primary', 0)
+    await api.getRankings()
+    await api.refreshRankings()
+
+    const endpoints = fetchSpy.mock.calls.map(([u, init]) => `${init?.method || 'GET'} ${u}`)
+    expect(endpoints).toEqual([
+      'POST /emby/Items/item-1',
+      'POST /emby/Items/item-1/Refresh?Recursive=true&MetadataRefreshMode=FullRefresh&ImageRefreshMode=FullRefresh&ReplaceAllMetadata=true&ReplaceAllImages=false',
+      'DELETE /emby/Items/item-1',
+      'DELETE /emby/Videos/item-1/AlternateSources',
+      'POST /emby/Videos/MergeVersions?Ids=item-1%2Citem-2',
+      'POST /emby/Items/RemoteSearch/Movie',
+      'POST /emby/Items/RemoteSearch/Apply/item-1?ReplaceAllImages=true',
+      'GET /emby/Items/item-1/Images',
+      'GET /emby/Items/item-1/RemoteImages?Type=Primary',
+      'POST /emby/Items/item-1/RemoteImages/Download?Type=Primary&ImageUrl=https%3A%2F%2Fimg.test%2Fa.jpg',
+      'POST /emby/Items/item-1/Images/Primary',
+      'POST /emby/Items/item-1/Images/Backdrop/Url',
+      'DELETE /emby/Items/item-1/Images/Primary/0',
+      'GET /emby/System/Rankings',
+      'POST /emby/System/Rankings/Refresh',
+    ])
+  })
 })

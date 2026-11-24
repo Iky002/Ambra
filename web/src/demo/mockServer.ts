@@ -3,9 +3,15 @@ import type {
   ApiKeyInfo,
   AuthenticationResult,
   BaseItemDto,
+  ItemImageInfo,
   PlaybackInfoResponse,
   PublicSystemInfo,
   QueryResult,
+  RankingsRefreshResult,
+  RankingsSummary,
+  RemoteImageInfo,
+  RemoteImageResult,
+  RemoteSearchResult,
   SearchHint,
   SearchHintResult,
   UserDto,
@@ -18,11 +24,53 @@ import { makeAvatarDataUrl, makeLibraryThumbDataUrl, makePosterDataUrl } from '.
 
 let store: DemoState = createInitialDemoState()
 
+interface DemoRankingsState {
+  doubanUpdatedAt: string
+  imdbUpdatedAt: string
+}
+
+function createInitialRankingsState(): DemoRankingsState {
+  const threeHoursAgo = new Date(Date.now() - 3 * 3600_000).toISOString()
+  return {
+    doubanUpdatedAt: threeHoursAgo,
+    imdbUpdatedAt: threeHoursAgo,
+  }
+}
+
+let rankingsState: DemoRankingsState = createInitialRankingsState()
+
+const DEMO_DOUBAN_TOP250_TMDB_IDS = new Set([
+  '278', // 肖申克的救赎
+  '238', // 教父
+  '155', // 蝙蝠侠：黑暗骑士
+  '10997', // 霸王别姬
+  '13', // 阿甘正传
+  '27205', // 盗梦空间
+  '157336', // 星际穿越
+  '129', // 千与千寻
+  '872585', // 奥本海默
+  '693134', // 沙丘 2
+])
+
+const DEMO_IMDB_TOP250_TMDB_IDS = new Set([
+  '278',
+  '238',
+  '155',
+  '13',
+  '27205',
+  '157336',
+  '129',
+  '872585',
+  '693134',
+  '335984', // 银翼杀手 2049
+])
+
 /**
  * 重置 Demo 内存态数据（供单元测试与演示重置使用）
  */
 export function resetDemoStore(): void {
   store = createInitialDemoState()
+  rankingsState = createInitialRankingsState()
 }
 
 export function getDemoImageUrl(
@@ -818,7 +866,550 @@ export async function demoFetch<T>(
     return content as T
   }
 
-  // ==================== 13. 单用户查询/删除（放在更具体路由之后） ====================
+  // ==================== 13. 榜单缓存与自动打标 ====================
+  if (pathname === '/emby/System/Rankings' && method === 'GET') {
+    const summary: RankingsSummary = {
+      douban_top250: {
+        chart: 'douban_top250',
+        source: '豆瓣电影 Top 250 (Demo 内存缓存)',
+        updated_at: rankingsState.doubanUpdatedAt,
+        count: 250,
+      },
+      imdb_top250: {
+        chart: 'imdb_top250',
+        source: 'IMDb Top 250 (Demo 内存缓存)',
+        updated_at: rankingsState.imdbUpdatedAt,
+        count: 250,
+      },
+    }
+    return summary as T
+  }
+
+  if (pathname === '/emby/System/Rankings/Refresh' && method === 'POST') {
+    const now = new Date().toISOString()
+    rankingsState.doubanUpdatedAt = now
+    rankingsState.imdbUpdatedAt = now
+
+    let matchedItems = 0
+    let tagsAdded = 0
+
+    for (const item of store.items.values()) {
+      if (item.Type !== 'Movie' && item.Type !== 'Series') continue
+      const tmdbId = item.ProviderIds?.Tmdb || ''
+      const inDouban =
+        DEMO_DOUBAN_TOP250_TMDB_IDS.has(tmdbId) || Boolean(item.Tags?.includes('豆瓣Top250'))
+      const inImdb =
+        DEMO_IMDB_TOP250_TMDB_IDS.has(tmdbId) || Boolean(item.Tags?.includes('IMDb Top250'))
+
+      if (!inDouban && !inImdb) continue
+      matchedItems++
+      const tags = new Set(item.Tags || [])
+      if (inDouban && !tags.has('豆瓣Top250')) {
+        tags.add('豆瓣Top250')
+        tagsAdded++
+      }
+      if (inImdb && !tags.has('IMDb Top250')) {
+        tags.add('IMDb Top250')
+        tagsAdded++
+      }
+      item.Tags = Array.from(tags)
+    }
+
+    pushActivity(
+      '已同步豆瓣 Top 250 / IMDb Top 250 榜单缓存',
+      'RankingsSynced',
+      `命中 ${matchedItems} 部影片，新增标签 ${tagsAdded} 个`,
+    )
+
+    const result: RankingsRefreshResult = {
+      douban_count: 250,
+      imdb_count: 250,
+      matched_items: matchedItems,
+      tags_added: tagsAdded,
+      synced_at: now,
+    }
+    return result as T
+  }
+
+  // ==================== 14. 媒体元数据、图片管理、远端识别与多版本拆分 ====================
+  const remoteSearchMatch = pathname.match(/^\/emby\/Items\/RemoteSearch\/(Movie|Series)$/)
+  if (remoteSearchMatch && method === 'POST') {
+    const itemType = remoteSearchMatch[1]
+    const body = parseJsonBody(options)
+    const searchInfo = (body.SearchInfo && typeof body.SearchInfo === 'object'
+      ? (body.SearchInfo as Record<string, unknown>)
+      : body) as {
+      Name?: string
+      Year?: number
+      ProviderIds?: Record<string, string>
+    }
+    const qName = String(searchInfo.Name || '').trim()
+    const qYear = searchInfo.Year ? Number(searchInfo.Year) : undefined
+    const qTmdb = searchInfo.ProviderIds?.Tmdb?.trim()
+    const qImdb = searchInfo.ProviderIds?.Imdb?.trim()
+
+    const pool = Array.from(store.items.values()).filter((it) =>
+      itemType === 'Series' ? it.Type === 'Series' : it.Type === 'Movie',
+    )
+
+    const scored = pool
+      .map((it) => {
+        let score = 0
+        if (qTmdb && it.ProviderIds?.Tmdb === qTmdb) score += 100
+        if (qImdb && it.ProviderIds?.Imdb === qImdb) score += 100
+        if (qName && matchesFuzzySearch(it, qName)) score += 50
+        if (qYear && it.ProductionYear === qYear) score += 20
+        return { item: it, score }
+      })
+      .sort((a, b) => b.score - a.score)
+
+    const topItems =
+      scored.filter((s) => s.score > 0).length > 0
+        ? scored.filter((s) => s.score > 0).slice(0, 5).map((s) => s.item)
+        : pool.slice(0, 4)
+
+    const results: RemoteSearchResult[] = topItems.map((it) => {
+      const art = store.artById.get(it.Id)
+      return {
+        Name: it.Name,
+        ProductionYear: it.ProductionYear,
+        PremiereDate: it.PremiereDate,
+        ImageUrl: art?.poster,
+        BackdropUrl: art?.backdrop,
+        SearchProviderName: 'TheMovieDb',
+        Overview: it.Overview,
+        ProviderIds: { ...(it.ProviderIds || {}) },
+      }
+    })
+
+    // 若用户输入了自定义搜索词且未完全精确命中，额外附带一条精确命名的高清候选方便演示
+    if (qName && !results.some((r) => r.Name.toLowerCase() === qName.toLowerCase())) {
+      const donor = topItems[0] || pool[0]
+      const donorArt = donor ? store.artById.get(donor.Id) : undefined
+      results.unshift({
+        Name: qName,
+        ProductionYear: qYear || 2024,
+        ImageUrl: donorArt?.poster,
+        BackdropUrl: donorArt?.backdrop,
+        SearchProviderName: 'TheMovieDb',
+        Overview: `来自 TMDB 的「${qName}」高清元数据匹配结果，支持一键写入片名、年份、简介、外部 ID 与官方海报/剧照。`,
+        ProviderIds: {
+          Tmdb: qTmdb || '990250',
+          ...(qImdb ? { Imdb: qImdb } : { Imdb: 'tt9900250' }),
+        },
+      })
+    }
+
+    return results as T
+  }
+
+  const remoteApplyMatch = pathname.match(/^\/emby\/Items\/RemoteSearch\/Apply\/([^/]+)$/)
+  if (remoteApplyMatch && method === 'POST') {
+    const itemId = decodeURIComponent(remoteApplyMatch[1])
+    const item = store.items.get(itemId)
+    if (!item) throw new ApiError(404, '项目不存在')
+    const body = parseJsonBody(options) as unknown as RemoteSearchResult
+    const replaceAllImages = qs.get('ReplaceAllImages') !== 'false'
+
+    if (body.Name) {
+      item.Name = body.Name
+      item.SortName = body.Name.toLowerCase()
+    }
+    if (body.ProductionYear !== undefined && body.ProductionYear !== null) {
+      item.ProductionYear = Number(body.ProductionYear)
+    }
+    if (body.PremiereDate) {
+      item.PremiereDate = body.PremiereDate
+    }
+    if (body.Overview) {
+      item.Overview = body.Overview
+    }
+    if (body.ProviderIds && Object.keys(body.ProviderIds).length > 0) {
+      item.ProviderIds = { ...(item.ProviderIds || {}), ...body.ProviderIds }
+    }
+    if (replaceAllImages && (body.ImageUrl || body.BackdropUrl)) {
+      const prevArt = store.artById.get(itemId) || { poster: '', backdrop: '' }
+      const nextTag = `demo-id-${Date.now().toString(36)}`
+      store.artById.set(itemId, {
+        ...prevArt,
+        poster: body.ImageUrl || prevArt.poster,
+        backdrop: body.BackdropUrl || prevArt.backdrop,
+      })
+      if (body.ImageUrl) {
+        item.ImageTags = { ...(item.ImageTags || {}), Primary: nextTag }
+      }
+      if (body.BackdropUrl) {
+        item.BackdropImageTags = [nextTag]
+      }
+    }
+    item.Etag = `etag-${Date.now().toString(36)}`
+    pushActivity(`已将远端识别结果应用于「${item.Name}」`, 'ItemIdentified')
+    return undefined as T
+  }
+
+  const itemRefreshMatch = pathname.match(/^\/emby\/Items\/([^/]+)\/Refresh$/)
+  if (itemRefreshMatch && method === 'POST') {
+    const itemId = decodeURIComponent(itemRefreshMatch[1])
+    const item = store.items.get(itemId)
+    if (!item) throw new ApiError(404, '项目不存在')
+    item.Etag = `etag-${Date.now().toString(36)}`
+    pushActivity(`已刷新「${item.Name}」的元数据`, 'ItemRefreshed')
+    return undefined as T
+  }
+
+  const itemImagesListMatch = pathname.match(/^\/emby\/Items\/([^/]+)\/Images$/)
+  if (itemImagesListMatch && method === 'GET') {
+    const itemId = decodeURIComponent(itemImagesListMatch[1])
+    const item = store.items.get(itemId)
+    if (!item) throw new ApiError(404, '项目不存在')
+    const art = store.artById.get(itemId)
+    const list: ItemImageInfo[] = []
+    if (item.ImageTags?.Primary && art?.poster) {
+      list.push({
+        ImageType: 'Primary',
+        ImageIndex: 0,
+        Filename: 'poster.jpg',
+        Width: 1000,
+        Height: 1500,
+        Size: 286_400,
+        ImageTag: item.ImageTags.Primary,
+      })
+    }
+    if (item.BackdropImageTags && item.BackdropImageTags.length > 0 && art?.backdrop) {
+      list.push({
+        ImageType: 'Backdrop',
+        ImageIndex: 0,
+        Filename: 'backdrop.jpg',
+        Width: 1920,
+        Height: 1080,
+        Size: 542_800,
+        ImageTag: item.BackdropImageTags[0],
+      })
+    }
+    return list as T
+  }
+
+  const remoteImagesDownloadMatch = pathname.match(
+    /^\/emby\/Items\/([^/]+)\/RemoteImages\/Download$/,
+  )
+  if (remoteImagesDownloadMatch && method === 'POST') {
+    const itemId = decodeURIComponent(remoteImagesDownloadMatch[1])
+    const item = store.items.get(itemId)
+    if (!item) throw new ApiError(404, '项目不存在')
+    const imgType = qs.get('Type') || 'Primary'
+    const imageUrl = qs.get('ImageUrl') || ''
+    if (!imageUrl) throw new ApiError(400, 'ImageUrl 不能为空')
+
+    const prevArt = store.artById.get(itemId) || { poster: '', backdrop: '' }
+    const nextTag = `demo-img-${Date.now().toString(36)}`
+    if (imgType.toLowerCase() === 'backdrop') {
+      store.artById.set(itemId, { ...prevArt, backdrop: imageUrl })
+      item.BackdropImageTags = [nextTag]
+    } else {
+      store.artById.set(itemId, { ...prevArt, poster: imageUrl })
+      item.ImageTags = { ...(item.ImageTags || {}), Primary: nextTag }
+    }
+    pushActivity(`已为「${item.Name}」替换远端 ${imgType} 图片`, 'ItemImageUpdated')
+    return undefined as T
+  }
+
+  const remoteImagesMatch = pathname.match(/^\/emby\/Items\/([^/]+)\/RemoteImages$/)
+  if (remoteImagesMatch && method === 'GET') {
+    const itemId = decodeURIComponent(remoteImagesMatch[1])
+    const item = store.items.get(itemId)
+    if (!item) throw new ApiError(404, '项目不存在')
+    const filterType = qs.get('Type') || ''
+
+    const images: RemoteImageInfo[] = []
+    const seenUrls = new Set<string>()
+
+    // 优先放入当前项目与库内其它已验证 TMDB 高清图
+    const candidateIds = [
+      itemId,
+      ...Array.from(store.items.values())
+        .filter((it) => it.Id !== itemId && (it.Type === 'Movie' || it.Type === 'Series'))
+        .map((it) => it.Id),
+    ]
+
+    for (const cid of candidateIds) {
+      const art = store.artById.get(cid)
+      if (!art) continue
+      if (
+        (!filterType || filterType.toLowerCase() === 'primary') &&
+        art.poster &&
+        art.poster.startsWith('http') &&
+        !seenUrls.has(art.poster)
+      ) {
+        seenUrls.add(art.poster)
+        images.push({
+          ProviderName: 'TheMovieDb',
+          Url: art.poster,
+          ThumbnailUrl: art.poster,
+          Width: 1000,
+          Height: 1500,
+          CommunityRating: cid === itemId ? 9.2 : 8.6,
+          VoteCount: cid === itemId ? 128 : 64,
+          Language: cid === itemId ? 'zh' : 'en',
+          Type: 'Primary',
+        })
+      }
+      if (
+        (!filterType || filterType.toLowerCase() === 'backdrop') &&
+        art.backdrop &&
+        art.backdrop.startsWith('http') &&
+        !seenUrls.has(art.backdrop)
+      ) {
+        seenUrls.add(art.backdrop)
+        images.push({
+          ProviderName: 'TheMovieDb',
+          Url: art.backdrop,
+          ThumbnailUrl: art.backdrop,
+          Width: 1920,
+          Height: 1080,
+          CommunityRating: cid === itemId ? 9.4 : 8.8,
+          VoteCount: cid === itemId ? 96 : 48,
+          Language: 'null',
+          Type: 'Backdrop',
+        })
+      }
+      if (images.length >= 12) break
+    }
+
+    const res: RemoteImageResult = {
+      Images: images,
+      TotalRecordCount: images.length,
+      Providers: ['TheMovieDb'],
+    }
+    return res as T
+  }
+
+  const imageByUrlMatch = pathname.match(
+    /^\/emby\/Items\/([^/]+)\/Images\/([^/]+)(?:\/(\d+))?\/Url$/,
+  )
+  if (imageByUrlMatch && method === 'POST') {
+    const itemId = decodeURIComponent(imageByUrlMatch[1])
+    const imgType = decodeURIComponent(imageByUrlMatch[2])
+    const item = store.items.get(itemId)
+    if (!item) throw new ApiError(404, '项目不存在')
+    const body = parseJsonBody(options)
+    const targetUrl = String(body.Url || body.url || '').trim()
+    if (!targetUrl) throw new ApiError(400, '图片 URL 不能为空')
+
+    const prevArt = store.artById.get(itemId) || { poster: '', backdrop: '' }
+    const nextTag = `demo-url-${Date.now().toString(36)}`
+    if (imgType.toLowerCase() === 'backdrop') {
+      store.artById.set(itemId, { ...prevArt, backdrop: targetUrl })
+      item.BackdropImageTags = [nextTag]
+    } else {
+      store.artById.set(itemId, { ...prevArt, poster: targetUrl })
+      item.ImageTags = { ...(item.ImageTags || {}), Primary: nextTag }
+    }
+    pushActivity(`已通过 URL 更新「${item.Name}」的 ${imgType} 图片`, 'ItemImageUpdated')
+    return undefined as T
+  }
+
+  const itemImageDeleteMatch = pathname.match(
+    /^\/emby\/Items\/([^/]+)\/Images\/([^/]+)(?:\/(\d+))?$/,
+  )
+  if (itemImageDeleteMatch && method === 'DELETE') {
+    const itemId = decodeURIComponent(itemImageDeleteMatch[1])
+    const imgType = decodeURIComponent(itemImageDeleteMatch[2])
+    const item = store.items.get(itemId)
+    if (!item) throw new ApiError(404, '项目不存在')
+    const prevArt = store.artById.get(itemId) || { poster: '', backdrop: '' }
+    if (imgType.toLowerCase() === 'backdrop') {
+      store.artById.set(itemId, { ...prevArt, backdrop: '' })
+      item.BackdropImageTags = []
+    } else {
+      store.artById.set(itemId, { ...prevArt, poster: '' })
+      if (item.ImageTags) {
+        const nextTags = { ...item.ImageTags }
+        delete nextTags.Primary
+        item.ImageTags = nextTags
+      }
+    }
+    pushActivity(`已删除「${item.Name}」的 ${imgType} 图片`, 'ItemImageDeleted')
+    return undefined as T
+  }
+
+  const itemImageUploadMatch = pathname.match(
+    /^\/emby\/Items\/([^/]+)\/Images\/([^/]+)(?:\/(\d+))?$/,
+  )
+  if (itemImageUploadMatch && method === 'POST') {
+    const itemId = decodeURIComponent(itemImageUploadMatch[1])
+    const imgType = decodeURIComponent(itemImageUploadMatch[2])
+    const item = store.items.get(itemId)
+    if (!item) throw new ApiError(404, '项目不存在')
+
+    const rawBody = typeof options.body === 'string' ? options.body.trim() : ''
+    if (!rawBody) throw new ApiError(400, '上传图片内容为空')
+    const hdrs = new Headers(options.headers || {})
+    const contentType = hdrs.get('Content-Type') || 'image/jpeg'
+    const dataUrl = rawBody.startsWith('data:')
+      ? rawBody
+      : `data:${contentType};base64,${rawBody}`
+
+    const prevArt = store.artById.get(itemId) || { poster: '', backdrop: '' }
+    const nextTag = `demo-up-${Date.now().toString(36)}`
+    if (imgType.toLowerCase() === 'backdrop') {
+      store.artById.set(itemId, { ...prevArt, backdrop: dataUrl })
+      item.BackdropImageTags = [nextTag]
+    } else {
+      store.artById.set(itemId, { ...prevArt, poster: dataUrl })
+      item.ImageTags = { ...(item.ImageTags || {}), Primary: nextTag }
+    }
+    pushActivity(`已上传「${item.Name}」的 ${imgType} 图片`, 'ItemImageUploaded')
+    return undefined as T
+  }
+
+  const splitVersionsMatch = pathname.match(/^\/emby\/Videos\/([^/]+)\/AlternateSources$/)
+  if (splitVersionsMatch && method === 'DELETE') {
+    const itemId = decodeURIComponent(splitVersionsMatch[1])
+    const item = store.items.get(itemId)
+    if (!item) throw new ApiError(404, '项目不存在')
+    const sources = item.MediaSources || []
+    if (sources.length <= 1) return undefined as T
+
+    const [first, ...rest] = sources
+    item.MediaSources = [first]
+    const parentArt = store.artById.get(itemId)
+
+    for (let i = 0; i < rest.length; i++) {
+      const src = rest[i]
+      const newId = `${itemId}-split-${i + 1}-${Date.now().toString(36)}`
+      const cloned: BaseItemDto = {
+        ...item,
+        Id: newId,
+        Name: `${item.Name} (${src.Name})`,
+        SortName: `${item.SortName || item.Name} ${i + 1}`,
+        MediaSources: [src],
+        DateCreated: new Date().toISOString(),
+        UserData: item.UserData ? { ...item.UserData } : undefined,
+        ImageTags: item.ImageTags ? { ...item.ImageTags } : undefined,
+        BackdropImageTags: item.BackdropImageTags ? [...item.BackdropImageTags] : undefined,
+      }
+      store.items.set(newId, cloned)
+      if (parentArt) {
+        store.artById.set(newId, { ...parentArt })
+      }
+      for (const [libId, ids] of store.libraryItems.entries()) {
+        if (ids.includes(itemId)) {
+          store.libraryItems.set(libId, [...ids, newId])
+        }
+      }
+    }
+
+    pushActivity(
+      `已拆分「${item.Name}」的 ${sources.length} 个多版本为独立条目`,
+      'ItemVersionsSplit',
+    )
+    return undefined as T
+  }
+
+  if (pathname === '/emby/Videos/MergeVersions' && method === 'POST') {
+    const ids = (qs.get('Ids') || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+    if (ids.length >= 2) {
+      const primary = store.items.get(ids[0])
+      if (primary) {
+        const mergedSources = [...(primary.MediaSources || [])]
+        for (const otherId of ids.slice(1)) {
+          const other = store.items.get(otherId)
+          if (!other) continue
+          if (other.MediaSources) mergedSources.push(...other.MediaSources)
+          store.items.delete(otherId)
+          for (const [libId, libIds] of store.libraryItems.entries()) {
+            store.libraryItems.set(
+              libId,
+              libIds.filter((id) => id !== otherId),
+            )
+          }
+        }
+        primary.MediaSources = mergedSources
+        pushActivity(`已将 ${ids.length} 个媒体合并为多版本「${primary.Name}」`, 'ItemVersionsMerged')
+      }
+    }
+    return undefined as T
+  }
+
+  const singleItemMutationMatch = pathname.match(/^\/emby\/Items\/([^/]+)$/)
+  if (singleItemMutationMatch && method === 'POST') {
+    const itemId = decodeURIComponent(singleItemMutationMatch[1])
+    const item = store.items.get(itemId)
+    if (!item) throw new ApiError(404, '项目不存在')
+    const body = parseJsonBody(options)
+
+    if (typeof body.Name === 'string' && body.Name.trim()) {
+      item.Name = body.Name.trim()
+    }
+    if (typeof body.OriginalTitle === 'string') {
+      item.OriginalTitle = body.OriginalTitle
+    }
+    if (typeof body.SortName === 'string') {
+      item.SortName = body.SortName
+    }
+    if (body.ProductionYear !== undefined && body.ProductionYear !== null && body.ProductionYear !== '') {
+      item.ProductionYear = Number(body.ProductionYear)
+    }
+    if (body.CommunityRating !== undefined && body.CommunityRating !== null && body.CommunityRating !== '') {
+      item.CommunityRating = Number(body.CommunityRating)
+    }
+    if (typeof body.OfficialRating === 'string') {
+      item.OfficialRating = body.OfficialRating
+    }
+    if (typeof body.Overview === 'string') {
+      item.Overview = body.Overview
+    }
+    if (Array.isArray(body.Genres)) {
+      item.Genres = body.Genres.map((g) => String(g).trim()).filter(Boolean)
+    }
+    if (Array.isArray(body.Tags)) {
+      item.Tags = body.Tags.map((t) => String(t).trim()).filter(Boolean)
+    }
+    if (body.ProviderIds && typeof body.ProviderIds === 'object') {
+      const nextProviders: Record<string, string> = {}
+      for (const [k, v] of Object.entries(body.ProviderIds as Record<string, unknown>)) {
+        const val = String(v ?? '').trim()
+        if (val) nextProviders[k] = val
+      }
+      item.ProviderIds = nextProviders
+    }
+    item.Etag = `etag-${Date.now().toString(36)}`
+    pushActivity(`已更新「${item.Name}」的元数据`, 'ItemMetadataUpdated')
+    return undefined as T
+  }
+
+  if (singleItemMutationMatch && method === 'DELETE') {
+    const itemId = decodeURIComponent(singleItemMutationMatch[1])
+    const item = store.items.get(itemId)
+    if (item) {
+      store.items.delete(itemId)
+      store.artById.delete(itemId)
+      const seasons = store.seasonsBySeries.get(itemId) || []
+      for (const s of seasons) {
+        const eps = store.episodesBySeason.get(s.Id) || []
+        for (const ep of eps) {
+          store.items.delete(ep.Id)
+          store.artById.delete(ep.Id)
+        }
+        store.episodesBySeason.delete(s.Id)
+        store.items.delete(s.Id)
+      }
+      store.seasonsBySeries.delete(itemId)
+      for (const [libId, libIds] of store.libraryItems.entries()) {
+        store.libraryItems.set(
+          libId,
+          libIds.filter((id) => id !== itemId),
+        )
+      }
+      pushActivity(`已删除媒体「${item.Name}」`, 'ItemDeleted')
+    }
+    return undefined as T
+  }
+
+  // ==================== 15. 单用户查询/删除（放在更具体路由之后） ====================
   const singleUserMatch = pathname.match(/^\/emby\/Users\/([^/]+)$/)
   if (singleUserMatch) {
     const userId = decodeURIComponent(singleUserMatch[1])
