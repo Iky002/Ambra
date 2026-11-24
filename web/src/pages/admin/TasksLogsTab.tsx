@@ -7,6 +7,7 @@ import {
   Play,
   RefreshCw,
   Search,
+  Square,
   Terminal,
 } from 'lucide-react'
 import { api } from '../../api/client'
@@ -18,6 +19,7 @@ export function TasksLogsTab() {
     null,
   )
   const [runningTaskId, setRunningTaskId] = useState<string | null>(null)
+  const [stoppingTaskId, setStoppingTaskId] = useState<string | null>(null)
   const [selectedLog, setSelectedLog] = useState<string | null>(null)
   const [logFilter, setLogFilter] = useState('')
 
@@ -77,6 +79,25 @@ export function TasksLogsTab() {
       })
     } finally {
       setRunningTaskId(null)
+    }
+  }
+
+  const handleStopTask = async (taskId: string, taskName: string) => {
+    setStoppingTaskId(taskId)
+    setFeedback(null)
+    try {
+      await api.stopScheduledTask(taskId)
+      setFeedback({ type: 'success', message: `已请求停止计划任务「${taskName}」` })
+      window.setTimeout(() => {
+        void refetchTasks()
+      }, 400)
+    } catch (err) {
+      setFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : '停止计划任务失败',
+      })
+    } finally {
+      setStoppingTaskId(null)
     }
   }
 
@@ -193,19 +214,36 @@ export function TasksLogsTab() {
                         : `Key: ${task.Key || task.Id}`}
                     </span>
 
-                    <button
-                      type="button"
-                      disabled={isRunning || isTriggering}
-                      onClick={() => handleRunTask(task.Id, task.Name)}
-                      className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500/15 px-3 py-1.5 text-xs font-semibold text-amber-300 ring-1 ring-amber-500/30 transition-colors hover:bg-amber-500/25 disabled:opacity-50"
-                    >
-                      {isTriggering ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <Play className="h-3.5 w-3.5 fill-current" />
+                    <div className="flex items-center gap-2">
+                      {isRunning && (
+                        <button
+                          type="button"
+                          disabled={stoppingTaskId === task.Id}
+                          onClick={() => handleStopTask(task.Id, task.Name)}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/30 bg-red-500/15 px-3 py-1.5 text-xs font-semibold text-red-300 transition-colors hover:bg-red-500/25 disabled:opacity-50"
+                        >
+                          {stoppingTaskId === task.Id ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <Square className="h-3 w-3 fill-current" />
+                          )}
+                          <span>停止</span>
+                        </button>
                       )}
-                      <span>立即运行</span>
-                    </button>
+                      <button
+                        type="button"
+                        disabled={isRunning || isTriggering}
+                        onClick={() => handleRunTask(task.Id, task.Name)}
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500/15 px-3 py-1.5 text-xs font-semibold text-amber-300 ring-1 ring-amber-500/30 transition-colors hover:bg-amber-500/25 disabled:opacity-50"
+                      >
+                        {isTriggering ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Play className="h-3.5 w-3.5 fill-current" />
+                        )}
+                        <span>立即运行</span>
+                      </button>
+                    </div>
                   </div>
                 </div>
               )

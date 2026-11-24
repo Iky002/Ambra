@@ -7,6 +7,7 @@ import {
   ChevronRight,
   ChevronsLeft,
   ChevronsRight,
+  FileCode2,
   Film,
   Flame,
   Image as ImageIcon,
@@ -71,6 +72,7 @@ export function MetadataTab() {
   const [identifyItem, setIdentifyItem] = useState<BaseItemDto | null>(null)
   const [deletingItem, setDeletingItem] = useState<BaseItemDto | null>(null)
   const [refreshingId, setRefreshingId] = useState<string | null>(null)
+  const [writingNfoId, setWritingNfoId] = useState<string | null>(null)
 
   const { data: rankings, isLoading: rankingsLoading } = useQuery({
     queryKey: ['rankings'],
@@ -184,6 +186,26 @@ export function MetadataTab() {
       })
     } finally {
       setRefreshingId(null)
+    }
+  }
+
+  const handleWriteItemNfo = async (item: BaseItemDto) => {
+    setWritingNfoId(item.Id)
+    try {
+      const res = await api.writeItemNfo(item.Id)
+      setFeedback({
+        type: 'success',
+        message: res?.path
+          ? `已原子回写「${item.Name}」的 NFO：${res.path}`
+          : `已成功回写「${item.Name}」的 .nfo 文件`,
+      })
+    } catch (err) {
+      setFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : '回写 NFO 失败',
+      })
+    } finally {
+      setWritingNfoId(null)
     }
   }
 
@@ -629,6 +651,20 @@ export function MetadataTab() {
                           className={`h-3 w-3 ${refreshingId === item.Id ? 'animate-spin' : ''}`}
                         />
                         <span>刷新</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={writingNfoId === item.Id}
+                        onClick={() => void handleWriteItemNfo(item)}
+                        title="原子回写 .nfo 元数据文件"
+                        className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-2.5 py-1.5 text-xs font-medium text-emerald-300 transition-colors hover:bg-emerald-500/20 disabled:opacity-50"
+                      >
+                        {writingNfoId === item.Id ? (
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <FileCode2 className="h-3 w-3" />
+                        )}
+                        <span>回写 NFO</span>
                       </button>
                       <button
                         type="button"

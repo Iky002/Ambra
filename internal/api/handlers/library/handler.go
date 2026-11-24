@@ -13,6 +13,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/scanner"
+	"github.com/ambra-media/ambra/internal/core/watcher"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
@@ -25,10 +26,12 @@ type AuthFuncs struct {
 }
 
 type Handler struct {
-	repo    *sqlite.LibraryRepo
-	scanner *scanner.Scanner
-	cfg     *config.Config
-	auth    AuthFuncs
+	repo     *sqlite.LibraryRepo
+	userRepo *sqlite.UserRepo
+	scanner  *scanner.Scanner
+	watcher  *watcher.Watcher
+	cfg      *config.Config
+	auth     AuthFuncs
 }
 
 func New(repo *sqlite.LibraryRepo, sc *scanner.Scanner, cfg *config.Config) *Handler {
@@ -37,6 +40,16 @@ func New(repo *sqlite.LibraryRepo, sc *scanner.Scanner, cfg *config.Config) *Han
 		scanner: sc,
 		cfg:     cfg,
 	}
+}
+
+// SetUserRepo attaches a UserRepo for per-user library access control (Policy.EnableAllFolders / EnabledFolders).
+func (h *Handler) SetUserRepo(userRepo *sqlite.UserRepo) {
+	h.userRepo = userRepo
+}
+
+// SetWatcher attaches a filesystem Watcher so library creation/deletion dynamically updates watches.
+func (h *Handler) SetWatcher(w *watcher.Watcher) {
+	h.watcher = w
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
@@ -92,6 +105,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	handleAdmin("POST /Library/Refresh", h.handleRefreshLibrary)
 	handleAdmin("POST /Library/Media/Updated", h.handleMediaUpdated)
 	handleAdmin("GET /api/admin/scanner/progress", h.handleScannerProgress)
+	handleAdmin("POST /api/admin/scanner/pause", h.handleScannerPause)
+	handleAdmin("POST /api/admin/scanner/resume", h.handleScannerResume)
+	handleAdmin("POST /api/admin/scanner/cancel", h.handleScannerCancel)
 }
 
 func (h *Handler) serverID() string {
@@ -114,7 +130,46 @@ func (h *Handler) resolveUserID(r *http.Request, q httpx.Query) string {
 	return ""
 }
 
+// allowedLibrariesForUser returns nil if the user has unrestricted access to all libraries,
+// or a non-nil slice of normalized library IDs (possibly empty) if restricted.
+func (h *Handler) allowedLibrariesForUser(ctx context.Context, userID string) []string {
+	if h.userRepo == nil || userID == "" {
+		return nil
+	}
+	u, err := h.userRepo.GetUserByID(ctx, userID)
+	if err != nil || u == nil {
+		return nil
+	}
+	if u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableAllFolders {
+		return nil
+	}
+	allowed := make([]string, 0, len(u.Policy.EnabledFolders))
+	for _, fid := range u.Policy.EnabledFolders {
+		if norm := guid.Normalize(fid); norm != "" {
+			allowed = append(allowed, norm)
+		}
+	}
+	return allowed
+}
+
+func isLibraryAllowed(libID string, allowed []string) bool {
+	if allowed == nil {
+		return true
+	}
+	norm := guid.Normalize(libID)
+	for _, id := range allowed {
+		if id == norm {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *Handler) handleUserViews(w http.ResponseWriter, r *http.Request) {
+	q := httpx.ParseQuery(r)
+	userID := h.resolveUserID(r, q)
+	allowed := h.allowedLibrariesForUser(r.Context(), userID)
+
 	libs, err := h.repo.ListLibraries(r.Context())
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -122,6 +177,9 @@ func (h *Handler) handleUserViews(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]dto.BaseItemDto, 0, len(libs))
 	for _, lib := range libs {
+		if !isLibraryAllowed(lib.ID, allowed) {
+			continue
+		}
 		items = append(items, h.libraryToViewDto(r.Context(), lib))
 	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
@@ -208,6 +266,7 @@ func (h *Handler) handleQueryItems(w http.ResponseWriter, r *http.Request) {
 		ServerID:               h.serverID(),
 		UserID:                 userID,
 		ParentID:               q.Get("ParentId"),
+		AllowedLibraryIDs:      h.allowedLibrariesForUser(r.Context(), userID),
 		Recursive:              rec,
 		IncludeItemTypes:       q.List("IncludeItemTypes"),
 		ExcludeItemTypes:       q.List("ExcludeItemTypes"),
@@ -244,7 +303,8 @@ func (h *Handler) handleQueryItems(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleLatestItems(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
-	items, err := h.repo.GetLatestItems(
+	allowed := h.allowedLibrariesForUser(r.Context(), userID)
+	items, err := h.repo.GetLatestItemsWithAllowedLibraries(
 		r.Context(),
 		h.serverID(),
 		userID,
@@ -252,6 +312,7 @@ func (h *Handler) handleLatestItems(w http.ResponseWriter, r *http.Request) {
 		q.List("IncludeItemTypes"),
 		q.Int("Limit", 16),
 		q.List("Fields"),
+		allowed,
 	)
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -288,9 +349,14 @@ func (h *Handler) handleGetItem(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
 	itemID := r.PathValue("Id")
+	allowed := h.allowedLibrariesForUser(r.Context(), userID)
 	item, err := h.repo.GetItemByID(r.Context(), h.serverID(), userID, itemID)
 	if errors.Is(err, sqlite.ErrNotFound) {
 		if lib, libErr := h.repo.GetLibrary(r.Context(), itemID); libErr == nil && lib != nil {
+			if !isLibraryAllowed(lib.ID, allowed) {
+				httpx.Error(w, http.StatusForbidden, "access denied")
+				return
+			}
 			httpx.JSON(w, http.StatusOK, h.libraryToViewDto(r.Context(), *lib))
 			return
 		}
@@ -300,6 +366,14 @@ func (h *Handler) handleGetItem(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if allowed != nil {
+		if rec, recErr := h.repo.GetItemRecordByID(r.Context(), itemID); recErr == nil && rec != nil && rec.LibraryID != "" {
+			if !isLibraryAllowed(rec.LibraryID, allowed) {
+				httpx.Error(w, http.StatusForbidden, "access denied")
+				return
+			}
+		}
 	}
 	httpx.JSON(w, http.StatusOK, item)
 }
@@ -385,12 +459,14 @@ func (h *Handler) handleNextUp(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleSearchHints(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	userID := h.resolveUserID(r, q)
 	hints, total, err := h.repo.SearchHints(r.Context(), sqlite.SearchHintFilter{
-		UserID:           h.resolveUserID(r, q),
-		ParentID:         q.Get("ParentId"),
-		SearchTerm:       q.Get("SearchTerm"),
-		IncludeItemTypes: q.List("IncludeItemTypes"),
-		Limit:            q.Int("Limit", 24),
+		UserID:            userID,
+		ParentID:          q.Get("ParentId"),
+		AllowedLibraryIDs: h.allowedLibrariesForUser(r.Context(), userID),
+		SearchTerm:        q.Get("SearchTerm"),
+		IncludeItemTypes:  q.List("IncludeItemTypes"),
+		Limit:             q.Int("Limit", 24),
 	})
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -528,6 +604,9 @@ func (h *Handler) handleCreateVirtualFolder(w http.ResponseWriter, r *http.Reque
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if h.watcher != nil {
+		_ = h.watcher.WatchLibrary(lib.ID, lib.Paths)
+	}
 	if h.scanner != nil && q.Bool("refreshLibrary") != nil && *q.Bool("refreshLibrary") {
 		h.scanner.ScanLibraryAsync(lib.ID)
 	}
@@ -546,13 +625,30 @@ func (h *Handler) handleDeleteVirtualFolder(w http.ResponseWriter, r *http.Reque
 			httpx.Error(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if h.watcher != nil {
+			_ = h.watcher.UnwatchLibrary(guid.Normalize(id))
+		}
 		httpx.NoContent(w)
 		return
 	}
 	if name := q.Get("name"); name != "" {
+		var watchID string
+		if h.watcher != nil {
+			if libs, err := h.repo.ListLibraries(r.Context()); err == nil {
+				for _, lib := range libs {
+					if lib.Name == name {
+						watchID = lib.ID
+						break
+					}
+				}
+			}
+		}
 		if err := h.repo.DeleteLibraryByName(r.Context(), name); err != nil && !errors.Is(err, sqlite.ErrNotFound) {
 			httpx.Error(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if h.watcher != nil && watchID != "" {
+			_ = h.watcher.UnwatchLibrary(watchID)
 		}
 		httpx.NoContent(w)
 		return
@@ -575,7 +671,7 @@ func (h *Handler) handleMediaUpdated(w http.ResponseWriter, r *http.Request) {
 	httpx.NoContent(w)
 }
 
-func (h *Handler) handleScannerProgress(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) writeScannerProgress(w http.ResponseWriter) {
 	if h.scanner == nil {
 		httpx.JSON(w, http.StatusOK, scanner.ScanProgressSnapshot{
 			Running:   false,
@@ -585,6 +681,31 @@ func (h *Handler) handleScannerProgress(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	httpx.JSON(w, http.StatusOK, h.scanner.Progress())
+}
+
+func (h *Handler) handleScannerProgress(w http.ResponseWriter, r *http.Request) {
+	h.writeScannerProgress(w)
+}
+
+func (h *Handler) handleScannerPause(w http.ResponseWriter, r *http.Request) {
+	if h.scanner != nil {
+		h.scanner.Pause()
+	}
+	h.writeScannerProgress(w)
+}
+
+func (h *Handler) handleScannerResume(w http.ResponseWriter, r *http.Request) {
+	if h.scanner != nil {
+		h.scanner.Resume()
+	}
+	h.writeScannerProgress(w)
+}
+
+func (h *Handler) handleScannerCancel(w http.ResponseWriter, r *http.Request) {
+	if h.scanner != nil {
+		h.scanner.CancelAll()
+	}
+	h.writeScannerProgress(w)
 }
 
 func passthrough(next http.Handler) http.Handler { return next }

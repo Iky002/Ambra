@@ -27,6 +27,7 @@ type LibraryScanProgress struct {
 // ScanProgressSnapshot aggregates live scan progress across all active libraries.
 type ScanProgressSnapshot struct {
 	Running       bool                  `json:"running"`
+	Paused        bool                  `json:"paused"`
 	Phase         string                `json:"phase"` // "idle" | "discovering" | "enriching"
 	LibraryID     string                `json:"library_id,omitempty"`
 	LibraryName   string                `json:"library_name,omitempty"`
@@ -139,12 +140,15 @@ func (s *Scanner) finishLibraryProgress(libraryID string) {
 
 // Progress returns a thread-safe snapshot of current scan progress.
 func (s *Scanner) Progress() ScanProgressSnapshot {
+	paused := s.IsPaused()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if len(s.progress) == 0 {
 		return ScanProgressSnapshot{
 			Running:   false,
+			Paused:    paused,
 			Phase:     "idle",
 			UpdatedAt: time.Now(),
 		}
@@ -163,6 +167,7 @@ func (s *Scanner) Progress() ScanProgressSnapshot {
 
 	snap := ScanProgressSnapshot{
 		Running:   true,
+		Paused:    paused,
 		Phase:     "enriching",
 		Libraries: libs,
 	}

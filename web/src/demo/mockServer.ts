@@ -16,6 +16,7 @@ import type {
   ScanProgressSnapshot,
   SearchHint,
   SearchHintResult,
+  ServerConfiguration,
   SetupStatus,
   UserDto,
   UserItemDataDto,
@@ -54,11 +55,29 @@ interface DemoScanState {
   libraryId: string
   libraryName: string
   items: string[]
+  paused?: boolean
+  pausedAtMs?: number
 }
 
 let activeDemoScan: DemoScanState | null = null
 let demoSetupCompleted = true
 let demoDefaultLanguage = 'zh-CN'
+
+function createInitialServerConfig(): ServerConfiguration {
+  return {
+    ServerName: store.systemInfo.ServerName,
+    IsStartupWizardCompleted: true,
+    TMDBApiKey: 'demo-tmdb-key-ambra',
+    TMDBLanguage: 'zh-CN',
+    EnableSTRM302: true,
+    PlayedThreshold: 0.9,
+    PreferredMetadataLanguage: 'zh',
+    MetadataCountryCode: 'CN',
+    UICulture: 'zh-cn',
+  }
+}
+
+let demoServerConfig: ServerConfiguration = createInitialServerConfig()
 
 const DEMO_TMDB_TRENDING_TMDB_IDS = new Set([
   '693134', // 沙丘 2
@@ -124,6 +143,7 @@ export function resetDemoStore(): void {
   activeDemoScan = null
   demoSetupCompleted = true
   demoDefaultLanguage = 'zh-CN'
+  demoServerConfig = createInitialServerConfig()
 }
 
 export function getDemoImageUrl(
@@ -404,6 +424,38 @@ export async function demoFetch<T>(
   }
 
   // ==================== 1. 系统与公开信息 ====================
+  if (pathname === '/emby/System/Configuration') {
+    if (method === 'GET') {
+      return {
+        ...demoServerConfig,
+        ServerName: store.systemInfo.ServerName,
+      } as T
+    }
+    if (method === 'POST') {
+      const body = parseJsonBody(options)
+      if (typeof body.ServerName === 'string' && body.ServerName.trim()) {
+        const nextName = body.ServerName.trim()
+        demoServerConfig.ServerName = nextName
+        store.systemInfo.ServerName = nextName
+      }
+      if (typeof body.TMDBApiKey === 'string') {
+        demoServerConfig.TMDBApiKey = body.TMDBApiKey.trim()
+      }
+      if (typeof body.TMDBLanguage === 'string' && body.TMDBLanguage.trim()) {
+        demoServerConfig.TMDBLanguage = body.TMDBLanguage.trim()
+        demoDefaultLanguage = body.TMDBLanguage.trim()
+      }
+      if (typeof body.EnableSTRM302 === 'boolean') {
+        demoServerConfig.EnableSTRM302 = body.EnableSTRM302
+      }
+      if (typeof body.PlayedThreshold === 'number' && body.PlayedThreshold > 0 && body.PlayedThreshold <= 1) {
+        demoServerConfig.PlayedThreshold = body.PlayedThreshold
+      }
+      pushActivity('已更新服务器常规设置', 'ServerConfigUpdated')
+      return undefined as T
+    }
+  }
+
   if (pathname === '/emby/System/Info/Public' && method === 'GET') {
     const pub: PublicSystemInfo = {
       Id: store.systemInfo.Id,
@@ -962,6 +1014,7 @@ export async function demoFetch<T>(
 
     const snapshot: ScanProgressSnapshot = {
       running: true,
+      paused: Boolean(activeDemoScan.paused),
       phase,
       library_id: activeDemoScan.libraryId || undefined,
       library_name: activeDemoScan.libraryName,
@@ -972,13 +1025,72 @@ export async function demoFetch<T>(
       skipped,
       failed: 0,
       current_item: currentItem,
-      current_action: currentAction,
+      current_action: activeDemoScan.paused ? '扫描已暂停' : currentAction,
       percentage,
       started_at: startedIso,
       updated_at: nowIso,
       libraries: [libProgress],
     }
     return snapshot as T
+  }
+
+  if (pathname === '/api/admin/scanner/pause' && method === 'POST') {
+    if (activeDemoScan && !activeDemoScan.paused) {
+      activeDemoScan.paused = true
+      activeDemoScan.pausedAtMs = Date.now()
+      pushActivity('已暂停媒体库扫描任务', 'LibraryScanPaused')
+    }
+    return undefined as T
+  }
+
+  if (pathname === '/api/admin/scanner/resume' && method === 'POST') {
+    if (activeDemoScan && activeDemoScan.paused) {
+      const pausedDelta = activeDemoScan.pausedAtMs ? Date.now() - activeDemoScan.pausedAtMs : 0
+      activeDemoScan.startedAtMs += pausedDelta
+      activeDemoScan.paused = false
+      activeDemoScan.pausedAtMs = undefined
+      pushActivity('已恢复媒体库扫描任务', 'LibraryScanResumed')
+    }
+    return undefined as T
+  }
+
+  if (pathname === '/api/admin/scanner/cancel' && method === 'POST') {
+    if (activeDemoScan) {
+      activeDemoScan = null
+      pushActivity('已取消当前媒体库扫描任务', 'LibraryScanCancelled')
+    }
+    return undefined as T
+  }
+
+  const govLockMatch = pathname.match(/^\/api\/admin\/governance\/items\/([^/]+)\/lock$/)
+  if (govLockMatch && method === 'POST') {
+    const itemId = decodeURIComponent(govLockMatch[1])
+    const item = store.items.get(itemId)
+    if (!item) throw new ApiError(404, '项目不存在')
+    const body = parseJsonBody(options)
+    const rawFields = Array.isArray(body.LockedFields)
+      ? body.LockedFields
+      : Array.isArray(body.fields)
+        ? body.fields
+        : []
+    const fields = rawFields.map((f) => String(f)).filter(Boolean)
+    const lockAll = Boolean(body.LockData ?? body.lock_data)
+    item.LockedFields = fields
+    item.LockData = lockAll
+    pushActivity(`已更新「${item.Name}」的元数据锁定配置`, 'ItemFieldsLocked')
+    return { item_id: itemId, locked_fields: fields, lock_data: lockAll } as T
+  }
+
+  const govNfoMatch = pathname.match(/^\/api\/admin\/governance\/items\/([^/]+)\/nfo$/)
+  if (govNfoMatch && method === 'POST') {
+    const itemId = decodeURIComponent(govNfoMatch[1])
+    const item = store.items.get(itemId)
+    if (!item) throw new ApiError(404, '项目不存在')
+    const nfoPath = item.Path
+      ? item.Path.replace(/\.[^/.]+$/, '.nfo')
+      : `/media/${item.Name}/movie.nfo`
+    pushActivity(`已原子回写「${item.Name}」的 NFO 文件`, 'ItemNfoWritten', nfoPath)
+    return { item_id: itemId, path: nfoPath, written: true } as T
   }
 
   if (pathname === '/emby/Library/Refresh' && method === 'POST') {
@@ -1006,6 +1118,47 @@ export async function demoFetch<T>(
       `正在扫描与刮削 ${activeDemoScan.items.length} 个媒体条目`,
     )
     return undefined as T
+  }
+
+  if (pathname === '/emby/Library/VirtualFolders/Name' && method === 'POST') {
+    const body = parseJsonBody(options)
+    const oldName = String(qs.get('Name') || qs.get('name') || body.Name || '').trim()
+    const newName = String(qs.get('NewName') || qs.get('newName') || body.NewName || '').trim()
+    const id = String(body.Id || qs.get('Id') || '').trim()
+    if (!newName) throw new ApiError(400, '新名称不能为空')
+    const lib = store.libraries.find((l) => (id && l.ItemId === id) || (oldName && l.Name === oldName))
+    if (!lib) throw new ApiError(404, '媒体库不存在')
+    const prevName = lib.Name
+    lib.Name = newName
+    pushActivity(`已将媒体库「${prevName}」重命名为「${newName}」`, 'LibraryRenamed')
+    return undefined as T
+  }
+
+  if (pathname === '/emby/Library/VirtualFolders/Paths') {
+    if (method === 'POST') {
+      const body = parseJsonBody(options)
+      const name = String(body.Name || qs.get('Name') || qs.get('name') || '').trim()
+      const id = String(body.Id || qs.get('Id') || '').trim()
+      const targetPath = String(body.Path || (body.PathInfo as { Path?: string } | undefined)?.Path || '').trim()
+      if (!targetPath) throw new ApiError(400, '路径不能为空')
+      const lib = store.libraries.find((l) => (id && l.ItemId === id) || (name && l.Name === name))
+      if (!lib) throw new ApiError(404, '媒体库不存在')
+      const locations = lib.Locations || []
+      if (!locations.includes(targetPath)) {
+        lib.Locations = [...locations, targetPath]
+      }
+      pushActivity(`为媒体库「${lib.Name}」添加路径`, 'LibraryPathAdded', targetPath)
+      return undefined as T
+    }
+    if (method === 'DELETE') {
+      const name = String(qs.get('Name') || qs.get('name') || '').trim()
+      const targetPath = String(qs.get('Path') || qs.get('path') || '').trim()
+      const lib = store.libraries.find((l) => l.Name === name)
+      if (!lib) throw new ApiError(404, '媒体库不存在')
+      lib.Locations = (lib.Locations || []).filter((p) => p !== targetPath)
+      pushActivity(`从媒体库「${lib.Name}」移除路径`, 'LibraryPathRemoved', targetPath)
+      return undefined as T
+    }
   }
 
   if (pathname === '/emby/Library/VirtualFolders') {
@@ -1140,8 +1293,10 @@ export async function demoFetch<T>(
       store.pluginConfigs.set(pluginId, nextCfg)
       const plugin = store.plugins.find((p) => p.Id === pluginId)
       if (plugin) {
-        if (typeof nextCfg.Enabled === 'boolean') plugin.Enabled = nextCfg.Enabled
-        if (typeof nextCfg.Priority === 'number') plugin.Priority = nextCfg.Priority
+        if (typeof nextCfg.enabled === 'boolean') plugin.Enabled = nextCfg.enabled
+        else if (typeof nextCfg.Enabled === 'boolean') plugin.Enabled = nextCfg.Enabled
+        if (typeof nextCfg.priority === 'number') plugin.Priority = nextCfg.priority
+        else if (typeof nextCfg.Priority === 'number') plugin.Priority = nextCfg.Priority
         pushActivity(`更新了插件「${plugin.Name}」的配置`, 'PluginConfigured')
       }
       return undefined as T
@@ -1167,6 +1322,22 @@ export async function demoFetch<T>(
       EndTimeUtc: now,
     }
     pushActivity(`手动执行计划任务「${task.Name}」完成`, 'ScheduledTaskCompleted')
+    return undefined as T
+  }
+
+  if (runTaskMatch && method === 'DELETE') {
+    const taskId = decodeURIComponent(runTaskMatch[1])
+    const task = store.scheduledTasks.find((t) => t.Id === taskId)
+    if (!task) throw new ApiError(404, '计划任务不存在')
+    const now = new Date().toISOString()
+    task.State = 'Idle'
+    task.CurrentProgressPercentage = 0
+    task.LastExecutionResult = {
+      Status: 'Aborted',
+      StartTimeUtc: now,
+      EndTimeUtc: now,
+    }
+    pushActivity(`已手动停止计划任务「${task.Name}」`, 'ScheduledTaskStopped')
     return undefined as T
   }
 

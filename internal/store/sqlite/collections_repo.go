@@ -100,7 +100,8 @@ func (r *LibraryRepo) CreatePlaylist(ctx context.Context, name, mediaType, userI
 	return rec, nil
 }
 
-// DeleteItem deletes an item (such as a BoxSet or Playlist) and its FTS / collection entries.
+// DeleteItem deletes an item and all of its descendants (e.g., Series -> Seasons -> Episodes),
+// cleaning up item_images, item_search_fts, item_ancestors, and items inside a transaction.
 func (r *LibraryRepo) DeleteItem(ctx context.Context, itemID string) error {
 	itemID = guid.Normalize(itemID)
 	tx, err := r.store.Writer.BeginTx(ctx, nil)
@@ -109,21 +110,195 @@ func (r *LibraryRepo) DeleteItem(ctx context.Context, itemID string) error {
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM item_search_fts WHERE item_id = ?`, itemID); err != nil {
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM items WHERE id = ?`, itemID).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM item_ancestors WHERE ancestor_id = ? OR descendant_id = ?`, itemID, itemID); err != nil {
-		return err
+
+	// Collect itemID and all descendant IDs via parent_id/series_id/season_id and item_ancestors.
+	ids := []string{itemID}
+	seen := map[string]struct{}{itemID: {}}
+	for i := 0; i < len(ids); i++ {
+		cur := ids[i]
+		rows, err := tx.QueryContext(ctx,
+			`SELECT id FROM items WHERE parent_id = ? OR series_id = ? OR season_id = ?
+			 UNION
+			 SELECT descendant_id FROM item_ancestors WHERE ancestor_id = ?`,
+			cur, cur, cur, cur,
+		)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var childID string
+			if err := rows.Scan(&childID); err != nil {
+				rows.Close()
+				return err
+			}
+			if _, ok := seen[childID]; !ok {
+				seen[childID] = struct{}{}
+				ids = append(ids, childID)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
 	}
-	res, err := tx.ExecContext(ctx, `DELETE FROM items WHERE id = ?`, itemID)
-	if err != nil {
-		return err
+
+	// Chunk deletes to stay well below SQLite's bind parameter limit.
+	const chunkSize = 400
+	for start := 0; start < len(ids); start += chunkSize {
+		end := start + chunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			args[i] = id
+		}
+
+		if _, err := tx.ExecContext(ctx, `DELETE FROM item_images WHERE item_id IN (`+placeholders+`)`, args...); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM item_search_fts WHERE item_id IN (`+placeholders+`)`, args...); err != nil {
+			return err
+		}
+		doubleArgs := make([]any, 0, len(batch)*2)
+		doubleArgs = append(doubleArgs, args...)
+		doubleArgs = append(doubleArgs, args...)
+		if _, err := tx.ExecContext(ctx, `DELETE FROM item_ancestors WHERE ancestor_id IN (`+placeholders+`) OR descendant_id IN (`+placeholders+`)`, doubleArgs...); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM items WHERE id IN (`+placeholders+`)`, args...); err != nil {
+			return err
+		}
 	}
-	affected, _ := res.RowsAffected()
-	if affected == 0 {
-		return ErrNotFound
-	}
+
 	return tx.Commit()
+}
+
+// ListLibraryItemPaths returns a map of media file path -> itemID for all Movie and Episode
+// items (and their attached media sources) belonging to libraryID.
+func (r *LibraryRepo) ListLibraryItemPaths(ctx context.Context, libraryID string) (map[string]string, error) {
+	libID := guid.Normalize(libraryID)
+	out := make(map[string]string)
+
+	rows, err := r.store.Reader.QueryContext(ctx,
+		`SELECT id, path FROM items
+		 WHERE library_id = ? AND path != '' AND type IN ('Movie', 'Episode')`,
+		libID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id, p string
+		if err := rows.Scan(&id, &p); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		out[p] = id
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	msRows, err := r.store.Reader.QueryContext(ctx,
+		`SELECT ms.item_id, ms.path
+		 FROM item_media_sources ms
+		 JOIN items i ON i.id = ms.item_id
+		 WHERE i.library_id = ? AND ms.path != '' AND i.type IN ('Movie', 'Episode')`,
+		libID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer msRows.Close()
+	for msRows.Next() {
+		var id, p string
+		if err := msRows.Scan(&id, &p); err != nil {
+			return nil, err
+		}
+		out[p] = id
+	}
+	if err := msRows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// DeleteItemByPath removes a stale media file from libraryID.
+// If the item has multiple media sources, only the matching media source is removed
+// (promoting a remaining source's path to items.path if needed).
+// Otherwise, the entire item (and its images/FTS/descendants) is deleted.
+// Returns true if a media source or item was removed.
+func (r *LibraryRepo) DeleteItemByPath(ctx context.Context, libraryID, path string) (bool, error) {
+	item, err := r.FindItemByMediaSourcePath(ctx, libraryID, path)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	sources, err := r.GetMediaSourcesByItemID(ctx, item.ID)
+	if err != nil {
+		return false, err
+	}
+
+	if len(sources) > 1 {
+		var remaining *MediaSourceRecord
+		matched := false
+		for i := range sources {
+			if sources[i].Path == path {
+				matched = true
+				continue
+			}
+			if remaining == nil {
+				remaining = &sources[i]
+			}
+		}
+		if matched && remaining != nil {
+			tx, err := r.store.Writer.BeginTx(ctx, nil)
+			if err != nil {
+				return false, err
+			}
+			defer tx.Rollback()
+
+			if _, err := tx.ExecContext(ctx, `DELETE FROM item_media_sources WHERE item_id = ? AND path = ?`, item.ID, path); err != nil {
+				return false, err
+			}
+			if item.Path == path {
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE items SET path = ?, container = ?, file_size = ?, date_modified = ? WHERE id = ?`,
+					remaining.Path, remaining.Container, remaining.Size, time.Now().Unix(), item.ID,
+				); err != nil {
+					return false, err
+				}
+			}
+			if err := tx.Commit(); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+	}
+
+	if err := r.DeleteItem(ctx, item.ID); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // AddItemsToContainer appends itemIDs to a collection or playlist.

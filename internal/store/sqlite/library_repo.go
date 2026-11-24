@@ -161,6 +161,7 @@ type ItemFilter struct {
 	UserID                 string
 	ParentID               string
 	LibraryID              string
+	AllowedLibraryIDs      []string
 	SeriesID               string
 	SeasonID               string
 	Recursive              bool
@@ -187,11 +188,12 @@ type ItemFilter struct {
 
 // SearchHintFilter holds parameters for SearchHints.
 type SearchHintFilter struct {
-	UserID           string
-	ParentID         string
-	SearchTerm       string
-	IncludeItemTypes []string
-	Limit            int
+	UserID            string
+	ParentID          string
+	AllowedLibraryIDs []string
+	SearchTerm        string
+	IncludeItemTypes  []string
+	Limit             int
 }
 
 // ItemCounts holds aggregate item counts by type.
@@ -813,6 +815,10 @@ func isCJK(r rune) bool {
 // --- Core Queries ---
 
 func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseItemDto, int, error) {
+	if f.AllowedLibraryIDs != nil && len(f.AllowedLibraryIDs) == 0 {
+		return []dto.BaseItemDto{}, 0, nil
+	}
+
 	var (
 		joins []string
 		where []string
@@ -836,6 +842,14 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 	if f.LibraryID != "" {
 		where = append(where, `i.library_id = ?`)
 		args = append(args, guid.Normalize(f.LibraryID))
+	}
+	if len(f.AllowedLibraryIDs) > 0 {
+		placeholders := make([]string, len(f.AllowedLibraryIDs))
+		for idx, lid := range f.AllowedLibraryIDs {
+			placeholders[idx] = "?"
+			args = append(args, guid.Normalize(lid))
+		}
+		where = append(where, fmt.Sprintf(`i.library_id IN (%s)`, strings.Join(placeholders, ",")))
 	}
 	if f.SeriesID != "" {
 		where = append(where, `i.series_id = ?`)
@@ -1101,6 +1115,10 @@ func (r *LibraryRepo) GetItemRecordByID(ctx context.Context, itemID string) (*It
 }
 
 func (r *LibraryRepo) GetLatestItems(ctx context.Context, serverID, userID, parentID string, includeTypes []string, limit int, fields []string) ([]dto.BaseItemDto, error) {
+	return r.GetLatestItemsWithAllowedLibraries(ctx, serverID, userID, parentID, includeTypes, limit, fields, nil)
+}
+
+func (r *LibraryRepo) GetLatestItemsWithAllowedLibraries(ctx context.Context, serverID, userID, parentID string, includeTypes []string, limit int, fields []string, allowedLibraryIDs []string) ([]dto.BaseItemDto, error) {
 	if limit <= 0 {
 		limit = 16
 	}
@@ -1112,6 +1130,7 @@ func (r *LibraryRepo) GetLatestItems(ctx context.Context, serverID, userID, pare
 		ServerID:               serverID,
 		UserID:                 userID,
 		ParentID:               parentID,
+		AllowedLibraryIDs:      allowedLibraryIDs,
 		Recursive:              parentID != "",
 		IncludeItemTypes:       includeTypes,
 		SortBy:                 []string{"DateCreated"},
@@ -1208,6 +1227,9 @@ func (r *LibraryRepo) GetNextUpEpisodes(ctx context.Context, serverID, userID, s
 }
 
 func (r *LibraryRepo) SearchHints(ctx context.Context, f SearchHintFilter) ([]dto.SearchHint, int, error) {
+	if f.AllowedLibraryIDs != nil && len(f.AllowedLibraryIDs) == 0 {
+		return []dto.SearchHint{}, 0, nil
+	}
 	ftsExpr := BuildFTSQuery(f.SearchTerm)
 	if ftsExpr == "" {
 		return []dto.SearchHint{}, 0, nil
@@ -1230,6 +1252,14 @@ func (r *LibraryRepo) SearchHints(ctx context.Context, f SearchHintFilter) ([]dt
 		joins = append(joins, `INNER JOIN item_ancestors anc ON anc.descendant_id = i.id`)
 		where = append(where, `anc.ancestor_id = ?`)
 		args = append(args, guid.Normalize(f.ParentID))
+	}
+	if len(f.AllowedLibraryIDs) > 0 {
+		ph := make([]string, len(f.AllowedLibraryIDs))
+		for idx, lid := range f.AllowedLibraryIDs {
+			ph[idx] = "?"
+			args = append(args, guid.Normalize(lid))
+		}
+		where = append(where, fmt.Sprintf(`i.library_id IN (%s)`, strings.Join(ph, ",")))
 	}
 	if len(f.IncludeItemTypes) > 0 {
 		ph := make([]string, len(f.IncludeItemTypes))

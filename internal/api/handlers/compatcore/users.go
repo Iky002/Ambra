@@ -21,6 +21,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/middleware"
+	"github.com/ambra-media/ambra/internal/core/auth"
 	"github.com/ambra-media/ambra/internal/core/session"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
@@ -121,13 +122,32 @@ func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, r, http.StatusNotFound, "user not found")
 		return
 	}
+	var body struct {
+		Pw       string `json:"Pw"`
+		Password string `json:"Password"`
+	}
+	if err := decodeOptionalJSON(r, &body); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	pw := body.Pw
+	if pw == "" && body.Password != "" {
+		pw = body.Password
+	}
+
 	u, err := h.userRepo.GetUserByID(r.Context(), uid)
 	if err != nil {
 		writeJSONError(w, r, http.StatusNotFound, "user not found")
 		return
 	}
-	if u.IsDisabled {
+	if u.IsDisabled || u.Policy.IsDisabled {
 		writeJSONError(w, r, http.StatusForbidden, "user is disabled")
+		return
+	}
+
+	ok, err := auth.VerifyPassword(pw, u.PasswordHash)
+	if err != nil || !ok {
+		writeJSONError(w, r, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
 

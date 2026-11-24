@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { CheckCircle2, FolderSync, Loader2, Sparkles } from 'lucide-react'
+import { CheckCircle2, FolderSync, Loader2, Pause, Play, Sparkles, XCircle } from 'lucide-react'
 import { api } from '../api/client'
 import type { LibraryScanProgress, ScanProgressSnapshot } from '../api/types'
 
@@ -42,6 +42,8 @@ export function ScanProgressBar({
   const wasRunningRef = useRef(false)
   const lastActiveRef = useRef<ScanProgressSnapshot | null>(null)
   const [completedSnapshot, setCompletedSnapshot] = useState<ScanProgressSnapshot | null>(null)
+  const [localPaused, setLocalPaused] = useState(false)
+  const [controlBusy, setControlBusy] = useState<'pause' | 'cancel' | null>(null)
 
   const { data: progress } = useQuery({
     queryKey: ['scanProgress'],
@@ -58,11 +60,15 @@ export function ScanProgressBar({
       wasRunningRef.current = true
       lastActiveRef.current = progress
       setCompletedSnapshot(null)
+      if (typeof progress.paused === 'boolean') {
+        setLocalPaused(progress.paused)
+      }
       return
     }
 
     if (wasRunningRef.current && !progress.running) {
       wasRunningRef.current = false
+      setLocalPaused(false)
       const prev = lastActiveRef.current
       setCompletedSnapshot(
         prev
@@ -99,10 +105,42 @@ export function ScanProgressBar({
   if (!active) return null
 
   const isCompleted = !active.running
+  const isPaused = typeof active.paused === 'boolean' ? active.paused : localPaused
   const pct = isCompleted ? 100 : clampPercentage(active.percentage, active.processed, active.total)
   const phaseLabel = getPhaseLabel(active.phase)
   const libraries: LibraryScanProgress[] = active.libraries || []
   const countText = active.total > 0 ? `${active.processed} / ${active.total}` : `${active.processed}`
+
+  const handleTogglePause = async () => {
+    setControlBusy('pause')
+    try {
+      if (isPaused) {
+        await api.resumeScan()
+        setLocalPaused(false)
+      } else {
+        await api.pauseScan()
+        setLocalPaused(true)
+      }
+      await queryClient.invalidateQueries({ queryKey: ['scanProgress'] })
+    } catch {
+      // 忽略控制失败，等待下次轮询同步真实状态
+    } finally {
+      setControlBusy(null)
+    }
+  }
+
+  const handleCancelScan = async () => {
+    setControlBusy('cancel')
+    try {
+      await api.cancelScan()
+      setLocalPaused(false)
+      await queryClient.invalidateQueries({ queryKey: ['scanProgress'] })
+    } catch {
+      // 忽略取消失败，等待下次轮询同步真实状态
+    } finally {
+      setControlBusy(null)
+    }
+  }
 
   if (variant === 'banner') {
     return (
@@ -233,13 +271,47 @@ export function ScanProgressBar({
           </div>
         </div>
 
-        <div className="flex shrink-0 items-baseline gap-2 font-mono">
-          <span className="text-xs text-zinc-400">{countText}</span>
-          <span
-            className={`text-lg font-bold ${isCompleted ? 'text-emerald-300' : 'text-amber-300'}`}
-          >
-            {pct}%
-          </span>
+        <div className="flex shrink-0 flex-wrap items-center gap-2">
+          {!isCompleted && (
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                disabled={controlBusy !== null}
+                onClick={() => void handleTogglePause()}
+                className="inline-flex items-center gap-1 rounded-lg border border-amber-500/30 bg-amber-500/15 px-2.5 py-1 text-xs font-medium text-amber-200 transition-colors hover:bg-amber-500/25 disabled:opacity-50"
+              >
+                {controlBusy === 'pause' ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : isPaused ? (
+                  <Play className="h-3 w-3 fill-current" />
+                ) : (
+                  <Pause className="h-3 w-3" />
+                )}
+                <span>{isPaused ? '恢复' : '暂停'}</span>
+              </button>
+              <button
+                type="button"
+                disabled={controlBusy !== null}
+                onClick={() => void handleCancelScan()}
+                className="inline-flex items-center gap-1 rounded-lg border border-red-500/30 bg-red-500/15 px-2.5 py-1 text-xs font-medium text-red-200 transition-colors hover:bg-red-500/25 disabled:opacity-50"
+              >
+                {controlBusy === 'cancel' ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : (
+                  <XCircle className="h-3 w-3" />
+                )}
+                <span>取消扫描</span>
+              </button>
+            </div>
+          )}
+          <div className="flex shrink-0 items-baseline gap-2 font-mono">
+            <span className="text-xs text-zinc-400">{countText}</span>
+            <span
+              className={`text-lg font-bold ${isCompleted ? 'text-emerald-300' : 'text-amber-300'}`}
+            >
+              {pct}%
+            </span>
+          </div>
         </div>
       </div>
 

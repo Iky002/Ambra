@@ -21,6 +21,7 @@ import (
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/imaging"
 	"github.com/ambra-media/ambra/internal/core/scanner"
+	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
@@ -577,7 +578,17 @@ func TestImagesUploadServeAndTaxonomyImages(t *testing.T) {
 	if w := doReq(env.router, http.MethodPost, "/Items/imgitem1/Images/Backdrop/0/Index?newIndex=1", `{}`); w.Code != http.StatusNoContent {
 		t.Fatalf("update image index: %d", w.Code)
 	}
-	if w := doReq(env.router, http.MethodPost, "/Items/imgitem1/Images/Primary/0/Url", `{"Url":"https://example.com/a.jpg"}`); w.Code != http.StatusNoContent {
+	imgSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/a.png" {
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(pngBytes)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer imgSrv.Close()
+	env.handler.SetHTTPClient(imgSrv.Client())
+	if w := doReq(env.router, http.MethodPost, "/Items/imgitem1/Images/Primary/0/Url", `{"Url":"`+imgSrv.URL+`/a.png"}`); w.Code != http.StatusNoContent {
 		t.Fatalf("set image url: %d", w.Code)
 	}
 
@@ -590,7 +601,7 @@ func TestImagesUploadServeAndTaxonomyImages(t *testing.T) {
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "MockTMDb") {
 		t.Fatalf("remote image providers: %d %s", w.Code, w.Body.String())
 	}
-	w = doReq(env.router, http.MethodGet, "/Images/Remote?imageUrl=https://example.com/a.jpg", "")
+	w = doReq(env.router, http.MethodGet, "/Images/Remote?imageUrl="+imgSrv.URL+"/missing.jpg", "")
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("remote image proxy expected 404, got %d", w.Code)
 	}
@@ -1077,6 +1088,125 @@ func TestVideoFontAttachments(t *testing.T) {
 	// 5. Out-of-range index -> 404
 	if w := doReq(env.router, http.MethodGet, "/Videos/anime001/ms001/Attachments/9", ""); w.Code != http.StatusNotFound {
 		t.Fatalf("out-of-range attachment index expected 404, got %d", w.Code)
+	}
+}
+
+func TestCompatMediaSubtitleConversionAndEmbeddedExtraction(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+
+	// Create fake ffmpeg script for embedded subtitle extraction
+	fakeFFmpeg := filepath.Join(env.tmpDir, "fake-ffmpeg.sh")
+	script := `#!/bin/sh
+out=""
+for arg in "$@"; do out="$arg"; done
+case "$out" in
+  *.vtt)
+    printf 'WEBVTT\n\n00:00:02.000 --> 00:00:04.000\nCompat Embedded VTT\n' > "$out"
+    ;;
+  *.ass)
+    printf '[Script Info]\nTitle: Compat\n[Events]\nDialogue: 0,0:00:02.00,0:00:04.00,Default,,0,0,0,,Compat Embedded ASS\n' > "$out"
+    ;;
+  *)
+    printf '1\n00:00:02,000 --> 00:00:04,000\nCompat Embedded SRT\n' > "$out"
+    ;;
+esac
+`
+	if err := os.WriteFile(fakeFFmpeg, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env.cfg.FFmpegPath = fakeFFmpeg
+	env.handler.SetExtractor(transcode.NewExtractor(env.cfg))
+
+	mkvPath := filepath.Join(env.tmpDir, "ep01.mkv")
+	_ = os.WriteFile(mkvPath, []byte("fake-mkv"), 0o644)
+	extSRT := filepath.Join(env.tmpDir, "ep01.chs.srt")
+	_ = os.WriteFile(extSRT, []byte("1\n00:00:05,000 --> 00:00:08,000\n外挂字幕转VTT\n"), 0o644)
+
+	itemID := "subitem01"
+	msID := "subms01"
+	if err := env.repo.UpsertItem(ctx, &sqlite.ItemRecord{
+		ID:        itemID,
+		LibraryID: "lib1",
+		Type:      "Movie",
+		Name:      "Sub Movie",
+		Container: "mkv",
+		Path:      mkvPath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.repo.ReplaceMediaSourcesAndStreams(ctx, itemID, []sqlite.MediaSourceRecord{{
+		ID:        msID,
+		ItemID:    itemID,
+		Name:      "Sub Movie",
+		Path:      mkvPath,
+		Container: "mkv",
+		Streams: []sqlite.MediaStreamRecord{
+			{MediaSourceID: msID, ItemID: itemID, StreamIndex: 2, StreamType: "Subtitle", Codec: "subrip", IsExternal: true, Path: extSRT},
+			{MediaSourceID: msID, ItemID: itemID, StreamIndex: 3, StreamType: "Subtitle", Codec: "ass", IsExternal: false, Path: ""},
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. External SRT requested as Stream.vtt -> converted to WebVTT!
+	w := doReq(env.router, http.MethodGet, "/Items/"+itemID+"/"+msID+"/Subtitles/2/Stream.vtt", "")
+	if w.Code != http.StatusOK || !strings.HasPrefix(w.Header().Get("Content-Type"), "text/vtt") ||
+		!strings.Contains(w.Body.String(), "WEBVTT") || !strings.Contains(w.Body.String(), "外挂字幕转VTT") {
+		t.Fatalf("expected external SRT->VTT conversion, got code=%d ct=%q body=%q", w.Code, w.Header().Get("Content-Type"), w.Body.String())
+	}
+
+	// 2. HEAD on external subtitle with StartPositionTicks path param
+	wHead := doReq(env.router, http.MethodHead, "/Items/"+itemID+"/"+msID+"/Subtitles/2/10000000/Stream.vtt", "")
+	if wHead.Code != http.StatusOK || wHead.Body.Len() != 0 {
+		t.Fatalf("expected 200 empty body for HEAD, got code=%d len=%d", wHead.Code, wHead.Body.Len())
+	}
+
+	// 3. Embedded subtitle extracted via fake ffmpeg -> VTT & ASS
+	wEmbVTT := doReq(env.router, http.MethodGet, "/Items/"+itemID+"/"+msID+"/Subtitles/3/Stream.vtt", "")
+	if wEmbVTT.Code != http.StatusOK || !strings.Contains(wEmbVTT.Body.String(), "Compat Embedded VTT") {
+		t.Fatalf("expected embedded VTT, got code=%d body=%q", wEmbVTT.Code, wEmbVTT.Body.String())
+	}
+
+	wEmbASS := doReq(env.router, http.MethodGet, "/Videos/"+itemID+"/"+msID+"/Subtitles/3/0/Stream.ass", "")
+	if wEmbASS.Code != http.StatusOK || !strings.Contains(wEmbASS.Body.String(), "Compat Embedded ASS") || !strings.HasPrefix(wEmbASS.Header().Get("Content-Type"), "text/x-ssa") {
+		t.Fatalf("expected embedded ASS, got code=%d ct=%q body=%q", wEmbASS.Code, wEmbASS.Header().Get("Content-Type"), wEmbASS.Body.String())
+	}
+
+	// 4. Embedded subtitle with nil extractor -> 404
+	env.handler.SetExtractor(nil)
+	wNoExt := doReq(env.router, http.MethodGet, "/Items/"+itemID+"/"+msID+"/Subtitles/3/Stream.vtt", "")
+	if wNoExt.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 when extractor is nil, got %d", wNoExt.Code)
+	}
+
+	// 5. Missing external subtitle file on disk -> 404
+	missingID := "subitem_missing"
+	missingMS := "subms_missing"
+	_ = env.repo.UpsertItem(ctx, &sqlite.ItemRecord{
+		ID: missingID, LibraryID: "lib1", Type: "Movie", Name: "Missing Sub", Container: "mkv", Path: mkvPath,
+	})
+	_ = env.repo.ReplaceMediaSourcesAndStreams(ctx, missingID, []sqlite.MediaSourceRecord{{
+		ID: missingMS, ItemID: missingID, Name: "Missing Sub", Path: mkvPath, Container: "mkv",
+		Streams: []sqlite.MediaStreamRecord{
+			{MediaSourceID: missingMS, ItemID: missingID, StreamIndex: 2, StreamType: "Subtitle", Codec: "subrip", IsExternal: true, Path: filepath.Join(env.tmpDir, "does-not-exist.srt")},
+		},
+	}})
+	if wMiss := doReq(env.router, http.MethodGet, "/Items/"+missingID+"/"+missingMS+"/Subtitles/2/Stream.vtt", ""); wMiss.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing subtitle file, got %d", wMiss.Code)
+	}
+
+	// 6. Embedded subtitle extraction failure -> 500 & subtitleContentType branches
+	failFFmpeg := filepath.Join(env.tmpDir, "fail-ffmpeg.sh")
+	_ = os.WriteFile(failFFmpeg, []byte("#!/bin/sh\necho fail >&2\nexit 1\n"), 0o755)
+	failCfg := config.Default(filepath.Join(env.tmpDir, "fail-cache"))
+	failCfg.FFmpegPath = failFFmpeg
+	env.handler.SetExtractor(transcode.NewExtractor(failCfg))
+	if wFail := doReq(env.router, http.MethodGet, "/Items/"+itemID+"/"+msID+"/Subtitles/3/Stream.vtt", ""); wFail.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 when extractor fails, got %d", wFail.Code)
+	}
+	if subtitleContentType("vtt") != "text/vtt; charset=utf-8" || subtitleContentType("srt") != "application/x-subrip; charset=utf-8" {
+		t.Fatalf("unexpected subtitleContentType values")
 	}
 }
 

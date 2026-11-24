@@ -82,6 +82,7 @@ type Server struct {
 	DVR          *dvr.Recorder
 	SSDP         *ssdp.Broadcaster
 	Imaging      *imaging.Service
+	Logs         *logs.Handler
 	WSHub        *ws.Hub
 	Handler      http.Handler
 }
@@ -141,6 +142,9 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		TMDBAPIKey: cfg.TMDBApiKey,
 	})
 	_ = rankingsSvc.LoadCache(ctx)
+	sc.SetOnScanComplete(func(c context.Context, _ string, _ scanner.ScanStats) {
+		_, _, _ = rankingsSvc.ApplyTagsToLibrary(c)
+	})
 	pb := playback.New(libRepo, registry, cfg)
 	imgSvc := imaging.New(libRepo).WithCacheDir(cfg.ImageCacheDir())
 	transcodeMgr := transcode.NewManager(cfg)
@@ -207,13 +211,19 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	}
 
 	mediaMux := http.NewServeMux()
+	subExtractor := transcode.NewExtractor(cfg)
 	// Phase 1: Library & Direct Streaming
-	library.New(libRepo, sc, cfg).RegisterRoutes(mediaMux, library.AuthFuncs{
+	libH := library.New(libRepo, sc, cfg)
+	libH.SetUserRepo(userRepo)
+	libH.SetWatcher(libWatcher)
+	libH.RegisterRoutes(mediaMux, library.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
 	})
-	streaming.New(libRepo, pb, imgSvc).RegisterRoutes(mediaMux, streaming.AuthFuncs{
+	streamH := streaming.New(libRepo, pb, imgSvc)
+	streamH.SetExtractor(subExtractor)
+	streamH.RegisterRoutes(mediaMux, streaming.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
@@ -240,7 +250,8 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
 	})
-	logs.New(cfg).RegisterRoutes(mediaMux, logs.AuthFuncs{
+	logsH := logs.New(cfg)
+	logsH.RegisterRoutes(mediaMux, logs.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
@@ -317,7 +328,9 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	})
 
 	// Emby 4.10.2.0 full 582-route compatibility routers (zero ServeMux conflicts)
-	compatMediaH := compatmedia.New(libRepo, sc, imgSvc, registry, store, cfg).BuildRouter(compatmedia.AuthFuncs{
+	compatMediaSvc := compatmedia.New(libRepo, sc, imgSvc, registry, store, cfg)
+	compatMediaSvc.SetExtractor(subExtractor)
+	compatMediaH := compatMediaSvc.BuildRouter(compatmedia.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
@@ -395,6 +408,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		DVR:          dvrRec,
 		SSDP:         ssdpB,
 		Imaging:      imgSvc,
+		Logs:         logsH,
 		WSHub:        wsHub,
 		Handler:      r,
 	}, nil

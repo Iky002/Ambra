@@ -26,6 +26,7 @@ import { api, buildEmbyAuthHeader, getStoredAuth, resolveApiUrl } from '../api/c
 import type { MediaSourceInfo, MediaStream } from '../api/types'
 import { AmbraLogo } from '../components/AmbraLogo'
 import { useAuth } from '../context/AuthContext'
+import { isDemoMode } from '../demo/demoMode'
 import { AssJassubRenderer } from '../player/assRenderer'
 import { PgsCanvasRenderer } from '../player/pgsRenderer'
 import {
@@ -116,6 +117,8 @@ export function PlayerPage() {
   const pgsRendererRef = useRef<PgsCanvasRenderer | null>(null)
   const hideOsdTimerRef = useRef<number | null>(null)
   const initialSeekDoneRef = useRef(false)
+  const initializedSubSourceIdRef = useRef<string | null>(null)
+  const lastSeekReportRef = useRef(0)
 
   const [selectedSourceId, setSelectedSourceId] = useState<string | undefined>(initialMediaSourceId)
   const [audioIndex, setAudioIndex] = useState<number | undefined>(initialAudio)
@@ -156,6 +159,12 @@ export function PlayerPage() {
       return next
     })
   }, [])
+
+  // 切换视频条目时重置初始化起播定位与默认字幕初始化标记
+  useEffect(() => {
+    initialSeekDoneRef.current = false
+    initializedSubSourceIdRef.current = null
+  }, [id])
 
   // 切换视频或音轨时重置强制回退状态
   useEffect(() => {
@@ -200,6 +209,7 @@ export function PlayerPage() {
       }),
     enabled: Boolean(id),
     staleTime: 0,
+    placeholderData: (prev, prevQuery) => (prevQuery?.queryKey[1] === id ? prev : undefined),
   })
 
   const activeSource: MediaSourceInfo | undefined = useMemo(() => {
@@ -215,17 +225,60 @@ export function PlayerPage() {
   const audioStreams = streams.filter((s) => s.Type === 'Audio')
   const subtitleStreams = streams.filter((s) => s.Type === 'Subtitle')
 
-  // 初始化默认音轨与字幕轨
+  // 初始化默认音轨与字幕轨（每个媒体源仅初始化一次默认字幕，避免用户关闭字幕后回弹）
   useEffect(() => {
     if (!activeSource) return
     if (selectedSourceId === undefined) setSelectedSourceId(activeSource.Id)
     if (audioIndex === undefined && activeSource.DefaultAudioStreamIndex !== undefined) {
       setAudioIndex(activeSource.DefaultAudioStreamIndex)
     }
-    if (subtitleIndex === undefined && activeSource.DefaultSubtitleStreamIndex !== undefined) {
-      setSubtitleIndex(activeSource.DefaultSubtitleStreamIndex)
+    if (initializedSubSourceIdRef.current !== activeSource.Id) {
+      initializedSubSourceIdRef.current = activeSource.Id
+      if (subtitleIndex === undefined && activeSource.DefaultSubtitleStreamIndex !== undefined) {
+        setSubtitleIndex(activeSource.DefaultSubtitleStreamIndex)
+      }
     }
   }, [activeSource, selectedSourceId, audioIndex, subtitleIndex])
+
+  // 计算生效的起播位置（优先 URL startTicks，否则从 item.UserData.PlaybackPositionTicks 自动续播）
+  const effectiveStartTicks = useMemo(() => {
+    if (Number.isFinite(initialStartTicks) && initialStartTicks > 0) {
+      return initialStartTicks
+    }
+    const savedTicks = item?.UserData?.PlaybackPositionTicks ?? 0
+    if (!Number.isFinite(savedTicks) || savedTicks <= 5 * 10_000_000) {
+      return 0
+    }
+    if (item?.UserData?.Played) {
+      return 0
+    }
+    const runtimeTicks = item?.RunTimeTicks ?? activeSource?.RunTimeTicks ?? 0
+    if (runtimeTicks > 0 && savedTicks >= runtimeTicks * 0.95) {
+      return 0
+    }
+    return savedTicks
+  }, [
+    initialStartTicks,
+    item?.UserData?.PlaybackPositionTicks,
+    item?.UserData?.Played,
+    item?.RunTimeTicks,
+    activeSource?.RunTimeTicks,
+  ])
+
+  const effectiveStartTicksRef = useRef(effectiveStartTicks)
+  effectiveStartTicksRef.current = effectiveStartTicks
+
+  // 若元数据先于 item 到达，item 加载完成后补做一次初始续播定位
+  useEffect(() => {
+    if (initialSeekDoneRef.current || effectiveStartTicks <= 0) return
+    const video = videoRef.current
+    if (!video || video.readyState < 1) return
+    const startSec = effectiveStartTicks / 10_000_000
+    if (Number.isFinite(startSec) && startSec > 0) {
+      video.currentTime = startSec
+      initialSeekDoneRef.current = true
+    }
+  }, [effectiveStartTicks])
 
   const activeSubtitleStream: MediaStream | undefined = useMemo(
     () => subtitleStreams.find((s) => s.Index === subtitleIndex),
@@ -436,8 +489,9 @@ export function PlayerPage() {
 
     const startPlayback = () => {
       if (cancelled) return
-      if (!initialSeekDoneRef.current && initialStartTicks > 0) {
-        const startSec = initialStartTicks / 10_000_000
+      const targetStartTicks = effectiveStartTicksRef.current
+      if (!initialSeekDoneRef.current && targetStartTicks > 0) {
+        const startSec = targetStartTicks / 10_000_000
         if (Number.isFinite(startSec) && startSec > 0) {
           video.currentTime = startSec
         }
@@ -653,7 +707,7 @@ export function PlayerPage() {
             : 'vtt'
       const msId = activeSource?.Id || id || ''
       return resolveApiUrl(
-        `/emby/Videos/${encodeURIComponent(id || '')}/${encodeURIComponent(msId)}/Subtitles/${stream.Index}/0/Stream.${ext}`,
+        `/emby/Videos/${encodeURIComponent(id || '')}/${encodeURIComponent(msId)}/Subtitles/${stream.Index}/Stream.${ext}`,
       )
     },
     [activeSource?.Id, id],
@@ -765,15 +819,38 @@ export function PlayerPage() {
     return () => window.removeEventListener('resize', onResize)
   }, [])
 
+  // 将音轨 / 字幕 / 播放模式 / 会话元数据保存在 ref 中，避免切换轨道或回退 HLS 时重建 reportState 触发多余的 Stopped -> Playing 循环
+  const playbackMetaRef = useRef({
+    audioIndex,
+    subtitleIndex,
+    playMethod,
+    mediaSourceId: activeSource?.Id,
+    playSessionId: playbackInfo?.PlaySessionId,
+  })
+  playbackMetaRef.current = {
+    audioIndex,
+    subtitleIndex,
+    playMethod,
+    mediaSourceId: activeSource?.Id,
+    playSessionId: playbackInfo?.PlaySessionId,
+  }
+
   // 上报播放状态 (/emby/Sessions/Playing, Progress, Stopped)
   const reportState = useCallback(
     (type: 'start' | 'progress' | 'stop', eventName?: string) => {
       if (!id || !videoRef.current) return
+      const {
+        audioIndex: latestAudioIndex,
+        subtitleIndex: latestSubtitleIndex,
+        playMethod: latestPlayMethod,
+        mediaSourceId: latestMediaSourceId,
+        playSessionId: latestPlaySessionId,
+      } = playbackMetaRef.current
       const posTicks = Math.floor(videoRef.current.currentTime * 10_000_000)
       const base = {
         ItemId: id,
-        MediaSourceId: activeSource?.Id,
-        PlaySessionId: playbackInfo?.PlaySessionId,
+        MediaSourceId: latestMediaSourceId,
+        PlaySessionId: latestPlaySessionId,
         PositionTicks: posTicks,
       }
       if (type === 'stop') {
@@ -785,12 +862,12 @@ export function PlayerPage() {
         IsPaused: videoRef.current.paused,
         IsMuted: videoRef.current.muted,
         VolumeLevel: Math.round(videoRef.current.volume * 100),
-        AudioStreamIndex: audioIndex,
-        SubtitleStreamIndex: subtitleIndex,
+        AudioStreamIndex: latestAudioIndex,
+        SubtitleStreamIndex: latestSubtitleIndex,
         PlayMethod:
-          playMethod === 'Server HLS'
+          latestPlayMethod === 'Server HLS'
             ? 'Transcode'
-            : playMethod === 'Proxy Direct'
+            : latestPlayMethod === 'Proxy Direct'
               ? 'DirectStream'
               : 'DirectPlay',
       }
@@ -800,11 +877,13 @@ export function PlayerPage() {
         void api.reportProgress({ ...full, EventName: eventName })
       }
     },
-    [id, activeSource?.Id, playbackInfo?.PlaySessionId, audioIndex, subtitleIndex, playMethod],
+    [id],
   )
 
+  const hasPlaybackInfo = Boolean(playbackInfo)
+
   useEffect(() => {
-    if (!playbackInfo) return
+    if (!hasPlaybackInfo) return
     reportState('start')
     const interval = window.setInterval(() => {
       reportState('progress', 'TimeUpdate')
@@ -814,7 +893,59 @@ export function PlayerPage() {
       window.clearInterval(interval)
       reportState('stop')
     }
-  }, [playbackInfo, reportState])
+  }, [hasPlaybackInfo, reportState])
+
+  // 页面关闭或刷新时通过 keepalive 上报最新播放进度，避免丢失续播点
+  useEffect(() => {
+    if (!hasPlaybackInfo || !id || isDemoMode()) return
+
+    let unloadReported = false
+    const sendKeepaliveStop = () => {
+      if (unloadReported || !videoRef.current) return
+      unloadReported = true
+      const storedAuth = getStoredAuth()
+      const token = storedAuth?.accessToken
+      if (!token) return
+      const { mediaSourceId: latestMediaSourceId, playSessionId: latestPlaySessionId } =
+        playbackMetaRef.current
+      const posTicks = Math.floor(videoRef.current.currentTime * 10_000_000)
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'X-Emby-Authorization': buildEmbyAuthHeader(token),
+        'X-Emby-Token': token,
+      }
+      try {
+        void fetch('/emby/Sessions/Playing/Stopped', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            ItemId: id,
+            MediaSourceId: latestMediaSourceId,
+            PlaySessionId: latestPlaySessionId,
+            PositionTicks: posTicks,
+          }),
+          keepalive: true,
+        })
+      } catch {
+        // 忽略页面卸载期间的网络异常
+      }
+    }
+
+    window.addEventListener('pagehide', sendKeepaliveStop)
+    window.addEventListener('beforeunload', sendKeepaliveStop)
+    return () => {
+      window.removeEventListener('pagehide', sendKeepaliveStop)
+      window.removeEventListener('beforeunload', sendKeepaliveStop)
+    }
+  }, [hasPlaybackInfo, id])
+
+  const reportSeekProgress = useCallback(() => {
+    const now = Date.now()
+    if (now - lastSeekReportRef.current < 100) return
+    lastSeekReportRef.current = now
+    reportState('progress', 'timeupdate')
+  }, [reportState])
 
   // OSD 自动隐藏逻辑
   const pokeOsd = useCallback(() => {
@@ -845,9 +976,10 @@ export function PlayerPage() {
       if (!v) return
       v.currentTime = Math.max(0, Math.min(v.duration || 0, v.currentTime + delta))
       setCurrentTime(v.currentTime)
+      reportState('progress', 'timeupdate')
       pokeOsd()
     },
-    [pokeOsd],
+    [pokeOsd, reportState],
   )
 
   const toggleFullscreen = useCallback(() => {
@@ -1332,6 +1464,10 @@ export function PlayerPage() {
               if (videoRef.current) videoRef.current.currentTime = t
               setCurrentTime(t)
             }}
+            onPointerUp={reportSeekProgress}
+            onMouseUp={reportSeekProgress}
+            onTouchEnd={reportSeekProgress}
+            onKeyUp={reportSeekProgress}
             className="ambra-range absolute inset-0 h-full w-full opacity-0 group-hover/bar:opacity-100"
           />
         </div>

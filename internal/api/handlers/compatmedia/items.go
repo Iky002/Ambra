@@ -18,6 +18,8 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/core/playback"
+	"github.com/ambra-media/ambra/internal/core/scanner"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
@@ -131,7 +133,19 @@ func (h *Handler) handleUpdateItem(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = h.repo.ReplaceItemTaxonomies(r.Context(), rec.ID, "studio", names)
 	}
-	_ = h.repo.UpsertSearchFTS(r.Context(), rec.ID, rec.Name, rec.Name+" "+rec.OriginalTitle, "", "", "")
+	var peopleNames []string
+	if people, err := h.repo.GetPeopleByItemID(r.Context(), rec.ID); err == nil {
+		peopleNames = make([]string, 0, len(people))
+		for _, p := range people {
+			if p.Name != "" {
+				peopleNames = append(peopleNames, p.Name)
+			}
+		}
+	}
+	titleRaw := strings.TrimSpace(rec.Name + " " + rec.OriginalTitle)
+	titleTokens := scanner.TokenizeForFTS(rec.Name, rec.OriginalTitle, rec.Extra.SeriesName)
+	peopleTokens := scanner.TokenizeForFTS(peopleNames...)
+	_ = h.repo.UpsertSearchFTS(r.Context(), rec.ID, titleRaw, titleTokens, "", "", peopleTokens)
 	httpx.NoContent(w)
 }
 
@@ -167,11 +181,26 @@ func (h *Handler) handleMetadataEditor(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleItemRefresh(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	q := httpx.ParseQuery(r)
+	replaceMeta := strings.EqualFold(q.Get("MetadataRefreshMode"), "FullRefresh")
+	if b := q.Bool("ReplaceAllMetadata"); b != nil && *b {
+		replaceMeta = true
+	}
+	replaceImages := strings.EqualFold(q.Get("ImageRefreshMode"), "FullRefresh")
+	if b := q.Bool("ReplaceAllImages"); b != nil && *b {
+		replaceImages = true
+	}
+
 	if h.scanner != nil {
-		if rec, err := h.repo.GetItemRecordByID(r.Context(), itemID); err == nil && rec.LibraryID != "" {
-			h.scanner.ScanLibraryAsync(rec.LibraryID)
-		} else {
-			h.scanner.ScanLibraryAsync("")
+		refreshCtx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+		defer cancel()
+		if err := h.scanner.RefreshItem(refreshCtx, itemID, replaceMeta, replaceImages); err != nil {
+			if errors.Is(err, sqlite.ErrNotFound) {
+				httpx.Error(w, http.StatusNotFound, "item not found")
+				return
+			}
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
 		}
 	}
 	httpx.NoContent(w)
@@ -342,6 +371,10 @@ type remoteSearchResult struct {
 	ProviderIds         map[string]string `json:"ProviderIds,omitempty"`
 }
 
+type candidateSearcher interface {
+	SearchCandidates(ctx context.Context, itemType, query string, year int, lang string) ([]plugins.MetadataResult, error)
+}
+
 func (h *Handler) handleRemoteSearch(itemType string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req remoteSearchQuery
@@ -350,15 +383,48 @@ func (h *Handler) handleRemoteSearch(itemType string) http.HandlerFunc {
 		}
 		results := make([]remoteSearchResult, 0)
 		if h.registry != nil && (req.SearchInfo.Name != "" || len(req.SearchInfo.ProviderIds) > 0) {
+			lang := "zh-CN"
+			if h.cfg != nil && h.cfg.TMDBLanguage != "" {
+				lang = h.cfg.TMDBLanguage
+			}
 			mq := plugins.MediaQuery{
 				ItemType:    itemType,
 				Title:       req.SearchInfo.Name,
 				Year:        req.SearchInfo.Year,
 				ProviderIDs: req.SearchInfo.ProviderIds,
+				Language:    lang,
 			}
 			for _, p := range h.registry.MetadataProviders() {
-				if req.SearchProviderName != "" && !strings.EqualFold(req.SearchProviderName, p.Manifest().Name) {
+				manifest := p.Manifest()
+				if req.SearchProviderName != "" &&
+					!strings.EqualFold(req.SearchProviderName, manifest.Name) &&
+					!(strings.EqualFold(req.SearchProviderName, "TheMovieDb") && strings.Contains(strings.ToLower(manifest.ID), "tmdb")) {
 					continue
+				}
+				if cs, ok := p.(candidateSearcher); ok && req.SearchInfo.Name != "" && len(req.SearchInfo.ProviderIds) == 0 {
+					candidates, err := cs.SearchCandidates(r.Context(), itemType, req.SearchInfo.Name, req.SearchInfo.Year, lang)
+					if err == nil && len(candidates) > 0 {
+						for _, c := range candidates {
+							if len(results) >= 10 {
+								break
+							}
+							var yr *int
+							if c.Year > 0 {
+								y := c.Year
+								yr = &y
+							}
+							results = append(results, remoteSearchResult{
+								Name:               nonEmpty(c.Name, req.SearchInfo.Name),
+								ProductionYear:     yr,
+								PremiereDate:       c.PremiereDate,
+								ImageUrl:           c.PosterURL,
+								SearchProviderName: manifest.Name,
+								Overview:           c.Overview,
+								ProviderIds:        c.ProviderIDs,
+							})
+						}
+						continue
+					}
 				}
 				meta, err := p.FetchMetadata(r.Context(), mq)
 				if err != nil || meta == nil {
@@ -374,7 +440,7 @@ func (h *Handler) handleRemoteSearch(itemType string) http.HandlerFunc {
 					ProductionYear:     yr,
 					PremiereDate:       meta.PremiereDate,
 					ImageUrl:           meta.PosterURL,
-					SearchProviderName: p.Manifest().Name,
+					SearchProviderName: manifest.Name,
 					Overview:           meta.Overview,
 					ProviderIds:        meta.ProviderIDs,
 				})
@@ -386,26 +452,50 @@ func (h *Handler) handleRemoteSearch(itemType string) http.HandlerFunc {
 
 func (h *Handler) handleRemoteSearchApply(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	q := httpx.ParseQuery(r)
+	replaceAllImages := true
+	if b := q.Bool("ReplaceAllImages"); b != nil {
+		replaceAllImages = *b
+	}
+
 	var res remoteSearchResult
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&res)
 	}
-	if rec, err := h.repo.GetItemRecordByID(r.Context(), itemID); err == nil {
-		if res.Name != "" {
-			rec.Name = res.Name
-			rec.SortName = strings.ToLower(res.Name)
-		}
-		if res.Overview != "" {
-			rec.Extra.Overview = res.Overview
-		}
-		if res.ProductionYear != nil {
-			rec.ProductionYear = res.ProductionYear
-		}
-		if len(res.ProviderIds) > 0 {
-			rec.Extra.ProviderIDs = res.ProviderIds
-		}
-		rec.DateModified = time.Now().Unix()
-		_ = h.repo.UpsertItem(r.Context(), rec)
+	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		httpx.Error(w, http.StatusNotFound, "item not found")
+		return
+	}
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if res.Name != "" {
+		rec.Name = res.Name
+		rec.SortName = strings.ToLower(res.Name)
+	}
+	if res.Overview != "" {
+		rec.Extra.Overview = res.Overview
+	}
+	if res.ProductionYear != nil {
+		rec.ProductionYear = res.ProductionYear
+	}
+	if len(res.ProviderIds) > 0 {
+		rec.Extra.ProviderIDs = res.ProviderIds
+	}
+	rec.DateModified = time.Now().Unix()
+	rec.Etag = guid.New()[:16]
+	if err := h.repo.UpsertItem(r.Context(), rec); err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if h.scanner != nil {
+		refreshCtx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+		defer cancel()
+		_ = h.scanner.RefreshItem(refreshCtx, itemID, true, replaceAllImages)
 	}
 	httpx.NoContent(w)
 }
@@ -630,32 +720,81 @@ func (h *Handler) handleSubtitleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	format := strings.TrimPrefix(streamFile, "stream.")
 
-	var subPath string
-	if h.store != nil {
-		var p sql.NullString
-		err := h.store.Reader.QueryRowContext(r.Context(), `
-			SELECT path FROM item_media_streams
-			WHERE item_id = ? AND stream_index = ? AND LOWER(stream_type) = 'subtitle'
-			  AND (? = '' OR media_source_id = ?)
-			LIMIT 1`, itemID, idx, mediaSourceID, mediaSourceID).Scan(&p)
-		if err == nil && p.Valid {
-			subPath = p.String
-		}
+	var startTicks int64
+	if rawTicks := chi.URLParam(r, "StartPositionTicks"); rawTicks != "" {
+		startTicks, _ = strconv.ParseInt(rawTicks, 10, 64)
+	} else {
+		startTicks = httpx.ParseQuery(r).Int64("StartPositionTicks", 0)
 	}
 
-	if subPath != "" {
-		if data, err := os.ReadFile(subPath); err == nil {
-			ct := subtitleContentType(format)
-			w.Header().Set("Content-Type", ct)
-			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-			w.WriteHeader(http.StatusOK)
-			if r.Method != http.MethodHead {
-				_, _ = w.Write(data)
-			}
+	if h.store == nil {
+		httpx.Error(w, http.StatusNotFound, "subtitle stream not found")
+		return
+	}
+	var (
+		p          sql.NullString
+		isExternal int
+		codec      sql.NullString
+		rowMSID    sql.NullString
+	)
+	err = h.store.Reader.QueryRowContext(r.Context(), `
+		SELECT path, is_external, codec, media_source_id FROM item_media_streams
+		WHERE item_id = ? AND stream_index = ? AND LOWER(stream_type) = 'subtitle'
+		  AND (? = '' OR media_source_id = ?)
+		LIMIT 1`, itemID, idx, mediaSourceID, mediaSourceID).Scan(&p, &isExternal, &codec, &rowMSID)
+	if err != nil {
+		httpx.Error(w, http.StatusNotFound, "subtitle stream not found")
+		return
+	}
+
+	subPath := p.String
+	effectiveMSID := mediaSourceID
+	if effectiveMSID == "" && rowMSID.Valid {
+		effectiveMSID = rowMSID.String
+	}
+
+	if isExternal == 0 && subPath == "" {
+		if h.extractor == nil {
+			httpx.Error(w, http.StatusNotFound, "subtitle stream not found")
 			return
 		}
+		mediaPath := h.resolveMediaSourcePath(r.Context(), itemID, effectiveMSID)
+		if mediaPath == "" {
+			httpx.Error(w, http.StatusNotFound, "media file not found for subtitle extraction")
+			return
+		}
+		extractExt := format
+		if extractExt == "" {
+			extractExt = codec.String
+		}
+		extractedPath, err := h.extractor.ExtractSubtitle(r.Context(), mediaPath, itemID, effectiveMSID, idx, extractExt)
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		subPath = extractedPath
 	}
-	httpx.Error(w, http.StatusNotFound, "subtitle stream not found")
+	if subPath == "" {
+		httpx.Error(w, http.StatusNotFound, "subtitle stream not found")
+		return
+	}
+
+	ct, data, err := playback.ServeSubtitle(subPath, format, startTicks)
+	if err != nil {
+		if os.IsNotExist(err) {
+			httpx.Error(w, http.StatusNotFound, "subtitle file missing")
+			return
+		}
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(data)
+	}
 }
 
 func subtitleContentType(format string) string {

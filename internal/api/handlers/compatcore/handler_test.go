@@ -206,7 +206,7 @@ func TestAll93MissingRoutesCovered(t *testing.T) {
 		{"POST", "/Users/" + uid + "/TrackSelections/Subtitle/Delete", ""},
 		{"DELETE", "/Users/" + uid + "/RecentlySearched", ""},
 		{"POST", "/Users/" + uid + "/RecentlySearched/Delete", ""},
-		{"POST", "/Users/" + uid + "/Authenticate", `{}`},
+		{"POST", "/Users/" + uid + "/Authenticate", `{"Pw":"admin"}`},
 		{"POST", "/Users/" + uid, `{"Name":"admin"}`},
 		{"POST", "/Users/" + uid + "/Configuration/Partial", `{"SubtitleMode":"Always"}`},
 		{"POST", "/Users/ForgotPassword", `{"EnteredUsername":"admin"}`},
@@ -631,5 +631,68 @@ func TestNilDepsFallback(t *testing.T) {
 	}
 	if sanitizeFilename("!!!") != "default" {
 		t.Fatal("expected default sanitized filename")
+	}
+}
+
+func TestAuthenticateUserByIDPasswordVerification(t *testing.T) {
+	env := newTestEnv(t)
+	uid := env.admin.ID
+
+	// Empty body rejected with 401 when user has a password
+	rec := doReq(t, env.router, "POST", "/Users/"+uid+"/Authenticate", `{}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for empty password, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Wrong Pw rejected with 401
+	rec = doReq(t, env.router, "POST", "/Users/"+uid+"/Authenticate", `{"Pw":"wrong"}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for wrong Pw, got %d", rec.Code)
+	}
+
+	// Wrong Password rejected with 401
+	rec = doReq(t, env.router, "POST", "/Users/"+uid+"/Authenticate", `{"Password":"wrong"}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for wrong Password, got %d", rec.Code)
+	}
+
+	// Malformed JSON rejected with 400
+	rec = doReq(t, env.router, "POST", "/Users/"+uid+"/Authenticate", `{bad-json`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for malformed JSON, got %d", rec.Code)
+	}
+
+	// Correct Pw accepted with 200 and returns AccessToken
+	rec = doReq(t, env.router, "POST", "/Users/"+uid+"/Authenticate", `{"Pw":"admin"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for valid Pw, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var res dto.AuthenticationResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("unmarshal auth result: %v", err)
+	}
+	if res.AccessToken == "" || res.User.Id != uid {
+		t.Fatalf("unexpected auth result: %+v", res)
+	}
+
+	// Correct Password field accepted with 200
+	rec = doReq(t, env.router, "POST", "/Users/"+uid+"/Authenticate", `{"Password":"admin"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for valid Password, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Empty-password user: accepts empty Pw, rejects non-empty Pw
+	authSvc := auth.NewService(env.userRepo, env.cfg)
+	nopwUser, err := authSvc.CreateUser(context.Background(), "nopw", "", false)
+	if err != nil {
+		t.Fatalf("CreateUser nopw: %v", err)
+	}
+	rec = doReq(t, env.router, "POST", "/Users/"+nopwUser.ID+"/Authenticate", `{"Pw":"unexpected"}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for non-empty pw on empty-pw user, got %d", rec.Code)
+	}
+	rec = doReq(t, env.router, "POST", "/Users/"+nopwUser.ID+"/Authenticate", `{}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for empty pw on empty-pw user, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
