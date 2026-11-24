@@ -388,4 +388,62 @@ describe('Demo Mock 引擎 - Serverless 完整闭环测试', () => {
     await api.deleteItem('item-wandering-earth-2')
     await expect(api.getItem(uid, 'item-wandering-earth-2')).rejects.toMatchObject({ status: 404 })
   })
+
+  it('支持 Trending 热门榜、Person 演职员详情与作品筛选、以及 BoxSet 合集查询', async () => {
+    const authRes = await loginAsDemo('admin')
+    const uid = authRes.User.Id
+
+    // 1. TMDB Trending 榜单状态与 Tags=Trending 过滤
+    const rankings = await api.getRankingsSummary()
+    expect(rankings.tmdb_trending).toBeDefined()
+    expect(rankings.tmdb_trending?.count).toBeGreaterThan(0)
+
+    const trendingItems = await api.getItems(uid, {
+      tags: 'Trending',
+      includeItemTypes: 'Movie,Series',
+      limit: 50,
+    })
+    expect(trendingItems.TotalRecordCount).toBeGreaterThanOrEqual(4)
+    expect(trendingItems.Items.some((i) => i.Id === 'item-dune-2')).toBe(true)
+    expect(trendingItems.Items.some((i) => i.Id === 'item-three-body')).toBe(true)
+
+    const refreshRes = await api.refreshRankings()
+    expect(refreshRes.tmdb_trending_count).toBeGreaterThan(0)
+
+    // 2. Person 演职员合成 DTO 与 PersonIds / Person 过滤
+    const nolan = await api.getItem(uid, 'p-nolan')
+    expect(nolan.Type).toBe('Person')
+    expect(nolan.Name).toBe('克里斯托弗·诺兰')
+
+    const nolanById = await api.getItems(uid, {
+      personIds: 'p-nolan',
+      includeItemTypes: 'Movie,Series',
+    })
+    expect(nolanById.TotalRecordCount).toBeGreaterThanOrEqual(3)
+    expect(nolanById.Items.map((i) => i.Name)).toEqual(
+      expect.arrayContaining(['盗梦空间', '星际穿越', '奥本海默']),
+    )
+
+    const nolanByName = await api.getItems(uid, {
+      person: '诺兰',
+      includeItemTypes: 'Movie,Series',
+    })
+    expect(nolanByName.TotalRecordCount).toBeGreaterThanOrEqual(3)
+
+    // 3. BoxSet 合集列表与合集内子项查询
+    const boxSets = await api.getItems(uid, {
+      includeItemTypes: 'BoxSet',
+      recursive: true,
+    })
+    expect(boxSets.TotalRecordCount).toBeGreaterThanOrEqual(2)
+    const scifiBoxSet = boxSets.Items.find((b) => b.Id === 'boxset-scifi-epics')
+    expect(scifiBoxSet).toBeDefined()
+
+    const boxSetChildren = await api.getItems(uid, {
+      parentId: 'boxset-scifi-epics',
+      includeItemTypes: 'Movie,Series',
+    })
+    expect(boxSetChildren.TotalRecordCount).toBe(5)
+    expect(boxSetChildren.Items.some((i) => i.Id === 'item-dune-2')).toBe(true)
+  })
 })

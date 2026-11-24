@@ -27,6 +27,7 @@ let store: DemoState = createInitialDemoState()
 interface DemoRankingsState {
   doubanUpdatedAt: string
   imdbUpdatedAt: string
+  tmdbTrendingUpdatedAt: string
 }
 
 function createInitialRankingsState(): DemoRankingsState {
@@ -34,10 +35,20 @@ function createInitialRankingsState(): DemoRankingsState {
   return {
     doubanUpdatedAt: threeHoursAgo,
     imdbUpdatedAt: threeHoursAgo,
+    tmdbTrendingUpdatedAt: threeHoursAgo,
   }
 }
 
 let rankingsState: DemoRankingsState = createInitialRankingsState()
+
+const DEMO_TMDB_TRENDING_TMDB_IDS = new Set([
+  '693134', // 沙丘 2
+  '872585', // 奥本海默
+  '157336', // 星际穿越
+  '842675', // 流浪地球 2
+  '204541', // 三体
+  '1429', // 进击的巨人
+])
 
 const DEMO_DOUBAN_TOP250_TMDB_IDS = new Set([
   '278', // 肖申克的救赎
@@ -481,6 +492,11 @@ export async function demoFetch<T>(
       .split(/[|,]/)
       .map((s) => s.trim().toLowerCase())
       .filter(Boolean)
+    const personIdsParam = (qs.get('PersonIds') || '')
+      .split(/[|,]/)
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean)
+    const personParam = (qs.get('Person') || '').trim().toLowerCase()
     const searchTerm = qs.get('SearchTerm') || ''
     const sortBy = qs.get('SortBy') || 'DateCreated'
     const sortOrder = qs.get('SortOrder') || 'Descending'
@@ -520,6 +536,16 @@ export async function demoFetch<T>(
         (it.Tags || []).some((t) => tagsParam.includes(t.toLowerCase())),
       )
     }
+    if (personIdsParam.length > 0) {
+      pool = pool.filter((it) =>
+        (it.People || []).some((p) => personIdsParam.includes(p.Id.toLowerCase())),
+      )
+    }
+    if (personParam) {
+      pool = pool.filter((it) =>
+        (it.People || []).some((p) => p.Name.toLowerCase().includes(personParam)),
+      )
+    }
     if (searchTerm) {
       pool = pool.filter((it) => matchesFuzzySearch(it, searchTerm))
     }
@@ -540,6 +566,40 @@ export async function demoFetch<T>(
     if (item) return { ...item } as T
     const lib = store.libraries.find((l) => l.ItemId === itemId)
     if (lib) return libraryToViewDto(lib) as T
+
+    // 若 ID 命中任意作品的演职员，则合成 Person DTO 返回
+    let matchedPerson: { Id: string; Name: string; Type: string; PrimaryImageTag?: string } | null =
+      null
+    const knownTitles: string[] = []
+    for (const it of store.items.values()) {
+      for (const p of it.People || []) {
+        if (p.Id === itemId || p.Name === itemId) {
+          if (!matchedPerson) {
+            matchedPerson = p
+          }
+          if (!knownTitles.includes(it.Name)) {
+            knownTitles.push(it.Name)
+          }
+        }
+      }
+    }
+    if (matchedPerson) {
+      const personDto: BaseItemDto = {
+        Id: matchedPerson.Id,
+        Name: matchedPerson.Name,
+        ServerId: DEMO_SERVER_ID,
+        Type: 'Person',
+        Overview:
+          knownTitles.length > 0
+            ? `${matchedPerson.Name}，当前媒体库中收录其参与的作品共 ${knownTitles.length} 部，包括《${knownTitles.slice(0, 4).join('》《')}》。`
+            : `${matchedPerson.Name} 的演职员资料。`,
+        ImageTags: matchedPerson.PrimaryImageTag
+          ? { Primary: matchedPerson.PrimaryImageTag }
+          : undefined,
+      }
+      return personDto as T
+    }
+
     throw new ApiError(404, `未找到项目 ${itemId}`)
   }
 
@@ -881,6 +941,12 @@ export async function demoFetch<T>(
         updated_at: rankingsState.imdbUpdatedAt,
         count: 250,
       },
+      tmdb_trending: {
+        chart: 'tmdb_trending',
+        source: 'TMDB Trending Weekly (Demo 内存缓存)',
+        updated_at: rankingsState.tmdbTrendingUpdatedAt,
+        count: 40,
+      },
     }
     return summary as T
   }
@@ -889,6 +955,7 @@ export async function demoFetch<T>(
     const now = new Date().toISOString()
     rankingsState.doubanUpdatedAt = now
     rankingsState.imdbUpdatedAt = now
+    rankingsState.tmdbTrendingUpdatedAt = now
 
     let matchedItems = 0
     let tagsAdded = 0
@@ -900,8 +967,10 @@ export async function demoFetch<T>(
         DEMO_DOUBAN_TOP250_TMDB_IDS.has(tmdbId) || Boolean(item.Tags?.includes('豆瓣Top250'))
       const inImdb =
         DEMO_IMDB_TOP250_TMDB_IDS.has(tmdbId) || Boolean(item.Tags?.includes('IMDb Top250'))
+      const inTrending =
+        DEMO_TMDB_TRENDING_TMDB_IDS.has(tmdbId) || Boolean(item.Tags?.includes('Trending'))
 
-      if (!inDouban && !inImdb) continue
+      if (!inDouban && !inImdb && !inTrending) continue
       matchedItems++
       const tags = new Set(item.Tags || [])
       if (inDouban && !tags.has('豆瓣Top250')) {
@@ -912,11 +981,15 @@ export async function demoFetch<T>(
         tags.add('IMDb Top250')
         tagsAdded++
       }
+      if (inTrending && !tags.has('Trending')) {
+        tags.add('Trending')
+        tagsAdded++
+      }
       item.Tags = Array.from(tags)
     }
 
     pushActivity(
-      '已同步豆瓣 Top 250 / IMDb Top 250 榜单缓存',
+      '已同步豆瓣 Top 250 / IMDb Top 250 / TMDB 热门榜缓存',
       'RankingsSynced',
       `命中 ${matchedItems} 部影片，新增标签 ${tagsAdded} 个`,
     )
@@ -924,6 +997,7 @@ export async function demoFetch<T>(
     const result: RankingsRefreshResult = {
       douban_count: 250,
       imdb_count: 250,
+      tmdb_trending_count: 40,
       matched_items: matchedItems,
       tags_added: tagsAdded,
       synced_at: now,

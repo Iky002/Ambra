@@ -420,9 +420,12 @@ export interface RankingsChartSnapshot {
   count: number
 }
 
+export type RankingChartStatus = RankingsChartSnapshot
+
 export interface RankingsSummary {
   douban_top250: RankingsChartSnapshot
   imdb_top250: RankingsChartSnapshot
+  tmdb_trending?: RankingsChartSnapshot
 }
 
 export interface RankingsRefreshResult {
@@ -430,6 +433,8 @@ export interface RankingsRefreshResult {
   douban_error?: string
   imdb_count: number
   imdb_error?: string
+  tmdb_trending_count?: number
+  tmdb_trending_error?: string
   matched_items: number
   tags_added: number
   synced_at: string

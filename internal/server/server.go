@@ -137,7 +137,9 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 			}
 		}
 	}
-	rankingsSvc := rankings.New(store, bus, rankings.Options{})
+	rankingsSvc := rankings.New(store, bus, rankings.Options{
+		TMDBAPIKey: cfg.TMDBApiKey,
+	})
 	_ = rankingsSvc.LoadCache(ctx)
 	pb := playback.New(libRepo, registry, cfg)
 	imgSvc := imaging.New(libRepo).WithCacheDir(cfg.ImageCacheDir())
@@ -169,9 +171,9 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	taskMgr.Register(scheduler.TaskDefinition{
 		ID:          "sync-rankings-top250",
 		Key:         "SyncRankings",
-		Name:        "同步豆瓣 Top 250 与 IMDb Top 250 榜单",
+		Name:        "同步豆瓣 Top 250、IMDb Top 250 与 TMDB 热门榜单",
 		Category:    "Library",
-		Description: "定期拉取豆瓣 Top 250 与 IMDb Top 250 榜单缓存至后端，并为匹配影片自动追加榜单标签",
+		Description: "定期拉取豆瓣 Top 250、IMDb Top 250 与 TMDB 热门趋势榜单缓存至后端，并为匹配影片与剧集自动追加榜单标签",
 		Triggers: []scheduler.TaskTriggerInfo{
 			{Type: "IntervalTrigger", IntervalTicks: &dayTicks},
 		},
