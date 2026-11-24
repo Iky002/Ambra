@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
@@ -255,7 +256,7 @@ func detectImageExtension(contentType, rawURL string) string {
 }
 
 func writeFileAtomic(destPath string, data []byte) error {
-	tmpPath := destPath + ".tmp"
+	tmpPath := destPath + "." + guid.New()[:8] + ".tmp"
 	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
 		return err
 	}

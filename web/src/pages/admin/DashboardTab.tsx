@@ -37,6 +37,7 @@ export function DashboardTab() {
   const [messageTarget, setMessageTarget] = useState<SessionInfo | null>(null)
   const [msgHeader, setMsgHeader] = useState('系统通知')
   const [msgText, setMsgText] = useState('')
+  const [msgError, setMsgError] = useState<string | null>(null)
   const [sendingMsg, setSendingMsg] = useState(false)
 
   const { data: sysInfo, isLoading: sysLoading } = useQuery({
@@ -94,6 +95,7 @@ export function DashboardTab() {
     setMessageTarget(session)
     setMsgHeader('系统通知')
     setMsgText('')
+    setMsgError(null)
   }
 
   const handleSendMessage = async (e: React.FormEvent) => {
@@ -101,10 +103,11 @@ export function DashboardTab() {
     if (!messageTarget) return
     const trimmedText = msgText.trim()
     if (!trimmedText) {
-      setFeedback({ type: 'error', message: '消息内容不能为空' })
+      setMsgError('消息内容不能为空')
       return
     }
     setSendingMsg(true)
+    setMsgError(null)
     setFeedback(null)
     const label = messageTarget.DeviceName || messageTarget.UserName || messageTarget.Id
     try {
@@ -115,11 +118,9 @@ export function DashboardTab() {
       setFeedback({ type: 'success', message: `已向「${label}」发送弹窗消息` })
       setMessageTarget(null)
       setMsgText('')
+      setMsgError(null)
     } catch (err) {
-      setFeedback({
-        type: 'error',
-        message: err instanceof Error ? err.message : '发送消息失败',
-      })
+      setMsgError(err instanceof Error ? err.message : '发送消息失败')
     } finally {
       setSendingMsg(false)
     }
@@ -163,7 +164,7 @@ export function DashboardTab() {
               />
               <StatusTile
                 label="当前版本"
-                value={sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.5.0')}
+                value={sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.9.0')}
                 sub={`Emby ${sysInfo?.Version || '4.10.2.0'} 兼容 · 端口 ${sysInfo?.HttpServerPortNumber || 8096}`}
               />
               <StatusTile
@@ -344,9 +345,19 @@ export function DashboardTab() {
             : undefined
         }
         maxWidthClass="max-w-md"
-        onClose={() => setMessageTarget(null)}
+        onClose={() => {
+          setMessageTarget(null)
+          setMsgError(null)
+        }}
       >
-        <form onSubmit={handleSendMessage} className="space-y-4">
+        <form onSubmit={handleSendMessage} noValidate className="space-y-4">
+          {msgError && (
+            <FeedbackBanner
+              message={msgError}
+              type="error"
+              onClose={() => setMsgError(null)}
+            />
+          )}
           <div>
             <label htmlFor="session-msg-header" className="mb-1.5 block text-xs text-zinc-400">
               消息标题 (Header)
@@ -367,9 +378,11 @@ export function DashboardTab() {
             <textarea
               id="session-msg-text"
               rows={3}
-              required
               value={msgText}
-              onChange={(e) => setMsgText(e.target.value)}
+              onChange={(e) => {
+                setMsgText(e.target.value)
+                if (msgError) setMsgError(null)
+              }}
               placeholder="输入要推送到客户端屏幕的提示内容..."
               className="w-full rounded-xl border border-white/10 bg-zinc-900/90 px-3.5 py-2 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
             />
@@ -377,7 +390,10 @@ export function DashboardTab() {
           <div className="flex justify-end gap-2 pt-2">
             <button
               type="button"
-              onClick={() => setMessageTarget(null)}
+              onClick={() => {
+                setMessageTarget(null)
+                setMsgError(null)
+              }}
               className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10"
             >
               取消

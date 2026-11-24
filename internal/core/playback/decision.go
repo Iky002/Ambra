@@ -161,6 +161,7 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 
 	// Find default audio & subtitle indices and extract primary video/audio/subtitle codecs
 	var videoCodec, audioCodec string
+	var videoWidth, videoHeight int
 	var selectedSub *dto.MediaStream
 	for i := range msDTO.MediaStreams {
 		st := &msDTO.MediaStreams[i]
@@ -168,6 +169,12 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 		case "Video":
 			if videoCodec == "" {
 				videoCodec = strings.ToLower(st.Codec)
+			}
+			if videoWidth == 0 && st.Width > 0 {
+				videoWidth = st.Width
+			}
+			if videoHeight == 0 && st.Height > 0 {
+				videoHeight = st.Height
 			}
 		case "Audio":
 			if audioCodec == "" {
@@ -262,9 +269,16 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 	}
 
 	containerOK, videoOK, audioOK := checkProfileCompatibility(src.Container, videoCodec, audioCodec, req.DeviceProfile)
+	resOK := true
+	if req.MaxWidth > 0 && videoWidth > req.MaxWidth {
+		resOK = false
+	}
+	if req.MaxHeight > 0 && videoHeight > req.MaxHeight {
+		resOK = false
+	}
 
 	// Tier 2: Native DirectPlay
-	if allowDirectPlay && bitrateOK && containerOK && videoOK && audioOK && !subtitleNeedsBurnIn {
+	if allowDirectPlay && bitrateOK && resOK && containerOK && videoOK && audioOK && !subtitleNeedsBurnIn {
 		msDTO.SupportsDirectPlay = true
 		msDTO.SupportsDirectStream = true
 		msDTO.SupportsTranscoding = true
@@ -277,7 +291,7 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 	}
 
 	// Tier 3: Client WASM Enhanced DirectPlay (e.g. Ambra Web ffmpeg.wasm + WebCodecs + JASSUB/PGS)
-	if allowDirectPlay && bitrateOK && !subtitleNeedsBurnIn && supportsClientWASM(req.DeviceProfile) {
+	if allowDirectPlay && bitrateOK && resOK && !subtitleNeedsBurnIn && supportsClientWASM(req.DeviceProfile) {
 		msDTO.SupportsDirectPlay = true
 		msDTO.SupportsDirectStream = true
 		msDTO.SupportsTranscoding = true
@@ -290,7 +304,7 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 	}
 
 	// Tier 4: Server DirectStream (video codec compatible, remux container or transcode audio only)
-	if allowDirectStream && bitrateOK && videoOK && !subtitleNeedsBurnIn {
+	if allowDirectStream && bitrateOK && resOK && videoOK && !subtitleNeedsBurnIn {
 		msDTO.SupportsDirectPlay = false
 		msDTO.SupportsDirectStream = true
 		msDTO.SupportsTranscoding = true
@@ -316,6 +330,8 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 	reason := "Full server HLS transcode"
 	if subtitleNeedsBurnIn {
 		reason = "Subtitle burn-in requested by client profile"
+	} else if !resOK {
+		reason = "Video resolution exceeds requested MaxWidth/MaxHeight"
 	}
 	return msDTO, DecisionDetail{
 		MediaSourceID: msDTO.Id,

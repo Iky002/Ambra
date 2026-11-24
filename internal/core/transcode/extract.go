@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sync/singleflight"
 
@@ -164,6 +165,83 @@ func (e *Extractor) ExtractFonts(ctx context.Context, mediaPath, itemID, mediaSo
 		return nil, err
 	}
 	return res.([]string), nil
+}
+
+// ChapterThumbnailCachePath computes the deterministic cache path for a lazily extracted chapter thumbnail.
+func (e *Extractor) ChapterThumbnailCachePath(itemID string, chapterIdx int) string {
+	baseDir := filepath.Join(os.TempDir(), "ambra-images")
+	if e.cfg != nil {
+		baseDir = e.cfg.ImageCacheDir()
+	}
+	return filepath.Join(baseDir, "chapters", sanitizePathSegment(itemID), fmt.Sprintf("chapter_%d.jpg", chapterIdx))
+}
+
+// ExtractChapterThumbnail lazily extracts a JPEG thumbnail for chapterIdx at startTicks into
+// <ImageCacheDir>/chapters/<itemID>/chapter_<idx>.jpg using singleflight deduplication,
+// atomic temp-file rename, and an 8-second FFmpeg timeout.
+func (e *Extractor) ExtractChapterThumbnail(ctx context.Context, mediaPath, itemID string, chapterIdx int, startTicks int64) (string, error) {
+	if strings.TrimSpace(mediaPath) == "" {
+		return "", fmt.Errorf("media path is empty")
+	}
+	if chapterIdx < 0 {
+		return "", fmt.Errorf("chapter index must be non-negative")
+	}
+	outPath := e.ChapterThumbnailCachePath(itemID, chapterIdx)
+	if fileReady(outPath) {
+		return outPath, nil
+	}
+
+	sfKey := "chapter:" + outPath
+	res, err, _ := e.sf.Do(sfKey, func() (any, error) {
+		if fileReady(outPath) {
+			return outPath, nil
+		}
+		if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+			return "", fmt.Errorf("create chapter thumbnail cache dir: %w", err)
+		}
+
+		tmpPath := outPath + ".tmp.jpg"
+		_ = os.Remove(tmpPath)
+
+		sec := float64(startTicks) / float64(TicksPerSecond)
+		if sec < 0 {
+			sec = 0
+		}
+		runCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		defer cancel()
+
+		args := []string{
+			"-hide_banner",
+			"-loglevel", "error",
+			"-y",
+			"-ss", strconv.FormatFloat(sec, 'f', 3, 64),
+			"-i", mediaPath,
+			"-frames:v", "1",
+			"-q:v", "4",
+			"-vf", "scale='min(640,iw)':-2",
+			tmpPath,
+		}
+		cmd := exec.CommandContext(runCtx, e.ffmpegPath, args...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			_ = os.Remove(tmpPath)
+			return "", fmt.Errorf("extract chapter %d thumbnail: %w (%s)", chapterIdx, err, strings.TrimSpace(stderr.String()))
+		}
+		if !fileReady(tmpPath) {
+			_ = os.Remove(tmpPath)
+			return "", fmt.Errorf("extracted chapter %d thumbnail is empty", chapterIdx)
+		}
+		if err := os.Rename(tmpPath, outPath); err != nil {
+			_ = os.Remove(tmpPath)
+			return "", fmt.Errorf("commit chapter thumbnail: %w", err)
+		}
+		return outPath, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return res.(string), nil
 }
 
 func listFontFiles(dir string) ([]string, error) {

@@ -360,8 +360,48 @@ func (m *Manager) GetSegment(ctx context.Context, params SessionParams, segIndex
 	})
 }
 
+func intPtrEqual(a, b *int) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
+}
+
+func sessionParamsDiffer(a, b SessionParams) bool {
+	return a.VideoBitrate != b.VideoBitrate ||
+		a.MaxWidth != b.MaxWidth ||
+		a.MaxHeight != b.MaxHeight ||
+		!intPtrEqual(a.AudioStreamIndex, b.AudioStreamIndex) ||
+		!intPtrEqual(a.SubtitleStreamIndex, b.SubtitleStreamIndex) ||
+		!strings.EqualFold(strings.TrimSpace(a.SubtitleMethod), strings.TrimSpace(b.SubtitleMethod))
+}
+
 func (m *Manager) getOrCreateSession(params SessionParams) (*transcodeSession, error) {
 	key := SessionKey(params)
+
+	var replaced *transcodeSession
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, errors.New("transcode manager is closed")
+	}
+	if existing, ok := m.sessions[key]; ok {
+		if !sessionParamsDiffer(existing.params, params) {
+			existing.touch()
+			m.mu.Unlock()
+			return existing, nil
+		}
+		replaced = existing
+		delete(m.sessions, key)
+	}
+	m.mu.Unlock()
+
+	if replaced != nil {
+		replaced.destroy()
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -369,8 +409,17 @@ func (m *Manager) getOrCreateSession(params SessionParams) (*transcodeSession, e
 		return nil, errors.New("transcode manager is closed")
 	}
 	if existing, ok := m.sessions[key]; ok {
-		existing.touch()
-		return existing, nil
+		if !sessionParamsDiffer(existing.params, params) {
+			existing.touch()
+			return existing, nil
+		}
+		delete(m.sessions, key)
+		m.mu.Unlock()
+		existing.destroy()
+		m.mu.Lock()
+		if m.closed {
+			return nil, errors.New("transcode manager is closed")
+		}
 	}
 
 	baseDir := filepath.Join(os.TempDir(), "ambra-transcode")
@@ -714,7 +763,12 @@ func (s *transcodeSession) startProcessLocked(startSeg int, caps *HWCapabilities
 	if s.forceSoftware {
 		effectiveCaps = SoftwareOnlyCapabilities()
 	}
-	usingHW := !strings.EqualFold(s.params.VideoCodec, "copy") && isHardwareEncoder(effectiveCaps.SelectVideoEncoder(s.params.VideoCodec))
+	vCodec := s.params.VideoCodec
+	if strings.EqualFold(vCodec, "copy") {
+		vCodec = "h264"
+	}
+	usingHW := (!strings.EqualFold(s.params.VideoCodec, "copy") || strings.EqualFold(strings.TrimSpace(s.params.SubtitleMethod), "Encode")) &&
+		isHardwareEncoder(effectiveCaps.SelectVideoEncoder(vCodec))
 
 	args := BuildFFmpegArgs(s.params, startSeg, s.workDir, effectiveCaps)
 	procCtx, cancel := context.WithCancel(context.Background())

@@ -25,6 +25,8 @@ export function LiveTvTab() {
     data: tunerHosts = [],
     isLoading: tunersLoading,
     isFetching: tunersFetching,
+    isError: tunersError,
+    error: tunersErr,
     refetch: refetchTuners,
   } = useQuery({
     queryKey: ['admin', 'liveTv', 'tunerHosts'],
@@ -34,6 +36,8 @@ export function LiveTvTab() {
   const {
     data: listingProviders = [],
     isLoading: epgLoading,
+    isError: epgError,
+    error: epgErr,
     refetch: refetchEpg,
   } = useQuery({
     queryKey: ['admin', 'liveTv', 'listingProviders'],
@@ -44,6 +48,8 @@ export function LiveTvTab() {
     data: channelsData,
     isLoading: channelsLoading,
     isFetching: channelsFetching,
+    isError: channelsError,
+    error: channelsErr,
     refetch: refetchChannels,
   } = useQuery({
     queryKey: ['admin', 'liveTv', 'channels'],
@@ -249,6 +255,11 @@ export function LiveTvTab() {
           <div className="flex h-24 items-center justify-center rounded-2xl border border-white/8 bg-white/[0.02]">
             <Loader2 className="h-5 w-5 animate-spin text-amber-400" />
           </div>
+        ) : tunersError ? (
+          <FeedbackBanner
+            type="error"
+            message={`加载 M3U 直播源失败：${tunersErr instanceof Error ? tunersErr.message : '请稍后重试'}`}
+          />
         ) : tunerHosts.length === 0 ? (
           <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-8 text-center text-xs text-zinc-500">
             暂未配置 M3U 直播源
@@ -344,6 +355,11 @@ export function LiveTvTab() {
           <div className="flex h-24 items-center justify-center rounded-2xl border border-white/8 bg-white/[0.02]">
             <Loader2 className="h-5 w-5 animate-spin text-amber-400" />
           </div>
+        ) : epgError ? (
+          <FeedbackBanner
+            type="error"
+            message={`加载 XMLTV 节目单来源失败：${epgErr instanceof Error ? epgErr.message : '请稍后重试'}`}
+          />
         ) : listingProviders.length === 0 ? (
           <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-8 text-center text-xs text-zinc-500">
             暂未配置 XMLTV 节目单来源
@@ -408,6 +424,11 @@ export function LiveTvTab() {
           <div className="flex h-28 items-center justify-center rounded-2xl border border-white/8 bg-white/[0.02]">
             <Loader2 className="h-5 w-5 animate-spin text-amber-400" />
           </div>
+        ) : channelsError ? (
+          <FeedbackBanner
+            type="error"
+            message={`加载电视频道列表失败：${channelsErr instanceof Error ? channelsErr.message : '请稍后重试'}`}
+          />
         ) : channels.length === 0 ? (
           <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-10 text-center text-xs text-zinc-500">
             暂无已导入频道，添加 M3U 直播源后将自动解析频道列表

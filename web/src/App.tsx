@@ -6,6 +6,7 @@ import { Layout } from './components/Layout'
 import { ScrollToTop } from './components/ScrollToTop'
 import { AudioPlayerProvider } from './context/AudioPlayerContext'
 import { AuthProvider, useAuth } from './context/AuthContext'
+import { WebSocketProvider } from './context/WebSocketContext'
 import { isDemoMode } from './demo/demoMode'
 import { AdminPage } from './pages/AdminPage'
 import { CollectionsPage } from './pages/CollectionsPage'
@@ -150,12 +151,14 @@ export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <AuthProvider>
-        <AudioPlayerProvider>
-          <HashRouter>
-            <ScrollToTop />
-            <AppRoutes />
-          </HashRouter>
-        </AudioPlayerProvider>
+        <WebSocketProvider>
+          <AudioPlayerProvider>
+            <HashRouter>
+              <ScrollToTop />
+              <AppRoutes />
+            </HashRouter>
+          </AudioPlayerProvider>
+        </WebSocketProvider>
       </AuthProvider>
     </QueryClientProvider>
   )

@@ -240,6 +240,9 @@ type BaseItemDto struct {
 	ParentId                string            `json:"ParentId,omitempty"`
 	Type                    string            `json:"Type"`
 	MediaType               string            `json:"MediaType,omitempty"`
+	ExtraType               string            `json:"ExtraType,omitempty"`
+	LocalTrailerCount       int               `json:"LocalTrailerCount,omitempty"`
+	SpecialFeatureCount     int               `json:"SpecialFeatureCount,omitempty"`
 	CollectionType          string            `json:"CollectionType,omitempty"`
 	SeriesName              string            `json:"SeriesName,omitempty"`
 	SeriesId                string            `json:"SeriesId,omitempty"`

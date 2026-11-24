@@ -2,6 +2,8 @@ package streaming
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -162,6 +164,12 @@ func (h *Handler) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.MaxStreamingBitrate == 0 {
 		req.MaxStreamingBitrate = q.Int("MaxStreamingBitrate", 0)
+	}
+	if req.MaxWidth == 0 {
+		req.MaxWidth = q.Int("MaxWidth", 0)
+	}
+	if req.MaxHeight == 0 {
+		req.MaxHeight = q.Int("MaxHeight", 0)
 	}
 	if req.StartTimeTicks == 0 {
 		req.StartTimeTicks = q.Int64("StartTimeTicks", 0)
@@ -416,6 +424,9 @@ func (h *Handler) handleImage(w http.ResponseWriter, r *http.Request) {
 	}
 	err := h.imaging.ServeHTTPWithOptions(w, r, itemID, imgType, idx, opts)
 	if errors.Is(err, sqlite.ErrNotFound) || os.IsNotExist(err) {
+		if strings.EqualFold(imgType, "Chapter") && h.tryExtractAndServeChapterImage(w, r, itemID, idx, opts) {
+			return
+		}
 		if h.tryServeLibraryCover(w, r, itemID, opts) {
 			return
 		}
@@ -426,6 +437,36 @@ func (h *Handler) handleImage(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+}
+
+func (h *Handler) tryExtractAndServeChapterImage(w http.ResponseWriter, r *http.Request, itemID string, idx int, opts imaging.Options) bool {
+	if h.extractor == nil || h.repo == nil || idx < 0 {
+		return false
+	}
+	normID := guid.Normalize(itemID)
+	rec, err := h.repo.GetItemRecordByID(r.Context(), normID)
+	if err != nil || rec == nil || idx >= len(rec.Extra.Chapters) {
+		return false
+	}
+	mediaPath, err := h.resolveMediaPath(r.Context(), normID, "")
+	if err != nil || strings.TrimSpace(mediaPath) == "" {
+		return false
+	}
+	startTicks := rec.Extra.Chapters[idx].StartPositionTicks
+	thumbPath, err := h.extractor.ExtractChapterThumbnail(r.Context(), mediaPath, normID, idx, startTicks)
+	if err != nil || thumbPath == "" {
+		return false
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("chapter:%s:%d:%d", normID, idx, startTicks)))
+	tag := hex.EncodeToString(sum[:8])
+	_ = h.repo.UpsertImage(r.Context(), &sqlite.ImageRecord{
+		ItemID:     normID,
+		ImageType:  "Chapter",
+		ImageIndex: idx,
+		Path:       thumbPath,
+		Tag:        tag,
+	})
+	return h.imaging.ServeHTTPWithOptions(w, r, normID, "Chapter", idx, opts) == nil
 }
 
 func (h *Handler) tryServeLibraryCover(w http.ResponseWriter, r *http.Request, libraryID string, opts imaging.Options) bool {

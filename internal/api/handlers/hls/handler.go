@@ -125,6 +125,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	mux.Handle("GET /Videos/{Id}/main.m3u8", wrapAuth(http.HandlerFunc(h.handleMediaPlaylist)))
 	mux.Handle("GET /Videos/{Id}/live.m3u8", wrapAuth(http.HandlerFunc(h.handleMediaPlaylist)))
 	mux.Handle("GET /Videos/{Id}/hls1/{PlaylistId}/{Segment}", wrapAuth(http.HandlerFunc(h.handleSegment)))
+	mux.Handle("GET /Videos/{Id}/hls/{PlaylistId}/{Segment}", wrapAuth(http.HandlerFunc(h.handleSegment)))
 	mux.Handle("GET /Videos/{Id}/{MediaSourceId}/Subtitles/{Index}/subtitles.m3u8", wrapAuth(http.HandlerFunc(h.handleSubtitlePlaylist)))
 
 	// Active Encodings Management

@@ -215,6 +215,25 @@ export interface TaskTriggerInfo {
   MaxRuntimeTicks?: number
 }
 
+export interface BackupFileInfo {
+  Name: string
+  Path?: string
+  Size: number
+  DateCreated: string
+}
+
+export interface BackupInfoResponse {
+  BackupDirectory: string
+  Backups: BackupFileInfo[]
+}
+
+export interface BackupRestoreResult {
+  Restored: boolean
+  BackupName: string
+  StagedPath?: string
+  RequiresRestart?: boolean
+}
+
 export interface BaseItemDto {
   Name: string
   OriginalTitle?: string
