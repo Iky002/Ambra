@@ -18,6 +18,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/core/playback"
 	"github.com/ambra-media/ambra/internal/core/scanner"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
@@ -578,6 +579,43 @@ func (h *Handler) handleItemAncestors(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, ancestors)
 }
 
+func (h *Handler) canAccessItem(r *http.Request, item *sqlite.ItemRecord) bool {
+	if item == nil {
+		return true
+	}
+	allowed := h.allowedLibrariesForRequest(r, "")
+	return isLibraryAllowed(item.LibraryID, allowed)
+}
+
+func (h *Handler) canAccessItemID(r *http.Request, itemID string) bool {
+	if h.userRepo == nil || h.repo == nil || itemID == "" {
+		return true
+	}
+	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
+	if err != nil || rec == nil {
+		return true
+	}
+	return h.canAccessItem(r, rec)
+}
+
+func (h *Handler) callerIdentity(r *http.Request) (userID string, isAdmin bool) {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		return guid.Normalize(ac.UserID()), ac.IsAdmin()
+	}
+	if h.auth.UserIDFromCtx != nil {
+		uid := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if uid != "" {
+			if h.userRepo != nil {
+				if u, err := h.userRepo.GetUserByID(r.Context(), uid); err == nil && u != nil {
+					return uid, u.IsAdmin || u.Policy.IsAdministrator
+				}
+			}
+			return uid, false
+		}
+	}
+	return "", false
+}
+
 func (h *Handler) handleItemFile(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
@@ -587,6 +625,10 @@ func (h *Handler) handleItemFile(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !h.canAccessItem(r, rec) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
 		return
 	}
 	if _, err := os.Stat(rec.Path); err != nil {
@@ -719,6 +761,10 @@ func (h *Handler) handleProviderSubtitleDownload(w http.ResponseWriter, _ *http.
 func (h *Handler) handleSubtitleStream(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	mediaSourceID := guid.Normalize(chi.URLParam(r, "MediaSourceId"))
+	if !h.canAccessItemID(r, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	idx, err := strconv.Atoi(chi.URLParam(r, "Index"))
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid subtitle index")
@@ -867,6 +913,10 @@ func (h *Handler) resolveMediaSourcePath(ctx context.Context, itemID, mediaSourc
 func (h *Handler) handleListVideoAttachments(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	mediaSourceID := guid.Normalize(chi.URLParam(r, "MediaSourceId"))
+	if !h.canAccessItemID(r, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	mediaPath := h.resolveMediaSourcePath(r.Context(), itemID, mediaSourceID)
 	if mediaPath == "" || h.extractor == nil {
 		httpx.JSON(w, http.StatusOK, []videoAttachmentDTO{})
@@ -893,6 +943,10 @@ func (h *Handler) handleListVideoAttachments(w http.ResponseWriter, r *http.Requ
 func (h *Handler) handleVideoAttachmentStream(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	mediaSourceID := guid.Normalize(chi.URLParam(r, "MediaSourceId"))
+	if !h.canAccessItemID(r, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	idx, err := strconv.Atoi(chi.URLParam(r, "Index"))
 	if err != nil || idx < 0 {
 		httpx.Error(w, http.StatusBadRequest, "invalid attachment index")
@@ -949,8 +1003,9 @@ func (h *Handler) handleDeleteActiveEncodings(w http.ResponseWriter, r *http.Req
 	q := httpx.ParseQuery(r)
 	deviceID := q.Get("DeviceId")
 	playSessionID := q.Get("PlaySessionId")
+	callerUserID, isAdmin := h.callerIdentity(r)
 	if h.transcodeMgr != nil {
-		h.transcodeMgr.StopByDevice(deviceID, playSessionID)
+		h.transcodeMgr.StopByDeviceForUser(deviceID, playSessionID, callerUserID, isAdmin)
 	}
 	httpx.NoContent(w)
 }

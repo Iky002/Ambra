@@ -304,7 +304,14 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 	msDTO.SupportsDirectPlay = false
 	msDTO.SupportsDirectStream = false
 	msDTO.SupportsTranscoding = true
-	msDTO.TranscodingUrl = fmt.Sprintf("/Videos/%s/master.m3u8?MediaSourceId=%s&PlaySessionId=%s&VideoCodec=h264&AudioCodec=aac", item.ID, msDTO.Id, sessionID)
+	transcodingURL := fmt.Sprintf("/Videos/%s/master.m3u8?MediaSourceId=%s&PlaySessionId=%s&VideoCodec=h264&AudioCodec=aac", item.ID, msDTO.Id, sessionID)
+	if req.AudioStreamIndex != nil && *req.AudioStreamIndex >= 0 {
+		transcodingURL += fmt.Sprintf("&AudioStreamIndex=%d", *req.AudioStreamIndex)
+	}
+	if subtitleNeedsBurnIn && selectedSub != nil {
+		transcodingURL += fmt.Sprintf("&SubtitleStreamIndex=%d&SubtitleMethod=Encode", selectedSub.Index)
+	}
+	msDTO.TranscodingUrl = transcodingURL
 	reason := "Full server HLS transcode"
 	if subtitleNeedsBurnIn {
 		reason = "Subtitle burn-in requested by client profile"

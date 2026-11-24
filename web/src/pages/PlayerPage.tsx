@@ -116,9 +116,13 @@ export function PlayerPage() {
 
   const initialMediaSourceId = searchParams.get('mediaSourceId') || undefined
   const initialAudio = searchParams.get('audio') ? Number(searchParams.get('audio')) : undefined
-  const initialSubtitle = searchParams.get('subtitle')
-    ? Number(searchParams.get('subtitle'))
-    : undefined
+  const rawInitialSubtitle = searchParams.get('subtitle')
+  const initialSubtitle =
+    rawInitialSubtitle &&
+    rawInitialSubtitle !== 'off' &&
+    Number.isFinite(Number(rawInitialSubtitle))
+      ? Number(rawInitialSubtitle)
+      : undefined
   const initialStartTicks = searchParams.get('startTicks')
     ? Number(searchParams.get('startTicks'))
     : 0
@@ -211,7 +215,11 @@ export function PlayerPage() {
       const sp = searchParamsRef.current
       const nextSourceId = sp.get('mediaSourceId') || undefined
       const nextAudio = sp.get('audio') ? Number(sp.get('audio')) : undefined
-      const nextSubtitle = sp.get('subtitle') ? Number(sp.get('subtitle')) : undefined
+      const nextSubRaw = sp.get('subtitle')
+      const nextSubtitle =
+        nextSubRaw && nextSubRaw !== 'off' && Number.isFinite(Number(nextSubRaw))
+          ? Number(nextSubRaw)
+          : undefined
       setSelectedSourceId(nextSourceId)
       setAudioIndex(nextAudio)
       setSubtitleIndex(nextSubtitle)
@@ -361,7 +369,9 @@ export function PlayerPage() {
     }
     if (initializedSubSourceIdRef.current !== activeSource.Id) {
       initializedSubSourceIdRef.current = activeSource.Id
-      if (subtitleIndex === undefined) {
+      if (searchParamsRef.current.get('subtitle') === 'off') {
+        setSubtitleIndex(undefined)
+      } else if (subtitleIndex === undefined) {
         const pickedSub = pickPreferredSubtitleIndex(
           subtitleStreams,
           prefs.preferredSubtitleLang,

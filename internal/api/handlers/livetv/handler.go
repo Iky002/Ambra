@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -162,10 +165,11 @@ type liveTVState struct {
 }
 
 type Handler struct {
-	store      *sqlite.Store
-	cfg        *config.Config
-	httpClient *http.Client
-	auth       AuthFuncs
+	store            *sqlite.Store
+	cfg              *config.Config
+	httpClient       *http.Client
+	customHTTPClient bool
+	auth             AuthFuncs
 
 	mu    sync.RWMutex
 	state liveTVState
@@ -175,10 +179,18 @@ func New(store *sqlite.Store, cfg *config.Config) *Handler {
 	h := &Handler{
 		store:      store,
 		cfg:        cfg,
-		httpClient: &http.Client{Timeout: 15 * time.Second},
+		httpClient: netutil.NewSafeHTTPClient(15*time.Second, false),
 	}
 	h.loadState(context.Background())
 	return h
+}
+
+// SetHTTPClient overrides the HTTP client used for remote M3U playlist fetching (primarily for testing).
+func (h *Handler) SetHTTPClient(client *http.Client) {
+	if client != nil {
+		h.httpClient = client
+		h.customHTTPClient = true
+	}
 }
 
 // AddRecording inserts a recording record (useful for tests and internal DVR integration).
@@ -828,30 +840,127 @@ func (h *Handler) handleSaveTunerHost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) loadM3UFromSource(ctx context.Context, src, userAgent string) ([]M3UChannel, error) {
-	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, src, nil)
-		if err != nil {
-			return nil, err
-		}
-		if userAgent != "" {
-			req.Header.Set("User-Agent", userAgent)
-		}
-		resp, err := h.httpClient.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode >= 400 {
-			return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
-		}
-		return ParseM3U(resp.Body)
+	trimmed := strings.TrimSpace(src)
+	if trimmed == "" {
+		return nil, errors.New("m3u source is empty")
 	}
-	f, err := os.Open(src)
+
+	if u, err := url.Parse(trimmed); err == nil && u.Scheme != "" {
+		scheme := strings.ToLower(u.Scheme)
+		if scheme == "http" || scheme == "https" {
+			if !h.customHTTPClient {
+				if err := netutil.ValidateRemoteURL(trimmed, false); err != nil {
+					return nil, fmt.Errorf("blocked m3u url: %w", err)
+				}
+			}
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, trimmed, nil)
+			if err != nil {
+				return nil, err
+			}
+			if userAgent != "" {
+				req.Header.Set("User-Agent", userAgent)
+			}
+			resp, err := h.httpClient.Do(req)
+			if err != nil {
+				return nil, err
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode >= 400 {
+				return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
+			}
+			return ParseM3U(resp.Body)
+		}
+		// Reject non-HTTP URL schemes (e.g. file://, ftp://, gopher://), while allowing
+		// single-letter Windows drive prefixes like C:\playlist.m3u.
+		if len(scheme) > 1 {
+			return nil, fmt.Errorf("unsupported m3u url scheme %q", u.Scheme)
+		}
+	}
+
+	resolvedPath, err := h.validateLocalM3UPath(ctx, trimmed)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Open(resolvedPath)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 	return ParseM3U(f)
+}
+
+func (h *Handler) validateLocalM3UPath(ctx context.Context, rawPath string) (string, error) {
+	ext := strings.ToLower(filepath.Ext(rawPath))
+	if ext != ".m3u" && ext != ".m3u8" {
+		return "", fmt.Errorf("local m3u file must have .m3u or .m3u8 extension")
+	}
+
+	resolvedPath, err := filepath.EvalSymlinks(rawPath)
+	if err != nil {
+		return "", err
+	}
+	resolvedPath = filepath.Clean(resolvedPath)
+
+	// Re-check extension after symlink resolution to prevent symlink-to-/etc/passwd tricks.
+	resolvedExt := strings.ToLower(filepath.Ext(resolvedPath))
+	if resolvedExt != ".m3u" && resolvedExt != ".m3u8" {
+		return "", fmt.Errorf("resolved local m3u target must have .m3u or .m3u8 extension")
+	}
+
+	allowedRoots := h.allowedLocalM3URoots(ctx)
+	for _, root := range allowedRoots {
+		if isPathWithinRoot(root, resolvedPath) {
+			return resolvedPath, nil
+		}
+	}
+	return "", fmt.Errorf("local m3u file path is outside allowed directories")
+}
+
+func (h *Handler) allowedLocalM3URoots(ctx context.Context) []string {
+	var roots []string
+	addRoot := func(dir string) {
+		dir = strings.TrimSpace(dir)
+		if dir == "" {
+			return
+		}
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+			roots = append(roots, filepath.Clean(resolved))
+		} else {
+			roots = append(roots, filepath.Clean(dir))
+		}
+	}
+
+	if h.cfg != nil && h.cfg.DataDir != "" {
+		addRoot(h.cfg.DataDir)
+	}
+	if h.store != nil {
+		libRepo := sqlite.NewLibraryRepo(h.store)
+		if libs, err := libRepo.ListLibraries(ctx); err == nil {
+			for _, lib := range libs {
+				for _, p := range lib.Paths {
+					addRoot(p)
+				}
+			}
+		}
+	}
+	return roots
+}
+
+func isPathWithinRoot(root, target string) bool {
+	if root == "" || target == "" {
+		return false
+	}
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return false
+	}
+	return true
 }
 
 func (h *Handler) handleDeleteTunerHost(w http.ResponseWriter, r *http.Request) {

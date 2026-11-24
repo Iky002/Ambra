@@ -156,6 +156,7 @@ export function AudioPlayerBar() {
     toggleShuffle,
     selectTrackAt,
     removeFromQueue,
+    retry,
     clearError,
     close,
   } = useAudioPlayer()
@@ -368,10 +369,7 @@ export function AudioPlayerBar() {
           <div className="flex shrink-0 items-center gap-1.5">
             <button
               type="button"
-              onClick={() => {
-                clearError()
-                togglePlay()
-              }}
+              onClick={retry}
               className="inline-flex items-center gap-1 rounded-md bg-red-500/20 px-2 py-0.5 text-[11px] font-medium text-red-100 transition-colors hover:bg-red-500/35"
             >
               <RotateCw className="h-3 w-3" />

@@ -16,6 +16,7 @@ import {
 import { useParams, useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
 import { MediaCard } from '../components/MediaCard'
+import { QueryErrorState } from '../components/QueryErrorState'
 import { useAuth } from '../context/AuthContext'
 
 const SORT_OPTIONS = [
@@ -137,7 +138,7 @@ export function LibraryPage() {
     ? musicSubTab
     : 'Movie,Series,MusicAlbum,Video'
 
-  const { data, isLoading, isFetching } = useQuery({
+  const { data, isLoading, isFetching, isError, error, refetch } = useQuery({
     queryKey: [
       'libraryItems',
       userId,
@@ -379,6 +380,13 @@ export function LibraryPage() {
         <div className="flex h-64 items-center justify-center">
           <Loader2 className="h-7 w-7 animate-spin text-amber-400" />
         </div>
+      ) : isError ? (
+        <QueryErrorState
+          title="无法加载媒体库内容"
+          error={error}
+          onRetry={() => void refetch()}
+          backTo="/"
+        />
       ) : items.length === 0 ? (
         <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-20 text-center text-sm text-zinc-500">
           当前筛选条件下没有找到媒体项目

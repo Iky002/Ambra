@@ -13,6 +13,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/middleware"
+	"github.com/ambra-media/ambra/internal/api/ws"
 	"github.com/ambra-media/ambra/internal/core/auth"
 )
 
@@ -205,5 +206,122 @@ func TestUserAvatarXSSProtection(t *testing.T) {
 	}
 	if legacyRec.Header().Get("X-Content-Type-Options") != "nosniff" {
 		t.Fatalf("expected nosniff header")
+	}
+}
+
+type fakeWSSender struct {
+	sent []struct {
+		deviceID string
+		msg      ws.Message
+	}
+}
+
+func (f *fakeWSSender) SendToDevice(deviceID string, msg ws.Message) {
+	f.sent = append(f.sent, struct {
+		deviceID string
+		msg      ws.Message
+	}{deviceID: deviceID, msg: msg})
+}
+
+func TestSessionRemoteControlWSForwardingAndRBAC(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+
+	authSvc := auth.NewService(env.userRepo, env.cfg)
+	authMW := middleware.NewAuth(authSvc, env.sessions)
+
+	adminAuth, err := authSvc.AuthenticateByName(ctx, "admin", "admin", "", auth.ClientInfo{DeviceID: "admin-tv"})
+	if err != nil {
+		t.Fatalf("auth admin: %v", err)
+	}
+	guestAuth, err := authSvc.AuthenticateByName(ctx, "9guest", "pass", "", auth.ClientInfo{DeviceID: "guest-phone"})
+	if err != nil {
+		t.Fatalf("auth guest: %v", err)
+	}
+
+	adminSess := env.sessions.TouchSession(env.admin, auth.ClientInfo{DeviceID: "admin-tv"})
+	guestSess := env.sessions.TouchSession(env.user2, auth.ClientInfo{DeviceID: "guest-phone"})
+
+	fakeWS := &fakeWSSender{}
+	env.handler.SetWSHub(fakeWS)
+
+	router := env.handler.BuildRouter(AuthFuncs{
+		RequireAuth:  authMW.RequireAuth,
+		RequireAdmin: authMW.RequireAdmin,
+		UserIDFromCtx: func(c context.Context) string {
+			if ac, ok := middleware.AuthFromContext(c); ok && ac != nil {
+				return ac.UserID()
+			}
+			return ""
+		},
+	})
+
+	doAuthReq := func(token, method, target, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, strings.NewReader(body))
+		if token != "" {
+			req.Header.Set("X-Emby-Token", token)
+		}
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. Non-admin attempting remote control against admin's session -> 403 Forbidden and NO WS push
+	blockedPaths := []struct {
+		path string
+		body string
+	}{
+		{"/Sessions/" + adminSess.Id + "/Viewing?ItemId=" + env.itemID + "&ItemType=Movie", ""},
+		{"/Sessions/" + adminSess.Id + "/Playing?ItemIds=" + env.itemID + "&PlayCommand=PlayNow", `{}`},
+		{"/Sessions/" + adminSess.Id + "/Playing/Pause", `{}`},
+		{"/Sessions/" + adminSess.Id + "/System/Restart", ""},
+		{"/Sessions/" + adminSess.Id + "/Command/GoHome", `{}`},
+		{"/Sessions/" + adminSess.Id + "/Message?Header=Hi&Text=Pwned", `{}`},
+	}
+	for _, tc := range blockedPaths {
+		rec := doAuthReq(guestAuth.AccessToken, http.MethodPost, tc.path, tc.body)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 for guest controlling admin session on %s, got %d", tc.path, rec.Code)
+		}
+	}
+	if len(fakeWS.sent) != 0 {
+		t.Fatalf("expected 0 WS messages when unauthorized, got %d", len(fakeWS.sent))
+	}
+
+	// 2. Non-admin controlling own session -> 204 and WS messages pushed to guest-phone
+	ownCases := []struct {
+		path     string
+		body     string
+		wantType string
+	}{
+		{"/Sessions/" + guestSess.Id + "/Playing?ItemIds=" + env.itemID + "&PlayCommand=PlayNow", `{}`, "Play"},
+		{"/Sessions/" + guestSess.Id + "/Playing/Pause", `{}`, "Playstate"},
+		{"/Sessions/" + guestSess.Id + "/Command/GoHome", `{}`, "GeneralCommand"},
+		{"/Sessions/" + guestSess.Id + "/Message?Header=Hi&Text=Self", `{}`, "GeneralCommand"},
+		{"/Sessions/" + guestSess.Id + "/Viewing?ItemId=" + env.itemID + "&ItemType=Movie", ``, "GeneralCommand"},
+		{"/Sessions/" + guestSess.Id + "/System/DisplayMessage", ``, "GeneralCommand"},
+	}
+	for i, tc := range ownCases {
+		rec := doAuthReq(guestAuth.AccessToken, http.MethodPost, tc.path, tc.body)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("expected 204 for own session %s, got %d (%s)", tc.path, rec.Code, rec.Body.String())
+		}
+		if len(fakeWS.sent) != i+1 {
+			t.Fatalf("expected %d WS messages, got %d", i+1, len(fakeWS.sent))
+		}
+		got := fakeWS.sent[i]
+		if got.deviceID != "guest-phone" || got.msg.MessageType != tc.wantType {
+			t.Fatalf("case %s: expected device=guest-phone type=%s, got device=%s type=%s", tc.path, tc.wantType, got.deviceID, got.msg.MessageType)
+		}
+	}
+
+	// 3. Admin controlling guest's session -> 204 and WS message pushed to guest-phone
+	before := len(fakeWS.sent)
+	rec := doAuthReq(adminAuth.AccessToken, http.MethodPost, "/Sessions/"+guestSess.Id+"/Playing/Stop", `{}`)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for admin controlling guest session, got %d", rec.Code)
+	}
+	if len(fakeWS.sent) != before+1 || fakeWS.sent[before].deviceID != "guest-phone" || fakeWS.sent[before].msg.MessageType != "Playstate" {
+		t.Fatalf("expected Playstate pushed to guest-phone, got %+v", fakeWS.sent[before:])
 	}
 }
