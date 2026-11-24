@@ -25,6 +25,7 @@ import type {
   RankingsSummary,
   RemoteImageResult,
   RemoteSearchResult,
+  ScanProgressSnapshot,
   ScheduledTaskInfo,
   SearchHintResult,
   ServerLogFile,
@@ -788,4 +789,6 @@ export const api = {
     embyFetch<RankingsRefreshResult>('/emby/System/Rankings/Refresh', {
       method: 'POST',
     }),
+
+  getScanProgress: () => embyFetch<ScanProgressSnapshot>('/api/admin/scanner/progress'),
 }

@@ -35,6 +35,8 @@ type ItemExtra struct {
 	SeriesName     string            `json:"series_name,omitempty"`
 	SeasonName     string            `json:"season_name,omitempty"`
 	CollectionType string            `json:"collection_type,omitempty"`
+	LockedFields   []string          `json:"LockedFields,omitempty"`
+	LockData       bool              `json:"LockData,omitempty"`
 }
 
 // ItemRecord represents a row in the items table.
@@ -563,6 +565,23 @@ func (r *LibraryRepo) ReplaceItemImages(ctx context.Context, itemID string, imag
 		}
 	}
 	return tx.Commit()
+}
+
+func (r *LibraryRepo) UpsertImage(ctx context.Context, img *ImageRecord) error {
+	if img == nil {
+		return nil
+	}
+	itemID := guid.Normalize(img.ItemID)
+	tag := img.Tag
+	if tag == "" {
+		tag = guid.New()[:16]
+	}
+	_, err := r.store.Writer.ExecContext(ctx, `
+		INSERT OR REPLACE INTO item_images (item_id, image_type, image_index, path, tag, width, height, blurhash)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		itemID, img.ImageType, img.ImageIndex, img.Path, tag, img.Width, img.Height, nullStr(img.Blurhash),
+	)
+	return err
 }
 
 func (r *LibraryRepo) ReplaceItemTaxonomies(ctx context.Context, itemID string, kind string, names []string) error {

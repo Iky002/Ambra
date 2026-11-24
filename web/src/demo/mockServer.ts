@@ -4,6 +4,7 @@ import type {
   AuthenticationResult,
   BaseItemDto,
   ItemImageInfo,
+  LibraryScanProgress,
   PlaybackInfoResponse,
   PublicSystemInfo,
   QueryResult,
@@ -12,6 +13,7 @@ import type {
   RemoteImageInfo,
   RemoteImageResult,
   RemoteSearchResult,
+  ScanProgressSnapshot,
   SearchHint,
   SearchHintResult,
   UserDto,
@@ -44,6 +46,16 @@ function createInitialRankingsState(): DemoRankingsState {
 }
 
 let rankingsState: DemoRankingsState = createInitialRankingsState()
+
+interface DemoScanState {
+  startedAtMs: number
+  durationMs: number
+  libraryId: string
+  libraryName: string
+  items: string[]
+}
+
+let activeDemoScan: DemoScanState | null = null
 
 const DEMO_TMDB_TRENDING_TMDB_IDS = new Set([
   '693134', // 沙丘 2
@@ -106,6 +118,7 @@ const DEMO_IMDB_TOP250_TMDB_IDS = new Set([
 export function resetDemoStore(): void {
   store = createInitialDemoState()
   rankingsState = createInitialRankingsState()
+  activeDemoScan = null
 }
 
 export function getDemoImageUrl(
@@ -765,13 +778,135 @@ export async function demoFetch<T>(
   }
 
   // ==================== 9. 媒体库管理与模拟目录浏览器 ====================
+  if (pathname === '/api/admin/scanner/progress' && method === 'GET') {
+    const nowMs = Date.now()
+    const nowIso = new Date(nowMs).toISOString()
+
+    if (!activeDemoScan) {
+      const idle: ScanProgressSnapshot = {
+        running: false,
+        phase: 'idle',
+        total: 0,
+        processed: 0,
+        added: 0,
+        updated: 0,
+        skipped: 0,
+        failed: 0,
+        percentage: 0,
+        updated_at: nowIso,
+        libraries: [],
+      }
+      return idle as T
+    }
+
+    const elapsed = Math.max(0, nowMs - activeDemoScan.startedAtMs)
+    if (elapsed >= activeDemoScan.durationMs) {
+      activeDemoScan = null
+      const done: ScanProgressSnapshot = {
+        running: false,
+        phase: 'idle',
+        total: 0,
+        processed: 0,
+        added: 0,
+        updated: 0,
+        skipped: 0,
+        failed: 0,
+        percentage: 0,
+        updated_at: nowIso,
+        libraries: [],
+      }
+      return done as T
+    }
+
+    const total = Math.max(1, activeDemoScan.items.length)
+    const discoverWindow = activeDemoScan.durationMs * 0.2
+    const isDiscovering = elapsed < discoverWindow
+    const phase = isDiscovering ? 'discovering' : 'enriching'
+    const currentAction = isDiscovering
+      ? '扫描媒体目录与文件'
+      : '刮削 TMDB 中文元数据与海报'
+
+    let processed: number
+    let percentage: number
+    if (isDiscovering) {
+      const ratio = elapsed / discoverWindow
+      processed = Math.min(total, Math.max(1, Math.ceil(ratio * Math.max(1, Math.floor(total * 0.25)))))
+      percentage = Math.min(19, Math.max(5, Math.round((elapsed / activeDemoScan.durationMs) * 100)))
+    } else {
+      const enrichRatio = (elapsed - discoverWindow) / (activeDemoScan.durationMs - discoverWindow)
+      processed = Math.min(total, Math.max(1, Math.ceil(enrichRatio * total)))
+      percentage = Math.min(99, Math.max(20, Math.round((elapsed / activeDemoScan.durationMs) * 100)))
+    }
+
+    const currentItem =
+      activeDemoScan.items[Math.min(activeDemoScan.items.length - 1, Math.max(0, processed - 1))] ||
+      '媒体索引项'
+    const updated = Math.floor(processed * 0.7)
+    const added = Math.floor(processed * 0.2)
+    const skipped = Math.max(0, processed - updated - added)
+    const startedIso = new Date(activeDemoScan.startedAtMs).toISOString()
+
+    const libProgress: LibraryScanProgress = {
+      library_id: activeDemoScan.libraryId || 'all',
+      library_name: activeDemoScan.libraryName,
+      phase,
+      total,
+      processed,
+      added,
+      updated,
+      skipped,
+      failed: 0,
+      current_item: currentItem,
+      current_action: currentAction,
+      percentage,
+      started_at: startedIso,
+      updated_at: nowIso,
+    }
+
+    const snapshot: ScanProgressSnapshot = {
+      running: true,
+      phase,
+      library_id: activeDemoScan.libraryId || undefined,
+      library_name: activeDemoScan.libraryName,
+      total,
+      processed,
+      added,
+      updated,
+      skipped,
+      failed: 0,
+      current_item: currentItem,
+      current_action: currentAction,
+      percentage,
+      started_at: startedIso,
+      updated_at: nowIso,
+      libraries: [libProgress],
+    }
+    return snapshot as T
+  }
+
   if (pathname === '/emby/Library/Refresh' && method === 'POST') {
     const parentId = qs.get('ParentId')
     const lib = parentId ? store.libraries.find((l) => l.ItemId === parentId) : null
+    const targetItems = lib
+      ? (store.libraryItems.get(lib.ItemId) || [])
+          .map((id) => store.items.get(id)?.Name)
+          .filter((name): name is string => Boolean(name))
+      : Array.from(store.items.values())
+          .filter((it) => it.Type === 'Movie' || it.Type === 'Series')
+          .map((it) => it.Name)
+
+    activeDemoScan = {
+      startedAtMs: Date.now(),
+      durationMs: 4000,
+      libraryId: lib?.ItemId || '',
+      libraryName: lib?.Name || '全部媒体库',
+      items: targetItems.length > 0 ? targetItems : ['流浪地球 2', '三体', '沙丘 2', '奥本海默'],
+    }
+
     pushActivity(
       lib ? `已触发媒体库「${lib.Name}」扫描任务` : '已触发全部媒体库扫描任务',
       'LibraryScan',
-      'Demo 模拟扫描已在 0.4s 内完成',
+      `正在扫描与刮削 ${activeDemoScan.items.length} 个媒体条目`,
     )
     return undefined as T
   }

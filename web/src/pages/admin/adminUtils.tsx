@@ -1,10 +1,15 @@
 import React, { useEffect } from 'react'
 import { AlertCircle, CheckCircle2, X } from 'lucide-react'
 
+function isZeroDate(d: Date): boolean {
+  return d.getUTCFullYear() <= 1970
+}
+
 export function formatDateTime(iso?: string): string {
   if (!iso) return '-'
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return iso
+  if (isZeroDate(d)) return '-'
   return d.toLocaleString('zh-CN', {
     year: 'numeric',
     month: '2-digit',
@@ -20,6 +25,7 @@ export function formatRelativeTime(iso?: string): string {
   if (!iso) return '从未'
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return iso
+  if (isZeroDate(d)) return '尚未同步'
   const diffSec = Math.floor((Date.now() - d.getTime()) / 1000)
   if (diffSec < 0) return formatDateTime(iso)
   if (diffSec < 60) return '刚刚'

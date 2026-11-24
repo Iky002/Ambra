@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
@@ -90,6 +91,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	handleAdmin("DELETE /Library/VirtualFolders", h.handleDeleteVirtualFolder)
 	handleAdmin("POST /Library/Refresh", h.handleRefreshLibrary)
 	handleAdmin("POST /Library/Media/Updated", h.handleMediaUpdated)
+	handleAdmin("GET /api/admin/scanner/progress", h.handleScannerProgress)
 }
 
 func (h *Handler) serverID() string {
@@ -536,6 +538,18 @@ func (h *Handler) handleMediaUpdated(w http.ResponseWriter, r *http.Request) {
 		h.scanner.ScanLibraryAsync("")
 	}
 	httpx.NoContent(w)
+}
+
+func (h *Handler) handleScannerProgress(w http.ResponseWriter, r *http.Request) {
+	if h.scanner == nil {
+		httpx.JSON(w, http.StatusOK, scanner.ScanProgressSnapshot{
+			Running:   false,
+			Phase:     "idle",
+			UpdatedAt: time.Now(),
+		})
+		return
+	}
+	httpx.JSON(w, http.StatusOK, h.scanner.Progress())
 }
 
 func passthrough(next http.Handler) http.Handler { return next }
