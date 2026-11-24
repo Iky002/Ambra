@@ -393,6 +393,8 @@ export class PgsCanvasRenderer {
   private ctx: CanvasRenderingContext2D | null
   private displaySets: PgsDisplaySet[] = []
   private lastRenderedIndex = -2
+  private timeOffset = 0
+  private lastTimeSec: number | null = null
   private offscreenCanvas: HTMLCanvasElement
   private offscreenCtx: CanvasRenderingContext2D | null
   private abortController: AbortController | null = null
@@ -402,6 +404,19 @@ export class PgsCanvasRenderer {
     this.ctx = canvas.getContext('2d')
     this.offscreenCanvas = document.createElement('canvas')
     this.offscreenCtx = this.offscreenCanvas.getContext('2d')
+  }
+
+  /**
+   * 动态调整 PGS 字幕时间轴偏移（秒），并按当前时间点立即重绘
+   */
+  setTimeOffset(seconds: number): void {
+    const next = Number.isFinite(seconds) ? seconds : 0
+    if (next === this.timeOffset) return
+    this.timeOffset = next
+    this.lastRenderedIndex = -2
+    if (this.lastTimeSec !== null) {
+      this.renderAtTime(this.lastTimeSec)
+    }
   }
 
   async loadFromUrl(url: string): Promise<number> {
@@ -419,18 +434,20 @@ export class PgsCanvasRenderer {
   }
 
   /**
-   * 二分查找当前时间点生效的 PGS DisplaySet 并绘制到 Canvas
+   * 二分查找当前时间点（叠加时间轴偏移）生效的 PGS DisplaySet 并绘制到 Canvas
    */
   renderAtTime(currentTimeSec: number): void {
+    this.lastTimeSec = currentTimeSec
     if (!this.ctx || this.displaySets.length === 0) return
 
+    const effectiveTime = currentTimeSec + this.timeOffset
     let lo = 0
     let hi = this.displaySets.length - 1
     let idx = -1
 
     while (lo <= hi) {
       const mid = (lo + hi) >>> 1
-      if (this.displaySets[mid].pts <= currentTimeSec) {
+      if (this.displaySets[mid].pts <= effectiveTime) {
         idx = mid
         lo = mid + 1
       } else {
@@ -486,6 +503,7 @@ export class PgsCanvasRenderer {
     this.cancel()
     this.displaySets = []
     this.lastRenderedIndex = -2
+    this.lastTimeSec = null
     this.clear()
   }
 }

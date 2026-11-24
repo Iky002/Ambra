@@ -19,10 +19,12 @@ import (
 	"github.com/ambra-media/ambra/internal/api/handlers/compatmedia"
 	"github.com/ambra-media/ambra/internal/api/handlers/dlna"
 	"github.com/ambra-media/ambra/internal/api/handlers/environment"
+	govhandler "github.com/ambra-media/ambra/internal/api/handlers/governance"
 	"github.com/ambra-media/ambra/internal/api/handlers/hls"
 	"github.com/ambra-media/ambra/internal/api/handlers/library"
 	"github.com/ambra-media/ambra/internal/api/handlers/livetv"
 	"github.com/ambra-media/ambra/internal/api/handlers/logs"
+	migrationhandler "github.com/ambra-media/ambra/internal/api/handlers/migration"
 	"github.com/ambra-media/ambra/internal/api/handlers/notifications"
 	"github.com/ambra-media/ambra/internal/api/handlers/ops"
 	"github.com/ambra-media/ambra/internal/api/handlers/pluginadmin"
@@ -35,8 +37,11 @@ import (
 	"github.com/ambra-media/ambra/internal/api/ws"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/auth"
+	"github.com/ambra-media/ambra/internal/core/budget"
 	"github.com/ambra-media/ambra/internal/core/dvr"
+	"github.com/ambra-media/ambra/internal/core/governance"
 	"github.com/ambra-media/ambra/internal/core/imaging"
+	"github.com/ambra-media/ambra/internal/core/migration"
 	"github.com/ambra-media/ambra/internal/core/playback"
 	"github.com/ambra-media/ambra/internal/core/rankings"
 	"github.com/ambra-media/ambra/internal/core/scanner"
@@ -44,6 +49,7 @@ import (
 	"github.com/ambra-media/ambra/internal/core/session"
 	"github.com/ambra-media/ambra/internal/core/ssdp"
 	"github.com/ambra-media/ambra/internal/core/transcode"
+	"github.com/ambra-media/ambra/internal/core/watcher"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/plugins/ext"
@@ -65,8 +71,12 @@ type Server struct {
 	Auth         *auth.Service
 	Sessions     *session.Manager
 	Scanner      *scanner.Scanner
+	Watcher      *watcher.Watcher
+	Budget       *budget.Pool
 	Scheduler    *scheduler.Manager
 	Rankings     *rankings.Service
+	Migrator     *migration.Migrator
+	Governance   *governance.Service
 	Playback     *playback.Engine
 	Transcode    *transcode.Manager
 	DVR          *dvr.Recorder
@@ -112,7 +122,21 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	authMW := middleware.NewAuth(authSvc, sessionMgr)
 	wsHub := ws.NewHub(authSvc, sessionMgr, bus)
 
+	bgBudget := budget.Global()
 	sc := scanner.New(libRepo, registry, bus, cfg)
+	sc.SetBudget(bgBudget)
+	libWatcher, _ := watcher.New(func(c context.Context, libraryID string, paths []string) {
+		for _, p := range paths {
+			_, _ = sc.ScanPath(c, libraryID, p)
+		}
+	})
+	if libWatcher != nil {
+		if libs, err := libRepo.ListLibraries(ctx); err == nil {
+			for _, l := range libs {
+				_ = libWatcher.WatchLibrary(l.ID, l.Paths)
+			}
+		}
+	}
 	rankingsSvc := rankings.New(store, bus, rankings.Options{})
 	_ = rankingsSvc.LoadCache(ctx)
 	pb := playback.New(libRepo, registry, cfg)
@@ -251,7 +275,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		UserIDFromCtx: userIDFromCtx,
 	})
 
-	// Phase 6: DLNA UPnP MediaServer & Rankings Sync API
+	// Phase 6: DLNA UPnP MediaServer, Rankings, Migration & Governance Admin APIs
 	dlna.New(cfg, libRepo, store).RegisterRoutes(mediaMux, dlna.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
@@ -260,6 +284,26 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	rankings.NewHandler(rankingsSvc).RegisterRoutes(mediaMux, rankings.AuthFuncs{
 		RequireAuth:  authMW.RequireAuth,
 		RequireAdmin: authMW.RequireAdmin,
+	})
+	migrator := migration.NewMigrator(store, userRepo)
+	migrationhandler.New(migrator).RegisterRoutes(mediaMux, migrationhandler.AuthFuncs{
+		RequireAuth:  authMW.RequireAuth,
+		RequireAdmin: authMW.RequireAdmin,
+	})
+	govSvc, err := governance.NewService(governance.Options{
+		Store:      store,
+		Config:     cfg,
+		Scheduler:  taskMgr,
+		BudgetPool: bgBudget,
+	})
+	if err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("init governance service: %w", err)
+	}
+	govhandler.New(govSvc).RegisterRoutes(mediaMux, govhandler.AuthFuncs{
+		RequireAuth:   authMW.RequireAuth,
+		RequireAdmin:  authMW.RequireAdmin,
+		UserIDFromCtx: userIDFromCtx,
 	})
 
 	// Emby 4.10.2.0 full 582-route compatibility routers (zero ServeMux conflicts)
@@ -286,6 +330,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 
 	r := chi.NewRouter()
 	r.Use(middleware.CORS)
+	r.Use(middleware.Gzip)
 	r.Use(middleware.EmbyPrefixAndCase)
 	r.Use(authMW.ParseAuth)
 
@@ -328,8 +373,12 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		Auth:         authSvc,
 		Sessions:     sessionMgr,
 		Scanner:      sc,
+		Watcher:      libWatcher,
+		Budget:       bgBudget,
 		Scheduler:    taskMgr,
 		Rankings:     rankingsSvc,
+		Migrator:     migrator,
+		Governance:   govSvc,
 		Playback:     pb,
 		Transcode:    transcodeMgr,
 		DVR:          dvrRec,
@@ -341,6 +390,9 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 }
 
 func (s *Server) Close() error {
+	if s.Watcher != nil {
+		_ = s.Watcher.Close()
+	}
 	if s.DVR != nil {
 		_ = s.DVR.Close()
 	}

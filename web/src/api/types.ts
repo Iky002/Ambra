@@ -200,6 +200,13 @@ export interface BaseItemDto {
   LocationType?: string
 }
 
+export interface MediaAttachmentInfo {
+  Index: number
+  FileName: string
+  MimeType: string
+  Url: string
+}
+
 export interface PlaybackInfoResponse {
   MediaSources: MediaSourceInfo[]
   PlaySessionId: string

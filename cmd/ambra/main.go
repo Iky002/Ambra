@@ -52,6 +52,9 @@ func main() {
 	if srv.Rankings != nil {
 		srv.Rankings.StartPeriodicSync(ctx, rankings.DefaultSyncInterval)
 	}
+	if srv.Watcher != nil {
+		go func() { _ = srv.Watcher.Start(ctx) }()
+	}
 
 	httpSrv := &http.Server{
 		Addr:              cfg.HTTPAddr,
