@@ -10,6 +10,7 @@ import {
   Terminal,
 } from 'lucide-react'
 import { api } from '../../api/client'
+import type { ScheduledTaskInfo, ServerLogFile } from '../../api/types'
 import { FeedbackBanner, formatBytes, formatDateTime } from './adminUtils'
 
 export function TasksLogsTab() {
@@ -21,7 +22,7 @@ export function TasksLogsTab() {
   const [logFilter, setLogFilter] = useState('')
 
   const {
-    data: tasks = [],
+    data: rawTasks,
     isLoading: tasksLoading,
     isFetching: tasksFetching,
     refetch: refetchTasks,
@@ -30,8 +31,10 @@ export function TasksLogsTab() {
     queryFn: () => api.getScheduledTasks(),
   })
 
+  const tasks: ScheduledTaskInfo[] = Array.isArray(rawTasks) ? rawTasks : []
+
   const {
-    data: logFiles = [],
+    data: rawLogFiles,
     isLoading: logsLoading,
     isFetching: logsFetching,
     refetch: refetchLogs,
@@ -39,6 +42,12 @@ export function TasksLogsTab() {
     queryKey: ['admin', 'serverLogs'],
     queryFn: () => api.getServerLogs(),
   })
+
+  const logFiles: ServerLogFile[] = Array.isArray(rawLogFiles)
+    ? rawLogFiles
+    : rawLogFiles && Array.isArray((rawLogFiles as { Items?: unknown }).Items)
+      ? (rawLogFiles as { Items: ServerLogFile[] }).Items
+      : []
 
   const {
     data: logContent,

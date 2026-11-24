@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	defaultBaseURL      = "https://api.themoviedb.org/3"
-	defaultImageBaseURL = "https://image.tmdb.org/t/p/original"
+	defaultBaseURL             = "https://api.themoviedb.org/3"
+	defaultImageBaseURL        = "https://image.tmdb.org/t/p/original"
+	defaultProfileImageBaseURL = "https://image.tmdb.org/t/p/w185"
 )
 
 // Provider implements plugins.MetadataProvider using TMDB v3 REST API.
@@ -88,6 +89,8 @@ func (p *Provider) FetchMetadata(ctx context.Context, q plugins.MediaQuery) (*pl
 	switch strings.ToLower(q.ItemType) {
 	case "series":
 		return p.fetchSeries(ctx, q, lang)
+	case "season":
+		return p.fetchSeason(ctx, q, lang)
 	case "episode":
 		return p.fetchEpisode(ctx, q, lang)
 	default:
@@ -95,11 +98,35 @@ func (p *Provider) FetchMetadata(ctx context.Context, q plugins.MediaQuery) (*pl
 	}
 }
 
-func (p *Provider) fetchMovie(ctx context.Context, q plugins.MediaQuery, lang string) (*plugins.MetadataResult, error) {
-	tmdbID := ""
-	if q.ProviderIDs != nil {
-		tmdbID = q.ProviderIDs["tmdb"]
+func providerID(ids map[string]string, key string) string {
+	if len(ids) == 0 {
+		return ""
 	}
+	if v := strings.TrimSpace(ids[key]); v != "" {
+		return v
+	}
+	for k, v := range ids {
+		if strings.EqualFold(k, key) {
+			if tv := strings.TrimSpace(v); tv != "" {
+				return tv
+			}
+		}
+	}
+	return ""
+}
+
+func (p *Provider) profileImageURL(profilePath string) string {
+	if profilePath == "" {
+		return ""
+	}
+	if p.imageBaseURL == defaultImageBaseURL {
+		return defaultProfileImageBaseURL + profilePath
+	}
+	return p.imageBaseURL + profilePath
+}
+
+func (p *Provider) fetchMovie(ctx context.Context, q plugins.MediaQuery, lang string) (*plugins.MetadataResult, error) {
+	tmdbID := providerID(q.ProviderIDs, "tmdb")
 	if tmdbID == "" {
 		if q.Title == "" {
 			return nil, nil
@@ -148,12 +175,14 @@ func (p *Provider) fetchMovie(ctx context.Context, q plugins.MediaQuery, lang st
 		} `json:"production_companies"`
 		Credits struct {
 			Cast []struct {
-				Name      string `json:"name"`
-				Character string `json:"character"`
+				Name        string `json:"name"`
+				Character   string `json:"character"`
+				ProfilePath string `json:"profile_path"`
 			} `json:"cast"`
 			Crew []struct {
-				Name string `json:"name"`
-				Job  string `json:"job"`
+				Name        string `json:"name"`
+				Job         string `json:"job"`
+				ProfilePath string `json:"profile_path"`
 			} `json:"crew"`
 		} `json:"credits"`
 		ExternalIDs struct {
@@ -195,25 +224,35 @@ func (p *Provider) fetchMovie(ctx context.Context, q plugins.MediaQuery, lang st
 	}
 	for _, c := range detail.Credits.Crew {
 		if c.Job == "Director" {
-			res.People = append(res.People, plugins.PersonCredit{Name: c.Name, Type: "Director"})
+			res.People = append(res.People, plugins.PersonCredit{
+				Name:     c.Name,
+				Type:     "Director",
+				ImageURL: p.profileImageURL(c.ProfilePath),
+			})
 		} else if c.Job == "Writer" || c.Job == "Screenplay" {
-			res.People = append(res.People, plugins.PersonCredit{Name: c.Name, Type: "Writer"})
+			res.People = append(res.People, plugins.PersonCredit{
+				Name:     c.Name,
+				Type:     "Writer",
+				ImageURL: p.profileImageURL(c.ProfilePath),
+			})
 		}
 	}
 	for i, c := range detail.Credits.Cast {
 		if i >= 15 {
 			break
 		}
-		res.People = append(res.People, plugins.PersonCredit{Name: c.Name, Role: c.Character, Type: "Actor"})
+		res.People = append(res.People, plugins.PersonCredit{
+			Name:     c.Name,
+			Role:     c.Character,
+			Type:     "Actor",
+			ImageURL: p.profileImageURL(c.ProfilePath),
+		})
 	}
 	return res, nil
 }
 
 func (p *Provider) fetchSeries(ctx context.Context, q plugins.MediaQuery, lang string) (*plugins.MetadataResult, error) {
-	tmdbID := ""
-	if q.ProviderIDs != nil {
-		tmdbID = q.ProviderIDs["tmdb"]
-	}
+	tmdbID := providerID(q.ProviderIDs, "tmdb")
 	if tmdbID == "" {
 		if q.Title == "" {
 			return nil, nil
@@ -262,9 +301,15 @@ func (p *Provider) fetchSeries(ctx context.Context, q plugins.MediaQuery, lang s
 		} `json:"networks"`
 		Credits struct {
 			Cast []struct {
-				Name      string `json:"name"`
-				Character string `json:"character"`
+				Name        string `json:"name"`
+				Character   string `json:"character"`
+				ProfilePath string `json:"profile_path"`
 			} `json:"cast"`
+			Crew []struct {
+				Name        string `json:"name"`
+				Job         string `json:"job"`
+				ProfilePath string `json:"profile_path"`
+			} `json:"crew"`
 		} `json:"credits"`
 		ExternalIDs struct {
 			IMDbID string `json:"imdb_id"`
@@ -307,24 +352,80 @@ func (p *Provider) fetchSeries(ctx context.Context, q plugins.MediaQuery, lang s
 	for _, n := range detail.Networks {
 		res.Studios = append(res.Studios, n.Name)
 	}
+	for _, c := range detail.Credits.Crew {
+		if c.Job == "Director" {
+			res.People = append(res.People, plugins.PersonCredit{
+				Name:     c.Name,
+				Type:     "Director",
+				ImageURL: p.profileImageURL(c.ProfilePath),
+			})
+		} else if c.Job == "Writer" || c.Job == "Screenplay" {
+			res.People = append(res.People, plugins.PersonCredit{
+				Name:     c.Name,
+				Type:     "Writer",
+				ImageURL: p.profileImageURL(c.ProfilePath),
+			})
+		}
+	}
 	for i, c := range detail.Credits.Cast {
 		if i >= 15 {
 			break
 		}
-		res.People = append(res.People, plugins.PersonCredit{Name: c.Name, Role: c.Character, Type: "Actor"})
+		res.People = append(res.People, plugins.PersonCredit{
+			Name:     c.Name,
+			Role:     c.Character,
+			Type:     "Actor",
+			ImageURL: p.profileImageURL(c.ProfilePath),
+		})
 	}
 	return res, nil
 }
 
-func (p *Provider) fetchEpisode(ctx context.Context, q plugins.MediaQuery, lang string) (*plugins.MetadataResult, error) {
-	if q.ProviderIDs == nil || q.ProviderIDs["tmdb"] == "" || q.EpisodeNumber <= 0 {
+func (p *Provider) fetchSeason(ctx context.Context, q plugins.MediaQuery, lang string) (*plugins.MetadataResult, error) {
+	tmdbID := providerID(q.ProviderIDs, "tmdb")
+	if tmdbID == "" || q.SeasonNumber < 0 {
 		return nil, nil
 	}
 	params := url.Values{}
 	params.Set("api_key", p.apiKey)
 	params.Set("language", lang)
 
-	endpoint := fmt.Sprintf("/tv/%s/season/%d/episode/%d", q.ProviderIDs["tmdb"], q.SeasonNumber, q.EpisodeNumber)
+	endpoint := fmt.Sprintf("/tv/%s/season/%d", tmdbID, q.SeasonNumber)
+	var season struct {
+		Name       string `json:"name"`
+		Overview   string `json:"overview"`
+		AirDate    string `json:"air_date"`
+		PosterPath string `json:"poster_path"`
+	}
+	if err := p.getJSON(ctx, endpoint, params, &season); err != nil {
+		return nil, err
+	}
+	res := &plugins.MetadataResult{
+		Name:         season.Name,
+		Overview:     season.Overview,
+		PremiereDate: season.AirDate,
+	}
+	if len(season.AirDate) >= 4 {
+		if y, err := strconv.Atoi(season.AirDate[:4]); err == nil {
+			res.Year = y
+		}
+	}
+	if season.PosterPath != "" {
+		res.PosterURL = p.imageBaseURL + season.PosterPath
+	}
+	return res, nil
+}
+
+func (p *Provider) fetchEpisode(ctx context.Context, q plugins.MediaQuery, lang string) (*plugins.MetadataResult, error) {
+	tmdbID := providerID(q.ProviderIDs, "tmdb")
+	if tmdbID == "" || q.EpisodeNumber <= 0 {
+		return nil, nil
+	}
+	params := url.Values{}
+	params.Set("api_key", p.apiKey)
+	params.Set("language", lang)
+
+	endpoint := fmt.Sprintf("/tv/%s/season/%d/episode/%d", tmdbID, q.SeasonNumber, q.EpisodeNumber)
 	var ep struct {
 		Name        string  `json:"name"`
 		Overview    string  `json:"overview"`

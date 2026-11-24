@@ -21,6 +21,7 @@ const (
 	defaultCleanupTick   = 15 * time.Second
 	defaultSeekThreshold = 3
 	defaultPollInterval  = 50 * time.Millisecond
+	defaultHTTPUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
 // SessionParams holds all parameters required to run a dynamic HLS FFmpeg transcode session.
@@ -95,6 +96,17 @@ func BuildFFmpegArgs(params SessionParams, startSeg int, outDir string, caps *HW
 	// Fast input seek when starting from a non-zero segment
 	if startSec > 0 {
 		args = append(args, "-ss", strconv.Itoa(startSec))
+	}
+
+	// Resilient HTTP(S) input flags for remote STRM / Alist / cloud drive URLs
+	if isHTTPInput(params.InputPath) {
+		args = append(args,
+			"-reconnect", "1",
+			"-reconnect_streamed", "1",
+			"-reconnect_delay_max", "5",
+			"-rw_timeout", "15000000",
+			"-user_agent", defaultHTTPUserAgent,
+		)
 	}
 
 	args = append(args, "-i", params.InputPath)
@@ -451,7 +463,7 @@ type transcodeSession struct {
 	cancel     context.CancelFunc
 	doneCh     chan struct{}
 	lastErr    error
-	stderrBuf  bytes.Buffer
+	stderrBuf  *bytes.Buffer
 	startSeg   int
 	running    bool
 	lastAccess time.Time
@@ -568,7 +580,10 @@ func (s *transcodeSession) getSegment(ctx context.Context, segIndex int, getCaps
 				return targetPath, nil
 			}
 			s.mu.Lock()
-			errMsg := strings.TrimSpace(s.stderrBuf.String())
+			var errMsg string
+			if s.stderrBuf != nil {
+				errMsg = strings.TrimSpace(s.stderrBuf.String())
+			}
 			procErr := s.lastErr
 			s.mu.Unlock()
 			if procErr != nil {
@@ -598,8 +613,8 @@ func (s *transcodeSession) startProcessLocked(startSeg int, caps *HWCapabilities
 	procCtx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(procCtx, s.ffmpegPath, args...)
 
-	s.stderrBuf.Reset()
-	cmd.Stderr = &s.stderrBuf
+	stderrBuf := &bytes.Buffer{}
+	cmd.Stderr = stderrBuf
 
 	if err := cmd.Start(); err != nil {
 		cancel()
@@ -610,6 +625,7 @@ func (s *transcodeSession) startProcessLocked(startSeg int, caps *HWCapabilities
 	s.cmd = cmd
 	s.cancel = cancel
 	s.doneCh = doneCh
+	s.stderrBuf = stderrBuf
 	s.startSeg = startSeg
 	s.running = true
 	s.lastErr = nil
@@ -659,6 +675,11 @@ func (s *transcodeSession) destroy() {
 	if workDir != "" {
 		_ = os.RemoveAll(workDir)
 	}
+}
+
+func isHTTPInput(inputPath string) bool {
+	lower := strings.ToLower(strings.TrimSpace(inputPath))
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
 }
 
 func fileReady(path string) bool {

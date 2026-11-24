@@ -552,9 +552,10 @@ func readFirstLineURL(strmPath string) string {
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
+		line := strings.TrimPrefix(sc.Text(), "\uFEFF")
+		line = strings.TrimSpace(line)
 		if line != "" && !strings.HasPrefix(line, "#") {
-			return line
+			return strings.ReplaceAll(line, " ", "%20")
 		}
 	}
 	return ""

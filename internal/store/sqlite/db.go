@@ -6,6 +6,7 @@ import (
 	"embed"
 	"fmt"
 	"runtime"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -73,9 +74,59 @@ func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.Writer.ExecContext(ctx, string(sqlBytes)); err != nil {
 		return fmt.Errorf("apply migration 001: %w", err)
 	}
-	_, err = s.Writer.ExecContext(ctx,
+	if _, err := s.Writer.ExecContext(ctx,
 		`INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?)`,
 		time.Now().Unix(),
-	)
-	return err
+	); err != nil {
+		return err
+	}
+
+	var v2 int
+	if err := s.Writer.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 2`).Scan(&v2); err != nil {
+		return err
+	}
+	if v2 == 0 {
+		// Rebuild item_images without foreign key on items(id) so people and taxonomies can also store images.
+		var ddl string
+		_ = s.Writer.QueryRowContext(ctx, `SELECT COALESCE(sql, '') FROM sqlite_master WHERE type = 'table' AND name = 'item_images'`).Scan(&ddl)
+		if ddl != "" && strings.Contains(strings.ToUpper(ddl), "REFERENCES") {
+			tx, err := s.Writer.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			stmts := []string{
+				`CREATE TABLE item_images_new (
+					item_id     TEXT NOT NULL,
+					image_type  TEXT NOT NULL,
+					image_index INTEGER NOT NULL DEFAULT 0,
+					path        TEXT NOT NULL,
+					tag         TEXT NOT NULL,
+					width       INTEGER,
+					height      INTEGER,
+					blurhash    TEXT,
+					PRIMARY KEY (item_id, image_type, image_index)
+				)`,
+				`INSERT OR IGNORE INTO item_images_new (item_id, image_type, image_index, path, tag, width, height, blurhash)
+				 SELECT item_id, image_type, image_index, path, tag, width, height, blurhash FROM item_images`,
+				`DROP TABLE item_images`,
+				`ALTER TABLE item_images_new RENAME TO item_images`,
+			}
+			for _, st := range stmts {
+				if _, err := tx.ExecContext(ctx, st); err != nil {
+					return fmt.Errorf("apply migration 002: %w", err)
+				}
+			}
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+		}
+		if _, err := s.Writer.ExecContext(ctx,
+			`INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (2, ?)`,
+			time.Now().Unix(),
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }

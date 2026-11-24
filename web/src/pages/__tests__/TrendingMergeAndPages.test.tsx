@@ -9,9 +9,11 @@ import { AuthProvider } from '../../context/AuthContext'
 import { setDemoModeOverride } from '../../demo/demoMode'
 import { resetDemoStore } from '../../demo/mockServer'
 import { CollectionsPage } from '../CollectionsPage'
+import { LibraryPage } from '../LibraryPage'
 import { PersonDetailPage } from '../PersonDetailPage'
 import { TrendingPage } from '../TrendingPage'
 import { MetadataTab } from '../admin/MetadataTab'
+import { TasksLogsTab } from '../admin/TasksLogsTab'
 
 function createWrapper(initialEntry = '/') {
   const qc = new QueryClient({
@@ -249,5 +251,51 @@ describe('v0.4 前端核心功能：合并多版本、热门趋势、演职员�
     // 切换到播放列表 Tab
     await user.click(screen.getByRole('button', { name: /播放列表/i }))
     expect(await screen.findByText('暂无播放列表')).toBeInTheDocument()
+  })
+
+  it('TasksLogsTab：getServerLogs 返回 { Items, TotalRecordCount } 对象时正常渲染不黑屏崩溃', async () => {
+    vi.spyOn(api, 'getScheduledTasks').mockResolvedValueOnce([
+      {
+        Id: 'task-1',
+        Name: '扫描媒体库',
+        State: 'Idle',
+        Category: '媒体库',
+      },
+    ])
+    vi.spyOn(api, 'getServerLogs').mockResolvedValueOnce({
+      Items: [
+        {
+          Name: 'ambra-server-2026.log',
+          Size: 2048,
+          DateModified: '2026-11-24T10:00:00Z',
+        },
+      ],
+      TotalRecordCount: 1,
+    } as unknown as Awaited<ReturnType<typeof api.getServerLogs>>)
+
+    const Wrapper = createWrapper('/admin/tasks')
+    render(
+      <Wrapper>
+        <TasksLogsTab />
+      </Wrapper>,
+    )
+
+    expect(await screen.findByText('扫描媒体库')).toBeInTheDocument()
+    expect(await screen.findByText('ambra-server-2026.log')).toBeInTheDocument()
+    expect(screen.getByText('日志文件 (1)')).toBeInTheDocument()
+  })
+
+  it('LibraryPage：不再展示手动「合并多版本」切换按钮', async () => {
+    const Wrapper = createWrapper('/library/lib-movies')
+    render(
+      <Wrapper>
+        <Routes>
+          <Route path="/library/:id" element={<LibraryPage />} />
+        </Routes>
+      </Wrapper>,
+    )
+
+    expect(await screen.findByText('沙丘 2')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /合并多版本/ })).not.toBeInTheDocument()
   })
 })

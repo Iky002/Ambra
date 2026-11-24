@@ -638,7 +638,14 @@ export const api = {
       method: 'POST',
     }),
 
-  getServerLogs: () => embyFetch<ServerLogFile[]>('/emby/System/Logs/Query'),
+  getServerLogs: async (): Promise<ServerLogFile[]> => {
+    const res = await embyFetch<ServerLogFile[] | QueryResult<ServerLogFile>>(
+      '/emby/System/Logs/Query',
+    )
+    if (Array.isArray(res)) return res
+    if (res && Array.isArray(res.Items)) return res.Items
+    return []
+  },
 
   getServerLogContent: (name: string) =>
     embyFetch<string>(`/emby/System/Logs/${encodeURIComponent(name)}`, {

@@ -320,4 +320,26 @@ describe('api/client - 管理控制台全部 API 方法', () => {
       'POST /emby/System/Rankings/Refresh',
     ])
   })
+
+  it('getServerLogs 兼容 { Items, TotalRecordCount } 分页对象与裸数组两种响应格式', async () => {
+    const sampleLogs = [
+      {
+        Name: 'ambra-2026-11-24.log',
+        Size: 4096,
+        DateCreated: '2026-11-24T08:00:00Z',
+        DateModified: '2026-11-24T09:00:00Z',
+      },
+    ]
+
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(
+        mockJsonResponse({ Items: sampleLogs, TotalRecordCount: sampleLogs.length }),
+      )
+      .mockResolvedValueOnce(mockJsonResponse(sampleLogs))
+      .mockResolvedValueOnce(mockJsonResponse({}))
+
+    await expect(api.getServerLogs()).resolves.toEqual(sampleLogs)
+    await expect(api.getServerLogs()).resolves.toEqual(sampleLogs)
+    await expect(api.getServerLogs()).resolves.toEqual([])
+  })
 })

@@ -50,9 +50,10 @@ type MediaQuery struct {
 }
 
 type PersonCredit struct {
-	Name string
-	Role string
-	Type string // Actor / Director / Writer
+	Name     string
+	Role     string
+	Type     string // Actor / Director / Writer
+	ImageURL string
 }
 
 type MetadataResult struct {

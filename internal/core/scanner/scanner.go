@@ -50,6 +50,8 @@ type Scanner struct {
 	pauseMu  sync.Mutex
 	paused   bool
 	resumeCh chan struct{}
+
+	mergeMu sync.Mutex
 }
 
 func New(repo *sqlite.LibraryRepo, registry *plugins.Registry, bus *eventbus.Bus, cfg *config.Config) *Scanner {
@@ -387,12 +389,42 @@ func (s *Scanner) indexEpisode(
 									Title:       seriesRec.Name,
 									Year:        sYear,
 									Path:        seriesRec.Path,
-									ProviderIDs: seriesRec.Extra.ProviderIDs,
+									ProviderIDs: cloneStringMap(seriesRec.Extra.ProviderIDs),
 									Language:    s.language(),
 								},
 								NeedOnlineMeta: true,
 								HasLocalTitle:  false,
 								DisplayName:    seriesRec.Name,
+							})
+						}
+					}
+				}
+				if existing.SeasonID != "" {
+					if _, dup := seenSeriesEnrich[existing.SeasonID]; !dup && s.isMissingPrimaryImage(ctx, existing.SeasonID) {
+						if seasonRec, sErr := s.repo.GetItemRecordByID(ctx, existing.SeasonID); sErr == nil && seasonRec != nil {
+							seenSeriesEnrich[existing.SeasonID] = struct{}{}
+							var sNum int
+							if seasonRec.IndexNumber != nil {
+								sNum = *seasonRec.IndexNumber
+							} else if existing.ParentIndexNumber != nil {
+								sNum = *existing.ParentIndexNumber
+							}
+							backfillTasks = append(backfillTasks, enrichTask{
+								ItemID:         seasonRec.ID,
+								LibraryID:      lib.ID,
+								ItemType:       "Season",
+								ParentSeriesID: existing.SeriesID,
+								MediaPath:      seasonRec.Path,
+								Query: plugins.MediaQuery{
+									ItemType:     "Season",
+									Title:        seasonRec.Name,
+									SeasonNumber: sNum,
+									Path:         seasonRec.Path,
+									Language:     s.language(),
+								},
+								NeedOnlineMeta: true,
+								HasLocalTitle:  false,
+								DisplayName:    seasonRec.Name,
 							})
 						}
 					}
@@ -406,21 +438,22 @@ func (s *Scanner) indexEpisode(
 						seasonNum = *existing.ParentIndexNumber
 					}
 					backfillTasks = append(backfillTasks, enrichTask{
-						ItemID:    existing.ID,
-						LibraryID: lib.ID,
-						ItemType:  "Episode",
-						MediaPath: mediaPath,
-						Size:      size,
-						Mtime:     mtime,
-						IsStrm:    isStrm,
-						Container: container,
+						ItemID:         existing.ID,
+						LibraryID:      lib.ID,
+						ItemType:       "Episode",
+						ParentSeriesID: existing.SeriesID,
+						MediaPath:      mediaPath,
+						Size:           size,
+						Mtime:          mtime,
+						IsStrm:         isStrm,
+						Container:      container,
 						Query: plugins.MediaQuery{
 							ItemType:      "Episode",
 							Title:         existing.Name,
 							SeasonNumber:  seasonNum,
 							EpisodeNumber: epNum,
 							Path:          mediaPath,
-							ProviderIDs:   existing.Extra.ProviderIDs,
+							ProviderIDs:   cloneStringMap(existing.Extra.ProviderIDs),
 							Language:      s.language(),
 						},
 						NeedProbe:      false,
@@ -471,9 +504,12 @@ func (s *Scanner) indexEpisode(
 	}
 
 	// 2. Ensure Season
-	seasonRec, err := s.ensureSeason(ctx, lib, seriesRec, epInfo, seasonCache)
+	seasonRec, seasonTask, err := s.ensureSeason(ctx, lib, seriesRec, epInfo, seasonCache, seenSeriesEnrich)
 	if err != nil {
 		return false, nil, err
+	}
+	if seasonTask != nil {
+		tasks = append(tasks, *seasonTask)
 	}
 
 	// Auto-merge into existing episode if same Series + SeasonNumber + EpisodeNumber already exists.
@@ -508,7 +544,7 @@ func (s *Scanner) indexEpisode(
 		SeasonNumber:  epInfo.SeasonNumber,
 		EpisodeNumber: epInfo.EpisodeNumber,
 		Path:          mediaPath,
-		ProviderIDs:   seriesRec.Extra.ProviderIDs,
+		ProviderIDs:   cloneStringMap(seriesRec.Extra.ProviderIDs),
 		Language:      s.language(),
 	}
 	meta := s.fetchMetadataFiltered(ctx, query, true)
@@ -581,6 +617,7 @@ func (s *Scanner) indexEpisode(
 			ItemID:         rec.ID,
 			LibraryID:      lib.ID,
 			ItemType:       "Episode",
+			ParentSeriesID: seriesRec.ID,
 			MediaPath:      mediaPath,
 			Size:           size,
 			Mtime:          mtime,
@@ -729,14 +766,25 @@ func (s *Scanner) ensureSeries(
 	return rec, task, nil
 }
 
-func (s *Scanner) ensureSeason(ctx context.Context, lib *sqlite.LibraryRecord, series *sqlite.ItemRecord, epInfo ParsedEpisode, cache map[string]*sqlite.ItemRecord) (*sqlite.ItemRecord, error) {
+func (s *Scanner) ensureSeason(
+	ctx context.Context,
+	lib *sqlite.LibraryRecord,
+	series *sqlite.ItemRecord,
+	epInfo ParsedEpisode,
+	cache map[string]*sqlite.ItemRecord,
+	seenEnrich map[string]struct{},
+) (*sqlite.ItemRecord, *enrichTask, error) {
 	key := fmt.Sprintf("%s#%d", series.ID, epInfo.SeasonNumber)
 	if rec, ok := cache[key]; ok {
-		return rec, nil
+		return rec, nil, nil
 	}
 	if existingByNum, err := s.repo.FindSeasonByNumber(ctx, series.ID, epInfo.SeasonNumber); err == nil && existingByNum != nil {
 		cache[key] = existingByNum
-		return existingByNum, nil
+		var task *enrichTask
+		if s.hasOnlineMetadataProviders() && s.isMissingPrimaryImage(ctx, existingByNum.ID) {
+			task = s.maybeBuildSeasonEnrichTask(lib.ID, series, existingByNum, epInfo.SeasonNumber, seenEnrich)
+		}
+		return existingByNum, task, nil
 	}
 	seasonPath := epInfo.SeasonDir
 	if seasonPath == "" {
@@ -746,10 +794,14 @@ func (s *Scanner) ensureSeason(ctx context.Context, lib *sqlite.LibraryRecord, s
 	existing, err := s.repo.FindItemByPath(ctx, lib.ID, seasonPath)
 	if err == nil && existing != nil {
 		cache[key] = existing
-		return existing, nil
+		var task *enrichTask
+		if s.hasOnlineMetadataProviders() && s.isMissingPrimaryImage(ctx, existing.ID) {
+			task = s.maybeBuildSeasonEnrichTask(lib.ID, series, existing, epInfo.SeasonNumber, seenEnrich)
+		}
+		return existing, task, nil
 	}
 	if err != nil && !errors.Is(err, sqlite.ErrNotFound) {
-		return nil, err
+		return nil, nil, err
 	}
 
 	sn := epInfo.SeasonNumber
@@ -771,13 +823,13 @@ func (s *Scanner) ensureSeason(ctx context.Context, lib *sqlite.LibraryRecord, s
 		},
 	}
 	if err := s.repo.UpsertItem(ctx, rec); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := s.repo.ReplaceItemAncestors(ctx, rec.ID, []sqlite.AncestorLink{
 		{AncestorID: series.ID, Depth: 1},
 		{AncestorID: lib.ID, Depth: 2},
 	}); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if epInfo.SeasonDir != "" {
 		imgs := discoverLocalImages(rec.ID, "", epInfo.SeasonDir, false)
@@ -786,7 +838,42 @@ func (s *Scanner) ensureSeason(ctx context.Context, lib *sqlite.LibraryRecord, s
 		}
 	}
 	cache[key] = rec
-	return rec, nil
+
+	var task *enrichTask
+	if s.hasOnlineMetadataProviders() {
+		task = s.maybeBuildSeasonEnrichTask(lib.ID, series, rec, epInfo.SeasonNumber, seenEnrich)
+	}
+	return rec, task, nil
+}
+
+func (s *Scanner) maybeBuildSeasonEnrichTask(
+	libraryID string,
+	series, season *sqlite.ItemRecord,
+	seasonNum int,
+	seenEnrich map[string]struct{},
+) *enrichTask {
+	if _, dup := seenEnrich[season.ID]; dup {
+		return nil
+	}
+	seenEnrich[season.ID] = struct{}{}
+	return &enrichTask{
+		ItemID:         season.ID,
+		LibraryID:      libraryID,
+		ItemType:       "Season",
+		ParentSeriesID: series.ID,
+		MediaPath:      season.Path,
+		Query: plugins.MediaQuery{
+			ItemType:     "Season",
+			Title:        season.Name,
+			SeasonNumber: seasonNum,
+			Path:         season.Path,
+			ProviderIDs:  cloneStringMap(series.Extra.ProviderIDs),
+			Language:     s.language(),
+		},
+		NeedOnlineMeta: true,
+		HasLocalTitle:  false,
+		DisplayName:    season.Name,
+	}
 }
 
 func (s *Scanner) probeMedia(ctx context.Context, mediaPath string, isStrm bool) *ProbeResult {
@@ -1294,6 +1381,7 @@ func (s *Scanner) persistMetaRelationsAndFTS(ctx context.Context, rec *sqlite.It
 		}
 		if len(meta.People) > 0 {
 			pins := make([]sqlite.PersonInput, len(meta.People))
+			hasAnyAvatar := false
 			for i, p := range meta.People {
 				pins[i] = sqlite.PersonInput{
 					Name:      p.Name,
@@ -1302,8 +1390,13 @@ func (s *Scanner) persistMetaRelationsAndFTS(ctx context.Context, rec *sqlite.It
 					SortOrder: i,
 				}
 				peopleNames = append(peopleNames, p.Name)
+				if strings.TrimSpace(p.ImageURL) != "" {
+					hasAnyAvatar = true
+				}
 			}
-			_ = s.repo.ReplaceItemPeople(ctx, rec.ID, pins)
+			if err := s.repo.ReplaceItemPeople(ctx, rec.ID, pins); err == nil && hasAnyAvatar {
+				s.downloadPersonAvatars(ctx, rec.ID, meta.People)
+			}
 		}
 	}
 
@@ -1311,6 +1404,54 @@ func (s *Scanner) persistMetaRelationsAndFTS(ctx context.Context, rec *sqlite.It
 	titleTokens := TokenizeForFTS(rec.Name, rec.OriginalTitle, rec.Extra.SeriesName)
 	peopleTokens := TokenizeForFTS(peopleNames...)
 	_ = s.repo.UpsertSearchFTS(ctx, rec.ID, titleRaw, titleTokens, "", "", peopleTokens)
+}
+
+const maxPersonAvatarsPerItem = 12
+
+func (s *Scanner) downloadPersonAvatars(ctx context.Context, itemID string, credits []plugins.PersonCredit) {
+	persisted, err := s.repo.GetPeopleByItemID(ctx, itemID)
+	if err != nil || len(persisted) == 0 {
+		return
+	}
+	nameToID := make(map[string]string, len(persisted))
+	for _, p := range persisted {
+		key := strings.ToLower(strings.TrimSpace(p.Name))
+		if key != "" && p.Id != "" {
+			nameToID[key] = p.Id
+		}
+	}
+	seenPerson := make(map[string]struct{}, maxPersonAvatarsPerItem)
+	processed := 0
+	for _, c := range credits {
+		if processed >= maxPersonAvatarsPerItem {
+			break
+		}
+		imgURL := strings.TrimSpace(c.ImageURL)
+		if imgURL == "" {
+			continue
+		}
+		personID := nameToID[strings.ToLower(strings.TrimSpace(c.Name))]
+		if personID == "" {
+			continue
+		}
+		if _, dup := seenPerson[personID]; dup {
+			continue
+		}
+		seenPerson[personID] = struct{}{}
+		processed++
+		s.downloadAndSaveRemoteImage(ctx, personID, "Primary", imgURL)
+	}
+}
+
+func cloneStringMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 func (s *Scanner) language() string {
