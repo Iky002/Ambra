@@ -91,6 +91,25 @@ func (s *Scanner) ScanLibraryAsync(libraryID string) {
 	}()
 }
 
+// WaitIdle blocks until no library scan is in progress or ctx is done.
+func (s *Scanner) WaitIdle(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		s.mu.Lock()
+		busy := len(s.scanning) > 0
+		s.mu.Unlock()
+		if !busy {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 // ScanLibrary incrementally scans all root paths of a library.
 func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string) (ScanStats, error) {
 	libraryID = guid.Normalize(libraryID)
