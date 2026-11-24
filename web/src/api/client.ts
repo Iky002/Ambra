@@ -15,6 +15,7 @@ import type {
   FileSystemEntry,
   ItemImageInfo,
   ItemMetadataUpdatePayload,
+  MediaAttachmentInfo,
   NameIdPair,
   PlaybackInfoResponse,
   PluginInfo,
@@ -434,6 +435,15 @@ export const api = {
         body: JSON.stringify(body),
       },
     )
+  },
+
+  getMediaAttachments: (itemId: string, mediaSourceId: string): Promise<MediaAttachmentInfo[]> => {
+    if (isDemoMode() || !itemId || !mediaSourceId) {
+      return Promise.resolve([])
+    }
+    return embyFetch<MediaAttachmentInfo[]>(
+      `/emby/Videos/${encodeURIComponent(itemId)}/${encodeURIComponent(mediaSourceId)}/Attachments`,
+    ).catch(() => [])
   },
 
   reportPlaying: (payload: {

@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/core/budget"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/plugins"
@@ -38,8 +38,15 @@ type Scanner struct {
 	cfg      *config.Config
 	prober   *Prober
 
-	mu       sync.Mutex
-	scanning map[string]bool
+	mu            sync.Mutex
+	budget        *budget.Pool
+	symlinkPolicy SymlinkPolicy
+	scanning      map[string]bool
+	cancels       map[string]context.CancelFunc
+
+	pauseMu  sync.Mutex
+	paused   bool
+	resumeCh chan struct{}
 }
 
 func New(repo *sqlite.LibraryRepo, registry *plugins.Registry, bus *eventbus.Bus, cfg *config.Config) *Scanner {
@@ -48,12 +55,14 @@ func New(repo *sqlite.LibraryRepo, registry *plugins.Registry, bus *eventbus.Bus
 		ffprobePath = cfg.FFprobePath
 	}
 	return &Scanner{
-		repo:     repo,
-		registry: registry,
-		bus:      bus,
-		cfg:      cfg,
-		prober:   NewProber(ffprobePath),
-		scanning: make(map[string]bool),
+		repo:          repo,
+		registry:      registry,
+		bus:           bus,
+		cfg:           cfg,
+		prober:        NewProber(ffprobePath),
+		symlinkPolicy: SymlinkFollowDirect,
+		scanning:      make(map[string]bool),
+		cancels:       make(map[string]context.CancelFunc),
 	}
 }
 
@@ -110,99 +119,16 @@ func (s *Scanner) WaitIdle(ctx context.Context) {
 	}
 }
 
-// ScanLibrary incrementally scans all root paths of a library.
+// ScanLibrary incrementally scans all root paths of a library using the two-phase
+// pipeline (Phase A discovery followed by budget-constrained concurrent Phase B enrichment).
 func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string) (ScanStats, error) {
-	libraryID = guid.Normalize(libraryID)
-	stats := ScanStats{LibraryID: libraryID}
-
-	s.mu.Lock()
-	if s.scanning[libraryID] {
-		s.mu.Unlock()
-		return stats, nil
-	}
-	s.scanning[libraryID] = true
-	s.mu.Unlock()
-	defer func() {
-		s.mu.Lock()
-		delete(s.scanning, libraryID)
-		s.mu.Unlock()
-	}()
-
-	lib, err := s.repo.GetLibrary(ctx, libraryID)
-	if err != nil {
-		return stats, err
-	}
-
-	forceTV := strings.EqualFold(lib.CollectionType, "tvshows")
-	seriesCache := make(map[string]*sqlite.ItemRecord)
-	seasonCache := make(map[string]*sqlite.ItemRecord)
-
-	for _, root := range lib.Paths {
-		root = strings.TrimSpace(root)
-		if root == "" {
-			continue
-		}
-		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				stats.Errors++
-				return nil
-			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-			}
-			if d.IsDir() {
-				if strings.HasPrefix(d.Name(), ".") {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			if strings.HasPrefix(d.Name(), ".") {
-				return nil
-			}
-			if !IsVideoFile(path) && !IsStrmFile(path) {
-				return nil
-			}
-
-			epInfo := ParseEpisodePath(root, path, forceTV)
-			var err error
-			var changed bool
-			if epInfo.IsEpisode {
-				changed, err = s.indexEpisode(ctx, lib, epInfo, path, seriesCache, seasonCache)
-			} else {
-				changed, err = s.indexMovie(ctx, lib, path)
-			}
-			if err != nil {
-				stats.Errors++
-				return nil
-			}
-			if changed {
-				stats.ItemsAdded++
-			} else {
-				stats.ItemsSkipped++
-			}
-			return nil
-		})
-	}
-
-	if s.bus != nil {
-		s.bus.Publish(ctx, eventbus.Event{
-			Type: eventbus.EventLibraryChanged,
-			Payload: map[string]any{
-				"LibraryId":    lib.ID,
-				"ItemsAdded":   stats.ItemsAdded,
-				"ItemsUpdated": stats.ItemsUpdated,
-			},
-		})
-	}
-	return stats, nil
+	return s.scanLibrary(ctx, libraryID, false)
 }
 
-func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, mediaPath string) (bool, error) {
+func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, mediaPath string) (bool, *enrichTask, error) {
 	info, err := os.Stat(mediaPath)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	mtime := info.ModTime().Unix()
 	size := info.Size()
@@ -213,18 +139,35 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 		container = "strm"
 	}
 
+	needProbe := !isStrm && s.prober != nil
+	needOnline := s.hasOnlineMetadataProviders()
+
 	existing, err := s.repo.FindItemByMediaSourcePath(ctx, lib.ID, mediaPath)
 	if err == nil && existing != nil {
 		if s.isMediaSourceUnchanged(ctx, existing, mediaPath, size, mtime) {
-			return false, nil
+			return false, nil, nil
 		}
 		if existing.Path != mediaPath {
-			probeRes := s.probeMedia(ctx, mediaPath, isStrm)
-			ms := s.buildMediaSource(existing, mediaPath, size, mtime, isStrm, container, probeRes)
+			ms := s.buildMediaSource(existing, mediaPath, size, mtime, isStrm, container, nil)
 			if err := s.repo.UpsertMediaSourceAndStreams(ctx, existing.ID, ms); err != nil {
-				return false, err
+				return false, nil, err
 			}
-			return true, nil
+			var task *enrichTask
+			if needProbe {
+				task = &enrichTask{
+					ItemID:           existing.ID,
+					LibraryID:        lib.ID,
+					ItemType:         "Movie",
+					MediaPath:        mediaPath,
+					Size:             size,
+					Mtime:            mtime,
+					IsStrm:           isStrm,
+					Container:        container,
+					NeedProbe:        true,
+					IsAltMediaSource: true,
+				}
+			}
+			return true, task, nil
 		}
 	}
 
@@ -234,13 +177,14 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 		title = strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath))
 	}
 
-	meta := s.fetchMergedMetadata(ctx, plugins.MediaQuery{
+	query := plugins.MediaQuery{
 		ItemType: "Movie",
 		Title:    title,
 		Year:     parsed.Year,
 		Path:     mediaPath,
 		Language: s.language(),
-	})
+	}
+	meta := s.fetchMetadataFiltered(ctx, query, true)
 
 	// Auto-merge into existing movie if this is a new file matching an existing item by TMDB/IMDB ID or same-dir title.
 	if existing == nil {
@@ -259,12 +203,26 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 			mergeTarget, _ = s.repo.FindMovieInDirByBaseTitle(ctx, lib.ID, filepath.Dir(mediaPath), title)
 		}
 		if mergeTarget != nil {
-			probeRes := s.probeMedia(ctx, mediaPath, isStrm)
-			ms := s.buildMediaSource(mergeTarget, mediaPath, size, mtime, isStrm, container, probeRes)
+			ms := s.buildMediaSource(mergeTarget, mediaPath, size, mtime, isStrm, container, nil)
 			if err := s.repo.UpsertMediaSourceAndStreams(ctx, mergeTarget.ID, ms); err != nil {
-				return false, err
+				return false, nil, err
 			}
-			return true, nil
+			var task *enrichTask
+			if needProbe {
+				task = &enrichTask{
+					ItemID:           mergeTarget.ID,
+					LibraryID:        lib.ID,
+					ItemType:         "Movie",
+					MediaPath:        mediaPath,
+					Size:             size,
+					Mtime:            mtime,
+					IsStrm:           isStrm,
+					Container:        container,
+					NeedProbe:        true,
+					IsAltMediaSource: true,
+				}
+			}
+			return true, task, nil
 		}
 	}
 
@@ -272,8 +230,6 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 	if existing != nil {
 		itemID = existing.ID
 	}
-
-	probeRes := s.probeMedia(ctx, mediaPath, isStrm)
 
 	rec := &sqlite.ItemRecord{
 		ID:        itemID,
@@ -291,10 +247,6 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 		FileMtime: &mtime,
 		Etag:      computeEtag(mediaPath, size, mtime),
 	}
-	if probeRes != nil && probeRes.RuntimeTicks > 0 {
-		rt := probeRes.RuntimeTicks
-		rec.RuntimeTicks = &rt
-	}
 	if parsed.Year > 0 {
 		y := parsed.Year
 		rec.ProductionYear = &y
@@ -302,29 +254,49 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 	applyMetadataToItem(rec, meta)
 
 	if err := s.repo.UpsertItem(ctx, rec); err != nil {
-		return false, err
+		return false, nil, err
 	}
 	if err := s.repo.ReplaceItemAncestors(ctx, rec.ID, []sqlite.AncestorLink{
 		{AncestorID: lib.ID, Depth: 1},
 	}); err != nil {
-		return false, err
+		return false, nil, err
 	}
 
-	// MediaSource + probed embedded streams + external subtitles (preserving any merged alternate versions)
-	ms := s.buildMediaSource(rec, mediaPath, size, mtime, isStrm, container, probeRes)
+	// MediaSource + external subtitles (ffprobe runs in Phase B)
+	ms := s.buildMediaSource(rec, mediaPath, size, mtime, isStrm, container, nil)
 	if err := s.repo.UpsertMediaSourceAndStreams(ctx, rec.ID, ms); err != nil {
-		return false, err
+		return false, nil, err
 	}
 
 	// Local images
 	imgs := discoverLocalImages(rec.ID, mediaPath, filepath.Dir(mediaPath), false)
 	if err := s.repo.ReplaceItemImages(ctx, rec.ID, imgs); err != nil {
-		return false, err
+		return false, nil, err
 	}
 
 	// Taxonomies, People & FTS5
 	s.persistMetaRelationsAndFTS(ctx, rec, meta)
-	return true, nil
+
+	var task *enrichTask
+	if needProbe || needOnline {
+		if len(rec.Extra.ProviderIDs) > 0 {
+			query.ProviderIDs = rec.Extra.ProviderIDs
+		}
+		task = &enrichTask{
+			ItemID:         rec.ID,
+			LibraryID:      lib.ID,
+			ItemType:       "Movie",
+			MediaPath:      mediaPath,
+			Size:           size,
+			Mtime:          mtime,
+			IsStrm:         isStrm,
+			Container:      container,
+			Query:          query,
+			NeedProbe:      needProbe,
+			NeedOnlineMeta: needOnline,
+		}
+	}
+	return true, task, nil
 }
 
 func (s *Scanner) indexEpisode(
@@ -334,10 +306,11 @@ func (s *Scanner) indexEpisode(
 	mediaPath string,
 	seriesCache map[string]*sqlite.ItemRecord,
 	seasonCache map[string]*sqlite.ItemRecord,
-) (bool, error) {
+	seenSeriesEnrich map[string]struct{},
+) (bool, []enrichTask, error) {
 	info, err := os.Stat(mediaPath)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	mtime := info.ModTime().Unix()
 	size := info.Size()
@@ -348,47 +321,82 @@ func (s *Scanner) indexEpisode(
 		container = "strm"
 	}
 
+	needProbe := !isStrm && s.prober != nil
+	needOnline := s.hasOnlineMetadataProviders()
+
 	existing, err := s.repo.FindItemByMediaSourcePath(ctx, lib.ID, mediaPath)
 	if err == nil && existing != nil {
 		if s.isMediaSourceUnchanged(ctx, existing, mediaPath, size, mtime) {
-			return false, nil
+			return false, nil, nil
 		}
 		if existing.Path != mediaPath {
-			probeRes := s.probeMedia(ctx, mediaPath, isStrm)
-			ms := s.buildMediaSource(existing, mediaPath, size, mtime, isStrm, container, probeRes)
+			ms := s.buildMediaSource(existing, mediaPath, size, mtime, isStrm, container, nil)
 			if err := s.repo.UpsertMediaSourceAndStreams(ctx, existing.ID, ms); err != nil {
-				return false, err
+				return false, nil, err
 			}
-			return true, nil
+			var tasks []enrichTask
+			if needProbe {
+				tasks = append(tasks, enrichTask{
+					ItemID:           existing.ID,
+					LibraryID:        lib.ID,
+					ItemType:         "Episode",
+					MediaPath:        mediaPath,
+					Size:             size,
+					Mtime:            mtime,
+					IsStrm:           isStrm,
+					Container:        container,
+					NeedProbe:        true,
+					IsAltMediaSource: true,
+				})
+			}
+			return true, tasks, nil
 		}
 	}
 
+	var tasks []enrichTask
+
 	// 1. Ensure Series
-	seriesRec, err := s.ensureSeries(ctx, lib, epInfo, seriesCache)
+	seriesRec, seriesTask, err := s.ensureSeries(ctx, lib, epInfo, seriesCache, seenSeriesEnrich)
 	if err != nil {
-		return false, err
+		return false, nil, err
+	}
+	if seriesTask != nil {
+		tasks = append(tasks, *seriesTask)
 	}
 
 	// 2. Ensure Season
 	seasonRec, err := s.ensureSeason(ctx, lib, seriesRec, epInfo, seasonCache)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 
 	// Auto-merge into existing episode if same Series + SeasonNumber + EpisodeNumber already exists.
 	if existing == nil {
 		if mergeTarget, err := s.repo.FindEpisodeByNumber(ctx, seriesRec.ID, epInfo.SeasonNumber, epInfo.EpisodeNumber); err == nil && mergeTarget != nil {
-			probeRes := s.probeMedia(ctx, mediaPath, isStrm)
-			ms := s.buildMediaSource(mergeTarget, mediaPath, size, mtime, isStrm, container, probeRes)
+			ms := s.buildMediaSource(mergeTarget, mediaPath, size, mtime, isStrm, container, nil)
 			if err := s.repo.UpsertMediaSourceAndStreams(ctx, mergeTarget.ID, ms); err != nil {
-				return false, err
+				return false, nil, err
 			}
-			return true, nil
+			if needProbe {
+				tasks = append(tasks, enrichTask{
+					ItemID:           mergeTarget.ID,
+					LibraryID:        lib.ID,
+					ItemType:         "Episode",
+					MediaPath:        mediaPath,
+					Size:             size,
+					Mtime:            mtime,
+					IsStrm:           isStrm,
+					Container:        container,
+					NeedProbe:        true,
+					IsAltMediaSource: true,
+				})
+			}
+			return true, tasks, nil
 		}
 	}
 
 	// 3. Upsert Episode
-	meta := s.fetchMergedMetadata(ctx, plugins.MediaQuery{
+	query := plugins.MediaQuery{
 		ItemType:      "Episode",
 		Title:         epInfo.EpisodeTitle,
 		SeasonNumber:  epInfo.SeasonNumber,
@@ -396,14 +404,13 @@ func (s *Scanner) indexEpisode(
 		Path:          mediaPath,
 		ProviderIDs:   seriesRec.Extra.ProviderIDs,
 		Language:      s.language(),
-	})
+	}
+	meta := s.fetchMetadataFiltered(ctx, query, true)
 
 	itemID := guid.New()
 	if existing != nil {
 		itemID = existing.ID
 	}
-
-	probeRes := s.probeMedia(ctx, mediaPath, isStrm)
 
 	epNum := epInfo.EpisodeNumber
 	seasonNum := epInfo.SeasonNumber
@@ -436,26 +443,22 @@ func (s *Scanner) indexEpisode(
 			SeasonName: seasonRec.Name,
 		},
 	}
-	if probeRes != nil && probeRes.RuntimeTicks > 0 {
-		rt := probeRes.RuntimeTicks
-		rec.RuntimeTicks = &rt
-	}
 	applyMetadataToItem(rec, meta)
 
 	if err := s.repo.UpsertItem(ctx, rec); err != nil {
-		return false, err
+		return false, nil, err
 	}
 	if err := s.repo.ReplaceItemAncestors(ctx, rec.ID, []sqlite.AncestorLink{
 		{AncestorID: seasonRec.ID, Depth: 1},
 		{AncestorID: seriesRec.ID, Depth: 2},
 		{AncestorID: lib.ID, Depth: 3},
 	}); err != nil {
-		return false, err
+		return false, nil, err
 	}
 
-	ms := s.buildMediaSource(rec, mediaPath, size, mtime, isStrm, container, probeRes)
+	ms := s.buildMediaSource(rec, mediaPath, size, mtime, isStrm, container, nil)
 	if err := s.repo.UpsertMediaSourceAndStreams(ctx, rec.ID, ms); err != nil {
-		return false, err
+		return false, nil, err
 	}
 
 	imgs := discoverLocalImages(rec.ID, mediaPath, filepath.Dir(mediaPath), true)
@@ -464,29 +467,52 @@ func (s *Scanner) indexEpisode(
 	}
 
 	s.persistMetaRelationsAndFTS(ctx, rec, meta)
-	return true, nil
+
+	if needProbe || needOnline {
+		tasks = append(tasks, enrichTask{
+			ItemID:         rec.ID,
+			LibraryID:      lib.ID,
+			ItemType:       "Episode",
+			MediaPath:      mediaPath,
+			Size:           size,
+			Mtime:          mtime,
+			IsStrm:         isStrm,
+			Container:      container,
+			Query:          query,
+			NeedProbe:      needProbe,
+			NeedOnlineMeta: needOnline,
+		})
+	}
+	return true, tasks, nil
 }
 
-func (s *Scanner) ensureSeries(ctx context.Context, lib *sqlite.LibraryRecord, epInfo ParsedEpisode, cache map[string]*sqlite.ItemRecord) (*sqlite.ItemRecord, error) {
+func (s *Scanner) ensureSeries(
+	ctx context.Context,
+	lib *sqlite.LibraryRecord,
+	epInfo ParsedEpisode,
+	cache map[string]*sqlite.ItemRecord,
+	seenEnrich map[string]struct{},
+) (*sqlite.ItemRecord, *enrichTask, error) {
 	if rec, ok := cache[epInfo.SeriesDir]; ok {
-		return rec, nil
+		return rec, nil, nil
 	}
 	existing, err := s.repo.FindItemByPath(ctx, lib.ID, epInfo.SeriesDir)
 	if err == nil && existing != nil {
 		cache[epInfo.SeriesDir] = existing
-		return existing, nil
+		return existing, nil, nil
 	}
 	if err != nil && !errors.Is(err, sqlite.ErrNotFound) {
-		return nil, err
+		return nil, nil, err
 	}
 
-	meta := s.fetchMergedMetadata(ctx, plugins.MediaQuery{
+	query := plugins.MediaQuery{
 		ItemType: "Series",
 		Title:    epInfo.SeriesName,
 		Year:     epInfo.SeriesYear,
 		Path:     epInfo.SeriesDir,
 		Language: s.language(),
-	})
+	}
+	meta := s.fetchMetadataFiltered(ctx, query, true)
 
 	// Cross-directory auto-merge for Series sharing the same TMDB/IMDB ID.
 	if meta != nil && len(meta.ProviderIDs) > 0 {
@@ -501,7 +527,7 @@ func (s *Scanner) ensureSeries(ctx context.Context, lib *sqlite.LibraryRecord, e
 		}
 		if matched != nil {
 			cache[epInfo.SeriesDir] = matched
-			return matched, nil
+			return matched, nil, nil
 		}
 	}
 
@@ -523,12 +549,12 @@ func (s *Scanner) ensureSeries(ctx context.Context, lib *sqlite.LibraryRecord, e
 	applyMetadataToItem(rec, meta)
 
 	if err := s.repo.UpsertItem(ctx, rec); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := s.repo.ReplaceItemAncestors(ctx, rec.ID, []sqlite.AncestorLink{
 		{AncestorID: lib.ID, Depth: 1},
 	}); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	imgs := discoverLocalImages(rec.ID, "", epInfo.SeriesDir, false)
@@ -538,7 +564,25 @@ func (s *Scanner) ensureSeries(ctx context.Context, lib *sqlite.LibraryRecord, e
 	s.persistMetaRelationsAndFTS(ctx, rec, meta)
 
 	cache[epInfo.SeriesDir] = rec
-	return rec, nil
+
+	var task *enrichTask
+	if s.hasOnlineMetadataProviders() {
+		if _, dup := seenEnrich[rec.ID]; !dup {
+			seenEnrich[rec.ID] = struct{}{}
+			if len(rec.Extra.ProviderIDs) > 0 {
+				query.ProviderIDs = rec.Extra.ProviderIDs
+			}
+			task = &enrichTask{
+				ItemID:         rec.ID,
+				LibraryID:      lib.ID,
+				ItemType:       "Series",
+				MediaPath:      epInfo.SeriesDir,
+				Query:          query,
+				NeedOnlineMeta: true,
+			}
+		}
+	}
+	return rec, task, nil
 }
 
 func (s *Scanner) ensureSeason(ctx context.Context, lib *sqlite.LibraryRecord, series *sqlite.ItemRecord, epInfo ParsedEpisode, cache map[string]*sqlite.ItemRecord) (*sqlite.ItemRecord, error) {

@@ -358,8 +358,8 @@ func EmbyPrefixAndCase(next http.Handler) http.Handler {
 
 		lower := strings.ToLower(p)
 
-		// Preserve /web static UI routes verbatim.
-		if lower == "/web" || strings.HasPrefix(lower, "/web/") {
+		// Preserve /web static UI routes and Ambra native /api/ routes verbatim.
+		if lower == "/web" || strings.HasPrefix(lower, "/web/") || strings.HasPrefix(lower, "/api/") {
 			next.ServeHTTP(w, r)
 			return
 		}

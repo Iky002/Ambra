@@ -15,6 +15,7 @@ import {
   RotateCcw,
   RotateCw,
   Settings,
+  SlidersHorizontal,
   Subtitles,
   Volume2,
   VolumeX,
@@ -28,6 +29,16 @@ import { useAuth } from '../context/AuthContext'
 import { AssJassubRenderer } from '../player/assRenderer'
 import { PgsCanvasRenderer } from '../player/pgsRenderer'
 import {
+  DEFAULT_SUBTITLE_PREFS,
+  formatSubtitleOffset,
+  loadSubtitlePrefs,
+  resetSubtitlePrefs,
+  saveSubtitlePrefs,
+  stepSubtitleOffset,
+  SUBTITLE_PREFS_LIMITS,
+  type SubtitlePrefs,
+} from '../player/subtitlePrefs'
+import {
   detectSubtitleEngine,
   formatSeconds,
   getAudioLabel,
@@ -35,6 +46,12 @@ import {
   parseVttOrSrt,
   type TextSubtitleCue,
 } from '../player/subtitleUtils'
+import {
+  canStreamMkvRemux,
+  isMkvContainer,
+  StreamMkvFallbackError,
+  StreamMkvRemuxer,
+} from '../player/streamMkvRemuxer'
 import {
   canUseWasmRemux,
   DEFAULT_WASM_MAX_BYTES,
@@ -48,8 +65,8 @@ import {
   type WasmRemuxStage,
 } from '../player/wasmRemuxer'
 
-type ActivePanel = 'none' | 'subtitle' | 'audio' | 'speed' | 'settings'
-type PlayMethodMode = 'DirectPlay' | 'Client WASM Remux' | 'Server HLS'
+type ActivePanel = 'none' | 'subtitle' | 'subtitlePrefs' | 'audio' | 'speed' | 'settings'
+type PlayMethodMode = 'DirectPlay' | 'Stream MKV (MSE)' | 'Client WASM Remux' | 'Server HLS'
 
 interface WasmProgressState {
   stage: WasmRemuxStage
@@ -79,6 +96,7 @@ export function PlayerPage() {
   const pgsCanvasRef = useRef<HTMLCanvasElement>(null)
 
   const hlsRef = useRef<Hls | null>(null)
+  const streamMkvRef = useRef<StreamMkvRemuxer | null>(null)
   const wasmRemuxerRef = useRef<WasmRemuxer | null>(null)
   const assRendererRef = useRef<AssJassubRenderer | null>(null)
   const pgsRendererRef = useRef<PgsCanvasRenderer | null>(null)
@@ -129,8 +147,20 @@ export function PlayerPage() {
     setWasmFallbackNotice(null)
   }, [id, selectedSourceId, audioIndex])
 
-  // WebVTT / SRT 文本字幕状态
+  // WebVTT / SRT 文本字幕状态 & 字幕微调偏好
   const [textCues, setTextCues] = useState<TextSubtitleCue[]>([])
+  const [subtitlePrefs, setSubtitlePrefs] = useState<SubtitlePrefs>(() => loadSubtitlePrefs())
+  const subtitlePrefsRef = useRef<SubtitlePrefs>(subtitlePrefs)
+  subtitlePrefsRef.current = subtitlePrefs
+  const [loadedFontCount, setLoadedFontCount] = useState(0)
+
+  const updateSubtitlePrefs = useCallback((patch: Partial<SubtitlePrefs>) => {
+    setSubtitlePrefs((prev) => saveSubtitlePrefs({ ...prev, ...patch }))
+  }, [])
+
+  const handleResetSubtitlePrefs = useCallback(() => {
+    setSubtitlePrefs(resetSubtitlePrefs())
+  }, [])
 
   const { data: item } = useQuery({
     queryKey: ['item', userId, id],
@@ -195,12 +225,13 @@ export function PlayerPage() {
     [audioStreams, audioIndex],
   )
 
-  // 五级播放策略规划：
+  // 播放策略规划：
   // 1) 原生兼容容器 (mp4/m4v/webm/mov) 且音轨原生兼容 -> DirectPlay
-  // 2) 非原生容器 (mkv/ts/avi/flv 等) 或 AC3/EAC3/DTS 音轨：
-  //    - 若开启客户端 WASM 解复用 + 浏览器支持 + 文件体积在安全阈值内 (<= 150MB) -> Client WASM Remux
+  // 2) 非原生 MKV 且浏览器 MSE 支持对应音视频编码 -> Stream MKV (MSE)（Range 分块流式解复用，支持 GB 级大文件）
+  // 3) 其他非原生容器 (ts/avi/flv 等) 或 AC3/EAC3/DTS 音轨：
+  //    - 若开启客户端解复用 + 浏览器支持 WASM + 文件体积 <= 150MB -> Client WASM Remux
   //    - 否则 / 超时 / 超阈值 / 出错 -> 自动无感回退服务端 HLS (master.m3u8)
-  // 3) 字幕始终走客户端 JASSUB / PGS Canvas / WebVTT，绝不因字幕触发转码
+  // 4) 字幕始终走客户端 JASSUB / PGS Canvas / WebVTT，绝不因字幕触发转码
   const streamPlan = useMemo(() => {
     if (!activeSource || !id) return null
 
@@ -236,6 +267,9 @@ export function PlayerPage() {
     const requiresRemux = needsClientRemux(activeSource.Container, activeAudioStream?.Codec)
     const sizeBytes = activeSource.Size
     const withinWasmThreshold = sizeBytes === undefined || sizeBytes <= DEFAULT_WASM_MAX_BYTES
+    const mkvStreamEligible =
+      isMkvContainer(activeSource.Container) &&
+      canStreamMkvRemux(videoStream?.Codec, activeAudioStream?.Codec, activeSource.Container)
 
     if (forceServerHls) {
       return {
@@ -243,6 +277,7 @@ export function PlayerPage() {
         directUrl,
         hlsUrl,
         requiresRemux,
+        withinWasmThreshold,
         skipReason: null as string | null,
       }
     }
@@ -254,11 +289,24 @@ export function PlayerPage() {
         directUrl,
         hlsUrl,
         requiresRemux,
+        withinWasmThreshold,
         skipReason: null as string | null,
       }
     }
 
-    // 2. 非原生容器 / 非原生音轨 -> 优先尝试客户端 WASM 解复用转封装
+    // 2. 非原生 MKV 且浏览器 MSE 支持该音视频编码 -> 优先流式 Range + MSE（无体积上限，支持 GB 级 MKV）
+    if (requiresRemux && preferWasmRemux && mkvStreamEligible) {
+      return {
+        strategy: 'stream-mkv' as const,
+        directUrl,
+        hlsUrl,
+        requiresRemux,
+        withinWasmThreshold,
+        skipReason: null as string | null,
+      }
+    }
+
+    // 3. 其他非原生容器 / 需音频转码（AC3/DTS 等）-> 尝试客户端 ffmpeg.wasm（<= 150MB）
     if (
       requiresRemux &&
       preferWasmRemux &&
@@ -270,19 +318,20 @@ export function PlayerPage() {
         directUrl,
         hlsUrl,
         requiresRemux,
+        withinWasmThreshold,
         skipReason: null as string | null,
       }
     }
 
-    // 3. 回退服务端 HLS master.m3u8，并记录回退原因供统计面板展示
+    // 4. 回退服务端 HLS master.m3u8，并记录回退原因供统计面板展示
     let skipReason: string | null = null
     if (requiresRemux) {
       if (!preferWasmRemux) {
-        skipReason = '已关闭客户端 WASM 解复用开关'
+        skipReason = '已关闭客户端解复用开关'
       } else if (!canUseWasmRemux()) {
-        skipReason = '当前浏览器不支持 WebAssembly / Web Worker'
+        skipReason = '当前浏览器不支持客户端流式解复用 / WebAssembly'
       } else if (!withinWasmThreshold && sizeBytes !== undefined) {
-        skipReason = `文件体积 ${formatBytes(sizeBytes)} 超过 WASM 阈值 (${formatBytes(DEFAULT_WASM_MAX_BYTES)})`
+        skipReason = `文件体积 ${formatBytes(sizeBytes)} 超过 WASM 阈值 (${formatBytes(DEFAULT_WASM_MAX_BYTES)}) 且音视频编码不支持 MSE 直通`
       }
     }
 
@@ -291,6 +340,7 @@ export function PlayerPage() {
       directUrl,
       hlsUrl,
       requiresRemux,
+      withinWasmThreshold,
       skipReason,
     }
   }, [
@@ -298,12 +348,13 @@ export function PlayerPage() {
     id,
     audioIndex,
     playbackInfo?.PlaySessionId,
+    videoStream?.Codec,
     activeAudioStream?.Codec,
     preferWasmRemux,
     forceServerHls,
   ])
 
-  // 挂载视频流 (DirectPlay / Client WASM Remux / Server HLS 自动降级)
+  // 挂载视频流 (DirectPlay / Stream MKV (MSE) / Client WASM Remux / Server HLS 自动降级)
   useEffect(() => {
     const video = videoRef.current
     if (!video || !streamPlan) return
@@ -324,6 +375,10 @@ export function PlayerPage() {
       hlsRef.current.destroy()
       hlsRef.current = null
     }
+    if (streamMkvRef.current) {
+      streamMkvRef.current.dispose()
+      streamMkvRef.current = null
+    }
     if (wasmRemuxerRef.current) {
       wasmRemuxerRef.current.dispose()
       wasmRemuxerRef.current = null
@@ -341,6 +396,17 @@ export function PlayerPage() {
       video.play().catch(() => {
         // 浏览器自动播放策略阻止时保持暂停状态让用户点击
       })
+    }
+
+    const buildAuthHeaders = (): Record<string, string> => {
+      const storedAuth = getStoredAuth()
+      const headers: Record<string, string> = {
+        'X-Emby-Authorization': buildEmbyAuthHeader(storedAuth?.accessToken),
+      }
+      if (storedAuth?.accessToken) {
+        headers['X-Emby-Token'] = storedAuth.accessToken
+      }
+      return headers
     }
 
     const mountServerHls = (url: string) => {
@@ -376,14 +442,8 @@ export function PlayerPage() {
       }
     }
 
-    if (streamPlan.strategy === 'direct') {
-      setPlayMethod('DirectPlay')
-      video.src = streamPlan.directUrl
-      video.addEventListener('loadedmetadata', startPlayback, { once: true })
-    } else if (streamPlan.strategy === 'hls') {
-      mountServerHls(streamPlan.hlsUrl)
-    } else {
-      // Client WASM Remux 路径：失败/超阈值/超时时自动无感回退服务端 HLS
+    const mountWasmRemux = () => {
+      if (cancelled) return
       setPlayMethod('Client WASM Remux')
       setWasmProgress({
         stage: 'fetch',
@@ -394,16 +454,8 @@ export function PlayerPage() {
       const remuxer = new WasmRemuxer()
       wasmRemuxerRef.current = remuxer
 
-      const storedAuth = getStoredAuth()
-      const authHeaders: Record<string, string> = {
-        'X-Emby-Authorization': buildEmbyAuthHeader(storedAuth?.accessToken),
-      }
-      if (storedAuth?.accessToken) {
-        authHeaders['X-Emby-Token'] = storedAuth.accessToken
-      }
-
       void remuxer
-        .remuxToMP4(streamPlan.directUrl, authHeaders, {
+        .remuxToMP4(streamPlan.directUrl, buildAuthHeaders(), {
           maxBytes: DEFAULT_WASM_MAX_BYTES,
           knownSizeBytes: activeSource?.Size,
           container: activeSource?.Container,
@@ -453,6 +505,60 @@ export function PlayerPage() {
         })
     }
 
+    const fallbackFromStreamMkv = (reasonMsg: string) => {
+      if (cancelled) return
+      if (streamMkvRef.current) {
+        streamMkvRef.current.dispose()
+        streamMkvRef.current = null
+      }
+      if (streamPlan.withinWasmThreshold && canUseWasmRemux({ enabled: preferWasmRemux })) {
+        setWasmFallbackNotice(`${reasonMsg}，已自动回退客户端 WASM 转封装`)
+        mountWasmRemux()
+      } else {
+        setWasmFallbackNotice(`${reasonMsg}，已自动切换服务端 HLS`)
+        mountServerHls(streamPlan.hlsUrl)
+      }
+    }
+
+    if (streamPlan.strategy === 'direct') {
+      setPlayMethod('DirectPlay')
+      video.src = streamPlan.directUrl
+      video.addEventListener('loadedmetadata', startPlayback, { once: true })
+    } else if (streamPlan.strategy === 'hls') {
+      mountServerHls(streamPlan.hlsUrl)
+    } else if (streamPlan.strategy === 'stream-mkv') {
+      // 大体积 MKV 流式解复用路径（HTTP Range + 纯 TS EBML/fMP4 + MSE）
+      setPlayMethod('Stream MKV (MSE)')
+      const streamMkv = new StreamMkvRemuxer()
+      streamMkvRef.current = streamMkv
+
+      void streamMkv
+        .attach(video, streamPlan.directUrl, buildAuthHeaders(), {
+          signal: abortController.signal,
+          onError: (err) => {
+            fallbackFromStreamMkv(err.message || '流式 MKV 解复用异常')
+          },
+        })
+        .then(() => {
+          if (cancelled) return
+          setPlayMethod('Stream MKV (MSE)')
+          startPlayback()
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return
+          const reasonMsg =
+            err instanceof StreamMkvFallbackError
+              ? err.message
+              : err instanceof Error
+                ? err.message
+                : '流式 MKV 解复用初始化失败'
+          fallbackFromStreamMkv(reasonMsg)
+        })
+    } else {
+      // Client WASM Remux 路径：失败/超阈值/超时时自动无感回退服务端 HLS
+      mountWasmRemux()
+    }
+
     return () => {
       cancelled = true
       abortController.abort()
@@ -460,12 +566,23 @@ export function PlayerPage() {
         hlsRef.current.destroy()
         hlsRef.current = null
       }
+      if (streamMkvRef.current) {
+        streamMkvRef.current.dispose()
+        streamMkvRef.current = null
+      }
       if (wasmRemuxerRef.current) {
         wasmRemuxerRef.current.dispose()
         wasmRemuxerRef.current = null
       }
     }
-  }, [streamPlan, activeSource?.Size, activeSource?.Container, initialStartTicks, forceServerHls])
+  }, [
+    streamPlan,
+    activeSource?.Size,
+    activeSource?.Container,
+    initialStartTicks,
+    forceServerHls,
+    preferWasmRemux,
+  ])
 
   // 构建外挂字幕直出 URL
   const resolveSubtitleUrl = useCallback(
@@ -492,6 +609,7 @@ export function PlayerPage() {
     let cancelled = false
     setSubtitleError(null)
     setTextCues([])
+    setLoadedFontCount(0)
 
     const cleanupEngines = async () => {
       if (assRendererRef.current) {
@@ -518,15 +636,33 @@ export function PlayerPage() {
       try {
         if (engine === 'ass') {
           if (!videoRef.current || !assCanvasRef.current) return
+          const attachments =
+            id && activeSource?.Id
+              ? await api.getMediaAttachments(id, activeSource.Id)
+              : []
+          if (cancelled || !videoRef.current || !assCanvasRef.current) return
+          const fontUrls = attachments.map((att) => {
+            const rawPath =
+              att.Url.startsWith('/emby/') || /^https?:\/\//i.test(att.Url)
+                ? att.Url
+                : `/emby${att.Url.startsWith('/') ? '' : '/'}${att.Url}`
+            return resolveApiUrl(rawPath)
+          })
+          setLoadedFontCount(fontUrls.length)
+
           const renderer = new AssJassubRenderer()
           assRendererRef.current = renderer
-          await renderer.mount(videoRef.current, assCanvasRef.current, subUrl)
+          await renderer.mount(videoRef.current, assCanvasRef.current, subUrl, {
+            fonts: fontUrls,
+            timeOffset: subtitlePrefsRef.current.offsetSec,
+          })
         } else if (engine === 'pgs') {
           if (!pgsCanvasRef.current) return
           const renderer = new PgsCanvasRenderer(pgsCanvasRef.current)
           pgsRendererRef.current = renderer
           await renderer.loadFromUrl(subUrl)
           if (!cancelled && videoRef.current) {
+            renderer.setTimeOffset(subtitlePrefsRef.current.offsetSec)
             renderer.renderAtTime(videoRef.current.currentTime)
           }
         } else {
@@ -550,7 +686,13 @@ export function PlayerPage() {
       cancelled = true
       void cleanupEngines()
     }
-  }, [activeSubtitleStream, resolveSubtitleUrl])
+  }, [activeSubtitleStream, resolveSubtitleUrl, id, activeSource?.Id])
+
+  // 字幕时间轴偏移实时同步至 ASS (JASSUB) 与 PGS Canvas 引擎
+  useEffect(() => {
+    assRendererRef.current?.setTimeOffset(subtitlePrefs.offsetSec)
+    pgsRendererRef.current?.setTimeOffset(subtitlePrefs.offsetSec)
+  }, [subtitlePrefs.offsetSec])
 
   // PGS 实时时间同步渲染
   useEffect(() => {
@@ -740,14 +882,15 @@ export function PlayerPage() {
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [togglePlay, seekBy, toggleFullscreen, cycleSubtitle, cycleAudio, activePanel, navigate, pokeOsd])
 
-  // 计算当前时间生效的 WebVTT/SRT 字幕文本
+  // 计算当前时间（叠加时间轴偏移）生效的 WebVTT/SRT 字幕文本
   const activeVttText = useMemo(() => {
     if (textCues.length === 0) return ''
+    const effectiveTime = currentTime + subtitlePrefs.offsetSec
     return textCues
-      .filter((c) => currentTime >= c.start && currentTime <= c.end)
+      .filter((c) => effectiveTime >= c.start && effectiveTime <= c.end)
       .map((c) => c.text)
       .join('\n')
-  }, [textCues, currentTime])
+  }, [textCues, currentTime, subtitlePrefs.offsetSec])
 
   const progressPct = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0
   const bufferedPct = duration > 0 ? Math.min(100, (bufferedEnd / duration) * 100) : 0
@@ -803,12 +946,14 @@ export function PlayerPage() {
           }
         }}
         onError={() => {
-          // 若当前为 DirectPlay 或 Client WASM Remux 解码失败，自动无感回退服务端 HLS
+          // 若当前为 DirectPlay / Stream MKV (MSE) / Client WASM Remux 解码失败，自动无感回退服务端 HLS
           if (playMethod !== 'Server HLS' && !forceServerHls && streamPlan?.hlsUrl) {
             setWasmFallbackNotice(
-              playMethod === 'Client WASM Remux'
-                ? '客户端转封装流解码异常，已自动回退服务端 HLS'
-                : '浏览器原生直连解码失败，已自动回退服务端 HLS',
+              playMethod === 'Stream MKV (MSE)'
+                ? '流式 MKV (MSE) 解码异常，已自动回退服务端 HLS'
+                : playMethod === 'Client WASM Remux'
+                  ? '客户端转封装流解码异常，已自动回退服务端 HLS'
+                  : '浏览器原生直连解码失败，已自动回退服务端 HLS',
             )
             setForceServerHls(true)
             return
@@ -837,8 +982,17 @@ export function PlayerPage() {
 
       {/* WebVTT / SRT 影院级文本字幕覆盖层 */}
       {activeSubtitleMeta.engine === 'vtt' && activeVttText && (
-        <div className="pointer-events-none absolute inset-x-0 bottom-[11%] z-10 flex justify-center px-6">
-          <div className="cinema-subtitle-text max-w-4xl whitespace-pre-line text-center text-xl font-semibold leading-snug tracking-wide text-white sm:text-2xl md:text-3xl">
+        <div
+          className="pointer-events-none absolute inset-x-0 z-10 flex justify-center px-6"
+          style={{ bottom: `${subtitlePrefs.bottomMarginPx}px` }}
+        >
+          <div
+            className="cinema-subtitle-text max-w-4xl whitespace-pre-line rounded-xl px-4 py-1.5 text-center font-semibold leading-snug tracking-wide text-white"
+            style={{
+              fontSize: `${(1.5 * subtitlePrefs.fontScale).toFixed(3)}rem`,
+              backgroundColor: `rgba(0, 0, 0, ${subtitlePrefs.bgOpacity})`,
+            }}
+          >
             {activeVttText}
           </div>
         </div>
@@ -964,19 +1118,21 @@ export function PlayerPage() {
               </dd>
             </div>
             <StatRow
-              label="WASM 解复用"
+              label="客户端解复用"
               value={
-                playMethod === 'Client WASM Remux'
-                  ? '已启用（单线程兼容）'
-                  : !wasmSupported
-                    ? '浏览器不支持'
-                    : !preferWasmRemux
-                      ? '已关闭'
-                      : wasmFallbackNotice
-                        ? '已自动降级'
-                        : '待命（当前直连）'
+                playMethod === 'Stream MKV (MSE)'
+                  ? '流式 Range + MSE（支持 GB 级 MKV）'
+                  : playMethod === 'Client WASM Remux'
+                    ? 'WASM 已启用（单线程兼容）'
+                    : !wasmSupported
+                      ? '浏览器不支持'
+                      : !preferWasmRemux
+                        ? '已关闭'
+                        : wasmFallbackNotice
+                          ? '已自动降级'
+                          : '待命（当前直连）'
               }
-              highlight={playMethod === 'Client WASM Remux'}
+              highlight={playMethod === 'Stream MKV (MSE)' || playMethod === 'Client WASM Remux'}
             />
             <StatRow label="容器格式" value={(activeSource?.Container || '-').toUpperCase()} />
             {activeSource?.Size !== undefined && activeSource.Size > 0 && (
@@ -1003,6 +1159,12 @@ export function PlayerPage() {
               value={activeSubtitleMeta.engineLabel}
               highlight={activeSubtitleMeta.engine !== 'none'}
             />
+            {activeSubtitleMeta.engine === 'ass' && loadedFontCount > 0 && (
+              <StatRow label="内封字体" value={`已挂载 ${loadedFontCount} 个`} highlight />
+            )}
+            {subtitlePrefs.offsetSec !== 0 && (
+              <StatRow label="字幕偏移" value={formatSubtitleOffset(subtitlePrefs.offsetSec)} highlight />
+            )}
             <StatRow
               label="缓冲进度"
               value={`${formatSeconds(bufferedEnd)} / ${formatSeconds(duration)}`}
@@ -1291,6 +1453,168 @@ export function PlayerPage() {
               )}
             </div>
 
+            {/* 字幕微调 */}
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() =>
+                  setActivePanel((p) => (p === 'subtitlePrefs' ? 'none' : 'subtitlePrefs'))
+                }
+                className={`flex items-center gap-1.5 rounded-xl px-3 py-2 text-xs font-medium transition-colors ${
+                  activePanel === 'subtitlePrefs'
+                    ? 'bg-amber-500 text-zinc-950'
+                    : subtitlePrefs.offsetSec !== DEFAULT_SUBTITLE_PREFS.offsetSec
+                      ? 'bg-amber-500/20 text-amber-300 ring-1 ring-amber-400/40'
+                      : 'bg-white/10 text-zinc-200 hover:bg-white/20'
+                }`}
+                title="字幕微调（时间偏移 / 字号 / 边距 / 背景）"
+              >
+                <SlidersHorizontal className="h-4 w-4" />
+                <span className="hidden lg:inline">字幕微调</span>
+              </button>
+
+              {activePanel === 'subtitlePrefs' && (
+                <div className="absolute bottom-12 right-0 z-30 w-80 overflow-hidden rounded-2xl border border-white/15 bg-zinc-950/95 p-3.5 shadow-2xl backdrop-blur-xl">
+                  <div className="mb-3 flex items-center justify-between">
+                    <div>
+                      <p className="text-xs font-semibold text-white">字幕微调</p>
+                      <p className="text-[10px] text-zinc-400">
+                        偏移同步作用于 ASS / PGS / VTT / SRT
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleResetSubtitlePrefs}
+                      className="rounded-lg border border-white/15 bg-white/5 px-2.5 py-1 text-[11px] font-medium text-zinc-300 transition-colors hover:bg-white/15 hover:text-white"
+                    >
+                      重置
+                    </button>
+                  </div>
+
+                  <div className="space-y-3.5">
+                    {/* 时间轴偏移 */}
+                    <div>
+                      <div className="mb-1.5 flex items-center justify-between text-[11px]">
+                        <span className="text-zinc-300">时间轴偏移</span>
+                        <span className="font-mono font-semibold text-amber-300">
+                          {formatSubtitleOffset(subtitlePrefs.offsetSec)}
+                        </span>
+                      </div>
+                      <div className="mb-2 grid grid-cols-3 gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            updateSubtitlePrefs({
+                              offsetSec: stepSubtitleOffset(subtitlePrefs.offsetSec, -0.5),
+                            })
+                          }
+                          className="rounded-lg bg-white/10 py-1.5 font-mono text-xs font-medium text-zinc-100 transition-colors hover:bg-white/20"
+                        >
+                          -0.5s
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => updateSubtitlePrefs({ offsetSec: 0 })}
+                          className={`rounded-lg py-1.5 font-mono text-xs font-medium transition-colors ${
+                            subtitlePrefs.offsetSec === 0
+                              ? 'bg-amber-500/20 text-amber-300 ring-1 ring-amber-400/40'
+                              : 'bg-white/10 text-zinc-200 hover:bg-white/20'
+                          }`}
+                        >
+                          0s
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            updateSubtitlePrefs({
+                              offsetSec: stepSubtitleOffset(subtitlePrefs.offsetSec, 0.5),
+                            })
+                          }
+                          className="rounded-lg bg-white/10 py-1.5 font-mono text-xs font-medium text-zinc-100 transition-colors hover:bg-white/20"
+                        >
+                          +0.5s
+                        </button>
+                      </div>
+                      <input
+                        type="range"
+                        min={SUBTITLE_PREFS_LIMITS.offsetSec.min}
+                        max={SUBTITLE_PREFS_LIMITS.offsetSec.max}
+                        step={SUBTITLE_PREFS_LIMITS.offsetSec.step}
+                        value={subtitlePrefs.offsetSec}
+                        onChange={(e) =>
+                          updateSubtitlePrefs({ offsetSec: Number(e.target.value) })
+                        }
+                        className="ambra-range h-1.5 w-full rounded-full bg-white/20"
+                      />
+                    </div>
+
+                    {/* 字号缩放 */}
+                    <div>
+                      <div className="mb-1 flex items-center justify-between text-[11px]">
+                        <span className="text-zinc-300">字号缩放</span>
+                        <span className="font-mono text-zinc-200">
+                          {Math.round(subtitlePrefs.fontScale * 100)}%
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={SUBTITLE_PREFS_LIMITS.fontScale.min}
+                        max={SUBTITLE_PREFS_LIMITS.fontScale.max}
+                        step={SUBTITLE_PREFS_LIMITS.fontScale.step}
+                        value={subtitlePrefs.fontScale}
+                        onChange={(e) =>
+                          updateSubtitlePrefs({ fontScale: Number(e.target.value) })
+                        }
+                        className="ambra-range h-1.5 w-full rounded-full bg-white/20"
+                      />
+                    </div>
+
+                    {/* 底边距 */}
+                    <div>
+                      <div className="mb-1 flex items-center justify-between text-[11px]">
+                        <span className="text-zinc-300">底边距</span>
+                        <span className="font-mono text-zinc-200">
+                          {subtitlePrefs.bottomMarginPx}px
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={SUBTITLE_PREFS_LIMITS.bottomMarginPx.min}
+                        max={SUBTITLE_PREFS_LIMITS.bottomMarginPx.max}
+                        step={SUBTITLE_PREFS_LIMITS.bottomMarginPx.step}
+                        value={subtitlePrefs.bottomMarginPx}
+                        onChange={(e) =>
+                          updateSubtitlePrefs({ bottomMarginPx: Number(e.target.value) })
+                        }
+                        className="ambra-range h-1.5 w-full rounded-full bg-white/20"
+                      />
+                    </div>
+
+                    {/* 背景透明度 */}
+                    <div>
+                      <div className="mb-1 flex items-center justify-between text-[11px]">
+                        <span className="text-zinc-300">背景透明度</span>
+                        <span className="font-mono text-zinc-200">
+                          {Math.round(subtitlePrefs.bgOpacity * 100)}%
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={SUBTITLE_PREFS_LIMITS.bgOpacity.min}
+                        max={SUBTITLE_PREFS_LIMITS.bgOpacity.max}
+                        step={SUBTITLE_PREFS_LIMITS.bgOpacity.step}
+                        value={subtitlePrefs.bgOpacity}
+                        onChange={(e) =>
+                          updateSubtitlePrefs({ bgOpacity: Number(e.target.value) })
+                        }
+                        className="ambra-range h-1.5 w-full rounded-full bg-white/20"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
             {/* 倍速 */}
             <div className="relative">
               <button
@@ -1410,15 +1734,19 @@ function PlayMethodBadge({ method }: { method: PlayMethodMode }) {
   const styleClass =
     method === 'DirectPlay'
       ? 'border-emerald-400/35 bg-emerald-500/20 text-emerald-300'
-      : method === 'Client WASM Remux'
-        ? 'border-amber-400/40 bg-amber-500/20 text-amber-300'
-        : 'border-sky-400/35 bg-sky-500/20 text-sky-300'
+      : method === 'Stream MKV (MSE)'
+        ? 'border-violet-400/40 bg-violet-500/20 text-violet-200'
+        : method === 'Client WASM Remux'
+          ? 'border-amber-400/40 bg-amber-500/20 text-amber-300'
+          : 'border-sky-400/35 bg-sky-500/20 text-sky-300'
 
   return (
     <span
       className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 font-mono text-[11px] font-semibold ${styleClass}`}
     >
-      {method === 'Client WASM Remux' && <Cpu className="h-3 w-3" />}
+      {(method === 'Client WASM Remux' || method === 'Stream MKV (MSE)') && (
+        <Cpu className="h-3 w-3" />
+      )}
       {method}
     </span>
   )

@@ -91,6 +91,24 @@ func TestServerLifecycleAndRoutes(t *testing.T) {
 		t.Fatalf("expected 404 on unknown endpoint, got %d", rec.Code)
 	}
 
+	// Admin v0.3 routes (health & migration) mounted behind RequireAdmin -> 401 without token
+	for _, p := range []string{"/api/admin/health", "/api/admin/migration/status"} {
+		rec = httptest.NewRecorder()
+		srv.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, p, nil))
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 on unauthenticated %s, got %d", p, rec.Code)
+		}
+	}
+
+	// Watcher initialized and can watch a library directory
+	if srv.Watcher == nil {
+		t.Fatalf("expected srv.Watcher to be initialized")
+	}
+	watchDir := t.TempDir()
+	if err := srv.Watcher.WatchLibrary("lib-test", []string{watchDir}); err != nil {
+		t.Fatalf("WatchLibrary failed: %v", err)
+	}
+
 	// Trigger builtin RefreshLibrary task callback via scheduler
 	tasks := srv.Scheduler.List(true)
 	if len(tasks) == 0 {

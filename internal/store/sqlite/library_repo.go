@@ -664,6 +664,29 @@ func (r *LibraryRepo) ReplaceItemPeople(ctx context.Context, itemID string, peop
 
 func (r *LibraryRepo) UpsertSearchFTS(ctx context.Context, itemID, titleRaw, titleTokens, pinyinFull, pinyinInitials, peopleNames string) error {
 	itemID = guid.Normalize(itemID)
+
+	titleRaw = TradToSimp(titleRaw)
+	peopleRaw := TradToSimp(peopleNames)
+	if strings.TrimSpace(titleTokens) == "" && strings.TrimSpace(titleRaw) != "" {
+		titleTokens = tokenizeForFTSSQLite(titleRaw)
+	} else {
+		titleTokens = TradToSimp(titleTokens)
+	}
+	if strings.TrimSpace(pinyinFull) == "" || strings.TrimSpace(pinyinInitials) == "" {
+		autoFull, autoInitials := ToPinyin(strings.TrimSpace(titleRaw + " " + peopleRaw))
+		if strings.TrimSpace(pinyinFull) == "" {
+			pinyinFull = autoFull
+		}
+		if strings.TrimSpace(pinyinInitials) == "" {
+			pinyinInitials = autoInitials
+		}
+	}
+	if strings.TrimSpace(peopleRaw) != "" {
+		peopleNames = tokenizeForFTSSQLite(peopleRaw)
+	} else {
+		peopleNames = ""
+	}
+
 	tx, err := r.store.Writer.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -686,9 +709,10 @@ func (r *LibraryRepo) UpsertSearchFTS(ctx context.Context, itemID, titleRaw, tit
 // --- FTS5 Query Builder ---
 
 // BuildFTSQuery converts a user search string into an FTS5 MATCH query supporting
-// multi-term out-of-order Chinese/English fuzzy search.
+// multi-term out-of-order Chinese/English fuzzy search with Traditional-to-Simplified
+// normalization.
 func BuildFTSQuery(term string) string {
-	term = strings.TrimSpace(term)
+	term = strings.TrimSpace(TradToSimp(term))
 	if term == "" {
 		return ""
 	}

@@ -1,6 +1,8 @@
 package compatmedia
 
 import (
+	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -669,8 +671,114 @@ func subtitleContentType(format string) string {
 	}
 }
 
-func (h *Handler) handleVideoAttachmentStream(w http.ResponseWriter, _ *http.Request) {
-	httpx.Error(w, http.StatusNotFound, "attachment stream not found")
+type videoAttachmentDTO struct {
+	Index    int    `json:"Index"`
+	FileName string `json:"FileName"`
+	MimeType string `json:"MimeType"`
+	Url      string `json:"Url"`
+}
+
+func fontContentType(filePath string) string {
+	switch strings.ToLower(filepath.Ext(filePath)) {
+	case ".ttf":
+		return "font/ttf"
+	case ".otf":
+		return "font/otf"
+	case ".woff2":
+		return "font/woff2"
+	case ".woff":
+		return "font/woff"
+	case ".ttc":
+		return "font/collection"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+func (h *Handler) resolveMediaSourcePath(ctx context.Context, itemID, mediaSourceID string) string {
+	if h.store != nil {
+		var p sql.NullString
+		err := h.store.Reader.QueryRowContext(ctx, `
+			SELECT path FROM item_media_sources
+			WHERE item_id = ? AND (? = '' OR id = ?)
+			ORDER BY rowid ASC LIMIT 1`, itemID, mediaSourceID, mediaSourceID).Scan(&p)
+		if err == nil && p.Valid && strings.TrimSpace(p.String) != "" {
+			return p.String
+		}
+	}
+	if h.repo != nil {
+		if rec, err := h.repo.GetItemRecordByID(ctx, itemID); err == nil && rec != nil && strings.TrimSpace(rec.Path) != "" {
+			return rec.Path
+		}
+	}
+	return ""
+}
+
+func (h *Handler) handleListVideoAttachments(w http.ResponseWriter, r *http.Request) {
+	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	mediaSourceID := guid.Normalize(chi.URLParam(r, "MediaSourceId"))
+	mediaPath := h.resolveMediaSourcePath(r.Context(), itemID, mediaSourceID)
+	if mediaPath == "" || h.extractor == nil {
+		httpx.JSON(w, http.StatusOK, []videoAttachmentDTO{})
+		return
+	}
+	fonts, err := h.extractor.ExtractFonts(r.Context(), mediaPath, itemID, mediaSourceID)
+	if err != nil || len(fonts) == 0 {
+		httpx.JSON(w, http.StatusOK, []videoAttachmentDTO{})
+		return
+	}
+	out := make([]videoAttachmentDTO, 0, len(fonts))
+	for i, fontPath := range fonts {
+		name := filepath.Base(fontPath)
+		out = append(out, videoAttachmentDTO{
+			Index:    i,
+			FileName: name,
+			MimeType: fontContentType(name),
+			Url:      fmt.Sprintf("/Videos/%s/%s/Attachments/%d", itemID, mediaSourceID, i),
+		})
+	}
+	httpx.JSON(w, http.StatusOK, out)
+}
+
+func (h *Handler) handleVideoAttachmentStream(w http.ResponseWriter, r *http.Request) {
+	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	mediaSourceID := guid.Normalize(chi.URLParam(r, "MediaSourceId"))
+	idx, err := strconv.Atoi(chi.URLParam(r, "Index"))
+	if err != nil || idx < 0 {
+		httpx.Error(w, http.StatusBadRequest, "invalid attachment index")
+		return
+	}
+	mediaPath := h.resolveMediaSourcePath(r.Context(), itemID, mediaSourceID)
+	if mediaPath == "" || h.extractor == nil {
+		httpx.Error(w, http.StatusNotFound, "attachment stream not found")
+		return
+	}
+	fonts, err := h.extractor.ExtractFonts(r.Context(), mediaPath, itemID, mediaSourceID)
+	if err != nil || idx >= len(fonts) {
+		httpx.Error(w, http.StatusNotFound, "attachment stream not found")
+		return
+	}
+	fontPath := fonts[idx]
+	data, err := os.ReadFile(fontPath)
+	if err != nil {
+		httpx.Error(w, http.StatusNotFound, "attachment file not found")
+		return
+	}
+	sum := sha256.Sum256(data)
+	etag := fmt.Sprintf(`"%x"`, sum[:8])
+
+	w.Header().Set("Content-Type", fontContentType(fontPath))
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.Header().Set("ETag", etag)
+	if inm := strings.TrimSpace(r.Header.Get("If-None-Match")); inm != "" && inm == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(data)
+	}
 }
 
 func (h *Handler) handleDeleteAlternateSources(w http.ResponseWriter, r *http.Request) {

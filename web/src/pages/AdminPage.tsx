@@ -1,8 +1,10 @@
 import { useState } from 'react'
 import {
   Activity,
+  ArrowRightLeft,
   CalendarClock,
   FolderOpen,
+  HeartPulse,
   Key,
   Puzzle,
   RefreshCw,
@@ -14,8 +16,10 @@ import { api } from '../api/client'
 import { AmbraLogo } from '../components/AmbraLogo'
 import { DashboardTab } from './admin/DashboardTab'
 import { DevicesKeysTab } from './admin/DevicesKeysTab'
+import { HealthAndAuditTab } from './admin/HealthAndAuditTab'
 import { LibrariesTab } from './admin/LibrariesTab'
 import { MetadataTab } from './admin/MetadataTab'
+import { MigrationTab } from './admin/MigrationTab'
 import { PluginsTab } from './admin/PluginsTab'
 import { TasksLogsTab } from './admin/TasksLogsTab'
 import { UsersTab } from './admin/UsersTab'
@@ -63,6 +67,18 @@ const ADMIN_TABS = [
     label: '任务与日志',
     desc: '计划任务 · 服务器日志',
     icon: CalendarClock,
+  },
+  {
+    path: 'health',
+    label: '健康与治理',
+    desc: '系统体检 · 审校 · NFO',
+    icon: HeartPulse,
+  },
+  {
+    path: 'migration',
+    label: 'Emby 迁移',
+    desc: '一键导入用户与进度',
+    icon: ArrowRightLeft,
   },
 ] as const
 
@@ -155,6 +171,8 @@ export function AdminPage() {
             <Route path="devices" element={<DevicesKeysTab />} />
             <Route path="plugins" element={<PluginsTab />} />
             <Route path="tasks" element={<TasksLogsTab />} />
+            <Route path="health" element={<HealthAndAuditTab />} />
+            <Route path="migration" element={<MigrationTab />} />
             <Route path="*" element={<Navigate to="dashboard" replace />} />
           </Routes>
         </div>
