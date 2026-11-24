@@ -142,6 +142,9 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		TMDBAPIKey: cfg.TMDBApiKey,
 	})
 	_ = rankingsSvc.LoadCache(ctx)
+	sc.SetOnScanComplete(func(c context.Context, _ string, _ scanner.ScanStats) {
+		_, _, _ = rankingsSvc.ApplyTagsToLibrary(c)
+	})
 	pb := playback.New(libRepo, registry, cfg)
 	imgSvc := imaging.New(libRepo).WithCacheDir(cfg.ImageCacheDir())
 	transcodeMgr := transcode.NewManager(cfg)
@@ -212,6 +215,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	// Phase 1: Library & Direct Streaming
 	libH := library.New(libRepo, sc, cfg)
 	libH.SetUserRepo(userRepo)
+	libH.SetWatcher(libWatcher)
 	libH.RegisterRoutes(mediaMux, library.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,

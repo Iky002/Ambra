@@ -56,6 +56,10 @@ func (s *Scanner) isMissingPrimaryImage(ctx context.Context, itemID string) bool
 }
 
 func (s *Scanner) downloadAndSaveRemoteImages(ctx context.Context, rec *sqlite.ItemRecord, meta *plugins.MetadataResult) bool {
+	return s.downloadAndSaveRemoteImagesForce(ctx, rec, meta, false)
+}
+
+func (s *Scanner) downloadAndSaveRemoteImagesForce(ctx context.Context, rec *sqlite.ItemRecord, meta *plugins.MetadataResult, forceReplace bool) bool {
 	if rec == nil || meta == nil {
 		return false
 	}
@@ -71,7 +75,7 @@ func (s *Scanner) downloadAndSaveRemoteImages(ctx context.Context, rec *sqlite.I
 
 	var savedAny bool
 	for _, art := range artworks {
-		if s.downloadAndSaveRemoteImage(ctx, rec.ID, art.imgType, art.rawURL) {
+		if s.downloadAndSaveRemoteImageForce(ctx, rec.ID, art.imgType, art.rawURL, forceReplace) {
 			savedAny = true
 		}
 	}
@@ -80,14 +84,20 @@ func (s *Scanner) downloadAndSaveRemoteImages(ctx context.Context, rec *sqlite.I
 }
 
 func (s *Scanner) downloadAndSaveRemoteImage(ctx context.Context, targetID, imgType, rawURL string) bool {
+	return s.downloadAndSaveRemoteImageForce(ctx, targetID, imgType, rawURL, false)
+}
+
+func (s *Scanner) downloadAndSaveRemoteImageForce(ctx context.Context, targetID, imgType, rawURL string, forceReplace bool) bool {
 	rawURL = strings.TrimSpace(rawURL)
 	if targetID == "" || !isHTTPURL(rawURL) {
 		return false
 	}
 
-	if existing, err := s.repo.GetImageByItemAndType(ctx, targetID, imgType, 0); err == nil && existing != nil && existing.Path != "" {
-		if info, statErr := os.Stat(existing.Path); statErr == nil && info.Size() > 0 {
-			return false
+	if !forceReplace {
+		if existing, err := s.repo.GetImageByItemAndType(ctx, targetID, imgType, 0); err == nil && existing != nil && existing.Path != "" {
+			if info, statErr := os.Stat(existing.Path); statErr == nil && info.Size() > 0 {
+				return false
+			}
 		}
 	}
 

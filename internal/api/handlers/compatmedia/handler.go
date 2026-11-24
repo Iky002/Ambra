@@ -31,14 +31,15 @@ type AuthFuncs struct {
 // Handler implements the remaining Emby 4.10.2.0 media, item, metadata, image,
 // encoding, library, taxonomy, audio, and video compatibility endpoints.
 type Handler struct {
-	repo      *sqlite.LibraryRepo
-	scanner   *scanner.Scanner
-	imaging   *imaging.Service
-	registry  *plugins.Registry
-	store     *sqlite.Store
-	cfg       *config.Config
-	extractor *transcode.Extractor
-	auth      AuthFuncs
+	repo       *sqlite.LibraryRepo
+	scanner    *scanner.Scanner
+	imaging    *imaging.Service
+	registry   *plugins.Registry
+	store      *sqlite.Store
+	cfg        *config.Config
+	extractor  *transcode.Extractor
+	httpClient *http.Client
+	auth       AuthFuncs
 }
 
 // New creates a new compatmedia Handler.
@@ -64,6 +65,18 @@ func New(
 // SetExtractor overrides the embedded subtitle & font extractor used by compatmedia endpoints.
 func (h *Handler) SetExtractor(ext *transcode.Extractor) {
 	h.extractor = ext
+}
+
+// SetHTTPClient overrides the HTTP client used for remote image downloading and proxying.
+func (h *Handler) SetHTTPClient(c *http.Client) {
+	h.httpClient = c
+}
+
+func (h *Handler) getHTTPClient() *http.Client {
+	if h.httpClient != nil {
+		return h.httpClient
+	}
+	return &http.Client{Timeout: 15 * time.Second}
 }
 
 // BuildRouter builds an isolated chi.Router containing all 21 media-domain route prefixes
@@ -203,6 +216,7 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 	r.Get("/Items/{Id}/Images/{Type}/{Index}/{Tag}/{Format}/{MaxWidth}/{MaxHeight}/{PercentPlayed}/{UnPlayedCount}", h.handleServeItemImageFull)
 	r.Head("/Items/{Id}/Images/{Type}/{Index}/{Tag}/{Format}/{MaxWidth}/{MaxHeight}/{PercentPlayed}/{UnPlayedCount}", h.handleServeItemImageFull)
 	r.Post("/Items/{Id}/Images/{Type}/{Index}/Index", adminFn(h.handleUpdateImageIndex))
+	r.Post("/Items/{Id}/Images/{Type}/Url", adminFn(h.handleSetImageURL))
 	r.Post("/Items/{Id}/Images/{Type}/{Index}/Url", adminFn(h.handleSetImageURL))
 	r.Delete("/Items/{Id}/Images/{Type}", adminFn(h.handleDeleteItemImage))
 	r.Delete("/Items/{Id}/Images/{Type}/{Index}", adminFn(h.handleDeleteItemImage))

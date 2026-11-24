@@ -68,29 +68,29 @@ export function PluginsTab() {
     try {
       const cfg = await api.getPluginConfiguration(plugin.Id)
       if (cfg && typeof cfg === 'object') {
-        if (typeof cfg.Enabled === 'boolean') setEnabled(cfg.Enabled)
-        else if (typeof cfg.enabled === 'boolean') setEnabled(cfg.enabled)
+        if (typeof cfg.enabled === 'boolean') setEnabled(cfg.enabled)
+        else if (typeof cfg.Enabled === 'boolean') setEnabled(cfg.Enabled)
 
-        if (typeof cfg.Priority === 'number') setPriority(cfg.Priority)
-        else if (typeof cfg.priority === 'number') setPriority(cfg.priority)
+        if (typeof cfg.priority === 'number') setPriority(cfg.priority)
+        else if (typeof cfg.Priority === 'number') setPriority(cfg.Priority)
 
         const apiKeyVal =
-          (cfg.ApiKey as string) ||
           (cfg.api_key as string) ||
-          (cfg.TMDBApiKey as string) ||
+          (cfg.ApiKey as string) ||
           (cfg.tmdb_api_key as string) ||
+          (cfg.TMDBApiKey as string) ||
           ''
         if (apiKeyVal) setTmdbApiKey(apiKeyVal)
 
         const langVal =
-          (cfg.Language as string) ||
           (cfg.language as string) ||
+          (cfg.Language as string) ||
           (cfg.TMDBLanguage as string) ||
           ''
         if (langVal) setTmdbLanguage(langVal)
 
-        if (typeof cfg.Enable302 === 'boolean') setEnable302(cfg.Enable302)
-        else if (typeof cfg.enable_302 === 'boolean') setEnable302(cfg.enable_302)
+        if (typeof cfg.enable_302 === 'boolean') setEnable302(cfg.enable_302)
+        else if (typeof cfg.Enable302 === 'boolean') setEnable302(cfg.Enable302)
 
         const rest: Record<string, unknown> = { ...cfg }
         delete rest.Enabled
@@ -137,7 +137,9 @@ export function PluginsTab() {
 
     const payload: Record<string, unknown> = {
       ...parsedExtra,
+      enabled,
       Enabled: enabled,
+      priority: Number(priority) || 0,
       Priority: Number(priority) || 0,
     }
 

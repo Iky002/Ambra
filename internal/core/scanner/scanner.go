@@ -27,6 +27,7 @@ type ScanStats struct {
 	LibraryID    string
 	ItemsAdded   int
 	ItemsUpdated int
+	ItemsDeleted int
 	ItemsSkipped int
 	Errors       int
 }
@@ -39,13 +40,14 @@ type Scanner struct {
 	cfg      *config.Config
 	prober   *Prober
 
-	mu            sync.Mutex
-	budget        *budget.Pool
-	httpClient    *http.Client
-	symlinkPolicy SymlinkPolicy
-	scanning      map[string]bool
-	cancels       map[string]context.CancelFunc
-	progress      map[string]*LibraryScanProgress
+	mu             sync.Mutex
+	budget         *budget.Pool
+	httpClient     *http.Client
+	symlinkPolicy  SymlinkPolicy
+	onScanComplete func(ctx context.Context, libraryID string, stats ScanStats)
+	scanning       map[string]bool
+	cancels        map[string]context.CancelFunc
+	progress       map[string]*LibraryScanProgress
 
 	pauseMu  sync.Mutex
 	paused   bool

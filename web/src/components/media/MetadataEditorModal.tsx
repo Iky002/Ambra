@@ -1,9 +1,29 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { Award, Loader2, Plus, Save, Tag, X } from 'lucide-react'
+import {
+  Award,
+  ChevronDown,
+  ChevronUp,
+  FileCode2,
+  Loader2,
+  Lock,
+  Plus,
+  Save,
+  Tag,
+  Unlock,
+  X,
+} from 'lucide-react'
 import { api } from '../../api/client'
 import type { BaseItemDto, ItemMetadataUpdatePayload } from '../../api/types'
 import { AdminModal, FeedbackBanner } from '../../pages/admin/adminUtils'
+
+const LOCKABLE_FIELDS = [
+  { key: 'Name', label: '片名 (Name)' },
+  { key: 'Overview', label: '简介 (Overview)' },
+  { key: 'Genres', label: '流派 (Genres)' },
+  { key: 'Tags', label: '标签 (Tags)' },
+  { key: 'Cast', label: '演职员 (Cast)' },
+] as const
 
 const RANKING_QUICK_TAGS = [
   {
@@ -50,6 +70,15 @@ export function MetadataEditorModal({
   const [imdbId, setImdbId] = useState('')
   const [doubanId, setDoubanId] = useState('')
   const [error, setError] = useState<string | null>(null)
+  const [govFeedback, setGovFeedback] = useState<{
+    type: 'success' | 'error'
+    message: string
+  } | null>(null)
+  const [govExpanded, setGovExpanded] = useState(true)
+  const [lockedFields, setLockedFields] = useState<string[]>([])
+  const [lockData, setLockData] = useState(false)
+  const [locking, setLocking] = useState(false)
+  const [writingNfo, setWritingNfo] = useState(false)
 
   useEffect(() => {
     if (!open || !item) return
@@ -67,7 +96,10 @@ export function MetadataEditorModal({
     setTmdbId(item.ProviderIds?.Tmdb || '')
     setImdbId(item.ProviderIds?.Imdb || '')
     setDoubanId(item.ProviderIds?.Douban || '')
+    setLockedFields([...(item.LockedFields || [])])
+    setLockData(Boolean(item.LockData))
     setError(null)
+    setGovFeedback(null)
   }, [open, item])
 
   const saveMutation = useMutation({
@@ -125,6 +157,61 @@ export function MetadataEditorModal({
     setTags((prev) =>
       prev.includes(tagVal) ? prev.filter((t) => t !== tagVal) : [...prev, tagVal],
     )
+  }
+
+  const toggleLockedField = (fieldKey: string) => {
+    setLockedFields((prev) =>
+      prev.includes(fieldKey) ? prev.filter((f) => f !== fieldKey) : [...prev, fieldKey],
+    )
+  }
+
+  const handleSaveLocks = async () => {
+    if (!item) return
+    setLocking(true)
+    setGovFeedback(null)
+    try {
+      const fieldsToSave = lockData
+        ? Array.from(new Set([...lockedFields, ...LOCKABLE_FIELDS.map((f) => f.key)]))
+        : lockedFields
+      await api.lockItemFields(item.Id, fieldsToSave, lockData)
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['item', item.Id] }),
+        queryClient.invalidateQueries({ queryKey: ['admin-metadata-items'] }),
+      ])
+      setGovFeedback({
+        type: 'success',
+        message: lockData
+          ? '已开启全局元数据锁定（刮削将跳过所有字段）'
+          : `已保存字段锁定（${fieldsToSave.length} 项）`,
+      })
+    } catch (err) {
+      setGovFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : '保存字段锁定失败',
+      })
+    } finally {
+      setLocking(false)
+    }
+  }
+
+  const handleWriteNfo = async () => {
+    if (!item) return
+    setWritingNfo(true)
+    setGovFeedback(null)
+    try {
+      const res = await api.writeItemNfo(item.Id)
+      setGovFeedback({
+        type: 'success',
+        message: res?.path ? `已原子回写 NFO：${res.path}` : `已成功回写「${item.Name}」的 .nfo 文件`,
+      })
+    } catch (err) {
+      setGovFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : '回写 .nfo 失败',
+      })
+    } finally {
+      setWritingNfo(false)
+    }
   }
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -408,6 +495,100 @@ export function MetadataEditorModal({
               添加
             </button>
           </div>
+        </div>
+
+        {/* 元数据锁定与 NFO 回写 */}
+        <div className="rounded-xl border border-amber-500/20 bg-amber-500/[0.04] p-3.5">
+          <button
+            type="button"
+            onClick={() => setGovExpanded((v) => !v)}
+            className="flex w-full items-center justify-between text-left"
+          >
+            <span className="flex items-center gap-1.5 text-xs font-semibold text-amber-200">
+              <Lock className="h-3.5 w-3.5 text-amber-400" />
+              <span>元数据锁定与 NFO 回写</span>
+            </span>
+            {govExpanded ? (
+              <ChevronUp className="h-4 w-4 text-zinc-400" />
+            ) : (
+              <ChevronDown className="h-4 w-4 text-zinc-400" />
+            )}
+          </button>
+
+          {govExpanded && (
+            <div className="mt-3 space-y-3 border-t border-white/8 pt-3">
+              <FeedbackBanner
+                message={govFeedback?.message}
+                type={govFeedback?.type}
+                onClose={() => setGovFeedback(null)}
+              />
+
+              <div className="flex flex-wrap items-center gap-1.5">
+                {LOCKABLE_FIELDS.map((field) => {
+                  const isLocked = lockData || lockedFields.includes(field.key)
+                  return (
+                    <button
+                      key={field.key}
+                      type="button"
+                      disabled={lockData}
+                      onClick={() => toggleLockedField(field.key)}
+                      className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors disabled:opacity-70 ${
+                        isLocked
+                          ? 'border-amber-400/50 bg-amber-500/20 text-amber-200'
+                          : 'border-white/10 bg-white/[0.03] text-zinc-400 hover:border-white/20 hover:text-zinc-200'
+                      }`}
+                    >
+                      {isLocked ? <Lock className="h-3 w-3" /> : <Unlock className="h-3 w-3" />}
+                      <span>{field.label}</span>
+                    </button>
+                  )
+                })}
+
+                <button
+                  type="button"
+                  onClick={() => setLockData((v) => !v)}
+                  className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+                    lockData
+                      ? 'border-red-400/50 bg-red-500/20 text-red-200'
+                      : 'border-white/10 bg-white/[0.03] text-zinc-300 hover:border-red-400/40 hover:text-red-200'
+                  }`}
+                >
+                  <Lock className="h-3 w-3" />
+                  <span>{lockData ? '已锁定全部 (LockData)' : '锁定全部字段'}</span>
+                </button>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                <button
+                  type="button"
+                  disabled={locking}
+                  onClick={() => void handleSaveLocks()}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/35 bg-amber-500/15 px-3 py-1.5 text-xs font-medium text-amber-200 transition-colors hover:bg-amber-500/25 disabled:opacity-50"
+                >
+                  {locking ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Lock className="h-3.5 w-3.5" />
+                  )}
+                  <span>保存锁定配置</span>
+                </button>
+
+                <button
+                  type="button"
+                  disabled={writingNfo}
+                  onClick={() => void handleWriteNfo()}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/35 bg-emerald-500/15 px-3 py-1.5 text-xs font-medium text-emerald-200 transition-colors hover:bg-emerald-500/25 disabled:opacity-50"
+                >
+                  {writingNfo ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <FileCode2 className="h-3.5 w-3.5" />
+                  )}
+                  <span>原子回写 .nfo</span>
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* 底部操作按钮 */}
