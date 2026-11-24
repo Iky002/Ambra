@@ -28,6 +28,8 @@ interface DemoRankingsState {
   doubanUpdatedAt: string
   imdbUpdatedAt: string
   tmdbTrendingUpdatedAt: string
+  doubanTrendingMovieUpdatedAt: string
+  doubanTrendingTvUpdatedAt: string
 }
 
 function createInitialRankingsState(): DemoRankingsState {
@@ -36,6 +38,8 @@ function createInitialRankingsState(): DemoRankingsState {
     doubanUpdatedAt: threeHoursAgo,
     imdbUpdatedAt: threeHoursAgo,
     tmdbTrendingUpdatedAt: threeHoursAgo,
+    doubanTrendingMovieUpdatedAt: threeHoursAgo,
+    doubanTrendingTvUpdatedAt: threeHoursAgo,
   }
 }
 
@@ -46,6 +50,26 @@ const DEMO_TMDB_TRENDING_TMDB_IDS = new Set([
   '872585', // 奥本海默
   '157336', // 星际穿越
   '842675', // 流浪地球 2
+  '1152014', // 周处除三害
+  '1022789', // 头脑特工队 2
+  '204541', // 三体
+  '1429', // 进击的巨人
+  '126308', // 幕府将军
+])
+
+const DEMO_DOUBAN_TRENDING_MOVIE_TMDB_IDS = new Set([
+  '1152014', // 周处除三害
+  '1022789', // 头脑特工队 2
+  '838240', // 机器人之梦
+  '693134', // 沙丘 2
+  '872585', // 奥本海默
+  '842675', // 流浪地球 2
+])
+
+const DEMO_DOUBAN_TRENDING_TV_TMDB_IDS = new Set([
+  '126308', // 幕府将军
+  '126506', // 繁花
+  '224937', // 漫长的季节
   '204541', // 三体
   '1429', // 进击的巨人
 ])
@@ -947,6 +971,18 @@ export async function demoFetch<T>(
         updated_at: rankingsState.tmdbTrendingUpdatedAt,
         count: 40,
       },
+      douban_trending_movie: {
+        chart: 'douban_trending_movie',
+        source: '豆瓣热门电影 (Demo 内存缓存)',
+        updated_at: rankingsState.doubanTrendingMovieUpdatedAt,
+        count: 50,
+      },
+      douban_trending_tv: {
+        chart: 'douban_trending_tv',
+        source: '豆瓣热门剧集 (Demo 内存缓存)',
+        updated_at: rankingsState.doubanTrendingTvUpdatedAt,
+        count: 50,
+      },
     }
     return summary as T
   }
@@ -956,6 +992,8 @@ export async function demoFetch<T>(
     rankingsState.doubanUpdatedAt = now
     rankingsState.imdbUpdatedAt = now
     rankingsState.tmdbTrendingUpdatedAt = now
+    rankingsState.doubanTrendingMovieUpdatedAt = now
+    rankingsState.doubanTrendingTvUpdatedAt = now
 
     let matchedItems = 0
     let tagsAdded = 0
@@ -967,10 +1005,23 @@ export async function demoFetch<T>(
         DEMO_DOUBAN_TOP250_TMDB_IDS.has(tmdbId) || Boolean(item.Tags?.includes('豆瓣Top250'))
       const inImdb =
         DEMO_IMDB_TOP250_TMDB_IDS.has(tmdbId) || Boolean(item.Tags?.includes('IMDb Top250'))
-      const inTrending =
-        DEMO_TMDB_TRENDING_TMDB_IDS.has(tmdbId) || Boolean(item.Tags?.includes('Trending'))
+      const inTmdbTrending =
+        DEMO_TMDB_TRENDING_TMDB_IDS.has(tmdbId) || Boolean(item.Tags?.includes('TMDB热门'))
+      const inDoubanTrendingMovie =
+        item.Type === 'Movie' &&
+        (DEMO_DOUBAN_TRENDING_MOVIE_TMDB_IDS.has(tmdbId) ||
+          Boolean(item.Tags?.includes('豆瓣热门电影')))
+      const inDoubanTrendingTv =
+        item.Type === 'Series' &&
+        (DEMO_DOUBAN_TRENDING_TV_TMDB_IDS.has(tmdbId) ||
+          Boolean(item.Tags?.includes('豆瓣热门剧集')))
+      const inAnyTrending =
+        inTmdbTrending ||
+        inDoubanTrendingMovie ||
+        inDoubanTrendingTv ||
+        Boolean(item.Tags?.includes('Trending'))
 
-      if (!inDouban && !inImdb && !inTrending) continue
+      if (!inDouban && !inImdb && !inAnyTrending) continue
       matchedItems++
       const tags = new Set(item.Tags || [])
       if (inDouban && !tags.has('豆瓣Top250')) {
@@ -981,15 +1032,27 @@ export async function demoFetch<T>(
         tags.add('IMDb Top250')
         tagsAdded++
       }
-      if (inTrending && !tags.has('Trending')) {
+      if (inAnyTrending && !tags.has('Trending')) {
         tags.add('Trending')
+        tagsAdded++
+      }
+      if (inTmdbTrending && !tags.has('TMDB热门')) {
+        tags.add('TMDB热门')
+        tagsAdded++
+      }
+      if (inDoubanTrendingMovie && !tags.has('豆瓣热门电影')) {
+        tags.add('豆瓣热门电影')
+        tagsAdded++
+      }
+      if (inDoubanTrendingTv && !tags.has('豆瓣热门剧集')) {
+        tags.add('豆瓣热门剧集')
         tagsAdded++
       }
       item.Tags = Array.from(tags)
     }
 
     pushActivity(
-      '已同步豆瓣 Top 250 / IMDb Top 250 / TMDB 热门榜缓存',
+      '已同步豆瓣 Top 250 / IMDb Top 250 / TMDB 热门 / 豆瓣热门电影与剧集缓存',
       'RankingsSynced',
       `命中 ${matchedItems} 部影片，新增标签 ${tagsAdded} 个`,
     )
@@ -998,6 +1061,8 @@ export async function demoFetch<T>(
       douban_count: 250,
       imdb_count: 250,
       tmdb_trending_count: 40,
+      douban_trending_movie_count: 50,
+      douban_trending_tv_count: 50,
       matched_items: matchedItems,
       tags_added: tagsAdded,
       synced_at: now,
