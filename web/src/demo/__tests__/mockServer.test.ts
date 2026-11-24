@@ -160,8 +160,8 @@ describe('Demo Mock 引擎 - Serverless 完整闭环测试', () => {
     expect(authRes.User.Policy?.IsAdministrator).toBe(true)
 
     const views = await api.getUserViews(authRes.User.Id)
-    expect(views.Items.length).toBe(3)
-    expect(views.Items.map((v) => v.Name)).toEqual(['电影', '剧集', '4K 精选'])
+    expect(views.Items.length).toBe(4)
+    expect(views.Items.map((v) => v.Name)).toEqual(['电影', '剧集', '4K 精选', '无损音乐'])
 
     const resume = await api.getResumeItems(authRes.User.Id, 12)
     expect(resume.Items.length).toBeGreaterThanOrEqual(2)

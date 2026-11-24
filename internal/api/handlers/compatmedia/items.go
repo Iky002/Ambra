@@ -934,7 +934,13 @@ func (h *Handler) handleMergeVersions(w http.ResponseWriter, r *http.Request) {
 	httpx.NoContent(w)
 }
 
-func (h *Handler) handleDeleteActiveEncodings(w http.ResponseWriter, _ *http.Request) {
+func (h *Handler) handleDeleteActiveEncodings(w http.ResponseWriter, r *http.Request) {
+	q := httpx.ParseQuery(r)
+	deviceID := q.Get("DeviceId")
+	playSessionID := q.Get("PlaySessionId")
+	if h.transcodeMgr != nil {
+		h.transcodeMgr.StopByDevice(deviceID, playSessionID)
+	}
 	httpx.NoContent(w)
 }
 

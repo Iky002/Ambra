@@ -184,7 +184,7 @@ func (r *LibraryRepo) DeleteItem(ctx context.Context, itemID string) error {
 	return tx.Commit()
 }
 
-// ListLibraryItemPaths returns a map of media file path -> itemID for all Movie and Episode
+// ListLibraryItemPaths returns a map of media file path -> itemID for all Movie, Episode, and Audio
 // items (and their attached media sources) belonging to libraryID.
 func (r *LibraryRepo) ListLibraryItemPaths(ctx context.Context, libraryID string) (map[string]string, error) {
 	libID := guid.Normalize(libraryID)
@@ -192,7 +192,7 @@ func (r *LibraryRepo) ListLibraryItemPaths(ctx context.Context, libraryID string
 
 	rows, err := r.store.Reader.QueryContext(ctx,
 		`SELECT id, path FROM items
-		 WHERE library_id = ? AND path != '' AND type IN ('Movie', 'Episode')`,
+		 WHERE library_id = ? AND path != '' AND type IN ('Movie', 'Episode', 'Audio')`,
 		libID,
 	)
 	if err != nil {
@@ -216,7 +216,7 @@ func (r *LibraryRepo) ListLibraryItemPaths(ctx context.Context, libraryID string
 		`SELECT ms.item_id, ms.path
 		 FROM item_media_sources ms
 		 JOIN items i ON i.id = ms.item_id
-		 WHERE i.library_id = ? AND ms.path != '' AND i.type IN ('Movie', 'Episode')`,
+		 WHERE i.library_id = ? AND ms.path != '' AND i.type IN ('Movie', 'Episode', 'Audio')`,
 		libID,
 	)
 	if err != nil {

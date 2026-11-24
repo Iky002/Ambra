@@ -1,6 +1,7 @@
 import { isDemoMode } from '../demo/demoMode'
 import {
   demoFetch,
+  getDemoAudioUrl,
   getDemoFallbackImageUrl,
   getDemoImageUrl,
   getDemoUserImageUrl,
@@ -8,6 +9,7 @@ import {
 import type {
   ActivityLogEntry,
   ApiKeyInfo,
+  AudioLyricsResponse,
   AuthSession,
   AuthenticationResult,
   BaseItemDto,
@@ -219,6 +221,22 @@ export function getBackdropUrl(item: BaseItemDto, maxWidth = 1920): string | nul
   return null
 }
 
+export function getAudioStreamUrl(itemId: string): string {
+  if (!itemId) return ''
+  if (isDemoMode()) {
+    return getDemoAudioUrl(itemId)
+  }
+  const auth = getStoredAuth()
+  const params = new URLSearchParams({
+    Container: 'mp3,flac,aac,m4a,ogg,opus,wav',
+    AudioCodec: 'aac,mp3,flac,opus,vorbis',
+    MaxStreamingBitrate: '140000000',
+  })
+  if (auth?.userId) params.set('UserId', auth.userId)
+  if (auth?.accessToken) params.set('api_key', auth.accessToken)
+  return `/emby/Audio/${encodeURIComponent(itemId)}/universal?${params.toString()}`
+}
+
 // ==================== API Endpoints ====================
 
 export const api = {
@@ -373,6 +391,11 @@ export const api = {
 
   getDownloadUrl: (itemId: string) =>
     resolveApiUrl(`/emby/Items/${encodeURIComponent(itemId)}/Download`),
+
+  getAudioLyrics: (itemId: string) =>
+    embyFetch<AudioLyricsResponse | string>(
+      `/emby/Audio/${encodeURIComponent(itemId)}/Lyrics`,
+    ),
 
   // ==================== Collections & Playlists CRUD ====================
 

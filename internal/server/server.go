@@ -331,6 +331,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	compatMediaSvc := compatmedia.New(libRepo, sc, imgSvc, registry, store, cfg)
 	compatMediaSvc.SetExtractor(subExtractor)
 	compatMediaSvc.SetWatcher(libWatcher)
+	compatMediaSvc.SetTranscodeManager(transcodeMgr)
 	compatMediaH := compatMediaSvc.BuildRouter(compatmedia.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,

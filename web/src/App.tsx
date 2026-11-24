@@ -3,6 +3,7 @@ import { ShieldAlert } from 'lucide-react'
 import { HashRouter, Link, Navigate, Route, Routes } from 'react-router-dom'
 import { api } from './api/client'
 import { Layout } from './components/Layout'
+import { AudioPlayerProvider } from './context/AudioPlayerContext'
 import { AuthProvider, useAuth } from './context/AuthContext'
 import { isDemoMode } from './demo/demoMode'
 import { AdminPage } from './pages/AdminPage'
@@ -148,9 +149,11 @@ export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <AuthProvider>
-        <HashRouter>
-          <AppRoutes />
-        </HashRouter>
+        <AudioPlayerProvider>
+          <HashRouter>
+            <AppRoutes />
+          </HashRouter>
+        </AudioPlayerProvider>
       </AuthProvider>
     </QueryClientProvider>
   )
