@@ -241,3 +241,110 @@ func TestLibraryHandlerPerUserFolderIsolation(t *testing.T) {
 		t.Fatalf("unknown user views expected 200, got %d", rec.Code)
 	}
 }
+
+func TestSpoofedUserIDCannotBypassEnabledFolders(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(tmp, "spoof.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	repo := sqlite.NewLibraryRepo(store)
+	userRepo := sqlite.NewUserRepo(store)
+	cfg := config.Default(tmp)
+	ctx := context.Background()
+
+	libA, _ := repo.CreateLibrary(ctx, "AllowedLib", "movies", []string{filepath.Join(tmp, "a")})
+	libB, _ := repo.CreateLibrary(ctx, "SecretLib", "tvshows", []string{filepath.Join(tmp, "b")})
+
+	movieA := &sqlite.ItemRecord{ID: guid.New(), LibraryID: libA.ID, ParentID: libA.ID, Type: "Movie", MediaType: "Video", Name: "Allowed Movie", SortName: "allowed"}
+	movieB := &sqlite.ItemRecord{ID: guid.New(), LibraryID: libB.ID, ParentID: libB.ID, Type: "Movie", MediaType: "Video", Name: "Secret Movie", SortName: "secret"}
+	seriesA := &sqlite.ItemRecord{ID: guid.New(), LibraryID: libA.ID, ParentID: libA.ID, Type: "Series", MediaType: "Video", Name: "Allowed Show", SortName: "allowed show"}
+	seriesB := &sqlite.ItemRecord{ID: guid.New(), LibraryID: libB.ID, ParentID: libB.ID, Type: "Series", MediaType: "Video", Name: "Secret Show", SortName: "secret show"}
+	seasonB := &sqlite.ItemRecord{ID: guid.New(), LibraryID: libB.ID, ParentID: seriesB.ID, SeriesID: seriesB.ID, Type: "Season", MediaType: "Video", Name: "Season 1", SortName: "season 1"}
+	epB := &sqlite.ItemRecord{ID: guid.New(), LibraryID: libB.ID, ParentID: seasonB.ID, SeriesID: seriesB.ID, SeasonID: seasonB.ID, Type: "Episode", MediaType: "Video", Name: "Ep 1", SortName: "ep 1"}
+	for _, it := range []*sqlite.ItemRecord{movieA, movieB, seriesA, seriesB, seasonB, epB} {
+		if err := repo.UpsertItem(ctx, it); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	adminUser := &sqlite.UserRecord{
+		ID: guid.New(), Name: "admin", IsAdmin: true,
+		Policy: sqlite.DefaultUserPolicy(true), Config: sqlite.DefaultUserConfig(),
+	}
+	_ = userRepo.CreateUser(ctx, adminUser)
+
+	restrictedPolicy := sqlite.DefaultUserPolicy(false)
+	restrictedPolicy.EnableAllFolders = false
+	restrictedPolicy.EnabledFolders = []string{libA.ID}
+	restrictedUser := &sqlite.UserRecord{
+		ID: guid.New(), Name: "restricted",
+		Policy: restrictedPolicy, Config: sqlite.DefaultUserConfig(),
+	}
+	_ = userRepo.CreateUser(ctx, restrictedUser)
+
+	// Mark both movieA and movieB as resumable for adminUser
+	_, _ = userRepo.UpsertPlaybackProgress(ctx, adminUser.ID, movieA.ID, 50000, false, nil, nil)
+	_, _ = userRepo.UpsertPlaybackProgress(ctx, adminUser.ID, movieB.ID, 50000, false, nil, nil)
+
+	// Wire AuthFuncs so authenticated caller in context is ALWAYS restrictedUser
+	mux := http.NewServeMux()
+	h := New(repo, nil, cfg)
+	h.SetUserRepo(userRepo)
+	h.RegisterRoutes(mux, AuthFuncs{
+		UserIDFromCtx: func(context.Context) string { return restrictedUser.ID },
+	})
+
+	get := func(path string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		return rec
+	}
+
+	// Spoofing adminUser.ID in path/query must NOT bypass restrictedUser's EnabledFolders!
+	rec := get("/Users/" + adminUser.ID + "/Views")
+	var views dto.QueryResult[dto.BaseItemDto]
+	_ = json.Unmarshal(rec.Body.Bytes(), &views)
+	if views.TotalRecordCount != 1 || views.Items[0].Id != libA.ID {
+		t.Fatalf("spoofed Views bypassed EnabledFolders: %+v", views)
+	}
+
+	rec = get("/Users/" + adminUser.ID + "/Items?Recursive=true&IncludeItemTypes=Movie")
+	var itemsRes dto.QueryResult[dto.BaseItemDto]
+	_ = json.Unmarshal(rec.Body.Bytes(), &itemsRes)
+	if itemsRes.TotalRecordCount != 1 || itemsRes.Items[0].Id != movieA.ID {
+		t.Fatalf("spoofed Items bypassed EnabledFolders: %+v", itemsRes)
+	}
+
+	rec = get("/Users/" + adminUser.ID + "/Items/Resume")
+	var resumeRes dto.QueryResult[dto.BaseItemDto]
+	_ = json.Unmarshal(rec.Body.Bytes(), &resumeRes)
+	if resumeRes.TotalRecordCount != 1 || resumeRes.Items[0].Id != movieA.ID {
+		t.Fatalf("spoofed Resume bypassed EnabledFolders: %+v", resumeRes)
+	}
+
+	rec = get("/Library/VirtualFolders?UserId=" + adminUser.ID)
+	var vfs []virtualFolderDTO
+	_ = json.Unmarshal(rec.Body.Bytes(), &vfs)
+	if len(vfs) != 1 || vfs[0].ItemId != libA.ID {
+		t.Fatalf("spoofed VirtualFolders bypassed EnabledFolders: %+v", vfs)
+	}
+
+	if rec := get("/Users/" + adminUser.ID + "/Items/" + movieB.ID); rec.Code != http.StatusForbidden {
+		t.Fatalf("spoofed GetItem on movieB expected 403, got %d", rec.Code)
+	}
+	if rec := get("/Shows/" + seriesB.ID + "/Seasons?UserId=" + adminUser.ID); rec.Code != http.StatusForbidden {
+		t.Fatalf("spoofed ShowSeasons on seriesB expected 403, got %d", rec.Code)
+	}
+	if rec := get("/Shows/" + seriesB.ID + "/Episodes?UserId=" + adminUser.ID); rec.Code != http.StatusForbidden {
+		t.Fatalf("spoofed ShowEpisodes on seriesB expected 403, got %d", rec.Code)
+	}
+	if rec := get("/Shows/" + seriesA.ID + "/Seasons?UserId=" + adminUser.ID); rec.Code != http.StatusOK {
+		t.Fatalf("allowed ShowSeasons on seriesA expected 200, got %d", rec.Code)
+	}
+	if rec := get("/Shows/" + seriesA.ID + "/Episodes?UserId=" + adminUser.ID); rec.Code != http.StatusOK {
+		t.Fatalf("allowed ShowEpisodes on seriesA expected 200, got %d", rec.Code)
+	}
+}

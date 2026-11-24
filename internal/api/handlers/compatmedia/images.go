@@ -16,12 +16,14 @@ import (
 	_ "image/png"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -118,9 +120,9 @@ func (h *Handler) handleServeItemImageFull(w http.ResponseWriter, r *http.Reques
 
 func (h *Handler) handleUploadItemImage(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
-	imageType := chi.URLParam(r, "Type")
-	if imageType == "" {
-		httpx.Error(w, http.StatusBadRequest, "image type is required")
+	imageType, ok := normalizeAllowedImageType(chi.URLParam(r, "Type"))
+	if !ok {
+		httpx.Error(w, http.StatusBadRequest, "unsupported image type")
 		return
 	}
 	idx := 0
@@ -154,7 +156,11 @@ func (h *Handler) handleUploadItemImage(w http.ResponseWriter, r *http.Request) 
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	filePath := filepath.Join(baseDir, strings.ToLower(imageType)+"_"+strconv.Itoa(idx)+ext)
+	filePath, err := safeImageFilePath(baseDir, imageType, idx, ext)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid image path")
+		return
+	}
 	if err := os.WriteFile(filePath, data, 0o644); err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
@@ -266,9 +272,14 @@ func (h *Handler) handleUpdateImageIndex(w http.ResponseWriter, r *http.Request)
 
 func (h *Handler) handleSetImageURL(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
-	imageType := chi.URLParam(r, "Type")
-	if imageType == "" {
-		imageType = "Primary"
+	rawType := strings.TrimSpace(chi.URLParam(r, "Type"))
+	if rawType == "" {
+		rawType = "Primary"
+	}
+	imageType, ok := normalizeAllowedImageType(rawType)
+	if !ok {
+		httpx.Error(w, http.StatusBadRequest, "unsupported image type")
+		return
 	}
 	idx := 0
 	if rawIdx := chi.URLParam(r, "Index"); rawIdx != "" {
@@ -286,8 +297,8 @@ func (h *Handler) handleSetImageURL(w http.ResponseWriter, r *http.Request) {
 			rawURL = nonEmpty(rawURL, body.Url, body.ImageUrl)
 		}
 	}
-	if !isValidHTTPURL(rawURL) {
-		httpx.Error(w, http.StatusBadRequest, "valid http/https image url is required")
+	if err := h.validateRemoteImageURL(rawURL); err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if _, err := h.repo.GetItemRecordByID(r.Context(), itemID); errors.Is(err, sqlite.ErrNotFound) {
@@ -402,7 +413,7 @@ func (h *Handler) listImageProviderNames() []string {
 func (h *Handler) handleDownloadRemoteImage(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	q := httpx.ParseQuery(r)
-	imageType := strings.TrimSpace(q.Get("Type"))
+	rawType := strings.TrimSpace(q.Get("Type"))
 	imageURL := nonEmpty(q.Get("ImageUrl"), q.Get("Url"))
 
 	if r.Body != nil {
@@ -412,15 +423,20 @@ func (h *Handler) handleDownloadRemoteImage(w http.ResponseWriter, r *http.Reque
 			Url      string `json:"Url"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
-			imageType = nonEmpty(imageType, body.Type)
+			rawType = nonEmpty(rawType, body.Type)
 			imageURL = nonEmpty(imageURL, body.ImageUrl, body.Url)
 		}
 	}
-	if imageType == "" {
-		imageType = "Primary"
+	if rawType == "" {
+		rawType = "Primary"
 	}
-	if !isValidHTTPURL(imageURL) {
-		httpx.Error(w, http.StatusBadRequest, "valid http/https ImageUrl is required")
+	imageType, ok := normalizeAllowedImageType(rawType)
+	if !ok {
+		httpx.Error(w, http.StatusBadRequest, "unsupported image type")
+		return
+	}
+	if err := h.validateRemoteImageURL(imageURL); err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if _, err := h.repo.GetItemRecordByID(r.Context(), itemID); errors.Is(err, sqlite.ErrNotFound) {
@@ -441,8 +457,8 @@ func (h *Handler) handleDownloadRemoteImage(w http.ResponseWriter, r *http.Reque
 func (h *Handler) handleRemoteImageProxy(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	rawURL := strings.TrimSpace(q.Get("imageUrl"))
-	if !isValidHTTPURL(rawURL) {
-		httpx.Error(w, http.StatusBadRequest, "valid http/https imageUrl is required")
+	if err := h.validateRemoteImageURL(rawURL); err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	parsed, _ := url.Parse(rawURL)
@@ -494,6 +510,13 @@ func (h *Handler) handleRemoteImageProxy(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *Handler) downloadAndSaveItemImage(ctx context.Context, itemID, imageType string, idx int, rawURL string) error {
+	safeType, ok := normalizeAllowedImageType(imageType)
+	if !ok {
+		return fmt.Errorf("unsupported image type %q", imageType)
+	}
+	if err := h.validateRemoteImageURL(rawURL); err != nil {
+		return err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return err
@@ -535,7 +558,10 @@ func (h *Handler) downloadAndSaveItemImage(ctx context.Context, itemID, imageTyp
 		return err
 	}
 
-	filePath := filepath.Join(baseDir, strings.ToLower(imageType)+"_"+strconv.Itoa(idx)+ext)
+	filePath, err := safeImageFilePath(baseDir, safeType, idx, ext)
+	if err != nil {
+		return err
+	}
 	tmpPath := filePath + ".tmp"
 	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
 		return err
@@ -554,7 +580,7 @@ func (h *Handler) downloadAndSaveItemImage(ctx context.Context, itemID, imageTyp
 
 	return h.repo.UpsertImage(ctx, &sqlite.ImageRecord{
 		ItemID:     itemID,
-		ImageType:  imageType,
+		ImageType:  safeType,
 		ImageIndex: idx,
 		Path:       filePath,
 		Tag:        tag,
@@ -563,13 +589,118 @@ func (h *Handler) downloadAndSaveItemImage(ctx context.Context, itemID, imageTyp
 	})
 }
 
-func isValidHTTPURL(raw string) bool {
+func normalizeAllowedImageType(raw string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "primary":
+		return "Primary", true
+	case "backdrop":
+		return "Backdrop", true
+	case "logo":
+		return "Logo", true
+	case "thumb":
+		return "Thumb", true
+	case "banner":
+		return "Banner", true
+	case "art":
+		return "Art", true
+	case "disc":
+		return "Disc", true
+	default:
+		return "", false
+	}
+}
+
+func safeImageFilePath(baseDir, imageType string, idx int, ext string) (string, error) {
+	filePath := filepath.Join(baseDir, strings.ToLower(imageType)+"_"+strconv.Itoa(idx)+ext)
+	rel, err := filepath.Rel(baseDir, filePath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", errors.New("image path escapes base directory")
+	}
+	return filePath, nil
+}
+
+func isBlockedIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	return ip.IsLoopback() ||
+		ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsUnspecified() ||
+		ip.IsMulticast()
+}
+
+func validatePublicHTTPURL(raw string, allowLocal bool) error {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || u.Host == "" {
-		return false
+		return errors.New("valid http/https image url is required")
 	}
 	scheme := strings.ToLower(u.Scheme)
-	return scheme == "http" || scheme == "https"
+	if scheme != "http" && scheme != "https" {
+		return errors.New("valid http/https image url is required")
+	}
+	if allowLocal {
+		return nil
+	}
+	host := strings.TrimSpace(u.Hostname())
+	if host == "" {
+		return errors.New("valid http/https image url is required")
+	}
+	lowerHost := strings.ToLower(host)
+	if lowerHost == "localhost" || strings.HasSuffix(lowerHost, ".localhost") {
+		return errors.New("remote image url targets a blocked local host")
+	}
+	if ip := net.ParseIP(host); ip != nil && isBlockedIP(ip) {
+		return errors.New("remote image url targets a blocked private or local IP")
+	}
+	return nil
+}
+
+func (h *Handler) validateRemoteImageURL(raw string) error {
+	return validatePublicHTTPURL(raw, h.httpClient != nil)
+}
+
+func newSafeRemoteHTTPClient() *http.Client {
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	transport := &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+			if err != nil {
+				return nil, err
+			}
+			for _, ipAddr := range ips {
+				if isBlockedIP(ipAddr.IP) {
+					return nil, fmt.Errorf("blocked remote IP %s", ipAddr.IP.String())
+				}
+			}
+			if len(ips) == 0 {
+				return nil, errors.New("no resolved IP addresses")
+			}
+			return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+		},
+	}
+	return &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("too many redirects")
+			}
+			return validatePublicHTTPURL(req.URL.String(), false)
+		},
+	}
 }
 
 func normalizeContentType(ct string) string {

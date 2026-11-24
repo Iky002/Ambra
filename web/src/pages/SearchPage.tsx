@@ -3,14 +3,36 @@ import { useQuery } from '@tanstack/react-query'
 import { Loader2, Search } from 'lucide-react'
 import { useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
+import type { BaseItemDto } from '../api/types'
 import { MediaCard } from '../components/MediaCard'
 import { useAuth } from '../context/AuthContext'
+
+type SearchTypeFilter = 'all' | 'Movie' | 'Series' | 'Person' | 'BoxSet'
+
+const TYPE_PILLS: Array<{ id: SearchTypeFilter; label: string; includeItemTypes: string }> = [
+  { id: 'all', label: '全部', includeItemTypes: 'Movie,Series,Episode,BoxSet,Person' },
+  { id: 'Movie', label: '电影', includeItemTypes: 'Movie' },
+  { id: 'Series', label: '剧集', includeItemTypes: 'Series,Episode' },
+  { id: 'Person', label: '演职员', includeItemTypes: 'Person' },
+  { id: 'BoxSet', label: '合集', includeItemTypes: 'BoxSet' },
+]
+
+function resolveSearchItemLink(item: BaseItemDto): string | undefined {
+  if (item.Type === 'Person') {
+    return `/person/${encodeURIComponent(item.Id)}?name=${encodeURIComponent(item.Name)}`
+  }
+  if (item.Type === 'BoxSet' || item.Type === 'Playlist') {
+    return `/collections/${encodeURIComponent(item.Id)}`
+  }
+  return undefined
+}
 
 export function SearchPage() {
   const { auth } = useAuth()
   const [searchParams, setSearchParams] = useSearchParams()
   const [input, setInput] = useState(searchParams.get('q') || '')
   const [debounced, setDebounced] = useState(input)
+  const [typeFilter, setTypeFilter] = useState<SearchTypeFilter>('all')
 
   useEffect(() => {
     const t = window.setTimeout(() => {
@@ -24,12 +46,14 @@ export function SearchPage() {
     return () => window.clearTimeout(t)
   }, [input, setSearchParams])
 
+  const activePill = TYPE_PILLS.find((p) => p.id === typeFilter) || TYPE_PILLS[0]
+
   const { data, isLoading } = useQuery({
-    queryKey: ['searchItems', auth?.userId, debounced],
+    queryKey: ['searchItems', auth?.userId, debounced, activePill.includeItemTypes],
     queryFn: () =>
       api.getItems(auth!.userId, {
         searchTerm: debounced,
-        includeItemTypes: 'Movie,Series,Episode',
+        includeItemTypes: activePill.includeItemTypes,
         limit: 48,
       }),
     enabled: debounced.length > 0,
@@ -39,8 +63,8 @@ export function SearchPage() {
 
   return (
     <div className="space-y-6 px-4 pt-6 lg:px-8">
-      <div className="max-w-2xl">
-        <h1 className="mb-4 text-2xl font-bold text-white">探索与搜索</h1>
+      <div className="max-w-2xl space-y-4">
+        <h1 className="text-2xl font-bold text-white">探索与搜索</h1>
         <div className="relative">
           <Search className="pointer-events-none absolute left-4 top-1/2 h-5 w-5 -translate-y-1/2 text-amber-400" />
           <input
@@ -48,9 +72,30 @@ export function SearchPage() {
             autoFocus
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="输入片名、原名、拼音或乱序关键词..."
+            placeholder="输入片名、原名、演职员、合集或乱序关键词..."
             className="w-full rounded-2xl border border-white/12 bg-white/[0.05] py-3.5 pl-12 pr-4 text-base text-zinc-100 placeholder-zinc-500 outline-none transition-all focus:border-amber-400/60 focus:bg-white/[0.08]"
           />
+        </div>
+
+        {/* 类型筛选胶囊 */}
+        <div className="flex flex-wrap items-center gap-2">
+          {TYPE_PILLS.map((pill) => {
+            const active = pill.id === typeFilter
+            return (
+              <button
+                key={pill.id}
+                type="button"
+                onClick={() => setTypeFilter(pill.id)}
+                className={`rounded-full px-3.5 py-1.5 text-xs font-medium transition-colors ${
+                  active
+                    ? 'bg-amber-500 text-zinc-950 shadow-sm'
+                    : 'border border-white/10 bg-white/[0.04] text-zinc-300 hover:bg-white/10 hover:text-white'
+                }`}
+              >
+                {pill.label}
+              </button>
+            )
+          })}
         </div>
       </div>
 
@@ -69,7 +114,7 @@ export function SearchPage() {
       ) : (
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
           {items.map((item) => (
-            <MediaCard key={item.Id} item={item} />
+            <MediaCard key={item.Id} item={item} linkTo={resolveSearchItemLink(item)} />
           ))}
         </div>
       )}

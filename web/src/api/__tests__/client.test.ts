@@ -304,7 +304,7 @@ describe('api/client - 管理控制台全部 API 方法', () => {
     const endpoints = fetchSpy.mock.calls.map(([u, init]) => `${init?.method || 'GET'} ${u}`)
     expect(endpoints).toEqual([
       'POST /emby/Items/item-1',
-      'POST /emby/Items/item-1/Refresh?Recursive=true&MetadataRefreshMode=FullRefresh&ImageRefreshMode=FullRefresh&ReplaceAllMetadata=true&ReplaceAllImages=false',
+      'POST /emby/Items/item-1/Refresh?Recursive=true&MetadataRefreshMode=FullRefresh&ImageRefreshMode=Default&ReplaceAllMetadata=true&ReplaceAllImages=false',
       'DELETE /emby/Items/item-1',
       'DELETE /emby/Videos/item-1/AlternateSources',
       'POST /emby/Videos/MergeVersions?Ids=item-1%2Citem-2',

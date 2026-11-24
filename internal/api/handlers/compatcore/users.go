@@ -31,10 +31,15 @@ import (
 
 func (h *Handler) toUserDto(u *sqlite.UserRecord) dto.UserDto {
 	hasPw := u.PasswordHash != ""
+	var dataDir string
+	if h.cfg != nil {
+		dataDir = h.cfg.DataDir
+	}
 	return dto.UserDto{
 		Name:                      u.Name,
 		ServerId:                  h.serverID(),
 		Id:                        u.ID,
+		PrimaryImageTag:           auth.UserPrimaryImageTag(dataDir, u.ID),
 		HasPassword:               hasPw,
 		HasConfiguredPassword:     hasPw,
 		HasConfiguredEasyPassword: false,
@@ -159,14 +164,17 @@ func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 	_, _ = rand.Read(tokenBytes)
 	token := hex.EncodeToString(tokenBytes)
 
-	_ = h.userRepo.CreateAccessToken(r.Context(), &sqlite.AccessTokenRecord{
+	if err := h.userRepo.CreateAccessToken(r.Context(), &sqlite.AccessTokenRecord{
 		Token:      token,
 		UserID:     u.ID,
 		DeviceID:   client.DeviceID,
 		DeviceName: client.Device,
 		AppName:    client.Client,
 		AppVersion: client.Version,
-	})
+	}); err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to create access token")
+		return
+	}
 	_ = h.userRepo.UpdateLastLogin(r.Context(), u.ID, time.Now().UTC())
 
 	var sessInfo dto.SessionInfo
@@ -256,6 +264,10 @@ func (h *Handler) getUserPrefixes(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) updateUser(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "Id")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	if h.userRepo == nil || uid == "" {
 		writeJSONError(w, r, http.StatusNotFound, "user not found")
 		return
@@ -273,6 +285,10 @@ func (h *Handler) updateUser(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := decodeOptionalJSON(r, &body); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if body.Policy != nil && !h.isCallerAdmin(r) {
+		writeJSONError(w, r, http.StatusForbidden, "admin privileges required to update user policy")
 		return
 	}
 	if body.Name != "" && body.Name != u.Name && h.store != nil && h.store.Writer != nil {
@@ -306,6 +322,10 @@ func (h *Handler) deleteUser(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) updateUserConfigurationPartial(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "Id")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	if h.userRepo == nil || uid == "" {
 		writeJSONError(w, r, http.StatusNotFound, "user not found")
 		return
@@ -722,6 +742,10 @@ func (h *Handler) postUserItemHideFromResume(w http.ResponseWriter, r *http.Requ
 
 func (h *Handler) postUserItemUserData(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	itemID := guid.Normalize(chi.URLParam(r, "ItemId"))
 	var body struct {
 		Played                *bool  `json:"Played"`
@@ -866,6 +890,15 @@ func (h *Handler) headUserImage(w http.ResponseWriter, r *http.Request) {
 	h.serveUserImage(w, r, true)
 }
 
+func isSafeRasterImageType(ct string) bool {
+	switch strings.ToLower(strings.TrimSpace(ct)) {
+	case "image/jpeg", "image/png", "image/gif", "image/webp":
+		return true
+	default:
+		return false
+	}
+}
+
 func (h *Handler) serveUserImage(w http.ResponseWriter, r *http.Request, headOnly bool) {
 	uid := h.resolveUserID(r, "Id")
 	imgType := chi.URLParam(r, "Type")
@@ -878,7 +911,12 @@ func (h *Handler) serveUserImage(w http.ResponseWriter, r *http.Request, headOnl
 		return
 	}
 	ct := http.DetectContentType(data)
+	if !isSafeRasterImageType(ct) {
+		ct = "application/octet-stream"
+	}
 	w.Header().Set("Content-Type", ct)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
 	w.WriteHeader(http.StatusOK)
 	if !headOnly {
@@ -886,8 +924,49 @@ func (h *Handler) serveUserImage(w http.ResponseWriter, r *http.Request, headOnl
 	}
 }
 
+func (h *Handler) isCallerAdmin(r *http.Request) bool {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil {
+		return ac.IsAdmin()
+	}
+	if h.auth.UserIDFromCtx != nil {
+		callerID := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if callerID != "" && h.userRepo != nil {
+			if u, err := h.userRepo.GetUserByID(r.Context(), callerID); err == nil && u != nil {
+				return u.IsAdmin || u.Policy.IsAdministrator
+			}
+		}
+	}
+	return false
+}
+
+func (h *Handler) canModifyUser(r *http.Request, targetUID string) bool {
+	targetID := guid.Normalize(targetUID)
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil {
+		return ac.IsAdmin() || (targetID != "" && guid.Normalize(ac.UserID()) == targetID)
+	}
+	if h.auth.UserIDFromCtx != nil {
+		callerID := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if callerID == "" {
+			return false
+		}
+		if callerID == targetID {
+			return true
+		}
+		if h.userRepo != nil {
+			if u, err := h.userRepo.GetUserByID(r.Context(), callerID); err == nil && u != nil {
+				return u.IsAdmin || u.Policy.IsAdministrator
+			}
+		}
+	}
+	return false
+}
+
 func (h *Handler) postUserImage(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "Id")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	imgType := chi.URLParam(r, "Type")
 	idx := chi.URLParam(r, "Index")
 	p := h.userImagePath(uid, imgType, idx)
@@ -900,6 +979,10 @@ func (h *Handler) postUserImage(w http.ResponseWriter, r *http.Request) {
 	// Emby clients often POST base64-encoded image payloads.
 	if decoded, decErr := base64.StdEncoding.DecodeString(strings.TrimSpace(string(raw))); decErr == nil && len(decoded) > 0 {
 		raw = decoded
+	}
+	if len(raw) == 0 || !isSafeRasterImageType(http.DetectContentType(raw)) {
+		httpx.Error(w, http.StatusBadRequest, "unsupported image format")
+		return
 	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to prepare user image directory")
@@ -914,6 +997,10 @@ func (h *Handler) postUserImage(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) deleteUserImage(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "Id")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	imgType := chi.URLParam(r, "Type")
 	idx := chi.URLParam(r, "Index")
 	p := h.userImagePath(uid, imgType, idx)
@@ -963,6 +1050,10 @@ func (h *Handler) getUserSettings(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) postUserSettings(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	body := map[string]any{}
 	if err := decodeOptionalJSON(r, &body); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -974,6 +1065,10 @@ func (h *Handler) postUserSettings(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) postUserSettingsPartial(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	patch := map[string]any{}
 	if err := decodeOptionalJSON(r, &patch); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")

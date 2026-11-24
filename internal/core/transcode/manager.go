@@ -601,6 +601,12 @@ func (s *transcodeSession) getSegment(ctx context.Context, segIndex int, getCaps
 				return targetPath, nil
 			}
 			s.mu.Lock()
+			if s.doneCh != doneCh {
+				// Another goroutine already restarted FFmpeg (e.g., HW->SW fallback or seek).
+				doneCh = s.doneCh
+				s.mu.Unlock()
+				continue
+			}
 			var errMsg string
 			if s.stderrBuf != nil {
 				errMsg = strings.TrimSpace(s.stderrBuf.String())
@@ -611,6 +617,11 @@ func (s *transcodeSession) getSegment(ctx context.Context, segIndex int, getCaps
 				retriedSoftware = true
 				s.forceSoftware = true
 				s.stopProcessLocked()
+				if s.running && s.doneCh != nil && s.doneCh != doneCh {
+					doneCh = s.doneCh
+					s.mu.Unlock()
+					continue
+				}
 				if err := s.startProcessLocked(segIndex, SoftwareOnlyCapabilities()); err != nil {
 					s.mu.Unlock()
 					return "", err

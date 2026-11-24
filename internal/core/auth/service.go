@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -358,9 +359,15 @@ func (s *Service) ChangePassword(ctx context.Context, userID, currentPw, newPw s
 		return err
 	}
 	if !isAdminAction {
-		ok, err := VerifyPassword(currentPw, u.PasswordHash)
-		if err != nil || !ok {
-			return ErrInvalidCredentials
+		if u.PasswordHash == "" {
+			if currentPw != "" {
+				return ErrInvalidCredentials
+			}
+		} else {
+			ok, err := VerifyPassword(currentPw, u.PasswordHash)
+			if err != nil || !ok {
+				return ErrInvalidCredentials
+			}
 		}
 	}
 	hash, err := HashPassword(newPw)
@@ -393,10 +400,15 @@ func (s *Service) InvalidateUserCache(userID string) {
 
 func (s *Service) ToUserDto(u *sqlite.UserRecord) dto.UserDto {
 	hasPw := u.PasswordHash != ""
+	var dataDir string
+	if s.cfg != nil {
+		dataDir = s.cfg.DataDir
+	}
 	return dto.UserDto{
 		Name:                      u.Name,
 		ServerId:                  s.cfg.ServerID,
 		Id:                        u.ID,
+		PrimaryImageTag:           UserPrimaryImageTag(dataDir, u.ID),
 		HasPassword:               hasPw,
 		HasConfiguredPassword:     hasPw,
 		HasConfiguredEasyPassword: false,
@@ -405,6 +417,40 @@ func (s *Service) ToUserDto(u *sqlite.UserRecord) dto.UserDto {
 		Configuration:             u.Config,
 		Policy:                    u.Policy,
 	}
+}
+
+// UserPrimaryImageTag returns a deterministic cache tag if the user has a saved primary avatar image.
+func UserPrimaryImageTag(dataDir, userID string) string {
+	if dataDir == "" || userID == "" {
+		return ""
+	}
+	safeUID := sanitizeUserDir(guid.Normalize(userID))
+	candidates := []string{
+		filepath.Join(dataDir, "metadata", "users", safeUID, "primary_0.img"),
+		filepath.Join(dataDir, "users", safeUID, "primary.jpg"),
+		filepath.Join(dataDir, "users", safeUID, "primary.jpeg"),
+		filepath.Join(dataDir, "users", safeUID, "primary.png"),
+		filepath.Join(dataDir, "users", safeUID, "primary.webp"),
+	}
+	for _, p := range candidates {
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return sha1Hex(fmt.Sprintf("%s:%d:%d", p, info.Size(), info.ModTime().UnixNano()))[:16]
+		}
+	}
+	return ""
+}
+
+func sanitizeUserDir(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "default"
+	}
+	return b.String()
 }
 
 func (s *Service) putCache(token string, id *TokenIdentity, now time.Time) {

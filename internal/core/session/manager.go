@@ -100,21 +100,34 @@ type sessionEntry struct {
 
 // Manager maintains active client sessions in memory and bridges playback progress to SQLite and EventBus.
 type Manager struct {
-	repo *sqlite.UserRepo
-	cfg  *config.Config
-	bus  *eventbus.Bus
+	repo    *sqlite.UserRepo
+	libRepo *sqlite.LibraryRepo
+	cfg     *config.Config
+	bus     *eventbus.Bus
 
 	mu       sync.RWMutex
 	sessions map[string]*sessionEntry // keyed by SessionInfo.Id
 }
 
 func NewManager(repo *sqlite.UserRepo, cfg *config.Config, bus *eventbus.Bus) *Manager {
+	var libRepo *sqlite.LibraryRepo
+	if repo != nil && repo.Store() != nil {
+		libRepo = sqlite.NewLibraryRepo(repo.Store())
+	}
 	return &Manager{
 		repo:     repo,
+		libRepo:  libRepo,
 		cfg:      cfg,
 		bus:      bus,
 		sessions: make(map[string]*sessionEntry),
 	}
+}
+
+// SetLibraryRepo overrides the library repository used to hydrate NowPlayingItem metadata.
+func (m *Manager) SetLibraryRepo(libRepo *sqlite.LibraryRepo) {
+	m.mu.Lock()
+	m.libRepo = libRepo
+	m.mu.Unlock()
 }
 
 func (m *Manager) TouchSession(user *sqlite.UserRecord, client auth.ClientInfo) dto.SessionInfo {
@@ -190,6 +203,59 @@ func (m *Manager) UpdateCapabilities(user *sqlite.UserRecord, client auth.Client
 	m.publish(context.Background(), eventbus.EventSessionUpdated, nil)
 }
 
+func (m *Manager) hydrateNowPlayingItem(ctx context.Context, dst *dto.BaseItemDto, itemID string) {
+	if dst == nil || itemID == "" {
+		return
+	}
+	m.mu.RLock()
+	libRepo := m.libRepo
+	m.mu.RUnlock()
+	if libRepo == nil {
+		return
+	}
+	rec, err := libRepo.GetItemRecordByID(ctx, itemID)
+	if err != nil || rec == nil {
+		return
+	}
+	if dst.Name == "" {
+		dst.Name = rec.Name
+	}
+	if dst.Type == "" {
+		dst.Type = rec.Type
+	}
+	if dst.MediaType == "" {
+		dst.MediaType = rec.MediaType
+	}
+	if dst.SeriesName == "" {
+		dst.SeriesName = rec.Extra.SeriesName
+	}
+	if dst.SeriesId == "" {
+		dst.SeriesId = rec.SeriesID
+	}
+	if dst.SeasonId == "" {
+		dst.SeasonId = rec.SeasonID
+	}
+	if dst.RunTimeTicks == nil && rec.RuntimeTicks != nil {
+		rt := *rec.RuntimeTicks
+		dst.RunTimeTicks = &rt
+	}
+	if dst.ProductionYear == nil && rec.ProductionYear != nil {
+		yr := *rec.ProductionYear
+		dst.ProductionYear = &yr
+	}
+	if dst.IndexNumber == nil && rec.IndexNumber != nil {
+		idx := *rec.IndexNumber
+		dst.IndexNumber = &idx
+	}
+	if dst.ParentIndexNumber == nil && rec.ParentIndexNumber != nil {
+		pidx := *rec.ParentIndexNumber
+		dst.ParentIndexNumber = &pidx
+	}
+	if dst.Container == "" {
+		dst.Container = rec.Container
+	}
+}
+
 func (m *Manager) ReportPlaybackStart(ctx context.Context, user *sqlite.UserRecord, client auth.ClientInfo, req PlaybackStartRequest) error {
 	if user == nil {
 		return nil
@@ -198,27 +264,37 @@ func (m *Manager) ReportPlaybackStart(ctx context.Context, user *sqlite.UserReco
 	itemID := guid.Normalize(req.ItemId)
 	now := time.Now().UTC()
 
+	var nowPlaying *dto.BaseItemDto
+	if req.Item != nil {
+		itemCopy := *req.Item
+		if itemCopy.Id == "" {
+			itemCopy.Id = itemID
+		} else if itemID == "" {
+			itemID = guid.Normalize(itemCopy.Id)
+		}
+		if itemCopy.ServerId == "" {
+			itemCopy.ServerId = m.cfg.ServerID
+		}
+		if itemCopy.Name == "" && itemID != "" {
+			m.hydrateNowPlayingItem(ctx, &itemCopy, itemID)
+		}
+		nowPlaying = &itemCopy
+	} else if itemID != "" {
+		nowPlaying = &dto.BaseItemDto{
+			Id:       itemID,
+			ServerId: m.cfg.ServerID,
+		}
+		m.hydrateNowPlayingItem(ctx, nowPlaying, itemID)
+	}
+
 	m.mu.Lock()
 	entry := m.sessions[info.Id]
 	entry.info.LastActivityDate = now
 	entry.playSessionID = req.PlaySessionId
 	entry.lastPausedState = req.IsPaused
 	entry.lastPersistAt = now
-
-	if req.Item != nil {
-		itemCopy := *req.Item
-		if itemCopy.Id == "" {
-			itemCopy.Id = itemID
-		}
-		if itemCopy.ServerId == "" {
-			itemCopy.ServerId = m.cfg.ServerID
-		}
-		entry.info.NowPlayingItem = &itemCopy
-	} else if itemID != "" {
-		entry.info.NowPlayingItem = &dto.BaseItemDto{
-			Id:       itemID,
-			ServerId: m.cfg.ServerID,
-		}
+	if nowPlaying != nil {
+		entry.info.NowPlayingItem = nowPlaying
 	}
 
 	repeatMode := req.RepeatMode

@@ -86,6 +86,7 @@ type UserDto struct {
 	Name                      string            `json:"Name"`
 	ServerId                  string            `json:"ServerId"`
 	Id                        string            `json:"Id"`
+	PrimaryImageTag           string            `json:"PrimaryImageTag,omitempty"`
 	HasPassword               bool              `json:"HasPassword"`
 	HasConfiguredPassword     bool              `json:"HasConfiguredPassword"`
 	HasConfiguredEasyPassword bool              `json:"HasConfiguredEasyPassword"`
