@@ -83,7 +83,9 @@ export function Layout() {
   }, [location.pathname])
 
   const navLinkClass = ({ isActive }: { isActive: boolean }) =>
-    `group flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition-all ${
+    `group flex items-center rounded-xl py-2.5 text-sm font-medium transition-all ${
+      collapsed ? 'justify-center px-2' : 'gap-3 px-3'
+    } ${
       isActive
         ? 'bg-gradient-to-r from-amber-500/20 to-orange-500/10 text-amber-400 ring-1 ring-amber-500/30'
         : 'text-zinc-400 hover:bg-white/6 hover:text-zinc-100'
@@ -92,10 +94,16 @@ export function Layout() {
   const sidebarContent = (
     <div className="flex h-full flex-col">
       {/* 品牌 Logo */}
-      <div className="flex h-16 items-center justify-between px-4">
-        <Link to="/" className="flex items-center overflow-hidden">
+      <div
+        className={`flex items-center transition-all ${
+          collapsed
+            ? 'flex-col justify-center gap-2 px-2 py-3.5'
+            : 'h-16 justify-between px-4'
+        }`}
+      >
+        <Link to="/" className="flex shrink-0 items-center">
           <AmbraLogo
-            size={36}
+            size={collapsed ? 32 : 36}
             showWordmark={!collapsed}
             subtitle={collapsed ? undefined : 'Cinema Server'}
           />
@@ -104,8 +112,11 @@ export function Layout() {
         <button
           type="button"
           onClick={() => setCollapsed((c) => !c)}
-          className="hidden rounded-lg p-1.5 text-zinc-400 hover:bg-white/8 hover:text-zinc-100 lg:flex"
+          className={`hidden items-center justify-center rounded-lg text-zinc-400 hover:bg-white/8 hover:text-zinc-100 lg:flex ${
+            collapsed ? 'h-7 w-7 bg-white/[0.04]' : 'p-1.5'
+          }`}
           title={collapsed ? '展开侧边栏' : '折叠侧边栏'}
+          aria-label={collapsed ? '展开侧边栏' : '折叠侧边栏'}
         >
           {collapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
         </button>
