@@ -38,12 +38,13 @@ type ProbedStream struct {
 
 // ProbeResult holds the parsed container-level and stream-level media metadata from ffprobe.
 type ProbeResult struct {
-	Container    string
-	RuntimeTicks int64
-	Bitrate      int
-	Size         int64
-	Tags         map[string]string
-	Streams      []ProbedStream
+	Container      string
+	RuntimeTicks   int64
+	Bitrate        int
+	Size           int64
+	Tags           map[string]string
+	Streams        []ProbedStream
+	HasAttachedPic bool
 }
 
 // Prober executes ffprobe to extract real media metadata from local video files.
@@ -195,6 +196,7 @@ func ParseFFprobeJSON(raw []byte) (*ProbeResult, error) {
 		case "video":
 			// Skip embedded cover art (attached_pic) so it is not treated as a video track.
 			if st.Disposition["attached_pic"] == 1 {
+				res.HasAttachedPic = true
 				continue
 			}
 			vRange := detectVideoRange(st)

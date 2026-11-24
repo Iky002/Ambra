@@ -2,13 +2,14 @@ import { useQuery } from '@tanstack/react-query'
 import { Heart, Loader2 } from 'lucide-react'
 import { api } from '../api/client'
 import { MediaCard } from '../components/MediaCard'
+import { QueryErrorState } from '../components/QueryErrorState'
 import { useAuth } from '../context/AuthContext'
 
 export function FavoritesPage() {
   const { auth } = useAuth()
   const userId = auth!.userId
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['favorites', userId],
     queryFn: () =>
       api.getItems(userId, {
@@ -38,6 +39,13 @@ export function FavoritesPage() {
         <div className="flex h-64 items-center justify-center">
           <Loader2 className="h-7 w-7 animate-spin text-amber-400" />
         </div>
+      ) : isError ? (
+        <QueryErrorState
+          title="无法加载收藏列表"
+          error={error}
+          onRetry={() => void refetch()}
+          backTo="/"
+        />
       ) : items.length === 0 ? (
         <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-20 text-center text-sm text-zinc-500">
           还没有收藏任何影片，在详情页点击爱心即可加入收藏

@@ -15,6 +15,7 @@ import { Link, useNavigate } from 'react-router-dom'
 import { api, getBackdropUrl, getFallbackImageUrl, getImageUrl } from '../api/client'
 import type { BaseItemDto } from '../api/types'
 import { MediaCard } from '../components/MediaCard'
+import { QueryErrorState } from '../components/QueryErrorState'
 import { useAuth } from '../context/AuthContext'
 import { formatTicks } from '../player/subtitleUtils'
 
@@ -86,17 +87,30 @@ export function HomePage() {
   const userId = auth!.userId
   const [heroIdx, setHeroIdx] = useState(0)
 
-  const { data: viewsData } = useQuery({
+  const {
+    data: viewsData,
+    isError: viewsError,
+    error: viewsErr,
+    refetch: refetchViews,
+  } = useQuery({
     queryKey: ['userViews', userId],
     queryFn: () => api.getUserViews(userId),
   })
 
-  const { data: resumeData } = useQuery({
+  const {
+    data: resumeData,
+    refetch: refetchResume,
+  } = useQuery({
     queryKey: ['resumeItems', userId],
     queryFn: () => api.getResumeItems(userId, 12),
   })
 
-  const { data: heroData } = useQuery({
+  const {
+    data: heroData,
+    isError: heroError,
+    error: heroErr,
+    refetch: refetchHero,
+  } = useQuery({
     queryKey: ['heroItems', userId],
     queryFn: () =>
       api.getItems(userId, {
@@ -110,6 +124,14 @@ export function HomePage() {
   const views = viewsData?.Items || []
   const resumeItems = resumeData?.Items || []
   const heroItems = heroData?.Items || []
+  const hasPrimaryError = (viewsError || heroError) && views.length === 0 && heroItems.length === 0
+  const primaryError = viewsErr || heroErr
+
+  const handleRetryHome = () => {
+    void refetchViews()
+    void refetchHero()
+    void refetchResume()
+  }
 
   const latestQueries = useQueries({
     queries: views.slice(0, 6).map((view) => ({
@@ -139,8 +161,28 @@ export function HomePage() {
     setHeroImgFailed(false)
   }, [activeHero?.Id, heroBackdrop])
 
+  if (hasPrimaryError) {
+    return (
+      <QueryErrorState
+        title="无法加载首页内容"
+        error={primaryError}
+        onRetry={handleRetryHome}
+      />
+    )
+  }
+
   return (
     <div className="space-y-10">
+      {(viewsError || heroError) && (
+        <div className="px-4 pt-6 lg:px-8">
+          <QueryErrorState
+            compact
+            title="部分首页数据加载失败"
+            error={primaryError}
+            onRetry={handleRetryHome}
+          />
+        </div>
+      )}
       {/* 全宽轮播 Hero Banner */}
       {activeHero ? (
         <section className="relative h-[54vh] min-h-[380px] max-h-[560px] w-full overflow-hidden">

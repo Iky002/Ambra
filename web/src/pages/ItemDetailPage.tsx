@@ -33,7 +33,7 @@ import {
 } from 'lucide-react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, getBackdropUrl, getFallbackImageUrl, getImageUrl } from '../api/client'
-import type { BaseItemDto, MediaSourceInfo, MediaStream } from '../api/types'
+import type { BaseItemDto, MediaSourceInfo } from '../api/types'
 import { formatAudioTime } from '../components/AudioPlayerBar'
 import { MediaCard } from '../components/MediaCard'
 import { IdentifyModal } from '../components/media/IdentifyModal'
@@ -42,7 +42,11 @@ import { MergeVersionsModal } from '../components/media/MergeVersionsModal'
 import { MetadataEditorModal } from '../components/media/MetadataEditorModal'
 import { useAudioPlayer } from '../context/AudioPlayerContext'
 import { useAuth } from '../context/AuthContext'
-import { loadPlaybackPrefs } from '../player/playbackPrefs'
+import {
+  loadPlaybackPrefs,
+  pickPreferredAudioIndex,
+  pickPreferredSubtitleIndex,
+} from '../player/playbackPrefs'
 import {
   detectChineseVariant,
   formatTicks,
@@ -50,64 +54,6 @@ import {
   getSubtitleMeta,
 } from '../player/subtitleUtils'
 import { AdminModal, FeedbackBanner } from './admin/adminUtils'
-
-function matchesPreferredLang(stream: MediaStream, pref: string): boolean {
-  const normalized = pref.trim().toLowerCase()
-  if (!normalized) return false
-  const haystack = [stream.Language, stream.DisplayTitle, stream.Title]
-    .filter(Boolean)
-    .join(' ')
-    .toLowerCase()
-
-  if (normalized === 'zh' || normalized === 'chi' || normalized === 'zho') {
-    return (
-      Boolean(detectChineseVariant(stream)) ||
-      /\b(zh|chi|zho|chs|cht|cmn|yue)\b/.test(haystack) ||
-      /中文|国语|國語|普通话|粤语|粵語|简体|繁體|繁体/.test(haystack)
-    )
-  }
-  if (normalized === 'zh-cn' || normalized === 'chs' || normalized === 'sc') {
-    return detectChineseVariant(stream) === '简体' || /\b(zh-cn|chs|sc)\b|简体|简中/.test(haystack)
-  }
-  if (normalized === 'zh-tw' || normalized === 'zh-hk' || normalized === 'cht' || normalized === 'tc') {
-    return detectChineseVariant(stream) === '繁体' || /\b(zh-tw|zh-hk|cht|tc)\b|繁体|繁體|繁中/.test(haystack)
-  }
-  if (normalized === 'en' || normalized === 'eng') {
-    return /\b(en|eng)\b|english|英语|英文/.test(haystack)
-  }
-  if (normalized === 'ja' || normalized === 'jpn') {
-    return /\b(ja|jpn|jp)\b|japanese|日语|日文/.test(haystack)
-  }
-  return haystack.includes(normalized)
-}
-
-function resolvePreferredTracks(source?: MediaSourceInfo): {
-  audioIdx: number | undefined
-  subIdx: number | undefined
-} {
-  if (!source) return { audioIdx: undefined, subIdx: undefined }
-  const prefs = loadPlaybackPrefs()
-  const allStreams = source.MediaStreams || []
-  const audios = allStreams.filter((s) => s.Type === 'Audio')
-  const subs = allStreams.filter((s) => s.Type === 'Subtitle')
-
-  let audioIdx = source.DefaultAudioStreamIndex
-  if (prefs.preferredAudioLang) {
-    const matchedAudio = audios.find((s) => matchesPreferredLang(s, prefs.preferredAudioLang))
-    if (matchedAudio) audioIdx = matchedAudio.Index
-  }
-
-  let subIdx = source.DefaultSubtitleStreamIndex
-  const prefSub = prefs.preferredSubtitleLang.trim().toLowerCase()
-  if (prefSub === 'off' || prefSub === 'none') {
-    subIdx = undefined
-  } else if (prefSub) {
-    const matchedSub = subs.find((s) => matchesPreferredLang(s, prefSub))
-    if (matchedSub) subIdx = matchedSub.Index
-  }
-
-  return { audioIdx, subIdx }
-}
 
 export function ItemDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -279,10 +225,23 @@ export function ItemDetailPage() {
   useEffect(() => {
     if (mediaSources.length > 0) {
       const first = mediaSources[0]
-      const { audioIdx, subIdx } = resolvePreferredTracks(first)
+      const prefs = loadPlaybackPrefs()
+      const firstStreams = first.MediaStreams || []
       setSelectedSourceId(first.Id)
-      setSelectedAudioIdx(audioIdx)
-      setSelectedSubIdx(subIdx)
+      setSelectedAudioIdx(
+        pickPreferredAudioIndex(
+          firstStreams.filter((s) => s.Type === 'Audio'),
+          prefs.preferredAudioLang,
+          first.DefaultAudioStreamIndex,
+        ),
+      )
+      setSelectedSubIdx(
+        pickPreferredSubtitleIndex(
+          firstStreams.filter((s) => s.Type === 'Subtitle'),
+          prefs.preferredSubtitleLang,
+          first.DefaultSubtitleStreamIndex,
+        ),
+      )
     }
   }, [item?.Id, mediaSources.length])
 
@@ -603,7 +562,11 @@ export function ItemDetailPage() {
     if (targetId === item.Id) {
       if (activeSource?.Id) params.set('mediaSourceId', activeSource.Id)
       if (selectedAudioIdx !== undefined) params.set('audio', String(selectedAudioIdx))
-      if (selectedSubIdx !== undefined) params.set('subtitle', String(selectedSubIdx))
+      if (selectedSubIdx !== undefined) {
+        params.set('subtitle', String(selectedSubIdx))
+      } else if (subtitleStreams.length > 0) {
+        params.set('subtitle', 'off')
+      }
     }
     if (startTicks > 0) params.set('startTicks', String(startTicks))
     const qs = params.toString()
@@ -964,10 +927,27 @@ export function ItemDetailPage() {
                         value={activeSource?.Id || ''}
                         onChange={(e) => {
                           const next = mediaSources.find((s) => s.Id === e.target.value)
-                          const { audioIdx, subIdx } = resolvePreferredTracks(next)
+                          const prefs = loadPlaybackPrefs()
+                          const nextStreams = next?.MediaStreams || []
                           setSelectedSourceId(e.target.value)
-                          setSelectedAudioIdx(audioIdx)
-                          setSelectedSubIdx(subIdx)
+                          setSelectedAudioIdx(
+                            next
+                              ? pickPreferredAudioIndex(
+                                  nextStreams.filter((s) => s.Type === 'Audio'),
+                                  prefs.preferredAudioLang,
+                                  next.DefaultAudioStreamIndex,
+                                )
+                              : undefined,
+                          )
+                          setSelectedSubIdx(
+                            next
+                              ? pickPreferredSubtitleIndex(
+                                  nextStreams.filter((s) => s.Type === 'Subtitle'),
+                                  prefs.preferredSubtitleLang,
+                                  next.DefaultSubtitleStreamIndex,
+                                )
+                              : undefined,
+                          )
                         }}
                         className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
                       >

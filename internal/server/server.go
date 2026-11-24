@@ -264,7 +264,9 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	})
 
 	// Phase 3: FFmpeg Dynamic HLS, Encoding, LiveStreams & Audio
-	hls.New(libRepo, transcodeMgr, cfg).RegisterRoutes(mediaMux, hls.AuthFuncs{
+	hlsH := hls.New(libRepo, transcodeMgr, cfg)
+	hlsH.SetUserRepo(userRepo)
+	hlsH.RegisterRoutes(mediaMux, hls.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
@@ -341,7 +343,9 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
 	})
-	compatCoreH := compatcore.New(cfg, store, userRepo, libRepo, sessionMgr, registry).BuildRouter(compatcore.AuthFuncs{
+	compatCoreSvc := compatcore.New(cfg, store, userRepo, libRepo, sessionMgr, registry)
+	compatCoreSvc.SetWSHub(wsHub)
+	compatCoreH := compatCoreSvc.BuildRouter(compatcore.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,

@@ -4,6 +4,7 @@ import { ArrowLeft, Film, Loader2, Tv, User } from 'lucide-react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { api, getFallbackImageUrl, getImageUrl } from '../api/client'
 import { MediaCard } from '../components/MediaCard'
+import { QueryErrorState } from '../components/QueryErrorState'
 import { useAuth } from '../context/AuthContext'
 
 type MediaFilter = 'ALL' | 'Movie' | 'Series'
@@ -35,7 +36,13 @@ export function PersonDetailPage() {
 
   const displayName = personItem?.Name || nameFromQuery || decodedId
 
-  const { data: worksData, isLoading: worksLoading } = useQuery({
+  const {
+    data: worksData,
+    isLoading: worksLoading,
+    isError: worksError,
+    error: worksErr,
+    refetch: refetchWorks,
+  } = useQuery({
     queryKey: ['personWorks', userId, decodedId, displayName],
     queryFn: async () => {
       const idLooksLikeName = Boolean(nameFromQuery && decodedId === nameFromQuery)
@@ -232,6 +239,13 @@ export function PersonDetailPage() {
           <div className="flex h-52 items-center justify-center">
             <Loader2 className="h-7 w-7 animate-spin text-amber-400" />
           </div>
+        ) : worksError ? (
+          <QueryErrorState
+            compact
+            title="无法加载相关作品"
+            error={worksErr}
+            onRetry={() => void refetchWorks()}
+          />
         ) : filteredWorks.length === 0 ? (
           <div className="rounded-2xl border border-dashed border-white/10 bg-white/[0.02] py-16 text-center text-sm text-zinc-500">
             媒体库中暂未找到该分类下与「{displayName}」相关的作品

@@ -39,6 +39,7 @@ export interface AudioPlayerContextValue {
   toggleShuffle: () => void
   selectTrackAt: (index: number) => void
   removeFromQueue: (index: number) => void
+  retry: () => void
   clearError: () => void
   close: () => void
 }
@@ -70,6 +71,7 @@ const DEFAULT_AUDIO_CONTEXT: AudioPlayerContextValue = {
   toggleShuffle: NOOP,
   selectTrackAt: NOOP,
   removeFromQueue: NOOP,
+  retry: NOOP,
   clearError: NOOP,
   close: NOOP,
 }
@@ -267,6 +269,34 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
     setIsPlaying(false)
   }, [])
 
+  const retry = useCallback(() => {
+    const audio = audioRef.current
+    const { queue: q, currentIndex: idx } = stateRef.current
+    const track = idx >= 0 && idx < q.length ? q[idx] : null
+    if (!audio || !track) return
+
+    setPlaybackError(null)
+    audio.src = getAudioStreamUrl(track.Id)
+    audio.load()
+
+    const p = audio.play()
+    if (p && typeof p.then === 'function') {
+      p.then(() => {
+        setIsPlaying(true)
+        setPlaybackError(null)
+      }).catch((err: unknown) => {
+        setIsPlaying(false)
+        setPlaybackError(
+          err instanceof Error && err.message
+            ? `音频播放失败：${err.message}`
+            : '音频播放被拦截或加载失败，请点击重试',
+        )
+      })
+    } else {
+      setIsPlaying(true)
+    }
+  }, [])
+
   const togglePlay = useCallback(() => {
     const audio = audioRef.current
     if (!audio || stateRef.current.currentIndex < 0) return
@@ -274,6 +304,12 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
       audio.pause()
       setIsPlaying(false)
     } else {
+      const noSourceState =
+        typeof HTMLMediaElement !== 'undefined' ? HTMLMediaElement.NETWORK_NO_SOURCE : 3
+      if (audio.error || audio.networkState === noSourceState) {
+        retry()
+        return
+      }
       setPlaybackError(null)
       const p = audio.play()
       if (p && typeof p.then === 'function') {
@@ -292,7 +328,7 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
         setIsPlaying(true)
       }
     }
-  }, [isPlaying])
+  }, [isPlaying, retry])
 
   const seek = useCallback((sec: number) => {
     const audio = audioRef.current
@@ -338,17 +374,21 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const removeFromQueue = useCallback((index: number) => {
-    setQueue((prevQueue) => {
-      if (index < 0 || index >= prevQueue.length) return prevQueue
-      const nextQueue = prevQueue.filter((_, i) => i !== index)
-      setCurrentIndex((prevIdx) => {
-        if (nextQueue.length === 0) return -1
-        if (index < prevIdx) return prevIdx - 1
-        if (index === prevIdx) return Math.min(prevIdx, nextQueue.length - 1)
-        return prevIdx
-      })
-      return nextQueue
-    })
+    const { queue: prevQueue, currentIndex: prevIdx } = stateRef.current
+    if (index < 0 || index >= prevQueue.length) return
+    const nextQueue = prevQueue.filter((_, i) => i !== index)
+    let nextIdx: number
+    if (nextQueue.length === 0) {
+      nextIdx = -1
+    } else if (index < prevIdx) {
+      nextIdx = prevIdx - 1
+    } else if (index === prevIdx) {
+      nextIdx = Math.min(prevIdx, nextQueue.length - 1)
+    } else {
+      nextIdx = prevIdx
+    }
+    setQueue(nextQueue)
+    setCurrentIndex(nextIdx)
   }, [])
 
   const close = useCallback(() => {
@@ -430,6 +470,7 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
       toggleShuffle,
       selectTrackAt,
       removeFromQueue,
+      retry,
       clearError,
       close,
     }),
@@ -458,6 +499,7 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
       toggleShuffle,
       selectTrackAt,
       removeFromQueue,
+      retry,
       clearError,
       close,
     ],

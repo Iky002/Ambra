@@ -85,7 +85,7 @@ func TestParseM3U(t *testing.T) {
 }
 
 func TestLiveTVTunerHostsChannelsPrograms(t *testing.T) {
-	_, mux, st, cfg := setupLiveTVTest(t)
+	h, mux, st, cfg := setupLiveTVTest(t)
 
 	// Info before tuners
 	rec := doJSON(t, mux, http.MethodGet, "/LiveTv/Info", nil)
@@ -128,6 +128,7 @@ func TestLiveTVTunerHostsChannelsPrograms(t *testing.T) {
 		_, _ = w.Write([]byte("#EXTM3U\n#EXTINF:-1 tvg-id=\"ch3\" group-title=\"News\",CNN\nhttp://tv/cnn.m3u8\n"))
 	}))
 	defer ts.Close()
+	h.SetHTTPClient(ts.Client())
 
 	// Failing HTTP M3U
 	if r := doJSON(t, mux, http.MethodPost, "/LiveTv/TunerHosts", map[string]any{
@@ -148,8 +149,8 @@ func TestLiveTVTunerHostsChannelsPrograms(t *testing.T) {
 		t.Fatalf("update host via HTTP status=%d body=%s", rec.Code, rec.Body.String())
 	}
 
-	// Local file M3U
-	m3uFile := filepath.Join(t.TempDir(), "local.m3u")
+	// Local file M3U inside cfg.DataDir
+	m3uFile := filepath.Join(cfg.DataDir, "local.m3u")
 	_ = os.WriteFile(m3uFile, []byte("#EXTM3U\n#EXTINF:-1 group-title=\"Kids\",Disney\nhttp://tv/disney.m3u8\n"), 0o644)
 	rec = doJSON(t, mux, http.MethodPost, "/LiveTv/TunerHosts", map[string]any{
 		"Type": "m3u",
@@ -406,5 +407,64 @@ func TestLiveTVRecordingsTimersSeriesTimersAndListingProviders(t *testing.T) {
 	p, tot = paginate([]int{1, 2, 3}, 10, 2)
 	if tot != 3 || len(p) != 0 {
 		t.Fatalf("unexpected paginate beyond end: %v %d", p, tot)
+	}
+}
+
+func TestLiveTVSSRFAndLocalFileBlocking(t *testing.T) {
+	_, mux, _, cfg := setupLiveTVTest(t)
+
+	// Local HTTP server on loopback must be blocked by default safe client
+	loopbackSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("#EXTM3U\n#EXTINF:-1,Secret\nhttp://internal/stream.m3u8\n"))
+	}))
+	defer loopbackSrv.Close()
+
+	// Outside directory files for path traversal & symlink escape tests
+	outsideDir := t.TempDir()
+	outsideM3U := filepath.Join(outsideDir, "outside.m3u")
+	_ = os.WriteFile(outsideM3U, []byte("#EXTM3U\n#EXTINF:-1,Outside\nhttp://tv/out.m3u8\n"), 0o644)
+
+	wrongExtInData := filepath.Join(cfg.DataDir, "secret.txt")
+	_ = os.WriteFile(wrongExtInData, []byte("#EXTM3U\n#EXTINF:-1,Txt\nhttp://tv/txt.m3u8\n"), 0o644)
+
+	symlinkEscape := filepath.Join(cfg.DataDir, "escape.m3u")
+	_ = os.Symlink(outsideM3U, symlinkEscape)
+
+	blockedSources := []struct {
+		name string
+		src  string
+	}{
+		{"loopback http", loopbackSrv.URL + "/playlist.m3u"},
+		{"uppercase HTTP loopback", "HTTP://127.0.0.1:8096/playlist.m3u"},
+		{"cloud metadata", "http://169.254.169.254/latest/meta-data/"},
+		{"private LAN", "http://192.168.1.1/playlist.m3u"},
+		{"file scheme", "file:///etc/passwd"},
+		{"etc passwd", "/etc/passwd"},
+		{"wrong extension inside DataDir", wrongExtInData},
+		{"m3u outside DataDir", outsideM3U},
+		{"symlink escape to outside m3u", symlinkEscape},
+	}
+
+	for _, tc := range blockedSources {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := doJSON(t, mux, http.MethodPost, "/LiveTv/TunerHosts", map[string]any{
+				"Type": "m3u",
+				"Url":  tc.src,
+			})
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for blocked source %q, got %d body=%s", tc.src, rec.Code, rec.Body.String())
+			}
+		})
+	}
+
+	// Valid .m3u8 file inside DataDir must succeed
+	validM3U8 := filepath.Join(cfg.DataDir, "valid.m3u8")
+	_ = os.WriteFile(validM3U8, []byte("#EXTM3U\n#EXTINF:-1,Allowed Channel\nhttp://tv/allowed.m3u8\n"), 0o644)
+	rec := doJSON(t, mux, http.MethodPost, "/LiveTv/TunerHosts", map[string]any{
+		"Type": "m3u",
+		"Url":  validM3U8,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for valid .m3u8 in DataDir, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }

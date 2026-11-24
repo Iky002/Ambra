@@ -136,6 +136,28 @@ func (s *Scanner) resolveLocalImagePath(ctx context.Context, lib *sqlite.Library
 			}
 		}
 
+	case "musicartist":
+		dir = itemPath
+		switch imgType {
+		case "Primary":
+			filename = "folder" + ext
+		case "Backdrop":
+			filename = "fanart" + ext
+		default:
+			return "", false
+		}
+
+	case "musicalbum":
+		dir = itemPath
+		switch imgType {
+		case "Primary":
+			filename = "cover" + ext
+		case "Backdrop":
+			filename = "fanart" + ext
+		default:
+			return "", false
+		}
+
 	default:
 		return "", false
 	}
@@ -428,6 +450,18 @@ func (s *Scanner) resolveLocalNFOTarget(ctx context.Context, rec *sqlite.ItemRec
 			return "", "", false
 		}
 		return "movie", replacePathExtWithNFO(itemPath), true
+
+	case "musicartist":
+		if !isExistingDirPath(itemPath) {
+			return "", "", false
+		}
+		return "artist", filepath.Join(itemPath, "artist.nfo"), true
+
+	case "musicalbum":
+		if !isExistingDirPath(itemPath) {
+			return "", "", false
+		}
+		return "album", filepath.Join(itemPath, "album.nfo"), true
 
 	default:
 		return "", "", false

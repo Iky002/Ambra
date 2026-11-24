@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/middleware"
@@ -20,6 +19,7 @@ import (
 	"github.com/ambra-media/ambra/internal/core/playback"
 	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -44,14 +44,17 @@ type Handler struct {
 
 func New(repo *sqlite.LibraryRepo, engine *playback.Engine, img *imaging.Service) *Handler {
 	return &Handler{
-		repo:    repo,
-		engine:  engine,
-		imaging: img,
-		httpClient: &http.Client{
-			Transport: &http.Transport{
-				ResponseHeaderTimeout: 30 * time.Second,
-			},
-		},
+		repo:       repo,
+		engine:     engine,
+		imaging:    img,
+		httpClient: netutil.NewSafeHTTPClient(0, true),
+	}
+}
+
+// SetProxyClient overrides the HTTP client used for remote STRM reverse-proxying (primarily for testing).
+func (h *Handler) SetProxyClient(client *http.Client) {
+	if client != nil {
+		h.httpClient = client
 	}
 }
 
@@ -457,6 +460,10 @@ func (h *Handler) tryServeLibraryCover(w http.ResponseWriter, r *http.Request, l
 }
 
 func (h *Handler) proxyRemoteMedia(w http.ResponseWriter, r *http.Request, targetURL string, asAttachment bool) {
+	if err := netutil.ValidateRemoteURL(targetURL, true); err != nil {
+		httpx.Error(w, http.StatusBadGateway, "blocked upstream stream url: "+err.Error())
+		return
+	}
 	upReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, nil)
 	if err != nil {
 		httpx.Error(w, http.StatusBadGateway, "invalid upstream stream url: "+err.Error())

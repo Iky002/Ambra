@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -607,7 +608,7 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 	if task.NeedProbe {
 		s.updateEnrichCurrent(task.LibraryID, itemLabel, "探测媒体流信息")
 		probeRes = s.probeMedia(ctx, task.MediaPath, task.IsStrm)
-		if probeRes != nil && (len(probeRes.Streams) > 0 || len(probeRes.Tags) > 0) {
+		if probeRes != nil && (len(probeRes.Streams) > 0 || len(probeRes.Tags) > 0 || probeRes.HasAttachedPic) {
 			rec, err := s.repo.GetItemRecordByID(ctx, task.ItemID)
 			if err == nil && rec != nil {
 				if len(probeRes.Streams) > 0 {
@@ -622,7 +623,8 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 					rec.RuntimeTicks = &rt
 					recDirty = true
 				}
-				if !task.IsAltMediaSource && (strings.EqualFold(rec.Type, "Audio") || strings.EqualFold(rec.MediaType, "Audio")) && len(probeRes.Tags) > 0 {
+				isAudio := strings.EqualFold(rec.Type, "Audio") || strings.EqualFold(rec.MediaType, "Audio")
+				if !task.IsAltMediaSource && isAudio && len(probeRes.Tags) > 0 {
 					if applyAudioProbeTags(rec, probeRes.Tags) {
 						recDirty = true
 					}
@@ -630,11 +632,16 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 				if recDirty {
 					if err := s.repo.UpsertItem(ctx, rec); err == nil {
 						updated = true
-						if strings.EqualFold(rec.Type, "Audio") || strings.EqualFold(rec.MediaType, "Audio") {
+						if isAudio {
 							artistStr := strings.Join(rec.Extra.Artists, " ")
 							titleTokens := TokenizeForFTS(rec.Name, rec.Extra.Album, artistStr)
 							_ = s.repo.UpsertSearchFTS(ctx, rec.ID, rec.Name, titleTokens, "", "", artistStr)
 						}
+					}
+				}
+				if !task.IsAltMediaSource && !task.IsStrm && isAudio && probeRes.HasAttachedPic {
+					if s.extractAudioAttachedPic(ctx, rec, task.MediaPath) {
+						updated = true
 					}
 				}
 			}
@@ -686,6 +693,100 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 	}
 
 	return updated
+}
+
+func (s *Scanner) extractAudioAttachedPic(ctx context.Context, rec *sqlite.ItemRecord, mediaPath string) bool {
+	if rec == nil || strings.TrimSpace(mediaPath) == "" || s.repo == nil {
+		return false
+	}
+
+	needTrackImg := s.isMissingPrimaryImage(ctx, rec.ID)
+	var albumRec *sqlite.ItemRecord
+	albumID := strings.TrimSpace(rec.Extra.AlbumID)
+	if albumID == "" {
+		albumID = strings.TrimSpace(rec.ParentID)
+	}
+	if albumID != "" {
+		if parent, err := s.repo.GetItemRecordByID(ctx, albumID); err == nil && parent != nil && strings.EqualFold(parent.Type, "MusicAlbum") {
+			albumRec = parent
+		}
+	}
+	needAlbumImg := albumRec != nil && s.isMissingPrimaryImage(ctx, albumRec.ID)
+	if !needTrackImg && !needAlbumImg {
+		return false
+	}
+
+	var destPath string
+	if needAlbumImg && albumRec != nil {
+		if lib, saveLocal := s.shouldSaveLocalMetadata(ctx, albumRec.LibraryID); saveLocal {
+			if localPath, ok := s.resolveLocalImagePath(ctx, lib, albumRec, "Primary", ".jpg"); ok && localPath != "" {
+				destPath = localPath
+			}
+		}
+		if destPath == "" && !needTrackImg {
+			destPath = filepath.Join(s.imageStorageDir(), albumRec.ID, "primary.jpg")
+		}
+	}
+	if destPath == "" {
+		destPath = filepath.Join(s.imageStorageDir(), rec.ID, "primary.jpg")
+	}
+
+	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+		return false
+	}
+
+	ffmpegPath := "ffmpeg"
+	if s.cfg != nil && strings.TrimSpace(s.cfg.FFmpegPath) != "" {
+		ffmpegPath = s.cfg.FFmpegPath
+	}
+
+	extractCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(
+		extractCtx,
+		ffmpegPath,
+		"-hide_banner",
+		"-loglevel", "error",
+		"-y",
+		"-i", mediaPath,
+		"-map", "0:v:0",
+		"-frames:v", "1",
+		destPath,
+	)
+	if err := cmd.Run(); err != nil {
+		return false
+	}
+	info, err := os.Stat(destPath)
+	if err != nil || info.IsDir() || info.Size() == 0 {
+		return false
+	}
+
+	tag := computeEtag(destPath, info.Size(), info.ModTime().Unix())
+	saved := false
+	if needTrackImg {
+		if err := s.repo.UpsertImage(ctx, &sqlite.ImageRecord{
+			ItemID:     rec.ID,
+			ImageType:  "Primary",
+			ImageIndex: 0,
+			Path:       destPath,
+			Tag:        tag,
+		}); err == nil {
+			saved = true
+		}
+	}
+	if needAlbumImg && albumRec != nil {
+		if err := s.repo.UpsertImage(ctx, &sqlite.ImageRecord{
+			ItemID:     albumRec.ID,
+			ImageType:  "Primary",
+			ImageIndex: 0,
+			Path:       destPath,
+			Tag:        tag,
+		}); err == nil {
+			saved = true
+		}
+	}
+	return saved
 }
 
 func (s *Scanner) tryAutoMergeMovieByProviderID(ctx context.Context, rec *sqlite.ItemRecord) bool {
