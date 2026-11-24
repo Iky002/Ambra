@@ -27,6 +27,7 @@ import type { BaseItemDto } from '../api/types'
 import { useAuth } from '../context/AuthContext'
 import { isDemoMode } from '../demo/demoMode'
 import { AmbraLogo } from './AmbraLogo'
+import { ScanProgressBar } from './ScanProgressBar'
 import { SearchModal } from './SearchModal'
 
 function libraryIcon(view: BaseItemDto) {
@@ -283,6 +284,9 @@ export function Layout() {
             </button>
           </div>
         )}
+
+        {/* 管理员实时媒体库扫描与刮削进度顶栏 */}
+        {isAdmin && <ScanProgressBar variant="banner" />}
 
         {/* 顶部毛玻璃导航条 */}
         <header className="sticky top-0 z-30 flex h-16 items-center justify-between gap-4 border-b border-white/6 bg-[#09090d]/75 px-4 backdrop-blur-xl lg:px-8">

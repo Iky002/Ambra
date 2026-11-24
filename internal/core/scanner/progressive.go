@@ -29,6 +29,8 @@ type enrichTask struct {
 	NeedProbe        bool
 	NeedOnlineMeta   bool
 	IsAltMediaSource bool
+	HasLocalTitle    bool
+	DisplayName      string
 }
 
 // SetBudget sets the shared background concurrency budget pool used by Phase B enrichment.
@@ -148,6 +150,7 @@ func (s *Scanner) scanLibrary(ctx context.Context, libraryID string, asyncPhaseB
 		s.mu.Lock()
 		delete(s.scanning, libraryID)
 		delete(s.cancels, libraryID)
+		delete(s.progress, libraryID)
 		s.mu.Unlock()
 	}
 
@@ -156,6 +159,8 @@ func (s *Scanner) scanLibrary(ctx context.Context, libraryID string, asyncPhaseB
 		releaseScan()
 		return stats, err
 	}
+
+	s.startLibraryProgress(lib.ID, lib.Name)
 
 	tasks, err := s.runPhaseA(scanCtx, lib, lib.Paths, &stats)
 	if err != nil {
@@ -341,12 +346,15 @@ func (s *Scanner) processDiscoveredFile(
 	}
 	if err != nil {
 		stats.Errors++
+		s.recordDiscoveryItem(lib.ID, filepath.Base(path), false, false, true)
 		return nil
 	}
 	if changed {
 		stats.ItemsAdded++
+		s.recordDiscoveryItem(lib.ID, filepath.Base(path), true, false, false)
 	} else {
 		stats.ItemsSkipped++
+		s.recordDiscoveryItem(lib.ID, filepath.Base(path), false, true, false)
 	}
 	return tasks
 }
@@ -355,6 +363,8 @@ func (s *Scanner) runPhaseB(ctx context.Context, libraryID string, tasks []enric
 	if len(tasks) == 0 {
 		return
 	}
+
+	s.startEnrichPhase(libraryID, len(tasks))
 
 	pool := s.budgetPool()
 	workers := int(pool.Capacity())
@@ -386,9 +396,11 @@ func (s *Scanner) runPhaseB(ctx context.Context, libraryID string, tasks []enric
 					return
 				}
 				err := pool.Do(ctx, 1, func(workCtx context.Context) error {
-					if s.enrichItem(workCtx, task) {
+					itemUpdated := s.enrichItem(workCtx, task)
+					if itemUpdated {
 						enriched.Add(1)
 					}
+					s.recordEnrichDone(libraryID, itemUpdated)
 					return nil
 				})
 				if err != nil {
@@ -412,10 +424,19 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 		return false
 	}
 
+	itemLabel := task.DisplayName
+	if itemLabel == "" {
+		itemLabel = task.Query.Title
+	}
+	if itemLabel == "" {
+		itemLabel = filepath.Base(task.MediaPath)
+	}
+
 	var updated bool
 
 	var probeRes *ProbeResult
 	if task.NeedProbe {
+		s.updateEnrichCurrent(task.LibraryID, itemLabel, "探测媒体流信息")
 		probeRes = s.probeMedia(ctx, task.MediaPath, task.IsStrm)
 		if probeRes != nil && len(probeRes.Streams) > 0 {
 			rec, err := s.repo.GetItemRecordByID(ctx, task.ItemID)
@@ -436,13 +457,15 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 	}
 
 	if task.NeedOnlineMeta && !task.IsAltMediaSource {
+		s.updateEnrichCurrent(task.LibraryID, itemLabel, "刮削元数据与下载海报")
 		onlineMeta := s.fetchMetadataFiltered(ctx, task.Query, false)
 		if onlineMeta != nil {
 			rec, err := s.repo.GetItemRecordByID(ctx, task.ItemID)
 			if err == nil && rec != nil {
-				applyOnlineMetadataToItem(rec, onlineMeta)
+				applyOnlineMetadataToItem(rec, onlineMeta, task.HasLocalTitle)
 				if err := s.repo.UpsertItem(ctx, rec); err == nil {
 					s.persistMetaRelationsAndFTS(ctx, rec, onlineMeta)
+					s.downloadAndSaveRemoteImages(ctx, rec, onlineMeta)
 					updated = true
 				}
 			}
@@ -522,39 +545,54 @@ func (s *Scanner) fetchMetadataFiltered(ctx context.Context, q plugins.MediaQuer
 	return merged
 }
 
-// applyOnlineMetadataToItem fills in metadata fields that were not already populated by local NFO.
-func applyOnlineMetadataToItem(rec *sqlite.ItemRecord, meta *plugins.MetadataResult) {
-	if meta == nil {
+func isFieldLocked(rec *sqlite.ItemRecord, field string) bool {
+	if rec == nil {
+		return false
+	}
+	if rec.Extra.LockData {
+		return true
+	}
+	for _, f := range rec.Extra.LockedFields {
+		if strings.EqualFold(strings.TrimSpace(f), field) {
+			return true
+		}
+	}
+	return false
+}
+
+// applyOnlineMetadataToItem applies online metadata fields while respecting local NFO titles and locked fields.
+func applyOnlineMetadataToItem(rec *sqlite.ItemRecord, meta *plugins.MetadataResult, hasLocalTitle bool) {
+	if rec == nil || meta == nil {
 		return
 	}
-	if meta.Name != "" && rec.Name == "" {
+	if meta.Name != "" && !hasLocalTitle && !isFieldLocked(rec, "Name") {
 		rec.Name = meta.Name
 		rec.SortName = strings.ToLower(meta.Name)
 	}
-	if meta.OriginalTitle != "" && rec.OriginalTitle == "" {
+	if meta.OriginalTitle != "" && rec.OriginalTitle == "" && !isFieldLocked(rec, "OriginalTitle") {
 		rec.OriginalTitle = meta.OriginalTitle
 	}
-	if meta.Overview != "" && rec.Extra.Overview == "" {
+	if meta.Overview != "" && rec.Extra.Overview == "" && !isFieldLocked(rec, "Overview") {
 		rec.Extra.Overview = meta.Overview
 	}
-	if meta.Tagline != "" && len(rec.Extra.Taglines) == 0 {
+	if meta.Tagline != "" && len(rec.Extra.Taglines) == 0 && !isFieldLocked(rec, "Taglines") {
 		rec.Extra.Taglines = []string{meta.Tagline}
 	}
-	if meta.Year > 0 && rec.ProductionYear == nil {
+	if meta.Year > 0 && rec.ProductionYear == nil && !isFieldLocked(rec, "ProductionYear") {
 		y := meta.Year
 		rec.ProductionYear = &y
 	}
-	if meta.PremiereDate != "" && rec.PremiereDate == nil {
+	if meta.PremiereDate != "" && rec.PremiereDate == nil && !isFieldLocked(rec, "PremiereDate") {
 		if t, err := time.Parse("2006-01-02", meta.PremiereDate); err == nil {
 			unix := t.Unix()
 			rec.PremiereDate = &unix
 		}
 	}
-	if meta.CommunityRating > 0 && rec.CommunityRating == nil {
+	if meta.CommunityRating > 0 && rec.CommunityRating == nil && !isFieldLocked(rec, "CommunityRating") {
 		r := meta.CommunityRating
 		rec.CommunityRating = &r
 	}
-	if meta.OfficialRating != "" && rec.OfficialRating == "" {
+	if meta.OfficialRating != "" && rec.OfficialRating == "" && !isFieldLocked(rec, "OfficialRating") {
 		rec.OfficialRating = meta.OfficialRating
 	}
 	if len(meta.ProviderIDs) > 0 {

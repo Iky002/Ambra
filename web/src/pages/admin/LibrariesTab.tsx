@@ -16,6 +16,7 @@ import {
 } from 'lucide-react'
 import { api } from '../../api/client'
 import type { VirtualFolderInfo } from '../../api/types'
+import { ScanProgressBar } from '../../components/ScanProgressBar'
 import { AdminModal, FeedbackBanner, ToggleSwitch } from './adminUtils'
 
 const COLLECTION_TYPES = [
@@ -95,6 +96,7 @@ export function LibrariesTab() {
     setFeedback(null)
     try {
       await api.refreshLibrary(lib?.ItemId)
+      await queryClient.invalidateQueries({ queryKey: ['scanProgress'] })
       setFeedback({
         type: 'success',
         message: lib ? `已触发媒体库「${lib.Name}」扫描任务` : '已触发全部媒体库扫描任务',
@@ -142,6 +144,9 @@ export function LibrariesTab() {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['admin', 'virtualFolders'] }),
         queryClient.invalidateQueries({ queryKey: ['userViews'] }),
+        ...(refreshAfterCreate
+          ? [queryClient.invalidateQueries({ queryKey: ['scanProgress'] })]
+          : []),
       ])
       setFeedback({ type: 'success', message: `已创建媒体库「${libName.trim()}」` })
       setCreateOpen(false)
@@ -227,6 +232,8 @@ export function LibrariesTab() {
         type={feedback?.type}
         onClose={() => setFeedback(null)}
       />
+
+      <ScanProgressBar variant="card" />
 
       {isLoading ? (
         <div className="flex h-40 items-center justify-center rounded-2xl border border-white/8 bg-white/[0.02]">

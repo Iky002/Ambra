@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,9 +41,11 @@ type Scanner struct {
 
 	mu            sync.Mutex
 	budget        *budget.Pool
+	httpClient    *http.Client
 	symlinkPolicy SymlinkPolicy
 	scanning      map[string]bool
 	cancels       map[string]context.CancelFunc
+	progress      map[string]*LibraryScanProgress
 
 	pauseMu  sync.Mutex
 	paused   bool
@@ -63,6 +66,7 @@ func New(repo *sqlite.LibraryRepo, registry *plugins.Registry, bus *eventbus.Bus
 		symlinkPolicy: SymlinkFollowDirect,
 		scanning:      make(map[string]bool),
 		cancels:       make(map[string]context.CancelFunc),
+		progress:      make(map[string]*LibraryScanProgress),
 	}
 }
 
@@ -145,6 +149,35 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 	existing, err := s.repo.FindItemByMediaSourcePath(ctx, lib.ID, mediaPath)
 	if err == nil && existing != nil {
 		if s.isMediaSourceUnchanged(ctx, existing, mediaPath, size, mtime) {
+			if needOnline && s.isMissingPrimaryImage(ctx, existing.ID) {
+				var year int
+				if existing.ProductionYear != nil {
+					year = *existing.ProductionYear
+				}
+				backfillQuery := plugins.MediaQuery{
+					ItemType:    "Movie",
+					Title:       existing.Name,
+					Year:        year,
+					Path:        mediaPath,
+					ProviderIDs: existing.Extra.ProviderIDs,
+					Language:    s.language(),
+				}
+				return false, &enrichTask{
+					ItemID:         existing.ID,
+					LibraryID:      lib.ID,
+					ItemType:       "Movie",
+					MediaPath:      mediaPath,
+					Size:           size,
+					Mtime:          mtime,
+					IsStrm:         isStrm,
+					Container:      container,
+					Query:          backfillQuery,
+					NeedProbe:      false,
+					NeedOnlineMeta: true,
+					HasLocalTitle:  false,
+					DisplayName:    existing.Name,
+				}, nil
+			}
 			return false, nil, nil
 		}
 		if existing.Path != mediaPath {
@@ -273,9 +306,14 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 	if err := s.repo.ReplaceItemImages(ctx, rec.ID, imgs); err != nil {
 		return false, nil, err
 	}
+	if meta != nil {
+		s.downloadAndSaveRemoteImages(ctx, rec, meta)
+	}
 
 	// Taxonomies, People & FTS5
 	s.persistMetaRelationsAndFTS(ctx, rec, meta)
+
+	hasLocalTitle := meta != nil && strings.TrimSpace(meta.Name) != ""
 
 	var task *enrichTask
 	if needProbe || needOnline {
@@ -294,6 +332,8 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 			Query:          query,
 			NeedProbe:      needProbe,
 			NeedOnlineMeta: needOnline,
+			HasLocalTitle:  hasLocalTitle,
+			DisplayName:    rec.Name,
 		}
 	}
 	return true, task, nil
@@ -327,6 +367,72 @@ func (s *Scanner) indexEpisode(
 	existing, err := s.repo.FindItemByMediaSourcePath(ctx, lib.ID, mediaPath)
 	if err == nil && existing != nil {
 		if s.isMediaSourceUnchanged(ctx, existing, mediaPath, size, mtime) {
+			if needOnline {
+				var backfillTasks []enrichTask
+				if existing.SeriesID != "" {
+					if _, dup := seenSeriesEnrich[existing.SeriesID]; !dup && s.isMissingPrimaryImage(ctx, existing.SeriesID) {
+						if seriesRec, sErr := s.repo.GetItemRecordByID(ctx, existing.SeriesID); sErr == nil && seriesRec != nil {
+							seenSeriesEnrich[existing.SeriesID] = struct{}{}
+							var sYear int
+							if seriesRec.ProductionYear != nil {
+								sYear = *seriesRec.ProductionYear
+							}
+							backfillTasks = append(backfillTasks, enrichTask{
+								ItemID:    seriesRec.ID,
+								LibraryID: lib.ID,
+								ItemType:  "Series",
+								MediaPath: seriesRec.Path,
+								Query: plugins.MediaQuery{
+									ItemType:    "Series",
+									Title:       seriesRec.Name,
+									Year:        sYear,
+									Path:        seriesRec.Path,
+									ProviderIDs: seriesRec.Extra.ProviderIDs,
+									Language:    s.language(),
+								},
+								NeedOnlineMeta: true,
+								HasLocalTitle:  false,
+								DisplayName:    seriesRec.Name,
+							})
+						}
+					}
+				}
+				if s.isMissingPrimaryImage(ctx, existing.ID) {
+					var epNum, seasonNum int
+					if existing.IndexNumber != nil {
+						epNum = *existing.IndexNumber
+					}
+					if existing.ParentIndexNumber != nil {
+						seasonNum = *existing.ParentIndexNumber
+					}
+					backfillTasks = append(backfillTasks, enrichTask{
+						ItemID:    existing.ID,
+						LibraryID: lib.ID,
+						ItemType:  "Episode",
+						MediaPath: mediaPath,
+						Size:      size,
+						Mtime:     mtime,
+						IsStrm:    isStrm,
+						Container: container,
+						Query: plugins.MediaQuery{
+							ItemType:      "Episode",
+							Title:         existing.Name,
+							SeasonNumber:  seasonNum,
+							EpisodeNumber: epNum,
+							Path:          mediaPath,
+							ProviderIDs:   existing.Extra.ProviderIDs,
+							Language:      s.language(),
+						},
+						NeedProbe:      false,
+						NeedOnlineMeta: true,
+						HasLocalTitle:  false,
+						DisplayName:    existing.Name,
+					})
+				}
+				if len(backfillTasks) > 0 {
+					return false, backfillTasks, nil
+				}
+			}
 			return false, nil, nil
 		}
 		if existing.Path != mediaPath {
@@ -468,6 +574,8 @@ func (s *Scanner) indexEpisode(
 
 	s.persistMetaRelationsAndFTS(ctx, rec, meta)
 
+	hasLocalTitle := meta != nil && strings.TrimSpace(meta.Name) != ""
+
 	if needProbe || needOnline {
 		tasks = append(tasks, enrichTask{
 			ItemID:         rec.ID,
@@ -481,6 +589,8 @@ func (s *Scanner) indexEpisode(
 			Query:          query,
 			NeedProbe:      needProbe,
 			NeedOnlineMeta: needOnline,
+			HasLocalTitle:  hasLocalTitle,
+			DisplayName:    rec.Name,
 		})
 	}
 	return true, tasks, nil
@@ -499,7 +609,34 @@ func (s *Scanner) ensureSeries(
 	existing, err := s.repo.FindItemByPath(ctx, lib.ID, epInfo.SeriesDir)
 	if err == nil && existing != nil {
 		cache[epInfo.SeriesDir] = existing
-		return existing, nil, nil
+		var backfillTask *enrichTask
+		if s.hasOnlineMetadataProviders() && s.isMissingPrimaryImage(ctx, existing.ID) {
+			if _, dup := seenEnrich[existing.ID]; !dup {
+				seenEnrich[existing.ID] = struct{}{}
+				var year int
+				if existing.ProductionYear != nil {
+					year = *existing.ProductionYear
+				}
+				backfillTask = &enrichTask{
+					ItemID:    existing.ID,
+					LibraryID: lib.ID,
+					ItemType:  "Series",
+					MediaPath: epInfo.SeriesDir,
+					Query: plugins.MediaQuery{
+						ItemType:    "Series",
+						Title:       existing.Name,
+						Year:        year,
+						Path:        epInfo.SeriesDir,
+						ProviderIDs: existing.Extra.ProviderIDs,
+						Language:    s.language(),
+					},
+					NeedOnlineMeta: true,
+					HasLocalTitle:  false,
+					DisplayName:    existing.Name,
+				}
+			}
+		}
+		return existing, backfillTask, nil
 	}
 	if err != nil && !errors.Is(err, sqlite.ErrNotFound) {
 		return nil, nil, err
@@ -561,9 +698,14 @@ func (s *Scanner) ensureSeries(
 	if len(imgs) > 0 {
 		_ = s.repo.ReplaceItemImages(ctx, rec.ID, imgs)
 	}
+	if meta != nil {
+		s.downloadAndSaveRemoteImages(ctx, rec, meta)
+	}
 	s.persistMetaRelationsAndFTS(ctx, rec, meta)
 
 	cache[epInfo.SeriesDir] = rec
+
+	hasLocalTitle := meta != nil && strings.TrimSpace(meta.Name) != ""
 
 	var task *enrichTask
 	if s.hasOnlineMetadataProviders() {
@@ -579,6 +721,8 @@ func (s *Scanner) ensureSeries(
 				MediaPath:      epInfo.SeriesDir,
 				Query:          query,
 				NeedOnlineMeta: true,
+				HasLocalTitle:  hasLocalTitle,
+				DisplayName:    rec.Name,
 			}
 		}
 	}
