@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Ban,
@@ -68,6 +68,24 @@ export function UsersTab() {
     queryFn: () => api.getParentalRatings(),
     staleTime: 300_000,
   })
+
+  const groupedParentalRatings = useMemo(() => {
+    const map = new Map<number, string[]>()
+    for (const r of parentalRatings) {
+      const names = map.get(r.Value) ?? []
+      if (!names.includes(r.Name)) {
+        names.push(r.Name)
+      }
+      map.set(r.Value, names)
+    }
+    return Array.from(map.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([value, names]) => ({
+        value,
+        label: names.join(' / '),
+        primaryName: names[0] || String(value),
+      }))
+  }, [parentalRatings])
 
   const invalidateUsers = async () => {
     await queryClient.invalidateQueries({ queryKey: ['admin', 'users'] })
@@ -635,9 +653,9 @@ export function UsersTab() {
                 className="w-full rounded-xl border border-white/10 bg-[#14141c] px-3.5 py-2.5 text-sm text-zinc-100 outline-none focus:border-amber-400/60"
               >
                 <option value="">不限制</option>
-                {parentalRatings.map((rating) => (
-                  <option key={rating.Name} value={String(rating.Value)}>
-                    {rating.Name} (≤ {rating.Value})
+                {groupedParentalRatings.map((group) => (
+                  <option key={group.value} value={String(group.value)}>
+                    {group.label} (≤ {group.value})
                   </option>
                 ))}
               </select>

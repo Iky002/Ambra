@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -206,6 +207,8 @@ type ItemFilter struct {
 	ParentID               string
 	LibraryID              string
 	AllowedLibraryIDs      []string
+	MaxParentalRating      *int
+	BlockedTags            []string
 	SeriesID               string
 	SeasonID               string
 	Recursive              bool
@@ -238,9 +241,169 @@ type SearchHintFilter struct {
 	UserID            string
 	ParentID          string
 	AllowedLibraryIDs []string
+	MaxParentalRating *int
+	BlockedTags       []string
 	SearchTerm        string
 	IncludeItemTypes  []string
 	Limit             int
+}
+
+// parentalRatingScores maps standard MPAA / TV / BBFC / FSK / HK / TW parental ratings
+// to numeric scores matching /Localization/ParentalRatings.
+var parentalRatingScores = map[string]int{
+	"G":        1,
+	"TV-Y":     1,
+	"TV-G":     1,
+	"U":        1,
+	"0":        1,
+	"0+":       1,
+	"I":        1,
+	"FSK-0":    1,
+	"TV-Y7":    4,
+	"TV-Y7-FV": 4,
+	"6":        4,
+	"6+":       4,
+	"FSK-6":    4,
+	"PG":       5,
+	"TV-PG":    5,
+	"IIA":      5,
+	"PG-13":    7,
+	"12":       7,
+	"12A":      7,
+	"12+":      7,
+	"FSK-12":   7,
+	"TV-14":    8,
+	"15":       8,
+	"15+":      8,
+	"IIB":      8,
+	"MA15+":    8,
+	"R":        9,
+	"TV-MA":    9,
+	"16":       9,
+	"16+":      9,
+	"18":       9,
+	"18+":      9,
+	"18A":      9,
+	"III":      9,
+	"FSK-16":   9,
+	"FSK-18":   9,
+	"R18+":     9,
+	"NC-17":    10,
+	"X":        10,
+	"XXX":      10,
+}
+
+// ParentalRatingScore maps a parental rating label (case-insensitive) to its numeric score.
+func ParentalRatingScore(rating string) (int, bool) {
+	key := strings.ToUpper(strings.TrimSpace(rating))
+	if key == "" {
+		return 0, false
+	}
+	score, ok := parentalRatingScores[key]
+	return score, ok
+}
+
+// ExceedingParentalRatings returns a sorted slice of uppercase rating strings whose
+// numeric score strictly exceeds maxScore.
+func ExceedingParentalRatings(maxScore int) []string {
+	var out []string
+	for label, score := range parentalRatingScores {
+		if score > maxScore {
+			out = append(out, label)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func normalizeBlockedTags(tags []string) []string {
+	if len(tags) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(tags))
+	out := make([]string, 0, len(tags))
+	for _, raw := range tags {
+		t := strings.ToLower(strings.TrimSpace(raw))
+		if t == "" {
+			continue
+		}
+		if _, dup := seen[t]; dup {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	return out
+}
+
+func appendParentalFilterSQL(alias string, maxRating *int, blockedTags []string) ([]string, []any) {
+	var (
+		clauses []string
+		args    []any
+	)
+	if maxRating != nil {
+		if exceeding := ExceedingParentalRatings(*maxRating); len(exceeding) > 0 {
+			ph := make([]string, len(exceeding))
+			for i, r := range exceeding {
+				ph[i] = "?"
+				args = append(args, r)
+			}
+			clauses = append(clauses, fmt.Sprintf(`COALESCE(upper(trim(%s.official_rating)), '') NOT IN (%s)`, alias, strings.Join(ph, ",")))
+		}
+	}
+	if normTags := normalizeBlockedTags(blockedTags); len(normTags) > 0 {
+		ph := make([]string, len(normTags))
+		for i, t := range normTags {
+			ph[i] = "?"
+			args = append(args, t)
+		}
+		clauses = append(clauses, fmt.Sprintf(`NOT EXISTS (
+			SELECT 1 FROM item_taxonomies it
+			JOIN taxonomies t ON t.id = it.taxonomy_id
+			WHERE it.item_id IN (%s.id, COALESCE(%s.series_id, ''))
+			  AND lower(t.kind) = 'tag'
+			  AND lower(t.name) IN (%s)
+		)`, alias, alias, strings.Join(ph, ",")))
+	}
+	return clauses, args
+}
+
+// IsItemBlockedByParentalPolicy reports whether rec is blocked by maxRating or blockedTags.
+func (r *LibraryRepo) IsItemBlockedByParentalPolicy(ctx context.Context, rec *ItemRecord, maxRating *int, blockedTags []string) (bool, error) {
+	if rec == nil {
+		return false, nil
+	}
+	if maxRating != nil {
+		if score, ok := ParentalRatingScore(rec.OfficialRating); ok && score > *maxRating {
+			return true, nil
+		}
+	}
+	if normTags := normalizeBlockedTags(blockedTags); len(normTags) > 0 {
+		ph := make([]string, len(normTags))
+		args := make([]any, 0, len(normTags)+2)
+		args = append(args, guid.Normalize(rec.ID), guid.Normalize(rec.SeriesID))
+		for i, t := range normTags {
+			ph[i] = "?"
+			args = append(args, t)
+		}
+		var blocked int
+		err := r.store.Reader.QueryRowContext(ctx, fmt.Sprintf(`
+			SELECT EXISTS (
+				SELECT 1 FROM item_taxonomies it
+				JOIN taxonomies t ON t.id = it.taxonomy_id
+				WHERE it.item_id IN (?, ?)
+				  AND lower(t.kind) = 'tag'
+				  AND lower(t.name) IN (%s)
+			)`, strings.Join(ph, ",")), args...,
+		).Scan(&blocked)
+		if err != nil {
+			return false, err
+		}
+		if blocked == 1 {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // ItemCounts holds aggregate item counts by type.
@@ -943,6 +1106,10 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 		}
 		where = append(where, fmt.Sprintf(`i.library_id IN (%s)`, strings.Join(placeholders, ",")))
 	}
+	if pClauses, pArgs := appendParentalFilterSQL("i", f.MaxParentalRating, f.BlockedTags); len(pClauses) > 0 {
+		where = append(where, pClauses...)
+		args = append(args, pArgs...)
+	}
 	if f.SeriesID != "" {
 		where = append(where, `i.series_id = ?`)
 		args = append(args, guid.Normalize(f.SeriesID))
@@ -1207,10 +1374,14 @@ func (r *LibraryRepo) GetItemRecordByID(ctx context.Context, itemID string) (*It
 }
 
 func (r *LibraryRepo) GetLatestItems(ctx context.Context, serverID, userID, parentID string, includeTypes []string, limit int, fields []string) ([]dto.BaseItemDto, error) {
-	return r.GetLatestItemsWithAllowedLibraries(ctx, serverID, userID, parentID, includeTypes, limit, fields, nil)
+	return r.GetLatestItemsWithPolicy(ctx, serverID, userID, parentID, includeTypes, limit, fields, nil, nil, nil)
 }
 
 func (r *LibraryRepo) GetLatestItemsWithAllowedLibraries(ctx context.Context, serverID, userID, parentID string, includeTypes []string, limit int, fields []string, allowedLibraryIDs []string) ([]dto.BaseItemDto, error) {
+	return r.GetLatestItemsWithPolicy(ctx, serverID, userID, parentID, includeTypes, limit, fields, allowedLibraryIDs, nil, nil)
+}
+
+func (r *LibraryRepo) GetLatestItemsWithPolicy(ctx context.Context, serverID, userID, parentID string, includeTypes []string, limit int, fields []string, allowedLibraryIDs []string, maxParentalRating *int, blockedTags []string) ([]dto.BaseItemDto, error) {
 	if limit <= 0 {
 		limit = 16
 	}
@@ -1223,6 +1394,8 @@ func (r *LibraryRepo) GetLatestItemsWithAllowedLibraries(ctx context.Context, se
 		UserID:                 userID,
 		ParentID:               parentID,
 		AllowedLibraryIDs:      allowedLibraryIDs,
+		MaxParentalRating:      maxParentalRating,
+		BlockedTags:            blockedTags,
 		Recursive:              parentID != "",
 		IncludeItemTypes:       includeTypes,
 		SortBy:                 []string{"DateCreated"},
@@ -1235,10 +1408,14 @@ func (r *LibraryRepo) GetLatestItemsWithAllowedLibraries(ctx context.Context, se
 }
 
 func (r *LibraryRepo) GetResumeItems(ctx context.Context, serverID, userID, parentID string, includeTypes []string, startIndex, limit int, fields []string) ([]dto.BaseItemDto, int, error) {
-	return r.GetResumeItemsWithAllowedLibraries(ctx, serverID, userID, parentID, includeTypes, startIndex, limit, fields, nil)
+	return r.GetResumeItemsWithPolicy(ctx, serverID, userID, parentID, includeTypes, startIndex, limit, fields, nil, nil, nil)
 }
 
 func (r *LibraryRepo) GetResumeItemsWithAllowedLibraries(ctx context.Context, serverID, userID, parentID string, includeTypes []string, startIndex, limit int, fields []string, allowedLibraryIDs []string) ([]dto.BaseItemDto, int, error) {
+	return r.GetResumeItemsWithPolicy(ctx, serverID, userID, parentID, includeTypes, startIndex, limit, fields, allowedLibraryIDs, nil, nil)
+}
+
+func (r *LibraryRepo) GetResumeItemsWithPolicy(ctx context.Context, serverID, userID, parentID string, includeTypes []string, startIndex, limit int, fields []string, allowedLibraryIDs []string, maxParentalRating *int, blockedTags []string) ([]dto.BaseItemDto, int, error) {
 	if limit <= 0 {
 		limit = 20
 	}
@@ -1248,6 +1425,8 @@ func (r *LibraryRepo) GetResumeItemsWithAllowedLibraries(ctx context.Context, se
 		UserID:            userID,
 		ParentID:          parentID,
 		AllowedLibraryIDs: allowedLibraryIDs,
+		MaxParentalRating: maxParentalRating,
+		BlockedTags:       blockedTags,
 		Recursive:         parentID != "",
 		IncludeItemTypes:  includeTypes,
 		IsResumable:       &isResumable,
@@ -1260,10 +1439,14 @@ func (r *LibraryRepo) GetResumeItemsWithAllowedLibraries(ctx context.Context, se
 }
 
 func (r *LibraryRepo) GetNextUpEpisodes(ctx context.Context, serverID, userID, seriesID string, limit int, fields []string) ([]dto.BaseItemDto, int, error) {
-	return r.GetNextUpEpisodesWithAllowedLibraries(ctx, serverID, userID, seriesID, limit, fields, nil)
+	return r.GetNextUpEpisodesWithPolicy(ctx, serverID, userID, seriesID, limit, fields, nil, nil, nil)
 }
 
 func (r *LibraryRepo) GetNextUpEpisodesWithAllowedLibraries(ctx context.Context, serverID, userID, seriesID string, limit int, fields []string, allowedLibraryIDs []string) ([]dto.BaseItemDto, int, error) {
+	return r.GetNextUpEpisodesWithPolicy(ctx, serverID, userID, seriesID, limit, fields, allowedLibraryIDs, nil, nil)
+}
+
+func (r *LibraryRepo) GetNextUpEpisodesWithPolicy(ctx context.Context, serverID, userID, seriesID string, limit int, fields []string, allowedLibraryIDs []string, maxParentalRating *int, blockedTags []string) ([]dto.BaseItemDto, int, error) {
 	if allowedLibraryIDs != nil && len(allowedLibraryIDs) == 0 {
 		return []dto.BaseItemDto{}, 0, nil
 	}
@@ -1288,6 +1471,12 @@ func (r *LibraryRepo) GetNextUpEpisodesWithAllowedLibraries(ctx context.Context,
 			args = append(args, guid.Normalize(lid))
 		}
 		extraCond.WriteString(" AND i.library_id IN (" + strings.Join(ph, ",") + ")")
+	}
+	if pClauses, pArgs := appendParentalFilterSQL("i", maxParentalRating, blockedTags); len(pClauses) > 0 {
+		for _, cl := range pClauses {
+			extraCond.WriteString(" AND " + cl)
+		}
+		args = append(args, pArgs...)
 	}
 	args = append(args, limit)
 
@@ -1402,6 +1591,10 @@ func (r *LibraryRepo) SearchHints(ctx context.Context, f SearchHintFilter) ([]dt
 			args = append(args, guid.Normalize(lid))
 		}
 		where = append(where, fmt.Sprintf(`i.library_id IN (%s)`, strings.Join(ph, ",")))
+	}
+	if pClauses, pArgs := appendParentalFilterSQL("i", f.MaxParentalRating, f.BlockedTags); len(pClauses) > 0 {
+		where = append(where, pClauses...)
+		args = append(args, pArgs...)
 	}
 	if len(f.IncludeItemTypes) > 0 {
 		ph := make([]string, len(f.IncludeItemTypes))

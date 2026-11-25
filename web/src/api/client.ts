@@ -28,11 +28,15 @@ import type {
   LiveTvTunerHostInfo,
   MediaAttachmentInfo,
   NameIdPair,
+  NotificationItem,
+  NotificationResult,
+  NotificationsSummary,
   ParentalRatingOption,
   PlaybackInfoResponse,
   PluginInfo,
   PublicSystemInfo,
   QueryResult,
+  QuickConnectResult,
   RankingsRefreshResult,
   RankingsSummary,
   RemoteImageResult,
@@ -1356,10 +1360,82 @@ export const api = {
     embyFetch<QueryResult<BaseItemDto>>(
       `/emby/Items/${encodeURIComponent(itemId)}/InstantMix?UserId=${encodeURIComponent(userId)}&Limit=${limit}`,
     ),
+
+  // ==================== v0.9.3 Notifications & QuickConnect APIs ====================
+
+  getNotifications: (userId: string, startIndex = 0, limit = 20) =>
+    embyFetch<NotificationResult>(
+      `/emby/Notifications/${encodeURIComponent(userId)}?StartIndex=${startIndex}&Limit=${limit}`,
+    ),
+
+  getNotificationsSummary: (userId: string) =>
+    embyFetch<NotificationsSummary>(
+      `/emby/Notifications/${encodeURIComponent(userId)}/Summary`,
+    ),
+
+  markNotificationsRead: (userId: string, ids?: string[]) => {
+    const qs = ids && ids.length > 0 ? `?Ids=${encodeURIComponent(ids.join(','))}` : ''
+    return embyFetch<void>(`/emby/Notifications/${encodeURIComponent(userId)}/Read${qs}`, {
+      method: 'POST',
+      body: JSON.stringify({ Ids: ids ?? [] }),
+    })
+  },
+
+  sendAdminNotification: (payload: {
+    Name: string
+    Description?: string
+    Url?: string
+    Level?: 'Normal' | 'Warning' | 'Error'
+    UserId?: string
+  }) =>
+    embyFetch<NotificationItem>('/emby/Notifications/Admin', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  getQuickConnectEnabled: () => embyFetch<boolean>('/emby/QuickConnect/Enabled', {}, false),
+
+  quickConnectInitiate: () =>
+    embyFetch<QuickConnectResult>(
+      '/emby/QuickConnect/Initiate',
+      { method: 'POST' },
+      false,
+    ),
+
+  quickConnectConnect: (secret: string) =>
+    embyFetch<QuickConnectResult>(
+      `/emby/QuickConnect/Connect?secret=${encodeURIComponent(secret)}`,
+      {},
+      false,
+    ),
+
+  quickConnectAuthorize: (code: string) =>
+    embyFetch<boolean>(
+      `/emby/QuickConnect/Authorize?code=${encodeURIComponent(code)}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ Code: code }),
+      },
+      true,
+    ),
+
+  authenticateWithQuickConnect: (secret: string) =>
+    embyFetch<AuthenticationResult>(
+      '/emby/Users/AuthenticateWithQuickConnect',
+      {
+        method: 'POST',
+        body: JSON.stringify({ Secret: secret }),
+      },
+      false,
+    ),
 }
 
 export function getLiveTvChannelStreamUrl(channelId: string): string {
   return resolveApiUrl(`/emby/LiveTv/Channels/${encodeURIComponent(channelId)}/Stream`)
+}
+
+export function getLiveTvRecordingStreamUrl(recordingId: string): string {
+  return resolveApiUrl(`/emby/LiveTv/LiveRecordings/${encodeURIComponent(recordingId)}/stream`)
 }
 
 export function getChapterImageUrl(

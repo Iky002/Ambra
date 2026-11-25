@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -671,5 +672,87 @@ func TestCompatExtDeleteDelegationUnifiesLiveTVState(t *testing.T) {
 	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/LiveTv/ListingProviders", nil))
 	if strings.Contains(w.Body.String(), "lp-del") {
 		t.Fatalf("deleted listing provider resurrected: %s", w.Body.String())
+	}
+}
+
+func TestLiveStreamFileHLSRewriteAndSignedProxy(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(tmpDir, "compatext-hls.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/live/master.m3u8":
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			_, _ = w.Write([]byte("#EXTM3U\n#EXTINF:6.0,\nseg0.ts\n"))
+		case "/live/seg0.ts":
+			w.Header().Set("Content-Type", "video/mp2t")
+			_, _ = w.Write([]byte("COMPAT_HLS_SEG0"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{ServerID: "srv-hls", DataDir: tmpDir}
+	lt := livetv.New(store, cfg)
+	ltMux := http.NewServeMux()
+	lt.RegisterRoutes(ltMux, livetv.AuthFuncs{})
+
+	body := `{"Type":"m3u","M3UContent":"#EXTM3U\n#EXTINF:-1,Compat HLS\n` + upstream.URL + `/live/master.m3u8\n"}`
+	ltRec := httptest.NewRecorder()
+	ltMux.ServeHTTP(ltRec, httptest.NewRequest(http.MethodPost, "/LiveTv/TunerHosts", strings.NewReader(body)))
+	if ltRec.Code != http.StatusOK {
+		t.Fatalf("seed livetv channel: %d %s", ltRec.Code, ltRec.Body.String())
+	}
+	chListRec := httptest.NewRecorder()
+	ltMux.ServeHTTP(chListRec, httptest.NewRequest(http.MethodGet, "/LiveTv/Channels", nil))
+	var chResp struct {
+		Items []livetv.ChannelInfo `json:"Items"`
+	}
+	_ = json.Unmarshal(chListRec.Body.Bytes(), &chResp)
+	chID := chResp.Items[0].Id
+
+	h := New(store, cfg)
+	h.SetLiveTV(lt)
+	router := h.BuildRouter(AuthFuncs{})
+
+	// Request HLS playlist via /LiveTv/LiveStreamFiles/{Id}/stream.m3u8
+	reqPath := "/LiveTv/LiveStreamFiles/" + chID + "/stream.m3u8?api_key=tok-compat"
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, reqPath, nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("LiveStreamFiles m3u8 status=%d body=%s", w.Code, w.Body.String())
+	}
+	playlist := w.Body.String()
+	var rewrittenLine string
+	for _, line := range strings.Split(playlist, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "#") {
+			rewrittenLine = line
+			break
+		}
+	}
+	if rewrittenLine == "" || !strings.Contains(rewrittenLine, "Stream?target=") || !strings.Contains(rewrittenLine, "&sig=") {
+		t.Fatalf("expected signed relative rewritten URI in playlist, got:\n%s", playlist)
+	}
+
+	// Resolve relative URI against the original request URL and verify livetv serves the segment
+	base, err := url.Parse(reqPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := url.Parse(rewrittenLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved := base.ResolveReference(ref)
+	segRec := httptest.NewRecorder()
+	ltMux.ServeHTTP(segRec, httptest.NewRequest(http.MethodGet, resolved.RequestURI(), nil))
+	if segRec.Code != http.StatusOK || segRec.Body.String() != "COMPAT_HLS_SEG0" {
+		t.Fatalf("expected resolved signed segment %q to return COMPAT_HLS_SEG0, got %d %q", resolved.RequestURI(), segRec.Code, segRec.Body.String())
 	}
 }

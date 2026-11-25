@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
@@ -42,6 +43,7 @@ type Notification struct {
 	UserId      string    `json:"UserId,omitempty"`
 	Date        time.Time `json:"Date"`
 	IsRead      bool      `json:"IsRead"`
+	ReadBy      []string  `json:"ReadBy,omitempty"`
 	Name        string    `json:"Name"`
 	Description string    `json:"Description,omitempty"`
 	Url         string    `json:"Url,omitempty"`
@@ -122,15 +124,73 @@ func (h *Handler) handleServices(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func canAccessUserNotifications(ctx context.Context, targetUserID string) bool {
+	ac, ok := middleware.AuthFromContext(ctx)
+	if !ok || ac == nil || (ac.User == nil && !ac.IsAPIKey) {
+		return true
+	}
+	if ac.IsAdmin() {
+		return true
+	}
+	return guid.Normalize(ac.UserID()) == guid.Normalize(targetUserID)
+}
+
+func containsString(items []string, target string) bool {
+	for _, s := range items {
+		if s == target {
+			return true
+		}
+	}
+	return false
+}
+
+func isReadForUser(n Notification, userID string) bool {
+	if n.UserId == "" {
+		return containsString(n.ReadBy, userID)
+	}
+	return n.IsRead || containsString(n.ReadBy, userID)
+}
+
+func setReadBy(readBy []string, userID string, read bool) []string {
+	if userID == "" {
+		return readBy
+	}
+	if read {
+		if containsString(readBy, userID) {
+			return readBy
+		}
+		return append(readBy, userID)
+	}
+	out := make([]string, 0, len(readBy))
+	for _, u := range readBy {
+		if u != userID {
+			out = append(out, u)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func (h *Handler) handleListByUser(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := guid.Normalize(r.PathValue("UserId"))
+	if !canAccessUserNotifications(r.Context(), userID) {
+		httpx.Error(w, http.StatusForbidden, "cannot access another user's notifications")
+		return
+	}
 
 	h.mu.RLock()
 	matched := make([]Notification, 0, len(h.state.Items))
 	for _, n := range h.state.Items {
 		if n.UserId == "" || guid.Normalize(n.UserId) == userID {
-			matched = append(matched, n)
+			item := n
+			item.IsRead = isReadForUser(n, userID)
+			if len(n.ReadBy) > 0 {
+				item.ReadBy = append([]string(nil), n.ReadBy...)
+			}
+			matched = append(matched, item)
 		}
 	}
 	h.mu.RUnlock()
@@ -144,6 +204,10 @@ func (h *Handler) handleListByUser(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleSummary(w http.ResponseWriter, r *http.Request) {
 	userID := guid.Normalize(r.PathValue("UserId"))
+	if !canAccessUserNotifications(r.Context(), userID) {
+		httpx.Error(w, http.StatusForbidden, "cannot access another user's notifications")
+		return
+	}
 
 	h.mu.RLock()
 	unread := 0
@@ -153,7 +217,7 @@ func (h *Handler) handleSummary(w http.ResponseWriter, r *http.Request) {
 		if n.UserId != "" && guid.Normalize(n.UserId) != userID {
 			continue
 		}
-		if !n.IsRead {
+		if !isReadForUser(n, userID) {
 			unread++
 			rank := levelRank(n.Level)
 			if rank > maxRank {
@@ -174,6 +238,10 @@ func (h *Handler) handleMarkRead(read bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := httpx.ParseQuery(r)
 		userID := guid.Normalize(r.PathValue("UserId"))
+		if !canAccessUserNotifications(r.Context(), userID) {
+			httpx.Error(w, http.StatusForbidden, "cannot access another user's notifications")
+			return
+		}
 		ids := q.List("Ids")
 		if len(ids) == 0 && r.Body != nil {
 			var body struct {
@@ -200,7 +268,10 @@ func (h *Handler) handleMarkRead(read bool) http.HandlerFunc {
 					continue
 				}
 			}
-			n.IsRead = read
+			n.ReadBy = setReadBy(n.ReadBy, userID, read)
+			if n.UserId != "" {
+				n.IsRead = read
+			}
 		}
 		h.saveStateLocked(r.Context())
 		h.mu.Unlock()

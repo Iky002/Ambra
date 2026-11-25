@@ -19,6 +19,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 )
 
 type WebhookConfig struct {
@@ -122,7 +123,7 @@ func (h *Handler) sendWebhook(ctx context.Context, wh WebhookConfig, payload Web
 		mac.Write(body)
 		req.Header.Set("X-Ambra-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
 	}
-	resp, err := h.httpClient.Do(req)
+	resp, err := h.getHTTPClient().Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -149,6 +150,10 @@ func (h *Handler) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.TrimSpace(wh.Url) == "" {
 		httpx.Error(w, http.StatusBadRequest, "webhook Url is required")
+		return
+	}
+	if err := netutil.ValidateRemoteURL(wh.Url, true); err != nil {
+		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("unsafe webhook url: %v", err))
 		return
 	}
 	if wh.Id == "" {
@@ -218,6 +223,10 @@ func (h *Handler) handleTestWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.TrimSpace(target.Url) == "" {
 		httpx.Error(w, http.StatusBadRequest, "webhook Id or Url is required")
+		return
+	}
+	if err := netutil.ValidateRemoteURL(target.Url, true); err != nil {
+		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("unsafe webhook url: %v", err))
 		return
 	}
 

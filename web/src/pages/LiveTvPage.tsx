@@ -6,17 +6,21 @@ import {
   CalendarClock,
   CheckCircle2,
   CircleDot,
+  Download,
   Film,
   Loader2,
+  Play,
   Radio,
   RefreshCw,
   Search,
   Settings,
   Trash2,
   Tv,
+  X,
 } from 'lucide-react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { api, getLiveTvChannelStreamUrl } from '../api/client'
+import { api, getLiveTvChannelStreamUrl, getLiveTvRecordingStreamUrl } from '../api/client'
+import type { LiveTvRecordingInfo } from '../api/types'
 import { QueryErrorState } from '../components/QueryErrorState'
 import { useAuth } from '../context/AuthContext'
 import { DEMO_VIDEO_DATA_URL } from '../demo/demoMedia'
@@ -86,8 +90,9 @@ export function LiveTvPage() {
     type: 'success' | 'error'
     message: string
   } | null>(null)
-  const [scheduledProgramIds, setScheduledProgramIds] = useState<string[]>([])
   const [schedulingProgramId, setSchedulingProgramId] = useState<string | null>(null)
+  const [playingRecording, setPlayingRecording] = useState<LiveTvRecordingInfo | null>(null)
+  const [recordingPlaybackError, setRecordingPlaybackError] = useState<string | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const mediaRecoveryCountRef = useRef(0)
   const demoActive = isDemoMode()
@@ -131,10 +136,15 @@ export function LiveTvPage() {
   } = useQuery({
     queryKey: ['liveTv', 'timers'],
     queryFn: () => api.getLiveTvTimers(),
-    enabled: activeSubTab === 'timers',
+    enabled: activeSubTab === 'timers' || channels.length > 0,
   })
 
   const timers = useMemo(() => timersData?.Items || [], [timersData])
+
+  const scheduledProgramIds = useMemo(
+    () => timers.map((t) => t.ProgramId).filter((id): id is string => Boolean(id)),
+    [timers],
+  )
 
   const {
     data: recordingsData,
@@ -169,7 +179,6 @@ export function LiveTvPage() {
       setDvrFeedback(null)
     },
     onSuccess: async (_created, prog) => {
-      setScheduledProgramIds((prev) => (prev.includes(prog.Id) ? prev : [...prev, prog.Id]))
       setDvrFeedback({
         type: 'success',
         message: `已预约录制「${prog.Name}」`,
@@ -203,7 +212,8 @@ export function LiveTvPage() {
 
   const deleteRecordingMutation = useMutation({
     mutationFn: (recordingId: string) => api.deleteLiveTvRecording(recordingId),
-    onSuccess: async () => {
+    onSuccess: async (_data, recordingId) => {
+      setPlayingRecording((prev) => (prev?.Id === recordingId ? null : prev))
       setDvrFeedback({ type: 'success', message: '已删除录制文件' })
       await queryClient.invalidateQueries({ queryKey: ['liveTv', 'recordings'] })
     },
@@ -384,31 +394,6 @@ export function LiveTvPage() {
     )
   }
 
-  if (channels.length === 0) {
-    return (
-      <div className="mx-auto max-w-2xl px-4 py-16 text-center lg:px-8">
-        <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-10">
-          <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-amber-500/15 text-amber-400 ring-1 ring-amber-500/30">
-            <Radio className="h-7 w-7" />
-          </div>
-          <h1 className="text-lg font-semibold text-white">暂无可观看的电视频道</h1>
-          <p className="mt-2 text-xs leading-relaxed text-zinc-400">
-            当前服务器尚未导入 M3U 直播源或频道列表为空。
-          </p>
-          {isAdmin && (
-            <Link
-              to="/admin/livetv"
-              className="mt-6 inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-5 py-2.5 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400"
-            >
-              <Settings className="h-3.5 w-3.5" />
-              <span>前往配置直播源</span>
-            </Link>
-          )}
-        </div>
-      </div>
-    )
-  }
-
   const currentProgram = activeEpg?.current || null
   const upcomingPrograms = activeEpg?.upcoming || []
   const currentProgress = currentProgram
@@ -506,7 +491,30 @@ export function LiveTvPage() {
         </div>
       )}
 
-      {activeSubTab === 'channels' && (
+      {activeSubTab === 'channels' && channels.length === 0 && (
+        <div className="mx-auto max-w-2xl py-10 text-center">
+          <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-10">
+            <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-amber-500/15 text-amber-400 ring-1 ring-amber-500/30">
+              <Radio className="h-7 w-7" />
+            </div>
+            <h2 className="text-lg font-semibold text-white">暂无可观看的电视频道</h2>
+            <p className="mt-2 text-xs leading-relaxed text-zinc-400">
+              当前服务器尚未导入 M3U 直播源或频道列表为空。您仍可切换到「预约计划」或「已录节目」查看历史记录。
+            </p>
+            {isAdmin && (
+              <Link
+                to="/admin/livetv"
+                className="mt-6 inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-5 py-2.5 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400"
+              >
+                <Settings className="h-3.5 w-3.5" />
+                <span>前往配置直播源</span>
+              </Link>
+            )}
+          </div>
+        </div>
+      )}
+
+      {activeSubTab === 'channels' && channels.length > 0 && (
         /* 2 栏主体布局：左播放器 + EPG，右可搜索频道列表 */
         <div className="grid gap-6 lg:grid-cols-12">
           {/* 左栏：播放器与节目单 */}
@@ -892,6 +900,90 @@ export function LiveTvPage() {
             </button>
           </div>
 
+          {playingRecording && (
+            <div
+              data-testid="dvr-recording-player"
+              className="overflow-hidden rounded-2xl border border-white/10 bg-black shadow-2xl"
+            >
+              <div className="flex items-center justify-between gap-3 border-b border-white/8 bg-zinc-950/90 px-4 py-2.5">
+                <div className="flex min-w-0 items-center gap-2">
+                  <Film className="h-4 w-4 shrink-0 text-amber-400" />
+                  <span className="truncate text-xs font-semibold text-zinc-100">
+                    {playingRecording.Name}
+                  </span>
+                  {playingRecording.ChannelName && (
+                    <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300">
+                      {playingRecording.ChannelName}
+                    </span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  aria-label="关闭录像播放器"
+                  onClick={() => {
+                    setPlayingRecording(null)
+                    setRecordingPlaybackError(null)
+                  }}
+                  className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-[11px] font-medium text-zinc-300 transition-colors hover:bg-white/10 hover:text-white"
+                >
+                  <X className="h-3.5 w-3.5" />
+                  <span>关闭</span>
+                </button>
+              </div>
+
+              <div className="aspect-video w-full bg-zinc-950">
+                <video
+                  key={playingRecording.Id}
+                  data-testid="dvr-recording-video"
+                  controls
+                  playsInline
+                  autoPlay
+                  src={
+                    demoActive
+                      ? DEMO_VIDEO_DATA_URL
+                      : getLiveTvRecordingStreamUrl(playingRecording.Id)
+                  }
+                  onError={(e) => {
+                    if (demoActive) return
+                    const errCode = e.currentTarget.error?.code
+                    const srcNotSupported =
+                      typeof MediaError !== 'undefined'
+                        ? MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED
+                        : MEDIA_ERR_SRC_NOT_SUPPORTED
+                    if (errCode === srcNotSupported) {
+                      setRecordingPlaybackError(
+                        '当前浏览器不支持直接播放此录制格式（如 MKV/TS），请点击右侧按钮直接下载观看',
+                      )
+                    } else {
+                      setRecordingPlaybackError('录制视频加载失败，可尝试直接下载录制文件')
+                    }
+                  }}
+                  className="h-full w-full bg-black object-contain"
+                />
+              </div>
+
+              {recordingPlaybackError && (
+                <div
+                  role="alert"
+                  className="flex flex-wrap items-center justify-between gap-3 border-t border-amber-500/25 bg-amber-950/40 px-4 py-2.5 text-xs text-amber-200"
+                >
+                  <div className="flex items-center gap-2">
+                    <AlertCircle className="h-4 w-4 shrink-0 text-amber-400" />
+                    <span>{recordingPlaybackError}</span>
+                  </div>
+                  <a
+                    href={getLiveTvRecordingStreamUrl(playingRecording.Id)}
+                    download
+                    className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-amber-400/40 bg-amber-500/20 px-3 py-1 text-[11px] font-semibold text-amber-100 transition-colors hover:bg-amber-500/30"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    <span>直接下载录制文件</span>
+                  </a>
+                </div>
+              )}
+            </div>
+          )}
+
           {recordingsLoading ? (
             <div className="flex h-36 items-center justify-center">
               <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
@@ -937,23 +1029,38 @@ export function LiveTvPage() {
                       </p>
                     )}
                   </div>
-                  <button
-                    type="button"
-                    disabled={
-                      deleteRecordingMutation.isPending &&
-                      deleteRecordingMutation.variables === rec.Id
-                    }
-                    onClick={() => deleteRecordingMutation.mutate(rec.Id)}
-                    className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
-                  >
-                    {deleteRecordingMutation.isPending &&
-                    deleteRecordingMutation.variables === rec.Id ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <Trash2 className="h-3.5 w-3.5" />
+                  <div className="flex shrink-0 items-center gap-2">
+                    {rec.Status !== 'InProgress' && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setRecordingPlaybackError(null)
+                          setPlayingRecording(rec)
+                        }}
+                        className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-amber-500/35 bg-amber-500/15 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/25"
+                      >
+                        <Play className="h-3.5 w-3.5" />
+                        <span>播放</span>
+                      </button>
                     )}
-                    <span>删除录制</span>
-                  </button>
+                    <button
+                      type="button"
+                      disabled={
+                        deleteRecordingMutation.isPending &&
+                        deleteRecordingMutation.variables === rec.Id
+                      }
+                      onClick={() => deleteRecordingMutation.mutate(rec.Id)}
+                      className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
+                    >
+                      {deleteRecordingMutation.isPending &&
+                      deleteRecordingMutation.variables === rec.Id ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Trash2 className="h-3.5 w-3.5" />
+                      )}
+                      <span>删除录制</span>
+                    </button>
+                  </div>
                 </div>
               ))}
             </div>
