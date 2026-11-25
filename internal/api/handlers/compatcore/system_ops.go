@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -103,15 +102,7 @@ func storageFolderInfo(path string) map[string]any {
 	info := map[string]any{"Path": path}
 	probe := path
 	for probe != "" {
-		var st syscall.Statfs_t
-		if err := syscall.Statfs(probe, &st); err == nil {
-			bsize := uint64(st.Bsize)
-			total := st.Blocks * bsize
-			free := st.Bavail * bsize
-			var used uint64
-			if total >= free {
-				used = total - free
-			}
+		if free, used, ok := diskUsage(probe); ok {
 			info["FreeSpace"] = free
 			info["UsedSpace"] = used
 			return info
