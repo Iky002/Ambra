@@ -172,9 +172,10 @@ func TestCancelRecordingActiveAndClose(t *testing.T) {
 		DataDir:    tmpDir,
 		FFmpegPath: "/bin/sh",
 		ArgsBuilder: func(_ RecordingJob, _ string) []string {
-			return []string{"-c", "sleep 10"}
+			return []string{"-c", "exec sleep 10"}
 		},
 	})
+	rec.gracefulTimeout = 300 * time.Millisecond
 
 	if err := rec.CancelRecording("nonexistent"); !errors.Is(err, ErrRecordingNotFound) {
 		t.Fatalf("expected ErrRecordingNotFound, got %v", err)
@@ -205,7 +206,7 @@ func TestCancelRecordingActiveAndClose(t *testing.T) {
 	if err := rec.CancelRecording("a-timer"); err != nil {
 		t.Fatalf("CancelRecording failed: %v", err)
 	}
-	waitForStatus(t, rec, "a-timer", StatusCancelled, 3*time.Second)
+	waitForStatus(t, rec, "a-timer", StatusCancelled, 5*time.Second)
 
 	// Close cancels remaining active recording and prevents new ones.
 	if err := rec.Close(); err != nil {
@@ -285,10 +286,11 @@ func TestSetOnFinishedCallback(t *testing.T) {
 			case "cb-fail":
 				return []string{"-c", "exit 3"}
 			default:
-				return []string{"-c", "sleep 10"}
+				return []string{"-c", "exec sleep 10"}
 			}
 		},
 	})
+	rec.gracefulTimeout = 300 * time.Millisecond
 	defer rec.Close()
 
 	finishedCh := make(chan RecordingState, 3)
@@ -317,7 +319,7 @@ func TestSetOnFinishedCallback(t *testing.T) {
 		select {
 		case st := <-finishedCh:
 			got[st.Job.TimerID] = st.Status
-		case <-time.After(3 * time.Second):
+		case <-time.After(5 * time.Second):
 			t.Fatalf("timed out waiting for OnFinished callbacks; got %+v", got)
 		}
 	}
@@ -427,7 +429,7 @@ func TestCancelRecordingGracefulQuitAndTimeoutKill(t *testing.T) {
 		DataDir:    tmpDir,
 		FFmpegPath: "/bin/sh",
 		ArgsBuilder: func(_ RecordingJob, _ string) []string {
-			return []string{"-c", `trap '' INT; sleep 30`}
+			return []string{"-c", `trap '' INT; exec sleep 30`}
 		},
 	})
 	recKill.gracefulTimeout = 150 * time.Millisecond
