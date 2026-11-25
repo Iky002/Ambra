@@ -123,3 +123,119 @@ func TestStreamingLibraryAccessControl(t *testing.T) {
 		}
 	}
 }
+
+func TestStreamingParentalControlEnforcement(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(tmp, "stream_parental.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	repo := sqlite.NewLibraryRepo(store)
+	userRepo := sqlite.NewUserRepo(store)
+	cfg := config.Default(tmp)
+
+	lib, _ := repo.CreateLibrary(ctx, "Movies", "movies", []string{tmp})
+
+	vidPG := filepath.Join(tmp, "pg.mp4")
+	vidR := filepath.Join(tmp, "r.mp4")
+	vidNSFW := filepath.Join(tmp, "nsfw.mp4")
+	for _, p := range []string{vidPG, vidR, vidNSFW} {
+		_ = os.WriteFile(p, []byte("video-data"), 0o644)
+	}
+
+	pgMovie := &sqlite.ItemRecord{
+		ID: guid.New(), LibraryID: lib.ID, ParentID: lib.ID,
+		Type: "Movie", MediaType: "Video", Name: "FamilyMovie", SortName: "familymovie",
+		OfficialRating: "PG", Path: vidPG,
+	}
+	rMovie := &sqlite.ItemRecord{
+		ID: guid.New(), LibraryID: lib.ID, ParentID: lib.ID,
+		Type: "Movie", MediaType: "Video", Name: "AdultMovie", SortName: "adultmovie",
+		OfficialRating: "R", Path: vidR,
+	}
+	nsfwMovie := &sqlite.ItemRecord{
+		ID: guid.New(), LibraryID: lib.ID, ParentID: lib.ID,
+		Type: "Movie", MediaType: "Video", Name: "TaggedMovie", SortName: "taggedmovie",
+		OfficialRating: "PG", Path: vidNSFW,
+	}
+	for _, m := range []*sqlite.ItemRecord{pgMovie, rMovie, nsfwMovie} {
+		_ = repo.UpsertItem(ctx, m)
+		_ = repo.ReplaceMediaSourcesAndStreams(ctx, m.ID, []sqlite.MediaSourceRecord{{
+			ID: guid.New(), ItemID: m.ID, Path: m.Path, Container: "mp4",
+		}})
+	}
+	_ = repo.ReplaceItemTaxonomies(ctx, nsfwMovie.ID, "tag", []string{"NSFW"})
+
+	maxRating := 7 // PG-13
+	kidPolicy := sqlite.DefaultUserPolicy(false)
+	kidPolicy.EnableAllFolders = true
+	kidPolicy.MaxParentalRating = &maxRating
+	kidPolicy.BlockedTags = []string{"NSFW"}
+	kidUser := &sqlite.UserRecord{
+		ID: guid.New(), Name: "kid", Policy: kidPolicy, Config: sqlite.DefaultUserConfig(),
+	}
+	_ = userRepo.CreateUser(ctx, kidUser)
+
+	adminPolicy := sqlite.DefaultUserPolicy(true)
+	adminPolicy.MaxParentalRating = &maxRating
+	adminPolicy.BlockedTags = []string{"NSFW"}
+	adminUser := &sqlite.UserRecord{
+		ID: guid.New(), Name: "admin", IsAdmin: true, Policy: adminPolicy, Config: sqlite.DefaultUserConfig(),
+	}
+	_ = userRepo.CreateUser(ctx, adminUser)
+
+	currentCaller := kidUser.ID
+	mux := http.NewServeMux()
+	h := New(repo, playback.New(repo, plugins.NewRegistry(), cfg), imaging.New(repo))
+	h.SetUserRepo(userRepo)
+	h.RegisterRoutes(mux, AuthFuncs{
+		UserIDFromCtx: func(context.Context) string { return currentCaller },
+	})
+
+	get := func(path string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		return rec
+	}
+
+	// Kid user blocked by rating (R > 7) and blocked tag (NSFW) on PlaybackInfo, stream, Download -> 403
+	for _, id := range []string{rMovie.ID, nsfwMovie.ID} {
+		for _, path := range []string{
+			"/Items/" + id + "/PlaybackInfo",
+			"/Videos/" + id + "/stream",
+			"/Items/" + id + "/Download",
+		} {
+			if rec := get(path); rec.Code != http.StatusForbidden {
+				t.Fatalf("kid GET %s expected 403, got %d", path, rec.Code)
+			}
+		}
+	}
+
+	// Kid user allowed for PG movie -> 200
+	for _, path := range []string{
+		"/Items/" + pgMovie.ID + "/PlaybackInfo",
+		"/Videos/" + pgMovie.ID + "/stream",
+		"/Items/" + pgMovie.ID + "/Download",
+	} {
+		if rec := get(path); rec.Code != http.StatusOK {
+			t.Fatalf("kid GET %s expected 200, got %d (%s)", path, rec.Code, rec.Body.String())
+		}
+	}
+
+	// Admin bypasses parental restrictions -> 200
+	currentCaller = adminUser.ID
+	for _, id := range []string{rMovie.ID, nsfwMovie.ID} {
+		for _, path := range []string{
+			"/Items/" + id + "/PlaybackInfo",
+			"/Videos/" + id + "/stream",
+			"/Items/" + id + "/Download",
+		} {
+			if rec := get(path); rec.Code != http.StatusOK {
+				t.Fatalf("admin GET %s expected 200, got %d", path, rec.Code)
+			}
+		}
+	}
+}

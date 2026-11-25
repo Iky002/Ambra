@@ -405,6 +405,37 @@ func isLibraryAllowed(libID string, allowed []string) bool {
 	return false
 }
 
+func (h *Handler) userParentalPolicyForRequest(r *http.Request, fallbackUserID string) (*int, []string) {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil {
+		if ac.IsAPIKey || ac.IsAdmin() {
+			return nil, nil
+		}
+	}
+	uid := ""
+	if h.auth.UserIDFromCtx != nil {
+		uid = guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+	}
+	if uid == "" {
+		if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil {
+			uid = guid.Normalize(ac.UserID())
+		}
+	}
+	if uid == "" {
+		uid = guid.Normalize(fallbackUserID)
+	}
+	if h.userRepo == nil || uid == "" {
+		return nil, nil
+	}
+	u, err := h.userRepo.GetUserByID(r.Context(), uid)
+	if err != nil || u == nil {
+		return nil, nil
+	}
+	if u.IsAdmin || u.Policy.IsAdministrator {
+		return nil, nil
+	}
+	return u.Policy.MaxParentalRating, u.Policy.BlockedTags
+}
+
 func (h *Handler) getConfigJSON(ctx context.Context, key string, dst any) (bool, error) {
 	if h.store == nil {
 		return false, nil

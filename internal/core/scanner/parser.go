@@ -56,7 +56,7 @@ var (
 	reYearParens      = regexp.MustCompile(`[\(\[（【]((?:19|20)\d{2})[\)\]）】]`)
 	reYearDigits      = regexp.MustCompile(`(?:19|20)\d{2}`)
 	reProviderTag     = regexp.MustCompile(`(?i)[\{\[\(（【]\s*(tmdb|imdb|tvdb)(?:id)?\s*[-:=]\s*(tt\d+|\d+)\s*[\}\]）)】]`)
-	reLeadingBracket  = regexp.MustCompile(`^\s*(?:[\[\(（【][^\]\)）】]{1,40}[\]\)）】]\s*)+`)
+	reLeadingBracket  = regexp.MustCompile(`^\s*[\[\(（【]([^\]\)）】]{1,40})[\]\)）】]\s*`)
 	reQualityNoise    = regexp.MustCompile(`(?i)(?:^|[\s._\-\[\(（【])(2160p|1080p|1080i|720p|576p|480p|4k|uhd|hdr10\+|hdr10plus|hdr10|hdr|hlg|dovi|dv|dolby[\s._]?vision|bluray|blu-ray|bdrip|bdremux|web-dl|webdl|webrip|hdtv|dvdrip|remux|x264|x265|h\.?264|h\.?265|hevc|avc|av1|aac|dts-hd|dtshd|dts|ac3|eac3|ddp|dd5\.?1|atmos|truehd|flac|lpcm|10bit|8bit|60fps|120fps|hq|imax|proper|repack|extended|unrated|directors?[\s._]?cut|theatrical)(?:$|[\s._\-\]\)）】]).*$`)
 	reChineseEdition  = regexp.MustCompile(`(?:^|[\s._\-\[\(（【])(国粤双语|国语|粤语|中英双字|双语字幕|简繁字幕|特效字幕|中字|未删减版?|导演剪辑版?|加长版|高码版|收藏版|臻彩|帧享|杜比视界|杜比全景声).*$`)
 	reAudioDiscDir    = regexp.MustCompile(`(?i)^(?:disc|cd|disk)\s*0*(\d{1,2})$`)
@@ -211,9 +211,26 @@ func ParseMovieName(filename string) ParsedMovie {
 	base := stripMediaExt(filename)
 	base, providerIDs := extractProviderIDsFromName(base)
 
-	// Strip leading release-group brackets only when meaningful title text follows.
-	if stripped := strings.TrimSpace(reLeadingBracket.ReplaceAllString(base, "")); stripped != "" {
-		base = stripped
+	// Strip leading release-group brackets only when meaningful title text follows,
+	// while preserving any valid 4-digit release year inside leading brackets/parens
+	// (e.g. "[2019] Parasite.mkv", "(2020) Tenet.mkv").
+	leadingYear := 0
+	for {
+		m := reLeadingBracket.FindStringSubmatchIndex(base)
+		if m == nil {
+			break
+		}
+		rest := strings.TrimSpace(base[m[1]:])
+		if rest == "" {
+			break
+		}
+		inner := strings.TrimSpace(base[m[2]:m[3]])
+		if len(inner) == 4 {
+			if y, err := strconv.Atoi(inner); err == nil && isValidReleaseYear(y) {
+				leadingYear = y
+			}
+		}
+		base = rest
 	}
 
 	year := 0
@@ -274,6 +291,10 @@ func ParseMovieName(filename string) ParsedMovie {
 			base = prefix
 			break
 		}
+	}
+
+	if year == 0 && leadingYear > 0 {
+		year = leadingYear
 	}
 
 	base = reQualityNoise.ReplaceAllString(base, "")
@@ -356,14 +377,16 @@ func ParseMoviePath(rootDir, mediaPath string) ParsedMovie {
 
 // ParsedEpisode holds parsed episode metadata from a file path.
 type ParsedEpisode struct {
-	IsEpisode     bool
-	SeriesName    string
-	SeriesYear    int
-	SeasonNumber  int
-	EpisodeNumber int
-	EpisodeTitle  string
-	SeriesDir     string
-	SeasonDir     string
+	IsEpisode           bool
+	SeriesName          string
+	SeriesOriginalTitle string
+	SeriesYear          int
+	SeriesProviderIDs   map[string]string
+	SeasonNumber        int
+	EpisodeNumber       int
+	EpisodeTitle        string
+	SeriesDir           string
+	SeasonDir           string
 }
 
 // ParseEpisodePath detects whether mediaPath belongs to a TV series (e.g. Series/Season 01/S01E01...).
@@ -443,14 +466,16 @@ func ParseEpisodePath(rootDir, mediaPath string, forceTV bool) ParsedEpisode {
 	}
 
 	return ParsedEpisode{
-		IsEpisode:     true,
-		SeriesName:    seriesName,
-		SeriesYear:    parsedSeries.Year,
-		SeasonNumber:  seasonNum,
-		EpisodeNumber: epNum,
-		EpisodeTitle:  epTitle,
-		SeriesDir:     seriesDir,
-		SeasonDir:     seasonDir,
+		IsEpisode:           true,
+		SeriesName:          seriesName,
+		SeriesOriginalTitle: parsedSeries.OriginalTitle,
+		SeriesYear:          parsedSeries.Year,
+		SeriesProviderIDs:   parsedSeries.ProviderIDs,
+		SeasonNumber:        seasonNum,
+		EpisodeNumber:       epNum,
+		EpisodeTitle:        epTitle,
+		SeriesDir:           seriesDir,
+		SeasonDir:           seasonDir,
 	}
 }
 
@@ -621,7 +646,9 @@ func ClassifySubtitle(filename, codec string) SubtitleClassification {
 
 	hasCHS := containsChineseMarker(lower, []string{"chs", "sc", "gb", "hans", "zh-cn", "zh_cn", "zh-hans", "zh_hans", "简体", "简中", "简日", "简英", "简"})
 	hasCHT := containsChineseMarker(lower, []string{"cht", "tc", "big5", "hant", "zh-tw", "zh_tw", "zh-hk", "zh_hk", "zh-hant", "zh_hant", "繁体", "繁體", "繁中", "繁日", "繁英", "繁"})
+	hasSimpTrad := strings.Contains(lower, "简繁") || strings.Contains(lower, "繁简")
 	hasBilingual := strings.Contains(lower, "双语") || strings.Contains(lower, "雙語") || strings.Contains(lower, "bilingual") ||
+		hasSimpTrad ||
 		(hasCHS && hasCHT) ||
 		strings.Contains(lower, "chs&eng") || strings.Contains(lower, "cht&eng") ||
 		strings.Contains(lower, "chs_eng") || strings.Contains(lower, "cht_eng") ||
@@ -634,7 +661,7 @@ func ClassifySubtitle(filename, codec string) SubtitleClassification {
 	}
 
 	switch {
-	case hasCHS && hasCHT:
+	case (hasCHS && hasCHT) || hasSimpTrad:
 		res.Language = "chi"
 		res.SubVariant = "bilingual"
 		res.DisplayTitle = "简繁双语 (" + formatLabel + ")"
@@ -699,8 +726,10 @@ func subtitleFormatLabel(codec string) string {
 
 func containsChineseMarker(lower string, markers []string) bool {
 	for _, m := range markers {
-		// Multi-byte Chinese characters can be matched anywhere
-		if hasNonASCII(m) {
+		// Multi-character CJK markers (e.g. "简体", "繁中") can be matched as substrings,
+		// while single-character markers ("简", "繁") must match as delimited tokens so
+		// titles like "繁花.S01E01.eng.srt" or "简爱.1943.eng.srt" never false-positive.
+		if hasNonASCII(m) && len([]rune(m)) > 1 {
 			if strings.Contains(lower, m) {
 				return true
 			}
@@ -728,7 +757,8 @@ func containsToken(s, tok string) bool {
 		return true
 	}
 	parts := strings.FieldsFunc(s, func(r rune) bool {
-		return r == '.' || r == '_' || r == '-' || r == ' ' || r == '[' || r == ']' || r == '(' || r == ')' || r == '&'
+		return r == '.' || r == '_' || r == '-' || r == ' ' || r == '[' || r == ']' || r == '(' || r == ')' ||
+			r == '&' || r == '/' || r == '+' || r == '（' || r == '）' || r == '【' || r == '】' || r == '、'
 	})
 	for _, p := range parts {
 		if p == tok {

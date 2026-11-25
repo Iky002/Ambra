@@ -9,8 +9,10 @@ import {
   Cpu,
   Gauge,
   HelpCircle,
+  Layers,
   Loader2,
   Maximize,
+  Maximize2,
   Minimize,
   Pause,
   PictureInPicture2,
@@ -81,6 +83,7 @@ import {
 
 type ActivePanel =
   | 'none'
+  | 'version'
   | 'subtitle'
   | 'subtitlePrefs'
   | 'audio'
@@ -88,6 +91,55 @@ type ActivePanel =
   | 'chapters'
   | 'speed'
   | 'settings'
+
+type VideoAspectMode = 'contain' | 'cover'
+
+const PLAYER_UI_PREFS_KEY = 'ambra_player_ui_prefs'
+
+interface PlayerUiPrefs {
+  volume: number
+  muted: boolean
+  playbackRate: number
+  aspectMode: VideoAspectMode
+}
+
+function loadPlayerUiPrefs(): PlayerUiPrefs {
+  const defaults: PlayerUiPrefs = {
+    volume: 1,
+    muted: false,
+    playbackRate: 1,
+    aspectMode: 'contain',
+  }
+  try {
+    const raw = localStorage.getItem(PLAYER_UI_PREFS_KEY)
+    if (!raw) return defaults
+    const parsed = JSON.parse(raw) as Partial<PlayerUiPrefs>
+    const volume =
+      typeof parsed.volume === 'number' && Number.isFinite(parsed.volume)
+        ? Math.min(1, Math.max(0, parsed.volume))
+        : defaults.volume
+    const muted = typeof parsed.muted === 'boolean' ? parsed.muted : defaults.muted
+    const playbackRate =
+      typeof parsed.playbackRate === 'number' &&
+      Number.isFinite(parsed.playbackRate) &&
+      parsed.playbackRate >= 0.25 &&
+      parsed.playbackRate <= 4
+        ? parsed.playbackRate
+        : defaults.playbackRate
+    const aspectMode: VideoAspectMode = parsed.aspectMode === 'cover' ? 'cover' : 'contain'
+    return { volume, muted, playbackRate, aspectMode }
+  } catch {
+    return defaults
+  }
+}
+
+function savePlayerUiPrefs(prefs: PlayerUiPrefs): void {
+  try {
+    localStorage.setItem(PLAYER_UI_PREFS_KEY, JSON.stringify(prefs))
+  } catch {
+    // ignore storage quota errors
+  }
+}
 type PlayMethodMode =
   | 'DirectPlay'
   | 'Proxy Direct'
@@ -183,6 +235,7 @@ export function PlayerPage() {
 
   const initialMediaSourceId = searchParams.get('mediaSourceId') || undefined
   const initialAudio = searchParams.get('audio') ? Number(searchParams.get('audio')) : undefined
+  const playlistId = searchParams.get('playlistId') || undefined
   const rawInitialSubtitle = searchParams.get('subtitle')
   const initialSubtitle =
     rawInitialSubtitle &&
@@ -224,16 +277,36 @@ export function PlayerPage() {
   const [episodeIdSynced, setEpisodeIdSynced] = useState<string | undefined>(id)
   const [retryNonce, setRetryNonce] = useState(0)
 
+  const initialUiPrefs = useMemo(() => loadPlayerUiPrefs(), [])
   const [playing, setPlaying] = useState(false)
   const [buffering, setBuffering] = useState(true)
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
   const [bufferedEnd, setBufferedEnd] = useState(0)
-  const [volume, setVolume] = useState(1)
-  const [muted, setMuted] = useState(false)
-  const [playbackRate, setPlaybackRate] = useState(1)
+  const [volume, setVolume] = useState(() => initialUiPrefs.volume)
+  const [muted, setMuted] = useState(() => initialUiPrefs.muted)
+  const [playbackRate, setPlaybackRate] = useState(() => initialUiPrefs.playbackRate)
+  const [aspectMode, setAspectMode] = useState<VideoAspectMode>(() => initialUiPrefs.aspectMode)
+  const volumeRef = useRef(volume)
+  volumeRef.current = volume
+  const mutedRef = useRef(muted)
+  mutedRef.current = muted
   const playbackRateRef = useRef(playbackRate)
   playbackRateRef.current = playbackRate
+
+  useEffect(() => {
+    savePlayerUiPrefs({ volume, muted, playbackRate, aspectMode })
+  }, [volume, muted, playbackRate, aspectMode])
+
+  useEffect(() => {
+    const v = videoRef.current
+    if (!v) return
+    v.volume = initialUiPrefs.volume
+    v.muted = initialUiPrefs.muted
+    if (Number.isFinite(initialUiPrefs.playbackRate) && initialUiPrefs.playbackRate > 0) {
+      v.playbackRate = initialUiPrefs.playbackRate
+    }
+  }, [initialUiPrefs])
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [isPip, setIsPip] = useState(false)
   const [osdVisible, setOsdVisible] = useState(true)
@@ -380,18 +453,52 @@ export function PlayerPage() {
 
   const nextEpisode = nextInSeasonEpisode || crossSeasonNextEpisode
 
+  // 播放列表队列：当携带 ?playlistId=... 时支持上一项 / 下一项与 8 秒自动连播
+  const { data: playlistItemsData } = useQuery({
+    queryKey: ['playlistItems', playlistId, userId],
+    queryFn: () => api.getPlaylistItems(playlistId!, userId),
+    enabled: Boolean(playlistId),
+    staleTime: 60_000,
+  })
+
+  const playlistVideoItems = useMemo(
+    () => (playlistItemsData?.Items || []).filter((it) => it.Type !== 'Audio'),
+    [playlistItemsData],
+  )
+  const currentPlaylistIdx = useMemo(
+    () => (playlistId ? playlistVideoItems.findIndex((it) => it.Id === id) : -1),
+    [playlistId, playlistVideoItems, id],
+  )
+  const prevPlaylistItem =
+    currentPlaylistIdx > 0 ? playlistVideoItems[currentPlaylistIdx - 1] : null
+  const nextPlaylistItem =
+    currentPlaylistIdx >= 0 && currentPlaylistIdx + 1 < playlistVideoItems.length
+      ? playlistVideoItems[currentPlaylistIdx + 1]
+      : null
+
+  const prevQueueItem = playlistId ? prevPlaylistItem : prevEpisode
+  const nextQueueItem = playlistId ? nextPlaylistItem : nextEpisode
+
+  const buildQueuePlayUrl = useCallback(
+    (targetId: string) =>
+      playlistId
+        ? `/play/${encodeURIComponent(targetId)}?playlistId=${encodeURIComponent(playlistId)}`
+        : `/play/${encodeURIComponent(targetId)}`,
+    [playlistId],
+  )
+
   useEffect(() => {
-    if (nextUpCountdown === null || !nextEpisode) return
+    if (nextUpCountdown === null || !nextQueueItem) return
     if (nextUpCountdown <= 0) {
       setNextUpCountdown(null)
-      navigate(`/play/${nextEpisode.Id}`, { replace: true })
+      navigate(buildQueuePlayUrl(nextQueueItem.Id), { replace: true })
       return
     }
     const timer = window.setTimeout(() => {
       setNextUpCountdown((c) => (c === null ? null : c - 1))
     }, 1000)
     return () => window.clearTimeout(timer)
-  }, [nextUpCountdown, nextEpisode, navigate])
+  }, [nextUpCountdown, nextQueueItem, navigate, buildQueuePlayUrl])
 
   const {
     data: playbackInfo,
@@ -752,6 +859,8 @@ export function PlayerPage() {
           initialSeekDoneRef.current = true
         }
       }
+      video.volume = volumeRef.current
+      video.muted = mutedRef.current
       if (Number.isFinite(playbackRateRef.current) && playbackRateRef.current > 0) {
         video.playbackRate = playbackRateRef.current
       }
@@ -787,6 +896,12 @@ export function PlayerPage() {
         const hls = new Hls({
           enableWorker: true,
           lowLatencyMode: false,
+          xhrSetup: (xhr) => {
+            const headers = buildAuthHeaders()
+            Object.entries(headers).forEach(([k, v]) => {
+              xhr.setRequestHeader(k, v)
+            })
+          },
         })
         hlsRef.current = hls
         hls.loadSource(url)
@@ -941,6 +1056,7 @@ export function PlayerPage() {
     return () => {
       cancelled = true
       abortController.abort()
+      video.removeEventListener('loadedmetadata', startPlayback)
       if (hlsRef.current) {
         hlsRef.current.destroy()
         hlsRef.current = null
@@ -953,6 +1069,9 @@ export function PlayerPage() {
         wasmRemuxerRef.current.dispose()
         wasmRemuxerRef.current = null
       }
+      video.pause()
+      video.removeAttribute('src')
+      video.load()
     }
   }, [
     streamPlan,
@@ -1246,6 +1365,15 @@ export function PlayerPage() {
       }
     }, 3200)
   }, [activePanel])
+
+  useEffect(() => {
+    return () => {
+      if (hideOsdTimerRef.current) {
+        window.clearTimeout(hideOsdTimerRef.current)
+        hideOsdTimerRef.current = null
+      }
+    }
+  }, [])
 
   // 播放控制方法
   const togglePlay = useCallback(() => {
@@ -1580,11 +1708,10 @@ export function PlayerPage() {
         osdVisible ? 'cursor-default' : 'cursor-none'
       }`}
     >
-      {/* 主视频元素 */}
+      {/* 主视频元素（不设 crossOrigin，避免 STRM 302 重定向到无 ACAO 响应头的网盘/CDN 时被浏览器 CORS 拦截） */}
       <video
         ref={videoRef}
         playsInline
-        crossOrigin="anonymous"
         onClick={(e) => {
           e.stopPropagation()
           if (activePanel !== 'none') {
@@ -1621,7 +1748,7 @@ export function PlayerPage() {
           setPlaying(false)
           setOsdVisible(true)
           reportState('stop')
-          if (nextEpisode && loadPlaybackPrefs().autoPlayNextEpisode) {
+          if (nextQueueItem && (playlistId || loadPlaybackPrefs().autoPlayNextEpisode)) {
             setNextUpCountdown(8)
           }
         }}
@@ -1657,23 +1784,23 @@ export function PlayerPage() {
           setBuffering(false)
           setPlayerError('视频流解码或加载失败，请检查媒体格式或网络连接')
         }}
-        className="h-full w-full object-contain"
+        className={`h-full w-full ${aspectMode === 'cover' ? 'object-cover' : 'object-contain'}`}
       />
 
       {/* JASSUB (libass WASM) ASS/SSA 特效字幕覆盖 Canvas */}
       <canvas
         ref={assCanvasRef}
-        className={`pointer-events-none absolute inset-0 h-full w-full object-contain ${
-          activeSubtitleMeta.engine === 'ass' ? 'block' : 'hidden'
-        }`}
+        className={`pointer-events-none absolute inset-0 h-full w-full ${
+          aspectMode === 'cover' ? 'object-cover' : 'object-contain'
+        } ${activeSubtitleMeta.engine === 'ass' ? 'block' : 'hidden'}`}
       />
 
       {/* PGS 蓝光图形字幕覆盖 Canvas */}
       <canvas
         ref={pgsCanvasRef}
-        className={`pointer-events-none absolute inset-0 h-full w-full object-contain ${
-          activeSubtitleMeta.engine === 'pgs' ? 'block' : 'hidden'
-        }`}
+        className={`pointer-events-none absolute inset-0 h-full w-full ${
+          aspectMode === 'cover' ? 'object-cover' : 'object-contain'
+        } ${activeSubtitleMeta.engine === 'pgs' ? 'block' : 'hidden'}`}
       />
 
       {/* WebVTT / SRT 影院级文本字幕覆盖层 */}
@@ -1797,22 +1924,22 @@ export function PlayerPage() {
         </div>
       )}
 
-      {/* 自动连播下一集 8 秒倒计时浮层 */}
-      {nextUpCountdown !== null && nextEpisode && (
+      {/* 自动连播下一集 / 下一项 8 秒倒计时浮层 */}
+      {nextUpCountdown !== null && nextQueueItem && (
         <div
           onClick={(e) => e.stopPropagation()}
           className="absolute bottom-28 right-6 z-30 w-80 max-w-[calc(100vw-3rem)] rounded-2xl border border-amber-500/35 bg-zinc-950/92 p-4 shadow-2xl backdrop-blur-xl"
         >
           <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-400">
-            即将播放下一集
+            {playlistId ? '即将播放播放列表下一项' : '即将播放下一集'}
           </p>
           <p className="mt-1 truncate text-sm font-semibold text-white">
-            {nextEpisode.ParentIndexNumber != null && nextEpisode.IndexNumber != null
-              ? `S${String(nextEpisode.ParentIndexNumber).padStart(2, '0')}E${String(nextEpisode.IndexNumber).padStart(2, '0')} `
-              : nextEpisode.IndexNumber != null
-                ? `第 ${nextEpisode.IndexNumber} 集 `
+            {nextQueueItem.ParentIndexNumber != null && nextQueueItem.IndexNumber != null
+              ? `S${String(nextQueueItem.ParentIndexNumber).padStart(2, '0')}E${String(nextQueueItem.IndexNumber).padStart(2, '0')} `
+              : nextQueueItem.IndexNumber != null
+                ? `第 ${nextQueueItem.IndexNumber} 集 `
                 : ''}
-            {nextEpisode.Name}
+            {nextQueueItem.Name}
           </p>
           <p className="mt-1 text-xs text-zinc-400">{nextUpCountdown} 秒后自动播放</p>
           <div className="mt-3 h-1 w-full overflow-hidden rounded-full bg-white/10">
@@ -1833,7 +1960,7 @@ export function PlayerPage() {
               type="button"
               onClick={() => {
                 setNextUpCountdown(null)
-                navigate(`/play/${nextEpisode.Id}`, { replace: true })
+                navigate(buildQueuePlayUrl(nextQueueItem.Id), { replace: true })
               }}
               className="inline-flex items-center gap-1 rounded-xl bg-amber-500 px-3.5 py-1.5 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400"
             >
@@ -2097,13 +2224,13 @@ export function PlayerPage() {
         <div className="flex items-center justify-between gap-3">
           {/* 左侧控制 */}
           <div className="flex items-center gap-2 sm:gap-3">
-            {prevEpisode && (
+            {prevQueueItem && (
               <button
                 type="button"
-                onClick={() => navigate(`/play/${prevEpisode.Id}`, { replace: true })}
+                onClick={() => navigate(buildQueuePlayUrl(prevQueueItem.Id), { replace: true })}
                 className="rounded-lg p-2 text-zinc-200 hover:bg-white/10"
-                title={`上一集：${prevEpisode.Name}`}
-                aria-label="上一集"
+                title={`${playlistId ? '上一项' : '上一集'}：${prevQueueItem.Name}`}
+                aria-label={playlistId ? '上一项' : '上一集'}
               >
                 <SkipBack className="h-4 w-4" />
               </button>
@@ -2122,13 +2249,13 @@ export function PlayerPage() {
               )}
             </button>
 
-            {nextEpisode && (
+            {nextQueueItem && (
               <button
                 type="button"
-                onClick={() => navigate(`/play/${nextEpisode.Id}`, { replace: true })}
+                onClick={() => navigate(buildQueuePlayUrl(nextQueueItem.Id), { replace: true })}
                 className="rounded-lg p-2 text-zinc-200 hover:bg-white/10"
-                title={`下一集：${nextEpisode.Name}`}
-                aria-label="下一集"
+                title={`${playlistId ? '下一项' : '下一集'}：${nextQueueItem.Name}`}
+                aria-label={playlistId ? '下一项' : '下一集'}
               >
                 <SkipForward className="h-4 w-4" />
               </button>
@@ -2237,6 +2364,68 @@ export function PlayerPage() {
                           </button>
                         )
                       })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* 多版本切换 */}
+            {(playbackInfo?.MediaSources?.length ?? 0) > 1 && (
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setActivePanel((p) => (p === 'version' ? 'none' : 'version'))}
+                  className={`flex items-center gap-1.5 rounded-xl px-2.5 py-2 text-xs font-medium transition-colors ${
+                    activePanel === 'version'
+                      ? 'bg-amber-500 text-zinc-950'
+                      : 'bg-white/10 text-zinc-200 hover:bg-white/20'
+                  }`}
+                  title="切换视频版本"
+                  aria-label="切换视频版本"
+                >
+                  <Layers className="h-4 w-4" />
+                  <span className="hidden md:inline">版本</span>
+                </button>
+
+                {activePanel === 'version' && (
+                  <div className="absolute bottom-12 right-0 z-30 w-64 overflow-hidden rounded-2xl border border-white/15 bg-zinc-950/95 p-2 shadow-2xl backdrop-blur-xl">
+                    <p className="px-2.5 py-1.5 text-[11px] font-semibold text-zinc-400">
+                      选择视频版本 ({playbackInfo!.MediaSources.length})
+                    </p>
+                    <div className="max-h-60 space-y-1 overflow-y-auto">
+                      {playbackInfo!.MediaSources.map((src) => (
+                        <button
+                          key={src.Id}
+                          type="button"
+                          onClick={() => {
+                            if (src.Id !== activeSource?.Id) {
+                              captureResumePosition()
+                              initializedAudioSourceIdRef.current = null
+                              initializedSubSourceIdRef.current = null
+                              setSelectedSourceId(src.Id)
+                              setQuerySourceId(src.Id)
+                              setAudioIndex(undefined)
+                              setQueryAudioIndex(undefined)
+                              setSubtitleIndex(undefined)
+                            }
+                            setActivePanel('none')
+                            pokeOsd()
+                          }}
+                          className={`flex w-full items-center justify-between gap-2 rounded-xl px-2.5 py-2 text-left text-xs transition-colors ${
+                            src.Id === activeSource?.Id
+                              ? 'bg-amber-500/20 font-semibold text-amber-300'
+                              : 'text-zinc-200 hover:bg-white/8'
+                          }`}
+                        >
+                          <span className="truncate">{src.Name || src.Id}</span>
+                          {src.Container && (
+                            <span className="shrink-0 rounded bg-white/10 px-1.5 py-0.5 font-mono text-[10px] text-zinc-300">
+                              {src.Container.toUpperCase()}
+                            </span>
+                          )}
+                        </button>
+                      ))}
                     </div>
                   </div>
                 )}
@@ -2663,6 +2852,30 @@ export function PlayerPage() {
                 </div>
               )}
             </div>
+
+            {/* 画面填充比例切换 (适应 / 铺满) */}
+            <button
+              type="button"
+              onClick={() => {
+                setAspectMode((prev) => (prev === 'contain' ? 'cover' : 'contain'))
+                pokeOsd()
+              }}
+              className={`flex items-center gap-1 rounded-xl px-2.5 py-2 text-xs font-medium transition-colors ${
+                aspectMode === 'cover'
+                  ? 'bg-amber-500/20 text-amber-300 ring-1 ring-amber-400/40'
+                  : 'bg-white/10 text-zinc-200 hover:bg-white/20'
+              }`}
+              title={
+                aspectMode === 'contain'
+                  ? '画面比例：适应屏幕（点击切换填充铺满）'
+                  : '画面比例：填充铺满（点击切换适应屏幕）'
+              }
+              aria-label="切换画面比例"
+              aria-pressed={aspectMode === 'cover'}
+            >
+              <Maximize2 className="h-4 w-4" />
+              <span className="hidden lg:inline">{aspectMode === 'cover' ? '填充' : '适应'}</span>
+            </button>
 
             {/* 画中画 (PiP) */}
             {pipSupported && (

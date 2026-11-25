@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowDownWideNarrow,
   ArrowUpNarrowWide,
+  Building2,
   Calendar,
   Check,
   CheckSquare,
@@ -89,6 +90,7 @@ export function LibraryPage() {
   const [genreFilter, setGenreFilter] = useState(() => searchParams.get('genre') || '')
   const [yearFilter, setYearFilter] = useState(() => searchParams.get('year') || '')
   const [tagFilter, setTagFilter] = useState(() => searchParams.get('tag') || '')
+  const [studioFilter, setStudioFilter] = useState(() => searchParams.get('studio') || '')
   const [musicSubTab, setMusicSubTab] = useState<MusicSubTab>('MusicAlbum')
   const [page, setPage] = useState(0)
 
@@ -111,11 +113,12 @@ export function LibraryPage() {
     }
   }
 
-  // 响应 URL query 参数变化（例如从详情页点击流派/年份/标签跳转或字母筛选）
+  // 响应 URL query 参数变化（例如从详情页点击流派/年份/标签/制片厂跳转或字母筛选）
   useEffect(() => {
     setGenreFilter(searchParams.get('genre') || '')
     setYearFilter(searchParams.get('year') || '')
     setTagFilter(searchParams.get('tag') || '')
+    setStudioFilter(searchParams.get('studio') || '')
     setLetterFilter(searchParams.get('letter') || '')
     setPage(0)
   }, [id, searchParams])
@@ -123,7 +126,6 @@ export function LibraryPage() {
   useEffect(() => {
     setMusicSubTab('MusicAlbum')
     setStatusFilter('')
-    setLetterFilter('')
     setSelectMode(false)
     setSelectedIds(new Set())
     setBatchFeedback(null)
@@ -132,9 +134,9 @@ export function LibraryPage() {
   // 切换任何筛选条件或音乐子标签时清空已选集合，避免隐藏项被误包含进批量操作
   useEffect(() => {
     setSelectedIds(new Set())
-  }, [musicSubTab, statusFilter, genreFilter, yearFilter, tagFilter, letterFilter])
+  }, [musicSubTab, statusFilter, genreFilter, yearFilter, tagFilter, studioFilter, letterFilter])
 
-  const updateUrlParam = (key: 'genre' | 'year' | 'tag' | 'letter', value: string) => {
+  const updateUrlParam = (key: 'genre' | 'year' | 'tag' | 'studio' | 'letter', value: string) => {
     const next = new URLSearchParams(searchParams)
     if (value) {
       next.set(key, value)
@@ -214,7 +216,8 @@ export function LibraryPage() {
       genreFilter,
       yearFilter,
       tagFilter,
-      page,
+      studioFilter,
+      studioFilter ? 0 : page,
     ],
     queryFn: () =>
       api.getItems(userId, {
@@ -229,18 +232,31 @@ export function LibraryPage() {
         nameLessThan: letterFilter === '#' ? 'a' : undefined,
         nameStartsWith:
           letterFilter && letterFilter !== '#' ? letterFilter.toLowerCase() : undefined,
-        startIndex: page * PAGE_SIZE,
-        limit: PAGE_SIZE,
+        startIndex: studioFilter ? 0 : page * PAGE_SIZE,
+        limit: studioFilter ? 500 : PAGE_SIZE,
       }),
     enabled: Boolean(id && (libraryInfo || libraryInfoFetched)),
     placeholderData: (prev) => prev,
   })
 
-  const items = data?.Items || []
-  const total = data?.TotalRecordCount || 0
+  const { items, total } = useMemo(() => {
+    const rawItems = data?.Items || []
+    if (!studioFilter) {
+      return { items: rawItems, total: data?.TotalRecordCount || 0 }
+    }
+    const targetStudio = studioFilter.trim().toLowerCase()
+    const matched = rawItems.filter((item) =>
+      item.Studios?.some((s) => s.Name.trim().toLowerCase() === targetStudio),
+    )
+    return {
+      items: matched.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE),
+      total: matched.length,
+    }
+  }, [data, studioFilter, page])
+
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const hasActiveFilters = Boolean(
-    statusFilter || letterFilter || genreFilter || yearFilter || tagFilter,
+    statusFilter || letterFilter || genreFilter || yearFilter || tagFilter || studioFilter,
   )
 
   const handleResetFilters = () => {
@@ -249,6 +265,7 @@ export function LibraryPage() {
     setGenreFilter('')
     setYearFilter('')
     setTagFilter('')
+    setStudioFilter('')
     setSearchParams({}, { replace: true })
     setPage(0)
   }
@@ -520,6 +537,24 @@ export function LibraryPage() {
             <CheckSquare className="h-3.5 w-3.5" />
             <span>多选</span>
           </button>
+
+          {studioFilter && (
+            <span className="inline-flex items-center gap-1.5 rounded-xl border border-amber-400/35 bg-amber-500/15 px-3 py-1.5 text-xs font-medium text-amber-200">
+              <Building2 className="h-3.5 w-3.5 text-amber-400" />
+              <span>制片厂：{studioFilter}</span>
+              <button
+                type="button"
+                aria-label="清除制片厂筛选"
+                onClick={() => {
+                  setStudioFilter('')
+                  updateUrlParam('studio', '')
+                }}
+                className="ml-0.5 rounded-full p-0.5 text-amber-300 transition-colors hover:bg-amber-400/20 hover:text-white"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </span>
+          )}
 
           {hasActiveFilters && (
             <button

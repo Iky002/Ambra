@@ -36,7 +36,12 @@ func (h *Handler) recordRemoteCommand(sessionID, kind, command string, payload m
 func (h *Handler) getSessionPlayQueue(w http.ResponseWriter, r *http.Request) {
 	items := []dto.BaseItemDto{}
 	if h.sessions != nil {
+		isAdmin := h.isCallerAdmin(r)
+		callerID := h.callerUserID(r)
 		for _, s := range h.sessions.ListSessions() {
+			if !isAdmin && callerID != "" && guid.Normalize(s.UserId) != callerID {
+				continue
+			}
 			if s.NowPlayingItem != nil {
 				items = append(items, *s.NowPlayingItem)
 			}
@@ -228,6 +233,10 @@ func (h *Handler) postSessionMessage(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) postSessionAddUser(w http.ResponseWriter, r *http.Request) {
 	sid := chi.URLParam(r, "Id")
+	if _, _, allowed := h.authorizeSessionTarget(r, sid); !allowed {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	uid := guid.Normalize(chi.URLParam(r, "UserId"))
 	h.mu.Lock()
 	if h.sessionUsers[sid] == nil {
@@ -240,6 +249,10 @@ func (h *Handler) postSessionAddUser(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) deleteSessionUser(w http.ResponseWriter, r *http.Request) {
 	sid := chi.URLParam(r, "Id")
+	if _, _, allowed := h.authorizeSessionTarget(r, sid); !allowed {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	uid := guid.Normalize(chi.URLParam(r, "UserId"))
 	h.mu.Lock()
 	if users, ok := h.sessionUsers[sid]; ok {
@@ -261,9 +274,46 @@ func (h *Handler) postSessionPlayingPing(w http.ResponseWriter, r *http.Request)
 
 // --- /Devices ---
 
+func (h *Handler) canAccessDevice(r *http.Request, deviceID string) bool {
+	if h.isCallerAdmin(r) {
+		return true
+	}
+	callerID := h.callerUserID(r)
+	if callerID == "" {
+		return false
+	}
+	if deviceID == "" {
+		return false
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.Client.DeviceID == deviceID {
+		return true
+	}
+	if h.userRepo != nil {
+		if list, err := h.userRepo.ListDevices(r.Context()); err == nil {
+			for _, d := range list {
+				if d.ID == deviceID {
+					return guid.Normalize(d.LastUserID) == callerID
+				}
+			}
+		}
+	}
+	if h.sessions != nil {
+		for _, s := range h.sessions.ListSessions() {
+			if s.DeviceId == deviceID {
+				return guid.Normalize(s.UserId) == callerID
+			}
+		}
+	}
+	return false
+}
+
 func (h *Handler) getDeviceInfo(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	deviceID := strings.TrimSpace(q.Get("Id"))
+	if !h.canAccessDevice(r, deviceID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 
 	if h.userRepo != nil && deviceID != "" {
 		if list, err := h.userRepo.ListDevices(r.Context()); err == nil {
@@ -304,6 +354,10 @@ func (h *Handler) getDeviceOptions(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) postDeviceOptions(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	deviceID := strings.TrimSpace(q.Get("Id"))
+	if !h.canAccessDevice(r, deviceID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	body := map[string]any{}
 	if err := decodeOptionalJSON(r, &body); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -324,11 +378,18 @@ func (h *Handler) postDevicesDelete(w http.ResponseWriter, r *http.Request) {
 		deviceID = strings.TrimSpace(body.Id)
 	}
 	if deviceID != "" {
-		if h.userRepo != nil {
+		if h.authSvc != nil {
+			_ = h.authSvc.RevokeDevice(r.Context(), deviceID)
+		} else if h.userRepo != nil {
 			_ = h.userRepo.DeleteTokensByDevice(r.Context(), deviceID)
 		}
 		if h.sessions != nil {
 			h.sessions.RemoveSessionByDevice(deviceID)
+		}
+		if h.wsHub != nil {
+			if disc, ok := h.wsHub.(interface{ DisconnectDevice(string) }); ok {
+				disc.DisconnectDevice(deviceID)
+			}
 		}
 	}
 	httpx.NoContent(w)
@@ -375,8 +436,12 @@ func (h *Handler) getAuthProviders(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) deleteAuthKey(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimSpace(chi.URLParam(r, "Key"))
-	if h.userRepo != nil && key != "" {
-		_ = h.userRepo.DeleteAPIKey(r.Context(), key)
+	if key != "" {
+		if h.authSvc != nil {
+			_ = h.authSvc.RevokeAPIKey(r.Context(), key)
+		} else if h.userRepo != nil {
+			_ = h.userRepo.DeleteAPIKey(r.Context(), key)
+		}
 	}
 	httpx.NoContent(w)
 }

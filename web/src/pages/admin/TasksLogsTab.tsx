@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import {
   CalendarClock,
   Clock,
+  Download,
   FileText,
   Loader2,
   Play,
@@ -16,20 +17,35 @@ import {
 } from 'lucide-react'
 import { api } from '../../api/client'
 import type { ScheduledTaskInfo, ServerLogFile, TaskTriggerInfo } from '../../api/types'
+import { QueryErrorState } from '../../components/QueryErrorState'
 import { AdminModal, FeedbackBanner, formatBytes, formatDateTime } from './adminUtils'
 
 const TICKS_PER_MINUTE = 60 * 10_000_000
 const TICKS_PER_HOUR = 3600 * 10_000_000
+
+const DAYS_OF_WEEK = [
+  { value: 'Sunday', label: '周日 (Sunday)' },
+  { value: 'Monday', label: '周一 (Monday)' },
+  { value: 'Tuesday', label: '周二 (Tuesday)' },
+  { value: 'Wednesday', label: '周三 (Wednesday)' },
+  { value: 'Thursday', label: '周四 (Thursday)' },
+  { value: 'Friday', label: '周五 (Friday)' },
+  { value: 'Saturday', label: '周六 (Saturday)' },
+] as const
+
+function formatTicksToHHMM(ticks: number): string {
+  const totalMins = Math.round(ticks / TICKS_PER_MINUTE)
+  const hh = String(Math.floor(totalMins / 60) % 24).padStart(2, '0')
+  const mm = String(totalMins % 60).padStart(2, '0')
+  return `${hh}:${mm}`
+}
 
 function formatTriggerLabel(trigger: TaskTriggerInfo): string {
   if (trigger.Type === 'StartupTrigger') {
     return '服务器启动时触发'
   }
   if (trigger.Type === 'DailyTrigger') {
-    const totalMins = Math.round((trigger.TimeOfDayTicks ?? 0) / TICKS_PER_MINUTE)
-    const hh = String(Math.floor(totalMins / 60) % 24).padStart(2, '0')
-    const mm = String(totalMins % 60).padStart(2, '0')
-    return `每日 ${hh}:${mm} 执行`
+    return `每日 ${formatTicksToHHMM(trigger.TimeOfDayTicks ?? 0)} 执行`
   }
   if (trigger.Type === 'IntervalTrigger') {
     const hours = (trigger.IntervalTicks ?? 0) / TICKS_PER_HOUR
@@ -40,7 +56,15 @@ function formatTriggerLabel(trigger: TaskTriggerInfo): string {
     return `每隔 ${mins} 分钟执行`
   }
   if (trigger.Type === 'WeeklyTrigger') {
-    return `每周 ${trigger.DayOfWeek || 'Sunday'} 执行`
+    const dayLabel =
+      DAYS_OF_WEEK.find((d) => d.value === trigger.DayOfWeek)?.label ||
+      trigger.DayOfWeek ||
+      'Sunday'
+    const timeStr =
+      typeof trigger.TimeOfDayTicks === 'number'
+        ? ` ${formatTicksToHHMM(trigger.TimeOfDayTicks)}`
+        : ''
+    return `每周 ${dayLabel}${timeStr} 执行`
   }
   return trigger.Type
 }
@@ -58,9 +82,10 @@ export function TasksLogsTab() {
   const [editingTriggersTask, setEditingTriggersTask] = useState<ScheduledTaskInfo | null>(null)
   const [draftTriggers, setDraftTriggers] = useState<TaskTriggerInfo[]>([])
   const [newTriggerType, setNewTriggerType] = useState<
-    'DailyTrigger' | 'IntervalTrigger' | 'StartupTrigger'
+    'DailyTrigger' | 'WeeklyTrigger' | 'IntervalTrigger' | 'StartupTrigger'
   >('DailyTrigger')
   const [newDailyTime, setNewDailyTime] = useState('03:00')
+  const [newWeeklyDay, setNewWeeklyDay] = useState<string>('Sunday')
   const [newIntervalHours, setNewIntervalHours] = useState(6)
   const [savingTriggers, setSavingTriggers] = useState(false)
 
@@ -68,6 +93,8 @@ export function TasksLogsTab() {
     data: rawTasks,
     isLoading: tasksLoading,
     isFetching: tasksFetching,
+    isError: tasksIsError,
+    error: tasksError,
     refetch: refetchTasks,
   } = useQuery({
     queryKey: ['admin', 'scheduledTasks'],
@@ -85,6 +112,8 @@ export function TasksLogsTab() {
     data: rawLogFiles,
     isLoading: logsLoading,
     isFetching: logsFetching,
+    isError: logsIsError,
+    error: logsError,
     refetch: refetchLogs,
   } = useQuery({
     queryKey: ['admin', 'serverLogs'],
@@ -152,6 +181,7 @@ export function TasksLogsTab() {
     setDraftTriggers(Array.isArray(task.Triggers) ? task.Triggers.map((t) => ({ ...t })) : [])
     setNewTriggerType('DailyTrigger')
     setNewDailyTime('03:00')
+    setNewWeeklyDay('Sunday')
     setNewIntervalHours(6)
   }
 
@@ -165,6 +195,15 @@ export function TasksLogsTab() {
         Type: 'DailyTrigger',
         TimeOfDayTicks: (hh * 60 + mm) * TICKS_PER_MINUTE,
       }
+    } else if (newTriggerType === 'WeeklyTrigger') {
+      const [hhRaw, mmRaw] = newDailyTime.split(':')
+      const hh = Math.min(23, Math.max(0, Number(hhRaw) || 0))
+      const mm = Math.min(59, Math.max(0, Number(mmRaw) || 0))
+      next = {
+        Type: 'WeeklyTrigger',
+        DayOfWeek: newWeeklyDay,
+        TimeOfDayTicks: (hh * 60 + mm) * TICKS_PER_MINUTE,
+      }
     } else if (newTriggerType === 'IntervalTrigger') {
       const hours = Math.max(1, Number(newIntervalHours) || 1)
       next = {
@@ -175,6 +214,27 @@ export function TasksLogsTab() {
       next = { Type: 'StartupTrigger' }
     }
     setDraftTriggers((prev) => [...prev, next])
+  }
+
+  const rawLogText = useMemo(() => {
+    return typeof logContent === 'string'
+      ? logContent
+      : logContent
+        ? JSON.stringify(logContent, null, 2)
+        : ''
+  }, [logContent])
+
+  const handleDownloadLog = () => {
+    if (!selectedLog) return
+    const blob = new Blob([rawLogText], { type: 'text/plain;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = selectedLog.toLowerCase().endsWith('.log') ? selectedLog : `${selectedLog}.log`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
   }
 
   const handleSaveTriggers = async () => {
@@ -248,6 +308,13 @@ export function TasksLogsTab() {
           <div className="flex h-32 items-center justify-center rounded-2xl border border-white/8 bg-white/[0.02]">
             <Loader2 className="h-5 w-5 animate-spin text-amber-400" />
           </div>
+        ) : tasksIsError ? (
+          <QueryErrorState
+            compact
+            title="无法加载计划任务"
+            error={tasksError}
+            onRetry={() => void refetchTasks()}
+          />
         ) : tasks.length === 0 ? (
           <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-10 text-center text-xs text-zinc-500">
             暂无计划任务
@@ -391,6 +458,15 @@ export function TasksLogsTab() {
               <div className="flex h-36 items-center justify-center">
                 <Loader2 className="h-5 w-5 animate-spin text-amber-400" />
               </div>
+            ) : logsIsError ? (
+              <div className="p-3">
+                <QueryErrorState
+                  compact
+                  title="无法加载服务器日志列表"
+                  error={logsError}
+                  onRetry={() => void refetchLogs()}
+                />
+              </div>
             ) : logFiles.length === 0 ? (
               <div className="py-12 text-center text-xs text-zinc-500">暂无服务器日志文件</div>
             ) : (
@@ -446,6 +522,16 @@ export function TasksLogsTab() {
                       className="w-40 rounded-lg border border-white/10 bg-black/40 py-1 pl-8 pr-2.5 text-xs text-zinc-200 placeholder-zinc-500 outline-none focus:border-amber-400/50 sm:w-52"
                     />
                   </div>
+                  <button
+                    type="button"
+                    disabled={contentLoading || Boolean(contentError)}
+                    onClick={handleDownloadLog}
+                    className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-xs font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:text-amber-300 disabled:cursor-not-allowed disabled:opacity-40"
+                    title="下载当前日志文件"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    <span>下载日志</span>
+                  </button>
                   <button
                     type="button"
                     onClick={() => void refetchLogContent()}
@@ -537,12 +623,17 @@ export function TasksLogsTab() {
                   value={newTriggerType}
                   onChange={(e) =>
                     setNewTriggerType(
-                      e.target.value as 'DailyTrigger' | 'IntervalTrigger' | 'StartupTrigger',
+                      e.target.value as
+                        | 'DailyTrigger'
+                        | 'WeeklyTrigger'
+                        | 'IntervalTrigger'
+                        | 'StartupTrigger',
                     )
                   }
                   className="w-full rounded-lg border border-white/10 bg-[#181822] px-2.5 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/60"
                 >
                   <option value="DailyTrigger">每日定时 (Daily)</option>
+                  <option value="WeeklyTrigger">每周定时 (Weekly)</option>
                   <option value="IntervalTrigger">固定间隔 (Interval)</option>
                   <option value="StartupTrigger">启动时触发 (Startup)</option>
                 </select>
@@ -557,6 +648,28 @@ export function TasksLogsTab() {
                     onChange={(e) => setNewDailyTime(e.target.value)}
                     className="w-full rounded-lg border border-white/10 bg-zinc-900/90 px-2.5 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/60"
                   />
+                ) : newTriggerType === 'WeeklyTrigger' ? (
+                  <div className="flex flex-col gap-2">
+                    <select
+                      aria-label="每周执行星期"
+                      value={newWeeklyDay}
+                      onChange={(e) => setNewWeeklyDay(e.target.value)}
+                      className="w-full rounded-lg border border-white/10 bg-[#181822] px-2.5 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/60"
+                    >
+                      {DAYS_OF_WEEK.map((d) => (
+                        <option key={d.value} value={d.value}>
+                          {d.label}
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      aria-label="每周执行时间"
+                      type="time"
+                      value={newDailyTime}
+                      onChange={(e) => setNewDailyTime(e.target.value)}
+                      className="w-full rounded-lg border border-white/10 bg-zinc-900/90 px-2.5 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/60"
+                    />
+                  </div>
                 ) : newTriggerType === 'IntervalTrigger' ? (
                   <div className="flex items-center gap-1.5">
                     <input
