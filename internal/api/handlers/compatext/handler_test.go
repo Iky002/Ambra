@@ -13,8 +13,10 @@ import (
 	"time"
 
 	"github.com/ambra-media/ambra/internal/api/handlers/livetv"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/dvr"
+	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -61,8 +63,8 @@ var all59Routes = []routeSpec{
 	{http.MethodGet, "/LiveTv/ChannelTags", false, false, ""},
 	{http.MethodGet, "/LiveTv/ChannelTags/Prefixes", false, false, ""},
 	{http.MethodPost, "/LiveTv/Recordings/rec-1/Delete", true, false, `{}`},
-	{http.MethodPost, "/LiveTv/Timers/timer-1/Delete", false, false, `{}`},
-	{http.MethodPost, "/LiveTv/SeriesTimers/st-1/Delete", false, false, `{}`},
+	{http.MethodPost, "/LiveTv/Timers/timer-1/Delete", true, false, `{}`},
+	{http.MethodPost, "/LiveTv/SeriesTimers/st-1/Delete", true, false, `{}`},
 	{http.MethodGet, "/LiveTv/TunerHosts", true, false, ""},
 	{http.MethodGet, "/LiveTv/TunerHosts/Default/m3u", true, false, ""},
 	{http.MethodPost, "/LiveTv/TunerHosts/Delete", true, false, `{"Id":"th-1"}`},
@@ -87,7 +89,7 @@ var all59Routes = []routeSpec{
 	{http.MethodDelete, "/Sync/target-1/Items", false, false, ""},
 	{http.MethodHead, "/Sync/JobItems/ji-1/File", false, true, ""},
 	{http.MethodGet, "/Sync/JobItems/ji-1/File", false, true, ""},
-	{http.MethodGet, "/Sync/JobItems/ji-1/AdditionalFiles", false, false, ""},
+	{http.MethodGet, "/Sync/JobItems/ji-1/AdditionalFiles", false, true, ""},
 	{http.MethodPost, "/Sync/OfflineActions", false, false, `{}`},
 
 	// /Notifications (5)
@@ -99,14 +101,27 @@ var all59Routes = []routeSpec{
 }
 
 func makeAuthFuncs() AuthFuncs {
+	attachRole := func(r *http.Request, role string) *http.Request {
+		isAdmin := role == "admin"
+		ac := &middleware.AuthContext{
+			User: &sqlite.UserRecord{
+				ID:      guid.Normalize("user-ctx-1"),
+				Name:    role,
+				IsAdmin: isAdmin,
+				Policy:  sqlite.DefaultUserPolicy(isAdmin),
+			},
+		}
+		return r.WithContext(middleware.WithAuthContext(r.Context(), ac))
+	}
 	return AuthFuncs{
 		RequireAuth: func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Header.Get("X-Test-Role") == "" {
+				role := r.Header.Get("X-Test-Role")
+				if role == "" {
 					w.WriteHeader(http.StatusUnauthorized)
 					return
 				}
-				next.ServeHTTP(w, r)
+				next.ServeHTTP(w, attachRole(r, role))
 			})
 		},
 		RequireAdmin: func(next http.Handler) http.Handler {
@@ -120,7 +135,7 @@ func makeAuthFuncs() AuthFuncs {
 					w.WriteHeader(http.StatusForbidden)
 					return
 				}
-				next.ServeHTTP(w, r)
+				next.ServeHTTP(w, attachRole(r, role))
 			})
 		},
 		UserIDFromCtx: func(ctx context.Context) string {
@@ -215,8 +230,8 @@ func TestNilStoreAndNilAuthFallback(t *testing.T) {
 	}
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Sync/JobItems/ji1/AdditionalFiles?Name=sub.vtt", nil))
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Header().Get("Content-Type"), "text/vtt") {
-		t.Errorf("GET AdditionalFiles .vtt: code=%d ct=%q", rec.Code, rec.Header().Get("Content-Type"))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("GET AdditionalFiles nonexistent item: code=%d want 404", rec.Code)
 	}
 }
 
@@ -359,7 +374,15 @@ func TestSQLitePersistenceAndSharedState(t *testing.T) {
 		t.Fatalf("mapping options: %d %s", w.Code, w.Body.String())
 	}
 
-	// 6. Delete Recording, Timer, SeriesTimer, TunerHost, ListingProvider
+	// 6. Delete Recording, Timer, SeriesTimer, TunerHost, ListingProvider (admin context for timer deletion)
+	adminAC := &middleware.AuthContext{
+		User: &sqlite.UserRecord{
+			ID:      guid.Normalize("admin-1"),
+			Name:    "admin",
+			IsAdmin: true,
+			Policy:  sqlite.DefaultUserPolicy(true),
+		},
+	}
 	for _, p := range []string{
 		"/LiveTv/Recordings/rec-2/Delete",
 		"/LiveTv/Timers/t-1/Delete",
@@ -368,7 +391,9 @@ func TestSQLitePersistenceAndSharedState(t *testing.T) {
 		"/LiveTv/ListingProviders/Delete?Id=lp-2",
 	} {
 		w = httptest.NewRecorder()
-		router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, p, nil))
+		req := httptest.NewRequest(http.MethodPost, p, nil)
+		req = req.WithContext(middleware.WithAuthContext(req.Context(), adminAC))
+		router.ServeHTTP(w, req)
 		if w.Code != http.StatusNoContent {
 			t.Fatalf("POST %s: %d", p, w.Code)
 		}
@@ -399,6 +424,11 @@ func TestSQLitePersistenceAndSharedState(t *testing.T) {
 	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/Sync/JobItems/ji-1/File", nil))
 	if w.Code != http.StatusOK || w.Body.String() != "SYNC_FILE_DATA" {
 		t.Fatalf("sync job item file: %d %q", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/Sync/JobItems/ji-1/AdditionalFiles?Name=sub.vtt", nil))
+	if w.Code != http.StatusOK || !strings.Contains(w.Header().Get("Content-Type"), "text/vtt") {
+		t.Fatalf("sync job item additional files: %d %q", w.Code, w.Header().Get("Content-Type"))
 	}
 	w = httptest.NewRecorder()
 	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/Sync/JobItems/ji-1/MarkForRemoval", nil))

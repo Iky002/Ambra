@@ -338,10 +338,16 @@ func TestSpoofedUserIDCannotBypassEnabledFolders(t *testing.T) {
 	if rec := get("/Shows/" + seriesB.ID + "/Episodes?UserId=" + adminUser.ID); rec.Code != http.StatusForbidden {
 		t.Fatalf("spoofed ShowEpisodes on seriesB expected 403, got %d", rec.Code)
 	}
-	if rec := get("/Shows/" + seriesA.ID + "/Seasons?UserId=" + adminUser.ID); rec.Code != http.StatusOK {
+	if rec := get("/Shows/" + seriesA.ID + "/Seasons?UserId=" + adminUser.ID); rec.Code != http.StatusForbidden {
+		t.Fatalf("spoofed ShowSeasons on seriesA expected 403, got %d", rec.Code)
+	}
+	if rec := get("/Shows/" + seriesA.ID + "/Episodes?UserId=" + adminUser.ID); rec.Code != http.StatusForbidden {
+		t.Fatalf("spoofed ShowEpisodes on seriesA expected 403, got %d", rec.Code)
+	}
+	if rec := get("/Shows/" + seriesA.ID + "/Seasons?UserId=" + restrictedUser.ID); rec.Code != http.StatusOK {
 		t.Fatalf("allowed ShowSeasons on seriesA expected 200, got %d", rec.Code)
 	}
-	if rec := get("/Shows/" + seriesA.ID + "/Episodes?UserId=" + adminUser.ID); rec.Code != http.StatusOK {
+	if rec := get("/Shows/" + seriesA.ID + "/Episodes?UserId=" + restrictedUser.ID); rec.Code != http.StatusOK {
 		t.Fatalf("allowed ShowEpisodes on seriesA expected 200, got %d", rec.Code)
 	}
 }

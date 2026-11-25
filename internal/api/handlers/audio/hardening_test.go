@@ -175,3 +175,126 @@ func TestAudioTranscodeArgsAndMP4Muxing(t *testing.T) {
 		}
 	}
 }
+
+func TestAudioStrmResolutionAndFFmpegClamp(t *testing.T) {
+	// 1. FFmpeg parameter clamping
+	args := buildAudioFFmpegArgs("/music/track.flac", "mp3", "libmp3lame", 99_000_000, 0, 64, 999_999)
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"-b:a 1536000", "-ac 8", "-ar 192000"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected clamped arg %q, got: %s", want, joined)
+		}
+	}
+
+	// 2. STRM audio resolution via SetStreamResolver + safe HTTP proxy
+	tmp := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(tmp, "audio_strm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/no-ct.flac" {
+			w.Header().Del("Content-Type")
+			w.WriteHeader(http.StatusOK)
+			if r.Method != http.MethodHead {
+				_, _ = w.Write([]byte("FLAC-data"))
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "audio/mpeg")
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			_, _ = w.Write([]byte("ID3-remote-mp3-data"))
+		}
+	}))
+	defer upstream.Close()
+
+	strmPath := filepath.Join(tmp, "remote.strm")
+	_ = os.WriteFile(strmPath, []byte("http://169.254.169.254/latest/meta-data/\n"), 0o644)
+
+	ctx := context.Background()
+	repo := sqlite.NewLibraryRepo(store)
+	itemID := guid.New()
+	_ = repo.UpsertItem(ctx, &sqlite.ItemRecord{
+		ID: itemID, LibraryID: "lib1", Type: "Audio", MediaType: "Audio", Name: "Remote Track", Path: strmPath,
+	})
+
+	cfg := config.Default(tmp)
+	h := New(repo, cfg)
+	h.SetProxyClient(upstream.Client())
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, AuthFuncs{})
+
+	// Without custom resolver, link-local metadata IP in .strm is blocked with 502 (direct & universal transcode)
+	recBlocked := httptest.NewRecorder()
+	mux.ServeHTTP(recBlocked, httptest.NewRequest(http.MethodGet, "/Audio/"+itemID+"/stream", nil))
+	if recBlocked.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 for blocked metadata strm url, got %d body=%q", recBlocked.Code, recBlocked.Body.String())
+	}
+	recBlockedTranscode := httptest.NewRecorder()
+	mux.ServeHTTP(recBlockedTranscode, httptest.NewRequest(http.MethodGet, "/Audio/"+itemID+"/universal.mp3?Container=flac", nil))
+	if recBlockedTranscode.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 for blocked metadata strm transcode, got %d", recBlockedTranscode.Code)
+	}
+
+	// Empty/invalid strm file -> 502
+	emptyStrm := filepath.Join(tmp, "empty.strm")
+	_ = os.WriteFile(emptyStrm, []byte("# comment only\n"), 0o644)
+	if _, err := h.resolveStrmAudio(ctx, emptyStrm); err == nil {
+		t.Fatalf("expected error for empty strm")
+	}
+	if got := readFirstLineAudioURL(filepath.Join(tmp, "nonexistent.strm")); got != "" {
+		t.Fatalf("expected empty url for missing strm, got %q", got)
+	}
+
+	// Custom resolver returning error -> 502
+	h.SetStreamResolver(func(_ context.Context, _ string) (string, error) {
+		return "", os.ErrNotExist
+	})
+	recResErr := httptest.NewRecorder()
+	mux.ServeHTTP(recResErr, httptest.NewRequest(http.MethodGet, "/Audio/"+itemID+"/stream", nil))
+	if recResErr.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 on resolver error, got %d", recResErr.Code)
+	}
+	recUnivResErr := httptest.NewRecorder()
+	mux.ServeHTTP(recUnivResErr, httptest.NewRequest(http.MethodGet, "/Audio/"+itemID+"/universal", nil))
+	if recUnivResErr.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 on universal resolver error, got %d", recUnivResErr.Code)
+	}
+
+	// With SetStreamResolver pointing to upstream test server, direct stream & universal proxy remote audio
+	h.SetStreamResolver(func(_ context.Context, rawPath string) (string, error) {
+		if rawPath != strmPath {
+			t.Errorf("unexpected rawPath %q", rawPath)
+		}
+		return upstream.URL + "/song.mp3", nil
+	})
+
+	reqStream := httptest.NewRequest(http.MethodGet, "/Audio/"+itemID+"/stream", nil)
+	reqStream.Header.Set("Range", "bytes=0-10")
+	reqStream.Header.Set("If-Range", `"etag1"`)
+	recStream := httptest.NewRecorder()
+	mux.ServeHTTP(recStream, reqStream)
+	if recStream.Code != http.StatusOK || recStream.Body.String() != "ID3-remote-mp3-data" {
+		t.Fatalf("expected proxied remote mp3, got %d %q", recStream.Code, recStream.Body.String())
+	}
+
+	recUniv := httptest.NewRecorder()
+	mux.ServeHTTP(recUniv, httptest.NewRequest(http.MethodGet, "/Audio/"+itemID+"/universal?Container=mp3", nil))
+	if recUniv.Code != http.StatusOK || recUniv.Body.String() != "ID3-remote-mp3-data" {
+		t.Fatalf("expected universal proxied remote mp3, got %d %q", recUniv.Code, recUniv.Body.String())
+	}
+
+	// Upstream without Content-Type falls back to audioContentType(url.Path), and HEAD omits body
+	h.SetStreamResolver(func(_ context.Context, _ string) (string, error) {
+		return upstream.URL + "/no-ct.flac", nil
+	})
+	recHead := httptest.NewRecorder()
+	mux.ServeHTTP(recHead, httptest.NewRequest(http.MethodHead, "/Audio/"+itemID+"/stream", nil))
+	if recHead.Code != http.StatusOK || recHead.Header().Get("Content-Type") != "audio/flac" || recHead.Body.Len() != 0 {
+		t.Fatalf("expected HEAD 200 audio/flac empty body, got %d ct=%q len=%d", recHead.Code, recHead.Header().Get("Content-Type"), recHead.Body.Len())
+	}
+}

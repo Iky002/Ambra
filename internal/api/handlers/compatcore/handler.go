@@ -29,7 +29,12 @@ type AuthFuncs struct {
 	UserIDFromCtx func(context.Context) string
 }
 
-const forgotPinMaxAttempts = 5
+const (
+	forgotPinMaxAttempts      = 5
+	forgotPasswordRateLimit   = 5
+	forgotPasswordRateWindow  = time.Minute
+	forgotPasswordMaxPinFiles = 10
+)
 
 type forgotPinEntry struct {
 	UserID    string
@@ -69,6 +74,7 @@ type Handler struct {
 	mu                sync.RWMutex
 	memKV             map[string]string
 	forgotPins        map[string]forgotPinEntry
+	forgotRates       map[string][]time.Time
 	sessionUsers      map[string]map[string]bool
 	remoteCommands    []remoteCommandRecord
 	restartRequested  bool
@@ -96,6 +102,7 @@ func New(
 		registry:     registry,
 		memKV:        make(map[string]string),
 		forgotPins:   make(map[string]forgotPinEntry),
+		forgotRates:  make(map[string][]time.Time),
 		sessionUsers: make(map[string]map[string]bool),
 	}
 }
@@ -196,7 +203,6 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 		pr.Get("/System/WakeOnLanInfo", h.getSystemWakeOnLanInfo)
 		pr.Get("/System/ReleaseNotes/Versions", h.getSystemReleaseNotesVersions)
 		pr.Get("/System/ReleaseNotes", h.getSystemReleaseNotes)
-		pr.Get("/System/Info/Storage", h.getSystemStorageInfo)
 
 		// /UserSettings
 		pr.Get("/UserSettings/{UserId}", h.getUserSettings)
@@ -285,6 +291,7 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 		ar.Post("/ScheduledTasks/Running/{Id}/Delete", h.deleteRunningScheduledTask)
 
 		// /System
+		ar.Get("/System/Info/Storage", h.getSystemStorageInfo)
 		ar.Post("/System/Restart", h.postSystemRestart)
 		ar.Post("/System/Shutdown", h.postSystemShutdown)
 

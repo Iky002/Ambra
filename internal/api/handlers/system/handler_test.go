@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -492,4 +493,99 @@ func TestLocalizationEndpoints10Locales(t *testing.T) {
 			t.Fatalf("missing locale %s in /Localization/Options", loc)
 		}
 	}
+}
+
+func TestSystemInfoPathMaskingNamedConfigRBACAndConcurrency(t *testing.T) {
+	r, _, _, _, adminTok, viewerTok := setupSystemHandler(t)
+
+	// 1. GET /System/Configuration/{Key} must be admin-only: viewer -> 403, admin -> 200.
+	req := httptest.NewRequest(http.MethodGet, "/System/Configuration/branding", nil)
+	req.Header.Set("X-Emby-Token", viewerTok)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("viewer GET /System/Configuration/branding expected 403, got %d", rec.Code)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/System/Configuration/branding", nil)
+	req.Header.Set("X-Emby-Token", adminTok)
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin GET /System/Configuration/branding expected 200, got %d", rec.Code)
+	}
+
+	// 2. GET /System/Info: non-admin must NOT receive internal filesystem paths.
+	req = httptest.NewRequest(http.MethodGet, "/System/Info", nil)
+	req.Header.Set("X-Emby-Token", viewerTok)
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("viewer GET /System/Info expected 200, got %d", rec.Code)
+	}
+	var viewerInfo map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &viewerInfo); err != nil {
+		t.Fatal(err)
+	}
+	for _, hidden := range []string{"ProgramDataPath", "CachePath", "LogPath", "InternalMetadataPath", "TranscodingTempPath"} {
+		if v, exists := viewerInfo[hidden]; exists && v != "" {
+			t.Fatalf("non-admin /System/Info leaked %s=%v", hidden, v)
+		}
+	}
+	for _, kept := range []string{"ServerName", "Version", "Id", "ProductName", "LocalAddress"} {
+		if v, _ := viewerInfo[kept].(string); v == "" {
+			t.Fatalf("non-admin /System/Info missing required field %s", kept)
+		}
+	}
+
+	// Admin GET /System/Info receives all internal filesystem paths.
+	req = httptest.NewRequest(http.MethodGet, "/System/Info", nil)
+	req.Header.Set("X-Emby-Token", adminTok)
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin GET /System/Info expected 200, got %d", rec.Code)
+	}
+	var adminInfo map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &adminInfo); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"ProgramDataPath", "CachePath", "LogPath", "InternalMetadataPath", "TranscodingTempPath"} {
+		if v, _ := adminInfo[field].(string); v == "" {
+			t.Fatalf("admin /System/Info missing %s", field)
+		}
+	}
+
+	// 3. Concurrent config reads & writes must be race-free under -race.
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				w := httptest.NewRecorder()
+				rq := httptest.NewRequest(http.MethodPost, "/System/Configuration", bytes.NewBufferString(`{"ServerName":"RaceTest","TMDBLanguage":"en-US"}`))
+				rq.Header.Set("X-Emby-Token", adminTok)
+				r.ServeHTTP(w, rq)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				w := httptest.NewRecorder()
+				rq := httptest.NewRequest(http.MethodGet, "/System/Configuration", nil)
+				rq.Header.Set("X-Emby-Token", adminTok)
+				r.ServeHTTP(w, rq)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				w := httptest.NewRecorder()
+				rq := httptest.NewRequest(http.MethodGet, "/System/Info", nil)
+				rq.Header.Set("X-Emby-Token", viewerTok)
+				r.ServeHTTP(w, rq)
+			}
+		}()
+	}
+	wg.Wait()
 }

@@ -400,7 +400,7 @@ func (h *Handler) handleItemVisibility(isPublic bool) http.HandlerFunc {
 						httpx.Error(w, http.StatusForbidden, "forbidden")
 						return
 					}
-				} else if !h.canAccessItem(r, rec) {
+				} else {
 					httpx.Error(w, http.StatusForbidden, "forbidden")
 					return
 				}
@@ -611,12 +611,16 @@ func buildExternalIDInfos(rec *sqlite.ItemRecord) []map[string]any {
 }
 
 func (h *Handler) handleItemAncestors(w http.ResponseWriter, r *http.Request) {
+	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	if !h.canAccessItemID(r, itemID) {
 		httpx.Error(w, http.StatusForbidden, "access denied")
 		return
 	}
-	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
 
 	ancestors := make([]dto.BaseItemDto, 0)
@@ -702,6 +706,10 @@ func (h *Handler) callerIdentity(r *http.Request) (userID string, isAdmin bool) 
 }
 
 func (h *Handler) handleItemFile(w http.ResponseWriter, r *http.Request) {
+	if !h.canDownloadContent(r) {
+		httpx.Error(w, http.StatusForbidden, "content downloading is disabled")
+		return
+	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
 	if errors.Is(err, sqlite.ErrNotFound) || rec.Path == "" {
@@ -716,6 +724,10 @@ func (h *Handler) handleItemFile(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusForbidden, "access denied")
 		return
 	}
+	if rec.IsStrm || strings.EqualFold(filepath.Ext(rec.Path), ".strm") {
+		httpx.Error(w, http.StatusForbidden, "downloading .strm files is not allowed")
+		return
+	}
 	if _, err := os.Stat(rec.Path); err != nil {
 		httpx.Error(w, http.StatusNotFound, "file not found on disk")
 		return
@@ -726,6 +738,15 @@ func (h *Handler) handleItemFile(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleSimilar(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	seedID := guid.Normalize(chi.URLParam(r, "Id"))
+	if !h.canAccessItemID(r, seedID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
@@ -733,7 +754,7 @@ func (h *Handler) handleSimilar(w http.ResponseWriter, r *http.Request) {
 		r.Context(),
 		h.serverID(),
 		userID,
-		chi.URLParam(r, "Id"),
+		seedID,
 		q.Int("Limit", 12),
 		q.List("Fields"),
 		allowed,
@@ -752,6 +773,15 @@ func (h *Handler) handleSimilar(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleItemInstantMix(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	seedID := guid.Normalize(chi.URLParam(r, "Id"))
+	if !h.canAccessItemID(r, seedID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
@@ -759,7 +789,7 @@ func (h *Handler) handleItemInstantMix(w http.ResponseWriter, r *http.Request) {
 		r.Context(),
 		h.serverID(),
 		userID,
-		chi.URLParam(r, "Id"),
+		seedID,
 		q.Int("Limit", 50),
 		q.List("Fields"),
 		allowed,
@@ -788,6 +818,11 @@ var specialFeatureExtraTypes = []string{
 }
 
 func (h *Handler) handleLocalTrailers(w http.ResponseWriter, r *http.Request) {
+	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	if !h.canAccessItemID(r, itemID) {
 		httpx.Error(w, http.StatusForbidden, "access denied")
@@ -797,7 +832,6 @@ func (h *Handler) handleLocalTrailers(w http.ResponseWriter, r *http.Request) {
 		httpx.JSON(w, http.StatusOK, []dto.BaseItemDto{})
 		return
 	}
-	q := httpx.ParseQuery(r)
 	items, err := h.repo.GetItemExtras(r.Context(), h.serverID(), h.resolveUserID(r, q), itemID, []string{"Trailer"})
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -807,6 +841,11 @@ func (h *Handler) handleLocalTrailers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleSpecialFeatures(w http.ResponseWriter, r *http.Request) {
+	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	if !h.canAccessItemID(r, itemID) {
 		httpx.Error(w, http.StatusForbidden, "access denied")
@@ -816,7 +855,6 @@ func (h *Handler) handleSpecialFeatures(w http.ResponseWriter, r *http.Request) 
 		httpx.JSON(w, http.StatusOK, []dto.BaseItemDto{})
 		return
 	}
-	q := httpx.ParseQuery(r)
 	items, err := h.repo.GetItemExtras(r.Context(), h.serverID(), h.resolveUserID(r, q), itemID, specialFeatureExtraTypes)
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -834,6 +872,11 @@ func (h *Handler) handleThemeVideos(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) serveThemeMediaByTypes(w http.ResponseWriter, r *http.Request, extraTypes []string) {
+	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	ownerID := guid.Normalize(chi.URLParam(r, "Id"))
 	if !h.canAccessItemID(r, ownerID) {
 		httpx.Error(w, http.StatusForbidden, "access denied")
@@ -841,7 +884,6 @@ func (h *Handler) serveThemeMediaByTypes(w http.ResponseWriter, r *http.Request,
 	}
 	items := []dto.BaseItemDto{}
 	if h.repo != nil && ownerID != "" {
-		q := httpx.ParseQuery(r)
 		var err error
 		items, err = h.repo.GetItemExtras(r.Context(), h.serverID(), h.resolveUserID(r, q), ownerID, extraTypes)
 		if err != nil {
@@ -857,6 +899,11 @@ func (h *Handler) serveThemeMediaByTypes(w http.ResponseWriter, r *http.Request,
 }
 
 func (h *Handler) handleAllThemeMedia(w http.ResponseWriter, r *http.Request) {
+	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	ownerID := guid.Normalize(chi.URLParam(r, "Id"))
 	if !h.canAccessItemID(r, ownerID) {
 		httpx.Error(w, http.StatusForbidden, "access denied")
@@ -865,7 +912,6 @@ func (h *Handler) handleAllThemeMedia(w http.ResponseWriter, r *http.Request) {
 	themeSongs := []dto.BaseItemDto{}
 	themeVideos := []dto.BaseItemDto{}
 	if h.repo != nil && ownerID != "" {
-		q := httpx.ParseQuery(r)
 		userID := h.resolveUserID(r, q)
 		allThemes, err := h.repo.GetItemExtras(r.Context(), h.serverID(), userID, ownerID, []string{"ThemeSong", "ThemeVideo"})
 		if err != nil {
@@ -1161,6 +1207,9 @@ func (h *Handler) handleDeleteSubtitle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	q := httpx.ParseQuery(r)
+	mediaSourceID := guid.Normalize(q.Get("MediaSourceId"))
+
 	var (
 		subPath    sql.NullString
 		isExternal int
@@ -1168,7 +1217,8 @@ func (h *Handler) handleDeleteSubtitle(w http.ResponseWriter, r *http.Request) {
 	err = h.store.Reader.QueryRowContext(r.Context(), `
 		SELECT path, is_external FROM item_media_streams
 		WHERE item_id = ? AND stream_index = ? AND LOWER(stream_type) = 'subtitle'
-		LIMIT 1`, itemID, idx,
+		  AND (? = '' OR media_source_id = ?)
+		LIMIT 1`, itemID, idx, mediaSourceID, mediaSourceID,
 	).Scan(&subPath, &isExternal)
 	if errors.Is(err, sql.ErrNoRows) {
 		httpx.Error(w, http.StatusNotFound, "subtitle stream not found")
@@ -1195,9 +1245,11 @@ func (h *Handler) handleDeleteSubtitle(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if _, err := h.store.Writer.ExecContext(r.Context(),
-		`DELETE FROM item_media_streams WHERE item_id = ? AND stream_index = ? AND LOWER(stream_type) = 'subtitle' AND is_external = 1`,
-		itemID, idx,
+	if _, err := h.store.Writer.ExecContext(r.Context(), `
+		DELETE FROM item_media_streams
+		WHERE item_id = ? AND stream_index = ? AND LOWER(stream_type) = 'subtitle' AND is_external = 1
+		  AND (? = '' OR media_source_id = ?)`,
+		itemID, idx, mediaSourceID, mediaSourceID,
 	); err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return

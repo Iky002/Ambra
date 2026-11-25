@@ -105,6 +105,60 @@ func (h *Handler) resolveUserID(r *http.Request, q httpx.Query) string {
 	return ""
 }
 
+func (h *Handler) canAccessUserData(r *http.Request, targetUserID string) bool {
+	targetID := guid.Normalize(targetUserID)
+	if targetID == "" {
+		return true
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		return ac.IsAdmin() || guid.Normalize(ac.UserID()) == targetID
+	}
+	if h.auth.UserIDFromCtx != nil {
+		callerID := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if callerID != "" {
+			if callerID == targetID {
+				return true
+			}
+			if h.userRepo != nil {
+				if u, err := h.userRepo.GetUserByID(r.Context(), callerID); err == nil && u != nil {
+					return u.IsAdmin || u.Policy.IsAdministrator
+				}
+			}
+			return false
+		}
+	}
+	// Unit tests without auth context
+	return true
+}
+
+func (h *Handler) filterAccessibleItemIDs(r *http.Request, fallbackUserID string, ids []string) []string {
+	if len(ids) == 0 {
+		return ids
+	}
+	allowed := h.allowedLibrariesForRequest(r, fallbackUserID)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, fallbackUserID)
+	if allowed == nil && maxRating == nil && len(blockedTags) == 0 {
+		return ids
+	}
+	filtered := make([]string, 0, len(ids))
+	for _, id := range ids {
+		rec, err := h.repo.GetItemRecordByID(r.Context(), id)
+		if err != nil || rec == nil {
+			continue
+		}
+		if allowed != nil && rec.LibraryID != "" && !isLibraryAllowed(rec.LibraryID, allowed) {
+			continue
+		}
+		if maxRating != nil || len(blockedTags) > 0 {
+			if blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags); bErr != nil || blocked {
+				continue
+			}
+		}
+		filtered = append(filtered, id)
+	}
+	return filtered
+}
+
 func (h *Handler) allowedLibrariesForRequest(r *http.Request, fallbackUserID string) []string {
 	if h.userRepo == nil {
 		return nil
@@ -265,6 +319,10 @@ func (h *Handler) isNonAdminCaller(r *http.Request) bool {
 
 func (h *Handler) handleListCollections(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 	items, total, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
@@ -350,6 +408,10 @@ func (h *Handler) handleDeleteCollection(w http.ResponseWriter, r *http.Request)
 
 func (h *Handler) handleListPlaylists(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 	startIndex := q.Int("StartIndex", 0)
@@ -454,6 +516,7 @@ func (h *Handler) handleCreatePlaylist(w http.ResponseWriter, r *http.Request) {
 	if len(ids) == 0 {
 		ids = body.Ids
 	}
+	ids = h.filterAccessibleItemIDs(r, userID, ids)
 
 	rec, err := h.repo.CreatePlaylist(r.Context(), name, mediaType, userID, ids)
 	if err != nil {
@@ -509,6 +572,10 @@ func (h *Handler) handleMovePlaylistItem(w http.ResponseWriter, r *http.Request)
 
 func (h *Handler) handlePlaylistInstantMix(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	playlistID := r.PathValue("Id")
 	rec, err := h.repo.GetItemRecordByID(r.Context(), playlistID)
 	if errors.Is(err, sqlite.ErrNotFound) {
@@ -556,6 +623,10 @@ func (h *Handler) handlePlaylistInstantMix(w http.ResponseWriter, r *http.Reques
 func (h *Handler) handleGetContainerItems(expectedType string, checkPlaylistAccess bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := httpx.ParseQuery(r)
+		if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+			httpx.Error(w, http.StatusForbidden, "forbidden")
+			return
+		}
 		containerID := r.PathValue("Id")
 		rec, err := h.repo.GetItemRecordByID(r.Context(), containerID)
 		if errors.Is(err, sqlite.ErrNotFound) {
@@ -651,6 +722,7 @@ func (h *Handler) addItemsToContainer(w http.ResponseWriter, r *http.Request, de
 			ids = body.Ids
 		}
 	}
+	ids = h.filterAccessibleItemIDs(r, "", ids)
 	if _, err := h.repo.AddItemsToContainer(r.Context(), containerID, ids, deduplicate); err != nil {
 		if errors.Is(err, sqlite.ErrNotFound) {
 			httpx.Error(w, http.StatusNotFound, "container not found")
@@ -668,6 +740,19 @@ func (h *Handler) handleRemoveContainerItems(w http.ResponseWriter, r *http.Requ
 	ids := q.List("EntryIds")
 	if len(ids) == 0 {
 		ids = q.List("Ids")
+	}
+	if len(ids) == 0 && r.Body != nil {
+		var body struct {
+			EntryIds []string `json:"EntryIds"`
+			Ids      []string `json:"Ids"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+			if len(body.EntryIds) > 0 {
+				ids = body.EntryIds
+			} else if len(body.Ids) > 0 {
+				ids = body.Ids
+			}
+		}
 	}
 	if _, err := h.repo.RemoveItemsFromContainer(r.Context(), containerID, ids); err != nil {
 		if errors.Is(err, sqlite.ErrNotFound) {

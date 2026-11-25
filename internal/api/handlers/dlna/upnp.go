@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/config"
@@ -190,20 +192,24 @@ func (h *Handler) handleBrowse(ctx context.Context, r *http.Request, params map[
 	reqCount, _ := strconv.Atoi(strings.TrimSpace(params["RequestedCount"]))
 	sortCriteria := strings.TrimSpace(params["SortCriteria"])
 	baseURL := h.baseURL(r)
+	serverUUID := strings.TrimSpace(r.PathValue("UuId"))
+	if serverUUID == "" {
+		serverUUID = h.cfg.ServerID
+	}
 
 	var didlEntries []string
 	totalMatches := 0
 
 	switch browseFlag {
 	case "BrowseMetadata":
-		entry, err := h.browseMetadata(ctx, objectID, baseURL)
+		entry, err := h.browseMetadata(ctx, objectID, baseURL, serverUUID)
 		if err != nil {
 			return "", err
 		}
 		didlEntries = append(didlEntries, entry)
 		totalMatches = 1
 	default:
-		entries, total, err := h.browseDirectChildren(ctx, objectID, startIdx, reqCount, sortCriteria, baseURL)
+		entries, total, err := h.browseDirectChildren(ctx, objectID, startIdx, reqCount, sortCriteria, baseURL, serverUUID)
 		if err != nil {
 			return "", err
 		}
@@ -244,6 +250,10 @@ func (h *Handler) handleSearch(ctx context.Context, r *http.Request, params map[
 	reqCount, _ := strconv.Atoi(strings.TrimSpace(params["RequestedCount"]))
 	sortCriteria := strings.TrimSpace(params["SortCriteria"])
 	baseURL := h.baseURL(r)
+	serverUUID := strings.TrimSpace(r.PathValue("UuId"))
+	if serverUUID == "" {
+		serverUUID = h.cfg.ServerID
+	}
 
 	var didlEntries []string
 	totalMatches := 0
@@ -305,7 +315,7 @@ func (h *Handler) handleSearch(ctx context.Context, r *http.Request, params map[
 		}
 		didlEntries = make([]string, 0, len(items))
 		for _, it := range items {
-			didlEntries = append(didlEntries, itemToDIDL(it, baseURL))
+			didlEntries = append(didlEntries, h.itemToDIDL(it, baseURL, serverUUID))
 		}
 		totalMatches = total
 	}
@@ -384,7 +394,7 @@ func parseSortCriteria(criteria string) (sortBy []string, sortOrder string) {
 	return nil, ""
 }
 
-func (h *Handler) browseMetadata(ctx context.Context, objectID, baseURL string) (string, error) {
+func (h *Handler) browseMetadata(ctx context.Context, objectID, baseURL, serverUUID string) (string, error) {
 	if objectID == "0" {
 		return fmt.Sprintf(
 			`<container id="0" parentID="-1" restricted="1"><dc:title>%s</dc:title><upnp:class>object.container.storageFolder</upnp:class></container>`,
@@ -401,10 +411,10 @@ func (h *Handler) browseMetadata(ctx context.Context, objectID, baseURL string) 
 	if err != nil {
 		return "", err
 	}
-	return itemToDIDL(*item, baseURL), nil
+	return h.itemToDIDL(*item, baseURL, serverUUID), nil
 }
 
-func (h *Handler) browseDirectChildren(ctx context.Context, objectID string, startIdx, reqCount int, sortCriteria, baseURL string) ([]string, int, error) {
+func (h *Handler) browseDirectChildren(ctx context.Context, objectID string, startIdx, reqCount int, sortCriteria, baseURL, serverUUID string) ([]string, int, error) {
 	if h.libRepo == nil {
 		return nil, 0, nil
 	}
@@ -471,7 +481,7 @@ func (h *Handler) browseDirectChildren(ctx context.Context, objectID string, sta
 
 	out := make([]string, 0, len(items))
 	for _, it := range items {
-		out = append(out, itemToDIDL(it, baseURL))
+		out = append(out, h.itemToDIDL(it, baseURL, serverUUID))
 	}
 	return out, total, nil
 }
@@ -484,7 +494,7 @@ func libraryToDIDL(lib sqlite.LibraryRecord) string {
 	)
 }
 
-func itemToDIDL(it dto.BaseItemDto, baseURL string) string {
+func (h *Handler) itemToDIDL(it dto.BaseItemDto, baseURL, serverUUID string) string {
 	parentID := it.ParentId
 	if parentID == "" {
 		parentID = "0"
@@ -503,8 +513,13 @@ func itemToDIDL(it dto.BaseItemDto, baseURL string) string {
 		)
 	}
 
-	upnpClass, mimeType, streamPath := mediaMetadataForItem(it)
-	resURL := fmt.Sprintf("%s%s", baseURL, streamPath)
+	upnpClass, mimeType, _ := mediaMetadataForItem(it)
+	if strings.TrimSpace(serverUUID) == "" {
+		serverUUID = h.cfg.ServerID
+	}
+	exp := time.Now().UTC().Add(dlnaStreamTokenTTL).Unix()
+	sig := h.signStreamToken(it.Id, exp)
+	resURL := fmt.Sprintf("%s/Dlna/%s/stream/%s?exp=%d&sig=%s", baseURL, url.PathEscape(serverUUID), url.PathEscape(it.Id), exp, sig)
 	attrs := fmt.Sprintf(`protocolInfo="http-get:*:%s:*"`, mimeType)
 	if it.RunTimeTicks != nil && *it.RunTimeTicks > 0 {
 		attrs += fmt.Sprintf(` duration="%s"`, formatUPnPDuration(*it.RunTimeTicks))

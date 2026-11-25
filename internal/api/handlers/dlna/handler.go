@@ -3,6 +3,10 @@ package dlna
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -11,6 +15,7 @@ import (
 	"image/color"
 	"image/png"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -25,12 +30,14 @@ import (
 )
 
 const (
-	profilesStoreKey    = "dlna:profiles"
-	defaultProfileID    = "default"
-	defaultSubTimeout   = 1800
-	minSubTimeout       = 60
-	maxSubTimeout       = 86400
-	defaultServerHeader = "Ambra/4.10.2.0 UPnP/1.0 DLNADOC/1.50"
+	profilesStoreKey     = "dlna:profiles"
+	defaultProfileID     = "default"
+	defaultSubTimeout    = 1800
+	minSubTimeout        = 60
+	maxSubTimeout        = 86400
+	maxDLNASubscriptions = 256
+	dlnaStreamTokenTTL   = 24 * time.Hour
+	defaultServerHeader  = "Ambra/4.10.2.0 UPnP/1.0 DLNADOC/1.50"
 )
 
 // AuthFuncs decouples route registration from the concrete middleware package.
@@ -84,10 +91,11 @@ type eventSubscription struct {
 
 // Handler implements Emby-compatible DLNA Profile management and UPnP MediaServer:1 endpoints.
 type Handler struct {
-	cfg     *config.Config
-	libRepo *sqlite.LibraryRepo
-	store   *sqlite.Store
-	auth    AuthFuncs
+	cfg          *config.Config
+	libRepo      *sqlite.LibraryRepo
+	store        *sqlite.Store
+	auth         AuthFuncs
+	streamSecret []byte
 
 	mu            sync.RWMutex
 	profiles      map[string]DlnaProfile
@@ -100,10 +108,16 @@ func New(cfg *config.Config, libRepo *sqlite.LibraryRepo, store *sqlite.Store) *
 	if cfg == nil {
 		cfg = config.Default("./data")
 	}
+	randBytes := make([]byte, 32)
+	_, _ = rand.Read(randBytes)
+	secretInput := append([]byte(cfg.ServerID+":"), randBytes...)
+	secretSum := sha256.Sum256(secretInput)
+
 	h := &Handler{
 		cfg:           cfg,
 		libRepo:       libRepo,
 		store:         store,
+		streamSecret:  secretSum[:],
 		profiles:      make(map[string]DlnaProfile),
 		subscriptions: make(map[string]eventSubscription),
 		systemUpdate:  1,
@@ -194,6 +208,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 
 	// Public server icons (3-segment form)
 	mux.HandleFunc("GET /Dlna/{UuId}/icons/{Filename}", h.handleIcon)
+
+	// Signed DLNA media stream endpoint (no RequireAuth; validated via HMAC sig & exp query params)
+	mux.HandleFunc("GET /Dlna/{UuId}/stream/{Id}", h.handleDLNAStream)
 
 	// Public UPnP GENA event subscriptions (SUBSCRIBE / UNSUBSCRIBE)
 	mux.HandleFunc("SUBSCRIBE /Dlna/{UuId}/contentdirectory/events", h.handleEventSubscribe("contentdirectory"))
@@ -420,6 +437,125 @@ func (h *Handler) serveIcon(w http.ResponseWriter, r *http.Request, filename str
 	}
 }
 
+// --- Signed DLNA Media Streaming ---
+
+func (h *Handler) signStreamToken(itemID string, exp int64) string {
+	mac := hmac.New(sha256.New, h.streamSecret)
+	_, _ = fmt.Fprintf(mac, "%s:%d", guid.Normalize(itemID), exp)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (h *Handler) verifyStreamToken(itemID, expStr, sig string) bool {
+	expStr = strings.TrimSpace(expStr)
+	sig = strings.TrimSpace(sig)
+	if expStr == "" || sig == "" {
+		return false
+	}
+	exp, err := strconv.ParseInt(expStr, 10, 64)
+	if err != nil || exp <= time.Now().UTC().Unix() {
+		return false
+	}
+	expected := h.signStreamToken(itemID, exp)
+	return hmac.Equal([]byte(expected), []byte(strings.ToLower(sig)))
+}
+
+func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
+	itemID := guid.Normalize(r.PathValue("Id"))
+	q := r.URL.Query()
+	if !h.verifyStreamToken(itemID, q.Get("exp"), q.Get("sig")) {
+		httpx.Error(w, http.StatusForbidden, "invalid or expired stream signature")
+		return
+	}
+	if h.libRepo == nil {
+		httpx.Error(w, http.StatusNotFound, "media item not found")
+		return
+	}
+
+	mediaPath, err := h.resolveDLNAMediaPath(r.Context(), itemID)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		httpx.Error(w, http.StatusNotFound, "media item not found")
+		return
+	}
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	f, err := os.Open(mediaPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			httpx.Error(w, http.StatusNotFound, "media file missing on disk")
+			return
+		}
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if ct := dlnaMediaContentType(mediaPath); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	w.Header().Set("SERVER", defaultServerHeader)
+	http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
+}
+
+func (h *Handler) resolveDLNAMediaPath(ctx context.Context, itemID string) (string, error) {
+	sources, err := h.libRepo.GetMediaSourcesByItemID(ctx, itemID)
+	if err == nil && len(sources) > 0 && strings.TrimSpace(sources[0].Path) != "" {
+		return sources[0].Path, nil
+	}
+	item, err := h.libRepo.GetItemRecordByID(ctx, itemID)
+	if err != nil {
+		return "", err
+	}
+	if item == nil || strings.TrimSpace(item.Path) == "" {
+		return "", sqlite.ErrNotFound
+	}
+	return item.Path, nil
+}
+
+func dlnaMediaContentType(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".mp4", ".m4v":
+		return "video/mp4"
+	case ".mkv":
+		return "video/x-matroska"
+	case ".webm":
+		return "video/webm"
+	case ".mov":
+		return "video/quicktime"
+	case ".avi":
+		return "video/x-msvideo"
+	case ".ts", ".m2ts":
+		return "video/mp2t"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".flac":
+		return "audio/flac"
+	case ".m4a", ".alac":
+		return "audio/mp4"
+	case ".aac":
+		return "audio/aac"
+	case ".ogg", ".oga", ".opus":
+		return "audio/ogg"
+	case ".wav":
+		return "audio/wav"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".webp":
+		return "image/webp"
+	default:
+		return "application/octet-stream"
+	}
+}
+
 // --- UPnP GENA Event Subscriptions ---
 
 func (h *Handler) handleEventSubscribe(service string) http.HandlerFunc {
@@ -431,6 +567,13 @@ func (h *Handler) handleEventSubscribe(service string) http.HandlerFunc {
 
 		h.mu.Lock()
 		defer h.mu.Unlock()
+
+		// Prune expired subscriptions before processing renewal or creation.
+		for k, sub := range h.subscriptions {
+			if !sub.ExpiresAt.After(now) {
+				delete(h.subscriptions, k)
+			}
+		}
 
 		if sid != "" {
 			// Renewal request
@@ -446,6 +589,10 @@ func (h *Handler) handleEventSubscribe(service string) http.HandlerFunc {
 			callback := strings.TrimSpace(r.Header.Get("CALLBACK"))
 			if callback == "" {
 				http.Error(w, "missing CALLBACK header", http.StatusPreconditionFailed)
+				return
+			}
+			if len(h.subscriptions) >= maxDLNASubscriptions {
+				http.Error(w, "too many active subscriptions", http.StatusServiceUnavailable)
 				return
 			}
 			sid = "uuid:" + guid.New()

@@ -8,7 +8,9 @@ import (
 	"image/png"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -429,7 +431,8 @@ func TestContentDirectoryAndConnectionManagerSOAP(t *testing.T) {
 		t.Fatalf("Browse movies got %d: %s", rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "video/x-matroska") ||
-		!strings.Contains(rec.Body.String(), "/Videos/"+movieItem.ID+"/stream?static=true") ||
+		!strings.Contains(rec.Body.String(), "/Dlna/srv/stream/"+movieItem.ID+"?exp=") ||
+		!strings.Contains(rec.Body.String(), "sig=") ||
 		!strings.Contains(rec.Body.String(), "duration=&#34;1:30:00&#34;") {
 		t.Fatalf("unexpected Browse movies DIDL: %s", rec.Body.String())
 	}
@@ -770,5 +773,161 @@ func TestDLNASearchSortCriteriaAndPNGDimensions(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "<TotalMatches>1</TotalMatches>") ||
 		!strings.Contains(rec.Body.String(), "Zulu Inception") {
 		t.Fatalf("Search combined unexpected: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDLNASignedStreamAndGENACap(t *testing.T) {
+	h, mux, libRepo, _ := setupDLNATestEnv(t)
+	ctx := context.Background()
+
+	tmp := t.TempDir()
+	mediaFile := filepath.Join(tmp, "sample.mp4")
+	payload := []byte("0123456789abcdef-dlna-video-stream")
+	if err := os.WriteFile(mediaFile, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lib, err := libRepo.CreateLibrary(ctx, "Movies", "movies", []string{tmp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := &sqlite.ItemRecord{
+		LibraryID: lib.ID, ParentID: lib.ID,
+		Type: "Movie", MediaType: "Video", Name: "Signed Movie", Container: "mp4", Path: mediaFile,
+	}
+	if err := libRepo.UpsertItem(ctx, item); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Valid signed stream URL serves full content and supports Range requests
+	exp := time.Now().UTC().Add(time.Hour).Unix()
+	sig := h.signStreamToken(item.ID, exp)
+	streamURL := "/Dlna/srv/stream/" + item.ID + "?exp=" + strconv.FormatInt(exp, 10) + "&sig=" + sig
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, streamURL, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("signed DLNA stream got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Content-Type") != "video/mp4" {
+		t.Fatalf("expected video/mp4 Content-Type, got %q", rec.Header().Get("Content-Type"))
+	}
+	if !bytes.Equal(rec.Body.Bytes(), payload) {
+		t.Fatalf("payload mismatch: got %q", rec.Body.String())
+	}
+
+	// Range request -> 206 Partial Content
+	rangeReq := httptest.NewRequest(http.MethodGet, streamURL, nil)
+	rangeReq.Header.Set("Range", "bytes=0-3")
+	recRange := httptest.NewRecorder()
+	mux.ServeHTTP(recRange, rangeReq)
+	if recRange.Code != http.StatusPartialContent || recRange.Body.String() != "0123" {
+		t.Fatalf("expected 206 '0123', got %d %q", recRange.Code, recRange.Body.String())
+	}
+
+	// 2. Missing, tampered, wrong-item, and expired signatures -> 403 Forbidden
+	expiredExp := time.Now().UTC().Add(-time.Minute).Unix()
+	expiredSig := h.signStreamToken(item.ID, expiredExp)
+	for _, badURL := range []string{
+		"/Dlna/srv/stream/" + item.ID,
+		"/Dlna/srv/stream/" + item.ID + "?exp=" + strconv.FormatInt(exp, 10) + "&sig=deadbeef",
+		"/Dlna/srv/stream/other-item-id?exp=" + strconv.FormatInt(exp, 10) + "&sig=" + sig,
+		"/Dlna/srv/stream/" + item.ID + "?exp=" + strconv.FormatInt(expiredExp, 10) + "&sig=" + expiredSig,
+	} {
+		recBad := httptest.NewRecorder()
+		mux.ServeHTTP(recBad, httptest.NewRequest(http.MethodGet, badURL, nil))
+		if recBad.Code != http.StatusForbidden {
+			t.Fatalf("GET %s expected 403, got %d", badURL, recBad.Code)
+		}
+	}
+
+	// 2b. Valid signature for missing item / missing disk file / nil repo -> 404
+	missingID := "nonexistent-item"
+	missingSig := h.signStreamToken(missingID, exp)
+	recMissing := httptest.NewRecorder()
+	mux.ServeHTTP(recMissing, httptest.NewRequest(http.MethodGet, "/Dlna/srv/stream/"+missingID+"?exp="+strconv.FormatInt(exp, 10)+"&sig="+missingSig, nil))
+	if recMissing.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing item, got %d", recMissing.Code)
+	}
+
+	goneItem := &sqlite.ItemRecord{
+		LibraryID: lib.ID, ParentID: lib.ID,
+		Type: "Movie", MediaType: "Video", Name: "Gone", Path: filepath.Join(tmp, "gone.mkv"),
+	}
+	_ = libRepo.UpsertItem(ctx, goneItem)
+	goneSig := h.signStreamToken(goneItem.ID, exp)
+	recGone := httptest.NewRecorder()
+	mux.ServeHTTP(recGone, httptest.NewRequest(http.MethodGet, "/Dlna/srv/stream/"+goneItem.ID+"?exp="+strconv.FormatInt(exp, 10)+"&sig="+goneSig, nil))
+	if recGone.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing disk file, got %d", recGone.Code)
+	}
+
+	nilHandler := New(nil, nil, nil)
+	nilMux := http.NewServeMux()
+	nilHandler.RegisterRoutes(nilMux, AuthFuncs{})
+	nilSig := nilHandler.signStreamToken("abc", exp)
+	recNil := httptest.NewRecorder()
+	nilMux.ServeHTTP(recNil, httptest.NewRequest(http.MethodGet, "/Dlna/srv/stream/abc?exp="+strconv.FormatInt(exp, 10)+"&sig="+nilSig, nil))
+	if recNil.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for nil repo, got %d", recNil.Code)
+	}
+
+	// 2c. dlnaMediaContentType coverage across video, audio, image, and fallback extensions
+	for ext, want := range map[string]string{
+		"a.mp4": "video/mp4", "a.mkv": "video/x-matroska", "a.webm": "video/webm",
+		"a.mov": "video/quicktime", "a.avi": "video/x-msvideo", "a.ts": "video/mp2t",
+		"a.mp3": "audio/mpeg", "a.flac": "audio/flac", "a.m4a": "audio/mp4",
+		"a.aac": "audio/aac", "a.ogg": "audio/ogg", "a.wav": "audio/wav",
+		"a.jpg": "image/jpeg", "a.png": "image/png", "a.webp": "image/webp",
+		"a.bin": "application/octet-stream",
+	} {
+		if got := dlnaMediaContentType(ext); got != want {
+			t.Fatalf("dlnaMediaContentType(%q) = %q, want %q", ext, got, want)
+		}
+	}
+
+	// 3. GENA subscription cap (256) and expiry pruning
+	var firstSID string
+	for i := 0; i < maxDLNASubscriptions; i++ {
+		req := httptest.NewRequest("SUBSCRIBE", "/Dlna/srv/contentdirectory/events", nil)
+		req.Header.Set("CALLBACK", "<http://192.168.1.50:9000/notify>")
+		req.Header.Set("TIMEOUT", "Second-600")
+		recSub := httptest.NewRecorder()
+		mux.ServeHTTP(recSub, req)
+		if recSub.Code != http.StatusOK {
+			t.Fatalf("subscription %d failed: %d", i, recSub.Code)
+		}
+		if i == 0 {
+			firstSID = recSub.Header().Get("SID")
+		}
+	}
+	if h.ActiveSubscriptionCount() != maxDLNASubscriptions {
+		t.Fatalf("expected %d subscriptions, got %d", maxDLNASubscriptions, h.ActiveSubscriptionCount())
+	}
+
+	// 257th subscription must be rejected with 503 Service Unavailable
+	reqOverflow := httptest.NewRequest("SUBSCRIBE", "/Dlna/srv/contentdirectory/events", nil)
+	reqOverflow.Header.Set("CALLBACK", "<http://192.168.1.50:9000/notify>")
+	recOverflow := httptest.NewRecorder()
+	mux.ServeHTTP(recOverflow, reqOverflow)
+	if recOverflow.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when subscriptions full, got %d", recOverflow.Code)
+	}
+
+	// Expire one subscription and verify next SUBSCRIBE prunes it and succeeds
+	h.mu.Lock()
+	sub := h.subscriptions[firstSID]
+	sub.ExpiresAt = time.Now().UTC().Add(-time.Second)
+	h.subscriptions[firstSID] = sub
+	h.mu.Unlock()
+
+	reqAfterPrune := httptest.NewRequest("SUBSCRIBE", "/Dlna/srv/contentdirectory/events", nil)
+	reqAfterPrune.Header.Set("CALLBACK", "<http://192.168.1.50:9000/notify>")
+	recAfterPrune := httptest.NewRecorder()
+	mux.ServeHTTP(recAfterPrune, reqAfterPrune)
+	if recAfterPrune.Code != http.StatusOK {
+		t.Fatalf("expected 200 after pruning expired subscription, got %d", recAfterPrune.Code)
+	}
+	if h.ActiveSubscriptionCount() != maxDLNASubscriptions {
+		t.Fatalf("expected %d active subscriptions after prune+add, got %d", maxDLNASubscriptions, h.ActiveSubscriptionCount())
 	}
 }

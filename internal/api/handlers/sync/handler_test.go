@@ -241,3 +241,79 @@ func TestSyncFullLifecycle(t *testing.T) {
 		t.Fatalf("unexpected paginate beyond end: %v %d", p, tot)
 	}
 }
+
+func TestSyncExportedDelegationHelpers(t *testing.T) {
+	h, mux, _, _ := setupSyncTest(t)
+	ctx := context.Background()
+
+	res := doReq(t, mux, http.MethodPost, "/Sync/Jobs", map[string]any{
+		"TargetId": "dev-1",
+		"Name":     "Helper Job",
+		"ItemIds":  []string{"i1", "i2"},
+	})
+	if res.Code != http.StatusOK {
+		t.Fatalf("create job: %d", res.Code)
+	}
+	var created SyncJobCreationResult
+	_ = json.Unmarshal(res.Body.Bytes(), &created)
+	ji1 := created.JobItems[0].Id
+	ji2 := created.JobItems[1].Id
+
+	// GetJobItemForCaller & RBAC (owner is "user-1")
+	if _, found, allowed := h.GetJobItemForCaller(ji1, "bob", false); !found || allowed {
+		t.Fatalf("expected found=true allowed=false for bob GetJobItemForCaller, got found=%v allowed=%v", found, allowed)
+	}
+	if it, found, allowed := h.GetJobItemForCaller(ji1, "user-1", false); it == nil || !found || !allowed {
+		t.Fatalf("expected user-1 to find ji1: it=%v found=%v allowed=%v", it, found, allowed)
+	}
+	if _, found, allowed := h.GetJobItemForCaller("missing", "user-1", false); found || !allowed {
+		t.Fatalf("expected missing ji not found")
+	}
+
+	// GetItemStatusForCaller
+	if it, found := h.GetItemStatusForCaller("i1", "", "bob", false); found || it != nil {
+		t.Fatalf("bob should not see user-1 item status: %+v %v", it, found)
+	}
+	if it, found := h.GetItemStatusForCaller("i1", "dev-1", "user-1", false); !found || it == nil {
+		t.Fatalf("user-1 should see own item status: %+v %v", it, found)
+	}
+
+	// SetJobItemRemovalForCaller
+	if found, allowed := h.SetJobItemRemovalForCaller(ctx, ji1, true, "bob", false); !found || allowed {
+		t.Fatalf("expected forbidden for bob mark removal: found=%v allowed=%v", found, allowed)
+	}
+	if found, allowed := h.SetJobItemRemovalForCaller(ctx, ji1, true, "user-1", false); !found || !allowed {
+		t.Fatalf("expected user-1 mark removal ok: found=%v allowed=%v", found, allowed)
+	}
+	if found, allowed := h.SetJobItemRemovalForCaller(ctx, ji1, false, "user-1", false); !found || !allowed {
+		t.Fatalf("expected user-1 unmark removal ok: found=%v allowed=%v", found, allowed)
+	}
+	if found, _ := h.SetJobItemRemovalForCaller(ctx, "missing", true, "user-1", false); found {
+		t.Fatal("expected missing mark removal found=false")
+	}
+
+	// DeleteJobItemForCaller
+	if found, allowed := h.DeleteJobItemForCaller(ctx, ji1, "bob", false); !found || allowed {
+		t.Fatalf("expected forbidden for bob delete item: found=%v allowed=%v", found, allowed)
+	}
+	if found, allowed := h.DeleteJobItemForCaller(ctx, ji1, "user-1", false); !found || !allowed {
+		t.Fatalf("expected user-1 delete ji1 ok: found=%v allowed=%v", found, allowed)
+	}
+	if found, _ := h.DeleteJobItemForCaller(ctx, "missing", "user-1", false); found {
+		t.Fatal("expected missing delete found=false")
+	}
+
+	// CancelItemsForCaller
+	if err := h.CancelItemsForCaller(ctx, "", nil, "user-1", false); err != nil {
+		t.Fatalf("expected empty cancel no-op nil, got %v", err)
+	}
+	if err := h.CancelItemsForCaller(ctx, "dev-1", []string{"i2"}, "bob", false); err != ErrForbidden {
+		t.Fatalf("expected ErrForbidden for bob cancel, got %v", err)
+	}
+	if err := h.CancelItemsForCaller(ctx, "dev-1", []string{"i2"}, "user-1", false); err != nil {
+		t.Fatalf("expected user-1 cancel ok: %v", err)
+	}
+	if _, found, _ := h.GetJobItemForCaller(ji2, "user-1", false); found {
+		t.Fatal("expected ji2 cancelled")
+	}
+}

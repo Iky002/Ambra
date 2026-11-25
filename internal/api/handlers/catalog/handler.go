@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"errors"
 	"net/http"
 
 	"github.com/ambra-media/ambra/internal/api/dto"
@@ -296,6 +297,50 @@ func (h *Handler) handleMovieRecommendations(w http.ResponseWriter, r *http.Requ
 	httpx.JSON(w, http.StatusOK, cats)
 }
 
+func isLibraryAllowed(libID string, allowed []string) bool {
+	if allowed == nil {
+		return true
+	}
+	norm := guid.Normalize(libID)
+	for _, id := range allowed {
+		if id == norm {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) canAccessItem(r *http.Request, fallbackUserID, itemID string) (bool, error) {
+	allowed := h.allowedLibrariesForRequest(r, fallbackUserID)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, fallbackUserID)
+	if allowed == nil && maxRating == nil && len(blockedTags) == 0 {
+		return true, nil
+	}
+	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if rec == nil {
+		return true, nil
+	}
+	if allowed != nil && rec.LibraryID != "" && !isLibraryAllowed(rec.LibraryID, allowed) {
+		return false, nil
+	}
+	if maxRating != nil || len(blockedTags) > 0 {
+		blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags)
+		if bErr != nil {
+			return false, bErr
+		}
+		if blocked {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 func (h *Handler) handleSimilar(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
@@ -303,13 +348,23 @@ func (h *Handler) handleSimilar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := h.resolveUserID(r, q)
+	seedID := r.PathValue("Id")
+	ok, err := h.canAccessItem(r, userID, seedID)
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !ok {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 	items, total, err := h.repo.GetSimilarItemsWithPolicy(
 		r.Context(),
 		h.serverID(),
 		userID,
-		r.PathValue("Id"),
+		seedID,
 		q.Int("Limit", 12),
 		q.List("Fields"),
 		allowed,
@@ -333,13 +388,23 @@ func (h *Handler) handleInstantMix(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := h.resolveUserID(r, q)
+	seedID := r.PathValue("Id")
+	ok, err := h.canAccessItem(r, userID, seedID)
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !ok {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 	items, total, err := h.repo.GetInstantMixWithPolicy(
 		r.Context(),
 		h.serverID(),
 		userID,
-		r.PathValue("Id"),
+		seedID,
 		q.Int("Limit", 50),
 		q.List("Fields"),
 		allowed,

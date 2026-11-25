@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/ambra-media/ambra/internal/api/handlers/livetv"
+	syncapi "github.com/ambra-media/ambra/internal/api/handlers/sync"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/dvr"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
@@ -336,5 +338,220 @@ func TestSyncAndNotificationsHardeningRBACAndOfflineActions(t *testing.T) {
 	ud2, err := libRepo.GetUserItemData(ctx, userA.ID, item2.ID)
 	if err != nil || ud2.PlaybackPositionTicks != 123450000 || !ud2.IsFavorite {
 		t.Fatalf("expected item2 PlaybackPositionTicks=123450000 IsFavorite=true, got %+v err=%v", ud2, err)
+	}
+}
+
+func TestCompatExtUnifiedStateRBACAndOfflineActionsCap(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(tmpDir, "compatext_unified.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	cfg := &config.Config{ServerID: "srv-uni", DataDir: tmpDir}
+	userRepo := sqlite.NewUserRepo(store)
+
+	alice := &sqlite.UserRecord{ID: guid.New(), Name: "alice", Policy: sqlite.DefaultUserPolicy(false), Config: sqlite.DefaultUserConfig()}
+	bob := &sqlite.UserRecord{ID: guid.New(), Name: "bob", Policy: sqlite.DefaultUserPolicy(false), Config: sqlite.DefaultUserConfig()}
+	dvrMgrPol := sqlite.DefaultUserPolicy(false)
+	dvrMgrPol.EnableLiveTvManagement = true
+	dvrMgr := &sqlite.UserRecord{ID: guid.New(), Name: "dvrmgr", Policy: dvrMgrPol, Config: sqlite.DefaultUserConfig()}
+	admin := &sqlite.UserRecord{ID: guid.New(), Name: "admin", IsAdmin: true, Policy: sqlite.DefaultUserPolicy(true), Config: sqlite.DefaultUserConfig()}
+	for _, u := range []*sqlite.UserRecord{alice, bob, dvrMgr, admin} {
+		_ = userRepo.CreateUser(ctx, u)
+	}
+
+	lt := livetv.New(store, cfg)
+	lt.SetUserRepo(userRepo)
+	ltMux := http.NewServeMux()
+	lt.RegisterRoutes(ltMux, livetv.AuthFuncs{})
+
+	sh := syncapi.New(store, cfg)
+	sh.SetUserRepo(userRepo)
+	shMux := http.NewServeMux()
+	sh.RegisterRoutes(shMux, syncapi.AuthFuncs{})
+
+	h := New(store, cfg)
+	h.SetLiveTV(lt)
+	h.SetSyncHandler(sh)
+	h.SetUserRepo(userRepo)
+	router := h.BuildRouter(AuthFuncs{})
+
+	withUser := func(req *http.Request, u *sqlite.UserRecord) *http.Request {
+		return req.WithContext(middleware.WithAuthContext(req.Context(), &middleware.AuthContext{User: u}))
+	}
+
+	// 1. LiveTV channel Disabled & SortIndex delegate to livetv (no split-brain)
+	ltMux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/LiveTv/TunerHosts",
+		strings.NewReader(`{"Id":"th-1","Type":"m3u","M3UContent":"#EXTM3U\n#EXTINF:-1,Chan 1\nhttp://192.168.1.50/1.ts\n"}`)))
+	chRec := httptest.NewRecorder()
+	ltMux.ServeHTTP(chRec, httptest.NewRequest(http.MethodGet, "/LiveTv/Channels", nil))
+	var chResp struct {
+		Items []livetv.ChannelInfo `json:"Items"`
+	}
+	_ = json.Unmarshal(chRec.Body.Bytes(), &chResp)
+	chID := chResp.Items[0].Id
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, withUser(httptest.NewRequest(http.MethodPost, "/LiveTv/Manage/Channels/"+chID+"/Disabled", strings.NewReader(`{"Disabled":true}`)), admin))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("set disabled: %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, withUser(httptest.NewRequest(http.MethodPost, "/LiveTv/Manage/Channels/"+chID+"/SortIndex", strings.NewReader(`{"NewIndex":9}`)), admin))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("set sort index: %d", w.Code)
+	}
+	ch, ok := lt.GetChannelByID(chID)
+	if !ok || !ch.Disabled || ch.SortIndex != 9 {
+		t.Fatalf("expected livetv in-memory channel updated via delegation, got %+v", ch)
+	}
+
+	// 2. POST /LiveTv/Timers/{Id}/Delete & SeriesTimers/{Id}/Delete RBAC + delegation
+	ltMux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/LiveTv/Timers",
+		strings.NewReader(`{"Id":"tm-1","Name":"T1","ChannelId":"`+chID+`"}`)))
+	ltMux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/LiveTv/SeriesTimers",
+		strings.NewReader(`{"Id":"st-1","Name":"S1","ChannelId":"`+chID+`"}`)))
+
+	// Regular user Alice gets 403
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, withUser(httptest.NewRequest(http.MethodPost, "/LiveTv/Timers/tm-1/Delete", nil), alice))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for regular user timer delete, got %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, withUser(httptest.NewRequest(http.MethodPost, "/LiveTv/SeriesTimers/st-1/Delete", nil), alice))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for regular user series timer delete, got %d", w.Code)
+	}
+	// User with EnableLiveTvManagement succeeds and deletes from livetv
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, withUser(httptest.NewRequest(http.MethodPost, "/LiveTv/Timers/tm-1/Delete", nil), dvrMgr))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for dvrMgr timer delete, got %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, withUser(httptest.NewRequest(http.MethodPost, "/LiveTv/SeriesTimers/st-1/Delete", nil), dvrMgr))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for dvrMgr series timer delete, got %d", w.Code)
+	}
+
+	// 3. Sync RBAC, delegation to syncH, and empty Cancel no-op
+	jobRec := httptest.NewRecorder()
+	shMux.ServeHTTP(jobRec, withUser(httptest.NewRequest(http.MethodPost, "/Sync/Jobs",
+		strings.NewReader(`{"TargetId":"dev-alice","Name":"Alice Sync","ItemIds":["item-a","item-b"]}`)), alice))
+	if jobRec.Code != http.StatusOK {
+		t.Fatalf("create alice sync job: %d %s", jobRec.Code, jobRec.Body.String())
+	}
+	var aliceJob syncapi.SyncJobCreationResult
+	_ = json.Unmarshal(jobRec.Body.Bytes(), &aliceJob)
+	jiA := aliceJob.JobItems[0].Id
+	jiB := aliceJob.JobItems[1].Id
+
+	// Bob gets 403 on all of Alice's sync mutation & AdditionalFiles endpoints
+	for _, tc := range []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodPost, "/Sync/Jobs/" + aliceJob.Job.Id + "/Delete", `{}`},
+		{http.MethodPost, "/Sync/JobItems/" + jiA + "/Delete", `{}`},
+		{http.MethodPost, "/Sync/JobItems/" + jiA + "/MarkForRemoval", `{}`},
+		{http.MethodPost, "/Sync/JobItems/" + jiA + "/UnmarkForRemoval", `{}`},
+		{http.MethodPost, "/Sync/Items/Cancel", `{"TargetId":"dev-alice","ItemIds":["item-a"]}`},
+		{http.MethodPost, "/Sync/dev-alice/Items/Delete", `{"ItemIds":["item-a"]}`},
+		{http.MethodDelete, "/Sync/dev-alice/Items?ItemIds=item-a", ``},
+		{http.MethodGet, "/Sync/JobItems/" + jiA + "/AdditionalFiles?Name=sub.vtt", ``},
+	} {
+		w = httptest.NewRecorder()
+		router.ServeHTTP(w, withUser(httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body)), bob))
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("bob %s %s: got %d, want 403", tc.method, tc.path, w.Code)
+		}
+	}
+
+	// Bob's POST /Sync/item-a/Status must NOT leak Alice's job item
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, withUser(httptest.NewRequest(http.MethodPost, "/Sync/item-a/Status", strings.NewReader(`{}`)), bob))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"Status":"None"`) {
+		t.Fatalf("bob status leaked alice item: %d %s", w.Code, w.Body.String())
+	}
+
+	// Nonexistent AdditionalFiles returns 404; Alice's returns 200
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, withUser(httptest.NewRequest(http.MethodGet, "/Sync/JobItems/no-such-item/AdditionalFiles?Name=sub.vtt", nil), alice))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("nonexistent AdditionalFiles: got %d, want 404", w.Code)
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, withUser(httptest.NewRequest(http.MethodGet, "/Sync/JobItems/"+jiA+"/AdditionalFiles?Name=sub.vtt", nil), alice))
+	if w.Code != http.StatusOK || !strings.Contains(w.Header().Get("Content-Type"), "text/vtt") {
+		t.Fatalf("alice AdditionalFiles: got %d ct=%q", w.Code, w.Header().Get("Content-Type"))
+	}
+
+	// POST /Sync/Items/Cancel with empty ItemIds AND empty TargetId must be a 204 no-op (never wipes all items)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, withUser(httptest.NewRequest(http.MethodPost, "/Sync/Items/Cancel", strings.NewReader(`{}`)), admin))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("empty cancel: got %d, want 204", w.Code)
+	}
+	listRec := httptest.NewRecorder()
+	shMux.ServeHTTP(listRec, withUser(httptest.NewRequest(http.MethodGet, "/Sync/JobItems", nil), alice))
+	if !strings.Contains(listRec.Body.String(), jiA) || !strings.Contains(listRec.Body.String(), jiB) {
+		t.Fatalf("empty cancel wiped sync items: %s", listRec.Body.String())
+	}
+
+	// Alice marks/unmarks jiB for removal, checks status, deletes jiA, then deletes job via compatext
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, withUser(httptest.NewRequest(http.MethodPost, "/Sync/JobItems/"+jiB+"/MarkForRemoval", nil), alice))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("alice mark for removal: %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, withUser(httptest.NewRequest(http.MethodPost, "/Sync/JobItems/"+jiB+"/UnmarkForRemoval", nil), alice))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("alice unmark for removal: %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, withUser(httptest.NewRequest(http.MethodPost, "/Sync/item-b/Status", strings.NewReader(`{}`)), alice))
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), `"Status":"None"`) {
+		t.Fatalf("alice status should see own item-b: %d %s", w.Code, w.Body.String())
+	}
+
+	// Alice deletes jiA via compatext -> immediately reflected in syncH in-memory state
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, withUser(httptest.NewRequest(http.MethodPost, "/Sync/JobItems/"+jiA+"/Delete", nil), alice))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("alice delete jiA: %d", w.Code)
+	}
+	listRec = httptest.NewRecorder()
+	shMux.ServeHTTP(listRec, withUser(httptest.NewRequest(http.MethodGet, "/Sync/JobItems", nil), alice))
+	if strings.Contains(listRec.Body.String(), jiA) || !strings.Contains(listRec.Body.String(), jiB) {
+		t.Fatalf("syncH state out of sync after compatext delete: %s", listRec.Body.String())
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, withUser(httptest.NewRequest(http.MethodPost, "/Sync/Jobs/"+aliceJob.Job.Id+"/Delete", nil), alice))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("alice delete own sync job: %d", w.Code)
+	}
+
+	// 4. OfflineActions capped to latest 500 entries
+	actions := make([]OfflineAction, 550)
+	for i := range actions {
+		actions[i] = OfflineAction{ItemId: "item-" + string(rune('0'+i%10)), Type: "Played"}
+	}
+	rawActions, _ := json.Marshal(actions)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, withUser(httptest.NewRequest(http.MethodPost, "/Sync/OfflineActions", strings.NewReader(string(rawActions))), alice))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("offline actions bulk: %d", w.Code)
+	}
+	h.mu.RLock()
+	actionCount := len(h.state.OfflineActions)
+	h.mu.RUnlock()
+	if actionCount != maxOfflineActions {
+		t.Fatalf("expected OfflineActions capped at %d, got %d", maxOfflineActions, actionCount)
 	}
 }

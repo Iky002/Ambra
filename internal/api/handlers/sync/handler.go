@@ -22,6 +22,9 @@ import (
 
 const stateConfigKey = "sync:state"
 
+// ErrForbidden is returned when a caller attempts to mutate or access another user's sync resources.
+var ErrForbidden = errors.New("forbidden")
+
 // AuthFuncs decouples route registration from the concrete middleware package.
 type AuthFuncs struct {
 	RequireAuth   func(http.Handler) http.Handler
@@ -207,6 +210,200 @@ func canAccessJob(job SyncJob, callerID string, isAdmin, hasAuth bool) bool {
 	return callerID != "" && guid.Normalize(job.UserId) == callerID
 }
 
+func callerCanAccessJob(job SyncJob, callerID string, isAdmin bool) bool {
+	if isAdmin {
+		return true
+	}
+	normCaller := guid.Normalize(callerID)
+	if normCaller == "" {
+		return false
+	}
+	return guid.Normalize(job.UserId) == normCaller
+}
+
+// DeleteJobForCaller removes a sync job and its job items if the caller owns the job or is admin.
+func (h *Handler) DeleteJobForCaller(ctx context.Context, jobID, callerID string, isAdmin bool) (found, allowed bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	idx := -1
+	for i, j := range h.state.Jobs {
+		if j.Id == jobID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return false, true
+	}
+	if !callerCanAccessJob(h.state.Jobs[idx], callerID, isAdmin) {
+		return true, false
+	}
+	h.state.Jobs = append(h.state.Jobs[:idx], h.state.Jobs[idx+1:]...)
+	keptItems := make([]SyncJobItem, 0, len(h.state.JobItems))
+	for _, ji := range h.state.JobItems {
+		if ji.JobId != jobID {
+			keptItems = append(keptItems, ji)
+		}
+	}
+	h.state.JobItems = keptItems
+	h.saveStateLocked(ctx)
+	return true, true
+}
+
+// DeleteJobItemForCaller removes a sync job item if the caller owns its parent job or is admin.
+func (h *Handler) DeleteJobItemForCaller(ctx context.Context, itemID, callerID string, isAdmin bool) (found, allowed bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for i, ji := range h.state.JobItems {
+		if ji.Id == itemID {
+			jobID := ji.JobId
+			if !isAdmin {
+				j, ok := h.findJobLocked(jobID)
+				if !ok || !callerCanAccessJob(j, callerID, isAdmin) {
+					return true, false
+				}
+			}
+			h.state.JobItems = append(h.state.JobItems[:i], h.state.JobItems[i+1:]...)
+			h.recomputeJobLocked(jobID)
+			h.saveStateLocked(ctx)
+			return true, true
+		}
+	}
+	return false, true
+}
+
+// SetJobItemRemovalForCaller marks or unmarks a sync job item for removal if the caller owns its parent job or is admin.
+func (h *Handler) SetJobItemRemovalForCaller(ctx context.Context, itemID string, remove bool, callerID string, isAdmin bool) (found, allowed bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for i := range h.state.JobItems {
+		if h.state.JobItems[i].Id == itemID {
+			jobID := h.state.JobItems[i].JobId
+			if !isAdmin {
+				j, ok := h.findJobLocked(jobID)
+				if !ok || !callerCanAccessJob(j, callerID, isAdmin) {
+					return true, false
+				}
+			}
+			if remove {
+				h.state.JobItems[i].Status = "Removing"
+			} else {
+				h.state.JobItems[i].Status = "Synced"
+			}
+			h.recomputeJobLocked(jobID)
+			h.saveStateLocked(ctx)
+			return true, true
+		}
+	}
+	return false, true
+}
+
+// CancelItemsForCaller cancels matching sync job items owned by the caller (or any user when isAdmin).
+// If both targetID and itemIDs are empty, this is a safe no-op and never wipes all sync items.
+func (h *Handler) CancelItemsForCaller(ctx context.Context, targetID string, itemIDs []string, callerID string, isAdmin bool) error {
+	targetID = strings.TrimSpace(targetID)
+	idSet := make(map[string]struct{}, len(itemIDs))
+	for _, id := range itemIDs {
+		if trimmed := strings.TrimSpace(id); trimmed != "" {
+			idSet[trimmed] = struct{}{}
+		}
+	}
+	if targetID == "" && len(idSet) == 0 {
+		return nil
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	jobByID := make(map[string]SyncJob, len(h.state.Jobs))
+	for _, j := range h.state.Jobs {
+		jobByID[j.Id] = j
+	}
+
+	remaining := make([]SyncJobItem, 0, len(h.state.JobItems))
+	affectedJobs := make(map[string]struct{})
+	removedCount := 0
+	deniedCount := 0
+
+	for _, it := range h.state.JobItems {
+		targetMatch := targetID == "" || it.TargetId == targetID
+		_, itemMatch := idSet[it.ItemId]
+		if targetMatch && (len(idSet) == 0 || itemMatch) {
+			if !isAdmin {
+				j, ok := jobByID[it.JobId]
+				if !ok || !callerCanAccessJob(j, callerID, isAdmin) {
+					deniedCount++
+					remaining = append(remaining, it)
+					continue
+				}
+			}
+			removedCount++
+			affectedJobs[it.JobId] = struct{}{}
+			continue
+		}
+		remaining = append(remaining, it)
+	}
+
+	if removedCount > 0 {
+		h.state.JobItems = remaining
+		for jid := range affectedJobs {
+			h.recomputeJobLocked(jid)
+		}
+		h.saveStateLocked(ctx)
+	}
+	if removedCount == 0 && deniedCount > 0 {
+		return ErrForbidden
+	}
+	return nil
+}
+
+// GetJobItemForCaller returns a copy of a SyncJobItem by ID if the caller owns its parent job or is admin.
+func (h *Handler) GetJobItemForCaller(itemID, callerID string, isAdmin bool) (item *SyncJobItem, found, allowed bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	for _, ji := range h.state.JobItems {
+		if ji.Id == itemID {
+			if !isAdmin {
+				j, ok := h.findJobLocked(ji.JobId)
+				if !ok || !callerCanAccessJob(j, callerID, isAdmin) {
+					return nil, true, false
+				}
+			}
+			cp := ji
+			return &cp, true, true
+		}
+	}
+	return nil, false, true
+}
+
+// GetItemStatusForCaller looks up a SyncJobItem matching itemID (and optional targetID) visible to the caller.
+func (h *Handler) GetItemStatusForCaller(itemID, targetID, callerID string, isAdmin bool) (*SyncJobItem, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	jobByID := make(map[string]SyncJob, len(h.state.Jobs))
+	for _, j := range h.state.Jobs {
+		jobByID[j.Id] = j
+	}
+	for _, ji := range h.state.JobItems {
+		if ji.ItemId == itemID && (targetID == "" || ji.TargetId == targetID) {
+			if !isAdmin {
+				j, ok := jobByID[ji.JobId]
+				if !ok || !callerCanAccessJob(j, callerID, isAdmin) {
+					continue
+				}
+			}
+			cp := ji
+			return &cp, true
+		}
+	}
+	return nil, false
+}
+
 func (h *Handler) findJobLocked(jobID string) (SyncJob, bool) {
 	for _, j := range h.state.Jobs {
 		if j.Id == jobID {
@@ -222,11 +419,14 @@ func defaultTargets() []SyncTarget {
 	}
 }
 
-func (h *Handler) resolveTargets(ctx context.Context) []SyncTarget {
+func (h *Handler) resolveTargets(ctx context.Context, callerID string, isAdmin, hasAuth bool) []SyncTarget {
 	if userRepo := h.getUserRepo(); userRepo != nil {
 		if devices, err := userRepo.ListDevices(ctx); err == nil && len(devices) > 0 {
 			targets := make([]SyncTarget, 0, len(devices))
 			for _, d := range devices {
+				if hasAuth && !isAdmin && guid.Normalize(d.LastUserID) != callerID {
+					continue
+				}
 				id := strings.TrimSpace(d.ID)
 				if id == "" {
 					continue
@@ -249,12 +449,14 @@ func (h *Handler) resolveTargets(ctx context.Context) []SyncTarget {
 }
 
 func (h *Handler) handleTargets(w http.ResponseWriter, r *http.Request) {
-	httpx.JSON(w, http.StatusOK, h.resolveTargets(r.Context()))
+	callerID, isAdmin, hasAuth := callerAuth(r)
+	httpx.JSON(w, http.StatusOK, h.resolveTargets(r.Context(), callerID, isAdmin, hasAuth))
 }
 
 func (h *Handler) handleOptions(w http.ResponseWriter, r *http.Request) {
+	callerID, isAdmin, hasAuth := callerAuth(r)
 	httpx.JSON(w, http.StatusOK, SyncDialogOptions{
-		Targets: h.resolveTargets(r.Context()),
+		Targets: h.resolveTargets(r.Context(), callerID, isAdmin, hasAuth),
 		Options: []string{"Name", "Quality", "UnwatchedOnly", "SyncNewContent", "ItemLimit"},
 		QualityOptions: []SyncQualityOption{
 			{Id: "original", Name: "Original", Description: "Keep original quality", IsDefault: true, IsOriginal: true},
@@ -371,18 +573,20 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		outputPath := ""
 		mediaSourceID := ""
 		if libRepo != nil {
-			if itemDTO, err := libRepo.GetItemByID(r.Context(), serverID, job.UserId, itemID); err == nil && itemDTO != nil {
-				if itemDTO.Name != "" {
-					itemName = itemDTO.Name
-				}
-				if itemDTO.Path != "" {
-					outputPath = itemDTO.Path
-				}
-				if len(itemDTO.MediaSources) > 0 && itemDTO.MediaSources[0].Id != "" {
-					mediaSourceID = itemDTO.MediaSources[0].Id
-				} else if itemDTO.Id != "" {
-					mediaSourceID = itemDTO.Id
-				}
+			itemDTO, err := libRepo.GetItemByID(r.Context(), serverID, job.UserId, itemID)
+			if err != nil || itemDTO == nil {
+				continue
+			}
+			if itemDTO.Name != "" {
+				itemName = itemDTO.Name
+			}
+			if itemDTO.Path != "" {
+				outputPath = itemDTO.Path
+			}
+			if len(itemDTO.MediaSources) > 0 && itemDTO.MediaSources[0].Id != "" {
+				mediaSourceID = itemDTO.MediaSources[0].Id
+			} else if itemDTO.Id != "" {
+				mediaSourceID = itemDTO.Id
 			}
 		}
 		createdItems = append(createdItems, SyncJobItem{
@@ -396,6 +600,11 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 			MediaSource: mediaSourceID,
 		})
 	}
+	if libRepo != nil && len(req.ItemIds) > 0 && len(createdItems) == 0 {
+		httpx.Error(w, http.StatusNotFound, "no matching library items found")
+		return
+	}
+	job.ItemCount = len(createdItems)
 
 	h.mu.Lock()
 	h.state.Jobs = append(h.state.Jobs, job)
@@ -682,7 +891,7 @@ func (h *Handler) handleReadyItems(w http.ResponseWriter, r *http.Request) {
 		if targetID != "" && ji.TargetId != targetID {
 			continue
 		}
-		if ji.Status == "ReadyToTransfer" || ji.Status == "Queued" {
+		if ji.Status == "ReadyToTransfer" || ji.Status == "Synced" {
 			origFile := ""
 			if ji.OutputPath != "" {
 				origFile = filepath.Base(ji.OutputPath)
