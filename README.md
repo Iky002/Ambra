@@ -9,12 +9,17 @@
 </p>
 
 <p align="center">
+  <strong>简体中文</strong> · <a href="README.en.md">English</a>
+</p>
+
+<p align="center">
   <a href="https://github.com/Iky002/Ambra/releases/latest"><img src="https://img.shields.io/github/v/release/Iky002/Ambra?label=Latest&color=f59e0b" alt="Latest Release" /></a>
   <a href="https://github.com/Iky002/Ambra/actions/workflows/ci.yml"><img src="https://github.com/Iky002/Ambra/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="https://github.com/Iky002/Ambra/actions/workflows/release.yml"><img src="https://github.com/Iky002/Ambra/actions/workflows/release.yml/badge.svg" alt="Release" /></a>
   <a href="https://iky002.github.io/Ambra/"><img src="https://img.shields.io/badge/Live%20Demo-在线体验-10b981" alt="Live Demo" /></a>
   <img src="https://img.shields.io/badge/Emby%204.10.2.0%20API-583%2F583%20(100%25)-0ea5e9" alt="583/583 APIs" />
   <img src="https://img.shields.io/badge/Go%20Coverage-%E2%89%A590%25-6366f1" alt="Go Coverage" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-94a3b8" alt="MIT License" /></a>
 </p>
 
 ---
@@ -23,6 +28,7 @@
 
 - **极轻部署，几乎零负担**：纯 Go 单文件 + 内嵌 SQLite + 内嵌现代 Web 客户端，单容器 / 单二进制即可运行，空载内存低、NAS 与轻量云服务器都能轻松驾驭。
 - **全面兼容 Emby 客户端生态**：100% 通过 Emby `4.10.2.0` 全部 **583 条 API** 契约测试，直接适配 **Infuse、VidHub、SenPlayer、Yamby、Hills、Emby 官方客户端、Kodi** 以及 **MoviePilot / Sonarr / Radarr**。
+- **内置 10 国语言国际化（i18n）**：前后端原生支持 **简体中文、繁體中文、English、日本語、한국어、Español、Deutsch、Français、Português、ไทย**，自动识别浏览器语言并支持顶栏/个人中心即时切换。
 - **为中文影音库深度优化**：
   - 支持 **中文分词、拼音全拼/首字母、繁简互通与多关键字乱序搜索**；
   - 媒体库 **A–Z 索引原生支持中文拼音首字母**；
@@ -115,3 +121,9 @@ make build        # 构建当前平台纯 Go 二进制 (bin/ambra)
 - **架构设计**：[系统总体架构](docs/architecture/01-system-overview.md) · [Emby API 兼容层](docs/architecture/02-api-compatibility-layer.md) · [SQLite 数据架构](docs/architecture/03-data-and-storage.md) · [媒体处理管线](docs/architecture/04-media-pipeline.md) · [统一插件内核](docs/architecture/05-extensibility.md)
 - **子系统规格**：[数据库与中文检索](docs/specs/01-database-schema-and-query.md) · [认证与实时通信](docs/specs/02-auth-sessions-and-realtime.md) · [播放与动态转码](docs/specs/03-playback-transcode-and-subtitles.md) · [全媒体与 Live TV / DLNA](docs/specs/04-all-media-types-and-subsystems.md) · [契约测试与基准](docs/specs/05-testing-and-compatibility.md) · [现代 Web 客户端](docs/specs/06-web-client-and-player.md)
 - **协议参考**：[Emby 4.10.2.0 API 兼容矩阵](docs/roadmap/02-api-coverage-matrix.md) · [Emby 4.10.2.0 完整 API 参考](docs/emby-4.10.2.0-api/README.md)
+
+---
+
+## 开源协议
+
+本项目基于 [MIT License](LICENSE) 开源。
