@@ -9,6 +9,8 @@ services:
     image: ghcr.io/iky002/ambra:latest
     container_name: ambra
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "8096:8096/tcp"   # HTTP / Web UI / Emby API
       - "1900:1900/udp"   # DLNA / SSDP 局域网发现

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/core/imaging"
@@ -284,6 +286,9 @@ func (h *Handler) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if _, isAdmin := h.callerIdentity(r); h.isAuthenticated(r) && !isAdmin {
+		dto.SanitizePlaybackInfo(resp)
+	}
 	httpx.JSON(w, http.StatusOK, resp)
 }
 
@@ -509,7 +514,7 @@ func (h *Handler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", ct)
-	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.Header().Set("Cache-Control", "private, max-age=3600")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
 }
@@ -651,16 +656,18 @@ func (h *Handler) proxyRemoteMedia(w http.ResponseWriter, r *http.Request, targe
 	}
 	defer resp.Body.Close()
 
-	for _, hdr := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"} {
+	for _, hdr := range []string{"Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"} {
 		if val := resp.Header.Get(hdr); val != "" {
 			w.Header().Set(hdr, val)
 		}
 	}
-	if w.Header().Get("Content-Type") == "" {
-		if u, parseErr := url.Parse(targetURL); parseErr == nil {
-			w.Header().Set("Content-Type", videoContentType(u.Path))
-		}
+	fallbackCT := "application/octet-stream"
+	if u, parseErr := url.Parse(targetURL); parseErr == nil {
+		fallbackCT = videoContentType(u.Path)
 	}
+	w.Header().Set("Content-Type", sanitizeProxyMediaContentType(resp.Header.Get("Content-Type"), fallbackCT))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox")
 	if asAttachment {
 		filename := "media"
 		if u, parseErr := url.Parse(targetURL); parseErr == nil {
@@ -674,6 +681,42 @@ func (h *Handler) proxyRemoteMedia(w http.ResponseWriter, r *http.Request, targe
 	w.WriteHeader(resp.StatusCode)
 	if r.Method != http.MethodHead {
 		_, _ = io.Copy(w, resp.Body)
+	}
+}
+
+func sanitizeProxyMediaContentType(rawCT, fallbackCT string) string {
+	trimmed := strings.TrimSpace(rawCT)
+	if trimmed == "" {
+		if fallbackCT != "" {
+			return fallbackCT
+		}
+		return "application/octet-stream"
+	}
+	mediaType, _, err := mime.ParseMediaType(trimmed)
+	if err != nil {
+		return "application/octet-stream"
+	}
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	if isAllowedProxyMediaMIME(mediaType) {
+		return mediaType
+	}
+	return "application/octet-stream"
+}
+
+func isAllowedProxyMediaMIME(mediaType string) bool {
+	if strings.HasPrefix(mediaType, "video/") || strings.HasPrefix(mediaType, "audio/") {
+		return true
+	}
+	switch mediaType {
+	case "application/octet-stream",
+		"application/vnd.apple.mpegurl",
+		"application/x-mpegurl",
+		"application/mp4",
+		"application/mp2t",
+		"text/vtt":
+		return true
+	default:
+		return false
 	}
 }
 

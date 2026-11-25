@@ -28,7 +28,6 @@
   "common.copy": "Copier",
   "common.copied": "Copié",
   "common.language": "Langue",
-
   "nav.home": "Accueil",
   "nav.trending": "Tendances",
   "nav.collections": "Collections",
@@ -50,7 +49,6 @@
   "nav.demoDesc": "(Simulation frontend en mémoire, sans serveur · Tous les changements s'appliquent immédiatement)",
   "nav.demoSwitchGuest": "Vue admin · Passer en utilisateur pour tester le RBAC",
   "nav.demoSwitchAdmin": "Vue utilisateur · Revenir à la console d'administration",
-
   "auth.loginTitle": "Connexion à Ambra",
   "auth.loginSubtitle": "Connectez-vous à votre serveur cinéma privé",
   "auth.username": "Nom d'utilisateur",
@@ -65,7 +63,6 @@
   "auth.noAdminDesc": "Ce compte ne dispose pas des droits administrateur (IsAdministrator = false). Contactez votre administrateur système pour gérer le serveur, les utilisateurs ou les bibliothèques.",
   "auth.backHome": "Retour à l'accueil",
   "auth.verifyingAdmin": "Vérification des droits administrateur...",
-
   "setup.title": "Bienvenue sur Ambra",
   "setup.subtitle": "Configurez votre serveur cinéma privé en quelques étapes",
   "setup.serverName": "Nom du serveur",
@@ -73,7 +70,6 @@
   "setup.tmdbLanguage": "Langue des métadonnées",
   "setup.createAdmin": "Créer le compte administrateur",
   "setup.complete": "Terminer la configuration",
-
   "home.continueWatching": "Reprendre la lecture",
   "home.nextUp": "À suivre",
   "home.myMedia": "Mes médias",
@@ -88,7 +84,6 @@
   "home.emptyTitle": "Votre bibliothèque est vide",
   "home.emptyDesc": "Ouvrez la console d'administration pour ajouter des dossiers locaux ou .strm et lancer la première analyse.",
   "home.goManageLibraries": "Ajouter des bibliothèques",
-
   "library.allItems": "Tout",
   "library.albums": "Albums",
   "library.artists": "Artistes",
@@ -111,7 +106,6 @@
   "library.exitMultiSelect": "Quitter la sélection",
   "library.selectedCount": "{{count}} sélectionné(s)",
   "library.emptyResult": "Aucun élément correspondant",
-
   "detail.play": "Lire",
   "detail.resume": "Reprendre",
   "detail.favorite": "Favori",
@@ -146,7 +140,6 @@
   "detail.container": "Conteneur",
   "detail.fileSize": "Taille du fichier",
   "detail.bitrate": "Débit total",
-
   "player.quality": "Qualité",
   "player.qualityAuto": "Lecture directe",
   "player.version": "Version",
@@ -163,33 +156,27 @@
   "player.playNextNow": "Lire maintenant",
   "player.cancelNextUp": "Annuler",
   "player.loadError": "Impossible de décoder ou charger le flux vidéo. Vérifiez le format média ou la connexion réseau.",
-
   "collections.title": "Collections et playlists",
   "collections.boxSets": "Collections",
   "collections.playlists": "Playlists",
   "collections.createCollection": "Nouvelle collection",
   "collections.createPlaylist": "Nouvelle playlist",
   "collections.playAll": "Tout lire",
-
   "favorites.title": "Favoris",
   "favorites.emptyTitle": "Aucun favori pour l'instant",
   "favorites.emptyDesc": "Cliquez sur le bouton favori d'un film, d'une série ou d'une musique pour l'ajouter ici.",
-
   "trending.title": "Classements tendances",
   "trending.subtitle": "Regroupe TMDB Tendances, Douban Hot et IMDb Top 250 avec accès direct à votre bibliothèque",
   "trending.refreshNow": "Synchroniser maintenant",
   "trending.inLibrary": "Dans la bibliothèque",
-
   "livetv.title": "TV en direct",
   "livetv.channels": "Chaînes",
   "livetv.guide": "Guide TV",
   "livetv.recordings": "Enregistrements",
   "livetv.timers": "Programmation",
-
   "search.title": "Explorer et rechercher",
   "search.placeholder": "Rechercher par titre, titre original ou casting...",
   "search.noResults": "Aucun film, série ou personne trouvé",
-
   "profile.title": "Profil",
   "profile.uiLanguage": "Langue de l'interface",
   "profile.uiLanguageDesc": "Changez la langue du client web et synchronisez votre préférence avec le serveur",
@@ -197,11 +184,9 @@
   "profile.avatar": "Avatar",
   "profile.quickConnect": "Autorisation Quick Connect",
   "profile.playbackPrefs": "Préférences de lecture",
-
   "notifications.title": "Notifications",
   "notifications.markAllRead": "Tout marquer comme lu",
   "notifications.empty": "Aucune notification",
-
   "admin.title": "Console d'administration",
   "admin.tabDashboard": "Tableau de bord",
   "admin.tabLibraries": "Bibliothèques",
@@ -220,5 +205,20 @@
   "admin.serverLogs": "Journaux du serveur",
   "admin.downloadLog": "Télécharger le journal",
   "admin.kickDevice": "Déconnecter l'appareil",
-  "admin.revokeKey": "Révoquer la clé"
+  "admin.revokeKey": "Révoquer la clé",
+  "player.cannotPlayTitle": "Impossible de lire ce média",
+  "player.retryPlayback": "Réessayer la lecture",
+  "player.goBack": "Retour",
+  "player.subtitleOff": "Désactiver les sous-titres",
+  "player.subtitleTweaks": "Réglages des sous-titres",
+  "player.loadingStream": "Chargement du flux média...",
+  "player.buffering": "Mise en mémoire tampon...",
+  "admin.scanAllLibraries": "Analyser toutes les bibliothèques",
+  "admin.scanningAllLibraries": "Démarrage de l'analyse...",
+  "admin.dashboardOverview": "Aperçu de l'état du serveur",
+  "admin.usersTitle": "Utilisateurs et permissions (RBAC)",
+  "admin.createUser": "Nouvel utilisateur",
+  "admin.pluginsTitle": "Extensions et scrapers",
+  "admin.webhooksTitle": "Notifications Webhook",
+  "admin.createWebhook": "Ajouter un Webhook"
 }

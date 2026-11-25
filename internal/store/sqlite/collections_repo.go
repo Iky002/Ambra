@@ -27,6 +27,46 @@ type RecommendationCategory struct {
 	CategoryId         string            `json:"CategoryId"`
 }
 
+func (r *LibraryRepo) upsertContainerAncestors(ctx context.Context, rec *ItemRecord) error {
+	if rec == nil || rec.ID == "" {
+		return nil
+	}
+	seen := make(map[string]struct{}, 4)
+	ancestors := make([]AncestorLink, 0, 4)
+	depth := 0
+	addAnc := func(rawID string) {
+		aid := guid.Normalize(rawID)
+		if aid == "" {
+			return
+		}
+		if _, dup := seen[aid]; dup {
+			return
+		}
+		seen[aid] = struct{}{}
+		ancestors = append(ancestors, AncestorLink{AncestorID: aid, Depth: depth})
+		depth++
+	}
+	addAnc(rec.ID)
+	if rec.ParentID != "" {
+		addAnc(rec.ParentID)
+		rows, err := r.store.Reader.QueryContext(ctx,
+			`SELECT ancestor_id FROM item_ancestors WHERE descendant_id = ? ORDER BY depth ASC`,
+			guid.Normalize(rec.ParentID),
+		)
+		if err == nil {
+			for rows.Next() {
+				var aid string
+				if rows.Scan(&aid) == nil {
+					addAnc(aid)
+				}
+			}
+			rows.Close()
+		}
+	}
+	addAnc(rec.LibraryID)
+	return r.ReplaceItemAncestors(ctx, rec.ID, ancestors)
+}
+
 // CreateCollection creates a new BoxSet item and optionally adds initial child items.
 func (r *LibraryRepo) CreateCollection(ctx context.Context, name, parentID string, itemIDs []string) (*ItemRecord, error) {
 	name = strings.TrimSpace(name)
@@ -47,6 +87,9 @@ func (r *LibraryRepo) CreateCollection(ctx context.Context, name, parentID strin
 		DateModified: now,
 	}
 	if err := r.UpsertItem(ctx, rec); err != nil {
+		return nil, err
+	}
+	if err := r.upsertContainerAncestors(ctx, rec); err != nil {
 		return nil, err
 	}
 	_ = r.UpsertSearchFTS(ctx, rec.ID, rec.Name, rec.Name, "", "", "")
@@ -89,6 +132,9 @@ func (r *LibraryRepo) CreatePlaylist(ctx context.Context, name, mediaType, userI
 		DateModified: now,
 	}
 	if err := r.UpsertItem(ctx, rec); err != nil {
+		return nil, err
+	}
+	if err := r.upsertContainerAncestors(ctx, rec); err != nil {
 		return nil, err
 	}
 	_ = r.UpsertSearchFTS(ctx, rec.ID, rec.Name, rec.Name, "", "", "")

@@ -8,19 +8,26 @@ import (
 	"fmt"
 	"image"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sync/singleflight"
 
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
-const maxImageFileSize = 50 << 20 // 50 MiB
+const (
+	maxImageFileSize     = 50 << 20  // 50 MiB
+	defaultMaxCacheBytes = 512 << 20 // 512 MiB
+)
 
 func readLimitedImageFile(path string) ([]byte, error) {
 	f, err := os.Open(path)
@@ -50,19 +57,49 @@ type ImagePayload struct {
 
 // Service serves item artwork with dynamic resizing, disk caching, singleflight deduplication, and strong ETag caching.
 type Service struct {
-	repo         *sqlite.LibraryRepo
-	mu           sync.RWMutex
-	cacheDir     string
-	sf           singleflight.Group
-	processCount atomic.Int64
-	tmpSeq       atomic.Uint64
+	repo             *sqlite.LibraryRepo
+	mu               sync.RWMutex
+	cacheDir         string
+	maxCacheBytes    int64
+	sem              chan struct{}
+	pruneMu          sync.Mutex
+	approxCacheBytes atomic.Int64
+	sf               singleflight.Group
+	processCount     atomic.Int64
+	tmpSeq           atomic.Uint64
 }
 
 func New(repo *sqlite.LibraryRepo) *Service {
-	return &Service{
-		repo:     repo,
-		cacheDir: filepath.Join(os.TempDir(), "ambra-image-cache"),
+	workers := runtime.NumCPU()
+	if workers < 4 {
+		workers = 4
 	}
+	return &Service{
+		repo:          repo,
+		cacheDir:      filepath.Join(os.TempDir(), "ambra-image-cache"),
+		maxCacheBytes: defaultMaxCacheBytes,
+		sem:           make(chan struct{}, workers),
+	}
+}
+
+// WithMaxCacheBytes sets the maximum disk cache size in bytes before LRU/oldest-file pruning triggers.
+func (s *Service) WithMaxCacheBytes(maxBytes int64) *Service {
+	s.mu.Lock()
+	if maxBytes > 0 {
+		s.maxCacheBytes = maxBytes
+	}
+	s.mu.Unlock()
+	return s
+}
+
+// WithMaxConcurrency overrides the maximum concurrent decode/resize worker semaphore size.
+func (s *Service) WithMaxConcurrency(n int) *Service {
+	if n > 0 {
+		s.mu.Lock()
+		s.sem = make(chan struct{}, n)
+		s.mu.Unlock()
+	}
+	return s
 }
 
 // WithCacheDir configures the disk cache directory and returns the Service for chaining.
@@ -105,10 +142,29 @@ func (s *Service) GetImageWithOptions(ctx context.Context, itemID, imageType str
 	if err != nil {
 		return nil, err
 	}
-	return s.getImageFromRecord(rec, opts)
+	return s.getImageFromRecord(ctx, rec, opts)
 }
 
-func (s *Service) getImageFromRecord(rec *sqlite.ImageRecord, opts Options) (*ImagePayload, error) {
+func (s *Service) acquireDecodeSlot(ctx context.Context) (func(), error) {
+	s.mu.RLock()
+	sem := s.sem
+	s.mu.RUnlock()
+	if sem == nil {
+		return func() {}, nil
+	}
+	if ctx == nil {
+		sem <- struct{}{}
+		return func() { <-sem }, nil
+	}
+	select {
+	case sem <- struct{}{}:
+		return func() { <-sem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *Service) getImageFromRecord(ctx context.Context, rec *sqlite.ImageRecord, opts Options) (*ImagePayload, error) {
 	opts = opts.Normalized()
 	if opts.IsZero() {
 		key := fmt.Sprintf("orig:%s:%s:%d:%s", rec.ItemID, strings.ToLower(rec.ImageType), rec.ImageIndex, rec.Tag)
@@ -143,6 +199,12 @@ func (s *Service) getImageFromRecord(rec *sqlite.ImageRecord, opts Options) (*Im
 		if payload, ok := s.readDiskCache(cacheKey, opts, etag); ok {
 			return payload, nil
 		}
+
+		release, err := s.acquireDecodeSlot(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
 
 		rawData, err := readLimitedImageFile(rec.Path)
 		if err != nil {
@@ -206,16 +268,21 @@ func (s *Service) ServeHTTPWithOptions(w http.ResponseWriter, r *http.Request, i
 	}
 
 	if inm := strings.TrimSpace(r.Header.Get("If-None-Match")); inm != "" && (inm == etag || inm == rawTag) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("ETag", etag)
 		w.WriteHeader(http.StatusNotModified)
 		return nil
 	}
 
-	payload, err := s.getImageFromRecord(rec, opts)
+	payload, err := s.getImageFromRecord(r.Context(), rec, opts)
 	if err != nil {
 		return err
 	}
 
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if !isSafeRasterContentType(payload.ContentType) {
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	}
 	w.Header().Set("Content-Type", payload.ContentType)
 	w.Header().Set("ETag", payload.ETag)
 	if tag := r.URL.Query().Get("tag"); tag != "" && tag == rec.Tag {
@@ -327,7 +394,88 @@ func (s *Service) writeDiskCache(cacheKey, contentType string, data []byte) erro
 		_ = os.Remove(tmpPath)
 		return err
 	}
+	s.mu.RLock()
+	limit := s.maxCacheBytes
+	s.mu.RUnlock()
+	if limit > 0 && s.approxCacheBytes.Add(int64(len(data))) > limit {
+		s.PruneCache()
+	}
 	return nil
+}
+
+// PruneCache enforces maxCacheBytes by removing the oldest cached image files until usage is within limit.
+func (s *Service) PruneCache() {
+	s.mu.RLock()
+	dir := s.cacheDir
+	limit := s.maxCacheBytes
+	s.mu.RUnlock()
+	if dir == "" || limit <= 0 {
+		return
+	}
+
+	s.pruneMu.Lock()
+	defer s.pruneMu.Unlock()
+
+	type cacheFile struct {
+		path    string
+		size    int64
+		modTime time.Time
+	}
+	var files []cacheFile
+	var total int64
+	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(d.Name(), ".tmp") {
+			return nil
+		}
+		if info, statErr := d.Info(); statErr == nil {
+			sz := info.Size()
+			total += sz
+			files = append(files, cacheFile{
+				path:    p,
+				size:    sz,
+				modTime: info.ModTime(),
+			})
+		}
+		return nil
+	})
+	if total <= limit {
+		s.approxCacheBytes.Store(total)
+		return
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		if !files[i].modTime.Equal(files[j].modTime) {
+			return files[i].modTime.Before(files[j].modTime)
+		}
+		return files[i].path < files[j].path
+	})
+
+	target := limit * 80 / 100
+	for _, f := range files {
+		if total <= target {
+			break
+		}
+		if err := os.Remove(f.path); err == nil {
+			total -= f.size
+		}
+	}
+	if total < 0 {
+		total = 0
+	}
+	s.approxCacheBytes.Store(total)
+}
+
+func isSafeRasterContentType(ct string) bool {
+	base := strings.ToLower(strings.TrimSpace(strings.SplitN(ct, ";", 2)[0]))
+	switch base {
+	case "image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp", "image/avif":
+		return true
+	default:
+		return false
+	}
 }
 
 func contentTypeForImage(path string, data []byte) string {
@@ -340,7 +488,15 @@ func contentTypeForImage(path string, data []byte) string {
 		return "image/webp"
 	case ".gif":
 		return "image/gif"
+	case ".bmp":
+		return "image/bmp"
+	case ".avif":
+		return "image/avif"
 	default:
-		return http.DetectContentType(data)
+		detected := http.DetectContentType(data)
+		if isSafeRasterContentType(detected) {
+			return detected
+		}
+		return "application/octet-stream"
 	}
 }

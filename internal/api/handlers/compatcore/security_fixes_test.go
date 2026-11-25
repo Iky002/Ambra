@@ -238,16 +238,18 @@ func TestUserAvatarXSSProtection(t *testing.T) {
 
 type fakeWSSender struct {
 	sent []struct {
+		userID   string
 		deviceID string
 		msg      ws.Message
 	}
 }
 
-func (f *fakeWSSender) SendToDevice(deviceID string, msg ws.Message) {
+func (f *fakeWSSender) SendToUserDevice(userID, deviceID string, msg ws.Message) {
 	f.sent = append(f.sent, struct {
+		userID   string
 		deviceID string
 		msg      ws.Message
-	}{deviceID: deviceID, msg: msg})
+	}{userID: userID, deviceID: deviceID, msg: msg})
 }
 
 func TestSessionRemoteControlWSForwardingAndRBAC(t *testing.T) {

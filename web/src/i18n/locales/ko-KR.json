@@ -28,7 +28,6 @@
   "common.copy": "복사",
   "common.copied": "복사됨",
   "common.language": "표시 언어",
-
   "nav.home": "홈",
   "nav.trending": "인기",
   "nav.collections": "컬렉션",
@@ -50,7 +49,6 @@
   "nav.demoDesc": "(프론트엔드 메모리 시뮬레이션, 백엔드 불필요 · 모든 변경 즉시 반영)",
   "nav.demoSwitchGuest": "관리자 보기 · 일반 사용자로 전환해 RBAC 체험",
   "nav.demoSwitchAdmin": "일반 사용자 보기 · 관리자 콘솔로 돌아가기",
-
   "auth.loginTitle": "Ambra 로그인",
   "auth.loginSubtitle": "개인 시네마 서버에 연결하세요",
   "auth.username": "사용자 이름",
@@ -65,7 +63,6 @@
   "auth.noAdminDesc": "현재 계정에는 관리자 권한(IsAdministrator = false)이 없습니다. 서버 설정, 사용자 또는 라이브러리를 관리하려면 시스템 관리자에게 문의하세요.",
   "auth.backHome": "홈으로 돌아가기",
   "auth.verifyingAdmin": "관리자 권한 확인 중...",
-
   "setup.title": "Ambra에 오신 것을 환영합니다",
   "setup.subtitle": "몇 단계만으로 개인 시네마 서버를 초기 설정하세요",
   "setup.serverName": "서버 이름",
@@ -73,7 +70,6 @@
   "setup.tmdbLanguage": "메타데이터 언어",
   "setup.createAdmin": "관리자 계정 생성",
   "setup.complete": "초기 설정 완료",
-
   "home.continueWatching": "이어서 보기",
   "home.nextUp": "다음 재생",
   "home.myMedia": "내 미디어",
@@ -88,7 +84,6 @@
   "home.emptyTitle": "라이브러리가 비어 있습니다",
   "home.emptyDesc": "관리자 콘솔에서 로컬 미디어 폴더 또는 .strm 디렉터리를 추가하고 첫 스캔을 실행하세요.",
   "home.goManageLibraries": "라이브러리 추가",
-
   "library.allItems": "전체",
   "library.albums": "앨범",
   "library.artists": "아티스트",
@@ -111,7 +106,6 @@
   "library.exitMultiSelect": "선택 종료",
   "library.selectedCount": "{{count}}개 선택됨",
   "library.emptyResult": "조건에 맞는 항목이 없습니다",
-
   "detail.play": "재생",
   "detail.resume": "이어서 재생",
   "detail.favorite": "즐겨찾기",
@@ -146,7 +140,6 @@
   "detail.container": "컨테이너 형식",
   "detail.fileSize": "파일 크기",
   "detail.bitrate": "총 비트레이트",
-
   "player.quality": "화질",
   "player.qualityAuto": "원본 직접 재생",
   "player.version": "버전",
@@ -163,33 +156,27 @@
   "player.playNextNow": "지금 재생",
   "player.cancelNextUp": "취소",
   "player.loadError": "비디오 스트림을 디코딩하거나 불러오지 못했습니다. 미디어 형식 또는 네트워크 연결을 확인하세요.",
-
   "collections.title": "컬렉션 및 재생목록",
   "collections.boxSets": "컬렉션",
   "collections.playlists": "재생목록",
   "collections.createCollection": "새 컬렉션",
   "collections.createPlaylist": "새 재생목록",
   "collections.playAll": "모두 재생",
-
   "favorites.title": "즐겨찾기",
   "favorites.emptyTitle": "즐겨찾기한 항목이 없습니다",
   "favorites.emptyDesc": "영화, 시리즈 또는 음악 페이지에서 즐겨찾기 버튼을 눌러 여기에 추가하세요.",
-
   "trending.title": "인기 차트",
   "trending.subtitle": "TMDB 트렌드, 더우반 인기, IMDb Top 250을 한눈에 모아 라이브러리 작품으로 바로 이동",
   "trending.refreshNow": "차트 지금 동기화",
   "trending.inLibrary": "라이브러리 보유",
-
   "livetv.title": "실시간 TV",
   "livetv.channels": "채널 목록",
   "livetv.guide": "편성표",
   "livetv.recordings": "녹화 목록",
   "livetv.timers": "녹화 예약",
-
   "search.title": "탐색 및 검색",
   "search.placeholder": "제목, 원제 또는 배우 이름을 입력하세요...",
   "search.noResults": "일치하는 영화, 시리즈 또는 인물을 찾을 수 없습니다",
-
   "profile.title": "프로필",
   "profile.uiLanguage": "인터페이스 언어",
   "profile.uiLanguageDesc": "웹 클라이언트 표시 언어를 변경하고 서버에 언어 설정을 동기화합니다",
@@ -197,11 +184,9 @@
   "profile.avatar": "프로필 사진",
   "profile.quickConnect": "Quick Connect 기기 인증",
   "profile.playbackPrefs": "재생 환경설정",
-
   "notifications.title": "알림 센터",
   "notifications.markAllRead": "모두 읽음 표시",
   "notifications.empty": "알림이 없습니다",
-
   "admin.title": "관리자 콘솔",
   "admin.tabDashboard": "대시보드",
   "admin.tabLibraries": "라이브러리",
@@ -220,5 +205,20 @@
   "admin.serverLogs": "서버 로그",
   "admin.downloadLog": "로그 다운로드",
   "admin.kickDevice": "기기 연결 해제",
-  "admin.revokeKey": "키 폐기"
+  "admin.revokeKey": "키 폐기",
+  "player.cannotPlayTitle": "이 미디어를 재생할 수 없습니다",
+  "player.retryPlayback": "재생 재시도",
+  "player.goBack": "뒤로 가기",
+  "player.subtitleOff": "자막 끄기",
+  "player.subtitleTweaks": "자막 미세 조정",
+  "player.loadingStream": "미디어 스트림 로딩 중...",
+  "player.buffering": "버퍼링 중...",
+  "admin.scanAllLibraries": "전체 라이브러리 스캔",
+  "admin.scanningAllLibraries": "라이브러리 스캔 시작 중...",
+  "admin.dashboardOverview": "서버 상태 개요",
+  "admin.usersTitle": "사용자 및 권한 관리 (RBAC)",
+  "admin.createUser": "새 사용자",
+  "admin.pluginsTitle": "플러그인 및 스크래퍼 관리",
+  "admin.webhooksTitle": "Webhook 이벤트 알림",
+  "admin.createWebhook": "Webhook 추가"
 }

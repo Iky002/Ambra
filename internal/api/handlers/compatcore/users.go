@@ -286,6 +286,21 @@ func (h *Handler) forgotPasswordPin(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if matched == nil {
+		// Increment global per-PIN attempt counter regardless of client IP;
+		// destroy any active PIN immediately once it accumulates 5 failed guesses.
+		for k, e := range h.forgotPins {
+			e.Attempts++
+			if e.Attempts >= forgotPinMaxAttempts {
+				if e.PinFile != "" {
+					filesToClean = append(filesToClean, e.PinFile)
+				}
+				delete(h.forgotPins, k)
+			} else {
+				h.forgotPins[k] = e
+			}
+		}
+	}
 	h.mu.Unlock()
 
 	for _, f := range filesToClean {
@@ -301,8 +316,8 @@ func (h *Handler) forgotPasswordPin(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		h.revokeAndDisconnectUser(r.Context(), matched.UserID)
 		if h.userRepo != nil {
-			_ = h.userRepo.DeleteTokensByUser(r.Context(), matched.UserID)
 			_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
 				Name:     fmt.Sprintf("Password reset via PIN for %s", matched.UserName),
 				Type:     "UserPasswordChanged",
@@ -325,18 +340,47 @@ func (h *Handler) forgotPasswordPin(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	ip := netutil.ClientIP(r)
+	uid := h.resolveUserID(r, "Id")
+
 	h.mu.Lock()
 	if h.authByIDRates == nil {
 		h.authByIDRates = make(map[string][]time.Time)
 	}
-	if !h.checkIPRateLimit(h.authByIDRates, ip, now, authByIDRateWindow, authByIDRateLimit) {
+	if h.authByIDUserRates == nil {
+		h.authByIDUserRates = make(map[string][]time.Time)
+	}
+	cutoff := now.Add(-authByIDRateWindow)
+	pruneBucket := func(bucket map[string][]time.Time) {
+		for k, ts := range bucket {
+			kept := ts[:0]
+			for _, t := range ts {
+				if t.After(cutoff) {
+					kept = append(kept, t)
+				}
+			}
+			if len(kept) == 0 {
+				delete(bucket, k)
+			} else {
+				bucket[k] = kept
+			}
+		}
+	}
+	pruneBucket(h.authByIDRates)
+	pruneBucket(h.authByIDUserRates)
+	if (ip != "" && len(h.authByIDRates[ip]) >= authByIDRateLimit) ||
+		(uid != "" && len(h.authByIDUserRates[uid]) >= authByIDRateLimit) {
 		h.mu.Unlock()
 		httpx.Error(w, http.StatusTooManyRequests, "too many authentication attempts")
 		return
 	}
+	if ip != "" {
+		h.authByIDRates[ip] = append(h.authByIDRates[ip], now)
+	}
+	if uid != "" {
+		h.authByIDUserRates[uid] = append(h.authByIDUserRates[uid], now)
+	}
 	h.mu.Unlock()
 
-	uid := h.resolveUserID(r, "Id")
 	if h.userRepo == nil || uid == "" {
 		writeJSONError(w, r, http.StatusUnauthorized, "invalid username or password")
 		return
@@ -625,6 +669,35 @@ func (h *Handler) getUserPrefixes(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, out)
 }
 
+func (h *Handler) disconnectUserSessions(userID string) {
+	norm := guid.Normalize(userID)
+	if norm == "" {
+		return
+	}
+	if h.sessions != nil {
+		h.sessions.RemoveSessionsByUser(norm)
+	}
+	if h.wsHub != nil {
+		if disc, ok := h.wsHub.(interface{ DisconnectUser(string) }); ok {
+			disc.DisconnectUser(norm)
+		}
+	}
+}
+
+func (h *Handler) revokeAndDisconnectUser(ctx context.Context, userID string) {
+	norm := guid.Normalize(userID)
+	if norm == "" {
+		return
+	}
+	if h.authSvc != nil {
+		_ = h.authSvc.RevokeUserTokens(ctx, norm)
+		h.authSvc.InvalidateUserCache(norm)
+	} else if h.userRepo != nil {
+		_ = h.userRepo.DeleteTokensByUser(ctx, norm)
+	}
+	h.disconnectUserSessions(norm)
+}
+
 func (h *Handler) updateUser(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "Id")
 	if !h.canModifyUser(r, uid) {
@@ -684,9 +757,23 @@ func (h *Handler) updateUser(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if body.Policy != nil {
-		if err := h.userRepo.UpdateUserPolicy(r.Context(), u.ID, *body.Policy); err != nil {
+		wasAdmin := u.IsAdmin || u.Policy.IsAdministrator
+		if err := h.userRepo.UpdateUserPolicySafe(r.Context(), u.ID, *body.Policy); err != nil {
+			if errors.Is(err, sqlite.ErrLastAdmin) {
+				httpx.Error(w, http.StatusBadRequest, "cannot revoke or disable the last administrator")
+				return
+			}
+			if errors.Is(err, sqlite.ErrNotFound) {
+				writeJSONError(w, r, http.StatusNotFound, "user not found")
+				return
+			}
 			httpx.Error(w, http.StatusInternalServerError, "failed to update user policy")
 			return
+		}
+		if body.Policy.IsDisabled {
+			h.revokeAndDisconnectUser(r.Context(), u.ID)
+		} else if wasAdmin && !body.Policy.IsAdministrator {
+			h.disconnectUserSessions(u.ID)
 		}
 	}
 	if h.authSvc != nil {
@@ -705,7 +792,11 @@ func (h *Handler) deleteUser(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, r, http.StatusNotFound, "user not found")
 		return
 	}
-	if err := h.userRepo.DeleteUser(r.Context(), uid); err != nil {
+	if err := h.userRepo.DeleteUserSafe(r.Context(), uid); err != nil {
+		if errors.Is(err, sqlite.ErrLastAdmin) {
+			httpx.Error(w, http.StatusBadRequest, "cannot delete the last administrator")
+			return
+		}
 		if errors.Is(err, sqlite.ErrNotFound) {
 			writeJSONError(w, r, http.StatusNotFound, "user not found")
 			return
@@ -713,9 +804,7 @@ func (h *Handler) deleteUser(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "failed to delete user")
 		return
 	}
-	if h.authSvc != nil {
-		h.authSvc.InvalidateUserCache(uid)
-	}
+	h.revokeAndDisconnectUser(r.Context(), uid)
 	httpx.NoContent(w)
 }
 
@@ -810,7 +899,26 @@ func (h *Handler) copyUserData(w http.ResponseWriter, r *http.Request) {
 					_ = h.userRepo.UpdateUserConfig(r.Context(), tid, src.Config)
 				}
 				if copyPolicy {
-					_ = h.userRepo.UpdateUserPolicy(r.Context(), tid, src.Policy)
+					wasAdmin := false
+					if existing, getErr := h.userRepo.GetUserByID(r.Context(), tid); getErr == nil && existing != nil {
+						wasAdmin = existing.IsAdmin || existing.Policy.IsAdministrator
+					}
+					if err := h.userRepo.UpdateUserPolicySafe(r.Context(), tid, src.Policy); err != nil {
+						if errors.Is(err, sqlite.ErrLastAdmin) {
+							httpx.Error(w, http.StatusBadRequest, "cannot revoke or disable the last administrator")
+							return
+						}
+						if !errors.Is(err, sqlite.ErrNotFound) {
+							httpx.Error(w, http.StatusInternalServerError, "failed to update target user policy")
+							return
+						}
+					} else {
+						if src.Policy.IsDisabled {
+							h.revokeAndDisconnectUser(r.Context(), tid)
+						} else if wasAdmin && !src.Policy.IsAdministrator {
+							h.disconnectUserSessions(tid)
+						}
+					}
 				}
 				if h.authSvc != nil {
 					h.authSvc.InvalidateUserCache(tid)
@@ -857,8 +965,15 @@ func (h *Handler) postUserSearchedItems(w http.ResponseWriter, r *http.Request) 
 		writeJSONError(w, r, http.StatusForbidden, "forbidden")
 		return
 	}
+	if r.ContentLength > maxKVJSONBodyBytes {
+		httpx.Error(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
 	var payload map[string]any
-	_ = decodeOptionalJSON(r, &payload)
+	if err := decodeOptionalJSONLimit(r, &payload, maxKVJSONBodyBytes); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid or oversized request body")
+		return
+	}
 	key := "user_searched_items:" + uid
 	var items []map[string]any
 	_, _ = h.loadKV(r.Context(), key, &items)
@@ -867,8 +982,8 @@ func (h *Handler) postUserSearchedItems(w http.ResponseWriter, r *http.Request) 
 	}
 	payload["SearchedAt"] = time.Now().UTC().Format(time.RFC3339)
 	items = append(items, payload)
-	if len(items) > 50 {
-		items = items[len(items)-50:]
+	if len(items) > maxSearchedItemsEntries {
+		items = items[len(items)-maxSearchedItemsEntries:]
 	}
 	_ = h.saveKV(r.Context(), key, items)
 	httpx.NoContent(w)
@@ -939,8 +1054,12 @@ func (h *Handler) postUserHomeSections(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, r, http.StatusForbidden, "forbidden")
 		return
 	}
+	if r.ContentLength > maxKVJSONBodyBytes {
+		httpx.Error(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
 	var sec homeSection
-	if err := decodeOptionalJSON(r, &sec); err != nil {
+	if err := decodeOptionalJSONLimit(r, &sec, maxKVJSONBodyBytes); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -964,6 +1083,10 @@ func (h *Handler) postUserHomeSections(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !replaced {
+		if len(sections) >= maxHomeSectionsEntries {
+			httpx.Error(w, http.StatusBadRequest, "home sections limit reached")
+			return
+		}
 		sec.SortOrder = len(sections)
 		sections = append(sections, sec)
 	}
@@ -1162,6 +1285,83 @@ func (h *Handler) preferredGenresForUser(ctx context.Context, uid string, allowe
 	return out
 }
 
+func (h *Handler) isPlaylistPublic(ctx context.Context, playlistID string) bool {
+	normID := guid.Normalize(playlistID)
+	if normID == "" {
+		return false
+	}
+	var vis struct {
+		IsPublic bool `json:"IsPublic"`
+	}
+	ok, err := h.loadKV(ctx, "item_visibility_"+normID, &vis)
+	return err == nil && ok && vis.IsPublic
+}
+
+func (h *Handler) canViewPlaylist(r *http.Request, playlistID, parentID string) bool {
+	if h.isCallerAdmin(r) {
+		return true
+	}
+	ownerID := guid.Normalize(parentID)
+	if ownerID == "" || h.isPlaylistPublic(r.Context(), playlistID) {
+		return true
+	}
+	callerID := h.callerUserID(r)
+	return callerID != "" && callerID == ownerID
+}
+
+func (h *Handler) hiddenPrivatePlaylistIDs(r *http.Request) []string {
+	if h.isCallerAdmin(r) {
+		return nil
+	}
+	store := h.store
+	if store == nil && h.userRepo != nil {
+		store = h.userRepo.Store()
+	}
+	if store == nil {
+		return nil
+	}
+	rows, err := store.Reader.QueryContext(r.Context(), `SELECT id, COALESCE(parent_id, '') FROM items WHERE LOWER(type) = 'playlist'`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var hidden []string
+	for rows.Next() {
+		var id, parentID string
+		if err := rows.Scan(&id, &parentID); err != nil {
+			continue
+		}
+		if !h.canViewPlaylist(r, id, parentID) {
+			hidden = append(hidden, id)
+		}
+	}
+	return hidden
+}
+
+func (h *Handler) filterVisiblePlaylists(r *http.Request, items []dto.BaseItemDto) ([]dto.BaseItemDto, int) {
+	if h.isCallerAdmin(r) || len(items) == 0 {
+		return items, 0
+	}
+	out := make([]dto.BaseItemDto, 0, len(items))
+	removed := 0
+	for _, it := range items {
+		if strings.EqualFold(it.Type, "Playlist") {
+			parentID := it.ParentId
+			if parentID == "" && h.libRepo != nil {
+				if rec, err := h.libRepo.GetItemRecordByID(r.Context(), it.Id); err == nil && rec != nil {
+					parentID = rec.ParentID
+				}
+			}
+			if !h.canViewPlaylist(r, it.Id, parentID) {
+				removed++
+				continue
+			}
+		}
+		out = append(out, it)
+	}
+	return out, removed
+}
+
 func (h *Handler) getUserSectionItems(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
 	if !h.canModifyUser(r, uid) {
@@ -1188,6 +1388,7 @@ func (h *Handler) getUserSectionItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	allowedLibs, maxRating, blockedTags := h.userPolicyForRequest(r, uid)
+	hiddenPlaylists := h.hiddenPrivatePlaylistIDs(r)
 	sectionID := strings.ToLower(strings.TrimSpace(chi.URLParam(r, "SectionId")))
 	parentID := guid.Normalize(q.Get("ParentId"))
 	includeTypes := q.List("IncludeItemTypes")
@@ -1211,6 +1412,7 @@ func (h *Handler) getUserSectionItems(w http.ResponseWriter, r *http.Request) {
 			ParentID:          parentID,
 			Recursive:         true,
 			IncludeItemTypes:  includeTypes,
+			ExcludeItemIDs:    hiddenPlaylists,
 			AllowedLibraryIDs: allowedLibs,
 			MaxParentalRating: maxRating,
 			BlockedTags:       blockedTags,
@@ -1228,6 +1430,7 @@ func (h *Handler) getUserSectionItems(w http.ResponseWriter, r *http.Request) {
 			ParentID:          parentID,
 			Recursive:         true,
 			IncludeItemTypes:  includeTypes,
+			ExcludeItemIDs:    hiddenPlaylists,
 			AllowedLibraryIDs: allowedLibs,
 			MaxParentalRating: maxRating,
 			BlockedTags:       blockedTags,
@@ -1261,6 +1464,7 @@ func (h *Handler) getUserSectionItems(w http.ResponseWriter, r *http.Request) {
 			ParentID:          parentID,
 			Recursive:         true,
 			IncludeItemTypes:  includeTypes,
+			ExcludeItemIDs:    hiddenPlaylists,
 			AllowedLibraryIDs: allowedLibs,
 			MaxParentalRating: maxRating,
 			BlockedTags:       blockedTags,
@@ -1275,6 +1479,17 @@ func (h *Handler) getUserSectionItems(w http.ResponseWriter, r *http.Request) {
 	}
 	if items == nil {
 		items = []dto.BaseItemDto{}
+	}
+	var removed int
+	items, removed = h.filterVisiblePlaylists(r, items)
+	if removed > 0 {
+		total -= removed
+		if total < 0 {
+			total = 0
+		}
+	}
+	if !h.isCallerAdmin(r) {
+		dto.SanitizeItemPathsSlice(items)
 	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{Items: items, TotalRecordCount: total})
 }
@@ -1306,6 +1521,7 @@ func (h *Handler) getUserSuggestions(w http.ResponseWriter, r *http.Request) {
 	}
 	itemTypes := q.List("Type")
 	allowedLibs, maxRating, blockedTags := h.userPolicyForRequest(r, uid)
+	hiddenPlaylists := h.hiddenPrivatePlaylistIDs(r)
 	unplayed := true
 
 	preferredGenres := h.preferredGenresForUser(r.Context(), uid, allowedLibs, maxRating, blockedTags)
@@ -1316,6 +1532,7 @@ func (h *Handler) getUserSuggestions(w http.ResponseWriter, r *http.Request) {
 			UserID:            uid,
 			Recursive:         true,
 			IncludeItemTypes:  itemTypes,
+			ExcludeItemIDs:    hiddenPlaylists,
 			AllowedLibraryIDs: allowedLibs,
 			MaxParentalRating: maxRating,
 			BlockedTags:       blockedTags,
@@ -1341,6 +1558,7 @@ func (h *Handler) getUserSuggestions(w http.ResponseWriter, r *http.Request) {
 				UserID:            uid,
 				Recursive:         true,
 				IncludeItemTypes:  itemTypes,
+				ExcludeItemIDs:    hiddenPlaylists,
 				AllowedLibraryIDs: allowedLibs,
 				MaxParentalRating: maxRating,
 				BlockedTags:       blockedTags,
@@ -1358,6 +1576,7 @@ func (h *Handler) getUserSuggestions(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		merged, _ = h.filterVisiblePlaylists(r, merged)
 		total := len(merged)
 		if startIndex > total {
 			startIndex = total
@@ -1366,7 +1585,11 @@ func (h *Handler) getUserSuggestions(w http.ResponseWriter, r *http.Request) {
 		if end > total {
 			end = total
 		}
-		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{Items: merged[startIndex:end], TotalRecordCount: total})
+		page := merged[startIndex:end]
+		if !h.isCallerAdmin(r) {
+			dto.SanitizeItemPathsSlice(page)
+		}
+		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{Items: page, TotalRecordCount: total})
 		return
 	}
 
@@ -1375,6 +1598,7 @@ func (h *Handler) getUserSuggestions(w http.ResponseWriter, r *http.Request) {
 		UserID:            uid,
 		Recursive:         true,
 		IncludeItemTypes:  itemTypes,
+		ExcludeItemIDs:    hiddenPlaylists,
 		AllowedLibraryIDs: allowedLibs,
 		MaxParentalRating: maxRating,
 		BlockedTags:       blockedTags,
@@ -1394,6 +1618,7 @@ func (h *Handler) getUserSuggestions(w http.ResponseWriter, r *http.Request) {
 			UserID:            uid,
 			Recursive:         true,
 			IncludeItemTypes:  itemTypes,
+			ExcludeItemIDs:    hiddenPlaylists,
 			AllowedLibraryIDs: allowedLibs,
 			MaxParentalRating: maxRating,
 			BlockedTags:       blockedTags,
@@ -1409,6 +1634,17 @@ func (h *Handler) getUserSuggestions(w http.ResponseWriter, r *http.Request) {
 	}
 	if items == nil {
 		items = []dto.BaseItemDto{}
+	}
+	var removed int
+	items, removed = h.filterVisiblePlaylists(r, items)
+	if removed > 0 {
+		total -= removed
+		if total < 0 {
+			total = 0
+		}
+	}
+	if !h.isCallerAdmin(r) {
+		dto.SanitizeItemPathsSlice(items)
 	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{Items: items, TotalRecordCount: total})
 }
@@ -1525,7 +1761,11 @@ func (h *Handler) canAccessItem(r *http.Request, targetUID, itemID string) bool 
 		return false
 	}
 	allowedLibs, maxRating, blockedTags := h.userPolicyForRequest(r, targetUID)
-	if !isLibraryAllowed(rec.LibraryID, allowedLibs) {
+	if strings.EqualFold(rec.Type, "Playlist") {
+		if !h.canViewPlaylist(r, rec.ID, rec.ParentID) {
+			return false
+		}
+	} else if !isLibraryAllowed(rec.LibraryID, allowedLibs) {
 		return false
 	}
 	if blocked, bErr := h.libRepo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags); bErr != nil || blocked {
@@ -1555,7 +1795,12 @@ func (h *Handler) serveUserItemExtras(w http.ResponseWriter, r *http.Request, ex
 		return
 	}
 	allowedLibs, maxRating, blockedTags := h.userPolicyForRequest(r, uid)
-	if !isLibraryAllowed(rec.LibraryID, allowedLibs) {
+	if strings.EqualFold(rec.Type, "Playlist") {
+		if !h.canViewPlaylist(r, rec.ID, rec.ParentID) {
+			writeJSONError(w, r, http.StatusForbidden, "access denied")
+			return
+		}
+	} else if !isLibraryAllowed(rec.LibraryID, allowedLibs) {
 		writeJSONError(w, r, http.StatusForbidden, "access denied")
 		return
 	}
@@ -1570,6 +1815,9 @@ func (h *Handler) serveUserItemExtras(w http.ResponseWriter, r *http.Request, ex
 	}
 	if items == nil {
 		items = []dto.BaseItemDto{}
+	}
+	if !h.isCallerAdmin(r) {
+		dto.SanitizeItemPathsSlice(items)
 	}
 	httpx.JSON(w, http.StatusOK, items)
 }

@@ -12,10 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
-	"net/netip"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -110,38 +107,25 @@ func sanitizeWebhookConfig(wh WebhookConfig) WebhookConfig {
 }
 
 func (h *Handler) validateWebhookURL(rawURL string) error {
-	if err := netutil.ValidateRemoteURL(rawURL, true); err != nil {
-		return err
-	}
 	if h.isCustomHTTPClient() {
-		return nil
+		return netutil.ValidateRemoteURL(rawURL, true)
 	}
-	u, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil {
-		return err
-	}
-	host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(u.Hostname()), "."))
-	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
-		return fmt.Errorf("blocked loopback hostname %q", host)
-	}
-	if addr, err := netip.ParseAddr(host); err == nil {
-		if addr.Unmap().IsLoopback() {
-			return fmt.Errorf("blocked loopback address %s", addr.Unmap())
+	return netutil.ValidateRemoteURLNoLoopback(rawURL, true)
+}
+
+func sanitizeWebhookPayloadData(data any) any {
+	switch v := data.(type) {
+	case Party:
+		return sanitizePartyForEvent(v)
+	case *Party:
+		if v == nil {
+			return nil
 		}
-		return nil
+		cp := sanitizePartyForEvent(*v)
+		return &cp
+	default:
+		return data
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-	if err != nil {
-		return err
-	}
-	for _, ia := range ips {
-		if addr, ok := netip.AddrFromSlice(ia.IP); ok && addr.Unmap().IsLoopback() {
-			return fmt.Errorf("host %q resolved to loopback address %s", host, addr.Unmap())
-		}
-	}
-	return nil
 }
 
 func (h *Handler) dispatchWebhooks(ctx context.Context, e eventbus.Event) {
@@ -166,7 +150,7 @@ func (h *Handler) dispatchWebhooks(ctx context.Context, e eventbus.Event) {
 		Event:     string(e.Type),
 		ServerId:  h.serverID(),
 		Timestamp: time.Now().UTC(),
-		Data:      e.Payload,
+		Data:      sanitizeWebhookPayloadData(e.Payload),
 	}
 	for _, wh := range targets {
 		select {
@@ -210,7 +194,7 @@ func (h *Handler) sendWebhook(ctx context.Context, wh WebhookConfig, payload Web
 		return 0, err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	return resp.StatusCode, nil
 }
 

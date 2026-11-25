@@ -1,11 +1,17 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg'
-import { toBlobURL } from '@ffmpeg/util'
 
 /** localStorage 键：是否优先启用客户端 WASM 解复用/转封装 */
 export const WASM_REMUX_PREF_KEY = 'ambra_player_prefer_wasm_remux'
 
 /** 默认安全文件大小上限（150 MB），防止浏览器 WASM 内存溢出 */
 export const DEFAULT_WASM_MAX_BYTES = 150 * 1024 * 1024
+
+/** 固定版本 @ffmpeg/core 资产 SHA-256 摘要（用于公网 CDN 完整性校验） */
+export const FFMPEG_CORE_VERSION = '0.12.6'
+export const FFMPEG_CORE_SHA256 = {
+  'ffmpeg-core.js': 'c972f5abeafcd5f3949e54edfbdc74a9badb27025809feb1945d468ffbcfb7f1',
+  'ffmpeg-core.wasm': '2390efa7fb66e7e42dbae15427571a5ffc96b829480904c30f471f0a78967f61',
+} as const
 
 /** 默认加载与转封装超时时间（本地自托管快速探测，CDN 缩短超时避免卡死 25 秒） */
 const LOCAL_CORE_BASE = '/web/ffmpeg'
@@ -18,8 +24,8 @@ const DEFAULT_REMUX_TIMEOUT_MS = 120_000
  */
 const SINGLE_THREAD_CORE_BASES = [
   LOCAL_CORE_BASE,
-  'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm',
-  'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm',
+  `https://unpkg.com/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/esm`,
+  `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/esm`,
 ]
 
 /** 浏览器原生 <video> 通常无法直连的封装容器 */
@@ -72,6 +78,7 @@ export type WasmFallbackReason =
   | 'aborted'
   | 'fetch_failed'
   | 'load_failed'
+  | 'integrity_failed'
   | 'exec_failed'
 
 export class WasmRemuxFallbackError extends Error {
@@ -219,6 +226,113 @@ export function formatBytes(bytes: number): string {
   return `${val >= 100 || idx === 0 ? val.toFixed(0) : val.toFixed(1)} ${units[idx]}`
 }
 
+/** 计算 ArrayBuffer 的小写十六进制 SHA-256 摘要 */
+export async function computeSha256Hex(buffer: ArrayBuffer): Promise<string> {
+  if (typeof crypto === 'undefined' || typeof crypto.subtle?.digest !== 'function') {
+    throw new WasmRemuxFallbackError(
+      'integrity_failed',
+      '当前运行环境不支持 Web Crypto SHA-256 校验，拒绝加载未校验的远端 WASM 资产',
+    )
+  }
+  const digest = await crypto.subtle.digest('SHA-256', buffer)
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+function isHtmlPayload(bytes: Uint8Array): boolean {
+  let i = 0
+  while (i < bytes.byteLength && (bytes[i] === 0x20 || bytes[i] === 0x09 || bytes[i] === 0x0a || bytes[i] === 0x0d)) {
+    i++
+  }
+  if (i >= bytes.byteLength) return false
+  return bytes[i] === 0x3c // '<'
+}
+
+function hasWasmMagic(bytes: Uint8Array): boolean {
+  return (
+    bytes.byteLength >= 4 &&
+    bytes[0] === 0x00 &&
+    bytes[1] === 0x61 &&
+    bytes[2] === 0x73 &&
+    bytes[3] === 0x6d
+  )
+}
+
+/**
+ * 拉取 FFmpeg Core JS/WASM 资产并校验 HTTP 状态、非 HTML Content-Type、WASM 魔数以及 SHA-256 完整性，
+ * 通过校验后再创建可执行的 Blob URL。
+ */
+export async function fetchVerifiedCoreBlobUrl(
+  url: string,
+  mimeType: 'text/javascript' | 'application/wasm',
+  opts?: {
+    expectedSha256?: string
+    signal?: AbortSignal
+  },
+): Promise<string> {
+  let res: Response
+  try {
+    res = await fetch(url, { method: 'GET', signal: opts?.signal })
+  } catch (err) {
+    if (opts?.signal?.aborted) {
+      throw new WasmRemuxFallbackError('aborted', '已取消 WASM 核心资产加载')
+    }
+    const msg = err instanceof Error ? err.message : '网络请求失败'
+    throw new WasmRemuxFallbackError('load_failed', `拉取 WASM 资产失败 (${url}): ${msg}`)
+  }
+
+  if (!res.ok) {
+    throw new WasmRemuxFallbackError('load_failed', `WASM 资产返回 HTTP ${res.status}: ${url}`)
+  }
+
+  const contentType = (res.headers.get('content-type') || '').toLowerCase()
+  if (contentType.includes('text/html') || contentType.includes('application/xhtml')) {
+    throw new WasmRemuxFallbackError(
+      'load_failed',
+      `WASM 资产返回无效 HTML 响应 (${contentType}): ${url}`,
+    )
+  }
+
+  const arrayBuffer = await res.arrayBuffer()
+  const bytes = new Uint8Array(arrayBuffer)
+  if (bytes.byteLength === 0) {
+    throw new WasmRemuxFallbackError('load_failed', `WASM 资产内容为空: ${url}`)
+  }
+
+  if (mimeType === 'application/wasm' && !hasWasmMagic(bytes)) {
+    throw new WasmRemuxFallbackError('load_failed', `无效的 WebAssembly 二进制魔数: ${url}`)
+  }
+  if (mimeType === 'text/javascript' && isHtmlPayload(bytes)) {
+    throw new WasmRemuxFallbackError('load_failed', `WASM 脚本内容疑似 HTML 回退页: ${url}`)
+  }
+
+  if (opts?.expectedSha256) {
+    const actualSha256 = await computeSha256Hex(arrayBuffer)
+    if (actualSha256 !== opts.expectedSha256.toLowerCase()) {
+      throw new WasmRemuxFallbackError(
+        'integrity_failed',
+        `WASM 资产 SHA-256 完整性校验失败 (${url})`,
+      )
+    }
+  }
+
+  const blob = new Blob([arrayBuffer], { type: mimeType })
+  return URL.createObjectURL(blob)
+}
+
+function resolveExpectedCoreSha256(
+  base: string,
+  assetName: keyof typeof FFMPEG_CORE_SHA256,
+): string | undefined {
+  if (base.startsWith('/')) {
+    // 同源本地自托管 /web/ffmpeg 允许管理员替换自定义编译版本，由 HTTP 状态 + MIME + 魔数校验
+    return undefined
+  }
+  // 远端公网 CDN 强校验固定版本 SHA-256
+  return FFMPEG_CORE_SHA256[assetName]
+}
+
 function mergeAbortSignals(a?: AbortSignal, b?: AbortSignal): AbortSignal | undefined {
   if (!a) return b
   if (!b) return a
@@ -299,22 +413,29 @@ export class WasmRemuxer {
         }
         const isLocalBase = base.startsWith('/')
         const loadTimeoutMs = isLocalBase ? DEFAULT_LOCAL_LOAD_TIMEOUT_MS : DEFAULT_CDN_LOAD_TIMEOUT_MS
+        const pendingBlobUrls: string[] = []
         try {
           opts?.onProgress?.(
             'init',
             35,
-            isLocalBase ? '正在加载本地离线 WASM 核心...' : '正在加载单线程 WASM 核心...',
+            isLocalBase ? '正在加载本地离线 WASM 核心...' : '正在加载并校验单线程 WASM 核心...',
           )
           const [coreURL, wasmURL] = await withTimeout(
             Promise.all([
-              toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript'),
-              toBlobURL(`${base}/ffmpeg-core.wasm`, 'application/wasm'),
+              fetchVerifiedCoreBlobUrl(`${base}/ffmpeg-core.js`, 'text/javascript', {
+                expectedSha256: resolveExpectedCoreSha256(base, 'ffmpeg-core.js'),
+                signal: opts?.signal,
+              }),
+              fetchVerifiedCoreBlobUrl(`${base}/ffmpeg-core.wasm`, 'application/wasm', {
+                expectedSha256: resolveExpectedCoreSha256(base, 'ffmpeg-core.wasm'),
+                signal: opts?.signal,
+              }),
             ]),
             loadTimeoutMs,
             'timeout',
             '加载 FFmpeg WASM 核心超时，自动回退服务端 HLS',
           )
-          this.coreBlobUrls.push(coreURL, wasmURL)
+          pendingBlobUrls.push(coreURL, wasmURL)
 
           opts?.onProgress?.('init', 80, '正在启动 WASM Worker...')
           await withTimeout(
@@ -324,11 +445,15 @@ export class WasmRemuxer {
             '启动 FFmpeg WASM Worker 超时，自动回退服务端 HLS',
           )
 
+          this.coreBlobUrls.push(...pendingBlobUrls)
           this.ffmpeg = ffmpeg
           this.loaded = true
           opts?.onProgress?.('init', 100, 'WASM 引擎就绪')
           return
         } catch (err) {
+          for (const url of pendingBlobUrls) {
+            URL.revokeObjectURL(url)
+          }
           lastErr = err
           if (err instanceof WasmRemuxFallbackError && err.reason === 'aborted') {
             throw err
@@ -381,6 +506,8 @@ export class WasmRemuxer {
     const inputExt = resolveInputExtension(opts.container)
     const inputName = `input.${inputExt}`
     const outputName = 'output.mp4'
+    let loadedFfmpeg: FFmpeg | null = null
+    let vfsDirty = false
 
     try {
       // 1. 先检查与流式拉取媒体数据（实时上报进度并动态检测体积上限）
@@ -403,6 +530,7 @@ export class WasmRemuxer {
         signal,
         onProgress: opts.onProgress,
       })
+      loadedFfmpeg = ffmpeg
 
       if (signal?.aborted || this.disposed) {
         throw new WasmRemuxFallbackError('aborted', '已取消客户端转封装')
@@ -410,6 +538,7 @@ export class WasmRemuxer {
 
       // 3. 写入虚拟文件系统并执行零重编码转封装
       opts.onProgress?.('remux', 2, '正在写入虚拟内存文件系统...')
+      vfsDirty = true
       await ffmpeg.writeFile(inputName, inputBytes, { signal })
 
       const onFfmpegProgress = ({ progress }: { progress: number }) => {
@@ -470,9 +599,6 @@ export class WasmRemuxer {
         throw new WasmRemuxFallbackError('exec_failed', 'WASM 转封装输出为空')
       }
 
-      // 及时清理虚拟文件系统释放 WASM 内存
-      await Promise.allSettled([ffmpeg.deleteFile(inputName), ffmpeg.deleteFile(outputName)])
-
       const blob = new Blob([outputBytes], { type: 'video/mp4' })
       const url = URL.createObjectURL(blob)
       this.activeObjectUrls.add(url)
@@ -495,6 +621,13 @@ export class WasmRemuxer {
       const message = err instanceof Error ? err.message : String(err)
       throw new WasmRemuxFallbackError('exec_failed', `客户端 WASM 转封装失败: ${message}`)
     } finally {
+      // 无论成功、失败、抛错还是超时，均清理 WASM 虚拟文件系统中的临时输入/输出文件，防止高达 150MB 内存泄漏
+      if (loadedFfmpeg && vfsDirty) {
+        await Promise.allSettled([
+          loadedFfmpeg.deleteFile(inputName),
+          loadedFfmpeg.deleteFile(outputName),
+        ])
+      }
       if (this.activeAbortController === localAbort) {
         this.activeAbortController = null
       }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/middleware"
+	"github.com/ambra-media/ambra/internal/core/session"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/pkg/i18n"
@@ -57,6 +59,7 @@ type Notification struct {
 	Url         string    `json:"Url,omitempty"`
 	ImageUrl    string    `json:"ImageUrl,omitempty"`
 	Level       string    `json:"Level"`
+	AdminOnly   bool      `json:"AdminOnly,omitempty"`
 }
 
 type NotificationResult struct {
@@ -213,6 +216,20 @@ func setReadBy(readBy []string, userID string, read bool) []string {
 	return out
 }
 
+func (h *Handler) isCallerAdmin(ctx context.Context) bool {
+	ac, ok := middleware.AuthFromContext(ctx)
+	if ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		return ac.IsAdmin()
+	}
+	if ok {
+		return false
+	}
+	if h.auth.RequireAuth != nil || h.auth.UserIDFromCtx != nil {
+		return false
+	}
+	return true
+}
+
 func (h *Handler) handleListByUser(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := guid.Normalize(r.PathValue("UserId"))
@@ -220,6 +237,7 @@ func (h *Handler) handleListByUser(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusForbidden, "cannot access another user's notifications")
 		return
 	}
+	isAdmin := h.isCallerAdmin(r.Context())
 	isReadFilter := q.Bool("IsRead")
 	acceptLang := strings.TrimSpace(r.Header.Get("Accept-Language"))
 	locale := ""
@@ -230,6 +248,9 @@ func (h *Handler) handleListByUser(w http.ResponseWriter, r *http.Request) {
 	h.mu.RLock()
 	matched := make([]Notification, 0, len(h.state.Items))
 	for _, n := range h.state.Items {
+		if n.AdminOnly && !isAdmin {
+			continue
+		}
 		if n.UserId == "" || guid.Normalize(n.UserId) == userID {
 			item := n
 			item.IsRead = isReadForUser(n, userID)
@@ -282,12 +303,16 @@ func (h *Handler) handleSummary(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusForbidden, "cannot access another user's notifications")
 		return
 	}
+	isAdmin := h.isCallerAdmin(r.Context())
 
 	h.mu.RLock()
 	unread := 0
 	maxRank := 0
 	maxLevel := ""
 	for _, n := range h.state.Items {
+		if n.AdminOnly && !isAdmin {
+			continue
+		}
 		if n.UserId != "" && guid.Normalize(n.UserId) != userID {
 			continue
 		}
@@ -316,12 +341,18 @@ func (h *Handler) handleMarkRead(read bool) http.HandlerFunc {
 			httpx.Error(w, http.StatusForbidden, "cannot access another user's notifications")
 			return
 		}
+		isAdmin := h.isCallerAdmin(r.Context())
 		ids := q.List("Ids")
 		if len(ids) == 0 && r.Body != nil {
 			var body struct {
 				Ids []string `json:"Ids"`
 			}
-			if err := httpx.DecodeJSONLimit(r, &body, 0); err == nil {
+			if err := httpx.DecodeJSONLimit(r, &body, 0); err != nil {
+				if !errors.Is(err, io.EOF) {
+					httpx.Error(w, http.StatusBadRequest, "invalid notification read payload")
+					return
+				}
+			} else {
 				ids = body.Ids
 			}
 		}
@@ -334,6 +365,9 @@ func (h *Handler) handleMarkRead(read bool) http.HandlerFunc {
 		h.mu.Lock()
 		for i := range h.state.Items {
 			n := &h.state.Items[i]
+			if n.AdminOnly && !isAdmin {
+				continue
+			}
 			if n.UserId != "" && guid.Normalize(n.UserId) != userID {
 				continue
 			}
@@ -361,6 +395,7 @@ func (h *Handler) handleSendAdmin(w http.ResponseWriter, r *http.Request) {
 		Url         string `json:"Url"`
 		Level       string `json:"Level"`
 		UserId      string `json:"UserId"`
+		AdminOnly   bool   `json:"AdminOnly"`
 	}
 	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid notification payload")
@@ -389,6 +424,7 @@ func (h *Handler) handleSendAdmin(w http.ResponseWriter, r *http.Request) {
 		Url:         strings.TrimSpace(req.Url),
 		ImageUrl:    strings.TrimSpace(req.ImageUrl),
 		Level:       level,
+		AdminOnly:   req.AdminOnly,
 	}
 
 	if err := h.appendNotification(r.Context(), n); err != nil {
@@ -493,28 +529,61 @@ func (h *Handler) SubscribeEvents(bus *eventbus.Bus) {
 				Name:        name + " Failed",
 				Description: desc,
 				Level:       "Error",
+				AdminOnly:   true,
 			})
 		}
 	})
 
 	bus.Subscribe(eventbus.EventUserDataChanged, func(ctx context.Context, e eventbus.Event) {
-		m, ok := e.Payload.(map[string]any)
-		if !ok {
-			return
+		switch p := e.Payload.(type) {
+		case session.UserDataChangedPayload:
+			h.recordUserDataChangedNotification(ctx, p)
+		case *session.UserDataChangedPayload:
+			if p != nil {
+				h.recordUserDataChangedNotification(ctx, *p)
+			}
+		case map[string]any:
+			uid, _ := p["UserId"].(string)
+			name, _ := p["Name"].(string)
+			if strings.TrimSpace(name) == "" {
+				return
+			}
+			desc, _ := p["Description"].(string)
+			level, _ := p["Level"].(string)
+			_ = h.appendNotification(ctx, Notification{
+				UserId:      guid.Normalize(uid),
+				Name:        strings.TrimSpace(name),
+				Description: strings.TrimSpace(desc),
+				Level:       level,
+			})
 		}
-		uid, _ := m["UserId"].(string)
-		name, _ := m["Name"].(string)
-		if strings.TrimSpace(name) == "" {
-			return
+	})
+}
+
+func (h *Handler) recordUserDataChangedNotification(ctx context.Context, p session.UserDataChangedPayload) {
+	if len(p.UserDataList) == 0 {
+		return
+	}
+	name := "User Data Updated"
+	desc := fmt.Sprintf("Updated user data for %d items", len(p.UserDataList))
+	if len(p.UserDataList) == 1 {
+		entry := p.UserDataList[0]
+		switch {
+		case entry.Played:
+			name = "Item Marked Played"
+			desc = fmt.Sprintf("Item %s marked as played", entry.ItemId)
+		case entry.IsFavorite:
+			name = "Item Added to Favorites"
+			desc = fmt.Sprintf("Item %s marked as favorite", entry.ItemId)
+		default:
+			desc = fmt.Sprintf("Updated user data for item %s", entry.ItemId)
 		}
-		desc, _ := m["Description"].(string)
-		level, _ := m["Level"].(string)
-		h.appendNotification(ctx, Notification{
-			UserId:      guid.Normalize(uid),
-			Name:        strings.TrimSpace(name),
-			Description: strings.TrimSpace(desc),
-			Level:       level,
-		})
+	}
+	_ = h.appendNotification(ctx, Notification{
+		UserId:      guid.Normalize(p.UserId),
+		Name:        name,
+		Description: desc,
+		Level:       "Normal",
 	})
 }
 

@@ -142,7 +142,9 @@ func (a *Auth) resolve(r *http.Request) *AuthContext {
 	}
 
 	if a.sessions != nil && ac.User != nil {
-		a.sessions.TouchSession(ac.User, ac.Client)
+		if ac.IsAPIKey || ac.User.Policy.EnableRemoteAccess || netutil.IsLocalOrLANRequest(r) {
+			a.sessions.TouchSession(ac.User, ac.Client)
+		}
 	}
 	return ac
 }

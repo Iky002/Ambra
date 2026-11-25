@@ -11,11 +11,11 @@ import (
 func TestLegacyHLSSegmentRoute(t *testing.T) {
 	mux, mgr, itemID, msID := setupHLSTest(t)
 
-	// Register the session via master.m3u8 so SessionParams match exact handler normalization, then seed seg_0.ts.
-	masterRec := httptest.NewRecorder()
-	mux.ServeHTTP(masterRec, httptest.NewRequest(http.MethodGet, "/Videos/"+itemID+"/master.m3u8?PlaySessionId=legacy-ps-1&MediaSourceId="+msID, nil))
-	if masterRec.Code != http.StatusOK {
-		t.Fatalf("master.m3u8 failed: %d", masterRec.Code)
+	// Register the session via main.m3u8 so SessionParams match exact handler normalization, then seed seg_0.ts.
+	mediaRec := httptest.NewRecorder()
+	mux.ServeHTTP(mediaRec, httptest.NewRequest(http.MethodGet, "/Videos/"+itemID+"/main.m3u8?PlaySessionId=legacy-ps-1&MediaSourceId="+msID, nil))
+	if mediaRec.Code != http.StatusOK {
+		t.Fatalf("main.m3u8 failed: %d", mediaRec.Code)
 	}
 	sessions := mgr.ActiveSessions()
 	if len(sessions) != 1 {

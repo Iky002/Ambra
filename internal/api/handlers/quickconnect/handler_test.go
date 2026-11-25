@@ -16,6 +16,7 @@ import (
 	"github.com/ambra-media/ambra/internal/core/auth"
 	"github.com/ambra-media/ambra/internal/core/session"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -342,7 +343,10 @@ func TestQuickConnectPerIPRateLimitAndEdgeCases(t *testing.T) {
 		t.Fatalf("clientIP empty = %q", got)
 	}
 
-	// X-Forwarded-For (first valid IP) and X-Real-IP precedence
+	// X-Forwarded-For (rightmost non-trusted proxy IP) and X-Real-IP precedence when RemoteAddr is a trusted proxy
+	netutil.SetTrustedProxies([]string{"10.0.0.0/8"})
+	t.Cleanup(func() { netutil.SetTrustedProxies(nil) })
+
 	xffReq := httptest.NewRequest(http.MethodPost, "/", nil)
 	xffReq.RemoteAddr = "10.0.0.1:4321"
 	xffReq.Header.Set("X-Forwarded-For", "not-an-ip, 203.0.113.55:8080, 10.0.0.2")

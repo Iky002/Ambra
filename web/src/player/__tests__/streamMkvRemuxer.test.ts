@@ -4,6 +4,7 @@ import {
   buildFmp4MediaSegment,
   canStreamMkvRemux,
   EBML_ID,
+  findNextClusterOffset,
   isMkvContainer,
   lookupCueOffset,
   parseClusterFrames,
@@ -727,5 +728,205 @@ describe('StreamMkvRemuxer Controller (Range + MSE + Seek + Dispose)', () => {
 
     expect(cancelled).toBe(true)
     expect(revokedUrls).toEqual(createdUrls)
+  })
+
+  it('builds trun v1 with signed CTS offsets for B-frame reordered PTS sequence', () => {
+    // 典型 I-P-B-B 解码顺序：PTS = [0, 120, 40, 80] (每帧 40ms)
+    const frames: MkvFrame[] = [
+      { trackNumber: 1, timestampMs: 0, isKeyframe: true, data: new Uint8Array([1, 2]) },
+      { trackNumber: 1, timestampMs: 120, isKeyframe: false, data: new Uint8Array([3, 4]) },
+      { trackNumber: 1, timestampMs: 40, isKeyframe: false, data: new Uint8Array([5, 6]) },
+      { trackNumber: 1, timestampMs: 80, isKeyframe: false, data: new Uint8Array([7, 8]) },
+    ]
+
+    const seg = buildFmp4MediaSegment(frames, { sequenceNumber: 1, trackId: 1 })
+    const moof = findChildBox(seg, 0, seg.byteLength, 'moof')!
+    const traf = findChildBox(seg, moof.offset + 8, moof.offset + moof.size, 'traf')!
+    const trun = findChildBox(seg, traf.offset + 8, traf.offset + traf.size, 'trun')!
+    const view = new DataView(seg.buffer, seg.byteOffset + trun.offset, trun.size)
+
+    // version === 1, flags === 0x000f01 (包含 sample_composition_time_offset)
+    expect(view.getUint8(8)).toBe(1)
+    const flags = (view.getUint8(9) << 16) | (view.getUint8(10) << 8) | view.getUint8(11)
+    expect(flags).toBe(0x000f01)
+    expect(view.getUint32(12, false)).toBe(4)
+
+    // 每个 sample 16 字节: duration(4), size(4), flags(4), cts(int32, 4)
+    const durs: number[] = []
+    const ctsList: number[] = []
+    let dts = 0
+    for (let i = 0; i < 4; i++) {
+      const off = 20 + i * 16
+      const dur = view.getUint32(off, false)
+      const cts = view.getInt32(off + 12, false)
+      durs.push(dur)
+      ctsList.push(cts)
+      expect(dts + cts).toBe(frames[i].timestampMs)
+      dts += dur
+    }
+    expect(durs).toEqual([40, 40, 40, 40])
+    expect(ctsList).toEqual([0, 80, -40, -40])
+  })
+
+  it('skips >512KB Attachments element before Tracks/Cluster during MKV header scan', async () => {
+    const ebmlHeader = ebmlEl(
+      EBML_ID.EBML,
+      ebmlEl(EBML_ID.EBMLVersion, uintBytes(1)),
+      ebmlEl(EBML_ID.DocType, strBytes('matroska')),
+    )
+    const info = ebmlEl(
+      EBML_ID.Info,
+      ebmlEl(EBML_ID.TimecodeScale, uintBytes(1_000_000)),
+      ebmlEl(EBML_ID.Duration, float64Bytes(60_000)),
+    )
+    // 模拟 600KB 字体附件位于 Tracks 之前（超过 512KB 初始拉取窗口）
+    const largeAttachment = ebmlEl(EBML_ID.Attachments, new Uint8Array(600 * 1024))
+    const avcC = new Uint8Array([0x01, 0x64, 0x00, 0x28, 0xff, 0xe1, 0x00, 0x04, 0x67, 0x64, 0x00, 0x28])
+    const tracks = ebmlEl(
+      EBML_ID.Tracks,
+      ebmlEl(
+        EBML_ID.TrackEntry,
+        ebmlEl(EBML_ID.TrackNumber, uintBytes(1)),
+        ebmlEl(EBML_ID.TrackType, uintBytes(1)),
+        ebmlEl(EBML_ID.CodecID, strBytes('V_MPEG4/ISO/AVC')),
+        ebmlEl(EBML_ID.CodecPrivate, avcC),
+        ebmlEl(EBML_ID.Video, ebmlEl(EBML_ID.PixelWidth, uintBytes(1920)), ebmlEl(EBML_ID.PixelHeight, uintBytes(1080))),
+      ),
+    )
+    const cluster = ebmlEl(
+      EBML_ID.Cluster,
+      ebmlEl(EBML_ID.Timecode, uintBytes(0)),
+      makeSimpleBlock(1, 0, 0x80, new Uint8Array([0x00, 0x00, 0x00, 0x02, 0x65, 0x88])),
+    )
+    const segment = ebmlEl(EBML_ID.Segment, concat(info, largeAttachment, tracks, cluster))
+    const bytes = concat(ebmlHeader, segment)
+
+    installMockMSE()
+    const mockFetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = (init?.headers || {}) as Record<string, string>
+      const range = headers.Range || headers.range || ''
+      const match = /bytes=(\d+)-(\d+)/.exec(range)
+      const start = match ? Number(match[1]) : 0
+      const end = match ? Math.min(bytes.byteLength - 1, Number(match[2])) : bytes.byteLength - 1
+      const slice = bytes.slice(start, end + 1)
+      return new Response(slice, {
+        status: 206,
+        headers: {
+          'Content-Range': `bytes ${start}-${end}/${bytes.byteLength}`,
+          'Content-Length': String(slice.byteLength),
+        },
+      })
+    }) as unknown as typeof fetch
+
+    const videoEl = document.createElement('video')
+    Object.defineProperty(videoEl, 'buffered', {
+      configurable: true,
+      value: { length: 0, start: () => 0, end: () => 0 },
+    })
+
+    const remuxer = new StreamMkvRemuxer()
+    const meta = await remuxer.attach(videoEl, '/emby/Videos/big-att/stream', {}, {
+      fetchImpl: mockFetch,
+      initialHeaderBytes: 512 * 1024,
+    })
+
+    expect(meta.videoTrack?.codecId).toBe('V_MPEG4/ISO/AVC')
+    expect(meta.durationSec).toBeCloseTo(60, 2)
+    remuxer.dispose()
+  })
+
+  it('resyncs to valid Cluster header and aligns keyframe on linear Seek without Cues', async () => {
+    const ebmlHeader = ebmlEl(
+      EBML_ID.EBML,
+      ebmlEl(EBML_ID.DocType, strBytes('matroska')),
+    )
+    const info = ebmlEl(
+      EBML_ID.Info,
+      ebmlEl(EBML_ID.TimecodeScale, uintBytes(1_000_000)),
+      ebmlEl(EBML_ID.Duration, float64Bytes(100_000)),
+    )
+    const avcC = new Uint8Array([0x01, 0x64, 0x00, 0x28, 0xff, 0xe1, 0x00, 0x04, 0x67, 0x64, 0x00, 0x28])
+    const tracks = ebmlEl(
+      EBML_ID.Tracks,
+      ebmlEl(
+        EBML_ID.TrackEntry,
+        ebmlEl(EBML_ID.TrackNumber, uintBytes(1)),
+        ebmlEl(EBML_ID.TrackType, uintBytes(1)),
+        ebmlEl(EBML_ID.CodecID, strBytes('V_MPEG4/ISO/AVC')),
+        ebmlEl(EBML_ID.CodecPrivate, avcC),
+      ),
+    )
+    // Cluster 1 带大负载以便线性 Seek 落在 Cluster 1 中间字节
+    const cluster1 = ebmlEl(
+      EBML_ID.Cluster,
+      ebmlEl(EBML_ID.Timecode, uintBytes(0)),
+      makeSimpleBlock(1, 0, 0x80, new Uint8Array(4000).fill(0x55)),
+    )
+    // Cluster 2 开头先有一帧非关键帧 (50000ms)，再有一帧关键帧 (50040ms)
+    const cluster2 = ebmlEl(
+      EBML_ID.Cluster,
+      ebmlEl(EBML_ID.Timecode, uintBytes(50_000)),
+      makeSimpleBlock(1, 0, 0x00, new Uint8Array([0x41, 0x01])),
+      makeSimpleBlock(1, 40, 0x80, new Uint8Array([0x65, 0x02])),
+    )
+    const segment = ebmlEl(EBML_ID.Segment, concat(info, tracks, cluster1, cluster2))
+    const bytes = concat(ebmlHeader, segment)
+
+    // 先直接验证 findNextClusterOffset 能在随机垃圾字节中精确定位 Cluster2
+    const junk = new Uint8Array([0x00, 0x11, 0x1f, 0x43, 0xb6, 0x75, 0x00, 0x99])
+    const probeBuf = concat(junk, cluster2)
+    expect(findNextClusterOffset(probeBuf, 0)).toBe(junk.byteLength)
+
+    const { appendedByMime } = installMockMSE()
+    const mockFetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = (init?.headers || {}) as Record<string, string>
+      const range = headers.Range || headers.range || ''
+      const match = /bytes=(\d+)-(\d+)/.exec(range)
+      const start = match ? Number(match[1]) : 0
+      const end = match ? Math.min(bytes.byteLength - 1, Number(match[2])) : bytes.byteLength - 1
+      const slice = bytes.slice(start, end + 1)
+      return new Response(slice, {
+        status: 206,
+        headers: {
+          'Content-Range': `bytes ${start}-${end}/${bytes.byteLength}`,
+          'Content-Length': String(slice.byteLength),
+        },
+      })
+    }) as unknown as typeof fetch
+
+    const videoEl = document.createElement('video')
+    Object.defineProperty(videoEl, 'buffered', {
+      configurable: true,
+      value: { length: 0, start: () => 0, end: () => 0 },
+    })
+
+    const remuxer = new StreamMkvRemuxer()
+    const meta = await remuxer.attach(videoEl, '/emby/Videos/no-cues/stream', {}, {
+      fetchImpl: mockFetch,
+      initialHeaderBytes: 512 * 1024,
+      chunkSizeBytes: 256 * 1024,
+    })
+    expect(meta.cuesCount).toBe(0)
+    await new Promise((r) => setTimeout(r, 30))
+
+    // 无 Cues 线性 Seek 到 45 秒 -> 落在 Cluster 1 中间，应重同步到 Cluster 2 并跳至 50.04s 关键帧
+    const beforeCount = (appendedByMime.get('video/mp4; codecs="avc1.640028"') || []).length
+    Object.defineProperty(videoEl, 'currentTime', { configurable: true, writable: true, value: 45 })
+    videoEl.dispatchEvent(new Event('seeking'))
+    await new Promise((r) => setTimeout(r, 40))
+
+    const videoChunks = appendedByMime.get('video/mp4; codecs="avc1.640028"') || []
+    expect(videoChunks.length).toBeGreaterThan(beforeCount)
+    // 验证最新写入的分片 tfdt baseMediaDecodeTime 对齐到关键帧 50040ms（跳过了 50000ms 非关键帧）
+    const lastSeg = videoChunks[videoChunks.length - 1]
+    const moof = findChildBox(lastSeg, 0, lastSeg.byteLength, 'moof')!
+    const traf = findChildBox(lastSeg, moof.offset + 8, moof.offset + moof.size, 'traf')!
+    const tfdt = findChildBox(lastSeg, traf.offset + 8, traf.offset + traf.size, 'tfdt')!
+    const tfdtView = new DataView(lastSeg.buffer, lastSeg.byteOffset + tfdt.offset + 12, 8)
+    const baseDecodeMs = tfdtView.getUint32(0, false) * 0x100000000 + tfdtView.getUint32(4, false)
+    expect(baseDecodeMs).toBe(50040)
+    expect(videoEl.currentTime).toBeCloseTo(50.04, 2)
+
+    remuxer.dispose()
   })
 })

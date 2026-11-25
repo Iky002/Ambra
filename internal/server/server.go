@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -56,6 +57,7 @@ import (
 	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/core/watcher"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
+	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/plugins/ext"
@@ -100,9 +102,7 @@ type Server struct {
 }
 
 func New(ctx context.Context, cfg *config.Config) (*Server, error) {
-	if len(cfg.TrustedProxies) > 0 {
-		netutil.SetTrustedProxies(cfg.TrustedProxies)
-	}
+	netutil.SetTrustedProxies(cfg.TrustedProxies)
 	if err := applyPendingDatabaseRestore(cfg.DataDir, cfg.DBPath()); err != nil {
 		return nil, fmt.Errorf("apply pending database restore: %w", err)
 	}
@@ -142,8 +142,11 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	}
 
 	sessionMgr := session.NewManager(userRepo, cfg, bus)
+	sessionMgr.SetItemAccessChecker(buildSessionItemAccessChecker(libRepo))
 	authMW := middleware.NewAuth(authSvc, sessionMgr)
 	wsHub := ws.NewHub(authSvc, sessionMgr, bus)
+	wsHub.SetAllowedOrigins(cfg.AllowedOrigins)
+	wsHub.SetLibraryChangeFilter(buildWSLibraryChangeFilter(userRepo, libRepo))
 
 	bgBudget := budget.Global()
 	sc := scanner.New(libRepo, registry, bus, cfg)
@@ -667,6 +670,146 @@ func dispatchMuxAndCompat(mux *http.ServeMux, routers ...http.Handler) http.Hand
 	})
 }
 
+const webContentSecurityPolicy = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; media-src 'self' blob: https: http:; connect-src 'self' ws: wss: https:; worker-src 'self' blob:; font-src 'self' data:; object-src 'none'; frame-ancestors 'self'; base-uri 'self'"
+
+func setWebSecurityHeaders(w http.ResponseWriter) {
+	h := w.Header()
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("X-Frame-Options", "SAMEORIGIN")
+	h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+	h.Set("Content-Security-Policy", webContentSecurityPolicy)
+}
+
+func userCanAccessLibrary(user *sqlite.UserRecord, libraryID string) bool {
+	if user == nil || user.IsAdmin || user.Policy.IsAdministrator || user.Policy.EnableAllFolders {
+		return true
+	}
+	normLib := guid.Normalize(libraryID)
+	if normLib == "" || normLib == "collections" || normLib == "playlists" {
+		return true
+	}
+	for _, allowed := range user.Policy.EnabledFolders {
+		if guid.Normalize(allowed) == normLib {
+			return true
+		}
+	}
+	return false
+}
+
+func buildSessionItemAccessChecker(libRepo *sqlite.LibraryRepo) func(ctx context.Context, user *sqlite.UserRecord, itemID string) bool {
+	return func(ctx context.Context, user *sqlite.UserRecord, itemID string) bool {
+		if libRepo == nil || itemID == "" {
+			return true
+		}
+		rec, err := libRepo.GetItemRecordByID(ctx, itemID)
+		if err != nil || rec == nil {
+			return false
+		}
+		if user == nil || user.IsAdmin || user.Policy.IsAdministrator {
+			return true
+		}
+		if !userCanAccessLibrary(user, rec.LibraryID) {
+			return false
+		}
+		blocked, err := libRepo.IsItemBlockedByParentalPolicy(ctx, rec, user.Policy.MaxParentalRating, user.Policy.BlockedTags)
+		return err == nil && !blocked
+	}
+}
+
+func buildWSLibraryChangeFilter(userRepo *sqlite.UserRepo, libRepo *sqlite.LibraryRepo) func(ctx context.Context, userID string, payload any) (any, bool) {
+	itemChecker := buildSessionItemAccessChecker(libRepo)
+	return func(ctx context.Context, userID string, payload any) (any, bool) {
+		if userRepo == nil || userID == "" {
+			return nil, false
+		}
+		user, err := userRepo.GetUserByID(ctx, userID)
+		if err != nil || user == nil || user.IsDisabled {
+			return nil, false
+		}
+		if user.IsAdmin || user.Policy.IsAdministrator {
+			return payload, true
+		}
+		m, ok := payload.(map[string]any)
+		if !ok {
+			return map[string]any{"LibraryChanged": true}, true
+		}
+
+		// Block DVR path leakage and enforce Live TV access policy.
+		if src, _ := m["source"].(string); strings.EqualFold(src, "dvr") {
+			if !user.Policy.EnableLiveTvAccess {
+				return nil, false
+			}
+			return map[string]any{"Source": "dvr"}, true
+		}
+		if _, hasOutputPath := m["output_path"]; hasOutputPath {
+			if !user.Policy.EnableLiveTvAccess {
+				return nil, false
+			}
+			return map[string]any{"LibraryChanged": true}, true
+		}
+
+		libID := ""
+		if v, ok := m["LibraryId"].(string); ok {
+			libID = guid.Normalize(v)
+		} else if v, ok := m["library_id"].(string); ok {
+			libID = guid.Normalize(v)
+		}
+		if libID != "" && !userCanAccessLibrary(user, libID) {
+			return nil, false
+		}
+
+		// Filter any explicit item ID slices so restricted item IDs are never disclosed.
+		hasIDLists := false
+		filteredLists := make(map[string][]string)
+		anyVisibleID := false
+		for _, key := range []string{"ItemsAdded", "ItemsUpdated", "ItemsRemoved"} {
+			rawIDs, ok := m[key].([]string)
+			if !ok {
+				continue
+			}
+			hasIDLists = true
+			kept := make([]string, 0, len(rawIDs))
+			for _, id := range rawIDs {
+				if itemChecker(ctx, user, id) {
+					kept = append(kept, id)
+				}
+			}
+			filteredLists[key] = kept
+			if len(kept) > 0 {
+				anyVisibleID = true
+			}
+		}
+		if hasIDLists {
+			if !anyVisibleID {
+				return nil, false
+			}
+			out := make(map[string]any, len(filteredLists)+1)
+			if libID != "" {
+				out["LibraryId"] = libID
+			}
+			for k, v := range filteredLists {
+				out[k] = v
+			}
+			return out, true
+		}
+
+		// For library-scoped scan summaries, emit only safe metadata without restricted counts when parental/tag policies apply.
+		if libID != "" {
+			hasContentPolicy := user.Policy.MaxParentalRating != nil || len(user.Policy.BlockedTags) > 0
+			if hasContentPolicy {
+				out := map[string]any{"LibraryId": libID}
+				if phase, ok := m["Phase"].(string); ok && phase != "" {
+					out["Phase"] = phase
+				}
+				return out, true
+			}
+			return m, true
+		}
+
+		return map[string]any{"LibraryChanged": true}, true
+	}
+}
+
 func buildWebHandler(webDir string) http.Handler {
 	var fsys fs.FS
 	if webDir != "" {
@@ -682,18 +825,29 @@ func buildWebHandler(webDir string) http.Handler {
 	}
 	if fsys == nil {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			setWebSecurityHeaders(w)
 			http.Error(w, "web UI unavailable", http.StatusServiceUnavailable)
 		})
 	}
 	fileServer := http.FileServer(http.FS(fsys))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p := strings.TrimPrefix(r.URL.Path, "/")
+		setWebSecurityHeaders(w)
+		cleaned := path.Clean("/" + r.URL.Path)
+		p := strings.TrimPrefix(cleaned, "/")
+		if p == "_headers" || p == "_redirects" {
+			http.NotFound(w, r)
+			return
+		}
 		if p == "" || p == "index.html" {
 			fileServer.ServeHTTP(w, r)
 			return
 		}
 		if _, err := fs.Stat(fsys, p); err == nil {
 			fileServer.ServeHTTP(w, r)
+			return
+		}
+		if p == "assets" || strings.HasPrefix(p, "assets/") || p == "ffmpeg" || strings.HasPrefix(p, "ffmpeg/") {
+			http.NotFound(w, r)
 			return
 		}
 		// SPA fallback to index.html

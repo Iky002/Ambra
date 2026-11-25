@@ -145,7 +145,7 @@ describe('Batch 3B Web UI 功能测试 (P1-3 / P1-4 / P1-6 / P2-3)', () => {
         ),
       ).toBe(true)
     })
-    expect(await screen.findByText('登录密码已修改成功')).toBeInTheDocument()
+    expect(await screen.findByText(/登录密码已修改成功/)).toBeInTheDocument()
 
     // 验证真实退出登录调用 /emby/Sessions/Logout
     await user.click(screen.getByRole('button', { name: '触发退出' }))

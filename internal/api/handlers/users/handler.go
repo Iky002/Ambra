@@ -25,8 +25,10 @@ import (
 )
 
 const (
-	authByNameRateLimit  = 30
-	authByNameRateWindow = time.Minute
+	authByNameRateLimit     = 30
+	authByNameUserRateLimit = 30
+	authByNameRateWindow    = time.Minute
+	authRateMaxBuckets      = 4096
 )
 
 type Handler struct {
@@ -37,8 +39,9 @@ type Handler struct {
 	wsHub      *ws.Hub
 	cfg        *config.Config
 
-	mu        sync.Mutex
-	authRates map[string][]time.Time
+	mu            sync.Mutex
+	authRates     map[string][]time.Time
+	authUserRates map[string][]time.Time
 }
 
 func NewHandler(
@@ -49,12 +52,13 @@ func NewHandler(
 	cfg *config.Config,
 ) *Handler {
 	return &Handler{
-		authSvc:    authSvc,
-		userRepo:   userRepo,
-		sessionMgr: sessionMgr,
-		wsHub:      wsHub,
-		cfg:        cfg,
-		authRates:  make(map[string][]time.Time),
+		authSvc:       authSvc,
+		userRepo:      userRepo,
+		sessionMgr:    sessionMgr,
+		wsHub:         wsHub,
+		cfg:           cfg,
+		authRates:     make(map[string][]time.Time),
+		authUserRates: make(map[string][]time.Time),
 	}
 }
 
@@ -71,17 +75,8 @@ func (h *Handler) getLibraryRepo() *sqlite.LibraryRepo {
 	return h.libRepo
 }
 
-func (h *Handler) checkAuthRateLimit(ip string, now time.Time) bool {
-	if ip == "" {
-		return true
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.authRates == nil {
-		h.authRates = make(map[string][]time.Time)
-	}
-	cutoff := now.Add(-authByNameRateWindow)
-	for k, ts := range h.authRates {
+func pruneRateBucketsLocked(buckets map[string][]time.Time, cutoff time.Time) {
+	for k, ts := range buckets {
 		kept := ts[:0]
 		for _, t := range ts {
 			if t.After(cutoff) {
@@ -89,15 +84,69 @@ func (h *Handler) checkAuthRateLimit(ip string, now time.Time) bool {
 			}
 		}
 		if len(kept) == 0 {
-			delete(h.authRates, k)
+			delete(buckets, k)
 		} else {
-			h.authRates[k] = kept
+			buckets[k] = kept
 		}
 	}
-	if len(h.authRates[ip]) >= authByNameRateLimit {
+	if len(buckets) > authRateMaxBuckets {
+		excess := len(buckets) - authRateMaxBuckets
+		for k := range buckets {
+			if excess <= 0 {
+				break
+			}
+			delete(buckets, k)
+			excess--
+		}
+	}
+}
+
+func (h *Handler) isIPRateLimited(ip string, now time.Time) bool {
+	if ip == "" {
 		return false
 	}
-	h.authRates[ip] = append(h.authRates[ip], now)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.authRates == nil {
+		return false
+	}
+	pruneRateBucketsLocked(h.authRates, now.Add(-authByNameRateWindow))
+	return len(h.authRates[ip]) >= authByNameRateLimit
+}
+
+func (h *Handler) checkAuthRateLimit(ip string, now time.Time) bool {
+	return h.checkAuthRateLimitForLogin(ip, "", now)
+}
+
+func (h *Handler) checkAuthRateLimitForLogin(ip, username string, now time.Time) bool {
+	ip = strings.TrimSpace(ip)
+	uname := strings.ToLower(strings.TrimSpace(username))
+	if ip == "" && uname == "" {
+		return true
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.authRates == nil {
+		h.authRates = make(map[string][]time.Time)
+	}
+	if h.authUserRates == nil {
+		h.authUserRates = make(map[string][]time.Time)
+	}
+	cutoff := now.Add(-authByNameRateWindow)
+	pruneRateBucketsLocked(h.authRates, cutoff)
+	pruneRateBucketsLocked(h.authUserRates, cutoff)
+	if ip != "" && len(h.authRates[ip]) >= authByNameRateLimit {
+		return false
+	}
+	if uname != "" && len(h.authUserRates[uname]) >= authByNameUserRateLimit {
+		return false
+	}
+	if ip != "" {
+		h.authRates[ip] = append(h.authRates[ip], now)
+	}
+	if uname != "" {
+		h.authUserRates[uname] = append(h.authUserRates[uname], now)
+	}
 	return true
 }
 
@@ -146,34 +195,33 @@ func (h *Handler) canAccessItem(ctx context.Context, ac *middleware.AuthContext,
 	return !blocked, nil
 }
 
-func (h *Handler) disconnectUserSessions(ctx context.Context, userID string) {
+func (h *Handler) disconnectUserSessions(_ context.Context, userID string) {
 	norm := guid.Normalize(userID)
 	if norm == "" {
 		return
 	}
 	if h.sessionMgr != nil {
-		if rem, ok := any(h.sessionMgr).(interface{ RemoveSessionsByUser(string) }); ok {
-			rem.RemoveSessionsByUser(norm)
-		} else {
-			for _, s := range h.sessionMgr.ListSessions() {
-				if guid.Normalize(s.UserId) == norm {
-					h.sessionMgr.RemoveSession(s.UserId, s.DeviceId)
-				}
+		h.sessionMgr.RemoveSessionsByUser(norm)
+	}
+	if h.wsHub != nil {
+		h.wsHub.DisconnectUser(norm)
+	}
+}
+
+func (h *Handler) disconnectUserSessionsExcept(userID, keepDeviceID, keepToken string) {
+	norm := guid.Normalize(userID)
+	if norm == "" {
+		return
+	}
+	if h.sessionMgr != nil {
+		for _, s := range h.sessionMgr.ListSessions() {
+			if guid.Normalize(s.UserId) == norm && (keepDeviceID == "" || s.DeviceId != keepDeviceID) {
+				h.sessionMgr.RemoveSession(s.UserId, s.DeviceId)
 			}
 		}
 	}
 	if h.wsHub != nil {
-		if disc, ok := any(h.wsHub).(interface{ DisconnectUser(string) }); ok {
-			disc.DisconnectUser(norm)
-		} else if h.userRepo != nil {
-			if devices, err := h.userRepo.ListDevices(ctx); err == nil {
-				for _, d := range devices {
-					if guid.Normalize(d.LastUserID) == norm {
-						h.wsHub.DisconnectDevice(d.ID)
-					}
-				}
-			}
-		}
+		h.wsHub.DisconnectUserExceptToken(norm, keepToken)
 	}
 }
 
@@ -252,7 +300,14 @@ func (h *Handler) ListPublicUsers(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]dto.UserDto, 0, len(users))
 	for _, u := range users {
-		out = append(out, h.authSvc.ToUserDto(u))
+		d := h.authSvc.ToUserDto(u)
+		// Strip sensitive policy and configuration details from unauthenticated public responses.
+		d.Policy = dto.UserPolicy{
+			EnabledFolders: []string{},
+			BlockedTags:    []string{},
+		}
+		d.Configuration = dto.UserConfiguration{}
+		out = append(out, d)
 	}
 	httpx.JSON(w, http.StatusOK, out)
 }
@@ -264,13 +319,20 @@ type authenticateByNameRequest struct {
 }
 
 func (h *Handler) AuthenticateByName(w http.ResponseWriter, r *http.Request) {
-	if !h.checkAuthRateLimit(netutil.ClientIP(r), time.Now().UTC()) {
+	now := time.Now().UTC()
+	ip := netutil.ClientIP(r)
+	if h.isIPRateLimited(ip, now) {
 		httpx.Error(w, http.StatusTooManyRequests, "Too many authentication attempts")
 		return
 	}
 	var req authenticateByNameRequest
-	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 64<<10); err != nil {
+		_ = h.checkAuthRateLimitForLogin(ip, "", now)
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if !h.checkAuthRateLimitForLogin(ip, req.Username, now) {
+		httpx.Error(w, http.StatusTooManyRequests, "Too many authentication attempts")
 		return
 	}
 	client := middleware.ExtractClientInfo(r)
@@ -421,28 +483,11 @@ func (h *Handler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "Cannot delete currently authenticated user")
 		return
 	}
-	existing, err := h.userRepo.GetUserByID(r.Context(), targetID)
-	if err != nil {
-		if errors.Is(err, sqlite.ErrNotFound) {
-			httpx.Error(w, http.StatusNotFound, "User not found")
-			return
-		}
-		httpx.Error(w, http.StatusInternalServerError, "failed to load user")
-		return
-	}
-	if (existing.IsAdmin || existing.Policy.IsAdministrator) && !existing.IsDisabled && !existing.Policy.IsDisabled {
-		others, countErr := h.countOtherActiveAdmins(r.Context(), targetID)
-		if countErr != nil {
-			httpx.Error(w, http.StatusInternalServerError, "failed to verify administrators")
-			return
-		}
-		if others == 0 {
+	if err := h.userRepo.DeleteUserSafe(r.Context(), targetID); err != nil {
+		if errors.Is(err, sqlite.ErrLastAdmin) {
 			httpx.Error(w, http.StatusBadRequest, "Cannot delete the last administrator")
 			return
 		}
-	}
-	h.disconnectUserSessions(r.Context(), targetID)
-	if err := h.userRepo.DeleteUser(r.Context(), targetID); err != nil {
 		if errors.Is(err, sqlite.ErrNotFound) {
 			httpx.Error(w, http.StatusNotFound, "User not found")
 			return
@@ -450,8 +495,13 @@ func (h *Handler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "failed to delete user")
 		return
 	}
-	_ = h.userRepo.DeleteTokensByUser(r.Context(), targetID)
-	h.authSvc.InvalidateUserCache(targetID)
+	if h.authSvc != nil {
+		_ = h.authSvc.RevokeUserTokens(r.Context(), targetID)
+		h.authSvc.InvalidateUserCache(targetID)
+	} else {
+		_ = h.userRepo.DeleteTokensByUser(r.Context(), targetID)
+	}
+	h.disconnectUserSessions(r.Context(), targetID)
 	_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
 		Name:     "User " + targetID + " was deleted",
 		Type:     "UserDeleted",
@@ -474,7 +524,7 @@ func (h *Handler) UpdateUserPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	targetID := guid.Normalize(chi.URLParam(r, "Id"))
-	isSelf := ac.User != nil && guid.Normalize(ac.User.ID) == targetID
+	isSelf := !ac.IsAPIKey && ac.User != nil && guid.Normalize(ac.User.ID) == targetID
 	if !ac.IsAdmin() && !isSelf {
 		httpx.Error(w, http.StatusForbidden, "Forbidden")
 		return
@@ -489,7 +539,11 @@ func (h *Handler) UpdateUserPassword(w http.ResponseWriter, r *http.Request) {
 	if req.ResetPassword {
 		newPw = ""
 	}
-	err := h.authSvc.ChangePassword(r.Context(), targetID, req.CurrentPw, newPw, ac.IsAdmin() && !isSelf)
+	keepToken := ""
+	if isSelf && strings.TrimSpace(ac.Token) != "" {
+		keepToken = strings.TrimSpace(ac.Token)
+	}
+	err := h.authSvc.ChangePasswordKeepToken(r.Context(), targetID, req.CurrentPw, newPw, ac.IsAdmin(), keepToken)
 	if err != nil {
 		switch {
 		case errors.Is(err, auth.ErrUserNotFound):
@@ -501,9 +555,12 @@ func (h *Handler) UpdateUserPassword(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	h.disconnectUserSessions(r.Context(), targetID)
+	if keepToken != "" {
+		h.disconnectUserSessionsExcept(targetID, ac.Client.DeviceID, keepToken)
+	} else {
+		h.disconnectUserSessions(r.Context(), targetID)
+	}
 	if h.userRepo != nil {
-		_ = h.userRepo.DeleteTokensByUser(r.Context(), targetID)
 		_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
 			Name:     "Password changed",
 			Type:     "UserPasswordChanged",
@@ -511,7 +568,6 @@ func (h *Handler) UpdateUserPassword(w http.ResponseWriter, r *http.Request) {
 			Severity: "Info",
 		})
 	}
-	h.authSvc.InvalidateUserCache(targetID)
 	httpx.NoContent(w)
 }
 
@@ -532,18 +588,11 @@ func (h *Handler) UpdateUserPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wasAdmin := existing.IsAdmin || existing.Policy.IsAdministrator
-	if wasAdmin && (!policy.IsAdministrator || policy.IsDisabled) {
-		others, countErr := h.countOtherActiveAdmins(r.Context(), targetID)
-		if countErr != nil {
-			httpx.Error(w, http.StatusInternalServerError, "failed to verify administrators")
-			return
-		}
-		if others == 0 {
+	if err := h.userRepo.UpdateUserPolicySafe(r.Context(), targetID, policy); err != nil {
+		if errors.Is(err, sqlite.ErrLastAdmin) {
 			httpx.Error(w, http.StatusBadRequest, "Cannot revoke or disable the last administrator")
 			return
 		}
-	}
-	if err := h.userRepo.UpdateUserPolicy(r.Context(), targetID, policy); err != nil {
 		if errors.Is(err, sqlite.ErrNotFound) {
 			httpx.Error(w, http.StatusNotFound, "User not found")
 			return
@@ -552,13 +601,19 @@ func (h *Handler) UpdateUserPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	demoted := wasAdmin && !policy.IsAdministrator
-	if policy.IsDisabled || demoted {
-		h.disconnectUserSessions(r.Context(), targetID)
-		if policy.IsDisabled {
+	if policy.IsDisabled {
+		if h.authSvc != nil {
+			_ = h.authSvc.RevokeUserTokens(r.Context(), targetID)
+		} else {
 			_ = h.userRepo.DeleteTokensByUser(r.Context(), targetID)
 		}
+		h.disconnectUserSessions(r.Context(), targetID)
+	} else if demoted {
+		h.disconnectUserSessions(r.Context(), targetID)
 	}
-	h.authSvc.InvalidateUserCache(targetID)
+	if h.authSvc != nil {
+		h.authSvc.InvalidateUserCache(targetID)
+	}
 	httpx.NoContent(w)
 }
 
@@ -697,6 +752,11 @@ func (h *Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
 		if !activeCutoff.IsZero() && s.LastActivityDate.Before(activeCutoff) {
 			continue
 		}
+		if !isAdmin && s.NowPlayingItem != nil {
+			cp := *s.NowPlayingItem
+			dto.SanitizeItemPaths(&cp)
+			s.NowPlayingItem = &cp
+		}
 		out = append(out, s)
 	}
 	httpx.JSON(w, http.StatusOK, out)
@@ -712,6 +772,9 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 		_ = h.authSvc.RevokeToken(r.Context(), ac.Token)
 		if h.sessionMgr != nil && ac.User != nil {
 			h.sessionMgr.RemoveSession(ac.User.ID, ac.Client.DeviceID)
+		}
+		if h.wsHub != nil {
+			h.wsHub.DisconnectToken(ac.Token)
 		}
 	}
 	httpx.NoContent(w)
@@ -910,6 +973,28 @@ func (h *Handler) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 	deviceID := strings.TrimSpace(q.Get("Id"))
 	if deviceID == "" {
 		httpx.Error(w, http.StatusBadRequest, "missing Id query parameter")
+		return
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && !ac.IsAdmin() {
+		callerID := guid.Normalize(ac.UserID())
+		if callerID == "" {
+			httpx.Error(w, http.StatusForbidden, "Forbidden")
+			return
+		}
+		if h.userRepo != nil && h.userRepo.Store() != nil && h.userRepo.Store().Writer != nil {
+			_, _ = h.userRepo.Store().Writer.ExecContext(r.Context(),
+				`DELETE FROM access_tokens WHERE user_id = ? AND device_id = ?`, callerID, deviceID)
+		}
+		if h.authSvc != nil {
+			h.authSvc.InvalidateUserCache(callerID)
+		}
+		if h.sessionMgr != nil {
+			h.sessionMgr.RemoveSession(callerID, deviceID)
+		}
+		if h.wsHub != nil {
+			h.wsHub.DisconnectUserDevice(callerID, deviceID)
+		}
+		httpx.NoContent(w)
 		return
 	}
 	if err := h.authSvc.RevokeDevice(r.Context(), deviceID); err != nil {

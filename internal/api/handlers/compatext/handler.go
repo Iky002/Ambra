@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -184,9 +185,11 @@ func (h *Handler) hasLiveTvAccess(r *http.Request) bool {
 			return true
 		}
 		if ur := h.resolveUserRepo(); ur != nil {
-			if u, err := ur.GetUserByID(r.Context(), guid.Normalize(ac.UserID())); err == nil && u != nil {
-				return u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableLiveTvAccess
+			u, err := ur.GetUserByID(r.Context(), guid.Normalize(ac.UserID()))
+			if err != nil || u == nil {
+				return false
 			}
+			return u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableLiveTvAccess
 		}
 		return ac.User != nil && ac.User.Policy.EnableLiveTvAccess
 	}
@@ -221,12 +224,14 @@ func (h *Handler) canDownloadContent(r *http.Request) bool {
 			return true
 		}
 		if ur := h.resolveUserRepo(); ur != nil {
-			if u, err := ur.GetUserByID(r.Context(), guid.Normalize(ac.UserID())); err == nil && u != nil {
-				if u.IsAdmin || u.Policy.IsAdministrator {
-					return true
-				}
-				return u.Policy.EnableContentDownloading
+			u, err := ur.GetUserByID(r.Context(), guid.Normalize(ac.UserID()))
+			if err != nil || u == nil {
+				return false
 			}
+			if u.IsAdmin || u.Policy.IsAdministrator {
+				return true
+			}
+			return u.Policy.EnableContentDownloading
 		}
 		return ac.User != nil && ac.User.Policy.EnableContentDownloading
 	}
@@ -260,31 +265,43 @@ func (h *Handler) canAccessItemID(r *http.Request, itemID string) bool {
 		return true
 	}
 	rec, err := libRepo.GetItemRecordByID(r.Context(), normID)
-	if err != nil || rec == nil {
+	if errors.Is(err, sqlite.ErrNotFound) {
 		return true
+	}
+	if err != nil || rec == nil {
+		return false
 	}
 
 	var policy *dto.UserPolicy
 	if ur := h.resolveUserRepo(); ur != nil {
-		if u, err := ur.GetUserByID(r.Context(), callerID); err == nil && u != nil {
-			if u.IsAdmin || u.Policy.IsAdministrator {
-				return true
-			}
-			p := u.Policy
-			policy = &p
+		u, err := ur.GetUserByID(r.Context(), callerID)
+		if err != nil || u == nil {
+			return false
 		}
-	}
-	if policy == nil {
-		if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil {
-			p := ac.User.Policy
-			policy = &p
+		if u.IsAdmin || u.Policy.IsAdministrator {
+			return true
 		}
+		p := u.Policy
+		policy = &p
+	} else if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil {
+		p := ac.User.Policy
+		policy = &p
 	}
 	if policy == nil {
 		return false
 	}
 
-	if !policy.EnableAllFolders && rec.LibraryID != "" {
+	if strings.EqualFold(rec.Type, "Playlist") {
+		ownerID := guid.Normalize(rec.ParentID)
+		if ownerID != "" && ownerID != callerID {
+			var vis struct {
+				IsPublic bool `json:"IsPublic"`
+			}
+			if !h.readConfigJSON(r.Context(), "item_visibility_"+guid.Normalize(rec.ID), &vis) || !vis.IsPublic {
+				return false
+			}
+		}
+	} else if !policy.EnableAllFolders && rec.LibraryID != "" {
 		normLib := guid.Normalize(rec.LibraryID)
 		allowed := false
 		for _, fid := range policy.EnabledFolders {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"path/filepath"
@@ -21,7 +22,10 @@ import (
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
-const stateConfigKey = "sync:state"
+const (
+	stateConfigKey    = "sync:state"
+	maxSyncJobItemIDs = 500
+)
 
 // ErrForbidden is returned when a caller attempts to mutate or access another user's sync resources.
 var ErrForbidden = errors.New("forbidden")
@@ -520,6 +524,10 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid sync job payload")
 		return
 	}
+	if len(req.ItemIds) > maxSyncJobItemIDs {
+		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("ItemIds exceeds maximum limit of %d per sync job", maxSyncJobItemIDs))
+		return
+	}
 	if req.TargetId == "" {
 		req.TargetId = "local-device"
 	}
@@ -941,9 +949,65 @@ func (h *Handler) handleEnableJobItem(w http.ResponseWriter, r *http.Request) {
 	httpx.Error(w, http.StatusNotFound, "sync job item not found")
 }
 
+func (h *Handler) resolveCallerUserForSync(r *http.Request, callerID string) (*sqlite.UserRecord, bool) {
+	if userRepo := h.getUserRepo(); userRepo != nil {
+		if callerID == "" {
+			return nil, false
+		}
+		u, err := userRepo.GetUserByID(r.Context(), callerID)
+		if err != nil || u == nil || u.IsDisabled {
+			return nil, false
+		}
+		return u, true
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil {
+		if ac.User.IsDisabled {
+			return nil, false
+		}
+		return ac.User, true
+	}
+	return nil, false
+}
+
+func canUserAccessItemRecord(ctx context.Context, libRepo *sqlite.LibraryRepo, callerUser *sqlite.UserRecord, rec *sqlite.ItemRecord) bool {
+	if callerUser == nil || rec == nil || callerUser.IsAdmin || callerUser.Policy.IsAdministrator {
+		return true
+	}
+	if rec.LibraryID != "" && !callerUser.Policy.EnableAllFolders {
+		normLib := guid.Normalize(rec.LibraryID)
+		allowed := false
+		for _, fid := range callerUser.Policy.EnabledFolders {
+			if guid.Normalize(fid) == normLib {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return false
+		}
+	}
+	if libRepo != nil {
+		blocked, err := libRepo.IsItemBlockedByParentalPolicy(ctx, rec, callerUser.Policy.MaxParentalRating, callerUser.Policy.BlockedTags)
+		if err != nil || blocked {
+			return false
+		}
+	}
+	return true
+}
+
 func (h *Handler) handleReadyItems(w http.ResponseWriter, r *http.Request) {
 	targetID := httpx.ParseQuery(r).Get("TargetId")
 	callerID, isAdmin, hasAuth := callerAuth(r)
+
+	var callerUser *sqlite.UserRecord
+	if hasAuth && !isAdmin {
+		u, ok := h.resolveCallerUserForSync(r, callerID)
+		if !ok {
+			httpx.Error(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		callerUser = u
+	}
 
 	type readyEntry struct {
 		item   SyncedItem
@@ -988,23 +1052,27 @@ func (h *Handler) handleReadyItems(w http.ResponseWriter, r *http.Request) {
 
 	libRepo := h.getLibraryRepo()
 	serverID := h.serverID()
-	ready := make([]SyncedItem, len(entries))
-	for i, e := range entries {
-		ready[i] = e.item
+	ready := make([]SyncedItem, 0, len(entries))
+	for _, e := range entries {
+		entry := e.item
 		if libRepo != nil {
-			if itemDTO, err := libRepo.GetItemByID(r.Context(), serverID, e.userID, e.item.ItemId); err == nil && itemDTO != nil {
-				if ready[i].OriginalFile == "" && itemDTO.Path != "" {
-					ready[i].OriginalFile = filepath.Base(itemDTO.Path)
+			if hasAuth && !isAdmin {
+				rec, recErr := libRepo.GetItemRecordByID(r.Context(), entry.ItemId)
+				if recErr != nil || rec == nil || !canUserAccessItemRecord(r.Context(), libRepo, callerUser, rec) {
+					continue
+				}
+			}
+			if itemDTO, err := libRepo.GetItemByID(r.Context(), serverID, e.userID, entry.ItemId); err == nil && itemDTO != nil {
+				if entry.OriginalFile == "" && itemDTO.Path != "" {
+					entry.OriginalFile = filepath.Base(itemDTO.Path)
 				}
 				if hasAuth && !isAdmin {
-					itemDTO.Path = ""
-					for j := range itemDTO.MediaSources {
-						itemDTO.MediaSources[j].Path = ""
-					}
+					dto.SanitizeItemPaths(itemDTO)
 				}
-				ready[i].Item = itemDTO
+				entry.Item = itemDTO
 			}
 		}
+		ready = append(ready, entry)
 	}
 	httpx.JSON(w, http.StatusOK, ready)
 }

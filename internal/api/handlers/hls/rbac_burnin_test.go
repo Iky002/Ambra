@@ -105,10 +105,22 @@ func TestHLSRBACAndLiveStreamOwnership(t *testing.T) {
 		t.Fatalf("POST /LiveStreams/Open forbidden item: got %d, want 403", rec.Code)
 	}
 
-	// Allowed library item succeeds and registers session with UserID.
+	// Allowed library item master.m3u8 succeeds WITHOUT pre-allocating a transcode slot.
 	rec := doReq(userA, http.MethodGet, "/Videos/"+allowedItem.ID+"/master.m3u8?DeviceId=devA&PlaySessionId=psA", nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET master.m3u8 allowed item: got %d, want 200", rec.Code)
+	}
+	if len(mgr.ActiveSessions()) != 0 {
+		t.Fatalf("expected master.m3u8 not to allocate transcode session, got %d", len(mgr.ActiveSessions()))
+	}
+
+	// main.m3u8 registers the session with UserID.
+	rec = doReq(userA, http.MethodGet, "/Videos/"+allowedItem.ID+"/main.m3u8?DeviceId=devA&PlaySessionId=psA", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET main.m3u8 allowed item: got %d, want 200", rec.Code)
+	}
+	if len(mgr.ActiveSessions()) != 1 {
+		t.Fatalf("expected 1 active session after main.m3u8, got %d", len(mgr.ActiveSessions()))
 	}
 
 	// userB cannot kill userA's active encoding.

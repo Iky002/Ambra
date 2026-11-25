@@ -140,6 +140,11 @@ type xmlActor struct {
 	Role string `xml:"role"`
 }
 
+type xmlSet struct {
+	Name    string `xml:"name"`
+	RawText string `xml:",chardata"`
+}
+
 type xmlNFO struct {
 	XMLName       xml.Name      `xml:""`
 	Title         string        `xml:"title"`
@@ -154,6 +159,8 @@ type xmlNFO struct {
 	Rating        string        `xml:"rating"`
 	Ratings       xmlRatings    `xml:"ratings"`
 	MPAA          string        `xml:"mpaa"`
+	LockData      string        `xml:"lockdata"`
+	Set           *xmlSet       `xml:"set"`
 	Genres        []string      `xml:"genre"`
 	Studios       []string      `xml:"studio"`
 	Tags          []string      `xml:"tag"`
@@ -183,7 +190,17 @@ func ParseNFO(data []byte) (*plugins.MetadataResult, error) {
 		Overview:       strings.TrimSpace(doc.Plot),
 		Tagline:        strings.TrimSpace(doc.Tagline),
 		OfficialRating: strings.TrimSpace(doc.MPAA),
+		LockData:       parseNFOBool(doc.LockData),
 		ProviderIDs:    make(map[string]string),
+	}
+	if doc.Set != nil {
+		setName := strings.TrimSpace(doc.Set.Name)
+		if setName == "" {
+			setName = strings.TrimSpace(doc.Set.RawText)
+		}
+		if setName != "" {
+			res.Collection = &plugins.CollectionMeta{Name: setName}
+		}
 	}
 	if res.Overview == "" {
 		res.Overview = strings.TrimSpace(doc.Outline)
@@ -276,4 +293,13 @@ func ParseNFO(data []byte) (*plugins.MetadataResult, error) {
 		}
 	}
 	return res, nil
+}
+
+func parseNFOBool(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "1", "yes":
+		return true
+	default:
+		return false
+	}
 }

@@ -39,7 +39,10 @@ const (
 	authByIDRateWindow        = time.Minute
 	maxSessionUsersEntries    = 500
 	maxCameraUploadsEntries   = 500
+	maxHomeSectionsEntries    = 500
+	maxSearchedItemsEntries   = 50
 	maxPartyMessageBytes      = 64 << 10
+	maxKVJSONBodyBytes        = 64 << 10
 )
 
 type forgotPinEntry struct {
@@ -59,9 +62,9 @@ type remoteCommandRecord struct {
 	At        time.Time
 }
 
-// WSSender pushes Emby WebSocket messages to connected devices.
+// WSSender pushes Emby WebSocket messages to connected user devices.
 type WSSender interface {
-	SendToDevice(deviceID string, msg ws.Message)
+	SendToUserDevice(userID, deviceID string, msg ws.Message)
 }
 
 // Handler implements the Emby 4.10.2.0 compatibility routes for users, sessions,
@@ -83,6 +86,7 @@ type Handler struct {
 	forgotRates       map[string][]time.Time
 	forgotPinRates    map[string][]time.Time
 	authByIDRates     map[string][]time.Time
+	authByIDUserRates map[string][]time.Time
 	sessionUsers      map[string]map[string]bool
 	remoteCommands    []remoteCommandRecord
 	restartRequested  bool
@@ -102,18 +106,19 @@ func New(
 	registry *plugins.Registry,
 ) *Handler {
 	return &Handler{
-		cfg:            cfg,
-		store:          store,
-		userRepo:       userRepo,
-		libRepo:        libRepo,
-		sessions:       sessions,
-		registry:       registry,
-		memKV:          make(map[string]string),
-		forgotPins:     make(map[string]forgotPinEntry),
-		forgotRates:    make(map[string][]time.Time),
-		forgotPinRates: make(map[string][]time.Time),
-		authByIDRates:  make(map[string][]time.Time),
-		sessionUsers:   make(map[string]map[string]bool),
+		cfg:               cfg,
+		store:             store,
+		userRepo:          userRepo,
+		libRepo:           libRepo,
+		sessions:          sessions,
+		registry:          registry,
+		memKV:             make(map[string]string),
+		forgotPins:        make(map[string]forgotPinEntry),
+		forgotRates:       make(map[string][]time.Time),
+		forgotPinRates:    make(map[string][]time.Time),
+		authByIDRates:     make(map[string][]time.Time),
+		authByIDUserRates: make(map[string][]time.Time),
+		sessionUsers:      make(map[string]map[string]bool),
 	}
 }
 

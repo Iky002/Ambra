@@ -37,7 +37,12 @@ func TestCatalogUserIdOwnershipEnforcement(t *testing.T) {
 		ID: guid.New(), LibraryID: lib.ID, ParentID: lib.ID,
 		Type: "Movie", MediaType: "Video", Name: "Movie1", SortName: "movie1",
 	}
+	ch := &sqlite.ItemRecord{
+		ID: guid.New(), LibraryID: lib.ID, ParentID: lib.ID,
+		Type: "Channel", IsFolder: true, Name: "TestChannel", SortName: "testchannel",
+	}
 	_ = repo.UpsertItem(ctx, m)
+	_ = repo.UpsertItem(ctx, ch)
 
 	adminAuth, _ := authSvc.AuthenticateByName(ctx, "admin", "admin123", "", auth.ClientInfo{DeviceID: "d-admin"})
 	aliceAuth, _ := authSvc.AuthenticateByName(ctx, "alice", "alice123", "", auth.ClientInfo{DeviceID: "d-alice"})
@@ -74,7 +79,7 @@ func TestCatalogUserIdOwnershipEnforcement(t *testing.T) {
 		"/Movies/" + m.ID + "/Similar?UserId=" + bob.ID,
 		"/Albums/" + m.ID + "/InstantMix?UserId=" + bob.ID,
 		"/Trailers?UserId=" + bob.ID,
-		"/Channels/" + lib.ID + "/Items?UserId=" + bob.ID,
+		"/Channels/" + ch.ID + "/Items?UserId=" + bob.ID,
 		"/Tags?UserId=" + bob.ID,
 	}
 	for _, ep := range endpoints {

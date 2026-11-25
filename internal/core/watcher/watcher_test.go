@@ -253,3 +253,93 @@ func TestWatcherInternalEdgeBranches(t *testing.T) {
 		t.Fatalf("expected non-empty fallback dirKey for missing path")
 	}
 }
+
+func TestWatcherSymlinkPolicyAndEscapeBlocked(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+
+	// Create an internal dir and an escaping symlink pointing outside library root.
+	insideDir := filepath.Join(root, "inside")
+	if err := os.MkdirAll(insideDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	escapeLink := filepath.Join(root, "escape_dir")
+	if err := os.Symlink(outside, escapeLink); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+	// Also create a valid intra-root symlink.
+	intraLink := filepath.Join(root, "intra_link")
+	if err := os.Symlink(insideDir, intraLink); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Default policy (SymlinkFollowDirect) blocks escaping symlink target outside root.
+	var mu sync.Mutex
+	var events []string
+	w, err := New(func(_ context.Context, _ string, paths []string) {
+		mu.Lock()
+		events = append(events, paths...)
+		mu.Unlock()
+	}, WithDebounce(30*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	if err := w.WatchLibrary("lib-sec", []string{root}); err != nil {
+		t.Fatalf("WatchLibrary: %v", err)
+	}
+	w.mu.Lock()
+	_, watchingEscape := w.dirToLib[escapeLink]
+	_, watchingOutside := w.dirToLib[outside]
+	w.mu.Unlock()
+	if watchingEscape || watchingOutside {
+		t.Fatalf("watcher must NOT watch symlink escaping root: escape=%v outside=%v", watchingEscape, watchingOutside)
+	}
+
+	// handleEvent on escaping symlink file/dir must be ignored and never schedule debounce.
+	escapeFile := filepath.Join(root, "escape_file.mkv")
+	outsideFile := filepath.Join(outside, "secret.mkv")
+	_ = os.WriteFile(outsideFile, []byte("secret"), 0o644)
+	_ = os.Symlink(outsideFile, escapeFile)
+
+	w.handleEvent(fsnotify.Event{Name: escapeFile, Op: fsnotify.Create})
+	w.handleEvent(fsnotify.Event{Name: escapeLink, Op: fsnotify.Create})
+	time.Sleep(80 * time.Millisecond)
+
+	mu.Lock()
+	gotEvents := append([]string(nil), events...)
+	mu.Unlock()
+	if len(gotEvents) != 0 {
+		t.Fatalf("expected escaping symlink events to be ignored, got %v", gotEvents)
+	}
+
+	// 2. SymlinkIgnore policy ignores even intra-root symlinks.
+	wIgnore, err := New(func(_ context.Context, _ string, paths []string) {
+		mu.Lock()
+		events = append(events, paths...)
+		mu.Unlock()
+	}, WithDebounce(30*time.Millisecond), WithSymlinkPolicy(SymlinkIgnore))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wIgnore.Close()
+
+	if err := wIgnore.WatchLibrary("lib-ign", []string{root}); err != nil {
+		t.Fatal(err)
+	}
+	wIgnore.mu.Lock()
+	_, watchingIntra := wIgnore.dirToLib[intraLink]
+	wIgnore.mu.Unlock()
+	if watchingIntra {
+		t.Fatalf("SymlinkIgnore policy must not watch intra-root symlink %q", intraLink)
+	}
+	wIgnore.handleEvent(fsnotify.Event{Name: intraLink, Op: fsnotify.Create})
+	time.Sleep(80 * time.Millisecond)
+	mu.Lock()
+	gotEvents2 := append([]string(nil), events...)
+	mu.Unlock()
+	if len(gotEvents2) != 0 {
+		t.Fatalf("expected SymlinkIgnore to drop symlink event, got %v", gotEvents2)
+	}
+}

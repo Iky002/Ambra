@@ -14,9 +14,10 @@ import (
 )
 
 const (
-	maxParties      = 200
-	minPlaybackRate = 0.25
-	maxPlaybackRate = 4.0
+	maxParties        = 200
+	maxPartiesPerUser = 10
+	minPlaybackRate   = 0.25
+	maxPlaybackRate   = 4.0
 )
 
 type PartyState struct {
@@ -80,15 +81,33 @@ func (h *Handler) resolveUserID(r *http.Request, explicit string) string {
 	return ""
 }
 
+func sanitizePartyForCaller(p Party, callerID string, isAdmin, hasAuth bool) Party {
+	if len(p.Members) > 0 {
+		p.Members = append([]string(nil), p.Members...)
+	}
+	if hasAuth && !isAdmin && (callerID == "" || guid.Normalize(p.HostUserId) != callerID) {
+		p.InviteCode = ""
+	}
+	return p
+}
+
+func sanitizePartyForEvent(p Party) Party {
+	if len(p.Members) > 0 {
+		p.Members = append([]string(nil), p.Members...)
+	}
+	p.InviteCode = ""
+	return p
+}
+
 func (h *Handler) handleListParties(w http.ResponseWriter, r *http.Request) {
 	callerID, isAdmin, hasAuth := callerAuth(r)
 	h.mu.RLock()
 	items := make([]Party, 0, len(h.state.Parties))
 	for _, p := range h.state.Parties {
-		if hasAuth && !isAdmin && (callerID == "" || (guid.Normalize(p.HostUserId) != callerID && !isPartyMember(p.Members, callerID))) {
+		if hasAuth && !isAdmin && !p.IsPublic && (callerID == "" || (guid.Normalize(p.HostUserId) != callerID && !isPartyMember(p.Members, callerID))) {
 			continue
 		}
-		items = append(items, p)
+		items = append(items, sanitizePartyForCaller(p, callerID, isAdmin, hasAuth))
 	}
 	h.mu.RUnlock()
 	httpx.JSON(w, http.StatusOK, items)
@@ -112,6 +131,7 @@ func (h *Handler) handleCreateParty(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = "Watch Party"
 	}
+	_, isAdmin, _ := callerAuth(r)
 	hostID := h.resolveUserID(r, req.HostUserId)
 	members := []string{}
 	if hostID != "" {
@@ -149,6 +169,19 @@ func (h *Handler) handleCreateParty(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusTooManyRequests, "maximum number of active watch parties reached")
 		return
 	}
+	if !isAdmin && hostID != "" {
+		ownedCount := 0
+		for _, existing := range h.state.Parties {
+			if guid.Normalize(existing.HostUserId) == hostID {
+				ownedCount++
+			}
+		}
+		if ownedCount >= maxPartiesPerUser {
+			h.mu.Unlock()
+			httpx.Error(w, http.StatusTooManyRequests, "maximum number of active watch parties per user reached")
+			return
+		}
+	}
 	h.state.Parties = append(h.state.Parties, party)
 	err := h.saveStateLocked(r.Context())
 	h.mu.Unlock()
@@ -167,11 +200,11 @@ func (h *Handler) handleGetParty(w http.ResponseWriter, r *http.Request) {
 	defer h.mu.RUnlock()
 	for _, p := range h.state.Parties {
 		if p.Id == id {
-			if hasAuth && !isAdmin && (callerID == "" || (guid.Normalize(p.HostUserId) != callerID && !isPartyMember(p.Members, callerID))) {
+			if hasAuth && !isAdmin && !p.IsPublic && (callerID == "" || (guid.Normalize(p.HostUserId) != callerID && !isPartyMember(p.Members, callerID))) {
 				httpx.Error(w, http.StatusForbidden, "only party members, host, or an administrator can view this party")
 				return
 			}
-			httpx.JSON(w, http.StatusOK, p)
+			httpx.JSON(w, http.StatusOK, sanitizePartyForCaller(p, callerID, isAdmin, hasAuth))
 			return
 		}
 	}
@@ -219,7 +252,7 @@ func (h *Handler) handleJoinParty(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "UserId is required")
 		return
 	}
-	callerID, isAdmin, _ := callerAuth(r)
+	callerID, isAdmin, hasAuth := callerAuth(r)
 
 	h.mu.Lock()
 	for i := range h.state.Parties {
@@ -236,7 +269,7 @@ func (h *Handler) handleJoinParty(w http.ResponseWriter, r *http.Request) {
 			}
 			exists := false
 			for _, m := range p.Members {
-				if m == userID {
+				if guid.Normalize(m) == userID {
 					exists = true
 					break
 				}
@@ -245,7 +278,7 @@ func (h *Handler) handleJoinParty(w http.ResponseWriter, r *http.Request) {
 				p.Members = append(p.Members, userID)
 				_ = h.saveStateLocked(r.Context())
 			}
-			party := *p
+			party := sanitizePartyForCaller(*p, callerID, isAdmin, hasAuth)
 			h.mu.Unlock()
 			httpx.JSON(w, http.StatusOK, party)
 			return
@@ -268,13 +301,28 @@ func (h *Handler) handleLeaveParty(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "UserId is required")
 		return
 	}
+	callerID, isAdmin, hasAuth := callerAuth(r)
 
 	h.mu.Lock()
 	for i := range h.state.Parties {
 		if h.state.Parties[i].Id == id {
-			kept := make([]string, 0, len(h.state.Parties[i].Members))
-			for _, m := range h.state.Parties[i].Members {
-				if m != userID {
+			p := &h.state.Parties[i]
+			isMemberOrHost := isPartyMember(p.Members, userID) || guid.Normalize(p.HostUserId) == userID
+			if !isAdmin {
+				if hasAuth && (callerID == "" || (guid.Normalize(p.HostUserId) != callerID && !isPartyMember(p.Members, callerID))) {
+					h.mu.Unlock()
+					httpx.Error(w, http.StatusForbidden, "only party members, host, or an administrator can leave this party")
+					return
+				}
+				if !isMemberOrHost {
+					h.mu.Unlock()
+					httpx.Error(w, http.StatusForbidden, "caller is not a member of this party")
+					return
+				}
+			}
+			kept := make([]string, 0, len(p.Members))
+			for _, m := range p.Members {
+				if guid.Normalize(m) != userID {
 					kept = append(kept, m)
 				}
 			}
@@ -338,17 +386,18 @@ func (h *Handler) handleUpdatePartyState(w http.ResponseWriter, r *http.Request)
 				st.PlaybackRate = *req.PlaybackRate
 			}
 			st.UpdatedAt = time.Now().UTC()
-			party := *p
+			respParty := sanitizePartyForCaller(*p, callerID, isAdmin, hasAuth)
+			eventParty := sanitizePartyForEvent(*p)
 			_ = h.saveStateLocked(r.Context())
 			h.mu.Unlock()
 
 			if h.bus != nil {
 				h.bus.Publish(r.Context(), eventbus.Event{
 					Type:    eventbus.EventSessionUpdated,
-					Payload: party,
+					Payload: eventParty,
 				})
 			}
-			httpx.JSON(w, http.StatusOK, party)
+			httpx.JSON(w, http.StatusOK, respParty)
 			return
 		}
 	}

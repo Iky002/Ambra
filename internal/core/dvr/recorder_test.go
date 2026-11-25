@@ -87,7 +87,7 @@ func TestStartRecordingSuccessAndEventBus(t *testing.T) {
 		TimerID:     "timer-001",
 		ChannelName: "CCTV 5+",
 		ProgramName: "足球/直播",
-		StreamURL:   "http://127.0.0.1:8080/ch5.ts",
+		StreamURL:   "http://192.168.1.50:8080/ch5.ts",
 		Duration:    5 * time.Second,
 	})
 	if err != nil {
@@ -140,7 +140,7 @@ func TestStartRecordingErrorsAndFailure(t *testing.T) {
 
 	if _, err := rec.StartRecording(context.Background(), RecordingJob{
 		TimerID:   "fail-1",
-		StreamURL: "http://127.0.0.1:8080/fail.ts",
+		StreamURL: "http://192.168.1.50:8080/fail.ts",
 	}); err != nil {
 		t.Fatalf("unexpected start error: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestStartRecordingErrorsAndFailure(t *testing.T) {
 	defer badRec.Close()
 	if _, err := badRec.StartRecording(context.Background(), RecordingJob{
 		TimerID:   "missing-bin",
-		StreamURL: "http://127.0.0.1:8080/a.ts",
+		StreamURL: "http://192.168.1.50:8080/a.ts",
 	}); err == nil {
 		t.Fatal("expected error when ffmpeg binary does not exist")
 	}
@@ -183,7 +183,7 @@ func TestCancelRecordingActiveAndClose(t *testing.T) {
 	for _, id := range []string{"b-timer", "a-timer"} {
 		if _, err := rec.StartRecording(context.Background(), RecordingJob{
 			TimerID:   id,
-			StreamURL: "http://127.0.0.1:8080/" + id,
+			StreamURL: "http://192.168.1.50:8080/" + id,
 		}); err != nil {
 			t.Fatalf("StartRecording %s failed: %v", id, err)
 		}
@@ -192,7 +192,7 @@ func TestCancelRecordingActiveAndClose(t *testing.T) {
 	// Duplicate active TimerID should be rejected.
 	if _, err := rec.StartRecording(context.Background(), RecordingJob{
 		TimerID:   "a-timer",
-		StreamURL: "http://127.0.0.1:8080/dup",
+		StreamURL: "http://192.168.1.50:8080/dup",
 	}); !errors.Is(err, ErrAlreadyRecording) {
 		t.Fatalf("expected ErrAlreadyRecording, got %v", err)
 	}
@@ -220,7 +220,7 @@ func TestCancelRecordingActiveAndClose(t *testing.T) {
 	}
 	if _, err := rec.StartRecording(context.Background(), RecordingJob{
 		TimerID:   "after-close",
-		StreamURL: "http://127.0.0.1:8080/x",
+		StreamURL: "http://192.168.1.50:8080/x",
 	}); !errors.Is(err, ErrRecorderClosed) {
 		t.Fatalf("expected ErrRecorderClosed, got %v", err)
 	}
@@ -251,7 +251,7 @@ func TestSchedulerLoop(t *testing.T) {
 				return nil, errors.New("temporary db error")
 			}
 			return []RecordingJob{
-				{TimerID: "sched-1", ChannelName: "HBO", ProgramName: "Movie", StreamURL: "http://127.0.0.1:8080/hbo"},
+				{TimerID: "sched-1", ChannelName: "HBO", ProgramName: "Movie", StreamURL: "http://192.168.1.50:8080/hbo"},
 				{TimerID: "", StreamURL: ""}, // invalid job logged and skipped
 			}, nil
 		})
@@ -303,7 +303,7 @@ func TestSetOnFinishedCallback(t *testing.T) {
 	for _, id := range []string{"cb-ok", "cb-fail", "cb-cancel"} {
 		if _, err := rec.StartRecording(context.Background(), RecordingJob{
 			TimerID:   id,
-			StreamURL: "http://127.0.0.1:8080/" + id,
+			StreamURL: "http://192.168.1.50:8080/" + id,
 		}); err != nil {
 			t.Fatalf("StartRecording %s: %v", id, err)
 		}
@@ -347,7 +347,7 @@ func TestStartRecordingStartFailureInvokesOnFinished(t *testing.T) {
 
 	if _, err := rec.StartRecording(context.Background(), RecordingJob{
 		TimerID:   "start-fail-cb",
-		StreamURL: "http://127.0.0.1:8080/stream.ts",
+		StreamURL: "http://192.168.1.50:8080/stream.ts",
 	}); err == nil {
 		t.Fatal("expected StartRecording error for missing binary")
 	}
@@ -357,5 +357,95 @@ func TestStartRecordingStartFailureInvokesOnFinished(t *testing.T) {
 	}
 	if gotState.Job.TimerID != "start-fail-cb" || gotState.Status != StatusFailed || gotState.Error == "" {
 		t.Fatalf("unexpected failed callback state: %+v", gotState)
+	}
+}
+
+func TestStartRecordingRejectsLoopbackAndSSRF(t *testing.T) {
+	tmpDir := t.TempDir()
+	rec := NewRecorder(Options{
+		DataDir:    tmpDir,
+		FFmpegPath: "/bin/sh",
+		ArgsBuilder: func(_ RecordingJob, _ string) []string {
+			return []string{"-c", "exit 0"}
+		},
+	})
+	defer rec.Close()
+
+	blocked := []string{
+		"http://127.0.0.1:8080/live.ts",
+		"http://localhost:8096/live.ts",
+		"http://[::1]:8080/live.ts",
+		"http://169.254.169.254/latest/meta-data/",
+		"file:///etc/passwd",
+		"rtmp://192.168.1.50/live/stream",
+	}
+	for _, u := range blocked {
+		if _, err := rec.StartRecording(context.Background(), RecordingJob{
+			TimerID:   "blocked-" + u,
+			StreamURL: u,
+		}); err == nil {
+			t.Errorf("expected SSRF/loopback URL %q to be rejected", u)
+		}
+	}
+}
+
+func TestCancelRecordingGracefulQuitAndTimeoutKill(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. Process reads 'q' from stdin and writes finalized marker before exiting cleanly.
+	rec := NewRecorder(Options{
+		DataDir:    tmpDir,
+		FFmpegPath: "/bin/sh",
+		ArgsBuilder: func(_ RecordingJob, outFile string) []string {
+			return []string{"-c", `trap '' INT; IFS= read -r line; printf 'finalized:%s' "$line" > "$1"`, "--", outFile}
+		},
+	})
+	defer rec.Close()
+
+	st, err := rec.StartRecording(context.Background(), RecordingJob{
+		TimerID:   "graceful-q",
+		StreamURL: "http://192.168.1.50:8080/live.ts",
+	})
+	if err != nil {
+		t.Fatalf("StartRecording graceful-q: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if err := rec.CancelRecording("graceful-q"); err != nil {
+		t.Fatalf("CancelRecording graceful-q: %v", err)
+	}
+	waitForStatus(t, rec, "graceful-q", StatusCancelled, 3*time.Second)
+	data, err := os.ReadFile(st.OutputPath)
+	if err != nil {
+		t.Fatalf("expected finalized output file: %v", err)
+	}
+	if string(data) != "finalized:q" {
+		t.Fatalf("expected process to receive 'q' on stdin and finalize, got %q", string(data))
+	}
+
+	// 2. Stubborn process ignores stdin & SIGINT -> killed after gracefulTimeout.
+	recKill := NewRecorder(Options{
+		DataDir:    tmpDir,
+		FFmpegPath: "/bin/sh",
+		ArgsBuilder: func(_ RecordingJob, _ string) []string {
+			return []string{"-c", `trap '' INT; sleep 30`}
+		},
+	})
+	recKill.gracefulTimeout = 150 * time.Millisecond
+	defer recKill.Close()
+
+	if _, err := recKill.StartRecording(context.Background(), RecordingJob{
+		TimerID:   "stubborn",
+		StreamURL: "http://192.168.1.50:8080/stubborn.ts",
+	}); err != nil {
+		t.Fatalf("StartRecording stubborn: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	start := time.Now()
+	if err := recKill.CancelRecording("stubborn"); err != nil {
+		t.Fatalf("CancelRecording stubborn: %v", err)
+	}
+	waitForStatus(t, recKill, "stubborn", StatusCancelled, 2*time.Second)
+	if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
+		t.Fatalf("expected graceful wait before SIGKILL, elapsed=%v", elapsed)
 	}
 }

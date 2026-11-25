@@ -155,6 +155,11 @@ func (s *Scanner) scanAndIndexExtras(ctx context.Context, lib *sqlite.LibraryRec
 	}
 
 	dedicatedDir := isDedicatedItemDir(lib, cleanParentDir)
+	libRoot := findContainingRoot(lib.Paths, cleanParentDir)
+	if libRoot == "" {
+		libRoot = cleanParentDir
+	}
+	policy := s.currentSymlinkPolicy()
 	type discoveredExtra struct {
 		path      string
 		extraType string
@@ -167,7 +172,19 @@ func (s *Scanner) scanAndIndexExtras(ctx context.Context, lib *sqlite.LibraryRec
 			continue
 		}
 		fullPath := filepath.Join(cleanParentDir, name)
-		if entry.IsDir() {
+		allowed, isSym := isSymlinkAllowedInRoot(libRoot, fullPath, policy)
+		if !allowed {
+			continue
+		}
+		isDir := entry.IsDir()
+		if isSym {
+			if st, statErr := os.Stat(fullPath); statErr == nil {
+				isDir = st.IsDir()
+			} else {
+				continue
+			}
+		}
+		if isDir {
 			if !dedicatedDir {
 				continue
 			}
@@ -179,10 +196,25 @@ func (s *Scanner) scanAndIndexExtras(ctx context.Context, lib *sqlite.LibraryRec
 				continue
 			}
 			for _, sub := range subEntries {
-				if sub.IsDir() || strings.HasPrefix(sub.Name(), ".") {
+				if strings.HasPrefix(sub.Name(), ".") {
 					continue
 				}
 				subPath := filepath.Join(fullPath, sub.Name())
+				subAllowed, subIsSym := isSymlinkAllowedInRoot(libRoot, subPath, policy)
+				if !subAllowed {
+					continue
+				}
+				if subIsSym && isSym && policy == SymlinkFollowDirect {
+					continue
+				}
+				if sub.IsDir() {
+					continue
+				}
+				if subIsSym {
+					if st, statErr := os.Stat(subPath); statErr != nil || st.IsDir() {
+						continue
+					}
+				}
 				if et, ok := ClassifyExtraFile(cleanParentDir, subPath); ok {
 					found = append(found, discoveredExtra{path: subPath, extraType: et})
 				}

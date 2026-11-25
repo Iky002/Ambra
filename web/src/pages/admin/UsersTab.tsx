@@ -10,10 +10,11 @@ import {
   UserPlus,
   Users,
 } from 'lucide-react'
-import { api } from '../../api/client'
+import { api, ApiError } from '../../api/client'
 import type { UserDto, UserPolicy } from '../../api/types'
 import { QueryErrorState } from '../../components/QueryErrorState'
 import { useAuth } from '../../context/AuthContext'
+import { useI18n } from '../../i18n/I18nContext'
 import {
   AdminModal,
   FeedbackBanner,
@@ -24,6 +25,7 @@ import {
 
 export function UsersTab() {
   const { auth, refreshUser } = useAuth()
+  const { t } = useI18n()
   const queryClient = useQueryClient()
 
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
@@ -157,6 +159,7 @@ export function UsersTab() {
   const handleUpdatePassword = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!pwTarget) return
+    const isSelf = pwTarget.Id === auth?.userId
     setSavingPw(true)
     setFeedback(null)
     try {
@@ -168,12 +171,24 @@ export function UsersTab() {
       await invalidateUsers()
       setFeedback({
         type: 'success',
-        message: resetEmptyPw
-          ? `已将用户「${pwTarget.Name}」的密码重置为空`
-          : `已更新用户「${pwTarget.Name}」的密码`,
+        message: isSelf
+          ? resetEmptyPw
+            ? `已将当前账号「${pwTarget.Name}」的密码重置为空，其他设备会话已自动下线`
+            : `已更新当前账号「${pwTarget.Name}」的密码，其他设备会话已自动下线`
+          : resetEmptyPw
+            ? `已将用户「${pwTarget.Name}」的密码重置为空`
+            : `已更新用户「${pwTarget.Name}」的密码`,
       })
       setPwTarget(null)
     } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        setPwTarget(null)
+        setFeedback({
+          type: 'error',
+          message: '当前登录会话已失效，请重新登录',
+        })
+        return
+      }
       setFeedback({
         type: 'error',
         message: err instanceof Error ? err.message : '更新密码失败',
@@ -272,7 +287,7 @@ export function UsersTab() {
         <div>
           <h2 className="flex items-center gap-2 text-base font-semibold text-zinc-100">
             <Users className="h-4 w-4 text-amber-400" />
-            <span>用户与权限管理 (RBAC)</span>
+            <span>{t('admin.usersTitle')}</span>
           </h2>
           <p className="mt-1 text-xs text-zinc-400">
             管理服务器账号、密码策略、管理员角色与媒体库访问白名单
@@ -285,7 +300,7 @@ export function UsersTab() {
           className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-4 py-2 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/20 transition-colors hover:bg-amber-400"
         >
           <UserPlus className="h-4 w-4" />
-          <span>新建用户</span>
+          <span>{t('admin.createUser')}</span>
         </button>
       </div>
 

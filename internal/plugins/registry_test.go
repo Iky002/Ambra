@@ -97,3 +97,38 @@ func TestRegistry(t *testing.T) {
 		t.Fatalf("unexpected stream resolver order: %s, %s", srs[0].Manifest().ID, srs[1].Manifest().ID)
 	}
 }
+
+func TestRegistryBuiltInProtection(t *testing.T) {
+	reg := NewRegistry()
+
+	// External plugin trying to claim ambra.builtin.* prefix must be rejected.
+	spoof := &stubPlugin{Manifest{
+		ID: "ambra.builtin.evil", Name: "Evil", BuiltIn: false, Enabled: true,
+	}}
+	reg.Register(spoof)
+	if _, ok := reg.Get("ambra.builtin.evil"); ok {
+		t.Fatal("expected external plugin with ambra.builtin. prefix to be rejected")
+	}
+
+	// Legitimate built-in plugin registers fine.
+	builtin := &stubPlugin{Manifest{
+		ID: "ambra.builtin.tmdb", Name: "TMDB", BuiltIn: true, Enabled: true,
+	}}
+	reg.Register(builtin)
+	if got, ok := reg.Get("ambra.builtin.tmdb"); !ok || got != builtin {
+		t.Fatal("expected built-in plugin to register")
+	}
+
+	// External plugin with same ID cannot overwrite built-in plugin (even with non-prefixed built-in ID).
+	customBuiltin := &stubPlugin{Manifest{
+		ID: "core.custom", Name: "Core", BuiltIn: true, Enabled: true,
+	}}
+	reg.Register(customBuiltin)
+	overwrite := &stubPlugin{Manifest{
+		ID: "core.custom", Name: "Hijack", BuiltIn: false, Enabled: true,
+	}}
+	reg.Register(overwrite)
+	if got, ok := reg.Get("core.custom"); !ok || got.Manifest().Name != "Core" {
+		t.Fatalf("expected built-in plugin to remain intact, got %+v", got)
+	}
+}

@@ -28,7 +28,6 @@
   "common.copy": "複製",
   "common.copied": "已複製",
   "common.language": "介面語言",
-
   "nav.home": "首頁",
   "nav.trending": "熱門",
   "nav.collections": "精選集",
@@ -50,7 +49,6 @@
   "nav.demoDesc": "（純前端記憶體模擬，無需後端 · 所有讀寫即時生效）",
   "nav.demoSwitchGuest": "管理員視角 · 切換一般使用者體驗 RBAC",
   "nav.demoSwitchAdmin": "一般使用者視角 · 切回管理員主控台",
-
   "auth.loginTitle": "登入 Ambra",
   "auth.loginSubtitle": "連線到你的私人影院伺服器",
   "auth.username": "使用者名稱",
@@ -65,7 +63,6 @@
   "auth.noAdminDesc": "目前帳號不具備管理員權限（IsAdministrator = false）。如需管理伺服器設定、使用者或媒體庫，請聯絡系統管理員授權。",
   "auth.backHome": "返回首頁",
   "auth.verifyingAdmin": "正在驗證管理員權限...",
-
   "setup.title": "歡迎使用 Ambra",
   "setup.subtitle": "幾步完成私人影院伺服器初始化",
   "setup.serverName": "伺服器名稱",
@@ -73,7 +70,6 @@
   "setup.tmdbLanguage": "中繼資料擷取語言",
   "setup.createAdmin": "建立管理員帳號",
   "setup.complete": "完成初始化",
-
   "home.continueWatching": "繼續觀看",
   "home.nextUp": "接下來播放",
   "home.myMedia": "我的媒體",
@@ -88,7 +84,6 @@
   "home.emptyTitle": "媒體庫還是空的",
   "home.emptyDesc": "前往管理主控台新增本機影音目錄或 .strm 資料夾，並觸發首次掃描。",
   "home.goManageLibraries": "前往新增媒體庫",
-
   "library.allItems": "全部",
   "library.albums": "專輯",
   "library.artists": "藝人",
@@ -111,7 +106,6 @@
   "library.exitMultiSelect": "結束多選",
   "library.selectedCount": "已選 {{count}} 項",
   "library.emptyResult": "沒有符合條件的項目",
-
   "detail.play": "立即播放",
   "detail.resume": "繼續播放",
   "detail.favorite": "最愛",
@@ -146,7 +140,6 @@
   "detail.container": "容器格式",
   "detail.fileSize": "檔案大小",
   "detail.bitrate": "總位元率",
-
   "player.quality": "畫質",
   "player.qualityAuto": "原畫直連",
   "player.version": "版本",
@@ -163,33 +156,27 @@
   "player.playNextNow": "立即播放",
   "player.cancelNextUp": "取消連播",
   "player.loadError": "視訊串流解碼或載入失敗，請檢查媒體格式或網路連線",
-
   "collections.title": "精選集與播放清單",
   "collections.boxSets": "精選集",
   "collections.playlists": "播放清單",
   "collections.createCollection": "新增精選集",
   "collections.createPlaylist": "新增播放清單",
   "collections.playAll": "全部播放",
-
   "favorites.title": "我的最愛",
   "favorites.emptyTitle": "還沒有最愛內容",
   "favorites.emptyDesc": "在電影、影集或音樂頁面點擊最愛按鈕即可加入這裡。",
-
   "trending.title": "熱門榜單",
   "trending.subtitle": "彙整 TMDB 趨勢、豆瓣熱門與 IMDb Top 250，一鍵直達庫內片源",
   "trending.refreshNow": "立即同步榜單",
   "trending.inLibrary": "庫內可播",
-
   "livetv.title": "電視直播",
   "livetv.channels": "頻道列表",
   "livetv.guide": "節目表",
   "livetv.recordings": "我的錄影",
   "livetv.timers": "錄製排程",
-
   "search.title": "探索與搜尋",
   "search.placeholder": "輸入中文、拼音首字母、英文片名或演員名稱...",
   "search.noResults": "找不到符合的電影、影集或演職員",
-
   "profile.title": "個人中心",
   "profile.uiLanguage": "介面語言",
   "profile.uiLanguageDesc": "切換 Web 用戶端顯示語言，並同步向伺服器傳送語言偏好",
@@ -197,11 +184,9 @@
   "profile.avatar": "個人頭像",
   "profile.quickConnect": "Quick Connect 裝置授權",
   "profile.playbackPrefs": "播放偏好設定",
-
   "notifications.title": "通知中心",
   "notifications.markAllRead": "全部已讀",
   "notifications.empty": "暫無通知",
-
   "admin.title": "管理主控台",
   "admin.tabDashboard": "儀表板",
   "admin.tabLibraries": "媒體庫",
@@ -220,5 +205,20 @@
   "admin.serverLogs": "伺服器日誌",
   "admin.downloadLog": "下載日誌",
   "admin.kickDevice": "移除裝置",
-  "admin.revokeKey": "撤銷金鑰"
+  "admin.revokeKey": "撤銷金鑰",
+  "player.cannotPlayTitle": "無法播放該媒體",
+  "player.retryPlayback": "重試播放",
+  "player.goBack": "返回上一頁",
+  "player.subtitleOff": "關閉字幕",
+  "player.subtitleTweaks": "字幕微調",
+  "player.loadingStream": "正在載入媒體串流...",
+  "player.buffering": "正在緩衝...",
+  "admin.scanAllLibraries": "觸發全庫掃描",
+  "admin.scanningAllLibraries": "正在觸發全庫掃描...",
+  "admin.dashboardOverview": "伺服器狀態概覽",
+  "admin.usersTitle": "使用者與權限管理 (RBAC)",
+  "admin.createUser": "新增使用者",
+  "admin.pluginsTitle": "外掛與刮削器管理",
+  "admin.webhooksTitle": "Webhook 事件通知",
+  "admin.createWebhook": "新增 Webhook"
 }

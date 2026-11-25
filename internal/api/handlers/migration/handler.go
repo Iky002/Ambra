@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
@@ -11,6 +12,8 @@ import (
 )
 
 const maxUpstreamErrorBytes = 512
+
+var urlCredentialsRe = regexp.MustCompile(`(?i)(https?://)([^/\s@]+)@`)
 
 // AuthFuncs decouples route registration from the concrete middleware package.
 type AuthFuncs struct {
@@ -165,14 +168,29 @@ func stripURLUserinfo(raw string) string {
 	return u.String()
 }
 
-func truncateErrorMsg(msg string, maxBytes int) string {
-	if len(msg) <= maxBytes {
+func redactURLCredentials(msg string) string {
+	if msg == "" || !strings.Contains(msg, "@") {
 		return msg
 	}
-	if maxBytes <= 3 {
-		return msg[:maxBytes]
+	return urlCredentialsRe.ReplaceAllString(msg, "${1}***@")
+}
+
+func truncateErrorMsg(msg string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
 	}
-	return msg[:maxBytes-3] + "..."
+	runes := []rune(msg)
+	if len(runes) <= maxRunes {
+		return msg
+	}
+	if maxRunes <= 3 {
+		return string(runes[:maxRunes])
+	}
+	return string(runes[:maxRunes-3]) + "..."
+}
+
+func sanitizeErrorMessage(msg string) string {
+	return truncateErrorMsg(redactURLCredentials(msg), maxUpstreamErrorBytes)
 }
 
 func sanitizeReportPtr(rep *coremigration.MigrationReport) *coremigration.MigrationReport {
@@ -188,7 +206,7 @@ func sanitizeReport(rep coremigration.MigrationReport) coremigration.MigrationRe
 	if len(rep.Errors) > 0 {
 		errs := make([]string, len(rep.Errors))
 		for i, e := range rep.Errors {
-			errs[i] = truncateErrorMsg(e, maxUpstreamErrorBytes)
+			errs[i] = sanitizeErrorMessage(e)
 		}
 		rep.Errors = errs
 	}
@@ -197,22 +215,22 @@ func sanitizeReport(rep coremigration.MigrationReport) coremigration.MigrationRe
 
 func writeMigrationError(w http.ResponseWriter, err error) {
 	if errors.Is(err, coremigration.ErrMigrationRunning) {
-		httpx.Error(w, http.StatusConflict, truncateErrorMsg(err.Error(), maxUpstreamErrorBytes))
+		httpx.Error(w, http.StatusConflict, sanitizeErrorMessage(err.Error()))
 		return
 	}
 	var apiErr *coremigration.APIError
 	if errors.As(err, &apiErr) {
 		if apiErr.StatusCode == http.StatusUnauthorized || apiErr.StatusCode == http.StatusForbidden {
-			httpx.Error(w, http.StatusBadGateway, truncateErrorMsg("source Emby rejected credentials: "+apiErr.Error(), maxUpstreamErrorBytes))
+			httpx.Error(w, http.StatusBadGateway, sanitizeErrorMessage("source Emby rejected credentials: "+apiErr.Error()))
 			return
 		}
-		httpx.Error(w, http.StatusBadGateway, truncateErrorMsg(apiErr.Error(), maxUpstreamErrorBytes))
+		httpx.Error(w, http.StatusBadGateway, sanitizeErrorMessage(apiErr.Error()))
 		return
 	}
 	if strings.Contains(err.Error(), "invalid source server URL") ||
 		strings.Contains(err.Error(), "is required") {
-		httpx.Error(w, http.StatusBadRequest, truncateErrorMsg(err.Error(), maxUpstreamErrorBytes))
+		httpx.Error(w, http.StatusBadRequest, sanitizeErrorMessage(err.Error()))
 		return
 	}
-	httpx.Error(w, http.StatusBadGateway, truncateErrorMsg(err.Error(), maxUpstreamErrorBytes))
+	httpx.Error(w, http.StatusBadGateway, sanitizeErrorMessage(err.Error()))
 }

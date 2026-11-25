@@ -600,11 +600,34 @@ func TestSubscribeEventsIntegration(t *testing.T) {
 		t.Fatalf("unexpected sync history shows: %v", shows)
 	}
 
-	// 5. EventUserDataChanged as map[string]any direct payload
+	// 5. EventUserDataChanged as map[string]any direct payload for movie.ID right after
+	//    /scrobble/stop >= 80% is deduplicated (no double-counting).
 	bus.Publish(ctx, eventbus.Event{
 		Type: eventbus.EventUserDataChanged,
 		Payload: map[string]any{
 			"item_id": movie.ID,
+			"played":  true,
+		},
+	})
+	assertNoReq(t, ch, 120*time.Millisecond)
+
+	// A separate movie marked watched via map payload still syncs to /sync/history.
+	movie2 := &sqlite.ItemRecord{
+		ID:             "movie-101",
+		LibraryID:      lib.ID,
+		ParentID:       lib.ID,
+		Type:           "Movie",
+		MediaType:      "Video",
+		Name:           "Tenet",
+		ProductionYear: intPtr(2020),
+	}
+	if err := repo.UpsertItem(ctx, movie2); err != nil {
+		t.Fatal(err)
+	}
+	bus.Publish(ctx, eventbus.Event{
+		Type: eventbus.EventUserDataChanged,
+		Payload: map[string]any{
+			"item_id": movie2.ID,
 			"played":  true,
 		},
 	})
@@ -688,4 +711,121 @@ func TestEventPayloadParsersEdgeCases(t *testing.T) {
 	if got := computeProgress(50, 100, nil); got != 50 {
 		t.Fatalf("got %v, want 50", got)
 	}
+}
+
+func TestTraktMultiUserIsolationPauseThrottleAndDedup(t *testing.T) {
+	srv, ch := newMockTraktServer(t, http.StatusCreated, `{}`)
+	repo := openTestLibraryRepo(t)
+	ctx := context.Background()
+
+	lib, _ := repo.CreateLibrary(ctx, "Movies", "movies", []string{"/media"})
+	movie := &sqlite.ItemRecord{
+		ID:           "mov-iso",
+		LibraryID:    lib.ID,
+		Type:         "Movie",
+		Name:         "Arrival",
+		RuntimeTicks: int64Ptr(10_000_000_000),
+	}
+	if err := repo.UpsertItem(ctx, movie); err != nil {
+		t.Fatal(err)
+	}
+
+	bus := eventbus.New()
+	p := New()
+	p.SetHTTPClient(srv.Client())
+	_ = p.Configure(map[string]any{
+		"enabled":         true,
+		"client_id":       "cid",
+		"access_token":    "tok",
+		"base_url":        srv.URL,
+		"allowed_user_id": "alice",
+	})
+	unsub := p.SubscribeEvents(bus, repo)
+	defer unsub()
+
+	// 1. Events from bob or anonymous user are ignored when allowed_user_id=alice
+	bus.Publish(ctx, eventbus.Event{
+		Type: eventbus.EventPlaybackStart,
+		Payload: session.PlaybackEventPayload{
+			UserId:        "bob",
+			ItemId:        movie.ID,
+			PositionTicks: 1_000_000_000,
+		},
+	})
+	bus.Publish(ctx, eventbus.Event{
+		Type: eventbus.EventPlaybackStart,
+		Payload: session.PlaybackEventPayload{
+			ItemId:        movie.ID,
+			PositionTicks: 1_000_000_000,
+		},
+	})
+	assertNoReq(t, ch, 120*time.Millisecond)
+
+	// 2. Alice's pause heartbeats are throttled (only 1 /scrobble/pause sent for repeated paused ticks)
+	for i := 0; i < 3; i++ {
+		bus.Publish(ctx, eventbus.Event{
+			Type: eventbus.EventPlaybackProgress,
+			Payload: session.PlaybackEventPayload{
+				UserId:        "alice",
+				ItemId:        movie.ID,
+				PositionTicks: 3_000_000_000,
+				IsPaused:      true,
+			},
+		})
+	}
+	req := waitReq(t, ch)
+	if req.Path != "/scrobble/pause" {
+		t.Fatalf("expected /scrobble/pause, got %s", req.Path)
+	}
+	assertNoReq(t, ch, 120*time.Millisecond)
+
+	// Resuming clears pause throttle so a subsequent pause sends again
+	bus.Publish(ctx, eventbus.Event{
+		Type: eventbus.EventPlaybackProgress,
+		Payload: session.PlaybackEventPayload{
+			UserId:        "alice",
+			ItemId:        movie.ID,
+			PositionTicks: 4_000_000_000,
+			IsPaused:      false,
+		},
+	})
+	time.Sleep(40 * time.Millisecond)
+	bus.Publish(ctx, eventbus.Event{
+		Type: eventbus.EventPlaybackProgress,
+		Payload: session.PlaybackEventPayload{
+			UserId:        "alice",
+			ItemId:        movie.ID,
+			PositionTicks: 5_000_000_000,
+			IsPaused:      true,
+		},
+	})
+	req = waitReq(t, ch)
+	if req.Path != "/scrobble/pause" {
+		t.Fatalf("expected second /scrobble/pause after resume, got %s", req.Path)
+	}
+
+	// 3. Stop >= 80% triggers /scrobble/stop and deduplicates immediate EventUserDataChanged
+	bus.Publish(ctx, eventbus.Event{
+		Type: eventbus.EventPlaybackStop,
+		Payload: session.PlaybackEventPayload{
+			UserId:        "alice",
+			ItemId:        movie.ID,
+			PositionTicks: 8_500_000_000,
+			RuntimeTicks:  10_000_000_000,
+		},
+	})
+	req = waitReq(t, ch)
+	if req.Path != "/scrobble/stop" {
+		t.Fatalf("expected /scrobble/stop, got %s", req.Path)
+	}
+	bus.Publish(ctx, eventbus.Event{
+		Type: eventbus.EventUserDataChanged,
+		Payload: session.UserDataChangedPayload{
+			UserId: "alice",
+			UserDataList: []session.UserDataChangedEntry{
+				{ItemId: movie.ID, Played: true},
+			},
+		},
+	})
+	assertNoReq(t, ch, 120*time.Millisecond)
 }

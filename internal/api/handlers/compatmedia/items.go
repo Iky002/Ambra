@@ -665,9 +665,15 @@ func (h *Handler) canAccessItem(r *http.Request, item *sqlite.ItemRecord) bool {
 	if item == nil {
 		return true
 	}
-	allowed := h.allowedLibrariesForRequest(r, "")
-	if !isLibraryAllowed(item.LibraryID, allowed) {
-		return false
+	if strings.EqualFold(item.Type, "Playlist") {
+		if !h.canViewPlaylist(r, item.ID, item.ParentID) {
+			return false
+		}
+	} else {
+		allowed := h.allowedLibrariesForRequest(r, "")
+		if !isLibraryAllowed(item.LibraryID, allowed) {
+			return false
+		}
 	}
 	if h.repo != nil {
 		maxRating, blockedTags := h.userParentalPolicyForRequest(r, "")
@@ -681,12 +687,15 @@ func (h *Handler) canAccessItem(r *http.Request, item *sqlite.ItemRecord) bool {
 }
 
 func (h *Handler) canAccessItemID(r *http.Request, itemID string) bool {
-	if h.userRepo == nil || h.repo == nil || itemID == "" {
+	if h.repo == nil || itemID == "" {
 		return true
 	}
 	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
-	if err != nil || rec == nil {
+	if errors.Is(err, sqlite.ErrNotFound) {
 		return true
+	}
+	if err != nil || rec == nil {
+		return false
 	}
 	return h.canAccessItem(r, rec)
 }

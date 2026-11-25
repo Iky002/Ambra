@@ -11,6 +11,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/middleware"
+	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/auth"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
@@ -68,10 +69,9 @@ func (h *Handler) syncTMDBPlugin() {
 	if h.registry == nil || h.cfg == nil {
 		return
 	}
-	h.cfgMu.RLock()
-	apiKey := h.cfg.TMDBApiKey
-	lang := h.cfg.TMDBLanguage
-	h.cfgMu.RUnlock()
+	snap := h.cfg.Snapshot()
+	apiKey := snap.TMDBApiKey
+	lang := snap.TMDBLanguage
 	if p, ok := h.registry.Get(tmdbPluginID); ok {
 		_ = p.Configure(map[string]any{
 			"api_key":  apiKey,
@@ -84,9 +84,7 @@ func (h *Handler) syncSTRMPlugin() {
 	if h.registry == nil || h.cfg == nil {
 		return
 	}
-	h.cfgMu.RLock()
-	enable302 := h.cfg.EnableSTRM302
-	h.cfgMu.RUnlock()
+	enable302 := h.cfg.Snapshot().EnableSTRM302
 	if p, ok := h.registry.Get(strmPluginID); ok {
 		_ = p.Configure(map[string]any{
 			"enable_302": enable302,
@@ -101,12 +99,11 @@ func (h *Handler) GetSetupStatus(w http.ResponseWriter, r *http.Request) {
 			hasUsers = true
 		}
 	}
-	h.cfgMu.RLock()
-	lang := strings.TrimSpace(h.cfg.TMDBLanguage)
-	completed := h.cfg.IsStartupWizardCompleted
-	serverName := h.cfg.ServerName
-	hasTMDBKey := strings.TrimSpace(h.cfg.TMDBApiKey) != ""
-	h.cfgMu.RUnlock()
+	snap := h.cfg.Snapshot()
+	lang := strings.TrimSpace(snap.TMDBLanguage)
+	completed := snap.IsStartupWizardCompleted
+	serverName := snap.ServerName
+	hasTMDBKey := strings.TrimSpace(snap.TMDBApiKey) != ""
 	if lang == "" {
 		lang = "zh-CN"
 	}
@@ -123,10 +120,7 @@ func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
 	h.setupMu.Lock()
 	defer h.setupMu.Unlock()
 
-	h.cfgMu.RLock()
-	completed := h.cfg.IsStartupWizardCompleted
-	h.cfgMu.RUnlock()
-	if completed {
+	if h.cfg.Snapshot().IsStartupWizardCompleted {
 		httpx.Error(w, http.StatusForbidden, "setup wizard is already completed")
 		return
 	}
@@ -185,17 +179,16 @@ func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tmdbLangChanged := false
-	h.cfgMu.Lock()
-	if name := strings.TrimSpace(req.ServerName); name != "" {
-		h.cfg.ServerName = name
-	}
-	if lang := strings.TrimSpace(req.Language); lang != "" {
-		h.cfg.TMDBLanguage = lang
-		tmdbLangChanged = true
-	}
-	saveErr := h.cfg.Save()
-	h.cfgMu.Unlock()
-	if saveErr != nil {
+	h.cfg.Update(func(c *config.Config) {
+		if name := strings.TrimSpace(req.ServerName); name != "" {
+			c.ServerName = name
+		}
+		if lang := strings.TrimSpace(req.Language); lang != "" {
+			c.TMDBLanguage = lang
+			tmdbLangChanged = true
+		}
+	})
+	if saveErr := h.cfg.Save(); saveErr != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to save configuration")
 		return
 	}
@@ -281,24 +274,23 @@ func (h *Handler) CompleteSetup(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	h.cfgMu.Lock()
-	if name := strings.TrimSpace(req.ServerName); name != "" {
-		h.cfg.ServerName = name
-	}
-	if req.TMDBApiKey != nil {
-		h.cfg.TMDBApiKey = strings.TrimSpace(*req.TMDBApiKey)
-	}
-	if lang := strings.TrimSpace(req.TMDBLanguage); lang != "" {
-		h.cfg.TMDBLanguage = lang
-	}
-	if req.EnableSTRM302 != nil {
-		h.cfg.EnableSTRM302 = *req.EnableSTRM302
-	}
-	h.cfg.IsStartupWizardCompleted = true
-	saveErr := h.cfg.Save()
-	h.cfgMu.Unlock()
+	h.cfg.Update(func(c *config.Config) {
+		if name := strings.TrimSpace(req.ServerName); name != "" {
+			c.ServerName = name
+		}
+		if req.TMDBApiKey != nil {
+			c.TMDBApiKey = strings.TrimSpace(*req.TMDBApiKey)
+		}
+		if lang := strings.TrimSpace(req.TMDBLanguage); lang != "" {
+			c.TMDBLanguage = lang
+		}
+		if req.EnableSTRM302 != nil {
+			c.EnableSTRM302 = *req.EnableSTRM302
+		}
+		c.IsStartupWizardCompleted = true
+	})
 
-	if saveErr != nil {
+	if saveErr := h.cfg.Save(); saveErr != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to save configuration")
 		return
 	}

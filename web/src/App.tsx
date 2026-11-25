@@ -24,7 +24,7 @@ import { SearchPage } from './pages/SearchPage'
 import { SetupWizardPage } from './pages/SetupWizardPage'
 import { TrendingPage } from './pages/TrendingPage'
 
-const queryClient = new QueryClient({
+export const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       refetchOnWindowFocus: false,

@@ -15,6 +15,9 @@ const DefaultMaxJSONBodyBytes int64 = 4 << 20
 
 // DecodeJSONLimit decodes a JSON request body bounded by maxBytes (defaults to 4 MiB).
 func DecodeJSONLimit(r *http.Request, dst any, maxBytes int64) error {
+	if r == nil || r.Body == nil {
+		return io.EOF
+	}
 	if maxBytes <= 0 {
 		maxBytes = DefaultMaxJSONBodyBytes
 	}

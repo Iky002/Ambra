@@ -157,11 +157,13 @@ func TestPartiesAuthSpoofingRBACAndEventBus(t *testing.T) {
 	outsider := makeAuthCtx("outsider-user", "outsider", false)
 	admin := makeAuthCtx("admin-user", "admin", true)
 
-	// Create party attempting to spoof HostUserId -> must use authenticated host ID.
+	// Create private party attempting to spoof HostUserId -> must use authenticated host ID.
 	rec := doAuthReq(t, mux, host, http.MethodPost, "/Parties", map[string]any{
 		"Name":       "Movie Night",
 		"HostUserId": "spoofed-victim",
 		"ItemId":     "movie-1",
+		"IsPublic":   false,
+		"InviteCode": "SECRET-CODE",
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST /Parties status=%d", rec.Code)
@@ -174,7 +176,8 @@ func TestPartiesAuthSpoofingRBACAndEventBus(t *testing.T) {
 
 	// Member joins attempting to spoof UserId -> must add member's own ID.
 	rec = doAuthReq(t, mux, member, http.MethodPost, "/Parties/"+party.Id+"/Join", map[string]any{
-		"UserId": "spoofed-other",
+		"UserId":     "spoofed-other",
+		"InviteCode": "SECRET-CODE",
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST /Parties/Join status=%d", rec.Code)

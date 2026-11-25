@@ -24,6 +24,7 @@ import { api } from '../../api/client'
 import type { SessionInfo } from '../../api/types'
 import { QueryErrorState } from '../../components/QueryErrorState'
 import { ScanProgressBar } from '../../components/ScanProgressBar'
+import { useI18n } from '../../i18n/I18nContext'
 import {
   AdminModal,
   FeedbackBanner,
@@ -51,6 +52,7 @@ function matchesSeverity(severity: string | undefined, filter: SeverityFilter): 
 }
 
 export function DashboardTab() {
+  const { t } = useI18n()
   const [autoRefresh, setAutoRefresh] = useState(true)
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
     null,
@@ -203,7 +205,7 @@ export function DashboardTab() {
         <div className="flex items-center justify-between gap-3">
           <div className="flex items-center gap-2 text-sm font-semibold text-zinc-200">
             <Server className="h-4 w-4 text-amber-400" />
-            <span>服务器状态概览</span>
+            <span>{t('admin.dashboardOverview')}</span>
           </div>
           <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-300">
             <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-400" />
@@ -232,7 +234,7 @@ export function DashboardTab() {
               />
               <StatusTile
                 label="当前版本"
-                value={sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.9.0')}
+                value={sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.10.4')}
                 sub={`Emby ${sysInfo?.Version || '4.10.2.0'} 兼容 · 端口 ${sysInfo?.HttpServerPortNumber || 8096}`}
               />
               <StatusTile

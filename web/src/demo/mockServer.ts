@@ -40,6 +40,7 @@ import type {
   WebhookInfo,
   WebhookTestResult,
 } from '../api/types'
+import { registerDemoServer } from './demoLoader'
 import { DEMO_VIDEO_DATA_URL, makeDemoAudioDataUrl } from './demoMedia'
 import { createInitialDemoState, DEMO_SERVER_ID, type DemoState } from './mockData'
 import { makeAvatarDataUrl, makeLibraryThumbDataUrl, makePosterDataUrl } from './svgArt'
@@ -383,7 +384,7 @@ function createInitialDemoNotifications(): DemoNotificationRecord[] {
     {
       Id: 'notif-demo-01',
       Date: new Date(now - 15 * 60_000).toISOString(),
-      Name: '欢迎体验 Ambra v0.9.3',
+      Name: '欢迎体验 Ambra v0.10.4',
       Description: '已上线应用内通知中心、家长控制分级过滤与 Quick Connect 设备授权码登录。',
       Level: 'Normal',
       readByUsers: new Set(),
@@ -3897,7 +3898,7 @@ export async function demoFetch<T>(
       DeviceId: 'dev-demo-web-01',
       DeviceName: 'Ambra Web Demo',
       AppName: 'Ambra Web',
-      AppVersion: '0.9.3',
+      AppVersion: '0.10.4',
       DateAdded: new Date().toISOString(),
     }
     demoQuickConnectSessions.set(secret, session)
@@ -4016,3 +4017,16 @@ export async function demoFetch<T>(
 
   throw new ApiError(404, `[Demo Mock] 未实现的端点: ${method} ${pathname}`)
 }
+
+export function getDemoVideoUrl(): string {
+  return DEMO_VIDEO_DATA_URL
+}
+
+registerDemoServer({
+  demoFetch,
+  getDemoImageUrl,
+  getDemoFallbackImageUrl,
+  getDemoUserImageUrl,
+  getDemoAudioUrl,
+  getDemoVideoUrl,
+})

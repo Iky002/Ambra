@@ -23,7 +23,7 @@ type captureWSHub struct {
 	msgs []ws.Message
 }
 
-func (c *captureWSHub) SendToDevice(_ string, msg ws.Message) {
+func (c *captureWSHub) SendToUserDevice(_, _ string, msg ws.Message) {
 	c.mu.Lock()
 	c.msgs = append(c.msgs, msg)
 	c.mu.Unlock()

@@ -17,7 +17,12 @@ import (
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
-const maxOfflineActions = 500
+const (
+	maxOfflineActions        = 500
+	maxRemovedJobItems       = 500
+	maxNotificationServices  = 500
+	maxNotificationBodyBytes = 64 << 10
+)
 
 // Mirror structures for reading/updating shared sync:state stored in server_config.
 type sharedSyncJob struct {
@@ -246,6 +251,11 @@ func (h *Handler) handleMarkJobItemRemoval(mark bool) http.HandlerFunc {
 		h.mu.Lock()
 		h.ensureMapsLocked()
 		if mark {
+			if !h.state.RemovedJobItems[id] && len(h.state.RemovedJobItems) >= maxRemovedJobItems {
+				h.mu.Unlock()
+				httpx.Error(w, http.StatusBadRequest, "removed job items limit reached")
+				return
+			}
 			h.state.RemovedJobItems[id] = true
 		} else {
 			delete(h.state.RemovedJobItems, id)
@@ -682,9 +692,13 @@ func (h *Handler) handleGetConfiguredNotifications(w http.ResponseWriter, r *htt
 }
 
 func (h *Handler) handleSaveConfiguredNotification(w http.ResponseWriter, r *http.Request) {
+	if r.ContentLength > maxNotificationBodyBytes {
+		httpx.Error(w, http.StatusRequestEntityTooLarge, "notification service config too large")
+		return
+	}
 	var svc NotificationServiceConfig
 	if r.Body != nil {
-		if err := httpx.DecodeJSONLimit(r, &svc, 0); err != nil {
+		if err := httpx.DecodeJSONLimit(r, &svc, maxNotificationBodyBytes); err != nil {
 			httpx.Error(w, http.StatusBadRequest, "invalid notification service config")
 			return
 		}
@@ -723,6 +737,11 @@ func (h *Handler) handleSaveConfiguredNotification(w http.ResponseWriter, r *htt
 		}
 	}
 	if !updated {
+		if len(h.state.NotificationServices) >= maxNotificationServices {
+			h.mu.Unlock()
+			httpx.Error(w, http.StatusBadRequest, "notification services limit reached")
+			return
+		}
 		h.state.NotificationServices = append(h.state.NotificationServices, svc)
 	}
 	h.saveStateLocked(r.Context())

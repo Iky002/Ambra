@@ -236,17 +236,18 @@ func (h *MultiSlogHandler) formatRecord(r slog.Record) string {
 }
 
 func escapeLogControlChars(s string) string {
-	if !strings.ContainsAny(s, "\r\n") {
+	if !strings.ContainsAny(s, "\r\n\x1b") {
 		return s
 	}
 	s = strings.ReplaceAll(s, "\r", `\r`)
 	s = strings.ReplaceAll(s, "\n", `\n`)
+	s = strings.ReplaceAll(s, "\x1b", `\x1b`)
 	return s
 }
 
 func formatAttrValue(v slog.Value) string {
 	s := v.String()
-	if s == "" || strings.ContainsAny(s, " \t\n\r\"") {
+	if s == "" || strings.ContainsAny(s, " \t\n\r\x1b\"") {
 		return strconv.Quote(s)
 	}
 	return escapeLogControlChars(s)

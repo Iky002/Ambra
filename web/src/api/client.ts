@@ -1,12 +1,6 @@
+import { getCachedDemoServer, loadDemoServer } from '../demo/demoLoader'
 import { DEMO_AUTH_STORAGE_KEY, isDemoMode } from '../demo/demoMode'
 import { getActiveLocale } from '../i18n/I18nContext'
-import {
-  demoFetch,
-  getDemoAudioUrl,
-  getDemoFallbackImageUrl,
-  getDemoImageUrl,
-  getDemoUserImageUrl,
-} from '../demo/mockServer'
 import type {
   ActivityLogEntry,
   ApiKeyInfo,
@@ -116,7 +110,7 @@ export function buildEmbyAuthHeader(token?: string): string {
     'Client="Ambra Web"',
     'Device="Web Browser"',
     `DeviceId="${deviceId}"`,
-    'Version="0.1.0"',
+    'Version="0.10.4"',
   ]
   if (token) {
     parts.push(`Token="${token}"`)
@@ -140,7 +134,8 @@ export async function embyFetch<T>(
   const normalizedPath = path.startsWith('/') ? path : `/${path}`
 
   if (isDemoMode()) {
-    return demoFetch<T>(normalizedPath, options, requireAuth)
+    const demo = await loadDemoServer()
+    return demo.demoFetch<T>(normalizedPath, options, requireAuth)
   }
 
   const auth = getStoredAuth()
@@ -218,7 +213,7 @@ export function resolveApiUrl(urlOrPath: string): string {
 export function getImageUrl(
   itemId: string,
   type: 'Primary' | 'Backdrop' | 'Thumb' | 'Logo' | 'Banner' | (string & {}) = 'Primary',
-  options?: { maxWidth?: number; maxHeight?: number; tag?: string; quality?: number },
+  options?: { maxWidth?: number; maxHeight?: number; tag?: string; quality?: number; index?: number },
 ): string {
   if (!itemId) return ''
   if (isDemoMode()) {
@@ -232,14 +227,18 @@ export function getImageUrl(
             : type === 'Banner'
               ? 'Banner'
               : 'Primary'
-    return getDemoImageUrl(itemId, demoType)
+    return getCachedDemoServer()?.getDemoImageUrl(itemId, demoType) ?? ''
   }
   const params = new URLSearchParams()
   if (options?.maxWidth) params.set('maxWidth', String(options.maxWidth))
   if (options?.maxHeight) params.set('maxHeight', String(options.maxHeight))
   if (options?.tag) params.set('tag', options.tag)
   params.set('quality', String(options?.quality ?? 88))
-  return `/emby/Items/${encodeURIComponent(itemId)}/Images/${encodeURIComponent(type)}?${params.toString()}`
+  const indexSegment =
+    options?.index !== undefined && Number.isInteger(options.index) && options.index >= 0
+      ? `/${options.index}`
+      : ''
+  return `/emby/Items/${encodeURIComponent(itemId)}/Images/${encodeURIComponent(type)}${indexSegment}?${params.toString()}`
 }
 
 export function getFallbackImageUrl(
@@ -247,12 +246,12 @@ export function getFallbackImageUrl(
   type: 'Primary' | 'Backdrop' | 'Thumb' | 'Logo' | 'Banner' = 'Primary',
 ): string | null {
   if (!itemId || !isDemoMode()) return null
-  return getDemoFallbackImageUrl(itemId, type)
+  return getCachedDemoServer()?.getDemoFallbackImageUrl(itemId, type) ?? null
 }
 
 export function getUserImageUrl(userId: string, tag?: string): string {
   if (isDemoMode()) {
-    return getDemoUserImageUrl(userId)
+    return getCachedDemoServer()?.getDemoUserImageUrl(userId) ?? ''
   }
   const params = new URLSearchParams({ maxWidth: '200', quality: '90' })
   if (tag) params.set('tag', tag)
@@ -275,7 +274,7 @@ export function getBackdropUrl(item: BaseItemDto, maxWidth = 1920): string | nul
 export function getAudioStreamUrl(itemId: string): string {
   if (!itemId) return ''
   if (isDemoMode()) {
-    return getDemoAudioUrl(itemId)
+    return getCachedDemoServer()?.getDemoAudioUrl(itemId) ?? ''
   }
   const auth = getStoredAuth()
   const params = new URLSearchParams({
@@ -1487,7 +1486,7 @@ export function getChapterImageUrl(
   maxWidth = 480,
 ): string {
   if (isDemoMode()) {
-    return getDemoImageUrl(itemId, 'Backdrop')
+    return getCachedDemoServer()?.getDemoImageUrl(itemId, 'Backdrop') ?? ''
   }
   const q = new URLSearchParams({ maxWidth: String(maxWidth), quality: '85' })
   if (tag) q.set('tag', tag)

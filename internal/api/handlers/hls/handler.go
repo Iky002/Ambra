@@ -33,13 +33,14 @@ type AuthFuncs struct {
 }
 
 const (
-	maxLiveStreams      = 256
-	liveStreamTTL       = 4 * time.Hour
-	maxHLSVideoBitrate  = 120_000_000
-	maxHLSAudioBitrate  = 1_536_000
-	maxHLSAudioChannels = 8
-	minHLSSegmentLength = 2
-	maxHLSSegmentLength = 15
+	maxLiveStreams        = 256
+	maxLiveStreamsPerUser = 16
+	liveStreamTTL         = 4 * time.Hour
+	maxHLSVideoBitrate    = 120_000_000
+	maxHLSAudioBitrate    = 1_536_000
+	maxHLSAudioChannels   = 8
+	minHLSSegmentLength   = 2
+	maxHLSSegmentLength   = 15
 )
 
 type liveStreamEntry struct {
@@ -179,6 +180,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	mux.Handle("GET /Videos/{Id}/master.m3u8", wrapAuth(http.HandlerFunc(h.handleMasterPlaylist)))
 	mux.Handle("GET /Videos/{Id}/main.m3u8", wrapAuth(http.HandlerFunc(h.handleMediaPlaylist)))
 	mux.Handle("GET /Videos/{Id}/live.m3u8", wrapAuth(http.HandlerFunc(h.handleMediaPlaylist)))
+	mux.Handle("GET /Videos/{Id}/hls1/{PlaylistId}/init.mp4", wrapAuth(http.HandlerFunc(h.handleInitSegment)))
+	mux.Handle("GET /Videos/{Id}/hls/{PlaylistId}/init.mp4", wrapAuth(http.HandlerFunc(h.handleInitSegment)))
+	mux.Handle("GET /Videos/{Id}/init.mp4", wrapAuth(http.HandlerFunc(h.handleInitSegment)))
 	mux.Handle("GET /Videos/{Id}/hls1/{PlaylistId}/{Segment}", wrapAuth(http.HandlerFunc(h.handleSegment)))
 	mux.Handle("GET /Videos/{Id}/hls/{PlaylistId}/{Segment}", wrapAuth(http.HandlerFunc(h.handleSegment)))
 	mux.Handle("GET /Videos/{Id}/{MediaSourceId}/Subtitles/{Index}/subtitles.m3u8", wrapAuth(http.HandlerFunc(h.handleSubtitlePlaylist)))
@@ -216,9 +220,6 @@ func (h *Handler) handleMasterPlaylist(w http.ResponseWriter, r *http.Request) {
 	}
 
 	params := h.buildSessionParams(r, item, src, q)
-	if h.mgr != nil {
-		_, _ = h.mgr.RegisterSession(params)
-	}
 
 	width, height := extractVideoDimensions(src)
 	if params.MaxWidth > 0 && (width == 0 || params.MaxWidth < width) {
@@ -448,13 +449,62 @@ func (h *Handler) handleSegment(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, segPath)
 }
 
+func (h *Handler) handleInitSegment(w http.ResponseWriter, r *http.Request) {
+	if h.mgr == nil {
+		httpx.Error(w, http.StatusServiceUnavailable, "transcode manager unavailable")
+		return
+	}
+	itemID := guid.Normalize(r.PathValue("Id"))
+	q := httpx.ParseQuery(r)
+	item, src, err := h.resolveItemAndSource(r.Context(), itemID, q.Get("MediaSourceId"))
+	if errors.Is(err, sqlite.ErrNotFound) {
+		httpx.Error(w, http.StatusNotFound, "media item not found")
+		return
+	}
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !h.canAccessItem(r, item) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
+
+	params := h.buildSessionParams(r, item, src, q)
+	if sc := strings.ToLower(strings.TrimSpace(params.SegmentContainer)); sc != "mp4" && sc != "m4s" {
+		params.SegmentContainer = "m4s"
+	}
+
+	initPath, err := h.mgr.GetInitSegment(r.Context(), params)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "video/mp4")
+	w.Header().Set("Cache-Control", "private, max-age=3600")
+	http.ServeFile(w, r, initPath)
+}
+
 func (h *Handler) handleDeleteActiveEncodings(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	callerUserID, isAdmin := h.callerIdentity(r)
 	deviceID := h.resolveDeviceID(r, q)
-	playSessionID := scopePlaySessionID(q.Get("PlaySessionId"), callerUserID, isAdmin)
+	rawPlaySessionID := strings.TrimSpace(q.Get("PlaySessionId"))
+	playSessionID := scopePlaySessionID(rawPlaySessionID, callerUserID, isAdmin)
 	if h.mgr != nil {
-		h.mgr.StopByDeviceForUser(deviceID, playSessionID, callerUserID, isAdmin)
+		h.mgr.StopSessionsScoped(callerUserID, playSessionID, deviceID, isAdmin)
+		if isAdmin && rawPlaySessionID != "" {
+			suffix := ":" + rawPlaySessionID
+			for _, snap := range h.mgr.ActiveSessions() {
+				if strings.HasSuffix(snap.PlaySessionID, suffix) {
+					h.mgr.StopSessionsScoped(callerUserID, snap.PlaySessionID, "", true)
+				}
+			}
+		}
 	}
 	httpx.NoContent(w)
 }
@@ -611,6 +661,19 @@ func (h *Handler) handleLiveStreamOpen(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	h.liveMu.Lock()
 	h.pruneLiveStreamsLocked(now)
+	if !isAdmin && callerUserID != "" {
+		userCount := 0
+		for _, existing := range h.liveStreams {
+			if existing != nil && existing.UserID == callerUserID {
+				userCount++
+			}
+		}
+		if userCount >= maxLiveStreamsPerUser {
+			h.liveMu.Unlock()
+			httpx.Error(w, http.StatusTooManyRequests, "maximum number of active live streams per user reached")
+			return
+		}
+	}
 	h.liveStreams[liveID] = &liveStreamEntry{
 		LiveStreamID:  liveID,
 		PlaySessionID: scopedPlaySessionID,
@@ -621,10 +684,30 @@ func (h *Handler) handleLiveStreamOpen(w http.ResponseWriter, r *http.Request) {
 	}
 	h.liveMu.Unlock()
 
+	respMS := h.sanitizeMediaSourceForCaller(r, msDTO)
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"LiveStreamId": liveID,
-		"MediaSource":  msDTO,
+		"MediaSource":  respMS,
 	})
+}
+
+func (h *Handler) sanitizeMediaSourceForCaller(r *http.Request, ms dto.MediaSourceInfo) dto.MediaSourceInfo {
+	uid, isAdmin := h.callerIdentity(r)
+	hasAuth := uid != "" || isAdmin
+	if !hasAuth {
+		if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+			hasAuth = true
+		}
+	}
+	if !hasAuth || isAdmin {
+		return ms
+	}
+	if len(ms.MediaStreams) > 0 {
+		ms.MediaStreams = append([]dto.MediaStream(nil), ms.MediaStreams...)
+	}
+	sources := []dto.MediaSourceInfo{ms}
+	dto.SanitizeMediaSources(sources)
+	return sources[0]
 }
 
 func (h *Handler) pruneLiveStreamsLocked(now time.Time) {
@@ -679,7 +762,7 @@ func (h *Handler) handleLiveStreamClose(w http.ResponseWriter, r *http.Request) 
 		h.liveMu.Unlock()
 	}
 	if h.mgr != nil && playSessionID != "" {
-		h.mgr.StopByDeviceForUser("", playSessionID, callerUserID, isAdmin)
+		h.mgr.StopSessionsScoped(callerUserID, playSessionID, "", isAdmin)
 	}
 	httpx.NoContent(w)
 }
@@ -705,7 +788,7 @@ func (h *Handler) handleLiveStreamMediaInfo(w http.ResponseWriter, r *http.Reque
 		httpx.Error(w, http.StatusForbidden, "access denied")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, liveStreamOpenResponse{MediaSource: entry.MediaSource})
+	httpx.JSON(w, http.StatusOK, liveStreamOpenResponse{MediaSource: h.sanitizeMediaSourceForCaller(r, entry.MediaSource)})
 }
 
 func (h *Handler) resolveItemAndSource(ctx context.Context, itemID, mediaSourceID string) (*sqlite.ItemRecord, *sqlite.MediaSourceRecord, error) {
@@ -760,6 +843,8 @@ func (h *Handler) buildSessionParams(r *http.Request, item *sqlite.ItemRecord, s
 		} else {
 			inputPath = ""
 		}
+	} else if isHTTPURL(inputPath) && !isSafeStrmURL(inputPath) {
+		inputPath = ""
 	}
 
 	segDur := q.Int("SegmentLength", transcode.DefaultSegmentDuration)
@@ -841,6 +926,10 @@ func (h *Handler) buildSessionParams(r *http.Request, item *sqlite.ItemRecord, s
 		}
 	}
 
+	if isHTTPURL(subPath) && !isSafeStrmURL(subPath) {
+		subPath = ""
+	}
+
 	callerUserID, isAdmin := h.callerIdentity(r)
 	deviceID := h.resolveDeviceID(r, q)
 	playSessionID := scopePlaySessionID(q.Get("PlaySessionId"), callerUserID, isAdmin)
@@ -872,10 +961,41 @@ func (h *Handler) buildSessionParams(r *http.Request, item *sqlite.ItemRecord, s
 		SubtitleMethod:        subMethod,
 		SubtitleCodec:         subCodec,
 		SubtitlePath:          subPath,
+		IsHDR:                 extractVideoIsHDR(src),
 		SegmentDuration:       segDur,
 		SegmentContainer:      q.Get("SegmentContainer"),
 		DurationSec:           float64(runtimeTicks) / float64(transcode.TicksPerSecond),
 	}
+}
+
+func isHTTPURL(s string) bool {
+	lower := strings.ToLower(strings.TrimSpace(s))
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
+}
+
+func isHDRVideoRange(videoRange string) bool {
+	vr := strings.ToUpper(strings.TrimSpace(videoRange))
+	if vr == "" || vr == "SDR" {
+		return false
+	}
+	for _, kw := range []string{"HDR", "HLG", "DOVI", "DOLBY", "PQ", "BT2020", "SMPTEST2084", "ARIB"} {
+		if strings.Contains(vr, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractVideoIsHDR(src *sqlite.MediaSourceRecord) bool {
+	if src == nil {
+		return false
+	}
+	for _, st := range src.Streams {
+		if strings.EqualFold(st.StreamType, "Video") && isHDRVideoRange(st.VideoRange) {
+			return true
+		}
+	}
+	return false
 }
 
 func resolveRuntimeTicks(item *sqlite.ItemRecord, src *sqlite.MediaSourceRecord) int64 {

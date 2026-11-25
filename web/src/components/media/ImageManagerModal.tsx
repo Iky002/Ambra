@@ -263,6 +263,7 @@ export function ImageManagerModal({
                   const previewUrl = getImageUrl(itemId, rawType, {
                     maxWidth: isWide ? 800 : 400,
                     tag: img.ImageTag,
+                    index: img.ImageIndex,
                   })
                   const fallback = getFallbackImageUrl(
                     itemId,

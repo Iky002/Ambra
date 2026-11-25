@@ -1329,9 +1329,15 @@ func (r *LibraryRepo) UpsertSearchFTS(ctx context.Context, itemID, titleRaw, tit
 		titleRaw, titleTokens, pinyinFull, pinyinInitials, peopleNames,
 	)
 
+	tx, err := r.store.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
 	// Fast O(log N) path via items.rowid when the item exists in items.
 	var itemRowID int64
-	hasItemRowID := r.store.Reader.QueryRowContext(ctx, `SELECT rowid FROM items WHERE id = ?`, itemID).Scan(&itemRowID) == nil
+	hasItemRowID := tx.QueryRowContext(ctx, `SELECT rowid FROM items WHERE id = ?`, itemID).Scan(&itemRowID) == nil
 
 	var (
 		curItemID, curRaw, curTokens, curPinyinFull, curPinyinInit, curPeople string
@@ -1339,7 +1345,7 @@ func (r *LibraryRepo) UpsertSearchFTS(ctx context.Context, itemID, titleRaw, tit
 		rowIDFree                                                              bool
 	)
 	if hasItemRowID && itemRowID > 0 {
-		err := r.store.Reader.QueryRowContext(ctx,
+		err := tx.QueryRowContext(ctx,
 			`SELECT item_id, title_raw, title_tokens, pinyin_full, pinyin_initials, people_names
 			 FROM item_search_fts WHERE rowid = ?`, itemRowID,
 		).Scan(&curItemID, &curRaw, &curTokens, &curPinyinFull, &curPinyinInit, &curPeople)
@@ -1358,7 +1364,7 @@ func (r *LibraryRepo) UpsertSearchFTS(ctx context.Context, itemID, titleRaw, tit
 	}
 
 	if !pinnedHit {
-		if err := r.store.Reader.QueryRowContext(ctx,
+		if err := tx.QueryRowContext(ctx,
 			`SELECT title_raw, title_tokens, pinyin_full, pinyin_initials, people_names
 			 FROM item_search_fts WHERE item_id = ? LIMIT 1`, itemID,
 		).Scan(&curRaw, &curTokens, &curPinyinFull, &curPinyinInit, &curPeople); err == nil {
@@ -1371,12 +1377,6 @@ func (r *LibraryRepo) UpsertSearchFTS(ctx context.Context, itemID, titleRaw, tit
 			}
 		}
 	}
-
-	tx, err := r.store.Writer.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
 
 	if pinnedHit {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM item_search_fts WHERE rowid = ?`, itemRowID); err != nil {
@@ -1428,11 +1428,11 @@ func BuildFTSQuery(term string) string {
 	if r := []rune(term); len(r) > maxFTSQueryRunes {
 		term = string(r[:maxFTSQueryRunes])
 	}
-	// Split on whitespace and punctuation into logical tokens
+	// Split on whitespace, control characters, and punctuation into logical tokens
 	var rawTokens []string
 	var cur strings.Builder
 	for _, r := range term {
-		if unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r) {
+		if r < 0x20 || r == 0x7f || unicode.IsControl(r) || unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r) {
 			if cur.Len() > 0 {
 				rawTokens = append(rawTokens, cur.String())
 				cur.Reset()
@@ -1878,17 +1878,33 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 	}
 
 	if userID != "" {
-		if f.IsPlayed != nil && *f.IsPlayed {
-			where = append(where, `COALESCE(u.played, 0) = 1`)
+		if f.IsPlayed != nil {
+			if *f.IsPlayed {
+				where = append(where, `COALESCE(u.played, 0) = 1`)
+			} else {
+				where = append(where, `COALESCE(u.played, 0) = 0`)
+			}
 		}
-		if f.IsUnplayed != nil && *f.IsUnplayed {
-			where = append(where, `COALESCE(u.played, 0) = 0`)
+		if f.IsUnplayed != nil {
+			if *f.IsUnplayed {
+				where = append(where, `COALESCE(u.played, 0) = 0`)
+			} else {
+				where = append(where, `COALESCE(u.played, 0) = 1`)
+			}
 		}
-		if f.IsFavorite != nil && *f.IsFavorite {
-			where = append(where, `COALESCE(u.is_favorite, 0) = 1`)
+		if f.IsFavorite != nil {
+			if *f.IsFavorite {
+				where = append(where, `COALESCE(u.is_favorite, 0) = 1`)
+			} else {
+				where = append(where, `COALESCE(u.is_favorite, 0) = 0`)
+			}
 		}
-		if f.IsResumable != nil && *f.IsResumable {
-			where = append(where, `COALESCE(u.playback_position_ticks, 0) > 0 AND COALESCE(u.played, 0) = 0`)
+		if f.IsResumable != nil {
+			if *f.IsResumable {
+				where = append(where, `COALESCE(u.playback_position_ticks, 0) > 0 AND COALESCE(u.played, 0) = 0`)
+			} else {
+				where = append(where, `(COALESCE(u.playback_position_ticks, 0) = 0 OR COALESCE(u.played, 0) = 1)`)
+			}
 		}
 	}
 
@@ -2583,15 +2599,21 @@ func (r *LibraryRepo) ListTaxonomiesWithPolicy(ctx context.Context, serverID, ki
 }
 
 func (r *LibraryRepo) GetItemCounts(ctx context.Context) (*ItemCounts, error) {
-	return r.GetItemCountsWithAllowedLibraries(ctx, nil)
+	return r.GetItemCountsFiltered(ctx, nil, nil)
 }
 
 // GetItemCountsWithAllowedLibraries counts items grouped by type, optionally restricted to allowedLibraryIDs.
 func (r *LibraryRepo) GetItemCountsWithAllowedLibraries(ctx context.Context, allowedLibraryIDs []string) (*ItemCounts, error) {
+	return r.GetItemCountsFiltered(ctx, allowedLibraryIDs, nil)
+}
+
+// GetItemCountsFiltered counts items grouped by type and trailers, optionally restricted to
+// allowedLibraryIDs and maxParentalRating.
+func (r *LibraryRepo) GetItemCountsFiltered(ctx context.Context, allowedLibraryIDs []string, maxParentalRating *int) (*ItemCounts, error) {
 	if allowedLibraryIDs != nil && len(allowedLibraryIDs) == 0 {
 		return &ItemCounts{}, nil
 	}
-	unfiltered := allowedLibraryIDs == nil
+	unfiltered := allowedLibraryIDs == nil && maxParentalRating == nil
 	if unfiltered {
 		r.countMu.RLock()
 		if r.cachedItemCounts != nil {
@@ -2602,20 +2624,28 @@ func (r *LibraryRepo) GetItemCountsWithAllowedLibraries(ctx context.Context, all
 		r.countMu.RUnlock()
 	}
 
-	query := `SELECT type, COUNT(*) FROM items WHERE extra_type = ''`
-	var args []any
+	var filterClauses []string
+	var filterArgs []any
 	if len(allowedLibraryIDs) > 0 {
 		ph := make([]string, len(allowedLibraryIDs))
-		args = make([]any, len(allowedLibraryIDs))
 		for i, id := range allowedLibraryIDs {
 			ph[i] = "?"
-			args[i] = guid.Normalize(id)
+			filterArgs = append(filterArgs, guid.Normalize(id))
 		}
-		query += ` AND library_id IN (` + strings.Join(ph, ",") + `)`
+		filterClauses = append(filterClauses, `i.library_id IN (`+strings.Join(ph, ",")+`)`)
 	}
-	query += ` GROUP BY type`
+	if maxParentalRating != nil {
+		pClauses, pArgs := appendParentalFilterSQL("i", maxParentalRating, nil)
+		filterClauses = append(filterClauses, pClauses...)
+		filterArgs = append(filterArgs, pArgs...)
+	}
+	filterSuffix := ""
+	if len(filterClauses) > 0 {
+		filterSuffix = ` AND ` + strings.Join(filterClauses, " AND ")
+	}
 
-	rows, err := r.store.Reader.QueryContext(ctx, query, args...)
+	query := `SELECT i.type, COUNT(*) FROM items i WHERE i.extra_type = ''` + filterSuffix + ` GROUP BY i.type`
+	rows, err := r.store.Reader.QueryContext(ctx, query, filterArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -2653,6 +2683,12 @@ func (r *LibraryRepo) GetItemCountsWithAllowedLibraries(ctx context.Context, all
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+
+	trailerQuery := `SELECT COUNT(*) FROM items i WHERE i.extra_type = 'trailer'` + filterSuffix
+	if err := r.store.Reader.QueryRowContext(ctx, trailerQuery, filterArgs...).Scan(&c.TrailerCount); err != nil {
+		return nil, err
+	}
+
 	if unfiltered {
 		r.countMu.Lock()
 		cp := *c
@@ -3224,7 +3260,7 @@ func (r *LibraryRepo) loadSeriesSeasonStatsBatch(ctx context.Context, userID str
 
 		// Direct season count per series
 		sRows, err := r.store.Reader.QueryContext(ctx,
-			`SELECT series_id, COUNT(*) FROM items WHERE type = 'Season' AND series_id IN (`+inClause+`) GROUP BY series_id`,
+			`SELECT series_id, COUNT(*) FROM items WHERE type = 'Season' AND extra_type = '' AND series_id IN (`+inClause+`) GROUP BY series_id`,
 			args...,
 		)
 		if err != nil {
@@ -3255,7 +3291,7 @@ func (r *LibraryRepo) loadSeriesSeasonStatsBatch(ctx context.Context, userID str
 			`SELECT i.series_id, COUNT(*), SUM(CASE WHEN COALESCE(u.played, 0) = 0 THEN 1 ELSE 0 END)
 			 FROM items i
 			 LEFT JOIN user_item_data u ON u.item_id = i.id AND u.user_id = ?
-			 WHERE i.type = 'Episode' AND i.series_id IN (`+inClause+`)
+			 WHERE i.type = 'Episode' AND i.extra_type = '' AND i.series_id IN (`+inClause+`)
 			 GROUP BY i.series_id`,
 			epArgs...,
 		)
@@ -3296,7 +3332,7 @@ func (r *LibraryRepo) loadSeriesSeasonStatsBatch(ctx context.Context, userID str
 			`SELECT i.season_id, COUNT(*), SUM(CASE WHEN COALESCE(u.played, 0) = 0 THEN 1 ELSE 0 END)
 			 FROM items i
 			 LEFT JOIN user_item_data u ON u.item_id = i.id AND u.user_id = ?
-			 WHERE i.type = 'Episode' AND i.season_id IN (`+inClause+`)
+			 WHERE i.type = 'Episode' AND i.extra_type = '' AND i.season_id IN (`+inClause+`)
 			 GROUP BY i.season_id`,
 			epArgs...,
 		)

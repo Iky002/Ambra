@@ -84,7 +84,7 @@ function getParentPath(path: string): string {
 }
 
 export function SetupWizardPage() {
-  const { auth, applyAuthResult } = useAuth()
+  const { auth, isAdmin, userLoading, applyAuthResult } = useAuth()
   const { locale, t } = useI18n()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
@@ -156,7 +156,7 @@ export function SetupWizardPage() {
   } = useQuery({
     queryKey: ['setup', 'env', 'drives'],
     queryFn: () => api.getDrives(),
-    enabled: browserOpen && browsePath === '',
+    enabled: isAdmin && browserOpen && browsePath === '',
   })
 
   const {
@@ -166,8 +166,13 @@ export function SetupWizardPage() {
   } = useQuery({
     queryKey: ['setup', 'env', 'dir', browsePath],
     queryFn: () => api.getDirectoryContents(browsePath, true, false),
-    enabled: browserOpen && browsePath !== '',
+    enabled: isAdmin && browserOpen && browsePath !== '',
   })
+
+  const nonAdminBlocked = Boolean(auth && !userLoading && !isAdmin)
+  const adminRequiredForStep =
+    step >= 3 || (step === 2 && setupStatus?.has_users === true)
+  const blockedByRole = adminRequiredForStep && (!isAdmin && (!userLoading || !auth))
 
   if (setupStatus?.completed === true) {
     return <Navigate to={auth ? '/' : '/login'} replace />
@@ -188,6 +193,10 @@ export function SetupWizardPage() {
 
   const handleStep2Submit = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (setupStatus?.has_users === true && !isAdmin) {
+      setError('服务器已创建用户，请先使用管理员账号登录后再继续初始化配置')
+      return
+    }
     const trimmedUser = username.trim()
     if (!trimmedUser) {
       setError('请输入管理员用户名')
@@ -227,6 +236,10 @@ export function SetupWizardPage() {
 
   const handleAddLibrary = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (!isAdmin) {
+      setError('仅管理员可执行媒体库挂载配置，请使用管理员账号登录')
+      return
+    }
     const trimmedName = libName.trim()
     const trimmedPath = libPath.trim()
     if (!trimmedName) {
@@ -278,6 +291,10 @@ export function SetupWizardPage() {
 
   const handleCompleteSetup = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (!isAdmin) {
+      setError('仅管理员可完成服务器初始化配置，请使用管理员账号登录')
+      return
+    }
     setError('')
     setSubmitting(true)
     try {
@@ -373,6 +390,28 @@ export function SetupWizardPage() {
             )
           })}
         </div>
+
+        {/* 非管理员已登录时提示无权继续初始化管理步骤 */}
+        {nonAdminBlocked && (
+          <div
+            role="alert"
+            className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-red-500/35 bg-red-500/10 px-4 py-3 text-xs text-red-200"
+          >
+            <div className="min-w-0 flex-1">
+              <p className="font-semibold text-red-100">当前账号不具备管理员权限</p>
+              <p className="mt-0.5 text-[11px] text-red-200/80">
+                普通成员账号无权执行服务器初始化向导及媒体库/刮削配置，请切换至管理员账号登录。
+              </p>
+            </div>
+            <Link
+              to="/login?redirect=/setup"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-amber-500 px-3.5 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400"
+            >
+              <LogIn className="h-3.5 w-3.5" />
+              <span>切换管理员登录</span>
+            </Link>
+          </div>
+        )}
 
         {/* 已有管理员账号但未登录时，提供登录入口防止向导死锁 */}
         {setupStatus?.has_users === true && !auth && (
@@ -605,7 +644,7 @@ export function SetupWizardPage() {
                       <span>使用已有管理员登录</span>
                     </Link>
                   )}
-                  {setupStatus?.has_users === true && auth && (
+                  {setupStatus?.has_users === true && auth && isAdmin && (
                     <button
                       type="button"
                       onClick={() => {
@@ -620,7 +659,7 @@ export function SetupWizardPage() {
                   )}
                   <button
                     type="submit"
-                    disabled={submitting}
+                    disabled={submitting || (setupStatus?.has_users === true && !isAdmin)}
                     className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 px-6 py-2.5 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all hover:from-amber-400 hover:to-orange-400 disabled:opacity-60"
                   >
                     {submitting ? (
@@ -640,8 +679,38 @@ export function SetupWizardPage() {
             </form>
           )}
 
+          {/* ==================== 非管理员访问 Step 3 / Step 4 权限拦截 ==================== */}
+          {step >= 3 && blockedByRole && (
+            <div className="space-y-4 py-6 text-center">
+              <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-red-500/15 text-red-400 ring-1 ring-red-500/30">
+                <ShieldCheck className="h-6 w-6" />
+              </div>
+              <h2 className="text-base font-semibold text-zinc-100">
+                需要管理员权限才能继续配置
+              </h2>
+              <p className="mx-auto max-w-md text-xs leading-relaxed text-zinc-400">
+                媒体库挂载与服务器初始化配置仅限管理员账号执行。请使用管理员账号登录后继续。
+              </p>
+              <div className="flex items-center justify-center gap-3 pt-2">
+                <Link
+                  to="/login?redirect=/setup"
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-5 py-2.5 text-xs font-semibold text-zinc-950 hover:bg-amber-400"
+                >
+                  <LogIn className="h-3.5 w-3.5" />
+                  <span>切换管理员登录</span>
+                </Link>
+                <Link
+                  to="/"
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2.5 text-xs font-medium text-zinc-300 hover:bg-white/[0.08]"
+                >
+                  <span>返回首页</span>
+                </Link>
+              </div>
+            </div>
+          )}
+
           {/* ==================== Step 3: 添加媒体库 ==================== */}
-          {step === 3 && (
+          {step === 3 && !blockedByRole && (
             <div className="space-y-5">
               <div>
                 <h2 className="text-lg font-semibold text-zinc-100">第 3 步 · 添加媒体库</h2>
@@ -809,7 +878,7 @@ export function SetupWizardPage() {
           )}
 
           {/* ==================== Step 4: 刮削与偏好设置 ==================== */}
-          {step === 4 && (
+          {step === 4 && !blockedByRole && (
             <form onSubmit={handleCompleteSetup} className="space-y-5">
               <div>
                 <h2 className="text-lg font-semibold text-zinc-100">第 4 步 · 刮削与偏好设置</h2>

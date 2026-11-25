@@ -19,10 +19,11 @@ const (
 )
 
 // AmbraVersion is the Ambra application release version (overridden at build time via -ldflags).
-var AmbraVersion = "v0.5.0"
+var AmbraVersion = "v0.10.4"
 
 type Config struct {
 	mu            sync.RWMutex
+	saveMu        sync.Mutex
 	envTMDBKeySet bool
 
 	ServerID                 string   `json:"server_id"`
@@ -168,7 +169,11 @@ func (c *Config) Update(fn func(*Config)) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	prevTMDB := c.TMDBApiKey
 	fn(c)
+	if c.TMDBApiKey != prevTMDB {
+		c.envTMDBKeySet = false
+	}
 }
 
 // Snapshot returns a thread-safe value copy of the current configuration.
@@ -204,6 +209,9 @@ func (c *Config) Snapshot() Config {
 }
 
 func (c *Config) Save() error {
+	c.saveMu.Lock()
+	defer c.saveMu.Unlock()
+
 	c.mu.RLock()
 	toSave := Config{
 		ServerID:                 c.ServerID,

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -747,19 +748,50 @@ func (h *Handler) proxyRemoteAudio(w http.ResponseWriter, r *http.Request, targe
 	}
 	defer resp.Body.Close()
 
-	for _, hdr := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"} {
+	for _, hdr := range []string{"Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"} {
 		if val := resp.Header.Get(hdr); val != "" {
 			w.Header().Set(hdr, val)
 		}
 	}
-	if w.Header().Get("Content-Type") == "" {
-		if u, parseErr := url.Parse(targetURL); parseErr == nil {
-			w.Header().Set("Content-Type", audioContentType(u.Path))
-		}
+	fallbackCT := "application/octet-stream"
+	if u, parseErr := url.Parse(targetURL); parseErr == nil {
+		fallbackCT = audioContentType(u.Path)
 	}
+	w.Header().Set("Content-Type", sanitizeProxyAudioContentType(resp.Header.Get("Content-Type"), fallbackCT))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox")
 	w.WriteHeader(resp.StatusCode)
 	if r.Method != http.MethodHead {
 		_, _ = io.Copy(w, resp.Body)
+	}
+}
+
+func sanitizeProxyAudioContentType(rawCT, fallbackCT string) string {
+	trimmed := strings.TrimSpace(rawCT)
+	if trimmed == "" {
+		if fallbackCT != "" {
+			return fallbackCT
+		}
+		return "application/octet-stream"
+	}
+	mediaType, _, err := mime.ParseMediaType(trimmed)
+	if err != nil {
+		return "application/octet-stream"
+	}
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	if strings.HasPrefix(mediaType, "audio/") || strings.HasPrefix(mediaType, "video/") {
+		return mediaType
+	}
+	switch mediaType {
+	case "application/octet-stream",
+		"application/vnd.apple.mpegurl",
+		"application/x-mpegurl",
+		"application/mp4",
+		"application/ogg",
+		"text/vtt":
+		return mediaType
+	default:
+		return "application/octet-stream"
 	}
 }
 

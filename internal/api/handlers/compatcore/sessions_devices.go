@@ -43,8 +43,8 @@ func (h *Handler) getSessionPlayQueue(w http.ResponseWriter, r *http.Request) {
 	limit := q.Int("Limit", 0)
 
 	items := []dto.BaseItemDto{}
+	isAdmin := h.isCallerAdmin(r)
 	if h.sessions != nil {
-		isAdmin := h.isCallerAdmin(r)
 		callerID := h.callerUserID(r)
 		for _, s := range h.sessions.ListSessions() {
 			if !isAdmin && (callerID == "" || guid.Normalize(s.UserId) != callerID) {
@@ -66,8 +66,12 @@ func (h *Handler) getSessionPlayQueue(w http.ResponseWriter, r *http.Request) {
 	if limit > 0 && startIndex+limit < end {
 		end = startIndex + limit
 	}
+	page := items[startIndex:end]
+	if !isAdmin {
+		dto.SanitizeItemPathsSlice(page)
+	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
-		Items:            items[startIndex:end],
+		Items:            page,
 		TotalRecordCount: total,
 	})
 }
@@ -98,10 +102,10 @@ func (h *Handler) authorizeSessionTarget(r *http.Request, sid string) (dto.Sessi
 }
 
 func (h *Handler) pushSessionWS(target dto.SessionInfo, found bool, msgType string, data any) {
-	if !found || h.wsHub == nil || target.DeviceId == "" {
+	if !found || h.wsHub == nil || target.DeviceId == "" || target.UserId == "" {
 		return
 	}
-	h.wsHub.SendToDevice(target.DeviceId, ws.Message{
+	h.wsHub.SendToUserDevice(target.UserId, target.DeviceId, ws.Message{
 		MessageType: msgType,
 		Data:        data,
 	})
@@ -412,6 +416,30 @@ func (h *Handler) postDevicesDelete(w http.ResponseWriter, r *http.Request) {
 		deviceID = strings.TrimSpace(body.Id)
 	}
 	if deviceID != "" {
+		if !h.isCallerAdmin(r) {
+			callerID := h.callerUserID(r)
+			if callerID == "" || !h.canAccessDevice(r, deviceID) {
+				httpx.Error(w, http.StatusForbidden, "forbidden")
+				return
+			}
+			if h.store != nil && h.store.Writer != nil {
+				_, _ = h.store.Writer.ExecContext(r.Context(),
+					`DELETE FROM access_tokens WHERE user_id = ? AND device_id = ?`, callerID, deviceID)
+			}
+			if h.authSvc != nil {
+				h.authSvc.InvalidateUserCache(callerID)
+			}
+			if h.sessions != nil {
+				h.sessions.RemoveSession(callerID, deviceID)
+			}
+			if h.wsHub != nil {
+				if disc, ok := h.wsHub.(interface{ DisconnectUserDevice(string, string) }); ok {
+					disc.DisconnectUserDevice(callerID, deviceID)
+				}
+			}
+			httpx.NoContent(w)
+			return
+		}
 		if h.authSvc != nil {
 			_ = h.authSvc.RevokeDevice(r.Context(), deviceID)
 		} else if h.userRepo != nil {

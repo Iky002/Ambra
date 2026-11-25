@@ -1,9 +1,11 @@
 package config
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -408,6 +410,76 @@ func TestUpdateSnapshotAndAtomicSaveErrors(t *testing.T) {
 	nanCfg.PlayedThreshold = math.NaN()
 	if err := nanCfg.Save(); err == nil {
 		t.Fatal("expected Save error for NaN PlayedThreshold")
+	}
+}
+
+func TestUpdateTMDBClearsEnvFlagAndConcurrentSave(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AMBRA_TMDB_API_KEY", "env-initial-secret")
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("initial Save: %v", err)
+	}
+	cfgPath := filepath.Join(dir, "config", "ambra.json")
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read ambra.json: %v", err)
+	}
+	if containsString(string(raw), "env-initial-secret") {
+		t.Fatalf("env TMDB key must not be written before explicit Update: %s", string(raw))
+	}
+
+	// Explicitly updating TMDBApiKey via Update clears envTMDBKeySet so Save persists the new key.
+	cfg.Update(func(c *Config) {
+		c.TMDBApiKey = "admin-updated-tmdb-key"
+	})
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save after Update: %v", err)
+	}
+	raw, err = os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read ambra.json after update: %v", err)
+	}
+	if !containsString(string(raw), "admin-updated-tmdb-key") {
+		t.Fatalf("expected updated TMDB key persisted to disk, got: %s", string(raw))
+	}
+
+	// Concurrent Update + Save + Snapshot must not race or corrupt ambra.json.
+	var wg sync.WaitGroup
+	errCh := make(chan error, 32)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			for j := 0; j < 5; j++ {
+				cfg.Update(func(c *Config) {
+					c.ServerName = fmt.Sprintf("Server-%d-%d", idx, j)
+				})
+				_ = cfg.Snapshot()
+				if err := cfg.Save(); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("concurrent Save failed: %v", err)
+	}
+
+	t.Setenv("AMBRA_TMDB_API_KEY", "")
+	reloaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("reload after concurrent Save: %v", err)
+	}
+	if reloaded.TMDBApiKey != "admin-updated-tmdb-key" {
+		t.Fatalf("expected reloaded TMDBApiKey=admin-updated-tmdb-key, got %q", reloaded.TMDBApiKey)
 	}
 }
 
