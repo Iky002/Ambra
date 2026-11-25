@@ -21,8 +21,11 @@ import { useI18n } from '../i18n/I18nContext'
 import { SUPPORTED_LOCALES } from '../i18n/types'
 import {
   loadPlaybackPrefs,
+  playbackPrefsToUserConfig,
   savePlaybackPrefs,
+  syncPlaybackPrefsFromUserConfig,
   type PlaybackPrefs,
+  type SubtitleModeOption,
 } from '../player/playbackPrefs'
 import { FeedbackBanner } from './admin/adminUtils'
 
@@ -30,7 +33,8 @@ const ALLOWED_AVATAR_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/web
 const MAX_AVATAR_UPLOAD_BYTES = 5 * 1024 * 1024 // 5 MB
 
 const AUDIO_LANG_OPTIONS = [
-  { value: '', label: '跟随媒体默认' },
+  { value: 'media', label: '跟随媒体默认' },
+  { value: 'auto', label: '跟随界面语言' },
   { value: 'chi', label: '中文 (国语/粤语)' },
   { value: 'eng', label: '英语 (English)' },
   { value: 'jpn', label: '日语 (日本語)' },
@@ -38,13 +42,23 @@ const AUDIO_LANG_OPTIONS = [
 ]
 
 const SUBTITLE_LANG_OPTIONS = [
-  { value: '', label: '跟随媒体默认' },
+  { value: 'auto', label: '跟随界面语言（默认）' },
+  { value: 'media', label: '跟随媒体默认' },
   { value: 'chs', label: '简体中文优先' },
   { value: 'cht', label: '繁体中文优先' },
   { value: 'chi', label: '中文（不限简繁）' },
   { value: 'eng', label: '英语 (English)' },
   { value: 'jpn', label: '日语 (日本語)' },
+  { value: 'kor', label: '韩语 (한국어)' },
   { value: 'off', label: '默认关闭字幕' },
+]
+
+const SUBTITLE_MODE_OPTIONS: { value: SubtitleModeOption; label: string }[] = [
+  { value: 'Default', label: '默认（按偏好自动匹配）' },
+  { value: 'Smart', label: '智能（仅非母语音轨时显示）' },
+  { value: 'OnlyForced', label: '仅强制字幕' },
+  { value: 'Always', label: '总是显示字幕' },
+  { value: 'None', label: '从不显示字幕' },
 ]
 
 export function ProfilePage() {
@@ -71,8 +85,14 @@ export function ProfilePage() {
     message: string
   } | null>(null)
 
-  // 本地播放偏好
+  // 播放偏好（优先与账号 UserConfiguration 同步，localStorage 作本地缓存）
   const [prefs, setPrefs] = useState<PlaybackPrefs>(() => loadPlaybackPrefs())
+
+  useEffect(() => {
+    if (user?.Configuration) {
+      setPrefs(syncPlaybackPrefsFromUserConfig(user.Configuration))
+    }
+  }, [user?.Configuration])
 
   useEffect(() => {
     setAvatarError(false)
@@ -202,10 +222,31 @@ export function ProfilePage() {
     quickConnectMutation.mutate(trimmed)
   }
 
+  const prefsMutation = useMutation({
+    mutationFn: async (nextPrefs: PlaybackPrefs) => {
+      if (!userId) return
+      const nextCfg = playbackPrefsToUserConfig(nextPrefs, user?.Configuration)
+      await api.updateUserConfiguration(userId, nextCfg)
+    },
+    onSuccess: async () => {
+      await refreshUser()
+      setFeedback({ type: 'success', message: '播放偏好已保存并同步至账号' })
+    },
+    onError: (err) => {
+      setFeedback({
+        type: 'error',
+        message:
+          err instanceof Error
+            ? `播放偏好已保存本地，同步账号失败：${err.message}`
+            : '播放偏好已保存本地，同步账号失败',
+      })
+    },
+  })
+
   const handlePrefsChange = (patch: Partial<PlaybackPrefs>) => {
     const updated = savePlaybackPrefs(patch)
     setPrefs(updated)
-    setFeedback({ type: 'success', message: '播放偏好已保存至本地浏览器' })
+    prefsMutation.mutate(updated)
   }
 
   if (!auth) return null
@@ -475,6 +516,23 @@ export function ProfilePage() {
                 className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 outline-none focus:border-amber-400/60"
               >
                 {SUBTITLE_LANG_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="block space-y-1.5">
+              <span className="text-xs font-medium text-zinc-300">字幕显示模式</span>
+              <select
+                value={prefs.subtitleMode}
+                onChange={(e) =>
+                  handlePrefsChange({ subtitleMode: e.target.value as SubtitleModeOption })
+                }
+                className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 outline-none focus:border-amber-400/60"
+              >
+                {SUBTITLE_MODE_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.value}>
                     {opt.label}
                   </option>

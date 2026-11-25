@@ -16,6 +16,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/core/playback"
 	"github.com/ambra-media/ambra/internal/core/scanner"
 	"github.com/ambra-media/ambra/internal/core/watcher"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
@@ -736,6 +737,26 @@ func (h *Handler) handleGetItem(w http.ResponseWriter, r *http.Request) {
 				httpx.Error(w, http.StatusForbidden, "access denied")
 				return
 			}
+		}
+	}
+	if item != nil && len(item.MediaSources) > 0 {
+		var userCfg *dto.UserConfiguration
+		var userData *sqlite.UserItemDataRecord
+		if h.userRepo != nil && userID != "" {
+			if u, uErr := h.userRepo.GetUserByID(r.Context(), userID); uErr == nil && u != nil {
+				cfgCopy := u.Config
+				userCfg = &cfgCopy
+			}
+			if ud, udErr := h.userRepo.GetUserItemData(r.Context(), userID, item.Id); udErr == nil && ud != nil {
+				userData = ud
+			}
+		}
+		serverDefaultLang := ""
+		if h.cfg != nil {
+			serverDefaultLang = h.cfg.Snapshot().TMDBLanguage
+		}
+		for i := range item.MediaSources {
+			playback.ApplyTrackSelection(&item.MediaSources[i], userCfg, userData, serverDefaultLang)
 		}
 	}
 	h.sanitizeItemPathsForCaller(r, item)

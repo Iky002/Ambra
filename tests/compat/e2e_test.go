@@ -18,6 +18,8 @@ import (
 )
 
 func TestAmbraEndToEndEmbyCompatibility(t *testing.T) {
+	t.Setenv("AMBRA_ADMIN_USER", "admin")
+	t.Setenv("AMBRA_ADMIN_PASS", "admin")
 	tmpDir := t.TempDir()
 	dataDir := filepath.Join(tmpDir, "data")
 	mediaDir := filepath.Join(tmpDir, "movies")

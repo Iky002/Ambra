@@ -70,7 +70,15 @@ export interface UserConfiguration {
   PlayDefaultAudioTrack?: boolean
   SubtitleLanguagePreference?: string
   AudioLanguagePreference?: string
+  DisplayMissingEpisodes?: boolean
   SubtitleMode?: string
+  EnableLocalPassword?: boolean
+  OrderedViews?: string[]
+  LatestItemsExcludes?: string[]
+  MyMediaExcludes?: string[]
+  HidePlayedInLatest?: boolean
+  RememberAudioSelections?: boolean
+  RememberSubtitleSelections?: boolean
   EnableNextEpisodeAutoPlay?: boolean
 }
 

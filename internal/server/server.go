@@ -171,6 +171,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		_, _, _ = rankingsSvc.ApplyTagsToLibrary(c)
 	})
 	pb := playback.New(libRepo, registry, cfg)
+	pb.SetUserRepo(userRepo)
 	imgSvc := imaging.New(libRepo).WithCacheDir(cfg.ImageCacheDir())
 	transcodeMgr := transcode.NewManager(cfg)
 	dvrRec := dvr.NewRecorder(dvr.Options{
