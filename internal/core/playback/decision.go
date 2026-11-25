@@ -257,14 +257,15 @@ func (e *Engine) decideOne(
 	if item.IsStrm || strings.HasSuffix(strings.ToLower(src.Path), ".strm") {
 		if resolved, err := e.ResolveStream(ctx, src.Path); err == nil && resolved != nil && resolved.Is302 {
 			msDTO.Protocol = "Http"
+			msDTO.Path = resolved.URL
 			msDTO.IsRemote = true
 			msDTO.SupportsDirectPlay = true
 			msDTO.SupportsDirectStream = true
 			msDTO.SupportsTranscoding = false
 			if isAudio {
-				msDTO.DirectStreamUrl = fmt.Sprintf("/Audio/%s/stream?Static=true&MediaSourceId=%s&PlaySessionId=%s", item.ID, msDTO.Id, sessionID)
+				msDTO.DirectStreamUrl = buildDirectStreamURL("Audio", item.ID, src.Container, msDTO.Id, sessionID)
 			} else {
-				msDTO.DirectStreamUrl = fmt.Sprintf("/Videos/%s/stream?Static=true&MediaSourceId=%s&PlaySessionId=%s", item.ID, msDTO.Id, sessionID)
+				msDTO.DirectStreamUrl = buildDirectStreamURL("Videos", item.ID, src.Container, msDTO.Id, sessionID)
 			}
 			return msDTO, DecisionDetail{
 				MediaSourceID: msDTO.Id,
@@ -291,7 +292,7 @@ func (e *Engine) decideOne(
 			msDTO.SupportsDirectPlay = true
 			msDTO.SupportsDirectStream = true
 			msDTO.SupportsTranscoding = allowTranscoding
-			msDTO.DirectStreamUrl = fmt.Sprintf("/Audio/%s/stream?Static=true&MediaSourceId=%s&PlaySessionId=%s", item.ID, msDTO.Id, sessionID)
+			msDTO.DirectStreamUrl = buildDirectStreamURL("Audio", item.ID, src.Container, msDTO.Id, sessionID)
 			return msDTO, DecisionDetail{
 				MediaSourceID: msDTO.Id,
 				PlayMethod:    PlayMethodDirectPlay,
@@ -334,7 +335,7 @@ func (e *Engine) decideOne(
 		msDTO.SupportsDirectPlay = true
 		msDTO.SupportsDirectStream = true
 		msDTO.SupportsTranscoding = allowTranscoding
-		msDTO.DirectStreamUrl = fmt.Sprintf("/Videos/%s/stream?Static=true&MediaSourceId=%s&PlaySessionId=%s", item.ID, msDTO.Id, sessionID)
+		msDTO.DirectStreamUrl = buildDirectStreamURL("Videos", item.ID, src.Container, msDTO.Id, sessionID)
 		return msDTO, DecisionDetail{
 			MediaSourceID: msDTO.Id,
 			PlayMethod:    PlayMethodDirectPlay,
@@ -347,7 +348,7 @@ func (e *Engine) decideOne(
 		msDTO.SupportsDirectPlay = true
 		msDTO.SupportsDirectStream = true
 		msDTO.SupportsTranscoding = allowTranscoding
-		msDTO.DirectStreamUrl = fmt.Sprintf("/Videos/%s/stream?Static=true&MediaSourceId=%s&PlaySessionId=%s", item.ID, msDTO.Id, sessionID)
+		msDTO.DirectStreamUrl = buildDirectStreamURL("Videos", item.ID, src.Container, msDTO.Id, sessionID)
 		return msDTO, DecisionDetail{
 			MediaSourceID: msDTO.Id,
 			PlayMethod:    PlayMethodClientWASM,
@@ -401,6 +402,27 @@ func (e *Engine) decideOne(
 		PlayMethod:    PlayMethodTranscode,
 		Reason:        reason,
 	}
+}
+
+func sanitizeContainerExt(container string) string {
+	ext := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(container), "."))
+	if ext == "" || ext == "strm" || len(ext) > 16 {
+		return ""
+	}
+	for i := 0; i < len(ext); i++ {
+		c := ext[i]
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+			return ""
+		}
+	}
+	return ext
+}
+
+func buildDirectStreamURL(kind, itemID, container, mediaSourceID, sessionID string) string {
+	if ext := sanitizeContainerExt(container); ext != "" {
+		return fmt.Sprintf("/%s/%s/stream.%s?Static=true&MediaSourceId=%s&PlaySessionId=%s", kind, itemID, ext, mediaSourceID, sessionID)
+	}
+	return fmt.Sprintf("/%s/%s/stream?Static=true&MediaSourceId=%s&PlaySessionId=%s", kind, itemID, mediaSourceID, sessionID)
 }
 
 func appendTranscodeQueryParams(baseURL string, req PlaybackInfoRequest, maxBitrate int) string {
