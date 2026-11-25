@@ -142,31 +142,140 @@ func (p *Provider) profileImageURL(profilePath string) string {
 	return p.imageBaseURL + profilePath
 }
 
-func (p *Provider) fetchMovie(ctx context.Context, q plugins.MediaQuery, lang string) (*plugins.MetadataResult, error) {
-	tmdbID := providerID(q.ProviderIDs, "tmdb")
-	if tmdbID == "" {
-		if q.Title == "" {
-			return nil, nil
+func (p *Provider) findTMDBIDByIMDb(ctx context.Context, imdbID, lang, mediaKind string) string {
+	imdbID = strings.TrimSpace(imdbID)
+	if imdbID == "" {
+		return ""
+	}
+	params := url.Values{}
+	params.Set("api_key", p.apiKey)
+	params.Set("language", lang)
+	params.Set("external_source", "imdb_id")
+	var fr struct {
+		MovieResults []struct {
+			ID int `json:"id"`
+		} `json:"movie_results"`
+		TVResults []struct {
+			ID int `json:"id"`
+		} `json:"tv_results"`
+	}
+	if err := p.getJSON(ctx, "/find/"+url.PathEscape(imdbID), params, &fr); err != nil {
+		return ""
+	}
+	if mediaKind == "tv" && len(fr.TVResults) > 0 {
+		return strconv.Itoa(fr.TVResults[0].ID)
+	}
+	if mediaKind == "movie" && len(fr.MovieResults) > 0 {
+		return strconv.Itoa(fr.MovieResults[0].ID)
+	}
+	return ""
+}
+
+type tmdbSearchCandidate struct {
+	ID           int    `json:"id"`
+	ReleaseDate  string `json:"release_date"`
+	FirstAirDate string `json:"first_air_date"`
+}
+
+func pickBestTMDBCandidate(results []tmdbSearchCandidate, targetYear int) int {
+	if len(results) == 0 {
+		return 0
+	}
+	if targetYear <= 0 {
+		return results[0].ID
+	}
+	// Prefer exact year match, then ±1 year tolerance (common for festival vs wide release).
+	nearID := 0
+	for _, r := range results {
+		dateStr := r.ReleaseDate
+		if dateStr == "" {
+			dateStr = r.FirstAirDate
 		}
+		if len(dateStr) >= 4 {
+			if y, err := strconv.Atoi(dateStr[:4]); err == nil {
+				if y == targetYear {
+					return r.ID
+				}
+				if nearID == 0 && (y == targetYear-1 || y == targetYear+1) {
+					nearID = r.ID
+				}
+			}
+		}
+	}
+	if nearID > 0 {
+		return nearID
+	}
+	return results[0].ID
+}
+
+func (p *Provider) searchTMDBWithFallbacks(ctx context.Context, endpoint, yearParam, lang string, q plugins.MediaQuery) (string, error) {
+	type attempt struct {
+		title string
+		year  int
+	}
+	var attempts []attempt
+	addAttempt := func(t string, y int) {
+		t = strings.TrimSpace(t)
+		if t == "" {
+			return
+		}
+		for _, a := range attempts {
+			if strings.EqualFold(a.title, t) && a.year == y {
+				return
+			}
+		}
+		attempts = append(attempts, attempt{title: t, year: y})
+	}
+
+	if q.Year > 0 {
+		addAttempt(q.Title, q.Year)
+		addAttempt(q.OriginalTitle, q.Year)
+	}
+	addAttempt(q.Title, 0)
+	addAttempt(q.OriginalTitle, 0)
+
+	var lastErr error
+	for _, a := range attempts {
 		params := url.Values{}
 		params.Set("api_key", p.apiKey)
 		params.Set("language", lang)
-		params.Set("query", q.Title)
-		if q.Year > 0 {
-			params.Set("year", strconv.Itoa(q.Year))
+		params.Set("query", a.title)
+		if a.year > 0 {
+			params.Set(yearParam, strconv.Itoa(a.year))
 		}
 		var sr struct {
-			Results []struct {
-				ID int `json:"id"`
-			} `json:"results"`
+			Results []tmdbSearchCandidate `json:"results"`
 		}
-		if err := p.getJSON(ctx, "/search/movie", params, &sr); err != nil {
-			return nil, err
+		if err := p.getJSON(ctx, endpoint, params, &sr); err != nil {
+			lastErr = err
+			continue
 		}
-		if len(sr.Results) == 0 {
+		if len(sr.Results) > 0 {
+			return strconv.Itoa(pickBestTMDBCandidate(sr.Results, q.Year)), nil
+		}
+	}
+	return "", lastErr
+}
+
+func (p *Provider) fetchMovie(ctx context.Context, q plugins.MediaQuery, lang string) (*plugins.MetadataResult, error) {
+	tmdbID := providerID(q.ProviderIDs, "tmdb")
+	if tmdbID == "" {
+		if imdbID := providerID(q.ProviderIDs, "imdb"); imdbID != "" {
+			tmdbID = p.findTMDBIDByIMDb(ctx, imdbID, lang, "movie")
+		}
+	}
+	if tmdbID == "" {
+		if strings.TrimSpace(q.Title) == "" && strings.TrimSpace(q.OriginalTitle) == "" {
 			return nil, nil
 		}
-		tmdbID = strconv.Itoa(sr.Results[0].ID)
+		var err error
+		tmdbID, err = p.searchTMDBWithFallbacks(ctx, "/search/movie", "year", lang, q)
+		if err != nil {
+			return nil, err
+		}
+		if tmdbID == "" {
+			return nil, nil
+		}
 	}
 
 	params := url.Values{}
@@ -290,28 +399,22 @@ func (p *Provider) fetchMovie(ctx context.Context, q plugins.MediaQuery, lang st
 func (p *Provider) fetchSeries(ctx context.Context, q plugins.MediaQuery, lang string) (*plugins.MetadataResult, error) {
 	tmdbID := providerID(q.ProviderIDs, "tmdb")
 	if tmdbID == "" {
-		if q.Title == "" {
+		if imdbID := providerID(q.ProviderIDs, "imdb"); imdbID != "" {
+			tmdbID = p.findTMDBIDByIMDb(ctx, imdbID, lang, "tv")
+		}
+	}
+	if tmdbID == "" {
+		if strings.TrimSpace(q.Title) == "" && strings.TrimSpace(q.OriginalTitle) == "" {
 			return nil, nil
 		}
-		params := url.Values{}
-		params.Set("api_key", p.apiKey)
-		params.Set("language", lang)
-		params.Set("query", q.Title)
-		if q.Year > 0 {
-			params.Set("first_air_date_year", strconv.Itoa(q.Year))
-		}
-		var sr struct {
-			Results []struct {
-				ID int `json:"id"`
-			} `json:"results"`
-		}
-		if err := p.getJSON(ctx, "/search/tv", params, &sr); err != nil {
+		var err error
+		tmdbID, err = p.searchTMDBWithFallbacks(ctx, "/search/tv", "first_air_date_year", lang, q)
+		if err != nil {
 			return nil, err
 		}
-		if len(sr.Results) == 0 {
+		if tmdbID == "" {
 			return nil, nil
 		}
-		tmdbID = strconv.Itoa(sr.Results[0].ID)
 	}
 
 	params := url.Values{}
