@@ -254,3 +254,132 @@ func TestSyncLibraryHydrationAndRealTargets(t *testing.T) {
 		t.Fatalf("expected hydrated ready item DTO, got %+v", ready)
 	}
 }
+
+func TestSyncTargetsIsolationItemValidationReadyFilterAndCallerHelpers(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default(dir)
+	st, err := sqlite.Open(cfg.DBPath())
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	ctx := context.Background()
+	libRepo := sqlite.NewLibraryRepo(st)
+	userRepo := sqlite.NewUserRepo(st)
+
+	aliceU := &sqlite.UserRecord{Name: "alice", Policy: sqlite.DefaultUserPolicy(false), Config: sqlite.DefaultUserConfig()}
+	bobU := &sqlite.UserRecord{Name: "bob", Policy: sqlite.DefaultUserPolicy(false), Config: sqlite.DefaultUserConfig()}
+	adminU := &sqlite.UserRecord{Name: "admin", IsAdmin: true, Policy: sqlite.DefaultUserPolicy(true), Config: sqlite.DefaultUserConfig()}
+	for _, u := range []*sqlite.UserRecord{aliceU, bobU, adminU} {
+		if err := userRepo.CreateUser(ctx, u); err != nil {
+			t.Fatalf("CreateUser %s: %v", u.Name, err)
+		}
+	}
+
+	_ = userRepo.CreateAccessToken(ctx, &sqlite.AccessTokenRecord{
+		Token: "tok-a", UserID: aliceU.ID, DeviceID: "dev-alice", DeviceName: "Alice iPad", AppName: "Emby",
+	})
+	_ = userRepo.CreateAccessToken(ctx, &sqlite.AccessTokenRecord{
+		Token: "tok-b", UserID: bobU.ID, DeviceID: "dev-bob", DeviceName: "Bob Phone", AppName: "Emby",
+	})
+
+	lib, _ := libRepo.CreateLibrary(ctx, "Movies", "movies", []string{dir})
+	validItemID := guid.New()
+	_ = libRepo.UpsertItem(ctx, &sqlite.ItemRecord{
+		ID: validItemID, LibraryID: lib.ID, ParentID: lib.ID, Type: "Movie", MediaType: "Video", Name: "Real Movie", Path: "/media/real.mkv",
+	})
+
+	h := New(st, cfg)
+	h.SetLibraryRepo(libRepo)
+	h.SetUserRepo(userRepo)
+	mux := http.NewServeMux()
+	authMW := middleware.NewAuth(nil, nil)
+	h.RegisterRoutes(mux, AuthFuncs{RequireAuth: authMW.RequireAuth, RequireAdmin: authMW.RequireAdmin})
+
+	aliceAC := makeSyncAuth(aliceU.ID, "alice", false)
+	bobAC := makeSyncAuth(bobU.ID, "bob", false)
+	adminAC := makeSyncAuth(adminU.ID, "admin", true)
+
+	// 1. Non-admin GET /Sync/Targets and /Sync/Options only see their own devices
+	rec := doSyncAuthReq(t, mux, aliceAC, http.MethodGet, "/Sync/Targets", nil)
+	var targets []SyncTarget
+	_ = json.Unmarshal(rec.Body.Bytes(), &targets)
+	if len(targets) != 1 || targets[0].Id != "dev-alice" {
+		t.Fatalf("alice targets leaked or missing: %+v", targets)
+	}
+	rec = doSyncAuthReq(t, mux, aliceAC, http.MethodGet, "/Sync/Options", nil)
+	var opts SyncDialogOptions
+	_ = json.Unmarshal(rec.Body.Bytes(), &opts)
+	if len(opts.Targets) != 1 || opts.Targets[0].Id != "dev-alice" {
+		t.Fatalf("alice options targets leaked or missing: %+v", opts.Targets)
+	}
+
+	// Admin sees both devices
+	rec = doSyncAuthReq(t, mux, adminAC, http.MethodGet, "/Sync/Targets", nil)
+	targets = nil
+	_ = json.Unmarshal(rec.Body.Bytes(), &targets)
+	if len(targets) != 2 {
+		t.Fatalf("expected admin to see 2 devices, got %+v", targets)
+	}
+
+	// 2. POST /Sync/Jobs with only nonexistent ItemIds -> 404 (no fake placeholders!)
+	rec = doSyncAuthReq(t, mux, aliceAC, http.MethodPost, "/Sync/Jobs", map[string]any{
+		"TargetId": "dev-alice",
+		"ItemIds":  []string{"does-not-exist-1", "does-not-exist-2"},
+	})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for nonexistent ItemIds, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Mix of 1 valid + 1 invalid -> creates only the 1 valid item
+	rec = doSyncAuthReq(t, mux, aliceAC, http.MethodPost, "/Sync/Jobs", map[string]any{
+		"TargetId": "dev-alice",
+		"ItemIds":  []string{"missing-id", validItemID},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for mixed valid/invalid ItemIds, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var created SyncJobCreationResult
+	_ = json.Unmarshal(rec.Body.Bytes(), &created)
+	if len(created.JobItems) != 1 || created.JobItems[0].ItemId != validItemID || created.Job.ItemCount != 1 {
+		t.Fatalf("expected 1 valid hydrated item, got %+v", created)
+	}
+
+	// 3. GET /Sync/Items/Ready returns ReadyToTransfer and Synced, excludes Queued
+	h.mu.Lock()
+	h.state.JobItems = append(h.state.JobItems,
+		SyncJobItem{Id: "ji-queued", JobId: created.Job.Id, ItemId: validItemID, TargetId: "dev-alice", Status: "Queued"},
+		SyncJobItem{Id: "ji-synced", JobId: created.Job.Id, ItemId: validItemID, TargetId: "dev-alice", Status: "Synced"},
+	)
+	h.mu.Unlock()
+
+	rec = doSyncAuthReq(t, mux, aliceAC, http.MethodGet, "/Sync/Items/Ready?TargetId=dev-alice", nil)
+	var ready []SyncedItem
+	_ = json.Unmarshal(rec.Body.Bytes(), &ready)
+	if len(ready) != 2 {
+		t.Fatalf("expected 2 ready items (ReadyToTransfer + Synced, excluding Queued), got %d (%+v)", len(ready), ready)
+	}
+	for _, rItem := range ready {
+		if rItem.SyncJobItemId == "ji-queued" {
+			t.Fatalf("Queued item should not be returned by /Sync/Items/Ready")
+		}
+	}
+
+	// 4. Exported caller helpers enforce RBAC and empty-filter no-op
+	if found, allowed := h.SetJobItemRemovalForCaller(ctx, "ji-synced", true, bobAC.UserID(), false); !found || allowed {
+		t.Fatalf("expected Bob denied on SetJobItemRemovalForCaller, got found=%v allowed=%v", found, allowed)
+	}
+	if err := h.CancelItemsForCaller(ctx, "", nil, aliceAC.UserID(), false); err != nil {
+		t.Fatalf("empty cancel should be no-op, got err=%v", err)
+	}
+	if err := h.CancelItemsForCaller(ctx, "dev-alice", []string{validItemID}, bobAC.UserID(), false); err != ErrForbidden {
+		t.Fatalf("expected ErrForbidden when Bob cancels Alice's items, got %v", err)
+	}
+	if found, allowed := h.DeleteJobForCaller(ctx, created.Job.Id, bobAC.UserID(), false); !found || allowed {
+		t.Fatalf("expected Bob denied on DeleteJobForCaller, got found=%v allowed=%v", found, allowed)
+	}
+	if found, allowed := h.DeleteJobForCaller(ctx, created.Job.Id, aliceAC.UserID(), false); !found || !allowed {
+		t.Fatalf("expected Alice allowed on DeleteJobForCaller, got found=%v allowed=%v", found, allowed)
+	}
+}

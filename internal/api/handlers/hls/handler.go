@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
@@ -31,12 +32,18 @@ type AuthFuncs struct {
 	UserIDFromCtx func(context.Context) string
 }
 
+const (
+	maxLiveStreams = 256
+	liveStreamTTL  = 4 * time.Hour
+)
+
 type liveStreamEntry struct {
 	LiveStreamID  string
 	PlaySessionID string
 	UserID        string
 	ItemID        string
 	MediaSource   dto.MediaSourceInfo
+	CreatedAt     time.Time
 }
 
 // Handler serves dynamic HLS playlists/segments, encoding capabilities/defaults, and LiveStreams APIs.
@@ -571,13 +578,16 @@ func (h *Handler) handleLiveStreamOpen(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	now := time.Now().UTC()
 	h.liveMu.Lock()
+	h.pruneLiveStreamsLocked(now)
 	h.liveStreams[liveID] = &liveStreamEntry{
 		LiveStreamID:  liveID,
 		PlaySessionID: req.PlaySessionId,
 		UserID:        callerUserID,
 		ItemID:        guid.Normalize(req.ItemId),
 		MediaSource:   msDTO,
+		CreatedAt:     now,
 	}
 	h.liveMu.Unlock()
 
@@ -585,6 +595,29 @@ func (h *Handler) handleLiveStreamOpen(w http.ResponseWriter, r *http.Request) {
 		"LiveStreamId": liveID,
 		"MediaSource":  msDTO,
 	})
+}
+
+func (h *Handler) pruneLiveStreamsLocked(now time.Time) {
+	cutoff := now.Add(-liveStreamTTL)
+	for id, entry := range h.liveStreams {
+		if entry == nil || entry.CreatedAt.Before(cutoff) {
+			delete(h.liveStreams, id)
+		}
+	}
+	for len(h.liveStreams) >= maxLiveStreams {
+		var oldestID string
+		var oldestTime time.Time
+		for id, entry := range h.liveStreams {
+			if oldestID == "" || entry.CreatedAt.Before(oldestTime) {
+				oldestID = id
+				oldestTime = entry.CreatedAt
+			}
+		}
+		if oldestID == "" {
+			break
+		}
+		delete(h.liveStreams, oldestID)
+	}
 }
 
 type liveStreamCloseRequest struct {

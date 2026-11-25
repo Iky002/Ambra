@@ -262,6 +262,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	libH := library.New(libRepo, sc, cfg)
 	libH.SetUserRepo(userRepo)
 	libH.SetWatcher(libWatcher)
+	libH.SetStore(store)
 	libH.RegisterRoutes(mediaMux, library.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
@@ -315,15 +316,16 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	})
 
 	// Phase 3: FFmpeg Dynamic HLS, Encoding, LiveStreams & Audio
-	hlsH := hls.New(libRepo, transcodeMgr, cfg)
-	hlsH.SetUserRepo(userRepo)
-	hlsH.SetStreamResolver(func(c context.Context, rawPath string) (string, error) {
+	resolveStreamURL := func(c context.Context, rawPath string) (string, error) {
 		res, err := pb.ResolveStream(c, rawPath)
 		if err != nil || res == nil {
 			return "", err
 		}
 		return res.URL, nil
-	})
+	}
+	hlsH := hls.New(libRepo, transcodeMgr, cfg)
+	hlsH.SetUserRepo(userRepo)
+	hlsH.SetStreamResolver(resolveStreamURL)
 	hlsH.RegisterRoutes(mediaMux, hls.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
@@ -331,6 +333,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	})
 	audioH := audio.New(libRepo, cfg)
 	audioH.SetUserRepo(userRepo)
+	audioH.SetStreamResolver(resolveStreamURL)
 	audioH.RegisterRoutes(mediaMux, audio.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
@@ -428,6 +431,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	})
 	compatExtSvc := compatext.New(store, cfg)
 	compatExtSvc.SetLiveTV(livetvH)
+	compatExtSvc.SetSyncHandler(syncH)
 	compatExtSvc.SetDVR(dvrRec)
 	compatExtSvc.SetLibraryRepo(libRepo)
 	compatExtSvc.SetUserRepo(userRepo)

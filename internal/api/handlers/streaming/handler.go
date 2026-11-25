@@ -91,6 +91,64 @@ func (h *Handler) CanAccessLibrary(ctx context.Context, userID, libraryID string
 	return false
 }
 
+func (h *Handler) callerIdentity(r *http.Request) (userID string, isAdmin bool) {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		return guid.Normalize(ac.UserID()), ac.IsAdmin()
+	}
+	if h.auth.UserIDFromCtx != nil {
+		uid := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if uid != "" {
+			if h.userRepo != nil {
+				if u, err := h.userRepo.GetUserByID(r.Context(), uid); err == nil && u != nil {
+					return uid, u.IsAdmin || u.Policy.IsAdministrator
+				}
+			}
+			return uid, false
+		}
+	}
+	return "", false
+}
+
+func (h *Handler) isAuthenticated(r *http.Request) bool {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		return true
+	}
+	if h.auth.UserIDFromCtx != nil && strings.TrimSpace(h.auth.UserIDFromCtx(r.Context())) != "" {
+		return true
+	}
+	return false
+}
+
+func (h *Handler) canAccessUserData(r *http.Request, targetUserID string) bool {
+	normTarget := guid.Normalize(targetUserID)
+	if normTarget == "" {
+		return true
+	}
+	callerID, isAdmin := h.callerIdentity(r)
+	if isAdmin || callerID == "" {
+		return true
+	}
+	return callerID == normTarget
+}
+
+func (h *Handler) canDownloadContent(r *http.Request) bool {
+	if h.userRepo == nil {
+		return true
+	}
+	callerID, isAdmin := h.callerIdentity(r)
+	if isAdmin || callerID == "" {
+		return true
+	}
+	u, err := h.userRepo.GetUserByID(r.Context(), callerID)
+	if err != nil || u == nil {
+		return true
+	}
+	if u.IsAdmin || u.Policy.IsAdministrator {
+		return true
+	}
+	return u.Policy.EnableContentDownloading
+}
+
 func (h *Handler) canAccessItem(r *http.Request, itemID string) bool {
 	if h.userRepo == nil || h.repo == nil {
 		return true
@@ -170,6 +228,10 @@ func (h *Handler) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 			req.UserID = h.auth.UserIDFromCtx(r.Context())
 		}
 	}
+	if req.UserID != "" && !h.canAccessUserData(r, req.UserID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	if req.MediaSourceID == "" {
 		req.MediaSourceID = q.Get("MediaSourceId")
 	}
@@ -216,6 +278,10 @@ func (h *Handler) handleVideoStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleDownload(w http.ResponseWriter, r *http.Request) {
+	if !h.canDownloadContent(r) {
+		httpx.Error(w, http.StatusForbidden, "content downloading is disabled")
+		return
+	}
 	h.serveMediaFile(w, r, true)
 }
 
@@ -286,7 +352,7 @@ func (h *Handler) serveMediaFile(w http.ResponseWriter, r *http.Request, asAttac
 		w.Header().Set("Content-Type", ct)
 	}
 	if asAttachment {
-		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filepath.Base(mediaPath)))
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, sanitizeContentDispositionFilename(filepath.Base(mediaPath))))
 	}
 	// http.ServeContent handles HTTP Range, If-Range, Accept-Ranges, HEAD, and 206 Partial Content natively.
 	http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
@@ -454,7 +520,13 @@ func (h *Handler) tryExtractAndServeChapterImage(w http.ResponseWriter, r *http.
 	if h.extractor == nil || h.repo == nil || idx < 0 {
 		return false
 	}
+	if !h.isAuthenticated(r) {
+		return false
+	}
 	normID := guid.Normalize(itemID)
+	if !h.canAccessItem(r, normID) {
+		return false
+	}
 	rec, err := h.repo.GetItemRecordByID(r.Context(), normID)
 	if err != nil || rec == nil || idx >= len(rec.Extra.Chapters) {
 		return false
@@ -557,13 +629,24 @@ func (h *Handler) proxyRemoteMedia(w http.ResponseWriter, r *http.Request, targe
 				filename = base
 			}
 		}
-		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, sanitizeContentDispositionFilename(filename)))
 	}
 
 	w.WriteHeader(resp.StatusCode)
 	if r.Method != http.MethodHead {
 		_, _ = io.Copy(w, resp.Body)
 	}
+}
+
+func sanitizeContentDispositionFilename(name string) string {
+	name = strings.ReplaceAll(name, "\r", "")
+	name = strings.ReplaceAll(name, "\n", "")
+	name = strings.ReplaceAll(name, "\\", "\\\\")
+	name = strings.ReplaceAll(name, `"`, `\"`)
+	if name == "" {
+		return "media"
+	}
+	return name
 }
 
 func isHTTPURL(s string) bool {

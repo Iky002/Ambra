@@ -260,3 +260,195 @@ func TestLiveTVProgramsFilteringSortingAndSeriesTimerAutoSchedule(t *testing.T) 
 		t.Fatalf("expected 3 deduplicated timers across channels, got %d", timers.TotalRecordCount)
 	}
 }
+
+func TestLiveTVAccessPolicyEnforcement(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default(dir)
+	st, err := sqlite.Open(cfg.DBPath())
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	userRepo := sqlite.NewUserRepo(st)
+	h := New(st, cfg)
+	h.SetUserRepo(userRepo)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp2t")
+		_, _ = w.Write([]byte("OK_STREAM"))
+	}))
+	defer upstream.Close()
+
+	h.mu.Lock()
+	h.state.Channels = []ChannelInfo{{Id: "ch-1", Name: "Chan 1", Type: "TvChannel", ChannelType: "TV", StreamUrl: upstream.URL + "/live.ts"}}
+	h.mu.Unlock()
+
+	mux := http.NewServeMux()
+	authMW := middleware.NewAuth(nil, nil)
+	h.RegisterRoutes(mux, AuthFuncs{
+		RequireAuth:  authMW.RequireAuth,
+		RequireAdmin: authMW.RequireAdmin,
+	})
+
+	noAccessPol := sqlite.DefaultUserPolicy(false)
+	noAccessPol.EnableLiveTvAccess = false
+	noAccessUser := &middleware.AuthContext{
+		User: &sqlite.UserRecord{
+			ID:      guid.Normalize("no-tv-1"),
+			Name:    "notv",
+			IsAdmin: false,
+			Policy:  noAccessPol,
+		},
+	}
+
+	okUser := makeLiveTVAuth("tv-ok-1", "tvok", false, false)
+
+	adminNoFlagPol := sqlite.DefaultUserPolicy(true)
+	adminNoFlagPol.EnableLiveTvAccess = false
+	adminUser := &middleware.AuthContext{
+		User: &sqlite.UserRecord{
+			ID:      guid.Normalize("admin-tv-1"),
+			Name:    "admin",
+			IsAdmin: true,
+			Policy:  adminNoFlagPol,
+		},
+	}
+
+	endpoints := []struct {
+		method string
+		path   string
+		body   any
+	}{
+		{http.MethodGet, "/LiveTv/Channels", nil},
+		{http.MethodGet, "/LiveTv/Channels/ch-1", nil},
+		{http.MethodGet, "/LiveTv/Channels/ch-1/Stream", nil},
+		{http.MethodGet, "/LiveTv/Programs", nil},
+		{http.MethodPost, "/LiveTv/Programs", map[string]any{}},
+		{http.MethodGet, "/LiveTv/Recordings", nil},
+		{http.MethodGet, "/LiveTv/Timers", nil},
+		{http.MethodGet, "/LiveTv/SeriesTimers", nil},
+	}
+
+	for _, ep := range endpoints {
+		if r := doLiveTVAuthReq(t, mux, noAccessUser, ep.method, ep.path, ep.body); r.Code != http.StatusForbidden {
+			t.Fatalf("noAccessUser %s %s: expected 403, got %d", ep.method, ep.path, r.Code)
+		}
+		if r := doLiveTVAuthReq(t, mux, okUser, ep.method, ep.path, ep.body); r.Code != http.StatusOK {
+			t.Fatalf("okUser %s %s: expected 200, got %d body=%s", ep.method, ep.path, r.Code, r.Body.String())
+		}
+		if r := doLiveTVAuthReq(t, mux, adminUser, ep.method, ep.path, ep.body); r.Code != http.StatusOK {
+			t.Fatalf("adminUser %s %s: expected 200, got %d body=%s", ep.method, ep.path, r.Code, r.Body.String())
+		}
+	}
+}
+
+func TestLiveTVSeriesTimerCascadeXMLTVRefreshAndExportedHelpers(t *testing.T) {
+	h, mux, _, _ := setupLiveTVTest(t)
+
+	futureStart := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Minute)
+	futureEnd := futureStart.Add(time.Hour)
+	xmltvPayload := `<?xml version="1.0" encoding="UTF-8"?>
+<tv>
+  <channel id="epg-1"><display-name>News 1</display-name></channel>
+  <programme start="` + futureStart.Format("20060102150405 -0700") + `" stop="` + futureEnd.Format("20060102150405 -0700") + `" channel="epg-1">
+    <title>Nightly Brief</title>
+    <desc>Daily news recap</desc>
+  </programme>
+</tv>`
+
+	lanSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/playlist.m3u":
+			_, _ = w.Write([]byte("#EXTM3U\n#EXTINF:-1 tvg-id=\"epg-1\",News 1\nhttp://192.168.1.50/news.ts\n"))
+		case "/guide.xml":
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = w.Write([]byte(xmltvPayload))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer lanSrv.Close()
+
+	// 1. LAN M3U import succeeds with default safe HTTP client
+	rec := doJSON(t, mux, http.MethodPost, "/LiveTv/TunerHosts", map[string]any{
+		"Type": "m3u",
+		"Url":  lanSrv.URL + "/playlist.m3u",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("LAN M3U import failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	chRec := doJSON(t, mux, http.MethodGet, "/LiveTv/Channels", nil)
+	var chRes dto.QueryResult[ChannelInfo]
+	_ = json.Unmarshal(chRec.Body.Bytes(), &chRes)
+	if len(chRes.Items) != 1 {
+		t.Fatalf("expected 1 channel, got %d", len(chRes.Items))
+	}
+	chID := chRes.Items[0].Id
+
+	// 2. Create SeriesTimer BEFORE XMLTV refresh
+	stRec := doJSON(t, mux, http.MethodPost, "/LiveTv/SeriesTimers", map[string]any{
+		"Name":             "Nightly Brief",
+		"ChannelId":        chID,
+		"RecordAnyChannel": false,
+	})
+	if stRec.Code != http.StatusOK {
+		t.Fatalf("POST /LiveTv/SeriesTimers: %d", stRec.Code)
+	}
+	var stTimer SeriesTimerInfo
+	_ = json.Unmarshal(stRec.Body.Bytes(), &stTimer)
+
+	// 3. Refresh XMLTV from LAN URL -> must automatically schedule pending timer for SeriesTimer
+	lpRec := doJSON(t, mux, http.MethodPost, "/LiveTv/ListingProviders", map[string]any{
+		"Type": "xmltv",
+		"Path": lanSrv.URL + "/guide.xml",
+	})
+	if lpRec.Code != http.StatusOK {
+		t.Fatalf("LAN XMLTV import failed: %d %s", lpRec.Code, lpRec.Body.String())
+	}
+
+	// Add a completed timer belonging to the same series timer + an unrelated timer to verify selective cascade.
+	h.mu.Lock()
+	h.state.Timers = append(h.state.Timers,
+		TimerInfo{Id: "tm-done", SeriesTimerId: stTimer.Id, Name: "Old Ep", Status: "Completed"},
+		TimerInfo{Id: "tm-other", Name: "Standalone", Status: "New"},
+	)
+	h.mu.Unlock()
+
+	tRec := doJSON(t, mux, http.MethodGet, "/LiveTv/Timers?SeriesTimerId="+stTimer.Id, nil)
+	var timers dto.QueryResult[TimerInfo]
+	_ = json.Unmarshal(tRec.Body.Bytes(), &timers)
+	if timers.TotalRecordCount != 2 {
+		t.Fatalf("expected 2 timers for series (1 auto-scheduled New + 1 Completed), got %d (%+v)", timers.TotalRecordCount, timers.Items)
+	}
+
+	// 4. DELETE /LiveTv/SeriesTimers/{Id} cascade-deletes pending ("New") single timers, keeping Completed & unrelated timers.
+	delRec := doJSON(t, mux, http.MethodDelete, "/LiveTv/SeriesTimers/"+stTimer.Id, nil)
+	if delRec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE /LiveTv/SeriesTimers/{Id}: %d", delRec.Code)
+	}
+	tRec = doJSON(t, mux, http.MethodGet, "/LiveTv/Timers", nil)
+	timers = dto.QueryResult[TimerInfo]{}
+	_ = json.Unmarshal(tRec.Body.Bytes(), &timers)
+	if timers.TotalRecordCount != 2 {
+		t.Fatalf("expected 2 remaining timers (tm-done + tm-other), got %d (%+v)", timers.TotalRecordCount, timers.Items)
+	}
+	for _, tm := range timers.Items {
+		if tm.SeriesTimerId == stTimer.Id && tm.Status == "New" {
+			t.Fatalf("pending timer %s was not cascade-deleted", tm.Id)
+		}
+	}
+
+	// 5. Exported channel state helpers update in-memory state cleanly
+	if err := h.SetChannelDisabled(context.Background(), chID, true); err != nil {
+		t.Fatalf("SetChannelDisabled: %v", err)
+	}
+	if err := h.SetChannelSortIndex(context.Background(), chID, 7); err != nil {
+		t.Fatalf("SetChannelSortIndex: %v", err)
+	}
+	ch, ok := h.GetChannelByID(chID)
+	if !ok || !ch.Disabled || ch.SortIndex != 7 {
+		t.Fatalf("expected Disabled=true SortIndex=7, got %+v", ch)
+	}
+}

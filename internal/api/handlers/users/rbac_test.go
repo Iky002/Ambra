@@ -296,12 +296,12 @@ func TestSessionsActiveWithinAndDevicesQueryFilters(t *testing.T) {
 		t.Fatalf("expected 1 device for guest, got %+v", devByUser)
 	}
 
-	// GET /Devices?SupportsSync=true returns 0 devices (sync not supported)
+	// GET /Devices?SupportsSync=true treats registered devices as supporting sync
 	rec = doReq("/Devices?SupportsSync=true")
 	var devSyncTrue dto.QueryResult[DeviceInfoDto]
 	_ = json.Unmarshal(rec.Body.Bytes(), &devSyncTrue)
-	if devSyncTrue.TotalRecordCount != 0 {
-		t.Fatalf("expected 0 sync devices, got %d", devSyncTrue.TotalRecordCount)
+	if devSyncTrue.TotalRecordCount < 2 {
+		t.Fatalf("expected >=2 devices for SupportsSync=true, got %d", devSyncTrue.TotalRecordCount)
 	}
 
 	// GET /Devices?SupportsSync=false returns all devices
@@ -310,5 +310,54 @@ func TestSessionsActiveWithinAndDevicesQueryFilters(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &devSyncFalse)
 	if devSyncFalse.TotalRecordCount < 2 {
 		t.Fatalf("expected >=2 devices for SupportsSync=false, got %d", devSyncFalse.TotalRecordCount)
+	}
+}
+
+func TestUpdateCapabilitiesQueryParamFallback(t *testing.T) {
+	env := setupUsersEnv(t)
+
+	// 1. Query-param fallback with empty body
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/Sessions/Capabilities?PlayableMediaTypes=Video,Audio&SupportedCommands=MoveUp,PlayState&SupportsMediaControl=true&SupportsSync=true",
+		nil,
+	)
+	req.Header.Set("X-Emby-Token", env.viewerTok)
+	rec := httptest.NewRecorder()
+	env.router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("POST /Sessions/Capabilities query fallback expected 204, got %d", rec.Code)
+	}
+
+	sessions := env.sessionMgr.ListSessions()
+	var viewerSess *dto.SessionInfo
+	for i := range sessions {
+		if sessions[i].DeviceId == "dev-viewer" {
+			viewerSess = &sessions[i]
+			break
+		}
+	}
+	if viewerSess == nil {
+		t.Fatal("expected viewer session to exist")
+	}
+	if !viewerSess.SupportsRemoteControl {
+		t.Fatal("expected SupportsRemoteControl=true from SupportsMediaControl query param")
+	}
+	if len(viewerSess.PlayableMediaTypes) != 2 || viewerSess.PlayableMediaTypes[0] != "Video" {
+		t.Fatalf("unexpected PlayableMediaTypes: %+v", viewerSess.PlayableMediaTypes)
+	}
+	if len(viewerSess.SupportedCommands) != 2 || viewerSess.SupportedCommands[0] != "MoveUp" {
+		t.Fatalf("unexpected SupportedCommands: %+v", viewerSess.SupportedCommands)
+	}
+
+	// 2. JSON body with SupportsMediaControl=false overrides query param
+	rec = doReq(env.router, http.MethodPost, "/Sessions/Capabilities?SupportsMediaControl=true", env.viewerTok, `{"SupportsMediaControl":false}`)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("POST /Sessions/Capabilities JSON SupportsMediaControl expected 204, got %d", rec.Code)
+	}
+	for _, s := range env.sessionMgr.ListSessions() {
+		if s.DeviceId == "dev-viewer" && s.SupportsRemoteControl {
+			t.Fatal("expected SupportsRemoteControl=false when JSON SupportsMediaControl=false")
+		}
 	}
 }

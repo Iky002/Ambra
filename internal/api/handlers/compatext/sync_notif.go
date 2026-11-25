@@ -2,6 +2,7 @@ package compatext
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"strings"
@@ -9,10 +10,13 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	syncapi "github.com/ambra-media/ambra/internal/api/handlers/sync"
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
+
+const maxOfflineActions = 500
 
 // Mirror structures for reading/updating shared sync:state stored in server_config.
 type sharedSyncJob struct {
@@ -87,15 +91,45 @@ func (h *Handler) registerNotificationRoutes(r chi.Router, wrapAuth func(http.Ha
 	})
 }
 
+func (h *Handler) syncCallerIdentity(r *http.Request) (callerID string, isAdmin bool, hasAuth bool) {
+	callerID, isAdmin = h.callerIdentity(r)
+	hasAuth = callerID != "" || isAdmin
+	return callerID, isAdmin, hasAuth
+}
+
+func sharedJobOwner(jobs []sharedSyncJob, jobID string) string {
+	for _, j := range jobs {
+		if j.Id == jobID {
+			return guid.Normalize(j.UserId)
+		}
+	}
+	return ""
+}
+
 func (h *Handler) handleDeleteSyncJobPost(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "Id")
+	callerID, isAdmin, hasAuth := h.syncCallerIdentity(r)
+	if sh := h.getSyncHandler(); sh != nil {
+		if _, allowed := sh.DeleteJobForCaller(r.Context(), id, callerID, isAdmin || !hasAuth); !allowed {
+			httpx.Error(w, http.StatusForbidden, "access denied")
+			return
+		}
+		httpx.NoContent(w)
+		return
+	}
+
 	var st sharedSyncState
 	if h.readConfigJSON(r.Context(), syncConfigKey, &st) {
 		jobs := make([]sharedSyncJob, 0, len(st.Jobs))
 		for _, j := range st.Jobs {
-			if j.Id != id {
-				jobs = append(jobs, j)
+			if j.Id == id {
+				if hasAuth && !isAdmin && guid.Normalize(j.UserId) != callerID {
+					httpx.Error(w, http.StatusForbidden, "access denied")
+					return
+				}
+				continue
 			}
+			jobs = append(jobs, j)
 		}
 		items := make([]sharedSyncJobItem, 0, len(st.JobItems))
 		for _, it := range st.JobItems {
@@ -123,10 +157,36 @@ func (h *Handler) handleSyncItemStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	callerID, isAdmin, hasAuth := h.syncCallerIdentity(r)
+	if sh := h.getSyncHandler(); sh != nil {
+		if it, ok := sh.GetItemStatusForCaller(itemID, targetID, callerID, isAdmin || !hasAuth); ok && it != nil {
+			httpx.JSON(w, http.StatusOK, map[string]any{
+				"Status":        it.Status,
+				"SyncJobItemId": it.Id,
+				"ItemId":        it.ItemId,
+				"TargetId":      it.TargetId,
+				"Progress":      it.Progress,
+			})
+			return
+		}
+		httpx.JSON(w, http.StatusOK, map[string]any{
+			"Status":   "None",
+			"ItemId":   itemID,
+			"TargetId": targetID,
+		})
+		return
+	}
+
 	var st sharedSyncState
 	_ = h.readConfigJSON(r.Context(), syncConfigKey, &st)
 	for _, it := range st.JobItems {
 		if it.ItemId == itemID && (targetID == "" || it.TargetId == targetID) {
+			if hasAuth && !isAdmin {
+				ownerID := sharedJobOwner(st.Jobs, it.JobId)
+				if ownerID == "" || ownerID != callerID {
+					continue
+				}
+			}
 			httpx.JSON(w, http.StatusOK, map[string]any{
 				"Status":        it.Status,
 				"SyncJobItemId": it.Id,
@@ -148,6 +208,39 @@ func (h *Handler) handleSyncItemStatus(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleMarkJobItemRemoval(mark bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "Id")
+		callerID, isAdmin, hasAuth := h.syncCallerIdentity(r)
+
+		if sh := h.getSyncHandler(); sh != nil {
+			if _, allowed := sh.SetJobItemRemovalForCaller(r.Context(), id, mark, callerID, isAdmin || !hasAuth); !allowed {
+				httpx.Error(w, http.StatusForbidden, "access denied")
+				return
+			}
+		} else {
+			var st sharedSyncState
+			if h.readConfigJSON(r.Context(), syncConfigKey, &st) {
+				changed := false
+				for i := range st.JobItems {
+					if st.JobItems[i].Id == id {
+						if hasAuth && !isAdmin {
+							ownerID := sharedJobOwner(st.Jobs, st.JobItems[i].JobId)
+							if ownerID == "" || ownerID != callerID {
+								httpx.Error(w, http.StatusForbidden, "access denied")
+								return
+							}
+						}
+						if mark {
+							st.JobItems[i].Status = "Removing"
+						} else {
+							st.JobItems[i].Status = "Synced"
+						}
+						changed = true
+					}
+				}
+				if changed {
+					h.writeConfigJSON(r.Context(), syncConfigKey, st)
+				}
+			}
+		}
 
 		h.mu.Lock()
 		h.ensureMapsLocked()
@@ -159,37 +252,37 @@ func (h *Handler) handleMarkJobItemRemoval(mark bool) http.HandlerFunc {
 		h.saveStateLocked(r.Context())
 		h.mu.Unlock()
 
-		var st sharedSyncState
-		if h.readConfigJSON(r.Context(), syncConfigKey, &st) {
-			changed := false
-			for i := range st.JobItems {
-				if st.JobItems[i].Id == id {
-					if mark {
-						st.JobItems[i].Status = "Removing"
-					} else {
-						st.JobItems[i].Status = "Synced"
-					}
-					changed = true
-				}
-			}
-			if changed {
-				h.writeConfigJSON(r.Context(), syncConfigKey, st)
-			}
-		}
-
 		httpx.NoContent(w)
 	}
 }
 
 func (h *Handler) handleDeleteSyncJobItemPost(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "Id")
+	callerID, isAdmin, hasAuth := h.syncCallerIdentity(r)
+	if sh := h.getSyncHandler(); sh != nil {
+		if _, allowed := sh.DeleteJobItemForCaller(r.Context(), id, callerID, isAdmin || !hasAuth); !allowed {
+			httpx.Error(w, http.StatusForbidden, "access denied")
+			return
+		}
+		httpx.NoContent(w)
+		return
+	}
+
 	var st sharedSyncState
 	if h.readConfigJSON(r.Context(), syncConfigKey, &st) {
 		items := make([]sharedSyncJobItem, 0, len(st.JobItems))
 		for _, it := range st.JobItems {
-			if it.Id != id {
-				items = append(items, it)
+			if it.Id == id {
+				if hasAuth && !isAdmin {
+					ownerID := sharedJobOwner(st.Jobs, it.JobId)
+					if ownerID == "" || ownerID != callerID {
+						httpx.Error(w, http.StatusForbidden, "access denied")
+						return
+					}
+				}
+				continue
 			}
+			items = append(items, it)
 		}
 		st.JobItems = items
 		h.writeConfigJSON(r.Context(), syncConfigKey, st)
@@ -199,9 +292,9 @@ func (h *Handler) handleDeleteSyncJobItemPost(w http.ResponseWriter, r *http.Req
 
 func (h *Handler) handleCancelSyncItems(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
-	targetID := chi.URLParam(r, "TargetId")
+	targetID := strings.TrimSpace(chi.URLParam(r, "TargetId"))
 	if targetID == "" {
-		targetID = q.Get("TargetId")
+		targetID = strings.TrimSpace(q.Get("TargetId"))
 	}
 	itemIDs := q.List("ItemIds")
 	if len(itemIDs) == 0 && r.Body != nil {
@@ -211,30 +304,66 @@ func (h *Handler) handleCancelSyncItems(w http.ResponseWriter, r *http.Request) 
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
 			if targetID == "" {
-				targetID = body.TargetId
+				targetID = strings.TrimSpace(body.TargetId)
 			}
 			itemIDs = body.ItemIds
 		}
 	}
 
+	cleanedItemIDs := make([]string, 0, len(itemIDs))
 	idSet := make(map[string]struct{}, len(itemIDs))
 	for _, id := range itemIDs {
-		idSet[id] = struct{}{}
+		if trimmed := strings.TrimSpace(id); trimmed != "" {
+			cleanedItemIDs = append(cleanedItemIDs, trimmed)
+			idSet[trimmed] = struct{}{}
+		}
+	}
+	// Never wipe all sync items when neither TargetId nor ItemIds is specified.
+	if targetID == "" && len(idSet) == 0 {
+		httpx.NoContent(w)
+		return
+	}
+
+	callerID, isAdmin, hasAuth := h.syncCallerIdentity(r)
+	if sh := h.getSyncHandler(); sh != nil {
+		if err := sh.CancelItemsForCaller(r.Context(), targetID, cleanedItemIDs, callerID, isAdmin || !hasAuth); errors.Is(err, syncapi.ErrForbidden) {
+			httpx.Error(w, http.StatusForbidden, "access denied")
+			return
+		}
+		httpx.NoContent(w)
+		return
 	}
 
 	var st sharedSyncState
 	if h.readConfigJSON(r.Context(), syncConfigKey, &st) {
 		remaining := make([]sharedSyncJobItem, 0, len(st.JobItems))
+		removedCount := 0
+		deniedCount := 0
 		for _, it := range st.JobItems {
 			targetMatch := targetID == "" || it.TargetId == targetID
 			_, itemMatch := idSet[it.ItemId]
 			if targetMatch && (len(idSet) == 0 || itemMatch) {
+				if hasAuth && !isAdmin {
+					ownerID := sharedJobOwner(st.Jobs, it.JobId)
+					if ownerID == "" || ownerID != callerID {
+						deniedCount++
+						remaining = append(remaining, it)
+						continue
+					}
+				}
+				removedCount++
 				continue
 			}
 			remaining = append(remaining, it)
 		}
-		st.JobItems = remaining
-		h.writeConfigJSON(r.Context(), syncConfigKey, st)
+		if removedCount == 0 && deniedCount > 0 {
+			httpx.Error(w, http.StatusForbidden, "access denied")
+			return
+		}
+		if removedCount > 0 {
+			st.JobItems = remaining
+			h.writeConfigJSON(r.Context(), syncConfigKey, st)
+		}
 	}
 	httpx.NoContent(w)
 }
@@ -242,44 +371,21 @@ func (h *Handler) handleCancelSyncItems(w http.ResponseWriter, r *http.Request) 
 func (h *Handler) handleSyncJobItemFile(headOnly bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "Id")
-		var st sharedSyncState
-		if !h.readConfigJSON(r.Context(), syncConfigKey, &st) {
-			if headOnly {
-				w.Header().Set("Content-Type", "application/json; charset=utf-8")
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-			httpx.Error(w, http.StatusNotFound, "sync job item not found")
-			return
-		}
+		callerID, isAdmin, hasAuth := h.syncCallerIdentity(r)
 
-		var found *sharedSyncJobItem
-		for i := range st.JobItems {
-			if st.JobItems[i].Id == id {
-				found = &st.JobItems[i]
-				break
-			}
-		}
-		if found == nil {
-			if headOnly {
-				w.Header().Set("Content-Type", "application/json; charset=utf-8")
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-			httpx.Error(w, http.StatusNotFound, "sync job item not found")
-			return
-		}
-
-		callerID, isAdmin := h.callerIdentity(r)
-		if !isAdmin && callerID != "" {
-			var ownerID string
-			for _, j := range st.Jobs {
-				if j.Id == found.JobId {
-					ownerID = guid.Normalize(j.UserId)
-					break
+		var outPath string
+		if sh := h.getSyncHandler(); sh != nil {
+			item, found, allowed := sh.GetJobItemForCaller(id, callerID, isAdmin || !hasAuth)
+			if !found {
+				if headOnly {
+					w.Header().Set("Content-Type", "application/json; charset=utf-8")
+					w.WriteHeader(http.StatusNotFound)
+					return
 				}
+				httpx.Error(w, http.StatusNotFound, "sync job item not found")
+				return
 			}
-			if ownerID == "" || ownerID != callerID {
+			if !allowed {
 				if headOnly {
 					w.WriteHeader(http.StatusForbidden)
 					return
@@ -287,9 +393,50 @@ func (h *Handler) handleSyncJobItemFile(headOnly bool) http.HandlerFunc {
 				httpx.Error(w, http.StatusForbidden, "access denied")
 				return
 			}
+			outPath = strings.TrimSpace(item.OutputPath)
+		} else {
+			var st sharedSyncState
+			if !h.readConfigJSON(r.Context(), syncConfigKey, &st) {
+				if headOnly {
+					w.Header().Set("Content-Type", "application/json; charset=utf-8")
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				httpx.Error(w, http.StatusNotFound, "sync job item not found")
+				return
+			}
+
+			var found *sharedSyncJobItem
+			for i := range st.JobItems {
+				if st.JobItems[i].Id == id {
+					found = &st.JobItems[i]
+					break
+				}
+			}
+			if found == nil {
+				if headOnly {
+					w.Header().Set("Content-Type", "application/json; charset=utf-8")
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				httpx.Error(w, http.StatusNotFound, "sync job item not found")
+				return
+			}
+
+			if hasAuth && !isAdmin {
+				ownerID := sharedJobOwner(st.Jobs, found.JobId)
+				if ownerID == "" || ownerID != callerID {
+					if headOnly {
+						w.WriteHeader(http.StatusForbidden)
+						return
+					}
+					httpx.Error(w, http.StatusForbidden, "access denied")
+					return
+				}
+			}
+			outPath = strings.TrimSpace(found.OutputPath)
 		}
 
-		outPath := strings.TrimSpace(found.OutputPath)
 		if outPath == "" {
 			if headOnly {
 				w.WriteHeader(http.StatusNotFound)
@@ -312,6 +459,45 @@ func (h *Handler) handleSyncJobItemFile(headOnly bool) http.HandlerFunc {
 }
 
 func (h *Handler) handleSyncJobItemAdditionalFiles(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "Id")
+	callerID, isAdmin, hasAuth := h.syncCallerIdentity(r)
+
+	if sh := h.getSyncHandler(); sh != nil {
+		_, found, allowed := sh.GetJobItemForCaller(id, callerID, isAdmin || !hasAuth)
+		if !found {
+			httpx.Error(w, http.StatusNotFound, "sync job item not found")
+			return
+		}
+		if !allowed {
+			httpx.Error(w, http.StatusForbidden, "access denied")
+			return
+		}
+	} else {
+		var st sharedSyncState
+		if !h.readConfigJSON(r.Context(), syncConfigKey, &st) {
+			httpx.Error(w, http.StatusNotFound, "sync job item not found")
+			return
+		}
+		var found *sharedSyncJobItem
+		for i := range st.JobItems {
+			if st.JobItems[i].Id == id {
+				found = &st.JobItems[i]
+				break
+			}
+		}
+		if found == nil {
+			httpx.Error(w, http.StatusNotFound, "sync job item not found")
+			return
+		}
+		if hasAuth && !isAdmin {
+			ownerID := sharedJobOwner(st.Jobs, found.JobId)
+			if ownerID == "" || ownerID != callerID {
+				httpx.Error(w, http.StatusForbidden, "access denied")
+				return
+			}
+		}
+	}
+
 	q := httpx.ParseQuery(r)
 	name := strings.ToLower(q.Get("Name"))
 	if strings.HasSuffix(name, ".vtt") {
@@ -343,6 +529,9 @@ func (h *Handler) handleSyncOfflineActions(w http.ResponseWriter, r *http.Reques
 				}
 				h.mu.Lock()
 				h.state.OfflineActions = append(h.state.OfflineActions, actions...)
+				if len(h.state.OfflineActions) > maxOfflineActions {
+					h.state.OfflineActions = append([]OfflineAction(nil), h.state.OfflineActions[len(h.state.OfflineActions)-maxOfflineActions:]...)
+				}
 				h.saveStateLocked(r.Context())
 				libRepo := h.libRepo
 				userRepo := h.userRepo

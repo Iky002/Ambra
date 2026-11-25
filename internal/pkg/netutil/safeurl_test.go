@@ -2,6 +2,7 @@ package netutil
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -120,5 +121,38 @@ func TestNewSafeHTTPClientDialAndRedirects(t *testing.T) {
 		t.Fatal("expected redirect loop to be stopped after 5 redirects")
 	} else if fmt.Sprint(err) == "" {
 		t.Fatal("expected non-empty error")
+	}
+}
+
+func TestValidateIPAndEdgeCases(t *testing.T) {
+	if err := ValidateIP(nil, true); err == nil {
+		t.Fatal("expected nil IP error")
+	}
+	if err := ValidateIP(net.IP{1, 2, 3}, true); err == nil {
+		t.Fatal("expected invalid length IP error")
+	}
+	if err := ValidateIP(net.ParseIP("1.1.1.1"), false); err != nil {
+		t.Fatalf("expected public IP allowed, got %v", err)
+	}
+	if err := ValidateIP(net.ParseIP("127.0.0.1"), false); err == nil {
+		t.Fatal("expected loopback IP blocked when allowPrivateLAN=false")
+	}
+	if err := ValidateIP(net.ParseIP("127.0.0.1"), true); err != nil {
+		t.Fatalf("expected loopback IP allowed when allowPrivateLAN=true, got %v", err)
+	}
+	if err := ValidateIP(net.ParseIP("192.168.1.10"), false); err == nil {
+		t.Fatal("expected private IP blocked when allowPrivateLAN=false")
+	}
+	if err := ValidateIP(net.ParseIP("169.254.169.254"), true); err == nil {
+		t.Fatal("expected link-local metadata IP always blocked")
+	}
+	if err := ValidateRemoteURL("http://[::1", true); err == nil {
+		t.Fatal("expected malformed URL error")
+	}
+	if err := ValidateRemoteURL("http://localhost:8096/", true); err != nil {
+		t.Fatalf("expected localhost allowed when allowPrivateLAN=true, got %v", err)
+	}
+	if err := ValidateRemoteURL("http://sub.localhost/", false); err == nil {
+		t.Fatal("expected sub.localhost blocked when allowPrivateLAN=false")
 	}
 }

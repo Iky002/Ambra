@@ -458,11 +458,12 @@ func TestItemMetadataTagsRemoteSearchAndRelations(t *testing.T) {
 		t.Fatalf("tags delete: %d", w.Code)
 	}
 
-	// Visibility & Access
-	if w := doReq(env.router, http.MethodPost, "/Items/movie001/MakePublic", `{}`); w.Code != http.StatusNoContent {
+	// Visibility & Access (non-Playlist requires admin; test via playlist owned by user-1)
+	pl, _ := env.repo.CreatePlaylist(ctx, "User1Pl", "Video", "user-1", nil)
+	if w := doReq(env.router, http.MethodPost, "/Items/"+pl.ID+"/MakePublic", `{}`); w.Code != http.StatusNoContent {
 		t.Fatalf("make public: %d", w.Code)
 	}
-	if w := doReq(env.router, http.MethodPost, "/Items/movie001/MakePrivate", `{}`); w.Code != http.StatusNoContent {
+	if w := doReq(env.router, http.MethodPost, "/Items/"+pl.ID+"/MakePrivate", `{}`); w.Code != http.StatusNoContent {
 		t.Fatalf("make private: %d", w.Code)
 	}
 	if w := doReq(env.router, http.MethodPost, "/Items/Access", `{"ItemIds":["movie001"]}`); w.Code != http.StatusNoContent {
@@ -866,7 +867,7 @@ func TestEdgeCasesForHighCoverage(t *testing.T) {
 	// Artist numeric prefix & UserId query resolution
 	numArtist := &sqlite.ItemRecord{ID: "numart1", LibraryID: lib2.ID, Type: "MusicArtist", Name: "50 Cent"}
 	_ = env.repo.UpsertItem(ctx, numArtist)
-	if w := doReq(env.router, http.MethodGet, "/Artists/Prefixes?UserId=user-9", ""); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"#"`) {
+	if w := doReq(env.router, http.MethodGet, "/Artists/Prefixes?UserId=user-1", ""); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"#"`) {
 		t.Fatalf("numeric artist prefix: %d %s", w.Code, w.Body.String())
 	}
 

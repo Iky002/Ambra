@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -24,6 +25,7 @@ import (
 )
 
 type Handler struct {
+	cfgMu    sync.RWMutex
 	cfg      *config.Config
 	userRepo *sqlite.UserRepo
 	registry *plugins.Registry
@@ -67,7 +69,6 @@ func RegisterRoutes(r chi.Router, authMW *middleware.Auth, h *Handler) {
 		pr.Use(authMW.RequireAuth)
 		pr.Get("/System/Info", h.GetSystemInfo)
 		pr.Get("/System/Configuration", h.GetConfiguration)
-		pr.Get("/System/Configuration/{Key}", h.GetNamedConfiguration)
 		pr.Get("/Plugins", h.GetPlugins)
 	})
 
@@ -75,9 +76,34 @@ func RegisterRoutes(r chi.Router, authMW *middleware.Auth, h *Handler) {
 	r.Group(func(ar chi.Router) {
 		ar.Use(authMW.RequireAdmin)
 		ar.Get("/System/ActivityLog/Entries", h.GetActivityLogEntries)
+		ar.Get("/System/Configuration/{Key}", h.GetNamedConfiguration)
 		ar.Post("/System/Configuration", h.UpdateConfiguration)
 		ar.Post("/System/Configuration/{Key}", h.UpdateNamedConfiguration)
 	})
+}
+
+type systemInfoResponse struct {
+	dto.PublicSystemInfo
+	OperatingSystem            string `json:"OperatingSystem"`
+	OperatingSystemDisplayName string `json:"OperatingSystemDisplayName"`
+	HasPendingRestart          bool   `json:"HasPendingRestart"`
+	IsShuttingDown             bool   `json:"IsShuttingDown"`
+	SupportsLibraryMonitor     bool   `json:"SupportsLibraryMonitor"`
+	WebSocketPortNumber        int    `json:"WebSocketPortNumber"`
+	CanSelfRestart             bool   `json:"CanSelfRestart"`
+	CanSelfUpdate              bool   `json:"CanSelfUpdate"`
+	CanLaunchWebBrowser        bool   `json:"CanLaunchWebBrowser"`
+	ProgramDataPath            string `json:"ProgramDataPath,omitempty"`
+	CachePath                  string `json:"CachePath,omitempty"`
+	LogPath                    string `json:"LogPath,omitempty"`
+	InternalMetadataPath       string `json:"InternalMetadataPath,omitempty"`
+	TranscodingTempPath        string `json:"TranscodingTempPath,omitempty"`
+	HttpServerPortNumber       int    `json:"HttpServerPortNumber"`
+	SupportsHttps              bool   `json:"SupportsHttps"`
+	HasUpdateAvailable         bool   `json:"HasUpdateAvailable"`
+	EncoderLocationType        string `json:"EncoderLocationType"`
+	SystemArchitecture         string `json:"SystemArchitecture"`
+	StartupWizardCompleted     bool   `json:"StartupWizardCompleted"`
 }
 
 func (h *Handler) GetPublicSystemInfo(w http.ResponseWriter, r *http.Request) {
@@ -85,8 +111,18 @@ func (h *Handler) GetPublicSystemInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetSystemInfo(w http.ResponseWriter, r *http.Request) {
-	port := parsePort(h.cfg.HTTPAddr, 8096)
-	info := dto.SystemInfo{
+	ac, ok := middleware.AuthFromContext(r.Context())
+	isAdmin := ok && ac != nil && ac.IsAdmin()
+
+	h.cfgMu.RLock()
+	httpAddr := h.cfg.HTTPAddr
+	dataDir := h.cfg.DataDir
+	transcodeTempDir := h.cfg.TranscodeTempDir()
+	wizardCompleted := h.cfg.IsStartupWizardCompleted
+	h.cfgMu.RUnlock()
+
+	port := parsePort(httpAddr, 8096)
+	info := systemInfoResponse{
 		PublicSystemInfo:           h.buildPublicInfo(r),
 		OperatingSystem:            runtime.GOOS,
 		OperatingSystemDisplayName: osDisplayName(runtime.GOOS),
@@ -97,17 +133,19 @@ func (h *Handler) GetSystemInfo(w http.ResponseWriter, r *http.Request) {
 		CanSelfRestart:             false,
 		CanSelfUpdate:              false,
 		CanLaunchWebBrowser:        false,
-		ProgramDataPath:            h.cfg.DataDir,
-		CachePath:                  filepath.Join(h.cfg.DataDir, "cache"),
-		LogPath:                    filepath.Join(h.cfg.DataDir, "logs"),
-		InternalMetadataPath:       filepath.Join(h.cfg.DataDir, "metadata"),
-		TranscodingTempPath:        h.cfg.TranscodeTempDir(),
 		HttpServerPortNumber:       port,
 		SupportsHttps:              false,
 		HasUpdateAvailable:         false,
 		EncoderLocationType:        "System",
 		SystemArchitecture:         runtime.GOARCH,
-		StartupWizardCompleted:     h.cfg.IsStartupWizardCompleted,
+		StartupWizardCompleted:     wizardCompleted,
+	}
+	if isAdmin {
+		info.ProgramDataPath = dataDir
+		info.CachePath = filepath.Join(dataDir, "cache")
+		info.LogPath = filepath.Join(dataDir, "logs")
+		info.InternalMetadataPath = filepath.Join(dataDir, "metadata")
+		info.TranscodingTempPath = transcodeTempDir
 	}
 	httpx.JSON(w, http.StatusOK, info)
 }
@@ -164,27 +202,40 @@ func stringFromMap(m map[string]any, key, fallback string) string {
 }
 
 func (h *Handler) GetConfiguration(w http.ResponseWriter, r *http.Request) {
-	tmdbKey := ""
+	isAdmin := false
 	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.IsAdmin() {
+		isAdmin = true
+	}
+
+	h.cfgMu.RLock()
+	serverName := h.cfg.ServerName
+	wizardCompleted := h.cfg.IsStartupWizardCompleted
+	tmdbKey := ""
+	if isAdmin {
 		tmdbKey = h.cfg.TMDBApiKey
 	}
+	tmdbLang := h.cfg.TMDBLanguage
+	enableSTRM302 := h.cfg.EnableSTRM302
+	playedThreshold := h.cfg.PlayedThreshold
+	h.cfgMu.RUnlock()
+
 	extra := h.loadExtraConfig(r.Context())
 	out := make(map[string]any, len(extra)+9)
 	for k, v := range extra {
 		out[k] = v
 	}
-	out["ServerName"] = h.cfg.ServerName
-	out["IsStartupWizardCompleted"] = h.cfg.IsStartupWizardCompleted
+	out["ServerName"] = serverName
+	out["IsStartupWizardCompleted"] = wizardCompleted
 	if tmdbKey != "" {
 		out["TMDBApiKey"] = tmdbKey
 	} else {
 		delete(out, "TMDBApiKey")
 	}
-	if h.cfg.TMDBLanguage != "" {
-		out["TMDBLanguage"] = h.cfg.TMDBLanguage
+	if tmdbLang != "" {
+		out["TMDBLanguage"] = tmdbLang
 	}
-	out["EnableSTRM302"] = h.cfg.EnableSTRM302
-	out["PlayedThreshold"] = h.cfg.PlayedThreshold
+	out["EnableSTRM302"] = enableSTRM302
+	out["PlayedThreshold"] = playedThreshold
 	out["PreferredMetadataLanguage"] = stringFromMap(extra, "PreferredMetadataLanguage", "zh")
 	out["MetadataCountryCode"] = stringFromMap(extra, "MetadataCountryCode", "CN")
 	out["UICulture"] = stringFromMap(extra, "UICulture", "zh-cn")
@@ -197,13 +248,16 @@ func (h *Handler) UpdateConfiguration(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
+	tmdbChanged := false
+	strmChanged := false
+
+	h.cfgMu.Lock()
 	if v, ok := body["ServerName"].(string); ok && strings.TrimSpace(v) != "" {
 		h.cfg.ServerName = strings.TrimSpace(v)
 	}
 	if v, ok := body["IsStartupWizardCompleted"].(bool); ok {
 		h.cfg.IsStartupWizardCompleted = v
 	}
-	tmdbChanged := false
 	if v, ok := body["TMDBApiKey"].(string); ok {
 		h.cfg.TMDBApiKey = strings.TrimSpace(v)
 		tmdbChanged = true
@@ -212,7 +266,6 @@ func (h *Handler) UpdateConfiguration(w http.ResponseWriter, r *http.Request) {
 		h.cfg.TMDBLanguage = strings.TrimSpace(v)
 		tmdbChanged = true
 	}
-	strmChanged := false
 	if v, ok := body["EnableSTRM302"].(bool); ok {
 		h.cfg.EnableSTRM302 = v
 		strmChanged = true
@@ -220,7 +273,10 @@ func (h *Handler) UpdateConfiguration(w http.ResponseWriter, r *http.Request) {
 	if v, ok := body["PlayedThreshold"].(float64); ok && v > 0 && v <= 1 {
 		h.cfg.PlayedThreshold = v
 	}
-	if err := h.cfg.Save(); err != nil {
+	saveErr := h.cfg.Save()
+	h.cfgMu.Unlock()
+
+	if saveErr != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to save configuration")
 		return
 	}
@@ -499,21 +555,27 @@ func (h *Handler) GetPlugins(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *Handler) buildPublicInfo(r *http.Request) dto.PublicSystemInfo {
+	h.cfgMu.RLock()
+	httpAddr := h.cfg.HTTPAddr
+	serverName := h.cfg.ServerName
+	serverID := h.cfg.ServerID
+	h.cfgMu.RUnlock()
+
 	scheme := "http"
 	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
 		scheme = "https"
 	}
 	host := r.Host
 	if host == "" {
-		host = "localhost" + h.cfg.HTTPAddr
+		host = "localhost" + httpAddr
 	}
 	return dto.PublicSystemInfo{
 		LocalAddress: scheme + "://" + host,
-		ServerName:   h.cfg.ServerName,
+		ServerName:   serverName,
 		Version:      config.ServerVersion,
 		AmbraVersion: config.AmbraVersion,
 		ProductName:  config.ProductName,
-		Id:           h.cfg.ServerID,
+		Id:           serverID,
 	}
 }
 

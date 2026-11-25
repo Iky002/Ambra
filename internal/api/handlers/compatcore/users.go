@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -53,7 +54,115 @@ func (h *Handler) toUserDto(u *sqlite.UserRecord) dto.UserDto {
 
 // --- /Users public & management ---
 
+func forgotClientIP(r *http.Request) string {
+	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
+		for _, part := range strings.Split(xff, ",") {
+			cand := strings.TrimSpace(part)
+			if cand == "" {
+				continue
+			}
+			if host, _, err := net.SplitHostPort(cand); err == nil {
+				cand = host
+			}
+			if ip := net.ParseIP(cand); ip != nil {
+				return ip.String()
+			}
+		}
+	}
+	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+		cand := xri
+		if host, _, err := net.SplitHostPort(cand); err == nil {
+			cand = host
+		}
+		if ip := net.ParseIP(cand); ip != nil {
+			return ip.String()
+		}
+	}
+	addr := strings.TrimSpace(r.RemoteAddr)
+	if addr == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return addr
+}
+
+func prunePasswordResetFiles(dataDir string, maxKeep int) {
+	if dataDir == "" || maxKeep <= 0 {
+		return
+	}
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		return
+	}
+	type pinFileInfo struct {
+		path    string
+		modTime time.Time
+	}
+	var files []pinFileInfo
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasPrefix(name, "passwordreset-") && strings.HasSuffix(name, ".txt") {
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			files = append(files, pinFileInfo{
+				path:    filepath.Join(dataDir, name),
+				modTime: info.ModTime(),
+			})
+		}
+	}
+	if len(files) <= maxKeep {
+		return
+	}
+	sort.Slice(files, func(i, j int) bool {
+		if !files[i].modTime.Equal(files[j].modTime) {
+			return files[i].modTime.After(files[j].modTime)
+		}
+		return files[i].path > files[j].path
+	})
+	for _, f := range files[maxKeep:] {
+		_ = os.Remove(f.path)
+	}
+}
+
 func (h *Handler) forgotPassword(w http.ResponseWriter, r *http.Request) {
+	now := time.Now().UTC()
+	ip := forgotClientIP(r)
+
+	h.mu.Lock()
+	if h.forgotRates == nil {
+		h.forgotRates = make(map[string][]time.Time)
+	}
+	cutoff := now.Add(-forgotPasswordRateWindow)
+	for k, ts := range h.forgotRates {
+		kept := ts[:0]
+		for _, t := range ts {
+			if t.After(cutoff) {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) == 0 {
+			delete(h.forgotRates, k)
+		} else {
+			h.forgotRates[k] = kept
+		}
+	}
+	if ip != "" {
+		if len(h.forgotRates[ip]) >= forgotPasswordRateLimit {
+			h.mu.Unlock()
+			httpx.Error(w, http.StatusTooManyRequests, "too many password reset requests")
+			return
+		}
+		h.forgotRates[ip] = append(h.forgotRates[ip], now)
+	}
+	h.mu.Unlock()
+
 	var body struct {
 		EnteredUsername string `json:"EnteredUsername"`
 	}
@@ -62,7 +171,6 @@ func (h *Handler) forgotPassword(w http.ResponseWriter, r *http.Request) {
 	pinBytes := make([]byte, 3)
 	_, _ = rand.Read(pinBytes)
 	pin := strings.ToUpper(hex.EncodeToString(pinBytes))
-	now := time.Now().UTC()
 	expiresAt := now.Add(30 * time.Minute)
 
 	uid := ""
@@ -107,6 +215,7 @@ func (h *Handler) forgotPassword(w http.ResponseWriter, r *http.Request) {
 	if uid != "" && pinFile != "" {
 		content := fmt.Sprintf("Ambra Password Reset PIN\nUser: %s\nPIN: %s\nExpiresAt: %s\n", uname, pin, expiresAt.Format(time.RFC3339))
 		_ = os.WriteFile(pinFile, []byte(content), 0o600)
+		prunePasswordResetFiles(h.cfg.DataDir, forgotPasswordMaxPinFiles)
 	}
 
 	httpx.JSON(w, http.StatusOK, map[string]any{
@@ -212,15 +321,63 @@ func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	pw := body.Pw
-	if pw == "" && body.Password != "" {
-		pw = body.Password
-	}
-
 	u, err := h.userRepo.GetUserByID(r.Context(), uid)
 	if err != nil {
 		writeJSONError(w, r, http.StatusNotFound, "user not found")
 		return
+	}
+
+	client := middleware.ExtractClientInfo(r)
+	if h.authSvc != nil {
+		pw := body.Pw
+		legacySHA1 := body.Password
+		if pw == "" && body.Password != "" && u.PasswordHash != "" {
+			pw = body.Password
+		}
+		res, authErr := h.authSvc.AuthenticateByName(r.Context(), u.Name, pw, legacySHA1, client)
+		if authErr != nil {
+			switch {
+			case errors.Is(authErr, auth.ErrInvalidCredentials):
+				_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+					Name:     u.Name + " failed to log in",
+					Type:     "AuthenticationFailed",
+					UserID:   u.ID,
+					Severity: "Warning",
+				})
+				writeJSONError(w, r, http.StatusUnauthorized, "invalid username or password")
+			case errors.Is(authErr, auth.ErrUserDisabled):
+				_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+					Name:     u.Name + " failed to log in (account disabled)",
+					Type:     "AuthenticationFailed",
+					UserID:   u.ID,
+					Severity: "Warning",
+				})
+				writeJSONError(w, r, http.StatusForbidden, "user is disabled")
+			default:
+				httpx.Error(w, http.StatusInternalServerError, "authentication failed")
+			}
+			return
+		}
+		if h.sessions != nil {
+			client.DeviceID = res.SessionInfo.DeviceId
+			client.Device = res.SessionInfo.DeviceName
+			client.Client = res.SessionInfo.Client
+			client.Version = res.SessionInfo.ApplicationVersion
+			res.SessionInfo = h.sessions.TouchSession(u, client)
+		}
+		_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+			Name:     res.User.Name + " has logged in",
+			Type:     "AuthenticationSucceeded",
+			UserID:   res.User.Id,
+			Severity: "Info",
+		})
+		httpx.JSON(w, http.StatusOK, res)
+		return
+	}
+
+	pw := body.Pw
+	if pw == "" && body.Password != "" {
+		pw = body.Password
 	}
 	if u.IsDisabled || u.Policy.IsDisabled {
 		writeJSONError(w, r, http.StatusForbidden, "user is disabled")
@@ -233,7 +390,6 @@ func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := middleware.ExtractClientInfo(r)
 	if client.DeviceID == "" {
 		client.DeviceID = guid.New()
 	}
@@ -1464,7 +1620,8 @@ func (h *Handler) postUserItemUserData(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if body.PlaybackPositionTicks != nil && h.userRepo != nil && uid != "" && itemID != "" {
-		_, _ = h.userRepo.UpsertPlaybackProgress(r.Context(), uid, itemID, *body.PlaybackPositionTicks, false, nil, nil)
+		played := body.Played != nil && *body.Played
+		_, _ = h.userRepo.UpsertPlaybackProgress(r.Context(), uid, itemID, *body.PlaybackPositionTicks, played, nil, nil)
 	}
 	httpx.NoContent(w)
 }

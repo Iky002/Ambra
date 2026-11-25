@@ -67,10 +67,14 @@ func (h *Handler) syncTMDBPlugin() {
 	if h.registry == nil || h.cfg == nil {
 		return
 	}
+	h.cfgMu.RLock()
+	apiKey := h.cfg.TMDBApiKey
+	lang := h.cfg.TMDBLanguage
+	h.cfgMu.RUnlock()
 	if p, ok := h.registry.Get(tmdbPluginID); ok {
 		_ = p.Configure(map[string]any{
-			"api_key":  h.cfg.TMDBApiKey,
-			"language": h.cfg.TMDBLanguage,
+			"api_key":  apiKey,
+			"language": lang,
 		})
 	}
 }
@@ -79,9 +83,12 @@ func (h *Handler) syncSTRMPlugin() {
 	if h.registry == nil || h.cfg == nil {
 		return
 	}
+	h.cfgMu.RLock()
+	enable302 := h.cfg.EnableSTRM302
+	h.cfgMu.RUnlock()
 	if p, ok := h.registry.Get(strmPluginID); ok {
 		_ = p.Configure(map[string]any{
-			"enable_302": h.cfg.EnableSTRM302,
+			"enable_302": enable302,
 		})
 	}
 }
@@ -93,27 +100,49 @@ func (h *Handler) GetSetupStatus(w http.ResponseWriter, r *http.Request) {
 			hasUsers = true
 		}
 	}
+	h.cfgMu.RLock()
 	lang := strings.TrimSpace(h.cfg.TMDBLanguage)
+	completed := h.cfg.IsStartupWizardCompleted
+	serverName := h.cfg.ServerName
+	hasTMDBKey := strings.TrimSpace(h.cfg.TMDBApiKey) != ""
+	h.cfgMu.RUnlock()
 	if lang == "" {
 		lang = "zh-CN"
 	}
 	httpx.JSON(w, http.StatusOK, SetupStatusResponse{
-		Completed:       h.cfg.IsStartupWizardCompleted,
-		ServerName:      h.cfg.ServerName,
+		Completed:       completed,
+		ServerName:      serverName,
 		DefaultLanguage: lang,
 		HasUsers:        hasUsers,
-		HasTMDBKey:      strings.TrimSpace(h.cfg.TMDBApiKey) != "",
+		HasTMDBKey:      hasTMDBKey,
 	})
 }
 
 func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.IsStartupWizardCompleted {
+	h.cfgMu.RLock()
+	completed := h.cfg.IsStartupWizardCompleted
+	h.cfgMu.RUnlock()
+	if completed {
 		httpx.Error(w, http.StatusForbidden, "setup wizard is already completed")
 		return
 	}
 	if h.setup.Auth == nil {
 		httpx.Error(w, http.StatusInternalServerError, "auth service unavailable")
 		return
+	}
+	if h.userRepo != nil {
+		count, err := h.userRepo.CountUsers(r.Context())
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to check existing users")
+			return
+		}
+		if count > 0 {
+			ac, ok := middleware.AuthFromContext(r.Context())
+			if !ok || ac == nil || !ac.IsAdmin() {
+				httpx.Error(w, http.StatusForbidden, "admin user already exists")
+				return
+			}
+		}
 	}
 
 	var req SetupAdminRequest
@@ -133,6 +162,7 @@ func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tmdbLangChanged := false
+	h.cfgMu.Lock()
 	if name := strings.TrimSpace(req.ServerName); name != "" {
 		h.cfg.ServerName = name
 	}
@@ -140,7 +170,9 @@ func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
 		h.cfg.TMDBLanguage = lang
 		tmdbLangChanged = true
 	}
-	if err := h.cfg.Save(); err != nil {
+	saveErr := h.cfg.Save()
+	h.cfgMu.Unlock()
+	if saveErr != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to save configuration")
 		return
 	}
@@ -207,6 +239,7 @@ func (h *Handler) CompleteSetup(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	h.cfgMu.Lock()
 	if name := strings.TrimSpace(req.ServerName); name != "" {
 		h.cfg.ServerName = name
 	}
@@ -220,8 +253,10 @@ func (h *Handler) CompleteSetup(w http.ResponseWriter, r *http.Request) {
 		h.cfg.EnableSTRM302 = *req.EnableSTRM302
 	}
 	h.cfg.IsStartupWizardCompleted = true
+	saveErr := h.cfg.Save()
+	h.cfgMu.Unlock()
 
-	if err := h.cfg.Save(); err != nil {
+	if saveErr != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to save configuration")
 		return
 	}

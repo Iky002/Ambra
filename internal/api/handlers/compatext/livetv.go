@@ -499,7 +499,14 @@ func (h *Handler) handleSetChannelDisabled(w http.ResponseWriter, r *http.Reques
 	h.ensureMapsLocked()
 	h.state.ChannelDisabled[id] = disabled
 	h.saveStateLocked(r.Context())
+	lt := h.liveTV
 	h.mu.Unlock()
+
+	if lt != nil {
+		_ = lt.SetChannelDisabled(r.Context(), id, disabled)
+		httpx.NoContent(w)
+		return
+	}
 
 	var st sharedLiveTVState
 	if h.readConfigJSON(r.Context(), liveTVConfigKey, &st) {
@@ -547,7 +554,14 @@ func (h *Handler) handleSetChannelSortIndex(w http.ResponseWriter, r *http.Reque
 	h.ensureMapsLocked()
 	h.state.ChannelSortIndex[id] = newIdx
 	h.saveStateLocked(r.Context())
+	lt := h.liveTV
 	h.mu.Unlock()
+
+	if lt != nil {
+		_ = lt.SetChannelSortIndex(r.Context(), id, newIdx)
+		httpx.NoContent(w)
+		return
+	}
 
 	var st sharedLiveTVState
 	if h.readConfigJSON(r.Context(), liveTVConfigKey, &st) {
@@ -672,13 +686,17 @@ func (h *Handler) handleDeleteRecordingPost(w http.ResponseWriter, r *http.Reque
 }
 
 func (h *Handler) handleDeleteTimerPost(w http.ResponseWriter, r *http.Request) {
+	if !h.hasLiveTvManagement(r) {
+		httpx.Error(w, http.StatusForbidden, "Live TV management privileges required")
+		return
+	}
 	id := chi.URLParam(r, "Id")
 	h.mu.RLock()
 	lt := h.liveTV
 	rec := h.dvrRec
 	h.mu.RUnlock()
 	if lt != nil {
-		lt.DeleteTimer(r.Context(), id)
+		lt.DeleteTimerByID(r.Context(), id)
 		if rec != nil {
 			_ = rec.CancelRecording(id)
 		}
@@ -697,12 +715,16 @@ func (h *Handler) handleDeleteTimerPost(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *Handler) handleDeleteSeriesTimerPost(w http.ResponseWriter, r *http.Request) {
+	if !h.hasLiveTvManagement(r) {
+		httpx.Error(w, http.StatusForbidden, "Live TV management privileges required")
+		return
+	}
 	id := chi.URLParam(r, "Id")
 	h.mu.RLock()
 	lt := h.liveTV
 	h.mu.RUnlock()
 	if lt != nil {
-		lt.DeleteSeriesTimer(r.Context(), id)
+		lt.DeleteSeriesTimerByID(r.Context(), id)
 		httpx.NoContent(w)
 		return
 	}

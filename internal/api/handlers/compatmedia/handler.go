@@ -350,6 +350,64 @@ func (h *Handler) resolveUserID(r *http.Request, q httpx.Query) string {
 	return ""
 }
 
+func (h *Handler) canAccessUserData(r *http.Request, targetUserID string) bool {
+	targetID := guid.Normalize(targetUserID)
+	if targetID == "" {
+		return true
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		return ac.IsAdmin() || guid.Normalize(ac.UserID()) == targetID
+	}
+	if h.auth.UserIDFromCtx != nil {
+		callerID := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if callerID != "" {
+			if callerID == targetID {
+				return true
+			}
+			if h.userRepo != nil {
+				if u, err := h.userRepo.GetUserByID(r.Context(), callerID); err == nil && u != nil {
+					return u.IsAdmin || u.Policy.IsAdministrator
+				}
+			}
+			return false
+		}
+	}
+	// Unit tests without auth context
+	return true
+}
+
+func (h *Handler) canDownloadContent(r *http.Request) bool {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.IsAdmin() || ac.IsAPIKey {
+			return true
+		}
+		if h.userRepo != nil {
+			if u, err := h.userRepo.GetUserByID(r.Context(), guid.Normalize(ac.UserID())); err == nil && u != nil {
+				if u.IsAdmin || u.Policy.IsAdministrator {
+					return true
+				}
+				return u.Policy.EnableContentDownloading
+			}
+		}
+		if ac.User != nil {
+			return ac.User.Policy.EnableContentDownloading
+		}
+		return true
+	}
+	if h.auth.UserIDFromCtx != nil {
+		callerID := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if callerID != "" && h.userRepo != nil {
+			if u, err := h.userRepo.GetUserByID(r.Context(), callerID); err == nil && u != nil {
+				if u.IsAdmin || u.Policy.IsAdministrator {
+					return true
+				}
+				return u.Policy.EnableContentDownloading
+			}
+		}
+	}
+	return true
+}
+
 // allowedLibrariesForRequest returns nil if the caller has unrestricted access to all libraries,
 // or a non-nil slice of normalized library IDs (possibly empty) if restricted.
 func (h *Handler) allowedLibrariesForRequest(r *http.Request, fallbackUserID string) []string {

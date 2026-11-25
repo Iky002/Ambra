@@ -484,9 +484,45 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) UpdateCapabilities(w http.ResponseWriter, r *http.Request) {
 	ac, _ := middleware.AuthFromContext(r.Context())
-	var req session.CapabilitiesRequest
+	var body struct {
+		PlayableMediaTypes    []string `json:"PlayableMediaTypes"`
+		SupportedCommands     []string `json:"SupportedCommands"`
+		SupportsRemoteControl *bool    `json:"SupportsRemoteControl"`
+		SupportsMediaControl  *bool    `json:"SupportsMediaControl"`
+		SupportsSync          *bool    `json:"SupportsSync"`
+	}
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
+	q := httpx.ParseQuery(r)
+	req := session.CapabilitiesRequest{
+		PlayableMediaTypes: body.PlayableMediaTypes,
+		SupportedCommands:  body.SupportedCommands,
+	}
+	if len(req.PlayableMediaTypes) == 0 {
+		if types := q.List("PlayableMediaTypes"); len(types) > 0 {
+			req.PlayableMediaTypes = types
+		}
+	}
+	if len(req.SupportedCommands) == 0 {
+		if cmds := q.List("SupportedCommands"); len(cmds) > 0 {
+			req.SupportedCommands = cmds
+		}
+	}
+	switch {
+	case body.SupportsRemoteControl != nil:
+		req.SupportsRemoteControl = *body.SupportsRemoteControl
+	case body.SupportsMediaControl != nil:
+		req.SupportsRemoteControl = *body.SupportsMediaControl
+	default:
+		if b := q.Bool("SupportsMediaControl"); b != nil {
+			req.SupportsRemoteControl = *b
+		} else if b := q.Bool("SupportsRemoteControl"); b != nil {
+			req.SupportsRemoteControl = *b
+		}
+	}
+	if body.SupportsSync == nil {
+		_ = q.Bool("SupportsSync")
 	}
 	if h.sessionMgr != nil && ac != nil && ac.User != nil {
 		h.sessionMgr.UpdateCapabilities(ac.User, ac.Client, req)
@@ -555,7 +591,7 @@ func (h *Handler) ListDevices(w http.ResponseWriter, r *http.Request) {
 
 	q := httpx.ParseQuery(r)
 	filterUserID := guid.Normalize(q.Get("UserId"))
-	supportsSync := q.Bool("SupportsSync")
+	_ = q.Bool("SupportsSync")
 
 	devices, err := h.userRepo.ListDevices(r.Context())
 	if err != nil {
@@ -568,9 +604,6 @@ func (h *Handler) ListDevices(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if filterUserID != "" && guid.Normalize(d.LastUserID) != filterUserID {
-			continue
-		}
-		if supportsSync != nil && *supportsSync {
 			continue
 		}
 		items = append(items, DeviceInfoDto{

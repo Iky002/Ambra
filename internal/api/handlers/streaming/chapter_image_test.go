@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/imaging"
 	"github.com/ambra-media/ambra/internal/core/playback"
@@ -63,9 +64,19 @@ exit 0
 	imgSvc := imaging.New(repo).WithCacheDir(cfg.ImageCacheDir())
 	ext := transcode.NewExtractor(cfg)
 
+	userRepo := sqlite.NewUserRepo(store)
+	adminUser := &sqlite.UserRecord{ID: guid.New(), Name: "admin", IsAdmin: true, Policy: sqlite.DefaultUserPolicy(true), Config: sqlite.DefaultUserConfig()}
+	restrictedPolicy := sqlite.DefaultUserPolicy(false)
+	restrictedPolicy.EnableAllFolders = false
+	restrictedPolicy.EnabledFolders = []string{"other-lib"}
+	restrictedUser := &sqlite.UserRecord{ID: guid.New(), Name: "restricted", Policy: restrictedPolicy, Config: sqlite.DefaultUserConfig()}
+	_ = userRepo.CreateUser(context.Background(), adminUser)
+	_ = userRepo.CreateUser(context.Background(), restrictedUser)
+
 	mux := http.NewServeMux()
 	h := New(repo, engine, imgSvc)
 	h.SetExtractor(ext)
+	h.SetUserRepo(userRepo)
 	h.RegisterRoutes(mux, AuthFuncs{})
 
 	ctx := context.Background()
@@ -101,9 +112,33 @@ exit 0
 		t.Fatal(err)
 	}
 
-	// First request triggers lazy extraction and persists item_images record.
+	// Anonymous request MUST NOT trigger FFmpeg chapter extraction (returns 404).
+	recAnon := httptest.NewRecorder()
+	mux.ServeHTTP(recAnon, httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Chapter/1", nil))
+	if recAnon.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for anonymous chapter extraction, got %d", recAnon.Code)
+	}
+	if _, err := os.Stat(callLog); !os.IsNotExist(err) {
+		t.Fatalf("expected ffmpeg NOT to be invoked for anonymous request")
+	}
+
+	// Restricted non-admin user who cannot access lib1 MUST NOT trigger FFmpeg extraction.
+	reqRestricted := httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Chapter/1", nil)
+	reqRestricted = reqRestricted.WithContext(middleware.WithAuthContext(reqRestricted.Context(), &middleware.AuthContext{User: restrictedUser}))
+	recRestricted := httptest.NewRecorder()
+	mux.ServeHTTP(recRestricted, reqRestricted)
+	if recRestricted.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for restricted user chapter extraction, got %d", recRestricted.Code)
+	}
+	if _, err := os.Stat(callLog); !os.IsNotExist(err) {
+		t.Fatalf("expected ffmpeg NOT to be invoked for restricted user")
+	}
+
+	// First authenticated authorized request triggers lazy extraction and persists item_images record.
+	reqAuth := httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Chapter/1", nil)
+	reqAuth = reqAuth.WithContext(middleware.WithAuthContext(reqAuth.Context(), &middleware.AuthContext{User: adminUser}))
 	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Chapter/1", nil))
+	mux.ServeHTTP(rec, reqAuth)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 OK for lazy chapter thumbnail, got %d body=%q", rec.Code, rec.Body.String())
 	}
@@ -131,8 +166,10 @@ exit 0
 	}
 
 	// Out-of-bounds chapter index returns 404.
+	reqOOB := httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Chapter/5", nil)
+	reqOOB = reqOOB.WithContext(middleware.WithAuthContext(reqOOB.Context(), &middleware.AuthContext{User: adminUser}))
 	recOOB := httptest.NewRecorder()
-	mux.ServeHTTP(recOOB, httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Chapter/5", nil))
+	mux.ServeHTTP(recOOB, reqOOB)
 	if recOOB.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for out-of-bounds chapter index, got %d", recOOB.Code)
 	}
