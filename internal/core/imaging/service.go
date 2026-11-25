@@ -218,7 +218,23 @@ func buildETag(tag, cacheKey string) string {
 
 func (s *Service) cachePath(cacheKey, ext string) string {
 	dir := s.CacheDir()
-	return filepath.Join(dir, cacheKey[:2], cacheKey+"."+ext)
+	filename := cacheKey + "." + ext
+	if len(cacheKey) < 4 {
+		return filepath.Join(dir, filename)
+	}
+	return filepath.Join(dir, cacheKey[:2], cacheKey[2:4], filename)
+}
+
+func (s *Service) legacyCachePaths(cacheKey, ext string) []string {
+	dir := s.CacheDir()
+	filename := cacheKey + "." + ext
+	if len(cacheKey) < 2 {
+		return []string{filepath.Join(dir, filename)}
+	}
+	return []string{
+		filepath.Join(dir, cacheKey[:2], filename), // legacy 1-level sharded path
+		filepath.Join(dir, filename),               // legacy flat path
+	}
 }
 
 func (s *Service) readDiskCache(cacheKey string, opts Options, etag string) (*ImagePayload, bool) {
@@ -233,14 +249,27 @@ func (s *Service) readDiskCache(cacheKey string, opts Options, etag string) (*Im
 		candidates[0], candidates[1] = candidates[1], candidates[0]
 	}
 
+	// Check the 2-level sharded cache path first.
 	for _, c := range candidates {
-		data, err := os.ReadFile(s.cachePath(cacheKey, c.ext))
-		if err == nil && len(data) > 0 {
+		if data, err := os.ReadFile(s.cachePath(cacheKey, c.ext)); err == nil && len(data) > 0 {
 			return &ImagePayload{
 				Data:        data,
 				ContentType: c.ct,
 				ETag:        etag,
 			}, true
+		}
+	}
+
+	// Seamless backward compatibility: fall back to legacy 1-level sharded and flat paths.
+	for _, c := range candidates {
+		for _, legacyPath := range s.legacyCachePaths(cacheKey, c.ext) {
+			if data, err := os.ReadFile(legacyPath); err == nil && len(data) > 0 {
+				return &ImagePayload{
+					Data:        data,
+					ContentType: c.ct,
+					ETag:        etag,
+				}, true
+			}
 		}
 	}
 	return nil, false

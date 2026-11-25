@@ -232,18 +232,22 @@ func (m *Manager) RegisterBuiltinTasks(scanAll func(ctx context.Context) error, 
 		Name:        "优化 SQLite 数据库",
 		Key:         "OptimizeDatabase",
 		Category:    "维护",
-		Description: "执行 SQLite WAL 检查点与统计信息优化，提升查询性能。",
+		Description: "执行 SQLite PRAGMA optimize、ANALYZE 与 WAL 检查点，刷新查询规划器统计信息以提升查询性能。",
 		Triggers: []TaskTriggerInfo{
 			{Type: "IntervalTrigger", IntervalTicks: &interval24h},
 		},
 		Run: func(ctx context.Context, report func(float64)) error {
-			report(20)
+			report(15)
 			if db != nil {
-				if _, err := db.ExecContext(ctx, `PRAGMA optimize`); err != nil {
+				if _, err := db.ExecContext(ctx, `PRAGMA optimize;`); err != nil {
 					return err
 				}
-				report(60)
-				if _, err := db.ExecContext(ctx, `PRAGMA wal_checkpoint(PASSIVE)`); err != nil {
+				report(40)
+				if _, err := db.ExecContext(ctx, `ANALYZE;`); err != nil {
+					return err
+				}
+				report(75)
+				if _, err := db.ExecContext(ctx, `PRAGMA wal_checkpoint(PASSIVE);`); err != nil {
 					return err
 				}
 			}

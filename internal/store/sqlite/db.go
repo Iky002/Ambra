@@ -6,7 +6,9 @@ import (
 	"database/sql/driver"
 	"embed"
 	"fmt"
+	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +33,23 @@ func init() {
 			}
 		},
 	)
+	sqlite3.MustRegisterDeterministicScalarFunction(
+		"parental_rating_rank",
+		1,
+		func(_ *sqlite3.FunctionContext, args []driver.Value) (driver.Value, error) {
+			if len(args) == 0 || args[0] == nil {
+				return int64(0), nil
+			}
+			switch v := args[0].(type) {
+			case string:
+				return int64(ParseParentalRatingValue(v)), nil
+			case []byte:
+				return int64(ParseParentalRatingValue(string(v))), nil
+			default:
+				return int64(ParseParentalRatingValue(fmt.Sprint(v))), nil
+			}
+		},
+	)
 }
 
 //go:embed migrations/*.sql
@@ -42,17 +61,44 @@ type Store struct {
 	Reader *sql.DB
 }
 
-func Open(dbPath string) (*Store, error) {
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)&_pragma=cache_size(-64000)", dbPath)
+func envIntWithDefault(key string, defVal, minVal int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return defVal
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return defVal
+	}
+	if v < minVal {
+		return minVal
+	}
+	return v
+}
 
-	writer, err := sql.Open("sqlite", dsn)
+func Open(dbPath string) (*Store, error) {
+	cacheMB := envIntWithDefault("AMBRA_SQLITE_CACHE_MB", 64, 4)
+	mmapMB := envIntWithDefault("AMBRA_SQLITE_MMAP_MB", 256, 0)
+	cacheKB := cacheMB * 1024
+	mmapBytes := int64(mmapMB) * 1024 * 1024
+
+	writerDSN := fmt.Sprintf(
+		"file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)&_pragma=cache_size(-%d)",
+		dbPath, cacheKB,
+	)
+
+	writer, err := sql.Open("sqlite", writerDSN)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite writer: %w", err)
 	}
 	writer.SetMaxOpenConns(1)
 	writer.SetMaxIdleConns(1)
 
-	reader, err := sql.Open("sqlite", dsn+"&mode=ro")
+	readerDSN := writerDSN + "&mode=ro"
+	if mmapBytes > 0 {
+		readerDSN += fmt.Sprintf("&_pragma=mmap_size(%d)", mmapBytes)
+	}
+	reader, err := sql.Open("sqlite", readerDSN)
 	if err != nil {
 		_ = writer.Close()
 		return nil, fmt.Errorf("open sqlite reader: %w", err)
@@ -69,6 +115,7 @@ func Open(dbPath string) (*Store, error) {
 		_ = s.Close()
 		return nil, err
 	}
+	_, _ = s.Writer.ExecContext(context.Background(), `PRAGMA optimize`)
 	return s, nil
 }
 
@@ -80,6 +127,7 @@ func (s *Store) Close() error {
 		}
 	}
 	if s.Writer != nil {
+		_, _ = s.Writer.Exec(`PRAGMA optimize`)
 		if err := s.Writer.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -149,5 +197,93 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 	}
+
+	var v3 int
+	if err := s.Writer.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 3`).Scan(&v3); err != nil {
+		return err
+	}
+	if v3 == 0 {
+		if err := s.applyMigrationV3(ctx); err != nil {
+			return err
+		}
+		if _, err := s.Writer.ExecContext(ctx,
+			`INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (3, ?)`,
+			time.Now().Unix(),
+		); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (s *Store) applyMigrationV3(ctx context.Context) error {
+	cols := make(map[string]bool)
+	rows, err := s.Writer.QueryContext(ctx, `PRAGMA table_info(items)`)
+	if err != nil {
+		return fmt.Errorf("migration 003 pragma table_info: %w", err)
+	}
+	for rows.Next() {
+		var (
+			cid        int
+			name, ctyp string
+			notnull    int
+			dflt       sql.NullString
+			pk         int
+		)
+		if err := rows.Scan(&cid, &name, &ctyp, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("migration 003 scan table_info: %w", err)
+		}
+		cols[strings.ToLower(name)] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	tx, err := s.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if !cols["sort_key"] {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE items ADD COLUMN sort_key TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("migration 003 add sort_key: %w", err)
+		}
+	}
+	if !cols["extra_type"] {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE items ADD COLUMN extra_type TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("migration 003 add extra_type: %w", err)
+		}
+	}
+	if !cols["parental_rating_value"] {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE items ADD COLUMN parental_rating_value INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("migration 003 add parental_rating_value: %w", err)
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE items
+		SET sort_key = pinyin_sort_key(COALESCE(NULLIF(sort_name, ''), name)),
+		    extra_type = LOWER(COALESCE(json_extract(extra_json, '$.extra_type'), '')),
+		    parental_rating_value = parental_rating_rank(official_rating)
+	`); err != nil {
+		return fmt.Errorf("migration 003 backfill items: %w", err)
+	}
+
+	indexStmts := []string{
+		`CREATE INDEX IF NOT EXISTS idx_items_lib_type_sortkey ON items(library_id, type, sort_key) WHERE extra_type = ''`,
+		`CREATE INDEX IF NOT EXISTS idx_items_type_sortkey ON items(type, sort_key) WHERE extra_type = ''`,
+		`CREATE INDEX IF NOT EXISTS idx_items_lib_type_created ON items(library_id, type, date_created DESC) WHERE extra_type = ''`,
+		`CREATE INDEX IF NOT EXISTS idx_items_parent_extras ON items(parent_id, extra_type) WHERE extra_type != ''`,
+	}
+	for _, st := range indexStmts {
+		if _, err := tx.ExecContext(ctx, st); err != nil {
+			return fmt.Errorf("migration 003 create index: %w", err)
+		}
+	}
+
+	return tx.Commit()
 }
