@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/dvr"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
@@ -73,6 +75,7 @@ type ProgramInfo struct {
 	Type        string    `json:"Type"`
 	ChannelId   string    `json:"ChannelId"`
 	ChannelName string    `json:"ChannelName,omitempty"`
+	SeriesId    string    `json:"SeriesId,omitempty"`
 	Overview    string    `json:"Overview,omitempty"`
 	StartDate   time.Time `json:"StartDate"`
 	EndDate     time.Time `json:"EndDate"`
@@ -117,6 +120,8 @@ type SeriesTimerInfo struct {
 	Id                    string   `json:"Id"`
 	ServerId              string   `json:"ServerId,omitempty"`
 	ChannelId             string   `json:"ChannelId,omitempty"`
+	ProgramId             string   `json:"ProgramId,omitempty"`
+	SeriesId              string   `json:"SeriesId,omitempty"`
 	Name                  string   `json:"Name"`
 	Overview              string   `json:"Overview,omitempty"`
 	RecordAnyTime         bool     `json:"RecordAnyTime"`
@@ -175,6 +180,7 @@ type liveTVState struct {
 type Handler struct {
 	store            *sqlite.Store
 	cfg              *config.Config
+	userRepo         *sqlite.UserRepo
 	httpClient       *http.Client
 	streamClient     *http.Client
 	customHTTPClient bool
@@ -198,6 +204,20 @@ func New(store *sqlite.Store, cfg *config.Config) *Handler {
 	}
 	h.loadState(context.Background())
 	return h
+}
+
+// SetUserRepo attaches a UserRepo for Live TV user access listing.
+func (h *Handler) SetUserRepo(r *sqlite.UserRepo) {
+	h.mu.Lock()
+	h.userRepo = r
+	h.mu.Unlock()
+}
+
+func (h *Handler) getUserRepo() *sqlite.UserRepo {
+	h.mu.RLock()
+	r := h.userRepo
+	h.mu.RUnlock()
+	return r
 }
 
 // SetRecorder attaches a DVR recorder for timer cancellation and recording cleanup.
@@ -431,6 +451,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	handleAdmin := func(pattern string, fn http.HandlerFunc) {
 		mux.Handle(pattern, wrapAdmin(fn))
 	}
+	handleLiveTvManage := func(pattern string, fn http.HandlerFunc) {
+		mux.Handle(pattern, h.requireLiveTvManagement(wrapAuth)(fn))
+	}
 
 	// Info, Channels, Programs
 	handleAuth("GET /LiveTv/Info", h.handleInfo)
@@ -450,18 +473,18 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 
 	// Timers
 	handleAuth("GET /LiveTv/Timers", h.handleListTimers)
-	handleAuth("POST /LiveTv/Timers", h.handleCreateTimer)
+	handleLiveTvManage("POST /LiveTv/Timers", h.handleCreateTimer)
 	handleAuth("GET /LiveTv/Timers/Defaults", h.handleTimerDefaults)
 	handleAuth("GET /LiveTv/Timers/{Id}", h.handleGetTimer)
-	handleAuth("POST /LiveTv/Timers/{Id}", h.handleUpdateTimer)
-	handleAuth("DELETE /LiveTv/Timers/{Id}", h.handleDeleteTimer)
+	handleLiveTvManage("POST /LiveTv/Timers/{Id}", h.handleUpdateTimer)
+	handleLiveTvManage("DELETE /LiveTv/Timers/{Id}", h.handleDeleteTimer)
 
 	// SeriesTimers
 	handleAuth("GET /LiveTv/SeriesTimers", h.handleListSeriesTimers)
-	handleAuth("POST /LiveTv/SeriesTimers", h.handleCreateSeriesTimer)
+	handleLiveTvManage("POST /LiveTv/SeriesTimers", h.handleCreateSeriesTimer)
 	handleAuth("GET /LiveTv/SeriesTimers/{Id}", h.handleGetSeriesTimer)
-	handleAuth("POST /LiveTv/SeriesTimers/{Id}", h.handleUpdateSeriesTimer)
-	handleAuth("DELETE /LiveTv/SeriesTimers/{Id}", h.handleDeleteSeriesTimer)
+	handleLiveTvManage("POST /LiveTv/SeriesTimers/{Id}", h.handleUpdateSeriesTimer)
+	handleLiveTvManage("DELETE /LiveTv/SeriesTimers/{Id}", h.handleDeleteSeriesTimer)
 
 	// Tuners, ListingProviders & GuideInfo
 	handleAdmin("POST /LiveTv/TunerHosts", h.handleSaveTunerHost)
@@ -470,6 +493,20 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	handleAdmin("POST /LiveTv/ListingProviders", h.handleSaveListingProvider)
 	handleAdmin("DELETE /LiveTv/ListingProviders", h.handleDeleteListingProvider)
 	handleAuth("GET /LiveTv/GuideInfo", h.handleGuideInfo)
+}
+
+func (h *Handler) requireLiveTvManagement(wrapAuth func(http.Handler) http.Handler) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return wrapAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+				if !ac.IsAdmin() && (ac.User == nil || !ac.User.Policy.EnableLiveTvManagement) {
+					httpx.Error(w, http.StatusForbidden, "Live TV management privileges required")
+					return
+				}
+			}
+			next.ServeHTTP(w, r)
+		}))
+	}
 }
 
 func (h *Handler) serverID() string {
@@ -492,6 +529,17 @@ func (h *Handler) handleInfo(w http.ResponseWriter, r *http.Request) {
 	enabled := len(h.state.TunerHosts) > 0 || len(h.state.Channels) > 0
 	h.mu.RUnlock()
 
+	enabledUsers := make([]string, 0)
+	if userRepo := h.getUserRepo(); userRepo != nil {
+		if users, err := userRepo.ListUsers(r.Context()); err == nil {
+			for _, u := range users {
+				if u != nil && !u.IsDisabled && (u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableLiveTvAccess) {
+					enabledUsers = append(enabledUsers, u.ID)
+				}
+			}
+		}
+	}
+
 	httpx.JSON(w, http.StatusOK, LiveTvInfo{
 		Services: []LiveTvServiceInfo{
 			{
@@ -502,7 +550,7 @@ func (h *Handler) handleInfo(w http.ResponseWriter, r *http.Request) {
 			},
 		},
 		IsEnabled:    enabled,
-		EnabledUsers: []string{},
+		EnabledUsers: enabledUsers,
 	})
 }
 
@@ -839,33 +887,139 @@ func parseTokenFromAuthHeader(header string) string {
 	return ""
 }
 
+type programQuery struct {
+	ChannelIds   []string
+	SearchTerm   string
+	IsMovie      *bool
+	IsSeries     *bool
+	MinStartDate *time.Time
+	MaxStartDate *time.Time
+	MinEndDate   *time.Time
+	MaxEndDate   *time.Time
+	HasAired     *bool
+	IsAiring     *bool
+	SortBy       []string
+	SortOrder    string
+	StartIndex   int
+	Limit        int
+}
+
+type flexStringList []string
+
+func (f *flexStringList) UnmarshalJSON(data []byte) error {
+	var arr []string
+	if err := json.Unmarshal(data, &arr); err == nil {
+		var out []string
+		for _, item := range arr {
+			for _, p := range strings.Split(item, ",") {
+				if s := strings.TrimSpace(p); s != "" {
+					out = append(out, s)
+				}
+			}
+		}
+		*f = out
+		return nil
+	}
+	var single string
+	if err := json.Unmarshal(data, &single); err == nil {
+		var out []string
+		for _, p := range strings.Split(single, ",") {
+			if s := strings.TrimSpace(p); s != "" {
+				out = append(out, s)
+			}
+		}
+		*f = out
+		return nil
+	}
+	return nil
+}
+
+func parseQueryTime(raw string) *time.Time {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return nil
+	}
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02T15:04:05",
+		"2006-01-02",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			u := t.UTC()
+			return &u
+		}
+	}
+	return nil
+}
+
 func (h *Handler) handleListPrograms(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
-	h.writeFilteredPrograms(w, q.List("ChannelIds"), q.Get("SearchTerm"), q.Bool("IsMovie"), q.Bool("IsSeries"), q.Int("StartIndex", 0), q.Int("Limit", 0))
+	h.writeFilteredPrograms(w, programQuery{
+		ChannelIds:   q.List("ChannelIds"),
+		SearchTerm:   q.Get("SearchTerm"),
+		IsMovie:      q.Bool("IsMovie"),
+		IsSeries:     q.Bool("IsSeries"),
+		MinStartDate: parseQueryTime(q.Get("MinStartDate")),
+		MaxStartDate: parseQueryTime(q.Get("MaxStartDate")),
+		MinEndDate:   parseQueryTime(q.Get("MinEndDate")),
+		MaxEndDate:   parseQueryTime(q.Get("MaxEndDate")),
+		HasAired:     q.Bool("HasAired"),
+		IsAiring:     q.Bool("IsAiring"),
+		SortBy:       q.List("SortBy"),
+		SortOrder:    q.Get("SortOrder"),
+		StartIndex:   q.Int("StartIndex", 0),
+		Limit:        q.Int("Limit", 0),
+	})
 }
 
 func (h *Handler) handleQueryProgramsPost(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ChannelIds []string `json:"ChannelIds"`
-		SearchTerm string   `json:"SearchTerm"`
-		IsMovie    *bool    `json:"IsMovie"`
-		IsSeries   *bool    `json:"IsSeries"`
-		StartIndex int      `json:"StartIndex"`
-		Limit      int      `json:"Limit"`
+		ChannelIds   []string       `json:"ChannelIds"`
+		SearchTerm   string         `json:"SearchTerm"`
+		IsMovie      *bool          `json:"IsMovie"`
+		IsSeries     *bool          `json:"IsSeries"`
+		MinStartDate string         `json:"MinStartDate"`
+		MaxStartDate string         `json:"MaxStartDate"`
+		MinEndDate   string         `json:"MinEndDate"`
+		MaxEndDate   string         `json:"MaxEndDate"`
+		HasAired     *bool          `json:"HasAired"`
+		IsAiring     *bool          `json:"IsAiring"`
+		SortBy       flexStringList `json:"SortBy"`
+		SortOrder    string         `json:"SortOrder"`
+		StartIndex   int            `json:"StartIndex"`
+		Limit        int            `json:"Limit"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid program query payload")
 		return
 	}
-	h.writeFilteredPrograms(w, body.ChannelIds, body.SearchTerm, body.IsMovie, body.IsSeries, body.StartIndex, body.Limit)
+	h.writeFilteredPrograms(w, programQuery{
+		ChannelIds:   body.ChannelIds,
+		SearchTerm:   body.SearchTerm,
+		IsMovie:      body.IsMovie,
+		IsSeries:     body.IsSeries,
+		MinStartDate: parseQueryTime(body.MinStartDate),
+		MaxStartDate: parseQueryTime(body.MaxStartDate),
+		MinEndDate:   parseQueryTime(body.MinEndDate),
+		MaxEndDate:   parseQueryTime(body.MaxEndDate),
+		HasAired:     body.HasAired,
+		IsAiring:     body.IsAiring,
+		SortBy:       []string(body.SortBy),
+		SortOrder:    body.SortOrder,
+		StartIndex:   body.StartIndex,
+		Limit:        body.Limit,
+	})
 }
 
-func (h *Handler) writeFilteredPrograms(w http.ResponseWriter, channelIDs []string, searchTerm string, isMovie, isSeries *bool, startIndex, limit int) {
-	chSet := make(map[string]struct{}, len(channelIDs))
-	for _, cid := range channelIDs {
+func (h *Handler) writeFilteredPrograms(w http.ResponseWriter, pq programQuery) {
+	chSet := make(map[string]struct{}, len(pq.ChannelIds))
+	for _, cid := range pq.ChannelIds {
 		chSet[cid] = struct{}{}
 	}
-	search := strings.ToLower(strings.TrimSpace(searchTerm))
+	search := strings.ToLower(strings.TrimSpace(pq.SearchTerm))
+	now := time.Now().UTC()
 
 	h.mu.RLock()
 	filtered := make([]ProgramInfo, 0, len(h.state.Programs))
@@ -878,21 +1032,83 @@ func (h *Handler) writeFilteredPrograms(w http.ResponseWriter, channelIDs []stri
 		if search != "" && !strings.Contains(strings.ToLower(p.Name), search) {
 			continue
 		}
-		if isMovie != nil && p.IsMovie != *isMovie {
+		if pq.IsMovie != nil && p.IsMovie != *pq.IsMovie {
 			continue
 		}
-		if isSeries != nil && p.IsSeries != *isSeries {
+		if pq.IsSeries != nil && p.IsSeries != *pq.IsSeries {
 			continue
+		}
+		if pq.MinStartDate != nil && p.StartDate.Before(*pq.MinStartDate) {
+			continue
+		}
+		if pq.MaxStartDate != nil && p.StartDate.After(*pq.MaxStartDate) {
+			continue
+		}
+		if pq.MinEndDate != nil && p.EndDate.Before(*pq.MinEndDate) {
+			continue
+		}
+		if pq.MaxEndDate != nil && p.EndDate.After(*pq.MaxEndDate) {
+			continue
+		}
+		if pq.HasAired != nil {
+			aired := !p.EndDate.IsZero() && !p.EndDate.After(now)
+			if aired != *pq.HasAired {
+				continue
+			}
+		}
+		if pq.IsAiring != nil {
+			airing := !p.StartDate.IsZero() && !p.EndDate.IsZero() && !p.StartDate.After(now) && p.EndDate.After(now)
+			if airing != *pq.IsAiring {
+				continue
+			}
 		}
 		filtered = append(filtered, p)
 	}
 	h.mu.RUnlock()
 
-	page, total := paginate(filtered, startIndex, limit)
+	if len(pq.SortBy) > 0 {
+		desc := strings.EqualFold(strings.TrimSpace(pq.SortOrder), "descending") ||
+			strings.EqualFold(strings.TrimSpace(pq.SortOrder), "desc")
+		sort.SliceStable(filtered, func(i, j int) bool {
+			a, b := filtered[i], filtered[j]
+			for _, key := range pq.SortBy {
+				var cmp int
+				switch strings.ToLower(strings.TrimSpace(key)) {
+				case "startdate":
+					cmp = compareTimes(a.StartDate, b.StartDate)
+				case "enddate":
+					cmp = compareTimes(a.EndDate, b.EndDate)
+				case "name", "sortname":
+					cmp = strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
+				case "channelname":
+					cmp = strings.Compare(strings.ToLower(a.ChannelName), strings.ToLower(b.ChannelName))
+				}
+				if cmp != 0 {
+					if desc {
+						return cmp > 0
+					}
+					return cmp < 0
+				}
+			}
+			return false
+		})
+	}
+
+	page, total := paginate(filtered, pq.StartIndex, pq.Limit)
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[ProgramInfo]{
 		Items:            page,
 		TotalRecordCount: total,
 	})
+}
+
+func compareTimes(a, b time.Time) int {
+	if a.Before(b) {
+		return -1
+	}
+	if a.After(b) {
+		return 1
+	}
+	return 0
 }
 
 func (h *Handler) handleRecommendedPrograms(w http.ResponseWriter, r *http.Request) {
@@ -1225,9 +1441,87 @@ func (h *Handler) handleCreateSeriesTimer(w http.ResponseWriter, r *http.Request
 
 	h.mu.Lock()
 	h.state.SeriesTimers = append(h.state.SeriesTimers, st)
+	h.scheduleTimersForSeriesLocked(st)
 	h.saveStateLocked(r.Context())
 	h.mu.Unlock()
 	httpx.JSON(w, http.StatusOK, st)
+}
+
+func (h *Handler) scheduleTimersForSeriesLocked(st SeriesTimerInfo) {
+	seriesID := strings.TrimSpace(st.SeriesId)
+	seriesName := strings.TrimSpace(st.Name)
+	if seriesID == "" && seriesName == "" {
+		return
+	}
+	daySet := make(map[string]struct{}, len(st.Days))
+	for _, d := range st.Days {
+		if k := strings.ToLower(strings.TrimSpace(d)); k != "" {
+			daySet[k] = struct{}{}
+		}
+	}
+
+	now := time.Now().UTC()
+	serverID := h.serverID()
+
+	for _, p := range h.state.Programs {
+		if !p.EndDate.IsZero() && !p.EndDate.After(now) {
+			continue
+		}
+		if !st.RecordAnyChannel && st.ChannelId != "" && p.ChannelId != st.ChannelId {
+			continue
+		}
+		matched := false
+		if seriesID != "" && p.SeriesId != "" && strings.EqualFold(strings.TrimSpace(p.SeriesId), seriesID) {
+			matched = true
+		} else if seriesName != "" && strings.EqualFold(strings.TrimSpace(p.Name), seriesName) {
+			matched = true
+		}
+		if !matched {
+			continue
+		}
+		if len(daySet) > 0 && !p.StartDate.IsZero() {
+			if _, ok := daySet[strings.ToLower(p.StartDate.UTC().Weekday().String())]; !ok {
+				continue
+			}
+		}
+
+		// Avoid creating duplicate timers for the same program or time slot.
+		duplicate := false
+		for _, existing := range h.state.Timers {
+			if p.Id != "" && existing.ProgramId == p.Id {
+				duplicate = true
+				break
+			}
+			if existing.SeriesTimerId == st.Id &&
+				existing.ChannelId == p.ChannelId &&
+				existing.StartDate.Equal(p.StartDate) &&
+				strings.EqualFold(existing.Name, p.Name) {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			continue
+		}
+
+		h.state.Timers = append(h.state.Timers, TimerInfo{
+			Id:                    guid.New(),
+			ServerId:              serverID,
+			ChannelId:             p.ChannelId,
+			ChannelName:           p.ChannelName,
+			ProgramId:             p.Id,
+			SeriesTimerId:         st.Id,
+			Name:                  p.Name,
+			Overview:              p.Overview,
+			StartDate:             p.StartDate,
+			EndDate:               p.EndDate,
+			Status:                "New",
+			PrePaddingSeconds:     st.PrePaddingSeconds,
+			PostPaddingSeconds:    st.PostPaddingSeconds,
+			IsPrePaddingRequired:  st.IsPrePaddingRequired,
+			IsPostPaddingRequired: st.IsPostPaddingRequired,
+		})
+	}
 }
 
 func (h *Handler) handleGetSeriesTimer(w http.ResponseWriter, r *http.Request) {
@@ -1259,6 +1553,7 @@ func (h *Handler) handleUpdateSeriesTimer(w http.ResponseWriter, r *http.Request
 				upd.Days = []string{}
 			}
 			h.state.SeriesTimers[i] = upd
+			h.scheduleTimersForSeriesLocked(upd)
 			h.saveStateLocked(r.Context())
 			h.mu.Unlock()
 			httpx.JSON(w, http.StatusOK, upd)

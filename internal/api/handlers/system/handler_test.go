@@ -69,7 +69,7 @@ func setupSystemHandler(t *testing.T) (chi.Router, *Handler, *sqlite.Store, *sql
 }
 
 func TestPublicSystemRoutes(t *testing.T) {
-	r, h, _, _, _, _ := setupSystemHandler(t)
+	r, _, _, _, _, _ := setupSystemHandler(t)
 
 	// /System/Info/Public with X-Forwarded-Proto and empty Host
 	req := httptest.NewRequest(http.MethodGet, "/System/Info/Public", nil)
@@ -96,7 +96,7 @@ func TestPublicSystemRoutes(t *testing.T) {
 		}
 	}
 
-	// Localization, Registrations, Features, ScheduledTasks
+	// Localization, Registrations, Features
 	for _, path := range []string{
 		"/Branding/Configuration",
 		"/Branding/Css",
@@ -113,13 +113,6 @@ func TestPublicSystemRoutes(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Errorf("GET %s: expected 200, got %d", path, rec.Code)
 		}
-	}
-
-	// Direct call to GetScheduledTasks
-	rec = httptest.NewRecorder()
-	h.GetScheduledTasks(rec, httptest.NewRequest(http.MethodGet, "/ScheduledTasks", nil))
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "refresh-library") {
-		t.Fatalf("GetScheduledTasks failed: %d %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -378,5 +371,54 @@ func TestSystemConfigMaskingAndActivityLogAdminOnly(t *testing.T) {
 	r.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "AuditEvent") {
 		t.Fatalf("admin GET /System/ActivityLog/Entries expected 200 with AuditEvent, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSystemConfigurationPersistenceAndExtraFields(t *testing.T) {
+	r, _, _, _, adminTok, viewerTok := setupSystemHandler(t)
+
+	// Default fallbacks when not yet set
+	req := httptest.NewRequest(http.MethodGet, "/System/Configuration", nil)
+	req.Header.Set("X-Emby-Token", adminTok)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET default config: %d", rec.Code)
+	}
+	var def map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &def); err != nil {
+		t.Fatal(err)
+	}
+	if def["PreferredMetadataLanguage"] != "zh" || def["MetadataCountryCode"] != "CN" || def["UICulture"] != "zh-cn" {
+		t.Fatalf("unexpected default localization config: %#v", def)
+	}
+
+	// Update localization and extra fields
+	body := `{"PreferredMetadataLanguage":"en","MetadataCountryCode":"US","UICulture":"en-us","EnableRemoteAccess":true,"MaxResumePct":90}`
+	req = httptest.NewRequest(http.MethodPost, "/System/Configuration", bytes.NewBufferString(body))
+	req.Header.Set("X-Emby-Token", adminTok)
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("POST config expected 204, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Verify persisted on GET
+	req = httptest.NewRequest(http.MethodGet, "/System/Configuration", nil)
+	req.Header.Set("X-Emby-Token", viewerTok)
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET updated config: %d", rec.Code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["PreferredMetadataLanguage"] != "en" || got["MetadataCountryCode"] != "US" || got["UICulture"] != "en-us" {
+		t.Fatalf("localization not persisted: %#v", got)
+	}
+	if got["EnableRemoteAccess"] != true || got["MaxResumePct"] != float64(90) {
+		t.Fatalf("extra config fields not persisted: %#v", got)
 	}
 }

@@ -180,6 +180,14 @@ func TestSetupWizardFlow(t *testing.T) {
 	if env.cfg.ServerName != "My Cinema" || env.cfg.TMDBLanguage != "en-US" {
 		t.Fatalf("config not updated: name=%q lang=%q", env.cfg.ServerName, env.cfg.TMDBLanguage)
 	}
+	// Verify country was persisted to system configuration
+	cfgReq := httptest.NewRequest(http.MethodGet, "/System/Configuration", nil)
+	cfgReq.Header.Set("X-Emby-Token", authRes.AccessToken)
+	cfgRec := httptest.NewRecorder()
+	env.router.ServeHTTP(cfgRec, cfgReq)
+	if cfgRec.Code != http.StatusOK || !strings.Contains(cfgRec.Body.String(), `"MetadataCountryCode":"US"`) {
+		t.Fatalf("expected country US persisted in /System/Configuration, got %d %s", cfgRec.Code, cfgRec.Body.String())
+	}
 	if calls, _, lang := env.tmdbSpy.snapshot(); calls != 1 || lang != "en-US" {
 		t.Fatalf("expected TMDB plugin language hot-reload, got calls=%d lang=%q", calls, lang)
 	}

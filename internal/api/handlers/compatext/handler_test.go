@@ -19,82 +19,83 @@ import (
 )
 
 type routeSpec struct {
-	method string
-	path   string
-	admin  bool
-	body   string
+	method         string
+	path           string
+	admin          bool
+	expectNotFound bool
+	body           string
 }
 
 // all59Routes lists all 59 missing Emby 4.10.2.0 routes across /LiveTv (42), /Sync (12), and /Notifications (5).
 var all59Routes = []routeSpec{
 	// /LiveTv - LiveStreamFiles (11)
-	{http.MethodGet, "/LiveTv/LiveStreamFiles/nonexistent-item-id/stream.mp4", false, ""},
-	{http.MethodGet, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/master.m3u8", false, ""},
-	{http.MethodHead, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/master.m3u8", false, ""},
-	{http.MethodGet, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/master_local.m3u8", false, ""},
-	{http.MethodHead, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/master_local.m3u8", false, ""},
-	{http.MethodGet, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/live.m3u8", false, ""},
-	{http.MethodHead, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/live.m3u8", false, ""},
-	{http.MethodGet, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/live_local.m3u8", false, ""},
-	{http.MethodHead, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/live_local.m3u8", false, ""},
-	{http.MethodGet, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/0", false, ""},
-	{http.MethodHead, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/0", false, ""},
+	{http.MethodGet, "/LiveTv/LiveStreamFiles/nonexistent-item-id/stream.mp4", false, true, ""},
+	{http.MethodGet, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/master.m3u8", false, true, ""},
+	{http.MethodHead, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/master.m3u8", false, true, ""},
+	{http.MethodGet, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/master_local.m3u8", false, true, ""},
+	{http.MethodHead, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/master_local.m3u8", false, true, ""},
+	{http.MethodGet, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/live.m3u8", false, true, ""},
+	{http.MethodHead, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/live.m3u8", false, true, ""},
+	{http.MethodGet, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/live_local.m3u8", false, true, ""},
+	{http.MethodHead, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/live_local.m3u8", false, true, ""},
+	{http.MethodGet, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/0", false, true, ""},
+	{http.MethodHead, "/LiveTv/LiveStreamFiles/nonexistent-item-id/hls/0", false, true, ""},
 
 	// /LiveTv - LiveRecordings (7)
-	{http.MethodGet, "/LiveTv/LiveRecordings/nonexistent-item-id/stream", false, ""},
-	{http.MethodGet, "/LiveTv/LiveRecordings/nonexistent-item-id/hls/master.m3u8", false, ""},
-	{http.MethodHead, "/LiveTv/LiveRecordings/nonexistent-item-id/hls/master.m3u8", false, ""},
-	{http.MethodGet, "/LiveTv/LiveRecordings/nonexistent-item-id/hls/0", false, ""},
-	{http.MethodHead, "/LiveTv/LiveRecordings/nonexistent-item-id/hls/0", false, ""},
-	{http.MethodGet, "/LiveTv/LiveRecordings/nonexistent-item-id/hls/live.m3u8", false, ""},
-	{http.MethodHead, "/LiveTv/LiveRecordings/nonexistent-item-id/hls/live.m3u8", false, ""},
+	{http.MethodGet, "/LiveTv/LiveRecordings/nonexistent-item-id/stream", false, true, ""},
+	{http.MethodGet, "/LiveTv/LiveRecordings/nonexistent-item-id/hls/master.m3u8", false, true, ""},
+	{http.MethodHead, "/LiveTv/LiveRecordings/nonexistent-item-id/hls/master.m3u8", false, true, ""},
+	{http.MethodGet, "/LiveTv/LiveRecordings/nonexistent-item-id/hls/0", false, true, ""},
+	{http.MethodHead, "/LiveTv/LiveRecordings/nonexistent-item-id/hls/0", false, true, ""},
+	{http.MethodGet, "/LiveTv/LiveRecordings/nonexistent-item-id/hls/live.m3u8", false, true, ""},
+	{http.MethodHead, "/LiveTv/LiveRecordings/nonexistent-item-id/hls/live.m3u8", false, true, ""},
 
 	// /LiveTv - Service (24)
-	{http.MethodGet, "/LiveTv/AvailableRecordingOptions", false, ""},
-	{http.MethodGet, "/LiveTv/EPG", false, ""},
-	{http.MethodGet, "/LiveTv/Manage/Channels", true, ""},
-	{http.MethodPost, "/LiveTv/Manage/Channels/ch-1/Disabled", true, `{"Disabled":true}`},
-	{http.MethodPost, "/LiveTv/Manage/Channels/ch-1/SortIndex", true, `{"NewIndex":2}`},
-	{http.MethodGet, "/LiveTv/Folder", false, ""},
-	{http.MethodPost, "/LiveTv/Tuners/tuner-1/Reset", true, `{}`},
-	{http.MethodGet, "/LiveTv/ChannelTags", false, ""},
-	{http.MethodGet, "/LiveTv/ChannelTags/Prefixes", false, ""},
-	{http.MethodPost, "/LiveTv/Recordings/rec-1/Delete", true, `{}`},
-	{http.MethodPost, "/LiveTv/Timers/timer-1/Delete", false, `{}`},
-	{http.MethodPost, "/LiveTv/SeriesTimers/st-1/Delete", false, `{}`},
-	{http.MethodGet, "/LiveTv/TunerHosts", true, ""},
-	{http.MethodGet, "/LiveTv/TunerHosts/Default/m3u", true, ""},
-	{http.MethodPost, "/LiveTv/TunerHosts/Delete", true, `{"Id":"th-1"}`},
-	{http.MethodGet, "/LiveTv/ListingProviders/Default", false, ""},
-	{http.MethodGet, "/LiveTv/ListingProviders/Available", true, ""},
-	{http.MethodGet, "/LiveTv/ListingProviders", true, ""},
-	{http.MethodPost, "/LiveTv/ListingProviders/Delete", true, `{"Id":"lp-1"}`},
-	{http.MethodGet, "/LiveTv/ListingProviders/Lineups", true, ""},
-	{http.MethodGet, "/LiveTv/ChannelMappingOptions", true, ""},
-	{http.MethodPost, "/LiveTv/ChannelMappings", true, `{"ProviderId":"lp-1","TunerChannelId":"ch-1","ProviderChannelId":"epg-1"}`},
-	{http.MethodGet, "/LiveTv/Tuners/Discvover", false, ""},
-	{http.MethodGet, "/LiveTv/Tuners/Discover", false, ""},
+	{http.MethodGet, "/LiveTv/AvailableRecordingOptions", false, false, ""},
+	{http.MethodGet, "/LiveTv/EPG", false, false, ""},
+	{http.MethodGet, "/LiveTv/Manage/Channels", true, false, ""},
+	{http.MethodPost, "/LiveTv/Manage/Channels/ch-1/Disabled", true, false, `{"Disabled":true}`},
+	{http.MethodPost, "/LiveTv/Manage/Channels/ch-1/SortIndex", true, false, `{"NewIndex":2}`},
+	{http.MethodGet, "/LiveTv/Folder", false, false, ""},
+	{http.MethodPost, "/LiveTv/Tuners/tuner-1/Reset", true, false, `{}`},
+	{http.MethodGet, "/LiveTv/ChannelTags", false, false, ""},
+	{http.MethodGet, "/LiveTv/ChannelTags/Prefixes", false, false, ""},
+	{http.MethodPost, "/LiveTv/Recordings/rec-1/Delete", true, false, `{}`},
+	{http.MethodPost, "/LiveTv/Timers/timer-1/Delete", false, false, `{}`},
+	{http.MethodPost, "/LiveTv/SeriesTimers/st-1/Delete", false, false, `{}`},
+	{http.MethodGet, "/LiveTv/TunerHosts", true, false, ""},
+	{http.MethodGet, "/LiveTv/TunerHosts/Default/m3u", true, false, ""},
+	{http.MethodPost, "/LiveTv/TunerHosts/Delete", true, false, `{"Id":"th-1"}`},
+	{http.MethodGet, "/LiveTv/ListingProviders/Default", false, false, ""},
+	{http.MethodGet, "/LiveTv/ListingProviders/Available", true, false, ""},
+	{http.MethodGet, "/LiveTv/ListingProviders", true, false, ""},
+	{http.MethodPost, "/LiveTv/ListingProviders/Delete", true, false, `{"Id":"lp-1"}`},
+	{http.MethodGet, "/LiveTv/ListingProviders/Lineups", true, false, ""},
+	{http.MethodGet, "/LiveTv/ChannelMappingOptions", true, false, ""},
+	{http.MethodPost, "/LiveTv/ChannelMappings", true, false, `{"ProviderId":"lp-1","TunerChannelId":"ch-1","ProviderChannelId":"epg-1"}`},
+	{http.MethodGet, "/LiveTv/Tuners/Discvover", true, false, ""},
+	{http.MethodGet, "/LiveTv/Tuners/Discover", true, false, ""},
 
 	// /Sync (12)
-	{http.MethodPost, "/Sync/Jobs/job-1/Delete", false, `{}`},
-	{http.MethodPost, "/Sync/item-1/Status", false, `{}`},
-	{http.MethodPost, "/Sync/JobItems/ji-1/MarkForRemoval", false, `{}`},
-	{http.MethodPost, "/Sync/JobItems/ji-1/UnmarkForRemoval", false, `{}`},
-	{http.MethodPost, "/Sync/JobItems/ji-1/Delete", false, `{}`},
-	{http.MethodPost, "/Sync/Items/Cancel", false, `{}`},
-	{http.MethodPost, "/Sync/target-1/Items/Delete", false, `{}`},
-	{http.MethodDelete, "/Sync/target-1/Items", false, ""},
-	{http.MethodHead, "/Sync/JobItems/ji-1/File", false, ""},
-	{http.MethodGet, "/Sync/JobItems/ji-1/File", false, ""},
-	{http.MethodGet, "/Sync/JobItems/ji-1/AdditionalFiles", false, ""},
-	{http.MethodPost, "/Sync/OfflineActions", false, `{}`},
+	{http.MethodPost, "/Sync/Jobs/job-1/Delete", false, false, `{}`},
+	{http.MethodPost, "/Sync/item-1/Status", false, false, `{}`},
+	{http.MethodPost, "/Sync/JobItems/ji-1/MarkForRemoval", false, false, `{}`},
+	{http.MethodPost, "/Sync/JobItems/ji-1/UnmarkForRemoval", false, false, `{}`},
+	{http.MethodPost, "/Sync/JobItems/ji-1/Delete", false, false, `{}`},
+	{http.MethodPost, "/Sync/Items/Cancel", false, false, `{}`},
+	{http.MethodPost, "/Sync/target-1/Items/Delete", false, false, `{}`},
+	{http.MethodDelete, "/Sync/target-1/Items", false, false, ""},
+	{http.MethodHead, "/Sync/JobItems/ji-1/File", false, true, ""},
+	{http.MethodGet, "/Sync/JobItems/ji-1/File", false, true, ""},
+	{http.MethodGet, "/Sync/JobItems/ji-1/AdditionalFiles", false, false, ""},
+	{http.MethodPost, "/Sync/OfflineActions", false, false, `{}`},
 
 	// /Notifications (5)
-	{http.MethodGet, "/Notifications/Services/Configured", false, ""},
-	{http.MethodPost, "/Notifications/Services/Configured", false, `{"Name":"Webhook","Enabled":true}`},
-	{http.MethodGet, "/Notifications/Services/Defaults", false, ""},
-	{http.MethodPost, "/Notifications/Services/Test", false, `{}`},
-	{http.MethodDelete, "/Notifications/Services/Configured?Id=nonexistent", false, ""},
+	{http.MethodGet, "/Notifications/Services/Configured", false, false, ""},
+	{http.MethodPost, "/Notifications/Services/Configured", false, false, `{"Name":"Webhook","Enabled":true}`},
+	{http.MethodGet, "/Notifications/Services/Defaults", false, false, ""},
+	{http.MethodPost, "/Notifications/Services/Test", false, false, `{}`},
+	{http.MethodDelete, "/Notifications/Services/Configured?Id=nonexistent", false, false, ""},
 }
 
 func makeAuthFuncs() AuthFuncs {
@@ -145,7 +146,7 @@ func TestAll59RoutesAndAuth(t *testing.T) {
 			t.Errorf("%s %s without auth: got %d, want 401", rt.method, rt.path, w.Code)
 		}
 
-		// 2. Non-admin user -> 403 for admin routes, 2xx for auth routes
+		// 2. Non-admin user -> 403 for admin routes, 404 for nonexistent media routes, 2xx for other auth routes
 		req = httptest.NewRequest(rt.method, rt.path, strings.NewReader(rt.body))
 		req.Header.Set("X-Test-Role", "user")
 		w = httptest.NewRecorder()
@@ -154,18 +155,26 @@ func TestAll59RoutesAndAuth(t *testing.T) {
 			if w.Code != http.StatusForbidden {
 				t.Errorf("%s %s as user: got %d, want 403", rt.method, rt.path, w.Code)
 			}
+		} else if rt.expectNotFound {
+			if w.Code != http.StatusNotFound {
+				t.Errorf("%s %s as user: got %d, want 404 (body=%q)", rt.method, rt.path, w.Code, w.Body.String())
+			}
 		} else {
 			if w.Code < 200 || w.Code >= 300 {
 				t.Errorf("%s %s as user: got %d, want 2xx (body=%q)", rt.method, rt.path, w.Code, w.Body.String())
 			}
 		}
 
-		// 3. Admin user -> 2xx for all routes
+		// 3. Admin user -> 404 for nonexistent media routes, 2xx for all other routes
 		req = httptest.NewRequest(rt.method, rt.path, strings.NewReader(rt.body))
 		req.Header.Set("X-Test-Role", "admin")
 		w = httptest.NewRecorder()
 		router.ServeHTTP(w, req)
-		if w.Code < 200 || w.Code >= 300 {
+		if rt.expectNotFound {
+			if w.Code != http.StatusNotFound {
+				t.Errorf("%s %s as admin: got %d, want 404 (body=%q)", rt.method, rt.path, w.Code, w.Body.String())
+			}
+		} else if w.Code < 200 || w.Code >= 300 {
 			t.Errorf("%s %s as admin: got %d, want 2xx (body=%q)", rt.method, rt.path, w.Code, w.Body.String())
 		}
 		if rt.method == http.MethodHead && w.Body.Len() != 0 {
@@ -188,26 +197,26 @@ func TestNilStoreAndNilAuthFallback(t *testing.T) {
 		t.Fatalf("expected 200 with passthrough auth, got %d", w.Code)
 	}
 
-	// Verify various container content types and .m4s / .vtt branches
-	for _, tc := range []struct {
-		path   string
-		wantCT string
-	}{
-		{"/LiveTv/LiveStreamFiles/s1/stream.mp4", "video/mp4"},
-		{"/LiveTv/LiveStreamFiles/s1/stream.ts", "video/mp2t"},
-		{"/LiveTv/LiveStreamFiles/s1/stream.mkv", "video/x-matroska"},
-		{"/LiveTv/LiveStreamFiles/s1/stream.webm", "video/webm"},
-		{"/LiveTv/LiveStreamFiles/s1/stream.m3u8", "application/vnd.apple.mpegurl"},
-		{"/LiveTv/LiveStreamFiles/s1/stream.bin", "application/octet-stream"},
-		{"/LiveTv/LiveStreamFiles/s1/hls/seg0.m4s", "video/iso.segment"},
-		{"/LiveTv/LiveStreamFiles/s1/hls/seg0.ts", "video/mp2t"},
-		{"/Sync/JobItems/ji1/AdditionalFiles?Name=sub.vtt", "text/vtt"},
+	// Verify nonexistent streams return 404 (never fake null packets) and .vtt branch works
+	for _, path := range []string{
+		"/LiveTv/LiveStreamFiles/s1/stream.mp4",
+		"/LiveTv/LiveStreamFiles/s1/stream.ts",
+		"/LiveTv/LiveStreamFiles/s1/hls/master.m3u8",
+		"/LiveTv/LiveStreamFiles/s1/hls/seg0.ts",
+		"/LiveTv/LiveRecordings/r1/stream",
+		"/LiveTv/LiveRecordings/r1/hls/live.m3u8",
+		"/Sync/JobItems/ji1/File",
 	} {
 		rec := httptest.NewRecorder()
-		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
-		if rec.Code != http.StatusOK || !strings.Contains(rec.Header().Get("Content-Type"), tc.wantCT) {
-			t.Errorf("GET %s: code=%d ct=%q want ct containing %q", tc.path, rec.Code, rec.Header().Get("Content-Type"), tc.wantCT)
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("GET %s: code=%d want 404", path, rec.Code)
 		}
+	}
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Sync/JobItems/ji1/AdditionalFiles?Name=sub.vtt", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Header().Get("Content-Type"), "text/vtt") {
+		t.Errorf("GET AdditionalFiles .vtt: code=%d ct=%q", rec.Code, rec.Header().Get("Content-Type"))
 	}
 }
 
@@ -269,8 +278,8 @@ func TestSQLitePersistenceAndSharedState(t *testing.T) {
 	})
 	h.writeConfigJSON(ctx, syncConfigKey, sharedSyncState{
 		Jobs: []sharedSyncJob{
-			{Id: "j-1", TargetId: "dev-1", Name: "Job 1", Status: "Queued"},
-			{Id: "j-2", TargetId: "dev-2", Name: "Job 2", Status: "Queued"},
+			{Id: "j-1", TargetId: "dev-1", Name: "Job 1", Status: "Queued", UserId: "u-1"},
+			{Id: "j-2", TargetId: "dev-2", Name: "Job 2", Status: "Queued", UserId: "u-1"},
 		},
 		JobItems: []sharedSyncJobItem{
 			{Id: "ji-1", JobId: "j-1", ItemId: "item-1", TargetId: "dev-1", Status: "Queued", OutputPath: syncFile},
@@ -444,7 +453,7 @@ func TestSQLitePersistenceAndSharedState(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&created); err != nil {
 		t.Fatal(err)
 	}
-	if created.Id == "" || created.UserId != "u-1" {
+	if created.Id == "" || created.UserId != "u1" {
 		t.Fatalf("unexpected created notification: %+v", created)
 	}
 	// Update same ID
@@ -454,11 +463,11 @@ func TestSQLitePersistenceAndSharedState(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("update notification service: %d", w.Code)
 	}
-	// Filter by another UserId -> empty
+	// Filter by another UserId as non-admin -> 403 Forbidden
 	w = httptest.NewRecorder()
 	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/Notifications/Services/Configured?UserId=other-user", nil))
-	if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != "[]" {
-		t.Fatalf("expected empty list for other user, got %d %s", w.Code, w.Body.String())
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-admin querying other user, got %d %s", w.Code, w.Body.String())
 	}
 
 	// Reload handler from SQLite and verify persisted state survives restart
@@ -536,11 +545,11 @@ func TestLiveStreamFileProxyAndRecordingPathTraversal(t *testing.T) {
 		t.Fatalf("expected proxied live stream, got %d %q", w.Code, w.Body.String())
 	}
 
-	// 2. LiveStreamFiles with unknown ID falls back to MPEG-TS null packet
+	// 2. LiveStreamFiles with unknown ID returns 404 Not Found
 	w = httptest.NewRecorder()
 	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/LiveTv/LiveStreamFiles/unknown-id/stream.ts", nil))
-	if w.Code != http.StatusOK || len(w.Body.Bytes()) != len(tsNullPacket) {
-		t.Fatalf("expected null packet fallback, got %d len=%d", w.Code, len(w.Body.Bytes()))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown live stream ID, got %d body=%q", w.Code, w.Body.String())
 	}
 
 	// 3. LiveRecordings path traversal & symlink escape blocked with 403

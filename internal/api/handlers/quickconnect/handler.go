@@ -222,13 +222,40 @@ func (h *Handler) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 
 	q := httpx.ParseQuery(r)
 	code := strings.TrimSpace(q.Get("code"))
-	if code == "" && r.Body != nil {
+	requestedUserID := strings.TrimSpace(q.Get("userId"))
+	if (code == "" || requestedUserID == "") && r.Body != nil {
 		var body struct {
-			Code string `json:"Code"`
+			Code   string `json:"Code"`
+			UserId string `json:"UserId"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
-			code = strings.TrimSpace(body.Code)
+			if code == "" {
+				code = strings.TrimSpace(body.Code)
+			}
+			if requestedUserID == "" {
+				requestedUserID = strings.TrimSpace(body.UserId)
+			}
 		}
+	}
+
+	targetUserID := callerID
+	if normReq := guid.Normalize(requestedUserID); normReq != "" && normReq != callerID {
+		ac, ok := middleware.AuthFromContext(r.Context())
+		if !ok || ac == nil || !ac.IsAdmin() {
+			httpx.Error(w, http.StatusForbidden, "admin privileges required to authorize for another user")
+			return
+		}
+		if h.userRepo != nil {
+			if _, err := h.userRepo.GetUserByID(r.Context(), normReq); err != nil {
+				if errors.Is(err, sqlite.ErrNotFound) {
+					httpx.Error(w, http.StatusNotFound, "target user not found")
+					return
+				}
+				httpx.Error(w, http.StatusInternalServerError, "failed to load target user")
+				return
+			}
+		}
+		targetUserID = normReq
 	}
 
 	now := h.now()
@@ -254,7 +281,7 @@ func (h *Handler) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entry.userID = callerID
+	entry.userID = targetUserID
 	entry.result.Authenticated = true
 	delete(h.byCode, code)
 	delete(h.failedAttempts, callerID)

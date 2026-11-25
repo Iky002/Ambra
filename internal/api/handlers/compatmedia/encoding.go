@@ -439,9 +439,14 @@ func (h *Handler) handleAddVirtualFolderPath(w http.ResponseWriter, r *http.Requ
 }
 
 func (h *Handler) handleUpdateVirtualFolderPath(w http.ResponseWriter, r *http.Request) {
+	q := httpx.ParseQuery(r)
 	var body struct {
-		Id       string `json:"Id"`
-		Name     string `json:"Name"`
+		Id       string   `json:"Id"`
+		Name     string   `json:"Name"`
+		OldPath  string   `json:"OldPath"`
+		NewPath  string   `json:"NewPath"`
+		Path     string   `json:"Path"`
+		Paths    []string `json:"Paths"`
 		PathInfo struct {
 			Path        string `json:"Path"`
 			NetworkPath string `json:"NetworkPath"`
@@ -450,13 +455,82 @@ func (h *Handler) handleUpdateVirtualFolderPath(w http.ResponseWriter, r *http.R
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 	}
-	if body.Id == "" && body.Name == "" {
+	id := nonEmpty(q.Get("id"), body.Id)
+	name := nonEmpty(q.Get("name"), body.Name)
+	if id == "" && name == "" {
 		httpx.NoContent(w)
 		return
 	}
-	if lib, err := h.findLibraryByIDOrName(r, body.Id, body.Name); err == nil && body.PathInfo.Path != "" {
-		if updated, addErr := h.repo.AddLibraryPath(r.Context(), lib.ID, body.PathInfo.Path); addErr == nil && h.watcher != nil && updated != nil {
-			_ = h.watcher.WatchLibrary(updated.ID, updated.Paths)
+	lib, err := h.findLibraryByIDOrName(r, id, name)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		httpx.Error(w, http.StatusNotFound, "library not found")
+		return
+	}
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var updatedPaths []string
+	oldPath := nonEmpty(q.Get("oldPath"), body.OldPath)
+	newPath := nonEmpty(q.Get("newPath"), body.NewPath, body.PathInfo.Path, body.Path)
+
+	switch {
+	case len(body.Paths) > 0:
+		seen := make(map[string]bool, len(body.Paths))
+		for _, p := range body.Paths {
+			if p = strings.TrimSpace(p); p != "" && !seen[p] {
+				seen[p] = true
+				updatedPaths = append(updatedPaths, p)
+			}
+		}
+	case oldPath != "" && newPath != "":
+		replaced := false
+		seen := make(map[string]bool, len(lib.Paths)+1)
+		for _, p := range lib.Paths {
+			target := p
+			if p == oldPath {
+				target = newPath
+				replaced = true
+			}
+			if target != "" && !seen[target] {
+				seen[target] = true
+				updatedPaths = append(updatedPaths, target)
+			}
+		}
+		if !replaced && !seen[newPath] {
+			updatedPaths = append(updatedPaths, newPath)
+		}
+	case newPath != "":
+		if len(lib.Paths) == 1 {
+			updatedPaths = []string{newPath}
+		} else {
+			updatedPaths = append([]string(nil), lib.Paths...)
+			exists := false
+			for _, p := range updatedPaths {
+				if p == newPath {
+					exists = true
+					break
+				}
+			}
+			if !exists {
+				updatedPaths = append(updatedPaths, newPath)
+			}
+		}
+	default:
+		httpx.NoContent(w)
+		return
+	}
+
+	if err := h.saveLibraryPaths(r, lib.ID, updatedPaths); err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if h.watcher != nil {
+		if len(updatedPaths) == 0 {
+			_ = h.watcher.UnwatchLibrary(lib.ID)
+		} else {
+			_ = h.watcher.WatchLibrary(lib.ID, updatedPaths)
 		}
 	}
 	httpx.NoContent(w)
@@ -530,22 +604,28 @@ func (h *Handler) handleUpdateVirtualFolderOptions(w http.ResponseWriter, r *htt
 func (h *Handler) handleListArtists(albumArtistsOnly bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := httpx.ParseQuery(r)
+		userID := h.resolveUserID(r, q)
+		allowed := h.allowedLibrariesForRequest(r, userID)
+		maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 		types := []string{"MusicArtist"}
 		if !albumArtistsOnly {
 			types = append(types, "Artist")
 		}
 		items, total, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
-			ServerID:         h.serverID(),
-			UserID:           h.resolveUserID(r, q),
-			ParentID:         q.Get("ParentId"),
-			Recursive:        true,
-			IncludeItemTypes: types,
-			SearchTerm:       q.Get("SearchTerm"),
-			SortBy:           q.List("SortBy"),
-			SortOrder:        q.Get("SortOrder"),
-			StartIndex:       q.Int("StartIndex", 0),
-			Limit:            q.Int("Limit", 0),
-			Fields:           q.List("Fields"),
+			ServerID:          h.serverID(),
+			UserID:            userID,
+			ParentID:          q.Get("ParentId"),
+			AllowedLibraryIDs: allowed,
+			MaxParentalRating: maxRating,
+			BlockedTags:       blockedTags,
+			Recursive:         true,
+			IncludeItemTypes:  types,
+			SearchTerm:        q.Get("SearchTerm"),
+			SortBy:            q.List("SortBy"),
+			SortOrder:         q.Get("SortOrder"),
+			StartIndex:        q.Int("StartIndex", 0),
+			Limit:             q.Int("Limit", 0),
+			Fields:            q.List("Fields"),
 		})
 		if err != nil {
 			httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -746,15 +826,21 @@ func (h *Handler) handlePersonCredits(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleAudioBooksNextUp(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
-	items, total, err := h.repo.GetResumeItems(
+	userID := h.resolveUserID(r, q)
+	allowed := h.allowedLibrariesForRequest(r, userID)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	items, total, err := h.repo.GetResumeItemsWithPolicy(
 		r.Context(),
 		h.serverID(),
-		h.resolveUserID(r, q),
+		userID,
 		q.Get("ParentId"),
 		[]string{"AudioBook"},
 		q.Int("StartIndex", 0),
 		q.Int("Limit", 20),
 		q.List("Fields"),
+		allowed,
+		maxRating,
+		blockedTags,
 	)
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -768,24 +854,99 @@ func (h *Handler) handleAudioBooksNextUp(w http.ResponseWriter, r *http.Request)
 
 func (h *Handler) handleChannelLatestItems(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
-	items, total, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
-		ServerID:         h.serverID(),
-		UserID:           h.resolveUserID(r, q),
-		ParentID:         q.Get("ChannelIds"),
-		Recursive:        true,
-		IncludeItemTypes: []string{"ChannelVideoItem", "ChannelAudioItem", "Video", "Audio"},
-		SortBy:           []string{"DateCreated"},
-		SortOrder:        "Descending",
-		StartIndex:       q.Int("StartIndex", 0),
-		Limit:            q.Int("Limit", 20),
-		Fields:           q.List("Fields"),
-	})
-	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+	channelIDs := q.List("ChannelIds")
+	if len(channelIDs) == 0 {
+		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
+			Items:            []dto.BaseItemDto{},
+			TotalRecordCount: 0,
+		})
 		return
 	}
+	userID := h.resolveUserID(r, q)
+	allowed := h.allowedLibrariesForRequest(r, userID)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	startIndex := q.Int("StartIndex", 0)
+	limit := q.Int("Limit", 20)
+	fields := q.List("Fields")
+
+	if len(channelIDs) == 1 {
+		items, total, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
+			ServerID:          h.serverID(),
+			UserID:            userID,
+			ParentID:          channelIDs[0],
+			AllowedLibraryIDs: allowed,
+			MaxParentalRating: maxRating,
+			BlockedTags:       blockedTags,
+			Recursive:         true,
+			IncludeItemTypes:  []string{"ChannelVideoItem", "ChannelAudioItem", "Video", "Audio"},
+			SortBy:            []string{"DateCreated"},
+			SortOrder:         "Descending",
+			StartIndex:        startIndex,
+			Limit:             limit,
+			Fields:            fields,
+		})
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
+			Items:            items,
+			TotalRecordCount: total,
+		})
+		return
+	}
+
+	seen := make(map[string]bool)
+	merged := make([]dto.BaseItemDto, 0)
+	for _, cid := range channelIDs {
+		part, _, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
+			ServerID:          h.serverID(),
+			UserID:            userID,
+			ParentID:          cid,
+			AllowedLibraryIDs: allowed,
+			MaxParentalRating: maxRating,
+			BlockedTags:       blockedTags,
+			Recursive:         true,
+			IncludeItemTypes:  []string{"ChannelVideoItem", "ChannelAudioItem", "Video", "Audio"},
+			SortBy:            []string{"DateCreated"},
+			SortOrder:         "Descending",
+			Fields:            fields,
+		})
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		for _, it := range part {
+			if !seen[it.Id] {
+				seen[it.Id] = true
+				merged = append(merged, it)
+			}
+		}
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		ti, tj := merged[i].DateCreated, merged[j].DateCreated
+		if ti == nil && tj == nil {
+			return false
+		}
+		if ti == nil {
+			return false
+		}
+		if tj == nil {
+			return true
+		}
+		return ti.After(*tj)
+	})
+	total := len(merged)
+	if startIndex > len(merged) {
+		merged = []dto.BaseItemDto{}
+	} else if startIndex > 0 {
+		merged = merged[startIndex:]
+	}
+	if limit > 0 && len(merged) > limit {
+		merged = merged[:limit]
+	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
-		Items:            items,
+		Items:            merged,
 		TotalRecordCount: total,
 	})
 }
@@ -799,13 +960,25 @@ func (h *Handler) handleCollectionMissing(w http.ResponseWriter, _ *http.Request
 
 func (h *Handler) handleCollectionProviderItems(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	userID := h.resolveUserID(r, q)
+	allowed := h.allowedLibrariesForRequest(r, userID)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	startIndex := q.Int("StartIndex", 0)
+	limit := q.Int("Limit", 0)
+	needFilter := allowed != nil || maxRating != nil || len(blockedTags) > 0
+
+	fetchStart, fetchLimit := startIndex, limit
+	if needFilter {
+		fetchStart, fetchLimit = 0, 0
+	}
+
 	items, total, err := h.repo.GetContainerItems(
 		r.Context(),
 		h.serverID(),
-		h.resolveUserID(r, q),
+		userID,
 		chi.URLParam(r, "Id"),
-		q.Int("StartIndex", 0),
-		q.Int("Limit", 0),
+		fetchStart,
+		fetchLimit,
 		q.List("Fields"),
 	)
 	if errors.Is(err, sqlite.ErrNotFound) {
@@ -819,48 +992,142 @@ func (h *Handler) handleCollectionProviderItems(w http.ResponseWriter, r *http.R
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if needFilter {
+		filtered := make([]sqlite.PlaylistItemDto, 0, len(items))
+		for _, it := range items {
+			rec, recErr := h.repo.GetItemRecordByID(r.Context(), it.Id)
+			if recErr != nil || rec == nil {
+				continue
+			}
+			if allowed != nil && rec.LibraryID != "" && !isLibraryAllowed(rec.LibraryID, allowed) {
+				continue
+			}
+			if maxRating != nil || len(blockedTags) > 0 {
+				if blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags); bErr != nil || blocked {
+					continue
+				}
+			}
+			filtered = append(filtered, it)
+		}
+		total = len(filtered)
+		if startIndex > len(filtered) {
+			filtered = []sqlite.PlaylistItemDto{}
+		} else if startIndex > 0 {
+			filtered = filtered[startIndex:]
+		}
+		if limit > 0 && len(filtered) > limit {
+			filtered = filtered[:limit]
+		}
+		items = filtered
+	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[sqlite.PlaylistItemDto]{
 		Items:            items,
 		TotalRecordCount: total,
 	})
 }
 
-func (h *Handler) handleContainerItemsDelete(w http.ResponseWriter, r *http.Request) {
-	containerID := guid.Normalize(chi.URLParam(r, "Id"))
-	q := httpx.ParseQuery(r)
-	ids := q.List("Ids")
-	if len(ids) == 0 {
-		ids = q.List("EntryIds")
-	}
-	if len(ids) == 0 && r.Body != nil {
-		var body struct {
-			Ids      []string `json:"Ids"`
-			EntryIds []string `json:"EntryIds"`
+func (h *Handler) handleContainerItemsDelete(expectedType string, checkOwner bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		containerID := guid.Normalize(chi.URLParam(r, "Id"))
+		rec, err := h.repo.GetItemRecordByID(r.Context(), containerID)
+		if errors.Is(err, sqlite.ErrNotFound) {
+			httpx.Error(w, http.StatusNotFound, "container not found")
+			return
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		if len(body.Ids) > 0 {
-			ids = body.Ids
-		} else {
-			ids = body.EntryIds
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
 		}
+		if !strings.EqualFold(rec.Type, expectedType) {
+			httpx.Error(w, http.StatusNotFound, "container not found")
+			return
+		}
+		if checkOwner {
+			callerID, isAdmin := h.callerIdentity(r)
+			if callerID != "" || isAdmin {
+				if !isAdmin {
+					ownerID := guid.Normalize(rec.ParentID)
+					if ownerID == "" || callerID != ownerID {
+						httpx.Error(w, http.StatusForbidden, "forbidden")
+						return
+					}
+				}
+			}
+		}
+
+		q := httpx.ParseQuery(r)
+		ids := q.List("Ids")
+		if len(ids) == 0 {
+			ids = q.List("EntryIds")
+		}
+		if len(ids) == 0 && r.Body != nil {
+			var body struct {
+				Ids      []string `json:"Ids"`
+				EntryIds []string `json:"EntryIds"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if len(body.Ids) > 0 {
+				ids = body.Ids
+			} else {
+				ids = body.EntryIds
+			}
+		}
+		if _, err := h.repo.RemoveItemsFromContainer(r.Context(), containerID, ids); errors.Is(err, sqlite.ErrNotFound) {
+			httpx.Error(w, http.StatusNotFound, "container not found")
+			return
+		} else if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		httpx.NoContent(w)
 	}
-	if _, err := h.repo.RemoveItemsFromContainer(r.Context(), containerID, ids); errors.Is(err, sqlite.ErrNotFound) {
-		httpx.Error(w, http.StatusNotFound, "container not found")
-		return
-	} else if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	httpx.NoContent(w)
 }
 
 func (h *Handler) handleAddToPlaylistInfo(w http.ResponseWriter, r *http.Request) {
 	playlistID := guid.Normalize(chi.URLParam(r, "Id"))
 	q := httpx.ParseQuery(r)
-	items, _, err := h.repo.GetContainerItems(r.Context(), h.serverID(), h.resolveUserID(r, q), playlistID, 0, 0, nil)
+	userID := h.resolveUserID(r, q)
+	allowed := h.allowedLibrariesForRequest(r, userID)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+
+	if rec, err := h.repo.GetItemRecordByID(r.Context(), playlistID); err == nil && rec != nil {
+		if strings.EqualFold(rec.Type, "Playlist") {
+			callerID, isAdmin := h.callerIdentity(r)
+			if (callerID != "" || isAdmin) && !isAdmin {
+				ownerID := guid.Normalize(rec.ParentID)
+				if ownerID != "" && ownerID != callerID {
+					var vis struct {
+						IsPublic bool `json:"IsPublic"`
+					}
+					ok, _ := h.getConfigJSON(r.Context(), "item_visibility_"+rec.ID, &vis)
+					if !ok || !vis.IsPublic {
+						httpx.Error(w, http.StatusForbidden, "forbidden")
+						return
+					}
+				}
+			}
+		}
+	}
+
+	items, _, err := h.repo.GetContainerItems(r.Context(), h.serverID(), userID, playlistID, 0, 0, nil)
 	existing := make(map[string]bool)
 	if err == nil {
+		needFilter := allowed != nil || maxRating != nil || len(blockedTags) > 0
 		for _, it := range items {
+			if needFilter {
+				itemRec, recErr := h.repo.GetItemRecordByID(r.Context(), it.Id)
+				if recErr != nil || itemRec == nil {
+					continue
+				}
+				if allowed != nil && itemRec.LibraryID != "" && !isLibraryAllowed(itemRec.LibraryID, allowed) {
+					continue
+				}
+				if maxRating != nil || len(blockedTags) > 0 {
+					if blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), itemRec, maxRating, blockedTags); bErr != nil || blocked {
+						continue
+					}
+				}
+			}
 			existing[it.Id] = true
 		}
 	}
@@ -872,32 +1139,55 @@ func (h *Handler) handleAddToPlaylistInfo(w http.ResponseWriter, r *http.Request
 		}
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
-		"ItemCount":           len(requested),
-		"ContainsDuplicates":  dups > 0,
-		"DuplicateCount":      dups,
+		"ItemCount":          len(requested),
+		"ContainsDuplicates": dups > 0,
+		"DuplicateCount":     dups,
 	})
 }
 
 func (h *Handler) handleShowsUpcoming(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
-	items, total, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
-		ServerID:         h.serverID(),
-		UserID:           h.resolveUserID(r, q),
-		ParentID:         q.Get("ParentId"),
-		Recursive:        true,
-		IncludeItemTypes: []string{"Episode"},
-		SortBy:           []string{"PremiereDate", "DateCreated"},
-		SortOrder:        "Descending",
-		StartIndex:       q.Int("StartIndex", 0),
-		Limit:            q.Int("Limit", 20),
-		Fields:           q.List("Fields"),
+	userID := h.resolveUserID(r, q)
+	allowed := h.allowedLibrariesForRequest(r, userID)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	startIndex := q.Int("StartIndex", 0)
+	limit := q.Int("Limit", 20)
+
+	items, _, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
+		ServerID:          h.serverID(),
+		UserID:            userID,
+		ParentID:          q.Get("ParentId"),
+		AllowedLibraryIDs: allowed,
+		MaxParentalRating: maxRating,
+		BlockedTags:       blockedTags,
+		Recursive:         true,
+		IncludeItemTypes:  []string{"Episode"},
+		SortBy:            []string{"PremiereDate", "DateCreated"},
+		SortOrder:         "Ascending",
+		Fields:            q.List("Fields"),
 	})
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	now := time.Now().UTC()
+	upcoming := make([]dto.BaseItemDto, 0)
+	for _, it := range items {
+		if it.PremiereDate != nil && !it.PremiereDate.Before(now) {
+			upcoming = append(upcoming, it)
+		}
+	}
+	total := len(upcoming)
+	if startIndex > len(upcoming) {
+		upcoming = []dto.BaseItemDto{}
+	} else if startIndex > 0 {
+		upcoming = upcoming[startIndex:]
+	}
+	if limit > 0 && len(upcoming) > limit {
+		upcoming = upcoming[:limit]
+	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
-		Items:            items,
+		Items:            upcoming,
 		TotalRecordCount: total,
 	})
 }

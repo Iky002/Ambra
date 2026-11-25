@@ -89,9 +89,11 @@ type managedTask struct {
 
 // Manager orchestrates scheduled and manually-triggered background tasks.
 type Manager struct {
-	mu    sync.RWMutex
-	tasks map[string]*managedTask
-	bus   *eventbus.Bus
+	mu           sync.RWMutex
+	tasks        map[string]*managedTask
+	bus          *eventbus.Bus
+	loadTriggers func(ctx context.Context) (map[string][]TaskTriggerInfo, error)
+	saveTriggers func(ctx context.Context, triggers map[string][]TaskTriggerInfo) error
 }
 
 func New(bus *eventbus.Bus) *Manager {
@@ -99,6 +101,44 @@ func New(bus *eventbus.Bus) *Manager {
 		tasks: make(map[string]*managedTask),
 		bus:   bus,
 	}
+}
+
+// SetTriggerStore configures optional callbacks used to persist custom task triggers across restarts.
+func (m *Manager) SetTriggerStore(
+	load func(ctx context.Context) (map[string][]TaskTriggerInfo, error),
+	save func(ctx context.Context, triggers map[string][]TaskTriggerInfo) error,
+) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.loadTriggers = load
+	m.saveTriggers = save
+}
+
+// LoadPersistedTriggers loads saved custom triggers from the configured trigger store
+// and applies them to registered tasks.
+func (m *Manager) LoadPersistedTriggers(ctx context.Context) error {
+	m.mu.RLock()
+	loadFn := m.loadTriggers
+	m.mu.RUnlock()
+	if loadFn == nil {
+		return nil
+	}
+	persisted, err := loadFn(ctx)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, triggers := range persisted {
+		mt := m.findLocked(id)
+		if mt == nil {
+			continue
+		}
+		cp := make([]TaskTriggerInfo, len(triggers))
+		copy(cp, triggers)
+		mt.def.Triggers = cp
+	}
+	return nil
 }
 
 // Register adds or replaces a task definition in the scheduler.
@@ -353,17 +393,39 @@ func (m *Manager) Stop(id string) error {
 	return nil
 }
 
-// SetTriggers replaces the trigger schedule for a task.
+// SetTriggers replaces the trigger schedule for a task and persists it when a trigger store is configured.
 func (m *Manager) SetTriggers(id string, triggers []TaskTriggerInfo) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	mt := m.findLocked(id)
 	if mt == nil {
+		m.mu.Unlock()
 		return ErrTaskNotFound
 	}
+	prev := mt.def.Triggers
 	cp := make([]TaskTriggerInfo, len(triggers))
 	copy(cp, triggers)
 	mt.def.Triggers = cp
+
+	saveFn := m.saveTriggers
+	var snapshot map[string][]TaskTriggerInfo
+	if saveFn != nil {
+		snapshot = make(map[string][]TaskTriggerInfo, len(m.tasks))
+		for taskID, task := range m.tasks {
+			tCopy := make([]TaskTriggerInfo, len(task.def.Triggers))
+			copy(tCopy, task.def.Triggers)
+			snapshot[taskID] = tCopy
+		}
+	}
+	m.mu.Unlock()
+
+	if saveFn != nil {
+		if err := saveFn(context.Background(), snapshot); err != nil {
+			m.mu.Lock()
+			mt.def.Triggers = prev
+			m.mu.Unlock()
+			return err
+		}
+	}
 	return nil
 }
 

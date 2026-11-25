@@ -144,6 +144,11 @@ func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "failed to save configuration")
 		return
 	}
+	if country := strings.TrimSpace(req.Country); country != "" && h.userRepo != nil {
+		extra := h.loadExtraConfig(r.Context())
+		extra["MetadataCountryCode"] = strings.ToUpper(country)
+		_ = h.saveExtraConfig(r.Context(), extra)
+	}
 	if tmdbLangChanged {
 		h.syncTMDBPlugin()
 	}

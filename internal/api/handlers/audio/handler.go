@@ -109,10 +109,21 @@ func (h *Handler) canAccessItem(r *http.Request, itemID string) bool {
 		return true
 	}
 	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
-	if err != nil || rec == nil || rec.LibraryID == "" {
+	if err != nil || rec == nil {
 		return true
 	}
-	return h.CanAccessLibrary(r.Context(), callerID, rec.LibraryID)
+	if rec.LibraryID != "" && !h.CanAccessLibrary(r.Context(), callerID, rec.LibraryID) {
+		return false
+	}
+	u, err := h.userRepo.GetUserByID(r.Context(), callerID)
+	if err != nil || u == nil || u.IsAdmin || u.Policy.IsAdministrator {
+		return true
+	}
+	blocked, err := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, u.Policy.MaxParentalRating, u.Policy.BlockedTags)
+	if err != nil {
+		return false
+	}
+	return !blocked
 }
 
 // RegisterRoutes mounts all /Audio/* endpoints on mux.
@@ -212,10 +223,17 @@ func (h *Handler) handleUniversal(w http.ResponseWriter, r *http.Request, urlExt
 		targetBitrate = 192_000
 	}
 
-	h.streamTranscodeAudio(w, r, mediaPath, targetContainer, q.Get("AudioCodec"), targetBitrate)
+	startTimeTicks := q.Int64("StartTimeTicks", 0)
+	audioChannels := q.Int("AudioChannels", 0)
+	if audioChannels <= 0 {
+		audioChannels = q.Int("MaxAudioChannels", 0)
+	}
+	audioSampleRate := q.Int("AudioSampleRate", 0)
+
+	h.streamTranscodeAudio(w, r, mediaPath, targetContainer, q.Get("AudioCodec"), targetBitrate, startTimeTicks, audioChannels, audioSampleRate)
 }
 
-func (h *Handler) streamTranscodeAudio(w http.ResponseWriter, r *http.Request, mediaPath, targetContainer, targetCodec string, bitrate int) {
+func (h *Handler) streamTranscodeAudio(w http.ResponseWriter, r *http.Request, mediaPath, targetContainer, targetCodec string, bitrate int, startTimeTicks int64, audioChannels, audioSampleRate int) {
 	if _, err := os.Stat(mediaPath); err != nil {
 		if os.IsNotExist(err) {
 			httpx.Error(w, http.StatusNotFound, "audio file missing on disk")
@@ -238,15 +256,7 @@ func (h *Handler) streamTranscodeAudio(w http.ResponseWriter, r *http.Request, m
 		ffmpegPath = h.cfg.FFmpegPath
 	}
 
-	args := []string{
-		"-hide_banner", "-loglevel", "error",
-		"-i", mediaPath,
-		"-vn",
-		"-c:a", encoder,
-		"-b:a", strconv.Itoa(bitrate),
-		"-f", muxFmt,
-		"pipe:1",
-	}
+	args := buildAudioFFmpegArgs(mediaPath, muxFmt, encoder, bitrate, startTimeTicks, audioChannels, audioSampleRate)
 	cmd := exec.CommandContext(r.Context(), ffmpegPath, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -261,6 +271,31 @@ func (h *Handler) streamTranscodeAudio(w http.ResponseWriter, r *http.Request, m
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, stdout)
 	_ = cmd.Wait()
+}
+
+func buildAudioFFmpegArgs(mediaPath, muxFmt, encoder string, bitrate int, startTimeTicks int64, audioChannels, audioSampleRate int) []string {
+	args := []string{"-hide_banner", "-loglevel", "error"}
+	if startTimeTicks > 0 {
+		secs := float64(startTimeTicks) / float64(ticksPerSecond)
+		args = append(args, "-ss", strconv.FormatFloat(secs, 'f', 3, 64))
+	}
+	args = append(args,
+		"-i", mediaPath,
+		"-vn",
+		"-c:a", encoder,
+		"-b:a", strconv.Itoa(bitrate),
+	)
+	if audioChannels > 0 {
+		args = append(args, "-ac", strconv.Itoa(audioChannels))
+	}
+	if audioSampleRate > 0 {
+		args = append(args, "-ar", strconv.Itoa(audioSampleRate))
+	}
+	if muxFmt == "mp4" {
+		args = append(args, "-movflags", "frag_keyframe+empty_moov")
+	}
+	args = append(args, "-f", muxFmt, "pipe:1")
+	return args
 }
 
 func (h *Handler) handleLyrics(w http.ResponseWriter, r *http.Request) {
@@ -362,7 +397,7 @@ func resolveAudioTranscodeTarget(container, codec string) (contentType, muxFmt, 
 	case "aac", "adts":
 		return "audio/aac", "adts", "aac"
 	case "m4a", "mp4":
-		return "audio/aac", "adts", "aac"
+		return "audio/mp4", "mp4", "aac"
 	case "ogg", "opus":
 		if strings.EqualFold(codec, "vorbis") {
 			return "audio/ogg", "ogg", "libvorbis"

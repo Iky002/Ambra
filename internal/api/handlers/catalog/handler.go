@@ -94,6 +94,32 @@ func (h *Handler) resolveUserID(r *http.Request, q httpx.Query) string {
 	return ""
 }
 
+func (h *Handler) canAccessUserData(r *http.Request, targetUserID string) bool {
+	targetID := guid.Normalize(targetUserID)
+	if targetID == "" {
+		return true
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		return ac.IsAdmin() || guid.Normalize(ac.UserID()) == targetID
+	}
+	if h.auth.UserIDFromCtx != nil {
+		callerID := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if callerID != "" {
+			if callerID == targetID {
+				return true
+			}
+			if h.userRepo != nil {
+				if u, err := h.userRepo.GetUserByID(r.Context(), callerID); err == nil && u != nil {
+					return u.IsAdmin || u.Policy.IsAdministrator
+				}
+			}
+			return false
+		}
+	}
+	// Unit tests without auth context
+	return true
+}
+
 func (h *Handler) allowedLibrariesForRequest(r *http.Request, fallbackUserID string) []string {
 	if h.userRepo == nil {
 		return nil
@@ -182,6 +208,10 @@ type queryFilters2Response struct {
 
 func (h *Handler) handleItemsFilters(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
@@ -211,6 +241,10 @@ func (h *Handler) handleItemsFilters(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleItemsFilters2(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
@@ -237,6 +271,10 @@ func (h *Handler) handleItemsFilters2(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleMovieRecommendations(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
@@ -260,6 +298,10 @@ func (h *Handler) handleMovieRecommendations(w http.ResponseWriter, r *http.Requ
 
 func (h *Handler) handleSimilar(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
@@ -286,6 +328,10 @@ func (h *Handler) handleSimilar(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleInstantMix(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
@@ -313,6 +359,10 @@ func (h *Handler) handleInstantMix(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleItemsByType(itemTypes []string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := httpx.ParseQuery(r)
+		if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+			httpx.Error(w, http.StatusForbidden, "forbidden")
+			return
+		}
 		userID := h.resolveUserID(r, q)
 		allowed := h.allowedLibrariesForRequest(r, userID)
 		maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
@@ -347,6 +397,10 @@ func (h *Handler) handleItemsByType(itemTypes []string) http.HandlerFunc {
 
 func (h *Handler) handleChannelItems(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
@@ -378,6 +432,10 @@ func (h *Handler) handleChannelItems(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleFilterDimension(dimension string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := httpx.ParseQuery(r)
+		if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+			httpx.Error(w, http.StatusForbidden, "forbidden")
+			return
+		}
 		userID := h.resolveUserID(r, q)
 		allowed := h.allowedLibrariesForRequest(r, userID)
 		maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)

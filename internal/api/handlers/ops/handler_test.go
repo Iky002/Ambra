@@ -435,13 +435,8 @@ func TestOpenAPIGenericUIPartiesAndConnect(t *testing.T) {
 		t.Fatalf("expected 400, got %d", r.Code)
 	}
 	res = doReq(t, mux, http.MethodPost, "/Connect/Exchange", map[string]any{"ConnectUserId": "connect-u1"})
-	if res.Code != http.StatusOK {
-		t.Fatalf("POST /Connect/Exchange status=%d", res.Code)
-	}
-	var ex ConnectExchangeResult
-	_ = json.Unmarshal(res.Body.Bytes(), &ex)
-	if ex.LocalUserId != "admin1" || ex.AccessToken == "" {
-		t.Fatalf("unexpected exchange result: %+v", ex)
+	if res.Code != http.StatusUnauthorized {
+		t.Fatalf("POST /Connect/Exchange expected 401, got %d", res.Code)
 	}
 
 	// Join/Leave/Exchange without UserIDFromCtx
@@ -454,8 +449,8 @@ func TestOpenAPIGenericUIPartiesAndConnect(t *testing.T) {
 	if r := doReq(t, noAuthMux, http.MethodPost, "/Parties/p1/Leave", map[string]any{}); r.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 when no UserId, got %d", r.Code)
 	}
-	if r := doReq(t, noAuthMux, http.MethodPost, "/Connect/Exchange?ConnectUserId=cu-99", nil); r.Code != http.StatusOK {
-		t.Fatalf("expected 200 on query ConnectUserId, got %d", r.Code)
+	if r := doReq(t, noAuthMux, http.MethodPost, "/Connect/Exchange?ConnectUserId=cu-99", nil); r.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on unlinked ConnectUserId, got %d", r.Code)
 	}
 }
 

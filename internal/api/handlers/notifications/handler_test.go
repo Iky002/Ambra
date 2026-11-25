@@ -2,13 +2,17 @@ package notifications
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/ambra-media/ambra/internal/api/middleware"
+	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -287,5 +291,102 @@ func TestNotificationsIDORAndPerUserReadBy(t *testing.T) {
 	reloaded := New(st)
 	if len(reloaded.state.Items) != 1 || !containsString(reloaded.state.Items[0].ReadBy, "user2") || containsString(reloaded.state.Items[0].ReadBy, "user1") {
 		t.Fatalf("unexpected persisted ReadBy: %+v", reloaded.state.Items)
+	}
+}
+
+func TestNotificationsIsReadFilterCapAndEventBus(t *testing.T) {
+	h, mux, _ := setupNotifTest(t)
+
+	// Send 2 notifications for user-1, mark 1 read
+	r1 := doReq(t, mux, http.MethodPost, "/Notifications/Admin", map[string]any{"Name": "N1", "UserId": "user-1"})
+	r2 := doReq(t, mux, http.MethodPost, "/Notifications/Admin", map[string]any{"Name": "N2", "UserId": "user-1"})
+	var n1, n2 Notification
+	_ = json.Unmarshal(r1.Body.Bytes(), &n1)
+	_ = json.Unmarshal(r2.Body.Bytes(), &n2)
+	_ = doReq(t, mux, http.MethodPost, "/Notifications/user-1/Read?Ids="+n1.Id, nil)
+
+	// IsRead=true returns only N1
+	rec := doReq(t, mux, http.MethodGet, "/Notifications/user-1?IsRead=true", nil)
+	var readRes NotificationResult
+	_ = json.Unmarshal(rec.Body.Bytes(), &readRes)
+	if readRes.TotalRecordCount != 1 || readRes.Notifications[0].Id != n1.Id {
+		t.Fatalf("expected only read notification N1, got %+v", readRes)
+	}
+
+	// IsRead=false returns only N2
+	rec = doReq(t, mux, http.MethodGet, "/Notifications/user-1?IsRead=false", nil)
+	var unreadRes NotificationResult
+	_ = json.Unmarshal(rec.Body.Bytes(), &unreadRes)
+	if unreadRes.TotalRecordCount != 1 || unreadRes.Notifications[0].Id != n2.Id {
+		t.Fatalf("expected only unread notification N2, got %+v", unreadRes)
+	}
+
+	// SubscribeEvents: nil bus safe, real bus receives LibraryChanged, TaskProgress(Failed), UserDataChanged
+	h.SubscribeEvents(nil)
+	bus := eventbus.New()
+	h.SubscribeEvents(bus)
+
+	bus.Publish(context.Background(), eventbus.Event{
+		Type: eventbus.EventLibraryChanged,
+		Payload: map[string]any{
+			"ItemsAdded":   3,
+			"ItemsUpdated": 1,
+			"ItemsDeleted": 0,
+		},
+	})
+	bus.Publish(context.Background(), eventbus.Event{
+		Type: eventbus.EventTaskProgress,
+		Payload: map[string]any{
+			"Name":  "Scan Library",
+			"State": "Idle",
+			"LastExecutionResult": map[string]any{
+				"Status":       "Failed",
+				"ErrorMessage": "disk read error",
+			},
+		},
+	})
+	bus.Publish(context.Background(), eventbus.Event{
+		Type: eventbus.EventUserDataChanged,
+		Payload: map[string]any{
+			"UserId":      "user-1",
+			"Name":        "User Event",
+			"Description": "Custom user alert",
+			"Level":       "Warning",
+		},
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		h.mu.RLock()
+		n := len(h.state.Items)
+		h.mu.RUnlock()
+		if n >= 5 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	h.mu.RLock()
+	gotCount := len(h.state.Items)
+	h.mu.RUnlock()
+	if gotCount < 5 {
+		t.Fatalf("expected >=5 notifications after eventbus events, got %d", gotCount)
+	}
+
+	// Cap at 500 entries
+	for i := 0; i < 510; i++ {
+		h.appendNotification(context.Background(), Notification{
+			Name:  fmt.Sprintf("Bulk-%d", i),
+			Level: "Normal",
+		})
+	}
+	h.mu.RLock()
+	finalLen := len(h.state.Items)
+	newestName := h.state.Items[0].Name
+	h.mu.RUnlock()
+	if finalLen != maxNotifications {
+		t.Fatalf("expected notifications capped at %d, got %d", maxNotifications, finalLen)
+	}
+	if newestName != "Bulk-509" {
+		t.Fatalf("expected newest notification Bulk-509, got %q", newestName)
 	}
 }

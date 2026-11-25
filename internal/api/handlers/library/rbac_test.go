@@ -303,26 +303,23 @@ func TestSpoofedUserIDCannotBypassEnabledFolders(t *testing.T) {
 		return rec
 	}
 
-	// Spoofing adminUser.ID in path/query must NOT bypass restrictedUser's EnabledFolders!
-	rec := get("/Users/" + adminUser.ID + "/Views")
+	// Spoofing adminUser.ID in /Users/{UserId}/... paths must be rejected with 403!
+	if rec := get("/Users/" + adminUser.ID + "/Views"); rec.Code != http.StatusForbidden {
+		t.Fatalf("spoofed Views expected 403, got %d", rec.Code)
+	}
+	if rec := get("/Users/" + adminUser.ID + "/Items?Recursive=true&IncludeItemTypes=Movie"); rec.Code != http.StatusForbidden {
+		t.Fatalf("spoofed Items expected 403, got %d", rec.Code)
+	}
+	if rec := get("/Users/" + adminUser.ID + "/Items/Resume"); rec.Code != http.StatusForbidden {
+		t.Fatalf("spoofed Resume expected 403, got %d", rec.Code)
+	}
+
+	// Self-access still respects restrictedUser's EnabledFolders
+	rec := get("/Users/" + restrictedUser.ID + "/Views")
 	var views dto.QueryResult[dto.BaseItemDto]
 	_ = json.Unmarshal(rec.Body.Bytes(), &views)
 	if views.TotalRecordCount != 1 || views.Items[0].Id != libA.ID {
-		t.Fatalf("spoofed Views bypassed EnabledFolders: %+v", views)
-	}
-
-	rec = get("/Users/" + adminUser.ID + "/Items?Recursive=true&IncludeItemTypes=Movie")
-	var itemsRes dto.QueryResult[dto.BaseItemDto]
-	_ = json.Unmarshal(rec.Body.Bytes(), &itemsRes)
-	if itemsRes.TotalRecordCount != 1 || itemsRes.Items[0].Id != movieA.ID {
-		t.Fatalf("spoofed Items bypassed EnabledFolders: %+v", itemsRes)
-	}
-
-	rec = get("/Users/" + adminUser.ID + "/Items/Resume")
-	var resumeRes dto.QueryResult[dto.BaseItemDto]
-	_ = json.Unmarshal(rec.Body.Bytes(), &resumeRes)
-	if resumeRes.TotalRecordCount != 1 || resumeRes.Items[0].Id != movieA.ID {
-		t.Fatalf("spoofed Resume bypassed EnabledFolders: %+v", resumeRes)
+		t.Fatalf("restricted Views expected libA only: %+v", views)
 	}
 
 	rec = get("/Library/VirtualFolders?UserId=" + adminUser.ID)

@@ -342,3 +342,106 @@ func TestQuickConnectPerIPRateLimitAndEdgeCases(t *testing.T) {
 		t.Fatalf("clientIP empty = %q", got)
 	}
 }
+
+func TestQuickConnectAdminAuthorizeForAnotherUser(t *testing.T) {
+	_, mux, authSvc, alice, _ := setupQuickConnectTest(t)
+	ctx := context.Background()
+
+	admin, err := authSvc.CreateUser(ctx, "admin", "adminpass", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminLogin, err := authSvc.AuthenticateByName(ctx, admin.Name, "adminpass", "", auth.ClientInfo{DeviceID: "admin-phone"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliceLogin, err := authSvc.AuthenticateByName(ctx, alice.Name, "secret123", "", auth.ClientInfo{DeviceID: "alice-phone"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	initiate := func() QuickConnectResult {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/QuickConnect/Initiate", nil))
+		var res QuickConnectResult
+		_ = json.Unmarshal(rec.Body.Bytes(), &res)
+		return res
+	}
+
+	// 1. Non-admin trying to authorize for admin -> 403
+	s1 := initiate()
+	req := httptest.NewRequest(http.MethodPost, "/QuickConnect/Authorize?code="+s1.Code+"&userId="+admin.ID, nil)
+	req.Header.Set("X-Emby-Token", aliceLogin.AccessToken)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("non-admin authorize for another user expected 403, got %d", rec.Code)
+	}
+
+	// 2. Admin trying to authorize for nonexistent user -> 404
+	req = httptest.NewRequest(http.MethodPost, "/QuickConnect/Authorize?code="+s1.Code+"&userId=does-not-exist", nil)
+	req.Header.Set("X-Emby-Token", adminLogin.AccessToken)
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("admin authorize for missing user expected 404, got %d", rec.Code)
+	}
+
+	// 3. Admin authorizing on behalf of alice via JSON body -> 200 and redeems as alice
+	body, _ := json.Marshal(map[string]string{"Code": s1.Code, "UserId": alice.ID})
+	req = httptest.NewRequest(http.MethodPost, "/QuickConnect/Authorize", bytes.NewReader(body))
+	req.Header.Set("X-Emby-Token", adminLogin.AccessToken)
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin authorize for alice expected 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	redeemBody, _ := json.Marshal(map[string]string{"Secret": s1.Secret})
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/Users/AuthenticateWithQuickConnect", bytes.NewReader(redeemBody)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("redeem expected 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	var qcAuth dto.AuthenticationResult
+	_ = json.Unmarshal(rec.Body.Bytes(), &qcAuth)
+	if qcAuth.User.Id != alice.ID {
+		t.Fatalf("expected redeemed user to be alice (%s), got %s", alice.ID, qcAuth.User.Id)
+	}
+
+	// 4. Admin authorizing via query params (?code=...&userId=...) also works
+	s2 := initiate()
+	req = httptest.NewRequest(http.MethodPost, "/QuickConnect/Authorize?code="+s2.Code+"&userId="+alice.ID, nil)
+	req.Header.Set("X-Emby-Token", adminLogin.AccessToken)
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin query authorize for alice expected 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	// 5. Default clock, nil RequireAuth passthrough, AuthFromContext fallback, and maxPendingSessions guard
+	hDefault := New(authSvc, nil, nil)
+	if hDefault.now().IsZero() {
+		t.Fatal("expected non-zero default clock")
+	}
+	muxDefault := http.NewServeMux()
+	hDefault.RegisterRoutes(muxDefault, AuthFuncs{})
+	reqCtx := httptest.NewRequest(http.MethodPost, "/QuickConnect/Authorize?code=999999", nil)
+	reqCtx = reqCtx.WithContext(middleware.WithAuthContext(reqCtx.Context(), &middleware.AuthContext{User: alice}))
+	rec = httptest.NewRecorder()
+	muxDefault.ServeHTTP(rec, reqCtx)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 via AuthFromContext fallback, got %d", rec.Code)
+	}
+	hDefault.mu.Lock()
+	for i := 0; i < maxPendingSessions; i++ {
+		k := string(rune('a'+i%26)) + time.Now().Format("150405") + string(rune(i))
+		hDefault.bySecret[k] = &pendingSession{expiresAt: time.Now().UTC().Add(time.Hour)}
+	}
+	hDefault.mu.Unlock()
+	rec = httptest.NewRecorder()
+	muxDefault.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/QuickConnect/Initiate", nil))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 when maxPendingSessions reached, got %d", rec.Code)
+	}
+}

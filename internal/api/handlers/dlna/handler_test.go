@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"image/png"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
@@ -642,5 +644,131 @@ func TestHelpersAndNilDependencies(t *testing.T) {
 		if got := audioMimeType(k); got != want {
 			t.Fatalf("audioMimeType(%s)=%s want %s", k, got, want)
 		}
+	}
+}
+
+func TestDLNASearchSortCriteriaAndPNGDimensions(t *testing.T) {
+	_, mux, libRepo, _ := setupDLNATestEnv(t)
+	ctx := context.Background()
+
+	// 1. Verify PNG icon actual dimensions match description.xml (120x120)
+	req := httptest.NewRequest(http.MethodGet, "/Dlna/icons/logo120.png", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET logo120.png status=%d", rec.Code)
+	}
+	imgCfg, err := png.DecodeConfig(bytes.NewReader(rec.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("decode png config: %v", err)
+	}
+	if imgCfg.Width != 120 || imgCfg.Height != 120 {
+		t.Fatalf("expected 120x120 PNG icon, got %dx%d", imgCfg.Width, imgCfg.Height)
+	}
+
+	// 2. Seed libraries and items with distinct names & dates
+	movieLib, err := libRepo.CreateLibrary(ctx, "Movies", "movies", []string{"/media/movies"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	musicLib, err := libRepo.CreateLibrary(ctx, "Audio", "music", []string{"/media/music"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d2010 := time.Date(2010, 7, 16, 0, 0, 0, 0, time.UTC).Unix()
+	d2023 := time.Date(2023, 7, 21, 0, 0, 0, 0, time.UTC).Unix()
+	y2010, y2023 := 2010, 2023
+
+	_ = libRepo.UpsertItem(ctx, &sqlite.ItemRecord{
+		LibraryID:      movieLib.ID,
+		ParentID:       movieLib.ID,
+		Type:           "Movie",
+		MediaType:      "Video",
+		Name:           "Alpha Movie",
+		SortName:       "Alpha Movie",
+		Container:      "mp4",
+		ProductionYear: &y2010,
+		PremiereDate:   &d2010,
+	})
+	_ = libRepo.UpsertItem(ctx, &sqlite.ItemRecord{
+		LibraryID:      movieLib.ID,
+		ParentID:       movieLib.ID,
+		Type:           "Movie",
+		MediaType:      "Video",
+		Name:           "Zulu Inception",
+		SortName:       "Zulu Inception",
+		Container:      "mkv",
+		ProductionYear: &y2023,
+		PremiereDate:   &d2023,
+	})
+	_ = libRepo.UpsertItem(ctx, &sqlite.ItemRecord{
+		LibraryID: musicLib.ID,
+		ParentID:  musicLib.ID,
+		Type:      "Audio",
+		MediaType: "Audio",
+		Name:      "Inception OST",
+		SortName:  "Inception OST",
+		Container: "flac",
+	})
+
+	postSOAP := func(action, inner string) *httptest.ResponseRecorder {
+		body := `<?xml version="1.0" encoding="utf-8"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:` + action + ` xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">` + inner + `</u:` + action + `></s:Body></s:Envelope>`
+		req := httptest.NewRequest(http.MethodPost, "/Dlna/srv/contentdirectory/control", strings.NewReader(body))
+		req.Host = "127.0.0.1:8096"
+		req.Header.Set("SOAPACTION", `"urn:schemas-upnp-org:service:ContentDirectory:1#`+action+`"`)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 3. Browse with -dc:title -> Zulu before Alpha
+	rec = postSOAP("Browse", "<ObjectID>"+movieLib.ID+"</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><StartingIndex>0</StartingIndex><RequestedCount>10</RequestedCount><SortCriteria>-dc:title</SortCriteria>")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Browse -dc:title status=%d", rec.Code)
+	}
+	bDesc := rec.Body.String()
+	if strings.Index(bDesc, "Zulu Inception") > strings.Index(bDesc, "Alpha Movie") {
+		t.Fatalf("expected Zulu Inception before Alpha Movie for -dc:title, got %s", bDesc)
+	}
+
+	// 4. Browse with +dc:date -> 2010 Alpha before 2023 Zulu; -dc:date -> 2023 Zulu before 2010 Alpha
+	rec = postSOAP("Browse", "<ObjectID>"+movieLib.ID+"</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><StartingIndex>0</StartingIndex><RequestedCount>10</RequestedCount><SortCriteria>+dc:date</SortCriteria>")
+	bDateAsc := rec.Body.String()
+	if strings.Index(bDateAsc, "Alpha Movie") > strings.Index(bDateAsc, "Zulu Inception") {
+		t.Fatalf("expected Alpha Movie (2010) before Zulu Inception (2023) for +dc:date, got %s", bDateAsc)
+	}
+	rec = postSOAP("Browse", "<ObjectID>"+movieLib.ID+"</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><StartingIndex>0</StartingIndex><RequestedCount>10</RequestedCount><SortCriteria>-dc:date</SortCriteria>")
+	bDateDesc := rec.Body.String()
+	if strings.Index(bDateDesc, "Zulu Inception") > strings.Index(bDateDesc, "Alpha Movie") {
+		t.Fatalf("expected Zulu Inception (2023) before Alpha Movie (2010) for -dc:date, got %s", bDateDesc)
+	}
+
+	// 5. Browse root "0" with -dc:title -> Movies before Audio
+	rec = postSOAP("Browse", "<ObjectID>0</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><StartingIndex>0</StartingIndex><RequestedCount>10</RequestedCount><SortCriteria>-dc:title</SortCriteria>")
+	bRootDesc := rec.Body.String()
+	if strings.Index(bRootDesc, "Movies") > strings.Index(bRootDesc, "Audio") {
+		t.Fatalf("expected Movies before Audio for root -dc:title, got %s", bRootDesc)
+	}
+
+	// 6. Search by dc:title
+	rec = postSOAP("Search", `<ContainerID>0</ContainerID><SearchCriteria>dc:title contains "Inception"</SearchCriteria><StartingIndex>0</StartingIndex><RequestedCount>10</RequestedCount><SortCriteria>+dc:title</SortCriteria>`)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "<TotalMatches>2</TotalMatches>") ||
+		!strings.Contains(rec.Body.String(), "Zulu Inception") || !strings.Contains(rec.Body.String(), "Inception OST") {
+		t.Fatalf("Search by dc:title unexpected: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 7. Search by upnp:class (audio only)
+	rec = postSOAP("Search", `<ContainerID>0</ContainerID><SearchCriteria>upnp:class derivedfrom "object.item.audioItem"</SearchCriteria><StartingIndex>0</StartingIndex><RequestedCount>10</RequestedCount>`)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "<TotalMatches>1</TotalMatches>") ||
+		!strings.Contains(rec.Body.String(), "Inception OST") {
+		t.Fatalf("Search by upnp:class audio unexpected: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 8. Search combined dc:title + upnp:class scoped to movieLib
+	rec = postSOAP("Search", `<ContainerID>`+movieLib.ID+`</ContainerID><SearchCriteria>(dc:title contains "Inception") and (upnp:class derivedfrom "object.item.videoItem.movie")</SearchCriteria><StartingIndex>0</StartingIndex><RequestedCount>10</RequestedCount>`)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "<TotalMatches>1</TotalMatches>") ||
+		!strings.Contains(rec.Body.String(), "Zulu Inception") {
+		t.Fatalf("Search combined unexpected: %d %s", rec.Code, rec.Body.String())
 	}
 }

@@ -11,6 +11,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
 // Mirror structures for reading/updating shared sync:state stored in server_config.
@@ -242,20 +243,71 @@ func (h *Handler) handleSyncJobItemFile(headOnly bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "Id")
 		var st sharedSyncState
-		if h.readConfigJSON(r.Context(), syncConfigKey, &st) {
-			for _, it := range st.JobItems {
-				if it.Id == id && it.OutputPath != "" {
-					if fi, err := os.Stat(it.OutputPath); err == nil && !fi.IsDir() {
-						http.ServeFile(w, r, it.OutputPath)
-						return
-					}
-				}
+		if !h.readConfigJSON(r.Context(), syncConfigKey, &st) {
+			if headOnly {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			httpx.Error(w, http.StatusNotFound, "sync job item not found")
+			return
+		}
+
+		var found *sharedSyncJobItem
+		for i := range st.JobItems {
+			if st.JobItems[i].Id == id {
+				found = &st.JobItems[i]
+				break
 			}
 		}
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Content-Length", "0")
-		w.WriteHeader(http.StatusOK)
-		_ = headOnly
+		if found == nil {
+			if headOnly {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			httpx.Error(w, http.StatusNotFound, "sync job item not found")
+			return
+		}
+
+		callerID, isAdmin := h.callerIdentity(r)
+		if !isAdmin && callerID != "" {
+			var ownerID string
+			for _, j := range st.Jobs {
+				if j.Id == found.JobId {
+					ownerID = guid.Normalize(j.UserId)
+					break
+				}
+			}
+			if ownerID == "" || ownerID != callerID {
+				if headOnly {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				httpx.Error(w, http.StatusForbidden, "access denied")
+				return
+			}
+		}
+
+		outPath := strings.TrimSpace(found.OutputPath)
+		if outPath == "" {
+			if headOnly {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			httpx.Error(w, http.StatusNotFound, "sync file not available")
+			return
+		}
+		fi, err := os.Stat(outPath)
+		if err != nil || fi.IsDir() {
+			if headOnly {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			httpx.Error(w, http.StatusNotFound, "sync file not found")
+			return
+		}
+		http.ServeFile(w, r, outPath)
 	}
 }
 
@@ -292,7 +344,66 @@ func (h *Handler) handleSyncOfflineActions(w http.ResponseWriter, r *http.Reques
 				h.mu.Lock()
 				h.state.OfflineActions = append(h.state.OfflineActions, actions...)
 				h.saveStateLocked(r.Context())
+				libRepo := h.libRepo
+				userRepo := h.userRepo
 				h.mu.Unlock()
+
+				if libRepo != nil {
+					callerID, isAdmin := h.callerIdentity(r)
+					if userRepo == nil && h.store != nil {
+						userRepo = sqlite.NewUserRepo(h.store)
+					}
+					for _, act := range actions {
+						itemID := strings.TrimSpace(act.ItemId)
+						if itemID == "" {
+							continue
+						}
+						uid := callerID
+						if uid == "" || (isAdmin && strings.TrimSpace(act.UserId) != "") {
+							if normActUser := guid.Normalize(act.UserId); normActUser != "" {
+								uid = normActUser
+							}
+						}
+						if uid == "" {
+							continue
+						}
+
+						markedPlayed := false
+						if act.Played != nil {
+							if *act.Played {
+								_, _ = libRepo.MarkPlayed(r.Context(), uid, itemID)
+								markedPlayed = true
+							} else {
+								_, _ = libRepo.MarkUnplayed(r.Context(), uid, itemID)
+							}
+						} else if strings.EqualFold(act.Type, "Played") {
+							_, _ = libRepo.MarkPlayed(r.Context(), uid, itemID)
+							markedPlayed = true
+						} else if strings.EqualFold(act.Type, "Unplayed") {
+							_, _ = libRepo.MarkUnplayed(r.Context(), uid, itemID)
+						}
+
+						pos := act.PlaybackPositionTicks
+						if pos <= 0 {
+							pos = act.PositionTicks
+						}
+						if pos > 0 && !markedPlayed && userRepo != nil {
+							_, _ = userRepo.UpsertPlaybackProgress(r.Context(), uid, itemID, pos, false, nil, nil)
+						}
+
+						if act.IsFavorite != nil {
+							if *act.IsFavorite {
+								_, _ = libRepo.MarkFavorite(r.Context(), uid, itemID)
+							} else {
+								_, _ = libRepo.UnmarkFavorite(r.Context(), uid, itemID)
+							}
+						} else if strings.EqualFold(act.Type, "Favorite") {
+							_, _ = libRepo.MarkFavorite(r.Context(), uid, itemID)
+						} else if strings.EqualFold(act.Type, "Unfavorite") {
+							_, _ = libRepo.UnmarkFavorite(r.Context(), uid, itemID)
+						}
+					}
+				}
 			}
 		}
 	}
@@ -302,11 +413,20 @@ func (h *Handler) handleSyncOfflineActions(w http.ResponseWriter, r *http.Reques
 func (h *Handler) handleGetConfiguredNotifications(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := guid.Normalize(q.Get("UserId"))
+	callerID, isAdmin := h.callerIdentity(r)
+
+	if !isAdmin && callerID != "" {
+		if userID != "" && userID != callerID {
+			httpx.Error(w, http.StatusForbidden, "access denied")
+			return
+		}
+		userID = callerID
+	}
 
 	h.mu.RLock()
 	out := make([]NotificationServiceConfig, 0, len(h.state.NotificationServices))
 	for _, svc := range h.state.NotificationServices {
-		if userID != "" && svc.UserId != "" && guid.Normalize(svc.UserId) != userID {
+		if userID != "" && guid.Normalize(svc.UserId) != userID {
 			continue
 		}
 		out = append(out, svc)
@@ -324,20 +444,34 @@ func (h *Handler) handleSaveConfiguredNotification(w http.ResponseWriter, r *htt
 			return
 		}
 	}
+
+	callerID, isAdmin := h.callerIdentity(r)
+	if !isAdmin && callerID != "" {
+		if strings.TrimSpace(svc.UserId) != "" && guid.Normalize(svc.UserId) != callerID {
+			httpx.Error(w, http.StatusForbidden, "access denied")
+			return
+		}
+		svc.UserId = callerID
+	} else if strings.TrimSpace(svc.UserId) == "" && callerID != "" {
+		svc.UserId = callerID
+	}
+
 	if strings.TrimSpace(svc.Id) == "" {
 		svc.Id = guid.New()
 	}
 	if strings.TrimSpace(svc.Name) == "" {
 		svc.Name = "Notification Service"
 	}
-	if svc.UserId == "" && h.auth.UserIDFromCtx != nil {
-		svc.UserId = h.auth.UserIDFromCtx(r.Context())
-	}
 
 	h.mu.Lock()
 	updated := false
 	for i := range h.state.NotificationServices {
 		if h.state.NotificationServices[i].Id == svc.Id {
+			if !isAdmin && callerID != "" && guid.Normalize(h.state.NotificationServices[i].UserId) != callerID {
+				h.mu.Unlock()
+				httpx.Error(w, http.StatusForbidden, "access denied")
+				return
+			}
 			h.state.NotificationServices[i] = svc
 			updated = true
 			break
@@ -375,12 +509,19 @@ func (h *Handler) handleTestNotificationService(w http.ResponseWriter, r *http.R
 func (h *Handler) handleDeleteConfiguredNotification(w http.ResponseWriter, r *http.Request) {
 	id := extractIDParam(r)
 	if id != "" {
+		callerID, isAdmin := h.callerIdentity(r)
 		h.mu.Lock()
 		filtered := make([]NotificationServiceConfig, 0, len(h.state.NotificationServices))
 		for _, svc := range h.state.NotificationServices {
-			if svc.Id != id {
-				filtered = append(filtered, svc)
+			if svc.Id == id {
+				if !isAdmin && callerID != "" && guid.Normalize(svc.UserId) != callerID {
+					h.mu.Unlock()
+					httpx.Error(w, http.StatusForbidden, "access denied")
+					return
+				}
+				continue
 			}
+			filtered = append(filtered, svc)
 		}
 		h.state.NotificationServices = filtered
 		h.saveStateLocked(r.Context())
