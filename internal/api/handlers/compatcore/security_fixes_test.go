@@ -113,18 +113,24 @@ func TestUserPrivilegeEscalationAndIDORBlocked(t *testing.T) {
 		}
 	}
 
-	// 4. GET /Connect/Exchange requires auth (401 without token) and returns caller's own ID (not users[0])
+	// 4. GET /Connect/Exchange requires auth (401 without token) and valid Connect link (401 when unlinked, 200 after linking)
 	if rec := doAuthReq("", http.MethodGet, "/Connect/Exchange?ConnectUserId=c1", ""); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for unauthenticated GET /Connect/Exchange, got %d", rec.Code)
 	}
+	if rec := doAuthReq(guestAuth.AccessToken, http.MethodGet, "/Connect/Exchange?ConnectUserId=c1", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unlinked GET /Connect/Exchange, got %d", rec.Code)
+	}
+	if rec := doAuthReq(guestAuth.AccessToken, http.MethodPost, "/Users/"+env.user2.ID+"/Connect/Link?ConnectUsername=c1", ""); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 linking connect user, got %d", rec.Code)
+	}
 	exRec := doAuthReq(guestAuth.AccessToken, http.MethodGet, "/Connect/Exchange?ConnectUserId=c1", "")
 	if exRec.Code != http.StatusOK {
-		t.Fatalf("expected 200 for authenticated GET /Connect/Exchange, got %d", exRec.Code)
+		t.Fatalf("expected 200 for linked GET /Connect/Exchange, got %d (%s)", exRec.Code, exRec.Body.String())
 	}
 	var exBody map[string]any
 	_ = json.Unmarshal(exRec.Body.Bytes(), &exBody)
-	if exBody["LocalUserId"] != env.user2.ID {
-		t.Fatalf("expected LocalUserId=%s, got %v", env.user2.ID, exBody["LocalUserId"])
+	if exBody["LocalUserId"] != env.user2.ID || exBody["AccessToken"] != guestAuth.AccessToken {
+		t.Fatalf("expected LocalUserId=%s and real AccessToken, got %v", env.user2.ID, exBody)
 	}
 
 	// 5. GET /Users/Query returns only caller's own record for non-admin, all users for admin

@@ -146,3 +146,77 @@ func TestBuiltinTasksAllBranches(t *testing.T) {
 		t.Fatalf("expected Failed on closed DB, got %+v", o3.LastExecutionResult)
 	}
 }
+
+func TestTriggerStorePersistenceAndReload(t *testing.T) {
+	persisted := make(map[string][]TaskTriggerInfo)
+	var saveErr error
+	var loadErr error
+
+	loadFn := func(_ context.Context) (map[string][]TaskTriggerInfo, error) {
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		out := make(map[string][]TaskTriggerInfo, len(persisted))
+		for k, v := range persisted {
+			cp := make([]TaskTriggerInfo, len(v))
+			copy(cp, v)
+			out[k] = cp
+		}
+		return out, nil
+	}
+	saveFn := func(_ context.Context, triggers map[string][]TaskTriggerInfo) error {
+		if saveErr != nil {
+			return saveErr
+		}
+		persisted = make(map[string][]TaskTriggerInfo, len(triggers))
+		for k, v := range triggers {
+			cp := make([]TaskTriggerInfo, len(v))
+			copy(cp, v)
+			persisted[k] = cp
+		}
+		return nil
+	}
+
+	mgr := New(nil)
+	// LoadPersistedTriggers is a no-op without store
+	if err := mgr.LoadPersistedTriggers(context.Background()); err != nil {
+		t.Fatalf("expected nil without store, got %v", err)
+	}
+
+	mgr.Register(TaskDefinition{ID: "t1", Name: "Task 1", Category: "Test"})
+	mgr.SetTriggerStore(loadFn, saveFn)
+
+	ticks := int64(7200_0000000)
+	if err := mgr.SetTriggers("t1", []TaskTriggerInfo{{Type: "IntervalTrigger", IntervalTicks: &ticks}}); err != nil {
+		t.Fatalf("SetTriggers failed: %v", err)
+	}
+
+	// Simulate save error -> triggers should roll back
+	saveErr = errors.New("disk full")
+	if err := mgr.SetTriggers("t1", []TaskTriggerInfo{}); !errors.Is(err, saveErr) {
+		t.Fatalf("expected save error, got %v", err)
+	}
+	info, _ := mgr.Get("t1")
+	if len(info.Triggers) != 1 || *info.Triggers[0].IntervalTicks != ticks {
+		t.Fatalf("expected rollback on save error, got %+v", info.Triggers)
+	}
+	saveErr = nil
+
+	// Simulate server restart with fresh manager
+	mgr2 := New(nil)
+	mgr2.Register(TaskDefinition{ID: "t1", Name: "Task 1", Category: "Test"})
+	mgr2.SetTriggerStore(loadFn, saveFn)
+	if err := mgr2.LoadPersistedTriggers(context.Background()); err != nil {
+		t.Fatalf("LoadPersistedTriggers failed: %v", err)
+	}
+	restored, _ := mgr2.Get("t1")
+	if len(restored.Triggers) != 1 || restored.Triggers[0].Type != "IntervalTrigger" || *restored.Triggers[0].IntervalTicks != ticks {
+		t.Fatalf("expected persisted trigger restored, got %+v", restored.Triggers)
+	}
+
+	// Load error propagates
+	loadErr = errors.New("read error")
+	if err := mgr2.LoadPersistedTriggers(context.Background()); !errors.Is(err, loadErr) {
+		t.Fatalf("expected load error, got %v", err)
+	}
+}

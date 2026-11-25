@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -22,14 +23,22 @@ import (
 func (h *Handler) postSystemRestart(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	h.restartRequested = true
+	cb := h.onRestart
 	h.mu.Unlock()
+	if cb != nil {
+		go cb()
+	}
 	httpx.NoContent(w)
 }
 
 func (h *Handler) postSystemShutdown(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	h.shutdownRequested = true
+	cb := h.onShutdown
 	h.mu.Unlock()
+	if cb != nil {
+		go cb()
+	}
 	httpx.NoContent(w)
 }
 
@@ -90,17 +99,43 @@ func (h *Handler) getSystemReleaseNotes(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+func storageFolderInfo(path string) map[string]any {
+	info := map[string]any{"Path": path}
+	probe := path
+	for probe != "" {
+		var st syscall.Statfs_t
+		if err := syscall.Statfs(probe, &st); err == nil {
+			bsize := uint64(st.Bsize)
+			total := st.Blocks * bsize
+			free := st.Bavail * bsize
+			var used uint64
+			if total >= free {
+				used = total - free
+			}
+			info["FreeSpace"] = free
+			info["UsedSpace"] = used
+			return info
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			break
+		}
+		probe = parent
+	}
+	return info
+}
+
 func (h *Handler) getSystemStorageInfo(w http.ResponseWriter, r *http.Request) {
 	dataDir := "./data"
 	if h.cfg != nil && h.cfg.DataDir != "" {
 		dataDir = h.cfg.DataDir
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
-		"ProgramDataFolder":     map[string]any{"Path": dataDir},
-		"CacheFolder":           map[string]any{"Path": filepath.Join(dataDir, "cache")},
-		"LogFolder":             map[string]any{"Path": filepath.Join(dataDir, "logs")},
-		"InternalMetadataFolder": map[string]any{"Path": filepath.Join(dataDir, "metadata")},
-		"TranscodingTempFolder": map[string]any{"Path": filepath.Join(dataDir, "cache", "transcoding-temp")},
+		"ProgramDataFolder":      storageFolderInfo(dataDir),
+		"CacheFolder":            storageFolderInfo(filepath.Join(dataDir, "cache")),
+		"LogFolder":              storageFolderInfo(filepath.Join(dataDir, "logs")),
+		"InternalMetadataFolder": storageFolderInfo(filepath.Join(dataDir, "metadata")),
+		"TranscodingTempFolder":  storageFolderInfo(filepath.Join(dataDir, "cache", "transcoding-temp")),
 	})
 }
 
@@ -312,6 +347,12 @@ func (h *Handler) postPartiesMessages(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) deleteRunningScheduledTask(w http.ResponseWriter, r *http.Request) {
 	taskID := strings.TrimSpace(chi.URLParam(r, "Id"))
 	if taskID != "" {
+		h.mu.RLock()
+		stopFn := h.taskStopper
+		h.mu.RUnlock()
+		if stopFn != nil {
+			stopFn(taskID)
+		}
 		_ = h.saveKV(r.Context(), "scheduled_task:stopped:"+taskID, map[string]any{
 			"Id":        taskID,
 			"StoppedAt": time.Now().UTC().Format(time.RFC3339),

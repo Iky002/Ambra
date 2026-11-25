@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -12,11 +13,15 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/middleware"
+	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
-const stateConfigKey = "notifications:state"
+const (
+	stateConfigKey   = "notifications:state"
+	maxNotifications = 500
+)
 
 // AuthFuncs decouples route registration from the concrete middleware package.
 type AuthFuncs struct {
@@ -180,6 +185,7 @@ func (h *Handler) handleListByUser(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusForbidden, "cannot access another user's notifications")
 		return
 	}
+	isReadFilter := q.Bool("IsRead")
 
 	h.mu.RLock()
 	matched := make([]Notification, 0, len(h.state.Items))
@@ -187,6 +193,9 @@ func (h *Handler) handleListByUser(w http.ResponseWriter, r *http.Request) {
 		if n.UserId == "" || guid.Normalize(n.UserId) == userID {
 			item := n
 			item.IsRead = isReadForUser(n, userID)
+			if isReadFilter != nil && item.IsRead != *isReadFilter {
+				continue
+			}
 			if len(n.ReadBy) > 0 {
 				item.ReadBy = append([]string(nil), n.ReadBy...)
 			}
@@ -309,12 +318,117 @@ func (h *Handler) handleSendAdmin(w http.ResponseWriter, r *http.Request) {
 		Level:       level,
 	}
 
-	h.mu.Lock()
-	h.state.Items = append([]Notification{n}, h.state.Items...)
-	h.saveStateLocked(r.Context())
-	h.mu.Unlock()
+	h.appendNotification(r.Context(), n)
 
 	httpx.JSON(w, http.StatusOK, n)
+}
+
+func (h *Handler) appendNotification(ctx context.Context, n Notification) {
+	if n.Id == "" {
+		n.Id = guid.New()
+	}
+	if n.Date.IsZero() {
+		n.Date = time.Now().UTC()
+	}
+	n.Level = normalizeLevel(n.Level)
+
+	h.mu.Lock()
+	h.state.Items = append([]Notification{n}, h.state.Items...)
+	if len(h.state.Items) > maxNotifications {
+		h.state.Items = h.state.Items[:maxNotifications]
+	}
+	h.saveStateLocked(ctx)
+	h.mu.Unlock()
+}
+
+// SubscribeEvents subscribes the notifications handler to system eventbus events
+// (library changes, scheduled task failures, and user data events).
+func (h *Handler) SubscribeEvents(bus *eventbus.Bus) {
+	if bus == nil {
+		return
+	}
+	bus.Subscribe(eventbus.EventLibraryChanged, func(ctx context.Context, e eventbus.Event) {
+		desc := "Media library scan completed"
+		if m, ok := e.Payload.(map[string]any); ok {
+			added := toInt(m["ItemsAdded"])
+			updated := toInt(m["ItemsUpdated"])
+			deleted := toInt(m["ItemsDeleted"])
+			if added > 0 || updated > 0 || deleted > 0 {
+				desc = fmt.Sprintf("Library updated: %d added, %d updated, %d deleted", added, updated, deleted)
+			}
+		}
+		h.appendNotification(ctx, Notification{
+			Name:        "Library Updated",
+			Description: desc,
+			Level:       "Normal",
+		})
+	})
+
+	bus.Subscribe(eventbus.EventTaskProgress, func(ctx context.Context, e eventbus.Event) {
+		raw, err := json.Marshal(e.Payload)
+		if err != nil {
+			return
+		}
+		var task struct {
+			Name                string `json:"Name"`
+			State               string `json:"State"`
+			LastExecutionResult *struct {
+				Status       string `json:"Status"`
+				ErrorMessage string `json:"ErrorMessage"`
+			} `json:"LastExecutionResult"`
+		}
+		if err := json.Unmarshal(raw, &task); err != nil {
+			return
+		}
+		if task.LastExecutionResult != nil && strings.EqualFold(task.LastExecutionResult.Status, "Failed") {
+			name := strings.TrimSpace(task.Name)
+			if name == "" {
+				name = "Scheduled Task"
+			}
+			desc := strings.TrimSpace(task.LastExecutionResult.ErrorMessage)
+			if desc == "" {
+				desc = name + " failed"
+			}
+			h.appendNotification(ctx, Notification{
+				Name:        name + " Failed",
+				Description: desc,
+				Level:       "Error",
+			})
+		}
+	})
+
+	bus.Subscribe(eventbus.EventUserDataChanged, func(ctx context.Context, e eventbus.Event) {
+		m, ok := e.Payload.(map[string]any)
+		if !ok {
+			return
+		}
+		uid, _ := m["UserId"].(string)
+		name, _ := m["Name"].(string)
+		if strings.TrimSpace(name) == "" {
+			return
+		}
+		desc, _ := m["Description"].(string)
+		level, _ := m["Level"].(string)
+		h.appendNotification(ctx, Notification{
+			UserId:      guid.Normalize(uid),
+			Name:        strings.TrimSpace(name),
+			Description: strings.TrimSpace(desc),
+			Level:       level,
+		})
+	})
+}
+
+func toInt(v any) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	default:
+		return 0
+	}
 }
 
 func normalizeLevel(level string) string {

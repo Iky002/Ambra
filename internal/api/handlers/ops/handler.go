@@ -14,7 +14,6 @@ import (
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
-	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
@@ -142,14 +141,17 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	handleAdmin := func(pattern string, fn http.HandlerFunc) {
 		mux.Handle(pattern, wrapAdmin(fn))
 	}
+	handleSetupOrAdmin := func(pattern string, fn http.HandlerFunc) {
+		mux.Handle(pattern, h.requireSetupOrAdmin(wrapAdmin)(fn))
+	}
 
-	// Startup Wizard (accessible during setup / admin)
-	handleAdmin("GET /Startup/Configuration", h.handleGetStartupConfig)
-	handleAdmin("POST /Startup/Configuration", h.handleUpdateStartupConfig)
-	handleAdmin("GET /Startup/User", h.handleGetStartupUser)
-	handleAdmin("POST /Startup/User", h.handleUpdateStartupUser)
-	handleAdmin("POST /Startup/RemoteAccess", h.handleUpdateRemoteAccess)
-	handleAdmin("POST /Startup/Complete", h.handleStartupComplete)
+	// Startup Wizard (accessible unauthenticated during initial setup; requires admin once a user exists)
+	handleSetupOrAdmin("GET /Startup/Configuration", h.handleGetStartupConfig)
+	handleSetupOrAdmin("POST /Startup/Configuration", h.handleUpdateStartupConfig)
+	handleSetupOrAdmin("GET /Startup/User", h.handleGetStartupUser)
+	handleSetupOrAdmin("POST /Startup/User", h.handleUpdateStartupUser)
+	handleSetupOrAdmin("POST /Startup/RemoteAccess", h.handleUpdateRemoteAccess)
+	handleSetupOrAdmin("POST /Startup/Complete", h.handleStartupComplete)
 
 	// Packages
 	handleAuth("GET /Packages", h.handleListPackages)
@@ -192,6 +194,24 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	// Connect
 	handleAuth("GET /Connect/Pending", h.handleConnectPending)
 	handleAuth("POST /Connect/Exchange", h.handleConnectExchange)
+}
+
+func (h *Handler) requireSetupOrAdmin(wrapAdmin func(http.Handler) http.Handler) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		adminWrapped := wrapAdmin(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if h.userRepo == nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+			count, err := h.userRepo.CountUsers(r.Context())
+			if err == nil && count == 0 {
+				next.ServeHTTP(w, r)
+				return
+			}
+			adminWrapped.ServeHTTP(w, r)
+		})
+	}
 }
 
 func (h *Handler) serverID() string {
@@ -261,6 +281,10 @@ func (h *Handler) handleUIView(w http.ResponseWriter, r *http.Request) {
 	if pageID == "" {
 		pageID = "default"
 	}
+	h.mu.RLock()
+	serverName := h.state.Startup.ServerName
+	h.mu.RUnlock()
+
 	httpx.JSON(w, http.StatusOK, UIView{
 		PageId:   pageID,
 		ViewType: "RegularPage",
@@ -270,7 +294,7 @@ func (h *Handler) handleUIView(w http.ResponseWriter, r *http.Request) {
 				"Id":      "serverName",
 				"Type":    "TextInput",
 				"Caption": "Server Name",
-				"Value":   h.state.Startup.ServerName,
+				"Value":   serverName,
 			},
 		},
 	})
@@ -313,30 +337,21 @@ func (h *Handler) handleConnectPending(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleConnectExchange(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
-	connectUserID := q.Get("ConnectUserId")
+	connectUserID := strings.TrimSpace(q.Get("ConnectUserId"))
 	if connectUserID == "" && r.Body != nil {
 		var body struct {
 			ConnectUserId string `json:"ConnectUserId"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
-			connectUserID = body.ConnectUserId
+			connectUserID = strings.TrimSpace(body.ConnectUserId)
 		}
 	}
-	if strings.TrimSpace(connectUserID) == "" {
+	if connectUserID == "" {
 		httpx.Error(w, http.StatusBadRequest, "ConnectUserId is required")
 		return
 	}
-	localUserID := ""
-	if h.auth.UserIDFromCtx != nil {
-		localUserID = guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
-	}
-	if localUserID == "" {
-		localUserID = guid.Normalize(connectUserID)
-	}
-	httpx.JSON(w, http.StatusOK, ConnectExchangeResult{
-		LocalUserId: localUserID,
-		AccessToken: guid.New(),
-	})
+	// Ambra does not fabricate unpersisted Connect access tokens; require a valid linked Connect credential.
+	httpx.Error(w, http.StatusUnauthorized, "Emby Connect is not linked or credentials are invalid")
 }
 
 // --- Persistence ---

@@ -129,4 +129,53 @@ func TestLogsHandlerExtraBranches(t *testing.T) {
 	if len(lRes.Items) != 0 {
 		t.Fatalf("expected empty lines when StartIndex >= total")
 	}
+
+	// 4. GET /System/Logs/Log?name=... alias (both ?name= and ?Name=, missing name -> 400, traversal -> 400)
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/System/Logs/Log?name=a.log", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "l2") {
+		t.Fatalf("GET /System/Logs/Log?name=a.log failed: %d %q", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/System/Logs/Log?Name=b.log", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "b1") {
+		t.Fatalf("GET /System/Logs/Log?Name=b.log failed: %d %q", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/System/Logs/Log", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when name query param missing, got %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/System/Logs/Log?name=../secret.txt", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for traversal in /System/Logs/Log, got %d", rec.Code)
+	}
+
+	// 5. Empty DataDir fallback to ambra-runtime.log in GetLog, GetLogByQuery, and GetLogLines
+	hEmptyDir := New(&config.Config{DataDir: ""})
+	hEmptyDir.AppendRuntimeLog("in-memory-boot-line")
+	muxEmpty := http.NewServeMux()
+	hEmptyDir.RegisterRoutes(muxEmpty, AuthFuncs{})
+
+	rec = httptest.NewRecorder()
+	muxEmpty.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/System/Logs/"+defaultRuntimeLogName, nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "in-memory-boot-line") {
+		t.Fatalf("expected runtime log fallback with empty DataDir, got %d %q", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	muxEmpty.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/System/Logs/Log?name="+defaultRuntimeLogName, nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "in-memory-boot-line") {
+		t.Fatalf("expected /System/Logs/Log runtime fallback with empty DataDir, got %d %q", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	muxEmpty.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/System/Logs/"+defaultRuntimeLogName+"/Lines", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "in-memory-boot-line") {
+		t.Fatalf("expected GetLogLines runtime fallback with empty DataDir, got %d %q", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	muxEmpty.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/System/Logs/other.log", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown log with empty DataDir, got %d", rec.Code)
+	}
 }

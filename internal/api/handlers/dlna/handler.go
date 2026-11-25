@@ -1,11 +1,15 @@
 package dlna
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"net/http"
 	"path/filepath"
 	"sort"
@@ -551,15 +555,35 @@ const ambraLogoSVG = `<?xml version="1.0" encoding="UTF-8"?>
   <polygon points="44,32 92,60 44,88" fill="#38BDF8"/>
 </svg>`
 
-// ambraLogoPNG is a valid 1x1 PNG pixel for DLNA clients requesting PNG icons.
-var ambraLogoPNG = []byte{
-	0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
-	0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
-	0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-	0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
-	0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41,
-	0x54, 0x78, 0x9C, 0x63, 0x60, 0xF8, 0xCF, 0xC0,
-	0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD,
-	0x8D, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
-	0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+// ambraLogoPNG is a valid 120x120 24-bit RGB PNG matching the dimensions declared in description.xml.
+var ambraLogoPNG = buildAmbraLogoPNG()
+
+func buildAmbraLogoPNG() []byte {
+	const size = 120
+	img := image.NewRGBA(image.Rect(0, 0, size, size))
+	bg := color.RGBA{R: 0x1E, G: 0x29, B: 0x3B, A: 0xFF}
+	fg := color.RGBA{R: 0x38, G: 0xBD, B: 0xF8, A: 0xFF}
+
+	// Fill background and draw centered play triangle matching ambraLogoSVG: (44,32), (92,60), (44,88).
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			c := bg
+			if x >= 44 && y >= 32 && y <= 88 {
+				// Triangle right edge x(y) = 44 + (48 * (28 - |y - 60|)) / 28
+				dy := y - 60
+				if dy < 0 {
+					dy = -dy
+				}
+				maxX := 44 + (48*(28-dy))/28
+				if x <= maxX {
+					c = fg
+				}
+			}
+			img.SetRGBA(x, y, c)
+		}
+	}
+
+	var buf bytes.Buffer
+	_ = png.Encode(&buf, img)
+	return buf.Bytes()
 }

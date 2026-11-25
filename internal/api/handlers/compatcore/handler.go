@@ -73,6 +73,9 @@ type Handler struct {
 	remoteCommands    []remoteCommandRecord
 	restartRequested  bool
 	shutdownRequested bool
+	onRestart         func()
+	onShutdown        func()
+	taskStopper       func(id string) bool
 }
 
 // New constructs a compatcore Handler.
@@ -105,6 +108,21 @@ func (h *Handler) SetWSHub(hub WSSender) {
 // SetAuthService attaches the authentication service for password reset flows.
 func (h *Handler) SetAuthService(a *auth.Service) {
 	h.authSvc = a
+}
+
+// SetLifecycleHooks wires callbacks invoked asynchronously on /System/Restart and /System/Shutdown.
+func (h *Handler) SetLifecycleHooks(onRestart, onShutdown func()) {
+	h.mu.Lock()
+	h.onRestart = onRestart
+	h.onShutdown = onShutdown
+	h.mu.Unlock()
+}
+
+// SetTaskStopper wires a callback to stop a running scheduled task by ID.
+func (h *Handler) SetTaskStopper(stopFn func(id string) bool) {
+	h.mu.Lock()
+	h.taskStopper = stopFn
+	h.mu.Unlock()
 }
 
 // BuildRouter builds a chi.Router containing all 16 compatibility prefixes.

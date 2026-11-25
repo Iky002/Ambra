@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math/rand"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -214,6 +216,10 @@ func (h *Handler) userParentalPolicyForRequest(r *http.Request, fallbackUserID s
 }
 
 func (h *Handler) handleUserViews(w http.ResponseWriter, r *http.Request) {
+	if !h.canAccessUserData(r, r.PathValue("UserId")) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
@@ -278,6 +284,14 @@ func (h *Handler) libraryToViewDto(ctx context.Context, lib sqlite.LibraryRecord
 
 func (h *Handler) handleQueryItems(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	targetUID := r.PathValue("UserId")
+	if targetUID == "" {
+		targetUID = q.Get("UserId")
+	}
+	if targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 
 	rec := false
@@ -386,6 +400,10 @@ func (h *Handler) handleQueryItems(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleLatestItems(w http.ResponseWriter, r *http.Request) {
+	if !h.canAccessUserData(r, r.PathValue("UserId")) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
@@ -411,6 +429,10 @@ func (h *Handler) handleLatestItems(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleResumeItems(w http.ResponseWriter, r *http.Request) {
+	if !h.canAccessUserData(r, r.PathValue("UserId")) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
@@ -440,6 +462,14 @@ func (h *Handler) handleResumeItems(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleGetItem(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	targetUID := r.PathValue("UserId")
+	if targetUID == "" {
+		targetUID = q.Get("UserId")
+	}
+	if targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 	itemID := r.PathValue("Id")
 	allowed := h.allowedLibrariesForRequest(r, userID)
@@ -481,14 +511,70 @@ func (h *Handler) handleGetItem(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleItemCounts(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
-	counts, err := h.repo.GetItemCountsWithAllowedLibraries(r.Context(), allowed)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	isFav := q.Bool("IsFavorite")
+
+	if maxRating == nil && len(blockedTags) == 0 && isFav == nil {
+		counts, err := h.repo.GetItemCountsWithAllowedLibraries(r.Context(), allowed)
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		httpx.JSON(w, http.StatusOK, counts)
+		return
+	}
+
+	items, _, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
+		ServerID:          h.serverID(),
+		UserID:            userID,
+		AllowedLibraryIDs: allowed,
+		MaxParentalRating: maxRating,
+		BlockedTags:       blockedTags,
+		IsFavorite:        isFav,
+		Recursive:         true,
+	})
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	httpx.JSON(w, http.StatusOK, counts)
+	c := &sqlite.ItemCounts{}
+	for _, it := range items {
+		if it.ExtraType != "" {
+			continue
+		}
+		c.ItemCount++
+		switch it.Type {
+		case "Movie":
+			c.MovieCount++
+		case "Series":
+			c.SeriesCount++
+		case "Episode":
+			c.EpisodeCount++
+		case "MusicArtist":
+			c.ArtistCount++
+		case "Audio":
+			c.SongCount++
+		case "MusicAlbum":
+			c.AlbumCount++
+		case "MusicVideo":
+			c.MusicVideoCount++
+		case "BoxSet":
+			c.BoxSetCount++
+		case "Book":
+			c.BookCount++
+		case "Trailer":
+			c.TrailerCount++
+		case "Program":
+			c.ProgramCount++
+		}
+	}
+	httpx.JSON(w, http.StatusOK, c)
 }
 
 func (h *Handler) handleShowSeasons(w http.ResponseWriter, r *http.Request) {
@@ -541,6 +627,33 @@ func (h *Handler) handleShowEpisodes(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
+	sortBy := q.List("SortBy")
+	if len(sortBy) == 0 {
+		sortBy = []string{"IndexNumber"}
+	}
+	sortOrder := strings.TrimSpace(q.Get("SortOrder"))
+	if sortOrder == "" {
+		sortOrder = "Ascending"
+	}
+
+	var seasonFilter *int
+	if rawSeason := strings.TrimSpace(q.Get("Season")); rawSeason != "" {
+		if n, convErr := strconv.Atoi(rawSeason); convErr == nil {
+			seasonFilter = &n
+		}
+	}
+	adjacentTo := guid.Normalize(q.Get("AdjacentTo"))
+	startItemID := guid.Normalize(q.Get("StartItemId"))
+	startIndex := q.Int("StartIndex", 0)
+	limit := q.Int("Limit", 0)
+	needPostFilter := seasonFilter != nil || adjacentTo != "" || startItemID != ""
+
+	fetchStart, fetchLimit := startIndex, limit
+	if needPostFilter {
+		fetchStart, fetchLimit = 0, 0
+	}
+
 	items, total, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
 		ServerID:          h.serverID(),
 		UserID:            userID,
@@ -550,16 +663,73 @@ func (h *Handler) handleShowEpisodes(w http.ResponseWriter, r *http.Request) {
 		MaxParentalRating: maxRating,
 		BlockedTags:       blockedTags,
 		IncludeItemTypes:  []string{"Episode"},
-		SortBy:            []string{"IndexNumber"},
-		SortOrder:         "Ascending",
-		StartIndex:        q.Int("StartIndex", 0),
-		Limit:             q.Int("Limit", 0),
+		SortBy:            sortBy,
+		SortOrder:         sortOrder,
+		StartIndex:        fetchStart,
+		Limit:             fetchLimit,
 		Fields:            q.List("Fields"),
 	})
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	if needPostFilter {
+		if seasonFilter != nil {
+			filtered := make([]dto.BaseItemDto, 0, len(items))
+			for _, it := range items {
+				if it.ParentIndexNumber != nil && *it.ParentIndexNumber == *seasonFilter {
+					filtered = append(filtered, it)
+				}
+			}
+			items = filtered
+		}
+		if adjacentTo != "" {
+			idx := -1
+			for i, it := range items {
+				if guid.Normalize(it.Id) == adjacentTo {
+					idx = i
+					break
+				}
+			}
+			if idx == -1 {
+				items = []dto.BaseItemDto{}
+			} else {
+				lo := idx - 1
+				if lo < 0 {
+					lo = 0
+				}
+				hi := idx + 2
+				if hi > len(items) {
+					hi = len(items)
+				}
+				items = items[lo:hi]
+			}
+		} else if startItemID != "" {
+			idx := -1
+			for i, it := range items {
+				if guid.Normalize(it.Id) == startItemID {
+					idx = i
+					break
+				}
+			}
+			if idx == -1 {
+				items = []dto.BaseItemDto{}
+			} else {
+				items = items[idx:]
+			}
+		}
+		total = len(items)
+		if startIndex > len(items) {
+			items = []dto.BaseItemDto{}
+		} else if startIndex > 0 {
+			items = items[startIndex:]
+		}
+		if limit > 0 && len(items) > limit {
+			items = items[:limit]
+		}
+	}
+
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            items,
 		TotalRecordCount: total,
@@ -621,13 +791,26 @@ func (h *Handler) handleTaxonomies(kind string) http.HandlerFunc {
 		userID := h.resolveUserID(r, q)
 		allowed := h.allowedLibrariesForRequest(r, userID)
 		maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+		searchTerm := strings.TrimSpace(q.Get("SearchTerm"))
+		nameStartsWith := strings.TrimSpace(q.Get("NameStartsWith"))
+		sortBy := q.List("SortBy")
+		sortOrder := strings.TrimSpace(q.Get("SortOrder"))
+		startIndex := q.Int("StartIndex", 0)
+		limit := q.Int("Limit", 200)
+		needPostProcess := searchTerm != "" || nameStartsWith != "" || len(sortBy) > 0 || sortOrder != ""
+
+		fetchStart, fetchLimit := startIndex, limit
+		if needPostProcess {
+			fetchStart, fetchLimit = 0, 100000
+		}
+
 		items, total, err := h.repo.ListTaxonomiesWithPolicy(
 			r.Context(),
 			h.serverID(),
 			kind,
 			q.Get("ParentId"),
-			q.Int("StartIndex", 0),
-			q.Int("Limit", 200),
+			fetchStart,
+			fetchLimit,
 			allowed,
 			maxRating,
 			blockedTags,
@@ -636,11 +819,64 @@ func (h *Handler) handleTaxonomies(kind string) http.HandlerFunc {
 			httpx.Error(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if needPostProcess {
+			lowerSearch := strings.ToLower(searchTerm)
+			lowerPrefix := strings.ToLower(nameStartsWith)
+			filtered := make([]dto.BaseItemDto, 0, len(items))
+			for _, it := range items {
+				lowerName := strings.ToLower(it.Name)
+				if lowerSearch != "" && !strings.Contains(lowerName, lowerSearch) {
+					continue
+				}
+				if lowerPrefix != "" && !strings.HasPrefix(lowerName, lowerPrefix) {
+					continue
+				}
+				filtered = append(filtered, it)
+			}
+			desc := strings.EqualFold(sortOrder, "Descending")
+			primarySort := ""
+			if len(sortBy) > 0 {
+				primarySort = strings.ToLower(strings.TrimSpace(sortBy[0]))
+			}
+			switch primarySort {
+			case "random":
+				rand.Shuffle(len(filtered), func(i, j int) {
+					filtered[i], filtered[j] = filtered[j], filtered[i]
+				})
+			default:
+				sort.Slice(filtered, func(i, j int) bool {
+					a := strings.ToLower(filtered[i].Name)
+					b := strings.ToLower(filtered[j].Name)
+					if desc {
+						return a > b
+					}
+					return a < b
+				})
+			}
+			total = len(filtered)
+			if startIndex > len(filtered) {
+				filtered = []dto.BaseItemDto{}
+			} else if startIndex > 0 {
+				filtered = filtered[startIndex:]
+			}
+			if limit > 0 && len(filtered) > limit {
+				filtered = filtered[:limit]
+			}
+			items = filtered
+		}
 		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 			Items:            items,
 			TotalRecordCount: total,
 		})
 	}
+}
+
+func (h *Handler) canAccessUserData(r *http.Request, targetUserID string) bool {
+	targetID := guid.Normalize(targetUserID)
+	if targetID == "" {
+		return true
+	}
+	return h.canModifyUser(r, targetID)
 }
 
 func (h *Handler) canModifyUser(r *http.Request, targetUserID string) bool {

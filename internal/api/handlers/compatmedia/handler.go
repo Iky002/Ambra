@@ -149,7 +149,7 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 	// --- /Collections (3 routes) ---
 	r.Get("/Collections/{Id}/Missing", authFn(h.handleCollectionMissing))
 	r.Get("/Collections/{Id}/ProviderItems", authFn(h.handleCollectionProviderItems))
-	r.Post("/Collections/{Id}/Items/Delete", adminFn(h.handleContainerItemsDelete))
+	r.Post("/Collections/{Id}/Items/Delete", adminFn(h.handleContainerItemsDelete("BoxSet", false)))
 
 	// --- /Encoding (11 routes) ---
 	r.Get("/Encoding/ToneMapOptions", adminFn(h.handleGetToneMapOptions))
@@ -290,7 +290,7 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 
 	// --- /Playlists (2 routes) ---
 	r.Get("/Playlists/{Id}/AddToPlaylistInfo", authFn(h.handleAddToPlaylistInfo))
-	r.Post("/Playlists/{Id}/Items/Delete", authFn(h.handleContainerItemsDelete))
+	r.Post("/Playlists/{Id}/Items/Delete", authFn(h.handleContainerItemsDelete("Playlist", true)))
 
 	// --- /Providers (1 route) ---
 	r.Get("/Providers/Subtitles/Subtitles/{Id}", authFn(h.handleProviderSubtitleDownload))

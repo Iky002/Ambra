@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	gosync "sync"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
@@ -94,12 +96,13 @@ type SyncJobCreationResult struct {
 }
 
 type SyncedItem struct {
-	ServerId      string `json:"ServerId"`
-	SyncJobId     string `json:"SyncJobId"`
-	SyncJobName   string `json:"SyncJobName"`
-	SyncJobItemId string `json:"SyncJobItemId"`
-	ItemId        string `json:"ItemId"`
-	OriginalFile  string `json:"OriginalFileName,omitempty"`
+	ServerId      string           `json:"ServerId"`
+	SyncJobId     string           `json:"SyncJobId"`
+	SyncJobName   string           `json:"SyncJobName"`
+	SyncJobItemId string           `json:"SyncJobItemId"`
+	ItemId        string           `json:"ItemId"`
+	Item          *dto.BaseItemDto `json:"Item,omitempty"`
+	OriginalFile  string           `json:"OriginalFileName,omitempty"`
 }
 
 type syncState struct {
@@ -108,9 +111,11 @@ type syncState struct {
 }
 
 type Handler struct {
-	store *sqlite.Store
-	cfg   *config.Config
-	auth  AuthFuncs
+	store    *sqlite.Store
+	cfg      *config.Config
+	libRepo  *sqlite.LibraryRepo
+	userRepo *sqlite.UserRepo
+	auth     AuthFuncs
 
 	mu    gosync.RWMutex
 	state syncState
@@ -123,6 +128,34 @@ func New(store *sqlite.Store, cfg *config.Config) *Handler {
 	}
 	h.loadState(context.Background())
 	return h
+}
+
+// SetLibraryRepo attaches a LibraryRepo so sync jobs and ready items can hydrate real library metadata.
+func (h *Handler) SetLibraryRepo(r *sqlite.LibraryRepo) {
+	h.mu.Lock()
+	h.libRepo = r
+	h.mu.Unlock()
+}
+
+// SetUserRepo attaches a UserRepo so sync targets can list real registered devices.
+func (h *Handler) SetUserRepo(r *sqlite.UserRepo) {
+	h.mu.Lock()
+	h.userRepo = r
+	h.mu.Unlock()
+}
+
+func (h *Handler) getLibraryRepo() *sqlite.LibraryRepo {
+	h.mu.RLock()
+	r := h.libRepo
+	h.mu.RUnlock()
+	return r
+}
+
+func (h *Handler) getUserRepo() *sqlite.UserRepo {
+	h.mu.RLock()
+	r := h.userRepo
+	h.mu.RUnlock()
+	return r
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
@@ -159,19 +192,69 @@ func (h *Handler) serverID() string {
 	return ""
 }
 
+func callerAuth(r *http.Request) (callerID string, isAdmin bool, hasAuth bool) {
+	ac, ok := middleware.AuthFromContext(r.Context())
+	if !ok || ac == nil || (ac.User == nil && !ac.IsAPIKey) {
+		return "", false, false
+	}
+	return guid.Normalize(ac.UserID()), ac.IsAdmin(), true
+}
+
+func canAccessJob(job SyncJob, callerID string, isAdmin, hasAuth bool) bool {
+	if !hasAuth || isAdmin {
+		return true
+	}
+	return callerID != "" && guid.Normalize(job.UserId) == callerID
+}
+
+func (h *Handler) findJobLocked(jobID string) (SyncJob, bool) {
+	for _, j := range h.state.Jobs {
+		if j.Id == jobID {
+			return j, true
+		}
+	}
+	return SyncJob{}, false
+}
+
 func defaultTargets() []SyncTarget {
 	return []SyncTarget{
 		{Id: "local-device", Name: "This Device"},
 	}
 }
 
+func (h *Handler) resolveTargets(ctx context.Context) []SyncTarget {
+	if userRepo := h.getUserRepo(); userRepo != nil {
+		if devices, err := userRepo.ListDevices(ctx); err == nil && len(devices) > 0 {
+			targets := make([]SyncTarget, 0, len(devices))
+			for _, d := range devices {
+				id := strings.TrimSpace(d.ID)
+				if id == "" {
+					continue
+				}
+				name := strings.TrimSpace(d.Name)
+				if name == "" {
+					name = strings.TrimSpace(d.AppName)
+				}
+				if name == "" {
+					name = id
+				}
+				targets = append(targets, SyncTarget{Id: id, Name: name})
+			}
+			if len(targets) > 0 {
+				return targets
+			}
+		}
+	}
+	return defaultTargets()
+}
+
 func (h *Handler) handleTargets(w http.ResponseWriter, r *http.Request) {
-	httpx.JSON(w, http.StatusOK, defaultTargets())
+	httpx.JSON(w, http.StatusOK, h.resolveTargets(r.Context()))
 }
 
 func (h *Handler) handleOptions(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, SyncDialogOptions{
-		Targets: defaultTargets(),
+		Targets: h.resolveTargets(r.Context()),
 		Options: []string{"Name", "Quality", "UnwatchedOnly", "SyncNewContent", "ItemLimit"},
 		QualityOptions: []SyncQualityOption{
 			{Id: "original", Name: "Original", Description: "Keep original quality", IsDefault: true, IsOriginal: true},
@@ -190,6 +273,10 @@ func (h *Handler) handleListJobs(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	targetID := q.Get("TargetId")
 	userID := guid.Normalize(q.Get("UserId"))
+	callerID, isAdmin, hasAuth := callerAuth(r)
+	if hasAuth && !isAdmin {
+		userID = callerID
+	}
 
 	h.mu.RLock()
 	filtered := make([]SyncJob, 0, len(h.state.Jobs))
@@ -233,7 +320,12 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	if req.TargetId == "" {
 		req.TargetId = "local-device"
 	}
-	if req.UserId == "" && h.auth.UserIDFromCtx != nil {
+	callerID, isAdmin, hasAuth := callerAuth(r)
+	if hasAuth && !isAdmin {
+		req.UserId = callerID
+	} else if hasAuth && req.UserId == "" {
+		req.UserId = callerID
+	} else if req.UserId == "" && h.auth.UserIDFromCtx != nil {
 		req.UserId = h.auth.UserIDFromCtx(r.Context())
 	}
 	if req.Name == "" {
@@ -271,15 +363,37 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		job.Status = "Queued"
 	}
 
+	libRepo := h.getLibraryRepo()
+	serverID := h.serverID()
 	createdItems := make([]SyncJobItem, 0, len(req.ItemIds))
 	for i, itemID := range req.ItemIds {
+		itemName := "Item " + strconv.Itoa(i+1)
+		outputPath := ""
+		mediaSourceID := ""
+		if libRepo != nil {
+			if itemDTO, err := libRepo.GetItemByID(r.Context(), serverID, job.UserId, itemID); err == nil && itemDTO != nil {
+				if itemDTO.Name != "" {
+					itemName = itemDTO.Name
+				}
+				if itemDTO.Path != "" {
+					outputPath = itemDTO.Path
+				}
+				if len(itemDTO.MediaSources) > 0 && itemDTO.MediaSources[0].Id != "" {
+					mediaSourceID = itemDTO.MediaSources[0].Id
+				} else if itemDTO.Id != "" {
+					mediaSourceID = itemDTO.Id
+				}
+			}
+		}
 		createdItems = append(createdItems, SyncJobItem{
-			Id:       guid.New(),
-			JobId:    job.Id,
-			ItemId:   itemID,
-			ItemName: "Item " + strconv.Itoa(i+1),
-			TargetId: job.TargetId,
-			Status:   "ReadyToTransfer",
+			Id:          guid.New(),
+			JobId:       job.Id,
+			ItemId:      itemID,
+			ItemName:    itemName,
+			TargetId:    job.TargetId,
+			Status:      "ReadyToTransfer",
+			OutputPath:  outputPath,
+			MediaSource: mediaSourceID,
 		})
 	}
 
@@ -297,10 +411,15 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
+	callerID, isAdmin, hasAuth := callerAuth(r)
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for _, j := range h.state.Jobs {
 		if j.Id == id {
+			if !canAccessJob(j, callerID, isAdmin, hasAuth) {
+				httpx.Error(w, http.StatusForbidden, "forbidden")
+				return
+			}
 			httpx.JSON(w, http.StatusOK, j)
 			return
 		}
@@ -324,9 +443,16 @@ func (h *Handler) handleUpdateJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	callerID, isAdmin, hasAuth := callerAuth(r)
+
 	h.mu.Lock()
 	for i := range h.state.Jobs {
 		if h.state.Jobs[i].Id == id {
+			if !canAccessJob(h.state.Jobs[i], callerID, isAdmin, hasAuth) {
+				h.mu.Unlock()
+				httpx.Error(w, http.StatusForbidden, "forbidden")
+				return
+			}
 			if req.Name != "" {
 				h.state.Jobs[i].Name = req.Name
 			}
@@ -362,11 +488,17 @@ func (h *Handler) handleUpdateJob(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
+	callerID, isAdmin, hasAuth := callerAuth(r)
 	h.mu.Lock()
 	found := false
 	keptJobs := make([]SyncJob, 0, len(h.state.Jobs))
 	for _, j := range h.state.Jobs {
 		if j.Id == id {
+			if !canAccessJob(j, callerID, isAdmin, hasAuth) {
+				h.mu.Unlock()
+				httpx.Error(w, http.StatusForbidden, "forbidden")
+				return
+			}
 			found = true
 			continue
 		}
@@ -400,10 +532,28 @@ func (h *Handler) handleListJobItems(w http.ResponseWriter, r *http.Request) {
 	for _, s := range statuses {
 		statusSet[strings.ToLower(s)] = struct{}{}
 	}
+	callerID, isAdmin, hasAuth := callerAuth(r)
 
 	h.mu.RLock()
+	jobByID := make(map[string]SyncJob, len(h.state.Jobs))
+	for _, j := range h.state.Jobs {
+		jobByID[j.Id] = j
+	}
+	if jobID != "" && hasAuth && !isAdmin {
+		if j, ok := jobByID[jobID]; ok && !canAccessJob(j, callerID, isAdmin, hasAuth) {
+			h.mu.RUnlock()
+			httpx.Error(w, http.StatusForbidden, "forbidden")
+			return
+		}
+	}
 	filtered := make([]SyncJobItem, 0, len(h.state.JobItems))
 	for _, ji := range h.state.JobItems {
+		if hasAuth && !isAdmin {
+			j, ok := jobByID[ji.JobId]
+			if !ok || !canAccessJob(j, callerID, isAdmin, hasAuth) {
+				continue
+			}
+		}
 		if jobID != "" && ji.JobId != jobID {
 			continue
 		}
@@ -428,10 +578,19 @@ func (h *Handler) handleListJobItems(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleDeleteJobItem(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
+	callerID, isAdmin, hasAuth := callerAuth(r)
 	h.mu.Lock()
 	for i, ji := range h.state.JobItems {
 		if ji.Id == id {
 			jobID := ji.JobId
+			if hasAuth && !isAdmin {
+				j, ok := h.findJobLocked(jobID)
+				if !ok || !canAccessJob(j, callerID, isAdmin, hasAuth) {
+					h.mu.Unlock()
+					httpx.Error(w, http.StatusForbidden, "forbidden")
+					return
+				}
+			}
 			h.state.JobItems = append(h.state.JobItems[:i], h.state.JobItems[i+1:]...)
 			h.recomputeJobLocked(jobID)
 			h.saveStateLocked(r.Context())
@@ -446,9 +605,18 @@ func (h *Handler) handleDeleteJobItem(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleMarkTransferred(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
+	callerID, isAdmin, hasAuth := callerAuth(r)
 	h.mu.Lock()
 	for i := range h.state.JobItems {
 		if h.state.JobItems[i].Id == id {
+			if hasAuth && !isAdmin {
+				j, ok := h.findJobLocked(h.state.JobItems[i].JobId)
+				if !ok || !canAccessJob(j, callerID, isAdmin, hasAuth) {
+					h.mu.Unlock()
+					httpx.Error(w, http.StatusForbidden, "forbidden")
+					return
+				}
+			}
 			h.state.JobItems[i].Status = "Synced"
 			h.state.JobItems[i].Progress = 100
 			h.recomputeJobLocked(h.state.JobItems[i].JobId)
@@ -464,9 +632,18 @@ func (h *Handler) handleMarkTransferred(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) handleEnableJobItem(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
+	callerID, isAdmin, hasAuth := callerAuth(r)
 	h.mu.Lock()
 	for i := range h.state.JobItems {
 		if h.state.JobItems[i].Id == id {
+			if hasAuth && !isAdmin {
+				j, ok := h.findJobLocked(h.state.JobItems[i].JobId)
+				if !ok || !canAccessJob(j, callerID, isAdmin, hasAuth) {
+					h.mu.Unlock()
+					httpx.Error(w, http.StatusForbidden, "forbidden")
+					return
+				}
+			}
 			h.state.JobItems[i].Status = "ReadyToTransfer"
 			h.state.JobItems[i].Progress = 0
 			h.recomputeJobLocked(h.state.JobItems[i].JobId)
@@ -482,27 +659,63 @@ func (h *Handler) handleEnableJobItem(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleReadyItems(w http.ResponseWriter, r *http.Request) {
 	targetID := httpx.ParseQuery(r).Get("TargetId")
-	h.mu.RLock()
-	jobNames := make(map[string]string, len(h.state.Jobs))
-	for _, j := range h.state.Jobs {
-		jobNames[j.Id] = j.Name
+	callerID, isAdmin, hasAuth := callerAuth(r)
+
+	type readyEntry struct {
+		item   SyncedItem
+		userID string
 	}
-	ready := make([]SyncedItem, 0)
+
+	h.mu.RLock()
+	jobByID := make(map[string]SyncJob, len(h.state.Jobs))
+	for _, j := range h.state.Jobs {
+		jobByID[j.Id] = j
+	}
+	entries := make([]readyEntry, 0)
 	for _, ji := range h.state.JobItems {
+		j, hasJob := jobByID[ji.JobId]
+		if hasAuth && !isAdmin {
+			if !hasJob || !canAccessJob(j, callerID, isAdmin, hasAuth) {
+				continue
+			}
+		}
 		if targetID != "" && ji.TargetId != targetID {
 			continue
 		}
 		if ji.Status == "ReadyToTransfer" || ji.Status == "Queued" {
-			ready = append(ready, SyncedItem{
-				ServerId:      h.serverID(),
-				SyncJobId:     ji.JobId,
-				SyncJobName:   jobNames[ji.JobId],
-				SyncJobItemId: ji.Id,
-				ItemId:        ji.ItemId,
+			origFile := ""
+			if ji.OutputPath != "" {
+				origFile = filepath.Base(ji.OutputPath)
+			}
+			entries = append(entries, readyEntry{
+				item: SyncedItem{
+					ServerId:      h.serverID(),
+					SyncJobId:     ji.JobId,
+					SyncJobName:   j.Name,
+					SyncJobItemId: ji.Id,
+					ItemId:        ji.ItemId,
+					OriginalFile:  origFile,
+				},
+				userID: j.UserId,
 			})
 		}
 	}
 	h.mu.RUnlock()
+
+	libRepo := h.getLibraryRepo()
+	serverID := h.serverID()
+	ready := make([]SyncedItem, len(entries))
+	for i, e := range entries {
+		ready[i] = e.item
+		if libRepo != nil {
+			if itemDTO, err := libRepo.GetItemByID(r.Context(), serverID, e.userID, e.item.ItemId); err == nil && itemDTO != nil {
+				ready[i].Item = itemDTO
+				if ready[i].OriginalFile == "" && itemDTO.Path != "" {
+					ready[i].OriginalFile = filepath.Base(itemDTO.Path)
+				}
+			}
+		}
+	}
 	httpx.JSON(w, http.StatusOK, ready)
 }
 
@@ -515,10 +728,21 @@ func (h *Handler) handleSyncData(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid sync data payload")
 		return
 	}
+	callerID, isAdmin, hasAuth := callerAuth(r)
 
 	h.mu.RLock()
+	jobByID := make(map[string]SyncJob, len(h.state.Jobs))
+	for _, j := range h.state.Jobs {
+		jobByID[j.Id] = j
+	}
 	active := make(map[string]struct{})
 	for _, ji := range h.state.JobItems {
+		if hasAuth && !isAdmin {
+			j, ok := jobByID[ji.JobId]
+			if !ok || !canAccessJob(j, callerID, isAdmin, hasAuth) {
+				continue
+			}
+		}
 		if req.TargetId != "" && ji.TargetId != req.TargetId {
 			continue
 		}

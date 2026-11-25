@@ -1,13 +1,14 @@
 package compatext
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -31,6 +32,8 @@ type liveTVChannel struct {
 	GroupTitle  string `json:"GroupTitle,omitempty"`
 	StreamUrl   string `json:"StreamUrl,omitempty"`
 	TunerHostId string `json:"TunerHostId,omitempty"`
+	Disabled    bool   `json:"Disabled,omitempty"`
+	SortIndex   int    `json:"SortIndex,omitempty"`
 }
 
 type liveTVProgram struct {
@@ -120,16 +123,6 @@ type NameValuePair struct {
 	Value string `json:"Value"`
 }
 
-// minimal 188-byte MPEG-TS null packet (sync 0x47, PID 0x1FFF).
-var tsNullPacket = func() []byte {
-	b := make([]byte, 188)
-	b[0] = 0x47
-	b[1] = 0x1F
-	b[2] = 0xFF
-	b[3] = 0x10
-	return b
-}()
-
 func (h *Handler) registerLiveTVRoutes(r chi.Router, wrapAuth, wrapAdmin func(http.Handler) http.Handler) {
 	// Authenticated LiveTv routes
 	r.Group(func(r chi.Router) {
@@ -137,27 +130,27 @@ func (h *Handler) registerLiveTVRoutes(r chi.Router, wrapAuth, wrapAdmin func(ht
 
 		// LiveStreamFiles (11 routes)
 		r.Get("/LiveTv/LiveStreamFiles/{Id}/stream.{Container}", h.handleLiveStreamFile)
-		r.Get("/LiveTv/LiveStreamFiles/{Id}/hls/master.m3u8", h.handleHLSMaster(false))
-		r.Head("/LiveTv/LiveStreamFiles/{Id}/hls/master.m3u8", h.handleHLSMaster(true))
-		r.Get("/LiveTv/LiveStreamFiles/{Id}/hls/master_local.m3u8", h.handleHLSMaster(false))
-		r.Head("/LiveTv/LiveStreamFiles/{Id}/hls/master_local.m3u8", h.handleHLSMaster(true))
-		r.Get("/LiveTv/LiveStreamFiles/{Id}/hls/live.m3u8", h.handleHLSLive(false))
-		r.Head("/LiveTv/LiveStreamFiles/{Id}/hls/live.m3u8", h.handleHLSLive(true))
-		r.Get("/LiveTv/LiveStreamFiles/{Id}/hls/live_local.m3u8", h.handleHLSLive(false))
-		r.Head("/LiveTv/LiveStreamFiles/{Id}/hls/live_local.m3u8", h.handleHLSLive(true))
-		r.Get("/LiveTv/LiveStreamFiles/{Id}/hls/{Segment}", h.handleHLSSegment(false))
-		r.Head("/LiveTv/LiveStreamFiles/{Id}/hls/{Segment}", h.handleHLSSegment(true))
+		r.Get("/LiveTv/LiveStreamFiles/{Id}/hls/master.m3u8", h.handleLiveStreamHLS(false))
+		r.Head("/LiveTv/LiveStreamFiles/{Id}/hls/master.m3u8", h.handleLiveStreamHLS(true))
+		r.Get("/LiveTv/LiveStreamFiles/{Id}/hls/master_local.m3u8", h.handleLiveStreamHLS(false))
+		r.Head("/LiveTv/LiveStreamFiles/{Id}/hls/master_local.m3u8", h.handleLiveStreamHLS(true))
+		r.Get("/LiveTv/LiveStreamFiles/{Id}/hls/live.m3u8", h.handleLiveStreamHLS(false))
+		r.Head("/LiveTv/LiveStreamFiles/{Id}/hls/live.m3u8", h.handleLiveStreamHLS(true))
+		r.Get("/LiveTv/LiveStreamFiles/{Id}/hls/live_local.m3u8", h.handleLiveStreamHLS(false))
+		r.Head("/LiveTv/LiveStreamFiles/{Id}/hls/live_local.m3u8", h.handleLiveStreamHLS(true))
+		r.Get("/LiveTv/LiveStreamFiles/{Id}/hls/{Segment}", h.handleLiveStreamHLS(false))
+		r.Head("/LiveTv/LiveStreamFiles/{Id}/hls/{Segment}", h.handleLiveStreamHLS(true))
 
 		// LiveRecordings (7 routes)
 		r.Get("/LiveTv/LiveRecordings/{Id}/stream", h.handleLiveRecordingStream)
-		r.Get("/LiveTv/LiveRecordings/{Id}/hls/master.m3u8", h.handleHLSMaster(false))
-		r.Head("/LiveTv/LiveRecordings/{Id}/hls/master.m3u8", h.handleHLSMaster(true))
-		r.Get("/LiveTv/LiveRecordings/{Id}/hls/live.m3u8", h.handleHLSLive(false))
-		r.Head("/LiveTv/LiveRecordings/{Id}/hls/live.m3u8", h.handleHLSLive(true))
-		r.Get("/LiveTv/LiveRecordings/{Id}/hls/{Segment}", h.handleHLSSegment(false))
-		r.Head("/LiveTv/LiveRecordings/{Id}/hls/{Segment}", h.handleHLSSegment(true))
+		r.Get("/LiveTv/LiveRecordings/{Id}/hls/master.m3u8", h.handleLiveRecordingHLS(false))
+		r.Head("/LiveTv/LiveRecordings/{Id}/hls/master.m3u8", h.handleLiveRecordingHLS(true))
+		r.Get("/LiveTv/LiveRecordings/{Id}/hls/live.m3u8", h.handleLiveRecordingHLS(false))
+		r.Head("/LiveTv/LiveRecordings/{Id}/hls/live.m3u8", h.handleLiveRecordingHLS(true))
+		r.Get("/LiveTv/LiveRecordings/{Id}/hls/{Segment}", h.handleLiveRecordingHLS(false))
+		r.Head("/LiveTv/LiveRecordings/{Id}/hls/{Segment}", h.handleLiveRecordingHLS(true))
 
-		// LiveTv general authenticated endpoints (10 routes)
+		// LiveTv general authenticated endpoints (8 routes)
 		r.Get("/LiveTv/AvailableRecordingOptions", h.handleAvailableRecordingOptions)
 		r.Get("/LiveTv/EPG", h.handleEPG)
 		r.Get("/LiveTv/Folder", h.handleLiveTVFolder)
@@ -166,11 +159,9 @@ func (h *Handler) registerLiveTVRoutes(r chi.Router, wrapAuth, wrapAdmin func(ht
 		r.Post("/LiveTv/Timers/{Id}/Delete", h.handleDeleteTimerPost)
 		r.Post("/LiveTv/SeriesTimers/{Id}/Delete", h.handleDeleteSeriesTimerPost)
 		r.Get("/LiveTv/ListingProviders/Default", h.handleListingProviderDefault)
-		r.Get("/LiveTv/Tuners/Discover", h.handleDiscoverTuners)
-		r.Get("/LiveTv/Tuners/Discvover", h.handleDiscoverTuners) // Emby legacy typo alias
 	})
 
-	// Admin LiveTv routes (14 routes)
+	// Admin LiveTv routes (16 routes)
 	r.Group(func(r chi.Router) {
 		r.Use(wrapAdmin)
 
@@ -188,47 +179,106 @@ func (h *Handler) registerLiveTVRoutes(r chi.Router, wrapAuth, wrapAdmin func(ht
 		r.Get("/LiveTv/ListingProviders/Lineups", h.handleListingProviderLineups)
 		r.Get("/LiveTv/ChannelMappingOptions", h.handleChannelMappingOptions)
 		r.Post("/LiveTv/ChannelMappings", h.handleSetChannelMapping)
+		r.Get("/LiveTv/Tuners/Discover", h.handleDiscoverTuners)
+		r.Get("/LiveTv/Tuners/Discvover", h.handleDiscoverTuners) // Emby legacy typo alias
 	})
 }
 
-func (h *Handler) handleLiveStreamFile(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "Id")
+func (h *Handler) lookupChannel(ctx context.Context, id string) (liveTVChannel, bool) {
 	h.mu.RLock()
 	lt := h.liveTV
 	h.mu.RUnlock()
 	if lt != nil {
-		if ch, ok := lt.GetChannelByID(id); ok && strings.TrimSpace(ch.StreamUrl) != "" {
-			lt.ProxyChannelStream(w, r, ch.Id, ch.StreamUrl)
-			return
+		if ch, ok := lt.GetChannelByID(id); ok && ch != nil {
+			return liveTVChannel{
+				Id:          ch.Id,
+				Name:        ch.Name,
+				ServerId:    ch.ServerId,
+				Type:        ch.Type,
+				ChannelType: ch.ChannelType,
+				Number:      ch.Number,
+				TvgId:       ch.TvgId,
+				LogoUrl:     ch.LogoUrl,
+				GroupTitle:  ch.GroupTitle,
+				StreamUrl:   ch.StreamUrl,
+				TunerHostId: ch.TunerHostId,
+			}, true
 		}
 	}
-	container := strings.ToLower(chi.URLParam(r, "Container"))
-	w.Header().Set("Content-Type", containerContentType(container))
-	w.Header().Set("Content-Length", strconv.Itoa(len(tsNullPacket)))
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(tsNullPacket)
+	var st sharedLiveTVState
+	if h.readConfigJSON(ctx, liveTVConfigKey, &st) {
+		for _, ch := range st.Channels {
+			if ch.Id == id {
+				return ch, true
+			}
+		}
+	}
+	return liveTVChannel{}, false
+}
+
+func (h *Handler) lookupRecording(ctx context.Context, id string) (liveTVRecording, bool) {
+	var st sharedLiveTVState
+	if h.readConfigJSON(ctx, liveTVConfigKey, &st) {
+		for _, rec := range st.Recordings {
+			if rec.Id == id {
+				return rec, true
+			}
+		}
+	}
+	return liveTVRecording{}, false
+}
+
+func isHLSStreamURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return strings.HasSuffix(strings.ToLower(strings.TrimSpace(raw)), ".m3u8")
+	}
+	return strings.HasSuffix(strings.ToLower(u.Path), ".m3u8")
+}
+
+func appendRawQuery(targetPath, rawQuery string) string {
+	if rawQuery == "" {
+		return targetPath
+	}
+	return targetPath + "?" + rawQuery
+}
+
+func (h *Handler) handleLiveStreamFile(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "Id")
+	ch, ok := h.lookupChannel(r.Context(), id)
+	if !ok || strings.TrimSpace(ch.StreamUrl) == "" {
+		httpx.Error(w, http.StatusNotFound, "live stream channel not found")
+		return
+	}
+	h.mu.RLock()
+	lt := h.liveTV
+	h.mu.RUnlock()
+	if lt != nil {
+		lt.ProxyChannelStream(w, r, ch.Id, ch.StreamUrl)
+		return
+	}
+	target := appendRawQuery("/LiveTv/Channels/"+url.PathEscape(ch.Id)+"/Stream", r.URL.RawQuery)
+	http.Redirect(w, r, target, http.StatusFound)
 }
 
 func (h *Handler) handleLiveRecordingStream(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "Id")
-	var st sharedLiveTVState
-	if h.readConfigJSON(r.Context(), liveTVConfigKey, &st) {
-		for _, rec := range st.Recordings {
-			if rec.Id == id && strings.TrimSpace(rec.Path) != "" {
-				resolved, ok := h.resolveRecordingPath(rec.Path)
-				if !ok {
-					httpx.Error(w, http.StatusForbidden, "recording path is outside recordings directory")
-					return
-				}
-				http.ServeFile(w, r, resolved)
-				return
-			}
-		}
+	rec, ok := h.lookupRecording(r.Context(), id)
+	if !ok || strings.TrimSpace(rec.Path) == "" {
+		httpx.Error(w, http.StatusNotFound, "live recording not found")
+		return
 	}
-	w.Header().Set("Content-Type", "video/mp2t")
-	w.Header().Set("Content-Length", strconv.Itoa(len(tsNullPacket)))
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(tsNullPacket)
+	resolved, ok := h.resolveRecordingPath(rec.Path)
+	if !ok {
+		httpx.Error(w, http.StatusForbidden, "recording path is outside recordings directory")
+		return
+	}
+	fi, err := os.Stat(resolved)
+	if err != nil || fi.IsDir() {
+		httpx.Error(w, http.StatusNotFound, "recording file not found")
+		return
+	}
+	http.ServeFile(w, r, resolved)
 }
 
 func (h *Handler) recordingsDir() string {
@@ -272,60 +322,80 @@ func (h *Handler) resolveRecordingPath(target string) (string, bool) {
 	return resolvedTarget, true
 }
 
-func (h *Handler) handleHLSMaster(headOnly bool) http.HandlerFunc {
+func (h *Handler) handleLiveStreamHLS(headOnly bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		playlist := "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720\nlive.m3u8\n"
-		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		w.Header().Set("Content-Length", strconv.Itoa(len(playlist)))
-		w.WriteHeader(http.StatusOK)
-		if !headOnly {
-			_, _ = w.Write([]byte(playlist))
+		id := chi.URLParam(r, "Id")
+		ch, ok := h.lookupChannel(r.Context(), id)
+		if !ok || strings.TrimSpace(ch.StreamUrl) == "" {
+			if headOnly {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			httpx.Error(w, http.StatusNotFound, "live stream channel not found")
+			return
 		}
+
+		isPlaylist := chi.URLParam(r, "Segment") == ""
+		if isPlaylist && isHLSStreamURL(ch.StreamUrl) {
+			if headOnly {
+				w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			h.mu.RLock()
+			lt := h.liveTV
+			h.mu.RUnlock()
+			if lt != nil {
+				lt.ProxyChannelStream(w, r, ch.Id, ch.StreamUrl)
+				return
+			}
+		}
+
+		target := appendRawQuery("/LiveTv/Channels/"+url.PathEscape(ch.Id)+"/Stream", r.URL.RawQuery)
+		http.Redirect(w, r, target, http.StatusFound)
 	}
 }
 
-func (h *Handler) handleHLSLive(headOnly bool) http.HandlerFunc {
+func (h *Handler) handleLiveRecordingHLS(headOnly bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		playlist := "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:6.000,\n0.ts\n"
-		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		w.Header().Set("Content-Length", strconv.Itoa(len(playlist)))
-		w.WriteHeader(http.StatusOK)
-		if !headOnly {
-			_, _ = w.Write([]byte(playlist))
+		id := chi.URLParam(r, "Id")
+		rec, ok := h.lookupRecording(r.Context(), id)
+		if !ok || strings.TrimSpace(rec.Path) == "" {
+			if headOnly {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			httpx.Error(w, http.StatusNotFound, "live recording not found")
+			return
 		}
-	}
-}
-
-func (h *Handler) handleHLSSegment(headOnly bool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		seg := strings.ToLower(chi.URLParam(r, "Segment"))
-		ct := "video/mp2t"
-		if strings.HasSuffix(seg, ".m4s") || strings.HasSuffix(seg, ".mp4") {
-			ct = "video/iso.segment"
+		resolved, ok := h.resolveRecordingPath(rec.Path)
+		if !ok {
+			if headOnly {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			httpx.Error(w, http.StatusForbidden, "recording path is outside recordings directory")
+			return
 		}
-		w.Header().Set("Content-Type", ct)
-		w.Header().Set("Content-Length", strconv.Itoa(len(tsNullPacket)))
-		w.WriteHeader(http.StatusOK)
-		if !headOnly {
-			_, _ = w.Write(tsNullPacket)
+		fi, err := os.Stat(resolved)
+		if err != nil || fi.IsDir() {
+			if headOnly {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			httpx.Error(w, http.StatusNotFound, "recording file not found")
+			return
 		}
-	}
-}
-
-func containerContentType(container string) string {
-	switch container {
-	case "mp4", "m4v":
-		return "video/mp4"
-	case "ts", "m2ts":
-		return "video/mp2t"
-	case "mkv":
-		return "video/x-matroska"
-	case "webm":
-		return "video/webm"
-	case "m3u8":
-		return "application/vnd.apple.mpegurl"
-	default:
-		return "application/octet-stream"
+		if strings.EqualFold(filepath.Ext(resolved), ".m3u8") {
+			http.ServeFile(w, r, resolved)
+			return
+		}
+		target := appendRawQuery("/LiveTv/LiveRecordings/"+url.PathEscape(rec.Id)+"/stream", r.URL.RawQuery)
+		http.Redirect(w, r, target, http.StatusFound)
 	}
 }
 
@@ -380,14 +450,21 @@ func (h *Handler) handleManageChannels(w http.ResponseWriter, r *http.Request) {
 	out := make([]ChannelManagementInfo, 0, len(st.Channels))
 	for i, ch := range st.Channels {
 		sortIdx := i
+		if ch.SortIndex != 0 {
+			sortIdx = ch.SortIndex
+		}
 		if v, ok := h.state.ChannelSortIndex[ch.Id]; ok {
 			sortIdx = v
+		}
+		disabled := ch.Disabled
+		if v, ok := h.state.ChannelDisabled[ch.Id]; ok {
+			disabled = v
 		}
 		out = append(out, ChannelManagementInfo{
 			Id:        ch.Id,
 			Name:      ch.Name,
 			Number:    ch.Number,
-			Disabled:  h.state.ChannelDisabled[ch.Id],
+			Disabled:  disabled,
 			SortIndex: sortIdx,
 		})
 	}
@@ -423,6 +500,21 @@ func (h *Handler) handleSetChannelDisabled(w http.ResponseWriter, r *http.Reques
 	h.state.ChannelDisabled[id] = disabled
 	h.saveStateLocked(r.Context())
 	h.mu.Unlock()
+
+	var st sharedLiveTVState
+	if h.readConfigJSON(r.Context(), liveTVConfigKey, &st) {
+		changed := false
+		for i := range st.Channels {
+			if st.Channels[i].Id == id {
+				st.Channels[i].Disabled = disabled
+				changed = true
+				break
+			}
+		}
+		if changed {
+			h.writeConfigJSON(r.Context(), liveTVConfigKey, st)
+		}
+	}
 	httpx.NoContent(w)
 }
 
@@ -456,6 +548,21 @@ func (h *Handler) handleSetChannelSortIndex(w http.ResponseWriter, r *http.Reque
 	h.state.ChannelSortIndex[id] = newIdx
 	h.saveStateLocked(r.Context())
 	h.mu.Unlock()
+
+	var st sharedLiveTVState
+	if h.readConfigJSON(r.Context(), liveTVConfigKey, &st) {
+		changed := false
+		for i := range st.Channels {
+			if st.Channels[i].Id == id {
+				st.Channels[i].SortIndex = newIdx
+				changed = true
+				break
+			}
+		}
+		if changed {
+			h.writeConfigJSON(r.Context(), liveTVConfigKey, st)
+		}
+	}
 	httpx.NoContent(w)
 }
 
@@ -728,13 +835,57 @@ func (h *Handler) handleChannelMappingOptions(w http.ResponseWriter, r *http.Req
 	_ = h.readConfigJSON(r.Context(), liveTVConfigKey, &st)
 
 	tunerChannels := make([]map[string]any, 0, len(st.Channels))
+	providerSeen := make(map[string]struct{})
+	providerChannels := make([]NameIdPair, 0, len(st.Channels))
 	for _, ch := range st.Channels {
 		tunerChannels = append(tunerChannels, map[string]any{
 			"Id":     ch.Id,
 			"Name":   ch.Name,
 			"Number": ch.Number,
 		})
+		epgID := strings.TrimSpace(ch.TvgId)
+		if epgID == "" {
+			epgID = strings.TrimSpace(ch.Id)
+		}
+		if epgID != "" {
+			key := strings.ToLower(epgID)
+			if _, ok := providerSeen[key]; !ok {
+				providerSeen[key] = struct{}{}
+				name := strings.TrimSpace(ch.Name)
+				if name == "" {
+					name = epgID
+				}
+				providerChannels = append(providerChannels, NameIdPair{
+					Name: name,
+					Id:   epgID,
+				})
+			}
+		}
 	}
+	for _, prog := range st.Programs {
+		epgID := strings.TrimSpace(prog.ChannelId)
+		if epgID == "" {
+			continue
+		}
+		key := strings.ToLower(epgID)
+		if _, ok := providerSeen[key]; !ok {
+			providerSeen[key] = struct{}{}
+			name := strings.TrimSpace(prog.ChannelName)
+			if name == "" {
+				name = epgID
+			}
+			providerChannels = append(providerChannels, NameIdPair{
+				Name: name,
+				Id:   epgID,
+			})
+		}
+	}
+	sort.SliceStable(providerChannels, func(i, j int) bool {
+		if providerChannels[i].Name == providerChannels[j].Name {
+			return providerChannels[i].Id < providerChannels[j].Id
+		}
+		return providerChannels[i].Name < providerChannels[j].Name
+	})
 
 	h.mu.RLock()
 	mappings := append([]ChannelMapping(nil), h.state.ChannelMappings[providerID]...)
@@ -745,7 +896,7 @@ func (h *Handler) handleChannelMappingOptions(w http.ResponseWriter, r *http.Req
 
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"TunerChannels":    tunerChannels,
-		"ProviderChannels": []NameIdPair{},
+		"ProviderChannels": providerChannels,
 		"Mappings":         mappings,
 		"ProviderName":     providerID,
 	})

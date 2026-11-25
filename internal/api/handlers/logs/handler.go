@@ -82,6 +82,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 
 	handleAdmin("GET /System/Logs", h.handleListLogs)
 	handleAdmin("GET /System/Logs/Query", h.handleQueryLogs)
+	handleAdmin("GET /System/Logs/Log", h.handleGetLogByQuery)
 	handleAdmin("GET /System/Logs/{Name}", h.handleGetLog)
 	handleAdmin("GET /System/Logs/{Name}/Lines", h.handleGetLogLines)
 }
@@ -173,6 +174,12 @@ func (h *Handler) resolveSafeLogPath(name string) (string, error) {
 func (h *Handler) readLogLines(name string) ([]string, error) {
 	safePath, err := h.resolveSafeLogPath(name)
 	if err != nil {
+		if os.IsNotExist(err) && name == defaultRuntimeLogName {
+			h.mu.RLock()
+			cp := append([]string(nil), h.runtimeLines...)
+			h.mu.RUnlock()
+			return cp, nil
+		}
 		return nil, err
 	}
 	f, err := os.Open(safePath)
@@ -231,8 +238,21 @@ func (h *Handler) handleQueryLogs(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) handleGetLogByQuery(w http.ResponseWriter, r *http.Request) {
+	q := httpx.ParseQuery(r)
+	name := strings.TrimSpace(q.Get("name"))
+	if name == "" {
+		httpx.Error(w, http.StatusBadRequest, "missing log file name")
+		return
+	}
+	h.serveLogByName(w, name)
+}
+
 func (h *Handler) handleGetLog(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("Name")
+	h.serveLogByName(w, r.PathValue("Name"))
+}
+
+func (h *Handler) serveLogByName(w http.ResponseWriter, name string) {
 	lines, err := h.readLogLines(name)
 	if err != nil {
 		if os.IsPermission(err) {

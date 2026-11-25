@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -200,6 +201,34 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		},
 	})
 
+	taskMgr.SetTriggerStore(
+		func(c context.Context) (map[string][]scheduler.TaskTriggerInfo, error) {
+			var raw string
+			err := store.Reader.QueryRowContext(c, `SELECT value FROM server_config WHERE key = 'scheduler:triggers'`).Scan(&raw)
+			if err != nil {
+				return nil, nil
+			}
+			var out map[string][]scheduler.TaskTriggerInfo
+			if err := json.Unmarshal([]byte(raw), &out); err != nil {
+				return nil, err
+			}
+			return out, nil
+		},
+		func(c context.Context, triggers map[string][]scheduler.TaskTriggerInfo) error {
+			raw, err := json.Marshal(triggers)
+			if err != nil {
+				return err
+			}
+			_, err = store.Writer.ExecContext(c,
+				`INSERT INTO server_config (key, value) VALUES ('scheduler:triggers', ?)
+				 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+				string(raw),
+			)
+			return err
+		},
+	)
+	_ = taskMgr.LoadPersistedTriggers(ctx)
+
 	pluginAdminH := pluginadmin.New(registry, store)
 	_ = pluginAdminH.ApplySavedConfigs(ctx)
 
@@ -247,7 +276,10 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
 	})
-	collections.New(libRepo, cfg).RegisterRoutes(mediaMux, collections.AuthFuncs{
+	collectionsH := collections.New(libRepo, cfg)
+	collectionsH.SetUserRepo(userRepo)
+	collectionsH.SetStore(store)
+	collectionsH.RegisterRoutes(mediaMux, collections.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
@@ -279,6 +311,13 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	// Phase 3: FFmpeg Dynamic HLS, Encoding, LiveStreams & Audio
 	hlsH := hls.New(libRepo, transcodeMgr, cfg)
 	hlsH.SetUserRepo(userRepo)
+	hlsH.SetStreamResolver(func(c context.Context, rawPath string) (string, error) {
+		res, err := pb.ResolveStream(c, rawPath)
+		if err != nil || res == nil {
+			return "", err
+		}
+		return res.URL, nil
+	})
 	hlsH.RegisterRoutes(mediaMux, hls.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
@@ -294,6 +333,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 
 	// Phase 4 & 5: LiveTV, Sync, Notifications, Startup, Packages, Webhooks, BackupRestore, OpenAPI, GenericUI, Parties, Connect
 	livetvH := livetv.New(store, cfg)
+	livetvH.SetUserRepo(userRepo)
 	livetvH.SetRecorder(dvrRec)
 	dvrRec.SetOnFinished(livetvH.OnRecordingFinished)
 	livetvH.RegisterRoutes(mediaMux, livetv.AuthFuncs{
@@ -301,12 +341,17 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
 	})
-	syncapi.New(store, cfg).RegisterRoutes(mediaMux, syncapi.AuthFuncs{
+	syncH := syncapi.New(store, cfg)
+	syncH.SetLibraryRepo(libRepo)
+	syncH.SetUserRepo(userRepo)
+	syncH.RegisterRoutes(mediaMux, syncapi.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
 	})
-	notifications.New(store).RegisterRoutes(mediaMux, notifications.AuthFuncs{
+	notifH := notifications.New(store)
+	notifH.SubscribeEvents(bus)
+	notifH.RegisterRoutes(mediaMux, notifications.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
@@ -367,6 +412,9 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	compatCoreSvc := compatcore.New(cfg, store, userRepo, libRepo, sessionMgr, registry)
 	compatCoreSvc.SetAuthService(authSvc)
 	compatCoreSvc.SetWSHub(wsHub)
+	compatCoreSvc.SetTaskStopper(func(id string) bool {
+		return taskMgr.Stop(id) == nil
+	})
 	compatCoreH := compatCoreSvc.BuildRouter(compatcore.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
@@ -375,6 +423,8 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	compatExtSvc := compatext.New(store, cfg)
 	compatExtSvc.SetLiveTV(livetvH)
 	compatExtSvc.SetDVR(dvrRec)
+	compatExtSvc.SetLibraryRepo(libRepo)
+	compatExtSvc.SetUserRepo(userRepo)
 	compatExtH := compatExtSvc.BuildRouter(compatext.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,

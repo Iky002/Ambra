@@ -37,15 +37,12 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 		wrapAdmin = wrapAuth
 	}
 
-	handleAuth := func(pattern string, fn http.HandlerFunc) {
-		mux.Handle(pattern, wrapAuth(fn))
-	}
 	handleAdmin := func(pattern string, fn http.HandlerFunc) {
 		mux.Handle(pattern, wrapAdmin(fn))
 	}
 
-	handleAuth("GET /ScheduledTasks", h.handleListTasks)
-	handleAuth("GET /ScheduledTasks/{Id}", h.handleGetTask)
+	handleAdmin("GET /ScheduledTasks", h.handleListTasks)
+	handleAdmin("GET /ScheduledTasks/{Id}", h.handleGetTask)
 	// Dispatch both "POST /ScheduledTasks/Running/{Id}" and "POST /ScheduledTasks/{Id}/Triggers"
 	// through a single pattern to avoid net/http.ServeMux precedence conflict on /ScheduledTasks/Running/Triggers.
 	handleAdmin("POST /ScheduledTasks/{Seg1}/{Seg2}", h.handlePostDispatch)
@@ -54,11 +51,28 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 
 func (h *Handler) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
-	includeHidden := false
-	if b := q.Bool("IsHidden"); b != nil {
-		includeHidden = *b
+	isHidden := q.Bool("IsHidden")
+	isEnabled := q.Bool("IsEnabled")
+
+	all := h.mgr.List(true)
+	filtered := make([]scheduler.TaskInfo, 0, len(all))
+	for _, t := range all {
+		if isHidden != nil {
+			if t.IsHidden != *isHidden {
+				continue
+			}
+		} else if t.IsHidden {
+			continue
+		}
+		if isEnabled != nil {
+			enabled := len(t.Triggers) > 0
+			if enabled != *isEnabled {
+				continue
+			}
+		}
+		filtered = append(filtered, t)
 	}
-	httpx.JSON(w, http.StatusOK, h.mgr.List(includeHidden))
+	httpx.JSON(w, http.StatusOK, filtered)
 }
 
 func (h *Handler) handleGetTask(w http.ResponseWriter, r *http.Request) {

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -123,6 +125,13 @@ func (h *Handler) handleContentDirectoryControl(w http.ResponseWriter, r *http.R
 			return
 		}
 		writeXML(w, r, http.StatusOK, wrapSOAPResponse(contentDirectoryServiceType, "BrowseResponse", resp))
+	case "Search":
+		resp, err := h.handleSearch(r.Context(), r, params)
+		if err != nil {
+			writeSOAPFault(w, r, 708, err.Error())
+			return
+		}
+		writeXML(w, r, http.StatusOK, wrapSOAPResponse(contentDirectoryServiceType, "SearchResponse", resp))
 	case "GetSystemUpdateID":
 		h.mu.RLock()
 		uid := h.systemUpdate
@@ -179,6 +188,7 @@ func (h *Handler) handleBrowse(ctx context.Context, r *http.Request, params map[
 		startIdx = 0
 	}
 	reqCount, _ := strconv.Atoi(strings.TrimSpace(params["RequestedCount"]))
+	sortCriteria := strings.TrimSpace(params["SortCriteria"])
 	baseURL := h.baseURL(r)
 
 	var didlEntries []string
@@ -193,7 +203,7 @@ func (h *Handler) handleBrowse(ctx context.Context, r *http.Request, params map[
 		didlEntries = append(didlEntries, entry)
 		totalMatches = 1
 	default:
-		entries, total, err := h.browseDirectChildren(ctx, objectID, startIdx, reqCount, baseURL)
+		entries, total, err := h.browseDirectChildren(ctx, objectID, startIdx, reqCount, sortCriteria, baseURL)
 		if err != nil {
 			return "", err
 		}
@@ -216,6 +226,164 @@ func (h *Handler) handleBrowse(ctx context.Context, r *http.Request, params map[
 	), nil
 }
 
+var (
+	reSearchTitle = regexp.MustCompile(`(?i)\bdc:title\s+(?:contains|=)\s+["']([^"']+)["']`)
+	reSearchClass = regexp.MustCompile(`(?i)\bupnp:class\s+(?:derivedfrom|=)\s+["']([^"']+)["']`)
+)
+
+func (h *Handler) handleSearch(ctx context.Context, r *http.Request, params map[string]string) (string, error) {
+	containerID := strings.TrimSpace(params["ContainerID"])
+	if containerID == "" {
+		containerID = "0"
+	}
+	searchCriteria := strings.TrimSpace(params["SearchCriteria"])
+	startIdx, _ := strconv.Atoi(strings.TrimSpace(params["StartingIndex"]))
+	if startIdx < 0 {
+		startIdx = 0
+	}
+	reqCount, _ := strconv.Atoi(strings.TrimSpace(params["RequestedCount"]))
+	sortCriteria := strings.TrimSpace(params["SortCriteria"])
+	baseURL := h.baseURL(r)
+
+	var didlEntries []string
+	totalMatches := 0
+
+	if h.libRepo != nil {
+		titleQuery, itemTypes := parseSearchCriteria(searchCriteria)
+		sortBy, sortOrder := parseSortCriteria(sortCriteria)
+
+		filter := sqlite.ItemFilter{
+			ServerID:         h.cfg.ServerID,
+			SearchTerm:       titleQuery,
+			IncludeItemTypes: itemTypes,
+			SortBy:           sortBy,
+			SortOrder:        sortOrder,
+			StartIndex:       startIdx,
+			Limit:            reqCount,
+		}
+		if containerID != "0" {
+			if _, libErr := h.libRepo.GetLibrary(ctx, containerID); libErr == nil {
+				filter.LibraryID = containerID
+			} else {
+				filter.ParentID = containerID
+				filter.Recursive = true
+			}
+		}
+
+		items, total, err := h.libRepo.QueryItems(ctx, filter)
+		if err != nil {
+			return "", err
+		}
+		// Fallback to case-insensitive substring match on Name when FTS index is empty or misses mid-word substrings.
+		if total == 0 && titleQuery != "" {
+			fallbackFilter := filter
+			fallbackFilter.SearchTerm = ""
+			fallbackFilter.StartIndex = 0
+			fallbackFilter.Limit = 0
+			allItems, _, fbErr := h.libRepo.QueryItems(ctx, fallbackFilter)
+			if fbErr != nil {
+				return "", fbErr
+			}
+			needle := strings.ToLower(titleQuery)
+			matched := make([]dto.BaseItemDto, 0, len(allItems))
+			for _, it := range allItems {
+				if strings.Contains(strings.ToLower(it.Name), needle) ||
+					strings.Contains(strings.ToLower(it.OriginalTitle), needle) {
+					matched = append(matched, it)
+				}
+			}
+			total = len(matched)
+			if startIdx >= total {
+				items = nil
+			} else {
+				end := total
+				if reqCount > 0 && startIdx+reqCount < end {
+					end = startIdx + reqCount
+				}
+				items = matched[startIdx:end]
+			}
+		}
+		didlEntries = make([]string, 0, len(items))
+		for _, it := range items {
+			didlEntries = append(didlEntries, itemToDIDL(it, baseURL))
+		}
+		totalMatches = total
+	}
+
+	didl := fmt.Sprintf(
+		`<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/">%s</DIDL-Lite>`,
+		strings.Join(didlEntries, ""),
+	)
+
+	h.mu.RLock()
+	uid := h.systemUpdate
+	h.mu.RUnlock()
+
+	return fmt.Sprintf(
+		"<Result>%s</Result><NumberReturned>%d</NumberReturned><TotalMatches>%d</TotalMatches><UpdateID>%d</UpdateID>",
+		xmlEscape(didl), len(didlEntries), totalMatches, uid,
+	), nil
+}
+
+func parseSearchCriteria(criteria string) (titleQuery string, itemTypes []string) {
+	criteria = strings.TrimSpace(criteria)
+	if criteria == "" || criteria == "*" {
+		return "", nil
+	}
+	if m := reSearchTitle.FindStringSubmatch(criteria); len(m) == 2 {
+		titleQuery = strings.TrimSpace(m[1])
+	}
+	if m := reSearchClass.FindStringSubmatch(criteria); len(m) == 2 {
+		cls := strings.ToLower(strings.TrimSpace(m[1]))
+		switch {
+		case cls == "object.item.videoitem.movie":
+			itemTypes = []string{"Movie"}
+		case cls == "object.item.videoitem.videobroadcast":
+			itemTypes = []string{"Episode"}
+		case strings.HasPrefix(cls, "object.item.videoitem"):
+			itemTypes = []string{"Movie", "Episode", "Video", "MusicVideo"}
+		case strings.HasPrefix(cls, "object.item.audioitem"):
+			itemTypes = []string{"Audio"}
+		case strings.HasPrefix(cls, "object.item.imageitem"):
+			itemTypes = []string{"Photo"}
+		case cls == "object.container.album.musicalbum":
+			itemTypes = []string{"MusicAlbum"}
+		case strings.HasPrefix(cls, "object.container"):
+			itemTypes = []string{"Folder", "Series", "Season", "MusicAlbum", "MusicArtist", "BoxSet", "Playlist"}
+		}
+	}
+	return titleQuery, itemTypes
+}
+
+func parseSortCriteria(criteria string) (sortBy []string, sortOrder string) {
+	criteria = strings.TrimSpace(criteria)
+	if criteria == "" {
+		return nil, ""
+	}
+	for _, token := range strings.Split(criteria, ",") {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		dir := "Ascending"
+		switch token[0] {
+		case '+':
+			dir = "Ascending"
+			token = strings.TrimSpace(token[1:])
+		case '-':
+			dir = "Descending"
+			token = strings.TrimSpace(token[1:])
+		}
+		switch strings.ToLower(token) {
+		case "dc:title":
+			return []string{"SortName"}, dir
+		case "dc:date":
+			return []string{"PremiereDate", "DateCreated"}, dir
+		}
+	}
+	return nil, ""
+}
+
 func (h *Handler) browseMetadata(ctx context.Context, objectID, baseURL string) (string, error) {
 	if objectID == "0" {
 		return fmt.Sprintf(
@@ -236,15 +404,27 @@ func (h *Handler) browseMetadata(ctx context.Context, objectID, baseURL string) 
 	return itemToDIDL(*item, baseURL), nil
 }
 
-func (h *Handler) browseDirectChildren(ctx context.Context, objectID string, startIdx, reqCount int, baseURL string) ([]string, int, error) {
+func (h *Handler) browseDirectChildren(ctx context.Context, objectID string, startIdx, reqCount int, sortCriteria, baseURL string) ([]string, int, error) {
 	if h.libRepo == nil {
 		return nil, 0, nil
 	}
+
+	sortBy, sortOrder := parseSortCriteria(sortCriteria)
 
 	if objectID == "0" {
 		libs, err := h.libRepo.ListLibraries(ctx)
 		if err != nil {
 			return nil, 0, err
+		}
+		if len(sortBy) > 0 && sortBy[0] == "SortName" {
+			desc := strings.EqualFold(sortOrder, "Descending")
+			sort.Slice(libs, func(i, j int) bool {
+				li, lj := strings.ToLower(libs[i].Name), strings.ToLower(libs[j].Name)
+				if desc {
+					return li > lj
+				}
+				return li < lj
+			})
 		}
 		total := len(libs)
 		if startIdx >= total {
@@ -264,6 +444,8 @@ func (h *Handler) browseDirectChildren(ctx context.Context, objectID string, sta
 	items, total, err := h.libRepo.QueryItems(ctx, sqlite.ItemFilter{
 		ServerID:   h.cfg.ServerID,
 		ParentID:   objectID,
+		SortBy:     sortBy,
+		SortOrder:  sortOrder,
 		StartIndex: startIdx,
 		Limit:      reqCount,
 	})
@@ -276,6 +458,8 @@ func (h *Handler) browseDirectChildren(ctx context.Context, objectID string, sta
 			items, total, err = h.libRepo.QueryItems(ctx, sqlite.ItemFilter{
 				ServerID:   h.cfg.ServerID,
 				LibraryID:  objectID,
+				SortBy:     sortBy,
+				SortOrder:  sortOrder,
 				StartIndex: startIdx,
 				Limit:      reqCount,
 			})
@@ -512,6 +696,21 @@ const contentDirectorySCPDXML = `<?xml version="1.0" encoding="utf-8"?>
       </argumentList>
     </action>
     <action>
+      <name>Search</name>
+      <argumentList>
+        <argument><name>ContainerID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_ObjectID</relatedStateVariable></argument>
+        <argument><name>SearchCriteria</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_SearchCriteria</relatedStateVariable></argument>
+        <argument><name>Filter</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Filter</relatedStateVariable></argument>
+        <argument><name>StartingIndex</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Index</relatedStateVariable></argument>
+        <argument><name>RequestedCount</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>
+        <argument><name>SortCriteria</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_SortCriteria</relatedStateVariable></argument>
+        <argument><name>Result</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Result</relatedStateVariable></argument>
+        <argument><name>NumberReturned</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>
+        <argument><name>TotalMatches</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>
+        <argument><name>UpdateID</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_UpdateID</relatedStateVariable></argument>
+      </argumentList>
+    </action>
+    <action>
       <name>GetSystemUpdateID</name>
       <argumentList>
         <argument><name>Id</name><direction>out</direction><relatedStateVariable>SystemUpdateID</relatedStateVariable></argument>
@@ -536,6 +735,7 @@ const contentDirectorySCPDXML = `<?xml version="1.0" encoding="utf-8"?>
     <stateVariable sendEvents="no"><name>SortCapabilities</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_ObjectID</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_BrowseFlag</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_SearchCriteria</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_Filter</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_Index</name><dataType>ui4</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_Count</name><dataType>ui4</dataType></stateVariable>
