@@ -1,8 +1,8 @@
-# 02. Emby 4.10.2.0 全量 582 条 API 兼容矩阵
+# Emby 4.10.2.0 全量 API 兼容矩阵
 
-[← 返回文档中心](../README.md) · [查看分阶段开发计划](01-development-roadmap.md)
+[← 返回文档中心](../README.md)
 
-本表将 `emby-4.10.2.0-api/` 中的 **7 个模块目录、23 份子文档、共 582 条路由** 全量映射到开发阶段，作为持续开发与契约覆盖率追踪的唯一基准清单。
+本表汇总 `emby-4.10.2.0-api/` 中的 **7 个模块目录、23 份子文档** 与当前契约测试覆盖状态（`tests/compat` 校验全部 583 条 Method+Path 组合）。
 
 > 状态图例：`⬜ 待开发` · `🟡 部分实现` · `✅ 已完成`
 
@@ -35,7 +35,7 @@
 | **07. 内置插件 API** *(31)* | [dlna.md](../emby-4.10.2.0-api/07-builtin-plugins/dlna.md) | `/Dlna` (`Emby.Dlna`) | 26 | Phase 6 | Phase 6 | ✅ 已完成 |
 | | [backup-restore.md](../emby-4.10.2.0-api/07-builtin-plugins/backup-restore.md) | `/BackupRestore` (`MBBackup`) | 3 | Phase 4 | Phase 4 | ✅ 已完成 |
 | | [webhooks.md](../emby-4.10.2.0-api/07-builtin-plugins/webhooks.md) | `/Webhooks` (`Emby.Webhooks`) | 2 | Phase 4 | Phase 4 | ✅ 已完成 |
-| **总计** | **23 份子文档** | **71 个一级路由前缀** | **582** | **Phase 1** | **Phase 6** | **全部 7 大业务域语义实现 + 95.5% 语句测试覆盖率** |
+| **总计** | **23 份子文档** | **71 个一级路由前缀** | **582** | **Phase 1** | **Phase 6** | **全部 7 大业务域语义实现 + 583/583 契约测试全通过（CI 覆盖率门禁 ≥90%）** |
 
 ---
 
