@@ -202,7 +202,7 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 	r.Post("/Items/{Id}/Refresh", adminFn(h.handleItemRefresh))
 	r.Post("/Items/Delete", adminFn(h.handleDeleteItemsBatch))
 	r.Delete("/Items", adminFn(h.handleDeleteItemsBatch))
-	r.Post("/Items/Access", authFn(h.handleItemsAccess))
+	r.Post("/Items/Access", adminFn(h.handleItemsAccess))
 	r.Post("/Items/Shared/Leave", authFn(h.handleSharedLeave))
 	r.Post("/Items/{ItemId}", adminFn(h.handleUpdateItem))
 	r.Get("/Items/{ItemId}/MetadataEditor", adminFn(h.handleMetadataEditor))

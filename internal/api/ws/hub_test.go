@@ -262,3 +262,60 @@ func TestHubFullLifecycleAndEvents(t *testing.T) {
 		t.Fatalf("expected 1 buffered message, got %d", len(fullClient.sendCh))
 	}
 }
+
+func TestHubSecurityDeviceIDBindingAndAdminSubscriptions(t *testing.T) {
+	hub, authSvc, sessMgr, bus, srv := setupWSHub(t)
+	ctx := context.Background()
+
+	adminUser, _ := authSvc.CreateUser(ctx, "admin", "pw", true)
+	bobUser, _ := authSvc.CreateUser(ctx, "bob", "pw", false)
+	_, _ = authSvc.AuthenticateByName(ctx, "admin", "pw", "", auth.ClientInfo{DeviceID: "dev-admin"})
+	bobAuth, _ := authSvc.AuthenticateByName(ctx, "bob", "pw", "", auth.ClientInfo{DeviceID: "dev-bob"})
+
+	sessMgr.TouchSession(adminUser, auth.ClientInfo{DeviceID: "dev-admin", Device: "AdminPC", Client: "Web"})
+	sessMgr.TouchSession(bobUser, auth.ClientInfo{DeviceID: "dev-bob", Device: "BobPhone", Client: "iOS"})
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	// 1. Non-admin Bob attempts to spoof ?deviceId=dev-admin -> must stay bound to dev-bob
+	bobConn, _, err := websocket.Dial(ctx, wsURL+"/embywebsocket?api_key="+bobAuth.AccessToken+"&deviceId=dev-admin", nil)
+	if err != nil {
+		t.Fatalf("dial bob ws: %v", err)
+	}
+	defer bobConn.Close(websocket.StatusNormalClosure, "")
+	_ = readMsg(t, bobConn) // ForceKeepAlive
+
+	// SendToDevice("dev-admin") must NOT reach Bob; SendToDevice("dev-bob") MUST reach Bob
+	hub.SendToDevice("dev-admin", Message{MessageType: "GeneralCommand", Data: "admin-secret"})
+	hub.SendToDevice("dev-bob", Message{MessageType: "GeneralCommand", Data: "bob-msg"})
+	if m := readMsg(t, bobConn); m.MessageType != "GeneralCommand" || m.Data != "bob-msg" {
+		t.Fatalf("expected only bob-msg (not admin-secret), got %+v", m)
+	}
+
+	// 2. Non-admin Bob sending SessionsStart receives ONLY Bob's session (not admin's)
+	if err := wsjson.Write(ctx, bobConn, Message{MessageType: "SessionsStart"}); err != nil {
+		t.Fatal(err)
+	}
+	m := readMsg(t, bobConn)
+	if m.MessageType != "Sessions" {
+		t.Fatalf("expected Sessions, got %+v", m)
+	}
+	list, ok := m.Data.([]any)
+	if !ok || len(list) != 1 {
+		t.Fatalf("expected exactly 1 session (bob only), got %#v", m.Data)
+	}
+	first, _ := list[0].(map[string]any)
+	if first["UserId"] != bobUser.ID {
+		t.Fatalf("expected bob's session UserId=%s, got %#v", bobUser.ID, first)
+	}
+
+	// 3. Non-admin Bob sending ScheduledTasksInfoStart & ActivityLogEntryStart must NOT receive EventTaskProgress
+	_ = wsjson.Write(ctx, bobConn, Message{MessageType: "ScheduledTasksInfoStart"})
+	_ = wsjson.Write(ctx, bobConn, Message{MessageType: "ActivityLogEntryStart"})
+	time.Sleep(40 * time.Millisecond)
+	bus.Publish(ctx, eventbus.Event{Type: eventbus.EventTaskProgress, Payload: "secret-task-progress"})
+	_ = wsjson.Write(ctx, bobConn, Message{MessageType: "KeepAlive"})
+	if m := readMsg(t, bobConn); m.MessageType != "KeepAlive" {
+		t.Fatalf("non-admin must not receive ScheduledTasksInfo; expected KeepAlive, got %+v", m)
+	}
+}

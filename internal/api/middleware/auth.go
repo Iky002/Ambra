@@ -117,7 +117,11 @@ func (a *Auth) resolve(r *http.Request) *AuthContext {
 	ac.User = id.User
 	ac.IsAPIKey = id.IsAPIKey
 	ac.APIKeyName = id.APIKeyName
-	if ac.Client.DeviceID == "" {
+	// For user session tokens, always enforce the token-bound DeviceID when present
+	// so callers cannot spoof another user's or device's DeviceId via headers/query params.
+	if !id.IsAPIKey && id.DeviceID != "" {
+		ac.Client.DeviceID = id.DeviceID
+	} else if ac.Client.DeviceID == "" {
 		ac.Client.DeviceID = id.DeviceID
 	}
 	if ac.Client.Device == "" {

@@ -72,12 +72,16 @@ func (h *Handler) resolveUserID(r *http.Request, explicit string) string {
 }
 
 func (h *Handler) handleListParties(w http.ResponseWriter, r *http.Request) {
+	callerID, isAdmin, hasAuth := callerAuth(r)
 	h.mu.RLock()
-	items := append([]Party(nil), h.state.Parties...)
-	h.mu.RUnlock()
-	if items == nil {
-		items = []Party{}
+	items := make([]Party, 0, len(h.state.Parties))
+	for _, p := range h.state.Parties {
+		if hasAuth && !isAdmin && (callerID == "" || (guid.Normalize(p.HostUserId) != callerID && !isPartyMember(p.Members, callerID))) {
+			continue
+		}
+		items = append(items, p)
 	}
+	h.mu.RUnlock()
 	httpx.JSON(w, http.StatusOK, items)
 }
 
@@ -129,10 +133,15 @@ func (h *Handler) handleCreateParty(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleGetParty(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
+	callerID, isAdmin, hasAuth := callerAuth(r)
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for _, p := range h.state.Parties {
 		if p.Id == id {
+			if hasAuth && !isAdmin && (callerID == "" || (guid.Normalize(p.HostUserId) != callerID && !isPartyMember(p.Members, callerID))) {
+				httpx.Error(w, http.StatusForbidden, "only party members, host, or an administrator can view this party")
+				return
+			}
 			httpx.JSON(w, http.StatusOK, p)
 			return
 		}

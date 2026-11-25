@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/ambra-media/ambra/internal/core/ffmpegbin"
@@ -31,10 +32,11 @@ type Config struct {
 	FFmpegPath               string `json:"ffmpeg_path"`
 	FFprobePath              string `json:"ffprobe_path"`
 	TMDBApiKey               string `json:"tmdb_api_key"`
-	TMDBLanguage             string `json:"tmdb_language"`
-	EnableSTRM302            bool   `json:"enable_strm_302"`
+	TMDBLanguage             string  `json:"tmdb_language"`
+	EnableSTRM302            bool    `json:"enable_strm_302"`
+	EnableDLNA               bool    `json:"enable_dlna"`
 	PlayedThreshold          float64 `json:"played_threshold"`
-	IsStartupWizardCompleted bool   `json:"is_startup_wizard_completed"`
+	IsStartupWizardCompleted bool    `json:"is_startup_wizard_completed"`
 }
 
 func Default(dataDir string) *Config {
@@ -50,6 +52,7 @@ func Default(dataDir string) *Config {
 		FFprobePath:              "ffprobe",
 		TMDBLanguage:             "zh-CN",
 		EnableSTRM302:            true,
+		EnableDLNA:               true,
 		PlayedThreshold:          0.90,
 		IsStartupWizardCompleted: false,
 	}
@@ -99,6 +102,14 @@ func Load(dataDir string) (*Config, error) {
 	}
 	if v := os.Getenv("AMBRA_TMDB_API_KEY"); v != "" {
 		cfg.TMDBApiKey = v
+	}
+	if v := strings.TrimSpace(os.Getenv("AMBRA_ENABLE_DLNA")); v != "" {
+		switch strings.ToLower(v) {
+		case "false", "0", "off", "no":
+			cfg.EnableDLNA = false
+		case "true", "1", "on", "yes":
+			cfg.EnableDLNA = true
+		}
 	}
 
 	// Resolve ffmpeg/ffprobe paths via ffmpegbin manager:

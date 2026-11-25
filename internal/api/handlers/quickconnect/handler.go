@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -19,6 +18,7 @@ import (
 	"github.com/ambra-media/ambra/internal/core/auth"
 	"github.com/ambra-media/ambra/internal/core/session"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -407,37 +407,7 @@ func (h *Handler) pruneExpiredLocked(now time.Time) {
 }
 
 func clientIP(r *http.Request) string {
-	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
-		for _, part := range strings.Split(xff, ",") {
-			cand := strings.TrimSpace(part)
-			if cand == "" {
-				continue
-			}
-			if host, _, err := net.SplitHostPort(cand); err == nil {
-				cand = host
-			}
-			if ip := net.ParseIP(cand); ip != nil {
-				return ip.String()
-			}
-		}
-	}
-	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
-		cand := xri
-		if host, _, err := net.SplitHostPort(cand); err == nil {
-			cand = host
-		}
-		if ip := net.ParseIP(cand); ip != nil {
-			return ip.String()
-		}
-	}
-	addr := strings.TrimSpace(r.RemoteAddr)
-	if addr == "" {
-		return ""
-	}
-	if host, _, err := net.SplitHostPort(addr); err == nil {
-		return host
-	}
-	return addr
+	return netutil.ClientIP(r)
 }
 
 func generateSecret() (string, error) {

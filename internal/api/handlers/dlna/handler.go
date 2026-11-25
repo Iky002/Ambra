@@ -26,6 +26,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -188,35 +189,62 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 				h.serveProfileByID(w, seg2)
 			})).ServeHTTP(w, r)
 		case seg1 == "icons":
+			if !h.checkDLNAAccess(w, r) {
+				return
+			}
 			h.serveIcon(w, r, seg2)
 		case seg2 == "description.xml" || seg2 == "description":
+			if !h.checkDLNAAccess(w, r) {
+				return
+			}
 			h.serveDescriptionXML(w, r, seg1)
 		default:
 			httpx.Error(w, http.StatusNotFound, "not found")
 		}
 	})
 
-	// Public UPnP SCPD documents (GET also matches HEAD in Go 1.22+ ServeMux)
-	mux.HandleFunc("GET /Dlna/{UuId}/contentdirectory/contentdirectory.xml", h.handleContentDirectoryXML)
-	mux.HandleFunc("GET /Dlna/{UuId}/contentdirectory/contentdirectory", h.handleContentDirectoryXML)
-	mux.HandleFunc("GET /Dlna/{UuId}/connectionmanager/connectionmanager.xml", h.handleConnectionManagerXML)
-	mux.HandleFunc("GET /Dlna/{UuId}/connectionmanager/connectionmanager", h.handleConnectionManagerXML)
+	// LAN-only UPnP SCPD documents (GET also matches HEAD in Go 1.22+ ServeMux)
+	mux.HandleFunc("GET /Dlna/{UuId}/contentdirectory/contentdirectory.xml", h.requireDLNALANAccess(h.handleContentDirectoryXML))
+	mux.HandleFunc("GET /Dlna/{UuId}/contentdirectory/contentdirectory", h.requireDLNALANAccess(h.handleContentDirectoryXML))
+	mux.HandleFunc("GET /Dlna/{UuId}/connectionmanager/connectionmanager.xml", h.requireDLNALANAccess(h.handleConnectionManagerXML))
+	mux.HandleFunc("GET /Dlna/{UuId}/connectionmanager/connectionmanager", h.requireDLNALANAccess(h.handleConnectionManagerXML))
 
-	// Public UPnP SOAP control endpoints
-	mux.HandleFunc("POST /Dlna/{UuId}/contentdirectory/control", h.handleContentDirectoryControl)
-	mux.HandleFunc("POST /Dlna/{UuId}/connectionmanager/control", h.handleConnectionManagerControl)
+	// LAN-only UPnP SOAP control endpoints
+	mux.HandleFunc("POST /Dlna/{UuId}/contentdirectory/control", h.requireDLNALANAccess(h.handleContentDirectoryControl))
+	mux.HandleFunc("POST /Dlna/{UuId}/connectionmanager/control", h.requireDLNALANAccess(h.handleConnectionManagerControl))
 
-	// Public server icons (3-segment form)
-	mux.HandleFunc("GET /Dlna/{UuId}/icons/{Filename}", h.handleIcon)
+	// LAN-only server icons (3-segment form)
+	mux.HandleFunc("GET /Dlna/{UuId}/icons/{Filename}", h.requireDLNALANAccess(h.handleIcon))
 
-	// Signed DLNA media stream endpoint (no RequireAuth; validated via HMAC sig & exp query params)
-	mux.HandleFunc("GET /Dlna/{UuId}/stream/{Id}", h.handleDLNAStream)
+	// LAN-only signed DLNA media stream endpoint (validated via LAN origin + HMAC sig & exp query params)
+	mux.HandleFunc("GET /Dlna/{UuId}/stream/{Id}", h.requireDLNALANAccess(h.handleDLNAStream))
 
-	// Public UPnP GENA event subscriptions (SUBSCRIBE / UNSUBSCRIBE)
-	mux.HandleFunc("SUBSCRIBE /Dlna/{UuId}/contentdirectory/events", h.handleEventSubscribe("contentdirectory"))
-	mux.HandleFunc("UNSUBSCRIBE /Dlna/{UuId}/contentdirectory/events", h.handleEventUnsubscribe("contentdirectory"))
-	mux.HandleFunc("SUBSCRIBE /Dlna/{UuId}/connectionmanager/events", h.handleEventSubscribe("connectionmanager"))
-	mux.HandleFunc("UNSUBSCRIBE /Dlna/{UuId}/connectionmanager/events", h.handleEventUnsubscribe("connectionmanager"))
+	// LAN-only UPnP GENA event subscriptions (SUBSCRIBE / UNSUBSCRIBE)
+	mux.HandleFunc("SUBSCRIBE /Dlna/{UuId}/contentdirectory/events", h.requireDLNALANAccess(h.handleEventSubscribe("contentdirectory")))
+	mux.HandleFunc("UNSUBSCRIBE /Dlna/{UuId}/contentdirectory/events", h.requireDLNALANAccess(h.handleEventUnsubscribe("contentdirectory")))
+	mux.HandleFunc("SUBSCRIBE /Dlna/{UuId}/connectionmanager/events", h.requireDLNALANAccess(h.handleEventSubscribe("connectionmanager")))
+	mux.HandleFunc("UNSUBSCRIBE /Dlna/{UuId}/connectionmanager/events", h.requireDLNALANAccess(h.handleEventUnsubscribe("connectionmanager")))
+}
+
+func (h *Handler) checkDLNAAccess(w http.ResponseWriter, r *http.Request) bool {
+	if h.cfg != nil && !h.cfg.EnableDLNA {
+		httpx.Error(w, http.StatusForbidden, "DLNA is disabled")
+		return false
+	}
+	if !netutil.IsLocalOrLANRequest(r) {
+		httpx.Error(w, http.StatusForbidden, "DLNA is restricted to local network")
+		return false
+	}
+	return true
+}
+
+func (h *Handler) requireDLNALANAccess(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !h.checkDLNAAccess(w, r) {
+			return
+		}
+		next(w, r)
+	}
 }
 
 // --- Profile CRUD Handlers ---
@@ -478,6 +506,10 @@ func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if strings.EqualFold(filepath.Ext(mediaPath), ".strm") {
+		httpx.Error(w, http.StatusForbidden, "direct download of .strm files is not permitted")
 		return
 	}
 

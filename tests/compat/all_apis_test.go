@@ -414,7 +414,6 @@ func TestAll582APIsAuthEnforcementMatrix(t *testing.T) {
 		"/emby/Branding/Configuration",
 		"/emby/openapi.json",
 		"/robots.txt",
-		"/Dlna/" + cfg.ServerID + "/description.xml",
 	}
 
 	for _, ep := range publicEndpoints {
@@ -422,6 +421,19 @@ func TestAll582APIsAuthEnforcementMatrix(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Errorf("public GET %s: expected 200 OK, got %d (body=%q)", ep, w.Code, strings.TrimSpace(w.Body.String()))
 		}
+	}
+
+	// 4. DLNA description.xml is restricted to LAN (403 from public IP, 200 from LAN)
+	dlnaDescPath := "/Dlna/" + cfg.ServerID + "/description.xml"
+	if w := sendCompatRequest(srv.Handler, http.MethodGet, dlnaDescPath, "", nil); w.Code != http.StatusForbidden {
+		t.Errorf("public IP GET %s: expected 403 Forbidden, got %d", dlnaDescPath, w.Code)
+	}
+	lanReq := httptest.NewRequest(http.MethodGet, dlnaDescPath, nil)
+	lanReq.RemoteAddr = "127.0.0.1:12345"
+	lanW := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(lanW, lanReq)
+	if lanW.Code != http.StatusOK {
+		t.Errorf("LAN GET %s: expected 200 OK, got %d", dlnaDescPath, lanW.Code)
 	}
 }
 
