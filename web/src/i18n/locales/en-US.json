@@ -97,6 +97,7 @@
   "library.sortDateAdded": "Date Added",
   "library.sortReleaseDate": "Release Date",
   "library.sortRating": "Rating",
+  "library.sortPlayCount": "Play Count",
   "library.filterAll": "All Status",
   "library.filterUnplayed": "Unwatched",
   "library.filterPlayed": "Watched",

@@ -97,6 +97,7 @@
   "library.sortDateAdded": "Date d'ajout",
   "library.sortReleaseDate": "Date de sortie",
   "library.sortRating": "Note",
+  "library.sortPlayCount": "Nombre de lectures",
   "library.filterAll": "Tous les statuts",
   "library.filterUnplayed": "Non vus",
   "library.filterPlayed": "Vus",

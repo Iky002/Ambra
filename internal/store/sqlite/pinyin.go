@@ -247,6 +247,9 @@ func ToPinyin(s string) (full string, initials string) {
 						continue
 					}
 					py := strings.ToLower(pys[0])
+					if py == "" {
+						continue
+					}
 					addFull(py)
 					runFull.WriteString(py)
 					runInit.WriteByte(py[0])

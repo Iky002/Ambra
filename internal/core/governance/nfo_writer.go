@@ -44,15 +44,21 @@ func (s *Service) SetLockedFields(ctx context.Context, itemID string, fields []s
 }
 
 // SetLockState updates LockedFields (when fields != nil) and/or global LockData (when lockData != nil)
-// in items.extra_json so future rescans respect both field-level and whole-item metadata locks.
+// in items.extra_json within a single writer transaction so future rescans respect both locks safely.
 func (s *Service) SetLockState(ctx context.Context, itemID string, fields []string, lockData *bool) (*LockedFieldsResult, error) {
 	itemID = guid.Normalize(itemID)
 	if itemID == "" {
 		return nil, fmt.Errorf("%w: item id is required", ErrInvalidArgument)
 	}
 
+	tx, err := s.store.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
 	var extraRaw string
-	err := s.store.Reader.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		`SELECT extra_json FROM items WHERE id = ?`, itemID,
 	).Scan(&extraRaw)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -87,10 +93,14 @@ func (s *Service) SetLockState(ctx context.Context, itemID string, fields []stri
 	}
 
 	now := time.Now().Unix()
-	if _, err := s.store.Writer.ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE items SET extra_json = ?, date_modified = ? WHERE id = ?`,
 		string(encoded), now, itemID,
 	); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
@@ -261,13 +271,19 @@ func isExistingDir(p string) bool {
 	return err == nil && info.IsDir()
 }
 
-// atomicWriteFile writes data to <target>.tmp, calls Sync(), closes it, and renames to target.
+// atomicWriteFile writes data to a unique temp file in the target directory, calls Sync(),
+// closes it, refuses symlink targets via Lstat, and renames atomically to targetPath.
 func atomicWriteFile(targetPath string, data []byte) error {
-	tmpPath := targetPath + ".tmp"
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if fi, err := os.Lstat(targetPath); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to overwrite symlink nfo target: %s", targetPath)
+		}
+	}
+	f, err := os.CreateTemp(filepath.Dir(targetPath), ".ambra-nfo-*.tmp")
 	if err != nil {
 		return fmt.Errorf("create nfo temp file: %w", err)
 	}
+	tmpPath := f.Name()
 	cleanup := true
 	defer func() {
 		if cleanup {
@@ -285,6 +301,10 @@ func atomicWriteFile(targetPath string, data []byte) error {
 	}
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close nfo temp file: %w", err)
+	}
+	_ = os.Chmod(tmpPath, 0o644)
+	if fi, err := os.Lstat(targetPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to overwrite symlink nfo target: %s", targetPath)
 	}
 	if err := os.Rename(tmpPath, targetPath); err != nil {
 		return fmt.Errorf("rename nfo temp file: %w", err)

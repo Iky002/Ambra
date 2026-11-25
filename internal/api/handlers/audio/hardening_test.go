@@ -297,4 +297,39 @@ func TestAudioStrmResolutionAndFFmpegClamp(t *testing.T) {
 	if recHead.Code != http.StatusOK || recHead.Header().Get("Content-Type") != "audio/flac" || recHead.Body.Len() != 0 {
 		t.Fatalf("expected HEAD 200 audio/flac empty body, got %d ct=%q len=%d", recHead.Code, recHead.Header().Get("Content-Type"), recHead.Body.Len())
 	}
+
+	// Remote HTTP input includes -protocol_whitelist
+	remoteArgs := buildAudioFFmpegArgs("https://93.184.216.34/song.flac", "mp3", "libmp3lame", 192000, 0, 2, 44100)
+	if !strings.Contains(strings.Join(remoteArgs, " "), "-protocol_whitelist http,https,tcp,tls,crypto") {
+		t.Fatalf("expected -protocol_whitelist for remote audio input, got: %v", remoteArgs)
+	}
+
+	// Custom resolver returning local file path must be rejected (no os.Open fallback)
+	h.SetStreamResolver(func(_ context.Context, _ string) (string, error) {
+		return "/etc/passwd", nil
+	})
+	recLocal := httptest.NewRecorder()
+	mux.ServeHTTP(recLocal, httptest.NewRequest(http.MethodGet, "/Audio/"+itemID+"/stream", nil))
+	if recLocal.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 when resolver returns local path, got %d", recLocal.Code)
+	}
+
+	// Concurrency semaphore exhaustion returns 503
+	for i := 0; i < cap(h.transcodeSem); i++ {
+		h.transcodeSem <- struct{}{}
+	}
+	defer func() {
+		for len(h.transcodeSem) > 0 {
+			<-h.transcodeSem
+		}
+	}()
+	localFlac := filepath.Join(tmp, "busy.flac")
+	_ = os.WriteFile(localFlac, []byte("fake"), 0o644)
+	busyID := guid.New()
+	_ = repo.UpsertItem(ctx, &sqlite.ItemRecord{ID: busyID, LibraryID: "lib1", Type: "Audio", Name: "Busy", Path: localFlac})
+	recBusy := httptest.NewRecorder()
+	mux.ServeHTTP(recBusy, httptest.NewRequest(http.MethodGet, "/Audio/"+busyID+"/universal.mp3?Container=mp3", nil))
+	if recBusy.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when audio transcode concurrency limit reached, got %d", recBusy.Code)
+	}
 }

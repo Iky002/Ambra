@@ -6,7 +6,6 @@ import (
 	"embed"
 	"io/fs"
 	"path"
-	"strings"
 )
 
 //go:embed bin/ffmpeg*
@@ -36,7 +35,7 @@ func loadFirstEmbedded(fsys embed.FS, prefix string) []byte {
 			continue
 		}
 		name := entry.Name()
-		if !strings.HasPrefix(name, prefix) {
+		if name != prefix && name != prefix+".exe" {
 			continue
 		}
 		data, err := fsys.ReadFile(path.Join("bin", name))

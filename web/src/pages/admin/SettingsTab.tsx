@@ -7,9 +7,15 @@ import { FeedbackBanner, ToggleSwitch } from './adminUtils'
 
 const TMDB_LANGUAGE_OPTIONS = [
   { value: 'zh-CN', label: '简体中文 (zh-CN)' },
-  { value: 'zh-TW', label: '繁体中文 (zh-TW)' },
+  { value: 'zh-TW', label: '繁體中文 (zh-TW)' },
   { value: 'en-US', label: 'English (en-US)' },
   { value: 'ja-JP', label: '日本語 (ja-JP)' },
+  { value: 'ko-KR', label: '한국어 (ko-KR)' },
+  { value: 'es-ES', label: 'Español (es-ES)' },
+  { value: 'de-DE', label: 'Deutsch (de-DE)' },
+  { value: 'fr-FR', label: 'Français (fr-FR)' },
+  { value: 'pt-BR', label: 'Português (pt-BR)' },
+  { value: 'th-TH', label: 'ไทย (th-TH)' },
 ] as const
 
 export function SettingsTab() {

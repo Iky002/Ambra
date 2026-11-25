@@ -175,6 +175,8 @@ export interface StreamMkvOptions {
   initialHeaderBytes?: number
   /** 最大超前缓冲秒数，超过后暂停拉流避免内存堆积（默认 30s） */
   maxBufferAheadSec?: number
+  /** 目标音轨索引（0-based 音轨序号，或回退匹配 MKV TrackNumber；未指定则默认选择第一条音轨） */
+  audioTrackIndex?: number
   /** 自定义 fetch 实现（方便单元测试注入） */
   fetchImpl?: typeof fetch
   /** 外部取消信号 */
@@ -1307,6 +1309,7 @@ export class StreamMkvRemuxer {
   private pumpGeneration = 0
   private activeAbort: AbortController | null = null
   private resumeResolver: (() => void) | null = null
+  private seekChain: Promise<void> = Promise.resolve()
 
   private boundOnSeeking: (() => void) | null = null
   private boundOnTimeUpdate: (() => void) | null = null
@@ -1400,7 +1403,19 @@ export class StreamMkvRemuxer {
 
     this.cues = cues
     this.videoTrack = tracks.find((t) => t.trackType === 'video')
-    this.audioTrack = tracks.find((t) => t.trackType === 'audio')
+    const audioTracks = tracks.filter((t) => t.trackType === 'audio')
+    if (
+      opts.audioTrackIndex !== undefined &&
+      Number.isInteger(opts.audioTrackIndex) &&
+      opts.audioTrackIndex >= 0
+    ) {
+      this.audioTrack =
+        audioTracks[opts.audioTrackIndex] ??
+        audioTracks.find((t) => t.trackNumber === opts.audioTrackIndex) ??
+        audioTracks[0]
+    } else {
+      this.audioTrack = audioTracks[0]
+    }
 
     const { videoMime, audioMime } = resolveMkvMimeType(this.videoTrack, this.audioTrack)
     if (!this.videoTrack || !videoMime || !MediaSource.isTypeSupported(videoMime)) {
@@ -1426,52 +1441,68 @@ export class StreamMkvRemuxer {
       this.currentByteOffset = clusterSeek ? clusterSeek.fileOffset : scanPos
     }
 
-    // 初始化 MediaSource 与 SourceBuffer
+    // 初始化 MediaSource 与 SourceBuffer（异常时清理已创建的 objectUrl，防止内存泄漏）
     const ms = new MediaSource()
     this.mediaSource = ms
     const url = URL.createObjectURL(ms)
     this.objectUrl = url
 
-    await new Promise<void>((resolve, reject) => {
-      const onOpen = () => {
-        ms.removeEventListener('sourceopen', onOpen)
-        resolve()
-      }
-      ms.addEventListener('sourceopen', onOpen, { once: true })
-      if (opts.signal) {
-        opts.signal.addEventListener(
-          'abort',
-          () => {
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const onOpen = () => {
+          ms.removeEventListener('sourceopen', onOpen)
+          resolve()
+        }
+        ms.addEventListener('sourceopen', onOpen, { once: true })
+        if (opts.signal) {
+          if (opts.signal.aborted) {
             ms.removeEventListener('sourceopen', onOpen)
             reject(new StreamMkvFallbackError('aborted', '已取消 MSE 初始化'))
-          },
-          { once: true },
-        )
+            return
+          }
+          opts.signal.addEventListener(
+            'abort',
+            () => {
+              ms.removeEventListener('sourceopen', onOpen)
+              reject(new StreamMkvFallbackError('aborted', '已取消 MSE 初始化'))
+            },
+            { once: true },
+          )
+        }
+        videoEl.src = url
+      })
+
+      if (this.disposed) {
+        throw new StreamMkvFallbackError('aborted', 'StreamMkvRemuxer 已销毁')
       }
-      videoEl.src = url
-    })
 
-    if (this.disposed) {
-      throw new StreamMkvFallbackError('aborted', 'StreamMkvRemuxer 已销毁')
-    }
-
-    if (this.durationSec > 0 && Number.isFinite(this.durationSec)) {
-      try {
-        ms.duration = this.durationSec
-      } catch {
-        // 某些浏览器或测试 stub 中 duration 可能只读
+      if (this.durationSec > 0 && Number.isFinite(this.durationSec)) {
+        try {
+          ms.duration = this.durationSec
+        } catch {
+          // 某些浏览器或测试 stub 中 duration 可能只读
+        }
       }
-    }
 
-    // 为视频轨和音频轨分别建立独立 SourceBuffer 并写入 init segment
-    this.videoSb = ms.addSourceBuffer(videoMime)
-    const videoInit = buildFmp4InitSegment([this.videoTrack], { durationSec: this.durationSec })
-    await this.appendToBuffer(this.videoSb, videoInit)
+      // 为视频轨和音频轨分别建立独立 SourceBuffer 并写入 init segment
+      this.videoSb = ms.addSourceBuffer(videoMime)
+      const videoInit = buildFmp4InitSegment([this.videoTrack], { durationSec: this.durationSec })
+      await this.appendToBuffer(this.videoSb, videoInit)
 
-    if (this.audioTrack && audioMime) {
-      this.audioSb = ms.addSourceBuffer(audioMime)
-      const audioInit = buildFmp4InitSegment([this.audioTrack], { durationSec: this.durationSec })
-      await this.appendToBuffer(this.audioSb, audioInit)
+      if (this.audioTrack && audioMime) {
+        this.audioSb = ms.addSourceBuffer(audioMime)
+        const audioInit = buildFmp4InitSegment([this.audioTrack], { durationSec: this.durationSec })
+        await this.appendToBuffer(this.audioSb, audioInit)
+      }
+    } catch (err) {
+      if (this.objectUrl) {
+        URL.revokeObjectURL(this.objectUrl)
+        this.objectUrl = null
+      }
+      this.mediaSource = null
+      this.videoSb = null
+      this.audioSb = null
+      throw err
     }
 
     // 绑定 seeking 与 timeupdate 事件监听
@@ -1508,6 +1539,74 @@ export class StreamMkvRemuxer {
     return this.segmentDataOffset
   }
 
+  private waitForBufferIdle(sb: SourceBuffer): Promise<void> {
+    if (this.disposed || !sb.updating) return Promise.resolve()
+    return new Promise<void>((resolve) => {
+      const done = () => {
+        sb.removeEventListener('updateend', done)
+        sb.removeEventListener('error', done)
+        resolve()
+      }
+      sb.addEventListener('updateend', done, { once: true })
+      sb.addEventListener('error', done, { once: true })
+    })
+  }
+
+  private removeFromBuffer(sb: SourceBuffer, start: number, end: number): Promise<void> {
+    if (this.disposed || typeof sb.remove !== 'function' || end <= start) {
+      return Promise.resolve()
+    }
+    return new Promise<void>((resolve) => {
+      const doRemove = () => {
+        if (this.disposed) {
+          resolve()
+          return
+        }
+        const onDone = () => {
+          sb.removeEventListener('updateend', onDone)
+          sb.removeEventListener('error', onDone)
+          resolve()
+        }
+        sb.addEventListener('updateend', onDone, { once: true })
+        sb.addEventListener('error', onDone, { once: true })
+        try {
+          sb.remove(start, end)
+        } catch {
+          sb.removeEventListener('updateend', onDone)
+          sb.removeEventListener('error', onDone)
+          resolve()
+        }
+      }
+      if (sb.updating) {
+        sb.addEventListener('updateend', doRemove, { once: true })
+      } else {
+        doRemove()
+      }
+    })
+  }
+
+  /** 定期驱逐 currentTime - 30 之前的旧 MSE 缓冲，防止长片触发 QuotaExceededError */
+  private async evictOldBuffers(): Promise<void> {
+    if (this.disposed || !this.videoEl) return
+    const evictEnd = this.videoEl.currentTime - 30
+    if (!Number.isFinite(evictEnd) || evictEnd <= 0) return
+
+    const buffers = [this.videoSb, this.audioSb].filter((sb): sb is SourceBuffer => Boolean(sb))
+    for (const sb of buffers) {
+      if (this.disposed) return
+      try {
+        const buffered = sb.buffered
+        if (!buffered || buffered.length === 0) continue
+        const rangeStart = buffered.start(0)
+        if (rangeStart < evictEnd - 1) {
+          await this.removeFromBuffer(sb, rangeStart, evictEnd)
+        }
+      } catch {
+        // 忽略测试 stub 或浏览器缓冲驱逐竞态
+      }
+    }
+  }
+
   private handleSeeking(): void {
     if (this.disposed || !this.videoEl) return
     const targetTime = this.videoEl.currentTime
@@ -1516,14 +1615,34 @@ export class StreamMkvRemuxer {
       return
     }
 
-    // 中止当前分块拉取，切换 generation 从新字节偏移启动
+    // 中止当前分块拉取，递增 generation 并通过 seekChain 串行化 abort + 重启泵循环
+    const seekGen = ++this.pumpGeneration
     if (this.activeAbort) {
       this.activeAbort.abort()
       this.activeAbort = null
     }
-    this.currentByteOffset = this.resolveSeekByteOffset(targetTime)
     this.wakePump()
-    void this.startPumpLoop(++this.pumpGeneration)
+
+    this.seekChain = this.seekChain
+      .then(async () => {
+        if (this.disposed || seekGen !== this.pumpGeneration) return
+        const buffers = [this.videoSb, this.audioSb].filter((sb): sb is SourceBuffer => Boolean(sb))
+        for (const sb of buffers) {
+          await this.waitForBufferIdle(sb)
+          if (this.disposed || seekGen !== this.pumpGeneration) return
+          if (this.mediaSource?.readyState === 'open' && typeof sb.abort === 'function') {
+            try {
+              sb.abort()
+            } catch {
+              // 忽略 abort 状态竞态
+            }
+          }
+        }
+        if (this.disposed || seekGen !== this.pumpGeneration) return
+        this.currentByteOffset = this.resolveSeekByteOffset(targetTime)
+        void this.startPumpLoop(seekGen)
+      })
+      .catch(() => undefined)
   }
 
   private isTimeBuffered(timeSec: number): boolean {
@@ -1636,6 +1755,9 @@ export class StreamMkvRemuxer {
         if (generation !== this.pumpGeneration || this.disposed) break
 
         if (parsed.frames.length > 0) {
+          await this.evictOldBuffers()
+          if (generation !== this.pumpGeneration || this.disposed) break
+
           if (this.videoTrack && this.videoSb) {
             const vFrames = parsed.frames.filter((f) => f.trackNumber === this.videoTrack!.trackNumber)
             if (vFrames.length > 0) {
@@ -1708,18 +1830,102 @@ export class StreamMkvRemuxer {
       throw new StreamMkvFallbackError('fetch_failed', `Range 拉取失败: ${msg}`)
     }
 
-    if (!res.ok && res.status !== 206) {
-      throw new StreamMkvFallbackError('fetch_failed', `Range 请求返回 HTTP ${res.status}`)
+    const expectedLen = Math.max(1, end - start + 1)
+
+    if (res.status === 206) {
+      const contentLength = Number(res.headers.get('content-length') || 0)
+      if (
+        Number.isFinite(contentLength) &&
+        contentLength > expectedLen * 2 &&
+        contentLength > 16 * 1024 * 1024
+      ) {
+        res.body?.cancel().catch(() => undefined)
+        throw new StreamMkvFallbackError('fetch_failed', 'Range 响应体积超出分块预期上限')
+      }
+      const totalBytes = parseContentRangeTotal(res.headers.get('content-range')) || contentLength
+      const buf = await res.arrayBuffer()
+      return {
+        data: new Uint8Array(buf),
+        totalBytes: Number.isFinite(totalBytes) ? totalBytes : 0,
+      }
     }
 
-    const totalBytes =
-      parseContentRangeTotal(res.headers.get('content-range')) ||
-      Number(res.headers.get('content-length') || 0)
-    const buf = await res.arrayBuffer()
-    return {
-      data: new Uint8Array(buf),
-      totalBytes: Number.isFinite(totalBytes) ? totalBytes : 0,
+    if (res.status === 200) {
+      // 服务端未响应 206：防止直接 arrayBuffer() 读取数 GB 整文件导致 OOM
+      if (start > 0) {
+        res.body?.cancel().catch(() => undefined)
+        throw new StreamMkvFallbackError(
+          'fetch_failed',
+          '服务端不支持 HTTP Range 分块请求（返回 HTTP 200），自动回退服务端 HLS',
+        )
+      }
+      const contentLength = Number(res.headers.get('content-length') || 0)
+      if (res.body && typeof res.body.getReader === 'function') {
+        const reader = res.body.getReader()
+        const chunks: Uint8Array[] = []
+        let received = 0
+        let truncated = false
+        try {
+          while (received < expectedLen) {
+            const { done, value } = await reader.read()
+            if (done || !value) break
+            const remain = expectedLen - received
+            if (value.byteLength > remain) {
+              chunks.push(value.subarray(0, remain))
+              received += remain
+              truncated = true
+              await reader.cancel().catch(() => undefined)
+              break
+            }
+            chunks.push(value)
+            received += value.byteLength
+          }
+          if (!truncated && Number.isFinite(contentLength) && contentLength > expectedLen) {
+            truncated = true
+            await reader.cancel().catch(() => undefined)
+          }
+        } finally {
+          reader.releaseLock?.()
+        }
+        if (truncated) {
+          throw new StreamMkvFallbackError(
+            'fetch_failed',
+            '服务端忽略 Range 返回超大 HTTP 200 整文件，已截断并回退服务端 HLS',
+          )
+        }
+        const merged = new Uint8Array(received)
+        let off = 0
+        for (const c of chunks) {
+          merged.set(c, off)
+          off += c.byteLength
+        }
+        return {
+          data: merged,
+          totalBytes: Number.isFinite(contentLength) && contentLength > 0 ? contentLength : received,
+        }
+      }
+
+      if (Number.isFinite(contentLength) && contentLength > expectedLen) {
+        throw new StreamMkvFallbackError(
+          'fetch_failed',
+          '服务端返回超大 HTTP 200 整文件，已拒绝加载以防 OOM',
+        )
+      }
+      const buf = await res.arrayBuffer()
+      if (buf.byteLength > expectedLen) {
+        throw new StreamMkvFallbackError(
+          'fetch_failed',
+          '服务端返回 HTTP 200 体积超过分块上限，已拒绝加载',
+        )
+      }
+      return {
+        data: new Uint8Array(buf),
+        totalBytes:
+          Number.isFinite(contentLength) && contentLength > 0 ? contentLength : buf.byteLength,
+      }
     }
+
+    throw new StreamMkvFallbackError('fetch_failed', `Range 请求返回 HTTP ${res.status}`)
   }
 
   private appendToBuffer(sb: SourceBuffer, data: Uint8Array): Promise<void> {

@@ -242,7 +242,8 @@ func (r *LibraryRepo) ListLibraryItemPaths(ctx context.Context, libraryID string
 
 // DeleteItemByPath removes a stale media file from libraryID.
 // If the item has multiple media sources, only the matching media source is removed
-// (promoting a remaining source's path to items.path if needed).
+// (promoting a remaining source's path, container, file_size, is_strm, etag, and runtime_ticks
+// to items in a single transaction if needed).
 // Otherwise, the entire item (and its images/FTS/descendants) is deleted.
 // Returns true if a media source or item was removed.
 func (r *LibraryRepo) DeleteItemByPath(ctx context.Context, libraryID, path string) (bool, error) {
@@ -254,16 +255,54 @@ func (r *LibraryRepo) DeleteItemByPath(ctx context.Context, libraryID, path stri
 		return false, err
 	}
 
-	sources, err := r.GetMediaSourcesByItemID(ctx, item.ID)
+	tx, err := r.store.Writer.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
+	txActive := true
+	defer func() {
+		if txActive {
+			_ = tx.Rollback()
+		}
+	}()
+
+	type srcRow struct {
+		path         string
+		container    string
+		size         int64
+		runtimeTicks int64
+		isRemote     bool
+	}
+	sRows, err := tx.QueryContext(ctx, `
+		SELECT path, COALESCE(container, ''), COALESCE(size, 0), COALESCE(runtime_ticks, 0), is_remote
+		FROM item_media_sources
+		WHERE item_id = ?
+		ORDER BY rowid ASC`, item.ID)
+	if err != nil {
+		return false, err
+	}
+	var sources []srcRow
+	for sRows.Next() {
+		var sr srcRow
+		var isRem int
+		if err := sRows.Scan(&sr.path, &sr.container, &sr.size, &sr.runtimeTicks, &isRem); err != nil {
+			sRows.Close()
+			return false, err
+		}
+		sr.isRemote = isRem == 1
+		sources = append(sources, sr)
+	}
+	if err := sRows.Err(); err != nil {
+		sRows.Close()
+		return false, err
+	}
+	sRows.Close()
 
 	if len(sources) > 1 {
-		var remaining *MediaSourceRecord
+		var remaining *srcRow
 		matched := false
 		for i := range sources {
-			if sources[i].Path == path {
+			if sources[i].path == path {
 				matched = true
 				continue
 			}
@@ -272,19 +311,33 @@ func (r *LibraryRepo) DeleteItemByPath(ctx context.Context, libraryID, path stri
 			}
 		}
 		if matched && remaining != nil {
-			tx, err := r.store.Writer.BeginTx(ctx, nil)
-			if err != nil {
-				return false, err
-			}
-			defer tx.Rollback()
-
 			if _, err := tx.ExecContext(ctx, `DELETE FROM item_media_sources WHERE item_id = ? AND path = ?`, item.ID, path); err != nil {
 				return false, err
 			}
+			now := time.Now().Unix()
+			newEtag := guid.New()[:16]
 			if item.Path == path {
+				isStrm := remaining.isRemote || strings.EqualFold(remaining.container, "strm")
+				if _, err := tx.ExecContext(ctx, `
+					UPDATE items
+					SET path = ?,
+					    container = ?,
+					    file_size = ?,
+					    is_strm = ?,
+					    etag = ?,
+					    runtime_ticks = CASE WHEN ? > 0 THEN ? ELSE runtime_ticks END,
+					    date_modified = ?
+					WHERE id = ?`,
+					remaining.path, nullStr(remaining.container), remaining.size,
+					boolToInt(isStrm), newEtag, remaining.runtimeTicks, remaining.runtimeTicks,
+					now, item.ID,
+				); err != nil {
+					return false, err
+				}
+			} else {
 				if _, err := tx.ExecContext(ctx,
-					`UPDATE items SET path = ?, container = ?, file_size = ?, date_modified = ? WHERE id = ?`,
-					remaining.Path, remaining.Container, remaining.Size, time.Now().Unix(), item.ID,
+					`UPDATE items SET etag = ?, date_modified = ? WHERE id = ?`,
+					newEtag, now, item.ID,
 				); err != nil {
 					return false, err
 				}
@@ -292,9 +345,14 @@ func (r *LibraryRepo) DeleteItemByPath(ctx context.Context, libraryID, path stri
 			if err := tx.Commit(); err != nil {
 				return false, err
 			}
+			txActive = false
 			return true, nil
 		}
 	}
+
+	// Release single-writer transaction before calling DeleteItem.
+	_ = tx.Rollback()
+	txActive = false
 
 	if err := r.DeleteItem(ctx, item.ID); err != nil {
 		if errors.Is(err, ErrNotFound) {
@@ -339,6 +397,10 @@ func (r *LibraryRepo) AddItemsToContainer(ctx context.Context, containerID strin
 				return 0, err
 			}
 			existing[iid] = true
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return 0, err
 		}
 		rows.Close()
 	}
@@ -544,6 +606,20 @@ func compactContainerPositionsTx(ctx context.Context, tx *sql.Tx, containerID st
 
 // GetContainerItems returns ordered items belonging to a BoxSet or Playlist.
 func (r *LibraryRepo) GetContainerItems(ctx context.Context, serverID, userID, containerID string, startIndex, limit int, fields []string) ([]PlaylistItemDto, int, error) {
+	return r.GetContainerItemsWithPolicy(ctx, serverID, userID, containerID, startIndex, limit, fields, nil, nil, nil)
+}
+
+// GetContainerItemsWithPolicy returns ordered items belonging to a BoxSet or Playlist
+// while enforcing library RBAC (allowedLibraryIDs) and parental controls (maxParentalRating, blockedTags).
+func (r *LibraryRepo) GetContainerItemsWithPolicy(
+	ctx context.Context,
+	serverID, userID, containerID string,
+	startIndex, limit int,
+	fields []string,
+	allowedLibraryIDs []string,
+	maxParentalRating *int,
+	blockedTags []string,
+) ([]PlaylistItemDto, int, error) {
 	containerID = guid.Normalize(containerID)
 	var exists int
 	if err := r.store.Reader.QueryRowContext(ctx, `SELECT 1 FROM items WHERE id = ?`, containerID).Scan(&exists); err != nil {
@@ -552,11 +628,38 @@ func (r *LibraryRepo) GetContainerItems(ctx context.Context, serverID, userID, c
 		}
 		return nil, 0, err
 	}
+	if allowedLibraryIDs != nil && len(allowedLibraryIDs) == 0 {
+		return []PlaylistItemDto{}, 0, nil
+	}
 
+	var (
+		policyConds []string
+		policyArgs  []any
+	)
+	if len(allowedLibraryIDs) > 0 {
+		ph := make([]string, len(allowedLibraryIDs))
+		for i, lid := range allowedLibraryIDs {
+			ph[i] = "?"
+			policyArgs = append(policyArgs, guid.Normalize(lid))
+		}
+		policyConds = append(policyConds, fmt.Sprintf(`i.library_id IN (%s)`, strings.Join(ph, ",")))
+	}
+	if pClauses, pArgs := appendParentalFilterSQL("i", maxParentalRating, blockedTags); len(pClauses) > 0 {
+		policyConds = append(policyConds, pClauses...)
+		policyArgs = append(policyArgs, pArgs...)
+	}
+	policySQL := ""
+	if len(policyConds) > 0 {
+		policySQL = " AND " + strings.Join(policyConds, " AND ")
+	}
+
+	countArgs := make([]any, 0, 1+len(policyArgs))
+	countArgs = append(countArgs, containerID)
+	countArgs = append(countArgs, policyArgs...)
 	var total int
 	if err := r.store.Reader.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM item_collections ic JOIN items i ON i.id = ic.item_id WHERE ic.container_id = ?`,
-		containerID,
+		`SELECT COUNT(*) FROM item_collections ic JOIN items i ON i.id = ic.item_id WHERE ic.container_id = ?`+policySQL,
+		countArgs...,
 	).Scan(&total); err != nil {
 		return nil, 0, err
 	}
@@ -582,9 +685,10 @@ func (r *LibraryRepo) GetContainerItems(ctx context.Context, serverID, userID, c
 			FROM item_collections ic
 			JOIN items i ON i.id = ic.item_id
 			LEFT JOIN user_item_data u ON u.item_id = i.id AND u.user_id = ?
-			WHERE ic.container_id = ?
+			WHERE ic.container_id = ?` + policySQL + `
 			ORDER BY ic.position ASC`
 		args = append(args, uid, containerID)
+		args = append(args, policyArgs...)
 	} else {
 		query = `
 			SELECT ic.entry_id,
@@ -597,9 +701,10 @@ func (r *LibraryRepo) GetContainerItems(ctx context.Context, serverID, userID, c
 			       i.etag, i.extra_json, i.date_created, i.date_modified
 			FROM item_collections ic
 			JOIN items i ON i.id = ic.item_id
-			WHERE ic.container_id = ?
+			WHERE ic.container_id = ?` + policySQL + `
 			ORDER BY ic.position ASC`
 		args = append(args, containerID)
+		args = append(args, policyArgs...)
 	}
 
 	if limit > 0 {
@@ -735,6 +840,37 @@ func (r *LibraryRepo) GetSimilarItems(ctx context.Context, serverID, userID, see
 	return r.GetSimilarItemsWithPolicy(ctx, serverID, userID, seedID, limit, fields, nil, nil, nil)
 }
 
+func (r *LibraryRepo) isSeedAccessibleUnderPolicy(
+	ctx context.Context,
+	seedRec *ItemRecord,
+	allowedLibraryIDs []string,
+	maxParentalRating *int,
+	blockedTags []string,
+) (bool, error) {
+	if seedRec == nil {
+		return false, nil
+	}
+	if len(allowedLibraryIDs) > 0 && seedRec.LibraryID != "" &&
+		seedRec.LibraryID != "collections" && seedRec.LibraryID != "playlists" {
+		normLib := guid.Normalize(seedRec.LibraryID)
+		found := false
+		for _, lid := range allowedLibraryIDs {
+			if guid.Normalize(lid) == normLib {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false, nil
+		}
+	}
+	blocked, err := r.IsItemBlockedByParentalPolicy(ctx, seedRec, maxParentalRating, blockedTags)
+	if err != nil {
+		return false, err
+	}
+	return !blocked, nil
+}
+
 // GetSimilarItemsWithPolicy finds similar items while enforcing library RBAC and parental policy.
 func (r *LibraryRepo) GetSimilarItemsWithPolicy(
 	ctx context.Context,
@@ -752,14 +888,21 @@ func (r *LibraryRepo) GetSimilarItemsWithPolicy(
 	if limit <= 0 {
 		limit = 12
 	}
-	var seedType string
-	err := r.store.Reader.QueryRowContext(ctx, `SELECT type FROM items WHERE id = ?`, seedID).Scan(&seedType)
-	if errors.Is(err, sql.ErrNoRows) {
+	seedRec, err := r.GetItemRecordByID(ctx, seedID)
+	if errors.Is(err, ErrNotFound) {
 		return []dto.BaseItemDto{}, 0, nil
 	}
 	if err != nil {
 		return nil, 0, err
 	}
+	accessible, err := r.isSeedAccessibleUnderPolicy(ctx, seedRec, allowedLibraryIDs, maxParentalRating, blockedTags)
+	if err != nil {
+		return nil, 0, err
+	}
+	if !accessible {
+		return []dto.BaseItemDto{}, 0, nil
+	}
+	seedType := seedRec.Type
 
 	// Find genres of seed item
 	gRows, err := r.store.Reader.QueryContext(ctx, `
@@ -772,9 +915,15 @@ func (r *LibraryRepo) GetSimilarItemsWithPolicy(
 	var genres []string
 	for gRows.Next() {
 		var g string
-		if err := gRows.Scan(&g); err == nil {
-			genres = append(genres, g)
+		if err := gRows.Scan(&g); err != nil {
+			gRows.Close()
+			return nil, 0, err
 		}
+		genres = append(genres, g)
+	}
+	if err := gRows.Err(); err != nil {
+		gRows.Close()
+		return nil, 0, err
 	}
 	gRows.Close()
 
@@ -866,16 +1015,22 @@ func (r *LibraryRepo) GetInstantMixWithPolicy(
 		limit = 50
 	}
 
-	var seedType, seedMediaType string
-	err := r.store.Reader.QueryRowContext(ctx,
-		`SELECT type, COALESCE(media_type, '') FROM items WHERE id = ?`, seedID,
-	).Scan(&seedType, &seedMediaType)
-	if errors.Is(err, sql.ErrNoRows) {
+	seedRec, err := r.GetItemRecordByID(ctx, seedID)
+	if errors.Is(err, ErrNotFound) {
 		return []dto.BaseItemDto{}, 0, nil
 	}
 	if err != nil {
 		return nil, 0, err
 	}
+	accessible, err := r.isSeedAccessibleUnderPolicy(ctx, seedRec, allowedLibraryIDs, maxParentalRating, blockedTags)
+	if err != nil {
+		return nil, 0, err
+	}
+	if !accessible {
+		return []dto.BaseItemDto{}, 0, nil
+	}
+	seedType := seedRec.Type
+	seedMediaType := seedRec.MediaType
 
 	// Determine target playable item type
 	targetTypes := []string{"Audio"}
@@ -885,27 +1040,56 @@ func (r *LibraryRepo) GetInstantMixWithPolicy(
 		targetTypes = []string{"Movie", "Episode"}
 	}
 
-	// Collect seed genres (directly or from playlist/album children)
+	// Collect seed genres (directly or from accessible playlist/album children)
+	var (
+		genreConds []string
+		genreArgs  = []any{seedID, seedID, seedID}
+	)
+	if len(allowedLibraryIDs) > 0 {
+		ph := make([]string, len(allowedLibraryIDs))
+		for i, lid := range allowedLibraryIDs {
+			ph[i] = "?"
+			genreArgs = append(genreArgs, guid.Normalize(lid))
+		}
+		genreConds = append(genreConds, fmt.Sprintf(`(i.library_id IN (%s) OR i.library_id IN ('', 'collections', 'playlists'))`, strings.Join(ph, ",")))
+	}
+	if pClauses, pArgs := appendParentalFilterSQL("i", maxParentalRating, blockedTags); len(pClauses) > 0 {
+		genreConds = append(genreConds, pClauses...)
+		genreArgs = append(genreArgs, pArgs...)
+	}
+	genreScopeSQL := ""
+	if len(genreConds) > 0 {
+		genreScopeSQL = " AND " + strings.Join(genreConds, " AND ")
+	}
+
 	var genres []string
 	gRows, err := r.store.Reader.QueryContext(ctx, `
 		SELECT DISTINCT t.name
 		FROM item_taxonomies it
 		JOIN taxonomies t ON t.id = it.taxonomy_id
+		JOIN items i ON i.id = it.item_id
 		WHERE t.kind = 'genre'
 		  AND (it.item_id = ?
 		       OR it.item_id IN (SELECT item_id FROM item_collections WHERE container_id = ?)
-		       OR it.item_id IN (SELECT id FROM items WHERE parent_id = ?))`,
-		seedID, seedID, seedID,
+		       OR it.item_id IN (SELECT id FROM items WHERE parent_id = ?))`+genreScopeSQL,
+		genreArgs...,
 	)
-	if err == nil {
-		for gRows.Next() {
-			var g string
-			if err := gRows.Scan(&g); err == nil {
-				genres = append(genres, g)
-			}
-		}
-		gRows.Close()
+	if err != nil {
+		return nil, 0, err
 	}
+	for gRows.Next() {
+		var g string
+		if err := gRows.Scan(&g); err != nil {
+			gRows.Close()
+			return nil, 0, err
+		}
+		genres = append(genres, g)
+	}
+	if err := gRows.Err(); err != nil {
+		gRows.Close()
+		return nil, 0, err
+	}
+	gRows.Close()
 
 	seen := map[string]bool{}
 	var mix []dto.BaseItemDto
@@ -1054,6 +1238,10 @@ func (r *LibraryRepo) GetMovieRecommendationsWithPolicy(
 			sm.isFav = favInt == 1
 			seeds = append(seeds, sm)
 		}
+		if err := seedRows.Err(); err != nil {
+			seedRows.Close()
+			return nil, err
+		}
 		seedRows.Close()
 
 		for _, seed := range seeds {
@@ -1071,9 +1259,17 @@ func (r *LibraryRepo) GetMovieRecommendationsWithPolicy(
 			var seedGenres []string
 			for gRows.Next() {
 				var g string
-				if err := gRows.Scan(&g); err == nil && g != "" {
+				if err := gRows.Scan(&g); err != nil {
+					gRows.Close()
+					return nil, err
+				}
+				if g != "" {
 					seedGenres = append(seedGenres, g)
 				}
+			}
+			if err := gRows.Err(); err != nil {
+				gRows.Close()
+				return nil, err
 			}
 			gRows.Close()
 			if len(seedGenres) == 0 {
@@ -1147,6 +1343,10 @@ func (r *LibraryRepo) GetMovieRecommendationsWithPolicy(
 				return nil, err
 			}
 			genres = append(genres, g)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
 		}
 		rows.Close()
 
@@ -1249,7 +1449,7 @@ func (r *LibraryRepo) GetQueryFilters(ctx context.Context, f QueryFiltersFilter)
 		args  []any
 	)
 	if parentID != "" {
-		conds = append(conds, `(i.library_id = ? OR i.parent_id = ? OR EXISTS (SELECT 1 FROM item_ancestors ia WHERE ia.ancestor_id = ? AND ia.descendant_id = i.id))`)
+		conds = append(conds, `(i.library_id = ? OR i.parent_id = ? OR EXISTS (SELECT 1 FROM item_ancestors ia WHERE ia.ancestor_id = ? AND ia.descendant_id = i.id AND ia.depth > 0))`)
 		args = append(args, parentID, parentID, parentID)
 	}
 	if len(f.IncludeItemTypes) > 0 {
@@ -1434,10 +1634,10 @@ func (r *LibraryRepo) ListFilterValuesWithPolicy(
 	)
 
 	itemScopeClause := func(alias string) (string, []any) {
-		var conds []string
+		conds := []string{fmt.Sprintf(`%s.extra_type = ''`, alias)}
 		var a []any
 		if parentID != "" {
-			conds = append(conds, fmt.Sprintf(`(%s.library_id = ? OR %s.parent_id = ? OR EXISTS (SELECT 1 FROM item_ancestors ia WHERE ia.ancestor_id = ? AND ia.descendant_id = %s.id))`, alias, alias, alias))
+			conds = append(conds, fmt.Sprintf(`(%s.library_id = ? OR %s.parent_id = ? OR EXISTS (SELECT 1 FROM item_ancestors ia WHERE ia.ancestor_id = ? AND ia.descendant_id = %s.id AND ia.depth > 0))`, alias, alias, alias))
 			a = append(a, parentID, parentID, parentID)
 		}
 		if len(includeItemTypes) > 0 {
@@ -1459,9 +1659,6 @@ func (r *LibraryRepo) ListFilterValuesWithPolicy(
 		if pClauses, pArgs := appendParentalFilterSQL(alias, maxParentalRating, blockedTags); len(pClauses) > 0 {
 			conds = append(conds, pClauses...)
 			a = append(a, pArgs...)
-		}
-		if len(conds) == 0 {
-			return "", nil
 		}
 		return " AND " + strings.Join(conds, " AND "), a
 	}

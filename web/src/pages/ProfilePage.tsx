@@ -7,12 +7,14 @@ import {
   Globe,
   KeyRound,
   Loader2,
+  LogOut,
   QrCode,
   ShieldCheck,
   Sliders,
   Trash2,
   User as UserIcon,
 } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
 import { api, getUserImageUrl } from '../api/client'
 import { useAuth } from '../context/AuthContext'
 import { useI18n } from '../i18n/I18nContext'
@@ -23,6 +25,9 @@ import {
   type PlaybackPrefs,
 } from '../player/playbackPrefs'
 import { FeedbackBanner } from './admin/adminUtils'
+
+const ALLOWED_AVATAR_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif'])
+const MAX_AVATAR_UPLOAD_BYTES = 5 * 1024 * 1024 // 5 MB
 
 const AUDIO_LANG_OPTIONS = [
   { value: '', label: '跟随媒体默认' },
@@ -43,8 +48,9 @@ const SUBTITLE_LANG_OPTIONS = [
 ]
 
 export function ProfilePage() {
-  const { auth, user, isAdmin, refreshUser } = useAuth()
+  const { auth, user, isAdmin, refreshUser, logout } = useAuth()
   const { locale, setLocale, t } = useI18n()
+  const navigate = useNavigate()
   const userId = auth?.userId || ''
   const fileInputRef = useRef<HTMLInputElement>(null)
 
@@ -100,6 +106,19 @@ export function ProfilePage() {
       })
     },
   })
+
+  const handleAvatarFileSelected = (file?: File | null) => {
+    if (!file) return
+    if (!ALLOWED_AVATAR_MIME_TYPES.has((file.type || '').toLowerCase())) {
+      setFeedback({ type: 'error', message: '仅支持上传 JPG / PNG / WebP / GIF 格式的头像图片' })
+      return
+    }
+    if (file.size > MAX_AVATAR_UPLOAD_BYTES) {
+      setFeedback({ type: 'error', message: '头像图片大小不能超过 5 MB' })
+      return
+    }
+    uploadAvatarMutation.mutate(file)
+  }
 
   const deleteAvatarMutation = useMutation({
     mutationFn: () => api.deleteUserImage(userId),
@@ -255,14 +274,11 @@ export function ProfilePage() {
             <input
               ref={fileInputRef}
               type="file"
-              accept="image/*"
+              accept="image/jpeg,image/png,image/webp,image/gif"
               aria-label="选择头像图片"
               className="hidden"
               onChange={(e) => {
-                const file = e.target.files?.[0]
-                if (file) {
-                  uploadAvatarMutation.mutate(file)
-                }
+                handleAvatarFileSelected(e.target.files?.[0])
                 e.target.value = ''
               }}
             />
@@ -290,6 +306,17 @@ export function ProfilePage() {
                 <span>移除头像</span>
               </button>
             )}
+            <button
+              type="button"
+              onClick={() => {
+                logout()
+                navigate('/login')
+              }}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-white/15 bg-white/[0.04] px-3.5 py-2 text-xs font-medium text-zinc-200 transition-colors hover:border-red-500/40 hover:bg-red-500/15 hover:text-red-300"
+            >
+              <LogOut className="h-3.5 w-3.5" />
+              <span>{t('nav.logout')}</span>
+            </button>
           </div>
         </div>
       </section>

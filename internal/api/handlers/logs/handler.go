@@ -3,7 +3,9 @@ package logs
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,7 +19,12 @@ import (
 	"github.com/ambra-media/ambra/internal/config"
 )
 
-const defaultRuntimeLogName = "ambra-runtime.log"
+const (
+	defaultRuntimeLogName = "ambra-runtime.log"
+	maxLogLinesLimit      = 2000
+)
+
+var errInvalidLogName = errors.New("invalid log file name")
 
 // AuthFuncs decouples route registration from the concrete middleware package.
 type AuthFuncs struct {
@@ -140,7 +147,7 @@ func (h *Handler) listLogFiles() []LogFileDto {
 	return files
 }
 
-// resolveSafeLogPath prevents path traversal by requiring a single-segment filename inside logDir.
+// resolveSafeLogPath prevents path traversal and symlink escapes by requiring a single-segment regular file inside logDir.
 func (h *Handler) resolveSafeLogPath(name string) (string, error) {
 	if name == "" ||
 		name == "." ||
@@ -149,7 +156,7 @@ func (h *Handler) resolveSafeLogPath(name string) (string, error) {
 		strings.Contains(name, "\\") ||
 		strings.Contains(name, "..") ||
 		filepath.Base(name) != name {
-		return "", os.ErrPermission
+		return "", errInvalidLogName
 	}
 	dir := h.logDir()
 	if dir == "" {
@@ -159,54 +166,97 @@ func (h *Handler) resolveSafeLogPath(name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	realDir, err := filepath.EvalSymlinks(absDir)
+	if err != nil {
+		return "", err
+	}
+	realDir = filepath.Clean(realDir)
+
 	target := filepath.Join(absDir, name)
 	absTarget, err := filepath.Abs(target)
 	if err != nil {
 		return "", err
 	}
 	rel, err := filepath.Rel(absDir, absTarget)
-	if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
 		return "", os.ErrPermission
 	}
-	return absTarget, nil
+
+	fi, err := os.Lstat(absTarget)
+	if err != nil {
+		return "", err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 || fi.IsDir() {
+		return "", os.ErrPermission
+	}
+
+	realTarget, err := filepath.EvalSymlinks(absTarget)
+	if err != nil {
+		return "", err
+	}
+	realTarget = filepath.Clean(realTarget)
+	realRel, err := filepath.Rel(realDir, realTarget)
+	if err != nil || realRel == "." || strings.HasPrefix(realRel, "..") || filepath.IsAbs(realRel) {
+		return "", os.ErrPermission
+	}
+	return realTarget, nil
 }
 
-func (h *Handler) readLogLines(name string) ([]string, error) {
+func (h *Handler) readLogLinesPage(name string, start, limit int) ([]string, int, error) {
+	if start < 0 {
+		start = 0
+	}
+	if limit <= 0 || limit > maxLogLinesLimit {
+		limit = maxLogLinesLimit
+	}
+
+	serveRuntime := func() ([]string, int, error) {
+		h.mu.RLock()
+		total := len(h.runtimeLines)
+		var page []string
+		if start >= total {
+			page = []string{}
+		} else {
+			end := total
+			if start+limit < end {
+				end = start + limit
+			}
+			page = append([]string(nil), h.runtimeLines[start:end]...)
+		}
+		h.mu.RUnlock()
+		return page, total, nil
+	}
+
 	safePath, err := h.resolveSafeLogPath(name)
 	if err != nil {
 		if os.IsNotExist(err) && name == defaultRuntimeLogName {
-			h.mu.RLock()
-			cp := append([]string(nil), h.runtimeLines...)
-			h.mu.RUnlock()
-			return cp, nil
+			return serveRuntime()
 		}
-		return nil, err
+		return nil, 0, err
 	}
 	f, err := os.Open(safePath)
 	if err != nil {
 		if os.IsNotExist(err) && name == defaultRuntimeLogName {
-			h.mu.RLock()
-			cp := append([]string(nil), h.runtimeLines...)
-			h.mu.RUnlock()
-			return cp, nil
+			return serveRuntime()
 		}
-		return nil, err
+		return nil, 0, err
 	}
 	defer f.Close()
 
-	var lines []string
+	page := make([]string, 0)
+	total := 0
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for sc.Scan() {
-		lines = append(lines, sc.Text())
+		if total >= start && len(page) < limit {
+			page = append(page, sc.Text())
+		}
+		total++
 	}
 	if err := sc.Err(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	if lines == nil {
-		lines = []string{}
-	}
-	return lines, nil
+	return page, total, nil
 }
 
 func (h *Handler) handleListLogs(w http.ResponseWriter, r *http.Request) {
@@ -253,64 +303,70 @@ func (h *Handler) handleGetLog(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) serveLogByName(w http.ResponseWriter, name string) {
-	lines, err := h.readLogLines(name)
+	serveRuntime := func() {
+		h.mu.RLock()
+		lines := append([]string(nil), h.runtimeLines...)
+		h.mu.RUnlock()
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(strings.Join(lines, "\n")))
+		if len(lines) > 0 {
+			_, _ = w.Write([]byte("\n"))
+		}
+	}
+
+	safePath, err := h.resolveSafeLogPath(name)
 	if err != nil {
-		if os.IsPermission(err) {
-			httpx.Error(w, http.StatusBadRequest, "invalid log file name")
+		if os.IsNotExist(err) && name == defaultRuntimeLogName {
+			serveRuntime()
 			return
 		}
-		if os.IsNotExist(err) {
-			httpx.Error(w, http.StatusNotFound, "log file not found")
-			return
-		}
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		writeLogError(w, err)
 		return
 	}
+	f, err := os.Open(safePath)
+	if err != nil {
+		if os.IsNotExist(err) && name == defaultRuntimeLogName {
+			serveRuntime()
+			return
+		}
+		writeLogError(w, err)
+		return
+	}
+	defer f.Close()
+
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(strings.Join(lines, "\n")))
-	if len(lines) > 0 {
-		_, _ = w.Write([]byte("\n"))
-	}
+	_, _ = io.Copy(w, f)
 }
 
 func (h *Handler) handleGetLogLines(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	name := r.PathValue("Name")
-	lines, err := h.readLogLines(name)
-	if err != nil {
-		if os.IsPermission(err) {
-			httpx.Error(w, http.StatusBadRequest, "invalid log file name")
-			return
-		}
-		if os.IsNotExist(err) {
-			httpx.Error(w, http.StatusNotFound, "log file not found")
-			return
-		}
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	total := len(lines)
 	start := q.Int("StartIndex", 0)
 	limit := q.Int("Limit", 100)
-	if start < 0 {
-		start = 0
-	}
-	var page []string
-	if start >= total {
-		page = []string{}
-	} else {
-		end := total
-		if limit > 0 && start+limit < end {
-			end = start + limit
-		}
-		page = lines[start:end]
+	page, total, err := h.readLogLinesPage(name, start, limit)
+	if err != nil {
+		writeLogError(w, err)
+		return
 	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[string]{
 		Items:            page,
 		TotalRecordCount: total,
 	})
+}
+
+func writeLogError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, errInvalidLogName):
+		httpx.Error(w, http.StatusBadRequest, "invalid log file name")
+	case os.IsPermission(err):
+		httpx.Error(w, http.StatusForbidden, "access to log file denied")
+	case os.IsNotExist(err):
+		httpx.Error(w, http.StatusNotFound, "log file not found")
+	default:
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+	}
 }
 
 func passthrough(next http.Handler) http.Handler { return next }

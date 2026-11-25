@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -75,12 +77,16 @@ type Handler struct {
 	store *sqlite.Store
 	auth  AuthFuncs
 
-	mu    sync.RWMutex
-	state notificationsState
+	mu                   sync.RWMutex
+	state                notificationsState
+	notifiedTaskFailures map[string]struct{}
 }
 
 func New(store *sqlite.Store) *Handler {
-	h := &Handler{store: store}
+	h := &Handler{
+		store:                store,
+		notifiedTaskFailures: make(map[string]struct{}),
+	}
 	h.loadState(context.Background())
 	return h
 }
@@ -130,15 +136,43 @@ func (h *Handler) handleServices(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func canAccessUserNotifications(ctx context.Context, targetUserID string) bool {
+func (h *Handler) canAccessUserNotifications(ctx context.Context, targetUserID string) bool {
 	ac, ok := middleware.AuthFromContext(ctx)
-	if !ok || ac == nil || (ac.User == nil && !ac.IsAPIKey) {
+	if ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.IsAdmin() {
+			return true
+		}
+		callerID := guid.Normalize(ac.UserID())
+		return callerID != "" && callerID == guid.Normalize(targetUserID)
+	}
+	if h.auth.UserIDFromCtx != nil {
+		callerID := guid.Normalize(h.auth.UserIDFromCtx(ctx))
+		return callerID != "" && callerID == guid.Normalize(targetUserID)
+	}
+	if h.auth.RequireAuth != nil {
+		return false
+	}
+	// Fail-closed if an empty/invalid AuthContext was explicitly attached.
+	if ok {
+		return false
+	}
+	return true
+}
+
+func isSafeNotificationURL(raw string) bool {
+	s := strings.TrimSpace(raw)
+	if s == "" {
 		return true
 	}
-	if ac.IsAdmin() {
-		return true
+	if strings.HasPrefix(s, "/") {
+		return !strings.HasPrefix(s, "//") && !strings.HasPrefix(s, "/\\")
 	}
-	return guid.Normalize(ac.UserID()) == guid.Normalize(targetUserID)
+	u, err := url.Parse(s)
+	if err != nil {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	return (scheme == "http" || scheme == "https") && u.Host != ""
 }
 
 func containsString(items []string, target string) bool {
@@ -182,7 +216,7 @@ func setReadBy(readBy []string, userID string, read bool) []string {
 func (h *Handler) handleListByUser(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := guid.Normalize(r.PathValue("UserId"))
-	if !canAccessUserNotifications(r.Context(), userID) {
+	if !h.canAccessUserNotifications(r.Context(), userID) {
 		httpx.Error(w, http.StatusForbidden, "cannot access another user's notifications")
 		return
 	}
@@ -199,11 +233,9 @@ func (h *Handler) handleListByUser(w http.ResponseWriter, r *http.Request) {
 		if n.UserId == "" || guid.Normalize(n.UserId) == userID {
 			item := n
 			item.IsRead = isReadForUser(n, userID)
+			item.ReadBy = nil
 			if isReadFilter != nil && item.IsRead != *isReadFilter {
 				continue
-			}
-			if len(n.ReadBy) > 0 {
-				item.ReadBy = append([]string(nil), n.ReadBy...)
 			}
 			if locale != "" {
 				item = localizeNotification(item, locale)
@@ -246,7 +278,7 @@ func localizeNotification(n Notification, locale string) Notification {
 
 func (h *Handler) handleSummary(w http.ResponseWriter, r *http.Request) {
 	userID := guid.Normalize(r.PathValue("UserId"))
-	if !canAccessUserNotifications(r.Context(), userID) {
+	if !h.canAccessUserNotifications(r.Context(), userID) {
 		httpx.Error(w, http.StatusForbidden, "cannot access another user's notifications")
 		return
 	}
@@ -280,7 +312,7 @@ func (h *Handler) handleMarkRead(read bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := httpx.ParseQuery(r)
 		userID := guid.Normalize(r.PathValue("UserId"))
-		if !canAccessUserNotifications(r.Context(), userID) {
+		if !h.canAccessUserNotifications(r.Context(), userID) {
 			httpx.Error(w, http.StatusForbidden, "cannot access another user's notifications")
 			return
 		}
@@ -289,7 +321,7 @@ func (h *Handler) handleMarkRead(read bool) http.HandlerFunc {
 			var body struct {
 				Ids []string `json:"Ids"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+			if err := httpx.DecodeJSONLimit(r, &body, 0); err == nil {
 				ids = body.Ids
 			}
 		}
@@ -315,7 +347,7 @@ func (h *Handler) handleMarkRead(read bool) http.HandlerFunc {
 				n.IsRead = read
 			}
 		}
-		h.saveStateLocked(r.Context())
+		_ = h.saveStateLocked(r.Context())
 		h.mu.Unlock()
 		httpx.NoContent(w)
 	}
@@ -330,12 +362,20 @@ func (h *Handler) handleSendAdmin(w http.ResponseWriter, r *http.Request) {
 		Level       string `json:"Level"`
 		UserId      string `json:"UserId"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid notification payload")
 		return
 	}
 	if strings.TrimSpace(req.Name) == "" {
 		httpx.Error(w, http.StatusBadRequest, "notification name is required")
+		return
+	}
+	if !isSafeNotificationURL(req.Url) {
+		httpx.Error(w, http.StatusBadRequest, "invalid notification Url scheme")
+		return
+	}
+	if !isSafeNotificationURL(req.ImageUrl) {
+		httpx.Error(w, http.StatusBadRequest, "invalid notification ImageUrl scheme")
 		return
 	}
 	level := normalizeLevel(req.Level)
@@ -346,17 +386,20 @@ func (h *Handler) handleSendAdmin(w http.ResponseWriter, r *http.Request) {
 		IsRead:      false,
 		Name:        req.Name,
 		Description: req.Description,
-		Url:         req.Url,
-		ImageUrl:    req.ImageUrl,
+		Url:         strings.TrimSpace(req.Url),
+		ImageUrl:    strings.TrimSpace(req.ImageUrl),
 		Level:       level,
 	}
 
-	h.appendNotification(r.Context(), n)
+	if err := h.appendNotification(r.Context(), n); err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to persist notification")
+		return
+	}
 
 	httpx.JSON(w, http.StatusOK, n)
 }
 
-func (h *Handler) appendNotification(ctx context.Context, n Notification) {
+func (h *Handler) appendNotification(ctx context.Context, n Notification) error {
 	if n.Id == "" {
 		n.Id = guid.New()
 	}
@@ -370,8 +413,9 @@ func (h *Handler) appendNotification(ctx context.Context, n Notification) {
 	if len(h.state.Items) > maxNotifications {
 		h.state.Items = h.state.Items[:maxNotifications]
 	}
-	h.saveStateLocked(ctx)
+	err := h.saveStateLocked(ctx)
 	h.mu.Unlock()
+	return err
 }
 
 // SubscribeEvents subscribes the notifications handler to system eventbus events
@@ -403,17 +447,40 @@ func (h *Handler) SubscribeEvents(bus *eventbus.Bus) {
 			return
 		}
 		var task struct {
+			Id                  string `json:"Id"`
 			Name                string `json:"Name"`
 			State               string `json:"State"`
 			LastExecutionResult *struct {
 				Status       string `json:"Status"`
 				ErrorMessage string `json:"ErrorMessage"`
+				EndTimeUtc   string `json:"EndTimeUtc"`
 			} `json:"LastExecutionResult"`
 		}
 		if err := json.Unmarshal(raw, &task); err != nil {
 			return
 		}
+		if !strings.EqualFold(strings.TrimSpace(task.State), "Idle") {
+			return
+		}
 		if task.LastExecutionResult != nil && strings.EqualFold(task.LastExecutionResult.Status, "Failed") {
+			dedupTaskID := strings.TrimSpace(task.Id)
+			dedupEnd := strings.TrimSpace(task.LastExecutionResult.EndTimeUtc)
+			if dedupTaskID != "" || dedupEnd != "" {
+				dedupKey := dedupTaskID + "|" + dedupEnd
+				h.mu.Lock()
+				if h.notifiedTaskFailures == nil {
+					h.notifiedTaskFailures = make(map[string]struct{})
+				}
+				if _, seen := h.notifiedTaskFailures[dedupKey]; seen {
+					h.mu.Unlock()
+					return
+				}
+				if len(h.notifiedTaskFailures) >= 1000 {
+					h.notifiedTaskFailures = make(map[string]struct{})
+				}
+				h.notifiedTaskFailures[dedupKey] = struct{}{}
+				h.mu.Unlock()
+			}
 			name := strings.TrimSpace(task.Name)
 			if name == "" {
 				name = "Scheduled Task"
@@ -422,7 +489,7 @@ func (h *Handler) SubscribeEvents(bus *eventbus.Bus) {
 			if desc == "" {
 				desc = name + " failed"
 			}
-			h.appendNotification(ctx, Notification{
+			_ = h.appendNotification(ctx, Notification{
 				Name:        name + " Failed",
 				Description: desc,
 				Level:       "Error",
@@ -508,15 +575,16 @@ func (h *Handler) loadState(ctx context.Context) {
 	}
 }
 
-func (h *Handler) saveStateLocked(ctx context.Context) {
+func (h *Handler) saveStateLocked(ctx context.Context) error {
 	if h.store == nil {
-		return
+		return nil
 	}
 	raw, err := json.Marshal(h.state)
 	if err != nil {
-		return
+		slog.Error("notifications: marshal state failed", "err", err)
+		return err
 	}
-	_, _ = h.store.Writer.ExecContext(ctx, `
+	_, err = h.store.Writer.ExecContext(ctx, `
 		INSERT INTO server_config (key, value_json, updated_at)
 		VALUES (?, ?, ?)
 		ON CONFLICT(key) DO UPDATE SET
@@ -524,6 +592,10 @@ func (h *Handler) saveStateLocked(ctx context.Context) {
 			updated_at = excluded.updated_at`,
 		stateConfigKey, string(raw), time.Now().UTC().Unix(),
 	)
+	if err != nil {
+		slog.Error("notifications: save state failed", "err", err)
+	}
+	return err
 }
 
 func paginate[T any](items []T, startIndex, limit int) ([]T, int) {

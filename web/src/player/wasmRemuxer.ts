@@ -7,14 +7,17 @@ export const WASM_REMUX_PREF_KEY = 'ambra_player_prefer_wasm_remux'
 /** 默认安全文件大小上限（150 MB），防止浏览器 WASM 内存溢出 */
 export const DEFAULT_WASM_MAX_BYTES = 150 * 1024 * 1024
 
-/** 默认加载与转封装超时时间 */
-const DEFAULT_LOAD_TIMEOUT_MS = 25_000
+/** 默认加载与转封装超时时间（本地自托管快速探测，CDN 缩短超时避免卡死 25 秒） */
+const LOCAL_CORE_BASE = '/web/ffmpeg'
+const DEFAULT_LOCAL_LOAD_TIMEOUT_MS = 4_000
+const DEFAULT_CDN_LOAD_TIMEOUT_MS = 10_000
 const DEFAULT_REMUX_TIMEOUT_MS = 120_000
 
 /**
- * 单线程 @ffmpeg/core CDN 列表（不依赖 SharedArrayBuffer，普通 HTTP 局域网 NAS 亦可运行）
+ * 单线程 @ffmpeg/core 源列表（优先同源本地自托管支持离线 NAS，失败后回退 CDN；不依赖 SharedArrayBuffer）
  */
 const SINGLE_THREAD_CORE_BASES = [
+  LOCAL_CORE_BASE,
   'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm',
   'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm',
 ]
@@ -88,6 +91,8 @@ export interface WasmRemuxOptions {
   knownSizeBytes?: number
   /** 源容器名（如 mkv / ts / avi），用于为虚拟文件选择正确扩展名 */
   container?: string
+  /** 目标音轨索引（0-based 音频流序号，传入 -map 0:v:0 -map 0:a:<idx>） */
+  audioStreamIndex?: number
   /** 转封装超时时间（毫秒），默认 120000 */
   timeoutMs?: number
   /** 可选自定义 @ffmpeg/core 基础 URL（例如自托管静态目录） */
@@ -292,14 +297,20 @@ export class WasmRemuxer {
         if (opts?.signal?.aborted || this.disposed) {
           throw new WasmRemuxFallbackError('aborted', '已取消 WASM 引擎加载')
         }
+        const isLocalBase = base.startsWith('/')
+        const loadTimeoutMs = isLocalBase ? DEFAULT_LOCAL_LOAD_TIMEOUT_MS : DEFAULT_CDN_LOAD_TIMEOUT_MS
         try {
-          opts?.onProgress?.('init', 35, '正在加载单线程 WASM 核心...')
+          opts?.onProgress?.(
+            'init',
+            35,
+            isLocalBase ? '正在加载本地离线 WASM 核心...' : '正在加载单线程 WASM 核心...',
+          )
           const [coreURL, wasmURL] = await withTimeout(
             Promise.all([
               toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript'),
               toBlobURL(`${base}/ffmpeg-core.wasm`, 'application/wasm'),
             ]),
-            DEFAULT_LOAD_TIMEOUT_MS,
+            loadTimeoutMs,
             'timeout',
             '加载 FFmpeg WASM 核心超时，自动回退服务端 HLS',
           )
@@ -308,7 +319,7 @@ export class WasmRemuxer {
           opts?.onProgress?.('init', 80, '正在启动 WASM Worker...')
           await withTimeout(
             ffmpeg.load({ coreURL, wasmURL }, { signal: opts?.signal }),
-            DEFAULT_LOAD_TIMEOUT_MS,
+            loadTimeoutMs,
             'timeout',
             '启动 FFmpeg WASM Worker 超时，自动回退服务端 HLS',
           )
@@ -411,11 +422,18 @@ export class WasmRemuxer {
       let exitCode: number
       try {
         const execTimeout = opts.timeoutMs ?? DEFAULT_REMUX_TIMEOUT_MS
+        const mapArgs =
+          opts.audioStreamIndex !== undefined &&
+          Number.isInteger(opts.audioStreamIndex) &&
+          opts.audioStreamIndex >= 0
+            ? ['-map', '0:v:0', '-map', `0:a:${opts.audioStreamIndex}`]
+            : []
         exitCode = await withTimeout(
           ffmpeg.exec(
             [
               '-i',
               inputName,
+              ...mapArgs,
               '-c:v',
               'copy',
               '-c:a',

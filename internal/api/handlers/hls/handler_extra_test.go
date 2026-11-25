@@ -64,7 +64,7 @@ func TestHLSHandlerExtraBranches(t *testing.T) {
 	// - itemA with 2 media sources + STRM path
 	// - itemNoMS with item.RuntimeTicks only (no MediaSources)
 	strmFile := filepath.Join(tmp, "remote.strm")
-	_ = os.WriteFile(strmFile, []byte("# comment\n\nhttps://cdn.example.com/live.mkv\n"), 0o644)
+	_ = os.WriteFile(strmFile, []byte("# comment\n\nhttps://93.184.216.34/live.mkv\n"), 0o644)
 
 	itemA := guid.New()
 	ms1 := guid.New()
@@ -133,7 +133,7 @@ func TestHLSHandlerExtraBranches(t *testing.T) {
 		PlaySessionID:    "m4s-ps",
 		ItemID:           itemA,
 		MediaSourceID:    ms1,
-		InputPath:        "https://cdn.example.com/live.mkv",
+		InputPath:        "https://93.184.216.34/live.mkv",
 		SegmentContainer: "m4s",
 	})
 	if err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/xml"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -731,5 +732,316 @@ func TestErrorPathsAndClosedStore(t *testing.T) {
 	}
 	if _, err := svc.CollectHealth(ctx); err == nil {
 		t.Fatalf("expected CollectHealth error on closed store")
+	}
+}
+
+func TestGovernanceSecurityHardeningAndAuditEdges(t *testing.T) {
+	svc, store, repo, _, _, _ := newTestEnv(t)
+	ctx := context.Background()
+
+	mediaDir := t.TempDir()
+	lib, err := repo.CreateLibrary(ctx, "Movies", "movies", []string{mediaDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. isVirtualPath coverage
+	for _, vp := range []string{"", "  ", "artist://beatles", "album://abbey-road", "smb://nas/share/a.mkv", "/media/Show#Season1"} {
+		if !isVirtualPath(vp) {
+			t.Fatalf("expected %q to be treated as virtual path", vp)
+		}
+	}
+	if isVirtualPath("/media/Movies/Inception.mkv") {
+		t.Fatal("expected normal file path not to be virtual")
+	}
+
+	// 2. CleanupOrphans skips existing physical files, STRM items, folders, and virtual paths
+	existingFile := filepath.Join(mediaDir, "still-here.mkv")
+	if err := os.WriteFile(existingFile, []byte("present"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	existingItem := &sqlite.ItemRecord{LibraryID: lib.ID, Type: "Movie", Name: "Present", Path: existingFile}
+	folderItem := &sqlite.ItemRecord{LibraryID: lib.ID, Type: "Series", IsFolder: true, Name: "Folder", Path: filepath.Join(mediaDir, "missing-dir")}
+	virtualItem := &sqlite.ItemRecord{LibraryID: lib.ID, Type: "MusicArtist", Name: "Artist", Path: "artist://123"}
+	realOrphan := &sqlite.ItemRecord{LibraryID: lib.ID, Type: "Movie", Name: "RealOrphan", Path: filepath.Join(mediaDir, "gone.mkv")}
+	for _, it := range []*sqlite.ItemRecord{existingItem, folderItem, virtualItem, realOrphan} {
+		if err := repo.UpsertItem(ctx, it); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, _ = svc.EnqueueAudit(ctx, EnqueueAuditInput{ItemID: realOrphan.ID, ItemName: realOrphan.Name})
+
+	cleanRes, err := svc.CleanupOrphans(ctx, []string{existingItem.ID, folderItem.ID, virtualItem.ID, realOrphan.ID})
+	if err != nil {
+		t.Fatalf("CleanupOrphans: %v", err)
+	}
+	if cleanRes.Requested != 4 || cleanRes.Deleted != 1 || cleanRes.DeletedIDs[0] != realOrphan.ID {
+		t.Fatalf("expected only realOrphan deleted, got %+v", cleanRes)
+	}
+
+	// 3. ApproveAudit: empty candidate, non-pending audit, custom ProviderName, Genres/Tags taxonomy replacement & FTS sync
+	movie := &sqlite.ItemRecord{
+		LibraryID: lib.ID,
+		Type:      "Movie",
+		Name:      "Raw File",
+		Path:      existingFile,
+	}
+	if err := repo.UpsertItem(ctx, movie); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpsertSearchFTS(ctx, movie.ID, "Raw File", "", "rawfile", "rf", "Actor One"); err != nil {
+		t.Fatal(err)
+	}
+	// Pre-seed one existing genre taxonomy to cover both existing-taxonomy lookup and new-taxonomy insert paths.
+	if err := repo.ReplaceItemTaxonomies(ctx, movie.ID, "Genre", []string{"Sci-Fi", "OldGenre"}); err != nil {
+		t.Fatal(err)
+	}
+
+	aud, err := svc.EnqueueAudit(ctx, EnqueueAuditInput{ItemID: movie.ID, ItemName: movie.Name, Path: movie.Path})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Empty candidate must be rejected
+	if _, err := svc.ApproveAudit(ctx, aud.ID, ScrapeCandidate{}, nil); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument for empty candidate, got %v", err)
+	}
+
+	cand := ScrapeCandidate{
+		ProviderName:  "Imdb",
+		ProviderID:    "tt0133093",
+		Title:         "黑客帝国",
+		OriginalTitle: "The Matrix",
+		Genres:        []string{"Sci-Fi", "  ", "Sci-Fi", "Action"},
+		Tags:          []string{"Cyberpunk", "Classic", "Cyberpunk"},
+	}
+	approved, err := svc.ApproveAudit(ctx, aud.ID, cand, []string{"Name"})
+	if err != nil {
+		t.Fatalf("ApproveAudit with taxonomies failed: %v", err)
+	}
+	if approved.Status != AuditStatusApproved {
+		t.Fatalf("expected approved status, got %s", approved.Status)
+	}
+
+	// Re-approving a non-pending (already approved) audit must fail
+	if _, err := svc.ApproveAudit(ctx, aud.ID, cand, nil); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument for non-pending audit, got %v", err)
+	}
+
+	// Verify genres, tags, custom ProviderName, and FTS preservation
+	genres, tags, err := svc.loadItemTaxonomies(ctx, movie.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(genres) != 2 || len(tags) != 2 {
+		t.Fatalf("expected 2 genres and 2 tags after taxonomy replace, got genres=%v tags=%v", genres, tags)
+	}
+	var ftsTitle, ftsPinyin, ftsPeople string
+	if err := store.Reader.QueryRowContext(ctx,
+		`SELECT title_raw, pinyin_full, people_names FROM item_search_fts WHERE item_id = ?`, movie.ID,
+	).Scan(&ftsTitle, &ftsPinyin, &ftsPeople); err != nil {
+		t.Fatalf("query item_search_fts: %v", err)
+	}
+	if ftsTitle != "黑客帝国 The Matrix" || ftsPinyin != "rawfile" || ftsPeople != "actor one" {
+		t.Fatalf("unexpected FTS row after ApproveAudit: title=%q pinyin=%q people=%q", ftsTitle, ftsPinyin, ftsPeople)
+	}
+	var extraRaw string
+	_ = store.Reader.QueryRowContext(ctx, `SELECT extra_json FROM items WHERE id = ?`, movie.ID).Scan(&extraRaw)
+	if extractProviderIDs(decodeExtraMap(extraRaw))["Imdb"] != "tt0133093" {
+		t.Fatalf("expected custom ProviderName Imdb saved, got %s", extraRaw)
+	}
+
+	// 4. WriteItemNFOAtomic & atomicWriteFile refuse symlink target without modifying link destination
+	secretFile := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(secretFile, []byte("DO-NOT-TOUCH"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	symlinkNFO := filepath.Join(mediaDir, "still-here.nfo")
+	if err := os.Symlink(secretFile, symlinkNFO); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.WriteItemNFOAtomic(ctx, movie.ID); err == nil {
+		t.Fatal("expected WriteItemNFOAtomic to refuse symlink target")
+	}
+	secretData, err := os.ReadFile(secretFile)
+	if err != nil || string(secretData) != "DO-NOT-TOUCH" {
+		t.Fatalf("symlink target file was modified: data=%q err=%v", string(secretData), err)
+	}
+
+	// 5. SetLockState with fields==nil and lockData!=nil preserves existing LockedFields
+	lockTrue := true
+	if _, err := svc.SetLockState(ctx, movie.ID, []string{"Overview"}, &lockTrue); err != nil {
+		t.Fatal(err)
+	}
+	lockFalse := false
+	resKeep, err := svc.SetLockState(ctx, movie.ID, nil, &lockFalse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resKeep.LockData || len(resKeep.LockedFields) != 1 || resKeep.LockedFields[0] != "Overview" {
+		t.Fatalf("expected LockedFields preserved when fields==nil && lockData!=nil, got %+v", resKeep)
+	}
+	if extractLockData(map[string]any{"LockData": "not-a-bool"}) {
+		t.Fatal("expected false for non-bool LockData")
+	}
+}
+
+func TestGovernanceRollbackAndErrorInjectionBranches(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Null candidates_json fallback across ListAudits, ApproveAudit, and DismissAudit
+	svc, store, repo, _, _, _ := newTestEnv(t)
+	lib, err := repo.CreateLibrary(ctx, "Movies", "movies", []string{t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m1 := &sqlite.ItemRecord{LibraryID: lib.ID, Type: "Movie", Name: "NullCand1", Path: filepath.Join(t.TempDir(), "m1.mkv")}
+	m2 := &sqlite.ItemRecord{LibraryID: lib.ID, Type: "Movie", Name: "NullCand2", Path: filepath.Join(t.TempDir(), "m2.mkv")}
+	_ = repo.UpsertItem(ctx, m1)
+	_ = repo.UpsertItem(ctx, m2)
+	a1, _ := svc.EnqueueAudit(ctx, EnqueueAuditInput{ItemID: m1.ID, ItemName: m1.Name})
+	a2, _ := svc.EnqueueAudit(ctx, EnqueueAuditInput{ItemID: m2.ID, ItemName: m2.Name})
+	_, _ = store.Writer.ExecContext(ctx, `UPDATE scrape_audit_queue SET candidates_json = 'null'`)
+
+	listed, err := svc.ListAudits(ctx, "pending")
+	if err != nil || len(listed) != 2 || listed[0].Candidates == nil {
+		t.Fatalf("expected non-nil empty Candidates slice from ListAudits, got %+v err=%v", listed, err)
+	}
+	if app, err := svc.ApproveAudit(ctx, a1.ID, ScrapeCandidate{Title: "OK"}, nil); err != nil || app.Candidates == nil {
+		t.Fatalf("expected ApproveAudit with null candidates_json to succeed, got %+v err=%v", app, err)
+	}
+	if dis, err := svc.DismissAudit(ctx, a2.ID); err != nil || dis.Candidates == nil {
+		t.Fatalf("expected DismissAudit with null candidates_json to succeed, got %+v err=%v", dis, err)
+	}
+
+	// 2. EnqueueAudit JSON marshal error via NaN confidence in candidate
+	if _, err := svc.EnqueueAudit(ctx, EnqueueAuditInput{
+		ItemID:     m1.ID,
+		ItemName:   m1.Name,
+		Candidates: []ScrapeCandidate{{Title: "Bad", Confidence: math.NaN()}},
+	}); err == nil {
+		t.Fatal("expected JSON marshal error for NaN candidate confidence")
+	}
+
+	// 3. SQLite trigger-injected write failures verify transaction rollbacks across ApproveAudit, EnqueueAudit, DismissAudit, SetLockState, CleanupOrphans
+	m3 := &sqlite.ItemRecord{LibraryID: lib.ID, Type: "Movie", Name: "RollbackMovie", Path: filepath.Join(t.TempDir(), "gone.mkv")}
+	_ = repo.UpsertItem(ctx, m3)
+	_ = repo.ReplaceItemAncestors(ctx, m3.ID, []sqlite.AncestorLink{{AncestorID: lib.ID, Depth: 1}})
+	a3, _ := svc.EnqueueAudit(ctx, EnqueueAuditInput{ItemID: m3.ID, ItemName: m3.Name})
+
+	mustExec := func(q string) {
+		t.Helper()
+		if _, err := store.Writer.ExecContext(ctx, q); err != nil {
+			t.Fatalf("exec %q: %v", q, err)
+		}
+	}
+
+	// 3a. SetLockState update failure & ApproveAudit update items failure
+	mustExec(`CREATE TRIGGER block_items_upd BEFORE UPDATE ON items BEGIN SELECT RAISE(ABORT, 'block upd'); END;`)
+	if _, err := svc.SetLockState(ctx, m3.ID, []string{"Name"}, nil); err == nil {
+		t.Fatal("expected SetLockState error under items update trigger")
+	}
+	if _, err := svc.ApproveAudit(ctx, a3.ID, ScrapeCandidate{Title: "New"}, nil); err == nil {
+		t.Fatal("expected ApproveAudit error under items update trigger")
+	}
+	mustExec(`DROP TRIGGER block_items_upd;`)
+
+	// 3b. ApproveAudit taxonomy insert failure & item_taxonomies insert failure
+	mustExec(`CREATE TRIGGER block_tax_ins BEFORE INSERT ON taxonomies BEGIN SELECT RAISE(ABORT, 'block tax'); END;`)
+	if _, err := svc.ApproveAudit(ctx, a3.ID, ScrapeCandidate{Title: "New", Genres: []string{"BrandNewGenre"}}, nil); err == nil {
+		t.Fatal("expected ApproveAudit error on genre taxonomy insert failure")
+	}
+	if _, err := svc.ApproveAudit(ctx, a3.ID, ScrapeCandidate{Title: "New", Tags: []string{"BrandNewTag"}}, nil); err == nil {
+		t.Fatal("expected ApproveAudit error on tag taxonomy insert failure")
+	}
+	mustExec(`DROP TRIGGER block_tax_ins;`)
+
+	mustExec(`CREATE TRIGGER block_itax_ins BEFORE INSERT ON item_taxonomies BEGIN SELECT RAISE(ABORT, 'block itax'); END;`)
+	if _, err := svc.ApproveAudit(ctx, a3.ID, ScrapeCandidate{Title: "New", Genres: []string{"G1"}}, nil); err == nil {
+		t.Fatal("expected ApproveAudit error on item_taxonomies insert failure")
+	}
+	mustExec(`DROP TRIGGER block_itax_ins;`)
+
+	// 3c. CleanupOrphans delete failures on item_ancestors, scrape_audit_queue, items
+	mustExec(`CREATE TRIGGER block_anc_del BEFORE DELETE ON item_ancestors BEGIN SELECT RAISE(ABORT, 'block anc'); END;`)
+	if _, err := svc.CleanupOrphans(ctx, []string{m3.ID}); err == nil {
+		t.Fatal("expected CleanupOrphans error on item_ancestors delete failure")
+	}
+	mustExec(`DROP TRIGGER block_anc_del;`)
+
+	mustExec(`CREATE TRIGGER block_aud_del BEFORE DELETE ON scrape_audit_queue BEGIN SELECT RAISE(ABORT, 'block aud del'); END;`)
+	if _, err := svc.CleanupOrphans(ctx, []string{m3.ID}); err == nil {
+		t.Fatal("expected CleanupOrphans error on scrape_audit_queue delete failure")
+	}
+	mustExec(`DROP TRIGGER block_aud_del;`)
+
+	mustExec(`CREATE TRIGGER block_items_del BEFORE DELETE ON items BEGIN SELECT RAISE(ABORT, 'block items del'); END;`)
+	if _, err := svc.CleanupOrphans(ctx, []string{m3.ID}); err == nil {
+		t.Fatal("expected CleanupOrphans error on items delete failure")
+	}
+	mustExec(`DROP TRIGGER block_items_del;`)
+
+	// 3d. scrape_audit_queue update & insert failures
+	mustExec(`CREATE TRIGGER block_aud_upd BEFORE UPDATE ON scrape_audit_queue BEGIN SELECT RAISE(ABORT, 'block aud upd'); END;`)
+	if _, err := svc.EnqueueAudit(ctx, EnqueueAuditInput{ItemID: m3.ID, ItemName: "Updated"}); err == nil {
+		t.Fatal("expected EnqueueAudit update error under trigger")
+	}
+	if _, err := svc.ApproveAudit(ctx, a3.ID, ScrapeCandidate{Title: "New"}, nil); err == nil {
+		t.Fatal("expected ApproveAudit status update error under trigger")
+	}
+	if _, err := svc.DismissAudit(ctx, a3.ID); err == nil {
+		t.Fatal("expected DismissAudit update error under trigger")
+	}
+	mustExec(`DROP TRIGGER block_aud_upd;`)
+
+	mustExec(`CREATE TRIGGER block_aud_ins BEFORE INSERT ON scrape_audit_queue BEGIN SELECT RAISE(ABORT, 'block aud ins'); END;`)
+	if _, err := svc.EnqueueAudit(ctx, EnqueueAuditInput{ItemID: "brand-new-item", ItemName: "X"}); err == nil {
+		t.Fatal("expected EnqueueAudit insert error under trigger")
+	}
+	mustExec(`DROP TRIGGER block_aud_ins;`)
+
+	// 4. Schema drop error paths for FTS, WriteItemNFOAtomic, ApproveAudit, RunLibraryAudit, collectLibraryStats, and closed store
+	mustExec(`PRAGMA foreign_keys = OFF;`)
+	nfoDir := t.TempDir()
+	m4 := &sqlite.ItemRecord{LibraryID: lib.ID, Type: "Movie", Name: "NFOErr", Path: filepath.Join(nfoDir, "m4.mkv")}
+	_ = repo.UpsertItem(ctx, m4)
+
+	// Drop virtual FTS table to cover FTS delete error in both ApproveAudit and CleanupOrphans
+	mustExec(`DROP TABLE item_search_fts;`)
+	if _, err := svc.ApproveAudit(ctx, a3.ID, ScrapeCandidate{Title: "New"}, nil); err == nil {
+		t.Fatal("expected ApproveAudit error when item_search_fts table missing")
+	}
+	if _, err := svc.CleanupOrphans(ctx, []string{m3.ID}); err == nil {
+		t.Fatal("expected CleanupOrphans error when item_search_fts table missing")
+	}
+
+	mustExec(`DROP TABLE item_people;`)
+	if _, err := svc.WriteItemNFOAtomic(ctx, m4.ID); err == nil {
+		t.Fatal("expected WriteItemNFOAtomic error when item_people table missing")
+	}
+	mustExec(`DROP TABLE item_taxonomies;`)
+	if _, err := svc.WriteItemNFOAtomic(ctx, m4.ID); err == nil {
+		t.Fatal("expected WriteItemNFOAtomic error when item_taxonomies table missing")
+	}
+	if _, err := svc.ApproveAudit(ctx, a3.ID, ScrapeCandidate{Title: "X", Genres: []string{"Drama"}}, nil); err == nil {
+		t.Fatal("expected ApproveAudit error when item_taxonomies table missing")
+	}
+	mustExec(`DROP TABLE scrape_audit_queue;`)
+	if _, err := svc.CollectHealth(ctx); err == nil {
+		t.Fatal("expected CollectHealth error when scrape_audit_queue table missing")
+	}
+	mustExec(`DROP TABLE users;`)
+	if _, err := svc.CollectHealth(ctx); err == nil {
+		t.Fatal("expected CollectHealth error when users table missing")
+	}
+	mustExec(`DROP TABLE items;`)
+	if _, err := svc.RunLibraryAudit(ctx); err == nil {
+		t.Fatal("expected RunLibraryAudit error when items table missing")
+	}
+
+	// Non-empty candidate on closed store hits BeginTx error in ApproveAudit
+	_ = store.Close()
+	if _, err := svc.ApproveAudit(ctx, "any-id", ScrapeCandidate{Title: "NonEmpty"}, nil); err == nil {
+		t.Fatal("expected ApproveAudit BeginTx error on closed store")
 	}
 }

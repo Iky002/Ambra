@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { ArrowLeft, Film, Loader2, Tv, User } from 'lucide-react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
@@ -20,6 +20,10 @@ export function PersonDetailPage() {
   const nameFromQuery = searchParams.get('name') || ''
   const [mediaFilter, setMediaFilter] = useState<MediaFilter>('ALL')
   const [avatarFailed, setAvatarFailed] = useState(false)
+
+  useEffect(() => {
+    setAvatarFailed(false)
+  }, [decodedId])
 
   const { data: personItem, isLoading: personLoading } = useQuery({
     queryKey: ['personItem', userId, decodedId],

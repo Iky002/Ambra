@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ambra-media/ambra/internal/api/dto"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/dvr"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
@@ -1204,8 +1205,9 @@ func TestLiveTVExportedDelegationHelpers(t *testing.T) {
 		t.Fatalf("unexpected channel after update: %+v", ch)
 	}
 
-	doJSON(t, mux, http.MethodPost, "/LiveTv/Timers", map[string]any{"Id": "del-tm", "Name": "T", "ChannelId": chID})
-	doJSON(t, mux, http.MethodPost, "/LiveTv/SeriesTimers", map[string]any{"Id": "del-st", "Name": "S", "ChannelId": chID})
+	adminCtx := makeLiveTVAuth("admin-1", "admin", true, true)
+	doLiveTVAuthReq(t, mux, adminCtx, http.MethodPost, "/LiveTv/Timers", map[string]any{"Id": "del-tm", "Name": "T", "ChannelId": chID})
+	doLiveTVAuthReq(t, mux, adminCtx, http.MethodPost, "/LiveTv/SeriesTimers", map[string]any{"Id": "del-st", "Name": "S", "ChannelId": chID})
 	if !h.DeleteTimerByID(ctx, "del-tm") {
 		t.Fatal("expected DeleteTimerByID true")
 	}
@@ -1217,7 +1219,10 @@ func TestLiveTVExportedDelegationHelpers(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/LiveTv/Timers", nil)
-	if !h.HasLiveTvManagement(ctx, req) {
-		t.Fatal("expected unauthenticated/legacy fallback HasLiveTvManagement=true")
+	if h.HasLiveTvManagement(ctx, req) {
+		t.Fatal("expected unauthenticated HasLiveTvManagement=false (fail-closed)")
+	}
+	if !h.HasLiveTvManagement(ctx, req.WithContext(middleware.WithAuthContext(req.Context(), adminCtx))) {
+		t.Fatal("expected admin HasLiveTvManagement=true")
 	}
 }

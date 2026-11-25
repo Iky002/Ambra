@@ -382,6 +382,12 @@ func (s *Service) ApplyTagsToLibrary(ctx context.Context) (matchedItems int, tag
 		tags   []string
 	}
 
+	s.mu.RLock()
+	hasTMDBChart := s.tmdbTrending != nil && len(s.tmdbTrending.Entries) > 0
+	hasDoubanMovieChart := s.doubanTrendingMovie != nil && len(s.doubanTrendingMovie.Entries) > 0
+	hasDoubanTVChart := s.doubanTrendingTV != nil && len(s.doubanTrendingTV.Entries) > 0
+	s.mu.RUnlock()
+
 	rows, err := s.store.Reader.QueryContext(ctx, `
 		SELECT id, type, name, COALESCE(original_title, ''), COALESCE(production_year, 0), COALESCE(extra_json, '{}')
 		FROM items
@@ -391,6 +397,12 @@ func (s *Service) ApplyTagsToLibrary(ctx context.Context) (matchedItems int, tag
 	}
 
 	var plans []itemTagPlan
+	activeByDynamicTag := map[string]map[string]struct{}{
+		TagTMDBTrending:         {},
+		TagTMDBTrendingSpecific: {},
+		TagDoubanTrendingMovie:  {},
+		TagDoubanTrendingTV:     {},
+	}
 	for rows.Next() {
 		var id, itemType, name, originalTitle, extraJSON string
 		var year int
@@ -405,6 +417,11 @@ func (s *Service) ApplyTagsToLibrary(ctx context.Context) (matchedItems int, tag
 		tags := s.MatchTagsForTypedItem(itemType, name, originalTitle, year, extra.ProviderIDs)
 		if len(tags) > 0 {
 			plans = append(plans, itemTagPlan{itemID: id, tags: tags})
+			for _, t := range tags {
+				if set, isDyn := activeByDynamicTag[t]; isDyn {
+					set[id] = struct{}{}
+				}
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -414,7 +431,8 @@ func (s *Service) ApplyTagsToLibrary(ctx context.Context) (matchedItems int, tag
 	rows.Close()
 
 	matchedItems = len(plans)
-	if matchedItems == 0 {
+	hasAnyDynamicChart := hasTMDBChart || hasDoubanMovieChart || hasDoubanTVChart
+	if matchedItems == 0 && !hasAnyDynamicChart {
 		return 0, 0, nil
 	}
 
@@ -424,7 +442,7 @@ func (s *Service) ApplyTagsToLibrary(ctx context.Context) (matchedItems int, tag
 	}
 	defer tx.Rollback()
 
-	taxIDCache := make(map[string]string, 2)
+	taxIDCache := make(map[string]string, 6)
 	ensureTaxID := func(tagName string) (string, error) {
 		if id, ok := taxIDCache[tagName]; ok {
 			return id, nil
@@ -444,6 +462,81 @@ func (s *Service) ApplyTagsToLibrary(ctx context.Context) (matchedItems int, tag
 		}
 		taxIDCache[tagName] = taxID
 		return taxID, nil
+	}
+
+	// Prune stale dynamic trending tags from items that have dropped off the active charts.
+	pruneStaleTag := func(tagName string) (int, error) {
+		var taxID string
+		err := tx.QueryRowContext(ctx, `SELECT id FROM taxonomies WHERE kind = 'tag' AND name = ?`, tagName).Scan(&taxID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		if err != nil {
+			return 0, err
+		}
+		curRows, err := tx.QueryContext(ctx, `SELECT item_id FROM item_taxonomies WHERE taxonomy_id = ?`, taxID)
+		if err != nil {
+			return 0, err
+		}
+		var toRemove []string
+		activeSet := activeByDynamicTag[tagName]
+		for curRows.Next() {
+			var itemID string
+			if err := curRows.Scan(&itemID); err != nil {
+				curRows.Close()
+				return 0, err
+			}
+			if _, stillOnChart := activeSet[itemID]; !stillOnChart {
+				toRemove = append(toRemove, itemID)
+			}
+		}
+		if err := curRows.Err(); err != nil {
+			curRows.Close()
+			return 0, err
+		}
+		curRows.Close()
+
+		removed := 0
+		for _, itemID := range toRemove {
+			res, err := tx.ExecContext(ctx, `DELETE FROM item_taxonomies WHERE item_id = ? AND taxonomy_id = ?`, itemID, taxID)
+			if err != nil {
+				return removed, err
+			}
+			if n, _ := res.RowsAffected(); n > 0 {
+				removed += int(n)
+			}
+		}
+		return removed, nil
+	}
+
+	tagsRemoved := 0
+	if hasTMDBChart {
+		if n, err := pruneStaleTag(TagTMDBTrendingSpecific); err != nil {
+			return 0, 0, fmt.Errorf("prune stale %q: %w", TagTMDBTrendingSpecific, err)
+		} else {
+			tagsRemoved += n
+		}
+	}
+	if hasDoubanMovieChart {
+		if n, err := pruneStaleTag(TagDoubanTrendingMovie); err != nil {
+			return 0, 0, fmt.Errorf("prune stale %q: %w", TagDoubanTrendingMovie, err)
+		} else {
+			tagsRemoved += n
+		}
+	}
+	if hasDoubanTVChart {
+		if n, err := pruneStaleTag(TagDoubanTrendingTV); err != nil {
+			return 0, 0, fmt.Errorf("prune stale %q: %w", TagDoubanTrendingTV, err)
+		} else {
+			tagsRemoved += n
+		}
+	}
+	if hasAnyDynamicChart {
+		if n, err := pruneStaleTag(TagTMDBTrending); err != nil {
+			return 0, 0, fmt.Errorf("prune stale %q: %w", TagTMDBTrending, err)
+		} else {
+			tagsRemoved += n
+		}
 	}
 
 	for _, p := range plans {
@@ -469,13 +562,14 @@ func (s *Service) ApplyTagsToLibrary(ctx context.Context) (matchedItems int, tag
 		return 0, 0, fmt.Errorf("commit tag tx: %w", err)
 	}
 
-	if tagsAdded > 0 && s.bus != nil {
+	if (tagsAdded > 0 || tagsRemoved > 0) && s.bus != nil {
 		s.bus.Publish(ctx, eventbus.Event{
 			Type: eventbus.EventLibraryChanged,
 			Payload: map[string]any{
 				"Source":       "rankings",
 				"MatchedItems": matchedItems,
 				"TagsAdded":    tagsAdded,
+				"TagsRemoved":  tagsRemoved,
 			},
 		})
 	}
@@ -536,48 +630,63 @@ func (s *Service) SyncAndApply(ctx context.Context) (SyncSummary, error) {
 		tmdbErr = err
 		summary.TMDBTrendingError = err.Error()
 	} else {
-		if err := s.saveSnapshot(ctx, ConfigKeyTMDBTrending, snap); err != nil {
-			return summary, fmt.Errorf("save tmdb trending cache: %w", err)
-		}
 		if snap.Source != SourceTMDBTrendingBuiltin {
 			tmdbLiveSucceeded = true
 		}
-		s.mu.Lock()
-		s.tmdbTrending = snap
-		s.tmdbTrendingIdx = buildChartIndex(snap.Entries)
-		s.mu.Unlock()
+		s.mu.RLock()
+		hasLiveTMDB := s.tmdbTrending != nil && len(s.tmdbTrending.Entries) > 0 && s.tmdbTrending.Source != SourceTMDBTrendingBuiltin
+		s.mu.RUnlock()
+		if tmdbLiveSucceeded || !hasLiveTMDB {
+			if err := s.saveSnapshot(ctx, ConfigKeyTMDBTrending, snap); err != nil {
+				return summary, fmt.Errorf("save tmdb trending cache: %w", err)
+			}
+			s.mu.Lock()
+			s.tmdbTrending = snap
+			s.tmdbTrendingIdx = buildChartIndex(snap.Entries)
+			s.mu.Unlock()
+		}
 	}
 
 	if snap, err := s.fetcher.FetchDoubanTrendingMovie(ctx); err != nil {
 		doubanMovieErr = err
 		summary.DoubanTrendingMovieError = err.Error()
 	} else {
-		if err := s.saveSnapshot(ctx, ConfigKeyDoubanTrendingMovie, snap); err != nil {
-			return summary, fmt.Errorf("save douban trending movie cache: %w", err)
-		}
 		if snap.Source != SourceDoubanTrendingMovieBuiltin {
 			doubanMovieLiveSucceeded = true
 		}
-		s.mu.Lock()
-		s.doubanTrendingMovie = snap
-		s.doubanTrendingMovieIdx = buildChartIndex(snap.Entries)
-		s.mu.Unlock()
+		s.mu.RLock()
+		hasLiveDoubanMovie := s.doubanTrendingMovie != nil && len(s.doubanTrendingMovie.Entries) > 0 && s.doubanTrendingMovie.Source != SourceDoubanTrendingMovieBuiltin
+		s.mu.RUnlock()
+		if doubanMovieLiveSucceeded || !hasLiveDoubanMovie {
+			if err := s.saveSnapshot(ctx, ConfigKeyDoubanTrendingMovie, snap); err != nil {
+				return summary, fmt.Errorf("save douban trending movie cache: %w", err)
+			}
+			s.mu.Lock()
+			s.doubanTrendingMovie = snap
+			s.doubanTrendingMovieIdx = buildChartIndex(snap.Entries)
+			s.mu.Unlock()
+		}
 	}
 
 	if snap, err := s.fetcher.FetchDoubanTrendingTV(ctx); err != nil {
 		doubanTVErr = err
 		summary.DoubanTrendingTVError = err.Error()
 	} else {
-		if err := s.saveSnapshot(ctx, ConfigKeyDoubanTrendingTV, snap); err != nil {
-			return summary, fmt.Errorf("save douban trending tv cache: %w", err)
-		}
 		if snap.Source != SourceDoubanTrendingTVBuiltin {
 			doubanTVLiveSucceeded = true
 		}
-		s.mu.Lock()
-		s.doubanTrendingTV = snap
-		s.doubanTrendingTVIdx = buildChartIndex(snap.Entries)
-		s.mu.Unlock()
+		s.mu.RLock()
+		hasLiveDoubanTV := s.doubanTrendingTV != nil && len(s.doubanTrendingTV.Entries) > 0 && s.doubanTrendingTV.Source != SourceDoubanTrendingTVBuiltin
+		s.mu.RUnlock()
+		if doubanTVLiveSucceeded || !hasLiveDoubanTV {
+			if err := s.saveSnapshot(ctx, ConfigKeyDoubanTrendingTV, snap); err != nil {
+				return summary, fmt.Errorf("save douban trending tv cache: %w", err)
+			}
+			s.mu.Lock()
+			s.doubanTrendingTV = snap
+			s.doubanTrendingTVIdx = buildChartIndex(snap.Entries)
+			s.mu.Unlock()
+		}
 	}
 
 	s.mu.RLock()

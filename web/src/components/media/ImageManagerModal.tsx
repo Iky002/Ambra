@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Check,
@@ -15,6 +15,9 @@ import { AdminModal, FeedbackBanner } from '../../pages/admin/adminUtils'
 
 type ModalTab = 'current' | 'remote' | 'upload'
 type ImageKind = 'Primary' | 'Backdrop'
+
+const ALLOWED_IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif'])
+const MAX_POSTER_UPLOAD_BYTES = 15 * 1024 * 1024 // 15 MB
 
 export interface ImageManagerModalProps {
   open: boolean
@@ -42,6 +45,15 @@ export function ImageManagerModal({
   )
 
   const itemId = item?.Id || ''
+
+  useEffect(() => {
+    setActiveTab('current')
+    setRemoteType('Primary')
+    setUploadType('Primary')
+    setCustomUrl('')
+    setDragging(false)
+    setFeedback(null)
+  }, [open, itemId])
 
   const { data: currentImages = [], isLoading: imagesLoading } = useQuery({
     queryKey: ['item-images', itemId],
@@ -71,7 +83,14 @@ export function ImageManagerModal({
       api.deleteItemImage(itemId, type, index ?? 0),
     onSuccess: async (_, vars) => {
       await invalidateAll()
-      const msg = `已删除 ${vars.type === 'Backdrop' ? '剧照 (Backdrop)' : '海报 (Primary)'}`
+      const lower = vars.type.toLowerCase()
+      const label =
+        lower === 'backdrop'
+          ? '剧照 (Backdrop)'
+          : lower === 'primary'
+            ? '海报 (Primary)'
+            : vars.type
+      const msg = `已删除 ${label}`
       setFeedback({ type: 'success', message: msg })
       onUpdated?.(msg)
     },
@@ -132,8 +151,12 @@ export function ImageManagerModal({
 
   const handleFile = (file?: File | null) => {
     if (!file) return
-    if (!file.type.startsWith('image/')) {
-      setFeedback({ type: 'error', message: '请选择有效的图片文件（JPG / PNG / WebP）' })
+    if (!ALLOWED_IMAGE_MIME_TYPES.has((file.type || '').toLowerCase())) {
+      setFeedback({ type: 'error', message: '请选择有效的图片文件（JPG / PNG / WebP / GIF）' })
+      return
+    }
+    if (file.size > MAX_POSTER_UPLOAD_BYTES) {
+      setFeedback({ type: 'error', message: '图片文件过大，请选择不超过 15 MB 的图片' })
       return
     }
     const reader = new FileReader()
@@ -228,16 +251,28 @@ export function ImageManagerModal({
             ) : (
               <div className="grid gap-4 sm:grid-cols-2">
                 {currentImages.map((img) => {
-                  const isBackdrop = img.ImageType.toLowerCase() === 'backdrop'
-                  const previewUrl = getImageUrl(
-                    itemId,
-                    isBackdrop ? 'Backdrop' : 'Primary',
-                    { maxWidth: isBackdrop ? 800 : 400, tag: img.ImageTag },
-                  )
+                  const rawType = img.ImageType || 'Primary'
+                  const lowerType = rawType.toLowerCase()
+                  const isBackdrop = lowerType === 'backdrop'
+                  const isWide =
+                    isBackdrop ||
+                    lowerType === 'banner' ||
+                    lowerType === 'thumb' ||
+                    lowerType === 'logo' ||
+                    lowerType === 'art'
+                  const previewUrl = getImageUrl(itemId, rawType, {
+                    maxWidth: isWide ? 800 : 400,
+                    tag: img.ImageTag,
+                  })
                   const fallback = getFallbackImageUrl(
                     itemId,
                     isBackdrop ? 'Backdrop' : 'Primary',
                   )
+                  const typeLabel = isBackdrop
+                    ? '剧照 · Backdrop'
+                    : lowerType === 'primary'
+                      ? '海报 · Primary'
+                      : rawType
                   return (
                     <div
                       key={`${img.ImageType}-${img.ImageIndex ?? 0}`}
@@ -245,12 +280,12 @@ export function ImageManagerModal({
                     >
                       <div
                         className={`relative w-full overflow-hidden bg-zinc-900 ${
-                          isBackdrop ? 'aspect-video' : 'aspect-[2/3] max-h-80'
+                          isWide ? 'aspect-video' : 'aspect-[2/3] max-h-80'
                         }`}
                       >
                         <img
                           src={previewUrl}
-                          alt={img.ImageType}
+                          alt={rawType}
                           onError={(e) => {
                             if (fallback && e.currentTarget.src !== fallback) {
                               e.currentTarget.src = fallback
@@ -259,7 +294,7 @@ export function ImageManagerModal({
                           className="h-full w-full object-cover"
                         />
                         <span className="absolute left-3 top-3 rounded-lg bg-black/70 px-2.5 py-1 text-[11px] font-semibold text-amber-300 backdrop-blur-sm">
-                          {isBackdrop ? '剧照 · Backdrop' : '海报 · Primary'}
+                          {typeLabel}
                         </span>
                       </div>
                       <div className="flex items-center justify-between gap-3 px-4 py-3">
@@ -433,7 +468,7 @@ export function ImageManagerModal({
               <input
                 ref={fileInputRef}
                 type="file"
-                accept="image/*"
+                accept="image/jpeg,image/png,image/webp,image/gif"
                 className="hidden"
                 onChange={(e) => {
                   handleFile(e.target.files?.[0])
@@ -449,7 +484,7 @@ export function ImageManagerModal({
                 拖拽本地图片到此处，或点击选择文件
               </p>
               <p className="mt-1 text-xs text-zinc-500">
-                支持 JPG / PNG / WebP，选择后立即上传替换当前
+                支持 JPG / PNG / WebP / GIF（≤ 15MB），选择后立即上传替换当前
                 {uploadType === 'Backdrop' ? '剧照' : '海报'}
               </p>
             </div>

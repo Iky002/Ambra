@@ -1,7 +1,8 @@
 package ops
 
 import (
-	"encoding/json"
+	"crypto/subtle"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -10,6 +11,12 @@ import (
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+)
+
+const (
+	maxParties      = 200
+	minPlaybackRate = 0.25
+	maxPlaybackRate = 4.0
 )
 
 type PartyState struct {
@@ -25,6 +32,8 @@ type Party struct {
 	Name        string     `json:"Name"`
 	HostUserId  string     `json:"HostUserId,omitempty"`
 	Members     []string   `json:"Members"`
+	IsPublic    bool       `json:"IsPublic"`
+	InviteCode  string     `json:"InviteCode,omitempty"`
 	State       PartyState `json:"State"`
 	DateCreated time.Time  `json:"DateCreated"`
 }
@@ -92,8 +101,10 @@ func (h *Handler) handleCreateParty(w http.ResponseWriter, r *http.Request) {
 		ItemId        string `json:"ItemId"`
 		PositionTicks int64  `json:"PositionTicks"`
 		IsPaused      bool   `json:"IsPaused"`
+		IsPublic      *bool  `json:"IsPublic"`
+		InviteCode    string `json:"InviteCode"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid party payload")
 		return
 	}
@@ -106,6 +117,13 @@ func (h *Handler) handleCreateParty(w http.ResponseWriter, r *http.Request) {
 	if hostID != "" {
 		members = append(members, hostID)
 	}
+	inviteCode := strings.TrimSpace(req.InviteCode)
+	isPublic := true
+	if req.IsPublic != nil {
+		isPublic = *req.IsPublic
+	} else if inviteCode != "" {
+		isPublic = false
+	}
 
 	now := time.Now().UTC()
 	party := Party{
@@ -113,6 +131,8 @@ func (h *Handler) handleCreateParty(w http.ResponseWriter, r *http.Request) {
 		Name:       name,
 		HostUserId: hostID,
 		Members:    members,
+		IsPublic:   isPublic,
+		InviteCode: inviteCode,
 		State: PartyState{
 			ItemId:        req.ItemId,
 			PositionTicks: req.PositionTicks,
@@ -124,9 +144,18 @@ func (h *Handler) handleCreateParty(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.Lock()
+	if len(h.state.Parties) >= maxParties {
+		h.mu.Unlock()
+		httpx.Error(w, http.StatusTooManyRequests, "maximum number of active watch parties reached")
+		return
+	}
 	h.state.Parties = append(h.state.Parties, party)
-	h.saveStateLocked(r.Context())
+	err := h.saveStateLocked(r.Context())
 	h.mu.Unlock()
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to persist party")
+		return
+	}
 
 	httpx.JSON(w, http.StatusOK, party)
 }
@@ -175,32 +204,48 @@ func (h *Handler) handleDeleteParty(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleJoinParty(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
 	var req struct {
-		UserId string `json:"UserId"`
+		UserId     string `json:"UserId"`
+		InviteCode string `json:"InviteCode"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = httpx.DecodeJSONLimit(r, &req, 0)
+	}
+	inviteCode := strings.TrimSpace(req.InviteCode)
+	if inviteCode == "" {
+		inviteCode = strings.TrimSpace(httpx.ParseQuery(r).Get("InviteCode"))
 	}
 	userID := h.resolveUserID(r, req.UserId)
 	if userID == "" {
 		httpx.Error(w, http.StatusBadRequest, "UserId is required")
 		return
 	}
+	callerID, isAdmin, _ := callerAuth(r)
 
 	h.mu.Lock()
 	for i := range h.state.Parties {
 		if h.state.Parties[i].Id == id {
+			p := &h.state.Parties[i]
+			isHostOrMember := (callerID != "" && (guid.Normalize(p.HostUserId) == callerID || isPartyMember(p.Members, callerID))) ||
+				guid.Normalize(p.HostUserId) == userID || isPartyMember(p.Members, userID)
+			if !isAdmin && !isHostOrMember && (!p.IsPublic || p.InviteCode != "") {
+				if p.InviteCode == "" || subtle.ConstantTimeCompare([]byte(inviteCode), []byte(p.InviteCode)) != 1 {
+					h.mu.Unlock()
+					httpx.Error(w, http.StatusForbidden, "valid InviteCode is required to join this party")
+					return
+				}
+			}
 			exists := false
-			for _, m := range h.state.Parties[i].Members {
+			for _, m := range p.Members {
 				if m == userID {
 					exists = true
 					break
 				}
 			}
 			if !exists {
-				h.state.Parties[i].Members = append(h.state.Parties[i].Members, userID)
-				h.saveStateLocked(r.Context())
+				p.Members = append(p.Members, userID)
+				_ = h.saveStateLocked(r.Context())
 			}
-			party := h.state.Parties[i]
+			party := *p
 			h.mu.Unlock()
 			httpx.JSON(w, http.StatusOK, party)
 			return
@@ -216,7 +261,7 @@ func (h *Handler) handleLeaveParty(w http.ResponseWriter, r *http.Request) {
 		UserId string `json:"UserId"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = httpx.DecodeJSONLimit(r, &req, 0)
 	}
 	userID := h.resolveUserID(r, req.UserId)
 	if userID == "" {
@@ -233,8 +278,12 @@ func (h *Handler) handleLeaveParty(w http.ResponseWriter, r *http.Request) {
 					kept = append(kept, m)
 				}
 			}
-			h.state.Parties[i].Members = kept
-			h.saveStateLocked(r.Context())
+			if len(kept) == 0 {
+				h.state.Parties = append(h.state.Parties[:i], h.state.Parties[i+1:]...)
+			} else {
+				h.state.Parties[i].Members = kept
+			}
+			_ = h.saveStateLocked(r.Context())
 			h.mu.Unlock()
 			httpx.NoContent(w)
 			return
@@ -252,9 +301,16 @@ func (h *Handler) handleUpdatePartyState(w http.ResponseWriter, r *http.Request)
 		IsPaused      *bool    `json:"IsPaused"`
 		PlaybackRate  *float64 `json:"PlaybackRate"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid party state payload")
 		return
+	}
+	if req.PlaybackRate != nil {
+		rate := *req.PlaybackRate
+		if math.IsNaN(rate) || math.IsInf(rate, 0) || rate < minPlaybackRate || rate > maxPlaybackRate {
+			httpx.Error(w, http.StatusBadRequest, "PlaybackRate must be finite and between 0.25 and 4.0")
+			return
+		}
 	}
 
 	callerID, isAdmin, hasAuth := callerAuth(r)
@@ -278,12 +334,12 @@ func (h *Handler) handleUpdatePartyState(w http.ResponseWriter, r *http.Request)
 			if req.IsPaused != nil {
 				st.IsPaused = *req.IsPaused
 			}
-			if req.PlaybackRate != nil && *req.PlaybackRate > 0 {
+			if req.PlaybackRate != nil {
 				st.PlaybackRate = *req.PlaybackRate
 			}
 			st.UpdatedAt = time.Now().UTC()
 			party := *p
-			h.saveStateLocked(r.Context())
+			_ = h.saveStateLocked(r.Context())
 			h.mu.Unlock()
 
 			if h.bus != nil {

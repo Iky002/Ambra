@@ -15,6 +15,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -159,7 +160,8 @@ func TestStartupAndPackages(t *testing.T) {
 }
 
 func TestWebhooksAndEventBusDispatch(t *testing.T) {
-	_, mux, _, _, bus := setupOpsTest(t)
+	h, mux, _, _, bus := setupOpsTest(t)
+	h.SetHTTPClient(netutil.NewSafeHTTPClient(10*time.Second, true))
 
 	var received atomic.Int32
 	var lastSig atomic.Value
@@ -455,10 +457,14 @@ func TestOpenAPIGenericUIPartiesAndConnect(t *testing.T) {
 }
 
 func TestWebhooksSSRFHardening(t *testing.T) {
-	_, mux, _, _, _ := setupOpsTest(t)
+	h, mux, _, _, _ := setupOpsTest(t)
 
 	blockedURLs := []string{
 		"http://169.254.169.254/latest/meta-data/",
+		"http://100.100.100.200/latest/meta-data/",
+		"http://127.0.0.1:8096/hook",
+		"http://[::1]:8096/hook",
+		"http://localhost:8096/hook",
 		"http://[fe80::1]/hook",
 		"http://0.0.0.0/hook",
 		"http://224.0.0.1/hook",
@@ -487,7 +493,8 @@ func TestWebhooksSSRFHardening(t *testing.T) {
 		})
 	}
 
-	// Redirect from allowed loopback server to cloud metadata must be blocked by SafeHTTPClient
+	// Redirect from allowed loopback test server to cloud metadata must be blocked by SafeHTTPClient
+	h.SetHTTPClient(netutil.NewSafeHTTPClient(10*time.Second, true))
 	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "http://169.254.169.254/latest/meta-data/", http.StatusFound)
 	}))

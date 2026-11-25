@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -58,12 +59,17 @@ type UIView struct {
 }
 
 type Handler struct {
-	store      *sqlite.Store
-	cfg        *config.Config
-	userRepo   *sqlite.UserRepo
-	bus        *eventbus.Bus
-	httpClient *http.Client
-	auth       AuthFuncs
+	store            *sqlite.Store
+	cfg              *config.Config
+	userRepo         *sqlite.UserRepo
+	bus              *eventbus.Bus
+	httpClient       *http.Client
+	customHTTPClient bool
+	auth             AuthFuncs
+
+	backupMu      sync.Mutex
+	webhookOnce   sync.Once
+	webhookCh     chan webhookDispatchJob
 
 	mu    sync.RWMutex
 	state opsState
@@ -111,7 +117,15 @@ func (h *Handler) SetHTTPClient(client *http.Client) {
 	}
 	h.mu.Lock()
 	h.httpClient = client
+	h.customHTTPClient = true
 	h.mu.Unlock()
+}
+
+func (h *Handler) isCustomHTTPClient() bool {
+	h.mu.RLock()
+	custom := h.customHTTPClient
+	h.mu.RUnlock()
+	return custom
 }
 
 func (h *Handler) getHTTPClient() *http.Client {
@@ -192,7 +206,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	handleAuth("POST /Parties/{Id}/State", h.handleUpdatePartyState)
 
 	// Connect
-	handleAuth("GET /Connect/Pending", h.handleConnectPending)
+	handleAdmin("GET /Connect/Pending", h.handleConnectPending)
 	handleAuth("POST /Connect/Exchange", h.handleConnectExchange)
 }
 
@@ -307,7 +321,7 @@ func (h *Handler) handleUICommand(w http.ResponseWriter, r *http.Request) {
 		ItemId    string         `json:"ItemId"`
 		Data      map[string]any `json:"Data"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&cmd); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &cmd, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid UI command payload")
 		return
 	}
@@ -342,7 +356,7 @@ func (h *Handler) handleConnectExchange(w http.ResponseWriter, r *http.Request) 
 		var body struct {
 			ConnectUserId string `json:"ConnectUserId"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+		if err := httpx.DecodeJSONLimit(r, &body, 0); err == nil {
 			connectUserID = strings.TrimSpace(body.ConnectUserId)
 		}
 	}
@@ -378,15 +392,16 @@ func (h *Handler) loadState(ctx context.Context) {
 	}
 }
 
-func (h *Handler) saveStateLocked(ctx context.Context) {
+func (h *Handler) saveStateLocked(ctx context.Context) error {
 	if h.store == nil {
-		return
+		return nil
 	}
 	raw, err := json.Marshal(h.state)
 	if err != nil {
-		return
+		slog.Error("ops: marshal state failed", "err", err)
+		return err
 	}
-	_, _ = h.store.Writer.ExecContext(ctx, `
+	_, err = h.store.Writer.ExecContext(ctx, `
 		INSERT INTO server_config (key, value_json, updated_at)
 		VALUES (?, ?, ?)
 		ON CONFLICT(key) DO UPDATE SET
@@ -394,6 +409,10 @@ func (h *Handler) saveStateLocked(ctx context.Context) {
 			updated_at = excluded.updated_at`,
 		stateConfigKey, string(raw), time.Now().UTC().Unix(),
 	)
+	if err != nil {
+		slog.Error("ops: save state failed", "err", err)
+	}
+	return err
 }
 
 func passthrough(next http.Handler) http.Handler { return next }

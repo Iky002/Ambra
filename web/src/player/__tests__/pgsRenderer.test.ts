@@ -290,6 +290,29 @@ describe('pgsRenderer - parsePgsSup 二进制解码', () => {
     expect(sets[0].objects[0].imageData.data[3]).toBe(255)
     expect(sets[0].objects[0].imageData.data[7]).toBe(255)
   })
+
+  it('拒绝超过 4096×2160 像素上限的恶意 PGS 字幕帧，防止 OOM', () => {
+    const oversizedBuf = concatBytes([
+      buildPgsSegment(
+        1.0,
+        0x16,
+        buildPcsPayload({
+          width: 6000,
+          height: 3000,
+          objects: [{ objectId: 9, windowId: 0, x: 0, y: 0 }],
+        }),
+      ),
+      buildPgsSegment(1.0, 0x14, buildPdsPayload(0, [{ id: 1, y: 235, cr: 128, cb: 128, a: 255 }])),
+      buildPgsSegment(1.0, 0x15, buildSingleOdsPayload(9, 6000, 3000, new Uint8Array([0x01, 0x00, 0x00]))),
+      buildPgsSegment(1.0, 0x80, new Uint8Array(0)),
+    ])
+
+    const sets = parsePgsSup(oversizedBuf)
+    expect(sets).toHaveLength(1)
+    expect(sets[0].objects).toHaveLength(0)
+    expect(sets[0].isClear).toBe(true)
+    expect(sets[0].width * sets[0].height).toBeLessThanOrEqual(4096 * 2160)
+  })
 })
 
 describe('pgsRenderer - PgsCanvasRenderer 同步绘制与二分查找', () => {

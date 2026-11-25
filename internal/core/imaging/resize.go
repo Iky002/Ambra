@@ -12,7 +12,22 @@ import (
 	"strings"
 )
 
-const defaultJPEGQuality = 85
+const (
+	defaultJPEGQuality = 85
+	maxImageDimension  = 4096
+	maxOutputPixels    = 16_777_216
+	maxSourcePixels    = 64_000_000
+)
+
+func clampDimension(v int) int {
+	if v < 0 {
+		return 0
+	}
+	if v > maxImageDimension {
+		return maxImageDimension
+	}
+	return v
+}
 
 // Options configures dynamic image resizing, cropping, quality, and output format.
 type Options struct {
@@ -29,24 +44,12 @@ type Options struct {
 // Normalized returns a sanitized copy of Options with bounds clamped and format canonicalized.
 func (o Options) Normalized() Options {
 	out := o
-	if out.MaxWidth < 0 {
-		out.MaxWidth = 0
-	}
-	if out.MaxHeight < 0 {
-		out.MaxHeight = 0
-	}
-	if out.Width < 0 {
-		out.Width = 0
-	}
-	if out.Height < 0 {
-		out.Height = 0
-	}
-	if out.FillWidth < 0 {
-		out.FillWidth = 0
-	}
-	if out.FillHeight < 0 {
-		out.FillHeight = 0
-	}
+	out.MaxWidth = clampDimension(out.MaxWidth)
+	out.MaxHeight = clampDimension(out.MaxHeight)
+	out.Width = clampDimension(out.Width)
+	out.Height = clampDimension(out.Height)
+	out.FillWidth = clampDimension(out.FillWidth)
+	out.FillHeight = clampDimension(out.FillHeight)
 	if out.Quality < 0 {
 		out.Quality = 0
 	} else if out.Quality > 100 {
@@ -89,19 +92,22 @@ func computeTargetDimensions(srcW, srcH int, opts Options) (dstW, dstH int, crop
 	if srcW <= 0 || srcH <= 0 {
 		return srcW, srcH, false
 	}
+	opts = opts.Normalized()
 
 	// FillWidth + FillHeight requests exact center-cropped fill dimensions.
 	if opts.FillWidth > 0 && opts.FillHeight > 0 {
-		if srcW == opts.FillWidth && srcH == opts.FillHeight {
+		dstW, dstH = clampOutputPixels(opts.FillWidth, opts.FillHeight)
+		if srcW == dstW && srcH == dstH {
 			return srcW, srcH, false
 		}
-		return opts.FillWidth, opts.FillHeight, true
+		return dstW, dstH, true
 	}
 
 	limW := minPositive(opts.Width, opts.MaxWidth)
 	limH := minPositive(opts.Height, opts.MaxHeight)
 	if limW == 0 && limH == 0 {
-		return srcW, srcH, false
+		dstW, dstH = clampOutputPixels(srcW, srcH)
+		return dstW, dstH, false
 	}
 
 	scale := 1.0
@@ -116,12 +122,30 @@ func computeTargetDimensions(srcW, srcH int, opts Options) (dstW, dstH int, crop
 		}
 	}
 	if scale >= 1.0 {
-		return srcW, srcH, false
+		dstW, dstH = clampOutputPixels(srcW, srcH)
+		return dstW, dstH, false
 	}
 
 	dstW = max(1, int(math.Round(float64(srcW)*scale)))
 	dstH = max(1, int(math.Round(float64(srcH)*scale)))
+	dstW, dstH = clampOutputPixels(dstW, dstH)
 	return dstW, dstH, false
+}
+
+func clampOutputPixels(w, h int) (int, int) {
+	if w <= 0 || h <= 0 {
+		return w, h
+	}
+	if int64(w)*int64(h) <= maxOutputPixels {
+		return w, h
+	}
+	scale := math.Sqrt(float64(maxOutputPixels) / float64(int64(w)*int64(h)))
+	nw := max(1, int(math.Floor(float64(w)*scale)))
+	nh := max(1, int(math.Floor(float64(h)*scale)))
+	for int64(nw)*int64(nh) > maxOutputPixels && nw > 1 {
+		nw--
+	}
+	return nw, nh
 }
 
 func minPositive(a, b int) int {
@@ -276,6 +300,14 @@ func ProcessImage(srcData []byte, srcContentType string, opts Options) (outData 
 	opts = opts.Normalized()
 	if opts.IsZero() {
 		return srcData, srcContentType, false, nil
+	}
+
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(srcData))
+	if err != nil {
+		return nil, "", false, fmt.Errorf("decode image config: %w", err)
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 || int64(cfg.Width)*int64(cfg.Height) > maxSourcePixels {
+		return nil, "", false, fmt.Errorf("source image dimensions %dx%d exceed safety limit", cfg.Width, cfg.Height)
 	}
 
 	img, decodedFormat, err := image.Decode(bytes.NewReader(srcData))

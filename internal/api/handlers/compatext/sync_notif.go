@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -152,7 +153,7 @@ func (h *Handler) handleSyncItemStatus(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			TargetId string `json:"TargetId"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+		if err := httpx.DecodeJSONLimit(r, &body, 0); err == nil {
 			targetID = body.TargetId
 		}
 	}
@@ -302,7 +303,7 @@ func (h *Handler) handleCancelSyncItems(w http.ResponseWriter, r *http.Request) 
 			TargetId string   `json:"TargetId"`
 			ItemIds  []string `json:"ItemIds"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+		if err := httpx.DecodeJSONLimit(r, &body, 0); err == nil {
 			if targetID == "" {
 				targetID = strings.TrimSpace(body.TargetId)
 			}
@@ -370,10 +371,19 @@ func (h *Handler) handleCancelSyncItems(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) handleSyncJobItemFile(headOnly bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !h.canDownloadContent(r) {
+			if headOnly {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			httpx.Error(w, http.StatusForbidden, "content downloading is disabled")
+			return
+		}
 		id := chi.URLParam(r, "Id")
 		callerID, isAdmin, hasAuth := h.syncCallerIdentity(r)
 
 		var outPath string
+		var targetItemID string
 		if sh := h.getSyncHandler(); sh != nil {
 			item, found, allowed := sh.GetJobItemForCaller(id, callerID, isAdmin || !hasAuth)
 			if !found {
@@ -394,6 +404,7 @@ func (h *Handler) handleSyncJobItemFile(headOnly bool) http.HandlerFunc {
 				return
 			}
 			outPath = strings.TrimSpace(item.OutputPath)
+			targetItemID = strings.TrimSpace(item.ItemId)
 		} else {
 			var st sharedSyncState
 			if !h.readConfigJSON(r.Context(), syncConfigKey, &st) {
@@ -435,6 +446,41 @@ func (h *Handler) handleSyncJobItemFile(headOnly bool) http.HandlerFunc {
 				}
 			}
 			outPath = strings.TrimSpace(found.OutputPath)
+			targetItemID = strings.TrimSpace(found.ItemId)
+		}
+
+		if targetItemID != "" && !h.canAccessItemID(r, targetItemID) {
+			if headOnly {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			httpx.Error(w, http.StatusForbidden, "access denied")
+			return
+		}
+		if strings.EqualFold(filepath.Ext(outPath), ".strm") {
+			if headOnly {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			httpx.Error(w, http.StatusForbidden, "downloading .strm files is not allowed")
+			return
+		}
+		if targetItemID != "" {
+			h.mu.RLock()
+			libRepo := h.libRepo
+			h.mu.RUnlock()
+			if libRepo != nil {
+				if rec, err := libRepo.GetItemRecordByID(r.Context(), guid.Normalize(targetItemID)); err == nil && rec != nil {
+					if rec.IsStrm || strings.EqualFold(filepath.Ext(rec.Path), ".strm") {
+						if headOnly {
+							w.WriteHeader(http.StatusForbidden)
+							return
+						}
+						httpx.Error(w, http.StatusForbidden, "downloading .strm files is not allowed")
+						return
+					}
+				}
+			}
 		}
 
 		if outPath == "" {
@@ -514,7 +560,7 @@ func (h *Handler) handleSyncJobItemAdditionalFiles(w http.ResponseWriter, r *htt
 func (h *Handler) handleSyncOfflineActions(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil {
 		var raw json.RawMessage
-		if err := json.NewDecoder(r.Body).Decode(&raw); err == nil && len(raw) > 0 {
+		if err := httpx.DecodeJSONLimit(r, &raw, 0); err == nil && len(raw) > 0 {
 			now := time.Now().UTC().Unix()
 			var actions []OfflineAction
 			if err := json.Unmarshal(raw, &actions); err != nil {
@@ -524,11 +570,21 @@ func (h *Handler) handleSyncOfflineActions(w http.ResponseWriter, r *http.Reques
 				}
 			}
 			if len(actions) > 0 {
+				allowedActions := make([]OfflineAction, 0, len(actions))
 				for i := range actions {
 					actions[i].RecordedAtUnix = now
+					itemID := strings.TrimSpace(actions[i].ItemId)
+					if itemID != "" && !h.canAccessItemID(r, itemID) {
+						continue
+					}
+					allowedActions = append(allowedActions, actions[i])
+				}
+				if len(allowedActions) == 0 {
+					httpx.NoContent(w)
+					return
 				}
 				h.mu.Lock()
-				h.state.OfflineActions = append(h.state.OfflineActions, actions...)
+				h.state.OfflineActions = append(h.state.OfflineActions, allowedActions...)
 				if len(h.state.OfflineActions) > maxOfflineActions {
 					h.state.OfflineActions = append([]OfflineAction(nil), h.state.OfflineActions[len(h.state.OfflineActions)-maxOfflineActions:]...)
 				}
@@ -542,7 +598,7 @@ func (h *Handler) handleSyncOfflineActions(w http.ResponseWriter, r *http.Reques
 					if userRepo == nil && h.store != nil {
 						userRepo = sqlite.NewUserRepo(h.store)
 					}
-					for _, act := range actions {
+					for _, act := range allowedActions {
 						itemID := strings.TrimSpace(act.ItemId)
 						if itemID == "" {
 							continue
@@ -628,7 +684,7 @@ func (h *Handler) handleGetConfiguredNotifications(w http.ResponseWriter, r *htt
 func (h *Handler) handleSaveConfiguredNotification(w http.ResponseWriter, r *http.Request) {
 	var svc NotificationServiceConfig
 	if r.Body != nil {
-		if err := json.NewDecoder(r.Body).Decode(&svc); err != nil {
+		if err := httpx.DecodeJSONLimit(r, &svc, 0); err != nil {
 			httpx.Error(w, http.StatusBadRequest, "invalid notification service config")
 			return
 		}

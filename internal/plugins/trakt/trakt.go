@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,17 +17,21 @@ import (
 
 	"github.com/ambra-media/ambra/internal/core/session"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
 const (
-	PluginID          = "ambra.builtin.trakt"
-	defaultBaseURL    = "https://api.trakt.tv"
-	defaultPriority   = 40
-	defaultTimeout    = 10 * time.Second
-	traktAPIVersion   = "2"
-	maxErrBodyPreview = 1024
+	PluginID             = "ambra.builtin.trakt"
+	defaultBaseURL       = "https://api.trakt.tv"
+	defaultPriority      = 40
+	defaultTimeout       = 10 * time.Second
+	traktAPIVersion      = "2"
+	maxErrBodyPreview    = 1024
+	maxDiscardRespBytes  = 1 << 20
+	traktWorkerPoolSize  = 8
+	traktWorkerQueueSize = 128
 )
 
 var _ plugins.Plugin = (*Plugin)(nil)
@@ -63,8 +68,18 @@ func New() *Plugin {
 		syncWatched:      true,
 		priority:         defaultPriority,
 		baseURL:          defaultBaseURL,
-		client:           &http.Client{Timeout: defaultTimeout},
+		client:           netutil.NewSafeHTTPClient(defaultTimeout, false),
 	}
+}
+
+// SetHTTPClient overrides the HTTP client used for Trakt API calls (useful in tests).
+func (p *Plugin) SetHTTPClient(c *http.Client) {
+	if c == nil {
+		return
+	}
+	p.mu.Lock()
+	p.client = c
+	p.mu.Unlock()
 }
 
 func (p *Plugin) snapshot() configSnapshot {
@@ -125,6 +140,10 @@ func (p *Plugin) Configure(cfg map[string]any) error {
 	}
 	if v, ok := firstString(cfg, "base_url", "BaseUrl"); ok {
 		if trimmed := strings.TrimRight(strings.TrimSpace(v), "/"); trimmed != "" {
+			u, err := url.Parse(trimmed)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				return fmt.Errorf("trakt: invalid base_url %q: must be http(s) URL", v)
+			}
 			p.baseURL = trimmed
 		}
 	}
@@ -396,7 +415,7 @@ func postTrakt(ctx context.Context, snap configSnapshot, endpoint string, payloa
 		preview, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrBodyPreview))
 		return fmt.Errorf("trakt %s: status %d: %s", endpoint, resp.StatusCode, strings.TrimSpace(string(preview)))
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDiscardRespBytes))
 	return nil
 }
 
@@ -407,6 +426,35 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 		return func() {}
 	}
 	var unsubscribed atomic.Bool
+	stopCh := make(chan struct{})
+	jobs := make(chan func(), traktWorkerQueueSize)
+	var stopOnce sync.Once
+
+	for i := 0; i < traktWorkerPoolSize; i++ {
+		go func() {
+			for {
+				select {
+				case <-stopCh:
+					return
+				case job := <-jobs:
+					if job != nil {
+						job()
+					}
+				}
+			}
+		}()
+	}
+
+	enqueue := func(fn func()) {
+		if unsubscribed.Load() {
+			return
+		}
+		select {
+		case jobs <- fn:
+		default:
+			// Drop when queue is saturated rather than spawning unbounded goroutines.
+		}
+	}
 
 	isReady := func() bool {
 		if unsubscribed.Load() || repo == nil {
@@ -424,7 +472,7 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 		if !ok || ev.itemID == "" {
 			return
 		}
-		go func() {
+		enqueue(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 			defer cancel()
 			item, series := lookupItemAndSeries(ctx, repo, ev.itemID)
@@ -433,7 +481,7 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 			}
 			pct := computeProgress(ev.positionTicks, ev.runtimeTicks, item.RuntimeTicks)
 			_ = p.ScrobbleStart(ctx, item, series, pct)
-		}()
+		})
 	})
 
 	bus.Subscribe(eventbus.EventPlaybackProgress, func(_ context.Context, e eventbus.Event) {
@@ -444,7 +492,7 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 		if !ok || ev.itemID == "" || !ev.isPaused {
 			return
 		}
-		go func() {
+		enqueue(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 			defer cancel()
 			item, series := lookupItemAndSeries(ctx, repo, ev.itemID)
@@ -453,7 +501,7 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 			}
 			pct := computeProgress(ev.positionTicks, ev.runtimeTicks, item.RuntimeTicks)
 			_ = p.ScrobblePause(ctx, item, series, pct)
-		}()
+		})
 	})
 
 	bus.Subscribe(eventbus.EventPlaybackStop, func(_ context.Context, e eventbus.Event) {
@@ -464,7 +512,7 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 		if !ok || ev.itemID == "" {
 			return
 		}
-		go func() {
+		enqueue(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 			defer cancel()
 			item, series := lookupItemAndSeries(ctx, repo, ev.itemID)
@@ -478,7 +526,7 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 				pct = computeProgress(ev.positionTicks, ev.runtimeTicks, item.RuntimeTicks)
 			}
 			_ = p.ScrobbleStop(ctx, item, series, pct)
-		}()
+		})
 	})
 
 	bus.Subscribe(eventbus.EventUserDataChanged, func(_ context.Context, e eventbus.Event) {
@@ -491,7 +539,7 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 				continue
 			}
 			itemID := entry.itemID
-			go func() {
+			enqueue(func() {
 				ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 				defer cancel()
 				item, series := lookupItemAndSeries(ctx, repo, itemID)
@@ -499,12 +547,15 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 					return
 				}
 				_ = p.SyncWatched(ctx, item, series)
-			}()
+			})
 		}
 	})
 
 	return func() {
 		unsubscribed.Store(true)
+		stopOnce.Do(func() {
+			close(stopCh)
+		})
 	}
 }
 
@@ -541,23 +592,25 @@ type playbackEventData struct {
 	played        bool
 }
 
+func extractPlaybackStructFields(v session.PlaybackEventPayload) playbackEventData {
+	return playbackEventData{
+		itemID:        strings.TrimSpace(v.ItemId),
+		positionTicks: v.PositionTicks,
+		runtimeTicks:  v.RuntimeTicks,
+		isPaused:      v.IsPaused,
+		played:        v.Played,
+	}
+}
+
 func parsePlaybackEvent(payload any) (playbackEventData, bool) {
 	switch v := payload.(type) {
 	case session.PlaybackEventPayload:
-		return playbackEventData{
-			itemID:        strings.TrimSpace(v.ItemId),
-			positionTicks: v.PositionTicks,
-			played:        v.Played,
-		}, true
+		return extractPlaybackStructFields(v), true
 	case *session.PlaybackEventPayload:
 		if v == nil {
 			return playbackEventData{}, false
 		}
-		return playbackEventData{
-			itemID:        strings.TrimSpace(v.ItemId),
-			positionTicks: v.PositionTicks,
-			played:        v.Played,
-		}, true
+		return extractPlaybackStructFields(*v), true
 	case map[string]any:
 		return parsePlaybackMap(v), true
 	default:

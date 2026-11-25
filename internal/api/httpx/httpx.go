@@ -2,11 +2,24 @@ package httpx
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 )
+
+// DefaultMaxJSONBodyBytes caps untrusted JSON request bodies at 4 MiB.
+const DefaultMaxJSONBodyBytes int64 = 4 << 20
+
+// DecodeJSONLimit decodes a JSON request body bounded by maxBytes (defaults to 4 MiB).
+func DecodeJSONLimit(r *http.Request, dst any, maxBytes int64) error {
+	if maxBytes <= 0 {
+		maxBytes = DefaultMaxJSONBodyBytes
+	}
+	return json.NewDecoder(io.LimitReader(r.Body, maxBytes)).Decode(dst)
+}
 
 func JSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -34,10 +47,15 @@ type Query struct {
 
 func ParseQuery(r *http.Request) Query {
 	raw := r.URL.Query()
+	keys := make([]string, 0, len(raw))
+	for k := range raw {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 	m := make(map[string][]string, len(raw))
-	for k, v := range raw {
+	for _, k := range keys {
 		lk := strings.ToLower(k)
-		m[lk] = append(m[lk], v...)
+		m[lk] = append(m[lk], raw[k]...)
 	}
 	return Query{values: m}
 }

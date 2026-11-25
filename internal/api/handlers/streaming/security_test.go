@@ -110,4 +110,23 @@ func TestPlaybackInfoUserIsolationAndDownloadPolicy(t *testing.T) {
 	if got := sanitizeContentDispositionFilename("\r\n"); got != "media" {
 		t.Fatalf("sanitizeContentDispositionFilename empty fallback got %q", got)
 	}
+
+	// 4. Image dimension clamping (<= 4096)
+	if clampImageDim(-10) != 0 || clampImageDim(1024) != 1024 || clampImageDim(999999) != maxImageDim {
+		t.Fatalf("unexpected clampImageDim results")
+	}
+
+	// 5. Fail-closed authorization when user cannot be resolved or DB is closed
+	if h.CanAccessLibrary(ctx, "", lib.ID) {
+		t.Fatalf("expected CanAccessLibrary fail-closed for empty userID")
+	}
+	if h.CanAccessLibrary(ctx, "nonexistent-user", lib.ID) {
+		t.Fatalf("expected CanAccessLibrary fail-closed for unknown user")
+	}
+	if h.canDownloadContent(httptest.NewRequest(http.MethodGet, "/Items/"+movie.ID+"/Download", nil)) {
+		t.Fatalf("expected canDownloadContent fail-closed without caller")
+	}
+	if h.canAccessItem(httptest.NewRequest(http.MethodGet, "/Videos/"+movie.ID+"/stream", nil), movie.ID) {
+		t.Fatalf("expected canAccessItem fail-closed without caller")
+	}
 }

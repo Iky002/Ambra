@@ -104,4 +104,22 @@ func TestEnvironmentHandler(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("ValidatePath nonexistent expected 404, got %d", rec.Code)
 	}
+
+	// 8. Relative paths must be rejected with 400 across all path endpoints
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Environment/DirectoryContents?path=relative/dir", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("DirectoryContents relative path expected 400, got %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Environment/ParentPath?path=relative/dir", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("ParentPath relative path expected 400, got %d", rec.Code)
+	}
+	body, _ = json.Marshal(ValidatePathRequest{Path: "relative/dir"})
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/Environment/ValidatePath", bytes.NewReader(body)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("ValidatePath relative path expected 400, got %d", rec.Code)
+	}
 }

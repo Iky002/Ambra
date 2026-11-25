@@ -127,6 +127,7 @@ func (h *Handler) registerLiveTVRoutes(r chi.Router, wrapAuth, wrapAdmin func(ht
 	// Authenticated LiveTv routes
 	r.Group(func(r chi.Router) {
 		r.Use(wrapAuth)
+		r.Use(h.requireLiveTvAccess)
 
 		// LiveStreamFiles (11 routes)
 		r.Get("/LiveTv/LiveStreamFiles/{Id}/stream.{Container}", h.handleLiveStreamFile)
@@ -187,10 +188,12 @@ func (h *Handler) registerLiveTVRoutes(r chi.Router, wrapAuth, wrapAdmin func(ht
 func (h *Handler) lookupChannel(ctx context.Context, id string) (liveTVChannel, bool) {
 	h.mu.RLock()
 	lt := h.liveTV
+	disabledOverride, hasDisabledOverride := h.state.ChannelDisabled[id]
+	sortOverride, hasSortOverride := h.state.ChannelSortIndex[id]
 	h.mu.RUnlock()
 	if lt != nil {
 		if ch, ok := lt.GetChannelByID(id); ok && ch != nil {
-			return liveTVChannel{
+			res := liveTVChannel{
 				Id:          ch.Id,
 				Name:        ch.Name,
 				ServerId:    ch.ServerId,
@@ -202,13 +205,28 @@ func (h *Handler) lookupChannel(ctx context.Context, id string) (liveTVChannel, 
 				GroupTitle:  ch.GroupTitle,
 				StreamUrl:   ch.StreamUrl,
 				TunerHostId: ch.TunerHostId,
-			}, true
+				Disabled:    ch.Disabled,
+				SortIndex:   ch.SortIndex,
+			}
+			if hasDisabledOverride {
+				res.Disabled = disabledOverride
+			}
+			if hasSortOverride {
+				res.SortIndex = sortOverride
+			}
+			return res, true
 		}
 	}
 	var st sharedLiveTVState
 	if h.readConfigJSON(ctx, liveTVConfigKey, &st) {
 		for _, ch := range st.Channels {
 			if ch.Id == id {
+				if hasDisabledOverride {
+					ch.Disabled = disabledOverride
+				}
+				if hasSortOverride {
+					ch.SortIndex = sortOverride
+				}
 				return ch, true
 			}
 		}
@@ -248,6 +266,10 @@ func (h *Handler) handleLiveStreamFile(w http.ResponseWriter, r *http.Request) {
 	ch, ok := h.lookupChannel(r.Context(), id)
 	if !ok || strings.TrimSpace(ch.StreamUrl) == "" {
 		httpx.Error(w, http.StatusNotFound, "live stream channel not found")
+		return
+	}
+	if ch.Disabled {
+		httpx.Error(w, http.StatusForbidden, "live stream channel is disabled")
 		return
 	}
 	h.mu.RLock()
@@ -335,6 +357,14 @@ func (h *Handler) handleLiveStreamHLS(headOnly bool) http.HandlerFunc {
 			httpx.Error(w, http.StatusNotFound, "live stream channel not found")
 			return
 		}
+		if ch.Disabled {
+			if headOnly {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			httpx.Error(w, http.StatusForbidden, "live stream channel is disabled")
+			return
+		}
 
 		isPlaylist := chi.URLParam(r, "Segment") == ""
 		if isPlaylist && isHLSStreamURL(ch.StreamUrl) {
@@ -401,7 +431,7 @@ func (h *Handler) handleLiveRecordingHLS(headOnly bool) http.HandlerFunc {
 
 func (h *Handler) handleAvailableRecordingOptions(w http.ResponseWriter, r *http.Request) {
 	baseDir := ""
-	if h.cfg != nil && h.cfg.DataDir != "" {
+	if !h.isNonAdminCaller(r) && h.cfg != nil && h.cfg.DataDir != "" {
 		baseDir = filepath.Join(h.cfg.DataDir, "recordings")
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
@@ -491,7 +521,7 @@ func (h *Handler) handleSetChannelDisabled(w http.ResponseWriter, r *http.Reques
 		var body struct {
 			Disabled bool `json:"Disabled"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = httpx.DecodeJSONLimit(r, &body, 0)
 		disabled = body.Disabled
 	}
 
@@ -540,7 +570,7 @@ func (h *Handler) handleSetChannelSortIndex(w http.ResponseWriter, r *http.Reque
 				NewIndex  *int `json:"NewIndex"`
 				SortIndex *int `json:"SortIndex"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+			if err := httpx.DecodeJSONLimit(r, &body, 0); err == nil {
 				if body.NewIndex != nil {
 					newIdx = *body.NewIndex
 				} else if body.SortIndex != nil {
@@ -941,7 +971,7 @@ func (h *Handler) handleSetChannelMapping(w http.ResponseWriter, r *http.Request
 			TunerChannelId    string `json:"TunerChannelId"`
 			ProviderChannelId string `json:"ProviderChannelId"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+		if err := httpx.DecodeJSONLimit(r, &body, 0); err == nil {
 			if body.ProviderId != "" {
 				req.ProviderId = body.ProviderId
 			}
@@ -1001,7 +1031,7 @@ func extractIDParam(r *http.Request) string {
 		var body struct {
 			Id string `json:"Id"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err == nil && body.Id != "" {
+		if err := httpx.DecodeJSONLimit(r, &body, 0); err == nil && body.Id != "" {
 			return body.Id
 		}
 	}

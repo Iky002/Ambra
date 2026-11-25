@@ -3,21 +3,28 @@ package nfo
 import (
 	"context"
 	"encoding/xml"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/ambra-media/ambra/internal/plugins"
 )
 
+const maxNFOFileSize = 2 << 20 // 2 MiB
+
 // Provider implements plugins.MetadataProvider for local Kodi/Emby .nfo files.
 type Provider struct {
-	enabled bool
+	enabled atomic.Bool
 }
 
 func New() *Provider {
-	return &Provider{enabled: true}
+	p := &Provider{}
+	p.enabled.Store(true)
+	return p
 }
 
 func (p *Provider) Manifest() plugins.Manifest {
@@ -28,7 +35,7 @@ func (p *Provider) Manifest() plugins.Manifest {
 		Description: "Reads local Kodi/Emby .nfo metadata files (<movie>, <tvshow>, <episodedetails>)",
 		Author:      "Ambra",
 		BuiltIn:     true,
-		Enabled:     p.enabled,
+		Enabled:     p.enabled.Load(),
 		Priority:    10,
 		Kinds:       []plugins.Kind{plugins.KindMetadata},
 	}
@@ -36,18 +43,37 @@ func (p *Provider) Manifest() plugins.Manifest {
 
 func (p *Provider) Configure(cfg map[string]any) error {
 	if v, ok := cfg["enabled"].(bool); ok {
-		p.enabled = v
+		p.enabled.Store(v)
 	}
 	return nil
 }
 
+func readLimitedNFO(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err == nil && fi.Size() > maxNFOFileSize {
+		return nil, fmt.Errorf("nfo file exceeds maximum size of %d bytes", maxNFOFileSize)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxNFOFileSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxNFOFileSize {
+		return nil, fmt.Errorf("nfo file exceeds maximum size of %d bytes", maxNFOFileSize)
+	}
+	return data, nil
+}
+
 func (p *Provider) FetchMetadata(_ context.Context, q plugins.MediaQuery) (*plugins.MetadataResult, error) {
-	if q.Path == "" {
+	if !p.enabled.Load() || q.Path == "" {
 		return nil, nil
 	}
 	candidates := candidateNFOPaths(q.ItemType, q.Path)
 	for _, nfoPath := range candidates {
-		data, err := os.ReadFile(nfoPath)
+		data, err := readLimitedNFO(nfoPath)
 		if err != nil {
 			continue
 		}

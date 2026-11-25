@@ -7,7 +7,6 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
@@ -16,20 +15,21 @@ import (
 	_ "image/png"
 	"io"
 	"mime"
-	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/core/imaging"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/plugins/tmdb"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
@@ -60,6 +60,7 @@ func (h *Handler) handleListItemImages(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusForbidden, "access denied")
 		return
 	}
+	hidePath := h.isNonAdminCaller(r)
 	out := make([]imageInfoDTO, 0)
 	if h.store != nil {
 		rows, err := h.store.Reader.QueryContext(r.Context(),
@@ -80,11 +81,15 @@ func (h *Handler) handleListItemImages(w http.ResponseWriter, r *http.Request) {
 			if st, err := os.Stat(imgPath); err == nil {
 				size = st.Size()
 			}
+			displayPath := imgPath
+			if hidePath {
+				displayPath = ""
+			}
 			idxCopy := idx
 			out = append(out, imageInfoDTO{
 				ImageType:  imgType,
 				ImageIndex: &idxCopy,
-				Path:       imgPath,
+				Path:       displayPath,
 				Filename:   filepath.Base(imgPath),
 				Width:      width,
 				Height:     height,
@@ -94,6 +99,16 @@ func (h *Handler) handleListItemImages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	httpx.JSON(w, http.StatusOK, out)
+}
+
+func clampImageDim(v int) int {
+	if v <= 0 {
+		return 0
+	}
+	if v > maxImageResizeDimension {
+		return maxImageResizeDimension
+	}
+	return v
 }
 
 func (h *Handler) handleServeItemImageFull(w http.ResponseWriter, r *http.Request) {
@@ -109,8 +124,8 @@ func (h *Handler) handleServeItemImageFull(w http.ResponseWriter, r *http.Reques
 	format := chi.URLParam(r, "Format")
 
 	opts := imaging.Options{
-		MaxWidth:  maxW,
-		MaxHeight: maxH,
+		MaxWidth:  clampImageDim(maxW),
+		MaxHeight: clampImageDim(maxH),
 		Format:    format,
 	}
 	if h.imaging == nil {
@@ -129,17 +144,40 @@ func (h *Handler) handleServeItemImageFull(w http.ResponseWriter, r *http.Reques
 	}
 }
 
+func (h *Handler) hasAuthenticatedCaller(r *http.Request) bool {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		return true
+	}
+	if h.auth.UserIDFromCtx != nil && strings.TrimSpace(h.auth.UserIDFromCtx(r.Context())) != "" {
+		return true
+	}
+	return false
+}
+
 func (h *Handler) tryExtractAndServeChapterImage(w http.ResponseWriter, r *http.Request, itemID string, idx int, opts imaging.Options) bool {
 	if h.extractor == nil || h.repo == nil || idx < 0 {
 		return false
 	}
+	if !h.hasAuthenticatedCaller(r) {
+		return false
+	}
 	normID := guid.Normalize(itemID)
+	if !h.canAccessItemID(r, normID) {
+		return false
+	}
 	rec, err := h.repo.GetItemRecordByID(r.Context(), normID)
 	if err != nil || rec == nil || idx >= len(rec.Extra.Chapters) {
 		return false
 	}
 	mediaPath, err := h.resolveItemMediaPath(r.Context(), normID, rec)
 	if err != nil || strings.TrimSpace(mediaPath) == "" {
+		return false
+	}
+	sem := h.getChapterSem()
+	select {
+	case sem <- struct{}{}:
+		defer func() { <-sem }()
+	case <-r.Context().Done():
 		return false
 	}
 	startTicks := rec.Extra.Chapters[idx].StartPositionTicks
@@ -200,8 +238,21 @@ func (h *Handler) handleUploadItemImage(w http.ResponseWriter, r *http.Request) 
 		httpx.NoContent(w)
 		return
 	}
+	rasterCT, ok := safeRasterImageType(data)
+	if !ok {
+		httpx.Error(w, http.StatusBadRequest, "unsupported or invalid raster image")
+		return
+	}
 
-	ext := imageExtForData(data, r.Header.Get("Content-Type"))
+	var prevPath string
+	if h.store != nil {
+		_ = h.store.Reader.QueryRowContext(r.Context(),
+			`SELECT path FROM item_images WHERE item_id = ? AND LOWER(image_type) = LOWER(?) AND image_index = ?`,
+			itemID, imageType, idx,
+		).Scan(&prevPath)
+	}
+
+	ext := imageExtForData(data, rasterCT)
 	var filePath string
 	if h.scanner != nil && idx == 0 {
 		if localPath, saved, localErr := h.scanner.SaveItemLocalImage(r.Context(), itemID, imageType, ext, data); localErr == nil && saved && localPath != "" {
@@ -249,7 +300,40 @@ func (h *Handler) handleUploadItemImage(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
+	h.cleanupReplacedImageFile(prevPath, filePath)
 	httpx.NoContent(w)
+}
+
+func safeRasterImageType(data []byte) (string, bool) {
+	if len(data) == 0 {
+		return "", false
+	}
+	detected := normalizeContentType(http.DetectContentType(data))
+	switch detected {
+	case "image/jpeg", "image/png", "image/gif", "image/webp":
+		return detected, true
+	default:
+		return "", false
+	}
+}
+
+func (h *Handler) cleanupReplacedImageFile(oldPath, newPath string) {
+	oldClean := filepath.Clean(strings.TrimSpace(oldPath))
+	newClean := filepath.Clean(strings.TrimSpace(newPath))
+	if oldClean == "" || oldClean == "." || oldClean == newClean {
+		return
+	}
+	managedDirs := []string{filepath.Join(os.TempDir(), "ambra-images")}
+	if h.cfg != nil && strings.TrimSpace(h.cfg.DataDir) != "" {
+		managedDirs = append(managedDirs, filepath.Join(h.cfg.DataDir, "metadata", "images"))
+	}
+	for _, root := range managedDirs {
+		rel, err := filepath.Rel(filepath.Clean(root), oldClean)
+		if err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+			_ = os.Remove(oldClean)
+			return
+		}
+	}
 }
 
 func decodeImageBody(raw []byte, contentType string) []byte {
@@ -433,7 +517,7 @@ func (h *Handler) handleSetImageURL(w http.ResponseWriter, r *http.Request) {
 			Url      string `json:"Url"`
 			ImageUrl string `json:"ImageUrl"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+		if err := httpx.DecodeJSONLimit(r, &body, 0); err == nil {
 			rawURL = nonEmpty(rawURL, body.Url, body.ImageUrl)
 		}
 	}
@@ -566,7 +650,7 @@ func (h *Handler) handleDownloadRemoteImage(w http.ResponseWriter, r *http.Reque
 			ImageUrl string `json:"ImageUrl"`
 			Url      string `json:"Url"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+		if err := httpx.DecodeJSONLimit(r, &body, 0); err == nil {
 			rawType = nonEmpty(rawType, body.Type)
 			imageURL = nonEmpty(imageURL, body.ImageUrl, body.Url)
 		}
@@ -591,7 +675,18 @@ func (h *Handler) handleDownloadRemoteImage(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if err := h.downloadAndSaveItemImage(r.Context(), itemID, imageType, 0, imageURL); err != nil {
+	idx := 0
+	if imageType == "Backdrop" && h.store != nil {
+		var nextIdx int
+		if err := h.store.Reader.QueryRowContext(r.Context(),
+			`SELECT COALESCE(MAX(image_index), -1) + 1 FROM item_images WHERE item_id = ? AND LOWER(image_type) = 'backdrop'`,
+			itemID,
+		).Scan(&nextIdx); err == nil && nextIdx >= 0 {
+			idx = nextIdx
+		}
+	}
+
+	if err := h.downloadAndSaveItemImage(r.Context(), itemID, imageType, idx, imageURL); err != nil {
 		httpx.Error(w, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -605,7 +700,6 @@ func (h *Handler) handleRemoteImageProxy(w http.ResponseWriter, r *http.Request)
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	parsed, _ := url.Parse(rawURL)
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -632,22 +726,15 @@ func (h *Handler) handleRemoteImageProxy(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	ct := normalizeContentType(resp.Header.Get("Content-Type"))
-	detected := normalizeContentType(http.DetectContentType(data))
-	isTMDBHost := parsed != nil && (strings.EqualFold(parsed.Hostname(), "image.tmdb.org") || strings.HasSuffix(strings.ToLower(parsed.Hostname()), ".tmdb.org"))
-	if !isTMDBHost && !strings.HasPrefix(ct, "image/") && !strings.HasPrefix(detected, "image/") {
-		httpx.Error(w, http.StatusBadRequest, "remote resource is not an image")
+	rasterCT, ok := safeRasterImageType(data)
+	if !ok {
+		httpx.Error(w, http.StatusBadRequest, "remote resource is not a supported raster image")
 		return
 	}
-	if !strings.HasPrefix(ct, "image/") {
-		if strings.HasPrefix(detected, "image/") {
-			ct = detected
-		} else {
-			ct = "image/jpeg"
-		}
-	}
 
-	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Content-Type", rasterCT)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox")
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
@@ -692,8 +779,20 @@ func (h *Handler) downloadAndSaveItemImage(ctx context.Context, itemID, imageTyp
 	if len(data) > maxRemoteImageDownloadBytes {
 		return errors.New("remote image exceeds 15MB limit")
 	}
+	rasterCT, ok := safeRasterImageType(data)
+	if !ok {
+		return errors.New("remote resource is not a supported raster image")
+	}
 
-	ext := imageExtForData(data, ct)
+	var prevPath string
+	if h.store != nil {
+		_ = h.store.Reader.QueryRowContext(ctx,
+			`SELECT path FROM item_images WHERE item_id = ? AND LOWER(image_type) = LOWER(?) AND image_index = ?`,
+			itemID, safeType, idx,
+		).Scan(&prevPath)
+	}
+
+	ext := imageExtForData(data, rasterCT)
 	var filePath string
 	if h.scanner != nil && idx == 0 {
 		if localPath, saved, localErr := h.scanner.SaveItemLocalImage(ctx, itemID, safeType, ext, data); localErr == nil && saved && localPath != "" {
@@ -744,7 +843,7 @@ func (h *Handler) downloadAndSaveItemImage(ctx context.Context, itemID, imageTyp
 	sum := sha256.Sum256(data)
 	tag := hex.EncodeToString(sum[:8])
 
-	return h.repo.UpsertImage(ctx, &sqlite.ImageRecord{
+	if err := h.repo.UpsertImage(ctx, &sqlite.ImageRecord{
 		ItemID:     itemID,
 		ImageType:  safeType,
 		ImageIndex: idx,
@@ -752,7 +851,11 @@ func (h *Handler) downloadAndSaveItemImage(ctx context.Context, itemID, imageTyp
 		Tag:        tag,
 		Width:      width,
 		Height:     height,
-	})
+	}); err != nil {
+		return err
+	}
+	h.cleanupReplacedImageFile(prevPath, filePath)
+	return nil
 }
 
 func normalizeAllowedImageType(raw string) (string, bool) {
@@ -785,21 +888,6 @@ func safeImageFilePath(baseDir, imageType string, idx int, ext string) (string, 
 	return filePath, nil
 }
 
-func isBlockedIP(ip net.IP) bool {
-	if ip == nil {
-		return true
-	}
-	if v4 := ip.To4(); v4 != nil {
-		ip = v4
-	}
-	return ip.IsLoopback() ||
-		ip.IsPrivate() ||
-		ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() ||
-		ip.IsUnspecified() ||
-		ip.IsMulticast()
-}
-
 func validatePublicHTTPURL(raw string, allowLocal bool) error {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || u.Host == "" {
@@ -816,57 +904,21 @@ func validatePublicHTTPURL(raw string, allowLocal bool) error {
 	if host == "" {
 		return errors.New("valid http/https image url is required")
 	}
-	lowerHost := strings.ToLower(host)
+	lowerHost := strings.ToLower(strings.TrimSuffix(host, "."))
 	if lowerHost == "localhost" || strings.HasSuffix(lowerHost, ".localhost") {
 		return errors.New("remote image url targets a blocked local host")
 	}
-	if ip := net.ParseIP(host); ip != nil && isBlockedIP(ip) {
-		return errors.New("remote image url targets a blocked private or local IP")
+	if addr, err := netip.ParseAddr(host); err == nil {
+		unmapped := addr.WithZone("").Unmap()
+		if err := netutil.ValidateIP(unmapped.AsSlice(), false); err != nil {
+			return errors.New("remote image url targets a blocked private or local IP")
+		}
 	}
 	return nil
 }
 
 func (h *Handler) validateRemoteImageURL(raw string) error {
 	return validatePublicHTTPURL(raw, h.httpClient != nil)
-}
-
-func newSafeRemoteHTTPClient() *http.Client {
-	dialer := &net.Dialer{
-		Timeout:   10 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-	transport := &http.Transport{
-		Proxy: nil,
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-			if err != nil {
-				return nil, err
-			}
-			for _, ipAddr := range ips {
-				if isBlockedIP(ipAddr.IP) {
-					return nil, fmt.Errorf("blocked remote IP %s", ipAddr.IP.String())
-				}
-			}
-			if len(ips) == 0 {
-				return nil, errors.New("no resolved IP addresses")
-			}
-			return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
-		},
-	}
-	return &http.Client{
-		Timeout:   15 * time.Second,
-		Transport: transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return errors.New("too many redirects")
-			}
-			return validatePublicHTTPURL(req.URL.String(), false)
-		},
-	}
 }
 
 func normalizeContentType(ct string) string {
@@ -925,12 +977,12 @@ func (h *Handler) handleEntityImage(kind string) http.HandlerFunc {
 		}
 		q := httpx.ParseQuery(r)
 		opts := imaging.Options{
-			MaxWidth:   q.Int("maxWidth", 0),
-			MaxHeight:  q.Int("maxHeight", 0),
-			Width:      q.Int("width", 0),
-			Height:     q.Int("height", 0),
-			FillWidth:  q.Int("fillWidth", 0),
-			FillHeight: q.Int("fillHeight", 0),
+			MaxWidth:   clampImageDim(q.Int("maxWidth", 0)),
+			MaxHeight:  clampImageDim(q.Int("maxHeight", 0)),
+			Width:      clampImageDim(q.Int("width", 0)),
+			Height:     clampImageDim(q.Int("height", 0)),
+			FillWidth:  clampImageDim(q.Int("fillWidth", 0)),
+			FillHeight: clampImageDim(q.Int("fillHeight", 0)),
 			Quality:    q.Int("quality", 0),
 			Format:     q.Get("format"),
 		}

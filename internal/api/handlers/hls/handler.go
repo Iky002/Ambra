@@ -3,7 +3,6 @@ package hls
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -22,6 +21,7 @@ import (
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -33,8 +33,13 @@ type AuthFuncs struct {
 }
 
 const (
-	maxLiveStreams = 256
-	liveStreamTTL  = 4 * time.Hour
+	maxLiveStreams      = 256
+	liveStreamTTL       = 4 * time.Hour
+	maxHLSVideoBitrate  = 120_000_000
+	maxHLSAudioBitrate  = 1_536_000
+	maxHLSAudioChannels = 8
+	minHLSSegmentLength = 2
+	maxHLSSegmentLength = 15
 )
 
 type liveStreamEntry struct {
@@ -102,12 +107,15 @@ func (h *Handler) canAccessItem(r *http.Request, item *sqlite.ItemRecord) bool {
 		return true
 	}
 	uid, isAdmin := h.callerIdentity(r)
-	if isAdmin || uid == "" {
+	if isAdmin {
 		return true
+	}
+	if uid == "" {
+		return false
 	}
 	u, err := h.userRepo.GetUserByID(r.Context(), uid)
 	if err != nil || u == nil {
-		return true
+		return false
 	}
 	if u.IsAdmin || u.Policy.IsAdministrator {
 		return true
@@ -132,6 +140,27 @@ func (h *Handler) canAccessItem(r *http.Request, item *sqlite.ItemRecord) bool {
 		}
 	}
 	return true
+}
+
+func (h *Handler) resolveDeviceID(r *http.Request, q httpx.Query) string {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil {
+		if boundDev := strings.TrimSpace(ac.Client.DeviceID); boundDev != "" {
+			return boundDev
+		}
+	}
+	return strings.TrimSpace(q.Get("DeviceId"))
+}
+
+func scopePlaySessionID(playSessionID, callerUserID string, isAdmin bool) string {
+	playSessionID = strings.TrimSpace(playSessionID)
+	if playSessionID == "" || isAdmin || callerUserID == "" {
+		return playSessionID
+	}
+	prefix := callerUserID + ":"
+	if strings.HasPrefix(playSessionID, prefix) {
+		return playSessionID
+	}
+	return prefix + playSessionID
 }
 
 // RegisterRoutes mounts all HLS, ActiveEncodings, Encoding, and LiveStreams endpoints on mux.
@@ -421,9 +450,9 @@ func (h *Handler) handleSegment(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleDeleteActiveEncodings(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
-	deviceID := q.Get("DeviceId")
-	playSessionID := q.Get("PlaySessionId")
 	callerUserID, isAdmin := h.callerIdentity(r)
+	deviceID := h.resolveDeviceID(r, q)
+	playSessionID := scopePlaySessionID(q.Get("PlaySessionId"), callerUserID, isAdmin)
 	if h.mgr != nil {
 		h.mgr.StopByDeviceForUser(deviceID, playSessionID, callerUserID, isAdmin)
 	}
@@ -507,7 +536,7 @@ func (h *Handler) handleLiveStreamOpen(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	var req liveStreamOpenRequest
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = httpx.DecodeJSONLimit(r, &req, 0)
 	}
 	if req.ItemId == "" {
 		req.ItemId = q.Get("ItemId")
@@ -524,7 +553,8 @@ func (h *Handler) handleLiveStreamOpen(w http.ResponseWriter, r *http.Request) {
 
 	liveID := guid.New()
 	var msDTO dto.MediaSourceInfo
-	callerUserID, _ := h.callerIdentity(r)
+	callerUserID, isAdmin := h.callerIdentity(r)
+	scopedPlaySessionID := scopePlaySessionID(req.PlaySessionId, callerUserID, isAdmin)
 
 	if req.ItemId != "" && h.repo != nil {
 		item, src, err := h.resolveItemAndSource(r.Context(), guid.Normalize(req.ItemId), req.MediaSourceId)
@@ -583,7 +613,7 @@ func (h *Handler) handleLiveStreamOpen(w http.ResponseWriter, r *http.Request) {
 	h.pruneLiveStreamsLocked(now)
 	h.liveStreams[liveID] = &liveStreamEntry{
 		LiveStreamID:  liveID,
-		PlaySessionID: req.PlaySessionId,
+		PlaySessionID: scopedPlaySessionID,
 		UserID:        callerUserID,
 		ItemID:        guid.Normalize(req.ItemId),
 		MediaSource:   msDTO,
@@ -629,7 +659,7 @@ func (h *Handler) handleLiveStreamClose(w http.ResponseWriter, r *http.Request) 
 	liveID := q.Get("LiveStreamId")
 	if liveID == "" && r.Body != nil {
 		var req liveStreamCloseRequest
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = httpx.DecodeJSONLimit(r, &req, 0)
 		liveID = req.LiveStreamId
 	}
 
@@ -638,7 +668,7 @@ func (h *Handler) handleLiveStreamClose(w http.ResponseWriter, r *http.Request) 
 	if liveID != "" {
 		h.liveMu.Lock()
 		if entry, ok := h.liveStreams[liveID]; ok {
-			if !isAdmin && entry.UserID != "" && entry.UserID != callerUserID {
+			if !isAdmin && (h.userRepo != nil || callerUserID != "" || entry.UserID != "") && (entry.UserID == "" || entry.UserID != callerUserID) {
 				h.liveMu.Unlock()
 				httpx.Error(w, http.StatusForbidden, "access denied")
 				return
@@ -659,7 +689,7 @@ func (h *Handler) handleLiveStreamMediaInfo(w http.ResponseWriter, r *http.Reque
 	liveID := q.Get("LiveStreamId")
 	if liveID == "" && r.Body != nil {
 		var req liveStreamCloseRequest
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = httpx.DecodeJSONLimit(r, &req, 0)
 		liveID = req.LiveStreamId
 	}
 
@@ -671,7 +701,7 @@ func (h *Handler) handleLiveStreamMediaInfo(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	callerUserID, isAdmin := h.callerIdentity(r)
-	if !isAdmin && entry.UserID != "" && entry.UserID != callerUserID {
+	if !isAdmin && (h.userRepo != nil || callerUserID != "" || entry.UserID != "") && (entry.UserID == "" || entry.UserID != callerUserID) {
 		httpx.Error(w, http.StatusForbidden, "access denied")
 		return
 	}
@@ -717,12 +747,18 @@ func (h *Handler) buildSessionParams(r *http.Request, item *sqlite.ItemRecord, s
 	}
 	// Resolve .strm file to its target URL for FFmpeg input
 	if strings.EqualFold(filepath.Ext(inputPath), ".strm") {
+		var resolved string
 		if h.streamResolver != nil {
-			if u, err := h.streamResolver(r.Context(), inputPath); err == nil && strings.TrimSpace(u) != "" {
-				inputPath = strings.TrimSpace(u)
+			if u, err := h.streamResolver(r.Context(), inputPath); err == nil {
+				resolved = strings.TrimSpace(u)
 			}
-		} else if u := readFirstLineURL(inputPath); u != "" {
-			inputPath = u
+		} else {
+			resolved = readFirstLineURL(inputPath)
+		}
+		if resolved != "" && isSafeStrmURL(resolved) {
+			inputPath = resolved
+		} else {
+			inputPath = ""
 		}
 	}
 
@@ -730,10 +766,19 @@ func (h *Handler) buildSessionParams(r *http.Request, item *sqlite.ItemRecord, s
 	if segDur <= 0 {
 		segDur = transcode.DefaultSegmentDuration
 	}
+	if segDur < minHLSSegmentLength {
+		segDur = minHLSSegmentLength
+	}
+	if segDur > maxHLSSegmentLength {
+		segDur = maxHLSSegmentLength
+	}
 
 	audioBitrate := q.Int("AudioBitrate", 192_000)
 	if audioBitrate <= 0 {
 		audioBitrate = 192_000
+	}
+	if audioBitrate > maxHLSAudioBitrate {
+		audioBitrate = maxHLSAudioBitrate
 	}
 	videoBitrate := q.Int("VideoBitrate", 0)
 	if videoBitrate <= 0 {
@@ -743,6 +788,18 @@ func (h *Handler) buildSessionParams(r *http.Request, item *sqlite.ItemRecord, s
 				videoBitrate = 256_000
 			}
 		}
+	}
+	if videoBitrate > maxHLSVideoBitrate {
+		videoBitrate = maxHLSVideoBitrate
+	}
+
+	audioCodec := sanitizeAudioCodec(q.Get("AudioCodec"))
+	audioChannels := q.Int("TranscodingMaxAudioChannels", 2)
+	if audioChannels <= 0 {
+		audioChannels = 2
+	}
+	if audioChannels > maxHLSAudioChannels {
+		audioChannels = maxHLSAudioChannels
 	}
 
 	var audioIdx *int
@@ -784,20 +841,29 @@ func (h *Handler) buildSessionParams(r *http.Request, item *sqlite.ItemRecord, s
 		}
 	}
 
-	callerUserID, _ := h.callerIdentity(r)
+	callerUserID, isAdmin := h.callerIdentity(r)
+	deviceID := h.resolveDeviceID(r, q)
+	playSessionID := scopePlaySessionID(q.Get("PlaySessionId"), callerUserID, isAdmin)
+	if !isAdmin && callerUserID != "" && playSessionID == "" {
+		if deviceID != "" {
+			playSessionID = callerUserID + ":" + deviceID + ":" + item.ID
+		} else {
+			playSessionID = callerUserID + ":" + item.ID + ":" + msID
+		}
+	}
 	runtimeTicks := resolveRuntimeTicks(item, src)
 	return transcode.SessionParams{
-		PlaySessionID:         q.Get("PlaySessionId"),
-		DeviceID:              q.Get("DeviceId"),
+		PlaySessionID:         playSessionID,
+		DeviceID:              deviceID,
 		UserID:                callerUserID,
 		ItemID:                item.ID,
 		MediaSourceID:         msID,
 		InputPath:             inputPath,
 		VideoCodec:            q.Get("VideoCodec"),
-		AudioCodec:            q.Get("AudioCodec"),
+		AudioCodec:            audioCodec,
 		VideoBitrate:          videoBitrate,
 		AudioBitrate:          audioBitrate,
-		AudioChannels:         q.Int("TranscodingMaxAudioChannels", 2),
+		AudioChannels:         audioChannels,
 		MaxWidth:              q.Int("MaxWidth", 0),
 		MaxHeight:             q.Int("MaxHeight", 0),
 		AudioStreamIndex:      audioIdx,
@@ -898,6 +964,32 @@ func readFirstLineURL(strmPath string) string {
 		}
 	}
 	return ""
+}
+
+func sanitizeAudioCodec(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return ""
+	case "copy", "aac", "mp3", "opus", "ac3", "eac3", "flac":
+		return strings.ToLower(strings.TrimSpace(raw))
+	default:
+		return "aac"
+	}
+}
+
+func isSafeStrmURL(rawURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return false
+	}
+	if isBlockedStrmHost(u.Hostname()) {
+		return false
+	}
+	return netutil.ValidateRemoteURL(rawURL, true) == nil
 }
 
 func isBlockedStrmHost(host string) bool {

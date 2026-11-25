@@ -16,7 +16,7 @@ func TestResolverManifestAndConfigure(t *testing.T) {
 	if err := r.Configure(map[string]any{"enabled": false, "enable_302": false}); err != nil {
 		t.Fatalf("Configure failed: %v", err)
 	}
-	if r.Manifest().Enabled || r.enable302 {
+	if r.Manifest().Enabled || r.enable302.Load() {
 		t.Fatalf("expected enabled=false and enable_302=false")
 	}
 }
@@ -40,17 +40,23 @@ func TestResolveSTRMExtraBranches(t *testing.T) {
 
 	// BOM + http URL
 	httpPath := filepath.Join(dir, "http.strm")
-	_ = os.WriteFile(httpPath, []byte("\xef\xbb\xbfhttp://example.com/a.mp4\n"), 0o644)
+	_ = os.WriteFile(httpPath, []byte("\xef\xbb\xbfhttp://192.168.1.20/a.mp4\n"), 0o644)
 	res, err := r.ResolveStream(ctx, httpPath)
-	if err != nil || res == nil || res.URL != "http://example.com/a.mp4" || !res.Is302 {
+	if err != nil || res == nil || res.URL != "http://192.168.1.20/a.mp4" || !res.Is302 {
 		t.Fatalf("unexpected http result: res=%+v err=%v", res, err)
 	}
 
-	// Local file path inside strm -> Is302=false even when enable302=true
-	localPath := filepath.Join(dir, "local.strm")
-	_ = os.WriteFile(localPath, []byte("/mnt/media/movie.mkv\n"), 0o644)
-	res, err = r.ResolveStream(ctx, localPath)
-	if err != nil || res == nil || res.URL != "/mnt/media/movie.mkv" || res.Is302 {
-		t.Fatalf("unexpected local result: res=%+v err=%v", res, err)
+	// Local file path, file://, concat:, and cloud metadata URLs must be rejected
+	for _, unsafeTarget := range []string{
+		"/mnt/media/movie.mkv",
+		"file:///etc/passwd",
+		"concat:/etc/passwd",
+		"http://169.254.169.254/latest/meta-data/",
+	} {
+		badPath := filepath.Join(dir, "unsafe.strm")
+		_ = os.WriteFile(badPath, []byte(unsafeTarget+"\n"), 0o644)
+		if res, err := r.ResolveStream(ctx, badPath); err == nil || res != nil {
+			t.Fatalf("expected error for unsafe strm target %q, got res=%+v err=%v", unsafeTarget, res, err)
+		}
 	}
 }

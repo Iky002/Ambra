@@ -88,7 +88,7 @@ func TestStreamingHandlerRange302AndSubtitle(t *testing.T) {
 
 	// 2. STRM file -> 302 Found
 	strmPath := filepath.Join(tmp, "cloud.strm")
-	_ = os.WriteFile(strmPath, []byte("https://cdn.example.com/direct.mkv\n"), 0o644)
+	_ = os.WriteFile(strmPath, []byte("https://93.184.216.34/direct.mkv\n"), 0o644)
 	strmID := guid.New()
 	_ = repo.UpsertItem(ctx, &sqlite.ItemRecord{
 		ID:        strmID,
@@ -111,7 +111,7 @@ func TestStreamingHandlerRange302AndSubtitle(t *testing.T) {
 
 	rec302 := httptest.NewRecorder()
 	mux.ServeHTTP(rec302, httptest.NewRequest(http.MethodGet, "/Videos/"+strmID+"/stream", nil))
-	if rec302.Code != http.StatusFound || rec302.Header().Get("Location") != "https://cdn.example.com/direct.mkv" {
+	if rec302.Code != http.StatusFound || rec302.Header().Get("Location") != "https://93.184.216.34/direct.mkv" {
 		t.Fatalf("expected 302 redirect, got code=%d location=%s", rec302.Code, rec302.Header().Get("Location"))
 	}
 }
@@ -329,11 +329,13 @@ func TestStreamingEmbeddedSubtitleExtractionAndVTT(t *testing.T) {
 	script := `#!/bin/sh
 out=""
 for arg in "$@"; do out="$arg"; done
-case "$out" in
+case "$*" in
   *fail_item*)
     echo "simulated ffmpeg error" >&2
     exit 1
     ;;
+esac
+case "$out" in
   *.vtt)
     printf 'WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nEmbedded VTT Line\n' > "$out"
     ;;
@@ -415,11 +417,13 @@ esac
 	// 3. Extraction error -> 500
 	failID := "fail_item_01"
 	failMS := "ms_fail_01"
+	failMKV := filepath.Join(tmp, "fail_item.mkv")
+	_ = os.WriteFile(failMKV, []byte("fake-mkv"), 0o644)
 	_ = repo.UpsertItem(ctx, &sqlite.ItemRecord{
-		ID: failID, LibraryID: "lib1", Type: "Movie", Name: "Fail", Container: "mkv", Path: mkvPath,
+		ID: failID, LibraryID: "lib1", Type: "Movie", Name: "Fail", Container: "mkv", Path: failMKV,
 	})
 	_ = repo.ReplaceMediaSourcesAndStreams(ctx, failID, []sqlite.MediaSourceRecord{{
-		ID: failMS, ItemID: failID, Name: "Fail", Path: mkvPath, Container: "mkv",
+		ID: failMS, ItemID: failID, Name: "Fail", Path: failMKV, Container: "mkv",
 		Streams: []sqlite.MediaStreamRecord{
 			{MediaSourceID: failMS, ItemID: failID, StreamIndex: 2, StreamType: "Subtitle", Codec: "subrip", IsExternal: false, Path: ""},
 		},

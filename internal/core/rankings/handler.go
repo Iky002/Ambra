@@ -58,7 +58,7 @@ func (h *Handler) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		httpx.JSON(w, http.StatusBadGateway, map[string]any{
 			"Error":   http.StatusText(http.StatusBadGateway),
-			"Message": err.Error(),
+			"Message": "failed to refresh rankings from upstream sources",
 			"Summary": summary,
 		})
 		return

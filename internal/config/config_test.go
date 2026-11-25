@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -233,4 +234,188 @@ func TestFFmpegEnvOverridesAndSiblingAutoDetect(t *testing.T) {
 	if cfgFallback.FFmpegPath != "ffmpeg" || cfgFallback.FFprobePath != "ffprobe" {
 		t.Fatalf("expected fallback to default names, got %q / %q", cfgFallback.FFmpegPath, cfgFallback.FFprobePath)
 	}
+}
+
+func TestLoadEmptyDataDirAndAllEnvOverrides(t *testing.T) {
+	// Exercise Load("") in an isolated working directory so ./data is created safely.
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpWD := t.TempDir()
+	if err := os.Chdir(tmpWD); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origWD) })
+
+	t.Setenv("AMBRA_ENABLE_DLNA", "false")
+	t.Setenv("AMBRA_ENABLE_QUICK_CONNECT", "0")
+	t.Setenv("AMBRA_ALLOWED_ORIGINS", " https://a.example.com , , https://b.example.com ")
+	t.Setenv("AMBRA_TRUSTED_PROXIES", "10.0.0.1, 172.16.0.0/12, ")
+	t.Setenv("AMBRA_TMDB_API_KEY", "env-only-secret")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load(\"\") failed: %v", err)
+	}
+	if cfg.DataDir != "./data" {
+		t.Fatalf("expected ./data, got %q", cfg.DataDir)
+	}
+	if cfg.EnableDLNA {
+		t.Fatal("expected EnableDLNA=false from env")
+	}
+	if cfg.EnableQuickConnect {
+		t.Fatal("expected EnableQuickConnect=false from env")
+	}
+	if len(cfg.AllowedOrigins) != 2 || cfg.AllowedOrigins[0] != "https://a.example.com" || cfg.AllowedOrigins[1] != "https://b.example.com" {
+		t.Fatalf("unexpected AllowedOrigins: %#v", cfg.AllowedOrigins)
+	}
+	if len(cfg.TrustedProxies) != 2 || cfg.TrustedProxies[0] != "10.0.0.1" || cfg.TrustedProxies[1] != "172.16.0.0/12" {
+		t.Fatalf("unexpected TrustedProxies: %#v", cfg.TrustedProxies)
+	}
+	if cfg.TMDBApiKey != "env-only-secret" {
+		t.Fatalf("expected TMDBApiKey in memory, got %q", cfg.TMDBApiKey)
+	}
+
+	// Save MUST NOT persist env-provided TMDBApiKey to disk.
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(tmpWD, "data", "config", "ambra.json"))
+	if err != nil {
+		t.Fatalf("read saved ambra.json: %v", err)
+	}
+	if string(raw) == "" {
+		t.Fatal("expected non-empty saved ambra.json")
+	}
+	if got := string(raw); filepath.Base(cfg.DBPath()) != "ambra.db" || containsString(got, "env-only-secret") {
+		t.Fatalf("env TMDB key must not be persisted to disk: %s", got)
+	}
+
+	// Verify positive boolean env overrides ("yes", "on") on top of persisted false values.
+	t.Setenv("AMBRA_ENABLE_DLNA", "yes")
+	t.Setenv("AMBRA_ENABLE_QUICK_CONNECT", "on")
+	t.Setenv("AMBRA_TMDB_API_KEY", "")
+	cfgTrue, err := Load("")
+	if err != nil {
+		t.Fatalf("reload Load(\"\") failed: %v", err)
+	}
+	if !cfgTrue.EnableDLNA || !cfgTrue.EnableQuickConnect {
+		t.Fatalf("expected true env overrides, got DLNA=%v QC=%v", cfgTrue.EnableDLNA, cfgTrue.EnableQuickConnect)
+	}
+	if cfgTrue.TMDBApiKey != "" {
+		t.Fatalf("expected empty TMDBApiKey after reloading without env, got %q", cfgTrue.TMDBApiKey)
+	}
+
+	// Check splitCSVEnv edge case: only commas/spaces.
+	if parts := splitCSVEnv(" , , "); len(parts) != 0 {
+		t.Fatalf("expected empty slice from blank CSV, got %#v", parts)
+	}
+}
+
+func TestUpdateSnapshotAndAtomicSaveErrors(t *testing.T) {
+	// Nil safety
+	var nilCfg *Config
+	nilCfg.Update(func(c *Config) { c.ServerName = "nope" })
+	if snap := nilCfg.Snapshot(); snap.ServerName != "" {
+		t.Fatalf("expected zero snapshot for nil Config, got %+v", snap)
+	}
+
+	dir := t.TempDir()
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Update(nil) // nil fn no-op
+
+	cfg.Update(func(c *Config) {
+		c.ServerName = "Updated Server"
+		c.TMDBApiKey = "saved-key"
+		c.AllowedOrigins = []string{"https://one.example"}
+		c.TrustedProxies = []string{"127.0.0.1"}
+	})
+
+	snap := cfg.Snapshot()
+	if snap.ServerName != "Updated Server" || snap.TMDBApiKey != "saved-key" {
+		t.Fatalf("unexpected snapshot: %+v", snap)
+	}
+	// Mutating snapshot slices must not affect original Config.
+	snap.AllowedOrigins[0] = "https://mutated.example"
+	snap.TrustedProxies[0] = "9.9.9.9"
+	snap2 := cfg.Snapshot()
+	if snap2.AllowedOrigins[0] != "https://one.example" || snap2.TrustedProxies[0] != "127.0.0.1" {
+		t.Fatalf("snapshot slices must be deep-copied, got %+v", snap2)
+	}
+
+	// Atomic Save writes mode 0600 and leaves no temp files behind.
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+	cfgPath := filepath.Join(dir, "config", "ambra.json")
+	st, err := os.Stat(cfgPath)
+	if err != nil {
+		t.Fatalf("stat saved config: %v", err)
+	}
+	if st.Mode().Perm() != 0o600 {
+		t.Fatalf("expected 0600 permissions on ambra.json, got %o", st.Mode().Perm())
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "ambra.json" {
+		t.Fatalf("expected only ambra.json in config dir, got %v", entries)
+	}
+
+	// Save error: DataDir is a regular file so MkdirAll fails.
+	fileAsDir := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(fileAsDir, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	badCfg := Default(fileAsDir)
+	if err := badCfg.Save(); err == nil {
+		t.Fatal("expected Save error when DataDir is a file")
+	}
+
+	// Save error: target ambra.json is a non-empty directory so Rename fails and temp file is cleaned up.
+	dirRename := t.TempDir()
+	targetDir := filepath.Join(dirRename, "config", "ambra.json")
+	if err := os.MkdirAll(filepath.Join(targetDir, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	renameFailCfg := Default(dirRename)
+	if err := renameFailCfg.Save(); err == nil {
+		t.Fatal("expected Save rename error when ambra.json is a directory")
+	}
+
+	// Save error: config dir is read-only so CreateTemp fails (also covers Load initial Save error).
+	roDir := t.TempDir()
+	roCfgDir := filepath.Join(roDir, "config")
+	if err := os.MkdirAll(roCfgDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(roCfgDir, 0o700) })
+	roCfg := Default(roDir)
+	if err := roCfg.Save(); err == nil {
+		t.Fatal("expected Save error when config dir is read-only")
+	}
+	if _, err := Load(roDir); err == nil {
+		t.Fatal("expected Load error when initial Save fails in read-only config dir")
+	}
+
+	// Save error: json.MarshalIndent fails when PlayedThreshold is NaN.
+	nanCfg := Default(t.TempDir())
+	nanCfg.PlayedThreshold = math.NaN()
+	if err := nanCfg.Save(); err == nil {
+		t.Fatal("expected Save error for NaN PlayedThreshold")
+	}
+}
+
+func containsString(s, substr string) bool {
+	for i := 0; i+len(substr) <= len(s); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -450,5 +452,90 @@ func TestLiveTVSeriesTimerCascadeXMLTVRefreshAndExportedHelpers(t *testing.T) {
 	ch, ok := h.GetChannelByID(chID)
 	if !ok || !ch.Disabled || ch.SortIndex != 7 {
 		t.Fatalf("expected Disabled=true SortIndex=7, got %+v", ch)
+	}
+}
+
+func TestLiveTVSecurityHardeningV0103(t *testing.T) {
+	h, mux, st, _ := setupLiveTVTest(t)
+	userRepo := sqlite.NewUserRepo(st)
+	h.SetUserRepo(userRepo)
+
+	ctx := context.Background()
+	adminU := &sqlite.UserRecord{Name: "admin2", IsAdmin: true, Policy: sqlite.DefaultUserPolicy(true), Config: sqlite.DefaultUserConfig()}
+	viewerU := &sqlite.UserRecord{Name: "viewer2", IsAdmin: false, Policy: sqlite.DefaultUserPolicy(false), Config: sqlite.DefaultUserConfig()}
+	_ = userRepo.CreateUser(ctx, adminU)
+	_ = userRepo.CreateUser(ctx, viewerU)
+	adminAC := &middleware.AuthContext{User: adminU}
+	viewerAC := &middleware.AuthContext{User: viewerU}
+
+	// 1. M3UContent must not be persisted after import, SortIndex ordering, non-admin hides StreamUrl, disabled channel blocked
+	m3u := "#EXTM3U\n#EXTINF:-1,ChanA\nhttp://93.184.216.34/a.m3u8\n#EXTINF:-1,ChanB\nhttp://93.184.216.34/b.m3u8\n"
+	rec := doLiveTVAuthReq(t, mux, adminAC, http.MethodPost, "/LiveTv/TunerHosts", map[string]any{"Type": "m3u", "M3UContent": m3u})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save tuner host: %d", rec.Code)
+	}
+	h.mu.RLock()
+	if len(h.state.TunerHosts) != 1 || h.state.TunerHosts[0].M3UContent != "" {
+		h.mu.RUnlock()
+		t.Fatalf("expected M3UContent cleared after import")
+	}
+	chA := h.state.Channels[0].Id
+	chB := h.state.Channels[1].Id
+	h.mu.RUnlock()
+
+	_ = h.SetChannelSortIndex(ctx, chA, 10)
+	_ = h.SetChannelSortIndex(ctx, chB, 1)
+	_ = h.SetChannelDisabled(ctx, chA, true)
+
+	// Non-admin list sorted by SortIndex and hides StreamUrl
+	listRec := doLiveTVAuthReq(t, mux, viewerAC, http.MethodGet, "/LiveTv/Channels", nil)
+	var listRes dto.QueryResult[ChannelInfo]
+	_ = json.Unmarshal(listRec.Body.Bytes(), &listRes)
+	if len(listRes.Items) != 2 || listRes.Items[0].Id != chB || listRes.Items[1].Id != chA {
+		t.Fatalf("expected channels sorted by SortIndex, got %+v", listRes.Items)
+	}
+	for _, ch := range listRes.Items {
+		if ch.StreamUrl != "" {
+			t.Fatalf("expected non-admin StreamUrl hidden, got %q", ch.StreamUrl)
+		}
+	}
+	// Disabled channel stream rejected
+	if streamRec := doLiveTVAuthReq(t, mux, viewerAC, http.MethodGet, "/LiveTv/Channels/"+chA+"/Stream", nil); streamRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for disabled channel stream, got %d", streamRec.Code)
+	}
+
+	// 2. GET /LiveTv/Info for non-admin returns only self, not admin ID
+	infoRec := doLiveTVAuthReq(t, mux, viewerAC, http.MethodGet, "/LiveTv/Info", nil)
+	var info LiveTvInfo
+	_ = json.Unmarshal(infoRec.Body.Bytes(), &info)
+	if len(info.EnabledUsers) != 1 || info.EnabledUsers[0] != viewerU.ID {
+		t.Fatalf("expected only self in EnabledUsers for non-admin, got %+v", info.EnabledUsers)
+	}
+
+	// 3. Timer duration (>24h) and padding (>3600) rejected
+	now := time.Now().UTC()
+	if r := doLiveTVAuthReq(t, mux, adminAC, http.MethodPost, "/LiveTv/Timers", map[string]any{
+		"Name": "TooLong", "StartDate": now, "EndDate": now.Add(25 * time.Hour),
+	}); r.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for >24h timer, got %d", r.Code)
+	}
+	if r := doLiveTVAuthReq(t, mux, adminAC, http.MethodPost, "/LiveTv/Timers", map[string]any{
+		"Name": "TooPad", "StartDate": now, "EndDate": now.Add(time.Hour), "PrePaddingSeconds": 7200,
+	}); r.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for >3600s padding, got %d", r.Code)
+	}
+
+	// 4. rewriteHLSPlaylistWithPolicy blocks loopback and metadata URIs when allowLoopback=false
+	base, _ := url.Parse("http://93.184.216.34/live/index.m3u8")
+	playlist := "#EXTM3U\nhttp://127.0.0.1:8096/secret.ts\nhttp://169.254.169.254/latest/meta-data/\nhttp://93.184.216.34/seg1.ts\n"
+	rewritten := h.rewriteHLSPlaylistWithPolicy(playlist, base, chB, "Stream", "", false)
+	if strings.Contains(rewritten, "target=http%3A%2F%2F127.0.0.1") {
+		t.Fatalf("expected loopback URI not signed when allowLoopback=false:\n%s", rewritten)
+	}
+	if strings.Contains(rewritten, "target=http%3A%2F%2F169.254.169.254") {
+		t.Fatalf("expected metadata URI not signed:\n%s", rewritten)
+	}
+	if !strings.Contains(rewritten, "sig=") {
+		t.Fatalf("expected safe URI to be signed:\n%s", rewritten)
 	}
 }

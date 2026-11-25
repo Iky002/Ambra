@@ -22,6 +22,18 @@ const (
 var (
 	// cgnatPrefix is RFC 6598 Shared Address Space (100.64.0.0/10).
 	cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
+	// Always-blocked special/transition/reserved/cloud-metadata prefixes & IPs.
+	alwaysBlockedPrefixes = []netip.Prefix{
+		netip.MustParsePrefix("64:ff9b::/96"),       // NAT64 well-known
+		netip.MustParsePrefix("64:ff9b:1::/48"),     // NAT64 local-use
+		netip.MustParsePrefix("2002::/16"),          // 6to4
+		netip.MustParsePrefix("2001::/32"),          // Teredo
+		netip.MustParsePrefix("240.0.0.0/4"),        // IPv4 reserved + broadcast
+		netip.MustParsePrefix("198.18.0.0/15"),      // Benchmark testing
+		netip.MustParsePrefix("fd00:ec2::254/128"),  // AWS IPv6 IMDS
+		netip.MustParsePrefix("100.100.100.200/32"), // Alibaba Cloud metadata
+	}
+	deprecatedIPv4CompatPrefix = netip.MustParsePrefix("::/96")
 )
 
 // ValidateRemoteURL validates that rawURL uses http or https, has a non-empty host,
@@ -89,6 +101,14 @@ func validateAddr(addr netip.Addr, allowPrivateLAN bool) error {
 	if addr.IsMulticast() || addr.IsLinkLocalMulticast() || addr.IsInterfaceLocalMulticast() {
 		return fmt.Errorf("blocked multicast address %s", addr)
 	}
+	for _, pfx := range alwaysBlockedPrefixes {
+		if pfx.Contains(addr) {
+			return fmt.Errorf("blocked reserved or metadata address %s", addr)
+		}
+	}
+	if addr.Is6() && !addr.IsLoopback() && deprecatedIPv4CompatPrefix.Contains(addr) {
+		return fmt.Errorf("blocked deprecated ipv4-compatible address %s", addr)
+	}
 
 	if !allowPrivateLAN {
 		if addr.IsLoopback() {
@@ -149,6 +169,8 @@ func NewSafeHTTPClient(timeout time.Duration, allowPrivateLAN bool) *http.Client
 	}
 
 	transport := &http.Transport{
+		TLSHandshakeTimeout:   10 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: respHeaderTimeout,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)
@@ -184,7 +206,31 @@ func NewSafeHTTPClient(timeout time.Duration, allowPrivateLAN bool) *http.Client
 			if req.URL == nil {
 				return errors.New("redirect target url is nil")
 			}
-			if err := ValidateRemoteURL(req.URL.String(), allowPrivateLAN); err != nil {
+			if len(via) > 0 && via[len(via)-1].URL != nil {
+				prev := via[len(via)-1].URL
+				if strings.EqualFold(prev.Scheme, "https") && strings.EqualFold(req.URL.Scheme, "http") {
+					return errors.New("blocked redirect downgrade from https to http")
+				}
+				if !strings.EqualFold(prev.Host, req.URL.Host) {
+					for _, hdr := range []string{
+						"Authorization", "X-Emby-Token", "X-MediaBrowser-Token",
+						"X-Emby-Authorization", "X-Api-Key", "trakt-api-key",
+					} {
+						req.Header.Del(hdr)
+					}
+				}
+			}
+			ctx, cancel := context.WithTimeout(req.Context(), dnsLookupTimeout)
+			defer cancel()
+			scheme := strings.ToLower(req.URL.Scheme)
+			if scheme != "http" && scheme != "https" {
+				return fmt.Errorf("blocked redirect target: unsupported url scheme %q", req.URL.Scheme)
+			}
+			host := strings.TrimSpace(req.URL.Hostname())
+			if host == "" {
+				return errors.New("blocked redirect target: url host is empty")
+			}
+			if _, err := resolveAndValidateHost(ctx, host, allowPrivateLAN); err != nil {
 				return fmt.Errorf("blocked redirect target: %w", err)
 			}
 			return nil

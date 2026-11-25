@@ -1,7 +1,6 @@
 package transcode
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -15,6 +14,26 @@ import (
 
 	"github.com/ambra-media/ambra/internal/config"
 )
+
+const defaultExtractTimeout = 45 * time.Second
+
+func resolveMediaInputPath(mediaPath string) (string, error) {
+	p := strings.TrimSpace(mediaPath)
+	if p == "" {
+		return "", fmt.Errorf("media path is empty")
+	}
+	if hasControlChars(p) {
+		return "", fmt.Errorf("media path contains forbidden control characters")
+	}
+	if isHTTPInput(p) {
+		return p, nil
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", fmt.Errorf("resolve media path: %w", err)
+	}
+	return abs, nil
+}
 
 // Extractor extracts embedded subtitle tracks and font attachments from media containers
 // on demand, caching results under cfg.SubtitleCacheDir() and deduplicating concurrent requests.
@@ -50,8 +69,9 @@ func (e *Extractor) SubtitleCachePath(itemID, mediaSourceID string, streamIndex 
 // ExtractSubtitle extracts an embedded subtitle track from mediaPath into cfg.SubtitleCacheDir().
 // Concurrent calls for the same track share a single FFmpeg invocation via singleflight.
 func (e *Extractor) ExtractSubtitle(ctx context.Context, mediaPath, itemID, mediaSourceID string, streamIndex int, targetExt string) (string, error) {
-	if mediaPath == "" {
-		return "", fmt.Errorf("media path is empty")
+	resolvedMedia, err := resolveMediaInputPath(mediaPath)
+	if err != nil {
+		return "", err
 	}
 	ext := normalizeSubtitleExt(targetExt)
 	outPath := e.SubtitleCachePath(itemID, mediaSourceID, streamIndex, ext)
@@ -64,27 +84,32 @@ func (e *Extractor) ExtractSubtitle(ctx context.Context, mediaPath, itemID, medi
 		if fileReady(outPath) {
 			return outPath, nil
 		}
-		if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(outPath), 0o700); err != nil {
 			return "", fmt.Errorf("create subtitle cache dir: %w", err)
 		}
 
-		tmpPath := outPath + ".tmp." + ext
-		_ = os.Remove(tmpPath)
+		tmpFile, err := os.CreateTemp(filepath.Dir(outPath), ".ambra-sub-*."+ext)
+		if err != nil {
+			return "", fmt.Errorf("create subtitle temp file: %w", err)
+		}
+		tmpPath := tmpFile.Name()
+		_ = tmpFile.Close()
+		defer os.Remove(tmpPath)
 
-		args := BuildSubtitleExtractArgs(mediaPath, streamIndex, ext, tmpPath)
-		cmd := exec.CommandContext(ctx, e.ffmpegPath, args...)
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
+		runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultExtractTimeout)
+		defer cancel()
+
+		args := BuildSubtitleExtractArgs(resolvedMedia, streamIndex, ext, tmpPath)
+		cmd := exec.CommandContext(runCtx, e.ffmpegPath, args...)
+		stderr := newSafeRingBuffer(maxStderrBytes)
+		cmd.Stderr = stderr
 		if err := cmd.Run(); err != nil {
-			_ = os.Remove(tmpPath)
 			return "", fmt.Errorf("extract subtitle stream %d: %w (%s)", streamIndex, err, strings.TrimSpace(stderr.String()))
 		}
 		if !fileReady(tmpPath) {
-			_ = os.Remove(tmpPath)
 			return "", fmt.Errorf("extracted subtitle stream %d is empty", streamIndex)
 		}
 		if err := os.Rename(tmpPath, outPath); err != nil {
-			_ = os.Remove(tmpPath)
 			return "", fmt.Errorf("commit extracted subtitle: %w", err)
 		}
 		return outPath, nil
@@ -125,14 +150,16 @@ func BuildSubtitleExtractArgs(mediaPath string, streamIndex int, targetExt, outP
 // ExtractFonts extracts embedded font attachments (e.g. TTF/OTF in MKV) for client-side ASS rendering (JASSUB).
 // Returns the list of extracted font file paths cached under cfg.SubtitleCacheDir()/fonts/<itemID>_<mediaSourceID>/.
 func (e *Extractor) ExtractFonts(ctx context.Context, mediaPath, itemID, mediaSourceID string) ([]string, error) {
-	if mediaPath == "" {
-		return nil, fmt.Errorf("media path is empty")
+	resolvedMedia, err := resolveMediaInputPath(mediaPath)
+	if err != nil {
+		return nil, err
 	}
 	baseDir := filepath.Join(os.TempDir(), "ambra-subtitles")
 	if e.cfg != nil {
 		baseDir = e.cfg.SubtitleCacheDir()
 	}
-	fontDir := filepath.Join(baseDir, "fonts", fmt.Sprintf("%s_%s", sanitizePathSegment(itemID), sanitizePathSegment(mediaSourceID)))
+	fontsRoot := filepath.Join(baseDir, "fonts")
+	fontDir := filepath.Join(fontsRoot, fmt.Sprintf("%s_%s", sanitizePathSegment(itemID), sanitizePathSegment(mediaSourceID)))
 	markerPath := filepath.Join(fontDir, ".extracted")
 
 	if _, err := os.Stat(markerPath); err == nil {
@@ -144,27 +171,72 @@ func (e *Extractor) ExtractFonts(ctx context.Context, mediaPath, itemID, mediaSo
 		if _, err := os.Stat(markerPath); err == nil {
 			return listFontFiles(fontDir)
 		}
-		if err := os.MkdirAll(fontDir, 0o755); err != nil {
-			return nil, fmt.Errorf("create font cache dir: %w", err)
+		if err := os.MkdirAll(fontsRoot, 0o700); err != nil {
+			return nil, fmt.Errorf("create fonts root dir: %w", err)
 		}
+		stageDir, err := os.MkdirTemp(fontsRoot, ".ambra-fonts-*")
+		if err != nil {
+			return nil, fmt.Errorf("create font staging dir: %w", err)
+		}
+		defer os.RemoveAll(stageDir)
+
+		runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultExtractTimeout)
+		defer cancel()
 
 		// ffmpeg -dump_attachment:t "" dumps all attachment streams into cmd.Dir.
-		// Note: ffmpeg exits non-zero when no output file is specified even after dumping attachments.
-		cmd := exec.CommandContext(ctx, e.ffmpegPath,
+		// Extract into an isolated staging directory first to reject unsafe filenames.
+		cmd := exec.CommandContext(runCtx, e.ffmpegPath,
 			"-hide_banner", "-loglevel", "error", "-y",
 			"-dump_attachment:t", "",
-			"-i", mediaPath,
+			"-i", resolvedMedia,
 		)
-		cmd.Dir = fontDir
+		cmd.Dir = stageDir
 		_ = cmd.Run()
 
-		_ = os.WriteFile(markerPath, []byte("ok"), 0o644)
+		if err := os.MkdirAll(fontDir, 0o700); err != nil {
+			return nil, fmt.Errorf("create font cache dir: %w", err)
+		}
+		if entries, err := os.ReadDir(stageDir); err == nil {
+			for _, ent := range entries {
+				name := ent.Name()
+				if ent.IsDir() || ent.Type()&os.ModeSymlink != 0 || !isSafeAttachmentFilename(name) {
+					continue
+				}
+				if !isFontExt(filepath.Ext(name)) {
+					continue
+				}
+				src := filepath.Join(stageDir, name)
+				dst := filepath.Join(fontDir, name)
+				_ = os.Rename(src, dst)
+			}
+		}
+
+		_ = os.WriteFile(markerPath, []byte("ok"), 0o600)
 		return listFontFiles(fontDir)
 	})
 	if err != nil {
 		return nil, err
 	}
 	return res.([]string), nil
+}
+
+func isSafeAttachmentFilename(name string) bool {
+	if name == "" || strings.HasPrefix(name, ".") {
+		return false
+	}
+	if strings.Contains(name, "/") || strings.Contains(name, `\`) || strings.Contains(name, "..") || strings.ContainsRune(name, '\x00') {
+		return false
+	}
+	return filepath.Base(name) == name
+}
+
+func isFontExt(ext string) bool {
+	switch strings.ToLower(ext) {
+	case ".ttf", ".otf", ".ttc", ".woff", ".woff2":
+		return true
+	default:
+		return false
+	}
 }
 
 // ChapterThumbnailCachePath computes the deterministic cache path for a lazily extracted chapter thumbnail.
@@ -180,8 +252,9 @@ func (e *Extractor) ChapterThumbnailCachePath(itemID string, chapterIdx int) str
 // <ImageCacheDir>/chapters/<itemID>/chapter_<idx>.jpg using singleflight deduplication,
 // atomic temp-file rename, and an 8-second FFmpeg timeout.
 func (e *Extractor) ExtractChapterThumbnail(ctx context.Context, mediaPath, itemID string, chapterIdx int, startTicks int64) (string, error) {
-	if strings.TrimSpace(mediaPath) == "" {
-		return "", fmt.Errorf("media path is empty")
+	resolvedMedia, err := resolveMediaInputPath(mediaPath)
+	if err != nil {
+		return "", err
 	}
 	if chapterIdx < 0 {
 		return "", fmt.Errorf("chapter index must be non-negative")
@@ -196,18 +269,23 @@ func (e *Extractor) ExtractChapterThumbnail(ctx context.Context, mediaPath, item
 		if fileReady(outPath) {
 			return outPath, nil
 		}
-		if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(outPath), 0o700); err != nil {
 			return "", fmt.Errorf("create chapter thumbnail cache dir: %w", err)
 		}
 
-		tmpPath := outPath + ".tmp.jpg"
-		_ = os.Remove(tmpPath)
+		tmpFile, err := os.CreateTemp(filepath.Dir(outPath), ".ambra-chap-*.jpg")
+		if err != nil {
+			return "", fmt.Errorf("create chapter thumbnail temp file: %w", err)
+		}
+		tmpPath := tmpFile.Name()
+		_ = tmpFile.Close()
+		defer os.Remove(tmpPath)
 
 		sec := float64(startTicks) / float64(TicksPerSecond)
 		if sec < 0 {
 			sec = 0
 		}
-		runCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 8*time.Second)
 		defer cancel()
 
 		args := []string{
@@ -215,25 +293,22 @@ func (e *Extractor) ExtractChapterThumbnail(ctx context.Context, mediaPath, item
 			"-loglevel", "error",
 			"-y",
 			"-ss", strconv.FormatFloat(sec, 'f', 3, 64),
-			"-i", mediaPath,
+			"-i", resolvedMedia,
 			"-frames:v", "1",
 			"-q:v", "4",
 			"-vf", "scale='min(640,iw)':-2",
 			tmpPath,
 		}
 		cmd := exec.CommandContext(runCtx, e.ffmpegPath, args...)
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
+		stderr := newSafeRingBuffer(maxStderrBytes)
+		cmd.Stderr = stderr
 		if err := cmd.Run(); err != nil {
-			_ = os.Remove(tmpPath)
 			return "", fmt.Errorf("extract chapter %d thumbnail: %w (%s)", chapterIdx, err, strings.TrimSpace(stderr.String()))
 		}
 		if !fileReady(tmpPath) {
-			_ = os.Remove(tmpPath)
 			return "", fmt.Errorf("extracted chapter %d thumbnail is empty", chapterIdx)
 		}
 		if err := os.Rename(tmpPath, outPath); err != nil {
-			_ = os.Remove(tmpPath)
 			return "", fmt.Errorf("commit chapter thumbnail: %w", err)
 		}
 		return outPath, nil

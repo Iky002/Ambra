@@ -14,6 +14,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/core/auth"
 	"github.com/ambra-media/ambra/internal/core/session"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
@@ -21,8 +22,10 @@ import (
 )
 
 const (
-	keepAliveSeconds = 60
-	writeTimeout     = 10 * time.Second
+	keepAliveSeconds    = 60
+	writeTimeout        = 10 * time.Second
+	defaultReadTimeout  = time.Duration(keepAliveSeconds*3) * time.Second
+	defaultMaxWSClients = 1024
 )
 
 // Message is the standard Emby WebSocket envelope.
@@ -42,6 +45,7 @@ type clientConn struct {
 	id          string
 	userID      string
 	deviceID    string
+	token       string
 	isAPIKey    bool
 	isAdmin     bool
 	conn        *websocket.Conn
@@ -67,9 +71,11 @@ func (c *clientConn) trySend(msg Message) {
 
 // Hub manages WebSocket connections and bridges EventBus notifications to Emby clients.
 type Hub struct {
-	authSvc    *auth.Service
-	sessionMgr *session.Manager
-	bus        *eventbus.Bus
+	authSvc     *auth.Service
+	sessionMgr  *session.Manager
+	bus         *eventbus.Bus
+	maxClients  int
+	readTimeout time.Duration
 
 	mu      sync.RWMutex
 	clients map[string]*clientConn
@@ -77,10 +83,12 @@ type Hub struct {
 
 func NewHub(authSvc *auth.Service, sessionMgr *session.Manager, bus *eventbus.Bus) *Hub {
 	h := &Hub{
-		authSvc:    authSvc,
-		sessionMgr: sessionMgr,
-		bus:        bus,
-		clients:    make(map[string]*clientConn),
+		authSvc:     authSvc,
+		sessionMgr:  sessionMgr,
+		bus:         bus,
+		maxClients:  defaultMaxWSClients,
+		readTimeout: defaultReadTimeout,
+		clients:     make(map[string]*clientConn),
 	}
 	h.subscribeEvents()
 	return h
@@ -116,7 +124,14 @@ func (h *Hub) subscribeEvents() {
 			h.SendToUser(payload.UserId, msg)
 			return
 		}
-		h.Broadcast(msg)
+		// Unknown payload or empty UserId: restrict delivery to API-key and administrator clients only.
+		h.mu.RLock()
+		for _, c := range h.clients {
+			if c.isAPIKey || c.isAdmin {
+				c.trySend(msg)
+			}
+		}
+		h.mu.RUnlock()
 	})
 
 	h.bus.Subscribe(eventbus.EventSessionUpdated, func(_ context.Context, _ eventbus.Event) {
@@ -167,6 +182,26 @@ func (h *Hub) subscribeEvents() {
 		}
 		h.mu.RUnlock()
 	})
+
+	h.bus.Subscribe(eventbus.EventActivityLogCreated, func(_ context.Context, e eventbus.Event) {
+		msg := Message{
+			MessageType: "ActivityLogEntry",
+			Data:        e.Payload,
+		}
+		h.mu.RLock()
+		for _, c := range h.clients {
+			if !c.isAdmin {
+				continue
+			}
+			c.mu.RLock()
+			subscribed := c.subActivity
+			c.mu.RUnlock()
+			if subscribed {
+				c.trySend(msg)
+			}
+		}
+		h.mu.RUnlock()
+	})
 }
 
 func filterSessionsForUser(sessions []dto.SessionInfo, userID string) []dto.SessionInfo {
@@ -184,14 +219,8 @@ func filterSessionsForUser(sessions []dto.SessionInfo, userID string) []dto.Sess
 }
 
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	q := httpx.ParseQuery(r)
-	token := q.Get("api_key")
-	if token == "" {
-		token = r.Header.Get("X-Emby-Token")
-	}
-	if token == "" {
-		token = r.Header.Get("X-MediaBrowser-Token")
-	}
+	clientInfo := middleware.ExtractClientInfo(r)
+	token := clientInfo.Token
 
 	id, err := h.authSvc.ValidateToken(r.Context(), token)
 	if err != nil {
@@ -199,11 +228,20 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	limit := h.maxClients
+	if limit <= 0 {
+		limit = defaultMaxWSClients
+	}
+	if h.ClientCount() >= limit {
+		httpx.Error(w, http.StatusServiceUnavailable, "too many websocket connections")
+		return
+	}
+
 	// Enforce token-bound DeviceID for user tokens so clients cannot spoof another device's channel.
 	deviceID := id.DeviceID
 	if id.IsAPIKey || deviceID == "" {
-		if qDev := strings.TrimSpace(q.Get("deviceId")); qDev != "" {
-			deviceID = qDev
+		if clientInfo.DeviceID != "" {
+			deviceID = clientInfo.DeviceID
 		}
 	}
 
@@ -228,6 +266,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		id:       guid.New(),
 		userID:   userID,
 		deviceID: deviceID,
+		token:    id.Token,
 		isAPIKey: id.IsAPIKey,
 		isAdmin:  isAdmin,
 		conn:     conn,
@@ -235,7 +274,10 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cancel:   cancel,
 	}
 
-	h.register(client)
+	if !h.tryRegister(client, limit) {
+		_ = conn.Close(websocket.StatusTryAgainLater, "too many websocket connections")
+		return
+	}
 	defer func() {
 		h.unregister(client.id)
 		_ = conn.Close(websocket.StatusNormalClosure, "")
@@ -269,9 +311,16 @@ func (h *Hub) writeLoop(ctx context.Context, client *clientConn) {
 }
 
 func (h *Hub) readLoop(ctx context.Context, client *clientConn) {
+	timeout := h.readTimeout
+	if timeout <= 0 {
+		timeout = defaultReadTimeout
+	}
 	for {
+		rctx, rcancel := context.WithTimeout(ctx, timeout)
 		var in incomingMessage
-		if err := wsjson.Read(ctx, client.conn, &in); err != nil {
+		err := wsjson.Read(rctx, client.conn, &in)
+		rcancel()
+		if err != nil {
 			return
 		}
 		switch strings.TrimSpace(in.MessageType) {
@@ -321,10 +370,14 @@ func (h *Hub) readLoop(ctx context.Context, client *clientConn) {
 	}
 }
 
-func (h *Hub) register(c *clientConn) {
+func (h *Hub) tryRegister(c *clientConn, limit int) bool {
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.clients) >= limit {
+		return false
+	}
 	h.clients[c.id] = c
-	h.mu.Unlock()
+	return true
 }
 
 func (h *Hub) unregister(id string) {
@@ -376,6 +429,50 @@ func (h *Hub) DisconnectDevice(deviceID string) {
 	for _, c := range targets {
 		c.cancel()
 		_ = c.conn.Close(websocket.StatusPolicyViolation, "device revoked")
+	}
+}
+
+// DisconnectUser closes all active WebSocket connections belonging to userID.
+func (h *Hub) DisconnectUser(userID string) {
+	norm := guid.Normalize(userID)
+	if norm == "" {
+		return
+	}
+	h.mu.Lock()
+	var targets []*clientConn
+	for id, c := range h.clients {
+		if !c.isAPIKey && guid.Normalize(c.userID) == norm {
+			targets = append(targets, c)
+			delete(h.clients, id)
+		}
+	}
+	h.mu.Unlock()
+
+	for _, c := range targets {
+		c.cancel()
+		_ = c.conn.Close(websocket.StatusPolicyViolation, "user session revoked")
+	}
+}
+
+// DisconnectToken closes all active WebSocket connections authenticated with token.
+func (h *Hub) DisconnectToken(token string) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return
+	}
+	h.mu.Lock()
+	var targets []*clientConn
+	for id, c := range h.clients {
+		if c.token == token {
+			targets = append(targets, c)
+			delete(h.clients, id)
+		}
+	}
+	h.mu.Unlock()
+
+	for _, c := range targets {
+		c.cancel()
+		_ = c.conn.Close(websocket.StatusPolicyViolation, "token revoked")
 	}
 }
 

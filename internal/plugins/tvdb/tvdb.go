@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -13,15 +14,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/plugins"
 )
 
 const (
-	defaultBaseURL  = "https://api4.thetvdb.com/v4"
-	defaultLanguage = "zh-CN"
-	defaultPriority = 30
-	tokenTTL        = 24 * time.Hour
-	maxActors       = 15
+	defaultBaseURL   = "https://api4.thetvdb.com/v4"
+	defaultLanguage  = "zh-CN"
+	defaultPriority  = 30
+	tokenTTL         = 24 * time.Hour
+	maxActors        = 15
+	maxResponseBytes = 16 << 20 // 16 MiB
+	maxEpisodePages  = 25
 )
 
 var errUnauthorized = errors.New("tvdb unauthorized")
@@ -50,6 +54,7 @@ type providerConfig struct {
 	language string
 	priority int
 	baseURL  string
+	client   *http.Client
 }
 
 func (p *Provider) snapshot() providerConfig {
@@ -62,6 +67,7 @@ func (p *Provider) snapshot() providerConfig {
 		language: p.language,
 		priority: p.priority,
 		baseURL:  p.baseURL,
+		client:   p.client,
 	}
 }
 
@@ -72,8 +78,18 @@ func New() *Provider {
 		language: defaultLanguage,
 		priority: defaultPriority,
 		baseURL:  defaultBaseURL,
-		client:   &http.Client{Timeout: 10 * time.Second},
+		client:   netutil.NewSafeHTTPClient(10*time.Second, false),
 	}
+}
+
+// SetHTTPClient overrides the HTTP client used for TVDB requests (useful in tests).
+func (p *Provider) SetHTTPClient(c *http.Client) {
+	if c == nil {
+		return
+	}
+	p.mu.Lock()
+	p.client = c
+	p.mu.Unlock()
 }
 
 func (p *Provider) Manifest() plugins.Manifest {
@@ -122,6 +138,10 @@ func (p *Provider) Configure(cfg map[string]any) error {
 	}
 	if v, ok := getString(cfg, "base_url", "BaseURL"); ok && strings.TrimSpace(v) != "" {
 		trimmed := strings.TrimRight(strings.TrimSpace(v), "/")
+		u, err := url.Parse(trimmed)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("tvdb: invalid base_url %q: must use http or https scheme with host", v)
+		}
 		if trimmed != p.baseURL {
 			p.baseURL = trimmed
 			authChanged = true
@@ -230,6 +250,8 @@ func (p *Provider) FetchMetadata(ctx context.Context, q plugins.MediaQuery) (*pl
 	switch strings.ToLower(strings.TrimSpace(q.ItemType)) {
 	case "series":
 		return p.fetchSeries(ctx, q, tvdbLang)
+	case "season":
+		return p.fetchSeason(ctx, q, tvdbLang)
 	case "episode":
 		return p.fetchEpisode(ctx, q, tvdbLang)
 	case "movie", "":
@@ -303,7 +325,7 @@ func (p *Provider) getToken(ctx context.Context) (string, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := p.client.Do(req)
+	resp, err := p.snapshot().client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -319,7 +341,14 @@ func (p *Provider) getToken(ctx context.Context) (string, error) {
 			Token string `json:"token"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&loginResp); err != nil {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(body) > maxResponseBytes {
+		return "", fmt.Errorf("tvdb login response exceeds %d bytes", maxResponseBytes)
+	}
+	if err := json.Unmarshal(body, &loginResp); err != nil {
 		return "", err
 	}
 	tok := strings.TrimSpace(loginResp.Data.Token)
@@ -362,8 +391,8 @@ func (p *Provider) getJSON(ctx context.Context, endpoint string, params url.Valu
 }
 
 func (p *Provider) doGetJSON(ctx context.Context, token, endpoint string, params url.Values, dst any) error {
-	baseURL := p.snapshot().baseURL
-	reqURL := baseURL + endpoint
+	snap := p.snapshot()
+	reqURL := snap.baseURL + endpoint
 	if len(params) > 0 {
 		reqURL += "?" + params.Encode()
 	}
@@ -374,7 +403,7 @@ func (p *Provider) doGetJSON(ctx context.Context, token, endpoint string, params
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := p.client.Do(req)
+	resp, err := snap.client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -386,7 +415,14 @@ func (p *Provider) doGetJSON(ctx context.Context, token, endpoint string, params
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("tvdb status %d", resp.StatusCode)
 	}
-	return json.NewDecoder(resp.Body).Decode(dst)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(body) > maxResponseBytes {
+		return fmt.Errorf("tvdb response exceeds %d bytes", maxResponseBytes)
+	}
+	return json.Unmarshal(body, dst)
 }
 
 // flexString decodes either a JSON string or a JSON number into a string.
@@ -811,6 +847,110 @@ func (p *Provider) fetchSeries(ctx context.Context, q plugins.MediaQuery, tvdbLa
 	return res, nil
 }
 
+func (p *Provider) fetchSeason(ctx context.Context, q plugins.MediaQuery, tvdbLang string) (*plugins.MetadataResult, error) {
+	if q.SeasonNumber < 0 {
+		return nil, nil
+	}
+	seriesID := providerID(q.ProviderIDs, "Tvdb")
+	if seriesID == "" {
+		if strings.TrimSpace(q.Title) == "" && strings.TrimSpace(q.OriginalTitle) == "" {
+			return nil, nil
+		}
+		var err error
+		seriesID, err = p.searchTVDBWithFallbacks(ctx, "series", q)
+		if err != nil {
+			return nil, err
+		}
+		if seriesID == "" {
+			return nil, nil
+		}
+	}
+
+	var seriesResp struct {
+		Data struct {
+			Seasons []struct {
+				ID     int    `json:"id"`
+				Number int    `json:"number"`
+				Name   string `json:"name"`
+				Image  string `json:"image"`
+				Type   *struct {
+					ID   int    `json:"id"`
+					Type string `json:"type"`
+				} `json:"type"`
+			} `json:"seasons"`
+		} `json:"data"`
+	}
+	if err := p.getJSON(ctx, "/series/"+url.PathEscape(seriesID)+"/extended", nil, &seriesResp); err != nil {
+		return nil, err
+	}
+
+	var matchedID int
+	var fallbackName, fallbackImage string
+	for _, s := range seriesResp.Data.Seasons {
+		if s.Number != q.SeasonNumber {
+			continue
+		}
+		// Prefer official/default season order (type.id == 1 or type.type == "official").
+		isOfficial := s.Type == nil || s.Type.ID == 1 || strings.EqualFold(s.Type.Type, "official")
+		if matchedID == 0 || isOfficial {
+			matchedID = s.ID
+			fallbackName = s.Name
+			fallbackImage = s.Image
+			if isOfficial {
+				break
+			}
+		}
+	}
+	if matchedID <= 0 {
+		return nil, nil
+	}
+
+	seasonIDStr := strconv.Itoa(matchedID)
+	var seasonResp struct {
+		Data struct {
+			ID           int                    `json:"id"`
+			Name         string                 `json:"name"`
+			Overview     string                 `json:"overview"`
+			Image        string                 `json:"image"`
+			Year         flexString             `json:"year"`
+			Artwork      []tvdbArtwork          `json:"artwork"`
+			Translations tvdbInlineTranslations `json:"translations"`
+		} `json:"data"`
+	}
+	if err := p.getJSON(ctx, "/seasons/"+url.PathEscape(seasonIDStr)+"/extended", nil, &seasonResp); err != nil {
+		// Fall back gracefully to summary season info if extended endpoint fails.
+		return &plugins.MetadataResult{
+			Name:        strings.TrimSpace(fallbackName),
+			PosterURL:   strings.TrimSpace(fallbackImage),
+			ProviderIDs: map[string]string{"Tvdb": seasonIDStr},
+		}, nil
+	}
+
+	d := seasonResp.Data
+	defName := strings.TrimSpace(d.Name)
+	if defName == "" {
+		defName = strings.TrimSpace(fallbackName)
+	}
+	trEndpoint := "/seasons/" + url.PathEscape(seasonIDStr) + "/translations/" + url.PathEscape(tvdbLang)
+	name, overview := p.resolveLocalization(ctx, d.Translations, trEndpoint, tvdbLang, defName, d.Overview)
+
+	posterURL := pickArtworkURL(d.Artwork, 7, tvdbLang)
+	if posterURL == "" {
+		posterURL = strings.TrimSpace(d.Image)
+	}
+	if posterURL == "" {
+		posterURL = strings.TrimSpace(fallbackImage)
+	}
+	return &plugins.MetadataResult{
+		Name:          name,
+		OriginalTitle: defName,
+		Overview:      overview,
+		Year:          parseYear(d.Year, ""),
+		PosterURL:     posterURL,
+		ProviderIDs:   map[string]string{"Tvdb": seasonIDStr},
+	}, nil
+}
+
 func (p *Provider) fetchEpisode(ctx context.Context, q plugins.MediaQuery, tvdbLang string) (*plugins.MetadataResult, error) {
 	if q.SeasonNumber <= 0 || q.EpisodeNumber <= 0 {
 		return nil, nil
@@ -830,50 +970,62 @@ func (p *Provider) fetchEpisode(ctx context.Context, q plugins.MediaQuery, tvdbL
 		}
 	}
 
-	params := url.Values{}
-	params.Set("season", strconv.Itoa(q.SeasonNumber))
 	endpoint := "/series/" + url.PathEscape(seriesID) + "/episodes/default"
+	for page := 0; page < maxEpisodePages; page++ {
+		params := url.Values{}
+		params.Set("season", strconv.Itoa(q.SeasonNumber))
+		if page > 0 {
+			params.Set("page", strconv.Itoa(page))
+		}
 
-	var resp struct {
-		Data struct {
-			Episodes []struct {
-				ID           int    `json:"id"`
-				Name         string `json:"name"`
-				Overview     string `json:"overview"`
-				Aired        string `json:"aired"`
-				Image        string `json:"image"`
-				SeasonNumber int    `json:"seasonNumber"`
-				Number       int    `json:"number"`
-			} `json:"episodes"`
-		} `json:"data"`
-	}
-	if err := p.getJSON(ctx, endpoint, params, &resp); err != nil {
-		return nil, err
-	}
+		var resp struct {
+			Data struct {
+				Episodes []struct {
+					ID           int    `json:"id"`
+					Name         string `json:"name"`
+					Overview     string `json:"overview"`
+					Aired        string `json:"aired"`
+					Image        string `json:"image"`
+					SeasonNumber int    `json:"seasonNumber"`
+					Number       int    `json:"number"`
+				} `json:"episodes"`
+			} `json:"data"`
+			Links struct {
+				Next string `json:"next"`
+			} `json:"links"`
+		}
+		if err := p.getJSON(ctx, endpoint, params, &resp); err != nil {
+			return nil, err
+		}
 
-	for _, ep := range resp.Data.Episodes {
-		if ep.SeasonNumber != q.SeasonNumber || ep.Number != q.EpisodeNumber {
-			continue
+		for _, ep := range resp.Data.Episodes {
+			if ep.SeasonNumber != q.SeasonNumber || ep.Number != q.EpisodeNumber {
+				continue
+			}
+			epID := strconv.Itoa(ep.ID)
+			trEndpoint := ""
+			if ep.ID > 0 {
+				trEndpoint = "/episodes/" + url.PathEscape(epID) + "/translations/" + url.PathEscape(tvdbLang)
+			}
+			name, overview := p.resolveLocalization(ctx, tvdbInlineTranslations{}, trEndpoint, tvdbLang, ep.Name, ep.Overview)
+			res := &plugins.MetadataResult{
+				Name:          name,
+				OriginalTitle: strings.TrimSpace(ep.Name),
+				Overview:      overview,
+				Year:          parseYear("", ep.Aired),
+				PremiereDate:  strings.TrimSpace(ep.Aired),
+				PosterURL:     strings.TrimSpace(ep.Image),
+				ProviderIDs:   map[string]string{},
+			}
+			if ep.ID > 0 {
+				res.ProviderIDs["Tvdb"] = epID
+			}
+			return res, nil
 		}
-		epID := strconv.Itoa(ep.ID)
-		trEndpoint := ""
-		if ep.ID > 0 {
-			trEndpoint = "/episodes/" + url.PathEscape(epID) + "/translations/" + url.PathEscape(tvdbLang)
+
+		if len(resp.Data.Episodes) == 0 || strings.TrimSpace(resp.Links.Next) == "" {
+			break
 		}
-		name, overview := p.resolveLocalization(ctx, tvdbInlineTranslations{}, trEndpoint, tvdbLang, ep.Name, ep.Overview)
-		res := &plugins.MetadataResult{
-			Name:          name,
-			OriginalTitle: strings.TrimSpace(ep.Name),
-			Overview:      overview,
-			Year:          parseYear("", ep.Aired),
-			PremiereDate:  strings.TrimSpace(ep.Aired),
-			PosterURL:     strings.TrimSpace(ep.Image),
-			ProviderIDs:   map[string]string{},
-		}
-		if ep.ID > 0 {
-			res.ProviderIDs["Tvdb"] = epID
-		}
-		return res, nil
 	}
 	return nil, nil
 }

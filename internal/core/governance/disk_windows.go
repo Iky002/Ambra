@@ -35,7 +35,7 @@ func collectDiskHealth(path string) DiskHealth {
 	out.TotalBytes = totalBytes
 	out.FreeBytes = totalFreeBytes
 	out.AvailableBytes = freeBytesAvailable
-	if out.TotalBytes > 0 {
+	if out.TotalBytes > 0 && out.TotalBytes >= out.FreeBytes {
 		used := out.TotalBytes - out.FreeBytes
 		pct := float64(used) / float64(out.TotalBytes) * 100
 		out.UsedPercent = math.Round(pct*10) / 10

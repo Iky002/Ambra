@@ -14,7 +14,10 @@ import (
 )
 
 // DefaultDebounce is the default debounce window for coalescing bursts of filesystem events.
-const DefaultDebounce = 3 * time.Second
+const (
+	DefaultDebounce = 3 * time.Second
+	maxWatchedDirs  = 10_000
+)
 
 // ChangeHandler is invoked after debouncing with the libraryID and deduplicated changed paths.
 type ChangeHandler func(ctx context.Context, libraryID string, paths []string)
@@ -232,16 +235,30 @@ func (w *Watcher) handleEvent(ev fsnotify.Event) {
 		w.mu.Unlock()
 		return
 	}
+	w.mu.Unlock()
 
-	// Dynamically manage subdirectory watches.
+	// Collect subdirectories outside w.mu so filesystem traversal never blocks other watcher operations.
+	var subdirs []string
 	if ev.Op&fsnotify.Create != 0 {
 		if info, err := os.Stat(cleanPath); err == nil && info.IsDir() {
-			var subdirs []string
 			collectDirsSafe(cleanPath, make(map[string]struct{}), &subdirs)
-			for _, d := range subdirs {
-				_ = w.addDirLocked(libID, d)
-			}
 		}
+	}
+
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return
+	}
+	// Re-verify library association under lock.
+	if curLib := w.lookupLibraryLocked(cleanPath); curLib == "" {
+		w.mu.Unlock()
+		return
+	} else {
+		libID = curLib
+	}
+	for _, d := range subdirs {
+		_ = w.addDirLocked(libID, d)
 	}
 	if ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
 		w.removeDirTreeLocked(libID, cleanPath)
@@ -273,6 +290,9 @@ func (w *Watcher) lookupLibraryLocked(path string) string {
 func (w *Watcher) addDirLocked(libraryID, dir string) error {
 	if _, exists := w.dirToLib[dir]; exists {
 		return nil
+	}
+	if len(w.dirToLib) >= maxWatchedDirs {
+		return fmt.Errorf("watcher: max watched directories limit (%d) reached", maxWatchedDirs)
 	}
 	if err := w.fsw.Add(dir); err != nil {
 		return err
@@ -341,16 +361,21 @@ func (w *Watcher) flush(libraryID string) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	w.wg.Add(1)
 	w.mu.Unlock()
+	defer w.wg.Done()
 
 	if cb != nil && len(paths) > 0 && ctx.Err() == nil {
 		cb(ctx, libraryID, paths)
 	}
 }
 
-// collectDirsSafe recursively collects all non-hidden directories under root,
+// collectDirsSafe recursively collects all non-hidden directories under root (up to maxWatchedDirs),
 // using Unix (Dev, Ino) deduplication with real-path fallback to prevent symlink loops.
 func collectDirsSafe(root string, visited map[string]struct{}, out *[]string) {
+	if len(*out) >= maxWatchedDirs {
+		return
+	}
 	info, err := os.Stat(root)
 	if err != nil || !info.IsDir() {
 		return
@@ -367,6 +392,9 @@ func collectDirsSafe(root string, visited map[string]struct{}, out *[]string) {
 		return
 	}
 	for _, entry := range entries {
+		if len(*out) >= maxWatchedDirs {
+			return
+		}
 		if strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}

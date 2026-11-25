@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -254,4 +256,103 @@ func TestUIViewConcurrentRaceFree(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestOpsSecurityHardeningV0103(t *testing.T) {
+	h, mux, _, cfg, _ := setupOpsTest(t)
+	authMW := middleware.NewAuth(nil, nil)
+	authMux := http.NewServeMux()
+	h.RegisterRoutes(authMux, AuthFuncs{
+		RequireAuth:  authMW.RequireAuth,
+		RequireAdmin: authMW.RequireAdmin,
+	})
+
+	host := makeAuthCtx("host-1", "host", false)
+	guest := makeAuthCtx("guest-1", "guest", false)
+	admin := makeAuthCtx("admin-1", "admin", true)
+
+	// 1. GET /Connect/Pending requires admin
+	if r := doAuthReq(t, authMux, guest, http.MethodGet, "/Connect/Pending", nil); r.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-admin GET /Connect/Pending, got %d", r.Code)
+	}
+	if r := doAuthReq(t, authMux, admin, http.MethodGet, "/Connect/Pending", nil); r.Code != http.StatusOK {
+		t.Fatalf("expected 200 for admin GET /Connect/Pending, got %d", r.Code)
+	}
+
+	// 2. POST /Startup/User rejects empty password
+	if r := doReq(t, mux, http.MethodPost, "/Startup/User", map[string]any{"Name": "admin", "Password": "   "}); r.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for empty password on /Startup/User, got %d", r.Code)
+	}
+
+	// 3. Private party requires matching InviteCode, validates PlaybackRate, auto-cleans when empty
+	rec := doAuthReq(t, authMux, host, http.MethodPost, "/Parties", map[string]any{
+		"Name":       "Secret Room",
+		"InviteCode": "XYZ123",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create private party: %d", rec.Code)
+	}
+	var p Party
+	_ = json.Unmarshal(rec.Body.Bytes(), &p)
+	if p.IsPublic {
+		t.Fatalf("expected IsPublic=false when InviteCode set")
+	}
+	if r := doAuthReq(t, authMux, guest, http.MethodPost, "/Parties/"+p.Id+"/Join", map[string]any{"InviteCode": "WRONG"}); r.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for wrong InviteCode, got %d", r.Code)
+	}
+	if r := doAuthReq(t, authMux, guest, http.MethodPost, "/Parties/"+p.Id+"/Join", map[string]any{"InviteCode": "XYZ123"}); r.Code != http.StatusOK {
+		t.Fatalf("expected 200 for valid InviteCode, got %d", r.Code)
+	}
+	if r := doAuthReq(t, authMux, host, http.MethodPost, "/Parties/"+p.Id+"/State", map[string]any{"PlaybackRate": 9.9}); r.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for out-of-range PlaybackRate, got %d", r.Code)
+	}
+	// Both leave -> empty party automatically deleted
+	_ = doAuthReq(t, authMux, guest, http.MethodPost, "/Parties/"+p.Id+"/Leave", nil)
+	_ = doAuthReq(t, authMux, host, http.MethodPost, "/Parties/"+p.Id+"/Leave", nil)
+	if r := doAuthReq(t, authMux, admin, http.MethodGet, "/Parties/"+p.Id, nil); r.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 after all members left party, got %d", r.Code)
+	}
+
+	// 4. Webhook secret redacted in responses and preserved on update with empty secret
+	whRec := doReq(t, mux, http.MethodPost, "/Webhooks", map[string]any{
+		"Url":     "https://93.184.216.34/hook",
+		"Secret":  "my-super-secret",
+		"Enabled": true,
+	})
+	if whRec.Code != http.StatusOK {
+		t.Fatalf("create webhook: %d %s", whRec.Code, whRec.Body.String())
+	}
+	var whResp WebhookConfig
+	_ = json.Unmarshal(whRec.Body.Bytes(), &whResp)
+	if whResp.Secret != "" || !whResp.HasSecret {
+		t.Fatalf("expected Secret redacted & HasSecret=true, got %+v", whResp)
+	}
+	// Update with empty secret keeps old secret
+	_ = doReq(t, mux, http.MethodPost, "/Webhooks", map[string]any{
+		"Id":      whResp.Id,
+		"Name":    "Renamed",
+		"Url":     "https://93.184.216.34/hook",
+		"Secret":  "",
+		"Enabled": true,
+	})
+	h.mu.RLock()
+	storedSecret := h.state.Webhooks[0].Secret
+	h.mu.RUnlock()
+	if storedSecret != "my-super-secret" {
+		t.Fatalf("expected secret preserved on empty update, got %q", storedSecret)
+	}
+
+	// 5. Restore rejects symlinks and non-SQLite files
+	bDir := h.backupsDir()
+	_ = os.MkdirAll(bDir, 0o700)
+	badFile := filepath.Join(bDir, "not-sqlite.db")
+	_ = os.WriteFile(badFile, []byte("plain text not sqlite"), 0o600)
+	if r := doReq(t, mux, http.MethodPost, "/BackupRestore/Restore", map[string]any{"Name": "not-sqlite.db"}); r.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-SQLite backup restore, got %d", r.Code)
+	}
+	symPath := filepath.Join(bDir, "link.db")
+	_ = os.Symlink(cfg.DBPath(), symPath)
+	if r := doReq(t, mux, http.MethodPost, "/BackupRestore/Restore", map[string]any{"Name": "link.db"}); r.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for symlink backup restore, got %d", r.Code)
+	}
 }

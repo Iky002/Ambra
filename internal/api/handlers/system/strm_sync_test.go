@@ -50,7 +50,7 @@ func TestHotSyncEnableSTRM302ToBuiltinPlugin(t *testing.T) {
 	reg.Register(strmPlugin)
 
 	strmFile := filepath.Join(tmp, "movie.strm")
-	if err := os.WriteFile(strmFile, []byte("https://cdn.example.com/movie.mkv\n"), 0o644); err != nil {
+	if err := os.WriteFile(strmFile, []byte("https://93.184.216.34/movie.mkv\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

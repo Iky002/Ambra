@@ -113,6 +113,7 @@ func newTMDBTestEnv(t *testing.T) (*testEnv, *httptest.Server, []byte, []byte) {
 	repo := sqlite.NewLibraryRepo(store)
 	reg := plugins.NewRegistry()
 	tp := tmdb.New("test-key", "zh-CN")
+	tp.SetHTTPClient(srv.Client())
 	_ = tp.Configure(map[string]any{
 		"base_url":       srv.URL,
 		"image_base_url": srv.URL,

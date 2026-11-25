@@ -25,19 +25,27 @@ export function AddToCollectionModal({
   onClose,
   onSuccess,
 }: AddToCollectionModalProps) {
-  const { auth } = useAuth()
+  const { auth, isAdmin } = useAuth()
   const queryClient = useQueryClient()
   const userId = auth?.userId || ''
 
-  const [activeTab, setActiveTab] = useState<ContainerTab>('BoxSet')
+  const [activeTab, setActiveTab] = useState<ContainerTab>(() => (isAdmin ? 'BoxSet' : 'Playlist'))
   const [newName, setNewName] = useState('')
   const [error, setError] = useState<string | null>(null)
+
+  const effectiveTab: ContainerTab = isAdmin ? activeTab : 'Playlist'
+
+  useEffect(() => {
+    if (!isAdmin && activeTab === 'BoxSet') {
+      setActiveTab('Playlist')
+    }
+  }, [isAdmin, activeTab])
 
   useEffect(() => {
     if (!open) return
     setNewName('')
     setError(null)
-  }, [open, activeTab])
+  }, [open, effectiveTab])
 
   const { data: boxSetsData, isLoading: boxSetsLoading } = useQuery({
     queryKey: ['collections', userId, 'BoxSet'],
@@ -49,7 +57,7 @@ export function AddToCollectionModal({
         sortOrder: 'Ascending',
         limit: 100,
       }),
-    enabled: Boolean(open && userId),
+    enabled: Boolean(open && userId && isAdmin),
   })
 
   const { data: playlistsData, isLoading: playlistsLoading } = useQuery({
@@ -75,7 +83,7 @@ export function AddToCollectionModal({
   const addExistingMutation = useMutation({
     mutationFn: async (target: BaseItemDto) => {
       if (itemIds.length === 0) return target
-      if (activeTab === 'BoxSet') {
+      if (effectiveTab === 'BoxSet') {
         await api.addCollectionItems(target.Id, itemIds)
       } else {
         await api.addPlaylistItems(target.Id, itemIds, userId)
@@ -84,7 +92,7 @@ export function AddToCollectionModal({
     },
     onSuccess: async (target) => {
       await invalidateCollections()
-      const kind = activeTab === 'BoxSet' ? '合集' : '播放列表'
+      const kind = effectiveTab === 'BoxSet' ? '合集' : '播放列表'
       onSuccess?.(`已将 ${itemIds.length} 项加入${kind}「${target.Name}」`)
       onClose()
     },
@@ -95,14 +103,14 @@ export function AddToCollectionModal({
 
   const createMutation = useMutation({
     mutationFn: async (name: string) => {
-      if (activeTab === 'BoxSet') {
+      if (effectiveTab === 'BoxSet') {
         return api.createCollection(name, itemIds)
       }
       return api.createPlaylist(name, userId, itemIds, mediaType)
     },
     onSuccess: async (created) => {
       await invalidateCollections()
-      const kind = activeTab === 'BoxSet' ? '合集' : '播放列表'
+      const kind = effectiveTab === 'BoxSet' ? '合集' : '播放列表'
       onSuccess?.(`已新建${kind}「${created.Name}」并加入 ${itemIds.length} 项`)
       onClose()
     },
@@ -111,15 +119,15 @@ export function AddToCollectionModal({
     },
   })
 
-  const list = activeTab === 'BoxSet' ? boxSetsData?.Items || [] : playlistsData?.Items || []
-  const isLoading = activeTab === 'BoxSet' ? boxSetsLoading : playlistsLoading
+  const list = effectiveTab === 'BoxSet' ? boxSetsData?.Items || [] : playlistsData?.Items || []
+  const isLoading = effectiveTab === 'BoxSet' ? boxSetsLoading : playlistsLoading
   const isBusy = addExistingMutation.isPending || createMutation.isPending
 
   const handleCreateSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     const trimmed = newName.trim()
     if (!trimmed) {
-      setError(activeTab === 'BoxSet' ? '请输入新合集名称' : '请输入新播放列表名称')
+      setError(effectiveTab === 'BoxSet' ? '请输入新合集名称' : '请输入新播放列表名称')
       return
     }
     if (itemIds.length === 0) {
@@ -133,7 +141,7 @@ export function AddToCollectionModal({
   return (
     <AdminModal
       open={open}
-      title="加入合集 / 播放列表"
+      title={isAdmin ? '加入合集 / 播放列表' : '加入播放列表'}
       subtitle={`目标媒体：${itemLabel}`}
       maxWidthClass="max-w-lg"
       onClose={onClose}
@@ -141,46 +149,48 @@ export function AddToCollectionModal({
       <div className="space-y-4">
         <FeedbackBanner message={error ?? undefined} type="error" onClose={() => setError(null)} />
 
-        {/* 合集 / 播放列表切换 */}
-        <div
-          role="tablist"
-          aria-label="目标容器类型"
-          className="grid grid-cols-2 gap-1 rounded-xl border border-white/10 bg-zinc-950/80 p-1"
-        >
-          <button
-            type="button"
-            role="tab"
-            aria-selected={activeTab === 'BoxSet'}
-            onClick={() => setActiveTab('BoxSet')}
-            className={`inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition-colors ${
-              activeTab === 'BoxSet'
-                ? 'bg-amber-500 text-zinc-950 shadow-sm'
-                : 'text-zinc-400 hover:bg-white/[0.05] hover:text-zinc-100'
-            }`}
+        {/* 合集 / 播放列表切换（仅管理员可操作 BoxSet 合集） */}
+        {isAdmin && (
+          <div
+            role="tablist"
+            aria-label="目标容器类型"
+            className="grid grid-cols-2 gap-1 rounded-xl border border-white/10 bg-zinc-950/80 p-1"
           >
-            <Layers className="h-3.5 w-3.5" />
-            <span>合集 (BoxSet)</span>
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={activeTab === 'Playlist'}
-            onClick={() => setActiveTab('Playlist')}
-            className={`inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition-colors ${
-              activeTab === 'Playlist'
-                ? 'bg-amber-500 text-zinc-950 shadow-sm'
-                : 'text-zinc-400 hover:bg-white/[0.05] hover:text-zinc-100'
-            }`}
-          >
-            <ListVideo className="h-3.5 w-3.5" />
-            <span>播放列表 (Playlist)</span>
-          </button>
-        </div>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={effectiveTab === 'BoxSet'}
+              onClick={() => setActiveTab('BoxSet')}
+              className={`inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition-colors ${
+                effectiveTab === 'BoxSet'
+                  ? 'bg-amber-500 text-zinc-950 shadow-sm'
+                  : 'text-zinc-400 hover:bg-white/[0.05] hover:text-zinc-100'
+              }`}
+            >
+              <Layers className="h-3.5 w-3.5" />
+              <span>合集 (BoxSet)</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={effectiveTab === 'Playlist'}
+              onClick={() => setActiveTab('Playlist')}
+              className={`inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition-colors ${
+                effectiveTab === 'Playlist'
+                  ? 'bg-amber-500 text-zinc-950 shadow-sm'
+                  : 'text-zinc-400 hover:bg-white/[0.05] hover:text-zinc-100'
+              }`}
+            >
+              <ListVideo className="h-3.5 w-3.5" />
+              <span>播放列表 (Playlist)</span>
+            </button>
+          </div>
+        )}
 
         {/* 选择现有容器 */}
         <div className="space-y-2">
           <p className="text-xs font-medium text-zinc-400">
-            选择现有{activeTab === 'BoxSet' ? '合集' : '播放列表'}
+            选择现有{effectiveTab === 'BoxSet' ? '合集' : '播放列表'}
           </p>
           <div className="max-h-56 space-y-1.5 overflow-y-auto pr-1">
             {isLoading ? (
@@ -189,7 +199,7 @@ export function AddToCollectionModal({
               </div>
             ) : list.length === 0 ? (
               <div className="rounded-xl border border-dashed border-white/10 bg-white/[0.02] py-6 text-center text-xs text-zinc-500">
-                暂无现有{activeTab === 'BoxSet' ? '合集' : '播放列表'}，可在下方直接新建
+                暂无现有{effectiveTab === 'BoxSet' ? '合集' : '播放列表'}，可在下方直接新建
               </div>
             ) : (
               list.map((target) => (
@@ -204,7 +214,7 @@ export function AddToCollectionModal({
                   className="flex w-full items-center justify-between gap-3 rounded-xl border border-white/8 bg-white/[0.03] px-3.5 py-2.5 text-left transition-colors hover:border-amber-400/50 hover:bg-amber-500/10 disabled:opacity-50"
                 >
                   <div className="flex min-w-0 items-center gap-2.5">
-                    {activeTab === 'BoxSet' ? (
+                    {effectiveTab === 'BoxSet' ? (
                       <Layers className="h-4 w-4 shrink-0 text-amber-400" />
                     ) : (
                       <ListVideo className="h-4 w-4 shrink-0 text-amber-400" />
@@ -227,7 +237,7 @@ export function AddToCollectionModal({
         {/* 新建并加入 */}
         <form onSubmit={handleCreateSubmit} className="space-y-2 border-t border-white/8 pt-4">
           <label htmlFor="new-collection-name" className="block text-xs font-medium text-zinc-400">
-            或新建{activeTab === 'BoxSet' ? '合集' : '播放列表'}并加入
+            或新建{effectiveTab === 'BoxSet' ? '合集' : '播放列表'}并加入
           </label>
           <div className="flex items-center gap-2">
             <input
@@ -239,7 +249,7 @@ export function AddToCollectionModal({
                 if (error) setError(null)
               }}
               placeholder={
-                activeTab === 'BoxSet' ? '输入新合集名称...' : '输入新播放列表名称...'
+                effectiveTab === 'BoxSet' ? '输入新合集名称...' : '输入新播放列表名称...'
               }
               className="flex-1 rounded-xl border border-white/10 bg-zinc-900/90 px-3.5 py-2 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
             />

@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/plugins"
 )
 
@@ -20,7 +21,7 @@ const (
 	defaultTimeout          = 5 * time.Second
 	defaultFailureThreshold = 3
 	defaultResetTimeout     = 30 * time.Second
-	maxResponseBytes        = 4 << 20 // 4 MiB
+	maxResponseBytes        = 16 << 20 // 16 MiB
 )
 
 // ErrCircuitOpen is returned when the plugin's circuit breaker is tripped.
@@ -101,11 +102,21 @@ func NewHTTPPlugin(m ExternalManifest) (*HTTPPlugin, error) {
 		priority:         m.Priority,
 		kinds:            kinds,
 		timeout:          timeout,
-		client:           &http.Client{Timeout: timeout},
+		client:           netutil.NewSafeHTTPClient(timeout, true),
 		failureThreshold: defaultFailureThreshold,
 		resetTimeout:     defaultResetTimeout,
 		nowFunc:          time.Now,
 	}, nil
+}
+
+// SetHTTPClient overrides the HTTP client used for external plugin requests (useful in tests).
+func (p *HTTPPlugin) SetHTTPClient(c *http.Client) {
+	if c == nil {
+		return
+	}
+	p.mu.Lock()
+	p.client = c
+	p.mu.Unlock()
 }
 
 // Manifest returns the current plugin manifest.
@@ -158,7 +169,7 @@ func (p *HTTPPlugin) Configure(cfg map[string]any) error {
 			return errors.New("TimeoutMs must be positive")
 		}
 		p.timeout = time.Duration(tms) * time.Millisecond
-		p.client = &http.Client{Timeout: p.timeout}
+		p.client = netutil.NewSafeHTTPClient(p.timeout, true)
 	}
 	return nil
 }

@@ -57,7 +57,7 @@ func TestAmbraEndToEndEmbyCompatibility(t *testing.T) {
 
 	// Create sample STRM movie
 	strmDir := filepath.Join(mediaDir, "Cloud Movie (2024)")
-	if err := os.WriteFile(filepath.Join(strmDir, "Cloud Movie (2024).strm"), []byte("https://cdn.example.com/cloud-movie.mkv\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(strmDir, "Cloud Movie (2024).strm"), []byte("https://93.184.216.34/cloud-movie.mkv\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -262,7 +262,7 @@ func TestAmbraEndToEndEmbyCompatibility(t *testing.T) {
 	resp = doAuth(http.MethodGet, "/emby/Videos/"+strmMovieID+"/stream", nil)
 	loc := resp.Header.Get("Location")
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusFound || loc != "https://cdn.example.com/cloud-movie.mkv" {
+	if resp.StatusCode != http.StatusFound || loc != "https://93.184.216.34/cloud-movie.mkv" {
 		t.Fatalf("expected 302 redirect to CDN URL, got status=%d location=%q", resp.StatusCode, loc)
 	}
 

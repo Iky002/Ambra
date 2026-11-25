@@ -1,14 +1,16 @@
 package migration
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	coremigration "github.com/ambra-media/ambra/internal/core/migration"
 )
+
+const maxUpstreamErrorBytes = 512
 
 // AuthFuncs decouples route registration from the concrete middleware package.
 type AuthFuncs struct {
@@ -58,7 +60,7 @@ type testRequest struct {
 
 func (h *Handler) handleTest(w http.ResponseWriter, r *http.Request) {
 	var req testRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid JSON request body")
 		return
 	}
@@ -77,7 +79,7 @@ func (h *Handler) handleTest(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleDryRun(w http.ResponseWriter, r *http.Request) {
 	var req coremigration.MigrationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid JSON request body")
 		return
 	}
@@ -92,7 +94,7 @@ func (h *Handler) handleDryRun(w http.ResponseWriter, r *http.Request) {
 		writeMigrationError(w, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, report)
+	httpx.JSON(w, http.StatusOK, sanitizeReportPtr(report))
 }
 
 type startRequest struct {
@@ -102,7 +104,7 @@ type startRequest struct {
 
 func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 	var req startRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid JSON request body")
 		return
 	}
@@ -124,7 +126,7 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 			writeMigrationError(w, err)
 			return
 		}
-		httpx.JSON(w, http.StatusOK, report)
+		httpx.JSON(w, http.StatusOK, sanitizeReportPtr(report))
 		return
 	}
 
@@ -133,39 +135,84 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 		writeMigrationError(w, err)
 		return
 	}
-	httpx.JSON(w, http.StatusAccepted, status)
+	httpx.JSON(w, http.StatusAccepted, sanitizeReport(status))
 }
 
 func (h *Handler) handleStatus(w http.ResponseWriter, _ *http.Request) {
-	httpx.JSON(w, http.StatusOK, h.migrator.Status())
+	httpx.JSON(w, http.StatusOK, sanitizeReport(h.migrator.Status()))
 }
 
 func (h *Handler) handleCancel(w http.ResponseWriter, _ *http.Request) {
 	cancelled := h.migrator.Cancel()
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"cancelled": cancelled,
-		"report":    h.migrator.Status(),
+		"report":    sanitizeReport(h.migrator.Status()),
 	})
+}
+
+func stripURLUserinfo(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return trimmed
+	}
+	if u.User != nil {
+		u.User = nil
+	}
+	return u.String()
+}
+
+func truncateErrorMsg(msg string, maxBytes int) string {
+	if len(msg) <= maxBytes {
+		return msg
+	}
+	if maxBytes <= 3 {
+		return msg[:maxBytes]
+	}
+	return msg[:maxBytes-3] + "..."
+}
+
+func sanitizeReportPtr(rep *coremigration.MigrationReport) *coremigration.MigrationReport {
+	if rep == nil {
+		return nil
+	}
+	clean := sanitizeReport(*rep)
+	return &clean
+}
+
+func sanitizeReport(rep coremigration.MigrationReport) coremigration.MigrationReport {
+	rep.SourceURL = stripURLUserinfo(rep.SourceURL)
+	if len(rep.Errors) > 0 {
+		errs := make([]string, len(rep.Errors))
+		for i, e := range rep.Errors {
+			errs[i] = truncateErrorMsg(e, maxUpstreamErrorBytes)
+		}
+		rep.Errors = errs
+	}
+	return rep
 }
 
 func writeMigrationError(w http.ResponseWriter, err error) {
 	if errors.Is(err, coremigration.ErrMigrationRunning) {
-		httpx.Error(w, http.StatusConflict, err.Error())
+		httpx.Error(w, http.StatusConflict, truncateErrorMsg(err.Error(), maxUpstreamErrorBytes))
 		return
 	}
 	var apiErr *coremigration.APIError
 	if errors.As(err, &apiErr) {
 		if apiErr.StatusCode == http.StatusUnauthorized || apiErr.StatusCode == http.StatusForbidden {
-			httpx.Error(w, http.StatusBadGateway, "source Emby rejected credentials: "+apiErr.Error())
+			httpx.Error(w, http.StatusBadGateway, truncateErrorMsg("source Emby rejected credentials: "+apiErr.Error(), maxUpstreamErrorBytes))
 			return
 		}
-		httpx.Error(w, http.StatusBadGateway, apiErr.Error())
+		httpx.Error(w, http.StatusBadGateway, truncateErrorMsg(apiErr.Error(), maxUpstreamErrorBytes))
 		return
 	}
 	if strings.Contains(err.Error(), "invalid source server URL") ||
 		strings.Contains(err.Error(), "is required") {
-		httpx.Error(w, http.StatusBadRequest, err.Error())
+		httpx.Error(w, http.StatusBadRequest, truncateErrorMsg(err.Error(), maxUpstreamErrorBytes))
 		return
 	}
-	httpx.Error(w, http.StatusBadGateway, err.Error())
+	httpx.Error(w, http.StatusBadGateway, truncateErrorMsg(err.Error(), maxUpstreamErrorBytes))
 }

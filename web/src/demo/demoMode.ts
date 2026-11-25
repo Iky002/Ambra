@@ -1,3 +1,5 @@
+export const DEMO_AUTH_STORAGE_KEY = 'ambra_demo_auth_v1'
+
 let demoModeOverride: boolean | null = null
 
 /**
@@ -11,7 +13,7 @@ export function setDemoModeOverride(override: boolean | null): void {
 /**
  * 判断当前是否处于 Serverless Demo 模式：
  * 1. 构建时环境变量 VITE_DEMO_MODE === 'true'
- * 2. 浏览器 URL 查询参数含 ?demo=1 或 ?demo=true（兼容 HashRouter 如 #/?demo=1）
+ * 2. 仅当 VITE_DEMO_MODE === 'true' 或开发模式 (DEV) 时，允许通过浏览器 URL 参数 ?demo=1 / ?demo=true 开启（兼容 HashRouter 如 #/?demo=1）
  */
 export function isDemoMode(): boolean {
   if (demoModeOverride !== null) {
@@ -22,7 +24,10 @@ export function isDemoMode(): boolean {
     return true
   }
 
-  if (typeof window !== 'undefined') {
+  const allowUrlDemoToggle =
+    import.meta.env.VITE_DEMO_MODE === 'true' || Boolean(import.meta.env.DEV)
+
+  if (allowUrlDemoToggle && typeof window !== 'undefined') {
     try {
       const searchParams = new URLSearchParams(window.location.search)
       const q = searchParams.get('demo')

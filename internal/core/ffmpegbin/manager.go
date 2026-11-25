@@ -13,12 +13,25 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 )
+
+const maxStaticBinarySize = 256 << 20 // 256 MiB
 
 var (
 	executablePathFn = os.Executable
-	downloadClient   = &http.Client{Timeout: 5 * time.Minute}
+	downloadClient   = netutil.NewSafeHTTPClient(5*time.Minute, false)
 )
+
+func isAllowedStaticBinaryName(name string) bool {
+	switch name {
+	case "ffmpeg", "ffprobe", "ffmpeg.exe", "ffprobe.exe":
+		return true
+	default:
+		return false
+	}
+}
 
 // ResolveOptions configures how ffmpeg and ffprobe binary paths are resolved.
 type ResolveOptions struct {
@@ -187,6 +200,14 @@ func DownloadStatic(ctx context.Context, targetDir, rawURL string) (string, erro
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		return "", fmt.Errorf("ffmpegbin: invalid download url %q", rawURL)
 	}
+	fileName := path.Base(parsed.Path)
+	if fileName == "" || fileName == "." || fileName == "/" {
+		fileName = binaryName("ffmpeg", runtime.GOOS)
+	}
+	if !isAllowedStaticBinaryName(fileName) {
+		return "", fmt.Errorf("ffmpegbin: disallowed binary name %q", fileName)
+	}
+
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -209,19 +230,18 @@ func DownloadStatic(ctx context.Context, targetDir, rawURL string) (string, erro
 		return "", fmt.Errorf("ffmpegbin: create target directory: %w", err)
 	}
 
-	fileName := path.Base(parsed.Path)
-	if fileName == "" || fileName == "." || fileName == "/" {
-		fileName = binaryName("ffmpeg", runtime.GOOS)
-	}
 	dest := filepath.Join(targetDir, fileName)
 
 	if err := atomicWriteExecutable(targetDir, dest, fileName, func(w io.Writer) (int64, error) {
-		n, copyErr := io.Copy(w, resp.Body)
+		n, copyErr := io.Copy(w, io.LimitReader(resp.Body, maxStaticBinarySize+1))
 		if copyErr != nil {
 			return n, copyErr
 		}
 		if n == 0 {
 			return 0, errors.New("ffmpegbin: downloaded file is empty")
+		}
+		if n > maxStaticBinarySize {
+			return n, fmt.Errorf("ffmpegbin: downloaded binary exceeds max size of %d bytes", maxStaticBinarySize)
 		}
 		return n, nil
 	}); err != nil {

@@ -694,4 +694,38 @@ describe('StreamMkvRemuxer Controller (Range + MSE + Seek + Dispose)', () => {
     ).rejects.toThrow(StreamMkvFallbackError)
     remuxer.dispose()
   })
+
+  it('rejects oversized HTTP 200 non-Range response and revokes objectUrl on attach failure', async () => {
+    const { createdUrls, revokedUrls } = installMockMSE()
+
+    let cancelled = false
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(new Uint8Array(256 * 1024))
+      },
+      cancel() {
+        cancelled = true
+      },
+    })
+    const mockFetch = vi.fn(async () => {
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          'Content-Length': String(100 * 1024 * 1024),
+        },
+      })
+    }) as unknown as typeof fetch
+
+    const videoEl = document.createElement('video')
+    const remuxer = new StreamMkvRemuxer()
+    await expect(
+      remuxer.attach(videoEl, '/emby/Videos/3/stream', {}, {
+        fetchImpl: mockFetch,
+        initialHeaderBytes: 64 * 1024,
+      }),
+    ).rejects.toThrow(StreamMkvFallbackError)
+
+    expect(cancelled).toBe(true)
+    expect(revokedUrls).toEqual(createdUrls)
+  })
 })

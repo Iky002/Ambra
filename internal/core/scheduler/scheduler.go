@@ -7,10 +7,18 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
+)
+
+const (
+	ticksPerSecond               = 10_000_000
+	defaultSchedulerTickInterval = 15 * time.Second
+	transcodeCleanMinAge         = 2 * time.Hour
 )
 
 var (
@@ -79,28 +87,174 @@ type TaskDefinition struct {
 }
 
 type managedTask struct {
-	def      TaskDefinition
-	state    TaskState
-	progress *float64
-	lastRes  *TaskResult
-	cancel   context.CancelFunc
-	doneCh   chan struct{}
+	def             TaskDefinition
+	state           TaskState
+	progress        *float64
+	lastRes         *TaskResult
+	cancel          context.CancelFunc
+	doneCh          chan struct{}
+	createdAt       time.Time
+	lastScheduledAt time.Time
 }
 
 // Manager orchestrates scheduled and manually-triggered background tasks.
 type Manager struct {
-	mu           sync.RWMutex
-	tasks        map[string]*managedTask
-	bus          *eventbus.Bus
-	loadTriggers func(ctx context.Context) (map[string][]TaskTriggerInfo, error)
-	saveTriggers func(ctx context.Context, triggers map[string][]TaskTriggerInfo) error
+	mu                    sync.RWMutex
+	triggerMu             sync.Mutex
+	tasks                 map[string]*managedTask
+	bus                   *eventbus.Bus
+	loadTriggers          func(ctx context.Context) (map[string][]TaskTriggerInfo, error)
+	saveTriggers          func(ctx context.Context, triggers map[string][]TaskTriggerInfo) error
+	activeTranscodeDirsFn func() []string
+	tickInterval          time.Duration
+	nowFn                 func() time.Time
+	started               atomic.Bool
 }
 
 func New(bus *eventbus.Bus) *Manager {
 	return &Manager{
-		tasks: make(map[string]*managedTask),
-		bus:   bus,
+		tasks:        make(map[string]*managedTask),
+		bus:          bus,
+		tickInterval: defaultSchedulerTickInterval,
+		nowFn:        time.Now,
 	}
+}
+
+// SetActiveTranscodeDirsFn registers a callback returning active transcoding session directories
+// so CleanTranscodeCache never deletes directories currently in use.
+func (m *Manager) SetActiveTranscodeDirsFn(fn func() []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.activeTranscodeDirsFn = fn
+}
+
+// SetTickInterval configures how frequently Start polls task triggers (defaults to 15s).
+func (m *Manager) SetTickInterval(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tickInterval = d
+}
+
+// Start launches the background scheduling loop that periodically evaluates IntervalTrigger,
+// DailyTrigger, and WeeklyTrigger definitions and executes due tasks until ctx is cancelled.
+func (m *Manager) Start(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !m.started.CompareAndSwap(false, true) {
+		return
+	}
+	m.mu.RLock()
+	interval := m.tickInterval
+	m.mu.RUnlock()
+	if interval <= 0 {
+		interval = defaultSchedulerTickInterval
+	}
+
+	go func() {
+		defer m.started.Store(false)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				m.evaluateAndRunDue()
+			}
+		}
+	}()
+}
+
+func (m *Manager) evaluateAndRunDue() {
+	m.mu.RLock()
+	nowFn := m.nowFn
+	m.mu.RUnlock()
+	now := nowFn()
+
+	var dueIDs []string
+	m.mu.Lock()
+	for _, mt := range m.tasks {
+		if mt.state != StateIdle {
+			continue
+		}
+		if taskIsDueLocked(mt, now) {
+			mt.lastScheduledAt = now
+			dueIDs = append(dueIDs, mt.def.ID)
+		}
+	}
+	m.mu.Unlock()
+
+	for _, id := range dueIDs {
+		_ = m.Run(id)
+	}
+}
+
+func taskIsDueLocked(mt *managedTask, now time.Time) bool {
+	lastRun := mt.lastScheduledAt
+	if mt.lastRes != nil && mt.lastRes.EndTimeUtc.After(lastRun) {
+		lastRun = mt.lastRes.EndTimeUtc
+	}
+	for _, tr := range mt.def.Triggers {
+		switch strings.TrimSpace(tr.Type) {
+		case "IntervalTrigger":
+			if tr.IntervalTicks == nil || *tr.IntervalTicks <= 0 {
+				continue
+			}
+			interval := ticksToDuration(*tr.IntervalTicks)
+			if interval <= 0 {
+				continue
+			}
+			anchor := lastRun
+			if anchor.IsZero() {
+				anchor = mt.createdAt
+			}
+			if now.Sub(anchor) >= interval {
+				return true
+			}
+		case "DailyTrigger":
+			if tr.TimeOfDayTicks == nil || *tr.TimeOfDayTicks < 0 {
+				continue
+			}
+			scheduled := dailyTriggerTime(now, *tr.TimeOfDayTicks)
+			if !now.Before(scheduled) && now.Sub(scheduled) < 5*time.Minute && lastRun.Before(scheduled) {
+				return true
+			}
+		case "WeeklyTrigger":
+			if tr.TimeOfDayTicks == nil || *tr.TimeOfDayTicks < 0 {
+				continue
+			}
+			if !strings.EqualFold(strings.TrimSpace(tr.DayOfWeek), now.Weekday().String()) {
+				continue
+			}
+			scheduled := dailyTriggerTime(now, *tr.TimeOfDayTicks)
+			if !now.Before(scheduled) && now.Sub(scheduled) < 5*time.Minute && lastRun.Before(scheduled) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func dailyTriggerTime(now time.Time, timeOfDayTicks int64) time.Time {
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	return dayStart.Add(ticksToDuration(timeOfDayTicks))
+}
+
+func ticksToDuration(ticks int64) time.Duration {
+	if ticks <= 0 {
+		return 0
+	}
+	// 1 tick = 100 nanoseconds; guard against int64 overflow when multiplying.
+	const maxTicks = int64(^uint64(0)>>1) / 100
+	if ticks > maxTicks {
+		return time.Duration(maxTicks) * 100 * time.Nanosecond
+	}
+	return time.Duration(ticks) * 100 * time.Nanosecond
 }
 
 // SetTriggerStore configures optional callbacks used to persist custom task triggers across restarts.
@@ -154,9 +308,11 @@ func (m *Manager) Register(def TaskDefinition) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := m.nowFn()
 	m.tasks[def.ID] = &managedTask{
-		def:   def,
-		state: StateIdle,
+		def:       def,
+		state:     StateIdle,
+		createdAt: now,
 	}
 }
 
@@ -210,6 +366,18 @@ func (m *Manager) RegisterBuiltinTasks(scanAll func(ctx context.Context) error, 
 				}
 				return err
 			}
+			m.mu.RLock()
+			activeFn := m.activeTranscodeDirsFn
+			m.mu.RUnlock()
+			activeDirs := make(map[string]struct{})
+			if activeFn != nil {
+				for _, d := range activeFn() {
+					if clean := filepath.Clean(strings.TrimSpace(d)); clean != "" && clean != "." {
+						activeDirs[clean] = struct{}{}
+					}
+				}
+			}
+
 			total := len(entries)
 			for i, entry := range entries {
 				select {
@@ -217,7 +385,22 @@ func (m *Manager) RegisterBuiltinTasks(scanAll func(ctx context.Context) error, 
 					return ctx.Err()
 				default:
 				}
-				_ = os.RemoveAll(filepath.Join(transcodeTempDir, entry.Name()))
+				fullPath := filepath.Join(transcodeTempDir, entry.Name())
+				if _, active := activeDirs[filepath.Clean(fullPath)]; active {
+					if total > 0 {
+						report(10 + float64(i+1)/float64(total)*90)
+					}
+					continue
+				}
+				if entry.IsDir() {
+					if info, statErr := entry.Info(); statErr == nil && time.Since(info.ModTime()) < transcodeCleanMinAge {
+						if total > 0 {
+							report(10 + float64(i+1)/float64(total)*90)
+						}
+						continue
+					}
+				}
+				_ = os.RemoveAll(fullPath)
 				if total > 0 {
 					report(10 + float64(i+1)/float64(total)*90)
 				}
@@ -302,7 +485,23 @@ func (m *Manager) Run(id string) error {
 		return ErrTaskAlreadyRunning
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	var maxRuntime time.Duration
+	for _, tr := range mt.def.Triggers {
+		if tr.MaxRuntimeTicks != nil && *tr.MaxRuntimeTicks > 0 {
+			d := ticksToDuration(*tr.MaxRuntimeTicks)
+			if d > 0 && (maxRuntime == 0 || d < maxRuntime) {
+				maxRuntime = d
+			}
+		}
+	}
+
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if maxRuntime > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), maxRuntime)
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
+	}
 	startPct := 0.0
 	mt.state = StateRunning
 	mt.progress = &startPct
@@ -399,37 +598,48 @@ func (m *Manager) Stop(id string) error {
 
 // SetTriggers replaces the trigger schedule for a task and persists it when a trigger store is configured.
 func (m *Manager) SetTriggers(id string, triggers []TaskTriggerInfo) error {
-	m.mu.Lock()
-	mt := m.findLocked(id)
-	if mt == nil {
-		m.mu.Unlock()
-		return ErrTaskNotFound
-	}
-	prev := mt.def.Triggers
+	m.triggerMu.Lock()
+	defer m.triggerMu.Unlock()
+
 	cp := make([]TaskTriggerInfo, len(triggers))
 	copy(cp, triggers)
-	mt.def.Triggers = cp
 
+	m.mu.RLock()
+	mt := m.findLocked(id)
+	if mt == nil {
+		m.mu.RUnlock()
+		return ErrTaskNotFound
+	}
+	targetID := mt.def.ID
 	saveFn := m.saveTriggers
 	var snapshot map[string][]TaskTriggerInfo
 	if saveFn != nil {
 		snapshot = make(map[string][]TaskTriggerInfo, len(m.tasks))
 		for taskID, task := range m.tasks {
+			if taskID == targetID {
+				tCopy := make([]TaskTriggerInfo, len(cp))
+				copy(tCopy, cp)
+				snapshot[taskID] = tCopy
+				continue
+			}
 			tCopy := make([]TaskTriggerInfo, len(task.def.Triggers))
 			copy(tCopy, task.def.Triggers)
 			snapshot[taskID] = tCopy
 		}
 	}
-	m.mu.Unlock()
+	m.mu.RUnlock()
 
 	if saveFn != nil {
 		if err := saveFn(context.Background(), snapshot); err != nil {
-			m.mu.Lock()
-			mt.def.Triggers = prev
-			m.mu.Unlock()
 			return err
 		}
 	}
+
+	m.mu.Lock()
+	if cur := m.findLocked(targetID); cur != nil {
+		cur.def.Triggers = cp
+	}
+	m.mu.Unlock()
 	return nil
 }
 

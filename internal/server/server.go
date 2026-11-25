@@ -56,6 +56,7 @@ import (
 	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/core/watcher"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/plugins/ext"
 	"github.com/ambra-media/ambra/internal/plugins/nfo"
@@ -99,6 +100,9 @@ type Server struct {
 }
 
 func New(ctx context.Context, cfg *config.Config) (*Server, error) {
+	if len(cfg.TrustedProxies) > 0 {
+		netutil.SetTrustedProxies(cfg.TrustedProxies)
+	}
 	if err := applyPendingDatabaseRestore(cfg.DataDir, cfg.DBPath()); err != nil {
 		return nil, fmt.Errorf("apply pending database restore: %w", err)
 	}
@@ -171,13 +175,17 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		FFmpegPath: cfg.FFmpegPath,
 		Bus:        bus,
 	})
-	ssdpB := ssdp.NewBroadcaster(ssdp.Config{
-		ServerID:      cfg.ServerID,
-		ServerName:    cfg.ServerName,
-		ServerVersion: config.ServerVersion,
-	})
+	var ssdpB *ssdp.Broadcaster
+	if cfg.EnableDLNA {
+		ssdpB = ssdp.NewBroadcaster(ssdp.Config{
+			ServerID:      cfg.ServerID,
+			ServerName:    cfg.ServerName,
+			ServerVersion: config.ServerVersion,
+		})
+	}
 
 	taskMgr := scheduler.New(bus)
+	taskMgr.SetActiveTranscodeDirsFn(transcodeMgr.ActiveWorkDirs)
 	taskMgr.RegisterBuiltinTasks(
 		func(c context.Context) error {
 			if _, err := sc.ScanAll(c); err != nil {
@@ -210,7 +218,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	taskMgr.SetTriggerStore(
 		func(c context.Context) (map[string][]scheduler.TaskTriggerInfo, error) {
 			var raw string
-			err := store.Reader.QueryRowContext(c, `SELECT value FROM server_config WHERE key = 'scheduler:triggers'`).Scan(&raw)
+			err := store.Reader.QueryRowContext(c, `SELECT value_json FROM server_config WHERE key = 'scheduler:triggers'`).Scan(&raw)
 			if err != nil {
 				return nil, nil
 			}
@@ -226,17 +234,21 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 				return err
 			}
 			_, err = store.Writer.ExecContext(c,
-				`INSERT INTO server_config (key, value) VALUES ('scheduler:triggers', ?)
-				 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-				string(raw),
+				`INSERT INTO server_config (key, value_json, updated_at) VALUES ('scheduler:triggers', ?, ?)
+				 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+				string(raw), time.Now().UTC().Unix(),
 			)
 			return err
 		},
 	)
-	_ = taskMgr.LoadPersistedTriggers(ctx)
+	if err := taskMgr.LoadPersistedTriggers(ctx); err != nil {
+		slog.Warn("failed to load persisted scheduler triggers", "error", err)
+	}
 
 	pluginAdminH := pluginadmin.New(registry, store)
-	_ = pluginAdminH.ApplySavedConfigs(ctx)
+	if err := pluginAdminH.ApplySavedConfigs(ctx); err != nil {
+		slog.Warn("some saved plugin configs failed to apply", "error", err)
+	}
 
 	systemHandler := system.NewHandler(cfg, userRepo, registry).WithSetupDeps(system.SetupDeps{
 		Auth: authSvc,
@@ -248,6 +260,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		},
 	})
 	usersHandler := users.NewHandler(authSvc, userRepo, sessionMgr, wsHub, cfg)
+	usersHandler.SetLibraryRepo(libRepo)
 
 	userIDFromCtx := func(c context.Context) string {
 		if ac, ok := middleware.AuthFromContext(c); ok && ac != nil {
@@ -372,7 +385,11 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	})
 
 	// Phase 6: DLNA UPnP MediaServer, Rankings, Migration & Governance Admin APIs
-	dlna.New(cfg, libRepo, store).RegisterRoutes(mediaMux, dlna.AuthFuncs{
+	dlnaH := dlna.New(cfg, libRepo, store)
+	bus.Subscribe(eventbus.EventLibraryChanged, func(context.Context, eventbus.Event) {
+		dlnaH.BumpSystemUpdate()
+	})
+	dlnaH.RegisterRoutes(mediaMux, dlna.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
@@ -393,6 +410,12 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		BudgetPool: bgBudget,
 	})
 	if err != nil {
+		if libWatcher != nil {
+			_ = libWatcher.Close()
+		}
+		if wHost != nil {
+			_ = wHost.Close(context.Background())
+		}
 		_ = store.Close()
 		return nil, fmt.Errorf("init governance service: %w", err)
 	}
@@ -401,7 +424,9 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
 	})
-	quickconnect.New(authSvc, userRepo, sessionMgr).RegisterRoutes(mediaMux, quickconnect.AuthFuncs{
+	qcH := quickconnect.New(authSvc, userRepo, sessionMgr)
+	qcH.SetConfig(cfg)
+	qcH.RegisterRoutes(mediaMux, quickconnect.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
@@ -447,7 +472,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	webHandler := buildWebHandler(cfg.WebDir)
 
 	r := chi.NewRouter()
-	r.Use(middleware.CORS)
+	r.Use(middleware.CORSWithOrigins(cfg.AllowedOrigins))
 	r.Use(middleware.Gzip)
 	r.Use(middleware.EmbyPrefixAndCase)
 	r.Use(authMW.ParseAuth)
@@ -484,6 +509,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 
 	dvrCtx, dvrCancel := context.WithCancel(ctx)
 	dvrDone := make(chan struct{})
+	taskMgr.Start(dvrCtx)
 	go func() {
 		defer close(dvrDone)
 		dvrRec.SchedulerLoop(dvrCtx, 15*time.Second, livetvH.DueRecordingJobs)
@@ -524,7 +550,7 @@ func applyPendingDatabaseRestore(dataDir, dbPath string) error {
 		return nil
 	}
 	restorePath := filepath.Join(dataDir, "ambra.db.restore")
-	info, err := os.Stat(restorePath)
+	info, err := os.Lstat(restorePath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -533,7 +559,7 @@ func applyPendingDatabaseRestore(dataDir, dbPath string) error {
 		return fmt.Errorf("stat pending restore %s: %w", restorePath, err)
 	}
 	if !info.Mode().IsRegular() || info.Size() == 0 {
-		slog.Warn("ignoring invalid or empty pending database restore file", "path", restorePath, "size", info.Size())
+		slog.Warn("ignoring invalid, symlink, or empty pending database restore file", "path", restorePath, "size", info.Size())
 		return nil
 	}
 
@@ -551,14 +577,6 @@ func applyPendingDatabaseRestore(dataDir, dbPath string) error {
 		return nil
 	}
 
-	for _, suffix := range []string{"-wal", "-shm"} {
-		sidecar := dbPath + suffix
-		if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
-			slog.Warn("failed to remove stale sqlite sidecar before restore", "path", sidecar, "error", err)
-			return fmt.Errorf("remove stale sidecar %s: %w", sidecar, err)
-		}
-	}
-
 	backupPath := dbPath + ".pre-restore.bak"
 	hadExistingDB := false
 	if _, err := os.Stat(dbPath); err == nil {
@@ -567,6 +585,17 @@ func applyPendingDatabaseRestore(dataDir, dbPath string) error {
 		if err := os.Rename(dbPath, backupPath); err != nil {
 			slog.Warn("failed to back up existing database before restore", "dbPath", dbPath, "backupPath", backupPath, "error", err)
 			return fmt.Errorf("backup existing db: %w", err)
+		}
+		// Preserve WAL/SHM sidecars alongside backup so pre-restore backup stays intact.
+		for _, suffix := range []string{"-wal", "-shm"} {
+			sidecar := dbPath + suffix
+			sidecarBak := backupPath + suffix
+			_ = os.Remove(sidecarBak)
+			if _, sErr := os.Stat(sidecar); sErr == nil {
+				if rErr := os.Rename(sidecar, sidecarBak); rErr != nil {
+					slog.Warn("failed to back up sqlite sidecar before restore", "path", sidecar, "error", rErr)
+				}
+			}
 		}
 	} else if !os.IsNotExist(err) {
 		slog.Warn("failed to stat existing database before restore", "dbPath", dbPath, "error", err)
@@ -577,6 +606,9 @@ func applyPendingDatabaseRestore(dataDir, dbPath string) error {
 		slog.Warn("failed to promote pending database restore", "restorePath", restorePath, "dbPath", dbPath, "error", err)
 		if hadExistingDB {
 			_ = os.Rename(backupPath, dbPath)
+			for _, suffix := range []string{"-wal", "-shm"} {
+				_ = os.Rename(backupPath+suffix, dbPath+suffix)
+			}
 		}
 		return fmt.Errorf("promote restore db: %w", err)
 	}
@@ -647,6 +679,11 @@ func buildWebHandler(webDir string) http.Handler {
 		if err == nil {
 			fsys = sub
 		}
+	}
+	if fsys == nil {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "web UI unavailable", http.StatusServiceUnavailable)
+		})
 	}
 	fileServer := http.FileServer(http.FS(fsys))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

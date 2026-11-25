@@ -168,6 +168,22 @@ func (h *Handler) forgotPassword(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if uid != "" {
+		if len(h.forgotPins) >= forgotPinsMaxEntries {
+			var oldestKey string
+			var oldestExp time.Time
+			for k, existing := range h.forgotPins {
+				if oldestKey == "" || existing.ExpiresAt.Before(oldestExp) {
+					oldestKey = k
+					oldestExp = existing.ExpiresAt
+				}
+			}
+			if oldestKey != "" {
+				if oldFile := h.forgotPins[oldestKey].PinFile; oldFile != "" {
+					expiredFiles = append(expiredFiles, oldFile)
+				}
+				delete(h.forgotPins, oldestKey)
+			}
+		}
 		h.forgotPins[pin] = forgotPinEntry{
 			UserID:    uid,
 			UserName:  uname,
@@ -188,21 +204,63 @@ func (h *Handler) forgotPassword(w http.ResponseWriter, r *http.Request) {
 		prunePasswordResetFiles(h.cfg.DataDir, forgotPasswordMaxPinFiles)
 	}
 
+	publicPinFile := ""
+	if pinFile != "" {
+		publicPinFile = filepath.Base(pinFile)
+	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"Action":            "PinCode",
-		"PinFile":           pinFile,
+		"PinFile":           publicPinFile,
 		"PinExpirationDate": expiresAt.Format(time.RFC3339),
 	})
 }
 
+func (h *Handler) checkIPRateLimit(bucket map[string][]time.Time, ip string, now time.Time, window time.Duration, limit int) bool {
+	if ip == "" {
+		return true
+	}
+	cutoff := now.Add(-window)
+	for k, ts := range bucket {
+		kept := ts[:0]
+		for _, t := range ts {
+			if t.After(cutoff) {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) == 0 {
+			delete(bucket, k)
+		} else {
+			bucket[k] = kept
+		}
+	}
+	if len(bucket[ip]) >= limit {
+		return false
+	}
+	bucket[ip] = append(bucket[ip], now)
+	return true
+}
+
 func (h *Handler) forgotPasswordPin(w http.ResponseWriter, r *http.Request) {
+	now := time.Now().UTC()
+	ip := forgotClientIP(r)
+
+	h.mu.Lock()
+	if h.forgotPinRates == nil {
+		h.forgotPinRates = make(map[string][]time.Time)
+	}
+	if !h.checkIPRateLimit(h.forgotPinRates, ip, now, forgotPasswordRateWindow, forgotPinMaxAttempts) {
+		h.mu.Unlock()
+		httpx.Error(w, http.StatusTooManyRequests, "too many pin attempts")
+		return
+	}
+	h.mu.Unlock()
+
 	var body struct {
 		Pin string `json:"Pin"`
 	}
 	_ = decodeOptionalJSON(r, &body)
 	pin := strings.ToUpper(strings.TrimSpace(body.Pin))
 
-	now := time.Now().UTC()
 	var (
 		matched      *forgotPinEntry
 		filesToClean []string
@@ -225,19 +283,6 @@ func (h *Handler) forgotPasswordPin(w http.ResponseWriter, r *http.Request) {
 			delete(h.forgotPins, pin)
 			if entry.PinFile != "" {
 				filesToClean = append(filesToClean, entry.PinFile)
-			}
-		} else {
-			// Rate-limit wrong attempts: increment attempts on active PINs and invalidate at limit.
-			for k, e := range h.forgotPins {
-				e.Attempts++
-				if e.Attempts >= forgotPinMaxAttempts {
-					if e.PinFile != "" {
-						filesToClean = append(filesToClean, e.PinFile)
-					}
-					delete(h.forgotPins, k)
-				} else {
-					h.forgotPins[k] = e
-				}
 			}
 		}
 	}
@@ -278,9 +323,22 @@ func (h *Handler) forgotPasswordPin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
+	now := time.Now().UTC()
+	ip := netutil.ClientIP(r)
+	h.mu.Lock()
+	if h.authByIDRates == nil {
+		h.authByIDRates = make(map[string][]time.Time)
+	}
+	if !h.checkIPRateLimit(h.authByIDRates, ip, now, authByIDRateWindow, authByIDRateLimit) {
+		h.mu.Unlock()
+		httpx.Error(w, http.StatusTooManyRequests, "too many authentication attempts")
+		return
+	}
+	h.mu.Unlock()
+
 	uid := h.resolveUserID(r, "Id")
 	if h.userRepo == nil || uid == "" {
-		writeJSONError(w, r, http.StatusNotFound, "user not found")
+		writeJSONError(w, r, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
 	var body struct {
@@ -293,7 +351,7 @@ func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 	}
 	u, err := h.userRepo.GetUserByID(r.Context(), uid)
 	if err != nil {
-		writeJSONError(w, r, http.StatusNotFound, "user not found")
+		writeJSONError(w, r, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
 
@@ -420,12 +478,8 @@ func (h *Handler) queryUsers(w http.ResponseWriter, r *http.Request) {
 				all = []*sqlite.UserRecord{u}
 			}
 		} else {
-			list, err := h.userRepo.ListUsers(r.Context())
-			if err != nil {
-				httpx.Error(w, http.StatusInternalServerError, "failed to query users")
-				return
-			}
-			all = list
+			writeJSONError(w, r, http.StatusUnauthorized, "authentication required")
+			return
 		}
 	}
 
@@ -543,9 +597,8 @@ func (h *Handler) getUserPrefixes(w http.ResponseWriter, r *http.Request) {
 				list = []*sqlite.UserRecord{u}
 			}
 		} else {
-			if all, err := h.userRepo.ListUsers(r.Context()); err == nil {
-				list = all
-			}
+			writeJSONError(w, r, http.StatusUnauthorized, "authentication required")
+			return
 		}
 		for _, u := range list {
 			runes := []rune(strings.TrimSpace(u.Name))
@@ -601,14 +654,27 @@ func (h *Handler) updateUser(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, r, http.StatusForbidden, "admin privileges required to update user policy")
 		return
 	}
-	if trimmedName := strings.TrimSpace(body.Name); trimmedName != "" && trimmedName != u.Name && h.store != nil && h.store.Writer != nil {
-		if _, err := h.store.Writer.ExecContext(r.Context(), `UPDATE users SET name = ? WHERE id = ?`, trimmedName, u.ID); err != nil {
-			if strings.Contains(strings.ToLower(err.Error()), "unique") {
-				httpx.Error(w, http.StatusBadRequest, "username already exists")
+	if body.Name != "" {
+		trimmedName := strings.TrimSpace(body.Name)
+		if trimmedName == "" || len([]rune(trimmedName)) > 64 {
+			httpx.Error(w, http.StatusBadRequest, "invalid username")
+			return
+		}
+		if trimmedName != u.Name {
+			if !h.isCallerAdmin(r) {
+				writeJSONError(w, r, http.StatusForbidden, "admin privileges required to rename user")
 				return
 			}
-			httpx.Error(w, http.StatusInternalServerError, "failed to update user name")
-			return
+			if h.store != nil && h.store.Writer != nil {
+				if _, err := h.store.Writer.ExecContext(r.Context(), `UPDATE users SET name = ? WHERE id = ?`, trimmedName, u.ID); err != nil {
+					if strings.Contains(strings.ToLower(err.Error()), "unique") {
+						httpx.Error(w, http.StatusBadRequest, "username already exists")
+						return
+					}
+					httpx.Error(w, http.StatusInternalServerError, "failed to update user name")
+					return
+				}
+			}
 		}
 	}
 	if body.Configuration != nil {
@@ -675,16 +741,33 @@ func (h *Handler) updateUserConfigurationPartial(w http.ResponseWriter, r *http.
 		return
 	}
 	if len(patch) > 0 {
-		rawCfg, _ := json.Marshal(u.Config)
+		rawCfg, err := json.Marshal(u.Config)
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to encode current configuration")
+			return
+		}
 		merged := map[string]any{}
-		_ = json.Unmarshal(rawCfg, &merged)
+		if err := json.Unmarshal(rawCfg, &merged); err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to decode current configuration")
+			return
+		}
 		for k, v := range patch {
 			merged[k] = v
 		}
-		updatedRaw, _ := json.Marshal(merged)
+		updatedRaw, err := json.Marshal(merged)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid configuration patch")
+			return
+		}
 		var nextCfg dto.UserConfiguration
-		_ = json.Unmarshal(updatedRaw, &nextCfg)
-		_ = h.userRepo.UpdateUserConfig(r.Context(), u.ID, nextCfg)
+		if err := json.Unmarshal(updatedRaw, &nextCfg); err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid configuration field type")
+			return
+		}
+		if err := h.userRepo.UpdateUserConfig(r.Context(), u.ID, nextCfg); err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to update user configuration")
+			return
+		}
 		if h.authSvc != nil {
 			h.authSvc.InvalidateUserCache(u.ID)
 		}
@@ -987,11 +1070,11 @@ func (h *Handler) userPolicyForRequest(r *http.Request, targetUID string) (allow
 		}
 	}
 	if uid == "" {
-		return nil, nil, nil
+		return []string{}, nil, nil
 	}
 	u, err := h.userRepo.GetUserByID(r.Context(), uid)
 	if err != nil || u == nil {
-		return nil, nil, nil
+		return []string{}, nil, nil
 	}
 	if u.IsAdmin || u.Policy.IsAdministrator {
 		return nil, nil, nil
@@ -1090,9 +1173,15 @@ func (h *Handler) getUserSectionItems(w http.ResponseWriter, r *http.Request) {
 	if startIndex < 0 {
 		startIndex = 0
 	}
+	if startIndex > 10000 {
+		startIndex = 10000
+	}
 	limit := q.Int("Limit", 20)
 	if limit <= 0 {
 		limit = 20
+	}
+	if limit > 500 {
+		limit = 500
 	}
 	if h.libRepo == nil {
 		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{Items: []dto.BaseItemDto{}, TotalRecordCount: 0})
@@ -1205,9 +1294,15 @@ func (h *Handler) getUserSuggestions(w http.ResponseWriter, r *http.Request) {
 	if startIndex < 0 {
 		startIndex = 0
 	}
+	if startIndex > 10000 {
+		startIndex = 10000
+	}
 	limit := q.Int("Limit", 20)
 	if limit <= 0 {
 		limit = 20
+	}
+	if limit > 500 {
+		limit = 500
 	}
 	itemTypes := q.List("Type")
 	allowedLibs, maxRating, blockedTags := h.userPolicyForRequest(r, uid)
@@ -1234,7 +1329,7 @@ func (h *Handler) getUserSuggestions(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusInternalServerError, "failed to load suggestions")
 			return
 		}
-		merged := make([]dto.BaseItemDto, 0, fetchLimit)
+		merged := make([]dto.BaseItemDto, 0, len(matched))
 		seen := make(map[string]bool, len(matched))
 		for _, it := range matched {
 			seen[it.Id] = true
@@ -1383,12 +1478,15 @@ func (h *Handler) allowedLibrariesForRequest(r *http.Request, fallbackUserID str
 }
 
 func (h *Handler) allowedLibrariesForUser(ctx context.Context, userID string) []string {
-	if h.userRepo == nil || userID == "" {
+	if h.userRepo == nil {
 		return nil
+	}
+	if userID == "" {
+		return []string{}
 	}
 	u, err := h.userRepo.GetUserByID(ctx, userID)
 	if err != nil || u == nil {
-		return nil
+		return []string{}
 	}
 	if u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableAllFolders {
 		return nil
@@ -1415,6 +1513,27 @@ func isLibraryAllowed(libID string, allowed []string) bool {
 	return false
 }
 
+func (h *Handler) canAccessItem(r *http.Request, targetUID, itemID string) bool {
+	if h.libRepo == nil || itemID == "" {
+		return true
+	}
+	rec, err := h.libRepo.GetItemRecordByID(r.Context(), itemID)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		return h.isCallerAdmin(r)
+	}
+	if err != nil || rec == nil {
+		return false
+	}
+	allowedLibs, maxRating, blockedTags := h.userPolicyForRequest(r, targetUID)
+	if !isLibraryAllowed(rec.LibraryID, allowedLibs) {
+		return false
+	}
+	if blocked, bErr := h.libRepo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags); bErr != nil || blocked {
+		return false
+	}
+	return true
+}
+
 func (h *Handler) serveUserItemExtras(w http.ResponseWriter, r *http.Request, extraTypes []string) {
 	uid := h.resolveUserID(r, "UserId")
 	if !h.canModifyUser(r, uid) {
@@ -1435,8 +1554,12 @@ func (h *Handler) serveUserItemExtras(w http.ResponseWriter, r *http.Request, ex
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	allowed := h.allowedLibrariesForRequest(r, uid)
-	if !isLibraryAllowed(rec.LibraryID, allowed) {
+	allowedLibs, maxRating, blockedTags := h.userPolicyForRequest(r, uid)
+	if !isLibraryAllowed(rec.LibraryID, allowedLibs) {
+		writeJSONError(w, r, http.StatusForbidden, "access denied")
+		return
+	}
+	if blocked, bErr := h.libRepo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags); bErr != nil || blocked {
 		writeJSONError(w, r, http.StatusForbidden, "access denied")
 		return
 	}
@@ -1468,6 +1591,10 @@ func (h *Handler) deleteUserFavoriteItem(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	if !h.canAccessItem(r, uid, itemID) {
+		writeJSONError(w, r, http.StatusForbidden, "access denied")
+		return
+	}
 	if h.libRepo != nil && uid != "" && itemID != "" {
 		if ud, err := h.libRepo.UnmarkFavorite(r.Context(), uid, itemID); err == nil && ud != nil {
 			httpx.JSON(w, http.StatusOK, ud)
@@ -1495,6 +1622,10 @@ func (h *Handler) postUserItemRating(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	if !h.canAccessItem(r, uid, itemID) {
+		writeJSONError(w, r, http.StatusForbidden, "access denied")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	likes := q.Bool("Likes")
 	val := true
@@ -1519,6 +1650,10 @@ func (h *Handler) deleteUserItemRating(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	if !h.canAccessItem(r, uid, itemID) {
+		writeJSONError(w, r, http.StatusForbidden, "access denied")
+		return
+	}
 	_ = h.deleteKV(r.Context(), fmt.Sprintf("user_rating:%s:%s", uid, itemID))
 
 	ud := dto.UserItemDataDto{Key: itemID}
@@ -1537,6 +1672,10 @@ func (h *Handler) postUserItemHideFromResume(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	if !h.canAccessItem(r, uid, itemID) {
+		writeJSONError(w, r, http.StatusForbidden, "access denied")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	hide := true
 	if b := q.Bool("Hide"); b != nil {
@@ -1564,6 +1703,10 @@ func (h *Handler) postUserItemUserData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	itemID := guid.Normalize(chi.URLParam(r, "ItemId"))
+	if !h.canAccessItem(r, uid, itemID) {
+		writeJSONError(w, r, http.StatusForbidden, "access denied")
+		return
+	}
 	var body struct {
 		Played                *bool  `json:"Played"`
 		IsFavorite            *bool  `json:"IsFavorite"`
@@ -1573,8 +1716,10 @@ func (h *Handler) postUserItemUserData(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	playedHandled := false
 	if h.libRepo != nil && uid != "" && itemID != "" {
 		if body.Played != nil {
+			playedHandled = true
 			if *body.Played {
 				_, _ = h.libRepo.MarkPlayed(r.Context(), uid, itemID)
 			} else {
@@ -1590,8 +1735,12 @@ func (h *Handler) postUserItemUserData(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if body.PlaybackPositionTicks != nil && h.userRepo != nil && uid != "" && itemID != "" {
-		played := body.Played != nil && *body.Played
-		_, _ = h.userRepo.UpsertPlaybackProgress(r.Context(), uid, itemID, *body.PlaybackPositionTicks, played, nil, nil)
+		pos := *body.PlaybackPositionTicks
+		if pos < 0 {
+			pos = 0
+		}
+		markPlayed := !playedHandled && body.Played != nil && *body.Played
+		_, _ = h.userRepo.UpsertPlaybackProgress(r.Context(), uid, itemID, pos, markPlayed, nil, nil)
 	}
 	httpx.NoContent(w)
 }
@@ -1603,6 +1752,10 @@ func (h *Handler) deleteUserPlayedItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	if !h.canAccessItem(r, uid, itemID) {
+		writeJSONError(w, r, http.StatusForbidden, "access denied")
+		return
+	}
 	if h.libRepo != nil && uid != "" && itemID != "" {
 		if ud, err := h.libRepo.MarkUnplayed(r.Context(), uid, itemID); err == nil && ud != nil {
 			httpx.JSON(w, http.StatusOK, ud)
@@ -1619,6 +1772,10 @@ func (h *Handler) postUserPlayingItemStart(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	if !h.canAccessItem(r, uid, itemID) {
+		writeJSONError(w, r, http.StatusForbidden, "access denied")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	if h.sessions != nil && h.userRepo != nil && uid != "" {
 		if u, err := h.userRepo.GetUserByID(r.Context(), uid); err == nil && u != nil {
@@ -1643,6 +1800,10 @@ func (h *Handler) postUserPlayingItemProgress(w http.ResponseWriter, r *http.Req
 		return
 	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	if !h.canAccessItem(r, uid, itemID) {
+		writeJSONError(w, r, http.StatusForbidden, "access denied")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	if h.sessions != nil && h.userRepo != nil && uid != "" {
 		if u, err := h.userRepo.GetUserByID(r.Context(), uid); err == nil && u != nil {
@@ -1672,6 +1833,10 @@ func (h *Handler) deleteUserPlayingItem(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	if !h.canAccessItem(r, uid, itemID) {
+		writeJSONError(w, r, http.StatusForbidden, "access denied")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	if h.sessions != nil && h.userRepo != nil && uid != "" {
 		if u, err := h.userRepo.GetUserByID(r.Context(), uid); err == nil && u != nil {
@@ -1811,9 +1976,13 @@ func (h *Handler) postUserImage(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, r, http.StatusForbidden, "forbidden")
 		return
 	}
-	imgType := chi.URLParam(r, "Type")
-	idx := chi.URLParam(r, "Index")
-	p := h.userImagePath(uid, imgType, idx)
+	imgType := strings.TrimSpace(chi.URLParam(r, "Type"))
+	idx := strings.TrimSpace(chi.URLParam(r, "Index"))
+	if !strings.EqualFold(imgType, "Primary") || (idx != "" && idx != "0") {
+		httpx.Error(w, http.StatusBadRequest, "only Primary image at index 0 is supported")
+		return
+	}
+	p := h.userImagePath(uid, "Primary", "0")
 
 	raw, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
 	if err != nil {

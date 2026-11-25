@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -362,42 +363,77 @@ func EmbyPrefixAndCase(next http.Handler) http.Handler {
 		}
 
 		lower := strings.ToLower(p)
+		origRawPath := r.URL.RawPath
+		hasEscapedSlash := strings.Contains(strings.ToLower(origRawPath), "%2f")
 
-		// Preserve /web static UI routes and Ambra native /api/ routes verbatim.
-		if lower == "/web" || strings.HasPrefix(lower, "/web/") || strings.HasPrefix(lower, "/api/") {
+		// Normalize /WEB (any casing) to /web and pass through without further segment rewriting.
+		if lower == "/web" || strings.HasPrefix(lower, "/web/") {
+			newPath := p
+			if lower == "/web" {
+				newPath = "/web"
+			} else {
+				newPath = "/web/" + p[len("/web/"):]
+			}
+			if newPath == p {
+				next.ServeHTTP(w, r)
+				return
+			}
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = newPath
+			if hasEscapedSlash {
+				rawLower := strings.ToLower(origRawPath)
+				if rawLower == "/web" {
+					r2.URL.RawPath = "/web"
+				} else if strings.HasPrefix(rawLower, "/web/") {
+					r2.URL.RawPath = "/web/" + origRawPath[len("/web/"):]
+				}
+			} else if r2.URL.RawPath != "" {
+				r2.URL.RawPath = ""
+			}
+			next.ServeHTTP(w, r2)
+			return
+		}
+
+		// Preserve Ambra native /api/ routes verbatim.
+		if strings.HasPrefix(lower, "/api/") {
 			next.ServeHTTP(w, r)
 			return
 		}
 
 		// Strip /emby prefix (but do NOT strip /embywebsocket).
+		rawP := origRawPath
 		if lower == "/emby" {
 			p = "/"
+			if hasEscapedSlash {
+				rawP = "/"
+			}
 		} else if strings.HasPrefix(lower, "/emby/") {
 			p = p[len("/emby"):]
-		}
-
-		// Canonicalize static path segments while leaving dynamic IDs/parameters intact.
-		if len(p) > 1 {
-			parts := strings.Split(p, "/")
-			changed := false
-			for i := 1; i < len(parts); i++ {
-				if parts[i] == "" {
-					continue
-				}
-				if canon, ok := canonicalSegments[strings.ToLower(parts[i])]; ok && canon != parts[i] {
-					parts[i] = canon
-					changed = true
-				}
-			}
-			if changed {
-				p = strings.Join(parts, "/")
+			if hasEscapedSlash && strings.HasPrefix(strings.ToLower(rawP), "/emby/") {
+				rawP = rawP[len("/emby"):]
 			}
 		}
 
-		if p != r.URL.Path {
+		// Re-check /api/ exemption after stripping /emby prefix so /emby/api/... is not canonicalized.
+		if !strings.HasPrefix(strings.ToLower(p), "/api/") {
+			if hasEscapedSlash && len(rawP) > 1 {
+				rawP = canonicalizePathSegments(rawP)
+				if unescaped, err := url.PathUnescape(rawP); err == nil {
+					p = unescaped
+				} else {
+					p = canonicalizePathSegments(p)
+				}
+			} else if len(p) > 1 {
+				p = canonicalizePathSegments(p)
+			}
+		}
+
+		if p != r.URL.Path || (hasEscapedSlash && rawP != origRawPath) {
 			r2 := r.Clone(r.Context())
 			r2.URL.Path = p
-			if r2.URL.RawPath != "" {
+			if hasEscapedSlash {
+				r2.URL.RawPath = rawP
+			} else if r2.URL.RawPath != "" {
 				r2.URL.RawPath = ""
 			}
 			next.ServeHTTP(w, r2)
@@ -406,4 +442,22 @@ func EmbyPrefixAndCase(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func canonicalizePathSegments(p string) string {
+	parts := strings.Split(p, "/")
+	changed := false
+	for i := 1; i < len(parts); i++ {
+		if parts[i] == "" {
+			continue
+		}
+		if canon, ok := canonicalSegments[strings.ToLower(parts[i])]; ok && canon != parts[i] {
+			parts[i] = canon
+			changed = true
+		}
+	}
+	if !changed {
+		return p
+	}
+	return strings.Join(parts, "/")
 }

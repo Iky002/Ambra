@@ -2,6 +2,7 @@ package migration
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/ambra-media/ambra/internal/core/auth"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
@@ -78,6 +80,7 @@ type MigrationReport struct {
 	ResumeMigrated        int             `json:"resume_migrated"`
 	Conflicts             []ConflictEntry `json:"conflicts"`
 	Errors                []string        `json:"errors"`
+	Notices               []string        `json:"notices,omitempty"`
 	ResumedFromCheckpoint bool            `json:"resumed_from_checkpoint"`
 	CheckpointKey         string          `json:"checkpoint_key,omitempty"`
 }
@@ -371,12 +374,15 @@ func (m *Migrator) execute(ctx context.Context, client *SourceClient, req Migrat
 		report.CurrentUser = srcUser.Name
 		m.setStatus(report)
 
-		targetUserID, matched, created, conflict, err := m.resolveOrCreateUser(ctx, srcUser, req.MigrateUsers, req.DryRun)
+		targetUserID, matched, created, conflict, notice, err := m.resolveOrCreateUser(ctx, srcUser, req.MigrateUsers, req.DryRun)
 		if err != nil {
 			report.Errors = append(report.Errors, fmt.Sprintf("user %s: %v", srcUser.Name, err))
 			report.ProcessedUsers++
 			m.setStatus(report)
 			continue
+		}
+		if notice != "" {
+			report.Notices = append(report.Notices, notice)
 		}
 		if matched {
 			report.UsersMatched++
@@ -438,7 +444,7 @@ func (m *Migrator) execute(ctx context.Context, client *SourceClient, req Migrat
 					break
 				}
 
-				for _, item := range page.Items {
+				for itemIdx, item := range page.Items {
 					if err := ctx.Err(); err != nil {
 						return finish(StatusCancelled, err)
 					}
@@ -505,7 +511,7 @@ func (m *Migrator) execute(ctx context.Context, client *SourceClient, req Migrat
 					})
 
 					if len(batch) >= batchSize {
-						if err := flushBatch(startIndex + len(page.Items)); err != nil {
+						if err := flushBatch(startIndex + itemIdx + 1); err != nil {
 							return finish(StatusFailed, fmt.Errorf("flush batch for user %s: %w", srcUser.Name, err))
 						}
 					}
@@ -550,13 +556,13 @@ func (m *Migrator) resolveOrCreateUser(
 	src SourceUser,
 	migrateUsers bool,
 	dryRun bool,
-) (targetUserID string, matched bool, created bool, conflict *ConflictEntry, err error) {
+) (targetUserID string, matched bool, created bool, conflict *ConflictEntry, notice string, err error) {
 	name := strings.TrimSpace(src.Name)
 	if name == "" {
 		return "", false, false, &ConflictEntry{
 			SourceItemID: src.ID,
 			Reason:       "source user has empty name",
-		}, nil
+		}, "", nil
 	}
 
 	existing, getErr := m.userRepo.GetUserByName(ctx, name)
@@ -566,28 +572,33 @@ func (m *Migrator) resolveOrCreateUser(
 			if policy.AuthenticationProviderId == "" {
 				policy.AuthenticationProviderId = existing.Policy.AuthenticationProviderId
 			}
+			// Never auto-promote a non-admin local user to administrator during migration merge.
+			if !existing.IsAdmin && policy.IsAdministrator {
+				policy.IsAdministrator = false
+				notice = fmt.Sprintf("user %q kept as non-administrator during merge (admin elevation skipped)", name)
+			}
 			if err := m.userRepo.UpdateUserPolicy(ctx, existing.ID, policy); err != nil {
-				return "", false, false, nil, err
+				return "", false, false, nil, "", err
 			}
 			if err := m.userRepo.UpdateUserConfig(ctx, existing.ID, src.Configuration); err != nil {
-				return "", false, false, nil, err
+				return "", false, false, nil, "", err
 			}
 		}
-		return existing.ID, true, false, nil, nil
+		return existing.ID, true, false, nil, notice, nil
 	}
 	if getErr != nil && !errors.Is(getErr, sqlite.ErrNotFound) {
-		return "", false, false, nil, getErr
+		return "", false, false, nil, "", getErr
 	}
 
 	if !migrateUsers {
 		return "", false, false, &ConflictEntry{
 			UserName: name,
 			Reason:   "local user not found and migrate_users is disabled",
-		}, nil
+		}, "", nil
 	}
 
 	if dryRun {
-		return "dryrun-" + guid.Normalize(src.ID), false, true, nil, nil
+		return "dryrun-" + guid.Normalize(src.ID), false, true, nil, "", nil
 	}
 
 	policy := src.Policy
@@ -599,10 +610,25 @@ func (m *Migrator) resolveOrCreateUser(
 		cfg = sqlite.DefaultUserConfig()
 	}
 
+	passwordHash := ""
+	if src.HasPassword {
+		var secret [32]byte
+		if _, err := rand.Read(secret[:]); err != nil {
+			return "", false, false, nil, "", fmt.Errorf("generate random password for migrated user %q: %w", name, err)
+		}
+		hashed, err := auth.HashPassword(hex.EncodeToString(secret[:]))
+		if err != nil {
+			return "", false, false, nil, "", fmt.Errorf("hash random password for migrated user %q: %w", name, err)
+		}
+		passwordHash = hashed
+		policy.IsDisabled = true
+		notice = fmt.Sprintf("user %q had a password on source server; created disabled with high-entropy random password and requires admin password reset", name)
+	}
+
 	rec := &sqlite.UserRecord{
 		ID:           guid.New(),
 		Name:         name,
-		PasswordHash: "",
+		PasswordHash: passwordHash,
 		IsAdmin:      policy.IsAdministrator,
 		IsDisabled:   policy.IsDisabled,
 		Policy:       policy,
@@ -612,9 +638,9 @@ func (m *Migrator) resolveOrCreateUser(
 		CreatedAt:    time.Now().UTC(),
 	}
 	if err := m.userRepo.CreateUser(ctx, rec); err != nil {
-		return "", false, false, nil, err
+		return "", false, false, nil, "", err
 	}
-	return rec.ID, false, true, nil, nil
+	return rec.ID, false, true, nil, notice, nil
 }
 
 func (m *Migrator) writeUserItemBatch(ctx context.Context, batch []pendingUserItemWrite) error {
@@ -1008,5 +1034,9 @@ func cloneReport(r MigrationReport) MigrationReport {
 	copy(out.Conflicts, r.Conflicts)
 	out.Errors = make([]string, len(r.Errors))
 	copy(out.Errors, r.Errors)
+	if len(r.Notices) > 0 {
+		out.Notices = make([]string, len(r.Notices))
+		copy(out.Notices, r.Notices)
+	}
 	return out
 }

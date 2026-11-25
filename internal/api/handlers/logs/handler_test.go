@@ -157,4 +157,34 @@ func TestMultiSlogHandlerBridgeAndFilePersistence(t *testing.T) {
 	if err := bridge.Close(); err != nil {
 		t.Fatalf("second Close failed: %v", err)
 	}
+
+	// 5. Security hardening: symlink rejected with 403, newline injection escaped, slog.KindGroup supported, 0600 file perm
+	outside := filepath.Join(tmp, "outside.txt")
+	_ = os.WriteFile(outside, []byte("secret"), 0o600)
+	_ = os.Symlink(outside, filepath.Join(tmp, "logs", "sym.log"))
+	recSym := httptest.NewRecorder()
+	mux.ServeHTTP(recSym, httptest.NewRequest(http.MethodGet, "/System/Logs/sym.log", nil))
+	if recSym.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for symlink log file, got %d", recSym.Code)
+	}
+
+	fi, err := os.Stat(logFilePath)
+	if err != nil {
+		t.Fatalf("stat log file: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+		t.Fatalf("expected 0600 log file permission, got %o", perm)
+	}
+
+	var injBuf bytes.Buffer
+	injBridge := NewMultiSlogHandler(&injBuf, nil, "")
+	injLogger := slog.New(injBridge)
+	injLogger.Info("line1\nFAKE [ERROR] injected", slog.Group("grp", slog.String("k", "v")))
+	injOut := injBuf.String()
+	if strings.Count(strings.TrimRight(injOut, "\n"), "\n") != 0 {
+		t.Fatalf("expected single escaped log line without raw newline injection, got:\n%s", injOut)
+	}
+	if !strings.Contains(injOut, "grp.k=v") {
+		t.Fatalf("expected slog.KindGroup expanded as grp.k=v, got:\n%s", injOut)
+	}
 }

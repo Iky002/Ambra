@@ -97,6 +97,7 @@
   "library.sortDateAdded": "Fecha añadido",
   "library.sortReleaseDate": "Fecha de estreno",
   "library.sortRating": "Valoración",
+  "library.sortPlayCount": "Reproducciones",
   "library.filterAll": "Todos los estados",
   "library.filterUnplayed": "No vistos",
   "library.filterPlayed": "Vistos",

@@ -70,6 +70,7 @@ func TestTMDBFetchMovieAndPersonAvatars(t *testing.T) {
 
 	// Default imageBaseURL -> w185 for profile images
 	p := New("test-key", "zh-CN")
+	p.SetHTTPClient(srv.Client())
 	_ = p.Configure(map[string]any{"base_url": srv.URL})
 
 	res, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
@@ -187,6 +188,7 @@ func TestTMDBFetchSeriesSeasonAndEpisode(t *testing.T) {
 	defer srv.Close()
 
 	p := New("test-key", "zh-CN")
+	p.SetHTTPClient(srv.Client())
 	_ = p.Configure(map[string]any{"base_url": srv.URL})
 
 	// Series
