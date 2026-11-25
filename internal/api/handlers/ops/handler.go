@@ -15,6 +15,7 @@ import (
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -75,7 +76,7 @@ func New(store *sqlite.Store, cfg *config.Config, userRepo *sqlite.UserRepo, bus
 		cfg:        cfg,
 		userRepo:   userRepo,
 		bus:        bus,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
+		httpClient: netutil.NewSafeHTTPClient(10*time.Second, true),
 		state: opsState{
 			Startup: StartupConfiguration{
 				ServerName:                "Ambra Media Server",
@@ -102,6 +103,26 @@ func New(store *sqlite.Store, cfg *config.Config, userRepo *sqlite.UserRepo, bus
 		h.subscribeWebhooks(bus)
 	}
 	return h
+}
+
+// SetHTTPClient overrides the HTTP client used for webhook delivery (primarily for testing).
+func (h *Handler) SetHTTPClient(client *http.Client) {
+	if client == nil {
+		return
+	}
+	h.mu.Lock()
+	h.httpClient = client
+	h.mu.Unlock()
+}
+
+func (h *Handler) getHTTPClient() *http.Client {
+	h.mu.RLock()
+	client := h.httpClient
+	h.mu.RUnlock()
+	if client == nil {
+		return netutil.NewSafeHTTPClient(10*time.Second, true)
+	}
+	return client
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {

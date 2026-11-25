@@ -98,15 +98,15 @@ describe('Stream 4 (v0.9.2): Webhooks Admin Tab, UsersTab Parental Controls & De
     fireEvent.change(screen.getByLabelText('HMAC 密钥（可选）'), {
       target: { value: 'super-secret-key' },
     })
-    // 取消勾选默认全部事件并选择 PlaybackStop & SessionStart
+    // 取消勾选默认全部事件并选择 PlaybackStop & SessionUpdated
     fireEvent.click(screen.getByLabelText(/PlaybackStop/))
-    fireEvent.click(screen.getByLabelText(/SessionStart/))
+    fireEvent.click(screen.getByLabelText(/SessionUpdated/))
     fireEvent.click(screen.getByRole('button', { name: '创建 Webhook' }))
 
     await screen.findByText('Slack 播放告警')
     expect(screen.getByText('https://hooks.slack.com/services/T00/B00/XXX')).toBeTruthy()
     expect(screen.getByText('PlaybackStop')).toBeTruthy()
-    expect(screen.getByText('SessionStart')).toBeTruthy()
+    expect(screen.getByText('SessionUpdated')).toBeTruthy()
 
     // 4. 编辑 Webhook
     fireEvent.click(within(initialCard).getByRole('button', { name: '编辑' }))

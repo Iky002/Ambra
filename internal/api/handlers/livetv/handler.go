@@ -2,7 +2,11 @@ package livetv
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -174,6 +178,7 @@ type Handler struct {
 	httpClient       *http.Client
 	streamClient     *http.Client
 	customHTTPClient bool
+	proxySecret      []byte
 	recorder         *dvr.Recorder
 	auth             AuthFuncs
 
@@ -182,11 +187,14 @@ type Handler struct {
 }
 
 func New(store *sqlite.Store, cfg *config.Config) *Handler {
+	secret := make([]byte, 32)
+	_, _ = rand.Read(secret)
 	h := &Handler{
 		store:        store,
 		cfg:          cfg,
 		httpClient:   netutil.NewSafeHTTPClient(15*time.Second, false),
 		streamClient: netutil.NewSafeHTTPClient(0, true),
+		proxySecret:  secret,
 	}
 	h.loadState(context.Background())
 	return h
@@ -541,6 +549,29 @@ const maxHLSPlaylistBytes = 2 << 20 // 2 MiB
 
 var hlsURIAttributeRe = regexp.MustCompile(`URI="([^"]+)"`)
 
+func (h *Handler) signProxyTarget(channelID, target string) string {
+	mac := hmac.New(sha256.New, h.proxySecret)
+	mac.Write([]byte(channelID))
+	mac.Write([]byte{0})
+	mac.Write([]byte(target))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (h *Handler) verifyProxyTarget(channelID, target, sig string) bool {
+	if len(h.proxySecret) == 0 {
+		return false
+	}
+	got, err := hex.DecodeString(strings.TrimSpace(sig))
+	if err != nil || len(got) != sha256.Size {
+		return false
+	}
+	mac := hmac.New(sha256.New, h.proxySecret)
+	mac.Write([]byte(channelID))
+	mac.Write([]byte{0})
+	mac.Write([]byte(target))
+	return hmac.Equal(got, mac.Sum(nil))
+}
+
 func (h *Handler) handleStreamChannel(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
 	ch, ok := h.GetChannelByID(id)
@@ -550,6 +581,11 @@ func (h *Handler) handleStreamChannel(w http.ResponseWriter, r *http.Request) {
 	}
 	streamURL := ch.StreamUrl
 	if target := strings.TrimSpace(r.URL.Query().Get("target")); target != "" {
+		sig := strings.TrimSpace(r.URL.Query().Get("sig"))
+		if !h.verifyProxyTarget(id, target, sig) {
+			httpx.Error(w, http.StatusForbidden, "invalid or missing target signature")
+			return
+		}
 		if err := netutil.ValidateRemoteURL(target, true); err != nil {
 			httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("unsafe target stream url: %v", err))
 			return
@@ -576,6 +612,12 @@ func (fw flushWriter) Write(p []byte) (int, error) {
 // metadata/link-local/non-HTTP URLs) and proxies the upstream live stream bound to r.Context().
 func (h *Handler) ProxyStreamURL(w http.ResponseWriter, r *http.Request, streamURL string) {
 	h.proxyChannelStream(w, r, "", streamURL)
+}
+
+// ProxyChannelStream validates streamURL and proxies the upstream live stream for channelID,
+// rewriting HLS playlist URIs with signed relative proxy URLs when channelID is non-empty.
+func (h *Handler) ProxyChannelStream(w http.ResponseWriter, r *http.Request, channelID, streamURL string) {
+	h.proxyChannelStream(w, r, channelID, streamURL)
 }
 
 func (h *Handler) proxyChannelStream(w http.ResponseWriter, r *http.Request, channelID, streamURL string) {
@@ -631,7 +673,11 @@ func (h *Handler) proxyChannelStream(w http.ResponseWriter, r *http.Request, cha
 		}
 
 		token := extractRequestToken(r)
-		rewritten := rewriteHLSPlaylist(string(raw), baseURL, channelID, token)
+		proxyBase := "Stream"
+		if r != nil && strings.Contains(strings.ToLower(r.URL.Path), "/livestreamfiles/") {
+			proxyBase = "../../Channels/" + url.PathEscape(channelID) + "/Stream"
+		}
+		rewritten := h.rewriteHLSPlaylist(string(raw), baseURL, channelID, proxyBase, token)
 		if ct == "" {
 			ct = "application/vnd.apple.mpegurl"
 		}
@@ -668,7 +714,10 @@ func isHLSPlaylistResponse(contentType string, u *url.URL) bool {
 	return false
 }
 
-func rewriteHLSPlaylist(playlist string, baseURL *url.URL, channelID, token string) string {
+func (h *Handler) rewriteHLSPlaylist(playlist string, baseURL *url.URL, channelID, proxyBase, token string) string {
+	if proxyBase == "" {
+		proxyBase = "Stream"
+	}
 	rewriteURI := func(rawURI string) string {
 		trimmed := strings.TrimSpace(rawURI)
 		if trimmed == "" || baseURL == nil {
@@ -683,7 +732,9 @@ func rewriteHLSPlaylist(playlist string, baseURL *url.URL, channelID, token stri
 		if scheme != "http" && scheme != "https" {
 			return rawURI
 		}
-		proxied := "/emby/LiveTv/Channels/" + url.PathEscape(channelID) + "/Stream?target=" + url.QueryEscape(resolved.String())
+		resolvedStr := resolved.String()
+		sig := h.signProxyTarget(channelID, resolvedStr)
+		proxied := proxyBase + "?target=" + url.QueryEscape(resolvedStr) + "&sig=" + sig
 		if token != "" {
 			proxied += "&api_key=" + url.QueryEscape(token)
 		}
@@ -1540,9 +1591,12 @@ func (h *Handler) handleSaveListingProvider(w http.ResponseWriter, r *http.Reque
 
 	var guide *XMLTVGuide
 	if strings.EqualFold(lp.Type, "xmltv") && strings.TrimSpace(lp.Path) != "" {
-		if parsed, err := h.loadXMLTVFromSource(r.Context(), lp.Path); err == nil {
-			guide = parsed
+		parsed, err := h.loadXMLTVFromSource(r.Context(), lp.Path)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("failed to load xmltv guide: %v", err))
+			return
 		}
+		guide = parsed
 	}
 
 	h.mu.Lock()
@@ -1607,7 +1661,7 @@ func (h *Handler) loadXMLTVFromSource(ctx context.Context, src string) (*XMLTVGu
 		return nil, err
 	}
 	defer f.Close()
-	return ParseXMLTV(f)
+	return ParseXMLTV(io.LimitReader(f, maxXMLTVDecompressedBytes+1))
 }
 
 func (h *Handler) validateLocalXMLTVPath(ctx context.Context, rawPath string) (string, error) {

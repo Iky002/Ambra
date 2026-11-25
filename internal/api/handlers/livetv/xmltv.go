@@ -33,9 +33,18 @@ type XMLTVGuide struct {
 	Programmes []XMLTVProgramme
 }
 
+const (
+	maxXMLTVDecompressedBytes int64 = 100 << 20 // 100 MiB max decompressed XMLTV stream
+	maxXMLTVProgrammes        int   = 200000
+)
+
 // ParseXMLTV parses an XMLTV EPG feed from r using streaming XML decoding.
 // Both plain XML (.xml) and gzip-compressed XML (.xml.gz) streams are detected automatically.
 func ParseXMLTV(r io.Reader) (*XMLTVGuide, error) {
+	return parseXMLTVWithLimits(r, maxXMLTVDecompressedBytes, maxXMLTVProgrammes)
+}
+
+func parseXMLTVWithLimits(r io.Reader, maxBytes int64, maxProgrammes int) (*XMLTVGuide, error) {
 	if r == nil {
 		return nil, errors.New("xmltv reader is nil")
 	}
@@ -49,6 +58,12 @@ func ParseXMLTV(r io.Reader) (*XMLTVGuide, error) {
 		}
 		defer gz.Close()
 		src = gz
+	}
+
+	var limited *io.LimitedReader
+	if maxBytes > 0 {
+		limited = &io.LimitedReader{R: src, N: maxBytes + 1}
+		src = limited
 	}
 
 	type rawChannel struct {
@@ -70,10 +85,16 @@ func ParseXMLTV(r io.Reader) (*XMLTVGuide, error) {
 	for {
 		tok, err := dec.Token()
 		if err != nil {
+			if limited != nil && limited.N <= 0 {
+				return nil, fmt.Errorf("xmltv decompressed size exceeds %d byte limit", maxBytes)
+			}
 			if errors.Is(err, io.EOF) {
 				break
 			}
 			return nil, fmt.Errorf("decode xmltv: %w", err)
+		}
+		if limited != nil && limited.N <= 0 {
+			return nil, fmt.Errorf("xmltv decompressed size exceeds %d byte limit", maxBytes)
 		}
 		se, ok := tok.(xml.StartElement)
 		if !ok {
@@ -83,6 +104,9 @@ func ParseXMLTV(r io.Reader) (*XMLTVGuide, error) {
 		case "channel":
 			var rc rawChannel
 			if err := dec.DecodeElement(&rc, &se); err != nil {
+				if limited != nil && limited.N <= 0 {
+					return nil, fmt.Errorf("xmltv decompressed size exceeds %d byte limit", maxBytes)
+				}
 				return nil, fmt.Errorf("decode xmltv channel: %w", err)
 			}
 			id := strings.TrimSpace(rc.ID)
@@ -101,8 +125,14 @@ func ParseXMLTV(r io.Reader) (*XMLTVGuide, error) {
 			})
 
 		case "programme":
+			if maxProgrammes > 0 && len(guide.Programmes) >= maxProgrammes {
+				return guide, nil
+			}
 			var rp rawProgramme
 			if err := dec.DecodeElement(&rp, &se); err != nil {
+				if limited != nil && limited.N <= 0 {
+					return nil, fmt.Errorf("xmltv decompressed size exceeds %d byte limit", maxBytes)
+				}
 				return nil, fmt.Errorf("decode xmltv programme: %w", err)
 			}
 			chID := strings.TrimSpace(rp.Channel)
@@ -138,6 +168,10 @@ func ParseXMLTV(r io.Reader) (*XMLTVGuide, error) {
 				Categories: cats,
 			})
 		}
+	}
+
+	if limited != nil && limited.N <= 0 {
+		return nil, fmt.Errorf("xmltv decompressed size exceeds %d byte limit", maxBytes)
 	}
 
 	return guide, nil

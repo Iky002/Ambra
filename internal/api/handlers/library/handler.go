@@ -180,6 +180,39 @@ func isLibraryAllowed(libID string, allowed []string) bool {
 	return false
 }
 
+// userParentalPolicyForRequest resolves parental control restrictions (MaxParentalRating, BlockedTags)
+// for the authenticated caller, exempting administrators and API keys.
+func (h *Handler) userParentalPolicyForRequest(r *http.Request, fallbackUserID string) (*int, []string) {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil {
+		if ac.IsAPIKey || ac.IsAdmin() {
+			return nil, nil
+		}
+	}
+	uid := ""
+	if h.auth.UserIDFromCtx != nil {
+		uid = guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+	}
+	if uid == "" {
+		if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil {
+			uid = guid.Normalize(ac.UserID())
+		}
+	}
+	if uid == "" {
+		uid = guid.Normalize(fallbackUserID)
+	}
+	if h.userRepo == nil || uid == "" {
+		return nil, nil
+	}
+	u, err := h.userRepo.GetUserByID(r.Context(), uid)
+	if err != nil || u == nil {
+		return nil, nil
+	}
+	if u.IsAdmin || u.Policy.IsAdministrator {
+		return nil, nil
+	}
+	return u.Policy.MaxParentalRating, u.Policy.BlockedTags
+}
+
 func (h *Handler) handleUserViews(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
@@ -277,11 +310,14 @@ func (h *Handler) handleQueryItems(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 	filter := sqlite.ItemFilter{
 		ServerID:               h.serverID(),
 		UserID:                 userID,
 		ParentID:               q.Get("ParentId"),
 		AllowedLibraryIDs:      h.allowedLibrariesForRequest(r, userID),
+		MaxParentalRating:      maxRating,
+		BlockedTags:            blockedTags,
 		Recursive:              rec,
 		IncludeItemTypes:       q.List("IncludeItemTypes"),
 		ExcludeItemTypes:       q.List("ExcludeItemTypes"),
@@ -322,7 +358,8 @@ func (h *Handler) handleLatestItems(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
-	items, err := h.repo.GetLatestItemsWithAllowedLibraries(
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	items, err := h.repo.GetLatestItemsWithPolicy(
 		r.Context(),
 		h.serverID(),
 		userID,
@@ -331,6 +368,8 @@ func (h *Handler) handleLatestItems(w http.ResponseWriter, r *http.Request) {
 		q.Int("Limit", 16),
 		q.List("Fields"),
 		allowed,
+		maxRating,
+		blockedTags,
 	)
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -344,7 +383,8 @@ func (h *Handler) handleResumeItems(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
-	items, total, err := h.repo.GetResumeItemsWithAllowedLibraries(
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	items, total, err := h.repo.GetResumeItemsWithPolicy(
 		r.Context(),
 		h.serverID(),
 		userID,
@@ -354,6 +394,8 @@ func (h *Handler) handleResumeItems(w http.ResponseWriter, r *http.Request) {
 		q.Int("Limit", 20),
 		q.List("Fields"),
 		allowed,
+		maxRating,
+		blockedTags,
 	)
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -370,6 +412,7 @@ func (h *Handler) handleGetItem(w http.ResponseWriter, r *http.Request) {
 	userID := h.resolveUserID(r, q)
 	itemID := r.PathValue("Id")
 	allowed := h.allowedLibrariesForRequest(r, userID)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 	item, err := h.repo.GetItemByID(r.Context(), h.serverID(), userID, itemID)
 	if errors.Is(err, sqlite.ErrNotFound) {
 		if lib, libErr := h.repo.GetLibrary(r.Context(), itemID); libErr == nil && lib != nil {
@@ -387,9 +430,16 @@ func (h *Handler) handleGetItem(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if allowed != nil {
-		if rec, recErr := h.repo.GetItemRecordByID(r.Context(), itemID); recErr == nil && rec != nil && rec.LibraryID != "" {
-			if !isLibraryAllowed(rec.LibraryID, allowed) {
+	if allowed != nil || maxRating != nil || len(blockedTags) > 0 {
+		if rec, recErr := h.repo.GetItemRecordByID(r.Context(), itemID); recErr == nil && rec != nil {
+			if allowed != nil && rec.LibraryID != "" && !isLibraryAllowed(rec.LibraryID, allowed) {
+				httpx.Error(w, http.StatusForbidden, "access denied")
+				return
+			}
+			if blocked, blockErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags); blockErr != nil {
+				httpx.Error(w, http.StatusInternalServerError, blockErr.Error())
+				return
+			} else if blocked {
 				httpx.Error(w, http.StatusForbidden, "access denied")
 				return
 			}
@@ -415,6 +465,7 @@ func (h *Handler) handleShowSeasons(w http.ResponseWriter, r *http.Request) {
 	seriesID := r.PathValue("Id")
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 	if allowed != nil {
 		if rec, recErr := h.repo.GetItemRecordByID(r.Context(), seriesID); recErr == nil && rec != nil && rec.LibraryID != "" {
 			if !isLibraryAllowed(rec.LibraryID, allowed) {
@@ -428,6 +479,8 @@ func (h *Handler) handleShowSeasons(w http.ResponseWriter, r *http.Request) {
 		UserID:            userID,
 		SeriesID:          seriesID,
 		AllowedLibraryIDs: allowed,
+		MaxParentalRating: maxRating,
+		BlockedTags:       blockedTags,
 		IncludeItemTypes:  []string{"Season"},
 		SortBy:            []string{"IndexNumber"},
 		SortOrder:         "Ascending",
@@ -448,6 +501,7 @@ func (h *Handler) handleShowEpisodes(w http.ResponseWriter, r *http.Request) {
 	seriesID := r.PathValue("Id")
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 	if allowed != nil {
 		if rec, recErr := h.repo.GetItemRecordByID(r.Context(), seriesID); recErr == nil && rec != nil && rec.LibraryID != "" {
 			if !isLibraryAllowed(rec.LibraryID, allowed) {
@@ -462,6 +516,8 @@ func (h *Handler) handleShowEpisodes(w http.ResponseWriter, r *http.Request) {
 		SeriesID:          seriesID,
 		SeasonID:          q.Get("SeasonId"),
 		AllowedLibraryIDs: allowed,
+		MaxParentalRating: maxRating,
+		BlockedTags:       blockedTags,
 		IncludeItemTypes:  []string{"Episode"},
 		SortBy:            []string{"IndexNumber"},
 		SortOrder:         "Ascending",
@@ -482,7 +538,8 @@ func (h *Handler) handleShowEpisodes(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleNextUp(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
-	items, total, err := h.repo.GetNextUpEpisodesWithAllowedLibraries(
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	items, total, err := h.repo.GetNextUpEpisodesWithPolicy(
 		r.Context(),
 		h.serverID(),
 		userID,
@@ -490,6 +547,8 @@ func (h *Handler) handleNextUp(w http.ResponseWriter, r *http.Request) {
 		q.Int("Limit", 20),
 		q.List("Fields"),
 		h.allowedLibrariesForRequest(r, userID),
+		maxRating,
+		blockedTags,
 	)
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -504,10 +563,13 @@ func (h *Handler) handleNextUp(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleSearchHints(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 	hints, total, err := h.repo.SearchHints(r.Context(), sqlite.SearchHintFilter{
 		UserID:            userID,
 		ParentID:          q.Get("ParentId"),
 		AllowedLibraryIDs: h.allowedLibrariesForRequest(r, userID),
+		MaxParentalRating: maxRating,
+		BlockedTags:       blockedTags,
 		SearchTerm:        q.Get("SearchTerm"),
 		IncludeItemTypes:  q.List("IncludeItemTypes"),
 		Limit:             q.Int("Limit", 24),

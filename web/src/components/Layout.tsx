@@ -30,6 +30,7 @@ import { useAuth } from '../context/AuthContext'
 import { isDemoMode } from '../demo/demoMode'
 import { AmbraLogo } from './AmbraLogo'
 import { AudioPlayerBar } from './AudioPlayerBar'
+import { NotificationBell } from './NotificationBell'
 import { ScanProgressBar } from './ScanProgressBar'
 import { SearchModal } from './SearchModal'
 
@@ -352,6 +353,7 @@ export function Layout() {
           </div>
 
           <div className="flex items-center gap-2">
+            <NotificationBell />
             <Link
               to="/favorites"
               className="hidden items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium text-zinc-400 transition-colors hover:bg-white/8 hover:text-zinc-100 sm:flex"

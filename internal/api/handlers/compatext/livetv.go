@@ -198,7 +198,7 @@ func (h *Handler) handleLiveStreamFile(w http.ResponseWriter, r *http.Request) {
 	h.mu.RUnlock()
 	if lt != nil {
 		if ch, ok := lt.GetChannelByID(id); ok && strings.TrimSpace(ch.StreamUrl) != "" {
-			lt.ProxyStreamURL(w, r, ch.StreamUrl)
+			lt.ProxyChannelStream(w, r, ch.Id, ch.StreamUrl)
 			return
 		}
 	}

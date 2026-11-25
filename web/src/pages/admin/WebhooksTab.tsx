@@ -19,23 +19,23 @@ import { AdminModal, FeedbackBanner, ToggleSwitch } from './adminUtils'
 export const WEBHOOK_EVENT_OPTIONS = [
   { id: '*', label: '全部事件 (*)', desc: '接收所有系统与播放事件推送' },
   { id: 'LibraryChanged', label: '媒体库变更 (LibraryChanged)', desc: '新媒体入库或元数据更新时触发' },
-  { id: 'PlaybackStart', label: '开始播放 (PlaybackStart)', desc: '用户开始播放音视频时触发' },
-  { id: 'PlaybackStop', label: '停止播放 (PlaybackStop)', desc: '用户停止播放或播完时触发' },
   { id: 'UserDataChanged', label: '用户数据变更 (UserDataChanged)', desc: '收藏、已看状态或进度变更时触发' },
+  { id: 'PlaybackStart', label: '开始播放 (PlaybackStart)', desc: '用户开始播放音视频时触发' },
+  { id: 'PlaybackProgress', label: '播放进度 (PlaybackProgress)', desc: '用户播放进度更新或暂停恢复时触发' },
+  { id: 'PlaybackStop', label: '停止播放 (PlaybackStop)', desc: '用户停止播放或播完时触发' },
+  { id: 'SessionUpdated', label: '会话状态更新 (SessionUpdated)', desc: '客户端会话建立、活跃状态或设备变更时触发' },
   { id: 'TaskProgress', label: '计划任务进度 (TaskProgress)', desc: '后台计划任务执行状态变更时触发' },
-  { id: 'SessionStart', label: '会话开始 (SessionStart)', desc: '新客户端登录并建立会话时触发' },
-  { id: 'SessionEnd', label: '会话结束 (SessionEnd)', desc: '客户端注销或会话断开时触发' },
 ] as const
 
 const EVENT_LABEL_MAP: Record<string, string> = {
   '*': '全部事件 (*)',
   LibraryChanged: 'LibraryChanged',
-  PlaybackStart: 'PlaybackStart',
-  PlaybackStop: 'PlaybackStop',
   UserDataChanged: 'UserDataChanged',
+  PlaybackStart: 'PlaybackStart',
+  PlaybackProgress: 'PlaybackProgress',
+  PlaybackStop: 'PlaybackStop',
+  SessionUpdated: 'SessionUpdated',
   TaskProgress: 'TaskProgress',
-  SessionStart: 'SessionStart',
-  SessionEnd: 'SessionEnd',
 }
 
 export function WebhooksTab() {
@@ -54,6 +54,7 @@ export function WebhooksTab() {
   const [enabled, setEnabled] = useState(true)
   const [events, setEvents] = useState<string[]>(['*'])
   const [saving, setSaving] = useState(false)
+  const [modalError, setModalError] = useState<string | null>(null)
 
   // 发送测试状态与每条 Webhook 的最近测试结果
   const [testingId, setTestingId] = useState<string | null>(null)
@@ -85,6 +86,7 @@ export function WebhooksTab() {
     setSecret('')
     setEnabled(true)
     setEvents(['*'])
+    setModalError(null)
     setModalOpen(true)
   }
 
@@ -95,7 +97,23 @@ export function WebhooksTab() {
     setSecret(wh.Secret || '')
     setEnabled(wh.Enabled)
     setEvents(Array.isArray(wh.Events) && wh.Events.length > 0 ? [...wh.Events] : ['*'])
+    setModalError(null)
     setModalOpen(true)
+  }
+
+  const closeEditModal = () => {
+    setModalOpen(false)
+    setModalError(null)
+  }
+
+  const openDeleteModal = (wh: WebhookInfo) => {
+    setModalError(null)
+    setDeleteTarget(wh)
+  }
+
+  const closeDeleteModal = () => {
+    setDeleteTarget(null)
+    setModalError(null)
   }
 
   const toggleEvent = (eventId: string) => {
@@ -116,19 +134,20 @@ export function WebhooksTab() {
     const trimmedName = name.trim()
     const trimmedUrl = url.trim()
     if (!trimmedName) {
-      setFeedback({ type: 'error', message: '请输入 Webhook 名称' })
+      setModalError('请输入 Webhook 名称')
       return
     }
     if (!trimmedUrl) {
-      setFeedback({ type: 'error', message: '请输入目标推送 URL' })
+      setModalError('请输入目标推送 URL')
       return
     }
     if (events.length === 0) {
-      setFeedback({ type: 'error', message: '请至少选择一个订阅事件' })
+      setModalError('请至少选择一个订阅事件')
       return
     }
 
     setSaving(true)
+    setModalError(null)
     setFeedback(null)
     try {
       await api.saveWebhook({
@@ -141,6 +160,7 @@ export function WebhooksTab() {
       })
       await invalidateWebhooks()
       setModalOpen(false)
+      setModalError(null)
       setFeedback({
         type: 'success',
         message: editingId
@@ -148,10 +168,7 @@ export function WebhooksTab() {
           : `已创建 Webhook「${trimmedName}」`,
       })
     } catch (err) {
-      setFeedback({
-        type: 'error',
-        message: err instanceof Error ? err.message : '保存 Webhook 失败',
-      })
+      setModalError(err instanceof Error ? err.message : '保存 Webhook 失败')
     } finally {
       setSaving(false)
     }
@@ -198,6 +215,7 @@ export function WebhooksTab() {
   const handleDelete = async () => {
     if (!deleteTarget) return
     setDeleting(true)
+    setModalError(null)
     setFeedback(null)
     try {
       await api.deleteWebhook(deleteTarget.Id)
@@ -209,11 +227,9 @@ export function WebhooksTab() {
       })
       setFeedback({ type: 'success', message: `已删除 Webhook「${deleteTarget.Name}」` })
       setDeleteTarget(null)
+      setModalError(null)
     } catch (err) {
-      setFeedback({
-        type: 'error',
-        message: err instanceof Error ? err.message : '删除 Webhook 失败',
-      })
+      setModalError(err instanceof Error ? err.message : '删除 Webhook 失败')
     } finally {
       setDeleting(false)
     }
@@ -373,7 +389,7 @@ export function WebhooksTab() {
 
                     <button
                       type="button"
-                      onClick={() => setDeleteTarget(wh)}
+                      onClick={() => openDeleteModal(wh)}
                       className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20"
                     >
                       <Trash2 className="h-3.5 w-3.5" />
@@ -393,9 +409,18 @@ export function WebhooksTab() {
         title={editingId ? '编辑 Webhook' : '新增 Webhook'}
         subtitle="配置目标推送地址、可选签名密钥以及需要监听的事件类型"
         maxWidthClass="max-w-xl"
-        onClose={() => setModalOpen(false)}
+        onClose={closeEditModal}
       >
         <form onSubmit={handleSave} className="space-y-4">
+          {modalError && (
+            <div role="alert">
+              <FeedbackBanner
+                message={modalError}
+                type="error"
+                onClose={() => setModalError(null)}
+              />
+            </div>
+          )}
           <div>
             <label
               htmlFor="webhook-name-input"
@@ -489,7 +514,7 @@ export function WebhooksTab() {
           <div className="flex justify-end gap-2 pt-2">
             <button
               type="button"
-              onClick={() => setModalOpen(false)}
+              onClick={closeEditModal}
               className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
             >
               取消
@@ -512,8 +537,17 @@ export function WebhooksTab() {
         title="确认删除 Webhook"
         subtitle="删除后将不再向此端点发送任何事件通知"
         maxWidthClass="max-w-md"
-        onClose={() => setDeleteTarget(null)}
+        onClose={closeDeleteModal}
       >
+        {modalError && (
+          <div role="alert" className="mb-4">
+            <FeedbackBanner
+              message={modalError}
+              type="error"
+              onClose={() => setModalError(null)}
+            />
+          </div>
+        )}
         <p className="text-sm text-zinc-300">
           确定要删除 Webhook <span className="font-semibold text-white">{deleteTarget?.Name}</span>{' '}
           吗？
@@ -521,7 +555,7 @@ export function WebhooksTab() {
         <div className="mt-6 flex justify-end gap-2">
           <button
             type="button"
-            onClick={() => setDeleteTarget(null)}
+            onClick={closeDeleteModal}
             className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
           >
             取消

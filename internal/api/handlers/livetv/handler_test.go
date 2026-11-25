@@ -373,11 +373,18 @@ func TestLiveTVRecordingsTimersSeriesTimersAndListingProviders(t *testing.T) {
 	if r := doJSON(t, mux, http.MethodPost, "/LiveTv/ListingProviders", "{bad"); r.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", r.Code)
 	}
+	// Invalid/unreachable XMLTV path must fail with 400 instead of silently succeeding
+	if r := doJSON(t, mux, http.MethodPost, "/LiveTv/ListingProviders", map[string]any{
+		"Path": "http://169.254.169.254/guide.xml",
+	}); r.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on blocked xmltv path, got %d", r.Code)
+	}
+	// Empty path saves gracefully
 	res = doJSON(t, mux, http.MethodPost, "/LiveTv/ListingProviders", map[string]any{
-		"Path": "http://epg.local/guide.xml",
+		"Type": "xmltv",
 	})
 	if res.Code != http.StatusOK {
-		t.Fatalf("POST /LiveTv/ListingProviders status=%d", res.Code)
+		t.Fatalf("POST /LiveTv/ListingProviders status=%d body=%s", res.Code, res.Body.String())
 	}
 	var lp ListingProviderInfo
 	_ = json.Unmarshal(res.Body.Bytes(), &lp)
@@ -706,7 +713,7 @@ func TestDueRecordingJobsAndDVRIntegration(t *testing.T) {
 }
 
 func TestHLSPlaylistURIRewritingAndTargetSSRF(t *testing.T) {
-	_, mux, _, _ := setupLiveTVTest(t)
+	h, mux, _, _ := setupLiveTVTest(t)
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -746,7 +753,7 @@ func TestHLSPlaylistURIRewritingAndTargetSSRF(t *testing.T) {
 	_ = json.Unmarshal(doJSON(t, mux, http.MethodGet, "/LiveTv/Channels", nil).Body.Bytes(), &chRes)
 	chID := chRes.Items[0].Id
 
-	// 1. Request master playlist with api_key query param
+	// 1. Request master playlist with api_key query param -> relative signed Stream?target=...&sig=...
 	req := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?api_key=tok-query", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -754,17 +761,22 @@ func TestHLSPlaylistURIRewritingAndTargetSSRF(t *testing.T) {
 		t.Fatalf("master m3u8 status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	wantAudio := `URI="/emby/LiveTv/Channels/` + chID + `/Stream?target=` + url.QueryEscape(upstream.URL+"/hls/audio/eng.m3u8") + `&api_key=tok-query"`
-	wantSub := "/emby/LiveTv/Channels/" + chID + "/Stream?target=" + url.QueryEscape(upstream.URL+"/hls/sub/720p.m3u8") + "&api_key=tok-query"
+	audioTarget := upstream.URL + "/hls/audio/eng.m3u8"
+	subTarget := upstream.URL + "/hls/sub/720p.m3u8"
+	wantAudio := `URI="Stream?target=` + url.QueryEscape(audioTarget) + `&sig=` + h.signProxyTarget(chID, audioTarget) + `&api_key=tok-query"`
+	wantSub := "Stream?target=" + url.QueryEscape(subTarget) + "&sig=" + h.signProxyTarget(chID, subTarget) + "&api_key=tok-query"
 	if !strings.Contains(body, wantAudio) {
 		t.Fatalf("expected rewritten EXT-X-MEDIA URI %q in:\n%s", wantAudio, body)
 	}
 	if !strings.Contains(body, wantSub) {
 		t.Fatalf("expected rewritten sub-playlist URI %q in:\n%s", wantSub, body)
 	}
+	if strings.Contains(body, "/emby/") {
+		t.Fatalf("expected relative rewrite without /emby/ prefix, got:\n%s", body)
+	}
 
-	// 2. Request sub-playlist via target query param + X-Emby-Token header
-	subReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?target="+url.QueryEscape(upstream.URL+"/hls/sub/720p.m3u8"), nil)
+	// 2. Request sub-playlist via signed target query param + X-Emby-Token header
+	subReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?target="+url.QueryEscape(subTarget)+"&sig="+h.signProxyTarget(chID, subTarget), nil)
 	subReq.Header.Set("X-Emby-Token", "tok-header")
 	subRec := httptest.NewRecorder()
 	mux.ServeHTTP(subRec, subReq)
@@ -772,10 +784,14 @@ func TestHLSPlaylistURIRewritingAndTargetSSRF(t *testing.T) {
 		t.Fatalf("sub m3u8 status=%d body=%s", subRec.Code, subRec.Body.String())
 	}
 	subBody := subRec.Body.String()
-	wantKey := `URI="/emby/LiveTv/Channels/` + chID + `/Stream?target=` + url.QueryEscape(upstream.URL+"/hls/keys/enc.key") + `&api_key=tok-header"`
-	wantMap := `URI="/emby/LiveTv/Channels/` + chID + `/Stream?target=` + url.QueryEscape(upstream.URL+"/hls/sub/init.mp4") + `&api_key=tok-header"`
-	wantSeg0 := "/emby/LiveTv/Channels/" + chID + "/Stream?target=" + url.QueryEscape(upstream.URL+"/hls/sub/seg0.ts") + "&api_key=tok-header"
-	wantSeg1 := "/emby/LiveTv/Channels/" + chID + "/Stream?target=" + url.QueryEscape(upstream.URL+"/cdn/seg1.ts") + "&api_key=tok-header"
+	keyTarget := upstream.URL + "/hls/keys/enc.key"
+	mapTarget := upstream.URL + "/hls/sub/init.mp4"
+	seg0Target := upstream.URL + "/hls/sub/seg0.ts"
+	seg1Target := upstream.URL + "/cdn/seg1.ts"
+	wantKey := `URI="Stream?target=` + url.QueryEscape(keyTarget) + `&sig=` + h.signProxyTarget(chID, keyTarget) + `&api_key=tok-header"`
+	wantMap := `URI="Stream?target=` + url.QueryEscape(mapTarget) + `&sig=` + h.signProxyTarget(chID, mapTarget) + `&api_key=tok-header"`
+	wantSeg0 := "Stream?target=" + url.QueryEscape(seg0Target) + "&sig=" + h.signProxyTarget(chID, seg0Target) + "&api_key=tok-header"
+	wantSeg1 := "Stream?target=" + url.QueryEscape(seg1Target) + "&sig=" + h.signProxyTarget(chID, seg1Target) + "&api_key=tok-header"
 	for _, want := range []string{wantKey, wantMap, wantSeg0, wantSeg1} {
 		if !strings.Contains(subBody, want) {
 			t.Fatalf("expected %q in rewritten sub-playlist:\n%s", want, subBody)
@@ -791,29 +807,51 @@ func TestHLSPlaylistURIRewritingAndTargetSSRF(t *testing.T) {
 		t.Fatalf("expected Authorization token preserved, got %d:\n%s", authRec.Code, authRec.Body.String())
 	}
 
-	// 4. Proxy actual TS segment via target param
-	segReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?target="+url.QueryEscape(upstream.URL+"/hls/sub/seg0.ts"), nil)
+	// 4. Proxy actual TS segment via signed target param
+	segReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?target="+url.QueryEscape(seg0Target)+"&sig="+h.signProxyTarget(chID, seg0Target), nil)
 	segRec := httptest.NewRecorder()
 	mux.ServeHTTP(segRec, segReq)
 	if segRec.Code != http.StatusOK || segRec.Body.String() != "SEGMENT_0_BYTES" {
 		t.Fatalf("expected segment bytes, got %d %q", segRec.Code, segRec.Body.String())
 	}
 
-	// 5. SSRF protection on target param
+	// 5. Missing, forged, or cross-channel HMAC signature on target param -> 403 Forbidden
+	for _, tc := range []struct {
+		name  string
+		query string
+	}{
+		{"missing sig", "target=" + url.QueryEscape(seg0Target)},
+		{"invalid hex sig", "target=" + url.QueryEscape(seg0Target) + "&sig=not-hex"},
+		{"wrong sig", "target=" + url.QueryEscape(seg0Target) + "&sig=" + strings.Repeat("a", 64)},
+		{"wrong channel sig", "target=" + url.QueryEscape(seg0Target) + "&sig=" + h.signProxyTarget("other-channel", seg0Target)},
+		{"unsigned ssrf target", "target=" + url.QueryEscape("http://169.254.169.254/latest/meta-data/")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			badReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?"+tc.query, nil)
+			badRec := httptest.NewRecorder()
+			mux.ServeHTTP(badRec, badReq)
+			if badRec.Code != http.StatusForbidden {
+				t.Fatalf("expected 403 for %s, got %d body=%s", tc.name, badRec.Code, badRec.Body.String())
+			}
+		})
+	}
+
+	// 6. Defense-in-depth: even with a valid signature, SSRF/unsafe targets are blocked with 400
 	for _, unsafeTarget := range []string{
 		"http://169.254.169.254/latest/meta-data/",
 		"file:///etc/passwd",
 	} {
-		badReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?target="+url.QueryEscape(unsafeTarget), nil)
+		sig := h.signProxyTarget(chID, unsafeTarget)
+		badReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?target="+url.QueryEscape(unsafeTarget)+"&sig="+sig, nil)
 		badRec := httptest.NewRecorder()
 		mux.ServeHTTP(badRec, badReq)
 		if badRec.Code != http.StatusBadRequest {
-			t.Fatalf("expected 400 for unsafe target %q, got %d body=%s", unsafeTarget, badRec.Code, badRec.Body.String())
+			t.Fatalf("expected 400 for signed unsafe target %q, got %d body=%s", unsafeTarget, badRec.Code, badRec.Body.String())
 		}
 	}
 
-	// 6. Unknown channel ID with valid target must still return 404
-	notFoundReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/missing/Stream?target="+url.QueryEscape(upstream.URL+"/hls/sub/seg0.ts"), nil)
+	// 7. Unknown channel ID with target must still return 404
+	notFoundReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/missing/Stream?target="+url.QueryEscape(seg0Target), nil)
 	notFoundRec := httptest.NewRecorder()
 	mux.ServeHTTP(notFoundRec, notFoundReq)
 	if notFoundRec.Code != http.StatusNotFound {
@@ -1010,14 +1048,23 @@ func TestXMLTVParserAndListingProviderImport(t *testing.T) {
 		t.Fatalf("missing expected programs: news=%v movie=%v unmatched=%v", foundNews, foundMovie, foundUnmatched)
 	}
 
-	// 2. Outside DataDir XML file is blocked gracefully (provider saves 200, existing programs kept)
+	// 2. Outside DataDir XML, SSRF URL, and malformed XML return 400 Bad Request
 	outsideXML := filepath.Join(t.TempDir(), "evil.xml")
 	_ = os.WriteFile(outsideXML, []byte(`<tv><programme start="20260501100000" stop="20260501110000" channel="cctv1.cn"><title>Evil</title></programme></tv>`), 0o600)
-	if r := doJSON(t, mux, http.MethodPost, "/LiveTv/ListingProviders", map[string]any{
-		"Type": "xmltv",
-		"Path": outsideXML,
-	}); r.Code != http.StatusOK {
-		t.Fatalf("expected graceful 200 on blocked local xmltv, got %d", r.Code)
+	invalidXML := filepath.Join(cfg.DataDir, "broken.xml")
+	_ = os.WriteFile(invalidXML, []byte(`<tv><programme><unclosed>`), 0o600)
+	for _, badPath := range []string{
+		outsideXML,
+		invalidXML,
+		"http://169.254.169.254/guide.xml",
+		"file:///etc/passwd",
+	} {
+		if r := doJSON(t, mux, http.MethodPost, "/LiveTv/ListingProviders", map[string]any{
+			"Type": "xmltv",
+			"Path": badPath,
+		}); r.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for bad xmltv path %q, got %d body=%s", badPath, r.Code, r.Body.String())
+		}
 	}
 	var progAfter dto.QueryResult[ProgramInfo]
 	_ = json.Unmarshal(doJSON(t, mux, http.MethodGet, "/LiveTv/Programs", nil).Body.Bytes(), &progAfter)
@@ -1044,5 +1091,80 @@ func TestXMLTVParserAndListingProviderImport(t *testing.T) {
 	_ = json.Unmarshal(doJSON(t, mux, http.MethodGet, "/LiveTv/Programs?ChannelIds="+chByName["CCTV 1"].Id, nil).Body.Bytes(), &progHTTP)
 	if progHTTP.TotalRecordCount != 1 || progHTTP.Items[0].Name != "Morning Show" || !progHTTP.Items[0].IsSeries {
 		t.Fatalf("expected HTTP XMLTV to replace CCTV 1 program, got %+v", progHTTP.Items)
+	}
+}
+
+func TestXMLTVGzipBombAndProgrammeCap(t *testing.T) {
+	// 1. Gzip bomb exceeding decompressed byte cap must fail
+	var rawBuf bytes.Buffer
+	rawBuf.WriteString("<tv>")
+	for i := 0; i < 64; i++ {
+		rawBuf.WriteString(`<programme start="20260501100000" stop="20260501110000" channel="ch1"><title>Show `)
+		rawBuf.WriteString(strings.Repeat("A", 128))
+		rawBuf.WriteString(`</title></programme>`)
+	}
+	rawBuf.WriteString("</tv>")
+
+	var gzBuf bytes.Buffer
+	gzw := gzip.NewWriter(&gzBuf)
+	_, _ = gzw.Write(rawBuf.Bytes())
+	_ = gzw.Close()
+
+	if _, err := parseXMLTVWithLimits(bytes.NewReader(gzBuf.Bytes()), 1024, 200000); err == nil || !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("expected decompressed size limit error, got %v", err)
+	}
+
+	// 2. Programme count cap truncates cleanly at maxProgrammes
+	guide, err := parseXMLTVWithLimits(bytes.NewReader(rawBuf.Bytes()), 10<<20, 5)
+	if err != nil {
+		t.Fatalf("expected capped parse to succeed, got %v", err)
+	}
+	if len(guide.Programmes) != 5 {
+		t.Fatalf("expected 5 capped programmes, got %d", len(guide.Programmes))
+	}
+}
+
+func TestDVRStartFailureTransitionsTimerToFailed(t *testing.T) {
+	h, mux, st, cfg := setupLiveTVTest(t)
+
+	rec := dvr.NewRecorder(dvr.Options{
+		DataDir:    cfg.DataDir,
+		FFmpegPath: filepath.Join(cfg.DataDir, "nonexistent-ffmpeg-binary"),
+	})
+	defer func() { _ = rec.Close() }()
+	h.SetRecorder(rec)
+	rec.SetOnFinished(h.OnRecordingFinished)
+
+	res := doJSON(t, mux, http.MethodPost, "/LiveTv/Timers", map[string]any{
+		"Id":        "start-fail-timer",
+		"Name":      "Missing Binary Show",
+		"ChannelId": "ch-1",
+		"Status":    "InProgress",
+	})
+	if res.Code != http.StatusOK {
+		t.Fatalf("create timer: %d", res.Code)
+	}
+
+	if _, err := rec.StartRecording(context.Background(), dvr.RecordingJob{
+		TimerID:     "start-fail-timer",
+		ChannelName: "CCTV 1",
+		ProgramName: "Missing Binary Show",
+		StreamURL:   "http://127.0.0.1:9999/live.ts",
+	}); err == nil {
+		t.Fatal("expected StartRecording error for missing ffmpeg binary")
+	}
+
+	reloaded := New(st, cfg)
+	found := false
+	for _, tm := range reloaded.state.Timers {
+		if tm.Id == "start-fail-timer" {
+			found = true
+			if tm.Status != "Failed" {
+				t.Fatalf("expected timer status Failed after start failure, got %q", tm.Status)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("start-fail-timer not found in persisted state")
 	}
 }
