@@ -63,7 +63,7 @@ Try the full dark-cinema Web UI and interactive Admin Console right in your brow
 
 ### 2. Docker Compose (Recommended)
 
-Download [docker-compose.yml](docker-compose.yml), uncomment your media volume mounts (and optional GPU passthrough), then run:
+Download [docker-compose.yml](docker-compose.yml), uncomment your media volume mounts (and optional GPU passthrough), adjust `PUID` / `PGID` to match your host/NAS media ownership if needed, then run:
 
 ```bash
 docker compose up -d
@@ -78,10 +78,17 @@ docker run -d \
   -p 8096:8096 \
   -p 1900:1900/udp \
   -e TZ=UTC \
+  -e PUID=1000 \
+  -e PGID=1000 \
   -v $(pwd)/data:/data \
   -v /path/to/media:/media:ro \
   ghcr.io/iky002/ambra:latest
 ```
+
+> **📁 Host / NAS Volume Permissions (Important)**
+> - By default, the container runs as non-root **`PUID=1000` / `PGID=1000`** and automatically fixes `/data` ownership on startup (official Emby `UID` / `GID` env names are also supported).
+> - If you encounter `Permission denied` on mounted media folders, run `stat -c '%u:%g' /path/to/media` or `id` on your host/NAS and set **`PUID` / `PGID`** accordingly (e.g. `1026:100` on Synology, `99:100` on Unraid). Use **`GIDLIST`** (comma-separated GIDs or group names) if multiple supplementary groups are needed.
+> - **Mixed-ownership directories**: If your mounted media folders have mixed owners/permissions, set **`PUID=0` and `PGID=0`** (i.e. `0:0` root mode, or `--user 0:0`) so Ambra can access all mapped folders cleanly.
 
 ### 4. First-Time Setup
 
@@ -105,8 +112,11 @@ make build        # Build pure-Go binary (bin/ambra)
 | Variable | Description | Default |
 | :--- | :--- | :--- |
 | `TZ` | Container timezone (for logs & scheduled tasks) | `Asia/Shanghai` |
+| `PUID` / `PGID` | Docker runtime UID / GID (also accepts `UID` / `GID`; set `0` / `0` for mixed-permission mounts) | `1000` / `1000` |
+| `GIDLIST` | Comma-separated supplementary GIDs or group names (e.g. `100,44,109`) | `""` |
+| `UMASK` | File creation mask inside Docker (e.g. `002`, `022`) | System default |
 | `AMBRA_HTTP_ADDR` | HTTP listen address | `:8096` |
-| `AMBRA_TMDB_API_KEY` | TMDB API Key for metadata & artwork scraping | `""` |
+| `AMBRA_TMDB_API_KEY` | Custom TMDB API Key (uses built-in default key when empty) | Built-in default |
 | `AMBRA_WEB_DIR` | External Web UI directory override (empty = embedded UI) | `""` |
 | `AMBRA_FFMPEG_PATH` | Custom `ffmpeg` binary path | Auto-detect |
 | `AMBRA_FFPROBE_PATH` | Custom `ffprobe` binary path | Auto-detect |

@@ -22,10 +22,26 @@ services:
       # - /path/to/music:/media/music:ro
     environment:
       TZ: Asia/Shanghai
+      # ========================================================================
+      # 权限配置（NAS / 宿主机映射目录必看）
+      # ========================================================================
+      # 容器默认以 PUID=1000 / PGID=1000 非 root 身份运行，并会在启动时自动修正 /data 权限。
+      # 若容器内无法访问映射的媒体文件夹（Permission denied），请在宿主机执行：
+      #   stat -c '%u:%g' /你的媒体目录   或   id
+      # 然后将 PUID / PGID 改为对应属主（如群晖常见 1026:100、Unraid 常见 99:100）：
+      PUID: 1000
+      PGID: 1000
+      # 如需同时访问多个不同用户组的目录或硬件加速设备，可追加逗号分隔的附加组 ID 或组名：
+      # GIDLIST: "100,44,109"
+      # 提示：如果你挂载了多个不同属主的混合权限目录，直接将 PUID 与 PGID 均设为 0（即 0:0 root 运行）即可全部访问：
+      # PUID: 0
+      # PGID: 0
+      # 可选：文件创建掩码（如 002 便于同组读写，默认继承宿主机）
+      # UMASK: "022"
       AMBRA_HTTP_ADDR: ":8096"
       AMBRA_FFMPEG_PATH: "/usr/bin/ffmpeg"
       AMBRA_FFPROBE_PATH: "/usr/bin/ffprobe"
-      # 可选：TMDB API Key（用于刮削影视元数据与海报）
+      # 可选：自定义 TMDB API Key（留空将自动使用内置默认密钥）
       # AMBRA_TMDB_API_KEY: "your_tmdb_api_key"
       # 可选：外部 Web UI 目录覆盖内嵌前端
       # AMBRA_WEB_DIR: "/web"
