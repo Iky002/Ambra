@@ -19,7 +19,7 @@ import (
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
-func setupDLNATestEnv(t *testing.T) (*Handler, *http.ServeMux, *sqlite.LibraryRepo, *sqlite.Store) {
+func setupDLNATestEnv(t *testing.T) (*Handler, http.Handler, *sqlite.LibraryRepo, *sqlite.Store) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 	store, err := sqlite.Open(dbPath)
@@ -56,7 +56,13 @@ func setupDLNATestEnv(t *testing.T) (*Handler, *http.ServeMux, *sqlite.LibraryRe
 		},
 		UserIDFromCtx: func(ctx context.Context) string { return "admin-1" },
 	})
-	return h, mux, libRepo, store
+	lanWrapper := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.RemoteAddr == "192.0.2.1:1234" {
+			r.RemoteAddr = "127.0.0.1:12345"
+		}
+		mux.ServeHTTP(w, r)
+	})
+	return h, lanWrapper, libRepo, store
 }
 
 func TestProfileCRUDAndPersistence(t *testing.T) {
@@ -604,6 +610,7 @@ func TestHelpersAndNilDependencies(t *testing.T) {
 	// Browse with nil libRepo
 	req := httptest.NewRequest(http.MethodPost, "/Dlna/srv/contentdirectory/control",
 		strings.NewReader(`<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>0</ObjectID></u:Browse></s:Body></s:Envelope>`))
+	req.RemoteAddr = "127.0.0.1:12345"
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "<TotalMatches>0</TotalMatches>") {
@@ -613,6 +620,7 @@ func TestHelpersAndNilDependencies(t *testing.T) {
 	// BrowseMetadata non-root with nil libRepo -> SOAP fault
 	req = httptest.NewRequest(http.MethodPost, "/Dlna/srv/contentdirectory/control",
 		strings.NewReader(`<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>abc</ObjectID><BrowseFlag>BrowseMetadata</BrowseFlag></u:Browse></s:Body></s:Envelope>`))
+	req.RemoteAddr = "127.0.0.1:12345"
 	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusInternalServerError {
@@ -866,7 +874,9 @@ func TestDLNASignedStreamAndGENACap(t *testing.T) {
 	nilHandler.RegisterRoutes(nilMux, AuthFuncs{})
 	nilSig := nilHandler.signStreamToken("abc", exp)
 	recNil := httptest.NewRecorder()
-	nilMux.ServeHTTP(recNil, httptest.NewRequest(http.MethodGet, "/Dlna/srv/stream/abc?exp="+strconv.FormatInt(exp, 10)+"&sig="+nilSig, nil))
+	nilReq := httptest.NewRequest(http.MethodGet, "/Dlna/srv/stream/abc?exp="+strconv.FormatInt(exp, 10)+"&sig="+nilSig, nil)
+	nilReq.RemoteAddr = "127.0.0.1:12345"
+	nilMux.ServeHTTP(recNil, nilReq)
 	if recNil.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for nil repo, got %d", recNil.Code)
 	}
@@ -929,5 +939,83 @@ func TestDLNASignedStreamAndGENACap(t *testing.T) {
 	}
 	if h.ActiveSubscriptionCount() != maxDLNASubscriptions {
 		t.Fatalf("expected %d active subscriptions after prune+add, got %d", maxDLNASubscriptions, h.ActiveSubscriptionCount())
+	}
+}
+
+func TestDLNALANRestrictionAndFeatureFlag(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "dlna_sec.db")
+	store, err := sqlite.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	tmp := t.TempDir()
+	strmFile := filepath.Join(tmp, "secret.strm")
+	_ = os.WriteFile(strmFile, []byte("https://user:pass@upstream.example/live.m3u8\n"), 0o600)
+
+	libRepo := sqlite.NewLibraryRepo(store)
+	lib, _ := libRepo.CreateLibrary(ctx, "Movies", "movies", []string{tmp})
+	strmItem := &sqlite.ItemRecord{
+		LibraryID: lib.ID, ParentID: lib.ID,
+		Type: "Movie", MediaType: "Video", Name: "Secret STRM", Path: strmFile, IsStrm: true,
+	}
+	_ = libRepo.UpsertItem(ctx, strmItem)
+
+	cfg := config.Default(tmp)
+	h := New(cfg, libRepo, store)
+	rawMux := http.NewServeMux()
+	h.RegisterRoutes(rawMux, AuthFuncs{})
+
+	exp := time.Now().UTC().Add(time.Hour).Unix()
+	strmSig := h.signStreamToken(strmItem.ID, exp)
+	strmURL := "/Dlna/srv/stream/" + strmItem.ID + "?exp=" + strconv.FormatInt(exp, 10) + "&sig=" + strmSig
+
+	// 1. Public direct IP -> 403 on description.xml, SOAP Browse, and signed stream
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/Dlna/srv/description.xml"},
+		{http.MethodPost, "/Dlna/srv/contentdirectory/control"},
+		{http.MethodGet, strmURL},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, nil)
+		req.RemoteAddr = "203.0.113.55:44444"
+		rec := httptest.NewRecorder()
+		rawMux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("public %s %s expected 403, got %d", tc.method, tc.path, rec.Code)
+		}
+	}
+
+	// 2. Public client forwarded through local reverse proxy -> 403
+	reqProxy := httptest.NewRequest(http.MethodGet, "/Dlna/srv/description.xml", nil)
+	reqProxy.RemoteAddr = "127.0.0.1:44444"
+	reqProxy.Header.Set("X-Forwarded-For", "198.51.100.20")
+	recProxy := httptest.NewRecorder()
+	rawMux.ServeHTTP(recProxy, reqProxy)
+	if recProxy.Code != http.StatusForbidden {
+		t.Fatalf("public client behind local proxy expected 403, got %d", recProxy.Code)
+	}
+
+	// 3. LAN request for .strm item -> 403 (never leak .strm credentials)
+	reqStrm := httptest.NewRequest(http.MethodGet, strmURL, nil)
+	reqStrm.RemoteAddr = "192.168.1.50:55555"
+	recStrm := httptest.NewRecorder()
+	rawMux.ServeHTTP(recStrm, reqStrm)
+	if recStrm.Code != http.StatusForbidden {
+		t.Fatalf("LAN .strm download expected 403, got %d", recStrm.Code)
+	}
+
+	// 4. EnableDLNA=false blocks even loopback LAN requests -> 403
+	cfg.EnableDLNA = false
+	reqDisabled := httptest.NewRequest(http.MethodGet, "/Dlna/srv/description.xml", nil)
+	reqDisabled.RemoteAddr = "127.0.0.1:55555"
+	recDisabled := httptest.NewRecorder()
+	rawMux.ServeHTTP(recDisabled, reqDisabled)
+	if recDisabled.Code != http.StatusForbidden {
+		t.Fatalf("disabled DLNA expected 403, got %d", recDisabled.Code)
 	}
 }

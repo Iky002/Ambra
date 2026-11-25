@@ -71,10 +71,12 @@ func TestServerLifecycleAndRoutes(t *testing.T) {
 		t.Fatalf("expected SPA fallback to index.html, got %d", rec.Code)
 	}
 
-	// Public Phase 4-6 routes via delegated mediaMux
+	// Public Phase 4-6 routes via delegated mediaMux (DLNA requires LAN origin)
 	for _, p := range []string{"/openapi.json", "/robots.txt", "/Dlna/test-uuid/description.xml"} {
+		req := httptest.NewRequest(http.MethodGet, p, nil)
+		req.RemoteAddr = "127.0.0.1:12345"
 		rec = httptest.NewRecorder()
-		srv.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, p, nil))
+		srv.Handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("expected 200 on %s, got %d", p, rec.Code)
 		}

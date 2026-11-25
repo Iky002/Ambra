@@ -351,4 +351,12 @@ func TestCompatMediaV0101SecurityAndParity(t *testing.T) {
 	if rec := call(aliceAuth.AccessToken, http.MethodGet, "/Items/"+movieSafe.ID+"/File", ""); rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 for alice downloading when enabled, got %d", rec.Code)
 	}
+
+	// 12. POST /Items/Access requires admin privileges
+	if rec := call(aliceAuth.AccessToken, http.MethodPost, "/Items/Access", `{"Public":true}`); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-admin POST /Items/Access, got %d", rec.Code)
+	}
+	if rec := call(adminAuth.AccessToken, http.MethodPost, "/Items/Access", `{"Public":true}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for admin POST /Items/Access, got %d", rec.Code)
+	}
 }

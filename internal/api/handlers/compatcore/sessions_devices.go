@@ -298,15 +298,11 @@ func (h *Handler) canAccessDevice(r *http.Request, deviceID string) bool {
 		return true
 	}
 	callerID := h.callerUserID(r)
-	if callerID == "" {
+	if callerID == "" || deviceID == "" {
 		return false
 	}
-	if deviceID == "" {
-		return false
-	}
-	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.Client.DeviceID == deviceID {
-		return true
-	}
+	// Check authoritative device/session ownership first so a spoofed or stale
+	// client DeviceID can never bypass ownership of another user's device.
 	if h.userRepo != nil {
 		if list, err := h.userRepo.ListDevices(r.Context()); err == nil {
 			for _, d := range list {
@@ -322,6 +318,9 @@ func (h *Handler) canAccessDevice(r *http.Request, deviceID string) bool {
 				return guid.Normalize(s.UserId) == callerID
 			}
 		}
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.Client.DeviceID == deviceID {
+		return true
 	}
 	return false
 }
