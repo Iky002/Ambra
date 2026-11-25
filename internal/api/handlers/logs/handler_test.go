@@ -93,13 +93,19 @@ func TestMultiSlogHandlerBridgeAndFilePersistence(t *testing.T) {
 	h.RegisterRoutes(mux, AuthFuncs{})
 
 	fixedDay := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
-	logFilePath := DailyLogFilePath(tmp, fixedDay)
-	if !strings.HasSuffix(logFilePath, filepath.Join("logs", "ambra-2026-11-24.log")) {
-		t.Fatalf("unexpected daily log path: %s", logFilePath)
+	dailyLogPath := DailyLogFilePath(tmp, fixedDay)
+	if !strings.HasSuffix(dailyLogPath, filepath.Join("logs", "ambra-2026-11-24.log")) {
+		t.Fatalf("unexpected daily log path: %s", dailyLogPath)
 	}
 	if DailyLogFilePath("", fixedDay) != "" {
 		t.Fatalf("expected empty daily log path for empty dataDir")
 	}
+
+	// Use a fixed non-daily log filename here because slog.Logger stamps records with
+	// time.Now(), which would rotate a daily-named file away from fixedDay on any other
+	// UTC date (daily rotation itself is tested deterministically in slog_rotation_test.go).
+	const testLogName = "ambra-bridge.log"
+	logFilePath := filepath.Join(tmp, "logs", testLogName)
 
 	var stdoutBuf bytes.Buffer
 	bridge := NewMultiSlogHandler(&stdoutBuf, nil, logFilePath).WithLevel(slog.LevelDebug)
@@ -121,17 +127,17 @@ func TestMultiSlogHandlerBridgeAndFilePersistence(t *testing.T) {
 		t.Fatalf("unexpected formatted stdout log:\n%s", outStr)
 	}
 
-	// 2. Verify GET /System/Logs lists ambra-2026-11-24.log and GET /System/Logs/{Name} serves it
+	// 2. Verify GET /System/Logs lists ambra-bridge.log and GET /System/Logs/{Name} serves it
 	recList := httptest.NewRecorder()
 	mux.ServeHTTP(recList, httptest.NewRequest(http.MethodGet, "/System/Logs", nil))
 	var list []LogFileDto
 	_ = json.Unmarshal(recList.Body.Bytes(), &list)
-	if len(list) != 1 || list[0].Name != "ambra-2026-11-24.log" {
-		t.Fatalf("expected ambra-2026-11-24.log in /System/Logs, got %+v", list)
+	if len(list) != 1 || list[0].Name != testLogName {
+		t.Fatalf("expected %s in /System/Logs, got %+v", testLogName, list)
 	}
 
 	recFile := httptest.NewRecorder()
-	mux.ServeHTTP(recFile, httptest.NewRequest(http.MethodGet, "/System/Logs/ambra-2026-11-24.log", nil))
+	mux.ServeHTTP(recFile, httptest.NewRequest(http.MethodGet, "/System/Logs/"+testLogName, nil))
 	if recFile.Code != http.StatusOK || !strings.Contains(recFile.Body.String(), "server started") || !strings.Contains(recFile.Body.String(), "fallback engaged") {
 		t.Fatalf("expected persisted log content, got code=%d body=%q", recFile.Code, recFile.Body.String())
 	}
