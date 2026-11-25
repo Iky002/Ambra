@@ -4,8 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -162,12 +165,38 @@ func (m *Manager) Start(ctx context.Context) {
 		for {
 			select {
 			case <-ctx.Done():
+				m.StopAll()
 				return
 			case <-ticker.C:
 				m.evaluateAndRunDue()
 			}
 		}
 	}()
+}
+
+// StopAll cancels the context of every currently running scheduled task.
+func (m *Manager) StopAll() int {
+	var (
+		cancels []context.CancelFunc
+		snaps   []TaskInfo
+	)
+	m.mu.Lock()
+	for _, mt := range m.tasks {
+		if mt.state != StateIdle && mt.cancel != nil {
+			mt.state = StateCancelling
+			cancels = append(cancels, mt.cancel)
+			snaps = append(snaps, snapshotLocked(mt))
+		}
+	}
+	m.mu.Unlock()
+
+	for _, c := range cancels {
+		c()
+	}
+	for _, s := range snaps {
+		m.publishProgress(s)
+	}
+	return len(cancels)
 }
 
 func (m *Manager) evaluateAndRunDue() {
@@ -535,8 +564,19 @@ func (m *Manager) Run(id string) error {
 		}
 
 		var runErr error
+		var longErr string
 		if runFn != nil {
-			runErr = runFn(ctx, reportProgress)
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						stack := string(debug.Stack())
+						slog.Error("scheduled task panicked", "task_id", mt.def.ID, "panic", r, "stack", stack)
+						runErr = fmt.Errorf("task panicked: %v", r)
+						longErr = stack
+					}
+				}()
+				runErr = runFn(ctx, reportProgress)
+			}()
 		}
 		cancel()
 
@@ -544,7 +584,7 @@ func (m *Manager) Run(id string) error {
 		status := "Completed"
 		errMsg := ""
 		if runErr != nil {
-			if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
+			if longErr == "" && (errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)) {
 				status = "Cancelled"
 			} else {
 				status = "Failed"
@@ -557,13 +597,14 @@ func (m *Manager) Run(id string) error {
 		mt.progress = nil
 		mt.cancel = nil
 		mt.lastRes = &TaskResult{
-			StartTimeUtc: startTime,
-			EndTimeUtc:   endTime,
-			Status:       status,
-			Name:         mt.def.Name,
-			Key:          mt.def.Key,
-			Id:           mt.def.ID,
-			ErrorMessage: errMsg,
+			StartTimeUtc:     startTime,
+			EndTimeUtc:       endTime,
+			Status:           status,
+			Name:             mt.def.Name,
+			Key:              mt.def.Key,
+			Id:               mt.def.ID,
+			ErrorMessage:     errMsg,
+			LongErrorMessage: longErr,
 		}
 		finalSnap := snapshotLocked(mt)
 		m.mu.Unlock()

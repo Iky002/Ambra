@@ -18,6 +18,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/core/auth"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -146,6 +147,9 @@ func TestForgotPasswordRateLimitAndFilePruning(t *testing.T) {
 	}
 
 	// Cover forgotClientIP edge cases.
+	netutil.SetTrustedProxies([]string{"10.0.0.0/8"})
+	t.Cleanup(func() { netutil.SetTrustedProxies(nil) })
+
 	for _, tc := range []struct {
 		name   string
 		remote string

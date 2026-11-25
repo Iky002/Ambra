@@ -513,6 +513,19 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 	}
 
 	cleanTarget := filepath.Clean(targetPath)
+	root := findContainingRoot(lib.Paths, cleanTarget)
+	if root == "" {
+		return stats, fmt.Errorf("scanner: path %q is outside library %s roots", cleanTarget, lib.ID)
+	}
+	policy := s.currentSymlinkPolicy()
+	if linfo, lerr := os.Lstat(cleanTarget); lerr == nil && linfo.Mode()&os.ModeSymlink != 0 {
+		if policy == SymlinkIgnore {
+			return stats, nil
+		}
+		if !isPathWithinRoot(root, cleanTarget) {
+			return stats, fmt.Errorf("scanner: symlink %q escapes library %s root", cleanTarget, lib.ID)
+		}
+	}
 	info, err := os.Stat(cleanTarget)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -527,11 +540,6 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 			return stats, nil
 		}
 		return stats, err
-	}
-
-	root := findContainingRoot(lib.Paths, cleanTarget)
-	if root == "" {
-		return stats, fmt.Errorf("scanner: path %q is outside library %s roots", cleanTarget, lib.ID)
 	}
 	forceTV := strings.EqualFold(lib.CollectionType, "tvshows")
 	seriesCache := make(map[string]*sqlite.ItemRecord)
@@ -719,6 +727,16 @@ func (s *Scanner) runPhaseAWithRoot(ctx context.Context, lib *sqlite.LibraryReco
 		}
 
 		name := info.Name()
+		if path != filepath.Clean(walkRoot) {
+			if linfo, lerr := os.Lstat(path); lerr == nil && linfo.Mode()&os.ModeSymlink != 0 {
+				if !isPathWithinRoot(logicalRoot, path) {
+					if info.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+			}
+		}
 		if info.IsDir() {
 			if path != filepath.Clean(walkRoot) && strings.HasPrefix(name, ".") {
 				return filepath.SkipDir
@@ -1160,13 +1178,20 @@ func (s *Scanner) ensureAutoBoxSet(ctx context.Context, movie *sqlite.ItemRecord
 	}
 	colID := strings.TrimSpace(col.ID)
 	colName := strings.TrimSpace(col.Name)
-	if colID == "" || colName == "" {
+	if colName == "" {
 		return
+	}
+
+	providerKey := "Tmdb"
+	providerVal := colID
+	if providerVal == "" {
+		providerKey = "NfoSet"
+		providerVal = strings.ToLower(colName)
 	}
 
 	var boxSet *sqlite.ItemRecord
 	s.mergeMu.Lock()
-	matches, err := s.repo.FindItemsByProviderID(ctx, "collections", "BoxSet", "Tmdb", colID)
+	matches, err := s.repo.FindItemsByProviderID(ctx, "collections", "BoxSet", providerKey, providerVal)
 	if err == nil && len(matches) > 0 {
 		boxSet = matches[0]
 	} else if err == nil {
@@ -1179,7 +1204,7 @@ func (s *Scanner) ensureAutoBoxSet(ctx context.Context, movie *sqlite.ItemRecord
 			Name:         colName,
 			SortName:     strings.ToLower(colName),
 			Etag:         guid.New()[:16],
-			Extra:        sqlite.ItemExtra{ProviderIDs: map[string]string{"Tmdb": colID}},
+			Extra:        sqlite.ItemExtra{ProviderIDs: map[string]string{providerKey: providerVal}},
 			DateCreated:  now,
 			DateModified: now,
 		}
@@ -1334,5 +1359,8 @@ func applyOnlineMetadataToItem(rec *sqlite.ItemRecord, meta *plugins.MetadataRes
 				rec.Extra.ProviderIDs[k] = v
 			}
 		}
+	}
+	if meta.LockData {
+		rec.Extra.LockData = true
 	}
 }

@@ -38,10 +38,18 @@ jobs:
           cache: true
 
       - name: Cross-compile Lite single-file binaries (without FFmpeg)
+        id: build-lite
+        env:
+          RELEASE_TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "ERROR: invalid release tag '${RELEASE_TAG}'" >&2
+            exit 1
+          fi
+          echo "version=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
           mkdir -p dist/lite dist/full
-          AMBRA_VERSION="${{ inputs.tag != '' && inputs.tag || github.ref_name }}"
+          AMBRA_VERSION="${RELEASE_TAG}"
           TARGETS=(
             "linux/amd64/ambra-lite-linux-amd64"
             "linux/arm64/ambra-lite-linux-arm64"
@@ -63,36 +71,90 @@ jobs:
           done
 
       - name: Bundle Full packages WITH static FFmpeg & FFprobe
+        env:
+          BTBN_RELEASE_BASE: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest
+          BTBN_FFMPEG_BRANCH: n8.1
+          MACOS_FFMPEG_BASE: https://ffmpeg.martin-riedl.de/download/macos/arm64/1795207104_9.1
+          MACOS_FFMPEG_SHA256: 1f66e9a690a7f1c9e60b012379f8869c11818d1797f45b21dbb2f2564ba61ae1
+          MACOS_FFPROBE_SHA256: 6ef2df5f575042923a28537ab37adf936f28bf3e7b85de23a1447ed447ec1dbd
         run: |
           set -euo pipefail
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends xz-utils zip unzip
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends xz-utils zip unzip file
           WORK="/tmp/ffmpeg-bundle"
           mkdir -p "${WORK}"
 
+          # Download upstream SHA-256 manifest from BtbN once and verify every downloaded archive against it.
+          BTBN_CHECKSUMS="${WORK}/btbn-checksums.sha256"
+          curl -fsSL -o "${BTBN_CHECKSUMS}" "${BTBN_RELEASE_BASE}/checksums.sha256"
+          if [ ! -s "${BTBN_CHECKSUMS}" ]; then
+            echo "ERROR: empty BtbN checksums.sha256" >&2
+            exit 1
+          fi
+
+          verify_binary() {
+            local bin_path="$1"
+            local expected_pattern="$2"
+            if [ ! -s "${bin_path}" ]; then
+              echo "ERROR: missing or empty binary ${bin_path}" >&2
+              exit 1
+            fi
+            local info
+            info="$(file -b "${bin_path}")"
+            if ! echo "${info}" | grep -Eiq "${expected_pattern}"; then
+              echo "ERROR: unexpected binary format for ${bin_path}: ${info}" >&2
+              exit 1
+            fi
+            sha256sum "${bin_path}"
+          }
+
           bundle_btbn() {
             local platform="$1"
-            local url="$2"
-            local lite_bin="$3"
-            local out_archive="$4"
-            local is_win="$5"
+            local arch_tag="$2"
+            local ext="$3"
+            local lite_bin="$4"
+            local out_archive="$5"
+            local is_win="$6"
+            local expected_file_re="$7"
 
             local stage="${WORK}/${platform}"
             mkdir -p "${stage}/pkg"
-            echo "Downloading FFmpeg for ${platform}..."
+
+            # Resolve pinned release branch archive name + SHA256 from upstream checksums.sha256.
+            local entry
+            entry="$(grep -E "^[0-9a-fA-F]{64}  ffmpeg-${BTBN_FFMPEG_BRANCH}-latest-${arch_tag}-gpl-[0-9]+\.[0-9]+\.${ext}$" "${BTBN_CHECKSUMS}" | head -n 1 || true)"
+            if [ -z "${entry}" ]; then
+              entry="$(grep -E "^[0-9a-fA-F]{64}  ffmpeg-n[0-9]+\.[0-9]+-latest-${arch_tag}-gpl-[0-9]+\.[0-9]+\.${ext}$" "${BTBN_CHECKSUMS}" | sort -V | tail -n 1 || true)"
+            fi
+            if [ -z "${entry}" ]; then
+              echo "ERROR: could not find release branch archive for ${platform} in checksums.sha256" >&2
+              exit 1
+            fi
+
+            local expected_sha asset_name
+            expected_sha="$(echo "${entry}" | awk '{print $1}')"
+            asset_name="$(echo "${entry}" | awk '{print $2}')"
+            local archive_path="${stage}/${asset_name}"
+
+            echo "Downloading ${asset_name} for ${platform} (sha256=${expected_sha})..."
+            curl -fsSL -o "${archive_path}" "${BTBN_RELEASE_BASE}/${asset_name}"
+            echo "${expected_sha}  ${archive_path}" | sha256sum -c -
+
             if [ "${is_win}" = "1" ]; then
-              curl -fsSL -o "${stage}/ffmpeg.zip" "${url}"
-              unzip -q "${stage}/ffmpeg.zip" -d "${stage}/extract"
+              unzip -q "${archive_path}" -d "${stage}/extract"
               cp "${lite_bin}" "${stage}/pkg/ambra.exe"
-              cp "$(find "${stage}/extract" -name 'ffmpeg.exe' | head -n 1)" "${stage}/pkg/ffmpeg.exe"
-              cp "$(find "${stage}/extract" -name 'ffprobe.exe' | head -n 1)" "${stage}/pkg/ffprobe.exe"
+              cp "$(find "${stage}/extract" -type f -name 'ffmpeg.exe' | head -n 1)" "${stage}/pkg/ffmpeg.exe"
+              cp "$(find "${stage}/extract" -type f -name 'ffprobe.exe' | head -n 1)" "${stage}/pkg/ffprobe.exe"
+              verify_binary "${stage}/pkg/ffmpeg.exe" "${expected_file_re}"
+              verify_binary "${stage}/pkg/ffprobe.exe" "${expected_file_re}"
               (cd "${stage}/pkg" && zip -q -r "${GITHUB_WORKSPACE}/dist/full/${out_archive}" .)
             else
-              curl -fsSL -o "${stage}/ffmpeg.tar.xz" "${url}"
-              tar -xJf "${stage}/ffmpeg.tar.xz" -C "${stage}" --one-top-level=extract
+              tar -xJf "${archive_path}" -C "${stage}" --one-top-level=extract
               cp "${lite_bin}" "${stage}/pkg/ambra"
               cp "$(find "${stage}/extract" -type f -name 'ffmpeg' | head -n 1)" "${stage}/pkg/ffmpeg"
               cp "$(find "${stage}/extract" -type f -name 'ffprobe' | head -n 1)" "${stage}/pkg/ffprobe"
               chmod +x "${stage}/pkg/ambra" "${stage}/pkg/ffmpeg" "${stage}/pkg/ffprobe"
+              verify_binary "${stage}/pkg/ffmpeg" "${expected_file_re}"
+              verify_binary "${stage}/pkg/ffprobe" "${expected_file_re}"
               tar -czf "${GITHUB_WORKSPACE}/dist/full/${out_archive}" -C "${stage}/pkg" .
             fi
           }
@@ -100,34 +162,36 @@ jobs:
           bundle_macos() {
             local stage="${WORK}/darwin-arm64"
             mkdir -p "${stage}/pkg"
-            echo "Downloading FFmpeg for darwin-arm64..."
+            echo "Downloading pinned FFmpeg/FFprobe for darwin-arm64..."
             cp "dist/lite/ambra-lite-darwin-arm64" "${stage}/pkg/ambra"
-            curl -fsSL -o "${stage}/ffmpeg.zip" "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip"
-            curl -fsSL -o "${stage}/ffprobe.zip" "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffprobe.zip"
-            unzip -q "${stage}/ffmpeg.zip" -d "${stage}/pkg"
-            unzip -q "${stage}/ffprobe.zip" -d "${stage}/pkg"
+            for pair in "ffmpeg:${MACOS_FFMPEG_SHA256}" "ffprobe:${MACOS_FFPROBE_SHA256}"; do
+              local tool="${pair%%:*}"
+              local expected_sha="${pair#*:}"
+              curl -fsSL -o "${stage}/${tool}.zip" "${MACOS_FFMPEG_BASE}/${tool}.zip"
+              echo "${expected_sha}  ${stage}/${tool}.zip" | sha256sum -c -
+              unzip -q "${stage}/${tool}.zip" -d "${stage}/pkg"
+            done
             chmod +x "${stage}/pkg/ambra" "${stage}/pkg/ffmpeg" "${stage}/pkg/ffprobe"
+            verify_binary "${stage}/pkg/ffmpeg" "Mach-O.*arm64"
+            verify_binary "${stage}/pkg/ffprobe" "Mach-O.*arm64"
             tar -czf "${GITHUB_WORKSPACE}/dist/full/ambra-full-darwin-arm64.tar.gz" -C "${stage}/pkg" .
           }
 
-          # Run all 4 platform FFmpeg downloads & packaging in parallel
+          # Run all 4 platform FFmpeg downloads, checksum verifications & packaging in parallel
           pids=()
-          bundle_btbn "linux-amd64" \
-            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz" \
+          bundle_btbn "linux-amd64" "linux64" "tar.xz" \
             "dist/lite/ambra-lite-linux-amd64" \
-            "ambra-full-linux-amd64.tar.gz" "0" &
+            "ambra-full-linux-amd64.tar.gz" "0" "ELF.*x86-64" &
           pids+=($!)
 
-          bundle_btbn "linux-arm64" \
-            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz" \
+          bundle_btbn "linux-arm64" "linuxarm64" "tar.xz" \
             "dist/lite/ambra-lite-linux-arm64" \
-            "ambra-full-linux-arm64.tar.gz" "0" &
+            "ambra-full-linux-arm64.tar.gz" "0" "ELF.*aarch64" &
           pids+=($!)
 
-          bundle_btbn "windows-amd64" \
-            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" \
+          bundle_btbn "windows-amd64" "win64" "zip" \
             "dist/lite/ambra-lite-windows-amd64.exe" \
-            "ambra-full-windows-amd64.zip" "1" &
+            "ambra-full-windows-amd64.zip" "1" "PE32\+" &
           pids+=($!)
 
           bundle_macos &
@@ -152,12 +216,13 @@ jobs:
           name: release-binaries
           path: dist/release/*
           if-no-files-found: error
+          retention-days: 7
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
+          tag_name: ${{ steps.build-lite.outputs.version }}
           generate_release_notes: true
           files: dist/release/*
 
@@ -212,6 +277,18 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: ${{ matrix.tags }}
 
+      - name: Validate release tag
+        id: validate-tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "ERROR: invalid release tag '${RELEASE_TAG}'" >&2
+            exit 1
+          fi
+          echo "version=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push multi-arch image (${{ matrix.variant }})
         uses: docker/build-push-action@v6
         with:
@@ -220,7 +297,7 @@ jobs:
           target: ${{ matrix.target }}
           platforms: linux/amd64,linux/arm64
           build-args: |
-            AMBRA_VERSION=${{ inputs.tag != '' && inputs.tag || github.ref_name }}
+            AMBRA_VERSION=${{ steps.validate-tag.outputs.version }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

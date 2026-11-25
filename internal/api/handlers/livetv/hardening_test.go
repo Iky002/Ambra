@@ -281,6 +281,7 @@ func TestLiveTVAccessPolicyEnforcement(t *testing.T) {
 		_, _ = w.Write([]byte("OK_STREAM"))
 	}))
 	defer upstream.Close()
+	h.SetStreamClient(upstream.Client())
 
 	h.mu.Lock()
 	h.state.Channels = []ChannelInfo{{Id: "ch-1", Name: "Chan 1", Type: "TvChannel", ChannelType: "TV", StreamUrl: upstream.URL + "/live.ts"}}
@@ -371,8 +372,9 @@ func TestLiveTVSeriesTimerCascadeXMLTVRefreshAndExportedHelpers(t *testing.T) {
 		}
 	}))
 	defer lanSrv.Close()
+	h.SetHTTPClient(lanSrv.Client())
 
-	// 1. LAN M3U import succeeds with default safe HTTP client
+	// 1. LAN M3U import succeeds with custom test client
 	rec := doJSON(t, mux, http.MethodPost, "/LiveTv/TunerHosts", map[string]any{
 		"Type": "m3u",
 		"Url":  lanSrv.URL + "/playlist.m3u",

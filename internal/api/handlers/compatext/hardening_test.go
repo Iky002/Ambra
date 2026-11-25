@@ -47,6 +47,7 @@ func TestLiveTVHardeningHLSChannelMappingAndPersistence(t *testing.T) {
 	defer func() { _ = dvrRec.Close() }()
 
 	lt := livetv.New(store, cfg)
+	lt.SetStreamClient(upstream.Client())
 	lt.SetRecorder(dvrRec)
 	ltMux := http.NewServeMux()
 	lt.RegisterRoutes(ltMux, livetv.AuthFuncs{})

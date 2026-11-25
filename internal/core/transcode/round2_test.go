@@ -95,7 +95,7 @@ func TestBuildFFmpegArgsSubtitleBurnIn(t *testing.T) {
 			t.Fatalf("expected -vf flag in args: %v", args)
 		}
 		vf := args[vfIdx+1]
-		wantSub := `subtitles='/media/My \[Show\]\:1'\''s/sub.ass'`
+		wantSub := `subtitles='/media/My \[Show\]\:1'\\\''s/sub.ass'`
 		if !strings.HasPrefix(vf, wantSub) {
 			t.Fatalf("expected -vf to start with %q, got %q", wantSub, vf)
 		}

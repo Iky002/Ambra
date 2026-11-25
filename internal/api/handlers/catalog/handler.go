@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -148,7 +149,7 @@ func (h *Handler) allowedLibrariesForUser(ctx context.Context, userID string) []
 	}
 	u, err := h.userRepo.GetUserByID(ctx, userID)
 	if err != nil || u == nil {
-		return nil
+		return []string{}
 	}
 	if u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableAllFolders {
 		return nil
@@ -185,12 +186,78 @@ func (h *Handler) userParentalPolicyForRequest(r *http.Request, fallbackUserID s
 	}
 	u, err := h.userRepo.GetUserByID(r.Context(), uid)
 	if err != nil || u == nil {
-		return nil, nil
+		zero := 0
+		return &zero, nil
 	}
 	if u.IsAdmin || u.Policy.IsAdministrator {
 		return nil, nil
 	}
 	return u.Policy.MaxParentalRating, u.Policy.BlockedTags
+}
+
+func (h *Handler) isNonAdminCaller(r *http.Request) bool {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		return !ac.IsAdmin()
+	}
+	if h.auth.UserIDFromCtx != nil {
+		callerID := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if callerID != "" {
+			if h.userRepo != nil {
+				if u, err := h.userRepo.GetUserByID(r.Context(), callerID); err == nil && u != nil && (u.IsAdmin || u.Policy.IsAdministrator) {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) isPlaylistPublic(ctx context.Context, playlistID string) bool {
+	normID := guid.Normalize(playlistID)
+	if normID == "" || h.userRepo == nil {
+		return false
+	}
+	raw, err := h.userRepo.GetServerConfig(ctx, "item_visibility_"+normID)
+	if err != nil || raw == "" {
+		return false
+	}
+	var vis struct {
+		IsPublic bool `json:"IsPublic"`
+	}
+	if err := json.Unmarshal([]byte(raw), &vis); err != nil {
+		return false
+	}
+	return vis.IsPublic
+}
+
+func (h *Handler) canViewPlaylist(r *http.Request, playlistID, parentID string) bool {
+	ownerID := guid.Normalize(parentID)
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.IsAdmin() {
+			return true
+		}
+		if ownerID == "" || h.isPlaylistPublic(r.Context(), playlistID) {
+			return true
+		}
+		callerID := guid.Normalize(ac.UserID())
+		return callerID != "" && callerID == ownerID
+	}
+	if h.auth.UserIDFromCtx != nil {
+		callerID := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if callerID != "" {
+			if h.userRepo != nil {
+				if u, err := h.userRepo.GetUserByID(r.Context(), callerID); err == nil && u != nil && (u.IsAdmin || u.Policy.IsAdministrator) {
+					return true
+				}
+			}
+			if ownerID == "" || h.isPlaylistPublic(r.Context(), playlistID) {
+				return true
+			}
+			return callerID == ownerID
+		}
+	}
+	return true
 }
 
 type queryFiltersLegacyResponse struct {
@@ -309,6 +376,11 @@ func (h *Handler) handleMovieRecommendations(w http.ResponseWriter, r *http.Requ
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if h.isNonAdminCaller(r) {
+		for i := range cats {
+			dto.SanitizeItemPathsSlice(cats[i].Items)
+		}
+	}
 	httpx.JSON(w, http.StatusOK, cats)
 }
 
@@ -326,9 +398,13 @@ func isLibraryAllowed(libID string, allowed []string) bool {
 }
 
 func (h *Handler) canAccessItem(r *http.Request, fallbackUserID, itemID string) (bool, error) {
+	if h.repo == nil {
+		return true, nil
+	}
 	allowed := h.allowedLibrariesForRequest(r, fallbackUserID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, fallbackUserID)
-	if allowed == nil && maxRating == nil && len(blockedTags) == 0 {
+	nonAdmin := h.isNonAdminCaller(r)
+	if !nonAdmin && allowed == nil && maxRating == nil && len(blockedTags) == 0 {
 		return true, nil
 	}
 	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
@@ -341,7 +417,11 @@ func (h *Handler) canAccessItem(r *http.Request, fallbackUserID, itemID string) 
 	if rec == nil {
 		return true, nil
 	}
-	if allowed != nil && rec.LibraryID != "" && !isLibraryAllowed(rec.LibraryID, allowed) {
+	if strings.EqualFold(rec.Type, "Playlist") {
+		if !h.canViewPlaylist(r, rec.ID, rec.ParentID) {
+			return false, nil
+		}
+	} else if allowed != nil && rec.LibraryID != "" && !isLibraryAllowed(rec.LibraryID, allowed) {
 		return false, nil
 	}
 	if maxRating != nil || len(blockedTags) > 0 {
@@ -390,6 +470,9 @@ func (h *Handler) handleSimilar(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if h.isNonAdminCaller(r) {
+		dto.SanitizeItemPathsSlice(items)
+	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            items,
 		TotalRecordCount: total,
@@ -429,6 +512,9 @@ func (h *Handler) handleInstantMix(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if h.isNonAdminCaller(r) {
+		dto.SanitizeItemPathsSlice(items)
 	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            items,
@@ -537,6 +623,9 @@ func (h *Handler) handleTrailers(w http.ResponseWriter, r *http.Request) {
 		merged = merged[startIndex:end]
 	}
 
+	if h.isNonAdminCaller(r) {
+		dto.SanitizeItemPathsSlice(merged)
+	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            merged,
 		TotalRecordCount: total,
@@ -575,6 +664,9 @@ func (h *Handler) handleItemsByType(itemTypes []string) http.HandlerFunc {
 			httpx.Error(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if h.isNonAdminCaller(r) {
+			dto.SanitizeItemPathsSlice(items)
+		}
 		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 			Items:            items,
 			TotalRecordCount: total,
@@ -589,13 +681,35 @@ func (h *Handler) handleChannelItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := h.resolveUserID(r, q)
+	channelID := guid.Normalize(r.PathValue("Id"))
+	chRec, err := h.repo.GetItemRecordByID(r.Context(), channelID)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		httpx.Error(w, http.StatusNotFound, "channel not found")
+		return
+	}
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if chRec == nil || !strings.EqualFold(chRec.Type, "Channel") {
+		httpx.Error(w, http.StatusNotFound, "channel not found")
+		return
+	}
+	ok, accessErr := h.canAccessItem(r, userID, chRec.ID)
+	if accessErr != nil {
+		httpx.Error(w, http.StatusInternalServerError, accessErr.Error())
+		return
+	}
+	if !ok {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
-	channelID := r.PathValue("Id")
 	items, total, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
 		ServerID:          h.serverID(),
 		UserID:            userID,
-		ParentID:          channelID,
+		ParentID:          chRec.ID,
 		AllowedLibraryIDs: allowed,
 		MaxParentalRating: maxRating,
 		BlockedTags:       blockedTags,
@@ -609,6 +723,9 @@ func (h *Handler) handleChannelItems(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if h.isNonAdminCaller(r) {
+		dto.SanitizeItemPathsSlice(items)
 	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            items,
@@ -641,6 +758,9 @@ func (h *Handler) handleFilterDimension(dimension string) http.HandlerFunc {
 		if err != nil {
 			httpx.Error(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if h.isNonAdminCaller(r) {
+			dto.SanitizeItemPathsSlice(items)
 		}
 		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 			Items:            items,

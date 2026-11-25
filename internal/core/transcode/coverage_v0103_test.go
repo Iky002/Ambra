@@ -269,8 +269,11 @@ func TestHWAccelAndExtractorSecurityCoverage(t *testing.T) {
 	if _, err := resolveMediaInputPath("/tmp/a\nb.mkv"); err == nil {
 		t.Fatalf("expected error for control char in resolveMediaInputPath")
 	}
-	if got, err := resolveMediaInputPath("https://example.com/v.mkv"); err != nil || got != "https://example.com/v.mkv" {
+	if got, err := resolveMediaInputPath("https://93.184.216.34/v.mkv"); err != nil || got != "https://93.184.216.34/v.mkv" {
 		t.Fatalf("expected http URL passthrough, got %q err=%v", got, err)
+	}
+	if _, err := resolveMediaInputPath("http://169.254.169.254/latest/meta-data"); err == nil {
+		t.Fatalf("expected SSRF metadata URL to be rejected")
 	}
 	for _, bad := range []string{"", ".hidden.ttf", "a/b.ttf", `a\b.ttf`, "a..b.ttf", "a\x00b.ttf"} {
 		if isSafeAttachmentFilename(bad) {

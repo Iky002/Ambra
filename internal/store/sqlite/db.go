@@ -77,6 +77,7 @@ func envIntWithDefault(key string, defVal, minVal int) int {
 }
 
 func escapeSQLiteURIPath(p string) string {
+	p = strings.ReplaceAll(p, `\`, `/`)
 	return strings.NewReplacer("%", "%25", "?", "%3F", "#", "%23").Replace(p)
 }
 

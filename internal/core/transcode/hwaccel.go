@@ -252,14 +252,14 @@ var hwCandidates = []hwCandidate{
 		framework: "NVENC",
 		h264Enc:   "h264_nvenc",
 		hevcEnc:   "hevc_nvenc",
-		tonemap:   "tonemap_cuda=format=yuv420p:tonemap=hable",
+		tonemap:   "zscale=t=linear:npl=100,tonemap=hable,zscale=p=bt709:t=bt709:m=bt709,format=yuv420p",
 	},
 	{
 		accel:     "qsv",
 		framework: "QSV",
 		h264Enc:   "h264_qsv",
 		hevcEnc:   "hevc_qsv",
-		tonemap:   "vpp_qsv=tonemap=1:format=nv12",
+		tonemap:   "zscale=t=linear:npl=100,tonemap=hable,zscale=p=bt709:t=bt709:m=bt709,format=nv12",
 	},
 	{
 		accel:     "vaapi",

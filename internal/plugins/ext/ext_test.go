@@ -138,7 +138,7 @@ func TestHTTPPluginMetadataAndStreamResolve(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(plugins.StreamResolveResult{URL: ""})
 			default:
 				_ = json.NewEncoder(w).Encode(plugins.StreamResolveResult{
-					URL:     "https://cdn.example.com/video.mp4",
+					URL:     "https://93.184.216.34/video.mp4",
 					Headers: map[string]string{"User-Agent": "Ambra"},
 					Is302:   true,
 				})
@@ -189,7 +189,7 @@ func TestHTTPPluginMetadataAndStreamResolve(t *testing.T) {
 
 	// ResolveStream success, 204, empty URL
 	sres, err := p.ResolveStream(context.Background(), "/media/movie.strm")
-	if err != nil || sres == nil || !sres.Is302 || sres.URL != "https://cdn.example.com/video.mp4" {
+	if err != nil || sres == nil || !sres.Is302 || sres.URL != "https://93.184.216.34/video.mp4" {
 		t.Fatalf("ResolveStream got (%+v, %v)", sres, err)
 	}
 	if sres, err := p.ResolveStream(context.Background(), "/media/nomatch.strm"); err != nil || sres != nil {
@@ -362,5 +362,96 @@ func TestHTTPPluginConfigureAndValidation(t *testing.T) {
 		if err := p.Configure(bad); err == nil {
 			t.Fatalf("expected error for invalid cfg %+v", bad)
 		}
+	}
+}
+
+func TestHTTPPluginAuditV0104Hardening(t *testing.T) {
+	// 1. Reject ambra.builtin.* prefix
+	if _, err := NewHTTPPlugin(ExternalManifest{
+		ID:       "ambra.builtin.hijack",
+		Name:     "Hijack",
+		Endpoint: "http://127.0.0.1:9000",
+	}); err == nil {
+		t.Fatal("expected ambra.builtin.* HTTPPlugin to be rejected")
+	}
+
+	// 2. TimeoutMs upper bound clamped to 60000ms in constructor and Configure
+	p, err := NewHTTPPlugin(ExternalManifest{
+		ID:        "ext.clamp",
+		Name:      "Clamp",
+		Endpoint:  "http://127.0.0.1:9000",
+		TimeoutMs: 999_999,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.timeout != maxTimeout {
+		t.Fatalf("expected constructor timeout clamped to %v, got %v", maxTimeout, p.timeout)
+	}
+	if err := p.Configure(map[string]any{"TimeoutMs": 500_000}); err != nil {
+		t.Fatal(err)
+	}
+	if p.timeout != maxTimeout {
+		t.Fatalf("expected Configure timeout clamped to %v, got %v", maxTimeout, p.timeout)
+	}
+
+	// 3. ResolveStream SSRF validation & half-open single-probe concurrency control
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	var probeHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/resolve":
+			_ = json.NewEncoder(w).Encode(plugins.StreamResolveResult{
+				URL:   "http://169.254.169.254/latest/meta-data",
+				Is302: true,
+			})
+		case "/metadata":
+			n := probeHits.Add(1)
+			if n <= 3 {
+				http.Error(w, "fail", http.StatusBadGateway)
+				return
+			}
+			// Half-open probe blocks until released
+			close(probeStarted)
+			<-releaseProbe
+			_ = json.NewEncoder(w).Encode(plugins.MetadataResult{Name: "OK"})
+		}
+	}))
+	defer srv.Close()
+
+	hp, err := NewHTTPPlugin(ExternalManifest{
+		ID:        "ext.sec",
+		Name:      "Sec",
+		Endpoint:  srv.URL,
+		TimeoutMs: 2000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hp.ResolveStream(context.Background(), "/a.strm"); err == nil {
+		t.Fatal("expected SSRF stream URL to be rejected")
+	}
+
+	fakeNow := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+	hp.nowFunc = func() time.Time { return fakeNow }
+	for i := 0; i < 3; i++ {
+		_, _ = hp.FetchMetadata(context.Background(), plugins.MediaQuery{Title: "Fail"})
+	}
+	// Advance past cooldown -> half-open
+	fakeNow = fakeNow.Add(defaultResetTimeout + time.Second)
+	done := make(chan error, 1)
+	go func() {
+		_, err := hp.FetchMetadata(context.Background(), plugins.MediaQuery{Title: "Probe1"})
+		done <- err
+	}()
+	<-probeStarted
+	// Second concurrent request while probe is in flight MUST get ErrCircuitOpen
+	if _, err := hp.FetchMetadata(context.Background(), plugins.MediaQuery{Title: "Probe2"}); !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("expected ErrCircuitOpen for concurrent half-open call, got %v", err)
+	}
+	close(releaseProbe)
+	if err := <-done; err != nil {
+		t.Fatalf("expected single probe to succeed, got %v", err)
 	}
 }

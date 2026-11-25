@@ -228,7 +228,7 @@ export function AdminPage() {
           className="inline-flex items-center justify-center gap-2 rounded-xl bg-amber-500 px-4 py-2.5 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/20 transition-all hover:bg-amber-400 disabled:opacity-60"
         >
           <RefreshCw className={`h-4 w-4 ${scanning ? 'animate-spin' : ''}`} />
-          <span>{scanning ? '正在触发全库扫描...' : '触发全库扫描'}</span>
+          <span>{scanning ? t('admin.scanningAllLibraries') : t('admin.scanAllLibraries')}</span>
         </button>
       </div>
 

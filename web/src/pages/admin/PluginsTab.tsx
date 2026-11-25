@@ -1,10 +1,21 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Loader2, Puzzle, RefreshCw, SlidersHorizontal } from 'lucide-react'
+import { Loader2, Puzzle, RefreshCw, RotateCcw, SlidersHorizontal, Trash2 } from 'lucide-react'
 import { api } from '../../api/client'
 import type { PluginInfo } from '../../api/types'
 import { QueryErrorState } from '../../components/QueryErrorState'
+import { useI18n } from '../../i18n/I18nContext'
 import { AdminModal, FeedbackBanner, ToggleSwitch } from './adminUtils'
+
+export const MASKED_PLUGIN_SECRET = '********'
+
+function resolveSecretForSubmit(input: string, configured: boolean, cleared: boolean): string {
+  const trimmed = input.trim()
+  if (trimmed !== '') return trimmed
+  if (cleared) return ''
+  if (configured) return MASKED_PLUGIN_SECRET
+  return ''
+}
 
 const KIND_LABELS: Record<string, string> = {
   metadata: '元数据刮削',
@@ -37,6 +48,7 @@ const TVDB_LANGUAGES = [
 
 export function PluginsTab() {
   const queryClient = useQueryClient()
+  const { t } = useI18n()
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
     null,
   )
@@ -49,12 +61,20 @@ export function PluginsTab() {
   const [enabled, setEnabled] = useState(true)
   const [priority, setPriority] = useState(10)
   const [tmdbApiKey, setTmdbApiKey] = useState('')
+  const [tmdbApiKeyConfigured, setTmdbApiKeyConfigured] = useState(false)
+  const [tmdbApiKeyCleared, setTmdbApiKeyCleared] = useState(false)
   const [tmdbLanguage, setTmdbLanguage] = useState('zh-CN')
   const [tvdbApiKey, setTvdbApiKey] = useState('')
+  const [tvdbApiKeyConfigured, setTvdbApiKeyConfigured] = useState(false)
+  const [tvdbApiKeyCleared, setTvdbApiKeyCleared] = useState(false)
   const [tvdbPin, setTvdbPin] = useState('')
+  const [tvdbPinConfigured, setTvdbPinConfigured] = useState(false)
+  const [tvdbPinCleared, setTvdbPinCleared] = useState(false)
   const [tvdbLanguage, setTvdbLanguage] = useState('zh-CN')
   const [traktClientId, setTraktClientId] = useState('')
   const [traktAccessToken, setTraktAccessToken] = useState('')
+  const [traktAccessTokenConfigured, setTraktAccessTokenConfigured] = useState(false)
+  const [traktAccessTokenCleared, setTraktAccessTokenCleared] = useState(false)
   const [traktScrobblePlayback, setTraktScrobblePlayback] = useState(true)
   const [traktSyncWatched, setTraktSyncWatched] = useState(true)
   const [enable302, setEnable302] = useState(true)
@@ -89,12 +109,20 @@ export function PluginsTab() {
     setEnabled(plugin.Enabled !== false)
     setPriority(plugin.Priority ?? 10)
     setTmdbApiKey('')
+    setTmdbApiKeyConfigured(false)
+    setTmdbApiKeyCleared(false)
     setTmdbLanguage('zh-CN')
     setTvdbApiKey('')
+    setTvdbApiKeyConfigured(false)
+    setTvdbApiKeyCleared(false)
     setTvdbPin('')
+    setTvdbPinConfigured(false)
+    setTvdbPinCleared(false)
     setTvdbLanguage('zh-CN')
     setTraktClientId('')
     setTraktAccessToken('')
+    setTraktAccessTokenConfigured(false)
+    setTraktAccessTokenCleared(false)
     setTraktScrobblePlayback(true)
     setTraktSyncWatched(true)
     setEnable302(true)
@@ -116,7 +144,12 @@ export function PluginsTab() {
           (cfg.tmdb_api_key as string) ||
           (cfg.TMDBApiKey as string) ||
           ''
-        if (apiKeyVal) setTmdbApiKey(apiKeyVal)
+        if (apiKeyVal === MASKED_PLUGIN_SECRET) {
+          setTmdbApiKey('')
+          setTmdbApiKeyConfigured(true)
+        } else if (apiKeyVal) {
+          setTmdbApiKey(apiKeyVal)
+        }
 
         const langVal =
           (cfg.language as string) ||
@@ -132,7 +165,12 @@ export function PluginsTab() {
             (cfg.tvdb_api_key as string) ||
             (cfg.TVDBApiKey as string) ||
             ''
-          if (tvdbKeyVal) setTvdbApiKey(tvdbKeyVal)
+          if (tvdbKeyVal === MASKED_PLUGIN_SECRET) {
+            setTvdbApiKey('')
+            setTvdbApiKeyConfigured(true)
+          } else if (tvdbKeyVal) {
+            setTvdbApiKey(tvdbKeyVal)
+          }
 
           const tvdbPinVal =
             (cfg.pin as string) ||
@@ -140,7 +178,12 @@ export function PluginsTab() {
             (cfg.tvdb_pin as string) ||
             (cfg.TVDBPin as string) ||
             ''
-          if (tvdbPinVal) setTvdbPin(tvdbPinVal)
+          if (tvdbPinVal === MASKED_PLUGIN_SECRET) {
+            setTvdbPin('')
+            setTvdbPinConfigured(true)
+          } else if (tvdbPinVal) {
+            setTvdbPin(tvdbPinVal)
+          }
 
           const tvdbLangVal =
             (cfg.language as string) ||
@@ -163,7 +206,12 @@ export function PluginsTab() {
             (cfg.access_token as string) ||
             (cfg.AccessToken as string) ||
             ''
-          if (accessTokenVal) setTraktAccessToken(accessTokenVal)
+          if (accessTokenVal === MASKED_PLUGIN_SECRET) {
+            setTraktAccessToken('')
+            setTraktAccessTokenConfigured(true)
+          } else if (accessTokenVal) {
+            setTraktAccessToken(accessTokenVal)
+          }
 
           if (typeof cfg.scrobble_playback === 'boolean') {
             setTraktScrobblePlayback(cfg.scrobble_playback)
@@ -254,26 +302,42 @@ export function PluginsTab() {
     }
 
     if (isTmdbPlugin(editingPlugin)) {
-      payload.ApiKey = tmdbApiKey.trim()
-      payload.api_key = tmdbApiKey.trim()
+      const nextTmdbKey = resolveSecretForSubmit(
+        tmdbApiKey,
+        tmdbApiKeyConfigured,
+        tmdbApiKeyCleared,
+      )
+      payload.ApiKey = nextTmdbKey
+      payload.api_key = nextTmdbKey
       payload.Language = tmdbLanguage
       payload.language = tmdbLanguage
     }
 
     if (isTvdbPlugin(editingPlugin)) {
-      payload.ApiKey = tvdbApiKey.trim()
-      payload.api_key = tvdbApiKey.trim()
-      payload.Pin = tvdbPin.trim()
-      payload.pin = tvdbPin.trim()
+      const nextTvdbKey = resolveSecretForSubmit(
+        tvdbApiKey,
+        tvdbApiKeyConfigured,
+        tvdbApiKeyCleared,
+      )
+      const nextTvdbPin = resolveSecretForSubmit(tvdbPin, tvdbPinConfigured, tvdbPinCleared)
+      payload.ApiKey = nextTvdbKey
+      payload.api_key = nextTvdbKey
+      payload.Pin = nextTvdbPin
+      payload.pin = nextTvdbPin
       payload.Language = tvdbLanguage
       payload.language = tvdbLanguage
     }
 
     if (isTraktPlugin(editingPlugin)) {
+      const nextTraktToken = resolveSecretForSubmit(
+        traktAccessToken,
+        traktAccessTokenConfigured,
+        traktAccessTokenCleared,
+      )
       payload.ClientId = traktClientId.trim()
       payload.client_id = traktClientId.trim()
-      payload.AccessToken = traktAccessToken.trim()
-      payload.access_token = traktAccessToken.trim()
+      payload.AccessToken = nextTraktToken
+      payload.access_token = nextTraktToken
       payload.ScrobblePlayback = traktScrobblePlayback
       payload.scrobble_playback = traktScrobblePlayback
       payload.SyncWatched = traktSyncWatched
@@ -308,7 +372,7 @@ export function PluginsTab() {
         <div>
           <h2 className="flex items-center gap-2 text-base font-semibold text-zinc-100">
             <Puzzle className="h-4 w-4 text-amber-400" />
-            <span>插件与刮削器管理</span>
+            <span>{t('admin.pluginsTitle')}</span>
           </h2>
           <p className="mt-1 text-xs text-zinc-400">
             管理内置及外部扩展插件的启用状态、执行优先级与刮削参数（如 TMDB API Key）
@@ -468,14 +532,50 @@ export function PluginsTab() {
               <div className="space-y-3 rounded-xl border border-amber-500/20 bg-amber-500/[0.04] p-4">
                 <p className="text-xs font-semibold text-amber-300">TMDB 刮削器参数</p>
                 <div>
-                  <label className="mb-1.5 block text-xs font-medium text-zinc-400">
-                    TMDB API Key
-                  </label>
+                  <div className="mb-1.5 flex items-center justify-between gap-2">
+                    <label htmlFor="tmdb-api-key" className="block text-xs font-medium text-zinc-400">
+                      TMDB API Key
+                    </label>
+                    {tmdbApiKeyConfigured && !tmdbApiKeyCleared && !tmdbApiKey.trim() && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setTmdbApiKey('')
+                          setTmdbApiKeyCleared(true)
+                        }}
+                        className="inline-flex items-center gap-1 rounded-md border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-[11px] font-medium text-red-300 transition-colors hover:bg-red-500/20"
+                      >
+                        <Trash2 className="h-3 w-3" />
+                        <span>清除密钥</span>
+                      </button>
+                    )}
+                    {tmdbApiKeyCleared && (
+                      <button
+                        type="button"
+                        onClick={() => setTmdbApiKeyCleared(false)}
+                        className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
+                      >
+                        <RotateCcw className="h-3 w-3" />
+                        <span>撤销清除</span>
+                      </button>
+                    )}
+                  </div>
                   <input
-                    type="text"
+                    id="tmdb-api-key"
+                    type="password"
+                    autoComplete="off"
                     value={tmdbApiKey}
-                    onChange={(e) => setTmdbApiKey(e.target.value)}
-                    placeholder="输入 TMDB v3 API Key"
+                    onChange={(e) => {
+                      setTmdbApiKey(e.target.value)
+                      if (e.target.value.trim()) setTmdbApiKeyCleared(false)
+                    }}
+                    placeholder={
+                      tmdbApiKeyCleared
+                        ? '已标记清除密钥，保存后将清空原值'
+                        : tmdbApiKeyConfigured
+                          ? '已配置密钥，留空保留原值'
+                          : '输入 TMDB v3 API Key'
+                    }
                     className="w-full rounded-xl border border-white/10 bg-black/40 px-3.5 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
                   />
                 </div>
@@ -505,34 +605,103 @@ export function PluginsTab() {
                   默认关闭；启用并填写 TheTVDB v4 API Key 后，将按优先级作为剧集/电影刮削补充源
                 </p>
                 <div>
-                  <label
-                    htmlFor="tvdb-api-key"
-                    className="mb-1.5 block text-xs font-medium text-zinc-400"
-                  >
-                    API Key
-                  </label>
+                  <div className="mb-1.5 flex items-center justify-between gap-2">
+                    <label
+                      htmlFor="tvdb-api-key"
+                      className="block text-xs font-medium text-zinc-400"
+                    >
+                      API Key
+                    </label>
+                    {tvdbApiKeyConfigured && !tvdbApiKeyCleared && !tvdbApiKey.trim() && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setTvdbApiKey('')
+                          setTvdbApiKeyCleared(true)
+                        }}
+                        className="inline-flex items-center gap-1 rounded-md border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-[11px] font-medium text-red-300 transition-colors hover:bg-red-500/20"
+                      >
+                        <Trash2 className="h-3 w-3" />
+                        <span>清除密钥</span>
+                      </button>
+                    )}
+                    {tvdbApiKeyCleared && (
+                      <button
+                        type="button"
+                        onClick={() => setTvdbApiKeyCleared(false)}
+                        className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
+                      >
+                        <RotateCcw className="h-3 w-3" />
+                        <span>撤销清除</span>
+                      </button>
+                    )}
+                  </div>
                   <input
                     id="tvdb-api-key"
-                    type="text"
+                    type="password"
+                    autoComplete="off"
                     value={tvdbApiKey}
-                    onChange={(e) => setTvdbApiKey(e.target.value)}
-                    placeholder="输入 TheTVDB v4 API Key"
+                    onChange={(e) => {
+                      setTvdbApiKey(e.target.value)
+                      if (e.target.value.trim()) setTvdbApiKeyCleared(false)
+                    }}
+                    placeholder={
+                      tvdbApiKeyCleared
+                        ? '已标记清除密钥，保存后将清空原值'
+                        : tvdbApiKeyConfigured
+                          ? '已配置密钥，留空保留原值'
+                          : '输入 TheTVDB v4 API Key'
+                    }
                     className="w-full rounded-xl border border-white/10 bg-black/40 px-3.5 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
                   />
                 </div>
                 <div>
-                  <label
-                    htmlFor="tvdb-pin"
-                    className="mb-1.5 block text-xs font-medium text-zinc-400"
-                  >
-                    Subscriber PIN（可选）
-                  </label>
+                  <div className="mb-1.5 flex items-center justify-between gap-2">
+                    <label
+                      htmlFor="tvdb-pin"
+                      className="block text-xs font-medium text-zinc-400"
+                    >
+                      Subscriber PIN（可选）
+                    </label>
+                    {tvdbPinConfigured && !tvdbPinCleared && !tvdbPin.trim() && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setTvdbPin('')
+                          setTvdbPinCleared(true)
+                        }}
+                        className="inline-flex items-center gap-1 rounded-md border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-[11px] font-medium text-red-300 transition-colors hover:bg-red-500/20"
+                      >
+                        <Trash2 className="h-3 w-3" />
+                        <span>清除密钥</span>
+                      </button>
+                    )}
+                    {tvdbPinCleared && (
+                      <button
+                        type="button"
+                        onClick={() => setTvdbPinCleared(false)}
+                        className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
+                      >
+                        <RotateCcw className="h-3 w-3" />
+                        <span>撤销清除</span>
+                      </button>
+                    )}
+                  </div>
                   <input
                     id="tvdb-pin"
                     type="text"
                     value={tvdbPin}
-                    onChange={(e) => setTvdbPin(e.target.value)}
-                    placeholder="若使用个人订阅 PIN 可在此填写"
+                    onChange={(e) => {
+                      setTvdbPin(e.target.value)
+                      if (e.target.value.trim()) setTvdbPinCleared(false)
+                    }}
+                    placeholder={
+                      tvdbPinCleared
+                        ? '已标记清除密钥，保存后将清空原值'
+                        : tvdbPinConfigured
+                          ? '已配置密钥，留空保留原值'
+                          : '若使用个人订阅 PIN 可在此填写'
+                    }
                     className="w-full rounded-xl border border-white/10 bg-black/40 px-3.5 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
                   />
                 </div>
@@ -582,18 +751,55 @@ export function PluginsTab() {
                   />
                 </div>
                 <div>
-                  <label
-                    htmlFor="trakt-access-token"
-                    className="mb-1.5 block text-xs font-medium text-zinc-400"
-                  >
-                    Access Token
-                  </label>
+                  <div className="mb-1.5 flex items-center justify-between gap-2">
+                    <label
+                      htmlFor="trakt-access-token"
+                      className="block text-xs font-medium text-zinc-400"
+                    >
+                      Access Token
+                    </label>
+                    {traktAccessTokenConfigured &&
+                      !traktAccessTokenCleared &&
+                      !traktAccessToken.trim() && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setTraktAccessToken('')
+                            setTraktAccessTokenCleared(true)
+                          }}
+                          className="inline-flex items-center gap-1 rounded-md border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-[11px] font-medium text-red-300 transition-colors hover:bg-red-500/20"
+                        >
+                          <Trash2 className="h-3 w-3" />
+                          <span>清除密钥</span>
+                        </button>
+                      )}
+                    {traktAccessTokenCleared && (
+                      <button
+                        type="button"
+                        onClick={() => setTraktAccessTokenCleared(false)}
+                        className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
+                      >
+                        <RotateCcw className="h-3 w-3" />
+                        <span>撤销清除</span>
+                      </button>
+                    )}
+                  </div>
                   <input
                     id="trakt-access-token"
                     type="password"
+                    autoComplete="off"
                     value={traktAccessToken}
-                    onChange={(e) => setTraktAccessToken(e.target.value)}
-                    placeholder="输入 Trakt OAuth Access Token"
+                    onChange={(e) => {
+                      setTraktAccessToken(e.target.value)
+                      if (e.target.value.trim()) setTraktAccessTokenCleared(false)
+                    }}
+                    placeholder={
+                      traktAccessTokenCleared
+                        ? '已标记清除密钥，保存后将清空原值'
+                        : traktAccessTokenConfigured
+                          ? '已配置密钥，留空保留原值'
+                          : '输入 Trakt OAuth Access Token'
+                    }
                     className="w-full rounded-xl border border-white/10 bg-black/40 px-3.5 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
                   />
                 </div>

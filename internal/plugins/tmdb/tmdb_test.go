@@ -103,7 +103,7 @@ func TestTMDBFetchMovieAndPersonAvatars(t *testing.T) {
 		t.Fatalf("expected empty profile URL when profile_path is empty, got %q", res.People[3].ImageURL)
 	}
 
-	// Custom imageBaseURL + case-insensitive ProviderIDs ("Tmdb")
+	// Disabled plugin must skip without sending HTTP requests.
 	_ = p.Configure(map[string]any{
 		"api_key":        "test-key",
 		"language":       "en-US",
@@ -113,6 +113,15 @@ func TestTMDBFetchMovieAndPersonAvatars(t *testing.T) {
 	if p.Manifest().Enabled {
 		t.Fatalf("expected enabled=false after Configure")
 	}
+	if r, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
+		ItemType:    "Movie",
+		ProviderIDs: map[string]string{"Tmdb": "438631"},
+	}); err != nil || r != nil {
+		t.Fatalf("expected (nil, nil) when TMDB is disabled, got res=%v err=%v", r, err)
+	}
+
+	// Re-enable and verify custom imageBaseURL + case-insensitive ProviderIDs ("Tmdb")
+	_ = p.Configure(map[string]any{"enabled": true})
 	res2, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
 		ItemType:    "Movie",
 		ProviderIDs: map[string]string{"Tmdb": "438631"},
@@ -273,5 +282,98 @@ func TestTMDBFetchSeriesSeasonAndEpisode(t *testing.T) {
 	}
 	if _, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{ItemType: "Episode", SeasonNumber: 1, EpisodeNumber: 99, ProviderIDs: map[string]string{"tmdb": "1396"}}); err == nil {
 		t.Fatalf("expected 404 error for nonexistent episode")
+	}
+}
+
+func TestTMDBV4BearerLogoAndOfficialRating(t *testing.T) {
+	const v4JWT = "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJ0ZXN0In0.sig123"
+	var sawAuthHeader, sawQueryAPIKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawAuthHeader = r.Header.Get("Authorization")
+		sawQueryAPIKey = r.URL.Query().Get("api_key")
+		switch r.URL.Path {
+		case "/movie/550":
+			_, _ = w.Write([]byte(`{
+				"id": 550,
+				"title": "搏击俱乐部",
+				"original_title": "Fight Club",
+				"release_date": "1999-10-15",
+				"images": {
+					"logos": [
+						{"file_path": "/logo_jpg.jpg", "iso_639_1": "zh", "vote_average": 9.0},
+						{"file_path": "/logo_en.png", "iso_639_1": "en", "vote_average": 6.0},
+						{"file_path": "/logo_zh.png", "iso_639_1": "zh", "vote_average": 5.0}
+					]
+				},
+				"release_dates": {
+					"results": [
+						{"iso_3166_1": "US", "release_dates": [{"certification": "R", "type": 3}]}
+					]
+				}
+			}`))
+		case "/tv/1396":
+			_, _ = w.Write([]byte(`{
+				"id": 1396,
+				"name": "绝命毒师",
+				"first_air_date": "2008-01-20",
+				"images": {
+					"logos": [
+						{"file_path": "/tv_logo.svg", "iso_639_1": "en", "vote_average": 8.0}
+					]
+				},
+				"content_ratings": {
+					"results": [
+						{"iso_3166_1": "US", "rating": "TV-MA"}
+					]
+				}
+			}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	p := New(v4JWT, "zh-CN")
+	p.SetHTTPClient(srv.Client())
+	_ = p.Configure(map[string]any{"base_url": srv.URL})
+
+	mov, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
+		ItemType:    "Movie",
+		ProviderIDs: map[string]string{"tmdb": "550"},
+	})
+	if err != nil || mov == nil {
+		t.Fatalf("FetchMetadata movie with v4 token failed: %v", err)
+	}
+	if sawAuthHeader != "Bearer "+v4JWT || sawQueryAPIKey != "" {
+		t.Fatalf("expected Bearer auth without api_key query param; got auth=%q api_key=%q", sawAuthHeader, sawQueryAPIKey)
+	}
+	if !strings.HasSuffix(mov.LogoURL, "/logo_zh.png") {
+		t.Fatalf("expected zh png logo, got %q", mov.LogoURL)
+	}
+	if mov.OfficialRating != "R" {
+		t.Fatalf("expected movie OfficialRating=R, got %q", mov.OfficialRating)
+	}
+
+	tv, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
+		ItemType:    "Series",
+		ProviderIDs: map[string]string{"tmdb": "1396"},
+	})
+	if err != nil || tv == nil {
+		t.Fatalf("FetchMetadata tv with v4 token failed: %v", err)
+	}
+	if !strings.HasSuffix(tv.LogoURL, "/tv_logo.svg") {
+		t.Fatalf("expected svg logo, got %q", tv.LogoURL)
+	}
+	if tv.OfficialRating != "TV-MA" {
+		t.Fatalf("expected tv OfficialRating=TV-MA, got %q", tv.OfficialRating)
+	}
+
+	// Disabled skips SearchCandidates and FetchImages too
+	_ = p.Configure(map[string]any{"enabled": false})
+	if cands, err := p.SearchCandidates(context.Background(), "Movie", "Fight Club", 1999, "zh-CN"); err != nil || cands != nil {
+		t.Fatalf("expected disabled SearchCandidates to skip, got (%v, %v)", cands, err)
+	}
+	if imgs, err := p.FetchImages(context.Background(), "Movie", "550"); err != nil || imgs != nil {
+		t.Fatalf("expected disabled FetchImages to skip, got (%v, %v)", imgs, err)
 	}
 }

@@ -190,12 +190,12 @@ func TestCollectionsCoverageBoostV0103(t *testing.T) {
 			t.Fatalf("expected 1 allowed lib via fallbackUserID, got %v", got)
 		}
 
-		// allowedLibrariesForUser edge cases
+		// allowedLibrariesForUser edge cases (unknown userID must fail-closed with empty slice)
 		if got := h.allowedLibrariesForUser(ctx, ""); got != nil {
 			t.Fatalf("expected nil for empty userID, got %v", got)
 		}
-		if got := h.allowedLibrariesForUser(ctx, guid.New()); got != nil {
-			t.Fatalf("expected nil for unknown userID, got %v", got)
+		if got := h.allowedLibrariesForUser(ctx, guid.New()); got == nil || len(got) != 0 {
+			t.Fatalf("expected non-nil empty slice (fail-closed) for unknown userID, got %#v", got)
 		}
 
 		// userParentalPolicyForRequest: UserIDFromCtx nil + AuthContext present, and admin via UserIDFromCtx

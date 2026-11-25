@@ -135,29 +135,32 @@ func TestLiveTVProxyHLSAndTokenCoverage(t *testing.T) {
 
 	// verifyProxyTarget with empty secret -> false
 	hEmptySecret := &Handler{}
-	if hEmptySecret.verifyProxyTarget("ch1", "http://example.com", "deadbeef") {
+	if hEmptySecret.verifyProxyTarget("ch1", "http://example.com", false, "9999999999", "deadbeef") {
 		t.Fatalf("expected false when proxySecret is empty")
 	}
 
-	// isLoopbackURL cases
-	if isLoopbackURL("://bad") || isLoopbackURL("/relative") || isLoopbackURL("https://example.com/a") {
-		t.Fatalf("expected non-loopback URLs to return false")
+	// channelAllowsPrivateLAN distinguishes public vs private LAN vs blocked loopback
+	if h.channelAllowsPrivateLAN("://bad") || h.channelAllowsPrivateLAN("/relative") || h.channelAllowsPrivateLAN("https://93.184.216.34/a") {
+		t.Fatalf("expected public/invalid URLs not to allow private LAN")
 	}
-	if !isLoopbackURL("http://localhost/a") || !isLoopbackURL("http://foo.localhost/a") || !isLoopbackURL("http://127.0.0.1/a") {
-		t.Fatalf("expected loopback URLs to return true")
+	if !h.channelAllowsPrivateLAN("http://192.168.1.50/a.m3u8") {
+		t.Fatalf("expected private LAN URL to allow private LAN")
+	}
+	if h.channelAllowsPrivateLAN("http://localhost/a") || h.channelAllowsPrivateLAN("http://foo.localhost/a") || h.channelAllowsPrivateLAN("http://127.0.0.1/a") {
+		t.Fatalf("expected loopback URLs to be rejected")
 	}
 
 	// rewriteHLSPlaylist & rewriteHLSPlaylistWithPolicy edge cases
 	pubBase, _ := url.Parse("https://93.184.216.34/live/index.m3u8")
-	loopBase, _ := url.Parse("http://127.0.0.1:8080/live/index.m3u8")
+	lanBase, _ := url.Parse("http://192.168.1.50:8080/live/index.m3u8")
 	pl := "#EXTM3U\r\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\r\n#EXT-X-MAP:URI=\"\"\r\nfile:///etc/passwd\r\nhttp://[::1]:bad\r\nseg1.ts\r\n"
 	outPub := h.rewriteHLSPlaylist(pl, pubBase, "ch1", "", "tok1")
-	if !strings.Contains(outPub, "Stream?target=") || !strings.Contains(outPub, "api_key=tok1") {
+	if !strings.Contains(outPub, "Stream?target=") || !strings.Contains(outPub, "&lan=0&sig=") || !strings.Contains(outPub, "api_key=tok1") {
 		t.Fatalf("expected rewritten HLS URLs, got:\n%s", outPub)
 	}
-	outLoop := h.rewriteHLSPlaylist("#EXTM3U\nseg1.ts\n", loopBase, "ch1", "Stream", "")
-	if !strings.Contains(outLoop, "Stream?target=") {
-		t.Fatalf("expected loopback HLS rewrite when base is loopback, got:\n%s", outLoop)
+	outLAN := h.rewriteHLSPlaylist("#EXTM3U\nseg1.ts\n", lanBase, "ch1", "Stream", "")
+	if !strings.Contains(outLAN, "Stream?target=") || !strings.Contains(outLAN, "&lan=1&sig=") {
+		t.Fatalf("expected LAN HLS rewrite when base is LAN, got:\n%s", outLAN)
 	}
 	if got := h.rewriteHLSPlaylistWithPolicy("#EXTM3U\nseg1.ts\n", nil, "ch1", "", "", false); !strings.Contains(got, "seg1.ts") {
 		t.Fatalf("expected nil baseURL to preserve URI")
@@ -194,7 +197,7 @@ func TestLiveTVProxyHLSAndTokenCoverage(t *testing.T) {
 
 	// ProxyStreamURL & ProxyChannelStream with mocked streamClient
 	var mode string
-	h.streamClient = &http.Client{
+	mockClient := &http.Client{
 		Transport: rtFunc(func(req *http.Request) (*http.Response, error) {
 			switch mode {
 			case "err":
@@ -226,6 +229,8 @@ func TestLiveTVProxyHLSAndTokenCoverage(t *testing.T) {
 			}
 		}),
 	}
+	h.streamClient = mockClient
+	h.publicStreamClient = mockClient
 
 	// 1. ProxyStreamURL raw TS stream with empty Content-Type -> video/mp2t
 	mode = "ts"
@@ -278,8 +283,9 @@ func TestLiveTVProxyHLSAndTokenCoverage(t *testing.T) {
 		t.Fatalf("ProxyChannelStream hls oversize: want 502, got %d", rec.Code)
 	}
 
-	// 7. Nil streamClient fallback path
+	// 7. Nil streamClient/publicStreamClient fallback path
 	h.streamClient = nil
+	h.publicStreamClient = nil
 	rec = httptest.NewRecorder()
 	h.ProxyStreamURL(rec, httptest.NewRequest(http.MethodGet, "/stream", nil).WithContext(cctx), "https://93.184.216.34/live.ts")
 }

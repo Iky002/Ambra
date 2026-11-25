@@ -9,18 +9,26 @@ import (
 )
 
 var (
-	trustedProxiesMu     sync.RWMutex
-	customTrustedProxies []netip.Prefix
+	trustedProxiesMu       sync.RWMutex
+	customTrustedProxies   []netip.Prefix
+	trustedProxiesDisabled bool
 )
 
 // SetTrustedProxies configures an explicit allowlist of trusted reverse proxy
-// IPs or CIDRs. Passing an empty slice restores the default private/loopback
-// proxy policy.
+// IPs or CIDRs. Passing an empty slice restores the default loopback-only
+// proxy policy. Passing "none" (or "off"/"false") explicitly disables trusting
+// forwarded headers even from loopback.
 func SetTrustedProxies(entries []string) {
 	var parsed []netip.Prefix
+	disabled := false
 	for _, raw := range entries {
 		s := strings.TrimSpace(raw)
 		if s == "" {
+			continue
+		}
+		switch strings.ToLower(s) {
+		case "none", "off", "false":
+			disabled = true
 			continue
 		}
 		if p, err := netip.ParsePrefix(s); err == nil {
@@ -37,13 +45,18 @@ func SetTrustedProxies(entries []string) {
 		}
 	}
 	trustedProxiesMu.Lock()
-	customTrustedProxies = parsed
+	if disabled {
+		trustedProxiesDisabled = true
+		customTrustedProxies = nil
+	} else {
+		trustedProxiesDisabled = false
+		customTrustedProxies = parsed
+	}
 	trustedProxiesMu.Unlock()
 }
 
 // IsTrustedProxyIP reports whether ip is a configured trusted reverse proxy,
-// or (when no explicit list is set) a loopback, RFC1918/ULA private, or CGNAT
-// (100.64.0.0/10) address typical of local/container reverse proxies.
+// or (when no explicit list is set and not disabled) a loopback address.
 func IsTrustedProxyIP(ip netip.Addr) bool {
 	if !ip.IsValid() {
 		return false
@@ -51,8 +64,12 @@ func IsTrustedProxyIP(ip netip.Addr) bool {
 	ip = ip.WithZone("").Unmap()
 
 	trustedProxiesMu.RLock()
+	disabled := trustedProxiesDisabled
 	custom := customTrustedProxies
 	trustedProxiesMu.RUnlock()
+	if disabled {
+		return false
+	}
 	if len(custom) > 0 {
 		for _, p := range custom {
 			if p.Contains(ip) {
@@ -62,29 +79,18 @@ func IsTrustedProxyIP(ip netip.Addr) bool {
 		return false
 	}
 
-	if ip.IsLoopback() || ip.IsPrivate() {
-		return true
-	}
-	if ip.Is4() && cgnatPrefix.Contains(ip) {
-		return true
-	}
-	return false
+	return ip.IsLoopback()
 }
 
-// IsLANIP reports whether ip belongs to a local/LAN/VPN private network
-// (loopback, RFC1918/ULA private, link-local unicast, or CGNAT 100.64.0.0/10).
+// IsLANIP reports whether ip belongs to a local/LAN private network
+// (loopback, RFC1918/ULA private, or link-local unicast).
+// Carrier-grade NAT (100.64.0.0/10) is intentionally excluded from default LAN trust.
 func IsLANIP(ip netip.Addr) bool {
 	if !ip.IsValid() {
 		return false
 	}
 	ip = ip.WithZone("").Unmap()
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
-		return true
-	}
-	if ip.Is4() && cgnatPrefix.Contains(ip) {
-		return true
-	}
-	return false
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
 }
 
 func parseAddrString(raw string) (netip.Addr, bool) {

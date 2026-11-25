@@ -165,13 +165,7 @@ func (h *Handler) allowedLibrariesForRequest(r *http.Request, fallbackUserID str
 			return nil
 		}
 		if h.userRepo != nil {
-			if allowed := h.allowedLibrariesForUser(r.Context(), guid.Normalize(ac.UserID())); allowed != nil {
-				return allowed
-			}
-			// If userRepo returned nil because user exists and has EnableAllFolders, trust DB.
-			if u, err := h.userRepo.GetUserByID(r.Context(), guid.Normalize(ac.UserID())); err == nil && u != nil {
-				return nil
-			}
+			return h.allowedLibrariesForUser(r.Context(), guid.Normalize(ac.UserID()))
 		}
 		if ac.User != nil && !ac.User.Policy.EnableAllFolders {
 			allowed := make([]string, 0, len(ac.User.Policy.EnabledFolders))
@@ -203,7 +197,7 @@ func (h *Handler) allowedLibrariesForUser(ctx context.Context, userID string) []
 	}
 	u, err := h.userRepo.GetUserByID(ctx, userID)
 	if err != nil || u == nil {
-		return nil
+		return []string{}
 	}
 	if u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableAllFolders {
 		return nil
@@ -248,12 +242,15 @@ func (h *Handler) userParentalPolicyForRequest(r *http.Request, fallbackUserID s
 		uid = guid.Normalize(fallbackUserID)
 	}
 	if h.userRepo != nil && uid != "" {
-		if u, err := h.userRepo.GetUserByID(r.Context(), uid); err == nil && u != nil {
-			if u.IsAdmin || u.Policy.IsAdministrator {
-				return nil, nil
-			}
-			return u.Policy.MaxParentalRating, u.Policy.BlockedTags
+		u, err := h.userRepo.GetUserByID(r.Context(), uid)
+		if err != nil || u == nil {
+			zero := 0
+			return &zero, nil
 		}
+		if u.IsAdmin || u.Policy.IsAdministrator {
+			return nil, nil
+		}
+		return u.Policy.MaxParentalRating, u.Policy.BlockedTags
 	}
 	if hasAC && ac != nil && ac.User != nil {
 		return ac.User.Policy.MaxParentalRating, ac.User.Policy.BlockedTags
@@ -359,6 +356,9 @@ func (h *Handler) handleListCollections(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if h.isNonAdminCaller(r) {
+		dto.SanitizeItemPathsSlice(items)
 	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            items,
@@ -480,6 +480,9 @@ func (h *Handler) handleListPlaylists(w http.ResponseWriter, r *http.Request) {
 			visible = visible[:limit]
 		}
 		items = visible
+	}
+	if h.isNonAdminCaller(r) {
+		dto.SanitizeItemPathsSlice(items)
 	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            items,
@@ -615,6 +618,17 @@ func (h *Handler) handlePlaylistInstantMix(w http.ResponseWriter, r *http.Reques
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	if maxRating != nil || len(blockedTags) > 0 {
+		blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags)
+		if bErr != nil {
+			httpx.Error(w, http.StatusInternalServerError, bErr.Error())
+			return
+		}
+		if blocked {
+			httpx.Error(w, http.StatusForbidden, "access denied")
+			return
+		}
+	}
 	items, total, err := h.repo.GetInstantMixWithPolicy(
 		r.Context(),
 		h.serverID(),
@@ -629,6 +643,9 @@ func (h *Handler) handlePlaylistInstantMix(w http.ResponseWriter, r *http.Reques
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if h.isNonAdminCaller(r) {
+		dto.SanitizeItemPathsSlice(items)
 	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            items,
@@ -667,6 +684,17 @@ func (h *Handler) handleGetContainerItems(expectedType string, checkPlaylistAcce
 		userID := h.resolveUserID(r, q)
 		allowed := h.allowedLibrariesForRequest(r, userID)
 		maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+		if maxRating != nil || len(blockedTags) > 0 {
+			blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags)
+			if bErr != nil {
+				httpx.Error(w, http.StatusInternalServerError, bErr.Error())
+				return
+			}
+			if blocked {
+				httpx.Error(w, http.StatusForbidden, "access denied")
+				return
+			}
+		}
 		startIndex := q.Int("StartIndex", 0)
 		limit := q.Int("Limit", 0)
 		needFilter := allowed != nil || maxRating != nil || len(blockedTags) > 0
@@ -730,13 +758,7 @@ func (h *Handler) handleGetContainerItems(expectedType string, checkPlaylistAcce
 		}
 		if h.isNonAdminCaller(r) {
 			for i := range items {
-				items[i].Path = ""
-				for j := range items[i].MediaSources {
-					items[i].MediaSources[j].Path = ""
-					for k := range items[i].MediaSources[j].MediaStreams {
-						items[i].MediaSources[j].MediaStreams[k].Path = ""
-					}
-				}
+				dto.SanitizeItemPaths(&items[i].BaseItemDto)
 			}
 		}
 		httpx.JSON(w, http.StatusOK, dto.QueryResult[sqlite.PlaylistItemDto]{

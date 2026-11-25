@@ -127,6 +127,9 @@ func (w *gzipResponseWriter) decide(statusCode int, sniff []byte) {
 	h.Set("Content-Encoding", "gzip")
 	addVaryHeader(h, "Accept-Encoding")
 	h.Del("Content-Length")
+	if etag := h.Get("ETag"); etag != "" && !strings.HasPrefix(etag, "W/") {
+		h.Set("ETag", "W/"+etag)
+	}
 }
 
 func (w *gzipResponseWriter) close() {
@@ -185,6 +188,9 @@ func isCompressibleContentType(contentType string) bool {
 		return false
 	}
 
+	if mediaType == "text/event-stream" {
+		return false
+	}
 	if strings.HasPrefix(mediaType, "text/") {
 		return true
 	}

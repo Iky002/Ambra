@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"os"
@@ -19,7 +20,10 @@ import (
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
 )
 
-const maxFinishedEntries = 500
+const (
+	maxFinishedEntries         = 500
+	defaultGracefulStopTimeout = 3 * time.Second
+)
 
 // Status represents the lifecycle state of a DVR recording job.
 type Status string
@@ -68,18 +72,22 @@ type Options struct {
 
 type recordingEntry struct {
 	state     RecordingState
+	cmd       *exec.Cmd
+	stdin     io.WriteCloser
 	cancel    context.CancelFunc
+	stopOnce  sync.Once
 	cancelled bool
 	done      chan struct{}
 }
 
 // Recorder manages active and historical Live TV recording tasks backed by ffmpeg.
 type Recorder struct {
-	recordingsDir string
-	ffmpegPath    string
-	bus           *eventbus.Bus
-	logger        *slog.Logger
-	argsBuilder   func(job RecordingJob, outFile string) []string
+	recordingsDir   string
+	ffmpegPath      string
+	bus             *eventbus.Bus
+	logger          *slog.Logger
+	argsBuilder     func(job RecordingJob, outFile string) []string
+	gracefulTimeout time.Duration
 
 	mu         sync.RWMutex
 	entries    map[string]*recordingEntry
@@ -121,12 +129,13 @@ func NewRecorder(opts Options) *Recorder {
 		argsBuilder = DefaultArgsBuilder
 	}
 	return &Recorder{
-		recordingsDir: filepath.Join(dataDir, "recordings"),
-		ffmpegPath:    ffmpegPath,
-		bus:           opts.Bus,
-		logger:        logger,
-		argsBuilder:   argsBuilder,
-		entries:       make(map[string]*recordingEntry),
+		recordingsDir:   filepath.Join(dataDir, "recordings"),
+		ffmpegPath:      ffmpegPath,
+		bus:             opts.Bus,
+		logger:          logger,
+		argsBuilder:     argsBuilder,
+		gracefulTimeout: defaultGracefulStopTimeout,
+		entries:         make(map[string]*recordingEntry),
 	}
 }
 
@@ -148,7 +157,7 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 	if strings.TrimSpace(job.TimerID) == "" || strings.TrimSpace(job.StreamURL) == "" {
 		return nil, ErrInvalidJob
 	}
-	if err := netutil.ValidateRemoteURL(job.StreamURL, true); err != nil {
+	if err := netutil.ValidateRemoteURLNoLoopback(job.StreamURL, true); err != nil {
 		return nil, fmt.Errorf("%w: invalid stream URL: %v", ErrInvalidJob, err)
 	}
 	if err := os.MkdirAll(r.recordingsDir, 0o755); err != nil {
@@ -168,9 +177,13 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 		return nil, ErrAlreadyRecording
 	}
 
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	recCtx, cancel := context.WithCancel(ctx)
 	args := r.argsBuilder(job, outFile)
-	cmd := exec.CommandContext(recCtx, r.ffmpegPath, args...)
+	cmd := exec.Command(r.ffmpegPath, args...)
+	stdinPipe, _ := cmd.StdinPipe()
 
 	entry := &recordingEntry{
 		state: RecordingState{
@@ -179,11 +192,16 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 			Status:     StatusRecording,
 			StartedAt:  now,
 		},
+		cmd:    cmd,
+		stdin:  stdinPipe,
 		cancel: cancel,
 		done:   make(chan struct{}),
 	}
 
 	if err := cmd.Start(); err != nil {
+		if stdinPipe != nil {
+			_ = stdinPipe.Close()
+		}
 		cancel()
 		entry.state.Status = StatusFailed
 		entry.state.EndedAt = time.Now().UTC()
@@ -205,15 +223,59 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 	snapshot := entry.state
 	r.mu.Unlock()
 
+	go r.watchCancel(recCtx, entry)
 	go r.waitRecording(recCtx, cmd, entry)
 
 	return &snapshot, nil
+}
+
+func (r *Recorder) watchCancel(recCtx context.Context, entry *recordingEntry) {
+	select {
+	case <-entry.done:
+		return
+	case <-recCtx.Done():
+		r.gracefulStop(entry)
+	}
+}
+
+// gracefulStop asks FFmpeg to finalize the MKV container cleanly by writing 'q' to stdin
+// and sending os.Interrupt, waiting up to gracefulTimeout (default 3s) before forcing Kill().
+func (r *Recorder) gracefulStop(entry *recordingEntry) {
+	if entry == nil {
+		return
+	}
+	entry.stopOnce.Do(func() {
+		if entry.stdin != nil {
+			_, _ = io.WriteString(entry.stdin, "q\n")
+			_ = entry.stdin.Close()
+		}
+		if entry.cmd != nil && entry.cmd.Process != nil {
+			_ = entry.cmd.Process.Signal(os.Interrupt)
+		}
+		timeout := r.gracefulTimeout
+		if timeout <= 0 {
+			timeout = defaultGracefulStopTimeout
+		}
+		select {
+		case <-entry.done:
+			return
+		case <-time.After(timeout):
+		}
+		if entry.cmd != nil && entry.cmd.Process != nil {
+			_ = entry.cmd.Process.Kill()
+		}
+	})
 }
 
 func (r *Recorder) waitRecording(recCtx context.Context, cmd *exec.Cmd, entry *recordingEntry) {
 	defer r.wg.Done()
 	defer close(entry.done)
 	defer entry.cancel()
+	defer func() {
+		if entry.stdin != nil {
+			_ = entry.stdin.Close()
+		}
+	}()
 
 	err := cmd.Wait()
 	endedAt := time.Now().UTC()

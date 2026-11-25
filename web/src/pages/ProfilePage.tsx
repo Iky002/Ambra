@@ -15,7 +15,7 @@ import {
   User as UserIcon,
 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
-import { api, getUserImageUrl } from '../api/client'
+import { api, ApiError, getUserImageUrl } from '../api/client'
 import { useAuth } from '../context/AuthContext'
 import { useI18n } from '../i18n/I18nContext'
 import { SUPPORTED_LOCALES } from '../i18n/types'
@@ -145,9 +145,14 @@ export function ProfilePage() {
       setCurrentPw('')
       setNewPw('')
       setConfirmPw('')
-      setFeedback({ type: 'success', message: '登录密码已修改成功' })
+      setFeedback({ type: 'success', message: '登录密码已修改成功，其他设备会话已自动下线' })
     },
     onError: (err) => {
+      if (err instanceof ApiError && err.status === 401) {
+        setFeedback({ type: 'error', message: '当前登录会话已失效，请重新登录' })
+        navigate('/login', { replace: true })
+        return
+      }
       setFeedback({
         type: 'error',
         message: err instanceof Error ? err.message : '修改密码失败，请检查当前密码',

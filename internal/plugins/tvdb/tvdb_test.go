@@ -366,6 +366,17 @@ func TestFetchEpisode(t *testing.T) {
 		case "/search":
 			_, _ = w.Write([]byte(`{"status":"success","data":[{"id":"series-81189","name":"Breaking Bad"}]}`))
 		case "/series/81189/episodes/default":
+			if r.URL.Query().Get("season") == "0" {
+				_, _ = w.Write([]byte(`{
+					"status": "success",
+					"data": {
+						"episodes": [
+							{"id": 349900, "name": "Special Episode", "overview": "OVA special", "aired": "2009-02-17", "seasonNumber": 0, "number": 1}
+						]
+					}
+				}`))
+				return
+			}
 			if r.URL.Query().Get("season") != "1" {
 				_, _ = w.Write([]byte(`{"status":"success","data":{"episodes":[]}}`))
 				return
@@ -433,14 +444,25 @@ func TestFetchEpisode(t *testing.T) {
 		t.Fatalf("expected nil for missing episode, got r=%v err=%v", r, err)
 	}
 
-	// Invalid season/episode number -> nil, nil
-	if r, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
+	// Season 0 specials MUST be supported.
+	spec, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
 		ItemType:      "Episode",
 		SeasonNumber:  0,
 		EpisodeNumber: 1,
 		ProviderIDs:   map[string]string{"Tvdb": "81189"},
+	})
+	if err != nil || spec == nil || spec.Name != "Special Episode" || spec.ProviderIDs["Tvdb"] != "349900" {
+		t.Fatalf("expected Season 0 special episode to succeed, got spec=%+v err=%v", spec, err)
+	}
+
+	// Negative season number -> nil, nil
+	if r, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
+		ItemType:      "Episode",
+		SeasonNumber:  -1,
+		EpisodeNumber: 1,
+		ProviderIDs:   map[string]string{"Tvdb": "81189"},
 	}); err != nil || r != nil {
-		t.Fatalf("expected nil for season <= 0, got r=%v err=%v", r, err)
+		t.Fatalf("expected nil for season < 0, got r=%v err=%v", r, err)
 	}
 }
 

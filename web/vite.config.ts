@@ -12,6 +12,24 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
     assetsInlineLimit: 0,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('node_modules/hls.js')) return 'vendor-hls'
+          if (id.includes('node_modules/jassub')) return 'vendor-jassub'
+          if (id.includes('node_modules/@ffmpeg')) return 'vendor-ffmpeg'
+          if (
+            id.includes('node_modules/react') ||
+            id.includes('node_modules/react-dom') ||
+            id.includes('node_modules/react-router') ||
+            id.includes('node_modules/@tanstack')
+          ) {
+            return 'vendor-react'
+          }
+          if (id.includes('node_modules/lucide-react')) return 'vendor-icons'
+        },
+      },
+    },
   },
   server: {
     port: 5173,

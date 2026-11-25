@@ -21,7 +21,7 @@ type trackingWSHub struct {
 	disconnected []string
 }
 
-func (t *trackingWSHub) SendToDevice(string, ws.Message) {}
+func (t *trackingWSHub) SendToUserDevice(string, string, ws.Message) {}
 func (t *trackingWSHub) DisconnectDevice(deviceID string) {
 	t.disconnected = append(t.disconnected, deviceID)
 }

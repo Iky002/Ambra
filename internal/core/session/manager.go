@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sort"
 	"sync"
@@ -16,11 +17,16 @@ import (
 )
 
 const (
-	defaultPlayedThreshold = 0.90
-	progressPersistWindow  = 15 * time.Second
-	maxSessions            = 2048
-	sessionStaleTTL        = 24 * time.Hour
+	defaultPlayedThreshold       = 0.90
+	progressPersistWindow        = 15 * time.Second
+	maxSessions                  = 2048
+	sessionStaleTTL              = 24 * time.Hour
+	defaultActivityLogCooldown   = 30 * time.Second
+	maxActivityLogThrottleKeys   = 4096
 )
+
+// ErrItemAccessDenied is returned when a playback report references a missing or unauthorized item.
+var ErrItemAccessDenied = errors.New("session: item not found or access denied")
 
 type PlaybackStartRequest struct {
 	ItemId              string           `json:"ItemId"`
@@ -103,6 +109,12 @@ type sessionEntry struct {
 	playSessionID   string
 }
 
+type activityThrottleKey struct {
+	userID    string
+	itemID    string
+	eventType string
+}
+
 // Manager maintains active client sessions in memory and bridges playback progress to SQLite and EventBus.
 type Manager struct {
 	repo    *sqlite.UserRepo
@@ -110,8 +122,11 @@ type Manager struct {
 	cfg     *config.Config
 	bus     *eventbus.Bus
 
-	mu       sync.RWMutex
-	sessions map[string]*sessionEntry // keyed by SessionInfo.Id
+	mu                  sync.RWMutex
+	sessions            map[string]*sessionEntry // keyed by SessionInfo.Id
+	itemAccessChecker   func(ctx context.Context, user *sqlite.UserRecord, itemID string) bool
+	activityLogCooldown time.Duration
+	activityLogThrottle map[activityThrottleKey]time.Time
 }
 
 func NewManager(repo *sqlite.UserRepo, cfg *config.Config, bus *eventbus.Bus) *Manager {
@@ -120,11 +135,13 @@ func NewManager(repo *sqlite.UserRepo, cfg *config.Config, bus *eventbus.Bus) *M
 		libRepo = sqlite.NewLibraryRepo(repo.Store())
 	}
 	return &Manager{
-		repo:     repo,
-		libRepo:  libRepo,
-		cfg:      cfg,
-		bus:      bus,
-		sessions: make(map[string]*sessionEntry),
+		repo:                repo,
+		libRepo:             libRepo,
+		cfg:                 cfg,
+		bus:                 bus,
+		sessions:            make(map[string]*sessionEntry),
+		activityLogCooldown: defaultActivityLogCooldown,
+		activityLogThrottle: make(map[activityThrottleKey]time.Time),
 	}
 }
 
@@ -133,6 +150,76 @@ func (m *Manager) SetLibraryRepo(libRepo *sqlite.LibraryRepo) {
 	m.mu.Lock()
 	m.libRepo = libRepo
 	m.mu.Unlock()
+}
+
+// SetItemAccessChecker configures an optional RBAC callback verified on playback start/progress/stopped.
+func (m *Manager) SetItemAccessChecker(fn func(ctx context.Context, user *sqlite.UserRecord, itemID string) bool) {
+	m.mu.Lock()
+	m.itemAccessChecker = fn
+	m.mu.Unlock()
+}
+
+func (m *Manager) checkItemAccess(ctx context.Context, user *sqlite.UserRecord, itemID string) error {
+	if itemID == "" {
+		return nil
+	}
+	m.mu.RLock()
+	checker := m.itemAccessChecker
+	libRepo := m.libRepo
+	m.mu.RUnlock()
+
+	if checker != nil {
+		if !checker(ctx, user, itemID) {
+			return ErrItemAccessDenied
+		}
+		if libRepo != nil {
+			rec, err := libRepo.GetItemRecordByID(ctx, itemID)
+			if err != nil || rec == nil {
+				return ErrItemAccessDenied
+			}
+		}
+		return nil
+	}
+	if libRepo != nil {
+		rec, err := libRepo.GetItemRecordByID(ctx, itemID)
+		if err != nil || rec == nil {
+			return ErrItemAccessDenied
+		}
+	}
+	return nil
+}
+
+func (m *Manager) shouldRecordActivityLog(userID, itemID, eventType string, now time.Time) bool {
+	key := activityThrottleKey{
+		userID:    guid.Normalize(userID),
+		itemID:    guid.Normalize(itemID),
+		eventType: eventType,
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cooldown := m.activityLogCooldown
+	if cooldown <= 0 {
+		cooldown = defaultActivityLogCooldown
+	}
+	if m.activityLogThrottle == nil {
+		m.activityLogThrottle = make(map[activityThrottleKey]time.Time)
+	}
+	if last, ok := m.activityLogThrottle[key]; ok && now.Sub(last) < cooldown {
+		return false
+	}
+	if len(m.activityLogThrottle) >= maxActivityLogThrottleKeys {
+		for k, ts := range m.activityLogThrottle {
+			if now.Sub(ts) >= cooldown {
+				delete(m.activityLogThrottle, k)
+			}
+		}
+		if len(m.activityLogThrottle) >= maxActivityLogThrottleKeys {
+			m.activityLogThrottle = make(map[activityThrottleKey]time.Time)
+		}
+	}
+	m.activityLogThrottle[key] = now
+	return true
 }
 
 func (m *Manager) touchSessionLocked(user *sqlite.UserRecord, client auth.ClientInfo, now time.Time) *sessionEntry {
@@ -319,6 +406,12 @@ func (m *Manager) ReportPlaybackStart(ctx context.Context, user *sqlite.UserReco
 		return nil
 	}
 	itemID := guid.Normalize(req.ItemId)
+	if itemID == "" && req.Item != nil {
+		itemID = guid.Normalize(req.Item.Id)
+	}
+	if err := m.checkItemAccess(ctx, user, itemID); err != nil {
+		return err
+	}
 	now := time.Now().UTC()
 
 	var nowPlaying *dto.BaseItemDto
@@ -379,7 +472,7 @@ func (m *Manager) ReportPlaybackStart(ctx context.Context, user *sqlite.UserReco
 	}
 	m.mu.Unlock()
 
-	if m.repo != nil && itemID != "" {
+	if m.repo != nil && itemID != "" && m.shouldRecordActivityLog(user.ID, itemID, "VideoPlayback", now) {
 		if err := m.repo.CreateActivityLog(ctx, &sqlite.ActivityLogRecord{
 			Name:     user.Name + " started playing",
 			Type:     "VideoPlayback",
@@ -412,6 +505,21 @@ func (m *Manager) ReportPlaybackProgress(ctx context.Context, user *sqlite.UserR
 		return nil
 	}
 	itemID := guid.Normalize(req.ItemId)
+	if itemID == "" {
+		deviceID := client.DeviceID
+		if deviceID == "" {
+			deviceID = "default-device"
+		}
+		sid := auth.SessionID(user.ID, deviceID)
+		m.mu.RLock()
+		if existing, ok := m.sessions[sid]; ok && existing.info.NowPlayingItem != nil {
+			itemID = guid.Normalize(existing.info.NowPlayingItem.Id)
+		}
+		m.mu.RUnlock()
+	}
+	if err := m.checkItemAccess(ctx, user, itemID); err != nil {
+		return err
+	}
 	now := time.Now().UTC()
 
 	shouldPersist := false
@@ -502,6 +610,21 @@ func (m *Manager) ReportPlaybackStopped(ctx context.Context, user *sqlite.UserRe
 		return nil
 	}
 	itemID := guid.Normalize(req.ItemId)
+	if itemID == "" {
+		deviceID := client.DeviceID
+		if deviceID == "" {
+			deviceID = "default-device"
+		}
+		sid := auth.SessionID(user.ID, deviceID)
+		m.mu.RLock()
+		if existing, ok := m.sessions[sid]; ok && existing.info.NowPlayingItem != nil {
+			itemID = guid.Normalize(existing.info.NowPlayingItem.Id)
+		}
+		m.mu.RUnlock()
+	}
+	if err := m.checkItemAccess(ctx, user, itemID); err != nil {
+		return err
+	}
 	now := time.Now().UTC()
 
 	var audioIdx, subIdx *int
@@ -565,14 +688,16 @@ func (m *Manager) ReportPlaybackStopped(ctx context.Context, user *sqlite.UserRe
 		} else if ud != nil {
 			updatedData = ud
 		}
-		if err := m.repo.CreateActivityLog(ctx, &sqlite.ActivityLogRecord{
-			Name:     user.Name + " stopped playing",
-			Type:     "VideoPlaybackStopped",
-			ItemID:   itemID,
-			UserID:   user.ID,
-			Severity: "Info",
-		}); err != nil {
-			slog.Warn("session: failed to record playback stop activity log", "user_id", user.ID, "item_id", itemID, "err", err)
+		if m.shouldRecordActivityLog(user.ID, itemID, "VideoPlaybackStopped", now) {
+			if err := m.repo.CreateActivityLog(ctx, &sqlite.ActivityLogRecord{
+				Name:     user.Name + " stopped playing",
+				Type:     "VideoPlaybackStopped",
+				ItemID:   itemID,
+				UserID:   user.ID,
+				Severity: "Info",
+			}); err != nil {
+				slog.Warn("session: failed to record playback stop activity log", "user_id", user.ID, "item_id", itemID, "err", err)
+			}
 		}
 	}
 

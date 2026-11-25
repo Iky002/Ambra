@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
@@ -21,38 +22,64 @@ import (
 )
 
 const (
-	DefaultTimeout      = 5 * time.Second
-	maxPluginTimeout    = 30 * time.Second
-	maxWasmMemoryPages  = 1024 // 64 MiB (1024 * 64 KiB)
-	maxWasmFileBytes    = 32 << 20
-	maxWasmStdoutBytes  = 4 << 20
-	maxWasmStderrBytes  = 64 << 10
-	maxManifestBytes    = 1 << 20
+	DefaultTimeout            = 5 * time.Second
+	maxPluginTimeout          = 30 * time.Second
+	maxWasmMemoryPages        = 1024 // 64 MiB (1024 * 64 KiB)
+	maxWasmFileBytes          = 32 << 20
+	maxWasmStdoutBytes        = 4 << 20
+	maxWasmStderrBytes        = 64 << 10
+	maxManifestBytes          = 1 << 20
+	defaultMaxConcurrentCalls = 8
 )
 
 type limitedBuffer struct {
+	mu        sync.Mutex
 	buf       bytes.Buffer
 	limit     int
 	truncated bool
+	cancel    context.CancelFunc
 }
 
 func (l *limitedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	remaining := l.limit - l.buf.Len()
 	if remaining <= 0 {
 		l.truncated = true
+		if l.cancel != nil {
+			l.cancel()
+		}
 		return len(p), nil
 	}
 	if len(p) > remaining {
 		_, _ = l.buf.Write(p[:remaining])
 		l.truncated = true
+		if l.cancel != nil {
+			l.cancel()
+		}
 		return len(p), nil
 	}
 	_, _ = l.buf.Write(p)
 	return len(p), nil
 }
 
-func (l *limitedBuffer) Bytes() []byte  { return l.buf.Bytes() }
-func (l *limitedBuffer) String() string { return l.buf.String() }
+func (l *limitedBuffer) Bytes() []byte {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]byte(nil), l.buf.Bytes()...)
+}
+
+func (l *limitedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+func (l *limitedBuffer) isTruncated() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.truncated
+}
 
 // PluginManifest extends plugins.Manifest with WASM runtime fields loaded from manifest.json.
 type PluginManifest struct {
@@ -73,13 +100,14 @@ type Request struct {
 type Host struct {
 	runtime        wazero.Runtime
 	defaultTimeout time.Duration
+	sem            chan struct{}
 
 	mu     sync.Mutex
 	closed bool
 }
 
 // NewHost initializes a pure-Go wazero runtime with WASI preview1 support,
-// memory page limit (64 MiB), and context-cancellation enforcement.
+// memory page limit (64 MiB), concurrency limiting, and context-cancellation enforcement.
 func NewHost(ctx context.Context) (*Host, error) {
 	rtCfg := wazero.NewRuntimeConfig().
 		WithCloseOnContextDone(true).
@@ -92,6 +120,7 @@ func NewHost(ctx context.Context) (*Host, error) {
 	return &Host{
 		runtime:        rt,
 		defaultTimeout: DefaultTimeout,
+		sem:            make(chan struct{}, defaultMaxConcurrentCalls),
 	}, nil
 }
 
@@ -109,6 +138,10 @@ func (h *Host) Close(ctx context.Context) error {
 
 // LoadModule compiles a WASM binary in memory and returns an executable WasmPlugin.
 func (h *Host) LoadModule(ctx context.Context, manifest plugins.Manifest, wasmBytes []byte, timeout time.Duration) (*WasmPlugin, error) {
+	manifest.BuiltIn = false
+	if plugins.IsBuiltInID(manifest.ID) {
+		return nil, fmt.Errorf("wasmhost: external plugin id %q cannot use reserved prefix %q", manifest.ID, plugins.BuiltInIDPrefix)
+	}
 	if len(wasmBytes) == 0 {
 		return nil, errors.New("wasmhost: empty wasm binary")
 	}
@@ -223,6 +256,17 @@ func (h *Host) LoadFromDir(ctx context.Context, dir string, reg *plugins.Registr
 		}
 		if pm.Name == "" {
 			pm.Name = pm.ID
+		}
+		pm.BuiltIn = false
+		if plugins.IsBuiltInID(pm.ID) {
+			slog.Warn("wasmhost: refusing plugin with reserved built-in prefix", "plugin_id", pm.ID, "manifest", manifestPath)
+			continue
+		}
+		if reg != nil {
+			if existing, ok := reg.Get(pm.ID); ok && existing.Manifest().BuiltIn {
+				slog.Warn("wasmhost: refusing to overwrite built-in plugin", "plugin_id", pm.ID, "manifest", manifestPath)
+				continue
+			}
 		}
 		var timeout time.Duration
 		if pm.TimeoutMs > 0 {
@@ -354,6 +398,12 @@ func (p *WasmPlugin) ResolveStream(ctx context.Context, rawPath string) (*plugin
 	if err := json.Unmarshal(out, &res); err != nil {
 		return nil, fmt.Errorf("wasmhost: decode stream result from %q: %w", p.manifest.ID, err)
 	}
+	if u := strings.TrimSpace(res.URL); u != "" {
+		if err := netutil.ValidateRemoteURL(u, true); err != nil {
+			return nil, fmt.Errorf("wasmhost: plugin %q returned unsafe stream url: %w", p.manifest.ID, err)
+		}
+		res.URL = u
+	}
 	return &res, nil
 }
 
@@ -376,11 +426,20 @@ func (p *WasmPlugin) invoke(ctx context.Context, req Request) ([]byte, error) {
 		return nil, fmt.Errorf("wasmhost: marshal request: %w", err)
 	}
 
+	if p.host.sem != nil {
+		select {
+		case p.host.sem <- struct{}{}:
+			defer func() { <-p.host.sem }()
+		case <-ctx.Done():
+			return nil, fmt.Errorf("wasmhost: plugin %q cancelled waiting for execution slot: %w", p.manifest.ID, ctx.Err())
+		}
+	}
+
 	callCtx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
 
-	stdout := &limitedBuffer{limit: maxWasmStdoutBytes}
-	stderr := &limitedBuffer{limit: maxWasmStderrBytes}
+	stdout := &limitedBuffer{limit: maxWasmStdoutBytes, cancel: cancel}
+	stderr := &limitedBuffer{limit: maxWasmStderrBytes, cancel: cancel}
 	modCfg := wazero.NewModuleConfig().
 		WithName("").
 		WithStdin(bytes.NewReader(payload)).
@@ -391,13 +450,16 @@ func (p *WasmPlugin) invoke(ctx context.Context, req Request) ([]byte, error) {
 	if mod != nil {
 		_ = mod.Close(context.Background())
 	}
+	if stdout.isTruncated() {
+		return nil, fmt.Errorf("wasmhost: plugin %q stdout exceeded %d bytes", p.manifest.ID, maxWasmStdoutBytes)
+	}
 	if err != nil {
 		var exitErr *sys.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 0 {
-			if stdout.truncated {
-				return nil, fmt.Errorf("wasmhost: plugin %q stdout exceeded %d bytes", p.manifest.ID, maxWasmStdoutBytes)
-			}
 			return stdout.Bytes(), nil
+		}
+		if stderr.isTruncated() {
+			return nil, fmt.Errorf("wasmhost: plugin %q stderr exceeded %d bytes", p.manifest.ID, maxWasmStderrBytes)
 		}
 		if callCtx.Err() != nil {
 			return nil, fmt.Errorf("wasmhost: plugin %q execution timed out or cancelled: %w", p.manifest.ID, callCtx.Err())
@@ -407,9 +469,6 @@ func (p *WasmPlugin) invoke(ctx context.Context, req Request) ([]byte, error) {
 			return nil, fmt.Errorf("wasmhost: plugin %q failed (%s): %w", p.manifest.ID, errMsg, err)
 		}
 		return nil, fmt.Errorf("wasmhost: plugin %q failed: %w", p.manifest.ID, err)
-	}
-	if stdout.truncated {
-		return nil, fmt.Errorf("wasmhost: plugin %q stdout exceeded %d bytes", p.manifest.ID, maxWasmStdoutBytes)
 	}
 	return stdout.Bytes(), nil
 }

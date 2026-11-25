@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/budget"
@@ -302,24 +303,25 @@ func (s *Service) ApproveAudit(ctx context.Context, auditID string, candidate Sc
 	}
 
 	now := time.Now().Unix()
+	sortKey := sqlite.PinyinSortKey(newName)
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE items
-		SET name = ?, original_title = ?, sort_name = ?, production_year = ?,
+		SET name = ?, original_title = ?, sort_name = ?, sort_key = ?, production_year = ?,
 		    community_rating = ?, extra_json = ?, date_modified = ?
 		WHERE id = ?`,
-		newName, newOriginalTitle, strings.ToLower(newName), newYear,
+		newName, newOriginalTitle, strings.ToLower(newName), sortKey, newYear,
 		newRating, string(encodedExtra), now, rec.ItemID,
 	); err != nil {
 		return nil, err
 	}
 
 	if len(candidate.Genres) > 0 {
-		if err := replaceItemTaxonomiesTx(ctx, tx, rec.ItemID, "Genre", candidate.Genres); err != nil {
+		if err := replaceItemTaxonomiesTx(ctx, tx, rec.ItemID, "genre", candidate.Genres); err != nil {
 			return nil, err
 		}
 	}
 	if len(candidate.Tags) > 0 {
-		if err := replaceItemTaxonomiesTx(ctx, tx, rec.ItemID, "Tag", candidate.Tags); err != nil {
+		if err := replaceItemTaxonomiesTx(ctx, tx, rec.ItemID, "tag", candidate.Tags); err != nil {
 			return nil, err
 		}
 	}
@@ -400,18 +402,81 @@ func replaceItemTaxonomiesTx(ctx context.Context, tx *sql.Tx, itemID, kind strin
 	return nil
 }
 
+func isCJKRune(r rune) bool {
+	return unicode.Is(unicode.Han, r) ||
+		(r >= 0x3040 && r <= 0x30FF) ||
+		(r >= 0xAC00 && r <= 0xD7AF)
+}
+
+func tokenizeForFTS(text string) string {
+	var tokens []string
+	seen := make(map[string]struct{})
+	add := func(t string) {
+		t = strings.TrimSpace(strings.ToLower(t))
+		if t == "" {
+			return
+		}
+		if _, ok := seen[t]; ok {
+			return
+		}
+		seen[t] = struct{}{}
+		tokens = append(tokens, t)
+	}
+
+	runes := []rune(text)
+	i := 0
+	for i < len(runes) {
+		r := runes[i]
+		if unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r) {
+			i++
+			continue
+		}
+		if isCJKRune(r) {
+			j := i
+			for j < len(runes) && isCJKRune(runes[j]) {
+				j++
+			}
+			cjk := runes[i:j]
+			add(string(cjk))
+			for k := 0; k < len(cjk); k++ {
+				add(string(cjk[k]))
+				if k+1 < len(cjk) {
+					add(string(cjk[k : k+2]))
+				}
+			}
+			i = j
+		} else {
+			j := i
+			for j < len(runes) && !unicode.IsSpace(runes[j]) && !unicode.IsPunct(runes[j]) && !unicode.IsSymbol(runes[j]) && !isCJKRune(runes[j]) {
+				j++
+			}
+			add(string(runes[i:j]))
+			i = j
+		}
+	}
+	return strings.Join(tokens, " ")
+}
+
 func syncItemSearchFTSTx(ctx context.Context, tx *sql.Tx, itemID, name, originalTitle string) error {
-	var pinyinFull, pinyinInitials, peopleNames string
+	var peopleNames string
 	_ = tx.QueryRowContext(ctx,
-		`SELECT COALESCE(pinyin_full, ''), COALESCE(pinyin_initials, ''), COALESCE(people_names, '') FROM item_search_fts WHERE item_id = ? LIMIT 1`,
+		`SELECT COALESCE(people_names, '') FROM item_search_fts WHERE item_id = ? LIMIT 1`,
 		itemID,
-	).Scan(&pinyinFull, &pinyinInitials, &peopleNames)
+	).Scan(&peopleNames)
 
 	titleRaw := strings.TrimSpace(name)
 	if orig := strings.TrimSpace(originalTitle); orig != "" && !strings.EqualFold(orig, titleRaw) {
 		titleRaw = strings.TrimSpace(titleRaw + " " + orig)
 	}
-	titleTokens := strings.ToLower(titleRaw)
+	titleRaw = sqlite.TradToSimp(titleRaw)
+	peopleRaw := sqlite.TradToSimp(peopleNames)
+	titleTokens := tokenizeForFTS(titleRaw)
+	pinyinFull, pinyinInitials := sqlite.ToPinyin(strings.TrimSpace(titleRaw + " " + peopleRaw))
+	if strings.TrimSpace(peopleRaw) != "" {
+		peopleNames = tokenizeForFTS(peopleRaw)
+	} else {
+		peopleNames = ""
+	}
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM item_search_fts WHERE item_id = ?`, itemID); err != nil {
 		return err

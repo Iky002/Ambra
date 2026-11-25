@@ -219,7 +219,8 @@ func TestSafeURLSpecialPrefixesAndRedirectHardening(t *testing.T) {
 		t.Fatal(err)
 	}
 	sensitive := []string{
-		"Authorization", "X-Emby-Token", "X-MediaBrowser-Token",
+		"Authorization", "Proxy-Authorization", "Cookie",
+		"X-Emby-Token", "X-MediaBrowser-Token",
 		"X-Emby-Authorization", "X-Api-Key", "trakt-api-key",
 	}
 	for _, h := range sensitive {
@@ -269,5 +270,27 @@ func TestSafeURLSpecialPrefixesAndRedirectHardening(t *testing.T) {
 	_ = ln.Close()
 	if _, err := tr.DialContext(context.Background(), "tcp", closedAddr); err == nil {
 		t.Fatal("expected dial error for closed loopback port")
+	}
+
+	// 5. NoLoopback variants block loopback even when allowPrivateLAN=true, while allowing RFC1918
+	if err := ValidateRemoteURLNoLoopback("http://127.0.0.1:8096/hook", true); err == nil {
+		t.Fatal("expected ValidateRemoteURLNoLoopback to block 127.0.0.1")
+	}
+	if err := ValidateRemoteURLNoLoopback("http://[::1]:8096/hook", true); err == nil {
+		t.Fatal("expected ValidateRemoteURLNoLoopback to block ::1")
+	}
+	if err := ValidateRemoteURLNoLoopback("http://localhost:8096/hook", true); err == nil {
+		t.Fatal("expected ValidateRemoteURLNoLoopback to block localhost")
+	}
+	if err := ValidateRemoteURLNoLoopback("http://192.168.1.50:8080/hook", true); err != nil {
+		t.Fatalf("expected ValidateRemoteURLNoLoopback to allow RFC1918 LAN when allowPrivateLAN=true, got %v", err)
+	}
+	if err := ValidateRemoteURLNoLoopback("http://192.168.1.50:8080/hook", false); err == nil {
+		t.Fatal("expected ValidateRemoteURLNoLoopback to block RFC1918 LAN when allowPrivateLAN=false")
+	}
+	noLoopClient := NewSafeHTTPClientNoLoopback(5*time.Second, true)
+	if resp, err := noLoopClient.Get(targetSrv.URL + "/landed"); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("expected NewSafeHTTPClientNoLoopback to block dialing loopback server")
 	}
 }

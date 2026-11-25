@@ -12,8 +12,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
-	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -39,6 +39,7 @@ const (
 	maxM3UPlaylistBytes = 20 << 20
 	maxTimerDuration    = 24 * time.Hour
 	maxPaddingSeconds   = 3600
+	proxyTargetTTL      = 6 * time.Hour
 )
 
 // AuthFuncs decouples route registration from the concrete middleware package.
@@ -62,19 +63,21 @@ type LiveTvInfo struct {
 }
 
 type ChannelInfo struct {
-	Id          string `json:"Id"`
-	Name        string `json:"Name"`
-	ServerId    string `json:"ServerId,omitempty"`
-	Type        string `json:"Type"`
-	ChannelType string `json:"ChannelType"`
-	Number      string `json:"Number,omitempty"`
-	TvgId       string `json:"TvgId,omitempty"`
-	LogoUrl     string `json:"LogoUrl,omitempty"`
-	GroupTitle  string `json:"GroupTitle,omitempty"`
-	StreamUrl   string `json:"StreamUrl,omitempty"`
-	TunerHostId string `json:"TunerHostId,omitempty"`
-	Disabled    bool   `json:"Disabled,omitempty"`
-	SortIndex   int    `json:"SortIndex,omitempty"`
+	Id           string `json:"Id"`
+	Name         string `json:"Name"`
+	ServerId     string `json:"ServerId,omitempty"`
+	Type         string `json:"Type"`
+	ChannelType  string `json:"ChannelType"`
+	Number       string `json:"Number,omitempty"`
+	TvgId        string `json:"TvgId,omitempty"`
+	LogoUrl      string `json:"LogoUrl,omitempty"`
+	GroupTitle   string `json:"GroupTitle,omitempty"`
+	StreamUrl    string `json:"StreamUrl,omitempty"`
+	IsHls        bool   `json:"IsHls"`
+	StreamFormat string `json:"StreamFormat,omitempty"`
+	TunerHostId  string `json:"TunerHostId,omitempty"`
+	Disabled     bool   `json:"Disabled,omitempty"`
+	SortIndex    int    `json:"SortIndex,omitempty"`
 }
 
 type ProgramInfo struct {
@@ -187,15 +190,17 @@ type liveTVState struct {
 }
 
 type Handler struct {
-	store            *sqlite.Store
-	cfg              *config.Config
-	userRepo         *sqlite.UserRepo
-	httpClient       *http.Client
-	streamClient     *http.Client
-	customHTTPClient bool
-	proxySecret      []byte
-	recorder         *dvr.Recorder
-	auth             AuthFuncs
+	store              *sqlite.Store
+	cfg                *config.Config
+	userRepo           *sqlite.UserRepo
+	httpClient         *http.Client
+	streamClient       *http.Client
+	publicStreamClient *http.Client
+	customHTTPClient   bool
+	customStreamClient bool
+	proxySecret        []byte
+	recorder           *dvr.Recorder
+	auth               AuthFuncs
 
 	mu    sync.RWMutex
 	state liveTVState
@@ -205,11 +210,12 @@ func New(store *sqlite.Store, cfg *config.Config) *Handler {
 	secret := make([]byte, 32)
 	_, _ = rand.Read(secret)
 	h := &Handler{
-		store:        store,
-		cfg:          cfg,
-		httpClient:   netutil.NewSafeHTTPClient(15*time.Second, true),
-		streamClient: netutil.NewSafeHTTPClient(0, true),
-		proxySecret:  secret,
+		store:              store,
+		cfg:                cfg,
+		httpClient:         netutil.NewSafeHTTPClientNoLoopback(15*time.Second, true),
+		streamClient:       netutil.NewSafeHTTPClientNoLoopback(0, true),
+		publicStreamClient: netutil.NewSafeHTTPClientNoLoopback(0, false),
+		proxySecret:        secret,
 	}
 	h.loadState(context.Background())
 	return h
@@ -365,7 +371,7 @@ func (h *Handler) DueRecordingJobs(ctx context.Context) ([]dvr.RecordingJob, err
 			continue
 		}
 		ch, ok := chByID[t.ChannelId]
-		if !ok {
+		if !ok || ch.Disabled {
 			continue
 		}
 		streamURL := strings.TrimSpace(ch.StreamUrl)
@@ -392,7 +398,7 @@ func (h *Handler) DueRecordingJobs(ctx context.Context) ([]dvr.RecordingJob, err
 
 	valid := make(map[string]candidate, len(candidates))
 	for _, c := range candidates {
-		if err := netutil.ValidateRemoteURL(c.streamURL, true); err != nil {
+		if err := netutil.ValidateRemoteURLNoLoopback(c.streamURL, true); err != nil {
 			continue
 		}
 		valid[c.timerID] = c
@@ -436,6 +442,15 @@ func (h *Handler) SetHTTPClient(client *http.Client) {
 	if client != nil {
 		h.httpClient = client
 		h.customHTTPClient = true
+	}
+}
+
+// SetStreamClient overrides the HTTP clients used for channel stream proxying (primarily for testing).
+func (h *Handler) SetStreamClient(client *http.Client) {
+	if client != nil {
+		h.streamClient = client
+		h.publicStreamClient = client
+		h.customStreamClient = true
 	}
 }
 
@@ -718,6 +733,35 @@ func (h *Handler) handleInfo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func detectStreamFormat(streamURL string) (isHLS bool, format string) {
+	trimmed := strings.TrimSpace(streamURL)
+	if trimmed == "" {
+		return false, "unknown"
+	}
+	lowerRaw := strings.ToLower(trimmed)
+	lowerPath := lowerRaw
+	if u, err := url.Parse(trimmed); err == nil && u.Path != "" {
+		lowerPath = strings.ToLower(u.Path)
+	}
+	if strings.HasSuffix(lowerPath, ".m3u8") ||
+		strings.HasSuffix(lowerPath, ".m3u") ||
+		strings.Contains(lowerPath, ".m3u8") ||
+		strings.Contains(lowerRaw, "format=m3u8") ||
+		strings.Contains(lowerRaw, "type=m3u8") {
+		return true, "hls"
+	}
+	if strings.HasSuffix(lowerPath, ".ts") ||
+		strings.HasSuffix(lowerPath, ".m2ts") ||
+		strings.HasSuffix(lowerPath, ".mpeg") ||
+		strings.HasSuffix(lowerPath, ".mpg") ||
+		strings.Contains(lowerRaw, "format=ts") ||
+		strings.Contains(lowerRaw, "output=ts") ||
+		strings.Contains(lowerRaw, "type=mpegts") {
+		return false, "mpegts"
+	}
+	return false, "unknown"
+}
+
 func (h *Handler) handleListChannels(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	search := strings.ToLower(strings.TrimSpace(q.Get("SearchTerm")))
@@ -739,6 +783,7 @@ func (h *Handler) handleListChannels(w http.ResponseWriter, r *http.Request) {
 		if chType != "" && strings.ToLower(ch.ChannelType) != chType {
 			continue
 		}
+		ch.IsHls, ch.StreamFormat = detectStreamFormat(ch.StreamUrl)
 		if hideStreamURL {
 			ch.StreamUrl = ""
 		}
@@ -764,6 +809,7 @@ func (h *Handler) handleGetChannel(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusNotFound, "channel not found")
 		return
 	}
+	ch.IsHls, ch.StreamFormat = detectStreamFormat(ch.StreamUrl)
 	if _, isAdmin, hasAuth := h.callerAuthInfo(r); hasAuth && !isAdmin {
 		ch.StreamUrl = ""
 	}
@@ -774,27 +820,67 @@ const maxHLSPlaylistBytes = 2 << 20 // 2 MiB
 
 var hlsURIAttributeRe = regexp.MustCompile(`URI="([^"]+)"`)
 
-func (h *Handler) signProxyTarget(channelID, target string) string {
+func (h *Handler) signProxyTarget(channelID, target string, allowPrivateLAN bool, exp int64) string {
+	lanFlag := "0"
+	if allowPrivateLAN {
+		lanFlag = "1"
+	}
 	mac := hmac.New(sha256.New, h.proxySecret)
 	mac.Write([]byte(channelID))
+	mac.Write([]byte{0})
+	mac.Write([]byte(lanFlag))
+	mac.Write([]byte{0})
+	mac.Write([]byte(strconv.FormatInt(exp, 10)))
 	mac.Write([]byte{0})
 	mac.Write([]byte(target))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-func (h *Handler) verifyProxyTarget(channelID, target, sig string) bool {
+func (h *Handler) verifyProxyTarget(channelID, target string, allowPrivateLAN bool, expStr, sig string) bool {
 	if len(h.proxySecret) == 0 {
+		return false
+	}
+	exp, err := strconv.ParseInt(strings.TrimSpace(expStr), 10, 64)
+	if err != nil || exp <= time.Now().UTC().Unix() {
 		return false
 	}
 	got, err := hex.DecodeString(strings.TrimSpace(sig))
 	if err != nil || len(got) != sha256.Size {
 		return false
 	}
+	lanFlag := "0"
+	if allowPrivateLAN {
+		lanFlag = "1"
+	}
 	mac := hmac.New(sha256.New, h.proxySecret)
 	mac.Write([]byte(channelID))
 	mac.Write([]byte{0})
+	mac.Write([]byte(lanFlag))
+	mac.Write([]byte{0})
+	mac.Write([]byte(strconv.FormatInt(exp, 10)))
+	mac.Write([]byte{0})
 	mac.Write([]byte(target))
 	return hmac.Equal(got, mac.Sum(nil))
+}
+
+func (h *Handler) validateStreamURL(rawURL string, allowPrivateLAN bool) error {
+	if h.customStreamClient {
+		return netutil.ValidateRemoteURL(rawURL, allowPrivateLAN)
+	}
+	return netutil.ValidateRemoteURLNoLoopback(rawURL, allowPrivateLAN)
+}
+
+func (h *Handler) channelAllowsPrivateLAN(channelURL string) bool {
+	trimmed := strings.TrimSpace(channelURL)
+	if trimmed == "" {
+		return false
+	}
+	// Public channels (valid under allowPrivateLAN=false) MUST NOT access RFC1918 private LAN.
+	if netutil.ValidateRemoteURL(trimmed, false) == nil {
+		return false
+	}
+	// Private LAN channels are allowed LAN access, never loopback in production.
+	return h.validateStreamURL(trimmed, true) == nil
 }
 
 func (h *Handler) handleStreamChannel(w http.ResponseWriter, r *http.Request) {
@@ -808,20 +894,35 @@ func (h *Handler) handleStreamChannel(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusForbidden, "channel is disabled")
 		return
 	}
+	channelAllowLAN := h.channelAllowsPrivateLAN(ch.StreamUrl)
 	streamURL := ch.StreamUrl
+	allowPrivateLAN := channelAllowLAN
 	if target := strings.TrimSpace(r.URL.Query().Get("target")); target != "" {
-		sig := strings.TrimSpace(r.URL.Query().Get("sig"))
-		if !h.verifyProxyTarget(id, target, sig) {
-			httpx.Error(w, http.StatusForbidden, "invalid or missing target signature")
+		q := r.URL.Query()
+		sig := strings.TrimSpace(q.Get("sig"))
+		expStr := strings.TrimSpace(q.Get("exp"))
+		lanParam := strings.TrimSpace(q.Get("lan"))
+		if lanParam != "0" && lanParam != "1" {
+			httpx.Error(w, http.StatusForbidden, "invalid or missing target scope")
 			return
 		}
-		if err := netutil.ValidateRemoteURL(target, true); err != nil {
+		reqAllowLAN := lanParam == "1"
+		if reqAllowLAN && !channelAllowLAN {
+			httpx.Error(w, http.StatusForbidden, "target scope exceeds channel network scope")
+			return
+		}
+		if !h.verifyProxyTarget(id, target, reqAllowLAN, expStr, sig) {
+			httpx.Error(w, http.StatusForbidden, "invalid, expired, or missing target signature")
+			return
+		}
+		if err := h.validateStreamURL(target, reqAllowLAN); err != nil {
 			httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("unsafe target stream url: %v", err))
 			return
 		}
 		streamURL = target
+		allowPrivateLAN = reqAllowLAN
 	}
-	h.proxyChannelStream(w, r, id, streamURL)
+	h.proxyChannelStreamWithPolicy(w, r, id, streamURL, allowPrivateLAN)
 }
 
 type flushWriter struct {
@@ -838,20 +939,30 @@ func (fw flushWriter) Write(p []byte) (int, error) {
 }
 
 // ProxyStreamURL validates streamURL (allowing private LAN IPTV tuners while blocking
-// metadata/link-local/non-HTTP URLs) and proxies the upstream live stream bound to r.Context().
+// loopback/metadata/link-local/non-HTTP URLs) and proxies the upstream live stream bound to r.Context().
 func (h *Handler) ProxyStreamURL(w http.ResponseWriter, r *http.Request, streamURL string) {
-	h.proxyChannelStream(w, r, "", streamURL)
+	h.proxyChannelStreamWithPolicy(w, r, "", streamURL, h.channelAllowsPrivateLAN(streamURL))
 }
 
 // ProxyChannelStream validates streamURL and proxies the upstream live stream for channelID,
 // rewriting HLS playlist URIs with signed relative proxy URLs when channelID is non-empty.
 func (h *Handler) ProxyChannelStream(w http.ResponseWriter, r *http.Request, channelID, streamURL string) {
-	h.proxyChannelStream(w, r, channelID, streamURL)
+	allowLAN := h.channelAllowsPrivateLAN(streamURL)
+	if channelID != "" {
+		if ch, ok := h.GetChannelByID(channelID); ok && strings.TrimSpace(ch.StreamUrl) != "" {
+			allowLAN = h.channelAllowsPrivateLAN(ch.StreamUrl)
+		}
+	}
+	h.proxyChannelStreamWithPolicy(w, r, channelID, streamURL, allowLAN)
 }
 
 func (h *Handler) proxyChannelStream(w http.ResponseWriter, r *http.Request, channelID, streamURL string) {
+	h.ProxyChannelStream(w, r, channelID, streamURL)
+}
+
+func (h *Handler) proxyChannelStreamWithPolicy(w http.ResponseWriter, r *http.Request, channelID, streamURL string, allowPrivateLAN bool) {
 	trimmed := strings.TrimSpace(streamURL)
-	if err := netutil.ValidateRemoteURL(trimmed, true); err != nil {
+	if err := h.validateStreamURL(trimmed, allowPrivateLAN); err != nil {
 		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("unsafe channel stream url: %v", err))
 		return
 	}
@@ -862,9 +973,21 @@ func (h *Handler) proxyChannelStream(w http.ResponseWriter, r *http.Request, cha
 		return
 	}
 
-	client := h.streamClient
-	if client == nil {
-		client = netutil.NewSafeHTTPClient(0, true)
+	var client *http.Client
+	if allowPrivateLAN {
+		client = h.streamClient
+		if client == nil {
+			client = netutil.NewSafeHTTPClientNoLoopback(0, true)
+		}
+	} else {
+		client = h.publicStreamClient
+		if client == nil {
+			if h.customStreamClient && h.streamClient != nil {
+				client = h.streamClient
+			} else {
+				client = netutil.NewSafeHTTPClientNoLoopback(0, false)
+			}
+		}
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -906,15 +1029,11 @@ func (h *Handler) proxyChannelStream(w http.ResponseWriter, r *http.Request, cha
 		if r != nil && strings.Contains(strings.ToLower(r.URL.Path), "/livestreamfiles/") {
 			proxyBase = "../../Channels/" + url.PathEscape(channelID) + "/Stream"
 		}
-		allowLoopback := isLoopbackURL(trimmed)
-		if ch, ok := h.GetChannelByID(channelID); ok && strings.TrimSpace(ch.StreamUrl) != "" {
-			allowLoopback = isLoopbackURL(ch.StreamUrl)
-		}
-		rewritten := h.rewriteHLSPlaylistWithPolicy(string(raw), baseURL, channelID, proxyBase, token, allowLoopback)
-		if ct == "" {
-			ct = "application/vnd.apple.mpegurl"
-		}
-		w.Header().Set("Content-Type", ct)
+		rewritten := h.rewriteHLSPlaylistWithPolicy(string(raw), baseURL, channelID, proxyBase, token, allowPrivateLAN)
+		safeCT := sanitizeLiveTVProxyContentType(ct, "application/vnd.apple.mpegurl")
+		w.Header().Set("Content-Type", safeCT)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Content-Security-Policy", "sandbox")
 		w.Header().Set("Cache-Control", "no-cache, no-store")
 		w.Header().Set("Content-Length", strconv.Itoa(len(rewritten)))
 		w.WriteHeader(http.StatusOK)
@@ -922,10 +1041,10 @@ func (h *Handler) proxyChannelStream(w http.ResponseWriter, r *http.Request, cha
 		return
 	}
 
-	if ct == "" {
-		ct = "video/mp2t"
-	}
-	w.Header().Set("Content-Type", ct)
+	safeCT := sanitizeLiveTVProxyContentType(ct, "video/mp2t")
+	w.Header().Set("Content-Type", safeCT)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox")
 	w.Header().Set("Cache-Control", "no-cache, no-store")
 	w.WriteHeader(http.StatusOK)
 
@@ -934,6 +1053,35 @@ func (h *Handler) proxyChannelStream(w http.ResponseWriter, r *http.Request, cha
 		dst = flushWriter{w: w, f: f}
 	}
 	_, _ = io.Copy(dst, resp.Body)
+}
+
+func sanitizeLiveTVProxyContentType(rawCT, fallbackCT string) string {
+	trimmed := strings.TrimSpace(rawCT)
+	if trimmed == "" {
+		if fallbackCT != "" {
+			return fallbackCT
+		}
+		return "application/octet-stream"
+	}
+	mediaType, _, err := mime.ParseMediaType(trimmed)
+	if err != nil {
+		return "application/octet-stream"
+	}
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	if strings.HasPrefix(mediaType, "video/") || strings.HasPrefix(mediaType, "audio/") {
+		return mediaType
+	}
+	switch mediaType {
+	case "application/octet-stream",
+		"application/vnd.apple.mpegurl",
+		"application/x-mpegurl",
+		"application/mp4",
+		"application/mp2t",
+		"text/vtt":
+		return mediaType
+	default:
+		return "application/octet-stream"
+	}
 }
 
 func isHLSPlaylistResponse(contentType string, u *url.URL) bool {
@@ -947,35 +1095,22 @@ func isHLSPlaylistResponse(contentType string, u *url.URL) bool {
 	return false
 }
 
-func isLoopbackURL(rawURL string) bool {
-	u, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil {
-		return false
-	}
-	host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(u.Hostname()), "."))
-	if host == "" {
-		return false
-	}
-	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
-		return true
-	}
-	if addr, err := netip.ParseAddr(host); err == nil {
-		return addr.Unmap().IsLoopback()
-	}
-	return false
-}
-
 func (h *Handler) rewriteHLSPlaylist(playlist string, baseURL *url.URL, channelID, proxyBase, token string) string {
-	allowLoopback := false
+	allowPrivateLAN := false
 	if baseURL != nil {
-		allowLoopback = isLoopbackURL(baseURL.String())
+		allowPrivateLAN = h.channelAllowsPrivateLAN(baseURL.String())
 	}
-	return h.rewriteHLSPlaylistWithPolicy(playlist, baseURL, channelID, proxyBase, token, allowLoopback)
+	return h.rewriteHLSPlaylistWithPolicy(playlist, baseURL, channelID, proxyBase, token, allowPrivateLAN)
 }
 
-func (h *Handler) rewriteHLSPlaylistWithPolicy(playlist string, baseURL *url.URL, channelID, proxyBase, token string, allowLoopback bool) string {
+func (h *Handler) rewriteHLSPlaylistWithPolicy(playlist string, baseURL *url.URL, channelID, proxyBase, token string, allowPrivateLAN bool) string {
 	if proxyBase == "" {
 		proxyBase = "Stream"
+	}
+	exp := time.Now().UTC().Add(proxyTargetTTL).Unix()
+	lanFlag := "0"
+	if allowPrivateLAN {
+		lanFlag = "1"
 	}
 	rewriteURI := func(rawURI string) string {
 		trimmed := strings.TrimSpace(rawURI)
@@ -992,14 +1127,11 @@ func (h *Handler) rewriteHLSPlaylistWithPolicy(playlist string, baseURL *url.URL
 			return rawURI
 		}
 		resolvedStr := resolved.String()
-		if err := netutil.ValidateRemoteURL(resolvedStr, true); err != nil {
+		if err := h.validateStreamURL(resolvedStr, allowPrivateLAN); err != nil {
 			return rawURI
 		}
-		if !allowLoopback && isLoopbackURL(resolvedStr) {
-			return rawURI
-		}
-		sig := h.signProxyTarget(channelID, resolvedStr)
-		proxied := proxyBase + "?target=" + url.QueryEscape(resolvedStr) + "&sig=" + sig
+		sig := h.signProxyTarget(channelID, resolvedStr, allowPrivateLAN, exp)
+		proxied := proxyBase + "?target=" + url.QueryEscape(resolvedStr) + "&exp=" + strconv.FormatInt(exp, 10) + "&lan=" + lanFlag + "&sig=" + sig
 		if token != "" {
 			proxied += "&api_key=" + url.QueryEscape(token)
 		}
@@ -1365,6 +1497,8 @@ func (h *Handler) handleListRecordings(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	chID := q.Get("ChannelId")
 	status := strings.ToLower(q.Get("Status"))
+	_, isAdmin, hasAuth := h.callerAuthInfo(r)
+	hidePath := hasAuth && !isAdmin
 
 	h.mu.RLock()
 	filtered := make([]RecordingInfo, 0, len(h.state.Recordings))
@@ -1374,6 +1508,9 @@ func (h *Handler) handleListRecordings(w http.ResponseWriter, r *http.Request) {
 		}
 		if status != "" && strings.ToLower(rec.Status) != status {
 			continue
+		}
+		if hidePath {
+			rec.Path = ""
 		}
 		filtered = append(filtered, rec)
 	}
@@ -1388,10 +1525,15 @@ func (h *Handler) handleListRecordings(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleGetRecording(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
+	_, isAdmin, hasAuth := h.callerAuthInfo(r)
+	hidePath := hasAuth && !isAdmin
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for _, rec := range h.state.Recordings {
 		if rec.Id == id {
+			if hidePath {
+				rec.Path = ""
+			}
 			httpx.JSON(w, http.StatusOK, rec)
 			return
 		}
@@ -1474,6 +1616,9 @@ func (h *Handler) handleRecordingFolders(w http.ResponseWriter, r *http.Request)
 			ImageTags:         map[string]string{},
 			BackdropImageTags: []string{},
 		},
+	}
+	if _, isAdmin, hasAuth := h.callerAuthInfo(r); hasAuth && !isAdmin {
+		dto.SanitizeItemPathsSlice(folders)
 	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            folders,
@@ -1726,8 +1871,17 @@ func (h *Handler) scheduleTimersForSeriesLocked(st SeriesTimerInfo) {
 
 	now := time.Now().UTC()
 	serverID := h.serverID()
+	disabledChannels := make(map[string]bool)
+	for _, ch := range h.state.Channels {
+		if ch.Disabled {
+			disabledChannels[ch.Id] = true
+		}
+	}
 
 	for _, p := range h.state.Programs {
+		if disabledChannels[p.ChannelId] {
+			continue
+		}
 		if !p.EndDate.IsZero() && !p.EndDate.After(now) {
 			continue
 		}
@@ -1987,7 +2141,7 @@ func (h *Handler) loadM3UFromSource(ctx context.Context, src, userAgent string) 
 		scheme := strings.ToLower(u.Scheme)
 		if scheme == "http" || scheme == "https" {
 			if !h.customHTTPClient {
-				if err := netutil.ValidateRemoteURL(trimmed, true); err != nil {
+				if err := netutil.ValidateRemoteURLNoLoopback(trimmed, true); err != nil {
 					return nil, fmt.Errorf("blocked m3u url: %w", err)
 				}
 			}
@@ -2222,7 +2376,7 @@ func (h *Handler) loadXMLTVFromSource(ctx context.Context, src string) (*XMLTVGu
 		scheme := strings.ToLower(u.Scheme)
 		if scheme == "http" || scheme == "https" {
 			if !h.customHTTPClient {
-				if err := netutil.ValidateRemoteURL(trimmed, true); err != nil {
+				if err := netutil.ValidateRemoteURLNoLoopback(trimmed, true); err != nil {
 					return nil, fmt.Errorf("blocked xmltv url: %w", err)
 				}
 			}

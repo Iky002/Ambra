@@ -234,3 +234,44 @@ func TestBroadcasterGracefulDegradationOnBindFailure(t *testing.T) {
 		t.Fatalf("expected nil LocalAddr after bind failure, got %v", b.LocalAddr())
 	}
 }
+
+func TestBroadcasterInvalidPacketsDoNotExhaustRateLimit(t *testing.T) {
+	b := NewBroadcaster(Config{
+		ServerID: "rate-order-test",
+		Host:     "127.0.0.1",
+		Port:     8096,
+	})
+
+	srvConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srvConn.Close()
+
+	client, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	clientAddr := client.LocalAddr().(*net.UDPAddr)
+
+	// Flood with more than ssdpMaxPerWindow invalid UDP packets from the same source IP.
+	for i := 0; i < ssdpMaxPerWindow*3; i++ {
+		b.handlePacket(srvConn, clientAddr, []byte("GARBAGE-UDP-NOISE"))
+	}
+
+	// A legitimate M-SEARCH immediately afterward MUST still be answered (bucket was not consumed by garbage).
+	validSearch := []byte("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: " + STMediaServer + "\r\n\r\n")
+	b.handlePacket(srvConn, clientAddr, validSearch)
+
+	_ = client.SetReadDeadline(time.Now().Add(1 * time.Second))
+	buf := make([]byte, 2048)
+	n, _, err := client.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("expected valid M-SEARCH after invalid flood to still receive 200 OK, got err=%v", err)
+	}
+	if !strings.Contains(string(buf[:n]), "HTTP/1.1 200 OK") {
+		t.Fatalf("unexpected response: %s", string(buf[:n]))
+	}
+}

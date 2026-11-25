@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   canUseWasmRemux,
+  computeSha256Hex,
   DEFAULT_WASM_MAX_BYTES,
+  fetchVerifiedCoreBlobUrl,
+  FFMPEG_CORE_SHA256,
   formatBytes,
   getPreferWasmRemux,
   needsClientRemux,
@@ -167,6 +170,151 @@ describe('wasmRemuxer - 超大文件 (>150MB) 降级保护', () => {
     })
 
     expect(cancelSpy).toHaveBeenCalledTimes(1)
+    remuxer.dispose()
+  })
+})
+
+describe('wasmRemuxer - H-07 完整性校验、HTML/404 快速失败与 VFS 泄漏防护', () => {
+  const originalWorker = globalThis.Worker
+  const originalCreateObjectURL = URL.createObjectURL
+  const originalRevokeObjectURL = URL.revokeObjectURL
+
+  beforeEach(() => {
+    globalThis.Worker = class MockWorker {} as unknown as typeof Worker
+    URL.createObjectURL = vi.fn(() => 'blob:verified-core-url')
+    URL.revokeObjectURL = vi.fn()
+  })
+
+  afterEach(() => {
+    globalThis.Worker = originalWorker
+    URL.createObjectURL = originalCreateObjectURL
+    URL.revokeObjectURL = originalRevokeObjectURL
+    vi.restoreAllMocks()
+  })
+
+  it('fetchVerifiedCoreBlobUrl 校验固定版本 SHA-256，哈希不匹配时拒绝创建 Blob URL', async () => {
+    const jsBytes = new TextEncoder().encode('export default function createFFmpegCore() {}')
+    const expectedHash = await computeSha256Hex(jsBytes.buffer)
+
+    expect(FFMPEG_CORE_SHA256['ffmpeg-core.js']).toMatch(/^[0-9a-f]{64}$/)
+    expect(FFMPEG_CORE_SHA256['ffmpeg-core.wasm']).toMatch(/^[0-9a-f]{64}$/)
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(jsBytes, {
+        status: 200,
+        headers: { 'content-type': 'application/javascript' },
+      }),
+    )
+
+    const blobUrl = await fetchVerifiedCoreBlobUrl(
+      'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.js',
+      'text/javascript',
+      { expectedSha256: expectedHash },
+    )
+    expect(blobUrl).toBe('blob:verified-core-url')
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(jsBytes, {
+        status: 200,
+        headers: { 'content-type': 'application/javascript' },
+      }),
+    )
+
+    await expect(
+      fetchVerifiedCoreBlobUrl(
+        'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.js',
+        'text/javascript',
+        { expectedSha256: '0'.repeat(64) },
+      ),
+    ).rejects.toSatisfy(
+      (err: unknown) => err instanceof WasmRemuxFallbackError && err.reason === 'integrity_failed',
+    )
+  })
+
+  it('fetchVerifiedCoreBlobUrl 对 404、HTML 回退页和非法 WASM 魔数立即失败', async () => {
+    // 1. 404 快速失败
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+    await expect(
+      fetchVerifiedCoreBlobUrl('/web/ffmpeg/ffmpeg-core.js', 'text/javascript'),
+    ).rejects.toSatisfy(
+      (err: unknown) => err instanceof WasmRemuxFallbackError && err.reason === 'load_failed',
+    )
+
+    // 2. SPA HTML 回退响应快速失败
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response('<!doctype html><html></html>', {
+        status: 200,
+        headers: { 'content-type': 'text/html; charset=utf-8' },
+      }),
+    )
+    await expect(
+      fetchVerifiedCoreBlobUrl('/web/ffmpeg/ffmpeg-core.js', 'text/javascript'),
+    ).rejects.toSatisfy(
+      (err: unknown) => err instanceof WasmRemuxFallbackError && err.reason === 'load_failed',
+    )
+
+    // 3. 非法 WASM 魔数快速失败
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(new Uint8Array([0x01, 0x02, 0x03, 0x04]), {
+        status: 200,
+        headers: { 'content-type': 'application/wasm' },
+      }),
+    )
+    await expect(
+      fetchVerifiedCoreBlobUrl('/web/ffmpeg/ffmpeg-core.wasm', 'application/wasm'),
+    ).rejects.toSatisfy(
+      (err: unknown) => err instanceof WasmRemuxFallbackError && err.reason === 'load_failed',
+    )
+  })
+
+  it('remuxToMP4 无论转封装失败（非零退出码）还是抛错，都在 finally 中清理 VFS 临时文件', async () => {
+    const deleteFileSpy = vi.fn().mockResolvedValue(true)
+    const writeFileSpy = vi.fn().mockResolvedValue(true)
+    const execSpy = vi.fn().mockResolvedValueOnce(1).mockRejectedValueOnce(new Error('wasm trap'))
+    const fakeFfmpeg = {
+      writeFile: writeFileSpy,
+      exec: execSpy,
+      readFile: vi.fn(),
+      deleteFile: deleteFileSpy,
+      on: vi.fn(),
+      off: vi.fn(),
+      terminate: vi.fn(),
+    }
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async () =>
+        new Response(new Uint8Array([0x1a, 0x45, 0xdf, 0xa3]), {
+          status: 200,
+          headers: { 'content-length': '4' },
+        }),
+    )
+
+    const remuxer = new WasmRemuxer()
+    // 注入已加载的 mock ffmpeg 实例
+    const internal = remuxer as unknown as { ffmpeg: unknown; loaded: boolean }
+    internal.ffmpeg = fakeFfmpeg
+    internal.loaded = true
+
+    // 1) 非零退出码 -> 必须清理 input.mkv 与 output.mp4
+    await expect(
+      remuxer.remuxToMP4('/emby/Videos/fail-1/stream', undefined, { container: 'mkv' }),
+    ).rejects.toSatisfy(
+      (err: unknown) => err instanceof WasmRemuxFallbackError && err.reason === 'exec_failed',
+    )
+    expect(deleteFileSpy).toHaveBeenCalledWith('input.mkv')
+    expect(deleteFileSpy).toHaveBeenCalledWith('output.mp4')
+
+    deleteFileSpy.mockClear()
+
+    // 2) exec 抛错 -> 依然清理 input.ts 与 output.mp4
+    await expect(
+      remuxer.remuxToMP4('/emby/Videos/fail-2/stream', undefined, { container: 'ts' }),
+    ).rejects.toSatisfy(
+      (err: unknown) => err instanceof WasmRemuxFallbackError && err.reason === 'exec_failed',
+    )
+    expect(deleteFileSpy).toHaveBeenCalledWith('input.ts')
+    expect(deleteFileSpy).toHaveBeenCalledWith('output.mp4')
+
     remuxer.dispose()
   })
 })

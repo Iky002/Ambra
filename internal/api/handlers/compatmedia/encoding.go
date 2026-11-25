@@ -1344,6 +1344,17 @@ func (h *Handler) handleCollectionProviderItems(w http.ResponseWriter, r *http.R
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	if maxRating != nil || len(blockedTags) > 0 {
+		blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), containerRec, maxRating, blockedTags)
+		if bErr != nil {
+			httpx.Error(w, http.StatusInternalServerError, bErr.Error())
+			return
+		}
+		if blocked {
+			httpx.Error(w, http.StatusForbidden, "access denied")
+			return
+		}
+	}
 	startIndex := q.Int("StartIndex", 0)
 	limit := q.Int("Limit", 0)
 	needFilter := allowed != nil || maxRating != nil || len(blockedTags) > 0

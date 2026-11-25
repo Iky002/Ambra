@@ -539,6 +539,7 @@ func TestLiveStreamFileProxyAndRecordingPathTraversal(t *testing.T) {
 
 	cfg := &config.Config{ServerID: "srv-stream", DataDir: tmpDir}
 	lt := livetv.New(store, cfg)
+	lt.SetStreamClient(upstream.Client())
 	ltMux := http.NewServeMux()
 	lt.RegisterRoutes(ltMux, livetv.AuthFuncs{})
 
@@ -738,6 +739,7 @@ func TestLiveStreamFileHLSRewriteAndSignedProxy(t *testing.T) {
 
 	cfg := &config.Config{ServerID: "srv-hls", DataDir: tmpDir}
 	lt := livetv.New(store, cfg)
+	lt.SetStreamClient(upstream.Client())
 	ltMux := http.NewServeMux()
 	lt.RegisterRoutes(ltMux, livetv.AuthFuncs{})
 

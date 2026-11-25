@@ -48,6 +48,17 @@ var (
 // (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7), and CGNAT (100.64.0.0/10)
 // addresses are also blocked.
 func ValidateRemoteURL(rawURL string, allowPrivateLAN bool) error {
+	return validateRemoteURLWithOpts(rawURL, allowPrivateLAN, allowPrivateLAN)
+}
+
+// ValidateRemoteURLNoLoopback validates rawURL like ValidateRemoteURL, but
+// ALWAYS rejects loopback addresses (127.0.0.0/8, ::1, localhost, *.localhost)
+// even when allowPrivateLAN is true (for webhooks and Live TV LAN streams).
+func ValidateRemoteURLNoLoopback(rawURL string, allowPrivateLAN bool) error {
+	return validateRemoteURLWithOpts(rawURL, allowPrivateLAN, false)
+}
+
+func validateRemoteURLWithOpts(rawURL string, allowPrivateLAN, allowLoopback bool) error {
 	trimmed := strings.TrimSpace(rawURL)
 	if trimmed == "" {
 		return errors.New("empty url")
@@ -67,7 +78,7 @@ func ValidateRemoteURL(rawURL string, allowPrivateLAN bool) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), dnsLookupTimeout)
 	defer cancel()
-	_, err = resolveAndValidateHost(ctx, host, allowPrivateLAN)
+	_, err = resolveAndValidateHostWithOpts(ctx, host, allowPrivateLAN, allowLoopback)
 	return err
 }
 
@@ -80,10 +91,14 @@ func ValidateIP(ip net.IP, allowPrivateLAN bool) error {
 	if !ok {
 		return fmt.Errorf("invalid ip address %q", ip.String())
 	}
-	return validateAddr(addr, allowPrivateLAN)
+	return validateAddrWithOpts(addr, allowPrivateLAN, allowPrivateLAN)
 }
 
 func validateAddr(addr netip.Addr, allowPrivateLAN bool) error {
+	return validateAddrWithOpts(addr, allowPrivateLAN, allowPrivateLAN)
+}
+
+func validateAddrWithOpts(addr netip.Addr, allowPrivateLAN, allowLoopback bool) error {
 	if !addr.IsValid() {
 		return errors.New("invalid ip address")
 	}
@@ -110,6 +125,9 @@ func validateAddr(addr netip.Addr, allowPrivateLAN bool) error {
 		return fmt.Errorf("blocked deprecated ipv4-compatible address %s", addr)
 	}
 
+	if !allowLoopback && addr.IsLoopback() {
+		return fmt.Errorf("blocked loopback address %s", addr)
+	}
 	if !allowPrivateLAN {
 		if addr.IsLoopback() {
 			return fmt.Errorf("blocked loopback address %s", addr)
@@ -125,16 +143,20 @@ func validateAddr(addr netip.Addr, allowPrivateLAN bool) error {
 }
 
 func resolveAndValidateHost(ctx context.Context, host string, allowPrivateLAN bool) ([]netip.Addr, error) {
+	return resolveAndValidateHostWithOpts(ctx, host, allowPrivateLAN, allowPrivateLAN)
+}
+
+func resolveAndValidateHostWithOpts(ctx context.Context, host string, allowPrivateLAN, allowLoopback bool) ([]netip.Addr, error) {
 	// Check IP literal first (handles both IPv4 and IPv6, with or without zone).
 	if addr, err := netip.ParseAddr(host); err == nil {
-		if err := validateAddr(addr, allowPrivateLAN); err != nil {
+		if err := validateAddrWithOpts(addr, allowPrivateLAN, allowLoopback); err != nil {
 			return nil, err
 		}
 		return []netip.Addr{addr.Unmap()}, nil
 	}
 
 	lowerHost := strings.ToLower(strings.TrimSuffix(host, "."))
-	if !allowPrivateLAN && (lowerHost == "localhost" || strings.HasSuffix(lowerHost, ".localhost")) {
+	if !allowLoopback && (lowerHost == "localhost" || strings.HasSuffix(lowerHost, ".localhost")) {
 		return nil, fmt.Errorf("blocked loopback hostname %q", host)
 	}
 
@@ -152,7 +174,7 @@ func resolveAndValidateHost(ctx context.Context, host string, allowPrivateLAN bo
 		if !ok {
 			return nil, fmt.Errorf("host %q resolved to invalid ip %q", host, ia.IP.String())
 		}
-		if err := validateAddr(addr, allowPrivateLAN); err != nil {
+		if err := validateAddrWithOpts(addr, allowPrivateLAN, allowLoopback); err != nil {
 			return nil, fmt.Errorf("host %q: %w", host, err)
 		}
 		validated = append(validated, addr.Unmap())
@@ -163,6 +185,17 @@ func resolveAndValidateHost(ctx context.Context, host string, allowPrivateLAN bo
 // NewSafeHTTPClient returns an *http.Client that validates every resolved IP before dialing
 // (preventing DNS rebinding) and validates every redirect target (max 5 redirects, http/https only).
 func NewSafeHTTPClient(timeout time.Duration, allowPrivateLAN bool) *http.Client {
+	return newSafeHTTPClientWithOpts(timeout, allowPrivateLAN, allowPrivateLAN)
+}
+
+// NewSafeHTTPClientNoLoopback returns an *http.Client that enforces SSRF IP validation
+// on both DialContext and CheckRedirect while unconditionally blocking loopback addresses
+// (even when allowPrivateLAN is true).
+func NewSafeHTTPClientNoLoopback(timeout time.Duration, allowPrivateLAN bool) *http.Client {
+	return newSafeHTTPClientWithOpts(timeout, allowPrivateLAN, false)
+}
+
+func newSafeHTTPClientWithOpts(timeout time.Duration, allowPrivateLAN, allowLoopback bool) *http.Client {
 	dialer := &net.Dialer{
 		Timeout:   dialTimeout,
 		KeepAlive: 30 * time.Second,
@@ -177,7 +210,7 @@ func NewSafeHTTPClient(timeout time.Duration, allowPrivateLAN bool) *http.Client
 			if err != nil {
 				return nil, fmt.Errorf("invalid dial address %q: %w", addr, err)
 			}
-			ips, err := resolveAndValidateHost(ctx, host, allowPrivateLAN)
+			ips, err := resolveAndValidateHostWithOpts(ctx, host, allowPrivateLAN, allowLoopback)
 			if err != nil {
 				return nil, err
 			}
@@ -213,7 +246,8 @@ func NewSafeHTTPClient(timeout time.Duration, allowPrivateLAN bool) *http.Client
 				}
 				if !strings.EqualFold(prev.Host, req.URL.Host) {
 					for _, hdr := range []string{
-						"Authorization", "X-Emby-Token", "X-MediaBrowser-Token",
+						"Authorization", "Proxy-Authorization", "Cookie",
+						"X-Emby-Token", "X-MediaBrowser-Token",
 						"X-Emby-Authorization", "X-Api-Key", "trakt-api-key",
 					} {
 						req.Header.Del(hdr)
@@ -230,7 +264,7 @@ func NewSafeHTTPClient(timeout time.Duration, allowPrivateLAN bool) *http.Client
 			if host == "" {
 				return errors.New("blocked redirect target: url host is empty")
 			}
-			if _, err := resolveAndValidateHost(ctx, host, allowPrivateLAN); err != nil {
+			if _, err := resolveAndValidateHostWithOpts(ctx, host, allowPrivateLAN, allowLoopback); err != nil {
 				return fmt.Errorf("blocked redirect target: %w", err)
 			}
 			return nil

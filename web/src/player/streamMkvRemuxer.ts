@@ -45,8 +45,16 @@ export const EBML_ID = {
   CueClusterPosition: 0xf1,
   CueRelativePosition: 0xf0,
 
+  Attachments: 0x1941a469,
+  Chapters: 0x1043a770,
+  Tags: 0x1254c367,
+  Void: 0xec,
+
   Cluster: 0x1f43b675,
   Timecode: 0xe7,
+  Position: 0xa7,
+  PrevSize: 0xab,
+  SilentTracks: 0x5854,
   SimpleBlock: 0xa3,
   BlockGroup: 0xa0,
   Block: 0xa1,
@@ -628,6 +636,45 @@ export function lookupCueOffset(cues: MkvCuePoint[], timeSec: number): MkvCuePoi
 
 // ==================== 流式 Cluster 帧解析 ====================
 
+const VALID_CLUSTER_CHILD_IDS = new Set<number>([
+  EBML_ID.Timecode,
+  EBML_ID.SimpleBlock,
+  EBML_ID.BlockGroup,
+  EBML_ID.Position,
+  EBML_ID.PrevSize,
+  EBML_ID.SilentTracks,
+  EBML_ID.Void,
+])
+
+/**
+ * 在字节流中向前搜索下一个合法 Matroska Cluster 元素头（0x1F43B675）的偏移。
+ * 用于无 Cues 线性字节 Seek 后从任意分块中间位置重新同步到最近的完整 Cluster。
+ */
+export function findNextClusterOffset(data: Uint8Array, startOffset = 0): number {
+  const from = Math.max(0, startOffset)
+  const limit = data.byteLength - 6
+  for (let i = from; i <= limit; i++) {
+    if (
+      data[i] === 0x1f &&
+      data[i + 1] === 0x43 &&
+      data[i + 2] === 0xb6 &&
+      data[i + 3] === 0x75
+    ) {
+      const el = readElementHeader(data, i)
+      if (!el || el.id !== EBML_ID.Cluster) continue
+      if (!el.isUnknown && el.size <= 0) continue
+      if (el.dataOffset >= data.byteLength) continue
+      const child = readElementHeader(data, el.dataOffset)
+      if (!child || !VALID_CLUSTER_CHILD_IDS.has(child.id)) continue
+      if (child.id === EBML_ID.Timecode && (child.isUnknown || child.size <= 0 || child.size > 8)) {
+        continue
+      }
+      return i
+    }
+  }
+  return -1
+}
+
 /**
  * 从 Range 分块中流式提取 Cluster 内的 SimpleBlock / BlockGroup 帧与时间戳。
  * 支持跨分块截断：返回 `consumedBytes` 表示已完整消费的字节数，调用方将剩余尾部字节拼到下一块头部继续解析。
@@ -1080,6 +1127,8 @@ export function buildFmp4InitSegment(
 
 /**
  * 构建 fMP4 媒体分片（`moof + mdat`），将一组 MKV 帧封装为标准 ISO BMFF 分片。
+ * 自动识别 B 帧（PTS 非单调重排）并推导单调 DTS 与有符号 CTS（`trun` v1 `sample_composition_time_offset`），
+ * 避免画面抖动与倒退。
  */
 export function buildFmp4MediaSegment(
   frames: MkvFrame[],
@@ -1094,12 +1143,92 @@ export function buildFmp4MediaSegment(
   const timescale = opts.timescale ?? 1000
   const scaleFactor = timescale / 1000
   const defaultDur = opts.defaultSampleDuration ?? Math.max(1, Math.round(40 * scaleFactor))
+  const sampleCount = frames.length
+
+  const ptsTicks = frames.map((f) => Math.max(0, Math.round(f.timestampMs * scaleFactor)))
+  const hasReordering = ptsTicks.some((p, i) => i > 0 && p < ptsTicks[i - 1])
+
+  // 估算帧间隔步长（优先取排序后相邻正 PTS 差值的最小值，防止 B 帧跨度污染）
+  let inferredStep = defaultDur
+  if (sampleCount > 1) {
+    const sortedForStep = [...ptsTicks].sort((a, b) => a - b)
+    let minPosDelta = Number.POSITIVE_INFINITY
+    for (let i = 1; i < sortedForStep.length; i++) {
+      const d = sortedForStep[i] - sortedForStep[i - 1]
+      if (d > 0 && d < minPosDelta) {
+        minPosDelta = d
+      }
+    }
+    if (Number.isFinite(minPosDelta) && minPosDelta > 0) {
+      inferredStep = minPosDelta
+    }
+  }
+
+  const dtsTicks = new Array<number>(sampleCount)
+  const ctsOffsets = new Array<number>(sampleCount)
+  const sampleDurs = new Array<number>(sampleCount)
+
+  if (sampleCount > 0) {
+    if (hasReordering) {
+      const sortedPts = [...ptsTicks].sort((a, b) => a - b)
+      dtsTicks[0] =
+        opts.baseMediaDecodeTime !== undefined
+          ? Math.max(0, Math.round(opts.baseMediaDecodeTime))
+          : sortedPts[0]
+      for (let i = 1; i < sampleCount; i++) {
+        if (opts.baseMediaDecodeTime !== undefined) {
+          const delta = sortedPts[i] - sortedPts[i - 1]
+          dtsTicks[i] = dtsTicks[i - 1] + (delta > 0 ? delta : inferredStep)
+        } else {
+          dtsTicks[i] = sortedPts[i] > dtsTicks[i - 1] ? sortedPts[i] : dtsTicks[i - 1] + inferredStep
+        }
+      }
+      for (let i = 0; i < sampleCount; i++) {
+        ctsOffsets[i] = ptsTicks[i] - dtsTicks[i]
+      }
+      for (let i = 0; i < sampleCount; i++) {
+        if (i + 1 < sampleCount) {
+          sampleDurs[i] = Math.max(1, dtsTicks[i + 1] - dtsTicks[i])
+        } else {
+          const f = frames[i]
+          sampleDurs[i] =
+            f.durationMs !== undefined && f.durationMs > 0
+              ? Math.max(1, Math.round(f.durationMs * scaleFactor))
+              : inferredStep
+        }
+      }
+    } else {
+      dtsTicks[0] =
+        opts.baseMediaDecodeTime !== undefined
+          ? Math.max(0, Math.round(opts.baseMediaDecodeTime))
+          : ptsTicks[0]
+      for (let i = 1; i < sampleCount; i++) {
+        dtsTicks[i] = ptsTicks[i] > dtsTicks[i - 1] ? ptsTicks[i] : dtsTicks[i - 1] + inferredStep
+      }
+      for (let i = 0; i < sampleCount; i++) {
+        ctsOffsets[i] = ptsTicks[i] - dtsTicks[i]
+      }
+      for (let i = 0; i < sampleCount; i++) {
+        const f = frames[i]
+        if (f.durationMs !== undefined && f.durationMs > 0) {
+          sampleDurs[i] = Math.max(1, Math.round(f.durationMs * scaleFactor))
+        } else if (i + 1 < sampleCount && dtsTicks[i + 1] > dtsTicks[i]) {
+          sampleDurs[i] = Math.max(1, dtsTicks[i + 1] - dtsTicks[i])
+        } else {
+          sampleDurs[i] = defaultDur
+        }
+      }
+    }
+  }
+
   const baseDecodeTime =
-    opts.baseMediaDecodeTime !== undefined
-      ? Math.max(0, Math.round(opts.baseMediaDecodeTime))
-      : frames.length > 0
-        ? Math.max(0, Math.round(frames[0].timestampMs * scaleFactor))
+    sampleCount > 0
+      ? dtsTicks[0]
+      : opts.baseMediaDecodeTime !== undefined
+        ? Math.max(0, Math.round(opts.baseMediaDecodeTime))
         : 0
+
+  const includeCts = hasReordering || ctsOffsets.some((c) => c !== 0)
 
   // mfhd
   const mfhdBody = new Uint8Array(4)
@@ -1120,9 +1249,13 @@ export function buildFmp4MediaSegment(
   tfdtView.setUint32(4, lo, false)
   const tfdt = makeFullBox('tfdt', 1, 0, tfdtBody)
 
-  // trun (flags = 0x000701: data-offset + sample-duration + sample-size + sample-flags)
-  const sampleCount = frames.length
-  const trunBody = new Uint8Array(8 + sampleCount * 12)
+  // trun:
+  // - 含 B 帧 / 非零 CTS 时使用 version 1 + flags 0x000f01（支持有符号 int32 sample_composition_time_offset）
+  // - 纯顺序帧使用 version 0 + flags 0x000701
+  const trunVersion = includeCts ? 1 : 0
+  const trunFlags = includeCts ? 0x000f01 : 0x000701
+  const bytesPerSample = includeCts ? 16 : 12
+  const trunBody = new Uint8Array(8 + sampleCount * bytesPerSample)
   const trunView = new DataView(trunBody.buffer)
   trunView.setUint32(0, sampleCount, false)
   // data_offset placeholder at offset 4, will be patched once moof size is known
@@ -1130,23 +1263,18 @@ export function buildFmp4MediaSegment(
   let cursor = 8
   for (let i = 0; i < sampleCount; i++) {
     const f = frames[i]
-    let dur: number
-    if (f.durationMs !== undefined && f.durationMs > 0) {
-      dur = Math.max(1, Math.round(f.durationMs * scaleFactor))
-    } else if (i + 1 < sampleCount && frames[i + 1].timestampMs > f.timestampMs) {
-      dur = Math.max(1, Math.round((frames[i + 1].timestampMs - f.timestampMs) * scaleFactor))
-    } else {
-      dur = defaultDur
-    }
     const sampleFlags = f.isKeyframe ? 0x02000000 : 0x01010000
 
-    trunView.setUint32(cursor, dur, false)
+    trunView.setUint32(cursor, sampleDurs[i], false)
     trunView.setUint32(cursor + 4, f.data.byteLength, false)
     trunView.setUint32(cursor + 8, sampleFlags, false)
-    cursor += 12
+    if (includeCts) {
+      trunView.setInt32(cursor + 12, ctsOffsets[i], false)
+    }
+    cursor += bytesPerSample
   }
 
-  const trun = makeFullBox('trun', 0, 0x000701, trunBody)
+  const trun = makeFullBox('trun', trunVersion, trunFlags, trunBody)
   const traf = makeBox('traf', tfhd, tfdt, trun)
   const moof = makeBox('moof', mfhd, traf)
 
@@ -1295,6 +1423,7 @@ export class StreamMkvRemuxer {
 
   private totalBytes = 0
   private segmentDataOffset = 0
+  private firstClusterOffset = -1
   private timecodeScale = DEFAULT_TIMECODE_SCALE_NS
   private durationSec = 0
   private videoTrack?: MkvTrackInfo
@@ -1304,6 +1433,10 @@ export class StreamMkvRemuxer {
   private currentByteOffset = 0
   private videoSeq = 1
   private audioSeq = 1
+  private nextVideoDtsMs: number | null = null
+  private pendingClusterResync = false
+  private pendingKeyframeSync = false
+  private pendingSeekTargetSec: number | null = null
   private disposed = false
   private pumpRunning = false
   private pumpGeneration = 0
@@ -1349,43 +1482,141 @@ export class StreamMkvRemuxer {
     }
     this.segmentDataOffset = ebml.segmentDataOffset
 
-    // 扫描初始头部中的顶层 Segment 子元素
+    // 扫描顶层 Segment 子元素；遇到超过 512KB 的大 Attachments/Void/Chapters/Tags 时自动按偏移跳过并继续拉取头部窗口
     let seekEntries: MkvSeekEntry[] = []
     let segInfo: MkvSegmentInfo = {
       timecodeScale: DEFAULT_TIMECODE_SCALE_NS,
       durationRaw: 0,
       durationSec: 0,
     }
+    let hasSegInfo = false
     let tracks: MkvTrackInfo[] = []
     let cues: MkvCuePoint[] = []
     let firstClusterOffset = -1
 
-    let scanPos = ebml.segmentDataOffset
-    while (scanPos < headerFetch.data.byteLength) {
-      const el = readElementHeader(headerFetch.data, scanPos)
+    let buf = headerFetch.data
+    let bufStart = 0
+    let absPos = ebml.segmentDataOffset
+    let headerHops = 0
+    const MAX_HEADER_HOPS = 12
+    const MAX_METADATA_BOX_BYTES = 4 * 1024 * 1024
+
+    const essentialHeaderIds = new Set<number>([
+      EBML_ID.SeekHead,
+      EBML_ID.Info,
+      EBML_ID.Tracks,
+      EBML_ID.Cues,
+    ])
+
+    while (absPos < this.totalBytes && headerHops <= MAX_HEADER_HOPS) {
+      let localPos = absPos - bufStart
+      // 若剩余缓冲不足以解析下一个 EBML 元素头（最多 16 字节），向前拉取新窗口
+      if (localPos < 0 || localPos + 16 > buf.byteLength) {
+        if (bufStart + buf.byteLength >= this.totalBytes && localPos >= buf.byteLength) {
+          break
+        }
+        if (localPos < 0 || (localPos + 16 > buf.byteLength && bufStart + buf.byteLength < this.totalBytes)) {
+          headerHops++
+          if (headerHops > MAX_HEADER_HOPS) break
+          const nextEnd = Math.min(this.totalBytes - 1, absPos + initialBytes - 1)
+          if (nextEnd < absPos) break
+          const nextRes = await this.fetchRange(absPos, nextEnd, opts.signal)
+          if (nextRes.data.byteLength === 0) break
+          buf = nextRes.data
+          bufStart = absPos
+          localPos = 0
+        }
+      }
+
+      const el = readElementHeader(buf, localPos)
       if (!el) break
       if (el.id === EBML_ID.Cluster) {
-        firstClusterOffset = scanPos
+        firstClusterOffset = absPos
         break
       }
-      if (el.isUnknown || el.endOffset > headerFetch.data.byteLength) {
+      if (el.isUnknown) {
         break
       }
-      const slice = headerFetch.data.subarray(scanPos, el.endOffset)
+
+      const absEnd = bufStart + el.endOffset
+      if (absEnd > bufStart + buf.byteLength) {
+        if (essentialHeaderIds.has(el.id) && el.size > 0 && el.size <= MAX_METADATA_BOX_BYTES) {
+          // 关键元数据盒被 512KB 边界截断：按精确大小拉取完整元素
+          headerHops++
+          if (headerHops > MAX_HEADER_HOPS) break
+          const fetchEnd = Math.min(this.totalBytes - 1, absEnd - 1)
+          const boxRes = await this.fetchRange(absPos, fetchEnd, opts.signal)
+          const slice = boxRes.data
+          if (el.id === EBML_ID.SeekHead) {
+            seekEntries = seekEntries.concat(parseSeekHead(slice, this.segmentDataOffset))
+          } else if (el.id === EBML_ID.Info) {
+            segInfo = parseSegmentInfo(slice)
+            hasSegInfo = true
+          } else if (el.id === EBML_ID.Tracks) {
+            tracks = parseTracks(slice)
+          } else if (el.id === EBML_ID.Cues) {
+            cues = parseCues(slice, segInfo.timecodeScale, this.segmentDataOffset)
+          }
+          absPos = absEnd
+          continue
+        }
+
+        // 大型非播放必需元素（如 >512KB 的 Attachments 字体/封面、Void、Chapters、Tags）：直接跳过至 absEnd
+        if (absEnd > absPos && absEnd <= this.totalBytes) {
+          absPos = absEnd
+          continue
+        }
+        break
+      }
+
+      const slice = buf.subarray(localPos, el.endOffset)
       if (el.id === EBML_ID.SeekHead) {
         seekEntries = seekEntries.concat(parseSeekHead(slice, this.segmentDataOffset))
       } else if (el.id === EBML_ID.Info) {
         segInfo = parseSegmentInfo(slice)
+        hasSegInfo = true
       } else if (el.id === EBML_ID.Tracks) {
         tracks = parseTracks(slice)
       } else if (el.id === EBML_ID.Cues) {
         cues = parseCues(slice, segInfo.timecodeScale, this.segmentDataOffset)
       }
-      scanPos = el.endOffset
+      absPos = absEnd
+    }
+
+    // 若 Info 或 Tracks 未在头部扫描中命中（例如位于文件尾部或超大附件之后），按 SeekHead 偏移定向拉取
+    if (!hasSegInfo) {
+      const infoSeek = seekEntries.find((s) => s.id === EBML_ID.Info)
+      if (infoSeek && infoSeek.fileOffset > 0 && infoSeek.fileOffset < this.totalBytes) {
+        try {
+          const infoEnd = Math.min(this.totalBytes - 1, infoSeek.fileOffset + 64 * 1024 - 1)
+          const infoRes = await this.fetchRange(infoSeek.fileOffset, infoEnd, opts.signal)
+          segInfo = parseSegmentInfo(infoRes.data)
+          hasSegInfo = true
+        } catch {
+          // 忽略 Info 定向拉取失败
+        }
+      }
+    }
+
+    if (tracks.length === 0) {
+      const tracksSeek = seekEntries.find((s) => s.id === EBML_ID.Tracks)
+      if (tracksSeek && tracksSeek.fileOffset > 0 && tracksSeek.fileOffset < this.totalBytes) {
+        try {
+          const tracksEnd = Math.min(this.totalBytes - 1, tracksSeek.fileOffset + 256 * 1024 - 1)
+          const tracksRes = await this.fetchRange(tracksSeek.fileOffset, tracksEnd, opts.signal)
+          tracks = parseTracks(tracksRes.data)
+        } catch {
+          // 忽略 Tracks 定向拉取失败
+        }
+      }
     }
 
     this.timecodeScale = segInfo.timecodeScale
     this.durationSec = segInfo.durationSec
+    this.nextVideoDtsMs = null
+    this.pendingClusterResync = false
+    this.pendingKeyframeSync = false
+    this.pendingSeekTargetSec = null
 
     // 若 Cues 不在头部但 SeekHead 中记录了 Cues 偏移（常见于大体积 MKV 尾部），按需发起一次小 Range 拉取
     if (cues.length === 0) {
@@ -1434,11 +1665,14 @@ export class StreamMkvRemuxer {
     // 确定首个 Cluster 偏移
     if (firstClusterOffset >= 0) {
       this.currentByteOffset = firstClusterOffset
+      this.firstClusterOffset = firstClusterOffset
     } else if (this.cues.length > 0) {
       this.currentByteOffset = this.cues[0].fileOffset
+      this.firstClusterOffset = this.cues[0].fileOffset
     } else {
       const clusterSeek = seekEntries.find((s) => s.id === EBML_ID.Cluster)
-      this.currentByteOffset = clusterSeek ? clusterSeek.fileOffset : scanPos
+      this.currentByteOffset = clusterSeek ? clusterSeek.fileOffset : absPos
+      this.firstClusterOffset = this.currentByteOffset
     }
 
     // 初始化 MediaSource 与 SourceBuffer（异常时清理已创建的 objectUrl，防止内存泄漏）
@@ -1525,18 +1759,22 @@ export class StreamMkvRemuxer {
     }
   }
 
-  /** 根据目标播放时间计算应跳转的字节偏移（优先使用 Cues 精确二分，否则线性估算） */
+  /** 根据目标播放时间计算应跳转的字节偏移（优先使用 Cues 精确二分，否则基于首个 Cluster 线性估算） */
   resolveSeekByteOffset(targetTimeSec: number): number {
     const cue = lookupCueOffset(this.cues, targetTimeSec)
     if (cue && cue.fileOffset >= this.segmentDataOffset && cue.fileOffset < this.totalBytes) {
       return cue.fileOffset
     }
-    if (this.durationSec > 0 && this.totalBytes > this.segmentDataOffset) {
+    const dataStart =
+      this.firstClusterOffset >= this.segmentDataOffset
+        ? this.firstClusterOffset
+        : this.segmentDataOffset
+    if (this.durationSec > 0 && this.totalBytes > dataStart) {
       const ratio = Math.max(0, Math.min(1, targetTimeSec / this.durationSec))
-      const dataSpan = this.totalBytes - this.segmentDataOffset
-      return Math.floor(this.segmentDataOffset + dataSpan * ratio)
+      const dataSpan = this.totalBytes - dataStart
+      return Math.floor(dataStart + dataSpan * ratio)
     }
-    return this.segmentDataOffset
+    return dataStart
   }
 
   private waitForBufferIdle(sb: SourceBuffer): Promise<void> {
@@ -1639,6 +1877,11 @@ export class StreamMkvRemuxer {
           }
         }
         if (this.disposed || seekGen !== this.pumpGeneration) return
+        const hitCue = Boolean(lookupCueOffset(this.cues, targetTime))
+        this.pendingClusterResync = !hitCue
+        this.pendingKeyframeSync = true
+        this.pendingSeekTargetSec = targetTime
+        this.nextVideoDtsMs = null
         this.currentByteOffset = this.resolveSeekByteOffset(targetTime)
         void this.startPumpLoop(seekGen)
       })
@@ -1688,6 +1931,13 @@ export class StreamMkvRemuxer {
 
     let leftover = new Uint8Array(0)
     let lastClusterTimecode = 0
+    let needClusterResync = this.pendingClusterResync
+    let needKeyframeSync = this.pendingKeyframeSync
+    const seekWasLinear = this.pendingClusterResync
+    const seekTargetSec = this.pendingSeekTargetSec
+    this.pendingClusterResync = false
+    this.pendingKeyframeSync = false
+    this.pendingSeekTargetSec = null
 
     try {
       while (!this.disposed && generation === this.pumpGeneration) {
@@ -1738,7 +1988,21 @@ export class StreamMkvRemuxer {
 
         this.currentByteOffset = start + chunkRes.data.byteLength
 
-        const combined = leftover.byteLength > 0 ? concatBytes(leftover, chunkRes.data) : chunkRes.data
+        let combined = leftover.byteLength > 0 ? concatBytes(leftover, chunkRes.data) : chunkRes.data
+
+        // 无 Cues 线性 Seek 时可能落在 Cluster 中间字节：先重同步到下一个合法 Cluster 元素头
+        if (needClusterResync) {
+          const clusterOffset = findNextClusterOffset(combined, 0)
+          if (clusterOffset < 0) {
+            // 保留尾部 16 字节防止 4 字节 Cluster 同步头跨分块截断
+            leftover =
+              combined.byteLength > 16 ? combined.slice(combined.byteLength - 16) : combined.slice()
+            continue
+          }
+          combined = combined.subarray(clusterOffset)
+          needClusterResync = false
+        }
+
         const parsed = parseClusterFrames(combined, {
           timecodeScale: this.timecodeScale,
           clusterBaseTimecode: lastClusterTimecode,
@@ -1758,32 +2022,77 @@ export class StreamMkvRemuxer {
           await this.evictOldBuffers()
           if (generation !== this.pumpGeneration || this.disposed) break
 
-          if (this.videoTrack && this.videoSb) {
-            const vFrames = parsed.frames.filter((f) => f.trackNumber === this.videoTrack!.trackNumber)
-            if (vFrames.length > 0) {
-              const seg = buildFmp4MediaSegment(vFrames, {
-                sequenceNumber: this.videoSeq++,
-                trackId: this.videoTrack.trackNumber,
-                defaultSampleDuration: this.videoTrack.defaultDurationNs
-                  ? Math.max(1, Math.round(this.videoTrack.defaultDurationNs / 1_000_000))
-                  : 40,
-              })
-              await this.appendToBuffer(this.videoSb, seg)
+          let vFrames = this.videoTrack
+            ? parsed.frames.filter((f) => f.trackNumber === this.videoTrack!.trackNumber)
+            : []
+          let aFrames = this.audioTrack
+            ? parsed.frames.filter((f) => f.trackNumber === this.audioTrack!.trackNumber)
+            : []
+
+          // Seek 后精确对齐首个视频关键帧与音频时间戳偏移，防止黑屏/花屏与音画失步
+          if (needKeyframeSync && this.videoTrack) {
+            const kfIdx = vFrames.findIndex((f) => f.isKeyframe)
+            if (kfIdx < 0) {
+              continue
+            }
+            vFrames = vFrames.slice(kfIdx)
+            const syncTimestampMs = vFrames[0].timestampMs
+            aFrames = aFrames.filter((f) => f.timestampMs >= syncTimestampMs - 50)
+            needKeyframeSync = false
+
+            // 无 Cues 线性 Seek 若落点略晚于目标时间，主动对齐 video.currentTime 至真实关键帧时间避免卡死在未缓冲间隙
+            if (
+              seekWasLinear &&
+              this.videoEl &&
+              seekTargetSec !== null &&
+              syncTimestampMs / 1000 > seekTargetSec + 0.5
+            ) {
+              try {
+                this.videoEl.currentTime = syncTimestampMs / 1000
+              } catch {
+                // 忽略测试环境只读 currentTime
+              }
             }
           }
 
-          if (this.audioTrack && this.audioSb) {
-            const aFrames = parsed.frames.filter((f) => f.trackNumber === this.audioTrack!.trackNumber)
-            if (aFrames.length > 0) {
-              const seg = buildFmp4MediaSegment(aFrames, {
-                sequenceNumber: this.audioSeq++,
-                trackId: this.audioTrack.trackNumber,
-                defaultSampleDuration: this.audioTrack.defaultDurationNs
-                  ? Math.max(1, Math.round(this.audioTrack.defaultDurationNs / 1_000_000))
-                  : 21,
-              })
-              await this.appendToBuffer(this.audioSb, seg)
-            }
+          if (this.videoTrack && this.videoSb && vFrames.length > 0) {
+            const defaultVideoDur = this.videoTrack.defaultDurationNs
+              ? Math.max(1, Math.round(this.videoTrack.defaultDurationNs / 1_000_000))
+              : 40
+            const minPtsMs = vFrames.reduce(
+              (m, f) => Math.min(m, f.timestampMs),
+              Number.POSITIVE_INFINITY,
+            )
+            // 若与上一分片 DTS 连续（跨分块未发生 Seek 跳变），衔接 baseMediaDecodeTime 避免 B 帧跨分块 DTS 倒退
+            const useChainedDts =
+              this.nextVideoDtsMs !== null &&
+              Math.abs(minPtsMs - this.nextVideoDtsMs) <= defaultVideoDur * 6
+            const baseDts = useChainedDts ? this.nextVideoDtsMs! : undefined
+            const seg = buildFmp4MediaSegment(vFrames, {
+              sequenceNumber: this.videoSeq++,
+              trackId: this.videoTrack.trackNumber,
+              defaultSampleDuration: defaultVideoDur,
+              baseMediaDecodeTime: baseDts,
+            })
+            const sortedPts = vFrames.map((f) => Math.round(f.timestampMs)).sort((a, b) => a - b)
+            const segStartDts = baseDts ?? sortedPts[0]
+            const segSpan =
+              sortedPts.length > 1
+                ? Math.max(defaultVideoDur * (sortedPts.length - 1), sortedPts[sortedPts.length - 1] - sortedPts[0])
+                : 0
+            this.nextVideoDtsMs = segStartDts + segSpan + defaultVideoDur
+            await this.appendToBuffer(this.videoSb, seg)
+          }
+
+          if (this.audioTrack && this.audioSb && aFrames.length > 0) {
+            const seg = buildFmp4MediaSegment(aFrames, {
+              sequenceNumber: this.audioSeq++,
+              trackId: this.audioTrack.trackNumber,
+              defaultSampleDuration: this.audioTrack.defaultDurationNs
+                ? Math.max(1, Math.round(this.audioTrack.defaultDurationNs / 1_000_000))
+                : 21,
+            })
+            await this.appendToBuffer(this.audioSb, seg)
           }
         }
 

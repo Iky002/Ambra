@@ -952,7 +952,7 @@ func (p *Provider) fetchSeason(ctx context.Context, q plugins.MediaQuery, tvdbLa
 }
 
 func (p *Provider) fetchEpisode(ctx context.Context, q plugins.MediaQuery, tvdbLang string) (*plugins.MetadataResult, error) {
-	if q.SeasonNumber <= 0 || q.EpisodeNumber <= 0 {
+	if q.SeasonNumber < 0 || q.EpisodeNumber <= 0 {
 		return nil, nil
 	}
 	seriesID := providerID(q.ProviderIDs, "Tvdb")

@@ -577,6 +577,21 @@ func (m *Migrator) resolveOrCreateUser(
 				policy.IsAdministrator = false
 				notice = fmt.Sprintf("user %q kept as non-administrator during merge (admin elevation skipped)", name)
 			}
+			// Protect existing local administrators from accidental demotion or lockout by source policy.
+			if existing.IsAdmin {
+				var protected []string
+				if !policy.IsAdministrator {
+					policy.IsAdministrator = true
+					protected = append(protected, "IsAdmin=true preserved")
+				}
+				if policy.IsDisabled {
+					policy.IsDisabled = false
+					protected = append(protected, "IsDisabled=false preserved")
+				}
+				if len(protected) > 0 {
+					notice = fmt.Sprintf("local admin %q protected during merge (%s)", name, strings.Join(protected, ", "))
+				}
+			}
 			if err := m.userRepo.UpdateUserPolicy(ctx, existing.ID, policy); err != nil {
 				return "", false, false, nil, "", err
 			}

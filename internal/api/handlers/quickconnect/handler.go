@@ -234,6 +234,10 @@ func (h *Handler) handleInitiate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
+	if !h.isEnabled() {
+		httpx.Error(w, http.StatusForbidden, "quickconnect is disabled")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	secret := strings.TrimSpace(q.Get("secret"))
 	if secret == "" {

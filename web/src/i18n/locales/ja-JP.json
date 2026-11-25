@@ -28,7 +28,6 @@
   "common.copy": "コピー",
   "common.copied": "コピーしました",
   "common.language": "表示言語",
-
   "nav.home": "ホーム",
   "nav.trending": "トレンド",
   "nav.collections": "コレクション",
@@ -50,7 +49,6 @@
   "nav.demoDesc": "（フロントエンドのメモリ上で動作・バックエンド不要・変更は即時反映）",
   "nav.demoSwitchGuest": "管理者ビュー · 一般ユーザーに切り替えて RBAC を体験",
   "nav.demoSwitchAdmin": "一般ユーザービュー · 管理コンソールに戻る",
-
   "auth.loginTitle": "Ambra にログイン",
   "auth.loginSubtitle": "プライベートシネマサーバーに接続",
   "auth.username": "ユーザー名",
@@ -65,7 +63,6 @@
   "auth.noAdminDesc": "現在のアカウントには管理者権限（IsAdministrator = false）がありません。サーバー設定、ユーザー、ライブラリを管理するにはシステム管理者にお問い合わせください。",
   "auth.backHome": "ホームへ戻る",
   "auth.verifyingAdmin": "管理者権限を確認中...",
-
   "setup.title": "Ambra へようこそ",
   "setup.subtitle": "数ステップでプライベートシネマサーバーを初期設定します",
   "setup.serverName": "サーバー名",
@@ -73,7 +70,6 @@
   "setup.tmdbLanguage": "メタデータ取得言語",
   "setup.createAdmin": "管理者アカウントを作成",
   "setup.complete": "初期設定を完了",
-
   "home.continueWatching": "視聴を再開",
   "home.nextUp": "次に再生",
   "home.myMedia": "マイメディア",
@@ -88,7 +84,6 @@
   "home.emptyTitle": "ライブラリが空です",
   "home.emptyDesc": "管理コンソールからローカルのメディアフォルダまたは .strm ディレクトリを追加し、初回スキャンを実行してください。",
   "home.goManageLibraries": "ライブラリを追加",
-
   "library.allItems": "すべて",
   "library.albums": "アルバム",
   "library.artists": "アーティスト",
@@ -111,7 +106,6 @@
   "library.exitMultiSelect": "選択を終了",
   "library.selectedCount": "{{count}} 件選択中",
   "library.emptyResult": "条件に一致する項目が見つかりません",
-
   "detail.play": "再生",
   "detail.resume": "続きから再生",
   "detail.favorite": "お気に入り",
@@ -146,7 +140,6 @@
   "detail.container": "コンテナ形式",
   "detail.fileSize": "ファイルサイズ",
   "detail.bitrate": "総ビットレート",
-
   "player.quality": "画質",
   "player.qualityAuto": "オリジナル画質",
   "player.version": "バージョン",
@@ -163,33 +156,27 @@
   "player.playNextNow": "今すぐ再生",
   "player.cancelNextUp": "キャンセル",
   "player.loadError": "動画ストリームのデコードまたは読み込みに失敗しました。メディア形式またはネットワーク接続を確認してください。",
-
   "collections.title": "コレクションとプレイリスト",
   "collections.boxSets": "コレクション",
   "collections.playlists": "プレイリスト",
   "collections.createCollection": "新規コレクション",
   "collections.createPlaylist": "新規プレイリスト",
   "collections.playAll": "すべて再生",
-
   "favorites.title": "お気に入り",
   "favorites.emptyTitle": "お気に入りはまだありません",
   "favorites.emptyDesc": "映画、ドラマ、音楽のページでお気に入りボタンをクリックするとここに追加されます。",
-
   "trending.title": "人気ランキング",
   "trending.subtitle": "TMDB トレンド・豆瓣人気・IMDb Top 250 を集約し、ライブラリ内の作品へすぐアクセス",
   "trending.refreshNow": "ランキングを今すぐ同期",
   "trending.inLibrary": "ライブラリ内",
-
   "livetv.title": "ライブTV",
   "livetv.channels": "チャンネル一覧",
   "livetv.guide": "番組表",
   "livetv.recordings": "録画済み",
   "livetv.timers": "録画予約",
-
   "search.title": "探索と検索",
   "search.placeholder": "タイトル、原題、キャスト名などで検索...",
   "search.noResults": "一致する映画、ドラマ、人物が見つかりませんでした",
-
   "profile.title": "プロフィール",
   "profile.uiLanguage": "表示言語",
   "profile.uiLanguageDesc": "Web クライアントの表示言語を切り替え、サーバーへ言語設定を同期します",
@@ -197,11 +184,9 @@
   "profile.avatar": "プロフィール画像",
   "profile.quickConnect": "Quick Connect 端末認証",
   "profile.playbackPrefs": "再生設定",
-
   "notifications.title": "通知センター",
   "notifications.markAllRead": "すべて既読にする",
   "notifications.empty": "通知はありません",
-
   "admin.title": "管理コンソール",
   "admin.tabDashboard": "ダッシュボード",
   "admin.tabLibraries": "ライブラリ",
@@ -220,5 +205,20 @@
   "admin.serverLogs": "サーバーログ",
   "admin.downloadLog": "ログをダウンロード",
   "admin.kickDevice": "端末を切断",
-  "admin.revokeKey": "キーを失効"
+  "admin.revokeKey": "キーを失効",
+  "player.cannotPlayTitle": "このメディアを再生できません",
+  "player.retryPlayback": "再生を再試行",
+  "player.goBack": "戻る",
+  "player.subtitleOff": "字幕オフ",
+  "player.subtitleTweaks": "字幕の調整",
+  "player.loadingStream": "メディアストリームを読み込み中...",
+  "player.buffering": "バッファリング中...",
+  "admin.scanAllLibraries": "すべてのライブラリをスキャン",
+  "admin.scanningAllLibraries": "ライブラリスキャンを開始中...",
+  "admin.dashboardOverview": "サーバーステータス概要",
+  "admin.usersTitle": "ユーザーと権限管理 (RBAC)",
+  "admin.createUser": "新規ユーザー",
+  "admin.pluginsTitle": "プラグインとスクレイパー管理",
+  "admin.webhooksTitle": "Webhook イベント通知",
+  "admin.createWebhook": "Webhook を追加"
 }

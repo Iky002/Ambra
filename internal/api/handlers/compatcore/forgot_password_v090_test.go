@@ -98,8 +98,9 @@ func TestForgotPasswordPinRealResetAndRateLimit(t *testing.T) {
 		t.Fatalf("unexpected PIN file content: %q", string(content))
 	}
 
-	// 2. Per-IP rate-limit test: 5 wrong PIN attempts rate-limit the offending IP (6th -> 429)
-	// WITHOUT wiping active PINs for other users/IPs.
+	// 2. Per-IP rate-limit AND global per-PIN attempt counter:
+	// 5 wrong PIN attempts rate-limit the offending IP (6th -> 429)
+	// AND immediately destroy the active PIN and its file on disk.
 	for i := 0; i < forgotPinMaxAttempts; i++ {
 		req := httptest.NewRequest(http.MethodPost, "/Users/ForgotPassword/Pin", strings.NewReader(`{"Pin":"WRONG1"}`))
 		req.RemoteAddr = "198.51.100.10:12345"
@@ -123,18 +124,61 @@ func TestForgotPasswordPinRealResetAndRateLimit(t *testing.T) {
 	if blockedRec.Code != http.StatusTooManyRequests {
 		t.Fatalf("expected 429 on 6th attempt from same IP, got %d", blockedRec.Code)
 	}
-	if _, err := os.Stat(firstPinPath); err != nil {
-		t.Fatalf("expected active PIN file to remain intact after another IP brute-force, stat err=%v", err)
+	if _, err := os.Stat(firstPinPath); !os.IsNotExist(err) {
+		t.Fatalf("expected active PIN file to be destroyed after 5 wrong attempts, stat err=%v", err)
 	}
 	env.handler.mu.RLock()
 	remaining := len(env.handler.forgotPins)
 	env.handler.mu.RUnlock()
-	if remaining != 1 {
-		t.Fatalf("expected 1 active PIN preserved after per-IP rate limit, got %d", remaining)
+	if remaining != 0 {
+		t.Fatalf("expected 0 active PINs after 5 failed attempts, got %d", remaining)
 	}
 
-	// 3. Redeem the active PIN cleanly from a different IP.
-	redeemReq := httptest.NewRequest(http.MethodPost, "/Users/ForgotPassword/Pin", strings.NewReader(`{"Pin":"`+firstPin+`"}`))
+	// 3. Issue a fresh PIN and verify distributed multi-IP brute-force (5 different IPs) also destroys it.
+	recDist := doReq(t, env.router, "POST", "/Users/ForgotPassword", `{"EnteredUsername":"admin"}`)
+	if recDist.Code != http.StatusOK {
+		t.Fatalf("second ForgotPassword got %d", recDist.Code)
+	}
+	var fpRespDist struct {
+		PinFile string `json:"PinFile"`
+	}
+	_ = json.Unmarshal(recDist.Body.Bytes(), &fpRespDist)
+	distPinPath := filepath.Join(env.cfg.DataDir, fpRespDist.PinFile)
+	for i := 0; i < forgotPinMaxAttempts; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/Users/ForgotPassword/Pin", strings.NewReader(`{"Pin":"BADPIN"}`))
+		req.RemoteAddr = "198.51.100." + string(rune('3'+i)) + "1:12345"
+		badRec := httptest.NewRecorder()
+		env.router.ServeHTTP(badRec, req)
+		if badRec.Code != http.StatusOK {
+			t.Fatalf("distributed attempt %d got %d", i+1, badRec.Code)
+		}
+	}
+	if _, err := os.Stat(distPinPath); !os.IsNotExist(err) {
+		t.Fatalf("expected PIN file destroyed after 5 distributed wrong attempts, stat err=%v", err)
+	}
+
+	// 4. Issue a fresh PIN and redeem it cleanly from a different IP.
+	rec2 := doReq(t, env.router, "POST", "/Users/ForgotPassword", `{"EnteredUsername":"admin"}`)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("third ForgotPassword got %d", rec2.Code)
+	}
+	var fpResp2 struct {
+		PinFile string `json:"PinFile"`
+	}
+	_ = json.Unmarshal(rec2.Body.Bytes(), &fpResp2)
+	secondPinPath := filepath.Join(env.cfg.DataDir, fpResp2.PinFile)
+	env.handler.mu.RLock()
+	var secondPin string
+	for k := range env.handler.forgotPins {
+		secondPin = k
+		break
+	}
+	env.handler.mu.RUnlock()
+	if secondPin == "" {
+		t.Fatal("expected fresh active PIN")
+	}
+
+	redeemReq := httptest.NewRequest(http.MethodPost, "/Users/ForgotPassword/Pin", strings.NewReader(`{"Pin":"`+secondPin+`"}`))
 	redeemReq.RemoteAddr = "198.51.100.20:54321"
 	redeemRec := httptest.NewRecorder()
 	env.router.ServeHTTP(redeemRec, redeemReq)
@@ -151,7 +195,7 @@ func TestForgotPasswordPinRealResetAndRateLimit(t *testing.T) {
 	}
 
 	// PIN file removed on disk.
-	if _, err := os.Stat(firstPinPath); !os.IsNotExist(err) {
+	if _, err := os.Stat(secondPinPath); !os.IsNotExist(err) {
 		t.Fatalf("expected PIN file removed after redeem, stat err=%v", err)
 	}
 

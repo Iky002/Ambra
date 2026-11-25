@@ -117,9 +117,9 @@ describe('Stream 4 (v0.9.3): QuickConnect Login, Profile Device Authorization & 
       </Routes>,
     )
 
-    // 验证回退版本号更新为 v0.9.3
+    // 验证回退版本号更新为 v0.10.4
     await waitFor(() => {
-      expect(screen.getByText(/v0\.9\.3/)).toBeInTheDocument()
+      expect(screen.getByText(/v0\.10\.4/)).toBeInTheDocument()
     })
 
     // 显示 Quick Connect 按钮

@@ -279,7 +279,16 @@ func (h *Handler) handleGetDefaultProfile(w http.ResponseWriter, r *http.Request
 	httpx.JSON(w, http.StatusOK, p)
 }
 
+func canonicalProfileID(id string) string {
+	trimmed := strings.TrimSpace(id)
+	if strings.EqualFold(trimmed, defaultProfileID) {
+		return defaultProfileID
+	}
+	return trimmed
+}
+
 func (h *Handler) serveProfileByID(w http.ResponseWriter, id string) {
+	id = canonicalProfileID(id)
 	h.mu.RLock()
 	p, ok := h.profiles[id]
 	h.mu.RUnlock()
@@ -300,11 +309,12 @@ func (h *Handler) handleCreateProfile(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "profile Name is required")
 		return
 	}
-	if strings.EqualFold(strings.TrimSpace(p.Id), defaultProfileID) {
+	p.Id = canonicalProfileID(p.Id)
+	if p.Id == defaultProfileID {
 		httpx.Error(w, http.StatusBadRequest, "cannot overwrite built-in default profile")
 		return
 	}
-	if strings.TrimSpace(p.Id) == "" {
+	if p.Id == "" {
 		p.Id = guid.New()
 	}
 	if strings.TrimSpace(p.Type) == "" {
@@ -324,7 +334,7 @@ func (h *Handler) handleCreateProfile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleUpdateProfile(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("Id")
+	id := canonicalProfileID(r.PathValue("Id"))
 	var p DlnaProfile
 	if err := httpx.DecodeJSONLimit(r, &p, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid dlna profile payload")
@@ -354,7 +364,7 @@ func (h *Handler) handleUpdateProfile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleDeleteProfile(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("Id")
+	id := canonicalProfileID(r.PathValue("Id"))
 	if id == defaultProfileID {
 		httpx.Error(w, http.StatusBadRequest, "cannot delete built-in default profile")
 		return
@@ -395,8 +405,10 @@ func (h *Handler) loadPersistedProfiles(ctx context.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for _, p := range list {
-		if p.Id != "" {
-			h.profiles[p.Id] = p
+		id := canonicalProfileID(p.Id)
+		if id != "" {
+			p.Id = id
+			h.profiles[id] = p
 		}
 	}
 }

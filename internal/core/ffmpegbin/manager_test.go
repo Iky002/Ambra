@@ -2,6 +2,8 @@ package ffmpegbin
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -272,11 +274,15 @@ func TestResolveWindowsAndDirectories(t *testing.T) {
 }
 
 func TestDownloadStatic(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	payload := []byte("#!/bin/sh\necho static-ffmpeg\n")
+	sumBytes := sha256.Sum256(payload)
+	payloadSHA := hex.EncodeToString(sumBytes[:])
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/releases/ffmpeg":
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("#!/bin/sh\necho static-ffmpeg\n"))
+			_, _ = w.Write(payload)
 		case "/":
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("root-binary"))
@@ -292,7 +298,7 @@ func TestDownloadStatic(t *testing.T) {
 	downloadClient = srv.Client()
 	t.Cleanup(func() { downloadClient = origClient })
 
-	// Valid download with filename from URL path
+	// Valid HTTPS download with filename from URL path
 	targetDir := filepath.Join(t.TempDir(), "bin")
 	dest, err := DownloadStatic(context.Background(), targetDir, srv.URL+"/releases/ffmpeg")
 	if err != nil {
@@ -307,6 +313,35 @@ func TestDownloadStatic(t *testing.T) {
 	}
 	if runtime.GOOS != "windows" && info.Mode().Perm()&0o111 == 0 {
 		t.Fatalf("expected executable permissions, got %o", info.Mode().Perm())
+	}
+
+	// Plain HTTP URL MUST be rejected (MH-12)
+	if _, err := DownloadStatic(context.Background(), targetDir, "http://127.0.0.1:8080/releases/ffmpeg"); err == nil {
+		t.Fatal("expected plain http:// URL to be rejected")
+	}
+
+	// DownloadStaticVerified succeeds with matching SHA-256 (case-insensitive)
+	verifiedDir := filepath.Join(t.TempDir(), "verified")
+	destV, err := DownloadStaticVerified(context.Background(), verifiedDir, srv.URL+"/releases/ffmpeg", "  "+payloadSHA+"  ")
+	if err != nil {
+		t.Fatalf("DownloadStaticVerified with matching hash failed: %v", err)
+	}
+	if _, err := os.Stat(destV); err != nil {
+		t.Fatalf("expected verified binary to exist: %v", err)
+	}
+
+	// DownloadStaticVerified fails and does not install file on SHA-256 mismatch
+	mismatchDir := filepath.Join(t.TempDir(), "mismatch")
+	if _, err := DownloadStaticVerified(context.Background(), mismatchDir, srv.URL+"/releases/ffmpeg", "0000000000000000000000000000000000000000000000000000000000000000"); err == nil {
+		t.Fatal("expected SHA-256 mismatch error")
+	}
+	if _, err := os.Stat(filepath.Join(mismatchDir, "ffmpeg")); !os.IsNotExist(err) {
+		t.Fatalf("expected no binary installed on SHA-256 mismatch, stat err=%v", err)
+	}
+
+	// Invalid SHA-256 format is rejected before download
+	if _, err := DownloadStaticVerified(context.Background(), mismatchDir, srv.URL+"/releases/ffmpeg", "not-hex"); err == nil {
+		t.Fatal("expected error for invalid expectedSHA256 format")
 	}
 
 	// Root URL path falls back to default binary name, nil ctx is handled

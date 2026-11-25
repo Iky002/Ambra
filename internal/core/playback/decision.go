@@ -222,7 +222,7 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 		method := decideSubtitleDeliveryMethod(st, req.DeviceProfile)
 		st.DeliveryMethod = method
 		if method == "External" {
-			ext := subtitleStreamFormat(st.Codec)
+			ext := subtitleStreamFormatForProfile(st.Codec, req.DeviceProfile)
 			st.DeliveryUrl = fmt.Sprintf("/Videos/%s/%s/Subtitles/%d/Stream.%s", item.ID, msDTO.Id, st.Index, ext)
 		}
 		if selectedSub != nil && st.Index == selectedSub.Index && method == "Encode" {
@@ -451,15 +451,77 @@ func checkProfileCompatibility(container, videoCodec, audioCodec string, profile
 	return false, videoOK
 }
 
+func isNativeNonWebClient(lowerName string) bool {
+	for _, kw := range []string{
+		"ios", "iphone", "ipad", "android", "tvos",
+		"apple tv", "appletv", "android tv", "androidtv",
+		"roku", "firetv", "kodi", "infuse", "mpv", "vlc", "swiftfin", " tv",
+	} {
+		if strings.Contains(lowerName, kw) {
+			return true
+		}
+	}
+	return strings.HasSuffix(lowerName, "tv")
+}
+
+func isWebBrowserProfile(profile *DeviceProfile) bool {
+	if profile == nil {
+		return false
+	}
+	lowerName := strings.ToLower(strings.TrimSpace(profile.Name))
+	if lowerName == "" || isNativeNonWebClient(lowerName) {
+		return false
+	}
+	return strings.Contains(lowerName, "web") ||
+		strings.Contains(lowerName, "browser") ||
+		strings.Contains(lowerName, "chrome") ||
+		strings.Contains(lowerName, "safari") ||
+		strings.Contains(lowerName, "firefox") ||
+		strings.Contains(lowerName, "edge")
+}
+
 func supportsClientWASM(profile *DeviceProfile) bool {
 	if profile == nil {
+		return false
+	}
+	lowerName := strings.ToLower(strings.TrimSpace(profile.Name))
+	if isNativeNonWebClient(lowerName) {
 		return false
 	}
 	if profile.SupportsClientWASM {
 		return true
 	}
-	lowerName := strings.ToLower(profile.Name)
-	return strings.Contains(lowerName, "ambra") || strings.Contains(lowerName, "wasm")
+	if lowerName == "" {
+		return false
+	}
+	return strings.Contains(lowerName, "ambra web") ||
+		strings.Contains(lowerName, "emby web") ||
+		strings.Contains(lowerName, "wasm")
+}
+
+func profileSupportsExternalFormat(profile *DeviceProfile, normalizedCodec string) bool {
+	if profile == nil {
+		return false
+	}
+	for _, sp := range profile.SubtitleProfiles {
+		if normalizeSubCodec(sp.Format) == normalizedCodec && (sp.Method == "" || strings.EqualFold(sp.Method, "External")) {
+			return true
+		}
+	}
+	return false
+}
+
+// subtitleStreamFormatForProfile selects the delivery extension for External subtitles.
+// HTML5 browsers cannot natively parse .srt in <track>, so external SRT subtitles are served
+// via Stream.vtt (on-the-fly WebVTT conversion) when the client is a Web browser or prefers VTT.
+func subtitleStreamFormatForProfile(codec string, profile *DeviceProfile) string {
+	ext := subtitleStreamFormat(codec)
+	if ext == "srt" && profile != nil {
+		if isWebBrowserProfile(profile) || (profileSupportsExternalFormat(profile, "vtt") && !profileSupportsExternalFormat(profile, "subrip")) {
+			return "vtt"
+		}
+	}
+	return ext
 }
 
 // decideSubtitleDeliveryMethod inspects DeviceProfile.SubtitleProfiles so that clients declaring

@@ -19,7 +19,7 @@ FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS go-builder
 
 ARG TARGETOS
 ARG TARGETARCH
-ARG AMBRA_VERSION=v0.5.2
+ARG AMBRA_VERSION=v0.10.4
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -46,8 +46,12 @@ ENV TZ=Asia/Shanghai \
     AMBRA_HTTP_ADDR=:8096
 
 RUN apk add --no-cache ca-certificates curl tzdata \
-    && mkdir -p /data
+    && addgroup -g 1000 -S ambra \
+    && adduser -u 1000 -S -G ambra -h /app -s /sbin/nologin ambra \
+    && mkdir -p /app /data \
+    && chown -R ambra:ambra /app /data
 
+WORKDIR /app
 COPY --from=go-builder /out/ambra /usr/local/bin/ambra
 
 EXPOSE 8096/tcp 1900/udp
@@ -56,6 +60,7 @@ VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8096/System/Ping || exit 1
 
+USER ambra
 ENTRYPOINT ["/usr/local/bin/ambra"]
 CMD ["-data", "/data"]
 
@@ -77,8 +82,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     tzdata \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /data
+    && groupadd -g 1000 -r ambra \
+    && useradd -u 1000 -r -g ambra -d /app -s /usr/sbin/nologin ambra \
+    && mkdir -p /app /data \
+    && chown -R ambra:ambra /app /data
 
+WORKDIR /app
 COPY --from=go-builder /out/ambra /usr/local/bin/ambra
 
 EXPOSE 8096/tcp 1900/udp
@@ -87,5 +96,6 @@ VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8096/System/Ping || exit 1
 
+USER ambra
 ENTRYPOINT ["/usr/local/bin/ambra"]
 CMD ["-data", "/data"]
