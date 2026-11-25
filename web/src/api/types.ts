@@ -234,6 +234,54 @@ export interface BackupRestoreResult {
   RequiresRestart?: boolean
 }
 
+export interface LiveTvTimerInfo {
+  Id: string
+  ChannelId: string
+  ChannelName?: string
+  ProgramId?: string
+  Name: string
+  Overview?: string
+  StartDate: string
+  EndDate: string
+  Status?: string
+  PrePaddingSeconds?: number
+  PostPaddingSeconds?: number
+}
+
+export interface LiveTvRecordingInfo {
+  Id: string
+  ChannelId?: string
+  ChannelName?: string
+  Name: string
+  Overview?: string
+  StartDate?: string
+  EndDate?: string
+  Status?: string
+  Path?: string
+}
+
+export interface WebhookInfo {
+  Id: string
+  Name: string
+  Url: string
+  Secret?: string
+  Events: string[]
+  Enabled: boolean
+  CreatedAt?: number
+}
+
+export interface WebhookTestResult {
+  Success: boolean
+  StatusCode?: number
+  DurationMs?: number
+  Error?: string
+}
+
+export interface ParentalRatingOption {
+  Name: string
+  Value: number
+}
+
 export interface BaseItemDto {
   Name: string
   OriginalTitle?: string

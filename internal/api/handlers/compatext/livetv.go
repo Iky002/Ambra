@@ -534,6 +534,14 @@ func (h *Handler) handleChannelTagPrefixes(w http.ResponseWriter, r *http.Reques
 
 func (h *Handler) handleDeleteRecordingPost(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "Id")
+	h.mu.RLock()
+	lt := h.liveTV
+	h.mu.RUnlock()
+	if lt != nil {
+		lt.DeleteRecording(r.Context(), id)
+		httpx.NoContent(w)
+		return
+	}
 	var removedPaths []string
 	var st sharedLiveTVState
 	if h.readConfigJSON(r.Context(), liveTVConfigKey, &st) {
@@ -558,14 +566,23 @@ func (h *Handler) handleDeleteRecordingPost(w http.ResponseWriter, r *http.Reque
 
 func (h *Handler) handleDeleteTimerPost(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "Id")
+	h.mu.RLock()
+	lt := h.liveTV
+	rec := h.dvrRec
+	h.mu.RUnlock()
+	if lt != nil {
+		lt.DeleteTimer(r.Context(), id)
+		if rec != nil {
+			_ = rec.CancelRecording(id)
+		}
+		httpx.NoContent(w)
+		return
+	}
 	var st sharedLiveTVState
 	if h.readConfigJSON(r.Context(), liveTVConfigKey, &st) {
 		st.Timers = filterRawByID(st.Timers, id)
 		h.writeConfigJSON(r.Context(), liveTVConfigKey, st)
 	}
-	h.mu.RLock()
-	rec := h.dvrRec
-	h.mu.RUnlock()
 	if rec != nil {
 		_ = rec.CancelRecording(id)
 	}
@@ -574,6 +591,14 @@ func (h *Handler) handleDeleteTimerPost(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) handleDeleteSeriesTimerPost(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "Id")
+	h.mu.RLock()
+	lt := h.liveTV
+	h.mu.RUnlock()
+	if lt != nil {
+		lt.DeleteSeriesTimer(r.Context(), id)
+		httpx.NoContent(w)
+		return
+	}
 	var st sharedLiveTVState
 	if h.readConfigJSON(r.Context(), liveTVConfigKey, &st) {
 		st.SeriesTimers = filterRawByID(st.SeriesTimers, id)
@@ -618,6 +643,16 @@ func (h *Handler) handleDefaultTunerHost(w http.ResponseWriter, r *http.Request)
 
 func (h *Handler) handleDeleteTunerHostPost(w http.ResponseWriter, r *http.Request) {
 	id := extractIDParam(r)
+	h.mu.RLock()
+	lt := h.liveTV
+	h.mu.RUnlock()
+	if lt != nil {
+		if id != "" {
+			lt.DeleteTunerHost(r.Context(), id)
+		}
+		httpx.NoContent(w)
+		return
+	}
 	var st sharedLiveTVState
 	if id != "" && h.readConfigJSON(r.Context(), liveTVConfigKey, &st) {
 		filtered := make([]liveTVTunerHost, 0, len(st.TunerHosts))
@@ -657,6 +692,16 @@ func (h *Handler) handleGetListingProviders(w http.ResponseWriter, r *http.Reque
 
 func (h *Handler) handleDeleteListingProviderPost(w http.ResponseWriter, r *http.Request) {
 	id := extractIDParam(r)
+	h.mu.RLock()
+	lt := h.liveTV
+	h.mu.RUnlock()
+	if lt != nil {
+		if id != "" {
+			lt.DeleteListingProvider(r.Context(), id)
+		}
+		httpx.NoContent(w)
+		return
+	}
 	var st sharedLiveTVState
 	if id != "" && h.readConfigJSON(r.Context(), liveTVConfigKey, &st) {
 		filtered := make([]liveTVListingProvider, 0, len(st.ListingProviders))

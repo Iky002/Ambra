@@ -576,3 +576,100 @@ func TestLiveStreamFileProxyAndRecordingPathTraversal(t *testing.T) {
 		}
 	}
 }
+
+func TestCompatExtDeleteDelegationUnifiesLiveTVState(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(tmpDir, "compatext-unify.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+
+	cfg := &config.Config{ServerID: "srv-unify", DataDir: tmpDir}
+	dvrRec := dvr.NewRecorder(dvr.Options{DataDir: tmpDir})
+	defer func() { _ = dvrRec.Close() }()
+
+	lt := livetv.New(store, cfg)
+	lt.SetRecorder(dvrRec)
+	ltMux := http.NewServeMux()
+	lt.RegisterRoutes(ltMux, livetv.AuthFuncs{})
+
+	h := New(store, cfg)
+	h.SetLiveTV(lt)
+	h.SetDVR(dvrRec)
+	router := h.BuildRouter(AuthFuncs{})
+
+	// 1. Seed tuner host (creates channel + placeholder program), recording, timer, series timer, listing provider via livetv
+	thRec := httptest.NewRecorder()
+	ltMux.ServeHTTP(thRec, httptest.NewRequest(http.MethodPost, "/LiveTv/TunerHosts",
+		strings.NewReader(`{"Id":"th-del","Type":"m3u","M3UContent":"#EXTM3U\n#EXTINF:-1,Chan 1\nhttp://tv/1.ts\n"}`)))
+	if thRec.Code != http.StatusOK {
+		t.Fatalf("seed tuner host: %d %s", thRec.Code, thRec.Body.String())
+	}
+
+	if err := os.MkdirAll(dvrRec.RecordingsDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recFile := filepath.Join(dvrRec.RecordingsDir(), "del.mkv")
+	if err := os.WriteFile(recFile, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lt.AddRecording(context.Background(), livetv.RecordingInfo{Id: "rec-del", Name: "Del Rec", Path: recFile})
+
+	ltMux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/LiveTv/Timers",
+		strings.NewReader(`{"Id":"tm-del","Name":"Del Timer","ChannelId":"ch-1"}`)))
+	ltMux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/LiveTv/SeriesTimers",
+		strings.NewReader(`{"Id":"st-del","Name":"Del Series"}`)))
+	ltMux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/LiveTv/ListingProviders",
+		strings.NewReader(`{"Id":"lp-del","Type":"xmltv"}`)))
+
+	// 2. Delete all 5 via compatext POST .../Delete routes
+	for _, tc := range []struct {
+		path string
+		body string
+	}{
+		{"/LiveTv/Recordings/rec-del/Delete", `{}`},
+		{"/LiveTv/Timers/tm-del/Delete", `{}`},
+		{"/LiveTv/SeriesTimers/st-del/Delete", `{}`},
+		{"/LiveTv/TunerHosts/Delete", `{"Id":"th-del"}`},
+		{"/LiveTv/ListingProviders/Delete", `{"Id":"lp-del"}`},
+	} {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body)))
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("POST %s: got %d, want 204", tc.path, w.Code)
+		}
+	}
+
+	// 3. Verify recording file removed and livetv in-memory state immediately reflects all deletions (including cascading channels & programs)
+	if _, err := os.Stat(recFile); !os.IsNotExist(err) {
+		t.Fatalf("expected recording file to be removed via delegated DeleteRecording, err=%v", err)
+	}
+	for _, checkPath := range []string{
+		"/LiveTv/Recordings",
+		"/LiveTv/Timers",
+		"/LiveTv/SeriesTimers",
+		"/LiveTv/Channels",
+		"/LiveTv/Programs",
+	} {
+		w := httptest.NewRecorder()
+		ltMux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, checkPath, nil))
+		if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"TotalRecordCount":0`) {
+			t.Fatalf("GET %s after compatext delete: expected TotalRecordCount 0, got %d %s", checkPath, w.Code, w.Body.String())
+		}
+	}
+
+	// 4. Write a new timer in livetv and verify deleted tuner host & listing provider do NOT resurrect in DB
+	ltMux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/LiveTv/Timers",
+		strings.NewReader(`{"Id":"tm-new","Name":"Fresh Timer"}`)))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/LiveTv/TunerHosts", nil))
+	if strings.Contains(w.Body.String(), "th-del") {
+		t.Fatalf("deleted tuner host resurrected: %s", w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/LiveTv/ListingProviders", nil))
+	if strings.Contains(w.Body.String(), "lp-del") {
+		t.Fatalf("deleted listing provider resurrected: %s", w.Body.String())
+	}
+}
