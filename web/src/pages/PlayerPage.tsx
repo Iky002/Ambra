@@ -1580,11 +1580,10 @@ export function PlayerPage() {
         osdVisible ? 'cursor-default' : 'cursor-none'
       }`}
     >
-      {/* 主视频元素 */}
+      {/* 主视频元素（不设 crossOrigin，避免 STRM 302 重定向到无 ACAO 响应头的网盘/CDN 时被浏览器 CORS 拦截） */}
       <video
         ref={videoRef}
         playsInline
-        crossOrigin="anonymous"
         onClick={(e) => {
           e.stopPropagation()
           if (activePanel !== 'none') {
