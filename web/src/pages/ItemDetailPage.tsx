@@ -56,6 +56,7 @@ import { MergeVersionsModal } from '../components/media/MergeVersionsModal'
 import { MetadataEditorModal } from '../components/media/MetadataEditorModal'
 import { useAudioPlayer } from '../context/AudioPlayerContext'
 import { useAuth } from '../context/AuthContext'
+import { useI18n } from '../i18n/I18nContext'
 import {
   loadPlaybackPrefs,
   pickPreferredAudioIndex,
@@ -115,6 +116,7 @@ function readFileAsBase64(file: File): Promise<string> {
 export function ItemDetailPage() {
   const { id } = useParams<{ id: string }>()
   const { auth, user, isAdmin } = useAuth()
+  const { locale, t } = useI18n()
   const {
     currentTrack,
     isPlaying: isAudioPlaying,
@@ -934,7 +936,7 @@ export function ItemDetailPage() {
                     <div className="flex flex-wrap items-center gap-1.5">
                       <span className="inline-flex items-center gap-1 text-zinc-500">
                         <Building2 className="h-3.5 w-3.5 text-amber-400/80" />
-                        <span>制片厂</span>
+                        <span>{t('detail.studios')}</span>
                       </span>
                       {item.Studios.map((studio) => (
                         <Link
@@ -949,7 +951,10 @@ export function ItemDetailPage() {
                     </div>
                   )}
                   {externalProviderLinks.length > 0 && (
-                    <div className="flex flex-wrap items-center gap-1.5">
+                    <div
+                      aria-label={t('detail.externalLinks')}
+                      className="flex flex-wrap items-center gap-1.5"
+                    >
                       {externalProviderLinks.map((ext) => (
                         <a
                           key={ext.key}
@@ -977,7 +982,7 @@ export function ItemDetailPage() {
                     className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all duration-200 hover:-translate-y-0.5 hover:bg-amber-400 active:scale-[0.97] disabled:opacity-50"
                   >
                     <Play className="h-4 w-4 fill-current" />
-                    <span>播放全部</span>
+                    <span>{t('collections.playAll')}</span>
                   </button>
                 ) : isMusicArtist ? (
                   artistTracks.length > 0 ? (
@@ -987,7 +992,7 @@ export function ItemDetailPage() {
                       className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all duration-200 hover:-translate-y-0.5 hover:bg-amber-400 active:scale-[0.97]"
                     >
                       <Play className="h-4 w-4 fill-current" />
-                      <span>播放全部</span>
+                      <span>{t('collections.playAll')}</span>
                     </button>
                   ) : null
                 ) : isAudio ? (
@@ -997,7 +1002,7 @@ export function ItemDetailPage() {
                     className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all duration-200 hover:-translate-y-0.5 hover:bg-amber-400 active:scale-[0.97]"
                   >
                     <Play className="h-4 w-4 fill-current" />
-                    <span>立即播放</span>
+                    <span>{t('detail.play')}</span>
                   </button>
                 ) : !isSeries ? (
                   <>
@@ -1007,7 +1012,7 @@ export function ItemDetailPage() {
                       className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all duration-200 hover:-translate-y-0.5 hover:bg-amber-400 active:scale-[0.97]"
                     >
                       <Play className="h-4 w-4 fill-current" />
-                      <span>{hasResume ? '继续播放' : '立即播放'}</span>
+                      <span>{hasResume ? t('detail.resume') : t('detail.play')}</span>
                     </button>
                     {hasResume && (
                       <button
@@ -1058,7 +1063,7 @@ export function ItemDetailPage() {
                     className="inline-flex items-center gap-2 rounded-xl border border-amber-400/35 bg-amber-500/12 px-4 py-3 text-sm font-medium text-amber-200 transition-all duration-200 hover:-translate-y-0.5 hover:border-amber-400/60 hover:bg-amber-500/20 active:scale-[0.97]"
                   >
                     <Film className="h-4 w-4" />
-                    <span>预告片</span>
+                    <span>{t('detail.trailers')}</span>
                   </button>
                 )}
 
@@ -1093,7 +1098,7 @@ export function ItemDetailPage() {
                   <Heart
                     className={`h-4 w-4 ${item.UserData?.IsFavorite ? 'fill-current' : ''}`}
                   />
-                  <span>{item.UserData?.IsFavorite ? '已收藏' : '收藏'}</span>
+                  <span>{item.UserData?.IsFavorite ? t('detail.favorited') : t('detail.favorite')}</span>
                 </button>
 
                 <button
@@ -1106,7 +1111,7 @@ export function ItemDetailPage() {
                   }`}
                 >
                   <Check className="h-4 w-4" />
-                  <span>{item.UserData?.Played ? '已观看' : '标记已看'}</span>
+                  <span>{item.UserData?.Played ? t('detail.watched') : t('detail.markWatched')}</span>
                 </button>
 
                 <button
@@ -1115,7 +1120,7 @@ export function ItemDetailPage() {
                   className="inline-flex items-center gap-2 rounded-xl border border-white/12 bg-white/[0.05] px-4 py-3 text-sm font-medium text-zinc-200 transition-all duration-200 hover:-translate-y-0.5 hover:border-amber-400/40 hover:bg-white/10 hover:text-amber-200 active:scale-[0.97]"
                 >
                   <FolderPlus className="h-4 w-4" />
-                  <span>加入合集 / 片单</span>
+                  <span>{t('detail.addToCollection')}</span>
                 </button>
 
                 {canDownload && (
@@ -1125,7 +1130,7 @@ export function ItemDetailPage() {
                     className="inline-flex items-center gap-2 rounded-xl border border-white/12 bg-white/[0.05] px-4 py-3 text-sm font-medium text-zinc-200 transition-all duration-200 hover:-translate-y-0.5 hover:border-amber-400/40 hover:bg-white/10 hover:text-amber-200 active:scale-[0.97]"
                   >
                     <Download className="h-4 w-4" />
-                    <span>下载原文件</span>
+                    <span>{t('detail.download')}</span>
                   </a>
                 )}
               </div>
@@ -1143,7 +1148,7 @@ export function ItemDetailPage() {
                 <div className="space-y-3 pt-1">
                   <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-amber-500/20 bg-zinc-950/65 p-2.5 backdrop-blur-md">
                     <span className="px-2 text-[11px] font-semibold uppercase tracking-wider text-amber-400/90">
-                      管理员操作
+                      {t('detail.adminActions')}
                     </span>
                     <button
                       type="button"
@@ -1151,7 +1156,7 @@ export function ItemDetailPage() {
                       className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:bg-white/10 hover:text-amber-200"
                     >
                       <Pencil className="h-3.5 w-3.5" />
-                      <span>编辑元数据</span>
+                      <span>{t('detail.editMetadata')}</span>
                     </button>
                     <button
                       type="button"
@@ -1159,7 +1164,7 @@ export function ItemDetailPage() {
                       className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:bg-white/10 hover:text-amber-200"
                     >
                       <ImageIcon className="h-3.5 w-3.5" />
-                      <span>编辑图片/海报</span>
+                      <span>{t('detail.editImages')}</span>
                     </button>
                     <button
                       type="button"
@@ -1167,7 +1172,7 @@ export function ItemDetailPage() {
                       className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:bg-white/10 hover:text-amber-200"
                     >
                       <ScanSearch className="h-3.5 w-3.5" />
-                      <span>识别</span>
+                      <span>{t('detail.identify')}</span>
                     </button>
                     <button
                       type="button"
@@ -1178,7 +1183,7 @@ export function ItemDetailPage() {
                       <RefreshCw
                         className={`h-3.5 w-3.5 ${refreshMetadataMutation.isPending ? 'animate-spin' : ''}`}
                       />
-                      <span>刷新元数据</span>
+                      <span>{t('detail.refreshMetadata')}</span>
                     </button>
                     {(item.Type === 'Movie' || item.Type === 'Video') && (
                       <button
@@ -1187,7 +1192,7 @@ export function ItemDetailPage() {
                         className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:bg-white/10 hover:text-amber-200"
                       >
                         <GitMerge className="h-3.5 w-3.5" />
-                        <span>合并版本</span>
+                        <span>{t('detail.mergeVersions')}</span>
                       </button>
                     )}
                     {mediaSources.length > 1 && (
@@ -1207,7 +1212,7 @@ export function ItemDetailPage() {
                       className="inline-flex items-center gap-1.5 rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20"
                     >
                       <Trash2 className="h-3.5 w-3.5" />
-                      <span>删除媒体</span>
+                      <span>{t('detail.deleteItem')}</span>
                     </button>
                   </div>
                 </div>
@@ -1262,7 +1267,7 @@ export function ItemDetailPage() {
                   <label className="block space-y-1.5">
                     <span className="flex items-center gap-1.5 text-xs font-medium text-zinc-400">
                       <Volume2 className="h-3.5 w-3.5 text-amber-400" />
-                      音轨 ({audioStreams.length})
+                      {t('detail.audioTrack')} ({audioStreams.length})
                     </span>
                     <select
                       value={selectedAudioIdx ?? ''}
@@ -1287,7 +1292,7 @@ export function ItemDetailPage() {
                         className="flex items-center gap-1.5 text-xs font-medium text-zinc-400"
                       >
                         <Subtitles className="h-3.5 w-3.5 text-amber-400" />
-                        字幕 ({subtitleStreams.length})
+                        {t('detail.subtitleTrack')} ({subtitleStreams.length})
                       </label>
                       {isAdmin && (
                         <button
@@ -1299,7 +1304,7 @@ export function ItemDetailPage() {
                           className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[11px] font-medium text-amber-300 transition-colors hover:border-amber-400/40 hover:bg-amber-500/15"
                         >
                           <Upload className="h-3 w-3" />
-                          <span>管理字幕</span>
+                          <span>{t('detail.manageSubtitles')}</span>
                         </button>
                       )}
                     </div>
@@ -1312,7 +1317,7 @@ export function ItemDetailPage() {
                       }}
                       className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
                     >
-                      <option value={-1}>关闭字幕</option>
+                      <option value={-1}>{t('detail.subtitleOff')}</option>
                       {subtitleStreams.map((s) => {
                         const meta = getSubtitleMeta(s)
                         return (
@@ -1739,7 +1744,7 @@ export function ItemDetailPage() {
                           className="inline-flex items-center gap-1 rounded-lg bg-white/[0.04] px-2 py-1 text-[11px] text-zinc-300 transition-colors hover:bg-amber-500/15 hover:text-amber-200"
                         >
                           <Info className="h-3 w-3" />
-                          <span>详情</span>
+                          <span>{t('detail.episodeDetail')}</span>
                         </Link>
                         <button
                           type="button"
@@ -1789,7 +1794,7 @@ export function ItemDetailPage() {
         <section className="mx-auto max-w-7xl space-y-4 px-4 pt-10 lg:px-8">
           <div className="flex items-center justify-between gap-3">
             <h2 className="text-lg font-semibold text-zinc-100">
-              演职员
+              {t('detail.castAndCrew')}
               <span className="ml-2 text-xs font-normal text-zinc-500">
                 ({item.People.length})
               </span>
@@ -1867,7 +1872,7 @@ export function ItemDetailPage() {
           <div className="flex items-center gap-2">
             <Bookmark className="h-4 w-4 text-amber-400" />
             <h2 className="text-lg font-semibold text-zinc-100">
-              章节
+              {t('detail.chapters')}
               <span className="ml-2 text-xs font-normal text-zinc-500">
                 ({item.Chapters.length})
               </span>
@@ -1924,7 +1929,7 @@ export function ItemDetailPage() {
           <div className="flex items-center gap-2">
             <Film className="h-4 w-4 text-amber-400" />
             <h2 className="text-lg font-semibold text-zinc-100">
-              花絮与特别收录
+              {locale === 'zh-CN' ? '花絮与特别收录' : t('detail.specialFeatures')}
               <span className="ml-2 text-xs font-normal text-zinc-500">
                 ({specialFeatures.length})
               </span>
@@ -2002,7 +2007,7 @@ export function ItemDetailPage() {
             >
               <div className="flex items-center gap-2">
                 <Info className="h-4 w-4 text-amber-400" />
-                <h2 className="text-base font-semibold text-zinc-100">媒体信息</h2>
+                <h2 className="text-base font-semibold text-zinc-100">{t('detail.mediaInfo')}</h2>
               </div>
               {mediaInfoExpanded ? (
                 <ChevronUp className="h-4 w-4 text-zinc-400" />
@@ -2018,7 +2023,7 @@ export function ItemDetailPage() {
                   {activeSource.Path && (
                     <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/8 bg-white/[0.025] px-3.5 py-2.5">
                       <div className="min-w-0 flex-1">
-                        <span className="block text-[11px] text-zinc-500">文件路径</span>
+                        <span className="block text-[11px] text-zinc-500">{t('detail.filePath')}</span>
                         <code className="block truncate font-mono text-xs text-zinc-200">
                           {activeSource.Path}
                         </code>
@@ -2031,7 +2036,7 @@ export function ItemDetailPage() {
                         {pathCopied ? (
                           <>
                             <Check className="h-3 w-3 text-emerald-400" />
-                            <span>已复制</span>
+                            <span>{t('common.copied')}</span>
                           </>
                         ) : (
                           <>
@@ -2045,19 +2050,19 @@ export function ItemDetailPage() {
 
                   <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
                     <div className="rounded-xl border border-white/8 bg-white/[0.02] px-3.5 py-2.5">
-                      <span className="block text-[11px] text-zinc-500">容器格式</span>
+                      <span className="block text-[11px] text-zinc-500">{t('detail.container')}</span>
                       <span className="mt-0.5 block font-mono text-xs font-semibold text-zinc-100">
                         {(activeSource.Container || '-').toUpperCase()}
                       </span>
                     </div>
                     <div className="rounded-xl border border-white/8 bg-white/[0.02] px-3.5 py-2.5">
-                      <span className="block text-[11px] text-zinc-500">文件大小</span>
+                      <span className="block text-[11px] text-zinc-500">{t('detail.fileSize')}</span>
                       <span className="mt-0.5 block font-mono text-xs font-semibold text-zinc-100">
                         {activeSource.Size ? formatBytes(activeSource.Size) : '-'}
                       </span>
                     </div>
                     <div className="rounded-xl border border-white/8 bg-white/[0.02] px-3.5 py-2.5">
-                      <span className="block text-[11px] text-zinc-500">总码率</span>
+                      <span className="block text-[11px] text-zinc-500">{t('detail.bitrate')}</span>
                       <span className="mt-0.5 block font-mono text-xs font-semibold text-zinc-100">
                         {formatBitrate(activeSource.Bitrate)}
                       </span>
@@ -2168,7 +2173,7 @@ export function ItemDetailPage() {
       {/* 相似推荐横向书架 */}
       {similarItems.length > 0 && (
         <section className="mx-auto max-w-7xl space-y-4 px-4 pt-10 lg:px-8">
-          <h2 className="text-lg font-semibold text-zinc-100">相似推荐</h2>
+          <h2 className="text-lg font-semibold text-zinc-100">{t('detail.similarItems')}</h2>
           <div className="no-scrollbar -mx-1 flex gap-4 overflow-x-auto px-1 pb-4 pt-1">
             {similarItems.map((sim) => (
               <div key={sim.Id} className="w-36 shrink-0 sm:w-40 md:w-44">
@@ -2205,7 +2210,7 @@ export function ItemDetailPage() {
       {isAdmin && (
         <AdminModal
           open={subModalOpen}
-          title="管理字幕"
+          title={t('detail.manageSubtitles')}
           subtitle={`管理「${item.Name}」的内封与外挂字幕轨道`}
           maxWidthClass="max-w-lg"
           onClose={() => setSubModalOpen(false)}

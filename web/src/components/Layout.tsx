@@ -28,8 +28,10 @@ import type { BaseItemDto } from '../api/types'
 import { useAudioPlayer } from '../context/AudioPlayerContext'
 import { useAuth } from '../context/AuthContext'
 import { isDemoMode } from '../demo/demoMode'
+import { useI18n } from '../i18n/I18nContext'
 import { AmbraLogo } from './AmbraLogo'
 import { AudioPlayerBar } from './AudioPlayerBar'
+import { LanguageSwitcher } from './LanguageSwitcher'
 import { NotificationBell } from './NotificationBell'
 import { ScanProgressBar } from './ScanProgressBar'
 import { SearchModal } from './SearchModal'
@@ -45,6 +47,7 @@ function libraryIcon(view: BaseItemDto) {
 export function Layout() {
   const { auth, user, isAdmin, logout, switchDemoRole } = useAuth()
   const { currentTrack } = useAudioPlayer()
+  const { t } = useI18n()
   const queryClient = useQueryClient()
   const navigate = useNavigate()
   const location = useLocation()
@@ -137,8 +140,8 @@ export function Layout() {
           className={`hidden items-center justify-center rounded-lg text-zinc-400 hover:bg-white/8 hover:text-zinc-100 lg:flex ${
             collapsed ? 'h-7 w-7 bg-white/[0.04]' : 'p-1.5'
           }`}
-          title={collapsed ? '展开侧边栏' : '折叠侧边栏'}
-          aria-label={collapsed ? '展开侧边栏' : '折叠侧边栏'}
+          title={collapsed ? t('nav.expandSidebar') : t('nav.collapseSidebar')}
+          aria-label={collapsed ? t('nav.expandSidebar') : t('nav.collapseSidebar')}
         >
           {collapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
         </button>
@@ -155,31 +158,31 @@ export function Layout() {
       {/* 导航菜单 */}
       <nav className="flex-1 space-y-6 overflow-y-auto px-3 py-4">
         <div className="space-y-1">
-          <NavLink to="/" end className={navLinkClass} title="首页">
+          <NavLink to="/" end className={navLinkClass} title={t('nav.home')}>
             <Home className="h-4 w-4 shrink-0" />
-            {!collapsed && <span>首页</span>}
+            {!collapsed && <span>{t('nav.home')}</span>}
           </NavLink>
-          <NavLink to="/trending" className={navLinkClass} title="热门">
+          <NavLink to="/trending" className={navLinkClass} title={t('nav.trending')}>
             <Flame className="h-4 w-4 shrink-0" />
-            {!collapsed && <span>热门</span>}
+            {!collapsed && <span>{t('nav.trending')}</span>}
           </NavLink>
-          <NavLink to="/collections" className={navLinkClass} title="合集">
+          <NavLink to="/collections" className={navLinkClass} title={t('nav.collections')}>
             <Library className="h-4 w-4 shrink-0" />
-            {!collapsed && <span>合集</span>}
+            {!collapsed && <span>{t('nav.collections')}</span>}
           </NavLink>
-          <NavLink to="/favorites" className={navLinkClass} title="我的收藏">
+          <NavLink to="/favorites" className={navLinkClass} title={t('nav.favorites')}>
             <Heart className="h-4 w-4 shrink-0" />
-            {!collapsed && <span>我的收藏</span>}
+            {!collapsed && <span>{t('nav.favorites')}</span>}
           </NavLink>
           {liveTvInfo?.IsEnabled && (
-            <NavLink to="/livetv" className={navLinkClass} title="电视直播">
+            <NavLink to="/livetv" className={navLinkClass} title={t('nav.livetv')}>
               <Radio className="h-4 w-4 shrink-0" />
-              {!collapsed && <span>电视直播</span>}
+              {!collapsed && <span>{t('nav.livetv')}</span>}
             </NavLink>
           )}
-          <NavLink to="/search" className={navLinkClass} title="探索与搜索">
+          <NavLink to="/search" className={navLinkClass} title={t('search.title')}>
             <Search className="h-4 w-4 shrink-0" />
-            {!collapsed && <span>探索搜索</span>}
+            {!collapsed && <span>{t('nav.search')}</span>}
           </NavLink>
         </div>
 
@@ -188,7 +191,7 @@ export function Layout() {
           <div className="space-y-1">
             {!collapsed && (
               <p className="px-3 pb-1 text-[11px] font-semibold tracking-wider text-zinc-500 uppercase">
-                媒体库
+                {t('nav.libraries')}
               </p>
             )}
             {views.map((view) => {
@@ -213,12 +216,12 @@ export function Layout() {
           <div className="space-y-1">
             {!collapsed && (
               <p className="px-3 pb-1 text-[11px] font-semibold tracking-wider text-zinc-500 uppercase">
-                控制台
+                {t('nav.console')}
               </p>
             )}
-            <NavLink to="/admin" className={navLinkClass} title="管理控制台">
+            <NavLink to="/admin" className={navLinkClass} title={t('nav.admin')}>
               <Settings className="h-4 w-4 shrink-0" />
-              {!collapsed && <span>管理控制台</span>}
+              {!collapsed && <span>{t('nav.admin')}</span>}
             </NavLink>
           </div>
         )}
@@ -229,7 +232,7 @@ export function Layout() {
         <div className="flex items-center justify-between gap-2 rounded-xl bg-white/[0.03] px-2.5 py-2">
           <Link
             to="/profile"
-            title="个人中心"
+            title={t('nav.profile')}
             className="flex min-w-0 flex-1 items-center gap-2.5 rounded-lg transition-colors hover:text-amber-300"
           >
             <div className="flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded-full bg-gradient-to-br from-amber-500/30 to-orange-500/20 text-xs font-bold text-amber-300 ring-1 ring-amber-400/30">
@@ -247,7 +250,9 @@ export function Layout() {
             {!collapsed && (
               <div className="min-w-0">
                 <p className="truncate text-sm font-medium text-zinc-100">{auth?.userName}</p>
-                <p className="text-[11px] text-zinc-500">{isAdmin ? '管理员' : '普通成员'}</p>
+                <p className="text-[11px] text-zinc-500">
+                  {isAdmin ? t('nav.roleAdmin') : t('nav.roleMember')}
+                </p>
               </div>
             )}
           </Link>
@@ -258,7 +263,7 @@ export function Layout() {
                 logout()
                 navigate('/login')
               }}
-              title="退出登录"
+              title={t('nav.logout')}
               className="rounded-lg p-1.5 text-zinc-400 transition-colors hover:bg-red-500/15 hover:text-red-400"
             >
               <LogOut className="h-4 w-4" />
@@ -298,8 +303,8 @@ export function Layout() {
             <div className="flex items-center gap-2">
               <Sparkles className="h-3.5 w-3.5 shrink-0 text-amber-400" />
               <span>
-                <strong className="font-semibold text-amber-300">Serverless Demo 模式</strong>
-                <span className="hidden sm:inline">（纯前端内存模拟，无需后端 · 所有读写即时生效）</span>
+                <strong className="font-semibold text-amber-300">{t('nav.demoTitle')}</strong>
+                <span className="hidden sm:inline">{t('nav.demoDesc')}</span>
               </span>
             </div>
             <button
@@ -311,12 +316,12 @@ export function Layout() {
               {isAdmin ? (
                 <>
                   <ShieldCheck className="h-3.5 w-3.5 text-amber-300" />
-                  <span>管理员视角 · 切换普通用户体验 RBAC</span>
+                  <span>{t('nav.demoSwitchGuest')}</span>
                 </>
               ) : (
                 <>
                   <UserCheck className="h-3.5 w-3.5 text-sky-300" />
-                  <span>普通用户视角 · 切回管理员控制台</span>
+                  <span>{t('nav.demoSwitchAdmin')}</span>
                 </>
               )}
             </button>
@@ -344,7 +349,7 @@ export function Layout() {
             >
               <span className="flex items-center gap-2.5 truncate">
                 <Search className="h-4 w-4 text-zinc-400" />
-                <span className="truncate">搜索影片、剧集、演员...</span>
+                <span className="truncate">{t('nav.searchPlaceholder')}</span>
               </span>
               <kbd className="hidden rounded-md border border-white/10 bg-black/40 px-1.5 py-0.5 text-[11px] font-medium text-zinc-400 sm:inline-block">
                 ⌘K
@@ -353,13 +358,14 @@ export function Layout() {
           </div>
 
           <div className="flex items-center gap-2">
+            <LanguageSwitcher compact />
             <NotificationBell />
             <Link
               to="/favorites"
               className="hidden items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium text-zinc-400 transition-colors hover:bg-white/8 hover:text-zinc-100 sm:flex"
             >
               <FolderHeart className="h-4 w-4 text-amber-400/80" />
-              <span>收藏</span>
+              <span>{t('nav.favoritesShort')}</span>
             </Link>
           </div>
         </header>

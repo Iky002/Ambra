@@ -31,6 +31,7 @@ import { QueryErrorState } from '../components/QueryErrorState'
 import { useAuth } from '../context/AuthContext'
 import { DEMO_VIDEO_DATA_URL } from '../demo/demoMedia'
 import { isDemoMode } from '../demo/demoMode'
+import { getActiveLocale, useI18n } from '../i18n/I18nContext'
 
 type LiveTvSubTab = 'channels' | 'timers' | 'recordings'
 
@@ -52,7 +53,7 @@ function formatTimeRange(startIso?: string, endIso?: string): string {
     if (!iso) return '--:--'
     const d = new Date(iso)
     if (Number.isNaN(d.getTime())) return '--:--'
-    return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
+    return d.toLocaleTimeString(getActiveLocale(), { hour: '2-digit', minute: '2-digit', hour12: false })
   }
   return `${fmt(startIso)} - ${fmt(endIso)}`
 }
@@ -63,7 +64,7 @@ function formatDateTimeRange(startIso?: string, endIso?: string): string {
     if (!iso) return '--'
     const d = new Date(iso)
     if (Number.isNaN(d.getTime())) return iso
-    return d.toLocaleString('zh-CN', {
+    return d.toLocaleString(getActiveLocale(), {
       month: '2-digit',
       day: '2-digit',
       hour: '2-digit',
@@ -84,6 +85,7 @@ function getProgramProgress(startIso?: string, endIso?: string, nowMs = Date.now
 
 export function LiveTvPage() {
   const { isAdmin } = useAuth()
+  const { locale, t } = useI18n()
   const queryClient = useQueryClient()
   const [searchParams, setSearchParams] = useSearchParams()
   const [activeSubTab, setActiveSubTab] = useState<LiveTvSubTab>('channels')
@@ -423,7 +425,7 @@ export function LiveTvPage() {
         <div>
           <h1 className="flex items-center gap-2.5 text-2xl font-bold tracking-tight text-white">
             <Radio className="h-6 w-6 text-amber-400" />
-            <span>电视直播</span>
+            <span>{t('livetv.title')}</span>
           </h1>
           <p className="mt-1 text-xs text-zinc-400">
             共 {channels.length} 个在线频道 · 支持 HLS 直播、实时 EPG 节目单与 DVR 预约录制
@@ -439,9 +441,21 @@ export function LiveTvPage() {
           >
             {(
               [
-                { key: 'channels', label: '直播频道', icon: Tv },
-                { key: 'timers', label: '预约计划', icon: CalendarClock },
-                { key: 'recordings', label: '已录节目', icon: Film },
+                {
+                  key: 'channels',
+                  label: locale === 'zh-CN' ? '直播频道' : t('livetv.channels'),
+                  icon: Tv,
+                },
+                {
+                  key: 'timers',
+                  label: locale === 'zh-CN' ? '预约计划' : t('livetv.timers'),
+                  icon: CalendarClock,
+                },
+                {
+                  key: 'recordings',
+                  label: locale === 'zh-CN' ? '已录节目' : t('livetv.recordings'),
+                  icon: Film,
+                },
               ] as const
             ).map(({ key, label, icon: Icon }) => {
               const selected = activeSubTab === key
@@ -739,7 +753,7 @@ export function LiveTvPage() {
             <div className="mb-3 flex items-center justify-between">
               <h2 className="flex items-center gap-2 text-sm font-semibold text-zinc-100">
                 <Tv className="h-4 w-4 text-amber-400" />
-                <span>频道列表</span>
+                <span>{t('livetv.channels')}</span>
               </h2>
               <span className="rounded-md bg-white/8 px-2 py-0.5 font-mono text-[11px] text-zinc-400">
                 {filteredChannels.length}/{channels.length}
@@ -901,7 +915,7 @@ export function LiveTvPage() {
           <div className="flex items-center justify-between gap-3 border-b border-white/8 pb-3">
             <h2 className="flex items-center gap-2 text-sm font-semibold text-zinc-100">
               <Film className="h-4 w-4 text-amber-400" />
-              <span>已录节目</span>
+              <span>{t('livetv.recordings')}</span>
               <span className="rounded-md bg-white/8 px-2 py-0.5 font-mono text-[11px] text-zinc-400">
                 {recordings.length}
               </span>
@@ -912,7 +926,7 @@ export function LiveTvPage() {
               className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-xs text-zinc-300 hover:border-amber-400/40 hover:text-amber-300"
             >
               <RefreshCw className="h-3 w-3" />
-              <span>刷新</span>
+              <span>{t('common.refresh')}</span>
             </button>
           </div>
 
@@ -1056,7 +1070,7 @@ export function LiveTvPage() {
                         className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-amber-500/35 bg-amber-500/15 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/25"
                       >
                         <Play className="h-3.5 w-3.5" />
-                        <span>播放</span>
+                        <span>{t('common.play')}</span>
                       </button>
                     )}
                     <button

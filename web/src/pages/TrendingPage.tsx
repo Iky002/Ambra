@@ -17,6 +17,7 @@ import type { BaseItemDto, RankingChartStatus } from '../api/types'
 import { MediaCard } from '../components/MediaCard'
 import { QueryErrorState } from '../components/QueryErrorState'
 import { useAuth } from '../context/AuthContext'
+import { useI18n } from '../i18n/I18nContext'
 import { FeedbackBanner, formatDateTime, formatRelativeTime } from './admin/adminUtils'
 
 type TrendingViewMode = 'overview' | 'tmdb' | 'douban_movie' | 'douban_tv'
@@ -122,6 +123,7 @@ function TrendingSection({
   onViewAll,
   headerExtra,
 }: TrendingSectionProps) {
+  const { t } = useI18n()
   const styles = ACCENT_STYLES[accent]
 
   return (
@@ -152,7 +154,7 @@ function TrendingSection({
           <p className="text-xs text-zinc-400">{subtitle}</p>
           <div className="flex flex-wrap items-center gap-2.5 pt-0.5 text-xs text-zinc-400">
             <span className="inline-flex items-center gap-1 rounded-lg bg-white/[0.06] px-2.5 py-1 text-zinc-200">
-              库内命中 <strong className={styles.countText}>{total}</strong> 部
+              {t('trending.inLibrary')} <strong className={styles.countText}>{total}</strong> 部
             </span>
             {chart && (
               <>
@@ -219,6 +221,7 @@ function TrendingSection({
 
 export function TrendingPage() {
   const { auth, isAdmin } = useAuth()
+  const { locale, t } = useI18n()
   const queryClient = useQueryClient()
   const userId = auth!.userId
 
@@ -409,10 +412,10 @@ export function TrendingPage() {
               <span>TMDB 全球热门 · 豆瓣热门电影 · 豆瓣热门剧集</span>
             </div>
             <h1 className="text-2xl font-bold tracking-tight text-white sm:text-3xl">
-              热门趋势
+              {locale === 'zh-CN' ? '热门趋势' : t('trending.title')}
             </h1>
             <p className="max-w-2xl text-xs leading-relaxed text-zinc-300 sm:text-sm">
-              分栏聚合 TMDB 全球热门趋势与豆瓣实时热门电影、热门剧集榜单，快速发现媒体库中正在热议的高人气佳作。
+              {t('trending.subtitle')}
             </p>
 
             <div className="flex flex-wrap items-center gap-2.5 pt-1 text-xs text-zinc-400">
@@ -441,7 +444,13 @@ export function TrendingPage() {
               <RefreshCw
                 className={`h-4 w-4 ${refreshMutation.isPending ? 'animate-spin' : ''}`}
               />
-              <span>{refreshMutation.isPending ? '正在同步热门榜...' : '立即同步热门榜'}</span>
+              <span>
+                {refreshMutation.isPending
+                  ? '正在同步热门榜...'
+                  : locale === 'zh-CN'
+                    ? '立即同步热门榜'
+                    : t('trending.refreshNow')}
+              </span>
             </button>
           )}
         </div>

@@ -17,6 +17,7 @@ import type { BaseItemDto } from '../api/types'
 import { MediaCard } from '../components/MediaCard'
 import { QueryErrorState } from '../components/QueryErrorState'
 import { useAuth } from '../context/AuthContext'
+import { useI18n } from '../i18n/I18nContext'
 import { formatTicks } from '../player/subtitleUtils'
 
 function HorizontalRow({
@@ -28,6 +29,7 @@ function HorizontalRow({
   moreLink?: string
   children: React.ReactNode
 }) {
+  const { t } = useI18n()
   const scrollRef = useRef<HTMLDivElement>(null)
 
   const scroll = (dir: 'left' | 'right') => {
@@ -47,7 +49,7 @@ function HorizontalRow({
               to={moreLink}
               className="text-xs font-medium text-amber-400/90 transition-colors hover:text-amber-300"
             >
-              查看全部 →
+              {t('home.viewAll')} →
             </Link>
           )}
         </div>
@@ -83,6 +85,7 @@ function HorizontalRow({
 
 export function HomePage() {
   const { auth } = useAuth()
+  const { locale, t } = useI18n()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const userId = auth!.userId
@@ -299,14 +302,20 @@ export function HomePage() {
                   className="flex items-center gap-2 rounded-xl bg-amber-500 px-5 py-2.5 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/30 transition-all duration-200 hover:-translate-y-0.5 hover:bg-amber-400 active:scale-[0.97]"
                 >
                   <Play className="h-4 w-4 fill-current" />
-                  <span>{activeHero.Type === 'Series' ? '开始观看' : '立即播放'}</span>
+                  <span>
+                    {activeHero.Type === 'Series'
+                      ? locale === 'zh-CN'
+                        ? '开始观看'
+                        : t('home.playNow')
+                      : t('home.playNow')}
+                  </span>
                 </button>
                 <Link
                   to={`/item/${activeHero.Id}`}
                   className="flex items-center gap-2 rounded-xl border border-white/15 bg-white/10 px-5 py-2.5 text-sm font-medium text-white backdrop-blur-md transition-all duration-200 hover:-translate-y-0.5 hover:bg-white/15 active:scale-[0.97]"
                 >
                   <Info className="h-4 w-4" />
-                  <span>查看详情</span>
+                  <span>{t('home.details')}</span>
                 </Link>
               </div>
             </div>
@@ -334,9 +343,13 @@ export function HomePage() {
       ) : (
         <div className="px-4 pt-6 lg:px-8">
           <div className="rounded-2xl border border-white/8 bg-gradient-to-r from-amber-500/10 via-zinc-900/60 to-zinc-950 p-8">
-            <h1 className="text-2xl font-bold text-white">欢迎回到 Ambra 影院</h1>
+            <h1 className="text-2xl font-bold text-white">
+              {locale === 'zh-CN' ? '欢迎回到 Ambra 影院' : t('home.emptyTitle')}
+            </h1>
             <p className="mt-2 text-sm text-zinc-400">
-              当前媒体库暂无影片，可在管理后台配置并扫描你的本地影视目录。
+              {locale === 'zh-CN'
+                ? '当前媒体库暂无影片，可在管理后台配置并扫描你的本地影视目录。'
+                : t('home.emptyDesc')}
             </p>
           </div>
         </div>
@@ -345,7 +358,7 @@ export function HomePage() {
       {/* 我的媒体 */}
       {views.length > 0 && (
         <section className="space-y-4 px-4 lg:px-8">
-          <h2 className="text-lg font-semibold tracking-tight text-zinc-100">我的媒体</h2>
+          <h2 className="text-lg font-semibold tracking-tight text-zinc-100">{t('home.myMedia')}</h2>
           <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-5">
             {views.map((view) => {
               const ct = (view.CollectionType || '').toLowerCase()
@@ -396,7 +409,7 @@ export function HomePage() {
 
       {/* 继续观看 */}
       {resumeItems.length > 0 && (
-        <HorizontalRow title="继续观看">
+        <HorizontalRow title={t('home.continueWatching')}>
           {resumeItems.map((item) => (
             <MediaCard
               key={item.Id}
@@ -413,7 +426,7 @@ export function HomePage() {
 
       {/* 接下来播放 (Next Up) */}
       {nextUpItems.length > 0 && (
-        <HorizontalRow title="接下来播放">
+        <HorizontalRow title={t('home.nextUp')}>
           {nextUpItems.map((item) => (
             <MediaCard
               key={item.Id}
@@ -434,7 +447,7 @@ export function HomePage() {
         return (
           <HorizontalRow
             key={view.Id}
-            title={`最新添加 · ${view.Name}`}
+            title={`${t('home.latestAdded')} · ${view.Name}`}
             moreLink={`/library/${view.Id}`}
           >
             {items.map((item) => (

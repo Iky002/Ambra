@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/core/scheduler"
+	"github.com/ambra-media/ambra/internal/pkg/i18n"
 )
 
 // AuthFuncs decouples route registration from the concrete middleware package.
@@ -53,6 +55,11 @@ func (h *Handler) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	isHidden := q.Bool("IsHidden")
 	isEnabled := q.Bool("IsEnabled")
+	acceptLang := strings.TrimSpace(r.Header.Get("Accept-Language"))
+	locale := ""
+	if acceptLang != "" {
+		locale = i18n.ResolveLocale(acceptLang, "")
+	}
 
 	all := h.mgr.List(true)
 	filtered := make([]scheduler.TaskInfo, 0, len(all))
@@ -70,6 +77,9 @@ func (h *Handler) handleListTasks(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
+		if locale != "" {
+			t = localizeTaskInfo(t, locale)
+		}
 		filtered = append(filtered, t)
 	}
 	httpx.JSON(w, http.StatusOK, filtered)
@@ -82,7 +92,33 @@ func (h *Handler) handleGetTask(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusNotFound, "scheduled task not found")
 		return
 	}
+	if acceptLang := strings.TrimSpace(r.Header.Get("Accept-Language")); acceptLang != "" {
+		info = localizeTaskInfo(info, i18n.ResolveLocale(acceptLang, ""))
+	}
 	httpx.JSON(w, http.StatusOK, info)
+}
+
+func localizeTaskInfo(info scheduler.TaskInfo, locale string) scheduler.TaskInfo {
+	key := info.Key
+	if key == "" {
+		key = info.Id
+	}
+	var nameKey, descKey string
+	switch key {
+	case "RefreshLibrary":
+		nameKey, descKey = "task.scan_library.name", "task.scan_library.desc"
+	case "CleanTranscode", "CleanTranscodeCache":
+		nameKey, descKey = "task.clean_transcode.name", "task.clean_transcode.desc"
+	case "OptimizeDatabase":
+		nameKey, descKey = "task.vacuum_db.name", "task.vacuum_db.desc"
+	case "SyncRankings":
+		nameKey, descKey = "task.sync_rankings.name", "task.sync_rankings.desc"
+	default:
+		return info
+	}
+	info.Name = i18n.T(locale, nameKey)
+	info.Description = i18n.T(locale, descKey)
+	return info
 }
 
 func (h *Handler) handlePostDispatch(w http.ResponseWriter, r *http.Request) {

@@ -33,30 +33,31 @@ import { AddToCollectionModal } from '../components/media/AddToCollectionModal'
 import { QueryErrorState } from '../components/QueryErrorState'
 import { useAudioPlayer } from '../context/AudioPlayerContext'
 import { useAuth } from '../context/AuthContext'
+import { useI18n } from '../i18n/I18nContext'
 import { formatTicks } from '../player/subtitleUtils'
 import { FeedbackBanner } from './admin/adminUtils'
 
 const SORT_OPTIONS = [
-  { value: 'DateCreated', label: '添加时间' },
-  { value: 'SortName', label: '名称排序' },
-  { value: 'CommunityRating', label: '评分最高' },
-  { value: 'PremiereDate', label: '上映年份' },
-  { value: 'PlayCount', label: '播放次数' },
+  { value: 'DateCreated', zhLabel: '按添加时间', i18nKey: 'library.sortDateAdded' },
+  { value: 'SortName', zhLabel: '按名称排序', i18nKey: 'library.sortName' },
+  { value: 'CommunityRating', zhLabel: '按评分最高', i18nKey: 'library.sortRating' },
+  { value: 'PremiereDate', zhLabel: '按上映年份', i18nKey: 'library.sortReleaseDate' },
+  { value: 'PlayCount', zhLabel: '按播放次数', i18nKey: 'library.sortDateAdded' },
 ]
 
 const FILTER_OPTIONS = [
-  { value: '', label: '全部状态' },
-  { value: 'IsUnplayed', label: '仅看未播' },
-  { value: 'IsPlayed', label: '仅看已播' },
-  { value: 'IsFavorite', label: '仅看收藏' },
+  { value: '', zhLabel: '全部状态', i18nKey: 'library.filterAll' },
+  { value: 'IsUnplayed', zhLabel: '仅看未播', i18nKey: 'library.filterUnplayed' },
+  { value: 'IsPlayed', zhLabel: '仅看已播', i18nKey: 'library.filterPlayed' },
+  { value: 'IsFavorite', zhLabel: '仅看收藏', i18nKey: 'library.filterFavorite' },
 ]
 
 type MusicSubTab = 'MusicAlbum' | 'MusicArtist' | 'Audio'
 
-const MUSIC_SUB_TABS: Array<{ id: MusicSubTab; label: string; icon: typeof Disc3 }> = [
-  { id: 'MusicAlbum', label: '专辑', icon: Disc3 },
-  { id: 'MusicArtist', label: '艺术家', icon: Mic2 },
-  { id: 'Audio', label: '曲目', icon: Music },
+const MUSIC_SUB_TABS: Array<{ id: MusicSubTab; i18nKey: string; icon: typeof Disc3 }> = [
+  { id: 'MusicAlbum', i18nKey: 'library.albums', icon: Disc3 },
+  { id: 'MusicArtist', i18nKey: 'library.artists', icon: Mic2 },
+  { id: 'Audio', i18nKey: 'library.tracks', icon: Music },
 ]
 
 const PAGE_SIZE = 36
@@ -78,6 +79,7 @@ export function LibraryPage() {
   const { id } = useParams<{ id: string }>()
   const [searchParams, setSearchParams] = useSearchParams()
   const { auth } = useAuth()
+  const { locale, t } = useI18n()
   const { currentTrack } = useAudioPlayer()
   const queryClient = useQueryClient()
   const userId = auth!.userId
@@ -348,7 +350,7 @@ export function LibraryPage() {
       <div className="flex flex-col gap-4 border-b border-white/8 pb-5 xl:flex-row xl:items-center xl:justify-between">
         <div>
           <h1 className="text-2xl font-bold tracking-tight text-white">
-            {libraryInfo?.Name || '媒体库'}
+            {libraryInfo?.Name || t('nav.libraries')}
           </h1>
           <p className="mt-1 text-xs text-zinc-400">
             共 {total} 部媒体{isFetching && !isLoading ? ' · 正在更新...' : ''}
@@ -369,7 +371,7 @@ export function LibraryPage() {
               className="max-w-[120px] bg-transparent text-zinc-200 outline-none"
             >
               <option value="" className="bg-zinc-900 text-zinc-100">
-                全部流派
+                {locale === 'zh-CN' ? '全部流派' : `${t('common.all')} · ${t('library.filterGenre')}`}
               </option>
               {genreOptions.map((g) => (
                 <option key={g} value={g} className="bg-zinc-900 text-zinc-100">
@@ -392,7 +394,7 @@ export function LibraryPage() {
               className="max-w-[100px] bg-transparent text-zinc-200 outline-none"
             >
               <option value="" className="bg-zinc-900 text-zinc-100">
-                全部年份
+                {locale === 'zh-CN' ? '全部年份' : `${t('common.all')} · ${t('library.filterYear')}`}
               </option>
               {yearOptions.map((y) => (
                 <option key={y} value={y} className="bg-zinc-900 text-zinc-100">
@@ -415,7 +417,7 @@ export function LibraryPage() {
               className="max-w-[130px] bg-transparent text-zinc-200 outline-none"
             >
               <option value="" className="bg-zinc-900 text-zinc-100">
-                全部标签
+                {locale === 'zh-CN' ? '全部标签' : `${t('common.all')} · ${t('library.filterTag')}`}
               </option>
               {tagOptions.map((t) => (
                 <option key={t} value={t} className="bg-zinc-900 text-zinc-100">
@@ -439,7 +441,7 @@ export function LibraryPage() {
             >
               {FILTER_OPTIONS.map((opt) => (
                 <option key={opt.value} value={opt.value} className="bg-zinc-900 text-zinc-100">
-                  {opt.label}
+                  {locale === 'zh-CN' ? opt.zhLabel : t(opt.i18nKey)}
                 </option>
               ))}
             </select>
@@ -458,7 +460,7 @@ export function LibraryPage() {
             >
               {SORT_OPTIONS.map((opt) => (
                 <option key={opt.value} value={opt.value} className="bg-zinc-900 text-zinc-100">
-                  按{opt.label}
+                  {locale === 'zh-CN' ? opt.zhLabel : t(opt.i18nKey)}
                 </option>
               ))}
             </select>
@@ -535,13 +537,15 @@ export function LibraryPage() {
             }`}
           >
             <CheckSquare className="h-3.5 w-3.5" />
-            <span>多选</span>
+            <span>{locale === 'zh-CN' ? '多选' : t('library.multiSelect')}</span>
           </button>
 
           {studioFilter && (
             <span className="inline-flex items-center gap-1.5 rounded-xl border border-amber-400/35 bg-amber-500/15 px-3 py-1.5 text-xs font-medium text-amber-200">
               <Building2 className="h-3.5 w-3.5 text-amber-400" />
-              <span>制片厂：{studioFilter}</span>
+              <span>
+                {t('library.filterStudio')}：{studioFilter}
+              </span>
               <button
                 type="button"
                 aria-label="清除制片厂筛选"
@@ -563,7 +567,7 @@ export function LibraryPage() {
               className="flex items-center gap-1 rounded-xl border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
             >
               <RotateCcw className="h-3 w-3" />
-              <span>重置</span>
+              <span>{locale === 'zh-CN' ? '重置' : t('library.clearFilters')}</span>
             </button>
           )}
         </div>
@@ -593,7 +597,7 @@ export function LibraryPage() {
                   : 'border border-white/8 bg-white/[0.03] text-zinc-400 hover:border-white/15 hover:text-zinc-100'
               }`}
             >
-              {letter}
+              {letter === '全部' ? t('library.allItems') : letter}
             </button>
           )
         })}
@@ -626,7 +630,7 @@ export function LibraryPage() {
                 }`}
               >
                 <Icon className="h-3.5 w-3.5" />
-                <span>{tab.label}</span>
+                <span>{t(tab.i18nKey)}</span>
               </button>
             )
           })}
@@ -647,7 +651,7 @@ export function LibraryPage() {
         />
       ) : items.length === 0 ? (
         <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-20 text-center text-sm text-zinc-500">
-          当前筛选条件下没有找到媒体项目
+          {locale === 'zh-CN' ? '当前筛选条件下没有找到媒体项目' : t('library.emptyResult')}
         </div>
       ) : viewMode === 'list' ? (
         <div
@@ -693,7 +697,7 @@ export function LibraryPage() {
             }}
             className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-200 transition-colors hover:bg-white/10 disabled:opacity-40"
           >
-            上一页
+            {t('common.prev')}
           </button>
           <span className="text-xs text-zinc-400">
             第 {page + 1} / {totalPages} 页
@@ -707,7 +711,7 @@ export function LibraryPage() {
             }}
             className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-200 transition-colors hover:bg-white/10 disabled:opacity-40"
           >
-            下一页
+            {t('common.next')}
           </button>
         </div>
       )}
@@ -722,7 +726,9 @@ export function LibraryPage() {
             currentTrack ? 'bottom-40 lg:bottom-24' : 'bottom-6'
           }`}
         >
-          <span className="font-semibold text-amber-300">已选 {selectedIds.size} 项</span>
+          <span className="font-semibold text-amber-300">
+            {t('library.selectedCount', { count: selectedIds.size })}
+          </span>
           <span className="h-4 w-px bg-white/15" />
 
           <button
@@ -739,7 +745,7 @@ export function LibraryPage() {
             disabled={selectedIds.size === 0 || batchBusy}
             className="rounded-lg border border-white/10 bg-white/[0.05] px-2.5 py-1.5 font-medium text-zinc-200 transition-colors hover:bg-white/10 disabled:opacity-40"
           >
-            清空
+            {locale === 'zh-CN' ? '清空' : t('common.clear')}
           </button>
 
           <span className="h-4 w-px bg-white/15" />
@@ -755,7 +761,7 @@ export function LibraryPage() {
             ) : (
               <Eye className="h-3.5 w-3.5" />
             )}
-            <span>标记已看</span>
+            <span>{t('home.markPlayed')}</span>
           </button>
           <button
             type="button"
@@ -764,7 +770,7 @@ export function LibraryPage() {
             className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.05] px-2.5 py-1.5 font-medium text-zinc-200 transition-colors hover:bg-white/10 disabled:opacity-40"
           >
             <EyeOff className="h-3.5 w-3.5" />
-            <span>标记未看</span>
+            <span>{t('home.markUnplayed')}</span>
           </button>
           <button
             type="button"
@@ -773,13 +779,13 @@ export function LibraryPage() {
             className="inline-flex items-center gap-1 rounded-lg bg-amber-500 px-3 py-1.5 font-semibold text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-40"
           >
             <FolderPlus className="h-3.5 w-3.5" />
-            <span>加入合集/片单</span>
+            <span>{locale === 'zh-CN' ? '加入合集/片单' : t('detail.addToCollection')}</span>
           </button>
 
           <button
             type="button"
-            aria-label="退出多选"
-            title="退出多选"
+            aria-label={t('library.exitMultiSelect')}
+            title={t('library.exitMultiSelect')}
             onClick={handleToggleSelectMode}
             className="ml-1 rounded-lg p-1.5 text-zinc-400 transition-colors hover:bg-white/10 hover:text-zinc-100"
           >

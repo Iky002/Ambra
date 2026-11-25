@@ -13,6 +13,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
+	"github.com/ambra-media/ambra/internal/pkg/i18n"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -388,5 +389,78 @@ func TestNotificationsIsReadFilterCapAndEventBus(t *testing.T) {
 	}
 	if newestName != "Bulk-509" {
 		t.Fatalf("expected newest notification Bulk-509, got %q", newestName)
+	}
+}
+
+func TestNotificationsLocalization(t *testing.T) {
+	h, mux, _ := setupNotifTest(t)
+	ctx := context.Background()
+
+	// Seed built-in system notifications and a custom notification
+	h.appendNotification(ctx, Notification{
+		Name:        "Library Updated",
+		Description: "Media library scan completed",
+		Level:       "Normal",
+	})
+	h.appendNotification(ctx, Notification{
+		Name:        "Scheduled Task Failed",
+		Description: "Scheduled Task failed",
+		Level:       "Error",
+	})
+	h.appendNotification(ctx, Notification{
+		Name:        "Scan Library Failed",
+		Description: "Scan Library failed",
+		Level:       "Error",
+	})
+	h.appendNotification(ctx, Notification{
+		Name:        "Custom Admin Notice",
+		Description: "Keep untouched",
+		Level:       "Normal",
+	})
+
+	// Without Accept-Language, titles remain original
+	rec := doReq(t, mux, http.MethodGet, "/Notifications/user-1", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /Notifications/user-1 status=%d", rec.Code)
+	}
+	var orig NotificationResult
+	_ = json.Unmarshal(rec.Body.Bytes(), &orig)
+	if len(orig.Notifications) != 4 {
+		t.Fatalf("expected 4 notifications, got %d", len(orig.Notifications))
+	}
+	if orig.Notifications[3].Name != "Library Updated" {
+		t.Fatalf("expected untranslated 'Library Updated' without Accept-Language, got %q", orig.Notifications[3].Name)
+	}
+
+	// With Accept-Language across multiple locales
+	for _, loc := range []string{"zh-CN", "zh-TW", "en-US", "ja-JP", "th-TH"} {
+		req := httptest.NewRequest(http.MethodGet, "/Notifications/user-1", nil)
+		req.Header.Set("Accept-Language", loc)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /Notifications/user-1 (%s) status=%d", loc, rec.Code)
+		}
+		var res NotificationResult
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+			t.Fatalf("unmarshal (%s): %v", loc, err)
+		}
+		if len(res.Notifications) != 4 {
+			t.Fatalf("expected 4 notifications for %s, got %d", loc, len(res.Notifications))
+		}
+		// Order is newest-first: Custom, Scan Library Failed, Scheduled Task Failed, Library Updated
+		if res.Notifications[0].Name != "Custom Admin Notice" || res.Notifications[0].Description != "Keep untouched" {
+			t.Fatalf("locale %s custom notification mutated: %+v", loc, res.Notifications[0])
+		}
+		wantPrefixed := i18n.T(loc, "notif.task_failed.name") + " (Scan Library)"
+		if res.Notifications[1].Name != wantPrefixed || res.Notifications[1].Description != i18n.T(loc, "notif.task_failed.desc") {
+			t.Fatalf("locale %s prefixed task failed = %+v, want name %q", loc, res.Notifications[1], wantPrefixed)
+		}
+		if res.Notifications[2].Name != i18n.T(loc, "notif.task_failed.name") || res.Notifications[2].Description != i18n.T(loc, "notif.task_failed.desc") {
+			t.Fatalf("locale %s task failed = %+v", loc, res.Notifications[2])
+		}
+		if res.Notifications[3].Name != i18n.T(loc, "notif.library_updated.name") || res.Notifications[3].Description != i18n.T(loc, "notif.library_updated.desc") {
+			t.Fatalf("locale %s library updated = %+v", loc, res.Notifications[3])
+		}
 	}
 }
