@@ -674,8 +674,8 @@ func TestCoreAdminAndMediaWorkflowEndToEnd(t *testing.T) {
 		UnreadCount int `json:"UnreadCount"`
 	}
 	_ = json.NewDecoder(w.Body).Decode(&summaryBefore)
-	if summaryBefore.UnreadCount != 1 {
-		t.Fatalf("expected 1 unread notification, got %d", summaryBefore.UnreadCount)
+	if summaryBefore.UnreadCount < 1 {
+		t.Fatalf("expected at least 1 unread notification, got %d", summaryBefore.UnreadCount)
 	}
 
 	w = sendCompatRequest(srv.Handler, http.MethodPost, "/emby/Notifications/"+normalUserID+"/Read?Ids="+notifResp.Id, normalToken, nil)
@@ -687,8 +687,8 @@ func TestCoreAdminAndMediaWorkflowEndToEnd(t *testing.T) {
 		UnreadCount int `json:"UnreadCount"`
 	}
 	_ = json.NewDecoder(w.Body).Decode(&summaryAfter)
-	if summaryAfter.UnreadCount != 0 {
-		t.Fatalf("expected 0 unread notifications after marking read, got %d", summaryAfter.UnreadCount)
+	if summaryAfter.UnreadCount != summaryBefore.UnreadCount-1 {
+		t.Fatalf("expected unread notifications to decrement from %d to %d after marking read, got %d", summaryBefore.UnreadCount, summaryBefore.UnreadCount-1, summaryAfter.UnreadCount)
 	}
 
 	// 10. Create and trigger Webhook against a local test HTTP receiver

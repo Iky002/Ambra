@@ -223,3 +223,92 @@ func TestUserAuditActivityLogs(t *testing.T) {
 		t.Errorf("expected at least 2 AuthenticationFailed events, got %d", seen["AuthenticationFailed"])
 	}
 }
+
+func TestSessionsActiveWithinAndDevicesQueryFilters(t *testing.T) {
+	tmp := t.TempDir()
+	cfg, err := config.Load(filepath.Join(tmp, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlite.Open(cfg.DBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	userRepo := sqlite.NewUserRepo(store)
+	authSvc := auth.NewService(userRepo, cfg)
+	sessMgr := session.NewManager(userRepo, cfg, eventbus.New())
+	authMW := middleware.NewAuth(authSvc, sessMgr)
+
+	admin, err := authSvc.CreateUser(ctx, "admin", "admin123", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, err := authSvc.CreateUser(ctx, "guest", "guest123", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	adminAuth, err := authSvc.AuthenticateByName(ctx, "admin", "admin123", "", auth.ClientInfo{DeviceID: "dev-admin", Device: "AdminPC", Client: "Web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = authSvc.AuthenticateByName(ctx, "guest", "guest123", "", auth.ClientInfo{DeviceID: "dev-guest", Device: "GuestPhone", Client: "Web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessMgr.TouchSession(admin, auth.ClientInfo{DeviceID: "dev-admin", Device: "AdminPC", Client: "Web"})
+	sessMgr.TouchSession(guest, auth.ClientInfo{DeviceID: "dev-guest", Device: "GuestPhone", Client: "Web"})
+
+	r := chi.NewRouter()
+	r.Use(authMW.ParseAuth)
+	RegisterRoutes(r, authMW, NewHandler(authSvc, userRepo, sessMgr, nil, cfg))
+
+	doReq := func(target string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		req.Header.Set("X-Emby-Token", adminAuth.AccessToken)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// ActiveWithinSeconds=60 includes recently active sessions
+	rec := doReq("/Sessions?ActiveWithinSeconds=60")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ActiveWithinSeconds=60 status=%d", rec.Code)
+	}
+	var active []dto.SessionInfo
+	_ = json.Unmarshal(rec.Body.Bytes(), &active)
+	if len(active) < 2 {
+		t.Fatalf("expected >=2 active sessions within 60s, got %d", len(active))
+	}
+
+	// GET /Devices?UserId=<guest> returns only guest's device
+	rec = doReq("/Devices?UserId=" + guest.ID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /Devices?UserId status=%d", rec.Code)
+	}
+	var devByUser dto.QueryResult[DeviceInfoDto]
+	_ = json.Unmarshal(rec.Body.Bytes(), &devByUser)
+	if devByUser.TotalRecordCount != 1 || devByUser.Items[0].LastUserId != guest.ID {
+		t.Fatalf("expected 1 device for guest, got %+v", devByUser)
+	}
+
+	// GET /Devices?SupportsSync=true returns 0 devices (sync not supported)
+	rec = doReq("/Devices?SupportsSync=true")
+	var devSyncTrue dto.QueryResult[DeviceInfoDto]
+	_ = json.Unmarshal(rec.Body.Bytes(), &devSyncTrue)
+	if devSyncTrue.TotalRecordCount != 0 {
+		t.Fatalf("expected 0 sync devices, got %d", devSyncTrue.TotalRecordCount)
+	}
+
+	// GET /Devices?SupportsSync=false returns all devices
+	rec = doReq("/Devices?SupportsSync=false")
+	var devSyncFalse dto.QueryResult[DeviceInfoDto]
+	_ = json.Unmarshal(rec.Body.Bytes(), &devSyncFalse)
+	if devSyncFalse.TotalRecordCount < 2 {
+		t.Fatalf("expected >=2 devices for SupportsSync=false, got %d", devSyncFalse.TotalRecordCount)
+	}
+}

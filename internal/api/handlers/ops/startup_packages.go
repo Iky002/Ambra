@@ -2,13 +2,16 @@ package ops
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/core/auth"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
 type StartupConfiguration struct {
@@ -113,11 +116,10 @@ func (h *Handler) handleUpdateStartupConfig(w http.ResponseWriter, r *http.Reque
 		}
 	}
 	h.saveStateLocked(r.Context())
-	h.mu.Unlock()
-
 	if h.cfg != nil {
 		_ = h.cfg.Save()
 	}
+	h.mu.Unlock()
 	httpx.NoContent(w)
 }
 
@@ -149,6 +151,36 @@ func (h *Handler) handleUpdateStartupUser(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	if h.userRepo != nil {
+		hash, err := auth.HashPassword(req.Password)
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to hash password")
+			return
+		}
+		existing, err := h.userRepo.GetUserByName(r.Context(), name)
+		if err == nil && existing != nil {
+			if err := h.userRepo.UpdateUserPassword(r.Context(), existing.ID, hash); err != nil {
+				httpx.Error(w, http.StatusInternalServerError, "failed to update user password")
+				return
+			}
+		} else if errors.Is(err, sqlite.ErrNotFound) {
+			u := &sqlite.UserRecord{
+				Name:         name,
+				PasswordHash: hash,
+				IsAdmin:      true,
+				Policy:       sqlite.DefaultUserPolicy(true),
+				Config:       sqlite.DefaultUserConfig(),
+			}
+			if err := h.userRepo.CreateUser(r.Context(), u); err != nil {
+				httpx.Error(w, http.StatusInternalServerError, "failed to create startup admin user")
+				return
+			}
+		} else if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to lookup user")
+			return
+		}
+	}
+
 	h.mu.Lock()
 	h.state.StartupUser = StartupUserState{
 		Name:        name,
@@ -173,11 +205,11 @@ func (h *Handler) handleUpdateRemoteAccess(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *Handler) handleStartupComplete(w http.ResponseWriter, r *http.Request) {
+	h.mu.Lock()
 	if h.cfg != nil {
 		h.cfg.IsStartupWizardCompleted = true
 		_ = h.cfg.Save()
 	}
-	h.mu.Lock()
 	h.saveStateLocked(r.Context())
 	h.mu.Unlock()
 	httpx.NoContent(w)

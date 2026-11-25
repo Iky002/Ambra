@@ -445,6 +445,11 @@ func (h *Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	deviceID := q.Get("DeviceId")
 	userID := guid.Normalize(q.Get("ControllableByUserId"))
+	activeWithin := q.Int("ActiveWithinSeconds", 0)
+	var activeCutoff time.Time
+	if activeWithin > 0 {
+		activeCutoff = time.Now().UTC().Add(-time.Duration(activeWithin) * time.Second)
+	}
 
 	all := h.sessionMgr.ListSessions()
 	out := make([]dto.SessionInfo, 0, len(all))
@@ -456,6 +461,9 @@ func (h *Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if userID != "" && guid.Normalize(s.UserId) != userID {
+			continue
+		}
+		if !activeCutoff.IsZero() && s.LastActivityDate.Before(activeCutoff) {
 			continue
 		}
 		out = append(out, s)
@@ -545,6 +553,10 @@ func (h *Handler) ListDevices(w http.ResponseWriter, r *http.Request) {
 		callerID = guid.Normalize(ac.UserID())
 	}
 
+	q := httpx.ParseQuery(r)
+	filterUserID := guid.Normalize(q.Get("UserId"))
+	supportsSync := q.Bool("SupportsSync")
+
 	devices, err := h.userRepo.ListDevices(r.Context())
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to list devices")
@@ -553,6 +565,12 @@ func (h *Handler) ListDevices(w http.ResponseWriter, r *http.Request) {
 	items := make([]DeviceInfoDto, 0, len(devices))
 	for _, d := range devices {
 		if !isAdmin && guid.Normalize(d.LastUserID) != callerID {
+			continue
+		}
+		if filterUserID != "" && guid.Normalize(d.LastUserID) != filterUserID {
+			continue
+		}
+		if supportsSync != nil && *supportsSync {
 			continue
 		}
 		items = append(items, DeviceInfoDto{

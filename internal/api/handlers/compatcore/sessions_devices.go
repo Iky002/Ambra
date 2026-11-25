@@ -34,6 +34,14 @@ func (h *Handler) recordRemoteCommand(sessionID, kind, command string, payload m
 }
 
 func (h *Handler) getSessionPlayQueue(w http.ResponseWriter, r *http.Request) {
+	q := httpx.ParseQuery(r)
+	filterID := strings.TrimSpace(q.Get("Id"))
+	startIndex := q.Int("StartIndex", 0)
+	if startIndex < 0 {
+		startIndex = 0
+	}
+	limit := q.Int("Limit", 0)
+
 	items := []dto.BaseItemDto{}
 	if h.sessions != nil {
 		isAdmin := h.isCallerAdmin(r)
@@ -42,14 +50,25 @@ func (h *Handler) getSessionPlayQueue(w http.ResponseWriter, r *http.Request) {
 			if !isAdmin && callerID != "" && guid.Normalize(s.UserId) != callerID {
 				continue
 			}
+			if filterID != "" && s.Id != filterID && s.DeviceId != filterID {
+				continue
+			}
 			if s.NowPlayingItem != nil {
 				items = append(items, *s.NowPlayingItem)
 			}
 		}
 	}
+	total := len(items)
+	if startIndex > total {
+		startIndex = total
+	}
+	end := total
+	if limit > 0 && startIndex+limit < end {
+		end = startIndex + limit
+	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
-		Items:            items,
-		TotalRecordCount: len(items),
+		Items:            items[startIndex:end],
+		TotalRecordCount: total,
 	})
 }
 
@@ -319,7 +338,7 @@ func (h *Handler) getDeviceInfo(w http.ResponseWriter, r *http.Request) {
 		if list, err := h.userRepo.ListDevices(r.Context()); err == nil {
 			for _, d := range list {
 				if d.ID == deviceID {
-					httpx.JSON(w, http.StatusOK, map[string]any{
+					info := map[string]any{
 						"Id":               d.ID,
 						"Name":             d.Name,
 						"AppName":          d.AppName,
@@ -327,25 +346,30 @@ func (h *Handler) getDeviceInfo(w http.ResponseWriter, r *http.Request) {
 						"LastUserId":       d.LastUserID,
 						"LastUserName":     d.LastUserName,
 						"DateLastActivity": d.DateLastActivity.Format(time.RFC3339),
-					})
+					}
+					var opts map[string]any
+					if found, _ := h.loadKV(r.Context(), "device_options:"+deviceID, &opts); found {
+						if cn, ok := opts["CustomName"].(string); ok && strings.TrimSpace(cn) != "" {
+							info["CustomName"] = strings.TrimSpace(cn)
+						}
+					}
+					httpx.JSON(w, http.StatusOK, info)
 					return
 				}
 			}
 		}
 	}
 
-	httpx.JSON(w, http.StatusOK, map[string]any{
-		"Id":               deviceID,
-		"Name":             "Unknown Device",
-		"AppName":          "Ambra Client",
-		"AppVersion":       "1.0.0",
-		"DateLastActivity": time.Now().UTC().Format(time.RFC3339),
-	})
+	writeJSONError(w, r, http.StatusNotFound, "device not found")
 }
 
 func (h *Handler) getDeviceOptions(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	deviceID := strings.TrimSpace(q.Get("Id"))
+	if !h.canAccessDevice(r, deviceID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	opts := map[string]any{"CustomName": ""}
 	_, _ = h.loadKV(r.Context(), "device_options:"+deviceID, &opts)
 	httpx.JSON(w, http.StatusOK, opts)
@@ -398,6 +422,10 @@ func (h *Handler) postDevicesDelete(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) getDeviceCameraUploads(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	deviceID := strings.TrimSpace(q.Get("DeviceId"))
+	if !h.canAccessDevice(r, deviceID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	var files []map[string]any
 	_, _ = h.loadKV(r.Context(), "device_camera_uploads:"+deviceID, &files)
 	if files == nil {
@@ -412,6 +440,10 @@ func (h *Handler) getDeviceCameraUploads(w http.ResponseWriter, r *http.Request)
 func (h *Handler) postDeviceCameraUploads(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	deviceID := strings.TrimSpace(q.Get("DeviceId"))
+	if !h.canAccessDevice(r, deviceID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	key := "device_camera_uploads:" + deviceID
 	var files []map[string]any
 	_, _ = h.loadKV(r.Context(), key, &files)
@@ -452,9 +484,27 @@ func (h *Handler) connectExchange(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	connectUserID := strings.TrimSpace(q.Get("ConnectUserId"))
 	localUserID := h.resolveUserID(r, "")
+	if connectUserID == "" || localUserID == "" {
+		writeJSONError(w, r, http.StatusUnauthorized, "connect credentials required")
+		return
+	}
+	var link struct {
+		UserId          string `json:"UserId"`
+		ConnectUsername string `json:"ConnectUsername"`
+	}
+	found, _ := h.loadKV(r.Context(), "user_connect_link:"+localUserID, &link)
+	if !found || strings.TrimSpace(link.ConnectUsername) == "" || !strings.EqualFold(strings.TrimSpace(link.ConnectUsername), connectUserID) {
+		writeJSONError(w, r, http.StatusUnauthorized, "invalid or unlinked connect credentials")
+		return
+	}
+	ac, ok := middleware.AuthFromContext(r.Context())
+	if !ok || ac == nil || strings.TrimSpace(ac.Token) == "" {
+		writeJSONError(w, r, http.StatusUnauthorized, "valid access token required")
+		return
+	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"LocalUserId":   localUserID,
-		"AccessToken":   guid.New(),
+		"AccessToken":   ac.Token,
 		"ConnectUserId": connectUserID,
 	})
 }

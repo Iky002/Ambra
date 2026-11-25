@@ -271,7 +271,14 @@ func (h *Handler) queryUsers(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	startIndex := q.Int("StartIndex", 0)
 	limit := q.Int("Limit", 0)
-	nameStartsWith := strings.ToLower(strings.TrimSpace(q.Get("NameStartsWithOrGreater")))
+	nameStartsWithOrGreater := strings.ToLower(strings.TrimSpace(q.Get("NameStartsWithOrGreater")))
+	nameStartsWith := strings.ToLower(strings.TrimSpace(q.Get("NameStartsWith")))
+	searchTerm := strings.ToLower(strings.TrimSpace(q.Get("SearchTerm")))
+	isHidden := q.Bool("IsHidden")
+	isDisabled := q.Bool("IsDisabled")
+	isAdmin := q.Bool("IsAdministrator")
+	sortBy := strings.ToLower(strings.TrimSpace(q.Get("SortBy")))
+	sortOrder := strings.ToLower(strings.TrimSpace(q.Get("SortOrder")))
 
 	var all []*sqlite.UserRecord
 	if h.userRepo != nil {
@@ -298,10 +305,66 @@ func (h *Handler) queryUsers(w http.ResponseWriter, r *http.Request) {
 
 	filtered := make([]dto.UserDto, 0, len(all))
 	for _, u := range all {
-		if nameStartsWith != "" && strings.ToLower(u.Name) < nameStartsWith {
+		lowerName := strings.ToLower(u.Name)
+		if nameStartsWithOrGreater != "" && lowerName < nameStartsWithOrGreater {
+			continue
+		}
+		if nameStartsWith != "" && !strings.HasPrefix(lowerName, nameStartsWith) {
+			continue
+		}
+		if searchTerm != "" && !strings.Contains(lowerName, searchTerm) {
+			continue
+		}
+		if isHidden != nil && u.Policy.IsHidden != *isHidden {
+			continue
+		}
+		if isDisabled != nil && (u.IsDisabled || u.Policy.IsDisabled) != *isDisabled {
+			continue
+		}
+		if isAdmin != nil && (u.IsAdmin || u.Policy.IsAdministrator) != *isAdmin {
 			continue
 		}
 		filtered = append(filtered, h.toUserDto(u))
+	}
+
+	if sortBy != "" || sortOrder != "" {
+		desc := sortOrder == "descending" || sortOrder == "desc"
+		primarySort := sortBy
+		if idx := strings.IndexByte(primarySort, ','); idx >= 0 {
+			primarySort = strings.TrimSpace(primarySort[:idx])
+		}
+		sort.SliceStable(filtered, func(i, j int) bool {
+			var cmp int
+			switch primarySort {
+			case "lastactivitydate":
+				cmp = compareTimePtr(filtered[i].LastActivityDate, filtered[j].LastActivityDate)
+			case "lastlogindate":
+				cmp = compareTimePtr(filtered[i].LastLoginDate, filtered[j].LastLoginDate)
+			case "isadministrator":
+				ai, aj := 0, 0
+				if filtered[i].Policy.IsAdministrator {
+					ai = 1
+				}
+				if filtered[j].Policy.IsAdministrator {
+					aj = 1
+				}
+				if ai < aj {
+					cmp = -1
+				} else if ai > aj {
+					cmp = 1
+				}
+			default:
+				ni, nj := strings.ToLower(filtered[i].Name), strings.ToLower(filtered[j].Name)
+				cmp = strings.Compare(ni, nj)
+			}
+			if cmp == 0 {
+				cmp = strings.Compare(strings.ToLower(filtered[i].Name), strings.ToLower(filtered[j].Name))
+			}
+			if desc {
+				return cmp > 0
+			}
+			return cmp < 0
+		})
 	}
 
 	total := len(filtered)
@@ -320,6 +383,25 @@ func (h *Handler) queryUsers(w http.ResponseWriter, r *http.Request) {
 		Items:            filtered[startIndex:end],
 		TotalRecordCount: total,
 	})
+}
+
+func compareTimePtr(a, b *time.Time) int {
+	if a == nil && b == nil {
+		return 0
+	}
+	if a == nil {
+		return -1
+	}
+	if b == nil {
+		return 1
+	}
+	if a.Before(*b) {
+		return -1
+	}
+	if a.After(*b) {
+		return 1
+	}
+	return 0
 }
 
 func (h *Handler) getUserPrefixes(w http.ResponseWriter, r *http.Request) {
@@ -393,14 +475,27 @@ func (h *Handler) updateUser(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, r, http.StatusForbidden, "admin privileges required to update user policy")
 		return
 	}
-	if body.Name != "" && body.Name != u.Name && h.store != nil && h.store.Writer != nil {
-		_, _ = h.store.Writer.ExecContext(r.Context(), `UPDATE users SET name = ? WHERE id = ?`, strings.TrimSpace(body.Name), u.ID)
+	if trimmedName := strings.TrimSpace(body.Name); trimmedName != "" && trimmedName != u.Name && h.store != nil && h.store.Writer != nil {
+		if _, err := h.store.Writer.ExecContext(r.Context(), `UPDATE users SET name = ? WHERE id = ?`, trimmedName, u.ID); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "unique") {
+				httpx.Error(w, http.StatusBadRequest, "username already exists")
+				return
+			}
+			httpx.Error(w, http.StatusInternalServerError, "failed to update user name")
+			return
+		}
 	}
 	if body.Configuration != nil {
-		_ = h.userRepo.UpdateUserConfig(r.Context(), u.ID, *body.Configuration)
+		if err := h.userRepo.UpdateUserConfig(r.Context(), u.ID, *body.Configuration); err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to update user configuration")
+			return
+		}
 	}
 	if body.Policy != nil {
-		_ = h.userRepo.UpdateUserPolicy(r.Context(), u.ID, *body.Policy)
+		if err := h.userRepo.UpdateUserPolicy(r.Context(), u.ID, *body.Policy); err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to update user policy")
+			return
+		}
 	}
 	if h.authSvc != nil {
 		h.authSvc.InvalidateUserCache(u.ID)
@@ -486,13 +581,31 @@ func (h *Handler) copyUserData(w http.ResponseWriter, r *http.Request) {
 		srcUID = guid.Normalize(body.CopyFromUserId)
 	}
 	if h.userRepo != nil && srcUID != "" {
+		copyConfig := len(body.CopyOptions) == 0
+		copyPolicy := false
+		for _, opt := range body.CopyOptions {
+			switch strings.ToLower(strings.TrimSpace(opt)) {
+			case "userconfiguration", "configuration", "config":
+				copyConfig = true
+			case "userpolicy", "policy":
+				copyPolicy = true
+			}
+		}
 		if src, err := h.userRepo.GetUserByID(r.Context(), srcUID); err == nil && src != nil {
 			for _, target := range body.ToUserIds {
 				tid := guid.Normalize(target)
 				if tid == "" || tid == src.ID {
 					continue
 				}
-				_ = h.userRepo.UpdateUserConfig(r.Context(), tid, src.Config)
+				if copyConfig {
+					_ = h.userRepo.UpdateUserConfig(r.Context(), tid, src.Config)
+				}
+				if copyPolicy {
+					_ = h.userRepo.UpdateUserPolicy(r.Context(), tid, src.Policy)
+				}
+				if h.authSvc != nil {
+					h.authSvc.InvalidateUserCache(tid)
+				}
 			}
 		}
 	}
@@ -842,23 +955,105 @@ func (h *Handler) preferredGenresForUser(ctx context.Context, uid string, allowe
 
 func (h *Handler) getUserSectionItems(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	q := httpx.ParseQuery(r)
+	startIndex := q.Int("StartIndex", 0)
+	if startIndex < 0 {
+		startIndex = 0
+	}
 	limit := q.Int("Limit", 20)
+	if limit <= 0 {
+		limit = 20
+	}
 	if h.libRepo == nil {
 		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{Items: []dto.BaseItemDto{}, TotalRecordCount: 0})
 		return
 	}
 	allowedLibs, maxRating, blockedTags := h.userPolicyForRequest(r, uid)
-	items, total, err := h.libRepo.QueryItems(r.Context(), sqlite.ItemFilter{
-		ServerID:          h.serverID(),
-		UserID:            uid,
-		Recursive:         true,
-		AllowedLibraryIDs: allowedLibs,
-		MaxParentalRating: maxRating,
-		BlockedTags:       blockedTags,
-		StartIndex:        q.Int("StartIndex", 0),
-		Limit:             limit,
-	})
+	sectionID := strings.ToLower(strings.TrimSpace(chi.URLParam(r, "SectionId")))
+	parentID := guid.Normalize(q.Get("ParentId"))
+	includeTypes := q.List("IncludeItemTypes")
+	fields := q.List("Fields")
+
+	var (
+		items []dto.BaseItemDto
+		total int
+		err   error
+	)
+	switch sectionID {
+	case "resume":
+		items, total, err = h.libRepo.GetResumeItemsWithPolicy(
+			r.Context(), h.serverID(), uid, parentID, includeTypes, startIndex, limit, fields,
+			allowedLibs, maxRating, blockedTags,
+		)
+	case "latestmedia", "latest":
+		items, total, err = h.libRepo.QueryItems(r.Context(), sqlite.ItemFilter{
+			ServerID:          h.serverID(),
+			UserID:            uid,
+			ParentID:          parentID,
+			Recursive:         true,
+			IncludeItemTypes:  includeTypes,
+			AllowedLibraryIDs: allowedLibs,
+			MaxParentalRating: maxRating,
+			BlockedTags:       blockedTags,
+			Fields:            fields,
+			SortBy:            []string{"DateCreated"},
+			SortOrder:         "Descending",
+			StartIndex:        startIndex,
+			Limit:             limit,
+		})
+	case "favorites":
+		fav := true
+		items, total, err = h.libRepo.QueryItems(r.Context(), sqlite.ItemFilter{
+			ServerID:          h.serverID(),
+			UserID:            uid,
+			ParentID:          parentID,
+			Recursive:         true,
+			IncludeItemTypes:  includeTypes,
+			AllowedLibraryIDs: allowedLibs,
+			MaxParentalRating: maxRating,
+			BlockedTags:       blockedTags,
+			IsFavorite:        &fav,
+			Fields:            fields,
+			StartIndex:        startIndex,
+			Limit:             limit,
+		})
+	case "nextup":
+		seriesID := guid.Normalize(q.Get("SeriesId"))
+		var allNextUp []dto.BaseItemDto
+		allNextUp, total, err = h.libRepo.GetNextUpEpisodesWithPolicy(
+			r.Context(), h.serverID(), uid, seriesID, startIndex+limit, fields,
+			allowedLibs, maxRating, blockedTags,
+		)
+		if err == nil {
+			if startIndex >= len(allNextUp) {
+				items = []dto.BaseItemDto{}
+			} else {
+				end := startIndex + limit
+				if end > len(allNextUp) {
+					end = len(allNextUp)
+				}
+				items = allNextUp[startIndex:end]
+			}
+		}
+	default:
+		items, total, err = h.libRepo.QueryItems(r.Context(), sqlite.ItemFilter{
+			ServerID:          h.serverID(),
+			UserID:            uid,
+			ParentID:          parentID,
+			Recursive:         true,
+			IncludeItemTypes:  includeTypes,
+			AllowedLibraryIDs: allowedLibs,
+			MaxParentalRating: maxRating,
+			BlockedTags:       blockedTags,
+			Fields:            fields,
+			StartIndex:        startIndex,
+			Limit:             limit,
+		})
+	}
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to query section items")
 		return
@@ -871,6 +1066,10 @@ func (h *Handler) getUserSectionItems(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) getUserSuggestions(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	if h.libRepo == nil {
 		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{Items: []dto.BaseItemDto{}, TotalRecordCount: 0})
@@ -994,10 +1193,19 @@ func (h *Handler) getUserSuggestions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) getUserGroupingOptions(w http.ResponseWriter, r *http.Request) {
+	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	out := []dto.NameIdPair{}
 	if h.libRepo != nil {
+		allowed := h.allowedLibrariesForUser(r.Context(), uid)
 		if libs, err := h.libRepo.ListLibraries(r.Context()); err == nil {
 			for _, lib := range libs {
+				if !isLibraryAllowed(lib.ID, allowed) {
+					continue
+				}
 				out = append(out, dto.NameIdPair{Name: lib.Name, Id: lib.ID})
 			}
 		}
@@ -1083,6 +1291,10 @@ func isLibraryAllowed(libID string, allowed []string) bool {
 
 func (h *Handler) serveUserItemExtras(w http.ResponseWriter, r *http.Request, extraTypes []string) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	if h.libRepo == nil || itemID == "" {
 		httpx.JSON(w, http.StatusOK, []dto.BaseItemDto{})
@@ -1139,6 +1351,17 @@ func (h *Handler) deleteUserFavoriteItem(w http.ResponseWriter, r *http.Request)
 	httpx.JSON(w, http.StatusOK, dto.UserItemDataDto{IsFavorite: false, Key: itemID})
 }
 
+func userItemDataWithLikes(ud dto.UserItemDataDto, likes *bool) map[string]any {
+	out := map[string]any{}
+	if raw, err := json.Marshal(ud); err == nil {
+		_ = json.Unmarshal(raw, &out)
+	}
+	if likes != nil {
+		out["Likes"] = *likes
+	}
+	return out
+}
+
 func (h *Handler) postUserItemRating(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
 	if !h.canModifyUser(r, uid) {
@@ -1160,7 +1383,7 @@ func (h *Handler) postUserItemRating(w http.ResponseWriter, r *http.Request) {
 			ud = *existing
 		}
 	}
-	httpx.JSON(w, http.StatusOK, ud)
+	httpx.JSON(w, http.StatusOK, userItemDataWithLikes(ud, &val))
 }
 
 func (h *Handler) deleteUserItemRating(w http.ResponseWriter, r *http.Request) {
@@ -1178,7 +1401,7 @@ func (h *Handler) deleteUserItemRating(w http.ResponseWriter, r *http.Request) {
 			ud = *existing
 		}
 	}
-	httpx.JSON(w, http.StatusOK, ud)
+	httpx.JSON(w, http.StatusOK, userItemDataWithLikes(ud, nil))
 }
 
 func (h *Handler) postUserItemHideFromResume(w http.ResponseWriter, r *http.Request) {
@@ -1193,9 +1416,11 @@ func (h *Handler) postUserItemHideFromResume(w http.ResponseWriter, r *http.Requ
 	if b := q.Bool("Hide"); b != nil {
 		hide = *b
 	}
-	_ = h.saveKV(r.Context(), fmt.Sprintf("user_hide_resume:%s:%s", uid, itemID), map[string]any{"Hide": hide})
-	if hide && h.userRepo != nil && uid != "" && itemID != "" {
-		_, _ = h.userRepo.UpsertPlaybackProgress(r.Context(), uid, itemID, 0, false, nil, nil)
+	kvKey := fmt.Sprintf("user_hide_resume:%s:%s", uid, itemID)
+	if hide {
+		_ = h.saveKV(r.Context(), kvKey, map[string]any{"Hide": true})
+	} else {
+		_ = h.deleteKV(r.Context(), kvKey)
 	}
 	ud := dto.UserItemDataDto{Key: itemID}
 	if h.libRepo != nil && uid != "" && itemID != "" {

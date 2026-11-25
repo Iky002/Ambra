@@ -113,4 +113,30 @@ func TestPluginAdminPersistenceAndRestore(t *testing.T) {
 	if restored["api_key"] != "secret-tmdb-key" || restored["enabled"] != false {
 		t.Fatalf("unexpected restored config: %+v", restored)
 	}
+	// Verify PascalCase metadata keys are present alongside lowercase keys
+	if restored["Id"] != "ambra.builtin.tmdb" || restored["Enabled"] != false || restored["Name"] == "" || restored["Priority"] == nil {
+		t.Fatalf("expected PascalCase metadata keys in GET Configuration, got: %+v", restored)
+	}
+
+	// 6. DELETE /Plugins/{Id} must preserve existing config keys (never wipe api_key/language)
+	rec = httptest.NewRecorder()
+	mux2.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/Plugins/ambra.builtin.tmdb/Enable?enabled=true", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("re-enable tmdb failed: %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	mux2.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/Plugins/ambra.builtin.tmdb", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE tmdb failed: %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	mux2.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Plugins/ambra.builtin.tmdb/Configuration", nil))
+	var afterDel map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &afterDel)
+	if afterDel["enabled"] != false || afterDel["Enabled"] != false {
+		t.Fatalf("expected enabled=false after DELETE, got %+v", afterDel)
+	}
+	if afterDel["api_key"] != "secret-tmdb-key" || afterDel["language"] != "en-US" {
+		t.Fatalf("expected DELETE to preserve existing config keys, got %+v", afterDel)
+	}
 }

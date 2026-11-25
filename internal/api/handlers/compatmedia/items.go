@@ -223,10 +223,46 @@ func (h *Handler) handleItemRefresh(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleMetadataReset(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	ids := q.List("ItemIds")
-	for _, id := range ids {
+	if len(ids) == 0 {
+		ids = q.List("Ids")
+	}
+	if r.Body != nil {
+		var raw map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&raw); err == nil {
+			for _, key := range []string{"ItemIds", "itemIds", "Ids", "ids"} {
+				v, ok := raw[key]
+				if !ok || len(v) == 0 {
+					continue
+				}
+				var arr []string
+				if err := json.Unmarshal(v, &arr); err == nil && len(arr) > 0 {
+					ids = append(ids, arr...)
+					break
+				}
+				var str string
+				if err := json.Unmarshal(v, &str); err == nil && strings.TrimSpace(str) != "" {
+					for _, p := range strings.Split(str, ",") {
+						if p = strings.TrimSpace(p); p != "" {
+							ids = append(ids, p)
+						}
+					}
+					break
+				}
+			}
+		}
+	}
+	seen := make(map[string]bool, len(ids))
+	for _, rawID := range ids {
+		id := guid.Normalize(rawID)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
 		if rec, err := h.repo.GetItemRecordByID(r.Context(), id); err == nil {
 			rec.Extra.Overview = ""
 			rec.Extra.Taglines = nil
+			rec.Extra.LockedFields = nil
+			rec.Extra.LockData = false
 			rec.DateModified = time.Now().Unix()
 			_ = h.repo.UpsertItem(r.Context(), rec)
 		}
@@ -266,6 +302,10 @@ func (h *Handler) handleDeleteItemsBatch(w http.ResponseWriter, r *http.Request)
 
 func (h *Handler) handleItemDeleteInfo(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	if !h.canAccessItemID(r, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	paths := []string{}
 	if rec, err := h.repo.GetItemRecordByID(r.Context(), itemID); err == nil && rec.Path != "" {
 		paths = append(paths, rec.Path)
@@ -342,6 +382,30 @@ func (h *Handler) getItemTagNames(r *http.Request, itemID string) []string {
 func (h *Handler) handleItemVisibility(isPublic bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		itemID := guid.Normalize(chi.URLParam(r, "Id"))
+		rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
+		if errors.Is(err, sqlite.ErrNotFound) {
+			httpx.Error(w, http.StatusNotFound, "item not found")
+			return
+		}
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		callerID, isAdmin := h.callerIdentity(r)
+		if callerID != "" || isAdmin {
+			if !isAdmin {
+				if strings.EqualFold(rec.Type, "Playlist") {
+					ownerID := guid.Normalize(rec.ParentID)
+					if ownerID == "" || ownerID != callerID {
+						httpx.Error(w, http.StatusForbidden, "forbidden")
+						return
+					}
+				} else if !h.canAccessItem(r, rec) {
+					httpx.Error(w, http.StatusForbidden, "forbidden")
+					return
+				}
+			}
+		}
 		_ = h.setConfigJSON(r.Context(), "item_visibility_"+itemID, map[string]any{"IsPublic": isPublic})
 		httpx.NoContent(w)
 	}
@@ -518,6 +582,10 @@ func (h *Handler) handleRemoteSearchApply(w http.ResponseWriter, r *http.Request
 
 func (h *Handler) handleExternalIDInfos(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	if !h.canAccessItemID(r, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
 	if err != nil {
 		httpx.JSON(w, http.StatusOK, []map[string]any{})
@@ -544,6 +612,10 @@ func buildExternalIDInfos(rec *sqlite.ItemRecord) []map[string]any {
 
 func (h *Handler) handleItemAncestors(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	if !h.canAccessItemID(r, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
 
@@ -586,7 +658,18 @@ func (h *Handler) canAccessItem(r *http.Request, item *sqlite.ItemRecord) bool {
 		return true
 	}
 	allowed := h.allowedLibrariesForRequest(r, "")
-	return isLibraryAllowed(item.LibraryID, allowed)
+	if !isLibraryAllowed(item.LibraryID, allowed) {
+		return false
+	}
+	if h.repo != nil {
+		maxRating, blockedTags := h.userParentalPolicyForRequest(r, "")
+		if maxRating != nil || len(blockedTags) > 0 {
+			if blocked, err := h.repo.IsItemBlockedByParentalPolicy(r.Context(), item, maxRating, blockedTags); err != nil || blocked {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (h *Handler) canAccessItemID(r *http.Request, itemID string) bool {

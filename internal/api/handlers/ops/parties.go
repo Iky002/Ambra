@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/middleware"
+	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 )
 
@@ -27,7 +29,39 @@ type Party struct {
 	DateCreated time.Time  `json:"DateCreated"`
 }
 
+func callerAuth(r *http.Request) (callerID string, isAdmin bool, hasAuth bool) {
+	ac, ok := middleware.AuthFromContext(r.Context())
+	if !ok || ac == nil || (ac.User == nil && !ac.IsAPIKey) {
+		return "", false, false
+	}
+	return guid.Normalize(ac.UserID()), ac.IsAdmin(), true
+}
+
+func isPartyMember(members []string, userID string) bool {
+	if userID == "" {
+		return false
+	}
+	norm := guid.Normalize(userID)
+	for _, m := range members {
+		if guid.Normalize(m) == norm {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *Handler) resolveUserID(r *http.Request, explicit string) string {
+	// Never trust client-supplied user IDs over an authenticated caller from AuthFromContext.
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if uid := guid.Normalize(ac.UserID()); uid != "" {
+			return uid
+		}
+		if explicit != "" {
+			return guid.Normalize(explicit)
+		}
+		return ""
+	}
+	// Fall back to explicit request field or UserIDFromCtx only when auth context is absent (e.g. unit tests).
 	if explicit != "" {
 		return guid.Normalize(explicit)
 	}
@@ -108,9 +142,16 @@ func (h *Handler) handleGetParty(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleDeleteParty(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
+	callerID, isAdmin, hasAuth := callerAuth(r)
+
 	h.mu.Lock()
 	for i, p := range h.state.Parties {
 		if p.Id == id {
+			if hasAuth && !isAdmin && (callerID == "" || guid.Normalize(p.HostUserId) != callerID) {
+				h.mu.Unlock()
+				httpx.Error(w, http.StatusForbidden, "only the party host or an administrator can delete this party")
+				return
+			}
 			h.state.Parties = append(h.state.Parties[:i], h.state.Parties[i+1:]...)
 			h.saveStateLocked(r.Context())
 			h.mu.Unlock()
@@ -207,10 +248,18 @@ func (h *Handler) handleUpdatePartyState(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	callerID, isAdmin, hasAuth := callerAuth(r)
+
 	h.mu.Lock()
 	for i := range h.state.Parties {
 		if h.state.Parties[i].Id == id {
-			st := &h.state.Parties[i].State
+			p := &h.state.Parties[i]
+			if hasAuth && !isAdmin && (callerID == "" || (guid.Normalize(p.HostUserId) != callerID && !isPartyMember(p.Members, callerID))) {
+				h.mu.Unlock()
+				httpx.Error(w, http.StatusForbidden, "only party members, host, or an administrator can update party state")
+				return
+			}
+			st := &p.State
 			if req.ItemId != "" {
 				st.ItemId = req.ItemId
 			}
@@ -224,9 +273,16 @@ func (h *Handler) handleUpdatePartyState(w http.ResponseWriter, r *http.Request)
 				st.PlaybackRate = *req.PlaybackRate
 			}
 			st.UpdatedAt = time.Now().UTC()
-			party := h.state.Parties[i]
+			party := *p
 			h.saveStateLocked(r.Context())
 			h.mu.Unlock()
+
+			if h.bus != nil {
+				h.bus.Publish(r.Context(), eventbus.Event{
+					Type:    eventbus.EventSessionUpdated,
+					Payload: party,
+				})
+			}
 			httpx.JSON(w, http.StatusOK, party)
 			return
 		}

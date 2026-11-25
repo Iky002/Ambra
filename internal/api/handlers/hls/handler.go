@@ -41,11 +41,12 @@ type liveStreamEntry struct {
 
 // Handler serves dynamic HLS playlists/segments, encoding capabilities/defaults, and LiveStreams APIs.
 type Handler struct {
-	repo     *sqlite.LibraryRepo
-	userRepo *sqlite.UserRepo
-	mgr      *transcode.Manager
-	cfg      *config.Config
-	auth     AuthFuncs
+	repo           *sqlite.LibraryRepo
+	userRepo       *sqlite.UserRepo
+	mgr            *transcode.Manager
+	cfg            *config.Config
+	auth           AuthFuncs
+	streamResolver func(ctx context.Context, rawPath string) (string, error)
 
 	liveMu      sync.RWMutex
 	liveStreams map[string]*liveStreamEntry
@@ -64,6 +65,11 @@ func New(repo *sqlite.LibraryRepo, mgr *transcode.Manager, cfg *config.Config) *
 // SetUserRepo attaches a UserRepo for per-user library access control and ownership checks.
 func (h *Handler) SetUserRepo(r *sqlite.UserRepo) {
 	h.userRepo = r
+}
+
+// SetStreamResolver attaches a resolver (e.g. playback.Engine.ResolveStream) for .strm files.
+func (h *Handler) SetStreamResolver(fn func(ctx context.Context, rawPath string) (string, error)) {
+	h.streamResolver = fn
 }
 
 func (h *Handler) callerIdentity(r *http.Request) (userID string, isAdmin bool) {
@@ -515,17 +521,25 @@ func (h *Handler) handleLiveStreamOpen(w http.ResponseWriter, r *http.Request) {
 
 	if req.ItemId != "" && h.repo != nil {
 		item, src, err := h.resolveItemAndSource(r.Context(), guid.Normalize(req.ItemId), req.MediaSourceId)
-		if err == nil && item != nil && !h.canAccessItem(r, item) {
+		if errors.Is(err, sqlite.ErrNotFound) {
+			httpx.Error(w, http.StatusNotFound, "media item not found")
+			return
+		}
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if item != nil && !h.canAccessItem(r, item) {
 			httpx.Error(w, http.StatusForbidden, "access denied")
 			return
 		}
-		if err == nil && src != nil {
+		if src != nil {
 			msDTO = sqlite.MediaSourceRecordsToDTO([]sqlite.MediaSourceRecord{*src})[0]
 			msDTO.Type = "Default"
 			if msDTO.Id == "" {
 				msDTO.Id = item.ID
 			}
-		} else if err == nil && item != nil {
+		} else if item != nil {
 			msDTO = dto.MediaSourceInfo{
 				Id:                   item.ID,
 				Name:                 item.Name,
@@ -670,7 +684,11 @@ func (h *Handler) buildSessionParams(r *http.Request, item *sqlite.ItemRecord, s
 	}
 	// Resolve .strm file to its target URL for FFmpeg input
 	if strings.EqualFold(filepath.Ext(inputPath), ".strm") {
-		if u := readFirstLineURL(inputPath); u != "" {
+		if h.streamResolver != nil {
+			if u, err := h.streamResolver(r.Context(), inputPath); err == nil && strings.TrimSpace(u) != "" {
+				inputPath = strings.TrimSpace(u)
+			}
+		} else if u := readFirstLineURL(inputPath); u != "" {
 			inputPath = u
 		}
 	}

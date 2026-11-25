@@ -56,6 +56,10 @@ type imageInfoDTO struct {
 
 func (h *Handler) handleListItemImages(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	if !h.canAccessItemID(r, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
 	out := make([]imageInfoDTO, 0)
 	if h.store != nil {
 		rows, err := h.store.Reader.QueryContext(r.Context(),
@@ -314,10 +318,67 @@ func (h *Handler) handleUpdateImageIndex(w http.ResponseWriter, r *http.Request)
 	newIdx := q.Int("newIndex", oldIdx)
 
 	if h.store != nil && oldIdx != newIdx {
-		_, _ = h.store.Writer.ExecContext(r.Context(),
-			`UPDATE item_images SET image_index = ? WHERE item_id = ? AND LOWER(image_type) = LOWER(?) AND image_index = ?`,
-			newIdx, itemID, imageType, oldIdx,
-		)
+		tx, err := h.store.Writer.BeginTx(r.Context(), nil)
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		defer tx.Rollback()
+
+		var oldExists int
+		if err := tx.QueryRowContext(r.Context(),
+			`SELECT COUNT(*) FROM item_images WHERE item_id = ? AND LOWER(image_type) = LOWER(?) AND image_index = ?`,
+			itemID, imageType, oldIdx,
+		).Scan(&oldExists); err != nil {
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if oldExists > 0 {
+			var targetExists int
+			if err := tx.QueryRowContext(r.Context(),
+				`SELECT COUNT(*) FROM item_images WHERE item_id = ? AND LOWER(image_type) = LOWER(?) AND image_index = ?`,
+				itemID, imageType, newIdx,
+			).Scan(&targetExists); err != nil {
+				httpx.Error(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if targetExists > 0 {
+				const tempIdx = -999999
+				if _, err := tx.ExecContext(r.Context(),
+					`UPDATE item_images SET image_index = ? WHERE item_id = ? AND LOWER(image_type) = LOWER(?) AND image_index = ?`,
+					tempIdx, itemID, imageType, newIdx,
+				); err != nil {
+					httpx.Error(w, http.StatusInternalServerError, err.Error())
+					return
+				}
+				if _, err := tx.ExecContext(r.Context(),
+					`UPDATE item_images SET image_index = ? WHERE item_id = ? AND LOWER(image_type) = LOWER(?) AND image_index = ?`,
+					newIdx, itemID, imageType, oldIdx,
+				); err != nil {
+					httpx.Error(w, http.StatusInternalServerError, err.Error())
+					return
+				}
+				if _, err := tx.ExecContext(r.Context(),
+					`UPDATE item_images SET image_index = ? WHERE item_id = ? AND LOWER(image_type) = LOWER(?) AND image_index = ?`,
+					oldIdx, itemID, imageType, tempIdx,
+				); err != nil {
+					httpx.Error(w, http.StatusInternalServerError, err.Error())
+					return
+				}
+			} else {
+				if _, err := tx.ExecContext(r.Context(),
+					`UPDATE item_images SET image_index = ? WHERE item_id = ? AND LOWER(image_type) = LOWER(?) AND image_index = ?`,
+					newIdx, itemID, imageType, oldIdx,
+				); err != nil {
+					httpx.Error(w, http.StatusInternalServerError, err.Error())
+					return
+				}
+			}
+			if err := tx.Commit(); err != nil {
+				httpx.Error(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
 	}
 	httpx.NoContent(w)
 }
@@ -385,6 +446,10 @@ func (h *Handler) handleRemoteImages(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !h.canAccessItem(r, rec) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
 		return
 	}
 

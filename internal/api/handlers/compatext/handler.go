@@ -12,8 +12,10 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/ambra-media/ambra/internal/api/handlers/livetv"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/dvr"
+	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -38,15 +40,16 @@ type ChannelMapping struct {
 
 // OfflineAction records an offline playback/user-data action submitted by a sync client.
 type OfflineAction struct {
-	Date           string `json:"Date,omitempty"`
-	ItemId         string `json:"ItemId,omitempty"`
-	ServerId       string `json:"ServerId,omitempty"`
-	UserId         string `json:"UserId,omitempty"`
-	Type           string `json:"Type,omitempty"`
-	IsFavorite     *bool  `json:"IsFavorite,omitempty"`
-	Played         *bool  `json:"Played,omitempty"`
-	PositionTicks  int64  `json:"PositionTicks,omitempty"`
-	RecordedAtUnix int64  `json:"RecordedAtUnix,omitempty"`
+	Date                  string `json:"Date,omitempty"`
+	ItemId                string `json:"ItemId,omitempty"`
+	ServerId              string `json:"ServerId,omitempty"`
+	UserId                string `json:"UserId,omitempty"`
+	Type                  string `json:"Type,omitempty"`
+	IsFavorite            *bool  `json:"IsFavorite,omitempty"`
+	Played                *bool  `json:"Played,omitempty"`
+	PositionTicks         int64  `json:"PositionTicks,omitempty"`
+	PlaybackPositionTicks int64  `json:"PlaybackPositionTicks,omitempty"`
+	RecordedAtUnix        int64  `json:"RecordedAtUnix,omitempty"`
 }
 
 // NotificationServiceConfig represents a configured Emby user notification service.
@@ -74,11 +77,13 @@ type compatExtState struct {
 
 // Handler implements extended Emby 4.10.2.0 compatibility routes for LiveTv, Sync, and Notifications.
 type Handler struct {
-	store  *sqlite.Store
-	cfg    *config.Config
-	auth   AuthFuncs
-	liveTV *livetv.Handler
-	dvrRec *dvr.Recorder
+	store    *sqlite.Store
+	cfg      *config.Config
+	auth     AuthFuncs
+	liveTV   *livetv.Handler
+	dvrRec   *dvr.Recorder
+	libRepo  *sqlite.LibraryRepo
+	userRepo *sqlite.UserRepo
 
 	mu    sync.RWMutex
 	state compatExtState
@@ -96,6 +101,41 @@ func (h *Handler) SetDVR(r *dvr.Recorder) {
 	h.mu.Lock()
 	h.dvrRec = r
 	h.mu.Unlock()
+}
+
+// SetLibraryRepo wires LibraryRepo for applying offline sync actions to user item data.
+func (h *Handler) SetLibraryRepo(r *sqlite.LibraryRepo) {
+	h.mu.Lock()
+	h.libRepo = r
+	h.mu.Unlock()
+}
+
+// SetUserRepo wires UserRepo for ownership/admin RBAC and playback position persistence.
+func (h *Handler) SetUserRepo(r *sqlite.UserRepo) {
+	h.mu.Lock()
+	h.userRepo = r
+	h.mu.Unlock()
+}
+
+func (h *Handler) callerIdentity(r *http.Request) (userID string, isAdmin bool) {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		return guid.Normalize(ac.UserID()), ac.IsAdmin()
+	}
+	if h.auth.UserIDFromCtx != nil {
+		uid := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if uid != "" {
+			h.mu.RLock()
+			ur := h.userRepo
+			h.mu.RUnlock()
+			if ur != nil {
+				if u, err := ur.GetUserByID(r.Context(), uid); err == nil && u != nil {
+					return uid, u.IsAdmin || u.Policy.IsAdministrator
+				}
+			}
+			return uid, false
+		}
+	}
+	return "", false
 }
 
 // New constructs a compatext Handler and loads persisted state from SQLite when store is non-nil.

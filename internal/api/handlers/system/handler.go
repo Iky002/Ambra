@@ -1,6 +1,7 @@
 package system
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -119,16 +120,47 @@ func (h *Handler) Ping(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+const systemExtraConfigKey = "system:config_extra"
+
 type ServerConfigurationDto struct {
-	ServerName               string  `json:"ServerName"`
-	IsStartupWizardCompleted bool    `json:"IsStartupWizardCompleted"`
-	TMDBApiKey               string  `json:"TMDBApiKey,omitempty"`
-	TMDBLanguage             string  `json:"TMDBLanguage,omitempty"`
-	EnableSTRM302            bool    `json:"EnableSTRM302"`
-	PlayedThreshold          float64 `json:"PlayedThreshold"`
-	PreferredMetadataLanguage string `json:"PreferredMetadataLanguage"`
-	MetadataCountryCode      string  `json:"MetadataCountryCode"`
-	UICulture                string  `json:"UICulture"`
+	ServerName                string  `json:"ServerName"`
+	IsStartupWizardCompleted  bool    `json:"IsStartupWizardCompleted"`
+	TMDBApiKey                string  `json:"TMDBApiKey,omitempty"`
+	TMDBLanguage              string  `json:"TMDBLanguage,omitempty"`
+	EnableSTRM302             bool    `json:"EnableSTRM302"`
+	PlayedThreshold           float64 `json:"PlayedThreshold"`
+	PreferredMetadataLanguage string  `json:"PreferredMetadataLanguage"`
+	MetadataCountryCode       string  `json:"MetadataCountryCode"`
+	UICulture                 string  `json:"UICulture"`
+}
+
+func (h *Handler) loadExtraConfig(ctx context.Context) map[string]any {
+	extra := map[string]any{}
+	if h.userRepo == nil {
+		return extra
+	}
+	if raw, err := h.userRepo.GetServerConfig(ctx, systemExtraConfigKey); err == nil && raw != "" {
+		_ = json.Unmarshal([]byte(raw), &extra)
+	}
+	return extra
+}
+
+func (h *Handler) saveExtraConfig(ctx context.Context, extra map[string]any) error {
+	if h.userRepo == nil {
+		return nil
+	}
+	raw, err := json.Marshal(extra)
+	if err != nil {
+		return err
+	}
+	return h.userRepo.SetServerConfig(ctx, systemExtraConfigKey, string(raw))
+}
+
+func stringFromMap(m map[string]any, key, fallback string) string {
+	if v, ok := m[key].(string); ok && strings.TrimSpace(v) != "" {
+		return strings.TrimSpace(v)
+	}
+	return fallback
 }
 
 func (h *Handler) GetConfiguration(w http.ResponseWriter, r *http.Request) {
@@ -136,17 +168,27 @@ func (h *Handler) GetConfiguration(w http.ResponseWriter, r *http.Request) {
 	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.IsAdmin() {
 		tmdbKey = h.cfg.TMDBApiKey
 	}
-	httpx.JSON(w, http.StatusOK, ServerConfigurationDto{
-		ServerName:                h.cfg.ServerName,
-		IsStartupWizardCompleted:  h.cfg.IsStartupWizardCompleted,
-		TMDBApiKey:                tmdbKey,
-		TMDBLanguage:              h.cfg.TMDBLanguage,
-		EnableSTRM302:             h.cfg.EnableSTRM302,
-		PlayedThreshold:           h.cfg.PlayedThreshold,
-		PreferredMetadataLanguage: "zh",
-		MetadataCountryCode:       "CN",
-		UICulture:                 "zh-cn",
-	})
+	extra := h.loadExtraConfig(r.Context())
+	out := make(map[string]any, len(extra)+9)
+	for k, v := range extra {
+		out[k] = v
+	}
+	out["ServerName"] = h.cfg.ServerName
+	out["IsStartupWizardCompleted"] = h.cfg.IsStartupWizardCompleted
+	if tmdbKey != "" {
+		out["TMDBApiKey"] = tmdbKey
+	} else {
+		delete(out, "TMDBApiKey")
+	}
+	if h.cfg.TMDBLanguage != "" {
+		out["TMDBLanguage"] = h.cfg.TMDBLanguage
+	}
+	out["EnableSTRM302"] = h.cfg.EnableSTRM302
+	out["PlayedThreshold"] = h.cfg.PlayedThreshold
+	out["PreferredMetadataLanguage"] = stringFromMap(extra, "PreferredMetadataLanguage", "zh")
+	out["MetadataCountryCode"] = stringFromMap(extra, "MetadataCountryCode", "CN")
+	out["UICulture"] = stringFromMap(extra, "UICulture", "zh-cn")
+	httpx.JSON(w, http.StatusOK, out)
 }
 
 func (h *Handler) UpdateConfiguration(w http.ResponseWriter, r *http.Request) {
@@ -182,6 +224,30 @@ func (h *Handler) UpdateConfiguration(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "failed to save configuration")
 		return
 	}
+
+	extra := h.loadExtraConfig(r.Context())
+	extraDirty := false
+	for k, v := range body {
+		switch k {
+		case "ServerName", "IsStartupWizardCompleted", "TMDBApiKey", "TMDBLanguage", "EnableSTRM302", "PlayedThreshold":
+			continue
+		case "PreferredMetadataLanguage", "MetadataCountryCode", "UICulture":
+			if s, ok := v.(string); ok {
+				extra[k] = strings.TrimSpace(s)
+				extraDirty = true
+			}
+		default:
+			extra[k] = v
+			extraDirty = true
+		}
+	}
+	if extraDirty {
+		if err := h.saveExtraConfig(r.Context(), extra); err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to save extended configuration")
+			return
+		}
+	}
+
 	if tmdbChanged {
 		h.syncTMDBPlugin()
 	}
@@ -418,39 +484,6 @@ func (h *Handler) GetPlugins(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, h.registry.List())
-}
-
-type ScheduledTaskDto struct {
-	Name        string `json:"Name"`
-	State       string `json:"State"`
-	Id          string `json:"Id"`
-	Description string `json:"Description"`
-	Category    string `json:"Category"`
-	IsHidden    bool   `json:"IsHidden"`
-	Key         string `json:"Key"`
-}
-
-func (h *Handler) GetScheduledTasks(w http.ResponseWriter, _ *http.Request) {
-	httpx.JSON(w, http.StatusOK, []ScheduledTaskDto{
-		{
-			Name:        "Scan media library",
-			State:       "Idle",
-			Id:          "refresh-library",
-			Description: "Scans your media libraries for new and updated files.",
-			Category:    "Library",
-			IsHidden:    false,
-			Key:         "RefreshLibrary",
-		},
-		{
-			Name:        "Clean Cache Directory",
-			State:       "Idle",
-			Id:          "clean-cache",
-			Description: "Deletes temporary transcoding and image cache files.",
-			Category:    "Maintenance",
-			IsHidden:    false,
-			Key:         "CleanCacheDirectory",
-		},
-	})
 }
 
 func (h *Handler) buildPublicInfo(r *http.Request) dto.PublicSystemInfo {

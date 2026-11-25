@@ -173,6 +173,10 @@ func (h *Handler) handleGetConfiguration(w http.ResponseWriter, r *http.Request)
 		"name":     manifest.Name,
 		"enabled":  manifest.Enabled,
 		"priority": manifest.Priority,
+		"Id":       manifest.ID,
+		"Name":     manifest.Name,
+		"Enabled":  manifest.Enabled,
+		"Priority": manifest.Priority,
 	}
 
 	saved, err := h.loadSavedConfig(r.Context(), id)
@@ -181,8 +185,15 @@ func (h *Handler) handleGetConfiguration(w http.ResponseWriter, r *http.Request)
 			out[k] = v
 		}
 	}
-	// Always reflect live manifest enabled state
+	// Always reflect live manifest metadata state
+	out["id"] = manifest.ID
+	out["name"] = manifest.Name
 	out["enabled"] = manifest.Enabled
+	out["priority"] = manifest.Priority
+	out["Id"] = manifest.ID
+	out["Name"] = manifest.Name
+	out["Enabled"] = manifest.Enabled
+	out["Priority"] = manifest.Priority
 	httpx.JSON(w, http.StatusOK, out)
 }
 
@@ -271,12 +282,17 @@ func (h *Handler) handleDeletePlugin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := map[string]any{"enabled": false}
-	if err := p.Configure(cfg); err != nil {
+	merged, err := h.loadSavedConfig(r.Context(), id)
+	if err != nil {
+		merged = map[string]any{}
+	}
+	merged["enabled"] = false
+
+	if err := p.Configure(cloneMap(merged)); err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := h.saveConfig(r.Context(), id, cfg); err != nil {
+	if err := h.saveConfig(r.Context(), id, merged); err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
