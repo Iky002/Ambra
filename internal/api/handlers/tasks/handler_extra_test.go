@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/ambra-media/ambra/internal/core/scheduler"
+	"github.com/ambra-media/ambra/internal/pkg/i18n"
 )
 
 func TestTasksHandlerExtraBranches(t *testing.T) {
@@ -194,5 +195,118 @@ func TestTasksFilteringAndAdminAuth(t *testing.T) {
 	// IsHidden=true&IsEnabled=false -> 0
 	if got := getList("?IsHidden=true&IsEnabled=false"); len(got) != 0 {
 		t.Fatalf("IsHidden=true&IsEnabled=false expected 0, got %+v", got)
+	}
+}
+
+func TestTasksLocalization(t *testing.T) {
+	mgr := scheduler.New(nil)
+	mgr.Register(scheduler.TaskDefinition{
+		ID:          "RefreshLibrary",
+		Key:         "RefreshLibrary",
+		Name:        "扫描媒体库",
+		Description: "默认扫描描述",
+	})
+	mgr.Register(scheduler.TaskDefinition{
+		ID:          "CleanTranscode",
+		Key:         "CleanTranscode",
+		Name:        "清理转码缓存",
+		Description: "默认清理描述",
+	})
+	mgr.Register(scheduler.TaskDefinition{
+		ID:          "OptimizeDatabase",
+		Key:         "OptimizeDatabase",
+		Name:        "优化 SQLite 数据库",
+		Description: "默认优化描述",
+	})
+	mgr.Register(scheduler.TaskDefinition{
+		ID:          "SyncRankings",
+		Key:         "SyncRankings",
+		Name:        "同步热门榜单",
+		Description: "默认榜单描述",
+	})
+	mgr.Register(scheduler.TaskDefinition{
+		ID:          "CustomTask",
+		Key:         "CustomTask",
+		Name:        "Custom Name",
+		Description: "Custom Desc",
+	})
+
+	mux := http.NewServeMux()
+	h := New(mgr)
+	h.RegisterRoutes(mux, AuthFuncs{})
+
+	// Without Accept-Language, default names are preserved
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ScheduledTasks/RefreshLibrary", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /ScheduledTasks/RefreshLibrary status=%d", rec.Code)
+	}
+	var defTask scheduler.TaskInfo
+	_ = json.Unmarshal(rec.Body.Bytes(), &defTask)
+	if defTask.Name != "扫描媒体库" || defTask.Description != "默认扫描描述" {
+		t.Fatalf("expected default task info without Accept-Language, got %+v", defTask)
+	}
+
+	// Verify localization across en-US, ja-JP, zh-TW, th-TH
+	locales := []string{"en-US", "ja-JP", "zh-TW", "th-TH"}
+	expectedByKey := map[string][2]string{
+		"RefreshLibrary":   {"task.scan_library.name", "task.scan_library.desc"},
+		"CleanTranscode":   {"task.clean_transcode.name", "task.clean_transcode.desc"},
+		"OptimizeDatabase": {"task.vacuum_db.name", "task.vacuum_db.desc"},
+		"SyncRankings":     {"task.sync_rankings.name", "task.sync_rankings.desc"},
+	}
+
+	for _, loc := range locales {
+		// GET /ScheduledTasks
+		req := httptest.NewRequest(http.MethodGet, "/ScheduledTasks", nil)
+		req.Header.Set("Accept-Language", loc)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /ScheduledTasks (%s) status=%d", loc, rec.Code)
+		}
+		var list []scheduler.TaskInfo
+		if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+			t.Fatalf("unmarshal list (%s): %v", loc, err)
+		}
+		for _, item := range list {
+			if keys, ok := expectedByKey[item.Key]; ok {
+				if want := i18n.T(loc, keys[0]); item.Name != want {
+					t.Fatalf("locale %s key %s Name = %q, want %q", loc, item.Key, item.Name, want)
+				}
+				if want := i18n.T(loc, keys[1]); item.Description != want {
+					t.Fatalf("locale %s key %s Description = %q, want %q", loc, item.Key, item.Description, want)
+				}
+			} else if item.Key == "CustomTask" {
+				if item.Name != "Custom Name" || item.Description != "Custom Desc" {
+					t.Fatalf("custom task should stay untouched, got %+v", item)
+				}
+			}
+		}
+
+		// GET /ScheduledTasks/{Id}
+		req = httptest.NewRequest(http.MethodGet, "/ScheduledTasks/RefreshLibrary", nil)
+		req.Header.Set("Accept-Language", loc)
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /ScheduledTasks/RefreshLibrary (%s) status=%d", loc, rec.Code)
+		}
+		var single scheduler.TaskInfo
+		if err := json.Unmarshal(rec.Body.Bytes(), &single); err != nil {
+			t.Fatalf("unmarshal single (%s): %v", loc, err)
+		}
+		if want := i18n.T(loc, "task.scan_library.name"); single.Name != want {
+			t.Fatalf("single locale %s Name = %q, want %q", loc, single.Name, want)
+		}
+		if want := i18n.T(loc, "task.scan_library.desc"); single.Description != want {
+			t.Fatalf("single locale %s Description = %q, want %q", loc, single.Description, want)
+		}
+	}
+
+	// Empty Key fallback to Id
+	localized := localizeTaskInfo(scheduler.TaskInfo{Id: "CleanTranscodeCache"}, "en-US")
+	if localized.Name != i18n.T("en-US", "task.clean_transcode.name") {
+		t.Fatalf("expected CleanTranscodeCache fallback to localize, got %+v", localized)
 	}
 }

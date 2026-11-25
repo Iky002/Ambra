@@ -4,6 +4,7 @@ import {
   AlertCircle,
   Camera,
   CheckCircle2,
+  Globe,
   KeyRound,
   Loader2,
   QrCode,
@@ -14,6 +15,8 @@ import {
 } from 'lucide-react'
 import { api, getUserImageUrl } from '../api/client'
 import { useAuth } from '../context/AuthContext'
+import { useI18n } from '../i18n/I18nContext'
+import { SUPPORTED_LOCALES } from '../i18n/types'
 import {
   loadPlaybackPrefs,
   savePlaybackPrefs,
@@ -41,6 +44,7 @@ const SUBTITLE_LANG_OPTIONS = [
 
 export function ProfilePage() {
   const { auth, user, isAdmin, refreshUser } = useAuth()
+  const { locale, setLocale, t } = useI18n()
   const userId = auth?.userId || ''
   const fileInputRef = useRef<HTMLInputElement>(null)
 
@@ -191,7 +195,7 @@ export function ProfilePage() {
       <div className="border-b border-white/8 pb-5">
         <h1 className="flex items-center gap-2.5 text-2xl font-bold tracking-tight text-white">
           <UserIcon className="h-6 w-6 text-amber-400" />
-          <span>个人中心</span>
+          <span>{t('profile.title')}</span>
         </h1>
         <p className="mt-1 text-xs text-zinc-400">
           管理您的账号头像、登录密码与本机播放器偏好设置
@@ -233,7 +237,7 @@ export function ProfilePage() {
                   }`}
                 >
                   {isAdmin && <ShieldCheck className="h-3 w-3" />}
-                  {isAdmin ? '管理员' : '普通成员'}
+                  {isAdmin ? t('nav.roleAdmin') : t('nav.roleMember')}
                 </span>
               </div>
               <p className="mt-1 text-xs text-zinc-400">
@@ -290,12 +294,43 @@ export function ProfilePage() {
         </div>
       </section>
 
+      {/* 界面语言设置 */}
+      <section className="rounded-2xl border border-white/10 bg-zinc-950/70 p-6 backdrop-blur-md">
+        <div className="mb-1.5 flex items-center gap-2">
+          <Globe className="h-4 w-4 text-amber-400" />
+          <h2 className="text-base font-semibold text-white">{t('profile.uiLanguage')}</h2>
+        </div>
+        <p className="mb-4 text-xs text-zinc-400">{t('profile.uiLanguageDesc')}</p>
+        <div className="flex flex-wrap gap-2" role="radiogroup" aria-label={t('profile.uiLanguage')}>
+          {SUPPORTED_LOCALES.map((item) => {
+            const active = item.code === locale
+            return (
+              <button
+                key={item.code}
+                type="button"
+                role="radio"
+                aria-checked={active}
+                onClick={() => setLocale(item.code)}
+                className={`inline-flex items-center gap-2 rounded-xl border px-3.5 py-2 text-xs font-medium transition-colors ${
+                  active
+                    ? 'border-amber-400/60 bg-amber-500/20 text-amber-200 ring-1 ring-amber-400/30'
+                    : 'border-white/10 bg-white/[0.03] text-zinc-300 hover:border-white/20 hover:bg-white/[0.07] hover:text-zinc-100'
+                }`}
+              >
+                <span>{item.nativeName}</span>
+                <span className="text-[10px] text-zinc-500">{item.code}</span>
+              </button>
+            )
+          })}
+        </div>
+      </section>
+
       <div className="grid gap-6 md:grid-cols-2">
         {/* 修改密码 */}
         <section className="rounded-2xl border border-white/10 bg-zinc-950/70 p-6 backdrop-blur-md">
           <div className="mb-4 flex items-center gap-2">
             <KeyRound className="h-4 w-4 text-amber-400" />
-            <h2 className="text-base font-semibold text-white">修改密码</h2>
+            <h2 className="text-base font-semibold text-white">{t('profile.changePassword')}</h2>
           </div>
 
           <form onSubmit={handlePasswordSubmit} className="space-y-4">
@@ -354,7 +389,7 @@ export function ProfilePage() {
         <section className="rounded-2xl border border-white/10 bg-zinc-950/70 p-6 backdrop-blur-md">
           <div className="mb-4 flex items-center gap-2">
             <Sliders className="h-4 w-4 text-amber-400" />
-            <h2 className="text-base font-semibold text-white">播放偏好设置</h2>
+            <h2 className="text-base font-semibold text-white">{t('profile.playbackPrefs')}</h2>
           </div>
 
           <div className="space-y-5">
@@ -422,7 +457,9 @@ export function ProfilePage() {
       <section className="rounded-2xl border border-white/10 bg-zinc-950/70 p-6 backdrop-blur-md">
         <div className="mb-4 flex items-center gap-2">
           <QrCode className="h-4 w-4 text-amber-400" />
-          <h2 className="text-base font-semibold text-white">Quick Connect 授权新设备</h2>
+          <h2 className="text-base font-semibold text-white">
+            {locale === 'zh-CN' ? 'Quick Connect 授权新设备' : t('profile.quickConnect')}
+          </h2>
         </div>
         <p className="mb-4 text-xs text-zinc-400">
           在电视、移动端或其他浏览器登录界面点击「Quick Connect 授权码登录」，将屏幕上显示的 6

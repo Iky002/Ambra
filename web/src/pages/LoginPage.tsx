@@ -20,11 +20,14 @@ import { Navigate, useNavigate } from 'react-router-dom'
 import { api, embyFetch, getUserImageUrl } from '../api/client'
 import type { QuickConnectResult } from '../api/types'
 import { AmbraLogo } from '../components/AmbraLogo'
+import { LanguageSwitcher } from '../components/LanguageSwitcher'
 import { useAuth } from '../context/AuthContext'
 import { isDemoMode } from '../demo/demoMode'
+import { useI18n } from '../i18n/I18nContext'
 
 export function LoginPage() {
   const { login, applyAuthResult } = useAuth()
+  const { locale, t } = useI18n()
   const navigate = useNavigate()
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
@@ -325,6 +328,11 @@ export function LoginPage() {
 
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#07070b] px-4 py-10">
+      {/* 右上角语言切换 */}
+      <div className="absolute right-4 top-4 z-20 sm:right-6 sm:top-6">
+        <LanguageSwitcher />
+      </div>
+
       {/* 影院氛围背景光晕 */}
       <div className="pointer-events-none absolute -left-32 -top-32 h-96 w-96 rounded-full bg-amber-500/15 blur-[130px]" />
       <div className="pointer-events-none absolute -bottom-32 -right-32 h-96 w-96 rounded-full bg-orange-600/15 blur-[130px]" />
@@ -396,7 +404,9 @@ export function LoginPage() {
         >
           <div className="space-y-4">
             <div>
-              <label className="mb-1.5 block text-xs font-medium text-zinc-400">用户名</label>
+              <label className="mb-1.5 block text-xs font-medium text-zinc-400">
+                {t('auth.username')}
+              </label>
               <div className="relative">
                 <User className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500" />
                 <input
@@ -404,14 +414,16 @@ export function LoginPage() {
                   autoComplete="username"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
-                  placeholder="输入用户名"
+                  placeholder={locale === 'zh-CN' ? '输入用户名' : t('auth.username')}
                   className="w-full rounded-xl border border-white/10 bg-white/[0.04] py-2.5 pl-10 pr-4 text-sm text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-amber-400/60 focus:bg-white/[0.06]"
                 />
               </div>
             </div>
 
             <div>
-              <label className="mb-1.5 block text-xs font-medium text-zinc-400">密码</label>
+              <label className="mb-1.5 block text-xs font-medium text-zinc-400">
+                {t('auth.password')}
+              </label>
               <div className="relative">
                 <Lock className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500" />
                 <input
@@ -419,7 +431,7 @@ export function LoginPage() {
                   autoComplete="current-password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  placeholder="留空表示无密码账号"
+                  placeholder={locale === 'zh-CN' ? '留空表示无密码账号' : t('auth.password')}
                   className="w-full rounded-xl border border-white/10 bg-white/[0.04] py-2.5 pl-10 pr-4 text-sm text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-amber-400/60 focus:bg-white/[0.06]"
                 />
               </div>
@@ -447,11 +459,11 @@ export function LoginPage() {
               {submitting ? (
                 <>
                   <Loader2 className="h-4 w-4 animate-spin" />
-                  <span>正在连接影院...</span>
+                  <span>{locale === 'zh-CN' ? '正在连接影院...' : t('auth.signingIn')}</span>
                 </>
               ) : (
                 <>
-                  <span>登录 Ambra</span>
+                  <span>{t('auth.loginTitle')}</span>
                   <ArrowRight className="h-4 w-4" />
                 </>
               )}
@@ -469,7 +481,7 @@ export function LoginPage() {
               className="flex w-full items-center justify-center gap-2 rounded-xl border border-amber-400/30 bg-amber-500/10 py-2.5 text-sm font-semibold text-amber-200 transition-colors hover:border-amber-400/50 hover:bg-amber-500/20 disabled:opacity-60"
             >
               <QrCode className="h-4 w-4 text-amber-300" />
-              <span>Quick Connect 授权码登录</span>
+              <span>{locale === 'zh-CN' ? 'Quick Connect 授权码登录' : t('auth.quickConnect')}</span>
             </button>
           </div>
         )}
@@ -482,7 +494,7 @@ export function LoginPage() {
             className="inline-flex items-center gap-1.5 text-xs font-medium text-zinc-400 transition-colors hover:text-amber-300"
           >
             <KeyRound className="h-3.5 w-3.5" />
-            <span>忘记密码？</span>
+            <span>{locale === 'zh-CN' ? `${t('auth.forgotPassword')}？` : t('auth.forgotPassword')}</span>
           </button>
         </div>
 

@@ -406,6 +406,8 @@ func (h *Handler) GetCultures(w http.ResponseWriter, _ *http.Request) {
 		{Name: "French", DisplayName: "Français", TwoLetterISOLanguageName: "fr", ThreeLetterISOLanguageName: "fra", ThreeLetterISOLanguageNames: []string{"fra", "fre"}},
 		{Name: "German", DisplayName: "Deutsch", TwoLetterISOLanguageName: "de", ThreeLetterISOLanguageName: "deu", ThreeLetterISOLanguageNames: []string{"deu", "ger"}},
 		{Name: "Spanish", DisplayName: "Español", TwoLetterISOLanguageName: "es", ThreeLetterISOLanguageName: "spa", ThreeLetterISOLanguageNames: []string{"spa"}},
+		{Name: "Portuguese", DisplayName: "Português", TwoLetterISOLanguageName: "pt", ThreeLetterISOLanguageName: "por", ThreeLetterISOLanguageNames: []string{"por"}},
+		{Name: "Thai", DisplayName: "ไทย", TwoLetterISOLanguageName: "th", ThreeLetterISOLanguageName: "tha", ThreeLetterISOLanguageNames: []string{"tha"}},
 	})
 }
 
@@ -426,6 +428,11 @@ func (h *Handler) GetCountries(w http.ResponseWriter, _ *http.Request) {
 		{Name: "GB", DisplayName: "United Kingdom", EnglishName: "United Kingdom", TwoLetterISORegionName: "GB", ThreeLetterISORegionName: "GBR"},
 		{Name: "JP", DisplayName: "日本", EnglishName: "Japan", TwoLetterISORegionName: "JP", ThreeLetterISORegionName: "JPN"},
 		{Name: "KR", DisplayName: "대한민국", EnglishName: "South Korea", TwoLetterISORegionName: "KR", ThreeLetterISORegionName: "KOR"},
+		{Name: "ES", DisplayName: "España", EnglishName: "Spain", TwoLetterISORegionName: "ES", ThreeLetterISORegionName: "ESP"},
+		{Name: "DE", DisplayName: "Deutschland", EnglishName: "Germany", TwoLetterISORegionName: "DE", ThreeLetterISORegionName: "DEU"},
+		{Name: "FR", DisplayName: "France", EnglishName: "France", TwoLetterISORegionName: "FR", ThreeLetterISORegionName: "FRA"},
+		{Name: "BR", DisplayName: "Brasil", EnglishName: "Brazil", TwoLetterISORegionName: "BR", ThreeLetterISORegionName: "BRA"},
+		{Name: "TH", DisplayName: "ประเทศไทย", EnglishName: "Thailand", TwoLetterISORegionName: "TH", ThreeLetterISORegionName: "THA"},
 	})
 }
 
@@ -436,11 +443,16 @@ type LocalizationOptionDto struct {
 
 func (h *Handler) GetLocalizationOptions(w http.ResponseWriter, _ *http.Request) {
 	httpx.JSON(w, http.StatusOK, []LocalizationOptionDto{
-		{Name: "Chinese (Simplified)", Value: "zh-cn"},
-		{Name: "Chinese (Traditional)", Value: "zh-tw"},
-		{Name: "English (US)", Value: "en-us"},
-		{Name: "Japanese", Value: "ja"},
-		{Name: "Korean", Value: "ko"},
+		{Name: "Chinese (Simplified)", Value: "zh-CN"},
+		{Name: "Chinese (Traditional)", Value: "zh-TW"},
+		{Name: "English (US)", Value: "en-US"},
+		{Name: "Japanese", Value: "ja-JP"},
+		{Name: "Korean", Value: "ko-KR"},
+		{Name: "Spanish", Value: "es-ES"},
+		{Name: "German", Value: "de-DE"},
+		{Name: "French", Value: "fr-FR"},
+		{Name: "Portuguese (Brazil)", Value: "pt-BR"},
+		{Name: "Thai", Value: "th-TH"},
 	})
 }
 

@@ -422,3 +422,74 @@ func TestSystemConfigurationPersistenceAndExtraFields(t *testing.T) {
 		t.Fatalf("extra config fields not persisted: %#v", got)
 	}
 }
+
+func TestLocalizationEndpoints10Locales(t *testing.T) {
+	r, _, _, _, _, _ := setupSystemHandler(t)
+
+	// 1. /Localization/Cultures must include pt/por and th/tha
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Localization/Cultures", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /Localization/Cultures status=%d", rec.Code)
+	}
+	var cultures []CultureDto
+	if err := json.Unmarshal(rec.Body.Bytes(), &cultures); err != nil {
+		t.Fatalf("unmarshal cultures: %v", err)
+	}
+	cultureMap := make(map[string]string, len(cultures))
+	for _, c := range cultures {
+		cultureMap[c.TwoLetterISOLanguageName] = c.ThreeLetterISOLanguageName
+	}
+	for two, three := range map[string]string{
+		"zh": "zho", "en": "eng", "ja": "jpn", "ko": "kor",
+		"fr": "fra", "de": "deu", "es": "spa", "pt": "por", "th": "tha",
+	} {
+		if cultureMap[two] != three {
+			t.Fatalf("expected culture %s -> %s, got %q", two, three, cultureMap[two])
+		}
+	}
+
+	// 2. /Localization/Countries must include ES, DE, FR, BR, TH
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Localization/Countries", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /Localization/Countries status=%d", rec.Code)
+	}
+	var countries []CountryInfoDto
+	if err := json.Unmarshal(rec.Body.Bytes(), &countries); err != nil {
+		t.Fatalf("unmarshal countries: %v", err)
+	}
+	countrySet := make(map[string]bool, len(countries))
+	for _, c := range countries {
+		countrySet[c.TwoLetterISORegionName] = true
+	}
+	for _, code := range []string{"CN", "HK", "TW", "US", "GB", "JP", "KR", "ES", "DE", "FR", "BR", "TH"} {
+		if !countrySet[code] {
+			t.Fatalf("expected country %s in /Localization/Countries", code)
+		}
+	}
+
+	// 3. /Localization/Options must return all 10 canonical UI locales
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Localization/Options", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /Localization/Options status=%d", rec.Code)
+	}
+	var opts []LocalizationOptionDto
+	if err := json.Unmarshal(rec.Body.Bytes(), &opts); err != nil {
+		t.Fatalf("unmarshal options: %v", err)
+	}
+	wantLocales := []string{"zh-CN", "zh-TW", "en-US", "ja-JP", "ko-KR", "es-ES", "de-DE", "fr-FR", "pt-BR", "th-TH"}
+	if len(opts) != len(wantLocales) {
+		t.Fatalf("expected %d localization options, got %d: %+v", len(wantLocales), len(opts), opts)
+	}
+	optSet := make(map[string]bool, len(opts))
+	for _, o := range opts {
+		optSet[o.Value] = true
+	}
+	for _, loc := range wantLocales {
+		if !optSet[loc] {
+			t.Fatalf("missing locale %s in /Localization/Options", loc)
+		}
+	}
+}

@@ -1,6 +1,7 @@
 import React, { useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { AlertCircle, CheckCircle2, X } from 'lucide-react'
+import { getActiveLocale } from '../../i18n/I18nContext'
 
 function isZeroDate(d: Date): boolean {
   return d.getUTCFullYear() <= 1970
@@ -11,7 +12,7 @@ export function formatDateTime(iso?: string): string {
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return iso
   if (isZeroDate(d)) return '-'
-  return d.toLocaleString('zh-CN', {
+  return d.toLocaleString(getActiveLocale(), {
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',

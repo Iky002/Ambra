@@ -7,20 +7,27 @@ import type { BaseItemDto } from '../api/types'
 import { MediaCard } from '../components/MediaCard'
 import { QueryErrorState } from '../components/QueryErrorState'
 import { useAuth } from '../context/AuthContext'
+import { useI18n } from '../i18n/I18nContext'
 
 type SearchTypeFilter = 'all' | 'Movie' | 'Series' | 'Music' | 'Person' | 'BoxSet'
 
-const TYPE_PILLS: Array<{ id: SearchTypeFilter; label: string; includeItemTypes: string }> = [
+const TYPE_PILLS: Array<{
+  id: SearchTypeFilter
+  label: string
+  labelKey?: string
+  includeItemTypes: string
+}> = [
   {
     id: 'all',
     label: '全部',
+    labelKey: 'common.all',
     includeItemTypes: 'Movie,Series,Episode,BoxSet,Person,MusicArtist,MusicAlbum,Audio,Playlist',
   },
   { id: 'Movie', label: '电影', includeItemTypes: 'Movie' },
   { id: 'Series', label: '剧集', includeItemTypes: 'Series,Episode' },
   { id: 'Music', label: '音乐', includeItemTypes: 'MusicAlbum,MusicArtist,Audio' },
-  { id: 'Person', label: '演职员', includeItemTypes: 'Person' },
-  { id: 'BoxSet', label: '合集', includeItemTypes: 'BoxSet' },
+  { id: 'Person', label: '演职员', labelKey: 'detail.castAndCrew', includeItemTypes: 'Person' },
+  { id: 'BoxSet', label: '合集', labelKey: 'collections.boxSets', includeItemTypes: 'BoxSet' },
 ]
 
 function resolveSearchItemLink(item: BaseItemDto): string | undefined {
@@ -35,6 +42,7 @@ function resolveSearchItemLink(item: BaseItemDto): string | undefined {
 
 export function SearchPage() {
   const { auth } = useAuth()
+  const { locale, t } = useI18n()
   const [searchParams, setSearchParams] = useSearchParams()
   const urlQuery = searchParams.get('q') || ''
   const [input, setInput] = useState(urlQuery)
@@ -80,7 +88,7 @@ export function SearchPage() {
   return (
     <div className="space-y-6 px-4 pt-6 lg:px-8">
       <div className="max-w-2xl space-y-4">
-        <h1 className="text-2xl font-bold text-white">探索与搜索</h1>
+        <h1 className="text-2xl font-bold text-white">{t('search.title')}</h1>
         <div className="relative">
           <Search className="pointer-events-none absolute left-4 top-1/2 h-5 w-5 -translate-y-1/2 text-amber-400" />
           <input
@@ -88,7 +96,11 @@ export function SearchPage() {
             autoFocus
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="输入片名、原名、演职员、合集或乱序关键词..."
+            placeholder={
+              locale === 'zh-CN'
+                ? '输入片名、原名、演职员、合集或乱序关键词...'
+                : t('search.placeholder')
+            }
             className="w-full rounded-2xl border border-white/12 bg-white/[0.05] py-3.5 pl-12 pr-4 text-base text-zinc-100 placeholder-zinc-500 outline-none transition-all focus:border-amber-400/60 focus:bg-white/[0.08]"
           />
         </div>
@@ -108,7 +120,7 @@ export function SearchPage() {
                     : 'border border-white/10 bg-white/[0.04] text-zinc-300 hover:bg-white/10 hover:text-white'
                 }`}
               >
-                {pill.label}
+                {pill.labelKey ? t(pill.labelKey) : pill.label}
               </button>
             )
           })}
@@ -132,7 +144,7 @@ export function SearchPage() {
         />
       ) : items.length === 0 ? (
         <div className="rounded-2xl border border-white/6 bg-white/[0.02] py-16 text-center text-sm text-zinc-500">
-          未找到与 “{debounced}” 相关的结果
+          {t('search.noResults')}
         </div>
       ) : (
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">

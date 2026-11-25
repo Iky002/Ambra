@@ -15,6 +15,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/pkg/i18n"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -186,6 +187,11 @@ func (h *Handler) handleListByUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	isReadFilter := q.Bool("IsRead")
+	acceptLang := strings.TrimSpace(r.Header.Get("Accept-Language"))
+	locale := ""
+	if acceptLang != "" {
+		locale = i18n.ResolveLocale(acceptLang, "")
+	}
 
 	h.mu.RLock()
 	matched := make([]Notification, 0, len(h.state.Items))
@@ -199,6 +205,9 @@ func (h *Handler) handleListByUser(w http.ResponseWriter, r *http.Request) {
 			if len(n.ReadBy) > 0 {
 				item.ReadBy = append([]string(nil), n.ReadBy...)
 			}
+			if locale != "" {
+				item = localizeNotification(item, locale)
+			}
 			matched = append(matched, item)
 		}
 	}
@@ -209,6 +218,30 @@ func (h *Handler) handleListByUser(w http.ResponseWriter, r *http.Request) {
 		Notifications:    page,
 		TotalRecordCount: total,
 	})
+}
+
+func localizeNotification(n Notification, locale string) Notification {
+	switch n.Name {
+	case "Library Updated", "notif.library_updated.name":
+		n.Name = i18n.T(locale, "notif.library_updated.name")
+		if n.Description == "" || n.Description == "Media library scan completed" || n.Description == "notif.library_updated.desc" {
+			n.Description = i18n.T(locale, "notif.library_updated.desc")
+		}
+	case "Scheduled Task Failed", "Task Failed", "notif.task_failed.name":
+		n.Name = i18n.T(locale, "notif.task_failed.name")
+		if n.Description == "" || n.Description == "Scheduled Task failed" || n.Description == "notif.task_failed.desc" {
+			n.Description = i18n.T(locale, "notif.task_failed.desc")
+		}
+	default:
+		if n.UserId == "" && strings.EqualFold(n.Level, "Error") && strings.HasSuffix(n.Name, " Failed") {
+			prefix := strings.TrimSuffix(n.Name, " Failed")
+			n.Name = i18n.T(locale, "notif.task_failed.name") + " (" + prefix + ")"
+			if n.Description == "" || n.Description == prefix+" failed" || n.Description == "notif.task_failed.desc" {
+				n.Description = i18n.T(locale, "notif.task_failed.desc")
+			}
+		}
+	}
+	return n
 }
 
 func (h *Handler) handleSummary(w http.ResponseWriter, r *http.Request) {
