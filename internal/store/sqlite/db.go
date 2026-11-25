@@ -3,14 +3,35 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"embed"
 	"fmt"
 	"runtime"
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite"
 )
+
+func init() {
+	sqlite3.MustRegisterDeterministicScalarFunction(
+		"pinyin_sort_key",
+		1,
+		func(_ *sqlite3.FunctionContext, args []driver.Value) (driver.Value, error) {
+			if len(args) == 0 || args[0] == nil {
+				return "", nil
+			}
+			switch v := args[0].(type) {
+			case string:
+				return PinyinSortKey(v), nil
+			case []byte:
+				return PinyinSortKey(string(v)), nil
+			default:
+				return PinyinSortKey(fmt.Sprint(v)), nil
+			}
+		},
+	)
+}
 
 //go:embed migrations/*.sql
 var migrationsFS embed.FS

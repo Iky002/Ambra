@@ -1091,15 +1091,15 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 	}
 	if prefix := strings.TrimSpace(f.NameStartsWith); prefix != "" {
 		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(strings.ToLower(prefix))
-		where = append(where, `lower(i.sort_name) LIKE ? ESCAPE '\'`)
-		args = append(args, escaped+"%")
+		where = append(where, `(lower(i.sort_name) LIKE ? ESCAPE '\' OR pinyin_sort_key(COALESCE(NULLIF(i.sort_name, ''), i.name)) LIKE ? ESCAPE '\' OR pinyin_sort_key(i.name) LIKE ? ESCAPE '\')`)
+		args = append(args, escaped+"%", escaped+"%", escaped+"%")
 	}
 	if gte := strings.TrimSpace(f.NameStartsWithOrGreater); gte != "" {
-		where = append(where, `lower(i.sort_name) >= lower(?)`)
+		where = append(where, `pinyin_sort_key(COALESCE(NULLIF(i.sort_name, ''), i.name)) >= lower(?)`)
 		args = append(args, gte)
 	}
 	if lt := strings.TrimSpace(f.NameLessThan); lt != "" {
-		where = append(where, `lower(i.sort_name) < lower(?)`)
+		where = append(where, `pinyin_sort_key(COALESCE(NULLIF(i.sort_name, ''), i.name)) < lower(?)`)
 		args = append(args, lt)
 	}
 
@@ -3136,13 +3136,13 @@ func buildOrderBy(sortBy []string, sortOrder string, ftsActive, hasUser bool) st
 		if ftsActive {
 			return `ORDER BY bm25(item_search_fts, 0, 10.0, 5.0, 3.0, 2.0, 1.0) ASC`
 		}
-		return `ORDER BY i.sort_name ` + dir
+		return `ORDER BY pinyin_sort_key(COALESCE(NULLIF(i.sort_name, ''), i.name)) ` + dir
 	}
 	var parts []string
 	for _, s := range sortBy {
 		switch strings.ToLower(strings.TrimSpace(s)) {
 		case "sortname", "name":
-			parts = append(parts, "i.sort_name "+dir)
+			parts = append(parts, "pinyin_sort_key(COALESCE(NULLIF(i.sort_name, ''), i.name)) "+dir)
 		case "datecreated":
 			parts = append(parts, "i.date_created "+dir)
 		case "premieredate", "productionyear":
