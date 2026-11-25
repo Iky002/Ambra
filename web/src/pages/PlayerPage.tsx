@@ -227,7 +227,7 @@ export function PlayerPage() {
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
   const { auth } = useAuth()
-  const { t } = useI18n()
+  const { locale, t } = useI18n()
   const { subscribePlaystate } = useWebSocket()
   const audioPlayer = useAudioPlayer()
   const userId = auth!.userId
@@ -269,6 +269,7 @@ export function PlayerPage() {
   const initialSeekDoneRef = useRef(false)
   const initializedAudioSourceIdRef = useRef<string | null>(null)
   const initializedSubSourceIdRef = useRef<string | null>(null)
+  const subtitleExplicitlyOffRef = useRef<boolean>(rawInitialSubtitle === 'off')
   const lastSeekReportRef = useRef(0)
   const resumeSecRef = useRef<number | null>(null)
   const hlsRecoveryCountRef = useRef(0)
@@ -373,6 +374,7 @@ export function PlayerPage() {
         nextSubRaw && nextSubRaw !== 'off' && Number.isFinite(Number(nextSubRaw))
           ? Number(nextSubRaw)
           : undefined
+      subtitleExplicitlyOffRef.current = nextSubRaw === 'off'
       setSelectedSourceId(nextSourceId)
       setQuerySourceId(nextSourceId)
       setAudioIndex(nextAudio)
@@ -543,8 +545,9 @@ export function PlayerPage() {
       audioStreams,
       prefs.preferredAudioLang,
       activeSource.DefaultAudioStreamIndex,
+      locale,
     )
-  }, [audioIndex, activeSource, episodeIdSynced, id, audioStreams])
+  }, [audioIndex, activeSource, episodeIdSynced, id, audioStreams, locale])
 
   // 初始化默认音轨与字幕轨（优先用户偏好语言，其次服务端默认；每个媒体源仅初始化一次，避免用户关闭字幕后回弹）
   useEffect(() => {
@@ -558,6 +561,7 @@ export function PlayerPage() {
           audioStreams,
           prefs.preferredAudioLang,
           activeSource.DefaultAudioStreamIndex,
+          locale,
         )
         if (pickedAudio !== undefined) {
           setAudioIndex(pickedAudio)
@@ -570,15 +574,22 @@ export function PlayerPage() {
     if (initializedSubSourceIdRef.current !== activeSource.Id) {
       initializedSubSourceIdRef.current = activeSource.Id
       if (searchParamsRef.current.get('subtitle') === 'off') {
+        subtitleExplicitlyOffRef.current = true
         setSubtitleIndex(undefined)
       } else if (subtitleIndex === undefined) {
         const pickedSub = pickPreferredSubtitleIndex(
           subtitleStreams,
           prefs.preferredSubtitleLang,
           activeSource.DefaultSubtitleStreamIndex,
+          locale,
+          prefs.subtitleMode,
         )
         if (pickedSub !== undefined) {
+          subtitleExplicitlyOffRef.current = false
           setSubtitleIndex(pickedSub)
+        } else {
+          subtitleExplicitlyOffRef.current =
+            prefs.preferredSubtitleLang === 'off' || prefs.subtitleMode === 'None'
         }
       }
     }
@@ -591,6 +602,7 @@ export function PlayerPage() {
     subtitleIndex,
     audioStreams,
     subtitleStreams,
+    locale,
   ])
 
   // 计算生效的起播位置（优先 URL startTicks，否则从 item.UserData.PlaybackPositionTicks 自动续播）
@@ -1356,6 +1368,12 @@ export function PlayerPage() {
       ) {
         posTicks = latestStartTicks
       }
+      const reportedSubIndex =
+        latestSubtitleIndex !== undefined
+          ? latestSubtitleIndex
+          : subtitleExplicitlyOffRef.current
+            ? -1
+            : undefined
       const base = {
         ItemId: id,
         MediaSourceId: latestMediaSourceId,
@@ -1363,7 +1381,11 @@ export function PlayerPage() {
         PositionTicks: posTicks,
       }
       if (type === 'stop') {
-        void api.reportStopped(base)
+        void api.reportStopped({
+          ...base,
+          AudioStreamIndex: latestAudioIndex,
+          SubtitleStreamIndex: reportedSubIndex,
+        })
         return
       }
       const full = {
@@ -1372,7 +1394,7 @@ export function PlayerPage() {
         IsMuted: videoRef.current.muted,
         VolumeLevel: Math.round(videoRef.current.volume * 100),
         AudioStreamIndex: latestAudioIndex,
-        SubtitleStreamIndex: latestSubtitleIndex,
+        SubtitleStreamIndex: reportedSubIndex,
         PlayMethod:
           latestPlayMethod === 'Server HLS'
             ? 'Transcode'
@@ -1416,10 +1438,18 @@ export function PlayerPage() {
       const token = storedAuth?.accessToken
       if (!token) return
       const {
+        audioIndex: latestAudioIndex,
+        subtitleIndex: latestSubtitleIndex,
         mediaSourceId: latestMediaSourceId,
         playSessionId: latestPlaySessionId,
         effectiveStartTicks: latestStartTicks,
       } = playbackMetaRef.current
+      const reportedSubIndex =
+        latestSubtitleIndex !== undefined
+          ? latestSubtitleIndex
+          : subtitleExplicitlyOffRef.current
+            ? -1
+            : undefined
       let posTicks = Math.floor(videoRef.current.currentTime * 10_000_000)
       if (!initialSeekDoneRef.current && latestStartTicks > 0 && videoRef.current.currentTime < 1) {
         posTicks = latestStartTicks
@@ -1439,6 +1469,8 @@ export function PlayerPage() {
             MediaSourceId: latestMediaSourceId,
             PlaySessionId: latestPlaySessionId,
             PositionTicks: posTicks,
+            AudioStreamIndex: latestAudioIndex,
+            SubtitleStreamIndex: reportedSubIndex,
           }),
           keepalive: true,
         })
@@ -2518,9 +2550,22 @@ export function PlayerPage() {
                                 nextAudioList,
                                 prefs.preferredAudioLang,
                                 src.DefaultAudioStreamIndex,
+                                locale,
                               )
-                              initializedAudioSourceIdRef.current = null
-                              initializedSubSourceIdRef.current = null
+                              const nextSubList = nextStreams.filter((s) => s.Type === 'Subtitle')
+                              const nextSub = pickPreferredSubtitleIndex(
+                                nextSubList,
+                                prefs.preferredSubtitleLang,
+                                src.DefaultSubtitleStreamIndex,
+                                locale,
+                                prefs.subtitleMode,
+                              )
+                              initializedAudioSourceIdRef.current = src.Id
+                              initializedSubSourceIdRef.current = src.Id
+                              subtitleExplicitlyOffRef.current =
+                                nextSub === undefined &&
+                                (prefs.preferredSubtitleLang === 'off' ||
+                                  prefs.subtitleMode === 'None')
                               setUseProxyDirect(false)
                               setForceServerHls(false)
                               setWasmFallbackNotice(null)
@@ -2532,7 +2577,7 @@ export function PlayerPage() {
                                   ? nextAudio
                                   : undefined,
                               )
-                              setSubtitleIndex(undefined)
+                              setSubtitleIndex(nextSub)
                             }
                             setActivePanel('none')
                             pokeOsd()
@@ -2638,6 +2683,8 @@ export function PlayerPage() {
                               setWasmFallbackNotice(null)
                               setAudioIndex(a.Index)
                               setQueryAudioIndex(a.Index)
+                              playbackMetaRef.current.audioIndex = a.Index
+                              reportState('progress', 'AudioTrackChange')
                             }
                             setActivePanel('none')
                           }}
@@ -2683,7 +2730,10 @@ export function PlayerPage() {
                     <button
                       type="button"
                       onClick={() => {
+                        subtitleExplicitlyOffRef.current = true
                         setSubtitleIndex(undefined)
+                        playbackMetaRef.current.subtitleIndex = undefined
+                        reportState('progress', 'SubtitleTrackChange')
                         setActivePanel('none')
                       }}
                       className={`flex w-full items-center justify-between rounded-xl px-2.5 py-2 text-left text-xs transition-colors ${
@@ -2701,7 +2751,10 @@ export function PlayerPage() {
                           key={s.Index}
                           type="button"
                           onClick={() => {
+                            subtitleExplicitlyOffRef.current = false
                             setSubtitleIndex(s.Index)
+                            playbackMetaRef.current.subtitleIndex = s.Index
+                            reportState('progress', 'SubtitleTrackChange')
                             setActivePanel('none')
                           }}
                           className={`flex w-full items-center justify-between gap-2 rounded-xl px-2.5 py-2 text-left text-xs transition-colors ${

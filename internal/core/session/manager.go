@@ -61,11 +61,13 @@ type PlaybackProgressRequest struct {
 }
 
 type PlaybackStoppedRequest struct {
-	ItemId        string `json:"ItemId"`
-	MediaSourceId string `json:"MediaSourceId"`
-	PlaySessionId string `json:"PlaySessionId"`
-	PositionTicks int64  `json:"PositionTicks"`
-	RuntimeTicks  int64  `json:"RuntimeTicks,omitempty"`
+	ItemId              string `json:"ItemId"`
+	MediaSourceId       string `json:"MediaSourceId"`
+	PlaySessionId       string `json:"PlaySessionId"`
+	PositionTicks       int64  `json:"PositionTicks"`
+	RuntimeTicks        int64  `json:"RuntimeTicks,omitempty"`
+	AudioStreamIndex    *int   `json:"AudioStreamIndex,omitempty"`
+	SubtitleStreamIndex *int   `json:"SubtitleStreamIndex,omitempty"`
 }
 
 type CapabilitiesRequest struct {
@@ -547,7 +549,10 @@ func (m *Manager) ReportPlaybackProgress(ctx context.Context, user *sqlite.UserR
 
 	pauseChanged := entry.lastPausedState != req.IsPaused
 	entry.lastPausedState = req.IsPaused
-	if pauseChanged || now.Sub(entry.lastPersistAt) >= progressPersistWindow {
+	audioChanged := req.AudioStreamIndex != nil && (entry.info.PlayState.AudioStreamIndex == nil || *entry.info.PlayState.AudioStreamIndex != *req.AudioStreamIndex)
+	subChanged := req.SubtitleStreamIndex != nil && (entry.info.PlayState.SubtitleStreamIndex == nil || *entry.info.PlayState.SubtitleStreamIndex != *req.SubtitleStreamIndex)
+	trackEvent := req.EventName == "AudioTrackChange" || req.EventName == "SubtitleTrackChange"
+	if pauseChanged || audioChanged || subChanged || trackEvent || now.Sub(entry.lastPersistAt) >= progressPersistWindow {
 		shouldPersist = true
 		entry.lastPersistAt = now
 	}
@@ -642,7 +647,13 @@ func (m *Manager) ReportPlaybackStopped(ctx context.Context, user *sqlite.UserRe
 		nowPlayingRuntime = *entry.info.NowPlayingItem.RunTimeTicks
 	}
 	audioIdx = entry.info.PlayState.AudioStreamIndex
+	if req.AudioStreamIndex != nil {
+		audioIdx = req.AudioStreamIndex
+	}
 	subIdx = entry.info.PlayState.SubtitleStreamIndex
+	if req.SubtitleStreamIndex != nil {
+		subIdx = req.SubtitleStreamIndex
+	}
 
 	entry.info.NowPlayingItem = nil
 	entry.info.PlayState = dto.PlayerStateInfo{

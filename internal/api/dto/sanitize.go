@@ -1,5 +1,12 @@
 package dto
 
+import "strings"
+
+func isRemoteHTTPPath(path string) bool {
+	lp := strings.ToLower(strings.TrimSpace(path))
+	return strings.HasPrefix(lp, "http://") || strings.HasPrefix(lp, "https://")
+}
+
 // SanitizeMediaStreams clears server filesystem paths from MediaStream entries
 // for non-administrator responses.
 func SanitizeMediaStreams(streams []MediaStream) {
@@ -8,11 +15,16 @@ func SanitizeMediaStreams(streams []MediaStream) {
 	}
 }
 
-// SanitizeMediaSources clears server filesystem paths from MediaSourceInfo
-// entries and their nested MediaStreams for non-administrator responses.
+// SanitizeMediaSources clears server-local filesystem paths from MediaSourceInfo
+// entries and their nested MediaStreams for non-administrator responses, while
+// preserving remote HTTP(S) direct URLs (e.g. resolved STRM 302 targets).
 func SanitizeMediaSources(sources []MediaSourceInfo) {
 	for i := range sources {
-		sources[i].Path = ""
+		isRemoteHTTP := (sources[i].IsRemote || strings.EqualFold(strings.TrimSpace(sources[i].Protocol), "Http")) &&
+			isRemoteHTTPPath(sources[i].Path)
+		if !isRemoteHTTP {
+			sources[i].Path = ""
+		}
 		SanitizeMediaStreams(sources[i].MediaStreams)
 	}
 }

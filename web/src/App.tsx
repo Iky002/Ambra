@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query'
-import { ShieldAlert } from 'lucide-react'
+import { Loader2, ShieldAlert } from 'lucide-react'
 import { HashRouter, Link, Navigate, Route, Routes } from 'react-router-dom'
 import { api } from './api/client'
 import { Layout } from './components/Layout'
@@ -33,15 +33,28 @@ export const queryClient = new QueryClient({
   },
 })
 
+function SetupLoadingScreen() {
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-[#09090b] text-zinc-400">
+      <Loader2 className="h-7 w-7 animate-spin text-amber-400" />
+    </div>
+  )
+}
+
 function RequireAuth({
   children,
   needsSetup = false,
+  setupLoading = false,
 }: {
   children: React.ReactNode
   needsSetup?: boolean
+  setupLoading?: boolean
 }) {
   const { auth } = useAuth()
   if (!auth) {
+    if (setupLoading) {
+      return <SetupLoadingScreen />
+    }
     return <Navigate to={needsSetup ? '/setup' : '/login'} replace />
   }
   return <>{children}</>
@@ -86,14 +99,15 @@ function AppRoutes() {
   const { auth } = useAuth()
   const demoActive = isDemoMode()
 
-  const { data: setupStatus } = useQuery({
+  const { data: setupStatus, isLoading: setupLoading } = useQuery({
     queryKey: ['setupStatus'],
     queryFn: () => api.getSetupStatus(),
     enabled: !auth && !demoActive,
     retry: false,
   })
 
-  const needsSetup = !demoActive && setupStatus?.completed === false
+  const waitingSetupStatus = !auth && !demoActive && setupLoading
+  const needsSetup = !demoActive && setupStatus?.completed === false && !setupStatus?.has_users
 
   return (
     <Routes>
@@ -103,7 +117,9 @@ function AppRoutes() {
         element={
           auth ? (
             <Navigate to="/" replace />
-          ) : needsSetup && !setupStatus?.has_users ? (
+          ) : waitingSetupStatus ? (
+            <SetupLoadingScreen />
+          ) : needsSetup ? (
             <Navigate to="/setup" replace />
           ) : (
             <LoginPage />
@@ -113,7 +129,7 @@ function AppRoutes() {
       <Route
         path="/play/:id"
         element={
-          <RequireAuth needsSetup={needsSetup}>
+          <RequireAuth needsSetup={needsSetup} setupLoading={waitingSetupStatus}>
             <PlayerPage />
           </RequireAuth>
         }
@@ -121,7 +137,7 @@ function AppRoutes() {
       <Route
         path="/"
         element={
-          <RequireAuth needsSetup={needsSetup}>
+          <RequireAuth needsSetup={needsSetup} setupLoading={waitingSetupStatus}>
             <Layout />
           </RequireAuth>
         }

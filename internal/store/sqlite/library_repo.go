@@ -3845,11 +3845,14 @@ func (r *LibraryRepo) loadPeopleBatch(ctx context.Context, itemIDs []string) (ma
 	return out, nil
 }
 
-// MediaSourceRecordsToDTO converts MediaSourceRecord slices into Emby DTOs.
+// MediaSourceRecordsToDTO converts MediaSourceRecord slices into Emby DTOs
+// and populates base DefaultAudioStreamIndex (first IsDefault audio -> else first audio)
+// and DefaultSubtitleStreamIndex (first IsDefault subtitle).
 func MediaSourceRecordsToDTO(srcs []MediaSourceRecord) []dto.MediaSourceInfo {
 	out := make([]dto.MediaSourceInfo, len(srcs))
 	for i, s := range srcs {
 		streams := make([]dto.MediaStream, len(s.Streams))
+		var defaultAudioIdx, firstAudioIdx, defaultSubIdx *int
 		for j, st := range s.Streams {
 			streams[j] = dto.MediaStream{
 				Codec:        st.Codec,
@@ -3870,22 +3873,42 @@ func MediaSourceRecordsToDTO(srcs []MediaSourceRecord) []dto.MediaSourceInfo {
 				Path:         st.Path,
 				SubVariant:   st.SubVariant,
 			}
+			switch {
+			case strings.EqualFold(st.StreamType, "Audio"):
+				idx := st.StreamIndex
+				if firstAudioIdx == nil {
+					firstAudioIdx = &idx
+				}
+				if st.IsDefault && defaultAudioIdx == nil {
+					defaultAudioIdx = &idx
+				}
+			case strings.EqualFold(st.StreamType, "Subtitle"):
+				if st.IsDefault && defaultSubIdx == nil {
+					idx := st.StreamIndex
+					defaultSubIdx = &idx
+				}
+			}
+		}
+		if defaultAudioIdx == nil {
+			defaultAudioIdx = firstAudioIdx
 		}
 		out[i] = dto.MediaSourceInfo{
-			Protocol:             s.Protocol,
-			Id:                   s.ID,
-			Path:                 s.Path,
-			Type:                 "Default",
-			Container:            s.Container,
-			Size:                 s.Size,
-			Name:                 s.Name,
-			IsRemote:             s.IsRemote,
-			RunTimeTicks:         s.RuntimeTicks,
-			Bitrate:              s.Bitrate,
-			SupportsTranscoding:  s.SupportsTranscoding,
-			SupportsDirectStream: s.SupportsDirectStream,
-			SupportsDirectPlay:   s.SupportsDirectPlay,
-			MediaStreams:         streams,
+			Protocol:                   s.Protocol,
+			Id:                         s.ID,
+			Path:                       s.Path,
+			Type:                       "Default",
+			Container:                  s.Container,
+			Size:                       s.Size,
+			Name:                       s.Name,
+			IsRemote:                   s.IsRemote,
+			RunTimeTicks:               s.RuntimeTicks,
+			Bitrate:                    s.Bitrate,
+			SupportsTranscoding:        s.SupportsTranscoding,
+			SupportsDirectStream:       s.SupportsDirectStream,
+			SupportsDirectPlay:         s.SupportsDirectPlay,
+			MediaStreams:               streams,
+			DefaultAudioStreamIndex:    defaultAudioIdx,
+			DefaultSubtitleStreamIndex: defaultSubIdx,
 		}
 	}
 	return out

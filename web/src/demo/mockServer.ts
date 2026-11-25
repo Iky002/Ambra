@@ -384,7 +384,7 @@ function createInitialDemoNotifications(): DemoNotificationRecord[] {
     {
       Id: 'notif-demo-01',
       Date: new Date(now - 15 * 60_000).toISOString(),
-      Name: '欢迎体验 Ambra v0.10.4',
+      Name: '欢迎体验 Ambra v0.10.5',
       Description: '已上线应用内通知中心、家长控制分级过滤与 Quick Connect 设备授权码登录。',
       Level: 'Normal',
       readByUsers: new Set(),
@@ -951,6 +951,16 @@ export async function demoFetch<T>(
     store.userAvatarById.set(id, makeAvatarDataUrl(name, ['#7c3aed', '#2e1065']))
     pushActivity(`管理员创建了新用户「${name}」`, 'UserCreated', isAdmin ? '管理员权限' : '普通用户')
     return { ...newUser } as T
+  }
+
+  const userConfigMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Configuration$/)
+  if (userConfigMatch && method === 'POST') {
+    const userId = decodeURIComponent(userConfigMatch[1])
+    const rec = store.users.find((u) => u.user.Id === userId)
+    if (!rec) throw new ApiError(404, '用户不存在')
+    const patch = parseJsonBody(options) as Record<string, unknown>
+    rec.user.Configuration = { ...rec.user.Configuration, ...patch }
+    return undefined as T
   }
 
   const userPolicyMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Policy$/)
@@ -3898,7 +3908,7 @@ export async function demoFetch<T>(
       DeviceId: 'dev-demo-web-01',
       DeviceName: 'Ambra Web Demo',
       AppName: 'Ambra Web',
-      AppVersion: '0.10.4',
+      AppVersion: '0.10.5',
       DateAdded: new Date().toISOString(),
     }
     demoQuickConnectSessions.set(secret, session)

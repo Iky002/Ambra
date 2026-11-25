@@ -318,6 +318,7 @@ export function ItemDetailPage() {
   const [selectedSourceId, setSelectedSourceId] = useState<string>('')
   const [selectedAudioIdx, setSelectedAudioIdx] = useState<number | undefined>(undefined)
   const [selectedSubIdx, setSelectedSubIdx] = useState<number | undefined>(undefined)
+  const [userExplicitlyDisabledSub, setUserExplicitlyDisabledSub] = useState(false)
 
   useEffect(() => {
     if (mediaSources.length > 0) {
@@ -325,11 +326,13 @@ export function ItemDetailPage() {
       const prefs = loadPlaybackPrefs()
       const firstStreams = first.MediaStreams || []
       setSelectedSourceId(first.Id)
+      setUserExplicitlyDisabledSub(false)
       setSelectedAudioIdx(
         pickPreferredAudioIndex(
           firstStreams.filter((s) => s.Type === 'Audio'),
           prefs.preferredAudioLang,
           first.DefaultAudioStreamIndex,
+          locale,
         ),
       )
       setSelectedSubIdx(
@@ -337,10 +340,12 @@ export function ItemDetailPage() {
           firstStreams.filter((s) => s.Type === 'Subtitle'),
           prefs.preferredSubtitleLang,
           first.DefaultSubtitleStreamIndex,
+          locale,
+          prefs.subtitleMode,
         ),
       )
     }
-  }, [item?.Id, mediaSources.length])
+  }, [item?.Id, mediaSources.length, locale])
 
   const activeSource = useMemo(
     () => mediaSources.find((s) => s.Id === selectedSourceId) || mediaSources[0],
@@ -765,11 +770,14 @@ export function ItemDetailPage() {
     const params = new URLSearchParams()
     if (startTicks > 0) params.set('startTicks', String(startTicks))
     if (targetId === item.Id) {
+      const prefs = loadPlaybackPrefs()
+      const prefDisabledSub =
+        prefs.preferredSubtitleLang === 'off' || prefs.subtitleMode === 'None'
       if (activeSource?.Id) params.set('mediaSourceId', activeSource.Id)
       if (selectedAudioIdx !== undefined) params.set('audio', String(selectedAudioIdx))
       if (selectedSubIdx !== undefined) {
         params.set('subtitle', String(selectedSubIdx))
-      } else if (subtitleStreams.length > 0) {
+      } else if (subtitleStreams.length > 0 && (userExplicitlyDisabledSub || prefDisabledSub)) {
         params.set('subtitle', 'off')
       }
     }
@@ -1251,12 +1259,14 @@ export function ItemDetailPage() {
                           const prefs = loadPlaybackPrefs()
                           const nextStreams = next?.MediaStreams || []
                           setSelectedSourceId(e.target.value)
+                          setUserExplicitlyDisabledSub(false)
                           setSelectedAudioIdx(
                             next
                               ? pickPreferredAudioIndex(
                                   nextStreams.filter((s) => s.Type === 'Audio'),
                                   prefs.preferredAudioLang,
                                   next.DefaultAudioStreamIndex,
+                                  locale,
                                 )
                               : undefined,
                           )
@@ -1266,6 +1276,8 @@ export function ItemDetailPage() {
                                   nextStreams.filter((s) => s.Type === 'Subtitle'),
                                   prefs.preferredSubtitleLang,
                                   next.DefaultSubtitleStreamIndex,
+                                  locale,
+                                  prefs.subtitleMode,
                                 )
                               : undefined,
                           )
@@ -1331,6 +1343,7 @@ export function ItemDetailPage() {
                       onChange={(e) => {
                         const v = Number(e.target.value)
                         setSelectedSubIdx(v === -1 ? undefined : v)
+                        setUserExplicitlyDisabledSub(v === -1)
                       }}
                       className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
                     >

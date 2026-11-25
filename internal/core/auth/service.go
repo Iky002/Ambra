@@ -77,7 +77,9 @@ func NewService(repo *sqlite.UserRepo, cfg *config.Config) *Service {
 	}
 }
 
-// EnsureDefaultAdmin creates a default administrator user if the users table is empty.
+// EnsureDefaultAdmin creates an initial administrator user when the users table is empty
+// ONLY if AMBRA_ADMIN_PASS is explicitly set (and AMBRA_SKIP_DEFAULT_ADMIN is not enabled).
+// Otherwise it skips creation so fresh instances boot directly into the /setup wizard.
 func (s *Service) EnsureDefaultAdmin(ctx context.Context) error {
 	if skip := strings.TrimSpace(os.Getenv("AMBRA_SKIP_DEFAULT_ADMIN")); strings.EqualFold(skip, "true") || skip == "1" {
 		return nil
@@ -91,14 +93,15 @@ func (s *Service) EnsureDefaultAdmin(ctx context.Context) error {
 		return nil
 	}
 
+	password, hasPassEnv := os.LookupEnv("AMBRA_ADMIN_PASS")
+	if !hasPassEnv {
+		slog.Info("no users found; complete initial setup via Web UI (/setup) or set AMBRA_ADMIN_PASS for headless bootstrap")
+		return nil
+	}
+
 	username := strings.TrimSpace(os.Getenv("AMBRA_ADMIN_USER"))
 	if username == "" {
 		username = "admin"
-	}
-	password, hasPassEnv := os.LookupEnv("AMBRA_ADMIN_PASS")
-	if !hasPassEnv {
-		password = "admin"
-		slog.Warn("creating default administrator with insecure default password; set AMBRA_ADMIN_PASS or AMBRA_SKIP_DEFAULT_ADMIN=true", "username", username)
 	}
 
 	_, err = s.CreateUser(ctx, username, password, true)

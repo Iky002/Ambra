@@ -289,7 +289,44 @@ func (h *Handler) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 	if _, isAdmin := h.callerIdentity(r); h.isAuthenticated(r) && !isAdmin {
 		dto.SanitizePlaybackInfo(resp)
 	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && strings.TrimSpace(ac.Token) != "" {
+		appendAPIKeyToPlaybackInfo(resp, ac.Token)
+	}
 	httpx.JSON(w, http.StatusOK, resp)
+}
+
+func appendAPIKeyToPlaybackInfo(resp *dto.PlaybackInfoResponse, token string) {
+	if resp == nil || strings.TrimSpace(token) == "" {
+		return
+	}
+	for i := range resp.MediaSources {
+		ms := &resp.MediaSources[i]
+		ms.DirectStreamUrl = appendAPIKeyQuery(ms.DirectStreamUrl, token)
+		ms.TranscodingUrl = appendAPIKeyQuery(ms.TranscodingUrl, token)
+		for j := range ms.MediaStreams {
+			ms.MediaStreams[j].DeliveryUrl = appendAPIKeyQuery(ms.MediaStreams[j].DeliveryUrl, token)
+		}
+	}
+}
+
+func appendAPIKeyQuery(rawURL, token string) string {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" || !strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, "//") {
+		return rawURL
+	}
+	parsed, err := url.Parse(trimmed)
+	if err == nil {
+		for k := range parsed.Query() {
+			if strings.EqualFold(k, "api_key") {
+				return trimmed
+			}
+		}
+	}
+	sep := "?"
+	if strings.Contains(trimmed, "?") {
+		sep = "&"
+	}
+	return trimmed + sep + "api_key=" + url.QueryEscape(token)
 }
 
 func (h *Handler) handleVideoStream(w http.ResponseWriter, r *http.Request) {
