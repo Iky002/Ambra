@@ -63,7 +63,7 @@
 
 ### 2. Docker Compose 部署（推荐）
 
-将仓库中的 [docker-compose.yml](docker-compose.yml) 下载到本地（按需取消注释媒体目录挂载与硬件加速设备），执行：
+将仓库中的 [docker-compose.yml](docker-compose.yml) 下载到本地（按需取消注释媒体目录挂载、硬件加速设备，并按宿主机目录属主调整 `PUID` / `PGID`），执行：
 
 ```bash
 docker compose up -d
@@ -78,10 +78,17 @@ docker run -d \
   -p 8096:8096 \
   -p 1900:1900/udp \
   -e TZ=Asia/Shanghai \
+  -e PUID=1000 \
+  -e PGID=1000 \
   -v $(pwd)/data:/data \
   -v /path/to/media:/media:ro \
   ghcr.io/iky002/ambra:latest
 ```
+
+> **📁 NAS / 宿主机映射目录权限说明（重要）**
+> - 容器默认以 **`PUID=1000` / `PGID=1000`** 非 root 身份运行，并在启动时自动修正 `/data` 目录权限（也兼容官方 Emby 的 `UID` / `GID` 环境变量名）。
+> - 如遇到容器内无法访问宿主机/NAS 映射的媒体目录（`Permission denied`），请先在宿主机执行 `stat -c '%u:%g' /path/to/media` 或 `id` 查看目录属主，并将 **`PUID` / `PGID`** 改为对应的 UID/GID（例如群晖常见 `1026:100`、Unraid 常见 `99:100`）；需要访问多个用户组时可通过 **`GIDLIST`** 传入逗号分隔的附加组 ID（如 `-e GIDLIST=100,44`）。
+> - **混合权限目录**：如果你同时挂载了多个不同属主的媒体文件夹，可直接将 **`PUID=0` 与 `PGID=0`**（即 `0:0` root 身份，或使用 `--user 0:0`）即可正常访问所有映射目录。
 
 ### 4. 访问与初始化
 
@@ -105,8 +112,11 @@ make build        # 构建当前平台纯 Go 二进制 (bin/ambra)
 | 环境变量 | 说明 | 默认值 |
 | :--- | :--- | :--- |
 | `TZ` | 容器时区（影响日志与计划任务时间） | `Asia/Shanghai` |
+| `PUID` / `PGID` | Docker 运行用户 UID / GID（兼容 `UID` / `GID`；混合权限目录可设为 `0` / `0`） | `1000` / `1000` |
+| `GIDLIST` | Docker 附加用户组 ID 或组名列表，逗号分隔（如 `100,44,109`） | `""` |
+| `UMASK` | Docker 新建文件默认权限掩码（如 `002`、`022`） | 继承系统 |
 | `AMBRA_HTTP_ADDR` | HTTP 监听地址 | `:8096` |
-| `AMBRA_TMDB_API_KEY` | TMDB API Key（用于刮削元数据与海报） | `""` |
+| `AMBRA_TMDB_API_KEY` | 自定义 TMDB API Key（留空自动使用内置默认密钥） | 内置默认密钥 |
 | `AMBRA_WEB_DIR` | 外部 Web UI 目录（留空使用内嵌前端） | `""` |
 | `AMBRA_FFMPEG_PATH` | 自定义 `ffmpeg` 路径 | 自动探测 |
 | `AMBRA_FFPROBE_PATH` | 自定义 `ffprobe` 路径 | 自动探测 |

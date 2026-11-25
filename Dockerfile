@@ -43,9 +43,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM alpine:3.21 AS runtime-lite
 
 ENV TZ=Asia/Shanghai \
+    PUID=1000 \
+    PGID=1000 \
     AMBRA_HTTP_ADDR=:8096
 
-RUN apk add --no-cache ca-certificates curl tzdata \
+RUN apk add --no-cache ca-certificates curl setpriv tzdata \
     && addgroup -g 1000 -S ambra \
     && adduser -u 1000 -S -G ambra -h /app -s /sbin/nologin ambra \
     && mkdir -p /app /data \
@@ -53,6 +55,7 @@ RUN apk add --no-cache ca-certificates curl tzdata \
 
 WORKDIR /app
 COPY --from=go-builder /out/ambra /usr/local/bin/ambra
+COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 EXPOSE 8096/tcp 1900/udp
 VOLUME ["/data"]
@@ -60,9 +63,8 @@ VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8096/System/Ping || exit 1
 
-USER ambra
-ENTRYPOINT ["/usr/local/bin/ambra"]
-CMD ["-data", "/data"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["/usr/local/bin/ambra", "-data", "/data"]
 
 # ==============================================================================
 # Stage 3B: Full runtime WITH bundled FFmpeg/FFprobe (target: runtime-full, default)
@@ -72,6 +74,8 @@ FROM debian:bookworm-slim AS runtime-full
 
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=Asia/Shanghai \
+    PUID=1000 \
+    PGID=1000 \
     AMBRA_HTTP_ADDR=:8096 \
     AMBRA_FFMPEG_PATH=/usr/bin/ffmpeg \
     AMBRA_FFPROBE_PATH=/usr/bin/ffprobe
@@ -89,6 +93,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 COPY --from=go-builder /out/ambra /usr/local/bin/ambra
+COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 EXPOSE 8096/tcp 1900/udp
 VOLUME ["/data"]
@@ -96,6 +101,5 @@ VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8096/System/Ping || exit 1
 
-USER ambra
-ENTRYPOINT ["/usr/local/bin/ambra"]
-CMD ["-data", "/data"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["/usr/local/bin/ambra", "-data", "/data"]
