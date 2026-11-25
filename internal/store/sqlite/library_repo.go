@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -312,6 +313,16 @@ func ParentalRatingScore(rating string) (int, bool) {
 	return score, ok
 }
 
+// ParseParentalRatingValue maps a parental rating label (case-insensitive) to its
+// numeric rank, returning 0 for empty or unrecognized ratings.
+func ParseParentalRatingValue(rating string) int {
+	score, ok := ParentalRatingScore(rating)
+	if !ok {
+		return 0
+	}
+	return score
+}
+
 // ExceedingParentalRatings returns a sorted slice of uppercase rating strings whose
 // numeric score strictly exceeds maxScore.
 func ExceedingParentalRatings(maxScore int) []string {
@@ -351,14 +362,12 @@ func appendParentalFilterSQL(alias string, maxRating *int, blockedTags []string)
 		args    []any
 	)
 	if maxRating != nil {
-		if exceeding := ExceedingParentalRatings(*maxRating); len(exceeding) > 0 {
-			ph := make([]string, len(exceeding))
-			for i, r := range exceeding {
-				ph[i] = "?"
-				args = append(args, r)
-			}
-			clauses = append(clauses, fmt.Sprintf(`COALESCE(upper(trim(%s.official_rating)), '') NOT IN (%s)`, alias, strings.Join(ph, ",")))
+		maxVal := *maxRating
+		if maxVal < 0 {
+			maxVal = 0
 		}
+		clauses = append(clauses, fmt.Sprintf(`%s.parental_rating_value <= ?`, alias))
+		args = append(args, maxVal)
 	}
 	if normTags := normalizeBlockedTags(blockedTags); len(normTags) > 0 {
 		ph := make([]string, len(normTags))
@@ -433,11 +442,25 @@ type ItemCounts struct {
 
 // LibraryRepo implements media library, item, search and user-data persistence.
 type LibraryRepo struct {
-	store *Store
+	store            *Store
+	countMu          sync.RWMutex
+	countCache       map[string]int
+	cachedItemCounts *ItemCounts
 }
 
 func NewLibraryRepo(store *Store) *LibraryRepo {
-	return &LibraryRepo{store: store}
+	return &LibraryRepo{
+		store:      store,
+		countCache: make(map[string]int),
+	}
+}
+
+// InvalidateCountCache clears cached COUNT(*) and GetItemCounts results.
+func (r *LibraryRepo) InvalidateCountCache() {
+	r.countMu.Lock()
+	r.countCache = make(map[string]int)
+	r.cachedItemCounts = nil
+	r.countMu.Unlock()
 }
 
 // --- Library CRUD ---
@@ -572,7 +595,11 @@ func (r *LibraryRepo) DeleteLibrary(ctx context.Context, id string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM libraries WHERE id = ?`, id); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	r.InvalidateCountCache()
+	return nil
 }
 
 func (r *LibraryRepo) DeleteLibraryByName(ctx context.Context, name string) error {
@@ -615,13 +642,38 @@ func (r *LibraryRepo) AddLibraryPath(ctx context.Context, id, path string) (*Lib
 
 // --- Item & Relation Writes ---
 
-func (r *LibraryRepo) UpsertItem(ctx context.Context, item *ItemRecord) error {
+// BatchItemInput bundles an item record with its ancestor chain and optional FTS5 payload
+// for single-transaction batch ingestion via UpsertItemsBatch.
+type BatchItemInput struct {
+	Item           *ItemRecord
+	AncestorIDs    []string
+	FTSTitleRaw    string
+	FTSTitleTokens string
+	FTSPinyinFull  string
+	FTSPinyinInit  string
+	FTSPeopleNames string
+}
+
+func firstNonEmpty(a, b string) string {
+	if strings.TrimSpace(a) != "" {
+		return a
+	}
+	return b
+}
+
+func computeItemDerivedFields(item *ItemRecord) (sortKey, extraType string, parentalRatingValue int) {
+	sortKey = PinyinSortKey(firstNonEmpty(item.SortName, item.Name))
+	extraType = strings.ToLower(strings.TrimSpace(item.Extra.ExtraType))
+	parentalRatingValue = ParseParentalRatingValue(item.OfficialRating)
+	return sortKey, extraType, parentalRatingValue
+}
+
+func prepareItemForUpsert(item *ItemRecord, now int64) (extraRaw []byte, sortKey, extraType string, parentalRatingValue int, err error) {
 	if item.ID == "" {
 		item.ID = guid.New()
 	} else {
 		item.ID = guid.Normalize(item.ID)
 	}
-	now := time.Now().Unix()
 	if item.DateCreated == 0 {
 		item.DateCreated = now
 	}
@@ -634,57 +686,73 @@ func (r *LibraryRepo) UpsertItem(ctx context.Context, item *ItemRecord) error {
 	if item.Etag == "" {
 		item.Etag = guid.New()[:16]
 	}
-	extraRaw, err := json.Marshal(item.Extra)
+	extraRaw, err = json.Marshal(item.Extra)
+	if err != nil {
+		return nil, "", "", 0, err
+	}
+	sortKey, extraType, parentalRatingValue = computeItemDerivedFields(item)
+	return extraRaw, sortKey, extraType, parentalRatingValue, nil
+}
+
+const upsertItemSQL = `
+	INSERT INTO items (
+		id, internal_id, library_id, parent_id, series_id, season_id,
+		type, media_type, is_folder, is_strm,
+		name, original_title, sort_name,
+		index_number, parent_index_number, production_year,
+		premiere_date, end_date, community_rating, critic_rating, official_rating,
+		runtime_ticks, container, path, file_size, file_mtime,
+		etag, extra_json, date_created, date_modified,
+		sort_key, extra_type, parental_rating_value
+	) VALUES (
+		?, ?, ?, ?, ?, ?,
+		?, ?, ?, ?,
+		?, ?, ?,
+		?, ?, ?,
+		?, ?, ?, ?, ?,
+		?, ?, ?, ?, ?,
+		?, ?, ?, ?,
+		?, ?, ?
+	)
+	ON CONFLICT(id) DO UPDATE SET
+		library_id = excluded.library_id,
+		parent_id = excluded.parent_id,
+		series_id = excluded.series_id,
+		season_id = excluded.season_id,
+		type = excluded.type,
+		media_type = excluded.media_type,
+		is_folder = excluded.is_folder,
+		is_strm = excluded.is_strm,
+		name = excluded.name,
+		original_title = excluded.original_title,
+		sort_name = excluded.sort_name,
+		index_number = excluded.index_number,
+		parent_index_number = excluded.parent_index_number,
+		production_year = excluded.production_year,
+		premiere_date = excluded.premiere_date,
+		end_date = excluded.end_date,
+		community_rating = excluded.community_rating,
+		critic_rating = excluded.critic_rating,
+		official_rating = excluded.official_rating,
+		runtime_ticks = excluded.runtime_ticks,
+		container = excluded.container,
+		path = excluded.path,
+		file_size = excluded.file_size,
+		file_mtime = excluded.file_mtime,
+		etag = excluded.etag,
+		extra_json = excluded.extra_json,
+		date_modified = excluded.date_modified,
+		sort_key = excluded.sort_key,
+		extra_type = excluded.extra_type,
+		parental_rating_value = excluded.parental_rating_value
+`
+
+func (r *LibraryRepo) UpsertItem(ctx context.Context, item *ItemRecord) error {
+	extraRaw, sortKey, extraType, parentalRatingValue, err := prepareItemForUpsert(item, time.Now().Unix())
 	if err != nil {
 		return err
 	}
-	_, err = r.store.Writer.ExecContext(ctx, `
-		INSERT INTO items (
-			id, internal_id, library_id, parent_id, series_id, season_id,
-			type, media_type, is_folder, is_strm,
-			name, original_title, sort_name,
-			index_number, parent_index_number, production_year,
-			premiere_date, end_date, community_rating, critic_rating, official_rating,
-			runtime_ticks, container, path, file_size, file_mtime,
-			etag, extra_json, date_created, date_modified
-		) VALUES (
-			?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?,
-			?, ?, ?,
-			?, ?, ?,
-			?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?,
-			?, ?, ?, ?
-		)
-		ON CONFLICT(id) DO UPDATE SET
-			library_id = excluded.library_id,
-			parent_id = excluded.parent_id,
-			series_id = excluded.series_id,
-			season_id = excluded.season_id,
-			type = excluded.type,
-			media_type = excluded.media_type,
-			is_folder = excluded.is_folder,
-			is_strm = excluded.is_strm,
-			name = excluded.name,
-			original_title = excluded.original_title,
-			sort_name = excluded.sort_name,
-			index_number = excluded.index_number,
-			parent_index_number = excluded.parent_index_number,
-			production_year = excluded.production_year,
-			premiere_date = excluded.premiere_date,
-			end_date = excluded.end_date,
-			community_rating = excluded.community_rating,
-			critic_rating = excluded.critic_rating,
-			official_rating = excluded.official_rating,
-			runtime_ticks = excluded.runtime_ticks,
-			container = excluded.container,
-			path = excluded.path,
-			file_size = excluded.file_size,
-			file_mtime = excluded.file_mtime,
-			etag = excluded.etag,
-			extra_json = excluded.extra_json,
-			date_modified = excluded.date_modified
-	`,
+	_, err = r.store.Writer.ExecContext(ctx, upsertItemSQL,
 		item.ID, item.InternalID, item.LibraryID, nullStr(item.ParentID), nullStr(item.SeriesID), nullStr(item.SeasonID),
 		item.Type, nullStr(item.MediaType), boolToInt(item.IsFolder), boolToInt(item.IsStrm),
 		item.Name, nullStr(item.OriginalTitle), item.SortName,
@@ -692,8 +760,229 @@ func (r *LibraryRepo) UpsertItem(ctx context.Context, item *ItemRecord) error {
 		item.PremiereDate, item.EndDate, item.CommunityRating, item.CriticRating, nullStr(item.OfficialRating),
 		item.RuntimeTicks, nullStr(item.Container), nullStr(item.Path), item.FileSize, item.FileMtime,
 		item.Etag, string(extraRaw), item.DateCreated, item.DateModified,
+		sortKey, extraType, parentalRatingValue,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	r.InvalidateCountCache()
+	return nil
+}
+
+// UpsertItemsBatch upserts items, their ancestor links, and optional FTS5 rows in a single transaction.
+func (r *LibraryRepo) UpsertItemsBatch(ctx context.Context, batch []BatchItemInput) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	tx, err := r.store.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	selItemRowIDStmt, err := tx.PrepareContext(ctx, `SELECT rowid FROM items WHERE id = ?`)
+	if err != nil {
+		return err
+	}
+	defer selItemRowIDStmt.Close()
+
+	itemStmt, err := tx.PrepareContext(ctx, upsertItemSQL)
+	if err != nil {
+		return err
+	}
+	defer itemStmt.Close()
+
+	delAncStmt, err := tx.PrepareContext(ctx, `DELETE FROM item_ancestors WHERE descendant_id = ?`)
+	if err != nil {
+		return err
+	}
+	defer delAncStmt.Close()
+
+	insAncStmt, err := tx.PrepareContext(ctx, `INSERT OR REPLACE INTO item_ancestors (ancestor_id, descendant_id, depth) VALUES (?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer insAncStmt.Close()
+
+	selFTSByRowIDStmt, err := tx.PrepareContext(ctx, `SELECT item_id, title_raw, title_tokens, pinyin_full, pinyin_initials, people_names FROM item_search_fts WHERE rowid = ?`)
+	if err != nil {
+		return err
+	}
+	defer selFTSByRowIDStmt.Close()
+
+	delFTSByRowIDStmt, err := tx.PrepareContext(ctx, `DELETE FROM item_search_fts WHERE rowid = ?`)
+	if err != nil {
+		return err
+	}
+	defer delFTSByRowIDStmt.Close()
+
+	insFTSWithRowIDStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO item_search_fts (rowid, item_id, title_raw, title_tokens, pinyin_full, pinyin_initials, people_names)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer insFTSWithRowIDStmt.Close()
+
+	selFTSByItemStmt, err := tx.PrepareContext(ctx, `SELECT title_raw, title_tokens, pinyin_full, pinyin_initials, people_names FROM item_search_fts WHERE item_id = ? LIMIT 1`)
+	if err != nil {
+		return err
+	}
+	defer selFTSByItemStmt.Close()
+
+	delFTSByItemStmt, err := tx.PrepareContext(ctx, `DELETE FROM item_search_fts WHERE item_id = ?`)
+	if err != nil {
+		return err
+	}
+	defer delFTSByItemStmt.Close()
+
+	insFTSAutoStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO item_search_fts (item_id, title_raw, title_tokens, pinyin_full, pinyin_initials, people_names)
+		VALUES (?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer insFTSAutoStmt.Close()
+
+	now := time.Now().Unix()
+	for _, entry := range batch {
+		if entry.Item == nil {
+			continue
+		}
+		item := entry.Item
+		extraRaw, sortKey, extraType, parentalRatingValue, err := prepareItemForUpsert(item, now)
+		if err != nil {
+			return err
+		}
+
+		var itemRowID int64
+		existedBefore := selItemRowIDStmt.QueryRowContext(ctx, item.ID).Scan(&itemRowID) == nil
+
+		res, err := itemStmt.ExecContext(ctx,
+			item.ID, item.InternalID, item.LibraryID, nullStr(item.ParentID), nullStr(item.SeriesID), nullStr(item.SeasonID),
+			item.Type, nullStr(item.MediaType), boolToInt(item.IsFolder), boolToInt(item.IsStrm),
+			item.Name, nullStr(item.OriginalTitle), item.SortName,
+			item.IndexNumber, item.ParentIndexNumber, item.ProductionYear,
+			item.PremiereDate, item.EndDate, item.CommunityRating, item.CriticRating, nullStr(item.OfficialRating),
+			item.RuntimeTicks, nullStr(item.Container), nullStr(item.Path), item.FileSize, item.FileMtime,
+			item.Etag, string(extraRaw), item.DateCreated, item.DateModified,
+			sortKey, extraType, parentalRatingValue,
+		)
+		if err != nil {
+			return err
+		}
+		if !existedBefore {
+			if rid, err := res.LastInsertId(); err == nil && rid > 0 {
+				itemRowID = rid
+			} else {
+				_ = selItemRowIDStmt.QueryRowContext(ctx, item.ID).Scan(&itemRowID)
+			}
+		}
+
+		// Replace item_ancestors: self (depth 0), parent, library, and any explicit AncestorIDs.
+		if existedBefore {
+			if _, err := delAncStmt.ExecContext(ctx, item.ID); err != nil {
+				return err
+			}
+		}
+		seenAnc := make(map[string]struct{}, 3+len(entry.AncestorIDs))
+		depth := 0
+		addAnc := func(rawID string) error {
+			aid := guid.Normalize(rawID)
+			if aid == "" {
+				return nil
+			}
+			if _, ok := seenAnc[aid]; ok {
+				return nil
+			}
+			seenAnc[aid] = struct{}{}
+			_, err := insAncStmt.ExecContext(ctx, aid, item.ID, depth)
+			depth++
+			return err
+		}
+		if err := addAnc(item.ID); err != nil {
+			return err
+		}
+		if err := addAnc(item.ParentID); err != nil {
+			return err
+		}
+		if err := addAnc(item.LibraryID); err != nil {
+			return err
+		}
+		for _, aid := range entry.AncestorIDs {
+			if err := addAnc(aid); err != nil {
+				return err
+			}
+		}
+
+		// Upsert FTS5 with O(log N) rowid-pinned dirty-check when FTSTitleRaw is provided.
+		if strings.TrimSpace(entry.FTSTitleRaw) != "" {
+			titleRaw, titleTokens, pinyinFull, pinyinInitials, peopleNames := normalizeFTSFields(
+				entry.FTSTitleRaw, entry.FTSTitleTokens, entry.FTSPinyinFull, entry.FTSPinyinInit, entry.FTSPeopleNames,
+			)
+			var curItemID, curRaw, curTokens, curPinyinFull, curPinyinInit, curPeople string
+			rowErr := selFTSByRowIDStmt.QueryRowContext(ctx, itemRowID).Scan(
+				&curItemID, &curRaw, &curTokens, &curPinyinFull, &curPinyinInit, &curPeople,
+			)
+			switch {
+			case rowErr == nil && curItemID == item.ID:
+				if curRaw == titleRaw &&
+					curTokens == titleTokens &&
+					curPinyinFull == pinyinFull &&
+					curPinyinInit == pinyinInitials &&
+					curPeople == peopleNames {
+					continue
+				}
+				if _, err := delFTSByRowIDStmt.ExecContext(ctx, itemRowID); err != nil {
+					return err
+				}
+				if _, err := insFTSWithRowIDStmt.ExecContext(ctx, itemRowID, item.ID, titleRaw, titleTokens, pinyinFull, pinyinInitials, peopleNames); err != nil {
+					return err
+				}
+			case errors.Is(rowErr, sql.ErrNoRows) && itemRowID > 0:
+				if existedBefore {
+					if err := selFTSByItemStmt.QueryRowContext(ctx, item.ID).Scan(&curRaw, &curTokens, &curPinyinFull, &curPinyinInit, &curPeople); err == nil {
+						if curRaw == titleRaw &&
+							curTokens == titleTokens &&
+							curPinyinFull == pinyinFull &&
+							curPinyinInit == pinyinInitials &&
+							curPeople == peopleNames {
+							continue
+						}
+						if _, err := delFTSByItemStmt.ExecContext(ctx, item.ID); err != nil {
+							return err
+						}
+					}
+				}
+				if _, err := insFTSWithRowIDStmt.ExecContext(ctx, itemRowID, item.ID, titleRaw, titleTokens, pinyinFull, pinyinInitials, peopleNames); err != nil {
+					return err
+				}
+			default:
+				// Legacy rowid collision fallback.
+				if err := selFTSByItemStmt.QueryRowContext(ctx, item.ID).Scan(&curRaw, &curTokens, &curPinyinFull, &curPinyinInit, &curPeople); err == nil {
+					if curRaw == titleRaw &&
+						curTokens == titleTokens &&
+						curPinyinFull == pinyinFull &&
+						curPinyinInit == pinyinInitials &&
+						curPeople == peopleNames {
+						continue
+					}
+				}
+				if _, err := delFTSByItemStmt.ExecContext(ctx, item.ID); err != nil {
+					return err
+				}
+				if _, err := insFTSAutoStmt.ExecContext(ctx, item.ID, titleRaw, titleTokens, pinyinFull, pinyinInitials, peopleNames); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	r.InvalidateCountCache()
+	return nil
 }
 
 // FindItemByPath looks up an existing item by library_id and path (for incremental scanning).
@@ -935,9 +1224,7 @@ func (r *LibraryRepo) ReplaceItemPeople(ctx context.Context, itemID string, peop
 	return tx.Commit()
 }
 
-func (r *LibraryRepo) UpsertSearchFTS(ctx context.Context, itemID, titleRaw, titleTokens, pinyinFull, pinyinInitials, peopleNames string) error {
-	itemID = guid.Normalize(itemID)
-
+func normalizeFTSFields(titleRaw, titleTokens, pinyinFull, pinyinInitials, peopleNames string) (string, string, string, string, string) {
 	titleRaw = TradToSimp(titleRaw)
 	peopleRaw := TradToSimp(peopleNames)
 	if strings.TrimSpace(titleTokens) == "" && strings.TrimSpace(titleRaw) != "" {
@@ -959,6 +1246,57 @@ func (r *LibraryRepo) UpsertSearchFTS(ctx context.Context, itemID, titleRaw, tit
 	} else {
 		peopleNames = ""
 	}
+	return titleRaw, titleTokens, pinyinFull, pinyinInitials, peopleNames
+}
+
+func (r *LibraryRepo) UpsertSearchFTS(ctx context.Context, itemID, titleRaw, titleTokens, pinyinFull, pinyinInitials, peopleNames string) error {
+	itemID = guid.Normalize(itemID)
+	titleRaw, titleTokens, pinyinFull, pinyinInitials, peopleNames = normalizeFTSFields(
+		titleRaw, titleTokens, pinyinFull, pinyinInitials, peopleNames,
+	)
+
+	// Fast O(log N) path via items.rowid when the item exists in items.
+	var itemRowID int64
+	hasItemRowID := r.store.Reader.QueryRowContext(ctx, `SELECT rowid FROM items WHERE id = ?`, itemID).Scan(&itemRowID) == nil
+
+	var (
+		curItemID, curRaw, curTokens, curPinyinFull, curPinyinInit, curPeople string
+		pinnedHit                                                              bool
+		rowIDFree                                                              bool
+	)
+	if hasItemRowID && itemRowID > 0 {
+		err := r.store.Reader.QueryRowContext(ctx,
+			`SELECT item_id, title_raw, title_tokens, pinyin_full, pinyin_initials, people_names
+			 FROM item_search_fts WHERE rowid = ?`, itemRowID,
+		).Scan(&curItemID, &curRaw, &curTokens, &curPinyinFull, &curPinyinInit, &curPeople)
+		if err == nil && curItemID == itemID {
+			if curRaw == titleRaw &&
+				curTokens == titleTokens &&
+				curPinyinFull == pinyinFull &&
+				curPinyinInit == pinyinInitials &&
+				curPeople == peopleNames {
+				return nil
+			}
+			pinnedHit = true
+		} else if errors.Is(err, sql.ErrNoRows) {
+			rowIDFree = true
+		}
+	}
+
+	if !pinnedHit {
+		if err := r.store.Reader.QueryRowContext(ctx,
+			`SELECT title_raw, title_tokens, pinyin_full, pinyin_initials, people_names
+			 FROM item_search_fts WHERE item_id = ? LIMIT 1`, itemID,
+		).Scan(&curRaw, &curTokens, &curPinyinFull, &curPinyinInit, &curPeople); err == nil {
+			if curRaw == titleRaw &&
+				curTokens == titleTokens &&
+				curPinyinFull == pinyinFull &&
+				curPinyinInit == pinyinInitials &&
+				curPeople == peopleNames {
+				return nil
+			}
+		}
+	}
 
 	tx, err := r.store.Writer.BeginTx(ctx, nil)
 	if err != nil {
@@ -966,15 +1304,39 @@ func (r *LibraryRepo) UpsertSearchFTS(ctx context.Context, itemID, titleRaw, tit
 	}
 	defer tx.Rollback()
 
+	if pinnedHit {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM item_search_fts WHERE rowid = ?`, itemRowID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO item_search_fts (rowid, item_id, title_raw, title_tokens, pinyin_full, pinyin_initials, people_names)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			itemRowID, itemID, titleRaw, titleTokens, pinyinFull, pinyinInitials, peopleNames,
+		); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+
 	if _, err := tx.ExecContext(ctx, `DELETE FROM item_search_fts WHERE item_id = ?`, itemID); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO item_search_fts (item_id, title_raw, title_tokens, pinyin_full, pinyin_initials, people_names)
-		VALUES (?, ?, ?, ?, ?, ?)`,
-		itemID, titleRaw, titleTokens, pinyinFull, pinyinInitials, peopleNames,
-	); err != nil {
-		return err
+	if rowIDFree && itemRowID > 0 {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO item_search_fts (rowid, item_id, title_raw, title_tokens, pinyin_full, pinyin_initials, people_names)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			itemRowID, itemID, titleRaw, titleTokens, pinyinFull, pinyinInitials, peopleNames,
+		); err != nil {
+			return err
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO item_search_fts (item_id, title_raw, title_tokens, pinyin_full, pinyin_initials, people_names)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			itemID, titleRaw, titleTokens, pinyinFull, pinyinInitials, peopleNames,
+		); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -1062,6 +1424,87 @@ func isCJK(r rune) bool {
 
 // --- Core Queries ---
 
+// prefixUpperBound returns the smallest string strictly greater than every string
+// having the given prefix, enabling B-Tree range scans (sort_key >= prefix AND sort_key < upper).
+func prefixUpperBound(prefix string) (string, bool) {
+	b := []byte(prefix)
+	for i := len(b) - 1; i >= 0; i-- {
+		if b[i] < 0xff {
+			b[i]++
+			return string(b[:i+1]), true
+		}
+	}
+	return "", false
+}
+
+// queryItemsCountCacheKey returns a cache key when f is a simple, cacheable COUNT(*) query
+// (no search term, no user-specific played/favorite/resumable filters, no dynamic taxonomies,
+// people, ratings, parental policy, or name prefix filters).
+func queryItemsCountCacheKey(f ItemFilter) (string, bool) {
+	if strings.TrimSpace(f.SearchTerm) != "" ||
+		strings.TrimSpace(f.NameStartsWith) != "" ||
+		strings.TrimSpace(f.NameStartsWithOrGreater) != "" ||
+		strings.TrimSpace(f.NameLessThan) != "" ||
+		f.MaxParentalRating != nil ||
+		len(f.BlockedTags) > 0 ||
+		f.SeriesID != "" ||
+		f.SeasonID != "" ||
+		len(f.IDs) > 0 ||
+		len(f.ExcludeItemIDs) > 0 ||
+		len(f.Genres) > 0 ||
+		len(f.GenreIDs) > 0 ||
+		len(f.Studios) > 0 ||
+		len(f.StudioIDs) > 0 ||
+		len(f.Tags) > 0 ||
+		len(f.OfficialRatings) > 0 ||
+		f.MinCommunityRating != nil ||
+		len(f.PersonIDs) > 0 ||
+		len(f.Persons) > 0 ||
+		len(f.Years) > 0 ||
+		f.IsHD != nil ||
+		f.Is4K != nil ||
+		f.HasSubtitles != nil ||
+		f.IsPlayed != nil ||
+		f.IsUnplayed != nil ||
+		f.IsFavorite != nil ||
+		f.IsResumable != nil {
+		return "", false
+	}
+
+	var b strings.Builder
+	b.WriteString("lib=")
+	b.WriteString(guid.Normalize(f.LibraryID))
+	b.WriteString("|parent=")
+	b.WriteString(guid.Normalize(f.ParentID))
+	if f.Recursive {
+		b.WriteString("|rec=1")
+	} else {
+		b.WriteString("|rec=0")
+	}
+	if len(f.AllowedLibraryIDs) > 0 {
+		allowed := make([]string, len(f.AllowedLibraryIDs))
+		for i, lid := range f.AllowedLibraryIDs {
+			allowed[i] = guid.Normalize(lid)
+		}
+		sort.Strings(allowed)
+		b.WriteString("|allow=")
+		b.WriteString(strings.Join(allowed, ","))
+	}
+	if len(f.IncludeItemTypes) > 0 {
+		inc := append([]string(nil), f.IncludeItemTypes...)
+		sort.Strings(inc)
+		b.WriteString("|inc=")
+		b.WriteString(strings.Join(inc, ","))
+	}
+	if len(f.ExcludeItemTypes) > 0 {
+		exc := append([]string(nil), f.ExcludeItemTypes...)
+		sort.Strings(exc)
+		b.WriteString("|exc=")
+		b.WriteString(strings.Join(exc, ","))
+	}
+	return b.String(), true
+}
+
 func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseItemDto, int, error) {
 	if f.AllowedLibraryIDs != nil && len(f.AllowedLibraryIDs) == 0 {
 		return []dto.BaseItemDto{}, 0, nil
@@ -1074,7 +1517,7 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 	)
 
 	// Exclude local extras (trailers, special features, theme songs/videos) from normal library/poster-wall queries.
-	where = append(where, `COALESCE(json_extract(i.extra_json, '$.extra_type'), '') = ''`)
+	where = append(where, `i.extra_type = ''`)
 
 	userID := guid.Normalize(f.UserID)
 	if userID != "" {
@@ -1090,17 +1533,33 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 		args = append(args, ftsExpr)
 	}
 	if prefix := strings.TrimSpace(f.NameStartsWith); prefix != "" {
-		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(strings.ToLower(prefix))
-		where = append(where, `(lower(i.sort_name) LIKE ? ESCAPE '\' OR pinyin_sort_key(COALESCE(NULLIF(i.sort_name, ''), i.name)) LIKE ? ESCAPE '\' OR pinyin_sort_key(i.name) LIKE ? ESCAPE '\')`)
-		args = append(args, escaped+"%", escaped+"%", escaped+"%")
+		key := PinyinSortKey(prefix)
+		if key == "" {
+			key = strings.ToLower(prefix)
+		}
+		if upper, ok := prefixUpperBound(key); ok {
+			where = append(where, `i.sort_key >= ? AND i.sort_key < ?`)
+			args = append(args, key, upper)
+		} else {
+			where = append(where, `i.sort_key >= ?`)
+			args = append(args, key)
+		}
 	}
 	if gte := strings.TrimSpace(f.NameStartsWithOrGreater); gte != "" {
-		where = append(where, `pinyin_sort_key(COALESCE(NULLIF(i.sort_name, ''), i.name)) >= lower(?)`)
-		args = append(args, gte)
+		key := PinyinSortKey(gte)
+		if key == "" {
+			key = strings.ToLower(gte)
+		}
+		where = append(where, `i.sort_key >= ?`)
+		args = append(args, key)
 	}
 	if lt := strings.TrimSpace(f.NameLessThan); lt != "" {
-		where = append(where, `pinyin_sort_key(COALESCE(NULLIF(i.sort_name, ''), i.name)) < lower(?)`)
-		args = append(args, lt)
+		key := PinyinSortKey(lt)
+		if key == "" {
+			key = strings.ToLower(lt)
+		}
+		where = append(where, `i.sort_key < ?`)
+		args = append(args, key)
 	}
 
 	if f.LibraryID != "" {
@@ -1365,9 +1824,29 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 	total := 0
 	countEnabled := f.EnableTotalRecordCount == nil || *f.EnableTotalRecordCount
 	if countEnabled {
-		countSQL := `SELECT COUNT(*) ` + fromClause + whereClause
-		if err := r.store.Reader.QueryRowContext(ctx, countSQL, args...).Scan(&total); err != nil {
-			return nil, 0, fmt.Errorf("count items: %w", err)
+		cacheKey, cacheable := queryItemsCountCacheKey(f)
+		cacheHit := false
+		if cacheable {
+			r.countMu.RLock()
+			if v, ok := r.countCache[cacheKey]; ok {
+				total = v
+				cacheHit = true
+			}
+			r.countMu.RUnlock()
+		}
+		if !cacheHit {
+			countSQL := `SELECT COUNT(*) ` + fromClause + whereClause
+			if err := r.store.Reader.QueryRowContext(ctx, countSQL, args...).Scan(&total); err != nil {
+				return nil, 0, fmt.Errorf("count items: %w", err)
+			}
+			if cacheable {
+				r.countMu.Lock()
+				if r.countCache == nil {
+					r.countCache = make(map[string]int)
+				}
+				r.countCache[cacheKey] = total
+				r.countMu.Unlock()
+			}
 		}
 	}
 
@@ -1513,21 +1992,29 @@ func (r *LibraryRepo) GetLatestItemsWithPolicy(ctx context.Context, serverID, us
 		includeTypes = []string{"Movie", "Series"}
 	}
 	disableCount := false
-	items, _, err := r.QueryItems(ctx, ItemFilter{
+	filter := ItemFilter{
 		ServerID:               serverID,
 		UserID:                 userID,
-		ParentID:               parentID,
 		AllowedLibraryIDs:      allowedLibraryIDs,
 		MaxParentalRating:      maxParentalRating,
 		BlockedTags:            blockedTags,
-		Recursive:              parentID != "",
 		IncludeItemTypes:       includeTypes,
 		SortBy:                 []string{"DateCreated"},
 		SortOrder:              "Descending",
 		Limit:                  limit,
 		Fields:                 fields,
 		EnableTotalRecordCount: &disableCount,
-	})
+	}
+	if pid := guid.Normalize(parentID); pid != "" {
+		var isLib int
+		if err := r.store.Reader.QueryRowContext(ctx, `SELECT 1 FROM libraries WHERE id = ? LIMIT 1`, pid).Scan(&isLib); err == nil && isLib == 1 {
+			filter.LibraryID = pid
+		} else {
+			filter.ParentID = pid
+			filter.Recursive = true
+		}
+	}
+	items, _, err := r.QueryItems(ctx, filter)
 	return items, err
 }
 
@@ -1698,7 +2185,7 @@ func (r *LibraryRepo) SearchHints(ctx context.Context, f SearchHintFilter) ([]dt
 	)
 
 	// Exclude local extras (trailers, special features, theme songs/videos) from normal library/poster-wall queries.
-	where = append(where, `COALESCE(json_extract(i.extra_json, '$.extra_type'), '') = ''`)
+	where = append(where, `i.extra_type = ''`)
 	joins = append(joins, `INNER JOIN item_search_fts fts ON fts.item_id = i.id`)
 	where = append(where, `item_search_fts MATCH ?`)
 	args = append(args, ftsExpr)
@@ -2014,7 +2501,18 @@ func (r *LibraryRepo) GetItemCountsWithAllowedLibraries(ctx context.Context, all
 	if allowedLibraryIDs != nil && len(allowedLibraryIDs) == 0 {
 		return &ItemCounts{}, nil
 	}
-	query := `SELECT type, COUNT(*) FROM items WHERE COALESCE(json_extract(extra_json, '$.extra_type'), '') = ''`
+	unfiltered := allowedLibraryIDs == nil
+	if unfiltered {
+		r.countMu.RLock()
+		if r.cachedItemCounts != nil {
+			cp := *r.cachedItemCounts
+			r.countMu.RUnlock()
+			return &cp, nil
+		}
+		r.countMu.RUnlock()
+	}
+
+	query := `SELECT type, COUNT(*) FROM items WHERE extra_type = ''`
 	var args []any
 	if len(allowedLibraryIDs) > 0 {
 		ph := make([]string, len(allowedLibraryIDs))
@@ -2062,7 +2560,16 @@ func (r *LibraryRepo) GetItemCountsWithAllowedLibraries(ctx context.Context, all
 			c.BookCount = cnt
 		}
 	}
-	return c, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if unfiltered {
+		r.countMu.Lock()
+		cp := *c
+		r.cachedItemCounts = &cp
+		r.countMu.Unlock()
+	}
+	return c, nil
 }
 
 // --- User Item Data ---
@@ -2123,24 +2630,24 @@ func (r *LibraryRepo) collectCascadeItemIDs(ctx context.Context, tx *sql.Tx, ite
 		switch strings.ToLower(itemType) {
 		case "series":
 			rows, err = tx.QueryContext(ctx,
-				`SELECT id FROM items WHERE (series_id = ? OR parent_id = ?) AND COALESCE(json_extract(extra_json, '$.extra_type'), '') = ''`,
+				`SELECT id FROM items WHERE (series_id = ? OR parent_id = ?) AND extra_type = ''`,
 				curID, curID,
 			)
 		case "season":
 			rows, err = tx.QueryContext(ctx,
-				`SELECT id FROM items WHERE (season_id = ? OR parent_id = ?) AND COALESCE(json_extract(extra_json, '$.extra_type'), '') = ''`,
+				`SELECT id FROM items WHERE (season_id = ? OR parent_id = ?) AND extra_type = ''`,
 				curID, curID,
 			)
 		case "musicalbum":
 			rows, err = tx.QueryContext(ctx,
-				`SELECT id FROM items WHERE parent_id = ? AND COALESCE(json_extract(extra_json, '$.extra_type'), '') = ''`,
+				`SELECT id FROM items WHERE parent_id = ? AND extra_type = ''`,
 				curID,
 			)
 		case "boxset":
 			rows, err = tx.QueryContext(ctx,
 				`SELECT item_id FROM item_collections WHERE container_id = ?
 				 UNION
-				 SELECT id FROM items WHERE parent_id = ? AND COALESCE(json_extract(extra_json, '$.extra_type'), '') = ''`,
+				 SELECT id FROM items WHERE parent_id = ? AND extra_type = ''`,
 				curID, curID,
 			)
 		default:
@@ -2423,7 +2930,7 @@ func (r *LibraryRepo) GetItemExtras(ctx context.Context, serverID, userID, paren
 
 	where := []string{
 		`i.parent_id = ?`,
-		`COALESCE(json_extract(i.extra_json, '$.extra_type'), '') != ''`,
+		`i.extra_type != ''`,
 	}
 	args = append(args, parentID)
 
@@ -2433,7 +2940,7 @@ func (r *LibraryRepo) GetItemExtras(ctx context.Context, serverID, userID, paren
 			ph[idx] = "?"
 			args = append(args, strings.ToLower(strings.TrimSpace(et)))
 		}
-		where = append(where, `LOWER(COALESCE(json_extract(i.extra_json, '$.extra_type'), '')) IN (`+strings.Join(ph, ",")+`)`)
+		where = append(where, `i.extra_type IN (`+strings.Join(ph, ",")+`)`)
 	}
 
 	querySQL := `SELECT ` + selectCols + ` FROM items i ` + joins + ` WHERE ` + strings.Join(where, " AND ") + ` ORDER BY i.sort_name ASC`
@@ -2551,11 +3058,11 @@ func (r *LibraryRepo) loadExtrasCountsBatch(ctx context.Context, parentIDs []str
 			args[i] = id
 		}
 		rows, err := r.store.Reader.QueryContext(ctx, `
-			SELECT parent_id, LOWER(COALESCE(json_extract(extra_json, '$.extra_type'), '')), COUNT(*)
+			SELECT parent_id, extra_type, COUNT(*)
 			FROM items
 			WHERE parent_id IN (`+strings.Join(ph, ",")+`)
-			  AND COALESCE(json_extract(extra_json, '$.extra_type'), '') != ''
-			GROUP BY parent_id, LOWER(COALESCE(json_extract(extra_json, '$.extra_type'), ''))`,
+			  AND extra_type != ''
+			GROUP BY parent_id, extra_type`,
 			args...,
 		)
 		if err != nil {
@@ -3136,13 +3643,13 @@ func buildOrderBy(sortBy []string, sortOrder string, ftsActive, hasUser bool) st
 		if ftsActive {
 			return `ORDER BY bm25(item_search_fts, 0, 10.0, 5.0, 3.0, 2.0, 1.0) ASC`
 		}
-		return `ORDER BY pinyin_sort_key(COALESCE(NULLIF(i.sort_name, ''), i.name)) ` + dir
+		return `ORDER BY i.sort_key ` + dir
 	}
 	var parts []string
 	for _, s := range sortBy {
 		switch strings.ToLower(strings.TrimSpace(s)) {
 		case "sortname", "name":
-			parts = append(parts, "pinyin_sort_key(COALESCE(NULLIF(i.sort_name, ''), i.name)) "+dir)
+			parts = append(parts, "i.sort_key "+dir)
 		case "datecreated":
 			parts = append(parts, "i.date_created "+dir)
 		case "premieredate", "productionyear":
@@ -3164,7 +3671,7 @@ func buildOrderBy(sortBy []string, sortOrder string, ftsActive, hasUser bool) st
 		}
 	}
 	if len(parts) == 0 {
-		return `ORDER BY i.sort_name ` + dir
+		return `ORDER BY i.sort_key ` + dir
 	}
 	return "ORDER BY " + strings.Join(parts, ", ")
 }

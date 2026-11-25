@@ -220,3 +220,47 @@ func TestTriggerStorePersistenceAndReload(t *testing.T) {
 		t.Fatalf("expected load error, got %v", err)
 	}
 }
+
+func TestOptimizeDatabaseRunsAnalyzeAndOptimize(t *testing.T) {
+	tmp := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(tmp, "analyze.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Create a table with a composite partial index and populate rows so ANALYZE records sqlite_stat1 stats.
+	if _, err := db.Exec(`
+		PRAGMA journal_mode=WAL;
+		CREATE TABLE items_test (id TEXT PRIMARY KEY, library_id TEXT, type TEXT, name TEXT);
+		CREATE INDEX idx_items_test_lib_type ON items_test(library_id, type) WHERE type = 'Episode';
+		INSERT INTO items_test (id, library_id, type, name) VALUES
+			('1', 'lib1', 'Episode', 'Ep 1'),
+			('2', 'lib1', 'Episode', 'Ep 2'),
+			('3', 'lib1', 'Movie', 'Mov 1');
+	`); err != nil {
+		t.Fatalf("seed db: %v", err)
+	}
+
+	mgr := New(nil)
+	mgr.RegisterBuiltinTasks(nil, "", db)
+
+	if err := mgr.Run("OptimizeDatabase"); err != nil {
+		t.Fatalf("Run OptimizeDatabase: %v", err)
+	}
+	mgr.Wait("OptimizeDatabase")
+
+	info, ok := mgr.Get("OptimizeDatabase")
+	if !ok || info.LastExecutionResult == nil || info.LastExecutionResult.Status != "Completed" {
+		t.Fatalf("expected OptimizeDatabase Completed, got %+v", info.LastExecutionResult)
+	}
+
+	// ANALYZE creates and populates sqlite_stat1 with index statistics.
+	var statRows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl = 'items_test'`).Scan(&statRows); err != nil {
+		t.Fatalf("query sqlite_stat1 (ANALYZE should have populated it): %v", err)
+	}
+	if statRows == 0 {
+		t.Fatalf("expected sqlite_stat1 to have statistics rows for items_test after OptimizeDatabase, got 0")
+	}
+}

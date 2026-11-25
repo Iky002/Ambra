@@ -181,7 +181,11 @@ func (r *LibraryRepo) DeleteItem(ctx context.Context, itemID string) error {
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	r.InvalidateCountCache()
+	return nil
 }
 
 // ListLibraryItemPaths returns a map of media file path -> itemID for all Movie, Episode, and Audio
@@ -499,7 +503,11 @@ func (r *LibraryRepo) MoveContainerItem(ctx context.Context, containerID, itemOr
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	r.InvalidateCountCache()
+	return nil
 }
 
 func compactContainerPositionsTx(ctx context.Context, tx *sql.Tx, containerID string) error {
@@ -1023,7 +1031,7 @@ func (r *LibraryRepo) GetMovieRecommendationsWithPolicy(
 			JOIN items i ON i.id = u.item_id
 			WHERE u.user_id = ?
 			  AND i.type = 'Movie'
-			  AND COALESCE(json_extract(i.extra_json, '$.extra_type'), '') = ''
+			  AND i.extra_type = ''
 			  AND (COALESCE(u.played, 0) = 1 OR COALESCE(u.is_favorite, 0) = 1)`+scopeSQL+`
 			ORDER BY COALESCE(u.is_favorite, 0) DESC, COALESCE(u.last_played_date, 0) DESC, i.date_modified DESC
 			LIMIT ?`, seedArgs...)
@@ -1119,7 +1127,7 @@ func (r *LibraryRepo) GetMovieRecommendationsWithPolicy(
 			JOIN items i ON i.id = it.item_id
 			WHERE t.kind = 'genre'
 			  AND i.type = 'Movie'
-			  AND COALESCE(json_extract(i.extra_json, '$.extra_type'), '') = ''`+scopeSQL+`
+			  AND i.extra_type = ''`+scopeSQL+`
 			GROUP BY t.id, t.name
 			ORDER BY cnt DESC, t.sort_name ASC
 			LIMIT ?`, genreArgs...)
@@ -1237,7 +1245,7 @@ func (r *LibraryRepo) GetQueryFilters(ctx context.Context, f QueryFiltersFilter)
 
 	parentID := guid.Normalize(f.ParentID)
 	var (
-		conds = []string{`COALESCE(json_extract(i.extra_json, '$.extra_type'), '') = ''`}
+		conds = []string{`i.extra_type = ''`}
 		args  []any
 	)
 	if parentID != "" {

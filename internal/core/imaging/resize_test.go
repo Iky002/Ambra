@@ -371,11 +371,14 @@ func TestServiceDiskCacheSingleflightDegradationAndETag(t *testing.T) {
 		t.Fatalf("expected ETag with tag and options hash, got %s", results[0].ETag)
 	}
 
-	// Verify disk cache file exists at <cacheDir>/<key[:2]>/<key>.jpg
+	// Verify disk cache file exists at 2-level sharded path <cacheDir>/<key[:2]>/<key[2:4]>/<key>.jpg
 	key := computeCacheKey(itemID, "Primary", 0, "tagv1", opts.Normalized())
-	cachedFile := filepath.Join(cacheDir, key[:2], key+".jpg")
+	cachedFile := filepath.Join(cacheDir, key[:2], key[2:4], key+".jpg")
 	if _, err := os.Stat(cachedFile); err != nil {
-		t.Fatalf("expected disk cache file %s to exist: %v", cachedFile, err)
+		t.Fatalf("expected 2-level sharded disk cache file %s to exist: %v", cachedFile, err)
+	}
+	if _, err := os.Stat(filepath.Join(cacheDir, key+".jpg")); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy flat cache file not to be written")
 	}
 
 	// 3. Second request hits disk cache directly without reprocessing (even if source is removed!)

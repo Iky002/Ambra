@@ -2,10 +2,12 @@ package scanner
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +19,183 @@ import (
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
+
+const phaseABatchSize = 500
+
+type pendingPhaseAItem struct {
+	input           sqlite.BatchItemInput
+	postHook        func(ctx context.Context) error
+	displayFileName string
+	tasks           []enrichTask
+}
+
+type phaseABatch struct {
+	scanner *Scanner
+	libID   string
+	maxSize int
+	items   []pendingPhaseAItem
+	stats   *ScanStats
+	tasks   *[]enrichTask
+
+	// In-memory collision sets for unflushed items so multi-version auto-merge
+	// within the same batch flushes before querying SQLite.
+	movieDirTitle map[string]struct{}
+	movieProvider map[string]struct{}
+	episodeKeys   map[string]struct{}
+}
+
+func newPhaseABatch(s *Scanner, libID string, stats *ScanStats, tasks *[]enrichTask) *phaseABatch {
+	return &phaseABatch{
+		scanner:       s,
+		libID:         libID,
+		maxSize:       phaseABatchSize,
+		items:         make([]pendingPhaseAItem, 0, phaseABatchSize),
+		stats:         stats,
+		tasks:         tasks,
+		movieDirTitle: make(map[string]struct{}),
+		movieProvider: make(map[string]struct{}),
+		episodeKeys:   make(map[string]struct{}),
+	}
+}
+
+func (b *phaseABatch) reset() {
+	b.items = b.items[:0]
+	clear(b.movieDirTitle)
+	clear(b.movieProvider)
+	clear(b.episodeKeys)
+}
+
+func movieDirTitleKey(dir, title string) string {
+	return filepath.Clean(dir) + "\x00" + strings.ToLower(strings.TrimSpace(title))
+}
+
+func episodeMergeKey(seriesID string, seasonNum, episodeNum int) string {
+	return fmt.Sprintf("%s#%d#%d", seriesID, seasonNum, episodeNum)
+}
+
+func (b *phaseABatch) flushIfMovieCollides(ctx context.Context, dir, title string, providerIDs map[string]string) error {
+	if len(b.items) == 0 {
+		return nil
+	}
+	collides := false
+	if title != "" {
+		if _, ok := b.movieDirTitle[movieDirTitleKey(dir, title)]; ok {
+			collides = true
+		}
+	}
+	if !collides && len(providerIDs) > 0 {
+		if tmdbID := getProviderID(providerIDs, "Tmdb"); tmdbID != "" {
+			if _, ok := b.movieProvider["tmdb:"+strings.ToLower(tmdbID)]; ok {
+				collides = true
+			}
+		}
+		if !collides {
+			if imdbID := getProviderID(providerIDs, "Imdb"); imdbID != "" {
+				if _, ok := b.movieProvider["imdb:"+strings.ToLower(imdbID)]; ok {
+					collides = true
+				}
+			}
+		}
+	}
+	if collides {
+		return b.flush(ctx)
+	}
+	return nil
+}
+
+func (b *phaseABatch) flushIfEpisodeCollides(ctx context.Context, seriesID string, seasonNum, episodeNum int) error {
+	if len(b.items) == 0 {
+		return nil
+	}
+	if _, ok := b.episodeKeys[episodeMergeKey(seriesID, seasonNum, episodeNum)]; ok {
+		return b.flush(ctx)
+	}
+	return nil
+}
+
+func (b *phaseABatch) addMovie(ctx context.Context, item pendingPhaseAItem, dir, parsedTitle string) error {
+	if parsedTitle != "" {
+		b.movieDirTitle[movieDirTitleKey(dir, parsedTitle)] = struct{}{}
+	}
+	if item.input.Item != nil {
+		if item.input.Item.Name != "" {
+			b.movieDirTitle[movieDirTitleKey(dir, item.input.Item.Name)] = struct{}{}
+		}
+		if len(item.input.Item.Extra.ProviderIDs) > 0 {
+			if tmdbID := getProviderID(item.input.Item.Extra.ProviderIDs, "Tmdb"); tmdbID != "" {
+				b.movieProvider["tmdb:"+strings.ToLower(tmdbID)] = struct{}{}
+			}
+			if imdbID := getProviderID(item.input.Item.Extra.ProviderIDs, "Imdb"); imdbID != "" {
+				b.movieProvider["imdb:"+strings.ToLower(imdbID)] = struct{}{}
+			}
+		}
+	}
+	b.items = append(b.items, item)
+	if len(b.items) >= b.maxSize {
+		return b.flush(ctx)
+	}
+	return nil
+}
+
+func (b *phaseABatch) addEpisode(ctx context.Context, item pendingPhaseAItem, seriesID string, seasonNum, episodeNum int) error {
+	b.episodeKeys[episodeMergeKey(seriesID, seasonNum, episodeNum)] = struct{}{}
+	b.items = append(b.items, item)
+	if len(b.items) >= b.maxSize {
+		return b.flush(ctx)
+	}
+	return nil
+}
+
+func (b *phaseABatch) flush(ctx context.Context) error {
+	if len(b.items) == 0 {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		b.reset()
+		return err
+	}
+
+	pending := make([]pendingPhaseAItem, len(b.items))
+	copy(pending, b.items)
+	b.reset()
+
+	inputs := make([]sqlite.BatchItemInput, len(pending))
+	for i, item := range pending {
+		inputs[i] = item.input
+	}
+
+	if err := b.scanner.repo.UpsertItemsBatch(ctx, inputs); err != nil {
+		for _, item := range pending {
+			b.stats.Errors++
+			b.scanner.recordDiscoveryItem(b.libID, item.displayFileName, false, false, true)
+		}
+		return err
+	}
+
+	for _, item := range pending {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if item.postHook != nil {
+			if err := item.postHook(ctx); err != nil {
+				b.stats.Errors++
+				b.scanner.recordDiscoveryItem(b.libID, item.displayFileName, false, false, true)
+				continue
+			}
+		}
+		b.stats.ItemsAdded++
+		b.scanner.recordDiscoveryItem(b.libID, item.displayFileName, true, false, false)
+		if len(item.tasks) > 0 {
+			*b.tasks = append(*b.tasks, item.tasks...)
+		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	runtime.Gosched()
+	return nil
+}
 
 type enrichTask struct {
 	ItemID           string
@@ -382,7 +561,10 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 			if err := s.waitIfPaused(ctx); err != nil {
 				return stats, err
 			}
-			itemTasks := s.processDiscoveredFile(ctx, lib, root, cleanTarget, forceTV, seriesCache, seasonCache, artistCache, albumCache, seenSeriesEnrich, seenSeriesExtras, &stats)
+			itemTasks, procErr := s.processDiscoveredFile(ctx, lib, root, cleanTarget, forceTV, seriesCache, seasonCache, artistCache, albumCache, seenSeriesEnrich, seenSeriesExtras, nil, &stats)
+			if procErr != nil {
+				return stats, procErr
+			}
 			tasks = append(tasks, itemTasks...)
 		}
 	} else {
@@ -523,6 +705,7 @@ func (s *Scanner) runPhaseAWithRoot(ctx context.Context, lib *sqlite.LibraryReco
 	policy := s.currentSymlinkPolicy()
 
 	var tasks []enrichTask
+	batch := newPhaseABatch(s, lib.ID, stats, &tasks)
 	walkErr := WalkSafe(walkRoot, policy, func(path string, info os.FileInfo) error {
 		if err := s.waitIfPaused(ctx); err != nil {
 			return err
@@ -558,16 +741,27 @@ func (s *Scanner) runPhaseAWithRoot(ctx context.Context, lib *sqlite.LibraryReco
 		if discovered != nil {
 			discovered[filepath.Clean(path)] = struct{}{}
 		}
-		itemTasks := s.processDiscoveredFile(ctx, lib, logicalRoot, path, forceTV, seriesCache, seasonCache, artistCache, albumCache, seenSeriesEnrich, seenSeriesExtras, stats)
+		itemTasks, err := s.processDiscoveredFile(ctx, lib, logicalRoot, path, forceTV, seriesCache, seasonCache, artistCache, albumCache, seenSeriesEnrich, seenSeriesExtras, batch, stats)
+		if err != nil {
+			return err
+		}
 		tasks = append(tasks, itemTasks...)
 		return nil
 	})
 	if walkErr != nil {
 		if ctx.Err() != nil {
+			batch.reset()
 			return tasks, true, ctx.Err()
 		}
 		stats.Errors++
+		_ = batch.flush(ctx)
 		return tasks, true, nil
+	}
+	if err := batch.flush(ctx); err != nil {
+		if ctx.Err() != nil {
+			return tasks, true, ctx.Err()
+		}
+		return tasks, false, nil
 	}
 	return tasks, false, nil
 }
@@ -580,12 +774,14 @@ func (s *Scanner) processDiscoveredFile(
 	seriesCache, seasonCache, artistCache, albumCache map[string]*sqlite.ItemRecord,
 	seenSeriesEnrich map[string]struct{},
 	seenSeriesExtras map[string]struct{},
+	batch *phaseABatch,
 	stats *ScanStats,
-) []enrichTask {
+) ([]enrichTask, error) {
 	var (
-		changed bool
-		tasks   []enrichTask
-		err     error
+		changed  bool
+		deferred bool
+		tasks    []enrichTask
+		err      error
 	)
 	if IsAudioFile(path) {
 		var task *enrichTask
@@ -596,19 +792,25 @@ func (s *Scanner) processDiscoveredFile(
 	} else {
 		epInfo := ParseEpisodePath(root, path, forceTV)
 		if epInfo.IsEpisode {
-			changed, tasks, err = s.indexEpisode(ctx, lib, epInfo, path, seriesCache, seasonCache, seenSeriesEnrich, seenSeriesExtras)
+			changed, deferred, tasks, err = s.indexEpisode(ctx, lib, epInfo, path, seriesCache, seasonCache, seenSeriesEnrich, seenSeriesExtras, batch)
 		} else {
 			var task *enrichTask
-			changed, task, err = s.indexMovie(ctx, lib, path)
+			changed, deferred, task, err = s.indexMovie(ctx, lib, path, batch)
 			if task != nil {
 				tasks = append(tasks, *task)
 			}
 		}
 	}
+	if deferred {
+		if err != nil && ctx.Err() != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
 	if err != nil {
 		stats.Errors++
 		s.recordDiscoveryItem(lib.ID, filepath.Base(path), false, false, true)
-		return nil
+		return nil, nil
 	}
 	if changed {
 		stats.ItemsAdded++
@@ -617,7 +819,7 @@ func (s *Scanner) processDiscoveredFile(
 		stats.ItemsSkipped++
 		s.recordDiscoveryItem(lib.ID, filepath.Base(path), false, true, false)
 	}
-	return tasks
+	return tasks, nil
 }
 
 func (s *Scanner) runPhaseB(ctx context.Context, libraryID string, tasks []enrichTask) int {
