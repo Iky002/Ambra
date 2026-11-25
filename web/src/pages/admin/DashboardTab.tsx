@@ -234,7 +234,7 @@ export function DashboardTab() {
               />
               <StatusTile
                 label="当前版本"
-                value={sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.10.4')}
+                value={sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.10.5')}
                 sub={`Emby ${sysInfo?.Version || '4.10.2.0'} 兼容 · 端口 ${sysInfo?.HttpServerPortNumber || 8096}`}
               />
               <StatusTile
