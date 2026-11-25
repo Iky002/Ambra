@@ -133,10 +133,10 @@ func (s *Scanner) ScanLibrary(ctx context.Context, libraryID string) (ScanStats,
 	return s.scanLibrary(ctx, libraryID, false)
 }
 
-func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, mediaPath string) (bool, *enrichTask, error) {
+func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, mediaPath string, batch *phaseABatch) (bool, bool, *enrichTask, error) {
 	info, err := os.Stat(mediaPath)
 	if err != nil {
-		return false, nil, err
+		return false, false, nil, err
 	}
 	mtime := info.ModTime().Unix()
 	size := info.Size()
@@ -193,7 +193,7 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 					ProviderIDs:   queryIDs,
 					Language:      s.language(),
 				}
-				return false, &enrichTask{
+				return false, false, &enrichTask{
 					ItemID:         existing.ID,
 					LibraryID:      lib.ID,
 					ItemType:       "Movie",
@@ -209,12 +209,12 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 					DisplayName:    queryTitle,
 				}, nil
 			}
-			return false, nil, nil
+			return false, false, nil, nil
 		}
 		if existing.Path != mediaPath {
 			ms := s.buildMediaSource(existing, mediaPath, size, mtime, isStrm, container, nil)
 			if err := s.repo.UpsertMediaSourceAndStreams(ctx, existing.ID, ms); err != nil {
-				return false, nil, err
+				return false, false, nil, err
 			}
 			var task *enrichTask
 			if needProbe {
@@ -231,7 +231,7 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 					IsAltMediaSource: true,
 				}
 			}
-			return true, task, nil
+			return true, false, task, nil
 		}
 	}
 
@@ -254,6 +254,17 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 
 	// Auto-merge into existing movie if this is a new file matching an existing item by TMDB/IMDB ID or same-dir title.
 	if existing == nil {
+		if batch != nil {
+			var checkProviderIDs map[string]string
+			if meta != nil && len(meta.ProviderIDs) > 0 {
+				checkProviderIDs = meta.ProviderIDs
+			} else if len(parsed.ProviderIDs) > 0 {
+				checkProviderIDs = parsed.ProviderIDs
+			}
+			if flushErr := batch.flushIfMovieCollides(ctx, filepath.Dir(mediaPath), title, checkProviderIDs); flushErr != nil && ctx.Err() != nil {
+				return false, false, nil, flushErr
+			}
+		}
 		var mergeTarget *sqlite.ItemRecord
 		if meta != nil && len(meta.ProviderIDs) > 0 {
 			if tmdbID := getProviderID(meta.ProviderIDs, "Tmdb"); tmdbID != "" {
@@ -271,7 +282,7 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 		if mergeTarget != nil {
 			ms := s.buildMediaSource(mergeTarget, mediaPath, size, mtime, isStrm, container, nil)
 			if err := s.repo.UpsertMediaSourceAndStreams(ctx, mergeTarget.ID, ms); err != nil {
-				return false, nil, err
+				return false, false, nil, err
 			}
 			var task *enrichTask
 			if needProbe {
@@ -288,7 +299,7 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 					IsAltMediaSource: true,
 				}
 			}
-			return true, task, nil
+			return true, false, task, nil
 		}
 	}
 
@@ -323,38 +334,7 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 	}
 	applyMetadataToItem(rec, meta)
 
-	if err := s.repo.UpsertItem(ctx, rec); err != nil {
-		return false, nil, err
-	}
-	if err := s.repo.ReplaceItemAncestors(ctx, rec.ID, []sqlite.AncestorLink{
-		{AncestorID: lib.ID, Depth: 1},
-	}); err != nil {
-		return false, nil, err
-	}
-
-	// MediaSource + external subtitles (ffprobe runs in Phase B)
-	ms := s.buildMediaSource(rec, mediaPath, size, mtime, isStrm, container, nil)
-	if err := s.repo.UpsertMediaSourceAndStreams(ctx, rec.ID, ms); err != nil {
-		return false, nil, err
-	}
-
-	// Local images
-	imgs := discoverLocalImages(rec.ID, mediaPath, filepath.Dir(mediaPath), false)
-	if err := s.repo.ReplaceItemImages(ctx, rec.ID, imgs); err != nil {
-		return false, nil, err
-	}
-	if meta != nil {
-		s.downloadAndSaveRemoteImages(ctx, rec, meta)
-	}
-
-	// Taxonomies, People & FTS5
-	s.persistMetaRelationsAndFTS(ctx, rec, meta)
-
-	// Local Trailers, Special Features & Theme Songs
-	s.scanAndIndexExtras(ctx, lib, rec, filepath.Dir(mediaPath), strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath)))
-
 	hasLocalTitle := meta != nil && strings.TrimSpace(meta.Name) != ""
-
 	var task *enrichTask
 	if needProbe || needOnline {
 		if len(rec.Extra.ProviderIDs) > 0 {
@@ -376,7 +356,78 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 			DisplayName:    rec.Name,
 		}
 	}
-	return true, task, nil
+
+	ms := s.buildMediaSource(rec, mediaPath, size, mtime, isStrm, container, nil)
+	imgs := discoverLocalImages(rec.ID, mediaPath, filepath.Dir(mediaPath), false)
+	mediaDir := filepath.Dir(mediaPath)
+	mediaBaseName := strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath))
+
+	if batch != nil {
+		titleRaw, titleTokens, peopleTokens := buildFTSFields(rec, extractMetaPeopleNames(meta))
+		var pendingTasks []enrichTask
+		if task != nil {
+			pendingTasks = []enrichTask{*task}
+		}
+		pending := pendingPhaseAItem{
+			input: sqlite.BatchItemInput{
+				Item:           rec,
+				AncestorIDs:    []string{lib.ID},
+				FTSTitleRaw:    titleRaw,
+				FTSTitleTokens: titleTokens,
+				FTSPinyinFull:  "",
+				FTSPinyinInit:  "",
+				FTSPeopleNames: peopleTokens,
+			},
+			postHook: func(hookCtx context.Context) error {
+				if err := s.repo.UpsertMediaSourceAndStreams(hookCtx, rec.ID, ms); err != nil {
+					return err
+				}
+				if err := s.repo.ReplaceItemImages(hookCtx, rec.ID, imgs); err != nil {
+					return err
+				}
+				if meta != nil {
+					s.downloadAndSaveRemoteImages(hookCtx, rec, meta)
+				}
+				s.persistMetaRelations(hookCtx, rec, meta)
+				s.scanAndIndexExtras(hookCtx, lib, rec, mediaDir, mediaBaseName)
+				return nil
+			},
+			displayFileName: filepath.Base(mediaPath),
+			tasks:           pendingTasks,
+		}
+		flushErr := batch.addMovie(ctx, pending, mediaDir, title)
+		return true, true, nil, flushErr
+	}
+
+	if err := s.repo.UpsertItem(ctx, rec); err != nil {
+		return false, false, nil, err
+	}
+	if err := s.repo.ReplaceItemAncestors(ctx, rec.ID, []sqlite.AncestorLink{
+		{AncestorID: lib.ID, Depth: 1},
+	}); err != nil {
+		return false, false, nil, err
+	}
+
+	// MediaSource + external subtitles (ffprobe runs in Phase B)
+	if err := s.repo.UpsertMediaSourceAndStreams(ctx, rec.ID, ms); err != nil {
+		return false, false, nil, err
+	}
+
+	// Local images
+	if err := s.repo.ReplaceItemImages(ctx, rec.ID, imgs); err != nil {
+		return false, false, nil, err
+	}
+	if meta != nil {
+		s.downloadAndSaveRemoteImages(ctx, rec, meta)
+	}
+
+	// Taxonomies, People & FTS5
+	s.persistMetaRelationsAndFTS(ctx, rec, meta)
+
+	// Local Trailers, Special Features & Theme Songs
+	s.scanAndIndexExtras(ctx, lib, rec, mediaDir, mediaBaseName)
+
+	return true, false, task, nil
 }
 
 func (s *Scanner) indexEpisode(
@@ -388,10 +439,11 @@ func (s *Scanner) indexEpisode(
 	seasonCache map[string]*sqlite.ItemRecord,
 	seenSeriesEnrich map[string]struct{},
 	seenSeriesExtras map[string]struct{},
-) (bool, []enrichTask, error) {
+	batch *phaseABatch,
+) (bool, bool, []enrichTask, error) {
 	info, err := os.Stat(mediaPath)
 	if err != nil {
-		return false, nil, err
+		return false, false, nil, err
 	}
 	mtime := info.ModTime().Unix()
 	size := info.Size()
@@ -517,15 +569,15 @@ func (s *Scanner) indexEpisode(
 					})
 				}
 				if len(backfillTasks) > 0 {
-					return false, backfillTasks, nil
+					return false, false, backfillTasks, nil
 				}
 			}
-			return false, nil, nil
+			return false, false, nil, nil
 		}
 		if existing.Path != mediaPath {
 			ms := s.buildMediaSource(existing, mediaPath, size, mtime, isStrm, container, nil)
 			if err := s.repo.UpsertMediaSourceAndStreams(ctx, existing.ID, ms); err != nil {
-				return false, nil, err
+				return false, false, nil, err
 			}
 			var tasks []enrichTask
 			if needProbe {
@@ -542,7 +594,7 @@ func (s *Scanner) indexEpisode(
 					IsAltMediaSource: true,
 				})
 			}
-			return true, tasks, nil
+			return true, false, tasks, nil
 		}
 	}
 
@@ -551,7 +603,7 @@ func (s *Scanner) indexEpisode(
 	// 1. Ensure Series
 	seriesRec, seriesTask, err := s.ensureSeries(ctx, lib, epInfo, seriesCache, seenSeriesEnrich)
 	if err != nil {
-		return false, nil, err
+		return false, false, nil, err
 	}
 	if seriesRec != nil {
 		seenSeriesExtras[seriesRec.ID] = struct{}{}
@@ -563,7 +615,7 @@ func (s *Scanner) indexEpisode(
 	// 2. Ensure Season
 	seasonRec, seasonTask, err := s.ensureSeason(ctx, lib, seriesRec, epInfo, seasonCache, seenSeriesEnrich)
 	if err != nil {
-		return false, nil, err
+		return false, false, nil, err
 	}
 	if seasonTask != nil {
 		tasks = append(tasks, *seasonTask)
@@ -571,10 +623,15 @@ func (s *Scanner) indexEpisode(
 
 	// Auto-merge into existing episode if same Series + SeasonNumber + EpisodeNumber already exists.
 	if existing == nil {
+		if batch != nil {
+			if flushErr := batch.flushIfEpisodeCollides(ctx, seriesRec.ID, epInfo.SeasonNumber, epInfo.EpisodeNumber); flushErr != nil && ctx.Err() != nil {
+				return false, false, nil, flushErr
+			}
+		}
 		if mergeTarget, err := s.repo.FindEpisodeByNumber(ctx, seriesRec.ID, epInfo.SeasonNumber, epInfo.EpisodeNumber); err == nil && mergeTarget != nil {
 			ms := s.buildMediaSource(mergeTarget, mediaPath, size, mtime, isStrm, container, nil)
 			if err := s.repo.UpsertMediaSourceAndStreams(ctx, mergeTarget.ID, ms); err != nil {
-				return false, nil, err
+				return false, false, nil, err
 			}
 			if needProbe {
 				tasks = append(tasks, enrichTask{
@@ -590,7 +647,7 @@ func (s *Scanner) indexEpisode(
 					IsAltMediaSource: true,
 				})
 			}
-			return true, tasks, nil
+			return true, false, tasks, nil
 		}
 	}
 
@@ -644,31 +701,7 @@ func (s *Scanner) indexEpisode(
 	}
 	applyMetadataToItem(rec, meta)
 
-	if err := s.repo.UpsertItem(ctx, rec); err != nil {
-		return false, nil, err
-	}
-	if err := s.repo.ReplaceItemAncestors(ctx, rec.ID, []sqlite.AncestorLink{
-		{AncestorID: seasonRec.ID, Depth: 1},
-		{AncestorID: seriesRec.ID, Depth: 2},
-		{AncestorID: lib.ID, Depth: 3},
-	}); err != nil {
-		return false, nil, err
-	}
-
-	ms := s.buildMediaSource(rec, mediaPath, size, mtime, isStrm, container, nil)
-	if err := s.repo.UpsertMediaSourceAndStreams(ctx, rec.ID, ms); err != nil {
-		return false, nil, err
-	}
-
-	imgs := discoverLocalImages(rec.ID, mediaPath, filepath.Dir(mediaPath), true)
-	if len(imgs) > 0 {
-		_ = s.repo.ReplaceItemImages(ctx, rec.ID, imgs)
-	}
-
-	s.persistMetaRelationsAndFTS(ctx, rec, meta)
-
 	hasLocalTitle := meta != nil && strings.TrimSpace(meta.Name) != ""
-
 	if needProbe || needOnline {
 		tasks = append(tasks, enrichTask{
 			ItemID:         rec.ID,
@@ -687,7 +720,61 @@ func (s *Scanner) indexEpisode(
 			DisplayName:    rec.Name,
 		})
 	}
-	return true, tasks, nil
+
+	ms := s.buildMediaSource(rec, mediaPath, size, mtime, isStrm, container, nil)
+	imgs := discoverLocalImages(rec.ID, mediaPath, filepath.Dir(mediaPath), true)
+
+	if batch != nil {
+		titleRaw, titleTokens, peopleTokens := buildFTSFields(rec, extractMetaPeopleNames(meta))
+		pending := pendingPhaseAItem{
+			input: sqlite.BatchItemInput{
+				Item:           rec,
+				AncestorIDs:    []string{seasonRec.ID, seriesRec.ID, lib.ID},
+				FTSTitleRaw:    titleRaw,
+				FTSTitleTokens: titleTokens,
+				FTSPinyinFull:  "",
+				FTSPinyinInit:  "",
+				FTSPeopleNames: peopleTokens, // empty for Episode (cast/crew indexed at Series level)
+			},
+			postHook: func(hookCtx context.Context) error {
+				if err := s.repo.UpsertMediaSourceAndStreams(hookCtx, rec.ID, ms); err != nil {
+					return err
+				}
+				if len(imgs) > 0 {
+					_ = s.repo.ReplaceItemImages(hookCtx, rec.ID, imgs)
+				}
+				s.persistMetaRelations(hookCtx, rec, meta)
+				return nil
+			},
+			displayFileName: filepath.Base(mediaPath),
+			tasks:           tasks,
+		}
+		flushErr := batch.addEpisode(ctx, pending, seriesRec.ID, seasonNum, epNum)
+		return true, true, nil, flushErr
+	}
+
+	if err := s.repo.UpsertItem(ctx, rec); err != nil {
+		return false, false, nil, err
+	}
+	if err := s.repo.ReplaceItemAncestors(ctx, rec.ID, []sqlite.AncestorLink{
+		{AncestorID: seasonRec.ID, Depth: 1},
+		{AncestorID: seriesRec.ID, Depth: 2},
+		{AncestorID: lib.ID, Depth: 3},
+	}); err != nil {
+		return false, false, nil, err
+	}
+
+	if err := s.repo.UpsertMediaSourceAndStreams(ctx, rec.ID, ms); err != nil {
+		return false, false, nil, err
+	}
+
+	if len(imgs) > 0 {
+		_ = s.repo.ReplaceItemImages(ctx, rec.ID, imgs)
+	}
+
+	s.persistMetaRelationsAndFTS(ctx, rec, meta)
+
+	return true, false, tasks, nil
 }
 
 func (s *Scanner) ensureSeries(
@@ -1573,7 +1660,7 @@ func applyMetadataToItem(rec *sqlite.ItemRecord, meta *plugins.MetadataResult) {
 	}
 }
 
-func (s *Scanner) persistMetaRelationsAndFTS(ctx context.Context, rec *sqlite.ItemRecord, meta *plugins.MetadataResult) {
+func (s *Scanner) persistMetaRelations(ctx context.Context, rec *sqlite.ItemRecord, meta *plugins.MetadataResult) []string {
 	var peopleNames []string
 	if meta != nil {
 		if len(meta.Genres) > 0 {
@@ -1605,10 +1692,34 @@ func (s *Scanner) persistMetaRelationsAndFTS(ctx context.Context, rec *sqlite.It
 			}
 		}
 	}
+	return peopleNames
+}
 
-	titleRaw := strings.TrimSpace(rec.Name + " " + rec.OriginalTitle)
-	titleTokens := TokenizeForFTS(rec.Name, rec.OriginalTitle, rec.Extra.SeriesName)
-	peopleTokens := TokenizeForFTS(peopleNames...)
+func extractMetaPeopleNames(meta *plugins.MetadataResult) []string {
+	if meta == nil || len(meta.People) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(meta.People))
+	for _, p := range meta.People {
+		names = append(names, p.Name)
+	}
+	return names
+}
+
+func buildFTSFields(rec *sqlite.ItemRecord, peopleNames []string) (titleRaw, titleTokens, peopleTokens string) {
+	titleRaw = strings.TrimSpace(rec.Name + " " + rec.OriginalTitle)
+	titleTokens = TokenizeForFTS(rec.Name, rec.OriginalTitle, rec.Extra.SeriesName)
+	// Episodes omit peopleNames in item_search_fts because cast/crew are already indexed at the
+	// Series level, eliminating massive FTS5 bloat across hundreds of thousands of episodes.
+	if !strings.EqualFold(rec.Type, "Episode") && len(peopleNames) > 0 {
+		peopleTokens = TokenizeForFTS(peopleNames...)
+	}
+	return titleRaw, titleTokens, peopleTokens
+}
+
+func (s *Scanner) persistMetaRelationsAndFTS(ctx context.Context, rec *sqlite.ItemRecord, meta *plugins.MetadataResult) {
+	peopleNames := s.persistMetaRelations(ctx, rec, meta)
+	titleRaw, titleTokens, peopleTokens := buildFTSFields(rec, peopleNames)
 	_ = s.repo.UpsertSearchFTS(ctx, rec.ID, titleRaw, titleTokens, "", "", peopleTokens)
 }
 

@@ -409,6 +409,7 @@ func (r *LibraryRepo) MergeItemVersions(ctx context.Context, itemIDs []string) (
 	if err := tx.Commit(); err != nil {
 		return "", 0, err
 	}
+	r.InvalidateCountCache()
 	return primaryID, mergedCount, nil
 }
 
@@ -485,6 +486,7 @@ func (r *LibraryRepo) SplitItemVersions(ctx context.Context, itemID string) ([]s
 		if container == "" {
 			container = primary.Container
 		}
+		sortKey, extraType, parentalRatingValue := computeItemDerivedFields(primary)
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO items (
 				id, internal_id, library_id, parent_id, series_id, season_id,
@@ -493,7 +495,8 @@ func (r *LibraryRepo) SplitItemVersions(ctx context.Context, itemID string) ([]s
 				index_number, parent_index_number, production_year,
 				premiere_date, end_date, community_rating, critic_rating, official_rating,
 				runtime_ticks, container, path, file_size, file_mtime,
-				etag, extra_json, date_created, date_modified
+				etag, extra_json, date_created, date_modified,
+				sort_key, extra_type, parental_rating_value
 			) VALUES (
 				?, NULL, ?, ?, ?, ?,
 				?, ?, 0, ?,
@@ -501,7 +504,8 @@ func (r *LibraryRepo) SplitItemVersions(ctx context.Context, itemID string) ([]s
 				?, ?, ?,
 				?, ?, ?, ?, ?,
 				?, ?, ?, ?, NULL,
-				?, ?, ?, ?
+				?, ?, ?, ?,
+				?, ?, ?
 			)`,
 			newID, primary.LibraryID, nullStr(primary.ParentID), nullStr(primary.SeriesID), nullStr(primary.SeasonID),
 			primary.Type, nullStr(primary.MediaType), boolToInt(isStrm),
@@ -510,6 +514,7 @@ func (r *LibraryRepo) SplitItemVersions(ctx context.Context, itemID string) ([]s
 			primary.PremiereDate, primary.EndDate, primary.CommunityRating, primary.CriticRating, nullStr(primary.OfficialRating),
 			rt, nullStr(container), nullStr(src.Path), fileSize,
 			guid.New()[:16], string(extraRaw), now, now,
+			sortKey, extraType, parentalRatingValue,
 		); err != nil {
 			return nil, err
 		}
@@ -551,5 +556,6 @@ func (r *LibraryRepo) SplitItemVersions(ctx context.Context, itemID string) ([]s
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	r.InvalidateCountCache()
 	return createdIDs, nil
 }
