@@ -35,6 +35,30 @@ func (s *Scanner) RefreshItem(ctx context.Context, itemID string, replaceMetadat
 	}
 
 	itemTypeLower := strings.ToLower(rec.Type)
+	if itemTypeLower == "movie" && rec.Path != "" && getProviderID(q.ProviderIDs, "tmdb") == "" {
+		var rootDir string
+		if lib, libErr := s.repo.GetLibrary(ctx, rec.LibraryID); libErr == nil && lib != nil {
+			rootDir = findContainingRoot(lib.Paths, rec.Path)
+		}
+		reparsed := ParseMoviePath(rootDir, rec.Path)
+		if reparsed.Title != "" {
+			q.Title = reparsed.Title
+		}
+		if reparsed.OriginalTitle != "" {
+			q.OriginalTitle = reparsed.OriginalTitle
+		}
+		if reparsed.Year > 0 {
+			q.Year = reparsed.Year
+		}
+		for k, v := range reparsed.ProviderIDs {
+			if q.ProviderIDs == nil {
+				q.ProviderIDs = make(map[string]string)
+			}
+			if _, exists := q.ProviderIDs[k]; !exists {
+				q.ProviderIDs[k] = v
+			}
+		}
+	}
 	if itemTypeLower == "season" {
 		if rec.IndexNumber != nil {
 			q.SeasonNumber = *rec.IndexNumber
