@@ -42,13 +42,14 @@ type RemoteImageCandidate struct {
 
 // Provider implements plugins.MetadataProvider using TMDB v3 REST API.
 type Provider struct {
-	mu           sync.RWMutex
-	apiKey       string
-	language     string
-	baseURL      string
-	imageBaseURL string
-	enabled      bool
-	client       *http.Client
+	mu            sync.RWMutex
+	apiKey        string
+	defaultAPIKey string
+	language      string
+	baseURL       string
+	imageBaseURL  string
+	enabled       bool
+	client        *http.Client
 }
 
 type providerConfig struct {
@@ -63,8 +64,12 @@ type providerConfig struct {
 func (p *Provider) snapshot() providerConfig {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+	apiKey := p.apiKey
+	if apiKey == "" {
+		apiKey = p.defaultAPIKey
+	}
 	return providerConfig{
-		apiKey:       p.apiKey,
+		apiKey:       apiKey,
 		language:     p.language,
 		baseURL:      p.baseURL,
 		imageBaseURL: p.imageBaseURL,
@@ -85,6 +90,15 @@ func New(apiKey, language string) *Provider {
 		enabled:      true,
 		client:       netutil.NewSafeHTTPClient(10*time.Second, false),
 	}
+}
+
+// WithDefaultAPIKey sets a built-in fallback TMDB API key used whenever no
+// user-configured api_key is present.
+func (p *Provider) WithDefaultAPIKey(key string) *Provider {
+	p.mu.Lock()
+	p.defaultAPIKey = strings.TrimSpace(key)
+	p.mu.Unlock()
+	return p
 }
 
 // SetHTTPClient overrides the HTTP client used for TMDB requests (useful in tests).
@@ -125,6 +139,8 @@ func (p *Provider) Configure(cfg map[string]any) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if v, ok := cfg["api_key"].(string); ok {
+		p.apiKey = strings.TrimSpace(v)
+	} else if v, ok := cfg["ApiKey"].(string); ok {
 		p.apiKey = strings.TrimSpace(v)
 	}
 	if v, ok := cfg["language"].(string); ok && v != "" {

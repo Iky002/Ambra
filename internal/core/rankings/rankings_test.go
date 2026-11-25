@@ -923,6 +923,34 @@ func TestFetchTMDBTrendingAPIKeyAndBearer(t *testing.T) {
 	if fDef.resolveTMDBBaseURL() != DefaultTMDBBaseURL {
 		t.Fatalf("expected default TMDB base URL, got %q", fDef.resolveTMDBBaseURL())
 	}
+
+	// 4. Dynamic TMDBAPIKeyFunc & DefaultTMDBAPIKey fallback priority
+	t.Setenv(EnvTMDBAPIKey, "")
+	t.Setenv(EnvTMDBAPIKeyFallback, "")
+	dynamicKey := ""
+	fDyn := NewFetcher(Options{
+		TMDBAPIKeyFunc:    func() string { return dynamicKey },
+		DefaultTMDBAPIKey: "builtin-default-key",
+	})
+	if got := fDyn.resolveTMDBAPIKey(); got != "builtin-default-key" {
+		t.Fatalf("expected DefaultTMDBAPIKey fallback, got %q", got)
+	}
+	// Env var takes precedence over DefaultTMDBAPIKey when dynamic user key is empty
+	t.Setenv(EnvTMDBAPIKeyFallback, "env-fallback-key")
+	if got := fDyn.resolveTMDBAPIKey(); got != "env-fallback-key" {
+		t.Fatalf("expected env fallback over DefaultTMDBAPIKey, got %q", got)
+	}
+	// Dynamic user key takes precedence over env var and DefaultTMDBAPIKey
+	dynamicKey = "  user-runtime-key  "
+	if got := fDyn.resolveTMDBAPIKey(); got != "user-runtime-key" {
+		t.Fatalf("expected dynamic user key override, got %q", got)
+	}
+	// Clearing dynamic user key + env falls back to DefaultTMDBAPIKey again
+	dynamicKey = ""
+	t.Setenv(EnvTMDBAPIKeyFallback, "")
+	if got := fDyn.resolveTMDBAPIKey(); got != "builtin-default-key" {
+		t.Fatalf("expected fallback to DefaultTMDBAPIKey after clear, got %q", got)
+	}
 }
 
 func TestFetchTMDBTrendingFallbacksAndCustomFetcher(t *testing.T) {

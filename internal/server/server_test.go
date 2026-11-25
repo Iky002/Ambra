@@ -14,6 +14,8 @@ import (
 	"github.com/ambra-media/ambra/internal/core/scheduler"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
+	"github.com/ambra-media/ambra/internal/plugins"
+	"github.com/ambra-media/ambra/internal/plugins/tmdb"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -153,6 +155,64 @@ func TestServerNewInvalidPath(t *testing.T) {
 	cfg := config.Default("/nonexistent-readonly-path-ambra/should-fail")
 	if _, err := New(context.Background(), cfg); err == nil {
 		t.Fatalf("expected error opening invalid db path")
+	}
+}
+
+func TestServerBuiltinTMDBKeyWiring(t *testing.T) {
+	t.Setenv("AMBRA_TMDB_API_KEY", "")
+	cfg, err := config.Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	defer func() { _ = srv.Close() }()
+
+	p, ok := srv.Registry.Get("ambra.builtin.tmdb")
+	if !ok {
+		t.Fatal("expected ambra.builtin.tmdb registered")
+	}
+	tmdbProvider, ok := p.(*tmdb.Provider)
+	if !ok {
+		t.Fatalf("expected *tmdb.Provider, got %T", p)
+	}
+
+	var seenKey string
+	mockTMDB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenKey = r.URL.Query().Get("api_key")
+		_, _ = w.Write([]byte(`{"id":550,"title":"Fight Club","release_date":"1999-10-15"}`))
+	}))
+	defer mockTMDB.Close()
+
+	tmdbProvider.SetHTTPClient(mockTMDB.Client())
+	if err := tmdbProvider.Configure(map[string]any{"base_url": mockTMDB.URL}); err != nil {
+		t.Fatalf("Configure base_url: %v", err)
+	}
+	res, err := tmdbProvider.FetchMetadata(context.Background(), plugins.MediaQuery{
+		ItemType:    "Movie",
+		ProviderIDs: map[string]string{"tmdb": "550"},
+	})
+	if err != nil || res == nil {
+		t.Fatalf("FetchMetadata with built-in key failed: res=%+v err=%v", res, err)
+	}
+	if seenKey != config.DefaultTMDBApiKey {
+		t.Fatalf("expected built-in key %q, got %q", config.DefaultTMDBApiKey, seenKey)
+	}
+
+	// Custom user key overrides built-in default
+	if err := tmdbProvider.Configure(map[string]any{"api_key": "custom-server-key"}); err != nil {
+		t.Fatalf("Configure custom api_key: %v", err)
+	}
+	if _, err := tmdbProvider.FetchMetadata(context.Background(), plugins.MediaQuery{
+		ItemType:    "Movie",
+		ProviderIDs: map[string]string{"tmdb": "550"},
+	}); err != nil {
+		t.Fatalf("FetchMetadata with custom key failed: %v", err)
+	}
+	if seenKey != "custom-server-key" {
+		t.Fatalf("expected custom-server-key, got %q", seenKey)
 	}
 }
 

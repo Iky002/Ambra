@@ -483,6 +483,55 @@ func TestUpdateTMDBClearsEnvFlagAndConcurrentSave(t *testing.T) {
 	}
 }
 
+func TestEffectiveTMDBApiKeyFallbackAndOverride(t *testing.T) {
+	t.Setenv("AMBRA_TMDB_API_KEY", "")
+
+	var nilCfg *Config
+	if got := nilCfg.EffectiveTMDBApiKey(); got != DefaultTMDBApiKey {
+		t.Fatalf("expected nil Config EffectiveTMDBApiKey=%q, got %q", DefaultTMDBApiKey, got)
+	}
+
+	dir := t.TempDir()
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TMDBApiKey != "" {
+		t.Fatalf("expected empty user TMDBApiKey by default, got %q", cfg.TMDBApiKey)
+	}
+	if got := cfg.EffectiveTMDBApiKey(); got != DefaultTMDBApiKey {
+		t.Fatalf("expected fallback DefaultTMDBApiKey=%q, got %q", DefaultTMDBApiKey, got)
+	}
+
+	// Default built-in key must not be persisted to ambra.json when user hasn't configured one.
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "config", "ambra.json"))
+	if err != nil {
+		t.Fatalf("read ambra.json: %v", err)
+	}
+	if containsString(string(raw), DefaultTMDBApiKey) {
+		t.Fatalf("built-in DefaultTMDBApiKey must not be written to ambra.json: %s", string(raw))
+	}
+
+	// User custom key overrides built-in fallback.
+	cfg.Update(func(c *Config) {
+		c.TMDBApiKey = "  user-custom-key  "
+	})
+	if got := cfg.EffectiveTMDBApiKey(); got != "user-custom-key" {
+		t.Fatalf("expected custom key override, got %q", got)
+	}
+
+	// Clearing user custom key falls back to built-in default again.
+	cfg.Update(func(c *Config) {
+		c.TMDBApiKey = ""
+	})
+	if got := cfg.EffectiveTMDBApiKey(); got != DefaultTMDBApiKey {
+		t.Fatalf("expected fallback to DefaultTMDBApiKey after clear, got %q", got)
+	}
+}
+
 func containsString(s, substr string) bool {
 	for i := 0; i+len(substr) <= len(s); i++ {
 		if s[i:i+len(substr)] == substr {

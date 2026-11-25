@@ -168,7 +168,7 @@ export function SettingsTab() {
                     type={showApiKey ? 'text' : 'password'}
                     value={tmdbApiKey}
                     onChange={(e) => setTmdbApiKey(e.target.value)}
-                    placeholder="输入 TMDB v3 API Key"
+                    placeholder="留空将使用内置默认密钥，可填写自定义 TMDB API Key"
                     className="w-full rounded-xl border border-white/10 bg-zinc-900/90 py-2.5 pl-3.5 pr-10 font-mono text-sm text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-amber-400/60"
                   />
                   <button
@@ -180,6 +180,9 @@ export function SettingsTab() {
                     {showApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                   </button>
                 </div>
+                <p className="mt-1.5 text-[11px] text-zinc-500">
+                  未填写时自动使用内置默认密钥，填写自定义密钥后将优先使用
+                </p>
               </div>
 
               <div>

@@ -45,6 +45,8 @@ type Fetcher struct {
 	imdbURL                    string
 	imdbMirrorURLs             []string
 	tmdbAPIKey                 string
+	tmdbAPIKeyFunc             func() string
+	defaultTMDBAPIKey          string
 	tmdbBaseURL                string
 	tmdbTrendingFetcher        func(ctx context.Context) ([]ChartEntry, string, error)
 	doubanTrendingMovieURL     string
@@ -76,6 +78,8 @@ func NewFetcher(opts Options) *Fetcher {
 		imdbURL:                    strings.TrimSpace(opts.IMDbURL),
 		imdbMirrorURLs:             mirrorURLs,
 		tmdbAPIKey:                 strings.TrimSpace(opts.TMDBAPIKey),
+		tmdbAPIKeyFunc:             opts.TMDBAPIKeyFunc,
+		defaultTMDBAPIKey:          strings.TrimSpace(opts.DefaultTMDBAPIKey),
 		tmdbBaseURL:                strings.TrimRight(strings.TrimSpace(opts.TMDBTrendingBaseURL), "/"),
 		tmdbTrendingFetcher:        opts.TMDBTrendingFetcher,
 		doubanTrendingMovieURL:     strings.TrimSpace(opts.DoubanTrendingMovieURL),
@@ -129,10 +133,18 @@ func (f *Fetcher) resolveTMDBAPIKey() string {
 	if f.tmdbAPIKey != "" {
 		return f.tmdbAPIKey
 	}
+	if f.tmdbAPIKeyFunc != nil {
+		if v := strings.TrimSpace(f.tmdbAPIKeyFunc()); v != "" {
+			return v
+		}
+	}
 	if v := strings.TrimSpace(os.Getenv(EnvTMDBAPIKey)); v != "" {
 		return v
 	}
-	return strings.TrimSpace(os.Getenv(EnvTMDBAPIKeyFallback))
+	if v := strings.TrimSpace(os.Getenv(EnvTMDBAPIKeyFallback)); v != "" {
+		return v
+	}
+	return f.defaultTMDBAPIKey
 }
 
 func (f *Fetcher) resolveTMDBBaseURL() string {

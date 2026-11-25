@@ -571,10 +571,10 @@ export function PluginsTab() {
                     }}
                     placeholder={
                       tmdbApiKeyCleared
-                        ? '已标记清除密钥，保存后将清空原值'
+                        ? '已标记清除自定义密钥，保存后将恢复使用内置默认密钥'
                         : tmdbApiKeyConfigured
                           ? '已配置密钥，留空保留原值'
-                          : '输入 TMDB v3 API Key'
+                          : '留空将使用内置默认密钥，或输入自定义 TMDB v3 API Key'
                     }
                     className="w-full rounded-xl border border-white/10 bg-black/40 px-3.5 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
                   />

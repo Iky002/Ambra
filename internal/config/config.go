@@ -16,6 +16,9 @@ var executablePathFn = os.Executable
 const (
 	ServerVersion = "4.10.2.0"
 	ProductName   = "Ambra"
+	// DefaultTMDBApiKey is the built-in fallback TMDB v3 API key used when the user
+	// has not configured a custom key in ambra.json or AMBRA_TMDB_API_KEY.
+	DefaultTMDBApiKey = "a3b1c06319c480a67f9a491a54cd555d"
 )
 
 // AmbraVersion is the Ambra application release version (overridden at build time via -ldflags).
@@ -275,6 +278,17 @@ func (c *Config) Save() error {
 		return err
 	}
 	return nil
+}
+
+// EffectiveTMDBApiKey returns the user/env-configured TMDB API key when set,
+// falling back to DefaultTMDBApiKey otherwise.
+func (c *Config) EffectiveTMDBApiKey() string {
+	if c != nil {
+		if k := strings.TrimSpace(c.Snapshot().TMDBApiKey); k != "" {
+			return k
+		}
+	}
+	return DefaultTMDBApiKey
 }
 
 func (c *Config) DBPath() string {

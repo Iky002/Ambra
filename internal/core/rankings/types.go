@@ -127,6 +127,8 @@ type Options struct {
 	IMDbURL                    string
 	IMDbMirrorURLs             []string
 	TMDBAPIKey                 string
+	TMDBAPIKeyFunc             func() string
+	DefaultTMDBAPIKey          string
 	TMDBTrendingBaseURL        string
 	TMDBTrendingFetcher        func(ctx context.Context) ([]ChartEntry, string, error)
 	DoubanTrendingMovieURL     string
