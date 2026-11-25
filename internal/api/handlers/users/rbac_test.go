@@ -133,3 +133,93 @@ func TestSessionsDevicesAndDisplayPreferencesRBAC(t *testing.T) {
 		t.Fatalf("expected 204 for admin DisplayPreferences write, got %d", rec.Code)
 	}
 }
+
+func TestUserAuditActivityLogs(t *testing.T) {
+	tmp := t.TempDir()
+	cfg, err := config.Load(filepath.Join(tmp, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlite.Open(cfg.DBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	userRepo := sqlite.NewUserRepo(store)
+	authSvc := auth.NewService(userRepo, cfg)
+	sessMgr := session.NewManager(userRepo, cfg, eventbus.New())
+	authMW := middleware.NewAuth(authSvc, sessMgr)
+
+	if _, err := authSvc.CreateUser(ctx, "admin", "admin123", true); err != nil {
+		t.Fatal(err)
+	}
+	adminAuth, err := authSvc.AuthenticateByName(ctx, "admin", "admin123", "", auth.ClientInfo{DeviceID: "dev-admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := chi.NewRouter()
+	r.Use(authMW.ParseAuth)
+	RegisterRoutes(r, authMW, NewHandler(authSvc, userRepo, sessMgr, nil, cfg))
+
+	doReq := func(token, method, target, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, strings.NewReader(body))
+		if token != "" {
+			req.Header.Set("X-Emby-Token", token)
+		}
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. Failed login -> AuthenticationFailed
+	if rec := doReq("", http.MethodPost, "/Users/AuthenticateByName", `{"Username":"admin","Pw":"wrong"}`); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for wrong password, got %d", rec.Code)
+	}
+
+	// 2. Create user -> UserCreated
+	createRec := doReq(adminAuth.AccessToken, http.MethodPost, "/Users/New", `{"Name":"audituser","Password":"pw1","IsAdministrator":false}`)
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for CreateUser, got %d", createRec.Code)
+	}
+	var created dto.UserDto
+	_ = json.Unmarshal(createRec.Body.Bytes(), &created)
+
+	// 3. Change password -> UserPasswordChanged
+	if rec := doReq(adminAuth.AccessToken, http.MethodPost, "/Users/"+created.Id+"/Password", `{"NewPw":"pw2"}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for UpdateUserPassword, got %d", rec.Code)
+	}
+
+	// 4. Disable user and attempt login -> AuthenticationFailed (disabled)
+	disabledPol := sqlite.DefaultUserPolicy(false)
+	disabledPol.IsDisabled = true
+	_ = userRepo.UpdateUserPolicy(ctx, created.Id, disabledPol)
+	authSvc.InvalidateUserCache(created.Id)
+	if rec := doReq("", http.MethodPost, "/Users/AuthenticateByName", `{"Username":"audituser","Pw":"pw2"}`); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for disabled user login, got %d", rec.Code)
+	}
+
+	// 5. Delete user -> UserDeleted
+	if rec := doReq(adminAuth.AccessToken, http.MethodDelete, "/Users/"+created.Id, ""); rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for DeleteUser, got %d", rec.Code)
+	}
+
+	logs, _, err := userRepo.ListActivityLogs(ctx, 0, 50, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]int{}
+	for _, l := range logs {
+		seen[l.Type]++
+	}
+	for _, want := range []string{"AuthenticationFailed", "UserCreated", "UserPasswordChanged", "UserDeleted"} {
+		if seen[want] == 0 {
+			t.Errorf("expected activity log event %q, got counts %+v", want, seen)
+		}
+	}
+	if seen["AuthenticationFailed"] < 2 {
+		t.Errorf("expected at least 2 AuthenticationFailed events, got %d", seen["AuthenticationFailed"])
+	}
+}

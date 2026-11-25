@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ambra-media/ambra/internal/plugins"
@@ -38,12 +39,33 @@ type RemoteImageCandidate struct {
 
 // Provider implements plugins.MetadataProvider using TMDB v3 REST API.
 type Provider struct {
+	mu           sync.RWMutex
 	apiKey       string
 	language     string
 	baseURL      string
 	imageBaseURL string
 	enabled      bool
 	client       *http.Client
+}
+
+type providerConfig struct {
+	apiKey       string
+	language     string
+	baseURL      string
+	imageBaseURL string
+	enabled      bool
+}
+
+func (p *Provider) snapshot() providerConfig {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return providerConfig{
+		apiKey:       p.apiKey,
+		language:     p.language,
+		baseURL:      p.baseURL,
+		imageBaseURL: p.imageBaseURL,
+		enabled:      p.enabled,
+	}
 }
 
 func New(apiKey, language string) *Provider {
@@ -61,6 +83,7 @@ func New(apiKey, language string) *Provider {
 }
 
 func (p *Provider) Manifest() plugins.Manifest {
+	snap := p.snapshot()
 	return plugins.Manifest{
 		ID:          "ambra.builtin.tmdb",
 		Name:        "TMDB Metadata Provider",
@@ -68,13 +91,15 @@ func (p *Provider) Manifest() plugins.Manifest {
 		Description: "Fetches Movie/Series metadata and artwork from The Movie Database (v3 API)",
 		Author:      "Ambra",
 		BuiltIn:     true,
-		Enabled:     p.enabled,
+		Enabled:     snap.enabled,
 		Priority:    20,
 		Kinds:       []plugins.Kind{plugins.KindMetadata, plugins.KindImage},
 	}
 }
 
 func (p *Provider) Configure(cfg map[string]any) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if v, ok := cfg["api_key"].(string); ok {
 		p.apiKey = strings.TrimSpace(v)
 	}
@@ -94,13 +119,14 @@ func (p *Provider) Configure(cfg map[string]any) error {
 }
 
 func (p *Provider) FetchMetadata(ctx context.Context, q plugins.MediaQuery) (*plugins.MetadataResult, error) {
-	if p.apiKey == "" {
+	snap := p.snapshot()
+	if snap.apiKey == "" {
 		// Gracefully skip when no API key is configured.
 		return nil, nil
 	}
 	lang := q.Language
 	if lang == "" {
-		lang = p.language
+		lang = snap.language
 	}
 
 	switch strings.ToLower(q.ItemType) {
@@ -136,10 +162,11 @@ func (p *Provider) profileImageURL(profilePath string) string {
 	if profilePath == "" {
 		return ""
 	}
-	if p.imageBaseURL == defaultImageBaseURL {
+	imgBase := p.snapshot().imageBaseURL
+	if imgBase == defaultImageBaseURL {
 		return defaultProfileImageBaseURL + profilePath
 	}
-	return p.imageBaseURL + profilePath
+	return imgBase + profilePath
 }
 
 func (p *Provider) findTMDBIDByIMDb(ctx context.Context, imdbID, lang, mediaKind string) string {
@@ -147,8 +174,9 @@ func (p *Provider) findTMDBIDByIMDb(ctx context.Context, imdbID, lang, mediaKind
 	if imdbID == "" {
 		return ""
 	}
+	snap := p.snapshot()
 	params := url.Values{}
-	params.Set("api_key", p.apiKey)
+	params.Set("api_key", snap.apiKey)
 	params.Set("language", lang)
 	params.Set("external_source", "imdb_id")
 	var fr struct {
@@ -234,10 +262,11 @@ func (p *Provider) searchTMDBWithFallbacks(ctx context.Context, endpoint, yearPa
 	addAttempt(q.Title, 0)
 	addAttempt(q.OriginalTitle, 0)
 
+	snap := p.snapshot()
 	var lastErr error
 	for _, a := range attempts {
 		params := url.Values{}
-		params.Set("api_key", p.apiKey)
+		params.Set("api_key", snap.apiKey)
 		params.Set("language", lang)
 		params.Set("query", a.title)
 		if a.year > 0 {
@@ -278,8 +307,9 @@ func (p *Provider) fetchMovie(ctx context.Context, q plugins.MediaQuery, lang st
 		}
 	}
 
+	snap := p.snapshot()
 	params := url.Values{}
-	params.Set("api_key", p.apiKey)
+	params.Set("api_key", snap.apiKey)
 	params.Set("language", lang)
 	params.Set("append_to_response", "credits,external_ids")
 
@@ -321,7 +351,7 @@ func (p *Provider) fetchMovie(ctx context.Context, q plugins.MediaQuery, lang st
 			BackdropPath string `json:"backdrop_path"`
 		} `json:"belongs_to_collection"`
 	}
-	if err := p.getJSON(ctx, "/movie/"+tmdbID, params, &detail); err != nil {
+	if err := p.getJSON(ctx, "/movie/"+url.PathEscape(tmdbID), params, &detail); err != nil {
 		return nil, err
 	}
 
@@ -340,10 +370,10 @@ func (p *Provider) fetchMovie(ctx context.Context, q plugins.MediaQuery, lang st
 			Name: strings.TrimSpace(detail.BelongsToCollection.Name),
 		}
 		if detail.BelongsToCollection.PosterPath != "" {
-			col.PosterURL = p.imageBaseURL + detail.BelongsToCollection.PosterPath
+			col.PosterURL = snap.imageBaseURL + detail.BelongsToCollection.PosterPath
 		}
 		if detail.BelongsToCollection.BackdropPath != "" {
-			col.BackdropURL = p.imageBaseURL + detail.BelongsToCollection.BackdropPath
+			col.BackdropURL = snap.imageBaseURL + detail.BelongsToCollection.BackdropPath
 		}
 		res.Collection = col
 	}
@@ -356,10 +386,10 @@ func (p *Provider) fetchMovie(ctx context.Context, q plugins.MediaQuery, lang st
 		res.ProviderIDs["imdb"] = detail.ExternalIDs.IMDbID
 	}
 	if detail.PosterPath != "" {
-		res.PosterURL = p.imageBaseURL + detail.PosterPath
+		res.PosterURL = snap.imageBaseURL + detail.PosterPath
 	}
 	if detail.BackdropPath != "" {
-		res.BackdropURL = p.imageBaseURL + detail.BackdropPath
+		res.BackdropURL = snap.imageBaseURL + detail.BackdropPath
 	}
 	for _, g := range detail.Genres {
 		res.Genres = append(res.Genres, g.Name)
@@ -417,8 +447,9 @@ func (p *Provider) fetchSeries(ctx context.Context, q plugins.MediaQuery, lang s
 		}
 	}
 
+	snap := p.snapshot()
 	params := url.Values{}
-	params.Set("api_key", p.apiKey)
+	params.Set("api_key", snap.apiKey)
 	params.Set("language", lang)
 	params.Set("append_to_response", "credits,external_ids")
 
@@ -455,7 +486,7 @@ func (p *Provider) fetchSeries(ctx context.Context, q plugins.MediaQuery, lang s
 			TVDBID int    `json:"tvdb_id"`
 		} `json:"external_ids"`
 	}
-	if err := p.getJSON(ctx, "/tv/"+tmdbID, params, &detail); err != nil {
+	if err := p.getJSON(ctx, "/tv/"+url.PathEscape(tmdbID), params, &detail); err != nil {
 		return nil, err
 	}
 
@@ -480,10 +511,10 @@ func (p *Provider) fetchSeries(ctx context.Context, q plugins.MediaQuery, lang s
 		res.ProviderIDs["tvdb"] = strconv.Itoa(detail.ExternalIDs.TVDBID)
 	}
 	if detail.PosterPath != "" {
-		res.PosterURL = p.imageBaseURL + detail.PosterPath
+		res.PosterURL = snap.imageBaseURL + detail.PosterPath
 	}
 	if detail.BackdropPath != "" {
-		res.BackdropURL = p.imageBaseURL + detail.BackdropPath
+		res.BackdropURL = snap.imageBaseURL + detail.BackdropPath
 	}
 	for _, g := range detail.Genres {
 		res.Genres = append(res.Genres, g.Name)
@@ -525,11 +556,12 @@ func (p *Provider) fetchSeason(ctx context.Context, q plugins.MediaQuery, lang s
 	if tmdbID == "" || q.SeasonNumber < 0 {
 		return nil, nil
 	}
+	snap := p.snapshot()
 	params := url.Values{}
-	params.Set("api_key", p.apiKey)
+	params.Set("api_key", snap.apiKey)
 	params.Set("language", lang)
 
-	endpoint := fmt.Sprintf("/tv/%s/season/%d", tmdbID, q.SeasonNumber)
+	endpoint := fmt.Sprintf("/tv/%s/season/%d", url.PathEscape(tmdbID), q.SeasonNumber)
 	var season struct {
 		Name       string `json:"name"`
 		Overview   string `json:"overview"`
@@ -550,7 +582,7 @@ func (p *Provider) fetchSeason(ctx context.Context, q plugins.MediaQuery, lang s
 		}
 	}
 	if season.PosterPath != "" {
-		res.PosterURL = p.imageBaseURL + season.PosterPath
+		res.PosterURL = snap.imageBaseURL + season.PosterPath
 	}
 	return res, nil
 }
@@ -560,11 +592,12 @@ func (p *Provider) fetchEpisode(ctx context.Context, q plugins.MediaQuery, lang 
 	if tmdbID == "" || q.EpisodeNumber <= 0 {
 		return nil, nil
 	}
+	snap := p.snapshot()
 	params := url.Values{}
-	params.Set("api_key", p.apiKey)
+	params.Set("api_key", snap.apiKey)
 	params.Set("language", lang)
 
-	endpoint := fmt.Sprintf("/tv/%s/season/%d/episode/%d", tmdbID, q.SeasonNumber, q.EpisodeNumber)
+	endpoint := fmt.Sprintf("/tv/%s/season/%d/episode/%d", url.PathEscape(tmdbID), q.SeasonNumber, q.EpisodeNumber)
 	var ep struct {
 		Name        string  `json:"name"`
 		Overview    string  `json:"overview"`
@@ -582,23 +615,24 @@ func (p *Provider) fetchEpisode(ctx context.Context, q plugins.MediaQuery, lang 
 		CommunityRating: ep.VoteAverage,
 	}
 	if ep.StillPath != "" {
-		res.PosterURL = p.imageBaseURL + ep.StillPath
+		res.PosterURL = snap.imageBaseURL + ep.StillPath
 	}
 	return res, nil
 }
 
 // SearchCandidates searches TMDB /search/movie or /search/tv and returns up to 10 candidates.
 func (p *Provider) SearchCandidates(ctx context.Context, itemType, query string, year int, lang string) ([]plugins.MetadataResult, error) {
-	if p.apiKey == "" || strings.TrimSpace(query) == "" {
+	snap := p.snapshot()
+	if snap.apiKey == "" || strings.TrimSpace(query) == "" {
 		return nil, nil
 	}
 	if lang == "" {
-		lang = p.language
+		lang = snap.language
 	}
 
 	isSeries := strings.EqualFold(itemType, "series") || strings.EqualFold(itemType, "tv")
 	params := url.Values{}
-	params.Set("api_key", p.apiKey)
+	params.Set("api_key", snap.apiKey)
 	params.Set("language", lang)
 	params.Set("query", strings.TrimSpace(query))
 
@@ -641,10 +675,10 @@ func (p *Provider) SearchCandidates(ctx context.Context, itemType, query string,
 				}
 			}
 			if item.PosterPath != "" {
-				mr.PosterURL = p.imageBaseURL + item.PosterPath
+				mr.PosterURL = snap.imageBaseURL + item.PosterPath
 			}
 			if item.BackdropPath != "" {
-				mr.BackdropURL = p.imageBaseURL + item.BackdropPath
+				mr.BackdropURL = snap.imageBaseURL + item.BackdropPath
 			}
 			out = append(out, mr)
 		}
@@ -689,10 +723,10 @@ func (p *Provider) SearchCandidates(ctx context.Context, itemType, query string,
 			}
 		}
 		if item.PosterPath != "" {
-			mr.PosterURL = p.imageBaseURL + item.PosterPath
+			mr.PosterURL = snap.imageBaseURL + item.PosterPath
 		}
 		if item.BackdropPath != "" {
-			mr.BackdropURL = p.imageBaseURL + item.BackdropPath
+			mr.BackdropURL = snap.imageBaseURL + item.BackdropPath
 		}
 		out = append(out, mr)
 	}
@@ -702,7 +736,8 @@ func (p *Provider) SearchCandidates(ctx context.Context, itemType, query string,
 // FetchImages queries TMDB /movie/{id}/images or /tv/{id}/images and returns Primary and Backdrop candidates.
 func (p *Provider) FetchImages(ctx context.Context, itemType, tmdbID string) ([]RemoteImageCandidate, error) {
 	tmdbID = strings.TrimSpace(tmdbID)
-	if p.apiKey == "" || tmdbID == "" {
+	snap := p.snapshot()
+	if snap.apiKey == "" || tmdbID == "" {
 		return nil, nil
 	}
 	endpoint := "/movie/" + url.PathEscape(tmdbID) + "/images"
@@ -710,7 +745,7 @@ func (p *Provider) FetchImages(ctx context.Context, itemType, tmdbID string) ([]
 		endpoint = "/tv/" + url.PathEscape(tmdbID) + "/images"
 	}
 	params := url.Values{}
-	params.Set("api_key", p.apiKey)
+	params.Set("api_key", snap.apiKey)
 	params.Set("include_image_language", "zh,en,null")
 
 	type tmdbImageEntry struct {
@@ -730,8 +765,8 @@ func (p *Provider) FetchImages(ctx context.Context, itemType, tmdbID string) ([]
 	}
 
 	thumbURL := func(imgType, filePath string) string {
-		if p.imageBaseURL != defaultImageBaseURL {
-			return p.imageBaseURL + filePath
+		if snap.imageBaseURL != defaultImageBaseURL {
+			return snap.imageBaseURL + filePath
 		}
 		if imgType == "Backdrop" {
 			return defaultBackdropThumbURL + filePath
@@ -746,7 +781,7 @@ func (p *Provider) FetchImages(ctx context.Context, itemType, tmdbID string) ([]
 		}
 		out = append(out, RemoteImageCandidate{
 			ProviderName:    "TheMovieDb",
-			Url:             p.imageBaseURL + img.FilePath,
+			Url:             snap.imageBaseURL + img.FilePath,
 			ThumbnailUrl:    thumbURL("Primary", img.FilePath),
 			Width:           img.Width,
 			Height:          img.Height,
@@ -763,7 +798,7 @@ func (p *Provider) FetchImages(ctx context.Context, itemType, tmdbID string) ([]
 		}
 		out = append(out, RemoteImageCandidate{
 			ProviderName:    "TheMovieDb",
-			Url:             p.imageBaseURL + img.FilePath,
+			Url:             snap.imageBaseURL + img.FilePath,
 			ThumbnailUrl:    thumbURL("Backdrop", img.FilePath),
 			Width:           img.Width,
 			Height:          img.Height,
@@ -778,7 +813,8 @@ func (p *Provider) FetchImages(ctx context.Context, itemType, tmdbID string) ([]
 }
 
 func (p *Provider) getJSON(ctx context.Context, endpoint string, params url.Values, dst any) error {
-	reqURL := p.baseURL + endpoint + "?" + params.Encode()
+	baseURL := p.snapshot().baseURL
+	reqURL := baseURL + endpoint + "?" + params.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return err

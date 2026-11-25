@@ -18,6 +18,7 @@ import {
 } from 'lucide-react'
 import { api } from '../../api/client'
 import type { VirtualFolderInfo } from '../../api/types'
+import { QueryErrorState } from '../../components/QueryErrorState'
 import { ScanProgressBar } from '../../components/ScanProgressBar'
 import { AdminModal, FeedbackBanner, ToggleSwitch } from './adminUtils'
 
@@ -80,7 +81,13 @@ export function LibrariesTab() {
   const [deleteTarget, setDeleteTarget] = useState<VirtualFolderInfo | null>(null)
   const [deleting, setDeleting] = useState(false)
 
-  const { data: libraries = [], isLoading } = useQuery({
+  const {
+    data: libraries = [],
+    isLoading,
+    isError,
+    error,
+    refetch,
+  } = useQuery({
     queryKey: ['admin', 'virtualFolders'],
     queryFn: () => api.getVirtualFolders(),
   })
@@ -377,6 +384,13 @@ export function LibrariesTab() {
         <div className="flex h-40 items-center justify-center rounded-2xl border border-white/8 bg-white/[0.02]">
           <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
         </div>
+      ) : isError ? (
+        <QueryErrorState
+          compact
+          title="无法加载媒体库列表"
+          error={error}
+          onRetry={() => void refetch()}
+        />
       ) : libraries.length === 0 ? (
         <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-14 text-center">
           <FolderOpen className="mx-auto mb-3 h-10 w-10 text-zinc-600" />

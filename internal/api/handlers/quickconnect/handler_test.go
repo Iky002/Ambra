@@ -221,3 +221,124 @@ func TestQuickConnectRateLimitAndExpiry(t *testing.T) {
 		t.Fatalf("expected 404 for expired secret, got %d", r.Code)
 	}
 }
+
+func TestQuickConnectPerIPRateLimitAndEdgeCases(t *testing.T) {
+	h, mux, authSvc, user, advance := setupQuickConnectTest(t)
+
+	// 10 initiates from same IP succeed, 11th returns 429 Too Many Requests.
+	for i := 0; i < maxInitiatesPerIPPerMin; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/QuickConnect/Initiate", nil)
+		req.RemoteAddr = "198.51.100.10:12345"
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("initiate %d from IP1 expected 200, got %d", i+1, rec.Code)
+		}
+	}
+	req11 := httptest.NewRequest(http.MethodPost, "/QuickConnect/Initiate", nil)
+	req11.RemoteAddr = "198.51.100.10:54321"
+	rec11 := httptest.NewRecorder()
+	mux.ServeHTTP(rec11, req11)
+	if rec11.Code != http.StatusTooManyRequests {
+		t.Fatalf("11th initiate from IP1 expected 429, got %d", rec11.Code)
+	}
+
+	// Different IP is unaffected.
+	reqOther := httptest.NewRequest(http.MethodPost, "/QuickConnect/Initiate", nil)
+	reqOther.RemoteAddr = "198.51.100.20:9999"
+	recOther := httptest.NewRecorder()
+	mux.ServeHTTP(recOther, reqOther)
+	if recOther.Code != http.StatusOK {
+		t.Fatalf("initiate from IP2 expected 200, got %d", recOther.Code)
+	}
+
+	// After 1 minute window expires, IP1 is allowed again.
+	advance(initiateRateWindow + time.Second)
+	reqAfter := httptest.NewRequest(http.MethodPost, "/QuickConnect/Initiate", nil)
+	reqAfter.RemoteAddr = "198.51.100.10:11111"
+	recAfter := httptest.NewRecorder()
+	mux.ServeHTTP(recAfter, reqAfter)
+	if recAfter.Code != http.StatusOK {
+		t.Fatalf("initiate after window reset expected 200, got %d", recAfter.Code)
+	}
+
+	// Edge cases: Connect missing secret -> 404; Authenticate invalid JSON / empty secret -> 400.
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/QuickConnect/Connect", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("Connect without secret expected 404, got %d", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/Users/AuthenticateWithQuickConnect", bytes.NewBufferString("{bad")))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("Authenticate bad JSON expected 400, got %d", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/Users/AuthenticateWithQuickConnect", bytes.NewBufferString(`{"Secret":""}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("Authenticate empty secret expected 400, got %d", rec.Code)
+	}
+
+	// Direct handleAuthorize without auth context -> 401
+	rec = httptest.NewRecorder()
+	h.handleAuthorize(rec, httptest.NewRequest(http.MethodPost, "/QuickConnect/Authorize?code=123456", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("handleAuthorize without user expected 401, got %d", rec.Code)
+	}
+
+	// Disabled user redemption returns 403.
+	var initiated QuickConnectResult
+	_ = json.Unmarshal(recAfter.Body.Bytes(), &initiated)
+	loginRes, err := authSvc.AuthenticateByName(context.Background(), user.Name, "secret123", "", auth.ClientInfo{DeviceID: "phone-3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authzReq := httptest.NewRequest(http.MethodPost, "/QuickConnect/Authorize?code="+initiated.Code, nil)
+	authzReq.Header.Set("X-Emby-Token", loginRes.AccessToken)
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, authzReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("authorize expected 200, got %d", rec.Code)
+	}
+
+	disabledPolicy := user.Policy
+	disabledPolicy.IsDisabled = true
+	_ = h.userRepo.UpdateUserPolicy(context.Background(), user.ID, disabledPolicy)
+	authBody, _ := json.Marshal(map[string]string{"Secret": initiated.Secret})
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/Users/AuthenticateWithQuickConnect", bytes.NewReader(authBody)))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("disabled user AuthenticateWithQuickConnect expected 403, got %d", rec.Code)
+	}
+
+	// Deleted user redemption returns 401.
+	var initiated2 QuickConnectResult
+	_ = json.Unmarshal(recOther.Body.Bytes(), &initiated2)
+	h.mu.Lock()
+	h.bySecret[initiated2.Secret].userID = "nonexistent-user-id"
+	h.bySecret[initiated2.Secret].result.Authenticated = true
+	h.mu.Unlock()
+	authBody2, _ := json.Marshal(map[string]string{"Secret": initiated2.Secret})
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/Users/AuthenticateWithQuickConnect", bytes.NewReader(authBody2)))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("deleted user AuthenticateWithQuickConnect expected 401, got %d", rec.Code)
+	}
+
+	// clientIP helper coverage
+	if got := clientIP(httptest.NewRequest(http.MethodPost, "/", nil)); got == "" {
+		t.Fatalf("expected non-empty clientIP")
+	}
+	noPortReq := httptest.NewRequest(http.MethodPost, "/", nil)
+	noPortReq.RemoteAddr = "198.51.100.30"
+	if got := clientIP(noPortReq); got != "198.51.100.30" {
+		t.Fatalf("clientIP without port = %q", got)
+	}
+	emptyReq := httptest.NewRequest(http.MethodPost, "/", nil)
+	emptyReq.RemoteAddr = ""
+	if got := clientIP(emptyReq); got != "" {
+		t.Fatalf("clientIP empty = %q", got)
+	}
+}

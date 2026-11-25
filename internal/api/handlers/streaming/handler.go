@@ -108,10 +108,21 @@ func (h *Handler) canAccessItem(r *http.Request, itemID string) bool {
 		return true
 	}
 	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
-	if err != nil || rec == nil || rec.LibraryID == "" {
+	if err != nil || rec == nil {
 		return true
 	}
-	return h.CanAccessLibrary(r.Context(), callerID, rec.LibraryID)
+	if rec.LibraryID != "" && !h.CanAccessLibrary(r.Context(), callerID, rec.LibraryID) {
+		return false
+	}
+	u, err := h.userRepo.GetUserByID(r.Context(), callerID)
+	if err != nil || u == nil || u.IsAdmin || u.Policy.IsAdministrator {
+		return true
+	}
+	blocked, err := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, u.Policy.MaxParentalRating, u.Policy.BlockedTags)
+	if err != nil {
+		return false
+	}
+	return !blocked
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {

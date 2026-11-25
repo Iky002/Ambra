@@ -14,7 +14,8 @@ import {
   Trash2,
 } from 'lucide-react'
 import { api } from '../../api/client'
-import { FeedbackBanner, formatDateTime, formatRelativeTime } from './adminUtils'
+import { QueryErrorState } from '../../components/QueryErrorState'
+import { AdminModal, FeedbackBanner, formatDateTime, formatRelativeTime } from './adminUtils'
 
 export function DevicesKeysTab() {
   const queryClient = useQueryClient()
@@ -23,9 +24,11 @@ export function DevicesKeysTab() {
   )
 
   const [revokingDeviceId, setRevokingDeviceId] = useState<string | null>(null)
+  const [confirmDevice, setConfirmDevice] = useState<{ id: string; name: string } | null>(null)
   const [appName, setAppName] = useState('')
   const [creatingKey, setCreatingKey] = useState(false)
   const [revokingKey, setRevokingKey] = useState<string | null>(null)
+  const [confirmApiKey, setConfirmApiKey] = useState<{ token: string; appName: string } | null>(null)
   const [copiedKey, setCopiedKey] = useState<string | null>(null)
   const [revealedKeys, setRevealedKeys] = useState<Record<string, boolean>>({})
 
@@ -33,6 +36,8 @@ export function DevicesKeysTab() {
     data: devicesData,
     isLoading: devicesLoading,
     isFetching: devicesFetching,
+    isError: devicesIsError,
+    error: devicesError,
     refetch: refetchDevices,
   } = useQuery({
     queryKey: ['admin', 'devices'],
@@ -43,6 +48,8 @@ export function DevicesKeysTab() {
     data: keysData,
     isLoading: keysLoading,
     isFetching: keysFetching,
+    isError: keysIsError,
+    error: keysError,
     refetch: refetchKeys,
   } = useQuery({
     queryKey: ['admin', 'apiKeys'],
@@ -61,6 +68,7 @@ export function DevicesKeysTab() {
         queryClient.invalidateQueries({ queryKey: ['admin', 'devices'] }),
         queryClient.invalidateQueries({ queryKey: ['admin', 'sessions'] }),
       ])
+      setConfirmDevice(null)
       setFeedback({ type: 'success', message: `已注销并踢出设备「${deviceName || deviceId}」` })
     } catch (err) {
       setFeedback({
@@ -104,6 +112,7 @@ export function DevicesKeysTab() {
     try {
       await api.deleteApiKey(key)
       await queryClient.invalidateQueries({ queryKey: ['admin', 'apiKeys'] })
+      setConfirmApiKey(null)
       setFeedback({ type: 'success', message: `已吊销「${name || 'API Key'}」` })
     } catch (err) {
       setFeedback({
@@ -165,6 +174,13 @@ export function DevicesKeysTab() {
           <div className="flex h-32 items-center justify-center rounded-2xl border border-white/8 bg-white/[0.02]">
             <Loader2 className="h-5 w-5 animate-spin text-amber-400" />
           </div>
+        ) : devicesIsError ? (
+          <QueryErrorState
+            compact
+            title="无法加载已登录设备"
+            error={devicesError}
+            onRetry={() => void refetchDevices()}
+          />
         ) : devices.length === 0 ? (
           <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-10 text-center text-xs text-zinc-500">
             暂无设备记录
@@ -202,7 +218,7 @@ export function DevicesKeysTab() {
                 <button
                   type="button"
                   disabled={revokingDeviceId === dev.Id}
-                  onClick={() => handleDeleteDevice(dev.Id, dev.Name)}
+                  onClick={() => setConfirmDevice({ id: dev.Id, name: dev.Name || dev.Id })}
                   className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
                 >
                   {revokingDeviceId === dev.Id ? (
@@ -274,6 +290,13 @@ export function DevicesKeysTab() {
           <div className="flex h-28 items-center justify-center rounded-2xl border border-white/8 bg-white/[0.02]">
             <Loader2 className="h-5 w-5 animate-spin text-amber-400" />
           </div>
+        ) : keysIsError ? (
+          <QueryErrorState
+            compact
+            title="无法加载 API Keys"
+            error={keysError}
+            onRetry={() => void refetchKeys()}
+          />
         ) : apiKeys.length === 0 ? (
           <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-10 text-center text-xs text-zinc-500">
             尚未创建任何 API Key
@@ -351,7 +374,12 @@ export function DevicesKeysTab() {
                       <button
                         type="button"
                         disabled={revokingKey === item.AccessToken}
-                        onClick={() => handleDeleteApiKey(item.AccessToken, item.AppName)}
+                        onClick={() =>
+                          setConfirmApiKey({
+                            token: item.AccessToken,
+                            appName: item.AppName || 'API Key',
+                          })
+                        }
                         className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
                       >
                         {revokingKey === item.AccessToken ? (
@@ -369,6 +397,82 @@ export function DevicesKeysTab() {
           </div>
         )}
       </section>
+
+      {/* 踢出设备确认弹窗 */}
+      <AdminModal
+        open={Boolean(confirmDevice)}
+        title="确认踢出设备"
+        subtitle="该设备将被强制注销并吊销访问令牌，客户端需要重新登录"
+        maxWidthClass="max-w-md"
+        onClose={() => setConfirmDevice(null)}
+      >
+        <p className="text-sm text-zinc-300">
+          确定要强制注销并踢出设备{' '}
+          <span className="font-semibold text-white">{confirmDevice?.name}</span> 吗？
+        </p>
+        <div className="mt-6 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={() => setConfirmDevice(null)}
+            className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            disabled={!confirmDevice || revokingDeviceId === confirmDevice.id}
+            onClick={() => {
+              if (confirmDevice) {
+                void handleDeleteDevice(confirmDevice.id, confirmDevice.name)
+              }
+            }}
+            className="inline-flex items-center gap-2 rounded-xl bg-red-500 px-4 py-2 text-xs font-semibold text-white hover:bg-red-400 disabled:opacity-60"
+          >
+            {confirmDevice && revokingDeviceId === confirmDevice.id && (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            )}
+            <span>确认踢出</span>
+          </button>
+        </div>
+      </AdminModal>
+
+      {/* 吊销 API Key 确认弹窗 */}
+      <AdminModal
+        open={Boolean(confirmApiKey)}
+        title="确认吊销 API Key"
+        subtitle="此操作不可恢复，使用该密钥的第三方应用将立即失去访问权限"
+        maxWidthClass="max-w-md"
+        onClose={() => setConfirmApiKey(null)}
+      >
+        <p className="text-sm text-zinc-300">
+          确定要永久吊销应用{' '}
+          <span className="font-semibold text-white">{confirmApiKey?.appName}</span> 的 API Key 吗？
+        </p>
+        <div className="mt-6 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={() => setConfirmApiKey(null)}
+            className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            disabled={!confirmApiKey || revokingKey === confirmApiKey.token}
+            onClick={() => {
+              if (confirmApiKey) {
+                void handleDeleteApiKey(confirmApiKey.token, confirmApiKey.appName)
+              }
+            }}
+            className="inline-flex items-center gap-2 rounded-xl bg-red-500 px-4 py-2 text-xs font-semibold text-white hover:bg-red-400 disabled:opacity-60"
+          >
+            {confirmApiKey && revokingKey === confirmApiKey.token && (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            )}
+            <span>确认吊销</span>
+          </button>
+        </div>
+      </AdminModal>
     </div>
   )
 }

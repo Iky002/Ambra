@@ -12,6 +12,7 @@ import {
 } from 'lucide-react'
 import { api } from '../../api/client'
 import type { UserDto, UserPolicy } from '../../api/types'
+import { QueryErrorState } from '../../components/QueryErrorState'
 import { useAuth } from '../../context/AuthContext'
 import {
   AdminModal,
@@ -53,7 +54,13 @@ export function UsersTab() {
   const [deleteTarget, setDeleteTarget] = useState<UserDto | null>(null)
   const [deleting, setDeleting] = useState(false)
 
-  const { data: users = [], isLoading } = useQuery({
+  const {
+    data: users = [],
+    isLoading,
+    isError,
+    error,
+    refetch,
+  } = useQuery({
     queryKey: ['admin', 'users'],
     queryFn: () => api.getUsers(),
   })
@@ -290,6 +297,13 @@ export function UsersTab() {
         <div className="flex h-40 items-center justify-center rounded-2xl border border-white/8 bg-white/[0.02]">
           <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
         </div>
+      ) : isError ? (
+        <QueryErrorState
+          compact
+          title="无法加载用户列表"
+          error={error}
+          onRetry={() => void refetch()}
+        />
       ) : (
         <div className="grid gap-4 md:grid-cols-2">
           {users.map((u) => {

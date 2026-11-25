@@ -252,7 +252,9 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
 	})
-	catalog.New(libRepo, cfg).RegisterRoutes(mediaMux, catalog.AuthFuncs{
+	catalogH := catalog.New(libRepo, cfg)
+	catalogH.SetUserRepo(userRepo)
+	catalogH.RegisterRoutes(mediaMux, catalog.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,

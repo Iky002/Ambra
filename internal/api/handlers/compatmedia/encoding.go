@@ -594,15 +594,21 @@ func (h *Handler) handleArtistPrefixes(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleInstantMixByQuery(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	userID := h.resolveUserID(r, q)
+	allowed := h.allowedLibrariesForRequest(r, userID)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 	seedID := q.Get("Id")
 	if seedID != "" {
-		items, total, err := h.repo.GetInstantMix(
+		items, total, err := h.repo.GetInstantMixWithPolicy(
 			r.Context(),
 			h.serverID(),
-			h.resolveUserID(r, q),
+			userID,
 			seedID,
 			q.Int("Limit", 50),
 			q.List("Fields"),
+			allowed,
+			maxRating,
+			blockedTags,
 		)
 		if err != nil {
 			httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -615,13 +621,16 @@ func (h *Handler) handleInstantMixByQuery(w http.ResponseWriter, r *http.Request
 		return
 	}
 	items, total, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
-		ServerID:         h.serverID(),
-		UserID:           h.resolveUserID(r, q),
-		Recursive:        true,
-		IncludeItemTypes: []string{"Audio"},
-		SortBy:           []string{"Random"},
-		Limit:            q.Int("Limit", 50),
-		Fields:           q.List("Fields"),
+		ServerID:          h.serverID(),
+		UserID:            userID,
+		AllowedLibraryIDs: allowed,
+		MaxParentalRating: maxRating,
+		BlockedTags:       blockedTags,
+		Recursive:         true,
+		IncludeItemTypes:  []string{"Audio"},
+		SortBy:            []string{"Random"},
+		Limit:             q.Int("Limit", 50),
+		Fields:            q.List("Fields"),
 	})
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -673,13 +682,14 @@ func (h *Handler) handleGetTaxonomyByName(kind, dtoType string) http.HandlerFunc
 
 func (h *Handler) handleGetPersonByName(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "Name")
+	normID := guid.Normalize(name)
 	if h.store != nil {
 		var id, foundName, primaryTag string
 		err := h.store.Reader.QueryRowContext(r.Context(), `
 			SELECT p.id, p.name, COALESCE(img.tag, '')
 			FROM people p
 			LEFT JOIN item_images img ON img.item_id = p.id AND LOWER(img.image_type) = 'primary' AND img.image_index = 0
-			WHERE LOWER(p.name) = LOWER(?) LIMIT 1`, name,
+			WHERE LOWER(p.name) = LOWER(?) OR p.id = ? LIMIT 1`, name, normID,
 		).Scan(&id, &foundName, &primaryTag)
 		if err == nil {
 			imageTags := map[string]string{}
@@ -706,15 +716,21 @@ func (h *Handler) handleGetPersonByName(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) handlePersonCredits(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	userID := h.resolveUserID(r, q)
+	allowed := h.allowedLibrariesForRequest(r, userID)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 	personID := guid.Normalize(chi.URLParam(r, "Id"))
 	items, total, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
-		ServerID:   h.serverID(),
-		UserID:     h.resolveUserID(r, q),
-		Recursive:  true,
-		PersonIDs:  []string{personID},
-		StartIndex: q.Int("StartIndex", 0),
-		Limit:      q.Int("Limit", 0),
-		Fields:     q.List("Fields"),
+		ServerID:          h.serverID(),
+		UserID:            userID,
+		AllowedLibraryIDs: allowed,
+		MaxParentalRating: maxRating,
+		BlockedTags:       blockedTags,
+		Recursive:         true,
+		PersonIDs:         []string{personID},
+		StartIndex:        q.Int("StartIndex", 0),
+		Limit:             q.Int("Limit", 0),
+		Fields:            q.List("Fields"),
 	})
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())

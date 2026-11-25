@@ -438,12 +438,13 @@ func (s *Scanner) indexEpisode(
 								ItemType:  "Series",
 								MediaPath: seriesRec.Path,
 								Query: plugins.MediaQuery{
-									ItemType:    "Series",
-									Title:       seriesRec.Name,
-									Year:        sYear,
-									Path:        seriesRec.Path,
-									ProviderIDs: cloneStringMap(seriesRec.Extra.ProviderIDs),
-									Language:    s.language(),
+									ItemType:      "Series",
+									Title:         seriesRec.Name,
+									OriginalTitle: seriesRec.OriginalTitle,
+									Year:          sYear,
+									Path:          seriesRec.Path,
+									ProviderIDs:   cloneStringMap(seriesRec.Extra.ProviderIDs),
+									Language:      s.language(),
 								},
 								NeedOnlineMeta: true,
 								HasLocalTitle:  false,
@@ -711,18 +712,32 @@ func (s *Scanner) ensureSeries(
 				if existing.ProductionYear != nil {
 					year = *existing.ProductionYear
 				}
+				queryOrig := existing.OriginalTitle
+				if queryOrig == "" {
+					queryOrig = epInfo.SeriesOriginalTitle
+				}
+				queryIDs := cloneStringMap(existing.Extra.ProviderIDs)
+				for k, v := range epInfo.SeriesProviderIDs {
+					if queryIDs == nil {
+						queryIDs = make(map[string]string, len(epInfo.SeriesProviderIDs))
+					}
+					if _, ok := queryIDs[k]; !ok {
+						queryIDs[k] = v
+					}
+				}
 				backfillTask = &enrichTask{
 					ItemID:    existing.ID,
 					LibraryID: lib.ID,
 					ItemType:  "Series",
 					MediaPath: epInfo.SeriesDir,
 					Query: plugins.MediaQuery{
-						ItemType:    "Series",
-						Title:       existing.Name,
-						Year:        year,
-						Path:        epInfo.SeriesDir,
-						ProviderIDs: existing.Extra.ProviderIDs,
-						Language:    s.language(),
+						ItemType:      "Series",
+						Title:         existing.Name,
+						OriginalTitle: queryOrig,
+						Year:          year,
+						Path:          epInfo.SeriesDir,
+						ProviderIDs:   queryIDs,
+						Language:      s.language(),
 					},
 					NeedOnlineMeta: true,
 					HasLocalTitle:  false,
@@ -737,22 +752,33 @@ func (s *Scanner) ensureSeries(
 	}
 
 	query := plugins.MediaQuery{
-		ItemType: "Series",
-		Title:    epInfo.SeriesName,
-		Year:     epInfo.SeriesYear,
-		Path:     epInfo.SeriesDir,
-		Language: s.language(),
+		ItemType:      "Series",
+		Title:         epInfo.SeriesName,
+		OriginalTitle: epInfo.SeriesOriginalTitle,
+		Year:          epInfo.SeriesYear,
+		Path:          epInfo.SeriesDir,
+		ProviderIDs:   cloneStringMap(epInfo.SeriesProviderIDs),
+		Language:      s.language(),
 	}
 	meta := s.fetchMetadataFiltered(ctx, query, true)
 
 	// Cross-directory auto-merge for Series sharing the same TMDB/IMDB ID.
+	mergeProviderIDs := cloneStringMap(epInfo.SeriesProviderIDs)
 	if meta != nil && len(meta.ProviderIDs) > 0 {
+		if mergeProviderIDs == nil {
+			mergeProviderIDs = make(map[string]string, len(meta.ProviderIDs))
+		}
+		for k, v := range meta.ProviderIDs {
+			mergeProviderIDs[k] = v
+		}
+	}
+	if len(mergeProviderIDs) > 0 {
 		var matched *sqlite.ItemRecord
-		if tmdbID := getProviderID(meta.ProviderIDs, "Tmdb"); tmdbID != "" {
+		if tmdbID := getProviderID(mergeProviderIDs, "Tmdb"); tmdbID != "" {
 			matched, _ = s.repo.FindItemByProviderID(ctx, lib.ID, "Series", "Tmdb", tmdbID)
 		}
 		if matched == nil {
-			if imdbID := getProviderID(meta.ProviderIDs, "Imdb"); imdbID != "" {
+			if imdbID := getProviderID(mergeProviderIDs, "Imdb"); imdbID != "" {
 				matched, _ = s.repo.FindItemByProviderID(ctx, lib.ID, "Series", "Imdb", imdbID)
 			}
 		}
@@ -763,15 +789,19 @@ func (s *Scanner) ensureSeries(
 	}
 
 	rec := &sqlite.ItemRecord{
-		ID:        guid.New(),
-		LibraryID: lib.ID,
-		ParentID:  lib.ID,
-		Type:      "Series",
-		IsFolder:  true,
-		Name:      epInfo.SeriesName,
-		SortName:  strings.ToLower(epInfo.SeriesName),
-		Path:      epInfo.SeriesDir,
-		Etag:      computeEtag(epInfo.SeriesDir, 0, time.Now().Unix()),
+		ID:            guid.New(),
+		LibraryID:     lib.ID,
+		ParentID:      lib.ID,
+		Type:          "Series",
+		IsFolder:      true,
+		Name:          epInfo.SeriesName,
+		OriginalTitle: epInfo.SeriesOriginalTitle,
+		SortName:      strings.ToLower(epInfo.SeriesName),
+		Path:          epInfo.SeriesDir,
+		Etag:          computeEtag(epInfo.SeriesDir, 0, time.Now().Unix()),
+	}
+	if len(epInfo.SeriesProviderIDs) > 0 {
+		rec.Extra.ProviderIDs = cloneStringMap(epInfo.SeriesProviderIDs)
 	}
 	if epInfo.SeriesYear > 0 {
 		y := epInfo.SeriesYear
@@ -1251,7 +1281,8 @@ func discoverExternalSubtitles(mediaPath, mediaSourceID, itemID string, startInd
 		if !strings.HasPrefix(lowerName, mediaStem) {
 			continue
 		}
-		cls := ClassifySubtitle(name, codec)
+		suffix := strings.TrimPrefix(lowerName, mediaStem)
+		cls := ClassifySubtitle(suffix, codec)
 		out = append(out, sqlite.MediaStreamRecord{
 			MediaSourceID: mediaSourceID,
 			ItemID:        itemID,

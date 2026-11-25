@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Loader2, Puzzle, RefreshCw, SlidersHorizontal } from 'lucide-react'
 import { api } from '../../api/client'
 import type { PluginInfo } from '../../api/types'
+import { QueryErrorState } from '../../components/QueryErrorState'
 import { AdminModal, FeedbackBanner, ToggleSwitch } from './adminUtils'
 
 const KIND_LABELS: Record<string, string> = {
@@ -43,6 +44,8 @@ export function PluginsTab() {
     data: plugins = [],
     isLoading,
     isFetching,
+    isError,
+    error,
     refetch,
   } = useQuery({
     queryKey: ['admin', 'plugins'],
@@ -205,6 +208,13 @@ export function PluginsTab() {
         <div className="flex h-40 items-center justify-center rounded-2xl border border-white/8 bg-white/[0.02]">
           <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
         </div>
+      ) : isError ? (
+        <QueryErrorState
+          compact
+          title="无法加载插件列表"
+          error={error}
+          onRetry={() => void refetch()}
+        />
       ) : plugins.length === 0 ? (
         <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-12 text-center text-xs text-zinc-500">
           暂无已注册插件

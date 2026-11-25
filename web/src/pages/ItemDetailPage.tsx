@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
   Bookmark,
+  Building2,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -10,6 +11,7 @@ import {
   Copy,
   Disc3,
   Download,
+  ExternalLink,
   Film,
   Flame,
   FolderPlus,
@@ -68,6 +70,26 @@ import {
 } from '../player/subtitleUtils'
 import { formatBytes } from '../player/wasmRemuxer'
 import { AdminModal, FeedbackBanner } from './admin/adminUtils'
+
+const TRENDING_TAGS = new Set(['trending', 'tmdb热门', '豆瓣热门电影', '豆瓣热门剧集'])
+
+function isTrendingTag(tag: string): boolean {
+  return TRENDING_TAGS.has(tag.trim().toLowerCase())
+}
+
+function getProviderIdCaseInsensitive(
+  providerIds: Record<string, string> | undefined,
+  key: string,
+): string | undefined {
+  if (!providerIds) return undefined
+  const lower = key.toLowerCase()
+  for (const [k, v] of Object.entries(providerIds)) {
+    if (k.toLowerCase() === lower && v && v.trim()) {
+      return v.trim()
+    }
+  }
+  return undefined
+}
 
 function formatBitrate(bitrate?: number): string {
   if (!bitrate || !Number.isFinite(bitrate) || bitrate <= 0) return '-'
@@ -617,7 +639,7 @@ export function ItemDetailPage() {
     !isMusicArtist &&
     (isAdmin || Boolean(user?.Policy?.EnableContentDownloading))
 
-  const buildFilterLink = (param: 'genre' | 'year' | 'tag', value: string) => {
+  const buildFilterLink = (param: 'genre' | 'year' | 'tag' | 'studio', value: string) => {
     if (item.ParentId && (item.Type === 'Movie' || item.Type === 'Series')) {
       return `/library/${encodeURIComponent(item.ParentId)}?${param}=${encodeURIComponent(value)}`
     }
@@ -643,16 +665,50 @@ export function ItemDetailPage() {
       : `播放 ${formatEpisodeCode(primarySeriesTarget)}`
     : '播放第 1 集'
 
+  const hasTrendingBadge = Boolean(item.Tags?.some(isTrendingTag))
+
   const customTags = (item.Tags || []).filter((t) => {
-    const lower = t.toLowerCase()
     return (
-      lower !== 'trending' &&
+      !isTrendingTag(t) &&
       t !== '豆瓣Top250' &&
       t !== '豆瓣 Top250' &&
       t !== 'IMDb Top250' &&
       t !== 'IMDb Top 250'
     )
   })
+
+  const externalProviderLinks = (() => {
+    const links: Array<{ key: string; label: string; href: string }> = []
+    const tmdbId = getProviderIdCaseInsensitive(item.ProviderIds, 'Tmdb')
+    if (tmdbId) {
+      const tmdbPath =
+        item.Type === 'Series' || item.Type === 'Season' || item.Type === 'Episode'
+          ? 'tv'
+          : 'movie'
+      links.push({
+        key: 'tmdb',
+        label: 'TMDB',
+        href: `https://www.themoviedb.org/${tmdbPath}/${encodeURIComponent(tmdbId)}`,
+      })
+    }
+    const imdbId = getProviderIdCaseInsensitive(item.ProviderIds, 'Imdb')
+    if (imdbId) {
+      links.push({
+        key: 'imdb',
+        label: 'IMDb',
+        href: `https://www.imdb.com/title/${encodeURIComponent(imdbId)}/`,
+      })
+    }
+    const doubanId = getProviderIdCaseInsensitive(item.ProviderIds, 'Douban')
+    if (doubanId) {
+      links.push({
+        key: 'douban',
+        label: '豆瓣',
+        href: `https://movie.douban.com/subject/${encodeURIComponent(doubanId)}/`,
+      })
+    }
+    return links
+  })()
 
   const handleToggleThemeSong = () => {
     const firstTheme = themeSongs[0]
@@ -822,7 +878,7 @@ export function ItemDetailPage() {
               {/* 榜单与技术徽章：热门 / 豆瓣 Top250 / IMDb Top250 / 标签 / 4K / HDR / 简繁字幕 / ASS / PGS */}
               {(techBadges.length > 0 || (item.Tags && item.Tags.length > 0)) && (
                 <div className="flex flex-wrap items-center gap-2">
-                  {item.Tags?.some((t) => t.toLowerCase() === 'trending') && (
+                  {hasTrendingBadge && (
                     <Link
                       to="/trending"
                       className="inline-flex items-center gap-1 rounded-md border border-orange-400/55 bg-gradient-to-r from-orange-950/90 via-amber-900/80 to-orange-950/90 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide text-orange-200 shadow-[0_0_12px_rgba(249,115,22,0.22)] transition-opacity hover:opacity-90"
@@ -868,6 +924,46 @@ export function ItemDetailPage() {
                       {b.label}
                     </span>
                   ))}
+                </div>
+              )}
+
+              {/* 制片厂与外部资料链接 (TMDB / IMDb / 豆瓣) */}
+              {((item.Studios && item.Studios.length > 0) || externalProviderLinks.length > 0) && (
+                <div className="flex flex-wrap items-center gap-2 text-xs">
+                  {item.Studios && item.Studios.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="inline-flex items-center gap-1 text-zinc-500">
+                        <Building2 className="h-3.5 w-3.5 text-amber-400/80" />
+                        <span>制片厂</span>
+                      </span>
+                      {item.Studios.map((studio) => (
+                        <Link
+                          key={studio.Id || studio.Name}
+                          to={buildFilterLink('studio', studio.Name)}
+                          title={`按制片厂「${studio.Name}」筛选`}
+                          className="rounded-full border border-white/10 bg-white/[0.05] px-2.5 py-0.5 text-zinc-200 transition-colors hover:border-amber-400/40 hover:bg-amber-500/15 hover:text-amber-200"
+                        >
+                          {studio.Name}
+                        </Link>
+                      ))}
+                    </div>
+                  )}
+                  {externalProviderLinks.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {externalProviderLinks.map((ext) => (
+                        <a
+                          key={ext.key}
+                          href={ext.href}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 rounded-lg border border-white/12 bg-white/[0.04] px-2.5 py-0.5 text-[11px] font-medium text-zinc-300 transition-colors hover:border-amber-400/45 hover:bg-amber-500/15 hover:text-amber-200"
+                        >
+                          <span>{ext.label}</span>
+                          <ExternalLink className="h-3 w-3 opacity-80" />
+                        </a>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -1635,6 +1731,16 @@ export function ItemDetailPage() {
                       </div>
 
                       <div className="mt-2 flex items-center justify-end gap-1.5">
+                        <Link
+                          to={`/item/${ep.Id}`}
+                          onClick={(e) => e.stopPropagation()}
+                          title="查看本集详情"
+                          aria-label={`查看 ${ep.Name} 详情`}
+                          className="inline-flex items-center gap-1 rounded-lg bg-white/[0.04] px-2 py-1 text-[11px] text-zinc-300 transition-colors hover:bg-amber-500/15 hover:text-amber-200"
+                        >
+                          <Info className="h-3 w-3" />
+                          <span>详情</span>
+                        </Link>
                         <button
                           type="button"
                           onClick={(e) => {
