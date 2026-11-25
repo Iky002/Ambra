@@ -79,4 +79,21 @@ func TestTasksHandler(t *testing.T) {
 	if len(updated.Triggers) != 1 || updated.Triggers[0].Type != "IntervalTrigger" {
 		t.Fatalf("expected trigger to be updated, got %+v", updated.Triggers)
 	}
+
+	// Invalid trigger types and negative ticks must return 400
+	neg := int64(-100)
+	badPayloads := [][]scheduler.TaskTriggerInfo{
+		{{Type: "EvilTrigger"}},
+		{{Type: "IntervalTrigger", IntervalTicks: &neg}},
+		{{Type: "DailyTrigger", TimeOfDayTicks: &neg}},
+		{{Type: "StartupTrigger", MaxRuntimeTicks: &neg}},
+	}
+	for _, bp := range badPayloads {
+		b, _ := json.Marshal(bp)
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/ScheduledTasks/demo/Triggers", bytes.NewReader(b)))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for invalid trigger %+v, got %d", bp, rec.Code)
+		}
+	}
 }

@@ -904,8 +904,8 @@ func TestEdgeCasesForHighCoverage(t *testing.T) {
 	req.Header.Set("Content-Type", "image/jpeg")
 	w = httptest.NewRecorder()
 	env.router.ServeHTTP(w, req)
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("raw image upload: %d", w.Code)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid raw image upload expected 400, got %d", w.Code)
 	}
 	if got := decodeImageBody([]byte("raw-text!"), "text/plain"); string(got) != "raw-text!" {
 		t.Fatalf("decodeImageBody fallback failed: %q", string(got))

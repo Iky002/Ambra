@@ -1,11 +1,13 @@
 package users
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -18,15 +20,25 @@ import (
 	"github.com/ambra-media/ambra/internal/core/auth"
 	"github.com/ambra-media/ambra/internal/core/session"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
+)
+
+const (
+	authByNameRateLimit  = 30
+	authByNameRateWindow = time.Minute
 )
 
 type Handler struct {
 	authSvc    *auth.Service
 	userRepo   *sqlite.UserRepo
+	libRepo    *sqlite.LibraryRepo
 	sessionMgr *session.Manager
 	wsHub      *ws.Hub
 	cfg        *config.Config
+
+	mu        sync.Mutex
+	authRates map[string][]time.Time
 }
 
 func NewHandler(
@@ -42,7 +54,148 @@ func NewHandler(
 		sessionMgr: sessionMgr,
 		wsHub:      wsHub,
 		cfg:        cfg,
+		authRates:  make(map[string][]time.Time),
 	}
+}
+
+// SetLibraryRepo attaches a LibraryRepo to enforce library RBAC and parental controls on playback reports.
+func (h *Handler) SetLibraryRepo(libRepo *sqlite.LibraryRepo) {
+	h.mu.Lock()
+	h.libRepo = libRepo
+	h.mu.Unlock()
+}
+
+func (h *Handler) getLibraryRepo() *sqlite.LibraryRepo {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.libRepo
+}
+
+func (h *Handler) checkAuthRateLimit(ip string, now time.Time) bool {
+	if ip == "" {
+		return true
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.authRates == nil {
+		h.authRates = make(map[string][]time.Time)
+	}
+	cutoff := now.Add(-authByNameRateWindow)
+	for k, ts := range h.authRates {
+		kept := ts[:0]
+		for _, t := range ts {
+			if t.After(cutoff) {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) == 0 {
+			delete(h.authRates, k)
+		} else {
+			h.authRates[k] = kept
+		}
+	}
+	if len(h.authRates[ip]) >= authByNameRateLimit {
+		return false
+	}
+	h.authRates[ip] = append(h.authRates[ip], now)
+	return true
+}
+
+func (h *Handler) canAccessItem(ctx context.Context, ac *middleware.AuthContext, itemID string) (bool, error) {
+	libRepo := h.getLibraryRepo()
+	if libRepo == nil {
+		return true, nil
+	}
+	if ac == nil {
+		return false, nil
+	}
+	if ac.IsAdmin() {
+		return true, nil
+	}
+	normID := guid.Normalize(itemID)
+	if normID == "" {
+		return true, nil
+	}
+	rec, err := libRepo.GetItemRecordByID(ctx, normID)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil || rec == nil {
+		return false, err
+	}
+	if ac.User == nil {
+		return false, nil
+	}
+	if !ac.User.Policy.EnableAllFolders {
+		allowed := false
+		recLib := guid.Normalize(rec.LibraryID)
+		for _, fid := range ac.User.Policy.EnabledFolders {
+			if guid.Normalize(fid) == recLib {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return false, nil
+		}
+	}
+	blocked, err := libRepo.IsItemBlockedByParentalPolicy(ctx, rec, ac.User.Policy.MaxParentalRating, ac.User.Policy.BlockedTags)
+	if err != nil {
+		return false, err
+	}
+	return !blocked, nil
+}
+
+func (h *Handler) disconnectUserSessions(ctx context.Context, userID string) {
+	norm := guid.Normalize(userID)
+	if norm == "" {
+		return
+	}
+	if h.sessionMgr != nil {
+		if rem, ok := any(h.sessionMgr).(interface{ RemoveSessionsByUser(string) }); ok {
+			rem.RemoveSessionsByUser(norm)
+		} else {
+			for _, s := range h.sessionMgr.ListSessions() {
+				if guid.Normalize(s.UserId) == norm {
+					h.sessionMgr.RemoveSession(s.UserId, s.DeviceId)
+				}
+			}
+		}
+	}
+	if h.wsHub != nil {
+		if disc, ok := any(h.wsHub).(interface{ DisconnectUser(string) }); ok {
+			disc.DisconnectUser(norm)
+		} else if h.userRepo != nil {
+			if devices, err := h.userRepo.ListDevices(ctx); err == nil {
+				for _, d := range devices {
+					if guid.Normalize(d.LastUserID) == norm {
+						h.wsHub.DisconnectDevice(d.ID)
+					}
+				}
+			}
+		}
+	}
+}
+
+func (h *Handler) countOtherActiveAdmins(ctx context.Context, excludeUserID string) (int, error) {
+	if h.userRepo == nil {
+		return 0, nil
+	}
+	all, err := h.userRepo.ListUsers(ctx)
+	if err != nil {
+		return 0, err
+	}
+	excludeNorm := guid.Normalize(excludeUserID)
+	count := 0
+	for _, u := range all {
+		if guid.Normalize(u.ID) == excludeNorm {
+			continue
+		}
+		if (u.IsAdmin || u.Policy.IsAdministrator) && !u.IsDisabled && !u.Policy.IsDisabled {
+			count++
+		}
+	}
+	return count, nil
 }
 
 func RegisterRoutes(r chi.Router, authMW *middleware.Auth, h *Handler) {
@@ -111,8 +264,12 @@ type authenticateByNameRequest struct {
 }
 
 func (h *Handler) AuthenticateByName(w http.ResponseWriter, r *http.Request) {
+	if !h.checkAuthRateLimit(netutil.ClientIP(r), time.Now().UTC()) {
+		httpx.Error(w, http.StatusTooManyRequests, "Too many authentication attempts")
+		return
+	}
 	var req authenticateByNameRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -173,7 +330,11 @@ func (h *Handler) AuthenticateByName(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListUsers(w http.ResponseWriter, r *http.Request) {
-	ac, _ := middleware.AuthFromContext(r.Context())
+	ac, ok := middleware.AuthFromContext(r.Context())
+	if !ok || ac == nil {
+		httpx.Error(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
 	if ac.IsAdmin() {
 		users, err := h.userRepo.ListUsers(r.Context())
 		if err != nil {
@@ -195,7 +356,11 @@ func (h *Handler) ListUsers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetUser(w http.ResponseWriter, r *http.Request) {
-	ac, _ := middleware.AuthFromContext(r.Context())
+	ac, ok := middleware.AuthFromContext(r.Context())
+	if !ok || ac == nil || (!ac.IsAPIKey && ac.User == nil) {
+		httpx.Error(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
 	targetID := guid.Normalize(chi.URLParam(r, "Id"))
 	if !ac.IsAdmin() && guid.Normalize(ac.UserID()) != targetID {
 		httpx.Error(w, http.StatusForbidden, "Forbidden")
@@ -221,7 +386,7 @@ type createUserRequest struct {
 
 func (h *Handler) CreateUser(w http.ResponseWriter, r *http.Request) {
 	var req createUserRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -246,12 +411,37 @@ func (h *Handler) CreateUser(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) DeleteUser(w http.ResponseWriter, r *http.Request) {
-	ac, _ := middleware.AuthFromContext(r.Context())
+	ac, ok := middleware.AuthFromContext(r.Context())
+	if !ok || ac == nil || !ac.IsAdmin() {
+		httpx.Error(w, http.StatusForbidden, "Administrator privileges required")
+		return
+	}
 	targetID := guid.Normalize(chi.URLParam(r, "Id"))
 	if ac.User != nil && guid.Normalize(ac.User.ID) == targetID {
 		httpx.Error(w, http.StatusBadRequest, "Cannot delete currently authenticated user")
 		return
 	}
+	existing, err := h.userRepo.GetUserByID(r.Context(), targetID)
+	if err != nil {
+		if errors.Is(err, sqlite.ErrNotFound) {
+			httpx.Error(w, http.StatusNotFound, "User not found")
+			return
+		}
+		httpx.Error(w, http.StatusInternalServerError, "failed to load user")
+		return
+	}
+	if (existing.IsAdmin || existing.Policy.IsAdministrator) && !existing.IsDisabled && !existing.Policy.IsDisabled {
+		others, countErr := h.countOtherActiveAdmins(r.Context(), targetID)
+		if countErr != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to verify administrators")
+			return
+		}
+		if others == 0 {
+			httpx.Error(w, http.StatusBadRequest, "Cannot delete the last administrator")
+			return
+		}
+	}
+	h.disconnectUserSessions(r.Context(), targetID)
 	if err := h.userRepo.DeleteUser(r.Context(), targetID); err != nil {
 		if errors.Is(err, sqlite.ErrNotFound) {
 			httpx.Error(w, http.StatusNotFound, "User not found")
@@ -260,6 +450,7 @@ func (h *Handler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "failed to delete user")
 		return
 	}
+	_ = h.userRepo.DeleteTokensByUser(r.Context(), targetID)
 	h.authSvc.InvalidateUserCache(targetID)
 	_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
 		Name:     "User " + targetID + " was deleted",
@@ -277,7 +468,11 @@ type updatePasswordRequest struct {
 }
 
 func (h *Handler) UpdateUserPassword(w http.ResponseWriter, r *http.Request) {
-	ac, _ := middleware.AuthFromContext(r.Context())
+	ac, ok := middleware.AuthFromContext(r.Context())
+	if !ok || ac == nil || (!ac.IsAPIKey && ac.User == nil) {
+		httpx.Error(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
 	targetID := guid.Normalize(chi.URLParam(r, "Id"))
 	isSelf := ac.User != nil && guid.Normalize(ac.User.ID) == targetID
 	if !ac.IsAdmin() && !isSelf {
@@ -286,7 +481,7 @@ func (h *Handler) UpdateUserPassword(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req updatePasswordRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -306,7 +501,9 @@ func (h *Handler) UpdateUserPassword(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	h.disconnectUserSessions(r.Context(), targetID)
 	if h.userRepo != nil {
+		_ = h.userRepo.DeleteTokensByUser(r.Context(), targetID)
 		_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
 			Name:     "Password changed",
 			Type:     "UserPasswordChanged",
@@ -314,15 +511,37 @@ func (h *Handler) UpdateUserPassword(w http.ResponseWriter, r *http.Request) {
 			Severity: "Info",
 		})
 	}
+	h.authSvc.InvalidateUserCache(targetID)
 	httpx.NoContent(w)
 }
 
 func (h *Handler) UpdateUserPolicy(w http.ResponseWriter, r *http.Request) {
 	targetID := guid.Normalize(chi.URLParam(r, "Id"))
 	var policy dto.UserPolicy
-	if err := json.NewDecoder(r.Body).Decode(&policy); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &policy, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid policy body")
 		return
+	}
+	existing, err := h.userRepo.GetUserByID(r.Context(), targetID)
+	if err != nil {
+		if errors.Is(err, sqlite.ErrNotFound) {
+			httpx.Error(w, http.StatusNotFound, "User not found")
+			return
+		}
+		httpx.Error(w, http.StatusInternalServerError, "failed to load user")
+		return
+	}
+	wasAdmin := existing.IsAdmin || existing.Policy.IsAdministrator
+	if wasAdmin && (!policy.IsAdministrator || policy.IsDisabled) {
+		others, countErr := h.countOtherActiveAdmins(r.Context(), targetID)
+		if countErr != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to verify administrators")
+			return
+		}
+		if others == 0 {
+			httpx.Error(w, http.StatusBadRequest, "Cannot revoke or disable the last administrator")
+			return
+		}
 	}
 	if err := h.userRepo.UpdateUserPolicy(r.Context(), targetID, policy); err != nil {
 		if errors.Is(err, sqlite.ErrNotFound) {
@@ -332,19 +551,30 @@ func (h *Handler) UpdateUserPolicy(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "failed to update user policy")
 		return
 	}
+	demoted := wasAdmin && !policy.IsAdministrator
+	if policy.IsDisabled || demoted {
+		h.disconnectUserSessions(r.Context(), targetID)
+		if policy.IsDisabled {
+			_ = h.userRepo.DeleteTokensByUser(r.Context(), targetID)
+		}
+	}
 	h.authSvc.InvalidateUserCache(targetID)
 	httpx.NoContent(w)
 }
 
 func (h *Handler) UpdateUserConfiguration(w http.ResponseWriter, r *http.Request) {
-	ac, _ := middleware.AuthFromContext(r.Context())
+	ac, ok := middleware.AuthFromContext(r.Context())
+	if !ok || ac == nil || (!ac.IsAPIKey && ac.User == nil) {
+		httpx.Error(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
 	targetID := guid.Normalize(chi.URLParam(r, "Id"))
 	if !ac.IsAdmin() && guid.Normalize(ac.UserID()) != targetID {
 		httpx.Error(w, http.StatusForbidden, "Forbidden")
 		return
 	}
 	var cfg dto.UserConfiguration
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &cfg, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid configuration body")
 		return
 	}
@@ -398,7 +628,7 @@ func (h *Handler) CreateAPIKey(w http.ResponseWriter, r *http.Request) {
 			App     string `json:"App"`
 			AppName string `json:"AppName"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+		if err := httpx.DecodeJSONLimit(r, &body, 0); err == nil {
 			if body.App != "" {
 				appName = body.App
 			} else if body.AppName != "" {
@@ -435,12 +665,13 @@ func (h *Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
 		httpx.JSON(w, http.StatusOK, []dto.SessionInfo{})
 		return
 	}
-	ac, _ := middleware.AuthFromContext(r.Context())
-	isAdmin := ac == nil || ac.IsAdmin()
-	callerID := ""
-	if ac != nil {
-		callerID = guid.Normalize(ac.UserID())
+	ac, ok := middleware.AuthFromContext(r.Context())
+	if !ok || ac == nil || (!ac.IsAPIKey && ac.User == nil) {
+		httpx.Error(w, http.StatusUnauthorized, "Authentication required")
+		return
 	}
+	isAdmin := ac.IsAdmin()
+	callerID := guid.Normalize(ac.UserID())
 
 	q := httpx.ParseQuery(r)
 	deviceID := q.Get("DeviceId")
@@ -472,8 +703,12 @@ func (h *Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
-	ac, _ := middleware.AuthFromContext(r.Context())
-	if ac != nil && ac.Token != "" && !ac.IsAPIKey {
+	ac, ok := middleware.AuthFromContext(r.Context())
+	if !ok || ac == nil {
+		httpx.Error(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+	if ac.Token != "" && !ac.IsAPIKey {
 		_ = h.authSvc.RevokeToken(r.Context(), ac.Token)
 		if h.sessionMgr != nil && ac.User != nil {
 			h.sessionMgr.RemoveSession(ac.User.ID, ac.Client.DeviceID)
@@ -483,7 +718,11 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) UpdateCapabilities(w http.ResponseWriter, r *http.Request) {
-	ac, _ := middleware.AuthFromContext(r.Context())
+	ac, ok := middleware.AuthFromContext(r.Context())
+	if !ok || ac == nil || (!ac.IsAPIKey && ac.User == nil) {
+		httpx.Error(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
 	var body struct {
 		PlayableMediaTypes    []string `json:"PlayableMediaTypes"`
 		SupportedCommands     []string `json:"SupportedCommands"`
@@ -492,7 +731,7 @@ func (h *Handler) UpdateCapabilities(w http.ResponseWriter, r *http.Request) {
 		SupportsSync          *bool    `json:"SupportsSync"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = httpx.DecodeJSONLimit(r, &body, 0)
 	}
 	q := httpx.ParseQuery(r)
 	req := session.CapabilitiesRequest{
@@ -531,39 +770,82 @@ func (h *Handler) UpdateCapabilities(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ReportPlaybackStart(w http.ResponseWriter, r *http.Request) {
-	ac, _ := middleware.AuthFromContext(r.Context())
+	ac, ok := middleware.AuthFromContext(r.Context())
+	if !ok || ac == nil || (!ac.IsAPIKey && ac.User == nil) {
+		httpx.Error(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
 	var req session.PlaybackStartRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid playback start payload")
 		return
 	}
-	if h.sessionMgr != nil && ac != nil && ac.User != nil {
+	itemID := req.ItemId
+	if itemID == "" && req.Item != nil {
+		itemID = req.Item.Id
+	}
+	allowed, err := h.canAccessItem(r.Context(), ac, itemID)
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to verify item access")
+		return
+	}
+	if !allowed {
+		httpx.Error(w, http.StatusForbidden, "Access denied")
+		return
+	}
+	if h.sessionMgr != nil && ac.User != nil {
 		_ = h.sessionMgr.ReportPlaybackStart(r.Context(), ac.User, ac.Client, req)
 	}
 	httpx.NoContent(w)
 }
 
 func (h *Handler) ReportPlaybackProgress(w http.ResponseWriter, r *http.Request) {
-	ac, _ := middleware.AuthFromContext(r.Context())
+	ac, ok := middleware.AuthFromContext(r.Context())
+	if !ok || ac == nil || (!ac.IsAPIKey && ac.User == nil) {
+		httpx.Error(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
 	var req session.PlaybackProgressRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid playback progress payload")
 		return
 	}
-	if h.sessionMgr != nil && ac != nil && ac.User != nil {
+	allowed, err := h.canAccessItem(r.Context(), ac, req.ItemId)
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to verify item access")
+		return
+	}
+	if !allowed {
+		httpx.Error(w, http.StatusForbidden, "Access denied")
+		return
+	}
+	if h.sessionMgr != nil && ac.User != nil {
 		_ = h.sessionMgr.ReportPlaybackProgress(r.Context(), ac.User, ac.Client, req)
 	}
 	httpx.NoContent(w)
 }
 
 func (h *Handler) ReportPlaybackStopped(w http.ResponseWriter, r *http.Request) {
-	ac, _ := middleware.AuthFromContext(r.Context())
+	ac, ok := middleware.AuthFromContext(r.Context())
+	if !ok || ac == nil || (!ac.IsAPIKey && ac.User == nil) {
+		httpx.Error(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
 	var req session.PlaybackStoppedRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid playback stopped payload")
 		return
 	}
-	if h.sessionMgr != nil && ac != nil && ac.User != nil {
+	allowed, err := h.canAccessItem(r.Context(), ac, req.ItemId)
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to verify item access")
+		return
+	}
+	if !allowed {
+		httpx.Error(w, http.StatusForbidden, "Access denied")
+		return
+	}
+	if h.sessionMgr != nil && ac.User != nil {
 		_ = h.sessionMgr.ReportPlaybackStopped(r.Context(), ac.User, ac.Client, req)
 	}
 	httpx.NoContent(w)
@@ -582,12 +864,13 @@ type DeviceInfoDto struct {
 }
 
 func (h *Handler) ListDevices(w http.ResponseWriter, r *http.Request) {
-	ac, _ := middleware.AuthFromContext(r.Context())
-	isAdmin := ac == nil || ac.IsAdmin()
-	callerID := ""
-	if ac != nil {
-		callerID = guid.Normalize(ac.UserID())
+	ac, ok := middleware.AuthFromContext(r.Context())
+	if !ok || ac == nil || (!ac.IsAPIKey && ac.User == nil) {
+		httpx.Error(w, http.StatusUnauthorized, "Authentication required")
+		return
 	}
+	isAdmin := ac.IsAdmin()
+	callerID := guid.Normalize(ac.UserID())
 
 	q := httpx.ParseQuery(r)
 	filterUserID := guid.Normalize(q.Get("UserId"))
@@ -660,23 +943,24 @@ type DisplayPreferencesDto struct {
 }
 
 func (h *Handler) GetDisplayPreferences(w http.ResponseWriter, r *http.Request) {
-	ac, _ := middleware.AuthFromContext(r.Context())
+	ac, ok := middleware.AuthFromContext(r.Context())
+	if !ok || ac == nil || (!ac.IsAPIKey && ac.User == nil) {
+		httpx.Error(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
 	id := chi.URLParam(r, "Id")
 	q := httpx.ParseQuery(r)
 	userID := guid.Normalize(q.Get("userId"))
-	callerID := ""
-	if ac != nil {
-		callerID = guid.Normalize(ac.UserID())
-	}
+	callerID := guid.Normalize(ac.UserID())
 	if userID == "" {
 		userID = callerID
 	}
-	if ac != nil && !ac.IsAdmin() && userID != "" && userID != callerID {
+	if !ac.IsAdmin() && userID != "" && userID != callerID {
 		httpx.Error(w, http.StatusForbidden, "Forbidden")
 		return
 	}
 	client := q.Get("client")
-	if client == "" && ac != nil {
+	if client == "" {
 		client = ac.Client.Client
 	}
 	if client == "" {
@@ -709,14 +993,18 @@ func (h *Handler) GetDisplayPreferences(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *Handler) UpdateDisplayPreferences(w http.ResponseWriter, r *http.Request) {
-	ac, _ := middleware.AuthFromContext(r.Context())
+	ac, ok := middleware.AuthFromContext(r.Context())
+	if !ok || ac == nil || (!ac.IsAPIKey && ac.User == nil) {
+		httpx.Error(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
 	id := chi.URLParam(r, "Id")
 	q := httpx.ParseQuery(r)
 	userID := guid.Normalize(q.Get("userId"))
 	if userID == "" {
 		userID = guid.Normalize(ac.UserID())
 	}
-	if ac != nil && !ac.IsAdmin() && userID != guid.Normalize(ac.UserID()) {
+	if !ac.IsAdmin() && userID != guid.Normalize(ac.UserID()) {
 		httpx.Error(w, http.StatusForbidden, "Forbidden")
 		return
 	}

@@ -250,3 +250,219 @@ func TestServeSubtitleExtraBranches(t *testing.T) {
 		}
 	}
 }
+
+func TestPlaybackDecisionSingleProfileAudioSwitchAndDisabledTranscode(t *testing.T) {
+	repo, engine, tmp := setupPlaybackTest(t)
+	ctx := context.Background()
+
+	// 1. Single-profile joint matching: Profile 1 has mp4+h264+aac, Profile 2 has mkv+vp9+opus.
+	// Media is mkv+h264+aac -> MUST NOT mix container from Profile 2 with codecs from Profile 1.
+	jointID := guid.New()
+	jointMS := guid.New()
+	_ = repo.UpsertItem(ctx, &sqlite.ItemRecord{
+		ID: jointID, LibraryID: "lib1", Type: "Movie", Name: "JointMatch", Container: "mkv", Path: filepath.Join(tmp, "joint.mkv"),
+	})
+	_ = repo.ReplaceMediaSourcesAndStreams(ctx, jointID, []sqlite.MediaSourceRecord{{
+		ID: jointMS, ItemID: jointID, Name: "JointMatch", Path: filepath.Join(tmp, "joint.mkv"), Container: "mkv", Bitrate: 4_000_000,
+		Streams: []sqlite.MediaStreamRecord{
+			{MediaSourceID: jointMS, ItemID: jointID, StreamIndex: 0, StreamType: "Video", Codec: "h264", Width: 1920, Height: 1080},
+			{MediaSourceID: jointMS, ItemID: jointID, StreamIndex: 1, StreamType: "Audio", Codec: "aac", IsDefault: true},
+			{MediaSourceID: jointMS, ItemID: jointID, StreamIndex: 2, StreamType: "Audio", Codec: "dts", IsDefault: false},
+		},
+	}})
+
+	splitProfile := &DeviceProfile{
+		Name: "Split Profiles Client",
+		DirectPlayProfiles: []DirectPlayProfile{
+			{Type: "Video", Container: "mp4", VideoCodec: "h264", AudioCodec: "aac"},
+			{Type: "Video", Container: "mkv", VideoCodec: "vp9", AudioCodec: "opus"},
+		},
+	}
+	_, detJoint, err := engine.Decide(ctx, jointID, PlaybackInfoRequest{DeviceProfile: splitProfile})
+	if err != nil || len(detJoint) != 1 || detJoint[0].PlayMethod != PlayMethodDirectStream {
+		t.Fatalf("expected DirectStream (no cross-profile DirectPlay), got det=%+v err=%v", detJoint, err)
+	}
+
+	// 2. AudioStreamIndex switching on an mp4 item:
+	// default audio (index 1, aac) -> DirectPlay; switching to AudioStreamIndex=2 (dts) -> DirectStream with AudioStreamIndex=2.
+	multiAudioID := guid.New()
+	multiAudioMS := guid.New()
+	_ = repo.UpsertItem(ctx, &sqlite.ItemRecord{
+		ID: multiAudioID, LibraryID: "lib1", Type: "Movie", Name: "DualAudio", Container: "mp4", Path: filepath.Join(tmp, "dual.mp4"),
+	})
+	_ = repo.ReplaceMediaSourcesAndStreams(ctx, multiAudioID, []sqlite.MediaSourceRecord{{
+		ID: multiAudioMS, ItemID: multiAudioID, Name: "DualAudio", Path: filepath.Join(tmp, "dual.mp4"), Container: "mp4", Bitrate: 4_000_000,
+		Streams: []sqlite.MediaStreamRecord{
+			{MediaSourceID: multiAudioMS, ItemID: multiAudioID, StreamIndex: 0, StreamType: "Video", Codec: "h264", Width: 1920, Height: 1080},
+			{MediaSourceID: multiAudioMS, ItemID: multiAudioID, StreamIndex: 1, StreamType: "Audio", Codec: "aac", IsDefault: true},
+			{MediaSourceID: multiAudioMS, ItemID: multiAudioID, StreamIndex: 2, StreamType: "Audio", Codec: "dts", IsDefault: false},
+		},
+	}})
+	mp4AACProfile := &DeviceProfile{
+		Name: "MP4 AAC Only",
+		DirectPlayProfiles: []DirectPlayProfile{
+			{Type: "Video", Container: "mp4", VideoCodec: "h264", AudioCodec: "aac"},
+		},
+	}
+	_, detDef, err := engine.Decide(ctx, multiAudioID, PlaybackInfoRequest{DeviceProfile: mp4AACProfile})
+	if err != nil || detDef[0].PlayMethod != PlayMethodDirectPlay {
+		t.Fatalf("expected DirectPlay with default aac track, got %+v err=%v", detDef, err)
+	}
+	dtsIdx := 2
+	respDTS, detDTS, err := engine.Decide(ctx, multiAudioID, PlaybackInfoRequest{
+		AudioStreamIndex: &dtsIdx,
+		DeviceProfile:    mp4AACProfile,
+	})
+	if err != nil || detDTS[0].PlayMethod != PlayMethodDirectStream {
+		t.Fatalf("expected DirectStream when switching to dts track, got %+v err=%v", detDTS, err)
+	}
+	if !strings.Contains(respDTS.MediaSources[0].TranscodingUrl, "AudioStreamIndex=2") {
+		t.Fatalf("expected AudioStreamIndex=2 in TranscodingUrl, got %q", respDTS.MediaSources[0].TranscodingUrl)
+	}
+
+	// 3. EnableTranscoding=false for Video when transcoding is required (bitrate limit exceeded)
+	falseVal := false
+	respNoTC, detNoTC, err := engine.Decide(ctx, multiAudioID, PlaybackInfoRequest{
+		MaxStreamingBitrate: 500_000,
+		EnableTranscoding:   &falseVal,
+		DeviceProfile:       mp4AACProfile,
+	})
+	if err != nil || detNoTC[0].PlayMethod != "" || respNoTC.MediaSources[0].SupportsTranscoding || respNoTC.MediaSources[0].TranscodingUrl != "" {
+		t.Fatalf("expected empty PlayMethod & disabled transcoding for video, got det=%+v ms=%+v err=%v", detNoTC, respNoTC.MediaSources[0], err)
+	}
+
+	// 4. Audio item: STRM 302 Audio URL, nil profile audio direct play, and EnableTranscoding=false for Audio
+	audioStrmPath := filepath.Join(tmp, "song.strm")
+	_ = os.WriteFile(audioStrmPath, []byte("https://192.168.1.10/song.flac\n"), 0o644)
+	audioStrmID := guid.New()
+	_ = repo.UpsertItem(ctx, &sqlite.ItemRecord{
+		ID: audioStrmID, LibraryID: "music", Type: "Audio", MediaType: "Audio", IsStrm: true, Name: "Remote Song", Container: "strm", Path: audioStrmPath,
+	})
+	respAS, detAS, err := engine.Decide(ctx, audioStrmID, PlaybackInfoRequest{})
+	if err != nil || detAS[0].PlayMethod != PlayMethodSTRM302 || !strings.HasPrefix(respAS.MediaSources[0].DirectStreamUrl, "/Audio/") {
+		t.Fatalf("expected Audio STRM302 DirectStreamUrl, got det=%+v ms=%+v err=%v", detAS, respAS.MediaSources[0], err)
+	}
+
+	audioID := guid.New()
+	audioMS := guid.New()
+	_ = repo.UpsertItem(ctx, &sqlite.ItemRecord{
+		ID: audioID, LibraryID: "music", Type: "Audio", MediaType: "Audio", Name: "FLAC", Container: "flac", Path: filepath.Join(tmp, "a.flac"),
+	})
+	_ = repo.ReplaceMediaSourcesAndStreams(ctx, audioID, []sqlite.MediaSourceRecord{{
+		ID: audioMS, ItemID: audioID, Name: "a.flac", Path: filepath.Join(tmp, "a.flac"), Container: "flac", Bitrate: 1_000_000,
+		Streams: []sqlite.MediaStreamRecord{{MediaSourceID: audioMS, ItemID: audioID, StreamIndex: 0, StreamType: "Audio", Codec: "flac"}},
+	}})
+	// Nil profile -> checkAudioProfileCompatibility returns true -> DirectPlay
+	_, detAudNil, err := engine.Decide(ctx, audioID, PlaybackInfoRequest{})
+	if err != nil || detAudNil[0].PlayMethod != PlayMethodDirectPlay {
+		t.Fatalf("expected audio DirectPlay with nil profile, got %+v err=%v", detAudNil, err)
+	}
+	// Incompatible audio profile with EnableTranscoding=false
+	respAudNoTC, detAudNoTC, err := engine.Decide(ctx, audioID, PlaybackInfoRequest{
+		EnableTranscoding: &falseVal,
+		DeviceProfile: &DeviceProfile{
+			Name:               "MP3 Only",
+			DirectPlayProfiles: []DirectPlayProfile{{Type: "Audio", Container: "mp3", AudioCodec: "mp3"}},
+		},
+	})
+	if err != nil || detAudNoTC[0].PlayMethod != "" || respAudNoTC.MediaSources[0].SupportsTranscoding {
+		t.Fatalf("expected disabled audio transcoding, got det=%+v ms=%+v err=%v", detAudNoTC, respAudNoTC.MediaSources[0], err)
+	}
+}
+
+func TestSubtitleShiftASSRenderSRTAndLimits(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1. shiftASS with BOM, header lines, malformed Dialogue, early dropped cue, clamped crossing cue, and shifted cue
+	assPath := filepath.Join(dir, "shift.ass")
+	assContent := "\xef\xbb\xbf[Script Info]\nTitle: Shift Test\n[Events]\n" +
+		"Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n" +
+		"Dialogue: broken,line\n" +
+		"Dialogue: 0,0:00:01.00,0:00:04.00,Default,,0,0,0,,DroppedBeforeOffset\n" +
+		"Dialogue: 0,0:00:03.00,0:00:08.50,Default,,0,0,0,,ClampedStart\n" +
+		"Dialogue: 0,0:00:10.25,0:00:15.75,Default,,0,0,0,,NormalShifted\n"
+	if err := os.WriteFile(assPath, []byte(assContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// ASS -> SSA with startPositionTicks <= 0 hits passthrough branch
+	ctSSA, ssaRaw, err := ServeSubtitle(assPath, "ssa", 0)
+	if err != nil || !strings.Contains(ctSSA, "text/x-ssa") || string(ssaRaw) != assContent {
+		t.Fatalf("expected ASS->SSA passthrough without offset, ct=%s err=%v", ctSSA, err)
+	}
+
+	// ASS -> ASS with startPositionTicks = 5s (50_000_000 ticks)
+	ctShifted, shiftedBytes, err := ServeSubtitle(assPath, "ass", 5_000*10_000)
+	if err != nil || !strings.Contains(ctShifted, "text/x-ssa") {
+		t.Fatalf("ASS shift failed: ct=%s err=%v", ctShifted, err)
+	}
+	shifted := string(shiftedBytes)
+	if !strings.HasPrefix(shifted, "\xef\xbb\xbf[Script Info]") {
+		t.Fatalf("expected BOM and header preserved: %q", shifted)
+	}
+	if strings.Contains(shifted, "DroppedBeforeOffset") {
+		t.Fatalf("expected early cue dropped, got:\n%s", shifted)
+	}
+	if !strings.Contains(shifted, "Dialogue: 0,0:00:00.00,0:00:03.50,Default,,0,0,0,,ClampedStart") {
+		t.Fatalf("expected clamped cue in shifted ASS, got:\n%s", shifted)
+	}
+	if !strings.Contains(shifted, "Dialogue: 0,0:00:05.25,0:00:10.75,Default,,0,0,0,,NormalShifted") {
+		t.Fatalf("expected shifted cue in shifted ASS, got:\n%s", shifted)
+	}
+	if !strings.Contains(shifted, "Dialogue: broken,line") {
+		t.Fatalf("expected malformed dialogue line preserved verbatim, got:\n%s", shifted)
+	}
+
+	// Direct negative clamping checks for formatASSTime and formatSRTTime
+	if got := formatASSTime(-100); got != "0:00:00.00" {
+		t.Fatalf("formatASSTime(-100) = %q, want 0:00:00.00", got)
+	}
+	if got := formatSRTTime(-100); got != "00:00:00,000" {
+		t.Fatalf("formatSRTTime(-100) = %q, want 00:00:00,000", got)
+	}
+
+	// 2. renderSRT via ServeSubtitle (ASS -> SRT with startPositionTicks > 0, and VTT -> SRT)
+	ctSRT, srtBytes, err := ServeSubtitle(assPath, "srt", 5_000*10_000)
+	if err != nil || !strings.Contains(ctSRT, "application/x-subrip") {
+		t.Fatalf("ASS->SRT failed: ct=%s err=%v", ctSRT, err)
+	}
+	srtOut := string(srtBytes)
+	if !strings.Contains(srtOut, "1\n00:00:00,000 --> 00:00:03,500\nClampedStart") ||
+		!strings.Contains(srtOut, "2\n00:00:05,250 --> 00:00:10,750\nNormalShifted") {
+		t.Fatalf("unexpected renderSRT output:\n%s", srtOut)
+	}
+
+	// 3. Oversized line (> maxSubtitleLineSize) rejected by both parseASS and shiftASS (and via ServeSubtitle)
+	overlongLine := "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,," + strings.Repeat("A", maxSubtitleLineSize+128) + "\n"
+	if _, err := parseASS(overlongLine, 0); err == nil {
+		t.Fatal("expected parseASS error for line exceeding maxSubtitleLineSize")
+	}
+	if _, err := shiftASS(overlongLine, 10_000); err == nil {
+		t.Fatal("expected shiftASS error for line exceeding maxSubtitleLineSize")
+	}
+	overlongPath := filepath.Join(dir, "overlong.ass")
+	if err := os.WriteFile(overlongPath, []byte(overlongLine), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ServeSubtitle(overlongPath, "vtt", 0); err == nil {
+		t.Fatal("expected ServeSubtitle ASS->VTT error for overlong ASS line")
+	}
+	if _, _, err := ServeSubtitle(overlongPath, "ass", 10_000); err == nil {
+		t.Fatal("expected ServeSubtitle ASS shift error for overlong ASS line")
+	}
+
+	// 4. Oversized file (> maxSubtitleFileSize) rejected by readLimitedSubtitleFile using a sparse file
+	bigPath := filepath.Join(dir, "huge.srt")
+	f, err := os.Create(bigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(maxSubtitleFileSize + 1); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	if _, _, err := ServeSubtitle(bigPath, "vtt", 0); err == nil || !strings.Contains(err.Error(), "exceeds maximum size") {
+		t.Fatalf("expected oversized subtitle file error, got %v", err)
+	}
+}

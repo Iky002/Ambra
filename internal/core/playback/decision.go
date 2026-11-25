@@ -161,6 +161,7 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 
 	// Find default audio & subtitle indices and extract primary video/audio/subtitle codecs
 	var videoCodec, audioCodec string
+	var selectedAudioCodec, defaultAudioCodec, firstAudioCodec string
 	var videoWidth, videoHeight int
 	var selectedSub *dto.MediaStream
 	for i := range msDTO.MediaStreams {
@@ -177,12 +178,21 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 				videoHeight = st.Height
 			}
 		case "Audio":
-			if audioCodec == "" {
-				audioCodec = strings.ToLower(st.Codec)
+			codecLower := strings.ToLower(st.Codec)
+			if firstAudioCodec == "" {
+				firstAudioCodec = codecLower
 			}
-			if msDTO.DefaultAudioStreamIndex == nil && st.IsDefault {
-				idx := st.Index
-				msDTO.DefaultAudioStreamIndex = &idx
+			if req.AudioStreamIndex != nil && st.Index == *req.AudioStreamIndex {
+				selectedAudioCodec = codecLower
+			}
+			if st.IsDefault {
+				if defaultAudioCodec == "" {
+					defaultAudioCodec = codecLower
+				}
+				if msDTO.DefaultAudioStreamIndex == nil {
+					idx := st.Index
+					msDTO.DefaultAudioStreamIndex = &idx
+				}
 			}
 		case "Subtitle":
 			if msDTO.DefaultSubtitleStreamIndex == nil && st.IsDefault {
@@ -193,6 +203,13 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 				selectedSub = st
 			}
 		}
+	}
+	if selectedAudioCodec != "" {
+		audioCodec = selectedAudioCodec
+	} else if defaultAudioCodec != "" {
+		audioCodec = defaultAudioCodec
+	} else {
+		audioCodec = firstAudioCodec
 	}
 
 	// Assign subtitle delivery method and DeliveryUrl for every subtitle stream
@@ -237,6 +254,7 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 
 	allowDirectPlay := req.EnableDirectPlay == nil || *req.EnableDirectPlay
 	allowDirectStream := req.EnableDirectStream == nil || *req.EnableDirectStream
+	allowTranscoding := req.EnableTranscoding == nil || *req.EnableTranscoding
 
 	maxBitrate := req.MaxStreamingBitrate
 	if maxBitrate == 0 && req.DeviceProfile != nil {
@@ -245,16 +263,27 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 	bitrateOK := maxBitrate <= 0 || src.Bitrate <= 0 || src.Bitrate <= maxBitrate
 
 	if isAudio {
-		containerOK, audioOK := checkAudioProfileCompatibility(src.Container, audioCodec, req.DeviceProfile)
-		if allowDirectPlay && bitrateOK && containerOK && audioOK {
+		audioDirectPlayOK := checkAudioProfileCompatibility(src.Container, audioCodec, req.DeviceProfile)
+		if allowDirectPlay && bitrateOK && audioDirectPlayOK {
 			msDTO.SupportsDirectPlay = true
 			msDTO.SupportsDirectStream = true
-			msDTO.SupportsTranscoding = true
+			msDTO.SupportsTranscoding = allowTranscoding
 			msDTO.DirectStreamUrl = fmt.Sprintf("/Audio/%s/stream?Static=true&MediaSourceId=%s&PlaySessionId=%s", item.ID, msDTO.Id, sessionID)
 			return msDTO, DecisionDetail{
 				MediaSourceID: msDTO.Id,
 				PlayMethod:    PlayMethodDirectPlay,
 				Reason:        "Native audio direct play",
+			}
+		}
+		if !allowTranscoding {
+			msDTO.SupportsDirectPlay = false
+			msDTO.SupportsDirectStream = false
+			msDTO.SupportsTranscoding = false
+			msDTO.TranscodingUrl = ""
+			return msDTO, DecisionDetail{
+				MediaSourceID: msDTO.Id,
+				PlayMethod:    "",
+				Reason:        "Transcoding disabled by request",
 			}
 		}
 		msDTO.SupportsDirectPlay = false
@@ -268,7 +297,7 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 		}
 	}
 
-	containerOK, videoOK, audioOK := checkProfileCompatibility(src.Container, videoCodec, audioCodec, req.DeviceProfile)
+	directPlayOK, videoOK := checkProfileCompatibility(src.Container, videoCodec, audioCodec, req.DeviceProfile)
 	resOK := true
 	if req.MaxWidth > 0 && videoWidth > req.MaxWidth {
 		resOK = false
@@ -278,10 +307,10 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 	}
 
 	// Tier 2: Native DirectPlay
-	if allowDirectPlay && bitrateOK && resOK && containerOK && videoOK && audioOK && !subtitleNeedsBurnIn {
+	if allowDirectPlay && bitrateOK && resOK && directPlayOK && !subtitleNeedsBurnIn {
 		msDTO.SupportsDirectPlay = true
 		msDTO.SupportsDirectStream = true
-		msDTO.SupportsTranscoding = true
+		msDTO.SupportsTranscoding = allowTranscoding
 		msDTO.DirectStreamUrl = fmt.Sprintf("/Videos/%s/stream?Static=true&MediaSourceId=%s&PlaySessionId=%s", item.ID, msDTO.Id, sessionID)
 		return msDTO, DecisionDetail{
 			MediaSourceID: msDTO.Id,
@@ -294,7 +323,7 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 	if allowDirectPlay && bitrateOK && resOK && !subtitleNeedsBurnIn && supportsClientWASM(req.DeviceProfile) {
 		msDTO.SupportsDirectPlay = true
 		msDTO.SupportsDirectStream = true
-		msDTO.SupportsTranscoding = true
+		msDTO.SupportsTranscoding = allowTranscoding
 		msDTO.DirectStreamUrl = fmt.Sprintf("/Videos/%s/stream?Static=true&MediaSourceId=%s&PlaySessionId=%s", item.ID, msDTO.Id, sessionID)
 		return msDTO, DecisionDetail{
 			MediaSourceID: msDTO.Id,
@@ -307,7 +336,7 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 	if allowDirectStream && bitrateOK && resOK && videoOK && !subtitleNeedsBurnIn {
 		msDTO.SupportsDirectPlay = false
 		msDTO.SupportsDirectStream = true
-		msDTO.SupportsTranscoding = true
+		msDTO.SupportsTranscoding = allowTranscoding
 		baseURL := fmt.Sprintf("/Videos/%s/master.m3u8?MediaSourceId=%s&PlaySessionId=%s&VideoCodec=copy&AudioCodec=aac", item.ID, msDTO.Id, sessionID)
 		msDTO.TranscodingUrl = appendTranscodeQueryParams(baseURL, req, maxBitrate)
 		return msDTO, DecisionDetail{
@@ -318,6 +347,17 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 	}
 
 	// Tier 5: Server Transcode (full HLS transcoding)
+	if !allowTranscoding {
+		msDTO.SupportsDirectPlay = false
+		msDTO.SupportsDirectStream = false
+		msDTO.SupportsTranscoding = false
+		msDTO.TranscodingUrl = ""
+		return msDTO, DecisionDetail{
+			MediaSourceID: msDTO.Id,
+			PlayMethod:    "",
+			Reason:        "Transcoding disabled by request",
+		}
+	}
 	msDTO.SupportsDirectPlay = false
 	msDTO.SupportsDirectStream = false
 	msDTO.SupportsTranscoding = true
@@ -365,9 +405,9 @@ func appendTranscodeQueryParams(baseURL string, req PlaybackInfoRequest, maxBitr
 	return out
 }
 
-func checkAudioProfileCompatibility(container, audioCodec string, profile *DeviceProfile) (containerOK, audioOK bool) {
+func checkAudioProfileCompatibility(container, audioCodec string, profile *DeviceProfile) bool {
 	if profile == nil || len(profile.DirectPlayProfiles) == 0 {
-		return true, true
+		return true
 	}
 	container = strings.ToLower(container)
 	audioCodec = strings.ToLower(audioCodec)
@@ -379,22 +419,16 @@ func checkAudioProfileCompatibility(container, audioCodec string, profile *Devic
 		cMatch := dp.Container == "" || csvContains(dp.Container, container)
 		aMatch := dp.AudioCodec == "" || audioCodec == "" || csvContains(dp.AudioCodec, audioCodec)
 		if cMatch && aMatch {
-			return true, true
-		}
-		if cMatch {
-			containerOK = true
-		}
-		if aMatch {
-			audioOK = true
+			return true
 		}
 	}
-	return containerOK, audioOK
+	return false
 }
 
-func checkProfileCompatibility(container, videoCodec, audioCodec string, profile *DeviceProfile) (containerOK, videoOK, audioOK bool) {
+func checkProfileCompatibility(container, videoCodec, audioCodec string, profile *DeviceProfile) (directPlayOK, videoOK bool) {
 	if profile == nil || len(profile.DirectPlayProfiles) == 0 {
 		// No DeviceProfile provided -> trust client can DirectPlay
-		return true, true, true
+		return true, true
 	}
 	container = strings.ToLower(container)
 	videoCodec = strings.ToLower(videoCodec)
@@ -408,19 +442,13 @@ func checkProfileCompatibility(container, videoCodec, audioCodec string, profile
 		vMatch := dp.VideoCodec == "" || videoCodec == "" || csvContains(dp.VideoCodec, videoCodec)
 		aMatch := dp.AudioCodec == "" || audioCodec == "" || csvContains(dp.AudioCodec, audioCodec)
 		if cMatch && vMatch && aMatch {
-			return true, true, true
+			return true, true
 		}
 		if vMatch {
 			videoOK = true
 		}
-		if cMatch {
-			containerOK = true
-		}
-		if aMatch {
-			audioOK = true
-		}
 	}
-	return containerOK, videoOK, audioOK
+	return false, videoOK
 }
 
 func supportsClientWASM(profile *DeviceProfile) bool {

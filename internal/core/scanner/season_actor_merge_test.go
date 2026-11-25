@@ -100,6 +100,7 @@ func TestPhaseBWaveOrderSeasonEpisodeAndActorAvatars(t *testing.T) {
 	repo := sqlite.NewLibraryRepo(store)
 	reg := plugins.NewRegistry()
 	tmdbProv := tmdb.New("test-api-key", "zh-CN")
+	tmdbProv.SetHTTPClient(srv.Client())
 	_ = tmdbProv.Configure(map[string]any{
 		"base_url":       srv.URL,
 		"image_base_url": srv.URL,

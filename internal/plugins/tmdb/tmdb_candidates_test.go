@@ -70,6 +70,7 @@ func TestTMDBSearchCandidatesMovieAndSeries(t *testing.T) {
 	}
 
 	p := New("test-key", "zh-CN")
+	p.SetHTTPClient(srv.Client())
 	_ = p.Configure(map[string]any{"base_url": srv.URL})
 
 	if res, err := p.SearchCandidates(context.Background(), "Movie", "   ", 0, ""); err != nil || res != nil {
@@ -155,6 +156,7 @@ func TestTMDBFetchImages(t *testing.T) {
 	}
 
 	p := New("test-key", "zh-CN")
+	p.SetHTTPClient(srv.Client())
 	_ = p.Configure(map[string]any{"base_url": srv.URL})
 
 	if imgs, err := p.FetchImages(context.Background(), "Movie", ""); err != nil || imgs != nil {

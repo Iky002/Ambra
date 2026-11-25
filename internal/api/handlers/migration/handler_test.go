@@ -375,4 +375,17 @@ func TestMigrationHandlerConflictAndErrorMapping(t *testing.T) {
 	if errRec.Code != http.StatusBadGateway {
 		t.Fatalf("expected 502 for upstream 500, got %d", errRec.Code)
 	}
+
+	// Strip URL userinfo & truncate long errors
+	if got := stripURLUserinfo("https://admin:supersecret@emby.example.com:8096/emby"); got != "https://emby.example.com:8096/emby" {
+		t.Fatalf("expected userinfo stripped, got %q", got)
+	}
+	longErr := make([]byte, 1024)
+	for i := range longErr {
+		longErr[i] = 'A'
+	}
+	trunc := truncateErrorMsg(string(longErr), maxUpstreamErrorBytes)
+	if len(trunc) > maxUpstreamErrorBytes {
+		t.Fatalf("expected truncated error <= %d bytes, got %d", maxUpstreamErrorBytes, len(trunc))
+	}
 }

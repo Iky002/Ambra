@@ -203,16 +203,25 @@ func (s *Service) ListAudits(ctx context.Context, status string) ([]ScrapeAuditI
 }
 
 // ApproveAudit applies the selected metadata candidate to the item, optionally locks
-// the specified fields in items.extra_json, and marks the audit item as approved.
+// the specified fields in items.extra_json, syncs taxonomies and FTS, and marks the audit item as approved.
 func (s *Service) ApproveAudit(ctx context.Context, auditID string, candidate ScrapeCandidate, lockFields []string) (*ScrapeAuditItem, error) {
 	auditID = strings.TrimSpace(auditID)
 	if auditID == "" {
 		return nil, fmt.Errorf("%w: audit id is required", ErrInvalidArgument)
 	}
+	if isCandidateEmpty(candidate) {
+		return nil, fmt.Errorf("%w: non-empty candidate metadata is required", ErrInvalidArgument)
+	}
+
+	tx, err := s.store.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
 
 	var rec ScrapeAuditItem
 	var candRaw string
-	err := s.store.Reader.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, `
 		SELECT id, item_id, item_name, item_type, path, confidence, candidates_json, status, created_at, updated_at
 		FROM scrape_audit_queue WHERE id = ?`, auditID,
 	).Scan(
@@ -225,12 +234,15 @@ func (s *Service) ApproveAudit(ctx context.Context, auditID string, candidate Sc
 	if err != nil {
 		return nil, err
 	}
+	if rec.Status != AuditStatusPending {
+		return nil, fmt.Errorf("%w: audit item %s is not pending (status=%s)", ErrInvalidArgument, rec.ID, rec.Status)
+	}
 	_ = json.Unmarshal([]byte(candRaw), &rec.Candidates)
 	if rec.Candidates == nil {
 		rec.Candidates = []ScrapeCandidate{}
 	}
 
-	// Load existing item to merge metadata updates.
+	// Load existing item inside the same writer transaction to merge metadata updates atomically.
 	var (
 		curName          string
 		curOriginalTitle sql.NullString
@@ -238,7 +250,7 @@ func (s *Service) ApproveAudit(ctx context.Context, auditID string, candidate Sc
 		curRating        sql.NullFloat64
 		extraRaw         string
 	)
-	err = s.store.Reader.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, `
 		SELECT name, original_title, production_year, community_rating, extra_json
 		FROM items WHERE id = ?`, rec.ItemID,
 	).Scan(&curName, &curOriginalTitle, &curYear, &curRating, &extraRaw)
@@ -290,12 +302,6 @@ func (s *Service) ApproveAudit(ctx context.Context, auditID string, candidate Sc
 	}
 
 	now := time.Now().Unix()
-	tx, err := s.store.Writer.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE items
 		SET name = ?, original_title = ?, sort_name = ?, production_year = ?,
@@ -307,11 +313,29 @@ func (s *Service) ApproveAudit(ctx context.Context, auditID string, candidate Sc
 		return nil, err
 	}
 
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE scrape_audit_queue SET status = ?, updated_at = ? WHERE id = ?`,
-		AuditStatusApproved, now, rec.ID,
-	); err != nil {
+	if len(candidate.Genres) > 0 {
+		if err := replaceItemTaxonomiesTx(ctx, tx, rec.ItemID, "Genre", candidate.Genres); err != nil {
+			return nil, err
+		}
+	}
+	if len(candidate.Tags) > 0 {
+		if err := replaceItemTaxonomiesTx(ctx, tx, rec.ItemID, "Tag", candidate.Tags); err != nil {
+			return nil, err
+		}
+	}
+	if err := syncItemSearchFTSTx(ctx, tx, rec.ItemID, newName, newOriginalTitle.String); err != nil {
 		return nil, err
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE scrape_audit_queue SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
+		AuditStatusApproved, now, rec.ID, AuditStatusPending,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if rows, _ := res.RowsAffected(); rows == 0 {
+		return nil, fmt.Errorf("%w: audit item %s is no longer pending", ErrInvalidArgument, rec.ID)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -321,6 +345,82 @@ func (s *Service) ApproveAudit(ctx context.Context, auditID string, candidate Sc
 	rec.Status = AuditStatusApproved
 	rec.UpdatedAt = now
 	return &rec, nil
+}
+
+func isCandidateEmpty(c ScrapeCandidate) bool {
+	return strings.TrimSpace(c.Title) == "" &&
+		strings.TrimSpace(c.OriginalTitle) == "" &&
+		strings.TrimSpace(c.ProviderID) == "" &&
+		strings.TrimSpace(c.Overview) == "" &&
+		c.Year == nil &&
+		c.Rating == nil &&
+		len(c.Genres) == 0 &&
+		len(c.Tags) == 0
+}
+
+func replaceItemTaxonomiesTx(ctx context.Context, tx *sql.Tx, itemID, kind string, names []string) error {
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM item_taxonomies
+		WHERE item_id = ? AND taxonomy_id IN (SELECT id FROM taxonomies WHERE kind = ?)`,
+		itemID, kind,
+	); err != nil {
+		return err
+	}
+	seen := make(map[string]struct{}, len(names))
+	for _, rawName := range names {
+		name := strings.TrimSpace(rawName)
+		if name == "" {
+			continue
+		}
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+
+		var taxID string
+		err := tx.QueryRowContext(ctx, `SELECT id FROM taxonomies WHERE kind = ? AND name = ?`, kind, name).Scan(&taxID)
+		if errors.Is(err, sql.ErrNoRows) {
+			taxID = guid.New()
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO taxonomies (id, kind, name, sort_name) VALUES (?, ?, ?, ?)`,
+				taxID, kind, name, strings.ToLower(name),
+			); err != nil {
+				return err
+			}
+		} else if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO item_taxonomies (item_id, taxonomy_id) VALUES (?, ?)`,
+			itemID, taxID,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func syncItemSearchFTSTx(ctx context.Context, tx *sql.Tx, itemID, name, originalTitle string) error {
+	var pinyinFull, pinyinInitials, peopleNames string
+	_ = tx.QueryRowContext(ctx,
+		`SELECT COALESCE(pinyin_full, ''), COALESCE(pinyin_initials, ''), COALESCE(people_names, '') FROM item_search_fts WHERE item_id = ? LIMIT 1`,
+		itemID,
+	).Scan(&pinyinFull, &pinyinInitials, &peopleNames)
+
+	titleRaw := strings.TrimSpace(name)
+	if orig := strings.TrimSpace(originalTitle); orig != "" && !strings.EqualFold(orig, titleRaw) {
+		titleRaw = strings.TrimSpace(titleRaw + " " + orig)
+	}
+	titleTokens := strings.ToLower(titleRaw)
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM item_search_fts WHERE item_id = ?`, itemID); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO item_search_fts (item_id, title_raw, title_tokens, pinyin_full, pinyin_initials, people_names) VALUES (?, ?, ?, ?, ?, ?)`,
+		itemID, titleRaw, titleTokens, pinyinFull, pinyinInitials, peopleNames,
+	)
+	return err
 }
 
 // DismissAudit marks a scrape audit queue item as dismissed without modifying the item.
@@ -396,7 +496,7 @@ func (s *Service) RunLibraryAudit(ctx context.Context) (*LibraryAuditReport, err
 	_ = imgRows.Close()
 
 	rows, err := s.store.Reader.QueryContext(ctx, `
-		SELECT id, name, type, library_id, path, production_year, is_strm, extra_json
+		SELECT id, name, type, library_id, path, production_year, is_strm, is_folder, extra_json
 		FROM items
 		ORDER BY type ASC, sort_name ASC`)
 	if err != nil {
@@ -406,16 +506,17 @@ func (s *Service) RunLibraryAudit(ctx context.Context) (*LibraryAuditReport, err
 
 	for rows.Next() {
 		var (
-			id        string
-			name      string
-			itemType  string
-			libraryID string
-			pathNull  sql.NullString
-			yearNull  sql.NullInt64
-			isStrmInt int
-			extraRaw  string
+			id          string
+			name        string
+			itemType    string
+			libraryID   string
+			pathNull    sql.NullString
+			yearNull    sql.NullInt64
+			isStrmInt   int
+			isFolderInt int
+			extraRaw    string
 		)
-		if err := rows.Scan(&id, &name, &itemType, &libraryID, &pathNull, &yearNull, &isStrmInt, &extraRaw); err != nil {
+		if err := rows.Scan(&id, &name, &itemType, &libraryID, &pathNull, &yearNull, &isStrmInt, &isFolderInt, &extraRaw); err != nil {
 			return nil, err
 		}
 
@@ -445,8 +546,8 @@ func (s *Service) RunLibraryAudit(ctx context.Context) (*LibraryAuditReport, err
 			}
 		}
 
-		if !issue.IsStrm && issue.Path != "" {
-			if _, statErr := os.Stat(issue.Path); statErr != nil && errors.Is(statErr, os.ErrNotExist) {
+		if isEligibleOrphanCandidate(issue.IsStrm, isFolderInt != 0, issue.Path) {
+			if _, statErr := os.Stat(issue.Path); statErr != nil && os.IsNotExist(statErr) {
 				report.OrphanItems = append(report.OrphanItems, issue)
 			}
 		}
@@ -458,8 +559,31 @@ func (s *Service) RunLibraryAudit(ctx context.Context) (*LibraryAuditReport, err
 	return report, nil
 }
 
+func isVirtualPath(p string) bool {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return true
+	}
+	lower := strings.ToLower(p)
+	if strings.HasPrefix(lower, "artist://") || strings.HasPrefix(lower, "album://") || strings.Contains(p, "://") {
+		return true
+	}
+	if strings.Contains(p, "#Season") {
+		return true
+	}
+	return false
+}
+
+func isEligibleOrphanCandidate(isStrm, isFolder bool, path string) bool {
+	if isStrm || isFolder {
+		return false
+	}
+	return !isVirtualPath(path)
+}
+
 // CleanupOrphans deletes the specified orphaned item IDs from items, item_ancestors,
-// item_search_fts, and scrape_audit_queue within a single transaction.
+// item_search_fts, and scrape_audit_queue within a single transaction after re-verifying
+// each item is a non-STRM, non-folder physical file whose disk path no longer exists.
 func (s *Service) CleanupOrphans(ctx context.Context, itemIDs []string) (*OrphanCleanupResult, error) {
 	seen := make(map[string]struct{}, len(itemIDs))
 	unique := make([]string, 0, len(itemIDs))
@@ -490,6 +614,26 @@ func (s *Service) CleanupOrphans(ctx context.Context, itemIDs []string) (*Orphan
 	defer tx.Rollback()
 
 	for _, id := range unique {
+		var (
+			isStrmInt   int
+			isFolderInt int
+			pathNull    sql.NullString
+		)
+		err := tx.QueryRowContext(ctx, `SELECT is_strm, is_folder, path FROM items WHERE id = ?`, id).Scan(&isStrmInt, &isFolderInt, &pathNull)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		itemPath := strings.TrimSpace(pathNull.String)
+		if !isEligibleOrphanCandidate(isStrmInt != 0, isFolderInt != 0, itemPath) {
+			continue
+		}
+		if _, statErr := os.Stat(itemPath); statErr == nil || !os.IsNotExist(statErr) {
+			continue
+		}
+
 		if _, err := tx.ExecContext(ctx, `DELETE FROM item_search_fts WHERE item_id = ?`, id); err != nil {
 			return nil, err
 		}

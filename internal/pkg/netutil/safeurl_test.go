@@ -1,10 +1,14 @@
 package netutil
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -154,5 +158,116 @@ func TestValidateIPAndEdgeCases(t *testing.T) {
 	}
 	if err := ValidateRemoteURL("http://sub.localhost/", false); err == nil {
 		t.Fatal("expected sub.localhost blocked when allowPrivateLAN=false")
+	}
+}
+
+func TestSafeURLSpecialPrefixesAndRedirectHardening(t *testing.T) {
+	// 1. Always-blocked special/transition/metadata/deprecated IPv4-compat prefixes
+	blockedURLs := []struct {
+		name string
+		url  string
+	}{
+		{"NAT64 well-known", "http://[64:ff9b::1.2.3.4]/"},
+		{"NAT64 local-use", "http://[64:ff9b:1::1]/"},
+		{"6to4", "http://[2002:c000:0201::1]/"},
+		{"Teredo", "http://[2001:0000:4136:e378::1]/"},
+		{"IPv4 reserved 240/4", "http://240.0.0.1/"},
+		{"Benchmark 198.18/15", "http://198.18.0.1/"},
+		{"AWS IPv6 IMDS", "http://[fd00:ec2::254]/latest/meta-data/"},
+		{"Alibaba Cloud metadata", "http://100.100.100.200/latest/meta-data/"},
+		{"IPv4-mapped Alibaba metadata", "http://[::ffff:100.100.100.200]/"},
+		{"Deprecated IPv4-compat", "http://[::127.0.0.1]/"},
+		{"Deprecated IPv4-compat public", "http://[::1.2.3.4]/"},
+	}
+	for _, tc := range blockedURLs {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := ValidateRemoteURL(tc.url, true); err == nil {
+				t.Fatalf("expected %s (%s) to be blocked even with allowPrivateLAN=true", tc.name, tc.url)
+			}
+			if err := ValidateRemoteURL(tc.url, false); err == nil {
+				t.Fatalf("expected %s (%s) to be blocked with allowPrivateLAN=false", tc.name, tc.url)
+			}
+		})
+	}
+
+	// Invalid netip.Addr directly in validateAddr
+	if err := validateAddr(netip.Addr{}, true); err == nil {
+		t.Fatal("expected error for invalid netip.Addr")
+	}
+
+	// DNS resolution failure on guaranteed non-existent domain
+	if err := ValidateRemoteURL("http://nonexistent.invalid/", true); err == nil {
+		t.Fatal("expected DNS resolution error for nonexistent.invalid")
+	}
+
+	// 2. Cross-host redirect strips all sensitive auth headers while preserving non-sensitive ones
+	var receivedHeaders http.Header
+	targetSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer targetSrv.Close()
+
+	originSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, targetSrv.URL+"/landed", http.StatusFound)
+	}))
+	defer originSrv.Close()
+
+	client := NewSafeHTTPClient(5*time.Second, true)
+	req, err := http.NewRequest(http.MethodGet, originSrv.URL+"/start", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sensitive := []string{
+		"Authorization", "X-Emby-Token", "X-MediaBrowser-Token",
+		"X-Emby-Authorization", "X-Api-Key", "trakt-api-key",
+	}
+	for _, h := range sensitive {
+		req.Header.Set(h, "secret-value")
+	}
+	req.Header.Set("X-Non-Sensitive", "keep-me")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("cross-host redirect request failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	for _, h := range sensitive {
+		if got := receivedHeaders.Get(h); got != "" {
+			t.Fatalf("expected sensitive header %q stripped on cross-host redirect, got %q", h, got)
+		}
+	}
+	if got := receivedHeaders.Get("X-Non-Sensitive"); got != "keep-me" {
+		t.Fatalf("expected non-sensitive header preserved, got %q", got)
+	}
+
+	// 3. HTTPS -> HTTP redirect downgrade must be rejected
+	prevReq := &http.Request{URL: &url.URL{Scheme: "https", Host: "127.0.0.1:8443", Path: "/a"}}
+	nextReq := &http.Request{URL: &url.URL{Scheme: "http", Host: "127.0.0.1:8080", Path: "/b"}, Header: make(http.Header)}
+	if err := client.CheckRedirect(nextReq, []*http.Request{prevReq}); err == nil || !strings.Contains(err.Error(), "downgrade") {
+		t.Fatalf("expected https->http downgrade rejection, got %v", err)
+	}
+
+	// Redirect with nil URL and empty host
+	if err := client.CheckRedirect(&http.Request{}, nil); err == nil {
+		t.Fatal("expected error for nil redirect URL")
+	}
+	if err := client.CheckRedirect(&http.Request{URL: &url.URL{Scheme: "http", Host: "", Path: "/x"}}, nil); err == nil {
+		t.Fatal("expected error for empty redirect host")
+	}
+
+	// 4. Transport DialContext error paths: invalid host:port and closed port dial error
+	tr := client.Transport.(*http.Transport)
+	if _, err := tr.DialContext(context.Background(), "tcp", "missing-port"); err == nil {
+		t.Fatal("expected SplitHostPort error from DialContext")
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedAddr := ln.Addr().String()
+	_ = ln.Close()
+	if _, err := tr.DialContext(context.Background(), "tcp", closedAddr); err == nil {
+		t.Fatal("expected dial error for closed loopback port")
 	}
 }

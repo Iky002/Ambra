@@ -220,6 +220,8 @@ export function UsersTab() {
       EnableContentDownloading: Boolean(p.EnableContentDownloading),
       EnableContentDeletion: Boolean(p.EnableContentDeletion),
       EnableRemoteAccess: p.EnableRemoteAccess ?? true,
+      EnableLiveTvAccess: p.EnableLiveTvAccess ?? true,
+      EnableLiveTvManagement: Boolean(p.EnableLiveTvManagement),
       MaxParentalRating: p.MaxParentalRating,
       BlockedTags: blockedTags,
     })
@@ -564,8 +566,9 @@ export function UsersTab() {
           <ToggleSwitch
             checked={Boolean(draftPolicy.IsAdministrator)}
             onChange={(v) => setDraftPolicy((p) => ({ ...p, IsAdministrator: v }))}
+            disabled={policyTarget?.Id === auth?.userId}
             label="管理员权限 (IsAdministrator)"
-            description="允许管理服务器设置、用户、媒体库、设备与插件"
+            description="允许管理服务器设置、用户、媒体库、设备与插件（禁止取消当前登录账号自身的管理员权限）"
           />
 
           <ToggleSwitch
@@ -637,6 +640,20 @@ export function UsersTab() {
             onChange={(v) => setDraftPolicy((p) => ({ ...p, EnableContentDeletion: v }))}
             label="允许删除媒体内容 (EnableContentDeletion)"
             description="危险权限：允许该账号从媒体库中删除媒体文件"
+          />
+
+          <ToggleSwitch
+            checked={draftPolicy.EnableLiveTvAccess !== false}
+            onChange={(v) => setDraftPolicy((p) => ({ ...p, EnableLiveTvAccess: v }))}
+            label="允许访问电视直播 (EnableLiveTvAccess)"
+            description="允许查看电视频道、节目指南与观看直播流"
+          />
+
+          <ToggleSwitch
+            checked={Boolean(draftPolicy.EnableLiveTvManagement)}
+            onChange={(v) => setDraftPolicy((p) => ({ ...p, EnableLiveTvManagement: v }))}
+            label="允许管理电视直播与录制 (EnableLiveTvManagement)"
+            description="允许创建和取消 DVR 录制预约计划"
           />
 
           <div className="space-y-3 rounded-xl border border-white/8 bg-white/[0.02] p-4">

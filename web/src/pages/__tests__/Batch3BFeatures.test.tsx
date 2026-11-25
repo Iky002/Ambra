@@ -159,7 +159,7 @@ describe('Batch 3B Web UI 功能测试 (P1-3 / P1-4 / P1-6 / P2-3)', () => {
     })
   })
 
-  it('CollectionsPage：打开新建合集弹窗提交 POST /emby/Collections', async () => {
+  it('CollectionsPage：非管理员隐藏新建合集，管理员打开新建合集弹窗提交 POST /emby/Collections', async () => {
     const user = userEvent.setup()
     const createdCollections: Array<{ Id: string; Name: string; Type: string }> = []
 
@@ -169,10 +169,19 @@ describe('Batch 3B Web UI 功能测试 (P1-3 / P1-4 / P1-6 / P2-3)', () => {
       if (url === '/emby/Users/u-1') {
         return jsonRes({ Id: 'u-1', Name: 'Alice', Policy: { IsAdministrator: false } })
       }
-      if (url.startsWith('/emby/Users/u-1/Items') && url.includes('IncludeItemTypes=BoxSet')) {
+      if (url === '/emby/Users/u-admin') {
+        return jsonRes({ Id: 'u-admin', Name: 'Admin', Policy: { IsAdministrator: true } })
+      }
+      if (
+        (url.startsWith('/emby/Users/u-1/Items') || url.startsWith('/emby/Users/u-admin/Items')) &&
+        url.includes('IncludeItemTypes=BoxSet')
+      ) {
         return jsonRes({ Items: createdCollections, TotalRecordCount: createdCollections.length })
       }
-      if (url.startsWith('/emby/Users/u-1/Items') && url.includes('IncludeItemTypes=Playlist')) {
+      if (
+        (url.startsWith('/emby/Users/u-1/Items') || url.startsWith('/emby/Users/u-admin/Items')) &&
+        url.includes('IncludeItemTypes=Playlist')
+      ) {
         return jsonRes({ Items: [], TotalRecordCount: 0 })
       }
       if (url.startsWith('/emby/Collections') && method === 'POST') {
@@ -182,6 +191,27 @@ describe('Batch 3B Web UI 功能测试 (P1-3 / P1-4 / P1-6 / P2-3)', () => {
         return jsonRes({ Id: created.Id, Name: created.Name })
       }
       return jsonRes({})
+    })
+
+    const { unmount } = renderWithProviders(
+      <Routes>
+        <Route path="/collections" element={<CollectionsPage />} />
+        <Route path="/collections/:id" element={<CollectionsPage />} />
+      </Routes>,
+      ['/collections'],
+    )
+
+    expect(await screen.findByText('合集与播放列表')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '新建合集' })).not.toBeInTheDocument()
+    unmount()
+
+    saveAuth({
+      accessToken: 'tok-batch3b-admin',
+      userId: 'u-admin',
+      serverId: 'srv-1',
+      userName: 'Admin',
+      isAdmin: true,
+      deviceId: 'dev-batch3b-admin',
     })
 
     renderWithProviders(

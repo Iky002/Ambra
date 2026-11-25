@@ -116,7 +116,7 @@ func TestFetchDoubanTop250HTMLPaginationAndTolerance(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	f := NewFetcher(Options{DoubanURL: srv.URL})
+	f := NewFetcher(Options{DoubanURL: srv.URL, HTTPClient: srv.Client()})
 	snap, err := f.FetchDoubanTop250(context.Background())
 	if err != nil {
 		t.Fatalf("FetchDoubanTop250 failed: %v", err)
@@ -178,7 +178,7 @@ func TestFetchIMDbTop250JSONLD(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	f := NewFetcher(Options{IMDbURL: srv.URL})
+	f := NewFetcher(Options{IMDbURL: srv.URL, HTTPClient: srv.Client()})
 	snap, err := f.FetchIMDbTop250(context.Background())
 	if err != nil {
 		t.Fatalf("FetchIMDbTop250 failed: %v", err)
@@ -216,7 +216,7 @@ func TestFetchCustomJSONFeedsAndEnvVars(t *testing.T) {
 	t.Setenv(EnvDouban250URL, doubanSrv.URL)
 	t.Setenv(EnvIMDb250URL, imdbSrv.URL)
 
-	f := NewFetcher(Options{})
+	f := NewFetcher(Options{HTTPClient: doubanSrv.Client()})
 	dSnap, err := f.FetchDoubanTop250(context.Background())
 	if err != nil {
 		t.Fatalf("FetchDoubanTop250 json failed: %v", err)
@@ -264,28 +264,29 @@ func TestFetcherErrorPaths(t *testing.T) {
 	defer err500Srv.Close()
 
 	ctx := context.Background()
-	if _, err := NewFetcher(Options{DoubanURL: badHTMLSrv.URL}).FetchDoubanTop250(ctx); err == nil {
+	testClient := badHTMLSrv.Client()
+	if _, err := NewFetcher(Options{DoubanURL: badHTMLSrv.URL, HTTPClient: testClient}).FetchDoubanTop250(ctx); err == nil {
 		t.Fatal("expected error for empty douban html")
 	}
-	if _, err := NewFetcher(Options{DoubanURL: badJSONSrv.URL}).FetchDoubanTop250(ctx); err == nil {
+	if _, err := NewFetcher(Options{DoubanURL: badJSONSrv.URL, HTTPClient: testClient}).FetchDoubanTop250(ctx); err == nil {
 		t.Fatal("expected error for invalid douban json")
 	}
-	if _, err := NewFetcher(Options{DoubanURL: emptyJSONSrv.URL}).FetchDoubanTop250(ctx); err == nil {
+	if _, err := NewFetcher(Options{DoubanURL: emptyJSONSrv.URL, HTTPClient: testClient}).FetchDoubanTop250(ctx); err == nil {
 		t.Fatal("expected error for empty douban json")
 	}
-	if _, err := NewFetcher(Options{DoubanURL: err500Srv.URL}).FetchDoubanTop250(ctx); err == nil {
+	if _, err := NewFetcher(Options{DoubanURL: err500Srv.URL, HTTPClient: testClient}).FetchDoubanTop250(ctx); err == nil {
 		t.Fatal("expected error for 502 douban response")
 	}
-	if _, err := NewFetcher(Options{IMDbURL: badHTMLSrv.URL}).FetchIMDbTop250(ctx); err == nil {
+	if _, err := NewFetcher(Options{IMDbURL: badHTMLSrv.URL, HTTPClient: testClient}).FetchIMDbTop250(ctx); err == nil {
 		t.Fatal("expected error for imdb html without ld+json")
 	}
-	if _, err := NewFetcher(Options{IMDbURL: badJSONSrv.URL}).FetchIMDbTop250(ctx); err == nil {
+	if _, err := NewFetcher(Options{IMDbURL: badJSONSrv.URL, HTTPClient: testClient}).FetchIMDbTop250(ctx); err == nil {
 		t.Fatal("expected error for invalid imdb json")
 	}
-	if _, err := NewFetcher(Options{IMDbURL: emptyJSONSrv.URL}).FetchIMDbTop250(ctx); err == nil {
+	if _, err := NewFetcher(Options{IMDbURL: emptyJSONSrv.URL, HTTPClient: testClient}).FetchIMDbTop250(ctx); err == nil {
 		t.Fatal("expected error for empty imdb json")
 	}
-	if _, err := NewFetcher(Options{IMDbURL: err500Srv.URL}).FetchIMDbTop250(ctx); err == nil {
+	if _, err := NewFetcher(Options{IMDbURL: err500Srv.URL, HTTPClient: testClient}).FetchIMDbTop250(ctx); err == nil {
 		t.Fatal("expected error for 502 imdb response")
 	}
 
@@ -330,8 +331,9 @@ func TestCachePersistenceFailureRetentionAndMatching(t *testing.T) {
 	defer imdbSrv.Close()
 
 	opts := Options{
-		DoubanURL: doubanSrv.URL,
-		IMDbURL:   imdbSrv.URL,
+		DoubanURL:  doubanSrv.URL,
+		IMDbURL:    imdbSrv.URL,
+		HTTPClient: doubanSrv.Client(),
 		TMDBTrendingFetcher: func(ctx context.Context) ([]ChartEntry, string, error) {
 			if failFetches.Load() {
 				return nil, "", http.ErrHandlerTimeout
@@ -498,8 +500,9 @@ func TestApplyTagsToLibraryNonDestructiveIdempotentAndEvent(t *testing.T) {
 	defer imdbSrv.Close()
 
 	svc := New(store, bus, Options{
-		DoubanURL: doubanSrv.URL,
-		IMDbURL:   imdbSrv.URL,
+		DoubanURL:  doubanSrv.URL,
+		IMDbURL:    imdbSrv.URL,
+		HTTPClient: doubanSrv.Client(),
 		TMDBTrendingFetcher: func(ctx context.Context) ([]ChartEntry, string, error) {
 			return []ChartEntry{
 				{Rank: 1, Title: "绝命毒师", OriginalTitle: "Breaking Bad", Year: 2008, MediaType: "tv", TMDBID: "1396"},
@@ -588,6 +591,7 @@ func TestStartPeriodicSyncAndGracefulShutdown(t *testing.T) {
 		IMDbURL:                feedSrv.URL,
 		DoubanTrendingMovieURL: feedSrv.URL,
 		DoubanTrendingTVURL:    feedSrv.URL,
+		HTTPClient:             feedSrv.Client(),
 		InitialDelay:           10 * time.Millisecond,
 		SyncInterval:           35 * time.Millisecond,
 	})
@@ -644,6 +648,7 @@ func TestHTTPHandlersAuthAndResponses(t *testing.T) {
 		IMDbURL:                feedSrv.URL,
 		DoubanTrendingMovieURL: feedSrv.URL,
 		DoubanTrendingTVURL:    feedSrv.URL,
+		HTTPClient:             feedSrv.Client(),
 	})
 	h := NewHandler(svc)
 
@@ -873,6 +878,7 @@ func TestFetchTMDBTrendingAPIKeyAndBearer(t *testing.T) {
 	f := NewFetcher(Options{
 		TMDBAPIKey:          "test-v3-key",
 		TMDBTrendingBaseURL: tmdbSrv.URL + "/",
+		HTTPClient:          tmdbSrv.Client(),
 	})
 	snap, err := f.FetchTMDBTrending(context.Background())
 	if err != nil {
@@ -895,7 +901,7 @@ func TestFetchTMDBTrendingAPIKeyAndBearer(t *testing.T) {
 	failTV.Store(true)
 	t.Setenv(EnvTMDBAPIKeyFallback, "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.sig")
 	t.Setenv(EnvTMDBTrendingURL, tmdbSrv.URL)
-	fEnv := NewFetcher(Options{})
+	fEnv := NewFetcher(Options{HTTPClient: tmdbSrv.Client()})
 	snap2, err := fEnv.FetchTMDBTrending(context.Background())
 	if err != nil {
 		t.Fatalf("FetchTMDBTrending (bearer) failed: %v", err)
@@ -952,7 +958,7 @@ func TestFetchTMDBTrendingFallbacksAndCustomFetcher(t *testing.T) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer errSrv.Close()
-	snapErr, err := NewFetcher(Options{TMDBAPIKey: "k", TMDBTrendingBaseURL: errSrv.URL}).FetchTMDBTrending(ctx)
+	snapErr, err := NewFetcher(Options{TMDBAPIKey: "k", TMDBTrendingBaseURL: errSrv.URL, HTTPClient: errSrv.Client()}).FetchTMDBTrending(ctx)
 	if err != nil || snapErr.Source != SourceTMDBTrendingBuiltin {
 		t.Fatalf("expected graceful fallback on 503, got snap=%+v err=%v", snapErr, err)
 	}
@@ -963,7 +969,7 @@ func TestFetchTMDBTrendingFallbacksAndCustomFetcher(t *testing.T) {
 		_, _ = w.Write([]byte(`{"results":[]}`))
 	}))
 	defer emptySrv.Close()
-	snapEmpty, err := NewFetcher(Options{TMDBAPIKey: "k", TMDBTrendingBaseURL: emptySrv.URL}).FetchTMDBTrending(ctx)
+	snapEmpty, err := NewFetcher(Options{TMDBAPIKey: "k", TMDBTrendingBaseURL: emptySrv.URL, HTTPClient: emptySrv.Client()}).FetchTMDBTrending(ctx)
 	if err != nil || snapEmpty.Source != SourceTMDBTrendingBuiltin {
 		t.Fatalf("expected graceful fallback on empty results, got snap=%+v err=%v", snapEmpty, err)
 	}
@@ -973,7 +979,7 @@ func TestFetchTMDBTrendingFallbacksAndCustomFetcher(t *testing.T) {
 		_, _ = w.Write([]byte(`{bad json`))
 	}))
 	defer badJSONSrv.Close()
-	snapBad, err := NewFetcher(Options{TMDBAPIKey: "k", TMDBTrendingBaseURL: badJSONSrv.URL}).FetchTMDBTrending(ctx)
+	snapBad, err := NewFetcher(Options{TMDBAPIKey: "k", TMDBTrendingBaseURL: badJSONSrv.URL, HTTPClient: badJSONSrv.Client()}).FetchTMDBTrending(ctx)
 	if err != nil || snapBad.Source != SourceTMDBTrendingBuiltin {
 		t.Fatalf("expected graceful fallback on invalid json, got snap=%+v err=%v", snapBad, err)
 	}
@@ -1055,6 +1061,7 @@ func TestTMDBTrendingPersistenceAutoTaggingAndEndpoint(t *testing.T) {
 		TMDBTrendingBaseURL:    tmdbSrv.URL,
 		DoubanTrendingMovieURL: failSrv.URL,
 		DoubanTrendingTVURL:    failSrv.URL,
+		HTTPClient:             tmdbSrv.Client(),
 	})
 
 	// Before sync, TrendingEntries returns empty non-nil slice.
@@ -1176,6 +1183,7 @@ func TestFetchDoubanTrendingMovieAndTVAndFallbacks(t *testing.T) {
 	f := NewFetcher(Options{
 		DoubanTrendingMovieURL: movieSrv.URL,
 		DoubanTrendingTVURL:    tvSrv.URL,
+		HTTPClient:             movieSrv.Client(),
 	})
 	mSnap, err := f.FetchDoubanTrendingMovie(ctx)
 	if err != nil {
@@ -1246,11 +1254,11 @@ func TestFetchDoubanTrendingMovieAndTVAndFallbacks(t *testing.T) {
 		"badJSON":    badJSONSrv.URL,
 		"invalidURL": "://bad-url",
 	} {
-		fbM, err := NewFetcher(Options{DoubanTrendingMovieURL: targetURL}).FetchDoubanTrendingMovie(ctx)
+		fbM, err := NewFetcher(Options{DoubanTrendingMovieURL: targetURL, HTTPClient: movieSrv.Client()}).FetchDoubanTrendingMovie(ctx)
 		if err != nil || fbM.Source != SourceDoubanTrendingMovieBuiltin || fbM.Count < 15 {
 			t.Fatalf("%s movie fallback unexpected: snap=%+v err=%v", name, fbM, err)
 		}
-		fbTV, err := NewFetcher(Options{DoubanTrendingTVURL: targetURL}).FetchDoubanTrendingTV(ctx)
+		fbTV, err := NewFetcher(Options{DoubanTrendingTVURL: targetURL, HTTPClient: movieSrv.Client()}).FetchDoubanTrendingTV(ctx)
 		if err != nil || fbTV.Source != SourceDoubanTrendingTVBuiltin || fbTV.Count < 15 {
 			t.Fatalf("%s tv fallback unexpected: snap=%+v err=%v", name, fbTV, err)
 		}
@@ -1364,6 +1372,7 @@ func TestDoubanTrendingPersistenceTypedAutoTaggingAndEndpoints(t *testing.T) {
 		IMDbURL:                failSrv.URL,
 		DoubanTrendingMovieURL: doubanMovieSrv.URL,
 		DoubanTrendingTVURL:    doubanTVSrv.URL,
+		HTTPClient:             doubanMovieSrv.Client(),
 		TMDBTrendingFetcher: func(ctx context.Context) ([]ChartEntry, string, error) {
 			return []ChartEntry{
 				{Rank: 1, Title: "沙丘2", OriginalTitle: "Dune: Part Two", Year: 2024, MediaType: "movie", TMDBID: "693134"},
@@ -1593,7 +1602,7 @@ func TestFetchIMDbTop250BuiltinFallbackAndHeaders(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer wafSrv.Close()
-	if _, err := NewFetcher(Options{IMDbURL: wafSrv.URL}).FetchIMDbTop250(ctx); err == nil {
+	if _, err := NewFetcher(Options{IMDbURL: wafSrv.URL, HTTPClient: wafSrv.Client()}).FetchIMDbTop250(ctx); err == nil {
 		t.Fatal("expected error for custom IMDbURL returning HTTP 202")
 	}
 }
@@ -1759,6 +1768,7 @@ func TestFetchIMDbTop250ThreeTierFallbackChain(t *testing.T) {
 		f := NewFetcher(Options{
 			IMDbURL:        wafSrv.URL,
 			IMDbMirrorURLs: []string{mirrorOKSrv.URL},
+			HTTPClient:     wafSrv.Client(),
 		})
 		snap, err := f.FetchIMDbTop250(ctx)
 		if err != nil {
@@ -1787,6 +1797,7 @@ func TestFetchIMDbTop250ThreeTierFallbackChain(t *testing.T) {
 		f := NewFetcher(Options{
 			IMDbURL:        wafSrv.URL,
 			IMDbMirrorURLs: []string{mirror1FailSrv.URL, mirrorBadJSONSrv.URL, mirrorOKSrv.URL},
+			HTTPClient:     wafSrv.Client(),
 		})
 		snap, err := f.FetchIMDbTop250(ctx)
 		if err != nil {
@@ -1802,6 +1813,7 @@ func TestFetchIMDbTop250ThreeTierFallbackChain(t *testing.T) {
 		f := NewFetcher(Options{
 			IMDbURL:        wafSrv.URL,
 			IMDbMirrorURLs: []string{mirror1FailSrv.URL, mirrorBadJSONSrv.URL},
+			HTTPClient:     wafSrv.Client(),
 		})
 		snap, err := f.FetchIMDbTop250(ctx)
 		if err != nil {
@@ -1815,7 +1827,7 @@ func TestFetchIMDbTop250ThreeTierFallbackChain(t *testing.T) {
 	// 4. Env var AMBRA_IMDB250_MIRROR_URL (comma-separated) works with default IMDb URL.
 	t.Run("env-var-mirror-urls", func(t *testing.T) {
 		t.Setenv(EnvIMDb250MirrorURL, mirror1FailSrv.URL+", "+mirrorOKSrv.URL)
-		f := NewFetcher(Options{IMDbURL: wafSrv.URL})
+		f := NewFetcher(Options{IMDbURL: wafSrv.URL, HTTPClient: wafSrv.Client()})
 		snap, err := f.FetchIMDbTop250(ctx)
 		if err != nil {
 			t.Fatalf("FetchIMDbTop250 via env mirror failed: %v", err)
@@ -1913,6 +1925,79 @@ func TestParseIMDbMirrorJSONEdgeCases(t *testing.T) {
 	entries2, err := parseIMDbMirrorJSON([]byte(entriesPayload))
 	if err != nil || len(entries2) != 1 || entries2[0].IMDbID != "tt0109830" || entries2[0].Year != 1994 || entries2[0].Rating != 8.8 {
 		t.Fatalf("unexpected entries wrapper parse: err=%v entries=%+v", err, entries2)
+	}
+}
+
+func TestStaleDynamicTrendingTagCleanupAndLiveCachePreservation(t *testing.T) {
+	store := openTestStore(t)
+	repo := sqlite.NewLibraryRepo(store)
+	ctx := context.Background()
+
+	lib, err := repo.CreateLibrary(ctx, "Movies", "movies", []string{"/movies"})
+	if err != nil {
+		t.Fatalf("CreateLibrary: %v", err)
+	}
+	y2024 := 2024
+	movie := &sqlite.ItemRecord{
+		LibraryID:      lib.ID,
+		Type:           "Movie",
+		Name:           "沙丘2",
+		ProductionYear: &y2024,
+		Extra:          sqlite.ItemExtra{ProviderIDs: map[string]string{"tmdb": "693134"}},
+	}
+	if err := repo.UpsertItem(ctx, movie); err != nil {
+		t.Fatalf("UpsertItem: %v", err)
+	}
+	if err := repo.ReplaceItemTaxonomies(ctx, movie.ID, "tag", []string{"用户自定义"}); err != nil {
+		t.Fatalf("ReplaceItemTaxonomies: %v", err)
+	}
+
+	var mode atomic.Int32 // 0 = movie on chart, 1 = movie dropped off chart, 2 = builtin fallback returned
+	svc := New(store, nil, Options{
+		DoubanURL: "http://127.0.0.1:1",
+		IMDbURL:   "http://127.0.0.1:1",
+		TMDBTrendingFetcher: func(ctx context.Context) ([]ChartEntry, string, error) {
+			switch mode.Load() {
+			case 0:
+				return []ChartEntry{{Rank: 1, Title: "沙丘2", Year: 2024, MediaType: "movie", TMDBID: "693134"}}, SourceTMDBTrendingAPI, nil
+			case 1:
+				return []ChartEntry{{Rank: 1, Title: "新片", Year: 2025, MediaType: "movie", TMDBID: "999999"}}, SourceTMDBTrendingAPI, nil
+			default:
+				return []ChartEntry{{Rank: 1, Title: "静态榜单", Year: 2020, MediaType: "movie", TMDBID: "1"}}, SourceTMDBTrendingBuiltin, nil
+			}
+		},
+		DoubanTrendingMovieFetcher: func(ctx context.Context) ([]ChartEntry, string, error) {
+			return []ChartEntry{{Rank: 1, Title: "其他电影", Year: 2025, MediaType: "movie", DoubanID: "999"}}, SourceDoubanTrendingMovieAPI, nil
+		},
+		DoubanTrendingTVFetcher: func(ctx context.Context) ([]ChartEntry, string, error) {
+			return []ChartEntry{{Rank: 1, Title: "其他剧集", Year: 2025, MediaType: "tv", DoubanID: "888"}}, SourceDoubanTrendingTVAPI, nil
+		},
+	})
+
+	if _, err := svc.SyncAndApply(ctx); err != nil {
+		t.Fatalf("initial SyncAndApply: %v", err)
+	}
+	if got := strings.Join(getItemTags(t, store, movie.ID), ","); !strings.Contains(got, TagTMDBTrending) || !strings.Contains(got, TagTMDBTrendingSpecific) {
+		t.Fatalf("expected dynamic trending tags, got %q", got)
+	}
+
+	// Movie drops off TMDB Trending -> stale dynamic trending tags must be pruned, custom tag kept.
+	mode.Store(1)
+	if _, err := svc.SyncAndApply(ctx); err != nil {
+		t.Fatalf("second SyncAndApply: %v", err)
+	}
+	if got := strings.Join(getItemTags(t, store, movie.ID), ","); got != "用户自定义" {
+		t.Fatalf("expected stale trending tags pruned leaving only custom tag, got %q", got)
+	}
+
+	// Builtin fallback must NOT overwrite existing live TMDB Trending cache.
+	mode.Store(2)
+	if _, err := svc.SyncAndApply(ctx); err != nil {
+		t.Fatalf("third SyncAndApply: %v", err)
+	}
+	st := svc.Status(true)
+	if st.TMDBTrending.Source != SourceTMDBTrendingAPI || len(st.TMDBTrending.Entries) != 1 || st.TMDBTrending.Entries[0].TMDBID != "999999" {
+		t.Fatalf("expected existing live TMDB trending cache to be preserved, got %+v", st.TMDBTrending)
 	}
 }
 

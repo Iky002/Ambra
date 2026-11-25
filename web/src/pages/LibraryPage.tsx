@@ -42,7 +42,7 @@ const SORT_OPTIONS = [
   { value: 'SortName', zhLabel: '按名称排序', i18nKey: 'library.sortName' },
   { value: 'CommunityRating', zhLabel: '按评分最高', i18nKey: 'library.sortRating' },
   { value: 'PremiereDate', zhLabel: '按上映年份', i18nKey: 'library.sortReleaseDate' },
-  { value: 'PlayCount', zhLabel: '按播放次数', i18nKey: 'library.sortDateAdded' },
+  { value: 'PlayCount', zhLabel: '按播放次数', i18nKey: 'library.sortPlayCount' },
 ]
 
 const FILTER_OPTIONS = [

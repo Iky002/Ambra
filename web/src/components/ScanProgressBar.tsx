@@ -93,13 +93,16 @@ export function ScanProgressBar({
         queryClient.invalidateQueries({ queryKey: ['admin-metadata-items'] }),
         queryClient.invalidateQueries({ queryKey: ['trendingItems'] }),
       ])
-
-      const timer = window.setTimeout(() => {
-        setCompletedSnapshot(null)
-      }, 4000)
-      return () => window.clearTimeout(timer)
     }
   }, [progress, queryClient])
+
+  useEffect(() => {
+    if (!completedSnapshot) return
+    const timer = window.setTimeout(() => {
+      setCompletedSnapshot(null)
+    }, 4000)
+    return () => window.clearTimeout(timer)
+  }, [completedSnapshot])
 
   const active = progress?.running ? progress : completedSnapshot
   if (!active) return null

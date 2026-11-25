@@ -375,27 +375,277 @@ func TestLoadFromDirErrors(t *testing.T) {
 	}
 	defer host.Close(ctx)
 
-	// Path traversal in WasmFile should be rejected.
+	// Path traversal in WasmFile should be skipped (loaded=0) without aborting other plugins.
 	dir1 := t.TempDir()
 	_ = os.MkdirAll(filepath.Join(dir1, "evil"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir1, "evil", "manifest.json"), []byte(`{"Id":"evil","WasmFile":"../escape.wasm"}`), 0o644)
-	if _, err := host.LoadFromDir(ctx, dir1, nil); err == nil {
-		t.Fatal("expected path traversal error")
+	_ = os.MkdirAll(filepath.Join(dir1, "good"), 0o755)
+	_ = os.WriteFile(filepath.Join(dir1, "good", "manifest.json"), []byte(`{"Id":"good","Name":"Good","Enabled":true,"WasmFile":"ok.wasm"}`), 0o644)
+	_ = os.WriteFile(filepath.Join(dir1, "good", "ok.wasm"), buildNoopModule(), 0o644)
+	if n, err := host.LoadFromDir(ctx, dir1, nil); err != nil || n != 1 {
+		t.Fatalf("expected evil skipped and good loaded (n=1, err=nil), got n=%d err=%v", n, err)
 	}
 
-	// Malformed manifest.json should return error.
+	// Malformed manifest.json should be skipped (loaded=0).
 	dir2 := t.TempDir()
 	_ = os.MkdirAll(filepath.Join(dir2, "broken"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir2, "broken", "manifest.json"), []byte(`{invalid`), 0o644)
-	if _, err := host.LoadFromDir(ctx, dir2, nil); err == nil {
-		t.Fatal("expected json parse error")
+	if n, err := host.LoadFromDir(ctx, dir2, nil); err != nil || n != 0 {
+		t.Fatalf("expected broken manifest skipped (n=0, err=nil), got n=%d err=%v", n, err)
 	}
 
-	// Missing wasm file should return error.
+	// Missing wasm file should be skipped (loaded=0).
 	dir3 := t.TempDir()
 	_ = os.MkdirAll(filepath.Join(dir3, "missing"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir3, "missing", "manifest.json"), []byte(`{"Id":"m","WasmFile":"nope.wasm"}`), 0o644)
-	if _, err := host.LoadFromDir(ctx, dir3, nil); err == nil {
-		t.Fatal("expected missing wasm file error")
+	if n, err := host.LoadFromDir(ctx, dir3, nil); err != nil || n != 0 {
+		t.Fatalf("expected missing wasm file skipped (n=0, err=nil), got n=%d err=%v", n, err)
+	}
+}
+
+// buildLargeStdoutModule creates a valid WASI WASM module that writes 70 * 65000 bytes (> 4 MiB)
+// to stdout so limitedBuffer truncation is triggered, optionally calling proc_exit(0).
+func buildLargeStdoutModule(callExit bool) []byte {
+	wasm := []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00}
+
+	var typeSec []byte
+	if callExit {
+		typeSec = appendULEB128(typeSec, 3)
+	} else {
+		typeSec = appendULEB128(typeSec, 2)
+	}
+	typeSec = append(typeSec, 0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f) // type 0: fd_write
+	typeSec = append(typeSec, 0x60, 0, 0)                               // type 1: _start
+	if callExit {
+		typeSec = append(typeSec, 0x60, 1, 0x7f, 0) // type 2: proc_exit
+	}
+	wasm = appendSection(wasm, 1, typeSec)
+
+	var importSec []byte
+	if callExit {
+		importSec = appendULEB128(importSec, 2)
+	} else {
+		importSec = appendULEB128(importSec, 1)
+	}
+	importSec = appendStr(importSec, "wasi_snapshot_preview1")
+	importSec = appendStr(importSec, "fd_write")
+	importSec = append(importSec, 0x00, 0x00)
+	if callExit {
+		importSec = appendStr(importSec, "wasi_snapshot_preview1")
+		importSec = appendStr(importSec, "proc_exit")
+		importSec = append(importSec, 0x00, 0x02)
+	}
+	wasm = appendSection(wasm, 2, importSec)
+
+	wasm = appendSection(wasm, 3, []byte{1, 1})
+	wasm = appendSection(wasm, 5, []byte{1, 0x00, 1})
+
+	startIdx := byte(1)
+	if callExit {
+		startIdx = 2
+	}
+	var exportSec []byte
+	exportSec = appendULEB128(exportSec, 2)
+	exportSec = appendStr(exportSec, "memory")
+	exportSec = append(exportSec, 0x02, 0x00)
+	exportSec = appendStr(exportSec, "_start")
+	exportSec = append(exportSec, 0x00, startIdx)
+	wasm = appendSection(wasm, 7, exportSec)
+
+	var body []byte
+	body = append(body, 0x01, 0x01, 0x7f) // 1 local: i32 (idx 0)
+	body = append(body, 0x03, 0x40)       // loop
+	body = append(body, 0x41, 0x01)       // fd=1 (stdout)
+	body = append(body, 0x41, 0x00)       // iovs=0
+	body = append(body, 0x41, 0x01)       // iovs_len=1
+	body = append(body, 0x41, 0x08)       // nwritten=8
+	body = append(body, 0x10, 0x00)       // call fd_write
+	body = append(body, 0x1a)             // drop
+	body = append(body, 0x20, 0x00)       // local.get 0
+	body = append(body, 0x41, 0x01)       // i32.const 1
+	body = append(body, 0x6a)             // i32.add
+	body = append(body, 0x22, 0x00)       // local.tee 0
+	body = append(body, 0x41)
+	body = appendSLEB128(body, 70)        // 70 * 65000 = 4.55MB > 4MiB
+	body = append(body, 0x49)             // i32.lt_u
+	body = append(body, 0x0d, 0x00)       // br_if 0
+	body = append(body, 0x0b)             // end loop
+	if callExit {
+		body = append(body, 0x41, 0x00, 0x10, 0x01) // proc_exit(0)
+	}
+	body = append(body, 0x0b) // end func
+
+	var codeSec []byte
+	codeSec = appendULEB128(codeSec, 1)
+	codeSec = appendULEB128(codeSec, uint32(len(body)))
+	codeSec = append(codeSec, body...)
+	wasm = appendSection(wasm, 10, codeSec)
+
+	// iovec { ptr: 16, len: 65000 }
+	iovec := make([]byte, 8)
+	binary.LittleEndian.PutUint32(iovec[0:4], 16)
+	binary.LittleEndian.PutUint32(iovec[4:8], 65000)
+	var dataSec []byte
+	dataSec = appendULEB128(dataSec, 1)
+	dataSec = append(dataSec, 0x00, 0x41, 0x00, 0x0b)
+	dataSec = appendULEB128(dataSec, uint32(len(iovec)))
+	dataSec = append(dataSec, iovec...)
+	wasm = appendSection(wasm, 11, dataSec)
+	return wasm
+}
+
+func TestWasmHostLimitsSymlinksTimeoutClampAndFiltering(t *testing.T) {
+	// 1. limitedBuffer truncation unit test
+	lb := &limitedBuffer{limit: 5}
+	n, err := lb.Write([]byte("abc"))
+	if err != nil || n != 3 || lb.truncated || lb.String() != "abc" {
+		t.Fatalf("unexpected first write: n=%d err=%v trunc=%v s=%q", n, err, lb.truncated, lb.String())
+	}
+	n, err = lb.Write([]byte("defgh"))
+	if err != nil || n != 5 || !lb.truncated || lb.String() != "abcde" {
+		t.Fatalf("unexpected partial truncation write: n=%d err=%v trunc=%v s=%q", n, err, lb.truncated, lb.String())
+	}
+	n, err = lb.Write([]byte("xyz"))
+	if err != nil || n != 3 || !lb.truncated || lb.String() != "abcde" {
+		t.Fatalf("unexpected overflow write: n=%d err=%v trunc=%v s=%q", n, err, lb.truncated, lb.String())
+	}
+
+	ctx := context.Background()
+	host, err := NewHost(ctx)
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer host.Close(ctx)
+
+	// 2. LoadModule size limit and timeout clamping
+	oversized := make([]byte, maxWasmFileBytes+1)
+	if _, err := host.LoadModule(ctx, plugins.Manifest{ID: "huge"}, oversized, 0); err == nil {
+		t.Fatal("expected error for wasm binary exceeding maxWasmFileBytes")
+	}
+	clampedMod, err := host.LoadModule(ctx, plugins.Manifest{ID: "clamp", Enabled: true, Kinds: []plugins.Kind{plugins.KindMetadata}}, buildNoopModule(), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("LoadModule clamp failed: %v", err)
+	}
+	if clampedMod.timeout != maxPluginTimeout {
+		t.Fatalf("expected timeout clamped to %v, got %v", maxPluginTimeout, clampedMod.timeout)
+	}
+
+	// 3. Enabled / Kinds filtering and Configure ("enabled" and "Enabled")
+	// Kinds=[metadata] -> ResolveStream skipped without invoking WASM
+	if res, err := clampedMod.ResolveStream(ctx, "/test.strm"); err != nil || res != nil {
+		t.Fatalf("expected (nil, nil) for unsupported kind ResolveStream, got (%+v, %v)", res, err)
+	}
+	// Disable via lowercase "enabled"
+	if err := clampedMod.Configure(map[string]any{"enabled": false}); err != nil {
+		t.Fatal(err)
+	}
+	if clampedMod.Manifest().Enabled {
+		t.Fatal("expected plugin disabled via lowercase enabled")
+	}
+	if res, err := clampedMod.FetchMetadata(ctx, plugins.MediaQuery{Title: "Disabled"}); err != nil || res != nil {
+		t.Fatalf("expected (nil, nil) when disabled, got (%+v, %v)", res, err)
+	}
+	// Re-enable via capitalized "Enabled"
+	if err := clampedMod.Configure(map[string]any{"Enabled": true}); err != nil {
+		t.Fatal(err)
+	}
+	if !clampedMod.Manifest().Enabled {
+		t.Fatal("expected plugin re-enabled via capitalized Enabled")
+	}
+	// Stream-only plugin -> FetchMetadata returns (nil, nil)
+	streamOnly, err := host.LoadModule(ctx, plugins.Manifest{ID: "stream-only", Enabled: true, Kinds: []plugins.Kind{plugins.KindStream}}, buildNoopModule(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res, err := streamOnly.FetchMetadata(ctx, plugins.MediaQuery{Title: "Skip"}); err != nil || res != nil {
+		t.Fatalf("expected (nil, nil) for stream-only FetchMetadata, got (%+v, %v)", res, err)
+	}
+
+	// 4. invoke: stdout truncation (normal return and proc_exit(0)), non-zero exit with empty stderr
+	truncReturn, err := host.LoadModule(ctx, plugins.Manifest{ID: "trunc-ret", Enabled: true}, buildLargeStdoutModule(false), 5*time.Second)
+	if err != nil {
+		t.Fatalf("LoadModule trunc-ret failed: %v", err)
+	}
+	if _, err := truncReturn.FetchMetadata(ctx, plugins.MediaQuery{Title: "Big"}); err == nil || !strings.Contains(err.Error(), "stdout exceeded") {
+		t.Fatalf("expected stdout exceeded error on normal return, got %v", err)
+	}
+
+	truncExit, err := host.LoadModule(ctx, plugins.Manifest{ID: "trunc-exit", Enabled: true}, buildLargeStdoutModule(true), 5*time.Second)
+	if err != nil {
+		t.Fatalf("LoadModule trunc-exit failed: %v", err)
+	}
+	if _, err := truncExit.FetchMetadata(ctx, plugins.MediaQuery{Title: "BigExit"}); err == nil || !strings.Contains(err.Error(), "stdout exceeded") {
+		t.Fatalf("expected stdout exceeded error on proc_exit(0), got %v", err)
+	}
+
+	silentFail, err := host.LoadModule(ctx, plugins.Manifest{ID: "silent-fail", Enabled: true}, buildWasiOutputModule(2, "", true, 2), time.Second)
+	if err != nil {
+		t.Fatalf("LoadModule silent-fail failed: %v", err)
+	}
+	if _, err := silentFail.FetchMetadata(ctx, plugins.MediaQuery{Title: "Fail"}); err == nil || !strings.Contains(err.Error(), "failed:") {
+		t.Fatalf("expected generic failure error when stderr is empty, got %v", err)
+	}
+
+	// 5. LoadFromDir: dir is regular file, symlink escape, oversized manifest/wasm, invalid wasm, TimeoutMs clamp
+	notADir := filepath.Join(t.TempDir(), "file")
+	_ = os.WriteFile(notADir, []byte("x"), 0o644)
+	if _, err := host.LoadFromDir(ctx, notADir, nil); err == nil {
+		t.Fatal("expected error when plugin dir is a file")
+	}
+
+	pluginsDir := t.TempDir()
+	outsideDir := t.TempDir()
+	outsideWasm := filepath.Join(outsideDir, "outside.wasm")
+	_ = os.WriteFile(outsideWasm, buildNoopModule(), 0o644)
+
+	// 5a. Symlink escaping plugin dir -> rejected
+	symDir := filepath.Join(pluginsDir, "sym-escape")
+	_ = os.MkdirAll(symDir, 0o755)
+	_ = os.WriteFile(filepath.Join(symDir, "manifest.json"), []byte(`{"Id":"sym","Enabled":true,"WasmFile":"link.wasm"}`), 0o644)
+	_ = os.Symlink(outsideWasm, filepath.Join(symDir, "link.wasm"))
+
+	// 5b. Oversized manifest.json -> skipped
+	bigManifestDir := filepath.Join(pluginsDir, "big-manifest")
+	_ = os.MkdirAll(bigManifestDir, 0o755)
+	if mf, err := os.Create(filepath.Join(bigManifestDir, "manifest.json")); err == nil {
+		_ = mf.Truncate(maxManifestBytes + 1)
+		_ = mf.Close()
+	}
+
+	// 5c. Oversized wasm file -> skipped
+	bigWasmDir := filepath.Join(pluginsDir, "big-wasm")
+	_ = os.MkdirAll(bigWasmDir, 0o755)
+	_ = os.WriteFile(filepath.Join(bigWasmDir, "manifest.json"), []byte(`{"Id":"bw","Enabled":true,"WasmFile":"huge.wasm"}`), 0o644)
+	if wf, err := os.Create(filepath.Join(bigWasmDir, "huge.wasm")); err == nil {
+		_ = wf.Truncate(maxWasmFileBytes + 1)
+		_ = wf.Close()
+	}
+
+	// 5d. Invalid wasm binary -> compile error skipped
+	badWasmDir := filepath.Join(pluginsDir, "bad-wasm")
+	_ = os.MkdirAll(badWasmDir, 0o755)
+	_ = os.WriteFile(filepath.Join(badWasmDir, "manifest.json"), []byte(`{"Id":"bad","Enabled":true,"WasmFile":"bad.wasm"}`), 0o644)
+	_ = os.WriteFile(filepath.Join(badWasmDir, "bad.wasm"), []byte("corrupt-bytes"), 0o644)
+
+	// 5e. Valid plugin with huge TimeoutMs -> clamped to maxPluginTimeout and loaded
+	clampedDir := filepath.Join(pluginsDir, "clamped-timeout")
+	_ = os.MkdirAll(clampedDir, 0o755)
+	_ = os.WriteFile(filepath.Join(clampedDir, "manifest.json"), []byte(`{"Id":"clamped-ok","Name":"Clamped","Enabled":true,"WasmFile":"ok.wasm","TimeoutMs":999999}`), 0o644)
+	_ = os.WriteFile(filepath.Join(clampedDir, "ok.wasm"), buildNoopModule(), 0o644)
+
+	reg := plugins.NewRegistry()
+	nLoaded, err := host.LoadFromDir(ctx, pluginsDir, reg)
+	if err != nil {
+		t.Fatalf("LoadFromDir failed: %v", err)
+	}
+	if nLoaded != 1 {
+		t.Fatalf("expected only clamped-ok loaded (1), got %d", nLoaded)
+	}
+	provs := reg.MetadataProviders()
+	if len(provs) != 1 || provs[0].Manifest().ID != "clamped-ok" {
+		t.Fatalf("unexpected loaded providers: %+v", provs)
+	}
+	if wp, ok := provs[0].(*WasmPlugin); !ok || wp.timeout != maxPluginTimeout {
+		t.Fatalf("expected TimeoutMs clamped to %v, got %+v", maxPluginTimeout, provs[0])
 	}
 }

@@ -87,7 +87,7 @@ func (h *Handler) handleSetEncodingConfig(key string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		if r.Body != nil {
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			if err := httpx.DecodeJSONLimit(r, &body, 0); err != nil {
 				body = map[string]any{}
 			}
 		}
@@ -120,7 +120,7 @@ func (h *Handler) handleSetCodecParameters(w http.ResponseWriter, r *http.Reques
 	key := "encoding_codec_params_" + strings.ToLower(codecID)
 	var body map[string]any
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = httpx.DecodeJSONLimit(r, &body, 0)
 	}
 	if body == nil {
 		body = map[string]any{}
@@ -201,14 +201,17 @@ func (h *Handler) handleSelectableMediaFolders(w http.ResponseWriter, r *http.Re
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	hidePaths := h.isNonAdminCaller(r)
 	out := make([]map[string]any, 0, len(libs))
 	for _, lib := range libs {
 		if !isLibraryAllowed(lib.ID, allowed) {
 			continue
 		}
 		subFolders := make([]map[string]any, 0, len(lib.Paths))
-		for _, p := range lib.Paths {
-			subFolders = append(subFolders, map[string]any{"Name": p, "Path": p})
+		if !hidePaths {
+			for _, p := range lib.Paths {
+				subFolders = append(subFolders, map[string]any{"Name": p, "Path": p})
+			}
 		}
 		out = append(out, map[string]any{
 			"Name":       lib.Name,
@@ -299,14 +302,23 @@ func (h *Handler) handleQueryVirtualFolders(w http.ResponseWriter, r *http.Reque
 		libs = libs[:limit]
 	}
 
+	hidePaths := h.isNonAdminCaller(r)
 	items := make([]virtualFolderInfo, 0, len(libs))
 	for _, lib := range libs {
+		locations := lib.Paths
+		opts := sqlite.ParseLibraryOptions(lib.OptionsJSON)
+		if hidePaths {
+			locations = []string{}
+			if opts != nil {
+				delete(opts, "PathInfos")
+			}
+		}
 		items = append(items, virtualFolderInfo{
 			Name:           lib.Name,
-			Locations:      lib.Paths,
+			Locations:      locations,
 			CollectionType: lib.CollectionType,
 			ItemId:         lib.ID,
-			LibraryOptions: sqlite.ParseLibraryOptions(lib.OptionsJSON),
+			LibraryOptions: opts,
 		})
 	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[virtualFolderInfo]{
@@ -322,7 +334,7 @@ func (h *Handler) handleDeleteVirtualFolder(w http.ResponseWriter, r *http.Reque
 		Name string `json:"Name"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = httpx.DecodeJSONLimit(r, &body, 0)
 	}
 	if id := nonEmpty(q.Get("id"), body.Id); id != "" {
 		_ = h.repo.DeleteLibrary(r.Context(), id)
@@ -357,7 +369,7 @@ func (h *Handler) handleRenameVirtualFolder(w http.ResponseWriter, r *http.Reque
 		NewName string `json:"NewName"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = httpx.DecodeJSONLimit(r, &body, 0)
 	}
 	newName := nonEmpty(q.Get("newName"), body.NewName)
 	id := nonEmpty(q.Get("id"), body.Id)
@@ -421,7 +433,7 @@ func (h *Handler) handleAddVirtualFolderPath(w http.ResponseWriter, r *http.Requ
 		} `json:"PathInfo"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = httpx.DecodeJSONLimit(r, &body, 0)
 	}
 	pathVal := nonEmpty(q.Get("path"), body.Path, body.PathInfo.Path)
 	id := nonEmpty(q.Get("id"), body.Id)
@@ -465,7 +477,7 @@ func (h *Handler) handleUpdateVirtualFolderPath(w http.ResponseWriter, r *http.R
 		} `json:"PathInfo"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = httpx.DecodeJSONLimit(r, &body, 0)
 	}
 	id := nonEmpty(q.Get("id"), body.Id)
 	name := nonEmpty(q.Get("name"), body.Name)
@@ -556,7 +568,7 @@ func (h *Handler) handleDeleteVirtualFolderPath(w http.ResponseWriter, r *http.R
 		Path string `json:"Path"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = httpx.DecodeJSONLimit(r, &body, 0)
 	}
 	pathVal := nonEmpty(q.Get("path"), body.Path)
 	id := nonEmpty(q.Get("id"), body.Id)
@@ -600,7 +612,7 @@ func (h *Handler) handleUpdateVirtualFolderOptions(w http.ResponseWriter, r *htt
 		LibraryOptions map[string]any `json:"LibraryOptions"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = httpx.DecodeJSONLimit(r, &body, 0)
 	}
 	if body.Id != "" && body.LibraryOptions != nil && h.repo != nil {
 		if _, err := h.repo.UpdateLibraryOptions(r.Context(), body.Id, body.LibraryOptions); err != nil && !errors.Is(err, sqlite.ErrNotFound) {
@@ -647,6 +659,7 @@ func (h *Handler) handleListArtists(albumArtistsOnly bool) http.HandlerFunc {
 			httpx.Error(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		h.sanitizeItemsPathsForCaller(r, items)
 		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 			Items:            items,
 			TotalRecordCount: total,
@@ -733,6 +746,7 @@ func (h *Handler) handleInstantMixByQuery(w http.ResponseWriter, r *http.Request
 			httpx.Error(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		h.sanitizeItemsPathsForCaller(r, items)
 		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 			Items:            items,
 			TotalRecordCount: total,
@@ -825,6 +839,7 @@ func (h *Handler) handleInstantMixByQuery(w http.ResponseWriter, r *http.Request
 		if limit > 0 && len(matched) > limit {
 			matched = matched[:limit]
 		}
+		h.sanitizeItemsPathsForCaller(r, matched)
 		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 			Items:            matched,
 			TotalRecordCount: total,
@@ -908,6 +923,7 @@ func (h *Handler) handleInstantMixByQuery(w http.ResponseWriter, r *http.Request
 		if limit > 0 && len(matched) > limit {
 			matched = matched[:limit]
 		}
+		h.sanitizeItemsPathsForCaller(r, matched)
 		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 			Items:            matched,
 			TotalRecordCount: total,
@@ -931,6 +947,7 @@ func (h *Handler) handleInstantMixByQuery(w http.ResponseWriter, r *http.Request
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.sanitizeItemsPathsForCaller(r, items)
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            items,
 		TotalRecordCount: total,
@@ -1012,6 +1029,7 @@ func (h *Handler) handleGetTaxonomyByName(kind, dtoType string) http.HandlerFunc
 							}
 						}
 						if it, err := h.repo.GetItemByID(r.Context(), h.serverID(), userID, id); err == nil {
+							h.sanitizeItemPathsForCaller(r, it)
 							httpx.JSON(w, http.StatusOK, it)
 							return
 						}
@@ -1039,7 +1057,50 @@ func (h *Handler) handleGetTaxonomyByName(kind, dtoType string) http.HandlerFunc
 	}
 }
 
+func (h *Handler) isPersonAccessible(r *http.Request, personID string, allowed []string, maxRating *int, blockedTags []string) bool {
+	if allowed == nil && maxRating == nil && len(blockedTags) == 0 {
+		return true
+	}
+	if h.store == nil || h.repo == nil {
+		return false
+	}
+	rows, err := h.store.Reader.QueryContext(r.Context(),
+		`SELECT item_id FROM item_people WHERE person_id = ?`, personID)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var iid string
+		if err := rows.Scan(&iid); err != nil {
+			continue
+		}
+		rec, recErr := h.repo.GetItemRecordByID(r.Context(), iid)
+		if recErr != nil || rec == nil {
+			continue
+		}
+		if allowed != nil && rec.LibraryID != "" && !isLibraryAllowed(rec.LibraryID, allowed) {
+			continue
+		}
+		if maxRating != nil || len(blockedTags) > 0 {
+			if blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags); bErr != nil || blocked {
+				continue
+			}
+		}
+		return true
+	}
+	return false
+}
+
 func (h *Handler) handleGetPersonByName(w http.ResponseWriter, r *http.Request) {
+	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	userID := h.resolveUserID(r, q)
+	allowed := h.allowedLibrariesForRequest(r, userID)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 	name := chi.URLParam(r, "Name")
 	normID := guid.Normalize(name)
 	if h.store != nil {
@@ -1051,6 +1112,10 @@ func (h *Handler) handleGetPersonByName(w http.ResponseWriter, r *http.Request) 
 			WHERE LOWER(p.name) = LOWER(?) OR p.id = ? LIMIT 1`, name, normID,
 		).Scan(&id, &foundName, &primaryTag)
 		if err == nil {
+			if !h.isPersonAccessible(r, id, allowed, maxRating, blockedTags) {
+				httpx.Error(w, http.StatusNotFound, "person not found")
+				return
+			}
 			imageTags := map[string]string{}
 			if primaryTag != "" {
 				imageTags["Primary"] = primaryTag
@@ -1099,6 +1164,7 @@ func (h *Handler) handlePersonCredits(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.sanitizeItemsPathsForCaller(r, items)
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            items,
 		TotalRecordCount: total,
@@ -1133,6 +1199,7 @@ func (h *Handler) handleAudioBooksNextUp(w http.ResponseWriter, r *http.Request)
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.sanitizeItemsPathsForCaller(r, items)
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            items,
 		TotalRecordCount: total,
@@ -1152,6 +1219,9 @@ func (h *Handler) handleChannelLatestItems(w http.ResponseWriter, r *http.Reques
 			TotalRecordCount: 0,
 		})
 		return
+	}
+	if len(channelIDs) > maxChannelLatestIDs {
+		channelIDs = channelIDs[:maxChannelLatestIDs]
 	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
@@ -1180,6 +1250,7 @@ func (h *Handler) handleChannelLatestItems(w http.ResponseWriter, r *http.Reques
 			httpx.Error(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		h.sanitizeItemsPathsForCaller(r, items)
 		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 			Items:            items,
 			TotalRecordCount: total,
@@ -1236,6 +1307,7 @@ func (h *Handler) handleChannelLatestItems(w http.ResponseWriter, r *http.Reques
 	if limit > 0 && len(merged) > limit {
 		merged = merged[:limit]
 	}
+	h.sanitizeItemsPathsForCaller(r, merged)
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            merged,
 		TotalRecordCount: total,
@@ -1329,6 +1401,7 @@ func (h *Handler) handleCollectionProviderItems(w http.ResponseWriter, r *http.R
 		}
 		items = filtered
 	}
+	h.sanitizePlaylistItemsPathsForCaller(r, items)
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[sqlite.PlaylistItemDto]{
 		Items:            items,
 		TotalRecordCount: total,
@@ -1374,7 +1447,7 @@ func (h *Handler) handleContainerItemsDelete(expectedType string, checkOwner boo
 				Ids      []string `json:"Ids"`
 				EntryIds []string `json:"EntryIds"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			_ = httpx.DecodeJSONLimit(r, &body, 0)
 			if len(body.Ids) > 0 {
 				ids = body.Ids
 			} else {
@@ -1503,6 +1576,7 @@ func (h *Handler) handleShowsUpcoming(w http.ResponseWriter, r *http.Request) {
 	if limit > 0 && len(upcoming) > limit {
 		upcoming = upcoming[:limit]
 	}
+	h.sanitizeItemsPathsForCaller(r, upcoming)
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            upcoming,
 		TotalRecordCount: total,

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -40,7 +41,7 @@ type multiLogSink struct {
 // stdout, the in-memory logs.Handler runtime buffer, and a persistent log file.
 type MultiSlogHandler struct {
 	sink   *multiLogSink
-	level  slog.Leveler
+	level  *atomic.Int64
 	attrs  []slog.Attr
 	groups []string
 }
@@ -76,16 +77,18 @@ func NewMultiSlogHandler(stdout io.Writer, logsHandler *Handler, logFilePath str
 			sink.currentDate = datePart
 		}
 	}
+	lvl := &atomic.Int64{}
+	lvl.Store(int64(slog.LevelInfo))
 	return &MultiSlogHandler{
 		sink:  sink,
-		level: slog.LevelInfo,
+		level: lvl,
 	}
 }
 
 // WithLevel sets the minimum log level for this handler and returns it for chaining.
 func (h *MultiSlogHandler) WithLevel(lvl slog.Leveler) *MultiSlogHandler {
-	if lvl != nil {
-		h.level = lvl
+	if lvl != nil && h.level != nil {
+		h.level.Store(int64(lvl.Level()))
 	}
 	return h
 }
@@ -112,7 +115,7 @@ func (h *MultiSlogHandler) Close() error {
 func (h *MultiSlogHandler) Enabled(_ context.Context, level slog.Level) bool {
 	minLevel := slog.LevelInfo
 	if h.level != nil {
-		minLevel = h.level.Level()
+		minLevel = slog.Level(h.level.Load())
 	}
 	return level >= minLevel
 }
@@ -144,10 +147,10 @@ func (h *MultiSlogHandler) Handle(_ context.Context, r slog.Record) error {
 			h.sink.logFilePath = filepath.Join(h.sink.logDir, fmt.Sprintf("ambra-%s.log", recDate))
 		}
 		if h.sink.file == nil {
-			if err := os.MkdirAll(filepath.Dir(h.sink.logFilePath), 0o755); err != nil {
+			if err := os.MkdirAll(filepath.Dir(h.sink.logFilePath), 0o700); err != nil {
 				return err
 			}
-			f, err := os.OpenFile(h.sink.logFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+			f, err := os.OpenFile(h.sink.logFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 			if err != nil {
 				return err
 			}
@@ -187,34 +190,58 @@ func (h *MultiSlogHandler) formatRecord(r slog.Record) string {
 	b.WriteString(" [")
 	b.WriteString(r.Level.String())
 	b.WriteString("] ")
-	b.WriteString(r.Message)
+	b.WriteString(escapeLogControlChars(r.Message))
 
 	prefix := ""
 	if len(h.groups) > 0 {
 		prefix = strings.Join(h.groups, ".") + "."
 	}
 
-	appendAttr := func(a slog.Attr) {
+	var appendAttr func(pref string, a slog.Attr)
+	appendAttr = func(pref string, a slog.Attr) {
 		a.Value = a.Value.Resolve()
 		if a.Equal(slog.Attr{}) {
 			return
 		}
+		if a.Value.Kind() == slog.KindGroup {
+			attrs := a.Value.Group()
+			if len(attrs) == 0 {
+				return
+			}
+			nextPref := pref
+			if a.Key != "" {
+				nextPref += escapeLogControlChars(a.Key) + "."
+			}
+			for _, ga := range attrs {
+				appendAttr(nextPref, ga)
+			}
+			return
+		}
 		b.WriteByte(' ')
-		b.WriteString(prefix)
-		b.WriteString(a.Key)
+		b.WriteString(pref)
+		b.WriteString(escapeLogControlChars(a.Key))
 		b.WriteByte('=')
 		b.WriteString(formatAttrValue(a.Value))
 	}
 
 	for _, a := range h.attrs {
-		appendAttr(a)
+		appendAttr(prefix, a)
 	}
 	r.Attrs(func(a slog.Attr) bool {
-		appendAttr(a)
+		appendAttr(prefix, a)
 		return true
 	})
 
 	return b.String()
+}
+
+func escapeLogControlChars(s string) string {
+	if !strings.ContainsAny(s, "\r\n") {
+		return s
+	}
+	s = strings.ReplaceAll(s, "\r", `\r`)
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	return s
 }
 
 func formatAttrValue(v slog.Value) string {
@@ -222,5 +249,5 @@ func formatAttrValue(v slog.Value) string {
 	if s == "" || strings.ContainsAny(s, " \t\n\r\"") {
 		return strconv.Quote(s)
 	}
-	return s
+	return escapeLogControlChars(s)
 }

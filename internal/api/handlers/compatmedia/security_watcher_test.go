@@ -16,6 +16,7 @@ import (
 	"github.com/ambra-media/ambra/internal/core/watcher"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/plugins"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -136,19 +137,35 @@ func TestSSRFProtectionBlocksPrivateAndLocalTargets(t *testing.T) {
 		}
 	}
 
-	// Verify isBlockedIP & safe client DialContext / CheckRedirect directly
-	if !isBlockedIP(nil) || !isBlockedIP(net.ParseIP("127.0.0.1")) || !isBlockedIP(net.ParseIP("10.1.2.3")) ||
-		!isBlockedIP(net.ParseIP("169.254.169.254")) || !isBlockedIP(net.ParseIP("::1")) || !isBlockedIP(net.ParseIP("fc00::1")) {
-		t.Fatal("expected private/local IPs to be blocked")
+	// Verify netutil.ValidateIP & shared safe client DialContext / CheckRedirect directly
+	for _, blocked := range []net.IP{
+		nil,
+		net.ParseIP("127.0.0.1"),
+		net.ParseIP("10.1.2.3"),
+		net.ParseIP("100.64.0.1"),
+		net.ParseIP("0.0.0.1"),
+		net.ParseIP("169.254.169.254"),
+		net.ParseIP("::1"),
+		net.ParseIP("fc00::1"),
+	} {
+		if err := netutil.ValidateIP(blocked, false); err == nil {
+			t.Fatalf("expected private/local/reserved IP %v to be blocked", blocked)
+		}
 	}
-	if isBlockedIP(net.ParseIP("8.8.8.8")) {
-		t.Fatal("expected public IP 8.8.8.8 to be allowed")
+	if err := netutil.ValidateIP(net.ParseIP("8.8.8.8"), false); err != nil {
+		t.Fatalf("expected public IP 8.8.8.8 to be allowed, got %v", err)
 	}
 
-	safeClient := newSafeRemoteHTTPClient()
+	safeClient := h.getHTTPClient()
+	if safeClient != h.getHTTPClient() {
+		t.Fatal("expected Handler.getHTTPClient() to reuse a single shared http.Client")
+	}
 	tr := safeClient.Transport.(*http.Transport)
 	if _, err := tr.DialContext(ctx, "tcp", "127.0.0.1:80"); err == nil {
 		t.Fatal("expected safe DialContext to block 127.0.0.1")
+	}
+	if _, err := tr.DialContext(ctx, "tcp", "100.64.0.1:80"); err == nil {
+		t.Fatal("expected safe DialContext to block CGNAT 100.64.0.1")
 	}
 	if _, err := tr.DialContext(ctx, "tcp", "bad-addr-no-port"); err == nil {
 		t.Fatal("expected safe DialContext to reject invalid addr")
@@ -157,11 +174,11 @@ func TestSSRFProtectionBlocksPrivateAndLocalTargets(t *testing.T) {
 	if err := safeClient.CheckRedirect(redirReq, []*http.Request{redirReq}); err == nil {
 		t.Fatal("expected CheckRedirect to block redirect to 127.0.0.1")
 	}
-	pubReq, _ := http.NewRequest(http.MethodGet, "https://image.tmdb.org/t/p/original/a.jpg", nil)
+	pubReq, _ := http.NewRequest(http.MethodGet, "https://93.184.216.34/a.jpg", nil)
 	if err := safeClient.CheckRedirect(pubReq, make([]*http.Request, 5)); err == nil {
 		t.Fatal("expected CheckRedirect to reject >= 5 redirects")
 	}
-	if err := safeClient.CheckRedirect(pubReq, make([]*http.Request, 1)); err != nil {
+	if err := safeClient.CheckRedirect(pubReq, []*http.Request{pubReq}); err != nil {
 		t.Fatalf("expected CheckRedirect to allow public redirect, got %v", err)
 	}
 }

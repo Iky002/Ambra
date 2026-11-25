@@ -31,6 +31,7 @@ export class AssJassubRenderer {
   private video: HTMLVideoElement | null = null
   private timeOffset = 0
   private abortController: AbortController | null = null
+  private destroyed = false
 
   async mount(
     video: HTMLVideoElement,
@@ -39,18 +40,24 @@ export class AssJassubRenderer {
     options?: AssMountOptions | string[],
   ): Promise<void> {
     await this.destroy()
-    this.abortController = new AbortController()
+    this.destroyed = false
+    const abortController = new AbortController()
+    this.abortController = abortController
+    const { signal } = abortController
     this.video = video
 
     const opts: AssMountOptions = Array.isArray(options) ? { fonts: options } : (options ?? {})
     this.timeOffset = Number.isFinite(opts.timeOffset) ? Number(opts.timeOffset) : 0
     const attachmentFonts = (opts.fonts ?? []).filter((u) => typeof u === 'string' && u.length > 0)
 
-    const res = await fetch(subtitleUrl, { signal: this.abortController.signal })
+    const res = await fetch(subtitleUrl, { signal })
     if (!res.ok) {
       throw new Error(`加载 ASS/SSA 字幕失败 (${res.status})`)
     }
     const subContent = await res.text()
+    if (signal.aborted || this.destroyed) {
+      return
+    }
 
     const jassubOptions: JassubConstructorOptions = {
       video,
@@ -68,10 +75,21 @@ export class AssJassubRenderer {
       prescaleFactor: 1.0,
       offscreenRender: false,
     }
-    this.instance = new JASSUB(jassubOptions) as JassubInstanceWithExtras
+    const instance = new JASSUB(jassubOptions) as JassubInstanceWithExtras
+    this.instance = instance
 
-    if (this.instance.ready) {
-      await this.instance.ready
+    if (instance.ready) {
+      await instance.ready
+    }
+    if (signal.aborted || this.destroyed) {
+      if (this.instance === instance) {
+        this.instance = null
+      }
+      try {
+        await instance.destroy()
+      } catch {
+        // ignore teardown errors
+      }
     }
   }
 
@@ -104,6 +122,7 @@ export class AssJassubRenderer {
   }
 
   async destroy(): Promise<void> {
+    this.destroyed = true
     if (this.abortController) {
       this.abortController.abort()
       this.abortController = null

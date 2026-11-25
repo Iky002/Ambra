@@ -382,4 +382,40 @@ func TestSyncTargetsIsolationItemValidationReadyFilterAndCallerHelpers(t *testin
 	if found, allowed := h.DeleteJobForCaller(ctx, created.Job.Id, aliceAC.UserID(), false); !found || !allowed {
 		t.Fatalf("expected Alice allowed on DeleteJobForCaller, got found=%v allowed=%v", found, allowed)
 	}
+
+	// 5. Security hardening: STRM rejected, non-admin download policy/library ACL/parental enforced, absolute paths stripped
+	strmID := guid.New()
+	_ = libRepo.UpsertItem(ctx, &sqlite.ItemRecord{
+		ID: strmID, LibraryID: lib.ID, ParentID: lib.ID, Type: "Movie", MediaType: "Video", Name: "Cloud", Path: "/media/cloud.strm", IsStrm: true,
+	})
+	if r := doSyncAuthReq(t, mux, aliceAC, http.MethodPost, "/Sync/Jobs", map[string]any{"ItemIds": []string{strmID}}); r.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for STRM sync job, got %d", r.Code)
+	}
+
+	// Non-admin response strips OutputPath and Item.Path
+	okRec := doSyncAuthReq(t, mux, aliceAC, http.MethodPost, "/Sync/Jobs", map[string]any{"TargetId": "dev-alice", "ItemIds": []string{validItemID}})
+	if okRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 creating job for alice, got %d body=%s", okRec.Code, okRec.Body.String())
+	}
+	var aliceCreated SyncJobCreationResult
+	_ = json.Unmarshal(okRec.Body.Bytes(), &aliceCreated)
+	if len(aliceCreated.JobItems) != 1 || aliceCreated.JobItems[0].OutputPath != "" {
+		t.Fatalf("expected OutputPath stripped for non-admin, got %+v", aliceCreated.JobItems)
+	}
+	readyRec := doSyncAuthReq(t, mux, aliceAC, http.MethodGet, "/Sync/Items/Ready?TargetId=dev-alice", nil)
+	var readyNonAdmin []SyncedItem
+	_ = json.Unmarshal(readyRec.Body.Bytes(), &readyNonAdmin)
+	if len(readyNonAdmin) == 0 || readyNonAdmin[0].Item == nil || readyNonAdmin[0].Item.Path != "" {
+		t.Fatalf("expected Item.Path stripped for non-admin in Ready, got %+v", readyNonAdmin)
+	}
+
+	// User with EnableContentDownloading=false is rejected with 403
+	noDlPol := sqlite.DefaultUserPolicy(false)
+	noDlPol.EnableContentDownloading = false
+	noDlU := &sqlite.UserRecord{Name: "nodl", Policy: noDlPol, Config: sqlite.DefaultUserConfig()}
+	_ = userRepo.CreateUser(ctx, noDlU)
+	noDlAC := &middleware.AuthContext{User: noDlU}
+	if r := doSyncAuthReq(t, mux, noDlAC, http.MethodPost, "/Sync/Jobs", map[string]any{"ItemIds": []string{validItemID}}); r.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when EnableContentDownloading=false, got %d", r.Code)
+	}
 }

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ambra-media/ambra/internal/api/dto"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 )
 
 const (
@@ -20,7 +21,16 @@ const (
 	defaultMaxRetries  = 4
 	defaultBaseBackoff = 250 * time.Millisecond
 	maxBackoffDelay    = 10 * time.Second
+	maxErrorBodyBytes  = 512
 )
+
+func truncateErrorBody(body []byte) string {
+	s := strings.TrimSpace(string(body))
+	if len(s) > maxErrorBodyBytes {
+		return s[:maxErrorBodyBytes] + "..."
+	}
+	return s
+}
 
 // APIError represents a non-2xx HTTP response returned by the source Emby server.
 type APIError struct {
@@ -163,7 +173,7 @@ func NewSourceClient(baseURL, apiKey string, opts ...ClientOption) (*SourceClien
 	sc := &SourceClient{
 		baseURL:     normalized,
 		apiKey:      apiKey,
-		httpClient:  &http.Client{Timeout: defaultHTTPTimeout},
+		httpClient:  netutil.NewSafeHTTPClient(defaultHTTPTimeout, true),
 		maxRetries:  defaultMaxRetries,
 		baseBackoff: defaultBaseBackoff,
 		sleepFn:     defaultSleep,
@@ -308,7 +318,7 @@ func (c *SourceClient) doJSON(ctx context.Context, path string, query url.Values
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
 			lastErr = &APIError{
 				StatusCode: resp.StatusCode,
-				Message:    strings.TrimSpace(string(body)),
+				Message:    truncateErrorBody(body),
 			}
 			if attempt < c.maxRetries {
 				delay := c.backoffDelay(attempt, resp.Header.Get("Retry-After"))
@@ -323,7 +333,7 @@ func (c *SourceClient) doJSON(ctx context.Context, path string, query url.Values
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return &APIError{
 				StatusCode: resp.StatusCode,
-				Message:    strings.TrimSpace(string(body)),
+				Message:    truncateErrorBody(body),
 			}
 		}
 

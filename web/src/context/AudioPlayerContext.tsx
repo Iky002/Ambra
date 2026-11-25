@@ -78,10 +78,17 @@ const DEFAULT_AUDIO_CONTEXT: AudioPlayerContextValue = {
 
 const AudioPlayerContext = createContext<AudioPlayerContextValue>(DEFAULT_AUDIO_CONTEXT)
 
+function isAbortError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false
+  const name = 'name' in err ? String((err as { name?: unknown }).name) : ''
+  return name === 'AbortError'
+}
+
 export function AudioPlayerProvider({ children }: { children: ReactNode }) {
   const { auth } = useAuth()
   const authUserId = auth?.userId ?? null
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const playSeqRef = useRef<number>(0)
   const [queue, setQueue] = useState<BaseItemDto[]>([])
   const [currentIndex, setCurrentIndex] = useState<number>(-1)
   const [isPlaying, setIsPlaying] = useState<boolean>(false)
@@ -95,6 +102,30 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
 
   const clearError = useCallback(() => {
     setPlaybackError(null)
+  }, [])
+
+  const triggerAudioPlay = useCallback((audio: HTMLAudioElement) => {
+    const seq = ++playSeqRef.current
+    const playPromise = audio.play()
+    if (playPromise && typeof playPromise.then === 'function') {
+      playPromise
+        .then(() => {
+          if (seq !== playSeqRef.current) return
+          setIsPlaying(true)
+          setPlaybackError(null)
+        })
+        .catch((err: unknown) => {
+          if (seq !== playSeqRef.current || isAbortError(err)) return
+          setIsPlaying(false)
+          const msg =
+            err instanceof Error && err.message
+              ? `音频播放失败：${err.message}`
+              : '音频播放被拦截或加载失败，请点击重试'
+          setPlaybackError(msg)
+        })
+    } else {
+      setIsPlaying(true)
+    }
   }, [])
 
   // 用 ref 保存最新状态供原生 <audio> ended 事件读取
@@ -119,6 +150,7 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
     if (!audio) return
 
     if (!currentTrackId) {
+      playSeqRef.current++
       audio.pause()
       audio.removeAttribute('src')
       audio.load()
@@ -136,25 +168,8 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
     setDuration(currentTrackFallbackDuration)
     setPlaybackError(null)
 
-    const playPromise = audio.play()
-    if (playPromise && typeof playPromise.then === 'function') {
-      playPromise
-        .then(() => {
-          setIsPlaying(true)
-          setPlaybackError(null)
-        })
-        .catch((err: unknown) => {
-          setIsPlaying(false)
-          const msg =
-            err instanceof Error && err.message
-              ? `音频播放失败：${err.message}`
-              : '音频播放被拦截或加载失败，请点击重试'
-          setPlaybackError(msg)
-        })
-    } else {
-      setIsPlaying(true)
-    }
-  }, [currentTrackId, currentTrackFallbackDuration])
+    triggerAudioPlay(audio)
+  }, [currentTrackId, currentTrackFallbackDuration, triggerAudioPlay])
 
   // 同步音量与静音状态
   useEffect(() => {
@@ -229,25 +244,10 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
         audio.currentTime = 0
         setCurrentTime(0)
         setPlaybackError(null)
-        const p = audio.play()
-        if (p && typeof p.then === 'function') {
-          p.then(() => {
-            setIsPlaying(true)
-            setPlaybackError(null)
-          }).catch((err: unknown) => {
-            setIsPlaying(false)
-            setPlaybackError(
-              err instanceof Error && err.message
-                ? `音频播放失败：${err.message}`
-                : '音频播放被拦截或加载失败，请点击重试',
-            )
-          })
-        } else {
-          setIsPlaying(true)
-        }
+        triggerAudioPlay(audio)
       }
     }
-  }, [])
+  }, [triggerAudioPlay])
 
   const playTrack = useCallback(
     (track: BaseItemDto, nextQueue?: BaseItemDto[]) => {
@@ -262,6 +262,7 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
   )
 
   const pause = useCallback(() => {
+    playSeqRef.current++
     const audio = audioRef.current
     if (audio) {
       audio.pause()
@@ -278,29 +279,14 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
     setPlaybackError(null)
     audio.src = getAudioStreamUrl(track.Id)
     audio.load()
-
-    const p = audio.play()
-    if (p && typeof p.then === 'function') {
-      p.then(() => {
-        setIsPlaying(true)
-        setPlaybackError(null)
-      }).catch((err: unknown) => {
-        setIsPlaying(false)
-        setPlaybackError(
-          err instanceof Error && err.message
-            ? `音频播放失败：${err.message}`
-            : '音频播放被拦截或加载失败，请点击重试',
-        )
-      })
-    } else {
-      setIsPlaying(true)
-    }
-  }, [])
+    triggerAudioPlay(audio)
+  }, [triggerAudioPlay])
 
   const togglePlay = useCallback(() => {
     const audio = audioRef.current
     if (!audio || stateRef.current.currentIndex < 0) return
     if (isPlaying) {
+      playSeqRef.current++
       audio.pause()
       setIsPlaying(false)
     } else {
@@ -311,24 +297,9 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
         return
       }
       setPlaybackError(null)
-      const p = audio.play()
-      if (p && typeof p.then === 'function') {
-        p.then(() => {
-          setIsPlaying(true)
-          setPlaybackError(null)
-        }).catch((err: unknown) => {
-          setIsPlaying(false)
-          setPlaybackError(
-            err instanceof Error && err.message
-              ? `音频播放失败：${err.message}`
-              : '音频播放被拦截或加载失败，请点击重试',
-          )
-        })
-      } else {
-        setIsPlaying(true)
-      }
+      triggerAudioPlay(audio)
     }
-  }, [isPlaying, retry])
+  }, [isPlaying, retry, triggerAudioPlay])
 
   const seek = useCallback((sec: number) => {
     const audio = audioRef.current
@@ -392,6 +363,7 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const close = useCallback(() => {
+    playSeqRef.current++
     const audio = audioRef.current
     if (audio) {
       audio.pause()
@@ -423,26 +395,11 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
       audio.currentTime = 0
       setCurrentTime(0)
       setPlaybackError(null)
-      const p = audio.play()
-      if (p && typeof p.then === 'function') {
-        p.then(() => {
-          setIsPlaying(true)
-          setPlaybackError(null)
-        }).catch((err: unknown) => {
-          setIsPlaying(false)
-          setPlaybackError(
-            err instanceof Error && err.message
-              ? `音频播放失败：${err.message}`
-              : '音频播放被拦截或加载失败，请点击重试',
-          )
-        })
-      } else {
-        setIsPlaying(true)
-      }
+      triggerAudioPlay(audio)
       return
     }
     next()
-  }, [next])
+  }, [next, triggerAudioPlay])
 
   const value = useMemo<AudioPlayerContextValue>(
     () => ({

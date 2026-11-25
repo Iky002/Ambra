@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/plugins"
 )
 
@@ -21,6 +23,7 @@ const (
 	defaultPosterThumbBaseURL  = "https://image.tmdb.org/t/p/w342"
 	defaultBackdropThumbURL    = "https://image.tmdb.org/t/p/w500"
 	maxSearchCandidates        = 10
+	maxResponseBytes           = 16 << 20 // 16 MiB
 )
 
 // RemoteImageCandidate represents a single remote artwork candidate from TMDB.
@@ -54,6 +57,7 @@ type providerConfig struct {
 	baseURL      string
 	imageBaseURL string
 	enabled      bool
+	client       *http.Client
 }
 
 func (p *Provider) snapshot() providerConfig {
@@ -65,6 +69,7 @@ func (p *Provider) snapshot() providerConfig {
 		baseURL:      p.baseURL,
 		imageBaseURL: p.imageBaseURL,
 		enabled:      p.enabled,
+		client:       p.client,
 	}
 }
 
@@ -78,8 +83,18 @@ func New(apiKey, language string) *Provider {
 		baseURL:      defaultBaseURL,
 		imageBaseURL: defaultImageBaseURL,
 		enabled:      true,
-		client:       &http.Client{Timeout: 10 * time.Second},
+		client:       netutil.NewSafeHTTPClient(10*time.Second, false),
 	}
+}
+
+// SetHTTPClient overrides the HTTP client used for TMDB requests (useful in tests).
+func (p *Provider) SetHTTPClient(c *http.Client) {
+	if c == nil {
+		return
+	}
+	p.mu.Lock()
+	p.client = c
+	p.mu.Unlock()
 }
 
 func (p *Provider) Manifest() plugins.Manifest {
@@ -97,6 +112,15 @@ func (p *Provider) Manifest() plugins.Manifest {
 	}
 }
 
+func validateHTTPBaseURL(raw string) (string, error) {
+	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
+	u, err := url.Parse(trimmed)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return "", fmt.Errorf("invalid url %q: must use http or https scheme with host", raw)
+	}
+	return trimmed, nil
+}
+
 func (p *Provider) Configure(cfg map[string]any) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -106,11 +130,19 @@ func (p *Provider) Configure(cfg map[string]any) error {
 	if v, ok := cfg["language"].(string); ok && v != "" {
 		p.language = v
 	}
-	if v, ok := cfg["base_url"].(string); ok && v != "" {
-		p.baseURL = strings.TrimRight(v, "/")
+	if v, ok := cfg["base_url"].(string); ok && strings.TrimSpace(v) != "" {
+		valid, err := validateHTTPBaseURL(v)
+		if err != nil {
+			return fmt.Errorf("tmdb base_url: %w", err)
+		}
+		p.baseURL = valid
 	}
-	if v, ok := cfg["image_base_url"].(string); ok && v != "" {
-		p.imageBaseURL = strings.TrimRight(v, "/")
+	if v, ok := cfg["image_base_url"].(string); ok && strings.TrimSpace(v) != "" {
+		valid, err := validateHTTPBaseURL(v)
+		if err != nil {
+			return fmt.Errorf("tmdb image_base_url: %w", err)
+		}
+		p.imageBaseURL = valid
 	}
 	if v, ok := cfg["enabled"].(bool); ok {
 		p.enabled = v
@@ -812,21 +844,40 @@ func (p *Provider) FetchImages(ctx context.Context, itemType, tmdbID string) ([]
 	return out, nil
 }
 
+func sanitizeAPIKeyError(err error, apiKey string) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if apiKey != "" {
+		msg = strings.ReplaceAll(msg, apiKey, "REDACTED")
+		msg = strings.ReplaceAll(msg, url.QueryEscape(apiKey), "REDACTED")
+	}
+	return fmt.Errorf("%s", msg)
+}
+
 func (p *Provider) getJSON(ctx context.Context, endpoint string, params url.Values, dst any) error {
-	baseURL := p.snapshot().baseURL
-	reqURL := baseURL + endpoint + "?" + params.Encode()
+	snap := p.snapshot()
+	reqURL := snap.baseURL + endpoint + "?" + params.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
-		return err
+		return sanitizeAPIKeyError(err, snap.apiKey)
 	}
 	req.Header.Set("Accept", "application/json")
-	resp, err := p.client.Do(req)
+	resp, err := snap.client.Do(req)
 	if err != nil {
-		return err
+		return sanitizeAPIKeyError(err, snap.apiKey)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("tmdb status %d", resp.StatusCode)
 	}
-	return json.NewDecoder(resp.Body).Decode(dst)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return sanitizeAPIKeyError(err, snap.apiKey)
+	}
+	if len(body) > maxResponseBytes {
+		return fmt.Errorf("tmdb response exceeds maximum size of %d bytes", maxResponseBytes)
+	}
+	return json.Unmarshal(body, dst)
 }

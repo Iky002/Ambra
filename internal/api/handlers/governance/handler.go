@@ -2,7 +2,6 @@ package governance
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -79,7 +78,7 @@ type cleanupOrphansRequest struct {
 
 func (h *Handler) handleCleanupOrphans(w http.ResponseWriter, r *http.Request) {
 	var req cleanupOrphansRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid cleanup payload")
 		return
 	}
@@ -124,7 +123,7 @@ type approveReviewRequest struct {
 func (h *Handler) handleApproveReview(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
 	var req approveReviewRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid approve payload")
 		return
 	}
@@ -156,7 +155,7 @@ type lockFieldsRequest struct {
 func (h *Handler) handleLockFields(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
 	var req lockFieldsRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid lock payload")
 		return
 	}

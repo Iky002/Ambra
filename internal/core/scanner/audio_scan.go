@@ -28,7 +28,7 @@ func (s *Scanner) indexAudio(
 	size := info.Size()
 
 	container := strings.TrimPrefix(strings.ToLower(filepath.Ext(mediaPath)), ".")
-	needProbe := s.prober != nil && !s.prober.disabled
+	needProbe := s.getProber().IsEnabled()
 
 	existing, err := s.repo.FindItemByMediaSourcePath(ctx, lib.ID, mediaPath)
 	if err == nil && existing != nil {

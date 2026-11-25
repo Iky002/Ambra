@@ -142,14 +142,17 @@ func TestHWAccelAndDetectorExtra(t *testing.T) {
 }
 
 func TestBuildFFmpegArgsAndSessionKeysExtra(t *testing.T) {
-	// SessionKey branches
-	if k := SessionKey(SessionParams{PlaySessionID: "ps"}); k != "ps" {
+	// SessionKey branches (must scope by UserID, ItemID, MediaSourceID, PlaySessionID)
+	if k := SessionKey(SessionParams{UserID: "u1", ItemID: "i1", MediaSourceID: "m1", PlaySessionID: "ps"}); k != "u1:i1:m1:ps" {
 		t.Fatalf("unexpected key: %s", k)
 	}
-	if k := SessionKey(SessionParams{DeviceID: "d", ItemID: "i"}); k != "d:i" {
+	if k1, k2 := SessionKey(SessionParams{UserID: "u1", ItemID: "i1", MediaSourceID: "m1", PlaySessionID: "same"}), SessionKey(SessionParams{UserID: "u2", ItemID: "i1", MediaSourceID: "m1", PlaySessionID: "same"}); k1 == k2 {
+		t.Fatalf("expected distinct keys across users for same PlaySessionID: %s", k1)
+	}
+	if k := SessionKey(SessionParams{UserID: "u1", DeviceID: "d", ItemID: "i", MediaSourceID: "m"}); k != "u1:d:i:m" {
 		t.Fatalf("unexpected key: %s", k)
 	}
-	if k := SessionKey(SessionParams{ItemID: "i", MediaSourceID: "m"}); k != "i:m" {
+	if k := SessionKey(SessionParams{ItemID: "i", MediaSourceID: "m"}); k != ":i:m" {
 		t.Fatalf("unexpected key: %s", k)
 	}
 	if sanitizePathSegment("") != "session" || sanitizePathSegment("a/b:c") != "a_b_c" {

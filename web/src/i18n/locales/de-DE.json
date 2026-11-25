@@ -97,6 +97,7 @@
   "library.sortDateAdded": "Hinzugefügt am",
   "library.sortReleaseDate": "Erscheinungsdatum",
   "library.sortRating": "Bewertung",
+  "library.sortPlayCount": "Wiedergaben",
   "library.filterAll": "Alle Status",
   "library.filterUnplayed": "Ungesehen",
   "library.filterPlayed": "Gesehen",

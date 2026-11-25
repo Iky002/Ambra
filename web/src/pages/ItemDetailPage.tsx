@@ -2020,7 +2020,7 @@ export function ItemDetailPage() {
               <div className="space-y-5 border-t border-white/8 px-5 py-4">
                 {/* 文件路径与基础参数 */}
                 <div className="space-y-3">
-                  {activeSource.Path && (
+                  {isAdmin && activeSource.Path && (
                     <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/8 bg-white/[0.025] px-3.5 py-2.5">
                       <div className="min-w-0 flex-1">
                         <span className="block text-[11px] text-zinc-500">{t('detail.filePath')}</span>

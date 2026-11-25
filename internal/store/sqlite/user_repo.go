@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ambra-media/ambra/internal/api/dto"
@@ -384,6 +385,15 @@ func (r *UserRepo) DeleteTokensByDevice(ctx context.Context, deviceID string) er
 
 func (r *UserRepo) DeleteTokensByUser(ctx context.Context, userID string) error {
 	_, err := r.store.Writer.ExecContext(ctx, `DELETE FROM access_tokens WHERE user_id = ?`, guid.Normalize(userID))
+	return err
+}
+
+func (r *UserRepo) DeleteTokensByUserExcept(ctx context.Context, userID, keepToken string) error {
+	keepToken = strings.TrimSpace(keepToken)
+	if keepToken == "" {
+		return r.DeleteTokensByUser(ctx, userID)
+	}
+	_, err := r.store.Writer.ExecContext(ctx, `DELETE FROM access_tokens WHERE user_id = ? AND token != ?`, guid.Normalize(userID), keepToken)
 	return err
 }
 

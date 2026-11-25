@@ -16,7 +16,7 @@ import {
   UserCheck,
   X,
 } from 'lucide-react'
-import { Navigate, useNavigate } from 'react-router-dom'
+import { Navigate, useNavigate, useSearchParams } from 'react-router-dom'
 import { api, embyFetch, getUserImageUrl } from '../api/client'
 import type { QuickConnectResult } from '../api/types'
 import { AmbraLogo } from '../components/AmbraLogo'
@@ -29,6 +29,10 @@ export function LoginPage() {
   const { login, applyAuthResult } = useAuth()
   const { locale, t } = useI18n()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const rawRedirect = searchParams.get('redirect') || ''
+  const safeRedirect =
+    rawRedirect.startsWith('/') && !rawRedirect.startsWith('//') ? rawRedirect : '/'
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [submitting, setSubmitting] = useState(false)
@@ -84,7 +88,7 @@ export function LoginPage() {
         const authRes = await api.authenticateWithQuickConnect(secret)
         applyAuthResult(authRes)
         setQcOpen(false)
-        navigate('/', { replace: true })
+        navigate(safeRedirect, { replace: true })
       } catch (err) {
         qcAuthenticatingRef.current = false
         setQcAuthenticating(false)
@@ -263,7 +267,7 @@ export function LoginPage() {
     setSubmitting(true)
     try {
       await login(role, '')
-      navigate('/', { replace: true })
+      navigate(safeRedirect, { replace: true })
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Demo 一键登录失败')
     } finally {
@@ -304,7 +308,7 @@ export function LoginPage() {
 
   const showQuickConnect = Boolean(quickConnectEnabled || demoActive)
 
-  if (!demoActive && setupStatus && setupStatus.completed === false) {
+  if (!demoActive && setupStatus && setupStatus.completed === false && !setupStatus.has_users) {
     return <Navigate to="/setup" replace />
   }
 
@@ -318,7 +322,7 @@ export function LoginPage() {
     setSubmitting(true)
     try {
       await login(username.trim(), password)
-      navigate('/', { replace: true })
+      navigate(safeRedirect, { replace: true })
     } catch (err) {
       setError(err instanceof Error ? err.message : '登录失败，请检查用户名或密码')
     } finally {

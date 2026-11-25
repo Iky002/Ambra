@@ -81,3 +81,60 @@ func TestBusConcurrentPublishSubscribe(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestBusNilPanicRecoveryAndConcurrencyLimit(t *testing.T) {
+	// 1. Nil bus Publish is a safe no-op.
+	var nilBus *Bus
+	nilBus.Publish(context.Background(), Event{Type: EventLibraryChanged, Payload: "ignored"})
+
+	// 2. Handler panic recovery + nil context fallback + semaphore release.
+	bus := New()
+	var wg sync.WaitGroup
+	var okCalled atomic.Bool
+	wg.Add(2)
+	bus.Subscribe(EventUserDataChanged, func(ctx context.Context, e Event) {
+		defer wg.Done()
+		panic("simulated handler crash")
+	})
+	bus.Subscribe(EventUserDataChanged, func(ctx context.Context, e Event) {
+		defer wg.Done()
+		if ctx == nil {
+			t.Error("expected non-nil handler context")
+		}
+		okCalled.Store(true)
+	})
+
+	// Pass nil context to exercise default context.Background() fallback.
+	bus.Publish(nil, Event{Type: EventUserDataChanged, Payload: "item-1"})
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for handlers after panic recovery")
+	}
+	if !okCalled.Load() {
+		t.Fatal("expected sibling handler to execute even when another handler panics")
+	}
+
+	// 3. Concurrency semaphore full drops event gracefully without blocking.
+	limitedBus := &Bus{
+		handlers: make(map[EventType][]Handler),
+		sem:      make(chan struct{}, 1),
+	}
+	called := atomic.Bool{}
+	limitedBus.Subscribe(EventPlaybackStop, func(ctx context.Context, e Event) {
+		called.Store(true)
+	})
+	// Occupy the only slot.
+	limitedBus.sem <- struct{}{}
+	limitedBus.Publish(context.Background(), Event{Type: EventPlaybackStop})
+	<-limitedBus.sem
+	if called.Load() {
+		t.Fatal("expected event to be dropped when semaphore is full")
+	}
+}

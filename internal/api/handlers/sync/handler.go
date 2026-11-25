@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -515,7 +516,7 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		ItemLimit      int      `json:"ItemLimit"`
 		Bitrate        int      `json:"Bitrate"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid sync job payload")
 		return
 	}
@@ -523,7 +524,29 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		req.TargetId = "local-device"
 	}
 	callerID, isAdmin, hasAuth := callerAuth(r)
+	var callerUser *sqlite.UserRecord
 	if hasAuth && !isAdmin {
+		if userRepo := h.getUserRepo(); userRepo != nil {
+			if callerID == "" {
+				httpx.Error(w, http.StatusForbidden, "forbidden")
+				return
+			}
+			u, err := userRepo.GetUserByID(r.Context(), callerID)
+			if err != nil || u == nil || u.IsDisabled {
+				httpx.Error(w, http.StatusForbidden, "forbidden")
+				return
+			}
+			callerUser = u
+		} else if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil {
+			callerUser = ac.User
+		} else {
+			httpx.Error(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		if !callerUser.IsAdmin && !callerUser.Policy.IsAdministrator && !callerUser.Policy.EnableContentDownloading {
+			httpx.Error(w, http.StatusForbidden, "content downloading is disabled")
+			return
+		}
 		req.UserId = callerID
 	} else if hasAuth && req.UserId == "" {
 		req.UserId = callerID
@@ -573,9 +596,42 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		outputPath := ""
 		mediaSourceID := ""
 		if libRepo != nil {
+			rec, recErr := libRepo.GetItemRecordByID(r.Context(), itemID)
+			if recErr != nil || rec == nil {
+				continue
+			}
+			if rec.IsStrm || strings.EqualFold(filepath.Ext(rec.Path), ".strm") {
+				httpx.Error(w, http.StatusBadRequest, "STRM items cannot be synced")
+				return
+			}
+			if callerUser != nil && !callerUser.IsAdmin && !callerUser.Policy.IsAdministrator {
+				if rec.LibraryID != "" && !callerUser.Policy.EnableAllFolders {
+					normLib := guid.Normalize(rec.LibraryID)
+					allowed := false
+					for _, fid := range callerUser.Policy.EnabledFolders {
+						if guid.Normalize(fid) == normLib {
+							allowed = true
+							break
+						}
+					}
+					if !allowed {
+						httpx.Error(w, http.StatusForbidden, "access denied to item library")
+						return
+					}
+				}
+				blocked, bErr := libRepo.IsItemBlockedByParentalPolicy(r.Context(), rec, callerUser.Policy.MaxParentalRating, callerUser.Policy.BlockedTags)
+				if bErr != nil || blocked {
+					httpx.Error(w, http.StatusForbidden, "item blocked by parental control policy")
+					return
+				}
+			}
 			itemDTO, err := libRepo.GetItemByID(r.Context(), serverID, job.UserId, itemID)
 			if err != nil || itemDTO == nil {
 				continue
+			}
+			if strings.EqualFold(filepath.Ext(itemDTO.Path), ".strm") {
+				httpx.Error(w, http.StatusBadRequest, "STRM items cannot be synced")
+				return
 			}
 			if itemDTO.Name != "" {
 				itemName = itemDTO.Name
@@ -609,12 +665,24 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	h.state.Jobs = append(h.state.Jobs, job)
 	h.state.JobItems = append(h.state.JobItems, createdItems...)
-	h.saveStateLocked(r.Context())
+	err := h.saveStateLocked(r.Context())
 	h.mu.Unlock()
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to persist sync job")
+		return
+	}
+
+	respItems := make([]SyncJobItem, len(createdItems))
+	copy(respItems, createdItems)
+	if hasAuth && !isAdmin {
+		for i := range respItems {
+			respItems[i].OutputPath = ""
+		}
+	}
 
 	httpx.JSON(w, http.StatusOK, SyncJobCreationResult{
 		Job:      job,
-		JobItems: createdItems,
+		JobItems: respItems,
 	})
 }
 
@@ -647,7 +715,7 @@ func (h *Handler) handleUpdateJob(w http.ResponseWriter, r *http.Request) {
 		ItemLimit      *int   `json:"ItemLimit"`
 		Status         string `json:"Status"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid sync job update payload")
 		return
 	}
@@ -685,8 +753,12 @@ func (h *Handler) handleUpdateJob(w http.ResponseWriter, r *http.Request) {
 			}
 			h.state.Jobs[i].DateLastModified = time.Now().UTC()
 			updated := h.state.Jobs[i]
-			h.saveStateLocked(r.Context())
+			err := h.saveStateLocked(r.Context())
 			h.mu.Unlock()
+			if err != nil {
+				httpx.Error(w, http.StatusInternalServerError, "failed to persist sync job")
+				return
+			}
 			httpx.JSON(w, http.StatusOK, updated)
 			return
 		}
@@ -773,6 +845,9 @@ func (h *Handler) handleListJobItems(w http.ResponseWriter, r *http.Request) {
 			if _, ok := statusSet[strings.ToLower(ji.Status)]; !ok {
 				continue
 			}
+		}
+		if hasAuth && !isAdmin {
+			ji.OutputPath = ""
 		}
 		filtered = append(filtered, ji)
 	}
@@ -918,10 +993,16 @@ func (h *Handler) handleReadyItems(w http.ResponseWriter, r *http.Request) {
 		ready[i] = e.item
 		if libRepo != nil {
 			if itemDTO, err := libRepo.GetItemByID(r.Context(), serverID, e.userID, e.item.ItemId); err == nil && itemDTO != nil {
-				ready[i].Item = itemDTO
 				if ready[i].OriginalFile == "" && itemDTO.Path != "" {
 					ready[i].OriginalFile = filepath.Base(itemDTO.Path)
 				}
+				if hasAuth && !isAdmin {
+					itemDTO.Path = ""
+					for j := range itemDTO.MediaSources {
+						itemDTO.MediaSources[j].Path = ""
+					}
+				}
+				ready[i].Item = itemDTO
 			}
 		}
 	}
@@ -933,7 +1014,7 @@ func (h *Handler) handleSyncData(w http.ResponseWriter, r *http.Request) {
 		LocalItemIds []string `json:"LocalItemIds"`
 		TargetId     string   `json:"TargetId"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid sync data payload")
 		return
 	}
@@ -1024,15 +1105,16 @@ func (h *Handler) loadState(ctx context.Context) {
 	}
 }
 
-func (h *Handler) saveStateLocked(ctx context.Context) {
+func (h *Handler) saveStateLocked(ctx context.Context) error {
 	if h.store == nil {
-		return
+		return nil
 	}
 	raw, err := json.Marshal(h.state)
 	if err != nil {
-		return
+		slog.Error("sync: marshal state failed", "err", err)
+		return err
 	}
-	_, _ = h.store.Writer.ExecContext(ctx, `
+	_, err = h.store.Writer.ExecContext(ctx, `
 		INSERT INTO server_config (key, value_json, updated_at)
 		VALUES (?, ?, ?)
 		ON CONFLICT(key) DO UPDATE SET
@@ -1040,6 +1122,10 @@ func (h *Handler) saveStateLocked(ctx context.Context) {
 			updated_at = excluded.updated_at`,
 		stateConfigKey, string(raw), time.Now().UTC().Unix(),
 	)
+	if err != nil {
+		slog.Error("sync: save state failed", "err", err)
+	}
+	return err
 }
 
 func paginate[T any](items []T, startIndex, limit int) ([]T, int) {

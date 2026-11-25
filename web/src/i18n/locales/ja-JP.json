@@ -97,6 +97,7 @@
   "library.sortDateAdded": "追加日",
   "library.sortReleaseDate": "公開日",
   "library.sortRating": "評価",
+  "library.sortPlayCount": "再生回数",
   "library.filterAll": "すべての状態",
   "library.filterUnplayed": "未視聴",
   "library.filterPlayed": "視聴済み",

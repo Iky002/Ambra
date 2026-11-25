@@ -9,9 +9,11 @@ import {
   getDeviceId,
   getImageUrl,
   getStoredAuth,
+  isSameOriginUrl,
   resolveApiUrl,
   saveAuth,
 } from '../client'
+import { DEMO_AUTH_STORAGE_KEY, setDemoModeOverride } from '../../demo/demoMode'
 
 function mockJsonResponse(data: unknown, status = 200, contentType = 'application/json') {
   return {
@@ -100,25 +102,67 @@ describe('api/client - 凭证管理、请求头注入与 401 处理', () => {
     window.removeEventListener('ambra:unauthorized', onUnauthorized)
   })
 
-  it('resolveApiUrl / getImageUrl / getBackdropUrl 正确拼接 api_key 与参数', () => {
+  it('resolveApiUrl / getImageUrl / getBackdropUrl 仅同源拼接 api_key，普通图片不暴露 api_key', () => {
     saveAuth(TEST_AUTH)
+    expect(isSameOriginUrl('/emby/Videos/1/stream.mp4')).toBe(true)
+    expect(isSameOriginUrl(`${window.location.origin}/emby/Videos/1/stream.mp4`)).toBe(true)
+    expect(isSameOriginUrl('https://cdn.external.example/video.m3u8')).toBe(false)
+    expect(isSameOriginUrl('//cdn.external.example/video.m3u8')).toBe(false)
+    expect(isSameOriginUrl('')).toBe(false)
+
     expect(resolveApiUrl('/emby/Videos/1/stream.mp4')).toBe(
       '/emby/Videos/1/stream.mp4?api_key=secret-token-123',
     )
     expect(resolveApiUrl('/emby/Videos/1/stream.mp4?Static=true')).toBe(
       '/emby/Videos/1/stream.mp4?Static=true&api_key=secret-token-123',
     )
-    expect(getImageUrl('item-1', 'Primary', { maxWidth: 400, tag: 't1' })).toContain(
-      '/emby/Items/item-1/Images/Primary?',
+    expect(resolveApiUrl('https://cdn.external.example/live/ch1.m3u8')).toBe(
+      'https://cdn.external.example/live/ch1.m3u8',
     )
-    expect(
-      getBackdropUrl({
-        Id: 'm1',
-        Name: 'Movie',
-        Type: 'Movie',
-        BackdropImageTags: ['bg-tag'],
-      }),
-    ).toContain('/emby/Items/m1/Images/Backdrop?')
+    expect(resolveApiUrl('https://cdn.external.example/live/ch1.m3u8')).not.toContain('api_key')
+
+    const imgUrl = getImageUrl('item-1', 'Primary', { maxWidth: 400, tag: 't1' })
+    expect(imgUrl).toContain('/emby/Items/item-1/Images/Primary?')
+    expect(imgUrl).not.toContain('api_key')
+    expect(getImageUrl('item-1', 'ClearLogo')).toContain('/emby/Items/item-1/Images/ClearLogo?')
+
+    const backdropUrl = getBackdropUrl({
+      Id: 'm1',
+      Name: 'Movie',
+      Type: 'Movie',
+      BackdropImageTags: ['bg-tag'],
+    })
+    expect(backdropUrl).toContain('/emby/Items/m1/Images/Backdrop?')
+    expect(backdropUrl).not.toContain('api_key')
+  })
+
+  it('setupAdmin 在已有登录态时自动附带认证头，Demo 模式使用独立会话存储不覆写真实会话', async () => {
+    saveAuth(TEST_AUTH)
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(
+        mockJsonResponse({
+          AccessToken: 'setup-tok',
+          ServerId: 'srv-1',
+          User: { Id: 'u-admin', Name: 'admin', ServerId: 'srv-1' },
+        }),
+      )
+
+    await api.setupAdmin('admin', 'StrongPass123!')
+    const [, init] = fetchSpy.mock.calls[0]
+    const headers = init?.headers as Headers
+    expect(headers.get('X-Emby-Token')).toBe(TEST_AUTH.accessToken)
+    expect(headers.get('X-Emby-Authorization')).toContain(`Token="${TEST_AUTH.accessToken}"`)
+
+    // Demo 模式切换后写入独立存储键，不影响真实会话
+    setDemoModeOverride(true)
+    expect(getStoredAuth()).toBeNull()
+    saveAuth({ ...TEST_AUTH, accessToken: 'demo-only-token', userId: 'demo-user' })
+    expect(localStorage.getItem(DEMO_AUTH_STORAGE_KEY)).toContain('demo-only-token')
+
+    setDemoModeOverride(false)
+    expect(getStoredAuth()?.accessToken).toBe(TEST_AUTH.accessToken)
+    setDemoModeOverride(null)
   })
 })
 

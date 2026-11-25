@@ -46,7 +46,7 @@ func TestPluginAdminPersistenceAndRestore(t *testing.T) {
 		t.Fatalf("POST Configuration status=%d body=%s", rec.Code, rec.Body.String())
 	}
 
-	// 2. Get TMDB config
+	// 2. Get TMDB config (sensitive key must be masked)
 	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Plugins/ambra.builtin.tmdb/Configuration", nil))
 	if rec.Code != http.StatusOK {
@@ -54,8 +54,22 @@ func TestPluginAdminPersistenceAndRestore(t *testing.T) {
 	}
 	var gotCfg map[string]any
 	_ = json.Unmarshal(rec.Body.Bytes(), &gotCfg)
-	if gotCfg["api_key"] != "secret-tmdb-key" || gotCfg["language"] != "en-US" {
-		t.Fatalf("unexpected persisted config: %+v", gotCfg)
+	if gotCfg["api_key"] != maskedSecret || gotCfg["language"] != "en-US" {
+		t.Fatalf("unexpected persisted config (expected masked api_key): %+v", gotCfg)
+	}
+	// Updating with masked sentinel or empty value preserves existing secret
+	updPayload, _ := json.Marshal(map[string]any{
+		"ApiKey":   maskedSecret,
+		"Language": "en-US",
+	})
+	recUpd := httptest.NewRecorder()
+	mux.ServeHTTP(recUpd, httptest.NewRequest(http.MethodPost, "/Plugins/ambra.builtin.tmdb/Configuration", bytes.NewReader(updPayload)))
+	if recUpd.Code != http.StatusOK {
+		t.Fatalf("POST masked update status=%d body=%s", recUpd.Code, recUpd.Body.String())
+	}
+	savedRaw, err := h.loadSavedConfig(context.Background(), "ambra.builtin.tmdb")
+	if err != nil || savedRaw["api_key"] != "secret-tmdb-key" {
+		t.Fatalf("expected underlying secret preserved, got %+v err=%v", savedRaw, err)
 	}
 
 	// 3. Disable STRM via DELETE /Plugins/{Id}
@@ -110,7 +124,7 @@ func TestPluginAdminPersistenceAndRestore(t *testing.T) {
 	mux2.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Plugins/ambra.builtin.tmdb/Configuration", nil))
 	var restored map[string]any
 	_ = json.Unmarshal(rec.Body.Bytes(), &restored)
-	if restored["api_key"] != "secret-tmdb-key" || restored["enabled"] != false {
+	if restored["api_key"] != maskedSecret || restored["enabled"] != false {
 		t.Fatalf("unexpected restored config: %+v", restored)
 	}
 	// Verify PascalCase metadata keys are present alongside lowercase keys
@@ -136,7 +150,11 @@ func TestPluginAdminPersistenceAndRestore(t *testing.T) {
 	if afterDel["enabled"] != false || afterDel["Enabled"] != false {
 		t.Fatalf("expected enabled=false after DELETE, got %+v", afterDel)
 	}
-	if afterDel["api_key"] != "secret-tmdb-key" || afterDel["language"] != "en-US" {
-		t.Fatalf("expected DELETE to preserve existing config keys, got %+v", afterDel)
+	if afterDel["api_key"] != maskedSecret || afterDel["language"] != "en-US" {
+		t.Fatalf("expected DELETE to preserve existing config keys (masked in response), got %+v", afterDel)
+	}
+	rawAfterDel, err := h2.loadSavedConfig(context.Background(), "ambra.builtin.tmdb")
+	if err != nil || rawAfterDel["api_key"] != "secret-tmdb-key" {
+		t.Fatalf("expected DELETE to preserve underlying secret, got %+v err=%v", rawAfterDel, err)
 	}
 }

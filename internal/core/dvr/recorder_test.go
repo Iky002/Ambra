@@ -42,7 +42,7 @@ func TestDefaultArgsBuilderAndDefaults(t *testing.T) {
 		Duration:    90 * time.Second,
 	}
 	got := DefaultArgsBuilder(job, "/tmp/out.mkv")
-	want := []string{"-y", "-i", "http://example.com/live.m3u8", "-t", "90", "-c", "copy", "/tmp/out.mkv"}
+	want := []string{"-y", "-protocol_whitelist", "http,https,tcp,tls,crypto", "-i", "http://example.com/live.m3u8", "-t", "90", "-c", "copy", "/tmp/out.mkv"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("DefaultArgsBuilder got %v, want %v", got, want)
 	}
@@ -51,7 +51,7 @@ func TestDefaultArgsBuilderAndDefaults(t *testing.T) {
 	jobShort := job
 	jobShort.Duration = 200 * time.Millisecond
 	gotShort := DefaultArgsBuilder(jobShort, "/tmp/out.mkv")
-	if gotShort[4] != "1" {
+	if gotShort[6] != "1" {
 		t.Fatalf("expected 1s duration, got %v", gotShort)
 	}
 
@@ -59,7 +59,7 @@ func TestDefaultArgsBuilderAndDefaults(t *testing.T) {
 	jobUnlimited := job
 	jobUnlimited.Duration = 0
 	gotUnlimited := DefaultArgsBuilder(jobUnlimited, "/tmp/out.mkv")
-	wantUnlimited := []string{"-y", "-i", "http://example.com/live.m3u8", "-c", "copy", "/tmp/out.mkv"}
+	wantUnlimited := []string{"-y", "-protocol_whitelist", "http,https,tcp,tls,crypto", "-i", "http://example.com/live.m3u8", "-c", "copy", "/tmp/out.mkv"}
 	if !reflect.DeepEqual(gotUnlimited, wantUnlimited) {
 		t.Fatalf("unlimited DefaultArgsBuilder got %v, want %v", gotUnlimited, wantUnlimited)
 	}
@@ -87,7 +87,7 @@ func TestStartRecordingSuccessAndEventBus(t *testing.T) {
 		TimerID:     "timer-001",
 		ChannelName: "CCTV 5+",
 		ProgramName: "足球/直播",
-		StreamURL:   "http://live.local/ch5.ts",
+		StreamURL:   "http://127.0.0.1:8080/ch5.ts",
 		Duration:    5 * time.Second,
 	})
 	if err != nil {
@@ -140,7 +140,7 @@ func TestStartRecordingErrorsAndFailure(t *testing.T) {
 
 	if _, err := rec.StartRecording(context.Background(), RecordingJob{
 		TimerID:   "fail-1",
-		StreamURL: "http://live.local/fail.ts",
+		StreamURL: "http://127.0.0.1:8080/fail.ts",
 	}); err != nil {
 		t.Fatalf("unexpected start error: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestStartRecordingErrorsAndFailure(t *testing.T) {
 	defer badRec.Close()
 	if _, err := badRec.StartRecording(context.Background(), RecordingJob{
 		TimerID:   "missing-bin",
-		StreamURL: "http://live.local/a.ts",
+		StreamURL: "http://127.0.0.1:8080/a.ts",
 	}); err == nil {
 		t.Fatal("expected error when ffmpeg binary does not exist")
 	}
@@ -183,7 +183,7 @@ func TestCancelRecordingActiveAndClose(t *testing.T) {
 	for _, id := range []string{"b-timer", "a-timer"} {
 		if _, err := rec.StartRecording(context.Background(), RecordingJob{
 			TimerID:   id,
-			StreamURL: "http://live.local/" + id,
+			StreamURL: "http://127.0.0.1:8080/" + id,
 		}); err != nil {
 			t.Fatalf("StartRecording %s failed: %v", id, err)
 		}
@@ -192,7 +192,7 @@ func TestCancelRecordingActiveAndClose(t *testing.T) {
 	// Duplicate active TimerID should be rejected.
 	if _, err := rec.StartRecording(context.Background(), RecordingJob{
 		TimerID:   "a-timer",
-		StreamURL: "http://live.local/dup",
+		StreamURL: "http://127.0.0.1:8080/dup",
 	}); !errors.Is(err, ErrAlreadyRecording) {
 		t.Fatalf("expected ErrAlreadyRecording, got %v", err)
 	}
@@ -220,7 +220,7 @@ func TestCancelRecordingActiveAndClose(t *testing.T) {
 	}
 	if _, err := rec.StartRecording(context.Background(), RecordingJob{
 		TimerID:   "after-close",
-		StreamURL: "http://live.local/x",
+		StreamURL: "http://127.0.0.1:8080/x",
 	}); !errors.Is(err, ErrRecorderClosed) {
 		t.Fatalf("expected ErrRecorderClosed, got %v", err)
 	}
@@ -251,7 +251,7 @@ func TestSchedulerLoop(t *testing.T) {
 				return nil, errors.New("temporary db error")
 			}
 			return []RecordingJob{
-				{TimerID: "sched-1", ChannelName: "HBO", ProgramName: "Movie", StreamURL: "http://live.local/hbo"},
+				{TimerID: "sched-1", ChannelName: "HBO", ProgramName: "Movie", StreamURL: "http://127.0.0.1:8080/hbo"},
 				{TimerID: "", StreamURL: ""}, // invalid job logged and skipped
 			}, nil
 		})
@@ -303,7 +303,7 @@ func TestSetOnFinishedCallback(t *testing.T) {
 	for _, id := range []string{"cb-ok", "cb-fail", "cb-cancel"} {
 		if _, err := rec.StartRecording(context.Background(), RecordingJob{
 			TimerID:   id,
-			StreamURL: "http://live.local/" + id,
+			StreamURL: "http://127.0.0.1:8080/" + id,
 		}); err != nil {
 			t.Fatalf("StartRecording %s: %v", id, err)
 		}
@@ -347,7 +347,7 @@ func TestStartRecordingStartFailureInvokesOnFinished(t *testing.T) {
 
 	if _, err := rec.StartRecording(context.Background(), RecordingJob{
 		TimerID:   "start-fail-cb",
-		StreamURL: "http://live.local/stream.ts",
+		StreamURL: "http://127.0.0.1:8080/stream.ts",
 	}); err == nil {
 		t.Fatal("expected StartRecording error for missing binary")
 	}

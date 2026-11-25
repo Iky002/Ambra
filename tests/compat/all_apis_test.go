@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"github.com/ambra-media/ambra/internal/api/dto"
@@ -703,17 +702,27 @@ func TestCoreAdminAndMediaWorkflowEndToEnd(t *testing.T) {
 		t.Fatalf("expected unread notifications to decrement from %d to %d after marking read, got %d", summaryBefore.UnreadCount, summaryBefore.UnreadCount-1, summaryAfter.UnreadCount)
 	}
 
-	// 10. Create and trigger Webhook against a local test HTTP receiver
-	var webhookHits atomic.Int32
+	// 10. Create Webhook: loopback SSRF target blocked (400), public target allowed (200) with masked Secret
 	hookReceiver := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		webhookHits.Add(1)
 		rw.WriteHeader(http.StatusOK)
 	}))
 	defer hookReceiver.Close()
 
+	loopbackBody, _ := json.Marshal(map[string]any{
+		"Name":    "Blocked Loopback Hook",
+		"Url":     hookReceiver.URL,
+		"Events":  []string{"*"},
+		"Secret":  "top-secret",
+		"Enabled": true,
+	})
+	w = sendCompatRequest(srv.Handler, http.MethodPost, "/emby/Webhooks", adminToken, loopbackBody)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("loopback webhook expected 400, got %d body=%s", w.Code, w.Body.String())
+	}
+
 	whBody, _ := json.Marshal(map[string]any{
 		"Name":    "Workflow Hook",
-		"Url":     hookReceiver.URL,
+		"Url":     "https://93.184.216.34/webhook",
 		"Events":  []string{"*"},
 		"Secret":  "top-secret",
 		"Enabled": true,
@@ -723,19 +732,12 @@ func TestCoreAdminAndMediaWorkflowEndToEnd(t *testing.T) {
 		t.Fatalf("create webhook: expected 200, got %d body=%s", w.Code, w.Body.String())
 	}
 	var whResp struct {
-		Id string `json:"Id"`
+		Id        string `json:"Id"`
+		Secret    string `json:"Secret"`
+		HasSecret bool   `json:"HasSecret"`
 	}
-	if err := json.NewDecoder(w.Body).Decode(&whResp); err != nil || whResp.Id == "" {
-		t.Fatalf("decode webhook: err=%v resp=%+v", err, whResp)
-	}
-
-	testWhBody, _ := json.Marshal(map[string]string{"Id": whResp.Id})
-	w = sendCompatRequest(srv.Handler, http.MethodPost, "/emby/Webhooks/Test", adminToken, testWhBody)
-	if w.Code != http.StatusOK {
-		t.Fatalf("test webhook: expected 200, got %d body=%s", w.Code, w.Body.String())
-	}
-	if webhookHits.Load() < 1 {
-		t.Fatalf("expected webhook receiver to be hit at least once, got %d", webhookHits.Load())
+	if err := json.NewDecoder(w.Body).Decode(&whResp); err != nil || whResp.Id == "" || whResp.Secret != "" || !whResp.HasSecret {
+		t.Fatalf("decode webhook expected masked secret & HasSecret=true: err=%v resp=%+v", err, whResp)
 	}
 
 	// 11. Create SQLite hot backup via VACUUM INTO

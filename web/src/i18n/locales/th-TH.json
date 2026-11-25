@@ -97,6 +97,7 @@
   "library.sortDateAdded": "วันที่เพิ่ม",
   "library.sortReleaseDate": "วันที่ออกฉาย",
   "library.sortRating": "คะแนน",
+  "library.sortPlayCount": "จำนวนการเล่น",
   "library.filterAll": "ทุกสถานะ",
   "library.filterUnplayed": "ยังไม่ได้ดู",
   "library.filterPlayed": "ดูแล้ว",

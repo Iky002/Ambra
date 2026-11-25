@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
@@ -33,11 +34,12 @@ func (s *Scanner) SetHTTPClient(c *http.Client) {
 func (s *Scanner) getHTTPClient() *http.Client {
 	s.mu.Lock()
 	c := s.httpClient
-	s.mu.Unlock()
-	if c != nil {
-		return c
+	if c == nil {
+		c = netutil.NewSafeHTTPClient(15*time.Second, false)
+		s.httpClient = c
 	}
-	return &http.Client{Timeout: 15 * time.Second}
+	s.mu.Unlock()
+	return c
 }
 
 func (s *Scanner) imageStorageDir() string {

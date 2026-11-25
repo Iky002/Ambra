@@ -2,7 +2,6 @@ package environment
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -127,6 +126,10 @@ func (h *Handler) handleDirectoryContents(w http.ResponseWriter, r *http.Request
 		return
 	}
 	cleanPath := filepath.Clean(rawPath)
+	if !filepath.IsAbs(cleanPath) {
+		httpx.Error(w, http.StatusBadRequest, "absolute path is required")
+		return
+	}
 
 	incFilesPtr := q.Bool("includeFiles")
 	incDirsPtr := q.Bool("includeDirectories")
@@ -216,6 +219,10 @@ func (h *Handler) handleParentPath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clean := filepath.Clean(rawPath)
+	if !filepath.IsAbs(clean) {
+		httpx.Error(w, http.StatusBadRequest, "absolute path is required")
+		return
+	}
 	parent := filepath.Dir(clean)
 	if parent == clean {
 		httpx.JSON(w, http.StatusOK, "")
@@ -238,7 +245,7 @@ func (h *Handler) handleNetworkShares(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleValidatePath(w http.ResponseWriter, r *http.Request) {
 	var body ValidatePathRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &body, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -248,6 +255,10 @@ func (h *Handler) handleValidatePath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clean := filepath.Clean(p)
+	if !filepath.IsAbs(clean) {
+		httpx.Error(w, http.StatusBadRequest, "absolute path is required")
+		return
+	}
 	info, err := os.Stat(clean)
 	if err != nil {
 		if os.IsNotExist(err) {

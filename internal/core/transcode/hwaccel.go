@@ -89,6 +89,18 @@ func (c *HWCapabilities) SelectVideoEncoder(targetCodec string) string {
 	}
 }
 
+// TonemapFilterForEncoder returns the HDR-to-SDR tonemap filter chain for the selected encoder.
+func (c *HWCapabilities) TonemapFilterForEncoder(encoder string) string {
+	if c != nil {
+		for _, ci := range c.Codecs {
+			if strings.EqualFold(ci.ShortName, encoder) && strings.TrimSpace(ci.TonemapFilter) != "" {
+				return ci.TonemapFilter
+			}
+		}
+	}
+	return "zscale=t=linear:npl=100,tonemap=hable,zscale=p=bt709:t=bt709:m=bt709,format=yuv420p"
+}
+
 // HardwareDetector probes and caches local FFmpeg hardware acceleration capabilities.
 type HardwareDetector struct {
 	ffmpegPath string

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,6 +16,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 )
 
 // --- /System ---
@@ -42,13 +44,14 @@ func (h *Handler) postSystemShutdown(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) getSystemEndpoint(w http.ResponseWriter, r *http.Request) {
-	host := r.RemoteAddr
-	if hPart, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		host = hPart
+	clientIP := netutil.ClientIP(r)
+	isLocal := false
+	isInNetwork := false
+	if addr, err := netip.ParseAddr(strings.TrimSpace(clientIP)); err == nil {
+		addr = addr.WithZone("").Unmap()
+		isLocal = addr.IsLoopback()
+		isInNetwork = netutil.IsLANIP(addr)
 	}
-	ip := net.ParseIP(strings.TrimSpace(host))
-	isLocal := ip != nil && ip.IsLoopback()
-	isInNetwork := isLocal || (ip != nil && ip.IsPrivate())
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"IsLocal":     isLocal,
 		"IsInNetwork": isInNetwork,
@@ -56,6 +59,10 @@ func (h *Handler) getSystemEndpoint(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) getSystemWakeOnLanInfo(w http.ResponseWriter, r *http.Request) {
+	if !h.isCallerAdmin(r) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	out := []map[string]any{}
 	if ifaces, err := net.Interfaces(); err == nil {
 		for _, iface := range ifaces {
@@ -318,9 +325,16 @@ func (h *Handler) postPartiesLeave(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) postPartiesMessages(w http.ResponseWriter, r *http.Request) {
+	if r.ContentLength > maxPartyMessageBytes {
+		httpx.Error(w, http.StatusRequestEntityTooLarge, "message too large")
+		return
+	}
 	uid := h.resolveUserID(r, "")
 	body := map[string]any{}
-	_ = decodeOptionalJSON(r, &body)
+	if err := decodeOptionalJSONLimit(r, &body, maxPartyMessageBytes); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid or oversized message body")
+		return
+	}
 	body["UserId"] = uid
 	body["SentAt"] = time.Now().UTC().Format(time.RFC3339)
 	var msgs []map[string]any

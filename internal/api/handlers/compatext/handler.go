@@ -11,8 +11,10 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/handlers/livetv"
 	syncapi "github.com/ambra-media/ambra/internal/api/handlers/sync"
+	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/dvr"
@@ -152,6 +154,155 @@ func (h *Handler) callerIdentity(r *http.Request) (userID string, isAdmin bool) 
 		}
 	}
 	return "", false
+}
+
+func (h *Handler) resolveUserRepo() *sqlite.UserRepo {
+	h.mu.RLock()
+	ur := h.userRepo
+	h.mu.RUnlock()
+	return ur
+}
+
+func (h *Handler) isNonAdminCaller(r *http.Request) bool {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		return !ac.IsAdmin()
+	}
+	if ur := h.resolveUserRepo(); ur != nil && h.auth.UserIDFromCtx != nil {
+		if uid := guid.Normalize(h.auth.UserIDFromCtx(r.Context())); uid != "" {
+			if u, err := ur.GetUserByID(r.Context(), uid); err == nil && u != nil {
+				return !(u.IsAdmin || u.Policy.IsAdministrator)
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) hasLiveTvAccess(r *http.Request) bool {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.IsAdmin() || ac.IsAPIKey {
+			return true
+		}
+		if ur := h.resolveUserRepo(); ur != nil {
+			if u, err := ur.GetUserByID(r.Context(), guid.Normalize(ac.UserID())); err == nil && u != nil {
+				return u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableLiveTvAccess
+			}
+		}
+		return ac.User != nil && ac.User.Policy.EnableLiveTvAccess
+	}
+	if ur := h.resolveUserRepo(); ur != nil && h.auth.UserIDFromCtx != nil {
+		if uid := guid.Normalize(h.auth.UserIDFromCtx(r.Context())); uid != "" {
+			if u, err := ur.GetUserByID(r.Context(), uid); err == nil && u != nil {
+				return u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableLiveTvAccess
+			}
+			return false
+		}
+	}
+	return true
+}
+
+func (h *Handler) requireLiveTvAccess(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !h.hasLiveTvAccess(r) {
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			httpx.Error(w, http.StatusForbidden, "Live TV access is disabled for this user")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (h *Handler) canDownloadContent(r *http.Request) bool {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.IsAdmin() || ac.IsAPIKey {
+			return true
+		}
+		if ur := h.resolveUserRepo(); ur != nil {
+			if u, err := ur.GetUserByID(r.Context(), guid.Normalize(ac.UserID())); err == nil && u != nil {
+				if u.IsAdmin || u.Policy.IsAdministrator {
+					return true
+				}
+				return u.Policy.EnableContentDownloading
+			}
+		}
+		return ac.User != nil && ac.User.Policy.EnableContentDownloading
+	}
+	if ur := h.resolveUserRepo(); ur != nil && h.auth.UserIDFromCtx != nil {
+		if uid := guid.Normalize(h.auth.UserIDFromCtx(r.Context())); uid != "" {
+			if u, err := ur.GetUserByID(r.Context(), uid); err == nil && u != nil {
+				if u.IsAdmin || u.Policy.IsAdministrator {
+					return true
+				}
+				return u.Policy.EnableContentDownloading
+			}
+			return false
+		}
+	}
+	return true
+}
+
+func (h *Handler) canAccessItemID(r *http.Request, itemID string) bool {
+	normID := guid.Normalize(itemID)
+	if normID == "" {
+		return true
+	}
+	callerID, isAdmin := h.callerIdentity(r)
+	if isAdmin || callerID == "" {
+		return true
+	}
+	h.mu.RLock()
+	libRepo := h.libRepo
+	h.mu.RUnlock()
+	if libRepo == nil {
+		return true
+	}
+	rec, err := libRepo.GetItemRecordByID(r.Context(), normID)
+	if err != nil || rec == nil {
+		return true
+	}
+
+	var policy *dto.UserPolicy
+	if ur := h.resolveUserRepo(); ur != nil {
+		if u, err := ur.GetUserByID(r.Context(), callerID); err == nil && u != nil {
+			if u.IsAdmin || u.Policy.IsAdministrator {
+				return true
+			}
+			p := u.Policy
+			policy = &p
+		}
+	}
+	if policy == nil {
+		if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil {
+			p := ac.User.Policy
+			policy = &p
+		}
+	}
+	if policy == nil {
+		return false
+	}
+
+	if !policy.EnableAllFolders && rec.LibraryID != "" {
+		normLib := guid.Normalize(rec.LibraryID)
+		allowed := false
+		for _, fid := range policy.EnabledFolders {
+			if guid.Normalize(fid) == normLib {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return false
+		}
+	}
+	if policy.MaxParentalRating != nil || len(policy.BlockedTags) > 0 {
+		if blocked, bErr := libRepo.IsItemBlockedByParentalPolicy(r.Context(), rec, policy.MaxParentalRating, policy.BlockedTags); bErr != nil || blocked {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *Handler) hasLiveTvManagement(r *http.Request) bool {

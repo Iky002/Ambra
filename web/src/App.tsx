@@ -103,7 +103,7 @@ function AppRoutes() {
         element={
           auth ? (
             <Navigate to="/" replace />
-          ) : needsSetup ? (
+          ) : needsSetup && !setupStatus?.has_users ? (
             <Navigate to="/setup" replace />
           ) : (
             <LoginPage />

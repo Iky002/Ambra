@@ -16,6 +16,7 @@ import {
   KeyRound,
   Loader2,
   Lock,
+  LogIn,
   Music,
   Plus,
   Server,
@@ -24,7 +25,7 @@ import {
   Tv,
   User,
 } from 'lucide-react'
-import { Navigate, useNavigate } from 'react-router-dom'
+import { Link, Navigate, useNavigate } from 'react-router-dom'
 import { api } from '../api/client'
 import { AmbraLogo } from '../components/AmbraLogo'
 import { LanguageSwitcher } from '../components/LanguageSwitcher'
@@ -373,6 +374,25 @@ export function SetupWizardPage() {
           })}
         </div>
 
+        {/* 已有管理员账号但未登录时，提供登录入口防止向导死锁 */}
+        {setupStatus?.has_users === true && !auth && (
+          <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-200">
+            <div className="min-w-0 flex-1">
+              <p className="font-semibold text-amber-100">检测到服务器已创建管理员账号</p>
+              <p className="mt-0.5 text-[11px] text-amber-200/80">
+                如果此前已创建管理员但尚未完成初始化，请先登录已有管理员账号再继续配置。
+              </p>
+            </div>
+            <Link
+              to="/login?redirect=/setup"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-amber-500 px-3.5 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400"
+            >
+              <LogIn className="h-3.5 w-3.5" />
+              <span>使用已有管理员登录</span>
+            </Link>
+          </div>
+        )}
+
         {/* 主卡片容器 */}
         <div className="rounded-2xl border border-white/10 bg-zinc-950/85 p-6 shadow-2xl backdrop-blur-xl sm:p-8">
           {error && (
@@ -575,23 +595,47 @@ export function SetupWizardPage() {
                   <span>上一步</span>
                 </button>
 
-                <button
-                  type="submit"
-                  disabled={submitting}
-                  className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 px-6 py-2.5 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all hover:from-amber-400 hover:to-orange-400 disabled:opacity-60"
-                >
-                  {submitting ? (
-                    <>
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      <span>正在创建管理员...</span>
-                    </>
-                  ) : (
-                    <>
-                      <span>创建并继续</span>
-                      <ArrowRight className="h-4 w-4" />
-                    </>
+                <div className="flex flex-wrap items-center gap-2">
+                  {setupStatus?.has_users === true && !auth && (
+                    <Link
+                      to="/login?redirect=/setup"
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-amber-400/40 bg-amber-500/15 px-4 py-2.5 text-xs font-semibold text-amber-200 transition-colors hover:bg-amber-500/25"
+                    >
+                      <LogIn className="h-3.5 w-3.5" />
+                      <span>使用已有管理员登录</span>
+                    </Link>
                   )}
-                </button>
+                  {setupStatus?.has_users === true && auth && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setError('')
+                        setStep(3)
+                      }}
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-400/40 bg-emerald-500/15 px-4 py-2.5 text-xs font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/25"
+                    >
+                      <span>已登录，直接下一步</span>
+                      <ArrowRight className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                  <button
+                    type="submit"
+                    disabled={submitting}
+                    className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 px-6 py-2.5 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all hover:from-amber-400 hover:to-orange-400 disabled:opacity-60"
+                  >
+                    {submitting ? (
+                      <>
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        <span>正在创建管理员...</span>
+                      </>
+                    ) : (
+                      <>
+                        <span>创建并继续</span>
+                        <ArrowRight className="h-4 w-4" />
+                      </>
+                    )}
+                  </button>
+                </div>
               </div>
             </form>
           )}

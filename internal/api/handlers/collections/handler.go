@@ -160,14 +160,32 @@ func (h *Handler) filterAccessibleItemIDs(r *http.Request, fallbackUserID string
 }
 
 func (h *Handler) allowedLibrariesForRequest(r *http.Request, fallbackUserID string) []string {
-	if h.userRepo == nil {
-		return nil
-	}
 	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
 		if ac.IsAdmin() {
 			return nil
 		}
-		return h.allowedLibrariesForUser(r.Context(), guid.Normalize(ac.UserID()))
+		if h.userRepo != nil {
+			if allowed := h.allowedLibrariesForUser(r.Context(), guid.Normalize(ac.UserID())); allowed != nil {
+				return allowed
+			}
+			// If userRepo returned nil because user exists and has EnableAllFolders, trust DB.
+			if u, err := h.userRepo.GetUserByID(r.Context(), guid.Normalize(ac.UserID())); err == nil && u != nil {
+				return nil
+			}
+		}
+		if ac.User != nil && !ac.User.Policy.EnableAllFolders {
+			allowed := make([]string, 0, len(ac.User.Policy.EnabledFolders))
+			for _, fid := range ac.User.Policy.EnabledFolders {
+				if norm := guid.Normalize(fid); norm != "" {
+					allowed = append(allowed, norm)
+				}
+			}
+			return allowed
+		}
+		return nil
+	}
+	if h.userRepo == nil {
+		return nil
 	}
 	uid := ""
 	if h.auth.UserIDFromCtx != nil {
@@ -213,7 +231,8 @@ func isLibraryAllowed(libID string, allowed []string) bool {
 }
 
 func (h *Handler) userParentalPolicyForRequest(r *http.Request, fallbackUserID string) (*int, []string) {
-	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil {
+	ac, hasAC := middleware.AuthFromContext(r.Context())
+	if hasAC && ac != nil {
 		if ac.IsAPIKey || ac.IsAdmin() {
 			return nil, nil
 		}
@@ -222,25 +241,24 @@ func (h *Handler) userParentalPolicyForRequest(r *http.Request, fallbackUserID s
 	if h.auth.UserIDFromCtx != nil {
 		uid = guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
 	}
-	if uid == "" {
-		if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil {
-			uid = guid.Normalize(ac.UserID())
-		}
+	if uid == "" && hasAC && ac != nil {
+		uid = guid.Normalize(ac.UserID())
 	}
 	if uid == "" {
 		uid = guid.Normalize(fallbackUserID)
 	}
-	if h.userRepo == nil || uid == "" {
-		return nil, nil
+	if h.userRepo != nil && uid != "" {
+		if u, err := h.userRepo.GetUserByID(r.Context(), uid); err == nil && u != nil {
+			if u.IsAdmin || u.Policy.IsAdministrator {
+				return nil, nil
+			}
+			return u.Policy.MaxParentalRating, u.Policy.BlockedTags
+		}
 	}
-	u, err := h.userRepo.GetUserByID(r.Context(), uid)
-	if err != nil || u == nil {
-		return nil, nil
+	if hasAC && ac != nil && ac.User != nil {
+		return ac.User.Policy.MaxParentalRating, ac.User.Policy.BlockedTags
 	}
-	if u.IsAdmin || u.Policy.IsAdministrator {
-		return nil, nil
-	}
-	return u.Policy.MaxParentalRating, u.Policy.BlockedTags
+	return nil, nil
 }
 
 func (h *Handler) isPlaylistPublic(ctx context.Context, playlistID string) bool {
@@ -356,7 +374,7 @@ func (h *Handler) handleCreateCollection(w http.ResponseWriter, r *http.Request)
 		Ids      []string `json:"Ids"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = httpx.DecodeJSONLimit(r, &body, 0)
 	}
 
 	name := strings.TrimSpace(q.Get("Name"))
@@ -478,7 +496,7 @@ func (h *Handler) handleCreatePlaylist(w http.ResponseWriter, r *http.Request) {
 		Ids       []string `json:"Ids"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = httpx.DecodeJSONLimit(r, &body, 0)
 	}
 
 	name := strings.TrimSpace(q.Get("Name"))
@@ -689,6 +707,13 @@ func (h *Handler) handleGetContainerItems(expectedType string, checkPlaylistAcce
 					if blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), itemRec, maxRating, blockedTags); bErr != nil || blocked {
 						continue
 					}
+					if itemRec.SeriesID != "" && itemRec.OfficialRating == "" && maxRating != nil {
+						if seriesRec, sErr := h.repo.GetItemRecordByID(r.Context(), itemRec.SeriesID); sErr == nil && seriesRec != nil {
+							if blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), seriesRec, maxRating, blockedTags); bErr != nil || blocked {
+								continue
+							}
+						}
+					}
 				}
 				filtered = append(filtered, it)
 			}
@@ -702,6 +727,17 @@ func (h *Handler) handleGetContainerItems(expectedType string, checkPlaylistAcce
 				filtered = filtered[:limit]
 			}
 			items = filtered
+		}
+		if h.isNonAdminCaller(r) {
+			for i := range items {
+				items[i].Path = ""
+				for j := range items[i].MediaSources {
+					items[i].MediaSources[j].Path = ""
+					for k := range items[i].MediaSources[j].MediaStreams {
+						items[i].MediaSources[j].MediaStreams[k].Path = ""
+					}
+				}
+			}
 		}
 		httpx.JSON(w, http.StatusOK, dto.QueryResult[sqlite.PlaylistItemDto]{
 			Items:            items,
@@ -718,7 +754,7 @@ func (h *Handler) addItemsToContainer(w http.ResponseWriter, r *http.Request, de
 		var body struct {
 			Ids []string `json:"Ids"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+		if err := httpx.DecodeJSONLimit(r, &body, 0); err == nil {
 			ids = body.Ids
 		}
 	}
@@ -746,7 +782,7 @@ func (h *Handler) handleRemoveContainerItems(w http.ResponseWriter, r *http.Requ
 			EntryIds []string `json:"EntryIds"`
 			Ids      []string `json:"Ids"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+		if err := httpx.DecodeJSONLimit(r, &body, 0); err == nil {
 			if len(body.EntryIds) > 0 {
 				ids = body.EntryIds
 			} else if len(body.Ids) > 0 {

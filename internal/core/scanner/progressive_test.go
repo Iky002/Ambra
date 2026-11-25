@@ -541,9 +541,13 @@ func TestScanPathAndWatcherEndToEnd(t *testing.T) {
 		t.Fatalf("ScanPath subdir expected 1 added, got st=%+v err=%v", st, err)
 	}
 
-	// ScanPath with outside path falls back to filepath.Dir(target)
+	// ScanPath with outside path must return empty root and error
 	outside := filepath.Join(tmp, "outside.mkv")
-	if got := findContainingRoot(lib.Paths, outside); got != tmp {
-		t.Fatalf("expected fallback root %q, got %q", tmp, got)
+	if got := findContainingRoot(lib.Paths, outside); got != "" {
+		t.Fatalf("expected empty root for outside path, got %q", got)
+	}
+	_ = os.WriteFile(outside, []byte("out"), 0o644)
+	if _, err := sc.ScanPath(ctx, lib.ID, outside); err == nil {
+		t.Fatalf("expected error for ScanPath outside library roots")
 	}
 }

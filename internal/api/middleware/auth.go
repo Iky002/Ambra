@@ -8,6 +8,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/core/auth"
 	"github.com/ambra-media/ambra/internal/core/session"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -20,6 +21,7 @@ type AuthContext struct {
 	IsAPIKey   bool
 	APIKeyName string
 	Client     auth.ClientInfo
+	resolved   bool
 }
 
 func (ac *AuthContext) IsAdmin() bool {
@@ -78,11 +80,15 @@ func (a *Auth) ParseAuth(next http.Handler) http.Handler {
 func (a *Auth) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ac, ok := AuthFromContext(r.Context())
-		if !ok || (ac.User == nil && !ac.IsAPIKey) {
+		if !ok || (!ac.resolved && ac.User == nil && !ac.IsAPIKey) {
 			ac = a.resolve(r)
 		}
 		if ac == nil || (ac.User == nil && !ac.IsAPIKey) {
 			httpx.Error(w, http.StatusUnauthorized, "Authentication required")
+			return
+		}
+		if !ac.IsAPIKey && ac.User != nil && !ac.User.Policy.EnableRemoteAccess && !netutil.IsLocalOrLANRequest(r) {
+			httpx.Error(w, http.StatusForbidden, "Remote access is disabled for this user")
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(WithAuthContext(r.Context(), ac)))
@@ -104,8 +110,9 @@ func (a *Auth) RequireAdmin(next http.Handler) http.Handler {
 func (a *Auth) resolve(r *http.Request) *AuthContext {
 	client := ExtractClientInfo(r)
 	ac := &AuthContext{
-		Token:  client.Token,
-		Client: client,
+		Token:    client.Token,
+		Client:   client,
+		resolved: true,
 	}
 	if client.Token == "" || a.svc == nil {
 		return ac
@@ -192,6 +199,13 @@ func ExtractClientInfo(r *http.Request) auth.ClientInfo {
 			if v := strings.TrimSpace(q.Get("deviceId")); v != "" {
 				info.DeviceID = v
 			}
+		}
+	}
+
+	if info.DeviceID == "" && r.URL != nil && r.URL.RawQuery != "" {
+		q := httpx.ParseQuery(r)
+		if v := strings.TrimSpace(q.Get("deviceId")); v != "" {
+			info.DeviceID = v
 		}
 	}
 

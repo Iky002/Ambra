@@ -72,14 +72,26 @@ func setupSystemHandler(t *testing.T) (chi.Router, *Handler, *sqlite.Store, *sql
 func TestPublicSystemRoutes(t *testing.T) {
 	r, _, _, _, _, _ := setupSystemHandler(t)
 
-	// /System/Info/Public with X-Forwarded-Proto and empty Host
+	// /System/Info/Public with X-Forwarded-Proto from trusted proxy (loopback) uses https
 	req := httptest.NewRequest(http.MethodGet, "/System/Info/Public", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
 	req.Host = ""
 	req.Header.Set("X-Forwarded-Proto", "https")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "https://localhost:8096") {
-		t.Fatalf("PublicSystemInfo failed: %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("PublicSystemInfo (trusted proxy) failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// /System/Info/Public ignores spoofed X-Forwarded-Proto from untrusted public IP
+	reqUntrusted := httptest.NewRequest(http.MethodGet, "/System/Info/Public", nil)
+	reqUntrusted.RemoteAddr = "198.51.100.77:54321"
+	reqUntrusted.Host = ""
+	reqUntrusted.Header.Set("X-Forwarded-Proto", "https")
+	recUntrusted := httptest.NewRecorder()
+	r.ServeHTTP(recUntrusted, reqUntrusted)
+	if recUntrusted.Code != http.StatusOK || !strings.Contains(recUntrusted.Body.String(), "http://localhost:8096") {
+		t.Fatalf("PublicSystemInfo (untrusted proxy) must ignore XFP: %d %s", recUntrusted.Code, recUntrusted.Body.String())
 	}
 
 	// /System/Ping GET, HEAD, POST
@@ -404,13 +416,13 @@ func TestSystemConfigurationPersistenceAndExtraFields(t *testing.T) {
 		t.Fatalf("POST config expected 204, got %d %s", rec.Code, rec.Body.String())
 	}
 
-	// Verify persisted on GET
+	// Verify persisted on GET for admin (includes extra config fields)
 	req = httptest.NewRequest(http.MethodGet, "/System/Configuration", nil)
-	req.Header.Set("X-Emby-Token", viewerTok)
+	req.Header.Set("X-Emby-Token", adminTok)
 	rec = httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("GET updated config: %d", rec.Code)
+		t.Fatalf("GET updated config (admin): %d", rec.Code)
 	}
 	var got map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
@@ -420,7 +432,29 @@ func TestSystemConfigurationPersistenceAndExtraFields(t *testing.T) {
 		t.Fatalf("localization not persisted: %#v", got)
 	}
 	if got["EnableRemoteAccess"] != true || got["MaxResumePct"] != float64(90) {
-		t.Fatalf("extra config fields not persisted: %#v", got)
+		t.Fatalf("extra config fields not persisted for admin: %#v", got)
+	}
+
+	// Verify non-admin viewer only gets whitelisted basic fields (no extra keys)
+	req = httptest.NewRequest(http.MethodGet, "/System/Configuration", nil)
+	req.Header.Set("X-Emby-Token", viewerTok)
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET updated config (viewer): %d", rec.Code)
+	}
+	var viewerGot map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &viewerGot); err != nil {
+		t.Fatal(err)
+	}
+	if viewerGot["PreferredMetadataLanguage"] != "en" || viewerGot["MetadataCountryCode"] != "US" {
+		t.Fatalf("viewer missing whitelisted localization fields: %#v", viewerGot)
+	}
+	if _, hasExtra := viewerGot["EnableRemoteAccess"]; hasExtra {
+		t.Fatalf("viewer should not see unknown extra config key EnableRemoteAccess: %#v", viewerGot)
+	}
+	if _, hasExtra := viewerGot["MaxResumePct"]; hasExtra {
+		t.Fatalf("viewer should not see unknown extra config key MaxResumePct: %#v", viewerGot)
 	}
 }
 

@@ -56,7 +56,7 @@ func TestDefaultDisabledManifestAndSkip(t *testing.T) {
 	// Unsupported ItemType -> returns nil, nil
 	_ = p.Configure(map[string]any{"api_key": "k"})
 	res, err = p.FetchMetadata(context.Background(), plugins.MediaQuery{
-		ItemType: "Season",
+		ItemType: "MusicVideo",
 		Title:    "Breaking Bad",
 	})
 	if err != nil || res != nil {
@@ -126,6 +126,7 @@ func TestConfigureVariantsAndTokenInvalidation(t *testing.T) {
 	defer srv.Close()
 
 	p := New()
+	p.SetHTTPClient(srv.Client())
 	if err := p.Configure(map[string]any{
 		"Enabled":  true,
 		"ApiKey":   "key1",
@@ -195,6 +196,7 @@ func TestConcurrentTokenCachingAndConfigureRace(t *testing.T) {
 	defer srv.Close()
 
 	p := New()
+	p.SetHTTPClient(srv.Client())
 	_ = p.Configure(map[string]any{
 		"enabled":  true,
 		"api_key":  "race-key",
@@ -289,6 +291,7 @@ func TestFetchSeriesBySearchAndByID(t *testing.T) {
 	defer srv.Close()
 
 	p := New()
+	p.SetHTTPClient(srv.Client())
 	_ = p.Configure(map[string]any{
 		"enabled":  true,
 		"api_key":  "test-key",
@@ -385,6 +388,7 @@ func TestFetchEpisode(t *testing.T) {
 	defer srv.Close()
 
 	p := New()
+	p.SetHTTPClient(srv.Client())
 	_ = p.Configure(map[string]any{
 		"enabled":  true,
 		"api_key":  "test-key",
@@ -494,6 +498,7 @@ func TestFetchMovieWithOriginalTitleFallback(t *testing.T) {
 	defer srv.Close()
 
 	p := New()
+	p.SetHTTPClient(srv.Client())
 	_ = p.Configure(map[string]any{
 		"enabled":  true,
 		"api_key":  "test-key",
@@ -538,6 +543,7 @@ func TestErrorHandlingAndUnauthorizedRetry(t *testing.T) {
 		defer srv.Close()
 
 		p := New()
+		p.SetHTTPClient(srv.Client())
 		_ = p.Configure(map[string]any{"enabled": true, "api_key": "bad", "base_url": srv.URL})
 		if _, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
 			ItemType:    "Series",
@@ -554,6 +560,7 @@ func TestErrorHandlingAndUnauthorizedRetry(t *testing.T) {
 		defer srv.Close()
 
 		p := New()
+		p.SetHTTPClient(srv.Client())
 		_ = p.Configure(map[string]any{"enabled": true, "api_key": "k", "base_url": srv.URL})
 		if _, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
 			ItemType:    "Movie",
@@ -574,6 +581,7 @@ func TestErrorHandlingAndUnauthorizedRetry(t *testing.T) {
 		defer srv.Close()
 
 		p := New()
+		p.SetHTTPClient(srv.Client())
 		_ = p.Configure(map[string]any{"enabled": true, "api_key": "k", "base_url": srv.URL})
 		if _, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
 			ItemType:    "Series",
@@ -618,6 +626,7 @@ func TestErrorHandlingAndUnauthorizedRetry(t *testing.T) {
 		defer srv.Close()
 
 		p := New()
+		p.SetHTTPClient(srv.Client())
 		_ = p.Configure(map[string]any{"enabled": true, "api_key": "k", "base_url": srv.URL})
 		res, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
 			ItemType:    "Series",
@@ -630,4 +639,102 @@ func TestErrorHandlingAndUnauthorizedRetry(t *testing.T) {
 			t.Fatalf("expected 2 login calls after 401 refresh, got %d", loginCalls.Load())
 		}
 	})
+}
+
+func TestFetchSeasonAndPaginatedEpisode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login":
+			_, _ = w.Write([]byte(`{"status":"success","data":{"token":"tok-s"}}`))
+		case "/series/81189/extended":
+			_, _ = w.Write([]byte(`{
+				"status": "success",
+				"data": {
+					"id": 81189,
+					"name": "Breaking Bad",
+					"seasons": [
+						{"id": 30272, "number": 1, "name": "Season 1", "image": "https://img.tvdb/s1.jpg", "type": {"id": 1, "type": "official"}},
+						{"id": 30273, "number": 2, "name": "Season 2", "image": "https://img.tvdb/s2.jpg", "type": {"id": 1, "type": "official"}}
+					]
+				}
+			}`))
+		case "/seasons/30272/extended":
+			_, _ = w.Write([]byte(`{
+				"status": "success",
+				"data": {
+					"id": 30272,
+					"number": 1,
+					"name": "Season 1",
+					"image": "https://img.tvdb/s1-ext.jpg",
+					"year": "2008"
+				}
+			}`))
+		case "/seasons/30272/translations/zho":
+			_, _ = w.Write([]byte(`{"status":"success","data":{"name":"第一季","overview":"第一季剧情简介"}}`))
+		case "/series/81189/episodes/default":
+			page := r.URL.Query().Get("page")
+			if page == "" || page == "0" {
+				_, _ = w.Write([]byte(`{
+					"status": "success",
+					"data": {
+						"episodes": [
+							{"id": 1001, "name": "Ep1", "seasonNumber": 1, "number": 1}
+						]
+					},
+					"links": {"next": "https://api4.thetvdb.com/v4/series/81189/episodes/default?page=1"}
+				}`))
+				return
+			}
+			if page == "1" {
+				_, _ = w.Write([]byte(`{
+					"status": "success",
+					"data": {
+						"episodes": [
+							{"id": 1055, "name": "Page 2 Episode", "overview": "Found on page 1", "aired": "2008-03-09", "seasonNumber": 1, "number": 55}
+						]
+					},
+					"links": {"next": ""}
+				}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"status":"success","data":{"episodes":[]}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	p := New()
+	p.SetHTTPClient(srv.Client())
+	_ = p.Configure(map[string]any{
+		"enabled":  true,
+		"api_key":  "k",
+		"language": "zh-CN",
+		"base_url": srv.URL,
+	})
+
+	season, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
+		ItemType:     "Season",
+		SeasonNumber: 1,
+		ProviderIDs:  map[string]string{"Tvdb": "81189"},
+	})
+	if err != nil || season == nil {
+		t.Fatalf("FetchMetadata Season failed: res=%v err=%v", season, err)
+	}
+	if season.Name != "第一季" || season.Overview != "第一季剧情简介" || season.PosterURL != "https://img.tvdb/s1-ext.jpg" || season.Year != 2008 {
+		t.Fatalf("unexpected season result: %+v", season)
+	}
+
+	ep, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
+		ItemType:      "Episode",
+		SeasonNumber:  1,
+		EpisodeNumber: 55,
+		ProviderIDs:   map[string]string{"Tvdb": "81189"},
+	})
+	if err != nil || ep == nil {
+		t.Fatalf("FetchMetadata paginated episode failed: ep=%v err=%v", ep, err)
+	}
+	if ep.Name != "Page 2 Episode" || ep.ProviderIDs["Tvdb"] != "1055" {
+		t.Fatalf("unexpected paginated episode: %+v", ep)
+	}
 }

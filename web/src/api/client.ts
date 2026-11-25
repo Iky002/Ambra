@@ -1,4 +1,4 @@
-import { isDemoMode } from '../demo/demoMode'
+import { DEMO_AUTH_STORAGE_KEY, isDemoMode } from '../demo/demoMode'
 import { getActiveLocale } from '../i18n/I18nContext'
 import {
   demoFetch,
@@ -64,6 +64,23 @@ import type {
 const STORAGE_KEY = 'ambra_web_auth_v1'
 const DEVICE_ID_KEY = 'ambra_web_device_id'
 
+function getAuthStorageKey(): string {
+  return isDemoMode() ? DEMO_AUTH_STORAGE_KEY : STORAGE_KEY
+}
+
+export function isSameOriginUrl(rawUrl: string): boolean {
+  if (!rawUrl) return false
+  if (typeof window === 'undefined' || !window.location?.origin) {
+    return !/^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(rawUrl) && !rawUrl.startsWith('//')
+  }
+  try {
+    const parsed = new URL(rawUrl, window.location.origin)
+    return parsed.origin === window.location.origin
+  } catch {
+    return false
+  }
+}
+
 export function getDeviceId(): string {
   let id = localStorage.getItem(DEVICE_ID_KEY)
   if (!id) {
@@ -75,7 +92,7 @@ export function getDeviceId(): string {
 
 export function getStoredAuth(): AuthSession | null {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
+    const raw = localStorage.getItem(getAuthStorageKey())
     if (!raw) return null
     const parsed = JSON.parse(raw) as AuthSession
     if (!parsed.accessToken || !parsed.userId) return null
@@ -86,11 +103,11 @@ export function getStoredAuth(): AuthSession | null {
 }
 
 export function saveAuth(auth: AuthSession): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(auth))
+  localStorage.setItem(getAuthStorageKey(), JSON.stringify(auth))
 }
 
 export function clearAuth(): void {
-  localStorage.removeItem(STORAGE_KEY)
+  localStorage.removeItem(getAuthStorageKey())
 }
 
 export function buildEmbyAuthHeader(token?: string): string {
@@ -180,12 +197,17 @@ export function resolveApiUrl(urlOrPath: string): string {
   const auth = getStoredAuth()
   const token = auth?.accessToken
   const hasProtocol = /^https?:\/\//i.test(urlOrPath)
-  const base = hasProtocol
-    ? urlOrPath
-    : urlOrPath.startsWith('/')
+  const isProtocolRelative = urlOrPath.startsWith('//')
+  const base =
+    hasProtocol || isProtocolRelative
       ? urlOrPath
-      : `/${urlOrPath}`
+      : urlOrPath.startsWith('/')
+        ? urlOrPath
+        : `/${urlOrPath}`
 
+  if (!isSameOriginUrl(base)) {
+    return base
+  }
   if (!token || base.includes('api_key=') || base.includes('X-Emby-Token=')) {
     return base
   }
@@ -195,21 +217,29 @@ export function resolveApiUrl(urlOrPath: string): string {
 
 export function getImageUrl(
   itemId: string,
-  type: 'Primary' | 'Backdrop' | 'Thumb' | 'Logo' | 'Banner' = 'Primary',
+  type: 'Primary' | 'Backdrop' | 'Thumb' | 'Logo' | 'Banner' | (string & {}) = 'Primary',
   options?: { maxWidth?: number; maxHeight?: number; tag?: string; quality?: number },
 ): string {
   if (!itemId) return ''
   if (isDemoMode()) {
-    return getDemoImageUrl(itemId, type)
+    const demoType: 'Primary' | 'Backdrop' | 'Thumb' | 'Logo' | 'Banner' =
+      type === 'Backdrop'
+        ? 'Backdrop'
+        : type === 'Thumb'
+          ? 'Thumb'
+          : type === 'Logo'
+            ? 'Logo'
+            : type === 'Banner'
+              ? 'Banner'
+              : 'Primary'
+    return getDemoImageUrl(itemId, demoType)
   }
   const params = new URLSearchParams()
   if (options?.maxWidth) params.set('maxWidth', String(options.maxWidth))
   if (options?.maxHeight) params.set('maxHeight', String(options.maxHeight))
   if (options?.tag) params.set('tag', options.tag)
   params.set('quality', String(options?.quality ?? 88))
-  const auth = getStoredAuth()
-  if (auth?.accessToken) params.set('api_key', auth.accessToken)
-  return `/emby/Items/${encodeURIComponent(itemId)}/Images/${type}?${params.toString()}`
+  return `/emby/Items/${encodeURIComponent(itemId)}/Images/${encodeURIComponent(type)}?${params.toString()}`
 }
 
 export function getFallbackImageUrl(
@@ -1135,15 +1165,23 @@ export const api = {
 
   getSetupStatus: () => embyFetch<SetupStatus>('/api/setup/status', {}, false),
 
-  setupAdmin: (req: SetupAdminRequest) =>
-    embyFetch<AuthenticationResult>(
+  setupAdmin: (req: SetupAdminRequest) => {
+    const auth = getStoredAuth()
+    const headers: Record<string, string> = {}
+    if (auth?.accessToken) {
+      headers['X-Emby-Authorization'] = buildEmbyAuthHeader(auth.accessToken)
+      headers['X-Emby-Token'] = auth.accessToken
+    }
+    return embyFetch<AuthenticationResult>(
       '/api/setup/admin',
       {
         method: 'POST',
+        headers,
         body: JSON.stringify(req),
       },
       false,
-    ),
+    )
+  },
 
   completeSetup: (req: SetupCompleteRequest) =>
     embyFetch<{ completed: boolean }>(

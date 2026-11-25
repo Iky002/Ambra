@@ -11,7 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -32,7 +34,12 @@ import (
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
-const stateConfigKey = "livetv:state"
+const (
+	stateConfigKey      = "livetv:state"
+	maxM3UPlaylistBytes = 20 << 20
+	maxTimerDuration    = 24 * time.Hour
+	maxPaddingSeconds   = 3600
+)
 
 // AuthFuncs decouples route registration from the concrete middleware package.
 type AuthFuncs struct {
@@ -249,8 +256,7 @@ func (h *Handler) SetChannelDisabled(ctx context.Context, channelID string, disa
 	for i := range h.state.Channels {
 		if h.state.Channels[i].Id == channelID {
 			h.state.Channels[i].Disabled = disabled
-			h.saveStateLocked(ctx)
-			return nil
+			return h.saveStateLocked(ctx)
 		}
 	}
 	return os.ErrNotExist
@@ -263,8 +269,7 @@ func (h *Handler) SetChannelSortIndex(ctx context.Context, channelID string, sor
 	for i := range h.state.Channels {
 		if h.state.Channels[i].Id == channelID {
 			h.state.Channels[i].SortIndex = sortIndex
-			h.saveStateLocked(ctx)
-			return nil
+			return h.saveStateLocked(ctx)
 		}
 	}
 	return os.ErrNotExist
@@ -282,30 +287,52 @@ func (h *Handler) DeleteSeriesTimerByID(ctx context.Context, id string) bool {
 
 // HasLiveTvManagement reports whether the request caller has admin or Live TV management privileges.
 func (h *Handler) HasLiveTvManagement(ctx context.Context, r *http.Request) bool {
+	if r != nil && ctx == nil {
+		ctx = r.Context()
+	}
+	var ac *middleware.AuthContext
 	if r != nil {
-		if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
-			return ac.IsAdmin() || (ac.User != nil && ac.User.Policy.EnableLiveTvManagement)
-		}
-		if ctx == nil {
-			ctx = r.Context()
+		if a, ok := middleware.AuthFromContext(r.Context()); ok && a != nil && (a.User != nil || a.IsAPIKey) {
+			ac = a
 		}
 	}
-	if ctx != nil {
-		if ac, ok := middleware.AuthFromContext(ctx); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
-			return ac.IsAdmin() || (ac.User != nil && ac.User.Policy.EnableLiveTvManagement)
+	if ac == nil && ctx != nil {
+		if a, ok := middleware.AuthFromContext(ctx); ok && a != nil && (a.User != nil || a.IsAPIKey) {
+			ac = a
 		}
-		if h.auth.UserIDFromCtx != nil {
-			if uid := guid.Normalize(h.auth.UserIDFromCtx(ctx)); uid != "" {
-				if ur := h.getUserRepo(); ur != nil {
-					if u, err := ur.GetUserByID(ctx, uid); err == nil && u != nil {
-						return u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableLiveTvManagement
-					}
-				}
+	}
+	ur := h.getUserRepo()
+	if ac != nil {
+		if ac.IsAdmin() {
+			return true
+		}
+		if ac.User == nil {
+			return false
+		}
+		if ur != nil && ac.User.ID != "" {
+			u, err := ur.GetUserByID(ctx, guid.Normalize(ac.User.ID))
+			if err != nil || u == nil || u.IsDisabled {
 				return false
 			}
+			return u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableLiveTvManagement
 		}
+		return ac.User.Policy.EnableLiveTvManagement
 	}
-	return true
+	if ctx != nil && h.auth.UserIDFromCtx != nil {
+		uid := guid.Normalize(h.auth.UserIDFromCtx(ctx))
+		if uid == "" {
+			return false
+		}
+		if ur == nil {
+			return false
+		}
+		u, err := ur.GetUserByID(ctx, uid)
+		if err != nil || u == nil || u.IsDisabled {
+			return false
+		}
+		return u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableLiveTvManagement
+	}
+	return false
 }
 
 // DueRecordingJobs scans pending ("New") timers whose padded window includes now,
@@ -604,15 +631,39 @@ func (h *Handler) requireLiveTvAccess(wrapAuth func(http.Handler) http.Handler) 
 func (h *Handler) requireLiveTvManagement(wrapAuth func(http.Handler) http.Handler) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return wrapAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
-				if !ac.IsAdmin() && (ac.User == nil || !ac.User.Policy.EnableLiveTvManagement) {
-					httpx.Error(w, http.StatusForbidden, "Live TV management privileges required")
+			if h.auth.RequireAuth == nil && h.auth.UserIDFromCtx == nil && h.getUserRepo() == nil {
+				if ac, ok := middleware.AuthFromContext(r.Context()); !ok || ac == nil || (ac.User == nil && !ac.IsAPIKey) {
+					next.ServeHTTP(w, r)
 					return
 				}
+			}
+			if !h.HasLiveTvManagement(r.Context(), r) {
+				httpx.Error(w, http.StatusForbidden, "Live TV management privileges required")
+				return
 			}
 			next.ServeHTTP(w, r)
 		}))
 	}
+}
+
+func (h *Handler) callerAuthInfo(r *http.Request) (userID string, isAdmin bool, hasAuth bool) {
+	if r == nil {
+		return "", false, false
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		return guid.Normalize(ac.UserID()), ac.IsAdmin(), true
+	}
+	if h.auth.UserIDFromCtx != nil {
+		if uid := guid.Normalize(h.auth.UserIDFromCtx(r.Context())); uid != "" {
+			if ur := h.getUserRepo(); ur != nil {
+				if u, err := ur.GetUserByID(r.Context(), uid); err == nil && u != nil {
+					return uid, u.IsAdmin || u.Policy.IsAdministrator, true
+				}
+			}
+			return uid, false, true
+		}
+	}
+	return "", false, false
 }
 
 func (h *Handler) serverID() string {
@@ -635,9 +686,16 @@ func (h *Handler) handleInfo(w http.ResponseWriter, r *http.Request) {
 	enabled := len(h.state.TunerHosts) > 0 || len(h.state.Channels) > 0
 	h.mu.RUnlock()
 
+	callerID, isAdmin, hasAuth := h.callerAuthInfo(r)
 	enabledUsers := make([]string, 0)
 	if userRepo := h.getUserRepo(); userRepo != nil {
-		if users, err := userRepo.ListUsers(r.Context()); err == nil {
+		if hasAuth && !isAdmin {
+			if callerID != "" {
+				if u, err := userRepo.GetUserByID(r.Context(), callerID); err == nil && u != nil && !u.IsDisabled && (u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableLiveTvAccess) {
+					enabledUsers = append(enabledUsers, u.ID)
+				}
+			}
+		} else if users, err := userRepo.ListUsers(r.Context()); err == nil {
 			for _, u := range users {
 				if u != nil && !u.IsDisabled && (u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableLiveTvAccess) {
 					enabledUsers = append(enabledUsers, u.ID)
@@ -666,6 +724,9 @@ func (h *Handler) handleListChannels(w http.ResponseWriter, r *http.Request) {
 	group := strings.ToLower(strings.TrimSpace(q.Get("GroupTitle")))
 	chType := strings.ToLower(strings.TrimSpace(q.Get("Type")))
 
+	_, isAdmin, hasAuth := h.callerAuthInfo(r)
+	hideStreamURL := hasAuth && !isAdmin
+
 	h.mu.RLock()
 	filtered := make([]ChannelInfo, 0, len(h.state.Channels))
 	for _, ch := range h.state.Channels {
@@ -678,9 +739,16 @@ func (h *Handler) handleListChannels(w http.ResponseWriter, r *http.Request) {
 		if chType != "" && strings.ToLower(ch.ChannelType) != chType {
 			continue
 		}
+		if hideStreamURL {
+			ch.StreamUrl = ""
+		}
 		filtered = append(filtered, ch)
 	}
 	h.mu.RUnlock()
+
+	sort.SliceStable(filtered, func(i, j int) bool {
+		return filtered[i].SortIndex < filtered[j].SortIndex
+	})
 
 	page, total := paginate(filtered, q.Int("StartIndex", 0), q.Int("Limit", 0))
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[ChannelInfo]{
@@ -695,6 +763,9 @@ func (h *Handler) handleGetChannel(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		httpx.Error(w, http.StatusNotFound, "channel not found")
 		return
+	}
+	if _, isAdmin, hasAuth := h.callerAuthInfo(r); hasAuth && !isAdmin {
+		ch.StreamUrl = ""
 	}
 	httpx.JSON(w, http.StatusOK, ch)
 }
@@ -731,6 +802,10 @@ func (h *Handler) handleStreamChannel(w http.ResponseWriter, r *http.Request) {
 	ch, ok := h.GetChannelByID(id)
 	if !ok {
 		httpx.Error(w, http.StatusNotFound, "channel not found")
+		return
+	}
+	if ch.Disabled {
+		httpx.Error(w, http.StatusForbidden, "channel is disabled")
 		return
 	}
 	streamURL := ch.StreamUrl
@@ -831,7 +906,11 @@ func (h *Handler) proxyChannelStream(w http.ResponseWriter, r *http.Request, cha
 		if r != nil && strings.Contains(strings.ToLower(r.URL.Path), "/livestreamfiles/") {
 			proxyBase = "../../Channels/" + url.PathEscape(channelID) + "/Stream"
 		}
-		rewritten := h.rewriteHLSPlaylist(string(raw), baseURL, channelID, proxyBase, token)
+		allowLoopback := isLoopbackURL(trimmed)
+		if ch, ok := h.GetChannelByID(channelID); ok && strings.TrimSpace(ch.StreamUrl) != "" {
+			allowLoopback = isLoopbackURL(ch.StreamUrl)
+		}
+		rewritten := h.rewriteHLSPlaylistWithPolicy(string(raw), baseURL, channelID, proxyBase, token, allowLoopback)
 		if ct == "" {
 			ct = "application/vnd.apple.mpegurl"
 		}
@@ -868,7 +947,33 @@ func isHLSPlaylistResponse(contentType string, u *url.URL) bool {
 	return false
 }
 
+func isLoopbackURL(rawURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(u.Hostname()), "."))
+	if host == "" {
+		return false
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return addr.Unmap().IsLoopback()
+	}
+	return false
+}
+
 func (h *Handler) rewriteHLSPlaylist(playlist string, baseURL *url.URL, channelID, proxyBase, token string) string {
+	allowLoopback := false
+	if baseURL != nil {
+		allowLoopback = isLoopbackURL(baseURL.String())
+	}
+	return h.rewriteHLSPlaylistWithPolicy(playlist, baseURL, channelID, proxyBase, token, allowLoopback)
+}
+
+func (h *Handler) rewriteHLSPlaylistWithPolicy(playlist string, baseURL *url.URL, channelID, proxyBase, token string, allowLoopback bool) string {
 	if proxyBase == "" {
 		proxyBase = "Stream"
 	}
@@ -887,6 +992,12 @@ func (h *Handler) rewriteHLSPlaylist(playlist string, baseURL *url.URL, channelI
 			return rawURI
 		}
 		resolvedStr := resolved.String()
+		if err := netutil.ValidateRemoteURL(resolvedStr, true); err != nil {
+			return rawURI
+		}
+		if !allowLoopback && isLoopbackURL(resolvedStr) {
+			return rawURI
+		}
 		sig := h.signProxyTarget(channelID, resolvedStr)
 		proxied := proxyBase + "?target=" + url.QueryEscape(resolvedStr) + "&sig=" + sig
 		if token != "" {
@@ -1097,7 +1208,7 @@ func (h *Handler) handleQueryProgramsPost(w http.ResponseWriter, r *http.Request
 		StartIndex   int            `json:"StartIndex"`
 		Limit        int            `json:"Limit"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &body, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid program query payload")
 		return
 	}
@@ -1394,9 +1505,25 @@ func (h *Handler) handleListTimers(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func validateTimerBounds(start, end time.Time, prePad, postPad int) error {
+	if prePad < 0 || prePad > maxPaddingSeconds {
+		return fmt.Errorf("PrePaddingSeconds must be between 0 and %d", maxPaddingSeconds)
+	}
+	if postPad < 0 || postPad > maxPaddingSeconds {
+		return fmt.Errorf("PostPaddingSeconds must be between 0 and %d", maxPaddingSeconds)
+	}
+	if !end.After(start) {
+		return errors.New("EndDate must be after StartDate")
+	}
+	if end.Sub(start) > maxTimerDuration {
+		return errors.New("recording duration cannot exceed 24 hours")
+	}
+	return nil
+}
+
 func (h *Handler) handleCreateTimer(w http.ResponseWriter, r *http.Request) {
 	var t TimerInfo
-	if err := json.NewDecoder(r.Body).Decode(&t); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &t, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid timer payload")
 		return
 	}
@@ -1413,11 +1540,19 @@ func (h *Handler) handleCreateTimer(w http.ResponseWriter, r *http.Request) {
 	if t.EndDate.IsZero() {
 		t.EndDate = t.StartDate.Add(time.Hour)
 	}
+	if err := validateTimerBounds(t.StartDate, t.EndDate, t.PrePaddingSeconds, t.PostPaddingSeconds); err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	h.mu.Lock()
 	h.state.Timers = append(h.state.Timers, t)
-	h.saveStateLocked(r.Context())
+	err := h.saveStateLocked(r.Context())
 	h.mu.Unlock()
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to persist timer")
+		return
+	}
 	httpx.JSON(w, http.StatusOK, t)
 }
 
@@ -1437,7 +1572,7 @@ func (h *Handler) handleGetTimer(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleUpdateTimer(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
 	var upd TimerInfo
-	if err := json.NewDecoder(r.Body).Decode(&upd); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &upd, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid timer payload")
 		return
 	}
@@ -1449,9 +1584,24 @@ func (h *Handler) handleUpdateTimer(w http.ResponseWriter, r *http.Request) {
 			if upd.Status == "" {
 				upd.Status = existing.Status
 			}
+			if upd.StartDate.IsZero() {
+				upd.StartDate = existing.StartDate
+			}
+			if upd.EndDate.IsZero() {
+				upd.EndDate = existing.EndDate
+			}
+			if err := validateTimerBounds(upd.StartDate, upd.EndDate, upd.PrePaddingSeconds, upd.PostPaddingSeconds); err != nil {
+				h.mu.Unlock()
+				httpx.Error(w, http.StatusBadRequest, err.Error())
+				return
+			}
 			h.state.Timers[i] = upd
-			h.saveStateLocked(r.Context())
+			err := h.saveStateLocked(r.Context())
 			h.mu.Unlock()
+			if err != nil {
+				httpx.Error(w, http.StatusInternalServerError, "failed to persist timer")
+				return
+			}
 			httpx.JSON(w, http.StatusOK, upd)
 			return
 		}
@@ -1533,8 +1683,12 @@ func (h *Handler) handleListSeriesTimers(w http.ResponseWriter, r *http.Request)
 
 func (h *Handler) handleCreateSeriesTimer(w http.ResponseWriter, r *http.Request) {
 	var st SeriesTimerInfo
-	if err := json.NewDecoder(r.Body).Decode(&st); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &st, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid series timer payload")
+		return
+	}
+	if st.PrePaddingSeconds < 0 || st.PrePaddingSeconds > maxPaddingSeconds || st.PostPaddingSeconds < 0 || st.PostPaddingSeconds > maxPaddingSeconds {
+		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("padding seconds must be between 0 and %d", maxPaddingSeconds))
 		return
 	}
 	if st.Id == "" {
@@ -1548,8 +1702,12 @@ func (h *Handler) handleCreateSeriesTimer(w http.ResponseWriter, r *http.Request
 	h.mu.Lock()
 	h.state.SeriesTimers = append(h.state.SeriesTimers, st)
 	h.scheduleTimersForSeriesLocked(st)
-	h.saveStateLocked(r.Context())
+	err := h.saveStateLocked(r.Context())
 	h.mu.Unlock()
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to persist series timer")
+		return
+	}
 	httpx.JSON(w, http.StatusOK, st)
 }
 
@@ -1646,8 +1804,12 @@ func (h *Handler) handleGetSeriesTimer(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleUpdateSeriesTimer(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
 	var upd SeriesTimerInfo
-	if err := json.NewDecoder(r.Body).Decode(&upd); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &upd, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid series timer payload")
+		return
+	}
+	if upd.PrePaddingSeconds < 0 || upd.PrePaddingSeconds > maxPaddingSeconds || upd.PostPaddingSeconds < 0 || upd.PostPaddingSeconds > maxPaddingSeconds {
+		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("padding seconds must be between 0 and %d", maxPaddingSeconds))
 		return
 	}
 	h.mu.Lock()
@@ -1660,8 +1822,12 @@ func (h *Handler) handleUpdateSeriesTimer(w http.ResponseWriter, r *http.Request
 			}
 			h.state.SeriesTimers[i] = upd
 			h.scheduleTimersForSeriesLocked(upd)
-			h.saveStateLocked(r.Context())
+			err := h.saveStateLocked(r.Context())
 			h.mu.Unlock()
+			if err != nil {
+				httpx.Error(w, http.StatusInternalServerError, "failed to persist series timer")
+				return
+			}
 			httpx.JSON(w, http.StatusOK, upd)
 			return
 		}
@@ -1708,7 +1874,7 @@ func (h *Handler) handleDeleteSeriesTimer(w http.ResponseWriter, r *http.Request
 
 func (h *Handler) handleSaveTunerHost(w http.ResponseWriter, r *http.Request) {
 	var host TunerHostInfo
-	if err := json.NewDecoder(r.Body).Decode(&host); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &host, maxM3UPlaylistBytes); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid tuner host payload")
 		return
 	}
@@ -1732,6 +1898,8 @@ func (h *Handler) handleSaveTunerHost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Do not persist raw inline M3U playlist content after parsing.
+	host.M3UContent = ""
 
 	h.mu.Lock()
 	// Upsert tuner host.
@@ -1799,8 +1967,12 @@ func (h *Handler) handleSaveTunerHost(w http.ResponseWriter, r *http.Request) {
 		h.state.Channels = keptChannels
 		h.state.Programs = keptPrograms
 	}
-	h.saveStateLocked(r.Context())
+	err := h.saveStateLocked(r.Context())
 	h.mu.Unlock()
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to persist tuner host")
+		return
+	}
 
 	httpx.JSON(w, http.StatusOK, host)
 }
@@ -1834,7 +2006,7 @@ func (h *Handler) loadM3UFromSource(ctx context.Context, src, userAgent string) 
 			if resp.StatusCode >= 400 {
 				return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
 			}
-			return ParseM3U(resp.Body)
+			return ParseM3U(io.LimitReader(resp.Body, maxM3UPlaylistBytes))
 		}
 		// Reject non-HTTP URL schemes (e.g. file://, ftp://, gopher://), while allowing
 		// single-letter Windows drive prefixes like C:\playlist.m3u.
@@ -1852,7 +2024,7 @@ func (h *Handler) loadM3UFromSource(ctx context.Context, src, userAgent string) 
 		return nil, err
 	}
 	defer f.Close()
-	return ParseM3U(f)
+	return ParseM3U(io.LimitReader(f, maxM3UPlaylistBytes))
 }
 
 func (h *Handler) validateLocalM3UPath(ctx context.Context, rawPath string) (string, error) {
@@ -1992,7 +2164,7 @@ func (h *Handler) handleTunerHostTypes(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleSaveListingProvider(w http.ResponseWriter, r *http.Request) {
 	var lp ListingProviderInfo
-	if err := json.NewDecoder(r.Body).Decode(&lp); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &lp, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid listing provider payload")
 		return
 	}
@@ -2031,8 +2203,12 @@ func (h *Handler) handleSaveListingProvider(w http.ResponseWriter, r *http.Reque
 			h.scheduleTimersForSeriesLocked(st)
 		}
 	}
-	h.saveStateLocked(r.Context())
+	err := h.saveStateLocked(r.Context())
 	h.mu.Unlock()
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to persist listing provider")
+		return
+	}
 	httpx.JSON(w, http.StatusOK, lp)
 }
 
@@ -2270,15 +2446,16 @@ func (h *Handler) loadState(ctx context.Context) {
 	}
 }
 
-func (h *Handler) saveStateLocked(ctx context.Context) {
+func (h *Handler) saveStateLocked(ctx context.Context) error {
 	if h.store == nil {
-		return
+		return nil
 	}
 	raw, err := json.Marshal(h.state)
 	if err != nil {
-		return
+		slog.Error("livetv: marshal state failed", "err", err)
+		return err
 	}
-	_, _ = h.store.Writer.ExecContext(ctx, `
+	_, err = h.store.Writer.ExecContext(ctx, `
 		INSERT INTO server_config (key, value_json, updated_at)
 		VALUES (?, ?, ?)
 		ON CONFLICT(key) DO UPDATE SET
@@ -2286,6 +2463,10 @@ func (h *Handler) saveStateLocked(ctx context.Context) {
 			updated_at = excluded.updated_at`,
 		stateConfigKey, string(raw), time.Now().UTC().Unix(),
 	)
+	if err != nil {
+		slog.Error("livetv: save state failed", "err", err)
+	}
+	return err
 }
 
 func paginate[T any](items []T, startIndex, limit int) ([]T, int) {

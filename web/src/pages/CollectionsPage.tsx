@@ -27,7 +27,7 @@ type CollectionTab = 'BoxSet' | 'Playlist'
 
 export function CollectionsPage() {
   const { id: selectedId } = useParams<{ id: string }>()
-  const { auth } = useAuth()
+  const { auth, isAdmin } = useAuth()
   const { t } = useI18n()
   const { playQueue } = useAudioPlayer()
   const userId = auth!.userId
@@ -201,7 +201,8 @@ export function CollectionsPage() {
   })
 
   const openCreateModal = (type: CollectionTab) => {
-    setCreateType(type)
+    const allowedType: CollectionTab = !isAdmin && type === 'BoxSet' ? 'Playlist' : type
+    setCreateType(allowedType)
     setNewName('')
     setCreateOpen(true)
   }
@@ -283,14 +284,16 @@ export function CollectionsPage() {
                   <span>{t('collections.playAll')}</span>
                 </button>
               )}
-              <button
-                type="button"
-                onClick={() => setDeleteTarget(selectedContainer)}
-                className="inline-flex items-center gap-1.5 rounded-xl border border-red-500/30 bg-red-500/10 px-3.5 py-2 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-                <span>删除{isSelectedPlaylist ? '播放列表' : '合集'}</span>
-              </button>
+              {(isSelectedPlaylist || isAdmin) && (
+                <button
+                  type="button"
+                  onClick={() => setDeleteTarget(selectedContainer)}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-red-500/30 bg-red-500/10 px-3.5 py-2 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  <span>删除{isSelectedPlaylist ? '播放列表' : '合集'}</span>
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -360,20 +363,22 @@ export function CollectionsPage() {
                     </button>
                   </div>
                 )}
-                <button
-                  type="button"
-                  disabled={removeMemberMutation.isPending}
-                  onClick={(e) => {
-                    e.preventDefault()
-                    e.stopPropagation()
-                    removeMemberMutation.mutate(member.Id)
-                  }}
-                  title="移出列表"
-                  aria-label={`移出 ${member.Name}`}
-                  className="absolute right-2 top-2 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-200 opacity-0 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-red-500 hover:text-white group-hover/member:opacity-100 focus:opacity-100"
-                >
-                  <X className="h-3.5 w-3.5" />
-                </button>
+                {(isSelectedPlaylist || isAdmin) && (
+                  <button
+                    type="button"
+                    disabled={removeMemberMutation.isPending}
+                    onClick={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      removeMemberMutation.mutate(member.Id)
+                    }}
+                    title="移出列表"
+                    aria-label={`移出 ${member.Name}`}
+                    className="absolute right-2 top-2 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-200 opacity-0 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-red-500 hover:text-white group-hover/member:opacity-100 focus:opacity-100"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                )}
               </div>
             ))}
           </div>
@@ -481,18 +486,20 @@ export function CollectionsPage() {
             </button>
           </div>
 
-          <button
-            type="button"
-            onClick={() => openCreateModal(activeTab)}
-            className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-3.5 py-2 text-xs font-semibold text-zinc-950 shadow-md shadow-amber-500/20 transition-colors hover:bg-amber-400"
-          >
-            <Plus className="h-4 w-4" />
-            <span>
-              {activeTab === 'BoxSet'
-                ? t('collections.createCollection')
-                : t('collections.createPlaylist')}
-            </span>
-          </button>
+          {(activeTab === 'Playlist' || isAdmin) && (
+            <button
+              type="button"
+              onClick={() => openCreateModal(activeTab)}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-3.5 py-2 text-xs font-semibold text-zinc-950 shadow-md shadow-amber-500/20 transition-colors hover:bg-amber-400"
+            >
+              <Plus className="h-4 w-4" />
+              <span>
+                {activeTab === 'BoxSet'
+                  ? t('collections.createCollection')
+                  : t('collections.createPlaylist')}
+              </span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -530,7 +537,9 @@ export function CollectionsPage() {
           </h2>
           <p className="mx-auto mt-2 max-w-md text-xs leading-relaxed text-zinc-400">
             {activeTab === 'BoxSet'
-              ? '点击右上角「新建合集」，将系列电影或主题影片归类管理。'
+              ? isAdmin
+                ? '点击右上角「新建合集」，将系列电影或主题影片归类管理。'
+                : '当前服务器暂无系列电影合集，可切换至「播放列表」创建您的专属片单。'
               : '点击右上角「新建播放列表」，创建您的专属片单。'}
           </p>
         </div>
@@ -544,19 +553,21 @@ export function CollectionsPage() {
                   {col.ChildCount} 部
                 </div>
               )}
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.preventDefault()
-                  e.stopPropagation()
-                  setDeleteTarget(col)
-                }}
-                title={`删除 ${col.Name}`}
-                aria-label={`删除 ${col.Name}`}
-                className="absolute right-2 top-2 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-300 opacity-0 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-red-500 hover:text-white group-hover/col:opacity-100 focus:opacity-100"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-              </button>
+              {(col.Type === 'Playlist' || isAdmin) && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.preventDefault()
+                    e.stopPropagation()
+                    setDeleteTarget(col)
+                  }}
+                  title={`删除 ${col.Name}`}
+                  aria-label={`删除 ${col.Name}`}
+                  className="absolute right-2 top-2 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-300 opacity-0 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-red-500 hover:text-white group-hover/col:opacity-100 focus:opacity-100"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              )}
             </div>
           ))}
         </div>
@@ -585,30 +596,32 @@ export function CollectionsPage() {
           }}
           className="space-y-4"
         >
-          <div className="flex gap-2">
-            <button
-              type="button"
-              onClick={() => setCreateType('BoxSet')}
-              className={`flex-1 rounded-xl border px-3 py-2 text-xs font-medium transition-colors ${
-                createType === 'BoxSet'
-                  ? 'border-amber-400/50 bg-amber-500/15 text-amber-300'
-                  : 'border-white/10 bg-white/[0.03] text-zinc-400 hover:text-zinc-200'
-              }`}
-            >
-              合集 (BoxSet)
-            </button>
-            <button
-              type="button"
-              onClick={() => setCreateType('Playlist')}
-              className={`flex-1 rounded-xl border px-3 py-2 text-xs font-medium transition-colors ${
-                createType === 'Playlist'
-                  ? 'border-amber-400/50 bg-amber-500/15 text-amber-300'
-                  : 'border-white/10 bg-white/[0.03] text-zinc-400 hover:text-zinc-200'
-              }`}
-            >
-              播放列表 (Playlist)
-            </button>
-          </div>
+          {isAdmin && (
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setCreateType('BoxSet')}
+                className={`flex-1 rounded-xl border px-3 py-2 text-xs font-medium transition-colors ${
+                  createType === 'BoxSet'
+                    ? 'border-amber-400/50 bg-amber-500/15 text-amber-300'
+                    : 'border-white/10 bg-white/[0.03] text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                合集 (BoxSet)
+              </button>
+              <button
+                type="button"
+                onClick={() => setCreateType('Playlist')}
+                className={`flex-1 rounded-xl border px-3 py-2 text-xs font-medium transition-colors ${
+                  createType === 'Playlist'
+                    ? 'border-amber-400/50 bg-amber-500/15 text-amber-300'
+                    : 'border-white/10 bg-white/[0.03] text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                播放列表 (Playlist)
+              </button>
+            </div>
+          )}
 
           <label className="block space-y-1.5">
             <span className="text-xs font-medium text-zinc-300">名称</span>

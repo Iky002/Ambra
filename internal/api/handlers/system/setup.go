@@ -2,7 +2,6 @@ package system
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -13,6 +12,8 @@ import (
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/core/auth"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
+	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
 const (
@@ -119,6 +120,9 @@ func (h *Handler) GetSetupStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
+	h.setupMu.Lock()
+	defer h.setupMu.Unlock()
+
 	h.cfgMu.RLock()
 	completed := h.cfg.IsStartupWizardCompleted
 	h.cfgMu.RUnlock()
@@ -130,15 +134,34 @@ func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "auth service unavailable")
 		return
 	}
+
+	ac, hasAC := middleware.AuthFromContext(r.Context())
+	isAuthAdmin := hasAC && ac != nil && ac.IsAdmin()
+	var defaultAdminToUpdate *sqlite.UserRecord
+
 	if h.userRepo != nil {
 		count, err := h.userRepo.CountUsers(r.Context())
 		if err != nil {
 			httpx.Error(w, http.StatusInternalServerError, "failed to check existing users")
 			return
 		}
-		if count > 0 {
-			ac, ok := middleware.AuthFromContext(r.Context())
-			if !ok || ac == nil || !ac.IsAdmin() {
+		if count > 0 && !isAuthAdmin {
+			allowedDefaultBootstrap := false
+			if count == 1 && netutil.IsLocalOrLANRequest(r) {
+				if users, listErr := h.userRepo.ListUsers(r.Context()); listErr == nil && len(users) == 1 {
+					sole := users[0]
+					if sole != nil &&
+						strings.EqualFold(sole.Name, "admin") &&
+						(sole.IsAdmin || sole.Policy.IsAdministrator) &&
+						!sole.IsDisabled && !sole.Policy.IsDisabled {
+						if ok, vErr := auth.VerifyPassword("admin", sole.PasswordHash); vErr == nil && ok {
+							allowedDefaultBootstrap = true
+							defaultAdminToUpdate = sole
+						}
+					}
+				}
+			}
+			if !allowedDefaultBootstrap {
 				httpx.Error(w, http.StatusForbidden, "admin user already exists")
 				return
 			}
@@ -146,13 +169,13 @@ func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req SetupAdminRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
 
 	username := strings.TrimSpace(req.Username)
-	if username == "" {
+	if username == "" || len([]rune(username)) > 64 {
 		httpx.Error(w, http.StatusBadRequest, "username is required")
 		return
 	}
@@ -187,9 +210,28 @@ func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
 	h.syncSTRMPlugin()
 
 	ctx := r.Context()
-	if _, err := h.setup.Auth.CreateUser(ctx, username, req.Password, true); err != nil {
+	if defaultAdminToUpdate != nil {
+		if username != defaultAdminToUpdate.Name && h.userRepo != nil && h.userRepo.Store() != nil && h.userRepo.Store().Writer != nil {
+			if _, err := h.userRepo.Store().Writer.ExecContext(ctx, `UPDATE users SET name = ? WHERE id = ?`, username, defaultAdminToUpdate.ID); err != nil {
+				httpx.Error(w, http.StatusInternalServerError, "failed to update default admin username")
+				return
+			}
+		}
+		if pwErr := h.setup.Auth.ChangePassword(ctx, defaultAdminToUpdate.ID, "", req.Password, true); pwErr != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to update default admin password")
+			return
+		}
+		if h.userRepo != nil {
+			_ = h.userRepo.DeleteTokensByUser(ctx, defaultAdminToUpdate.ID)
+		}
+		h.setup.Auth.InvalidateUserCache(defaultAdminToUpdate.ID)
+	} else if _, err := h.setup.Auth.CreateUser(ctx, username, req.Password, true); err != nil {
 		if !errors.Is(err, auth.ErrUserExists) {
 			httpx.Error(w, http.StatusInternalServerError, "failed to create admin user")
+			return
+		}
+		if !isAuthAdmin {
+			httpx.Error(w, http.StatusForbidden, "admin user already exists")
 			return
 		}
 		if h.userRepo == nil {
@@ -233,7 +275,7 @@ func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) CompleteSetup(w http.ResponseWriter, r *http.Request) {
 	var req SetupCompleteRequest
 	if r.Body != nil {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil && !errors.Is(err, io.EOF) {
 			httpx.Error(w, http.StatusBadRequest, "invalid json body")
 			return
 		}

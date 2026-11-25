@@ -321,10 +321,10 @@ func (s *Scanner) CancelScan(libraryID string) {
 	libraryID = guid.Normalize(libraryID)
 	s.mu.Lock()
 	cancel := s.cancels[libraryID]
-	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
+	s.mu.Unlock()
 }
 
 // CancelLibrary cancels an in-progress scan for libraryID.
@@ -335,17 +335,12 @@ func (s *Scanner) CancelLibrary(libraryID string) {
 // CancelAll cancels all in-progress library scans and clears paused state.
 func (s *Scanner) CancelAll() {
 	s.mu.Lock()
-	cancels := make([]context.CancelFunc, 0, len(s.cancels))
 	for _, cancel := range s.cancels {
 		if cancel != nil {
-			cancels = append(cancels, cancel)
+			cancel()
 		}
 	}
 	s.mu.Unlock()
-
-	for _, cancel := range cancels {
-		cancel()
-	}
 	s.Resume()
 }
 
@@ -408,12 +403,13 @@ func (s *Scanner) scanLibrary(ctx context.Context, libraryID string, asyncPhaseB
 	}
 
 	if asyncPhaseB {
+		s.mu.Lock()
 		if scanCtx.Err() != nil {
+			s.mu.Unlock()
 			releaseScan()
 			return stats, scanCtx.Err()
 		}
 		bgCtx, bgCancel := context.WithCancel(context.WithoutCancel(ctx))
-		s.mu.Lock()
 		s.cancels[libraryID] = bgCancel
 		s.mu.Unlock()
 		cancel()
@@ -534,6 +530,9 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 	}
 
 	root := findContainingRoot(lib.Paths, cleanTarget)
+	if root == "" {
+		return stats, fmt.Errorf("scanner: path %q is outside library %s roots", cleanTarget, lib.ID)
+	}
 	forceTV := strings.EqualFold(lib.CollectionType, "tvshows")
 	seriesCache := make(map[string]*sqlite.ItemRecord)
 	seasonCache := make(map[string]*sqlite.ItemRecord)
@@ -587,6 +586,7 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 
 func findContainingRoot(roots []string, target string) string {
 	cleanTarget := filepath.Clean(target)
+	best := ""
 	for _, r := range roots {
 		r = strings.TrimSpace(r)
 		if r == "" {
@@ -594,10 +594,12 @@ func findContainingRoot(roots []string, target string) string {
 		}
 		cr := filepath.Clean(r)
 		if cleanTarget == cr || strings.HasPrefix(cleanTarget, cr+string(filepath.Separator)) {
-			return cr
+			if len(cr) > len(best) {
+				best = cr
+			}
 		}
 	}
-	return filepath.Dir(cleanTarget)
+	return best
 }
 
 func resolveExtraParentDir(root, cleanTarget string) string {

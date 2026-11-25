@@ -38,3 +38,37 @@ func TestTicksConversions(t *testing.T) {
 		t.Fatalf("ToSeconds(0) = %v, want 0", got)
 	}
 }
+
+func TestTicksEdgeAndOverflowClamping(t *testing.T) {
+	if got := FromSeconds(math.NaN()); got != 0 {
+		t.Fatalf("FromSeconds(NaN) = %d, want 0", got)
+	}
+	if got := FromSeconds(math.Inf(1)); got != math.MaxInt64 {
+		t.Fatalf("FromSeconds(+Inf) = %d, want MaxInt64", got)
+	}
+	if got := FromSeconds(1e18); got != math.MaxInt64 {
+		t.Fatalf("FromSeconds(1e18) = %d, want MaxInt64", got)
+	}
+	if got := FromSeconds(math.Inf(-1)); got != math.MinInt64 {
+		t.Fatalf("FromSeconds(-Inf) = %d, want MinInt64", got)
+	}
+	if got := FromSeconds(-1e18); got != math.MinInt64 {
+		t.Fatalf("FromSeconds(-1e18) = %d, want MinInt64", got)
+	}
+	if got := FromSeconds(-1.5); got != -15_000_000 {
+		t.Fatalf("FromSeconds(-1.5) = %d, want -15000000", got)
+	}
+
+	if got := ToDuration(maxDurationTicks); got != time.Duration(math.MaxInt64) {
+		t.Fatalf("ToDuration(maxDurationTicks) = %v, want MaxInt64", got)
+	}
+	if got := ToDuration(math.MaxInt64); got != time.Duration(math.MaxInt64) {
+		t.Fatalf("ToDuration(MaxInt64) = %v, want MaxInt64", got)
+	}
+	if got := ToDuration(minDurationTicks); got != time.Duration(math.MinInt64) {
+		t.Fatalf("ToDuration(minDurationTicks) = %v, want MinInt64", got)
+	}
+	if got := ToDuration(math.MinInt64); got != time.Duration(math.MinInt64) {
+		t.Fatalf("ToDuration(MinInt64) = %v, want MinInt64", got)
+	}
+}

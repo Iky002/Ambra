@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -48,31 +49,44 @@ func main() {
 	defer func() { _ = logBridge.Close() }()
 	slog.SetDefault(slog.New(logBridge))
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	srv, err := server.New(ctx, cfg)
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	defer bgCancel()
+
+	srv, err := server.New(bgCtx, cfg)
 	if err != nil {
 		slog.Error("failed to initialize Ambra server", "error", err)
 		os.Exit(1)
 	}
-	defer func() { _ = srv.Close() }()
+	defer func() {
+		bgCancel()
+		_ = srv.Close()
+	}()
 	logBridge.SetLogsHandler(srv.Logs)
 
 	if srv.SSDP != nil {
-		go func() { _ = srv.SSDP.Start(ctx) }()
+		go func() { _ = srv.SSDP.Start(bgCtx) }()
 	}
 	if srv.Rankings != nil {
-		srv.Rankings.StartPeriodicSync(ctx, rankings.DefaultSyncInterval)
+		srv.Rankings.StartPeriodicSync(bgCtx, rankings.DefaultSyncInterval)
 	}
 	if srv.Watcher != nil {
-		go func() { _ = srv.Watcher.Start(ctx) }()
+		go func() { _ = srv.Watcher.Start(bgCtx) }()
 	}
 
 	httpSrv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           srv.Handler,
 		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+
+	webURL := "http://localhost" + cfg.HTTPAddr + "/web/"
+	if !strings.HasPrefix(cfg.HTTPAddr, ":") {
+		webURL = "http://" + cfg.HTTPAddr + "/web/"
 	}
 
 	go func() {
@@ -80,7 +94,7 @@ func main() {
 			"ambra_version", config.AmbraVersion,
 			"emby_compat_version", config.ServerVersion,
 			"addr", cfg.HTTPAddr,
-			"web_ui", "http://localhost"+cfg.HTTPAddr+"/web/",
+			"web_ui", webURL,
 			"server_id", cfg.ServerID,
 		)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -89,7 +103,7 @@ func main() {
 		}
 	}()
 
-	<-ctx.Done()
+	<-sigCtx.Done()
 	slog.Info("shutting down Ambra Media Server...")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

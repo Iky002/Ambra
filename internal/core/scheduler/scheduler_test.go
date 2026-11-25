@@ -119,3 +119,121 @@ func TestBuiltinTasksCleanTranscodeCache(t *testing.T) {
 		t.Fatal("expected scanAll callback to be invoked")
 	}
 }
+
+func TestSchedulerStartTriggersMaxRuntimeAndActiveDirProtection(t *testing.T) {
+	i64 := func(v int64) *int64 { return &v }
+
+	// 1. Start loop fires IntervalTrigger and enforces MaxRuntimeTicks
+	var intervalRuns atomic.Int32
+	mgr := New(nil)
+	mgr.SetTickInterval(10 * time.Millisecond)
+
+	mgr.Register(TaskDefinition{
+		ID:       "interval-task",
+		Name:     "Interval Task",
+		Category: "Test",
+		Triggers: []TaskTriggerInfo{
+			{Type: "IntervalTrigger", IntervalTicks: i64((20 * time.Millisecond).Nanoseconds() / 100)},
+		},
+		Run: func(ctx context.Context, _ func(float64)) error {
+			intervalRuns.Add(1)
+			return nil
+		},
+	})
+
+	mgr.Register(TaskDefinition{
+		ID:       "timeout-task",
+		Name:     "Timeout Task",
+		Category: "Test",
+		Triggers: []TaskTriggerInfo{
+			{Type: "IntervalTrigger", IntervalTicks: i64(time.Hour.Nanoseconds() / 100), MaxRuntimeTicks: i64((30 * time.Millisecond).Nanoseconds() / 100)},
+		},
+		Run: func(ctx context.Context, _ func(float64)) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	mgr.Start(ctx)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && intervalRuns.Load() < 1 {
+		time.Sleep(15 * time.Millisecond)
+	}
+	cancel()
+	if intervalRuns.Load() < 1 {
+		t.Fatalf("expected interval-task to be triggered by Start loop")
+	}
+
+	// Verify MaxRuntimeTicks terminates long-running task
+	if err := mgr.Run("timeout-task"); err != nil {
+		t.Fatalf("Run timeout-task: %v", err)
+	}
+	mgr.Wait("timeout-task")
+	tInfo, _ := mgr.Get("timeout-task")
+	if tInfo.LastExecutionResult == nil || tInfo.LastExecutionResult.Status != "Cancelled" {
+		t.Fatalf("expected Cancelled status on MaxRuntimeTicks timeout, got %+v", tInfo.LastExecutionResult)
+	}
+
+	// 2. CleanTranscodeCache skips recent (<2h) dirs and active dirs, removes old inactive dirs
+	tmp := t.TempDir()
+	recentDir := filepath.Join(tmp, "recent-sess")
+	activeOldDir := filepath.Join(tmp, "active-old-sess")
+	staleOldDir := filepath.Join(tmp, "stale-old-sess")
+	for _, d := range []string{recentDir, activeOldDir, staleOldDir} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "seg0.ts"), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldTime := time.Now().Add(-4 * time.Hour)
+	_ = os.Chtimes(activeOldDir, oldTime, oldTime)
+	_ = os.Chtimes(staleOldDir, oldTime, oldTime)
+
+	mgr.SetActiveTranscodeDirsFn(func() []string { return []string{activeOldDir} })
+	mgr.RegisterBuiltinTasks(nil, tmp, nil)
+	if err := mgr.Run("CleanTranscodeCache"); err != nil {
+		t.Fatal(err)
+	}
+	mgr.Wait("CleanTranscodeCache")
+
+	if _, err := os.Stat(recentDir); err != nil {
+		t.Fatalf("expected recent dir to be preserved, err=%v", err)
+	}
+	if _, err := os.Stat(activeOldDir); err != nil {
+		t.Fatalf("expected active dir to be preserved, err=%v", err)
+	}
+	if _, err := os.Stat(staleOldDir); !os.IsNotExist(err) {
+		t.Fatalf("expected stale inactive dir to be removed, stat err=%v", err)
+	}
+
+	// 3. Unit check for DailyTrigger / WeeklyTrigger schedule evaluation
+	now := time.Date(2026, 3, 15, 9, 2, 0, 0, time.UTC) // Sunday 09:02
+	dailyMT := &managedTask{
+		def: TaskDefinition{
+			Triggers: []TaskTriggerInfo{{Type: "DailyTrigger", TimeOfDayTicks: i64((9 * time.Hour).Nanoseconds() / 100)}},
+		},
+	}
+	if !taskIsDueLocked(dailyMT, now) {
+		t.Fatal("expected DailyTrigger to fire within 5m window with no prior run")
+	}
+	dailyMT.lastScheduledAt = now.Add(-1 * time.Minute)
+	if taskIsDueLocked(dailyMT, now) {
+		t.Fatal("expected DailyTrigger not to re-fire after already running for today's slot")
+	}
+
+	weeklyMT := &managedTask{
+		def: TaskDefinition{
+			Triggers: []TaskTriggerInfo{{Type: "WeeklyTrigger", DayOfWeek: "Sunday", TimeOfDayTicks: i64((9 * time.Hour).Nanoseconds() / 100)}},
+		},
+	}
+	if !taskIsDueLocked(weeklyMT, now) {
+		t.Fatal("expected WeeklyTrigger to fire on matching Sunday")
+	}
+	weeklyMT.def.Triggers[0].DayOfWeek = "Monday"
+	if taskIsDueLocked(weeklyMT, now) {
+		t.Fatal("expected WeeklyTrigger not to fire on non-matching weekday")
+	}
+}
