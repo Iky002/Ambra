@@ -22,6 +22,19 @@ const TMDB_LANGUAGES = [
   { value: 'ko-KR', label: '한국어 (ko-KR)' },
 ]
 
+const TVDB_LANGUAGES = [
+  { value: 'zh-CN', label: '简体中文 (zh-CN)' },
+  { value: 'zh-TW', label: '繁体中文 (zh-TW)' },
+  { value: 'en-US', label: 'English (en-US)' },
+  { value: 'ja-JP', label: '日本語 (ja-JP)' },
+  { value: 'ko-KR', label: '한국어 (ko-KR)' },
+  { value: 'es-ES', label: 'Español (es-ES)' },
+  { value: 'de-DE', label: 'Deutsch (de-DE)' },
+  { value: 'fr-FR', label: 'Français (fr-FR)' },
+  { value: 'pt-BR', label: 'Português (pt-BR)' },
+  { value: 'th-TH', label: 'ไทย (th-TH)' },
+]
+
 export function PluginsTab() {
   const queryClient = useQueryClient()
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
@@ -37,6 +50,13 @@ export function PluginsTab() {
   const [priority, setPriority] = useState(10)
   const [tmdbApiKey, setTmdbApiKey] = useState('')
   const [tmdbLanguage, setTmdbLanguage] = useState('zh-CN')
+  const [tvdbApiKey, setTvdbApiKey] = useState('')
+  const [tvdbPin, setTvdbPin] = useState('')
+  const [tvdbLanguage, setTvdbLanguage] = useState('zh-CN')
+  const [traktClientId, setTraktClientId] = useState('')
+  const [traktAccessToken, setTraktAccessToken] = useState('')
+  const [traktScrobblePlayback, setTraktScrobblePlayback] = useState(true)
+  const [traktSyncWatched, setTraktSyncWatched] = useState(true)
   const [enable302, setEnable302] = useState(true)
   const [extraJson, setExtraJson] = useState('{}')
 
@@ -55,6 +75,12 @@ export function PluginsTab() {
   const isTmdbPlugin = (p: PluginInfo | null) =>
     Boolean(p && `${p.Id} ${p.Name}`.toLowerCase().includes('tmdb'))
 
+  const isTvdbPlugin = (p: PluginInfo | null) =>
+    Boolean(p && `${p.Id} ${p.Name}`.toLowerCase().includes('tvdb'))
+
+  const isTraktPlugin = (p: PluginInfo | null) =>
+    Boolean(p && `${p.Id} ${p.Name}`.toLowerCase().includes('trakt'))
+
   const isStrmPlugin = (p: PluginInfo | null) =>
     Boolean(p && `${p.Id} ${p.Name}`.toLowerCase().includes('strm'))
 
@@ -64,6 +90,13 @@ export function PluginsTab() {
     setPriority(plugin.Priority ?? 10)
     setTmdbApiKey('')
     setTmdbLanguage('zh-CN')
+    setTvdbApiKey('')
+    setTvdbPin('')
+    setTvdbLanguage('zh-CN')
+    setTraktClientId('')
+    setTraktAccessToken('')
+    setTraktScrobblePlayback(true)
+    setTraktSyncWatched(true)
     setEnable302(true)
     setExtraJson('{}')
     setLoadingConfig(true)
@@ -92,6 +125,59 @@ export function PluginsTab() {
           ''
         if (langVal) setTmdbLanguage(langVal)
 
+        if (isTvdbPlugin(plugin)) {
+          const tvdbKeyVal =
+            (cfg.api_key as string) ||
+            (cfg.ApiKey as string) ||
+            (cfg.tvdb_api_key as string) ||
+            (cfg.TVDBApiKey as string) ||
+            ''
+          if (tvdbKeyVal) setTvdbApiKey(tvdbKeyVal)
+
+          const tvdbPinVal =
+            (cfg.pin as string) ||
+            (cfg.Pin as string) ||
+            (cfg.tvdb_pin as string) ||
+            (cfg.TVDBPin as string) ||
+            ''
+          if (tvdbPinVal) setTvdbPin(tvdbPinVal)
+
+          const tvdbLangVal =
+            (cfg.language as string) ||
+            (cfg.Language as string) ||
+            (cfg.tvdb_language as string) ||
+            (cfg.TVDBLanguage as string) ||
+            ''
+          if (tvdbLangVal) setTvdbLanguage(tvdbLangVal)
+        }
+
+        if (isTraktPlugin(plugin)) {
+          const clientIdVal =
+            (cfg.client_id as string) ||
+            (cfg.ClientId as string) ||
+            (cfg.ClientID as string) ||
+            ''
+          if (clientIdVal) setTraktClientId(clientIdVal)
+
+          const accessTokenVal =
+            (cfg.access_token as string) ||
+            (cfg.AccessToken as string) ||
+            ''
+          if (accessTokenVal) setTraktAccessToken(accessTokenVal)
+
+          if (typeof cfg.scrobble_playback === 'boolean') {
+            setTraktScrobblePlayback(cfg.scrobble_playback)
+          } else if (typeof cfg.ScrobblePlayback === 'boolean') {
+            setTraktScrobblePlayback(cfg.ScrobblePlayback)
+          }
+
+          if (typeof cfg.sync_watched === 'boolean') {
+            setTraktSyncWatched(cfg.sync_watched)
+          } else if (typeof cfg.SyncWatched === 'boolean') {
+            setTraktSyncWatched(cfg.SyncWatched)
+          }
+        }
+
         if (typeof cfg.enable_302 === 'boolean') setEnable302(cfg.enable_302)
         else if (typeof cfg.Enable302 === 'boolean') setEnable302(cfg.Enable302)
 
@@ -109,6 +195,27 @@ export function PluginsTab() {
         delete rest.TMDBLanguage
         delete rest.Enable302
         delete rest.enable_302
+        if (isTvdbPlugin(plugin)) {
+          delete rest.pin
+          delete rest.Pin
+          delete rest.tvdb_pin
+          delete rest.TVDBPin
+          delete rest.tvdb_api_key
+          delete rest.TVDBApiKey
+          delete rest.tvdb_language
+          delete rest.TVDBLanguage
+        }
+        if (isTraktPlugin(plugin)) {
+          delete rest.client_id
+          delete rest.ClientId
+          delete rest.ClientID
+          delete rest.access_token
+          delete rest.AccessToken
+          delete rest.scrobble_playback
+          delete rest.ScrobblePlayback
+          delete rest.sync_watched
+          delete rest.SyncWatched
+        }
         setExtraJson(Object.keys(rest).length > 0 ? JSON.stringify(rest, null, 2) : '{}')
       }
     } catch {
@@ -151,6 +258,26 @@ export function PluginsTab() {
       payload.api_key = tmdbApiKey.trim()
       payload.Language = tmdbLanguage
       payload.language = tmdbLanguage
+    }
+
+    if (isTvdbPlugin(editingPlugin)) {
+      payload.ApiKey = tvdbApiKey.trim()
+      payload.api_key = tvdbApiKey.trim()
+      payload.Pin = tvdbPin.trim()
+      payload.pin = tvdbPin.trim()
+      payload.Language = tvdbLanguage
+      payload.language = tvdbLanguage
+    }
+
+    if (isTraktPlugin(editingPlugin)) {
+      payload.ClientId = traktClientId.trim()
+      payload.client_id = traktClientId.trim()
+      payload.AccessToken = traktAccessToken.trim()
+      payload.access_token = traktAccessToken.trim()
+      payload.ScrobblePlayback = traktScrobblePlayback
+      payload.scrobble_playback = traktScrobblePlayback
+      payload.SyncWatched = traktSyncWatched
+      payload.sync_watched = traktSyncWatched
     }
 
     if (isStrmPlugin(editingPlugin)) {
@@ -368,6 +495,120 @@ export function PluginsTab() {
                     ))}
                   </select>
                 </div>
+              </div>
+            )}
+
+            {isTvdbPlugin(editingPlugin) && (
+              <div className="space-y-3 rounded-xl border border-sky-500/20 bg-sky-500/[0.04] p-4">
+                <p className="text-xs font-semibold text-sky-300">TheTVDB 刮削器参数</p>
+                <p className="text-xs leading-relaxed text-zinc-400">
+                  默认关闭；启用并填写 TheTVDB v4 API Key 后，将按优先级作为剧集/电影刮削补充源
+                </p>
+                <div>
+                  <label
+                    htmlFor="tvdb-api-key"
+                    className="mb-1.5 block text-xs font-medium text-zinc-400"
+                  >
+                    API Key
+                  </label>
+                  <input
+                    id="tvdb-api-key"
+                    type="text"
+                    value={tvdbApiKey}
+                    onChange={(e) => setTvdbApiKey(e.target.value)}
+                    placeholder="输入 TheTVDB v4 API Key"
+                    className="w-full rounded-xl border border-white/10 bg-black/40 px-3.5 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
+                  />
+                </div>
+                <div>
+                  <label
+                    htmlFor="tvdb-pin"
+                    className="mb-1.5 block text-xs font-medium text-zinc-400"
+                  >
+                    Subscriber PIN（可选）
+                  </label>
+                  <input
+                    id="tvdb-pin"
+                    type="text"
+                    value={tvdbPin}
+                    onChange={(e) => setTvdbPin(e.target.value)}
+                    placeholder="若使用个人订阅 PIN 可在此填写"
+                    className="w-full rounded-xl border border-white/10 bg-black/40 px-3.5 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
+                  />
+                </div>
+                <div>
+                  <label
+                    htmlFor="tvdb-language"
+                    className="mb-1.5 block text-xs font-medium text-zinc-400"
+                  >
+                    刮削语言
+                  </label>
+                  <select
+                    id="tvdb-language"
+                    value={tvdbLanguage}
+                    onChange={(e) => setTvdbLanguage(e.target.value)}
+                    className="w-full rounded-xl border border-white/10 bg-[#181822] px-3.5 py-2 text-sm text-zinc-100 outline-none focus:border-amber-400/60"
+                  >
+                    {TVDB_LANGUAGES.map((lang) => (
+                      <option key={lang.value} value={lang.value}>
+                        {lang.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            )}
+
+            {isTraktPlugin(editingPlugin) && (
+              <div className="space-y-3 rounded-xl border border-rose-500/20 bg-rose-500/[0.04] p-4">
+                <p className="text-xs font-semibold text-rose-300">Trakt.tv 同步参数</p>
+                <p className="text-xs leading-relaxed text-zinc-400">
+                  默认关闭；启用后自动将播放进度与已看状态同步至 Trakt.tv
+                </p>
+                <div>
+                  <label
+                    htmlFor="trakt-client-id"
+                    className="mb-1.5 block text-xs font-medium text-zinc-400"
+                  >
+                    Client ID
+                  </label>
+                  <input
+                    id="trakt-client-id"
+                    type="text"
+                    value={traktClientId}
+                    onChange={(e) => setTraktClientId(e.target.value)}
+                    placeholder="输入 Trakt OAuth App Client ID"
+                    className="w-full rounded-xl border border-white/10 bg-black/40 px-3.5 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
+                  />
+                </div>
+                <div>
+                  <label
+                    htmlFor="trakt-access-token"
+                    className="mb-1.5 block text-xs font-medium text-zinc-400"
+                  >
+                    Access Token
+                  </label>
+                  <input
+                    id="trakt-access-token"
+                    type="password"
+                    value={traktAccessToken}
+                    onChange={(e) => setTraktAccessToken(e.target.value)}
+                    placeholder="输入 Trakt OAuth Access Token"
+                    className="w-full rounded-xl border border-white/10 bg-black/40 px-3.5 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
+                  />
+                </div>
+                <ToggleSwitch
+                  checked={traktScrobblePlayback}
+                  onChange={setTraktScrobblePlayback}
+                  label="实时同步播放进度 (Scrobble)"
+                  description="播放、暂停及停止时自动上报进度至 Trakt"
+                />
+                <ToggleSwitch
+                  checked={traktSyncWatched}
+                  onChange={setTraktSyncWatched}
+                  label="同步已观看历史 (Watched Sync)"
+                  description="影片或剧集标记为已看时同步至 Trakt 历史记录"
+                />
               </div>
             )}
 
