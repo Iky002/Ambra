@@ -245,7 +245,7 @@ func TestHostLoadFromDirAndExecutePlugins(t *testing.T) {
 	// 2. Stream resolver WASM plugin (writes StreamResolveResult JSON to stdout).
 	streamDir := filepath.Join(pluginsDir, "alist-wasm")
 	_ = os.MkdirAll(streamDir, 0o755)
-	streamJSON := `{"URL":"https://cdn.example.com/movie.mkv?sig=abc","Headers":{"Referer":"https://example.com"},"Is302":true}`
+	streamJSON := `{"URL":"https://93.184.216.34/movie.mkv?sig=abc","Headers":{"Referer":"https://93.184.216.34"},"Is302":true}`
 	_ = os.WriteFile(filepath.Join(streamDir, "resolver.wasm"), buildWasiOutputModule(1, streamJSON, false, 0), 0o644)
 	_ = os.WriteFile(filepath.Join(streamDir, "manifest.json"), []byte(`{
 		"Id": "alist-wasm",
@@ -294,7 +294,7 @@ func TestHostLoadFromDirAndExecutePlugins(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveStream failed: %v", err)
 	}
-	if streamRes == nil || !streamRes.Is302 || streamRes.URL != "https://cdn.example.com/movie.mkv?sig=abc" || streamRes.Headers["Referer"] != "https://example.com" {
+	if streamRes == nil || !streamRes.Is302 || streamRes.URL != "https://93.184.216.34/movie.mkv?sig=abc" || streamRes.Headers["Referer"] != "https://93.184.216.34" {
 		t.Fatalf("unexpected stream resolve result: %+v", streamRes)
 	}
 }
@@ -647,5 +647,59 @@ func TestWasmHostLimitsSymlinksTimeoutClampAndFiltering(t *testing.T) {
 	}
 	if wp, ok := provs[0].(*WasmPlugin); !ok || wp.timeout != maxPluginTimeout {
 		t.Fatalf("expected TimeoutMs clamped to %v, got %+v", maxPluginTimeout, provs[0])
+	}
+}
+
+func TestWasmHostAuditV0104Security(t *testing.T) {
+	ctx := context.Background()
+	host, err := NewHost(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close(ctx)
+
+	// 1. limitedBuffer invokes cancel immediately on overflow
+	cancelled := false
+	lb := &limitedBuffer{limit: 4, cancel: func() { cancelled = true }}
+	_, _ = lb.Write([]byte("123456"))
+	if !cancelled || !lb.isTruncated() {
+		t.Fatal("expected limitedBuffer to call cancel on overflow")
+	}
+
+	// 2. BuiltIn forced false and ambra.builtin.* prefix rejected
+	if _, err := host.LoadModule(ctx, plugins.Manifest{ID: "ambra.builtin.fake", BuiltIn: true, Enabled: true}, buildNoopModule(), time.Second); err == nil {
+		t.Fatal("expected ambra.builtin.* wasm plugin to be rejected")
+	}
+	extMod, err := host.LoadModule(ctx, plugins.Manifest{ID: "ext.ok", BuiltIn: true, Enabled: true}, buildNoopModule(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if extMod.Manifest().BuiltIn {
+		t.Fatal("expected BuiltIn forced to false for WASM plugin")
+	}
+
+	// 3. ResolveStream SSRF targets blocked (file:// and cloud metadata)
+	for _, badURL := range []string{"file:///etc/passwd", "http://169.254.169.254/latest/meta-data"} {
+		ssrfMod, err := host.LoadModule(ctx, plugins.Manifest{ID: "ssrf", Enabled: true, Kinds: []plugins.Kind{plugins.KindStream}},
+			buildWasiOutputModule(1, `{"URL":"`+badURL+`","Is302":true}`, false, 0), time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ssrfMod.ResolveStream(ctx, "/x.strm"); err == nil {
+			t.Fatalf("expected SSRF URL %q to be blocked", badURL)
+		}
+	}
+
+	// 4. Concurrency semaphore respects cancelled context when full
+	for i := 0; i < cap(host.sem); i++ {
+		host.sem <- struct{}{}
+	}
+	cctx, ccancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer ccancel()
+	if _, err := extMod.FetchMetadata(cctx, plugins.MediaQuery{Title: "Wait"}); err == nil {
+		t.Fatal("expected semaphore wait to fail on context deadline")
+	}
+	for i := 0; i < cap(host.sem); i++ {
+		<-host.sem
 	}
 }

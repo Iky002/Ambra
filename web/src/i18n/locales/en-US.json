@@ -28,7 +28,6 @@
   "common.copy": "Copy",
   "common.copied": "Copied",
   "common.language": "Language",
-
   "nav.home": "Home",
   "nav.trending": "Trending",
   "nav.collections": "Collections",
@@ -50,7 +49,6 @@
   "nav.demoDesc": "(In-memory frontend simulation, no backend required · All changes apply immediately)",
   "nav.demoSwitchGuest": "Admin view · Switch to member for RBAC demo",
   "nav.demoSwitchAdmin": "Member view · Switch back to Admin Console",
-
   "auth.loginTitle": "Sign in to Ambra",
   "auth.loginSubtitle": "Connect to your private cinema server",
   "auth.username": "Username",
@@ -65,7 +63,6 @@
   "auth.noAdminDesc": "This account does not have administrator privileges (IsAdministrator = false). Contact your system administrator to manage server settings, users, or libraries.",
   "auth.backHome": "Back to Home",
   "auth.verifyingAdmin": "Verifying administrator privileges...",
-
   "setup.title": "Welcome to Ambra",
   "setup.subtitle": "Set up your private cinema server in a few steps",
   "setup.serverName": "Server Name",
@@ -73,7 +70,6 @@
   "setup.tmdbLanguage": "Metadata Language",
   "setup.createAdmin": "Create Administrator Account",
   "setup.complete": "Finish Setup",
-
   "home.continueWatching": "Continue Watching",
   "home.nextUp": "Next Up",
   "home.myMedia": "My Media",
@@ -88,7 +84,6 @@
   "home.emptyTitle": "Your library is empty",
   "home.emptyDesc": "Open the Admin Console to add local media folders or .strm directories and run your first library scan.",
   "home.goManageLibraries": "Add Media Libraries",
-
   "library.allItems": "All",
   "library.albums": "Albums",
   "library.artists": "Artists",
@@ -111,7 +106,6 @@
   "library.exitMultiSelect": "Exit Selection",
   "library.selectedCount": "{{count}} selected",
   "library.emptyResult": "No matching items found",
-
   "detail.play": "Play",
   "detail.resume": "Resume",
   "detail.favorite": "Favorite",
@@ -146,7 +140,6 @@
   "detail.container": "Container",
   "detail.fileSize": "File Size",
   "detail.bitrate": "Bitrate",
-
   "player.quality": "Quality",
   "player.qualityAuto": "Direct Play",
   "player.version": "Version",
@@ -163,33 +156,27 @@
   "player.playNextNow": "Play Now",
   "player.cancelNextUp": "Cancel",
   "player.loadError": "Failed to decode or load the video stream. Please check the media format or network connection.",
-
   "collections.title": "Collections & Playlists",
   "collections.boxSets": "Collections",
   "collections.playlists": "Playlists",
   "collections.createCollection": "New Collection",
   "collections.createPlaylist": "New Playlist",
   "collections.playAll": "Play All",
-
   "favorites.title": "Favorites",
   "favorites.emptyTitle": "No favorites yet",
   "favorites.emptyDesc": "Click the favorite button on any movie, series, or music item to save it here.",
-
   "trending.title": "Trending",
   "trending.subtitle": "Aggregated from TMDB Trending, Douban Hot, and IMDb Top 250 — jump straight to titles in your library",
   "trending.refreshNow": "Sync Charts Now",
   "trending.inLibrary": "In Library",
-
   "livetv.title": "Live TV",
   "livetv.channels": "Channels",
   "livetv.guide": "TV Guide",
   "livetv.recordings": "Recordings",
   "livetv.timers": "Schedule",
-
   "search.title": "Explore & Search",
   "search.placeholder": "Search by title, initials, original name, or cast...",
   "search.noResults": "No matching movies, series, or people found",
-
   "profile.title": "Profile",
   "profile.uiLanguage": "Interface Language",
   "profile.uiLanguageDesc": "Change the web client display language and sync your preference with the server",
@@ -197,11 +184,9 @@
   "profile.avatar": "Avatar",
   "profile.quickConnect": "Quick Connect Authorization",
   "profile.playbackPrefs": "Playback Preferences",
-
   "notifications.title": "Notifications",
   "notifications.markAllRead": "Mark All Read",
   "notifications.empty": "No notifications",
-
   "admin.title": "Admin Console",
   "admin.tabDashboard": "Dashboard",
   "admin.tabLibraries": "Libraries",
@@ -220,5 +205,20 @@
   "admin.serverLogs": "Server Logs",
   "admin.downloadLog": "Download Log",
   "admin.kickDevice": "Disconnect Device",
-  "admin.revokeKey": "Revoke Key"
+  "admin.revokeKey": "Revoke Key",
+  "player.cannotPlayTitle": "Unable to Play Media",
+  "player.retryPlayback": "Retry Playback",
+  "player.goBack": "Go Back",
+  "player.subtitleOff": "Subtitles Off",
+  "player.subtitleTweaks": "Subtitle Adjustments",
+  "player.loadingStream": "Loading media stream...",
+  "player.buffering": "Buffering...",
+  "admin.scanAllLibraries": "Scan All Libraries",
+  "admin.scanningAllLibraries": "Starting library scan...",
+  "admin.dashboardOverview": "Server Status Overview",
+  "admin.usersTitle": "Users & Permissions (RBAC)",
+  "admin.createUser": "New User",
+  "admin.pluginsTitle": "Plugins & Scrapers",
+  "admin.webhooksTitle": "Webhook Notifications",
+  "admin.createWebhook": "Add Webhook"
 }

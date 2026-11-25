@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -235,5 +236,74 @@ func TestSchedulerStartTriggersMaxRuntimeAndActiveDirProtection(t *testing.T) {
 	weeklyMT.def.Triggers[0].DayOfWeek = "Monday"
 	if taskIsDueLocked(weeklyMT, now) {
 		t.Fatal("expected WeeklyTrigger not to fire on non-matching weekday")
+	}
+}
+
+func TestSchedulerPanicRecoveryAndStopAll(t *testing.T) {
+	mgr := New(nil)
+	mgr.Register(TaskDefinition{
+		ID:       "panic-task",
+		Name:     "Panic Task",
+		Category: "Test",
+		Run: func(_ context.Context, _ func(float64)) error {
+			panic("boom-in-scheduler")
+		},
+	})
+
+	if err := mgr.Run("panic-task"); err != nil {
+		t.Fatalf("Run panic-task: %v", err)
+	}
+	mgr.Wait("panic-task")
+
+	pInfo, ok := mgr.Get("panic-task")
+	if !ok || pInfo.State != StateIdle {
+		t.Fatalf("expected panic-task to return to StateIdle, got %+v", pInfo)
+	}
+	if pInfo.LastExecutionResult == nil || pInfo.LastExecutionResult.Status != "Failed" {
+		t.Fatalf("expected Failed status after panic, got %+v", pInfo.LastExecutionResult)
+	}
+	if !strings.Contains(pInfo.LastExecutionResult.ErrorMessage, "boom-in-scheduler") {
+		t.Fatalf("expected ErrorMessage to include panic value, got %q", pInfo.LastExecutionResult.ErrorMessage)
+	}
+	if pInfo.LastExecutionResult.LongErrorMessage == "" {
+		t.Fatal("expected stack trace in LongErrorMessage")
+	}
+
+	// Verify StopAll and Start(ctx) cancellation cancel all running tasks.
+	started := make(chan struct{})
+	mgr.Register(TaskDefinition{
+		ID:       "long-running",
+		Name:     "Long Running",
+		Category: "Test",
+		Run: func(ctx context.Context, _ func(float64)) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	mgr.Start(ctx)
+	if err := mgr.Run("long-running"); err != nil {
+		t.Fatalf("Run long-running: %v", err)
+	}
+	<-started
+
+	// Cancelling the Start context triggers StopAll() and cancels running tasks.
+	cancel()
+	doneCh := make(chan struct{})
+	go func() {
+		mgr.Wait("long-running")
+		close(doneCh)
+	}()
+	select {
+	case <-doneCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected long-running task to be cancelled when Start(ctx) is cancelled")
+	}
+
+	lInfo, _ := mgr.Get("long-running")
+	if lInfo.LastExecutionResult == nil || lInfo.LastExecutionResult.Status != "Cancelled" {
+		t.Fatalf("expected Cancelled status after Start(ctx) shutdown, got %+v", lInfo.LastExecutionResult)
 	}
 }

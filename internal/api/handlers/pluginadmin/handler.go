@@ -382,20 +382,43 @@ func normalizeConfigKeyLookup(k string) string {
 }
 
 func maskSensitiveMap(src map[string]any) map[string]any {
+	return maskSensitiveMapInternal(src, false)
+}
+
+func maskSensitiveMapInternal(src map[string]any, forceSensitive bool) map[string]any {
 	out := make(map[string]any, len(src))
 	for k, v := range src {
-		if isSensitiveConfigKey(k) {
-			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
-				out[k] = maskedSecret
-				continue
-			}
-		}
-		out[k] = v
+		keySensitive := forceSensitive || isSensitiveConfigKey(k)
+		out[k] = maskSensitiveValue(v, keySensitive)
 	}
 	return out
 }
 
+func maskSensitiveValue(v any, sensitive bool) any {
+	switch val := v.(type) {
+	case string:
+		if sensitive && strings.TrimSpace(val) != "" {
+			return maskedSecret
+		}
+		return val
+	case map[string]any:
+		return maskSensitiveMapInternal(val, sensitive)
+	case []any:
+		out := make([]any, len(val))
+		for i, elem := range val {
+			out[i] = maskSensitiveValue(elem, sensitive)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
 func mergePluginConfig(prev, incoming map[string]any) map[string]any {
+	return mergePluginConfigInternal(prev, incoming, false)
+}
+
+func mergePluginConfigInternal(prev, incoming map[string]any, forceSensitive bool) map[string]any {
 	merged := cloneMap(prev)
 	existingByLower := make(map[string]string, len(merged))
 	existingByNorm := make(map[string]string, len(merged))
@@ -410,29 +433,103 @@ func mergePluginConfig(prev, incoming map[string]any) map[string]any {
 		} else if ek, ok := existingByNorm[normalizeConfigKeyLookup(k)]; ok {
 			targetKey = ek
 		}
-		if isSensitiveConfigKey(targetKey) {
-			if s, ok := v.(string); ok {
-				trimmed := strings.TrimSpace(s)
-				if trimmed == "" || trimmed == maskedSecret {
-					if oldStr, okOld := merged[targetKey].(string); okOld && strings.TrimSpace(oldStr) != "" {
-						continue
-					}
+		keySensitive := forceSensitive || isSensitiveConfigKey(targetKey)
+		switch val := v.(type) {
+		case string:
+			if keySensitive && strings.TrimSpace(val) == maskedSecret {
+				if oldStr, okOld := merged[targetKey].(string); okOld && strings.TrimSpace(oldStr) != "" {
+					continue
 				}
 			}
+			// Explicit empty string "" clears any previously saved secret instead of preserving it.
+			merged[targetKey] = val
+		case map[string]any:
+			if prevMap, okPrev := merged[targetKey].(map[string]any); okPrev {
+				merged[targetKey] = mergePluginConfigInternal(prevMap, val, keySensitive)
+			} else {
+				merged[targetKey] = cloneMap(val)
+			}
+		case []any:
+			if prevSlice, okPrev := merged[targetKey].([]any); okPrev {
+				merged[targetKey] = mergePluginSlice(prevSlice, val, keySensitive)
+			} else {
+				merged[targetKey] = cloneSlice(val)
+			}
+		default:
+			merged[targetKey] = cloneValue(v)
 		}
-		merged[targetKey] = v
 		existingByLower[strings.ToLower(targetKey)] = targetKey
 		existingByNorm[normalizeConfigKeyLookup(targetKey)] = targetKey
 	}
 	return merged
 }
 
+func mergePluginSlice(prev, incoming []any, forceSensitive bool) []any {
+	out := make([]any, len(incoming))
+	for i, elem := range incoming {
+		var hasPrev bool
+		var prevElem any
+		if i < len(prev) {
+			hasPrev = true
+			prevElem = prev[i]
+		}
+		switch val := elem.(type) {
+		case string:
+			if forceSensitive && strings.TrimSpace(val) == maskedSecret && hasPrev {
+				if oldStr, okOld := prevElem.(string); okOld && strings.TrimSpace(oldStr) != "" {
+					out[i] = oldStr
+					continue
+				}
+			}
+			out[i] = val
+		case map[string]any:
+			if hasPrev {
+				if prevMap, okPrev := prevElem.(map[string]any); okPrev {
+					out[i] = mergePluginConfigInternal(prevMap, val, forceSensitive)
+					continue
+				}
+			}
+			out[i] = cloneMap(val)
+		case []any:
+			if hasPrev {
+				if prevSub, okPrev := prevElem.([]any); okPrev {
+					out[i] = mergePluginSlice(prevSub, val, forceSensitive)
+					continue
+				}
+			}
+			out[i] = cloneSlice(val)
+		default:
+			out[i] = cloneValue(elem)
+		}
+	}
+	return out
+}
+
 func cloneMap(src map[string]any) map[string]any {
 	dst := make(map[string]any, len(src))
 	for k, v := range src {
-		dst[k] = v
+		dst[k] = cloneValue(v)
 	}
 	return dst
+}
+
+func cloneSlice(src []any) []any {
+	dst := make([]any, len(src))
+	for i, v := range src {
+		dst[i] = cloneValue(v)
+	}
+	return dst
+}
+
+func cloneValue(v any) any {
+	switch val := v.(type) {
+	case map[string]any:
+		return cloneMap(val)
+	case []any:
+		return cloneSlice(val)
+	default:
+		return v
+	}
 }
 
 func passthrough(next http.Handler) http.Handler { return next }

@@ -310,6 +310,18 @@ func TestServerLiveTVAndDVRWiring(t *testing.T) {
 	rest := rec.Body.String()[idx+len(`"Id":"`):]
 	chID := rest[:strings.Index(rest, `"`)]
 
+	// Loopback upstream must be rejected by default SSRF protection (H-04)
+	reqBlocked := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream", nil)
+	reqBlocked.Header.Set("X-Emby-Token", token)
+	recBlocked := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(recBlocked, reqBlocked)
+	if recBlocked.Code != http.StatusBadRequest {
+		t.Fatalf("expected loopback stream blocked with 400 by default, got code=%d body=%q", recBlocked.Code, recBlocked.Body.String())
+	}
+
+	// Override stream client for loopback httptest upstream to verify E2E proxy wiring
+	srv.LiveTV.SetStreamClient(upstream.Client())
+
 	// Proxy via primary route /LiveTv/Channels/{Id}/Stream
 	req = httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream", nil)
 	req.Header.Set("X-Emby-Token", token)

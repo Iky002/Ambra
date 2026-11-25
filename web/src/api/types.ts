@@ -199,6 +199,8 @@ export interface LiveTvChannelInfo {
   Type?: string
   ImageUrl?: string
   StreamUrl?: string
+  IsHls?: boolean
+  StreamFormat?: string
 }
 
 export interface LiveTvInfo {
@@ -265,6 +267,7 @@ export interface WebhookInfo {
   Name: string
   Url: string
   Secret?: string
+  HasSecret?: boolean
   Events: string[]
   Enabled: boolean
   CreatedAt?: number

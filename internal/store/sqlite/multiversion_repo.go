@@ -332,10 +332,11 @@ func (r *LibraryRepo) MergeItemVersions(ctx context.Context, itemIDs []string) (
 	defer tx.Rollback()
 
 	var (
-		primaryType     string
-		primaryIsFolder int
+		primaryLibraryID string
+		primaryType      string
+		primaryIsFolder  int
 	)
-	if err := tx.QueryRowContext(ctx, `SELECT type, is_folder FROM items WHERE id = ?`, primaryID).Scan(&primaryType, &primaryIsFolder); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT library_id, type, is_folder FROM items WHERE id = ?`, primaryID).Scan(&primaryLibraryID, &primaryType, &primaryIsFolder); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", 0, ErrNotFound
 		}
@@ -367,10 +368,11 @@ func (r *LibraryRepo) MergeItemVersions(ctx context.Context, itemIDs []string) (
 	mergedCount := 0
 	for _, otherID := range cleanIDs[1:] {
 		var (
-			otherType     string
-			otherIsFolder int
+			otherLibraryID string
+			otherType      string
+			otherIsFolder  int
 		)
-		if err := tx.QueryRowContext(ctx, `SELECT type, is_folder FROM items WHERE id = ?`, otherID).Scan(&otherType, &otherIsFolder); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT library_id, type, is_folder FROM items WHERE id = ?`, otherID).Scan(&otherLibraryID, &otherType, &otherIsFolder); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				continue
 			}
@@ -378,6 +380,9 @@ func (r *LibraryRepo) MergeItemVersions(ctx context.Context, itemIDs []string) (
 		}
 		if otherIsFolder != 0 {
 			return "", 0, fmt.Errorf("cannot merge folder item %s", otherID)
+		}
+		if guid.Normalize(otherLibraryID) != guid.Normalize(primaryLibraryID) {
+			return "", 0, fmt.Errorf("cannot merge items across different libraries: %s vs %s", primaryLibraryID, otherLibraryID)
 		}
 		if !strings.EqualFold(otherType, primaryType) {
 			return "", 0, fmt.Errorf("cannot merge items of different types: %s vs %s", primaryType, otherType)
@@ -500,25 +505,60 @@ func (r *LibraryRepo) MergeItemVersions(ctx context.Context, itemIDs []string) (
 
 // SplitItemVersions keeps the first MediaSource on itemID and splits every additional
 // MediaSource into its own independent ItemRecord (copying base metadata, ancestors, and FTS,
-// and migrating the corresponding MediaSource and MediaStreams).
+// and migrating the corresponding MediaSource and MediaStreams) inside a single Writer transaction.
 func (r *LibraryRepo) SplitItemVersions(ctx context.Context, itemID string) ([]string, error) {
 	itemID = guid.Normalize(itemID)
-	primary, err := r.GetItemRecordByID(ctx, itemID)
+
+	tx, err := r.store.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	primary, err := scanItemRecord(tx.QueryRowContext(ctx,
+		`SELECT `+itemSelectCols+` FROM items i WHERE i.id = ? LIMIT 1`, itemID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
 	if err != nil {
 		return nil, err
 	}
 
-	sources, err := r.GetMediaSourcesByItemID(ctx, itemID)
+	var sources []MediaSourceRecord
+	msRows, err := tx.QueryContext(ctx, `
+		SELECT id, item_id, name, path, protocol, COALESCE(container,''), COALESCE(size,0), COALESCE(bitrate,0),
+		       COALESCE(runtime_ticks,0), is_remote, supports_direct_play, supports_direct_stream, supports_transcoding, extra_json
+		FROM item_media_sources WHERE item_id = ? ORDER BY rowid ASC`, itemID)
 	if err != nil {
 		return nil, err
 	}
+	for msRows.Next() {
+		var ms MediaSourceRecord
+		var isRem, dp, ds, tc int
+		if err := msRows.Scan(&ms.ID, &ms.ItemID, &ms.Name, &ms.Path, &ms.Protocol, &ms.Container, &ms.Size, &ms.Bitrate,
+			&ms.RuntimeTicks, &isRem, &dp, &ds, &tc, &ms.ExtraJSON); err != nil {
+			msRows.Close()
+			return nil, err
+		}
+		ms.IsRemote = isRem != 0
+		ms.SupportsDirectPlay = dp != 0
+		ms.SupportsDirectStream = ds != 0
+		ms.SupportsTranscoding = tc != 0
+		sources = append(sources, ms)
+	}
+	if err := msRows.Err(); err != nil {
+		msRows.Close()
+		return nil, err
+	}
+	msRows.Close()
+
 	if len(sources) <= 1 {
 		return []string{}, nil
 	}
 
 	// Load existing ancestors to replicate on split items.
 	var ancestors []AncestorLink
-	aRows, err := r.store.Reader.QueryContext(ctx,
+	aRows, err := tx.QueryContext(ctx,
 		`SELECT ancestor_id, depth FROM item_ancestors WHERE descendant_id = ? ORDER BY depth ASC`, itemID)
 	if err != nil {
 		return nil, err
@@ -539,7 +579,7 @@ func (r *LibraryRepo) SplitItemVersions(ctx context.Context, itemID string) ([]s
 
 	// Load existing FTS fields if present.
 	var ftsTitleRaw, ftsTitleTokens, ftsPinyinFull, ftsPinyinInit, ftsPeople string
-	hasFTS := r.store.Reader.QueryRowContext(ctx,
+	hasFTS := tx.QueryRowContext(ctx,
 		`SELECT title_raw, title_tokens, pinyin_full, pinyin_initials, people_names FROM item_search_fts WHERE item_id = ? LIMIT 1`,
 		itemID,
 	).Scan(&ftsTitleRaw, &ftsTitleTokens, &ftsPinyinFull, &ftsPinyinInit, &ftsPeople) == nil
@@ -548,12 +588,6 @@ func (r *LibraryRepo) SplitItemVersions(ctx context.Context, itemID string) ([]s
 	if err != nil {
 		return nil, err
 	}
-
-	tx, err := r.store.Writer.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
 
 	now := time.Now().Unix()
 	createdIDs := make([]string, 0, len(sources)-1)

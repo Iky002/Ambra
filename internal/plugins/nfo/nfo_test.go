@@ -89,3 +89,44 @@ func TestParseNFOTVShowAndEpisode(t *testing.T) {
 		t.Fatalf("unexpected episode result: %+v", epRes)
 	}
 }
+
+func TestParseNFOLockDataAndSet(t *testing.T) {
+	xmlStructuredSet := `<?xml version="1.0" encoding="UTF-8"?>
+<movie>
+  <title>哈利·波特与魔法石</title>
+  <year>2001</year>
+  <lockdata>true</lockdata>
+  <set>
+    <name>哈利·波特系列</name>
+    <overview>魔法世界合集</overview>
+  </set>
+</movie>`
+	res, err := ParseNFO([]byte(xmlStructuredSet))
+	if err != nil {
+		t.Fatalf("ParseNFO structured set failed: %v", err)
+	}
+	if !res.LockData {
+		t.Fatalf("expected LockData=true, got false")
+	}
+	if res.Collection == nil || res.Collection.Name != "哈利·波特系列" {
+		t.Fatalf("expected Collection='哈利·波特系列', got %+v", res.Collection)
+	}
+
+	xmlInlineSet := `<movie><title>指环王：护戒使者</title><lockdata>1</lockdata><set>指环王三部曲</set></movie>`
+	res2, err := ParseNFO([]byte(xmlInlineSet))
+	if err != nil {
+		t.Fatalf("ParseNFO inline set failed: %v", err)
+	}
+	if !res2.LockData || res2.Collection == nil || res2.Collection.Name != "指环王三部曲" {
+		t.Fatalf("unexpected inline set result: lock=%v collection=%+v", res2.LockData, res2.Collection)
+	}
+
+	xmlUnlocked := `<movie><title>Unlocked</title><lockdata>false</lockdata></movie>`
+	res3, err := ParseNFO([]byte(xmlUnlocked))
+	if err != nil {
+		t.Fatalf("ParseNFO unlocked failed: %v", err)
+	}
+	if res3.LockData {
+		t.Fatalf("expected LockData=false")
+	}
+}

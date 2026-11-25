@@ -19,6 +19,8 @@ import (
 
 const (
 	defaultTimeout          = 5 * time.Second
+	maxTimeout              = 60 * time.Second
+	maxTimeoutMs            = 60_000
 	defaultFailureThreshold = 3
 	defaultResetTimeout     = 30 * time.Second
 	maxResponseBytes        = 16 << 20 // 16 MiB
@@ -57,6 +59,7 @@ type HTTPPlugin struct {
 	resetTimeout     time.Duration
 	consecutiveFails int
 	circuitOpenUntil time.Time
+	probeInFlight    bool
 	nowFunc          func() time.Time
 }
 
@@ -65,6 +68,9 @@ func NewHTTPPlugin(m ExternalManifest) (*HTTPPlugin, error) {
 	id := strings.TrimSpace(m.ID)
 	if id == "" {
 		return nil, errors.New("manifest Id is required")
+	}
+	if plugins.IsBuiltInID(id) {
+		return nil, fmt.Errorf("manifest Id %q cannot use reserved prefix %q", id, plugins.BuiltInIDPrefix)
 	}
 	name := strings.TrimSpace(m.Name)
 	if name == "" {
@@ -77,7 +83,11 @@ func NewHTTPPlugin(m ExternalManifest) (*HTTPPlugin, error) {
 
 	timeout := defaultTimeout
 	if m.TimeoutMs > 0 {
-		timeout = time.Duration(m.TimeoutMs) * time.Millisecond
+		ms := m.TimeoutMs
+		if ms > maxTimeoutMs {
+			ms = maxTimeoutMs
+		}
+		timeout = time.Duration(ms) * time.Millisecond
 	}
 
 	enabled := true
@@ -168,6 +178,9 @@ func (p *HTTPPlugin) Configure(cfg map[string]any) error {
 		if tms <= 0 {
 			return errors.New("TimeoutMs must be positive")
 		}
+		if tms > maxTimeoutMs {
+			tms = maxTimeoutMs
+		}
 		p.timeout = time.Duration(tms) * time.Millisecond
 		p.client = netutil.NewSafeHTTPClient(p.timeout, true)
 	}
@@ -198,9 +211,14 @@ func (p *HTTPPlugin) ResolveStream(ctx context.Context, rawPath string) (*plugin
 	if err != nil || !ok {
 		return nil, err
 	}
-	if strings.TrimSpace(out.URL) == "" {
+	resolvedURL := strings.TrimSpace(out.URL)
+	if resolvedURL == "" {
 		return nil, nil
 	}
+	if err := netutil.ValidateRemoteURL(resolvedURL, true); err != nil {
+		return nil, fmt.Errorf("plugin %s returned unsafe stream url: %w", p.id, err)
+	}
+	out.URL = resolvedURL
 	return &out, nil
 }
 
@@ -226,17 +244,35 @@ func (p *HTTPPlugin) supports(kind plugins.Kind) bool {
 }
 
 func (p *HTTPPlugin) postJSON(ctx context.Context, suffix string, payload any, dst any) (bool, error) {
-	p.mu.RLock()
+	var isProbe bool
+	p.mu.Lock()
 	now := p.nowFunc()
-	if now.Before(p.circuitOpenUntil) {
-		p.mu.RUnlock()
-		return false, ErrCircuitOpen
+	if !p.circuitOpenUntil.IsZero() {
+		if now.Before(p.circuitOpenUntil) {
+			p.mu.Unlock()
+			return false, ErrCircuitOpen
+		}
+		// Half-open state: allow only one concurrent probe request.
+		if p.probeInFlight {
+			p.mu.Unlock()
+			return false, ErrCircuitOpen
+		}
+		p.probeInFlight = true
+		isProbe = true
 	}
 	endpoint := p.endpoint
 	apiKey := p.apiKey
 	timeout := p.timeout
 	client := p.client
-	p.mu.RUnlock()
+	p.mu.Unlock()
+
+	if isProbe {
+		defer func() {
+			p.mu.Lock()
+			p.probeInFlight = false
+			p.mu.Unlock()
+		}()
+	}
 
 	rawReq, err := json.Marshal(payload)
 	if err != nil {
@@ -294,6 +330,7 @@ func (p *HTTPPlugin) postJSON(ctx context.Context, suffix string, payload any, d
 func (p *HTTPPlugin) recordFailure() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.probeInFlight = false
 	p.consecutiveFails++
 	if p.consecutiveFails >= p.failureThreshold {
 		p.circuitOpenUntil = p.nowFunc().Add(p.resetTimeout)
@@ -303,6 +340,7 @@ func (p *HTTPPlugin) recordFailure() {
 func (p *HTTPPlugin) recordSuccess() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.probeInFlight = false
 	p.consecutiveFails = 0
 	p.circuitOpenUntil = time.Time{}
 }

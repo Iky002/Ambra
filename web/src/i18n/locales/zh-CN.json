@@ -28,7 +28,6 @@
   "common.copy": "复制",
   "common.copied": "已复制",
   "common.language": "界面语言",
-
   "nav.home": "首页",
   "nav.trending": "热门",
   "nav.collections": "合集",
@@ -50,7 +49,6 @@
   "nav.demoDesc": "（纯前端内存模拟，无需后端 · 所有读写即时生效）",
   "nav.demoSwitchGuest": "管理员视角 · 切换普通用户体验 RBAC",
   "nav.demoSwitchAdmin": "普通用户视角 · 切回管理员控制台",
-
   "auth.loginTitle": "登录 Ambra",
   "auth.loginSubtitle": "连接到你的私人影院服务器",
   "auth.username": "用户名",
@@ -65,7 +63,6 @@
   "auth.noAdminDesc": "当前账号不具备管理员权限（IsAdministrator = false）。如需管理服务器配置、用户或媒体库，请联系系统管理员授权。",
   "auth.backHome": "返回首页",
   "auth.verifyingAdmin": "正在校验管理员权限...",
-
   "setup.title": "欢迎使用 Ambra",
   "setup.subtitle": "几步完成私人影院服务器初始化",
   "setup.serverName": "服务器名称",
@@ -73,7 +70,6 @@
   "setup.tmdbLanguage": "元数据刮削语言",
   "setup.createAdmin": "创建管理员账号",
   "setup.complete": "完成初始化",
-
   "home.continueWatching": "继续观看",
   "home.nextUp": "接下来播放",
   "home.myMedia": "我的媒体",
@@ -88,7 +84,6 @@
   "home.emptyTitle": "媒体库还是空的",
   "home.emptyDesc": "前往管理控制台添加本地影视目录或 .strm 文件夹，并触发首次扫描。",
   "home.goManageLibraries": "前往添加媒体库",
-
   "library.allItems": "全部",
   "library.albums": "专辑",
   "library.artists": "艺术家",
@@ -111,7 +106,6 @@
   "library.exitMultiSelect": "退出多选",
   "library.selectedCount": "已选 {{count}} 项",
   "library.emptyResult": "没有符合条件的条目",
-
   "detail.play": "立即播放",
   "detail.resume": "继续播放",
   "detail.favorite": "收藏",
@@ -146,7 +140,6 @@
   "detail.container": "容器格式",
   "detail.fileSize": "文件大小",
   "detail.bitrate": "总码率",
-
   "player.quality": "画质",
   "player.qualityAuto": "原画直连",
   "player.version": "版本",
@@ -163,33 +156,27 @@
   "player.playNextNow": "立即播放",
   "player.cancelNextUp": "取消连播",
   "player.loadError": "视频流解码或加载失败，请检查媒体格式或网络连接",
-
   "collections.title": "合集与播放列表",
   "collections.boxSets": "合集",
   "collections.playlists": "播放列表",
   "collections.createCollection": "新建合集",
   "collections.createPlaylist": "新建播放列表",
   "collections.playAll": "播放全部",
-
   "favorites.title": "我的收藏",
   "favorites.emptyTitle": "还没有收藏内容",
   "favorites.emptyDesc": "在影片、剧集或音乐页面点击收藏按钮即可添加到这里。",
-
   "trending.title": "热门榜单",
   "trending.subtitle": "聚合 TMDB 趋势、豆瓣热门与 IMDb Top 250，一键直达库内片源",
   "trending.refreshNow": "立即同步榜单",
   "trending.inLibrary": "库内可播",
-
   "livetv.title": "电视直播",
   "livetv.channels": "频道列表",
   "livetv.guide": "节目指南",
   "livetv.recordings": "我的录播",
   "livetv.timers": "录制计划",
-
   "search.title": "探索与搜索",
   "search.placeholder": "输入中文、拼音首字母、英文片名或演员名...",
   "search.noResults": "未找到匹配的影片、剧集或演职员",
-
   "profile.title": "个人中心",
   "profile.uiLanguage": "界面语言",
   "profile.uiLanguageDesc": "切换 Web 客户端显示语言，并同步向服务端发送语言偏好",
@@ -197,11 +184,9 @@
   "profile.avatar": "个人头像",
   "profile.quickConnect": "Quick Connect 设备授权",
   "profile.playbackPrefs": "播放偏好设置",
-
   "notifications.title": "通知中心",
   "notifications.markAllRead": "全部已读",
   "notifications.empty": "暂无通知",
-
   "admin.title": "管理控制台",
   "admin.tabDashboard": "概览与监控",
   "admin.tabLibraries": "媒体库管理",
@@ -220,5 +205,20 @@
   "admin.serverLogs": "服务器日志",
   "admin.downloadLog": "下载日志",
   "admin.kickDevice": "踢出设备",
-  "admin.revokeKey": "吊销密钥"
+  "admin.revokeKey": "吊销密钥",
+  "player.cannotPlayTitle": "无法播放该媒体",
+  "player.retryPlayback": "重试播放",
+  "player.goBack": "返回上一页",
+  "player.subtitleOff": "关闭字幕",
+  "player.subtitleTweaks": "字幕微调",
+  "player.loadingStream": "正在加载媒体流...",
+  "player.buffering": "正在缓冲...",
+  "admin.scanAllLibraries": "触发全库扫描",
+  "admin.scanningAllLibraries": "正在触发全库扫描...",
+  "admin.dashboardOverview": "服务器状态概览",
+  "admin.usersTitle": "用户与权限管理 (RBAC)",
+  "admin.createUser": "新建用户",
+  "admin.pluginsTitle": "插件与刮削器管理",
+  "admin.webhooksTitle": "Webhook 事件通知",
+  "admin.createWebhook": "新增 Webhook"
 }

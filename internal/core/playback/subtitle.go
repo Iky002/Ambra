@@ -49,7 +49,8 @@ type SubtitleTrackInfo struct {
 }
 
 var (
-	reSRTTime = regexp.MustCompile(`(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})`)
+	// Matches both HH:MM:SS[.,]mmm and short WebVTT MM:SS[.,]mmm timestamps.
+	reSRTTime = regexp.MustCompile(`(?:(\d{1,2}):)?(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(?:(\d{1,2}):)?(\d{2}):(\d{2})[,.](\d{3})`)
 	reASSTags = regexp.MustCompile(`\{[^}]*\}`)
 )
 

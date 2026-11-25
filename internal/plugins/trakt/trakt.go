@@ -23,15 +23,18 @@ import (
 )
 
 const (
-	PluginID             = "ambra.builtin.trakt"
-	defaultBaseURL       = "https://api.trakt.tv"
-	defaultPriority      = 40
-	defaultTimeout       = 10 * time.Second
-	traktAPIVersion      = "2"
-	maxErrBodyPreview    = 1024
-	maxDiscardRespBytes  = 1 << 20
-	traktWorkerPoolSize  = 8
-	traktWorkerQueueSize = 128
+	PluginID                   = "ambra.builtin.trakt"
+	defaultBaseURL             = "https://api.trakt.tv"
+	defaultPriority            = 40
+	defaultTimeout             = 10 * time.Second
+	defaultPauseThrottleWindow = 60 * time.Second
+	defaultCompleteDedupWindow = 2 * time.Minute
+	scrobbleCompletionPct      = 80.0
+	traktAPIVersion            = "2"
+	maxErrBodyPreview          = 1024
+	maxDiscardRespBytes        = 1 << 20
+	traktWorkerPoolSize        = 8
+	traktWorkerQueueSize       = 128
 )
 
 var _ plugins.Plugin = (*Plugin)(nil)
@@ -42,17 +45,27 @@ type Plugin struct {
 	enabled          bool
 	clientID         string
 	accessToken      string
+	allowedUserID    string
+	boundUserID      string
 	scrobblePlayback bool
 	syncWatched      bool
 	priority         int
 	baseURL          string
 	client           *http.Client
+
+	stateMu             sync.Mutex
+	pausedAt            map[string]time.Time
+	completedAt         map[string]time.Time
+	pauseThrottleWindow time.Duration
+	completeDedupWindow time.Duration
+	nowFunc             func() time.Time
 }
 
 type configSnapshot struct {
 	enabled          bool
 	clientID         string
 	accessToken      string
+	allowedUserID    string
 	scrobblePlayback bool
 	syncWatched      bool
 	priority         int
@@ -63,12 +76,17 @@ type configSnapshot struct {
 // New creates a new Trakt plugin instance (disabled by default).
 func New() *Plugin {
 	return &Plugin{
-		enabled:          false,
-		scrobblePlayback: true,
-		syncWatched:      true,
-		priority:         defaultPriority,
-		baseURL:          defaultBaseURL,
-		client:           netutil.NewSafeHTTPClient(defaultTimeout, false),
+		enabled:             false,
+		scrobblePlayback:    true,
+		syncWatched:         true,
+		priority:            defaultPriority,
+		baseURL:             defaultBaseURL,
+		client:              netutil.NewSafeHTTPClient(defaultTimeout, false),
+		pausedAt:            make(map[string]time.Time),
+		completedAt:         make(map[string]time.Time),
+		pauseThrottleWindow: defaultPauseThrottleWindow,
+		completeDedupWindow: defaultCompleteDedupWindow,
+		nowFunc:             time.Now,
 	}
 }
 
@@ -89,6 +107,7 @@ func (p *Plugin) snapshot() configSnapshot {
 		enabled:          p.enabled,
 		clientID:         p.clientID,
 		accessToken:      p.accessToken,
+		allowedUserID:    p.allowedUserID,
 		scrobblePlayback: p.scrobblePlayback,
 		syncWatched:      p.syncWatched,
 		priority:         p.priority,
@@ -128,6 +147,10 @@ func (p *Plugin) Configure(cfg map[string]any) error {
 	}
 	if v, ok := firstString(cfg, "access_token", "AccessToken", "trakt_access_token"); ok {
 		p.accessToken = strings.TrimSpace(v)
+	}
+	if v, ok := firstString(cfg, "user_id", "UserId", "UserID", "allowed_user_id", "AllowedUserId"); ok {
+		p.allowedUserID = strings.TrimSpace(v)
+		p.boundUserID = ""
 	}
 	if v, ok := firstBool(cfg, "scrobble_playback", "ScrobblePlayback"); ok {
 		p.scrobblePlayback = v
@@ -419,6 +442,107 @@ func postTrakt(ctx context.Context, snap configSnapshot, endpoint string, payloa
 	return nil
 }
 
+func (p *Plugin) shouldReportForUser(userID string) bool {
+	uid := strings.TrimSpace(userID)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.allowedUserID != "" {
+		return uid != "" && strings.EqualFold(uid, p.allowedUserID)
+	}
+	if uid == "" {
+		return true
+	}
+	if p.boundUserID == "" {
+		p.boundUserID = uid
+		return true
+	}
+	return strings.EqualFold(uid, p.boundUserID)
+}
+
+func userItemKey(userID, itemID string) string {
+	return strings.ToLower(strings.TrimSpace(userID)) + ":" + strings.ToLower(strings.TrimSpace(itemID))
+}
+
+func (p *Plugin) now() time.Time {
+	if p.nowFunc != nil {
+		return p.nowFunc()
+	}
+	return time.Now()
+}
+
+func (p *Plugin) clearPaused(userID, itemID string) {
+	p.stateMu.Lock()
+	delete(p.pausedAt, userItemKey(userID, itemID))
+	p.stateMu.Unlock()
+}
+
+// allowPauseScrobble returns true if a pause scrobble should be sent (throttling repeated pause heartbeats).
+func (p *Plugin) allowPauseScrobble(userID, itemID string) bool {
+	key := userItemKey(userID, itemID)
+	now := p.now()
+	win := p.pauseThrottleWindow
+	if win <= 0 {
+		win = defaultPauseThrottleWindow
+	}
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	if p.pausedAt == nil {
+		p.pausedAt = make(map[string]time.Time)
+	}
+	if last, ok := p.pausedAt[key]; ok && now.Sub(last) < win {
+		return false
+	}
+	if len(p.pausedAt) > 1024 {
+		for k, ts := range p.pausedAt {
+			if now.Sub(ts) >= win {
+				delete(p.pausedAt, k)
+			}
+		}
+	}
+	p.pausedAt[key] = now
+	return true
+}
+
+func (p *Plugin) markScrobbleCompleted(userID, itemID string) {
+	key := userItemKey(userID, itemID)
+	now := p.now()
+	win := p.completeDedupWindow
+	if win <= 0 {
+		win = defaultCompleteDedupWindow
+	}
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	if p.completedAt == nil {
+		p.completedAt = make(map[string]time.Time)
+	}
+	if len(p.completedAt) > 1024 {
+		for k, ts := range p.completedAt {
+			if now.Sub(ts) >= win {
+				delete(p.completedAt, k)
+			}
+		}
+	}
+	p.completedAt[key] = now
+}
+
+func (p *Plugin) wasRecentlyScrobbleCompleted(userID, itemID string) bool {
+	key := userItemKey(userID, itemID)
+	now := p.now()
+	win := p.completeDedupWindow
+	if win <= 0 {
+		win = defaultCompleteDedupWindow
+	}
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	if ts, ok := p.completedAt[key]; ok {
+		if now.Sub(ts) < win {
+			return true
+		}
+		delete(p.completedAt, key)
+	}
+	return false
+}
+
 // SubscribeEvents registers EventBus handlers for playback scrobbling and watched-history sync.
 // Calling the returned function stops the plugin from processing subsequent events.
 func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) func() {
@@ -469,9 +593,10 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 			return
 		}
 		ev, ok := parsePlaybackEvent(e.Payload)
-		if !ok || ev.itemID == "" {
+		if !ok || ev.itemID == "" || !p.shouldReportForUser(ev.userID) {
 			return
 		}
+		p.clearPaused(ev.userID, ev.itemID)
 		enqueue(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 			defer cancel()
@@ -489,7 +614,14 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 			return
 		}
 		ev, ok := parsePlaybackEvent(e.Payload)
-		if !ok || ev.itemID == "" || !ev.isPaused {
+		if !ok || ev.itemID == "" || !p.shouldReportForUser(ev.userID) {
+			return
+		}
+		if !ev.isPaused {
+			p.clearPaused(ev.userID, ev.itemID)
+			return
+		}
+		if !p.allowPauseScrobble(ev.userID, ev.itemID) {
 			return
 		}
 		enqueue(func() {
@@ -509,8 +641,12 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 			return
 		}
 		ev, ok := parsePlaybackEvent(e.Payload)
-		if !ok || ev.itemID == "" {
+		if !ok || ev.itemID == "" || !p.shouldReportForUser(ev.userID) {
 			return
+		}
+		p.clearPaused(ev.userID, ev.itemID)
+		if ev.played || computeProgress(ev.positionTicks, ev.runtimeTicks, nil) >= scrobbleCompletionPct {
+			p.markScrobbleCompleted(ev.userID, ev.itemID)
 		}
 		enqueue(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
@@ -525,6 +661,9 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 			} else {
 				pct = computeProgress(ev.positionTicks, ev.runtimeTicks, item.RuntimeTicks)
 			}
+			if pct >= scrobbleCompletionPct {
+				p.markScrobbleCompleted(ev.userID, ev.itemID)
+			}
 			_ = p.ScrobbleStop(ctx, item, series, pct)
 		})
 	})
@@ -535,7 +674,10 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 		}
 		entries := parseUserDataChangedEvent(e.Payload)
 		for _, entry := range entries {
-			if !entry.played || entry.itemID == "" {
+			if !entry.played || entry.itemID == "" || !p.shouldReportForUser(entry.userID) {
+				continue
+			}
+			if p.wasRecentlyScrobbleCompleted(entry.userID, entry.itemID) {
 				continue
 			}
 			itemID := entry.itemID
@@ -585,6 +727,7 @@ func computeProgress(positionTicks, payloadRuntimeTicks int64, itemRuntimeTicks 
 }
 
 type playbackEventData struct {
+	userID        string
 	itemID        string
 	positionTicks int64
 	runtimeTicks  int64
@@ -594,6 +737,7 @@ type playbackEventData struct {
 
 func extractPlaybackStructFields(v session.PlaybackEventPayload) playbackEventData {
 	return playbackEventData{
+		userID:        strings.TrimSpace(v.UserId),
 		itemID:        strings.TrimSpace(v.ItemId),
 		positionTicks: v.PositionTicks,
 		runtimeTicks:  v.RuntimeTicks,
@@ -631,6 +775,9 @@ func parsePlaybackEvent(payload any) (playbackEventData, bool) {
 
 func parsePlaybackMap(m map[string]any) playbackEventData {
 	var out playbackEventData
+	if s, ok := firstString(m, "user_id", "UserId", "UserID"); ok {
+		out.userID = strings.TrimSpace(s)
+	}
 	if s, ok := firstString(m, "item_id", "ItemId", "ItemID"); ok {
 		out.itemID = strings.TrimSpace(s)
 	}
@@ -650,6 +797,7 @@ func parsePlaybackMap(m map[string]any) playbackEventData {
 }
 
 type userDataEventEntry struct {
+	userID string
 	itemID string
 	played bool
 }
@@ -657,9 +805,11 @@ type userDataEventEntry struct {
 func parseUserDataChangedEvent(payload any) []userDataEventEntry {
 	switch v := payload.(type) {
 	case session.UserDataChangedPayload:
+		uid := strings.TrimSpace(v.UserId)
 		out := make([]userDataEventEntry, 0, len(v.UserDataList))
 		for _, entry := range v.UserDataList {
 			out = append(out, userDataEventEntry{
+				userID: uid,
 				itemID: strings.TrimSpace(entry.ItemId),
 				played: entry.Played,
 			})
@@ -669,9 +819,11 @@ func parseUserDataChangedEvent(payload any) []userDataEventEntry {
 		if v == nil {
 			return nil
 		}
+		uid := strings.TrimSpace(v.UserId)
 		out := make([]userDataEventEntry, 0, len(v.UserDataList))
 		for _, entry := range v.UserDataList {
 			out = append(out, userDataEventEntry{
+				userID: uid,
 				itemID: strings.TrimSpace(entry.ItemId),
 				played: entry.Played,
 			})
@@ -696,21 +848,23 @@ func parseUserDataChangedEvent(payload any) []userDataEventEntry {
 }
 
 func parseUserDataMap(m map[string]any) []userDataEventEntry {
+	uid, _ := firstString(m, "user_id", "UserId", "UserID")
+	uid = strings.TrimSpace(uid)
 	if listRaw, ok := m["UserDataList"]; ok {
-		return parseUserDataList(listRaw)
+		return parseUserDataList(listRaw, uid)
 	}
 	if listRaw, ok := m["user_data_list"]; ok {
-		return parseUserDataList(listRaw)
+		return parseUserDataList(listRaw, uid)
 	}
 	itemID, _ := firstString(m, "item_id", "ItemId", "ItemID")
 	played, _ := firstBool(m, "played", "Played")
 	if strings.TrimSpace(itemID) == "" {
 		return nil
 	}
-	return []userDataEventEntry{{itemID: strings.TrimSpace(itemID), played: played}}
+	return []userDataEventEntry{{userID: uid, itemID: strings.TrimSpace(itemID), played: played}}
 }
 
-func parseUserDataList(raw any) []userDataEventEntry {
+func parseUserDataList(raw any, userID string) []userDataEventEntry {
 	items, ok := raw.([]any)
 	if !ok {
 		return nil
@@ -724,7 +878,7 @@ func parseUserDataList(raw any) []userDataEventEntry {
 		itemID, _ := firstString(em, "item_id", "ItemId", "ItemID")
 		played, _ := firstBool(em, "played", "Played")
 		if strings.TrimSpace(itemID) != "" {
-			out = append(out, userDataEventEntry{itemID: strings.TrimSpace(itemID), played: played})
+			out = append(out, userDataEventEntry{userID: userID, itemID: strings.TrimSpace(itemID), played: played})
 		}
 	}
 	return out

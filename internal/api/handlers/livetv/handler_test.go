@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -423,21 +424,32 @@ func TestLiveTVRecordingsTimersSeriesTimersAndListingProviders(t *testing.T) {
 }
 
 func TestLiveTVSSRFAndLocalFileBlocking(t *testing.T) {
-	_, mux, _, cfg := setupLiveTVTest(t)
+	h, mux, _, cfg := setupLiveTVTest(t)
 
-	// Local HTTP server on loopback/LAN must succeed for self-hosted IPTV tuners
+	// Loopback HTTP server MUST be blocked by default (H-04 no-loopback SSRF protection)
 	loopbackSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("#EXTM3U\n#EXTINF:-1,LAN Channel\nhttp://192.168.1.50/stream.m3u8\n"))
 	}))
 	defer loopbackSrv.Close()
 
+	loopRec := doJSON(t, mux, http.MethodPost, "/LiveTv/TunerHosts", map[string]any{
+		"Type": "m3u",
+		"Url":  loopbackSrv.URL + "/playlist.m3u",
+	})
+	if loopRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 blocking loopback M3U tuner by default, got %d body=%s", loopRec.Code, loopRec.Body.String())
+	}
+
+	// With explicit test HTTP client override, local test server succeeds
+	h.SetHTTPClient(loopbackSrv.Client())
 	lanRec := doJSON(t, mux, http.MethodPost, "/LiveTv/TunerHosts", map[string]any{
 		"Type": "m3u",
 		"Url":  loopbackSrv.URL + "/playlist.m3u",
 	})
 	if lanRec.Code != http.StatusOK {
-		t.Fatalf("expected 200 for LAN/loopback M3U tuner, got %d body=%s", lanRec.Code, lanRec.Body.String())
+		t.Fatalf("expected 200 with custom test client, got %d body=%s", lanRec.Code, lanRec.Body.String())
 	}
+	h.customHTTPClient = false
 
 	// Outside directory files for path traversal & symlink escape tests
 	outsideDir := t.TempDir()
@@ -501,6 +513,7 @@ func TestLiveTVChannelStreamProxy(t *testing.T) {
 		}
 	}))
 	defer upstream.Close()
+	h.SetStreamClient(upstream.Client())
 
 	m3u := "#EXTM3U\n" +
 		"#EXTINF:-1 tvg-id=\"ch-ok\",Live OK\n" + upstream.URL + "/live.ts\n" +
@@ -579,9 +592,9 @@ func TestDueRecordingJobsAndDVRIntegration(t *testing.T) {
 	defer func() { _ = rec.Close() }()
 	h.SetRecorder(rec)
 
-	// Seed two channels: one valid LAN/loopback URL and one blocked cloud metadata URL
+	// Seed two channels: one valid LAN URL and one blocked cloud metadata URL
 	m3u := "#EXTM3U\n" +
-		"#EXTINF:-1 tvg-id=\"good\",Good TV\nhttp://127.0.0.1:18080/live.ts\n" +
+		"#EXTINF:-1 tvg-id=\"good\",Good TV\nhttp://192.168.1.50:18080/live.ts\n" +
 		"#EXTINF:-1 tvg-id=\"bad\",Bad TV\nhttp://169.254.169.254/live.ts\n"
 	res := doJSON(t, mux, http.MethodPost, "/LiveTv/TunerHosts", map[string]any{
 		"Type":       "m3u",
@@ -747,6 +760,7 @@ func TestHLSPlaylistURIRewritingAndTargetSSRF(t *testing.T) {
 		}
 	}))
 	defer upstream.Close()
+	h.SetStreamClient(upstream.Client())
 
 	m3u := "#EXTM3U\n#EXTINF:-1 tvg-id=\"hls-ch\",HLS Channel\n" + upstream.URL + "/hls/master.m3u8\n"
 	if r := doJSON(t, mux, http.MethodPost, "/LiveTv/TunerHosts", map[string]any{
@@ -760,7 +774,7 @@ func TestHLSPlaylistURIRewritingAndTargetSSRF(t *testing.T) {
 	_ = json.Unmarshal(doJSON(t, mux, http.MethodGet, "/LiveTv/Channels", nil).Body.Bytes(), &chRes)
 	chID := chRes.Items[0].Id
 
-	// 1. Request master playlist with api_key query param -> relative signed Stream?target=...&sig=...
+	// 1. Request master playlist with api_key query param -> relative signed Stream?target=...&exp=...&lan=1&sig=...
 	req := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?api_key=tok-query", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -770,20 +784,23 @@ func TestHLSPlaylistURIRewritingAndTargetSSRF(t *testing.T) {
 	body := rec.Body.String()
 	audioTarget := upstream.URL + "/hls/audio/eng.m3u8"
 	subTarget := upstream.URL + "/hls/sub/720p.m3u8"
-	wantAudio := `URI="Stream?target=` + url.QueryEscape(audioTarget) + `&sig=` + h.signProxyTarget(chID, audioTarget) + `&api_key=tok-query"`
-	wantSub := "Stream?target=" + url.QueryEscape(subTarget) + "&sig=" + h.signProxyTarget(chID, subTarget) + "&api_key=tok-query"
-	if !strings.Contains(body, wantAudio) {
-		t.Fatalf("expected rewritten EXT-X-MEDIA URI %q in:\n%s", wantAudio, body)
+	if !strings.Contains(body, `URI="Stream?target=`+url.QueryEscape(audioTarget)+`&exp=`) ||
+		!strings.Contains(body, `&lan=1&sig=`) ||
+		!strings.Contains(body, `&api_key=tok-query"`) {
+		t.Fatalf("expected rewritten EXT-X-MEDIA URI in:\n%s", body)
 	}
-	if !strings.Contains(body, wantSub) {
-		t.Fatalf("expected rewritten sub-playlist URI %q in:\n%s", wantSub, body)
+	if !strings.Contains(body, "Stream?target="+url.QueryEscape(subTarget)+"&exp=") {
+		t.Fatalf("expected rewritten sub-playlist URI in:\n%s", body)
 	}
 	if strings.Contains(body, "/emby/") {
 		t.Fatalf("expected relative rewrite without /emby/ prefix, got:\n%s", body)
 	}
 
+	exp := time.Now().UTC().Add(time.Hour).Unix()
+	expStr := strconv.FormatInt(exp, 10)
+
 	// 2. Request sub-playlist via signed target query param + X-Emby-Token header
-	subReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?target="+url.QueryEscape(subTarget)+"&sig="+h.signProxyTarget(chID, subTarget), nil)
+	subReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?target="+url.QueryEscape(subTarget)+"&exp="+expStr+"&lan=1&sig="+h.signProxyTarget(chID, subTarget, true, exp), nil)
 	subReq.Header.Set("X-Emby-Token", "tok-header")
 	subRec := httptest.NewRecorder()
 	mux.ServeHTTP(subRec, subReq)
@@ -795,11 +812,13 @@ func TestHLSPlaylistURIRewritingAndTargetSSRF(t *testing.T) {
 	mapTarget := upstream.URL + "/hls/sub/init.mp4"
 	seg0Target := upstream.URL + "/hls/sub/seg0.ts"
 	seg1Target := upstream.URL + "/cdn/seg1.ts"
-	wantKey := `URI="Stream?target=` + url.QueryEscape(keyTarget) + `&sig=` + h.signProxyTarget(chID, keyTarget) + `&api_key=tok-header"`
-	wantMap := `URI="Stream?target=` + url.QueryEscape(mapTarget) + `&sig=` + h.signProxyTarget(chID, mapTarget) + `&api_key=tok-header"`
-	wantSeg0 := "Stream?target=" + url.QueryEscape(seg0Target) + "&sig=" + h.signProxyTarget(chID, seg0Target) + "&api_key=tok-header"
-	wantSeg1 := "Stream?target=" + url.QueryEscape(seg1Target) + "&sig=" + h.signProxyTarget(chID, seg1Target) + "&api_key=tok-header"
-	for _, want := range []string{wantKey, wantMap, wantSeg0, wantSeg1} {
+	for _, want := range []string{
+		`URI="Stream?target=` + url.QueryEscape(keyTarget) + `&exp=`,
+		`URI="Stream?target=` + url.QueryEscape(mapTarget) + `&exp=`,
+		"Stream?target=" + url.QueryEscape(seg0Target) + "&exp=",
+		"Stream?target=" + url.QueryEscape(seg1Target) + "&exp=",
+		"&api_key=tok-header",
+	} {
 		if !strings.Contains(subBody, want) {
 			t.Fatalf("expected %q in rewritten sub-playlist:\n%s", want, subBody)
 		}
@@ -815,22 +834,28 @@ func TestHLSPlaylistURIRewritingAndTargetSSRF(t *testing.T) {
 	}
 
 	// 4. Proxy actual TS segment via signed target param
-	segReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?target="+url.QueryEscape(seg0Target)+"&sig="+h.signProxyTarget(chID, seg0Target), nil)
+	segReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?target="+url.QueryEscape(seg0Target)+"&exp="+expStr+"&lan=1&sig="+h.signProxyTarget(chID, seg0Target, true, exp), nil)
 	segRec := httptest.NewRecorder()
 	mux.ServeHTTP(segRec, segReq)
 	if segRec.Code != http.StatusOK || segRec.Body.String() != "SEGMENT_0_BYTES" {
 		t.Fatalf("expected segment bytes, got %d %q", segRec.Code, segRec.Body.String())
 	}
 
-	// 5. Missing, forged, or cross-channel HMAC signature on target param -> 403 Forbidden
+	// 5. Missing, forged, expired, cross-scope, or cross-channel HMAC signature on target param -> 403 Forbidden
+	expiredExp := time.Now().UTC().Add(-time.Minute).Unix()
+	expiredStr := strconv.FormatInt(expiredExp, 10)
 	for _, tc := range []struct {
 		name  string
 		query string
 	}{
-		{"missing sig", "target=" + url.QueryEscape(seg0Target)},
-		{"invalid hex sig", "target=" + url.QueryEscape(seg0Target) + "&sig=not-hex"},
-		{"wrong sig", "target=" + url.QueryEscape(seg0Target) + "&sig=" + strings.Repeat("a", 64)},
-		{"wrong channel sig", "target=" + url.QueryEscape(seg0Target) + "&sig=" + h.signProxyTarget("other-channel", seg0Target)},
+		{"missing sig", "target=" + url.QueryEscape(seg0Target) + "&exp=" + expStr + "&lan=1"},
+		{"missing exp", "target=" + url.QueryEscape(seg0Target) + "&lan=1&sig=" + h.signProxyTarget(chID, seg0Target, true, exp)},
+		{"expired sig", "target=" + url.QueryEscape(seg0Target) + "&exp=" + expiredStr + "&lan=1&sig=" + h.signProxyTarget(chID, seg0Target, true, expiredExp)},
+		{"missing lan", "target=" + url.QueryEscape(seg0Target) + "&exp=" + expStr + "&sig=" + h.signProxyTarget(chID, seg0Target, true, exp)},
+		{"tampered lan scope", "target=" + url.QueryEscape(seg0Target) + "&exp=" + expStr + "&lan=1&sig=" + h.signProxyTarget(chID, seg0Target, false, exp)},
+		{"invalid hex sig", "target=" + url.QueryEscape(seg0Target) + "&exp=" + expStr + "&lan=1&sig=not-hex"},
+		{"wrong sig", "target=" + url.QueryEscape(seg0Target) + "&exp=" + expStr + "&lan=1&sig=" + strings.Repeat("a", 64)},
+		{"wrong channel sig", "target=" + url.QueryEscape(seg0Target) + "&exp=" + expStr + "&lan=1&sig=" + h.signProxyTarget("other-channel", seg0Target, true, exp)},
 		{"unsigned ssrf target", "target=" + url.QueryEscape("http://169.254.169.254/latest/meta-data/")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -848,8 +873,8 @@ func TestHLSPlaylistURIRewritingAndTargetSSRF(t *testing.T) {
 		"http://169.254.169.254/latest/meta-data/",
 		"file:///etc/passwd",
 	} {
-		sig := h.signProxyTarget(chID, unsafeTarget)
-		badReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?target="+url.QueryEscape(unsafeTarget)+"&sig="+sig, nil)
+		sig := h.signProxyTarget(chID, unsafeTarget, true, exp)
+		badReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?target="+url.QueryEscape(unsafeTarget)+"&exp="+expStr+"&lan=1&sig="+sig, nil)
 		badRec := httptest.NewRecorder()
 		mux.ServeHTTP(badRec, badReq)
 		if badRec.Code != http.StatusBadRequest {
@@ -908,7 +933,7 @@ func TestDVRCompletionCallbackUpdatesTimerAndCreatesRecording(t *testing.T) {
 		TimerID:     "ok-timer",
 		ChannelName: "CCTV 1",
 		ProgramName: "Evening News",
-		StreamURL:   "http://127.0.0.1:9999/ok.ts",
+		StreamURL:   "http://192.168.1.50:9999/ok.ts",
 	}); err != nil {
 		t.Fatalf("start ok-timer: %v", err)
 	}
@@ -916,7 +941,7 @@ func TestDVRCompletionCallbackUpdatesTimerAndCreatesRecording(t *testing.T) {
 		TimerID:     "fail-timer",
 		ChannelName: "CCTV 2",
 		ProgramName: "Broken Stream",
-		StreamURL:   "http://127.0.0.1:9999/fail.ts",
+		StreamURL:   "http://192.168.1.50:9999/fail.ts",
 	}); err != nil {
 		t.Fatalf("start fail-timer: %v", err)
 	}
@@ -1156,7 +1181,7 @@ func TestDVRStartFailureTransitionsTimerToFailed(t *testing.T) {
 		TimerID:     "start-fail-timer",
 		ChannelName: "CCTV 1",
 		ProgramName: "Missing Binary Show",
-		StreamURL:   "http://127.0.0.1:9999/live.ts",
+		StreamURL:   "http://192.168.1.50:9999/live.ts",
 	}); err == nil {
 		t.Fatal("expected StartRecording error for missing ffmpeg binary")
 	}

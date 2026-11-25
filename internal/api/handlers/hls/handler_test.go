@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/ambra-media/ambra/internal/api/handlers/hls"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
@@ -132,8 +133,9 @@ func TestHLSPlaylistsSegmentAndActiveEncodings(t *testing.T) {
 		t.Fatalf("expected video/mp2t, got %q", ct)
 	}
 
-	// 4. DELETE /Videos/ActiveEncodings
+	// 4. DELETE /Videos/ActiveEncodings (authenticated admin/API key stops unowned session)
 	req = httptest.NewRequest(http.MethodDelete, "/Videos/ActiveEncodings?DeviceId=dev1", nil)
+	req = req.WithContext(middleware.WithAuthContext(req.Context(), &middleware.AuthContext{IsAPIKey: true}))
 	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNoContent {

@@ -28,7 +28,6 @@
   "common.copy": "คัดลอก",
   "common.copied": "คัดลอกแล้ว",
   "common.language": "ภาษา",
-
   "nav.home": "หน้าแรก",
   "nav.trending": "ยอดนิยม",
   "nav.collections": "คอลเลกชัน",
@@ -50,7 +49,6 @@
   "nav.demoDesc": "(จำลองในหน่วยความจำฝั่งฟรอนต์เอนด์ ไม่ต้องใช้แบ็กเอนด์ · เปลี่ยนแปลงมีผลทันที)",
   "nav.demoSwitchGuest": "มุมมองผู้ดูแล · สลับเป็นผู้ใช้ทั่วไปเพื่อทดลอง RBAC",
   "nav.demoSwitchAdmin": "มุมมองผู้ใช้ทั่วไป · กลับสู่คอนโซลผู้ดูแลระบบ",
-
   "auth.loginTitle": "เข้าสู่ระบบ Ambra",
   "auth.loginSubtitle": "เชื่อมต่อกับเซิร์ฟเวอร์โรงภาพยนตร์ส่วนตัวของคุณ",
   "auth.username": "ชื่อผู้ใช้",
@@ -65,7 +63,6 @@
   "auth.noAdminDesc": "บัญชีนี้ไม่มีสิทธิ์ผู้ดูแลระบบ (IsAdministrator = false) หากต้องการจัดการการตั้งค่าเซิร์ฟเวอร์ ผู้ใช้ หรือคลังสื่อ โปรดติดต่อผู้ดูแลระบบ",
   "auth.backHome": "กลับหน้าแรก",
   "auth.verifyingAdmin": "กำลังตรวจสอบสิทธิ์ผู้ดูแลระบบ...",
-
   "setup.title": "ยินดีต้อนรับสู่ Ambra",
   "setup.subtitle": "ตั้งค่าเซิร์ฟเวอร์โรงภาพยนตร์ส่วนตัวในไม่กี่ขั้นตอน",
   "setup.serverName": "ชื่อเซิร์ฟเวอร์",
@@ -73,7 +70,6 @@
   "setup.tmdbLanguage": "ภาษาของข้อมูลเมตา",
   "setup.createAdmin": "สร้างบัญชีผู้ดูแลระบบ",
   "setup.complete": "เสร็จสิ้นการตั้งค่า",
-
   "home.continueWatching": "ดูต่อ",
   "home.nextUp": "ถัดไป",
   "home.myMedia": "สื่อของฉัน",
@@ -88,7 +84,6 @@
   "home.emptyTitle": "คลังสื่อยังว่างอยู่",
   "home.emptyDesc": "ไปที่คอนโซลผู้ดูแลระบบเพื่อเพิ่มโฟลเดอร์สื่อในเครื่องหรือโฟลเดอร์ .strm และเริ่มการสแกนครั้งแรก",
   "home.goManageLibraries": "เพิ่มคลังสื่อ",
-
   "library.allItems": "ทั้งหมด",
   "library.albums": "อัลบั้ม",
   "library.artists": "ศิลปิน",
@@ -111,7 +106,6 @@
   "library.exitMultiSelect": "ออกจากการเลือก",
   "library.selectedCount": "เลือกแล้ว {{count}} รายการ",
   "library.emptyResult": "ไม่พบรายการที่ตรงเงื่อนไข",
-
   "detail.play": "เล่น",
   "detail.resume": "เล่นต่อ",
   "detail.favorite": "รายการโปรด",
@@ -146,7 +140,6 @@
   "detail.container": "รูปแบบคอนเทนเนอร์",
   "detail.fileSize": "ขนาดไฟล์",
   "detail.bitrate": "บิตเรตทั้งหมด",
-
   "player.quality": "คุณภาพ",
   "player.qualityAuto": "เล่นต้นฉบับโดยตรง",
   "player.version": "เวอร์ชัน",
@@ -163,33 +156,27 @@
   "player.playNextNow": "เล่นเลย",
   "player.cancelNextUp": "ยกเลิก",
   "player.loadError": "ถอดรหัสหรือโหลดสตรีมวิดีโอไม่สำเร็จ โปรดตรวจสอบรูปแบบสื่อหรือการเชื่อมต่อเครือข่าย",
-
   "collections.title": "คอลเลกชันและเพลย์ลิสต์",
   "collections.boxSets": "คอลเลกชัน",
   "collections.playlists": "เพลย์ลิสต์",
   "collections.createCollection": "สร้างคอลเลกชันใหม่",
   "collections.createPlaylist": "สร้างเพลย์ลิสต์ใหม่",
   "collections.playAll": "เล่นทั้งหมด",
-
   "favorites.title": "รายการโปรด",
   "favorites.emptyTitle": "ยังไม่มีรายการโปรด",
   "favorites.emptyDesc": "กดปุ่มรายการโปรดในหน้าภาพยนตร์ ซีรีส์ หรือเพลงเพื่อเพิ่มมาที่นี่",
-
   "trending.title": "อันดับยอดนิยม",
   "trending.subtitle": "รวม TMDB ยอดนิยม, Douban Hot และ IMDb Top 250 เข้าถึงเรื่องที่มีในคลังได้ทันที",
   "trending.refreshNow": "ซิงก์อันดับทันที",
   "trending.inLibrary": "มีในคลัง",
-
   "livetv.title": "ทีวีสด",
   "livetv.channels": "ช่องรายการ",
   "livetv.guide": "ผังรายการ",
   "livetv.recordings": "รายการที่บันทึกไว้",
   "livetv.timers": "ตารางการบันทึก",
-
   "search.title": "สำรวจและค้นหา",
   "search.placeholder": "ค้นหาด้วยชื่อเรื่อง ชื่อต้นฉบับ หรือชื่อนักแสดง...",
   "search.noResults": "ไม่พบภาพยนตร์ ซีรีส์ หรือบุคคลที่ตรงกัน",
-
   "profile.title": "โปรไฟล์",
   "profile.uiLanguage": "ภาษาของอินเทอร์เฟซ",
   "profile.uiLanguageDesc": "เปลี่ยนภาษาที่แสดงบนเว็บไคลเอนต์และซิงก์ค่าที่เลือกกับเซิร์ฟเวอร์",
@@ -197,11 +184,9 @@
   "profile.avatar": "รูปโปรไฟล์",
   "profile.quickConnect": "การอนุญาตอุปกรณ์ Quick Connect",
   "profile.playbackPrefs": "การตั้งค่าการเล่น",
-
   "notifications.title": "ศูนย์การแจ้งเตือน",
   "notifications.markAllRead": "ทำเครื่องหมายว่าอ่านทั้งหมด",
   "notifications.empty": "ไม่มีการแจ้งเตือน",
-
   "admin.title": "คอนโซลผู้ดูแลระบบ",
   "admin.tabDashboard": "แดชบอร์ด",
   "admin.tabLibraries": "คลังสื่อ",
@@ -220,5 +205,20 @@
   "admin.serverLogs": "บันทึกเซิร์ฟเวอร์",
   "admin.downloadLog": "ดาวน์โหลดบันทึก",
   "admin.kickDevice": "ตัดการเชื่อมต่ออุปกรณ์",
-  "admin.revokeKey": "เพิกถอนคีย์"
+  "admin.revokeKey": "เพิกถอนคีย์",
+  "player.cannotPlayTitle": "ไม่สามารถเล่นสื่อนี้ได้",
+  "player.retryPlayback": "ลองเล่นอีกครั้ง",
+  "player.goBack": "ย้อนกลับ",
+  "player.subtitleOff": "ปิดคำบรรยาย",
+  "player.subtitleTweaks": "ปรับแต่งคำบรรยาย",
+  "player.loadingStream": "กำลังโหลดสตรีมสื่อ...",
+  "player.buffering": "กำลังบัฟเฟอร์...",
+  "admin.scanAllLibraries": "สแกนคลังสื่อทั้งหมด",
+  "admin.scanningAllLibraries": "กำลังเริ่มการสแกนคลังสื่อ...",
+  "admin.dashboardOverview": "ภาพรวมสถานะเซิร์ฟเวอร์",
+  "admin.usersTitle": "จัดการผู้ใช้และสิทธิ์ (RBAC)",
+  "admin.createUser": "สร้างผู้ใช้ใหม่",
+  "admin.pluginsTitle": "จัดการปลั๊กอินและตัวดึงข้อมูล",
+  "admin.webhooksTitle": "การแจ้งเตือน Webhook",
+  "admin.createWebhook": "เพิ่ม Webhook"
 }

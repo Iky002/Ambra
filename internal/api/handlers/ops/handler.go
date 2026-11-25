@@ -81,7 +81,7 @@ func New(store *sqlite.Store, cfg *config.Config, userRepo *sqlite.UserRepo, bus
 		cfg:        cfg,
 		userRepo:   userRepo,
 		bus:        bus,
-		httpClient: netutil.NewSafeHTTPClient(10*time.Second, true),
+		httpClient: netutil.NewSafeHTTPClientNoLoopback(10*time.Second, true),
 		state: opsState{
 			Startup: StartupConfiguration{
 				ServerName:                "Ambra Media Server",
@@ -133,7 +133,7 @@ func (h *Handler) getHTTPClient() *http.Client {
 	client := h.httpClient
 	h.mu.RUnlock()
 	if client == nil {
-		return netutil.NewSafeHTTPClient(10*time.Second, true)
+		return netutil.NewSafeHTTPClientNoLoopback(10*time.Second, true)
 	}
 	return client
 }

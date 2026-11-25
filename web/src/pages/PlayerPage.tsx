@@ -43,6 +43,7 @@ import { useAudioPlayer } from '../context/AudioPlayerContext'
 import { useAuth } from '../context/AuthContext'
 import { useWebSocket } from '../context/WebSocketContext'
 import { isDemoMode } from '../demo/demoMode'
+import { useI18n } from '../i18n/I18nContext'
 import { AssJassubRenderer } from '../player/assRenderer'
 import { PgsCanvasRenderer } from '../player/pgsRenderer'
 import {
@@ -226,6 +227,7 @@ export function PlayerPage() {
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
   const { auth } = useAuth()
+  const { t } = useI18n()
   const { subscribePlaystate } = useWebSocket()
   const audioPlayer = useAudioPlayer()
   const userId = auth!.userId
@@ -278,7 +280,6 @@ export function PlayerPage() {
   const [querySourceId, setQuerySourceId] = useState<string | undefined>(initialMediaSourceId)
   const [audioIndex, setAudioIndex] = useState<number | undefined>(initialAudio)
   const [queryAudioIndex, setQueryAudioIndex] = useState<number | undefined>(initialAudio)
-  const [audioManuallySwitched, setAudioManuallySwitched] = useState(false)
   const [subtitleIndex, setSubtitleIndex] = useState<number | undefined>(initialSubtitle)
   const [qualityPreset, setQualityPreset] = useState<QualityPresetId>('auto')
   const [episodeIdSynced, setEpisodeIdSynced] = useState<string | undefined>(id)
@@ -376,7 +377,6 @@ export function PlayerPage() {
       setQuerySourceId(nextSourceId)
       setAudioIndex(nextAudio)
       setQueryAudioIndex(nextAudio)
-      setAudioManuallySwitched(false)
       setSubtitleIndex(nextSubtitle)
       setQualityPreset('auto')
       setShowShortcuts(false)
@@ -393,13 +393,6 @@ export function PlayerPage() {
       setEpisodeIdSynced(id)
     }
   }, [id])
-
-  // 切换视频或音轨时重置强制回退状态
-  useEffect(() => {
-    setUseProxyDirect(false)
-    setForceServerHls(false)
-    setWasmFallbackNotice(null)
-  }, [id, selectedSourceId, audioIndex])
 
   // WebVTT / SRT 文本字幕状态 & 字幕微调偏好
   const [textCues, setTextCues] = useState<TextSubtitleCue[]>([])
@@ -511,6 +504,7 @@ export function PlayerPage() {
   const {
     data: playbackInfo,
     isLoading: infoLoading,
+    isPlaceholderData: infoIsPlaceholder,
     error: infoError,
     refetch: refetchPlaybackInfo,
   } = useQuery({
@@ -535,10 +529,22 @@ export function PlayerPage() {
     )
   }, [playbackInfo, selectedSourceId])
 
-  const streams = activeSource?.MediaStreams || []
-  const videoStream = streams.find((s) => s.Type === 'Video')
-  const audioStreams = streams.filter((s) => s.Type === 'Audio')
-  const subtitleStreams = streams.filter((s) => s.Type === 'Subtitle')
+  const streams = useMemo(() => activeSource?.MediaStreams || [], [activeSource?.MediaStreams])
+  const videoStream = useMemo(() => streams.find((s) => s.Type === 'Video'), [streams])
+  const audioStreams = useMemo(() => streams.filter((s) => s.Type === 'Audio'), [streams])
+  const subtitleStreams = useMemo(() => streams.filter((s) => s.Type === 'Subtitle'), [streams])
+
+  // 同步计算生效音轨（避免首帧 audioIndex=undefined 与初始化回填触发两次流挂载）
+  const effectiveAudioIndex = useMemo(() => {
+    if (audioIndex !== undefined) return audioIndex
+    if (!activeSource || episodeIdSynced !== id) return undefined
+    const prefs = loadPlaybackPrefs()
+    return pickPreferredAudioIndex(
+      audioStreams,
+      prefs.preferredAudioLang,
+      activeSource.DefaultAudioStreamIndex,
+    )
+  }, [audioIndex, activeSource, episodeIdSynced, id, audioStreams])
 
   // 初始化默认音轨与字幕轨（优先用户偏好语言，其次服务端默认；每个媒体源仅初始化一次，避免用户关闭字幕后回弹）
   useEffect(() => {
@@ -638,25 +644,43 @@ export function PlayerPage() {
   )
 
   const activeAudioStream = useMemo(
-    () => audioStreams.find((a) => a.Index === audioIndex) || audioStreams[0],
-    [audioStreams, audioIndex],
+    () => audioStreams.find((a) => a.Index === effectiveAudioIndex) || audioStreams[0],
+    [audioStreams, effectiveAudioIndex],
   )
 
   const selectedAudioOrdinal = useMemo(() => {
-    if (audioIndex === undefined || audioStreams.length === 0) return undefined
-    const idx = audioStreams.findIndex((a) => a.Index === audioIndex)
+    if (effectiveAudioIndex === undefined || audioStreams.length === 0) return undefined
+    const idx = audioStreams.findIndex((a) => a.Index === effectiveAudioIndex)
     return idx >= 0 ? idx : undefined
-  }, [audioStreams, audioIndex])
+  }, [audioStreams, effectiveAudioIndex])
+
+  const selectedAudioOrdinalRef = useRef(selectedAudioOrdinal)
+  selectedAudioOrdinalRef.current = selectedAudioOrdinal
+
+  const browserSupportsHls = useMemo(() => {
+    if (Hls.isSupported()) return true
+    if (typeof document !== 'undefined') {
+      const probe = document.createElement('video')
+      if (
+        typeof probe.canPlayType === 'function' &&
+        probe.canPlayType('application/vnd.apple.mpegurl')
+      ) {
+        return true
+      }
+    }
+    return false
+  }, [])
 
   const defaultAudioStreamIndex =
     activeSource?.DefaultAudioStreamIndex ?? audioStreams[0]?.Index
   const isNonDefaultEmbeddedAudio =
     audioStreams.length > 1 &&
-    audioIndex !== undefined &&
+    effectiveAudioIndex !== undefined &&
     defaultAudioStreamIndex !== undefined &&
-    audioIndex !== defaultAudioStreamIndex &&
+    effectiveAudioIndex !== defaultAudioStreamIndex &&
     !activeAudioStream?.IsExternal
-  const needsTrackSwitchRemux = audioManuallySwitched && isNonDefaultEmbeddedAudio
+  // 无论是 URL ?audio=N、用户语言偏好还是手动切换，只要选中非默认内封音轨即触发音轨选择/切流
+  const needsTrackSwitchRemux = isNonDefaultEmbeddedAudio
 
   // 播放策略规划：
   // 1) 原生兼容容器 (mp4/m4v/webm/mov) 且音轨原生兼容 -> DirectPlay
@@ -666,13 +690,15 @@ export function PlayerPage() {
   //    - 否则 / 超时 / 超阈值 / 出错 -> 自动无感回退服务端 HLS (master.m3u8)
   // 4) 字幕始终走客户端 JASSUB / PGS Canvas / WebVTT，绝不因字幕触发转码
   const streamPlan = useMemo(() => {
-    if (!activeSource || !id) return null
+    if (!activeSource || !id || infoIsPlaceholder) return null
 
     const staticParams = new URLSearchParams({
       Static: 'true',
       MediaSourceId: activeSource.Id,
     })
-    if (audioIndex !== undefined) staticParams.set('AudioStreamIndex', String(audioIndex))
+    if (effectiveAudioIndex !== undefined) {
+      staticParams.set('AudioStreamIndex', String(effectiveAudioIndex))
+    }
     const staticDirectUrl = resolveApiUrl(
       `/emby/Videos/${encodeURIComponent(id)}/stream?${staticParams.toString()}`,
     )
@@ -696,7 +722,9 @@ export function PlayerPage() {
       MediaSourceId: activeSource.Id,
     })
     if (playbackInfo?.PlaySessionId) hlsParams.set('PlaySessionId', playbackInfo.PlaySessionId)
-    if (audioIndex !== undefined) hlsParams.set('AudioStreamIndex', String(audioIndex))
+    if (effectiveAudioIndex !== undefined) {
+      hlsParams.set('AudioStreamIndex', String(effectiveAudioIndex))
+    }
     if (qualityPreset !== 'auto') {
       if (activeQuality.maxBitrate) {
         hlsParams.set('MaxStreamingBitrate', String(activeQuality.maxBitrate))
@@ -751,8 +779,12 @@ export function PlayerPage() {
       }
     }
 
-    // 1. 原生兼容容器 + 原生兼容音轨（且未显式切换非默认内封音轨）-> DirectPlay
-    if (!requiresRemux && !needsTrackSwitchRemux && activeSource.SupportsDirectPlay !== false) {
+    // 1. 原生兼容容器 + 原生兼容音轨（未选中非默认内封音轨，或当前环境不支持 HLS 时由 DirectPlay 配合 audioTracks 切轨）-> DirectPlay
+    if (
+      !requiresRemux &&
+      (!needsTrackSwitchRemux || (!mkvStreamEligible && !browserSupportsHls)) &&
+      activeSource.SupportsDirectPlay !== false
+    ) {
       return {
         strategy: 'direct' as const,
         directUrl,
@@ -765,7 +797,7 @@ export function PlayerPage() {
       }
     }
 
-    // 2. 非原生 MKV 或显式切换内封音轨的 MKV 且浏览器 MSE 支持该音视频编码 -> 优先流式 Range + MSE（支持指定音轨）
+    // 2. 非原生 MKV 或选中非默认内封音轨的 MKV 且浏览器 MSE 支持该音视频编码 -> 优先流式 Range + MSE（支持指定音轨）
     if ((requiresRemux || needsTrackSwitchRemux) && preferWasmRemux && mkvStreamEligible) {
       return {
         strategy: 'stream-mkv' as const,
@@ -779,7 +811,7 @@ export function PlayerPage() {
       }
     }
 
-    // 2.5 用户显式切换静态 DirectPlay 容器（如 MP4）的非默认内封音轨 -> 切换服务端 HLS 精准选轨
+    // 2.5 静态 DirectPlay 容器（如 MP4）选中非默认内封音轨（?audio=N / 偏好语言 / 手动切换）-> 切换服务端 HLS 精准选轨
     if (needsTrackSwitchRemux && !requiresRemux) {
       return {
         strategy: 'hls' as const,
@@ -789,7 +821,7 @@ export function PlayerPage() {
         isStrm,
         requiresRemux,
         withinWasmThreshold,
-        skipReason: '切换非默认内封音轨，已自动使用 HLS 音轨流',
+        skipReason: '已切换非默认内封音轨，自动使用 HLS 音轨流',
       }
     }
 
@@ -837,7 +869,8 @@ export function PlayerPage() {
   }, [
     activeSource,
     id,
-    audioIndex,
+    infoIsPlaceholder,
+    effectiveAudioIndex,
     playbackInfo?.PlaySessionId,
     videoStream?.Codec,
     activeAudioStream?.Codec,
@@ -846,6 +879,7 @@ export function PlayerPage() {
     forceServerHls,
     qualityPreset,
     needsTrackSwitchRemux,
+    browserSupportsHls,
   ])
 
   // 挂载视频流 (DirectPlay / Stream MKV (MSE) / Client WASM Remux / Server HLS 自动降级)
@@ -902,6 +936,22 @@ export function PlayerPage() {
       video.muted = mutedRef.current
       if (Number.isFinite(playbackRateRef.current) && playbackRateRef.current > 0) {
         video.playbackRate = playbackRateRef.current
+      }
+      // 在支持原生 HTMLMediaElement.audioTracks 的浏览器（如 Safari）下，DirectPlay 同步切换对应音轨
+      const nativeAudioTracks = (
+        video as HTMLVideoElement & {
+          audioTracks?: { length: number; [idx: number]: { enabled: boolean } }
+        }
+      ).audioTracks
+      if (
+        nativeAudioTracks &&
+        nativeAudioTracks.length > 1 &&
+        selectedAudioOrdinalRef.current !== undefined
+      ) {
+        const targetOrd = selectedAudioOrdinalRef.current
+        for (let i = 0; i < nativeAudioTracks.length; i++) {
+          nativeAudioTracks[i].enabled = i === targetOrd
+        }
       }
       video.play().catch(() => {
         // 浏览器自动播放策略阻止时保持暂停状态让用户点击
@@ -1152,8 +1202,15 @@ export function PlayerPage() {
     [activeSource?.Id, id],
   )
 
+  const activeSubtitleStreamRef = useRef<MediaStream | undefined>(activeSubtitleStream)
+  activeSubtitleStreamRef.current = activeSubtitleStream
+  const activeSubtitleKey = activeSubtitleStream
+    ? `${id || ''}|${activeSource?.Id || ''}|${activeSubtitleStream.Index}|${activeSubtitleStream.DeliveryUrl || ''}|${activeSubtitleStream.Codec || ''}`
+    : ''
+
   // 字幕渲染引擎切换与生命周期管理（JASSUB WASM / PGS Canvas / Native VTT）
   useEffect(() => {
+    const currentSubStream = activeSubtitleStreamRef.current
     let cancelled = false
     setSubtitleError(null)
     setTextCues([])
@@ -1176,10 +1233,10 @@ export function PlayerPage() {
 
     const setup = async () => {
       await cleanupEngines()
-      if (cancelled || !activeSubtitleStream) return
+      if (cancelled || !currentSubStream) return
 
-      const engine = detectSubtitleEngine(activeSubtitleStream)
-      const subUrl = resolveSubtitleUrl(activeSubtitleStream)
+      const engine = detectSubtitleEngine(currentSubStream)
+      const subUrl = resolveSubtitleUrl(currentSubStream)
 
       try {
         if (engine === 'ass') {
@@ -1236,7 +1293,7 @@ export function PlayerPage() {
       cancelled = true
       void cleanupEngines()
     }
-  }, [activeSubtitleStream, resolveSubtitleUrl, id, activeSource?.Id])
+  }, [activeSubtitleKey, resolveSubtitleUrl, id, activeSource?.Id])
 
   // 字幕时间轴偏移实时同步至 ASS (JASSUB) 与 PGS Canvas 引擎
   useEffect(() => {
@@ -1581,14 +1638,16 @@ export function PlayerPage() {
 
   const cycleAudio = useCallback(() => {
     if (audioStreams.length <= 1) return
-    const curPos = audioStreams.findIndex((a) => a.Index === audioIndex)
+    const curPos = audioStreams.findIndex((a) => a.Index === effectiveAudioIndex)
     const next = audioStreams[(curPos + 1) % audioStreams.length]
     captureResumePosition()
-    setAudioManuallySwitched(true)
+    setUseProxyDirect(false)
+    setForceServerHls(false)
+    setWasmFallbackNotice(null)
     setAudioIndex(next.Index)
     setQueryAudioIndex(next.Index)
     pokeOsd()
-  }, [audioStreams, audioIndex, captureResumePosition, pokeOsd])
+  }, [audioStreams, effectiveAudioIndex, captureResumePosition, pokeOsd])
 
   const handleRetryPlayback = useCallback(() => {
     captureResumePosition()
@@ -1833,7 +1892,7 @@ export function PlayerPage() {
             return
           }
           setBuffering(false)
-          setPlayerError('视频流解码或加载失败，请检查媒体格式或网络连接')
+          setPlayerError(t('player.loadError'))
         }}
         className={`h-full w-full ${aspectMode === 'cover' ? 'object-cover' : 'object-contain'}`}
       />
@@ -1940,7 +1999,7 @@ export function PlayerPage() {
               <Loader2 className="absolute -bottom-1.5 -right-1.5 h-5 w-5 animate-spin rounded-full bg-zinc-950/90 p-0.5 text-amber-400" />
             </div>
             <span className="text-xs font-medium tracking-wide text-zinc-300">
-              {infoLoading ? '正在加载媒体流...' : '正在缓冲...'}
+              {infoLoading ? t('player.loadingStream') : t('player.buffering')}
             </span>
           </div>
         </div>
@@ -1951,7 +2010,7 @@ export function PlayerPage() {
         <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/80 px-4">
           <div className="max-w-md rounded-2xl border border-red-500/30 bg-zinc-950 p-6 text-center shadow-2xl">
             <AlertTriangle className="mx-auto mb-3 h-10 w-10 text-red-400" />
-            <h2 className="text-base font-semibold text-white">无法播放该媒体</h2>
+            <h2 className="text-base font-semibold text-white">{t('player.cannotPlayTitle')}</h2>
             <p className="mt-2 text-xs text-zinc-400">
               {playerError || (infoError instanceof Error ? infoError.message : '获取播放信息失败')}
             </p>
@@ -1961,14 +2020,14 @@ export function PlayerPage() {
                 onClick={handleRetryPlayback}
                 className="rounded-xl bg-amber-500 px-5 py-2 text-xs font-semibold text-zinc-950 hover:bg-amber-400"
               >
-                重试播放
+                {t('player.retryPlayback')}
               </button>
               <button
                 type="button"
                 onClick={handleExit}
                 className="rounded-xl border border-white/15 bg-white/10 px-5 py-2 text-xs font-semibold text-zinc-100 hover:bg-white/20"
               >
-                返回上一页
+                {t('player.goBack')}
               </button>
             </div>
           </div>
@@ -2031,7 +2090,7 @@ export function PlayerPage() {
           <div className="mb-3 flex items-center justify-between border-b border-white/10 pb-2">
             <span className="flex items-center gap-1.5 font-semibold text-amber-400">
               <Activity className="h-3.5 w-3.5" />
-              播放统计信息
+              {t('player.stats')}
             </span>
             <button
               type="button"
@@ -2125,7 +2184,7 @@ export function PlayerPage() {
             <div className="mb-3 flex items-center justify-between border-b border-white/10 pb-2.5">
               <span className="flex items-center gap-1.5 text-sm font-semibold text-amber-400">
                 <HelpCircle className="h-4 w-4" />
-                快捷键说明
+                {t('player.shortcuts')}
               </span>
               <button
                 type="button"
@@ -2452,13 +2511,27 @@ export function PlayerPage() {
                           onClick={() => {
                             if (src.Id !== activeSource?.Id) {
                               captureResumePosition()
+                              const prefs = loadPlaybackPrefs()
+                              const nextStreams = src.MediaStreams || []
+                              const nextAudioList = nextStreams.filter((s) => s.Type === 'Audio')
+                              const nextAudio = pickPreferredAudioIndex(
+                                nextAudioList,
+                                prefs.preferredAudioLang,
+                                src.DefaultAudioStreamIndex,
+                              )
                               initializedAudioSourceIdRef.current = null
                               initializedSubSourceIdRef.current = null
+                              setUseProxyDirect(false)
+                              setForceServerHls(false)
+                              setWasmFallbackNotice(null)
                               setSelectedSourceId(src.Id)
                               setQuerySourceId(src.Id)
-                              setAudioManuallySwitched(false)
-                              setAudioIndex(undefined)
-                              setQueryAudioIndex(undefined)
+                              setAudioIndex(nextAudio)
+                              setQueryAudioIndex(
+                                nextAudio !== undefined && nextAudio !== src.DefaultAudioStreamIndex
+                                  ? nextAudio
+                                  : undefined,
+                              )
                               setSubtitleIndex(undefined)
                             }
                             setActivePanel('none')
@@ -2558,14 +2631,18 @@ export function PlayerPage() {
                           key={a.Index}
                           type="button"
                           onClick={() => {
-                            captureResumePosition()
-                            setAudioManuallySwitched(true)
-                            setAudioIndex(a.Index)
-                            setQueryAudioIndex(a.Index)
+                            if (a.Index !== effectiveAudioIndex) {
+                              captureResumePosition()
+                              setUseProxyDirect(false)
+                              setForceServerHls(false)
+                              setWasmFallbackNotice(null)
+                              setAudioIndex(a.Index)
+                              setQueryAudioIndex(a.Index)
+                            }
                             setActivePanel('none')
                           }}
                           className={`flex w-full items-center justify-between rounded-xl px-2.5 py-2 text-left text-xs transition-colors ${
-                            a.Index === audioIndex
+                            a.Index === effectiveAudioIndex
                               ? 'bg-amber-500/20 font-semibold text-amber-300'
                               : 'text-zinc-200 hover:bg-white/8'
                           }`}
@@ -2615,7 +2692,7 @@ export function PlayerPage() {
                           : 'text-zinc-200 hover:bg-white/8'
                       }`}
                     >
-                      <span>关闭字幕</span>
+                      <span>{t('player.subtitleOff')}</span>
                     </button>
                     {subtitleStreams.map((s) => {
                       const meta = getSubtitleMeta(s)
@@ -2662,14 +2739,14 @@ export function PlayerPage() {
                 title="字幕微调（时间偏移 / 字号 / 边距 / 背景）"
               >
                 <SlidersHorizontal className="h-4 w-4" />
-                <span className="hidden lg:inline">字幕微调</span>
+                <span className="hidden lg:inline">{t('player.subtitleTweaks')}</span>
               </button>
 
               {activePanel === 'subtitlePrefs' && (
                 <div className="absolute bottom-12 right-0 z-30 w-80 overflow-hidden rounded-2xl border border-white/15 bg-zinc-950/95 p-3.5 shadow-2xl backdrop-blur-xl">
                   <div className="mb-3 flex items-center justify-between">
                     <div>
-                      <p className="text-xs font-semibold text-white">字幕微调</p>
+                      <p className="text-xs font-semibold text-white">{t('player.subtitleTweaks')}</p>
                       <p className="text-[10px] text-zinc-400">
                         偏移同步作用于 ASS / PGS / VTT / SRT
                       </p>

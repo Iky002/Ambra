@@ -14,6 +14,7 @@ import {
 import { api } from '../../api/client'
 import type { WebhookInfo, WebhookTestResult } from '../../api/types'
 import { QueryErrorState } from '../../components/QueryErrorState'
+import { useI18n } from '../../i18n/I18nContext'
 import { AdminModal, FeedbackBanner, ToggleSwitch } from './adminUtils'
 
 export const WEBHOOK_EVENT_OPTIONS = [
@@ -40,6 +41,7 @@ const EVENT_LABEL_MAP: Record<string, string> = {
 
 export function WebhooksTab() {
   const queryClient = useQueryClient()
+  const { t } = useI18n()
 
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
     null,
@@ -48,6 +50,7 @@ export function WebhooksTab() {
   // 新增 / 编辑弹窗状态
   const [modalOpen, setModalOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [editingHasSecret, setEditingHasSecret] = useState(false)
   const [name, setName] = useState('')
   const [url, setUrl] = useState('')
   const [secret, setSecret] = useState('')
@@ -81,6 +84,7 @@ export function WebhooksTab() {
 
   const openCreateModal = () => {
     setEditingId(null)
+    setEditingHasSecret(false)
     setName('')
     setUrl('')
     setSecret('')
@@ -92,9 +96,10 @@ export function WebhooksTab() {
 
   const openEditModal = (wh: WebhookInfo) => {
     setEditingId(wh.Id)
+    setEditingHasSecret(Boolean(wh.HasSecret || wh.Secret))
     setName(wh.Name)
     setUrl(wh.Url)
-    setSecret(wh.Secret || '')
+    setSecret('')
     setEnabled(wh.Enabled)
     setEvents(Array.isArray(wh.Events) && wh.Events.length > 0 ? [...wh.Events] : ['*'])
     setModalError(null)
@@ -241,7 +246,7 @@ export function WebhooksTab() {
         <div>
           <h2 className="flex items-center gap-2 text-base font-semibold text-zinc-100">
             <Webhook className="h-4 w-4 text-amber-400" />
-            <span>Webhook 事件通知</span>
+            <span>{t('admin.webhooksTitle')}</span>
           </h2>
           <p className="mt-1 text-xs text-zinc-400">
             将媒体库入库、播放启停与系统任务事件通过 HTTP POST 实时推送至 Discord、Slack 或自建服务
@@ -254,7 +259,7 @@ export function WebhooksTab() {
           className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-4 py-2 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/20 transition-colors hover:bg-amber-400"
         >
           <Plus className="h-4 w-4" />
-          <span>新增 Webhook</span>
+          <span>{t('admin.createWebhook')}</span>
         </button>
       </div>
 
@@ -317,7 +322,7 @@ export function WebhooksTab() {
                           已停用
                         </span>
                       )}
-                      {wh.Secret && (
+                      {(wh.HasSecret || Boolean(wh.Secret)) && (
                         <span className="inline-flex items-center gap-1 rounded-md bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300 ring-1 ring-amber-500/20">
                           <Lock className="h-3 w-3" />
                           HMAC 签名
@@ -469,9 +474,18 @@ export function WebhooksTab() {
               type="password"
               value={secret}
               onChange={(e) => setSecret(e.target.value)}
-              placeholder="留空则不签名；填写后将附带 X-Ambra-Signature 请求头"
+              placeholder={
+                editingId && editingHasSecret
+                  ? '已配置密钥，留空保留原密钥；输入新密钥将覆盖原值'
+                  : '留空不签名；填写后将附带 X-Ambra-Signature 请求头'
+              }
               className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
             />
+            {editingId && editingHasSecret && (
+              <p className="mt-1.5 text-[11px] text-amber-300/80">
+                当前 Webhook 已配置 HMAC 签名密钥：留空保留原密钥，输入新内容则更新密钥。
+              </p>
+            )}
           </div>
 
           <ToggleSwitch

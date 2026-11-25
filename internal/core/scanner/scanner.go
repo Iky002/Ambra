@@ -399,6 +399,9 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 					s.downloadAndSaveRemoteImages(hookCtx, rec, meta)
 				}
 				s.persistMetaRelations(hookCtx, rec, meta)
+				if meta != nil && meta.Collection != nil {
+					s.ensureAutoBoxSet(hookCtx, rec, meta.Collection)
+				}
 				s.scanAndIndexExtras(hookCtx, lib, rec, mediaDir, mediaBaseName)
 				return nil
 			},
@@ -433,6 +436,9 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 
 	// Taxonomies, People & FTS5
 	s.persistMetaRelationsAndFTS(ctx, rec, meta)
+	if meta != nil && meta.Collection != nil {
+		s.ensureAutoBoxSet(ctx, rec, meta.Collection)
+	}
 
 	// Local Trailers, Special Features & Theme Songs
 	s.scanAndIndexExtras(ctx, lib, rec, mediaDir, mediaBaseName)
@@ -1660,6 +1666,9 @@ func mergeMetadata(dst, src *plugins.MetadataResult) {
 		cp := *src.Collection
 		dst.Collection = &cp
 	}
+	if src.LockData {
+		dst.LockData = true
+	}
 }
 
 func applyMetadataToItem(rec *sqlite.ItemRecord, meta *plugins.MetadataResult) {
@@ -1699,6 +1708,29 @@ func applyMetadataToItem(rec *sqlite.ItemRecord, meta *plugins.MetadataResult) {
 	if len(meta.ProviderIDs) > 0 {
 		rec.Extra.ProviderIDs = meta.ProviderIDs
 	}
+	if meta.LockData {
+		rec.Extra.LockData = true
+	}
+}
+
+func mergeUniqueStrings(existing, incoming []string) []string {
+	seen := make(map[string]struct{}, len(existing)+len(incoming))
+	out := make([]string, 0, len(existing)+len(incoming))
+	for _, list := range [][]string{existing, incoming} {
+		for _, raw := range list {
+			trimmed := strings.TrimSpace(raw)
+			if trimmed == "" {
+				continue
+			}
+			key := strings.ToLower(trimmed)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 func (s *Scanner) persistMetaRelations(ctx context.Context, rec *sqlite.ItemRecord, meta *plugins.MetadataResult) []string {
@@ -1711,7 +1743,14 @@ func (s *Scanner) persistMetaRelations(ctx context.Context, rec *sqlite.ItemReco
 			_ = s.repo.ReplaceItemTaxonomies(ctx, rec.ID, "studio", meta.Studios)
 		}
 		if len(meta.Tags) > 0 {
-			_ = s.repo.ReplaceItemTaxonomies(ctx, rec.ID, "tag", meta.Tags)
+			// Merge scraped tags with existing tags so ranking tags (e.g. Douban/IMDb Top 250)
+			// and user-defined custom tags are preserved instead of overwritten.
+			var existingTags []string
+			if _, _, curTags, err := s.repo.GetTaxonomiesByItemID(ctx, rec.ID); err == nil {
+				existingTags = curTags
+			}
+			mergedTags := mergeUniqueStrings(existingTags, meta.Tags)
+			_ = s.repo.ReplaceItemTaxonomies(ctx, rec.ID, "tag", mergedTags)
 		}
 		if len(meta.People) > 0 {
 			pins := make([]sqlite.PersonInput, len(meta.People))

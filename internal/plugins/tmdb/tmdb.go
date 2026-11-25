@@ -152,8 +152,8 @@ func (p *Provider) Configure(cfg map[string]any) error {
 
 func (p *Provider) FetchMetadata(ctx context.Context, q plugins.MediaQuery) (*plugins.MetadataResult, error) {
 	snap := p.snapshot()
-	if snap.apiKey == "" {
-		// Gracefully skip when no API key is configured.
+	if !snap.enabled || snap.apiKey == "" {
+		// Gracefully skip when disabled or no API key is configured.
 		return nil, nil
 	}
 	lang := q.Language
@@ -343,7 +343,8 @@ func (p *Provider) fetchMovie(ctx context.Context, q plugins.MediaQuery, lang st
 	params := url.Values{}
 	params.Set("api_key", snap.apiKey)
 	params.Set("language", lang)
-	params.Set("append_to_response", "credits,external_ids")
+	params.Set("append_to_response", "credits,external_ids,images,release_dates")
+	params.Set("include_image_language", "zh,en,null")
 
 	var detail struct {
 		ID            int     `json:"id"`
@@ -376,6 +377,12 @@ func (p *Provider) fetchMovie(ctx context.Context, q plugins.MediaQuery, lang st
 		ExternalIDs struct {
 			IMDbID string `json:"imdb_id"`
 		} `json:"external_ids"`
+		Images struct {
+			Logos []tmdbLogoEntry `json:"logos"`
+		} `json:"images"`
+		ReleaseDates struct {
+			Results []tmdbReleaseDateCountry `json:"results"`
+		} `json:"release_dates"`
 		BelongsToCollection *struct {
 			ID           int    `json:"id"`
 			Name         string `json:"name"`
@@ -394,7 +401,11 @@ func (p *Provider) fetchMovie(ctx context.Context, q plugins.MediaQuery, lang st
 		Tagline:         detail.Tagline,
 		PremiereDate:    detail.ReleaseDate,
 		CommunityRating: detail.VoteAverage,
+		OfficialRating:  extractMovieCertification(detail.ReleaseDates.Results, lang),
 		ProviderIDs:     map[string]string{"tmdb": strconv.Itoa(detail.ID)},
+	}
+	if logoPath := pickBestLogoPath(detail.Images.Logos, lang); logoPath != "" {
+		res.LogoURL = snap.imageBaseURL + logoPath
 	}
 	if detail.BelongsToCollection != nil && detail.BelongsToCollection.ID > 0 && strings.TrimSpace(detail.BelongsToCollection.Name) != "" {
 		col := &plugins.CollectionMeta{
@@ -483,7 +494,8 @@ func (p *Provider) fetchSeries(ctx context.Context, q plugins.MediaQuery, lang s
 	params := url.Values{}
 	params.Set("api_key", snap.apiKey)
 	params.Set("language", lang)
-	params.Set("append_to_response", "credits,external_ids")
+	params.Set("append_to_response", "credits,external_ids,images,content_ratings")
+	params.Set("include_image_language", "zh,en,null")
 
 	var detail struct {
 		ID           int     `json:"id"`
@@ -517,6 +529,12 @@ func (p *Provider) fetchSeries(ctx context.Context, q plugins.MediaQuery, lang s
 			IMDbID string `json:"imdb_id"`
 			TVDBID int    `json:"tvdb_id"`
 		} `json:"external_ids"`
+		Images struct {
+			Logos []tmdbLogoEntry `json:"logos"`
+		} `json:"images"`
+		ContentRatings struct {
+			Results []tmdbContentRating `json:"results"`
+		} `json:"content_ratings"`
 	}
 	if err := p.getJSON(ctx, "/tv/"+url.PathEscape(tmdbID), params, &detail); err != nil {
 		return nil, err
@@ -529,7 +547,11 @@ func (p *Provider) fetchSeries(ctx context.Context, q plugins.MediaQuery, lang s
 		Tagline:         detail.Tagline,
 		PremiereDate:    detail.FirstAirDate,
 		CommunityRating: detail.VoteAverage,
+		OfficialRating:  extractSeriesContentRating(detail.ContentRatings.Results, lang),
 		ProviderIDs:     map[string]string{"tmdb": strconv.Itoa(detail.ID)},
+	}
+	if logoPath := pickBestLogoPath(detail.Images.Logos, lang); logoPath != "" {
+		res.LogoURL = snap.imageBaseURL + logoPath
 	}
 	if len(detail.FirstAirDate) >= 4 {
 		if y, err := strconv.Atoi(detail.FirstAirDate[:4]); err == nil {
@@ -655,7 +677,7 @@ func (p *Provider) fetchEpisode(ctx context.Context, q plugins.MediaQuery, lang 
 // SearchCandidates searches TMDB /search/movie or /search/tv and returns up to 10 candidates.
 func (p *Provider) SearchCandidates(ctx context.Context, itemType, query string, year int, lang string) ([]plugins.MetadataResult, error) {
 	snap := p.snapshot()
-	if snap.apiKey == "" || strings.TrimSpace(query) == "" {
+	if !snap.enabled || snap.apiKey == "" || strings.TrimSpace(query) == "" {
 		return nil, nil
 	}
 	if lang == "" {
@@ -769,7 +791,7 @@ func (p *Provider) SearchCandidates(ctx context.Context, itemType, query string,
 func (p *Provider) FetchImages(ctx context.Context, itemType, tmdbID string) ([]RemoteImageCandidate, error) {
 	tmdbID = strings.TrimSpace(tmdbID)
 	snap := p.snapshot()
-	if snap.apiKey == "" || tmdbID == "" {
+	if !snap.enabled || snap.apiKey == "" || tmdbID == "" {
 		return nil, nil
 	}
 	endpoint := "/movie/" + url.PathEscape(tmdbID) + "/images"
@@ -844,6 +866,159 @@ func (p *Provider) FetchImages(ctx context.Context, itemType, tmdbID string) ([]
 	return out, nil
 }
 
+type tmdbLogoEntry struct {
+	FilePath    string  `json:"file_path"`
+	ISO6391     string  `json:"iso_639_1"`
+	VoteAverage float64 `json:"vote_average"`
+	VoteCount   int     `json:"vote_count"`
+}
+
+type tmdbReleaseDateCountry struct {
+	ISO31661     string `json:"iso_3166_1"`
+	ReleaseDates []struct {
+		Certification string `json:"certification"`
+		Type          int    `json:"type"`
+	} `json:"release_dates"`
+}
+
+type tmdbContentRating struct {
+	ISO31661 string `json:"iso_3166_1"`
+	Rating   string `json:"rating"`
+}
+
+func isV4BearerToken(apiKey string) bool {
+	k := strings.TrimSpace(apiKey)
+	return strings.HasPrefix(k, "eyJ") && strings.Count(k, ".") == 2
+}
+
+func primaryLangCode(lang string) string {
+	l := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(lang, "_", "-")))
+	if idx := strings.IndexByte(l, '-'); idx > 0 {
+		return l[:idx]
+	}
+	return l
+}
+
+func preferredRegionCode(lang string) string {
+	l := strings.ToUpper(strings.TrimSpace(strings.ReplaceAll(lang, "_", "-")))
+	if idx := strings.IndexByte(l, '-'); idx > 0 && idx+1 < len(l) {
+		return l[idx+1:]
+	}
+	return ""
+}
+
+func pickBestLogoPath(logos []tmdbLogoEntry, lang string) string {
+	wantLang := primaryLangCode(lang)
+	bestPath := ""
+	bestFormatRank := -1
+	bestLangRank := -1
+	bestVote := -1.0
+
+	for _, logo := range logos {
+		fp := strings.TrimSpace(logo.FilePath)
+		if fp == "" {
+			continue
+		}
+		lower := strings.ToLower(fp)
+		fmtRank := 0
+		if strings.HasSuffix(lower, ".png") || strings.HasSuffix(lower, ".svg") {
+			fmtRank = 2
+		} else if strings.HasSuffix(lower, ".webp") {
+			fmtRank = 1
+		}
+		langRank := 0
+		l := strings.ToLower(strings.TrimSpace(logo.ISO6391))
+		if wantLang != "" && l == wantLang {
+			langRank = 3
+		} else if l == "en" {
+			langRank = 2
+		} else if l == "" {
+			langRank = 1
+		}
+
+		if fmtRank > bestFormatRank ||
+			(fmtRank == bestFormatRank && langRank > bestLangRank) ||
+			(fmtRank == bestFormatRank && langRank == bestLangRank && logo.VoteAverage > bestVote) {
+			bestFormatRank = fmtRank
+			bestLangRank = langRank
+			bestVote = logo.VoteAverage
+			bestPath = fp
+		}
+	}
+	return bestPath
+}
+
+func extractMovieCertification(results []tmdbReleaseDateCountry, lang string) string {
+	if len(results) == 0 {
+		return ""
+	}
+	findRegion := func(region string) string {
+		if region == "" {
+			return ""
+		}
+		for _, r := range results {
+			if !strings.EqualFold(strings.TrimSpace(r.ISO31661), region) {
+				continue
+			}
+			for _, rd := range r.ReleaseDates {
+				if cert := strings.TrimSpace(rd.Certification); cert != "" {
+					return cert
+				}
+			}
+		}
+		return ""
+	}
+	if reg := preferredRegionCode(lang); reg != "" {
+		if cert := findRegion(reg); cert != "" {
+			return cert
+		}
+	}
+	if cert := findRegion("US"); cert != "" {
+		return cert
+	}
+	for _, r := range results {
+		for _, rd := range r.ReleaseDates {
+			if cert := strings.TrimSpace(rd.Certification); cert != "" {
+				return cert
+			}
+		}
+	}
+	return ""
+}
+
+func extractSeriesContentRating(results []tmdbContentRating, lang string) string {
+	if len(results) == 0 {
+		return ""
+	}
+	findRegion := func(region string) string {
+		if region == "" {
+			return ""
+		}
+		for _, r := range results {
+			if strings.EqualFold(strings.TrimSpace(r.ISO31661), region) {
+				if rating := strings.TrimSpace(r.Rating); rating != "" {
+					return rating
+				}
+			}
+		}
+		return ""
+	}
+	if reg := preferredRegionCode(lang); reg != "" {
+		if rating := findRegion(reg); rating != "" {
+			return rating
+		}
+	}
+	if rating := findRegion("US"); rating != "" {
+		return rating
+	}
+	for _, r := range results {
+		if rating := strings.TrimSpace(r.Rating); rating != "" {
+			return rating
+		}
+	}
+	return ""
+}
+
 func sanitizeAPIKeyError(err error, apiKey string) error {
 	if err == nil {
 		return nil
@@ -858,12 +1033,31 @@ func sanitizeAPIKeyError(err error, apiKey string) error {
 
 func (p *Provider) getJSON(ctx context.Context, endpoint string, params url.Values, dst any) error {
 	snap := p.snapshot()
-	reqURL := snap.baseURL + endpoint + "?" + params.Encode()
+	if !snap.enabled {
+		return fmt.Errorf("tmdb provider is disabled")
+	}
+	qParams := url.Values{}
+	for k, vals := range params {
+		for _, v := range vals {
+			qParams.Add(k, v)
+		}
+	}
+	useBearer := isV4BearerToken(snap.apiKey)
+	if useBearer {
+		qParams.Del("api_key")
+	}
+	reqURL := snap.baseURL + endpoint
+	if encoded := qParams.Encode(); encoded != "" {
+		reqURL += "?" + encoded
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return sanitizeAPIKeyError(err, snap.apiKey)
 	}
 	req.Header.Set("Accept", "application/json")
+	if useBearer {
+		req.Header.Set("Authorization", "Bearer "+snap.apiKey)
+	}
 	resp, err := snap.client.Do(req)
 	if err != nil {
 		return sanitizeAPIKeyError(err, snap.apiKey)

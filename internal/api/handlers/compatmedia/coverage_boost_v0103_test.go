@@ -255,18 +255,18 @@ func TestCompatMediaCoverageBoostV0103(t *testing.T) {
 			t.Fatal("alice via UserIDFromCtx should be denied download")
 		}
 
-		// allowedLibrariesForUser & userParentalPolicyForRequest edge cases
+		// allowedLibrariesForUser & userParentalPolicyForRequest edge cases (fail-closed for unknown user)
 		if got := h.allowedLibrariesForUser(ctx, ""); got != nil {
 			t.Fatalf("expected nil for empty userID, got %v", got)
 		}
-		if got := h.allowedLibrariesForUser(ctx, guid.New()); got != nil {
-			t.Fatalf("expected nil for unknown userID, got %v", got)
+		if got := h.allowedLibrariesForUser(ctx, guid.New()); got == nil || len(got) != 0 {
+			t.Fatalf("expected non-nil empty slice (fail-closed) for unknown userID, got %#v", got)
 		}
 		if maxR, _ := h.userParentalPolicyForRequest(reqBase, alice.ID); maxR == nil || *maxR != maxPG {
 			t.Fatalf("expected maxPG via fallbackUserID, got %v", maxR)
 		}
-		if maxR, _ := h.userParentalPolicyForRequest(reqBase, guid.New()); maxR != nil {
-			t.Fatalf("expected nil for unknown fallbackUserID, got %v", maxR)
+		if maxR, _ := h.userParentalPolicyForRequest(reqBase, guid.New()); maxR == nil || *maxR != 0 {
+			t.Fatalf("expected fail-closed maxRating=0 for unknown fallbackUserID, got %v", maxR)
 		}
 		if maxR, _ := h.userParentalPolicyForRequest(reqAdminUID, ""); maxR != nil {
 			t.Fatalf("expected nil for admin via UserIDFromCtx, got %v", maxR)
@@ -284,8 +284,8 @@ func TestCompatMediaCoverageBoostV0103(t *testing.T) {
 			t.Fatalf("expected error on cancelled ctx, got (%v, %v)", ok, err)
 		}
 
-		// sanitizeItemPaths nil & nested MediaStreams
-		sanitizeItemPaths(nil)
+		// dto.SanitizeItemPaths nil & nested MediaStreams
+		dto.SanitizeItemPaths(nil)
 		it := &dto.BaseItemDto{
 			Path: "/secret/a.mkv",
 			MediaSources: []dto.MediaSourceInfo{{
@@ -293,7 +293,7 @@ func TestCompatMediaCoverageBoostV0103(t *testing.T) {
 				MediaStreams: []dto.MediaStream{{Path: "/secret/a.srt"}},
 			}},
 		}
-		sanitizeItemPaths(it)
+		dto.SanitizeItemPaths(it)
 		if it.Path != "" || it.MediaSources[0].Path != "" || it.MediaSources[0].MediaStreams[0].Path != "" {
 			t.Fatalf("expected all paths sanitized: %+v", it)
 		}
@@ -741,8 +741,8 @@ func TestCompatMediaCoverageBoostV0103(t *testing.T) {
 			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
 			rec := httptest.NewRecorder()
 			closedRouter.ServeHTTP(rec, req)
-			if rec.Code != http.StatusInternalServerError {
-				t.Fatalf("closed DB %s %s: want 500, got %d (%s)", tc.method, tc.path, rec.Code, rec.Body.String())
+			if rec.Code != http.StatusInternalServerError && rec.Code != http.StatusForbidden {
+				t.Fatalf("closed DB %s %s: want 500 or 403 (fail-closed), got %d (%s)", tc.method, tc.path, rec.Code, rec.Body.String())
 			}
 		}
 	})

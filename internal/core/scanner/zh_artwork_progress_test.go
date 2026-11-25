@@ -32,6 +32,7 @@ func (m *zhMockOnlineProvider) Manifest() plugins.Manifest {
 		ID:       m.id,
 		Name:     "Mock TMDB ZH",
 		Version:  "1.0.0",
+		BuiltIn:  true,
 		Enabled:  true,
 		Priority: 20,
 		Kinds:    []plugins.Kind{plugins.KindMetadata},

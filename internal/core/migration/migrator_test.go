@@ -946,3 +946,75 @@ func TestMigratorEdgeCasesErrorsAndAmbiguousFallbacks(t *testing.T) {
 		t.Fatal("expected empty normalized title")
 	}
 }
+
+func TestMigratorProtectsExistingLocalAdminFromDowngradeAndDisable(t *testing.T) {
+	st, userRepo, _ := openTestStore(t)
+	ctx := context.Background()
+
+	// Seed an active local administrator account.
+	localAdmin := &sqlite.UserRecord{
+		Name:       "SuperAdmin",
+		IsAdmin:    true,
+		IsDisabled: false,
+		Policy:     sqlite.DefaultUserPolicy(true),
+		Config:     sqlite.DefaultUserConfig(),
+	}
+	if err := userRepo.CreateUser(ctx, localAdmin); err != nil {
+		t.Fatalf("CreateUser localAdmin: %v", err)
+	}
+
+	// Source server has a user with the same name who is NOT admin and IS disabled.
+	srcPolicy := sqlite.DefaultUserPolicy(false)
+	srcPolicy.IsAdministrator = false
+	srcPolicy.IsDisabled = true
+
+	fake := &fakeEmbyServer{
+		apiKey:     "k",
+		serverInfo: SourceServerInfo{ID: "s1", ServerName: "Legacy"},
+		users: []SourceUser{
+			{ID: "src-admin", Name: "SuperAdmin", Policy: srcPolicy, Configuration: sqlite.DefaultUserConfig()},
+		},
+		itemsByUser: map[string][]SourceItem{
+			"src-admin": {},
+		},
+	}
+	srv := newFakeEmbyServer(t, fake)
+
+	m := NewMigrator(st, userRepo, WithClientFactory(func(baseURL, apiKey string) (*SourceClient, error) {
+		return NewSourceClient(baseURL, apiKey, WithHTTPClient(srv.Client()))
+	}))
+
+	rep, err := m.Run(ctx, MigrationRequest{
+		SourceURL:    srv.URL,
+		APIKey:       "k",
+		MigrateUsers: true,
+	})
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if rep.Status != StatusCompleted || rep.UsersMatched != 1 {
+		t.Fatalf("unexpected report: %+v", rep)
+	}
+
+	after, err := userRepo.GetUserByName(ctx, "SuperAdmin")
+	if err != nil {
+		t.Fatalf("GetUserByName: %v", err)
+	}
+	if !after.IsAdmin || !after.Policy.IsAdministrator {
+		t.Fatalf("local admin was downgraded! IsAdmin=%v Policy.IsAdministrator=%v", after.IsAdmin, after.Policy.IsAdministrator)
+	}
+	if after.IsDisabled || after.Policy.IsDisabled {
+		t.Fatalf("local admin was disabled! IsDisabled=%v Policy.IsDisabled=%v", after.IsDisabled, after.Policy.IsDisabled)
+	}
+
+	foundProtectionNotice := false
+	for _, n := range rep.Notices {
+		if strings.Contains(n, "protected") {
+			foundProtectionNotice = true
+			break
+		}
+	}
+	if !foundProtectionNotice {
+		t.Fatalf("expected protection notice in Notices, got %+v", rep.Notices)
+	}
+}

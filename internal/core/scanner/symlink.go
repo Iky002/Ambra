@@ -4,7 +4,48 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 )
+
+// isPathWithinRoot resolves symlinks on both root and target and returns true iff
+// the resolved target path is equal to or strictly inside the resolved root directory.
+func isPathWithinRoot(root, target string) bool {
+	if strings.TrimSpace(root) == "" || strings.TrimSpace(target) == "" {
+		return false
+	}
+	realRoot, err := filepath.EvalSymlinks(filepath.Clean(root))
+	if err != nil {
+		realRoot, err = filepath.Abs(filepath.Clean(root))
+		if err != nil {
+			return false
+		}
+	}
+	realTarget, err := filepath.EvalSymlinks(filepath.Clean(target))
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(realRoot, realTarget)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (!strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel))
+}
+
+// isSymlinkAllowedInRoot validates whether target complies with policy and, when target
+// is a symbolic link, verifies via EvalSymlinks that its destination stays inside root.
+func isSymlinkAllowedInRoot(root, target string, policy SymlinkPolicy) (allowed bool, isSymlink bool) {
+	linfo, err := os.Lstat(target)
+	if err != nil {
+		return false, false
+	}
+	if linfo.Mode()&os.ModeSymlink == 0 {
+		return true, false
+	}
+	if policy == SymlinkIgnore {
+		return false, true
+	}
+	return isPathWithinRoot(root, target), true
+}
 
 // SymlinkPolicy controls how WalkSafe handles symbolic links during directory traversal.
 type SymlinkPolicy int

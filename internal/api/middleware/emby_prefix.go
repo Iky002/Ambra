@@ -414,8 +414,19 @@ func EmbyPrefixAndCase(next http.Handler) http.Handler {
 			}
 		}
 
-		// Re-check /api/ exemption after stripping /emby prefix so /emby/api/... is not canonicalized.
-		if !strings.HasPrefix(strings.ToLower(p), "/api/") {
+		// Re-check /web and /api/ exemptions after stripping /emby prefix so /emby/web/... and /emby/api/... are not canonicalized.
+		lowerAfterStrip := strings.ToLower(p)
+		if lowerAfterStrip == "/web" {
+			p = "/web"
+			if hasEscapedSlash {
+				rawP = "/web"
+			}
+		} else if strings.HasPrefix(lowerAfterStrip, "/web/") {
+			p = "/web/" + p[len("/web/"):]
+			if hasEscapedSlash && strings.HasPrefix(strings.ToLower(rawP), "/web/") {
+				rawP = "/web/" + rawP[len("/web/"):]
+			}
+		} else if !strings.HasPrefix(lowerAfterStrip, "/api/") {
 			if hasEscapedSlash && len(rawP) > 1 {
 				rawP = canonicalizePathSegments(rawP)
 				if unescaped, err := url.PathUnescape(rawP); err == nil {

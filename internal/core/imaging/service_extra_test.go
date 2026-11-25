@@ -108,7 +108,7 @@ func TestContentTypeForImage(t *testing.T) {
 		{"a.png", nil, "image/png"},
 		{"a.webp", nil, "image/webp"},
 		{"a.gif", nil, "image/gif"},
-		{"a.bin", []byte("hello plain text"), "text/plain; charset=utf-8"},
+		{"a.bin", []byte("hello plain text"), "application/octet-stream"},
 	}
 	for _, tc := range cases {
 		if got := contentTypeForImage(tc.path, tc.data); got != tc.want {

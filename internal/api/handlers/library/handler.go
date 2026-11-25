@@ -146,6 +146,24 @@ func (h *Handler) resolveUserID(r *http.Request, q httpx.Query) string {
 // caller from context (preventing spoofed UserId query/path bypasses). Only when no caller
 // is in context (e.g. unit tests without auth middleware) does it fall back to fallbackUserID.
 func (h *Handler) allowedLibrariesForRequest(r *http.Request, fallbackUserID string) []string {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.IsAdmin() {
+			return nil
+		}
+		if h.userRepo != nil {
+			return h.allowedLibrariesForUser(r.Context(), guid.Normalize(ac.UserID()))
+		}
+		if ac.User != nil && !ac.User.Policy.EnableAllFolders {
+			allowed := make([]string, 0, len(ac.User.Policy.EnabledFolders))
+			for _, fid := range ac.User.Policy.EnabledFolders {
+				if norm := guid.Normalize(fid); norm != "" {
+					allowed = append(allowed, norm)
+				}
+			}
+			return allowed
+		}
+		return nil
+	}
 	uid := ""
 	if h.auth.UserIDFromCtx != nil {
 		uid = guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
@@ -164,7 +182,7 @@ func (h *Handler) allowedLibrariesForUser(ctx context.Context, userID string) []
 	}
 	u, err := h.userRepo.GetUserByID(ctx, userID)
 	if err != nil || u == nil {
-		return nil
+		return []string{}
 	}
 	if u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableAllFolders {
 		return nil
@@ -216,7 +234,8 @@ func (h *Handler) userParentalPolicyForRequest(r *http.Request, fallbackUserID s
 	}
 	u, err := h.userRepo.GetUserByID(r.Context(), uid)
 	if err != nil || u == nil {
-		return nil, nil
+		zero := 0
+		return &zero, nil
 	}
 	if u.IsAdmin || u.Policy.IsAdministrator {
 		return nil, nil
@@ -364,31 +383,15 @@ func (h *Handler) hiddenPrivatePlaylistIDs(r *http.Request) []string {
 	return hidden
 }
 
-func sanitizeItemPaths(item *dto.BaseItemDto) {
-	if item == nil {
-		return
-	}
-	item.Path = ""
-	for i := range item.MediaSources {
-		item.MediaSources[i].Path = ""
-		for j := range item.MediaSources[i].MediaStreams {
-			item.MediaSources[i].MediaStreams[j].Path = ""
-		}
-	}
-}
-
 func (h *Handler) sanitizeItemPathsForCaller(r *http.Request, item *dto.BaseItemDto) {
 	if h.isNonAdminCaller(r) {
-		sanitizeItemPaths(item)
+		dto.SanitizeItemPaths(item)
 	}
 }
 
 func (h *Handler) sanitizeItemsPathsForCaller(r *http.Request, items []dto.BaseItemDto) {
-	if !h.isNonAdminCaller(r) {
-		return
-	}
-	for i := range items {
-		sanitizeItemPaths(&items[i])
+	if h.isNonAdminCaller(r) {
+		dto.SanitizeItemPathsSlice(items)
 	}
 }
 
@@ -710,7 +713,12 @@ func (h *Handler) handleGetItem(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if rec, recErr := h.repo.GetItemRecordByID(r.Context(), itemID); recErr == nil && rec != nil {
+	rec, recErr := h.repo.GetItemRecordByID(r.Context(), itemID)
+	if recErr != nil && !errors.Is(recErr, sqlite.ErrNotFound) {
+		httpx.Error(w, http.StatusInternalServerError, recErr.Error())
+		return
+	}
+	if recErr == nil && rec != nil {
 		if strings.EqualFold(rec.Type, "Playlist") {
 			if !h.canViewPlaylist(r, rec.ID, rec.ParentID) {
 				httpx.Error(w, http.StatusForbidden, "access denied")
@@ -1229,9 +1237,13 @@ func (h *Handler) canModifyUser(r *http.Request, targetUserID string) bool {
 }
 
 func (h *Handler) canAccessItem(r *http.Request, fallbackUserID, itemID string) (bool, error) {
+	if h.repo == nil {
+		return true, nil
+	}
 	allowed := h.allowedLibrariesForRequest(r, fallbackUserID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, fallbackUserID)
-	if allowed == nil && maxRating == nil && len(blockedTags) == 0 {
+	nonAdmin := h.isNonAdminCaller(r)
+	if !nonAdmin && allowed == nil && maxRating == nil && len(blockedTags) == 0 {
 		return true, nil
 	}
 	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
@@ -1244,7 +1256,11 @@ func (h *Handler) canAccessItem(r *http.Request, fallbackUserID, itemID string) 
 	if rec == nil {
 		return true, nil
 	}
-	if allowed != nil && rec.LibraryID != "" && !isLibraryAllowed(rec.LibraryID, allowed) {
+	if strings.EqualFold(rec.Type, "Playlist") {
+		if !h.canViewPlaylist(r, rec.ID, rec.ParentID) {
+			return false, nil
+		}
+	} else if allowed != nil && rec.LibraryID != "" && !isLibraryAllowed(rec.LibraryID, allowed) {
 		return false, nil
 	}
 	if maxRating != nil || len(blockedTags) > 0 {

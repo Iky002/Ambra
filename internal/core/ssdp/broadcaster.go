@@ -385,11 +385,11 @@ func (b *Broadcaster) allowRemoteIP(remote *net.UDPAddr, now time.Time) bool {
 }
 
 func (b *Broadcaster) handlePacket(conn *net.UDPConn, remote *net.UDPAddr, data []byte) {
-	if !b.allowRemoteIP(remote, time.Now()) {
-		return
-	}
 	req, ok := ParseMSearch(data)
 	if !ok {
+		return
+	}
+	if !b.allowRemoteIP(remote, time.Now()) {
 		return
 	}
 	if req.ST == STAll {

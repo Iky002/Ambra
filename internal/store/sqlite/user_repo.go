@@ -313,11 +313,20 @@ func (r *UserRepo) UpdateLastActive(ctx context.Context, id string, at time.Time
 	return err
 }
 
+// ErrLastAdmin is returned when an operation would delete, disable, or demote
+// the last active administrator account.
+var ErrLastAdmin = errors.New("cannot remove or disable the last active administrator")
+
 func (r *UserRepo) DeleteUser(ctx context.Context, id string) error {
-	res, err := r.store.Writer.ExecContext(ctx,
-		`DELETE FROM users WHERE id = ? OR id = ?`,
-		guid.Normalize(id), id,
-	)
+	norm := guid.Normalize(id)
+	tx, err := r.store.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, _ = tx.ExecContext(ctx, `DELETE FROM display_preferences WHERE user_id = ? OR user_id = ?`, norm, id)
+	res, err := tx.ExecContext(ctx, `DELETE FROM users WHERE id = ? OR id = ?`, norm, id)
 	if err != nil {
 		return err
 	}
@@ -325,7 +334,114 @@ func (r *UserRepo) DeleteUser(ctx context.Context, id string) error {
 	if n == 0 {
 		return ErrNotFound
 	}
-	return nil
+	return tx.Commit()
+}
+
+// DeleteUserSafe atomically verifies that deleting id will not leave zero active
+// administrators, cleans up user-owned display_preferences, and deletes the user.
+func (r *UserRepo) DeleteUserSafe(ctx context.Context, id string) error {
+	norm := guid.Normalize(id)
+	tx, err := r.store.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var targetID string
+	var isAdmin, isDisabled int
+	err = tx.QueryRowContext(ctx,
+		`SELECT id, is_admin, is_disabled FROM users WHERE id = ? OR id = ? LIMIT 1`,
+		norm, id,
+	).Scan(&targetID, &isAdmin, &isDisabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+
+	if isAdmin != 0 && isDisabled == 0 {
+		var activeAdmins int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM users WHERE is_admin = 1 AND is_disabled = 0`,
+		).Scan(&activeAdmins); err != nil {
+			return err
+		}
+		if activeAdmins <= 1 {
+			return ErrLastAdmin
+		}
+	}
+
+	_, _ = tx.ExecContext(ctx, `DELETE FROM display_preferences WHERE user_id = ? OR user_id = ?`, norm, targetID)
+	res, err := tx.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, targetID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit()
+}
+
+// UpdateUserPolicySafe atomically updates a user's policy while refusing to
+// demote or disable the last active administrator.
+func (r *UserRepo) UpdateUserPolicySafe(ctx context.Context, id string, policy dto.UserPolicy) error {
+	if policy.EnabledFolders == nil {
+		policy.EnabledFolders = []string{}
+	}
+	if policy.BlockedTags == nil {
+		policy.BlockedTags = []string{}
+	}
+	raw, err := json.Marshal(policy)
+	if err != nil {
+		return fmt.Errorf("marshal policy: %w", err)
+	}
+
+	norm := guid.Normalize(id)
+	tx, err := r.store.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var targetID string
+	var curAdmin, curDisabled int
+	err = tx.QueryRowContext(ctx,
+		`SELECT id, is_admin, is_disabled FROM users WHERE id = ? OR id = ? LIMIT 1`,
+		norm, id,
+	).Scan(&targetID, &curAdmin, &curDisabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+
+	wasActiveAdmin := curAdmin != 0 && curDisabled == 0
+	willBeActiveAdmin := policy.IsAdministrator && !policy.IsDisabled
+	if wasActiveAdmin && !willBeActiveAdmin {
+		var activeAdmins int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM users WHERE is_admin = 1 AND is_disabled = 0`,
+		).Scan(&activeAdmins); err != nil {
+			return err
+		}
+		if activeAdmins <= 1 {
+			return ErrLastAdmin
+		}
+	}
+
+	res, err := tx.ExecContext(ctx,
+		`UPDATE users SET is_admin = ?, is_disabled = ?, policy_json = ? WHERE id = ?`,
+		boolToInt(policy.IsAdministrator), boolToInt(policy.IsDisabled), string(raw), targetID,
+	)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit()
 }
 
 // --- Access Tokens & Devices ---

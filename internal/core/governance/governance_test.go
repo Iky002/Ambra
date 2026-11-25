@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -793,7 +794,7 @@ func TestGovernanceSecurityHardeningAndAuditEdges(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Pre-seed one existing genre taxonomy to cover both existing-taxonomy lookup and new-taxonomy insert paths.
-	if err := repo.ReplaceItemTaxonomies(ctx, movie.ID, "Genre", []string{"Sci-Fi", "OldGenre"}); err != nil {
+	if err := repo.ReplaceItemTaxonomies(ctx, movie.ID, "genre", []string{"Sci-Fi", "OldGenre"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -828,7 +829,7 @@ func TestGovernanceSecurityHardeningAndAuditEdges(t *testing.T) {
 		t.Fatalf("expected ErrInvalidArgument for non-pending audit, got %v", err)
 	}
 
-	// Verify genres, tags, custom ProviderName, and FTS preservation
+	// Verify genres, tags, lowercase taxonomy kind, sort_key, custom ProviderName, and updated FTS pinyin/tokens
 	genres, tags, err := svc.loadItemTaxonomies(ctx, movie.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -836,14 +837,34 @@ func TestGovernanceSecurityHardeningAndAuditEdges(t *testing.T) {
 	if len(genres) != 2 || len(tags) != 2 {
 		t.Fatalf("expected 2 genres and 2 tags after taxonomy replace, got genres=%v tags=%v", genres, tags)
 	}
-	var ftsTitle, ftsPinyin, ftsPeople string
+	// Verify taxonomies.kind is strictly lowercase ("genre"/"tag")
+	var badKindCount int
 	if err := store.Reader.QueryRowContext(ctx,
-		`SELECT title_raw, pinyin_full, people_names FROM item_search_fts WHERE item_id = ?`, movie.ID,
-	).Scan(&ftsTitle, &ftsPinyin, &ftsPeople); err != nil {
+		`SELECT COUNT(*) FROM taxonomies t JOIN item_taxonomies it ON it.taxonomy_id = t.id WHERE it.item_id = ? AND t.kind NOT IN ('genre', 'tag')`,
+		movie.ID,
+	).Scan(&badKindCount); err != nil {
+		t.Fatal(err)
+	}
+	if badKindCount != 0 {
+		t.Fatalf("expected only lowercase genre/tag taxonomy kinds, found %d non-lowercase rows", badKindCount)
+	}
+
+	var sortKey string
+	if err := store.Reader.QueryRowContext(ctx, `SELECT sort_key FROM items WHERE id = ?`, movie.ID).Scan(&sortKey); err != nil {
+		t.Fatal(err)
+	}
+	if sortKey != sqlite.PinyinSortKey("黑客帝国") {
+		t.Fatalf("expected sort_key=%q, got %q", sqlite.PinyinSortKey("黑客帝国"), sortKey)
+	}
+
+	var ftsTitle, ftsTokens, ftsPinyin, ftsInit, ftsPeople string
+	if err := store.Reader.QueryRowContext(ctx,
+		`SELECT title_raw, title_tokens, pinyin_full, pinyin_initials, people_names FROM item_search_fts WHERE item_id = ?`, movie.ID,
+	).Scan(&ftsTitle, &ftsTokens, &ftsPinyin, &ftsInit, &ftsPeople); err != nil {
 		t.Fatalf("query item_search_fts: %v", err)
 	}
-	if ftsTitle != "黑客帝国 The Matrix" || ftsPinyin != "rawfile" || ftsPeople != "actor one" {
-		t.Fatalf("unexpected FTS row after ApproveAudit: title=%q pinyin=%q people=%q", ftsTitle, ftsPinyin, ftsPeople)
+	if ftsTitle != "黑客帝国 The Matrix" || !strings.Contains(ftsTokens, "黑客") || !strings.Contains(ftsPinyin, "heikediguo") || !strings.Contains(ftsInit, "hkdg") || ftsPeople != "actor one" {
+		t.Fatalf("unexpected FTS row after ApproveAudit: title=%q tokens=%q pinyin=%q init=%q people=%q", ftsTitle, ftsTokens, ftsPinyin, ftsInit, ftsPeople)
 	}
 	var extraRaw string
 	_ = store.Reader.QueryRowContext(ctx, `SELECT extra_json FROM items WHERE id = ?`, movie.ID).Scan(&extraRaw)

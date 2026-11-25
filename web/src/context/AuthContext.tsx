@@ -1,4 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react'
+import { QueryClientContext } from '@tanstack/react-query'
 import { api, clearAuth, getDeviceId, getStoredAuth, saveAuth } from '../api/client'
 import type { AuthSession, AuthenticationResult, UserDto } from '../api/types'
 import { isDemoMode } from '../demo/demoMode'
@@ -20,6 +21,7 @@ interface AuthContextValue {
 const AuthContext = createContext<AuthContextValue | null>(null)
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const queryClient = useContext(QueryClientContext)
   const [auth, setAuth] = useState<AuthSession | null>(() => getStoredAuth())
   const [user, setUser] = useState<UserDto | null>(null)
   const [userLoading, setUserLoading] = useState<boolean>(() => Boolean(getStoredAuth()))
@@ -36,10 +38,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       void api.logout().catch(() => undefined)
     }
     clearAuth()
+    queryClient?.clear()
     setAuth(null)
     setUser(null)
     setUserLoading(false)
-  }, [])
+  }, [queryClient])
 
   const refreshUser = useCallback(async () => {
     const current = getStoredAuth()
@@ -69,28 +72,33 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, [])
 
-  const applyAuthResult = useCallback((res: AuthenticationResult) => {
-    const isAdminFlag = Boolean(res.User.Policy?.IsAdministrator)
-    const session: AuthSession = {
-      accessToken: res.AccessToken,
-      userId: res.User.Id,
-      serverId: res.ServerId || res.User.ServerId || '',
-      userName: res.User.Name,
-      isAdmin: isAdminFlag,
-      deviceId: getDeviceId(),
-    }
-    if (isDemoMode()) {
-      try {
-        sessionStorage.removeItem(DEMO_LOGGED_OUT_KEY)
-      } catch {
-        // 忽略存储异常
+  const applyAuthResult = useCallback(
+    (res: AuthenticationResult) => {
+      const isAdminFlag = Boolean(res.User.Policy?.IsAdministrator)
+      const session: AuthSession = {
+        accessToken: res.AccessToken,
+        userId: res.User.Id,
+        serverId: res.ServerId || res.User.ServerId || '',
+        userName: res.User.Name,
+        isAdmin: isAdminFlag,
+        deviceId: getDeviceId(),
       }
-    }
-    saveAuth(session)
-    setAuth(session)
-    setUser(res.User)
-    setUserLoading(false)
-  }, [])
+      if (isDemoMode()) {
+        try {
+          sessionStorage.removeItem(DEMO_LOGGED_OUT_KEY)
+        } catch {
+          // 忽略存储异常
+        }
+      }
+      // 登录或切换账号时清空 React Query 内存缓存，防止跨账号数据残留
+      queryClient?.clear()
+      saveAuth(session)
+      setAuth(session)
+      setUser(res.User)
+      setUserLoading(false)
+    },
+    [queryClient],
+  )
 
   const login = useCallback(
     async (username: string, password: string) => {
@@ -133,13 +141,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     const onUnauthorized = () => {
+      queryClient?.clear()
       setAuth(null)
       setUser(null)
       setUserLoading(false)
     }
     window.addEventListener('ambra:unauthorized', onUnauthorized)
     return () => window.removeEventListener('ambra:unauthorized', onUnauthorized)
-  }, [])
+  }, [queryClient])
 
   // 严格以当前用户 Policy.IsAdministrator 为准；用户资料尚未加载完时回退至登录会话中的 isAdmin
   const isAdmin = user ? Boolean(user.Policy?.IsAdministrator) : Boolean(auth?.isAdmin)

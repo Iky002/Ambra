@@ -72,23 +72,39 @@ func (s *Scanner) RefreshItem(ctx context.Context, itemID string, replaceMetadat
 		}
 	}
 
-	if (itemTypeLower == "season" || itemTypeLower == "episode") && getProviderID(q.ProviderIDs, "tmdb") == "" {
+	if itemTypeLower == "season" || itemTypeLower == "episode" {
 		parentSeriesID := rec.SeriesID
 		if parentSeriesID == "" && itemTypeLower == "season" {
 			parentSeriesID = rec.ParentID
 		}
 		if parentSeriesID != "" {
-			if parent, pErr := s.repo.GetItemRecordByID(ctx, parentSeriesID); pErr == nil && parent != nil && len(parent.Extra.ProviderIDs) > 0 {
+			if parent, pErr := s.repo.GetItemRecordByID(ctx, parentSeriesID); pErr == nil && parent != nil {
 				if q.ProviderIDs == nil {
-					q.ProviderIDs = make(map[string]string, len(parent.Extra.ProviderIDs)+1)
+					q.ProviderIDs = make(map[string]string, len(parent.Extra.ProviderIDs)+2)
+				}
+				// Season/Episode metadata lookups on TMDB and TVDB require the parent Series provider ID,
+				// never the individual season/episode's own TVDB ID (which causes 404 on /series/<id>/...).
+				deleteProviderIDCaseInsensitive(q.ProviderIDs, "tvdb")
+				if tvdbID := getProviderID(parent.Extra.ProviderIDs, "tvdb"); tvdbID != "" {
+					q.ProviderIDs["Tvdb"] = tvdbID
+				}
+				if tmdbID := getProviderID(parent.Extra.ProviderIDs, "tmdb"); tmdbID != "" {
+					deleteProviderIDCaseInsensitive(q.ProviderIDs, "tmdb")
+					q.ProviderIDs["tmdb"] = tmdbID
 				}
 				for k, v := range parent.Extra.ProviderIDs {
+					if strings.EqualFold(k, "tvdb") || strings.EqualFold(k, "tmdb") {
+						continue
+					}
 					if _, exists := q.ProviderIDs[k]; !exists {
 						q.ProviderIDs[k] = v
 					}
 				}
-				if tmdbID := getProviderID(parent.Extra.ProviderIDs, "tmdb"); tmdbID != "" {
-					q.ProviderIDs["tmdb"] = tmdbID
+				if strings.TrimSpace(parent.Name) != "" {
+					q.Title = parent.Name
+				}
+				if strings.TrimSpace(parent.OriginalTitle) != "" {
+					q.OriginalTitle = parent.OriginalTitle
 				}
 			}
 		}
@@ -163,6 +179,17 @@ func applyRefreshMetadataToItem(rec *sqlite.ItemRecord, meta *plugins.MetadataRe
 		}
 		for k, v := range meta.ProviderIDs {
 			rec.Extra.ProviderIDs[k] = v
+		}
+	}
+	if meta.LockData {
+		rec.Extra.LockData = true
+	}
+}
+
+func deleteProviderIDCaseInsensitive(ids map[string]string, key string) {
+	for k := range ids {
+		if strings.EqualFold(k, key) {
+			delete(ids, k)
 		}
 	}
 }

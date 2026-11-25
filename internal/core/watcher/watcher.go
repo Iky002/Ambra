@@ -13,6 +13,18 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+// SymlinkPolicy controls how Watcher handles symbolic links during directory traversal and event handling.
+type SymlinkPolicy int
+
+const (
+	// SymlinkFollowDirect follows direct symlinks (depth 1) whose targets remain inside the library root.
+	SymlinkFollowDirect SymlinkPolicy = iota
+	// SymlinkIgnore ignores all symbolic links.
+	SymlinkIgnore
+	// SymlinkFollowAll follows symbolic links at any depth whose targets remain inside the library root.
+	SymlinkFollowAll
+)
+
 // DefaultDebounce is the default debounce window for coalescing bursts of filesystem events.
 const (
 	DefaultDebounce = 3 * time.Second
@@ -34,6 +46,13 @@ func WithDebounce(d time.Duration) Option {
 	}
 }
 
+// WithSymlinkPolicy configures how Watcher handles symbolic links.
+func WithSymlinkPolicy(policy SymlinkPolicy) Option {
+	return func(w *Watcher) {
+		w.symlinkPolicy = policy
+	}
+}
+
 type pendingBatch struct {
 	timer *time.Timer
 	paths map[string]struct{}
@@ -43,13 +62,15 @@ type pendingBatch struct {
 // dynamically tracks newly created or removed subdirectories, and debounces
 // bursts of Create/Write/Rename/Remove events before invoking onChange.
 type Watcher struct {
-	fsw      *fsnotify.Watcher
-	onChange ChangeHandler
-	debounce time.Duration
+	fsw           *fsnotify.Watcher
+	onChange      ChangeHandler
+	debounce      time.Duration
+	symlinkPolicy SymlinkPolicy
 
 	mu       sync.Mutex
 	dirToLib map[string]string
 	libDirs  map[string]map[string]struct{}
+	libRoots map[string][]string
 	pending  map[string]*pendingBatch
 	started  bool
 	closed   bool
@@ -65,13 +86,15 @@ func New(onChange ChangeHandler, opts ...Option) (*Watcher, error) {
 		return nil, err
 	}
 	w := &Watcher{
-		fsw:      fsw,
-		onChange: onChange,
-		debounce: DefaultDebounce,
-		dirToLib: make(map[string]string),
-		libDirs:  make(map[string]map[string]struct{}),
-		pending:  make(map[string]*pendingBatch),
-		stopCh:   make(chan struct{}),
+		fsw:           fsw,
+		onChange:      onChange,
+		debounce:      DefaultDebounce,
+		symlinkPolicy: SymlinkFollowDirect,
+		dirToLib:      make(map[string]string),
+		libDirs:       make(map[string]map[string]struct{}),
+		libRoots:      make(map[string][]string),
+		pending:       make(map[string]*pendingBatch),
+		stopCh:        make(chan struct{}),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -92,13 +115,18 @@ func (w *Watcher) WatchLibrary(libraryID string, roots []string) error {
 	}
 
 	var dirs []string
+	var cleanRoots []string
 	visited := make(map[string]struct{})
+	policy := w.symlinkPolicy
 	for _, root := range roots {
 		root = strings.TrimSpace(root)
 		if root == "" {
 			continue
 		}
-		collectDirsSafe(filepath.Clean(root), visited, &dirs)
+		cleanRoot := filepath.Clean(root)
+		cleanRoots = append(cleanRoots, cleanRoot)
+		realRoot := resolveRealRoot(cleanRoot)
+		collectDirsSafeWithPolicy(cleanRoot, realRoot, 0, policy, visited, &dirs)
 	}
 
 	w.mu.Lock()
@@ -110,6 +138,7 @@ func (w *Watcher) WatchLibrary(libraryID string, roots []string) error {
 	if w.libDirs[libraryID] == nil {
 		w.libDirs[libraryID] = make(map[string]struct{})
 	}
+	w.libRoots[libraryID] = cleanRoots
 	var firstErr error
 	for _, dir := range dirs {
 		if err := w.addDirLocked(libraryID, dir); err != nil && firstErr == nil {
@@ -130,6 +159,7 @@ func (w *Watcher) UnwatchLibrary(libraryID string) error {
 		delete(w.pending, libraryID)
 	}
 
+	delete(w.libRoots, libraryID)
 	dirs, ok := w.libDirs[libraryID]
 	if !ok {
 		return nil
@@ -235,13 +265,29 @@ func (w *Watcher) handleEvent(ev fsnotify.Event) {
 		w.mu.Unlock()
 		return
 	}
+	roots := append([]string(nil), w.libRoots[libID]...)
+	policy := w.symlinkPolicy
 	w.mu.Unlock()
 
-	// Collect subdirectories outside w.mu so filesystem traversal never blocks other watcher operations.
+	// Enforce SymlinkPolicy and EvalSymlinks root containment on newly created/modified paths.
 	var subdirs []string
+	if ev.Op&(fsnotify.Create|fsnotify.Write) != 0 {
+		if linfo, lerr := os.Lstat(cleanPath); lerr == nil {
+			if linfo.Mode()&os.ModeSymlink != 0 {
+				if policy == SymlinkIgnore || !isWithinAnyRoot(roots, cleanPath) {
+					return
+				}
+			}
+		}
+	}
 	if ev.Op&fsnotify.Create != 0 {
 		if info, err := os.Stat(cleanPath); err == nil && info.IsDir() {
-			collectDirsSafe(cleanPath, make(map[string]struct{}), &subdirs)
+			realRoot := findRealRootForPath(roots, cleanPath)
+			startDepth := 0
+			if linfo, lerr := os.Lstat(cleanPath); lerr == nil && linfo.Mode()&os.ModeSymlink != 0 {
+				startDepth = 1
+			}
+			collectDirsSafeWithPolicy(cleanPath, realRoot, startDepth, policy, make(map[string]struct{}), &subdirs)
 		}
 	}
 
@@ -370,11 +416,68 @@ func (w *Watcher) flush(libraryID string) {
 	}
 }
 
+func resolveRealRoot(root string) string {
+	if r, err := filepath.EvalSymlinks(root); err == nil {
+		return filepath.Clean(r)
+	}
+	if a, err := filepath.Abs(root); err == nil {
+		return filepath.Clean(a)
+	}
+	return filepath.Clean(root)
+}
+
+func isPathContainedInRealRoot(realRoot, target string) bool {
+	if realRoot == "" {
+		return false
+	}
+	realTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(realRoot, filepath.Clean(realTarget))
+	if err != nil {
+		return false
+	}
+	return rel == "." || (!strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel))
+}
+
+func isWithinAnyRoot(roots []string, target string) bool {
+	for _, r := range roots {
+		if isPathContainedInRealRoot(resolveRealRoot(r), target) {
+			return true
+		}
+	}
+	return false
+}
+
+func findRealRootForPath(roots []string, target string) string {
+	for _, r := range roots {
+		rr := resolveRealRoot(r)
+		if isPathContainedInRealRoot(rr, target) {
+			return rr
+		}
+	}
+	if len(roots) > 0 {
+		return resolveRealRoot(roots[0])
+	}
+	return resolveRealRoot(target)
+}
+
 // collectDirsSafe recursively collects all non-hidden directories under root (up to maxWatchedDirs),
 // using Unix (Dev, Ino) deduplication with real-path fallback to prevent symlink loops.
 func collectDirsSafe(root string, visited map[string]struct{}, out *[]string) {
+	collectDirsSafeWithPolicy(root, resolveRealRoot(root), 0, SymlinkFollowDirect, visited, out)
+}
+
+func collectDirsSafeWithPolicy(root, realRoot string, symlinkDepth int, policy SymlinkPolicy, visited map[string]struct{}, out *[]string) {
 	if len(*out) >= maxWatchedDirs {
 		return
+	}
+	if policy == SymlinkIgnore {
+		linfo, err := os.Lstat(root)
+		if err != nil || linfo.Mode()&os.ModeSymlink != 0 {
+			return
+		}
 	}
 	info, err := os.Stat(root)
 	if err != nil || !info.IsDir() {
@@ -399,11 +502,25 @@ func collectDirsSafe(root string, visited map[string]struct{}, out *[]string) {
 			continue
 		}
 		full := filepath.Join(root, entry.Name())
+		isSymlink := entry.Type()&os.ModeSymlink != 0
+		nextDepth := symlinkDepth
+		if isSymlink {
+			if policy == SymlinkIgnore {
+				continue
+			}
+			if policy == SymlinkFollowDirect && symlinkDepth >= 1 {
+				continue
+			}
+			if !isPathContainedInRealRoot(realRoot, full) {
+				continue
+			}
+			nextDepth++
+		}
 		subInfo, err := os.Stat(full)
 		if err != nil || !subInfo.IsDir() {
 			continue
 		}
-		collectDirsSafe(full, visited, out)
+		collectDirsSafeWithPolicy(full, realRoot, nextDepth, policy, visited, out)
 	}
 }
 

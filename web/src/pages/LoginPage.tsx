@@ -95,7 +95,7 @@ export function LoginPage() {
         setQcError(err instanceof Error ? err.message : 'Quick Connect 登录失败，请重新获取授权码')
       }
     },
-    [applyAuthResult, clearQcPollTimer, navigate],
+    [applyAuthResult, clearQcPollTimer, navigate, safeRedirect],
   )
 
   const startQuickConnect = useCallback(async () => {
@@ -189,11 +189,11 @@ export function LoginPage() {
     setForgotOpen(true)
   }
 
-  const closeForgotModal = () => {
+  const closeForgotModal = useCallback(() => {
     setForgotOpen(false)
     setForgotError('')
     setForgotLoading(false)
-  }
+  }, [])
 
   useEffect(() => {
     if (!forgotOpen) return
@@ -204,7 +204,7 @@ export function LoginPage() {
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [forgotOpen, forgotLoading])
+  }, [forgotOpen, forgotLoading, closeForgotModal])
 
   const formatPinExpiration = (raw: string): string => {
     const parsed = new Date(raw)
@@ -354,7 +354,7 @@ export function LoginPage() {
             <Server className="h-3.5 w-3.5 text-amber-400/80" />
             <span>
               {sysInfo?.ProductName || 'Ambra'}{' '}
-              {sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.9.3')}
+              {sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.10.4')}
             </span>
           </p>
         </div>

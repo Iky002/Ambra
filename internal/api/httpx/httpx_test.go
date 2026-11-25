@@ -2,10 +2,13 @@ package httpx
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -121,5 +124,36 @@ func TestParseQuery(t *testing.T) {
 	raw := q.Raw()
 	if raw.Get("limit") != "25" {
 		t.Fatalf("Raw().Get(limit) = %q, want 25", raw.Get("limit"))
+	}
+}
+
+func TestDecodeJSONLimitNilAndLimits(t *testing.T) {
+	var dst map[string]string
+
+	// nil request -> io.EOF
+	if err := DecodeJSONLimit(nil, &dst, 0); !errors.Is(err, io.EOF) {
+		t.Fatalf("DecodeJSONLimit(nil) = %v, want io.EOF", err)
+	}
+
+	// nil request body -> io.EOF
+	reqNilBody := &http.Request{Method: http.MethodPost, Body: nil}
+	if err := DecodeJSONLimit(reqNilBody, &dst, 128); !errors.Is(err, io.EOF) {
+		t.Fatalf("DecodeJSONLimit(nil body) = %v, want io.EOF", err)
+	}
+
+	// Valid JSON with default limit (maxBytes <= 0)
+	reqOK := httptest.NewRequest(http.MethodPost, "/test", strings.NewReader(`{"hello":"world"}`))
+	if err := DecodeJSONLimit(reqOK, &dst, 0); err != nil {
+		t.Fatalf("DecodeJSONLimit valid failed: %v", err)
+	}
+	if dst["hello"] != "world" {
+		t.Fatalf("unexpected decoded payload: %+v", dst)
+	}
+
+	// Payload exceeding small limit -> decode error
+	reqTooLarge := httptest.NewRequest(http.MethodPost, "/test", strings.NewReader(`{"hello":"`+strings.Repeat("a", 64)+`"}`))
+	var dst2 map[string]string
+	if err := DecodeJSONLimit(reqTooLarge, &dst2, 16); err == nil {
+		t.Fatal("expected error when JSON body exceeds maxBytes")
 	}
 }

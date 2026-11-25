@@ -209,7 +209,11 @@ func BuildMediaPlaylist(p PlaylistParams) string {
 	b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
 	b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
 	if isFMP4 {
-		b.WriteString("#EXT-X-MAP:URI=\"init.mp4\"\n")
+		initURL := fmt.Sprintf("hls1/%s/init.mp4", playlistID)
+		if queryStr != "" {
+			initURL += "?" + queryStr
+		}
+		b.WriteString(fmt.Sprintf("#EXT-X-MAP:URI=\"%s\"\n", initURL))
 	}
 
 	for idx, d := range durs {

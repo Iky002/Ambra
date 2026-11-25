@@ -411,27 +411,31 @@ func (h *Handler) canDownloadContent(r *http.Request) bool {
 			return true
 		}
 		if h.userRepo != nil {
-			if u, err := h.userRepo.GetUserByID(r.Context(), guid.Normalize(ac.UserID())); err == nil && u != nil {
-				if u.IsAdmin || u.Policy.IsAdministrator {
-					return true
-				}
-				return u.Policy.EnableContentDownloading
+			u, err := h.userRepo.GetUserByID(r.Context(), guid.Normalize(ac.UserID()))
+			if err != nil || u == nil {
+				return false
 			}
+			if u.IsAdmin || u.Policy.IsAdministrator {
+				return true
+			}
+			return u.Policy.EnableContentDownloading
 		}
 		if ac.User != nil {
 			return ac.User.Policy.EnableContentDownloading
 		}
-		return true
+		return false
 	}
 	if h.auth.UserIDFromCtx != nil {
 		callerID := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
 		if callerID != "" && h.userRepo != nil {
-			if u, err := h.userRepo.GetUserByID(r.Context(), callerID); err == nil && u != nil {
-				if u.IsAdmin || u.Policy.IsAdministrator {
-					return true
-				}
-				return u.Policy.EnableContentDownloading
+			u, err := h.userRepo.GetUserByID(r.Context(), callerID)
+			if err != nil || u == nil {
+				return false
 			}
+			if u.IsAdmin || u.Policy.IsAdministrator {
+				return true
+			}
+			return u.Policy.EnableContentDownloading
 		}
 	}
 	return true
@@ -465,7 +469,7 @@ func (h *Handler) allowedLibrariesForUser(ctx context.Context, userID string) []
 	}
 	u, err := h.userRepo.GetUserByID(ctx, userID)
 	if err != nil || u == nil {
-		return nil
+		return []string{}
 	}
 	if u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableAllFolders {
 		return nil
@@ -515,12 +519,63 @@ func (h *Handler) userParentalPolicyForRequest(r *http.Request, fallbackUserID s
 	}
 	u, err := h.userRepo.GetUserByID(r.Context(), uid)
 	if err != nil || u == nil {
-		return nil, nil
+		zero := 0
+		return &zero, nil
 	}
 	if u.IsAdmin || u.Policy.IsAdministrator {
 		return nil, nil
 	}
 	return u.Policy.MaxParentalRating, u.Policy.BlockedTags
+}
+
+func (h *Handler) isPlaylistPublic(ctx context.Context, playlistID string) bool {
+	normID := guid.Normalize(playlistID)
+	if normID == "" {
+		return false
+	}
+	var vis struct {
+		IsPublic bool `json:"IsPublic"`
+	}
+	if ok, err := h.getConfigJSON(ctx, "item_visibility_"+normID, &vis); err == nil && ok {
+		return vis.IsPublic
+	}
+	if h.userRepo != nil {
+		if raw, err := h.userRepo.GetServerConfig(ctx, "item_visibility_"+normID); err == nil && raw != "" {
+			if err := json.Unmarshal([]byte(raw), &vis); err == nil {
+				return vis.IsPublic
+			}
+		}
+	}
+	return false
+}
+
+func (h *Handler) canViewPlaylist(r *http.Request, playlistID, parentID string) bool {
+	ownerID := guid.Normalize(parentID)
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.IsAdmin() {
+			return true
+		}
+		if ownerID == "" || h.isPlaylistPublic(r.Context(), playlistID) {
+			return true
+		}
+		callerID := guid.Normalize(ac.UserID())
+		return callerID != "" && callerID == ownerID
+	}
+	if h.auth.UserIDFromCtx != nil {
+		callerID := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if callerID != "" {
+			if h.userRepo != nil {
+				if u, err := h.userRepo.GetUserByID(r.Context(), callerID); err == nil && u != nil && (u.IsAdmin || u.Policy.IsAdministrator) {
+					return true
+				}
+			}
+			if ownerID == "" || h.isPlaylistPublic(r.Context(), playlistID) {
+				return true
+			}
+			return callerID == ownerID
+		}
+	}
+	return true
 }
 
 func (h *Handler) getConfigJSON(ctx context.Context, key string, dst any) (bool, error) {
@@ -573,32 +628,15 @@ func (h *Handler) isNonAdminCaller(r *http.Request) bool {
 	return false
 }
 
-func sanitizeItemPaths(item *dto.BaseItemDto) {
-	if item == nil {
-		return
-	}
-	item.Path = ""
-	for i := range item.MediaSources {
-		item.MediaSources[i].Path = ""
-		for j := range item.MediaSources[i].MediaStreams {
-			item.MediaSources[i].MediaStreams[j].Path = ""
-		}
-	}
-}
-
 func (h *Handler) sanitizeItemPathsForCaller(r *http.Request, item *dto.BaseItemDto) {
-	if !h.isNonAdminCaller(r) {
-		return
+	if h.isNonAdminCaller(r) {
+		dto.SanitizeItemPaths(item)
 	}
-	sanitizeItemPaths(item)
 }
 
 func (h *Handler) sanitizeItemsPathsForCaller(r *http.Request, items []dto.BaseItemDto) {
-	if !h.isNonAdminCaller(r) {
-		return
-	}
-	for i := range items {
-		sanitizeItemPaths(&items[i])
+	if h.isNonAdminCaller(r) {
+		dto.SanitizeItemPathsSlice(items)
 	}
 }
 
@@ -607,7 +645,7 @@ func (h *Handler) sanitizePlaylistItemsPathsForCaller(r *http.Request, items []s
 		return
 	}
 	for i := range items {
-		sanitizeItemPaths(&items[i].BaseItemDto)
+		dto.SanitizeItemPaths(&items[i].BaseItemDto)
 	}
 }
 

@@ -27,7 +27,6 @@ import (
 )
 
 type Handler struct {
-	cfgMu    sync.RWMutex
 	setupMu  sync.Mutex
 	cfg      *config.Config
 	userRepo *sqlite.UserRepo
@@ -117,12 +116,11 @@ func (h *Handler) GetSystemInfo(w http.ResponseWriter, r *http.Request) {
 	ac, ok := middleware.AuthFromContext(r.Context())
 	isAdmin := ok && ac != nil && ac.IsAdmin()
 
-	h.cfgMu.RLock()
-	httpAddr := h.cfg.HTTPAddr
-	dataDir := h.cfg.DataDir
-	transcodeTempDir := h.cfg.TranscodeTempDir()
-	wizardCompleted := h.cfg.IsStartupWizardCompleted
-	h.cfgMu.RUnlock()
+	snap := h.cfg.Snapshot()
+	httpAddr := snap.HTTPAddr
+	dataDir := snap.DataDir
+	transcodeTempDir := (&snap).TranscodeTempDir()
+	wizardCompleted := snap.IsStartupWizardCompleted
 
 	port := parsePort(httpAddr, 8096)
 	info := systemInfoResponse{
@@ -210,17 +208,16 @@ func (h *Handler) GetConfiguration(w http.ResponseWriter, r *http.Request) {
 		isAdmin = true
 	}
 
-	h.cfgMu.RLock()
-	serverName := h.cfg.ServerName
-	wizardCompleted := h.cfg.IsStartupWizardCompleted
+	snap := h.cfg.Snapshot()
+	serverName := snap.ServerName
+	wizardCompleted := snap.IsStartupWizardCompleted
 	tmdbKey := ""
 	if isAdmin {
-		tmdbKey = h.cfg.TMDBApiKey
+		tmdbKey = snap.TMDBApiKey
 	}
-	tmdbLang := h.cfg.TMDBLanguage
-	enableSTRM302 := h.cfg.EnableSTRM302
-	playedThreshold := h.cfg.PlayedThreshold
-	h.cfgMu.RUnlock()
+	tmdbLang := snap.TMDBLanguage
+	enableSTRM302 := snap.EnableSTRM302
+	playedThreshold := snap.PlayedThreshold
 
 	extra := h.loadExtraConfig(r.Context())
 	out := make(map[string]any, 9)
@@ -256,30 +253,30 @@ func (h *Handler) UpdateConfiguration(w http.ResponseWriter, r *http.Request) {
 	tmdbChanged := false
 	strmChanged := false
 
-	h.cfgMu.Lock()
-	if v, ok := body["ServerName"].(string); ok && strings.TrimSpace(v) != "" {
-		h.cfg.ServerName = strings.TrimSpace(v)
-	}
-	if v, ok := body["IsStartupWizardCompleted"].(bool); ok {
-		h.cfg.IsStartupWizardCompleted = v
-	}
-	if v, ok := body["TMDBApiKey"].(string); ok {
-		h.cfg.TMDBApiKey = strings.TrimSpace(v)
-		tmdbChanged = true
-	}
-	if v, ok := body["TMDBLanguage"].(string); ok && strings.TrimSpace(v) != "" {
-		h.cfg.TMDBLanguage = strings.TrimSpace(v)
-		tmdbChanged = true
-	}
-	if v, ok := body["EnableSTRM302"].(bool); ok {
-		h.cfg.EnableSTRM302 = v
-		strmChanged = true
-	}
-	if v, ok := body["PlayedThreshold"].(float64); ok && v > 0 && v <= 1 {
-		h.cfg.PlayedThreshold = v
-	}
+	h.cfg.Update(func(c *config.Config) {
+		if v, ok := body["ServerName"].(string); ok && strings.TrimSpace(v) != "" {
+			c.ServerName = strings.TrimSpace(v)
+		}
+		if v, ok := body["IsStartupWizardCompleted"].(bool); ok {
+			c.IsStartupWizardCompleted = v
+		}
+		if v, ok := body["TMDBApiKey"].(string); ok {
+			c.TMDBApiKey = strings.TrimSpace(v)
+			tmdbChanged = true
+		}
+		if v, ok := body["TMDBLanguage"].(string); ok && strings.TrimSpace(v) != "" {
+			c.TMDBLanguage = strings.TrimSpace(v)
+			tmdbChanged = true
+		}
+		if v, ok := body["EnableSTRM302"].(bool); ok {
+			c.EnableSTRM302 = v
+			strmChanged = true
+		}
+		if v, ok := body["PlayedThreshold"].(float64); ok && v > 0 && v <= 1 {
+			c.PlayedThreshold = v
+		}
+	})
 	saveErr := h.cfg.Save()
-	h.cfgMu.Unlock()
 
 	if saveErr != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to save configuration")
@@ -560,11 +557,10 @@ func (h *Handler) GetPlugins(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *Handler) buildPublicInfo(r *http.Request) dto.PublicSystemInfo {
-	h.cfgMu.RLock()
-	httpAddr := h.cfg.HTTPAddr
-	serverName := h.cfg.ServerName
-	serverID := h.cfg.ServerID
-	h.cfgMu.RUnlock()
+	snap := h.cfg.Snapshot()
+	httpAddr := snap.HTTPAddr
+	serverName := snap.ServerName
+	serverID := snap.ServerID
 
 	scheme := "http"
 	if r.TLS != nil {

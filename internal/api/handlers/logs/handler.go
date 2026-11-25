@@ -64,6 +64,7 @@ func New(cfg *config.Config) *Handler {
 
 // AppendRuntimeLog appends a line to the in-memory runtime log buffer.
 func (h *Handler) AppendRuntimeLog(line string) {
+	line = escapeLogControlChars(line)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.runtimeLines = append(h.runtimeLines, line)
@@ -107,18 +108,18 @@ func (h *Handler) listLogFiles() []LogFileDto {
 	if dir != "" {
 		if entries, err := os.ReadDir(dir); err == nil {
 			for _, e := range entries {
-				if e.IsDir() {
+				if e.IsDir() || e.Type()&os.ModeSymlink != 0 {
 					continue
 				}
-				info, err := e.Info()
-				if err != nil {
+				fi, err := os.Lstat(filepath.Join(dir, e.Name()))
+				if err != nil || fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
 					continue
 				}
-				mod := info.ModTime().UTC()
+				mod := fi.ModTime().UTC()
 				files = append(files, LogFileDto{
 					DateCreated:  mod,
 					DateModified: mod,
-					Size:         info.Size(),
+					Size:         fi.Size(),
 					Name:         e.Name(),
 				})
 			}
@@ -249,7 +250,7 @@ func (h *Handler) readLogLinesPage(name string, start, limit int) ([]string, int
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for sc.Scan() {
 		if total >= start && len(page) < limit {
-			page = append(page, sc.Text())
+			page = append(page, escapeLogControlChars(sc.Text()))
 		}
 		total++
 	}

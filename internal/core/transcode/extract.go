@@ -13,9 +13,21 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 )
 
-const defaultExtractTimeout = 45 * time.Second
+const (
+	defaultExtractTimeout    = 45 * time.Second
+	localProtocolWhitelist   = "file,pipe"
+	remoteProtocolWhitelist  = "file,pipe,http,https,tcp,tls,crypto"
+)
+
+func protocolWhitelistForInput(mediaPath string) string {
+	if isHTTPInput(mediaPath) {
+		return remoteProtocolWhitelist
+	}
+	return localProtocolWhitelist
+}
 
 func resolveMediaInputPath(mediaPath string) (string, error) {
 	p := strings.TrimSpace(mediaPath)
@@ -26,6 +38,9 @@ func resolveMediaInputPath(mediaPath string) (string, error) {
 		return "", fmt.Errorf("media path contains forbidden control characters")
 	}
 	if isHTTPInput(p) {
+		if err := netutil.ValidateRemoteURL(p, true); err != nil {
+			return "", fmt.Errorf("invalid media url: %w", err)
+		}
 		return p, nil
 	}
 	abs, err := filepath.Abs(p)
@@ -136,15 +151,22 @@ func BuildSubtitleExtractArgs(mediaPath string, streamIndex int, targetExt, outP
 	case "sup":
 		subCodec = "copy"
 	}
-	return []string{
+	args := []string{
 		"-hide_banner",
 		"-loglevel", "error",
 		"-y",
+		"-protocol_whitelist", protocolWhitelistForInput(mediaPath),
+	}
+	if isHTTPInput(mediaPath) {
+		args = append(args, "-follow_redirects", "0")
+	}
+	args = append(args,
 		"-i", mediaPath,
-		"-map", "0:" + strconv.Itoa(streamIndex),
+		"-map", "0:"+strconv.Itoa(streamIndex),
 		"-c:s", subCodec,
 		outPath,
-	}
+	)
+	return args
 }
 
 // ExtractFonts extracts embedded font attachments (e.g. TTF/OTF in MKV) for client-side ASS rendering (JASSUB).
@@ -185,11 +207,18 @@ func (e *Extractor) ExtractFonts(ctx context.Context, mediaPath, itemID, mediaSo
 
 		// ffmpeg -dump_attachment:t "" dumps all attachment streams into cmd.Dir.
 		// Extract into an isolated staging directory first to reject unsafe filenames.
-		cmd := exec.CommandContext(runCtx, e.ffmpegPath,
+		fontArgs := []string{
 			"-hide_banner", "-loglevel", "error", "-y",
+			"-protocol_whitelist", protocolWhitelistForInput(resolvedMedia),
+		}
+		if isHTTPInput(resolvedMedia) {
+			fontArgs = append(fontArgs, "-follow_redirects", "0")
+		}
+		fontArgs = append(fontArgs,
 			"-dump_attachment:t", "",
 			"-i", resolvedMedia,
 		)
+		cmd := exec.CommandContext(runCtx, e.ffmpegPath, fontArgs...)
 		cmd.Dir = stageDir
 		_ = cmd.Run()
 
@@ -292,13 +321,19 @@ func (e *Extractor) ExtractChapterThumbnail(ctx context.Context, mediaPath, item
 			"-hide_banner",
 			"-loglevel", "error",
 			"-y",
+			"-protocol_whitelist", protocolWhitelistForInput(resolvedMedia),
+		}
+		if isHTTPInput(resolvedMedia) {
+			args = append(args, "-follow_redirects", "0")
+		}
+		args = append(args,
 			"-ss", strconv.FormatFloat(sec, 'f', 3, 64),
 			"-i", resolvedMedia,
 			"-frames:v", "1",
 			"-q:v", "4",
 			"-vf", "scale='min(640,iw)':-2",
 			tmpPath,
-		}
+		)
 		cmd := exec.CommandContext(runCtx, e.ffmpegPath, args...)
 		stderr := newSafeRingBuffer(maxStderrBytes)
 		cmd.Stderr = stderr

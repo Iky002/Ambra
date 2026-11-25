@@ -2,9 +2,19 @@ package plugins
 
 import (
 	"context"
+	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 )
+
+// BuiltInIDPrefix is the reserved plugin ID prefix exclusively for built-in plugins.
+const BuiltInIDPrefix = "ambra.builtin."
+
+// IsBuiltInID reports whether id uses the reserved built-in plugin namespace.
+func IsBuiltInID(id string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(id)), BuiltInIDPrefix)
+}
 
 // Kind identifies what capabilities a plugin provides.
 type Kind string
@@ -80,6 +90,7 @@ type MetadataResult struct {
 	PosterURL       string
 	BackdropURL     string
 	LogoURL         string
+	LockData        bool
 	Collection      *CollectionMeta
 }
 
@@ -112,9 +123,25 @@ func NewRegistry() *Registry {
 }
 
 func (r *Registry) Register(p Plugin) {
+	if p == nil {
+		return
+	}
+	m := p.Manifest()
+	id := strings.TrimSpace(m.ID)
+	if id == "" {
+		return
+	}
+	if !m.BuiltIn && IsBuiltInID(id) {
+		slog.Warn("plugins: refusing external plugin with reserved built-in prefix", "plugin_id", id)
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.plugins[p.Manifest().ID] = p
+	if existing, ok := r.plugins[id]; ok && existing.Manifest().BuiltIn && !m.BuiltIn {
+		slog.Warn("plugins: refusing external plugin attempt to overwrite built-in plugin", "plugin_id", id)
+		return
+	}
+	r.plugins[id] = p
 }
 
 func (r *Registry) Get(id string) (Plugin, bool) {

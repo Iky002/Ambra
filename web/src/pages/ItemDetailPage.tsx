@@ -402,9 +402,26 @@ export function ItemDetailPage() {
     },
   })
 
+  const ALLOWED_SUBTITLE_EXTENSIONS = new Set(['srt', 'vtt', 'ass', 'ssa', 'sub', 'sup'])
+  const MAX_SUBTITLE_UPLOAD_BYTES = 20 * 1024 * 1024 // 20 MB
+
+  const validateSubtitleFile = (file: File): string | null => {
+    const extMatch = file.name.toLowerCase().match(/\.([a-z0-9]+)$/)
+    const ext = extMatch ? extMatch[1] : ''
+    if (!ext || !ALLOWED_SUBTITLE_EXTENSIONS.has(ext)) {
+      return '仅支持上传 .srt / .vtt / .ass / .ssa / .sub / .sup 格式的字幕文件'
+    }
+    if (file.size > MAX_SUBTITLE_UPLOAD_BYTES) {
+      return '字幕文件过大，请选择不超过 20 MB 的字幕文件'
+    }
+    return null
+  }
+
   const uploadSubtitleMutation = useMutation({
     mutationFn: async () => {
       if (!item || !subFile) throw new Error('请选择要上传的字幕文件')
+      const validationErr = validateSubtitleFile(subFile)
+      if (validationErr) throw new Error(validationErr)
       const extMatch = subFile.name.toLowerCase().match(/\.([a-z0-9]+)$/)
       const format = extMatch ? extMatch[1] : 'srt'
       const data = await readFileAsBase64(subFile)
@@ -2293,15 +2310,25 @@ export function ItemDetailPage() {
 
               <label className="block space-y-1.5">
                 <span className="block text-[11px] text-zinc-400">
-                  选择字幕文件 (.srt, .ass, .ssa, .vtt, .sub)
+                  选择字幕文件 (.srt, .vtt, .ass, .ssa, .sub, .sup，≤ 20 MB)
                 </span>
                 <input
                   ref={subFileInputRef}
                   type="file"
-                  accept=".srt,.ass,.ssa,.vtt,.sub"
+                  accept=".srt,.vtt,.ass,.ssa,.sub,.sup"
                   aria-label="选择字幕文件"
                   onChange={(e) => {
-                    setSubFile(e.target.files?.[0] || null)
+                    const picked = e.target.files?.[0] || null
+                    if (picked) {
+                      const errMsg = validateSubtitleFile(picked)
+                      if (errMsg) {
+                        setSubFile(null)
+                        setSubError(errMsg)
+                        e.target.value = ''
+                        return
+                      }
+                    }
+                    setSubFile(picked)
                     setSubError(null)
                   }}
                   className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-200 file:mr-3 file:rounded-lg file:border-0 file:bg-amber-500/20 file:px-2.5 file:py-1 file:text-xs file:font-medium file:text-amber-300 hover:file:bg-amber-500/30"

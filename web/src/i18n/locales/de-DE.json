@@ -28,7 +28,6 @@
   "common.copy": "Kopieren",
   "common.copied": "Kopiert",
   "common.language": "Sprache",
-
   "nav.home": "Startseite",
   "nav.trending": "Trends",
   "nav.collections": "Sammlungen",
@@ -50,7 +49,6 @@
   "nav.demoDesc": "(In-Memory-Simulation im Frontend, kein Backend nötig · Änderungen wirken sofort)",
   "nav.demoSwitchGuest": "Admin-Ansicht · Zu Benutzer wechseln für RBAC-Demo",
   "nav.demoSwitchAdmin": "Benutzeransicht · Zurück zur Admin-Konsole",
-
   "auth.loginTitle": "Bei Ambra anmelden",
   "auth.loginSubtitle": "Mit deinem privaten Heimkino-Server verbinden",
   "auth.username": "Benutzername",
@@ -65,7 +63,6 @@
   "auth.noAdminDesc": "Dieses Konto besitzt keine Administratorrechte (IsAdministrator = false). Wende dich an den Systemadministrator, um Servereinstellungen, Benutzer oder Mediatheken zu verwalten.",
   "auth.backHome": "Zur Startseite",
   "auth.verifyingAdmin": "Administratorrechte werden überprüft...",
-
   "setup.title": "Willkommen bei Ambra",
   "setup.subtitle": "Richte deinen privaten Heimkino-Server in wenigen Schritten ein",
   "setup.serverName": "Servername",
@@ -73,7 +70,6 @@
   "setup.tmdbLanguage": "Metadatensprache",
   "setup.createAdmin": "Administratorkonto erstellen",
   "setup.complete": "Einrichtung abschließen",
-
   "home.continueWatching": "Weiterschauen",
   "home.nextUp": "Als Nächstes",
   "home.myMedia": "Meine Medien",
@@ -88,7 +84,6 @@
   "home.emptyTitle": "Deine Mediathek ist leer",
   "home.emptyDesc": "Öffne die Admin-Konsole, um lokale Medienordner oder .strm-Verzeichnisse hinzuzufügen und den ersten Scan zu starten.",
   "home.goManageLibraries": "Mediatheken hinzufügen",
-
   "library.allItems": "Alle",
   "library.albums": "Alben",
   "library.artists": "Künstler",
@@ -111,7 +106,6 @@
   "library.exitMultiSelect": "Auswahl beenden",
   "library.selectedCount": "{{count}} ausgewählt",
   "library.emptyResult": "Keine passenden Einträge gefunden",
-
   "detail.play": "Abspielen",
   "detail.resume": "Fortsetzen",
   "detail.favorite": "Favorit",
@@ -146,7 +140,6 @@
   "detail.container": "Containerformat",
   "detail.fileSize": "Dateigröße",
   "detail.bitrate": "Gesamtbitrate",
-
   "player.quality": "Qualität",
   "player.qualityAuto": "Direktwiedergabe",
   "player.version": "Version",
@@ -163,33 +156,27 @@
   "player.playNextNow": "Jetzt abspielen",
   "player.cancelNextUp": "Abbrechen",
   "player.loadError": "Videostream konnte nicht dekodiert oder geladen werden. Bitte prüfe das Medienformat oder die Netzwerkverbindung.",
-
   "collections.title": "Sammlungen & Wiedergabelisten",
   "collections.boxSets": "Sammlungen",
   "collections.playlists": "Wiedergabelisten",
   "collections.createCollection": "Neue Sammlung",
   "collections.createPlaylist": "Neue Wiedergabeliste",
   "collections.playAll": "Alle abspielen",
-
   "favorites.title": "Favoriten",
   "favorites.emptyTitle": "Noch keine Favoriten",
   "favorites.emptyDesc": "Klicke bei einem Film, einer Serie oder Musik auf das Favoriten-Symbol, um sie hier zu speichern.",
-
   "trending.title": "Top-Charts",
   "trending.subtitle": "Vereint TMDB-Trends, Douban Hot und IMDb Top 250 – direkt zu Titeln in deiner Mediathek",
   "trending.refreshNow": "Charts jetzt synchronisieren",
   "trending.inLibrary": "In Mediathek",
-
   "livetv.title": "Live-TV",
   "livetv.channels": "Sender",
   "livetv.guide": "TV-Programm",
   "livetv.recordings": "Aufnahmen",
   "livetv.timers": "Aufnahmeplan",
-
   "search.title": "Entdecken & Suchen",
   "search.placeholder": "Nach Titel, Originaltitel oder Besetzung suchen...",
   "search.noResults": "Keine passenden Filme, Serien oder Personen gefunden",
-
   "profile.title": "Profil",
   "profile.uiLanguage": "Oberflächensprache",
   "profile.uiLanguageDesc": "Sprache des Web-Clients ändern und Präferenz mit dem Server synchronisieren",
@@ -197,11 +184,9 @@
   "profile.avatar": "Profilbild",
   "profile.quickConnect": "Quick Connect-Autorisierung",
   "profile.playbackPrefs": "Wiedergabeeinstellungen",
-
   "notifications.title": "Benachrichtigungen",
   "notifications.markAllRead": "Alle als gelesen markieren",
   "notifications.empty": "Keine Benachrichtigungen",
-
   "admin.title": "Admin-Konsole",
   "admin.tabDashboard": "Dashboard",
   "admin.tabLibraries": "Mediatheken",
@@ -220,5 +205,20 @@
   "admin.serverLogs": "Serverprotokolle",
   "admin.downloadLog": "Protokoll herunterladen",
   "admin.kickDevice": "Gerät trennen",
-  "admin.revokeKey": "Schlüssel widerrufen"
+  "admin.revokeKey": "Schlüssel widerrufen",
+  "player.cannotPlayTitle": "Medium kann nicht wiedergegeben werden",
+  "player.retryPlayback": "Wiedergabe wiederholen",
+  "player.goBack": "Zurück",
+  "player.subtitleOff": "Untertitel aus",
+  "player.subtitleTweaks": "Untertitel-Anpassung",
+  "player.loadingStream": "Medienstream wird geladen...",
+  "player.buffering": "Puffern...",
+  "admin.scanAllLibraries": "Alle Bibliotheken scannen",
+  "admin.scanningAllLibraries": "Bibliotheksscan wird gestartet...",
+  "admin.dashboardOverview": "Serverstatus-Übersicht",
+  "admin.usersTitle": "Benutzer & Berechtigungen (RBAC)",
+  "admin.createUser": "Neuer Benutzer",
+  "admin.pluginsTitle": "Plugins & Scraper",
+  "admin.webhooksTitle": "Webhook-Benachrichtigungen",
+  "admin.createWebhook": "Webhook hinzufügen"
 }

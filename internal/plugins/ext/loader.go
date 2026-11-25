@@ -82,6 +82,12 @@ func (l *Loader) LoadFromDir(dir string, reg *plugins.Registry) (int, error) {
 			errs = append(errs, fmt.Errorf("init plugin %s: %w", manifestPath, err))
 			continue
 		}
+		if reg != nil {
+			if existing, ok := reg.Get(p.Manifest().ID); ok && existing.Manifest().BuiltIn {
+				errs = append(errs, fmt.Errorf("init plugin %s: cannot overwrite built-in plugin %q", manifestPath, p.Manifest().ID))
+				continue
+			}
+		}
 
 		l.mu.Lock()
 		l.loaded[p.Manifest().ID] = p

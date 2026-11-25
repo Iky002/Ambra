@@ -1,7 +1,9 @@
 package middleware
 
 import (
+	"compress/gzip"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/auth"
+	"github.com/ambra-media/ambra/internal/core/session"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -226,5 +229,134 @@ func TestEmbyPrefixWebLowercaseAPIAfterStripAndEscapedSlash(t *testing.T) {
 	r.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || rec.Body.String() != "/Genres/Sci%2FFi/Items" {
 		t.Fatalf("GET /emby/genres/Sci%%2FFi/items: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	// 5. /emby/web and /emby/web/... strip /emby without canonicalizing web asset paths
+	r.Get("/web/assets/index.js", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("asset-ok:" + r.URL.Path))
+	})
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/emby/web", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "web-root" {
+		t.Fatalf("GET /emby/web: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/emby/web/assets/index.js", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "asset-ok:/web/assets/index.js" {
+		t.Fatalf("GET /emby/web/assets/index.js: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/EMBY/WEB/index.html", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "web-ok" {
+		t.Fatalf("GET /EMBY/WEB/index.html: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestGzipSkipsSSEAndWeakensStrongETag(t *testing.T) {
+	// 1. text/event-stream must NOT be gzip-compressed.
+	sseHandler := Gzip(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: hello\n\n"))
+	}))
+	reqSSE := httptest.NewRequest(http.MethodGet, "/events", nil)
+	reqSSE.Header.Set("Accept-Encoding", "gzip")
+	recSSE := httptest.NewRecorder()
+	sseHandler.ServeHTTP(recSSE, reqSSE)
+	if recSSE.Header().Get("Content-Encoding") != "" {
+		t.Fatalf("expected SSE not compressed, got Content-Encoding=%q", recSSE.Header().Get("Content-Encoding"))
+	}
+	if recSSE.Body.String() != "data: hello\n\n" {
+		t.Fatalf("unexpected SSE body: %q", recSSE.Body.String())
+	}
+
+	// 2. Strong ETag is weakened to W/... when compressed.
+	jsonHandler := Gzip(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", `"abc123"`)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	reqJSON := httptest.NewRequest(http.MethodGet, "/Items", nil)
+	reqJSON.Header.Set("Accept-Encoding", "gzip")
+	recJSON := httptest.NewRecorder()
+	jsonHandler.ServeHTTP(recJSON, reqJSON)
+	if recJSON.Header().Get("Content-Encoding") != "gzip" {
+		t.Fatalf("expected gzip Content-Encoding, got %q", recJSON.Header().Get("Content-Encoding"))
+	}
+	if etag := recJSON.Header().Get("ETag"); etag != `W/"abc123"` {
+		t.Fatalf("expected weakened ETag W/\"abc123\", got %q", etag)
+	}
+	gr, err := gzip.NewReader(recJSON.Body)
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	plain, _ := io.ReadAll(gr)
+	_ = gr.Close()
+	if string(plain) != `{"ok":true}` {
+		t.Fatalf("unexpected decompressed body: %q", string(plain))
+	}
+
+	// 3. Already-weak ETag stays unchanged.
+	weakHandler := Gzip(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", `W/"already-weak"`)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	recWeak := httptest.NewRecorder()
+	weakHandler.ServeHTTP(recWeak, reqJSON)
+	if etag := recWeak.Header().Get("ETag"); etag != `W/"already-weak"` {
+		t.Fatalf("expected already-weak ETag preserved, got %q", etag)
+	}
+}
+
+func TestParseAuthDoesNotTouchSessionForDeniedRemoteUser(t *testing.T) {
+	dir := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(dir, "mw_remote_touch.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	cfg := config.Default(dir)
+	repo := sqlite.NewUserRepo(store)
+	authSvc := auth.NewService(repo, cfg)
+	sessMgr := session.NewManager(repo, cfg, nil)
+	ctx := context.Background()
+
+	u, err := authSvc.CreateUser(ctx, "lanuser", "pw", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Policy.EnableRemoteAccess = false
+	if err := repo.UpdateUserPolicy(ctx, u.ID, u.Policy); err != nil {
+		t.Fatal(err)
+	}
+	authRes, err := authSvc.AuthenticateByName(ctx, "lanuser", "pw", "", auth.ClientInfo{DeviceID: "dev-remote-check"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mw := NewAuth(authSvc, sessMgr)
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// Public IP request through ParseAuth must NOT touch/create an active session.
+	reqPublic := httptest.NewRequest(http.MethodGet, "/Items", nil)
+	reqPublic.RemoteAddr = "198.51.100.77:55555"
+	reqPublic.Header.Set("X-Emby-Token", authRes.AccessToken)
+	mw.ParseAuth(next).ServeHTTP(httptest.NewRecorder(), reqPublic)
+	if sessions := sessMgr.ListSessions(); len(sessions) != 0 {
+		t.Fatalf("expected 0 sessions for remote-denied user, got %+v", sessions)
+	}
+
+	// LAN IP request through ParseAuth MUST touch session.
+	reqLAN := httptest.NewRequest(http.MethodGet, "/Items", nil)
+	reqLAN.RemoteAddr = "192.168.1.99:55555"
+	reqLAN.Header.Set("X-Emby-Token", authRes.AccessToken)
+	mw.ParseAuth(next).ServeHTTP(httptest.NewRecorder(), reqLAN)
+	if sessions := sessMgr.ListSessions(); len(sessions) != 1 || sessions[0].UserId != u.ID {
+		t.Fatalf("expected 1 session for LAN request, got %+v", sessions)
 	}
 }

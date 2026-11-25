@@ -30,7 +30,7 @@ import {
 import type { LiveTvRecordingInfo } from '../api/types'
 import { QueryErrorState } from '../components/QueryErrorState'
 import { useAuth } from '../context/AuthContext'
-import { DEMO_VIDEO_DATA_URL } from '../demo/demoMedia'
+import { getCachedDemoServer } from '../demo/demoLoader'
 import { isDemoMode } from '../demo/demoMode'
 import { getActiveLocale, useI18n } from '../i18n/I18nContext'
 
@@ -249,6 +249,9 @@ export function LiveTvPage() {
   const activeStreamUrl = activeChannel ? getLiveTvChannelStreamUrl(activeChannel.Id) : ''
   const activeLooksLikeHls = useMemo(() => {
     if (!activeChannel) return false
+    if (activeChannel.IsHls === true) return true
+    if ((activeChannel.StreamFormat || '').trim().toLowerCase() === 'hls') return true
+    if (activeChannel.IsHls === false) return false
     const hintUrl = (activeChannel.StreamUrl || activeStreamUrl).toLowerCase()
     return hintUrl.includes('.m3u8') || hintUrl.includes('hls')
   }, [activeChannel, activeStreamUrl])
@@ -335,9 +338,22 @@ export function LiveTvPage() {
     mediaRecoveryCountRef.current = 0
 
     if (demoActive) {
-      video.src = DEMO_VIDEO_DATA_URL
-      video.load()
+      const cachedUrl = getCachedDemoServer()?.getDemoVideoUrl()
+      if (cachedUrl) {
+        video.src = cachedUrl
+        video.load()
+        return () => {
+          video.pause()
+        }
+      }
+      let cancelled = false
+      void import('../demo/demoMedia').then(({ DEMO_VIDEO_DATA_URL }) => {
+        if (cancelled) return
+        video.src = DEMO_VIDEO_DATA_URL
+        video.load()
+      })
       return () => {
+        cancelled = true
         video.pause()
       }
     }
@@ -979,7 +995,7 @@ export function LiveTvPage() {
                   autoPlay
                   src={
                     demoActive
-                      ? DEMO_VIDEO_DATA_URL
+                      ? getCachedDemoServer()?.getDemoVideoUrl() || ''
                       : getLiveTvRecordingStreamUrl(playingRecording.Id)
                   }
                   onError={(e) => {

@@ -2,6 +2,9 @@ package ffmpegbin
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -189,16 +192,26 @@ func resolveOne(baseName, envVal, cfgVal, dataDir, exePath, goos string, embedde
 	return baseName
 }
 
-// DownloadStatic downloads a static binary from rawURL and atomically installs it
+// DownloadStatic downloads a static binary from an HTTPS rawURL and atomically installs it
 // into targetDir with executable permissions (0755).
 func DownloadStatic(ctx context.Context, targetDir, rawURL string) (string, error) {
+	return DownloadStaticVerified(ctx, targetDir, rawURL, "")
+}
+
+// DownloadStaticVerified downloads a static binary over HTTPS, optionally verifies its SHA-256
+// hex digest when expectedSHA256 is non-empty, and atomically installs it into targetDir (0755).
+func DownloadStaticVerified(ctx context.Context, targetDir, rawURL, expectedSHA256 string) (string, error) {
 	targetDir = strings.TrimSpace(targetDir)
 	if targetDir == "" {
 		return "", errors.New("ffmpegbin: target directory is empty")
 	}
 	parsed, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
-		return "", fmt.Errorf("ffmpegbin: invalid download url %q", rawURL)
+	if err != nil || !strings.EqualFold(parsed.Scheme, "https") || parsed.Host == "" {
+		return "", fmt.Errorf("ffmpegbin: invalid download url %q (https required)", rawURL)
+	}
+	expectedHash := strings.ToLower(strings.TrimSpace(expectedSHA256))
+	if expectedHash != "" && len(expectedHash) != sha256.Size*2 {
+		return "", fmt.Errorf("ffmpegbin: invalid expected SHA-256 digest length %d", len(expectedHash))
 	}
 	fileName := path.Base(parsed.Path)
 	if fileName == "" || fileName == "." || fileName == "/" {
@@ -233,7 +246,9 @@ func DownloadStatic(ctx context.Context, targetDir, rawURL string) (string, erro
 	dest := filepath.Join(targetDir, fileName)
 
 	if err := atomicWriteExecutable(targetDir, dest, fileName, func(w io.Writer) (int64, error) {
-		n, copyErr := io.Copy(w, io.LimitReader(resp.Body, maxStaticBinarySize+1))
+		hasher := sha256.New()
+		mw := io.MultiWriter(w, hasher)
+		n, copyErr := io.Copy(mw, io.LimitReader(resp.Body, maxStaticBinarySize+1))
 		if copyErr != nil {
 			return n, copyErr
 		}
@@ -242,6 +257,12 @@ func DownloadStatic(ctx context.Context, targetDir, rawURL string) (string, erro
 		}
 		if n > maxStaticBinarySize {
 			return n, fmt.Errorf("ffmpegbin: downloaded binary exceeds max size of %d bytes", maxStaticBinarySize)
+		}
+		if expectedHash != "" {
+			actualHash := hex.EncodeToString(hasher.Sum(nil))
+			if subtle.ConstantTimeCompare([]byte(actualHash), []byte(expectedHash)) != 1 {
+				return n, fmt.Errorf("ffmpegbin: sha256 mismatch: got %s, want %s", actualHash, expectedHash)
+			}
 		}
 		return n, nil
 	}); err != nil {
