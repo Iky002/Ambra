@@ -22,6 +22,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/core/playback"
 	"github.com/ambra-media/ambra/internal/core/scanner"
+	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
@@ -964,18 +965,38 @@ func (h *Handler) handleAllThemeMedia(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handler) handleItemThumbnails(w http.ResponseWriter, _ *http.Request) {
-	httpx.JSON(w, http.StatusOK, map[string]any{
+func (h *Handler) buildThumbnailSetPayload(r *http.Request) map[string]any {
+	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	q := httpx.ParseQuery(r)
+	width := transcode.ParseBIFWidthParam(q.Get("Width"))
+	thumbs := []map[string]any{}
+
+	if h.extractor != nil && itemID != "" && h.canAccessItemID(r, itemID) {
+		mediaPath := h.resolveMediaSourcePath(r.Context(), itemID, guid.Normalize(q.Get("MediaSourceId")))
+		if bifPath := h.extractor.FindExistingBIF(mediaPath, itemID, width); bifPath != "" {
+			if meta, err := transcode.ReadBIFMetadata(bifPath); err == nil && len(meta.FrameTimestampsMs) > 0 {
+				thumbs = make([]map[string]any, 0, len(meta.FrameTimestampsMs))
+				for _, ms := range meta.FrameTimestampsMs {
+					thumbs = append(thumbs, map[string]any{
+						"PositionTicks": int64(ms) * 10_000,
+						"ImageTag":      fmt.Sprintf("bif-%d", width),
+					})
+				}
+			}
+		}
+	}
+	return map[string]any{
 		"AspectRatio": 1.777,
-		"Thumbnails":  []any{},
-	})
+		"Thumbnails":  thumbs,
+	}
 }
 
-func (h *Handler) handleItemThumbnailSet(w http.ResponseWriter, _ *http.Request) {
-	httpx.JSON(w, http.StatusOK, map[string]any{
-		"AspectRatio": 1.777,
-		"Thumbnails":  []any{},
-	})
+func (h *Handler) handleItemThumbnails(w http.ResponseWriter, r *http.Request) {
+	httpx.JSON(w, http.StatusOK, h.buildThumbnailSetPayload(r))
+}
+
+func (h *Handler) handleItemThumbnailSet(w http.ResponseWriter, r *http.Request) {
+	httpx.JSON(w, http.StatusOK, h.buildThumbnailSetPayload(r))
 }
 
 // --- Subtitles, Videos & Audio HLS ---

@@ -42,6 +42,8 @@ interface DatabaseHealth {
 
 interface CacheHealth {
   ImagesBytes: number
+  ChaptersBytes?: number
+  BifBytes?: number
   SubtitlesBytes: number
   TranscodeBytes: number
   TotalBytes: number
@@ -566,15 +568,20 @@ export function HealthAndAuditTab() {
                     <HardDrive className="h-3.5 w-3.5 text-amber-400" />
                     缓存目录占用
                   </span>
-                  <span className="font-mono text-[11px] text-zinc-500">3 项缓存</span>
+                  <span className="font-mono text-[11px] text-zinc-500">5 项缓存</span>
                 </div>
                 <p className="mt-2.5 text-xl font-semibold text-zinc-100">
                   {formatBytes(health.Cache.TotalBytes)}
                 </p>
                 <p className="mt-2 text-[11px] text-zinc-500">
-                  图片 {formatBytes(health.Cache.ImagesBytes)} · 字幕{' '}
+                  图片 {formatBytes(health.Cache.ImagesBytes)} · 章节图{' '}
+                  {formatBytes(health.Cache.ChaptersBytes ?? 0)} · BIF{' '}
+                  {formatBytes(health.Cache.BifBytes ?? 0)} · 字幕{' '}
                   {formatBytes(health.Cache.SubtitlesBytes)} · 转码{' '}
                   {formatBytes(health.Cache.TranscodeBytes)}
+                </p>
+                <p className="mt-1.5 text-[10px] leading-relaxed text-amber-400/80">
+                  章节图 (cache/chapters) 与 BIF (cache/bif) 为独立持久缓存，请谨慎删除，删除后需重新运行对应计划任务恢复
                 </p>
               </div>
 

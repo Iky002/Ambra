@@ -35,6 +35,8 @@ export interface SystemInfo extends PublicSystemInfo {
   CanSelfUpdate?: boolean
   ProgramDataPath?: string
   CachePath?: string
+  ChapterCachePath?: string
+  BifCachePath?: string
   LogPath?: string
   InternalMetadataPath?: string
   TranscodingTempPath?: string

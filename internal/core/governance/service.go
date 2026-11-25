@@ -761,13 +761,17 @@ func (s *Service) CollectHealth(ctx context.Context) (*SystemHealthReport, error
 		}
 
 		imgSize := dirSizeBytes(s.cfg.ImageCacheDir())
+		chapSize := dirSizeBytes(s.cfg.ChapterCacheDir())
+		bifSize := dirSizeBytes(s.cfg.BifCacheDir())
 		subSize := dirSizeBytes(s.cfg.SubtitleCacheDir())
 		transSize := dirSizeBytes(s.cfg.TranscodeTempDir())
 		report.Cache = CacheHealth{
 			ImagesBytes:    imgSize,
+			ChaptersBytes:  chapSize,
+			BifBytes:       bifSize,
 			SubtitlesBytes: subSize,
 			TranscodeBytes: transSize,
-			TotalBytes:     imgSize + subSize + transSize,
+			TotalBytes:     imgSize + chapSize + bifSize + subSize + transSize,
 		}
 
 		report.Disk = collectDiskHealth(s.cfg.DataDir)
@@ -864,6 +868,9 @@ func dirSizeBytes(root string) int64 {
 	var total int64
 	_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
+			return nil
+		}
+		if d.Name() == config.ChapterCacheReadmeName {
 			return nil
 		}
 		if info, statErr := d.Info(); statErr == nil {

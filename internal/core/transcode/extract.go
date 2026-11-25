@@ -268,18 +268,19 @@ func isFontExt(ext string) bool {
 	}
 }
 
-// ChapterThumbnailCachePath computes the deterministic cache path for a lazily extracted chapter thumbnail.
+// ChapterThumbnailCachePath computes the deterministic cache path for a chapter thumbnail
+// inside the dedicated persistent chapter cache directory (<DataDir>/cache/chapters/<itemID>/chapter_<idx>.jpg).
 func (e *Extractor) ChapterThumbnailCachePath(itemID string, chapterIdx int) string {
-	baseDir := filepath.Join(os.TempDir(), "ambra-images")
+	baseDir := filepath.Join(os.TempDir(), "ambra-chapters")
 	if e.cfg != nil {
-		baseDir = e.cfg.ImageCacheDir()
+		baseDir = e.cfg.ChapterCacheDir()
 	}
-	return filepath.Join(baseDir, "chapters", sanitizePathSegment(itemID), fmt.Sprintf("chapter_%d.jpg", chapterIdx))
+	return filepath.Join(baseDir, sanitizePathSegment(itemID), fmt.Sprintf("chapter_%d.jpg", chapterIdx))
 }
 
-// ExtractChapterThumbnail lazily extracts a JPEG thumbnail for chapterIdx at startTicks into
-// <ImageCacheDir>/chapters/<itemID>/chapter_<idx>.jpg using singleflight deduplication,
-// atomic temp-file rename, and an 8-second FFmpeg timeout.
+// ExtractChapterThumbnail extracts a JPEG thumbnail for chapterIdx at startTicks into
+// <ChapterCacheDir>/<itemID>/chapter_<idx>.jpg using singleflight deduplication,
+// atomic temp-file rename, and a 15-second FFmpeg timeout.
 func (e *Extractor) ExtractChapterThumbnail(ctx context.Context, mediaPath, itemID string, chapterIdx int, startTicks int64) (string, error) {
 	resolvedMedia, err := resolveMediaInputPath(mediaPath)
 	if err != nil {
@@ -314,7 +315,7 @@ func (e *Extractor) ExtractChapterThumbnail(ctx context.Context, mediaPath, item
 		if sec < 0 {
 			sec = 0
 		}
-		runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 8*time.Second)
+		runCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		defer cancel()
 
 		args := []string{

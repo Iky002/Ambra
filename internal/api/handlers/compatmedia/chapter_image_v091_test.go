@@ -3,6 +3,7 @@ package compatmedia
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -21,7 +22,7 @@ import (
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
-func TestHandleServeItemImageFullChapterLazyExtraction(t *testing.T) {
+func TestHandleServeItemImageFullChapterCacheOnlyAndThumbnailSet(t *testing.T) {
 	tmp := t.TempDir()
 	store, err := sqlite.Open(filepath.Join(tmp, "chapter_img.db"))
 	if err != nil {
@@ -33,7 +34,7 @@ func TestHandleServeItemImageFullChapterLazyExtraction(t *testing.T) {
 	repo := sqlite.NewLibraryRepo(store)
 	cfg := config.Default(tmp)
 
-	// Prepare a valid 16x16 JPEG fixture for the fake ffmpeg script to copy to its output arg.
+	// Prepare a valid 16x16 JPEG fixture.
 	var jpgBuf bytes.Buffer
 	img := image.NewRGBA(image.Rect(0, 0, 16, 16))
 	for y := 0; y < 16; y++ {
@@ -49,8 +50,10 @@ func TestHandleServeItemImageFullChapterLazyExtraction(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	callLog := filepath.Join(tmp, "calls.log")
 	fakeFFmpeg := filepath.Join(tmp, "fake-ffmpeg.sh")
 	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> \"" + callLog + "\"\n" +
 		"last=\"\"\n" +
 		"for arg in \"$@\"; do last=\"$arg\"; done\n" +
 		"cp \"" + sampleJPG + "\" \"$last\"\n"
@@ -81,49 +84,70 @@ func TestHandleServeItemImageFullChapterLazyExtraction(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	ext := transcode.NewExtractor(cfg)
 	h := New(repo, nil, imaging.New(repo), plugins.NewRegistry(), store, cfg)
-	h.SetExtractor(transcode.NewExtractor(cfg))
+	h.SetExtractor(ext)
 	router := h.BuildRouter(AuthFuncs{})
-
-	// Unauthenticated request must NOT trigger chapter extraction (returns 404).
-	unauthReq := httptest.NewRequest(http.MethodGet, "/Items/"+movie.ID+"/Images/Chapter/0/tag123/jpg/320/180/0/0", nil)
-	unauthRec := httptest.NewRecorder()
-	router.ServeHTTP(unauthRec, unauthReq)
-	if unauthRec.Code != http.StatusNotFound {
-		t.Fatalf("expected 404 for unauthenticated chapter extraction, got %d", unauthRec.Code)
-	}
 
 	adminCtx := &middleware.AuthContext{User: &sqlite.UserRecord{ID: guid.New(), Name: "admin", IsAdmin: true}}
 
-	// Authenticated request for full Emby image route for Chapter index 0 (not yet in DB).
-	req := httptest.NewRequest(http.MethodGet, "/Items/"+movie.ID+"/Images/Chapter/0/tag123/jpg/320/180/0/0", nil)
-	req = req.WithContext(middleware.WithAuthContext(req.Context(), adminCtx))
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK for lazy chapter thumbnail, got %d body=%s", rec.Code, rec.Body.String())
+	// 1. Before scheduled task runs, even authenticated request MUST return 404 without invoking FFmpeg.
+	reqBefore := httptest.NewRequest(http.MethodGet, "/Items/"+movie.ID+"/Images/Chapter/0/tag123/jpg/320/180/0/0", nil)
+	reqBefore = reqBefore.WithContext(middleware.WithAuthContext(reqBefore.Context(), adminCtx))
+	recBefore := httptest.NewRecorder()
+	router.ServeHTTP(recBefore, reqBefore)
+	if recBefore.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 before scheduled chapter extraction, got %d", recBefore.Code)
 	}
-	if rec.Body.Len() == 0 {
-		t.Fatal("expected non-empty JPEG response body")
-	}
-
-	// Verify ImageRecord was upserted into DB.
-	imgRec, err := repo.GetImageByItemAndType(ctx, movie.ID, "Chapter", 0)
-	if err != nil || imgRec == nil || imgRec.Path == "" {
-		t.Fatalf("expected upserted Chapter ImageRecord in DB, got %+v err=%v", imgRec, err)
-	}
-	if _, err := os.Stat(imgRec.Path); err != nil {
-		t.Fatalf("expected extracted chapter file on disk at %s: %v", imgRec.Path, err)
+	if _, err := os.Stat(callLog); !os.IsNotExist(err) {
+		t.Fatal("expected HTTP chapter request NOT to invoke ffmpeg")
 	}
 
-	// Delete the extracted file on disk to verify missing-on-disk fallback re-extracts cleanly.
-	_ = os.Remove(imgRec.Path)
-	req2 := httptest.NewRequest(http.MethodGet, "/Items/"+movie.ID+"/Images/Chapter/0/tag123/jpg/320/180/0/0", nil)
-	req2 = req2.WithContext(middleware.WithAuthContext(req2.Context(), adminCtx))
-	rec2 := httptest.NewRecorder()
-	router.ServeHTTP(rec2, req2)
-	if rec2.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK on re-extraction after missing file, got %d body=%s", rec2.Code, rec2.Body.String())
+	// 2. Run scheduled chapter extraction task -> persists to cache/chapters and DB.
+	sum, err := transcode.ExtractAllChapterImages(ctx, repo, ext, nil)
+	if err != nil || sum.Extracted != 1 {
+		t.Fatalf("ExtractAllChapterImages: sum=%+v err=%v", sum, err)
+	}
+
+	// 3. After scheduled task runs, full Emby image route serves 200 OK from cache.
+	reqAfter := httptest.NewRequest(http.MethodGet, "/Items/"+movie.ID+"/Images/Chapter/0/tag123/jpg/320/180/0/0", nil)
+	reqAfter = reqAfter.WithContext(middleware.WithAuthContext(reqAfter.Context(), adminCtx))
+	recAfter := httptest.NewRecorder()
+	router.ServeHTTP(recAfter, reqAfter)
+	if recAfter.Code != http.StatusOK || recAfter.Body.Len() == 0 {
+		t.Fatalf("expected 200 OK with JPEG body after scheduled extraction, got %d len=%d", recAfter.Code, recAfter.Body.Len())
+	}
+
+	// 4. ThumbnailSet returns empty before BIF exists, and returns BIF frames once cached BIF exists.
+	reqTS1 := httptest.NewRequest(http.MethodGet, "/Items/"+movie.ID+"/ThumbnailSet?Width=320", nil)
+	reqTS1 = reqTS1.WithContext(middleware.WithAuthContext(reqTS1.Context(), adminCtx))
+	recTS1 := httptest.NewRecorder()
+	router.ServeHTTP(recTS1, reqTS1)
+	if recTS1.Code != http.StatusOK {
+		t.Fatalf("expected 200 on ThumbnailSet, got %d", recTS1.Code)
+	}
+	var tsResp1 struct {
+		Thumbnails []map[string]any `json:"Thumbnails"`
+	}
+	_ = json.Unmarshal(recTS1.Body.Bytes(), &tsResp1)
+	if len(tsResp1.Thumbnails) != 0 {
+		t.Fatalf("expected 0 thumbnails before BIF exists, got %d", len(tsResp1.Thumbnails))
+	}
+
+	// Write a 2-frame cached BIF directly into cache/bif
+	bifPath := ext.BifCachePath(movie.ID, 320)
+	if err := transcode.WriteBIF(bifPath, 10000, [][]byte{jpgBuf.Bytes(), jpgBuf.Bytes()}); err != nil {
+		t.Fatalf("WriteBIF: %v", err)
+	}
+	reqTS2 := httptest.NewRequest(http.MethodGet, "/Items/"+movie.ID+"/ThumbnailSet?Width=320", nil)
+	reqTS2 = reqTS2.WithContext(middleware.WithAuthContext(reqTS2.Context(), adminCtx))
+	recTS2 := httptest.NewRecorder()
+	router.ServeHTTP(recTS2, reqTS2)
+	var tsResp2 struct {
+		Thumbnails []map[string]any `json:"Thumbnails"`
+	}
+	_ = json.Unmarshal(recTS2.Body.Bytes(), &tsResp2)
+	if len(tsResp2.Thumbnails) != 2 {
+		t.Fatalf("expected 2 thumbnails from cached BIF, got %+v", tsResp2.Thumbnails)
 	}
 }

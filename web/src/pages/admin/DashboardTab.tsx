@@ -234,7 +234,7 @@ export function DashboardTab() {
               />
               <StatusTile
                 label="当前版本"
-                value={sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.10.5')}
+                value={sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.10.6')}
                 sub={`Emby ${sysInfo?.Version || '4.10.2.0'} 兼容 · 端口 ${sysInfo?.HttpServerPortNumber || 8096}`}
               />
               <StatusTile
@@ -258,31 +258,69 @@ export function DashboardTab() {
             </div>
 
             {sysInfo && (
-              <div className="grid gap-3 rounded-2xl border border-white/8 bg-white/[0.02] p-4 text-xs text-zinc-400 md:grid-cols-3">
-                <div className="flex items-center gap-2 truncate">
-                  <HardDrive className="h-3.5 w-3.5 shrink-0 text-amber-400/80" />
-                  <span className="text-zinc-500">数据目录:</span>
-                  <span className="truncate font-mono text-zinc-300" title={sysInfo.ProgramDataPath}>
-                    {sysInfo.ProgramDataPath || '-'}
-                  </span>
+              <div className="space-y-2.5 rounded-2xl border border-white/8 bg-white/[0.02] p-4 text-xs text-zinc-400">
+                <div className="grid gap-3 md:grid-cols-3">
+                  <div className="flex items-center gap-2 truncate">
+                    <HardDrive className="h-3.5 w-3.5 shrink-0 text-amber-400/80" />
+                    <span className="text-zinc-500">数据目录:</span>
+                    <span className="truncate font-mono text-zinc-300" title={sysInfo.ProgramDataPath}>
+                      {sysInfo.ProgramDataPath || '-'}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2 truncate">
+                    <Cpu className="h-3.5 w-3.5 shrink-0 text-amber-400/80" />
+                    <span className="text-zinc-500">转码缓存:</span>
+                    <span
+                      className="truncate font-mono text-zinc-300"
+                      title={sysInfo.TranscodingTempPath}
+                    >
+                      {sysInfo.TranscodingTempPath || '-'}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2 truncate">
+                    <Terminal className="h-3.5 w-3.5 shrink-0 text-amber-400/80" />
+                    <span className="text-zinc-500">日志目录:</span>
+                    <span className="truncate font-mono text-zinc-300" title={sysInfo.LogPath}>
+                      {sysInfo.LogPath || '-'}
+                    </span>
+                  </div>
                 </div>
-                <div className="flex items-center gap-2 truncate">
-                  <Cpu className="h-3.5 w-3.5 shrink-0 text-amber-400/80" />
-                  <span className="text-zinc-500">转码缓存:</span>
-                  <span
-                    className="truncate font-mono text-zinc-300"
-                    title={sysInfo.TranscodingTempPath}
-                  >
-                    {sysInfo.TranscodingTempPath || '-'}
-                  </span>
-                </div>
-                <div className="flex items-center gap-2 truncate">
-                  <Terminal className="h-3.5 w-3.5 shrink-0 text-amber-400/80" />
-                  <span className="text-zinc-500">日志目录:</span>
-                  <span className="truncate font-mono text-zinc-300" title={sysInfo.LogPath}>
-                    {sysInfo.LogPath || '-'}
-                  </span>
-                </div>
+                {(sysInfo.ChapterCachePath || sysInfo.BifCachePath) && (
+                  <div className="grid gap-3 border-t border-white/6 pt-2.5 md:grid-cols-2">
+                    <div className="flex items-center gap-2 truncate">
+                      <HardDrive className="h-3.5 w-3.5 shrink-0 text-amber-400" />
+                      <span className="shrink-0 text-zinc-500">章节图独立缓存:</span>
+                      <span
+                        className="truncate font-mono text-zinc-300"
+                        title={sysInfo.ChapterCachePath}
+                      >
+                        {sysInfo.ChapterCachePath || '-'}
+                      </span>
+                      <span
+                        className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300"
+                        title="由计划任务「提取章节缩略图」生成，删除后需重新运行计划任务"
+                      >
+                        谨慎删除
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2 truncate">
+                      <HardDrive className="h-3.5 w-3.5 shrink-0 text-amber-400" />
+                      <span className="shrink-0 text-zinc-500">BIF 独立缓存:</span>
+                      <span
+                        className="truncate font-mono text-zinc-300"
+                        title={sysInfo.BifCachePath}
+                      >
+                        {sysInfo.BifCachePath || '-'}
+                      </span>
+                      <span
+                        className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300"
+                        title="由计划任务「生成视频预览图 (BIF)」生成，删除后需重新运行计划任务"
+                      >
+                        谨慎删除
+                      </span>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </>
