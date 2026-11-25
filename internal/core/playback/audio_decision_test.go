@@ -51,7 +51,7 @@ func TestDecide_AudioDirectPlayAndTranscodeURLs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 1. Audio DirectPlay matches Type=="Audio" profile -> /Audio/{Id}/stream?Static=true&MediaSourceId=...
+	// 1. Audio DirectPlay matches Type=="Audio" profile -> /Audio/{Id}/stream.flac?Static=true&MediaSourceId=...
 	resp, details, err := eng.Decide(ctx, itemID, PlaybackInfoRequest{
 		DeviceProfile: &DeviceProfile{
 			Name: "Web Audio Client",
@@ -67,7 +67,7 @@ func TestDecide_AudioDirectPlayAndTranscodeURLs(t *testing.T) {
 	if len(details) != 1 || details[0].PlayMethod != PlayMethodDirectPlay {
 		t.Fatalf("expected DirectPlay, got %+v", details)
 	}
-	wantDirectPrefix := "/Audio/" + itemID + "/stream?Static=true&MediaSourceId=" + msID
+	wantDirectPrefix := "/Audio/" + itemID + "/stream.flac?Static=true&MediaSourceId=" + msID
 	if !strings.HasPrefix(resp.MediaSources[0].DirectStreamUrl, wantDirectPrefix) {
 		t.Fatalf("DirectStreamUrl = %q, want prefix %q", resp.MediaSources[0].DirectStreamUrl, wantDirectPrefix)
 	}

@@ -41,10 +41,32 @@ func TestSanitizeItemPaths(t *testing.T) {
 	pi := &PlaybackInfoResponse{
 		MediaSources: []MediaSourceInfo{
 			{Path: "/secret/a.mkv", MediaStreams: []MediaStream{{Path: "/secret/a.srt"}}},
+			{
+				Protocol: "Http",
+				IsRemote: true,
+				Path:     "https://cdn.example.com/direct/movie.mkv",
+				MediaStreams: []MediaStream{
+					{Path: "/secret/local.srt"},
+				},
+			},
+			{
+				Protocol: "File",
+				IsRemote: true,
+				Path:     "/secret/local.strm",
+			},
 		},
 	}
 	SanitizePlaybackInfo(pi)
 	if pi.MediaSources[0].Path != "" || pi.MediaSources[0].MediaStreams[0].Path != "" {
-		t.Fatalf("expected PlaybackInfo paths cleared: %+v", pi)
+		t.Fatalf("expected local PlaybackInfo paths cleared: %+v", pi.MediaSources[0])
+	}
+	if pi.MediaSources[1].Path != "https://cdn.example.com/direct/movie.mkv" {
+		t.Fatalf("expected remote HTTP STRM Path preserved, got %q", pi.MediaSources[1].Path)
+	}
+	if pi.MediaSources[1].MediaStreams[0].Path != "" {
+		t.Fatalf("expected local MediaStream path cleared even on remote source, got %q", pi.MediaSources[1].MediaStreams[0].Path)
+	}
+	if pi.MediaSources[2].Path != "" {
+		t.Fatalf("expected local .strm filesystem path cleared, got %q", pi.MediaSources[2].Path)
 	}
 }
