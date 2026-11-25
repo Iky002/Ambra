@@ -288,16 +288,47 @@ func TestSetupAdminUpdatesExistingUserAndPromotes(t *testing.T) {
 	env := newSetupTestEnv(t)
 	ctx := context.Background()
 
-	// Pre-seed a non-admin user with same username (simulates auto-seeded or existing user)
-	if _, err := env.authSvc.CreateUser(ctx, "admin", "oldpass", false); err != nil {
+	// Pre-seed a non-admin user (simulates existing user while wizard is incomplete)
+	if _, err := env.authSvc.CreateUser(ctx, "targetuser", "oldpass", false); err != nil {
+		t.Fatal(err)
+	}
+	nonAdminAuth, err := env.authSvc.AuthenticateByName(ctx, "targetuser", "oldpass", "", auth.ClientInfo{DeviceID: "d-na"})
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	body := `{"username":"admin","password":"newpassword123"}`
+	body := `{"username":"targetuser","password":"newpassword123"}`
+
+	// Unauthenticated POST /api/setup/admin when users already exist MUST be rejected with 403
 	rec := httptest.NewRecorder()
 	env.router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/setup/admin", bytes.NewBufferString(body)))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for unauthenticated SetupAdmin when users exist, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Non-admin authenticated POST /api/setup/admin MUST also be rejected with 403
+	reqNonAdmin := httptest.NewRequest(http.MethodPost, "/api/setup/admin", bytes.NewBufferString(body))
+	reqNonAdmin.Header.Set("X-Emby-Token", nonAdminAuth.AccessToken)
+	rec = httptest.NewRecorder()
+	env.router.ServeHTTP(rec, reqNonAdmin)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-admin SetupAdmin when users exist, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Authenticated admin CAN update/promote an existing user while wizard is incomplete
+	if _, err := env.authSvc.CreateUser(ctx, "rootadmin", "rootpass", true); err != nil {
+		t.Fatal(err)
+	}
+	adminAuth, err := env.authSvc.AuthenticateByName(ctx, "rootadmin", "rootpass", "", auth.ClientInfo{DeviceID: "d-adm"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqAdmin := httptest.NewRequest(http.MethodPost, "/api/setup/admin", bytes.NewBufferString(body))
+	reqAdmin.Header.Set("X-Emby-Token", adminAuth.AccessToken)
+	rec = httptest.NewRecorder()
+	env.router.ServeHTTP(rec, reqAdmin)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 updating existing admin, got %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("expected 200 updating existing user as authenticated admin, got %d %s", rec.Code, rec.Body.String())
 	}
 	var authRes dto.AuthenticationResult
 	if err := json.Unmarshal(rec.Body.Bytes(), &authRes); err != nil {

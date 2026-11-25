@@ -1,10 +1,12 @@
 package audio
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,10 +19,17 @@ import (
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
-const ticksPerSecond = 10_000_000
+const (
+	ticksPerSecond        = 10_000_000
+	maxAudioBitrate       = 1_536_000
+	maxAudioChannels      = 8
+	maxAudioSampleRate    = 192_000
+	defaultAudioBrowserUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 // AuthFuncs decouples route registration from the concrete middleware package.
 type AuthFuncs struct {
@@ -52,23 +61,38 @@ type LyricDto struct {
 
 // Handler serves audio direct streams, universal audio streaming/transcoding, and lyrics.
 type Handler struct {
-	repo     *sqlite.LibraryRepo
-	userRepo *sqlite.UserRepo
-	cfg      *config.Config
-	auth     AuthFuncs
+	repo           *sqlite.LibraryRepo
+	userRepo       *sqlite.UserRepo
+	cfg            *config.Config
+	auth           AuthFuncs
+	streamResolver func(ctx context.Context, rawPath string) (string, error)
+	httpClient     *http.Client
 }
 
 // New constructs an Audio API handler.
 func New(repo *sqlite.LibraryRepo, cfg *config.Config) *Handler {
 	return &Handler{
-		repo: repo,
-		cfg:  cfg,
+		repo:       repo,
+		cfg:        cfg,
+		httpClient: netutil.NewSafeHTTPClient(0, true),
 	}
 }
 
 // SetUserRepo attaches a UserRepo for per-user library access control on audio streams and lyrics.
 func (h *Handler) SetUserRepo(userRepo *sqlite.UserRepo) {
 	h.userRepo = userRepo
+}
+
+// SetStreamResolver attaches a resolver (e.g. playback.Engine.ResolveStream) for .strm audio files.
+func (h *Handler) SetStreamResolver(fn func(ctx context.Context, rawPath string) (string, error)) {
+	h.streamResolver = fn
+}
+
+// SetProxyClient overrides the HTTP client used for remote STRM audio reverse-proxying (primarily for testing).
+func (h *Handler) SetProxyClient(client *http.Client) {
+	if client != nil {
+		h.httpClient = client
+	}
 }
 
 // CanAccessLibrary returns true if userID is permitted to access libraryID.
@@ -173,6 +197,18 @@ func (h *Handler) handleDirectStream(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if strings.EqualFold(filepath.Ext(mediaPath), ".strm") {
+		resolved, err := h.resolveStrmAudio(r.Context(), mediaPath)
+		if err != nil {
+			httpx.Error(w, http.StatusBadGateway, "failed to resolve strm: "+err.Error())
+			return
+		}
+		mediaPath = resolved
+	}
+	if isHTTPURL(mediaPath) {
+		h.proxyRemoteAudio(w, r, mediaPath)
+		return
+	}
 	serveAudioFile(w, r, mediaPath)
 }
 
@@ -192,8 +228,22 @@ func (h *Handler) handleUniversal(w http.ResponseWriter, r *http.Request, urlExt
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if strings.EqualFold(filepath.Ext(mediaPath), ".strm") {
+		resolved, err := h.resolveStrmAudio(r.Context(), mediaPath)
+		if err != nil {
+			httpx.Error(w, http.StatusBadGateway, "failed to resolve strm: "+err.Error())
+			return
+		}
+		mediaPath = resolved
+	}
 
+	isRemote := isHTTPURL(mediaPath)
 	srcExt := strings.ToLower(strings.TrimPrefix(filepath.Ext(mediaPath), "."))
+	if isRemote {
+		if u, parseErr := url.Parse(mediaPath); parseErr == nil {
+			srcExt = strings.ToLower(strings.TrimPrefix(filepath.Ext(u.Path), "."))
+		}
+	}
 	allowedContainers := q.List("Container")
 	maxBitrate := q.Int("MaxStreamingBitrate", 0)
 	if maxBitrate <= 0 {
@@ -203,6 +253,10 @@ func (h *Handler) handleUniversal(w http.ResponseWriter, r *http.Request, urlExt
 	// Direct play if source container is supported by client and within bitrate limit
 	bitrateOK := maxBitrate <= 0 || srcBitrate <= 0 || srcBitrate <= maxBitrate
 	if bitrateOK && isContainerAllowed(srcExt, allowedContainers) && (urlExt == "" || urlExt == srcExt) {
+		if isRemote {
+			h.proxyRemoteAudio(w, r, mediaPath)
+			return
+		}
 		serveAudioFile(w, r, mediaPath)
 		return
 	}
@@ -222,19 +276,33 @@ func (h *Handler) handleUniversal(w http.ResponseWriter, r *http.Request, urlExt
 	if targetBitrate <= 0 {
 		targetBitrate = 192_000
 	}
+	if targetBitrate > maxAudioBitrate {
+		targetBitrate = maxAudioBitrate
+	}
 
 	startTimeTicks := q.Int64("StartTimeTicks", 0)
 	audioChannels := q.Int("AudioChannels", 0)
 	if audioChannels <= 0 {
 		audioChannels = q.Int("MaxAudioChannels", 0)
 	}
+	if audioChannels > maxAudioChannels {
+		audioChannels = maxAudioChannels
+	}
 	audioSampleRate := q.Int("AudioSampleRate", 0)
+	if audioSampleRate > maxAudioSampleRate {
+		audioSampleRate = maxAudioSampleRate
+	}
 
 	h.streamTranscodeAudio(w, r, mediaPath, targetContainer, q.Get("AudioCodec"), targetBitrate, startTimeTicks, audioChannels, audioSampleRate)
 }
 
 func (h *Handler) streamTranscodeAudio(w http.ResponseWriter, r *http.Request, mediaPath, targetContainer, targetCodec string, bitrate int, startTimeTicks int64, audioChannels, audioSampleRate int) {
-	if _, err := os.Stat(mediaPath); err != nil {
+	if isHTTPURL(mediaPath) {
+		if err := netutil.ValidateRemoteURL(mediaPath, true); err != nil {
+			httpx.Error(w, http.StatusBadGateway, "blocked upstream audio url: "+err.Error())
+			return
+		}
+	} else if _, err := os.Stat(mediaPath); err != nil {
 		if os.IsNotExist(err) {
 			httpx.Error(w, http.StatusNotFound, "audio file missing on disk")
 			return
@@ -274,6 +342,15 @@ func (h *Handler) streamTranscodeAudio(w http.ResponseWriter, r *http.Request, m
 }
 
 func buildAudioFFmpegArgs(mediaPath, muxFmt, encoder string, bitrate int, startTimeTicks int64, audioChannels, audioSampleRate int) []string {
+	if bitrate > maxAudioBitrate {
+		bitrate = maxAudioBitrate
+	}
+	if audioChannels > maxAudioChannels {
+		audioChannels = maxAudioChannels
+	}
+	if audioSampleRate > maxAudioSampleRate {
+		audioSampleRate = maxAudioSampleRate
+	}
 	args := []string{"-hide_banner", "-loglevel", "error"}
 	if startTimeTicks > 0 {
 		secs := float64(startTimeTicks) / float64(ticksPerSecond)
@@ -566,6 +643,100 @@ func ParseLRC(content string) *LyricDto {
 	}
 
 	return out
+}
+
+func (h *Handler) resolveStrmAudio(ctx context.Context, strmPath string) (string, error) {
+	if h.streamResolver != nil {
+		resolved, err := h.streamResolver(ctx, strmPath)
+		if err != nil {
+			return "", err
+		}
+		resolved = strings.TrimSpace(resolved)
+		if resolved == "" {
+			return "", errors.New("empty strm resolution")
+		}
+		return resolved, nil
+	}
+	u := readFirstLineAudioURL(strmPath)
+	if u == "" {
+		return "", errors.New("empty or invalid strm file")
+	}
+	return u, nil
+}
+
+func readFirstLineAudioURL(strmPath string) string {
+	f, err := os.Open(strmPath)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimPrefix(sc.Text(), "\uFEFF")
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "#") {
+			candidate := strings.ReplaceAll(line, " ", "%20")
+			if isHTTPURL(candidate) {
+				return candidate
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
+func (h *Handler) proxyRemoteAudio(w http.ResponseWriter, r *http.Request, targetURL string) {
+	if err := netutil.ValidateRemoteURL(targetURL, true); err != nil {
+		httpx.Error(w, http.StatusBadGateway, "blocked upstream audio url: "+err.Error())
+		return
+	}
+	upReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, nil)
+	if err != nil {
+		httpx.Error(w, http.StatusBadGateway, "invalid upstream audio url: "+err.Error())
+		return
+	}
+	if rng := r.Header.Get("Range"); rng != "" {
+		upReq.Header.Set("Range", rng)
+	}
+	if ifRange := r.Header.Get("If-Range"); ifRange != "" {
+		upReq.Header.Set("If-Range", ifRange)
+	}
+	ua := r.Header.Get("User-Agent")
+	if ua == "" {
+		ua = defaultAudioBrowserUA
+	}
+	upReq.Header.Set("User-Agent", ua)
+
+	client := h.httpClient
+	if client == nil {
+		client = netutil.NewSafeHTTPClient(0, true)
+	}
+	resp, err := client.Do(upReq)
+	if err != nil {
+		httpx.Error(w, http.StatusBadGateway, "upstream audio error: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	for _, hdr := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"} {
+		if val := resp.Header.Get(hdr); val != "" {
+			w.Header().Set(hdr, val)
+		}
+	}
+	if w.Header().Get("Content-Type") == "" {
+		if u, parseErr := url.Parse(targetURL); parseErr == nil {
+			w.Header().Set("Content-Type", audioContentType(u.Path))
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	if r.Method != http.MethodHead {
+		_, _ = io.Copy(w, resp.Body)
+	}
+}
+
+func isHTTPURL(s string) bool {
+	lower := strings.ToLower(strings.TrimSpace(s))
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
 }
 
 func passthrough(next http.Handler) http.Handler { return next }

@@ -566,7 +566,7 @@ func TestRemoteImagesListDownloadSetURLAndProxy(t *testing.T) {
 	}
 
 	// Cover resolveUserID via query param & nil-auth fallback
-	ancReq := httptest.NewRequest(http.MethodGet, "/Items/mov-img/Ancestors?UserId=user-query", nil)
+	ancReq := httptest.NewRequest(http.MethodGet, "/Items/mov-img/Ancestors?UserId=user-1", nil)
 	ancRec := httptest.NewRecorder()
 	env.router.ServeHTTP(ancRec, ancReq)
 	if ancRec.Code != http.StatusOK {

@@ -191,6 +191,10 @@ func (h *Handler) handlePhysicalPaths(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleSelectableMediaFolders(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	allowed := h.allowedLibrariesForRequest(r, h.resolveUserID(r, q))
 	libs, err := h.repo.ListLibraries(r.Context())
 	if err != nil {
@@ -217,6 +221,10 @@ func (h *Handler) handleSelectableMediaFolders(w http.ResponseWriter, r *http.Re
 
 func (h *Handler) handleMediaFolders(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	allowed := h.allowedLibrariesForRequest(r, h.resolveUserID(r, q))
 	libs, err := h.repo.ListLibraries(r.Context())
 	if err != nil {
@@ -262,6 +270,10 @@ type virtualFolderInfo struct {
 
 func (h *Handler) handleQueryVirtualFolders(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	allowed := h.allowedLibrariesForRequest(r, h.resolveUserID(r, q))
 	allLibs, err := h.repo.ListLibraries(r.Context())
 	if err != nil {
@@ -458,7 +470,7 @@ func (h *Handler) handleUpdateVirtualFolderPath(w http.ResponseWriter, r *http.R
 	id := nonEmpty(q.Get("id"), body.Id)
 	name := nonEmpty(q.Get("name"), body.Name)
 	if id == "" && name == "" {
-		httpx.NoContent(w)
+		httpx.Error(w, http.StatusBadRequest, "id or name is required")
 		return
 	}
 	lib, err := h.findLibraryByIDOrName(r, id, name)
@@ -604,6 +616,10 @@ func (h *Handler) handleUpdateVirtualFolderOptions(w http.ResponseWriter, r *htt
 func (h *Handler) handleListArtists(albumArtistsOnly bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := httpx.ParseQuery(r)
+		if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+			httpx.Error(w, http.StatusForbidden, "forbidden")
+			return
+		}
 		userID := h.resolveUserID(r, q)
 		allowed := h.allowedLibrariesForRequest(r, userID)
 		maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
@@ -639,10 +655,23 @@ func (h *Handler) handleListArtists(albumArtistsOnly bool) http.HandlerFunc {
 }
 
 func (h *Handler) handleArtistPrefixes(w http.ResponseWriter, r *http.Request) {
+	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	userID := h.resolveUserID(r, q)
+	allowed := h.allowedLibrariesForRequest(r, userID)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 	items, _, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
-		ServerID:         h.serverID(),
-		Recursive:        true,
-		IncludeItemTypes: []string{"MusicArtist", "Artist"},
+		ServerID:          h.serverID(),
+		UserID:            userID,
+		ParentID:          q.Get("ParentId"),
+		AllowedLibraryIDs: allowed,
+		MaxParentalRating: maxRating,
+		BlockedTags:       blockedTags,
+		Recursive:         true,
+		IncludeItemTypes:  []string{"MusicArtist", "Artist"},
 	})
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -674,18 +703,28 @@ func (h *Handler) handleArtistPrefixes(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleInstantMixByQuery(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
-	seedID := q.Get("Id")
-	if seedID != "" {
+	limit := q.Int("Limit", 50)
+	fields := q.List("Fields")
+
+	if seedID := q.Get("Id"); seedID != "" {
+		if !h.canAccessItemID(r, seedID) {
+			httpx.Error(w, http.StatusForbidden, "access denied")
+			return
+		}
 		items, total, err := h.repo.GetInstantMixWithPolicy(
 			r.Context(),
 			h.serverID(),
 			userID,
 			seedID,
-			q.Int("Limit", 50),
-			q.List("Fields"),
+			limit,
+			fields,
 			allowed,
 			maxRating,
 			blockedTags,
@@ -700,6 +739,182 @@ func (h *Handler) handleInstantMixByQuery(w http.ResponseWriter, r *http.Request
 		})
 		return
 	}
+
+	lowerPath := strings.ToLower(r.URL.Path)
+	isArtistRoute := strings.HasPrefix(lowerPath, "/artists")
+	isMusicGenreRoute := strings.HasPrefix(lowerPath, "/musicgenres")
+	reqName := strings.TrimSpace(nonEmpty(chi.URLParam(r, "Name"), q.Get("Name")))
+	artistIDs := q.List("ArtistIds")
+	musicGenreIDs := append(q.List("MusicGenreIds"), q.List("GenreIds")...)
+
+	if isArtistRoute && (reqName != "" || len(artistIDs) > 0) {
+		targetArtistIDs := make(map[string]bool)
+		targetArtistNames := make(map[string]bool)
+		if reqName != "" {
+			targetArtistNames[strings.ToLower(reqName)] = true
+		}
+		for _, rawID := range artistIDs {
+			aid := guid.Normalize(rawID)
+			if aid == "" {
+				continue
+			}
+			if rec, err := h.repo.GetItemRecordByID(r.Context(), aid); err == nil && rec != nil {
+				if !h.canAccessItem(r, rec) {
+					continue
+				}
+				targetArtistIDs[aid] = true
+				if n := strings.ToLower(strings.TrimSpace(rec.Name)); n != "" {
+					targetArtistNames[n] = true
+				}
+			} else {
+				targetArtistIDs[aid] = true
+			}
+		}
+
+		ancestorMatchedIDs := make(map[string]bool)
+		if h.store != nil && len(targetArtistIDs) > 0 {
+			for aid := range targetArtistIDs {
+				rows, qErr := h.store.Reader.QueryContext(r.Context(),
+					`SELECT descendant_id FROM item_ancestors WHERE ancestor_id = ?`, aid)
+				if qErr == nil {
+					for rows.Next() {
+						var did string
+						if err := rows.Scan(&did); err == nil {
+							ancestorMatchedIDs[guid.Normalize(did)] = true
+						}
+					}
+					rows.Close()
+				}
+			}
+		}
+
+		allAudio, _, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
+			ServerID:          h.serverID(),
+			UserID:            userID,
+			AllowedLibraryIDs: allowed,
+			MaxParentalRating: maxRating,
+			BlockedTags:       blockedTags,
+			Recursive:         true,
+			IncludeItemTypes:  []string{"Audio"},
+			SortBy:            []string{"Random"},
+			Fields:            fields,
+		})
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		matched := make([]dto.BaseItemDto, 0, len(allAudio))
+		for _, it := range allAudio {
+			ok := ancestorMatchedIDs[guid.Normalize(it.Id)] || targetArtistIDs[guid.Normalize(it.ParentId)]
+			if !ok && it.AlbumArtist != "" && targetArtistNames[strings.ToLower(strings.TrimSpace(it.AlbumArtist))] {
+				ok = true
+			}
+			if !ok {
+				for _, a := range it.Artists {
+					if targetArtistNames[strings.ToLower(strings.TrimSpace(a))] {
+						ok = true
+						break
+					}
+				}
+			}
+			if ok {
+				matched = append(matched, it)
+			}
+		}
+		total := len(matched)
+		if limit > 0 && len(matched) > limit {
+			matched = matched[:limit]
+		}
+		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
+			Items:            matched,
+			TotalRecordCount: total,
+		})
+		return
+	}
+
+	if isMusicGenreRoute && (reqName != "" || len(musicGenreIDs) > 0) {
+		targetGenreNames := make(map[string]bool)
+		targetGenreIDs := make(map[string]bool)
+		if reqName != "" {
+			targetGenreNames[strings.ToLower(reqName)] = true
+		}
+		for _, rawID := range musicGenreIDs {
+			gid := guid.Normalize(rawID)
+			if gid == "" {
+				continue
+			}
+			targetGenreIDs[gid] = true
+			if h.store != nil {
+				var gName string
+				if err := h.store.Reader.QueryRowContext(r.Context(),
+					`SELECT name FROM taxonomies WHERE id = ? LIMIT 1`, gid,
+				).Scan(&gName); err == nil && strings.TrimSpace(gName) != "" {
+					targetGenreNames[strings.ToLower(strings.TrimSpace(gName))] = true
+				}
+			}
+		}
+
+		matchedItemIDs := make(map[string]bool)
+		if h.store != nil {
+			rows, qErr := h.store.Reader.QueryContext(r.Context(), `
+				SELECT it.item_id, tx.id, tx.name
+				FROM item_taxonomies it
+				JOIN taxonomies tx ON tx.id = it.taxonomy_id
+				WHERE LOWER(tx.kind) IN ('genre', 'musicgenre')`)
+			if qErr == nil {
+				for rows.Next() {
+					var iid, tid, tname string
+					if err := rows.Scan(&iid, &tid, &tname); err == nil {
+						if targetGenreIDs[guid.Normalize(tid)] || targetGenreNames[strings.ToLower(strings.TrimSpace(tname))] {
+							matchedItemIDs[guid.Normalize(iid)] = true
+						}
+					}
+				}
+				rows.Close()
+			}
+		}
+
+		allAudio, _, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
+			ServerID:          h.serverID(),
+			UserID:            userID,
+			AllowedLibraryIDs: allowed,
+			MaxParentalRating: maxRating,
+			BlockedTags:       blockedTags,
+			Recursive:         true,
+			IncludeItemTypes:  []string{"Audio"},
+			SortBy:            []string{"Random"},
+			Fields:            append(append([]string(nil), fields...), "Genres"),
+		})
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		matched := make([]dto.BaseItemDto, 0, len(allAudio))
+		for _, it := range allAudio {
+			ok := matchedItemIDs[guid.Normalize(it.Id)]
+			if !ok {
+				for _, g := range it.Genres {
+					if targetGenreNames[strings.ToLower(strings.TrimSpace(g))] {
+						ok = true
+						break
+					}
+				}
+			}
+			if ok {
+				matched = append(matched, it)
+			}
+		}
+		total := len(matched)
+		if limit > 0 && len(matched) > limit {
+			matched = matched[:limit]
+		}
+		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
+			Items:            matched,
+			TotalRecordCount: total,
+		})
+		return
+	}
+
 	items, total, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
 		ServerID:          h.serverID(),
 		UserID:            userID,
@@ -709,8 +924,8 @@ func (h *Handler) handleInstantMixByQuery(w http.ResponseWriter, r *http.Request
 		Recursive:         true,
 		IncludeItemTypes:  []string{"Audio"},
 		SortBy:            []string{"Random"},
-		Limit:             q.Int("Limit", 50),
-		Fields:            q.List("Fields"),
+		Limit:             limit,
+		Fields:            fields,
 	})
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -722,20 +937,84 @@ func (h *Handler) handleInstantMixByQuery(w http.ResponseWriter, r *http.Request
 	})
 }
 
+func (h *Handler) isTaxonomyAccessible(r *http.Request, taxonomyID string, allowed []string, maxRating *int, blockedTags []string) bool {
+	if allowed == nil && maxRating == nil && len(blockedTags) == 0 {
+		return true
+	}
+	if h.store == nil || h.repo == nil {
+		return false
+	}
+	rows, err := h.store.Reader.QueryContext(r.Context(),
+		`SELECT item_id FROM item_taxonomies WHERE taxonomy_id = ?`, taxonomyID)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var iid string
+		if err := rows.Scan(&iid); err != nil {
+			continue
+		}
+		rec, recErr := h.repo.GetItemRecordByID(r.Context(), iid)
+		if recErr != nil || rec == nil {
+			continue
+		}
+		if allowed != nil && rec.LibraryID != "" && !isLibraryAllowed(rec.LibraryID, allowed) {
+			continue
+		}
+		if maxRating != nil || len(blockedTags) > 0 {
+			if blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags); bErr != nil || blocked {
+				continue
+			}
+		}
+		return true
+	}
+	return false
+}
+
 func (h *Handler) handleGetTaxonomyByName(kind, dtoType string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		q := httpx.ParseQuery(r)
+		if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+			httpx.Error(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		userID := h.resolveUserID(r, q)
+		allowed := h.allowedLibrariesForRequest(r, userID)
+		maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 		name := chi.URLParam(r, "Name")
 		if h.store != nil {
-			// Check items table first for artists
+			// Check items table first for artists (enforcing library RBAC + parental controls)
 			if kind == "artist" {
-				var id string
-				err := h.store.Reader.QueryRowContext(r.Context(),
-					`SELECT id FROM items WHERE LOWER(type) IN ('musicartist','artist') AND LOWER(name) = LOWER(?) LIMIT 1`, name,
-				).Scan(&id)
-				if err == nil {
-					if it, err := h.repo.GetItemByID(r.Context(), h.serverID(), h.resolveUserID(r, httpx.ParseQuery(r)), id); err == nil {
-						httpx.JSON(w, http.StatusOK, it)
-						return
+				rows, qErr := h.store.Reader.QueryContext(r.Context(),
+					`SELECT id FROM items WHERE LOWER(type) IN ('musicartist','artist') AND LOWER(name) = LOWER(?)`, name,
+				)
+				if qErr == nil {
+					var matchedIDs []string
+					for rows.Next() {
+						var id string
+						if err := rows.Scan(&id); err == nil {
+							matchedIDs = append(matchedIDs, id)
+						}
+					}
+					rows.Close()
+					for _, id := range matchedIDs {
+						rec, recErr := h.repo.GetItemRecordByID(r.Context(), id)
+						if recErr != nil || rec == nil {
+							continue
+						}
+						if allowed != nil && rec.LibraryID != "" && !isLibraryAllowed(rec.LibraryID, allowed) {
+							continue
+						}
+						if maxRating != nil || len(blockedTags) > 0 {
+							if blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags); bErr != nil || blocked {
+								continue
+							}
+						}
+						if it, err := h.repo.GetItemByID(r.Context(), h.serverID(), userID, id); err == nil {
+							httpx.JSON(w, http.StatusOK, it)
+							return
+						}
 					}
 				}
 			}
@@ -744,7 +1023,7 @@ func (h *Handler) handleGetTaxonomyByName(kind, dtoType string) http.HandlerFunc
 				`SELECT id, name FROM taxonomies WHERE LOWER(kind) = LOWER(?) AND LOWER(name) = LOWER(?) LIMIT 1`,
 				kind, name,
 			).Scan(&id, &foundName)
-			if err == nil {
+			if err == nil && h.isTaxonomyAccessible(r, id, allowed, maxRating, blockedTags) {
 				httpx.JSON(w, http.StatusOK, dto.BaseItemDto{
 					Id:                id,
 					Name:              foundName,
@@ -796,6 +1075,10 @@ func (h *Handler) handleGetPersonByName(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) handlePersonCredits(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
@@ -826,6 +1109,10 @@ func (h *Handler) handlePersonCredits(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleAudioBooksNextUp(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
@@ -854,6 +1141,10 @@ func (h *Handler) handleAudioBooksNextUp(w http.ResponseWriter, r *http.Request)
 
 func (h *Handler) handleChannelLatestItems(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	channelIDs := q.List("ChannelIds")
 	if len(channelIDs) == 0 {
 		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
@@ -960,6 +1251,24 @@ func (h *Handler) handleCollectionMissing(w http.ResponseWriter, _ *http.Request
 
 func (h *Handler) handleCollectionProviderItems(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	containerID := guid.Normalize(chi.URLParam(r, "Id"))
+	containerRec, err := h.repo.GetItemRecordByID(r.Context(), containerID)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		httpx.Error(w, http.StatusNotFound, "collection not found")
+		return
+	}
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !strings.EqualFold(containerRec.Type, "BoxSet") {
+		httpx.Error(w, http.StatusNotFound, "collection not found")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
@@ -976,7 +1285,7 @@ func (h *Handler) handleCollectionProviderItems(w http.ResponseWriter, r *http.R
 		r.Context(),
 		h.serverID(),
 		userID,
-		chi.URLParam(r, "Id"),
+		containerID,
 		fetchStart,
 		fetchLimit,
 		q.List("Fields"),
@@ -1086,6 +1395,10 @@ func (h *Handler) handleContainerItemsDelete(expectedType string, checkOwner boo
 func (h *Handler) handleAddToPlaylistInfo(w http.ResponseWriter, r *http.Request) {
 	playlistID := guid.Normalize(chi.URLParam(r, "Id"))
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
@@ -1147,6 +1460,10 @@ func (h *Handler) handleAddToPlaylistInfo(w http.ResponseWriter, r *http.Request
 
 func (h *Handler) handleShowsUpcoming(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)

@@ -424,11 +424,19 @@ func TestLiveTVRecordingsTimersSeriesTimersAndListingProviders(t *testing.T) {
 func TestLiveTVSSRFAndLocalFileBlocking(t *testing.T) {
 	_, mux, _, cfg := setupLiveTVTest(t)
 
-	// Local HTTP server on loopback must be blocked by default safe client
+	// Local HTTP server on loopback/LAN must succeed for self-hosted IPTV tuners
 	loopbackSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("#EXTM3U\n#EXTINF:-1,Secret\nhttp://internal/stream.m3u8\n"))
+		_, _ = w.Write([]byte("#EXTM3U\n#EXTINF:-1,LAN Channel\nhttp://192.168.1.50/stream.m3u8\n"))
 	}))
 	defer loopbackSrv.Close()
+
+	lanRec := doJSON(t, mux, http.MethodPost, "/LiveTv/TunerHosts", map[string]any{
+		"Type": "m3u",
+		"Url":  loopbackSrv.URL + "/playlist.m3u",
+	})
+	if lanRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for LAN/loopback M3U tuner, got %d body=%s", lanRec.Code, lanRec.Body.String())
+	}
 
 	// Outside directory files for path traversal & symlink escape tests
 	outsideDir := t.TempDir()
@@ -445,10 +453,8 @@ func TestLiveTVSSRFAndLocalFileBlocking(t *testing.T) {
 		name string
 		src  string
 	}{
-		{"loopback http", loopbackSrv.URL + "/playlist.m3u"},
-		{"uppercase HTTP loopback", "HTTP://127.0.0.1:8096/playlist.m3u"},
 		{"cloud metadata", "http://169.254.169.254/latest/meta-data/"},
-		{"private LAN", "http://192.168.1.1/playlist.m3u"},
+		{"ipv4-mapped cloud metadata", "http://[::ffff:169.254.169.254]/latest/meta-data/"},
 		{"file scheme", "file:///etc/passwd"},
 		{"etc passwd", "/etc/passwd"},
 		{"wrong extension inside DataDir", wrongExtInData},
@@ -1166,5 +1172,52 @@ func TestDVRStartFailureTransitionsTimerToFailed(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("start-fail-timer not found in persisted state")
+	}
+}
+
+func TestLiveTVExportedDelegationHelpers(t *testing.T) {
+	h, mux, st, _ := setupLiveTVTest(t)
+	ctx := context.Background()
+	userRepo := sqlite.NewUserRepo(st)
+	h.SetUserRepo(userRepo)
+
+	m3u := "#EXTM3U\n#EXTINF:-1,ChanA\nhttp://192.168.1.5/a.ts\n"
+	doJSON(t, mux, http.MethodPost, "/LiveTv/TunerHosts", map[string]any{"Type": "m3u", "M3UContent": m3u})
+	var chRes dto.QueryResult[ChannelInfo]
+	_ = json.Unmarshal(doJSON(t, mux, http.MethodGet, "/LiveTv/Channels", nil).Body.Bytes(), &chRes)
+	chID := chRes.Items[0].Id
+
+	if err := h.SetChannelDisabled(ctx, chID, true); err != nil {
+		t.Fatalf("expected SetChannelDisabled nil, got %v", err)
+	}
+	if err := h.SetChannelSortIndex(ctx, chID, 7); err != nil {
+		t.Fatalf("expected SetChannelSortIndex nil, got %v", err)
+	}
+	if err := h.SetChannelDisabled(ctx, "missing", true); err == nil {
+		t.Fatal("expected error for missing channel disabled")
+	}
+	if err := h.SetChannelSortIndex(ctx, "missing", 1); err == nil {
+		t.Fatal("expected error for missing channel sort index")
+	}
+	ch, ok := h.GetChannelByID(chID)
+	if !ok || !ch.Disabled || ch.SortIndex != 7 {
+		t.Fatalf("unexpected channel after update: %+v", ch)
+	}
+
+	doJSON(t, mux, http.MethodPost, "/LiveTv/Timers", map[string]any{"Id": "del-tm", "Name": "T", "ChannelId": chID})
+	doJSON(t, mux, http.MethodPost, "/LiveTv/SeriesTimers", map[string]any{"Id": "del-st", "Name": "S", "ChannelId": chID})
+	if !h.DeleteTimerByID(ctx, "del-tm") {
+		t.Fatal("expected DeleteTimerByID true")
+	}
+	if !h.DeleteSeriesTimerByID(ctx, "del-st") {
+		t.Fatal("expected DeleteSeriesTimerByID true")
+	}
+	if h.DeleteTimerByID(ctx, "nonexistent") {
+		t.Fatal("expected DeleteTimerByID false for nonexistent")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/LiveTv/Timers", nil)
+	if !h.HasLiveTvManagement(ctx, req) {
+		t.Fatal("expected unauthenticated/legacy fallback HasLiveTvManagement=true")
 	}
 }

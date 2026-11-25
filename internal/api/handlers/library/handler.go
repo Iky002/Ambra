@@ -31,6 +31,7 @@ type AuthFuncs struct {
 type Handler struct {
 	repo     *sqlite.LibraryRepo
 	userRepo *sqlite.UserRepo
+	store    *sqlite.Store
 	scanner  *scanner.Scanner
 	watcher  *watcher.Watcher
 	cfg      *config.Config
@@ -48,6 +49,11 @@ func New(repo *sqlite.LibraryRepo, sc *scanner.Scanner, cfg *config.Config) *Han
 // SetUserRepo attaches a UserRepo for per-user library access control (Policy.EnableAllFolders / EnabledFolders).
 func (h *Handler) SetUserRepo(userRepo *sqlite.UserRepo) {
 	h.userRepo = userRepo
+}
+
+// SetStore attaches a sqlite.Store for direct user_item_data timestamp updates (e.g. DatePlayed).
+func (h *Handler) SetStore(s *sqlite.Store) {
+	h.store = s
 }
 
 // SetWatcher attaches a filesystem Watcher so library creation/deletion dynamically updates watches.
@@ -579,6 +585,10 @@ func (h *Handler) handleItemCounts(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleShowSeasons(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	seriesID := r.PathValue("Id")
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
@@ -591,6 +601,13 @@ func (h *Handler) handleShowSeasons(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	startIndex := q.Int("StartIndex", 0)
+	limit := q.Int("Limit", 0)
+	isSpecial := q.Bool("IsSpecialSeason")
+	fetchStart, fetchLimit := startIndex, limit
+	if isSpecial != nil {
+		fetchStart, fetchLimit = 0, 0
+	}
 	items, total, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
 		ServerID:          h.serverID(),
 		UserID:            userID,
@@ -601,11 +618,32 @@ func (h *Handler) handleShowSeasons(w http.ResponseWriter, r *http.Request) {
 		IncludeItemTypes:  []string{"Season"},
 		SortBy:            []string{"IndexNumber"},
 		SortOrder:         "Ascending",
+		StartIndex:        fetchStart,
+		Limit:             fetchLimit,
 		Fields:            q.List("Fields"),
 	})
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if isSpecial != nil {
+		filtered := make([]dto.BaseItemDto, 0, len(items))
+		for _, it := range items {
+			special := it.IndexNumber != nil && *it.IndexNumber == 0
+			if special == *isSpecial {
+				filtered = append(filtered, it)
+			}
+		}
+		total = len(filtered)
+		if startIndex > len(filtered) {
+			filtered = []dto.BaseItemDto{}
+		} else if startIndex > 0 {
+			filtered = filtered[startIndex:]
+		}
+		if limit > 0 && len(filtered) > limit {
+			filtered = filtered[:limit]
+		}
+		items = filtered
 	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            items,
@@ -615,6 +653,10 @@ func (h *Handler) handleShowSeasons(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleShowEpisodes(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	seriesID := r.PathValue("Id")
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
@@ -738,6 +780,10 @@ func (h *Handler) handleShowEpisodes(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleNextUp(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 	items, total, err := h.repo.GetNextUpEpisodesWithPolicy(
@@ -763,6 +809,10 @@ func (h *Handler) handleNextUp(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleSearchHints(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
 	userID := h.resolveUserID(r, q)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 	hints, total, err := h.repo.SearchHints(r.Context(), sqlite.SearchHintFilter{
@@ -788,6 +838,10 @@ func (h *Handler) handleSearchHints(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleTaxonomies(kind string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := httpx.ParseQuery(r)
+		if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+			httpx.Error(w, http.StatusForbidden, "forbidden")
+			return
+		}
 		userID := h.resolveUserID(r, q)
 		allowed := h.allowedLibrariesForRequest(r, userID)
 		maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
@@ -902,12 +956,104 @@ func (h *Handler) canModifyUser(r *http.Request, targetUserID string) bool {
 	return true
 }
 
+func (h *Handler) canAccessItem(r *http.Request, fallbackUserID, itemID string) (bool, error) {
+	allowed := h.allowedLibrariesForRequest(r, fallbackUserID)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, fallbackUserID)
+	if allowed == nil && maxRating == nil && len(blockedTags) == 0 {
+		return true, nil
+	}
+	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if rec == nil {
+		return true, nil
+	}
+	if allowed != nil && rec.LibraryID != "" && !isLibraryAllowed(rec.LibraryID, allowed) {
+		return false, nil
+	}
+	if maxRating != nil || len(blockedTags) > 0 {
+		blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags)
+		if bErr != nil {
+			return false, bErr
+		}
+		if blocked {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func parseDatePlayed(raw string) (time.Time, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{
+		"20060102150405",
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02T15:04:05",
+		"2006-01-02",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC(), true
+		}
+	}
+	return time.Time{}, false
+}
+
 func (h *Handler) handleMarkPlayed(w http.ResponseWriter, r *http.Request) {
-	if !h.canModifyUser(r, r.PathValue("UserId")) {
+	userID := r.PathValue("UserId")
+	itemID := r.PathValue("Id")
+	if !h.canModifyUser(r, userID) {
 		httpx.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
-	ud, err := h.repo.MarkPlayed(r.Context(), r.PathValue("UserId"), r.PathValue("Id"))
+	allowed, err := h.canAccessItem(r, userID, itemID)
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !allowed {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
+	q := httpx.ParseQuery(r)
+	var (
+		playedAt    time.Time
+		hasDatePlay bool
+	)
+	if rawDate := q.Get("DatePlayed"); rawDate != "" {
+		playedAt, hasDatePlay = parseDatePlayed(rawDate)
+	}
+	var ud *dto.UserItemDataDto
+	if hasDatePlay {
+		if mpa, ok := any(h.repo).(interface {
+			MarkPlayedAt(context.Context, string, string, time.Time) (*dto.UserItemDataDto, error)
+		}); ok {
+			ud, err = mpa.MarkPlayedAt(r.Context(), userID, itemID, playedAt)
+		} else {
+			ud, err = h.repo.MarkPlayed(r.Context(), userID, itemID)
+			if err == nil {
+				if h.store != nil {
+					_, _ = h.store.Writer.ExecContext(r.Context(),
+						`UPDATE user_item_data SET last_played_date = ? WHERE user_id = ? AND item_id = ?`,
+						playedAt.UTC().Unix(), guid.Normalize(userID), guid.Normalize(itemID),
+					)
+				}
+				if ud != nil {
+					t := playedAt.UTC()
+					ud.LastPlayedDate = &t
+				}
+			}
+		}
+	} else {
+		ud, err = h.repo.MarkPlayed(r.Context(), userID, itemID)
+	}
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
@@ -916,11 +1062,22 @@ func (h *Handler) handleMarkPlayed(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleMarkUnplayed(w http.ResponseWriter, r *http.Request) {
-	if !h.canModifyUser(r, r.PathValue("UserId")) {
+	userID := r.PathValue("UserId")
+	itemID := r.PathValue("Id")
+	if !h.canModifyUser(r, userID) {
 		httpx.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
-	ud, err := h.repo.MarkUnplayed(r.Context(), r.PathValue("UserId"), r.PathValue("Id"))
+	allowed, err := h.canAccessItem(r, userID, itemID)
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !allowed {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
+	ud, err := h.repo.MarkUnplayed(r.Context(), userID, itemID)
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
@@ -929,11 +1086,22 @@ func (h *Handler) handleMarkUnplayed(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleMarkFavorite(w http.ResponseWriter, r *http.Request) {
-	if !h.canModifyUser(r, r.PathValue("UserId")) {
+	userID := r.PathValue("UserId")
+	itemID := r.PathValue("Id")
+	if !h.canModifyUser(r, userID) {
 		httpx.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
-	ud, err := h.repo.MarkFavorite(r.Context(), r.PathValue("UserId"), r.PathValue("Id"))
+	allowed, err := h.canAccessItem(r, userID, itemID)
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !allowed {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
+	ud, err := h.repo.MarkFavorite(r.Context(), userID, itemID)
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
@@ -942,11 +1110,22 @@ func (h *Handler) handleMarkFavorite(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleUnmarkFavorite(w http.ResponseWriter, r *http.Request) {
-	if !h.canModifyUser(r, r.PathValue("UserId")) {
+	userID := r.PathValue("UserId")
+	itemID := r.PathValue("Id")
+	if !h.canModifyUser(r, userID) {
 		httpx.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
-	ud, err := h.repo.UnmarkFavorite(r.Context(), r.PathValue("UserId"), r.PathValue("Id"))
+	allowed, err := h.canAccessItem(r, userID, itemID)
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !allowed {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
+	ud, err := h.repo.UnmarkFavorite(r.Context(), userID, itemID)
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return

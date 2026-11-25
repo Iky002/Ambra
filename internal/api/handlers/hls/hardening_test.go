@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/config"
@@ -75,5 +76,47 @@ func TestHLSStreamResolverAndLiveStreamOpenNotFound(t *testing.T) {
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/LiveStreams/Open", bytes.NewReader([]byte(`{}`))))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 for empty ItemId in LiveStreams/Open, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestLiveStreamsCapAndTTLEviction(t *testing.T) {
+	h := New(nil, nil, config.Default(t.TempDir()))
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, AuthFuncs{})
+
+	// 1. Seed an expired entry (>4 hours old)
+	expiredID := "expired-live-stream"
+	h.liveMu.Lock()
+	h.liveStreams[expiredID] = &liveStreamEntry{
+		LiveStreamID: expiredID,
+		CreatedAt:    time.Now().UTC().Add(-5 * time.Hour),
+	}
+	h.liveMu.Unlock()
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/LiveStreams/Open", bytes.NewReader([]byte(`{}`))))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("LiveStreams/Open got %d", rec.Code)
+	}
+	h.liveMu.RLock()
+	_, stillExists := h.liveStreams[expiredID]
+	h.liveMu.RUnlock()
+	if stillExists {
+		t.Fatalf("expected expired live stream entry to be evicted")
+	}
+
+	// 2. Open maxLiveStreams + 10 entries; map must stay capped at maxLiveStreams
+	for i := 0; i < maxLiveStreams+10; i++ {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/LiveStreams/Open", bytes.NewReader([]byte(`{}`))))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("LiveStreams/Open #%d got %d", i, rec.Code)
+		}
+	}
+	h.liveMu.RLock()
+	count := len(h.liveStreams)
+	h.liveMu.RUnlock()
+	if count != maxLiveStreams {
+		t.Fatalf("expected liveStreams capped at %d, got %d", maxLiveStreams, count)
 	}
 }

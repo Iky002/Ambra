@@ -99,7 +99,11 @@ func (h *Handler) handleListItemImages(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleServeItemImageFull(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	imageType := chi.URLParam(r, "Type")
-	idx, _ := strconv.Atoi(chi.URLParam(r, "Index"))
+	idx, err := strconv.Atoi(chi.URLParam(r, "Index"))
+	if err != nil || idx < 0 {
+		httpx.Error(w, http.StatusBadRequest, "invalid image index")
+		return
+	}
 	maxW, _ := strconv.Atoi(chi.URLParam(r, "MaxWidth"))
 	maxH, _ := strconv.Atoi(chi.URLParam(r, "MaxHeight"))
 	format := chi.URLParam(r, "Format")
@@ -174,7 +178,12 @@ func (h *Handler) handleUploadItemImage(w http.ResponseWriter, r *http.Request) 
 	}
 	idx := 0
 	if rawIdx := chi.URLParam(r, "Index"); rawIdx != "" {
-		idx, _ = strconv.Atoi(rawIdx)
+		parsed, err := strconv.Atoi(rawIdx)
+		if err != nil || parsed < 0 {
+			httpx.Error(w, http.StatusBadRequest, "invalid image index")
+			return
+		}
+		idx = parsed
 	}
 	if _, err := h.repo.GetItemRecordByID(r.Context(), itemID); errors.Is(err, sqlite.ErrNotFound) {
 		httpx.Error(w, http.StatusNotFound, "item not found")
@@ -290,7 +299,12 @@ func (h *Handler) handleDeleteItemImage(w http.ResponseWriter, r *http.Request) 
 	imageType := chi.URLParam(r, "Type")
 	idx := 0
 	if rawIdx := chi.URLParam(r, "Index"); rawIdx != "" {
-		idx, _ = strconv.Atoi(rawIdx)
+		parsed, err := strconv.Atoi(rawIdx)
+		if err != nil || parsed < 0 {
+			httpx.Error(w, http.StatusBadRequest, "invalid image index")
+			return
+		}
+		idx = parsed
 	}
 	if h.store != nil {
 		var imgPath string
@@ -313,9 +327,17 @@ func (h *Handler) handleDeleteItemImage(w http.ResponseWriter, r *http.Request) 
 func (h *Handler) handleUpdateImageIndex(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	imageType := chi.URLParam(r, "Type")
-	oldIdx, _ := strconv.Atoi(chi.URLParam(r, "Index"))
+	oldIdx, err := strconv.Atoi(chi.URLParam(r, "Index"))
+	if err != nil || oldIdx < 0 {
+		httpx.Error(w, http.StatusBadRequest, "invalid image index")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	newIdx := q.Int("newIndex", oldIdx)
+	if newIdx < 0 {
+		httpx.Error(w, http.StatusBadRequest, "invalid newIndex")
+		return
+	}
 
 	if h.store != nil && oldIdx != newIdx {
 		tx, err := h.store.Writer.BeginTx(r.Context(), nil)
@@ -396,7 +418,12 @@ func (h *Handler) handleSetImageURL(w http.ResponseWriter, r *http.Request) {
 	}
 	idx := 0
 	if rawIdx := chi.URLParam(r, "Index"); rawIdx != "" {
-		idx, _ = strconv.Atoi(rawIdx)
+		parsed, err := strconv.Atoi(rawIdx)
+		if err != nil || parsed < 0 {
+			httpx.Error(w, http.StatusBadRequest, "invalid image index")
+			return
+		}
+		idx = parsed
 	}
 
 	q := httpx.ParseQuery(r)
@@ -686,8 +713,22 @@ func (h *Handler) downloadAndSaveItemImage(ctx context.Context, itemID, imageTyp
 		if err != nil {
 			return err
 		}
-		tmpPath := filePath + ".tmp"
-		if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+		tmpFile, err := os.CreateTemp(baseDir, ".img-*.tmp")
+		if err != nil {
+			return err
+		}
+		tmpPath := tmpFile.Name()
+		if _, err := tmpFile.Write(data); err != nil {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpPath)
+			return err
+		}
+		if err := tmpFile.Close(); err != nil {
+			_ = os.Remove(tmpPath)
+			return err
+		}
+		if err := os.Chmod(tmpPath, 0o644); err != nil {
+			_ = os.Remove(tmpPath)
 			return err
 		}
 		if err := os.Rename(tmpPath, filePath); err != nil {
@@ -869,7 +910,12 @@ func (h *Handler) handleEntityImage(kind string) http.HandlerFunc {
 		imageType := chi.URLParam(r, "Type")
 		idx := 0
 		if rawIdx := chi.URLParam(r, "Index"); rawIdx != "" {
-			idx, _ = strconv.Atoi(rawIdx)
+			parsed, err := strconv.Atoi(rawIdx)
+			if err != nil || parsed < 0 {
+				httpx.Error(w, http.StatusBadRequest, "invalid image index")
+				return
+			}
+			idx = parsed
 		}
 
 		entityID := h.resolveEntityID(r.Context(), kind, name)

@@ -66,6 +66,8 @@ type ChannelInfo struct {
 	GroupTitle  string `json:"GroupTitle,omitempty"`
 	StreamUrl   string `json:"StreamUrl,omitempty"`
 	TunerHostId string `json:"TunerHostId,omitempty"`
+	Disabled    bool   `json:"Disabled,omitempty"`
+	SortIndex   int    `json:"SortIndex,omitempty"`
 }
 
 type ProgramInfo struct {
@@ -198,7 +200,7 @@ func New(store *sqlite.Store, cfg *config.Config) *Handler {
 	h := &Handler{
 		store:        store,
 		cfg:          cfg,
-		httpClient:   netutil.NewSafeHTTPClient(15*time.Second, false),
+		httpClient:   netutil.NewSafeHTTPClient(15*time.Second, true),
 		streamClient: netutil.NewSafeHTTPClient(0, true),
 		proxySecret:  secret,
 	}
@@ -238,6 +240,72 @@ func (h *Handler) GetChannelByID(id string) (*ChannelInfo, bool) {
 		}
 	}
 	return nil, false
+}
+
+// SetChannelDisabled updates a channel's disabled state in memory and persists state to SQLite.
+func (h *Handler) SetChannelDisabled(ctx context.Context, channelID string, disabled bool) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i := range h.state.Channels {
+		if h.state.Channels[i].Id == channelID {
+			h.state.Channels[i].Disabled = disabled
+			h.saveStateLocked(ctx)
+			return nil
+		}
+	}
+	return os.ErrNotExist
+}
+
+// SetChannelSortIndex updates a channel's sort index in memory and persists state to SQLite.
+func (h *Handler) SetChannelSortIndex(ctx context.Context, channelID string, sortIndex int) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i := range h.state.Channels {
+		if h.state.Channels[i].Id == channelID {
+			h.state.Channels[i].SortIndex = sortIndex
+			h.saveStateLocked(ctx)
+			return nil
+		}
+	}
+	return os.ErrNotExist
+}
+
+// DeleteTimerByID removes a timer by ID, persists state, and cancels any active DVR recording.
+func (h *Handler) DeleteTimerByID(ctx context.Context, id string) bool {
+	return h.DeleteTimer(ctx, id)
+}
+
+// DeleteSeriesTimerByID removes a series timer by ID (cascading pending single timers) and persists state.
+func (h *Handler) DeleteSeriesTimerByID(ctx context.Context, id string) bool {
+	return h.DeleteSeriesTimer(ctx, id)
+}
+
+// HasLiveTvManagement reports whether the request caller has admin or Live TV management privileges.
+func (h *Handler) HasLiveTvManagement(ctx context.Context, r *http.Request) bool {
+	if r != nil {
+		if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+			return ac.IsAdmin() || (ac.User != nil && ac.User.Policy.EnableLiveTvManagement)
+		}
+		if ctx == nil {
+			ctx = r.Context()
+		}
+	}
+	if ctx != nil {
+		if ac, ok := middleware.AuthFromContext(ctx); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+			return ac.IsAdmin() || (ac.User != nil && ac.User.Policy.EnableLiveTvManagement)
+		}
+		if h.auth.UserIDFromCtx != nil {
+			if uid := guid.Normalize(h.auth.UserIDFromCtx(ctx)); uid != "" {
+				if ur := h.getUserRepo(); ur != nil {
+					if u, err := ur.GetUserByID(ctx, uid); err == nil && u != nil {
+						return u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableLiveTvManagement
+					}
+				}
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // DueRecordingJobs scans pending ("New") timers whose padded window includes now,
@@ -451,38 +519,41 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	handleAdmin := func(pattern string, fn http.HandlerFunc) {
 		mux.Handle(pattern, wrapAdmin(fn))
 	}
+	handleLiveTvAccess := func(pattern string, fn http.HandlerFunc) {
+		mux.Handle(pattern, h.requireLiveTvAccess(wrapAuth)(fn))
+	}
 	handleLiveTvManage := func(pattern string, fn http.HandlerFunc) {
 		mux.Handle(pattern, h.requireLiveTvManagement(wrapAuth)(fn))
 	}
 
 	// Info, Channels, Programs
 	handleAuth("GET /LiveTv/Info", h.handleInfo)
-	handleAuth("GET /LiveTv/Channels", h.handleListChannels)
-	handleAuth("GET /LiveTv/Channels/{Id}", h.handleGetChannel)
-	handleAuth("GET /LiveTv/Channels/{Id}/Stream", h.handleStreamChannel)
-	handleAuth("GET /LiveTv/Programs", h.handleListPrograms)
-	handleAuth("POST /LiveTv/Programs", h.handleQueryProgramsPost)
-	handleAuth("GET /LiveTv/Programs/Recommended", h.handleRecommendedPrograms)
-	handleAuth("GET /LiveTv/Programs/{Id}", h.handleGetProgram)
+	handleLiveTvAccess("GET /LiveTv/Channels", h.handleListChannels)
+	handleLiveTvAccess("GET /LiveTv/Channels/{Id}", h.handleGetChannel)
+	handleLiveTvAccess("GET /LiveTv/Channels/{Id}/Stream", h.handleStreamChannel)
+	handleLiveTvAccess("GET /LiveTv/Programs", h.handleListPrograms)
+	handleLiveTvAccess("POST /LiveTv/Programs", h.handleQueryProgramsPost)
+	handleLiveTvAccess("GET /LiveTv/Programs/Recommended", h.handleRecommendedPrograms)
+	handleLiveTvAccess("GET /LiveTv/Programs/{Id}", h.handleGetProgram)
 
 	// Recordings
-	handleAuth("GET /LiveTv/Recordings", h.handleListRecordings)
-	handleAuth("GET /LiveTv/Recordings/Folders", h.handleRecordingFolders)
-	handleAuth("GET /LiveTv/Recordings/{Id}", h.handleGetRecording)
+	handleLiveTvAccess("GET /LiveTv/Recordings", h.handleListRecordings)
+	handleLiveTvAccess("GET /LiveTv/Recordings/Folders", h.handleRecordingFolders)
+	handleLiveTvAccess("GET /LiveTv/Recordings/{Id}", h.handleGetRecording)
 	handleAdmin("DELETE /LiveTv/Recordings/{Id}", h.handleDeleteRecording)
 
 	// Timers
-	handleAuth("GET /LiveTv/Timers", h.handleListTimers)
+	handleLiveTvAccess("GET /LiveTv/Timers", h.handleListTimers)
 	handleLiveTvManage("POST /LiveTv/Timers", h.handleCreateTimer)
-	handleAuth("GET /LiveTv/Timers/Defaults", h.handleTimerDefaults)
-	handleAuth("GET /LiveTv/Timers/{Id}", h.handleGetTimer)
+	handleLiveTvAccess("GET /LiveTv/Timers/Defaults", h.handleTimerDefaults)
+	handleLiveTvAccess("GET /LiveTv/Timers/{Id}", h.handleGetTimer)
 	handleLiveTvManage("POST /LiveTv/Timers/{Id}", h.handleUpdateTimer)
 	handleLiveTvManage("DELETE /LiveTv/Timers/{Id}", h.handleDeleteTimer)
 
 	// SeriesTimers
-	handleAuth("GET /LiveTv/SeriesTimers", h.handleListSeriesTimers)
+	handleLiveTvAccess("GET /LiveTv/SeriesTimers", h.handleListSeriesTimers)
 	handleLiveTvManage("POST /LiveTv/SeriesTimers", h.handleCreateSeriesTimer)
-	handleAuth("GET /LiveTv/SeriesTimers/{Id}", h.handleGetSeriesTimer)
+	handleLiveTvAccess("GET /LiveTv/SeriesTimers/{Id}", h.handleGetSeriesTimer)
 	handleLiveTvManage("POST /LiveTv/SeriesTimers/{Id}", h.handleUpdateSeriesTimer)
 	handleLiveTvManage("DELETE /LiveTv/SeriesTimers/{Id}", h.handleDeleteSeriesTimer)
 
@@ -492,7 +563,42 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	handleAuth("GET /LiveTv/TunerHosts/Types", h.handleTunerHostTypes)
 	handleAdmin("POST /LiveTv/ListingProviders", h.handleSaveListingProvider)
 	handleAdmin("DELETE /LiveTv/ListingProviders", h.handleDeleteListingProvider)
-	handleAuth("GET /LiveTv/GuideInfo", h.handleGuideInfo)
+	handleLiveTvAccess("GET /LiveTv/GuideInfo", h.handleGuideInfo)
+}
+
+func (h *Handler) requireLiveTvAccess(wrapAuth func(http.Handler) http.Handler) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return wrapAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+				if !ac.IsAdmin() {
+					if ac.User == nil || !ac.User.Policy.EnableLiveTvAccess {
+						httpx.Error(w, http.StatusForbidden, "Live TV access is disabled for this user")
+						return
+					}
+					if ur := h.getUserRepo(); ur != nil && ac.User.ID != "" {
+						if u, err := ur.GetUserByID(r.Context(), ac.User.ID); err == nil && u != nil {
+							if !u.IsAdmin && !u.Policy.IsAdministrator && !u.Policy.EnableLiveTvAccess {
+								httpx.Error(w, http.StatusForbidden, "Live TV access is disabled for this user")
+								return
+							}
+						}
+					}
+				}
+			} else if h.auth.UserIDFromCtx != nil {
+				if ur := h.getUserRepo(); ur != nil {
+					if uid := guid.Normalize(h.auth.UserIDFromCtx(r.Context())); uid != "" {
+						if u, err := ur.GetUserByID(r.Context(), uid); err == nil && u != nil {
+							if !u.IsAdmin && !u.Policy.IsAdministrator && !u.Policy.EnableLiveTvAccess {
+								httpx.Error(w, http.StatusForbidden, "Live TV access is disabled for this user")
+								return
+							}
+						}
+					}
+				}
+			}
+			next.ServeHTTP(w, r)
+		}))
+	}
 }
 
 func (h *Handler) requireLiveTvManagement(wrapAuth func(http.Handler) http.Handler) func(http.Handler) http.Handler {
@@ -1564,19 +1670,32 @@ func (h *Handler) handleUpdateSeriesTimer(w http.ResponseWriter, r *http.Request
 	httpx.Error(w, http.StatusNotFound, "series timer not found")
 }
 
-// DeleteSeriesTimer removes a series timer by ID and persists state.
+// DeleteSeriesTimer removes a series timer by ID, cascade-deletes its pending single timers, and persists state.
 func (h *Handler) DeleteSeriesTimer(ctx context.Context, id string) bool {
 	h.mu.Lock()
+	idx := -1
 	for i, st := range h.state.SeriesTimers {
 		if st.Id == id {
-			h.state.SeriesTimers = append(h.state.SeriesTimers[:i], h.state.SeriesTimers[i+1:]...)
-			h.saveStateLocked(ctx)
-			h.mu.Unlock()
-			return true
+			idx = i
+			break
 		}
 	}
+	if idx < 0 {
+		h.mu.Unlock()
+		return false
+	}
+	h.state.SeriesTimers = append(h.state.SeriesTimers[:idx], h.state.SeriesTimers[idx+1:]...)
+	keptTimers := make([]TimerInfo, 0, len(h.state.Timers))
+	for _, t := range h.state.Timers {
+		if t.SeriesTimerId == id && (t.Status == "" || t.Status == "New") {
+			continue
+		}
+		keptTimers = append(keptTimers, t)
+	}
+	h.state.Timers = keptTimers
+	h.saveStateLocked(ctx)
 	h.mu.Unlock()
-	return false
+	return true
 }
 
 func (h *Handler) handleDeleteSeriesTimer(w http.ResponseWriter, r *http.Request) {
@@ -1696,7 +1815,7 @@ func (h *Handler) loadM3UFromSource(ctx context.Context, src, userAgent string) 
 		scheme := strings.ToLower(u.Scheme)
 		if scheme == "http" || scheme == "https" {
 			if !h.customHTTPClient {
-				if err := netutil.ValidateRemoteURL(trimmed, false); err != nil {
+				if err := netutil.ValidateRemoteURL(trimmed, true); err != nil {
 					return nil, fmt.Errorf("blocked m3u url: %w", err)
 				}
 			}
@@ -1908,6 +2027,9 @@ func (h *Handler) handleSaveListingProvider(w http.ResponseWriter, r *http.Reque
 	}
 	if guide != nil && len(guide.Programmes) > 0 {
 		h.applyXMLTVGuideLocked(guide)
+		for _, st := range h.state.SeriesTimers {
+			h.scheduleTimersForSeriesLocked(st)
+		}
 	}
 	h.saveStateLocked(r.Context())
 	h.mu.Unlock()
@@ -1924,7 +2046,7 @@ func (h *Handler) loadXMLTVFromSource(ctx context.Context, src string) (*XMLTVGu
 		scheme := strings.ToLower(u.Scheme)
 		if scheme == "http" || scheme == "https" {
 			if !h.customHTTPClient {
-				if err := netutil.ValidateRemoteURL(trimmed, false); err != nil {
+				if err := netutil.ValidateRemoteURL(trimmed, true); err != nil {
 					return nil, fmt.Errorf("blocked xmltv url: %w", err)
 				}
 			}

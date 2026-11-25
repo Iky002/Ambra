@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/ambra-media/ambra/internal/api/handlers/livetv"
+	syncapi "github.com/ambra-media/ambra/internal/api/handlers/sync"
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/dvr"
@@ -81,6 +82,7 @@ type Handler struct {
 	cfg      *config.Config
 	auth     AuthFuncs
 	liveTV   *livetv.Handler
+	syncH    *syncapi.Handler
 	dvrRec   *dvr.Recorder
 	libRepo  *sqlite.LibraryRepo
 	userRepo *sqlite.UserRepo
@@ -89,11 +91,25 @@ type Handler struct {
 	state compatExtState
 }
 
-// SetLiveTV wires the primary Live TV handler for real channel stream proxying.
+// SetLiveTV wires the primary Live TV handler for real channel stream proxying and unified state.
 func (h *Handler) SetLiveTV(lt *livetv.Handler) {
 	h.mu.Lock()
 	h.liveTV = lt
 	h.mu.Unlock()
+}
+
+// SetSyncHandler wires the primary Sync handler to unify in-memory and SQLite sync state.
+func (h *Handler) SetSyncHandler(s *syncapi.Handler) {
+	h.mu.Lock()
+	h.syncH = s
+	h.mu.Unlock()
+}
+
+func (h *Handler) getSyncHandler() *syncapi.Handler {
+	h.mu.RLock()
+	s := h.syncH
+	h.mu.RUnlock()
+	return s
 }
 
 // SetDVR wires the DVR recorder for recordings directory validation and timer cancellation.
@@ -136,6 +152,32 @@ func (h *Handler) callerIdentity(r *http.Request) (userID string, isAdmin bool) 
 		}
 	}
 	return "", false
+}
+
+func (h *Handler) hasLiveTvManagement(r *http.Request) bool {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		h.mu.RLock()
+		lt := h.liveTV
+		h.mu.RUnlock()
+		if lt != nil {
+			return lt.HasLiveTvManagement(r.Context(), r)
+		}
+		return ac.IsAdmin() || (ac.User != nil && ac.User.Policy.EnableLiveTvManagement)
+	}
+	if h.auth.UserIDFromCtx != nil {
+		if uid := guid.Normalize(h.auth.UserIDFromCtx(r.Context())); uid != "" {
+			h.mu.RLock()
+			ur := h.userRepo
+			h.mu.RUnlock()
+			if ur != nil {
+				if u, err := ur.GetUserByID(r.Context(), uid); err == nil && u != nil {
+					return u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableLiveTvManagement
+				}
+			}
+			return false
+		}
+	}
+	return true
 }
 
 // New constructs a compatext Handler and loads persisted state from SQLite when store is non-nil.

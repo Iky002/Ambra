@@ -341,6 +341,23 @@ func TestQuickConnectPerIPRateLimitAndEdgeCases(t *testing.T) {
 	if got := clientIP(emptyReq); got != "" {
 		t.Fatalf("clientIP empty = %q", got)
 	}
+
+	// X-Forwarded-For (first valid IP) and X-Real-IP precedence
+	xffReq := httptest.NewRequest(http.MethodPost, "/", nil)
+	xffReq.RemoteAddr = "10.0.0.1:4321"
+	xffReq.Header.Set("X-Forwarded-For", "not-an-ip, 203.0.113.55:8080, 10.0.0.2")
+	xffReq.Header.Set("X-Real-IP", "203.0.113.77")
+	if got := clientIP(xffReq); got != "203.0.113.55" {
+		t.Fatalf("clientIP X-Forwarded-For = %q, want 203.0.113.55", got)
+	}
+
+	xriReq := httptest.NewRequest(http.MethodPost, "/", nil)
+	xriReq.RemoteAddr = "10.0.0.1:4321"
+	xriReq.Header.Set("X-Forwarded-For", "invalid-only")
+	xriReq.Header.Set("X-Real-IP", "203.0.113.77:9000")
+	if got := clientIP(xriReq); got != "203.0.113.77" {
+		t.Fatalf("clientIP X-Real-IP = %q, want 203.0.113.77", got)
+	}
 }
 
 func TestQuickConnectAdminAuthorizeForAnotherUser(t *testing.T) {

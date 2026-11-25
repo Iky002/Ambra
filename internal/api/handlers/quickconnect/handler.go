@@ -407,6 +407,29 @@ func (h *Handler) pruneExpiredLocked(now time.Time) {
 }
 
 func clientIP(r *http.Request) string {
+	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
+		for _, part := range strings.Split(xff, ",") {
+			cand := strings.TrimSpace(part)
+			if cand == "" {
+				continue
+			}
+			if host, _, err := net.SplitHostPort(cand); err == nil {
+				cand = host
+			}
+			if ip := net.ParseIP(cand); ip != nil {
+				return ip.String()
+			}
+		}
+	}
+	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+		cand := xri
+		if host, _, err := net.SplitHostPort(cand); err == nil {
+			cand = host
+		}
+		if ip := net.ParseIP(cand); ip != nil {
+			return ip.String()
+		}
+	}
 	addr := strings.TrimSpace(r.RemoteAddr)
 	if addr == "" {
 		return ""
