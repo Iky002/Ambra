@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   AlertCircle,
@@ -7,6 +7,8 @@ import {
   KeyRound,
   Loader2,
   Lock,
+  QrCode,
+  RefreshCw,
   Server,
   ShieldCheck,
   Sparkles,
@@ -15,13 +17,14 @@ import {
   X,
 } from 'lucide-react'
 import { Navigate, useNavigate } from 'react-router-dom'
-import { api, getUserImageUrl } from '../api/client'
+import { api, embyFetch, getUserImageUrl } from '../api/client'
+import type { QuickConnectResult } from '../api/types'
 import { AmbraLogo } from '../components/AmbraLogo'
 import { useAuth } from '../context/AuthContext'
 import { isDemoMode } from '../demo/demoMode'
 
 export function LoginPage() {
-  const { login } = useAuth()
+  const { login, applyAuthResult } = useAuth()
   const navigate = useNavigate()
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
@@ -39,7 +42,135 @@ export function LoginPage() {
   const [forgotLoading, setForgotLoading] = useState(false)
   const [forgotError, setForgotError] = useState('')
 
+  // Quick Connect 授权码登录弹窗状态
+  const [qcOpen, setQcOpen] = useState(false)
+  const [qcLoading, setQcLoading] = useState(false)
+  const [qcAuthenticating, setQcAuthenticating] = useState(false)
+  const [qcResult, setQcResult] = useState<QuickConnectResult | null>(null)
+  const [qcError, setQcError] = useState('')
+  const qcPollTimerRef = useRef<number | null>(null)
+  const qcAuthenticatingRef = useRef(false)
+
   const demoActive = isDemoMode()
+
+  const clearQcPollTimer = useCallback(() => {
+    if (qcPollTimerRef.current !== null) {
+      window.clearInterval(qcPollTimerRef.current)
+      qcPollTimerRef.current = null
+    }
+  }, [])
+
+  const closeQcModal = useCallback(() => {
+    clearQcPollTimer()
+    qcAuthenticatingRef.current = false
+    setQcOpen(false)
+    setQcLoading(false)
+    setQcAuthenticating(false)
+    setQcResult(null)
+    setQcError('')
+  }, [clearQcPollTimer])
+
+  const completeQcLogin = useCallback(
+    async (secret: string) => {
+      if (qcAuthenticatingRef.current) return
+      qcAuthenticatingRef.current = true
+      clearQcPollTimer()
+      setQcAuthenticating(true)
+      setQcError('')
+      try {
+        const authRes = await api.authenticateWithQuickConnect(secret)
+        applyAuthResult(authRes)
+        setQcOpen(false)
+        navigate('/', { replace: true })
+      } catch (err) {
+        qcAuthenticatingRef.current = false
+        setQcAuthenticating(false)
+        setQcError(err instanceof Error ? err.message : 'Quick Connect 登录失败，请重新获取授权码')
+      }
+    },
+    [applyAuthResult, clearQcPollTimer, navigate],
+  )
+
+  const startQuickConnect = useCallback(async () => {
+    clearQcPollTimer()
+    qcAuthenticatingRef.current = false
+    setQcOpen(true)
+    setQcLoading(true)
+    setQcAuthenticating(false)
+    setQcError('')
+    setQcResult(null)
+    try {
+      const res = await api.quickConnectInitiate()
+      setQcResult(res)
+    } catch (err) {
+      setQcError(err instanceof Error ? err.message : '获取 Quick Connect 授权码失败，请稍后重试')
+    } finally {
+      setQcLoading(false)
+    }
+  }, [clearQcPollTimer])
+
+  useEffect(() => {
+    if (!qcOpen || !qcResult?.Secret || qcResult.Authenticated) {
+      clearQcPollTimer()
+      return
+    }
+    const secret = qcResult.Secret
+    const timerId = window.setInterval(() => {
+      if (qcAuthenticatingRef.current) return
+      void api
+        .quickConnectConnect(secret)
+        .then((status) => {
+          if (status?.Authenticated) {
+            setQcResult(status)
+            void completeQcLogin(secret)
+          }
+        })
+        .catch(() => {
+          // 轮询期间忽略瞬时网络错误
+        })
+    }, 2000)
+    qcPollTimerRef.current = timerId
+    return () => {
+      window.clearInterval(timerId)
+      if (qcPollTimerRef.current === timerId) {
+        qcPollTimerRef.current = null
+      }
+    }
+  }, [qcOpen, qcResult?.Secret, qcResult?.Authenticated, clearQcPollTimer, completeQcLogin])
+
+  useEffect(() => {
+    return () => {
+      clearQcPollTimer()
+    }
+  }, [clearQcPollTimer])
+
+  useEffect(() => {
+    if (!qcOpen) return
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !qcAuthenticating) {
+        closeQcModal()
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [qcOpen, qcAuthenticating, closeQcModal])
+
+  const handleDemoApproveQuickConnect = async () => {
+    if (!qcResult?.Secret || qcAuthenticatingRef.current) return
+    try {
+      const approved = await embyFetch<QuickConnectResult>(
+        `/emby/QuickConnect/Connect?secret=${encodeURIComponent(qcResult.Secret)}&demoApprove=1`,
+        {},
+        false,
+      )
+      if (approved?.Authenticated) {
+        setQcResult(approved)
+        await completeQcLogin(qcResult.Secret)
+      }
+    } catch (err) {
+      setQcError(err instanceof Error ? err.message : 'Demo 模拟授权失败')
+    }
+  }
 
   const openForgotModal = () => {
     setForgotUsername(username.trim())
@@ -156,6 +287,20 @@ export function LoginPage() {
     retry: 1,
   })
 
+  const { data: quickConnectEnabled } = useQuery({
+    queryKey: ['quickConnectEnabled'],
+    queryFn: async () => {
+      try {
+        return await api.getQuickConnectEnabled()
+      } catch {
+        return false
+      }
+    },
+    retry: false,
+  })
+
+  const showQuickConnect = Boolean(quickConnectEnabled || demoActive)
+
   if (!demoActive && setupStatus && setupStatus.completed === false) {
     return <Navigate to="/setup" replace />
   }
@@ -197,7 +342,7 @@ export function LoginPage() {
             <Server className="h-3.5 w-3.5 text-amber-400/80" />
             <span>
               {sysInfo?.ProductName || 'Ambra'}{' '}
-              {sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.9.1')}
+              {sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.9.3')}
             </span>
           </p>
         </div>
@@ -313,6 +458,21 @@ export function LoginPage() {
             </button>
           </div>
         </form>
+
+        {/* Quick Connect 授权码登录入口 */}
+        {showQuickConnect && (
+          <div className="mt-4">
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={() => void startQuickConnect()}
+              className="flex w-full items-center justify-center gap-2 rounded-xl border border-amber-400/30 bg-amber-500/10 py-2.5 text-sm font-semibold text-amber-200 transition-colors hover:border-amber-400/50 hover:bg-amber-500/20 disabled:opacity-60"
+            >
+              <QrCode className="h-4 w-4 text-amber-300" />
+              <span>Quick Connect 授权码登录</span>
+            </button>
+          </div>
+        )}
 
         {/* 忘记密码入口 */}
         <div className="mt-4 text-center">
@@ -497,6 +657,141 @@ export function LoginPage() {
                   </button>
                 </div>
               </form>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Quick Connect 授权码登录弹窗 */}
+      {qcOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="quick-connect-title"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
+          onClick={() => {
+            if (!qcAuthenticating) closeQcModal()
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-md rounded-2xl border border-white/10 bg-zinc-950 p-6 shadow-2xl"
+          >
+            <div className="mb-4 flex items-start justify-between gap-3">
+              <div>
+                <h2
+                  id="quick-connect-title"
+                  className="flex items-center gap-2 text-base font-semibold text-zinc-50"
+                >
+                  <QrCode className="h-4 w-4 text-amber-400" />
+                  <span>Quick Connect 授权码登录</span>
+                </h2>
+                <p className="mt-1 text-xs text-zinc-400">
+                  在已登录的 Ambra 网页端「个人中心 → Quick Connect」输入此授权码
+                </p>
+              </div>
+              <button
+                type="button"
+                aria-label="关闭 Quick Connect 弹窗"
+                disabled={qcAuthenticating}
+                onClick={() => {
+                  if (!qcAuthenticating) closeQcModal()
+                }}
+                className="rounded-lg p-1 text-zinc-400 transition-colors hover:bg-white/10 hover:text-zinc-100 disabled:opacity-50"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {qcError && (
+              <div className="mb-4 flex items-start gap-2 rounded-xl border border-red-500/30 bg-red-500/10 px-3.5 py-2.5 text-xs text-red-300">
+                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>{qcError}</span>
+              </div>
+            )}
+
+            {qcLoading ? (
+              <div className="flex flex-col items-center justify-center gap-3 py-8 text-xs text-zinc-400">
+                <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
+                <span>正在生成 6 位 Quick Connect 授权码...</span>
+              </div>
+            ) : qcResult ? (
+              <div className="space-y-4">
+                <div className="rounded-2xl border border-amber-400/25 bg-gradient-to-b from-amber-500/10 to-white/[0.02] px-4 py-6 text-center">
+                  <p className="mb-2 text-[11px] font-medium uppercase tracking-widest text-amber-300/80">
+                    一次性设备授权码
+                  </p>
+                  <div
+                    data-testid="quick-connect-code"
+                    className="select-all font-mono text-4xl font-bold tracking-[0.35em] text-zinc-50 pl-[0.35em]"
+                  >
+                    {qcResult.Code}
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-center gap-2 text-xs text-zinc-400">
+                  {qcAuthenticating ? (
+                    <>
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-400" />
+                      <span className="text-emerald-300">授权已确认，正在登录影院...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-400" />
+                      <span>等待已登录设备确认授权中（每 2 秒自动检查）...</span>
+                    </>
+                  )}
+                </div>
+
+                {demoActive && !qcAuthenticating && (
+                  <button
+                    type="button"
+                    onClick={() => void handleDemoApproveQuickConnect()}
+                    className="flex w-full items-center justify-center gap-1.5 rounded-xl border border-emerald-500/35 bg-emerald-500/15 px-4 py-2 text-xs font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/25"
+                  >
+                    <CheckCircle2 className="h-3.5 w-3.5" />
+                    <span>Demo 模拟立即授权登录</span>
+                  </button>
+                )}
+
+                <div className="flex items-center justify-between gap-2 pt-1">
+                  <button
+                    type="button"
+                    disabled={qcAuthenticating}
+                    onClick={() => void startQuickConnect()}
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10 disabled:opacity-50"
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" />
+                    <span>重新生成</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={qcAuthenticating}
+                    onClick={closeQcModal}
+                    className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10 disabled:opacity-50"
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={closeQcModal}
+                  className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10"
+                >
+                  关闭
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void startQuickConnect()}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400"
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  <span>重试</span>
+                </button>
+              </div>
             )}
           </div>
         </div>

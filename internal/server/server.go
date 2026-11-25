@@ -31,6 +31,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/handlers/notifications"
 	"github.com/ambra-media/ambra/internal/api/handlers/ops"
 	"github.com/ambra-media/ambra/internal/api/handlers/pluginadmin"
+	"github.com/ambra-media/ambra/internal/api/handlers/quickconnect"
 	"github.com/ambra-media/ambra/internal/api/handlers/streaming"
 	syncapi "github.com/ambra-media/ambra/internal/api/handlers/sync"
 	"github.com/ambra-media/ambra/internal/api/handlers/system"
@@ -340,6 +341,11 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		return nil, fmt.Errorf("init governance service: %w", err)
 	}
 	govhandler.New(govSvc).RegisterRoutes(mediaMux, govhandler.AuthFuncs{
+		RequireAuth:   authMW.RequireAuth,
+		RequireAdmin:  authMW.RequireAdmin,
+		UserIDFromCtx: userIDFromCtx,
+	})
+	quickconnect.New(authSvc, userRepo, sessionMgr).RegisterRoutes(mediaMux, quickconnect.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,

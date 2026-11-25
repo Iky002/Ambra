@@ -282,6 +282,38 @@ export interface ParentalRatingOption {
   Value: number
 }
 
+export interface NotificationItem {
+  Id: string
+  UserId?: string
+  Date: string
+  IsRead: boolean
+  Name: string
+  Description?: string
+  Url?: string
+  Level: 'Normal' | 'Warning' | 'Error' | string
+}
+
+export interface NotificationResult {
+  Notifications: NotificationItem[]
+  TotalRecordCount: number
+}
+
+export interface NotificationsSummary {
+  UnreadCount: number
+  MaxUnreadNotificationLevel?: 'Normal' | 'Warning' | 'Error' | string
+}
+
+export interface QuickConnectResult {
+  Authenticated: boolean
+  Secret: string
+  Code: string
+  DeviceId?: string
+  DeviceName?: string
+  AppName?: string
+  AppVersion?: string
+  DateAdded?: string
+}
+
 export interface BaseItemDto {
   Name: string
   OriginalTitle?: string

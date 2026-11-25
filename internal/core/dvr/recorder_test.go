@@ -325,3 +325,37 @@ func TestSetOnFinishedCallback(t *testing.T) {
 		t.Fatalf("unexpected OnFinished statuses: %+v", got)
 	}
 }
+
+func TestStartRecordingStartFailureInvokesOnFinished(t *testing.T) {
+	tmpDir := t.TempDir()
+	rec := NewRecorder(Options{
+		DataDir:    tmpDir,
+		FFmpegPath: filepath.Join(tmpDir, "missing-ffmpeg"),
+	})
+	defer rec.Close()
+
+	var called atomic.Bool
+	var gotState RecordingState
+	rec.SetOnFinished(func(_ context.Context, st RecordingState) {
+		// Verify r.mu is not held during callback
+		if _, ok := rec.GetRecording(st.Job.TimerID); !ok {
+			t.Errorf("GetRecording returned false inside OnFinished")
+		}
+		gotState = st
+		called.Store(true)
+	})
+
+	if _, err := rec.StartRecording(context.Background(), RecordingJob{
+		TimerID:   "start-fail-cb",
+		StreamURL: "http://live.local/stream.ts",
+	}); err == nil {
+		t.Fatal("expected StartRecording error for missing binary")
+	}
+
+	if !called.Load() {
+		t.Fatal("expected OnFinished callback to be invoked on cmd.Start failure")
+	}
+	if gotState.Job.TimerID != "start-fail-cb" || gotState.Status != StatusFailed || gotState.Error == "" {
+		t.Fatalf("unexpected failed callback state: %+v", gotState)
+	}
+}

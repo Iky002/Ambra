@@ -14,10 +14,14 @@ import type {
   LiveTvRecordingInfo,
   LiveTvTimerInfo,
   LiveTvTunerHostInfo,
+  NotificationItem,
+  NotificationResult,
+  NotificationsSummary,
   ParentalRatingOption,
   PlaybackInfoResponse,
   PublicSystemInfo,
   QueryResult,
+  QuickConnectResult,
   RankingsRefreshResult,
   RankingsSummary,
   RemoteImageInfo,
@@ -316,6 +320,57 @@ function createInitialDemoBackups(): BackupFileInfo[] {
 
 let demoBackups: BackupFileInfo[] = createInitialDemoBackups()
 
+interface DemoNotificationRecord {
+  Id: string
+  UserId?: string
+  Date: string
+  Name: string
+  Description?: string
+  Url?: string
+  Level: 'Normal' | 'Warning' | 'Error' | string
+  defaultRead?: boolean
+  readByUsers: Set<string>
+}
+
+interface DemoQuickConnectSession extends QuickConnectResult {
+  AuthorizedUserId?: string
+}
+
+function createInitialDemoNotifications(): DemoNotificationRecord[] {
+  const now = Date.now()
+  return [
+    {
+      Id: 'notif-demo-01',
+      Date: new Date(now - 15 * 60_000).toISOString(),
+      Name: '欢迎体验 Ambra v0.9.3',
+      Description: '已上线应用内通知中心、家长控制分级过滤与 Quick Connect 设备授权码登录。',
+      Level: 'Normal',
+      readByUsers: new Set(),
+    },
+    {
+      Id: 'notif-demo-02',
+      Date: new Date(now - 2 * 3600_000).toISOString(),
+      Name: '媒体库扫描完成',
+      Description: '「电影」与「剧集」媒体库已完成增量扫描，共识别 20 部影片与剧集。',
+      Level: 'Normal',
+      readByUsers: new Set(),
+    },
+    {
+      Id: 'notif-demo-03',
+      Date: new Date(now - 12 * 3600_000).toISOString(),
+      Name: '检测到 1 条待复核刮削记录',
+      Description: '可在「管理控制台 → 媒体治理」中查看并确认低置信度识别结果。',
+      Url: '/admin',
+      Level: 'Warning',
+      defaultRead: true,
+      readByUsers: new Set(),
+    },
+  ]
+}
+
+let demoNotifications: DemoNotificationRecord[] = createInitialDemoNotifications()
+let demoQuickConnectSessions = new Map<string, DemoQuickConnectSession>()
+
 const DEMO_TMDB_TRENDING_TMDB_IDS = new Set([
   '693134', // 沙丘 2
   '872585', // 奥本海默
@@ -390,6 +445,8 @@ export function resetDemoStore(): void {
   demoLiveTvRecordings = createInitialLiveTvRecordings()
   demoWebhooks = createInitialDemoWebhooks()
   demoBackups = createInitialDemoBackups()
+  demoNotifications = createInitialDemoNotifications()
+  demoQuickConnectSessions = new Map<string, DemoQuickConnectSession>()
 }
 
 export function getDemoImageUrl(
@@ -3536,6 +3593,224 @@ export async function demoFetch<T>(
       RequiresRestart: true,
     }
     return res as T
+  }
+
+  // ==================== 14.6 应用内通知中心 (Notifications) ====================
+  if (pathname === '/emby/Notifications/Admin' && method === 'POST') {
+    const body = parseJsonBody(options)
+    const name = String(body.Name || '').trim()
+    if (!name) {
+      throw new ApiError(400, '通知标题不能为空')
+    }
+    const description = typeof body.Description === 'string' ? body.Description.trim() : undefined
+    const targetUrl = typeof body.Url === 'string' && body.Url.trim() ? body.Url.trim() : undefined
+    const level =
+      body.Level === 'Warning' || body.Level === 'Error' || body.Level === 'Normal'
+        ? body.Level
+        : 'Normal'
+    const targetUserId =
+      typeof body.UserId === 'string' && body.UserId.trim() ? body.UserId.trim() : undefined
+
+    const record: DemoNotificationRecord = {
+      Id: `notif-demo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      UserId: targetUserId,
+      Date: new Date().toISOString(),
+      Name: name,
+      Description: description,
+      Url: targetUrl,
+      Level: level,
+      readByUsers: new Set(),
+    }
+    demoNotifications.unshift(record)
+    pushActivity(`管理员发送了系统通知「${name}」`, 'NotificationSent', description, auth?.userId)
+
+    const item: NotificationItem = {
+      Id: record.Id,
+      UserId: record.UserId,
+      Date: record.Date,
+      IsRead: false,
+      Name: record.Name,
+      Description: record.Description,
+      Url: record.Url,
+      Level: record.Level,
+    }
+    return item as T
+  }
+
+  const notifSummaryMatch = pathname.match(/^\/emby\/Notifications\/([^/]+)\/Summary$/)
+  if (notifSummaryMatch && method === 'GET') {
+    const userId = decodeURIComponent(notifSummaryMatch[1])
+    const visible = demoNotifications.filter((n) => !n.UserId || n.UserId === userId)
+    const unread = visible.filter((n) => !n.defaultRead && !n.readByUsers.has(userId))
+    let maxLevel: 'Normal' | 'Warning' | 'Error' = 'Normal'
+    if (unread.some((n) => n.Level === 'Error')) {
+      maxLevel = 'Error'
+    } else if (unread.some((n) => n.Level === 'Warning')) {
+      maxLevel = 'Warning'
+    }
+    const summary: NotificationsSummary = {
+      UnreadCount: unread.length,
+      MaxUnreadNotificationLevel: maxLevel,
+    }
+    return summary as T
+  }
+
+  const notifReadMatch = pathname.match(/^\/emby\/Notifications\/([^/]+)\/Read$/)
+  if (notifReadMatch && method === 'POST') {
+    const userId = decodeURIComponent(notifReadMatch[1])
+    const body = parseJsonBody(options)
+    const qsIds = (qs.get('Ids') || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+    const bodyIds = Array.isArray(body.Ids)
+      ? body.Ids.map((id) => String(id).trim()).filter(Boolean)
+      : []
+    const targetIds = new Set([...qsIds, ...bodyIds])
+
+    for (const notif of demoNotifications) {
+      if (notif.UserId && notif.UserId !== userId) continue
+      if (targetIds.size === 0 || targetIds.has(notif.Id)) {
+        notif.readByUsers.add(userId)
+      }
+    }
+    return undefined as T
+  }
+
+  const notifListMatch = pathname.match(/^\/emby\/Notifications\/([^/]+)$/)
+  if (notifListMatch && method === 'GET') {
+    const userId = decodeURIComponent(notifListMatch[1])
+    const startIndex = Math.max(0, Number(qs.get('StartIndex') || '0') || 0)
+    const limit = Math.max(1, Number(qs.get('Limit') || '20') || 20)
+    const visible = demoNotifications.filter((n) => !n.UserId || n.UserId === userId)
+    const paged: NotificationItem[] = visible.slice(startIndex, startIndex + limit).map((n) => ({
+      Id: n.Id,
+      UserId: n.UserId,
+      Date: n.Date,
+      IsRead: Boolean(n.defaultRead || n.readByUsers.has(userId)),
+      Name: n.Name,
+      Description: n.Description,
+      Url: n.Url,
+      Level: n.Level,
+    }))
+    const res: NotificationResult = {
+      Notifications: paged,
+      TotalRecordCount: visible.length,
+    }
+    return res as T
+  }
+
+  // ==================== 14.7 Quick Connect 设备授权码登录 ====================
+  if (pathname === '/emby/QuickConnect/Enabled' && method === 'GET') {
+    return true as T
+  }
+
+  if (pathname === '/emby/QuickConnect/Initiate' && method === 'POST') {
+    const code = String(Math.floor(100000 + Math.random() * 900000))
+    const secret = `qc-demo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    const session: DemoQuickConnectSession = {
+      Authenticated: false,
+      Secret: secret,
+      Code: code,
+      DeviceId: 'dev-demo-web-01',
+      DeviceName: 'Ambra Web Demo',
+      AppName: 'Ambra Web',
+      AppVersion: '0.9.3',
+      DateAdded: new Date().toISOString(),
+    }
+    demoQuickConnectSessions.set(secret, session)
+    const { AuthorizedUserId: _ignored, ...pub } = session
+    return pub as T
+  }
+
+  if (pathname === '/emby/QuickConnect/Connect' && method === 'GET') {
+    const secret = (qs.get('secret') || qs.get('Secret') || '').trim()
+    const session = demoQuickConnectSessions.get(secret)
+    if (!session) {
+      throw new ApiError(404, 'Quick Connect 会话不存在或已过期')
+    }
+    const demoApprove = qs.get('demoApprove')
+    if (demoApprove === '1' || demoApprove === 'true') {
+      session.Authenticated = true
+      session.AuthorizedUserId = auth?.userId || store.users[0]?.user.Id || 'user-demo-admin'
+    }
+    const { AuthorizedUserId: _ignored, ...pub } = session
+    return pub as T
+  }
+
+  if (pathname === '/emby/QuickConnect/Authorize' && method === 'POST') {
+    const body = parseJsonBody(options)
+    const code = String(
+      qs.get('code') || qs.get('Code') || body.Code || body.code || '',
+    ).trim()
+    if (!code) {
+      throw new ApiError(400, '请输入 6 位 Quick Connect 授权码')
+    }
+    let matched: DemoQuickConnectSession | undefined
+    for (const session of demoQuickConnectSessions.values()) {
+      if (session.Code === code) {
+        matched = session
+        break
+      }
+    }
+    if (matched) {
+      matched.Authenticated = true
+      matched.AuthorizedUserId = auth?.userId || store.users[0]?.user.Id || 'user-demo-admin'
+      pushActivity(
+        `已通过 Quick Connect 授权新设备登录（授权码 ${code}）`,
+        'QuickConnectAuthorized',
+        undefined,
+        auth?.userId,
+      )
+      return true as T
+    }
+    if (code === '123456') {
+      pushActivity(
+        '已通过 Quick Connect 授权演示设备登录（授权码 123456）',
+        'QuickConnectAuthorized',
+        undefined,
+        auth?.userId,
+      )
+      return true as T
+    }
+    throw new ApiError(404, '授权码无效或已过期，请核对后重试')
+  }
+
+  if (pathname === '/emby/Users/AuthenticateWithQuickConnect' && method === 'POST') {
+    const body = parseJsonBody(options)
+    const secret = String(body.Secret || body.secret || '').trim()
+    const session = demoQuickConnectSessions.get(secret)
+    if (!session || !session.Authenticated) {
+      throw new ApiError(401, 'Quick Connect 尚未完成授权或已过期')
+    }
+    demoQuickConnectSessions.delete(secret)
+    const rec =
+      store.users.find((u) => u.user.Id === session.AuthorizedUserId) ||
+      store.users.find((u) => u.user.Policy?.IsAdministrator) ||
+      store.users[0]
+    if (!rec) {
+      throw new ApiError(401, 'Demo 用户不存在')
+    }
+    const now = new Date().toISOString()
+    rec.user.LastLoginDate = now
+    rec.user.LastActivityDate = now
+    const token = `demo_tok_qc_${rec.user.Id}_${Date.now().toString(36)}`
+    pushActivity(
+      `${rec.user.Name} 通过 Quick Connect 登录了 Ambra Serverless Demo`,
+      'AuthenticationSucceeded',
+      'Quick Connect 设备授权',
+      rec.user.Id,
+    )
+    const result: AuthenticationResult = {
+      User: { ...rec.user, Policy: { ...rec.user.Policy } },
+      AccessToken: token,
+      ServerId: DEMO_SERVER_ID,
+      SessionInfo: {
+        Id: `sess-qc-${rec.user.Id}`,
+        DeviceId: session.DeviceId || 'dev-demo-web-01',
+      },
+    }
+    return result as T
   }
 
   // ==================== 15. 单用户查询/删除（放在更具体路由之后） ====================

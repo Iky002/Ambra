@@ -156,6 +156,19 @@ func (s *Service) AuthenticateByName(ctx context.Context, username, password, le
 		return nil, ErrInvalidCredentials
 	}
 
+	return s.IssueSessionForUser(ctx, u, client)
+}
+
+// IssueSessionForUser issues a new access token and session for an already-authenticated user
+// (used by password login and QuickConnect).
+func (s *Service) IssueSessionForUser(ctx context.Context, u *sqlite.UserRecord, client ClientInfo) (*dto.AuthenticationResult, error) {
+	if u == nil {
+		return nil, ErrUserNotFound
+	}
+	if u.IsDisabled || u.Policy.IsDisabled {
+		return nil, ErrUserDisabled
+	}
+
 	token, err := GenerateToken()
 	if err != nil {
 		return nil, fmt.Errorf("generate token: %w", err)

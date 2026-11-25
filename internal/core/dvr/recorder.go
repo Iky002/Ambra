@@ -184,7 +184,12 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 		entry.state.Error = err.Error()
 		close(entry.done)
 		r.entries[job.TimerID] = entry
+		failedState := entry.state
+		onFinished := r.onFinished
 		r.mu.Unlock()
+		if onFinished != nil {
+			onFinished(context.Background(), failedState)
+		}
 		return nil, fmt.Errorf("dvr: start ffmpeg: %w", err)
 	}
 

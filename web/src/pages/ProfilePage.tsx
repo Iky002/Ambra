@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import {
+  AlertCircle,
   Camera,
   CheckCircle2,
   KeyRound,
   Loader2,
+  QrCode,
   ShieldCheck,
   Sliders,
   Trash2,
@@ -51,6 +53,13 @@ export function ProfilePage() {
   const [currentPw, setCurrentPw] = useState('')
   const [newPw, setNewPw] = useState('')
   const [confirmPw, setConfirmPw] = useState('')
+
+  // Quick Connect 授权新设备
+  const [qcCode, setQcCode] = useState('')
+  const [qcFeedback, setQcFeedback] = useState<{
+    type: 'success' | 'error'
+    message: string
+  } | null>(null)
 
   // 本地播放偏好
   const [prefs, setPrefs] = useState<PlaybackPrefs>(() => loadPlaybackPrefs())
@@ -134,6 +143,35 @@ export function ProfilePage() {
       return
     }
     passwordMutation.mutate()
+  }
+
+  const quickConnectMutation = useMutation({
+    mutationFn: (code: string) => api.quickConnectAuthorize(code),
+    onSuccess: (ok) => {
+      if (ok === false) {
+        setQcFeedback({ type: 'error', message: '授权码无效或已过期，请核对后重试' })
+        return
+      }
+      setQcCode('')
+      setQcFeedback({ type: 'success', message: '已成功授权该设备登录' })
+    },
+    onError: (err) => {
+      setQcFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : '授权失败，请检查授权码是否正确或已过期',
+      })
+    },
+  })
+
+  const handleQuickConnectSubmit = (e: React.FormEvent) => {
+    e.preventDefault()
+    const trimmed = qcCode.trim()
+    if (!trimmed) {
+      setQcFeedback({ type: 'error', message: '请输入 6 位 Quick Connect 授权码' })
+      return
+    }
+    setQcFeedback(null)
+    quickConnectMutation.mutate(trimmed)
   }
 
   const handlePrefsChange = (patch: Partial<PlaybackPrefs>) => {
@@ -379,6 +417,69 @@ export function ProfilePage() {
           </div>
         </section>
       </div>
+
+      {/* Quick Connect 授权新设备 */}
+      <section className="rounded-2xl border border-white/10 bg-zinc-950/70 p-6 backdrop-blur-md">
+        <div className="mb-4 flex items-center gap-2">
+          <QrCode className="h-4 w-4 text-amber-400" />
+          <h2 className="text-base font-semibold text-white">Quick Connect 授权新设备</h2>
+        </div>
+        <p className="mb-4 text-xs text-zinc-400">
+          在电视、移动端或其他浏览器登录界面点击「Quick Connect 授权码登录」，将屏幕上显示的 6
+          位授权码输入下方即可免密授权登录。
+        </p>
+
+        <form onSubmit={handleQuickConnectSubmit} className="space-y-3.5">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+            <label className="block flex-1 space-y-1.5">
+              <span className="text-xs font-medium text-zinc-300">6 位设备授权码</span>
+              <input
+                type="text"
+                inputMode="numeric"
+                maxLength={12}
+                value={qcCode}
+                onChange={(e) => {
+                  setQcCode(e.target.value)
+                  if (qcFeedback) setQcFeedback(null)
+                }}
+                placeholder="例如：123456"
+                className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5 font-mono text-sm tracking-[0.25em] text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
+              />
+            </label>
+
+            <button
+              type="submit"
+              disabled={quickConnectMutation.isPending}
+              className="inline-flex items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 py-2.5 text-sm font-semibold text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-50 sm:shrink-0"
+            >
+              {quickConnectMutation.isPending ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <CheckCircle2 className="h-4 w-4" />
+              )}
+              <span>确认授权</span>
+            </button>
+          </div>
+
+          {qcFeedback && (
+            <div
+              role="status"
+              className={`flex items-start gap-2 rounded-xl border px-3.5 py-2.5 text-xs ${
+                qcFeedback.type === 'success'
+                  ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                  : 'border-red-500/30 bg-red-500/10 text-red-300'
+              }`}
+            >
+              {qcFeedback.type === 'success' ? (
+                <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
+              ) : (
+                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+              )}
+              <span>{qcFeedback.message}</span>
+            </div>
+          )}
+        </form>
+      </section>
     </div>
   )
 }

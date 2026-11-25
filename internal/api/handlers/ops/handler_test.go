@@ -458,3 +458,50 @@ func TestOpenAPIGenericUIPartiesAndConnect(t *testing.T) {
 		t.Fatalf("expected 200 on query ConnectUserId, got %d", r.Code)
 	}
 }
+
+func TestWebhooksSSRFHardening(t *testing.T) {
+	_, mux, _, _, _ := setupOpsTest(t)
+
+	blockedURLs := []string{
+		"http://169.254.169.254/latest/meta-data/",
+		"http://[fe80::1]/hook",
+		"http://0.0.0.0/hook",
+		"http://224.0.0.1/hook",
+		"file:///etc/passwd",
+		"ftp://example.com/hook",
+	}
+
+	for _, u := range blockedURLs {
+		t.Run("create_"+u, func(t *testing.T) {
+			rec := doReq(t, mux, http.MethodPost, "/Webhooks", map[string]any{
+				"Name":    "Evil Hook",
+				"Url":     u,
+				"Enabled": true,
+			})
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("POST /Webhooks with %q: got %d, want 400 (body=%s)", u, rec.Code, rec.Body.String())
+			}
+		})
+		t.Run("test_"+u, func(t *testing.T) {
+			rec := doReq(t, mux, http.MethodPost, "/Webhooks/Test", map[string]any{
+				"Url": u,
+			})
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("POST /Webhooks/Test with %q: got %d, want 400 (body=%s)", u, rec.Code, rec.Body.String())
+			}
+		})
+	}
+
+	// Redirect from allowed loopback server to cloud metadata must be blocked by SafeHTTPClient
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://169.254.169.254/latest/meta-data/", http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	rec := doReq(t, mux, http.MethodPost, "/Webhooks/Test", map[string]any{
+		"Url": redirector.URL,
+	})
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 when webhook redirects to metadata IP, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
