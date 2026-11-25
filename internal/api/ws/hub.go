@@ -12,6 +12,7 @@ import (
 	"github.com/coder/websocket/wsjson"
 	"github.com/go-chi/chi/v5"
 
+	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/core/auth"
 	"github.com/ambra-media/ambra/internal/core/session"
@@ -42,6 +43,7 @@ type clientConn struct {
 	userID      string
 	deviceID    string
 	isAPIKey    bool
+	isAdmin     bool
 	conn        *websocket.Conn
 	sendCh      chan Message
 	cancel      context.CancelFunc
@@ -121,18 +123,26 @@ func (h *Hub) subscribeEvents() {
 		if h.sessionMgr == nil {
 			return
 		}
-		sessions := h.sessionMgr.ListSessions()
-		msg := Message{
+		allSessions := h.sessionMgr.ListSessions()
+		adminMsg := Message{
 			MessageType: "Sessions",
-			Data:        sessions,
+			Data:        allSessions,
 		}
 		h.mu.RLock()
 		for _, c := range h.clients {
 			c.mu.RLock()
 			subscribed := c.subSessions
 			c.mu.RUnlock()
-			if subscribed {
-				c.trySend(msg)
+			if !subscribed {
+				continue
+			}
+			if c.isAdmin {
+				c.trySend(adminMsg)
+			} else {
+				c.trySend(Message{
+					MessageType: "Sessions",
+					Data:        filterSessionsForUser(allSessions, c.userID),
+				})
 			}
 		}
 		h.mu.RUnlock()
@@ -145,6 +155,9 @@ func (h *Hub) subscribeEvents() {
 		}
 		h.mu.RLock()
 		for _, c := range h.clients {
+			if !c.isAdmin {
+				continue
+			}
 			c.mu.RLock()
 			subscribed := c.subTasks
 			c.mu.RUnlock()
@@ -154,6 +167,20 @@ func (h *Hub) subscribeEvents() {
 		}
 		h.mu.RUnlock()
 	})
+}
+
+func filterSessionsForUser(sessions []dto.SessionInfo, userID string) []dto.SessionInfo {
+	norm := guid.Normalize(userID)
+	if norm == "" {
+		return []dto.SessionInfo{}
+	}
+	out := make([]dto.SessionInfo, 0, len(sessions))
+	for _, s := range sessions {
+		if guid.Normalize(s.UserId) == norm {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -172,9 +199,12 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deviceID := q.Get("deviceId")
-	if deviceID == "" {
-		deviceID = id.DeviceID
+	// Enforce token-bound DeviceID for user tokens so clients cannot spoof another device's channel.
+	deviceID := id.DeviceID
+	if id.IsAPIKey || deviceID == "" {
+		if qDev := strings.TrimSpace(q.Get("deviceId")); qDev != "" {
+			deviceID = qDev
+		}
 	}
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
@@ -188,8 +218,10 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	userID := ""
+	isAdmin := id.IsAPIKey
 	if id.User != nil {
 		userID = id.User.ID
+		isAdmin = isAdmin || id.User.IsAdmin || id.User.Policy.IsAdministrator
 	}
 
 	client := &clientConn{
@@ -197,6 +229,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		userID:   userID,
 		deviceID: deviceID,
 		isAPIKey: id.IsAPIKey,
+		isAdmin:  isAdmin,
 		conn:     conn,
 		sendCh:   make(chan Message, 64),
 		cancel:   cancel,
@@ -249,9 +282,13 @@ func (h *Hub) readLoop(ctx context.Context, client *clientConn) {
 			client.subSessions = true
 			client.mu.Unlock()
 			if h.sessionMgr != nil {
+				sessions := h.sessionMgr.ListSessions()
+				if !client.isAdmin {
+					sessions = filterSessionsForUser(sessions, client.userID)
+				}
 				client.trySend(Message{
 					MessageType: "Sessions",
-					Data:        h.sessionMgr.ListSessions(),
+					Data:        sessions,
 				})
 			}
 		case "SessionsStop":
@@ -259,6 +296,9 @@ func (h *Hub) readLoop(ctx context.Context, client *clientConn) {
 			client.subSessions = false
 			client.mu.Unlock()
 		case "ScheduledTasksInfoStart":
+			if !client.isAdmin {
+				continue
+			}
 			client.mu.Lock()
 			client.subTasks = true
 			client.mu.Unlock()
@@ -267,6 +307,9 @@ func (h *Hub) readLoop(ctx context.Context, client *clientConn) {
 			client.subTasks = false
 			client.mu.Unlock()
 		case "ActivityLogEntryStart":
+			if !client.isAdmin {
+				continue
+			}
 			client.mu.Lock()
 			client.subActivity = true
 			client.mu.Unlock()
