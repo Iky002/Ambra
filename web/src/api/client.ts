@@ -23,9 +23,12 @@ import type {
   LiveTvChannelInfo,
   LiveTvInfo,
   LiveTvListingProviderInfo,
+  LiveTvRecordingInfo,
+  LiveTvTimerInfo,
   LiveTvTunerHostInfo,
   MediaAttachmentInfo,
   NameIdPair,
+  ParentalRatingOption,
   PlaybackInfoResponse,
   PluginInfo,
   PublicSystemInfo,
@@ -49,6 +52,8 @@ import type {
   UserItemDataDto,
   UserPolicy,
   VirtualFolderInfo,
+  WebhookInfo,
+  WebhookTestResult,
 } from './types'
 
 const STORAGE_KEY = 'ambra_web_auth_v1'
@@ -1292,6 +1297,65 @@ export const api = {
       }>
     >(`/emby/LiveTv/Programs?${q.toString()}`)
   },
+
+  // ==================== v0.9.2 DVR, Webhooks, Parental & InstantMix APIs ====================
+
+  getLiveTvTimers: () => embyFetch<QueryResult<LiveTvTimerInfo>>('/emby/LiveTv/Timers'),
+
+  createLiveTvTimer: (timer: {
+    ChannelId: string
+    ChannelName?: string
+    ProgramId?: string
+    Name: string
+    Overview?: string
+    StartDate: string
+    EndDate: string
+    PrePaddingSeconds?: number
+    PostPaddingSeconds?: number
+  }) =>
+    embyFetch<LiveTvTimerInfo>('/emby/LiveTv/Timers', {
+      method: 'POST',
+      body: JSON.stringify(timer),
+    }),
+
+  deleteLiveTvTimer: (id: string) =>
+    embyFetch<void>(`/emby/LiveTv/Timers/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+
+  getLiveTvRecordings: () =>
+    embyFetch<QueryResult<LiveTvRecordingInfo>>('/emby/LiveTv/Recordings'),
+
+  deleteLiveTvRecording: (id: string) =>
+    embyFetch<void>(`/emby/LiveTv/Recordings/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+
+  getWebhooks: () => embyFetch<WebhookInfo[]>('/emby/Webhooks'),
+
+  saveWebhook: (webhook: Partial<WebhookInfo> & { Name: string; Url: string; Events: string[] }) =>
+    embyFetch<WebhookInfo>('/emby/Webhooks', {
+      method: 'POST',
+      body: JSON.stringify(webhook),
+    }),
+
+  deleteWebhook: (id: string) =>
+    embyFetch<void>(`/emby/Webhooks/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+
+  testWebhook: (payload: { Id?: string; Url?: string; Secret?: string; Name?: string }) =>
+    embyFetch<WebhookTestResult>('/emby/Webhooks/Test', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  getParentalRatings: () => embyFetch<ParentalRatingOption[]>('/emby/Localization/ParentalRatings'),
+
+  getInstantMix: (itemId: string, userId: string, limit = 50) =>
+    embyFetch<QueryResult<BaseItemDto>>(
+      `/emby/Items/${encodeURIComponent(itemId)}/InstantMix?UserId=${encodeURIComponent(userId)}&Limit=${limit}`,
+    ),
 }
 
 export function getLiveTvChannelStreamUrl(channelId: string): string {

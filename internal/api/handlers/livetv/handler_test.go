@@ -2,10 +2,12 @@ package livetv
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -700,5 +702,347 @@ func TestDueRecordingJobsAndDVRIntegration(t *testing.T) {
 	}
 	if _, err := os.Stat(outsideFile); err != nil {
 		t.Fatalf("expected outside file to remain untouched, stat err=%v", err)
+	}
+}
+
+func TestHLSPlaylistURIRewritingAndTargetSSRF(t *testing.T) {
+	_, mux, _, _ := setupLiveTVTest(t)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/hls/master.m3u8":
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			_, _ = w.Write([]byte("#EXTM3U\n" +
+				"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Eng\",URI=\"audio/eng.m3u8\"\n" +
+				"#EXT-X-STREAM-INF:BANDWIDTH=2000000\n" +
+				"sub/720p.m3u8\n"))
+		case "/hls/sub/720p.m3u8":
+			w.Header().Set("Content-Type", "application/x-mpegURL")
+			_, _ = w.Write([]byte("#EXTM3U\n" +
+				"#EXT-X-KEY:METHOD=AES-128,URI=\"../keys/enc.key\"\n" +
+				"#EXT-X-MAP:URI=\"init.mp4\"\n" +
+				"#EXTINF:6.0,\n" +
+				"seg0.ts\n" +
+				"#EXTINF:6.0,\n" +
+				"/cdn/seg1.ts\n"))
+		case "/hls/sub/seg0.ts":
+			w.Header().Set("Content-Type", "video/mp2t")
+			_, _ = w.Write([]byte("SEGMENT_0_BYTES"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer upstream.Close()
+
+	m3u := "#EXTM3U\n#EXTINF:-1 tvg-id=\"hls-ch\",HLS Channel\n" + upstream.URL + "/hls/master.m3u8\n"
+	if r := doJSON(t, mux, http.MethodPost, "/LiveTv/TunerHosts", map[string]any{
+		"Type":       "m3u",
+		"M3UContent": m3u,
+	}); r.Code != http.StatusOK {
+		t.Fatalf("seed tuner: %d %s", r.Code, r.Body.String())
+	}
+
+	var chRes dto.QueryResult[ChannelInfo]
+	_ = json.Unmarshal(doJSON(t, mux, http.MethodGet, "/LiveTv/Channels", nil).Body.Bytes(), &chRes)
+	chID := chRes.Items[0].Id
+
+	// 1. Request master playlist with api_key query param
+	req := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?api_key=tok-query", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("master m3u8 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	wantAudio := `URI="/emby/LiveTv/Channels/` + chID + `/Stream?target=` + url.QueryEscape(upstream.URL+"/hls/audio/eng.m3u8") + `&api_key=tok-query"`
+	wantSub := "/emby/LiveTv/Channels/" + chID + "/Stream?target=" + url.QueryEscape(upstream.URL+"/hls/sub/720p.m3u8") + "&api_key=tok-query"
+	if !strings.Contains(body, wantAudio) {
+		t.Fatalf("expected rewritten EXT-X-MEDIA URI %q in:\n%s", wantAudio, body)
+	}
+	if !strings.Contains(body, wantSub) {
+		t.Fatalf("expected rewritten sub-playlist URI %q in:\n%s", wantSub, body)
+	}
+
+	// 2. Request sub-playlist via target query param + X-Emby-Token header
+	subReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?target="+url.QueryEscape(upstream.URL+"/hls/sub/720p.m3u8"), nil)
+	subReq.Header.Set("X-Emby-Token", "tok-header")
+	subRec := httptest.NewRecorder()
+	mux.ServeHTTP(subRec, subReq)
+	if subRec.Code != http.StatusOK {
+		t.Fatalf("sub m3u8 status=%d body=%s", subRec.Code, subRec.Body.String())
+	}
+	subBody := subRec.Body.String()
+	wantKey := `URI="/emby/LiveTv/Channels/` + chID + `/Stream?target=` + url.QueryEscape(upstream.URL+"/hls/keys/enc.key") + `&api_key=tok-header"`
+	wantMap := `URI="/emby/LiveTv/Channels/` + chID + `/Stream?target=` + url.QueryEscape(upstream.URL+"/hls/sub/init.mp4") + `&api_key=tok-header"`
+	wantSeg0 := "/emby/LiveTv/Channels/" + chID + "/Stream?target=" + url.QueryEscape(upstream.URL+"/hls/sub/seg0.ts") + "&api_key=tok-header"
+	wantSeg1 := "/emby/LiveTv/Channels/" + chID + "/Stream?target=" + url.QueryEscape(upstream.URL+"/cdn/seg1.ts") + "&api_key=tok-header"
+	for _, want := range []string{wantKey, wantMap, wantSeg0, wantSeg1} {
+		if !strings.Contains(subBody, want) {
+			t.Fatalf("expected %q in rewritten sub-playlist:\n%s", want, subBody)
+		}
+	}
+
+	// 3. Request with Authorization header token
+	authReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream", nil)
+	authReq.Header.Set("Authorization", `MediaBrowser Client="Test", Token="tok-auth"`)
+	authRec := httptest.NewRecorder()
+	mux.ServeHTTP(authRec, authReq)
+	if authRec.Code != http.StatusOK || !strings.Contains(authRec.Body.String(), "&api_key=tok-auth") {
+		t.Fatalf("expected Authorization token preserved, got %d:\n%s", authRec.Code, authRec.Body.String())
+	}
+
+	// 4. Proxy actual TS segment via target param
+	segReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?target="+url.QueryEscape(upstream.URL+"/hls/sub/seg0.ts"), nil)
+	segRec := httptest.NewRecorder()
+	mux.ServeHTTP(segRec, segReq)
+	if segRec.Code != http.StatusOK || segRec.Body.String() != "SEGMENT_0_BYTES" {
+		t.Fatalf("expected segment bytes, got %d %q", segRec.Code, segRec.Body.String())
+	}
+
+	// 5. SSRF protection on target param
+	for _, unsafeTarget := range []string{
+		"http://169.254.169.254/latest/meta-data/",
+		"file:///etc/passwd",
+	} {
+		badReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?target="+url.QueryEscape(unsafeTarget), nil)
+		badRec := httptest.NewRecorder()
+		mux.ServeHTTP(badRec, badReq)
+		if badRec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for unsafe target %q, got %d body=%s", unsafeTarget, badRec.Code, badRec.Body.String())
+		}
+	}
+
+	// 6. Unknown channel ID with valid target must still return 404
+	notFoundReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/missing/Stream?target="+url.QueryEscape(upstream.URL+"/hls/sub/seg0.ts"), nil)
+	notFoundRec := httptest.NewRecorder()
+	mux.ServeHTTP(notFoundRec, notFoundReq)
+	if notFoundRec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown channel with target, got %d", notFoundRec.Code)
+	}
+}
+
+func TestDVRCompletionCallbackUpdatesTimerAndCreatesRecording(t *testing.T) {
+	h, mux, st, cfg := setupLiveTVTest(t)
+
+	rec := dvr.NewRecorder(dvr.Options{
+		DataDir:    cfg.DataDir,
+		FFmpegPath: "/bin/sh",
+		ArgsBuilder: func(job dvr.RecordingJob, outFile string) []string {
+			if job.TimerID == "fail-timer" {
+				return []string{"-c", "exit 1"}
+			}
+			return []string{"-c", "printf 'recorded-bytes' > \"$1\"", "--", outFile}
+		},
+	})
+	defer func() { _ = rec.Close() }()
+	h.SetRecorder(rec)
+	rec.SetOnFinished(h.OnRecordingFinished)
+
+	// Create two timers: one will succeed, one will fail
+	r1 := doJSON(t, mux, http.MethodPost, "/LiveTv/Timers", map[string]any{
+		"Id":          "ok-timer",
+		"Name":        "Evening News",
+		"ChannelId":   "ch-1",
+		"ChannelName": "CCTV 1",
+		"Status":      "InProgress",
+	})
+	if r1.Code != http.StatusOK {
+		t.Fatalf("create ok-timer: %d", r1.Code)
+	}
+	r2 := doJSON(t, mux, http.MethodPost, "/LiveTv/Timers", map[string]any{
+		"Id":        "fail-timer",
+		"Name":      "Broken Stream",
+		"ChannelId": "ch-2",
+		"Status":    "InProgress",
+	})
+	if r2.Code != http.StatusOK {
+		t.Fatalf("create fail-timer: %d", r2.Code)
+	}
+
+	if _, err := rec.StartRecording(context.Background(), dvr.RecordingJob{
+		TimerID:     "ok-timer",
+		ChannelName: "CCTV 1",
+		ProgramName: "Evening News",
+		StreamURL:   "http://127.0.0.1:9999/ok.ts",
+	}); err != nil {
+		t.Fatalf("start ok-timer: %v", err)
+	}
+	if _, err := rec.StartRecording(context.Background(), dvr.RecordingJob{
+		TimerID:     "fail-timer",
+		ChannelName: "CCTV 2",
+		ProgramName: "Broken Stream",
+		StreamURL:   "http://127.0.0.1:9999/fail.ts",
+	}); err != nil {
+		t.Fatalf("start fail-timer: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		h.mu.RLock()
+		okDone := false
+		failDone := false
+		for _, tm := range h.state.Timers {
+			if tm.Id == "ok-timer" && tm.Status == "Completed" {
+				okDone = true
+			}
+			if tm.Id == "fail-timer" && tm.Status == "Failed" {
+				failDone = true
+			}
+		}
+		recCount := len(h.state.Recordings)
+		h.mu.RUnlock()
+		if okDone && failDone && recCount == 1 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	// Reload from SQLite to confirm persistence
+	reloaded := New(st, cfg)
+	if len(reloaded.state.Recordings) != 1 {
+		t.Fatalf("expected 1 persisted recording, got %d", len(reloaded.state.Recordings))
+	}
+	gotRec := reloaded.state.Recordings[0]
+	if gotRec.ChannelId != "ch-1" || gotRec.Name != "Evening News" || gotRec.Status != "Completed" || gotRec.Path == "" {
+		t.Fatalf("unexpected recording info: %+v", gotRec)
+	}
+	if _, err := os.Stat(gotRec.Path); err != nil {
+		t.Fatalf("expected recorded file at %q: %v", gotRec.Path, err)
+	}
+
+	statuses := map[string]string{}
+	for _, tm := range reloaded.state.Timers {
+		statuses[tm.Id] = tm.Status
+	}
+	if statuses["ok-timer"] != "Completed" || statuses["fail-timer"] != "Failed" {
+		t.Fatalf("unexpected timer statuses: %+v", statuses)
+	}
+}
+
+func TestXMLTVParserAndListingProviderImport(t *testing.T) {
+	h, mux, _, cfg := setupLiveTVTest(t)
+
+	// Seed 3 channels: one matched by TvgId, one matched by display-name, one unmatched
+	m3u := "#EXTM3U\n" +
+		"#EXTINF:-1 tvg-id=\"cctv1.cn\",CCTV 1\nhttp://tv/1.m3u8\n" +
+		"#EXTINF:-1 tvg-id=\"other\",HBO HD\nhttp://tv/2.m3u8\n" +
+		"#EXTINF:-1 tvg-id=\"keep-me\",Unmatched TV\nhttp://tv/3.m3u8\n"
+	if r := doJSON(t, mux, http.MethodPost, "/LiveTv/TunerHosts", map[string]any{
+		"Type":       "m3u",
+		"M3UContent": m3u,
+	}); r.Code != http.StatusOK {
+		t.Fatalf("seed tuner: %d", r.Code)
+	}
+
+	var chRes dto.QueryResult[ChannelInfo]
+	_ = json.Unmarshal(doJSON(t, mux, http.MethodGet, "/LiveTv/Channels", nil).Body.Bytes(), &chRes)
+	chByName := make(map[string]ChannelInfo, len(chRes.Items))
+	for _, ch := range chRes.Items {
+		chByName[ch.Name] = ch
+	}
+
+	xmltvDoc := `<?xml version="1.0" encoding="UTF-8"?>
+<tv>
+  <channel id="cctv1.cn">
+    <display-name>CCTV 1</display-name>
+  </channel>
+  <channel id="hbo-xml-id">
+    <display-name>HBO HD</display-name>
+  </channel>
+  <programme start="20260501200000 +0800" stop="20260501210000 +0800" channel="cctv1.cn">
+    <title>Xinwen Lianbo</title>
+    <desc>Evening news broadcast</desc>
+    <category>News</category>
+  </programme>
+  <programme start="20260501140000" stop="20260501160000" channel="hbo-xml-id">
+    <title>Inception</title>
+    <desc>Sci-fi thriller</desc>
+    <category>Movie</category>
+  </programme>
+</tv>`
+
+	// 1. Test gzip-compressed .xml.gz file inside cfg.DataDir
+	gzPath := filepath.Join(cfg.DataDir, "guide.xml.gz")
+	var gzBuf bytes.Buffer
+	gzw := gzip.NewWriter(&gzBuf)
+	_, _ = gzw.Write([]byte(xmltvDoc))
+	_ = gzw.Close()
+	if err := os.WriteFile(gzPath, gzBuf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := doJSON(t, mux, http.MethodPost, "/LiveTv/ListingProviders", map[string]any{
+		"Type": "xmltv",
+		"Path": gzPath,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save xml.gz listing provider: %d %s", rec.Code, rec.Body.String())
+	}
+
+	var progRes dto.QueryResult[ProgramInfo]
+	_ = json.Unmarshal(doJSON(t, mux, http.MethodGet, "/LiveTv/Programs", nil).Body.Bytes(), &progRes)
+	if progRes.TotalRecordCount != 3 {
+		t.Fatalf("expected 3 programs (2 XMLTV + 1 unmatched placeholder), got %d: %+v", progRes.TotalRecordCount, progRes.Items)
+	}
+
+	foundNews, foundMovie, foundUnmatched := false, false, false
+	for _, p := range progRes.Items {
+		switch p.Name {
+		case "Xinwen Lianbo":
+			foundNews = true
+			if p.ChannelId != chByName["CCTV 1"].Id || p.Overview != "Evening news broadcast" {
+				t.Fatalf("unexpected news program: %+v", p)
+			}
+			wantStart := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+			if !p.StartDate.Equal(wantStart) {
+				t.Fatalf("expected UTC start %v, got %v", wantStart, p.StartDate)
+			}
+		case "Inception":
+			foundMovie = true
+			if p.ChannelId != chByName["HBO HD"].Id || !p.IsMovie {
+				t.Fatalf("unexpected movie program: %+v", p)
+			}
+		case "Unmatched TV Live":
+			foundUnmatched = true
+		}
+	}
+	if !foundNews || !foundMovie || !foundUnmatched {
+		t.Fatalf("missing expected programs: news=%v movie=%v unmatched=%v", foundNews, foundMovie, foundUnmatched)
+	}
+
+	// 2. Outside DataDir XML file is blocked gracefully (provider saves 200, existing programs kept)
+	outsideXML := filepath.Join(t.TempDir(), "evil.xml")
+	_ = os.WriteFile(outsideXML, []byte(`<tv><programme start="20260501100000" stop="20260501110000" channel="cctv1.cn"><title>Evil</title></programme></tv>`), 0o600)
+	if r := doJSON(t, mux, http.MethodPost, "/LiveTv/ListingProviders", map[string]any{
+		"Type": "xmltv",
+		"Path": outsideXML,
+	}); r.Code != http.StatusOK {
+		t.Fatalf("expected graceful 200 on blocked local xmltv, got %d", r.Code)
+	}
+	var progAfter dto.QueryResult[ProgramInfo]
+	_ = json.Unmarshal(doJSON(t, mux, http.MethodGet, "/LiveTv/Programs", nil).Body.Bytes(), &progAfter)
+	for _, p := range progAfter.Items {
+		if p.Name == "Evil" {
+			t.Fatalf("outside DataDir xmltv should not have been imported")
+		}
+	}
+
+	// 3. HTTP XMLTV feed with custom HTTP client
+	epgSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`<tv><programme start="20260502100000 +0000" stop="20260502110000 +0000" channel="cctv1.cn"><title>Morning Show</title><category>Series</category></programme></tv>`))
+	}))
+	defer epgSrv.Close()
+	h.SetHTTPClient(epgSrv.Client())
+
+	if r := doJSON(t, mux, http.MethodPost, "/LiveTv/ListingProviders", map[string]any{
+		"Type": "xmltv",
+		"Path": epgSrv.URL + "/epg.xml",
+	}); r.Code != http.StatusOK {
+		t.Fatalf("save HTTP xmltv listing provider: %d", r.Code)
+	}
+	var progHTTP dto.QueryResult[ProgramInfo]
+	_ = json.Unmarshal(doJSON(t, mux, http.MethodGet, "/LiveTv/Programs?ChannelIds="+chByName["CCTV 1"].Id, nil).Body.Bytes(), &progHTTP)
+	if progHTTP.TotalRecordCount != 1 || progHTTP.Items[0].Name != "Morning Show" || !progHTTP.Items[0].IsSeries {
+		t.Fatalf("expected HTTP XMLTV to replace CCTV 1 program, got %+v", progHTTP.Items)
 	}
 }

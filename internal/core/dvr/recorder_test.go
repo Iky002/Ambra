@@ -272,3 +272,56 @@ func TestSchedulerLoop(t *testing.T) {
 		t.Fatalf("expected at least 2 polls, got %d", calls.Load())
 	}
 }
+
+func TestSetOnFinishedCallback(t *testing.T) {
+	tmpDir := t.TempDir()
+	rec := NewRecorder(Options{
+		DataDir:    tmpDir,
+		FFmpegPath: "/bin/sh",
+		ArgsBuilder: func(job RecordingJob, outFile string) []string {
+			switch job.TimerID {
+			case "cb-ok":
+				return []string{"-c", "printf 'ok' > \"$1\"", "--", outFile}
+			case "cb-fail":
+				return []string{"-c", "exit 3"}
+			default:
+				return []string{"-c", "sleep 10"}
+			}
+		},
+	})
+	defer rec.Close()
+
+	finishedCh := make(chan RecordingState, 3)
+	rec.SetOnFinished(func(_ context.Context, st RecordingState) {
+		// Calling GetRecording inside callback verifies r.mu was released before invoking callback.
+		if _, ok := rec.GetRecording(st.Job.TimerID); !ok {
+			t.Errorf("GetRecording(%q) returned false inside OnFinished", st.Job.TimerID)
+		}
+		finishedCh <- st
+	})
+
+	for _, id := range []string{"cb-ok", "cb-fail", "cb-cancel"} {
+		if _, err := rec.StartRecording(context.Background(), RecordingJob{
+			TimerID:   id,
+			StreamURL: "http://live.local/" + id,
+		}); err != nil {
+			t.Fatalf("StartRecording %s: %v", id, err)
+		}
+	}
+	if err := rec.CancelRecording("cb-cancel"); err != nil {
+		t.Fatalf("CancelRecording: %v", err)
+	}
+
+	got := make(map[string]Status, 3)
+	for i := 0; i < 3; i++ {
+		select {
+		case st := <-finishedCh:
+			got[st.Job.TimerID] = st.Status
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for OnFinished callbacks; got %+v", got)
+		}
+	}
+	if got["cb-ok"] != StatusCompleted || got["cb-fail"] != StatusFailed || got["cb-cancel"] != StatusCancelled {
+		t.Fatalf("unexpected OnFinished statuses: %+v", got)
+	}
+}

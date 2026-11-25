@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
@@ -416,5 +417,153 @@ EOF
 	}
 	if trailers[0].MediaSources[0].MediaStreams[0].Codec != "hevc" {
 		t.Fatalf("expected probed video codec hevc, got %q", trailers[0].MediaSources[0].MediaStreams[0].Codec)
+	}
+}
+
+func TestScanPathSingleExtraReindexesParent(t *testing.T) {
+	tmp := t.TempDir()
+	st, err := sqlite.Open(filepath.Join(tmp, "scanpath_extra_parent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	repo := sqlite.NewLibraryRepo(st)
+	ctx := context.Background()
+
+	// Set up Movie library with an already-scanned Movie and no extras yet.
+	movieRoot := filepath.Join(tmp, "movies")
+	movieDir := filepath.Join(movieRoot, "Interstellar (2014)")
+	if err := os.MkdirAll(movieDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(movieDir, "Interstellar (2014).mkv"), []byte("movie-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set up TV library with an already-scanned Series and no extras yet.
+	tvRoot := filepath.Join(tmp, "tv")
+	seriesDir := filepath.Join(tvRoot, "Severance (2022)")
+	seasonDir := filepath.Join(seriesDir, "Season 01")
+	if err := os.MkdirAll(seasonDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(seasonDir, "Severance S01E01.mkv"), []byte("ep-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	movLib, err := repo.CreateLibrary(ctx, "Movies", "movies", []string{movieRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tvLib, err := repo.CreateLibrary(ctx, "TV", "tvshows", []string{tvRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bus := eventbus.New()
+	sc := New(repo, plugins.NewRegistry(), bus, config.Default(tmp))
+	sc.SetProber(NewDisabledProber())
+
+	if _, err := sc.ScanLibrary(ctx, movLib.ID); err != nil {
+		t.Fatalf("ScanLibrary movies: %v", err)
+	}
+	if _, err := sc.ScanLibrary(ctx, tvLib.ID); err != nil {
+		t.Fatalf("ScanLibrary tv: %v", err)
+	}
+
+	movItems, movTotal, err := repo.QueryItems(ctx, sqlite.ItemFilter{ServerID: "srv1", LibraryID: movLib.ID})
+	if err != nil || movTotal != 1 || len(movItems) != 1 {
+		t.Fatalf("expected 1 movie before trailer drop, got total=%d err=%v", movTotal, err)
+	}
+	movieID := movItems[0].Id
+
+	seriesItems, serTotal, err := repo.QueryItems(ctx, sqlite.ItemFilter{
+		ServerID:         "srv1",
+		LibraryID:        tvLib.ID,
+		IncludeItemTypes: []string{"Series"},
+	})
+	if err != nil || serTotal != 1 || len(seriesItems) != 1 {
+		t.Fatalf("expected 1 series before theme drop, got total=%d err=%v", serTotal, err)
+	}
+	seriesID := seriesItems[0].Id
+
+	var (
+		evMu   sync.Mutex
+		events []eventbus.Event
+	)
+	bus.Subscribe(eventbus.EventLibraryChanged, func(_ context.Context, ev eventbus.Event) {
+		evMu.Lock()
+		events = append(events, ev)
+		evMu.Unlock()
+	})
+
+	// Drop a new trailers/trailer.mp4 into the already-scanned Movie folder and invoke ScanPath.
+	trailerDir := filepath.Join(movieDir, "trailers")
+	if err := os.MkdirAll(trailerDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	trailerPath := filepath.Join(trailerDir, "trailer.mp4")
+	if err := os.WriteFile(trailerPath, []byte("trailer-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := sc.ScanPath(ctx, movLib.ID, trailerPath)
+	if err != nil {
+		t.Fatalf("ScanPath(trailer): %v", err)
+	}
+	if stats.ItemsAdded != 0 {
+		t.Fatalf("expected ItemsAdded=0 for extra file, got %d", stats.ItemsAdded)
+	}
+	if stats.ItemsUpdated != 1 {
+		t.Fatalf("expected ItemsUpdated=1 for parent re-index, got %d", stats.ItemsUpdated)
+	}
+
+	// Poster wall must still contain ONLY the 1 Movie (no standalone Movie created).
+	movItemsAfter, movTotalAfter, err := repo.QueryItems(ctx, sqlite.ItemFilter{ServerID: "srv1", LibraryID: movLib.ID})
+	if err != nil || movTotalAfter != 1 || len(movItemsAfter) != 1 || movItemsAfter[0].Id != movieID {
+		t.Fatalf("expected still 1 Movie on poster wall, got total=%d items=%+v err=%v", movTotalAfter, movItemsAfter, err)
+	}
+
+	// Trailer must be attached to the existing Movie as a playable Trailer extra.
+	trailers, err := repo.GetItemExtras(ctx, "srv1", "", movieID, []string{"Trailer"})
+	if err != nil || len(trailers) != 1 || len(trailers[0].MediaSources) != 1 {
+		t.Fatalf("expected 1 playable Trailer extra attached to Movie, got %+v err=%v", trailers, err)
+	}
+	movieDetail, err := repo.GetItemByID(ctx, "srv1", "", movieID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if movieDetail.LocalTrailerCount != 1 {
+		t.Fatalf("expected LocalTrailerCount=1, got %d", movieDetail.LocalTrailerCount)
+	}
+
+	// Drop a new theme-music/theme.mp3 into the already-scanned Series folder and invoke ScanPath.
+	themeDir := filepath.Join(seriesDir, "theme-music")
+	if err := os.MkdirAll(themeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	themePath := filepath.Join(themeDir, "theme.mp3")
+	if err := os.WriteFile(themePath, []byte("theme-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tvStats, err := sc.ScanPath(ctx, tvLib.ID, themePath)
+	if err != nil {
+		t.Fatalf("ScanPath(theme): %v", err)
+	}
+	if tvStats.ItemsAdded != 0 || tvStats.ItemsUpdated != 1 {
+		t.Fatalf("expected ItemsAdded=0 ItemsUpdated=1 for series extra, got %+v", tvStats)
+	}
+	themes, err := repo.GetItemExtras(ctx, "srv1", "", seriesID, []string{"ThemeSong"})
+	if err != nil || len(themes) != 1 || len(themes[0].MediaSources) != 1 {
+		t.Fatalf("expected 1 playable ThemeSong extra attached to Series, got %+v err=%v", themes, err)
+	}
+
+	// Verify LibraryChanged discovery events were published for both re-indexes.
+	evMu.Lock()
+	gotEvents := len(events)
+	evMu.Unlock()
+	if gotEvents < 2 {
+		t.Fatalf("expected at least 2 EventLibraryChanged events, got %d", gotEvents)
 	}
 }

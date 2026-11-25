@@ -66,7 +66,10 @@ export function AddToCollectionModal({
   })
 
   const invalidateCollections = async () => {
-    await queryClient.invalidateQueries({ queryKey: ['collections'] })
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['collections'] }),
+      queryClient.invalidateQueries({ queryKey: ['collectionItems'] }),
+    ])
   }
 
   const addExistingMutation = useMutation({

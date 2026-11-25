@@ -11,7 +11,10 @@ import type {
   LiveTvChannelInfo,
   LiveTvInfo,
   LiveTvListingProviderInfo,
+  LiveTvRecordingInfo,
+  LiveTvTimerInfo,
   LiveTvTunerHostInfo,
+  ParentalRatingOption,
   PlaybackInfoResponse,
   PublicSystemInfo,
   QueryResult,
@@ -30,6 +33,8 @@ import type {
   UserItemDataDto,
   UserPolicy,
   VirtualFolderInfo,
+  WebhookInfo,
+  WebhookTestResult,
 } from '../api/types'
 import { DEMO_VIDEO_DATA_URL, makeDemoAudioDataUrl } from './demoMedia'
 import { createInitialDemoState, DEMO_SERVER_ID, type DemoState } from './mockData'
@@ -228,6 +233,70 @@ let demoTunerHosts: LiveTvTunerHostInfo[] = createInitialTunerHosts()
 let demoListingProviders: LiveTvListingProviderInfo[] = createInitialListingProviders()
 let demoLiveTvChannels: LiveTvChannelInfo[] = createInitialLiveTvChannels()
 
+function createInitialLiveTvTimers(): LiveTvTimerInfo[] {
+  const start = new Date(Date.now() + 3600_000)
+  const end = new Date(Date.now() + 7200_000)
+  return [
+    {
+      Id: 'timer-demo-01',
+      ChannelId: 'ch-demo-02',
+      ChannelName: 'CCTV-6 电影频道',
+      ProgramId: 'prog-ch-demo-02-1',
+      Name: '佳片有约：经典科幻之夜',
+      Overview: '定时录制 CCTV-6 电影频道晚间精选影片',
+      StartDate: start.toISOString(),
+      EndDate: end.toISOString(),
+      Status: 'New',
+      PrePaddingSeconds: 120,
+      PostPaddingSeconds: 300,
+    },
+  ]
+}
+
+function createInitialLiveTvRecordings(): LiveTvRecordingInfo[] {
+  const start = new Date(Date.now() - 26 * 3600_000)
+  const end = new Date(Date.now() - 24 * 3600_000)
+  return [
+    {
+      Id: 'rec-demo-01',
+      ChannelId: 'ch-demo-01',
+      ChannelName: 'CCTV-1 综合高清',
+      Name: '新闻联播（录制回看）',
+      Overview: '已完成录制的示范电视节目',
+      StartDate: start.toISOString(),
+      EndDate: end.toISOString(),
+      Status: 'Completed',
+      Path: '/data/recordings/cctv1-news-demo.ts',
+    },
+  ]
+}
+
+function createInitialDemoWebhooks(): WebhookInfo[] {
+  return [
+    {
+      Id: 'wh-demo-01',
+      Name: 'Discord 媒体入库通知',
+      Url: 'https://discord.com/api/webhooks/demo/ambra-notify',
+      Secret: 'demo-hmac-secret',
+      Events: ['LibraryChanged', 'PlaybackStart'],
+      Enabled: true,
+      CreatedAt: Math.floor(Date.now() / 1000) - 86400,
+    },
+  ]
+}
+
+let demoLiveTvTimers: LiveTvTimerInfo[] = createInitialLiveTvTimers()
+let demoLiveTvRecordings: LiveTvRecordingInfo[] = createInitialLiveTvRecordings()
+let demoWebhooks: WebhookInfo[] = createInitialDemoWebhooks()
+
+const DEMO_PARENTAL_RATINGS: ParentalRatingOption[] = [
+  { Name: 'G', Value: 1 },
+  { Name: 'PG', Value: 5 },
+  { Name: 'PG-13', Value: 7 },
+  { Name: 'R', Value: 9 },
+  { Name: 'NC-17', Value: 10 },
+]
+
 function createInitialDemoBackups(): BackupFileInfo[] {
   return [
     {
@@ -317,6 +386,9 @@ export function resetDemoStore(): void {
   demoTunerHosts = createInitialTunerHosts()
   demoListingProviders = createInitialListingProviders()
   demoLiveTvChannels = createInitialLiveTvChannels()
+  demoLiveTvTimers = createInitialLiveTvTimers()
+  demoLiveTvRecordings = createInitialLiveTvRecordings()
+  demoWebhooks = createInitialDemoWebhooks()
   demoBackups = createInitialDemoBackups()
 }
 
@@ -788,7 +860,14 @@ export async function demoFetch<T>(
     const rec = store.users.find((u) => u.user.Id === userId)
     if (!rec) throw new ApiError(404, '用户不存在')
     const patch = parseJsonBody(options) as UserPolicy
-    rec.user.Policy = { ...rec.user.Policy, ...patch }
+    const nextPolicy: UserPolicy = { ...rec.user.Policy, ...patch }
+    if (
+      patch.MaxParentalRating === null ||
+      (patch.MaxParentalRating === undefined && Array.isArray(patch.BlockedTags))
+    ) {
+      delete nextPolicy.MaxParentalRating
+    }
+    rec.user.Policy = nextPolicy
     pushActivity(`已更新用户「${rec.user.Name}」的权限策略`, 'UserPolicyUpdated')
     return undefined as T
   }
@@ -2526,6 +2605,163 @@ export async function demoFetch<T>(
     }
   }
 
+  // Live TV DVR 预约录制 (Timers)
+  if (pathname === '/emby/LiveTv/Timers') {
+    if (method === 'GET') {
+      const items = demoLiveTvTimers.map((t) => ({ ...t }))
+      return { Items: items, TotalRecordCount: items.length } as T
+    }
+    if (method === 'POST') {
+      const body = parseJsonBody(options)
+      const channelId = String(body.ChannelId || '').trim()
+      const name = String(body.Name || '').trim()
+      if (!channelId || !name) {
+        throw new ApiError(400, '频道 ID 与录制名称不能为空')
+      }
+      const ch = demoLiveTvChannels.find((c) => c.Id === channelId)
+      const created: LiveTvTimerInfo = {
+        Id: `timer-demo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`,
+        ChannelId: channelId,
+        ChannelName: String(body.ChannelName || ch?.Name || channelId),
+        ProgramId: body.ProgramId ? String(body.ProgramId) : undefined,
+        Name: name,
+        Overview: body.Overview ? String(body.Overview) : undefined,
+        StartDate: String(body.StartDate || new Date().toISOString()),
+        EndDate: String(body.EndDate || new Date(Date.now() + 3600_000).toISOString()),
+        Status: 'New',
+        PrePaddingSeconds:
+          typeof body.PrePaddingSeconds === 'number' ? body.PrePaddingSeconds : 0,
+        PostPaddingSeconds:
+          typeof body.PostPaddingSeconds === 'number' ? body.PostPaddingSeconds : 0,
+      }
+      demoLiveTvTimers.push(created)
+      pushActivity(`已创建 DVR 录制计划「${created.Name}」`, 'LiveTvTimerCreated')
+      return { ...created } as T
+    }
+    if (method === 'DELETE') {
+      const id = qs.get('id') || qs.get('Id') || ''
+      const idx = demoLiveTvTimers.findIndex((t) => t.Id === id)
+      if (idx >= 0) {
+        const [removed] = demoLiveTvTimers.splice(idx, 1)
+        pushActivity(`已取消 DVR 录制计划「${removed.Name}」`, 'LiveTvTimerDeleted')
+      }
+      return undefined as T
+    }
+  }
+
+  const liveTvTimerDeleteMatch = pathname.match(/^\/emby\/LiveTv\/Timers\/([^/]+)$/)
+  if (liveTvTimerDeleteMatch && method === 'DELETE') {
+    const id = decodeURIComponent(liveTvTimerDeleteMatch[1])
+    const idx = demoLiveTvTimers.findIndex((t) => t.Id === id)
+    if (idx >= 0) {
+      const [removed] = demoLiveTvTimers.splice(idx, 1)
+      pushActivity(`已取消 DVR 录制计划「${removed.Name}」`, 'LiveTvTimerDeleted')
+    }
+    return undefined as T
+  }
+
+  // Live TV DVR 已完成录制 (Recordings)
+  if (pathname === '/emby/LiveTv/Recordings') {
+    if (method === 'GET') {
+      const items = demoLiveTvRecordings.map((r) => ({ ...r }))
+      return { Items: items, TotalRecordCount: items.length } as T
+    }
+    if (method === 'DELETE') {
+      const id = qs.get('id') || qs.get('Id') || ''
+      const idx = demoLiveTvRecordings.findIndex((r) => r.Id === id)
+      if (idx >= 0) {
+        const [removed] = demoLiveTvRecordings.splice(idx, 1)
+        pushActivity(`已删除 DVR 录制文件「${removed.Name}」`, 'LiveTvRecordingDeleted')
+      }
+      return undefined as T
+    }
+  }
+
+  const liveTvRecordingDeleteMatch = pathname.match(/^\/emby\/LiveTv\/Recordings\/([^/]+)$/)
+  if (liveTvRecordingDeleteMatch && method === 'DELETE') {
+    const id = decodeURIComponent(liveTvRecordingDeleteMatch[1])
+    const idx = demoLiveTvRecordings.findIndex((r) => r.Id === id)
+    if (idx >= 0) {
+      const [removed] = demoLiveTvRecordings.splice(idx, 1)
+      pushActivity(`已删除 DVR 录制文件「${removed.Name}」`, 'LiveTvRecordingDeleted')
+    }
+    return undefined as T
+  }
+
+  // Webhooks 事件通知管理
+  if (pathname === '/emby/Webhooks') {
+    if (method === 'GET') {
+      return demoWebhooks.map((w) => ({ ...w, Events: [...w.Events] })) as T
+    }
+    if (method === 'POST') {
+      const body = parseJsonBody(options)
+      const name = String(body.Name || '').trim()
+      const urlVal = String(body.Url || '').trim()
+      if (!name || !urlVal) {
+        throw new ApiError(400, 'Webhook 名称与推送 URL 不能为空')
+      }
+      const events = Array.isArray(body.Events)
+        ? body.Events.map((e) => String(e).trim()).filter(Boolean)
+        : ['*']
+      const secretVal = typeof body.Secret === 'string' && body.Secret.trim() ? body.Secret.trim() : undefined
+      const enabledVal = body.Enabled !== undefined ? Boolean(body.Enabled) : true
+      const existingId = typeof body.Id === 'string' ? body.Id.trim() : ''
+      const existingIdx = existingId ? demoWebhooks.findIndex((w) => w.Id === existingId) : -1
+
+      if (existingIdx >= 0) {
+        const updated: WebhookInfo = {
+          ...demoWebhooks[existingIdx],
+          Name: name,
+          Url: urlVal,
+          Secret: secretVal,
+          Events: events.length > 0 ? events : ['*'],
+          Enabled: enabledVal,
+        }
+        demoWebhooks[existingIdx] = updated
+        pushActivity(`已更新 Webhook「${updated.Name}」`, 'WebhookUpdated')
+        return { ...updated, Events: [...updated.Events] } as T
+      }
+
+      const created: WebhookInfo = {
+        Id: `wh-demo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`,
+        Name: name,
+        Url: urlVal,
+        Secret: secretVal,
+        Events: events.length > 0 ? events : ['*'],
+        Enabled: enabledVal,
+        CreatedAt: Math.floor(Date.now() / 1000),
+      }
+      demoWebhooks.push(created)
+      pushActivity(`已创建 Webhook「${created.Name}」`, 'WebhookCreated')
+      return { ...created, Events: [...created.Events] } as T
+    }
+  }
+
+  if (pathname === '/emby/Webhooks/Test' && method === 'POST') {
+    const res: WebhookTestResult = {
+      Success: true,
+      StatusCode: 200,
+      DurationMs: 42,
+    }
+    return res as T
+  }
+
+  const webhookDeleteMatch = pathname.match(/^\/emby\/Webhooks\/([^/]+)$/)
+  if (webhookDeleteMatch && method === 'DELETE') {
+    const id = decodeURIComponent(webhookDeleteMatch[1])
+    const idx = demoWebhooks.findIndex((w) => w.Id === id)
+    if (idx >= 0) {
+      const [removed] = demoWebhooks.splice(idx, 1)
+      pushActivity(`已删除 Webhook「${removed.Name}」`, 'WebhookDeleted')
+    }
+    return undefined as T
+  }
+
+  // 家长控制内容分级列表
+  if (pathname === '/emby/Localization/ParentalRatings' && method === 'GET') {
+    return DEMO_PARENTAL_RATINGS.map((r) => ({ ...r })) as T
+  }
+
   const runTaskMatch = pathname.match(/^\/emby\/ScheduledTasks\/Running\/([^/]+)$/)
   if (runTaskMatch && method === 'POST') {
     const taskId = decodeURIComponent(runTaskMatch[1])
@@ -2826,6 +3062,28 @@ export async function demoFetch<T>(
       ParentId: item.Id,
     }
     return { Items: [themeSong], TotalRecordCount: 1 } as T
+  }
+
+  const itemInstantMixMatch = pathname.match(/^\/emby\/Items\/([^/]+)\/InstantMix$/)
+  if (itemInstantMixMatch && method === 'GET') {
+    const itemId = decodeURIComponent(itemInstantMixMatch[1])
+    const limit = Math.max(1, Number(qs.get('Limit') || 50))
+    const seed = store.items.get(itemId)
+    const audioItems = Array.from(store.items.values()).filter(
+      (it) => it.Type === 'Audio' || it.MediaType === 'Audio',
+    )
+    const ordered = [...audioItems].sort((a, b) => {
+      const aSeed = a.Id === itemId ? -1 : 0
+      const bSeed = b.Id === itemId ? -1 : 0
+      if (aSeed !== bSeed) return aSeed - bSeed
+      const aSameArtist =
+        seed?.Artists?.length && a.Artists?.some((ar) => seed.Artists?.includes(ar)) ? -1 : 0
+      const bSameArtist =
+        seed?.Artists?.length && b.Artists?.some((ar) => seed.Artists?.includes(ar)) ? -1 : 0
+      return aSameArtist - bSameArtist
+    })
+    const sliced = ordered.slice(0, limit)
+    return { Items: sliced, TotalRecordCount: ordered.length } as T
   }
 
   const itemRefreshMatch = pathname.match(/^\/emby\/Items\/([^/]+)\/Refresh$/)

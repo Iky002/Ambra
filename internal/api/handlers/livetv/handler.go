@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -335,6 +337,75 @@ func (h *Handler) AddRecording(ctx context.Context, rec RecordingInfo) Recording
 	return rec
 }
 
+// OnRecordingFinished updates the matching timer status and, when the recording completed,
+// appends a RecordingInfo entry and persists Live TV state.
+func (h *Handler) OnRecordingFinished(ctx context.Context, state dvr.RecordingState) {
+	timerStatus := string(state.Status)
+	switch state.Status {
+	case dvr.StatusCompleted:
+		timerStatus = "Completed"
+	case dvr.StatusFailed:
+		timerStatus = "Failed"
+	case dvr.StatusCancelled:
+		timerStatus = "Cancelled"
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	var (
+		changed     bool
+		channelID   string
+		channelName = state.Job.ChannelName
+		programID   string
+		recName     = state.Job.ProgramName
+	)
+
+	for i := range h.state.Timers {
+		if h.state.Timers[i].Id == state.Job.TimerID {
+			h.state.Timers[i].Status = timerStatus
+			channelID = h.state.Timers[i].ChannelId
+			if channelName == "" {
+				channelName = h.state.Timers[i].ChannelName
+			}
+			programID = h.state.Timers[i].ProgramId
+			if recName == "" {
+				recName = h.state.Timers[i].Name
+			}
+			changed = true
+			break
+		}
+	}
+
+	if state.Status == dvr.StatusCompleted {
+		if recName == "" {
+			if channelName != "" {
+				recName = channelName
+			} else {
+				recName = "Recording"
+			}
+		}
+		h.state.Recordings = append(h.state.Recordings, RecordingInfo{
+			Id:          guid.New(),
+			Name:        recName,
+			ServerId:    h.serverID(),
+			Type:        "Recording",
+			ChannelId:   channelID,
+			ChannelName: channelName,
+			ProgramId:   programID,
+			Status:      "Completed",
+			StartDate:   state.StartedAt,
+			EndDate:     state.EndedAt,
+			Path:        state.OutputPath,
+		})
+		changed = true
+	}
+
+	if changed {
+		h.saveStateLocked(ctx)
+	}
+}
+
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	h.auth = auth
 	wrapAuth := auth.RequireAuth
@@ -466,6 +537,10 @@ func (h *Handler) handleGetChannel(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, ch)
 }
 
+const maxHLSPlaylistBytes = 2 << 20 // 2 MiB
+
+var hlsURIAttributeRe = regexp.MustCompile(`URI="([^"]+)"`)
+
 func (h *Handler) handleStreamChannel(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
 	ch, ok := h.GetChannelByID(id)
@@ -473,7 +548,15 @@ func (h *Handler) handleStreamChannel(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusNotFound, "channel not found")
 		return
 	}
-	h.ProxyStreamURL(w, r, ch.StreamUrl)
+	streamURL := ch.StreamUrl
+	if target := strings.TrimSpace(r.URL.Query().Get("target")); target != "" {
+		if err := netutil.ValidateRemoteURL(target, true); err != nil {
+			httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("unsafe target stream url: %v", err))
+			return
+		}
+		streamURL = target
+	}
+	h.proxyChannelStream(w, r, id, streamURL)
 }
 
 type flushWriter struct {
@@ -492,6 +575,10 @@ func (fw flushWriter) Write(p []byte) (int, error) {
 // ProxyStreamURL validates streamURL (allowing private LAN IPTV tuners while blocking
 // metadata/link-local/non-HTTP URLs) and proxies the upstream live stream bound to r.Context().
 func (h *Handler) ProxyStreamURL(w http.ResponseWriter, r *http.Request, streamURL string) {
+	h.proxyChannelStream(w, r, "", streamURL)
+}
+
+func (h *Handler) proxyChannelStream(w http.ResponseWriter, r *http.Request, channelID, streamURL string) {
 	trimmed := strings.TrimSpace(streamURL)
 	if err := netutil.ValidateRemoteURL(trimmed, true); err != nil {
 		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("unsafe channel stream url: %v", err))
@@ -523,7 +610,39 @@ func (h *Handler) ProxyStreamURL(w http.ResponseWriter, r *http.Request, streamU
 		return
 	}
 
+	baseURL := req.URL
+	if resp.Request != nil && resp.Request.URL != nil {
+		baseURL = resp.Request.URL
+	}
+
 	ct := resp.Header.Get("Content-Type")
+	if channelID != "" && isHLSPlaylistResponse(ct, baseURL) {
+		raw, err := io.ReadAll(io.LimitReader(resp.Body, maxHLSPlaylistBytes+1))
+		if err != nil {
+			if r.Context().Err() != nil {
+				return
+			}
+			httpx.Error(w, http.StatusBadGateway, fmt.Sprintf("upstream playlist read error: %v", err))
+			return
+		}
+		if len(raw) > maxHLSPlaylistBytes {
+			httpx.Error(w, http.StatusBadGateway, "upstream HLS playlist exceeds 2 MiB limit")
+			return
+		}
+
+		token := extractRequestToken(r)
+		rewritten := rewriteHLSPlaylist(string(raw), baseURL, channelID, token)
+		if ct == "" {
+			ct = "application/vnd.apple.mpegurl"
+		}
+		w.Header().Set("Content-Type", ct)
+		w.Header().Set("Cache-Control", "no-cache, no-store")
+		w.Header().Set("Content-Length", strconv.Itoa(len(rewritten)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, rewritten)
+		return
+	}
+
 	if ct == "" {
 		ct = "video/mp2t"
 	}
@@ -536,6 +655,137 @@ func (h *Handler) ProxyStreamURL(w http.ResponseWriter, r *http.Request, streamU
 		dst = flushWriter{w: w, f: f}
 	}
 	_, _ = io.Copy(dst, resp.Body)
+}
+
+func isHLSPlaylistResponse(contentType string, u *url.URL) bool {
+	ctLower := strings.ToLower(contentType)
+	if strings.Contains(ctLower, "mpegurl") || strings.Contains(ctLower, "x-mpegurl") {
+		return true
+	}
+	if u != nil && strings.HasSuffix(strings.ToLower(u.Path), ".m3u8") {
+		return true
+	}
+	return false
+}
+
+func rewriteHLSPlaylist(playlist string, baseURL *url.URL, channelID, token string) string {
+	rewriteURI := func(rawURI string) string {
+		trimmed := strings.TrimSpace(rawURI)
+		if trimmed == "" || baseURL == nil {
+			return rawURI
+		}
+		ref, err := url.Parse(trimmed)
+		if err != nil {
+			return rawURI
+		}
+		resolved := baseURL.ResolveReference(ref)
+		scheme := strings.ToLower(resolved.Scheme)
+		if scheme != "http" && scheme != "https" {
+			return rawURI
+		}
+		proxied := "/emby/LiveTv/Channels/" + url.PathEscape(channelID) + "/Stream?target=" + url.QueryEscape(resolved.String())
+		if token != "" {
+			proxied += "&api_key=" + url.QueryEscape(token)
+		}
+		return proxied
+	}
+
+	lines := strings.Split(playlist, "\n")
+	for i, line := range lines {
+		cr := ""
+		if strings.HasSuffix(line, "\r") {
+			cr = "\r"
+			line = strings.TrimSuffix(line, "\r")
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#") {
+			if strings.Contains(line, `URI="`) {
+				lines[i] = hlsURIAttributeRe.ReplaceAllStringFunc(line, func(match string) string {
+					sub := hlsURIAttributeRe.FindStringSubmatch(match)
+					if len(sub) < 2 {
+						return match
+					}
+					return `URI="` + rewriteURI(sub[1]) + `"`
+				}) + cr
+			}
+			continue
+		}
+		lines[i] = rewriteURI(trimmed) + cr
+	}
+	return strings.Join(lines, "\n")
+}
+
+func extractRequestToken(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	if v := strings.TrimSpace(httpx.ParseQuery(r).Get("api_key")); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(r.Header.Get("X-Emby-Token")); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(r.Header.Get("X-MediaBrowser-Token")); v != "" {
+		return v
+	}
+	authHeader := strings.TrimSpace(r.Header.Get("X-Emby-Authorization"))
+	if authHeader == "" {
+		authHeader = strings.TrimSpace(r.Header.Get("Authorization"))
+	}
+	if authHeader == "" {
+		return ""
+	}
+	return parseTokenFromAuthHeader(authHeader)
+}
+
+func parseTokenFromAuthHeader(header string) string {
+	s := strings.TrimSpace(header)
+	if idx := strings.IndexAny(s, " \t"); idx > 0 {
+		scheme := strings.ToLower(s[:idx])
+		rest := strings.TrimSpace(s[idx+1:])
+		if scheme == "bearer" {
+			return rest
+		}
+		if scheme == "mediabrowser" || scheme == "emby" {
+			s = rest
+		}
+	}
+	for len(s) > 0 {
+		s = strings.TrimLeft(s, " ,\t")
+		if len(s) == 0 {
+			break
+		}
+		eq := strings.IndexByte(s, '=')
+		if eq < 0 {
+			break
+		}
+		key := strings.ToLower(strings.TrimSpace(s[:eq]))
+		s = strings.TrimLeft(s[eq+1:], " \t")
+		var val string
+		if len(s) > 0 && s[0] == '"' {
+			s = s[1:]
+			if end := strings.IndexByte(s, '"'); end >= 0 {
+				val = s[:end]
+				s = s[end+1:]
+			} else {
+				val = s
+				s = ""
+			}
+		} else if comma := strings.IndexByte(s, ','); comma >= 0 {
+			val = strings.TrimSpace(s[:comma])
+			s = s[comma+1:]
+		} else {
+			val = strings.TrimSpace(s)
+			s = ""
+		}
+		if key == "token" && val != "" {
+			return val
+		}
+	}
+	return ""
 }
 
 func (h *Handler) handleListPrograms(w http.ResponseWriter, r *http.Request) {
@@ -665,8 +915,8 @@ func (h *Handler) handleGetRecording(w http.ResponseWriter, r *http.Request) {
 	httpx.Error(w, http.StatusNotFound, "recording not found")
 }
 
-func (h *Handler) handleDeleteRecording(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("Id")
+// DeleteRecording removes a recording by ID, persists state, and deletes its file if inside RecordingsDir.
+func (h *Handler) DeleteRecording(ctx context.Context, id string) bool {
 	h.mu.Lock()
 	idx := -1
 	for i, rec := range h.state.Recordings {
@@ -677,13 +927,12 @@ func (h *Handler) handleDeleteRecording(w http.ResponseWriter, r *http.Request) 
 	}
 	if idx < 0 {
 		h.mu.Unlock()
-		httpx.Error(w, http.StatusNotFound, "recording not found")
-		return
+		return false
 	}
 	recPath := strings.TrimSpace(h.state.Recordings[idx].Path)
 	recorder := h.recorder
 	h.state.Recordings = append(h.state.Recordings[:idx], h.state.Recordings[idx+1:]...)
-	h.saveStateLocked(r.Context())
+	h.saveStateLocked(ctx)
 	h.mu.Unlock()
 
 	if recorder != nil && recPath != "" {
@@ -693,6 +942,14 @@ func (h *Handler) handleDeleteRecording(w http.ResponseWriter, r *http.Request) 
 				_ = err
 			}
 		}
+	}
+	return true
+}
+
+func (h *Handler) handleDeleteRecording(w http.ResponseWriter, r *http.Request) {
+	if !h.DeleteRecording(r.Context(), r.PathValue("Id")) {
+		httpx.Error(w, http.StatusNotFound, "recording not found")
+		return
 	}
 	httpx.NoContent(w)
 }
@@ -830,24 +1087,31 @@ func (h *Handler) handleUpdateTimer(w http.ResponseWriter, r *http.Request) {
 	httpx.Error(w, http.StatusNotFound, "timer not found")
 }
 
-func (h *Handler) handleDeleteTimer(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("Id")
+// DeleteTimer removes a timer by ID, persists state, and cancels any active DVR recording.
+func (h *Handler) DeleteTimer(ctx context.Context, id string) bool {
 	h.mu.Lock()
 	for i, t := range h.state.Timers {
 		if t.Id == id {
 			recorder := h.recorder
 			h.state.Timers = append(h.state.Timers[:i], h.state.Timers[i+1:]...)
-			h.saveStateLocked(r.Context())
+			h.saveStateLocked(ctx)
 			h.mu.Unlock()
 			if recorder != nil {
 				_ = recorder.CancelRecording(id)
 			}
-			httpx.NoContent(w)
-			return
+			return true
 		}
 	}
 	h.mu.Unlock()
-	httpx.Error(w, http.StatusNotFound, "timer not found")
+	return false
+}
+
+func (h *Handler) handleDeleteTimer(w http.ResponseWriter, r *http.Request) {
+	if !h.DeleteTimer(r.Context(), r.PathValue("Id")) {
+		httpx.Error(w, http.StatusNotFound, "timer not found")
+		return
+	}
+	httpx.NoContent(w)
 }
 
 func (h *Handler) handleTimerDefaults(w http.ResponseWriter, r *http.Request) {
@@ -954,20 +1218,27 @@ func (h *Handler) handleUpdateSeriesTimer(w http.ResponseWriter, r *http.Request
 	httpx.Error(w, http.StatusNotFound, "series timer not found")
 }
 
-func (h *Handler) handleDeleteSeriesTimer(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("Id")
+// DeleteSeriesTimer removes a series timer by ID and persists state.
+func (h *Handler) DeleteSeriesTimer(ctx context.Context, id string) bool {
 	h.mu.Lock()
 	for i, st := range h.state.SeriesTimers {
 		if st.Id == id {
 			h.state.SeriesTimers = append(h.state.SeriesTimers[:i], h.state.SeriesTimers[i+1:]...)
-			h.saveStateLocked(r.Context())
+			h.saveStateLocked(ctx)
 			h.mu.Unlock()
-			httpx.NoContent(w)
-			return
+			return true
 		}
 	}
 	h.mu.Unlock()
-	httpx.Error(w, http.StatusNotFound, "series timer not found")
+	return false
+}
+
+func (h *Handler) handleDeleteSeriesTimer(w http.ResponseWriter, r *http.Request) {
+	if !h.DeleteSeriesTimer(r.Context(), r.PathValue("Id")) {
+		httpx.Error(w, http.StatusNotFound, "series timer not found")
+		return
+	}
+	httpx.NoContent(w)
 }
 
 func (h *Handler) handleSaveTunerHost(w http.ResponseWriter, r *http.Request) {
@@ -1193,12 +1464,8 @@ func isPathWithinRoot(root, target string) bool {
 	return true
 }
 
-func (h *Handler) handleDeleteTunerHost(w http.ResponseWriter, r *http.Request) {
-	id := httpx.ParseQuery(r).Get("id")
-	if id == "" {
-		httpx.Error(w, http.StatusBadRequest, "id query parameter is required")
-		return
-	}
+// DeleteTunerHost removes a tuner host by ID along with its channels and programs, and persists state.
+func (h *Handler) DeleteTunerHost(ctx context.Context, id string) bool {
 	h.mu.Lock()
 	found := false
 	keptHosts := make([]TunerHostInfo, 0, len(h.state.TunerHosts))
@@ -1211,8 +1478,7 @@ func (h *Handler) handleDeleteTunerHost(w http.ResponseWriter, r *http.Request) 
 	}
 	if !found {
 		h.mu.Unlock()
-		httpx.Error(w, http.StatusNotFound, "tuner host not found")
-		return
+		return false
 	}
 	h.state.TunerHosts = keptHosts
 
@@ -1234,8 +1500,21 @@ func (h *Handler) handleDeleteTunerHost(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	h.state.Programs = keptPrograms
-	h.saveStateLocked(r.Context())
+	h.saveStateLocked(ctx)
 	h.mu.Unlock()
+	return true
+}
+
+func (h *Handler) handleDeleteTunerHost(w http.ResponseWriter, r *http.Request) {
+	id := httpx.ParseQuery(r).Get("id")
+	if id == "" {
+		httpx.Error(w, http.StatusBadRequest, "id query parameter is required")
+		return
+	}
+	if !h.DeleteTunerHost(r.Context(), id) {
+		httpx.Error(w, http.StatusNotFound, "tuner host not found")
+		return
+	}
 	httpx.NoContent(w)
 }
 
@@ -1259,6 +1538,13 @@ func (h *Handler) handleSaveListingProvider(w http.ResponseWriter, r *http.Reque
 		lp.Type = "xmltv"
 	}
 
+	var guide *XMLTVGuide
+	if strings.EqualFold(lp.Type, "xmltv") && strings.TrimSpace(lp.Path) != "" {
+		if parsed, err := h.loadXMLTVFromSource(r.Context(), lp.Path); err == nil {
+			guide = parsed
+		}
+	}
+
 	h.mu.Lock()
 	replaced := false
 	for i, existing := range h.state.ListingProviders {
@@ -1271,9 +1557,189 @@ func (h *Handler) handleSaveListingProvider(w http.ResponseWriter, r *http.Reque
 	if !replaced {
 		h.state.ListingProviders = append(h.state.ListingProviders, lp)
 	}
+	if guide != nil && len(guide.Programmes) > 0 {
+		h.applyXMLTVGuideLocked(guide)
+	}
 	h.saveStateLocked(r.Context())
 	h.mu.Unlock()
 	httpx.JSON(w, http.StatusOK, lp)
+}
+
+func (h *Handler) loadXMLTVFromSource(ctx context.Context, src string) (*XMLTVGuide, error) {
+	trimmed := strings.TrimSpace(src)
+	if trimmed == "" {
+		return nil, errors.New("xmltv source is empty")
+	}
+
+	if u, err := url.Parse(trimmed); err == nil && u.Scheme != "" {
+		scheme := strings.ToLower(u.Scheme)
+		if scheme == "http" || scheme == "https" {
+			if !h.customHTTPClient {
+				if err := netutil.ValidateRemoteURL(trimmed, false); err != nil {
+					return nil, fmt.Errorf("blocked xmltv url: %w", err)
+				}
+			}
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, trimmed, nil)
+			if err != nil {
+				return nil, err
+			}
+			resp, err := h.httpClient.Do(req)
+			if err != nil {
+				return nil, err
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode >= 400 {
+				return nil, fmt.Errorf("unexpected xmltv status %d", resp.StatusCode)
+			}
+			return ParseXMLTV(io.LimitReader(resp.Body, 50<<20))
+		}
+		if len(scheme) > 1 {
+			return nil, fmt.Errorf("unsupported xmltv url scheme %q", u.Scheme)
+		}
+	}
+
+	resolvedPath, err := h.validateLocalXMLTVPath(ctx, trimmed)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Open(resolvedPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return ParseXMLTV(f)
+}
+
+func (h *Handler) validateLocalXMLTVPath(ctx context.Context, rawPath string) (string, error) {
+	if !hasXMLTVExt(rawPath) {
+		return "", fmt.Errorf("local xmltv file must have .xml or .xml.gz extension")
+	}
+	resolvedPath, err := filepath.EvalSymlinks(rawPath)
+	if err != nil {
+		return "", err
+	}
+	resolvedPath = filepath.Clean(resolvedPath)
+	if !hasXMLTVExt(resolvedPath) {
+		return "", fmt.Errorf("resolved local xmltv target must have .xml or .xml.gz extension")
+	}
+	allowedRoots := h.allowedLocalM3URoots(ctx)
+	for _, root := range allowedRoots {
+		if isPathWithinRoot(root, resolvedPath) {
+			return resolvedPath, nil
+		}
+	}
+	return "", fmt.Errorf("local xmltv file path is outside allowed directories")
+}
+
+func (h *Handler) applyXMLTVGuideLocked(guide *XMLTVGuide) {
+	if guide == nil || len(guide.Programmes) == 0 || len(h.state.Channels) == 0 {
+		return
+	}
+
+	byTvgID := make(map[string]ChannelInfo, len(h.state.Channels))
+	byID := make(map[string]ChannelInfo, len(h.state.Channels))
+	byName := make(map[string]ChannelInfo, len(h.state.Channels))
+	for _, ch := range h.state.Channels {
+		if k := strings.ToLower(strings.TrimSpace(ch.TvgId)); k != "" {
+			byTvgID[k] = ch
+		}
+		if k := strings.ToLower(strings.TrimSpace(ch.Id)); k != "" {
+			byID[k] = ch
+		}
+		if k := strings.ToLower(strings.TrimSpace(ch.Name)); k != "" {
+			byName[k] = ch
+		}
+	}
+
+	xmlDisplayNames := make(map[string][]string, len(guide.Channels))
+	for _, xc := range guide.Channels {
+		if k := strings.ToLower(strings.TrimSpace(xc.ID)); k != "" {
+			xmlDisplayNames[k] = xc.DisplayNames
+		}
+	}
+
+	matchChannel := func(xmlChID string) (ChannelInfo, bool) {
+		key := strings.ToLower(strings.TrimSpace(xmlChID))
+		if key == "" {
+			return ChannelInfo{}, false
+		}
+		if ch, ok := byTvgID[key]; ok {
+			return ch, true
+		}
+		if ch, ok := byID[key]; ok {
+			return ch, true
+		}
+		if ch, ok := byName[key]; ok {
+			return ch, true
+		}
+		for _, dn := range xmlDisplayNames[key] {
+			dnKey := strings.ToLower(strings.TrimSpace(dn))
+			if dnKey == "" {
+				continue
+			}
+			if ch, ok := byName[dnKey]; ok {
+				return ch, true
+			}
+			if ch, ok := byTvgID[dnKey]; ok {
+				return ch, true
+			}
+		}
+		return ChannelInfo{}, false
+	}
+
+	matchedChannelIDs := make(map[string]struct{})
+	newPrograms := make([]ProgramInfo, 0, len(guide.Programmes))
+	serverID := h.serverID()
+
+	for _, prog := range guide.Programmes {
+		ch, ok := matchChannel(prog.Channel)
+		if !ok {
+			continue
+		}
+		matchedChannelIDs[ch.Id] = struct{}{}
+		isMovie, isSeries := classifyXMLTVCategories(prog.Categories)
+		newPrograms = append(newPrograms, ProgramInfo{
+			Id:          guid.New(),
+			Name:        prog.Title,
+			ServerId:    serverID,
+			Type:        "Program",
+			ChannelId:   ch.Id,
+			ChannelName: ch.Name,
+			Overview:    prog.Desc,
+			StartDate:   prog.Start,
+			EndDate:     prog.Stop,
+			IsMovie:     isMovie,
+			IsSeries:    isSeries,
+		})
+	}
+
+	if len(matchedChannelIDs) == 0 {
+		return
+	}
+
+	kept := make([]ProgramInfo, 0, len(h.state.Programs)+len(newPrograms))
+	for _, p := range h.state.Programs {
+		if _, replace := matchedChannelIDs[p.ChannelId]; !replace {
+			kept = append(kept, p)
+		}
+	}
+	kept = append(kept, newPrograms...)
+	h.state.Programs = kept
+}
+
+// DeleteListingProvider removes a listing provider by ID and persists state.
+func (h *Handler) DeleteListingProvider(ctx context.Context, id string) bool {
+	h.mu.Lock()
+	for i, lp := range h.state.ListingProviders {
+		if lp.Id == id {
+			h.state.ListingProviders = append(h.state.ListingProviders[:i], h.state.ListingProviders[i+1:]...)
+			h.saveStateLocked(ctx)
+			h.mu.Unlock()
+			return true
+		}
+	}
+	h.mu.Unlock()
+	return false
 }
 
 func (h *Handler) handleDeleteListingProvider(w http.ResponseWriter, r *http.Request) {
@@ -1282,18 +1748,11 @@ func (h *Handler) handleDeleteListingProvider(w http.ResponseWriter, r *http.Req
 		httpx.Error(w, http.StatusBadRequest, "id query parameter is required")
 		return
 	}
-	h.mu.Lock()
-	for i, lp := range h.state.ListingProviders {
-		if lp.Id == id {
-			h.state.ListingProviders = append(h.state.ListingProviders[:i], h.state.ListingProviders[i+1:]...)
-			h.saveStateLocked(r.Context())
-			h.mu.Unlock()
-			httpx.NoContent(w)
-			return
-		}
+	if !h.DeleteListingProvider(r.Context(), id) {
+		httpx.Error(w, http.StatusNotFound, "listing provider not found")
+		return
 	}
-	h.mu.Unlock()
-	httpx.Error(w, http.StatusNotFound, "listing provider not found")
+	httpx.NoContent(w)
 }
 
 func (h *Handler) handleGuideInfo(w http.ResponseWriter, r *http.Request) {

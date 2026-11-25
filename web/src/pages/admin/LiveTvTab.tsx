@@ -86,6 +86,8 @@ export function LiveTvTab() {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['admin', 'liveTv', 'tunerHosts'] }),
         queryClient.invalidateQueries({ queryKey: ['admin', 'liveTv', 'channels'] }),
+        queryClient.invalidateQueries({ queryKey: ['liveTvInfo'] }),
+        queryClient.invalidateQueries({ queryKey: ['liveTv'] }),
       ])
       setFeedback({ type: 'success', message: '已添加 M3U 直播源' })
     } catch (err) {
@@ -106,6 +108,8 @@ export function LiveTvTab() {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['admin', 'liveTv', 'tunerHosts'] }),
         queryClient.invalidateQueries({ queryKey: ['admin', 'liveTv', 'channels'] }),
+        queryClient.invalidateQueries({ queryKey: ['liveTvInfo'] }),
+        queryClient.invalidateQueries({ queryKey: ['liveTv'] }),
       ])
       setFeedback({ type: 'success', message: `已删除直播源「${name || id}」` })
     } catch (err) {
