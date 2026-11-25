@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Eye, EyeOff, Loader2, RefreshCw, Save, SlidersHorizontal } from 'lucide-react'
 import { api } from '../../api/client'
+import { QueryErrorState } from '../../components/QueryErrorState'
 import { FeedbackBanner, ToggleSwitch } from './adminUtils'
 
 const TMDB_LANGUAGE_OPTIONS = [
@@ -29,6 +30,8 @@ export function SettingsTab() {
     data: config,
     isLoading,
     isFetching,
+    isError,
+    error,
     refetch,
   } = useQuery({
     queryKey: ['admin', 'serverConfig'],
@@ -115,6 +118,13 @@ export function SettingsTab() {
         <div className="flex h-48 items-center justify-center rounded-2xl border border-white/8 bg-white/[0.02]">
           <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
         </div>
+      ) : isError ? (
+        <QueryErrorState
+          compact
+          title="无法加载服务器配置"
+          error={error}
+          onRetry={() => void refetch()}
+        />
       ) : (
         <form onSubmit={handleSave} className="space-y-5">
           <div className="rounded-2xl border border-white/8 bg-white/[0.02] p-5 space-y-5">

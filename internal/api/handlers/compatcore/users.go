@@ -402,11 +402,18 @@ func (h *Handler) updateUser(w http.ResponseWriter, r *http.Request) {
 	if body.Policy != nil {
 		_ = h.userRepo.UpdateUserPolicy(r.Context(), u.ID, *body.Policy)
 	}
+	if h.authSvc != nil {
+		h.authSvc.InvalidateUserCache(u.ID)
+	}
 	httpx.NoContent(w)
 }
 
 func (h *Handler) deleteUser(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "Id")
+	if callerID := h.callerUserID(r); callerID != "" && callerID == uid {
+		httpx.Error(w, http.StatusBadRequest, "cannot delete currently authenticated user")
+		return
+	}
 	if h.userRepo == nil || uid == "" {
 		writeJSONError(w, r, http.StatusNotFound, "user not found")
 		return
@@ -418,6 +425,9 @@ func (h *Handler) deleteUser(w http.ResponseWriter, r *http.Request) {
 		}
 		httpx.Error(w, http.StatusInternalServerError, "failed to delete user")
 		return
+	}
+	if h.authSvc != nil {
+		h.authSvc.InvalidateUserCache(uid)
 	}
 	httpx.NoContent(w)
 }
@@ -454,6 +464,9 @@ func (h *Handler) updateUserConfigurationPartial(w http.ResponseWriter, r *http.
 		var nextCfg dto.UserConfiguration
 		_ = json.Unmarshal(updatedRaw, &nextCfg)
 		_ = h.userRepo.UpdateUserConfig(r.Context(), u.ID, nextCfg)
+		if h.authSvc != nil {
+			h.authSvc.InvalidateUserCache(u.ID)
+		}
 	}
 	httpx.NoContent(w)
 }
@@ -541,6 +554,10 @@ func (h *Handler) postUserSearchedItems(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) getUserTypedSettings(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	settingKey := strings.TrimSpace(chi.URLParam(r, "Key"))
 	out := map[string]any{}
 	_, _ = h.loadKV(r.Context(), fmt.Sprintf("user_typed_settings:%s:%s", uid, settingKey), &out)
@@ -582,6 +599,10 @@ func defaultHomeSections() []homeSection {
 
 func (h *Handler) getUserHomeSections(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	var sections []homeSection
 	found, _ := h.loadKV(r.Context(), "user_home_sections:"+uid, &sections)
 	if !found || len(sections) == 0 {
@@ -712,6 +733,113 @@ func (h *Handler) moveUserHomeSection(w http.ResponseWriter, r *http.Request) {
 	httpx.NoContent(w)
 }
 
+func (h *Handler) userPolicyForRequest(r *http.Request, targetUID string) (allowedLibs []string, maxRating *int, blockedTags []string) {
+	if h.userRepo == nil {
+		return nil, nil, nil
+	}
+	uid := guid.Normalize(targetUID)
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.IsAdmin() {
+			if uid == "" || uid == guid.Normalize(ac.UserID()) {
+				return nil, nil, nil
+			}
+		} else {
+			uid = guid.Normalize(ac.UserID())
+		}
+	}
+	if uid == "" {
+		return nil, nil, nil
+	}
+	u, err := h.userRepo.GetUserByID(r.Context(), uid)
+	if err != nil || u == nil {
+		return nil, nil, nil
+	}
+	if u.IsAdmin || u.Policy.IsAdministrator {
+		return nil, nil, nil
+	}
+	if !u.Policy.EnableAllFolders {
+		allowedLibs = make([]string, 0, len(u.Policy.EnabledFolders))
+		for _, fid := range u.Policy.EnabledFolders {
+			if norm := guid.Normalize(fid); norm != "" {
+				allowedLibs = append(allowedLibs, norm)
+			}
+		}
+	}
+	return allowedLibs, u.Policy.MaxParentalRating, u.Policy.BlockedTags
+}
+
+func (h *Handler) preferredGenresForUser(ctx context.Context, uid string, allowedLibs []string, maxRating *int, blockedTags []string) []string {
+	if h.libRepo == nil || uid == "" {
+		return nil
+	}
+	trueVal := true
+	counts := map[string]int{}
+	addGenres := func(items []dto.BaseItemDto, weight int) {
+		for _, it := range items {
+			for _, g := range it.Genres {
+				g = strings.TrimSpace(g)
+				if g != "" {
+					counts[g] += weight
+				}
+			}
+		}
+	}
+	if favs, _, err := h.libRepo.QueryItems(ctx, sqlite.ItemFilter{
+		ServerID:          h.serverID(),
+		UserID:            uid,
+		Recursive:         true,
+		AllowedLibraryIDs: allowedLibs,
+		MaxParentalRating: maxRating,
+		BlockedTags:       blockedTags,
+		IsFavorite:        &trueVal,
+		Fields:            []string{"Genres"},
+		Limit:             20,
+	}); err == nil {
+		addGenres(favs, 2)
+	}
+	if played, _, err := h.libRepo.QueryItems(ctx, sqlite.ItemFilter{
+		ServerID:          h.serverID(),
+		UserID:            uid,
+		Recursive:         true,
+		AllowedLibraryIDs: allowedLibs,
+		MaxParentalRating: maxRating,
+		BlockedTags:       blockedTags,
+		IsPlayed:          &trueVal,
+		SortBy:            []string{"DatePlayed"},
+		SortOrder:         "Descending",
+		Fields:            []string{"Genres"},
+		Limit:             20,
+	}); err == nil {
+		addGenres(played, 1)
+	}
+	if len(counts) == 0 {
+		return nil
+	}
+	type kv struct {
+		genre string
+		score int
+	}
+	ranked := make([]kv, 0, len(counts))
+	for g, s := range counts {
+		ranked = append(ranked, kv{genre: g, score: s})
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].score != ranked[j].score {
+			return ranked[i].score > ranked[j].score
+		}
+		return ranked[i].genre < ranked[j].genre
+	})
+	limit := len(ranked)
+	if limit > 5 {
+		limit = 5
+	}
+	out := make([]string, 0, limit)
+	for i := 0; i < limit; i++ {
+		out = append(out, ranked[i].genre)
+	}
+	return out
+}
+
 func (h *Handler) getUserSectionItems(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
 	q := httpx.ParseQuery(r)
@@ -720,12 +848,16 @@ func (h *Handler) getUserSectionItems(w http.ResponseWriter, r *http.Request) {
 		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{Items: []dto.BaseItemDto{}, TotalRecordCount: 0})
 		return
 	}
+	allowedLibs, maxRating, blockedTags := h.userPolicyForRequest(r, uid)
 	items, total, err := h.libRepo.QueryItems(r.Context(), sqlite.ItemFilter{
-		ServerID:   h.serverID(),
-		UserID:     uid,
-		Recursive:  true,
-		StartIndex: q.Int("StartIndex", 0),
-		Limit:      limit,
+		ServerID:          h.serverID(),
+		UserID:            uid,
+		Recursive:         true,
+		AllowedLibraryIDs: allowedLibs,
+		MaxParentalRating: maxRating,
+		BlockedTags:       blockedTags,
+		StartIndex:        q.Int("StartIndex", 0),
+		Limit:             limit,
 	})
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to query section items")
@@ -744,17 +876,116 @@ func (h *Handler) getUserSuggestions(w http.ResponseWriter, r *http.Request) {
 		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{Items: []dto.BaseItemDto{}, TotalRecordCount: 0})
 		return
 	}
+	startIndex := q.Int("StartIndex", 0)
+	if startIndex < 0 {
+		startIndex = 0
+	}
+	limit := q.Int("Limit", 20)
+	if limit <= 0 {
+		limit = 20
+	}
+	itemTypes := q.List("Type")
+	allowedLibs, maxRating, blockedTags := h.userPolicyForRequest(r, uid)
+	unplayed := true
+
+	preferredGenres := h.preferredGenresForUser(r.Context(), uid, allowedLibs, maxRating, blockedTags)
+	if len(preferredGenres) > 0 {
+		fetchLimit := startIndex + limit
+		matched, _, err := h.libRepo.QueryItems(r.Context(), sqlite.ItemFilter{
+			ServerID:          h.serverID(),
+			UserID:            uid,
+			Recursive:         true,
+			IncludeItemTypes:  itemTypes,
+			AllowedLibraryIDs: allowedLibs,
+			MaxParentalRating: maxRating,
+			BlockedTags:       blockedTags,
+			Genres:            preferredGenres,
+			IsUnplayed:        &unplayed,
+			SortBy:            []string{"CommunityRating", "DateCreated"},
+			SortOrder:         "Descending",
+			Limit:             fetchLimit,
+		})
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to load suggestions")
+			return
+		}
+		merged := make([]dto.BaseItemDto, 0, fetchLimit)
+		seen := make(map[string]bool, len(matched))
+		for _, it := range matched {
+			seen[it.Id] = true
+			merged = append(merged, it)
+		}
+		if len(merged) < fetchLimit {
+			fallback, _, fbErr := h.libRepo.QueryItems(r.Context(), sqlite.ItemFilter{
+				ServerID:          h.serverID(),
+				UserID:            uid,
+				Recursive:         true,
+				IncludeItemTypes:  itemTypes,
+				AllowedLibraryIDs: allowedLibs,
+				MaxParentalRating: maxRating,
+				BlockedTags:       blockedTags,
+				IsUnplayed:        &unplayed,
+				SortBy:            []string{"CommunityRating", "DateCreated"},
+				SortOrder:         "Descending",
+				Limit:             fetchLimit,
+			})
+			if fbErr == nil {
+				for _, it := range fallback {
+					if !seen[it.Id] {
+						seen[it.Id] = true
+						merged = append(merged, it)
+					}
+				}
+			}
+		}
+		total := len(merged)
+		if startIndex > total {
+			startIndex = total
+		}
+		end := startIndex + limit
+		if end > total {
+			end = total
+		}
+		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{Items: merged[startIndex:end], TotalRecordCount: total})
+		return
+	}
+
 	items, total, err := h.libRepo.QueryItems(r.Context(), sqlite.ItemFilter{
-		ServerID:         h.serverID(),
-		UserID:           uid,
-		Recursive:        true,
-		IncludeItemTypes: q.List("Type"),
-		StartIndex:       q.Int("StartIndex", 0),
-		Limit:            q.Int("Limit", 20),
+		ServerID:          h.serverID(),
+		UserID:            uid,
+		Recursive:         true,
+		IncludeItemTypes:  itemTypes,
+		AllowedLibraryIDs: allowedLibs,
+		MaxParentalRating: maxRating,
+		BlockedTags:       blockedTags,
+		IsUnplayed:        &unplayed,
+		SortBy:            []string{"CommunityRating", "DateCreated"},
+		SortOrder:         "Descending",
+		StartIndex:        startIndex,
+		Limit:             limit,
 	})
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to load suggestions")
 		return
+	}
+	if total == 0 {
+		items, total, err = h.libRepo.QueryItems(r.Context(), sqlite.ItemFilter{
+			ServerID:          h.serverID(),
+			UserID:            uid,
+			Recursive:         true,
+			IncludeItemTypes:  itemTypes,
+			AllowedLibraryIDs: allowedLibs,
+			MaxParentalRating: maxRating,
+			BlockedTags:       blockedTags,
+			SortBy:            []string{"CommunityRating", "DateCreated"},
+			SortOrder:         "Descending",
+			StartIndex:        startIndex,
+			Limit:             limit,
+		})
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to load suggestions")
+			return
+		}
 	}
 	if items == nil {
 		items = []dto.BaseItemDto{}
@@ -1175,6 +1406,16 @@ func (h *Handler) serveUserImage(w http.ResponseWriter, r *http.Request, headOnl
 	}
 }
 
+func (h *Handler) callerUserID(r *http.Request) string {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil {
+		return guid.Normalize(ac.UserID())
+	}
+	if h.auth.UserIDFromCtx != nil {
+		return guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+	}
+	return ""
+}
+
 func (h *Handler) isCallerAdmin(r *http.Request) bool {
 	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil {
 		return ac.IsAdmin()
@@ -1302,6 +1543,10 @@ func (h *Handler) deleteUserConnectLink(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) getUserSettings(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
+	if !h.canModifyUser(r, uid) {
+		writeJSONError(w, r, http.StatusForbidden, "forbidden")
+		return
+	}
 	out := map[string]any{}
 	_, _ = h.loadKV(r.Context(), "user_settings:"+uid, &out)
 	httpx.JSON(w, http.StatusOK, out)

@@ -1,7 +1,9 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   Activity,
+  ChevronLeft,
+  ChevronRight,
   Cpu,
   HardDrive,
   Loader2,
@@ -11,6 +13,7 @@ import {
   Play,
   Radio,
   RefreshCw,
+  Search,
   Send,
   Server,
   ShieldCheck,
@@ -19,6 +22,7 @@ import {
 } from 'lucide-react'
 import { api } from '../../api/client'
 import type { SessionInfo } from '../../api/types'
+import { QueryErrorState } from '../../components/QueryErrorState'
 import { ScanProgressBar } from '../../components/ScanProgressBar'
 import {
   AdminModal,
@@ -27,6 +31,24 @@ import {
   formatRelativeTime,
   formatTicks,
 } from './adminUtils'
+
+const ACTIVITY_PAGE_SIZE = 20
+type SeverityFilter = 'All' | 'Info' | 'Warn' | 'Error'
+
+const SEVERITY_OPTIONS: Array<{ value: SeverityFilter; label: string }> = [
+  { value: 'All', label: '全部' },
+  { value: 'Info', label: 'Info' },
+  { value: 'Warn', label: 'Warn' },
+  { value: 'Error', label: 'Error' },
+]
+
+function matchesSeverity(severity: string | undefined, filter: SeverityFilter): boolean {
+  if (filter === 'All') return true
+  const s = (severity || 'Info').toLowerCase()
+  if (filter === 'Error') return s === 'error' || s === 'fatal' || s === 'critical'
+  if (filter === 'Warn') return s === 'warn' || s === 'warning'
+  return s !== 'error' && s !== 'fatal' && s !== 'critical' && s !== 'warn' && s !== 'warning'
+}
 
 export function DashboardTab() {
   const [autoRefresh, setAutoRefresh] = useState(true)
@@ -40,7 +62,18 @@ export function DashboardTab() {
   const [msgError, setMsgError] = useState<string | null>(null)
   const [sendingMsg, setSendingMsg] = useState(false)
 
-  const { data: sysInfo, isLoading: sysLoading } = useQuery({
+  // 系统活动日志分页与筛选
+  const [logPage, setLogPage] = useState(0)
+  const [severityFilter, setSeverityFilter] = useState<SeverityFilter>('All')
+  const [logSearch, setLogSearch] = useState('')
+
+  const {
+    data: sysInfo,
+    isLoading: sysLoading,
+    isError: sysIsError,
+    error: sysError,
+    refetch: refetchSysInfo,
+  } = useQuery({
     queryKey: ['admin', 'systemInfo'],
     queryFn: () => api.getSystemInfo(),
   })
@@ -49,6 +82,8 @@ export function DashboardTab() {
     data: sessions = [],
     isLoading: sessionsLoading,
     isFetching: sessionsFetching,
+    isError: sessionsIsError,
+    error: sessionsError,
     refetch: refetchSessions,
   } = useQuery({
     queryKey: ['admin', 'sessions'],
@@ -60,14 +95,40 @@ export function DashboardTab() {
     data: activityData,
     isLoading: logsLoading,
     isFetching: logsFetching,
+    isError: logsIsError,
+    error: logsError,
     refetch: refetchLogs,
   } = useQuery({
-    queryKey: ['admin', 'activityLogs'],
-    queryFn: () => api.getActivityLogs(0, 30),
+    queryKey: ['admin', 'activityLogs', logPage],
+    queryFn: () => api.getActivityLogs(logPage * ACTIVITY_PAGE_SIZE, ACTIVITY_PAGE_SIZE),
     refetchInterval: autoRefresh ? 15000 : false,
   })
 
   const activityItems = activityData?.Items || []
+  const totalActivityCount = activityData?.TotalRecordCount ?? activityItems.length
+  const totalActivityPages = Math.max(1, Math.ceil(totalActivityCount / ACTIVITY_PAGE_SIZE))
+
+  const filteredActivityItems = useMemo(() => {
+    const keyword = logSearch.trim().toLowerCase()
+    return activityItems.filter((entry) => {
+      if (!matchesSeverity(entry.Severity, severityFilter)) {
+        return false
+      }
+      if (!keyword) return true
+      const haystack = [
+        entry.Name,
+        entry.ShortOverview,
+        entry.Overview,
+        entry.Type,
+        entry.Severity,
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase()
+      return haystack.includes(keyword)
+    })
+  }, [activityItems, severityFilter, logSearch])
+
   const playingCount = sessions.filter((s) => Boolean(s.NowPlayingItem)).length
 
   const handleRemoteCommand = async (session: SessionInfo, command: 'PlayPause' | 'Stop') => {
@@ -154,6 +215,13 @@ export function DashboardTab() {
           <div className="flex h-32 items-center justify-center rounded-2xl border border-white/8 bg-white/[0.02]">
             <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
           </div>
+        ) : sysIsError ? (
+          <QueryErrorState
+            compact
+            title="无法加载服务器状态"
+            error={sysError}
+            onRetry={() => void refetchSysInfo()}
+          />
         ) : (
           <>
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -257,6 +325,13 @@ export function DashboardTab() {
           <div className="flex h-28 items-center justify-center rounded-2xl border border-white/8 bg-white/[0.02]">
             <Loader2 className="h-5 w-5 animate-spin text-amber-400" />
           </div>
+        ) : sessionsIsError ? (
+          <QueryErrorState
+            compact
+            title="无法加载实时活动会话"
+            error={sessionsError}
+            onRetry={() => void refetchSessions()}
+          />
         ) : sessions.length === 0 ? (
           <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-10 text-center text-xs text-zinc-500">
             当前暂无在线活动会话
@@ -278,36 +353,83 @@ export function DashboardTab() {
 
       {/* 系统活动日志 */}
       <section className="space-y-4">
-        <div className="flex items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2 text-sm font-semibold text-zinc-200">
             <Activity className="h-4 w-4 text-amber-400" />
             <span>系统活动日志</span>
             <span className="rounded-md bg-white/8 px-2 py-0.5 text-xs font-medium text-zinc-300">
-              {activityData?.TotalRecordCount ?? activityItems.length}
+              {totalActivityCount}
             </span>
           </div>
-          <button
-            type="button"
-            onClick={() => void refetchLogs()}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-amber-400/40 hover:text-amber-300"
-          >
-            <RefreshCw className={`h-3.5 w-3.5 ${logsFetching ? 'animate-spin' : ''}`} />
-            <span>刷新</span>
-          </button>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="inline-flex rounded-lg border border-white/10 bg-white/[0.03] p-0.5">
+              {SEVERITY_OPTIONS.map((opt) => {
+                const active = severityFilter === opt.value
+                return (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    aria-pressed={active}
+                    onClick={() => setSeverityFilter(opt.value)}
+                    className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                      active
+                        ? 'bg-amber-500/20 text-amber-300'
+                        : 'text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                )
+              })}
+            </div>
+
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-500" />
+              <input
+                type="text"
+                aria-label="搜索活动日志"
+                value={logSearch}
+                onChange={(e) => setLogSearch(e.target.value)}
+                placeholder="搜索日志关键词..."
+                className="w-40 rounded-lg border border-white/10 bg-white/[0.04] py-1.5 pl-8 pr-2.5 text-xs text-zinc-200 placeholder-zinc-500 outline-none focus:border-amber-400/50 sm:w-48"
+              />
+            </div>
+
+            <button
+              type="button"
+              onClick={() => void refetchLogs()}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-amber-400/40 hover:text-amber-300"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${logsFetching ? 'animate-spin' : ''}`} />
+              <span>刷新</span>
+            </button>
+          </div>
         </div>
 
         {logsLoading ? (
           <div className="flex h-32 items-center justify-center rounded-2xl border border-white/8 bg-white/[0.02]">
             <Loader2 className="h-5 w-5 animate-spin text-amber-400" />
           </div>
+        ) : logsIsError ? (
+          <QueryErrorState
+            compact
+            title="无法加载系统活动日志"
+            error={logsError}
+            onRetry={() => void refetchLogs()}
+          />
         ) : activityItems.length === 0 ? (
           <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-10 text-center text-xs text-zinc-500">
             暂无活动日志记录
           </div>
+        ) : filteredActivityItems.length === 0 ? (
+          <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-10 text-center text-xs text-zinc-500">
+            当前筛选条件下无匹配的活动日志
+          </div>
         ) : (
           <div className="overflow-hidden rounded-2xl border border-white/8 bg-white/[0.02]">
             <div className="divide-y divide-white/6">
-              {activityItems.map((entry) => (
+              {filteredActivityItems.map((entry) => (
                 <div
                   key={entry.Id}
                   className="flex flex-col gap-1.5 px-4 py-3 text-xs sm:flex-row sm:items-center sm:justify-between"
@@ -331,6 +453,32 @@ export function DashboardTab() {
                   </div>
                 </div>
               ))}
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-white/8 bg-white/[0.02] px-4 py-2.5 text-xs text-zinc-400">
+              <span>
+                共 {totalActivityCount} 条记录 · 第 {logPage + 1} / {totalActivityPages} 页
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={logPage <= 0}
+                  onClick={() => setLogPage((p) => Math.max(0, p - 1))}
+                  className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-xs font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:text-amber-300 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <ChevronLeft className="h-3.5 w-3.5" />
+                  <span>上一页</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={(logPage + 1) * ACTIVITY_PAGE_SIZE >= totalActivityCount}
+                  onClick={() => setLogPage((p) => p + 1)}
+                  className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-xs font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:text-amber-300 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <span>下一页</span>
+                  <ChevronRight className="h-3.5 w-3.5" />
+                </button>
+              </div>
             </div>
           </div>
         )}

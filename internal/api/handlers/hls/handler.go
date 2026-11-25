@@ -96,16 +96,29 @@ func (h *Handler) canAccessItem(r *http.Request, item *sqlite.ItemRecord) bool {
 	if err != nil || u == nil {
 		return true
 	}
-	if u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableAllFolders {
+	if u.IsAdmin || u.Policy.IsAdministrator {
 		return true
 	}
-	normLib := guid.Normalize(item.LibraryID)
-	for _, fid := range u.Policy.EnabledFolders {
-		if guid.Normalize(fid) == normLib {
-			return true
+	if item.LibraryID != "" && !u.Policy.EnableAllFolders {
+		normLib := guid.Normalize(item.LibraryID)
+		allowed := false
+		for _, fid := range u.Policy.EnabledFolders {
+			if guid.Normalize(fid) == normLib {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return false
 		}
 	}
-	return false
+	if h.repo != nil {
+		blocked, err := h.repo.IsItemBlockedByParentalPolicy(r.Context(), item, u.Policy.MaxParentalRating, u.Policy.BlockedTags)
+		if err != nil || blocked {
+			return false
+		}
+	}
+	return true
 }
 
 // RegisterRoutes mounts all HLS, ActiveEncodings, Encoding, and LiveStreams endpoints on mux.

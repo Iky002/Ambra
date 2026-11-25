@@ -133,6 +133,14 @@ export function HomePage() {
   })
 
   const {
+    data: nextUpData,
+    refetch: refetchNextUp,
+  } = useQuery({
+    queryKey: ['nextUp', userId],
+    queryFn: () => api.getNextUp(userId, { limit: 12 }),
+  })
+
+  const {
     data: heroData,
     isError: heroError,
     error: heroErr,
@@ -150,6 +158,7 @@ export function HomePage() {
 
   const views = viewsData?.Items || []
   const resumeItems = resumeData?.Items || []
+  const nextUpItems = nextUpData?.Items || []
   const heroItems = heroData?.Items || []
   const hasPrimaryError = (viewsError || heroError) && views.length === 0 && heroItems.length === 0
   const primaryError = viewsErr || heroErr
@@ -158,6 +167,7 @@ export function HomePage() {
     void refetchViews()
     void refetchHero()
     void refetchResume()
+    void refetchNextUp()
   }
 
   const latestQueries = useQueries({
@@ -395,6 +405,22 @@ export function HomePage() {
               showProgress
               onMarkPlayed={handleMarkPlayed}
               onHideFromResume={handleHideFromResume}
+              className="w-64 shrink-0 sm:w-72"
+            />
+          ))}
+        </HorizontalRow>
+      )}
+
+      {/* 接下来播放 (Next Up) */}
+      {nextUpItems.length > 0 && (
+        <HorizontalRow title="接下来播放">
+          {nextUpItems.map((item) => (
+            <MediaCard
+              key={item.Id}
+              item={item}
+              variant="landscape"
+              showProgress
+              onMarkPlayed={handleMarkPlayed}
               className="w-64 shrink-0 sm:w-72"
             />
           ))}

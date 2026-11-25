@@ -310,25 +310,56 @@ func (h *Handler) handleQueryItems(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var minCommunityRating *float64
+	if rawMin := strings.TrimSpace(q.Get("MinCommunityRating")); rawMin != "" {
+		if v, err := strconv.ParseFloat(rawMin, 64); err == nil {
+			minCommunityRating = &v
+		}
+	}
+
+	splitMulti := func(vals []string) []string {
+		if len(vals) == 0 {
+			return nil
+		}
+		var out []string
+		for _, v := range vals {
+			for _, part := range strings.Split(v, "|") {
+				if p := strings.TrimSpace(part); p != "" {
+					out = append(out, p)
+				}
+			}
+		}
+		return out
+	}
+
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 	filter := sqlite.ItemFilter{
-		ServerID:               h.serverID(),
-		UserID:                 userID,
-		ParentID:               q.Get("ParentId"),
-		AllowedLibraryIDs:      h.allowedLibrariesForRequest(r, userID),
-		MaxParentalRating:      maxRating,
-		BlockedTags:            blockedTags,
-		Recursive:              rec,
-		IncludeItemTypes:       q.List("IncludeItemTypes"),
-		ExcludeItemTypes:       q.List("ExcludeItemTypes"),
-		Genres:                 q.List("Genres"),
-		Studios:                q.List("Studios"),
-		Tags:                   q.List("Tags"),
-		PersonIDs:              q.List("PersonIds"),
-		Persons:                q.List("Person"),
-		Years:                  years,
-		IsPlayed:               isPlayed,
-		IsUnplayed:             isUnplayed,
+		ServerID:                h.serverID(),
+		UserID:                  userID,
+		ParentID:                q.Get("ParentId"),
+		AllowedLibraryIDs:       h.allowedLibrariesForRequest(r, userID),
+		MaxParentalRating:       maxRating,
+		BlockedTags:             blockedTags,
+		Recursive:               rec,
+		IncludeItemTypes:        q.List("IncludeItemTypes"),
+		ExcludeItemTypes:        q.List("ExcludeItemTypes"),
+		IDs:                     splitMulti(q.List("Ids")),
+		ExcludeItemIDs:          splitMulti(q.List("ExcludeItemIds")),
+		Genres:                  splitMulti(q.List("Genres")),
+		GenreIDs:                splitMulti(q.List("GenreIds")),
+		Studios:                 splitMulti(q.List("Studios")),
+		StudioIDs:               splitMulti(q.List("StudioIds")),
+		Tags:                    splitMulti(q.List("Tags")),
+		OfficialRatings:         splitMulti(q.List("OfficialRatings")),
+		MinCommunityRating:      minCommunityRating,
+		PersonIDs:               q.List("PersonIds"),
+		Persons:                 q.List("Person"),
+		Years:                   years,
+		IsHD:                    q.Bool("IsHD"),
+		Is4K:                    q.Bool("Is4K"),
+		HasSubtitles:            q.Bool("HasSubtitles"),
+		IsPlayed:                isPlayed,
+		IsUnplayed:              isUnplayed,
 		IsFavorite:              isFav,
 		IsResumable:             isResumable,
 		SearchTerm:              q.Get("SearchTerm"),
@@ -336,11 +367,11 @@ func (h *Handler) handleQueryItems(w http.ResponseWriter, r *http.Request) {
 		NameStartsWithOrGreater: q.Get("NameStartsWithOrGreater"),
 		NameLessThan:            q.Get("NameLessThan"),
 		SortBy:                  q.List("SortBy"),
-		SortOrder:              q.Get("SortOrder"),
-		StartIndex:             q.Int("StartIndex", 0),
-		Limit:                  q.Int("Limit", 0),
-		Fields:                 q.List("Fields"),
-		EnableTotalRecordCount: q.Bool("EnableTotalRecordCount"),
+		SortOrder:               q.Get("SortOrder"),
+		StartIndex:              q.Int("StartIndex", 0),
+		Limit:                   q.Int("Limit", 0),
+		Fields:                  q.List("Fields"),
+		EnableTotalRecordCount:  q.Bool("EnableTotalRecordCount"),
 	}
 
 	items, total, err := h.repo.QueryItems(r.Context(), filter)
@@ -589,7 +620,8 @@ func (h *Handler) handleTaxonomies(kind string) http.HandlerFunc {
 		q := httpx.ParseQuery(r)
 		userID := h.resolveUserID(r, q)
 		allowed := h.allowedLibrariesForRequest(r, userID)
-		items, total, err := h.repo.ListTaxonomiesWithAllowedLibraries(
+		maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+		items, total, err := h.repo.ListTaxonomiesWithPolicy(
 			r.Context(),
 			h.serverID(),
 			kind,
@@ -597,6 +629,8 @@ func (h *Handler) handleTaxonomies(kind string) http.HandlerFunc {
 			q.Int("StartIndex", 0),
 			q.Int("Limit", 200),
 			allowed,
+			maxRating,
+			blockedTags,
 		)
 		if err != nil {
 			httpx.Error(w, http.StatusInternalServerError, err.Error())

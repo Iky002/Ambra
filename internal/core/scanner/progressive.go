@@ -229,10 +229,27 @@ func (s *Scanner) scanLibrary(ctx context.Context, libraryID string, asyncPhaseB
 	}
 
 	if asyncPhaseB {
+		if scanCtx.Err() != nil {
+			releaseScan()
+			return stats, scanCtx.Err()
+		}
+		bgCtx, bgCancel := context.WithCancel(context.WithoutCancel(ctx))
+		s.mu.Lock()
+		s.cancels[libraryID] = bgCancel
+		s.mu.Unlock()
+		cancel()
+		bgStats := stats
 		go func() {
-			defer releaseScan()
-			stats.ItemsUpdated += s.runPhaseB(scanCtx, lib.ID, tasks)
-			s.notifyScanComplete(scanCtx, lib.ID, stats)
+			defer func() {
+				bgCancel()
+				s.mu.Lock()
+				delete(s.scanning, libraryID)
+				delete(s.cancels, libraryID)
+				delete(s.progress, libraryID)
+				s.mu.Unlock()
+			}()
+			bgStats.ItemsUpdated += s.runPhaseB(bgCtx, lib.ID, tasks)
+			s.notifyScanComplete(bgCtx, lib.ID, bgStats)
 		}()
 		return stats, nil
 	}

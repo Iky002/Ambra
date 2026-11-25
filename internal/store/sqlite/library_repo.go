@@ -214,12 +214,21 @@ type ItemFilter struct {
 	Recursive              bool
 	IncludeItemTypes       []string
 	ExcludeItemTypes       []string
+	IDs                    []string
+	ExcludeItemIDs         []string
 	Genres                 []string
+	GenreIDs               []string
 	Studios                []string
+	StudioIDs              []string
 	Tags                   []string
+	OfficialRatings        []string
+	MinCommunityRating     *float64
 	PersonIDs              []string
 	Persons                []string
 	Years                  []int
+	IsHD                   *bool
+	Is4K                   *bool
+	HasSubtitles           *bool
 	IsPlayed               *bool
 	IsUnplayed             *bool
 	IsFavorite              *bool
@@ -1146,6 +1155,30 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 		}
 		where = append(where, fmt.Sprintf(`i.type NOT IN (%s)`, strings.Join(placeholders, ",")))
 	}
+	if len(f.IDs) > 0 {
+		ph := make([]string, 0, len(f.IDs))
+		for _, id := range f.IDs {
+			if norm := guid.Normalize(id); norm != "" {
+				ph = append(ph, "?")
+				args = append(args, norm)
+			}
+		}
+		if len(ph) > 0 {
+			where = append(where, fmt.Sprintf(`i.id IN (%s)`, strings.Join(ph, ",")))
+		}
+	}
+	if len(f.ExcludeItemIDs) > 0 {
+		ph := make([]string, 0, len(f.ExcludeItemIDs))
+		for _, id := range f.ExcludeItemIDs {
+			if norm := guid.Normalize(id); norm != "" {
+				ph = append(ph, "?")
+				args = append(args, norm)
+			}
+		}
+		if len(ph) > 0 {
+			where = append(where, fmt.Sprintf(`i.id NOT IN (%s)`, strings.Join(ph, ",")))
+		}
+	}
 	if len(f.Years) > 0 {
 		placeholders := make([]string, len(f.Years))
 		for idx, y := range f.Years {
@@ -1153,6 +1186,22 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 			args = append(args, y)
 		}
 		where = append(where, fmt.Sprintf(`i.production_year IN (%s)`, strings.Join(placeholders, ",")))
+	}
+	if len(f.OfficialRatings) > 0 {
+		ph := make([]string, 0, len(f.OfficialRatings))
+		for _, or := range f.OfficialRatings {
+			if trimmed := strings.ToUpper(strings.TrimSpace(or)); trimmed != "" {
+				ph = append(ph, "?")
+				args = append(args, trimmed)
+			}
+		}
+		if len(ph) > 0 {
+			where = append(where, fmt.Sprintf(`upper(trim(COALESCE(i.official_rating, ''))) IN (%s)`, strings.Join(ph, ",")))
+		}
+	}
+	if f.MinCommunityRating != nil {
+		where = append(where, `i.community_rating IS NOT NULL AND i.community_rating >= ?`)
+		args = append(args, *f.MinCommunityRating)
 	}
 
 	if len(f.Genres) > 0 {
@@ -1167,6 +1216,22 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 			WHERE it.item_id = i.id AND tx.kind = 'genre' AND tx.name IN (%s)
 		)`, strings.Join(ph, ",")))
 	}
+	if len(f.GenreIDs) > 0 {
+		ph := make([]string, 0, len(f.GenreIDs))
+		for _, gid := range f.GenreIDs {
+			if norm := guid.Normalize(gid); norm != "" {
+				ph = append(ph, "?")
+				args = append(args, norm)
+			}
+		}
+		if len(ph) > 0 {
+			where = append(where, fmt.Sprintf(`EXISTS (
+				SELECT 1 FROM item_taxonomies it
+				JOIN taxonomies tx ON tx.id = it.taxonomy_id
+				WHERE it.item_id = i.id AND tx.kind = 'genre' AND tx.id IN (%s)
+			)`, strings.Join(ph, ",")))
+		}
+	}
 	if len(f.Studios) > 0 {
 		ph := make([]string, len(f.Studios))
 		for idx, s := range f.Studios {
@@ -1178,6 +1243,65 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 			JOIN taxonomies tx ON tx.id = it.taxonomy_id
 			WHERE it.item_id = i.id AND tx.kind = 'studio' AND tx.name IN (%s)
 		)`, strings.Join(ph, ",")))
+	}
+	if len(f.StudioIDs) > 0 {
+		ph := make([]string, 0, len(f.StudioIDs))
+		for _, sid := range f.StudioIDs {
+			if norm := guid.Normalize(sid); norm != "" {
+				ph = append(ph, "?")
+				args = append(args, norm)
+			}
+		}
+		if len(ph) > 0 {
+			where = append(where, fmt.Sprintf(`EXISTS (
+				SELECT 1 FROM item_taxonomies it
+				JOIN taxonomies tx ON tx.id = it.taxonomy_id
+				WHERE it.item_id = i.id AND tx.kind = 'studio' AND tx.id IN (%s)
+			)`, strings.Join(ph, ",")))
+		}
+	}
+	if f.IsHD != nil {
+		if *f.IsHD {
+			where = append(where, `EXISTS (
+				SELECT 1 FROM item_media_streams ms
+				WHERE ms.item_id = i.id AND lower(ms.stream_type) = 'video'
+				  AND (COALESCE(ms.height, 0) >= 720 OR COALESCE(ms.width, 0) >= 1280)
+			)`)
+		} else {
+			where = append(where, `NOT EXISTS (
+				SELECT 1 FROM item_media_streams ms
+				WHERE ms.item_id = i.id AND lower(ms.stream_type) = 'video'
+				  AND (COALESCE(ms.height, 0) >= 720 OR COALESCE(ms.width, 0) >= 1280)
+			)`)
+		}
+	}
+	if f.Is4K != nil {
+		if *f.Is4K {
+			where = append(where, `EXISTS (
+				SELECT 1 FROM item_media_streams ms
+				WHERE ms.item_id = i.id AND lower(ms.stream_type) = 'video'
+				  AND (COALESCE(ms.width, 0) >= 3800 OR COALESCE(ms.height, 0) >= 2100)
+			)`)
+		} else {
+			where = append(where, `NOT EXISTS (
+				SELECT 1 FROM item_media_streams ms
+				WHERE ms.item_id = i.id AND lower(ms.stream_type) = 'video'
+				  AND (COALESCE(ms.width, 0) >= 3800 OR COALESCE(ms.height, 0) >= 2100)
+			)`)
+		}
+	}
+	if f.HasSubtitles != nil {
+		if *f.HasSubtitles {
+			where = append(where, `EXISTS (
+				SELECT 1 FROM item_media_streams ms
+				WHERE ms.item_id = i.id AND lower(ms.stream_type) = 'subtitle'
+			)`)
+		} else {
+			where = append(where, `NOT EXISTS (
+				SELECT 1 FROM item_media_streams ms
+				WHERE ms.item_id = i.id AND lower(ms.stream_type) = 'subtitle'
+			)`)
+		}
 	}
 	if len(f.Tags) > 0 {
 		ph := make([]string, len(f.Tags))
@@ -1676,6 +1800,11 @@ func (r *LibraryRepo) ListTaxonomies(ctx context.Context, serverID, kind, parent
 // ListTaxonomiesWithAllowedLibraries lists Genres, Studios, Persons, or Years scoped to allowedLibraryIDs.
 // When allowedLibraryIDs is nil, all libraries are included; when non-nil and empty, an empty result is returned.
 func (r *LibraryRepo) ListTaxonomiesWithAllowedLibraries(ctx context.Context, serverID, kind, parentID string, startIndex, limit int, allowedLibraryIDs []string) ([]dto.BaseItemDto, int, error) {
+	return r.ListTaxonomiesWithPolicy(ctx, serverID, kind, parentID, startIndex, limit, allowedLibraryIDs, nil, nil)
+}
+
+// ListTaxonomiesWithPolicy lists Genres, Studios, Persons, or Years scoped to allowedLibraryIDs and parental policy.
+func (r *LibraryRepo) ListTaxonomiesWithPolicy(ctx context.Context, serverID, kind, parentID string, startIndex, limit int, allowedLibraryIDs []string, maxParentalRating *int, blockedTags []string) ([]dto.BaseItemDto, int, error) {
 	if limit <= 0 {
 		limit = 200
 	}
@@ -1683,6 +1812,7 @@ func (r *LibraryRepo) ListTaxonomiesWithAllowedLibraries(ctx context.Context, se
 		return []dto.BaseItemDto{}, 0, nil
 	}
 	parentID = guid.Normalize(parentID)
+	hasParental := maxParentalRating != nil || len(normalizeBlockedTags(blockedTags)) > 0
 
 	libInClause := func(col string) (string, []any) {
 		if len(allowedLibraryIDs) == 0 {
@@ -1702,19 +1832,25 @@ func (r *LibraryRepo) ListTaxonomiesWithAllowedLibraries(ctx context.Context, se
 		var (
 			args       []any
 			parentJoin string
-			libWhere   string
+			extraWhere strings.Builder
 		)
 		if parentID != "" {
 			parentJoin = `INNER JOIN item_ancestors anc ON anc.descendant_id = i.id AND anc.ancestor_id = ?`
 			args = append(args, parentID)
 		}
 		if clause, vals := libInClause("i.library_id"); clause != "" {
-			libWhere = " AND " + clause
+			extraWhere.WriteString(" AND " + clause)
 			args = append(args, vals...)
+		}
+		if pClauses, pArgs := appendParentalFilterSQL("i", maxParentalRating, blockedTags); len(pClauses) > 0 {
+			for _, cl := range pClauses {
+				extraWhere.WriteString(" AND " + cl)
+			}
+			args = append(args, pArgs...)
 		}
 		rows, err := r.store.Reader.QueryContext(ctx,
 			`SELECT DISTINCT i.production_year FROM items i `+parentJoin+`
-			 WHERE i.production_year IS NOT NULL`+libWhere+` ORDER BY i.production_year DESC`, args...)
+			 WHERE i.production_year IS NOT NULL`+extraWhere.String()+` ORDER BY i.production_year DESC`, args...)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -1743,7 +1879,7 @@ func (r *LibraryRepo) ListTaxonomiesWithAllowedLibraries(ctx context.Context, se
 			args  []any
 			where string
 		)
-		if parentID != "" || len(allowedLibraryIDs) > 0 {
+		if parentID != "" || len(allowedLibraryIDs) > 0 || hasParental {
 			var joins, conds []string
 			conds = append(conds, "ip.person_id = p.id")
 			if parentID != "" {
@@ -1751,10 +1887,16 @@ func (r *LibraryRepo) ListTaxonomiesWithAllowedLibraries(ctx context.Context, se
 				conds = append(conds, "anc.ancestor_id = ?")
 				args = append(args, parentID)
 			}
-			if clause, vals := libInClause("i.library_id"); clause != "" {
+			if len(allowedLibraryIDs) > 0 || hasParental {
 				joins = append(joins, "JOIN items i ON i.id = ip.item_id")
-				conds = append(conds, clause)
-				args = append(args, vals...)
+				if clause, vals := libInClause("i.library_id"); clause != "" {
+					conds = append(conds, clause)
+					args = append(args, vals...)
+				}
+				if pClauses, pArgs := appendParentalFilterSQL("i", maxParentalRating, blockedTags); len(pClauses) > 0 {
+					conds = append(conds, pClauses...)
+					args = append(args, pArgs...)
+				}
 			}
 			where = `WHERE EXISTS (SELECT 1 FROM item_people ip ` + strings.Join(joins, " ") + ` WHERE ` + strings.Join(conds, " AND ") + `)`
 		}
@@ -1808,7 +1950,7 @@ func (r *LibraryRepo) ListTaxonomiesWithAllowedLibraries(ctx context.Context, se
 			args  = []any{taxKind}
 			extra string
 		)
-		if parentID != "" || len(allowedLibraryIDs) > 0 {
+		if parentID != "" || len(allowedLibraryIDs) > 0 || hasParental {
 			var joins, conds []string
 			conds = append(conds, "it.taxonomy_id = t.id")
 			if parentID != "" {
@@ -1816,10 +1958,16 @@ func (r *LibraryRepo) ListTaxonomiesWithAllowedLibraries(ctx context.Context, se
 				conds = append(conds, "anc.ancestor_id = ?")
 				args = append(args, parentID)
 			}
-			if clause, vals := libInClause("i.library_id"); clause != "" {
+			if len(allowedLibraryIDs) > 0 || hasParental {
 				joins = append(joins, "JOIN items i ON i.id = it.item_id")
-				conds = append(conds, clause)
-				args = append(args, vals...)
+				if clause, vals := libInClause("i.library_id"); clause != "" {
+					conds = append(conds, clause)
+					args = append(args, vals...)
+				}
+				if pClauses, pArgs := appendParentalFilterSQL("i", maxParentalRating, blockedTags); len(pClauses) > 0 {
+					conds = append(conds, pClauses...)
+					args = append(args, pArgs...)
+				}
 			}
 			extra = ` AND EXISTS (SELECT 1 FROM item_taxonomies it ` + strings.Join(joins, " ") + ` WHERE ` + strings.Join(conds, " AND ") + `)`
 		}

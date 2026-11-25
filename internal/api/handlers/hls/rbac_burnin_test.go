@@ -244,3 +244,98 @@ func TestReadFirstLineURLBlocksMetadataAndLinkLocal(t *testing.T) {
 		}
 	}
 }
+
+func TestHLSParentalControlEnforcement(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(tmp, "hls_parental.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	repo := sqlite.NewLibraryRepo(store)
+	userRepo := sqlite.NewUserRepo(store)
+	cfg := config.Default(tmp)
+	mgr := transcode.NewManager(cfg, transcode.WithCapabilities(transcode.SoftwareOnlyCapabilities()))
+	defer mgr.Close()
+
+	lib, _ := repo.CreateLibrary(ctx, "Movies", "movies", []string{tmp})
+
+	pgItem := &sqlite.ItemRecord{
+		ID: guid.New(), LibraryID: lib.ID, ParentID: lib.ID,
+		Type: "Movie", MediaType: "Video", Name: "PGMovie", OfficialRating: "PG",
+		Path: filepath.Join(tmp, "pg.mkv"),
+	}
+	rItem := &sqlite.ItemRecord{
+		ID: guid.New(), LibraryID: lib.ID, ParentID: lib.ID,
+		Type: "Movie", MediaType: "Video", Name: "RMovie", OfficialRating: "R",
+		Path: filepath.Join(tmp, "r.mkv"),
+	}
+	nsfwItem := &sqlite.ItemRecord{
+		ID: guid.New(), LibraryID: lib.ID, ParentID: lib.ID,
+		Type: "Movie", MediaType: "Video", Name: "NSFWMovie", OfficialRating: "PG",
+		Path: filepath.Join(tmp, "nsfw.mkv"),
+	}
+	for _, it := range []*sqlite.ItemRecord{pgItem, rItem, nsfwItem} {
+		_ = repo.UpsertItem(ctx, it)
+	}
+	_ = repo.ReplaceItemTaxonomies(ctx, nsfwItem.ID, "tag", []string{"NSFW"})
+
+	maxRating := 7 // PG-13
+	kidPolicy := sqlite.DefaultUserPolicy(false)
+	kidPolicy.EnableAllFolders = true
+	kidPolicy.MaxParentalRating = &maxRating
+	kidPolicy.BlockedTags = []string{"NSFW"}
+	kid := &sqlite.UserRecord{ID: guid.New(), Name: "kid", Policy: kidPolicy, Config: sqlite.DefaultUserConfig()}
+	_ = userRepo.CreateUser(ctx, kid)
+
+	admin := &sqlite.UserRecord{ID: guid.New(), Name: "admin", IsAdmin: true, Policy: sqlite.DefaultUserPolicy(true), Config: sqlite.DefaultUserConfig()}
+	_ = userRepo.CreateUser(ctx, admin)
+
+	h := New(repo, mgr, cfg)
+	h.SetUserRepo(userRepo)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, AuthFuncs{})
+
+	doReq := func(user *sqlite.UserRecord, method, target string, body []byte) *httptest.ResponseRecorder {
+		var r *http.Request
+		if body != nil {
+			r = httptest.NewRequest(method, target, bytes.NewReader(body))
+		} else {
+			r = httptest.NewRequest(method, target, nil)
+		}
+		r = r.WithContext(middleware.WithAuthContext(r.Context(), &middleware.AuthContext{User: user}))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, r)
+		return rec
+	}
+
+	// Kid gets 403 on R-rated and NSFW-tagged items for master.m3u8, main.m3u8, LiveStreams/Open
+	for _, id := range []string{rItem.ID, nsfwItem.ID} {
+		for _, path := range []string{
+			"/Videos/" + id + "/master.m3u8",
+			"/Videos/" + id + "/main.m3u8",
+		} {
+			if rec := doReq(kid, http.MethodGet, path, nil); rec.Code != http.StatusForbidden {
+				t.Fatalf("kid GET %s expected 403, got %d", path, rec.Code)
+			}
+		}
+		openBody, _ := json.Marshal(map[string]any{"ItemId": id})
+		if rec := doReq(kid, http.MethodPost, "/LiveStreams/Open", openBody); rec.Code != http.StatusForbidden {
+			t.Fatalf("kid LiveStreams/Open for %s expected 403, got %d", id, rec.Code)
+		}
+	}
+
+	// Kid gets 200 on PG item
+	if rec := doReq(kid, http.MethodGet, "/Videos/"+pgItem.ID+"/master.m3u8", nil); rec.Code != http.StatusOK {
+		t.Fatalf("kid GET PG master.m3u8 expected 200, got %d", rec.Code)
+	}
+
+	// Admin bypasses parental restrictions
+	for _, id := range []string{rItem.ID, nsfwItem.ID} {
+		if rec := doReq(admin, http.MethodGet, "/Videos/"+id+"/master.m3u8", nil); rec.Code != http.StatusOK {
+			t.Fatalf("admin GET %s master.m3u8 expected 200, got %d", id, rec.Code)
+		}
+	}
+}

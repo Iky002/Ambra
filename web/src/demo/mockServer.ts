@@ -1083,6 +1083,76 @@ export async function demoFetch<T>(
     return { Items: items, TotalRecordCount: items.length } as T
   }
 
+  if (
+    (pathname === '/emby/Items/Filters' ||
+      pathname === '/Items/Filters' ||
+      pathname === '/emby/Items/Filters2' ||
+      pathname === '/Items/Filters2') &&
+    method === 'GET'
+  ) {
+    const isV2 = pathname.endsWith('/Filters2')
+    const parentId = qs.get('ParentId') || ''
+    const includeTypesRaw = qs.get('IncludeItemTypes') || ''
+    const includeTypes = includeTypesRaw
+      ? new Set(includeTypesRaw.split(',').map((s) => s.trim()))
+      : null
+
+    let pool: BaseItemDto[] =
+      parentId && store.libraryItems.has(parentId)
+        ? (store.libraryItems.get(parentId) || [])
+            .map((id) => store.items.get(id))
+            .filter((it): it is BaseItemDto => Boolean(it))
+        : Array.from(store.items.values())
+
+    if (includeTypes) {
+      pool = pool.filter((it) => includeTypes.has(it.Type))
+    }
+
+    const genreSet = new Set<string>()
+    const tagSet = new Set<string>()
+    const yearSet = new Set<number>()
+    const studioSet = new Set<string>()
+    const ratingSet = new Set<string>()
+
+    for (const it of pool) {
+      for (const g of it.Genres || []) {
+        if (g) genreSet.add(g)
+      }
+      for (const t of it.Tags || []) {
+        if (t) tagSet.add(t)
+      }
+      if (it.ProductionYear) yearSet.add(it.ProductionYear)
+      for (const st of it.Studios || []) {
+        if (st?.Name) studioSet.add(st.Name)
+      }
+      if (it.OfficialRating) ratingSet.add(it.OfficialRating)
+    }
+
+    const genres = Array.from(genreSet).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))
+    const tags = Array.from(tagSet).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))
+    const years = Array.from(yearSet).sort((a, b) => b - a)
+    const studios = Array.from(studioSet).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))
+    const officialRatings = Array.from(ratingSet).sort((a, b) => a.localeCompare(b, 'en'))
+
+    if (isV2) {
+      return {
+        Genres: genres.map((name) => ({ Name: name, Id: `genre-${name}` })),
+        Tags: tags,
+        Years: years,
+        Studios: studios.map((name) => ({ Name: name, Id: `studio-${name}` })),
+        OfficialRatings: officialRatings,
+      } as T
+    }
+
+    return {
+      Genres: genres,
+      Tags: tags,
+      Years: years,
+      Studios: studios,
+      OfficialRatings: officialRatings,
+    } as T
+  }
+
   const userItemsMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Items$/)
   const isGlobalItemsQuery = pathname === '/emby/Items' || pathname === '/Items'
   if ((userItemsMatch || isGlobalItemsQuery) && method === 'GET') {
@@ -1104,6 +1174,10 @@ export async function demoFetch<T>(
       .split(/[|,]/)
       .map((s) => s.trim().toLowerCase())
       .filter(Boolean)
+    const studiosParam = (qs.get('Studios') || '')
+      .split(/[|,]/)
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean)
     const personIdsParam = (qs.get('PersonIds') || '')
       .split(/[|,]/)
       .map((s) => s.trim().toLowerCase())
@@ -1120,9 +1194,60 @@ export async function demoFetch<T>(
 
     let pool: BaseItemDto[]
     if (parentId && store.libraryItems.has(parentId)) {
-      pool = (store.libraryItems.get(parentId) || [])
+      const directItems = (store.libraryItems.get(parentId) || [])
         .map((id) => store.items.get(id))
         .filter((it): it is BaseItemDto => Boolean(it))
+      const isMusicLibrary =
+        parentId === 'lib-music' ||
+        store.libraries.find((l) => l.ItemId === parentId)?.CollectionType?.toLowerCase() === 'music'
+
+      if (isMusicLibrary && (includeTypes?.has('Audio') || includeTypes?.has('MusicArtist'))) {
+        const seenIds = new Set<string>()
+        const expanded: BaseItemDto[] = []
+        const pushUnique = (item: BaseItemDto) => {
+          if (!seenIds.has(item.Id)) {
+            seenIds.add(item.Id)
+            expanded.push(item)
+          }
+        }
+        for (const it of directItems) {
+          pushUnique(it)
+        }
+        if (includeTypes.has('Audio')) {
+          for (const album of directItems) {
+            if (album.Type === 'MusicAlbum' || store.libraryItems.has(album.Id)) {
+              const trackIds = store.libraryItems.get(album.Id) || []
+              for (const tid of trackIds) {
+                const track = store.items.get(tid)
+                if (track && track.Type === 'Audio') {
+                  pushUnique(track)
+                }
+              }
+              for (const candidate of store.items.values()) {
+                if (
+                  candidate.Type === 'Audio' &&
+                  (candidate.ParentId === album.Id || candidate.AlbumId === album.Id)
+                ) {
+                  pushUnique(candidate)
+                }
+              }
+            }
+          }
+        }
+        if (includeTypes.has('MusicArtist')) {
+          for (const candidate of store.items.values()) {
+            if (
+              candidate.Type === 'MusicArtist' &&
+              (!candidate.ParentId || candidate.ParentId === parentId)
+            ) {
+              pushUnique(candidate)
+            }
+          }
+        }
+        pool = expanded
+      } else {
+        pool = directItems
+      }
     } else if (parentId) {
       pool = []
     } else {
@@ -1152,6 +1277,15 @@ export async function demoFetch<T>(
     if (tagsParam.length > 0) {
       pool = pool.filter((it) =>
         (it.Tags || []).some((t) => tagsParam.includes(t.toLowerCase())),
+      )
+    }
+    if (studiosParam.length > 0) {
+      pool = pool.filter((it) =>
+        (it.Studios || []).some(
+          (st) =>
+            studiosParam.includes(st.Name.toLowerCase()) ||
+            studiosParam.includes(st.Id.toLowerCase()),
+        ),
       )
     }
     if (personIdsParam.length > 0) {

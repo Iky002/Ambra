@@ -643,13 +643,19 @@ func (h *Handler) handleItemFile(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleSimilar(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
-	items, total, err := h.repo.GetSimilarItems(
+	userID := h.resolveUserID(r, q)
+	allowed := h.allowedLibrariesForRequest(r, userID)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	items, total, err := h.repo.GetSimilarItemsWithPolicy(
 		r.Context(),
 		h.serverID(),
-		h.resolveUserID(r, q),
+		userID,
 		chi.URLParam(r, "Id"),
 		q.Int("Limit", 12),
 		q.List("Fields"),
+		allowed,
+		maxRating,
+		blockedTags,
 	)
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -663,13 +669,19 @@ func (h *Handler) handleSimilar(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleItemInstantMix(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
-	items, total, err := h.repo.GetInstantMix(
+	userID := h.resolveUserID(r, q)
+	allowed := h.allowedLibrariesForRequest(r, userID)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	items, total, err := h.repo.GetInstantMixWithPolicy(
 		r.Context(),
 		h.serverID(),
-		h.resolveUserID(r, q),
+		userID,
 		chi.URLParam(r, "Id"),
 		q.Int("Limit", 50),
 		q.List("Fields"),
+		allowed,
+		maxRating,
+		blockedTags,
 	)
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())

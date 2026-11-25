@@ -19,7 +19,13 @@ import {
   X,
 } from 'lucide-react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { api, getLiveTvChannelStreamUrl, getLiveTvRecordingStreamUrl } from '../api/client'
+import {
+  api,
+  buildEmbyAuthHeader,
+  getLiveTvChannelStreamUrl,
+  getLiveTvRecordingStreamUrl,
+  getStoredAuth,
+} from '../api/client'
 import type { LiveTvRecordingInfo } from '../api/types'
 import { QueryErrorState } from '../components/QueryErrorState'
 import { useAuth } from '../context/AuthContext'
@@ -341,6 +347,16 @@ export function LiveTvPage() {
       hls = new Hls({
         enableWorker: true,
         lowLatencyMode: true,
+        xhrSetup: (xhr) => {
+          const storedAuth = getStoredAuth()
+          xhr.setRequestHeader(
+            'X-Emby-Authorization',
+            buildEmbyAuthHeader(storedAuth?.accessToken),
+          )
+          if (storedAuth?.accessToken) {
+            xhr.setRequestHeader('X-Emby-Token', storedAuth.accessToken)
+          }
+        },
       })
       hls.loadSource(streamUrl)
       hls.attachMedia(video)

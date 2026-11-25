@@ -314,3 +314,69 @@ func TestSystemHandlerHelpersAndNilDeps(t *testing.T) {
 		}
 	}
 }
+
+func TestSystemConfigMaskingAndActivityLogAdminOnly(t *testing.T) {
+	r, _, _, userRepo, adminTok, viewerTok := setupSystemHandler(t)
+	ctx := context.Background()
+
+	// Configure a TMDB API key as admin.
+	req := httptest.NewRequest(http.MethodPost, "/System/Configuration", bytes.NewBufferString(`{"TMDBApiKey":"secret-tmdb-key"}`))
+	req.Header.Set("X-Emby-Token", adminTok)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("UpdateConfiguration expected 204, got %d", rec.Code)
+	}
+
+	// Non-admin GET /System/Configuration must NOT receive TMDBApiKey.
+	req = httptest.NewRequest(http.MethodGet, "/System/Configuration", nil)
+	req.Header.Set("X-Emby-Token", viewerTok)
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("viewer GetConfiguration expected 200, got %d", rec.Code)
+	}
+	var viewerCfg ServerConfigurationDto
+	if err := json.Unmarshal(rec.Body.Bytes(), &viewerCfg); err != nil {
+		t.Fatal(err)
+	}
+	if viewerCfg.TMDBApiKey != "" {
+		t.Fatalf("expected TMDBApiKey masked for non-admin, got %q", viewerCfg.TMDBApiKey)
+	}
+
+	// Admin GET /System/Configuration receives the configured TMDBApiKey.
+	req = httptest.NewRequest(http.MethodGet, "/System/Configuration", nil)
+	req.Header.Set("X-Emby-Token", adminTok)
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin GetConfiguration expected 200, got %d", rec.Code)
+	}
+	var adminCfg ServerConfigurationDto
+	if err := json.Unmarshal(rec.Body.Bytes(), &adminCfg); err != nil {
+		t.Fatal(err)
+	}
+	if adminCfg.TMDBApiKey != "secret-tmdb-key" {
+		t.Fatalf("expected TMDBApiKey=secret-tmdb-key for admin, got %q", adminCfg.TMDBApiKey)
+	}
+
+	// ActivityLog must be admin-only: viewer -> 403, admin -> 200.
+	_ = userRepo.CreateActivityLog(ctx, &sqlite.ActivityLogRecord{
+		Name: "AuditEvent", Type: "Auth", Severity: "Info",
+	})
+	req = httptest.NewRequest(http.MethodGet, "/System/ActivityLog/Entries", nil)
+	req.Header.Set("X-Emby-Token", viewerTok)
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("viewer GET /System/ActivityLog/Entries expected 403, got %d", rec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/System/ActivityLog/Entries", nil)
+	req.Header.Set("X-Emby-Token", adminTok)
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "AuditEvent") {
+		t.Fatalf("admin GET /System/ActivityLog/Entries expected 200 with AuditEvent, got %d %s", rec.Code, rec.Body.String())
+	}
+}

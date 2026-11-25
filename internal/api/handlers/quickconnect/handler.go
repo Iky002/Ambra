@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -22,9 +23,11 @@ import (
 )
 
 const (
-	defaultTTL         = 10 * time.Minute
-	maxPendingSessions = 1000
-	maxFailedAttempts  = 5
+	defaultTTL              = 10 * time.Minute
+	maxPendingSessions      = 1000
+	maxFailedAttempts       = 5
+	maxInitiatesPerIPPerMin = 10
+	initiateRateWindow      = time.Minute
 )
 
 // AuthFuncs decouples route registration from the concrete middleware package.
@@ -71,6 +74,7 @@ type Handler struct {
 	bySecret       map[string]*pendingSession
 	byCode         map[string]*pendingSession
 	failedAttempts map[string]*failWindow
+	initiateRates  map[string]*failWindow
 }
 
 func New(authSvc *auth.Service, userRepo *sqlite.UserRepo, sessionMgr *session.Manager) *Handler {
@@ -83,6 +87,7 @@ func New(authSvc *auth.Service, userRepo *sqlite.UserRepo, sessionMgr *session.M
 		bySecret:       make(map[string]*pendingSession),
 		byCode:         make(map[string]*pendingSession),
 		failedAttempts: make(map[string]*failWindow),
+		initiateRates:  make(map[string]*failWindow),
 	}
 }
 
@@ -107,6 +112,29 @@ func (h *Handler) handleEnabled(w http.ResponseWriter, _ *http.Request) {
 func (h *Handler) handleInitiate(w http.ResponseWriter, r *http.Request) {
 	client := middleware.ExtractClientInfo(r)
 	now := h.now()
+	ip := clientIP(r)
+
+	h.mu.Lock()
+	h.pruneExpiredLocked(now)
+	if ip != "" {
+		rw := h.initiateRates[ip]
+		if rw != nil && now.Before(rw.resetAt) && rw.count >= maxInitiatesPerIPPerMin {
+			h.mu.Unlock()
+			httpx.Error(w, http.StatusTooManyRequests, "too many quickconnect initiate requests from this ip")
+			return
+		}
+		if rw == nil || !now.Before(rw.resetAt) {
+			rw = &failWindow{count: 0, resetAt: now.Add(initiateRateWindow)}
+			h.initiateRates[ip] = rw
+		}
+		rw.count++
+	}
+	if len(h.bySecret) >= maxPendingSessions {
+		h.mu.Unlock()
+		httpx.Error(w, http.StatusTooManyRequests, "too many pending quickconnect sessions")
+		return
+	}
+	h.mu.Unlock()
 
 	secret, err := generateSecret()
 	if err != nil {
@@ -344,6 +372,22 @@ func (h *Handler) pruneExpiredLocked(now time.Time) {
 			delete(h.failedAttempts, uid)
 		}
 	}
+	for ip, rw := range h.initiateRates {
+		if !now.Before(rw.resetAt) {
+			delete(h.initiateRates, ip)
+		}
+	}
+}
+
+func clientIP(r *http.Request) string {
+	addr := strings.TrimSpace(r.RemoteAddr)
+	if addr == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return addr
 }
 
 func generateSecret() (string, error) {

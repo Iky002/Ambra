@@ -270,7 +270,9 @@ export function CollectionsPage() {
                     }
                     const firstVideo = members.find((m) => m.Type !== 'Audio') || members[0]
                     if (firstVideo) {
-                      navigate(`/play/${encodeURIComponent(firstVideo.Id)}`)
+                      navigate(
+                        `/play/${encodeURIComponent(firstVideo.Id)}?playlistId=${encodeURIComponent(selectedContainer.Id)}`,
+                      )
                     }
                   }}
                   className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-3.5 py-2 text-xs font-semibold text-zinc-950 shadow-md shadow-amber-500/20 transition-colors hover:bg-amber-400"

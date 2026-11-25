@@ -121,8 +121,30 @@ func (h *Handler) AuthenticateByName(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, auth.ErrInvalidCredentials):
+			if h.userRepo != nil {
+				uname := strings.TrimSpace(req.Username)
+				if uname == "" {
+					uname = "unknown"
+				}
+				_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+					Name:     uname + " failed to log in",
+					Type:     "AuthenticationFailed",
+					Severity: "Warning",
+				})
+			}
 			httpx.Error(w, http.StatusUnauthorized, "Invalid username or password")
 		case errors.Is(err, auth.ErrUserDisabled):
+			if h.userRepo != nil {
+				uname := strings.TrimSpace(req.Username)
+				if uname == "" {
+					uname = "unknown"
+				}
+				_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+					Name:     uname + " failed to log in (account disabled)",
+					Type:     "AuthenticationFailed",
+					Severity: "Warning",
+				})
+			}
 			httpx.Error(w, http.StatusForbidden, "User account is disabled")
 		default:
 			httpx.Error(w, http.StatusInternalServerError, "Authentication failed")
@@ -212,6 +234,14 @@ func (h *Handler) CreateUser(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if h.userRepo != nil {
+		_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+			Name:     u.Name + " was created",
+			Type:     "UserCreated",
+			UserID:   u.ID,
+			Severity: "Info",
+		})
+	}
 	httpx.JSON(w, http.StatusOK, h.authSvc.ToUserDto(u))
 }
 
@@ -231,6 +261,12 @@ func (h *Handler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.authSvc.InvalidateUserCache(targetID)
+	_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+		Name:     "User " + targetID + " was deleted",
+		Type:     "UserDeleted",
+		UserID:   targetID,
+		Severity: "Info",
+	})
 	httpx.NoContent(w)
 }
 
@@ -269,6 +305,14 @@ func (h *Handler) UpdateUserPassword(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusInternalServerError, "failed to update password")
 		}
 		return
+	}
+	if h.userRepo != nil {
+		_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+			Name:     "Password changed",
+			Type:     "UserPasswordChanged",
+			UserID:   targetID,
+			Severity: "Info",
+		})
 	}
 	httpx.NoContent(w)
 }

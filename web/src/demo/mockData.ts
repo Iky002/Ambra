@@ -2083,8 +2083,74 @@ export function createInitialDemoState(): DemoState {
     TMDB_MEDIA_ART['item-shawshank-redemption'],
   )
 
-  // ==================== 4b. 无损音乐专辑、音轨与同步 LRC 歌词 ====================
+  // ==================== 4b. 无损音乐专辑、艺术家、音轨与同步 LRC 歌词 ====================
   const SEC_TICKS = 10_000_000
+
+  registerItem(
+    {
+      Id: 'artist-hans-zimmer',
+      Name: 'Hans Zimmer',
+      OriginalTitle: 'Hans Zimmer',
+      SortName: 'hans zimmer',
+      ServerId: DEMO_SERVER_ID,
+      Type: 'MusicArtist',
+      MediaType: 'Audio',
+      IsFolder: true,
+      ParentId: 'lib-music',
+      DateCreated: isoAgo(25),
+      CommunityRating: 9.6,
+      Genres: ['电影原声', '古典', '氛围电子'],
+      Tags: ['Hi-Res FLAC', '原声典藏'],
+      Overview:
+        '德国著名电影配乐作曲家与音乐制作人，擅长将交响乐与电子音色融合，代表作包括《星际穿越》《盗梦空间》《沙丘》等。',
+      ChildCount: 1,
+      ImageTags: { Primary: 'demo-p' },
+      BackdropImageTags: ['demo-b'],
+      PrimaryImageAspectRatio: 1,
+      UserData: {
+        PlaybackPositionTicks: 0,
+        PlayCount: 3,
+        IsFavorite: true,
+        Played: false,
+      },
+    },
+    ['#0c1e35', '#1e3a5f', '#f59e0b'],
+    'ARTIST',
+    TMDB_MEDIA_ART['item-interstellar'],
+  )
+
+  registerItem(
+    {
+      Id: 'artist-joe-hisaishi',
+      Name: '久石让',
+      OriginalTitle: 'Joe Hisaishi',
+      SortName: 'jiushirang joe hisaishi',
+      ServerId: DEMO_SERVER_ID,
+      Type: 'MusicArtist',
+      MediaType: 'Audio',
+      IsFolder: true,
+      ParentId: 'lib-music',
+      DateCreated: isoAgo(40),
+      CommunityRating: 9.7,
+      Genres: ['电影原声', '动漫', '钢琴'],
+      Tags: ['Hi-Res FLAC', '吉卜力'],
+      Overview:
+        '日本著名作曲家、指挥家与钢琴家，长期为宫崎骏动画创作配乐，代表作包括《千与千寻》《龙猫》《天空之城》等。',
+      ChildCount: 1,
+      ImageTags: { Primary: 'demo-p' },
+      BackdropImageTags: ['demo-b'],
+      PrimaryImageAspectRatio: 1,
+      UserData: {
+        PlaybackPositionTicks: 0,
+        PlayCount: 4,
+        IsFavorite: true,
+        Played: false,
+      },
+    },
+    ['#1e1b4b', '#312e81', '#38bdf8'],
+    'ARTIST',
+    TMDB_MEDIA_ART['item-spirited-away'],
+  )
 
   registerItem(
     {

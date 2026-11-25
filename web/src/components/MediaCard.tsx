@@ -5,6 +5,12 @@ import { getFallbackImageUrl, getImageUrl } from '../api/client'
 import type { BaseItemDto } from '../api/types'
 import { useAudioPlayer } from '../context/AudioPlayerContext'
 
+const TRENDING_TAGS = new Set(['trending', 'tmdb热门', '豆瓣热门电影', '豆瓣热门剧集'])
+
+function isTrendingTag(tag: string): boolean {
+  return TRENDING_TAGS.has(tag.trim().toLowerCase())
+}
+
 interface MediaCardProps {
   item: BaseItemDto
   variant?: 'poster' | 'landscape'
@@ -97,7 +103,7 @@ export function MediaCard({
       : `/play/${item.Id}`
   const hasDoubanTop250 = Boolean(item.Tags?.some((t) => t === '豆瓣Top250' || t === '豆瓣 Top250'))
   const hasImdbTop250 = Boolean(item.Tags?.some((t) => t === 'IMDb Top250' || t === 'IMDb Top 250'))
-  const hasTrending = Boolean(item.Tags?.some((t) => t.toLowerCase() === 'trending'))
+  const hasTrending = Boolean(item.Tags?.some(isTrendingTag))
   const hasProgressBar = (showProgress || progress > 0) && progress > 0
 
   const handleCardClick = (e: React.MouseEvent) => {

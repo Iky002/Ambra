@@ -724,6 +724,22 @@ func (e *ItemExtra) unmarshal(raw string) error {
 
 // GetSimilarItems finds items of the same type sharing genres with seedID, falling back to same-type items.
 func (r *LibraryRepo) GetSimilarItems(ctx context.Context, serverID, userID, seedID string, limit int, fields []string) ([]dto.BaseItemDto, int, error) {
+	return r.GetSimilarItemsWithPolicy(ctx, serverID, userID, seedID, limit, fields, nil, nil, nil)
+}
+
+// GetSimilarItemsWithPolicy finds similar items while enforcing library RBAC and parental policy.
+func (r *LibraryRepo) GetSimilarItemsWithPolicy(
+	ctx context.Context,
+	serverID, userID, seedID string,
+	limit int,
+	fields []string,
+	allowedLibraryIDs []string,
+	maxParentalRating *int,
+	blockedTags []string,
+) ([]dto.BaseItemDto, int, error) {
+	if allowedLibraryIDs != nil && len(allowedLibraryIDs) == 0 {
+		return []dto.BaseItemDto{}, 0, nil
+	}
 	seedID = guid.Normalize(seedID)
 	if limit <= 0 {
 		limit = 12
@@ -759,14 +775,17 @@ func (r *LibraryRepo) GetSimilarItems(ctx context.Context, serverID, userID, see
 
 	if len(genres) > 0 {
 		items, _, err := r.QueryItems(ctx, ItemFilter{
-			ServerID:         serverID,
-			UserID:           userID,
-			IncludeItemTypes: []string{seedType},
-			Genres:           genres,
-			SortBy:           []string{"CommunityRating", "DateCreated"},
-			SortOrder:        "Descending",
-			Limit:            limit + 1,
-			Fields:           fields,
+			ServerID:          serverID,
+			UserID:            userID,
+			AllowedLibraryIDs: allowedLibraryIDs,
+			MaxParentalRating: maxParentalRating,
+			BlockedTags:       blockedTags,
+			IncludeItemTypes:  []string{seedType},
+			Genres:            genres,
+			SortBy:            []string{"CommunityRating", "DateCreated"},
+			SortOrder:         "Descending",
+			Limit:             limit + 1,
+			Fields:            fields,
 		})
 		if err != nil {
 			return nil, 0, err
@@ -785,13 +804,16 @@ func (r *LibraryRepo) GetSimilarItems(ctx context.Context, serverID, userID, see
 
 	if len(result) < limit {
 		items, _, err := r.QueryItems(ctx, ItemFilter{
-			ServerID:         serverID,
-			UserID:           userID,
-			IncludeItemTypes: []string{seedType},
-			SortBy:           []string{"DateCreated"},
-			SortOrder:        "Descending",
-			Limit:            limit + len(seen),
-			Fields:           fields,
+			ServerID:          serverID,
+			UserID:            userID,
+			AllowedLibraryIDs: allowedLibraryIDs,
+			MaxParentalRating: maxParentalRating,
+			BlockedTags:       blockedTags,
+			IncludeItemTypes:  []string{seedType},
+			SortBy:            []string{"DateCreated"},
+			SortOrder:         "Descending",
+			Limit:             limit + len(seen),
+			Fields:            fields,
 		})
 		if err != nil {
 			return nil, 0, err
@@ -815,6 +837,22 @@ func (r *LibraryRepo) GetSimilarItems(ctx context.Context, serverID, userID, see
 
 // GetInstantMix generates an instant mix list seeded from an item, album, song, or playlist.
 func (r *LibraryRepo) GetInstantMix(ctx context.Context, serverID, userID, seedID string, limit int, fields []string) ([]dto.BaseItemDto, int, error) {
+	return r.GetInstantMixWithPolicy(ctx, serverID, userID, seedID, limit, fields, nil, nil, nil)
+}
+
+// GetInstantMixWithPolicy generates an instant mix while enforcing library RBAC and parental policy.
+func (r *LibraryRepo) GetInstantMixWithPolicy(
+	ctx context.Context,
+	serverID, userID, seedID string,
+	limit int,
+	fields []string,
+	allowedLibraryIDs []string,
+	maxParentalRating *int,
+	blockedTags []string,
+) ([]dto.BaseItemDto, int, error) {
+	if allowedLibraryIDs != nil && len(allowedLibraryIDs) == 0 {
+		return []dto.BaseItemDto{}, 0, nil
+	}
 	seedID = guid.Normalize(seedID)
 	if limit <= 0 {
 		limit = 50
@@ -866,13 +904,16 @@ func (r *LibraryRepo) GetInstantMix(ctx context.Context, serverID, userID, seedI
 
 	if len(genres) > 0 {
 		items, _, err := r.QueryItems(ctx, ItemFilter{
-			ServerID:         serverID,
-			UserID:           userID,
-			IncludeItemTypes: targetTypes,
-			Genres:           genres,
-			SortBy:           []string{"Random"},
-			Limit:            limit,
-			Fields:           fields,
+			ServerID:          serverID,
+			UserID:            userID,
+			AllowedLibraryIDs: allowedLibraryIDs,
+			MaxParentalRating: maxParentalRating,
+			BlockedTags:       blockedTags,
+			IncludeItemTypes:  targetTypes,
+			Genres:            genres,
+			SortBy:            []string{"Random"},
+			Limit:             limit,
+			Fields:            fields,
 		})
 		if err != nil {
 			return nil, 0, err
@@ -887,12 +928,15 @@ func (r *LibraryRepo) GetInstantMix(ctx context.Context, serverID, userID, seedI
 
 	if len(mix) < limit {
 		items, _, err := r.QueryItems(ctx, ItemFilter{
-			ServerID:         serverID,
-			UserID:           userID,
-			IncludeItemTypes: targetTypes,
-			SortBy:           []string{"Random"},
-			Limit:            limit,
-			Fields:           fields,
+			ServerID:          serverID,
+			UserID:            userID,
+			AllowedLibraryIDs: allowedLibraryIDs,
+			MaxParentalRating: maxParentalRating,
+			BlockedTags:       blockedTags,
+			IncludeItemTypes:  targetTypes,
+			SortBy:            []string{"Random"},
+			Limit:             limit,
+			Fields:            fields,
 		})
 		if err != nil {
 			return nil, 0, err
@@ -914,8 +958,25 @@ func (r *LibraryRepo) GetInstantMix(ctx context.Context, serverID, userID, seedI
 	return mix, len(mix), nil
 }
 
-// GetMovieRecommendations returns grouped movie recommendations by top genres and recent additions.
+// GetMovieRecommendations returns grouped movie recommendations by user history, top genres, and recent additions.
 func (r *LibraryRepo) GetMovieRecommendations(ctx context.Context, serverID, userID string, categoryLimit, itemLimit int, fields []string) ([]RecommendationCategory, error) {
+	return r.GetMovieRecommendationsWithPolicy(ctx, serverID, userID, categoryLimit, itemLimit, fields, nil, nil, nil)
+}
+
+// GetMovieRecommendationsWithPolicy returns personalized movie recommendations when userID has played/favorited movies,
+// falling back to top library genres and recent additions, while enforcing library RBAC and parental policy.
+func (r *LibraryRepo) GetMovieRecommendationsWithPolicy(
+	ctx context.Context,
+	serverID, userID string,
+	categoryLimit, itemLimit int,
+	fields []string,
+	allowedLibraryIDs []string,
+	maxParentalRating *int,
+	blockedTags []string,
+) ([]RecommendationCategory, error) {
+	if allowedLibraryIDs != nil && len(allowedLibraryIDs) == 0 {
+		return []RecommendationCategory{}, nil
+	}
 	if categoryLimit <= 0 {
 		categoryLimit = 5
 	}
@@ -923,69 +984,210 @@ func (r *LibraryRepo) GetMovieRecommendations(ctx context.Context, serverID, use
 		itemLimit = 8
 	}
 
-	// Pick top genres that have movies
-	rows, err := r.store.Reader.QueryContext(ctx, `
-		SELECT t.id, t.name, COUNT(*) AS cnt
-		FROM item_taxonomies it
-		JOIN taxonomies t ON t.id = it.taxonomy_id
-		JOIN items i ON i.id = it.item_id
-		WHERE t.kind = 'genre' AND i.type = 'Movie'
-		GROUP BY t.id, t.name
-		ORDER BY cnt DESC, t.sort_name ASC
-		LIMIT ?`, categoryLimit)
-	if err != nil {
-		return nil, err
-	}
-	type genreRow struct {
-		id   string
-		name string
-	}
-	var genres []genreRow
-	for rows.Next() {
-		var g genreRow
-		var cnt int
-		if err := rows.Scan(&g.id, &g.name, &cnt); err != nil {
-			rows.Close()
-			return nil, err
+	buildPolicyScope := func(alias string) (string, []any) {
+		var conds []string
+		var a []any
+		if len(allowedLibraryIDs) > 0 {
+			ph := make([]string, len(allowedLibraryIDs))
+			for i, lid := range allowedLibraryIDs {
+				ph[i] = "?"
+				a = append(a, guid.Normalize(lid))
+			}
+			conds = append(conds, fmt.Sprintf(`%s.library_id IN (%s)`, alias, strings.Join(ph, ",")))
 		}
-		genres = append(genres, g)
+		if pClauses, pArgs := appendParentalFilterSQL(alias, maxParentalRating, blockedTags); len(pClauses) > 0 {
+			conds = append(conds, pClauses...)
+			a = append(a, pArgs...)
+		}
+		if len(conds) == 0 {
+			return "", nil
+		}
+		return " AND " + strings.Join(conds, " AND "), a
 	}
-	rows.Close()
 
-	out := make([]RecommendationCategory, 0, len(genres)+1)
-	for _, g := range genres {
-		items, _, err := r.QueryItems(ctx, ItemFilter{
-			ServerID:         serverID,
-			UserID:           userID,
-			IncludeItemTypes: []string{"Movie"},
-			Genres:           []string{g.name},
-			SortBy:           []string{"CommunityRating", "DateCreated"},
-			SortOrder:        "Descending",
-			Limit:            itemLimit,
-			Fields:           fields,
-		})
+	out := make([]RecommendationCategory, 0, categoryLimit)
+	coveredGenres := make(map[string]bool)
+
+	// 1. Personalized recommendations based on the user's recently played / favorited movies.
+	uid := guid.Normalize(userID)
+	if uid != "" {
+		scopeSQL, scopeArgs := buildPolicyScope("i")
+		seedArgs := make([]any, 0, len(scopeArgs)+2)
+		seedArgs = append(seedArgs, uid)
+		seedArgs = append(seedArgs, scopeArgs...)
+		seedArgs = append(seedArgs, categoryLimit*2)
+
+		seedRows, err := r.store.Reader.QueryContext(ctx, `
+			SELECT i.id, i.name, COALESCE(u.is_favorite, 0)
+			FROM user_item_data u
+			JOIN items i ON i.id = u.item_id
+			WHERE u.user_id = ?
+			  AND i.type = 'Movie'
+			  AND COALESCE(json_extract(i.extra_json, '$.extra_type'), '') = ''
+			  AND (COALESCE(u.played, 0) = 1 OR COALESCE(u.is_favorite, 0) = 1)`+scopeSQL+`
+			ORDER BY COALESCE(u.is_favorite, 0) DESC, COALESCE(u.last_played_date, 0) DESC, i.date_modified DESC
+			LIMIT ?`, seedArgs...)
 		if err != nil {
 			return nil, err
 		}
-		if len(items) > 0 {
+		type seedMovie struct {
+			id    string
+			name  string
+			isFav bool
+		}
+		var seeds []seedMovie
+		for seedRows.Next() {
+			var sm seedMovie
+			var favInt int
+			if err := seedRows.Scan(&sm.id, &sm.name, &favInt); err != nil {
+				seedRows.Close()
+				return nil, err
+			}
+			sm.isFav = favInt == 1
+			seeds = append(seeds, sm)
+		}
+		seedRows.Close()
+
+		for _, seed := range seeds {
+			if len(out) >= categoryLimit {
+				break
+			}
+			gRows, err := r.store.Reader.QueryContext(ctx, `
+				SELECT t.name FROM item_taxonomies it
+				JOIN taxonomies t ON t.id = it.taxonomy_id
+				WHERE it.item_id = ? AND t.kind = 'genre'
+				ORDER BY t.sort_name ASC`, seed.id)
+			if err != nil {
+				return nil, err
+			}
+			var seedGenres []string
+			for gRows.Next() {
+				var g string
+				if err := gRows.Scan(&g); err == nil && g != "" {
+					seedGenres = append(seedGenres, g)
+				}
+			}
+			gRows.Close()
+			if len(seedGenres) == 0 {
+				continue
+			}
+
+			items, _, err := r.QueryItems(ctx, ItemFilter{
+				ServerID:          serverID,
+				UserID:            userID,
+				AllowedLibraryIDs: allowedLibraryIDs,
+				MaxParentalRating: maxParentalRating,
+				BlockedTags:       blockedTags,
+				IncludeItemTypes:  []string{"Movie"},
+				ExcludeItemIDs:    []string{seed.id},
+				Genres:            seedGenres,
+				SortBy:            []string{"CommunityRating", "DateCreated"},
+				SortOrder:         "Descending",
+				Limit:             itemLimit,
+				Fields:            fields,
+			})
+			if err != nil {
+				return nil, err
+			}
+			if len(items) == 0 {
+				continue
+			}
+			for _, g := range seedGenres {
+				coveredGenres[strings.ToLower(g)] = true
+			}
+			recType := "SimilarToRecentlyPlayed"
+			if seed.isFav {
+				recType = "SimilarToLikedItem"
+			}
 			out = append(out, RecommendationCategory{
 				Items:              items,
-				RecommendationType: "SimilarToRecentlyPlayed",
-				BaselineItemName:   g.name,
-				CategoryId:         g.id,
+				RecommendationType: recType,
+				BaselineItemName:   seed.name,
+				CategoryId:         seed.id,
 			})
+		}
+	}
+
+	// 2. Fall back to top library genres for any remaining category slots.
+	if len(out) < categoryLimit {
+		scopeSQL, scopeArgs := buildPolicyScope("i")
+		genreArgs := append(append([]any(nil), scopeArgs...), categoryLimit+len(coveredGenres))
+		rows, err := r.store.Reader.QueryContext(ctx, `
+			SELECT t.id, t.name, COUNT(*) AS cnt
+			FROM item_taxonomies it
+			JOIN taxonomies t ON t.id = it.taxonomy_id
+			JOIN items i ON i.id = it.item_id
+			WHERE t.kind = 'genre'
+			  AND i.type = 'Movie'
+			  AND COALESCE(json_extract(i.extra_json, '$.extra_type'), '') = ''`+scopeSQL+`
+			GROUP BY t.id, t.name
+			ORDER BY cnt DESC, t.sort_name ASC
+			LIMIT ?`, genreArgs...)
+		if err != nil {
+			return nil, err
+		}
+		type genreRow struct {
+			id   string
+			name string
+		}
+		var genres []genreRow
+		for rows.Next() {
+			var g genreRow
+			var cnt int
+			if err := rows.Scan(&g.id, &g.name, &cnt); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			genres = append(genres, g)
+		}
+		rows.Close()
+
+		for _, g := range genres {
+			if len(out) >= categoryLimit {
+				break
+			}
+			if coveredGenres[strings.ToLower(g.name)] {
+				continue
+			}
+			items, _, err := r.QueryItems(ctx, ItemFilter{
+				ServerID:          serverID,
+				UserID:            userID,
+				AllowedLibraryIDs: allowedLibraryIDs,
+				MaxParentalRating: maxParentalRating,
+				BlockedTags:       blockedTags,
+				IncludeItemTypes:  []string{"Movie"},
+				Genres:            []string{g.name},
+				SortBy:            []string{"CommunityRating", "DateCreated"},
+				SortOrder:         "Descending",
+				Limit:             itemLimit,
+				Fields:            fields,
+			})
+			if err != nil {
+				return nil, err
+			}
+			if len(items) > 0 {
+				out = append(out, RecommendationCategory{
+					Items:              items,
+					RecommendationType: "SimilarToRecentlyPlayed",
+					BaselineItemName:   g.name,
+					CategoryId:         g.id,
+				})
+			}
 		}
 	}
 
 	if len(out) == 0 {
 		items, _, err := r.QueryItems(ctx, ItemFilter{
-			ServerID:         serverID,
-			UserID:           userID,
-			IncludeItemTypes: []string{"Movie"},
-			SortBy:           []string{"DateCreated"},
-			SortOrder:        "Descending",
-			Limit:            itemLimit,
-			Fields:           fields,
+			ServerID:          serverID,
+			UserID:            userID,
+			AllowedLibraryIDs: allowedLibraryIDs,
+			MaxParentalRating: maxParentalRating,
+			BlockedTags:       blockedTags,
+			IncludeItemTypes:  []string{"Movie"},
+			SortBy:            []string{"DateCreated"},
+			SortOrder:         "Descending",
+			Limit:             itemLimit,
+			Fields:            fields,
 		})
 		if err != nil {
 			return nil, err
@@ -1002,6 +1204,192 @@ func (r *LibraryRepo) GetMovieRecommendations(ctx context.Context, serverID, use
 	return out, nil
 }
 
+// QueryFiltersFilter scopes GET /Items/Filters and GET /Items/Filters2.
+type QueryFiltersFilter struct {
+	ParentID          string
+	IncludeItemTypes  []string
+	AllowedLibraryIDs []string
+	MaxParentalRating *int
+	BlockedTags       []string
+}
+
+// QueryFiltersResult holds distinct filter dimensions for /Items/Filters and /Items/Filters2.
+type QueryFiltersResult struct {
+	Genres          []dto.NameIdPair
+	Studios         []dto.NameIdPair
+	Tags            []string
+	OfficialRatings []string
+	Years           []int
+}
+
+// GetQueryFilters returns distinct Genres, Studios, Tags, OfficialRatings, and Years scoped to f.
+func (r *LibraryRepo) GetQueryFilters(ctx context.Context, f QueryFiltersFilter) (*QueryFiltersResult, error) {
+	res := &QueryFiltersResult{
+		Genres:          []dto.NameIdPair{},
+		Studios:         []dto.NameIdPair{},
+		Tags:            []string{},
+		OfficialRatings: []string{},
+		Years:           []int{},
+	}
+	if f.AllowedLibraryIDs != nil && len(f.AllowedLibraryIDs) == 0 {
+		return res, nil
+	}
+
+	parentID := guid.Normalize(f.ParentID)
+	var (
+		conds = []string{`COALESCE(json_extract(i.extra_json, '$.extra_type'), '') = ''`}
+		args  []any
+	)
+	if parentID != "" {
+		conds = append(conds, `(i.library_id = ? OR i.parent_id = ? OR EXISTS (SELECT 1 FROM item_ancestors ia WHERE ia.ancestor_id = ? AND ia.descendant_id = i.id))`)
+		args = append(args, parentID, parentID, parentID)
+	}
+	if len(f.IncludeItemTypes) > 0 {
+		ph := make([]string, len(f.IncludeItemTypes))
+		for idx, t := range f.IncludeItemTypes {
+			ph[idx] = "?"
+			args = append(args, t)
+		}
+		conds = append(conds, fmt.Sprintf(`i.type IN (%s)`, strings.Join(ph, ",")))
+	}
+	if len(f.AllowedLibraryIDs) > 0 {
+		ph := make([]string, len(f.AllowedLibraryIDs))
+		for idx, lid := range f.AllowedLibraryIDs {
+			ph[idx] = "?"
+			args = append(args, guid.Normalize(lid))
+		}
+		conds = append(conds, fmt.Sprintf(`i.library_id IN (%s)`, strings.Join(ph, ",")))
+	}
+	if pClauses, pArgs := appendParentalFilterSQL("i", f.MaxParentalRating, f.BlockedTags); len(pClauses) > 0 {
+		conds = append(conds, pClauses...)
+		args = append(args, pArgs...)
+	}
+	scope := strings.Join(conds, " AND ")
+
+	// 1. Genres
+	gRows, err := r.store.Reader.QueryContext(ctx, `
+		SELECT DISTINCT t.id, t.name
+		FROM taxonomies t
+		JOIN item_taxonomies it ON it.taxonomy_id = t.id
+		JOIN items i ON i.id = it.item_id
+		WHERE t.kind = 'genre' AND `+scope+`
+		ORDER BY t.sort_name ASC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	for gRows.Next() {
+		var p dto.NameIdPair
+		if err := gRows.Scan(&p.Id, &p.Name); err != nil {
+			gRows.Close()
+			return nil, err
+		}
+		res.Genres = append(res.Genres, p)
+	}
+	if err := gRows.Err(); err != nil {
+		gRows.Close()
+		return nil, err
+	}
+	gRows.Close()
+
+	// 2. Studios
+	sRows, err := r.store.Reader.QueryContext(ctx, `
+		SELECT DISTINCT t.id, t.name
+		FROM taxonomies t
+		JOIN item_taxonomies it ON it.taxonomy_id = t.id
+		JOIN items i ON i.id = it.item_id
+		WHERE t.kind = 'studio' AND `+scope+`
+		ORDER BY t.sort_name ASC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	for sRows.Next() {
+		var p dto.NameIdPair
+		if err := sRows.Scan(&p.Id, &p.Name); err != nil {
+			sRows.Close()
+			return nil, err
+		}
+		res.Studios = append(res.Studios, p)
+	}
+	if err := sRows.Err(); err != nil {
+		sRows.Close()
+		return nil, err
+	}
+	sRows.Close()
+
+	// 3. Tags
+	tRows, err := r.store.Reader.QueryContext(ctx, `
+		SELECT DISTINCT t.name
+		FROM taxonomies t
+		JOIN item_taxonomies it ON it.taxonomy_id = t.id
+		JOIN items i ON i.id = it.item_id
+		WHERE t.kind = 'tag' AND `+scope+`
+		ORDER BY t.sort_name ASC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	for tRows.Next() {
+		var name string
+		if err := tRows.Scan(&name); err != nil {
+			tRows.Close()
+			return nil, err
+		}
+		res.Tags = append(res.Tags, name)
+	}
+	if err := tRows.Err(); err != nil {
+		tRows.Close()
+		return nil, err
+	}
+	tRows.Close()
+
+	// 4. OfficialRatings
+	rRows, err := r.store.Reader.QueryContext(ctx, `
+		SELECT DISTINCT i.official_rating
+		FROM items i
+		WHERE i.official_rating IS NOT NULL AND i.official_rating != '' AND `+scope+`
+		ORDER BY lower(i.official_rating) ASC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	for rRows.Next() {
+		var rating string
+		if err := rRows.Scan(&rating); err != nil {
+			rRows.Close()
+			return nil, err
+		}
+		res.OfficialRatings = append(res.OfficialRatings, rating)
+	}
+	if err := rRows.Err(); err != nil {
+		rRows.Close()
+		return nil, err
+	}
+	rRows.Close()
+
+	// 5. Years
+	yRows, err := r.store.Reader.QueryContext(ctx, `
+		SELECT DISTINCT i.production_year
+		FROM items i
+		WHERE i.production_year IS NOT NULL AND `+scope+`
+		ORDER BY i.production_year DESC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	for yRows.Next() {
+		var y int
+		if err := yRows.Scan(&y); err != nil {
+			yRows.Close()
+			return nil, err
+		}
+		res.Years = append(res.Years, y)
+	}
+	if err := yRows.Err(); err != nil {
+		yRows.Close()
+		return nil, err
+	}
+	yRows.Close()
+
+	return res, nil
+}
+
 // ListFilterValues dynamically aggregates distinct filter values (genres, tags, codecs, containers, etc.)
 // from SQLite tables and returns them as Emby-compatible BaseItemDto records.
 func (r *LibraryRepo) ListFilterValues(
@@ -1010,6 +1398,22 @@ func (r *LibraryRepo) ListFilterValues(
 	includeItemTypes []string,
 	startIndex, limit int,
 ) ([]dto.BaseItemDto, int, error) {
+	return r.ListFilterValuesWithPolicy(ctx, serverID, dimension, parentID, includeItemTypes, startIndex, limit, nil, nil, nil)
+}
+
+// ListFilterValuesWithPolicy dynamically aggregates distinct filter values while enforcing library RBAC and parental policy.
+func (r *LibraryRepo) ListFilterValuesWithPolicy(
+	ctx context.Context,
+	serverID, dimension, parentID string,
+	includeItemTypes []string,
+	startIndex, limit int,
+	allowedLibraryIDs []string,
+	maxParentalRating *int,
+	blockedTags []string,
+) ([]dto.BaseItemDto, int, error) {
+	if allowedLibraryIDs != nil && len(allowedLibraryIDs) == 0 {
+		return []dto.BaseItemDto{}, 0, nil
+	}
 	if limit <= 0 {
 		limit = 200
 	}
@@ -1035,6 +1439,18 @@ func (r *LibraryRepo) ListFilterValues(
 				a = append(a, t)
 			}
 			conds = append(conds, fmt.Sprintf(`%s.type IN (%s)`, alias, strings.Join(ph, ",")))
+		}
+		if len(allowedLibraryIDs) > 0 {
+			ph := make([]string, len(allowedLibraryIDs))
+			for i, lid := range allowedLibraryIDs {
+				ph[i] = "?"
+				a = append(a, guid.Normalize(lid))
+			}
+			conds = append(conds, fmt.Sprintf(`%s.library_id IN (%s)`, alias, strings.Join(ph, ",")))
+		}
+		if pClauses, pArgs := appendParentalFilterSQL(alias, maxParentalRating, blockedTags); len(pClauses) > 0 {
+			conds = append(conds, pClauses...)
+			a = append(a, pArgs...)
 		}
 		if len(conds) == 0 {
 			return "", nil

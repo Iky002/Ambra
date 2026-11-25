@@ -67,13 +67,13 @@ func RegisterRoutes(r chi.Router, authMW *middleware.Auth, h *Handler) {
 		pr.Get("/System/Info", h.GetSystemInfo)
 		pr.Get("/System/Configuration", h.GetConfiguration)
 		pr.Get("/System/Configuration/{Key}", h.GetNamedConfiguration)
-		pr.Get("/System/ActivityLog/Entries", h.GetActivityLogEntries)
 		pr.Get("/Plugins", h.GetPlugins)
 	})
 
-	// Admin-only system mutation routes
+	// Admin-only system routes
 	r.Group(func(ar chi.Router) {
 		ar.Use(authMW.RequireAdmin)
+		ar.Get("/System/ActivityLog/Entries", h.GetActivityLogEntries)
 		ar.Post("/System/Configuration", h.UpdateConfiguration)
 		ar.Post("/System/Configuration/{Key}", h.UpdateNamedConfiguration)
 	})
@@ -131,11 +131,15 @@ type ServerConfigurationDto struct {
 	UICulture                string  `json:"UICulture"`
 }
 
-func (h *Handler) GetConfiguration(w http.ResponseWriter, _ *http.Request) {
+func (h *Handler) GetConfiguration(w http.ResponseWriter, r *http.Request) {
+	tmdbKey := ""
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.IsAdmin() {
+		tmdbKey = h.cfg.TMDBApiKey
+	}
 	httpx.JSON(w, http.StatusOK, ServerConfigurationDto{
 		ServerName:                h.cfg.ServerName,
 		IsStartupWizardCompleted:  h.cfg.IsStartupWizardCompleted,
-		TMDBApiKey:                h.cfg.TMDBApiKey,
+		TMDBApiKey:                tmdbKey,
 		TMDBLanguage:              h.cfg.TMDBLanguage,
 		EnableSTRM302:             h.cfg.EnableSTRM302,
 		PlayedThreshold:           h.cfg.PlayedThreshold,
