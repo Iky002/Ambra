@@ -1,4 +1,5 @@
 import { isDemoMode } from '../demo/demoMode'
+import { getActiveLocale } from '../i18n/I18nContext'
 import {
   demoFetch,
   getDemoAudioUrl,
@@ -132,6 +133,9 @@ export async function embyFetch<T>(
     headers.set('Content-Type', 'application/json')
   }
   headers.set('Accept', 'application/json')
+  if (!headers.has('Accept-Language')) {
+    headers.set('Accept-Language', getActiveLocale())
+  }
 
   const token = auth?.accessToken
   headers.set('X-Emby-Authorization', buildEmbyAuthHeader(token))

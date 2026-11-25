@@ -27,7 +27,9 @@ import {
 import { Navigate, useNavigate } from 'react-router-dom'
 import { api } from '../api/client'
 import { AmbraLogo } from '../components/AmbraLogo'
+import { LanguageSwitcher } from '../components/LanguageSwitcher'
 import { useAuth } from '../context/AuthContext'
+import { useI18n } from '../i18n/I18nContext'
 import { AdminModal, ToggleSwitch } from './admin/adminUtils'
 
 type WizardStep = 1 | 2 | 3 | 4
@@ -82,6 +84,7 @@ function getParentPath(path: string): string {
 
 export function SetupWizardPage() {
   const { auth, applyAuthResult } = useAuth()
+  const { locale, t } = useI18n()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
 
@@ -304,6 +307,11 @@ export function SetupWizardPage() {
 
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#07070b] px-4 py-10">
+      {/* 右上角语言切换 */}
+      <div className="absolute right-4 top-4 z-20 sm:right-6 sm:top-6">
+        <LanguageSwitcher />
+      </div>
+
       {/* 影院氛围背景光晕 */}
       <div className="pointer-events-none absolute -left-32 -top-32 h-96 w-96 rounded-full bg-amber-500/15 blur-[130px]" />
       <div className="pointer-events-none absolute -bottom-32 -right-32 h-96 w-96 rounded-full bg-orange-600/15 blur-[130px]" />
@@ -314,9 +322,11 @@ export function SetupWizardPage() {
           <div className="mb-3.5 flex justify-center">
             <AmbraLogo size={54} />
           </div>
-          <h1 className="text-2xl font-bold tracking-tight text-zinc-50">欢迎使用 Ambra</h1>
+          <h1 className="text-2xl font-bold tracking-tight text-zinc-50">{t('setup.title')}</h1>
           <p className="mt-1.5 text-xs text-zinc-400">
-            首次运行初始化向导 · 只需 4 步完成你的专属私人影院部署
+            {locale === 'zh-CN'
+              ? '首次运行初始化向导 · 只需 4 步完成你的专属私人影院部署'
+              : t('setup.subtitle')}
           </p>
         </div>
 
@@ -391,7 +401,7 @@ export function SetupWizardPage() {
                     htmlFor="setup-server-name"
                     className="mb-1.5 block text-xs font-medium text-zinc-400"
                   >
-                    服务器名称
+                    {t('setup.serverName')}
                   </label>
                   <div className="relative">
                     <Server className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500" />
@@ -415,7 +425,7 @@ export function SetupWizardPage() {
                       htmlFor="setup-language"
                       className="mb-1.5 block text-xs font-medium text-zinc-400"
                     >
-                      首选刮削语言
+                      {locale === 'zh-CN' ? '首选刮削语言' : t('setup.tmdbLanguage')}
                     </label>
                     <div className="relative">
                       <Globe className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500" />
@@ -476,7 +486,9 @@ export function SetupWizardPage() {
           {step === 2 && (
             <form onSubmit={handleStep2Submit} className="space-y-5">
               <div>
-                <h2 className="text-lg font-semibold text-zinc-100">第 2 步 · 创建管理员账号</h2>
+                <h2 className="text-lg font-semibold text-zinc-100">
+                  {locale === 'zh-CN' ? '第 2 步 · 创建管理员账号' : t('setup.createAdmin')}
+                </h2>
                 <p className="mt-1 text-xs text-zinc-400">
                   此账号拥有服务器完整管理权限，创建完成后将自动为您登录
                 </p>
@@ -768,7 +780,7 @@ export function SetupWizardPage() {
                     htmlFor="setup-tmdb-key"
                     className="mb-1.5 block text-xs font-medium text-zinc-400"
                   >
-                    TMDB API Key（可选）
+                    {t('setup.tmdbApiKey')}
                   </label>
                   <div className="relative">
                     <KeyRound className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500" />
@@ -861,7 +873,9 @@ export function SetupWizardPage() {
                   ) : (
                     <>
                       <Sparkles className="h-4 w-4" />
-                      <span>完成初始化并进入 Ambra</span>
+                      <span>
+                        {locale === 'zh-CN' ? '完成初始化并进入 Ambra' : t('setup.complete')}
+                      </span>
                     </>
                   )}
                 </button>

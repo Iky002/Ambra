@@ -14,6 +14,7 @@ import {
 import { api } from '../api/client'
 import type { NotificationItem } from '../api/types'
 import { useAuth } from '../context/AuthContext'
+import { useI18n } from '../i18n/I18nContext'
 import { formatRelativeTime } from '../pages/admin/adminUtils'
 
 type NotificationLevel = 'Normal' | 'Warning' | 'Error'
@@ -43,6 +44,7 @@ function getLevelPresentation(level: string) {
 
 export function NotificationBell() {
   const { auth, isAdmin } = useAuth()
+  const { locale, t } = useI18n()
   const queryClient = useQueryClient()
   const containerRef = useRef<HTMLDivElement | null>(null)
 
@@ -156,7 +158,7 @@ export function NotificationBell() {
       <button
         type="button"
         data-testid="notification-bell-button"
-        aria-label="通知中心"
+        aria-label={t('notifications.title')}
         aria-expanded={open}
         aria-haspopup="dialog"
         onClick={() => setOpen((prev) => !prev)}
@@ -180,7 +182,7 @@ export function NotificationBell() {
       {open && (
         <div
           role="dialog"
-          aria-label="通知中心"
+          aria-label={t('notifications.title')}
           data-testid="notification-dropdown"
           className="absolute right-0 z-50 mt-2 w-80 overflow-hidden rounded-2xl border border-white/12 bg-[#111118]/98 shadow-2xl shadow-black/60 backdrop-blur-xl sm:w-96"
         >
@@ -188,7 +190,7 @@ export function NotificationBell() {
           <div className="flex items-center justify-between gap-2 border-b border-white/8 px-4 py-3">
             <div className="flex items-center gap-2">
               <Bell className="h-4 w-4 text-amber-400" />
-              <h2 className="text-sm font-semibold text-zinc-100">通知中心</h2>
+              <h2 className="text-sm font-semibold text-zinc-100">{t('notifications.title')}</h2>
               {unreadCount > 0 && (
                 <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-300">
                   {unreadCount} 未读
@@ -223,7 +225,7 @@ export function NotificationBell() {
                   className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-medium text-amber-300 transition-colors hover:bg-amber-500/15 disabled:opacity-50"
                 >
                   <CheckCheck className="h-3.5 w-3.5" />
-                  <span>全部标为已读</span>
+                  <span>{locale === 'zh-CN' ? '全部标为已读' : t('notifications.markAllRead')}</span>
                 </button>
               )}
             </div>
@@ -320,12 +322,12 @@ export function NotificationBell() {
                   onClick={() => void refetchList()}
                   className="rounded-lg border border-white/10 bg-white/[0.04] px-3 py-1 text-zinc-200 hover:border-amber-400/40 hover:text-amber-300"
                 >
-                  重试
+                  {t('common.retry')}
                 </button>
               </div>
             ) : notifications.length === 0 ? (
               <div className="px-4 py-10 text-center text-xs text-zinc-500">
-                暂无新通知
+                {locale === 'zh-CN' ? '暂无新通知' : t('notifications.empty')}
               </div>
             ) : (
               notifications.map((item) => {

@@ -18,6 +18,7 @@ import {
 import { NavLink, Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { api } from '../api/client'
 import { AmbraLogo } from '../components/AmbraLogo'
+import { useI18n } from '../i18n/I18nContext'
 import { DashboardTab } from './admin/DashboardTab'
 import { DevicesKeysTab } from './admin/DevicesKeysTab'
 import { HealthAndAuditTab } from './admin/HealthAndAuditTab'
@@ -35,73 +36,73 @@ import { FeedbackBanner } from './admin/adminUtils'
 const ADMIN_TABS = [
   {
     path: 'dashboard',
-    label: '概览与监控',
+    labelKey: 'admin.tabDashboard',
     desc: '状态 · 会话 · 活动日志',
     icon: Activity,
   },
   {
     path: 'settings',
-    label: '常规设置',
+    labelKey: 'admin.tabSettings',
     desc: '名称 · TMDB · 302 · 阈值',
     icon: SlidersHorizontal,
   },
   {
     path: 'users',
-    label: '用户与权限',
+    labelKey: 'admin.tabUsers',
     desc: '账号 · 密码 · RBAC 策略',
     icon: Users,
   },
   {
     path: 'libraries',
-    label: '媒体库管理',
+    labelKey: 'admin.tabLibraries',
     desc: '挂载目录 · 扫描 · 删除',
     icon: FolderOpen,
   },
   {
     path: 'metadata',
-    label: '元数据与榜单',
+    labelKey: 'admin.tabRankings',
     desc: '豆瓣/IMDb · 编辑 · 识别',
     icon: Sparkles,
   },
   {
     path: 'devices',
-    label: '设备与密钥',
+    labelKey: 'admin.tabDevicesKeys',
     desc: '设备注销 · API Keys',
     icon: Key,
   },
   {
     path: 'plugins',
-    label: '插件与刮削',
+    labelKey: 'admin.tabPlugins',
     desc: 'TMDB · NFO · STRM 配置',
     icon: Puzzle,
   },
   {
     path: 'tasks',
-    label: '任务与日志',
+    labelKey: 'admin.tabTasksLogs',
     desc: '计划任务 · 服务器日志',
     icon: CalendarClock,
   },
   {
     path: 'livetv',
-    label: '电视直播',
+    labelKey: 'admin.tabLiveTv',
     desc: 'M3U 源 · XMLTV · 频道',
     icon: Radio,
   },
   {
     path: 'webhooks',
-    label: 'Webhook 通知',
+    labelKey: 'admin.tabWebhooks',
     desc: '事件推送 · HMAC · 测试',
     icon: Webhook,
   },
   {
     path: 'health',
-    label: '健康与治理',
+    labelKey: 'admin.tabBackup',
     desc: '系统体检 · 审校 · NFO',
     icon: HeartPulse,
   },
   {
     path: 'migration',
-    label: 'Emby 迁移',
+    labelKey: 'admin.tabMigration',
     desc: '一键导入用户与进度',
     icon: ArrowRightLeft,
   },
@@ -161,6 +162,7 @@ class AdminTabErrorBoundary extends Component<
 }
 
 export function AdminPage() {
+  const { t, locale } = useI18n()
   const location = useLocation()
   const navRef = useRef<HTMLElement | null>(null)
   const savedScrollLeftRef = useRef<number>(0)
@@ -212,7 +214,11 @@ export function AdminPage() {
       {/* 控制台顶部品牌栏 */}
       <div className="flex flex-col gap-4 border-b border-white/8 pb-5 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-3">
-          <AmbraLogo size={40} showWordmark subtitle="管理控制台 · Admin Console" />
+          <AmbraLogo
+            size={40}
+            showWordmark
+            subtitle={locale === 'zh-CN' ? '管理控制台 · Admin Console' : t('admin.title')}
+          />
         </div>
 
         <button
@@ -260,7 +266,7 @@ export function AdminPage() {
                 >
                   <Icon className="h-4 w-4 shrink-0" />
                   <div className="min-w-0">
-                    <p className="truncate text-sm font-medium">{tab.label}</p>
+                    <p className="truncate text-sm font-medium">{t(tab.labelKey)}</p>
                     <p className="hidden truncate text-[11px] text-zinc-500 xl:block">{tab.desc}</p>
                   </div>
                 </NavLink>

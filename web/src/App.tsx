@@ -8,6 +8,7 @@ import { AudioPlayerProvider } from './context/AudioPlayerContext'
 import { AuthProvider, useAuth } from './context/AuthContext'
 import { WebSocketProvider } from './context/WebSocketContext'
 import { isDemoMode } from './demo/demoMode'
+import { I18nProvider, useI18n } from './i18n/I18nContext'
 import { AdminPage } from './pages/AdminPage'
 import { CollectionsPage } from './pages/CollectionsPage'
 import { FavoritesPage } from './pages/FavoritesPage'
@@ -48,10 +49,11 @@ function RequireAuth({
 
 function RequireAdmin({ children }: { children: React.ReactNode }) {
   const { isAdmin, userLoading } = useAuth()
+  const { t } = useI18n()
   if (userLoading) {
     return (
       <div className="flex min-h-[60vh] items-center justify-center text-sm text-zinc-400">
-        正在校验管理员权限...
+        {t('auth.verifyingAdmin')}
       </div>
     )
   }
@@ -62,16 +64,16 @@ function RequireAdmin({ children }: { children: React.ReactNode }) {
           <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-amber-500/15 text-amber-400 ring-1 ring-amber-500/30">
             <ShieldAlert className="h-7 w-7" />
           </div>
-          <h1 className="text-lg font-semibold text-zinc-100">无权访问管理控制台</h1>
+          <h1 className="text-lg font-semibold text-zinc-100">{t('auth.noAdminTitle')}</h1>
           <p className="mt-2 text-xs leading-relaxed text-zinc-400">
-            当前账号不具备管理员权限（IsAdministrator = false）。如需管理服务器配置、用户或媒体库，请联系系统管理员授权。
+            {t('auth.noAdminDesc')}
           </p>
           <Link
             to="/"
             replace
             className="mt-6 inline-flex items-center justify-center rounded-xl bg-amber-500 px-5 py-2.5 text-sm font-semibold text-zinc-950 transition-colors hover:bg-amber-400"
           >
-            返回首页
+            {t('auth.backHome')}
           </Link>
         </div>
       </div>
@@ -151,17 +153,19 @@ function AppRoutes() {
 
 export default function App() {
   return (
-    <QueryClientProvider client={queryClient}>
-      <AuthProvider>
-        <WebSocketProvider>
-          <AudioPlayerProvider>
-            <HashRouter>
-              <ScrollToTop />
-              <AppRoutes />
-            </HashRouter>
-          </AudioPlayerProvider>
-        </WebSocketProvider>
-      </AuthProvider>
-    </QueryClientProvider>
+    <I18nProvider>
+      <QueryClientProvider client={queryClient}>
+        <AuthProvider>
+          <WebSocketProvider>
+            <AudioPlayerProvider>
+              <HashRouter>
+                <ScrollToTop />
+                <AppRoutes />
+              </HashRouter>
+            </AudioPlayerProvider>
+          </WebSocketProvider>
+        </AuthProvider>
+      </QueryClientProvider>
+    </I18nProvider>
   )
 }

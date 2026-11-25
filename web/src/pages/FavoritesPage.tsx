@@ -4,9 +4,11 @@ import { api } from '../api/client'
 import { MediaCard } from '../components/MediaCard'
 import { QueryErrorState } from '../components/QueryErrorState'
 import { useAuth } from '../context/AuthContext'
+import { useI18n } from '../i18n/I18nContext'
 
 export function FavoritesPage() {
   const { auth } = useAuth()
+  const { t } = useI18n()
   const userId = auth!.userId
 
   const { data, isLoading, isError, error, refetch } = useQuery({
@@ -30,7 +32,7 @@ export function FavoritesPage() {
           <Heart className="h-5 w-5 fill-current" />
         </div>
         <div>
-          <h1 className="text-2xl font-bold text-white">我的收藏</h1>
+          <h1 className="text-2xl font-bold text-white">{t('favorites.title')}</h1>
           <p className="text-xs text-zinc-400">共收藏 {items.length} 部影片与剧集</p>
         </div>
       </div>
@@ -47,8 +49,9 @@ export function FavoritesPage() {
           backTo="/"
         />
       ) : items.length === 0 ? (
-        <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-20 text-center text-sm text-zinc-500">
-          还没有收藏任何影片，在详情页点击爱心即可加入收藏
+        <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-20 text-center">
+          <p className="text-sm font-medium text-zinc-300">{t('favorites.emptyTitle')}</p>
+          <p className="mt-1.5 text-xs text-zinc-500">{t('favorites.emptyDesc')}</p>
         </div>
       ) : (
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">

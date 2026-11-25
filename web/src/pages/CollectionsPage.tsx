@@ -20,6 +20,7 @@ import { MediaCard } from '../components/MediaCard'
 import { QueryErrorState } from '../components/QueryErrorState'
 import { useAudioPlayer } from '../context/AudioPlayerContext'
 import { useAuth } from '../context/AuthContext'
+import { useI18n } from '../i18n/I18nContext'
 import { AdminModal, FeedbackBanner } from './admin/adminUtils'
 
 type CollectionTab = 'BoxSet' | 'Playlist'
@@ -27,6 +28,7 @@ type CollectionTab = 'BoxSet' | 'Playlist'
 export function CollectionsPage() {
   const { id: selectedId } = useParams<{ id: string }>()
   const { auth } = useAuth()
+  const { t } = useI18n()
   const { playQueue } = useAudioPlayer()
   const userId = auth!.userId
   const navigate = useNavigate()
@@ -239,10 +241,10 @@ export function CollectionsPage() {
                 <Layers className="h-6 w-6 text-amber-400" />
               )}
               <h1 className="text-2xl font-bold tracking-tight text-white">
-                {selectedContainer?.Name || '加载中...'}
+                {selectedContainer?.Name || t('common.loading')}
               </h1>
               <span className="rounded-full bg-white/10 px-2.5 py-0.5 text-xs text-zinc-300">
-                {isSelectedPlaylist ? '播放列表' : '合集'} · {members.length} 部
+                {isSelectedPlaylist ? t('collections.playlists') : t('collections.boxSets')} · {members.length} 部
               </span>
             </div>
             {selectedContainer?.Overview && (
@@ -278,7 +280,7 @@ export function CollectionsPage() {
                   className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-3.5 py-2 text-xs font-semibold text-zinc-950 shadow-md shadow-amber-500/20 transition-colors hover:bg-amber-400"
                 >
                   <Play className="h-3.5 w-3.5 fill-current" />
-                  <span>播放全部</span>
+                  <span>{t('collections.playAll')}</span>
                 </button>
               )}
               <button
@@ -427,7 +429,7 @@ export function CollectionsPage() {
         <div>
           <h1 className="flex items-center gap-2.5 text-2xl font-bold tracking-tight text-white">
             <Library className="h-6 w-6 text-amber-400" />
-            <span>合集与播放列表</span>
+            <span>{t('collections.title')}</span>
           </h1>
           <p className="mt-1 text-xs text-zinc-400">
             浏览系列电影合集（BoxSet）与自定义播放列表，点击即可管理列表内的全部作品
@@ -446,7 +448,7 @@ export function CollectionsPage() {
               }`}
             >
               <Layers className="h-3.5 w-3.5" />
-              <span>合集 (BoxSet)</span>
+              <span>{t('collections.boxSets')} (BoxSet)</span>
               <span
                 className={`rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${
                   activeTab === 'BoxSet' ? 'bg-black/20 text-zinc-950' : 'bg-white/10 text-zinc-300'
@@ -466,7 +468,7 @@ export function CollectionsPage() {
               }`}
             >
               <ListVideo className="h-3.5 w-3.5" />
-              <span>播放列表</span>
+              <span>{t('collections.playlists')}</span>
               <span
                 className={`rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${
                   activeTab === 'Playlist'
@@ -485,7 +487,11 @@ export function CollectionsPage() {
             className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-3.5 py-2 text-xs font-semibold text-zinc-950 shadow-md shadow-amber-500/20 transition-colors hover:bg-amber-400"
           >
             <Plus className="h-4 w-4" />
-            <span>{activeTab === 'BoxSet' ? '新建合集' : '新建播放列表'}</span>
+            <span>
+              {activeTab === 'BoxSet'
+                ? t('collections.createCollection')
+                : t('collections.createPlaylist')}
+            </span>
           </button>
         </div>
       </div>
@@ -559,7 +565,11 @@ export function CollectionsPage() {
       {/* 新建合集 / 播放列表弹窗 */}
       <AdminModal
         open={createOpen}
-        title={createType === 'BoxSet' ? '新建合集' : '新建播放列表'}
+        title={
+          createType === 'BoxSet'
+            ? t('collections.createCollection')
+            : t('collections.createPlaylist')
+        }
         subtitle={
           createType === 'BoxSet'
             ? '创建一个新的系列合集（BoxSet）'
