@@ -34,6 +34,12 @@ func TestDefault(t *testing.T) {
 	if cfg2.ImageCacheDir() != filepath.Join("/custom/dir", "cache", "images") {
 		t.Fatalf("unexpected ImageCacheDir: %q", cfg2.ImageCacheDir())
 	}
+	if cfg2.ChapterCacheDir() != filepath.Join("/custom/dir", "cache", "chapters") {
+		t.Fatalf("unexpected ChapterCacheDir: %q", cfg2.ChapterCacheDir())
+	}
+	if cfg2.BifCacheDir() != filepath.Join("/custom/dir", "cache", "bif") {
+		t.Fatalf("unexpected BifCacheDir: %q", cfg2.BifCacheDir())
+	}
 	if cfg2.SubtitleCacheDir() != filepath.Join("/custom/dir", "cache", "subtitles") {
 		t.Fatalf("unexpected SubtitleCacheDir: %q", cfg2.SubtitleCacheDir())
 	}
@@ -480,6 +486,55 @@ func TestUpdateTMDBClearsEnvFlagAndConcurrentSave(t *testing.T) {
 	}
 	if reloaded.TMDBApiKey != "admin-updated-tmdb-key" {
 		t.Fatalf("expected reloaded TMDBApiKey=admin-updated-tmdb-key, got %q", reloaded.TMDBApiKey)
+	}
+}
+
+func TestEffectiveTMDBApiKeyFallbackAndOverride(t *testing.T) {
+	t.Setenv("AMBRA_TMDB_API_KEY", "")
+
+	var nilCfg *Config
+	if got := nilCfg.EffectiveTMDBApiKey(); got != DefaultTMDBApiKey {
+		t.Fatalf("expected nil Config EffectiveTMDBApiKey=%q, got %q", DefaultTMDBApiKey, got)
+	}
+
+	dir := t.TempDir()
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TMDBApiKey != "" {
+		t.Fatalf("expected empty user TMDBApiKey by default, got %q", cfg.TMDBApiKey)
+	}
+	if got := cfg.EffectiveTMDBApiKey(); got != DefaultTMDBApiKey {
+		t.Fatalf("expected fallback DefaultTMDBApiKey=%q, got %q", DefaultTMDBApiKey, got)
+	}
+
+	// Default built-in key must not be persisted to ambra.json when user hasn't configured one.
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "config", "ambra.json"))
+	if err != nil {
+		t.Fatalf("read ambra.json: %v", err)
+	}
+	if containsString(string(raw), DefaultTMDBApiKey) {
+		t.Fatalf("built-in DefaultTMDBApiKey must not be written to ambra.json: %s", string(raw))
+	}
+
+	// User custom key overrides built-in fallback.
+	cfg.Update(func(c *Config) {
+		c.TMDBApiKey = "  user-custom-key  "
+	})
+	if got := cfg.EffectiveTMDBApiKey(); got != "user-custom-key" {
+		t.Fatalf("expected custom key override, got %q", got)
+	}
+
+	// Clearing user custom key falls back to built-in default again.
+	cfg.Update(func(c *Config) {
+		c.TMDBApiKey = ""
+	})
+	if got := cfg.EffectiveTMDBApiKey(); got != DefaultTMDBApiKey {
+		t.Fatalf("expected fallback to DefaultTMDBApiKey after clear, got %q", got)
 	}
 }
 

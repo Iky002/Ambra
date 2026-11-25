@@ -2,8 +2,6 @@ package streaming
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -331,11 +329,53 @@ func appendAPIKeyQuery(rawURL, token string) string {
 
 func (h *Handler) handleVideoStream(w http.ResponseWriter, r *http.Request) {
 	fileSeg := strings.ToLower(r.PathValue("File"))
+	if fileSeg == "index.bif" {
+		h.handleVideoBIF(w, r)
+		return
+	}
 	if fileSeg != "stream" && !strings.HasPrefix(fileSeg, "stream.") && !strings.HasPrefix(fileSeg, "original.") {
 		httpx.Error(w, http.StatusNotFound, "unsupported stream endpoint")
 		return
 	}
 	h.serveMediaFile(w, r, false)
+}
+
+// handleVideoBIF serves pre-generated or sidecar Roku/Emby BIF preview archives from cache only.
+// It intentionally never invokes FFmpeg on demand; BIF files are generated exclusively by the
+// scheduled GenerateBifThumbnails task (or placed alongside media as sidecar .bif files).
+func (h *Handler) handleVideoBIF(w http.ResponseWriter, r *http.Request) {
+	itemID := guid.Normalize(r.PathValue("Id"))
+	if !h.canAccessItem(r, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
+	if h.extractor == nil {
+		httpx.Error(w, http.StatusNotFound, "bif not found")
+		return
+	}
+	q := httpx.ParseQuery(r)
+	mediaSourceID := guid.Normalize(q.Get("MediaSourceId"))
+	width := transcode.ParseBIFWidthParam(q.Get("Width"))
+	mediaPath, _ := h.resolveMediaPath(r.Context(), itemID, mediaSourceID)
+	bifPath := h.extractor.FindExistingBIF(mediaPath, itemID, width)
+	if bifPath == "" {
+		httpx.Error(w, http.StatusNotFound, "bif not found")
+		return
+	}
+	f, err := os.Open(bifPath)
+	if err != nil {
+		httpx.Error(w, http.StatusNotFound, "bif not found")
+		return
+	}
+	defer f.Close()
+	stat, err := f.Stat()
+	if err != nil || stat.IsDir() {
+		httpx.Error(w, http.StatusNotFound, "bif not found")
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	http.ServeContent(w, r, "index.bif", stat.ModTime(), f)
 }
 
 func (h *Handler) handleDownload(w http.ResponseWriter, r *http.Request) {
@@ -578,10 +618,9 @@ func (h *Handler) handleImage(w http.ResponseWriter, r *http.Request) {
 	}
 	err := h.imaging.ServeHTTPWithOptions(w, r, itemID, imgType, idx, opts)
 	if errors.Is(err, sqlite.ErrNotFound) || os.IsNotExist(err) {
-		if strings.EqualFold(imgType, "Chapter") && h.tryExtractAndServeChapterImage(w, r, itemID, idx, opts) {
-			return
-		}
-		if h.tryServeLibraryCover(w, r, itemID, opts) {
+		// Chapter thumbnails are extracted exclusively by the scheduled ExtractChapterImages task
+		// into the dedicated cache/chapters directory; never invoke FFmpeg during page visits.
+		if !strings.EqualFold(imgType, "Chapter") && h.tryServeLibraryCover(w, r, itemID, opts) {
 			return
 		}
 		httpx.Error(w, http.StatusNotFound, "image not found")
@@ -591,46 +630,6 @@ func (h *Handler) handleImage(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-}
-
-func (h *Handler) tryExtractAndServeChapterImage(w http.ResponseWriter, r *http.Request, itemID string, idx int, opts imaging.Options) bool {
-	if h.extractor == nil || h.repo == nil || idx < 0 {
-		return false
-	}
-	if !h.isAuthenticated(r) {
-		return false
-	}
-	normID := guid.Normalize(itemID)
-	if !h.canAccessItem(r, normID) {
-		return false
-	}
-	rec, err := h.repo.GetItemRecordByID(r.Context(), normID)
-	if err != nil || rec == nil || idx >= len(rec.Extra.Chapters) {
-		return false
-	}
-	mediaPath, err := h.resolveMediaPath(r.Context(), normID, "")
-	if err != nil || strings.TrimSpace(mediaPath) == "" {
-		return false
-	}
-	mediaPath, err = h.resolveExtractionMediaPath(r.Context(), mediaPath)
-	if err != nil || strings.TrimSpace(mediaPath) == "" {
-		return false
-	}
-	startTicks := rec.Extra.Chapters[idx].StartPositionTicks
-	thumbPath, err := h.extractor.ExtractChapterThumbnail(r.Context(), mediaPath, normID, idx, startTicks)
-	if err != nil || thumbPath == "" {
-		return false
-	}
-	sum := sha256.Sum256([]byte(fmt.Sprintf("chapter:%s:%d:%d", normID, idx, startTicks)))
-	tag := hex.EncodeToString(sum[:8])
-	_ = h.repo.UpsertImage(r.Context(), &sqlite.ImageRecord{
-		ItemID:     normID,
-		ImageType:  "Chapter",
-		ImageIndex: idx,
-		Path:       thumbPath,
-		Tag:        tag,
-	})
-	return h.imaging.ServeHTTPWithOptions(w, r, normID, "Chapter", idx, opts) == nil
 }
 
 func (h *Handler) tryServeLibraryCover(w http.ResponseWriter, r *http.Request, libraryID string, opts imaging.Options) bool {

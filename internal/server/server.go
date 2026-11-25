@@ -115,7 +115,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	registry := plugins.NewRegistry()
 	// Register built-in official plugins
 	registry.Register(nfo.New())
-	registry.Register(tmdb.New(cfg.TMDBApiKey, cfg.TMDBLanguage))
+	registry.Register(tmdb.New(cfg.TMDBApiKey, cfg.TMDBLanguage).WithDefaultAPIKey(config.DefaultTMDBApiKey))
 	registry.Register(tvdb.New())
 	registry.Register(strm.New(cfg.EnableSTRM302))
 	traktPlugin := trakt.New()
@@ -164,7 +164,10 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		}
 	}
 	rankingsSvc := rankings.New(store, bus, rankings.Options{
-		TMDBAPIKey: cfg.TMDBApiKey,
+		TMDBAPIKeyFunc: func() string {
+			return cfg.Snapshot().TMDBApiKey
+		},
+		DefaultTMDBAPIKey: config.DefaultTMDBApiKey,
 	})
 	_ = rankingsSvc.LoadCache(ctx)
 	sc.SetOnScanComplete(func(c context.Context, _ string, _ scanner.ScanStats) {
@@ -215,6 +218,32 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 			reportProgress(10)
 			_, err := rankingsSvc.SyncAndApply(c)
 			reportProgress(100)
+			return err
+		},
+	})
+
+	subExtractor := transcode.NewExtractor(cfg)
+	taskMgr.Register(scheduler.TaskDefinition{
+		ID:          "extract-chapter-images",
+		Key:         "ExtractChapterImages",
+		Name:        "提取章节缩略图",
+		Category:    "媒体库",
+		Description: "为包含章节信息的本地影片批量提取章节缩略图，保存至独立缓存目录（cache/chapters，请谨慎删除，删除后需重新运行本任务）。自动跳过已提取章节与 .strm 远程媒体。",
+		Triggers:    []scheduler.TaskTriggerInfo{},
+		Run: func(c context.Context, reportProgress func(float64)) error {
+			_, err := transcode.ExtractAllChapterImages(c, libRepo, subExtractor, reportProgress)
+			return err
+		},
+	})
+	taskMgr.Register(scheduler.TaskDefinition{
+		ID:          "generate-bif-thumbnails",
+		Key:         "GenerateBifThumbnails",
+		Name:        "生成视频预览图 (BIF)",
+		Category:    "媒体库",
+		Description: "为本地电影与剧集生成标准 Emby/Roku BIF 进度条预览图，保存至独立缓存目录（cache/bif，请谨慎删除）。自动跳过已生成或同目录已含 .bif 的影片及 .strm 远程媒体。",
+		Triggers:    []scheduler.TaskTriggerInfo{},
+		Run: func(c context.Context, reportProgress func(float64)) error {
+			_, err := transcode.GenerateAllBIFThumbnails(c, libRepo, subExtractor, reportProgress)
 			return err
 		},
 	})
@@ -274,7 +303,6 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	}
 
 	mediaMux := http.NewServeMux()
-	subExtractor := transcode.NewExtractor(cfg)
 	// Phase 1: Library & Direct Streaming
 	libH := library.New(libRepo, sc, cfg)
 	libH.SetUserRepo(userRepo)

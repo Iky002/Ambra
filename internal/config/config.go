@@ -16,10 +16,15 @@ var executablePathFn = os.Executable
 const (
 	ServerVersion = "4.10.2.0"
 	ProductName   = "Ambra"
+	// DefaultTMDBApiKey is the built-in fallback TMDB v3 API key used when the user
+	// has not configured a custom key in ambra.json or AMBRA_TMDB_API_KEY.
+	DefaultTMDBApiKey = "a3b1c06319c480a67f9a491a54cd555d"
+	// ChapterCacheReadmeName is written into cache/chapters to warn users before manual deletion.
+	ChapterCacheReadmeName = "DO_NOT_DELETE_README.txt"
 )
 
 // AmbraVersion is the Ambra application release version (overridden at build time via -ldflags).
-var AmbraVersion = "v0.10.5"
+var AmbraVersion = "v0.10.6"
 
 type Config struct {
 	mu            sync.RWMutex
@@ -72,6 +77,8 @@ func Load(dataDir string) (*Config, error) {
 		"bin",
 		"config",
 		"cache/images",
+		"cache/chapters",
+		"cache/bif",
 		"cache/subtitles",
 		"cache/transcoding-temp",
 		"metadata",
@@ -85,6 +92,17 @@ func Load(dataDir string) (*Config, error) {
 		if err := os.MkdirAll(filepath.Join(cfg.DataDir, sub), perm); err != nil {
 			return nil, err
 		}
+	}
+
+	// Write a reminder file into the dedicated chapter thumbnail cache directory so users
+	// do not accidentally wipe pre-extracted chapter images when cleaning temporary caches.
+	chapterReadme := filepath.Join(cfg.ChapterCacheDir(), ChapterCacheReadmeName)
+	if _, err := os.Stat(chapterReadme); os.IsNotExist(err) {
+		const notice = "Ambra 章节缩略图独立缓存目录（请谨慎删除）\n" +
+			"==========================================\n" +
+			"此目录用于持久保存由计划任务「提取章节缩略图」生成的章节预览图。\n" +
+			"手动删除后，影片详情页将不再显示章节图片，需重新在管理后台运行「提取章节缩略图」计划任务方可恢复。\n"
+		_ = os.WriteFile(chapterReadme, []byte(notice), 0o644)
 	}
 
 	cfgPath := filepath.Join(cfg.DataDir, "config", "ambra.json")
@@ -277,12 +295,34 @@ func (c *Config) Save() error {
 	return nil
 }
 
+// EffectiveTMDBApiKey returns the user/env-configured TMDB API key when set,
+// falling back to DefaultTMDBApiKey otherwise.
+func (c *Config) EffectiveTMDBApiKey() string {
+	if c != nil {
+		if k := strings.TrimSpace(c.Snapshot().TMDBApiKey); k != "" {
+			return k
+		}
+	}
+	return DefaultTMDBApiKey
+}
+
 func (c *Config) DBPath() string {
 	return filepath.Join(c.DataDir, "ambra.db")
 }
 
 func (c *Config) ImageCacheDir() string {
 	return filepath.Join(c.DataDir, "cache", "images")
+}
+
+// ChapterCacheDir returns the dedicated persistent cache directory for chapter thumbnails.
+// Kept separate from ImageCacheDir so automatic image resize cache pruning never removes them.
+func (c *Config) ChapterCacheDir() string {
+	return filepath.Join(c.DataDir, "cache", "chapters")
+}
+
+// BifCacheDir returns the dedicated persistent cache directory for generated Emby/Roku BIF files.
+func (c *Config) BifCacheDir() string {
+	return filepath.Join(c.DataDir, "cache", "bif")
 }
 
 func (c *Config) SubtitleCacheDir() string {

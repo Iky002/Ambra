@@ -370,15 +370,17 @@ func TestStreamingSubtitleAndChapterEdgeCoverage(t *testing.T) {
 		t.Fatalf("no-ext sub extract fail: want 500, got %d", rec.Code)
 	}
 
-	// 6. Chapter thumbnail extraction edge cases: idx < 0, empty mediaPath, blocked .strm, failing ffmpeg
-	if h.tryExtractAndServeChapterImage(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil), itLocal.ID, -1, imaging.Options{}) {
-		t.Fatalf("expected false for negative chapter index")
-	}
+	// 6. Chapter images & BIF are never extracted on demand -> 404 when missing from cache
 	for _, id := range []string{itNoMedia.ID, itStrm.ID, itLocal.ID} {
 		rec = httptest.NewRecorder()
 		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Items/"+id+"/Images/Chapter/0?maxWidth=99999&maxHeight=-5", nil))
 		if rec.Code != http.StatusNotFound {
 			t.Fatalf("chapter image %s: want 404, got %d", id, rec.Code)
+		}
+		recBif := httptest.NewRecorder()
+		mux.ServeHTTP(recBif, httptest.NewRequest(http.MethodGet, "/Videos/"+id+"/index.bif", nil))
+		if recBif.Code != http.StatusNotFound {
+			t.Fatalf("index.bif %s: want 404, got %d", id, recBif.Code)
 		}
 	}
 

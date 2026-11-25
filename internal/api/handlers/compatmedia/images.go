@@ -26,7 +26,6 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
-	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/core/imaging"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
@@ -134,67 +133,12 @@ func (h *Handler) handleServeItemImageFull(w http.ResponseWriter, r *http.Reques
 	}
 	if err := h.imaging.ServeHTTPWithOptions(w, r, itemID, imageType, idx, opts); err != nil {
 		if errors.Is(err, sqlite.ErrNotFound) || os.IsNotExist(err) {
-			if strings.EqualFold(imageType, "Chapter") && h.tryExtractAndServeChapterImage(w, r, itemID, idx, opts) {
-				return
-			}
+			// Chapter thumbnails are generated exclusively by the scheduled task; never extract on page load.
 			httpx.Error(w, http.StatusNotFound, "image not found")
 			return
 		}
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 	}
-}
-
-func (h *Handler) hasAuthenticatedCaller(r *http.Request) bool {
-	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
-		return true
-	}
-	if h.auth.UserIDFromCtx != nil && strings.TrimSpace(h.auth.UserIDFromCtx(r.Context())) != "" {
-		return true
-	}
-	return false
-}
-
-func (h *Handler) tryExtractAndServeChapterImage(w http.ResponseWriter, r *http.Request, itemID string, idx int, opts imaging.Options) bool {
-	if h.extractor == nil || h.repo == nil || idx < 0 {
-		return false
-	}
-	if !h.hasAuthenticatedCaller(r) {
-		return false
-	}
-	normID := guid.Normalize(itemID)
-	if !h.canAccessItemID(r, normID) {
-		return false
-	}
-	rec, err := h.repo.GetItemRecordByID(r.Context(), normID)
-	if err != nil || rec == nil || idx >= len(rec.Extra.Chapters) {
-		return false
-	}
-	mediaPath, err := h.resolveItemMediaPath(r.Context(), normID, rec)
-	if err != nil || strings.TrimSpace(mediaPath) == "" {
-		return false
-	}
-	sem := h.getChapterSem()
-	select {
-	case sem <- struct{}{}:
-		defer func() { <-sem }()
-	case <-r.Context().Done():
-		return false
-	}
-	startTicks := rec.Extra.Chapters[idx].StartPositionTicks
-	thumbPath, err := h.extractor.ExtractChapterThumbnail(r.Context(), mediaPath, normID, idx, startTicks)
-	if err != nil || thumbPath == "" {
-		return false
-	}
-	sum := sha256.Sum256([]byte(fmt.Sprintf("chapter:%s:%d:%d", normID, idx, startTicks)))
-	tag := hex.EncodeToString(sum[:8])
-	_ = h.repo.UpsertImage(r.Context(), &sqlite.ImageRecord{
-		ItemID:     normID,
-		ImageType:  "Chapter",
-		ImageIndex: idx,
-		Path:       thumbPath,
-		Tag:        tag,
-	})
-	return h.imaging.ServeHTTPWithOptions(w, r, normID, "Chapter", idx, opts) == nil
 }
 
 func (h *Handler) resolveItemMediaPath(ctx context.Context, itemID string, rec *sqlite.ItemRecord) (string, error) {
