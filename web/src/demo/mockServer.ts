@@ -44,6 +44,47 @@ import { DEMO_VIDEO_DATA_URL, makeDemoAudioDataUrl } from './demoMedia'
 import { createInitialDemoState, DEMO_SERVER_ID, type DemoState } from './mockData'
 import { makeAvatarDataUrl, makeLibraryThumbDataUrl, makePosterDataUrl } from './svgArt'
 
+const PINYIN_COLLATOR = new Intl.Collator('zh-CN-u-co-pinyin')
+const PINYIN_BOUNDARIES: Array<[string, string]> = [
+  ['z', '匝'],
+  ['y', '压'],
+  ['x', '昔'],
+  ['w', '挖'],
+  ['t', '塌'],
+  ['s', '撒'],
+  ['r', '然'],
+  ['q', '期'],
+  ['p', '啪'],
+  ['o', '哦'],
+  ['n', '拿'],
+  ['m', '妈'],
+  ['l', '垃'],
+  ['k', '咔'],
+  ['j', '讥'],
+  ['h', '哈'],
+  ['g', '旮'],
+  ['f', '发'],
+  ['e', '妸'],
+  ['d', '哒'],
+  ['c', '嚓'],
+  ['b', '八'],
+  ['a', '阿'],
+]
+
+function getDemoSortKey(raw: string): string {
+  const trimmed = raw.trim().replace(/^[《〈「『【（“‘]+/, '')
+  if (!trimmed) return ''
+  const first = trimmed[0]
+  if (/[\u4e00-\u9fff]/.test(first)) {
+    for (const [letter, boundary] of PINYIN_BOUNDARIES) {
+      if (PINYIN_COLLATOR.compare(first, boundary) >= 0) {
+        return letter + trimmed.slice(1).toLowerCase()
+      }
+    }
+  }
+  return trimmed.toLowerCase()
+}
+
 let store: DemoState = createInitialDemoState()
 
 interface DemoRankingsState {
@@ -1303,20 +1344,27 @@ export async function demoFetch<T>(
     }
     if (nameStartsWith) {
       pool = pool.filter((it) => {
-        const sortKey = (it.SortName || it.Name).trim().toLowerCase()
-        const nameKey = it.Name.trim().toLowerCase()
-        return sortKey.startsWith(nameStartsWith) || nameKey.startsWith(nameStartsWith)
+        const sortKey = getDemoSortKey(it.SortName || it.Name)
+        const nameKey = getDemoSortKey(it.Name)
+        const rawSort = (it.SortName || it.Name).trim().toLowerCase()
+        const rawName = it.Name.trim().toLowerCase()
+        return (
+          sortKey.startsWith(nameStartsWith) ||
+          nameKey.startsWith(nameStartsWith) ||
+          rawSort.startsWith(nameStartsWith) ||
+          rawName.startsWith(nameStartsWith)
+        )
       })
     }
     if (nameStartsWithOrGreater) {
       pool = pool.filter((it) => {
-        const sortKey = (it.SortName || it.Name).trim().toLowerCase()
+        const sortKey = getDemoSortKey(it.SortName || it.Name)
         return sortKey >= nameStartsWithOrGreater
       })
     }
     if (nameLessThan) {
       pool = pool.filter((it) => {
-        const sortKey = (it.SortName || it.Name).trim().toLowerCase()
+        const sortKey = getDemoSortKey(it.SortName || it.Name)
         return sortKey.length > 0 && sortKey < nameLessThan
       })
     }

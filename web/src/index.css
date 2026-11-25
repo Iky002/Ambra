@@ -79,15 +79,13 @@ input[type="range"].ambra-range:hover::-webkit-slider-thumb {
   transform: scale(1.2);
 }
 
-/* 现代交互动效关键帧 */
+/* 现代交互动效关键帧（pageEnter 仅做透明度淡入，避免 transform 创建新的 fixed 定位包含块导致长页面弹窗偏移） */
 @keyframes pageEnter {
   from {
     opacity: 0;
-    transform: translateY(10px);
   }
   to {
     opacity: 1;
-    transform: translateY(0);
   }
 }
 

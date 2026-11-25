@@ -1,4 +1,5 @@
 import React, { useEffect } from 'react'
+import { createPortal } from 'react-dom'
 import { AlertCircle, CheckCircle2, X } from 'lucide-react'
 
 function isZeroDate(d: Date): boolean {
@@ -126,7 +127,7 @@ export function AdminModal({
 
   if (!open) return null
 
-  return (
+  const modal = (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="fixed inset-0 bg-black/75 backdrop-blur-sm" onClick={onClose} />
       <div
@@ -149,6 +150,8 @@ export function AdminModal({
       </div>
     </div>
   )
+
+  return typeof document !== 'undefined' ? createPortal(modal, document.body) : modal
 }
 
 interface ToggleSwitchProps {

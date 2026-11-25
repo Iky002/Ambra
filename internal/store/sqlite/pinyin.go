@@ -338,3 +338,47 @@ func tokenizeForFTSSQLite(text string) string {
 	}
 	return strings.Join(tokens, " ")
 }
+
+// PinyinSortKey returns a lowercased ASCII-friendly sort key for A–Z indexing and
+// alphabetical ordering. Pure ASCII strings are lowercased as-is; CJK characters
+// (Traditional or Simplified) are converted to their tone-less pinyin syllables
+// (e.g. "肖申克的救赎" -> "xiaoshenkedejiushu", "《三体》" -> "santi").
+func PinyinSortKey(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	isASCII := true
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			isASCII = false
+			break
+		}
+	}
+	if isASCII {
+		return strings.ToLower(s)
+	}
+
+	s = TradToSimp(s)
+	// Strip leading CJK brackets/quotes (e.g. 《三体》 -> 三体) while preserving ASCII symbols/digits for '#'.
+	s = strings.TrimLeft(s, "《〈「『【（“‘")
+	if s == "" {
+		return ""
+	}
+
+	args := pinyin.NewArgs()
+	args.Style = pinyin.Normal
+
+	var b strings.Builder
+	b.Grow(len(s) * 2)
+	for _, r := range s {
+		if isCJK(r) {
+			if pys := pinyin.SinglePinyin(r, args); len(pys) > 0 && pys[0] != "" {
+				b.WriteString(strings.ToLower(pys[0]))
+				continue
+			}
+		}
+		b.WriteRune(unicode.ToLower(r))
+	}
+	return b.String()
+}
