@@ -61,6 +61,8 @@ import (
 	"github.com/ambra-media/ambra/internal/plugins/nfo"
 	"github.com/ambra-media/ambra/internal/plugins/strm"
 	"github.com/ambra-media/ambra/internal/plugins/tmdb"
+	"github.com/ambra-media/ambra/internal/plugins/trakt"
+	"github.com/ambra-media/ambra/internal/plugins/tvdb"
 	"github.com/ambra-media/ambra/internal/plugins/wasmhost"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 	"github.com/ambra-media/ambra/web"
@@ -110,7 +112,10 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	// Register built-in official plugins
 	registry.Register(nfo.New())
 	registry.Register(tmdb.New(cfg.TMDBApiKey, cfg.TMDBLanguage))
+	registry.Register(tvdb.New())
 	registry.Register(strm.New(cfg.EnableSTRM302))
+	traktPlugin := trakt.New()
+	registry.Register(traktPlugin)
 
 	// Discover external HTTP & WASM (wazero) plugins in data/plugins/*
 	pluginsDir := filepath.Join(cfg.DataDir, "plugins")
@@ -124,6 +129,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 
 	userRepo := sqlite.NewUserRepo(store)
 	libRepo := sqlite.NewLibraryRepo(store)
+	traktPlugin.SubscribeEvents(bus, libRepo)
 
 	authSvc := auth.NewService(userRepo, cfg)
 	if err := authSvc.EnsureDefaultAdmin(ctx); err != nil {
