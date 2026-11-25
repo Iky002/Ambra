@@ -46,6 +46,7 @@ export function UsersTab() {
   // 权限策略弹窗状态
   const [policyTarget, setPolicyTarget] = useState<UserDto | null>(null)
   const [draftPolicy, setDraftPolicy] = useState<UserPolicy>({})
+  const [blockedTagsInput, setBlockedTagsInput] = useState('')
   const [savingPolicy, setSavingPolicy] = useState(false)
 
   // 删除确认弹窗状态
@@ -60,6 +61,12 @@ export function UsersTab() {
   const { data: libraries = [] } = useQuery({
     queryKey: ['admin', 'virtualFolders'],
     queryFn: () => api.getVirtualFolders(),
+  })
+
+  const { data: parentalRatings = [] } = useQuery({
+    queryKey: ['admin', 'parentalRatings'],
+    queryFn: () => api.getParentalRatings(),
+    staleTime: 300_000,
   })
 
   const invalidateUsers = async () => {
@@ -151,9 +158,30 @@ export function UsersTab() {
     }
   }
 
+  const parseBlockedTags = (raw: string): string[] => {
+    const seen = new Set<string>()
+    const result: string[] = []
+    for (const part of raw.split(/[,，]/)) {
+      const tag = part.trim()
+      if (tag && !seen.has(tag)) {
+        seen.add(tag)
+        result.push(tag)
+      }
+    }
+    return result
+  }
+
+  const getParentalRatingLabel = (value?: number): string | null => {
+    if (value === undefined || value === null) return null
+    const found = parentalRatings.find((r) => r.Value === value)
+    return found ? found.Name : String(value)
+  }
+
   const openPolicyModal = (u: UserDto) => {
     const p = u.Policy || {}
+    const blockedTags = Array.isArray(p.BlockedTags) ? [...p.BlockedTags] : []
     setPolicyTarget(u)
+    setBlockedTagsInput(blockedTags.join(', '))
     setDraftPolicy({
       ...p,
       IsAdministrator: Boolean(p.IsAdministrator),
@@ -167,6 +195,8 @@ export function UsersTab() {
       EnableContentDownloading: Boolean(p.EnableContentDownloading),
       EnableContentDeletion: Boolean(p.EnableContentDeletion),
       EnableRemoteAccess: p.EnableRemoteAccess ?? true,
+      MaxParentalRating: p.MaxParentalRating,
+      BlockedTags: blockedTags,
     })
   }
 
@@ -187,7 +217,12 @@ export function UsersTab() {
     setSavingPolicy(true)
     setFeedback(null)
     try {
-      await api.updateUserPolicy(policyTarget.Id, draftPolicy)
+      const nextPolicy: UserPolicy = {
+        ...draftPolicy,
+        MaxParentalRating: draftPolicy.MaxParentalRating,
+        BlockedTags: parseBlockedTags(blockedTagsInput),
+      }
+      await api.updateUserPolicy(policyTarget.Id, nextPolicy)
       await invalidateUsers()
       if (policyTarget.Id === auth?.userId) {
         await refreshUser()
@@ -315,6 +350,17 @@ export function UsersTab() {
                   <span className="rounded-md bg-white/[0.04] px-2 py-0.5">
                     删除: {u.Policy?.EnableContentDeletion ? '允许' : '禁止'}
                   </span>
+                  {u.Policy?.MaxParentalRating !== undefined &&
+                    u.Policy?.MaxParentalRating !== null && (
+                      <span className="rounded-md bg-amber-500/10 px-2 py-0.5 text-amber-300 ring-1 ring-amber-500/20">
+                        分级 ≤ {getParentalRatingLabel(u.Policy.MaxParentalRating)}
+                      </span>
+                    )}
+                  {(u.Policy?.BlockedTags?.length ?? 0) > 0 && (
+                    <span className="rounded-md bg-rose-500/10 px-2 py-0.5 text-rose-300 ring-1 ring-rose-500/20">
+                      屏蔽 {u.Policy!.BlockedTags!.length} 个标签
+                    </span>
+                  )}
                 </div>
 
                 {/* 操作栏 */}
@@ -560,6 +606,72 @@ export function UsersTab() {
             label="允许删除媒体内容 (EnableContentDeletion)"
             description="危险权限：允许该账号从媒体库中删除媒体文件"
           />
+
+          <div className="space-y-3 rounded-xl border border-white/8 bg-white/[0.02] p-4">
+            <p className="text-xs font-semibold text-amber-300">家长控制与内容过滤</p>
+
+            <div>
+              <label
+                htmlFor="user-max-parental-rating"
+                className="mb-1.5 block text-xs font-medium text-zinc-400"
+              >
+                最高允许内容分级 (MaxParentalRating)
+              </label>
+              <select
+                id="user-max-parental-rating"
+                value={
+                  draftPolicy.MaxParentalRating !== undefined &&
+                  draftPolicy.MaxParentalRating !== null
+                    ? String(draftPolicy.MaxParentalRating)
+                    : ''
+                }
+                onChange={(e) => {
+                  const val = e.target.value
+                  setDraftPolicy((p) => ({
+                    ...p,
+                    MaxParentalRating: val === '' ? undefined : Number(val),
+                  }))
+                }}
+                className="w-full rounded-xl border border-white/10 bg-[#14141c] px-3.5 py-2.5 text-sm text-zinc-100 outline-none focus:border-amber-400/60"
+              >
+                <option value="">不限制</option>
+                {parentalRatings.map((rating) => (
+                  <option key={rating.Name} value={String(rating.Value)}>
+                    {rating.Name} (≤ {rating.Value})
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label
+                htmlFor="user-blocked-tags"
+                className="mb-1.5 block text-xs font-medium text-zinc-400"
+              >
+                屏蔽标签 (BlockedTags)
+              </label>
+              <input
+                id="user-blocked-tags"
+                type="text"
+                value={blockedTagsInput}
+                onChange={(e) => setBlockedTagsInput(e.target.value)}
+                placeholder="例如: 18+, 恐怖, 血腥（多个标签用逗号分隔）"
+                className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
+              />
+              {parseBlockedTags(blockedTagsInput).length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {parseBlockedTags(blockedTagsInput).map((tag) => (
+                    <span
+                      key={tag}
+                      className="rounded-md bg-rose-500/15 px-2 py-0.5 text-[11px] text-rose-200 ring-1 ring-rose-500/25"
+                    >
+                      {tag}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
 
           <div className="flex justify-end gap-2 pt-3">
             <button

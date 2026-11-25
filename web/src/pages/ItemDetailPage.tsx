@@ -25,6 +25,7 @@ import {
   Play,
   RefreshCw,
   ScanSearch,
+  Shuffle,
   Split,
   Star,
   Subtitles,
@@ -263,17 +264,28 @@ export function ItemDetailPage() {
   })
   const themeSongs = themeSongsData?.Items || []
 
+  const stopThemeSong = () => {
+    const audio = activeThemeAudioRef.current || themeAudioRef.current
+    if (audio) {
+      audio.pause()
+      audio.currentTime = 0
+      audio.removeAttribute('src')
+    }
+    activeThemeAudioRef.current = null
+    setThemeSongPlaying(false)
+  }
+
+  // 全局音乐播放器恢复播放时自动停止详情页主题曲，避免双音频叠加
+  useEffect(() => {
+    if (isAudioPlaying && themeSongPlaying) {
+      stopThemeSong()
+    }
+  }, [isAudioPlaying, themeSongPlaying])
+
   // 离开详情页或切换条目时自动停止并清理主题曲播放
   useEffect(() => {
     return () => {
-      const audio = activeThemeAudioRef.current || themeAudioRef.current
-      if (audio) {
-        audio.pause()
-        audio.currentTime = 0
-        audio.removeAttribute('src')
-      }
-      activeThemeAudioRef.current = null
-      setThemeSongPlaying(false)
+      stopThemeSong()
     }
   }, [id])
 
@@ -496,6 +508,22 @@ export function ItemDetailPage() {
     },
   })
 
+  const instantMixMutation = useMutation({
+    mutationFn: () => api.getInstantMix(item!.Id, userId, 50),
+    onSuccess: (res) => {
+      const tracks = res?.Items || []
+      if (tracks.length > 0) {
+        playQueue(tracks, 0)
+        showToast('success', `已开启「${item!.Name}」即时混音（共 ${tracks.length} 首）`)
+      } else {
+        showToast('error', '未找到可用于即时混音的曲目')
+      }
+    },
+    onError: (err) => {
+      showToast('error', err instanceof Error ? err.message : '获取即时混音失败')
+    },
+  })
+
   const deleteItemMutation = useMutation({
     mutationFn: () => api.deleteItem(item!.Id),
     onSuccess: async () => {
@@ -625,17 +653,6 @@ export function ItemDetailPage() {
       t !== 'IMDb Top 250'
     )
   })
-
-  const stopThemeSong = () => {
-    const audio = activeThemeAudioRef.current || themeAudioRef.current
-    if (audio) {
-      audio.pause()
-      audio.currentTime = 0
-      audio.removeAttribute('src')
-    }
-    activeThemeAudioRef.current = null
-    setThemeSongPlaying(false)
-  }
 
   const handleToggleThemeSong = () => {
     const firstTheme = themeSongs[0]
@@ -921,6 +938,22 @@ export function ItemDetailPage() {
                     <span>{seriesPlayLabel}</span>
                   </button>
                 ) : null}
+
+                {(isMusicAlbum || isMusicArtist || isAudio) && (
+                  <button
+                    type="button"
+                    disabled={instantMixMutation.isPending}
+                    onClick={() => instantMixMutation.mutate()}
+                    className="inline-flex items-center gap-2 rounded-xl border border-amber-400/35 bg-amber-500/12 px-4 py-3 text-sm font-medium text-amber-200 transition-all duration-200 hover:-translate-y-0.5 hover:border-amber-400/60 hover:bg-amber-500/20 active:scale-[0.97] disabled:opacity-50"
+                  >
+                    {instantMixMutation.isPending ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Shuffle className="h-4 w-4" />
+                    )}
+                    <span>即时混音</span>
+                  </button>
+                )}
 
                 {localTrailers.length > 0 && (
                   <button
@@ -2043,8 +2076,13 @@ export function ItemDetailPage() {
       {/* 本地主题曲播放器（仅用于当前详情页，卸载自动停止） */}
       <audio
         ref={themeAudioRef}
+        data-testid="theme-song-audio"
         className="hidden"
         onEnded={() => setThemeSongPlaying(false)}
+        onError={() => {
+          stopThemeSong()
+          showToast('error', '主题曲加载失败')
+        }}
       />
 
       {/* 加入合集 / 播放列表弹窗（复用公共组件） */}

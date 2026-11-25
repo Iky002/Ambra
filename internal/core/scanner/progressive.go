@@ -351,6 +351,14 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 		if !strings.HasPrefix(filepath.Base(cleanTarget), ".") && (IsVideoFile(cleanTarget) || IsStrmFile(cleanTarget) || IsAudioFile(cleanTarget)) {
 			if !strings.EqualFold(lib.CollectionType, "music") {
 				if _, isExtra := ClassifyExtraFile(root, cleanTarget); isExtra {
+					if err := s.waitIfPaused(ctx); err != nil {
+						return stats, err
+					}
+					if s.reindexExtraParent(ctx, lib, root, cleanTarget) {
+						stats.ItemsUpdated++
+						s.publishLibraryChanged(ctx, lib.ID, stats, "discovery")
+						s.notifyScanComplete(ctx, lib.ID, stats)
+					}
 					return stats, nil
 				}
 			}
@@ -391,6 +399,80 @@ func findContainingRoot(roots []string, target string) string {
 		}
 	}
 	return filepath.Dir(cleanTarget)
+}
+
+func resolveExtraParentDir(root, cleanTarget string) string {
+	dir := filepath.Clean(filepath.Dir(cleanTarget))
+	cleanRoot := filepath.Clean(strings.TrimSpace(root))
+	if dir != cleanRoot {
+		if _, isExtraSubdir := extraSubdirTypes[strings.ToLower(strings.TrimSpace(filepath.Base(dir)))]; isExtraSubdir {
+			return filepath.Clean(filepath.Dir(dir))
+		}
+	}
+	return dir
+}
+
+func (s *Scanner) findExtraParentItems(ctx context.Context, libraryID, parentDir string) []*sqlite.ItemRecord {
+	if s.repo == nil || strings.TrimSpace(parentDir) == "" {
+		return nil
+	}
+	cleanParentDir := filepath.Clean(parentDir)
+	seen := make(map[string]struct{})
+	var parents []*sqlite.ItemRecord
+
+	addIfParent := func(rec *sqlite.ItemRecord) {
+		if rec == nil {
+			return
+		}
+		if _, dup := seen[rec.ID]; dup {
+			return
+		}
+		if strings.EqualFold(rec.Type, "Series") || strings.EqualFold(rec.Type, "Movie") {
+			seen[rec.ID] = struct{}{}
+			parents = append(parents, rec)
+		}
+	}
+
+	if rec, err := s.repo.FindItemByPath(ctx, libraryID, cleanParentDir); err == nil && rec != nil {
+		addIfParent(rec)
+	}
+
+	if itemPaths, err := s.repo.ListLibraryItemPaths(ctx, libraryID); err == nil {
+		for p, itemID := range itemPaths {
+			if _, dup := seen[itemID]; dup {
+				continue
+			}
+			cp := filepath.Clean(p)
+			if cp == cleanParentDir || filepath.Dir(cp) == cleanParentDir {
+				if rec, recErr := s.repo.GetItemRecordByID(ctx, itemID); recErr == nil && rec != nil {
+					if strings.EqualFold(rec.Type, "Movie") {
+						addIfParent(rec)
+					}
+				}
+			}
+		}
+	}
+
+	return parents
+}
+
+func (s *Scanner) reindexExtraParent(ctx context.Context, lib *sqlite.LibraryRecord, root, cleanTarget string) bool {
+	parentDir := resolveExtraParentDir(root, cleanTarget)
+	parents := s.findExtraParentItems(ctx, lib.ID, parentDir)
+	if len(parents) == 0 {
+		return false
+	}
+	for _, parentRec := range parents {
+		if ctx.Err() != nil {
+			return false
+		}
+		mediaBaseName := ""
+		if strings.EqualFold(parentRec.Type, "Movie") && strings.TrimSpace(parentRec.Path) != "" {
+			mediaBaseName = strings.TrimSuffix(filepath.Base(parentRec.Path), filepath.Ext(parentRec.Path))
+		}
+		s.scanAndIndexExtras(ctx, lib, parentRec, parentDir, mediaBaseName)
+	}
+	return true
 }
 
 func (s *Scanner) runPhaseA(ctx context.Context, lib *sqlite.LibraryRecord, roots []string, discovered map[string]struct{}, stats *ScanStats) ([]enrichTask, bool, error) {

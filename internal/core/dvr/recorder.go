@@ -78,10 +78,11 @@ type Recorder struct {
 	logger        *slog.Logger
 	argsBuilder   func(job RecordingJob, outFile string) []string
 
-	mu      sync.RWMutex
-	entries map[string]*recordingEntry
-	closed  bool
-	wg      sync.WaitGroup
+	mu         sync.RWMutex
+	entries    map[string]*recordingEntry
+	onFinished func(ctx context.Context, state RecordingState)
+	closed     bool
+	wg         sync.WaitGroup
 }
 
 // DefaultArgsBuilder builds the standard ffmpeg remux command arguments.
@@ -129,6 +130,14 @@ func NewRecorder(opts Options) *Recorder {
 // RecordingsDir returns the directory where recorded files are written.
 func (r *Recorder) RecordingsDir() string {
 	return r.recordingsDir
+}
+
+// SetOnFinished registers a callback invoked after a recording process finishes
+// (Completed, Failed, or Cancelled). The callback is invoked without holding r.mu.
+func (r *Recorder) SetOnFinished(fn func(ctx context.Context, state RecordingState)) {
+	r.mu.Lock()
+	r.onFinished = fn
+	r.mu.Unlock()
 }
 
 // StartRecording launches an ffmpeg process to record the given job.
@@ -213,7 +222,12 @@ func (r *Recorder) waitRecording(recCtx context.Context, cmd *exec.Cmd, entry *r
 		entry.state.Status = StatusCompleted
 	}
 	finalState := entry.state
+	onFinished := r.onFinished
 	r.mu.Unlock()
+
+	if onFinished != nil {
+		onFinished(context.Background(), finalState)
+	}
 
 	if finalState.Status == StatusCompleted && r.bus != nil {
 		r.bus.Publish(context.Background(), eventbus.Event{

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   AlertCircle,
@@ -55,6 +55,23 @@ export function LoginPage() {
     setForgotOpen(false)
     setForgotError('')
     setForgotLoading(false)
+  }
+
+  useEffect(() => {
+    if (!forgotOpen) return
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !forgotLoading) {
+        closeForgotModal()
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [forgotOpen, forgotLoading])
+
+  const formatPinExpiration = (raw: string): string => {
+    const parsed = new Date(raw)
+    if (Number.isNaN(parsed.getTime())) return raw
+    return parsed.toLocaleString('zh-CN')
   }
 
   const handleForgotStep1 = async (e: React.FormEvent) => {
@@ -347,7 +364,9 @@ export function LoginPage() {
           aria-modal="true"
           aria-labelledby="forgot-password-title"
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
-          onClick={closeForgotModal}
+          onClick={() => {
+            if (!forgotLoading) closeForgotModal()
+          }}
         >
           <div
             onClick={(e) => e.stopPropagation()}
@@ -367,8 +386,11 @@ export function LoginPage() {
               <button
                 type="button"
                 aria-label="关闭找回密码弹窗"
-                onClick={closeForgotModal}
-                className="rounded-lg p-1 text-zinc-400 transition-colors hover:bg-white/10 hover:text-zinc-100"
+                disabled={forgotLoading}
+                onClick={() => {
+                  if (!forgotLoading) closeForgotModal()
+                }}
+                className="rounded-lg p-1 text-zinc-400 transition-colors hover:bg-white/10 hover:text-zinc-100 disabled:opacity-50"
               >
                 <X className="h-4 w-4" />
               </button>
@@ -429,7 +451,7 @@ export function LoginPage() {
                   )}
                   {forgotPinExpiration && (
                     <p className="text-[11px] text-amber-200/75">
-                      有效期至：{forgotPinExpiration}
+                      有效期至：{formatPinExpiration(forgotPinExpiration)}
                     </p>
                   )}
                 </div>

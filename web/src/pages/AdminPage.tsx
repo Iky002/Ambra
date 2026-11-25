@@ -13,6 +13,7 @@ import {
   SlidersHorizontal,
   Sparkles,
   Users,
+  Webhook,
 } from 'lucide-react'
 import { NavLink, Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { api } from '../api/client'
@@ -28,6 +29,7 @@ import { PluginsTab } from './admin/PluginsTab'
 import { SettingsTab } from './admin/SettingsTab'
 import { TasksLogsTab } from './admin/TasksLogsTab'
 import { UsersTab } from './admin/UsersTab'
+import { WebhooksTab } from './admin/WebhooksTab'
 import { FeedbackBanner } from './admin/adminUtils'
 
 const ADMIN_TABS = [
@@ -84,6 +86,12 @@ const ADMIN_TABS = [
     label: '电视直播',
     desc: 'M3U 源 · XMLTV · 频道',
     icon: Radio,
+  },
+  {
+    path: 'webhooks',
+    label: 'Webhook 通知',
+    desc: '事件推送 · HMAC · 测试',
+    icon: Webhook,
   },
   {
     path: 'health',
@@ -275,6 +283,7 @@ export function AdminPage() {
               <Route path="plugins" element={<PluginsTab />} />
               <Route path="tasks" element={<TasksLogsTab />} />
               <Route path="livetv" element={<LiveTvTab />} />
+              <Route path="webhooks" element={<WebhooksTab />} />
               <Route path="health" element={<HealthAndAuditTab />} />
               <Route path="migration" element={<MigrationTab />} />
               <Route path="*" element={<Navigate to="dashboard" replace />} />

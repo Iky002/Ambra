@@ -292,6 +292,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	// Phase 4 & 5: LiveTV, Sync, Notifications, Startup, Packages, Webhooks, BackupRestore, OpenAPI, GenericUI, Parties, Connect
 	livetvH := livetv.New(store, cfg)
 	livetvH.SetRecorder(dvrRec)
+	dvrRec.SetOnFinished(livetvH.OnRecordingFinished)
 	livetvH.RegisterRoutes(mediaMux, livetv.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
