@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -49,16 +50,27 @@ var (
 		".gif":  true,
 	}
 
-	reSeasonEpisode = regexp.MustCompile(`(?i)(?:^|[\s._\-\[\(])S(\d{1,2})[\s._\-]*E(\d{1,3})(?:[\s._\-\]\)]|$)`)
-	reAltEpisode    = regexp.MustCompile(`(?i)(?:^|[\s._\-])(\d{1,2})x(\d{1,3})(?:[\s._\-]|$)`)
-	reSeasonDir     = regexp.MustCompile(`(?i)^(?:season|s|第)\s*0*(\d{1,2})\s*(?:季)?$`)
-	reYearParens     = regexp.MustCompile(`[\(\[（]((?:19|20)\d{2})[\)\]）]`)
-	reYearBare       = regexp.MustCompile(`(?:^|[\s._\-])((?:19|20)\d{2})(?:$|[\s._\-])`)
-	reQualityNoise   = regexp.MustCompile(`(?i)\b(2160p|1080p|720p|480p|4k|uhd|hdr|hdr10|dv|bluray|blu-ray|bdrip|web-dl|webdl|webrip|remux|x264|x265|h264|h265|hevc|avc|aac|dts|ac3|atmos|truehd|flac|10bit)\b.*$`)
-	reAudioDiscDir   = regexp.MustCompile(`(?i)^(?:disc|cd|disk)\s*0*(\d{1,2})$`)
-	reAudioDiscTrack = regexp.MustCompile(`^(\d{1,2})[-.](\d{1,3})(?:\s*[-._]\s*|\s+)(.*)$`)
-	reAudioTrack     = regexp.MustCompile(`^(\d{1,3})(?:\s*[-._]\s*|\s+)(.*)$`)
-	reAlbumYearLead  = regexp.MustCompile(`^(?:[\(\[（]((?:19|20)\d{2})[\)\]）]|((?:19|20)\d{2}))\s*[-._]?\s*(.+)$`)
+	reSeasonEpisode   = regexp.MustCompile(`(?i)(?:^|[\s._\-\[\(])S(\d{1,2})[\s._\-]*E(\d{1,3})(?:[\s._\-\]\)]|$)`)
+	reAltEpisode      = regexp.MustCompile(`(?i)(?:^|[\s._\-])(\d{1,2})x(\d{1,3})(?:[\s._\-]|$)`)
+	reSeasonDir       = regexp.MustCompile(`(?i)^(?:season|s|第)\s*0*(\d{1,2})\s*(?:季)?$`)
+	reYearParens      = regexp.MustCompile(`[\(\[（【]((?:19|20)\d{2})[\)\]）】]`)
+	reYearDigits      = regexp.MustCompile(`(?:19|20)\d{2}`)
+	reProviderTag     = regexp.MustCompile(`(?i)[\{\[\(（【]\s*(tmdb|imdb|tvdb)(?:id)?\s*[-:=]\s*(tt\d+|\d+)\s*[\}\]）)】]`)
+	reLeadingBracket  = regexp.MustCompile(`^\s*(?:[\[\(（【][^\]\)）】]{1,40}[\]\)）】]\s*)+`)
+	reQualityNoise    = regexp.MustCompile(`(?i)(?:^|[\s._\-\[\(（【])(2160p|1080p|1080i|720p|576p|480p|4k|uhd|hdr10\+|hdr10plus|hdr10|hdr|hlg|dovi|dv|dolby[\s._]?vision|bluray|blu-ray|bdrip|bdremux|web-dl|webdl|webrip|hdtv|dvdrip|remux|x264|x265|h\.?264|h\.?265|hevc|avc|av1|aac|dts-hd|dtshd|dts|ac3|eac3|ddp|dd5\.?1|atmos|truehd|flac|lpcm|10bit|8bit|60fps|120fps|hq|imax|proper|repack|extended|unrated|directors?[\s._]?cut|theatrical)(?:$|[\s._\-\]\)）】]).*$`)
+	reChineseEdition  = regexp.MustCompile(`(?:^|[\s._\-\[\(（【])(国粤双语|国语|粤语|中英双字|双语字幕|简繁字幕|特效字幕|中字|未删减版?|导演剪辑版?|加长版|高码版|收藏版|臻彩|帧享|杜比视界|杜比全景声).*$`)
+	reAudioDiscDir    = regexp.MustCompile(`(?i)^(?:disc|cd|disk)\s*0*(\d{1,2})$`)
+	reAudioDiscTrack  = regexp.MustCompile(`^(\d{1,2})[-.](\d{1,3})(?:\s*[-._]\s*|\s+)(.*)$`)
+	reAudioTrack      = regexp.MustCompile(`^(\d{1,3})(?:\s*[-._]\s*|\s+)(.*)$`)
+	reAlbumYearLead   = regexp.MustCompile(`^(?:[\(\[（]((?:19|20)\d{2})[\)\]）]|((?:19|20)\d{2}))\s*[-._]?\s*(.+)$`)
+
+	genericMovieDirs = map[string]bool{
+		"movie": true, "movies": true, "film": true, "films": true,
+		"video": true, "videos": true, "media": true, "strm": true,
+		"4k": true, "uhd": true, "2160p": true, "1080p": true, "720p": true,
+		"bluray": true, "remux": true, "downloads": true, "download": true,
+		"电影": true, "影视": true, "影片": true, "高清电影": true, "4k电影": true,
+	}
 )
 
 // IsVideoFile reports whether the file extension is a supported video format.
@@ -87,30 +99,259 @@ func IsImageFile(path string) bool {
 	return imageExtensions[strings.ToLower(filepath.Ext(path))]
 }
 
-// ParsedMovie holds parsed movie title and year from a filename or folder name.
+// ParsedMovie holds parsed movie title, optional alternate/original title, year,
+// and any explicit provider IDs extracted from a filename or folder name.
 type ParsedMovie struct {
-	Title string
-	Year  int
+	Title         string
+	OriginalTitle string
+	Year          int
+	ProviderIDs   map[string]string
 }
 
-// ParseMovieName extracts a clean title and optional production year from a file or directory name.
+func maxValidReleaseYear() int {
+	return time.Now().Year() + 2
+}
+
+func isValidReleaseYear(y int) bool {
+	return y >= 1900 && y <= maxValidReleaseYear()
+}
+
+func isYearBoundaryRune(r rune) bool {
+	if r == 0 {
+		return true
+	}
+	return unicode.IsSpace(r) || r == '.' || r == '_' || r == '-' ||
+		r == '(' || r == ')' || r == '[' || r == ']' ||
+		r == '（' || r == '）' || r == '【' || r == '】' || r == '/'
+}
+
+func extractProviderIDsFromName(s string) (string, map[string]string) {
+	matches := reProviderTag.FindAllStringSubmatch(s, -1)
+	if len(matches) == 0 {
+		return s, nil
+	}
+	ids := make(map[string]string, len(matches))
+	for _, m := range matches {
+		if len(m) >= 3 {
+			ids[strings.ToLower(m[1])] = strings.TrimSpace(m[2])
+		}
+	}
+	cleaned := reProviderTag.ReplaceAllString(s, " ")
+	return cleaned, ids
+}
+
+func splitBilingualTitle(title string) (string, string) {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return "", ""
+	}
+	// Check if title starts with CJK characters followed by an English/Latin title
+	// e.g. "肖申克的救赎 The Shawshank Redemption" or "流浪地球2 The Wandering Earth II"
+	fields := strings.Fields(title)
+	if len(fields) < 2 {
+		return title, ""
+	}
+	splitIdx := -1
+	seenCJK := false
+	for i, f := range fields {
+		if containsCJK(f) {
+			seenCJK = true
+			continue
+		}
+		if seenCJK && containsASCIIAlpha(f) {
+			splitIdx = i
+			break
+		}
+	}
+	if splitIdx > 0 {
+		// Verify remainder has no CJK (pure English/Latin alternate title)
+		rest := strings.Join(fields[splitIdx:], " ")
+		if !containsCJK(rest) && len(rest) >= 2 {
+			return strings.TrimSpace(strings.Join(fields[:splitIdx], " ")), strings.TrimSpace(rest)
+		}
+	}
+	return title, ""
+}
+
+func containsCJK(s string) bool {
+	for _, r := range s {
+		if unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hiragana, r) || unicode.Is(unicode.Katakana, r) || unicode.Is(unicode.Hangul, r) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsASCIIAlpha(s string) bool {
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			return true
+		}
+	}
+	return false
+}
+
+func stripMediaExt(filename string) string {
+	base := filepath.Base(filename)
+	ext := strings.ToLower(filepath.Ext(base))
+	if ext != "" && (videoExtensions[ext] || audioExtensions[ext] || ext == ".strm" || ext == ".nfo" || ext == ".iso") {
+		return strings.TrimSuffix(base, filepath.Ext(base))
+	}
+	return base
+}
+
+// ParseMovieName extracts a clean title, optional alternate title, production year,
+// and inline provider IDs from a file or directory name using MoviePilot-inspired rules:
+//   - Prefers the LAST valid release year (1900..currentYear+2) so titles containing
+//     numbers/years (e.g. "The.Legend.of.1900.1998", "Blade.Runner.2049.2017",
+//     "2001.A.Space.Odyssey.1968", "1917.2019") are never truncated prematurely.
+//   - Supports full-width CJK brackets （） 【】 and inline {tmdb-12345} / [imdb=tt...] tags.
+//   - Strips release-group prefixes, technical codecs/resolutions, and Chinese edition tags.
 func ParseMovieName(filename string) ParsedMovie {
-	base := strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
+	base := stripMediaExt(filename)
+	base, providerIDs := extractProviderIDsFromName(base)
+
+	// Strip leading release-group brackets only when meaningful title text follows.
+	if stripped := strings.TrimSpace(reLeadingBracket.ReplaceAllString(base, "")); stripped != "" {
+		base = stripped
+	}
+
 	year := 0
 
-	if m := reYearParens.FindStringSubmatchIndex(base); m != nil {
-		y, _ := strconv.Atoi(base[m[2]:m[3]])
-		year = y
-		base = base[:m[0]]
-	} else if m := reYearBare.FindStringSubmatchIndex(base); m != nil {
-		y, _ := strconv.Atoi(base[m[2]:m[3]])
-		year = y
-		base = base[:m[0]]
+	// 1. Try parenthesized years first: (), [], （）, 【】 — pick the LAST valid year.
+	if allParens := reYearParens.FindAllStringSubmatchIndex(base, -1); len(allParens) > 0 {
+		for i := len(allParens) - 1; i >= 0; i-- {
+			m := allParens[i]
+			y, _ := strconv.Atoi(base[m[2]:m[3]])
+			if !isValidReleaseYear(y) {
+				continue
+			}
+			before := strings.TrimSpace(base[:m[0]])
+			after := strings.TrimSpace(base[m[1]:])
+			if cleanTitle(before) != "" {
+				year = y
+				base = before
+				break
+			}
+			if cleanTitle(after) != "" {
+				year = y
+				base = after
+				break
+			}
+		}
+	}
+
+	// 2. Strip quality/codec/Chinese edition noise BEFORE bare-year fallback only after
+	//    recording candidate bare years so a release year right before "1080p" is kept.
+	if year == 0 {
+		// Scan all 4-digit year tokens with explicit boundary checks so consecutive
+		// years like "1900.1998" or "2049.2017" are BOTH discovered.
+		allDigits := reYearDigits.FindAllStringIndex(base, -1)
+		for i := len(allDigits) - 1; i >= 0; i-- {
+			start, end := allDigits[i][0], allDigits[i][1]
+			var prevRune, nextRune rune
+			if start > 0 {
+				r := []rune(base[:start])
+				prevRune = r[len(r)-1]
+			}
+			if end < len(base) {
+				r := []rune(base[end:])
+				nextRune = r[0]
+			}
+			if !isYearBoundaryRune(prevRune) || !isYearBoundaryRune(nextRune) {
+				continue
+			}
+			y, _ := strconv.Atoi(base[start:end])
+			if !isValidReleaseYear(y) {
+				continue
+			}
+			prefix := strings.TrimSpace(base[:start])
+			if cleanTitle(reQualityNoise.ReplaceAllString(prefix, "")) == "" {
+				// Leading year is part of the title itself (e.g. "2001.A.Space.Odyssey", "1917").
+				continue
+			}
+			year = y
+			base = prefix
+			break
+		}
 	}
 
 	base = reQualityNoise.ReplaceAllString(base, "")
+	base = reChineseEdition.ReplaceAllString(base, "")
 	title := cleanTitle(base)
-	return ParsedMovie{Title: title, Year: year}
+	primary, alt := splitBilingualTitle(title)
+	return ParsedMovie{
+		Title:         primary,
+		OriginalTitle: alt,
+		Year:          year,
+		ProviderIDs:   providerIDs,
+	}
+}
+
+// ParseMoviePath parses both the media filename and its immediate parent directory
+// (when the file lives inside a dedicated movie folder under rootDir), cross-enriching
+// title, original/alternate title, year, and provider IDs like MoviePilot.
+func ParseMoviePath(rootDir, mediaPath string) ParsedMovie {
+	fileParsed := ParseMovieName(mediaPath)
+
+	dir := filepath.Clean(filepath.Dir(mediaPath))
+	cleanRoot := filepath.Clean(strings.TrimSpace(rootDir))
+	if dir == "" || dir == "." || dir == string(filepath.Separator) || (cleanRoot != "" && cleanRoot != "." && dir == cleanRoot) {
+		return fileParsed
+	}
+
+	dirBase := strings.TrimSpace(filepath.Base(dir))
+	if dirBase == "" || genericMovieDirs[strings.ToLower(dirBase)] {
+		return fileParsed
+	}
+
+	dirParsed := ParseMovieName(dirBase)
+	if dirParsed.Title == "" && dirParsed.Year == 0 && len(dirParsed.ProviderIDs) == 0 {
+		return fileParsed
+	}
+
+	out := fileParsed
+	if len(dirParsed.ProviderIDs) > 0 {
+		if out.ProviderIDs == nil {
+			out.ProviderIDs = make(map[string]string, len(dirParsed.ProviderIDs))
+		}
+		for k, v := range dirParsed.ProviderIDs {
+			if _, exists := out.ProviderIDs[k]; !exists {
+				out.ProviderIDs[k] = v
+			}
+		}
+	}
+
+	// Prefer explicit folder year when filename year is absent, or when folder year
+	// is parenthesized and filename year looks suspiciously older than folder year.
+	if out.Year == 0 && dirParsed.Year > 0 {
+		out.Year = dirParsed.Year
+	}
+
+	// Cross-enrich Chinese folder title + English filename title (e.g.
+	// "海上钢琴师 （1998）/The.Legend.of.1900.1998.1080p.strm" or
+	// "银翼杀手2049 (2017)/Blade.Runner.2049.2017.2160p.strm"):
+	// keep the clean CJK title as Title and the English filename title as OriginalTitle
+	// so both display and TMDB fallback search work seamlessly.
+	if dirParsed.Title != "" {
+		if out.Title == "" {
+			out.Title = dirParsed.Title
+		} else if containsCJK(dirParsed.Title) && !containsCJK(out.Title) {
+			if out.OriginalTitle == "" {
+				out.OriginalTitle = out.Title
+			}
+			out.Title = dirParsed.Title
+		} else if !strings.EqualFold(dirParsed.Title, out.Title) && out.OriginalTitle == "" {
+			out.OriginalTitle = dirParsed.Title
+		}
+	}
+	if out.OriginalTitle == "" && dirParsed.OriginalTitle != "" && !strings.EqualFold(dirParsed.OriginalTitle, out.Title) {
+		out.OriginalTitle = dirParsed.OriginalTitle
+	}
+	if strings.EqualFold(out.OriginalTitle, out.Title) {
+		out.OriginalTitle = ""
+	}
+	return out
 }
 
 // ParsedEpisode holds parsed episode metadata from a file path.

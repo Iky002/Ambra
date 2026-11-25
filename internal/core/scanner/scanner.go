@@ -159,13 +159,39 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 				if existing.ProductionYear != nil {
 					year = *existing.ProductionYear
 				}
+				queryTitle := existing.Name
+				queryOrig := existing.OriginalTitle
+				queryIDs := cloneStringMap(existing.Extra.ProviderIDs)
+				// If previously unscraped (no TMDB ID) and unlocked, re-parse from path
+				// so improved filename/folder recognition heals previously mis-parsed titles.
+				if !existing.Extra.LockData && getProviderID(queryIDs, "tmdb") == "" {
+					reparsed := ParseMoviePath(findContainingRoot(lib.Paths, mediaPath), mediaPath)
+					if reparsed.Title != "" {
+						queryTitle = reparsed.Title
+					}
+					if reparsed.OriginalTitle != "" {
+						queryOrig = reparsed.OriginalTitle
+					}
+					if reparsed.Year > 0 {
+						year = reparsed.Year
+					}
+					for k, v := range reparsed.ProviderIDs {
+						if queryIDs == nil {
+							queryIDs = make(map[string]string)
+						}
+						if _, exists := queryIDs[k]; !exists {
+							queryIDs[k] = v
+						}
+					}
+				}
 				backfillQuery := plugins.MediaQuery{
-					ItemType:    "Movie",
-					Title:       existing.Name,
-					Year:        year,
-					Path:        mediaPath,
-					ProviderIDs: existing.Extra.ProviderIDs,
-					Language:    s.language(),
+					ItemType:      "Movie",
+					Title:         queryTitle,
+					OriginalTitle: queryOrig,
+					Year:          year,
+					Path:          mediaPath,
+					ProviderIDs:   queryIDs,
+					Language:      s.language(),
 				}
 				return false, &enrichTask{
 					ItemID:         existing.ID,
@@ -180,7 +206,7 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 					NeedProbe:      false,
 					NeedOnlineMeta: true,
 					HasLocalTitle:  false,
-					DisplayName:    existing.Name,
+					DisplayName:    queryTitle,
 				}, nil
 			}
 			return false, nil, nil
@@ -209,18 +235,20 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 		}
 	}
 
-	parsed := ParseMovieName(mediaPath)
+	parsed := ParseMoviePath(findContainingRoot(lib.Paths, mediaPath), mediaPath)
 	title := parsed.Title
 	if title == "" {
 		title = strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath))
 	}
 
 	query := plugins.MediaQuery{
-		ItemType: "Movie",
-		Title:    title,
-		Year:     parsed.Year,
-		Path:     mediaPath,
-		Language: s.language(),
+		ItemType:      "Movie",
+		Title:         title,
+		OriginalTitle: parsed.OriginalTitle,
+		Year:          parsed.Year,
+		Path:          mediaPath,
+		ProviderIDs:   cloneStringMap(parsed.ProviderIDs),
+		Language:      s.language(),
 	}
 	meta := s.fetchMetadataFiltered(ctx, query, true)
 
@@ -270,20 +298,24 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 	}
 
 	rec := &sqlite.ItemRecord{
-		ID:        itemID,
-		LibraryID: lib.ID,
-		ParentID:  lib.ID,
-		Type:      "Movie",
-		MediaType: "Video",
-		IsFolder:  false,
-		IsStrm:    isStrm,
-		Name:      title,
-		SortName:  strings.ToLower(title),
-		Container: container,
-		Path:      mediaPath,
-		FileSize:  &size,
-		FileMtime: &mtime,
-		Etag:      computeEtag(mediaPath, size, mtime),
+		ID:            itemID,
+		LibraryID:     lib.ID,
+		ParentID:      lib.ID,
+		Type:          "Movie",
+		MediaType:     "Video",
+		IsFolder:      false,
+		IsStrm:        isStrm,
+		Name:          title,
+		OriginalTitle: parsed.OriginalTitle,
+		SortName:      strings.ToLower(title),
+		Container:     container,
+		Path:          mediaPath,
+		FileSize:      &size,
+		FileMtime:     &mtime,
+		Etag:          computeEtag(mediaPath, size, mtime),
+	}
+	if len(parsed.ProviderIDs) > 0 {
+		rec.Extra.ProviderIDs = cloneStringMap(parsed.ProviderIDs)
 	}
 	if parsed.Year > 0 {
 		y := parsed.Year
