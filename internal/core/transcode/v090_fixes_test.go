@@ -188,7 +188,7 @@ exit 0
 	}
 	wg.Wait()
 
-	wantPath := filepath.Join(cfg.ImageCacheDir(), "chapters", "item123", "chapter_2.jpg")
+	wantPath := filepath.Join(cfg.ChapterCacheDir(), "item123", "chapter_2.jpg")
 	for i := 0; i < concurrency; i++ {
 		if errs[i] != nil {
 			t.Fatalf("goroutine %d error: %v", i, errs[i])

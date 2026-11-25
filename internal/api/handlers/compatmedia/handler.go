@@ -34,9 +34,8 @@ type AuthFuncs struct {
 }
 
 const (
-	maxChapterExtractConcurrency = 4
-	maxImageResizeDimension      = 4096
-	maxChannelLatestIDs          = 50
+	maxImageResizeDimension = 4096
+	maxChannelLatestIDs     = 50
 )
 
 // Handler implements the remaining Emby 4.10.2.0 media, item, metadata, image,
@@ -55,8 +54,6 @@ type Handler struct {
 	httpClient        *http.Client
 	defaultHTTPClient *http.Client
 	clientOnce        sync.Once
-	chapterSem        chan struct{}
-	chapterSemOnce    sync.Once
 	auth              AuthFuncs
 }
 
@@ -78,7 +75,6 @@ func New(
 		cfg:               cfg,
 		extractor:         transcode.NewExtractor(cfg),
 		defaultHTTPClient: netutil.NewSafeHTTPClient(15*time.Second, false),
-		chapterSem:        make(chan struct{}, maxChapterExtractConcurrency),
 	}
 }
 
@@ -117,15 +113,6 @@ func (h *Handler) getHTTPClient() *http.Client {
 		}
 	})
 	return h.defaultHTTPClient
-}
-
-func (h *Handler) getChapterSem() chan struct{} {
-	h.chapterSemOnce.Do(func() {
-		if h.chapterSem == nil {
-			h.chapterSem = make(chan struct{}, maxChapterExtractConcurrency)
-		}
-	})
-	return h.chapterSem
 }
 
 // BuildRouter builds an isolated chi.Router containing all 21 media-domain route prefixes

@@ -657,12 +657,9 @@ func TestCompatMediaCoverageBoostV0103(t *testing.T) {
 			t.Fatal("expected error for empty hostname")
 		}
 
-		// resolveItemMediaPath & tryExtractAndServeChapterImage edge cases
+		// resolveItemMediaPath edge case
 		if _, err := h.resolveItemMediaPath(ctx, noPathMovie.ID, noPathMovie); err == nil {
 			t.Fatal("expected ErrNotFound for empty item path")
-		}
-		if h.tryExtractAndServeChapterImage(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil), safeMovie.ID, 0, imaging.Options{}) {
-			t.Fatal("expected false when ffmpeg is nil")
 		}
 
 		// Closed store triggers BeginTx 500 in handleUpdateImageIndex & GetItemRecordByID 500 in handleSetImageURL

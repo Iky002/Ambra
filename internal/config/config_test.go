@@ -34,6 +34,12 @@ func TestDefault(t *testing.T) {
 	if cfg2.ImageCacheDir() != filepath.Join("/custom/dir", "cache", "images") {
 		t.Fatalf("unexpected ImageCacheDir: %q", cfg2.ImageCacheDir())
 	}
+	if cfg2.ChapterCacheDir() != filepath.Join("/custom/dir", "cache", "chapters") {
+		t.Fatalf("unexpected ChapterCacheDir: %q", cfg2.ChapterCacheDir())
+	}
+	if cfg2.BifCacheDir() != filepath.Join("/custom/dir", "cache", "bif") {
+		t.Fatalf("unexpected BifCacheDir: %q", cfg2.BifCacheDir())
+	}
 	if cfg2.SubtitleCacheDir() != filepath.Join("/custom/dir", "cache", "subtitles") {
 		t.Fatalf("unexpected SubtitleCacheDir: %q", cfg2.SubtitleCacheDir())
 	}

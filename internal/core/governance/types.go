@@ -116,6 +116,8 @@ type DatabaseHealth struct {
 // CacheHealth captures disk usage across cache directories.
 type CacheHealth struct {
 	ImagesBytes    int64 `json:"ImagesBytes"`
+	ChaptersBytes  int64 `json:"ChaptersBytes"`
+	BifBytes       int64 `json:"BifBytes"`
 	SubtitlesBytes int64 `json:"SubtitlesBytes"`
 	TranscodeBytes int64 `json:"TranscodeBytes"`
 	TotalBytes     int64 `json:"TotalBytes"`

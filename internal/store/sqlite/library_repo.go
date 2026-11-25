@@ -2,9 +2,7 @@ package sqlite
 
 import (
 	"context"
-	"crypto/sha1"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -3132,6 +3130,7 @@ type imageTagsSummary struct {
 	primary   string
 	allTags   map[string]string
 	backdrops []string
+	chapters  map[int]string
 }
 
 func (r *LibraryRepo) loadImageTagsBatch(ctx context.Context, itemIDs []string) (map[string]*imageTagsSummary, error) {
@@ -3167,6 +3166,11 @@ func (r *LibraryRepo) loadImageTagsBatch(ctx context.Context, itemIDs []string) 
 			}
 			if strings.EqualFold(imgType, "Backdrop") {
 				sum.backdrops = append(sum.backdrops, tag)
+			} else if strings.EqualFold(imgType, "Chapter") {
+				if sum.chapters == nil {
+					sum.chapters = make(map[int]string)
+				}
+				sum.chapters[idx] = tag
 			} else {
 				if idx == 0 {
 					sum.allTags[imgType] = tag
@@ -3514,16 +3518,15 @@ func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []
 		}
 		if len(rec.Extra.Chapters) > 0 {
 			chapters := make([]dto.ChapterInfo, len(rec.Extra.Chapters))
-			tagSeed := rec.Etag
-			if tagSeed == "" {
-				tagSeed = rec.ID
+			var chapterTags map[int]string
+			if img, ok := imgMap[rec.ID]; ok && img != nil {
+				chapterTags = img.chapters
 			}
 			for idx, ch := range rec.Extra.Chapters {
-				sum := sha1.Sum([]byte(fmt.Sprintf("%s:%d", tagSeed, idx)))
 				chapters[idx] = dto.ChapterInfo{
 					StartPositionTicks: ch.StartPositionTicks,
 					Name:               ch.Name,
-					ImageTag:           hex.EncodeToString(sum[:])[:12],
+					ImageTag:           chapterTags[idx],
 				}
 			}
 			d.Chapters = chapters
@@ -4085,6 +4088,105 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// ChapterExtractionCandidate holds the minimal item info needed by the scheduled chapter extraction task.
+type ChapterExtractionCandidate struct {
+	ItemID    string
+	MediaPath string
+	Chapters  []ChapterRecord
+}
+
+// BIFCandidate holds the minimal item info needed by the scheduled BIF generation task.
+type BIFCandidate struct {
+	ItemID    string
+	MediaPath string
+}
+
+// ListChapterExtractionCandidates returns all video items that have persisted chapters.
+func (r *LibraryRepo) ListChapterExtractionCandidates(ctx context.Context) ([]ChapterExtractionCandidate, error) {
+	rows, err := r.store.Reader.QueryContext(ctx, `
+		SELECT i.id,
+		       COALESCE(NULLIF(ms.path, ''), i.path, ''),
+		       COALESCE(i.extra_json, '{}')
+		FROM items i
+		LEFT JOIN item_media_sources ms ON ms.item_id = i.id
+		WHERE LOWER(COALESCE(i.media_type, '')) = 'video'
+		  AND i.extra_json LIKE '%"chapters"%'
+		ORDER BY i.id ASC, ms.rowid ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	seen := make(map[string]struct{})
+	var out []ChapterExtractionCandidate
+	for rows.Next() {
+		var id, mediaPath, extraRaw string
+		if err := rows.Scan(&id, &mediaPath, &extraRaw); err != nil {
+			return nil, err
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		var extra ItemExtra
+		if extraRaw != "" && extraRaw != "{}" {
+			_ = json.Unmarshal([]byte(extraRaw), &extra)
+		}
+		if len(extra.Chapters) == 0 {
+			continue
+		}
+		out = append(out, ChapterExtractionCandidate{
+			ItemID:    id,
+			MediaPath: strings.TrimSpace(mediaPath),
+			Chapters:  extra.Chapters,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListBIFCandidates returns all video items eligible for scheduled BIF preview generation.
+func (r *LibraryRepo) ListBIFCandidates(ctx context.Context) ([]BIFCandidate, error) {
+	rows, err := r.store.Reader.QueryContext(ctx, `
+		SELECT i.id,
+		       COALESCE(NULLIF(ms.path, ''), i.path, '')
+		FROM items i
+		LEFT JOIN item_media_sources ms ON ms.item_id = i.id
+		WHERE LOWER(COALESCE(i.media_type, '')) = 'video'
+		  AND i.type IN ('Movie', 'Episode', 'Video', 'MusicVideo', 'Trailer')
+		ORDER BY i.id ASC, ms.rowid ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	seen := make(map[string]struct{})
+	var out []BIFCandidate
+	for rows.Next() {
+		var id, mediaPath string
+		if err := rows.Scan(&id, &mediaPath); err != nil {
+			return nil, err
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		if strings.TrimSpace(mediaPath) == "" {
+			continue
+		}
+		out = append(out, BIFCandidate{
+			ItemID:    id,
+			MediaPath: strings.TrimSpace(mediaPath),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func paginateSlice[T any](items []T, start, limit int) []T {

@@ -97,6 +97,8 @@ type systemInfoResponse struct {
 	CanLaunchWebBrowser        bool   `json:"CanLaunchWebBrowser"`
 	ProgramDataPath            string `json:"ProgramDataPath,omitempty"`
 	CachePath                  string `json:"CachePath,omitempty"`
+	ChapterCachePath           string `json:"ChapterCachePath,omitempty"`
+	BifCachePath               string `json:"BifCachePath,omitempty"`
 	LogPath                    string `json:"LogPath,omitempty"`
 	InternalMetadataPath       string `json:"InternalMetadataPath,omitempty"`
 	TranscodingTempPath        string `json:"TranscodingTempPath,omitempty"`
@@ -144,6 +146,8 @@ func (h *Handler) GetSystemInfo(w http.ResponseWriter, r *http.Request) {
 	if isAdmin {
 		info.ProgramDataPath = dataDir
 		info.CachePath = filepath.Join(dataDir, "cache")
+		info.ChapterCachePath = (&snap).ChapterCacheDir()
+		info.BifCachePath = (&snap).BifCacheDir()
 		info.LogPath = filepath.Join(dataDir, "logs")
 		info.InternalMetadataPath = filepath.Join(dataDir, "metadata")
 		info.TranscodingTempPath = transcodeTempDir

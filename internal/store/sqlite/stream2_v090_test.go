@@ -32,21 +32,43 @@ func TestChapterImageTagDeterministic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(dto1.Chapters) != 2 {
+		t.Fatalf("expected 2 chapters, got %d", len(dto1.Chapters))
+	}
+	// Before scheduled chapter extraction populates item_images, ImageTag must be empty so clients do not trigger 404s.
+	if dto1.Chapters[0].ImageTag != "" || dto1.Chapters[1].ImageTag != "" {
+		t.Fatalf("expected empty chapter ImageTags before extraction, got %q and %q", dto1.Chapters[0].ImageTag, dto1.Chapters[1].ImageTag)
+	}
+
+	// Once scheduled extraction upserts Chapter images, DTO exposes persisted tags deterministically.
+	_ = repo.UpsertImage(ctx, &ImageRecord{ItemID: mov.ID, ImageType: "Chapter", ImageIndex: 0, Path: "/cache/chapters/ch-mov-1/chapter_0.jpg", Tag: "chaptag000001"})
+	_ = repo.UpsertImage(ctx, &ImageRecord{ItemID: mov.ID, ImageType: "Chapter", ImageIndex: 1, Path: "/cache/chapters/ch-mov-1/chapter_1.jpg", Tag: "chaptag000002"})
+
 	dto2, err := repo.GetItemByID(ctx, "srv1", "", mov.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(dto1.Chapters) != 2 {
-		t.Fatalf("expected 2 chapters, got %d", len(dto1.Chapters))
+	if dto2.Chapters[0].ImageTag != "chaptag000001" || dto2.Chapters[1].ImageTag != "chaptag000002" {
+		t.Fatalf("expected persisted chapter ImageTags, got %q and %q", dto2.Chapters[0].ImageTag, dto2.Chapters[1].ImageTag)
 	}
-	if len(dto1.Chapters[0].ImageTag) != 12 || len(dto1.Chapters[1].ImageTag) != 12 {
-		t.Fatalf("expected 12-char chapter ImageTags, got %q and %q", dto1.Chapters[0].ImageTag, dto1.Chapters[1].ImageTag)
+	if _, hasChapterInAllTags := dto2.ImageTags["Chapter"]; hasChapterInAllTags {
+		t.Fatalf("Chapter images must not pollute Item.ImageTags map: %+v", dto2.ImageTags)
 	}
-	if dto1.Chapters[0].ImageTag == dto1.Chapters[1].ImageTag {
-		t.Fatalf("expected distinct ImageTags for different chapter indices, both were %q", dto1.Chapters[0].ImageTag)
+
+	// ListChapterExtractionCandidates & ListBIFCandidates deduplicate media sources and return video items.
+	_ = repo.UpsertMediaSourceAndStreams(ctx, mov.ID, MediaSourceRecord{
+		ID: "ms-1", ItemID: mov.ID, Name: "v1.mkv", Path: "/movies/ch1.mkv", Protocol: "File", Container: "mkv",
+	})
+	_ = repo.UpsertMediaSourceAndStreams(ctx, mov.ID, MediaSourceRecord{
+		ID: "ms-2", ItemID: mov.ID, Name: "v2.mkv", Path: "/movies/ch2.mkv", Protocol: "File", Container: "mkv",
+	})
+	chCands, err := repo.ListChapterExtractionCandidates(ctx)
+	if err != nil || len(chCands) != 1 || chCands[0].ItemID != mov.ID || chCands[0].MediaPath != "/movies/ch1.mkv" || len(chCands[0].Chapters) != 2 {
+		t.Fatalf("unexpected ListChapterExtractionCandidates: %+v err=%v", chCands, err)
 	}
-	if dto1.Chapters[0].ImageTag != dto2.Chapters[0].ImageTag {
-		t.Fatalf("expected deterministic ImageTag across reads: %q vs %q", dto1.Chapters[0].ImageTag, dto2.Chapters[0].ImageTag)
+	bifCands, err := repo.ListBIFCandidates(ctx)
+	if err != nil || len(bifCands) != 1 || bifCands[0].ItemID != mov.ID || bifCands[0].MediaPath != "/movies/ch1.mkv" {
+		t.Fatalf("unexpected ListBIFCandidates: %+v err=%v", bifCands, err)
 	}
 }
 
