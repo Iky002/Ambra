@@ -1,7 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { Bell, X } from 'lucide-react'
-import { getDeviceId } from '../api/client'
+import { api, ApiError, clearAuth, getDeviceId } from '../api/client'
 import { isDemoMode } from '../demo/demoMode'
 import { useAuth } from './AuthContext'
 
@@ -46,6 +46,8 @@ const KEEPALIVE_INTERVAL_MS = 30_000
 const DEFAULT_TOAST_TIMEOUT_MS = 5_000
 const MAX_VISIBLE_TOASTS = 5
 const INVALIDATE_DEBOUNCE_MS = 350
+const AUTH_PROBE_FAILURE_THRESHOLD = 3
+const MAX_CONSECUTIVE_HANDSHAKE_FAILURES = 5
 
 const USER_DATA_CHANGED_KEYS = [
   'resumeItems',
@@ -211,20 +213,24 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
     }
   }, [])
 
-  // Demo 模式及本地调试事件桥：支持通过 window.dispatchEvent(new CustomEvent('ambra:ws-mock', { detail })) 模拟消息
+  const demoActive = isDemoMode()
+
+  // 仅在 Demo 模式下注册 ambra:ws-mock 事件监听，避免生产环境暴露调试事件注入通道
   useEffect(() => {
+    if (!demoActive) return
     const onMockEvent = (evt: Event) => {
       const customEvt = evt as CustomEvent<unknown>
       handleIncomingPayload(customEvt.detail)
     }
     window.addEventListener('ambra:ws-mock', onMockEvent)
     return () => window.removeEventListener('ambra:ws-mock', onMockEvent)
-  }, [handleIncomingPayload])
+  }, [demoActive, handleIncomingPayload])
 
-  // 连接 /embywebsocket（含指数退避重连 + 30s KeepAlive 心跳）
+  // 连接 /embywebsocket（含指数退避重连 + 30s KeepAlive 心跳 + 连续握手失败鉴权探测）
   useEffect(() => {
     const token = auth?.accessToken
-    if (!token || isDemoMode() || typeof WebSocket === 'undefined') {
+    const userId = auth?.userId
+    if (!token || demoActive || typeof WebSocket === 'undefined') {
       setConnected(false)
       return
     }
@@ -234,6 +240,8 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
     let reconnectTimer: number | null = null
     let keepAliveTimer: number | null = null
     let reconnectDelay = INITIAL_RECONNECT_DELAY_MS
+    let consecutiveHandshakeFailures = 0
+    let probingAuth = false
 
     const clearKeepAlive = () => {
       if (keepAliveTimer !== null) {
@@ -249,6 +257,52 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
+    const scheduleNextReconnect = () => {
+      if (disposed) return
+      if (consecutiveHandshakeFailures >= MAX_CONSECUTIVE_HANDSHAKE_FAILURES) {
+        return
+      }
+      const delay = reconnectDelay
+      reconnectDelay = Math.min(MAX_RECONNECT_DELAY_MS, reconnectDelay * 2)
+      clearReconnect()
+      reconnectTimer = window.setTimeout(connect, delay)
+    }
+
+    const handleDisconnect = (openedDuringAttempt: boolean) => {
+      clearKeepAlive()
+      setConnected(false)
+      if (disposed) return
+
+      if (!openedDuringAttempt) {
+        consecutiveHandshakeFailures += 1
+        if (consecutiveHandshakeFailures >= AUTH_PROBE_FAILURE_THRESHOLD && !probingAuth) {
+          probingAuth = true
+          const probePromise = userId ? api.getUser(userId) : api.getSystemInfo()
+          void probePromise
+            .then(() => {
+              probingAuth = false
+              scheduleNextReconnect()
+            })
+            .catch((err: unknown) => {
+              probingAuth = false
+              if (disposed) return
+              if (err instanceof ApiError && err.status === 401) {
+                disposed = true
+                clearReconnect()
+                clearKeepAlive()
+                clearAuth()
+                window.dispatchEvent(new CustomEvent('ambra:unauthorized'))
+                return
+              }
+              scheduleNextReconnect()
+            })
+          return
+        }
+      }
+
+      scheduleNextReconnect()
+    }
+
     const connect = () => {
       if (disposed) return
       clearKeepAlive()
@@ -257,14 +311,12 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
       const deviceId = auth.deviceId || getDeviceId()
       const wsUrl = `${protocol}//${window.location.host}/embywebsocket?api_key=${encodeURIComponent(token)}&deviceId=${encodeURIComponent(deviceId)}`
 
+      let openedDuringAttempt = false
+
       try {
         ws = new WebSocket(wsUrl)
       } catch {
-        setConnected(false)
-        reconnectTimer = window.setTimeout(() => {
-          reconnectDelay = Math.min(MAX_RECONNECT_DELAY_MS, reconnectDelay * 2)
-          connect()
-        }, reconnectDelay)
+        handleDisconnect(false)
         return
       }
 
@@ -273,6 +325,8 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
           ws?.close()
           return
         }
+        openedDuringAttempt = true
+        consecutiveHandshakeFailures = 0
         setConnected(true)
         reconnectDelay = INITIAL_RECONNECT_DELAY_MS
         clearKeepAlive()
@@ -298,13 +352,7 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
       }
 
       ws.onclose = () => {
-        clearKeepAlive()
-        setConnected(false)
-        if (disposed) return
-        const delay = reconnectDelay
-        reconnectDelay = Math.min(MAX_RECONNECT_DELAY_MS, reconnectDelay * 2)
-        clearReconnect()
-        reconnectTimer = window.setTimeout(connect, delay)
+        handleDisconnect(openedDuringAttempt)
       }
     }
 
@@ -329,7 +377,7 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
       }
       setConnected(false)
     }
-  }, [auth?.accessToken, auth?.deviceId, handleIncomingPayload, clearPendingInvalidations])
+  }, [auth?.accessToken, auth?.userId, auth?.deviceId, demoActive, handleIncomingPayload, clearPendingInvalidations])
 
   const value = useMemo<WebSocketContextValue>(
     () => ({

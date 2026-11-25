@@ -276,8 +276,8 @@ func TestGovernanceErrorBranchesAndPassthrough(t *testing.T) {
 	if rec := doReq(mux, "POST", "/api/admin/governance/review/nope/approve", "", "{bad"); rec.Code != http.StatusBadRequest {
 		t.Fatalf("bad approve json: want 400, got %d", rec.Code)
 	}
-	if rec := doReq(mux, "POST", "/api/admin/governance/review/nope/approve", "", map[string]any{}); rec.Code != http.StatusNotFound {
-		t.Fatalf("missing approve id: want 404, got %d", rec.Code)
+	if rec := doReq(mux, "POST", "/api/admin/governance/review/nope/approve", "", map[string]any{"Candidate": map[string]any{"Title": "Demo"}}); rec.Code != http.StatusNotFound {
+		t.Fatalf("missing approve id: want 404, got %d body=%s", rec.Code, rec.Body.String())
 	}
 	if rec := doReq(mux, "POST", "/api/admin/governance/review/nope/dismiss", "", nil); rec.Code != http.StatusNotFound {
 		t.Fatalf("missing dismiss id: want 404, got %d", rec.Code)

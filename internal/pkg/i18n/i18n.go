@@ -1,6 +1,7 @@
 package i18n
 
 import (
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -52,7 +53,7 @@ func ResolveLocale(acceptLanguage, fallback string) string {
 				param = strings.TrimSpace(param)
 				if len(param) >= 2 && (param[0] == 'q' || param[0] == 'Q') && param[1] == '=' {
 					v, err := strconv.ParseFloat(strings.TrimSpace(param[2:]), 64)
-					if err != nil || v < 0 || v > 1 {
+					if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 1 {
 						validQ = false
 						break
 					}

@@ -229,11 +229,19 @@ export function Layout() {
 
       {/* 用户信息与退出 */}
       <div className="border-t border-white/8 p-3">
-        <div className="flex items-center justify-between gap-2 rounded-xl bg-white/[0.03] px-2.5 py-2">
+        <div
+          className={`flex rounded-xl bg-white/[0.03] ${
+            collapsed
+              ? 'flex-col items-center gap-2 px-1.5 py-2'
+              : 'items-center justify-between gap-2 px-2.5 py-2'
+          }`}
+        >
           <Link
             to="/profile"
             title={t('nav.profile')}
-            className="flex min-w-0 flex-1 items-center gap-2.5 rounded-lg transition-colors hover:text-amber-300"
+            className={`flex min-w-0 items-center gap-2.5 rounded-lg transition-colors hover:text-amber-300 ${
+              collapsed ? 'justify-center' : 'flex-1'
+            }`}
           >
             <div className="flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded-full bg-gradient-to-br from-amber-500/30 to-orange-500/20 text-xs font-bold text-amber-300 ring-1 ring-amber-400/30">
               {auth?.userId && user?.PrimaryImageTag && !avatarFailed ? (
@@ -256,19 +264,18 @@ export function Layout() {
               </div>
             )}
           </Link>
-          {!collapsed && (
-            <button
-              type="button"
-              onClick={() => {
-                logout()
-                navigate('/login')
-              }}
-              title={t('nav.logout')}
-              className="rounded-lg p-1.5 text-zinc-400 transition-colors hover:bg-red-500/15 hover:text-red-400"
-            >
-              <LogOut className="h-4 w-4" />
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={() => {
+              logout()
+              navigate('/login')
+            }}
+            title={t('nav.logout')}
+            aria-label={t('nav.logout')}
+            className="rounded-lg p-1.5 text-zinc-400 transition-colors hover:bg-red-500/15 hover:text-red-400"
+          >
+            <LogOut className="h-4 w-4" />
+          </button>
         </div>
       </div>
     </div>

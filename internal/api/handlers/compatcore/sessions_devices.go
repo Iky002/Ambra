@@ -47,7 +47,7 @@ func (h *Handler) getSessionPlayQueue(w http.ResponseWriter, r *http.Request) {
 		isAdmin := h.isCallerAdmin(r)
 		callerID := h.callerUserID(r)
 		for _, s := range h.sessions.ListSessions() {
-			if !isAdmin && callerID != "" && guid.Normalize(s.UserId) != callerID {
+			if !isAdmin && (callerID == "" || guid.Normalize(s.UserId) != callerID) {
 				continue
 			}
 			if filterID != "" && s.Id != filterID && s.DeviceId != filterID {
@@ -81,15 +81,17 @@ func (h *Handler) authorizeSessionTarget(r *http.Request, sid string) (dto.Sessi
 		return dto.SessionInfo{}, false, true
 	}
 	if target.UserId != "" {
-		if ac, hasAuth := middleware.AuthFromContext(r.Context()); hasAuth && ac != nil {
+		if ac, hasAuth := middleware.AuthFromContext(r.Context()); hasAuth && ac != nil && (ac.User != nil || ac.IsAPIKey) {
 			if !ac.IsAdmin() && guid.Normalize(ac.UserID()) != guid.Normalize(target.UserId) {
 				return target, true, false
 			}
 		} else if h.auth.UserIDFromCtx != nil {
 			callerID := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
-			if callerID != "" && callerID != guid.Normalize(target.UserId) && !h.isCallerAdmin(r) {
+			if callerID == "" || (callerID != guid.Normalize(target.UserId) && !h.isCallerAdmin(r)) {
 				return target, true, false
 			}
+		} else {
+			return target, true, false
 		}
 	}
 	return target, true, true
@@ -259,9 +261,18 @@ func (h *Handler) postSessionAddUser(w http.ResponseWriter, r *http.Request) {
 	uid := guid.Normalize(chi.URLParam(r, "UserId"))
 	h.mu.Lock()
 	if h.sessionUsers[sid] == nil {
+		if len(h.sessionUsers) >= maxSessionUsersEntries {
+			// Evict an entry to bound memory usage.
+			for k := range h.sessionUsers {
+				delete(h.sessionUsers, k)
+				break
+			}
+		}
 		h.sessionUsers[sid] = make(map[string]bool)
 	}
-	h.sessionUsers[sid][uid] = true
+	if len(h.sessionUsers[sid]) < maxSessionUsersEntries || h.sessionUsers[sid][uid] {
+		h.sessionUsers[sid][uid] = true
+	}
 	h.mu.Unlock()
 	httpx.NoContent(w)
 }
@@ -453,6 +464,9 @@ func (h *Handler) postDeviceCameraUploads(w http.ResponseWriter, r *http.Request
 		"UploadedAt": time.Now().UTC().Format(time.RFC3339),
 	}
 	files = append(files, entry)
+	if len(files) > maxCameraUploadsEntries {
+		files = files[len(files)-maxCameraUploadsEntries:]
+	}
 	_ = h.saveKV(r.Context(), key, files)
 	httpx.NoContent(w)
 }

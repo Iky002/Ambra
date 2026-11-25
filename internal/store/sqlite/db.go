@@ -76,15 +76,20 @@ func envIntWithDefault(key string, defVal, minVal int) int {
 	return v
 }
 
+func escapeSQLiteURIPath(p string) string {
+	return strings.NewReplacer("%", "%25", "?", "%3F", "#", "%23").Replace(p)
+}
+
 func Open(dbPath string) (*Store, error) {
 	cacheMB := envIntWithDefault("AMBRA_SQLITE_CACHE_MB", 64, 4)
 	mmapMB := envIntWithDefault("AMBRA_SQLITE_MMAP_MB", 256, 0)
 	cacheKB := cacheMB * 1024
 	mmapBytes := int64(mmapMB) * 1024 * 1024
+	escapedPath := escapeSQLiteURIPath(dbPath)
 
 	writerDSN := fmt.Sprintf(
 		"file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)&_pragma=cache_size(-%d)",
-		dbPath, cacheKB,
+		escapedPath, cacheKB,
 	)
 
 	writer, err := sql.Open("sqlite", writerDSN)
@@ -94,7 +99,10 @@ func Open(dbPath string) (*Store, error) {
 	writer.SetMaxOpenConns(1)
 	writer.SetMaxIdleConns(1)
 
-	readerDSN := writerDSN + "&mode=ro"
+	readerDSN := fmt.Sprintf(
+		"file:%s?mode=ro&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)&_pragma=cache_size(-%d)",
+		escapedPath, cacheKB,
+	)
 	if mmapBytes > 0 {
 		readerDSN += fmt.Sprintf("&_pragma=mmap_size(%d)", mmapBytes)
 	}
@@ -206,10 +214,14 @@ func (s *Store) migrate(ctx context.Context) error {
 		if err := s.applyMigrationV3(ctx); err != nil {
 			return err
 		}
-		if _, err := s.Writer.ExecContext(ctx,
-			`INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (3, ?)`,
-			time.Now().Unix(),
-		); err != nil {
+	}
+
+	var v4 int
+	if err := s.Writer.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 4`).Scan(&v4); err != nil {
+		return err
+	}
+	if v4 == 0 {
+		if err := s.applyMigrationV4(ctx); err != nil {
 			return err
 		}
 	}
@@ -283,6 +295,39 @@ func (s *Store) applyMigrationV3(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx, st); err != nil {
 			return fmt.Errorf("migration 003 create index: %w", err)
 		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (3, ?)`,
+		time.Now().Unix(),
+	); err != nil {
+		return fmt.Errorf("migration 003 record version: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+func (s *Store) applyMigrationV4(ctx context.Context) error {
+	tx, err := s.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	indexStmts := []string{
+		`CREATE INDEX IF NOT EXISTS idx_users_name_nocase ON users(LOWER(name))`,
+		`CREATE INDEX IF NOT EXISTS idx_activity_logs_created_at ON activity_logs(created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_item_collections_item_id ON item_collections(item_id)`,
+	}
+	for _, st := range indexStmts {
+		if _, err := tx.ExecContext(ctx, st); err != nil {
+			return fmt.Errorf("migration 004 create index: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (4, ?)`,
+		time.Now().Unix(),
+	); err != nil {
+		return fmt.Errorf("migration 004 record version: %w", err)
 	}
 
 	return tx.Commit()

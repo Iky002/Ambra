@@ -312,7 +312,7 @@ func TestUPnPDescriptionSCPDAndIcons(t *testing.T) {
 }
 
 func TestContentDirectoryAndConnectionManagerSOAP(t *testing.T) {
-	_, mux, libRepo, _ := setupDLNATestEnv(t)
+	h, mux, libRepo, _ := setupDLNATestEnv(t)
 	ctx := context.Background()
 
 	// Seed real libraries and items into SQLite LibraryRepo
@@ -475,12 +475,15 @@ func TestContentDirectoryAndConnectionManagerSOAP(t *testing.T) {
 		t.Fatalf("expected SOAP fault for missing metadata object, got %d", rec.Code)
 	}
 
-	// 7. GetSystemUpdateID / GetSearchCapabilities / GetSortCapabilities / Unknown Action
+	// 7. GetSystemUpdateID / BumpSystemUpdate / GetSearchCapabilities / GetSortCapabilities / Unknown Action
+	if uid := h.BumpSystemUpdate(); uid != 2 {
+		t.Fatalf("expected BumpSystemUpdate() == 2, got %d", uid)
+	}
 	for _, tc := range []struct {
 		action string
 		want   string
 	}{
-		{"GetSystemUpdateID", "<Id>1</Id>"},
+		{"GetSystemUpdateID", "<Id>2</Id>"},
 		{"GetSearchCapabilities", "<SearchCaps>dc:title,upnp:class</SearchCaps>"},
 		{"GetSortCapabilities", "<SortCaps>dc:title,dc:date</SortCaps>"},
 	} {
@@ -488,6 +491,13 @@ func TestContentDirectoryAndConnectionManagerSOAP(t *testing.T) {
 		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), tc.want) {
 			t.Fatalf("%s failed: %d %s", tc.action, rec.Code, rec.Body.String())
 		}
+	}
+
+	// Reject creating profile with default ID
+	recDef := httptest.NewRecorder()
+	mux.ServeHTTP(recDef, httptest.NewRequest(http.MethodPost, "/Dlna/Profiles", strings.NewReader(`{"Id":"default","Name":"Hijack"}`)))
+	if recDef.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when creating profile with Id=default, got %d", recDef.Code)
 	}
 
 	rec = postSOAP("/Dlna/srv/contentdirectory/control", `"urn:schemas-upnp-org:service:ContentDirectory:1#BogusAction"`, "")

@@ -548,9 +548,14 @@ func TestHomeSectionsAndUserQueriesAndEdgeCases(t *testing.T) {
 		t.Fatalf("expected 403 for disabled user, got %d", rec.Code)
 	}
 
+	// Missing user authenticate returns 401 (anti-enumeration)
+	rec = doReq(t, env.router, "POST", "/Users/missing-id/Authenticate", `{}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for POST /Users/missing-id/Authenticate, got %d", rec.Code)
+	}
+
 	// Nonexistent user endpoints return JSON 404
 	for _, tc := range []struct{ m, p string }{
-		{"POST", "/Users/missing-id/Authenticate"},
 		{"POST", "/Users/missing-id"},
 		{"POST", "/Users/missing-id/Delete"},
 		{"POST", "/Users/missing-id/Configuration/Partial"},

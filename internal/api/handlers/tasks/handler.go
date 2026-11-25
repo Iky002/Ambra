@@ -2,8 +2,8 @@ package tasks
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -11,6 +11,8 @@ import (
 	"github.com/ambra-media/ambra/internal/core/scheduler"
 	"github.com/ambra-media/ambra/internal/pkg/i18n"
 )
+
+const ticksPerDay int64 = 86400 * 10_000_000
 
 // AuthFuncs decouples route registration from the concrete middleware package.
 type AuthFuncs struct {
@@ -167,10 +169,34 @@ func (h *Handler) handleStopTask(w http.ResponseWriter, r *http.Request) {
 	httpx.NoContent(w)
 }
 
+func validateTriggers(triggers []scheduler.TaskTriggerInfo) error {
+	for i, tr := range triggers {
+		switch strings.TrimSpace(tr.Type) {
+		case "IntervalTrigger", "DailyTrigger", "WeeklyTrigger", "StartupTrigger", "SystemEventTrigger":
+		default:
+			return fmt.Errorf("trigger[%d]: unsupported trigger type %q", i, tr.Type)
+		}
+		if tr.TimeOfDayTicks != nil && (*tr.TimeOfDayTicks < 0 || *tr.TimeOfDayTicks >= ticksPerDay) {
+			return fmt.Errorf("trigger[%d]: TimeOfDayTicks must be between 0 and %d", i, ticksPerDay-1)
+		}
+		if tr.IntervalTicks != nil && *tr.IntervalTicks <= 0 {
+			return fmt.Errorf("trigger[%d]: IntervalTicks must be positive", i)
+		}
+		if tr.MaxRuntimeTicks != nil && *tr.MaxRuntimeTicks < 0 {
+			return fmt.Errorf("trigger[%d]: MaxRuntimeTicks must be non-negative", i)
+		}
+	}
+	return nil
+}
+
 func (h *Handler) setTriggersByID(w http.ResponseWriter, r *http.Request, id string) {
 	var triggers []scheduler.TaskTriggerInfo
-	if err := json.NewDecoder(r.Body).Decode(&triggers); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &triggers, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid triggers payload")
+		return
+	}
+	if err := validateTriggers(triggers); err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if err := h.mgr.SetTriggers(id, triggers); err != nil {

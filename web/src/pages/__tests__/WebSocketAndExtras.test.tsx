@@ -7,6 +7,7 @@ import { saveAuth } from '../../api/client'
 import { AudioPlayerProvider } from '../../context/AudioPlayerContext'
 import { AuthProvider } from '../../context/AuthContext'
 import { WebSocketProvider } from '../../context/WebSocketContext'
+import { setDemoModeOverride } from '../../demo/demoMode'
 import { ItemDetailPage } from '../ItemDetailPage'
 import { PlayerPage } from '../PlayerPage'
 
@@ -145,11 +146,12 @@ describe('Stream 3 (v0.9.0): WebSocket Live Client, Player & Extras', () => {
   })
 
   afterEach(() => {
+    setDemoModeOverride(null)
     vi.stubGlobal('WebSocket', OriginalWebSocket)
     vi.restoreAllMocks()
   })
 
-  it('接收 WebSocket GeneralCommand(DisplayMessage) 与 ambra:ws-mock 并渲染全局 Toast（支持手动关闭）', async () => {
+  it('接收 WebSocket GeneralCommand(DisplayMessage) 并渲染全局 Toast（非 Demo 模式忽略 ambra:ws-mock，Demo 模式允许）', async () => {
     const user = userEvent.setup()
     saveAuth({
       accessToken: 'tok-ws',
@@ -169,7 +171,7 @@ describe('Stream 3 (v0.9.0): WebSocket Live Client, Player & Extras', () => {
     })
 
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    render(
+    const { unmount } = render(
       <QueryClientProvider client={qc}>
         <AuthProvider>
           <WebSocketProvider>
@@ -203,7 +205,55 @@ describe('Stream 3 (v0.9.0): WebSocket Live Client, Player & Extras', () => {
     expect(await screen.findByText('管理员广播')).toBeInTheDocument()
     expect(screen.getByText('服务器将在 10 分钟后维护')).toBeInTheDocument()
 
-    // 通过 Demo 模拟事件桥触发第二条通知
+    // 非 Demo 模式下 ambra:ws-mock 不应注入伪造通知
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent('ambra:ws-mock', {
+          detail: {
+            MessageType: 'GeneralCommand',
+            Data: {
+              Name: 'DisplayMessage',
+              Arguments: {
+                Header: '未授权模拟推送',
+                Text: '非 Demo 模式应忽略',
+                TimeoutMs: 60_000,
+              },
+            },
+          },
+        }),
+      )
+    })
+    expect(screen.queryByText('未授权模拟推送')).not.toBeInTheDocument()
+
+    // 手动关闭通知
+    const closeButtons = screen.getAllByRole('button', { name: '关闭通知' })
+    await user.click(closeButtons[0])
+    await waitFor(() => {
+      expect(screen.queryByText('管理员广播')).not.toBeInTheDocument()
+    })
+    unmount()
+
+    // Demo 模式下通过 ambra:ws-mock 桥触发通知
+    setDemoModeOverride(true)
+    saveAuth({
+      accessToken: 'tok-demo-ws',
+      userId: 'demo-admin',
+      serverId: 'demo-srv',
+      userName: 'Demo Admin',
+      isAdmin: true,
+      deviceId: 'dev-demo-ws',
+    })
+    const qcDemo = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={qcDemo}>
+        <AuthProvider>
+          <WebSocketProvider>
+            <div>Demo Body</div>
+          </WebSocketProvider>
+        </AuthProvider>
+      </QueryClientProvider>,
+    )
+
     act(() => {
       window.dispatchEvent(
         new CustomEvent('ambra:ws-mock', {
@@ -223,14 +273,6 @@ describe('Stream 3 (v0.9.0): WebSocket Live Client, Player & Extras', () => {
     })
 
     expect(await screen.findByText('Demo 推送')).toBeInTheDocument()
-
-    // 手动关闭第一条通知
-    const closeButtons = screen.getAllByRole('button', { name: '关闭通知' })
-    await user.click(closeButtons[0])
-    await waitFor(() => {
-      expect(screen.queryByText('管理员广播')).not.toBeInTheDocument()
-    })
-    expect(screen.getByText('Demo 推送')).toBeInTheDocument()
   })
 
   it('PlayerPage 响应 WebSocket Playstate 远端播控 (Pause/Unpause/Seek/Stop) 并在快捷键浮层打开时屏蔽播控热键', async () => {

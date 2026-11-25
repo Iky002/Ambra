@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ambra-media/ambra/internal/pkg/ticks"
@@ -56,6 +58,7 @@ type ProbeResult struct {
 
 // Prober executes ffprobe to extract real media metadata from local video files.
 type Prober struct {
+	mu          sync.RWMutex
 	ffprobePath string
 	timeout     time.Duration
 	disabled    bool
@@ -79,10 +82,23 @@ func NewDisabledProber() *Prober {
 	return &Prober{disabled: true}
 }
 
+// IsEnabled reports whether this prober is non-nil and active.
+func (p *Prober) IsEnabled() bool {
+	if p == nil {
+		return false
+	}
+	p.mu.RLock()
+	enabled := !p.disabled && strings.TrimSpace(p.ffprobePath) != ""
+	p.mu.RUnlock()
+	return enabled
+}
+
 // SetTimeout overrides the per-file ffprobe execution timeout.
 func (p *Prober) SetTimeout(d time.Duration) {
 	if p != nil && d > 0 {
+		p.mu.Lock()
 		p.timeout = d
+		p.mu.Unlock()
 	}
 }
 
@@ -90,14 +106,32 @@ func (p *Prober) SetTimeout(d time.Duration) {
 // If the prober is nil/disabled, it returns (nil, nil).
 // If ffprobe is unavailable, times out, or filePath is not a valid media file, it returns (nil, err).
 func (p *Prober) Probe(ctx context.Context, filePath string) (*ProbeResult, error) {
-	if p == nil || p.disabled || strings.TrimSpace(p.ffprobePath) == "" {
+	if p == nil {
 		return nil, nil
 	}
-	if strings.TrimSpace(filePath) == "" {
+	p.mu.RLock()
+	disabled := p.disabled
+	ffprobePath := p.ffprobePath
+	timeout := p.timeout
+	p.mu.RUnlock()
+
+	if disabled || strings.TrimSpace(ffprobePath) == "" {
+		return nil, nil
+	}
+	trimmed := strings.TrimSpace(filePath)
+	if trimmed == "" {
 		return nil, errors.New("ffprobe: empty file path")
 	}
+	lower := strings.ToLower(trimmed)
+	probeTarget := trimmed
+	if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
+		absPath, err := filepath.Abs(trimmed)
+		if err != nil {
+			return nil, fmt.Errorf("ffprobe: resolve path %q: %w", filePath, err)
+		}
+		probeTarget = absPath
+	}
 
-	timeout := p.timeout
 	if timeout <= 0 {
 		timeout = defaultProbeTimeout
 	}
@@ -106,13 +140,14 @@ func (p *Prober) Probe(ctx context.Context, filePath string) (*ProbeResult, erro
 
 	cmd := exec.CommandContext(
 		probeCtx,
-		p.ffprobePath,
+		ffprobePath,
 		"-v", "quiet",
 		"-print_format", "json",
 		"-show_format",
 		"-show_streams",
 		"-show_chapters",
-		filePath,
+		"--",
+		probeTarget,
 	)
 	out, err := cmd.Output()
 	if err != nil {

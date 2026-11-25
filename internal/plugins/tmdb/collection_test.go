@@ -38,6 +38,7 @@ func TestFetchMovieBelongsToCollection(t *testing.T) {
 	defer srv.Close()
 
 	p := New("test-key", "zh-CN")
+	p.SetHTTPClient(srv.Client())
 	_ = p.Configure(map[string]any{
 		"base_url":       srv.URL,
 		"image_base_url": "https://img.example.com",

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { api, saveAuth } from '../../api/client'
 import type { ScanProgressSnapshot } from '../../api/types'
@@ -168,6 +168,59 @@ describe('ScanProgressBar 实时扫描进度组件', () => {
     expect(screen.getByText('失败 0')).toBeInTheDocument()
     expect(screen.getByText('电影库')).toBeInTheDocument()
     expect(screen.getByText('剧集库')).toBeInTheDocument()
+  })
+
+  it('扫描从运行态结束为空闲态后展示完成横幅并在 4 秒后自动隐藏', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      const now = new Date().toISOString()
+      const runningSnap: ScanProgressSnapshot = {
+        running: true,
+        phase: 'enriching',
+        library_name: '电影库',
+        total: 10,
+        processed: 8,
+        added: 3,
+        updated: 5,
+        skipped: 0,
+        failed: 0,
+        percentage: 80,
+        updated_at: now,
+      }
+      const idleSnap: ScanProgressSnapshot = {
+        running: false,
+        phase: 'idle',
+        total: 0,
+        processed: 0,
+        added: 0,
+        updated: 0,
+        skipped: 0,
+        failed: 0,
+        percentage: 0,
+        updated_at: now,
+      }
+
+      let currentSnap = runningSnap
+      vi.spyOn(api, 'getScanProgress').mockImplementation(async () => currentSnap)
+
+      const { queryClient } = renderWithQueryClient(<ScanProgressBar variant="banner" />)
+      expect(await screen.findByTestId('scan-progress-banner')).toBeInTheDocument()
+
+      // 切换为 idle 态，触发完成态快照展示
+      currentSnap = idleSnap
+      await queryClient.invalidateQueries({ queryKey: ['scanProgress'] })
+      expect(await screen.findByText('扫描完成')).toBeInTheDocument()
+
+      // 推进超过 4 秒后自动隐藏
+      act(() => {
+        vi.advanceTimersByTime(4200)
+      })
+      await waitFor(() => {
+        expect(screen.queryByTestId('scan-progress-banner')).not.toBeInTheDocument()
+      })
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 

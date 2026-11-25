@@ -459,8 +459,73 @@ func TestNotificationsLocalization(t *testing.T) {
 		if res.Notifications[2].Name != i18n.T(loc, "notif.task_failed.name") || res.Notifications[2].Description != i18n.T(loc, "notif.task_failed.desc") {
 			t.Fatalf("locale %s task failed = %+v", loc, res.Notifications[2])
 		}
-		if res.Notifications[3].Name != i18n.T(loc, "notif.library_updated.name") || res.Notifications[3].Description != i18n.T(loc, "notif.library_updated.desc") {
+	if localized := res.Notifications[3]; localized.Name != i18n.T(loc, "notif.library_updated.name") || localized.Description != i18n.T(loc, "notif.library_updated.desc") {
 			t.Fatalf("locale %s library updated = %+v", loc, res.Notifications[3])
 		}
+	}
+}
+
+func TestNotificationsSecurityHardeningV0103(t *testing.T) {
+	h, mux, _ := setupNotifTest(t)
+
+	// 1. Reject javascript: / data: URLs in handleSendAdmin
+	for _, bad := range []string{"javascript:alert(1)", "data:text/html,<h1>x</h1>", "//evil.example.com/a"} {
+		if r := doReq(t, mux, http.MethodPost, "/Notifications/Admin", map[string]any{"Name": "XSS", "Url": bad}); r.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for dangerous Url %q, got %d", bad, r.Code)
+		}
+		if r := doReq(t, mux, http.MethodPost, "/Notifications/Admin", map[string]any{"Name": "XSS", "ImageUrl": bad}); r.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for dangerous ImageUrl %q, got %d", bad, r.Code)
+		}
+	}
+
+	// 2. ReadBy must be omitted from list responses
+	_ = doReq(t, mux, http.MethodPost, "/Notifications/Admin", map[string]any{"Name": "Broadcast", "Url": "/web/index.html"})
+	_ = doReq(t, mux, http.MethodPost, "/Notifications/user-1/Read", nil)
+	rec := doReq(t, mux, http.MethodGet, "/Notifications/user-1", nil)
+	var listRes NotificationResult
+	_ = json.Unmarshal(rec.Body.Bytes(), &listRes)
+	if len(listRes.Notifications) != 1 || !listRes.Notifications[0].IsRead || len(listRes.Notifications[0].ReadBy) != 0 {
+		t.Fatalf("expected ReadBy hidden while IsRead preserved, got %+v", listRes.Notifications)
+	}
+
+	// 3. TaskFailed notification triggers only on State=Idle and deduplicates by (Id, EndTimeUtc)
+	bus := eventbus.New()
+	h.SubscribeEvents(bus)
+	before := len(h.state.Items)
+
+	// Running state with previous Failed result must NOT trigger notification
+	bus.Publish(context.Background(), eventbus.Event{
+		Type: eventbus.EventTaskProgress,
+		Payload: map[string]any{
+			"Id":    "task-1",
+			"Name":  "Backup",
+			"State": "Running",
+			"LastExecutionResult": map[string]any{
+				"Status":     "Failed",
+				"EndTimeUtc": "2026-11-25T08:00:00Z",
+			},
+		},
+	})
+	// Idle state with same (Id, EndTimeUtc) published twice must produce only 1 notification
+	for i := 0; i < 2; i++ {
+		bus.Publish(context.Background(), eventbus.Event{
+			Type: eventbus.EventTaskProgress,
+			Payload: map[string]any{
+				"Id":    "task-1",
+				"Name":  "Backup",
+				"State": "Idle",
+				"LastExecutionResult": map[string]any{
+					"Status":     "Failed",
+					"EndTimeUtc": "2026-11-25T08:00:00Z",
+				},
+			},
+		})
+	}
+	time.Sleep(100 * time.Millisecond)
+	h.mu.RLock()
+	after := len(h.state.Items)
+	h.mu.RUnlock()
+	if after != before+1 {
+		t.Fatalf("expected exactly 1 deduplicated task failure notification, before=%d after=%d", before, after)
 	}
 }

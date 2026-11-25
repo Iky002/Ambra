@@ -292,12 +292,16 @@ func (h *Handler) serveProfileByID(w http.ResponseWriter, id string) {
 
 func (h *Handler) handleCreateProfile(w http.ResponseWriter, r *http.Request) {
 	var p DlnaProfile
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &p, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid dlna profile payload")
 		return
 	}
 	if strings.TrimSpace(p.Name) == "" {
 		httpx.Error(w, http.StatusBadRequest, "profile Name is required")
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(p.Id), defaultProfileID) {
+		httpx.Error(w, http.StatusBadRequest, "cannot overwrite built-in default profile")
 		return
 	}
 	if strings.TrimSpace(p.Id) == "" {
@@ -322,7 +326,7 @@ func (h *Handler) handleCreateProfile(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleUpdateProfile(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
 	var p DlnaProfile
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &p, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid dlna profile payload")
 		return
 	}
@@ -670,6 +674,14 @@ func (h *Handler) ActiveSubscriptionCount() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return len(h.subscriptions)
+}
+
+// BumpSystemUpdate increments the UPnP ContentDirectory SystemUpdateID when library contents change.
+func (h *Handler) BumpSystemUpdate() uint32 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.systemUpdate++
+	return h.systemUpdate
 }
 
 func parseTimeoutHeader(raw string) int {

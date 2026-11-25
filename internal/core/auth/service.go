@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,6 +30,7 @@ var (
 const (
 	tokenCacheTTL       = 5 * time.Minute
 	activityFlushWindow = 30 * time.Second
+	maxTokenCacheSize   = 4096
 )
 
 // ClientInfo holds parsed Emby client metadata extracted from headers or query parameters.
@@ -77,6 +79,10 @@ func NewService(repo *sqlite.UserRepo, cfg *config.Config) *Service {
 
 // EnsureDefaultAdmin creates a default administrator user if the users table is empty.
 func (s *Service) EnsureDefaultAdmin(ctx context.Context) error {
+	if skip := strings.TrimSpace(os.Getenv("AMBRA_SKIP_DEFAULT_ADMIN")); strings.EqualFold(skip, "true") || skip == "1" {
+		return nil
+	}
+
 	count, err := s.repo.CountUsers(ctx)
 	if err != nil {
 		return fmt.Errorf("count users: %w", err)
@@ -92,6 +98,7 @@ func (s *Service) EnsureDefaultAdmin(ctx context.Context) error {
 	password, hasPassEnv := os.LookupEnv("AMBRA_ADMIN_PASS")
 	if !hasPassEnv {
 		password = "admin"
+		slog.Warn("creating default administrator with insecure default password; set AMBRA_ADMIN_PASS or AMBRA_SKIP_DEFAULT_ADMIN=true", "username", username)
 	}
 
 	_, err = s.CreateUser(ctx, username, password, true)
@@ -133,6 +140,7 @@ func (s *Service) AuthenticateByName(ctx context.Context, username, password, le
 	u, err := s.repo.GetUserByName(ctx, strings.TrimSpace(username))
 	if err != nil {
 		if errors.Is(err, sqlite.ErrNotFound) {
+			dummyPasswordWork(password)
 			return nil, ErrInvalidCredentials
 		}
 		return nil, err
@@ -256,15 +264,27 @@ func (s *Service) ValidateToken(ctx context.Context, token string) (*TokenIdenti
 
 	s.mu.RLock()
 	entry, ok := s.cache[token]
+	var (
+		identity   *TokenIdentity
+		expiresAt  time.Time
+		lastFlush  time.Time
+		isDisabled bool
+	)
+	if ok {
+		identity = entry.identity
+		expiresAt = entry.expiresAt
+		lastFlush = entry.lastFlush
+		isDisabled = !identity.IsAPIKey && identity.User != nil && (identity.User.IsDisabled || identity.User.Policy.IsDisabled)
+	}
 	s.mu.RUnlock()
 
-	if ok && now.Before(entry.expiresAt) {
-		if !entry.identity.IsAPIKey && entry.identity.User != nil && (entry.identity.User.IsDisabled || entry.identity.User.Policy.IsDisabled) {
+	if ok && now.Before(expiresAt) {
+		if isDisabled {
 			s.InvalidateTokenCache(token)
 			return nil, ErrUserDisabled
 		}
 		// Throttle DB last_active_at updates to once every 30s
-		if !entry.identity.IsAPIKey && now.Sub(entry.lastFlush) >= activityFlushWindow {
+		if !identity.IsAPIKey && now.Sub(lastFlush) >= activityFlushWindow {
 			s.mu.Lock()
 			if cur, exists := s.cache[token]; exists && now.Sub(cur.lastFlush) >= activityFlushWindow {
 				cur.lastFlush = now
@@ -278,7 +298,13 @@ func (s *Service) ValidateToken(ctx context.Context, token string) (*TokenIdenti
 			}
 			s.mu.Unlock()
 		}
-		return entry.identity, nil
+		return identity, nil
+	} else if ok {
+		s.mu.Lock()
+		if cur, exists := s.cache[token]; exists && !now.Before(cur.expiresAt) {
+			delete(s.cache, token)
+		}
+		s.mu.Unlock()
 	}
 
 	// Cache miss: check access_tokens first
@@ -363,7 +389,18 @@ func (s *Service) RevokeDevice(ctx context.Context, deviceID string) error {
 	return s.repo.DeleteTokensByDevice(ctx, deviceID)
 }
 
+// RevokeUserTokens revokes all active access tokens for userID in both memory cache and SQLite.
+func (s *Service) RevokeUserTokens(ctx context.Context, userID string) error {
+	s.InvalidateUserCache(userID)
+	return s.repo.DeleteTokensByUser(ctx, userID)
+}
+
 func (s *Service) ChangePassword(ctx context.Context, userID, currentPw, newPw string, isAdminAction bool) error {
+	return s.ChangePasswordKeepToken(ctx, userID, currentPw, newPw, isAdminAction, "")
+}
+
+// ChangePasswordKeepToken updates a user's password and revokes all existing tokens except keepToken (if non-empty).
+func (s *Service) ChangePasswordKeepToken(ctx context.Context, userID, currentPw, newPw string, isAdminAction bool, keepToken string) error {
 	u, err := s.repo.GetUserByID(ctx, userID)
 	if err != nil {
 		if errors.Is(err, sqlite.ErrNotFound) {
@@ -390,8 +427,29 @@ func (s *Service) ChangePassword(ctx context.Context, userID, currentPw, newPw s
 	if err := s.repo.UpdateUserPassword(ctx, u.ID, hash); err != nil {
 		return err
 	}
-	s.InvalidateUserCache(u.ID)
-	return nil
+	keepToken = strings.TrimSpace(keepToken)
+	if keepToken != "" {
+		if err := s.repo.DeleteTokensByUserExcept(ctx, u.ID, keepToken); err != nil {
+			return err
+		}
+		s.invalidateUserCacheExcept(u.ID, keepToken)
+		return nil
+	}
+	return s.RevokeUserTokens(ctx, u.ID)
+}
+
+func (s *Service) invalidateUserCacheExcept(userID, keepToken string) {
+	norm := guid.Normalize(userID)
+	s.mu.Lock()
+	for tok, entry := range s.cache {
+		if tok == keepToken {
+			continue
+		}
+		if entry.identity.User != nil && guid.Normalize(entry.identity.User.ID) == norm {
+			delete(s.cache, tok)
+		}
+	}
+	s.mu.Unlock()
 }
 
 func (s *Service) InvalidateTokenCache(token string) {
@@ -468,6 +526,28 @@ func sanitizeUserDir(s string) string {
 
 func (s *Service) putCache(token string, id *TokenIdentity, now time.Time) {
 	s.mu.Lock()
+	if _, exists := s.cache[token]; !exists && len(s.cache) >= maxTokenCacheSize {
+		// First purge all expired entries.
+		for tok, e := range s.cache {
+			if !now.Before(e.expiresAt) {
+				delete(s.cache, tok)
+			}
+		}
+		// If still at capacity, evict the entry with the earliest expiry.
+		if len(s.cache) >= maxTokenCacheSize {
+			var oldestTok string
+			var oldestExp time.Time
+			for tok, e := range s.cache {
+				if oldestTok == "" || e.expiresAt.Before(oldestExp) {
+					oldestTok = tok
+					oldestExp = e.expiresAt
+				}
+			}
+			if oldestTok != "" {
+				delete(s.cache, oldestTok)
+			}
+		}
+	}
 	s.cache[token] = &cachedToken{
 		identity:  id,
 		expiresAt: now.Add(tokenCacheTTL),

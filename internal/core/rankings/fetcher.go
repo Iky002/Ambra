@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 )
 
 const (
@@ -56,7 +58,7 @@ type Fetcher struct {
 func NewFetcher(opts Options) *Fetcher {
 	client := opts.HTTPClient
 	if client == nil {
-		client = &http.Client{Timeout: DefaultHTTPTimeout}
+		client = netutil.NewSafeHTTPClient(15*time.Second, false)
 	}
 	ua := strings.TrimSpace(opts.UserAgent)
 	if ua == "" {

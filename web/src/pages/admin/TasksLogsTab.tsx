@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   CalendarClock,
@@ -88,6 +88,17 @@ export function TasksLogsTab() {
   const [newWeeklyDay, setNewWeeklyDay] = useState<string>('Sunday')
   const [newIntervalHours, setNewIntervalHours] = useState(6)
   const [savingTriggers, setSavingTriggers] = useState(false)
+  const timersRef = useRef<Set<number>>(new Set())
+
+  useEffect(() => {
+    const timers = timersRef.current
+    return () => {
+      for (const timerId of timers) {
+        window.clearTimeout(timerId)
+      }
+      timers.clear()
+    }
+  }, [])
 
   const {
     data: rawTasks,
@@ -138,15 +149,21 @@ export function TasksLogsTab() {
     enabled: Boolean(selectedLog),
   })
 
+  const scheduleRefetchTasks = (delayMs: number) => {
+    const timerId = window.setTimeout(() => {
+      timersRef.current.delete(timerId)
+      void refetchTasks()
+    }, delayMs)
+    timersRef.current.add(timerId)
+  }
+
   const handleRunTask = async (taskId: string, taskName: string) => {
     setRunningTaskId(taskId)
     setFeedback(null)
     try {
       await api.runScheduledTask(taskId)
       setFeedback({ type: 'success', message: `已触发计划任务「${taskName}」` })
-      window.setTimeout(() => {
-        void refetchTasks()
-      }, 600)
+      scheduleRefetchTasks(600)
     } catch (err) {
       setFeedback({
         type: 'error',
@@ -163,9 +180,7 @@ export function TasksLogsTab() {
     try {
       await api.stopScheduledTask(taskId)
       setFeedback({ type: 'success', message: `已请求停止计划任务「${taskName}」` })
-      window.setTimeout(() => {
-        void refetchTasks()
-      }, 400)
+      scheduleRefetchTasks(400)
     } catch (err) {
       setFeedback({
         type: 'error',

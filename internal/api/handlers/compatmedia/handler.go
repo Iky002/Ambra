@@ -7,10 +7,12 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
@@ -19,6 +21,7 @@ import (
 	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/core/watcher"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
@@ -30,21 +33,31 @@ type AuthFuncs struct {
 	UserIDFromCtx func(context.Context) string
 }
 
+const (
+	maxChapterExtractConcurrency = 4
+	maxImageResizeDimension      = 4096
+	maxChannelLatestIDs          = 50
+)
+
 // Handler implements the remaining Emby 4.10.2.0 media, item, metadata, image,
 // encoding, library, taxonomy, audio, and video compatibility endpoints.
 type Handler struct {
-	repo         *sqlite.LibraryRepo
-	userRepo     *sqlite.UserRepo
-	scanner      *scanner.Scanner
-	watcher      *watcher.Watcher
-	imaging      *imaging.Service
-	registry     *plugins.Registry
-	store        *sqlite.Store
-	cfg          *config.Config
-	extractor    *transcode.Extractor
-	transcodeMgr *transcode.Manager
-	httpClient   *http.Client
-	auth         AuthFuncs
+	repo              *sqlite.LibraryRepo
+	userRepo          *sqlite.UserRepo
+	scanner           *scanner.Scanner
+	watcher           *watcher.Watcher
+	imaging           *imaging.Service
+	registry          *plugins.Registry
+	store             *sqlite.Store
+	cfg               *config.Config
+	extractor         *transcode.Extractor
+	transcodeMgr      *transcode.Manager
+	httpClient        *http.Client
+	defaultHTTPClient *http.Client
+	clientOnce        sync.Once
+	chapterSem        chan struct{}
+	chapterSemOnce    sync.Once
+	auth              AuthFuncs
 }
 
 // New creates a new compatmedia Handler.
@@ -57,13 +70,15 @@ func New(
 	cfg *config.Config,
 ) *Handler {
 	return &Handler{
-		repo:      repo,
-		scanner:   sc,
-		imaging:   img,
-		registry:  reg,
-		store:     store,
-		cfg:       cfg,
-		extractor: transcode.NewExtractor(cfg),
+		repo:              repo,
+		scanner:           sc,
+		imaging:           img,
+		registry:          reg,
+		store:             store,
+		cfg:               cfg,
+		extractor:         transcode.NewExtractor(cfg),
+		defaultHTTPClient: netutil.NewSafeHTTPClient(15*time.Second, false),
+		chapterSem:        make(chan struct{}, maxChapterExtractConcurrency),
 	}
 }
 
@@ -96,7 +111,21 @@ func (h *Handler) getHTTPClient() *http.Client {
 	if h.httpClient != nil {
 		return h.httpClient
 	}
-	return newSafeRemoteHTTPClient()
+	h.clientOnce.Do(func() {
+		if h.defaultHTTPClient == nil {
+			h.defaultHTTPClient = netutil.NewSafeHTTPClient(15*time.Second, false)
+		}
+	})
+	return h.defaultHTTPClient
+}
+
+func (h *Handler) getChapterSem() chan struct{} {
+	h.chapterSemOnce.Do(func() {
+		if h.chapterSem == nil {
+			h.chapterSem = make(chan struct{}, maxChapterExtractConcurrency)
+		}
+	})
+	return h.chapterSem
 }
 
 // BuildRouter builds an isolated chi.Router containing all 21 media-domain route prefixes
@@ -232,7 +261,7 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 	r.Get("/Items/{Id}/Ancestors", authFn(h.handleItemAncestors))
 	r.Get("/Items/{Id}/File", authFn(h.handleItemFile))
 	r.Get("/Items/{Id}/Similar", authFn(h.handleSimilar))
-	r.Get("/Items/{Id}/DeleteInfo", authFn(h.handleItemDeleteInfo))
+	r.Get("/Items/{Id}/DeleteInfo", adminFn(h.handleItemDeleteInfo))
 	r.Get("/Items/{Id}/Images", authFn(h.handleListItemImages))
 	r.Get("/Items/{Id}/Images/{Type}/{Index}/{Tag}/{Format}/{MaxWidth}/{MaxHeight}/{PercentPlayed}/{UnPlayedCount}", h.handleServeItemImageFull)
 	r.Head("/Items/{Id}/Images/{Type}/{Index}/{Tag}/{Format}/{MaxWidth}/{MaxHeight}/{PercentPlayed}/{UnPlayedCount}", h.handleServeItemImageFull)
@@ -526,6 +555,60 @@ func (h *Handler) setConfigJSON(ctx context.Context, key string, val any) error 
 		key, string(raw), time.Now().Unix(),
 	)
 	return err
+}
+
+func (h *Handler) isNonAdminCaller(r *http.Request) bool {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		return !ac.IsAdmin()
+	}
+	if h.userRepo != nil && h.auth.UserIDFromCtx != nil {
+		uid := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if uid != "" {
+			if u, err := h.userRepo.GetUserByID(r.Context(), uid); err == nil && u != nil {
+				return !(u.IsAdmin || u.Policy.IsAdministrator)
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func sanitizeItemPaths(item *dto.BaseItemDto) {
+	if item == nil {
+		return
+	}
+	item.Path = ""
+	for i := range item.MediaSources {
+		item.MediaSources[i].Path = ""
+		for j := range item.MediaSources[i].MediaStreams {
+			item.MediaSources[i].MediaStreams[j].Path = ""
+		}
+	}
+}
+
+func (h *Handler) sanitizeItemPathsForCaller(r *http.Request, item *dto.BaseItemDto) {
+	if !h.isNonAdminCaller(r) {
+		return
+	}
+	sanitizeItemPaths(item)
+}
+
+func (h *Handler) sanitizeItemsPathsForCaller(r *http.Request, items []dto.BaseItemDto) {
+	if !h.isNonAdminCaller(r) {
+		return
+	}
+	for i := range items {
+		sanitizeItemPaths(&items[i])
+	}
+}
+
+func (h *Handler) sanitizePlaylistItemsPathsForCaller(r *http.Request, items []sqlite.PlaylistItemDto) {
+	if !h.isNonAdminCaller(r) {
+		return
+	}
+	for i := range items {
+		sanitizeItemPaths(&items[i].BaseItemDto)
+	}
 }
 
 func passthrough(next http.Handler) http.Handler { return next }

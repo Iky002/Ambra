@@ -37,7 +37,7 @@ func TestFiveTierPlaybackDecisions(t *testing.T) {
 
 	// 1. STRM 302 DirectPlay
 	strmFile := filepath.Join(tmp, "remote.strm")
-	_ = os.WriteFile(strmFile, []byte("https://cdn.example.com/4k.mkv\n"), 0o644)
+	_ = os.WriteFile(strmFile, []byte("https://192.168.1.10/4k.mkv\n"), 0o644)
 	strmItemID := guid.New()
 	_ = repo.UpsertItem(ctx, &sqlite.ItemRecord{
 		ID:        strmItemID,

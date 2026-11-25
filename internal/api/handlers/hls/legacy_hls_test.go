@@ -6,26 +6,22 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"github.com/ambra-media/ambra/internal/core/transcode"
 )
 
 func TestLegacyHLSSegmentRoute(t *testing.T) {
 	mux, mgr, itemID, msID := setupHLSTest(t)
 
-	// Pre-register a session and seed seg_0.ts on disk so handleSegment serves it immediately without running ffmpeg.
-	snap, err := mgr.RegisterSession(transcode.SessionParams{
-		PlaySessionID:    "legacy-ps-1",
-		ItemID:           itemID,
-		MediaSourceID:    msID,
-		VideoCodec:       "h264",
-		AudioCodec:       "aac",
-		SegmentContainer: "ts",
-	})
-	if err != nil {
-		t.Fatalf("RegisterSession: %v", err)
+	// Register the session via master.m3u8 so SessionParams match exact handler normalization, then seed seg_0.ts.
+	masterRec := httptest.NewRecorder()
+	mux.ServeHTTP(masterRec, httptest.NewRequest(http.MethodGet, "/Videos/"+itemID+"/master.m3u8?PlaySessionId=legacy-ps-1&MediaSourceId="+msID, nil))
+	if masterRec.Code != http.StatusOK {
+		t.Fatalf("master.m3u8 failed: %d", masterRec.Code)
 	}
-	segPath := filepath.Join(snap.WorkDir, "seg_0.ts")
+	sessions := mgr.ActiveSessions()
+	if len(sessions) != 1 {
+		t.Fatalf("expected 1 registered session, got %d", len(sessions))
+	}
+	segPath := filepath.Join(sessions[0].WorkDir, "seg_0.ts")
 	if err := os.WriteFile(segPath, []byte("LEGACY_TS_PAYLOAD"), 0o644); err != nil {
 		t.Fatalf("write seg_0.ts: %v", err)
 	}

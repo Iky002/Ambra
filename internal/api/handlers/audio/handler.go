@@ -24,11 +24,12 @@ import (
 )
 
 const (
-	ticksPerSecond        = 10_000_000
-	maxAudioBitrate       = 1_536_000
-	maxAudioChannels      = 8
-	maxAudioSampleRate    = 192_000
-	defaultAudioBrowserUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+	ticksPerSecond               = 10_000_000
+	maxAudioBitrate              = 1_536_000
+	maxAudioChannels             = 8
+	maxAudioSampleRate           = 192_000
+	maxConcurrentAudioTranscodes = 8
+	defaultAudioBrowserUA        = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
 // AuthFuncs decouples route registration from the concrete middleware package.
@@ -67,14 +68,16 @@ type Handler struct {
 	auth           AuthFuncs
 	streamResolver func(ctx context.Context, rawPath string) (string, error)
 	httpClient     *http.Client
+	transcodeSem   chan struct{}
 }
 
 // New constructs an Audio API handler.
 func New(repo *sqlite.LibraryRepo, cfg *config.Config) *Handler {
 	return &Handler{
-		repo:       repo,
-		cfg:        cfg,
-		httpClient: netutil.NewSafeHTTPClient(0, true),
+		repo:         repo,
+		cfg:          cfg,
+		httpClient:   netutil.NewSafeHTTPClient(0, true),
+		transcodeSem: make(chan struct{}, maxConcurrentAudioTranscodes),
 	}
 }
 
@@ -97,12 +100,15 @@ func (h *Handler) SetProxyClient(client *http.Client) {
 
 // CanAccessLibrary returns true if userID is permitted to access libraryID.
 func (h *Handler) CanAccessLibrary(ctx context.Context, userID, libraryID string) bool {
-	if h.userRepo == nil || userID == "" || libraryID == "" {
+	if h.userRepo == nil || libraryID == "" {
 		return true
+	}
+	if strings.TrimSpace(userID) == "" {
+		return false
 	}
 	u, err := h.userRepo.GetUserByID(ctx, guid.Normalize(userID))
 	if err != nil || u == nil {
-		return true
+		return false
 	}
 	if u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableAllFolders {
 		return true
@@ -130,17 +136,23 @@ func (h *Handler) canAccessItem(r *http.Request, itemID string) bool {
 		callerID = guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
 	}
 	if callerID == "" {
-		return true
+		return false
 	}
 	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
-	if err != nil || rec == nil {
+	if errors.Is(err, sqlite.ErrNotFound) {
 		return true
+	}
+	if err != nil || rec == nil {
+		return false
 	}
 	if rec.LibraryID != "" && !h.CanAccessLibrary(r.Context(), callerID, rec.LibraryID) {
 		return false
 	}
 	u, err := h.userRepo.GetUserByID(r.Context(), callerID)
-	if err != nil || u == nil || u.IsAdmin || u.Policy.IsAdministrator {
+	if err != nil || u == nil {
+		return false
+	}
+	if u.IsAdmin || u.Policy.IsAdministrator {
 		return true
 	}
 	blocked, err := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, u.Policy.MaxParentalRating, u.Policy.BlockedTags)
@@ -319,6 +331,16 @@ func (h *Handler) streamTranscodeAudio(w http.ResponseWriter, r *http.Request, m
 		return
 	}
 
+	if h.transcodeSem != nil {
+		select {
+		case h.transcodeSem <- struct{}{}:
+			defer func() { <-h.transcodeSem }()
+		default:
+			httpx.Error(w, http.StatusServiceUnavailable, "audio transcoding concurrency limit reached")
+			return
+		}
+	}
+
 	ffmpegPath := "ffmpeg"
 	if h.cfg != nil && h.cfg.FFmpegPath != "" {
 		ffmpegPath = h.cfg.FFmpegPath
@@ -355,6 +377,9 @@ func buildAudioFFmpegArgs(mediaPath, muxFmt, encoder string, bitrate int, startT
 	if startTimeTicks > 0 {
 		secs := float64(startTimeTicks) / float64(ticksPerSecond)
 		args = append(args, "-ss", strconv.FormatFloat(secs, 'f', 3, 64))
+	}
+	if isHTTPURL(mediaPath) {
+		args = append(args, "-protocol_whitelist", "http,https,tcp,tls,crypto")
 	}
 	args = append(args,
 		"-i", mediaPath,
@@ -646,22 +671,26 @@ func ParseLRC(content string) *LyricDto {
 }
 
 func (h *Handler) resolveStrmAudio(ctx context.Context, strmPath string) (string, error) {
+	var resolved string
 	if h.streamResolver != nil {
-		resolved, err := h.streamResolver(ctx, strmPath)
+		u, err := h.streamResolver(ctx, strmPath)
 		if err != nil {
 			return "", err
 		}
-		resolved = strings.TrimSpace(resolved)
-		if resolved == "" {
-			return "", errors.New("empty strm resolution")
-		}
-		return resolved, nil
+		resolved = strings.TrimSpace(u)
+	} else {
+		resolved = readFirstLineAudioURL(strmPath)
 	}
-	u := readFirstLineAudioURL(strmPath)
-	if u == "" {
+	if resolved == "" {
 		return "", errors.New("empty or invalid strm file")
 	}
-	return u, nil
+	if !isHTTPURL(resolved) {
+		return "", errors.New("strm target must be an http/https url")
+	}
+	if err := netutil.ValidateRemoteURL(resolved, true); err != nil {
+		return "", err
+	}
+	return resolved, nil
 }
 
 func readFirstLineAudioURL(strmPath string) string {

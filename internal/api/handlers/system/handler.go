@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -20,12 +21,14 @@ import (
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
 type Handler struct {
 	cfgMu    sync.RWMutex
+	setupMu  sync.Mutex
 	cfg      *config.Config
 	userRepo *sqlite.UserRepo
 	registry *plugins.Registry
@@ -220,13 +223,15 @@ func (h *Handler) GetConfiguration(w http.ResponseWriter, r *http.Request) {
 	h.cfgMu.RUnlock()
 
 	extra := h.loadExtraConfig(r.Context())
-	out := make(map[string]any, len(extra)+9)
-	for k, v := range extra {
-		out[k] = v
+	out := make(map[string]any, 9)
+	if isAdmin {
+		for k, v := range extra {
+			out[k] = v
+		}
 	}
 	out["ServerName"] = serverName
 	out["IsStartupWizardCompleted"] = wizardCompleted
-	if tmdbKey != "" {
+	if isAdmin && tmdbKey != "" {
 		out["TMDBApiKey"] = tmdbKey
 	} else {
 		delete(out, "TMDBApiKey")
@@ -244,7 +249,7 @@ func (h *Handler) GetConfiguration(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) UpdateConfiguration(w http.ResponseWriter, r *http.Request) {
 	var body map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &body, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
@@ -562,8 +567,17 @@ func (h *Handler) buildPublicInfo(r *http.Request) dto.PublicSystemInfo {
 	h.cfgMu.RUnlock()
 
 	scheme := "http"
-	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+	if r.TLS != nil {
 		scheme = "https"
+	} else if strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		remoteHost := strings.TrimSpace(r.RemoteAddr)
+		if hPart, _, err := net.SplitHostPort(remoteHost); err == nil {
+			remoteHost = hPart
+		}
+		remoteHost = strings.Trim(remoteHost, "[]")
+		if addr, err := netip.ParseAddr(remoteHost); err == nil && netutil.IsTrustedProxyIP(addr) {
+			scheme = "https"
+		}
 	}
 	host := r.Host
 	if host == "" {

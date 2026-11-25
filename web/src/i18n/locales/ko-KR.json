@@ -97,6 +97,7 @@
   "library.sortDateAdded": "추가된 날짜",
   "library.sortReleaseDate": "개봉일",
   "library.sortRating": "평점",
+  "library.sortPlayCount": "재생 횟수",
   "library.filterAll": "모든 상태",
   "library.filterUnplayed": "미시청",
   "library.filterPlayed": "시청 완료",

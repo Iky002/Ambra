@@ -16,11 +16,14 @@ func collectDiskHealth(path string) DiskHealth {
 	if err := syscall.Statfs(path, &st); err != nil {
 		return out
 	}
+	if st.Bsize <= 0 {
+		return out
+	}
 	bsize := uint64(st.Bsize)
 	out.TotalBytes = st.Blocks * bsize
 	out.FreeBytes = st.Bfree * bsize
 	out.AvailableBytes = st.Bavail * bsize
-	if out.TotalBytes > 0 {
+	if out.TotalBytes > 0 && out.TotalBytes >= out.FreeBytes {
 		used := out.TotalBytes - out.FreeBytes
 		pct := float64(used) / float64(out.TotalBytes) * 100
 		out.UsedPercent = math.Round(pct*10) / 10

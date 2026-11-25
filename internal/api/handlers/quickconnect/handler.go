@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/middleware"
+	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/auth"
 	"github.com/ambra-media/ambra/internal/core/session"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
@@ -25,6 +25,7 @@ import (
 const (
 	defaultTTL              = 10 * time.Minute
 	maxPendingSessions      = 1000
+	maxPendingPerIP         = 20
 	maxFailedAttempts       = 5
 	maxInitiatesPerIPPerMin = 10
 	initiateRateWindow      = time.Minute
@@ -52,6 +53,7 @@ type QuickConnectResult struct {
 type pendingSession struct {
 	result    QuickConnectResult
 	userID    string
+	clientIP  string
 	expiresAt time.Time
 }
 
@@ -65,6 +67,7 @@ type Handler struct {
 	authSvc    *auth.Service
 	userRepo   *sqlite.UserRepo
 	sessionMgr *session.Manager
+	cfg        *config.Config
 	auth       AuthFuncs
 
 	ttl time.Duration
@@ -91,6 +94,23 @@ func New(authSvc *auth.Service, userRepo *sqlite.UserRepo, sessionMgr *session.M
 	}
 }
 
+// SetConfig attaches the server configuration so QuickConnect honors EnableQuickConnect.
+func (h *Handler) SetConfig(cfg *config.Config) {
+	h.mu.Lock()
+	h.cfg = cfg
+	h.mu.Unlock()
+}
+
+func (h *Handler) isEnabled() bool {
+	h.mu.Lock()
+	cfg := h.cfg
+	h.mu.Unlock()
+	if cfg == nil {
+		return true
+	}
+	return cfg.Snapshot().EnableQuickConnect
+}
+
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, authFuncs AuthFuncs) {
 	h.auth = authFuncs
 	wrapAuth := authFuncs.RequireAuth
@@ -106,10 +126,27 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authFuncs AuthFuncs) {
 }
 
 func (h *Handler) handleEnabled(w http.ResponseWriter, _ *http.Request) {
-	httpx.JSON(w, http.StatusOK, true)
+	httpx.JSON(w, http.StatusOK, h.isEnabled())
+}
+
+func (h *Handler) countPendingForIPLocked(ip string) int {
+	if ip == "" {
+		return 0
+	}
+	n := 0
+	for _, entry := range h.bySecret {
+		if entry.clientIP == ip {
+			n++
+		}
+	}
+	return n
 }
 
 func (h *Handler) handleInitiate(w http.ResponseWriter, r *http.Request) {
+	if !h.isEnabled() {
+		httpx.Error(w, http.StatusForbidden, "quickconnect is disabled")
+		return
+	}
 	client := middleware.ExtractClientInfo(r)
 	now := h.now()
 	ip := clientIP(r)
@@ -117,6 +154,11 @@ func (h *Handler) handleInitiate(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	h.pruneExpiredLocked(now)
 	if ip != "" {
+		if h.countPendingForIPLocked(ip) >= maxPendingPerIP {
+			h.mu.Unlock()
+			httpx.Error(w, http.StatusTooManyRequests, "too many pending quickconnect sessions from this ip")
+			return
+		}
 		rw := h.initiateRates[ip]
 		if rw != nil && now.Before(rw.resetAt) && rw.count >= maxInitiatesPerIPPerMin {
 			h.mu.Unlock()
@@ -144,7 +186,7 @@ func (h *Handler) handleInitiate(w http.ResponseWriter, r *http.Request) {
 
 	h.mu.Lock()
 	h.pruneExpiredLocked(now)
-	if len(h.bySecret) >= maxPendingSessions {
+	if len(h.bySecret) >= maxPendingSessions || (ip != "" && h.countPendingForIPLocked(ip) >= maxPendingPerIP) {
 		h.mu.Unlock()
 		httpx.Error(w, http.StatusTooManyRequests, "too many pending quickconnect sessions")
 		return
@@ -180,6 +222,7 @@ func (h *Handler) handleInitiate(w http.ResponseWriter, r *http.Request) {
 			AppVersion:    client.Version,
 			DateAdded:     now,
 		},
+		clientIP:  ip,
 		expiresAt: now.Add(h.ttl),
 	}
 	h.bySecret[secret] = entry
@@ -214,8 +257,14 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleAuthorize(w http.ResponseWriter, r *http.Request) {
+	if !h.isEnabled() {
+		httpx.Error(w, http.StatusForbidden, "quickconnect is disabled")
+		return
+	}
+	ac, hasAC := middleware.AuthFromContext(r.Context())
+	isAPIKey := hasAC && ac != nil && ac.IsAPIKey
 	callerID := h.callerUserID(r)
-	if callerID == "" {
+	if callerID == "" && !isAPIKey {
 		httpx.Error(w, http.StatusUnauthorized, "user authentication required")
 		return
 	}
@@ -228,7 +277,7 @@ func (h *Handler) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 			Code   string `json:"Code"`
 			UserId string `json:"UserId"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+		if err := httpx.DecodeJSONLimit(r, &body, 0); err == nil {
 			if code == "" {
 				code = strings.TrimSpace(body.Code)
 			}
@@ -239,9 +288,25 @@ func (h *Handler) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	targetUserID := callerID
-	if normReq := guid.Normalize(requestedUserID); normReq != "" && normReq != callerID {
-		ac, ok := middleware.AuthFromContext(r.Context())
-		if !ok || ac == nil || !ac.IsAdmin() {
+	normReq := guid.Normalize(requestedUserID)
+	if isAPIKey && callerID == "" {
+		if normReq == "" {
+			httpx.Error(w, http.StatusBadRequest, "userId is required for API key authorization")
+			return
+		}
+		if h.userRepo != nil {
+			if _, err := h.userRepo.GetUserByID(r.Context(), normReq); err != nil {
+				if errors.Is(err, sqlite.ErrNotFound) {
+					httpx.Error(w, http.StatusNotFound, "target user not found")
+					return
+				}
+				httpx.Error(w, http.StatusInternalServerError, "failed to load target user")
+				return
+			}
+		}
+		targetUserID = normReq
+	} else if normReq != "" && normReq != callerID {
+		if !hasAC || ac == nil || !ac.IsAdmin() {
 			httpx.Error(w, http.StatusForbidden, "admin privileges required to authorize for another user")
 			return
 		}
@@ -258,11 +323,16 @@ func (h *Handler) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		targetUserID = normReq
 	}
 
+	rateKey := callerID
+	if rateKey == "" && ac != nil {
+		rateKey = "apikey:" + ac.APIKeyName
+	}
+
 	now := h.now()
 	h.mu.Lock()
 	h.pruneExpiredLocked(now)
 
-	fw := h.failedAttempts[callerID]
+	fw := h.failedAttempts[rateKey]
 	if fw != nil && now.Before(fw.resetAt) && fw.count >= maxFailedAttempts {
 		h.mu.Unlock()
 		httpx.Error(w, http.StatusTooManyRequests, "too many failed quickconnect authorize attempts")
@@ -273,7 +343,7 @@ func (h *Handler) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	if !ok || code == "" {
 		if fw == nil || !now.Before(fw.resetAt) {
 			fw = &failWindow{count: 0, resetAt: now.Add(h.ttl)}
-			h.failedAttempts[callerID] = fw
+			h.failedAttempts[rateKey] = fw
 		}
 		fw.count++
 		h.mu.Unlock()
@@ -284,17 +354,21 @@ func (h *Handler) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	entry.userID = targetUserID
 	entry.result.Authenticated = true
 	delete(h.byCode, code)
-	delete(h.failedAttempts, callerID)
+	delete(h.failedAttempts, rateKey)
 	h.mu.Unlock()
 
 	httpx.JSON(w, http.StatusOK, true)
 }
 
 func (h *Handler) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
+	if !h.isEnabled() {
+		httpx.Error(w, http.StatusForbidden, "quickconnect is disabled")
+		return
+	}
 	var body struct {
 		Secret string `json:"Secret"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &body, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}

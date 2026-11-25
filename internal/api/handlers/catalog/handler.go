@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
@@ -54,7 +55,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	// Media category endpoints
 	handleAuth("GET /Movies/Recommendations", h.handleMovieRecommendations)
 	handleAuth("GET /Movies/{Id}/Similar", h.handleSimilar)
-	handleAuth("GET /Trailers", h.handleItemsByType([]string{"Trailer"}))
+	handleAuth("GET /Trailers", h.handleTrailers)
 	handleAuth("GET /Albums/{Id}/Similar", h.handleSimilar)
 	handleAuth("GET /Albums/{Id}/InstantMix", h.handleInstantMix)
 	handleAuth("GET /Songs/{Id}/InstantMix", h.handleInstantMix)
@@ -279,12 +280,26 @@ func (h *Handler) handleMovieRecommendations(w http.ResponseWriter, r *http.Requ
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	categoryLimit := q.Int("CategoryLimit", 5)
+	if categoryLimit <= 0 {
+		categoryLimit = 5
+	}
+	if categoryLimit > 50 {
+		categoryLimit = 50
+	}
+	itemLimit := q.Int("ItemLimit", 8)
+	if itemLimit <= 0 {
+		itemLimit = 8
+	}
+	if itemLimit > 100 {
+		itemLimit = 100
+	}
 	cats, err := h.repo.GetMovieRecommendationsWithPolicy(
 		r.Context(),
 		h.serverID(),
 		userID,
-		q.Int("CategoryLimit", 5),
-		q.Int("ItemLimit", 8),
+		categoryLimit,
+		itemLimit,
 		q.List("Fields"),
 		allowed,
 		maxRating,
@@ -417,6 +432,113 @@ func (h *Handler) handleInstantMix(w http.ResponseWriter, r *http.Request) {
 	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            items,
+		TotalRecordCount: total,
+	})
+}
+
+func (h *Handler) handleTrailers(w http.ResponseWriter, r *http.Request) {
+	q := httpx.ParseQuery(r)
+	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	userID := h.resolveUserID(r, q)
+	allowed := h.allowedLibrariesForRequest(r, userID)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	parentID := q.Get("ParentId")
+	genres := q.List("Genres")
+	tags := q.List("Tags")
+	searchTerm := strings.TrimSpace(q.Get("SearchTerm"))
+	lowerSearch := strings.ToLower(searchTerm)
+	startIndex := q.Int("StartIndex", 0)
+	if startIndex < 0 {
+		startIndex = 0
+	}
+	limit := q.Int("Limit", 0)
+	if limit > 500 {
+		limit = 500
+	}
+	fields := q.List("Fields")
+
+	// 1. Standalone Trailer items (type = 'Trailer', extra_type = '')
+	standalone, _, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
+		ServerID:          h.serverID(),
+		UserID:            userID,
+		ParentID:          parentID,
+		AllowedLibraryIDs: allowed,
+		MaxParentalRating: maxRating,
+		BlockedTags:       blockedTags,
+		Recursive:         true,
+		IncludeItemTypes:  []string{"Trailer"},
+		Genres:            genres,
+		Tags:              tags,
+		SearchTerm:        searchTerm,
+		SortBy:            q.List("SortBy"),
+		SortOrder:         q.Get("SortOrder"),
+		Fields:            fields,
+	})
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	seen := make(map[string]bool, len(standalone))
+	merged := make([]dto.BaseItemDto, 0, len(standalone))
+	for _, it := range standalone {
+		seen[it.Id] = true
+		merged = append(merged, it)
+	}
+
+	// 2. Local trailer extras (extra_type = 'trailer') attached to accessible parent items
+	disableTotal := false
+	parents, _, pErr := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
+		ServerID:               h.serverID(),
+		UserID:                 userID,
+		ParentID:               parentID,
+		AllowedLibraryIDs:      allowed,
+		MaxParentalRating:      maxRating,
+		BlockedTags:            blockedTags,
+		Recursive:              true,
+		IncludeItemTypes:       []string{"Movie", "Series", "MusicVideo", "Video"},
+		Genres:                 genres,
+		Tags:                   tags,
+		Limit:                  1000,
+		EnableTotalRecordCount: &disableTotal,
+	})
+	if pErr == nil {
+		for _, parent := range parents {
+			extras, exErr := h.repo.GetItemExtras(r.Context(), h.serverID(), userID, parent.Id, []string{"Trailer"})
+			if exErr != nil {
+				continue
+			}
+			for _, tr := range extras {
+				if seen[tr.Id] {
+					continue
+				}
+				if lowerSearch != "" &&
+					!strings.Contains(strings.ToLower(tr.Name), lowerSearch) &&
+					!strings.Contains(strings.ToLower(tr.OriginalTitle), lowerSearch) {
+					continue
+				}
+				seen[tr.Id] = true
+				merged = append(merged, tr)
+			}
+		}
+	}
+
+	total := len(merged)
+	if startIndex >= total {
+		merged = []dto.BaseItemDto{}
+	} else {
+		end := total
+		if limit > 0 && startIndex+limit < end {
+			end = startIndex + limit
+		}
+		merged = merged[startIndex:end]
+	}
+
+	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
+		Items:            merged,
 		TotalRecordCount: total,
 	})
 }

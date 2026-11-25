@@ -64,6 +64,14 @@ const SEG_PCS = 0x16
 const SEG_WDS = 0x17
 const SEG_END = 0x80
 
+/** 限制单字幕帧最大像素数（4K 上限），防止恶意 .sup 字幕 OOM 炸弹 */
+export const MAX_PGS_FRAME_PIXELS = 4096 * 2160
+const MAX_PGS_ODS_BYTES = 16 * 1024 * 1024
+
+function isValidPgsDimensions(width: number, height: number): boolean {
+  return width > 0 && height > 0 && width * height <= MAX_PGS_FRAME_PIXELS
+}
+
 function clampByte(v: number): number {
   return v < 0 ? 0 : v > 255 ? 255 : v | 0
 }
@@ -90,6 +98,9 @@ function decodePgsRle(
   width: number,
   height: number,
 ): Uint8Array {
+  if (!isValidPgsDimensions(width, height)) {
+    return new Uint8Array(0)
+  }
   const pixels = new Uint8Array(width * height)
   let x = 0
   let y = 0
@@ -289,11 +300,14 @@ export function parsePgsSup(buffer: ArrayBuffer): PgsDisplaySet[] {
         const height = view.getUint16(payloadStart + 9, false)
         const rleSlice = bytes.subarray(payloadStart + 11, payloadEnd)
 
-        if (isLast) {
+        if (!isValidPgsDimensions(width, height)) {
+          pendingOds.delete(objectId)
+          objects.delete(objectId)
+        } else if (isLast) {
           const pixels = decodePgsRle(rleSlice, width, height)
           objects.set(objectId, { id: objectId, width, height, pixels })
           pendingOds.delete(objectId)
-        } else {
+        } else if (rleSlice.length <= MAX_PGS_ODS_BYTES) {
           pendingOds.set(objectId, {
             width,
             height,
@@ -306,24 +320,28 @@ export function parsePgsSup(buffer: ArrayBuffer): PgsDisplaySet[] {
         const pending = pendingOds.get(objectId)
         if (pending) {
           const rleSlice = bytes.subarray(payloadStart + 4, payloadEnd)
-          pending.chunks.push(rleSlice)
-          pending.totalLen += rleSlice.length
-
-          if (isLast) {
-            const merged = new Uint8Array(pending.totalLen)
-            let writePos = 0
-            for (const c of pending.chunks) {
-              merged.set(c, writePos)
-              writePos += c.length
-            }
-            const pixels = decodePgsRle(merged, pending.width, pending.height)
-            objects.set(objectId, {
-              id: objectId,
-              width: pending.width,
-              height: pending.height,
-              pixels,
-            })
+          if (pending.totalLen + rleSlice.length > MAX_PGS_ODS_BYTES) {
             pendingOds.delete(objectId)
+          } else {
+            pending.chunks.push(rleSlice)
+            pending.totalLen += rleSlice.length
+
+            if (isLast) {
+              const merged = new Uint8Array(pending.totalLen)
+              let writePos = 0
+              for (const c of pending.chunks) {
+                merged.set(c, writePos)
+                writePos += c.length
+              }
+              const pixels = decodePgsRle(merged, pending.width, pending.height)
+              objects.set(objectId, {
+                id: objectId,
+                width: pending.width,
+                height: pending.height,
+                pixels,
+              })
+              pendingOds.delete(objectId)
+            }
           }
         }
       }
@@ -331,16 +349,22 @@ export function parsePgsSup(buffer: ArrayBuffer): PgsDisplaySet[] {
       const palette = palettes.get(currentPcs.paletteId)
       const renderedObjects: PgsDisplaySet['objects'] = []
 
-      if (palette && currentPcs.compositionObjects.length > 0) {
+      if (
+        palette &&
+        currentPcs.compositionObjects.length > 0 &&
+        (currentPcs.width === 0 ||
+          currentPcs.height === 0 ||
+          isValidPgsDimensions(currentPcs.width, currentPcs.height))
+      ) {
         for (const comp of currentPcs.compositionObjects) {
           const obj = objects.get(comp.objectId)
-          if (!obj || obj.width <= 0 || obj.height <= 0) continue
+          if (!obj || !isValidPgsDimensions(obj.width, obj.height)) continue
 
           const srcX = comp.cropped ? comp.cropX : 0
           const srcY = comp.cropped ? comp.cropY : 0
           const drawW = comp.cropped ? Math.min(comp.cropWidth, obj.width - srcX) : obj.width
           const drawH = comp.cropped ? Math.min(comp.cropHeight, obj.height - srcY) : obj.height
-          if (drawW <= 0 || drawH <= 0) continue
+          if (!isValidPgsDimensions(drawW, drawH)) continue
 
           const rgba = new Uint8ClampedArray(drawW * drawH * 4)
           for (let row = 0; row < drawH; row++) {
@@ -367,10 +391,17 @@ export function parsePgsSup(buffer: ArrayBuffer): PgsDisplaySet[] {
         }
       }
 
+      const safeWidth = isValidPgsDimensions(currentPcs.width, currentPcs.height)
+        ? currentPcs.width
+        : 1920
+      const safeHeight = isValidPgsDimensions(currentPcs.width, currentPcs.height)
+        ? currentPcs.height
+        : 1080
+
       displaySets.push({
         pts: currentPcs.pts,
-        width: currentPcs.width || 1920,
-        height: currentPcs.height || 1080,
+        width: safeWidth,
+        height: safeHeight,
         paletteId: currentPcs.paletteId,
         objects: renderedObjects,
         isClear: renderedObjects.length === 0,

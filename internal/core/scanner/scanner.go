@@ -76,7 +76,16 @@ func New(repo *sqlite.LibraryRepo, registry *plugins.Registry, bus *eventbus.Bus
 
 // SetProber replaces the media prober (pass nil or NewDisabledProber() to disable probing).
 func (s *Scanner) SetProber(p *Prober) {
+	s.mu.Lock()
 	s.prober = p
+	s.mu.Unlock()
+}
+
+func (s *Scanner) getProber() *Prober {
+	s.mu.Lock()
+	p := s.prober
+	s.mu.Unlock()
+	return p
 }
 
 // ScanAll scans all configured libraries sequentially.
@@ -147,7 +156,8 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 		container = "strm"
 	}
 
-	needProbe := !isStrm && s.prober != nil
+	prober := s.getProber()
+	needProbe := !isStrm && prober.IsEnabled()
 	needOnline := s.hasOnlineMetadataProviders()
 
 	existing, err := s.repo.FindItemByMediaSourcePath(ctx, lib.ID, mediaPath)
@@ -454,7 +464,8 @@ func (s *Scanner) indexEpisode(
 		container = "strm"
 	}
 
-	needProbe := !isStrm && s.prober != nil
+	prober := s.getProber()
+	needProbe := !isStrm && prober.IsEnabled()
 	needOnline := s.hasOnlineMetadataProviders()
 
 	existing, err := s.repo.FindItemByMediaSourcePath(ctx, lib.ID, mediaPath)
@@ -1065,10 +1076,11 @@ func (s *Scanner) maybeBuildSeasonEnrichTask(
 
 func (s *Scanner) probeMedia(ctx context.Context, mediaPath string, isStrm bool) *ProbeResult {
 	// Never probe .strm files during scan to avoid triggering cloud-drive rate limits or bans.
-	if isStrm || s.prober == nil {
+	prober := s.getProber()
+	if isStrm || !prober.IsEnabled() {
 		return nil
 	}
-	res, err := s.prober.Probe(ctx, mediaPath)
+	res, err := prober.Probe(ctx, mediaPath)
 	if err != nil || res == nil {
 		return nil
 	}
@@ -1369,6 +1381,9 @@ func discoverExternalSubtitles(mediaPath, mediaSourceID, itemID string, startInd
 			continue
 		}
 		suffix := strings.TrimPrefix(lowerName, mediaStem)
+		if !isValidSubtitleSuffixBoundary(suffix) {
+			continue
+		}
 		cls := ClassifySubtitle(suffix, codec)
 		out = append(out, sqlite.MediaStreamRecord{
 			MediaSourceID: mediaSourceID,
@@ -1388,6 +1403,32 @@ func discoverExternalSubtitles(mediaPath, mediaSourceID, itemID string, startInd
 		idx++
 	}
 	return out
+}
+
+func isValidSubtitleSuffixBoundary(suffix string) bool {
+	if len(suffix) == 0 {
+		return false
+	}
+	switch suffix[0] {
+	case '.', '_', '-':
+		return true
+	case ' ':
+		// Reject sequel-like suffixes such as " 2.srt" where the token before extension is purely numeric.
+		rest := strings.TrimSpace(strings.TrimSuffix(suffix, filepath.Ext(suffix)))
+		if rest == "" {
+			return true
+		}
+		allDigits := true
+		for _, r := range rest {
+			if r < '0' || r > '9' {
+				allDigits = false
+				break
+			}
+		}
+		return !allDigits
+	default:
+		return false
+	}
 }
 
 func discoverLocalImages(itemID, mediaPath, dir string, episodeOnly bool) []sqlite.ImageRecord {

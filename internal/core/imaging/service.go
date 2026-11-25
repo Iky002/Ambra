@@ -1,10 +1,13 @@
 package imaging
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"image"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,6 +19,27 @@ import (
 
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
+
+const maxImageFileSize = 50 << 20 // 50 MiB
+
+func readLimitedImageFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err == nil && fi.Size() > maxImageFileSize {
+		return nil, fmt.Errorf("image file %q exceeds max size of %d bytes", filepath.Base(path), maxImageFileSize)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxImageFileSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxImageFileSize {
+		return nil, fmt.Errorf("image file %q exceeds max size of %d bytes", filepath.Base(path), maxImageFileSize)
+	}
+	return data, nil
+}
 
 // ImagePayload represents a loaded image ready for HTTP delivery.
 type ImagePayload struct {
@@ -89,7 +113,7 @@ func (s *Service) getImageFromRecord(rec *sqlite.ImageRecord, opts Options) (*Im
 	if opts.IsZero() {
 		key := fmt.Sprintf("orig:%s:%s:%d:%s", rec.ItemID, strings.ToLower(rec.ImageType), rec.ImageIndex, rec.Tag)
 		v, err, _ := s.sf.Do(key, func() (any, error) {
-			data, err := os.ReadFile(rec.Path)
+			data, err := readLimitedImageFile(rec.Path)
 			if err != nil {
 				return nil, err
 			}
@@ -120,11 +144,18 @@ func (s *Service) getImageFromRecord(rec *sqlite.ImageRecord, opts Options) (*Im
 			return payload, nil
 		}
 
-		rawData, err := os.ReadFile(rec.Path)
+		rawData, err := readLimitedImageFile(rec.Path)
 		if err != nil {
 			return nil, err
 		}
 		origCT := contentTypeForImage(rec.Path, rawData)
+
+		// Pre-check image dimensions before full decode to guard against pixel bombs.
+		if cfg, _, cfgErr := image.DecodeConfig(bytes.NewReader(rawData)); cfgErr == nil {
+			if cfg.Width <= 0 || cfg.Height <= 0 || int64(cfg.Width)*int64(cfg.Height) > maxSourcePixels {
+				return nil, fmt.Errorf("source image dimensions %dx%d exceed safety limit", cfg.Width, cfg.Height)
+			}
+		}
 
 		s.processCount.Add(1)
 		outData, outCT, transformed, procErr := ProcessImage(rawData, origCT, opts)
@@ -187,7 +218,7 @@ func (s *Service) ServeHTTPWithOptions(w http.ResponseWriter, r *http.Request, i
 
 	w.Header().Set("Content-Type", payload.ContentType)
 	w.Header().Set("ETag", payload.ETag)
-	if r.URL.Query().Get("tag") != "" {
+	if tag := r.URL.Query().Get("tag"); tag != "" && tag == rec.Tag {
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	} else {
 		w.Header().Set("Cache-Control", "public, max-age=86400")
@@ -251,7 +282,7 @@ func (s *Service) readDiskCache(cacheKey string, opts Options, etag string) (*Im
 
 	// Check the 2-level sharded cache path first.
 	for _, c := range candidates {
-		if data, err := os.ReadFile(s.cachePath(cacheKey, c.ext)); err == nil && len(data) > 0 {
+		if data, err := readLimitedImageFile(s.cachePath(cacheKey, c.ext)); err == nil && len(data) > 0 {
 			return &ImagePayload{
 				Data:        data,
 				ContentType: c.ct,
@@ -263,7 +294,7 @@ func (s *Service) readDiskCache(cacheKey string, opts Options, etag string) (*Im
 	// Seamless backward compatibility: fall back to legacy 1-level sharded and flat paths.
 	for _, c := range candidates {
 		for _, legacyPath := range s.legacyCachePaths(cacheKey, c.ext) {
-			if data, err := os.ReadFile(legacyPath); err == nil && len(data) > 0 {
+			if data, err := readLimitedImageFile(legacyPath); err == nil && len(data) > 0 {
 				return &ImagePayload{
 					Data:        data,
 					ContentType: c.ct,
@@ -281,12 +312,15 @@ func (s *Service) writeDiskCache(cacheKey, contentType string, data []byte) erro
 		ext = "png"
 	}
 	targetPath := s.cachePath(cacheKey, ext)
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+	if err := os.MkdirAll(s.CacheDir(), 0o700); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
 		return err
 	}
 	seq := s.tmpSeq.Add(1)
 	tmpPath := fmt.Sprintf("%s.%d.%d.tmp", targetPath, os.Getpid(), seq)
-	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpPath, targetPath); err != nil {

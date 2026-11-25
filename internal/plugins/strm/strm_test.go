@@ -10,7 +10,7 @@ import (
 func TestResolveSTRM(t *testing.T) {
 	dir := t.TempDir()
 	strmPath := filepath.Join(dir, "Movie.strm")
-	content := "# comment line\n\nhttps://cdn.example.com/media/movie.mkv?token=abc\n"
+	content := "# comment line\n\nhttps://192.168.1.10/media/movie.mkv?token=abc\n"
 	if err := os.WriteFile(strmPath, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -20,7 +20,7 @@ func TestResolveSTRM(t *testing.T) {
 	if err != nil || res == nil {
 		t.Fatalf("ResolveStream failed: res=%v err=%v", res, err)
 	}
-	if res.URL != "https://cdn.example.com/media/movie.mkv?token=abc" || !res.Is302 {
+	if res.URL != "https://192.168.1.10/media/movie.mkv?token=abc" || !res.Is302 {
 		t.Fatalf("unexpected resolve result: %+v", res)
 	}
 

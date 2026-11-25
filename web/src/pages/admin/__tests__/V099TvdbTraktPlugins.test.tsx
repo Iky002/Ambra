@@ -73,6 +73,14 @@ describe('v0.9.9 PluginsTab TVDB & Trakt Configuration', () => {
 
   it('默认渲染 TVDB 与 Trakt 插件为已停用状态，且 Demo 模式包含对应内置插件', async () => {
     setDemoModeOverride(true)
+    saveAuth({
+      accessToken: 'demo-admin-token',
+      userId: 'user-admin',
+      serverId: 'srv-demo',
+      userName: 'admin',
+      isAdmin: true,
+      deviceId: 'dev-demo',
+    })
     const demoPlugins = await api.getPlugins()
     const tvdb = demoPlugins.find((p) => p.Id === 'ambra.builtin.tvdb')
     const trakt = demoPlugins.find((p) => p.Id === 'ambra.builtin.trakt')

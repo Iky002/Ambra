@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -69,7 +68,7 @@ func (h *Handler) handleUpdateItem(w http.ResponseWriter, r *http.Request) {
 
 	var req itemUpdateRequest
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = httpx.DecodeJSONLimit(r, &req, 0)
 	}
 
 	if s := strings.TrimSpace(req.Name); s != "" {
@@ -228,7 +227,7 @@ func (h *Handler) handleMetadataReset(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Body != nil {
 		var raw map[string]json.RawMessage
-		if err := json.NewDecoder(r.Body).Decode(&raw); err == nil {
+		if err := httpx.DecodeJSONLimit(r, &raw, 0); err == nil {
 			for _, key := range []string{"ItemIds", "itemIds", "Ids", "ids"} {
 				v, ok := raw[key]
 				if !ok || len(v) == 0 {
@@ -291,7 +290,7 @@ func (h *Handler) handleDeleteItemsBatch(w http.ResponseWriter, r *http.Request)
 		var body struct {
 			Ids []string `json:"Ids"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = httpx.DecodeJSONLimit(r, &body, 0)
 		ids = body.Ids
 	}
 	for _, id := range ids {
@@ -301,6 +300,10 @@ func (h *Handler) handleDeleteItemsBatch(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *Handler) handleItemDeleteInfo(w http.ResponseWriter, r *http.Request) {
+	if h.isNonAdminCaller(r) {
+		httpx.Error(w, http.StatusForbidden, "admin privileges required")
+		return
+	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	if !h.canAccessItemID(r, itemID) {
 		httpx.Error(w, http.StatusForbidden, "access denied")
@@ -330,7 +333,7 @@ func (h *Handler) handleItemTags(add bool) http.HandlerFunc {
 			} `json:"Tags"`
 		}
 		if r.Body != nil {
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			_ = httpx.DecodeJSONLimit(r, &body, 0)
 		}
 		existing := h.getItemTagNames(r, itemID)
 		tagSet := make(map[string]bool, len(existing))
@@ -414,7 +417,7 @@ func (h *Handler) handleItemVisibility(isPublic bool) http.HandlerFunc {
 func (h *Handler) handleItemsAccess(w http.ResponseWriter, r *http.Request) {
 	var body map[string]any
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = httpx.DecodeJSONLimit(r, &body, 0)
 	}
 	if len(body) > 0 {
 		_ = h.setConfigJSON(r.Context(), "items_access_last", body)
@@ -457,7 +460,7 @@ func (h *Handler) handleRemoteSearch(itemType string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req remoteSearchQuery
 		if r.Body != nil {
-			_ = json.NewDecoder(r.Body).Decode(&req)
+			_ = httpx.DecodeJSONLimit(r, &req, 0)
 		}
 		results := make([]remoteSearchResult, 0)
 		if h.registry != nil && (req.SearchInfo.Name != "" || len(req.SearchInfo.ProviderIds) > 0) {
@@ -538,7 +541,7 @@ func (h *Handler) handleRemoteSearchApply(w http.ResponseWriter, r *http.Request
 
 	var res remoteSearchResult
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&res)
+		_ = httpx.DecodeJSONLimit(r, &res, 0)
 	}
 	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
 	if errors.Is(err, sqlite.ErrNotFound) {
@@ -654,6 +657,7 @@ func (h *Handler) handleItemAncestors(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	h.sanitizeItemsPathsForCaller(r, ancestors)
 	httpx.JSON(w, http.StatusOK, ancestors)
 }
 
@@ -765,6 +769,7 @@ func (h *Handler) handleSimilar(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.sanitizeItemsPathsForCaller(r, items)
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            items,
 		TotalRecordCount: total,
@@ -800,6 +805,7 @@ func (h *Handler) handleItemInstantMix(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.sanitizeItemsPathsForCaller(r, items)
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            items,
 		TotalRecordCount: total,
@@ -837,6 +843,7 @@ func (h *Handler) handleLocalTrailers(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.sanitizeItemsPathsForCaller(r, items)
 	httpx.JSON(w, http.StatusOK, items)
 }
 
@@ -860,6 +867,7 @@ func (h *Handler) handleSpecialFeatures(w http.ResponseWriter, r *http.Request) 
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.sanitizeItemsPathsForCaller(r, items)
 	httpx.JSON(w, http.StatusOK, items)
 }
 
@@ -891,6 +899,7 @@ func (h *Handler) serveThemeMediaByTypes(w http.ResponseWriter, r *http.Request,
 			return
 		}
 	}
+	h.sanitizeItemsPathsForCaller(r, items)
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"Items":            items,
 		"TotalRecordCount": len(items),
@@ -918,6 +927,7 @@ func (h *Handler) handleAllThemeMedia(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		h.sanitizeItemsPathsForCaller(r, allThemes)
 		for _, it := range allThemes {
 			if strings.EqualFold(it.ExtraType, "ThemeSong") {
 				themeSongs = append(themeSongs, it)
@@ -1062,8 +1072,7 @@ func (h *Handler) handleUploadSubtitle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Limit JSON payload (~8MB accommodates 5MB base64-encoded subtitle + JSON envelope)
-	dec := json.NewDecoder(io.LimitReader(r.Body, 8*1024*1024))
-	if err := dec.Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 8*1024*1024); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid json body")
 		return
 	}

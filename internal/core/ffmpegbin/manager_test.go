@@ -280,7 +280,7 @@ func TestDownloadStatic(t *testing.T) {
 		case "/":
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("root-binary"))
-		case "/empty":
+		case "/empty/ffmpeg":
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -319,12 +319,17 @@ func TestDownloadStatic(t *testing.T) {
 	}
 
 	// HTTP 404 error
-	if _, err := DownloadStatic(context.Background(), targetDir, srv.URL+"/missing"); err == nil {
+	if _, err := DownloadStatic(context.Background(), targetDir, srv.URL+"/missing/ffmpeg"); err == nil {
 		t.Fatal("expected error for HTTP 404")
 	}
 
+	// Disallowed binary filename
+	if _, err := DownloadStatic(context.Background(), targetDir, srv.URL+"/releases/evil.sh"); err == nil {
+		t.Fatal("expected error for disallowed binary name")
+	}
+
 	// Empty body error
-	if _, err := DownloadStatic(context.Background(), targetDir, srv.URL+"/empty"); err == nil {
+	if _, err := DownloadStatic(context.Background(), targetDir, srv.URL+"/empty/ffmpeg"); err == nil {
 		t.Fatal("expected error for empty downloaded body")
 	}
 

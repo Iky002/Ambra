@@ -34,6 +34,12 @@ const (
 	forgotPasswordRateLimit   = 5
 	forgotPasswordRateWindow  = time.Minute
 	forgotPasswordMaxPinFiles = 10
+	forgotPinsMaxEntries      = 256
+	authByIDRateLimit         = 30
+	authByIDRateWindow        = time.Minute
+	maxSessionUsersEntries    = 500
+	maxCameraUploadsEntries   = 500
+	maxPartyMessageBytes      = 64 << 10
 )
 
 type forgotPinEntry struct {
@@ -75,6 +81,8 @@ type Handler struct {
 	memKV             map[string]string
 	forgotPins        map[string]forgotPinEntry
 	forgotRates       map[string][]time.Time
+	forgotPinRates    map[string][]time.Time
+	authByIDRates     map[string][]time.Time
 	sessionUsers      map[string]map[string]bool
 	remoteCommands    []remoteCommandRecord
 	restartRequested  bool
@@ -94,16 +102,18 @@ func New(
 	registry *plugins.Registry,
 ) *Handler {
 	return &Handler{
-		cfg:          cfg,
-		store:        store,
-		userRepo:     userRepo,
-		libRepo:      libRepo,
-		sessions:     sessions,
-		registry:     registry,
-		memKV:        make(map[string]string),
-		forgotPins:   make(map[string]forgotPinEntry),
-		forgotRates:  make(map[string][]time.Time),
-		sessionUsers: make(map[string]map[string]bool),
+		cfg:            cfg,
+		store:          store,
+		userRepo:       userRepo,
+		libRepo:        libRepo,
+		sessions:       sessions,
+		registry:       registry,
+		memKV:          make(map[string]string),
+		forgotPins:     make(map[string]forgotPinEntry),
+		forgotRates:    make(map[string][]time.Time),
+		forgotPinRates: make(map[string][]time.Time),
+		authByIDRates:  make(map[string][]time.Time),
+		sessionUsers:   make(map[string]map[string]bool),
 	}
 }
 
@@ -200,7 +210,6 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 
 		// /System
 		pr.Get("/System/Endpoint", h.getSystemEndpoint)
-		pr.Get("/System/WakeOnLanInfo", h.getSystemWakeOnLanInfo)
 		pr.Get("/System/ReleaseNotes/Versions", h.getSystemReleaseNotesVersions)
 		pr.Get("/System/ReleaseNotes", h.getSystemReleaseNotes)
 
@@ -292,6 +301,7 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 
 		// /System
 		ar.Get("/System/Info/Storage", h.getSystemStorageInfo)
+		ar.Get("/System/WakeOnLanInfo", h.getSystemWakeOnLanInfo)
 		ar.Post("/System/Restart", h.postSystemRestart)
 		ar.Post("/System/Shutdown", h.postSystemShutdown)
 
@@ -328,19 +338,19 @@ func (h *Handler) resolveUserID(r *http.Request, param string) string {
 	return ""
 }
 
-func decodeOptionalJSON(r *http.Request, dst any) error {
+func decodeOptionalJSONLimit(r *http.Request, dst any, maxBytes int64) error {
 	if r.Body == nil {
 		return nil
 	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
-	if err != nil {
-		return err
-	}
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" {
+	err := httpx.DecodeJSONLimit(r, dst, maxBytes)
+	if errors.Is(err, io.EOF) {
 		return nil
 	}
-	return json.Unmarshal([]byte(trimmed), dst)
+	return err
+}
+
+func decodeOptionalJSON(r *http.Request, dst any) error {
+	return decodeOptionalJSONLimit(r, dst, httpx.DefaultMaxJSONBodyBytes)
 }
 
 func (h *Handler) loadKV(ctx context.Context, key string, dst any) (bool, error) {

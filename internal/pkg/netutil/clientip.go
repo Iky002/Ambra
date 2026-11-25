@@ -5,15 +5,63 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+	"sync"
 )
 
-// IsTrustedProxyIP reports whether ip is a loopback, RFC1918/ULA private,
-// or CGNAT (100.64.0.0/10) address typical of local/container reverse proxies.
+var (
+	trustedProxiesMu     sync.RWMutex
+	customTrustedProxies []netip.Prefix
+)
+
+// SetTrustedProxies configures an explicit allowlist of trusted reverse proxy
+// IPs or CIDRs. Passing an empty slice restores the default private/loopback
+// proxy policy.
+func SetTrustedProxies(entries []string) {
+	var parsed []netip.Prefix
+	for _, raw := range entries {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			continue
+		}
+		if p, err := netip.ParsePrefix(s); err == nil {
+			parsed = append(parsed, p)
+			continue
+		}
+		if a, err := netip.ParseAddr(s); err == nil {
+			a = a.WithZone("").Unmap()
+			bits := 32
+			if a.Is6() {
+				bits = 128
+			}
+			parsed = append(parsed, netip.PrefixFrom(a, bits))
+		}
+	}
+	trustedProxiesMu.Lock()
+	customTrustedProxies = parsed
+	trustedProxiesMu.Unlock()
+}
+
+// IsTrustedProxyIP reports whether ip is a configured trusted reverse proxy,
+// or (when no explicit list is set) a loopback, RFC1918/ULA private, or CGNAT
+// (100.64.0.0/10) address typical of local/container reverse proxies.
 func IsTrustedProxyIP(ip netip.Addr) bool {
 	if !ip.IsValid() {
 		return false
 	}
 	ip = ip.WithZone("").Unmap()
+
+	trustedProxiesMu.RLock()
+	custom := customTrustedProxies
+	trustedProxiesMu.RUnlock()
+	if len(custom) > 0 {
+		for _, p := range custom {
+			if p.Contains(ip) {
+				return true
+			}
+		}
+		return false
+	}
+
 	if ip.IsLoopback() || ip.IsPrivate() {
 		return true
 	}
@@ -30,7 +78,13 @@ func IsLANIP(ip netip.Addr) bool {
 		return false
 	}
 	ip = ip.WithZone("").Unmap()
-	return IsTrustedProxyIP(ip) || ip.IsLinkLocalUnicast()
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+		return true
+	}
+	if ip.Is4() && cgnatPrefix.Contains(ip) {
+		return true
+	}
+	return false
 }
 
 func parseAddrString(raw string) (netip.Addr, bool) {
@@ -51,8 +105,9 @@ func parseAddrString(raw string) (netip.Addr, bool) {
 
 // ClientIP returns the effective client IP for rate-limiting and access checks.
 // X-Forwarded-For and X-Real-IP headers are ONLY consulted when r.RemoteAddr is
-// itself a trusted local/private reverse proxy; direct public connections cannot
-// spoof forwarded headers.
+// itself a trusted reverse proxy; direct public connections cannot spoof
+// forwarded headers. All X-Forwarded-For header instances are merged and scanned
+// right-to-left to resist multi-header spoofing.
 func ClientIP(r *http.Request) string {
 	if r == nil {
 		return ""
@@ -65,28 +120,40 @@ func ClientIP(r *http.Request) string {
 		return remoteAddr.String()
 	}
 
-	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
-		parts := strings.Split(xff, ",")
-		var leftmostValid netip.Addr
+	var realIPAddr netip.Addr
+	var hasRealIP bool
+	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+		realIPAddr, hasRealIP = parseAddrString(xri)
+	}
+
+	if xffVals := r.Header.Values("X-Forwarded-For"); len(xffVals) > 0 {
+		merged := strings.Join(xffVals, ",")
+		parts := strings.Split(merged, ",")
+		var rightmostValid netip.Addr
 		for i := len(parts) - 1; i >= 0; i-- {
 			addr, valid := parseAddrString(parts[i])
 			if !valid {
 				continue
 			}
-			leftmostValid = addr
+			if !rightmostValid.IsValid() {
+				rightmostValid = addr
+			}
 			if !IsTrustedProxyIP(addr) {
 				return addr.String()
 			}
 		}
-		if leftmostValid.IsValid() {
-			return leftmostValid.String()
+		// If every XFF hop looked like a trusted proxy, do not fall back to a
+		// spoofable leftmost 127.0.0.1 when X-Real-IP carries a non-trusted public IP.
+		if hasRealIP && !IsTrustedProxyIP(realIPAddr) {
+			return realIPAddr.String()
+		}
+		if rightmostValid.IsValid() {
+			return rightmostValid.String()
 		}
 	}
 
-	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
-		if addr, valid := parseAddrString(xri); valid {
-			return addr.String()
-		}
+	if hasRealIP {
+		return realIPAddr.String()
 	}
 
 	return remoteAddr.String()

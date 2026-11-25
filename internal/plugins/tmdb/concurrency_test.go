@@ -30,6 +30,7 @@ func TestProvider_ConcurrentConfigureAndFetch_NoRace(t *testing.T) {
 	defer srv.Close()
 
 	p := New("key-initial", "zh-CN")
+	p.SetHTTPClient(srv.Client())
 	_ = p.Configure(map[string]any{
 		"base_url":       srv.URL,
 		"image_base_url": "https://img.example/original",
@@ -105,6 +106,7 @@ func TestProvider_PathEscapesTMDBID(t *testing.T) {
 	defer srv.Close()
 
 	p := New("test-key", "en-US")
+	p.SetHTTPClient(srv.Client())
 	_ = p.Configure(map[string]any{"base_url": srv.URL})
 
 	ctx := context.Background()

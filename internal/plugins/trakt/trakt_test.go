@@ -195,6 +195,7 @@ func TestConfigureAndConcurrency(t *testing.T) {
 func TestMovieScrobbleAndSyncWatched(t *testing.T) {
 	srv, ch := newMockTraktServer(t, http.StatusCreated, `{"id":1}`)
 	p := New()
+	p.SetHTTPClient(srv.Client())
 	_ = p.Configure(map[string]any{
 		"enabled":      true,
 		"client_id":    "my-client-id",
@@ -283,6 +284,7 @@ func TestMovieScrobbleAndSyncWatched(t *testing.T) {
 func TestEpisodeScrobbleAndSyncWatched(t *testing.T) {
 	srv, ch := newMockTraktServer(t, http.StatusCreated, `{}`)
 	p := New()
+	p.SetHTTPClient(srv.Client())
 	_ = p.Configure(map[string]any{
 		"enabled":      true,
 		"client_id":    "cid",
@@ -378,6 +380,7 @@ func TestEpisodeScrobbleAndSyncWatched(t *testing.T) {
 func TestNoOpWhenDisabledOrMissingCredsOrUnsupportedType(t *testing.T) {
 	srv, ch := newMockTraktServer(t, http.StatusOK, `{}`)
 	p := New()
+	p.SetHTTPClient(srv.Client())
 	ctx := context.Background()
 	movie := &sqlite.ItemRecord{ID: "m1", Type: "Movie", Name: "Test"}
 
@@ -422,6 +425,7 @@ func TestNoOpWhenDisabledOrMissingCredsOrUnsupportedType(t *testing.T) {
 func TestUpstreamHTTPError(t *testing.T) {
 	srv, _ := newMockTraktServer(t, http.StatusUnauthorized, `{"error":"invalid_token"}`)
 	p := New()
+	p.SetHTTPClient(srv.Client())
 	_ = p.Configure(map[string]any{
 		"enabled":      true,
 		"client_id":    "cid",
@@ -493,6 +497,7 @@ func TestSubscribeEventsIntegration(t *testing.T) {
 
 	bus := eventbus.New()
 	p := New()
+	p.SetHTTPClient(srv.Client())
 	// Nil bus returns safe no-op unsubscribe
 	p.SubscribeEvents(nil, repo)()
 
@@ -530,13 +535,14 @@ func TestSubscribeEventsIntegration(t *testing.T) {
 	}
 	assertTraktHeaders(t, req.Headers, "bus-cid", "bus-tok")
 
-	// 2. EventPlaybackProgress paused=true (map[string]any) for Episode at 50%
+	// 2. EventPlaybackProgress paused=true (session.PlaybackEventPayload) for Episode at 50%
 	bus.Publish(ctx, eventbus.Event{
 		Type: eventbus.EventPlaybackProgress,
-		Payload: map[string]any{
-			"item_id":        ep.ID,
-			"position_ticks": int64(1_800_000_000),
-			"is_paused":      true,
+		Payload: session.PlaybackEventPayload{
+			ItemId:        ep.ID,
+			PositionTicks: 1_800_000_000,
+			RuntimeTicks:  3_600_000_000,
+			IsPaused:      true,
 		},
 	})
 	req = waitReq(t, ch)

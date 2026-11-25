@@ -97,6 +97,7 @@
   "library.sortDateAdded": "加入時間",
   "library.sortReleaseDate": "上映日期",
   "library.sortRating": "評分",
+  "library.sortPlayCount": "播放次數",
   "library.filterAll": "全部狀態",
   "library.filterUnplayed": "未觀看",
   "library.filterPlayed": "已觀看",

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -15,7 +16,10 @@ import (
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
-const configKeyPrefix = "plugin:"
+const (
+	configKeyPrefix = "plugin:"
+	maskedSecret    = "********"
+)
 
 // AuthFuncs decouples route registration from the concrete middleware package.
 type AuthFuncs struct {
@@ -29,6 +33,7 @@ type Handler struct {
 	store    *sqlite.Store
 	auth     AuthFuncs
 
+	cfgMu   sync.Mutex
 	mu      sync.RWMutex
 	tracked map[string]plugins.Plugin
 	configs map[string]map[string]any
@@ -93,6 +98,8 @@ func (h *Handler) ApplySavedConfigs(ctx context.Context) error {
 	if h.store == nil {
 		return nil
 	}
+	h.cfgMu.Lock()
+	defer h.cfgMu.Unlock()
 	h.syncFromRegistry()
 
 	rows, err := h.store.Reader.QueryContext(ctx,
@@ -125,6 +132,7 @@ func (h *Handler) ApplySavedConfigs(ctx context.Context) error {
 		return err
 	}
 
+	var errs []error
 	for _, e := range entries {
 		h.mu.Lock()
 		h.configs[e.pluginID] = cloneMap(e.cfg)
@@ -132,11 +140,13 @@ func (h *Handler) ApplySavedConfigs(ctx context.Context) error {
 		h.mu.Unlock()
 		if p != nil {
 			if err := p.Configure(cloneMap(e.cfg)); err != nil {
-				return err
+				slog.Error("pluginadmin: failed to apply saved config", "pluginId", e.pluginID, "err", err)
+				errs = append(errs, err)
+				continue
 			}
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
@@ -181,7 +191,7 @@ func (h *Handler) handleGetConfiguration(w http.ResponseWriter, r *http.Request)
 
 	saved, err := h.loadSavedConfig(r.Context(), id)
 	if err == nil {
-		for k, v := range saved {
+		for k, v := range maskSensitiveMap(saved) {
 			out[k] = v
 		}
 	}
@@ -206,7 +216,7 @@ func (h *Handler) handleUpdateConfiguration(w http.ResponseWriter, r *http.Reque
 	}
 
 	var incoming map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&incoming); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &incoming, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid JSON configuration")
 		return
 	}
@@ -214,23 +224,25 @@ func (h *Handler) handleUpdateConfiguration(w http.ResponseWriter, r *http.Reque
 		incoming = map[string]any{}
 	}
 
-	merged, err := h.loadSavedConfig(r.Context(), id)
+	h.cfgMu.Lock()
+	defer h.cfgMu.Unlock()
+
+	prev, err := h.loadSavedConfig(r.Context(), id)
 	if err != nil {
-		merged = map[string]any{}
+		prev = map[string]any{}
 	}
-	for k, v := range incoming {
-		merged[k] = v
-	}
+	merged := mergePluginConfig(prev, incoming)
 
 	if err := p.Configure(cloneMap(merged)); err != nil {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if err := h.saveConfig(r.Context(), id, merged); err != nil {
+		_ = p.Configure(cloneMap(prev))
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	httpx.JSON(w, http.StatusOK, merged)
+	httpx.JSON(w, http.StatusOK, maskSensitiveMap(merged))
 }
 
 func (h *Handler) handleEnablePlugin(w http.ResponseWriter, r *http.Request) {
@@ -249,15 +261,19 @@ func (h *Handler) handleEnablePlugin(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Enabled *bool `json:"enabled"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err == nil && body.Enabled != nil {
+		if err := httpx.DecodeJSONLimit(r, &body, 0); err == nil && body.Enabled != nil {
 			enabled = *body.Enabled
 		}
 	}
 
-	merged, err := h.loadSavedConfig(r.Context(), id)
+	h.cfgMu.Lock()
+	defer h.cfgMu.Unlock()
+
+	prev, err := h.loadSavedConfig(r.Context(), id)
 	if err != nil {
-		merged = map[string]any{}
+		prev = map[string]any{}
 	}
+	merged := cloneMap(prev)
 	merged["enabled"] = enabled
 
 	if err := p.Configure(cloneMap(merged)); err != nil {
@@ -265,6 +281,7 @@ func (h *Handler) handleEnablePlugin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.saveConfig(r.Context(), id, merged); err != nil {
+		_ = p.Configure(cloneMap(prev))
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -282,10 +299,14 @@ func (h *Handler) handleDeletePlugin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	merged, err := h.loadSavedConfig(r.Context(), id)
+	h.cfgMu.Lock()
+	defer h.cfgMu.Unlock()
+
+	prev, err := h.loadSavedConfig(r.Context(), id)
 	if err != nil {
-		merged = map[string]any{}
+		prev = map[string]any{}
 	}
+	merged := cloneMap(prev)
 	merged["enabled"] = false
 
 	if err := p.Configure(cloneMap(merged)); err != nil {
@@ -293,6 +314,7 @@ func (h *Handler) handleDeletePlugin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.saveConfig(r.Context(), id, merged); err != nil {
+		_ = p.Configure(cloneMap(prev))
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -324,26 +346,85 @@ func (h *Handler) loadSavedConfig(ctx context.Context, id string) (map[string]an
 }
 
 func (h *Handler) saveConfig(ctx context.Context, id string, cfg map[string]any) error {
+	if h.store != nil {
+		raw, err := json.Marshal(cfg)
+		if err != nil {
+			return err
+		}
+		_, err = h.store.Writer.ExecContext(ctx, `
+			INSERT INTO server_config (key, value_json, updated_at)
+			VALUES (?, ?, ?)
+			ON CONFLICT(key) DO UPDATE SET
+				value_json = excluded.value_json,
+				updated_at = excluded.updated_at`,
+			configKeyPrefix+id, string(raw), time.Now().UTC().Unix(),
+		)
+		if err != nil {
+			return err
+		}
+	}
 	h.mu.Lock()
 	h.configs[id] = cloneMap(cfg)
 	h.mu.Unlock()
+	return nil
+}
 
-	if h.store == nil {
-		return nil
+func isSensitiveConfigKey(k string) bool {
+	lk := strings.ToLower(strings.TrimSpace(k))
+	return strings.Contains(lk, "key") ||
+		strings.Contains(lk, "secret") ||
+		strings.Contains(lk, "token") ||
+		strings.Contains(lk, "password")
+}
+
+func normalizeConfigKeyLookup(k string) string {
+	return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(k), "_", ""))
+}
+
+func maskSensitiveMap(src map[string]any) map[string]any {
+	out := make(map[string]any, len(src))
+	for k, v := range src {
+		if isSensitiveConfigKey(k) {
+			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+				out[k] = maskedSecret
+				continue
+			}
+		}
+		out[k] = v
 	}
-	raw, err := json.Marshal(cfg)
-	if err != nil {
-		return err
+	return out
+}
+
+func mergePluginConfig(prev, incoming map[string]any) map[string]any {
+	merged := cloneMap(prev)
+	existingByLower := make(map[string]string, len(merged))
+	existingByNorm := make(map[string]string, len(merged))
+	for k := range merged {
+		existingByLower[strings.ToLower(k)] = k
+		existingByNorm[normalizeConfigKeyLookup(k)] = k
 	}
-	_, err = h.store.Writer.ExecContext(ctx, `
-		INSERT INTO server_config (key, value_json, updated_at)
-		VALUES (?, ?, ?)
-		ON CONFLICT(key) DO UPDATE SET
-			value_json = excluded.value_json,
-			updated_at = excluded.updated_at`,
-		configKeyPrefix+id, string(raw), time.Now().UTC().Unix(),
-	)
-	return err
+	for k, v := range incoming {
+		targetKey := k
+		if ek, ok := existingByLower[strings.ToLower(k)]; ok {
+			targetKey = ek
+		} else if ek, ok := existingByNorm[normalizeConfigKeyLookup(k)]; ok {
+			targetKey = ek
+		}
+		if isSensitiveConfigKey(targetKey) {
+			if s, ok := v.(string); ok {
+				trimmed := strings.TrimSpace(s)
+				if trimmed == "" || trimmed == maskedSecret {
+					if oldStr, okOld := merged[targetKey].(string); okOld && strings.TrimSpace(oldStr) != "" {
+						continue
+					}
+				}
+			}
+		}
+		merged[targetKey] = v
+		existingByLower[strings.ToLower(targetKey)] = targetKey
+		existingByNorm[normalizeConfigKeyLookup(targetKey)] = targetKey
+	}
+	return merged
 }
 
 func cloneMap(src map[string]any) map[string]any {

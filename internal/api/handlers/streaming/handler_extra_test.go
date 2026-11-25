@@ -137,8 +137,8 @@ func TestStreamingHandlerExtraBranches(t *testing.T) {
 	_ = repo.UpsertItem(ctx, &sqlite.ItemRecord{ID: localStrmID, LibraryID: "lib1", Type: "Movie", IsStrm: true, Name: "LocalStrm", Path: localStrm})
 	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Videos/"+localStrmID+"/stream", nil))
-	if rec.Code != http.StatusOK || rec.Body.String() != "mp4-bytes" {
-		t.Fatalf("expected local strm target served, got code=%d body=%q", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected non-http local strm target to be blocked with 502, got code=%d body=%q", rec.Code, rec.Body.String())
 	}
 
 	// 4. Subtitle error branches: invalid index (400), wrong msID (404), missing file on disk (404)

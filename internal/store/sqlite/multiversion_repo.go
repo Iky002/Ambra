@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 )
@@ -76,9 +77,10 @@ func (r *LibraryRepo) FindItemsByProviderID(ctx context.Context, libraryID, item
 		args = append(args, itemType)
 	}
 	for _, v := range variants {
+		quoted := escapeJSONPathKey(v)
 		for _, prefix := range []string{"$.provider_ids.", "$.ProviderIds."} {
 			conds = append(conds, `LOWER(CAST(json_extract(i.extra_json, ?) AS TEXT)) = LOWER(?)`)
-			args = append(args, prefix+v, providerVal)
+			args = append(args, prefix+quoted, providerVal)
 		}
 	}
 
@@ -110,10 +112,23 @@ func (r *LibraryRepo) FindItemsByProviderID(ctx context.Context, libraryID, item
 	return out, rows.Err()
 }
 
+func escapeJSONPathKey(key string) string {
+	escaped := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(key)
+	return `"` + escaped + `"`
+}
+
+func escapeLikePattern(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
+}
+
 func providerKeyVariants(key string) []string {
+	if key == "" {
+		return nil
+	}
 	lower := strings.ToLower(key)
 	upper := strings.ToUpper(key)
-	title := strings.ToUpper(lower[:1]) + lower[1:]
+	runes := []rune(lower)
+	title := string(unicode.ToUpper(runes[0])) + string(runes[1:])
 	seen := make(map[string]struct{}, 4)
 	out := make([]string, 0, 4)
 	for _, v := range []string{key, lower, title, upper} {
@@ -175,12 +190,12 @@ func (r *LibraryRepo) FindMovieInDirByBaseTitle(ctx context.Context, libraryID, 
 		return nil, ErrNotFound
 	}
 	cleanDir := filepath.Clean(dir)
-	prefix := cleanDir + string(filepath.Separator) + "%"
+	prefix := escapeLikePattern(cleanDir+string(filepath.Separator)) + "%"
 
 	rows, err := r.store.Reader.QueryContext(ctx,
 		`SELECT `+itemSelectCols+`
 		 FROM items i
-		 WHERE i.library_id = ? AND i.type = 'Movie' AND i.path LIKE ?
+		 WHERE i.library_id = ? AND i.type = 'Movie' AND i.path LIKE ? ESCAPE '\'
 		 ORDER BY i.date_created ASC, i.id ASC`,
 		guid.Normalize(libraryID), prefix,
 	)
@@ -309,19 +324,26 @@ func (r *LibraryRepo) MergeItemVersions(ctx context.Context, itemIDs []string) (
 	}
 
 	primaryID := cleanIDs[0]
-	var exists int
-	if err := r.store.Reader.QueryRowContext(ctx, `SELECT 1 FROM items WHERE id = ?`, primaryID).Scan(&exists); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", 0, ErrNotFound
-		}
-		return "", 0, err
-	}
 
 	tx, err := r.store.Writer.BeginTx(ctx, nil)
 	if err != nil {
 		return "", 0, err
 	}
 	defer tx.Rollback()
+
+	var (
+		primaryType     string
+		primaryIsFolder int
+	)
+	if err := tx.QueryRowContext(ctx, `SELECT type, is_folder FROM items WHERE id = ?`, primaryID).Scan(&primaryType, &primaryIsFolder); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", 0, ErrNotFound
+		}
+		return "", 0, err
+	}
+	if primaryIsFolder != 0 {
+		return "", 0, fmt.Errorf("cannot merge folder item %s", primaryID)
+	}
 
 	existingPaths := make(map[string]bool)
 	pRows, err := tx.QueryContext(ctx, `SELECT path FROM item_media_sources WHERE item_id = ?`, primaryID)
@@ -336,16 +358,29 @@ func (r *LibraryRepo) MergeItemVersions(ctx context.Context, itemIDs []string) (
 		}
 		existingPaths[p] = true
 	}
+	if err := pRows.Err(); err != nil {
+		pRows.Close()
+		return "", 0, err
+	}
 	pRows.Close()
 
 	mergedCount := 0
 	for _, otherID := range cleanIDs[1:] {
-		var otherExists int
-		if err := tx.QueryRowContext(ctx, `SELECT 1 FROM items WHERE id = ?`, otherID).Scan(&otherExists); err != nil {
+		var (
+			otherType     string
+			otherIsFolder int
+		)
+		if err := tx.QueryRowContext(ctx, `SELECT type, is_folder FROM items WHERE id = ?`, otherID).Scan(&otherType, &otherIsFolder); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				continue
 			}
 			return "", 0, err
+		}
+		if otherIsFolder != 0 {
+			return "", 0, fmt.Errorf("cannot merge folder item %s", otherID)
+		}
+		if !strings.EqualFold(otherType, primaryType) {
+			return "", 0, fmt.Errorf("cannot merge items of different types: %s vs %s", primaryType, otherType)
 		}
 
 		type srcRow struct {
@@ -364,6 +399,10 @@ func (r *LibraryRepo) MergeItemVersions(ctx context.Context, itemIDs []string) (
 				return "", 0, err
 			}
 			otherSources = append(otherSources, sr)
+		}
+		if err := sRows.Err(); err != nil {
+			sRows.Close()
+			return "", 0, err
 		}
 		sRows.Close()
 
@@ -384,6 +423,52 @@ func (r *LibraryRepo) MergeItemVersions(ctx context.Context, itemIDs []string) (
 			if _, err := tx.ExecContext(ctx, `UPDATE item_media_streams SET item_id = ? WHERE media_source_id = ?`, primaryID, sr.id); err != nil {
 				return "", 0, err
 			}
+		}
+
+		// Preserve secondary item's user_item_data by merging into primaryID before cascade delete.
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO user_item_data (
+				user_id, item_id, played, play_count, playback_position_ticks,
+				is_favorite, last_played_date, audio_stream_index, subtitle_stream_index
+			)
+			SELECT user_id, ?, played, play_count, playback_position_ticks,
+			       is_favorite, last_played_date, audio_stream_index, subtitle_stream_index
+			FROM user_item_data
+			WHERE item_id = ?
+			ON CONFLICT(user_id, item_id) DO UPDATE SET
+				played = MAX(user_item_data.played, excluded.played),
+				play_count = MAX(user_item_data.play_count, excluded.play_count),
+				playback_position_ticks = CASE
+					WHEN MAX(user_item_data.played, excluded.played) = 1 THEN 0
+					WHEN COALESCE(excluded.last_played_date, 0) > COALESCE(user_item_data.last_played_date, 0) THEN excluded.playback_position_ticks
+					ELSE MAX(user_item_data.playback_position_ticks, excluded.playback_position_ticks)
+				END,
+				is_favorite = MAX(user_item_data.is_favorite, excluded.is_favorite),
+				last_played_date = CASE
+					WHEN user_item_data.last_played_date IS NULL THEN excluded.last_played_date
+					WHEN excluded.last_played_date IS NULL THEN user_item_data.last_played_date
+					ELSE MAX(user_item_data.last_played_date, excluded.last_played_date)
+				END,
+				audio_stream_index = COALESCE(user_item_data.audio_stream_index, excluded.audio_stream_index),
+				subtitle_stream_index = COALESCE(user_item_data.subtitle_stream_index, excluded.subtitle_stream_index)`,
+			primaryID, otherID,
+		); err != nil {
+			return "", 0, err
+		}
+
+		// Preserve collection/playlist memberships that do not already include primaryID.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE item_collections
+			SET item_id = ?
+			WHERE item_id = ?
+			  AND NOT EXISTS (
+				  SELECT 1 FROM item_collections ic2
+				  WHERE ic2.container_id = item_collections.container_id
+				    AND ic2.item_id = ?
+			  )`,
+			primaryID, otherID, primaryID,
+		); err != nil {
+			return "", 0, err
 		}
 
 		if _, err := tx.ExecContext(ctx, `DELETE FROM item_search_fts WHERE item_id = ?`, otherID); err != nil {
@@ -445,6 +530,10 @@ func (r *LibraryRepo) SplitItemVersions(ctx context.Context, itemID string) ([]s
 			return nil, err
 		}
 		ancestors = append(ancestors, a)
+	}
+	if err := aRows.Err(); err != nil {
+		aRows.Close()
+		return nil, err
 	}
 	aRows.Close()
 
@@ -538,6 +627,29 @@ func (r *LibraryRepo) SplitItemVersions(ctx context.Context, itemID string) ([]s
 			}
 		}
 
+		if _, err := tx.ExecContext(ctx, `
+			INSERT OR IGNORE INTO item_images (item_id, image_type, image_index, path, tag, width, height, blurhash)
+			SELECT ?, image_type, image_index, path, tag, width, height, blurhash
+			FROM item_images WHERE item_id = ?`,
+			newID, itemID,
+		); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT OR IGNORE INTO item_taxonomies (item_id, taxonomy_id)
+			SELECT ?, taxonomy_id FROM item_taxonomies WHERE item_id = ?`,
+			newID, itemID,
+		); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT OR IGNORE INTO item_people (item_id, person_id, role, person_type, sort_order)
+			SELECT ?, person_id, role, person_type, sort_order FROM item_people WHERE item_id = ?`,
+			newID, itemID,
+		); err != nil {
+			return nil, err
+		}
+
 		if _, err := tx.ExecContext(ctx, `UPDATE item_media_sources SET item_id = ? WHERE id = ?`, newID, src.ID); err != nil {
 			return nil, err
 		}
@@ -548,8 +660,29 @@ func (r *LibraryRepo) SplitItemVersions(ctx context.Context, itemID string) ([]s
 		createdIDs = append(createdIDs, newID)
 	}
 
-	if _, err := tx.ExecContext(ctx, `UPDATE items SET date_modified = ?, etag = ? WHERE id = ?`,
-		now, guid.New()[:16], itemID); err != nil {
+	firstSrc := sources[0]
+	firstIsStrm := firstSrc.IsRemote || strings.EqualFold(firstSrc.Container, "strm")
+	firstContainer := firstSrc.Container
+	if firstContainer == "" {
+		firstContainer = primary.Container
+	}
+	firstRT := primary.RuntimeTicks
+	if firstSrc.RuntimeTicks > 0 {
+		v := firstSrc.RuntimeTicks
+		firstRT = &v
+	}
+	firstSize := primary.FileSize
+	if firstSrc.Size > 0 {
+		sz := firstSrc.Size
+		firstSize = &sz
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE items
+		SET path = ?, container = ?, file_size = ?, is_strm = ?, runtime_ticks = ?, date_modified = ?, etag = ?
+		WHERE id = ?`,
+		nullStr(firstSrc.Path), nullStr(firstContainer), firstSize, boolToInt(firstIsStrm), firstRT,
+		now, guid.New()[:16], itemID,
+	); err != nil {
 		return nil, err
 	}
 

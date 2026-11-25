@@ -18,7 +18,12 @@ import (
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 )
 
-const sqliteInChunkSize = 400
+const (
+	sqliteInChunkSize    = 400
+	maxCountCacheEntries = 2048
+	maxFTSQueryRunes     = 256
+	maxFTSQueryTerms     = 32
+)
 
 var ErrNotFound = errors.New("not found")
 
@@ -258,49 +263,75 @@ type SearchHintFilter struct {
 	Limit             int
 }
 
-// parentalRatingScores maps standard MPAA / TV / BBFC / FSK / HK / TW parental ratings
+// parentalRatingScores maps standard MPAA / TV / BBFC / FSK / HK / TW / JP / AU parental ratings
 // to numeric scores matching /Localization/ParentalRatings.
 var parentalRatingScores = map[string]int{
-	"G":        1,
-	"TV-Y":     1,
-	"TV-G":     1,
-	"U":        1,
-	"0":        1,
-	"0+":       1,
-	"I":        1,
-	"FSK-0":    1,
-	"TV-Y7":    4,
-	"TV-Y7-FV": 4,
-	"6":        4,
-	"6+":       4,
-	"FSK-6":    4,
-	"PG":       5,
-	"TV-PG":    5,
-	"IIA":      5,
-	"PG-13":    7,
-	"12":       7,
-	"12A":      7,
-	"12+":      7,
-	"FSK-12":   7,
-	"TV-14":    8,
-	"15":       8,
-	"15+":      8,
-	"IIB":      8,
-	"MA15+":    8,
-	"R":        9,
-	"TV-MA":    9,
-	"16":       9,
-	"16+":      9,
-	"18":       9,
-	"18+":      9,
-	"18A":      9,
-	"III":      9,
-	"FSK-16":   9,
-	"FSK-18":   9,
-	"R18+":     9,
-	"NC-17":    10,
-	"X":        10,
-	"XXX":      10,
+	"G":            1,
+	"TV-Y":         1,
+	"TV-G":         1,
+	"U":            1,
+	"0":            1,
+	"0+":           1,
+	"I":            1,
+	"FSK-0":        1,
+	"ALL":          1,
+	"AL":           1,
+	"APPROVED":     1,
+	"PASSED":       1,
+	"TV-Y7":        4,
+	"TV-Y7-FV":     4,
+	"6":            4,
+	"6+":           4,
+	"FSK-6":        4,
+	"PG":           5,
+	"TV-PG":        5,
+	"IIA":          5,
+	"PG-12":        7,
+	"PG12":         7,
+	"PG-13":        7,
+	"PG13":         7,
+	"12":           7,
+	"12A":          7,
+	"12+":          7,
+	"13+":          7,
+	"FSK-12":       7,
+	"M":            7,
+	"TV-14":        8,
+	"14A":          8,
+	"14+":          8,
+	"15":           8,
+	"15+":          8,
+	"IIB":          8,
+	"MA15+":        8,
+	"MA-15+":       8,
+	"R-15":         8,
+	"R15":          8,
+	"R15+":         8,
+	"R":            9,
+	"TV-MA":        9,
+	"16":           9,
+	"16+":          9,
+	"17+":          9,
+	"18":           9,
+	"18+":          9,
+	"18A":          9,
+	"III":          9,
+	"CAT-III":      9,
+	"M18":          9,
+	"FSK-16":       9,
+	"FSK-18":       9,
+	"R18+":         9,
+	"R-18":         10,
+	"R18":          10,
+	"R-18+":        10,
+	"R21":          10,
+	"NC-17":        10,
+	"NC17":         10,
+	"AO":           10,
+	"ADULT":        10,
+	"EXPLICIT":     10,
+	"X":            10,
+	"XXX":          10,
 }
 
 // ParentalRatingScore maps a parental rating label (case-insensitive) to its numeric score.
@@ -309,8 +340,38 @@ func ParentalRatingScore(rating string) (int, bool) {
 	if key == "" {
 		return 0, false
 	}
-	score, ok := parentalRatingScores[key]
-	return score, ok
+	if score, ok := parentalRatingScores[key]; ok {
+		return score, true
+	}
+	// Strip optional country prefix such as "US:R", "JP:R18+", "DE:FSK 16".
+	if idx := strings.IndexByte(key, ':'); idx > 0 && idx < len(key)-1 {
+		key = strings.TrimSpace(key[idx+1:])
+		if score, ok := parentalRatingScores[key]; ok {
+			return score, true
+		}
+	}
+	// Normalize whitespace/underscores to hyphens (e.g. "FSK 16" -> "FSK-16", "NC 17" -> "NC-17").
+	norm := strings.NewReplacer(" ", "-", "_", "-").Replace(key)
+	for strings.Contains(norm, "--") {
+		norm = strings.ReplaceAll(norm, "--", "-")
+	}
+	if score, ok := parentalRatingScores[norm]; ok {
+		return score, true
+	}
+	// Match US TV ratings with content descriptors (e.g. TV-MA-LSV, TV-14-DLV, TV-PG-V).
+	switch {
+	case strings.HasPrefix(norm, "TV-MA-"):
+		return 9, true
+	case strings.HasPrefix(norm, "TV-14-"):
+		return 8, true
+	case strings.HasPrefix(norm, "TV-PG-"):
+		return 5, true
+	case strings.HasPrefix(norm, "TV-Y7-"):
+		return 4, true
+	case strings.HasPrefix(norm, "TV-G-"), strings.HasPrefix(norm, "TV-Y-"):
+		return 1, true
+	}
+	return 0, false
 }
 
 // ParseParentalRatingValue maps a parental rating label (case-insensitive) to its
@@ -366,8 +427,11 @@ func appendParentalFilterSQL(alias string, maxRating *int, blockedTags []string)
 		if maxVal < 0 {
 			maxVal = 0
 		}
-		clauses = append(clauses, fmt.Sprintf(`%s.parental_rating_value <= ?`, alias))
-		args = append(args, maxVal)
+		clauses = append(clauses, fmt.Sprintf(
+			`(%s.parental_rating_value <= ? AND (COALESCE(%s.series_id, '') = '' OR NOT EXISTS (SELECT 1 FROM items ps WHERE ps.id = %s.series_id AND ps.parental_rating_value > ?)))`,
+			alias, alias, alias,
+		))
+		args = append(args, maxVal, maxVal)
 	}
 	if normTags := normalizeBlockedTags(blockedTags); len(normTags) > 0 {
 		ph := make([]string, len(normTags))
@@ -392,8 +456,18 @@ func (r *LibraryRepo) IsItemBlockedByParentalPolicy(ctx context.Context, rec *It
 		return false, nil
 	}
 	if maxRating != nil {
-		if score, ok := ParentalRatingScore(rec.OfficialRating); ok && score > *maxRating {
+		maxVal := *maxRating
+		if maxVal < 0 {
+			maxVal = 0
+		}
+		if score, ok := ParentalRatingScore(rec.OfficialRating); ok && score > maxVal {
 			return true, nil
+		}
+		if sid := guid.Normalize(rec.SeriesID); sid != "" {
+			var seriesScore int
+			if err := r.store.Reader.QueryRowContext(ctx, `SELECT parental_rating_value FROM items WHERE id = ?`, sid).Scan(&seriesScore); err == nil && seriesScore > maxVal {
+				return true, nil
+			}
 		}
 	}
 	if normTags := normalizeBlockedTags(blockedTags); len(normTags) > 0 {
@@ -1351,6 +1425,9 @@ func BuildFTSQuery(term string) string {
 	if term == "" {
 		return ""
 	}
+	if r := []rune(term); len(r) > maxFTSQueryRunes {
+		term = string(r[:maxFTSQueryRunes])
+	}
 	// Split on whitespace and punctuation into logical tokens
 	var rawTokens []string
 	var cur strings.Builder
@@ -1371,6 +1448,9 @@ func BuildFTSQuery(term string) string {
 	var exprs []string
 	seen := make(map[string]struct{})
 	addTerm := func(t string) {
+		if len(exprs) >= maxFTSQueryTerms {
+			return
+		}
 		t = strings.ReplaceAll(t, `"`, "")
 		if t == "" {
 			return
@@ -1590,7 +1670,7 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 		pid := guid.Normalize(f.ParentID)
 		if f.Recursive {
 			joins = append(joins, `INNER JOIN item_ancestors anc ON anc.descendant_id = i.id`)
-			where = append(where, `anc.ancestor_id = ?`)
+			where = append(where, `anc.ancestor_id = ? AND anc.depth > 0`)
 			args = append(args, pid)
 		} else {
 			where = append(where, `i.parent_id = ?`)
@@ -1844,6 +1924,9 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 				if r.countCache == nil {
 					r.countCache = make(map[string]int)
 				}
+				if _, exists := r.countCache[cacheKey]; !exists && len(r.countCache) >= maxCountCacheEntries {
+					r.countCache = make(map[string]int)
+				}
 				r.countCache[cacheKey] = total
 				r.countMu.Unlock()
 			}
@@ -2094,10 +2177,11 @@ func (r *LibraryRepo) GetNextUpEpisodesWithPolicy(ctx context.Context, serverID,
 	querySQL := `
 		WITH series_activity AS (
 			SELECT e.series_id,
-			       MAX(COALESCE(ue.last_played_date, '')) AS last_played
+			       MAX(COALESCE(ue.last_played_date, 0)) AS last_played
 			FROM items e
 			INNER JOIN user_item_data ue ON ue.item_id = e.id AND ue.user_id = ?
 			WHERE e.type = 'Episode'
+			  AND e.extra_type = ''
 			  AND COALESCE(e.series_id, '') != ''
 			  AND (COALESCE(ue.played, 0) = 1 OR COALESCE(ue.playback_position_ticks, 0) > 0)
 			GROUP BY e.series_id
@@ -2116,7 +2200,7 @@ func (r *LibraryRepo) GetNextUpEpisodesWithPolicy(ctx context.Context, serverID,
 			       COALESCE(u.is_favorite, 0) AS u_fav,
 			       u.last_played_date AS u_last_played,
 			       CASE WHEN sa.series_id IS NOT NULL THEN 1 ELSE 0 END AS is_started,
-			       COALESCE(sa.last_played, '') AS series_last_played,
+			       COALESCE(sa.last_played, 0) AS series_last_played,
 			       ROW_NUMBER() OVER (
 			           PARTITION BY CASE WHEN COALESCE(i.series_id, '') != '' THEN i.series_id ELSE i.id END
 			           ORDER BY COALESCE(i.parent_index_number, 0) ASC, COALESCE(i.index_number, 0) ASC, i.id ASC
@@ -2124,7 +2208,7 @@ func (r *LibraryRepo) GetNextUpEpisodesWithPolicy(ctx context.Context, serverID,
 			FROM items i
 			LEFT JOIN user_item_data u ON u.item_id = i.id AND u.user_id = ?
 			LEFT JOIN series_activity sa ON sa.series_id = i.series_id
-			WHERE i.type = 'Episode' AND COALESCE(u.played, 0) = 0` + extraCond.String() + `
+			WHERE i.type = 'Episode' AND i.extra_type = '' AND COALESCE(u.played, 0) = 0` + extraCond.String() + `
 		)
 		SELECT id, library_id, parent_id, series_id, season_id,
 		       type, media_type, is_folder, is_strm,
@@ -2192,7 +2276,7 @@ func (r *LibraryRepo) SearchHints(ctx context.Context, f SearchHintFilter) ([]dt
 
 	if f.ParentID != "" {
 		joins = append(joins, `INNER JOIN item_ancestors anc ON anc.descendant_id = i.id`)
-		where = append(where, `anc.ancestor_id = ?`)
+		where = append(where, `anc.ancestor_id = ? AND anc.depth > 0`)
 		args = append(args, guid.Normalize(f.ParentID))
 	}
 	if len(f.AllowedLibraryIDs) > 0 {
@@ -2322,7 +2406,7 @@ func (r *LibraryRepo) ListTaxonomiesWithPolicy(ctx context.Context, serverID, ki
 			extraWhere strings.Builder
 		)
 		if parentID != "" {
-			parentJoin = `INNER JOIN item_ancestors anc ON anc.descendant_id = i.id AND anc.ancestor_id = ?`
+			parentJoin = `INNER JOIN item_ancestors anc ON anc.descendant_id = i.id AND anc.ancestor_id = ? AND anc.depth > 0`
 			args = append(args, parentID)
 		}
 		if clause, vals := libInClause("i.library_id"); clause != "" {
@@ -2337,7 +2421,7 @@ func (r *LibraryRepo) ListTaxonomiesWithPolicy(ctx context.Context, serverID, ki
 		}
 		rows, err := r.store.Reader.QueryContext(ctx,
 			`SELECT DISTINCT i.production_year FROM items i `+parentJoin+`
-			 WHERE i.production_year IS NOT NULL`+extraWhere.String()+` ORDER BY i.production_year DESC`, args...)
+			 WHERE i.production_year IS NOT NULL AND i.extra_type = ''`+extraWhere.String()+` ORDER BY i.production_year DESC`, args...)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -2358,6 +2442,9 @@ func (r *LibraryRepo) ListTaxonomiesWithPolicy(ctx context.Context, serverID, ki
 				BackdropImageTags: []string{},
 			})
 		}
+		if err := rows.Err(); err != nil {
+			return nil, 0, err
+		}
 		total := len(all)
 		return paginateSlice(all, startIndex, limit), total, nil
 
@@ -2371,7 +2458,7 @@ func (r *LibraryRepo) ListTaxonomiesWithPolicy(ctx context.Context, serverID, ki
 			conds = append(conds, "ip.person_id = p.id")
 			if parentID != "" {
 				joins = append(joins, "JOIN item_ancestors anc ON anc.descendant_id = ip.item_id")
-				conds = append(conds, "anc.ancestor_id = ?")
+				conds = append(conds, "anc.ancestor_id = ? AND anc.depth > 0")
 				args = append(args, parentID)
 			}
 			if len(allowedLibraryIDs) > 0 || hasParental {
@@ -2430,8 +2517,11 @@ func (r *LibraryRepo) ListTaxonomiesWithPolicy(ctx context.Context, serverID, ki
 		// genre / studio / tag
 		taxKind := strings.ToLower(strings.TrimSuffix(kind, "s"))
 		dtoType := "Genre"
-		if taxKind == "studio" {
+		switch taxKind {
+		case "studio":
 			dtoType = "Studio"
+		case "tag":
+			dtoType = "Tag"
 		}
 		var (
 			args  = []any{taxKind}
@@ -2442,7 +2532,7 @@ func (r *LibraryRepo) ListTaxonomiesWithPolicy(ctx context.Context, serverID, ki
 			conds = append(conds, "it.taxonomy_id = t.id")
 			if parentID != "" {
 				joins = append(joins, "JOIN item_ancestors anc ON anc.descendant_id = it.item_id")
-				conds = append(conds, "anc.ancestor_id = ?")
+				conds = append(conds, "anc.ancestor_id = ? AND anc.depth > 0")
 				args = append(args, parentID)
 			}
 			if len(allowedLibraryIDs) > 0 || hasParental {
@@ -2696,6 +2786,14 @@ func (r *LibraryRepo) MarkPlayed(ctx context.Context, userID, itemID string) (*d
 	}
 	defer tx.Rollback()
 
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM items WHERE id = ?`, itemID).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+
 	targetIDs, err := r.collectCascadeItemIDs(ctx, tx, itemID)
 	if err != nil {
 		return nil, err
@@ -2734,6 +2832,14 @@ func (r *LibraryRepo) MarkUnplayed(ctx context.Context, userID, itemID string) (
 		return nil, err
 	}
 	defer tx.Rollback()
+
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM items WHERE id = ?`, itemID).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
 
 	targetIDs, err := r.collectCascadeItemIDs(ctx, tx, itemID)
 	if err != nil {
@@ -3306,6 +3412,14 @@ func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []
 		}
 	}
 
+	var mediaSourcesMap map[string][]MediaSourceRecord
+	if wantMediaSources {
+		mediaSourcesMap, err = r.loadMediaSourcesBatch(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	dtos := make([]dto.BaseItemDto, len(recs))
 	for i, rec := range recs {
 		created := time.Unix(rec.DateCreated, 0).UTC()
@@ -3441,8 +3555,7 @@ func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []
 			}
 		}
 		if wantMediaSources {
-			srcs, err := r.GetMediaSourcesByItemID(ctx, rec.ID)
-			if err == nil && len(srcs) > 0 {
+			if srcs := mediaSourcesMap[rec.ID]; len(srcs) > 0 {
 				d.MediaSources = MediaSourceRecordsToDTO(srcs)
 				if len(d.MediaSources) > 0 && len(d.MediaSources[0].MediaStreams) > 0 {
 					d.MediaStreams = d.MediaSources[0].MediaStreams
@@ -3452,6 +3565,114 @@ func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []
 		dtos[i] = d
 	}
 	return dtos, nil
+}
+
+func (r *LibraryRepo) loadMediaSourcesBatch(ctx context.Context, itemIDs []string) (map[string][]MediaSourceRecord, error) {
+	out := make(map[string][]MediaSourceRecord)
+	if len(itemIDs) == 0 {
+		return out, nil
+	}
+	type srcRef struct {
+		itemID string
+		idx    int
+	}
+	for _, chunk := range chunkStrings(itemIDs, sqliteInChunkSize) {
+		ph := make([]string, len(chunk))
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			ph[i] = "?"
+			args[i] = id
+		}
+		inClause := strings.Join(ph, ",")
+
+		rows, err := r.store.Reader.QueryContext(ctx, `
+			SELECT id, item_id, name, path, protocol, container, COALESCE(size,0), COALESCE(bitrate,0),
+			       COALESCE(runtime_ticks,0), is_remote, supports_direct_play, supports_direct_stream,
+			       supports_transcoding, extra_json
+			FROM item_media_sources
+			WHERE item_id IN (`+inClause+`)
+			ORDER BY rowid ASC`, args...)
+		if err != nil {
+			return nil, err
+		}
+
+		srcIndex := make(map[string]srcRef)
+		for rows.Next() {
+			var (
+				s                MediaSourceRecord
+				container        sql.NullString
+				isRem, dp, ds, tc int
+			)
+			if err := rows.Scan(&s.ID, &s.ItemID, &s.Name, &s.Path, &s.Protocol, &container,
+				&s.Size, &s.Bitrate, &s.RuntimeTicks, &isRem, &dp, &ds, &tc, &s.ExtraJSON); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			s.Container = container.String
+			s.IsRemote = isRem == 1
+			s.SupportsDirectPlay = dp == 1
+			s.SupportsDirectStream = ds == 1
+			s.SupportsTranscoding = tc == 1
+			list := out[s.ItemID]
+			srcIndex[s.ID] = srcRef{itemID: s.ItemID, idx: len(list)}
+			out[s.ItemID] = append(list, s)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+
+		if len(srcIndex) == 0 {
+			continue
+		}
+
+		sRows, err := r.store.Reader.QueryContext(ctx, `
+			SELECT media_source_id, item_id, stream_index, stream_type, codec, language, sub_variant,
+			       display_title, title, COALESCE(width,0), COALESCE(height,0), video_range, audio_layout,
+			       COALESCE(channels,0), COALESCE(sample_rate,0), COALESCE(bitrate,0),
+			       is_default, is_forced, is_external, path
+			FROM item_media_streams
+			WHERE item_id IN (`+inClause+`)
+			ORDER BY stream_index ASC`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for sRows.Next() {
+			var (
+				st                                                           MediaStreamRecord
+				codec, lang, subVar, dispTitle, title, vRange, aLayout, path sql.NullString
+				isDef, isForced, isExt                                       int
+			)
+			if err := sRows.Scan(&st.MediaSourceID, &st.ItemID, &st.StreamIndex, &st.StreamType,
+				&codec, &lang, &subVar, &dispTitle, &title, &st.Width, &st.Height, &vRange, &aLayout,
+				&st.Channels, &st.SampleRate, &st.Bitrate, &isDef, &isForced, &isExt, &path); err != nil {
+				sRows.Close()
+				return nil, err
+			}
+			st.Codec = codec.String
+			st.Language = lang.String
+			st.SubVariant = subVar.String
+			st.DisplayTitle = dispTitle.String
+			st.Title = title.String
+			st.VideoRange = vRange.String
+			st.AudioLayout = aLayout.String
+			st.IsDefault = isDef == 1
+			st.IsForced = isForced == 1
+			st.IsExternal = isExt == 1
+			st.Path = path.String
+
+			if ref, ok := srcIndex[st.MediaSourceID]; ok {
+				out[ref.itemID][ref.idx].Streams = append(out[ref.itemID][ref.idx].Streams, st)
+			}
+		}
+		if err := sRows.Err(); err != nil {
+			sRows.Close()
+			return nil, err
+		}
+		sRows.Close()
+	}
+	return out, nil
 }
 
 func (r *LibraryRepo) loadTaxonomiesBatch(ctx context.Context, itemIDs []string) (map[string][]dto.NameIdPair, map[string][]dto.NameIdPair, map[string][]string, error) {

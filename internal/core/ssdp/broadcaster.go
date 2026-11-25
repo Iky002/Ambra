@@ -7,11 +7,31 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 )
+
+const (
+	ssdpRateWindow     = 5 * time.Second
+	ssdpMaxPerWindow   = 20
+	ssdpMaxTrackedIPs  = 1024
+)
+
+type ssdpIPRate struct {
+	windowStart time.Time
+	count       int
+}
+
+func sanitizeSSDPHeader(s string) string {
+	s = strings.ReplaceAll(s, "\r", "")
+	s = strings.ReplaceAll(s, "\n", "")
+	return s
+}
 
 const (
 	MulticastAddr = "239.255.255.250:1900"
@@ -55,6 +75,9 @@ type Broadcaster struct {
 
 	mu        sync.RWMutex
 	localAddr net.Addr
+
+	rateMu  sync.Mutex
+	ipRates map[string]*ssdpIPRate
 }
 
 // NewBroadcaster creates a new SSDP Broadcaster with sensible UPnP 1.0 defaults.
@@ -86,22 +109,26 @@ func NewBroadcaster(cfg Config) *Broadcaster {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Broadcaster{cfg: cfg}
+	return &Broadcaster{
+		cfg:     cfg,
+		ipRates: make(map[string]*ssdpIPRate),
+	}
 }
 
 // LocationURL returns the UPnP device description URL announced by this server.
 func (b *Broadcaster) LocationURL() string {
-	return fmt.Sprintf("http://%s:%d/Dlna/%s/description.xml", b.cfg.Host, b.cfg.Port, b.cfg.ServerID)
+	return sanitizeSSDPHeader(fmt.Sprintf("http://%s:%d/Dlna/%s/description.xml", b.cfg.Host, b.cfg.Port, b.cfg.ServerID))
 }
 
 // ServerHeader returns the UPnP SERVER header value.
 func (b *Broadcaster) ServerHeader() string {
-	return fmt.Sprintf("Linux/1.0 UPnP/1.0 Ambra/%s", b.cfg.ServerVersion)
+	return sanitizeSSDPHeader(fmt.Sprintf("Linux/1.0 UPnP/1.0 Ambra/%s", b.cfg.ServerVersion))
 }
 
 // USN formats the Unique Service Name for a given notification type or search target.
 func (b *Broadcaster) USN(nt string) string {
-	rootUUID := "uuid:" + b.cfg.ServerID
+	nt = sanitizeSSDPHeader(nt)
+	rootUUID := "uuid:" + sanitizeSSDPHeader(b.cfg.ServerID)
 	if nt == rootUUID {
 		return rootUUID
 	}
@@ -127,6 +154,8 @@ func (b *Broadcaster) NotificationTargets() []string {
 
 // BuildNotify constructs a UPnP 1.0 NOTIFY packet for ssdp:alive or ssdp:byebye.
 func (b *Broadcaster) BuildNotify(nt, nts string) []byte {
+	nt = sanitizeSSDPHeader(nt)
+	nts = sanitizeSSDPHeader(nts)
 	var buf bytes.Buffer
 	buf.WriteString("NOTIFY * HTTP/1.1\r\n")
 	fmt.Fprintf(&buf, "HOST: %s\r\n", MulticastAddr)
@@ -144,6 +173,7 @@ func (b *Broadcaster) BuildNotify(nt, nts string) []byte {
 
 // BuildMSearchResponse constructs a UPnP 1.0 HTTP/1.1 200 OK response to an M-SEARCH request.
 func (b *Broadcaster) BuildMSearchResponse(st string) []byte {
+	st = sanitizeSSDPHeader(st)
 	if st == "" || st == STAll {
 		st = STMediaServer
 	}
@@ -313,7 +343,51 @@ func (b *Broadcaster) readLoop(ctx context.Context, conn *net.UDPConn) {
 	}
 }
 
+func (b *Broadcaster) allowRemoteIP(remote *net.UDPAddr, now time.Time) bool {
+	if remote == nil || remote.IP == nil {
+		return false
+	}
+	addr, ok := netip.AddrFromSlice(remote.IP)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+	if !netutil.IsLANIP(addr) {
+		return false
+	}
+	key := addr.String()
+
+	b.rateMu.Lock()
+	defer b.rateMu.Unlock()
+	if b.ipRates == nil {
+		b.ipRates = make(map[string]*ssdpIPRate)
+	}
+	if len(b.ipRates) >= ssdpMaxTrackedIPs {
+		for ip, st := range b.ipRates {
+			if now.Sub(st.windowStart) >= ssdpRateWindow {
+				delete(b.ipRates, ip)
+			}
+		}
+		if len(b.ipRates) >= ssdpMaxTrackedIPs {
+			return false
+		}
+	}
+	st, exists := b.ipRates[key]
+	if !exists || now.Sub(st.windowStart) >= ssdpRateWindow {
+		b.ipRates[key] = &ssdpIPRate{windowStart: now, count: 1}
+		return true
+	}
+	if st.count >= ssdpMaxPerWindow {
+		return false
+	}
+	st.count++
+	return true
+}
+
 func (b *Broadcaster) handlePacket(conn *net.UDPConn, remote *net.UDPAddr, data []byte) {
+	if !b.allowRemoteIP(remote, time.Now()) {
+		return
+	}
 	req, ok := ParseMSearch(data)
 	if !ok {
 		return

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -25,7 +24,20 @@ import (
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
-const defaultBrowserUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+const (
+	defaultBrowserUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+	maxImageDim      = 4096
+)
+
+func clampImageDim(v int) int {
+	if v < 0 {
+		return 0
+	}
+	if v > maxImageDim {
+		return maxImageDim
+	}
+	return v
+}
 
 // AuthFuncs decouples route registration from the concrete middleware package.
 type AuthFuncs struct {
@@ -72,12 +84,15 @@ func (h *Handler) SetUserRepo(userRepo *sqlite.UserRepo) {
 
 // CanAccessLibrary returns true if userID is permitted to access libraryID.
 func (h *Handler) CanAccessLibrary(ctx context.Context, userID, libraryID string) bool {
-	if h.userRepo == nil || userID == "" || libraryID == "" {
+	if h.userRepo == nil || libraryID == "" {
 		return true
+	}
+	if strings.TrimSpace(userID) == "" {
+		return false
 	}
 	u, err := h.userRepo.GetUserByID(ctx, guid.Normalize(userID))
 	if err != nil || u == nil {
-		return true
+		return false
 	}
 	if u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableAllFolders {
 		return true
@@ -136,12 +151,15 @@ func (h *Handler) canDownloadContent(r *http.Request) bool {
 		return true
 	}
 	callerID, isAdmin := h.callerIdentity(r)
-	if isAdmin || callerID == "" {
+	if isAdmin {
 		return true
+	}
+	if callerID == "" {
+		return false
 	}
 	u, err := h.userRepo.GetUserByID(r.Context(), callerID)
 	if err != nil || u == nil {
-		return true
+		return false
 	}
 	if u.IsAdmin || u.Policy.IsAdministrator {
 		return true
@@ -153,27 +171,28 @@ func (h *Handler) canAccessItem(r *http.Request, itemID string) bool {
 	if h.userRepo == nil || h.repo == nil {
 		return true
 	}
-	var callerID string
-	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
-		if ac.IsAdmin() {
-			return true
-		}
-		callerID = guid.Normalize(ac.UserID())
-	} else if h.auth.UserIDFromCtx != nil {
-		callerID = guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+	callerID, isAdmin := h.callerIdentity(r)
+	if isAdmin {
+		return true
 	}
 	if callerID == "" {
-		return true
+		return false
 	}
 	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
-	if err != nil || rec == nil {
+	if errors.Is(err, sqlite.ErrNotFound) {
 		return true
+	}
+	if err != nil || rec == nil {
+		return false
 	}
 	if rec.LibraryID != "" && !h.CanAccessLibrary(r.Context(), callerID, rec.LibraryID) {
 		return false
 	}
 	u, err := h.userRepo.GetUserByID(r.Context(), callerID)
-	if err != nil || u == nil || u.IsAdmin || u.Policy.IsAdministrator {
+	if err != nil || u == nil {
+		return false
+	}
+	if u.IsAdmin || u.Policy.IsAdministrator {
 		return true
 	}
 	blocked, err := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, u.Policy.MaxParentalRating, u.Policy.BlockedTags)
@@ -220,7 +239,7 @@ func (h *Handler) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 
 	var req playback.PlaybackInfoRequest
 	if r.Body != nil && r.Method == http.MethodPost {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = httpx.DecodeJSONLimit(r, &req, 0)
 	}
 	if req.UserID == "" {
 		req.UserID = q.Get("UserId")
@@ -310,19 +329,30 @@ func (h *Handler) serveMediaFile(w http.ResponseWriter, r *http.Request, asAttac
 		forceProxy = true
 	}
 	if strings.EqualFold(filepath.Ext(mediaPath), ".strm") {
+		if h.engine == nil {
+			httpx.Error(w, http.StatusBadGateway, "strm resolver unavailable")
+			return
+		}
 		resolved, err := h.engine.ResolveStream(r.Context(), mediaPath)
 		if err != nil {
 			httpx.Error(w, http.StatusBadGateway, "failed to resolve strm: "+err.Error())
 			return
 		}
-		if resolved != nil && resolved.URL != "" {
-			if resolved.Is302 && !forceProxy {
-				w.Header().Set("Cache-Control", "no-store")
-				http.Redirect(w, r, resolved.URL, http.StatusFound)
-				return
-			}
-			mediaPath = resolved.URL
+		if resolved == nil || !isHTTPURL(resolved.URL) {
+			httpx.Error(w, http.StatusBadGateway, "invalid strm target url")
+			return
 		}
+		targetURL := strings.TrimSpace(resolved.URL)
+		if err := netutil.ValidateRemoteURL(targetURL, true); err != nil {
+			httpx.Error(w, http.StatusBadGateway, "blocked upstream stream url: "+err.Error())
+			return
+		}
+		if resolved.Is302 && !forceProxy {
+			w.Header().Set("Cache-Control", "no-store")
+			http.Redirect(w, r, targetURL, http.StatusFound)
+			return
+		}
+		mediaPath = targetURL
 	}
 
 	// Reverse-proxy remote HTTP(S) streams (e.g. non-302 STRM or explicit proxy=1/true)
@@ -446,6 +476,11 @@ func (h *Handler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusNotFound, "media file not found for subtitle extraction")
 			return
 		}
+		mediaPath, err = h.resolveExtractionMediaPath(r.Context(), mediaPath)
+		if err != nil {
+			httpx.Error(w, http.StatusBadGateway, "failed to resolve strm: "+err.Error())
+			return
+		}
 		extractExt := targetFormat
 		if extractExt == "" {
 			extractExt = foundStream.Codec
@@ -490,12 +525,12 @@ func (h *Handler) handleImage(w http.ResponseWriter, r *http.Request) {
 	}
 	q := httpx.ParseQuery(r)
 	opts := imaging.Options{
-		MaxWidth:   q.Int("maxWidth", 0),
-		MaxHeight:  q.Int("maxHeight", 0),
-		Width:      q.Int("width", 0),
-		Height:     q.Int("height", 0),
-		FillWidth:  q.Int("fillWidth", 0),
-		FillHeight: q.Int("fillHeight", 0),
+		MaxWidth:   clampImageDim(q.Int("maxWidth", 0)),
+		MaxHeight:  clampImageDim(q.Int("maxHeight", 0)),
+		Width:      clampImageDim(q.Int("width", 0)),
+		Height:     clampImageDim(q.Int("height", 0)),
+		FillWidth:  clampImageDim(q.Int("fillWidth", 0)),
+		FillHeight: clampImageDim(q.Int("fillHeight", 0)),
 		Quality:    q.Int("quality", 0),
 		Format:     q.Get("format"),
 	}
@@ -532,6 +567,10 @@ func (h *Handler) tryExtractAndServeChapterImage(w http.ResponseWriter, r *http.
 		return false
 	}
 	mediaPath, err := h.resolveMediaPath(r.Context(), normID, "")
+	if err != nil || strings.TrimSpace(mediaPath) == "" {
+		return false
+	}
+	mediaPath, err = h.resolveExtractionMediaPath(r.Context(), mediaPath)
 	if err != nil || strings.TrimSpace(mediaPath) == "" {
 		return false
 	}
@@ -647,6 +686,27 @@ func sanitizeContentDispositionFilename(name string) string {
 		return "media"
 	}
 	return name
+}
+
+func (h *Handler) resolveExtractionMediaPath(ctx context.Context, mediaPath string) (string, error) {
+	if !strings.EqualFold(filepath.Ext(mediaPath), ".strm") {
+		return mediaPath, nil
+	}
+	if h.engine == nil {
+		return "", errors.New("strm resolver unavailable")
+	}
+	resolved, err := h.engine.ResolveStream(ctx, mediaPath)
+	if err != nil {
+		return "", err
+	}
+	if resolved == nil || !isHTTPURL(resolved.URL) {
+		return "", errors.New("invalid strm target url")
+	}
+	targetURL := strings.TrimSpace(resolved.URL)
+	if err := netutil.ValidateRemoteURL(targetURL, true); err != nil {
+		return "", err
+	}
+	return targetURL, nil
 }
 
 func isHTTPURL(s string) bool {

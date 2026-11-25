@@ -16,7 +16,10 @@ import (
 	"time"
 
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 )
+
+const maxFinishedEntries = 500
 
 // Status represents the lifecycle state of a DVR recording job.
 type Status string
@@ -87,7 +90,7 @@ type Recorder struct {
 
 // DefaultArgsBuilder builds the standard ffmpeg remux command arguments.
 func DefaultArgsBuilder(job RecordingJob, outFile string) []string {
-	args := []string{"-y", "-i", job.StreamURL}
+	args := []string{"-y", "-protocol_whitelist", "http,https,tcp,tls,crypto", "-i", job.StreamURL}
 	if job.Duration > 0 {
 		sec := int(math.Ceil(job.Duration.Seconds()))
 		if sec < 1 {
@@ -145,6 +148,9 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 	if strings.TrimSpace(job.TimerID) == "" || strings.TrimSpace(job.StreamURL) == "" {
 		return nil, ErrInvalidJob
 	}
+	if err := netutil.ValidateRemoteURL(job.StreamURL, true); err != nil {
+		return nil, fmt.Errorf("%w: invalid stream URL: %v", ErrInvalidJob, err)
+	}
 	if err := os.MkdirAll(r.recordingsDir, 0o755); err != nil {
 		return nil, fmt.Errorf("dvr: create recordings dir: %w", err)
 	}
@@ -184,6 +190,7 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 		entry.state.Error = err.Error()
 		close(entry.done)
 		r.entries[job.TimerID] = entry
+		r.pruneFinishedLocked()
 		failedState := entry.state
 		onFinished := r.onFinished
 		r.mu.Unlock()
@@ -226,6 +233,7 @@ func (r *Recorder) waitRecording(recCtx context.Context, cmd *exec.Cmd, entry *r
 	default:
 		entry.state.Status = StatusCompleted
 	}
+	r.pruneFinishedLocked()
 	finalState := entry.state
 	onFinished := r.onFinished
 	r.mu.Unlock()
@@ -243,6 +251,29 @@ func (r *Recorder) waitRecording(recCtx context.Context, cmd *exec.Cmd, entry *r
 				"output_path": finalState.OutputPath,
 			},
 		})
+	}
+}
+
+func (r *Recorder) pruneFinishedLocked() {
+	type finishedItem struct {
+		id      string
+		endedAt time.Time
+	}
+	var finished []finishedItem
+	for id, ent := range r.entries {
+		if ent.state.Status != StatusRecording {
+			finished = append(finished, finishedItem{id: id, endedAt: ent.state.EndedAt})
+		}
+	}
+	if len(finished) <= maxFinishedEntries {
+		return
+	}
+	sort.Slice(finished, func(i, j int) bool {
+		return finished[i].endedAt.Before(finished[j].endedAt)
+	})
+	excess := len(finished) - maxFinishedEntries
+	for i := 0; i < excess; i++ {
+		delete(r.entries, finished[i].id)
 	}
 }
 

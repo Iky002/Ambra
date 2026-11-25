@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"log/slog"
 	"sort"
 	"sync"
 	"time"
@@ -17,6 +18,8 @@ import (
 const (
 	defaultPlayedThreshold = 0.90
 	progressPersistWindow  = 15 * time.Second
+	maxSessions            = 2048
+	sessionStaleTTL        = 24 * time.Hour
 )
 
 type PlaybackStartRequest struct {
@@ -74,6 +77,8 @@ type PlaybackEventPayload struct {
 	MediaSourceId string `json:"MediaSourceId,omitempty"`
 	PlaySessionId string `json:"PlaySessionId,omitempty"`
 	PositionTicks int64  `json:"PositionTicks"`
+	RuntimeTicks  int64  `json:"RuntimeTicks,omitempty"`
+	IsPaused      bool   `json:"IsPaused,omitempty"`
 	Played        bool   `json:"Played,omitempty"`
 }
 
@@ -130,20 +135,16 @@ func (m *Manager) SetLibraryRepo(libRepo *sqlite.LibraryRepo) {
 	m.mu.Unlock()
 }
 
-func (m *Manager) TouchSession(user *sqlite.UserRecord, client auth.ClientInfo) dto.SessionInfo {
-	if user == nil {
-		return dto.SessionInfo{}
-	}
-	now := time.Now().UTC()
+func (m *Manager) touchSessionLocked(user *sqlite.UserRecord, client auth.ClientInfo, now time.Time) *sessionEntry {
 	deviceID := client.DeviceID
 	if deviceID == "" {
 		deviceID = "default-device"
 	}
 	sid := auth.SessionID(user.ID, deviceID)
 
-	m.mu.Lock()
 	entry, ok := m.sessions[sid]
 	if !ok {
+		m.pruneSessionsLocked(now)
 		entry = &sessionEntry{
 			info: dto.SessionInfo{
 				Id:                 sid,
@@ -176,6 +177,39 @@ func (m *Manager) TouchSession(user *sqlite.UserRecord, client auth.ClientInfo) 
 			entry.info.ApplicationVersion = client.Version
 		}
 	}
+	return entry
+}
+
+func (m *Manager) pruneSessionsLocked(now time.Time) {
+	for sid, entry := range m.sessions {
+		if now.Sub(entry.info.LastActivityDate) > sessionStaleTTL {
+			delete(m.sessions, sid)
+		}
+	}
+	for len(m.sessions) >= maxSessions {
+		var oldestID string
+		var oldestTime time.Time
+		for sid, entry := range m.sessions {
+			if oldestID == "" || entry.info.LastActivityDate.Before(oldestTime) {
+				oldestID = sid
+				oldestTime = entry.info.LastActivityDate
+			}
+		}
+		if oldestID == "" {
+			break
+		}
+		delete(m.sessions, oldestID)
+	}
+}
+
+func (m *Manager) TouchSession(user *sqlite.UserRecord, client auth.ClientInfo) dto.SessionInfo {
+	if user == nil {
+		return dto.SessionInfo{}
+	}
+	now := time.Now().UTC()
+
+	m.mu.Lock()
+	entry := m.touchSessionLocked(user, client, now)
 	out := cloneSession(entry.info)
 	m.mu.Unlock()
 	return out
@@ -185,25 +219,40 @@ func (m *Manager) UpdateCapabilities(user *sqlite.UserRecord, client auth.Client
 	if user == nil {
 		return
 	}
-	info := m.TouchSession(user, client)
+	now := time.Now().UTC()
 
 	m.mu.Lock()
-	if entry, ok := m.sessions[info.Id]; ok {
-		entry.info.SupportsRemoteControl = req.SupportsRemoteControl
-		if req.PlayableMediaTypes != nil {
-			entry.info.PlayableMediaTypes = append([]string(nil), req.PlayableMediaTypes...)
-		}
-		if req.SupportedCommands != nil {
-			entry.info.SupportedCommands = append([]string(nil), req.SupportedCommands...)
-		}
-		entry.info.LastActivityDate = time.Now().UTC()
+	entry := m.touchSessionLocked(user, client, now)
+	entry.info.SupportsRemoteControl = req.SupportsRemoteControl
+	if req.PlayableMediaTypes != nil {
+		entry.info.PlayableMediaTypes = append([]string(nil), req.PlayableMediaTypes...)
 	}
+	if req.SupportedCommands != nil {
+		entry.info.SupportedCommands = append([]string(nil), req.SupportedCommands...)
+	}
+	entry.info.LastActivityDate = now
 	m.mu.Unlock()
 
 	m.publish(context.Background(), eventbus.EventSessionUpdated, nil)
 }
 
-func (m *Manager) hydrateNowPlayingItem(ctx context.Context, dst *dto.BaseItemDto, itemID string) {
+func userCanAccessLibrary(user *sqlite.UserRecord, libraryID string) bool {
+	if user == nil || user.IsAdmin || user.Policy.IsAdministrator || user.Policy.EnableAllFolders {
+		return true
+	}
+	normLib := guid.Normalize(libraryID)
+	if normLib == "" || normLib == "collections" || normLib == "playlists" {
+		return true
+	}
+	for _, allowed := range user.Policy.EnabledFolders {
+		if guid.Normalize(allowed) == normLib {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) hydrateNowPlayingItem(ctx context.Context, user *sqlite.UserRecord, dst *dto.BaseItemDto, itemID string) {
 	if dst == nil || itemID == "" {
 		return
 	}
@@ -216,6 +265,15 @@ func (m *Manager) hydrateNowPlayingItem(ctx context.Context, dst *dto.BaseItemDt
 	rec, err := libRepo.GetItemRecordByID(ctx, itemID)
 	if err != nil || rec == nil {
 		return
+	}
+	if user != nil && !user.IsAdmin && !user.Policy.IsAdministrator {
+		if !userCanAccessLibrary(user, rec.LibraryID) {
+			return
+		}
+		blocked, err := libRepo.IsItemBlockedByParentalPolicy(ctx, rec, user.Policy.MaxParentalRating, user.Policy.BlockedTags)
+		if err != nil || blocked {
+			return
+		}
 	}
 	if dst.Name == "" {
 		dst.Name = rec.Name
@@ -260,7 +318,6 @@ func (m *Manager) ReportPlaybackStart(ctx context.Context, user *sqlite.UserReco
 	if user == nil {
 		return nil
 	}
-	info := m.TouchSession(user, client)
 	itemID := guid.Normalize(req.ItemId)
 	now := time.Now().UTC()
 
@@ -276,7 +333,7 @@ func (m *Manager) ReportPlaybackStart(ctx context.Context, user *sqlite.UserReco
 			itemCopy.ServerId = m.cfg.ServerID
 		}
 		if itemCopy.Name == "" && itemID != "" {
-			m.hydrateNowPlayingItem(ctx, &itemCopy, itemID)
+			m.hydrateNowPlayingItem(ctx, user, &itemCopy, itemID)
 		}
 		nowPlaying = &itemCopy
 	} else if itemID != "" {
@@ -284,11 +341,18 @@ func (m *Manager) ReportPlaybackStart(ctx context.Context, user *sqlite.UserReco
 			Id:       itemID,
 			ServerId: m.cfg.ServerID,
 		}
-		m.hydrateNowPlayingItem(ctx, nowPlaying, itemID)
+		m.hydrateNowPlayingItem(ctx, user, nowPlaying, itemID)
+	}
+
+	var runtimeTicks int64
+	if nowPlaying != nil && nowPlaying.RunTimeTicks != nil {
+		runtimeTicks = *nowPlaying.RunTimeTicks
 	}
 
 	m.mu.Lock()
-	entry := m.sessions[info.Id]
+	entry := m.touchSessionLocked(user, client, now)
+	sessionID := entry.info.Id
+	deviceID := entry.info.DeviceId
 	entry.info.LastActivityDate = now
 	entry.playSessionID = req.PlaySessionId
 	entry.lastPausedState = req.IsPaused
@@ -316,24 +380,28 @@ func (m *Manager) ReportPlaybackStart(ctx context.Context, user *sqlite.UserReco
 	m.mu.Unlock()
 
 	if m.repo != nil && itemID != "" {
-		_ = m.repo.CreateActivityLog(ctx, &sqlite.ActivityLogRecord{
+		if err := m.repo.CreateActivityLog(ctx, &sqlite.ActivityLogRecord{
 			Name:     user.Name + " started playing",
 			Type:     "VideoPlayback",
 			ItemID:   itemID,
 			UserID:   user.ID,
 			Severity: "Info",
-		})
+		}); err != nil {
+			slog.Warn("session: failed to record playback start activity log", "user_id", user.ID, "item_id", itemID, "err", err)
+		}
 	}
 
 	m.publish(ctx, eventbus.EventPlaybackStart, PlaybackEventPayload{
-		SessionId:     info.Id,
+		SessionId:     sessionID,
 		UserId:        user.ID,
 		UserName:      user.Name,
-		DeviceId:      info.DeviceId,
+		DeviceId:      deviceID,
 		ItemId:        itemID,
 		MediaSourceId: req.MediaSourceId,
 		PlaySessionId: req.PlaySessionId,
 		PositionTicks: req.PositionTicks,
+		RuntimeTicks:  runtimeTicks,
+		IsPaused:      req.IsPaused,
 	})
 	m.publish(ctx, eventbus.EventSessionUpdated, nil)
 	return nil
@@ -343,13 +411,15 @@ func (m *Manager) ReportPlaybackProgress(ctx context.Context, user *sqlite.UserR
 	if user == nil {
 		return nil
 	}
-	info := m.TouchSession(user, client)
 	itemID := guid.Normalize(req.ItemId)
 	now := time.Now().UTC()
 
 	shouldPersist := false
+	var runtimeTicks int64
 	m.mu.Lock()
-	entry := m.sessions[info.Id]
+	entry := m.touchSessionLocked(user, client, now)
+	sessionID := entry.info.Id
+	deviceID := entry.info.DeviceId
 	entry.info.LastActivityDate = now
 	if req.PlaySessionId != "" {
 		entry.playSessionID = req.PlaySessionId
@@ -362,6 +432,9 @@ func (m *Manager) ReportPlaybackProgress(ctx context.Context, user *sqlite.UserR
 	}
 	if itemID == "" && entry.info.NowPlayingItem != nil {
 		itemID = guid.Normalize(entry.info.NowPlayingItem.Id)
+	}
+	if entry.info.NowPlayingItem != nil && entry.info.NowPlayingItem.RunTimeTicks != nil {
+		runtimeTicks = *entry.info.NowPlayingItem.RunTimeTicks
 	}
 
 	pauseChanged := entry.lastPausedState != req.IsPaused
@@ -400,20 +473,25 @@ func (m *Manager) ReportPlaybackProgress(ctx context.Context, user *sqlite.UserR
 		if pos < 0 {
 			pos = 0
 		}
-		if ud, err := m.repo.UpsertPlaybackProgress(ctx, user.ID, itemID, pos, false, req.AudioStreamIndex, req.SubtitleStreamIndex); err == nil && ud != nil {
+		ud, err := m.repo.UpsertPlaybackProgress(ctx, user.ID, itemID, pos, false, req.AudioStreamIndex, req.SubtitleStreamIndex)
+		if err != nil {
+			slog.Warn("session: failed to persist playback progress", "user_id", user.ID, "item_id", itemID, "err", err)
+		} else if ud != nil {
 			m.publishUserDataChanged(ctx, user.ID, ud)
 		}
 	}
 
 	m.publish(ctx, eventbus.EventPlaybackProgress, PlaybackEventPayload{
-		SessionId:     info.Id,
+		SessionId:     sessionID,
 		UserId:        user.ID,
 		UserName:      user.Name,
-		DeviceId:      info.DeviceId,
+		DeviceId:      deviceID,
 		ItemId:        itemID,
 		MediaSourceId: req.MediaSourceId,
 		PlaySessionId: req.PlaySessionId,
 		PositionTicks: req.PositionTicks,
+		RuntimeTicks:  runtimeTicks,
+		IsPaused:      req.IsPaused,
 	})
 	m.publish(ctx, eventbus.EventSessionUpdated, nil)
 	return nil
@@ -423,21 +501,22 @@ func (m *Manager) ReportPlaybackStopped(ctx context.Context, user *sqlite.UserRe
 	if user == nil {
 		return nil
 	}
-	info := m.TouchSession(user, client)
 	itemID := guid.Normalize(req.ItemId)
 	now := time.Now().UTC()
 
 	var audioIdx, subIdx *int
-	var runtimeTicks int64 = req.RuntimeTicks
+	var nowPlayingRuntime int64
 
 	m.mu.Lock()
-	entry := m.sessions[info.Id]
+	entry := m.touchSessionLocked(user, client, now)
+	sessionID := entry.info.Id
+	deviceID := entry.info.DeviceId
 	entry.info.LastActivityDate = now
 	if itemID == "" && entry.info.NowPlayingItem != nil {
 		itemID = guid.Normalize(entry.info.NowPlayingItem.Id)
 	}
-	if runtimeTicks == 0 && entry.info.NowPlayingItem != nil && entry.info.NowPlayingItem.RunTimeTicks != nil {
-		runtimeTicks = *entry.info.NowPlayingItem.RunTimeTicks
+	if entry.info.NowPlayingItem != nil && entry.info.NowPlayingItem.RunTimeTicks != nil {
+		nowPlayingRuntime = *entry.info.NowPlayingItem.RunTimeTicks
 	}
 	audioIdx = entry.info.PlayState.AudioStreamIndex
 	subIdx = entry.info.PlayState.SubtitleStreamIndex
@@ -449,10 +528,18 @@ func (m *Manager) ReportPlaybackStopped(ctx context.Context, user *sqlite.UserRe
 	entry.playSessionID = ""
 	m.mu.Unlock()
 
-	if runtimeTicks == 0 && m.repo != nil && itemID != "" {
+	// Prefer authoritative DB runtime_ticks when available instead of trusting client-supplied req.RuntimeTicks.
+	var runtimeTicks int64
+	if m.repo != nil && itemID != "" {
 		if rt, err := m.repo.GetItemRuntimeTicks(ctx, itemID); err == nil && rt > 0 {
 			runtimeTicks = rt
 		}
+	}
+	if runtimeTicks <= 0 && nowPlayingRuntime > 0 {
+		runtimeTicks = nowPlayingRuntime
+	}
+	if runtimeTicks <= 0 && req.RuntimeTicks > 0 {
+		runtimeTicks = req.RuntimeTicks
 	}
 
 	threshold := m.cfg.PlayedThreshold
@@ -473,16 +560,20 @@ func (m *Manager) ReportPlaybackStopped(ctx context.Context, user *sqlite.UserRe
 	var updatedData *sqlite.UserItemDataRecord
 	if m.repo != nil && itemID != "" {
 		ud, err := m.repo.UpsertPlaybackProgress(ctx, user.ID, itemID, pos, markPlayed, audioIdx, subIdx)
-		if err == nil && ud != nil {
+		if err != nil {
+			slog.Warn("session: failed to persist playback stop progress", "user_id", user.ID, "item_id", itemID, "err", err)
+		} else if ud != nil {
 			updatedData = ud
 		}
-		_ = m.repo.CreateActivityLog(ctx, &sqlite.ActivityLogRecord{
+		if err := m.repo.CreateActivityLog(ctx, &sqlite.ActivityLogRecord{
 			Name:     user.Name + " stopped playing",
 			Type:     "VideoPlaybackStopped",
 			ItemID:   itemID,
 			UserID:   user.ID,
 			Severity: "Info",
-		})
+		}); err != nil {
+			slog.Warn("session: failed to record playback stop activity log", "user_id", user.ID, "item_id", itemID, "err", err)
+		}
 	}
 
 	if updatedData != nil {
@@ -501,14 +592,16 @@ func (m *Manager) ReportPlaybackStopped(ctx context.Context, user *sqlite.UserRe
 	}
 
 	m.publish(ctx, eventbus.EventPlaybackStop, PlaybackEventPayload{
-		SessionId:     info.Id,
+		SessionId:     sessionID,
 		UserId:        user.ID,
 		UserName:      user.Name,
-		DeviceId:      info.DeviceId,
+		DeviceId:      deviceID,
 		ItemId:        itemID,
 		MediaSourceId: req.MediaSourceId,
 		PlaySessionId: req.PlaySessionId,
 		PositionTicks: pos,
+		RuntimeTicks:  runtimeTicks,
+		IsPaused:      false,
 		Played:        markPlayed,
 	})
 	m.publish(ctx, eventbus.EventSessionUpdated, nil)
@@ -532,11 +625,13 @@ func (m *Manager) ListSessions() []dto.SessionInfo {
 func (m *Manager) GetSession(sessionID string) (dto.SessionInfo, bool) {
 	m.mu.RLock()
 	entry, ok := m.sessions[sessionID]
-	m.mu.RUnlock()
 	if !ok {
+		m.mu.RUnlock()
 		return dto.SessionInfo{}, false
 	}
-	return cloneSession(entry.info), true
+	out := cloneSession(entry.info)
+	m.mu.RUnlock()
+	return out, true
 }
 
 func (m *Manager) GetSessionByUserDevice(userID, deviceID string) (dto.SessionInfo, bool) {
@@ -559,6 +654,26 @@ func (m *Manager) RemoveSessionByDevice(deviceID string) {
 	m.mu.Lock()
 	for sid, entry := range m.sessions {
 		if entry.info.DeviceId == deviceID {
+			delete(m.sessions, sid)
+			removed = true
+		}
+	}
+	m.mu.Unlock()
+	if removed {
+		m.publish(context.Background(), eventbus.EventSessionUpdated, nil)
+	}
+}
+
+// RemoveSessionsByUser removes all active in-memory sessions belonging to userID.
+func (m *Manager) RemoveSessionsByUser(userID string) {
+	norm := guid.Normalize(userID)
+	if norm == "" {
+		return
+	}
+	removed := false
+	m.mu.Lock()
+	for sid, entry := range m.sessions {
+		if guid.Normalize(entry.info.UserId) == norm {
 			delete(m.sessions, sid)
 			removed = true
 		}

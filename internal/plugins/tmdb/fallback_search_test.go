@@ -58,6 +58,7 @@ func TestFetchMovie_MultiFallbackAndYearMatching(t *testing.T) {
 	defer srv.Close()
 
 	p := New("test-key", "zh-CN")
+	p.SetHTTPClient(srv.Client())
 	p.baseURL = srv.URL
 
 	// 1. Falls back to OriginalTitle + exact year candidate matching

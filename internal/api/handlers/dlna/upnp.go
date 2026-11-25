@@ -289,7 +289,7 @@ func (h *Handler) handleSearch(ctx context.Context, r *http.Request, params map[
 			fallbackFilter := filter
 			fallbackFilter.SearchTerm = ""
 			fallbackFilter.StartIndex = 0
-			fallbackFilter.Limit = 0
+			fallbackFilter.Limit = 1000
 			allItems, _, fbErr := h.libRepo.QueryItems(ctx, fallbackFilter)
 			if fbErr != nil {
 				return "", fbErr

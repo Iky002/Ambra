@@ -25,6 +25,7 @@ import {
   getLiveTvChannelStreamUrl,
   getLiveTvRecordingStreamUrl,
   getStoredAuth,
+  isSameOriginUrl,
 } from '../api/client'
 import type { LiveTvRecordingInfo } from '../api/types'
 import { QueryErrorState } from '../components/QueryErrorState'
@@ -84,7 +85,8 @@ function getProgramProgress(startIso?: string, endIso?: string, nowMs = Date.now
 }
 
 export function LiveTvPage() {
-  const { isAdmin } = useAuth()
+  const { isAdmin, user } = useAuth()
+  const canManageLiveTv = isAdmin || Boolean(user?.Policy?.EnableLiveTvManagement)
   const { locale, t } = useI18n()
   const queryClient = useQueryClient()
   const [searchParams, setSearchParams] = useSearchParams()
@@ -349,7 +351,8 @@ export function LiveTvPage() {
       hls = new Hls({
         enableWorker: true,
         lowLatencyMode: true,
-        xhrSetup: (xhr) => {
+        xhrSetup: (xhr, requestUrl) => {
+          if (!isSameOriginUrl(requestUrl)) return
           const storedAuth = getStoredAuth()
           xhr.setRequestHeader(
             'X-Emby-Authorization',
@@ -647,30 +650,32 @@ export function LiveTvPage() {
                         <span className="font-mono text-xs text-zinc-400">
                           {formatTimeRange(currentProgram.StartDate, currentProgram.EndDate)}
                         </span>
-                        <button
-                          type="button"
-                          disabled={
-                            schedulingProgramId === currentProgram.Id ||
-                            scheduledProgramIds.includes(currentProgram.Id)
-                          }
-                          onClick={() => createTimerMutation.mutate(currentProgram)}
-                          className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors disabled:opacity-60 ${
-                            scheduledProgramIds.includes(currentProgram.Id)
-                              ? 'border-emerald-500/35 bg-emerald-500/15 text-emerald-300'
-                              : 'border-amber-500/35 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20'
-                          }`}
-                        >
-                          {schedulingProgramId === currentProgram.Id ? (
-                            <Loader2 className="h-3 w-3 animate-spin" />
-                          ) : (
-                            <CircleDot className="h-3 w-3" />
-                          )}
-                          <span>
-                            {scheduledProgramIds.includes(currentProgram.Id)
-                              ? '已预约'
-                              : '预约录制'}
-                          </span>
-                        </button>
+                        {canManageLiveTv && (
+                          <button
+                            type="button"
+                            disabled={
+                              schedulingProgramId === currentProgram.Id ||
+                              scheduledProgramIds.includes(currentProgram.Id)
+                            }
+                            onClick={() => createTimerMutation.mutate(currentProgram)}
+                            className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors disabled:opacity-60 ${
+                              scheduledProgramIds.includes(currentProgram.Id)
+                                ? 'border-emerald-500/35 bg-emerald-500/15 text-emerald-300'
+                                : 'border-amber-500/35 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20'
+                            }`}
+                          >
+                            {schedulingProgramId === currentProgram.Id ? (
+                              <Loader2 className="h-3 w-3 animate-spin" />
+                            ) : (
+                              <CircleDot className="h-3 w-3" />
+                            )}
+                            <span>
+                              {scheduledProgramIds.includes(currentProgram.Id)
+                                ? '已预约'
+                                : '预约录制'}
+                            </span>
+                          </button>
+                        )}
                       </div>
                     </div>
                     <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
@@ -720,23 +725,25 @@ export function LiveTvPage() {
                               <span className="font-mono text-[11px] text-zinc-400">
                                 {formatTimeRange(prog.StartDate, prog.EndDate)}
                               </span>
-                              <button
-                                type="button"
-                                disabled={isScheduling || isScheduled}
-                                onClick={() => createTimerMutation.mutate(prog)}
-                                className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors disabled:opacity-60 ${
-                                  isScheduled
-                                    ? 'border-emerald-500/35 bg-emerald-500/15 text-emerald-300'
-                                    : 'border-amber-500/35 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20'
-                                }`}
-                              >
-                                {isScheduling ? (
-                                  <Loader2 className="h-3 w-3 animate-spin" />
-                                ) : (
-                                  <CircleDot className="h-3 w-3" />
-                                )}
-                                <span>{isScheduled ? '已预约' : '预约录制'}</span>
-                              </button>
+                              {canManageLiveTv && (
+                                <button
+                                  type="button"
+                                  disabled={isScheduling || isScheduled}
+                                  onClick={() => createTimerMutation.mutate(prog)}
+                                  className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors disabled:opacity-60 ${
+                                    isScheduled
+                                      ? 'border-emerald-500/35 bg-emerald-500/15 text-emerald-300'
+                                      : 'border-amber-500/35 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20'
+                                  }`}
+                                >
+                                  {isScheduling ? (
+                                    <Loader2 className="h-3 w-3 animate-spin" />
+                                  ) : (
+                                    <CircleDot className="h-3 w-3" />
+                                  )}
+                                  <span>{isScheduled ? '已预约' : '预约录制'}</span>
+                                </button>
+                              )}
                             </div>
                           </div>
                         )
@@ -885,21 +892,23 @@ export function LiveTvPage() {
                       <p className="truncate text-[11px] text-zinc-500">{timer.Overview}</p>
                     )}
                   </div>
-                  <button
-                    type="button"
-                    disabled={
-                      deleteTimerMutation.isPending && deleteTimerMutation.variables === timer.Id
-                    }
-                    onClick={() => deleteTimerMutation.mutate(timer.Id)}
-                    className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
-                  >
-                    {deleteTimerMutation.isPending && deleteTimerMutation.variables === timer.Id ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <Trash2 className="h-3.5 w-3.5" />
-                    )}
-                    <span>取消预约</span>
-                  </button>
+                  {canManageLiveTv && (
+                    <button
+                      type="button"
+                      disabled={
+                        deleteTimerMutation.isPending && deleteTimerMutation.variables === timer.Id
+                      }
+                      onClick={() => deleteTimerMutation.mutate(timer.Id)}
+                      className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
+                    >
+                      {deleteTimerMutation.isPending && deleteTimerMutation.variables === timer.Id ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Trash2 className="h-3.5 w-3.5" />
+                      )}
+                      <span>取消预约</span>
+                    </button>
+                  )}
                 </div>
               ))}
             </div>
@@ -1053,7 +1062,7 @@ export function LiveTvPage() {
                     {rec.Overview && (
                       <p className="truncate text-[11px] text-zinc-500">{rec.Overview}</p>
                     )}
-                    {rec.Path && (
+                    {isAdmin && rec.Path && (
                       <p className="truncate font-mono text-[10px] text-zinc-500" title={rec.Path}>
                         {rec.Path}
                       </p>
@@ -1073,23 +1082,25 @@ export function LiveTvPage() {
                         <span>{t('common.play')}</span>
                       </button>
                     )}
-                    <button
-                      type="button"
-                      disabled={
-                        deleteRecordingMutation.isPending &&
-                        deleteRecordingMutation.variables === rec.Id
-                      }
-                      onClick={() => deleteRecordingMutation.mutate(rec.Id)}
-                      className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
-                    >
-                      {deleteRecordingMutation.isPending &&
-                      deleteRecordingMutation.variables === rec.Id ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <Trash2 className="h-3.5 w-3.5" />
-                      )}
-                      <span>删除录制</span>
-                    </button>
+                    {isAdmin && (
+                      <button
+                        type="button"
+                        disabled={
+                          deleteRecordingMutation.isPending &&
+                          deleteRecordingMutation.variables === rec.Id
+                        }
+                        onClick={() => deleteRecordingMutation.mutate(rec.Id)}
+                        className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
+                      >
+                        {deleteRecordingMutation.isPending &&
+                        deleteRecordingMutation.variables === rec.Id ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Trash2 className="h-3.5 w-3.5" />
+                        )}
+                        <span>删除录制</span>
+                      </button>
+                    )}
                   </div>
                 </div>
               ))}

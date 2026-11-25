@@ -30,7 +30,13 @@ import {
   X,
 } from 'lucide-react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { api, buildEmbyAuthHeader, getStoredAuth, resolveApiUrl } from '../api/client'
+import {
+  api,
+  buildEmbyAuthHeader,
+  getStoredAuth,
+  isSameOriginUrl,
+  resolveApiUrl,
+} from '../api/client'
 import type { MediaSourceInfo, MediaStream } from '../api/types'
 import { AmbraLogo } from '../components/AmbraLogo'
 import { useAudioPlayer } from '../context/AudioPlayerContext'
@@ -272,6 +278,7 @@ export function PlayerPage() {
   const [querySourceId, setQuerySourceId] = useState<string | undefined>(initialMediaSourceId)
   const [audioIndex, setAudioIndex] = useState<number | undefined>(initialAudio)
   const [queryAudioIndex, setQueryAudioIndex] = useState<number | undefined>(initialAudio)
+  const [audioManuallySwitched, setAudioManuallySwitched] = useState(false)
   const [subtitleIndex, setSubtitleIndex] = useState<number | undefined>(initialSubtitle)
   const [qualityPreset, setQualityPreset] = useState<QualityPresetId>('auto')
   const [episodeIdSynced, setEpisodeIdSynced] = useState<string | undefined>(id)
@@ -369,6 +376,7 @@ export function PlayerPage() {
       setQuerySourceId(nextSourceId)
       setAudioIndex(nextAudio)
       setQueryAudioIndex(nextAudio)
+      setAudioManuallySwitched(false)
       setSubtitleIndex(nextSubtitle)
       setQualityPreset('auto')
       setShowShortcuts(false)
@@ -634,6 +642,22 @@ export function PlayerPage() {
     [audioStreams, audioIndex],
   )
 
+  const selectedAudioOrdinal = useMemo(() => {
+    if (audioIndex === undefined || audioStreams.length === 0) return undefined
+    const idx = audioStreams.findIndex((a) => a.Index === audioIndex)
+    return idx >= 0 ? idx : undefined
+  }, [audioStreams, audioIndex])
+
+  const defaultAudioStreamIndex =
+    activeSource?.DefaultAudioStreamIndex ?? audioStreams[0]?.Index
+  const isNonDefaultEmbeddedAudio =
+    audioStreams.length > 1 &&
+    audioIndex !== undefined &&
+    defaultAudioStreamIndex !== undefined &&
+    audioIndex !== defaultAudioStreamIndex &&
+    !activeAudioStream?.IsExternal
+  const needsTrackSwitchRemux = audioManuallySwitched && isNonDefaultEmbeddedAudio
+
   // 播放策略规划：
   // 1) 原生兼容容器 (mp4/m4v/webm/mov) 且音轨原生兼容 -> DirectPlay
   // 2) 非原生 MKV 且浏览器 MSE 支持对应音视频编码 -> Stream MKV (MSE)（Range 分块流式解复用，支持 GB 级大文件）
@@ -685,7 +709,7 @@ export function PlayerPage() {
     )
 
     const hlsUrl =
-      qualityPreset !== 'auto'
+      qualityPreset !== 'auto' || needsTrackSwitchRemux
         ? fallbackMasterHlsUrl
         : activeSource.TranscodingUrl
           ? resolveApiUrl(activeSource.TranscodingUrl)
@@ -714,7 +738,7 @@ export function PlayerPage() {
     }
 
     // 0. STRM 直连失败后，先尝试服务端反代直出 (&proxy=1，支持 Range)
-    if (useProxyDirect && isStrm) {
+    if (useProxyDirect && isStrm && !needsTrackSwitchRemux) {
       return {
         strategy: 'proxy-direct' as const,
         directUrl,
@@ -727,8 +751,8 @@ export function PlayerPage() {
       }
     }
 
-    // 1. 原生兼容容器 + 原生兼容音轨 -> DirectPlay
-    if (!requiresRemux && activeSource.SupportsDirectPlay !== false) {
+    // 1. 原生兼容容器 + 原生兼容音轨（且未显式切换非默认内封音轨）-> DirectPlay
+    if (!requiresRemux && !needsTrackSwitchRemux && activeSource.SupportsDirectPlay !== false) {
       return {
         strategy: 'direct' as const,
         directUrl,
@@ -741,8 +765,8 @@ export function PlayerPage() {
       }
     }
 
-    // 2. 非原生 MKV 且浏览器 MSE 支持该音视频编码 -> 优先流式 Range + MSE（无体积上限，支持 GB 级 MKV）
-    if (requiresRemux && preferWasmRemux && mkvStreamEligible) {
+    // 2. 非原生 MKV 或显式切换内封音轨的 MKV 且浏览器 MSE 支持该音视频编码 -> 优先流式 Range + MSE（支持指定音轨）
+    if ((requiresRemux || needsTrackSwitchRemux) && preferWasmRemux && mkvStreamEligible) {
       return {
         strategy: 'stream-mkv' as const,
         directUrl,
@@ -752,6 +776,20 @@ export function PlayerPage() {
         requiresRemux,
         withinWasmThreshold,
         skipReason: null as string | null,
+      }
+    }
+
+    // 2.5 用户显式切换静态 DirectPlay 容器（如 MP4）的非默认内封音轨 -> 切换服务端 HLS 精准选轨
+    if (needsTrackSwitchRemux && !requiresRemux) {
+      return {
+        strategy: 'hls' as const,
+        directUrl,
+        proxyDirectUrl,
+        hlsUrl,
+        isStrm,
+        requiresRemux,
+        withinWasmThreshold,
+        skipReason: '切换非默认内封音轨，已自动使用 HLS 音轨流',
       }
     }
 
@@ -807,6 +845,7 @@ export function PlayerPage() {
     useProxyDirect,
     forceServerHls,
     qualityPreset,
+    needsTrackSwitchRemux,
   ])
 
   // 挂载视频流 (DirectPlay / Stream MKV (MSE) / Client WASM Remux / Server HLS 自动降级)
@@ -869,7 +908,10 @@ export function PlayerPage() {
       })
     }
 
-    const buildAuthHeaders = (): Record<string, string> => {
+    const buildAuthHeaders = (targetUrl: string): Record<string, string> => {
+      if (!isSameOriginUrl(targetUrl)) {
+        return {}
+      }
       const storedAuth = getStoredAuth()
       const headers: Record<string, string> = {
         'X-Emby-Authorization': buildEmbyAuthHeader(storedAuth?.accessToken),
@@ -896,8 +938,9 @@ export function PlayerPage() {
         const hls = new Hls({
           enableWorker: true,
           lowLatencyMode: false,
-          xhrSetup: (xhr) => {
-            const headers = buildAuthHeaders()
+          xhrSetup: (xhr, requestUrl) => {
+            if (!isSameOriginUrl(requestUrl)) return
+            const headers = buildAuthHeaders(requestUrl)
             Object.entries(headers).forEach(([k, v]) => {
               xhr.setRequestHeader(k, v)
             })
@@ -945,10 +988,11 @@ export function PlayerPage() {
       wasmRemuxerRef.current = remuxer
 
       void remuxer
-        .remuxToMP4(streamPlan.directUrl, buildAuthHeaders(), {
+        .remuxToMP4(streamPlan.directUrl, buildAuthHeaders(streamPlan.directUrl), {
           maxBytes: DEFAULT_WASM_MAX_BYTES,
           knownSizeBytes: activeSource?.Size,
           container: activeSource?.Container,
+          audioStreamIndex: selectedAudioOrdinal,
           signal: abortController.signal,
           onProgress: (stage, percent, detail) => {
             if (cancelled) return
@@ -1027,7 +1071,8 @@ export function PlayerPage() {
       streamMkvRef.current = streamMkv
 
       void streamMkv
-        .attach(video, streamPlan.directUrl, buildAuthHeaders(), {
+        .attach(video, streamPlan.directUrl, buildAuthHeaders(streamPlan.directUrl), {
+          audioTrackIndex: selectedAudioOrdinal,
           signal: abortController.signal,
           onError: (err) => {
             fallbackFromStreamMkv(err.message || '流式 MKV 解复用异常')
@@ -1081,14 +1126,17 @@ export function PlayerPage() {
     useProxyDirect,
     forceServerHls,
     preferWasmRemux,
+    selectedAudioOrdinal,
     retryNonce,
   ])
 
-  // 构建外挂字幕直出 URL
+  // 构建外挂字幕直出 URL（仅同源附加 api_key，跨域字幕不泄露会话令牌）
   const resolveSubtitleUrl = useCallback(
     (stream: MediaStream): string => {
       if (stream.DeliveryUrl) {
-        return resolveApiUrl(stream.DeliveryUrl)
+        return isSameOriginUrl(stream.DeliveryUrl)
+          ? resolveApiUrl(stream.DeliveryUrl)
+          : stream.DeliveryUrl
       }
       const ext =
         detectSubtitleEngine(stream) === 'ass'
@@ -1143,10 +1191,12 @@ export function PlayerPage() {
           if (cancelled || !videoRef.current || !assCanvasRef.current) return
           const fontUrls = attachments.map((att) => {
             const rawPath =
-              att.Url.startsWith('/emby/') || /^https?:\/\//i.test(att.Url)
+              att.Url.startsWith('/emby/') ||
+              /^https?:\/\//i.test(att.Url) ||
+              att.Url.startsWith('//')
                 ? att.Url
                 : `/emby${att.Url.startsWith('/') ? '' : '/'}${att.Url}`
-            return resolveApiUrl(rawPath)
+            return isSameOriginUrl(rawPath) ? resolveApiUrl(rawPath) : rawPath
           })
           setLoadedFontCount(fontUrls.length)
 
@@ -1534,6 +1584,7 @@ export function PlayerPage() {
     const curPos = audioStreams.findIndex((a) => a.Index === audioIndex)
     const next = audioStreams[(curPos + 1) % audioStreams.length]
     captureResumePosition()
+    setAudioManuallySwitched(true)
     setAudioIndex(next.Index)
     setQueryAudioIndex(next.Index)
     pokeOsd()
@@ -2405,6 +2456,7 @@ export function PlayerPage() {
                               initializedSubSourceIdRef.current = null
                               setSelectedSourceId(src.Id)
                               setQuerySourceId(src.Id)
+                              setAudioManuallySwitched(false)
                               setAudioIndex(undefined)
                               setQueryAudioIndex(undefined)
                               setSubtitleIndex(undefined)
@@ -2507,6 +2559,7 @@ export function PlayerPage() {
                           type="button"
                           onClick={() => {
                             captureResumePosition()
+                            setAudioManuallySwitched(true)
                             setAudioIndex(a.Index)
                             setQueryAudioIndex(a.Index)
                             setActivePanel('none')

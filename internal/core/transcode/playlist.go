@@ -86,7 +86,11 @@ func BuildMasterPlaylist(p PlaylistParams) string {
 
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n")
-	b.WriteString("#EXT-X-VERSION:3\n")
+	if ext := normalizeSegmentExt(p.SegmentContainer); ext == "mp4" || ext == "m4s" {
+		b.WriteString("#EXT-X-VERSION:7\n")
+	} else {
+		b.WriteString("#EXT-X-VERSION:3\n")
+	}
 	for _, sub := range p.Subtitles {
 		name := strings.TrimSpace(sub.Title)
 		if name == "" {
@@ -192,12 +196,21 @@ func BuildMediaPlaylist(p PlaylistParams) string {
 	durs := SegmentDurations(durSec, segDur)
 	queryStr := encodeQuery(p.Query)
 
+	isFMP4 := ext == "mp4" || ext == "m4s"
+
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n")
-	b.WriteString("#EXT-X-VERSION:3\n")
+	if isFMP4 {
+		b.WriteString("#EXT-X-VERSION:7\n")
+	} else {
+		b.WriteString("#EXT-X-VERSION:3\n")
+	}
 	b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", segDur))
 	b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
 	b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
+	if isFMP4 {
+		b.WriteString("#EXT-X-MAP:URI=\"init.mp4\"\n")
+	}
 
 	for idx, d := range durs {
 		b.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", d))

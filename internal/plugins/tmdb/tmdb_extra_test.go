@@ -84,6 +84,7 @@ func TestTMDBMovieExtraBranches(t *testing.T) {
 	defer srv.Close()
 
 	p := New("k", "zh-CN")
+	p.SetHTTPClient(srv.Client())
 	_ = p.Configure(map[string]any{"base_url": srv.URL})
 	ctx := context.Background()
 
@@ -176,6 +177,7 @@ func TestTMDBSeriesAndEpisode(t *testing.T) {
 	defer srv.Close()
 
 	p := New("k", "zh-CN")
+	p.SetHTTPClient(srv.Client())
 	_ = p.Configure(map[string]any{"base_url": srv.URL})
 	ctx := context.Background()
 
@@ -249,6 +251,7 @@ func TestTMDBSeriesAndEpisode(t *testing.T) {
 
 	srvClosed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	srvClosed.Close()
+	pBad.SetHTTPClient(srvClosed.Client())
 	_ = pBad.Configure(map[string]any{"base_url": srvClosed.URL})
 	if _, err := pBad.FetchMetadata(ctx, plugins.MediaQuery{ItemType: "Movie", ProviderIDs: map[string]string{"tmdb": "1"}}); err == nil {
 		t.Fatalf("expected error for closed server")

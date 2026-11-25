@@ -18,6 +18,9 @@ type M3UChannel struct {
 	URL        string `json:"Url"`
 }
 
+// maxM3UChannels caps the number of channels parsed from a single M3U playlist to prevent OOM.
+const maxM3UChannels = 20000
+
 // ParseM3U parses an M3U/M3U8 playlist from r and extracts channel metadata and stream URLs.
 func ParseM3U(r io.Reader) ([]M3UChannel, error) {
 	scanner := bufio.NewScanner(r)
@@ -29,6 +32,9 @@ func ParseM3U(r io.Reader) ([]M3UChannel, error) {
 	autoNum := 1
 
 	for scanner.Scan() {
+		if len(channels) >= maxM3UChannels {
+			break
+		}
 		line := strings.TrimSpace(scanner.Text())
 		line = strings.TrimPrefix(line, "\uFEFF") // Strip UTF-8 BOM if present.
 		if line == "" {

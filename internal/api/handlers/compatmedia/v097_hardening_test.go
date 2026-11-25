@@ -195,11 +195,17 @@ func TestCompatMediaV097HardeningAndParity(t *testing.T) {
 			}
 		}
 	}
-	// Allowed item succeeds for alice
-	for _, suffix := range []string{"/Images", "/Ancestors", "/DeleteInfo", "/ExternalIdInfos", "/RemoteImages"} {
+	// Allowed item succeeds for alice (except admin-only DeleteInfo)
+	for _, suffix := range []string{"/Images", "/Ancestors", "/ExternalIdInfos", "/RemoteImages"} {
 		if rec := call(aliceAuth.AccessToken, http.MethodGet, "/Items/"+movieSafe.ID+suffix, ""); rec.Code != http.StatusOK {
 			t.Fatalf("expected 200 for alice GET /Items/%s%s, got %d", movieSafe.ID, suffix, rec.Code)
 		}
+	}
+	if rec := call(aliceAuth.AccessToken, http.MethodGet, "/Items/"+movieSafe.ID+"/DeleteInfo", ""); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-admin alice GET /Items/%s/DeleteInfo, got %d", movieSafe.ID, rec.Code)
+	}
+	if rec := call(adminAuth.AccessToken, http.MethodGet, "/Items/"+movieSafe.ID+"/DeleteInfo", ""); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for admin GET /Items/%s/DeleteInfo, got %d", movieSafe.ID, rec.Code)
 	}
 
 	// 3. GET /Shows/Upcoming: only future episodes, respecting AllowedLibraryIDs + parental policy

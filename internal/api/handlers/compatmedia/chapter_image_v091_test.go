@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/imaging"
 	"github.com/ambra-media/ambra/internal/core/transcode"
@@ -84,8 +85,19 @@ func TestHandleServeItemImageFullChapterLazyExtraction(t *testing.T) {
 	h.SetExtractor(transcode.NewExtractor(cfg))
 	router := h.BuildRouter(AuthFuncs{})
 
-	// Request full Emby image route for Chapter index 0 (not yet in DB).
+	// Unauthenticated request must NOT trigger chapter extraction (returns 404).
+	unauthReq := httptest.NewRequest(http.MethodGet, "/Items/"+movie.ID+"/Images/Chapter/0/tag123/jpg/320/180/0/0", nil)
+	unauthRec := httptest.NewRecorder()
+	router.ServeHTTP(unauthRec, unauthReq)
+	if unauthRec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unauthenticated chapter extraction, got %d", unauthRec.Code)
+	}
+
+	adminCtx := &middleware.AuthContext{User: &sqlite.UserRecord{ID: guid.New(), Name: "admin", IsAdmin: true}}
+
+	// Authenticated request for full Emby image route for Chapter index 0 (not yet in DB).
 	req := httptest.NewRequest(http.MethodGet, "/Items/"+movie.ID+"/Images/Chapter/0/tag123/jpg/320/180/0/0", nil)
+	req = req.WithContext(middleware.WithAuthContext(req.Context(), adminCtx))
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -108,6 +120,7 @@ func TestHandleServeItemImageFullChapterLazyExtraction(t *testing.T) {
 	// Delete the extracted file on disk to verify missing-on-disk fallback re-extracts cleanly.
 	_ = os.Remove(imgRec.Path)
 	req2 := httptest.NewRequest(http.MethodGet, "/Items/"+movie.ID+"/Images/Chapter/0/tag123/jpg/320/180/0/0", nil)
+	req2 = req2.WithContext(middleware.WithAuthContext(req2.Context(), adminCtx))
 	rec2 := httptest.NewRecorder()
 	router.ServeHTTP(rec2, req2)
 	if rec2.Code != http.StatusOK {

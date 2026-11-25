@@ -23,7 +23,8 @@ var gzipWriterPool = sync.Pool{
 // already-encoded responses, and binary/media content types (video/*, audio/*, raster images, octet-stream).
 func Gzip(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !acceptsGzip(r.Header.Get("Accept-Encoding")) ||
+		if r.Method == http.MethodHead ||
+			!acceptsGzip(r.Header.Get("Accept-Encoding")) ||
 			r.Header.Get("Upgrade") != "" ||
 			r.Header.Get("Range") != "" {
 			next.ServeHTTP(w, r)

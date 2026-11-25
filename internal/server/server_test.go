@@ -4,12 +4,16 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/core/scheduler"
+	"github.com/ambra-media/ambra/internal/pkg/eventbus"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -322,5 +326,273 @@ func TestServerLiveTVAndDVRWiring(t *testing.T) {
 	srv.Handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || rec.Body.String() != "E2E_LIVE_STREAM" {
 		t.Fatalf("compat stream proxy: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestServerSecurityOptionsAndHardening(t *testing.T) {
+	t.Cleanup(func() { netutil.SetTrustedProxies(nil) })
+
+	// 1. EnableDLNA=false disables SSDP broadcaster; TrustedProxies wires into netutil
+	dataDir := t.TempDir()
+	cfg, err := config.Load(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.EnableDLNA = false
+	cfg.TrustedProxies = []string{"198.51.100.7"}
+
+	srv, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("server.New with EnableDLNA=false failed: %v", err)
+	}
+	if srv.SSDP != nil {
+		_ = srv.Close()
+		t.Fatal("expected srv.SSDP to be nil when EnableDLNA=false")
+	}
+	if !netutil.IsTrustedProxyIP(netip.MustParseAddr("198.51.100.7")) {
+		_ = srv.Close()
+		t.Fatal("expected TrustedProxies to be applied to netutil")
+	}
+	if netutil.IsTrustedProxyIP(netip.MustParseAddr("127.0.0.1")) {
+		_ = srv.Close()
+		t.Fatal("expected custom TrustedProxies allowlist to exclude 127.0.0.1")
+	}
+
+	// Exercise /web redirect, /favicon.svg, EventLibraryChanged callback, scheduler trigger persistence & library watcher preload
+	rec := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/web", nil))
+	if rec.Code != http.StatusMovedPermanently {
+		t.Fatalf("expected 301 for /web, got %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/favicon.svg", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for /favicon.svg, got %d", rec.Code)
+	}
+
+	srv.Bus.Publish(context.Background(), eventbus.Event{Type: eventbus.EventLibraryChanged})
+
+	libRepo := sqlite.NewLibraryRepo(srv.Store)
+	if _, err := libRepo.CreateLibrary(context.Background(), "Movies", "movies", []string{t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	interval := int64(3600 * 10_000_000)
+	tasks := srv.Scheduler.List(true)
+	if len(tasks) > 0 {
+		if err := srv.Scheduler.SetTriggers(tasks[0].Id, []scheduler.TaskTriggerInfo{
+			{Type: "IntervalTrigger", IntervalTicks: &interval},
+		}); err != nil {
+			t.Fatalf("SetTriggers failed: %v", err)
+		}
+	}
+	if err := srv.Close(); err != nil {
+		t.Fatalf("srv.Close: %v", err)
+	}
+
+	// Boot a second Server against the same dataDir to exercise persisted trigger loading & pre-existing library watching
+	cfg.EnableDLNA = true
+	srv2, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("second server.New failed: %v", err)
+	}
+	if srv2.SSDP == nil {
+		_ = srv2.Close()
+		t.Fatal("expected srv2.SSDP initialized when EnableDLNA=true")
+	}
+
+	// Trigger RefreshLibrary task (exercises ScanAll + OnScanComplete + ApplyTagsToLibrary)
+	for _, tk := range srv2.Scheduler.List(true) {
+		if tk.Key == "RefreshLibrary" {
+			if err := srv2.Scheduler.Run(tk.Id); err != nil {
+				t.Fatalf("Run RefreshLibrary: %v", err)
+			}
+			srv2.Scheduler.Wait(tk.Id)
+		}
+	}
+
+	// Exercise TaskStopper callback via compatCore DELETE /ScheduledTasks/Running/{id}
+	apiKey, err := srv2.Auth.CreateAPIKey(context.Background(), "admin-ops")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopReq := httptest.NewRequest(http.MethodDelete, "/ScheduledTasks/Running/nonexistent-task", nil)
+	stopReq.Header.Set("X-Emby-Token", apiKey.Token)
+	rec = httptest.NewRecorder()
+	srv2.Handler.ServeHTTP(rec, stopReq)
+
+	// Exercise resolveStreamURL closure via Audio STRM item request
+	strmFile := filepath.Join(t.TempDir(), "track.strm")
+	_ = os.WriteFile(strmFile, []byte("http://127.0.0.1:1/test.mp3\n"), 0o644)
+	libRepo2 := sqlite.NewLibraryRepo(srv2.Store)
+	audioItem := &sqlite.ItemRecord{
+		ID:        "strmaudio00000000000000000000001",
+		LibraryID: "music-lib",
+		Type:      "Audio",
+		MediaType: "Audio",
+		IsStrm:    true,
+		Name:      "STRM Song",
+		Container: "strm",
+		Path:      strmFile,
+	}
+	_ = libRepo2.UpsertItem(context.Background(), audioItem)
+	audioReq := httptest.NewRequest(http.MethodGet, "/Audio/"+audioItem.ID+"/stream?Static=true", nil)
+	audioReq.Header.Set("X-Emby-Token", apiKey.Token)
+	rec = httptest.NewRecorder()
+	srv2.Handler.ServeHTTP(rec, audioReq)
+
+	// Corrupt scheduler:triggers JSON and boot a third Server to cover LoadPersistedTriggers warn path
+	_, _ = srv2.Store.Writer.ExecContext(context.Background(),
+		`UPDATE server_config SET value_json = '{corrupt-json' WHERE key = 'scheduler:triggers'`)
+	_ = srv2.Close()
+
+	srv3, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("third server.New with corrupt triggers should warn and boot, got %v", err)
+	}
+	_ = srv3.Close()
+
+	// Closing a zero-value Server with nil Store returns nil cleanly
+	var emptySrv Server
+	if err := emptySrv.Close(); err != nil {
+		t.Fatalf("emptySrv.Close: %v", err)
+	}
+}
+
+func TestApplyPendingDatabaseRestoreSymlinkAndSidecars(t *testing.T) {
+	// 1. Empty args are no-op
+	if err := applyPendingDatabaseRestore("", "/tmp/x.db"); err != nil {
+		t.Fatalf("expected nil for empty dataDir, got %v", err)
+	}
+	if err := applyPendingDatabaseRestore(t.TempDir(), ""); err != nil {
+		t.Fatalf("expected nil for empty dbPath, got %v", err)
+	}
+
+	// 2. Symlink ambra.db.restore pointing to a valid SQLite file MUST be rejected
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "ambra.db")
+	if err := os.WriteFile(dbPath, []byte("original-db-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	externalSQLite := filepath.Join(t.TempDir(), "external.db")
+	extStore, err := sqlite.Open(externalSQLite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = extStore.Close()
+
+	restoreLink := filepath.Join(dataDir, "ambra.db.restore")
+	if err := os.Symlink(externalSQLite, restoreLink); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyPendingDatabaseRestore(dataDir, dbPath); err != nil {
+		t.Fatalf("expected symlink restore ignored without error, got %v", err)
+	}
+	got, _ := os.ReadFile(dbPath)
+	if string(got) != "original-db-content" {
+		t.Fatalf("expected original DB untouched when restore is a symlink, got %q", string(got))
+	}
+	_ = os.Remove(restoreLink)
+
+	// 3. Truncated (<16 bytes) restore file ignored
+	if err := os.WriteFile(restoreLink, []byte("SQLite"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyPendingDatabaseRestore(dataDir, dbPath); err != nil {
+		t.Fatalf("expected short restore ignored, got %v", err)
+	}
+	_ = os.Remove(restoreLink)
+
+	// 4. Valid restore preserves WAL and SHM sidecars alongside .pre-restore.bak
+	seedBytes, err := os.ReadFile(externalSQLite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(restoreLink, seedBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dbPath+"-wal", []byte("orig-wal-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dbPath+"-shm", []byte("orig-shm-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyPendingDatabaseRestore(dataDir, dbPath); err != nil {
+		t.Fatalf("applyPendingDatabaseRestore failed: %v", err)
+	}
+	walBak, err := os.ReadFile(dbPath + ".pre-restore.bak-wal")
+	if err != nil || string(walBak) != "orig-wal-bytes" {
+		t.Fatalf("expected WAL backup preserved, data=%q err=%v", string(walBak), err)
+	}
+	shmBak, err := os.ReadFile(dbPath + ".pre-restore.bak-shm")
+	if err != nil || string(shmBak) != "orig-shm-bytes" {
+		t.Fatalf("expected SHM backup preserved, data=%q err=%v", string(shmBak), err)
+	}
+	if _, err := os.Stat(dbPath + "-wal"); !os.IsNotExist(err) {
+		t.Fatalf("expected original -wal moved to backup, stat err=%v", err)
+	}
+
+	// 5. Promote restore when no existing DB exists yet
+	freshDir := t.TempDir()
+	freshDB := filepath.Join(freshDir, "ambra.db")
+	if err := os.WriteFile(filepath.Join(freshDir, "ambra.db.restore"), seedBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyPendingDatabaseRestore(freshDir, freshDB); err != nil {
+		t.Fatalf("applyPendingDatabaseRestore fresh failed: %v", err)
+	}
+	if _, err := os.Stat(freshDB); err != nil {
+		t.Fatalf("expected fresh DB promoted, err=%v", err)
+	}
+
+	// 6. Backup rename failure returns error (backupPath is a non-empty directory)
+	failDir := t.TempDir()
+	failDB := filepath.Join(failDir, "ambra.db")
+	_ = os.WriteFile(failDB, []byte("old"), 0o644)
+	_ = os.WriteFile(filepath.Join(failDir, "ambra.db.restore"), seedBytes, 0o644)
+	_ = os.MkdirAll(filepath.Join(failDB+".pre-restore.bak", "blocker"), 0o755)
+	if err := applyPendingDatabaseRestore(failDir, failDB); err == nil {
+		t.Fatal("expected error when backup rename is blocked by non-empty directory")
+	}
+	// And server.New propagates applyPendingDatabaseRestore failure
+	cfgFail := config.Default(failDir)
+	if _, err := New(context.Background(), cfgFail); err == nil {
+		t.Fatal("expected server.New to fail when pending restore fails")
+	}
+
+	// 7. Error paths in applyPendingDatabaseRestore:
+	// 7a. dataDir is a regular file -> Lstat ENOTDIR error
+	notDirFile := filepath.Join(t.TempDir(), "not-a-dir")
+	_ = os.WriteFile(notDirFile, []byte("x"), 0o644)
+	if err := applyPendingDatabaseRestore(notDirFile, filepath.Join(t.TempDir(), "ambra.db")); err == nil {
+		t.Fatal("expected Lstat error when dataDir is a regular file")
+	}
+
+	// 7b. Unreadable restore file -> os.Open fails and is ignored
+	unreadableDir := t.TempDir()
+	unreadableRestore := filepath.Join(unreadableDir, "ambra.db.restore")
+	_ = os.WriteFile(unreadableRestore, seedBytes, 0o000)
+	t.Cleanup(func() { _ = os.Chmod(unreadableRestore, 0o644) })
+	if err := applyPendingDatabaseRestore(unreadableDir, filepath.Join(unreadableDir, "ambra.db")); err != nil {
+		t.Fatalf("expected unreadable restore ignored without error, got %v", err)
+	}
+
+	// 7c. dbPath parent is a regular file -> os.Stat(dbPath) returns ENOTDIR error
+	statErrDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(statErrDir, "ambra.db.restore"), seedBytes, 0o644)
+	if err := applyPendingDatabaseRestore(statErrDir, filepath.Join(notDirFile, "ambra.db")); err == nil {
+		t.Fatal("expected stat existing db error when dbPath parent is a regular file")
+	}
+
+	// 7d. Promote rename failure when dbPath parent directory does not exist
+	if err := applyPendingDatabaseRestore(statErrDir, filepath.Join(t.TempDir(), "missing-parent", "ambra.db")); err == nil {
+		t.Fatal("expected promote rename error when dbPath parent does not exist")
+	}
+
+	// 8. buildWebHandler with non-existent dir and explicit /index.html request
+	h := buildWebHandler(filepath.Join(t.TempDir(), "does-not-exist"))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/index.html", nil))
+	if rec.Code != http.StatusOK && rec.Code != http.StatusMovedPermanently {
+		t.Fatalf("expected 200 or 301 for /index.html, got %d", rec.Code)
 	}
 }

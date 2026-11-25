@@ -1,7 +1,6 @@
 package ops
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -92,16 +91,13 @@ func (h *Handler) handleGetStartupConfig(w http.ResponseWriter, r *http.Request)
 
 func (h *Handler) handleUpdateStartupConfig(w http.ResponseWriter, r *http.Request) {
 	var req StartupConfiguration
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid startup configuration payload")
 		return
 	}
 	h.mu.Lock()
 	if req.ServerName != "" {
 		h.state.Startup.ServerName = req.ServerName
-		if h.cfg != nil {
-			h.cfg.ServerName = req.ServerName
-		}
 	}
 	if req.UICulture != "" {
 		h.state.Startup.UICulture = req.UICulture
@@ -111,11 +107,18 @@ func (h *Handler) handleUpdateStartupConfig(w http.ResponseWriter, r *http.Reque
 	}
 	if req.PreferredMetadataLanguage != "" {
 		h.state.Startup.PreferredMetadataLanguage = req.PreferredMetadataLanguage
-		if h.cfg != nil {
-			h.cfg.TMDBLanguage = req.PreferredMetadataLanguage
-		}
 	}
-	h.saveStateLocked(r.Context())
+	if h.cfg != nil {
+		h.cfg.Update(func(c *config.Config) {
+			if req.ServerName != "" {
+				c.ServerName = req.ServerName
+			}
+			if req.PreferredMetadataLanguage != "" {
+				c.TMDBLanguage = req.PreferredMetadataLanguage
+			}
+		})
+	}
+	_ = h.saveStateLocked(r.Context())
 	if h.cfg != nil {
 		_ = h.cfg.Save()
 	}
@@ -141,13 +144,17 @@ func (h *Handler) handleUpdateStartupUser(w http.ResponseWriter, r *http.Request
 		Name     string `json:"Name"`
 		Password string `json:"Password"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid startup user payload")
 		return
 	}
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
 		httpx.Error(w, http.StatusBadRequest, "username is required")
+		return
+	}
+	if strings.TrimSpace(req.Password) == "" {
+		httpx.Error(w, http.StatusBadRequest, "password is required")
 		return
 	}
 
@@ -184,22 +191,22 @@ func (h *Handler) handleUpdateStartupUser(w http.ResponseWriter, r *http.Request
 	h.mu.Lock()
 	h.state.StartupUser = StartupUserState{
 		Name:        name,
-		HasPassword: req.Password != "",
+		HasPassword: true,
 	}
-	h.saveStateLocked(r.Context())
+	_ = h.saveStateLocked(r.Context())
 	h.mu.Unlock()
 	httpx.NoContent(w)
 }
 
 func (h *Handler) handleUpdateRemoteAccess(w http.ResponseWriter, r *http.Request) {
 	var req RemoteAccessConfig
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid remote access payload")
 		return
 	}
 	h.mu.Lock()
 	h.state.RemoteAccess = req
-	h.saveStateLocked(r.Context())
+	_ = h.saveStateLocked(r.Context())
 	h.mu.Unlock()
 	httpx.NoContent(w)
 }
@@ -207,10 +214,12 @@ func (h *Handler) handleUpdateRemoteAccess(w http.ResponseWriter, r *http.Reques
 func (h *Handler) handleStartupComplete(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	if h.cfg != nil {
-		h.cfg.IsStartupWizardCompleted = true
+		h.cfg.Update(func(c *config.Config) {
+			c.IsStartupWizardCompleted = true
+		})
 		_ = h.cfg.Save()
 	}
-	h.saveStateLocked(r.Context())
+	_ = h.saveStateLocked(r.Context())
 	h.mu.Unlock()
 	httpx.NoContent(w)
 }

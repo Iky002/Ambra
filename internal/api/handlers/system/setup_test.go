@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -387,8 +388,12 @@ func TestUpdateConfigurationHotReloadsTMDB(t *testing.T) {
 }
 
 func TestSetupErrorPaths(t *testing.T) {
-	// 1. cfg.Save() failure in SetupAdmin & CompleteSetup
-	badDir := filepath.Join(t.TempDir(), "missing", "nested")
+	// 1. cfg.Save() failure in SetupAdmin & CompleteSetup (parent path is a regular file)
+	blockingFile := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blockingFile, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	badDir := filepath.Join(blockingFile, "nested")
 	badCfg := config.Default(badDir)
 	store, err := sqlite.Open(filepath.Join(t.TempDir(), "err.db"))
 	if err != nil {
@@ -412,19 +417,28 @@ func TestSetupErrorPaths(t *testing.T) {
 		t.Fatalf("expected 500 on CompleteSetup Save failure, got %d", rec.Code)
 	}
 
-	// 2. Existing user with nil h.userRepo -> 500
+	// 2. Existing user: unauthenticated -> 403; authenticated admin with nil h.userRepo -> 500
 	goodCfg, err := config.Load(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := authSvc.CreateUser(context.Background(), "dupadmin", "oldpass", true); err != nil {
+	dupUser, err := authSvc.CreateUser(context.Background(), "dupadmin", "oldpass", true)
+	if err != nil {
 		t.Fatal(err)
 	}
 	hNilRepo := NewHandler(goodCfg, nil, nil).WithSetupDeps(SetupDeps{Auth: authSvc})
 	rec = httptest.NewRecorder()
 	hNilRepo.SetupAdmin(rec, httptest.NewRequest(http.MethodPost, "/api/setup/admin", bytes.NewBufferString(`{"username":"dupadmin","password":"newpassword"}`)))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for unauthenticated duplicate user on nil userRepo, got %d", rec.Code)
+	}
+
+	adminReq := httptest.NewRequest(http.MethodPost, "/api/setup/admin", bytes.NewBufferString(`{"username":"dupadmin","password":"newpassword"}`))
+	adminReq = adminReq.WithContext(middleware.WithAuthContext(adminReq.Context(), &middleware.AuthContext{User: dupUser}))
+	rec = httptest.NewRecorder()
+	hNilRepo.SetupAdmin(rec, adminReq)
 	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500 when userRepo is nil on existing user, got %d", rec.Code)
+		t.Fatalf("expected 500 when userRepo is nil on authenticated admin existing user, got %d", rec.Code)
 	}
 
 	// 3. Closed DB error on CreateUser -> 500
