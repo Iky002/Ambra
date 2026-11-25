@@ -72,6 +72,10 @@ func TestAmbraEndToEndEmbyCompatibility(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = srv.Close() }()
+	// Keep offline E2E scan deterministic without hitting live TMDB API via built-in fallback key.
+	if p, ok := srv.Registry.Get("ambra.builtin.tmdb"); ok {
+		_ = p.Configure(map[string]any{"enabled": false})
+	}
 
 	ts := httptest.NewServer(srv.Handler)
 	defer ts.Close()

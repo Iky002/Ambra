@@ -115,7 +115,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	registry := plugins.NewRegistry()
 	// Register built-in official plugins
 	registry.Register(nfo.New())
-	registry.Register(tmdb.New(cfg.TMDBApiKey, cfg.TMDBLanguage))
+	registry.Register(tmdb.New(cfg.TMDBApiKey, cfg.TMDBLanguage).WithDefaultAPIKey(config.DefaultTMDBApiKey))
 	registry.Register(tvdb.New())
 	registry.Register(strm.New(cfg.EnableSTRM302))
 	traktPlugin := trakt.New()
@@ -164,7 +164,10 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		}
 	}
 	rankingsSvc := rankings.New(store, bus, rankings.Options{
-		TMDBAPIKey: cfg.TMDBApiKey,
+		TMDBAPIKeyFunc: func() string {
+			return cfg.Snapshot().TMDBApiKey
+		},
+		DefaultTMDBAPIKey: config.DefaultTMDBApiKey,
 	})
 	_ = rankingsSvc.LoadCache(ctx)
 	sc.SetOnScanComplete(func(c context.Context, _ string, _ scanner.ScanStats) {

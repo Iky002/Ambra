@@ -377,3 +377,89 @@ func TestTMDBV4BearerLogoAndOfficialRating(t *testing.T) {
 		t.Fatalf("expected disabled FetchImages to skip, got (%v, %v)", imgs, err)
 	}
 }
+
+func TestTMDBDefaultAPIKeyFallbackAndOverride(t *testing.T) {
+	var seenKeys []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenKeys = append(seenKeys, r.URL.Query().Get("api_key"))
+		if r.URL.Path == "/movie/550" {
+			_, _ = w.Write([]byte(`{"id":550,"title":"搏击俱乐部","original_title":"Fight Club","release_date":"1999-10-15"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	// 1. No user key -> uses built-in defaultAPIKey
+	p := New("", "zh-CN").WithDefaultAPIKey("builtin-default-tmdb-key")
+	p.SetHTTPClient(srv.Client())
+	if err := p.Configure(map[string]any{"base_url": srv.URL}); err != nil {
+		t.Fatalf("Configure base_url: %v", err)
+	}
+	res, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
+		ItemType:    "Movie",
+		ProviderIDs: map[string]string{"tmdb": "550"},
+	})
+	if err != nil || res == nil || res.Name != "搏击俱乐部" {
+		t.Fatalf("expected metadata fetch via default key, got res=%+v err=%v", res, err)
+	}
+	if len(seenKeys) != 1 || seenKeys[0] != "builtin-default-tmdb-key" {
+		t.Fatalf("expected default api_key sent, got %v", seenKeys)
+	}
+
+	// 2. User sets custom api_key -> overrides built-in default
+	if err := p.Configure(map[string]any{"api_key": "user-custom-key"}); err != nil {
+		t.Fatalf("Configure custom key: %v", err)
+	}
+	if _, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
+		ItemType:    "Movie",
+		ProviderIDs: map[string]string{"tmdb": "550"},
+	}); err != nil {
+		t.Fatalf("FetchMetadata with custom key: %v", err)
+	}
+	if len(seenKeys) != 2 || seenKeys[1] != "user-custom-key" {
+		t.Fatalf("expected user-custom-key sent, got %v", seenKeys)
+	}
+
+	// 3. User sets PascalCase ApiKey (e.g. via plugin admin) -> also overrides
+	if err := p.Configure(map[string]any{"ApiKey": "pascal-custom-key"}); err != nil {
+		t.Fatalf("Configure ApiKey: %v", err)
+	}
+	if _, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
+		ItemType:    "Movie",
+		ProviderIDs: map[string]string{"tmdb": "550"},
+	}); err != nil {
+		t.Fatalf("FetchMetadata with PascalCase key: %v", err)
+	}
+	if len(seenKeys) != 3 || seenKeys[2] != "pascal-custom-key" {
+		t.Fatalf("expected pascal-custom-key sent, got %v", seenKeys)
+	}
+
+	// 4. User clears api_key -> falls back to built-in default again
+	if err := p.Configure(map[string]any{"api_key": ""}); err != nil {
+		t.Fatalf("Configure clear key: %v", err)
+	}
+	if _, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
+		ItemType:    "Movie",
+		ProviderIDs: map[string]string{"tmdb": "550"},
+	}); err != nil {
+		t.Fatalf("FetchMetadata after clearing key: %v", err)
+	}
+	if len(seenKeys) != 4 || seenKeys[3] != "builtin-default-tmdb-key" {
+		t.Fatalf("expected fallback to default key after clear, got %v", seenKeys)
+	}
+
+	// 5. Disabling provider still skips even when defaultAPIKey is configured
+	if err := p.Configure(map[string]any{"enabled": false}); err != nil {
+		t.Fatalf("Configure disable: %v", err)
+	}
+	if res, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
+		ItemType:    "Movie",
+		ProviderIDs: map[string]string{"tmdb": "550"},
+	}); err != nil || res != nil {
+		t.Fatalf("expected (nil, nil) when disabled, got (%+v, %v)", res, err)
+	}
+	if len(seenKeys) != 4 {
+		t.Fatalf("expected no extra HTTP requests while disabled, got %v", seenKeys)
+	}
+}

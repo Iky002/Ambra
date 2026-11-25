@@ -902,12 +902,12 @@ export function SetupWizardPage() {
                       type="text"
                       value={tmdbApiKey}
                       onChange={(e) => setTmdbApiKey(e.target.value)}
-                      placeholder="输入 TMDB v3 API Key 或 Read Access Token"
+                      placeholder="留空将使用内置默认密钥，或输入自定义 TMDB v3 API Key / Read Access Token"
                       className="w-full rounded-xl border border-white/10 bg-white/[0.04] py-2.5 pl-10 pr-4 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-amber-400/60 focus:bg-white/[0.06]"
                     />
                   </div>
                   <p className="mt-1.5 text-[11px] leading-relaxed text-zinc-500">
-                    填写后可自动刮削中文元数据与高清海报，留空也可稍后在管理控制台配置
+                    留空即自动使用内置 TMDB 密钥刮削中文元数据与高清海报；填写自定义密钥将优先使用，也可稍后在管理控制台修改
                   </p>
                 </div>
 
