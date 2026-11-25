@@ -16,6 +16,8 @@ import (
 )
 
 func TestServerQuickConnectRoutingAndEmbyPrefix(t *testing.T) {
+	t.Setenv("AMBRA_ADMIN_USER", "admin")
+	t.Setenv("AMBRA_ADMIN_PASS", "admin")
 	tmp := t.TempDir()
 	cfg := config.Default(tmp)
 	srv, err := server.New(context.Background(), cfg)

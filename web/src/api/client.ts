@@ -47,6 +47,7 @@ import type {
   SetupStatus,
   SystemInfo,
   TaskTriggerInfo,
+  UserConfiguration,
   UserDto,
   UserItemDataDto,
   UserPolicy,
@@ -748,6 +749,8 @@ export const api = {
     MediaSourceId?: string
     PlaySessionId?: string
     PositionTicks: number
+    AudioStreamIndex?: number
+    SubtitleStreamIndex?: number
   }) =>
     embyFetch<void>('/emby/Sessions/Playing/Stopped', {
       method: 'POST',
@@ -790,6 +793,12 @@ export const api = {
     embyFetch<void>(`/emby/Users/${encodeURIComponent(userId)}/Policy`, {
       method: 'POST',
       body: JSON.stringify(policy),
+    }),
+
+  updateUserConfiguration: (userId: string, config: UserConfiguration) =>
+    embyFetch<void>(`/emby/Users/${encodeURIComponent(userId)}/Configuration`, {
+      method: 'POST',
+      body: JSON.stringify(config),
     }),
 
   getSessions: () => embyFetch<SessionInfo[]>('/emby/Sessions'),

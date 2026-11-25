@@ -77,6 +77,7 @@ type DecisionDetail struct {
 
 type Engine struct {
 	repo     *sqlite.LibraryRepo
+	userRepo *sqlite.UserRepo
 	registry *plugins.Registry
 	cfg      *config.Config
 }
@@ -87,6 +88,12 @@ func New(repo *sqlite.LibraryRepo, registry *plugins.Registry, cfg *config.Confi
 		registry: registry,
 		cfg:      cfg,
 	}
+}
+
+// SetUserRepo attaches a UserRepo so playback decisions honor per-user UserConfiguration
+// and per-item remembered audio/subtitle stream selections.
+func (e *Engine) SetUserRepo(r *sqlite.UserRepo) {
+	e.userRepo = r
 }
 
 // ResolveStream runs registered StreamResolvers (e.g. STRM 302) against a media path.
@@ -132,6 +139,22 @@ func (e *Engine) Decide(ctx context.Context, itemID string, req PlaybackInfoRequ
 		}}
 	}
 
+	var userCfg *dto.UserConfiguration
+	var userData *sqlite.UserItemDataRecord
+	if e.userRepo != nil && strings.TrimSpace(req.UserID) != "" {
+		if u, uErr := e.userRepo.GetUserByID(ctx, req.UserID); uErr == nil && u != nil {
+			cfgCopy := u.Config
+			userCfg = &cfgCopy
+		}
+		if ud, udErr := e.userRepo.GetUserItemData(ctx, req.UserID, item.ID); udErr == nil && ud != nil {
+			userData = ud
+		}
+	}
+	serverDefaultLang := ""
+	if e.cfg != nil {
+		serverDefaultLang = e.cfg.Snapshot().TMDBLanguage
+	}
+
 	sessionID := guid.New()
 	var outSources []dto.MediaSourceInfo
 	var details []DecisionDetail
@@ -140,7 +163,7 @@ func (e *Engine) Decide(ctx context.Context, itemID string, req PlaybackInfoRequ
 		if req.MediaSourceID != "" && !strings.EqualFold(guid.Normalize(req.MediaSourceID), guid.Normalize(src.ID)) {
 			continue
 		}
-		msDTO, detail := e.decideOne(ctx, item, src, req, sessionID)
+		msDTO, detail := e.decideOne(ctx, item, src, req, sessionID, userCfg, userData, serverDefaultLang)
 		outSources = append(outSources, msDTO)
 		details = append(details, detail)
 	}
@@ -154,12 +177,22 @@ func (e *Engine) Decide(ctx context.Context, itemID string, req PlaybackInfoRequ
 	}, details, nil
 }
 
-func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sqlite.MediaSourceRecord, req PlaybackInfoRequest, sessionID string) (dto.MediaSourceInfo, DecisionDetail) {
+func (e *Engine) decideOne(
+	ctx context.Context,
+	item *sqlite.ItemRecord,
+	src sqlite.MediaSourceRecord,
+	req PlaybackInfoRequest,
+	sessionID string,
+	userCfg *dto.UserConfiguration,
+	userData *sqlite.UserItemDataRecord,
+	serverDefaultLang string,
+) (dto.MediaSourceInfo, DecisionDetail) {
 	msDTO := sqlite.MediaSourceRecordsToDTO([]sqlite.MediaSourceRecord{src})[0]
 	msDTO.Type = "Default"
+	ApplyTrackSelection(&msDTO, userCfg, userData, serverDefaultLang)
 	isAudio := strings.EqualFold(item.Type, "Audio") || strings.EqualFold(item.MediaType, "Audio")
 
-	// Find default audio & subtitle indices and extract primary video/audio/subtitle codecs
+	// Extract primary video/audio/subtitle codecs using unified default track selection
 	var videoCodec, audioCodec string
 	var selectedAudioCodec, defaultAudioCodec, firstAudioCodec string
 	var videoWidth, videoHeight int
@@ -185,20 +218,10 @@ func (e *Engine) decideOne(ctx context.Context, item *sqlite.ItemRecord, src sql
 			if req.AudioStreamIndex != nil && st.Index == *req.AudioStreamIndex {
 				selectedAudioCodec = codecLower
 			}
-			if st.IsDefault {
-				if defaultAudioCodec == "" {
-					defaultAudioCodec = codecLower
-				}
-				if msDTO.DefaultAudioStreamIndex == nil {
-					idx := st.Index
-					msDTO.DefaultAudioStreamIndex = &idx
-				}
+			if msDTO.DefaultAudioStreamIndex != nil && st.Index == *msDTO.DefaultAudioStreamIndex {
+				defaultAudioCodec = codecLower
 			}
 		case "Subtitle":
-			if msDTO.DefaultSubtitleStreamIndex == nil && st.IsDefault {
-				idx := st.Index
-				msDTO.DefaultSubtitleStreamIndex = &idx
-			}
 			if req.SubtitleStreamIndex != nil && st.Index == *req.SubtitleStreamIndex {
 				selectedSub = st
 			}

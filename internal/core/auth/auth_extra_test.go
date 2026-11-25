@@ -36,15 +36,27 @@ func TestEnsureDefaultAdminFallbackAndUserErrors(t *testing.T) {
 	svc, repo := setupAuthTest(t)
 	ctx := context.Background()
 
-	// Unset env vars so default "admin" / "admin" are used.
+	// 1. Without AMBRA_ADMIN_PASS, EnsureDefaultAdmin must NOT create any user (fresh instance boots into /setup).
 	t.Setenv("AMBRA_ADMIN_USER", "")
-	// Ensure AMBRA_ADMIN_PASS is not set by testing with empty/set or just authenticating
 	if err := svc.EnsureDefaultAdmin(ctx); err != nil {
-		t.Fatalf("EnsureDefaultAdmin default: %v", err)
+		t.Fatalf("EnsureDefaultAdmin default skip: %v", err)
+	}
+	cnt, err := repo.CountUsers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cnt != 0 {
+		t.Fatalf("expected 0 users when AMBRA_ADMIN_PASS is not set, got %d", cnt)
+	}
+
+	// 2. With AMBRA_ADMIN_PASS explicitly set (and AMBRA_ADMIN_USER empty), default username "admin" is created.
+	t.Setenv("AMBRA_ADMIN_PASS", "StrongInitPass!1")
+	if err := svc.EnsureDefaultAdmin(ctx); err != nil {
+		t.Fatalf("EnsureDefaultAdmin with env pass: %v", err)
 	}
 	u, err := repo.GetUserByName(ctx, "admin")
 	if err != nil || !u.IsAdmin {
-		t.Fatalf("expected default admin user, got u=%+v err=%v", u, err)
+		t.Fatalf("expected admin user created via AMBRA_ADMIN_PASS, got u=%+v err=%v", u, err)
 	}
 
 	// Empty username error

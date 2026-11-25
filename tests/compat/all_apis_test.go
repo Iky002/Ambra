@@ -37,6 +37,8 @@ func loadBaselineRoutes(t *testing.T) []baselineRoute {
 
 func newCompatTestServer(t *testing.T) (*server.Server, *config.Config, string, string) {
 	t.Helper()
+	t.Setenv("AMBRA_ADMIN_USER", "admin")
+	t.Setenv("AMBRA_ADMIN_PASS", "admin")
 	tmpDir := t.TempDir()
 	dataDir := filepath.Join(tmpDir, "data")
 	cfg, err := config.Load(dataDir)

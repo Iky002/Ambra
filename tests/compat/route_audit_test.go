@@ -85,6 +85,8 @@ func TestEmby4102RouteCoverageAudit(t *testing.T) {
 		t.Fatalf("expected 582 baseline routes, got %d", len(routes))
 	}
 
+	t.Setenv("AMBRA_ADMIN_USER", "admin")
+	t.Setenv("AMBRA_ADMIN_PASS", "admin")
 	tmpDir := t.TempDir()
 	dataDir := filepath.Join(tmpDir, "data")
 	cfg, err := config.Load(dataDir)

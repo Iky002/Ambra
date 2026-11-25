@@ -3,6 +3,7 @@ import { QueryClientContext } from '@tanstack/react-query'
 import { api, clearAuth, getDeviceId, getStoredAuth, saveAuth } from '../api/client'
 import type { AuthSession, AuthenticationResult, UserDto } from '../api/types'
 import { isDemoMode } from '../demo/demoMode'
+import { syncPlaybackPrefsFromUserConfig } from '../player/playbackPrefs'
 
 const DEMO_LOGGED_OUT_KEY = 'ambra_demo_logged_out'
 
@@ -55,6 +56,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     try {
       const freshUser = await api.getUser(current.userId)
       setUser(freshUser)
+      syncPlaybackPrefsFromUserConfig(freshUser.Configuration)
       const freshIsAdmin = Boolean(freshUser.Policy?.IsAdministrator)
       if (current.isAdmin !== freshIsAdmin || current.userName !== freshUser.Name) {
         const updated: AuthSession = {
@@ -95,6 +97,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       saveAuth(session)
       setAuth(session)
       setUser(res.User)
+      syncPlaybackPrefsFromUserConfig(res.User.Configuration)
       setUserLoading(false)
     },
     [queryClient],

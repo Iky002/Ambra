@@ -953,6 +953,16 @@ export async function demoFetch<T>(
     return { ...newUser } as T
   }
 
+  const userConfigMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Configuration$/)
+  if (userConfigMatch && method === 'POST') {
+    const userId = decodeURIComponent(userConfigMatch[1])
+    const rec = store.users.find((u) => u.user.Id === userId)
+    if (!rec) throw new ApiError(404, '用户不存在')
+    const patch = parseJsonBody(options) as Record<string, unknown>
+    rec.user.Configuration = { ...rec.user.Configuration, ...patch }
+    return undefined as T
+  }
+
   const userPolicyMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Policy$/)
   if (userPolicyMatch && method === 'POST') {
     const userId = decodeURIComponent(userPolicyMatch[1])
