@@ -250,12 +250,12 @@ func TestHWAccelAndExtractorSecurityCoverage(t *testing.T) {
 		t.Fatalf("defaultCheckFile glob got %v", got)
 	}
 
-	// HardwareDetector caches on second call & ProbeHardware empty ffmpegPath
+	// HardwareDetector does not permanently cache FFmpegAvailable=false & ProbeHardware empty ffmpegPath
 	det := NewHardwareDetector(filepath.Join(tmp, "no-ffmpeg"))
 	c1 := det.Detect(context.Background())
 	c2 := det.Detect(context.Background())
-	if c1 != c2 {
-		t.Fatalf("expected HardwareDetector.Detect to return cached instance")
+	if c1.FFmpegAvailable || c2.FFmpegAvailable || c1 == c2 {
+		t.Fatalf("expected failed HardwareDetector.Detect not to be permanently cached")
 	}
 	_ = ProbeHardware(context.Background(), "")
 
@@ -291,12 +291,32 @@ func TestHWAccelAndExtractorSecurityCoverage(t *testing.T) {
 		return
 	}
 
-	// Fake ffmpeg script for ExtractFonts safe filtering & ExtractChapterThumbnail error/success paths
+	// Fake ffprobe + ffmpeg scripts for ExtractFonts safe filtering & ExtractChapterThumbnail error/success paths
+	fakeFFprobe := filepath.Join(tmp, "fake-ffprobe.sh")
+	probeScript := `#!/bin/sh
+cat <<'EOF'
+{"streams":[
+  {"index":2,"tags":{"filename":"SafeFont.ttf"}},
+  {"index":3,"tags":{"filename":".hidden.ttf"}},
+  {"index":4,"tags":{"filename":"readme.txt"}},
+  {"index":5,"tags":{"filename":"../../evil.ttf"}}
+]}
+EOF
+`
+	if err := os.WriteFile(fakeFFprobe, []byte(probeScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	fakeFFmpeg := filepath.Join(tmp, "fake-ffmpeg.sh")
 	script := `#!/bin/sh
 case "$*" in
-  *-dump_attachment:t*)
-    printf "font-data" > "SafeFont.ttf"
+  *-dump_attachment:*)
+    prev=""
+    for arg in "$@"; do
+      case "$prev" in
+        -dump_attachment:*) printf "font-data" > "$arg" ;;
+      esac
+      prev="$arg"
+    done
     printf "hidden" > ".hidden.ttf"
     printf "notfont" > "readme.txt"
     mkdir -p "subdir"
@@ -324,6 +344,7 @@ esac
 	}
 	cfg := config.Default(tmp)
 	cfg.FFmpegPath = fakeFFmpeg
+	cfg.FFprobePath = fakeFFprobe
 	ext := NewExtractor(cfg)
 
 	// ExtractFonts filters out hidden, non-font, symlink, and directories

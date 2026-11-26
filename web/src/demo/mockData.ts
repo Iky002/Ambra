@@ -15,7 +15,12 @@ import type {
   UserDto,
   VirtualFolderInfo,
 } from '../api/types'
-import { DEMO_VIDEO_DATA_URL, makeDemoAssDataUrl, makeDemoVttDataUrl } from './demoMedia'
+import {
+  DEMO_VIDEO_DATA_URL,
+  makeDemoAssDataUrl,
+  makeDemoChtVttDataUrl,
+  makeDemoVttDataUrl,
+} from './demoMedia'
 import {
   makeAvatarDataUrl,
   makeBackdropDataUrl,
@@ -175,6 +180,7 @@ function makeMediaSources(
 ): MediaSourceInfo[] {
   const vttUrl = makeDemoVttDataUrl(title)
   const assUrl = makeDemoAssDataUrl(title)
+  const chtVttUrl = makeDemoChtVttDataUrl(title)
   const is4k = opts.resolution === '4K'
 
   const primary: MediaSourceInfo = {
@@ -267,16 +273,16 @@ function makeMediaSources(
             {
               Type: 'Subtitle',
               Index: 5,
-              Codec: 'pgssub',
+              Codec: 'vtt',
               Language: 'chi',
               DisplayLanguage: '繁體中文',
-              Title: '繁体蓝光原盘字幕 (PGS)',
-              DisplayTitle: '繁体蓝光',
+              Title: '繁體中文字幕 (WebVTT)',
+              DisplayTitle: '繁體中文',
               SubVariant: 'cht',
               IsDefault: false,
               IsExternal: true,
               DeliveryMethod: 'External',
-              DeliveryUrl: vttUrl,
+              DeliveryUrl: chtVttUrl,
             },
           ]
         : []),
@@ -2589,7 +2595,8 @@ export function createInitialDemoState(): DemoState {
     Id: DEMO_SERVER_ID,
     ServerName: 'Ambra Serverless Demo',
     ProductName: 'Ambra',
-    Version: '0.1.0-demo',
+    Version: '0.10.6-demo',
+    AmbraVersion: '0.10.6-demo',
     LocalAddress: 'https://demo.ambra.local (Browser Memory)',
     OperatingSystem: 'WebAssembly / Browser Sandbox',
     OperatingSystemDisplayName: 'Serverless Demo Engine',
@@ -2599,6 +2606,8 @@ export function createInitialDemoState(): DemoState {
     SupportsLibraryMonitor: true,
     ProgramDataPath: '/var/lib/ambra/data',
     CachePath: '/var/lib/ambra/cache',
+    ChapterCachePath: '/var/lib/ambra/cache/chapters',
+    BifCachePath: '/var/lib/ambra/cache/bif',
     LogPath: '/var/lib/ambra/logs',
     TranscodingTempPath: '/tmp/ambra-transcode',
     StartupWizardCompleted: true,
@@ -2612,7 +2621,7 @@ export function createInitialDemoState(): DemoState {
       UserId: 'user-demo-admin',
       UserName: 'admin',
       Client: 'Ambra Web',
-      ApplicationVersion: '0.1.0',
+      ApplicationVersion: '0.10.6',
       DeviceName: 'Chrome on macOS (Demo)',
       DeviceId: 'dev-demo-web-01',
       LastActivityDate: isoAgo(1),
@@ -2646,7 +2655,7 @@ export function createInitialDemoState(): DemoState {
       Id: 'dev-demo-web-01',
       Name: 'Chrome on macOS (Demo)',
       AppName: 'Ambra Web',
-      AppVersion: '0.1.0',
+      AppVersion: '0.10.6',
       LastUserId: 'user-demo-admin',
       LastUserName: 'admin',
       DateLastActivity: isoAgo(1),
@@ -2928,7 +2937,7 @@ export function createInitialDemoState(): DemoState {
     [
       'ambra-server-2026-11-24.log',
       [
-        '2026-11-24T08:00:01Z INFO  [server] Ambra Media Server v0.1.0-demo starting (Serverless Memory Engine)',
+        '2026-11-24T08:00:01Z INFO  [server] Ambra Media Server v0.10.6-demo starting (Serverless Memory Engine)',
         '2026-11-24T08:00:01Z INFO  [db]     Loaded 3 virtual folders, 14 curated titles, 2 users (admin, guest)',
         '2026-11-24T08:00:02Z INFO  [search] Chinese out-of-order fuzzy search index ready (CJK + Pinyin + Cast)',
         '2026-11-24T08:00:02Z INFO  [plugin] Enabled: ambra.metadata.tmdb (priority=10), ambra.stream.strm302 (priority=20)',

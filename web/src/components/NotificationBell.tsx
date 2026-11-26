@@ -11,6 +11,7 @@ import {
   Send,
   X,
 } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
 import { api } from '../api/client'
 import type { NotificationItem } from '../api/types'
 import { useAuth } from '../context/AuthContext'
@@ -18,6 +19,20 @@ import { useI18n } from '../i18n/I18nContext'
 import { formatRelativeTime } from '../pages/admin/adminUtils'
 
 type NotificationLevel = 'Normal' | 'Warning' | 'Error'
+
+function resolveSafeInternalUrl(raw?: string): string | null {
+  if (!raw) return null
+  const trimmed = raw.trim()
+  if (!trimmed) return null
+  if (trimmed.startsWith('#/')) {
+    const hashPath = trimmed.slice(1)
+    return hashPath.startsWith('/') && !hashPath.startsWith('//') ? hashPath : null
+  }
+  if (trimmed.startsWith('/') && !trimmed.startsWith('//')) {
+    return trimmed
+  }
+  return null
+}
 
 function getLevelPresentation(level: string) {
   switch (level) {
@@ -45,6 +60,7 @@ function getLevelPresentation(level: string) {
 export function NotificationBell() {
   const { auth, isAdmin } = useAuth()
   const { locale, t } = useI18n()
+  const navigate = useNavigate()
   const queryClient = useQueryClient()
   const containerRef = useRef<HTMLDivElement | null>(null)
 
@@ -135,6 +151,11 @@ export function NotificationBell() {
   const handleItemClick = (item: NotificationItem) => {
     if (!item.IsRead && !markReadMutation.isPending) {
       markReadMutation.mutate([item.Id])
+    }
+    const targetPath = resolveSafeInternalUrl(item.Url)
+    if (targetPath) {
+      setOpen(false)
+      navigate(targetPath)
     }
   }
 

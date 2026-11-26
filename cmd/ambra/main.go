@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -19,6 +20,10 @@ import (
 )
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	dataDir := flag.String("data", "./data", "Ambra data directory")
 	httpAddr := flag.String("addr", "", "HTTP listen address (overrides config, e.g. :8096)")
 	webDir := flag.String("web", "", "External web UI directory (overrides embedded web UI)")
@@ -27,7 +32,7 @@ func main() {
 
 	if *showVersion {
 		fmt.Printf("Ambra %s (Emby compat %s)\n", config.AmbraVersion, config.ServerVersion)
-		return
+		return 0
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -36,7 +41,7 @@ func main() {
 	cfg, err := config.Load(*dataDir)
 	if err != nil {
 		slog.Error("failed to load config", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	if *httpAddr != "" {
 		cfg.HTTPAddr = *httpAddr
@@ -58,7 +63,7 @@ func main() {
 	srv, err := server.New(bgCtx, cfg)
 	if err != nil {
 		slog.Error("failed to initialize Ambra server", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	defer func() {
 		bgCancel()
@@ -89,6 +94,7 @@ func main() {
 		webURL = "http://" + cfg.HTTPAddr + "/web/"
 	}
 
+	serveErrCh := make(chan error, 1)
 	go func() {
 		slog.Info("Ambra Media Server started",
 			"ambra_version", config.AmbraVersion,
@@ -97,15 +103,26 @@ func main() {
 			"web_ui", webURL,
 			"server_id", cfg.ServerID,
 		)
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("http server error", "error", err)
+			serveErrCh <- err
 			stop()
 		}
 	}()
 
 	<-sigCtx.Done()
+	var serveErr error
+	select {
+	case serveErr = <-serveErrCh:
+	default:
+	}
+
 	slog.Info("shutting down Ambra Media Server...")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
+	if serveErr != nil {
+		return 1
+	}
+	return 0
 }

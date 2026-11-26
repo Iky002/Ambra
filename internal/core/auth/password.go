@@ -53,6 +53,7 @@ func VerifyPassword(password, encodedHash string) (bool, error) {
 		return password == "", nil
 	}
 	if password == "" {
+		dummyPasswordWork("")
 		return false, nil
 	}
 	parts := strings.Split(encodedHash, "$")

@@ -125,15 +125,20 @@ func storageFolderInfo(path string) map[string]any {
 
 func (h *Handler) getSystemStorageInfo(w http.ResponseWriter, r *http.Request) {
 	dataDir := "./data"
-	if h.cfg != nil && h.cfg.DataDir != "" {
-		dataDir = h.cfg.DataDir
+	transcodeTempDir := filepath.Join(dataDir, "cache", "transcoding-temp")
+	if h.cfg != nil {
+		snap := h.cfg.Snapshot()
+		if snap.DataDir != "" {
+			dataDir = snap.DataDir
+			transcodeTempDir = (&snap).TranscodeTempDir()
+		}
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"ProgramDataFolder":      storageFolderInfo(dataDir),
 		"CacheFolder":            storageFolderInfo(filepath.Join(dataDir, "cache")),
 		"LogFolder":              storageFolderInfo(filepath.Join(dataDir, "logs")),
 		"InternalMetadataFolder": storageFolderInfo(filepath.Join(dataDir, "metadata")),
-		"TranscodingTempFolder":  storageFolderInfo(filepath.Join(dataDir, "cache", "transcoding-temp")),
+		"TranscodingTempFolder":  storageFolderInfo(transcodeTempDir),
 	})
 }
 
@@ -245,9 +250,12 @@ func (h *Handler) postEnvironmentDirectoryContents(w http.ResponseWriter, r *htt
 		body.IncludeDirectories = *b
 	}
 	if target == "" {
-		if h.cfg != nil && h.cfg.DataDir != "" {
-			target = h.cfg.DataDir
-		} else {
+		if h.cfg != nil {
+			if dd := h.cfg.Snapshot().DataDir; dd != "" {
+				target = dd
+			}
+		}
+		if target == "" {
 			target = "/"
 		}
 	}
@@ -337,13 +345,15 @@ func (h *Handler) postPartiesMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	body["UserId"] = uid
 	body["SentAt"] = time.Now().UTC().Format(time.RFC3339)
+	h.mu.Lock()
 	var msgs []map[string]any
-	_, _ = h.loadKV(r.Context(), "party:messages", &msgs)
+	_, _ = h.loadKVLocked(r.Context(), "party:messages", &msgs)
 	msgs = append(msgs, body)
 	if len(msgs) > 100 {
 		msgs = msgs[len(msgs)-100:]
 	}
-	_ = h.saveKV(r.Context(), "party:messages", msgs)
+	_ = h.saveKVLocked(r.Context(), "party:messages", msgs)
+	h.mu.Unlock()
 	httpx.NoContent(w)
 }
 

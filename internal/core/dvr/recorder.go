@@ -98,7 +98,13 @@ type Recorder struct {
 
 // DefaultArgsBuilder builds the standard ffmpeg remux command arguments.
 func DefaultArgsBuilder(job RecordingJob, outFile string) []string {
-	args := []string{"-y", "-protocol_whitelist", "http,https,tcp,tls,crypto", "-i", job.StreamURL}
+	args := []string{
+		"-y",
+		"-protocol_whitelist", "http,https,tcp,tls,crypto",
+		"-follow_redirects", "0",
+		"-rw_timeout", "15000000",
+		"-i", job.StreamURL,
+	}
 	if job.Duration > 0 {
 		sec := int(math.Ceil(job.Duration.Seconds()))
 		if sec < 1 {
@@ -180,7 +186,15 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	recCtx, cancel := context.WithCancel(ctx)
+	var (
+		recCtx context.Context
+		cancel context.CancelFunc
+	)
+	if job.Duration > 0 {
+		recCtx, cancel = context.WithTimeout(ctx, job.Duration+2*time.Minute)
+	} else {
+		recCtx, cancel = context.WithCancel(ctx)
+	}
 	args := r.argsBuilder(job, outFile)
 	cmd := exec.Command(r.ffmpegPath, args...)
 	stdinPipe, _ := cmd.StdinPipe()
@@ -219,7 +233,7 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 	}
 
 	r.entries[job.TimerID] = entry
-	r.wg.Add(1)
+	r.wg.Add(2)
 	snapshot := entry.state
 	r.mu.Unlock()
 
@@ -230,6 +244,7 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 }
 
 func (r *Recorder) watchCancel(recCtx context.Context, entry *recordingEntry) {
+	defer r.wg.Done()
 	select {
 	case <-entry.done:
 		return

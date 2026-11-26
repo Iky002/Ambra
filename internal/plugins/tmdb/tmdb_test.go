@@ -71,7 +71,7 @@ func TestTMDBFetchMovieAndPersonAvatars(t *testing.T) {
 	// Default imageBaseURL -> w185 for profile images
 	p := New("test-key", "zh-CN")
 	p.SetHTTPClient(srv.Client())
-	_ = p.Configure(map[string]any{"base_url": srv.URL})
+	_ = p.Configure(map[string]any{"base_url": srv.URL, "api_key": "test-key"})
 
 	res, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
 		ItemType: "Movie",
@@ -198,7 +198,7 @@ func TestTMDBFetchSeriesSeasonAndEpisode(t *testing.T) {
 
 	p := New("test-key", "zh-CN")
 	p.SetHTTPClient(srv.Client())
-	_ = p.Configure(map[string]any{"base_url": srv.URL})
+	_ = p.Configure(map[string]any{"base_url": srv.URL, "api_key": "test-key"})
 
 	// Series
 	series, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
@@ -335,7 +335,7 @@ func TestTMDBV4BearerLogoAndOfficialRating(t *testing.T) {
 
 	p := New(v4JWT, "zh-CN")
 	p.SetHTTPClient(srv.Client())
-	_ = p.Configure(map[string]any{"base_url": srv.URL})
+	_ = p.Configure(map[string]any{"base_url": srv.URL, "api_key": v4JWT})
 
 	mov, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
 		ItemType:    "Movie",

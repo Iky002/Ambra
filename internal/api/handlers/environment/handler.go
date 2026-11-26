@@ -13,6 +13,8 @@ import (
 	"github.com/ambra-media/ambra/internal/config"
 )
 
+const maxDirectoryEntries = 2000
+
 // AuthFuncs decouples route registration from the concrete middleware package.
 type AuthFuncs struct {
 	RequireAuth   func(http.Handler) http.Handler
@@ -208,6 +210,9 @@ func (h *Handler) handleDirectoryContents(w http.ResponseWriter, r *http.Request
 	out := make([]FileSystemEntryInfo, 0, len(dirs)+len(files))
 	out = append(out, dirs...)
 	out = append(out, files...)
+	if len(out) > maxDirectoryEntries {
+		out = out[:maxDirectoryEntries]
+	}
 	httpx.JSON(w, http.StatusOK, out)
 }
 
@@ -281,18 +286,23 @@ func (h *Handler) handleValidatePath(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if body.ValidateWritable {
-		targetDir := clean
-		if !info.IsDir() {
-			targetDir = filepath.Dir(clean)
+		if info.IsDir() {
+			probe, err := os.CreateTemp(clean, ".ambra-write-check-*")
+			if err != nil {
+				httpx.Error(w, http.StatusForbidden, "path is not writable")
+				return
+			}
+			probeName := probe.Name()
+			_ = probe.Close()
+			_ = os.Remove(probeName)
+		} else {
+			f, err := os.OpenFile(clean, os.O_WRONLY|os.O_APPEND, 0)
+			if err != nil {
+				httpx.Error(w, http.StatusForbidden, "path is not writable")
+				return
+			}
+			_ = f.Close()
 		}
-		probe, err := os.CreateTemp(targetDir, ".ambra-write-check-*")
-		if err != nil {
-			httpx.Error(w, http.StatusForbidden, "path is not writable")
-			return
-		}
-		probeName := probe.Name()
-		_ = probe.Close()
-		_ = os.Remove(probeName)
 	}
 
 	httpx.NoContent(w)

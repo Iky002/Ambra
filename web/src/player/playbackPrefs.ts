@@ -155,7 +155,6 @@ export function playbackPrefsToUserConfig(
   existing?: UserConfiguration | null,
 ): UserConfiguration {
   return {
-    PlayDefaultAudioTrack: prefs.preferredAudioLang === 'media',
     DisplayMissingEpisodes: existing?.DisplayMissingEpisodes ?? false,
     EnableLocalPassword: existing?.EnableLocalPassword ?? true,
     OrderedViews: existing?.OrderedViews ?? [],
@@ -165,6 +164,7 @@ export function playbackPrefsToUserConfig(
     RememberAudioSelections: existing?.RememberAudioSelections ?? true,
     RememberSubtitleSelections: existing?.RememberSubtitleSelections ?? true,
     ...(existing || {}),
+    PlayDefaultAudioTrack: prefs.preferredAudioLang === 'media',
     AudioLanguagePreference: prefs.preferredAudioLang === 'media' ? '' : prefs.preferredAudioLang,
     SubtitleLanguagePreference: prefs.preferredSubtitleLang,
     SubtitleMode: prefs.subtitleMode,
@@ -354,6 +354,7 @@ export function pickPreferredSubtitleIndex(
   serverDefault?: number,
   uiLocale?: string,
   subtitleMode?: string,
+  selectedAudioStream?: MediaStream,
 ): number | undefined {
   const mode = (subtitleMode || 'Default').trim().toLowerCase()
   if (mode === 'none') return undefined
@@ -364,20 +365,37 @@ export function pickPreferredSubtitleIndex(
 
   const mediaDefault = serverDefault ?? streams.find((s) => s.IsDefault)?.Index
 
+  const resolvedPrefLang =
+    rawPref === 'media'
+      ? ''
+      : !rawPref || rawPref === 'auto'
+        ? localeToTrackLang(uiLocale)
+        : localeToTrackLang(rawPref)
+
   if (mode === 'onlyforced') {
     const forced = streams.filter((s) => s.IsForced)
     if (forced.length === 0) return undefined
-    const targetLang =
-      rawPref === 'media'
-        ? ''
-        : !rawPref || rawPref === 'auto'
-          ? localeToTrackLang(uiLocale)
-          : localeToTrackLang(rawPref)
-    if (targetLang) {
-      const matchedForced = pickBestSubtitleForLang(forced, targetLang)
+    if (resolvedPrefLang) {
+      const matchedForced = pickBestSubtitleForLang(forced, resolvedPrefLang)
       if (matchedForced) return matchedForced.Index
     }
     return forced[0].Index
+  }
+
+  if (mode === 'smart') {
+    const userNativeLang = resolvedPrefLang || localeToTrackLang(uiLocale)
+    if (selectedAudioStream && userNativeLang && matchesLanguage(selectedAudioStream, userNativeLang)) {
+      const forced = streams.filter((s) => s.IsForced)
+      if (forced.length === 0) return undefined
+      const matchedForced = pickBestSubtitleForLang(forced, userNativeLang)
+      if (matchedForced) return matchedForced.Index
+      return forced[0].Index
+    }
+    if (userNativeLang) {
+      const best = pickBestSubtitleForLang(streams, userNativeLang)
+      if (best) return best.Index
+    }
+    return mediaDefault
   }
 
   if (rawPref === 'media') {
@@ -385,13 +403,12 @@ export function pickPreferredSubtitleIndex(
     return mode === 'always' ? streams[0]?.Index : undefined
   }
 
-  const pref = !rawPref || rawPref === 'auto' ? localeToTrackLang(uiLocale) : localeToTrackLang(rawPref)
-  if (!pref) {
+  if (!resolvedPrefLang) {
     if (mediaDefault !== undefined) return mediaDefault
     return mode === 'always' ? streams[0]?.Index : undefined
   }
 
-  const best = pickBestSubtitleForLang(streams, pref)
+  const best = pickBestSubtitleForLang(streams, resolvedPrefLang)
   if (best) return best.Index
 
   if (mediaDefault !== undefined) return mediaDefault

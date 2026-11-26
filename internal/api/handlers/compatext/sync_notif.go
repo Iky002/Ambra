@@ -18,10 +18,11 @@ import (
 )
 
 const (
-	maxOfflineActions        = 500
-	maxRemovedJobItems       = 500
-	maxNotificationServices  = 500
-	maxNotificationBodyBytes = 64 << 10
+	maxOfflineActions              = 500
+	maxRemovedJobItems             = 500
+	maxNotificationServices        = 500
+	maxNotificationServicesPerUser = 50
+	maxNotificationBodyBytes       = 64 << 10
 )
 
 // Mirror structures for reading/updating shared sync:state stored in server_config.
@@ -112,18 +113,42 @@ func sharedJobOwner(jobs []sharedSyncJob, jobID string) string {
 	return ""
 }
 
+func (h *Handler) cleanupRemovedJobItems(r *http.Request, ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	h.mu.Lock()
+	changed := false
+	for _, id := range ids {
+		if h.state.RemovedJobItems[id] {
+			delete(h.state.RemovedJobItems, id)
+			changed = true
+		}
+	}
+	if changed {
+		h.saveStateLocked(r.Context())
+	}
+	h.mu.Unlock()
+}
+
 func (h *Handler) handleDeleteSyncJobPost(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "Id")
 	callerID, isAdmin, hasAuth := h.syncCallerIdentity(r)
 	if sh := h.getSyncHandler(); sh != nil {
-		if _, allowed := sh.DeleteJobForCaller(r.Context(), id, callerID, isAdmin || !hasAuth); !allowed {
+		removedItemIDs := sh.JobItemIDsForJob(id)
+		found, allowed := sh.DeleteJobForCaller(r.Context(), id, callerID, isAdmin || !hasAuth)
+		if !allowed {
 			httpx.Error(w, http.StatusForbidden, "access denied")
 			return
+		}
+		if found {
+			h.cleanupRemovedJobItems(r, removedItemIDs)
 		}
 		httpx.NoContent(w)
 		return
 	}
 
+	var removedItemIDs []string
 	var st sharedSyncState
 	if h.readConfigJSON(r.Context(), syncConfigKey, &st) {
 		jobs := make([]sharedSyncJob, 0, len(st.Jobs))
@@ -141,12 +166,15 @@ func (h *Handler) handleDeleteSyncJobPost(w http.ResponseWriter, r *http.Request
 		for _, it := range st.JobItems {
 			if it.JobId != id {
 				items = append(items, it)
+			} else {
+				removedItemIDs = append(removedItemIDs, it.Id)
 			}
 		}
 		st.Jobs = jobs
 		st.JobItems = items
 		h.writeConfigJSON(r.Context(), syncConfigKey, st)
 	}
+	h.cleanupRemovedJobItems(r, removedItemIDs)
 	httpx.NoContent(w)
 }
 
@@ -215,16 +243,18 @@ func (h *Handler) handleMarkJobItemRemoval(mark bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "Id")
 		callerID, isAdmin, hasAuth := h.syncCallerIdentity(r)
+		found := false
 
 		if sh := h.getSyncHandler(); sh != nil {
-			if _, allowed := sh.SetJobItemRemovalForCaller(r.Context(), id, mark, callerID, isAdmin || !hasAuth); !allowed {
+			var allowed bool
+			found, allowed = sh.SetJobItemRemovalForCaller(r.Context(), id, mark, callerID, isAdmin || !hasAuth)
+			if !allowed {
 				httpx.Error(w, http.StatusForbidden, "access denied")
 				return
 			}
 		} else {
 			var st sharedSyncState
 			if h.readConfigJSON(r.Context(), syncConfigKey, &st) {
-				changed := false
 				for i := range st.JobItems {
 					if st.JobItems[i].Id == id {
 						if hasAuth && !isAdmin {
@@ -239,10 +269,10 @@ func (h *Handler) handleMarkJobItemRemoval(mark bool) http.HandlerFunc {
 						} else {
 							st.JobItems[i].Status = "Synced"
 						}
-						changed = true
+						found = true
 					}
 				}
-				if changed {
+				if found {
 					h.writeConfigJSON(r.Context(), syncConfigKey, st)
 				}
 			}
@@ -251,16 +281,21 @@ func (h *Handler) handleMarkJobItemRemoval(mark bool) http.HandlerFunc {
 		h.mu.Lock()
 		h.ensureMapsLocked()
 		if mark {
-			if !h.state.RemovedJobItems[id] && len(h.state.RemovedJobItems) >= maxRemovedJobItems {
-				h.mu.Unlock()
-				httpx.Error(w, http.StatusBadRequest, "removed job items limit reached")
-				return
+			if found {
+				if !h.state.RemovedJobItems[id] && len(h.state.RemovedJobItems) >= maxRemovedJobItems {
+					h.mu.Unlock()
+					httpx.Error(w, http.StatusBadRequest, "removed job items limit reached")
+					return
+				}
+				h.state.RemovedJobItems[id] = true
+				h.saveStateLocked(r.Context())
 			}
-			h.state.RemovedJobItems[id] = true
 		} else {
-			delete(h.state.RemovedJobItems, id)
+			if h.state.RemovedJobItems[id] {
+				delete(h.state.RemovedJobItems, id)
+				h.saveStateLocked(r.Context())
+			}
 		}
-		h.saveStateLocked(r.Context())
 		h.mu.Unlock()
 
 		httpx.NoContent(w)
@@ -275,6 +310,7 @@ func (h *Handler) handleDeleteSyncJobItemPost(w http.ResponseWriter, r *http.Req
 			httpx.Error(w, http.StatusForbidden, "access denied")
 			return
 		}
+		h.cleanupRemovedJobItems(r, []string{id})
 		httpx.NoContent(w)
 		return
 	}
@@ -298,6 +334,7 @@ func (h *Handler) handleDeleteSyncJobItemPost(w http.ResponseWriter, r *http.Req
 		st.JobItems = items
 		h.writeConfigJSON(r.Context(), syncConfigKey, st)
 	}
+	h.cleanupRemovedJobItems(r, []string{id})
 	httpx.NoContent(w)
 }
 
@@ -480,15 +517,22 @@ func (h *Handler) handleSyncJobItemFile(headOnly bool) http.HandlerFunc {
 			libRepo := h.libRepo
 			h.mu.RUnlock()
 			if libRepo != nil {
-				if rec, err := libRepo.GetItemRecordByID(r.Context(), guid.Normalize(targetItemID)); err == nil && rec != nil {
-					if rec.IsStrm || strings.EqualFold(filepath.Ext(rec.Path), ".strm") {
-						if headOnly {
-							w.WriteHeader(http.StatusForbidden)
-							return
-						}
-						httpx.Error(w, http.StatusForbidden, "downloading .strm files is not allowed")
+				rec, err := libRepo.GetItemRecordByID(r.Context(), guid.Normalize(targetItemID))
+				if err != nil || rec == nil {
+					if headOnly {
+						w.WriteHeader(http.StatusNotFound)
 						return
 					}
+					httpx.Error(w, http.StatusNotFound, "sync item not found")
+					return
+				}
+				if rec.IsStrm || strings.EqualFold(filepath.Ext(rec.Path), ".strm") {
+					if headOnly {
+						w.WriteHeader(http.StatusForbidden)
+						return
+					}
+					httpx.Error(w, http.StatusForbidden, "downloading .strm files is not allowed")
+					return
 				}
 			}
 		}
@@ -515,11 +559,16 @@ func (h *Handler) handleSyncJobItemFile(headOnly bool) http.HandlerFunc {
 }
 
 func (h *Handler) handleSyncJobItemAdditionalFiles(w http.ResponseWriter, r *http.Request) {
+	if !h.canDownloadContent(r) {
+		httpx.Error(w, http.StatusForbidden, "content downloading is disabled")
+		return
+	}
 	id := chi.URLParam(r, "Id")
 	callerID, isAdmin, hasAuth := h.syncCallerIdentity(r)
+	var targetItemID string
 
 	if sh := h.getSyncHandler(); sh != nil {
-		_, found, allowed := sh.GetJobItemForCaller(id, callerID, isAdmin || !hasAuth)
+		item, found, allowed := sh.GetJobItemForCaller(id, callerID, isAdmin || !hasAuth)
 		if !found {
 			httpx.Error(w, http.StatusNotFound, "sync job item not found")
 			return
@@ -528,6 +577,7 @@ func (h *Handler) handleSyncJobItemAdditionalFiles(w http.ResponseWriter, r *htt
 			httpx.Error(w, http.StatusForbidden, "access denied")
 			return
 		}
+		targetItemID = strings.TrimSpace(item.ItemId)
 	} else {
 		var st sharedSyncState
 		if !h.readConfigJSON(r.Context(), syncConfigKey, &st) {
@@ -549,6 +599,24 @@ func (h *Handler) handleSyncJobItemAdditionalFiles(w http.ResponseWriter, r *htt
 			ownerID := sharedJobOwner(st.Jobs, found.JobId)
 			if ownerID == "" || ownerID != callerID {
 				httpx.Error(w, http.StatusForbidden, "access denied")
+				return
+			}
+		}
+		targetItemID = strings.TrimSpace(found.ItemId)
+	}
+
+	if targetItemID != "" && !h.canAccessItemID(r, targetItemID) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
+	if targetItemID != "" {
+		h.mu.RLock()
+		libRepo := h.libRepo
+		h.mu.RUnlock()
+		if libRepo != nil {
+			rec, err := libRepo.GetItemRecordByID(r.Context(), guid.Normalize(targetItemID))
+			if err != nil || rec == nil {
+				httpx.Error(w, http.StatusNotFound, "sync item not found")
 				return
 			}
 		}
@@ -578,6 +646,10 @@ func (h *Handler) handleSyncOfflineActions(w http.ResponseWriter, r *http.Reques
 				if err2 := json.Unmarshal(raw, &single); err2 == nil && (single.ItemId != "" || single.Type != "") {
 					actions = []OfflineAction{single}
 				}
+			}
+			if len(actions) > maxOfflineActions {
+				httpx.Error(w, http.StatusBadRequest, "too many offline actions in a single request")
+				return
 			}
 			if len(actions) > 0 {
 				allowedActions := make([]OfflineAction, 0, len(actions))
@@ -741,6 +813,19 @@ func (h *Handler) handleSaveConfiguredNotification(w http.ResponseWriter, r *htt
 			h.mu.Unlock()
 			httpx.Error(w, http.StatusBadRequest, "notification services limit reached")
 			return
+		}
+		if ownerID := guid.Normalize(svc.UserId); ownerID != "" && !isAdmin {
+			userCount := 0
+			for _, existing := range h.state.NotificationServices {
+				if guid.Normalize(existing.UserId) == ownerID {
+					userCount++
+				}
+			}
+			if userCount >= maxNotificationServicesPerUser {
+				h.mu.Unlock()
+				httpx.Error(w, http.StatusTooManyRequests, "per-user notification services limit reached")
+				return
+			}
 		}
 		h.state.NotificationServices = append(h.state.NotificationServices, svc)
 	}

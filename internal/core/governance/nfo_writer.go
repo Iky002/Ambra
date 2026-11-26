@@ -26,13 +26,21 @@ type nfoDocument struct {
 	Title         string     `xml:"title"`
 	OriginalTitle string     `xml:"originaltitle,omitempty"`
 	Year          *int       `xml:"year,omitempty"`
+	Premiered     string     `xml:"premiered,omitempty"`
+	Tagline       string     `xml:"tagline,omitempty"`
 	Plot          string     `xml:"plot,omitempty"`
 	Rating        *float64   `xml:"rating,omitempty"`
 	MPAA          string     `xml:"mpaa,omitempty"`
+	Season        *int       `xml:"season,omitempty"`
+	Episode       *int       `xml:"episode,omitempty"`
 	TMDBID        string     `xml:"tmdbid,omitempty"`
 	IMDBID        string     `xml:"imdbid,omitempty"`
+	TVDBID        string     `xml:"tvdbid,omitempty"`
+	Studios       []string   `xml:"studio,omitempty"`
 	Genres        []string   `xml:"genre,omitempty"`
 	Tags          []string   `xml:"tag,omitempty"`
+	Directors     []string   `xml:"director,omitempty"`
+	Writers       []string   `xml:"writer,omitempty"`
 	Actors        []nfoActor `xml:"actor,omitempty"`
 }
 
@@ -149,22 +157,27 @@ func (s *Service) WriteItemNFOAtomic(ctx context.Context, itemID string) (*NFOWr
 	}
 
 	var (
-		itemType       string
-		isFolderInt    int
-		name           string
-		originalTitle  sql.NullString
-		productionYear sql.NullInt64
-		communityRate  sql.NullFloat64
-		officialRating sql.NullString
-		itemPath       sql.NullString
-		extraRaw       string
+		itemType          string
+		isFolderInt       int
+		name              string
+		originalTitle     sql.NullString
+		productionYear    sql.NullInt64
+		premiereDate      sql.NullInt64
+		parentIndexNumber sql.NullInt64
+		indexNumber       sql.NullInt64
+		communityRate     sql.NullFloat64
+		officialRating    sql.NullString
+		itemPath          sql.NullString
+		extraRaw          string
 	)
 	err := s.store.Reader.QueryRowContext(ctx, `
-		SELECT type, is_folder, name, original_title, production_year,
+		SELECT type, is_folder, name, original_title, production_year, premiere_date,
+		       parent_index_number, index_number,
 		       community_rating, official_rating, path, extra_json
 		FROM items WHERE id = ?`, itemID,
 	).Scan(
-		&itemType, &isFolderInt, &name, &originalTitle, &productionYear,
+		&itemType, &isFolderInt, &name, &originalTitle, &productionYear, &premiereDate,
+		&parentIndexNumber, &indexNumber,
 		&communityRate, &officialRating, &itemPath, &extraRaw,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -178,6 +191,9 @@ func (s *Service) WriteItemNFOAtomic(ctx context.Context, itemID string) (*NFOWr
 	if pathStr == "" {
 		return nil, ErrItemPathEmpty
 	}
+	if isVirtualPath(pathStr) {
+		return nil, fmt.Errorf("%w: cannot write NFO for virtual item path %q", ErrInvalidArgument, pathStr)
+	}
 
 	rootTag, nfoPath := resolveNFOTarget(itemType, isFolderInt != 0, pathStr)
 	parentDir := filepath.Dir(nfoPath)
@@ -187,27 +203,39 @@ func (s *Service) WriteItemNFOAtomic(ctx context.Context, itemID string) (*NFOWr
 
 	extra := decodeExtraMap(extraRaw)
 	plot, _ := extra["overview"].(string)
+	tagline := extractTagline(extra)
 	providerIDs := extractProviderIDs(extra)
 
-	genres, tags, err := s.loadItemTaxonomies(ctx, itemID)
+	genres, studios, tags, err := s.loadItemTaxonomies(ctx, itemID)
 	if err != nil {
 		return nil, err
 	}
-	actors, err := s.loadItemActors(ctx, itemID)
+	actors, directors, writers, err := s.loadItemPeople(ctx, itemID)
 	if err != nil {
 		return nil, err
+	}
+
+	var premiered string
+	if premiereDate.Valid && premiereDate.Int64 != 0 {
+		premiered = time.Unix(premiereDate.Int64, 0).UTC().Format("2006-01-02")
 	}
 
 	doc := nfoDocument{
 		XMLName:       xml.Name{Local: rootTag},
 		Title:         name,
 		OriginalTitle: strings.TrimSpace(originalTitle.String),
+		Premiered:     premiered,
+		Tagline:       tagline,
 		Plot:          strings.TrimSpace(plot),
 		MPAA:          strings.TrimSpace(officialRating.String),
 		TMDBID:        lookupProviderID(providerIDs, "Tmdb"),
 		IMDBID:        lookupProviderID(providerIDs, "Imdb"),
+		TVDBID:        lookupProviderID(providerIDs, "Tvdb"),
+		Studios:       studios,
 		Genres:        genres,
 		Tags:          tags,
+		Directors:     directors,
+		Writers:       writers,
 		Actors:        actors,
 	}
 	if productionYear.Valid {
@@ -218,6 +246,17 @@ func (s *Service) WriteItemNFOAtomic(ctx context.Context, itemID string) (*NFOWr
 		r := communityRate.Float64
 		doc.Rating = &r
 	}
+	if strings.EqualFold(strings.TrimSpace(itemType), "Episode") {
+		if parentIndexNumber.Valid {
+			sv := int(parentIndexNumber.Int64)
+			doc.Season = &sv
+		}
+		if indexNumber.Valid {
+			ev := int(indexNumber.Int64)
+			doc.Episode = &ev
+		}
+	}
+	preserveMissingNFOFields(nfoPath, &doc)
 
 	body, err := xml.MarshalIndent(doc, "", "  ")
 	if err != nil {
@@ -313,7 +352,7 @@ func atomicWriteFile(targetPath string, data []byte) error {
 	return nil
 }
 
-func (s *Service) loadItemTaxonomies(ctx context.Context, itemID string) (genres []string, tags []string, err error) {
+func (s *Service) loadItemTaxonomies(ctx context.Context, itemID string) (genres []string, studios []string, tags []string, err error) {
 	rows, err := s.store.Reader.QueryContext(ctx, `
 		SELECT t.kind, t.name
 		FROM item_taxonomies it
@@ -322,55 +361,133 @@ func (s *Service) loadItemTaxonomies(ctx context.Context, itemID string) (genres
 		ORDER BY t.sort_name ASC`, itemID,
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer rows.Close()
 
 	for rows.Next() {
 		var kind, name string
 		if err := rows.Scan(&kind, &name); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		switch strings.ToLower(strings.TrimSpace(kind)) {
 		case "genre":
 			genres = append(genres, name)
+		case "studio":
+			studios = append(studios, name)
 		case "tag":
 			tags = append(tags, name)
 		}
 	}
-	return genres, tags, rows.Err()
+	return genres, studios, tags, rows.Err()
 }
 
-func (s *Service) loadItemActors(ctx context.Context, itemID string) ([]nfoActor, error) {
+func (s *Service) loadItemPeople(ctx context.Context, itemID string) (actors []nfoActor, directors []string, writers []string, err error) {
 	rows, err := s.store.Reader.QueryContext(ctx, `
-		SELECT p.name, ip.role, ip.sort_order
+		SELECT p.name, ip.person_type, ip.role, ip.sort_order
 		FROM item_people ip
 		JOIN people p ON p.id = ip.person_id
-		WHERE ip.item_id = ? AND lower(ip.person_type) = 'actor'
+		WHERE ip.item_id = ?
 		ORDER BY ip.sort_order ASC, p.sort_name ASC`, itemID,
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	defer rows.Close()
 
-	var actors []nfoActor
 	for rows.Next() {
 		var (
-			name  string
-			role  sql.NullString
-			order int
+			name       string
+			personType string
+			role       sql.NullString
+			order      int
 		)
-		if err := rows.Scan(&name, &role, &order); err != nil {
-			return nil, err
+		if err := rows.Scan(&name, &personType, &role, &order); err != nil {
+			return nil, nil, nil, err
 		}
-		actors = append(actors, nfoActor{
-			Name:  name,
-			Role:  strings.TrimSpace(role.String),
-			Order: order,
-		})
+		switch strings.ToLower(strings.TrimSpace(personType)) {
+		case "actor":
+			actors = append(actors, nfoActor{
+				Name:  name,
+				Role:  strings.TrimSpace(role.String),
+				Order: order,
+			})
+		case "director":
+			directors = append(directors, name)
+		case "writer":
+			writers = append(writers, name)
+		}
 	}
-	return actors, rows.Err()
+	return actors, directors, writers, rows.Err()
+}
+
+func extractTagline(extra map[string]any) string {
+	if raw, ok := extra["taglines"]; ok && raw != nil {
+		switch arr := raw.(type) {
+		case []string:
+			for _, s := range arr {
+				if trimmed := strings.TrimSpace(s); trimmed != "" {
+					return trimmed
+				}
+			}
+		case []any:
+			for _, elem := range arr {
+				if s, ok := elem.(string); ok {
+					if trimmed := strings.TrimSpace(s); trimmed != "" {
+						return trimmed
+					}
+				}
+			}
+		}
+	}
+	if s, ok := extra["tagline"].(string); ok {
+		return strings.TrimSpace(s)
+	}
+	return ""
+}
+
+func preserveMissingNFOFields(nfoPath string, doc *nfoDocument) {
+	if doc == nil {
+		return
+	}
+	fi, err := os.Lstat(nfoPath)
+	if err != nil || fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 || fi.Size() <= 0 || fi.Size() > 1<<20 {
+		return
+	}
+	raw, err := os.ReadFile(nfoPath)
+	if err != nil {
+		return
+	}
+	var existing nfoDocument
+	if err := xml.Unmarshal(raw, &existing); err != nil {
+		return
+	}
+	if doc.Premiered == "" && strings.TrimSpace(existing.Premiered) != "" {
+		doc.Premiered = strings.TrimSpace(existing.Premiered)
+	}
+	if doc.Tagline == "" && strings.TrimSpace(existing.Tagline) != "" {
+		doc.Tagline = strings.TrimSpace(existing.Tagline)
+	}
+	if doc.TVDBID == "" && strings.TrimSpace(existing.TVDBID) != "" {
+		doc.TVDBID = strings.TrimSpace(existing.TVDBID)
+	}
+	if doc.Season == nil && existing.Season != nil {
+		v := *existing.Season
+		doc.Season = &v
+	}
+	if doc.Episode == nil && existing.Episode != nil {
+		v := *existing.Episode
+		doc.Episode = &v
+	}
+	if len(doc.Studios) == 0 && len(existing.Studios) > 0 {
+		doc.Studios = existing.Studios
+	}
+	if len(doc.Directors) == 0 && len(existing.Directors) > 0 {
+		doc.Directors = existing.Directors
+	}
+	if len(doc.Writers) == 0 && len(existing.Writers) > 0 {
+		doc.Writers = existing.Writers
+	}
 }
 
 func decodeExtraMap(raw string) map[string]any {

@@ -246,16 +246,23 @@ func (h *Handler) readLogLinesPage(name string, start, limit int) ([]string, int
 
 	page := make([]string, 0)
 	total := 0
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for sc.Scan() {
-		if total >= start && len(page) < limit {
-			page = append(page, escapeLogControlChars(sc.Text()))
+	reader := bufio.NewReaderSize(f, 64*1024)
+	for {
+		line, readErr := reader.ReadString('\n')
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return nil, 0, readErr
 		}
-		total++
-	}
-	if err := sc.Err(); err != nil {
-		return nil, 0, err
+		if len(line) > 0 {
+			line = strings.TrimSuffix(line, "\n")
+			line = strings.TrimSuffix(line, "\r")
+			if total >= start && len(page) < limit {
+				page = append(page, escapeLogControlChars(line))
+			}
+			total++
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
 	}
 	return page, total, nil
 }

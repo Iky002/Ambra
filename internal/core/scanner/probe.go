@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,10 +13,41 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/pkg/ticks"
 )
 
-const defaultProbeTimeout = 15 * time.Second
+const (
+	defaultProbeTimeout          = 15 * time.Second
+	maxProbeOutputBytes          = 16 << 20 // 16 MiB
+	probeLocalProtocolWhitelist  = "file,pipe"
+	probeRemoteProtocolWhitelist = "http,https,tcp,tls,crypto"
+)
+
+type limitedProbeBuffer struct {
+	buf       bytes.Buffer
+	max       int
+	truncated bool
+}
+
+func (l *limitedProbeBuffer) Write(p []byte) (int, error) {
+	if l.max <= 0 {
+		l.truncated = true
+		return len(p), nil
+	}
+	rem := l.max - l.buf.Len()
+	if rem <= 0 {
+		l.truncated = true
+		return len(p), nil
+	}
+	if len(p) > rem {
+		_, _ = l.buf.Write(p[:rem])
+		l.truncated = true
+		return len(p), nil
+	}
+	_, _ = l.buf.Write(p)
+	return len(p), nil
+}
 
 // ProbedStream holds normalized metadata for a single embedded stream discovered by ffprobe.
 type ProbedStream struct {
@@ -122,9 +154,19 @@ func (p *Prober) Probe(ctx context.Context, filePath string) (*ProbeResult, erro
 	if trimmed == "" {
 		return nil, errors.New("ffprobe: empty file path")
 	}
+	if strings.ContainsAny(trimmed, "\r\n\x00") {
+		return nil, errors.New("ffprobe: file path contains forbidden control characters")
+	}
 	lower := strings.ToLower(trimmed)
 	probeTarget := trimmed
-	if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
+	isRemote := strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
+	whitelist := probeLocalProtocolWhitelist
+	if isRemote {
+		if err := netutil.ValidateRemoteURL(trimmed, true); err != nil {
+			return nil, fmt.Errorf("ffprobe: invalid remote url %q: %w", filePath, err)
+		}
+		whitelist = probeRemoteProtocolWhitelist
+	} else {
 		absPath, err := filepath.Abs(trimmed)
 		if err != nil {
 			return nil, fmt.Errorf("ffprobe: resolve path %q: %w", filePath, err)
@@ -138,10 +180,14 @@ func (p *Prober) Probe(ctx context.Context, filePath string) (*ProbeResult, erro
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(
-		probeCtx,
-		ffprobePath,
+	args := []string{
 		"-v", "quiet",
+		"-protocol_whitelist", whitelist,
+	}
+	if isRemote {
+		args = append(args, "-follow_redirects", "0")
+	}
+	args = append(args,
 		"-print_format", "json",
 		"-show_format",
 		"-show_streams",
@@ -149,11 +195,16 @@ func (p *Prober) Probe(ctx context.Context, filePath string) (*ProbeResult, erro
 		"--",
 		probeTarget,
 	)
-	out, err := cmd.Output()
-	if err != nil {
+	cmd := exec.CommandContext(probeCtx, ffprobePath, args...)
+	stdout := &limitedProbeBuffer{max: maxProbeOutputBytes}
+	cmd.Stdout = stdout
+	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("ffprobe %q: %w", filePath, err)
 	}
-	return ParseFFprobeJSON(out)
+	if stdout.truncated {
+		return nil, fmt.Errorf("ffprobe %q: output exceeds maximum size of %d bytes", filePath, maxProbeOutputBytes)
+	}
+	return ParseFFprobeJSON(stdout.buf.Bytes())
 }
 
 type ffprobeOutput struct {

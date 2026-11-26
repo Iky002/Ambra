@@ -125,13 +125,36 @@ export function DevicesKeysTab() {
   }
 
   const handleCopy = async (token: string) => {
+    let copied = false
     try {
-      await navigator.clipboard.writeText(token)
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(token)
+        copied = true
+      }
+    } catch {
+      copied = false
+    }
+    if (!copied) {
+      try {
+        const ta = document.createElement('textarea')
+        ta.value = token
+        ta.setAttribute('readonly', '')
+        ta.style.position = 'fixed'
+        ta.style.opacity = '0'
+        document.body.appendChild(ta)
+        ta.select()
+        copied = document.execCommand('copy')
+        document.body.removeChild(ta)
+      } catch {
+        copied = false
+      }
+    }
+    if (copied) {
       setCopiedKey(token)
       window.setTimeout(() => {
         setCopiedKey((prev) => (prev === token ? null : prev))
       }, 2000)
-    } catch {
+    } else {
       setFeedback({ type: 'error', message: '复制失败，请手动选中复制' })
     }
   }

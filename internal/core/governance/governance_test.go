@@ -830,7 +830,7 @@ func TestGovernanceSecurityHardeningAndAuditEdges(t *testing.T) {
 	}
 
 	// Verify genres, tags, lowercase taxonomy kind, sort_key, custom ProviderName, and updated FTS pinyin/tokens
-	genres, tags, err := svc.loadItemTaxonomies(ctx, movie.ID)
+	genres, _, tags, err := svc.loadItemTaxonomies(ctx, movie.ID)
 	if err != nil {
 		t.Fatal(err)
 	}

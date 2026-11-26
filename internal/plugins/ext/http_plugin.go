@@ -146,6 +146,14 @@ func (p *HTTPPlugin) Manifest() plugins.Manifest {
 	}
 }
 
+func urlHostLower(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(u.Host))
+}
+
 // Configure dynamically updates Endpoint, APIKey, Enabled, Priority, and TimeoutMs.
 func (p *HTTPPlugin) Configure(cfg map[string]any) error {
 	if cfg == nil {
@@ -154,15 +162,20 @@ func (p *HTTPPlugin) Configure(cfg map[string]any) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	hasNewAPIKey := false
+	if raw, ok := lookupString(cfg, "APIKey", "ApiKey", "api_key"); ok {
+		p.apiKey = strings.TrimSpace(raw)
+		hasNewAPIKey = true
+	}
 	if raw, ok := lookupString(cfg, "Endpoint", "endpoint"); ok {
 		ep, err := validateEndpoint(raw)
 		if err != nil {
 			return err
 		}
+		if urlHostLower(ep) != urlHostLower(p.endpoint) && !hasNewAPIKey {
+			p.apiKey = ""
+		}
 		p.endpoint = ep
-	}
-	if raw, ok := lookupString(cfg, "APIKey", "ApiKey", "api_key"); ok {
-		p.apiKey = strings.TrimSpace(raw)
 	}
 	if b, ok := lookupBool(cfg, "Enabled", "enabled"); ok {
 		p.enabled = b

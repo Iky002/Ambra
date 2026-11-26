@@ -139,7 +139,7 @@ func TestAuditV0104_H05_ProtocolWhitelistAndSSRF(t *testing.T) {
 
 	remoteExtract := BuildSubtitleExtractArgs("https://93.184.216.34/movie.mkv", 2, "vtt", "/tmp/out.vtt")
 	idxWL = slices.Index(remoteExtract, "-protocol_whitelist")
-	if idxWL < 0 || remoteExtract[idxWL+1] != "file,pipe,http,https,tcp,tls,crypto" {
+	if idxWL < 0 || remoteExtract[idxWL+1] != "http,https,tcp,tls,crypto" {
 		t.Fatalf("expected remote extract protocol_whitelist, got %v", remoteExtract)
 	}
 	if idxFR := slices.Index(remoteExtract, "-follow_redirects"); idxFR < 0 || remoteExtract[idxFR+1] != "0" {

@@ -56,6 +56,7 @@ func WithSymlinkPolicy(policy SymlinkPolicy) Option {
 type pendingBatch struct {
 	timer *time.Timer
 	paths map[string]struct{}
+	gen   uint64
 }
 
 // Watcher monitors media library root directories recursively using fsnotify,
@@ -72,6 +73,7 @@ type Watcher struct {
 	libDirs  map[string]map[string]struct{}
 	libRoots map[string][]string
 	pending  map[string]*pendingBatch
+	nextGen  uint64
 	started  bool
 	closed   bool
 	runCtx   context.Context
@@ -370,29 +372,40 @@ func (w *Watcher) scheduleDebounceLocked(libraryID, path string) {
 	if w.closed {
 		return
 	}
+	w.nextGen++
+	gen := w.nextGen
 	batch, ok := w.pending[libraryID]
 	if !ok {
 		batch = &pendingBatch{
 			paths: make(map[string]struct{}),
+			gen:   gen,
 		}
 		batch.timer = time.AfterFunc(w.debounce, func() {
-			w.flush(libraryID)
+			w.flushGen(libraryID, gen)
 		})
 		w.pending[libraryID] = batch
 	} else {
-		batch.timer.Reset(w.debounce)
+		batch.timer.Stop()
+		batch.gen = gen
+		batch.timer = time.AfterFunc(w.debounce, func() {
+			w.flushGen(libraryID, gen)
+		})
 	}
 	batch.paths[path] = struct{}{}
 }
 
 func (w *Watcher) flush(libraryID string) {
+	w.flushGen(libraryID, 0)
+}
+
+func (w *Watcher) flushGen(libraryID string, gen uint64) {
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
 		return
 	}
 	batch, ok := w.pending[libraryID]
-	if !ok {
+	if !ok || (gen != 0 && batch.gen != gen) {
 		w.mu.Unlock()
 		return
 	}

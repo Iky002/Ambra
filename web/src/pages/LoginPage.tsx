@@ -17,7 +17,7 @@ import {
   X,
 } from 'lucide-react'
 import { Navigate, useNavigate, useSearchParams } from 'react-router-dom'
-import { api, embyFetch, getUserImageUrl } from '../api/client'
+import { ApiError, api, embyFetch, getUserImageUrl } from '../api/client'
 import type { QuickConnectResult } from '../api/types'
 import { AmbraLogo } from '../components/AmbraLogo'
 import { LanguageSwitcher } from '../components/LanguageSwitcher'
@@ -25,9 +25,11 @@ import { useAuth } from '../context/AuthContext'
 import { isDemoMode } from '../demo/demoMode'
 import { useI18n } from '../i18n/I18nContext'
 
+const QUICK_CONNECT_TIMEOUT_MS = 5 * 60 * 1000
+
 export function LoginPage() {
   const { login, applyAuthResult } = useAuth()
-  const { locale, t } = useI18n()
+  const { locale, t, formatDateTime } = useI18n()
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const rawRedirect = searchParams.get('redirect') || ''
@@ -53,10 +55,13 @@ export function LoginPage() {
   const [qcOpen, setQcOpen] = useState(false)
   const [qcLoading, setQcLoading] = useState(false)
   const [qcAuthenticating, setQcAuthenticating] = useState(false)
+  const [qcExpired, setQcExpired] = useState(false)
   const [qcResult, setQcResult] = useState<QuickConnectResult | null>(null)
   const [qcError, setQcError] = useState('')
   const qcPollTimerRef = useRef<number | null>(null)
   const qcAuthenticatingRef = useRef(false)
+  const qcInitiateAbortRef = useRef<AbortController | null>(null)
+  const qcPollAbortRef = useRef<AbortController | null>(null)
 
   const demoActive = isDemoMode()
 
@@ -65,14 +70,19 @@ export function LoginPage() {
       window.clearInterval(qcPollTimerRef.current)
       qcPollTimerRef.current = null
     }
+    qcPollAbortRef.current?.abort()
+    qcPollAbortRef.current = null
   }, [])
 
   const closeQcModal = useCallback(() => {
+    qcInitiateAbortRef.current?.abort()
+    qcInitiateAbortRef.current = null
     clearQcPollTimer()
     qcAuthenticatingRef.current = false
     setQcOpen(false)
     setQcLoading(false)
     setQcAuthenticating(false)
+    setQcExpired(false)
     setQcResult(null)
     setQcError('')
   }, [clearQcPollTimer])
@@ -99,40 +109,65 @@ export function LoginPage() {
   )
 
   const startQuickConnect = useCallback(async () => {
+    qcInitiateAbortRef.current?.abort()
+    const controller = new AbortController()
+    qcInitiateAbortRef.current = controller
     clearQcPollTimer()
     qcAuthenticatingRef.current = false
     setQcOpen(true)
     setQcLoading(true)
     setQcAuthenticating(false)
+    setQcExpired(false)
     setQcError('')
     setQcResult(null)
     try {
-      const res = await api.quickConnectInitiate()
+      const res = await api.quickConnectInitiate(controller.signal)
+      if (controller.signal.aborted) return
       setQcResult(res)
     } catch (err) {
+      if (controller.signal.aborted) return
       setQcError(err instanceof Error ? err.message : '获取 Quick Connect 授权码失败，请稍后重试')
     } finally {
-      setQcLoading(false)
+      if (!controller.signal.aborted) {
+        setQcLoading(false)
+      }
     }
   }, [clearQcPollTimer])
 
   useEffect(() => {
-    if (!qcOpen || !qcResult?.Secret || qcResult.Authenticated) {
+    if (!qcOpen || !qcResult?.Secret || qcResult.Authenticated || qcExpired) {
       clearQcPollTimer()
       return
     }
     const secret = qcResult.Secret
+    const startedAt = Date.now()
     const timerId = window.setInterval(() => {
       if (qcAuthenticatingRef.current) return
+      if (Date.now() - startedAt >= QUICK_CONNECT_TIMEOUT_MS) {
+        clearQcPollTimer()
+        setQcExpired(true)
+        setQcError('Quick Connect 授权码已超时过期，请点击「重新生成」获取新授权码')
+        return
+      }
+      qcPollAbortRef.current?.abort()
+      const pollController = new AbortController()
+      qcPollAbortRef.current = pollController
       void api
-        .quickConnectConnect(secret)
+        .quickConnectConnect(secret, pollController.signal)
         .then((status) => {
+          if (pollController.signal.aborted) return
           if (status?.Authenticated) {
             setQcResult(status)
             void completeQcLogin(secret)
           }
         })
-        .catch(() => {
+        .catch((err) => {
+          if (pollController.signal.aborted) return
+          if (err instanceof ApiError && (err.status === 404 || err.status === 410)) {
+            clearQcPollTimer()
+            setQcExpired(true)
+            setQcError('Quick Connect 授权码已过期或失效，请点击「重新生成」')
+          }
           // 轮询期间忽略瞬时网络错误
         })
     }, 2000)
@@ -142,11 +177,15 @@ export function LoginPage() {
       if (qcPollTimerRef.current === timerId) {
         qcPollTimerRef.current = null
       }
+      qcPollAbortRef.current?.abort()
+      qcPollAbortRef.current = null
     }
-  }, [qcOpen, qcResult?.Secret, qcResult?.Authenticated, clearQcPollTimer, completeQcLogin])
+  }, [qcOpen, qcResult?.Secret, qcResult?.Authenticated, qcExpired, clearQcPollTimer, completeQcLogin])
 
   useEffect(() => {
     return () => {
+      qcInitiateAbortRef.current?.abort()
+      qcInitiateAbortRef.current = null
       clearQcPollTimer()
     }
   }, [clearQcPollTimer])
@@ -207,9 +246,7 @@ export function LoginPage() {
   }, [forgotOpen, forgotLoading, closeForgotModal])
 
   const formatPinExpiration = (raw: string): string => {
-    const parsed = new Date(raw)
-    if (Number.isNaN(parsed.getTime())) return raw
-    return parsed.toLocaleString('zh-CN')
+    return formatDateTime(raw)
   }
 
   const handleForgotStep1 = async (e: React.FormEvent) => {
@@ -750,6 +787,11 @@ export function LoginPage() {
                     <>
                       <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-400" />
                       <span className="text-emerald-300">授权已确认，正在登录影院...</span>
+                    </>
+                  ) : qcExpired ? (
+                    <>
+                      <AlertCircle className="h-3.5 w-3.5 text-amber-400" />
+                      <span className="text-amber-300">授权码已过期，请点击下方重新生成</span>
                     </>
                   ) : (
                     <>

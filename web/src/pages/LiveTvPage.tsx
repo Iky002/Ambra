@@ -171,12 +171,20 @@ export function LiveTvPage() {
   const recordings = useMemo(() => recordingsData?.Items || [], [recordingsData])
 
   const createTimerMutation = useMutation({
-    mutationFn: (prog: LiveTvProgramItem) => {
+    mutationFn: ({
+      program: prog,
+      channelId,
+      channelName,
+    }: {
+      program: LiveTvProgramItem
+      channelId: string
+      channelName?: string
+    }) => {
       const startIso = prog.StartDate || new Date(nowMs).toISOString()
       const endIso = prog.EndDate || new Date(Date.parse(startIso) + 3_600_000).toISOString()
       return api.createLiveTvTimer({
-        ChannelId: activeChannel!.Id,
-        ChannelName: activeChannel!.Name,
+        ChannelId: channelId,
+        ChannelName: channelName,
         ProgramId: prog.Id,
         Name: prog.Name,
         Overview: prog.Overview,
@@ -184,11 +192,11 @@ export function LiveTvPage() {
         EndDate: endIso,
       })
     },
-    onMutate: (prog) => {
+    onMutate: ({ program: prog }) => {
       setSchedulingProgramId(prog.Id)
       setDvrFeedback(null)
     },
-    onSuccess: async (_created, prog) => {
+    onSuccess: async (_created, { program: prog }) => {
       setDvrFeedback({
         type: 'success',
         message: `已预约录制「${prog.Name}」`,
@@ -673,7 +681,13 @@ export function LiveTvPage() {
                               schedulingProgramId === currentProgram.Id ||
                               scheduledProgramIds.includes(currentProgram.Id)
                             }
-                            onClick={() => createTimerMutation.mutate(currentProgram)}
+                            onClick={() =>
+                              createTimerMutation.mutate({
+                                program: currentProgram,
+                                channelId: activeChannel.Id,
+                                channelName: activeChannel.Name,
+                              })
+                            }
                             className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors disabled:opacity-60 ${
                               scheduledProgramIds.includes(currentProgram.Id)
                                 ? 'border-emerald-500/35 bg-emerald-500/15 text-emerald-300'
@@ -745,7 +759,13 @@ export function LiveTvPage() {
                                 <button
                                   type="button"
                                   disabled={isScheduling || isScheduled}
-                                  onClick={() => createTimerMutation.mutate(prog)}
+                                  onClick={() =>
+                                    createTimerMutation.mutate({
+                                      program: prog,
+                                      channelId: activeChannel.Id,
+                                      channelName: activeChannel.Name,
+                                    })
+                                  }
                                   className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors disabled:opacity-60 ${
                                     isScheduled
                                       ? 'border-emerald-500/35 bg-emerald-500/15 text-emerald-300'

@@ -51,6 +51,7 @@ type Handler struct {
 	cfg               *config.Config
 	extractor         *transcode.Extractor
 	transcodeMgr      *transcode.Manager
+	streamResolver    func(ctx context.Context, rawPath string) (string, error)
 	httpClient        *http.Client
 	defaultHTTPClient *http.Client
 	clientOnce        sync.Once
@@ -96,6 +97,11 @@ func (h *Handler) SetExtractor(ext *transcode.Extractor) {
 // SetTranscodeManager attaches a transcode Manager so ActiveEncodings/Delete stops active sessions.
 func (h *Handler) SetTranscodeManager(mgr *transcode.Manager) {
 	h.transcodeMgr = mgr
+}
+
+// SetStreamResolver attaches a resolver (e.g. playback.Engine.ResolveStream) for .strm files.
+func (h *Handler) SetStreamResolver(fn func(ctx context.Context, rawPath string) (string, error)) {
+	h.streamResolver = fn
 }
 
 // SetHTTPClient overrides the HTTP client used for remote image downloading and proxying.
@@ -348,7 +354,7 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 
 func (h *Handler) serverID() string {
 	if h.cfg != nil {
-		return h.cfg.ServerID
+		return h.cfg.Snapshot().ServerID
 	}
 	return ""
 }

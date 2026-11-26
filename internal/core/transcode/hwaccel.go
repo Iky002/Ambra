@@ -117,6 +117,7 @@ func NewHardwareDetector(ffmpegPath string) *HardwareDetector {
 }
 
 // Detect returns cached hardware capabilities, probing FFmpeg on first call.
+// Transient errors or caller context cancellation are not permanently cached.
 func (d *HardwareDetector) Detect(ctx context.Context) *HWCapabilities {
 	d.mu.RLock()
 	if d.cached != nil {
@@ -131,8 +132,11 @@ func (d *HardwareDetector) Detect(ctx context.Context) *HWCapabilities {
 	if d.cached != nil {
 		return d.cached
 	}
-	d.cached = ProbeHardware(ctx, d.ffmpegPath)
-	return d.cached
+	caps := ProbeHardware(context.WithoutCancel(ctx), d.ffmpegPath)
+	if caps != nil && caps.FFmpegAvailable {
+		d.cached = caps
+	}
+	return caps
 }
 
 // SetCapabilities injects capabilities directly (useful for tests or manual overrides).

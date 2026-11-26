@@ -18,18 +18,37 @@ import (
 )
 
 type chartIndex struct {
-	imdbIDs   map[string]struct{}
-	doubanIDs map[string]struct{}
-	tmdbIDs   map[string]struct{}
-	titles    map[string][]int // normalized title -> slice of years (0 if unknown)
+	imdbIDs      map[string]struct{}
+	doubanIDs    map[string]struct{}
+	tmdbIDsAny   map[string]struct{}
+	tmdbIDsMovie map[string]struct{}
+	tmdbIDsTV    map[string]struct{}
+	titlesAny    map[string][]int // normalized title -> slice of years (0 if unknown)
+	titlesMovie  map[string][]int
+	titlesTV     map[string][]int
+}
+
+func normalizeChartMediaType(mt string) string {
+	switch strings.ToLower(strings.TrimSpace(mt)) {
+	case "movie", "film":
+		return "movie"
+	case "tv", "series", "show":
+		return "tv"
+	default:
+		return ""
+	}
 }
 
 func buildChartIndex(entries []ChartEntry) *chartIndex {
 	idx := &chartIndex{
-		imdbIDs:   make(map[string]struct{}, len(entries)),
-		doubanIDs: make(map[string]struct{}, len(entries)),
-		tmdbIDs:   make(map[string]struct{}, len(entries)),
-		titles:    make(map[string][]int, len(entries)*2),
+		imdbIDs:      make(map[string]struct{}, len(entries)),
+		doubanIDs:    make(map[string]struct{}, len(entries)),
+		tmdbIDsAny:   make(map[string]struct{}),
+		tmdbIDsMovie: make(map[string]struct{}),
+		tmdbIDsTV:    make(map[string]struct{}),
+		titlesAny:    make(map[string][]int),
+		titlesMovie:  make(map[string][]int),
+		titlesTV:     make(map[string][]int),
 	}
 	for _, e := range entries {
 		if id := normalizeIMDbID(e.IMDbID); id != "" {
@@ -38,20 +57,35 @@ func buildChartIndex(entries []ChartEntry) *chartIndex {
 		if id := strings.TrimSpace(e.DoubanID); id != "" {
 			idx.doubanIDs[id] = struct{}{}
 		}
+		ns := normalizeChartMediaType(e.MediaType)
 		if id := strings.TrimSpace(e.TMDBID); id != "" {
-			idx.tmdbIDs[id] = struct{}{}
+			switch ns {
+			case "movie":
+				idx.tmdbIDsMovie[id] = struct{}{}
+			case "tv":
+				idx.tmdbIDsTV[id] = struct{}{}
+			default:
+				idx.tmdbIDsAny[id] = struct{}{}
+			}
+		}
+		targetTitles := idx.titlesAny
+		switch ns {
+		case "movie":
+			targetTitles = idx.titlesMovie
+		case "tv":
+			targetTitles = idx.titlesTV
 		}
 		if norm := NormalizeTitle(e.Title); norm != "" {
-			idx.titles[norm] = append(idx.titles[norm], e.Year)
+			targetTitles[norm] = append(targetTitles[norm], e.Year)
 		}
 		if norm := NormalizeTitle(e.OriginalTitle); norm != "" {
-			idx.titles[norm] = append(idx.titles[norm], e.Year)
+			targetTitles[norm] = append(targetTitles[norm], e.Year)
 		}
 	}
 	return idx
 }
 
-func (idx *chartIndex) match(name, originalTitle string, year int, imdbID, doubanID, tmdbID string) bool {
+func (idx *chartIndex) match(mediaNS, name, originalTitle string, year int, imdbID, doubanID, tmdbID string) bool {
 	if idx == nil {
 		return false
 	}
@@ -66,17 +100,55 @@ func (idx *chartIndex) match(name, originalTitle string, year int, imdbID, douba
 		}
 	}
 	if tmdbID != "" {
-		if _, ok := idx.tmdbIDs[tmdbID]; ok {
+		if idx.matchTMDB(mediaNS, tmdbID) {
 			return true
 		}
 	}
-	if matchNormalizedTitle(idx.titles, NormalizeTitle(name), year) {
+	if idx.matchTitle(mediaNS, NormalizeTitle(name), year) {
 		return true
 	}
-	if matchNormalizedTitle(idx.titles, NormalizeTitle(originalTitle), year) {
+	if idx.matchTitle(mediaNS, NormalizeTitle(originalTitle), year) {
 		return true
 	}
 	return false
+}
+
+func (idx *chartIndex) matchTMDB(mediaNS, tmdbID string) bool {
+	if _, ok := idx.tmdbIDsAny[tmdbID]; ok {
+		return true
+	}
+	switch mediaNS {
+	case "movie":
+		_, ok := idx.tmdbIDsMovie[tmdbID]
+		return ok
+	case "tv":
+		_, ok := idx.tmdbIDsTV[tmdbID]
+		return ok
+	default:
+		if _, ok := idx.tmdbIDsMovie[tmdbID]; ok {
+			return true
+		}
+		_, ok := idx.tmdbIDsTV[tmdbID]
+		return ok
+	}
+}
+
+func (idx *chartIndex) matchTitle(mediaNS, norm string, year int) bool {
+	if norm == "" {
+		return false
+	}
+	if matchNormalizedTitle(idx.titlesAny, norm, year) {
+		return true
+	}
+	switch mediaNS {
+	case "movie":
+		return matchNormalizedTitle(idx.titlesMovie, norm, year)
+	case "tv":
+		return matchNormalizedTitle(idx.titlesTV, norm, year)
+	default:
+		return matchNormalizedTitle(idx.titlesMovie, norm, year) ||
+			matchNormalizedTitle(idx.titlesTV, norm, year)
+	}
 }
 
 func matchNormalizedTitle(titles map[string][]int, norm string, year int) bool {
@@ -311,8 +383,9 @@ func (s *Service) MatchTagsForTypedItem(itemType, name, originalTitle string, ye
 	imdbID, doubanID, tmdbID := extractProviderIDs(providerIDs)
 
 	itemTypeNorm := strings.ToLower(strings.TrimSpace(itemType))
-	allowMovie := itemTypeNorm == "" || itemTypeNorm == "movie"
-	allowTV := itemTypeNorm == "" || itemTypeNorm == "series" || itemTypeNorm == "tv"
+	mediaNS := normalizeChartMediaType(itemTypeNorm)
+	allowMovie := itemTypeNorm == "" || mediaNS == "movie"
+	allowTV := itemTypeNorm == "" || mediaNS == "tv"
 
 	s.mu.RLock()
 	dIdx := s.doubanIdx
@@ -331,21 +404,21 @@ func (s *Service) MatchTagsForTypedItem(itemType, name, originalTitle string, ye
 		}
 	}
 
-	if dIdx != nil && dIdx.match(name, originalTitle, year, imdbID, doubanID, tmdbID) {
+	if allowMovie && dIdx != nil && dIdx.match(mediaNS, name, originalTitle, year, imdbID, doubanID, tmdbID) {
 		tags = append(tags, TagDoubanTop250)
 	}
-	if iIdx != nil && iIdx.match(name, originalTitle, year, imdbID, doubanID, tmdbID) {
+	if allowMovie && iIdx != nil && iIdx.match(mediaNS, name, originalTitle, year, imdbID, doubanID, tmdbID) {
 		tags = append(tags, TagIMDbTop250)
 	}
-	if tIdx != nil && tIdx.match(name, originalTitle, year, imdbID, doubanID, tmdbID) {
+	if tIdx != nil && tIdx.match(mediaNS, name, originalTitle, year, imdbID, doubanID, tmdbID) {
 		addTrending()
 		tags = append(tags, TagTMDBTrendingSpecific)
 	}
-	if allowMovie && dmIdx != nil && dmIdx.match(name, originalTitle, year, imdbID, doubanID, tmdbID) {
+	if allowMovie && dmIdx != nil && dmIdx.match(mediaNS, name, originalTitle, year, imdbID, doubanID, tmdbID) {
 		addTrending()
 		tags = append(tags, TagDoubanTrendingMovie)
 	}
-	if allowTV && dtIdx != nil && dtIdx.match(name, originalTitle, year, imdbID, doubanID, tmdbID) {
+	if allowTV && dtIdx != nil && dtIdx.match(mediaNS, name, originalTitle, year, imdbID, doubanID, tmdbID) {
 		addTrending()
 		tags = append(tags, TagDoubanTrendingTV)
 	}

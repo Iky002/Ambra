@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { FolderPlus, Layers, ListVideo, Loader2, Plus } from 'lucide-react'
 import { api } from '../../api/client'
@@ -30,6 +30,7 @@ export function AddToCollectionModal({
   const userId = auth?.userId || ''
 
   const [activeTab, setActiveTab] = useState<ContainerTab>(() => (isAdmin ? 'BoxSet' : 'Playlist'))
+  const userSelectedTabRef = useRef(false)
   const [newName, setNewName] = useState('')
   const [error, setError] = useState<string | null>(null)
 
@@ -38,6 +39,8 @@ export function AddToCollectionModal({
   useEffect(() => {
     if (!isAdmin && activeTab === 'BoxSet') {
       setActiveTab('Playlist')
+    } else if (isAdmin && !userSelectedTabRef.current && activeTab !== 'BoxSet') {
+      setActiveTab('BoxSet')
     }
   }, [isAdmin, activeTab])
 
@@ -160,7 +163,10 @@ export function AddToCollectionModal({
               type="button"
               role="tab"
               aria-selected={effectiveTab === 'BoxSet'}
-              onClick={() => setActiveTab('BoxSet')}
+              onClick={() => {
+                userSelectedTabRef.current = true
+                setActiveTab('BoxSet')
+              }}
               className={`inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition-colors ${
                 effectiveTab === 'BoxSet'
                   ? 'bg-amber-500 text-zinc-950 shadow-sm'
@@ -174,7 +180,10 @@ export function AddToCollectionModal({
               type="button"
               role="tab"
               aria-selected={effectiveTab === 'Playlist'}
-              onClick={() => setActiveTab('Playlist')}
+              onClick={() => {
+                userSelectedTabRef.current = true
+                setActiveTab('Playlist')
+              }}
               className={`inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition-colors ${
                 effectiveTab === 'Playlist'
                   ? 'bg-amber-500 text-zinc-950 shadow-sm'

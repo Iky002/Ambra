@@ -109,4 +109,36 @@ describe('playbackPrefs', () => {
     expect(cfg.SubtitleMode).toBe('Smart')
     expect(cfg.RememberSubtitleSelections).toBe(true)
   })
+
+  it('H-20: PlayDefaultAudioTrack in playbackPrefsToUserConfig overrides existing config value', () => {
+    const nonMedia = savePlaybackPrefs({ preferredAudioLang: 'jpn' })
+    const cfg1 = playbackPrefsToUserConfig(nonMedia, { PlayDefaultAudioTrack: true })
+    expect(cfg1.PlayDefaultAudioTrack).toBe(false)
+    expect(cfg1.AudioLanguagePreference).toBe('jpn')
+
+    const media = savePlaybackPrefs({ preferredAudioLang: 'media' })
+    const cfg2 = playbackPrefsToUserConfig(media, { PlayDefaultAudioTrack: false })
+    expect(cfg2.PlayDefaultAudioTrack).toBe(true)
+    expect(cfg2.AudioLanguagePreference).toBe('')
+  })
+
+  it('H-21: supports Smart subtitle mode based on selectedAudioStream language', () => {
+    const subsWithForced: MediaStream[] = [
+      { Type: 'Subtitle', Index: 3, Language: 'chi', Codec: 'srt', Title: '简体中文', SubVariant: 'chs', IsForced: false },
+      { Type: 'Subtitle', Index: 4, Language: 'chi', Codec: 'srt', Title: '简体强制字幕', SubVariant: 'chs', IsForced: true },
+      { Type: 'Subtitle', Index: 5, Language: 'eng', Codec: 'srt', Title: 'English', IsForced: false },
+    ]
+    const subsWithoutForced = subsWithForced.filter((s) => !s.IsForced)
+
+    const zhAudio: MediaStream = { Type: 'Audio', Index: 1, Language: 'chi', Codec: 'aac' }
+    const jpnAudio: MediaStream = { Type: 'Audio', Index: 2, Language: 'jpn', Codec: 'aac' }
+
+    // 音轨与用户母语/偏好语言一致：若有强制字幕则仅选强制字幕，否则不开启字幕
+    expect(pickPreferredSubtitleIndex(subsWithForced, 'auto', undefined, 'zh-CN', 'Smart', zhAudio)).toBe(4)
+    expect(pickPreferredSubtitleIndex(subsWithoutForced, 'auto', undefined, 'zh-CN', 'Smart', zhAudio)).toBeUndefined()
+
+    // 音轨为外语：按偏好语言选中对应字幕
+    expect(pickPreferredSubtitleIndex(subsWithoutForced, 'auto', undefined, 'zh-CN', 'Smart', jpnAudio)).toBe(3)
+    expect(pickPreferredSubtitleIndex(subsWithForced, 'eng', undefined, 'zh-CN', 'Smart', jpnAudio)).toBe(5)
+  })
 })

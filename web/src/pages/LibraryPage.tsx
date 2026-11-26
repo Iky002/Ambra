@@ -219,7 +219,7 @@ export function LibraryPage() {
       yearFilter,
       tagFilter,
       studioFilter,
-      studioFilter ? 0 : page,
+      page,
     ],
     queryFn: () =>
       api.getItems(userId, {
@@ -231,11 +231,12 @@ export function LibraryPage() {
         genres: genreFilter || undefined,
         years: yearFilter || undefined,
         tags: tagFilter || undefined,
+        studios: studioFilter || undefined,
         nameLessThan: letterFilter === '#' ? 'a' : undefined,
         nameStartsWith:
           letterFilter && letterFilter !== '#' ? letterFilter.toLowerCase() : undefined,
-        startIndex: studioFilter ? 0 : page * PAGE_SIZE,
-        limit: studioFilter ? 500 : PAGE_SIZE,
+        startIndex: page * PAGE_SIZE,
+        limit: PAGE_SIZE,
       }),
     enabled: Boolean(id && (libraryInfo || libraryInfoFetched)),
     placeholderData: (prev) => prev,
@@ -244,17 +245,26 @@ export function LibraryPage() {
   const { items, total } = useMemo(() => {
     const rawItems = data?.Items || []
     if (!studioFilter) {
-      return { items: rawItems, total: data?.TotalRecordCount || 0 }
+      return { items: rawItems, total: data?.TotalRecordCount ?? rawItems.length }
     }
     const targetStudio = studioFilter.trim().toLowerCase()
+    const hasStudioMismatch = rawItems.some(
+      (item) =>
+        item.Studios &&
+        item.Studios.length > 0 &&
+        !item.Studios.some((s) => s.Name.trim().toLowerCase() === targetStudio),
+    )
+    if (!hasStudioMismatch) {
+      return { items: rawItems, total: data?.TotalRecordCount ?? rawItems.length }
+    }
     const matched = rawItems.filter((item) =>
       item.Studios?.some((s) => s.Name.trim().toLowerCase() === targetStudio),
     )
     return {
-      items: matched.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE),
+      items: matched,
       total: matched.length,
     }
-  }, [data, studioFilter, page])
+  }, [data, studioFilter])
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const hasActiveFilters = Boolean(

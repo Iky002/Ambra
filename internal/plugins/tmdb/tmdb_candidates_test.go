@@ -71,7 +71,7 @@ func TestTMDBSearchCandidatesMovieAndSeries(t *testing.T) {
 
 	p := New("test-key", "zh-CN")
 	p.SetHTTPClient(srv.Client())
-	_ = p.Configure(map[string]any{"base_url": srv.URL})
+	_ = p.Configure(map[string]any{"base_url": srv.URL, "api_key": "test-key"})
 
 	if res, err := p.SearchCandidates(context.Background(), "Movie", "   ", 0, ""); err != nil || res != nil {
 		t.Fatalf("expected nil, nil for empty query, got %v, %v", res, err)
@@ -157,7 +157,7 @@ func TestTMDBFetchImages(t *testing.T) {
 
 	p := New("test-key", "zh-CN")
 	p.SetHTTPClient(srv.Client())
-	_ = p.Configure(map[string]any{"base_url": srv.URL})
+	_ = p.Configure(map[string]any{"base_url": srv.URL, "api_key": "test-key"})
 
 	if imgs, err := p.FetchImages(context.Background(), "Movie", ""); err != nil || imgs != nil {
 		t.Fatalf("expected nil, nil for empty tmdbID, got %v, %v", imgs, err)

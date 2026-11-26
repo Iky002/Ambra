@@ -14,6 +14,7 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
 	"net/netip"
@@ -66,7 +67,8 @@ func (h *Handler) handleListItemImages(w http.ResponseWriter, r *http.Request) {
 			`SELECT image_type, image_index, path, tag, COALESCE(width, 0), COALESCE(height, 0)
 			 FROM item_images WHERE item_id = ? ORDER BY image_type ASC, image_index ASC`, itemID)
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("failed to list item images", "item_id", itemID, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to list item images")
 			return
 		}
 		defer rows.Close()
@@ -137,7 +139,18 @@ func (h *Handler) handleServeItemImageFull(w http.ResponseWriter, r *http.Reques
 			httpx.Error(w, http.StatusNotFound, "image not found")
 			return
 		}
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		if errors.Is(err, os.ErrPermission) {
+			imgPath := itemID
+			if h.repo != nil {
+				if rec, rErr := h.repo.GetImageByItemAndType(r.Context(), itemID, imageType, idx); rErr == nil && rec != nil && rec.Path != "" {
+					imgPath = rec.Path
+				}
+			}
+			logAndWritePermissionDenied(w, imgPath, err)
+			return
+		}
+		slog.Error("failed to serve item image", "item_id", itemID, "image_type", imageType, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to serve item image")
 	}
 }
 
@@ -169,6 +182,10 @@ func (h *Handler) handleUploadItemImage(w http.ResponseWriter, r *http.Request) 
 	}
 	if _, err := h.repo.GetItemRecordByID(r.Context(), itemID); errors.Is(err, sqlite.ErrNotFound) {
 		httpx.Error(w, http.StatusNotFound, "item not found")
+		return
+	} else if err != nil {
+		slog.Error("failed to load item for image upload", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to load item")
 		return
 	}
 
@@ -205,13 +222,14 @@ func (h *Handler) handleUploadItemImage(w http.ResponseWriter, r *http.Request) 
 	}
 	if filePath == "" {
 		baseDir := os.TempDir()
-		if h.cfg != nil && h.cfg.DataDir != "" {
-			baseDir = filepath.Join(h.cfg.DataDir, "metadata", "images", itemID)
+		if dataDir := h.configDataDir(); dataDir != "" {
+			baseDir = filepath.Join(dataDir, "metadata", "images", itemID)
 		} else {
 			baseDir = filepath.Join(baseDir, "ambra-images", itemID)
 		}
 		if err := os.MkdirAll(baseDir, 0o755); err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("failed to create image directory", "dir", baseDir, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to save image")
 			return
 		}
 		var err error
@@ -221,7 +239,8 @@ func (h *Handler) handleUploadItemImage(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		if err := os.WriteFile(filePath, data, 0o644); err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("failed to write uploaded image", "path", filePath, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to save image")
 			return
 		}
 	}
@@ -240,7 +259,8 @@ func (h *Handler) handleUploadItemImage(w http.ResponseWriter, r *http.Request) 
 			itemID, imageType, idx, filePath, tag, width, height,
 		)
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("failed to persist uploaded image record", "item_id", itemID, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to save image record")
 			return
 		}
 	}
@@ -261,6 +281,13 @@ func safeRasterImageType(data []byte) (string, bool) {
 	}
 }
 
+func (h *Handler) configDataDir() string {
+	if h.cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(h.cfg.Snapshot().DataDir)
+}
+
 func (h *Handler) cleanupReplacedImageFile(oldPath, newPath string) {
 	oldClean := filepath.Clean(strings.TrimSpace(oldPath))
 	newClean := filepath.Clean(strings.TrimSpace(newPath))
@@ -268,8 +295,8 @@ func (h *Handler) cleanupReplacedImageFile(oldPath, newPath string) {
 		return
 	}
 	managedDirs := []string{filepath.Join(os.TempDir(), "ambra-images")}
-	if h.cfg != nil && strings.TrimSpace(h.cfg.DataDir) != "" {
-		managedDirs = append(managedDirs, filepath.Join(h.cfg.DataDir, "metadata", "images"))
+	if dataDir := h.configDataDir(); dataDir != "" {
+		managedDirs = append(managedDirs, filepath.Join(dataDir, "metadata", "images"))
 	}
 	for _, root := range managedDirs {
 		rel, err := filepath.Rel(filepath.Clean(root), oldClean)
@@ -344,9 +371,17 @@ func (h *Handler) handleDeleteItemImage(w http.ResponseWriter, r *http.Request) 
 			`DELETE FROM item_images WHERE item_id = ? AND LOWER(image_type) = LOWER(?) AND image_index = ?`,
 			itemID, imageType, idx,
 		)
-		if imgPath != "" && h.cfg != nil && h.cfg.DataDir != "" &&
-			strings.HasPrefix(imgPath, filepath.Join(h.cfg.DataDir, "metadata", "images")) {
-			_ = os.Remove(imgPath)
+		if imgPath != "" {
+			if dataDir := h.configDataDir(); dataDir != "" {
+				managedRoot := filepath.Clean(filepath.Join(dataDir, "metadata", "images"))
+				cleanImg := filepath.Clean(strings.TrimSpace(imgPath))
+				if rel, err := filepath.Rel(managedRoot, cleanImg); err == nil &&
+					rel != "." && rel != ".." &&
+					!strings.HasPrefix(rel, ".."+string(filepath.Separator)) &&
+					!filepath.IsAbs(rel) {
+					_ = os.Remove(cleanImg)
+				}
+			}
 		}
 	}
 	httpx.NoContent(w)
@@ -370,7 +405,8 @@ func (h *Handler) handleUpdateImageIndex(w http.ResponseWriter, r *http.Request)
 	if h.store != nil && oldIdx != newIdx {
 		tx, err := h.store.Writer.BeginTx(r.Context(), nil)
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("failed to begin image index update tx", "item_id", itemID, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to update image index")
 			return
 		}
 		defer tx.Rollback()
@@ -380,7 +416,8 @@ func (h *Handler) handleUpdateImageIndex(w http.ResponseWriter, r *http.Request)
 			`SELECT COUNT(*) FROM item_images WHERE item_id = ? AND LOWER(image_type) = LOWER(?) AND image_index = ?`,
 			itemID, imageType, oldIdx,
 		).Scan(&oldExists); err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("failed to check source image index", "item_id", itemID, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to update image index")
 			return
 		}
 		if oldExists > 0 {
@@ -389,7 +426,8 @@ func (h *Handler) handleUpdateImageIndex(w http.ResponseWriter, r *http.Request)
 				`SELECT COUNT(*) FROM item_images WHERE item_id = ? AND LOWER(image_type) = LOWER(?) AND image_index = ?`,
 				itemID, imageType, newIdx,
 			).Scan(&targetExists); err != nil {
-				httpx.Error(w, http.StatusInternalServerError, err.Error())
+				slog.Error("failed to check target image index", "item_id", itemID, "error", err)
+				httpx.Error(w, http.StatusInternalServerError, "failed to update image index")
 				return
 			}
 			if targetExists > 0 {
@@ -398,21 +436,24 @@ func (h *Handler) handleUpdateImageIndex(w http.ResponseWriter, r *http.Request)
 					`UPDATE item_images SET image_index = ? WHERE item_id = ? AND LOWER(image_type) = LOWER(?) AND image_index = ?`,
 					tempIdx, itemID, imageType, newIdx,
 				); err != nil {
-					httpx.Error(w, http.StatusInternalServerError, err.Error())
+					slog.Error("failed to swap image index step 1", "item_id", itemID, "error", err)
+					httpx.Error(w, http.StatusInternalServerError, "failed to update image index")
 					return
 				}
 				if _, err := tx.ExecContext(r.Context(),
 					`UPDATE item_images SET image_index = ? WHERE item_id = ? AND LOWER(image_type) = LOWER(?) AND image_index = ?`,
 					newIdx, itemID, imageType, oldIdx,
 				); err != nil {
-					httpx.Error(w, http.StatusInternalServerError, err.Error())
+					slog.Error("failed to swap image index step 2", "item_id", itemID, "error", err)
+					httpx.Error(w, http.StatusInternalServerError, "failed to update image index")
 					return
 				}
 				if _, err := tx.ExecContext(r.Context(),
 					`UPDATE item_images SET image_index = ? WHERE item_id = ? AND LOWER(image_type) = LOWER(?) AND image_index = ?`,
 					oldIdx, itemID, imageType, tempIdx,
 				); err != nil {
-					httpx.Error(w, http.StatusInternalServerError, err.Error())
+					slog.Error("failed to swap image index step 3", "item_id", itemID, "error", err)
+					httpx.Error(w, http.StatusInternalServerError, "failed to update image index")
 					return
 				}
 			} else {
@@ -420,12 +461,14 @@ func (h *Handler) handleUpdateImageIndex(w http.ResponseWriter, r *http.Request)
 					`UPDATE item_images SET image_index = ? WHERE item_id = ? AND LOWER(image_type) = LOWER(?) AND image_index = ?`,
 					newIdx, itemID, imageType, oldIdx,
 				); err != nil {
-					httpx.Error(w, http.StatusInternalServerError, err.Error())
+					slog.Error("failed to update image index", "item_id", itemID, "error", err)
+					httpx.Error(w, http.StatusInternalServerError, "failed to update image index")
 					return
 				}
 			}
 			if err := tx.Commit(); err != nil {
-				httpx.Error(w, http.StatusInternalServerError, err.Error())
+				slog.Error("failed to commit image index update", "item_id", itemID, "error", err)
+				httpx.Error(w, http.StatusInternalServerError, "failed to update image index")
 				return
 			}
 		}
@@ -473,12 +516,14 @@ func (h *Handler) handleSetImageURL(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusNotFound, "item not found")
 		return
 	} else if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to load item for set image url", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to load item")
 		return
 	}
 
 	if err := h.downloadAndSaveItemImage(r.Context(), itemID, imageType, idx, rawURL); err != nil {
-		httpx.Error(w, http.StatusBadGateway, err.Error())
+		slog.Error("failed to download remote image", "item_id", itemID, "url", rawURL, "error", err)
+		httpx.Error(w, http.StatusBadGateway, "failed to download remote image")
 		return
 	}
 	httpx.NoContent(w)
@@ -500,7 +545,8 @@ func (h *Handler) handleRemoteImages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to load item for remote images", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to load item")
 		return
 	}
 	if !h.canAccessItem(r, rec) {
@@ -615,7 +661,8 @@ func (h *Handler) handleDownloadRemoteImage(w http.ResponseWriter, r *http.Reque
 		httpx.Error(w, http.StatusNotFound, "item not found")
 		return
 	} else if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to load item for download remote image", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to load item")
 		return
 	}
 
@@ -631,7 +678,8 @@ func (h *Handler) handleDownloadRemoteImage(w http.ResponseWriter, r *http.Reque
 	}
 
 	if err := h.downloadAndSaveItemImage(r.Context(), itemID, imageType, idx, imageURL); err != nil {
-		httpx.Error(w, http.StatusBadGateway, err.Error())
+		slog.Error("failed to download remote image", "item_id", itemID, "url", imageURL, "error", err)
+		httpx.Error(w, http.StatusBadGateway, "failed to download remote image")
 		return
 	}
 	httpx.NoContent(w)
@@ -745,8 +793,8 @@ func (h *Handler) downloadAndSaveItemImage(ctx context.Context, itemID, imageTyp
 	}
 	if filePath == "" {
 		baseDir := filepath.Join(os.TempDir(), "ambra-images", itemID)
-		if h.cfg != nil && strings.TrimSpace(h.cfg.DataDir) != "" {
-			baseDir = filepath.Join(h.cfg.DataDir, "metadata", "images", itemID)
+		if dataDir := h.configDataDir(); dataDir != "" {
+			baseDir = filepath.Join(dataDir, "metadata", "images", itemID)
 		}
 		if err := os.MkdirAll(baseDir, 0o755); err != nil {
 			return err
@@ -935,7 +983,18 @@ func (h *Handler) handleEntityImage(kind string) http.HandlerFunc {
 				httpx.Error(w, http.StatusNotFound, "image not found")
 				return
 			}
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			if errors.Is(err, os.ErrPermission) {
+				imgPath := entityID
+				if h.repo != nil {
+					if rec, rErr := h.repo.GetImageByItemAndType(r.Context(), entityID, imageType, idx); rErr == nil && rec != nil && rec.Path != "" {
+						imgPath = rec.Path
+					}
+				}
+				logAndWritePermissionDenied(w, imgPath, err)
+				return
+			}
+			slog.Error("failed to serve entity image", "entity_id", entityID, "image_type", imageType, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to serve image")
 		}
 	}
 }

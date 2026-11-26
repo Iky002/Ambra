@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"sort"
@@ -125,7 +126,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 
 func (h *Handler) serverID() string {
 	if h.cfg != nil {
-		return h.cfg.ServerID
+		return h.cfg.Snapshot().ServerID
 	}
 	return ""
 }
@@ -404,10 +405,12 @@ func (h *Handler) handleUserViews(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 
 	libs, err := h.repo.ListLibraries(r.Context())
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to list libraries", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to list libraries")
 		return
 	}
 	items := make([]dto.BaseItemDto, 0, len(libs))
@@ -415,7 +418,7 @@ func (h *Handler) handleUserViews(w http.ResponseWriter, r *http.Request) {
 		if !isLibraryAllowed(lib.ID, allowed) {
 			continue
 		}
-		items = append(items, h.libraryToViewDto(r.Context(), lib))
+		items = append(items, h.libraryToViewDto(r.Context(), lib, maxRating, blockedTags))
 	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            items,
@@ -423,17 +426,19 @@ func (h *Handler) handleUserViews(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handler) libraryToViewDto(ctx context.Context, lib sqlite.LibraryRecord) dto.BaseItemDto {
+func (h *Handler) libraryToViewDto(ctx context.Context, lib sqlite.LibraryRecord, maxRating *int, blockedTags []string) dto.BaseItemDto {
 	imageTags := map[string]string{}
 	if img, err := h.repo.GetImageByItemAndType(ctx, lib.ID, "Primary", 0); err == nil && img != nil && img.Tag != "" {
 		imageTags["Primary"] = img.Tag
 	}
 	if imageTags["Primary"] == "" {
 		if children, _, err := h.repo.QueryItems(ctx, sqlite.ItemFilter{
-			LibraryID:        lib.ID,
-			IncludeItemTypes: []string{"Movie", "Series", "MusicAlbum", "Video"},
-			Recursive:        true,
-			Limit:            12,
+			LibraryID:         lib.ID,
+			MaxParentalRating: maxRating,
+			BlockedTags:       blockedTags,
+			IncludeItemTypes:  []string{"Movie", "Series", "MusicAlbum", "Video"},
+			Recursive:         true,
+			Limit:             12,
 		}); err == nil {
 			for _, it := range children {
 				if len(it.BackdropImageTags) > 0 && it.BackdropImageTags[0] != "" {
@@ -584,7 +589,8 @@ func (h *Handler) handleQueryItems(w http.ResponseWriter, r *http.Request) {
 
 	items, total, err := h.repo.QueryItems(r.Context(), filter)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in library handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if mayReturnPlaylists && h.isNonAdminCaller(r) {
@@ -642,7 +648,8 @@ func (h *Handler) handleLatestItems(w http.ResponseWriter, r *http.Request) {
 		blockedTags,
 	)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in library handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	// Emby /Items/Latest returns a bare JSON array
@@ -673,7 +680,8 @@ func (h *Handler) handleResumeItems(w http.ResponseWriter, r *http.Request) {
 		blockedTags,
 	)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in library handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	h.sanitizeItemsPathsForCaller(r, items)
@@ -704,19 +712,21 @@ func (h *Handler) handleGetItem(w http.ResponseWriter, r *http.Request) {
 				httpx.Error(w, http.StatusForbidden, "access denied")
 				return
 			}
-			httpx.JSON(w, http.StatusOK, h.libraryToViewDto(r.Context(), *lib))
+			httpx.JSON(w, http.StatusOK, h.libraryToViewDto(r.Context(), *lib, maxRating, blockedTags))
 			return
 		}
 		httpx.Error(w, http.StatusNotFound, "item not found")
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in library handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	rec, recErr := h.repo.GetItemRecordByID(r.Context(), itemID)
 	if recErr != nil && !errors.Is(recErr, sqlite.ErrNotFound) {
-		httpx.Error(w, http.StatusInternalServerError, recErr.Error())
+		slog.Error("failed to load item record", "item_id", itemID, "error", recErr)
+		httpx.Error(w, http.StatusInternalServerError, "failed to load item")
 		return
 	}
 	if recErr == nil && rec != nil {
@@ -731,7 +741,8 @@ func (h *Handler) handleGetItem(w http.ResponseWriter, r *http.Request) {
 		}
 		if maxRating != nil || len(blockedTags) > 0 {
 			if blocked, blockErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags); blockErr != nil {
-				httpx.Error(w, http.StatusInternalServerError, blockErr.Error())
+				slog.Error("failed to check parental policy", "item_id", rec.ID, "error", blockErr)
+				httpx.Error(w, http.StatusInternalServerError, "failed to verify item access")
 				return
 			} else if blocked {
 				httpx.Error(w, http.StatusForbidden, "access denied")
@@ -777,7 +788,8 @@ func (h *Handler) handleItemCounts(w http.ResponseWriter, r *http.Request) {
 	if maxRating == nil && len(blockedTags) == 0 && isFav == nil {
 		counts, err := h.repo.GetItemCountsWithAllowedLibraries(r.Context(), allowed)
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("internal error in library handler", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal server error")
 			return
 		}
 		httpx.JSON(w, http.StatusOK, counts)
@@ -797,7 +809,8 @@ func (h *Handler) handleItemCounts(w http.ResponseWriter, r *http.Request) {
 		EnableTotalRecordCount: &disableTotal,
 	})
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in library handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	c := &sqlite.ItemCounts{}
@@ -852,7 +865,8 @@ func (h *Handler) handleShowSeasons(w http.ResponseWriter, r *http.Request) {
 			}
 			if maxRating != nil || len(blockedTags) > 0 {
 				if blocked, blockErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags); blockErr != nil {
-					httpx.Error(w, http.StatusInternalServerError, blockErr.Error())
+					slog.Error("failed to check parental policy", "item_id", rec.ID, "error", blockErr)
+					httpx.Error(w, http.StatusInternalServerError, "failed to verify item access")
 					return
 				} else if blocked {
 					httpx.Error(w, http.StatusForbidden, "access denied")
@@ -883,7 +897,8 @@ func (h *Handler) handleShowSeasons(w http.ResponseWriter, r *http.Request) {
 		Fields:            q.List("Fields"),
 	})
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in library handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if isSpecial != nil {
@@ -930,7 +945,8 @@ func (h *Handler) handleShowEpisodes(w http.ResponseWriter, r *http.Request) {
 			}
 			if maxRating != nil || len(blockedTags) > 0 {
 				if blocked, blockErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags); blockErr != nil {
-					httpx.Error(w, http.StatusInternalServerError, blockErr.Error())
+					slog.Error("failed to check parental policy", "item_id", rec.ID, "error", blockErr)
+					httpx.Error(w, http.StatusInternalServerError, "failed to verify item access")
 					return
 				} else if blocked {
 					httpx.Error(w, http.StatusForbidden, "access denied")
@@ -982,7 +998,8 @@ func (h *Handler) handleShowEpisodes(w http.ResponseWriter, r *http.Request) {
 		Fields:            q.List("Fields"),
 	})
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in library handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 
@@ -1069,7 +1086,8 @@ func (h *Handler) handleNextUp(w http.ResponseWriter, r *http.Request) {
 		blockedTags,
 	)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in library handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	h.sanitizeItemsPathsForCaller(r, items)
@@ -1089,8 +1107,26 @@ func (h *Handler) handleSearchHints(w http.ResponseWriter, r *http.Request) {
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 	includeTypes := q.List("IncludeItemTypes")
 	allowedLibs := h.allowedLibrariesForRequest(r, userID)
-	if allowedLibs != nil && queryIncludesPlaylists(includeTypes, nil) {
+	mayReturnPlaylists := queryIncludesPlaylists(includeTypes, nil)
+	if allowedLibs != nil && mayReturnPlaylists {
 		allowedLibs = appendPlaylistsLibrary(allowedLibs)
+	}
+	reqLimit := q.Int("Limit", 24)
+	if reqLimit <= 0 {
+		reqLimit = 24
+	}
+	nonAdmin := h.isNonAdminCaller(r)
+	var hiddenSet map[string]bool
+	fetchLimit := reqLimit
+	if nonAdmin && mayReturnPlaylists {
+		hidden := h.hiddenPrivatePlaylistIDs(r)
+		if len(hidden) > 0 {
+			hiddenSet = make(map[string]bool, len(hidden))
+			for _, id := range hidden {
+				hiddenSet[guid.Normalize(id)] = true
+			}
+			fetchLimit = reqLimit + len(hidden)
+		}
 	}
 	hints, total, err := h.repo.SearchHints(r.Context(), sqlite.SearchHintFilter{
 		UserID:            userID,
@@ -1100,35 +1136,35 @@ func (h *Handler) handleSearchHints(w http.ResponseWriter, r *http.Request) {
 		BlockedTags:       blockedTags,
 		SearchTerm:        q.Get("SearchTerm"),
 		IncludeItemTypes:  includeTypes,
-		Limit:             q.Int("Limit", 24),
+		Limit:             fetchLimit,
 	})
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to search hints", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to search hints")
 		return
 	}
-	if h.isNonAdminCaller(r) {
+	if nonAdmin {
 		filtered := make([]dto.SearchHint, 0, len(hints))
-		removed := 0
 		for _, hint := range hints {
 			if strings.EqualFold(hint.Type, "Playlist") {
+				if hiddenSet[guid.Normalize(hint.Id)] {
+					continue
+				}
 				parentID := ""
 				if rec, recErr := h.repo.GetItemRecordByID(r.Context(), hint.Id); recErr == nil && rec != nil {
 					parentID = rec.ParentID
 				}
 				if !h.canViewPlaylist(r, hint.Id, parentID) {
-					removed++
 					continue
 				}
 			}
 			filtered = append(filtered, hint)
 		}
-		if removed > 0 {
-			hints = filtered
-			total -= removed
-			if total < 0 {
-				total = 0
-			}
+		if len(filtered) > reqLimit {
+			filtered = filtered[:reqLimit]
 		}
+		hints = filtered
+		total = len(hints)
 	}
 	httpx.JSON(w, http.StatusOK, dto.SearchHintResult{
 		SearchHints:      hints,
@@ -1171,7 +1207,8 @@ func (h *Handler) handleTaxonomies(kind string) http.HandlerFunc {
 			blockedTags,
 		)
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("internal error in library handler", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal server error")
 			return
 		}
 		if needPostProcess {
@@ -1324,7 +1361,8 @@ func (h *Handler) handleMarkPlayed(w http.ResponseWriter, r *http.Request) {
 	}
 	allowed, err := h.canAccessItem(r, userID, itemID)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in library handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if !allowed {
@@ -1364,7 +1402,8 @@ func (h *Handler) handleMarkPlayed(w http.ResponseWriter, r *http.Request) {
 		ud, err = h.repo.MarkPlayed(r.Context(), userID, itemID)
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in library handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	httpx.JSON(w, http.StatusOK, ud)
@@ -1379,7 +1418,8 @@ func (h *Handler) handleMarkUnplayed(w http.ResponseWriter, r *http.Request) {
 	}
 	allowed, err := h.canAccessItem(r, userID, itemID)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in library handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if !allowed {
@@ -1388,7 +1428,8 @@ func (h *Handler) handleMarkUnplayed(w http.ResponseWriter, r *http.Request) {
 	}
 	ud, err := h.repo.MarkUnplayed(r.Context(), userID, itemID)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in library handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	httpx.JSON(w, http.StatusOK, ud)
@@ -1403,7 +1444,8 @@ func (h *Handler) handleMarkFavorite(w http.ResponseWriter, r *http.Request) {
 	}
 	allowed, err := h.canAccessItem(r, userID, itemID)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in library handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if !allowed {
@@ -1412,7 +1454,8 @@ func (h *Handler) handleMarkFavorite(w http.ResponseWriter, r *http.Request) {
 	}
 	ud, err := h.repo.MarkFavorite(r.Context(), userID, itemID)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in library handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	httpx.JSON(w, http.StatusOK, ud)
@@ -1427,7 +1470,8 @@ func (h *Handler) handleUnmarkFavorite(w http.ResponseWriter, r *http.Request) {
 	}
 	allowed, err := h.canAccessItem(r, userID, itemID)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in library handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if !allowed {
@@ -1436,7 +1480,8 @@ func (h *Handler) handleUnmarkFavorite(w http.ResponseWriter, r *http.Request) {
 	}
 	ud, err := h.repo.UnmarkFavorite(r.Context(), userID, itemID)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in library handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	httpx.JSON(w, http.StatusOK, ud)
@@ -1456,7 +1501,8 @@ func (h *Handler) handleListVirtualFolders(w http.ResponseWriter, r *http.Reques
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	libs, err := h.repo.ListLibraries(r.Context())
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in library handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	nonAdmin := h.isNonAdminCaller(r)
@@ -1526,7 +1572,8 @@ func (h *Handler) handleCreateVirtualFolder(w http.ResponseWriter, r *http.Reque
 
 	lib, err := h.repo.CreateLibrary(r.Context(), name, colType, paths)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in library handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if len(body.LibraryOptions) > 0 {
@@ -1562,7 +1609,8 @@ func (h *Handler) handleDeleteVirtualFolder(w http.ResponseWriter, r *http.Reque
 	q := httpx.ParseQuery(r)
 	if id := q.Get("id"); id != "" {
 		if err := h.repo.DeleteLibrary(r.Context(), id); err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("failed to delete library", "library_id", id, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to delete library")
 			return
 		}
 		if h.watcher != nil {
@@ -1584,7 +1632,8 @@ func (h *Handler) handleDeleteVirtualFolder(w http.ResponseWriter, r *http.Reque
 			}
 		}
 		if err := h.repo.DeleteLibraryByName(r.Context(), name); err != nil && !errors.Is(err, sqlite.ErrNotFound) {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("failed to delete library by name", "name", name, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to delete library")
 			return
 		}
 		if h.watcher != nil && watchID != "" {

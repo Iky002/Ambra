@@ -16,7 +16,7 @@ export function PersonDetailPage() {
   const { auth } = useAuth()
   const userId = auth!.userId
 
-  const decodedId = id ? decodeURIComponent(id) : ''
+  const decodedId = id ?? ''
   const nameFromQuery = searchParams.get('name') || ''
   const [mediaFilter, setMediaFilter] = useState<MediaFilter>('ALL')
   const [avatarFailed, setAvatarFailed] = useState(false)

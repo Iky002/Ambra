@@ -135,13 +135,24 @@ func validateHTTPBaseURL(raw string) (string, error) {
 	return trimmed, nil
 }
 
+func urlHostLower(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(u.Host))
+}
+
 func (p *Provider) Configure(cfg map[string]any) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	hasNewAPIKey := false
 	if v, ok := cfg["api_key"].(string); ok {
 		p.apiKey = strings.TrimSpace(v)
+		hasNewAPIKey = true
 	} else if v, ok := cfg["ApiKey"].(string); ok {
 		p.apiKey = strings.TrimSpace(v)
+		hasNewAPIKey = true
 	}
 	if v, ok := cfg["language"].(string); ok && v != "" {
 		p.language = v
@@ -150,6 +161,9 @@ func (p *Provider) Configure(cfg map[string]any) error {
 		valid, err := validateHTTPBaseURL(v)
 		if err != nil {
 			return fmt.Errorf("tmdb base_url: %w", err)
+		}
+		if urlHostLower(valid) != urlHostLower(p.baseURL) && !hasNewAPIKey {
+			p.apiKey = ""
 		}
 		p.baseURL = valid
 	}
@@ -222,9 +236,7 @@ func (p *Provider) findTMDBIDByIMDb(ctx context.Context, imdbID, lang, mediaKind
 	if imdbID == "" {
 		return ""
 	}
-	snap := p.snapshot()
 	params := url.Values{}
-	params.Set("api_key", snap.apiKey)
 	params.Set("language", lang)
 	params.Set("external_source", "imdb_id")
 	var fr struct {
@@ -310,11 +322,9 @@ func (p *Provider) searchTMDBWithFallbacks(ctx context.Context, endpoint, yearPa
 	addAttempt(q.Title, 0)
 	addAttempt(q.OriginalTitle, 0)
 
-	snap := p.snapshot()
 	var lastErr error
 	for _, a := range attempts {
 		params := url.Values{}
-		params.Set("api_key", snap.apiKey)
 		params.Set("language", lang)
 		params.Set("query", a.title)
 		if a.year > 0 {
@@ -357,7 +367,6 @@ func (p *Provider) fetchMovie(ctx context.Context, q plugins.MediaQuery, lang st
 
 	snap := p.snapshot()
 	params := url.Values{}
-	params.Set("api_key", snap.apiKey)
 	params.Set("language", lang)
 	params.Set("append_to_response", "credits,external_ids,images,release_dates")
 	params.Set("include_image_language", "zh,en,null")
@@ -508,7 +517,6 @@ func (p *Provider) fetchSeries(ctx context.Context, q plugins.MediaQuery, lang s
 
 	snap := p.snapshot()
 	params := url.Values{}
-	params.Set("api_key", snap.apiKey)
 	params.Set("language", lang)
 	params.Set("append_to_response", "credits,external_ids,images,content_ratings")
 	params.Set("include_image_language", "zh,en,null")
@@ -628,7 +636,6 @@ func (p *Provider) fetchSeason(ctx context.Context, q plugins.MediaQuery, lang s
 	}
 	snap := p.snapshot()
 	params := url.Values{}
-	params.Set("api_key", snap.apiKey)
 	params.Set("language", lang)
 
 	endpoint := fmt.Sprintf("/tv/%s/season/%d", url.PathEscape(tmdbID), q.SeasonNumber)
@@ -664,7 +671,6 @@ func (p *Provider) fetchEpisode(ctx context.Context, q plugins.MediaQuery, lang 
 	}
 	snap := p.snapshot()
 	params := url.Values{}
-	params.Set("api_key", snap.apiKey)
 	params.Set("language", lang)
 
 	endpoint := fmt.Sprintf("/tv/%s/season/%d/episode/%d", url.PathEscape(tmdbID), q.SeasonNumber, q.EpisodeNumber)
@@ -702,7 +708,6 @@ func (p *Provider) SearchCandidates(ctx context.Context, itemType, query string,
 
 	isSeries := strings.EqualFold(itemType, "series") || strings.EqualFold(itemType, "tv")
 	params := url.Values{}
-	params.Set("api_key", snap.apiKey)
 	params.Set("language", lang)
 	params.Set("query", strings.TrimSpace(query))
 
@@ -815,7 +820,6 @@ func (p *Provider) FetchImages(ctx context.Context, itemType, tmdbID string) ([]
 		endpoint = "/tv/" + url.PathEscape(tmdbID) + "/images"
 	}
 	params := url.Values{}
-	params.Set("api_key", snap.apiKey)
 	params.Set("include_image_language", "zh,en,null")
 
 	type tmdbImageEntry struct {
@@ -936,11 +940,17 @@ func pickBestLogoPath(logos []tmdbLogoEntry, lang string) string {
 			continue
 		}
 		lower := strings.ToLower(fp)
-		fmtRank := 0
-		if strings.HasSuffix(lower, ".png") || strings.HasSuffix(lower, ".svg") {
+		fmtRank := 1
+		switch {
+		case strings.HasSuffix(lower, ".png"):
+			fmtRank = 3
+		case strings.HasSuffix(lower, ".webp"):
 			fmtRank = 2
-		} else if strings.HasSuffix(lower, ".webp") {
+		case strings.HasSuffix(lower, ".jpg") || strings.HasSuffix(lower, ".jpeg"):
 			fmtRank = 1
+		case strings.HasSuffix(lower, ".svg"):
+			// Raster logos outrank SVG because image downloaders reject non-raster SVG files.
+			fmtRank = 0
 		}
 		langRank := 0
 		l := strings.ToLower(strings.TrimSpace(logo.ISO6391))
@@ -1054,13 +1064,16 @@ func (p *Provider) getJSON(ctx context.Context, endpoint string, params url.Valu
 	}
 	qParams := url.Values{}
 	for k, vals := range params {
+		if strings.EqualFold(k, "api_key") {
+			continue
+		}
 		for _, v := range vals {
 			qParams.Add(k, v)
 		}
 	}
 	useBearer := isV4BearerToken(snap.apiKey)
-	if useBearer {
-		qParams.Del("api_key")
+	if !useBearer && snap.apiKey != "" {
+		qParams.Set("api_key", snap.apiKey)
 	}
 	reqURL := snap.baseURL + endpoint
 	if encoded := qParams.Encode(); encoded != "" {

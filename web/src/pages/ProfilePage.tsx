@@ -63,10 +63,12 @@ const SUBTITLE_MODE_OPTIONS: { value: SubtitleModeOption; label: string }[] = [
 
 export function ProfilePage() {
   const { auth, user, isAdmin, refreshUser, logout } = useAuth()
-  const { locale, setLocale, t } = useI18n()
+  const { locale, setLocale, t, formatDateTime } = useI18n()
   const navigate = useNavigate()
   const userId = auth?.userId || ''
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const prefsSeqRef = useRef(0)
+  const prefsInFlightRef = useRef(0)
 
   const [avatarError, setAvatarError] = useState(false)
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
@@ -89,7 +91,7 @@ export function ProfilePage() {
   const [prefs, setPrefs] = useState<PlaybackPrefs>(() => loadPlaybackPrefs())
 
   useEffect(() => {
-    if (user?.Configuration) {
+    if (user?.Configuration && prefsInFlightRef.current === 0) {
       setPrefs(syncPlaybackPrefsFromUserConfig(user.Configuration))
     }
   }, [user?.Configuration])
@@ -223,16 +225,19 @@ export function ProfilePage() {
   }
 
   const prefsMutation = useMutation({
-    mutationFn: async (nextPrefs: PlaybackPrefs) => {
+    mutationFn: async ({ nextPrefs }: { nextPrefs: PlaybackPrefs; seq: number }) => {
       if (!userId) return
       const nextCfg = playbackPrefsToUserConfig(nextPrefs, user?.Configuration)
       await api.updateUserConfiguration(userId, nextCfg)
     },
-    onSuccess: async () => {
+    onSuccess: async (_data, { seq }) => {
+      if (seq !== prefsSeqRef.current) return
       await refreshUser()
+      if (seq !== prefsSeqRef.current) return
       setFeedback({ type: 'success', message: '播放偏好已保存并同步至账号' })
     },
-    onError: (err) => {
+    onError: (err, { seq }) => {
+      if (seq !== prefsSeqRef.current) return
       setFeedback({
         type: 'error',
         message:
@@ -241,12 +246,17 @@ export function ProfilePage() {
             : '播放偏好已保存本地，同步账号失败',
       })
     },
+    onSettled: () => {
+      prefsInFlightRef.current = Math.max(0, prefsInFlightRef.current - 1)
+    },
   })
 
   const handlePrefsChange = (patch: Partial<PlaybackPrefs>) => {
+    const seq = ++prefsSeqRef.current
+    prefsInFlightRef.current += 1
     const updated = savePlaybackPrefs(patch)
     setPrefs(updated)
-    prefsMutation.mutate(updated)
+    prefsMutation.mutate({ nextPrefs: updated, seq })
   }
 
   if (!auth) return null
@@ -310,7 +320,7 @@ export function ProfilePage() {
               </p>
               {user?.LastLoginDate && (
                 <p className="mt-0.5 text-[11px] text-zinc-500">
-                  最近登录：{new Date(user.LastLoginDate).toLocaleString('zh-CN')}
+                  最近登录：{formatDateTime(user.LastLoginDate)}
                 </p>
               )}
             </div>

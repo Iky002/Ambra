@@ -1,6 +1,7 @@
 package netutil
 
 import (
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -21,11 +22,13 @@ var (
 func SetTrustedProxies(entries []string) {
 	var parsed []netip.Prefix
 	disabled := false
+	nonEmptyCount := 0
 	for _, raw := range entries {
 		s := strings.TrimSpace(raw)
 		if s == "" {
 			continue
 		}
+		nonEmptyCount++
 		switch strings.ToLower(s) {
 		case "none", "off", "false":
 			disabled = true
@@ -42,7 +45,13 @@ func SetTrustedProxies(entries []string) {
 				bits = 128
 			}
 			parsed = append(parsed, netip.PrefixFrom(a, bits))
+			continue
 		}
+		slog.Warn("netutil: ignoring invalid trusted proxy entry", "entry", s)
+	}
+	if !disabled && nonEmptyCount > 0 && len(parsed) == 0 {
+		slog.Warn("netutil: all configured trusted proxy entries are invalid; disabling forwarded header trust")
+		disabled = true
 	}
 	trustedProxiesMu.Lock()
 	if disabled {

@@ -64,7 +64,7 @@ services:
     #           count: all
     #           capabilities: [gpu, video]
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8096/System/Ping"]
+      test: ["CMD-SHELL", 'port="$${AMBRA_HTTP_ADDR##*:}"; case "$$port" in ""|*[!0-9]*) port=8096 ;; esac; curl -fsS "http://127.0.0.1:$${port}/System/Ping" || exit 1']
       interval: 30s
       timeout: 5s
       retries: 3

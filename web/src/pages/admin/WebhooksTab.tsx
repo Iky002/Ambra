@@ -54,6 +54,7 @@ export function WebhooksTab() {
   const [name, setName] = useState('')
   const [url, setUrl] = useState('')
   const [secret, setSecret] = useState('')
+  const [clearSecret, setClearSecret] = useState(false)
   const [enabled, setEnabled] = useState(true)
   const [events, setEvents] = useState<string[]>(['*'])
   const [saving, setSaving] = useState(false)
@@ -88,6 +89,7 @@ export function WebhooksTab() {
     setName('')
     setUrl('')
     setSecret('')
+    setClearSecret(false)
     setEnabled(true)
     setEvents(['*'])
     setModalError(null)
@@ -100,6 +102,7 @@ export function WebhooksTab() {
     setName(wh.Name)
     setUrl(wh.Url)
     setSecret('')
+    setClearSecret(false)
     setEnabled(wh.Enabled)
     setEvents(Array.isArray(wh.Events) && wh.Events.length > 0 ? [...wh.Events] : ['*'])
     setModalError(null)
@@ -159,7 +162,11 @@ export function WebhooksTab() {
         ...(editingId ? { Id: editingId } : {}),
         Name: trimmedName,
         Url: trimmedUrl,
-        Secret: secret.trim() || undefined,
+        ...(clearSecret
+          ? { Secret: '', ClearSecret: true }
+          : secret.trim()
+            ? { Secret: secret.trim() }
+            : {}),
         Enabled: enabled,
         Events: events,
       })
@@ -473,18 +480,42 @@ export function WebhooksTab() {
               id="webhook-secret-input"
               type="password"
               value={secret}
+              disabled={clearSecret}
               onChange={(e) => setSecret(e.target.value)}
               placeholder={
                 editingId && editingHasSecret
-                  ? '已配置密钥，留空保留原密钥；输入新密钥将覆盖原值'
+                  ? clearSecret
+                    ? '保存后将清除已有签名密钥'
+                    : '已配置密钥，留空保留原密钥；输入新密钥将覆盖原值'
                   : '留空不签名；填写后将附带 X-Ambra-Signature 请求头'
               }
-              className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
+              className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60 disabled:cursor-not-allowed disabled:opacity-50"
             />
             {editingId && editingHasSecret && (
-              <p className="mt-1.5 text-[11px] text-amber-300/80">
-                当前 Webhook 已配置 HMAC 签名密钥：留空保留原密钥，输入新内容则更新密钥。
-              </p>
+              <div className="mt-2 space-y-1.5">
+                <label
+                  htmlFor="webhook-clear-secret"
+                  className="inline-flex cursor-pointer items-center gap-2 text-xs text-zinc-300"
+                >
+                  <input
+                    id="webhook-clear-secret"
+                    type="checkbox"
+                    checked={clearSecret}
+                    onChange={(e) => {
+                      const next = e.target.checked
+                      setClearSecret(next)
+                      if (next) setSecret('')
+                    }}
+                    className="h-3.5 w-3.5 rounded accent-amber-500"
+                  />
+                  <span>清除已有 HMAC 签名密钥</span>
+                </label>
+                <p className="text-[11px] text-amber-300/80">
+                  {clearSecret
+                    ? '保存后将清空已有 HMAC 签名密钥，不再附带 X-Ambra-Signature 请求头。'
+                    : '当前 Webhook 已配置 HMAC 签名密钥：留空保留原密钥，输入新内容则更新密钥，或勾选上方选项清空密钥。'}
+                </p>
+              </div>
             )}
           </div>
 

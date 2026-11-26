@@ -47,6 +47,7 @@ import type {
   SetupStatus,
   SystemInfo,
   TaskTriggerInfo,
+  ThumbnailSetResponse,
   UserConfiguration,
   UserDto,
   UserItemDataDto,
@@ -145,7 +146,9 @@ export async function embyFetch<T>(
   if (!headers.has('Content-Type') && options.body && typeof options.body === 'string') {
     headers.set('Content-Type', 'application/json')
   }
-  headers.set('Accept', 'application/json')
+  if (!headers.has('Accept')) {
+    headers.set('Accept', 'application/json')
+  }
   if (!headers.has('Accept-Language')) {
     headers.set('Accept-Language', getActiveLocale())
   }
@@ -357,6 +360,7 @@ export const api = {
       genres?: string
       years?: string
       tags?: string
+      studios?: string
       personIds?: string
       person?: string
       startIndex?: number
@@ -378,6 +382,7 @@ export const api = {
     if (params.genres) q.set('Genres', params.genres)
     if (params.years) q.set('Years', params.years)
     if (params.tags) q.set('Tags', params.tags)
+    if (params.studios) q.set('Studios', params.studios)
     if (params.personIds) q.set('PersonIds', params.personIds)
     if (params.person) q.set('Person', params.person)
     if (params.startIndex !== undefined) q.set('StartIndex', String(params.startIndex))
@@ -1387,7 +1392,14 @@ export const api = {
 
   getWebhooks: () => embyFetch<WebhookInfo[]>('/emby/Webhooks'),
 
-  saveWebhook: (webhook: Partial<WebhookInfo> & { Name: string; Url: string; Events: string[] }) =>
+  saveWebhook: (
+    webhook: Partial<WebhookInfo> & {
+      Name: string
+      Url: string
+      Events: string[]
+      ClearSecret?: boolean
+    },
+  ) =>
     embyFetch<WebhookInfo>('/emby/Webhooks', {
       method: 'POST',
       body: JSON.stringify(webhook),
@@ -1445,17 +1457,17 @@ export const api = {
 
   getQuickConnectEnabled: () => embyFetch<boolean>('/emby/QuickConnect/Enabled', {}, false),
 
-  quickConnectInitiate: () =>
+  quickConnectInitiate: (signal?: AbortSignal) =>
     embyFetch<QuickConnectResult>(
       '/emby/QuickConnect/Initiate',
-      { method: 'POST' },
+      { method: 'POST', signal },
       false,
     ),
 
-  quickConnectConnect: (secret: string) =>
+  quickConnectConnect: (secret: string, signal?: AbortSignal) =>
     embyFetch<QuickConnectResult>(
       `/emby/QuickConnect/Connect?secret=${encodeURIComponent(secret)}`,
-      {},
+      { signal },
       false,
     ),
 
@@ -1478,6 +1490,24 @@ export const api = {
       },
       false,
     ),
+
+  getBifUrl: (itemId: string, width = 320, mediaSourceId?: string) =>
+    getBifUrl(itemId, width, mediaSourceId),
+
+  getThumbnailSet: (itemId: string, width = 320, mediaSourceId?: string) => {
+    const q = new URLSearchParams({ Width: String(width) })
+    if (mediaSourceId) q.set('MediaSourceId', mediaSourceId)
+    return embyFetch<ThumbnailSetResponse>(
+      `/emby/Items/${encodeURIComponent(itemId)}/ThumbnailSet?${q.toString()}`,
+    )
+  },
+}
+
+export function getBifUrl(itemId: string, width = 320, mediaSourceId?: string): string {
+  if (!itemId) return ''
+  const q = new URLSearchParams({ Width: String(width) })
+  if (mediaSourceId) q.set('MediaSourceId', mediaSourceId)
+  return resolveApiUrl(`/emby/Videos/${encodeURIComponent(itemId)}/index.bif?${q.toString()}`)
 }
 
 export function getLiveTvChannelStreamUrl(channelId: string): string {

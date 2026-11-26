@@ -14,11 +14,22 @@ import (
 )
 
 const (
-	maxParties        = 200
-	maxPartiesPerUser = 10
-	minPlaybackRate   = 0.25
-	maxPlaybackRate   = 4.0
+	maxParties            = 200
+	maxPartiesPerUser     = 10
+	minPlaybackRate       = 0.25
+	maxPlaybackRate       = 4.0
+	maxPartyNameLen       = 128
+	maxPartyInviteCodeLen = 64
+	maxPartyItemIDLen     = 128
+	maxPartyJoinFails     = 5
+	partyJoinFailWindow   = 10 * time.Minute
+	maxPartyFailBuckets   = 4096
 )
+
+type partyFailWindow struct {
+	count   int
+	resetAt time.Time
+}
 
 type PartyState struct {
 	ItemId        string    `json:"ItemId,omitempty"`
@@ -131,13 +142,30 @@ func (h *Handler) handleCreateParty(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = "Watch Party"
 	}
+	if len([]rune(name)) > maxPartyNameLen {
+		httpx.Error(w, http.StatusBadRequest, "party Name exceeds maximum length")
+		return
+	}
+	inviteCode := strings.TrimSpace(req.InviteCode)
+	if len([]rune(inviteCode)) > maxPartyInviteCodeLen {
+		httpx.Error(w, http.StatusBadRequest, "party InviteCode exceeds maximum length")
+		return
+	}
+	itemID := strings.TrimSpace(req.ItemId)
+	if len([]rune(itemID)) > maxPartyItemIDLen {
+		httpx.Error(w, http.StatusBadRequest, "party ItemId exceeds maximum length")
+		return
+	}
+	if req.PositionTicks < 0 {
+		httpx.Error(w, http.StatusBadRequest, "PositionTicks must be non-negative")
+		return
+	}
 	_, isAdmin, _ := callerAuth(r)
 	hostID := h.resolveUserID(r, req.HostUserId)
 	members := []string{}
 	if hostID != "" {
 		members = append(members, hostID)
 	}
-	inviteCode := strings.TrimSpace(req.InviteCode)
 	isPublic := true
 	if req.IsPublic != nil {
 		isPublic = *req.IsPublic
@@ -154,7 +182,7 @@ func (h *Handler) handleCreateParty(w http.ResponseWriter, r *http.Request) {
 		IsPublic:   isPublic,
 		InviteCode: inviteCode,
 		State: PartyState{
-			ItemId:        req.ItemId,
+			ItemId:        itemID,
 			PositionTicks: req.PositionTicks,
 			IsPaused:      req.IsPaused,
 			PlaybackRate:  1.0,
@@ -247,25 +275,56 @@ func (h *Handler) handleJoinParty(w http.ResponseWriter, r *http.Request) {
 	if inviteCode == "" {
 		inviteCode = strings.TrimSpace(httpx.ParseQuery(r).Get("InviteCode"))
 	}
+	if len([]rune(inviteCode)) > maxPartyInviteCodeLen {
+		httpx.Error(w, http.StatusBadRequest, "InviteCode exceeds maximum length")
+		return
+	}
 	userID := h.resolveUserID(r, req.UserId)
 	if userID == "" {
 		httpx.Error(w, http.StatusBadRequest, "UserId is required")
 		return
 	}
 	callerID, isAdmin, hasAuth := callerAuth(r)
+	failKey := userID + ":" + id
+	now := time.Now().UTC()
 
 	h.mu.Lock()
+	for k, fw := range h.partyJoinFails {
+		if !now.Before(fw.resetAt) {
+			delete(h.partyJoinFails, k)
+		}
+	}
 	for i := range h.state.Parties {
 		if h.state.Parties[i].Id == id {
 			p := &h.state.Parties[i]
 			isHostOrMember := (callerID != "" && (guid.Normalize(p.HostUserId) == callerID || isPartyMember(p.Members, callerID))) ||
 				guid.Normalize(p.HostUserId) == userID || isPartyMember(p.Members, userID)
 			if !isAdmin && !isHostOrMember && (!p.IsPublic || p.InviteCode != "") {
+				if fw := h.partyJoinFails[failKey]; fw != nil && now.Before(fw.resetAt) && fw.count >= maxPartyJoinFails {
+					h.mu.Unlock()
+					httpx.Error(w, http.StatusTooManyRequests, "too many failed party join attempts")
+					return
+				}
 				if p.InviteCode == "" || subtle.ConstantTimeCompare([]byte(inviteCode), []byte(p.InviteCode)) != 1 {
+					if h.partyJoinFails == nil {
+						h.partyJoinFails = make(map[string]*partyFailWindow)
+					}
+					fw := h.partyJoinFails[failKey]
+					if fw == nil || !now.Before(fw.resetAt) {
+						if fw == nil && len(h.partyJoinFails) >= maxPartyFailBuckets {
+							h.mu.Unlock()
+							httpx.Error(w, http.StatusTooManyRequests, "too many failed party join attempts")
+							return
+						}
+						fw = &partyFailWindow{count: 0, resetAt: now.Add(partyJoinFailWindow)}
+						h.partyJoinFails[failKey] = fw
+					}
+					fw.count++
 					h.mu.Unlock()
 					httpx.Error(w, http.StatusForbidden, "valid InviteCode is required to join this party")
 					return
 				}
+				delete(h.partyJoinFails, failKey)
 			}
 			exists := false
 			for _, m := range p.Members {
@@ -330,6 +389,9 @@ func (h *Handler) handleLeaveParty(w http.ResponseWriter, r *http.Request) {
 				h.state.Parties = append(h.state.Parties[:i], h.state.Parties[i+1:]...)
 			} else {
 				h.state.Parties[i].Members = kept
+				if guid.Normalize(p.HostUserId) == userID {
+					h.state.Parties[i].HostUserId = kept[0]
+				}
 			}
 			_ = h.saveStateLocked(r.Context())
 			h.mu.Unlock()
@@ -353,6 +415,15 @@ func (h *Handler) handleUpdatePartyState(w http.ResponseWriter, r *http.Request)
 		httpx.Error(w, http.StatusBadRequest, "invalid party state payload")
 		return
 	}
+	itemID := strings.TrimSpace(req.ItemId)
+	if len([]rune(itemID)) > maxPartyItemIDLen {
+		httpx.Error(w, http.StatusBadRequest, "party ItemId exceeds maximum length")
+		return
+	}
+	if req.PositionTicks != nil && *req.PositionTicks < 0 {
+		httpx.Error(w, http.StatusBadRequest, "PositionTicks must be non-negative")
+		return
+	}
 	if req.PlaybackRate != nil {
 		rate := *req.PlaybackRate
 		if math.IsNaN(rate) || math.IsInf(rate, 0) || rate < minPlaybackRate || rate > maxPlaybackRate {
@@ -373,8 +444,8 @@ func (h *Handler) handleUpdatePartyState(w http.ResponseWriter, r *http.Request)
 				return
 			}
 			st := &p.State
-			if req.ItemId != "" {
-				st.ItemId = req.ItemId
+			if itemID != "" {
+				st.ItemId = itemID
 			}
 			if req.PositionTicks != nil {
 				st.PositionTicks = *req.PositionTicks

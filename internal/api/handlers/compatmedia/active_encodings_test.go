@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/imaging"
 	"github.com/ambra-media/ambra/internal/core/scanner"
@@ -65,8 +66,14 @@ func TestActiveEncodingsDeleteStopsTranscodeSession(t *testing.T) {
 		t.Fatalf("expected 2 active sessions, got %d", got)
 	}
 
+	adminCtx := func(r *http.Request) *http.Request {
+		return r.WithContext(middleware.WithAuthContext(r.Context(), &middleware.AuthContext{
+			User: &sqlite.UserRecord{ID: "admin", Name: "admin", IsAdmin: true},
+		}))
+	}
+
 	// Stop only dev-1 / ps-1 via POST /Videos/ActiveEncodings/Delete.
-	req := httptest.NewRequest(http.MethodPost, "/Videos/ActiveEncodings/Delete?DeviceId=dev-1&PlaySessionId=ps-1", nil)
+	req := adminCtx(httptest.NewRequest(http.MethodPost, "/Videos/ActiveEncodings/Delete?DeviceId=dev-1&PlaySessionId=ps-1", nil))
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNoContent {
@@ -79,7 +86,7 @@ func TestActiveEncodingsDeleteStopsTranscodeSession(t *testing.T) {
 	}
 
 	// Stop dev-2 by DeviceId alone.
-	req2 := httptest.NewRequest(http.MethodPost, "/Videos/ActiveEncodings/Delete?DeviceId=dev-2", nil)
+	req2 := adminCtx(httptest.NewRequest(http.MethodPost, "/Videos/ActiveEncodings/Delete?DeviceId=dev-2", nil))
 	rec2 := httptest.NewRecorder()
 	router.ServeHTTP(rec2, req2)
 	if rec2.Code != http.StatusNoContent {

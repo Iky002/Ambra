@@ -103,20 +103,29 @@ func (s *Service) EnqueueAudit(ctx context.Context, in EnqueueAuditInput) (*Scra
 
 	now := time.Now().Unix()
 
-	// Idempotent update if a pending audit already exists for this item.
+	tx, err := s.store.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// Idempotent check-and-upsert inside a single writer transaction to avoid duplicate pending rows.
 	var existingID string
 	var createdAt int64
-	err = s.store.Reader.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		`SELECT id, created_at FROM scrape_audit_queue WHERE item_id = ? AND status = ? LIMIT 1`,
 		itemID, AuditStatusPending,
 	).Scan(&existingID, &createdAt)
 	if err == nil && existingID != "" {
-		if _, err := s.store.Writer.ExecContext(ctx, `
+		if _, err := tx.ExecContext(ctx, `
 			UPDATE scrape_audit_queue
 			SET item_name = ?, item_type = ?, path = ?, confidence = ?, candidates_json = ?, updated_at = ?
 			WHERE id = ?`,
 			in.ItemName, itemType, in.Path, in.Confidence, string(candJSON), now, existingID,
 		); err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(); err != nil {
 			return nil, err
 		}
 		return &ScrapeAuditItem{
@@ -148,13 +157,16 @@ func (s *Service) EnqueueAudit(ctx context.Context, in EnqueueAuditInput) (*Scra
 		CreatedAt:  now,
 		UpdatedAt:  now,
 	}
-	if _, err := s.store.Writer.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO scrape_audit_queue (
 			id, item_id, item_name, item_type, path, confidence, candidates_json, status, created_at, updated_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		rec.ID, rec.ItemID, rec.ItemName, rec.ItemType, rec.Path, rec.Confidence,
 		string(candJSON), rec.Status, rec.CreatedAt, rec.UpdatedAt,
 	); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return rec, nil
@@ -288,6 +300,11 @@ func (s *Service) ApproveAudit(ctx context.Context, auditID string, candidate Sc
 		provName := strings.TrimSpace(candidate.ProviderName)
 		if provName == "" {
 			provName = "Tmdb"
+		}
+		for existingKey := range providers {
+			if strings.EqualFold(existingKey, provName) {
+				delete(providers, existingKey)
+			}
 		}
 		providers[provName] = strings.TrimSpace(candidate.ProviderID)
 		extra["provider_ids"] = providers
@@ -560,6 +577,35 @@ func (s *Service) RunLibraryAudit(ctx context.Context) (*LibraryAuditReport, err
 	}
 	_ = imgRows.Close()
 
+	// Load all media_sources per item so multi-version items are only flagged as orphans
+	// when ALL associated physical paths are missing.
+	type mediaSourcePathInfo struct {
+		path     string
+		isRemote bool
+	}
+	sourcesByItem := make(map[string][]mediaSourcePathInfo)
+	msRows, err := s.store.Reader.QueryContext(ctx, `SELECT item_id, path, is_remote FROM item_media_sources`)
+	if err != nil {
+		return nil, err
+	}
+	for msRows.Next() {
+		var itemID, msPath string
+		var isRemoteInt int
+		if err := msRows.Scan(&itemID, &msPath, &isRemoteInt); err != nil {
+			_ = msRows.Close()
+			return nil, err
+		}
+		sourcesByItem[itemID] = append(sourcesByItem[itemID], mediaSourcePathInfo{
+			path:     strings.TrimSpace(msPath),
+			isRemote: isRemoteInt != 0,
+		})
+	}
+	if err := msRows.Err(); err != nil {
+		_ = msRows.Close()
+		return nil, err
+	}
+	_ = msRows.Close()
+
 	rows, err := s.store.Reader.QueryContext(ctx, `
 		SELECT id, name, type, library_id, path, production_year, is_strm, is_folder, extra_json
 		FROM items
@@ -612,7 +658,12 @@ func (s *Service) RunLibraryAudit(ctx context.Context) (*LibraryAuditReport, err
 		}
 
 		if isEligibleOrphanCandidate(issue.IsStrm, isFolderInt != 0, issue.Path) {
-			if _, statErr := os.Stat(issue.Path); statErr != nil && os.IsNotExist(statErr) {
+			msList := sourcesByItem[id]
+			msPaths := make([]mediaSourceRef, 0, len(msList))
+			for _, ms := range msList {
+				msPaths = append(msPaths, mediaSourceRef{path: ms.path, isRemote: ms.isRemote})
+			}
+			if allPhysicalPathsMissing(issue.Path, msPaths) {
 				report.OrphanItems = append(report.OrphanItems, issue)
 			}
 		}
@@ -637,6 +688,30 @@ func isVirtualPath(p string) bool {
 		return true
 	}
 	return false
+}
+
+type mediaSourceRef struct {
+	path     string
+	isRemote bool
+}
+
+func allPhysicalPathsMissing(itemPath string, sources []mediaSourceRef) bool {
+	if _, statErr := os.Stat(itemPath); statErr == nil || !os.IsNotExist(statErr) {
+		return false
+	}
+	for _, ms := range sources {
+		if ms.isRemote {
+			return false
+		}
+		p := strings.TrimSpace(ms.path)
+		if p == "" || isVirtualPath(p) {
+			continue
+		}
+		if _, statErr := os.Stat(p); statErr == nil || !os.IsNotExist(statErr) {
+			return false
+		}
+	}
+	return true
 }
 
 func isEligibleOrphanCandidate(isStrm, isFolder bool, path string) bool {
@@ -695,7 +770,29 @@ func (s *Service) CleanupOrphans(ctx context.Context, itemIDs []string) (*Orphan
 		if !isEligibleOrphanCandidate(isStrmInt != 0, isFolderInt != 0, itemPath) {
 			continue
 		}
-		if _, statErr := os.Stat(itemPath); statErr == nil || !os.IsNotExist(statErr) {
+		msRows, msErr := tx.QueryContext(ctx, `SELECT path, is_remote FROM item_media_sources WHERE item_id = ?`, id)
+		if msErr != nil {
+			return nil, msErr
+		}
+		var sources []mediaSourceRef
+		for msRows.Next() {
+			var msPath string
+			var isRemoteInt int
+			if scanErr := msRows.Scan(&msPath, &isRemoteInt); scanErr != nil {
+				_ = msRows.Close()
+				return nil, scanErr
+			}
+			sources = append(sources, mediaSourceRef{
+				path:     strings.TrimSpace(msPath),
+				isRemote: isRemoteInt != 0,
+			})
+		}
+		if err := msRows.Err(); err != nil {
+			_ = msRows.Close()
+			return nil, err
+		}
+		_ = msRows.Close()
+		if !allPhysicalPathsMissing(itemPath, sources) {
 			continue
 		}
 

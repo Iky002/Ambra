@@ -56,6 +56,12 @@ describe('Stream 3 (v0.9.3): NotificationBell Center, DVR Playback & LiveTV/Webh
       isAdmin: true,
       deviceId: 'dev-v093',
     })
+    vi.spyOn(api, 'getUser').mockResolvedValue({
+      Id: 'user-admin-01',
+      Name: 'admin',
+      ServerId: 'server-v093',
+      Policy: { IsAdministrator: true },
+    })
     vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => undefined)
     vi.spyOn(HTMLMediaElement.prototype, 'load').mockImplementation(() => undefined)
     vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)

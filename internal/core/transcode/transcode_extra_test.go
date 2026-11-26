@@ -207,19 +207,33 @@ func TestExtractorExtraAndFonts(t *testing.T) {
 		t.Fatalf("expected error for empty mediaPath in ExtractFonts")
 	}
 
-	// Mock ffmpeg that succeeds and writes non-empty output (last arg) + fonts
+	// Mock ffprobe + ffmpeg that succeeds and writes non-empty output (last arg) + fonts
+	probeScript := writeMockScript(t, tmp, "ffprobe_ok.sh", `
+cat <<'EOF'
+{"streams":[
+  {"index":3,"tags":{"filename":"Arial.ttf"}},
+  {"index":4,"tags":{"filename":"Noto.otf"}},
+  {"index":5,"tags":{"filename":"readme.txt"}},
+  {"index":6,"tags":{"filename":"../escape.ttf"}}
+]}
+EOF
+`)
 	okScript := writeMockScript(t, tmp, "ffmpeg_ok.sh", `
 for arg in "$@"; do last="$arg"; done
 if [ "$1" = "-hide_banner" ] && echo "$@" | grep -q "dump_attachment"; then
-  echo "fontdata" > Arial.ttf
-  echo "fontdata2" > Noto.otf
-  echo "notfont" > readme.txt
-  mkdir -p subdir
+  prev=""
+  for arg in "$@"; do
+    case "$prev" in
+      -dump_attachment:*) echo "fontdata" > "$arg" ;;
+    esac
+    prev="$arg"
+  done
   exit 0
 fi
 echo "WEBVTT" > "$last"
 `)
 	cfg.FFmpegPath = okScript
+	cfg.FFprobePath = probeScript
 	extOK := NewExtractor(cfg)
 
 	subPath, err := extOK.ExtractSubtitle(context.Background(), "/fake.mkv", "item1", "ms1", 2, "vtt")

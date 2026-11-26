@@ -78,35 +78,7 @@ func (s *Scanner) RefreshItem(ctx context.Context, itemID string, replaceMetadat
 			parentSeriesID = rec.ParentID
 		}
 		if parentSeriesID != "" {
-			if parent, pErr := s.repo.GetItemRecordByID(ctx, parentSeriesID); pErr == nil && parent != nil {
-				if q.ProviderIDs == nil {
-					q.ProviderIDs = make(map[string]string, len(parent.Extra.ProviderIDs)+2)
-				}
-				// Season/Episode metadata lookups on TMDB and TVDB require the parent Series provider ID,
-				// never the individual season/episode's own TVDB ID (which causes 404 on /series/<id>/...).
-				deleteProviderIDCaseInsensitive(q.ProviderIDs, "tvdb")
-				if tvdbID := getProviderID(parent.Extra.ProviderIDs, "tvdb"); tvdbID != "" {
-					q.ProviderIDs["Tvdb"] = tvdbID
-				}
-				if tmdbID := getProviderID(parent.Extra.ProviderIDs, "tmdb"); tmdbID != "" {
-					deleteProviderIDCaseInsensitive(q.ProviderIDs, "tmdb")
-					q.ProviderIDs["tmdb"] = tmdbID
-				}
-				for k, v := range parent.Extra.ProviderIDs {
-					if strings.EqualFold(k, "tvdb") || strings.EqualFold(k, "tmdb") {
-						continue
-					}
-					if _, exists := q.ProviderIDs[k]; !exists {
-						q.ProviderIDs[k] = v
-					}
-				}
-				if strings.TrimSpace(parent.Name) != "" {
-					q.Title = parent.Name
-				}
-				if strings.TrimSpace(parent.OriginalTitle) != "" {
-					q.OriginalTitle = parent.OriginalTitle
-				}
-			}
+			s.applyParentSeriesQueryContext(ctx, parentSeriesID, &q)
 		}
 	}
 
@@ -178,11 +150,55 @@ func applyRefreshMetadataToItem(rec *sqlite.ItemRecord, meta *plugins.MetadataRe
 			rec.Extra.ProviderIDs = make(map[string]string, len(meta.ProviderIDs))
 		}
 		for k, v := range meta.ProviderIDs {
-			rec.Extra.ProviderIDs[k] = v
+			val := strings.TrimSpace(v)
+			if val == "" {
+				continue
+			}
+			deleteProviderIDCaseInsensitive(rec.Extra.ProviderIDs, k)
+			rec.Extra.ProviderIDs[k] = val
 		}
 	}
 	if meta.LockData {
 		rec.Extra.LockData = true
+	}
+}
+
+// applyParentSeriesQueryContext populates a Season or Episode MediaQuery with the parent
+// Series's TVDB/TMDB provider IDs (replacing any child-level IDs) and canonical titles.
+func (s *Scanner) applyParentSeriesQueryContext(ctx context.Context, parentSeriesID string, q *plugins.MediaQuery) {
+	if s.repo == nil || strings.TrimSpace(parentSeriesID) == "" || q == nil {
+		return
+	}
+	parent, pErr := s.repo.GetItemRecordByID(ctx, parentSeriesID)
+	if pErr != nil || parent == nil {
+		return
+	}
+	if q.ProviderIDs == nil {
+		q.ProviderIDs = make(map[string]string, len(parent.Extra.ProviderIDs)+2)
+	}
+	// Season/Episode metadata lookups on TMDB and TVDB require the parent Series provider ID,
+	// never the individual season/episode's own TVDB ID (which causes 404 on /series/<id>/...).
+	deleteProviderIDCaseInsensitive(q.ProviderIDs, "tvdb")
+	if tvdbID := getProviderID(parent.Extra.ProviderIDs, "tvdb"); tvdbID != "" {
+		q.ProviderIDs["Tvdb"] = tvdbID
+	}
+	if tmdbID := getProviderID(parent.Extra.ProviderIDs, "tmdb"); tmdbID != "" {
+		deleteProviderIDCaseInsensitive(q.ProviderIDs, "tmdb")
+		q.ProviderIDs["tmdb"] = tmdbID
+	}
+	for k, v := range parent.Extra.ProviderIDs {
+		if strings.EqualFold(k, "tvdb") || strings.EqualFold(k, "tmdb") {
+			continue
+		}
+		if getProviderID(q.ProviderIDs, k) == "" && strings.TrimSpace(v) != "" {
+			q.ProviderIDs[k] = strings.TrimSpace(v)
+		}
+	}
+	if strings.TrimSpace(parent.Name) != "" {
+		q.Title = parent.Name
+	}
+	if strings.TrimSpace(parent.OriginalTitle) != "" {
+		q.OriginalTitle = parent.OriginalTitle
 	}
 }
 

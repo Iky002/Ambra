@@ -34,6 +34,13 @@ func New(migrator *coremigration.Migrator) *Handler {
 	}
 }
 
+// Close cancels any in-flight migration job during server shutdown.
+func (h *Handler) Close() {
+	if h != nil && h.migrator != nil {
+		h.migrator.Cancel()
+	}
+}
+
 // RegisterRoutes mounts the migration admin endpoints onto mux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	h.auth = auth
@@ -162,9 +169,9 @@ func stripURLUserinfo(raw string) string {
 	if err != nil {
 		return trimmed
 	}
-	if u.User != nil {
-		u.User = nil
-	}
+	u.User = nil
+	u.RawQuery = ""
+	u.Fragment = ""
 	return u.String()
 }
 

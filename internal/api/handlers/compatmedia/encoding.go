@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -76,7 +77,8 @@ func (h *Handler) handleGetEncodingConfig(key string, defFn func() map[string]an
 	return func(w http.ResponseWriter, r *http.Request) {
 		val := defFn()
 		if _, err := h.getConfigJSON(r.Context(), key, &val); err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("failed to load encoding config", "key", key, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to load encoding config")
 			return
 		}
 		httpx.JSON(w, http.StatusOK, val)
@@ -95,7 +97,8 @@ func (h *Handler) handleSetEncodingConfig(key string) http.HandlerFunc {
 			body = map[string]any{}
 		}
 		if err := h.setConfigJSON(r.Context(), key, body); err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("failed to save encoding config", "key", key, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to save encoding config")
 			return
 		}
 		httpx.NoContent(w)
@@ -127,7 +130,8 @@ func (h *Handler) handleSetCodecParameters(w http.ResponseWriter, r *http.Reques
 	}
 	body["CodecId"] = codecID
 	if err := h.setConfigJSON(r.Context(), key, body); err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to save codec parameters", "key", key, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to save codec parameters")
 		return
 	}
 	httpx.NoContent(w)
@@ -173,7 +177,8 @@ func (h *Handler) handleLibraryAvailableOptions(w http.ResponseWriter, _ *http.R
 func (h *Handler) handlePhysicalPaths(w http.ResponseWriter, r *http.Request) {
 	libs, err := h.repo.ListLibraries(r.Context())
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia encoding handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	seen := map[string]bool{}
@@ -198,7 +203,8 @@ func (h *Handler) handleSelectableMediaFolders(w http.ResponseWriter, r *http.Re
 	allowed := h.allowedLibrariesForRequest(r, h.resolveUserID(r, q))
 	libs, err := h.repo.ListLibraries(r.Context())
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia encoding handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	hidePaths := h.isNonAdminCaller(r)
@@ -231,7 +237,8 @@ func (h *Handler) handleMediaFolders(w http.ResponseWriter, r *http.Request) {
 	allowed := h.allowedLibrariesForRequest(r, h.resolveUserID(r, q))
 	libs, err := h.repo.ListLibraries(r.Context())
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia encoding handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	items := make([]dto.BaseItemDto, 0, len(libs))
@@ -280,7 +287,8 @@ func (h *Handler) handleQueryVirtualFolders(w http.ResponseWriter, r *http.Reque
 	allowed := h.allowedLibrariesForRequest(r, h.resolveUserID(r, q))
 	allLibs, err := h.repo.ListLibraries(r.Context())
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia encoding handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	libs := make([]sqlite.LibraryRecord, 0, len(allLibs))
@@ -448,12 +456,14 @@ func (h *Handler) handleAddVirtualFolderPath(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia encoding handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	updated, err := h.repo.AddLibraryPath(r.Context(), lib.ID, pathVal)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia encoding handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if h.watcher != nil && updated != nil {
@@ -491,7 +501,8 @@ func (h *Handler) handleUpdateVirtualFolderPath(w http.ResponseWriter, r *http.R
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia encoding handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 
@@ -547,7 +558,8 @@ func (h *Handler) handleUpdateVirtualFolderPath(w http.ResponseWriter, r *http.R
 	}
 
 	if err := h.saveLibraryPaths(r, lib.ID, updatedPaths); err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to update library paths", "library_id", lib.ID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to update library paths")
 		return
 	}
 	if h.watcher != nil {
@@ -583,7 +595,8 @@ func (h *Handler) handleDeleteVirtualFolderPath(w http.ResponseWriter, r *http.R
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia encoding handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	filtered := make([]string, 0, len(lib.Paths))
@@ -593,7 +606,8 @@ func (h *Handler) handleDeleteVirtualFolderPath(w http.ResponseWriter, r *http.R
 		}
 	}
 	if err := h.saveLibraryPaths(r, lib.ID, filtered); err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to delete library path", "library_id", lib.ID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to update library paths")
 		return
 	}
 	if h.watcher != nil {
@@ -616,7 +630,8 @@ func (h *Handler) handleUpdateVirtualFolderOptions(w http.ResponseWriter, r *htt
 	}
 	if body.Id != "" && body.LibraryOptions != nil && h.repo != nil {
 		if _, err := h.repo.UpdateLibraryOptions(r.Context(), body.Id, body.LibraryOptions); err != nil && !errors.Is(err, sqlite.ErrNotFound) {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("failed to update library options", "library_id", body.Id, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to update library options")
 			return
 		}
 	}
@@ -656,7 +671,8 @@ func (h *Handler) handleListArtists(albumArtistsOnly bool) http.HandlerFunc {
 			Fields:            q.List("Fields"),
 		})
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("internal error in compatmedia encoding handler", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal server error")
 			return
 		}
 		h.sanitizeItemsPathsForCaller(r, items)
@@ -687,7 +703,8 @@ func (h *Handler) handleArtistPrefixes(w http.ResponseWriter, r *http.Request) {
 		IncludeItemTypes:  []string{"MusicArtist", "Artist"},
 	})
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia encoding handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	seen := map[string]bool{}
@@ -743,7 +760,8 @@ func (h *Handler) handleInstantMixByQuery(w http.ResponseWriter, r *http.Request
 			blockedTags,
 		)
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("internal error in compatmedia encoding handler", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal server error")
 			return
 		}
 		h.sanitizeItemsPathsForCaller(r, items)
@@ -814,7 +832,8 @@ func (h *Handler) handleInstantMixByQuery(w http.ResponseWriter, r *http.Request
 			Fields:            fields,
 		})
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("internal error in compatmedia encoding handler", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal server error")
 			return
 		}
 		matched := make([]dto.BaseItemDto, 0, len(allAudio))
@@ -901,7 +920,8 @@ func (h *Handler) handleInstantMixByQuery(w http.ResponseWriter, r *http.Request
 			Fields:            append(append([]string(nil), fields...), "Genres"),
 		})
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("internal error in compatmedia encoding handler", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal server error")
 			return
 		}
 		matched := make([]dto.BaseItemDto, 0, len(allAudio))
@@ -944,7 +964,8 @@ func (h *Handler) handleInstantMixByQuery(w http.ResponseWriter, r *http.Request
 		Fields:            fields,
 	})
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia encoding handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	h.sanitizeItemsPathsForCaller(r, items)
@@ -1131,7 +1152,8 @@ func (h *Handler) handleGetPersonByName(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("failed to query person", "name", name, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to query person")
 			return
 		}
 	}
@@ -1161,7 +1183,8 @@ func (h *Handler) handlePersonCredits(w http.ResponseWriter, r *http.Request) {
 		Fields:            q.List("Fields"),
 	})
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia encoding handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	h.sanitizeItemsPathsForCaller(r, items)
@@ -1196,7 +1219,8 @@ func (h *Handler) handleAudioBooksNextUp(w http.ResponseWriter, r *http.Request)
 		blockedTags,
 	)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia encoding handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	h.sanitizeItemsPathsForCaller(r, items)
@@ -1247,7 +1271,8 @@ func (h *Handler) handleChannelLatestItems(w http.ResponseWriter, r *http.Reques
 			Fields:            fields,
 		})
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("internal error in compatmedia encoding handler", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal server error")
 			return
 		}
 		h.sanitizeItemsPathsForCaller(r, items)
@@ -1275,7 +1300,8 @@ func (h *Handler) handleChannelLatestItems(w http.ResponseWriter, r *http.Reques
 			Fields:            fields,
 		})
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("internal error in compatmedia encoding handler", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal server error")
 			return
 		}
 		for _, it := range part {
@@ -1334,7 +1360,8 @@ func (h *Handler) handleCollectionProviderItems(w http.ResponseWriter, r *http.R
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia encoding handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if !strings.EqualFold(containerRec.Type, "BoxSet") {
@@ -1347,7 +1374,8 @@ func (h *Handler) handleCollectionProviderItems(w http.ResponseWriter, r *http.R
 	if maxRating != nil || len(blockedTags) > 0 {
 		blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), containerRec, maxRating, blockedTags)
 		if bErr != nil {
-			httpx.Error(w, http.StatusInternalServerError, bErr.Error())
+			slog.Error("failed to check parental policy", "container_id", containerID, "error", bErr)
+			httpx.Error(w, http.StatusInternalServerError, "failed to verify item access")
 			return
 		}
 		if blocked {
@@ -1381,7 +1409,8 @@ func (h *Handler) handleCollectionProviderItems(w http.ResponseWriter, r *http.R
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia encoding handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if needFilter {
@@ -1428,7 +1457,8 @@ func (h *Handler) handleContainerItemsDelete(expectedType string, checkOwner boo
 			return
 		}
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("internal error in compatmedia encoding handler", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal server error")
 			return
 		}
 		if !strings.EqualFold(rec.Type, expectedType) {
@@ -1469,7 +1499,8 @@ func (h *Handler) handleContainerItemsDelete(expectedType string, checkOwner boo
 			httpx.Error(w, http.StatusNotFound, "container not found")
 			return
 		} else if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("failed to remove items from container", "container_id", containerID, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to remove items from container")
 			return
 		}
 		httpx.NoContent(w)
@@ -1568,7 +1599,8 @@ func (h *Handler) handleShowsUpcoming(w http.ResponseWriter, r *http.Request) {
 		Fields:            q.List("Fields"),
 	})
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia encoding handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	now := time.Now().UTC()

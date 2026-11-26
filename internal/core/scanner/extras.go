@@ -107,7 +107,7 @@ func cleanExtraDisplayName(filePath string) string {
 		if strings.HasSuffix(lower, s.suffix) && len(base) > len(s.suffix) {
 			trimmed := strings.TrimSpace(base[:len(base)-len(s.suffix)])
 			if trimmed != "" {
-				return base
+				return trimmed
 			}
 		}
 	}

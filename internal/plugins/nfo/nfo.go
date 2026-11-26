@@ -48,14 +48,51 @@ func (p *Provider) Configure(cfg map[string]any) error {
 	return nil
 }
 
+func isNFOSymlinkWithinDir(nfoPath string) bool {
+	baseDir := filepath.Dir(filepath.Clean(nfoPath))
+	realBase, err := filepath.EvalSymlinks(baseDir)
+	if err != nil {
+		realBase, err = filepath.Abs(baseDir)
+		if err != nil {
+			return false
+		}
+	}
+	realTarget, err := filepath.EvalSymlinks(filepath.Clean(nfoPath))
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(realBase, realTarget)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+}
+
 func readLimitedNFO(path string) ([]byte, error) {
+	linfo, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if linfo.IsDir() {
+		return nil, fmt.Errorf("nfo path %q is a directory", path)
+	}
+	if linfo.Mode()&os.ModeSymlink != 0 {
+		if !isNFOSymlinkWithinDir(path) {
+			return nil, fmt.Errorf("nfo symlink %q escapes media directory", path)
+		}
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	if fi, err := f.Stat(); err == nil && fi.Size() > maxNFOFileSize {
-		return nil, fmt.Errorf("nfo file exceeds maximum size of %d bytes", maxNFOFileSize)
+	if fi, err := f.Stat(); err == nil {
+		if fi.IsDir() {
+			return nil, fmt.Errorf("nfo path %q is a directory", path)
+		}
+		if fi.Size() > maxNFOFileSize {
+			return nil, fmt.Errorf("nfo file exceeds maximum size of %d bytes", maxNFOFileSize)
+		}
 	}
 	data, err := io.ReadAll(io.LimitReader(f, maxNFOFileSize+1))
 	if err != nil {

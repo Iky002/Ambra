@@ -107,7 +107,7 @@ func TestProvider_PathEscapesTMDBID(t *testing.T) {
 
 	p := New("test-key", "en-US")
 	p.SetHTTPClient(srv.Client())
-	_ = p.Configure(map[string]any{"base_url": srv.URL})
+	_ = p.Configure(map[string]any{"base_url": srv.URL, "api_key": "test-key"})
 
 	ctx := context.Background()
 	_, err := p.FetchMetadata(ctx, plugins.MediaQuery{

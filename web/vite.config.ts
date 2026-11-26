@@ -38,6 +38,11 @@ export default defineConfig({
         target: 'http://localhost:8096',
         changeOrigin: true,
       },
+      '/embywebsocket': {
+        target: 'http://localhost:8096',
+        ws: true,
+        changeOrigin: true,
+      },
     },
   },
 })

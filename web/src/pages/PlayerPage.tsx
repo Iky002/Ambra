@@ -33,6 +33,7 @@ import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   api,
   buildEmbyAuthHeader,
+  getBifUrl,
   getStoredAuth,
   isSameOriginUrl,
   resolveApiUrl,
@@ -42,9 +43,11 @@ import { AmbraLogo } from '../components/AmbraLogo'
 import { useAudioPlayer } from '../context/AudioPlayerContext'
 import { useAuth } from '../context/AuthContext'
 import { useWebSocket } from '../context/WebSocketContext'
+import { loadDemoServer } from '../demo/demoLoader'
 import { isDemoMode } from '../demo/demoMode'
 import { useI18n } from '../i18n/I18nContext'
 import { AssJassubRenderer } from '../player/assRenderer'
+import { parseBif, type BifArchive } from '../player/bifParser'
 import { PgsCanvasRenderer } from '../player/pgsRenderer'
 import {
   loadPlaybackPrefs,
@@ -216,6 +219,12 @@ function isStrmSource(source?: MediaSourceInfo): boolean {
   return false
 }
 
+function parseNonNegativeIntParam(raw: string | null): number | undefined {
+  if (raw === null || raw.trim() === '') return undefined
+  const n = Number(raw)
+  return Number.isInteger(n) && n >= 0 ? n : undefined
+}
+
 interface WasmProgressState {
   stage: WasmRemuxStage
   percent: number
@@ -242,18 +251,21 @@ export function PlayerPage() {
   }, [])
 
   const initialMediaSourceId = searchParams.get('mediaSourceId') || undefined
-  const initialAudio = searchParams.get('audio') ? Number(searchParams.get('audio')) : undefined
+  const initialAudio = parseNonNegativeIntParam(searchParams.get('audio'))
   const playlistId = searchParams.get('playlistId') || undefined
   const rawInitialSubtitle = searchParams.get('subtitle')
   const initialSubtitle =
-    rawInitialSubtitle &&
-    rawInitialSubtitle !== 'off' &&
-    Number.isFinite(Number(rawInitialSubtitle))
-      ? Number(rawInitialSubtitle)
+    rawInitialSubtitle && rawInitialSubtitle !== 'off'
+      ? parseNonNegativeIntParam(rawInitialSubtitle)
       : undefined
-  const initialStartTicks = searchParams.get('startTicks')
-    ? Number(searchParams.get('startTicks'))
-    : 0
+  const rawStartTicks = searchParams.get('startTicks')
+  const parsedStartTicks =
+    rawStartTicks !== null && rawStartTicks.trim() !== '' ? Number(rawStartTicks) : null
+  const explicitStartTicks =
+    parsedStartTicks !== null && Number.isFinite(parsedStartTicks) && parsedStartTicks >= 0
+      ? parsedStartTicks
+      : null
+  const initialStartTicks = explicitStartTicks ?? 0
 
   const containerRef = useRef<HTMLDivElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
@@ -265,17 +277,22 @@ export function PlayerPage() {
   const wasmRemuxerRef = useRef<WasmRemuxer | null>(null)
   const assRendererRef = useRef<AssJassubRenderer | null>(null)
   const pgsRendererRef = useRef<PgsCanvasRenderer | null>(null)
+  const bifArchiveRef = useRef<BifArchive | null>(null)
   const hideOsdTimerRef = useRef<number | null>(null)
   const initialSeekDoneRef = useRef(false)
   const initializedAudioSourceIdRef = useRef<string | null>(null)
   const initializedSubSourceIdRef = useRef<string | null>(null)
   const subtitleExplicitlyOffRef = useRef<boolean>(rawInitialSubtitle === 'off')
+  const stopReportedRef = useRef<boolean>(false)
   const lastSeekReportRef = useRef(0)
   const resumeSecRef = useRef<number | null>(null)
   const hlsRecoveryCountRef = useRef(0)
   const searchParamsRef = useRef(searchParams)
   searchParamsRef.current = searchParams
   const prevIdRef = useRef<string | undefined>(id)
+
+  const [bifArchive, setBifArchive] = useState<BifArchive | null>(null)
+  const [hoverSeek, setHoverSeek] = useState<{ timeSec: number; pct: number } | null>(null)
 
   const [selectedSourceId, setSelectedSourceId] = useState<string | undefined>(initialMediaSourceId)
   const [querySourceId, setQuerySourceId] = useState<string | undefined>(initialMediaSourceId)
@@ -360,20 +377,20 @@ export function PlayerPage() {
     initialSeekDoneRef.current = false
     initializedAudioSourceIdRef.current = null
     initializedSubSourceIdRef.current = null
+    stopReportedRef.current = false
     resumeSecRef.current = null
     hlsRecoveryCountRef.current = 0
     setNextUpCountdown(null)
+    setHoverSeek(null)
 
     if (prevIdRef.current !== id) {
       prevIdRef.current = id
       const sp = searchParamsRef.current
       const nextSourceId = sp.get('mediaSourceId') || undefined
-      const nextAudio = sp.get('audio') ? Number(sp.get('audio')) : undefined
+      const nextAudio = parseNonNegativeIntParam(sp.get('audio'))
       const nextSubRaw = sp.get('subtitle')
       const nextSubtitle =
-        nextSubRaw && nextSubRaw !== 'off' && Number.isFinite(Number(nextSubRaw))
-          ? Number(nextSubRaw)
-          : undefined
+        nextSubRaw && nextSubRaw !== 'off' ? parseNonNegativeIntParam(nextSubRaw) : undefined
       subtitleExplicitlyOffRef.current = nextSubRaw === 'off'
       setSelectedSourceId(nextSourceId)
       setQuerySourceId(nextSourceId)
@@ -554,6 +571,7 @@ export function PlayerPage() {
     if (!activeSource || episodeIdSynced !== id) return
     if (selectedSourceId === undefined) setSelectedSourceId(activeSource.Id)
     const prefs = loadPlaybackPrefs()
+    let resolvedAudioIdx = audioIndex
     if (initializedAudioSourceIdRef.current !== activeSource.Id) {
       initializedAudioSourceIdRef.current = activeSource.Id
       if (audioIndex === undefined) {
@@ -563,6 +581,7 @@ export function PlayerPage() {
           activeSource.DefaultAudioStreamIndex,
           locale,
         )
+        resolvedAudioIdx = pickedAudio
         if (pickedAudio !== undefined) {
           setAudioIndex(pickedAudio)
           if (pickedAudio !== activeSource.DefaultAudioStreamIndex) {
@@ -577,19 +596,25 @@ export function PlayerPage() {
         subtitleExplicitlyOffRef.current = true
         setSubtitleIndex(undefined)
       } else if (subtitleIndex === undefined) {
+        const resolvedAudioStream =
+          audioStreams.find((a) => a.Index === resolvedAudioIdx) || audioStreams[0]
         const pickedSub = pickPreferredSubtitleIndex(
           subtitleStreams,
           prefs.preferredSubtitleLang,
           activeSource.DefaultSubtitleStreamIndex,
           locale,
           prefs.subtitleMode,
+          resolvedAudioStream,
         )
         if (pickedSub !== undefined) {
           subtitleExplicitlyOffRef.current = false
           setSubtitleIndex(pickedSub)
         } else {
           subtitleExplicitlyOffRef.current =
-            prefs.preferredSubtitleLang === 'off' || prefs.subtitleMode === 'None'
+            prefs.preferredSubtitleLang === 'off' ||
+            prefs.subtitleMode === 'None' ||
+            prefs.subtitleMode === 'Smart' ||
+            prefs.subtitleMode === 'OnlyForced'
         }
       }
     }
@@ -605,10 +630,10 @@ export function PlayerPage() {
     locale,
   ])
 
-  // 计算生效的起播位置（优先 URL startTicks，否则从 item.UserData.PlaybackPositionTicks 自动续播）
+  // 计算生效的起播位置（显式传 startTicks >= 0 时直接使用；未传参时从 item.UserData.PlaybackPositionTicks 自动续播）
   const effectiveStartTicks = useMemo(() => {
-    if (Number.isFinite(initialStartTicks) && initialStartTicks > 0) {
-      return initialStartTicks
+    if (explicitStartTicks !== null) {
+      return explicitStartTicks
     }
     const savedTicks = item?.UserData?.PlaybackPositionTicks ?? 0
     if (!Number.isFinite(savedTicks) || savedTicks <= 5 * 10_000_000) {
@@ -623,7 +648,7 @@ export function PlayerPage() {
     }
     return savedTicks
   }, [
-    initialStartTicks,
+    explicitStartTicks,
     item?.UserData?.PlaybackPositionTicks,
     item?.UserData?.Played,
     item?.RunTimeTicks,
@@ -1192,6 +1217,82 @@ export function PlayerPage() {
     retryNonce,
   ])
 
+  // 异步静默拉取 BIF 视频预览图归档（404 或不可用时静默降级，不影响播放；卸载或切片时释放全部 ObjectURL）
+  useEffect(() => {
+    if (!id || !activeSource?.Id || infoIsPlaceholder) {
+      if (bifArchiveRef.current) {
+        bifArchiveRef.current.dispose()
+        bifArchiveRef.current = null
+      }
+      setBifArchive(null)
+      return
+    }
+
+    let cancelled = false
+    const controller = new AbortController()
+
+    const loadBif = async () => {
+      try {
+        let rawBuf: ArrayBuffer | Uint8Array | null = null
+        if (isDemoMode()) {
+          const demo = await loadDemoServer()
+          const demoRes = await demo.demoFetch<ArrayBuffer | Uint8Array>(
+            `/emby/Videos/${encodeURIComponent(id)}/index.bif?Width=320&MediaSourceId=${encodeURIComponent(activeSource.Id)}`,
+            { signal: controller.signal },
+          )
+          if (demoRes instanceof ArrayBuffer || demoRes instanceof Uint8Array) {
+            rawBuf = demoRes
+          }
+        } else {
+          const bifUrl = getBifUrl(id, 320, activeSource.Id)
+          if (!bifUrl) return
+          const storedAuth = getStoredAuth()
+          const headers: Record<string, string> = {}
+          if (isSameOriginUrl(bifUrl)) {
+            headers['X-Emby-Authorization'] = buildEmbyAuthHeader(storedAuth?.accessToken)
+            if (storedAuth?.accessToken) {
+              headers['X-Emby-Token'] = storedAuth.accessToken
+            }
+          }
+          const res = await fetch(bifUrl, {
+            method: 'GET',
+            headers,
+            signal: controller.signal,
+          })
+          if (!res.ok) return
+          if (typeof res.arrayBuffer === 'function') {
+            rawBuf = await res.arrayBuffer()
+          }
+        }
+        if (cancelled || !rawBuf) return
+        const parsed = parseBif(rawBuf)
+        if (cancelled) {
+          parsed.dispose()
+          return
+        }
+        if (bifArchiveRef.current) {
+          bifArchiveRef.current.dispose()
+        }
+        bifArchiveRef.current = parsed
+        setBifArchive(parsed)
+      } catch {
+        // 404 / 取消 / 格式无效静默降级，不干扰正常播放
+      }
+    }
+
+    void loadBif()
+
+    return () => {
+      cancelled = true
+      controller.abort()
+      if (bifArchiveRef.current) {
+        bifArchiveRef.current.dispose()
+        bifArchiveRef.current = null
+      }
+      setBifArchive(null)
+    }
+  }, [id, activeSource?.Id, infoIsPlaceholder])
+
   // 构建外挂字幕直出 URL（仅同源附加 api_key，跨域字幕不泄露会话令牌）
   const resolveSubtitleUrl = useCallback(
     (stream: MediaStream): string => {
@@ -1224,6 +1325,7 @@ export function PlayerPage() {
   useEffect(() => {
     const currentSubStream = activeSubtitleStreamRef.current
     let cancelled = false
+    const controller = new AbortController()
     setSubtitleError(null)
     setTextCues([])
     setLoadedFontCount(0)
@@ -1285,7 +1387,7 @@ export function PlayerPage() {
             renderer.renderAtTime(videoRef.current.currentTime)
           }
         } else {
-          const res = await fetch(subUrl)
+          const res = await fetch(subUrl, { signal: controller.signal })
           if (!res.ok) throw new Error(`加载文本字幕失败 (${res.status})`)
           const raw = await res.text()
           if (!cancelled) {
@@ -1293,7 +1395,7 @@ export function PlayerPage() {
           }
         }
       } catch (err) {
-        if (!cancelled) {
+        if (!cancelled && !controller.signal.aborted) {
           setSubtitleError(err instanceof Error ? err.message : '字幕加载失败')
         }
       }
@@ -1303,6 +1405,7 @@ export function PlayerPage() {
 
     return () => {
       cancelled = true
+      controller.abort()
       void cleanupEngines()
     }
   }, [activeSubtitleKey, resolveSubtitleUrl, id, activeSource?.Id])
@@ -1381,12 +1484,17 @@ export function PlayerPage() {
         PositionTicks: posTicks,
       }
       if (type === 'stop') {
+        if (stopReportedRef.current) return
+        stopReportedRef.current = true
         void api.reportStopped({
           ...base,
           AudioStreamIndex: latestAudioIndex,
           SubtitleStreamIndex: reportedSubIndex,
         })
         return
+      }
+      if (type === 'start') {
+        stopReportedRef.current = false
       }
       const full = {
         ...base,
@@ -1432,8 +1540,9 @@ export function PlayerPage() {
 
     let unloadReported = false
     const sendKeepaliveStop = () => {
-      if (unloadReported || !videoRef.current) return
+      if (unloadReported || stopReportedRef.current || !videoRef.current) return
       unloadReported = true
+      stopReportedRef.current = true
       const storedAuth = getStoredAuth()
       const token = storedAuth?.accessToken
       if (!token) return
@@ -1548,14 +1657,24 @@ export function PlayerPage() {
     }
   }, [])
 
+  const selectSubtitleTrack = useCallback(
+    (nextIndex: number | undefined) => {
+      subtitleExplicitlyOffRef.current = nextIndex === undefined
+      setSubtitleIndex(nextIndex)
+      playbackMetaRef.current.subtitleIndex = nextIndex
+      reportState('progress', 'SubtitleTrackChange')
+      pokeOsd()
+    },
+    [reportState, pokeOsd],
+  )
+
   const cycleSubtitle = useCallback(() => {
     if (subtitleStreams.length === 0) return
     const indices = [undefined, ...subtitleStreams.map((s) => s.Index)]
     const curPos = indices.indexOf(subtitleIndex)
     const next = indices[(curPos + 1) % indices.length]
-    setSubtitleIndex(next)
-    pokeOsd()
-  }, [subtitleStreams, subtitleIndex, pokeOsd])
+    selectSubtitleTrack(next)
+  }, [subtitleStreams, subtitleIndex, selectSubtitleTrack])
 
   const handleExit = useCallback(() => {
     const historyIdx = (window.history.state as { idx?: number } | null)?.idx ?? 0
@@ -1668,18 +1787,29 @@ export function PlayerPage() {
     [pokeOsd, reportState],
   )
 
+  const selectAudioTrack = useCallback(
+    (nextIndex: number) => {
+      if (nextIndex !== effectiveAudioIndex) {
+        captureResumePosition()
+        setUseProxyDirect(false)
+        setForceServerHls(false)
+        setWasmFallbackNotice(null)
+        setAudioIndex(nextIndex)
+        setQueryAudioIndex(nextIndex)
+        playbackMetaRef.current.audioIndex = nextIndex
+        reportState('progress', 'AudioTrackChange')
+      }
+      pokeOsd()
+    },
+    [effectiveAudioIndex, captureResumePosition, reportState, pokeOsd],
+  )
+
   const cycleAudio = useCallback(() => {
     if (audioStreams.length <= 1) return
     const curPos = audioStreams.findIndex((a) => a.Index === effectiveAudioIndex)
     const next = audioStreams[(curPos + 1) % audioStreams.length]
-    captureResumePosition()
-    setUseProxyDirect(false)
-    setForceServerHls(false)
-    setWasmFallbackNotice(null)
-    setAudioIndex(next.Index)
-    setQueryAudioIndex(next.Index)
-    pokeOsd()
-  }, [audioStreams, effectiveAudioIndex, captureResumePosition, pokeOsd])
+    selectAudioTrack(next.Index)
+  }, [audioStreams, effectiveAudioIndex, selectAudioTrack])
 
   const handleRetryPlayback = useCallback(() => {
     captureResumePosition()
@@ -1836,6 +1966,21 @@ export function PlayerPage() {
 
   const progressPct = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0
   const bufferedPct = duration > 0 ? Math.min(100, (bufferedEnd / duration) * 100) : 0
+  const hoverBifFrame = useMemo(() => {
+    if (!hoverSeek || !bifArchive) return null
+    return bifArchive.getFrameUrl(hoverSeek.timeSec)
+  }, [hoverSeek, bifArchive])
+  const hoverChapterTitle = useMemo(() => {
+    if (!hoverSeek || chapters.length === 0) return null
+    let matched: string | null = null
+    for (let i = 0; i < chapters.length; i++) {
+      const startSec = chapters[i].StartPositionTicks / 10_000_000
+      if (hoverSeek.timeSec >= startSec) {
+        matched = chapters[i].Name || `章节 ${i + 1}`
+      }
+    }
+    return matched
+  }, [hoverSeek, chapters])
 
   return (
     <div
@@ -1864,6 +2009,7 @@ export function PlayerPage() {
         }}
         onDoubleClick={toggleFullscreen}
         onPlay={() => {
+          stopReportedRef.current = false
           setPlaying(true)
           setBuffering(false)
           reportState('progress', 'Unpause')
@@ -2316,7 +2462,41 @@ export function PlayerPage() {
         }`}
       >
         {/* 进度条 */}
-        <div className="group/bar relative mb-3 flex items-center py-2">
+        <div
+          className="group/bar relative mb-3 flex items-center py-2"
+          onMouseMove={(e) => {
+            if (duration <= 0) return
+            const rect = e.currentTarget.getBoundingClientRect()
+            if (rect.width <= 0) return
+            const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width))
+            setHoverSeek({ timeSec: ratio * duration, pct: ratio * 100 })
+          }}
+          onMouseLeave={() => setHoverSeek(null)}
+        >
+          {hoverSeek && duration > 0 && (
+            <div
+              data-testid="bif-preview-tooltip"
+              className="pointer-events-none absolute bottom-8 z-30 -translate-x-1/2 overflow-hidden rounded-xl border border-white/15 bg-zinc-950/95 p-1.5 text-center shadow-2xl backdrop-blur-md"
+              style={{ left: `${Math.min(92, Math.max(8, hoverSeek.pct))}%` }}
+            >
+              {hoverBifFrame && (
+                <img
+                  data-testid="bif-preview-image"
+                  src={hoverBifFrame.url}
+                  alt={`预览 ${formatSeconds(hoverSeek.timeSec)}`}
+                  className="mb-1 block h-[90px] w-40 rounded-lg bg-black object-cover"
+                />
+              )}
+              <div className="px-1 font-mono text-[11px] font-semibold text-amber-300">
+                {formatSeconds(hoverSeek.timeSec)}
+              </div>
+              {hoverChapterTitle && (
+                <div className="max-w-[160px] truncate px-1 text-[10px] text-zinc-300">
+                  {hoverChapterTitle}
+                </div>
+              )}
+            </div>
+          )}
           <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-white/20 transition-all group-hover/bar:h-2">
             <div
               className="absolute inset-y-0 left-0 bg-white/30"
@@ -2353,10 +2533,19 @@ export function PlayerPage() {
               const t = Number(e.target.value)
               if (videoRef.current) videoRef.current.currentTime = t
               setCurrentTime(t)
+              if (duration > 0) {
+                setHoverSeek({ timeSec: t, pct: Math.min(100, Math.max(0, (t / duration) * 100)) })
+              }
             }}
-            onPointerUp={reportSeekProgress}
+            onPointerUp={() => {
+              setHoverSeek(null)
+              reportSeekProgress()
+            }}
             onMouseUp={reportSeekProgress}
-            onTouchEnd={reportSeekProgress}
+            onTouchEnd={() => {
+              setHoverSeek(null)
+              reportSeekProgress()
+            }}
             onKeyUp={reportSeekProgress}
             className="ambra-range absolute inset-0 h-full w-full opacity-0 group-hover/bar:opacity-100"
           />
@@ -2552,6 +2741,8 @@ export function PlayerPage() {
                                 src.DefaultAudioStreamIndex,
                                 locale,
                               )
+                              const nextAudioStream =
+                                nextAudioList.find((a) => a.Index === nextAudio) || nextAudioList[0]
                               const nextSubList = nextStreams.filter((s) => s.Type === 'Subtitle')
                               const nextSub = pickPreferredSubtitleIndex(
                                 nextSubList,
@@ -2559,13 +2750,16 @@ export function PlayerPage() {
                                 src.DefaultSubtitleStreamIndex,
                                 locale,
                                 prefs.subtitleMode,
+                                nextAudioStream,
                               )
                               initializedAudioSourceIdRef.current = src.Id
                               initializedSubSourceIdRef.current = src.Id
                               subtitleExplicitlyOffRef.current =
                                 nextSub === undefined &&
                                 (prefs.preferredSubtitleLang === 'off' ||
-                                  prefs.subtitleMode === 'None')
+                                  prefs.subtitleMode === 'None' ||
+                                  prefs.subtitleMode === 'Smart' ||
+                                  prefs.subtitleMode === 'OnlyForced')
                               setUseProxyDirect(false)
                               setForceServerHls(false)
                               setWasmFallbackNotice(null)
@@ -2676,16 +2870,7 @@ export function PlayerPage() {
                           key={a.Index}
                           type="button"
                           onClick={() => {
-                            if (a.Index !== effectiveAudioIndex) {
-                              captureResumePosition()
-                              setUseProxyDirect(false)
-                              setForceServerHls(false)
-                              setWasmFallbackNotice(null)
-                              setAudioIndex(a.Index)
-                              setQueryAudioIndex(a.Index)
-                              playbackMetaRef.current.audioIndex = a.Index
-                              reportState('progress', 'AudioTrackChange')
-                            }
+                            selectAudioTrack(a.Index)
                             setActivePanel('none')
                           }}
                           className={`flex w-full items-center justify-between rounded-xl px-2.5 py-2 text-left text-xs transition-colors ${
@@ -2730,10 +2915,7 @@ export function PlayerPage() {
                     <button
                       type="button"
                       onClick={() => {
-                        subtitleExplicitlyOffRef.current = true
-                        setSubtitleIndex(undefined)
-                        playbackMetaRef.current.subtitleIndex = undefined
-                        reportState('progress', 'SubtitleTrackChange')
+                        selectSubtitleTrack(undefined)
                         setActivePanel('none')
                       }}
                       className={`flex w-full items-center justify-between rounded-xl px-2.5 py-2 text-left text-xs transition-colors ${
@@ -2751,10 +2933,7 @@ export function PlayerPage() {
                           key={s.Index}
                           type="button"
                           onClick={() => {
-                            subtitleExplicitlyOffRef.current = false
-                            setSubtitleIndex(s.Index)
-                            playbackMetaRef.current.subtitleIndex = s.Index
-                            reportState('progress', 'SubtitleTrackChange')
+                            selectSubtitleTrack(s.Index)
                             setActivePanel('none')
                           }}
                           className={`flex w-full items-center justify-between gap-2 rounded-xl px-2.5 py-2 text-left text-xs transition-colors ${

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -90,7 +91,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 
 func (h *Handler) serverID() string {
 	if h.cfg != nil {
-		return h.cfg.ServerID
+		return h.cfg.Snapshot().ServerID
 	}
 	return ""
 }
@@ -135,15 +136,21 @@ func (h *Handler) filterAccessibleItemIDs(r *http.Request, fallbackUserID string
 	if len(ids) == 0 {
 		return ids
 	}
+	isNonAdmin := h.isNonAdminCaller(r)
 	allowed := h.allowedLibrariesForRequest(r, fallbackUserID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, fallbackUserID)
-	if allowed == nil && maxRating == nil && len(blockedTags) == 0 {
-		return ids
-	}
+	restricted := isNonAdmin || allowed != nil || maxRating != nil || len(blockedTags) > 0
 	filtered := make([]string, 0, len(ids))
 	for _, id := range ids {
 		rec, err := h.repo.GetItemRecordByID(r.Context(), id)
 		if err != nil || rec == nil {
+			if !restricted {
+				filtered = append(filtered, id)
+			}
+			continue
+		}
+		// Never allow nesting a Playlist inside another Playlist/Collection or adding another user's private Playlist.
+		if strings.EqualFold(rec.Type, "Playlist") {
 			continue
 		}
 		if allowed != nil && rec.LibraryID != "" && !isLibraryAllowed(rec.LibraryID, allowed) {
@@ -152,6 +159,13 @@ func (h *Handler) filterAccessibleItemIDs(r *http.Request, fallbackUserID string
 		if maxRating != nil || len(blockedTags) > 0 {
 			if blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags); bErr != nil || blocked {
 				continue
+			}
+			if rec.SeriesID != "" && rec.OfficialRating == "" && maxRating != nil {
+				if seriesRec, sErr := h.repo.GetItemRecordByID(r.Context(), rec.SeriesID); sErr == nil && seriesRec != nil {
+					if blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), seriesRec, maxRating, blockedTags); bErr != nil || blocked {
+						continue
+					}
+				}
 			}
 		}
 		filtered = append(filtered, id)
@@ -354,7 +368,8 @@ func (h *Handler) handleListCollections(w http.ResponseWriter, r *http.Request) 
 		Fields:            q.List("Fields"),
 	})
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in collections handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if h.isNonAdminCaller(r) {
@@ -396,7 +411,8 @@ func (h *Handler) handleCreateCollection(w http.ResponseWriter, r *http.Request)
 
 	rec, err := h.repo.CreateCollection(r.Context(), name, parentID, ids)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in collections handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	httpx.JSON(w, http.StatusOK, creationResult{Id: rec.ID, Name: rec.Name})
@@ -454,7 +470,8 @@ func (h *Handler) handleListPlaylists(w http.ResponseWriter, r *http.Request) {
 
 	items, total, err := h.repo.QueryItems(r.Context(), filter)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in collections handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if filterByOwner {
@@ -541,7 +558,8 @@ func (h *Handler) handleCreatePlaylist(w http.ResponseWriter, r *http.Request) {
 
 	rec, err := h.repo.CreatePlaylist(r.Context(), name, mediaType, userID, ids)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in collections handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	httpx.JSON(w, http.StatusOK, creationResult{Id: rec.ID, Name: rec.Name})
@@ -585,7 +603,8 @@ func (h *Handler) handleMovePlaylistItem(w http.ResponseWriter, r *http.Request)
 			httpx.Error(w, http.StatusNotFound, "playlist or item not found")
 			return
 		}
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in collections container operation", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	httpx.NoContent(w)
@@ -604,7 +623,8 @@ func (h *Handler) handlePlaylistInstantMix(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in collections handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if !strings.EqualFold(rec.Type, "Playlist") {
@@ -621,7 +641,8 @@ func (h *Handler) handlePlaylistInstantMix(w http.ResponseWriter, r *http.Reques
 	if maxRating != nil || len(blockedTags) > 0 {
 		blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags)
 		if bErr != nil {
-			httpx.Error(w, http.StatusInternalServerError, bErr.Error())
+			slog.Error("failed to verify parental policy", "error", bErr)
+			httpx.Error(w, http.StatusInternalServerError, "failed to verify item access")
 			return
 		}
 		if blocked {
@@ -641,7 +662,8 @@ func (h *Handler) handlePlaylistInstantMix(w http.ResponseWriter, r *http.Reques
 		blockedTags,
 	)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in collections handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if h.isNonAdminCaller(r) {
@@ -669,7 +691,8 @@ func (h *Handler) handleGetContainerItems(expectedType string, checkPlaylistAcce
 			return
 		}
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("failed to load container", "container_id", containerID, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to load container")
 			return
 		}
 		if !strings.EqualFold(rec.Type, expectedType) {
@@ -687,7 +710,8 @@ func (h *Handler) handleGetContainerItems(expectedType string, checkPlaylistAcce
 		if maxRating != nil || len(blockedTags) > 0 {
 			blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags)
 			if bErr != nil {
-				httpx.Error(w, http.StatusInternalServerError, bErr.Error())
+				slog.Error("failed to check container parental policy", "container_id", containerID, "error", bErr)
+				httpx.Error(w, http.StatusInternalServerError, "failed to verify item access")
 				return
 			}
 			if blocked {
@@ -697,7 +721,8 @@ func (h *Handler) handleGetContainerItems(expectedType string, checkPlaylistAcce
 		}
 		startIndex := q.Int("StartIndex", 0)
 		limit := q.Int("Limit", 0)
-		needFilter := allowed != nil || maxRating != nil || len(blockedTags) > 0
+		isNonAdmin := h.isNonAdminCaller(r)
+		needFilter := isNonAdmin || allowed != nil || maxRating != nil || len(blockedTags) > 0
 
 		fetchStart, fetchLimit := startIndex, limit
 		if needFilter {
@@ -718,7 +743,8 @@ func (h *Handler) handleGetContainerItems(expectedType string, checkPlaylistAcce
 			return
 		}
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("failed to get container items", "container_id", containerID, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to get container items")
 			return
 		}
 		if needFilter {
@@ -728,7 +754,11 @@ func (h *Handler) handleGetContainerItems(expectedType string, checkPlaylistAcce
 				if recErr != nil || itemRec == nil {
 					continue
 				}
-				if allowed != nil && itemRec.LibraryID != "" && !isLibraryAllowed(itemRec.LibraryID, allowed) {
+				if strings.EqualFold(itemRec.Type, "Playlist") {
+					if !h.canViewPlaylist(r, itemRec.ID, itemRec.ParentID) {
+						continue
+					}
+				} else if allowed != nil && itemRec.LibraryID != "" && !isLibraryAllowed(itemRec.LibraryID, allowed) {
 					continue
 				}
 				if maxRating != nil || len(blockedTags) > 0 {
@@ -786,7 +816,8 @@ func (h *Handler) addItemsToContainer(w http.ResponseWriter, r *http.Request, de
 			httpx.Error(w, http.StatusNotFound, "container not found")
 			return
 		}
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in collections container operation", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	httpx.NoContent(w)
@@ -817,7 +848,8 @@ func (h *Handler) handleRemoveContainerItems(w http.ResponseWriter, r *http.Requ
 			httpx.Error(w, http.StatusNotFound, "container not found")
 			return
 		}
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in collections container operation", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	httpx.NoContent(w)
@@ -849,7 +881,8 @@ func (h *Handler) requireContainer(w http.ResponseWriter, r *http.Request, conta
 		return nil, false
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in collections container operation", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return nil, false
 	}
 	if !strings.EqualFold(rec.Type, expectedType) {
@@ -873,7 +906,8 @@ func (h *Handler) handleDeleteContainer(w http.ResponseWriter, r *http.Request, 
 			httpx.Error(w, http.StatusNotFound, "container not found")
 			return
 		}
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in collections container operation", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	httpx.NoContent(w)

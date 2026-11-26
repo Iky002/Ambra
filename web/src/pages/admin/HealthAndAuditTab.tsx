@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
   AlertTriangle,
@@ -197,6 +197,8 @@ export function HealthAndAuditTab() {
   const [reviewsLoading, setReviewsLoading] = useState(true)
   const [lockFields, setLockFields] = useState<string[]>(DEFAULT_LOCK_FIELDS)
   const [actingReviewId, setActingReviewId] = useState<string | null>(null)
+  const reviewReqSeqRef = useRef(0)
+  const reviewAbortRef = useRef<AbortController | null>(null)
 
   // 4. Database backup & restore state
   const [backupInfo, setBackupInfo] = useState<BackupInfoResponse | null>(null)
@@ -245,19 +247,28 @@ export function HealthAndAuditTab() {
   }, [])
 
   const fetchReviews = useCallback(async (status: ReviewStatusFilter) => {
+    reviewAbortRef.current?.abort()
+    const controller = new AbortController()
+    reviewAbortRef.current = controller
+    const seq = ++reviewReqSeqRef.current
     setReviewsLoading(true)
     try {
       const res = await embyFetch<ScrapeReviewListResponse>(
         `/api/admin/governance/review?status=${encodeURIComponent(status)}`,
+        { signal: controller.signal },
       )
+      if (seq !== reviewReqSeqRef.current || controller.signal.aborted) return
       setReviews(res.Items || [])
     } catch (err) {
+      if (seq !== reviewReqSeqRef.current || controller.signal.aborted) return
       setFeedback({
         type: 'error',
         message: err instanceof Error ? err.message : '加载低置信度审校队列失败',
       })
     } finally {
-      setReviewsLoading(false)
+      if (seq === reviewReqSeqRef.current && !controller.signal.aborted) {
+        setReviewsLoading(false)
+      }
     }
   }, [])
 
@@ -268,6 +279,9 @@ export function HealthAndAuditTab() {
 
   useEffect(() => {
     void fetchReviews(reviewStatus)
+    return () => {
+      reviewAbortRef.current?.abort()
+    }
   }, [fetchReviews, reviewStatus])
 
   const handleCreateBackup = async () => {
