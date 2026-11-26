@@ -18,7 +18,7 @@ import {
 import { NavLink, Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { api } from '../api/client'
 import { AmbraLogo } from '../components/AmbraLogo'
-import { useI18n } from '../i18n/I18nContext'
+import { getActiveLocale, translateForLocale, useI18n } from '../i18n/I18nContext'
 import { DashboardTab } from './admin/DashboardTab'
 import { DevicesKeysTab } from './admin/DevicesKeysTab'
 import { HealthAndAuditTab } from './admin/HealthAndAuditTab'
@@ -37,73 +37,73 @@ const ADMIN_TABS = [
   {
     path: 'dashboard',
     labelKey: 'admin.tabDashboard',
-    desc: '状态 · 会话 · 活动日志',
+    descKey: 'admin.tabDashboardDesc',
     icon: Activity,
   },
   {
     path: 'settings',
     labelKey: 'admin.tabSettings',
-    desc: '名称 · TMDB · 302 · 阈值',
+    descKey: 'admin.tabSettingsDesc',
     icon: SlidersHorizontal,
   },
   {
     path: 'users',
     labelKey: 'admin.tabUsers',
-    desc: '账号 · 密码 · RBAC 策略',
+    descKey: 'admin.tabUsersDesc',
     icon: Users,
   },
   {
     path: 'libraries',
     labelKey: 'admin.tabLibraries',
-    desc: '挂载目录 · 扫描 · 删除',
+    descKey: 'admin.tabLibrariesDesc',
     icon: FolderOpen,
   },
   {
     path: 'metadata',
-    labelKey: 'admin.tabRankings',
-    desc: '豆瓣/IMDb · 编辑 · 识别',
+    labelKey: 'admin.tabMetadata',
+    descKey: 'admin.tabMetadataDesc',
     icon: Sparkles,
   },
   {
     path: 'devices',
     labelKey: 'admin.tabDevicesKeys',
-    desc: '设备注销 · API Keys',
+    descKey: 'admin.tabDevicesKeysDesc',
     icon: Key,
   },
   {
     path: 'plugins',
     labelKey: 'admin.tabPlugins',
-    desc: 'TMDB · NFO · STRM 配置',
+    descKey: 'admin.tabPluginsDesc',
     icon: Puzzle,
   },
   {
     path: 'tasks',
     labelKey: 'admin.tabTasksLogs',
-    desc: '计划任务 · 服务器日志',
+    descKey: 'admin.tabTasksLogsDesc',
     icon: CalendarClock,
   },
   {
     path: 'livetv',
     labelKey: 'admin.tabLiveTv',
-    desc: 'M3U 源 · XMLTV · 频道',
+    descKey: 'admin.tabLiveTvDesc',
     icon: Radio,
   },
   {
     path: 'webhooks',
     labelKey: 'admin.tabWebhooks',
-    desc: '事件推送 · HMAC · 测试',
+    descKey: 'admin.tabWebhooksDesc',
     icon: Webhook,
   },
   {
     path: 'health',
-    labelKey: 'admin.tabBackup',
-    desc: '系统体检 · 审校 · NFO',
+    labelKey: 'admin.tabGovernance',
+    descKey: 'admin.tabGovernanceDesc',
     icon: HeartPulse,
   },
   {
     path: 'migration',
     labelKey: 'admin.tabMigration',
-    desc: '一键导入用户与进度',
+    descKey: 'admin.tabMigrationDesc',
     icon: ArrowRightLeft,
   },
 ] as const
@@ -129,7 +129,7 @@ class AdminTabErrorBoundary extends Component<
   static getDerivedStateFromError(error: Error): AdminTabErrorBoundaryState {
     return {
       hasError: true,
-      errorMessage: error?.message || '页面渲染发生未知错误',
+      errorMessage: error?.message || translateForLocale(getActiveLocale(), 'admin.errorUnknown'),
     }
   }
 
@@ -139,10 +139,13 @@ class AdminTabErrorBoundary extends Component<
 
   render() {
     if (this.state.hasError) {
+      const currentLocale = getActiveLocale()
       return (
         <div className="flex min-h-[280px] flex-col items-center justify-center rounded-2xl border border-red-500/25 bg-red-500/[0.04] p-6 text-center">
           <AlertTriangle className="mb-3 h-8 w-8 text-red-400" />
-          <h3 className="text-sm font-semibold text-zinc-100">当前管理面板加载异常</h3>
+          <h3 className="text-sm font-semibold text-zinc-100">
+            {translateForLocale(currentLocale, 'admin.errorPanelTitle')}
+          </h3>
           <p className="mt-1.5 max-w-md text-xs leading-relaxed text-zinc-400">
             {this.state.errorMessage}
           </p>
@@ -152,7 +155,7 @@ class AdminTabErrorBoundary extends Component<
             className="mt-4 inline-flex items-center gap-1.5 rounded-xl border border-white/15 bg-white/8 px-4 py-2 text-xs font-medium text-zinc-200 transition-colors hover:bg-white/15"
           >
             <RefreshCw className="h-3.5 w-3.5" />
-            <span>重试加载</span>
+            <span>{translateForLocale(currentLocale, 'admin.retryLoad')}</span>
           </button>
         </div>
       )
@@ -162,7 +165,7 @@ class AdminTabErrorBoundary extends Component<
 }
 
 export function AdminPage() {
-  const { t, locale } = useI18n()
+  const { t } = useI18n()
   const location = useLocation()
   const navRef = useRef<HTMLElement | null>(null)
   const savedScrollLeftRef = useRef<number>(0)
@@ -176,7 +179,6 @@ export function AdminPage() {
     const nav = navRef.current
     if (!nav) return
 
-    // 保持切换子标签前的横向滚动位置，防止回弹至 0
     if (savedScrollLeftRef.current > 0 && nav.scrollLeft === 0) {
       nav.scrollLeft = savedScrollLeftRef.current
     }
@@ -198,11 +200,11 @@ export function AdminPage() {
     setScanFeedback(null)
     try {
       await api.refreshLibrary()
-      setScanFeedback({ type: 'success', message: '已成功触发全部媒体库扫描任务' })
+      setScanFeedback({ type: 'success', message: t('admin.scanTriggeredSuccess') })
     } catch (err) {
       setScanFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '触发扫描失败',
+        message: err instanceof Error ? err.message : t('admin.scanTriggerFailed'),
       })
     } finally {
       setScanning(false)
@@ -211,13 +213,12 @@ export function AdminPage() {
 
   return (
     <div className="space-y-6 px-4 pt-6 lg:px-8">
-      {/* 控制台顶部品牌栏 */}
       <div className="flex flex-col gap-4 border-b border-white/8 pb-5 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-3">
           <AmbraLogo
             size={40}
             showWordmark
-            subtitle={locale === 'zh-CN' ? '管理控制台 · Admin Console' : t('admin.title')}
+            subtitle={t('admin.subtitleBrand')}
           />
         </div>
 
@@ -238,9 +239,7 @@ export function AdminPage() {
         onClose={() => setScanFeedback(null)}
       />
 
-      {/* 暗色侧边标签 + 内容主区域 */}
       <div className="flex flex-col gap-6 xl:flex-row">
-        {/* 左侧/顶部子导航 */}
         <aside className="shrink-0 xl:w-60">
           <nav
             ref={navRef}
@@ -267,7 +266,9 @@ export function AdminPage() {
                   <Icon className="h-4 w-4 shrink-0" />
                   <div className="min-w-0">
                     <p className="truncate text-sm font-medium">{t(tab.labelKey)}</p>
-                    <p className="hidden truncate text-[11px] text-zinc-500 xl:block">{tab.desc}</p>
+                    <p className="hidden truncate text-[11px] text-zinc-500 xl:block">
+                      {t(tab.descKey)}
+                    </p>
                   </div>
                 </NavLink>
               )

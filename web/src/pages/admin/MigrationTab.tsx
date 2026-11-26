@@ -6,6 +6,7 @@ import {
   ArrowRightLeft,
   CheckCircle2,
   FolderOpen,
+  History,
   KeyRound,
   Loader2,
   Play,
@@ -17,7 +18,7 @@ import {
   Users,
 } from 'lucide-react'
 import { embyFetch } from '../../api/client'
-import { isDemoMode } from '../../demo/demoMode'
+import { useI18n } from '../../i18n/I18nContext'
 import { FeedbackBanner, ToggleSwitch, formatDateTime } from './adminUtils'
 
 interface SourceServerInfo {
@@ -89,52 +90,16 @@ interface MigrationReport {
 
 type WizardStep = 1 | 2 | 3
 
-const DEMO_TEST_RESULT: SourceTestResult = {
-  server: {
-    Id: 'demo-legacy-emby-01',
-    ServerName: '旧 Emby NAS 影院 (Demo)',
-    Version: '4.8.10.0',
-    ProductName: 'Emby Server',
-    OperatingSystem: 'Linux',
-    Status: 'ok',
-  },
-  users: [
-    {
-      Id: 'demo-u-1',
-      Name: 'Admin',
-      Policy: { IsAdministrator: true, IsDisabled: false },
-      LastActivityDate: new Date(Date.now() - 3600_000).toISOString(),
-    },
-    {
-      Id: 'demo-u-2',
-      Name: '家庭观影',
-      Policy: { IsAdministrator: false, IsDisabled: false },
-      LastActivityDate: new Date(Date.now() - 86400_000).toISOString(),
-    },
-    {
-      Id: 'demo-u-3',
-      Name: '访客账号',
-      Policy: { IsAdministrator: false, IsDisabled: false },
-      LastActivityDate: new Date(Date.now() - 7 * 86400_000).toISOString(),
-    },
-  ],
-  virtual_folders: [
-    { Name: '4K 电影', CollectionType: 'movies', Locations: ['/volume1/media/movies'] },
-    { Name: '精选剧集', CollectionType: 'tvshows', Locations: ['/volume1/media/tv'] },
-    { Name: '动画番剧', CollectionType: 'tvshows', Locations: ['/volume1/media/anime'] },
-  ],
-}
-
 export function MigrationTab() {
-  const demo = isDemoMode()
+  const { t } = useI18n()
   const [step, setStep] = useState<WizardStep>(1)
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
     null,
   )
 
   // Step 1: 连接配置
-  const [sourceURL, setSourceURL] = useState(demo ? 'http://192.168.1.88:8096' : '')
-  const [apiKey, setApiKey] = useState(demo ? 'demo-emby-api-key-9f2a4c' : '')
+  const [sourceURL, setSourceURL] = useState('')
+  const [apiKey, setApiKey] = useState('')
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<SourceTestResult | null>(null)
 
@@ -152,32 +117,33 @@ export function MigrationTab() {
   const [starting, setStarting] = useState(false)
   const [cancelling, setCancelling] = useState(false)
   const [liveReport, setLiveReport] = useState<MigrationReport | null>(null)
-  const demoTimerRef = useRef<number | null>(null)
   const pollSeqRef = useRef(0)
 
   const validateSourceUrl = (rawUrl: string): string | null => {
     const trimmed = rawUrl.trim()
-    if (!trimmed) return '请先填写旧 Emby 服务器地址和 API Key'
+    if (!trimmed) return t('admin.migration.errMissingCreds')
     try {
       const parsed = new URL(trimmed)
       if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-        return '旧 Emby 服务器地址必须使用 http:// 或 https:// 协议'
+        return t('admin.migration.errProtocol')
       }
       return null
     } catch {
-      return '旧 Emby 服务器地址格式无效，请填写完整的 http:// 或 https:// 地址'
+      return t('admin.migration.errInvalidUrl')
     }
   }
 
-  // 初始拉取当前后端迁移状态（如果有正在进行或最近完成的任务）
+  // 初始拉取当前后端迁移状态（自动恢复运行中任务或预填中断断点）
   useEffect(() => {
-    if (demo) return
     let mounted = true
     const reqSeq = ++pollSeqRef.current
     embyFetch<MigrationReport>('/api/admin/migration/status')
       .then((rep) => {
         if (!mounted || reqSeq !== pollSeqRef.current || !rep || rep.status === 'idle') return
         setLiveReport(rep)
+        if (rep.source_url) {
+          setSourceURL((prev) => (prev.trim() ? prev : rep.source_url || ''))
+        }
         if (rep.status === 'running') {
           setStep(3)
         }
@@ -188,11 +154,11 @@ export function MigrationTab() {
     return () => {
       mounted = false
     }
-  }, [demo])
+  }, [])
 
   // 运行中轮询进度
   useEffect(() => {
-    if (demo || !liveReport || liveReport.status !== 'running') return
+    if (!liveReport || liveReport.status !== 'running') return
     let cancelled = false
     const timer = window.setInterval(() => {
       const reqSeq = ++pollSeqRef.current
@@ -203,12 +169,17 @@ export function MigrationTab() {
           if (rep.status === 'completed') {
             setFeedback({
               type: 'success',
-              message: `迁移完成：共匹配 ${rep.items_matched} 条记录（已看 ${rep.played_migrated} / 收藏 ${rep.favorites_migrated} / 断点 ${rep.resume_migrated}）`,
+              message: t('admin.migration.completedSuccess', {
+                matched: rep.items_matched,
+                played: rep.played_migrated,
+                favorites: rep.favorites_migrated,
+                resume: rep.resume_migrated,
+              }),
             })
           } else if (rep.status === 'failed') {
             setFeedback({
               type: 'error',
-              message: rep.errors?.[0] || '迁移执行失败，请检查源服务器状态与日志',
+              message: rep.errors?.[0] || t('admin.migration.failedDefault'),
             })
           }
         })
@@ -220,15 +191,7 @@ export function MigrationTab() {
       cancelled = true
       window.clearInterval(timer)
     }
-  }, [demo, liveReport?.status])
-
-  useEffect(() => {
-    return () => {
-      if (demoTimerRef.current) {
-        window.clearInterval(demoTimerRef.current)
-      }
-    }
-  }, [])
+  }, [liveReport?.status, t])
 
   const toggleUser = (id: string) => {
     setSelectedUserIDs((prev) =>
@@ -260,7 +223,7 @@ export function MigrationTab() {
   const handleTestConnection = async () => {
     setFeedback(null)
     if (!sourceURL.trim() || !apiKey.trim()) {
-      setFeedback({ type: 'error', message: '请先填写旧 Emby 服务器地址和 API Key' })
+      setFeedback({ type: 'error', message: t('admin.migration.errMissingCreds') })
       return
     }
     const urlErr = validateSourceUrl(sourceURL)
@@ -270,27 +233,26 @@ export function MigrationTab() {
     }
     setTesting(true)
     try {
-      let res: SourceTestResult
-      if (demo) {
-        await new Promise((r) => setTimeout(r, 450))
-        res = DEMO_TEST_RESULT
-      } else {
-        res = await embyFetch<SourceTestResult>('/api/admin/migration/test', {
-          method: 'POST',
-          body: JSON.stringify({ source_url: sourceURL.trim(), api_key: apiKey.trim() }),
-        })
-      }
+      const res = await embyFetch<SourceTestResult>('/api/admin/migration/test', {
+        method: 'POST',
+        body: JSON.stringify({ source_url: sourceURL.trim(), api_key: apiKey.trim() }),
+      })
       setTestResult(res)
       setSelectedUserIDs(res.users.map((u) => u.Id))
       setDryReport(null)
       setFeedback({
         type: 'success',
-        message: `连接成功：${res.server.ServerName}（v${res.server.Version}），发现 ${res.users.length} 个用户与 ${res.virtual_folders.length} 个媒体库`,
+        message: t('admin.migration.testSuccess', {
+          name: res.server.ServerName,
+          version: res.server.Version,
+          users: res.users.length,
+          libs: res.virtual_folders.length,
+        }),
       })
     } catch (err) {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '无法连接到旧 Emby 服务器',
+        message: err instanceof Error ? err.message : t('admin.migration.testFailed'),
       })
     } finally {
       setTesting(false)
@@ -305,58 +267,28 @@ export function MigrationTab() {
       return
     }
     if (selectedUserIDs.length === 0) {
-      setFeedback({ type: 'error', message: '请至少勾选一个需要迁移的用户' })
+      setFeedback({ type: 'error', message: t('admin.migration.errNoUsers') })
       return
     }
     setDryRunning(true)
     try {
-      let rep: MigrationReport
-      if (demo) {
-        await new Promise((r) => setTimeout(r, 600))
-        const userCount = selectedUserIDs.length
-        rep = {
-          status: 'completed',
-          dry_run: true,
-          source_url: sourceURL.trim(),
-          source_server_name: DEMO_TEST_RESULT.server.ServerName,
-          started_at: new Date().toISOString(),
-          completed_at: new Date().toISOString(),
-          total_users: userCount,
-          processed_users: userCount,
-          users_matched: 1,
-          users_created: migrateUsers ? Math.max(0, userCount - 1) : 0,
-          items_scanned: userCount * 142,
-          items_matched: userCount * 134,
-          items_skipped: userCount * 8,
-          played_migrated: migratePlayed ? userCount * 96 : 0,
-          favorites_migrated: migrateFavorites ? userCount * 24 : 0,
-          resume_migrated: migrateResume ? userCount * 14 : 0,
-          conflicts: [
-            {
-              user_name: 'Admin',
-              item_name: '沙丘 (2021)',
-              item_type: 'Movie',
-              reason: '演示冲突：本地存在多版本重复条目，已安全跳过',
-            },
-          ],
-          errors: [],
-          resumed_from_checkpoint: false,
-        }
-      } else {
-        rep = await embyFetch<MigrationReport>('/api/admin/migration/dry-run', {
-          method: 'POST',
-          body: JSON.stringify(buildPayload(true)),
-        })
-      }
+      const rep = await embyFetch<MigrationReport>('/api/admin/migration/dry-run', {
+        method: 'POST',
+        body: JSON.stringify(buildPayload(true)),
+      })
       setDryReport(rep)
       setFeedback({
         type: 'success',
-        message: `Dry-Run 模拟评估完成：扫描 ${rep.items_scanned} 条，可精确匹配 ${rep.items_matched} 条，冲突 ${rep.conflicts.length} 条`,
+        message: t('admin.migration.dryRunSuccess', {
+          scanned: rep.items_scanned,
+          matched: rep.items_matched,
+          conflicts: rep.conflicts.length,
+        }),
       })
     } catch (err) {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : 'Dry-Run 模拟评估失败',
+        message: err instanceof Error ? err.message : t('admin.migration.dryRunFailed'),
       })
     } finally {
       setDryRunning(false)
@@ -370,138 +302,68 @@ export function MigrationTab() {
       setFeedback({ type: 'error', message: urlErr })
       return
     }
+    if (!apiKey.trim()) {
+      setFeedback({ type: 'error', message: t('admin.migration.errMissingCreds') })
+      return
+    }
     if (selectedUserIDs.length === 0) {
-      setFeedback({ type: 'error', message: '请至少勾选一个需要迁移的用户' })
+      setFeedback({ type: 'error', message: t('admin.migration.errNoUsers') })
       return
     }
     pollSeqRef.current += 1
     setStarting(true)
     setStep(3)
     try {
-      if (demo) {
-        const totalUsers = selectedUserIDs.length
-        const startedAt = new Date().toISOString()
-        let tick = 0
-        setLiveReport({
-          status: 'running',
-          dry_run: false,
-          source_url: sourceURL.trim(),
-          source_server_name: DEMO_TEST_RESULT.server.ServerName,
-          started_at: startedAt,
-          total_users: totalUsers,
-          processed_users: 0,
-          current_user: DEMO_TEST_RESULT.users[0]?.Name || 'Admin',
-          users_matched: 0,
-          users_created: 0,
-          items_scanned: 0,
-          items_matched: 0,
-          items_skipped: 0,
-          played_migrated: 0,
-          favorites_migrated: 0,
-          resume_migrated: 0,
-          conflicts: [],
-          errors: [],
-          resumed_from_checkpoint: false,
-        })
-        if (demoTimerRef.current) window.clearInterval(demoTimerRef.current)
-        demoTimerRef.current = window.setInterval(() => {
-          tick += 1
-          const done = tick >= totalUsers
-          const processed = Math.min(tick, totalUsers)
-          setLiveReport({
-            status: done ? 'completed' : 'running',
-            dry_run: false,
-            source_url: sourceURL.trim(),
-            source_server_name: DEMO_TEST_RESULT.server.ServerName,
-            started_at: startedAt,
-            completed_at: done ? new Date().toISOString() : undefined,
-            total_users: totalUsers,
-            processed_users: processed,
-            current_user: done ? '' : DEMO_TEST_RESULT.users[processed]?.Name || '',
-            users_matched: 1,
-            users_created: migrateUsers ? Math.max(0, processed - 1) : 0,
-            items_scanned: processed * 142,
-            items_matched: processed * 134,
-            items_skipped: processed * 8,
-            played_migrated: migratePlayed ? processed * 96 : 0,
-            favorites_migrated: migrateFavorites ? processed * 24 : 0,
-            resume_migrated: migrateResume ? processed * 14 : 0,
-            conflicts: done
-              ? [
-                  {
-                    user_name: 'Admin',
-                    item_name: '沙丘 (2021)',
-                    item_type: 'Movie',
-                    reason: '演示冲突：本地存在多版本重复条目，已安全跳过',
-                  },
-                ]
-              : [],
-            errors: [],
-            resumed_from_checkpoint: false,
-          })
-          if (done && demoTimerRef.current) {
-            window.clearInterval(demoTimerRef.current)
-            demoTimerRef.current = null
-            setFeedback({
-              type: 'success',
-              message: '演示迁移已完成！所有用户观影记录、收藏与播放断点已同步到 Ambra',
-            })
-          }
-        }, 700)
-      } else {
-        const rep = await embyFetch<MigrationReport>('/api/admin/migration/start', {
-          method: 'POST',
-          body: JSON.stringify(buildPayload(false)),
-        })
-        setLiveReport(rep)
-        setFeedback({
-          type: 'success',
-          message: '迁移任务已启动，正在后台批量写入并自动保存断点...',
-        })
-      }
+      const rep = await embyFetch<MigrationReport>('/api/admin/migration/start', {
+        method: 'POST',
+        body: JSON.stringify(buildPayload(false)),
+      })
+      setLiveReport(rep)
+      setFeedback({
+        type: 'success',
+        message: t('admin.migration.startedSuccess'),
+      })
     } catch (err) {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '启动迁移失败',
+        message: err instanceof Error ? err.message : t('admin.migration.startFailed'),
       })
     } finally {
       setStarting(false)
     }
   }
 
+  const handleReturnToFillCredentials = () => {
+    if (liveReport?.source_url) {
+      setSourceURL((prev) => prev.trim() || liveReport.source_url || '')
+    }
+    setStep(1)
+    setFeedback({
+      type: 'success',
+      message: t('admin.migration.backFillKeyHint'),
+    })
+  }
+
   const handleCancelMigration = async () => {
     pollSeqRef.current += 1
     setCancelling(true)
     try {
-      if (demo) {
-        if (demoTimerRef.current) {
-          window.clearInterval(demoTimerRef.current)
-          demoTimerRef.current = null
-        }
-        setLiveReport((prev) =>
-          prev
-            ? { ...prev, status: 'cancelled', completed_at: new Date().toISOString() }
-            : prev,
-        )
-        setFeedback({ type: 'success', message: '已取消演示迁移任务，当前断点已保留' })
-      } else {
-        const res = await embyFetch<{ cancelled: boolean; report: MigrationReport }>(
-          '/api/admin/migration/cancel',
-          { method: 'POST' },
-        )
-        pollSeqRef.current += 1
-        setLiveReport(res.report)
-        setFeedback({
-          type: 'success',
-          message: res.cancelled
-            ? '已发送取消信号，已完成批次的断点已持久化，可随时断点续传'
-            : '当前没有正在运行的迁移任务',
-        })
-      }
+      const res = await embyFetch<{ cancelled: boolean; report: MigrationReport }>(
+        '/api/admin/migration/cancel',
+        { method: 'POST' },
+      )
+      pollSeqRef.current += 1
+      setLiveReport(res.report)
+      setFeedback({
+        type: 'success',
+        message: res.cancelled
+          ? t('admin.migration.cancelledSuccess')
+          : t('admin.migration.cancelNoRunning'),
+      })
     } catch (err) {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '取消迁移失败',
+        message: err instanceof Error ? err.message : t('admin.migration.cancelFailed'),
       })
     } finally {
       setCancelling(false)
@@ -521,25 +383,19 @@ export function MigrationTab() {
     return Math.min(99, Math.round((liveReport.processed_users / liveReport.total_users) * 100))
   }, [liveReport])
 
+  const isCheckpointInterrupted =
+    liveReport?.status === 'cancelled' || liveReport?.status === 'failed'
+  const needsCredentialsToResume = !testResult || !apiKey.trim()
+
   return (
     <div className="space-y-6">
       {/* 顶部标题 */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h2 className="flex items-center gap-2 text-base font-semibold text-zinc-100">
-            <ArrowRightLeft className="h-4 w-4 text-amber-400" />
-            从旧 Emby 一键迁移
-          </h2>
-          <p className="mt-0.5 text-xs text-zinc-400">
-            通过旧 Emby API 安全迁移用户账号与权限、已看状态、收藏列表及播放断点，支持 Dry-Run 预览与断点续传
-          </p>
-        </div>
-        {demo && (
-          <span className="inline-flex items-center gap-1.5 self-start rounded-full border border-amber-500/30 bg-amber-500/10 px-3 py-1 text-xs font-medium text-amber-300">
-            <Sparkles className="h-3.5 w-3.5" />
-            Demo 模拟模式
-          </span>
-        )}
+      <div>
+        <h2 className="flex items-center gap-2 text-base font-semibold text-zinc-100">
+          <ArrowRightLeft className="h-4 w-4 text-amber-400" />
+          <span>{t('admin.migration.title')}</span>
+        </h2>
+        <p className="mt-0.5 text-xs text-zinc-400">{t('admin.migration.subtitle')}</p>
       </div>
 
       <FeedbackBanner
@@ -551,13 +407,28 @@ export function MigrationTab() {
       {/* 3 步向导导航栏 */}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
         {[
-          { num: 1 as WizardStep, title: '1. 连接旧 Emby 服务器', desc: '验证地址与 API Key' },
-          { num: 2 as WizardStep, title: '2. 迁移范围与 Dry-Run', desc: '勾选用户与模拟评估' },
-          { num: 3 as WizardStep, title: '3. 执行迁移与报告', desc: '实时进度与结果汇总' },
+          {
+            num: 1 as WizardStep,
+            title: t('admin.migration.step1Title'),
+            desc: t('admin.migration.step1Desc'),
+          },
+          {
+            num: 2 as WizardStep,
+            title: t('admin.migration.step2Title'),
+            desc: t('admin.migration.step2Desc'),
+          },
+          {
+            num: 3 as WizardStep,
+            title: t('admin.migration.step3Title'),
+            desc: t('admin.migration.step3Desc'),
+          },
         ].map((item) => {
           const active = step === item.num
           const done = step > item.num
-          const clickable = item.num === 1 || (item.num === 2 && Boolean(testResult)) || (item.num === 3 && Boolean(liveReport || testResult))
+          const clickable =
+            item.num === 1 ||
+            (item.num === 2 && Boolean(testResult)) ||
+            (item.num === 3 && Boolean(liveReport || testResult))
           return (
             <button
               key={item.num}
@@ -595,17 +466,51 @@ export function MigrationTab() {
       {/* Step 1: 连接旧 Emby 服务器 */}
       {step === 1 && (
         <section className="space-y-5 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
+          {isCheckpointInterrupted && liveReport && (
+            <div
+              data-testid="migration-checkpoint-banner"
+              className="flex flex-col gap-3 rounded-xl border border-amber-500/35 bg-amber-500/10 p-4 sm:flex-row sm:items-center sm:justify-between"
+            >
+              <div className="space-y-1">
+                <p className="flex items-center gap-1.5 text-xs font-semibold text-amber-200">
+                  <History className="h-4 w-4 shrink-0 text-amber-400" />
+                  <span>{t('admin.migration.checkpointBannerTitle')}</span>
+                </p>
+                <p className="text-xs leading-relaxed text-amber-100/85">
+                  {t('admin.migration.checkpointBannerDesc', {
+                    status:
+                      liveReport.status === 'cancelled'
+                        ? t('admin.migration.statusCancelled')
+                        : t('admin.migration.statusFailed'),
+                    url: liveReport.source_url || '-',
+                    processed: liveReport.processed_users,
+                    total: liveReport.total_users,
+                    matched: liveReport.items_matched,
+                  })}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setStep(3)}
+                className="inline-flex shrink-0 items-center gap-1.5 self-start rounded-lg border border-amber-400/40 bg-amber-500/15 px-3 py-1.5 text-xs font-medium text-amber-200 transition-colors hover:bg-amber-500/25 sm:self-center"
+              >
+                <span>{t('admin.migration.viewLastReport')}</span>
+                <ArrowRight className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
+
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             <div>
               <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-zinc-300">
                 <Server className="h-3.5 w-3.5 text-amber-400" />
-                旧 Emby 服务器地址
+                <span>{t('admin.migration.sourceUrlLabel')}</span>
               </label>
               <input
                 type="url"
                 value={sourceURL}
                 onChange={(e) => setSourceURL(e.target.value)}
-                placeholder="例如 http://192.168.1.88:8096"
+                placeholder={t('admin.migration.sourceUrlPlaceholder')}
                 className="w-full rounded-xl border border-white/10 bg-[#0d0d14] px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-amber-500/60"
               />
             </div>
@@ -613,30 +518,32 @@ export function MigrationTab() {
             <div>
               <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-zinc-300">
                 <KeyRound className="h-3.5 w-3.5 text-amber-400" />
-                旧 Emby 管理员 API Key
+                <span>{t('admin.migration.apiKeyLabel')}</span>
               </label>
               <input
                 type="password"
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
-                placeholder="在旧 Emby 控制台 → API 密钥中生成"
+                placeholder={t('admin.migration.apiKeyPlaceholder')}
                 className="w-full rounded-xl border border-white/10 bg-[#0d0d14] px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-amber-500/60"
               />
             </div>
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <p className="text-xs text-zinc-500">
-              迁移过程仅读取旧服务器数据，不会修改或删除旧 Emby 上的任何文件与记录。
-            </p>
+            <p className="text-xs text-zinc-500">{t('admin.migration.readOnlyHint')}</p>
             <button
               type="button"
               disabled={testing}
-              onClick={handleTestConnection}
+              onClick={() => void handleTestConnection()}
               className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-4 py-2 text-sm font-medium text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-60"
             >
-              {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-              测试连接
+              {testing ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <RefreshCw className="h-4 w-4" />
+              )}
+              <span>{t('admin.migration.testBtn')}</span>
             </button>
           </div>
 
@@ -644,24 +551,27 @@ export function MigrationTab() {
             <div className="space-y-4 border-t border-white/8 pt-4">
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
                 <div className="rounded-xl border border-white/8 bg-[#0d0d14] p-3.5">
-                  <p className="text-xs text-zinc-400">源服务器</p>
+                  <p className="text-xs text-zinc-400">{t('admin.migration.sourceServer')}</p>
                   <p className="mt-1 truncate text-sm font-semibold text-zinc-100">
                     {testResult.server.ServerName}
                   </p>
                   <p className="mt-0.5 text-xs text-amber-400">Emby v{testResult.server.Version}</p>
                 </div>
                 <div className="rounded-xl border border-white/8 bg-[#0d0d14] p-3.5">
-                  <p className="text-xs text-zinc-400">发现用户数</p>
+                  <p className="text-xs text-zinc-400">{t('admin.migration.discoveredUsers')}</p>
                   <p className="mt-1 text-xl font-bold text-zinc-100">{testResult.users.length}</p>
-                  <p className="mt-0.5 text-xs text-zinc-500">支持自动匹配或新建本地账号</p>
+                  <p className="mt-0.5 text-xs text-zinc-500">
+                    {t('admin.migration.discoveredUsersHint')}
+                  </p>
                 </div>
                 <div className="rounded-xl border border-white/8 bg-[#0d0d14] p-3.5">
-                  <p className="text-xs text-zinc-400">源媒体库数</p>
+                  <p className="text-xs text-zinc-400">{t('admin.migration.sourceLibs')}</p>
                   <p className="mt-1 text-xl font-bold text-zinc-100">
                     {testResult.virtual_folders.length}
                   </p>
                   <p className="mt-0.5 truncate text-xs text-zinc-500">
-                    {testResult.virtual_folders.map((f) => f.Name).join('、') || '暂无媒体库'}
+                    {testResult.virtual_folders.map((f) => f.Name).join(', ') ||
+                      t('admin.migration.noLibs')}
                   </p>
                 </div>
               </div>
@@ -670,7 +580,7 @@ export function MigrationTab() {
                 <div className="rounded-xl border border-white/8 bg-[#0d0d14] p-3.5">
                   <p className="mb-2 flex items-center gap-1.5 text-xs font-medium text-zinc-300">
                     <FolderOpen className="h-3.5 w-3.5 text-amber-400" />
-                    源媒体库概览
+                    <span>{t('admin.migration.sourceLibsOverview')}</span>
                   </p>
                   <div className="flex flex-wrap gap-2">
                     {testResult.virtual_folders.map((vf) => (
@@ -692,7 +602,7 @@ export function MigrationTab() {
                   onClick={() => setStep(2)}
                   className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-4 py-2 text-sm font-medium text-zinc-950 transition-colors hover:bg-amber-400"
                 >
-                  下一步：选择迁移范围
+                  <span>{t('admin.migration.nextStepBtn')}</span>
                   <ArrowRight className="h-4 w-4" />
                 </button>
               </div>
@@ -704,19 +614,25 @@ export function MigrationTab() {
       {/* Step 2: 选择迁移范围与 Dry-Run 预览 */}
       {step === 2 && testResult && (
         <section className="space-y-5 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
-          {/* 用户选择 */}
           <div className="space-y-3">
             <div className="flex items-center justify-between">
               <h3 className="flex items-center gap-2 text-sm font-semibold text-zinc-100">
                 <Users className="h-4 w-4 text-amber-400" />
-                选择要迁移的用户 ({selectedUserIDs.length}/{testResult.users.length})
+                <span>
+                  {t('admin.migration.selectUsersTitle', {
+                    selected: selectedUserIDs.length,
+                    total: testResult.users.length,
+                  })}
+                </span>
               </h3>
               <button
                 type="button"
                 onClick={toggleAllUsers}
                 className="text-xs font-medium text-amber-400 hover:text-amber-300"
               >
-                {selectedUserIDs.length === testResult.users.length ? '取消全选' : '全选所有用户'}
+                {selectedUserIDs.length === testResult.users.length
+                  ? t('admin.migration.deselectAll')
+                  : t('admin.migration.selectAllUsers')}
               </button>
             </div>
             <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 lg:grid-cols-3">
@@ -741,8 +657,10 @@ export function MigrationTab() {
                       <div className="min-w-0">
                         <p className="truncate text-sm font-medium text-zinc-100">{u.Name}</p>
                         <p className="text-[11px] text-zinc-400">
-                          {u.Policy?.IsAdministrator ? '管理员' : '普通用户'}
-                          {u.Policy?.IsDisabled ? ' · 已禁用' : ''}
+                          {u.Policy?.IsAdministrator
+                            ? t('admin.users.roleAdmin')
+                            : t('admin.users.roleMember')}
+                          {u.Policy?.IsDisabled ? ` · ${t('admin.users.disabledBadge')}` : ''}
                         </p>
                       </div>
                     </div>
@@ -756,39 +674,39 @@ export function MigrationTab() {
           <div className="space-y-3 border-t border-white/8 pt-4">
             <h3 className="flex items-center gap-2 text-sm font-semibold text-zinc-100">
               <ShieldCheck className="h-4 w-4 text-amber-400" />
-              选择迁移数据类型
+              <span>{t('admin.migration.dataTypesTitle')}</span>
             </h3>
             <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
               <ToggleSwitch
                 checked={migrateUsers}
                 onChange={setMigrateUsers}
-                label="用户账号与权限"
-                description="自动按用户名匹配本地账号，不存在时自动创建并同步 Policy / 配置"
+                label={t('admin.migration.typeUsersLabel')}
+                description={t('admin.migration.typeUsersDesc')}
               />
               <ToggleSwitch
                 checked={migratePlayed}
                 onChange={setMigratePlayed}
-                label="已看记录"
-                description="迁移影片与剧集的已看状态、观看次数及最近播放时间"
+                label={t('admin.migration.typePlayedLabel')}
+                description={t('admin.migration.typePlayedDesc')}
               />
               <ToggleSwitch
                 checked={migrateFavorites}
                 onChange={setMigrateFavorites}
-                label="收藏列表"
-                description="保留用户在旧 Emby 中标记的收藏影片、剧集与单集"
+                label={t('admin.migration.typeFavsLabel')}
+                description={t('admin.migration.typeFavsDesc')}
               />
               <ToggleSwitch
                 checked={migrateResume}
                 onChange={setMigrateResume}
-                label="播放断点"
-                description="迁移未看完媒体的播放进度（Ticks），无缝衔接继续观看"
+                label={t('admin.migration.typeResumeLabel')}
+                description={t('admin.migration.typeResumeDesc')}
               />
             </div>
             <ToggleSwitch
               checked={resetCheckpoint}
               onChange={setResetCheckpoint}
-              label="忽略历史断点，从头全量重跑"
-              description="默认启用断点续传；勾选此项将清除历史断点并从头幂等重跑"
+              label={t('admin.migration.resetCpLabel')}
+              description={t('admin.migration.resetCpDesc')}
             />
           </div>
 
@@ -796,27 +714,43 @@ export function MigrationTab() {
           {dryReport && (
             <div className="space-y-3 rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <p className="text-sm font-semibold text-amber-200">Dry-Run 模拟评估结果</p>
+                <p className="text-sm font-semibold text-amber-200">
+                  {t('admin.migration.dryRunResultTitle')}
+                </p>
                 <span className="rounded-full bg-amber-500/20 px-2.5 py-0.5 text-xs font-medium text-amber-300">
-                  匹配率 {matchRate}%
+                  {t('admin.migration.matchRateBadge', { rate: matchRate })}
                 </span>
               </div>
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-                <StatCard label="扫描条目" value={dryReport.items_scanned} />
-                <StatCard label="精确匹配" value={dryReport.items_matched} accent="emerald" />
-                <StatCard label="跳过 / 无数据" value={dryReport.items_skipped} />
+                <StatCard label={t('admin.migration.statScanned')} value={dryReport.items_scanned} />
                 <StatCard
-                  label="潜在冲突"
+                  label={t('admin.migration.statMatched')}
+                  value={dryReport.items_matched}
+                  accent="emerald"
+                />
+                <StatCard label={t('admin.migration.statSkipped')} value={dryReport.items_skipped} />
+                <StatCard
+                  label={t('admin.migration.statConflicts')}
                   value={dryReport.conflicts.length}
                   accent={dryReport.conflicts.length > 0 ? 'amber' : 'default'}
                 />
               </div>
               <div className="flex flex-wrap gap-4 text-xs text-zinc-300">
-                <span>匹配本地用户：{dryReport.users_matched}</span>
-                <span>预计新建用户：{dryReport.users_created}</span>
-                <span>预计同步已看：{dryReport.played_migrated}</span>
-                <span>预计同步收藏：{dryReport.favorites_migrated}</span>
-                <span>预计同步断点：{dryReport.resume_migrated}</span>
+                <span>
+                  {t('admin.migration.summaryUsersMatched', { count: dryReport.users_matched })}
+                </span>
+                <span>
+                  {t('admin.migration.summaryUsersCreated', { count: dryReport.users_created })}
+                </span>
+                <span>
+                  {t('admin.migration.summaryPlayed', { count: dryReport.played_migrated })}
+                </span>
+                <span>
+                  {t('admin.migration.summaryFavs', { count: dryReport.favorites_migrated })}
+                </span>
+                <span>
+                  {t('admin.migration.summaryResume', { count: dryReport.resume_migrated })}
+                </span>
               </div>
               {dryReport.conflicts.length > 0 && (
                 <div className="max-h-36 space-y-1.5 overflow-y-auto rounded-lg border border-white/8 bg-[#0d0d14] p-3 text-xs">
@@ -824,7 +758,7 @@ export function MigrationTab() {
                     <div key={idx} className="flex items-start gap-2 text-amber-300/90">
                       <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                       <span>
-                        [{c.user_name || '系统'}] {c.item_name || c.source_item_id || ''}：{c.reason}
+                        [{c.user_name || t('admin.migration.systemTag')}] {c.item_name || c.source_item_id || ''}：{c.reason}
                       </span>
                     </div>
                   ))}
@@ -841,26 +775,34 @@ export function MigrationTab() {
               className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 px-3.5 py-2 text-sm text-zinc-300 transition-colors hover:bg-white/5"
             >
               <ArrowLeft className="h-4 w-4" />
-              上一步
+              <span>{t('admin.migration.prevStepBtn')}</span>
             </button>
             <div className="flex flex-wrap items-center gap-2.5">
               <button
                 type="button"
                 disabled={dryRunning}
-                onClick={handleDryRun}
+                onClick={() => void handleDryRun()}
                 className="inline-flex items-center gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-2 text-sm font-medium text-amber-300 transition-colors hover:bg-amber-500/20 disabled:opacity-60"
               >
-                {dryRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
-                Dry-Run 模拟评估
+                {dryRunning ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Sparkles className="h-4 w-4" />
+                )}
+                <span>{t('admin.migration.dryRunBtn')}</span>
               </button>
               <button
                 type="button"
                 disabled={starting}
-                onClick={handleStartMigration}
+                onClick={() => void handleStartMigration()}
                 className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-4 py-2 text-sm font-medium text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-60"
               >
-                {starting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-                开始正式迁移
+                {starting ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Play className="h-4 w-4" />
+                )}
+                <span>{t('admin.migration.startBtn')}</span>
               </button>
             </div>
           </div>
@@ -873,24 +815,32 @@ export function MigrationTab() {
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <h3 className="text-sm font-semibold text-zinc-100">
-                迁移任务状态：
+                <span>{t('admin.migration.taskStatusLabel')}</span>
                 <span className="ml-2 text-amber-400">
                   {liveReport?.status === 'running'
-                    ? '迁移进行中...'
+                    ? t('admin.migration.statusRunning')
                     : liveReport?.status === 'completed'
-                      ? '迁移已完成'
+                      ? t('admin.migration.statusCompleted')
                       : liveReport?.status === 'cancelled'
-                        ? '已取消（已保留断点）'
+                        ? t('admin.migration.statusCancelled')
                         : liveReport?.status === 'failed'
-                          ? '迁移失败'
-                          : '等待启动'}
+                          ? t('admin.migration.statusFailed')
+                          : t('admin.migration.statusIdle')}
                 </span>
               </h3>
               {liveReport?.started_at && (
                 <p className="mt-0.5 text-xs text-zinc-400">
-                  开始时间：{formatDateTime(liveReport.started_at)}
-                  {liveReport.completed_at ? ` · 结束时间：${formatDateTime(liveReport.completed_at)}` : ''}
-                  {liveReport.resumed_from_checkpoint ? ' · 已从历史断点续传' : ''}
+                  {t('admin.migration.startedAtLabel', {
+                    time: formatDateTime(liveReport.started_at),
+                  })}
+                  {liveReport.completed_at
+                    ? ` · ${t('admin.migration.completedAtLabel', {
+                        time: formatDateTime(liveReport.completed_at),
+                      })}`
+                    : ''}
+                  {liveReport.resumed_from_checkpoint
+                    ? ` · ${t('admin.migration.resumedBadge')}`
+                    : ''}
                 </p>
               )}
             </div>
@@ -900,21 +850,38 @@ export function MigrationTab() {
                 <button
                   type="button"
                   disabled={cancelling}
-                  onClick={handleCancelMigration}
+                  onClick={() => void handleCancelMigration()}
                   className="inline-flex items-center gap-1.5 rounded-xl border border-red-500/40 bg-red-500/10 px-3.5 py-2 text-sm font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-60"
                 >
-                  {cancelling ? <Loader2 className="h-4 w-4 animate-spin" /> : <StopCircle className="h-4 w-4" />}
-                  取消迁移
+                  {cancelling ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <StopCircle className="h-4 w-4" />
+                  )}
+                  <span>{t('admin.migration.cancelBtn')}</span>
+                </button>
+              ) : needsCredentialsToResume ? (
+                <button
+                  type="button"
+                  onClick={handleReturnToFillCredentials}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-3.5 py-2 text-sm font-medium text-zinc-950 transition-colors hover:bg-amber-400"
+                >
+                  <KeyRound className="h-4 w-4" />
+                  <span>{t('admin.migration.backFillKeyResumeBtn')}</span>
                 </button>
               ) : (
                 <button
                   type="button"
-                  disabled={starting || !testResult}
-                  onClick={handleStartMigration}
+                  disabled={starting}
+                  onClick={() => void handleStartMigration()}
                   className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-3.5 py-2 text-sm font-medium text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-60"
                 >
                   <Play className="h-4 w-4" />
-                  {liveReport?.status === 'cancelled' ? '从断点继续迁移' : '重新执行迁移'}
+                  <span>
+                    {liveReport?.status === 'cancelled' || liveReport?.status === 'failed'
+                      ? t('admin.migration.resumeFromCpBtn')
+                      : t('admin.migration.rerunBtn')}
+                  </span>
                 </button>
               )}
             </div>
@@ -925,8 +892,11 @@ export function MigrationTab() {
             <div className="flex items-center justify-between text-xs text-zinc-400">
               <span>
                 {liveReport?.current_user
-                  ? `正在处理用户：${liveReport.current_user}`
-                  : `用户进度：${liveReport?.processed_users ?? 0} / ${liveReport?.total_users ?? 0}`}
+                  ? t('admin.migration.processingUser', { user: liveReport.current_user })
+                  : t('admin.migration.userProgress', {
+                      processed: liveReport?.processed_users ?? 0,
+                      total: liveReport?.total_users ?? 0,
+                    })}
               </span>
               <span className="font-mono text-amber-300">{progressPct}%</span>
             </div>
@@ -948,23 +918,39 @@ export function MigrationTab() {
           {liveReport && (
             <>
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-                <StatCard label="匹配 / 新建用户" value={`${liveReport.users_matched} / ${liveReport.users_created}`} />
-                <StatCard label="扫描 / 匹配条目" value={`${liveReport.items_scanned} / ${liveReport.items_matched}`} accent="emerald" />
-                <StatCard label="已看 / 收藏" value={`${liveReport.played_migrated} / ${liveReport.favorites_migrated}`} />
-                <StatCard label="播放断点 / 跳过" value={`${liveReport.resume_migrated} / ${liveReport.items_skipped}`} accent="amber" />
+                <StatCard
+                  label={t('admin.migration.statUsersPair')}
+                  value={`${liveReport.users_matched} / ${liveReport.users_created}`}
+                />
+                <StatCard
+                  label={t('admin.migration.statItemsPair')}
+                  value={`${liveReport.items_scanned} / ${liveReport.items_matched}`}
+                  accent="emerald"
+                />
+                <StatCard
+                  label={t('admin.migration.statPlayedFavPair')}
+                  value={`${liveReport.played_migrated} / ${liveReport.favorites_migrated}`}
+                />
+                <StatCard
+                  label={t('admin.migration.statResumeSkipPair')}
+                  value={`${liveReport.resume_migrated} / ${liveReport.items_skipped}`}
+                  accent="amber"
+                />
               </div>
 
               {liveReport.conflicts.length > 0 && (
                 <div className="space-y-2 rounded-xl border border-amber-500/25 bg-amber-500/5 p-4">
                   <p className="text-xs font-semibold text-amber-300">
-                    冲突明细（共 {liveReport.conflicts.length} 条）
+                    {t('admin.migration.conflictDetailsTitle', {
+                      count: liveReport.conflicts.length,
+                    })}
                   </p>
                   <div className="max-h-40 space-y-1.5 overflow-y-auto text-xs text-zinc-300">
                     {liveReport.conflicts.map((c, idx) => (
                       <div key={idx} className="flex items-start gap-2">
                         <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-400" />
                         <span>
-                          [{c.user_name || '系统'}] {c.item_name || c.source_item_id || ''}：{c.reason}
+                          [{c.user_name || t('admin.migration.systemTag')}] {c.item_name || c.source_item_id || ''}：{c.reason}
                         </span>
                       </div>
                     ))}
@@ -974,7 +960,7 @@ export function MigrationTab() {
 
               {liveReport.errors.length > 0 && (
                 <div className="space-y-1.5 rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-xs text-red-300">
-                  <p className="font-semibold">错误信息</p>
+                  <p className="font-semibold">{t('admin.migration.errorTitle')}</p>
                   {liveReport.errors.map((e, idx) => (
                     <p key={idx}>{e}</p>
                   ))}
@@ -991,7 +977,7 @@ export function MigrationTab() {
               className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 px-3.5 py-2 text-sm text-zinc-300 transition-colors hover:bg-white/5 disabled:opacity-50"
             >
               <ArrowLeft className="h-4 w-4" />
-              返回配置
+              <span>{t('admin.migration.backConfigBtn')}</span>
             </button>
           </div>
         </section>

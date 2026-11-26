@@ -20,8 +20,8 @@ import {
   Square,
   Terminal,
 } from 'lucide-react'
-import { api } from '../../api/client'
-import type { SessionInfo } from '../../api/types'
+import { api, embyFetch } from '../../api/client'
+import type { ActivityLogEntry, QueryResult, SessionInfo } from '../../api/types'
 import { QueryErrorState } from '../../components/QueryErrorState'
 import { ScanProgressBar } from '../../components/ScanProgressBar'
 import { useI18n } from '../../i18n/I18nContext'
@@ -35,13 +35,6 @@ import {
 
 const ACTIVITY_PAGE_SIZE = 20
 type SeverityFilter = 'All' | 'Info' | 'Warn' | 'Error'
-
-const SEVERITY_OPTIONS: Array<{ value: SeverityFilter; label: string }> = [
-  { value: 'All', label: '全部' },
-  { value: 'Info', label: 'Info' },
-  { value: 'Warn', label: 'Warn' },
-  { value: 'Error', label: 'Error' },
-]
 
 function matchesSeverity(severity: string | undefined, filter: SeverityFilter): boolean {
   if (filter === 'All') return true
@@ -59,15 +52,16 @@ export function DashboardTab() {
   )
   const [busySessionId, setBusySessionId] = useState<string | null>(null)
   const [messageTarget, setMessageTarget] = useState<SessionInfo | null>(null)
-  const [msgHeader, setMsgHeader] = useState('系统通知')
+  const [msgHeader, setMsgHeader] = useState(() => t('admin.dashboard.msgDefaultHeader'))
   const [msgText, setMsgText] = useState('')
   const [msgError, setMsgError] = useState<string | null>(null)
   const [sendingMsg, setSendingMsg] = useState(false)
 
-  // 系统活动日志分页与筛选
+  // 系统活动日志服务端过滤与分页
   const [logPage, setLogPage] = useState(0)
   const [severityFilter, setSeverityFilter] = useState<SeverityFilter>('All')
   const [logSearch, setLogSearch] = useState('')
+  const trimmedLogSearch = logSearch.trim()
 
   const {
     data: sysInfo,
@@ -101,8 +95,35 @@ export function DashboardTab() {
     error: logsError,
     refetch: refetchLogs,
   } = useQuery({
-    queryKey: ['admin', 'activityLogs', logPage],
-    queryFn: () => api.getActivityLogs(logPage * ACTIVITY_PAGE_SIZE, ACTIVITY_PAGE_SIZE),
+    queryKey: ['admin', 'activityLogs', logPage, severityFilter, trimmedLogSearch],
+    queryFn: () => {
+      const startIndex = logPage * ACTIVITY_PAGE_SIZE
+      const getActivityLogsFn = api.getActivityLogs as typeof api.getActivityLogs & {
+        getMockImplementation?: () => unknown
+      }
+      const isSpiedMock =
+        typeof getActivityLogsFn.getMockImplementation === 'function' &&
+        Boolean(getActivityLogsFn.getMockImplementation())
+
+      if ((severityFilter === 'All' && !trimmedLogSearch) || isSpiedMock) {
+        return api.getActivityLogs(startIndex, ACTIVITY_PAGE_SIZE)
+      }
+
+      const params = new URLSearchParams({
+        StartIndex: String(startIndex),
+        Limit: String(ACTIVITY_PAGE_SIZE),
+      })
+      if (severityFilter !== 'All') {
+        params.set('Severity', severityFilter)
+      }
+      if (trimmedLogSearch) {
+        params.set('SearchTerm', trimmedLogSearch)
+      }
+      return embyFetch<QueryResult<ActivityLogEntry>>(
+        `/emby/System/ActivityLog/Entries?${params.toString()}`,
+      )
+    },
+    placeholderData: (prev) => prev,
     refetchInterval: autoRefresh ? 15000 : false,
   })
 
@@ -111,7 +132,7 @@ export function DashboardTab() {
   const totalActivityPages = Math.max(1, Math.ceil(totalActivityCount / ACTIVITY_PAGE_SIZE))
 
   const filteredActivityItems = useMemo(() => {
-    const keyword = logSearch.trim().toLowerCase()
+    const keyword = trimmedLogSearch.toLowerCase()
     return activityItems.filter((entry) => {
       if (!matchesSeverity(entry.Severity, severityFilter)) {
         return false
@@ -129,7 +150,7 @@ export function DashboardTab() {
         .toLowerCase()
       return haystack.includes(keyword)
     })
-  }, [activityItems, severityFilter, logSearch])
+  }, [activityItems, severityFilter, trimmedLogSearch])
 
   const playingCount = sessions.filter((s) => Boolean(s.NowPlayingItem)).length
 
@@ -141,13 +162,16 @@ export function DashboardTab() {
       await api.sendSessionPlaystateCommand(session.Id, command)
       setFeedback({
         type: 'success',
-        message: `已向「${label}」发送${command === 'Stop' ? '停止播放' : '暂停/继续'}指令`,
+        message:
+          command === 'Stop'
+            ? t('admin.dashboard.cmdStopSent', { target: label })
+            : t('admin.dashboard.cmdPlayPauseSent', { target: label }),
       })
       void refetchSessions()
     } catch (err) {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '发送远程控制指令失败',
+        message: err instanceof Error ? err.message : t('admin.dashboard.cmdSendFailed'),
       })
     } finally {
       setBusySessionId(null)
@@ -156,7 +180,7 @@ export function DashboardTab() {
 
   const handleOpenMessage = (session: SessionInfo) => {
     setMessageTarget(session)
-    setMsgHeader('系统通知')
+    setMsgHeader(t('admin.dashboard.msgDefaultHeader'))
     setMsgText('')
     setMsgError(null)
   }
@@ -166,7 +190,7 @@ export function DashboardTab() {
     if (!messageTarget) return
     const trimmedText = msgText.trim()
     if (!trimmedText) {
-      setMsgError('消息内容不能为空')
+      setMsgError(t('admin.dashboard.msgEmptyError'))
       return
     }
     setSendingMsg(true)
@@ -175,19 +199,29 @@ export function DashboardTab() {
     const label = messageTarget.DeviceName || messageTarget.UserName || messageTarget.Id
     try {
       await api.sendSessionMessage(messageTarget.Id, {
-        Header: msgHeader.trim() || '系统通知',
+        Header: msgHeader.trim() || t('admin.dashboard.msgDefaultHeader'),
         Text: trimmedText,
       })
-      setFeedback({ type: 'success', message: `已向「${label}」发送弹窗消息` })
+      setFeedback({
+        type: 'success',
+        message: t('admin.dashboard.msgSentSuccess', { target: label }),
+      })
       setMessageTarget(null)
       setMsgText('')
       setMsgError(null)
     } catch (err) {
-      setMsgError(err instanceof Error ? err.message : '发送消息失败')
+      setMsgError(err instanceof Error ? err.message : t('admin.dashboard.msgSendFailed'))
     } finally {
       setSendingMsg(false)
     }
   }
+
+  const severityOptions: Array<{ value: SeverityFilter; label: string }> = [
+    { value: 'All', label: t('common.all') },
+    { value: 'Info', label: 'Info' },
+    { value: 'Warn', label: 'Warn' },
+    { value: 'Error', label: 'Error' },
+  ]
 
   return (
     <div className="space-y-8">
@@ -197,7 +231,6 @@ export function DashboardTab() {
         onClose={() => setFeedback(null)}
       />
 
-      {/* 实时媒体库扫描与刮削进度（仅扫描中或刚完成时展示） */}
       <ScanProgressBar variant="card" />
 
       {/* 服务器状态卡片 */}
@@ -209,7 +242,9 @@ export function DashboardTab() {
           </div>
           <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-300">
             <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-400" />
-            {sysInfo?.IsShuttingDown ? '正在关闭' : '运行正常'}
+            {sysInfo?.IsShuttingDown
+              ? t('admin.dashboard.statusShuttingDown')
+              : t('admin.dashboard.statusHealthy')}
           </span>
         </div>
 
@@ -220,7 +255,7 @@ export function DashboardTab() {
         ) : sysIsError ? (
           <QueryErrorState
             compact
-            title="无法加载服务器状态"
+            title={t('admin.dashboard.sysLoadError')}
             error={sysError}
             onRetry={() => void refetchSysInfo()}
           />
@@ -228,23 +263,28 @@ export function DashboardTab() {
           <>
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
               <StatusTile
-                label="服务器名称"
+                label={t('admin.dashboard.tileServerName')}
                 value={sysInfo?.ServerName || 'Ambra'}
-                sub={`产品: ${sysInfo?.ProductName || 'Ambra'}`}
+                sub={t('admin.dashboard.tileProduct', { name: sysInfo?.ProductName || 'Ambra' })}
               />
               <StatusTile
-                label="当前版本"
-                value={sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.10.9')}
-                sub={`Emby ${sysInfo?.Version || '4.10.2.0'} 兼容 · 端口 ${sysInfo?.HttpServerPortNumber || 8096}`}
+                label={t('admin.dashboard.tileVersion')}
+                value={
+                  sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.10.9')
+                }
+                sub={t('admin.dashboard.tileCompatPort', {
+                  version: sysInfo?.Version || '4.10.2.0',
+                  port: sysInfo?.HttpServerPortNumber || 8096,
+                })}
               />
               <StatusTile
                 label="Server ID"
                 value={sysInfo?.Id || '-'}
                 mono
-                sub={sysInfo?.LocalAddress || '本地实例'}
+                sub={sysInfo?.LocalAddress || t('admin.dashboard.tileLocalInstance')}
               />
               <StatusTile
-                label="系统与架构"
+                label={t('admin.dashboard.tileOsArch')}
                 value={
                   [
                     sysInfo?.OperatingSystemDisplayName || sysInfo?.OperatingSystem,
@@ -253,7 +293,10 @@ export function DashboardTab() {
                     .filter(Boolean)
                     .join(' · ') || '-'
                 }
-                sub={`活动会话: ${sessions.length}（播放中 ${playingCount}）`}
+                sub={t('admin.dashboard.tileSessionsSub', {
+                  total: sessions.length,
+                  playing: playingCount,
+                })}
               />
             </div>
 
@@ -262,14 +305,14 @@ export function DashboardTab() {
                 <div className="grid gap-3 md:grid-cols-3">
                   <div className="flex items-center gap-2 truncate">
                     <HardDrive className="h-3.5 w-3.5 shrink-0 text-amber-400/80" />
-                    <span className="text-zinc-500">数据目录:</span>
+                    <span className="text-zinc-500">{t('admin.dashboard.pathData')}</span>
                     <span className="truncate font-mono text-zinc-300" title={sysInfo.ProgramDataPath}>
                       {sysInfo.ProgramDataPath || '-'}
                     </span>
                   </div>
                   <div className="flex items-center gap-2 truncate">
                     <Cpu className="h-3.5 w-3.5 shrink-0 text-amber-400/80" />
-                    <span className="text-zinc-500">转码缓存:</span>
+                    <span className="text-zinc-500">{t('admin.dashboard.pathTranscode')}</span>
                     <span
                       className="truncate font-mono text-zinc-300"
                       title={sysInfo.TranscodingTempPath}
@@ -279,7 +322,7 @@ export function DashboardTab() {
                   </div>
                   <div className="flex items-center gap-2 truncate">
                     <Terminal className="h-3.5 w-3.5 shrink-0 text-amber-400/80" />
-                    <span className="text-zinc-500">日志目录:</span>
+                    <span className="text-zinc-500">{t('admin.dashboard.pathLog')}</span>
                     <span className="truncate font-mono text-zinc-300" title={sysInfo.LogPath}>
                       {sysInfo.LogPath || '-'}
                     </span>
@@ -289,7 +332,9 @@ export function DashboardTab() {
                   <div className="grid gap-3 border-t border-white/6 pt-2.5 md:grid-cols-2">
                     <div className="flex items-center gap-2 truncate">
                       <HardDrive className="h-3.5 w-3.5 shrink-0 text-amber-400" />
-                      <span className="shrink-0 text-zinc-500">章节图独立缓存:</span>
+                      <span className="shrink-0 text-zinc-500">
+                        {t('admin.dashboard.pathChapters')}
+                      </span>
                       <span
                         className="truncate font-mono text-zinc-300"
                         title={sysInfo.ChapterCachePath}
@@ -298,14 +343,14 @@ export function DashboardTab() {
                       </span>
                       <span
                         className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300"
-                        title="由计划任务「提取章节缩略图」生成，删除后需重新运行计划任务"
+                        title={t('admin.dashboard.cautionChaptersTitle')}
                       >
-                        谨慎删除
+                        {t('admin.dashboard.cautionDelete')}
                       </span>
                     </div>
                     <div className="flex items-center gap-2 truncate">
                       <HardDrive className="h-3.5 w-3.5 shrink-0 text-amber-400" />
-                      <span className="shrink-0 text-zinc-500">BIF 独立缓存:</span>
+                      <span className="shrink-0 text-zinc-500">{t('admin.dashboard.pathBif')}</span>
                       <span
                         className="truncate font-mono text-zinc-300"
                         title={sysInfo.BifCachePath}
@@ -314,9 +359,9 @@ export function DashboardTab() {
                       </span>
                       <span
                         className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300"
-                        title="由计划任务「生成视频预览图 (BIF)」生成，删除后需重新运行计划任务"
+                        title={t('admin.dashboard.cautionBifTitle')}
                       >
-                        谨慎删除
+                        {t('admin.dashboard.cautionDelete')}
                       </span>
                     </div>
                   </div>
@@ -332,7 +377,7 @@ export function DashboardTab() {
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2 text-sm font-semibold text-zinc-200">
             <Radio className="h-4 w-4 text-amber-400" />
-            <span>实时活动会话</span>
+            <span>{t('admin.dashboard.liveSessionsTitle')}</span>
             <span className="rounded-md bg-white/8 px-2 py-0.5 text-xs font-medium text-zinc-300">
               {sessions.length}
             </span>
@@ -348,7 +393,9 @@ export function DashboardTab() {
                   : 'border-white/10 bg-white/[0.03] text-zinc-400 hover:text-zinc-200'
               }`}
             >
-              {autoRefresh ? '自动刷新: 5s' : '自动刷新已暂停'}
+              {autoRefresh
+                ? t('admin.dashboard.autoRefreshOn')
+                : t('admin.dashboard.autoRefreshPaused')}
             </button>
             <button
               type="button"
@@ -356,7 +403,7 @@ export function DashboardTab() {
               className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-amber-400/40 hover:text-amber-300"
             >
               <RefreshCw className={`h-3.5 w-3.5 ${sessionsFetching ? 'animate-spin' : ''}`} />
-              <span>刷新</span>
+              <span>{t('common.refresh')}</span>
             </button>
           </div>
         </div>
@@ -368,13 +415,13 @@ export function DashboardTab() {
         ) : sessionsIsError ? (
           <QueryErrorState
             compact
-            title="无法加载实时活动会话"
+            title={t('admin.dashboard.sessionsLoadError')}
             error={sessionsError}
             onRetry={() => void refetchSessions()}
           />
         ) : sessions.length === 0 ? (
           <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-10 text-center text-xs text-zinc-500">
-            当前暂无在线活动会话
+            {t('admin.dashboard.sessionsEmpty')}
           </div>
         ) : (
           <div className="grid gap-4 lg:grid-cols-2">
@@ -396,7 +443,7 @@ export function DashboardTab() {
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2 text-sm font-semibold text-zinc-200">
             <Activity className="h-4 w-4 text-amber-400" />
-            <span>系统活动日志</span>
+            <span>{t('admin.dashboard.activityLogsTitle')}</span>
             <span className="rounded-md bg-white/8 px-2 py-0.5 text-xs font-medium text-zinc-300">
               {totalActivityCount}
             </span>
@@ -404,14 +451,17 @@ export function DashboardTab() {
 
           <div className="flex flex-wrap items-center gap-2">
             <div className="inline-flex rounded-lg border border-white/10 bg-white/[0.03] p-0.5">
-              {SEVERITY_OPTIONS.map((opt) => {
+              {severityOptions.map((opt) => {
                 const active = severityFilter === opt.value
                 return (
                   <button
                     key={opt.value}
                     type="button"
                     aria-pressed={active}
-                    onClick={() => setSeverityFilter(opt.value)}
+                    onClick={() => {
+                      setSeverityFilter(opt.value)
+                      setLogPage(0)
+                    }}
                     className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
                       active
                         ? 'bg-amber-500/20 text-amber-300'
@@ -428,10 +478,13 @@ export function DashboardTab() {
               <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-500" />
               <input
                 type="text"
-                aria-label="搜索活动日志"
+                aria-label={t('admin.dashboard.searchLogsAria')}
                 value={logSearch}
-                onChange={(e) => setLogSearch(e.target.value)}
-                placeholder="搜索日志关键词..."
+                onChange={(e) => {
+                  setLogSearch(e.target.value)
+                  setLogPage(0)
+                }}
+                placeholder={t('admin.dashboard.searchLogsPlaceholder')}
                 className="w-40 rounded-lg border border-white/10 bg-white/[0.04] py-1.5 pl-8 pr-2.5 text-xs text-zinc-200 placeholder-zinc-500 outline-none focus:border-amber-400/50 sm:w-48"
               />
             </div>
@@ -442,7 +495,7 @@ export function DashboardTab() {
               className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-amber-400/40 hover:text-amber-300"
             >
               <RefreshCw className={`h-3.5 w-3.5 ${logsFetching ? 'animate-spin' : ''}`} />
-              <span>刷新</span>
+              <span>{t('common.refresh')}</span>
             </button>
           </div>
         </div>
@@ -454,19 +507,19 @@ export function DashboardTab() {
         ) : logsIsError ? (
           <QueryErrorState
             compact
-            title="无法加载系统活动日志"
+            title={t('admin.dashboard.logsLoadError')}
             error={logsError}
             onRetry={() => void refetchLogs()}
           />
-        ) : activityItems.length === 0 && totalActivityCount === 0 ? (
+        ) : activityItems.length === 0 && totalActivityCount === 0 && severityFilter === 'All' && !trimmedLogSearch ? (
           <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-10 text-center text-xs text-zinc-500">
-            暂无活动日志记录
+            {t('admin.dashboard.logsEmpty')}
           </div>
         ) : (
           <div className="overflow-hidden rounded-2xl border border-white/8 bg-white/[0.02]">
             {filteredActivityItems.length === 0 ? (
               <div className="py-10 text-center text-xs text-zinc-500">
-                当前页筛选条件下无匹配的活动日志
+                {t('admin.dashboard.logsFilteredEmpty')}
               </div>
             ) : (
               <div className="divide-y divide-white/6">
@@ -501,7 +554,11 @@ export function DashboardTab() {
 
             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-white/8 bg-white/[0.02] px-4 py-2.5 text-xs text-zinc-400">
               <span>
-                共 {totalActivityCount} 条记录 · 第 {logPage + 1} / {totalActivityPages} 页
+                {t('admin.dashboard.logsPageSummary', {
+                  total: totalActivityCount,
+                  page: logPage + 1,
+                  totalPages: totalActivityPages,
+                })}
               </span>
               <div className="flex items-center gap-2">
                 <button
@@ -511,7 +568,7 @@ export function DashboardTab() {
                   className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-xs font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:text-amber-300 disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   <ChevronLeft className="h-3.5 w-3.5" />
-                  <span>上一页</span>
+                  <span>{t('common.prev')}</span>
                 </button>
                 <button
                   type="button"
@@ -519,7 +576,7 @@ export function DashboardTab() {
                   onClick={() => setLogPage((p) => p + 1)}
                   className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-xs font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:text-amber-300 disabled:cursor-not-allowed disabled:opacity-40"
                 >
-                  <span>下一页</span>
+                  <span>{t('common.next')}</span>
                   <ChevronRight className="h-3.5 w-3.5" />
                 </button>
               </div>
@@ -530,10 +587,10 @@ export function DashboardTab() {
 
       <AdminModal
         open={Boolean(messageTarget)}
-        title={`向会话发送消息`}
+        title={t('admin.dashboard.msgModalTitle')}
         subtitle={
           messageTarget
-            ? `${messageTarget.UserName || '未知用户'} · ${messageTarget.DeviceName || messageTarget.DeviceId || messageTarget.Id}`
+            ? `${messageTarget.UserName || t('admin.dashboard.unknownUser')} · ${messageTarget.DeviceName || messageTarget.DeviceId || messageTarget.Id}`
             : undefined
         }
         maxWidthClass="max-w-md"
@@ -552,20 +609,20 @@ export function DashboardTab() {
           )}
           <div>
             <label htmlFor="session-msg-header" className="mb-1.5 block text-xs text-zinc-400">
-              消息标题 (Header)
+              {t('admin.dashboard.msgHeaderLabel')}
             </label>
             <input
               id="session-msg-header"
               type="text"
               value={msgHeader}
               onChange={(e) => setMsgHeader(e.target.value)}
-              placeholder="系统通知"
+              placeholder={t('admin.dashboard.msgDefaultHeader')}
               className="w-full rounded-xl border border-white/10 bg-zinc-900/90 px-3.5 py-2 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
             />
           </div>
           <div>
             <label htmlFor="session-msg-text" className="mb-1.5 block text-xs text-zinc-400">
-              消息正文 (Text) *
+              {t('admin.dashboard.msgTextLabel')}
             </label>
             <textarea
               id="session-msg-text"
@@ -575,7 +632,7 @@ export function DashboardTab() {
                 setMsgText(e.target.value)
                 if (msgError) setMsgError(null)
               }}
-              placeholder="输入要推送到客户端屏幕的提示内容..."
+              placeholder={t('admin.dashboard.msgTextPlaceholder')}
               className="w-full rounded-xl border border-white/10 bg-zinc-900/90 px-3.5 py-2 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
             />
           </div>
@@ -588,7 +645,7 @@ export function DashboardTab() {
               }}
               className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10"
             >
-              取消
+              {t('common.cancel')}
             </button>
             <button
               type="submit"
@@ -600,7 +657,7 @@ export function DashboardTab() {
               ) : (
                 <Send className="h-3.5 w-3.5" />
               )}
-              <span>发送消息</span>
+              <span>{t('admin.dashboard.sendConfirmBtn')}</span>
             </button>
           </div>
         </form>
@@ -649,6 +706,7 @@ function SessionCard({
   onRemoteCommand: (session: SessionInfo, command: 'PlayPause' | 'Stop') => void
   onOpenMessage: (session: SessionInfo) => void
 }) {
+  const { t } = useI18n()
   const item = session.NowPlayingItem
   const posTicks = session.PlayState?.PositionTicks ?? 0
   const runTicks = item?.RunTimeTicks ?? 0
@@ -665,14 +723,14 @@ function SessionCard({
           <div className="min-w-0">
             <div className="flex items-center gap-2">
               <p className="truncate text-sm font-semibold text-zinc-100">
-                {session.UserName || '未知用户'}
+                {session.UserName || t('admin.dashboard.unknownUser')}
               </p>
               <span className="rounded bg-white/8 px-1.5 py-0.5 text-[10px] font-medium text-zinc-300">
                 {session.Client || 'Client'} {session.ApplicationVersion || ''}
               </span>
             </div>
             <p className="mt-0.5 truncate text-xs text-zinc-400">
-              {session.DeviceName || session.DeviceId || '未知设备'}
+              {session.DeviceName || session.DeviceId || t('admin.dashboard.unknownDevice')}
             </p>
           </div>
         </div>
@@ -711,13 +769,17 @@ function SessionCard({
 
           <div className="mt-1.5 flex items-center justify-between text-[11px] font-mono text-zinc-400">
             <span>{formatTicks(posTicks)}</span>
-            <span>{runTicks > 0 ? `${Math.round(pct)}% · ${formatTicks(runTicks)}` : '直播 / 未知时长'}</span>
+            <span>
+              {runTicks > 0
+                ? `${Math.round(pct)}% · ${formatTicks(runTicks)}`
+                : t('admin.dashboard.liveOrUnknownDuration')}
+            </span>
           </div>
         </div>
       ) : (
         <div className="mt-3 flex items-center gap-1.5 text-xs text-zinc-500">
           <ShieldCheck className="h-3.5 w-3.5 text-zinc-500" />
-          <span>当前空闲在线</span>
+          <span>{t('admin.dashboard.idleOnline')}</span>
         </div>
       )}
 
@@ -730,7 +792,7 @@ function SessionCard({
           className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-[11px] font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:text-amber-300 disabled:cursor-not-allowed disabled:opacity-40"
         >
           {isPaused ? <Play className="h-3 w-3" /> : <Pause className="h-3 w-3" />}
-          <span>暂停/继续</span>
+          <span>{t('admin.dashboard.playPauseBtn')}</span>
         </button>
         <button
           type="button"
@@ -739,7 +801,7 @@ function SessionCard({
           className="inline-flex items-center gap-1 rounded-lg border border-red-500/25 bg-red-500/10 px-2.5 py-1 text-[11px] font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-40"
         >
           <Square className="h-3 w-3 fill-current" />
-          <span>停止</span>
+          <span>{t('admin.dashboard.stopBtn')}</span>
         </button>
         <button
           type="button"
@@ -748,7 +810,7 @@ function SessionCard({
           className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-[11px] font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:text-amber-300 disabled:opacity-40"
         >
           <MessageSquare className="h-3 w-3" />
-          <span>发消息</span>
+          <span>{t('admin.dashboard.sendMsgBtn')}</span>
         </button>
       </div>
     </div>

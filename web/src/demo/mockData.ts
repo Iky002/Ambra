@@ -13,6 +13,7 @@ import type {
   SessionInfo,
   SystemInfo,
   UserDto,
+  UserItemDataDto,
   VirtualFolderInfo,
 } from '../api/types'
 import {
@@ -138,6 +139,7 @@ export interface DemoState {
   libraries: VirtualFolderInfo[]
   libraryItems: Map<string, string[]> // libraryId -> top-level itemIds
   items: Map<string, BaseItemDto>
+  userDataByUser: Map<string, Map<string, UserItemDataDto>>
   seasonsBySeries: Map<string, BaseItemDto[]>
   episodesBySeason: Map<string, BaseItemDto[]>
   localTrailersByItemId: Map<string, BaseItemDto[]>
@@ -2682,13 +2684,17 @@ export function createInitialDemoState(): DemoState {
 
   const apiKeys: ApiKeyInfo[] = [
     {
+      Id: 'apikey-demo-moviepilot',
       AccessToken: 'ambra_demo_key_moviepilot_9f2a8c4e1d7b',
+      MaskedToken: 'ambra_de••••••••••••••••1d7b',
       AppName: 'MoviePilot',
       DateCreated: isoAgo(2880),
       IsActive: true,
     },
     {
+      Id: 'apikey-demo-sonarr',
       AccessToken: 'ambra_demo_key_sonarr_3b7e5a90c14f',
+      MaskedToken: 'ambra_de••••••••••••••••c14f',
       AppName: 'Sonarr',
       DateCreated: isoAgo(1440),
       IsActive: true,
@@ -2987,12 +2993,39 @@ export function createInitialDemoState(): DemoState {
     ],
   }
 
+  // 初始化按用户完全隔离的观看进度 / 收藏 / 已看状态 (userId -> itemId -> UserItemDataDto)
+  const adminUserData = new Map<string, UserItemDataDto>()
+  for (const it of items.values()) {
+    if (it.UserData) {
+      adminUserData.set(it.Id, { ...it.UserData })
+      delete it.UserData
+    }
+  }
+  const guestUserData = new Map<string, UserItemDataDto>([
+    [
+      'item-inside-out-2',
+      {
+        PlaybackPositionTicks: 24 * MIN_TICKS,
+        PlayCount: 0,
+        IsFavorite: false,
+        Played: false,
+        PlayedPercentage: 25,
+        LastPlayedDate: isoAgo(45),
+      },
+    ],
+  ])
+  const userDataByUser = new Map<string, Map<string, UserItemDataDto>>([
+    ['user-demo-admin', adminUserData],
+    ['user-demo-guest', guestUserData],
+  ])
+
   return {
     systemInfo,
     users,
     libraries,
     libraryItems,
     items,
+    userDataByUser,
     seasonsBySeries,
     episodesBySeason,
     localTrailersByItemId,

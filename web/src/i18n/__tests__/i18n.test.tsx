@@ -82,6 +82,38 @@ describe('i18n locale dictionaries', () => {
       }
     },
   )
+
+  it('has accurate admin navigation keys and zero untranslated Chinese in non-CJK/Korean locales', () => {
+    expect(zhCN['admin.tabMetadata']).toBe('元数据管理')
+    expect(zhCN['admin.tabGovernance']).toBe('健康与备份')
+    expect(enUS['admin.tabMetadata']).toBe('Metadata')
+    expect(enUS['admin.tabGovernance']).toBe('Health & Backup')
+
+    const nonHanLocales: LocaleCode[] = [
+      'en-US',
+      'ko-KR',
+      'es-ES',
+      'de-DE',
+      'fr-FR',
+      'pt-BR',
+      'th-TH',
+    ]
+    const hanRegex = /[\u4e00-\u9fff]/
+    for (const code of nonHanLocales) {
+      const dict = ALL_DICTS[code]
+      for (const [key, val] of Object.entries(dict)) {
+        expect(hanRegex.test(val), `${code}:${key} contains Chinese characters: ${val}`).toBe(false)
+      }
+    }
+
+    const simplifiedOnlyRegex = /[设库户码盘览志规执迁断续删编页]/
+    for (const [key, val] of Object.entries(zhTW)) {
+      expect(
+        simplifiedOnlyRegex.test(val),
+        `zh-TW:${key} contains simplified Chinese residue: ${val}`,
+      ).toBe(false)
+    }
+  })
 })
 
 describe('normalizeLocale', () => {

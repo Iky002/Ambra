@@ -171,30 +171,39 @@ export interface I18nContextValue {
   ) => string
 }
 
-function createFallbackContextValue(): I18nContextValue {
+const FALLBACK_CONTEXT_CACHE: Partial<Record<LocaleCode, I18nContextValue>> = {}
+
+const setFallbackLocale = (next: LocaleCode) => {
+  activeLocale = next
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(LOCALE_STORAGE_KEY, next)
+    }
+  } catch {
+    // Ignore storage write failures in restricted environments
+  }
+  if (typeof document !== 'undefined') {
+    document.documentElement.lang = next
+  }
+}
+
+function getStableFallbackContextValue(): I18nContextValue {
   const locale = getActiveLocale()
-  return {
+  const cached = FALLBACK_CONTEXT_CACHE[locale]
+  if (cached) return cached
+
+  const created: I18nContextValue = {
     locale,
     localeMeta: LOCALE_META_MAP[locale] ?? SUPPORTED_LOCALES[0],
-    setLocale: (next: LocaleCode) => {
-      activeLocale = next
-      try {
-        if (typeof localStorage !== 'undefined') {
-          localStorage.setItem(LOCALE_STORAGE_KEY, next)
-        }
-      } catch {
-        // Ignore storage write failures in restricted environments
-      }
-      if (typeof document !== 'undefined') {
-        document.documentElement.lang = next
-      }
-    },
+    setLocale: setFallbackLocale,
     t: (key: string, vars?: TranslationVars) => translateForLocale(locale, key, vars),
     formatDateTime: (
       value?: string | number | Date | null,
       options?: Intl.DateTimeFormatOptions,
     ) => formatDateTimeForLocale(locale, value, options),
   }
+  FALLBACK_CONTEXT_CACHE[locale] = created
+  return created
 }
 
 const I18nContext = createContext<I18nContextValue | null>(null)
@@ -261,5 +270,5 @@ export function I18nProvider({ initialLocale, children }: I18nProviderProps) {
 export function useI18n(): I18nContextValue {
   const ctx = useContext(I18nContext)
   if (ctx) return ctx
-  return createFallbackContextValue()
+  return getStableFallbackContextValue()
 }

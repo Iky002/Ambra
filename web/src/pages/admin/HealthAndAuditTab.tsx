@@ -22,6 +22,7 @@ import {
 } from 'lucide-react'
 import { api, embyFetch } from '../../api/client'
 import type { BackupFileInfo, BackupInfoResponse } from '../../api/types'
+import { useI18n } from '../../i18n/I18nContext'
 import { AdminModal, FeedbackBanner, formatBytes, formatDateTime } from './adminUtils'
 
 interface MemoryHealth {
@@ -154,44 +155,42 @@ function formatUnixTime(sec?: number): string {
   return formatDateTime(new Date(sec * 1000).toISOString())
 }
 
-function getStatusBadge(status?: string) {
+function getStatusBadge(status: string | undefined, t: (key: string) => string) {
   switch (status) {
     case 'critical':
       return {
-        label: '磁盘告急',
+        label: t('admin.health.badgeCritical'),
         cls: 'bg-red-500/20 text-red-300 ring-1 ring-red-500/40',
       }
     case 'warning':
       return {
-        label: '需要注意',
+        label: t('admin.health.badgeWarning'),
         cls: 'bg-amber-500/20 text-amber-300 ring-1 ring-amber-500/40',
       }
     default:
       return {
-        label: '运行健康',
+        label: t('admin.health.badgeHealthy'),
         cls: 'bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-500/40',
       }
   }
 }
 
 export function HealthAndAuditTab() {
+  const { t } = useI18n()
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
     null,
   )
 
-  // 1. System health state
   const [health, setHealth] = useState<SystemHealthReport | null>(null)
   const [healthLoading, setHealthLoading] = useState(true)
   const [healthRefreshing, setHealthRefreshing] = useState(false)
 
-  // 2. Library audit state
   const [auditReport, setAuditReport] = useState<LibraryAuditReport | null>(null)
   const [auditRunning, setAuditRunning] = useState(false)
   const [auditSubTab, setAuditSubTab] = useState<AuditSubTab>('missingPosters')
   const [selectedOrphans, setSelectedOrphans] = useState<Set<string>>(new Set())
   const [cleaningOrphans, setCleaningOrphans] = useState(false)
 
-  // 3. Scrape review queue state
   const [reviewStatus, setReviewStatus] = useState<ReviewStatusFilter>('pending')
   const [reviews, setReviews] = useState<ScrapeAuditItem[]>([])
   const [reviewsLoading, setReviewsLoading] = useState(true)
@@ -200,7 +199,6 @@ export function HealthAndAuditTab() {
   const reviewReqSeqRef = useRef(0)
   const reviewAbortRef = useRef<AbortController | null>(null)
 
-  // 4. Database backup & restore state
   const [backupInfo, setBackupInfo] = useState<BackupInfoResponse | null>(null)
   const [backupLoading, setBackupLoading] = useState(true)
   const [creatingBackup, setCreatingBackup] = useState(false)
@@ -219,58 +217,64 @@ export function HealthAndAuditTab() {
     } catch (err) {
       setBackupFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '获取数据库备份列表失败',
+        message: err instanceof Error ? err.message : t('admin.health.backupListFailed'),
       })
     } finally {
       setBackupLoading(false)
     }
-  }, [])
+  }, [t])
 
-  const fetchHealth = useCallback(async (isManual = false) => {
-    if (isManual) {
-      setHealthRefreshing(true)
-    } else {
-      setHealthLoading(true)
-    }
-    try {
-      const data = await embyFetch<SystemHealthReport>('/api/admin/health')
-      setHealth(data)
-    } catch (err) {
-      setFeedback({
-        type: 'error',
-        message: err instanceof Error ? err.message : '获取系统健康诊断失败',
-      })
-    } finally {
-      setHealthLoading(false)
-      setHealthRefreshing(false)
-    }
-  }, [])
-
-  const fetchReviews = useCallback(async (status: ReviewStatusFilter) => {
-    reviewAbortRef.current?.abort()
-    const controller = new AbortController()
-    reviewAbortRef.current = controller
-    const seq = ++reviewReqSeqRef.current
-    setReviewsLoading(true)
-    try {
-      const res = await embyFetch<ScrapeReviewListResponse>(
-        `/api/admin/governance/review?status=${encodeURIComponent(status)}`,
-        { signal: controller.signal },
-      )
-      if (seq !== reviewReqSeqRef.current || controller.signal.aborted) return
-      setReviews(res.Items || [])
-    } catch (err) {
-      if (seq !== reviewReqSeqRef.current || controller.signal.aborted) return
-      setFeedback({
-        type: 'error',
-        message: err instanceof Error ? err.message : '加载低置信度审校队列失败',
-      })
-    } finally {
-      if (seq === reviewReqSeqRef.current && !controller.signal.aborted) {
-        setReviewsLoading(false)
+  const fetchHealth = useCallback(
+    async (isManual = false) => {
+      if (isManual) {
+        setHealthRefreshing(true)
+      } else {
+        setHealthLoading(true)
       }
-    }
-  }, [])
+      try {
+        const data = await embyFetch<SystemHealthReport>('/api/admin/health')
+        setHealth(data)
+      } catch (err) {
+        setFeedback({
+          type: 'error',
+          message: err instanceof Error ? err.message : t('admin.health.healthFetchFailed'),
+        })
+      } finally {
+        setHealthLoading(false)
+        setHealthRefreshing(false)
+      }
+    },
+    [t],
+  )
+
+  const fetchReviews = useCallback(
+    async (status: ReviewStatusFilter) => {
+      reviewAbortRef.current?.abort()
+      const controller = new AbortController()
+      reviewAbortRef.current = controller
+      const seq = ++reviewReqSeqRef.current
+      setReviewsLoading(true)
+      try {
+        const res = await embyFetch<ScrapeReviewListResponse>(
+          `/api/admin/governance/review?status=${encodeURIComponent(status)}`,
+          { signal: controller.signal },
+        )
+        if (seq !== reviewReqSeqRef.current || controller.signal.aborted) return
+        setReviews(res.Items || [])
+      } catch (err) {
+        if (seq !== reviewReqSeqRef.current || controller.signal.aborted) return
+        setFeedback({
+          type: 'error',
+          message: err instanceof Error ? err.message : t('admin.health.reviewsFetchFailed'),
+        })
+      } finally {
+        if (seq === reviewReqSeqRef.current && !controller.signal.aborted) {
+          setReviewsLoading(false)
+        }
+      }
+    },
+    [t],
+  )
 
   useEffect(() => {
     void fetchHealth(false)
@@ -291,13 +295,16 @@ export function HealthAndAuditTab() {
       const created = await api.createBackup()
       setBackupFeedback({
         type: 'success',
-        message: `已创建数据库备份「${created.Name}」（${formatBytes(created.Size)}）`,
+        message: t('admin.health.backupCreatedSuccess', {
+          name: created.Name,
+          size: formatBytes(created.Size),
+        }),
       })
       await fetchBackupInfo()
     } catch (err) {
       setBackupFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '创建数据库备份失败',
+        message: err instanceof Error ? err.message : t('admin.health.backupCreateFailed'),
       })
     } finally {
       setCreatingBackup(false)
@@ -313,13 +320,16 @@ export function HealthAndAuditTab() {
       setRestoreTarget(null)
       setBackupFeedback({
         type: 'success',
-        message: `已暂存恢复文件「${res.BackupName}」至 ${res.StagedPath || 'ambra.db.restore'}，将在下次重启服务器后生效`,
+        message: t('admin.health.backupStagedSuccess', {
+          name: res.BackupName,
+          path: res.StagedPath || 'ambra.db.restore',
+        }),
       })
       await fetchBackupInfo()
     } catch (err) {
       setBackupFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '恢复数据库备份失败',
+        message: err instanceof Error ? err.message : t('admin.health.backupRestoreFailed'),
       })
     } finally {
       setRestoringBackup(false)
@@ -335,12 +345,17 @@ export function HealthAndAuditTab() {
       setSelectedOrphans(new Set())
       setFeedback({
         type: 'success',
-        message: `体检完成：共检查 ${report.TotalChecked} 个条目，缺海报 ${report.MissingPosters.length}，缺 TMDB ${report.MissingTmdb.length}，孤立记录 ${report.OrphanItems.length}`,
+        message: t('admin.health.auditDoneSuccess', {
+          checked: report.TotalChecked,
+          posters: report.MissingPosters.length,
+          tmdb: report.MissingTmdb.length,
+          orphans: report.OrphanItems.length,
+        }),
       })
     } catch (err) {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '执行媒体库体检失败',
+        message: err instanceof Error ? err.message : t('admin.health.auditFailed'),
       })
     } finally {
       setAuditRunning(false)
@@ -385,7 +400,7 @@ export function HealthAndAuditTab() {
       })
       setFeedback({
         type: 'success',
-        message: `已清理 ${res.Deleted} 条磁盘孤立记录`,
+        message: t('admin.health.orphansCleanedSuccess', { count: res.Deleted }),
       })
       setSelectedOrphans(new Set())
       const refreshed = await embyFetch<LibraryAuditReport>('/api/admin/governance/audit')
@@ -394,7 +409,7 @@ export function HealthAndAuditTab() {
     } catch (err) {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '清理孤立记录失败',
+        message: err instanceof Error ? err.message : t('admin.health.orphansCleanFailed'),
       })
     } finally {
       setCleaningOrphans(false)
@@ -423,14 +438,18 @@ export function HealthAndAuditTab() {
       )
       setFeedback({
         type: 'success',
-        message: `已将「${candidate.Title}」应用至「${audit.ItemName}」并锁定 ${lockFields.length} 个字段`,
+        message: t('admin.health.reviewApprovedSuccess', {
+          title: candidate.Title,
+          item: audit.ItemName,
+          count: lockFields.length,
+        }),
       })
       await fetchReviews(reviewStatus)
       void fetchHealth(true)
     } catch (err) {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '应用候选元数据失败',
+        message: err instanceof Error ? err.message : t('admin.health.reviewApproveFailed'),
       })
     } finally {
       setActingReviewId(null)
@@ -447,14 +466,14 @@ export function HealthAndAuditTab() {
       )
       setFeedback({
         type: 'success',
-        message: `已忽略审校项「${audit.ItemName}」`,
+        message: t('admin.health.reviewDismissedSuccess', { item: audit.ItemName }),
       })
       await fetchReviews(reviewStatus)
       void fetchHealth(true)
     } catch (err) {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '忽略审校项失败',
+        message: err instanceof Error ? err.message : t('admin.health.reviewDismissFailed'),
       })
     } finally {
       setActingReviewId(null)
@@ -473,7 +492,7 @@ export function HealthAndAuditTab() {
     }
   }, [auditReport, auditSubTab])
 
-  const statusBadge = getStatusBadge(health?.Status)
+  const statusBadge = getStatusBadge(health?.Status, t)
   const diskPct = Math.min(100, Math.max(0, health?.Disk.UsedPercent ?? 0))
   const budgetPct = Math.min(100, Math.max(0, health?.Scheduler.BudgetUsagePct ?? 0))
 
@@ -485,27 +504,28 @@ export function HealthAndAuditTab() {
         onClose={() => setFeedback(null)}
       />
 
-      {/* 区块 1：系统健康诊断卡片 */}
+      {/* Section 1: System Health Diagnostics */}
       <section className="space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="flex items-center gap-2 text-base font-semibold text-zinc-100">
               <Activity className="h-4 w-4 text-amber-400" />
-              <span>系统健康诊断</span>
+              <span>{t('admin.health.sysHealthTitle')}</span>
               {health && (
-                <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${statusBadge.cls}`}>
+                <span
+                  className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${statusBadge.cls}`}
+                >
                   {statusBadge.label}
                 </span>
               )}
             </h2>
-            <p className="mt-1 text-xs text-zinc-400">
-              实时监控 Go 运行时内存与协程、SQLite 数据库及 WAL 体积、缓存目录占用与数据盘剩余空间
-            </p>
+            <p className="mt-1 text-xs text-zinc-400">{t('admin.health.sysHealthDesc')}</p>
           </div>
           <div className="flex items-center gap-2">
             {health && (
               <span className="hidden font-mono text-[11px] text-zinc-500 sm:inline">
-                {health.GoVersion} · {health.NumCpu} vCPU · 更新于 {formatUnixTime(health.CollectedAt)}
+                {health.GoVersion} · {health.NumCpu} vCPU ·{' '}
+                {t('admin.health.updatedAtPrefix', { time: formatUnixTime(health.CollectedAt) })}
               </span>
             )}
             <button
@@ -515,7 +535,7 @@ export function HealthAndAuditTab() {
               className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-amber-400/40 hover:text-amber-300 disabled:opacity-50"
             >
               <RefreshCw className={`h-3.5 w-3.5 ${healthRefreshing ? 'animate-spin' : ''}`} />
-              <span>刷新指标</span>
+              <span>{t('admin.health.refreshMetricsBtn')}</span>
             </button>
           </div>
         </div>
@@ -526,17 +546,16 @@ export function HealthAndAuditTab() {
           </div>
         ) : !health ? (
           <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-10 text-center text-xs text-zinc-500">
-            暂未获取到健康诊断数据
+            {t('admin.health.noHealthData')}
           </div>
         ) : (
           <div className="space-y-4">
             <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-              {/* 内存与 Goroutine */}
               <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-4">
                 <div className="flex items-center justify-between text-xs text-zinc-400">
                   <span className="flex items-center gap-1.5 font-medium">
                     <Cpu className="h-3.5 w-3.5 text-amber-400" />
-                    运行时内存 / 协程
+                    {t('admin.health.memGoroutineTitle')}
                   </span>
                   <span className="font-mono text-[11px] text-zinc-500">
                     GC #{health.Memory.NumGC}
@@ -556,12 +575,11 @@ export function HealthAndAuditTab() {
                 </p>
               </div>
 
-              {/* SQLite DB + WAL */}
               <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-4">
                 <div className="flex items-center justify-between text-xs text-zinc-400">
                   <span className="flex items-center gap-1.5 font-medium">
                     <Database className="h-3.5 w-3.5 text-amber-400" />
-                    SQLite 数据库体积
+                    {t('admin.health.sqliteVolumeTitle')}
                   </span>
                   <span className="font-mono text-[11px] text-zinc-500">WAL Mode</span>
                 </div>
@@ -575,47 +593,54 @@ export function HealthAndAuditTab() {
                 </p>
               </div>
 
-              {/* 缓存目录占用 */}
               <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-4">
                 <div className="flex items-center justify-between text-xs text-zinc-400">
                   <span className="flex items-center gap-1.5 font-medium">
                     <HardDrive className="h-3.5 w-3.5 text-amber-400" />
-                    缓存目录占用
+                    {t('admin.health.cacheDirTitle')}
                   </span>
-                  <span className="font-mono text-[11px] text-zinc-500">5 项缓存</span>
+                  <span className="font-mono text-[11px] text-zinc-500">
+                    {t('admin.health.cache5Items')}
+                  </span>
                 </div>
                 <p className="mt-2.5 text-xl font-semibold text-zinc-100">
                   {formatBytes(health.Cache.TotalBytes)}
                 </p>
                 <p className="mt-2 text-[11px] text-zinc-500">
-                  图片 {formatBytes(health.Cache.ImagesBytes)} · 章节图{' '}
-                  {formatBytes(health.Cache.ChaptersBytes ?? 0)} · BIF{' '}
-                  {formatBytes(health.Cache.BifBytes ?? 0)} · 字幕{' '}
-                  {formatBytes(health.Cache.SubtitlesBytes)} · 转码{' '}
-                  {formatBytes(health.Cache.TranscodeBytes)}
+                  {t('admin.health.cacheBreakdown', {
+                    images: formatBytes(health.Cache.ImagesBytes),
+                    chapters: formatBytes(health.Cache.ChaptersBytes ?? 0),
+                    bif: formatBytes(health.Cache.BifBytes ?? 0),
+                    subs: formatBytes(health.Cache.SubtitlesBytes),
+                    transcode: formatBytes(health.Cache.TranscodeBytes),
+                  })}
                 </p>
                 <p className="mt-1.5 text-[10px] leading-relaxed text-amber-400/80">
-                  章节图 (cache/chapters) 与 BIF (cache/bif) 为独立持久缓存，请谨慎删除，删除后需重新运行对应计划任务恢复
+                  {t('admin.health.cacheCautionNote')}
                 </p>
               </div>
 
-              {/* 媒体条目 & 任务预算 */}
               <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-4">
                 <div className="flex items-center justify-between text-xs text-zinc-400">
                   <span className="flex items-center gap-1.5 font-medium">
                     <Sparkles className="h-3.5 w-3.5 text-amber-400" />
-                    媒体规模 / 后台预算
+                    {t('admin.health.scaleBudgetTitle')}
                   </span>
                   <span className="font-mono text-[11px] text-zinc-500">
-                    {health.Scheduler.ActiveTasks}/{health.Scheduler.TotalTasks} 任务活跃
+                    {t('admin.health.tasksActiveCount', {
+                      active: health.Scheduler.ActiveTasks,
+                      total: health.Scheduler.TotalTasks,
+                    })}
                   </span>
                 </div>
                 <div className="mt-2.5 flex items-baseline justify-between">
                   <p className="text-xl font-semibold text-zinc-100">
-                    {health.Library.TotalItems.toLocaleString()} 条目
+                    {t('admin.health.itemsCount', {
+                      count: health.Library.TotalItems.toLocaleString(),
+                    })}
                   </p>
                   <span className="font-mono text-[11px] text-zinc-400">
-                    {health.Library.UserCount} 用户
+                    {t('admin.health.usersCount', { count: health.Library.UserCount })}
                   </span>
                 </div>
                 <div className="mt-2 flex items-center gap-2">
@@ -626,26 +651,31 @@ export function HealthAndAuditTab() {
                     />
                   </div>
                   <span className="font-mono text-[10px] text-zinc-400">
-                    预算 {health.Scheduler.BudgetInUse}/{health.Scheduler.BudgetCapacity} (
-                    {budgetPct.toFixed(0)}%)
+                    {t('admin.health.budgetUsage', {
+                      inUse: health.Scheduler.BudgetInUse,
+                      capacity: health.Scheduler.BudgetCapacity,
+                      pct: budgetPct.toFixed(0),
+                    })}
                   </span>
                 </div>
               </div>
             </div>
 
-            {/* 数据盘剩余空间进度条 */}
             <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-4">
               <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
                 <div className="flex items-center gap-2 text-zinc-200">
                   <HardDrive className="h-4 w-4 text-amber-400" />
-                  <span className="font-medium">数据盘空间</span>
+                  <span className="font-medium">{t('admin.health.diskSpaceTitle')}</span>
                   <span className="font-mono text-[11px] text-zinc-500">
                     {health.Disk.Path || '-'}
                   </span>
                 </div>
                 <div className="font-mono text-xs text-zinc-300">
-                  可用 {formatBytes(health.Disk.AvailableBytes)} / 总计{' '}
-                  {formatBytes(health.Disk.TotalBytes)} ({diskPct.toFixed(1)}% 已用)
+                  {t('admin.health.diskUsageSummary', {
+                    avail: formatBytes(health.Disk.AvailableBytes),
+                    total: formatBytes(health.Disk.TotalBytes),
+                    pct: diskPct.toFixed(1),
+                  })}
                 </div>
               </div>
               <div className="mt-2.5 h-2.5 w-full overflow-hidden rounded-full bg-white/10">
@@ -665,22 +695,20 @@ export function HealthAndAuditTab() {
         )}
       </section>
 
-      {/* 区块 2：媒体库体检中心 */}
+      {/* Section 2: Library Integrity Audit Center */}
       <section className="space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="flex items-center gap-2 text-base font-semibold text-zinc-100">
               <SearchCheck className="h-4 w-4 text-amber-400" />
-              <span>媒体库体检中心</span>
+              <span>{t('admin.health.auditCenterTitle')}</span>
             </h2>
-            <p className="mt-1 text-xs text-zinc-400">
-              一键扫描缺失海报、未关联 TMDB 编号及磁盘物理路径已失效的孤立媒体记录
-            </p>
+            <p className="mt-1 text-xs text-zinc-400">{t('admin.health.auditCenterDesc')}</p>
           </div>
           <div className="flex items-center gap-2">
             {auditReport && (
               <span className="font-mono text-[11px] text-zinc-500">
-                上次体检：{formatUnixTime(auditReport.ScannedAt)}
+                {t('admin.health.lastAuditPrefix', { time: formatUnixTime(auditReport.ScannedAt) })}
               </span>
             )}
             <button
@@ -694,13 +722,14 @@ export function HealthAndAuditTab() {
               ) : (
                 <SearchCheck className="h-3.5 w-3.5" />
               )}
-              <span>{auditRunning ? '体检扫描中...' : '一键全面体检'}</span>
+              <span>
+                {auditRunning ? t('admin.health.auditingBtn') : t('admin.health.runAuditBtn')}
+              </span>
             </button>
           </div>
         </div>
 
         <div className="overflow-hidden rounded-2xl border border-white/8 bg-white/[0.02]">
-          {/* 分 Tab 导航 */}
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/8 px-4 py-3">
             <div className="flex flex-wrap items-center gap-2">
               <button
@@ -713,7 +742,7 @@ export function HealthAndAuditTab() {
                 }`}
               >
                 <ImageOff className="h-3.5 w-3.5" />
-                <span>缺失海报</span>
+                <span>{t('admin.health.missingPostersTab')}</span>
                 <span className="rounded bg-black/30 px-1.5 py-0.5 font-mono text-[10px]">
                   {auditReport?.MissingPosters.length ?? 0}
                 </span>
@@ -729,7 +758,7 @@ export function HealthAndAuditTab() {
                 }`}
               >
                 <FileWarning className="h-3.5 w-3.5" />
-                <span>未刮削 TMDB</span>
+                <span>{t('admin.health.missingTmdbTab')}</span>
                 <span className="rounded bg-black/30 px-1.5 py-0.5 font-mono text-[10px]">
                   {auditReport?.MissingTmdb.length ?? 0}
                 </span>
@@ -745,7 +774,7 @@ export function HealthAndAuditTab() {
                 }`}
               >
                 <AlertTriangle className="h-3.5 w-3.5" />
-                <span>磁盘孤立记录</span>
+                <span>{t('admin.health.orphanItemsTab')}</span>
                 <span className="rounded bg-black/30 px-1.5 py-0.5 font-mono text-[10px]">
                   {auditReport?.OrphanItems.length ?? 0}
                 </span>
@@ -759,7 +788,9 @@ export function HealthAndAuditTab() {
                   onClick={handleToggleSelectAllOrphans}
                   className="rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-xs text-zinc-300 hover:text-zinc-100"
                 >
-                  {allOrphansSelected ? '取消全选' : '全选孤立项'}
+                  {allOrphansSelected
+                    ? t('admin.health.deselectAllOrphans')
+                    : t('admin.health.selectAllOrphans')}
                 </button>
                 <button
                   type="button"
@@ -772,7 +803,9 @@ export function HealthAndAuditTab() {
                   ) : (
                     <Trash2 className="h-3.5 w-3.5" />
                   )}
-                  <span>一键清理选中 ({selectedOrphans.size})</span>
+                  <span>
+                    {t('admin.health.cleanupSelectedBtn', { count: selectedOrphans.size })}
+                  </span>
                 </button>
               </div>
             )}
@@ -780,12 +813,12 @@ export function HealthAndAuditTab() {
 
           {!auditReport ? (
             <div className="py-12 text-center text-xs text-zinc-500">
-              点击右上角「一键全面体检」开始扫描媒体库异常项
+              {t('admin.health.auditIdlePrompt')}
             </div>
           ) : activeAuditItems.length === 0 ? (
             <div className="flex flex-col items-center justify-center gap-2 py-12 text-xs text-emerald-400">
               <CheckCircle2 className="h-5 w-5" />
-              <span>该维度未发现任何异常条目，媒体库状态良好</span>
+              <span>{t('admin.health.auditCleanState')}</span>
             </div>
           ) : (
             <div className="max-h-[340px] divide-y divide-white/6 overflow-y-auto">
@@ -817,7 +850,7 @@ export function HealthAndAuditTab() {
                           )}
                         </div>
                         <p className="mt-0.5 truncate font-mono text-[11px] text-zinc-500">
-                          {item.Path || '(无本地路径)'}
+                          {item.Path || t('admin.health.noLocalPath')}
                         </p>
                       </div>
                     </div>
@@ -832,17 +865,15 @@ export function HealthAndAuditTab() {
         </div>
       </section>
 
-      {/* 区块 3：低置信度刮削审校队列 */}
+      {/* Section 3: Low-Confidence Scrape Review Queue */}
       <section className="space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="flex items-center gap-2 text-base font-semibold text-zinc-100">
               <ShieldAlert className="h-4 w-4 text-amber-400" />
-              <span>低置信度刮削审校队列</span>
+              <span>{t('admin.health.reviewQueueTitle')}</span>
             </h2>
-            <p className="mt-1 text-xs text-zinc-400">
-              人工核对模糊匹配的刮削结果，一键应用正确候选元数据并锁定字段防止重扫覆盖
-            </p>
+            <p className="mt-1 text-xs text-zinc-400">{t('admin.health.reviewQueueDesc')}</p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
@@ -851,10 +882,10 @@ export function HealthAndAuditTab() {
               onChange={(e) => setReviewStatus(e.target.value as ReviewStatusFilter)}
               className="rounded-lg border border-white/10 bg-[#12121a] px-2.5 py-1.5 text-xs text-zinc-200 outline-none focus:border-amber-400/50"
             >
-              <option value="pending">待审校</option>
-              <option value="approved">已通过</option>
-              <option value="dismissed">已忽略</option>
-              <option value="all">全部状态</option>
+              <option value="pending">{t('admin.health.statusPending')}</option>
+              <option value="approved">{t('admin.health.statusApproved')}</option>
+              <option value="dismissed">{t('admin.health.statusDismissed')}</option>
+              <option value="all">{t('admin.health.statusAll')}</option>
             </select>
             <button
               type="button"
@@ -862,16 +893,15 @@ export function HealthAndAuditTab() {
               className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-amber-400/40 hover:text-amber-300"
             >
               <RefreshCw className={`h-3.5 w-3.5 ${reviewsLoading ? 'animate-spin' : ''}`} />
-              <span>刷新</span>
+              <span>{t('common.refresh')}</span>
             </button>
           </div>
         </div>
 
-        {/* 应用时默认锁定字段选择 */}
         <div className="flex flex-wrap items-center gap-2 rounded-xl border border-white/8 bg-white/[0.02] px-4 py-2.5 text-xs">
           <span className="flex items-center gap-1.5 text-zinc-400">
             <Lock className="h-3.5 w-3.5 text-amber-400" />
-            <span>应用候选时自动锁定字段：</span>
+            <span>{t('admin.health.autoLockFieldsLabel')}</span>
           </span>
           {DEFAULT_LOCK_FIELDS.map((field) => {
             const active = lockFields.includes(field)
@@ -898,7 +928,7 @@ export function HealthAndAuditTab() {
           </div>
         ) : reviews.length === 0 ? (
           <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-12 text-center text-xs text-zinc-500">
-            当前筛选条件下暂无刮削审校条目
+            {t('admin.health.reviewsEmpty')}
           </div>
         ) : (
           <div className="space-y-3">
@@ -918,7 +948,9 @@ export function HealthAndAuditTab() {
                           {audit.ItemType}
                         </span>
                         <span className="rounded-full bg-amber-500/15 px-2 py-0.5 font-mono text-[10px] text-amber-300">
-                          置信度 {(audit.Confidence * 100).toFixed(0)}%
+                          {t('admin.health.confidenceBadge', {
+                            pct: (audit.Confidence * 100).toFixed(0),
+                          })}
                         </span>
                         <span
                           className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
@@ -945,14 +977,13 @@ export function HealthAndAuditTab() {
                         className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-xs text-zinc-400 transition-colors hover:border-red-400/40 hover:text-red-300 disabled:opacity-50"
                       >
                         <XCircle className="h-3.5 w-3.5" />
-                        <span>忽略</span>
+                        <span>{t('admin.health.ignoreBtn')}</span>
                       </button>
                     )}
                   </div>
 
-                  {/* 候选对比列表 */}
                   {audit.Candidates.length === 0 ? (
-                    <p className="mt-3 text-xs text-zinc-500">暂无自动候选匹配项</p>
+                    <p className="mt-3 text-xs text-zinc-500">{t('admin.health.noCandidates')}</p>
                   ) : (
                     <div className="mt-3 grid gap-2.5 md:grid-cols-2">
                       {audit.Candidates.map((cand, idx) => (
@@ -987,7 +1018,9 @@ export function HealthAndAuditTab() {
                           <div className="mt-3 flex items-center justify-between border-t border-white/6 pt-2">
                             <span className="font-mono text-[10px] text-zinc-500">
                               {cand.ProviderName || 'Tmdb'}: {cand.ProviderId || '-'}
-                              {typeof cand.Rating === 'number' ? ` · ★ ${cand.Rating.toFixed(1)}` : ''}
+                              {typeof cand.Rating === 'number'
+                                ? ` · ★ ${cand.Rating.toFixed(1)}`
+                                : ''}
                             </span>
                             {isPending && (
                               <button
@@ -1001,7 +1034,7 @@ export function HealthAndAuditTab() {
                                 ) : (
                                   <Check className="h-3 w-3" />
                                 )}
-                                <span>应用并锁定</span>
+                                <span>{t('admin.health.applyAndLockBtn')}</span>
                               </button>
                             )}
                           </div>
@@ -1015,17 +1048,16 @@ export function HealthAndAuditTab() {
           </div>
         )}
       </section>
-      {/* 区块 4：数据库备份与恢复 */}
+
+      {/* Section 4: Database Backup & Restore */}
       <section data-testid="backup-restore-section" className="space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="flex items-center gap-2 text-base font-semibold text-zinc-100">
               <Archive className="h-4 w-4 text-amber-400" />
-              <span>数据库备份与恢复</span>
+              <span>{t('admin.health.backupSectionTitle')}</span>
             </h2>
-            <p className="mt-1 text-xs text-zinc-400">
-              在线创建 SQLite 数据库热备份快照，或从历史备份文件暂存恢复（重启后生效）
-            </p>
+            <p className="mt-1 text-xs text-zinc-400">{t('admin.health.backupSectionDesc')}</p>
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -1035,7 +1067,7 @@ export function HealthAndAuditTab() {
               className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-amber-400/40 hover:text-amber-300 disabled:opacity-50"
             >
               <RefreshCw className={`h-3.5 w-3.5 ${backupLoading ? 'animate-spin' : ''}`} />
-              <span>刷新</span>
+              <span>{t('common.refresh')}</span>
             </button>
             <button
               type="button"
@@ -1048,7 +1080,11 @@ export function HealthAndAuditTab() {
               ) : (
                 <Database className="h-3.5 w-3.5" />
               )}
-              <span>{creatingBackup ? '创建备份中...' : '立即创建备份'}</span>
+              <span>
+                {creatingBackup
+                  ? t('admin.health.creatingBackupBtn')
+                  : t('admin.health.createBackupBtn')}
+              </span>
             </button>
           </div>
         </div>
@@ -1069,13 +1105,11 @@ export function HealthAndAuditTab() {
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/8 px-4 py-3 text-xs">
             <div className="flex items-center gap-2 text-zinc-400">
               <HardDrive className="h-3.5 w-3.5 text-amber-400" />
-              <span>备份目录：</span>
-              <span className="font-mono text-zinc-200">
-                {backupInfo?.BackupDirectory || '-'}
-              </span>
+              <span>{t('admin.health.backupDirLabel')}</span>
+              <span className="font-mono text-zinc-200">{backupInfo?.BackupDirectory || '-'}</span>
             </div>
             <span className="font-mono text-[11px] text-zinc-500">
-              共 {backupInfo?.Backups?.length ?? 0} 个备份文件
+              {t('admin.health.backupCountLabel', { count: backupInfo?.Backups?.length ?? 0 })}
             </span>
           </div>
 
@@ -1085,7 +1119,7 @@ export function HealthAndAuditTab() {
             </div>
           ) : !backupInfo?.Backups || backupInfo.Backups.length === 0 ? (
             <div className="py-10 text-center text-xs text-zinc-500">
-              暂无数据库备份文件，点击右上角「立即创建备份」生成首个快照
+              {t('admin.health.backupsEmpty')}
             </div>
           ) : (
             <div className="divide-y divide-white/6">
@@ -1099,7 +1133,10 @@ export function HealthAndAuditTab() {
                       {backup.Name}
                     </p>
                     <p className="mt-0.5 text-[11px] text-zinc-400">
-                      大小 {formatBytes(backup.Size)} · 创建于 {formatDateTime(backup.DateCreated)}
+                      {t('admin.health.backupSizeCreated', {
+                        size: formatBytes(backup.Size),
+                        time: formatDateTime(backup.DateCreated),
+                      })}
                     </p>
                   </div>
                   <button
@@ -1108,7 +1145,7 @@ export function HealthAndAuditTab() {
                     className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
                   >
                     <RotateCcw className="h-3.5 w-3.5" />
-                    <span>恢复此备份</span>
+                    <span>{t('admin.health.restoreThisBtn')}</span>
                   </button>
                 </div>
               ))}
@@ -1119,8 +1156,12 @@ export function HealthAndAuditTab() {
 
       <AdminModal
         open={Boolean(restoreTarget)}
-        title="确认恢复数据库备份"
-        subtitle={restoreTarget ? `目标快照：${restoreTarget.Name}` : undefined}
+        title={t('admin.health.restoreModalTitle')}
+        subtitle={
+          restoreTarget
+            ? t('admin.health.restoreModalSubtitle', { name: restoreTarget.Name })
+            : undefined
+        }
         maxWidthClass="max-w-md"
         onClose={() => {
           if (!restoringBackup) setRestoreTarget(null)
@@ -1130,11 +1171,8 @@ export function HealthAndAuditTab() {
           <div className="flex items-start gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3.5 text-xs leading-relaxed text-amber-200">
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
             <div>
-              <p className="font-semibold text-amber-100">即将暂存数据库恢复文件</p>
-              <p className="mt-1 text-amber-200/85">
-                此操作会将所选备份暂存为 <code className="font-mono text-amber-100">ambra.db.restore</code>
-                ，并在<strong>下次重启服务器</strong>时自动覆盖当前数据库。请确认已了解风险后再继续。
-              </p>
+              <p className="font-semibold text-amber-100">{t('admin.health.restoreWarnTitle')}</p>
+              <p className="mt-1 text-amber-200/85">{t('admin.health.restoreWarnDesc')}</p>
             </div>
           </div>
 
@@ -1142,8 +1180,10 @@ export function HealthAndAuditTab() {
             <div className="rounded-xl border border-white/8 bg-white/[0.03] px-3.5 py-2.5 text-xs text-zinc-400">
               <p className="font-mono text-zinc-200">{restoreTarget.Name}</p>
               <p className="mt-1">
-                大小：{formatBytes(restoreTarget.Size)} · 创建时间：
-                {formatDateTime(restoreTarget.DateCreated)}
+                {t('admin.health.backupSizeCreated', {
+                  size: formatBytes(restoreTarget.Size),
+                  time: formatDateTime(restoreTarget.DateCreated),
+                })}
               </p>
             </div>
           )}
@@ -1155,7 +1195,7 @@ export function HealthAndAuditTab() {
               onClick={() => setRestoreTarget(null)}
               className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10 disabled:opacity-50"
             >
-              取消
+              {t('common.cancel')}
             </button>
             <button
               type="button"
@@ -1168,7 +1208,7 @@ export function HealthAndAuditTab() {
               ) : (
                 <RotateCcw className="h-3.5 w-3.5" />
               )}
-              <span>确认恢复</span>
+              <span>{t('admin.health.confirmRestoreBtn')}</span>
             </button>
           </div>
         </div>
