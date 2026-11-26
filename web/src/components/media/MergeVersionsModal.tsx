@@ -48,7 +48,21 @@ export function MergeVersionsModal({
     placeholderData: (prev) => prev,
   })
 
-  const candidates = (candidatesData?.Items || []).filter((c) => c.Id !== item?.Id)
+  const candidates = (candidatesData?.Items || [])
+    .filter((c) => c.Id !== item?.Id)
+    .sort((a, b) => {
+      if (item?.Type === 'Episode') {
+        const aSameSeries = Boolean(item.SeriesId && a.SeriesId === item.SeriesId)
+        const bSameSeries = Boolean(item.SeriesId && b.SeriesId === item.SeriesId)
+        if (aSameSeries !== bSameSeries) return aSameSeries ? -1 : 1
+        const aSameEp =
+          a.ParentIndexNumber === item.ParentIndexNumber && a.IndexNumber === item.IndexNumber
+        const bSameEp =
+          b.ParentIndexNumber === item.ParentIndexNumber && b.IndexNumber === item.IndexNumber
+        if (aSameEp !== bSameEp) return aSameEp ? -1 : 1
+      }
+      return 0
+    })
 
   const toggleCandidate = (candidateId: string) => {
     setSelectedIds((prev) =>
@@ -64,13 +78,15 @@ export function MergeVersionsModal({
     onSuccess: async () => {
       if (!item) return
       const count = selectedIds.length + 1
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['item'] }),
-        queryClient.invalidateQueries({ queryKey: ['libraryItems'] }),
-        queryClient.invalidateQueries({ queryKey: ['latestItems'] }),
-        queryClient.invalidateQueries({ queryKey: ['items'] }),
-        queryClient.invalidateQueries({ queryKey: ['admin-metadata-items'] }),
-      ])
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: ['item'] }),
+          queryClient.invalidateQueries({ queryKey: ['episodes'] }),
+          queryClient.invalidateQueries({ queryKey: ['seasons'] }),
+          queryClient.invalidateQueries({ queryKey: ['libraryItems'] }),
+          queryClient.invalidateQueries({ queryKey: ['latestItems'] }),
+          queryClient.invalidateQueries({ queryKey: ['items'] }),
+          queryClient.invalidateQueries({ queryKey: ['admin-metadata-items'] }),
+        ])
       onMerged?.(`已将 ${count} 个版本合并到「${item.Name}」`)
       onClose()
     },
@@ -173,6 +189,17 @@ export function MergeVersionsModal({
 
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-2">
+                      {cand.Type === 'Episode' &&
+                        (cand.ParentIndexNumber != null || cand.IndexNumber != null) && (
+                          <span className="rounded bg-white/10 px-1.5 py-0.5 font-mono text-[10px] text-amber-300">
+                            {cand.ParentIndexNumber != null
+                              ? `S${String(cand.ParentIndexNumber).padStart(2, '0')}`
+                              : ''}
+                            {cand.IndexNumber != null
+                              ? `E${String(cand.IndexNumber).padStart(2, '0')}`
+                              : ''}
+                          </span>
+                        )}
                       <p className="truncate text-sm font-medium text-zinc-100">{cand.Name}</p>
                       {cand.ProductionYear && (
                         <span className="text-xs text-zinc-500">{cand.ProductionYear}</span>
@@ -184,6 +211,9 @@ export function MergeVersionsModal({
                         </span>
                       )}
                     </div>
+                    {cand.SeriesName && (
+                      <p className="mt-0.5 truncate text-xs text-amber-400/80">{cand.SeriesName}</p>
+                    )}
                     {cand.OriginalTitle && cand.OriginalTitle !== cand.Name && (
                       <p className="mt-0.5 truncate text-xs text-zinc-500">{cand.OriginalTitle}</p>
                     )}

@@ -170,12 +170,20 @@ export function CollectionsPage() {
   })
 
   const removeMemberMutation = useMutation({
-    mutationFn: async (itemId: string) => {
+    mutationFn: async (member: BaseItemDto) => {
       if (!selectedId) return
       if (isSelectedPlaylist) {
-        await api.removePlaylistItems(selectedId, [itemId])
+        if (member.PlaylistItemId) {
+          await api.removePlaylistItems(selectedId, [member.PlaylistItemId], {
+            isPlaylistItemId: true,
+          })
+        } else {
+          await api.removePlaylistItems(selectedId, [member.Id], {
+            isPlaylistItemId: false,
+          })
+        }
       } else {
-        await api.removeCollectionItems(selectedId, [itemId])
+        await api.removeCollectionItems(selectedId, [member.Id])
       }
     },
     onSuccess: async () => {
@@ -338,59 +346,67 @@ export function CollectionsPage() {
           </div>
         ) : (
           <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
-            {members.map((member, idx) => (
-              <div key={member.Id} className="group/member relative">
-                <MediaCard item={member} />
-                {isSelectedPlaylist && members.length > 1 && (
-                  <div className="absolute left-2 top-2 z-20 flex items-center gap-1 opacity-100 transition-opacity [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/member:opacity-100 [@media(hover:hover)]:focus-within:opacity-100">
+            {members.map((member, idx) => {
+              const memberEntryId =
+                isSelectedPlaylist && member.PlaylistItemId ? member.PlaylistItemId : member.Id
+              const memberKey =
+                isSelectedPlaylist && member.PlaylistItemId
+                  ? member.PlaylistItemId
+                  : `${member.Id}-${idx}`
+              return (
+                <div key={memberKey} className="group/member relative">
+                  <MediaCard item={member} />
+                  {isSelectedPlaylist && members.length > 1 && (
+                    <div className="absolute left-2 top-2 z-20 flex items-center gap-1 opacity-100 transition-opacity [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/member:opacity-100 [@media(hover:hover)]:focus-within:opacity-100">
+                      <button
+                        type="button"
+                        disabled={idx === 0 || moveMemberMutation.isPending}
+                        onClick={(e) => {
+                          e.preventDefault()
+                          e.stopPropagation()
+                          moveMemberMutation.mutate({ itemId: memberEntryId, newIndex: idx - 1 })
+                        }}
+                        title="上移"
+                        aria-label={`上移 ${member.Name}`}
+                        className="flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-200 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-amber-500 hover:text-zinc-950 disabled:opacity-35"
+                      >
+                        <ArrowUp className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        disabled={idx === members.length - 1 || moveMemberMutation.isPending}
+                        onClick={(e) => {
+                          e.preventDefault()
+                          e.stopPropagation()
+                          moveMemberMutation.mutate({ itemId: memberEntryId, newIndex: idx + 1 })
+                        }}
+                        title="下移"
+                        aria-label={`下移 ${member.Name}`}
+                        className="flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-200 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-amber-500 hover:text-zinc-950 disabled:opacity-35"
+                      >
+                        <ArrowDown className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  )}
+                  {(isSelectedPlaylist || isAdmin) && (
                     <button
                       type="button"
-                      disabled={idx === 0 || moveMemberMutation.isPending}
+                      disabled={removeMemberMutation.isPending}
                       onClick={(e) => {
                         e.preventDefault()
                         e.stopPropagation()
-                        moveMemberMutation.mutate({ itemId: member.Id, newIndex: idx - 1 })
+                        removeMemberMutation.mutate(member)
                       }}
-                      title="上移"
-                      aria-label={`上移 ${member.Name}`}
-                      className="flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-200 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-amber-500 hover:text-zinc-950 disabled:opacity-35"
+                      title="移出列表"
+                      aria-label={`移出 ${member.Name}`}
+                      className="absolute right-2 top-2 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-200 opacity-100 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-red-500 hover:text-white [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/member:opacity-100 [@media(hover:hover)]:focus:opacity-100"
                     >
-                      <ArrowUp className="h-3.5 w-3.5" />
+                      <X className="h-3.5 w-3.5" />
                     </button>
-                    <button
-                      type="button"
-                      disabled={idx === members.length - 1 || moveMemberMutation.isPending}
-                      onClick={(e) => {
-                        e.preventDefault()
-                        e.stopPropagation()
-                        moveMemberMutation.mutate({ itemId: member.Id, newIndex: idx + 1 })
-                      }}
-                      title="下移"
-                      aria-label={`下移 ${member.Name}`}
-                      className="flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-200 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-amber-500 hover:text-zinc-950 disabled:opacity-35"
-                    >
-                      <ArrowDown className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                )}
-                {(isSelectedPlaylist || isAdmin) && (
-                  <button
-                    type="button"
-                    disabled={removeMemberMutation.isPending}
-                    onClick={(e) => {
-                      e.preventDefault()
-                      e.stopPropagation()
-                      removeMemberMutation.mutate(member.Id)
-                    }}
-                    title="移出列表"
-                    aria-label={`移出 ${member.Name}`}
-                    className="absolute right-2 top-2 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-200 opacity-100 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-red-500 hover:text-white [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/member:opacity-100 [@media(hover:hover)]:focus:opacity-100"
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                )}
-              </div>
-            ))}
+                  )}
+                </div>
+              )
+            })}
           </div>
         )}
 

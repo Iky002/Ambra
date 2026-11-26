@@ -6,9 +6,11 @@ import { isDemoMode } from '../demo/demoMode'
 import { useAuth } from './AuthContext'
 
 export interface PlaystateCommand {
-  Command: 'Pause' | 'Unpause' | 'PlayPause' | 'Stop' | 'Seek' | string
+  Command: 'Pause' | 'Unpause' | 'PlayPause' | 'Stop' | 'Seek' | 'NextTrack' | 'PreviousTrack' | string
   SeekPositionTicks?: number | string
   ControllingUserId?: string
+  PlaySessionId?: string
+  ItemId?: string
 }
 
 export interface DisplayMessagePayload {
@@ -38,7 +40,7 @@ const defaultWebSocketContext: WebSocketContextValue = {
   subscribePlaystate: () => () => undefined,
 }
 
-const WebSocketContext = createContext<WebSocketContextValue>(defaultWebSocketContext)
+export const WebSocketContext = createContext<WebSocketContextValue>(defaultWebSocketContext)
 
 const INITIAL_RECONNECT_DELAY_MS = 1_000
 const MAX_RECONNECT_DELAY_MS = 30_000

@@ -1,4 +1,13 @@
+import { getStoredAuth } from '../api/client'
+
 export const SUBTITLE_PREFS_STORAGE_KEY = 'ambra_subtitle_prefs'
+
+export function getSubtitlePrefsStorageKey(userId?: string | null): string {
+  const effectiveUserId = (userId ?? getStoredAuth()?.userId ?? '').trim()
+  return effectiveUserId
+    ? `${SUBTITLE_PREFS_STORAGE_KEY}:${effectiveUserId}`
+    : SUBTITLE_PREFS_STORAGE_KEY
+}
 
 export interface SubtitlePrefs {
   /** 字幕时间轴偏移（秒），范围 -10 ~ +10，步进 0.5 */
@@ -74,10 +83,10 @@ export function clampSubtitlePrefs(partial?: Partial<SubtitlePrefs> | null): Sub
   }
 }
 
-export function loadSubtitlePrefs(): SubtitlePrefs {
+export function loadSubtitlePrefs(userId?: string | null): SubtitlePrefs {
   try {
     if (typeof localStorage === 'undefined') return { ...DEFAULT_SUBTITLE_PREFS }
-    const raw = localStorage.getItem(SUBTITLE_PREFS_STORAGE_KEY)
+    const raw = localStorage.getItem(getSubtitlePrefsStorageKey(userId))
     if (!raw) return { ...DEFAULT_SUBTITLE_PREFS }
     const parsed = JSON.parse(raw) as Partial<SubtitlePrefs>
     return clampSubtitlePrefs(parsed)
@@ -86,11 +95,14 @@ export function loadSubtitlePrefs(): SubtitlePrefs {
   }
 }
 
-export function saveSubtitlePrefs(prefs: Partial<SubtitlePrefs>): SubtitlePrefs {
+export function saveSubtitlePrefs(
+  prefs: Partial<SubtitlePrefs>,
+  userId?: string | null,
+): SubtitlePrefs {
   const normalized = clampSubtitlePrefs(prefs)
   try {
     if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(SUBTITLE_PREFS_STORAGE_KEY, JSON.stringify(normalized))
+      localStorage.setItem(getSubtitlePrefsStorageKey(userId), JSON.stringify(normalized))
     }
   } catch {
     // ignore storage quota / privacy mode errors
@@ -98,8 +110,8 @@ export function saveSubtitlePrefs(prefs: Partial<SubtitlePrefs>): SubtitlePrefs 
   return normalized
 }
 
-export function resetSubtitlePrefs(): SubtitlePrefs {
-  return saveSubtitlePrefs(DEFAULT_SUBTITLE_PREFS)
+export function resetSubtitlePrefs(userId?: string | null): SubtitlePrefs {
+  return saveSubtitlePrefs(DEFAULT_SUBTITLE_PREFS, userId)
 }
 
 export function stepSubtitleOffset(currentSec: number, deltaSec: number): number {
