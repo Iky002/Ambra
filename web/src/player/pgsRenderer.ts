@@ -452,12 +452,19 @@ export class PgsCanvasRenderer {
 
   async loadFromUrl(url: string): Promise<number> {
     this.cancel()
-    this.abortController = new AbortController()
-    const res = await fetch(url, { signal: this.abortController.signal })
+    const controller = new AbortController()
+    this.abortController = controller
+    const res = await fetch(url, { signal: controller.signal })
+    if (controller.signal.aborted || this.abortController !== controller) {
+      return 0
+    }
     if (!res.ok) {
       throw new Error(`加载 PGS 字幕失败 (${res.status})`)
     }
     const buf = await res.arrayBuffer()
+    if (controller.signal.aborted || this.abortController !== controller) {
+      return 0
+    }
     this.displaySets = parsePgsSup(buf)
     this.lastRenderedIndex = -2
     this.clear()

@@ -1981,6 +1981,8 @@ export class StreamMkvRemuxer {
           }
         }
 
+        if (generation !== this.pumpGeneration || this.disposed) break
+
         if (chunkRes.totalBytes > 0 && this.totalBytes === 0) {
           this.totalBytes = chunkRes.totalBytes
         }

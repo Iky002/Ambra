@@ -138,7 +138,9 @@ export function syncPlaybackPrefsFromUserConfig(cfg?: UserConfiguration | null):
   if (typeof cfg.EnableNextEpisodeAutoPlay === 'boolean') {
     patch.autoPlayNextEpisode = cfg.EnableNextEpisodeAutoPlay
   }
-  if (cfg.AudioLanguagePreference !== undefined) {
+  if (cfg.PlayDefaultAudioTrack === true) {
+    patch.preferredAudioLang = 'media'
+  } else if (cfg.AudioLanguagePreference !== undefined) {
     patch.preferredAudioLang = normalizeAudioPref(cfg.AudioLanguagePreference)
   }
   if (cfg.SubtitleLanguagePreference !== undefined) {

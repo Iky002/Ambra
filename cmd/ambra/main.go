@@ -45,9 +45,11 @@ func run() int {
 	}
 	if *httpAddr != "" {
 		cfg.HTTPAddr = *httpAddr
+		cfg.MarkHTTPAddrRuntimeOverride()
 	}
 	if *webDir != "" {
 		cfg.WebDir = *webDir
+		cfg.MarkWebDirRuntimeOverride()
 	}
 
 	logBridge := logs.NewMultiSlogHandler(os.Stdout, nil, logs.DailyLogFilePath(cfg.DataDir, time.Now().UTC()))

@@ -187,6 +187,17 @@ func readFileWithLimit(path string, maxBytes int64) ([]byte, error) {
 	return data, nil
 }
 
+func isWithinRealDir(realBase, realTarget string) bool {
+	rel, err := filepath.Rel(realBase, realTarget)
+	if err != nil {
+		return false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return false
+	}
+	return true
+}
+
 // LoadFromDir scans <dir>/*/manifest.json and registers every plugin defining a "WasmFile" into reg.
 // Individual plugin load failures are logged and skipped so one bad plugin cannot block others.
 func (h *Host) LoadFromDir(ctx context.Context, dir string, reg *plugins.Registry) (int, error) {
@@ -196,6 +207,10 @@ func (h *Host) LoadFromDir(ctx context.Context, dir string, reg *plugins.Registr
 			return 0, nil
 		}
 		return 0, fmt.Errorf("wasmhost: read plugin dir %q: %w", dir, err)
+	}
+	realRootDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return 0, fmt.Errorf("wasmhost: resolve plugin root dir %q: %w", dir, err)
 	}
 
 	loaded := 0
@@ -209,8 +224,28 @@ func (h *Host) LoadFromDir(ctx context.Context, dir string, reg *plugins.Registr
 			slog.Warn("wasmhost: resolve plugin dir failed, skipping", "dir", pluginDir, "err", err)
 			continue
 		}
+		if !isWithinRealDir(realRootDir, realPluginDir) {
+			slog.Warn("wasmhost: plugin dir symlink escapes plugins root, skipping", "dir", pluginDir)
+			continue
+		}
 		manifestPath := filepath.Join(pluginDir, "manifest.json")
-		raw, err := readFileWithLimit(manifestPath, maxManifestBytes)
+		if _, err := os.Lstat(manifestPath); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			slog.Warn("wasmhost: stat manifest failed, skipping", "manifest", manifestPath, "err", err)
+			continue
+		}
+		realManifestPath, err := filepath.EvalSymlinks(manifestPath)
+		if err != nil {
+			slog.Warn("wasmhost: resolve manifest path failed, skipping", "manifest", manifestPath, "err", err)
+			continue
+		}
+		if !isWithinRealDir(realPluginDir, realManifestPath) {
+			slog.Warn("wasmhost: manifest symlink escapes plugin dir, skipping", "manifest", manifestPath)
+			continue
+		}
+		raw, err := readFileWithLimit(realManifestPath, maxManifestBytes)
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue
@@ -229,8 +264,7 @@ func (h *Host) LoadFromDir(ctx context.Context, dir string, reg *plugins.Registr
 		}
 
 		wasmPath := filepath.Clean(filepath.Join(pluginDir, pm.WasmFile))
-		rel, err := filepath.Rel(pluginDir, wasmPath)
-		if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+		if !isWithinRealDir(pluginDir, wasmPath) {
 			slog.Warn("wasmhost: invalid wasm path, skipping", "wasm_file", pm.WasmFile, "manifest", manifestPath)
 			continue
 		}
@@ -239,8 +273,7 @@ func (h *Host) LoadFromDir(ctx context.Context, dir string, reg *plugins.Registr
 			slog.Warn("wasmhost: resolve wasm path failed, skipping", "wasm_path", wasmPath, "err", err)
 			continue
 		}
-		realRel, err := filepath.Rel(realPluginDir, realWasmPath)
-		if err != nil || strings.HasPrefix(realRel, "..") || filepath.IsAbs(realRel) {
+		if !isWithinRealDir(realPluginDir, realWasmPath) {
 			slog.Warn("wasmhost: symlink escapes plugin dir, skipping", "wasm_path", wasmPath)
 			continue
 		}

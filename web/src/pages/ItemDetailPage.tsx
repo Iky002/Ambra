@@ -576,7 +576,16 @@ export function ItemDetailPage() {
   const deleteItemMutation = useMutation({
     mutationFn: () => api.deleteItem(item!.Id),
     onSuccess: async () => {
-      const targetPath = item?.ParentId ? `/library/${item.ParentId}` : '/'
+      let targetPath = '/'
+      if (item?.Type === 'Episode' || item?.Type === 'Season') {
+        const parentItemId = item.SeriesId || item.ParentId
+        targetPath = parentItemId ? `/item/${parentItemId}` : '/'
+      } else if (item?.Type === 'Audio') {
+        const parentItemId = item.AlbumId || item.ParentId
+        targetPath = parentItemId ? `/item/${parentItemId}` : '/'
+      } else if (item?.ParentId) {
+        targetPath = `/library/${item.ParentId}`
+      }
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['items'] }),
         queryClient.invalidateQueries({ queryKey: ['latestItems'] }),

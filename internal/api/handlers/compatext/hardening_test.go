@@ -198,7 +198,9 @@ func TestSyncAndNotificationsHardeningRBACAndOfflineActions(t *testing.T) {
 	_ = userRepo.CreateUser(ctx, adminU)
 
 	lib, _ := libRepo.CreateLibrary(ctx, "Movies", "movies", []string{tmpDir})
-	item1 := &sqlite.ItemRecord{ID: guid.New(), LibraryID: lib.ID, ParentID: lib.ID, Type: "Movie", MediaType: "Video", Name: "Movie 1"}
+	validSyncFile := filepath.Join(tmpDir, "alice_sync.mp4")
+	_ = os.WriteFile(validSyncFile, []byte("SYNC_BYTES"), 0o600)
+	item1 := &sqlite.ItemRecord{ID: guid.New(), LibraryID: lib.ID, ParentID: lib.ID, Type: "Movie", MediaType: "Video", Name: "Movie 1", Path: validSyncFile}
 	item2 := &sqlite.ItemRecord{ID: guid.New(), LibraryID: lib.ID, ParentID: lib.ID, Type: "Movie", MediaType: "Video", Name: "Movie 2"}
 	_ = libRepo.UpsertItem(ctx, item1)
 	_ = libRepo.UpsertItem(ctx, item2)
@@ -269,8 +271,6 @@ func TestSyncAndNotificationsHardeningRBACAndOfflineActions(t *testing.T) {
 	}
 
 	// 2. Sync/JobItems/{Id}/File RBAC + missing file -> 404
-	validSyncFile := filepath.Join(tmpDir, "alice_sync.mp4")
-	_ = os.WriteFile(validSyncFile, []byte("SYNC_BYTES"), 0o600)
 	h.writeConfigJSON(ctx, syncConfigKey, sharedSyncState{
 		Jobs: []sharedSyncJob{
 			{Id: "job-a", TargetId: "dev-a", Name: "Alice Job", UserId: userA.ID, DateCreated: time.Now()},

@@ -27,11 +27,12 @@ import (
 )
 
 type Handler struct {
-	setupMu  sync.Mutex
-	cfg      *config.Config
-	userRepo *sqlite.UserRepo
-	registry *plugins.Registry
-	setup    SetupDeps
+	setupMu       sync.Mutex
+	extraConfigMu sync.Mutex
+	cfg           *config.Config
+	userRepo      *sqlite.UserRepo
+	registry      *plugins.Registry
+	setup         SetupDeps
 }
 
 func NewHandler(cfg *config.Config, userRepo *sqlite.UserRepo, registry *plugins.Registry) *Handler {
@@ -177,7 +178,7 @@ type ServerConfigurationDto struct {
 	UICulture                 string  `json:"UICulture"`
 }
 
-func (h *Handler) loadExtraConfig(ctx context.Context) map[string]any {
+func (h *Handler) loadExtraConfigLocked(ctx context.Context) map[string]any {
 	extra := map[string]any{}
 	if h.userRepo == nil {
 		return extra
@@ -188,7 +189,7 @@ func (h *Handler) loadExtraConfig(ctx context.Context) map[string]any {
 	return extra
 }
 
-func (h *Handler) saveExtraConfig(ctx context.Context, extra map[string]any) error {
+func (h *Handler) saveExtraConfigLocked(ctx context.Context, extra map[string]any) error {
 	if h.userRepo == nil {
 		return nil
 	}
@@ -199,6 +200,18 @@ func (h *Handler) saveExtraConfig(ctx context.Context, extra map[string]any) err
 	return h.userRepo.SetServerConfig(ctx, systemExtraConfigKey, string(raw))
 }
 
+func (h *Handler) loadExtraConfig(ctx context.Context) map[string]any {
+	h.extraConfigMu.Lock()
+	defer h.extraConfigMu.Unlock()
+	return h.loadExtraConfigLocked(ctx)
+}
+
+func (h *Handler) saveExtraConfig(ctx context.Context, extra map[string]any) error {
+	h.extraConfigMu.Lock()
+	defer h.extraConfigMu.Unlock()
+	return h.saveExtraConfigLocked(ctx, extra)
+}
+
 func stringFromMap(m map[string]any, key, fallback string) string {
 	if v, ok := m[key].(string); ok && strings.TrimSpace(v) != "" {
 		return strings.TrimSpace(v)
@@ -207,6 +220,7 @@ func stringFromMap(m map[string]any, key, fallback string) string {
 }
 
 func (h *Handler) GetConfiguration(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "private, no-store")
 	isAdmin := false
 	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.IsAdmin() {
 		isAdmin = true
@@ -287,7 +301,8 @@ func (h *Handler) UpdateConfiguration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	extra := h.loadExtraConfig(r.Context())
+	h.extraConfigMu.Lock()
+	extra := h.loadExtraConfigLocked(r.Context())
 	extraDirty := false
 	for k, v := range body {
 		switch k {
@@ -303,11 +318,14 @@ func (h *Handler) UpdateConfiguration(w http.ResponseWriter, r *http.Request) {
 			extraDirty = true
 		}
 	}
+	var extraErr error
 	if extraDirty {
-		if err := h.saveExtraConfig(r.Context(), extra); err != nil {
-			httpx.Error(w, http.StatusInternalServerError, "failed to save extended configuration")
-			return
-		}
+		extraErr = h.saveExtraConfigLocked(r.Context(), extra)
+	}
+	h.extraConfigMu.Unlock()
+	if extraErr != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to save extended configuration")
+		return
 	}
 
 	if tmdbChanged {

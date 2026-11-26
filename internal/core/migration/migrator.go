@@ -148,6 +148,7 @@ type Migrator struct {
 	running  bool
 	cancelFn context.CancelFunc
 	status   MigrationReport
+	wg       sync.WaitGroup
 }
 
 // NewMigrator creates a new Migrator backed by the given SQLite store and UserRepo.
@@ -220,6 +221,11 @@ func (m *Migrator) Cancel() bool {
 	return true
 }
 
+// Wait blocks until any active asynchronous migration goroutine has finished.
+func (m *Migrator) Wait() {
+	m.wg.Wait()
+}
+
 // StartAsync launches a live migration in the background and returns the initial running report.
 func (m *Migrator) StartAsync(req MigrationRequest) (MigrationReport, error) {
 	req.DryRun = false
@@ -237,7 +243,9 @@ func (m *Migrator) StartAsync(req MigrationRequest) (MigrationReport, error) {
 	}
 
 	initial := m.Status()
+	m.wg.Add(1)
 	go func() {
+		defer m.wg.Done()
 		_, _ = m.execute(runCtx, client, req)
 	}()
 	return initial, nil
@@ -849,7 +857,7 @@ func (m *Migrator) loadLocalIndex(ctx context.Context) (*localItemIndex, error) 
 		for k, v := range it.Extra.ProviderIDs {
 			pk := strings.ToLower(strings.TrimSpace(k))
 			pv := strings.ToLower(strings.TrimSpace(v))
-			if (pk == "tmdb" || pk == "imdb") && pv != "" {
+			if (pk == "tmdb" || pk == "imdb" || pk == "tvdb") && pv != "" {
 				key := normType + "|" + pk + ":" + pv
 				idx.byProvider[key] = appendUnique(idx.byProvider[key], it.ID)
 			}
@@ -908,7 +916,7 @@ func (idx *localItemIndex) match(src SourceItem) (string, string) {
 				lowerProviders[lk] = lv
 			}
 		}
-		for _, provider := range []string{"tmdb", "imdb"} {
+		for _, provider := range []string{"tmdb", "imdb", "tvdb"} {
 			if val, ok := lowerProviders[provider]; ok {
 				if ids := idx.byProvider[normType+"|"+provider+":"+val]; len(ids) > 0 {
 					if len(ids) > 1 {

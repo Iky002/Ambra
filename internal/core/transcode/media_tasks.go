@@ -187,7 +187,7 @@ func GenerateAllBIFThumbnails(
 		} else if existing := ext.FindExistingBIF(item.MediaPath, item.ItemID, DefaultBIFWidth); existing != "" {
 			summary.Skipped++
 		} else {
-			if _, genErr := ext.GenerateBIF(ctx, item.MediaPath, item.ItemID, DefaultBIFWidth, DefaultBIFIntervalSec); genErr != nil {
+			if _, genErr := ext.GenerateBIFWithContext(ctx, item.MediaPath, item.ItemID, DefaultBIFWidth, DefaultBIFIntervalSec); genErr != nil {
 				if ctx.Err() != nil {
 					return summary, ctx.Err()
 				}

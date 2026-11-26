@@ -290,8 +290,8 @@ func TestWatcherSymlinkPolicyAndEscapeBlocked(t *testing.T) {
 		t.Fatalf("WatchLibrary: %v", err)
 	}
 	w.mu.Lock()
-	_, watchingEscape := w.dirToLib[escapeLink]
-	_, watchingOutside := w.dirToLib[outside]
+	_, watchingEscape := w.dirToLibs[escapeLink]
+	_, watchingOutside := w.dirToLibs[outside]
 	w.mu.Unlock()
 	if watchingEscape || watchingOutside {
 		t.Fatalf("watcher must NOT watch symlink escaping root: escape=%v outside=%v", watchingEscape, watchingOutside)
@@ -329,7 +329,7 @@ func TestWatcherSymlinkPolicyAndEscapeBlocked(t *testing.T) {
 		t.Fatal(err)
 	}
 	wIgnore.mu.Lock()
-	_, watchingIntra := wIgnore.dirToLib[intraLink]
+	_, watchingIntra := wIgnore.dirToLibs[intraLink]
 	wIgnore.mu.Unlock()
 	if watchingIntra {
 		t.Fatalf("SymlinkIgnore policy must not watch intra-root symlink %q", intraLink)

@@ -105,8 +105,8 @@ func TestPluginAdminDeepMaskMergeAndClearSecret(t *testing.T) {
 		"api_key":  "", // explicit empty string MUST clear top-secret-1!
 		"language": "en-US",
 		"auth": map[string]any{
-			"client_secret": maskedSecret, // sentinel MUST preserve nested-secret-2!
-			"endpoint":      "https://api2.example.com",
+			"client_secret": maskedSecret, // sentinel MUST preserve nested-secret-2 when host is unchanged!
+			"endpoint":      "https://api.example.com/v2",
 		},
 		"providers": []any{
 			map[string]any{
@@ -138,7 +138,7 @@ func TestPluginAdminDeepMaskMergeAndClearSecret(t *testing.T) {
 	if savedAuth["client_secret"] != "nested-secret-2" {
 		t.Fatalf("expected sentinel to preserve nested client_secret, got %v", savedAuth["client_secret"])
 	}
-	if savedAuth["endpoint"] != "https://api2.example.com" {
+	if savedAuth["endpoint"] != "https://api.example.com/v2" {
 		t.Fatalf("expected updated endpoint, got %v", savedAuth["endpoint"])
 	}
 	savedProvs := saved["providers"].([]any)

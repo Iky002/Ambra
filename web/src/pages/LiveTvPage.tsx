@@ -104,6 +104,7 @@ export function LiveTvPage() {
   const [playingRecording, setPlayingRecording] = useState<LiveTvRecordingInfo | null>(null)
   const [recordingPlaybackError, setRecordingPlaybackError] = useState<string | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
+  const hlsRef = useRef<Hls | null>(null)
   const mediaRecoveryCountRef = useRef(0)
   const demoActive = isDemoMode()
 
@@ -371,6 +372,16 @@ export function LiveTvPage() {
 
     let hls: Hls | null = null
 
+    const destroyHls = () => {
+      if (hls) {
+        hls.destroy()
+        if (hlsRef.current === hls) {
+          hlsRef.current = null
+        }
+        hls = null
+      }
+    }
+
     if (useHls) {
       hls = new Hls({
         enableWorker: true,
@@ -387,21 +398,24 @@ export function LiveTvPage() {
           }
         },
       })
+      hlsRef.current = hls
       hls.loadSource(streamUrl)
       hls.attachMedia(video)
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (data.fatal) {
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            destroyHls()
             setPlaybackError('直播流网络连接失败，请检查直播源可用性或稍后重试')
           } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
             if (mediaRecoveryCountRef.current < MAX_HLS_MEDIA_RECOVERIES) {
               mediaRecoveryCountRef.current += 1
               hls?.recoverMediaError()
             } else {
-              hls?.destroy()
+              destroyHls()
               setPlaybackError('直播流媒体解码多次失败，请点击重试或切换频道')
             }
           } else {
+            destroyHls()
             setPlaybackError('直播流解码异常，尝试切换频道或检查流格式')
           }
         }
@@ -412,9 +426,7 @@ export function LiveTvPage() {
     }
 
     return () => {
-      if (hls) {
-        hls.destroy()
-      }
+      destroyHls()
       video.pause()
       video.removeAttribute('src')
     }

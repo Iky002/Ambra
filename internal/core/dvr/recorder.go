@@ -44,11 +44,12 @@ var (
 
 // RecordingJob describes a Live TV recording task to execute.
 type RecordingJob struct {
-	TimerID     string
-	ChannelName string
-	ProgramName string
-	StreamURL   string
-	Duration    time.Duration
+	TimerID        string
+	ChannelName    string
+	ProgramName    string
+	StreamURL      string
+	Duration       time.Duration
+	DenyPrivateLAN bool
 }
 
 // RecordingState captures the runtime state of a recording task.
@@ -73,11 +74,39 @@ type Options struct {
 type recordingEntry struct {
 	state     RecordingState
 	cmd       *exec.Cmd
+	stdinMu   sync.Mutex
 	stdin     io.WriteCloser
 	cancel    context.CancelFunc
 	stopOnce  sync.Once
 	cancelled bool
 	done      chan struct{}
+}
+
+func (e *recordingEntry) closeStdin() {
+	if e == nil {
+		return
+	}
+	e.stdinMu.Lock()
+	s := e.stdin
+	e.stdin = nil
+	e.stdinMu.Unlock()
+	if s != nil {
+		_ = s.Close()
+	}
+}
+
+func (e *recordingEntry) sendQuitAndCloseStdin() {
+	if e == nil {
+		return
+	}
+	e.stdinMu.Lock()
+	s := e.stdin
+	e.stdin = nil
+	e.stdinMu.Unlock()
+	if s != nil {
+		_, _ = io.WriteString(s, "q\n")
+		_ = s.Close()
+	}
 }
 
 // Recorder manages active and historical Live TV recording tasks backed by ffmpeg.
@@ -163,7 +192,7 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 	if strings.TrimSpace(job.TimerID) == "" || strings.TrimSpace(job.StreamURL) == "" {
 		return nil, ErrInvalidJob
 	}
-	if err := netutil.ValidateRemoteURLNoLoopback(job.StreamURL, true); err != nil {
+	if err := netutil.ValidateRemoteURLNoLoopback(job.StreamURL, !job.DenyPrivateLAN); err != nil {
 		return nil, fmt.Errorf("%w: invalid stream URL: %v", ErrInvalidJob, err)
 	}
 	if err := os.MkdirAll(r.recordingsDir, 0o755); err != nil {
@@ -259,11 +288,13 @@ func (r *Recorder) gracefulStop(entry *recordingEntry) {
 	if entry == nil {
 		return
 	}
+	select {
+	case <-entry.done:
+		return
+	default:
+	}
 	entry.stopOnce.Do(func() {
-		if entry.stdin != nil {
-			_, _ = io.WriteString(entry.stdin, "q\n")
-			_ = entry.stdin.Close()
-		}
+		entry.sendQuitAndCloseStdin()
 		if entry.cmd != nil && entry.cmd.Process != nil {
 			_ = entry.cmd.Process.Signal(os.Interrupt)
 		}
@@ -284,13 +315,9 @@ func (r *Recorder) gracefulStop(entry *recordingEntry) {
 
 func (r *Recorder) waitRecording(recCtx context.Context, cmd *exec.Cmd, entry *recordingEntry) {
 	defer r.wg.Done()
-	defer close(entry.done)
 	defer entry.cancel()
-	defer func() {
-		if entry.stdin != nil {
-			_ = entry.stdin.Close()
-		}
-	}()
+	defer close(entry.done)
+	defer entry.closeStdin()
 
 	err := cmd.Wait()
 	endedAt := time.Now().UTC()

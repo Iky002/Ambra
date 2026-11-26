@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,13 +22,16 @@ import (
 var ErrSessionClosed = errors.New("transcode session closed")
 
 const (
-	defaultIdleTimeout        = 60 * time.Second
-	defaultCleanupTick        = 15 * time.Second
-	defaultSeekThreshold      = 3
-	defaultPollInterval       = 50 * time.Millisecond
-	defaultMaxSessions        = 16
-	defaultMaxSessionsPerUser = 4
-	maxStderrBytes            = 64 * 1024
+	defaultIdleTimeout            = 60 * time.Second
+	defaultCleanupTick            = 15 * time.Second
+	defaultSeekThreshold          = 3
+	defaultPollInterval           = 50 * time.Millisecond
+	defaultSegmentWaitTimeout     = 90 * time.Second
+	defaultMaxSessions            = 16
+	defaultMaxSessionsPerUser     = 4
+	maxStderrBytes                = 64 * 1024
+	maxRemoteSubtitleBytes        = int64(16 << 20) // 16 MiB
+	remoteSubtitleDownloadTimeout = 15 * time.Second
 	defaultHTTPUserAgent      = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 	softwareTonemapFilter     = "zscale=t=linear:npl=100,tonemap=hable,zscale=p=bt709:t=bt709:m=bt709,format=yuv420p"
 	qsvSoftwareTonemapFilter  = "zscale=t=linear:npl=100,tonemap=hable,zscale=p=bt709:t=bt709:m=bt709,format=nv12"
@@ -171,6 +175,10 @@ func BuildFFmpegArgs(params SessionParams, startSeg int, outDir string, caps *HW
 	isBitmapSub := burnIn && isBitmapSubtitleCodec(params.SubtitleCodec) &&
 		subPath == "" &&
 		params.SubtitleStreamIndex != nil && *params.SubtitleStreamIndex >= 0
+	// Never pass raw http(s):// URLs into FFmpeg's subtitles= filter (bypasses -follow_redirects 0).
+	if burnIn && !isBitmapSub && (isHTTPInput(subPath) || (subPath == "" && isHTTPInput(inputPath))) {
+		burnIn = false
+	}
 	textBurnInSeek := burnIn && !isBitmapSub && startSec > 0
 
 	isVideoCopy := strings.EqualFold(params.VideoCodec, "copy") && !burnIn
@@ -320,11 +328,15 @@ func BuildFFmpegArgs(params SessionParams, startSeg int, outDir string, caps *HW
 		if vBitrate <= 0 {
 			vBitrate = 4_000_000
 		}
+		keyframeExpr := fmt.Sprintf("expr:gte(t,n_forced*%d)", segDur)
+		if textBurnInSeek && startSec > 0 {
+			keyframeExpr = fmt.Sprintf("expr:gte(t-%d,n_forced*%d)", startSec, segDur)
+		}
 		args = append(args,
 			"-b:v", strconv.Itoa(vBitrate),
 			"-maxrate", strconv.Itoa(vBitrate),
 			"-bufsize", strconv.Itoa(vBitrate*2),
-			"-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%d)", segDur),
+			"-force_key_frames", keyframeExpr,
 		)
 	}
 
@@ -570,6 +582,16 @@ func sessionParamsDiffer(a, b SessionParams) bool {
 		strings.TrimSpace(a.SubtitlePath) != strings.TrimSpace(b.SubtitlePath)
 }
 
+func sessionQuotaOwner(p SessionParams) string {
+	if u := strings.TrimSpace(p.UserID); u != "" {
+		return "user:" + u
+	}
+	if d := strings.TrimSpace(p.DeviceID); d != "" {
+		return "device:" + d
+	}
+	return "__anonymous__"
+}
+
 func (m *Manager) getOrCreateSession(params SessionParams) (*transcodeSession, error) {
 	key := SessionKey(params)
 
@@ -591,20 +613,21 @@ func (m *Manager) getOrCreateSession(params SessionParams) (*transcodeSession, e
 			continue
 		}
 
-		// Enforce per-user session quota first so one user cannot exhaust global slots
-		// and evict other users' active streams.
+		// Enforce per-user (or per-device / __anonymous__ bucket when UserID is empty)
+		// session quota first so no single principal can exhaust global slots.
 		var evicted []*transcodeSession
-		if userID := strings.TrimSpace(params.UserID); userID != "" && m.maxSessionsPerUser > 0 {
+		if m.maxSessionsPerUser > 0 {
+			owner := sessionQuotaOwner(params)
 			for {
-				userCount := 0
+				ownerCount := 0
 				var oldestKey string
 				var oldestSess *transcodeSession
 				var oldestTime time.Time
 				for k, s := range m.sessions {
-					if strings.TrimSpace(s.params.UserID) != userID {
+					if sessionQuotaOwner(s.params) != owner {
 						continue
 					}
-					userCount++
+					ownerCount++
 					t := s.lastAccessTime()
 					if oldestSess == nil || t.Before(oldestTime) {
 						oldestKey = k
@@ -612,7 +635,7 @@ func (m *Manager) getOrCreateSession(params SessionParams) (*transcodeSession, e
 						oldestTime = t
 					}
 				}
-				if userCount < m.maxSessionsPerUser || oldestSess == nil {
+				if ownerCount < m.maxSessionsPerUser || oldestSess == nil {
 					break
 				}
 				delete(m.sessions, oldestKey)
@@ -839,10 +862,11 @@ func (m *Manager) reapIdleSessions(now time.Time) int {
 }
 
 type transcodeSession struct {
-	key        string
-	ffmpegPath string
-	params     SessionParams
-	workDir    string
+	key                string
+	ffmpegPath         string
+	params             SessionParams
+	workDir            string
+	segmentWaitTimeout time.Duration
 
 	mu            sync.Mutex
 	cmd           *exec.Cmd
@@ -1059,6 +1083,13 @@ func (s *transcodeSession) waitForFile(ctx context.Context, targetPath string, r
 	ticker := time.NewTicker(defaultPollInterval)
 	defer ticker.Stop()
 
+	waitTimeout := s.segmentWaitTimeout
+	if waitTimeout <= 0 {
+		waitTimeout = defaultSegmentWaitTimeout
+	}
+	waitTimer := time.NewTimer(waitTimeout)
+	defer waitTimer.Stop()
+
 	retriedSoftware := false
 	for {
 		if fileReady(targetPath) {
@@ -1071,6 +1102,8 @@ func (s *transcodeSession) waitForFile(ctx context.Context, targetPath string, r
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
+		case <-waitTimer.C:
+			return "", fmt.Errorf("timed out waiting for %s after %s", label, waitTimeout)
 		case <-doneCh:
 			// FFmpeg exited; check one final time if the file finished writing right before exit
 			if fileReady(targetPath) {
@@ -1087,6 +1120,11 @@ func (s *transcodeSession) waitForFile(ctx context.Context, targetPath string, r
 				if s.doneCh == nil {
 					s.mu.Unlock()
 					return "", ErrSessionClosed
+				}
+				if label != "init.mp4" && restartSeg < s.startSeg {
+					restartedAt := s.startSeg
+					s.mu.Unlock()
+					return "", fmt.Errorf("transcode session restarted at segment %d before producing %s", restartedAt, label)
 				}
 				doneCh = s.doneCh
 				s.mu.Unlock()
@@ -1198,10 +1236,100 @@ func copyFileAtomic(src, dst string) error {
 	return out.Close()
 }
 
-// stageBurnInFiles stages external subtitle files (copy) or local embedded-subtitle media files
-// containing special characters (symlink/hardlink) into workDir under safe alphanumeric filenames
-// so FFmpeg's subtitles= filter never chokes on single quotes, brackets, or colons.
+func downloadRemoteSubtitleAtomic(rawURL, dst string, client *http.Client) error {
+	if client == nil {
+		if err := netutil.ValidateRemoteURL(rawURL, true); err != nil {
+			return err
+		}
+		client = netutil.NewSafeHTTPClient(remoteSubtitleDownloadTimeout, true)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), remoteSubtitleDownloadTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", defaultHTTPUserAgent)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("remote subtitle HTTP status %d", resp.StatusCode)
+	}
+
+	tmpFile, err := os.CreateTemp(filepath.Dir(dst), ".burn-sub-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	written, err := io.Copy(tmpFile, io.LimitReader(resp.Body, maxRemoteSubtitleBytes+1))
+	if err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+	if written <= 0 {
+		return errors.New("remote subtitle response is empty")
+	}
+	if written > maxRemoteSubtitleBytes {
+		return fmt.Errorf("remote subtitle exceeds %d bytes", maxRemoteSubtitleBytes)
+	}
+	if err := os.Rename(tmpPath, dst); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
+func extractRemoteEmbeddedSubtitle(ffmpegPath, mediaURL string, streamIndex int, subCodec, dst string) error {
+	if strings.TrimSpace(ffmpegPath) == "" {
+		ffmpegPath = "ffmpeg"
+	}
+	if err := netutil.ValidateRemoteURL(mediaURL, true); err != nil {
+		return err
+	}
+	ext := normalizeSubtitleExt(subCodec)
+	tmpFile, err := os.CreateTemp(filepath.Dir(dst), ".burn-emb-*."+ext)
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	_ = tmpFile.Close()
+	defer os.Remove(tmpPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultExtractTimeout)
+	defer cancel()
+	args := BuildSubtitleExtractArgs(mediaURL, streamIndex, ext, tmpPath)
+	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	if !fileReady(tmpPath) {
+		return errors.New("extracted remote embedded subtitle is empty")
+	}
+	return os.Rename(tmpPath, dst)
+}
+
+// stageBurnInFiles stages external subtitle files (copy or safe HTTP download) or embedded-subtitle
+// media files into workDir under safe alphanumeric filenames so FFmpeg's subtitles= filter never
+// receives raw HTTP(S) URLs or chokes on special path characters.
 func stageBurnInFiles(params SessionParams, workDir string) SessionParams {
+	return stageBurnInFilesWithDeps(params, workDir, "ffmpeg", nil)
+}
+
+func stageBurnInFilesWithDeps(params SessionParams, workDir, ffmpegPath string, httpClient *http.Client) SessionParams {
 	if !strings.EqualFold(strings.TrimSpace(params.SubtitleMethod), "Encode") {
 		return params
 	}
@@ -1213,7 +1341,22 @@ func stageBurnInFiles(params SessionParams, workDir string) SessionParams {
 		return params
 	}
 
-	if subPath != "" && !isHTTPInput(subPath) {
+	if subPath != "" {
+		if isHTTPInput(subPath) {
+			dst := filepath.Join(workDir, "burn_sub"+safeBurnSubExt(subPath, params.SubtitleCodec))
+			if fileReady(dst) {
+				params.SubtitlePath = dst
+				return params
+			}
+			if err := downloadRemoteSubtitleAtomic(subPath, dst, httpClient); err == nil {
+				params.SubtitlePath = dst
+				return params
+			}
+			// Never pass raw HTTP(S) subtitle URL into FFmpeg's subtitles= filter.
+			params.SubtitlePath = ""
+			params.SubtitleMethod = ""
+			return params
+		}
 		absSub := subPath
 		if a, err := filepath.Abs(subPath); err == nil {
 			absSub = a
@@ -1229,7 +1372,21 @@ func stageBurnInFiles(params SessionParams, workDir string) SessionParams {
 
 	if params.SubtitleStreamIndex != nil && *params.SubtitleStreamIndex >= 0 {
 		inputPath := strings.TrimSpace(params.InputPath)
-		if inputPath != "" && !isHTTPInput(inputPath) && needsBurnInStaging(inputPath) {
+		if isHTTPInput(inputPath) {
+			dst := filepath.Join(workDir, "burn_sub"+safeBurnSubExt("", params.SubtitleCodec))
+			if fileReady(dst) {
+				params.SubtitlePath = dst
+				return params
+			}
+			if err := extractRemoteEmbeddedSubtitle(ffmpegPath, inputPath, *params.SubtitleStreamIndex, params.SubtitleCodec, dst); err == nil {
+				params.SubtitlePath = dst
+				return params
+			}
+			// Never pass raw HTTP(S) media URL into FFmpeg's subtitles= filter.
+			params.SubtitleMethod = ""
+			return params
+		}
+		if inputPath != "" && needsBurnInStaging(inputPath) {
 			absIn := inputPath
 			if a, err := filepath.Abs(inputPath); err == nil {
 				absIn = a
@@ -1275,7 +1432,7 @@ func (s *transcodeSession) startProcessLocked(startSeg int, caps *HWCapabilities
 	usingHW := (!strings.EqualFold(s.params.VideoCodec, "copy") || strings.EqualFold(strings.TrimSpace(s.params.SubtitleMethod), "Encode")) &&
 		isHardwareEncoder(effectiveCaps.SelectVideoEncoder(vCodec))
 
-	effectiveParams := stageBurnInFiles(s.params, s.workDir)
+	effectiveParams := stageBurnInFilesWithDeps(s.params, s.workDir, s.ffmpegPath, nil)
 	args := BuildFFmpegArgs(effectiveParams, startSeg, s.workDir, effectiveCaps)
 	procCtx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(procCtx, s.ffmpegPath, args...)

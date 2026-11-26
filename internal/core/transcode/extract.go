@@ -23,6 +23,10 @@ const (
 	localProtocolWhitelist  = "file,pipe"
 	remoteProtocolWhitelist = "http,https,tcp,tls,crypto"
 	maxProbeAttachmentBytes = 4 << 20 // 4 MiB
+	maxFontAttachments      = 64
+	maxSingleFontBytes      = int64(32 << 20)  // 32 MiB
+	maxTotalFontBytes       = int64(128 << 20) // 128 MiB
+	maxAttachmentNameBytes  = 255
 )
 
 func protocolWhitelistForInput(mediaPath string) string {
@@ -219,13 +223,17 @@ func (e *Extractor) ExtractFonts(ctx context.Context, mediaPath, itemID, mediaSo
 		// Step 1: Probe attachment streams with ffprobe and filter safe font filenames in Go.
 		// Never use `ffmpeg -dump_attachment:t ""` because untrusted container attachment filenames
 		// can contain path traversal sequences that FFmpeg writes outside the staging directory.
-		targets := e.probeSafeFontAttachments(runCtx, resolvedMedia)
+		targets, probeErr := e.probeSafeFontAttachments(runCtx, resolvedMedia)
+		if probeErr != nil {
+			return nil, fmt.Errorf("probe font attachments: %w", probeErr)
+		}
 
 		if err := os.MkdirAll(fontDir, 0o700); err != nil {
 			return nil, fmt.Errorf("create font cache dir: %w", err)
 		}
 
 		// Step 2: Explicitly dump each validated font attachment stream to a safe path inside stageDir.
+		extractedCount := 0
 		if len(targets) > 0 {
 			fontArgs := []string{
 				"-hide_banner", "-loglevel", "error", "-y",
@@ -245,17 +253,30 @@ func (e *Extractor) ExtractFonts(ctx context.Context, mediaPath, itemID, mediaSo
 			cmd.Dir = stageDir
 			_ = cmd.Run()
 
+			var totalBytes int64
 			for _, t := range targets {
 				src := filepath.Join(stageDir, t.safeName)
 				info, statErr := os.Lstat(src)
-				if statErr != nil || info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Size() == 0 {
+				if statErr != nil || info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Size() <= 0 {
+					continue
+				}
+				if info.Size() > maxSingleFontBytes || totalBytes+info.Size() > maxTotalFontBytes {
 					continue
 				}
 				dst := filepath.Join(fontDir, t.safeName)
-				_ = os.Rename(src, dst)
+				if err := os.Rename(src, dst); err == nil {
+					totalBytes += info.Size()
+					extractedCount++
+				}
 			}
 		}
 
+		if runCtx.Err() != nil {
+			return nil, fmt.Errorf("extract font attachments cancelled: %w", runCtx.Err())
+		}
+		if len(targets) > 0 && extractedCount == 0 {
+			return nil, fmt.Errorf("failed to extract any font attachments")
+		}
 		_ = os.WriteFile(markerPath, []byte("ok"), 0o600)
 		return listFontFiles(fontDir)
 	})
@@ -295,9 +316,9 @@ func (l *limitedBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (e *Extractor) probeSafeFontAttachments(ctx context.Context, resolvedMedia string) []fontAttachmentTarget {
+func (e *Extractor) probeSafeFontAttachments(ctx context.Context, resolvedMedia string) ([]fontAttachmentTarget, error) {
 	if strings.TrimSpace(e.ffprobePath) == "" {
-		return nil
+		return nil, fmt.Errorf("ffprobe path is empty")
 	}
 	probeArgs := []string{
 		"-v", "error",
@@ -316,8 +337,11 @@ func (e *Extractor) probeSafeFontAttachments(ctx context.Context, resolvedMedia 
 	cmd := exec.CommandContext(ctx, e.ffprobePath, probeArgs...)
 	stdout := &limitedBuffer{max: maxProbeAttachmentBytes}
 	cmd.Stdout = stdout
-	if err := cmd.Run(); err != nil || stdout.truncated {
-		return nil
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("ffprobe attachments failed: %w", err)
+	}
+	if stdout.truncated {
+		return nil, fmt.Errorf("ffprobe attachments output exceeded %d bytes", maxProbeAttachmentBytes)
 	}
 
 	var parsed struct {
@@ -327,12 +351,15 @@ func (e *Extractor) probeSafeFontAttachments(ctx context.Context, resolvedMedia 
 		} `json:"streams"`
 	}
 	if err := json.Unmarshal(stdout.buf.Bytes(), &parsed); err != nil {
-		return nil
+		return nil, fmt.Errorf("parse ffprobe attachments json: %w", err)
 	}
 
 	usedNames := make(map[string]struct{}, len(parsed.Streams))
-	targets := make([]fontAttachmentTarget, 0, len(parsed.Streams))
+	targets := make([]fontAttachmentTarget, 0, min(len(parsed.Streams), maxFontAttachments))
 	for _, s := range parsed.Streams {
+		if len(targets) >= maxFontAttachments {
+			break
+		}
 		if s.Index < 0 {
 			continue
 		}
@@ -353,7 +380,7 @@ func (e *Extractor) probeSafeFontAttachments(ctx context.Context, resolvedMedia 
 			safeName:    safeName,
 		})
 	}
-	return targets
+	return targets, nil
 }
 
 func deduplicateAttachmentName(name string, streamIdx int, used map[string]struct{}) string {
@@ -375,10 +402,15 @@ func deduplicateAttachmentName(name string, streamIdx int, used map[string]struc
 }
 
 func isSafeAttachmentFilename(name string) bool {
-	if name == "" || strings.HasPrefix(name, ".") {
+	if name == "" || len(name) > maxAttachmentNameBytes || strings.HasPrefix(name, ".") {
 		return false
 	}
-	if strings.Contains(name, "/") || strings.Contains(name, `\`) || strings.Contains(name, "..") || strings.ContainsRune(name, '\x00') {
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	if strings.Contains(name, "/") || strings.Contains(name, `\`) || strings.Contains(name, "..") {
 		return false
 	}
 	return filepath.Base(name) == name

@@ -268,7 +268,7 @@ func (h *Handler) JobItemIDsForJob(jobID string) []string {
 }
 
 // DeleteJobForCaller removes a sync job and its job items if the caller owns the job or is admin.
-func (h *Handler) DeleteJobForCaller(ctx context.Context, jobID, callerID string, isAdmin bool) (found, allowed bool) {
+func (h *Handler) DeleteJobForCaller(ctx context.Context, jobID, callerID string, isAdmin bool) (found, allowed bool, err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -280,10 +280,10 @@ func (h *Handler) DeleteJobForCaller(ctx context.Context, jobID, callerID string
 		}
 	}
 	if idx < 0 {
-		return false, true
+		return false, true, nil
 	}
 	if !callerCanAccessJob(h.state.Jobs[idx], callerID, isAdmin) {
-		return true, false
+		return true, false, nil
 	}
 	snapshot := cloneSyncState(h.state)
 	h.state.Jobs = append(h.state.Jobs[:idx], h.state.Jobs[idx+1:]...)
@@ -296,12 +296,13 @@ func (h *Handler) DeleteJobForCaller(ctx context.Context, jobID, callerID string
 	h.state.JobItems = keptItems
 	if err := h.saveStateLocked(ctx); err != nil {
 		h.state = snapshot
+		return true, true, err
 	}
-	return true, true
+	return true, true, nil
 }
 
 // DeleteJobItemForCaller removes a sync job item if the caller owns its parent job or is admin.
-func (h *Handler) DeleteJobItemForCaller(ctx context.Context, itemID, callerID string, isAdmin bool) (found, allowed bool) {
+func (h *Handler) DeleteJobItemForCaller(ctx context.Context, itemID, callerID string, isAdmin bool) (found, allowed bool, err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -311,7 +312,7 @@ func (h *Handler) DeleteJobItemForCaller(ctx context.Context, itemID, callerID s
 			if !isAdmin {
 				j, ok := h.findJobLocked(jobID)
 				if !ok || !callerCanAccessJob(j, callerID, isAdmin) {
-					return true, false
+					return true, false, nil
 				}
 			}
 			snapshot := cloneSyncState(h.state)
@@ -319,15 +320,16 @@ func (h *Handler) DeleteJobItemForCaller(ctx context.Context, itemID, callerID s
 			h.recomputeJobLocked(jobID)
 			if err := h.saveStateLocked(ctx); err != nil {
 				h.state = snapshot
+				return true, true, err
 			}
-			return true, true
+			return true, true, nil
 		}
 	}
-	return false, true
+	return false, true, nil
 }
 
 // SetJobItemRemovalForCaller marks or unmarks a sync job item for removal if the caller owns its parent job or is admin.
-func (h *Handler) SetJobItemRemovalForCaller(ctx context.Context, itemID string, remove bool, callerID string, isAdmin bool) (found, allowed bool) {
+func (h *Handler) SetJobItemRemovalForCaller(ctx context.Context, itemID string, remove bool, callerID string, isAdmin bool) (found, allowed bool, err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -337,7 +339,7 @@ func (h *Handler) SetJobItemRemovalForCaller(ctx context.Context, itemID string,
 			if !isAdmin {
 				j, ok := h.findJobLocked(jobID)
 				if !ok || !callerCanAccessJob(j, callerID, isAdmin) {
-					return true, false
+					return true, false, nil
 				}
 			}
 			snapshot := cloneSyncState(h.state)
@@ -349,11 +351,12 @@ func (h *Handler) SetJobItemRemovalForCaller(ctx context.Context, itemID string,
 			h.recomputeJobLocked(jobID)
 			if err := h.saveStateLocked(ctx); err != nil {
 				h.state = snapshot
+				return true, true, err
 			}
-			return true, true
+			return true, true, nil
 		}
 	}
-	return false, true
+	return false, true, nil
 }
 
 // CancelItemsForCaller cancels matching sync job items owned by the caller (or any user when isAdmin).
@@ -362,8 +365,8 @@ func (h *Handler) CancelItemsForCaller(ctx context.Context, targetID string, ite
 	targetID = strings.TrimSpace(targetID)
 	idSet := make(map[string]struct{}, len(itemIDs))
 	for _, id := range itemIDs {
-		if trimmed := strings.TrimSpace(id); trimmed != "" {
-			idSet[trimmed] = struct{}{}
+		if norm := guid.Normalize(id); norm != "" {
+			idSet[norm] = struct{}{}
 		}
 	}
 	if targetID == "" && len(idSet) == 0 {
@@ -385,7 +388,7 @@ func (h *Handler) CancelItemsForCaller(ctx context.Context, targetID string, ite
 
 	for _, it := range h.state.JobItems {
 		targetMatch := targetID == "" || it.TargetId == targetID
-		_, itemMatch := idSet[it.ItemId]
+		_, itemMatch := idSet[guid.Normalize(it.ItemId)]
 		if targetMatch && (len(idSet) == 0 || itemMatch) {
 			if !isAdmin {
 				j, ok := jobByID[it.JobId]
@@ -448,8 +451,9 @@ func (h *Handler) GetItemStatusForCaller(itemID, targetID, callerID string, isAd
 	for _, j := range h.state.Jobs {
 		jobByID[j.Id] = j
 	}
+	normItemID := guid.Normalize(itemID)
 	for _, ji := range h.state.JobItems {
-		if ji.ItemId == itemID && (targetID == "" || ji.TargetId == targetID) {
+		if guid.Normalize(ji.ItemId) == normItemID && (targetID == "" || ji.TargetId == targetID) {
 			if !isAdmin {
 				j, ok := jobByID[ji.JobId]
 				if !ok || !callerCanAccessJob(j, callerID, isAdmin) {
@@ -637,6 +641,20 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	if req.ItemIds == nil {
 		req.ItemIds = []string{}
 	}
+	dedupedItemIDs := make([]string, 0, len(req.ItemIds))
+	seenReqIDs := make(map[string]struct{}, len(req.ItemIds))
+	for _, rawID := range req.ItemIds {
+		normID := guid.Normalize(rawID)
+		if normID == "" {
+			continue
+		}
+		if _, dup := seenReqIDs[normID]; dup {
+			continue
+		}
+		seenReqIDs[normID] = struct{}{}
+		dedupedItemIDs = append(dedupedItemIDs, normID)
+	}
+	req.ItemIds = dedupedItemIDs
 
 	now := time.Now().UTC()
 	job := SyncJob{
@@ -666,18 +684,25 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	libRepo := h.getLibraryRepo()
 	serverID := h.serverID()
 	createdItems := make([]SyncJobItem, 0, len(req.ItemIds))
-	for i, itemID := range req.ItemIds {
-		itemName := "Item " + strconv.Itoa(i+1)
-		outputPath := ""
-		mediaSourceID := ""
-		if libRepo != nil {
+	if libRepo == nil {
+		for i, itemID := range req.ItemIds {
+			createdItems = append(createdItems, SyncJobItem{
+				Id:       guid.New(),
+				JobId:    job.Id,
+				ItemId:   itemID,
+				ItemName: "Item " + strconv.Itoa(i+1),
+				TargetId: job.TargetId,
+				Status:   "ReadyToTransfer",
+			})
+		}
+	} else {
+		expandedIDs := make([]string, 0, len(req.ItemIds))
+		seenExpanded := make(map[string]struct{}, len(req.ItemIds))
+		visitedContainers := make(map[string]struct{})
+		for _, itemID := range req.ItemIds {
 			rec, recErr := libRepo.GetItemRecordByID(r.Context(), itemID)
 			if recErr != nil || rec == nil {
 				continue
-			}
-			if rec.IsStrm || strings.EqualFold(filepath.Ext(rec.Path), ".strm") {
-				httpx.Error(w, http.StatusBadRequest, "STRM items cannot be synced")
-				return
 			}
 			if callerUser != nil && !callerUser.IsAdmin && !callerUser.Policy.IsAdministrator {
 				if !h.canUserAccessItemRecord(r.Context(), libRepo, callerUser, rec) {
@@ -685,6 +710,25 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+			if isSyncContainerType(rec.Type) {
+				h.expandSyncContainer(r.Context(), libRepo, serverID, job.UserId, callerUser, rec, visitedContainers, seenExpanded, &expandedIDs)
+				continue
+			}
+			if rec.IsStrm || strings.EqualFold(filepath.Ext(rec.Path), ".strm") {
+				httpx.Error(w, http.StatusBadRequest, "STRM items cannot be synced")
+				return
+			}
+			normRecID := guid.Normalize(rec.ID)
+			if _, exists := seenExpanded[normRecID]; !exists && len(expandedIDs) < maxSyncJobItemIDs {
+				seenExpanded[normRecID] = struct{}{}
+				expandedIDs = append(expandedIDs, rec.ID)
+			}
+		}
+
+		for i, itemID := range expandedIDs {
+			itemName := "Item " + strconv.Itoa(i+1)
+			outputPath := ""
+			mediaSourceID := ""
 			itemDTO, err := libRepo.GetItemByID(r.Context(), serverID, job.UserId, itemID)
 			if err != nil || itemDTO == nil {
 				continue
@@ -704,17 +748,17 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 			} else if itemDTO.Id != "" {
 				mediaSourceID = itemDTO.Id
 			}
+			createdItems = append(createdItems, SyncJobItem{
+				Id:          guid.New(),
+				JobId:       job.Id,
+				ItemId:      itemID,
+				ItemName:    itemName,
+				TargetId:    job.TargetId,
+				Status:      "ReadyToTransfer",
+				OutputPath:  outputPath,
+				MediaSource: mediaSourceID,
+			})
 		}
-		createdItems = append(createdItems, SyncJobItem{
-			Id:          guid.New(),
-			JobId:       job.Id,
-			ItemId:      itemID,
-			ItemName:    itemName,
-			TargetId:    job.TargetId,
-			Status:      "ReadyToTransfer",
-			OutputPath:  outputPath,
-			MediaSource: mediaSourceID,
-		})
 	}
 	if libRepo != nil && len(req.ItemIds) > 0 && len(createdItems) == 0 {
 		httpx.Error(w, http.StatusNotFound, "no matching library items found")
@@ -1233,6 +1277,140 @@ func (h *Handler) handleReadyItems(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, ready)
 }
 
+func isSyncContainerType(itemType string) bool {
+	switch strings.ToLower(strings.TrimSpace(itemType)) {
+	case "series", "season", "playlist", "boxset", "folder", "musicartist", "musicalbum", "collectionfolder":
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Handler) expandSyncContainer(
+	ctx context.Context,
+	libRepo *sqlite.LibraryRepo,
+	serverID, userID string,
+	callerUser *sqlite.UserRecord,
+	container *sqlite.ItemRecord,
+	visited map[string]struct{},
+	seenExpanded map[string]struct{},
+	out *[]string,
+) {
+	if container == nil || len(*out) >= maxSyncJobItemIDs {
+		return
+	}
+	normContainerID := guid.Normalize(container.ID)
+	if normContainerID == "" {
+		return
+	}
+	if _, seen := visited[normContainerID]; seen {
+		return
+	}
+	visited[normContainerID] = struct{}{}
+
+	var childIDs []string
+	seenChild := make(map[string]struct{})
+	addChildID := func(id string) {
+		norm := guid.Normalize(id)
+		if norm == "" || norm == normContainerID {
+			return
+		}
+		if _, ok := seenChild[norm]; ok {
+			return
+		}
+		seenChild[norm] = struct{}{}
+		childIDs = append(childIDs, id)
+	}
+
+	switch strings.ToLower(strings.TrimSpace(container.Type)) {
+	case "playlist", "boxset":
+		if entries, _, err := libRepo.GetContainerItems(ctx, serverID, userID, container.ID, 0, maxSyncJobItemIDs, nil); err == nil {
+			for _, e := range entries {
+				addChildID(e.Id)
+			}
+		}
+	case "series":
+		if items, _, err := libRepo.QueryItems(ctx, sqlite.ItemFilter{
+			ServerID: serverID,
+			SeriesID: container.ID,
+			Limit:    maxSyncJobItemIDs,
+		}); err == nil {
+			for _, it := range items {
+				addChildID(it.Id)
+			}
+		}
+		if items, _, err := libRepo.QueryItems(ctx, sqlite.ItemFilter{
+			ServerID:  serverID,
+			ParentID:  container.ID,
+			Recursive: true,
+			Limit:     maxSyncJobItemIDs,
+		}); err == nil {
+			for _, it := range items {
+				addChildID(it.Id)
+			}
+		}
+	case "season":
+		if items, _, err := libRepo.QueryItems(ctx, sqlite.ItemFilter{
+			ServerID: serverID,
+			SeasonID: container.ID,
+			Limit:    maxSyncJobItemIDs,
+		}); err == nil {
+			for _, it := range items {
+				addChildID(it.Id)
+			}
+		}
+		if items, _, err := libRepo.QueryItems(ctx, sqlite.ItemFilter{
+			ServerID:  serverID,
+			ParentID:  container.ID,
+			Recursive: true,
+			Limit:     maxSyncJobItemIDs,
+		}); err == nil {
+			for _, it := range items {
+				addChildID(it.Id)
+			}
+		}
+	default:
+		if items, _, err := libRepo.QueryItems(ctx, sqlite.ItemFilter{
+			ServerID:  serverID,
+			ParentID:  container.ID,
+			Recursive: true,
+			Limit:     maxSyncJobItemIDs,
+		}); err == nil {
+			for _, it := range items {
+				addChildID(it.Id)
+			}
+		}
+	}
+
+	for _, cid := range childIDs {
+		if len(*out) >= maxSyncJobItemIDs {
+			return
+		}
+		childRec, err := libRepo.GetItemRecordByID(ctx, cid)
+		if err != nil || childRec == nil {
+			continue
+		}
+		if callerUser != nil && !callerUser.IsAdmin && !callerUser.Policy.IsAdministrator {
+			if !h.canUserAccessItemRecord(ctx, libRepo, callerUser, childRec) {
+				continue
+			}
+		}
+		if isSyncContainerType(childRec.Type) {
+			h.expandSyncContainer(ctx, libRepo, serverID, userID, callerUser, childRec, visited, seenExpanded, out)
+			continue
+		}
+		if childRec.IsStrm || strings.EqualFold(filepath.Ext(childRec.Path), ".strm") {
+			continue
+		}
+		normChildID := guid.Normalize(childRec.ID)
+		if _, dup := seenExpanded[normChildID]; dup {
+			continue
+		}
+		seenExpanded[normChildID] = struct{}{}
+		*out = append(*out, childRec.ID)
+	}
+}
+
 func (h *Handler) handleSyncData(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		LocalItemIds []string `json:"LocalItemIds"`
@@ -1260,13 +1438,20 @@ func (h *Handler) handleSyncData(w http.ResponseWriter, r *http.Request) {
 		if req.TargetId != "" && ji.TargetId != req.TargetId {
 			continue
 		}
-		active[ji.ItemId] = struct{}{}
+		switch strings.ToLower(strings.TrimSpace(ji.Status)) {
+		case "removing", "cancelled", "failed":
+			continue
+		}
+		if normID := guid.Normalize(ji.ItemId); normID != "" {
+			active[normID] = struct{}{}
+		}
 	}
 	h.mu.RUnlock()
 
 	toRemove := make([]string, 0)
 	for _, localID := range req.LocalItemIds {
-		if _, ok := active[localID]; !ok {
+		normLocal := guid.Normalize(localID)
+		if _, ok := active[normLocal]; !ok {
 			toRemove = append(toRemove, localID)
 		}
 	}

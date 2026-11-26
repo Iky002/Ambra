@@ -85,12 +85,12 @@ describe('Stream 4 (v0.9.0): Multi-Select Batch Actions, Backup & Restore UI, Re
     const wrapper = quickBtn.parentElement
     expect(wrapper).toBeTruthy()
     expect(wrapper?.className).toContain('opacity-100')
-    expect(wrapper?.className).toContain('sm:opacity-0')
-    expect(wrapper?.className).toContain('sm:pointer-events-none')
-    expect(wrapper?.className).toContain('sm:group-hover:opacity-100')
-    expect(wrapper?.className).toContain('sm:group-hover:pointer-events-auto')
-    expect(wrapper?.className).toContain('sm:focus-within:opacity-100')
-    expect(wrapper?.className).toContain('sm:focus-within:pointer-events-auto')
+    expect(wrapper?.className).toContain('[@media(hover:hover)]:opacity-0')
+    expect(wrapper?.className).toContain('[@media(hover:hover)]:pointer-events-none')
+    expect(wrapper?.className).toContain('[@media(hover:hover)]:group-hover:opacity-100')
+    expect(wrapper?.className).toContain('[@media(hover:hover)]:group-hover:pointer-events-auto')
+    expect(wrapper?.className).toContain('[@media(hover:hover)]:focus-within:opacity-100')
+    expect(wrapper?.className).toContain('[@media(hover:hover)]:focus-within:pointer-events-auto')
     expect(container).toBeTruthy()
   })
 
@@ -210,7 +210,7 @@ describe('Stream 4 (v0.9.0): Multi-Select Batch Actions, Backup & Restore UI, Re
     await screen.findByText(/已暂存恢复文件/)
   })
 
-  it('DashboardTab 发消息弹窗空内容展示内联校验错误且默认回退版本为 v0.10.6', async () => {
+  it('DashboardTab 发消息弹窗空内容展示内联校验错误且默认回退版本为 v0.10.9', async () => {
     vi.spyOn(api, 'getSystemInfo').mockResolvedValue({
       Id: 'srv-1',
       ServerName: 'Ambra Test',
@@ -219,7 +219,7 @@ describe('Stream 4 (v0.9.0): Multi-Select Batch Actions, Backup & Restore UI, Re
 
     renderWithProviders(<DashboardTab />, ['/admin/dashboard'])
 
-    await screen.findByText('v0.10.6')
+    await screen.findByText('v0.10.9')
 
     const msgBtns = await screen.findAllByRole('button', { name: '发消息' })
     fireEvent.click(msgBtns[0])

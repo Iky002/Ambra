@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Loader2, Puzzle, RefreshCw, RotateCcw, SlidersHorizontal, Trash2 } from 'lucide-react'
 import { api } from '../../api/client'
@@ -31,6 +31,11 @@ const TMDB_LANGUAGES = [
   { value: 'en-US', label: 'English (en-US)' },
   { value: 'ja-JP', label: '日本語 (ja-JP)' },
   { value: 'ko-KR', label: '한국어 (ko-KR)' },
+  { value: 'es-ES', label: 'Español (es-ES)' },
+  { value: 'de-DE', label: 'Deutsch (de-DE)' },
+  { value: 'fr-FR', label: 'Français (fr-FR)' },
+  { value: 'pt-BR', label: 'Português (pt-BR)' },
+  { value: 'th-TH', label: 'ไทย (th-TH)' },
 ]
 
 const TVDB_LANGUAGES = [
@@ -56,6 +61,8 @@ export function PluginsTab() {
   const [editingPlugin, setEditingPlugin] = useState<PluginInfo | null>(null)
   const [loadingConfig, setLoadingConfig] = useState(false)
   const [savingConfig, setSavingConfig] = useState(false)
+  const [modalError, setModalError] = useState<string | null>(null)
+  const loadSeqRef = useRef(0)
 
   // 通用与扩展配置字段
   const [enabled, setEnabled] = useState(true)
@@ -98,8 +105,17 @@ export function PluginsTab() {
   const isStrmPlugin = (p: PluginInfo | null) =>
     Boolean(p && `${p.Id} ${p.Name}`.toLowerCase().includes('strm'))
 
+  const closeConfigModal = () => {
+    loadSeqRef.current += 1
+    setEditingPlugin(null)
+    setLoadingConfig(false)
+    setModalError(null)
+  }
+
   const openConfigModal = async (plugin: PluginInfo) => {
+    const seq = ++loadSeqRef.current
     setEditingPlugin(plugin)
+    setModalError(null)
     setEnabled(plugin.Enabled !== false)
     setPriority(plugin.Priority ?? 10)
     setTmdbApiKey('')
@@ -119,6 +135,7 @@ export function PluginsTab() {
 
     try {
       const cfg = await api.getPluginConfiguration(plugin.Id)
+      if (seq !== loadSeqRef.current) return
       if (cfg && typeof cfg === 'object') {
         if (typeof cfg.enabled === 'boolean') setEnabled(cfg.enabled)
         else if (typeof cfg.Enabled === 'boolean') setEnabled(cfg.Enabled)
@@ -126,25 +143,41 @@ export function PluginsTab() {
         if (typeof cfg.priority === 'number') setPriority(cfg.priority)
         else if (typeof cfg.Priority === 'number') setPriority(cfg.Priority)
 
-        const apiKeyVal =
-          (cfg.api_key as string) ||
-          (cfg.ApiKey as string) ||
-          (cfg.tmdb_api_key as string) ||
-          (cfg.TMDBApiKey as string) ||
-          ''
-        if (apiKeyVal === MASKED_PLUGIN_SECRET) {
-          setTmdbApiKey('')
-          setTmdbApiKeyConfigured(true)
-        } else if (apiKeyVal) {
-          setTmdbApiKey(apiKeyVal)
-        }
+        const rest: Record<string, unknown> = { ...cfg }
+        delete rest.Enabled
+        delete rest.enabled
+        delete rest.Priority
+        delete rest.priority
 
-        const langVal =
-          (cfg.language as string) ||
-          (cfg.Language as string) ||
-          (cfg.TMDBLanguage as string) ||
-          ''
-        if (langVal) setTmdbLanguage(langVal)
+        if (isTmdbPlugin(plugin)) {
+          const apiKeyVal =
+            (cfg.api_key as string) ||
+            (cfg.ApiKey as string) ||
+            (cfg.tmdb_api_key as string) ||
+            (cfg.TMDBApiKey as string) ||
+            ''
+          if (apiKeyVal === MASKED_PLUGIN_SECRET) {
+            setTmdbApiKey('')
+            setTmdbApiKeyConfigured(true)
+          } else if (apiKeyVal) {
+            setTmdbApiKey(apiKeyVal)
+          }
+
+          const langVal =
+            (cfg.language as string) ||
+            (cfg.Language as string) ||
+            (cfg.TMDBLanguage as string) ||
+            ''
+          if (langVal) setTmdbLanguage(langVal)
+
+          delete rest.ApiKey
+          delete rest.api_key
+          delete rest.TMDBApiKey
+          delete rest.tmdb_api_key
+          delete rest.Language
+          delete rest.language
+          delete rest.TMDBLanguage
+        }
 
         if (isTvdbPlugin(plugin)) {
           const tvdbKeyVal =
@@ -180,26 +213,11 @@ export function PluginsTab() {
             (cfg.TVDBLanguage as string) ||
             ''
           if (tvdbLangVal) setTvdbLanguage(tvdbLangVal)
-        }
 
-        if (typeof cfg.enable_302 === 'boolean') setEnable302(cfg.enable_302)
-        else if (typeof cfg.Enable302 === 'boolean') setEnable302(cfg.Enable302)
-
-        const rest: Record<string, unknown> = { ...cfg }
-        delete rest.Enabled
-        delete rest.enabled
-        delete rest.Priority
-        delete rest.priority
-        delete rest.ApiKey
-        delete rest.api_key
-        delete rest.TMDBApiKey
-        delete rest.tmdb_api_key
-        delete rest.Language
-        delete rest.language
-        delete rest.TMDBLanguage
-        delete rest.Enable302
-        delete rest.enable_302
-        if (isTvdbPlugin(plugin)) {
+          delete rest.ApiKey
+          delete rest.api_key
+          delete rest.Language
+          delete rest.language
           delete rest.pin
           delete rest.Pin
           delete rest.tvdb_pin
@@ -209,6 +227,15 @@ export function PluginsTab() {
           delete rest.tvdb_language
           delete rest.TVDBLanguage
         }
+
+        if (isStrmPlugin(plugin)) {
+          if (typeof cfg.enable_302 === 'boolean') setEnable302(cfg.enable_302)
+          else if (typeof cfg.Enable302 === 'boolean') setEnable302(cfg.Enable302)
+
+          delete rest.Enable302
+          delete rest.enable_302
+        }
+
         if (isTraktPlugin(plugin)) {
           delete rest.client_id
           delete rest.ClientId
@@ -223,9 +250,12 @@ export function PluginsTab() {
         setExtraJson(Object.keys(rest).length > 0 ? JSON.stringify(rest, null, 2) : '{}')
       }
     } catch {
+      if (seq !== loadSeqRef.current) return
       // 如果服务端暂未返回已有配置，保留 Manifest 默认值
     } finally {
-      setLoadingConfig(false)
+      if (seq === loadSeqRef.current) {
+        setLoadingConfig(false)
+      }
     }
   }
 
@@ -240,11 +270,11 @@ export function PluginsTab() {
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
           parsedExtra = parsed as Record<string, unknown>
         } else {
-          setFeedback({ type: 'error', message: '高级 JSON 配置必须是对象格式 {}' })
+          setModalError('高级 JSON 配置必须是对象格式 {}')
           return
         }
       } catch {
-        setFeedback({ type: 'error', message: '高级 JSON 配置语法错误，请检查格式' })
+        setModalError('高级 JSON 配置语法错误，请检查格式')
         return
       }
     }
@@ -296,17 +326,15 @@ export function PluginsTab() {
     }
 
     setSavingConfig(true)
+    setModalError(null)
     setFeedback(null)
     try {
       await api.updatePluginConfiguration(editingPlugin.Id, payload)
       await queryClient.invalidateQueries({ queryKey: ['admin', 'plugins'] })
       setFeedback({ type: 'success', message: `已保存插件「${editingPlugin.Name}」配置` })
-      setEditingPlugin(null)
+      closeConfigModal()
     } catch (err) {
-      setFeedback({
-        type: 'error',
-        message: err instanceof Error ? err.message : '保存插件配置失败',
-      })
+      setModalError(err instanceof Error ? err.message : '保存插件配置失败')
     } finally {
       setSavingConfig(false)
     }
@@ -447,7 +475,7 @@ export function PluginsTab() {
         title={`配置插件 · ${editingPlugin?.Name || ''}`}
         subtitle={`ID: ${editingPlugin?.Id || ''}`}
         maxWidthClass="max-w-lg"
-        onClose={() => setEditingPlugin(null)}
+        onClose={closeConfigModal}
       >
         {loadingConfig ? (
           <div className="flex h-36 items-center justify-center">
@@ -455,6 +483,11 @@ export function PluginsTab() {
           </div>
         ) : (
           <form onSubmit={handleSaveConfig} className="space-y-4">
+            <FeedbackBanner
+              message={modalError ?? undefined}
+              type="error"
+              onClose={() => setModalError(null)}
+            />
             <ToggleSwitch
               checked={enabled}
               onChange={setEnabled}
@@ -707,7 +740,7 @@ export function PluginsTab() {
             <div className="flex justify-end gap-2 pt-2">
               <button
                 type="button"
-                onClick={() => setEditingPlugin(null)}
+                onClick={closeConfigModal}
                 className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
               >
                 取消

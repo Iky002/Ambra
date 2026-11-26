@@ -367,8 +367,8 @@ func TestSyncTargetsIsolationItemValidationReadyFilterAndCallerHelpers(t *testin
 	}
 
 	// 4. Exported caller helpers enforce RBAC and empty-filter no-op
-	if found, allowed := h.SetJobItemRemovalForCaller(ctx, "ji-synced", true, bobAC.UserID(), false); !found || allowed {
-		t.Fatalf("expected Bob denied on SetJobItemRemovalForCaller, got found=%v allowed=%v", found, allowed)
+	if found, allowed, err := h.SetJobItemRemovalForCaller(ctx, "ji-synced", true, bobAC.UserID(), false); err != nil || !found || allowed {
+		t.Fatalf("expected Bob denied on SetJobItemRemovalForCaller, got found=%v allowed=%v err=%v", found, allowed, err)
 	}
 	if err := h.CancelItemsForCaller(ctx, "", nil, aliceAC.UserID(), false); err != nil {
 		t.Fatalf("empty cancel should be no-op, got err=%v", err)
@@ -376,11 +376,11 @@ func TestSyncTargetsIsolationItemValidationReadyFilterAndCallerHelpers(t *testin
 	if err := h.CancelItemsForCaller(ctx, "dev-alice", []string{validItemID}, bobAC.UserID(), false); err != ErrForbidden {
 		t.Fatalf("expected ErrForbidden when Bob cancels Alice's items, got %v", err)
 	}
-	if found, allowed := h.DeleteJobForCaller(ctx, created.Job.Id, bobAC.UserID(), false); !found || allowed {
-		t.Fatalf("expected Bob denied on DeleteJobForCaller, got found=%v allowed=%v", found, allowed)
+	if found, allowed, err := h.DeleteJobForCaller(ctx, created.Job.Id, bobAC.UserID(), false); err != nil || !found || allowed {
+		t.Fatalf("expected Bob denied on DeleteJobForCaller, got found=%v allowed=%v err=%v", found, allowed, err)
 	}
-	if found, allowed := h.DeleteJobForCaller(ctx, created.Job.Id, aliceAC.UserID(), false); !found || !allowed {
-		t.Fatalf("expected Alice allowed on DeleteJobForCaller, got found=%v allowed=%v", found, allowed)
+	if found, allowed, err := h.DeleteJobForCaller(ctx, created.Job.Id, aliceAC.UserID(), false); err != nil || !found || !allowed {
+		t.Fatalf("expected Alice allowed on DeleteJobForCaller, got found=%v allowed=%v err=%v", found, allowed, err)
 	}
 
 	// 5. Security hardening: STRM rejected, non-admin download policy/library ACL/parental enforced, absolute paths stripped

@@ -319,7 +319,21 @@ type authenticateByNameRequest struct {
 	Password string `json:"Password"` // Legacy SHA1 field
 }
 
+const emptyPasswordSHA1 = "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+
+func verifyUserPassword(u *sqlite.UserRecord, pw, legacySHA1 string) bool {
+	if u == nil {
+		return false
+	}
+	if u.PasswordHash == "" {
+		return pw == "" && (legacySHA1 == "" || strings.EqualFold(legacySHA1, emptyPasswordSHA1))
+	}
+	ok, err := auth.VerifyPassword(pw, u.PasswordHash)
+	return err == nil && ok
+}
+
 func (h *Handler) AuthenticateByName(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "private, no-store")
 	now := time.Now().UTC()
 	ip := netutil.ClientIP(r)
 	if h.isIPRateLimited(ip, now) {
@@ -335,6 +349,38 @@ func (h *Handler) AuthenticateByName(w http.ResponseWriter, r *http.Request) {
 	if !h.checkAuthRateLimitForLogin(ip, req.Username, now) {
 		httpx.Error(w, http.StatusTooManyRequests, "Too many authentication attempts")
 		return
+	}
+	if h.userRepo != nil && !netutil.IsLocalOrLANRequest(r) {
+		if u, lookupErr := h.userRepo.GetUserByName(r.Context(), strings.TrimSpace(req.Username)); lookupErr == nil && u != nil && !u.Policy.EnableRemoteAccess {
+			if !verifyUserPassword(u, req.Pw, req.Password) {
+				_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+					Name:     u.Name + " failed to log in",
+					Type:     "AuthenticationFailed",
+					UserID:   u.ID,
+					Severity: "Warning",
+				})
+				httpx.Error(w, http.StatusUnauthorized, "Invalid username or password")
+				return
+			}
+			if u.IsDisabled || u.Policy.IsDisabled {
+				_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+					Name:     u.Name + " failed to log in (account disabled)",
+					Type:     "AuthenticationFailed",
+					UserID:   u.ID,
+					Severity: "Warning",
+				})
+				httpx.Error(w, http.StatusForbidden, "User account is disabled")
+				return
+			}
+			_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+				Name:     u.Name + " failed to log in (remote access disabled)",
+				Type:     "AuthenticationFailed",
+				UserID:   u.ID,
+				Severity: "Warning",
+			})
+			httpx.Error(w, http.StatusForbidden, "Remote access is disabled for this user")
+			return
+		}
 	}
 	client := middleware.ExtractClientInfo(r)
 	res, err := h.authSvc.AuthenticateByName(r.Context(), req.Username, req.Pw, req.Password, client)
@@ -661,6 +707,7 @@ type APIKeyDto struct {
 }
 
 func (h *Handler) ListAPIKeys(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "private, no-store")
 	keys, err := h.authSvc.ListAPIKeys(r.Context())
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to list api keys")
@@ -682,6 +729,7 @@ func (h *Handler) ListAPIKeys(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) CreateAPIKey(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "private, no-store")
 	q := httpx.ParseQuery(r)
 	appName := q.Get("App")
 	if appName == "" && r.Body != nil {

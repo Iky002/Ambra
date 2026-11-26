@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Award,
@@ -79,9 +79,19 @@ export function MetadataEditorModal({
   const [lockData, setLockData] = useState(false)
   const [locking, setLocking] = useState(false)
   const [writingNfo, setWritingNfo] = useState(false)
+  const prevOpenRef = useRef(false)
+  const prevItemIdRef = useRef<string | null>(null)
 
   useEffect(() => {
-    if (!open || !item) return
+    if (!open || !item) {
+      prevOpenRef.current = false
+      prevItemIdRef.current = null
+      return
+    }
+    const shouldInitialize = !prevOpenRef.current || prevItemIdRef.current !== item.Id
+    prevOpenRef.current = true
+    prevItemIdRef.current = item.Id
+    if (!shouldInitialize) return
     setName(item.Name || '')
     setOriginalTitle(item.OriginalTitle || '')
     setSortName(item.SortName || '')

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -79,6 +80,14 @@ func (h *Handler) syncFromRegistry() {
 }
 
 func (h *Handler) findPlugin(id string) (plugins.Plugin, bool) {
+	if h.registry != nil {
+		if p, ok := h.registry.Get(id); ok && p != nil {
+			h.mu.Lock()
+			h.tracked[id] = p
+			h.mu.Unlock()
+			return p, true
+		}
+	}
 	h.mu.RLock()
 	p, ok := h.tracked[id]
 	h.mu.RUnlock()
@@ -247,12 +256,28 @@ func (h *Handler) handleUpdateConfiguration(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		prev = map[string]any{}
 	}
-	merged := mergePluginConfig(prev, incoming)
+	prevForMerge := prev
+	hostChanged := configURLHostChanged(prev, incoming)
+	var clearedSensitiveKeys []string
+	if hostChanged {
+		prevForMerge, clearedSensitiveKeys = stripSensitiveKeys(prev)
+	}
+	merged := mergePluginConfig(prevForMerge, incoming)
 	if filter, ok := p.(plugins.ServerConfigFilter); ok {
 		merged = filter.FilterServerConfig(merged)
 	}
 
-	if err := p.Configure(cloneMap(merged)); err != nil {
+	cfgForConfigure := cloneMap(merged)
+	if hostChanged && len(clearedSensitiveKeys) > 0 {
+		for _, sk := range clearedSensitiveKeys {
+			if _, exists := cfgForConfigure[sk]; !exists {
+				cfgForConfigure[sk] = ""
+			}
+		}
+	}
+
+	if err := p.Configure(cfgForConfigure); err != nil {
+		_ = p.Configure(cloneMap(prev))
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -296,6 +321,7 @@ func (h *Handler) handleEnablePlugin(w http.ResponseWriter, r *http.Request) {
 	merged["enabled"] = enabled
 
 	if err := p.Configure(cloneMap(merged)); err != nil {
+		_ = p.Configure(cloneMap(prev))
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -329,6 +355,7 @@ func (h *Handler) handleDeletePlugin(w http.ResponseWriter, r *http.Request) {
 	merged["enabled"] = false
 
 	if err := p.Configure(cloneMap(merged)); err != nil {
+		_ = p.Configure(cloneMap(prev))
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -395,10 +422,108 @@ func (h *Handler) saveConfig(ctx context.Context, id string, cfg map[string]any)
 
 func isSensitiveConfigKey(k string) bool {
 	lk := strings.ToLower(strings.TrimSpace(k))
-	return strings.Contains(lk, "key") ||
+	if strings.Contains(lk, "key") ||
 		strings.Contains(lk, "secret") ||
 		strings.Contains(lk, "token") ||
-		strings.Contains(lk, "password")
+		strings.Contains(lk, "password") ||
+		strings.Contains(lk, "credential") ||
+		strings.Contains(lk, "authorization") ||
+		strings.Contains(lk, "cookie") {
+		return true
+	}
+	if lk == "pin" || strings.HasSuffix(lk, "_pin") || strings.HasSuffix(lk, "-pin") {
+		return true
+	}
+	if strings.HasSuffix(lk, "pin") && (strings.Contains(lk, "tvdb") || strings.Contains(lk, "user") || strings.Contains(lk, "auth") || strings.Contains(lk, "api") || strings.Contains(lk, "access")) {
+		return true
+	}
+	return false
+}
+
+func isURLOrHostConfigKey(k string) bool {
+	norm := normalizeConfigKeyLookup(k)
+	if norm == "" {
+		return false
+	}
+	switch norm {
+	case "baseurl", "endpoint", "imagebaseurl", "apiurl", "serverurl", "url", "host", "apihost", "basehost", "endpointurl":
+		return true
+	}
+	return strings.HasSuffix(norm, "url") || strings.HasSuffix(norm, "endpoint") || strings.HasSuffix(norm, "host")
+}
+
+func extractURLHostLower(v any) string {
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return ""
+	}
+	if u, err := url.Parse(trimmed); err == nil && u.Host != "" {
+		return strings.ToLower(u.Host)
+	}
+	if !strings.Contains(trimmed, "://") && !strings.ContainsAny(trimmed, " \t\r\n/") {
+		return strings.ToLower(trimmed)
+	}
+	return ""
+}
+
+func configURLHostChanged(prev, incoming map[string]any) bool {
+	if len(incoming) == 0 {
+		return false
+	}
+	prevByNorm := make(map[string]any, len(prev))
+	for k, v := range prev {
+		prevByNorm[normalizeConfigKeyLookup(k)] = v
+	}
+	for k, v := range incoming {
+		norm := normalizeConfigKeyLookup(k)
+		prevVal, hasPrev := prevByNorm[norm]
+		if subIn, ok := v.(map[string]any); ok {
+			var subPrev map[string]any
+			if hasPrev {
+				subPrev, _ = prevVal.(map[string]any)
+			}
+			if configURLHostChanged(subPrev, subIn) {
+				return true
+			}
+			continue
+		}
+		if !isURLOrHostConfigKey(k) {
+			continue
+		}
+		newHost := extractURLHostLower(v)
+		oldHost := ""
+		if hasPrev {
+			oldHost = extractURLHostLower(prevVal)
+		}
+		if newHost != oldHost {
+			return true
+		}
+	}
+	return false
+}
+
+func stripSensitiveKeys(src map[string]any) (map[string]any, []string) {
+	out := make(map[string]any, len(src))
+	var cleared []string
+	for k, v := range src {
+		if isSensitiveConfigKey(k) {
+			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+				cleared = append(cleared, k)
+			}
+			continue
+		}
+		if sub, ok := v.(map[string]any); ok {
+			cleanedSub, _ := stripSensitiveKeys(sub)
+			out[k] = cleanedSub
+			continue
+		}
+		out[k] = cloneValue(v)
+	}
+	return out, cleared
 }
 
 func normalizeConfigKeyLookup(k string) string {
@@ -470,6 +595,8 @@ func mergePluginConfigInternal(prev, incoming map[string]any, forceSensitive boo
 				if oldStr, okOld := merged[targetKey].(string); okOld && strings.TrimSpace(oldStr) != "" {
 					continue
 				}
+				// Never persist literal masked placeholder "********" when no prior secret exists.
+				continue
 			}
 			// Explicit empty string "" clears any previously saved secret instead of preserving it.
 			merged[targetKey] = val
@@ -477,13 +604,13 @@ func mergePluginConfigInternal(prev, incoming map[string]any, forceSensitive boo
 			if prevMap, okPrev := merged[targetKey].(map[string]any); okPrev {
 				merged[targetKey] = mergePluginConfigInternal(prevMap, val, keySensitive)
 			} else {
-				merged[targetKey] = cloneMap(val)
+				merged[targetKey] = mergePluginConfigInternal(map[string]any{}, val, keySensitive)
 			}
 		case []any:
 			if prevSlice, okPrev := merged[targetKey].([]any); okPrev {
 				merged[targetKey] = mergePluginSlice(prevSlice, val, keySensitive)
 			} else {
-				merged[targetKey] = cloneSlice(val)
+				merged[targetKey] = mergePluginSlice(nil, val, keySensitive)
 			}
 		default:
 			merged[targetKey] = cloneValue(v)
@@ -505,11 +632,15 @@ func mergePluginSlice(prev, incoming []any, forceSensitive bool) []any {
 		}
 		switch val := elem.(type) {
 		case string:
-			if forceSensitive && strings.TrimSpace(val) == maskedSecret && hasPrev {
-				if oldStr, okOld := prevElem.(string); okOld && strings.TrimSpace(oldStr) != "" {
-					out[i] = oldStr
-					continue
+			if forceSensitive && strings.TrimSpace(val) == maskedSecret {
+				if hasPrev {
+					if oldStr, okOld := prevElem.(string); okOld && strings.TrimSpace(oldStr) != "" {
+						out[i] = oldStr
+						continue
+					}
 				}
+				out[i] = ""
+				continue
 			}
 			out[i] = val
 		case map[string]any:

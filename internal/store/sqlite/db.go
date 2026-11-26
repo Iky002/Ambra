@@ -236,23 +236,29 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 	}
-	tx, err := s.Writer.BeginTx(ctx, nil)
-	if err != nil {
+	var v6 int
+	if err := s.Writer.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 6`).Scan(&v6); err != nil {
 		return err
 	}
-	defer tx.Rollback()
-	traktSQL, err := migrationsFS.ReadFile("migrations/006_user_trakt.sql")
-	if err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, string(traktSQL)); err != nil {
-		return fmt.Errorf("migration 006 user Trakt accounts: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (6, ?)`, time.Now().Unix()); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
+	if v6 == 0 {
+		tx, err := s.Writer.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		traktSQL, err := migrationsFS.ReadFile("migrations/006_user_trakt.sql")
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, string(traktSQL)); err != nil {
+			return fmt.Errorf("migration 006 user Trakt accounts: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (6, ?)`, time.Now().Unix()); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -394,6 +400,10 @@ func (s *Store) applyMigrationV5(ctx context.Context) error {
 	}
 	rows.Close()
 
+	reservedLower := make(map[string]struct{}, len(allUsers))
+	for _, u := range allUsers {
+		reservedLower[strings.ToLower(u.name)] = struct{}{}
+	}
 	seenLower := make(map[string]struct{}, len(allUsers))
 	for _, u := range allUsers {
 		low := strings.ToLower(u.name)
@@ -403,12 +413,14 @@ func (s *Store) applyMigrationV5(ctx context.Context) error {
 		}
 		candidate := fmt.Sprintf("%s_dup_%d", u.name, u.rowid)
 		for suffix := 1; ; suffix++ {
-			if _, exists := seenLower[strings.ToLower(candidate)]; !exists {
+			if _, exists := reservedLower[strings.ToLower(candidate)]; !exists {
 				break
 			}
 			candidate = fmt.Sprintf("%s_dup_%d_%d", u.name, u.rowid, suffix)
 		}
-		seenLower[strings.ToLower(candidate)] = struct{}{}
+		candLow := strings.ToLower(candidate)
+		seenLower[candLow] = struct{}{}
+		reservedLower[candLow] = struct{}{}
 		if _, err := tx.ExecContext(ctx, `UPDATE users SET name = ? WHERE id = ?`, candidate, u.id); err != nil {
 			return fmt.Errorf("migration 005 rename duplicate user %s: %w", u.id, err)
 		}

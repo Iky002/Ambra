@@ -597,19 +597,42 @@ func (h *Handler) handleTrailers(w http.ResponseWriter, r *http.Request) {
 	var trailerParentIDs []string
 	hasPreFilteredParents := false
 	if h.userRepo != nil && h.userRepo.Store() != nil {
-		rows, qErr := h.userRepo.Store().Reader.QueryContext(r.Context(),
-			`SELECT DISTINCT parent_id FROM items WHERE extra_type = 'trailer' AND parent_id != '' LIMIT ?`,
-			maxTrailerParentsScan,
-		)
-		if qErr == nil {
+		if allowed != nil && len(allowed) == 0 {
 			hasPreFilteredParents = true
-			for rows.Next() {
-				var pid string
-				if sErr := rows.Scan(&pid); sErr == nil && pid != "" {
-					trailerParentIDs = append(trailerParentIDs, pid)
+		} else {
+			var (
+				where []string
+				args  []any
+			)
+			where = append(where, "LOWER(i.extra_type) = 'trailer'", "i.parent_id != ''")
+			if len(allowed) > 0 {
+				placeholders := strings.TrimSuffix(strings.Repeat("?,", len(allowed)), ",")
+				where = append(where, "i.library_id IN ("+placeholders+")")
+				for _, lid := range allowed {
+					args = append(args, lid)
 				}
 			}
-			rows.Close()
+			if normParent := guid.Normalize(parentID); normParent != "" {
+				where = append(where, "(i.library_id = ? OR i.parent_id = ? OR EXISTS (SELECT 1 FROM item_ancestors ia WHERE ia.descendant_id = i.parent_id AND ia.ancestor_id = ?))")
+				args = append(args, normParent, normParent, normParent)
+			}
+			hasPostFilter := maxRating != nil || len(blockedTags) > 0 || len(genres) > 0 || len(tags) > 0 || lowerSearch != ""
+			querySQL := "SELECT DISTINCT i.parent_id FROM items i WHERE " + strings.Join(where, " AND ")
+			if !hasPostFilter {
+				querySQL += " LIMIT ?"
+				args = append(args, maxTrailerParentsScan)
+			}
+			rows, qErr := h.userRepo.Store().Reader.QueryContext(r.Context(), querySQL, args...)
+			if qErr == nil {
+				hasPreFilteredParents = true
+				for rows.Next() {
+					var pid string
+					if sErr := rows.Scan(&pid); sErr == nil && pid != "" {
+						trailerParentIDs = append(trailerParentIDs, pid)
+					}
+				}
+				rows.Close()
+			}
 		}
 	}
 

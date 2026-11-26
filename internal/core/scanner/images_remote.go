@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"mime"
 	"net/http"
@@ -13,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
@@ -258,13 +258,40 @@ func detectImageExtension(contentType, rawURL string) string {
 }
 
 func writeFileAtomic(destPath string, data []byte) error {
-	tmpPath := destPath + "." + guid.New()[:8] + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+	if fi, err := os.Lstat(destPath); err == nil {
+		if fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to overwrite symlink or directory target: %s", destPath)
+		}
+	}
+	f, err := os.CreateTemp(filepath.Dir(destPath), ".ambra-atomic-*.tmp")
+	if err != nil {
 		return err
+	}
+	tmpPath := f.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	_ = os.Chmod(tmpPath, 0o644)
+
+	if fi, err := os.Lstat(destPath); err == nil {
+		if fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to overwrite symlink or directory target: %s", destPath)
+		}
 	}
 	if err := os.Rename(tmpPath, destPath); err != nil {
-		_ = os.Remove(tmpPath)
 		return err
 	}
+	cleanup = false
 	return nil
 }

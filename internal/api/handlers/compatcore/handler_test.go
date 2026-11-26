@@ -543,7 +543,7 @@ func TestHomeSectionsAndUserQueriesAndEdgeCases(t *testing.T) {
 	disabledPolicy := sqlite.DefaultUserPolicy(false)
 	disabledPolicy.IsDisabled = true
 	_ = env.userRepo.UpdateUserPolicy(context.Background(), env.user2.ID, disabledPolicy)
-	rec = doReq(t, env.router, "POST", "/Users/"+env.user2.ID+"/Authenticate", `{}`)
+	rec = doReq(t, env.router, "POST", "/Users/"+env.user2.ID+"/Authenticate", `{"Pw":"pass"}`)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for disabled user, got %d", rec.Code)
 	}

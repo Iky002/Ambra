@@ -465,8 +465,17 @@ func isDynamicSegment(parts []string, idx int) bool {
 	switch idx {
 	case 2:
 		switch p1 {
-		case "genres", "studios", "persons", "displaypreferences":
+		case "genres", "studios", "persons", "displaypreferences", "gamegenres", "registrations":
 			return true
+		case "artists":
+			seg := strings.ToLower(parts[2])
+			return len(parts) > 3 || (seg != "albumartists" && seg != "prefixes" && seg != "instantmix")
+		case "musicgenres":
+			seg := strings.ToLower(parts[2])
+			return len(parts) > 3 || seg != "instantmix"
+		case "packages":
+			seg := strings.ToLower(parts[2])
+			return seg != "updates" && seg != "installed" && seg != "installing"
 		case "plugins":
 			seg := strings.ToLower(parts[2])
 			return seg != "securityinfo" && seg != "registrationrecords"
@@ -477,6 +486,20 @@ func isDynamicSegment(parts []string, idx int) bool {
 			return true
 		}
 		if p1 == "plugins" && p2 == "registrationrecords" {
+			return true
+		}
+		if p1 == "packages" && (p2 == "installed" || p2 == "installing") {
+			return true
+		}
+		if p1 == "system" && p2 == "configuration" {
+			return true
+		}
+		if p1 == "system" && p2 == "logs" {
+			seg := strings.ToLower(parts[3])
+			return len(parts) > 4 || (seg != "query" && seg != "log")
+		}
+	case 4:
+		if p1 == "users" && strings.ToLower(parts[3]) == "typedsettings" {
 			return true
 		}
 	}

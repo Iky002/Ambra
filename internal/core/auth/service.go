@@ -65,8 +65,9 @@ type Service struct {
 	repo *sqlite.UserRepo
 	cfg  *config.Config
 
-	mu    sync.RWMutex
-	cache map[string]*cachedToken
+	mu          sync.RWMutex
+	cache       map[string]*cachedToken
+	revokeEpoch uint64
 }
 
 func NewService(repo *sqlite.UserRepo, cfg *config.Config) *Service {
@@ -273,6 +274,7 @@ func (s *Service) ValidateToken(ctx context.Context, token string) (*TokenIdenti
 	now := time.Now().UTC()
 
 	s.mu.RLock()
+	epoch := s.revokeEpoch
 	entry, ok := s.cache[token]
 	var (
 		identity   *TokenIdentity
@@ -311,6 +313,7 @@ func (s *Service) ValidateToken(ctx context.Context, token string) (*TokenIdenti
 		return identity, nil
 	} else if ok {
 		s.mu.Lock()
+		epoch = s.revokeEpoch
 		if cur, exists := s.cache[token]; exists && !now.Before(cur.expiresAt) {
 			delete(s.cache, token)
 		}
@@ -335,7 +338,7 @@ func (s *Service) ValidateToken(ctx context.Context, token string) (*TokenIdenti
 			AppName:    tokRec.AppName,
 			AppVersion: tokRec.AppVersion,
 		}
-		s.putCache(token, id, now)
+		s.putCacheWithEpoch(token, id, now, epoch)
 		return id, nil
 	}
 
@@ -347,7 +350,7 @@ func (s *Service) ValidateToken(ctx context.Context, token string) (*TokenIdenti
 			APIKeyName: apiKey.AppName,
 			AppName:    apiKey.AppName,
 		}
-		s.putCache(token, id, now)
+		s.putCacheWithEpoch(token, id, now, epoch)
 		return id, nil
 	}
 
@@ -379,30 +382,43 @@ func (s *Service) ListAPIKeys(ctx context.Context) ([]sqlite.APIKeyRecord, error
 }
 
 func (s *Service) RevokeAPIKey(ctx context.Context, token string) error {
+	if err := s.repo.DeleteAPIKey(ctx, token); err != nil {
+		return err
+	}
 	s.InvalidateTokenCache(token)
-	return s.repo.DeleteAPIKey(ctx, token)
+	return nil
 }
 
 func (s *Service) RevokeToken(ctx context.Context, token string) error {
+	if err := s.repo.DeleteAccessToken(ctx, token); err != nil {
+		return err
+	}
 	s.InvalidateTokenCache(token)
-	return s.repo.DeleteAccessToken(ctx, token)
+	return nil
 }
 
 func (s *Service) RevokeDevice(ctx context.Context, deviceID string) error {
+	if err := s.repo.DeleteTokensByDevice(ctx, deviceID); err != nil {
+		return err
+	}
 	s.mu.Lock()
+	s.revokeEpoch++
 	for tok, entry := range s.cache {
 		if entry.identity.DeviceID == deviceID {
 			delete(s.cache, tok)
 		}
 	}
 	s.mu.Unlock()
-	return s.repo.DeleteTokensByDevice(ctx, deviceID)
+	return nil
 }
 
-// RevokeUserTokens revokes all active access tokens for userID in both memory cache and SQLite.
+// RevokeUserTokens revokes all active access tokens for userID in both SQLite and memory cache.
 func (s *Service) RevokeUserTokens(ctx context.Context, userID string) error {
+	if err := s.repo.DeleteTokensByUser(ctx, userID); err != nil {
+		return err
+	}
 	s.InvalidateUserCache(userID)
-	return s.repo.DeleteTokensByUser(ctx, userID)
+	return nil
 }
 
 func (s *Service) ChangePassword(ctx context.Context, userID, currentPw, newPw string, isAdminAction bool) error {
@@ -451,6 +467,7 @@ func (s *Service) ChangePasswordKeepToken(ctx context.Context, userID, currentPw
 func (s *Service) invalidateUserCacheExcept(userID, keepToken string) {
 	norm := guid.Normalize(userID)
 	s.mu.Lock()
+	s.revokeEpoch++
 	for tok, entry := range s.cache {
 		if tok == keepToken {
 			continue
@@ -463,7 +480,9 @@ func (s *Service) invalidateUserCacheExcept(userID, keepToken string) {
 }
 
 func (s *Service) InvalidateTokenCache(token string) {
+	token = strings.TrimSpace(token)
 	s.mu.Lock()
+	s.revokeEpoch++
 	delete(s.cache, token)
 	s.mu.Unlock()
 }
@@ -471,6 +490,7 @@ func (s *Service) InvalidateTokenCache(token string) {
 func (s *Service) InvalidateUserCache(userID string) {
 	norm := guid.Normalize(userID)
 	s.mu.Lock()
+	s.revokeEpoch++
 	for tok, entry := range s.cache {
 		if entry.identity.User != nil && guid.Normalize(entry.identity.User.ID) == norm {
 			delete(s.cache, tok)
@@ -481,13 +501,14 @@ func (s *Service) InvalidateUserCache(userID string) {
 
 func (s *Service) ToUserDto(u *sqlite.UserRecord) dto.UserDto {
 	hasPw := u.PasswordHash != ""
-	var dataDir string
+	var dataDir, serverID string
 	if s.cfg != nil {
 		dataDir = s.cfg.DataDir
+		serverID = s.cfg.ServerID
 	}
 	return dto.UserDto{
 		Name:                      u.Name,
-		ServerId:                  s.cfg.ServerID,
+		ServerId:                  serverID,
 		Id:                        u.ID,
 		PrimaryImageTag:           UserPrimaryImageTag(dataDir, u.ID),
 		HasPassword:               hasPw,
@@ -536,6 +557,19 @@ func sanitizeUserDir(s string) string {
 
 func (s *Service) putCache(token string, id *TokenIdentity, now time.Time) {
 	s.mu.Lock()
+	s.putCacheLocked(token, id, now)
+	s.mu.Unlock()
+}
+
+func (s *Service) putCacheWithEpoch(token string, id *TokenIdentity, now time.Time, epoch uint64) {
+	s.mu.Lock()
+	if s.revokeEpoch == epoch {
+		s.putCacheLocked(token, id, now)
+	}
+	s.mu.Unlock()
+}
+
+func (s *Service) putCacheLocked(token string, id *TokenIdentity, now time.Time) {
 	if _, exists := s.cache[token]; !exists && len(s.cache) >= maxTokenCacheSize {
 		// First purge all expired entries.
 		for tok, e := range s.cache {
@@ -563,7 +597,6 @@ func (s *Service) putCache(token string, id *TokenIdentity, now time.Time) {
 		expiresAt: now.Add(tokenCacheTTL),
 		lastFlush: now,
 	}
-	s.mu.Unlock()
 }
 
 // SessionID produces a deterministic session identifier for a (userID, deviceID) pair.

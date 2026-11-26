@@ -768,7 +768,7 @@ describe('v0.10.7 Audit 5 Web 全量修复回归测试', () => {
     })
   })
 
-  it('M-19: Demo Mock 同步 v0.10.6 版本号、ChapterCachePath/BifCachePath、264MB 缓存、/Attachments、/index.bif 与真实字幕格式', async () => {
+  it('M-19: Demo Mock 同步 v0.10.9 版本号、ChapterCachePath/BifCachePath、264MB 缓存、/Attachments、/index.bif 与真实字幕格式', async () => {
     setDemoModeOverride(true)
     const authRes = await api.authenticateByName('admin', '')
     saveAuth({
@@ -781,7 +781,7 @@ describe('v0.10.7 Audit 5 Web 全量修复回归测试', () => {
     })
 
     const sysInfo = await api.getSystemInfo()
-    expect(sysInfo.Version).toBe('0.10.6-demo')
+    expect(sysInfo.Version).toBe('0.10.9-demo')
     expect(sysInfo.ChapterCachePath).toBe('/var/lib/ambra/cache/chapters')
     expect(sysInfo.BifCachePath).toBe('/var/lib/ambra/cache/bif')
 

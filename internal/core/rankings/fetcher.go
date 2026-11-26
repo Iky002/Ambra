@@ -422,7 +422,20 @@ type tmdbTrendingPayload struct {
 }
 
 func isTMDBBearerToken(apiKey string) bool {
-	return strings.HasPrefix(apiKey, "eyJ") || strings.Count(apiKey, ".") == 2
+	k := strings.TrimSpace(apiKey)
+	return strings.HasPrefix(k, "eyJ") && strings.Count(k, ".") == 2
+}
+
+func sanitizeTMDBKeyError(err error, apiKey string) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if apiKey != "" {
+		msg = strings.ReplaceAll(msg, apiKey, "REDACTED")
+		msg = strings.ReplaceAll(msg, url.QueryEscape(apiKey), "REDACTED")
+	}
+	return fmt.Errorf("%s", msg)
 }
 
 func (f *Fetcher) fetchTMDBTrendingPage(ctx context.Context, baseURL, endpoint, defaultMediaType, apiKey string) ([]ChartEntry, error) {
@@ -437,7 +450,7 @@ func (f *Fetcher) fetchTMDBTrendingPage(ctx context.Context, baseURL, endpoint, 
 	reqURL := baseURL + endpoint + "?" + params.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
-		return nil, err
+		return nil, sanitizeTMDBKeyError(err, apiKey)
 	}
 	req.Header.Set("User-Agent", f.userAgent)
 	req.Header.Set("Accept", "application/json")
@@ -447,7 +460,7 @@ func (f *Fetcher) fetchTMDBTrendingPage(ctx context.Context, baseURL, endpoint, 
 
 	resp, err := f.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, sanitizeTMDBKeyError(err, apiKey)
 	}
 	defer resp.Body.Close()
 
@@ -457,7 +470,7 @@ func (f *Fetcher) fetchTMDBTrendingPage(ctx context.Context, baseURL, endpoint, 
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
-		return nil, err
+		return nil, sanitizeTMDBKeyError(err, apiKey)
 	}
 
 	var payload tmdbTrendingPayload

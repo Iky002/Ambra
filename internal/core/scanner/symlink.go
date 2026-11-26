@@ -28,7 +28,36 @@ func isPathWithinRoot(root, target string) bool {
 	if err != nil {
 		return false
 	}
-	return rel == "." || (!strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel))
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel))
+}
+
+// countSymlinkHopsUnderRoot counts how many path components strictly beneath root
+// up to and including target are symbolic links.
+func countSymlinkHopsUnderRoot(root, target string) int {
+	cleanRoot := filepath.Clean(strings.TrimSpace(root))
+	cleanTarget := filepath.Clean(strings.TrimSpace(target))
+	if cleanRoot == "" || cleanTarget == "" {
+		return 0
+	}
+	rel, err := filepath.Rel(cleanRoot, cleanTarget)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		if linfo, lerr := os.Lstat(cleanTarget); lerr == nil && linfo.Mode()&os.ModeSymlink != 0 {
+			return 1
+		}
+		return 0
+	}
+	hops := 0
+	cur := cleanRoot
+	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
+		if part == "" || part == "." {
+			continue
+		}
+		cur = filepath.Join(cur, part)
+		if linfo, lerr := os.Lstat(cur); lerr == nil && linfo.Mode()&os.ModeSymlink != 0 {
+			hops++
+		}
+	}
+	return hops
 }
 
 // isSymlinkAllowedInRoot validates whether target complies with policy and, when target
@@ -50,29 +79,7 @@ func isSymlinkAllowedInRoot(root, target string, policy SymlinkPolicy) (allowed 
 // hasSymlinkComponentUnderRoot reports whether any path component strictly beneath root
 // up to and including target is a symbolic link.
 func hasSymlinkComponentUnderRoot(root, target string) bool {
-	cleanRoot := filepath.Clean(strings.TrimSpace(root))
-	cleanTarget := filepath.Clean(strings.TrimSpace(target))
-	if cleanRoot == "" || cleanTarget == "" {
-		return false
-	}
-	rel, err := filepath.Rel(cleanRoot, cleanTarget)
-	if err != nil || rel == "." || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
-		if linfo, lerr := os.Lstat(cleanTarget); lerr == nil && linfo.Mode()&os.ModeSymlink != 0 {
-			return true
-		}
-		return false
-	}
-	cur := cleanRoot
-	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
-		if part == "" || part == "." {
-			continue
-		}
-		cur = filepath.Join(cur, part)
-		if linfo, lerr := os.Lstat(cur); lerr == nil && linfo.Mode()&os.ModeSymlink != 0 {
-			return true
-		}
-	}
-	return false
+	return countSymlinkHopsUnderRoot(root, target) > 0
 }
 
 // SymlinkPolicy controls how WalkSafe handles symbolic links during directory traversal.
@@ -94,8 +101,17 @@ const (
 // Directory cycles introduced by symlinks are guaranteed not to loop infinitely:
 // visited directories are deduplicated by Unix (Dev, Ino) with a real-path fallback.
 func WalkSafe(root string, policy SymlinkPolicy, fn func(path string, info os.FileInfo) error) error {
+	return WalkSafeWithStartDepth(root, 0, policy, fn)
+}
+
+// WalkSafeWithStartDepth behaves like WalkSafe while starting symlink depth tracking
+// at startDepth (e.g. relative hop count from library root during incremental ScanPath).
+func WalkSafeWithStartDepth(root string, startDepth int, policy SymlinkPolicy, fn func(path string, info os.FileInfo) error) error {
 	if fn == nil {
 		return nil
+	}
+	if startDepth < 0 {
+		startDepth = 0
 	}
 	root = filepath.Clean(root)
 
@@ -129,7 +145,7 @@ func WalkSafe(root string, policy SymlinkPolicy, fn func(path string, info os.Fi
 	visited := map[string]struct{}{
 		dirIdentity(root, rootInfo): {},
 	}
-	return walkDirSafe(root, 0, policy, visited, fn)
+	return walkDirSafe(root, startDepth, policy, visited, fn)
 }
 
 func walkDirSafe(dir string, symlinkDepth int, policy SymlinkPolicy, visited map[string]struct{}, fn func(path string, info os.FileInfo) error) error {

@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
@@ -119,6 +119,12 @@ export function MetadataTab() {
   const totalCount = itemsData?.TotalRecordCount ?? items.length
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize))
   const currentPage = Math.min(page, totalPages - 1)
+
+  useEffect(() => {
+    if (itemsData && page >= totalPages) {
+      setPage(Math.max(0, totalPages - 1))
+    }
+  }, [itemsData, page, totalPages])
   const rangeStart = totalCount === 0 ? 0 : currentPage * pageSize + 1
   const rangeEnd = totalCount === 0 ? 0 : Math.min(totalCount, currentPage * pageSize + items.length)
   const pageButtons = useMemo(

@@ -27,10 +27,12 @@ type nfoDocument struct {
 	OriginalTitle string     `xml:"originaltitle,omitempty"`
 	Year          *int       `xml:"year,omitempty"`
 	Premiered     string     `xml:"premiered,omitempty"`
+	Aired         string     `xml:"aired,omitempty"`
 	Tagline       string     `xml:"tagline,omitempty"`
 	Plot          string     `xml:"plot,omitempty"`
 	Rating        *float64   `xml:"rating,omitempty"`
 	MPAA          string     `xml:"mpaa,omitempty"`
+	SeasonNumber  *int       `xml:"seasonnumber,omitempty"`
 	Season        *int       `xml:"season,omitempty"`
 	Episode       *int       `xml:"episode,omitempty"`
 	TMDBID        string     `xml:"tmdbid,omitempty"`
@@ -195,7 +197,10 @@ func (s *Service) WriteItemNFOAtomic(ctx context.Context, itemID string) (*NFOWr
 		return nil, fmt.Errorf("%w: cannot write NFO for virtual item path %q", ErrInvalidArgument, pathStr)
 	}
 
-	rootTag, nfoPath := resolveNFOTarget(itemType, isFolderInt != 0, pathStr)
+	rootTag, nfoPath, err := resolveNFOTarget(itemType, isFolderInt != 0, pathStr)
+	if err != nil {
+		return nil, err
+	}
 	parentDir := filepath.Dir(nfoPath)
 	if info, statErr := os.Stat(parentDir); statErr != nil || !info.IsDir() {
 		return nil, fmt.Errorf("nfo target directory unavailable: %s", parentDir)
@@ -215,16 +220,15 @@ func (s *Service) WriteItemNFOAtomic(ctx context.Context, itemID string) (*NFOWr
 		return nil, err
 	}
 
-	var premiered string
+	var dateStr string
 	if premiereDate.Valid && premiereDate.Int64 != 0 {
-		premiered = time.Unix(premiereDate.Int64, 0).UTC().Format("2006-01-02")
+		dateStr = time.Unix(premiereDate.Int64, 0).UTC().Format("2006-01-02")
 	}
 
 	doc := nfoDocument{
 		XMLName:       xml.Name{Local: rootTag},
 		Title:         name,
 		OriginalTitle: strings.TrimSpace(originalTitle.String),
-		Premiered:     premiered,
 		Tagline:       tagline,
 		Plot:          strings.TrimSpace(plot),
 		MPAA:          strings.TrimSpace(officialRating.String),
@@ -238,6 +242,13 @@ func (s *Service) WriteItemNFOAtomic(ctx context.Context, itemID string) (*NFOWr
 		Writers:       writers,
 		Actors:        actors,
 	}
+	if dateStr != "" {
+		if rootTag == "episodedetails" {
+			doc.Aired = dateStr
+		} else {
+			doc.Premiered = dateStr
+		}
+	}
 	if productionYear.Valid {
 		y := int(productionYear.Int64)
 		doc.Year = &y
@@ -246,7 +257,13 @@ func (s *Service) WriteItemNFOAtomic(ctx context.Context, itemID string) (*NFOWr
 		r := communityRate.Float64
 		doc.Rating = &r
 	}
-	if strings.EqualFold(strings.TrimSpace(itemType), "Episode") {
+	switch rootTag {
+	case "season":
+		if indexNumber.Valid {
+			sn := int(indexNumber.Int64)
+			doc.SeasonNumber = &sn
+		}
+	case "episodedetails":
 		if parentIndexNumber.Valid {
 			sv := int(parentIndexNumber.Int64)
 			doc.Season = &sv
@@ -277,23 +294,37 @@ func (s *Service) WriteItemNFOAtomic(ctx context.Context, itemID string) (*NFOWr
 	}, nil
 }
 
-func resolveNFOTarget(itemType string, isFolder bool, itemPath string) (rootTag string, nfoPath string) {
+func resolveNFOTarget(itemType string, isFolder bool, itemPath string) (rootTag string, nfoPath string, err error) {
 	switch strings.ToLower(strings.TrimSpace(itemType)) {
+	case "movie":
+		if isFolder || isExistingDir(itemPath) {
+			return "movie", filepath.Join(itemPath, "movie.nfo"), nil
+		}
+		return "movie", replaceExtWithNFO(itemPath), nil
 	case "series":
-		rootTag = "tvshow"
 		if isFolder || isExistingDir(itemPath) {
-			return rootTag, filepath.Join(itemPath, "tvshow.nfo")
+			return "tvshow", filepath.Join(itemPath, "tvshow.nfo"), nil
 		}
-		return rootTag, filepath.Join(filepath.Dir(itemPath), "tvshow.nfo")
+		return "tvshow", filepath.Join(filepath.Dir(itemPath), "tvshow.nfo"), nil
+	case "season":
+		if !isExistingDir(itemPath) {
+			return "", "", fmt.Errorf("%w: season NFO requires an existing directory path %q", ErrInvalidArgument, itemPath)
+		}
+		return "season", filepath.Join(itemPath, "season.nfo"), nil
 	case "episode":
-		rootTag = "episodedetails"
-		return rootTag, replaceExtWithNFO(itemPath)
-	default:
-		rootTag = "movie"
-		if isFolder || isExistingDir(itemPath) {
-			return rootTag, filepath.Join(itemPath, "movie.nfo")
+		return "episodedetails", replaceExtWithNFO(itemPath), nil
+	case "musicartist":
+		if !isExistingDir(itemPath) {
+			return "", "", fmt.Errorf("%w: music artist NFO requires an existing directory path %q", ErrInvalidArgument, itemPath)
 		}
-		return rootTag, replaceExtWithNFO(itemPath)
+		return "artist", filepath.Join(itemPath, "artist.nfo"), nil
+	case "musicalbum":
+		if !isExistingDir(itemPath) {
+			return "", "", fmt.Errorf("%w: music album NFO requires an existing directory path %q", ErrInvalidArgument, itemPath)
+		}
+		return "album", filepath.Join(itemPath, "album.nfo"), nil
+	default:
+		return "", "", fmt.Errorf("%w: unsupported item type %q for NFO write", ErrInvalidArgument, itemType)
 	}
 }
 
@@ -462,8 +493,18 @@ func preserveMissingNFOFields(nfoPath string, doc *nfoDocument) {
 	if err := xml.Unmarshal(raw, &existing); err != nil {
 		return
 	}
-	if doc.Premiered == "" && strings.TrimSpace(existing.Premiered) != "" {
-		doc.Premiered = strings.TrimSpace(existing.Premiered)
+	if doc.XMLName.Local == "episodedetails" {
+		if doc.Aired == "" && strings.TrimSpace(existing.Aired) != "" {
+			doc.Aired = strings.TrimSpace(existing.Aired)
+		}
+	} else {
+		if doc.Premiered == "" && strings.TrimSpace(existing.Premiered) != "" {
+			doc.Premiered = strings.TrimSpace(existing.Premiered)
+		}
+	}
+	if doc.SeasonNumber == nil && existing.SeasonNumber != nil {
+		v := *existing.SeasonNumber
+		doc.SeasonNumber = &v
 	}
 	if doc.Tagline == "" && strings.TrimSpace(existing.Tagline) != "" {
 		doc.Tagline = strings.TrimSpace(existing.Tagline)

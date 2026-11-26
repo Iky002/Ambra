@@ -14,6 +14,8 @@ import (
 	"time"
 )
 
+const defaultLogRetentionDays = 30
+
 // DailyLogFilePath returns the daily runtime log path `<dataDir>/logs/ambra-YYYY-MM-DD.log`.
 func DailyLogFilePath(dataDir string, now time.Time) string {
 	if strings.TrimSpace(dataDir) == "" {
@@ -26,14 +28,16 @@ func DailyLogFilePath(dataDir string, now time.Time) string {
 }
 
 type multiLogSink struct {
-	mu          sync.Mutex
-	stdout      io.Writer
-	logsHandler *Handler
-	logFilePath string
-	logDir      string
-	currentDate string
-	rotatable   bool
-	file        *os.File
+	mu            sync.Mutex
+	stdout        io.Writer
+	logsHandler   *Handler
+	logFilePath   string
+	logDir        string
+	currentDate   string
+	lastPruneDate string
+	retentionDays int
+	rotatable     bool
+	file          *os.File
 }
 
 // MultiSlogHandler is a slog.Handler that formats every log record as
@@ -66,9 +70,10 @@ func parseDailyLogDate(logFilePath string) (string, bool) {
 func NewMultiSlogHandler(stdout io.Writer, logsHandler *Handler, logFilePath string) *MultiSlogHandler {
 	cleanPath := strings.TrimSpace(logFilePath)
 	sink := &multiLogSink{
-		stdout:      stdout,
-		logsHandler: logsHandler,
-		logFilePath: cleanPath,
+		stdout:        stdout,
+		logsHandler:   logsHandler,
+		logFilePath:   cleanPath,
+		retentionDays: defaultLogRetentionDays,
 	}
 	if cleanPath != "" {
 		sink.logDir = filepath.Dir(cleanPath)
@@ -83,6 +88,16 @@ func NewMultiSlogHandler(stdout io.Writer, logsHandler *Handler, logFilePath str
 		sink:  sink,
 		level: lvl,
 	}
+}
+
+// WithRetentionDays configures the daily log retention window in days (default 30).
+func (h *MultiSlogHandler) WithRetentionDays(days int) *MultiSlogHandler {
+	if days > 0 {
+		h.sink.mu.Lock()
+		h.sink.retentionDays = days
+		h.sink.mu.Unlock()
+	}
+	return h
 }
 
 // WithLevel sets the minimum log level for this handler and returns it for chaining.
@@ -156,10 +171,48 @@ func (h *MultiSlogHandler) Handle(_ context.Context, r slog.Record) error {
 			}
 			h.sink.file = f
 		}
+		if h.sink.rotatable && h.sink.lastPruneDate != recDate {
+			h.sink.lastPruneDate = recDate
+			h.pruneOldDailyLogsLocked(recTime)
+		}
 		_, err := io.WriteString(h.sink.file, line+"\n")
 		return err
 	}
 	return nil
+}
+
+func (h *MultiSlogHandler) pruneOldDailyLogsLocked(now time.Time) {
+	if !h.sink.rotatable || h.sink.logDir == "" {
+		return
+	}
+	retention := h.sink.retentionDays
+	if retention <= 0 {
+		retention = defaultLogRetentionDays
+	}
+	cutoff := now.UTC().Truncate(24*time.Hour).AddDate(0, 0, -retention)
+	entries, err := os.ReadDir(h.sink.logDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() || e.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		datePart, ok := parseDailyLogDate(e.Name())
+		if !ok {
+			continue
+		}
+		fileDate, err := time.Parse("2006-01-02", datePart)
+		if err != nil {
+			continue
+		}
+		if fileDate.Before(cutoff) {
+			fullPath := filepath.Join(h.sink.logDir, e.Name())
+			if fi, statErr := os.Lstat(fullPath); statErr == nil && !fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 {
+				_ = os.Remove(fullPath)
+			}
+		}
+	}
 }
 
 func (h *MultiSlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
@@ -236,18 +289,20 @@ func (h *MultiSlogHandler) formatRecord(r slog.Record) string {
 }
 
 func escapeLogControlChars(s string) string {
-	if !strings.ContainsAny(s, "\r\n\x1b") {
+	if !strings.ContainsAny(s, "\r\n\x1b\x9b\x00") {
 		return s
 	}
 	s = strings.ReplaceAll(s, "\r", `\r`)
 	s = strings.ReplaceAll(s, "\n", `\n`)
 	s = strings.ReplaceAll(s, "\x1b", `\x1b`)
+	s = strings.ReplaceAll(s, "\x9b", `\x9b`)
+	s = strings.ReplaceAll(s, "\x00", `\x00`)
 	return s
 }
 
 func formatAttrValue(v slog.Value) string {
 	s := v.String()
-	if s == "" || strings.ContainsAny(s, " \t\n\r\x1b\"") {
+	if s == "" || strings.ContainsAny(s, " \t\n\r\x1b\x9b\x00\"") {
 		return strconv.Quote(s)
 	}
 	return escapeLogControlChars(s)

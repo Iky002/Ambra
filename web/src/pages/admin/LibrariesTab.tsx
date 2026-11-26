@@ -49,6 +49,10 @@ export function LibrariesTab() {
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
     null,
   )
+  const [modalFeedback, setModalFeedback] = useState<{
+    type: 'success' | 'error'
+    message: string
+  } | null>(null)
   const [scanningId, setScanningId] = useState<string | null>(null)
 
   // 新增媒体库弹窗
@@ -146,7 +150,7 @@ export function LibrariesTab() {
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!libName.trim()) {
-      setFeedback({ type: 'error', message: '请输入媒体库名称' })
+      setModalFeedback({ type: 'error', message: '请输入媒体库名称' })
       return
     }
     const finalPaths = manualPath.trim()
@@ -154,12 +158,12 @@ export function LibrariesTab() {
       : paths
 
     if (finalPaths.length === 0) {
-      setFeedback({ type: 'error', message: '请至少添加一个服务器媒体目录路径' })
+      setModalFeedback({ type: 'error', message: '请至少添加一个服务器媒体目录路径' })
       return
     }
 
     setCreating(true)
-    setFeedback(null)
+    setModalFeedback(null)
     try {
       await api.createVirtualFolder({
         Name: libName.trim(),
@@ -176,6 +180,7 @@ export function LibrariesTab() {
           : []),
       ])
       setFeedback({ type: 'success', message: `已创建媒体库「${libName.trim()}」` })
+      setModalFeedback(null)
       setCreateOpen(false)
       setLibName('')
       setLibType('movies')
@@ -185,7 +190,7 @@ export function LibrariesTab() {
       setShowBrowser(false)
       setBrowsePath('')
     } catch (err) {
-      setFeedback({
+      setModalFeedback({
         type: 'error',
         message: err instanceof Error ? err.message : '创建媒体库失败',
       })
@@ -202,14 +207,14 @@ export function LibrariesTab() {
     setEditNewPath('')
     setEditShowBrowser(false)
     setEditBrowsePath('')
-    setFeedback(null)
+    setModalFeedback(null)
   }
 
   const handleToggleEditSaveLocal = async (next: boolean) => {
     if (!editTarget || savingOptions) return
     setEditSaveLocalMetadata(next)
     setSavingOptions(true)
-    setFeedback(null)
+    setModalFeedback(null)
     try {
       const nextOptions = {
         ...(editTarget.LibraryOptions || {}),
@@ -218,7 +223,7 @@ export function LibrariesTab() {
       await api.updateVirtualFolderOptions(editTarget.ItemId, nextOptions)
       setEditTarget({ ...editTarget, LibraryOptions: nextOptions })
       await queryClient.invalidateQueries({ queryKey: ['admin', 'virtualFolders'] })
-      setFeedback({
+      setModalFeedback({
         type: 'success',
         message: next
           ? `已开启「${editTarget.Name}」的本地 NFO 与图片保存`
@@ -226,7 +231,7 @@ export function LibrariesTab() {
       })
     } catch (err) {
       setEditSaveLocalMetadata(!next)
-      setFeedback({
+      setModalFeedback({
         type: 'error',
         message: err instanceof Error ? err.message : '更新媒体库选项失败',
       })
@@ -240,13 +245,13 @@ export function LibrariesTab() {
     if (!editTarget) return
     const nextName = editName.trim()
     if (!nextName) {
-      setFeedback({ type: 'error', message: '媒体库名称不能为空' })
+      setModalFeedback({ type: 'error', message: '媒体库名称不能为空' })
       return
     }
     if (nextName === editTarget.Name) return
 
     setRenaming(true)
-    setFeedback(null)
+    setModalFeedback(null)
     try {
       await api.renameVirtualFolder(editTarget.Name, nextName, editTarget.ItemId)
       setEditTarget({ ...editTarget, Name: nextName })
@@ -254,9 +259,9 @@ export function LibrariesTab() {
         queryClient.invalidateQueries({ queryKey: ['admin', 'virtualFolders'] }),
         queryClient.invalidateQueries({ queryKey: ['userViews'] }),
       ])
-      setFeedback({ type: 'success', message: `已将媒体库重命名为「${nextName}」` })
+      setModalFeedback({ type: 'success', message: `已将媒体库重命名为「${nextName}」` })
     } catch (err) {
-      setFeedback({
+      setModalFeedback({
         type: 'error',
         message: err instanceof Error ? err.message : '重命名媒体库失败',
       })
@@ -275,15 +280,15 @@ export function LibrariesTab() {
     }
 
     setPathBusy(`add:${cleaned}`)
-    setFeedback(null)
+    setModalFeedback(null)
     try {
       await api.addVirtualFolderPath(editTarget.Name, cleaned, false, editTarget.ItemId)
       setEditLocations((prev) => (prev.includes(cleaned) ? prev : [...prev, cleaned]))
       setEditNewPath('')
       await queryClient.invalidateQueries({ queryKey: ['admin', 'virtualFolders'] })
-      setFeedback({ type: 'success', message: `已为「${editTarget.Name}」添加挂载路径 ${cleaned}` })
+      setModalFeedback({ type: 'success', message: `已为「${editTarget.Name}」添加挂载路径 ${cleaned}` })
     } catch (err) {
-      setFeedback({
+      setModalFeedback({
         type: 'error',
         message: err instanceof Error ? err.message : '添加路径失败',
       })
@@ -295,14 +300,14 @@ export function LibrariesTab() {
   const handleRemoveEditPath = async (loc: string) => {
     if (!editTarget) return
     setPathBusy(`remove:${loc}`)
-    setFeedback(null)
+    setModalFeedback(null)
     try {
       await api.removeVirtualFolderPath(editTarget.Name, loc, editTarget.ItemId)
       setEditLocations((prev) => prev.filter((item) => item !== loc))
       await queryClient.invalidateQueries({ queryKey: ['admin', 'virtualFolders'] })
-      setFeedback({ type: 'success', message: `已从「${editTarget.Name}」移除路径 ${loc}` })
+      setModalFeedback({ type: 'success', message: `已从「${editTarget.Name}」移除路径 ${loc}` })
     } catch (err) {
-      setFeedback({
+      setModalFeedback({
         type: 'error',
         message: err instanceof Error ? err.message : '移除路径失败',
       })
@@ -314,7 +319,7 @@ export function LibrariesTab() {
   const handleDelete = async () => {
     if (!deleteTarget) return
     setDeleting(true)
-    setFeedback(null)
+    setModalFeedback(null)
     try {
       await api.deleteVirtualFolder({ name: deleteTarget.Name, id: deleteTarget.ItemId })
       await Promise.all([
@@ -322,9 +327,10 @@ export function LibrariesTab() {
         queryClient.invalidateQueries({ queryKey: ['userViews'] }),
       ])
       setFeedback({ type: 'success', message: `已删除媒体库「${deleteTarget.Name}」` })
+      setModalFeedback(null)
       setDeleteTarget(null)
     } catch (err) {
-      setFeedback({
+      setModalFeedback({
         type: 'error',
         message: err instanceof Error ? err.message : '删除媒体库失败',
       })
@@ -363,7 +369,10 @@ export function LibrariesTab() {
 
           <button
             type="button"
-            onClick={() => setCreateOpen(true)}
+            onClick={() => {
+              setModalFeedback(null)
+              setCreateOpen(true)
+            }}
             className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-4 py-2 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/20 transition-colors hover:bg-amber-400"
           >
             <FolderPlus className="h-4 w-4" />
@@ -472,7 +481,10 @@ export function LibrariesTab() {
 
                 <button
                   type="button"
-                  onClick={() => setDeleteTarget(lib)}
+                  onClick={() => {
+                    setModalFeedback(null)
+                    setDeleteTarget(lib)
+                  }}
                   className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20"
                 >
                   <Trash2 className="h-3.5 w-3.5" />
@@ -490,13 +502,16 @@ export function LibrariesTab() {
         title="新增媒体库"
         subtitle="配置媒体库名称、类型并选择一个或多个服务器本地目录"
         maxWidthClass="max-w-2xl"
-        onClose={() => setCreateOpen(false)}
+        onClose={() => {
+          setCreateOpen(false)
+          setModalFeedback(null)
+        }}
       >
         <form onSubmit={handleCreate} className="space-y-4">
           <FeedbackBanner
-            message={feedback?.message}
-            type={feedback?.type}
-            onClose={() => setFeedback(null)}
+            message={modalFeedback?.message}
+            type={modalFeedback?.type}
+            onClose={() => setModalFeedback(null)}
           />
           <div className="grid gap-4 sm:grid-cols-2">
             <div>
@@ -702,7 +717,10 @@ export function LibrariesTab() {
           <div className="flex justify-end gap-2 pt-2">
             <button
               type="button"
-              onClick={() => setCreateOpen(false)}
+              onClick={() => {
+                setCreateOpen(false)
+                setModalFeedback(null)
+              }}
               className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
             >
               取消
@@ -725,13 +743,16 @@ export function LibrariesTab() {
         title="编辑媒体库"
         subtitle={editTarget ? `重命名「${editTarget.Name}」或增删已挂载的媒体目录` : undefined}
         maxWidthClass="max-w-2xl"
-        onClose={() => setEditTarget(null)}
+        onClose={() => {
+          setEditTarget(null)
+          setModalFeedback(null)
+        }}
       >
         <div className="space-y-5">
           <FeedbackBanner
-            message={feedback?.message}
-            type={feedback?.type}
-            onClose={() => setFeedback(null)}
+            message={modalFeedback?.message}
+            type={modalFeedback?.type}
+            onClose={() => setModalFeedback(null)}
           />
           {/* 重命名表单 */}
           <form onSubmit={handleRename} className="space-y-2">
@@ -947,7 +968,10 @@ export function LibrariesTab() {
           <div className="flex justify-end border-t border-white/8 pt-3">
             <button
               type="button"
-              onClick={() => setEditTarget(null)}
+              onClick={() => {
+                setEditTarget(null)
+                setModalFeedback(null)
+              }}
               className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
             >
               完成
@@ -962,29 +986,42 @@ export function LibrariesTab() {
         title="确认删除媒体库"
         subtitle="仅从 Ambra 数据库中移除索引记录，不会删除磁盘上的原始媒体文件"
         maxWidthClass="max-w-md"
-        onClose={() => setDeleteTarget(null)}
+        onClose={() => {
+          setDeleteTarget(null)
+          setModalFeedback(null)
+        }}
       >
-        <p className="text-sm text-zinc-300">
-          确定要移除媒体库 <span className="font-semibold text-white">{deleteTarget?.Name}</span>{' '}
-          吗？
-        </p>
-        <div className="mt-6 flex justify-end gap-2">
-          <button
-            type="button"
-            onClick={() => setDeleteTarget(null)}
-            className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
-          >
-            取消
-          </button>
-          <button
-            type="button"
-            disabled={deleting}
-            onClick={handleDelete}
-            className="inline-flex items-center gap-2 rounded-xl bg-red-500 px-4 py-2 text-xs font-semibold text-white hover:bg-red-400 disabled:opacity-60"
-          >
-            {deleting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-            <span>确认删除</span>
-          </button>
+        <div className="space-y-4">
+          <FeedbackBanner
+            message={modalFeedback?.message}
+            type={modalFeedback?.type}
+            onClose={() => setModalFeedback(null)}
+          />
+          <p className="text-sm text-zinc-300">
+            确定要移除媒体库 <span className="font-semibold text-white">{deleteTarget?.Name}</span>{' '}
+            吗？
+          </p>
+          <div className="mt-6 flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                setDeleteTarget(null)
+                setModalFeedback(null)
+              }}
+              className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              disabled={deleting}
+              onClick={handleDelete}
+              className="inline-flex items-center gap-2 rounded-xl bg-red-500 px-4 py-2 text-xs font-semibold text-white hover:bg-red-400 disabled:opacity-60"
+            >
+              {deleting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+              <span>确认删除</span>
+            </button>
+          </div>
         </div>
       </AdminModal>
     </div>

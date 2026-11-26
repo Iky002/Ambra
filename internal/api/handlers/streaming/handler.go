@@ -301,6 +301,7 @@ func (h *Handler) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && strings.TrimSpace(ac.Token) != "" {
 		appendAPIKeyToPlaybackInfo(resp, ac.Token)
 	}
+	w.Header().Set("Cache-Control", "private, no-store")
 	httpx.JSON(w, http.StatusOK, resp)
 }
 
@@ -698,14 +699,77 @@ func (h *Handler) tryServeLibraryCover(w http.ResponseWriter, r *http.Request, l
 	if err != nil || lib == nil {
 		return false
 	}
+	var (
+		maxRating   *int
+		blockedTags []string
+	)
+	if h.isAuthenticated(r) {
+		callerID, isAdmin := h.callerIdentity(r)
+		if !isAdmin {
+			if h.userRepo != nil {
+				if callerID == "" || !h.CanAccessLibrary(r.Context(), callerID, lib.ID) {
+					return false
+				}
+				u, uErr := h.userRepo.GetUserByID(r.Context(), callerID)
+				if uErr != nil || u == nil {
+					return false
+				}
+				if !u.IsAdmin && !u.Policy.IsAdministrator {
+					maxRating = u.Policy.MaxParentalRating
+					blockedTags = u.Policy.BlockedTags
+				}
+			} else if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil {
+				if !ac.User.Policy.EnableAllFolders {
+					allowed := false
+					normLib := guid.Normalize(lib.ID)
+					for _, fid := range ac.User.Policy.EnabledFolders {
+						if guid.Normalize(fid) == normLib {
+							allowed = true
+							break
+						}
+					}
+					if !allowed {
+						return false
+					}
+				}
+				maxRating = ac.User.Policy.MaxParentalRating
+				blockedTags = ac.User.Policy.BlockedTags
+			}
+		}
+	}
+	reqTag := strings.TrimSpace(httpx.ParseQuery(r).Get("tag"))
+	queryLimit := 12
+	if reqTag != "" {
+		queryLimit = 100
+	}
 	children, _, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
-		LibraryID:        lib.ID,
-		IncludeItemTypes: []string{"Movie", "Series", "MusicAlbum", "Video"},
-		Recursive:        true,
-		Limit:            12,
+		LibraryID:         lib.ID,
+		MaxParentalRating: maxRating,
+		BlockedTags:       blockedTags,
+		IncludeItemTypes:  []string{"Movie", "Series", "MusicAlbum", "Video"},
+		Recursive:         true,
+		Limit:             queryLimit,
 	})
 	if err != nil || len(children) == 0 {
 		return false
+	}
+	if reqTag != "" {
+		for _, it := range children {
+			for i, tag := range it.BackdropImageTags {
+				if tag == reqTag {
+					if err := h.imaging.ServeHTTPWithOptions(w, r, it.Id, "Backdrop", i, opts); err == nil {
+						return true
+					}
+				}
+			}
+		}
+		for _, it := range children {
+			if it.ImageTags["Primary"] == reqTag {
+				if err := h.imaging.ServeHTTPWithOptions(w, r, it.Id, "Primary", 0, opts); err == nil {
+					return true
+				}
+			}
+		}
 	}
 	for _, it := range children {
 		if len(it.BackdropImageTags) > 0 {

@@ -150,7 +150,7 @@ func TestConfigureAndConcurrency(t *testing.T) {
 		t.Fatalf("unexpected manifest after Configure: %+v", m)
 	}
 	snap := p.snapshot()
-	if snap.clientID != "" || snap.accessToken != "" || snap.scrobblePlayback || snap.syncWatched || snap.baseURL != "https://example.trakt.local" {
+	if snap.clientID != "" || snap.accessToken != "" || snap.scrobblePlayback || snap.syncWatched || snap.baseURL != defaultBaseURL {
 		t.Fatalf("unexpected snapshot: %+v", snap)
 	}
 

@@ -71,6 +71,8 @@ type Handler struct {
 	setupMu       sync.Mutex
 	webhookMu     sync.Mutex
 	webhookClosed bool
+	webhookCtx    context.Context
+	webhookCancel context.CancelFunc
 	webhookWG     sync.WaitGroup
 	webhookCh     chan webhookDispatchJob
 
@@ -395,6 +397,35 @@ func (h *Handler) loadState(ctx context.Context) {
 		h.state = st
 		h.mu.Unlock()
 	}
+}
+
+func cloneOpsState(st opsState) opsState {
+	out := st
+	if st.Installations != nil {
+		out.Installations = append([]InstallationInfo(nil), st.Installations...)
+	}
+	if st.Webhooks != nil {
+		out.Webhooks = make([]WebhookConfig, len(st.Webhooks))
+		copy(out.Webhooks, st.Webhooks)
+		for i := range out.Webhooks {
+			if st.Webhooks[i].Events != nil {
+				out.Webhooks[i].Events = append([]string(nil), st.Webhooks[i].Events...)
+			}
+		}
+	}
+	if st.Parties != nil {
+		out.Parties = make([]Party, len(st.Parties))
+		copy(out.Parties, st.Parties)
+		for i := range out.Parties {
+			if st.Parties[i].Members != nil {
+				out.Parties[i].Members = append([]string(nil), st.Parties[i].Members...)
+			}
+		}
+	}
+	if st.ConnectLinks != nil {
+		out.ConnectLinks = append([]ConnectPending(nil), st.ConnectLinks...)
+	}
+	return out
 }
 
 func (h *Handler) saveStateLocked(ctx context.Context) error {
