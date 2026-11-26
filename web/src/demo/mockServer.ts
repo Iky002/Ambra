@@ -750,7 +750,7 @@ function createInitialDemoNotifications(): DemoNotificationRecord[] {
     {
       Id: 'notif-demo-01',
       Date: new Date(now - 15 * 60_000).toISOString(),
-      Name: '欢迎体验 Ambra v0.10.9',
+      Name: '欢迎体验 Ambra v0.11.0',
       Description: '已上线应用内通知中心、家长控制分级过滤与 Quick Connect 设备授权码登录。',
       Level: 'Normal',
       readByUsers: new Set(),
@@ -3121,7 +3121,7 @@ export async function demoFetch<T>(
           UserId: sessionUserId,
           UserName: caller.user?.Name || sessionUserId,
           Client: 'Ambra Web',
-          ApplicationVersion: '0.10.9',
+          ApplicationVersion: '0.11.0',
           DeviceName: 'Web Browser (Demo)',
           DeviceId: `dev-web-${sessionUserId}`,
           LastActivityDate: new Date().toISOString(),
@@ -5865,7 +5865,7 @@ export async function demoFetch<T>(
       DeviceId: 'dev-demo-web-01',
       DeviceName: 'Ambra Web Demo',
       AppName: 'Ambra Web',
-      AppVersion: '0.10.9',
+      AppVersion: '0.11.0',
       DateAdded: new Date().toISOString(),
     }
     demoQuickConnectSessions.set(secret, session)
