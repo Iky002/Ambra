@@ -15,7 +15,7 @@ func TestAuditV0107_H5_WallClockFallbackAndWatchCancelTrackedInWG(t *testing.T) 
 	}
 	tmp := t.TempDir()
 	fakeFF := filepath.Join(tmp, "sleep-ffmpeg.sh")
-	if err := os.WriteFile(fakeFF, []byte("#!/bin/sh\nsleep 30\n"), 0o755); err != nil {
+	if err := os.WriteFile(fakeFF, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	r := NewRecorder(Options{

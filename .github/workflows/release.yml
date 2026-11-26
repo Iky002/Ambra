@@ -83,8 +83,8 @@ jobs:
 
       - name: Bundle Full packages WITH static FFmpeg & FFprobe
         env:
-          # Deterministic monthly-retained BtbN release tag (override via repo variable BTBN_RELEASE_TAG if upgrading).
-          BTBN_RELEASE_TAG: ${{ vars.BTBN_RELEASE_TAG || 'autobuild-2026-02-28-14-26' }}
+          # Rolling BtbN release tag (override via repo variable BTBN_RELEASE_TAG if pinning a specific autobuild).
+          BTBN_RELEASE_TAG: ${{ vars.BTBN_RELEASE_TAG || 'latest' }}
           BTBN_FFMPEG_BRANCH: n8.1
           BTBN_SHA256_LINUX64: ${{ vars.BTBN_SHA256_LINUX64 || '' }}
           BTBN_SHA256_LINUXARM64: ${{ vars.BTBN_SHA256_LINUXARM64 || '' }}
@@ -94,8 +94,8 @@ jobs:
           MACOS_FFPROBE_SHA256: 6ef2df5f575042923a28537ab37adf936f28bf3e7b85de23a1447ed447ec1dbd
         run: |
           set -euo pipefail
-          if [[ ! "${BTBN_RELEASE_TAG}" =~ ^autobuild-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]]; then
-            echo "ERROR: BTBN_RELEASE_TAG must be a deterministic autobuild-YYYY-MM-DD-HH-MM tag, got '${BTBN_RELEASE_TAG}'" >&2
+          if [[ ! "${BTBN_RELEASE_TAG}" =~ ^(latest|autobuild-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2})$ ]]; then
+            echo "ERROR: BTBN_RELEASE_TAG must be 'latest' or 'autobuild-YYYY-MM-DD-HH-MM', got '${BTBN_RELEASE_TAG}'" >&2
             exit 1
           fi
           BTBN_RELEASE_BASE="https://github.com/BtbN/FFmpeg-Builds/releases/download/${BTBN_RELEASE_TAG}"

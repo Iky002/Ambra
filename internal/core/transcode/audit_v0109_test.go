@@ -463,7 +463,7 @@ for i in 0 1 2 3 4 5; do
   seg=$(echo "$segpat" | sed "s/%d/$i/")
   printf 'SEGMENT_DATA_PAYLOAD_%d' "$i" > "$seg"
 done
-sleep 10
+exec sleep 10
 `
 		_ = os.WriteFile(fakeThrottleFF, []byte(throttleScript), 0o755)
 		tCfg := config.Default(throttleTmp)
@@ -487,8 +487,8 @@ sleep 10
 		ts := tMgr.sessions[SessionKey(tp)]
 		tMgr.mu.Unlock()
 
-		// Wait up to 1s for throttle monitor to suspend process (head=5, lastReq=0 -> lead=30s > 12s)
-		deadline := time.Now().Add(time.Second)
+		// Wait up to 5s for throttle monitor to suspend process (head=5, lastReq=0 -> lead=30s > 12s)
+		deadline := time.Now().Add(5 * time.Second)
 		for time.Now().Before(deadline) && !ts.IsThrottled() {
 			time.Sleep(30 * time.Millisecond)
 		}

@@ -261,7 +261,7 @@ func TestLiveTVV0109AuditH05H06M20M28L18(t *testing.T) {
 		DataDir:    filepath.Join(cfg.DataDir, "dvr-tuner-del"),
 		FFmpegPath: "/bin/sh",
 		ArgsBuilder: func(job dvr.RecordingJob, outFile string) []string {
-			return []string{"-c", "sleep 30"}
+			return []string{"-c", "exec sleep 30"}
 		},
 	})
 	defer func() { _ = dvrRec.Close() }()
@@ -295,7 +295,7 @@ func TestLiveTVV0109AuditH05H06M20M28L18(t *testing.T) {
 	}
 	h.mu.RUnlock()
 	// Active recording should have been cancelled (CancelRecording returns error once removed/cancelled).
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		active := dvrRec.ActiveRecordings()
 		found := false

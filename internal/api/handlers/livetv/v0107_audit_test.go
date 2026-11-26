@@ -287,7 +287,7 @@ func TestLiveTVV0107AuditSSRFAuthHLSAndTimers(t *testing.T) {
 		DataDir:    filepath.Join(cfg.DataDir, "dvr-st"),
 		FFmpegPath: "/bin/sh",
 		ArgsBuilder: func(job dvr.RecordingJob, outFile string) []string {
-			return []string{"-c", "sleep 30"}
+			return []string{"-c", "exec sleep 30"}
 		},
 	})
 	defer func() { _ = dvrRec.Close() }()
