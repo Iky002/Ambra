@@ -220,5 +220,20 @@
   "admin.createUser": "Neuer Benutzer",
   "admin.pluginsTitle": "Plugins & Scraper",
   "admin.webhooksTitle": "Webhook-Benachrichtigungen",
-  "admin.createWebhook": "Webhook hinzufügen"
+  "admin.createWebhook": "Webhook hinzufügen",
+  "trakt.title": "Trakt-Konto",
+  "trakt.configured": "Verknüpfung eingerichtet",
+  "trakt.description": "Verknüpfe dein eigenes Trakt-Konto. Nur Fortschritt und Verlauf dieses Ambra-Benutzers werden synchronisiert.",
+  "trakt.disabled": "Trakt wurde vom Administrator deaktiviert. Eine bestehende Verknüpfung kann entfernt werden.",
+  "trakt.keepToken": "Token gespeichert; leer lassen zum Beibehalten",
+  "trakt.tokenPlaceholder": "Eigenes OAuth Access Token eingeben",
+  "trakt.credentialsHelp": "Client ID und Access Token aus deiner Trakt-Autorisierung eingeben. Abgelaufene Tokens hier erneuern. Gespeicherte Tokens werden nicht angezeigt.",
+  "trakt.scrobble": "Wiedergabefortschritt synchronisieren",
+  "trakt.watched": "Gesehene Inhalte synchronisieren",
+  "trakt.save": "Konto und Einstellungen speichern",
+  "trakt.disconnect": "Verknüpfung entfernen",
+  "trakt.saved": "Trakt-Konto und Einstellungen gespeichert",
+  "trakt.disconnected": "Trakt-Verknüpfung entfernt",
+  "trakt.retry": "Trakt-Einstellungen nicht geladen. Erneut versuchen",
+  "trakt.adminDescription": "Steuert die Verfügbarkeit von Trakt. Jeder Benutzer verwaltet seine Zugangsdaten und Einstellungen unter Profil → Trakt-Konto. Hier wird kein globales Konto gespeichert."
 }

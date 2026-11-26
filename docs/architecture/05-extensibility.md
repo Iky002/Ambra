@@ -46,3 +46,12 @@ Ambra 完整继承这一**高度模块化的插件架构思想**，但因为用 
 
 - **Emby API 映射**：Ambra 的全部内置插件与外部插件统一映射到 `/Plugins`、`/Plugins/{Id}/Configuration`、`/Packages` 与 `/UI/View`，客户端与配置工具可像操作 Emby 一样管理插件。
 - **自动化工具全兼容**：完整兼容 `/Library/Media/Updated`、`/Library/Refresh`、`/Users`、`/System/Info` 与标准 `.nfo`/本地海报规范，保证 **MoviePilot、Sonarr、Radarr、TinyMediaManager、Emby2Alist** 零改动无缝衔接。
+
+## 5. Trakt：服务端可用性与个人账号分离
+
+- 管理员通过 `/Plugins/ambra.builtin.trakt/Configuration` 或 `/Enable` 控制全局启用状态；全局配置只保存 `enabled` 和 `priority`。通知类插件与元数据、流解析插件均可被插件管理器发现。
+- 普通用户与管理员均通过自己的登录会话调用 `GET /Users/Me/Trakt`、`POST /Users/Me/Trakt`、`DELETE /Users/Me/Trakt`。接口不接受目标用户 ID，服务端 API Key 无法代替个人会话绑定账号。
+- POST 支持 `ClientId`、`AccessToken`、`ScrobblePlayback`、`SyncWatched`；省略 Token 会保留现有值，切换 Client ID 时必须提供新 Token。GET / POST 仅返回配置状态，不返回 Token。当前使用用户自行取得的 OAuth Token，过期后由用户更新。
+- 凭据单独保存在 `user_trakt` 表，以 Ambra 用户 ID 为主键，删除用户时级联删除；不写入通用 UserConfiguration / User DTO。全局停用后仍允许查看状态与解除绑定。
+- 播放与已看事件根据实际事件用户 ID 查询账号，未绑定或被禁用的用户不会上报。后台任务执行时重新读取配置，避免继续使用已解除的绑定。暂停节流与完成去重按用户和媒体共同隔离。
+- 升级时清理旧的全局账号字段，不推断归属、不自动绑定。已有用户需在个人中心重新填写自己的凭据。

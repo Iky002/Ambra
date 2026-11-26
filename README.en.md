@@ -127,6 +127,12 @@ make build        # Build pure-Go binary (bin/ambra)
 
 ---
 
+## Personal Trakt Accounts
+
+An administrator enables Trakt under **Admin → Plugins → Trakt** (disabled by default). Each user then enters their own **Client ID / OAuth Access Token** under **Profile → Trakt account**, with independent playback and watched-history preferences. Saved tokens are never returned; leave the token blank to preserve it when updating preferences. Expired tokens must be updated here. Users can disconnect even when the plugin is disabled.
+
+**Upgrading from v0.10.7 or earlier:** legacy global Trakt account settings are removed without assigning them to any user. Each user must configure their own binding in Profile. Other plugins are unaffected.
+
 ## Architecture & Documentation
 
 Full technical documentation is available in [docs/README.md](docs/README.md) (in Chinese):

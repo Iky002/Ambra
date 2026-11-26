@@ -220,5 +220,20 @@
   "admin.createUser": "Nouvel utilisateur",
   "admin.pluginsTitle": "Extensions et scrapers",
   "admin.webhooksTitle": "Notifications Webhook",
-  "admin.createWebhook": "Ajouter un Webhook"
+  "admin.createWebhook": "Ajouter un Webhook",
+  "trakt.title": "Compte Trakt",
+  "trakt.configured": "Liaison configurée",
+  "trakt.description": "Liez votre compte Trakt. Seuls la progression et l’historique de cet utilisateur Ambra sont synchronisés.",
+  "trakt.disabled": "Trakt est désactivé par l’administrateur. Vous pouvez supprimer une liaison existante.",
+  "trakt.keepToken": "Jeton enregistré ; laisser vide pour le conserver",
+  "trakt.tokenPlaceholder": "Saisissez votre OAuth Access Token",
+  "trakt.credentialsHelp": "Saisissez le Client ID et l’Access Token de votre autorisation Trakt. Renouvelez ici les jetons expirés. Les jetons enregistrés ne sont jamais affichés.",
+  "trakt.scrobble": "Synchroniser la progression (Scrobble)",
+  "trakt.watched": "Synchroniser l’historique",
+  "trakt.save": "Enregistrer le compte et les préférences",
+  "trakt.disconnect": "Dissocier",
+  "trakt.saved": "Compte Trakt et préférences enregistrés",
+  "trakt.disconnected": "Compte Trakt dissocié",
+  "trakt.retry": "Impossible de charger Trakt. Réessayer",
+  "trakt.adminDescription": "Contrôle l’accès à Trakt. Chaque utilisateur configure ses identifiants et préférences dans Profil → Compte Trakt. Aucun compte global n’est enregistré ici."
 }

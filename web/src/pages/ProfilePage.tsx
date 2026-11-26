@@ -28,6 +28,7 @@ import {
   type SubtitleModeOption,
 } from '../player/playbackPrefs'
 import { FeedbackBanner } from './admin/adminUtils'
+import { TraktSettings } from '../components/TraktSettings'
 
 const ALLOWED_AVATAR_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif'])
 const MAX_AVATAR_UPLOAD_BYTES = 5 * 1024 * 1024 // 5 MB
@@ -554,6 +555,8 @@ export function ProfilePage() {
       </div>
 
       {/* Quick Connect 授权新设备 */}
+      <TraktSettings key={userId} userId={userId} />
+
       <section className="rounded-2xl border border-white/10 bg-zinc-950/70 p-6 backdrop-blur-md">
         <div className="mb-4 flex items-center gap-2">
           <QrCode className="h-4 w-4 text-amber-400" />

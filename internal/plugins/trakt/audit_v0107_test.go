@@ -76,7 +76,7 @@ func TestAuditV0107_H9_HostChangeClearsCredsAndM17_NoAutoBindAndDedupRace(t *tes
 	bus := eventbus.New()
 	p2 := New()
 	p2.SetHTTPClient(srv.Client())
-	_ = p2.Configure(map[string]any{
+	_ = configureTestPlugin(t, p2, map[string]any{
 		"enabled":      true,
 		"client_id":    "cid",
 		"access_token": "tok",

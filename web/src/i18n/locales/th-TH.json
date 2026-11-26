@@ -220,5 +220,20 @@
   "admin.createUser": "สร้างผู้ใช้ใหม่",
   "admin.pluginsTitle": "จัดการปลั๊กอินและตัวดึงข้อมูล",
   "admin.webhooksTitle": "การแจ้งเตือน Webhook",
-  "admin.createWebhook": "เพิ่ม Webhook"
+  "admin.createWebhook": "เพิ่ม Webhook",
+  "trakt.title": "บัญชี Trakt",
+  "trakt.configured": "ตั้งค่าการเชื่อมต่อแล้ว",
+  "trakt.description": "เชื่อมต่อบัญชี Trakt ของคุณ ซิงค์เฉพาะความคืบหน้าและประวัติการรับชมของผู้ใช้ Ambra นี้",
+  "trakt.disabled": "ผู้ดูแลระบบปิด Trakt อยู่ คุณยังยกเลิกการเชื่อมต่อเดิมได้",
+  "trakt.keepToken": "บันทึกโทเค็นแล้ว เว้นว่างเพื่อใช้ค่าเดิม",
+  "trakt.tokenPlaceholder": "กรอก OAuth Access Token ของคุณ",
+  "trakt.credentialsHelp": "กรอก Client ID และ Access Token ที่ได้รับจากการอนุญาต Trakt อัปเดตโทเค็นที่หมดอายุที่นี่ ระบบจะไม่แสดงโทเค็นที่บันทึกไว้",
+  "trakt.scrobble": "ซิงค์ความคืบหน้าการเล่น (Scrobble)",
+  "trakt.watched": "ซิงค์ประวัติการรับชม",
+  "trakt.save": "บันทึกบัญชีและการตั้งค่า",
+  "trakt.disconnect": "ยกเลิกการเชื่อมต่อ",
+  "trakt.saved": "บันทึกบัญชี Trakt และการตั้งค่าแล้ว",
+  "trakt.disconnected": "ยกเลิกการเชื่อมต่อ Trakt แล้ว",
+  "trakt.retry": "โหลดการตั้งค่า Trakt ไม่สำเร็จ ลองอีกครั้ง",
+  "trakt.adminDescription": "ควบคุมการเปิดใช้ Trakt ผู้ใช้แต่ละคนตั้งค่าข้อมูลบัญชีและการซิงค์ได้ที่ โปรไฟล์ → บัญชี Trakt โดยไม่ใช้บัญชีกลาง"
 }
