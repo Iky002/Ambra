@@ -635,7 +635,7 @@ func (h *Handler) streamTranscodeAudioWithHeaders(w http.ResponseWriter, r *http
 		}
 	}
 
-	args := buildAudioFFmpegArgs(ffmpegInput, muxFmt, encoder, bitrate, startTimeTicks, audioChannels, audioSampleRate)
+	args := netutil.FilterFFmpegArgs(ffmpegPath, buildAudioFFmpegArgs(ffmpegInput, muxFmt, encoder, bitrate, startTimeTicks, audioChannels, audioSampleRate))
 	cmd := exec.CommandContext(r.Context(), ffmpegPath, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

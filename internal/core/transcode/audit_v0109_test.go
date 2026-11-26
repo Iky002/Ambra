@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -252,20 +253,20 @@ func TestC02_MaxRedirectsSmokeAndLoopbackStreamProxy(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		args := BuildFFmpegArgs(SessionParams{
+		args := netutil.FilterFFmpegArgs(ffmpegPath, BuildFFmpegArgs(SessionParams{
 			InputPath:  "http://" + closedAddr + "/test.mkv",
 			VideoCodec: "copy",
 			AudioCodec: "aac",
-		}, 0, t.TempDir(), SoftwareOnlyCapabilities())
+		}, 0, t.TempDir(), SoftwareOnlyCapabilities()))
 		out, _ := exec.CommandContext(ctx, ffmpegPath, args...).CombinedOutput()
 		if strings.Contains(string(out), "Unrecognized option") || strings.Contains(string(out), "Option not found") {
-			t.Fatalf("ffmpeg rejected -max_redirects 0 in BuildFFmpegArgs: %s", string(out))
+			t.Fatalf("ffmpeg rejected options in BuildFFmpegArgs: %s", string(out))
 		}
 
-		subArgs := BuildSubtitleExtractArgs("http://"+closedAddr+"/test.mkv", 2, "vtt", filepath.Join(t.TempDir(), "s.vtt"))
+		subArgs := netutil.FilterFFmpegArgs(ffmpegPath, BuildSubtitleExtractArgs("http://"+closedAddr+"/test.mkv", 2, "vtt", filepath.Join(t.TempDir(), "s.vtt")))
 		outSub, _ := exec.CommandContext(ctx, ffmpegPath, subArgs...).CombinedOutput()
 		if strings.Contains(string(outSub), "Unrecognized option") || strings.Contains(string(outSub), "Option not found") {
-			t.Fatalf("ffmpeg rejected -max_redirects 0 in BuildSubtitleExtractArgs: %s", string(outSub))
+			t.Fatalf("ffmpeg rejected options in BuildSubtitleExtractArgs: %s", string(outSub))
 		}
 	}
 

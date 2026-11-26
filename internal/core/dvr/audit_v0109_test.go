@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 )
 
 func TestAuditV0109_H05_DenyPrivateLANEnforced(t *testing.T) {
@@ -53,11 +55,11 @@ func TestC02_RealFFmpegAcceptsMaxRedirects(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	args := DefaultArgsBuilder(RecordingJob{
+	args := netutil.FilterFFmpegArgs(ffmpegPath, DefaultArgsBuilder(RecordingJob{
 		TimerID:   "smoke",
 		StreamURL: "http://" + addr + "/closed.ts",
 		Duration:  time.Second,
-	}, filepath.Join(t.TempDir(), "out.mkv"))
+	}, filepath.Join(t.TempDir(), "out.mkv")))
 	out, _ := exec.CommandContext(ctx, ffmpegPath, args...).CombinedOutput()
 	if strings.Contains(string(out), "Unrecognized option") || strings.Contains(string(out), "Option not found") {
 		t.Fatalf("ffmpeg rejected DVR DefaultArgsBuilder options: %s", string(out))

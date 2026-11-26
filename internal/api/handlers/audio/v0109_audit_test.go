@@ -18,6 +18,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -47,7 +48,7 @@ func TestV0109Audit_FFmpegHardeningAndExtensionlessUniversal302(t *testing.T) {
 			http.Redirect(w, r, "http://127.0.0.1:9/blocked", http.StatusFound)
 		}))
 		defer lnSrv.Close()
-		smokeArgs := buildAudioFFmpegArgs(lnSrv.URL+"/audio.mp3", "mp3", "libmp3lame", 128000, 0, 2, 44100)
+		smokeArgs := netutil.FilterFFmpegArgs(ffmpegBin, buildAudioFFmpegArgs(lnSrv.URL+"/audio.mp3", "mp3", "libmp3lame", 128000, 0, 2, 44100))
 		smokeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		out, _ := exec.CommandContext(smokeCtx, ffmpegBin, smokeArgs...).CombinedOutput()

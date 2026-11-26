@@ -160,7 +160,7 @@ func (e *Extractor) ExtractSubtitleWithHeaders(ctx context.Context, mediaPath st
 		}
 		defer closeProxy()
 
-		args := BuildSubtitleExtractArgs(ffInput, streamIndex, ext, tmpPath)
+		args := netutil.FilterFFmpegArgs(e.ffmpegPath, BuildSubtitleExtractArgs(ffInput, streamIndex, ext, tmpPath))
 		cmd := exec.CommandContext(runCtx, e.ffmpegPath, args...)
 		stderr := newSafeRingBuffer(maxStderrBytes)
 		cmd.Stderr = stderr
@@ -286,6 +286,7 @@ func (e *Extractor) ExtractFonts(ctx context.Context, mediaPath, itemID, mediaSo
 				)
 			}
 			fontArgs = append(fontArgs, "-i", ffInput)
+			fontArgs = netutil.FilterFFmpegArgs(e.ffmpegPath, fontArgs)
 			cmd := exec.CommandContext(runCtx, e.ffmpegPath, fontArgs...)
 			cmd.Dir = stageDir
 			_ = cmd.Run()
@@ -371,6 +372,7 @@ func (e *Extractor) probeSafeFontAttachments(ctx context.Context, resolvedMedia 
 		resolvedMedia,
 	)
 
+	probeArgs = netutil.FilterFFmpegArgs(e.ffprobePath, probeArgs)
 	cmd := exec.CommandContext(ctx, e.ffprobePath, probeArgs...)
 	stdout := &limitedBuffer{max: maxProbeAttachmentBytes}
 	cmd.Stdout = stdout
@@ -535,6 +537,7 @@ func (e *Extractor) ExtractChapterThumbnail(ctx context.Context, mediaPath, item
 			"-vf", "scale='min(640,iw)':-2",
 			tmpPath,
 		)
+		args = netutil.FilterFFmpegArgs(e.ffmpegPath, args)
 		cmd := exec.CommandContext(runCtx, e.ffmpegPath, args...)
 		stderr := newSafeRingBuffer(maxStderrBytes)
 		cmd.Stderr = stderr

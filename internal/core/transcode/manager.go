@@ -1788,7 +1788,7 @@ func extractRemoteEmbeddedSubtitle(ffmpegPath, mediaURL string, headers map[stri
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultExtractTimeout)
 	defer cancel()
-	args := BuildSubtitleExtractArgs(ffInput, streamIndex, ext, tmpPath)
+	args := netutil.FilterFFmpegArgs(ffmpegPath, BuildSubtitleExtractArgs(ffInput, streamIndex, ext, tmpPath))
 	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
 	if err := cmd.Run(); err != nil {
 		return err
@@ -1950,7 +1950,7 @@ func (s *transcodeSession) startProcessLocked(startSeg int, caps *HWCapabilities
 		}
 	}
 
-	args := BuildFFmpegArgs(effectiveParams, startSeg, s.workDir, effectiveCaps)
+	args := netutil.FilterFFmpegArgs(s.ffmpegPath, BuildFFmpegArgs(effectiveParams, startSeg, s.workDir, effectiveCaps))
 	procCtx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(procCtx, s.ffmpegPath, args...)
 

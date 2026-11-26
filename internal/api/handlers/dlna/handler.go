@@ -933,6 +933,7 @@ func (h *Handler) streamDLNATranscode(w http.ResponseWriter, r *http.Request, it
 		args = append(args, "-sn", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-b:v", "4000000", "-c:a", "aac", "-b:a", "192000", "-ac", "2", "-f", "mpegts", "pipe:1")
 	}
 
+	args = netutil.FilterFFmpegArgs(ffmpegPath, args)
 	cmd := exec.CommandContext(r.Context(), ffmpegPath, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

@@ -507,7 +507,7 @@ func (h *Handler) processQueuedSyncItem(ctx context.Context, work *queuedSyncWor
 		ffInput = proxy.URL()
 	}
 
-	args := buildSyncFFmpegArgs(ffInput, tmpOut, work.mediaType, work.bitrate)
+	args := netutil.FilterFFmpegArgs(ffmpegBin, buildSyncFFmpegArgs(ffInput, tmpOut, work.mediaType, work.bitrate))
 	cmd := exec.CommandContext(itemCtx, ffmpegBin, args...)
 	outBytes, runErr := cmd.CombinedOutput()
 	if itemCtx.Err() != nil {
