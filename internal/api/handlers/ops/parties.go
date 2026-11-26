@@ -1,7 +1,10 @@
 package ops
 
 import (
+	"context"
 	"crypto/subtle"
+	"errors"
+	"io"
 	"math"
 	"net/http"
 	"strings"
@@ -9,21 +12,24 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/middleware"
+	"github.com/ambra-media/ambra/internal/api/ws"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 )
 
 const (
-	maxParties            = 200
-	maxPartiesPerUser     = 10
-	minPlaybackRate       = 0.25
-	maxPlaybackRate       = 4.0
-	maxPartyNameLen       = 128
-	maxPartyInviteCodeLen = 64
-	maxPartyItemIDLen     = 128
-	maxPartyJoinFails     = 5
-	partyJoinFailWindow   = 10 * time.Minute
-	maxPartyFailBuckets   = 4096
+	maxParties              = 200
+	maxPartiesPerUser       = 10
+	minPlaybackRate         = 0.25
+	maxPlaybackRate         = 4.0
+	maxPartyNameLen         = 128
+	maxPartyInviteCodeLen   = 64
+	maxPartyItemIDLen       = 128
+	maxPartyJoinFails       = 5
+	partyJoinFailWindow     = 10 * time.Minute
+	maxPartyFailBuckets     = 4096
+	maxPartyMessagesPerRoom = 100
+	maxPartyMessageBytes    = 64 << 10
 )
 
 type partyFailWindow struct {
@@ -39,15 +45,25 @@ type PartyState struct {
 	UpdatedAt     time.Time `json:"UpdatedAt"`
 }
 
+type PartyMessage struct {
+	Id       string    `json:"Id"`
+	PartyId  string    `json:"PartyId"`
+	UserId   string    `json:"UserId"`
+	UserName string    `json:"UserName,omitempty"`
+	Text     string    `json:"Text"`
+	SentAt   time.Time `json:"SentAt"`
+}
+
 type Party struct {
-	Id          string     `json:"Id"`
-	Name        string     `json:"Name"`
-	HostUserId  string     `json:"HostUserId,omitempty"`
-	Members     []string   `json:"Members"`
-	IsPublic    bool       `json:"IsPublic"`
-	InviteCode  string     `json:"InviteCode,omitempty"`
-	State       PartyState `json:"State"`
-	DateCreated time.Time  `json:"DateCreated"`
+	Id          string         `json:"Id"`
+	Name        string         `json:"Name"`
+	HostUserId  string         `json:"HostUserId,omitempty"`
+	Members     []string       `json:"Members"`
+	IsPublic    bool           `json:"IsPublic"`
+	InviteCode  string         `json:"InviteCode,omitempty"`
+	State       PartyState     `json:"State"`
+	Messages    []PartyMessage `json:"Messages,omitempty"`
+	DateCreated time.Time      `json:"DateCreated"`
 }
 
 func callerAuth(r *http.Request) (callerID string, isAdmin bool, hasAuth bool) {
@@ -56,6 +72,13 @@ func callerAuth(r *http.Request) (callerID string, isAdmin bool, hasAuth bool) {
 		return "", false, false
 	}
 	return guid.Normalize(ac.UserID()), ac.IsAdmin(), true
+}
+
+func callerUserName(r *http.Request) string {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil {
+		return ac.User.Name
+	}
+	return ""
 }
 
 func isPartyMember(members []string, userID string) bool {
@@ -96,6 +119,9 @@ func sanitizePartyForCaller(p Party, callerID string, isAdmin, hasAuth bool) Par
 	if len(p.Members) > 0 {
 		p.Members = append([]string(nil), p.Members...)
 	}
+	if len(p.Messages) > 0 {
+		p.Messages = append([]PartyMessage(nil), p.Messages...)
+	}
 	if hasAuth && !isAdmin && (callerID == "" || guid.Normalize(p.HostUserId) != callerID) {
 		p.InviteCode = ""
 	}
@@ -106,8 +132,55 @@ func sanitizePartyForEvent(p Party) Party {
 	if len(p.Members) > 0 {
 		p.Members = append([]string(nil), p.Members...)
 	}
+	if len(p.Messages) > 0 {
+		p.Messages = append([]PartyMessage(nil), p.Messages...)
+	}
 	p.InviteCode = ""
 	return p
+}
+
+// PurgeUser removes a deleted user from all active Watch-Together parties and deletes empty rooms.
+func (h *Handler) PurgeUser(ctx context.Context, userID string) {
+	norm := guid.Normalize(userID)
+	if norm == "" {
+		return
+	}
+	h.mu.Lock()
+	changed := false
+	nextParties := make([]Party, 0, len(h.state.Parties))
+	for _, p := range h.state.Parties {
+		kept := make([]string, 0, len(p.Members))
+		removedMember := false
+		for _, m := range p.Members {
+			if guid.Normalize(m) == norm {
+				removedMember = true
+				continue
+			}
+			kept = append(kept, m)
+		}
+		if removedMember || guid.Normalize(p.HostUserId) == norm {
+			changed = true
+			if len(kept) == 0 {
+				continue
+			}
+			p.Members = kept
+			if guid.Normalize(p.HostUserId) == norm {
+				p.HostUserId = kept[0]
+			}
+		}
+		nextParties = append(nextParties, p)
+	}
+	if changed {
+		h.state.Parties = nextParties
+		_ = h.saveStateLocked(ctx)
+	}
+	h.mu.Unlock()
+}
+
+func (h *Handler) pushPartyWS(members []string, msg ws.Message) {
+	if hub := h.getWSHub(); hub != nil && len(members) > 0 {
+		hub.SendToUsers(members, msg)
+	}
 }
 
 func (h *Handler) handleListParties(w http.ResponseWriter, r *http.Request) {
@@ -124,6 +197,281 @@ func (h *Handler) handleListParties(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, items)
 }
 
+// HandleGetCurrentPartyInfo exposes GET /Parties/Info.
+func (h *Handler) HandleGetCurrentPartyInfo(w http.ResponseWriter, r *http.Request) {
+	h.handleGetCurrentPartyInfo(w, r)
+}
+
+func (h *Handler) handleGetCurrentPartyInfo(w http.ResponseWriter, r *http.Request) {
+	callerID, isAdmin, hasAuth := callerAuth(r)
+	userID := h.resolveUserID(r, httpx.ParseQuery(r).Get("UserId"))
+	if callerID == "" {
+		callerID = userID
+	}
+
+	h.mu.RLock()
+	for i := len(h.state.Parties) - 1; i >= 0; i-- {
+		p := h.state.Parties[i]
+		if userID != "" && (guid.Normalize(p.HostUserId) == userID || isPartyMember(p.Members, userID)) {
+			san := sanitizePartyForCaller(p, callerID, isAdmin, hasAuth)
+			h.mu.RUnlock()
+			httpx.JSON(w, http.StatusOK, map[string]any{
+				"InParty": true,
+				"Party":   san,
+			})
+			return
+		}
+	}
+	h.mu.RUnlock()
+	httpx.JSON(w, http.StatusOK, map[string]any{
+		"InParty": false,
+		"Party":   nil,
+	})
+}
+
+// HandleListPartyMessages exposes GET /Parties/Messages.
+func (h *Handler) HandleListPartyMessages(w http.ResponseWriter, r *http.Request) {
+	h.handleListPartyMessages(w, r)
+}
+
+func (h *Handler) handleListPartyMessages(w http.ResponseWriter, r *http.Request) {
+	partyID := strings.TrimSpace(httpx.ParseQuery(r).Get("PartyId"))
+	callerID, isAdmin, hasAuth := callerAuth(r)
+	userID := h.resolveUserID(r, "")
+	if callerID == "" {
+		callerID = userID
+	}
+
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for i := len(h.state.Parties) - 1; i >= 0; i-- {
+		p := h.state.Parties[i]
+		if partyID != "" && p.Id != partyID {
+			continue
+		}
+		isMember := userID != "" && (guid.Normalize(p.HostUserId) == userID || isPartyMember(p.Members, userID))
+		if partyID == "" && !isMember {
+			continue
+		}
+		if hasAuth && !isAdmin && !isMember {
+			httpx.Error(w, http.StatusForbidden, "only party members can view party messages")
+			return
+		}
+		msgs := append([]PartyMessage(nil), p.Messages...)
+		if msgs == nil {
+			msgs = []PartyMessage{}
+		}
+		httpx.JSON(w, http.StatusOK, msgs)
+		return
+	}
+	if partyID != "" {
+		httpx.Error(w, http.StatusNotFound, "party not found")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, []PartyMessage{})
+}
+
+// HandlePostPartyMessage exposes POST /Parties/Messages so compatcore can delegate to it.
+func (h *Handler) HandlePostPartyMessage(w http.ResponseWriter, r *http.Request) {
+	h.handlePostPartyMessage(w, r)
+}
+
+func (h *Handler) handlePostPartyMessage(w http.ResponseWriter, r *http.Request) {
+	if r.ContentLength > maxPartyMessageBytes {
+		httpx.Error(w, http.StatusRequestEntityTooLarge, "message too large")
+		return
+	}
+	var req struct {
+		PartyId string `json:"PartyId"`
+		Text    string `json:"Text"`
+		Message string `json:"Message"`
+		UserId  string `json:"UserId"`
+	}
+	if r.Body != nil {
+		err := httpx.DecodeJSONLimit(r, &req, maxPartyMessageBytes)
+		if err != nil && !errors.Is(err, io.EOF) {
+			httpx.Error(w, http.StatusBadRequest, "invalid or oversized message body")
+			return
+		}
+	}
+	q := httpx.ParseQuery(r)
+	partyID := strings.TrimSpace(req.PartyId)
+	if partyID == "" {
+		partyID = strings.TrimSpace(q.Get("PartyId"))
+	}
+	text := strings.TrimSpace(req.Text)
+	if text == "" {
+		text = strings.TrimSpace(req.Message)
+	}
+	if text == "" {
+		text = strings.TrimSpace(q.Get("Text"))
+	}
+
+	callerID, isAdmin, hasAuth := callerAuth(r)
+	userID := h.resolveUserID(r, req.UserId)
+	if callerID == "" {
+		callerID = userID
+	}
+	userName := callerUserName(r)
+
+	h.mu.Lock()
+	targetIdx := -1
+	for i := len(h.state.Parties) - 1; i >= 0; i-- {
+		p := &h.state.Parties[i]
+		if partyID != "" {
+			if p.Id == partyID {
+				targetIdx = i
+				break
+			}
+			continue
+		}
+		if userID != "" && (guid.Normalize(p.HostUserId) == userID || isPartyMember(p.Members, userID)) {
+			targetIdx = i
+			break
+		}
+	}
+	if targetIdx < 0 {
+		h.mu.Unlock()
+		if partyID != "" {
+			httpx.Error(w, http.StatusNotFound, "party not found")
+			return
+		}
+		httpx.NoContent(w)
+		return
+	}
+	p := &h.state.Parties[targetIdx]
+	isMember := userID != "" && (guid.Normalize(p.HostUserId) == userID || isPartyMember(p.Members, userID))
+	if hasAuth && !isAdmin && !isMember {
+		h.mu.Unlock()
+		httpx.Error(w, http.StatusForbidden, "only party members can send messages")
+		return
+	}
+	if text == "" {
+		h.mu.Unlock()
+		httpx.NoContent(w)
+		return
+	}
+
+	msg := PartyMessage{
+		Id:       guid.New(),
+		PartyId:  p.Id,
+		UserId:   userID,
+		UserName: userName,
+		Text:     text,
+		SentAt:   time.Now().UTC(),
+	}
+	snapshot := cloneOpsState(h.state)
+	p.Messages = append(p.Messages, msg)
+	if len(p.Messages) > maxPartyMessagesPerRoom {
+		p.Messages = append([]PartyMessage(nil), p.Messages[len(p.Messages)-maxPartyMessagesPerRoom:]...)
+	}
+	members := append([]string(nil), p.Members...)
+	err := h.saveStateLocked(r.Context())
+	if err != nil {
+		h.state = snapshot
+		h.mu.Unlock()
+		httpx.Error(w, http.StatusInternalServerError, "failed to persist party message")
+		return
+	}
+	h.mu.Unlock()
+
+	h.pushPartyWS(members, ws.Message{
+		MessageType: "GeneralCommand",
+		Data: map[string]any{
+			"Name": "DisplayMessage",
+			"Arguments": map[string]any{
+				"Header":    userName,
+				"Text":      msg.Text,
+				"PartyId":   msg.PartyId,
+				"UserId":    msg.UserId,
+				"SentAt":    msg.SentAt.Format(time.RFC3339),
+				"TimeoutMs": "5000",
+			},
+		},
+	})
+	httpx.NoContent(w)
+}
+
+// HandleLeaveCurrentParty exposes POST /Parties/Leave so compatcore can delegate to it.
+func (h *Handler) HandleLeaveCurrentParty(w http.ResponseWriter, r *http.Request) {
+	h.handleLeaveCurrentParty(w, r)
+}
+
+func (h *Handler) handleLeaveCurrentParty(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		PartyId string `json:"PartyId"`
+		UserId  string `json:"UserId"`
+	}
+	if r.Body != nil {
+		_ = httpx.DecodeJSONLimit(r, &req, 64<<10)
+	}
+	partyID := strings.TrimSpace(req.PartyId)
+	if partyID == "" {
+		partyID = strings.TrimSpace(httpx.ParseQuery(r).Get("PartyId"))
+	}
+	userID := h.resolveUserID(r, req.UserId)
+	if userID == "" {
+		httpx.NoContent(w)
+		return
+	}
+
+	h.mu.Lock()
+	snapshot := cloneOpsState(h.state)
+	changed := false
+	var notifyLists []struct {
+		members []string
+		party   Party
+	}
+	nextParties := make([]Party, 0, len(h.state.Parties))
+	for _, p := range h.state.Parties {
+		if partyID != "" && p.Id != partyID {
+			nextParties = append(nextParties, p)
+			continue
+		}
+		if !isPartyMember(p.Members, userID) && guid.Normalize(p.HostUserId) != userID {
+			nextParties = append(nextParties, p)
+			continue
+		}
+		changed = true
+		kept := make([]string, 0, len(p.Members))
+		for _, m := range p.Members {
+			if guid.Normalize(m) != userID {
+				kept = append(kept, m)
+			}
+		}
+		if len(kept) == 0 {
+			continue
+		}
+		p.Members = kept
+		if guid.Normalize(p.HostUserId) == userID {
+			p.HostUserId = kept[0]
+		}
+		nextParties = append(nextParties, p)
+		notifyLists = append(notifyLists, struct {
+			members []string
+			party   Party
+		}{members: append([]string(nil), kept...), party: sanitizePartyForEvent(p)})
+	}
+	if changed {
+		h.state.Parties = nextParties
+		if err := h.saveStateLocked(r.Context()); err != nil {
+			h.state = snapshot
+			h.mu.Unlock()
+			httpx.Error(w, http.StatusInternalServerError, "failed to persist party leave")
+			return
+		}
+	}
+	h.mu.Unlock()
+
+	for _, n := range notifyLists {
+		h.pushPartyWS(n.members, ws.Message{
+			MessageType: "PartyUpdated",
+			Data:        n.party,
+		})
+	}
+	httpx.NoContent(w)
+}
+
 func (h *Handler) handleCreateParty(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name          string `json:"Name"`
@@ -134,7 +482,7 @@ func (h *Handler) handleCreateParty(w http.ResponseWriter, r *http.Request) {
 		IsPublic      *bool  `json:"IsPublic"`
 		InviteCode    string `json:"InviteCode"`
 	}
-	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 64<<10); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid party payload")
 		return
 	}
@@ -296,7 +644,7 @@ func (h *Handler) handleJoinParty(w http.ResponseWriter, r *http.Request) {
 		InviteCode string `json:"InviteCode"`
 	}
 	if r.Body != nil {
-		_ = httpx.DecodeJSONLimit(r, &req, 0)
+		_ = httpx.DecodeJSONLimit(r, &req, 64<<10)
 	}
 	inviteCode := strings.TrimSpace(req.InviteCode)
 	if inviteCode == "" {
@@ -363,7 +711,16 @@ func (h *Handler) handleJoinParty(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			party := sanitizePartyForCaller(*p, callerID, isAdmin, hasAuth)
+			eventParty := sanitizePartyForEvent(*p)
+			members := append([]string(nil), p.Members...)
 			h.mu.Unlock()
+
+			if !exists {
+				h.pushPartyWS(members, ws.Message{
+					MessageType: "PartyUpdated",
+					Data:        eventParty,
+				})
+			}
 			httpx.JSON(w, http.StatusOK, party)
 			return
 		}
@@ -390,7 +747,7 @@ func (h *Handler) handleLeaveParty(w http.ResponseWriter, r *http.Request) {
 		UserId string `json:"UserId"`
 	}
 	if r.Body != nil {
-		_ = httpx.DecodeJSONLimit(r, &req, 0)
+		_ = httpx.DecodeJSONLimit(r, &req, 64<<10)
 	}
 	userID := h.resolveUserID(r, req.UserId)
 	if userID == "" {
@@ -423,6 +780,8 @@ func (h *Handler) handleLeaveParty(w http.ResponseWriter, r *http.Request) {
 					kept = append(kept, m)
 				}
 			}
+			var eventParty *Party
+			var notifyMembers []string
 			if len(kept) == 0 {
 				h.state.Parties = append(h.state.Parties[:i], h.state.Parties[i+1:]...)
 			} else {
@@ -430,6 +789,9 @@ func (h *Handler) handleLeaveParty(w http.ResponseWriter, r *http.Request) {
 				if guid.Normalize(p.HostUserId) == userID {
 					h.state.Parties[i].HostUserId = kept[0]
 				}
+				ep := sanitizePartyForEvent(h.state.Parties[i])
+				eventParty = &ep
+				notifyMembers = append([]string(nil), kept...)
 			}
 			if err := h.saveStateLocked(r.Context()); err != nil {
 				h.state = snapshot
@@ -438,6 +800,13 @@ func (h *Handler) handleLeaveParty(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			h.mu.Unlock()
+
+			if eventParty != nil {
+				h.pushPartyWS(notifyMembers, ws.Message{
+					MessageType: "PartyUpdated",
+					Data:        *eventParty,
+				})
+			}
 			httpx.NoContent(w)
 			return
 		}
@@ -454,7 +823,7 @@ func (h *Handler) handleUpdatePartyState(w http.ResponseWriter, r *http.Request)
 		IsPaused      *bool    `json:"IsPaused"`
 		PlaybackRate  *float64 `json:"PlaybackRate"`
 	}
-	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 64<<10); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid party state payload")
 		return
 	}
@@ -476,6 +845,10 @@ func (h *Handler) handleUpdatePartyState(w http.ResponseWriter, r *http.Request)
 	}
 
 	callerID, isAdmin, hasAuth := callerAuth(r)
+	actorID := h.resolveUserID(r, "")
+	if callerID == "" {
+		callerID = actorID
+	}
 
 	h.mu.Lock()
 	for i := range h.state.Parties {
@@ -501,8 +874,10 @@ func (h *Handler) handleUpdatePartyState(w http.ResponseWriter, r *http.Request)
 				st.PlaybackRate = *req.PlaybackRate
 			}
 			st.UpdatedAt = time.Now().UTC()
+			stateCopy := *st
 			respParty := sanitizePartyForCaller(*p, callerID, isAdmin, hasAuth)
 			eventParty := sanitizePartyForEvent(*p)
+			members := append([]string(nil), p.Members...)
 			if err := h.saveStateLocked(r.Context()); err != nil {
 				h.state = snapshot
 				h.mu.Unlock()
@@ -517,6 +892,25 @@ func (h *Handler) handleUpdatePartyState(w http.ResponseWriter, r *http.Request)
 					Payload: eventParty,
 				})
 			}
+			playstateCmd := "Unpause"
+			if stateCopy.IsPaused {
+				playstateCmd = "Pause"
+			} else if req.PositionTicks != nil {
+				playstateCmd = "Seek"
+			}
+			h.pushPartyWS(members, ws.Message{
+				MessageType: "Playstate",
+				Data: map[string]any{
+					"Command":           playstateCmd,
+					"SeekPositionTicks": stateCopy.PositionTicks,
+					"PositionTicks":     stateCopy.PositionTicks,
+					"IsPaused":          stateCopy.IsPaused,
+					"PlaybackRate":      stateCopy.PlaybackRate,
+					"ItemId":            stateCopy.ItemId,
+					"PartyId":           id,
+					"ControllingUserId": callerID,
+				},
+			})
 			httpx.JSON(w, http.StatusOK, respParty)
 			return
 		}

@@ -405,12 +405,23 @@ func TestSetupErrorPaths(t *testing.T) {
 
 	hBad := NewHandler(badCfg, userRepo, nil).WithSetupDeps(SetupDeps{Auth: authSvc})
 
+	// CompleteSetup with 0 users must return 400 (H-06)
 	rec := httptest.NewRecorder()
+	hBad.CompleteSetup(rec, httptest.NewRequest(http.MethodPost, "/api/setup/complete", bytes.NewBufferString(`{}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on CompleteSetup with 0 users, got %d", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
 	hBad.SetupAdmin(rec, httptest.NewRequest(http.MethodPost, "/api/setup/admin", bytes.NewBufferString(`{"username":"admin","password":"password123"}`)))
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 on SetupAdmin Save failure, got %d", rec.Code)
 	}
 
+	// Seed a user so CompleteSetup reaches cfg.Save() and returns 500 on badCfg
+	if _, err := authSvc.CreateUser(context.Background(), "seedadmin", "password123", true); err != nil {
+		t.Fatal(err)
+	}
 	rec = httptest.NewRecorder()
 	hBad.CompleteSetup(rec, httptest.NewRequest(http.MethodPost, "/api/setup/complete", bytes.NewBufferString(`{}`)))
 	if rec.Code != http.StatusInternalServerError {

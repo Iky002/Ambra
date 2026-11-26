@@ -19,11 +19,14 @@ import (
 )
 
 type fullMockWSHub struct {
-	mu                     sync.Mutex
-	sentUserDevices        []struct{ userID, deviceID string; msg ws.Message }
-	disconnectedDevices    []string
-	disconnectedUserDevs   []struct{ userID, deviceID string }
-	disconnectedUsers      []string
+	mu              sync.Mutex
+	sentUserDevices []struct {
+		userID, deviceID string
+		msg              ws.Message
+	}
+	disconnectedDevices  []string
+	disconnectedUserDevs []struct{ userID, deviceID string }
+	disconnectedUsers    []string
 }
 
 func (m *fullMockWSHub) SendToUserDevice(userID, deviceID string, msg ws.Message) {
@@ -277,10 +280,10 @@ func TestCompatCoreV0104SecurityRemediations(t *testing.T) {
 		t.Fatalf("501st HomeSection expected 400, got %d (%s)", r.Code, r.Body.String())
 	}
 
-	// 5. Per-userID rate limit on authenticateUserByID across distinct IPs
+	// 5. [M-03] Composite (ClientIP, UserID) failure-only rate limit on authenticateUserByID + loopback exemption
 	for i := 0; i < authByIDRateLimit; i++ {
 		req := httptest.NewRequest(http.MethodPost, "/Users/"+env.user2.ID+"/Authenticate", strings.NewReader(`{"Pw":"wrong"}`))
-		req.RemoteAddr = "198.51.100." + string(rune('1'+(i%9))) + string(rune('0'+(i/9))) + ":1234"
+		req.RemoteAddr = "198.51.100.42:1234"
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
 		if w.Code != http.StatusUnauthorized {
@@ -288,11 +291,19 @@ func TestCompatCoreV0104SecurityRemediations(t *testing.T) {
 		}
 	}
 	req429 := httptest.NewRequest(http.MethodPost, "/Users/"+env.user2.ID+"/Authenticate", strings.NewReader(`{"Pw":"wrong"}`))
-	req429.RemoteAddr = "203.0.113.250:1234"
+	req429.RemoteAddr = "198.51.100.42:1234"
 	w429 := httptest.NewRecorder()
 	router.ServeHTTP(w429, req429)
 	if w429.Code != http.StatusTooManyRequests {
-		t.Fatalf("authByID per-userID rate limit expected 429, got %d", w429.Code)
+		t.Fatalf("authByID composite rate limit expected 429 for offending IP, got %d", w429.Code)
+	}
+	// Legitimate login from loopback (or another IP) for the same user MUST NOT be locked out!
+	reqLoop := httptest.NewRequest(http.MethodPost, "/Users/"+env.user2.ID+"/Authenticate", strings.NewReader(`{"Pw":"pass"}`))
+	reqLoop.RemoteAddr = "127.0.0.1:9999"
+	wLoop := httptest.NewRecorder()
+	router.ServeHTTP(wLoop, reqLoop)
+	if wLoop.Code != http.StatusOK {
+		t.Fatalf("M-03: loopback login must not be locked out by external brute-force, got %d", wLoop.Code)
 	}
 	var dummy dto.UserDto
 	_ = json.Unmarshal([]byte(`{}`), &dummy)

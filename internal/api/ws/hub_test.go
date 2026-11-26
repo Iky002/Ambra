@@ -319,3 +319,74 @@ func TestHubSecurityDeviceIDBindingAndAdminSubscriptions(t *testing.T) {
 		t.Fatalf("non-admin must not receive ScheduledTasksInfo; expected KeepAlive, got %+v", m)
 	}
 }
+
+func TestHubSessionsStartThrottlingSendToUsersAndGlobalRemoteAccess(t *testing.T) {
+	hub, authSvc, _, bus, srv := setupWSHub(t)
+	ctx := context.Background()
+
+	u1, _ := authSvc.CreateUser(ctx, "throttle_admin", "pw", true)
+	u2, _ := authSvc.CreateUser(ctx, "party_member", "pw", false)
+	res1, _ := authSvc.AuthenticateByName(ctx, "throttle_admin", "pw", "", auth.ClientInfo{DeviceID: "d1"})
+	res2, _ := authSvc.AuthenticateByName(ctx, "party_member", "pw", "", auth.ClientInfo{DeviceID: "d2"})
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	conn1, _, err := websocket.Dial(ctx, wsURL+"/embywebsocket?api_key="+res1.AccessToken, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn1.Close(websocket.StatusNormalClosure, "")
+	_ = readMsg(t, conn1) // ForceKeepAlive
+
+	conn2, _, err := websocket.Dial(ctx, wsURL+"/embywebsocket?api_key="+res2.AccessToken, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close(websocket.StatusNormalClosure, "")
+	_ = readMsg(t, conn2) // ForceKeepAlive
+
+	// Subscribe with "0,120" -> immediate initial snapshot, then coalesce burst updates within 120ms
+	if err := wsjson.Write(ctx, conn1, Message{MessageType: "SessionsStart", Data: "0,120"}); err != nil {
+		t.Fatal(err)
+	}
+	if m := readMsg(t, conn1); m.MessageType != "Sessions" {
+		t.Fatalf("expected immediate initial Sessions snapshot, got %+v", m)
+	}
+
+	// Emit a burst of 6 EventSessionUpdated notifications inside the 120ms throttle window
+	for i := 0; i < 6; i++ {
+		bus.Publish(ctx, eventbus.Event{Type: eventbus.EventSessionUpdated})
+	}
+	// Wait past the 120ms window for the single coalesced trailing flush
+	if m := readMsg(t, conn1); m.MessageType != "Sessions" {
+		t.Fatalf("expected coalesced Sessions flush, got %+v", m)
+	}
+	// Verify no extra duplicate burst messages were queued
+	_ = wsjson.Write(ctx, conn1, Message{MessageType: "KeepAlive"})
+	if m := readMsg(t, conn1); m.MessageType != "KeepAlive" {
+		t.Fatalf("expected burst of 6 events to coalesce into 1 Sessions message, got extra %+v", m)
+	}
+
+	// SendToUsers delivers Party Playstate/chat messages to targeted users
+	hub.SendToUsers([]string{u1.ID, u2.ID}, Message{MessageType: "Playstate", Data: map[string]any{"Command": "Pause"}})
+	if m := readMsg(t, conn1); m.MessageType != "Playstate" {
+		t.Fatalf("expected Playstate on conn1, got %+v", m)
+	}
+	if m := readMsg(t, conn2); m.MessageType != "Playstate" {
+		t.Fatalf("expected Playstate on conn2, got %+v", m)
+	}
+
+	// Global remote access disabled rejects external HTTP handshake before WS upgrade (C-01)
+	cfg := authSvc.Config()
+	cfg.Update(func(c *config.Config) {
+		f := false
+		c.EnableRemoteAccessGlobal = &f
+	})
+	hub.SetConfig(cfg)
+	reqExt := httptest.NewRequest(http.MethodGet, "/embywebsocket?api_key="+res1.AccessToken, nil)
+	reqExt.RemoteAddr = "203.0.113.99:55555"
+	recExt := httptest.NewRecorder()
+	hub.ServeHTTP(recExt, reqExt)
+	if recExt.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when global remote access disabled for external WS handshake, got %d", recExt.Code)
+	}
+}

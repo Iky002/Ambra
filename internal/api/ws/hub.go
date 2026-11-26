@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/middleware"
+	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/auth"
 	"github.com/ambra-media/ambra/internal/core/session"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
@@ -45,21 +47,38 @@ type incomingMessage struct {
 }
 
 type clientConn struct {
-	id          string
-	userID      string
-	user        *sqlite.UserRecord
-	deviceID    string
-	token       string
-	isAPIKey    bool
-	isAdmin     bool
-	conn        *websocket.Conn
-	sendCh      chan Message
-	cancel      context.CancelFunc
+	id       string
+	userID   string
+	user     *sqlite.UserRecord
+	deviceID string
+	token    string
+	isAPIKey bool
+	isAdmin  bool
+	conn     *websocket.Conn
+	sendCh   chan Message
+	cancel   context.CancelFunc
 
-	mu          sync.RWMutex
-	subSessions bool
-	subTasks    bool
-	subActivity bool
+	mu               sync.RWMutex
+	closed           bool
+	subSessions      bool
+	sessionsInterval time.Duration
+	lastSessionsSent time.Time
+	sessionsPending  bool
+	sessionsTimer    *time.Timer
+	subTasks         bool
+	subActivity      bool
+}
+
+func (c *clientConn) stopTimers() {
+	c.mu.Lock()
+	c.closed = true
+	c.subSessions = false
+	c.sessionsPending = false
+	if c.sessionsTimer != nil {
+		c.sessionsTimer.Stop()
+		c.sessionsTimer = nil
+	}
+	c.mu.Unlock()
 }
 
 func (c *clientConn) trySend(msg Message) {
@@ -82,6 +101,7 @@ type Hub struct {
 	authSvc           *auth.Service
 	sessionMgr        *session.Manager
 	bus               *eventbus.Bus
+	cfg               *config.Config
 	maxClients        int
 	maxClientsPerUser int
 	readTimeout       time.Duration
@@ -94,10 +114,15 @@ type Hub struct {
 }
 
 func NewHub(authSvc *auth.Service, sessionMgr *session.Manager, bus *eventbus.Bus) *Hub {
+	var cfg *config.Config
+	if authSvc != nil {
+		cfg = authSvc.Config()
+	}
 	h := &Hub{
 		authSvc:           authSvc,
 		sessionMgr:        sessionMgr,
 		bus:               bus,
+		cfg:               cfg,
 		maxClients:        defaultMaxWSClients,
 		maxClientsPerUser: defaultMaxWSPerUser,
 		readTimeout:       defaultReadTimeout,
@@ -105,6 +130,32 @@ func NewHub(authSvc *auth.Service, sessionMgr *session.Manager, bus *eventbus.Bu
 	}
 	h.subscribeEvents()
 	return h
+}
+
+// SetConfig configures server-wide configuration for remote access checks.
+func (h *Hub) SetConfig(cfg *config.Config) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.cfg = cfg
+	h.mu.Unlock()
+}
+
+func (h *Hub) isGlobalRemoteAccessEnabled() bool {
+	if h == nil {
+		return true
+	}
+	h.mu.RLock()
+	cfg := h.cfg
+	h.mu.RUnlock()
+	if cfg == nil && h.authSvc != nil {
+		cfg = h.authSvc.Config()
+	}
+	if cfg == nil {
+		return true
+	}
+	return cfg.Snapshot().IsGlobalRemoteAccessEnabled()
 }
 
 // SetAllowedOrigins configures an optional Origin allowlist for browser WebSocket handshakes.
@@ -230,29 +281,57 @@ func (h *Hub) subscribeEvents() {
 		if h.sessionMgr == nil {
 			return
 		}
-		allSessions := h.sessionMgr.ListSessions()
-		adminMsg := Message{
-			MessageType: "Sessions",
-			Data:        allSessions,
-		}
 		h.mu.RLock()
+		snapshot := make([]*clientConn, 0, len(h.clients))
 		for _, c := range h.clients {
-			c.mu.RLock()
-			subscribed := c.subSessions
-			c.mu.RUnlock()
-			if !subscribed {
-				continue
-			}
-			if c.isAdmin {
-				c.trySend(adminMsg)
-			} else {
-				c.trySend(Message{
-					MessageType: "Sessions",
-					Data:        filterSessionsForUser(allSessions, c.userID),
-				})
-			}
+			snapshot = append(snapshot, c)
 		}
 		h.mu.RUnlock()
+
+		now := time.Now()
+		var immediate []*clientConn
+		for _, c := range snapshot {
+			c.mu.Lock()
+			if c.closed || !c.subSessions {
+				c.mu.Unlock()
+				continue
+			}
+			if c.sessionsInterval <= 0 {
+				c.lastSessionsSent = now
+				c.sessionsPending = false
+				c.mu.Unlock()
+				immediate = append(immediate, c)
+				continue
+			}
+			elapsed := now.Sub(c.lastSessionsSent)
+			if (!c.lastSessionsSent.IsZero() && elapsed < c.sessionsInterval) || c.sessionsTimer != nil {
+				c.sessionsPending = true
+				if c.sessionsTimer == nil {
+					wait := c.sessionsInterval - elapsed
+					if wait <= 0 {
+						wait = c.sessionsInterval
+					}
+					target := c
+					c.sessionsTimer = time.AfterFunc(wait, func() {
+						h.flushPendingSessions(target)
+					})
+				}
+				c.mu.Unlock()
+				continue
+			}
+			c.lastSessionsSent = now
+			c.sessionsPending = false
+			c.mu.Unlock()
+			immediate = append(immediate, c)
+		}
+
+		if len(immediate) == 0 {
+			return
+		}
+		allSessions := h.sessionMgr.ListSessions()
+		for _, c := range immediate {
+			h.sendSessionsSnapshotToClient(c, allSessions)
+		}
 	})
 
 	h.bus.Subscribe(eventbus.EventTaskProgress, func(_ context.Context, e eventbus.Event) {
@@ -296,6 +375,72 @@ func (h *Hub) subscribeEvents() {
 	})
 }
 
+func (h *Hub) sendSessionsSnapshotToClient(c *clientConn, allSessions []dto.SessionInfo) {
+	if c == nil {
+		return
+	}
+	if c.isAdmin || c.isAPIKey {
+		c.trySend(Message{
+			MessageType: "Sessions",
+			Data:        allSessions,
+		})
+		return
+	}
+	c.trySend(Message{
+		MessageType: "Sessions",
+		Data:        filterSessionsForUser(allSessions, c.userID),
+	})
+}
+
+func (h *Hub) flushPendingSessions(c *clientConn) {
+	c.mu.Lock()
+	c.sessionsTimer = nil
+	if c.closed || !c.subSessions || !c.sessionsPending {
+		c.sessionsPending = false
+		c.mu.Unlock()
+		return
+	}
+	c.sessionsPending = false
+	c.lastSessionsSent = time.Now()
+	c.mu.Unlock()
+
+	if h.sessionMgr == nil {
+		return
+	}
+	h.sendSessionsSnapshotToClient(c, h.sessionMgr.ListSessions())
+}
+
+func parseSubscriptionTiming(raw json.RawMessage) (time.Duration, time.Duration) {
+	if len(raw) == 0 {
+		return 0, 0
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		s = strings.Trim(string(raw), "\" \t\r\n")
+	}
+	s = strings.TrimSpace(s)
+	if s == "" || s == "null" {
+		return 0, 0
+	}
+	clampMs := func(ms int64) time.Duration {
+		if ms <= 0 {
+			return 0
+		}
+		if ms > 60_000 {
+			ms = 60_000
+		}
+		return time.Duration(ms) * time.Millisecond
+	}
+	parts := strings.Split(s, ",")
+	if len(parts) == 1 {
+		ms, _ := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64)
+		return 0, clampMs(ms)
+	}
+	initMs, _ := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64)
+	intvMs, _ := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+	return clampMs(initMs), clampMs(intvMs)
+}
+
 func filterSessionsForUser(sessions []dto.SessionInfo, userID string) []dto.SessionInfo {
 	norm := guid.Normalize(userID)
 	if norm == "" {
@@ -305,6 +450,13 @@ func filterSessionsForUser(sessions []dto.SessionInfo, userID string) []dto.Sess
 	for _, s := range sessions {
 		if guid.Normalize(s.UserId) == norm {
 			out = append(out, s)
+			continue
+		}
+		for _, au := range s.AdditionalUsers {
+			if guid.Normalize(au.UserId) == norm {
+				out = append(out, s)
+				break
+			}
 		}
 	}
 	return out
@@ -368,9 +520,15 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !id.IsAPIKey && id.User != nil && !id.User.Policy.EnableRemoteAccess && !netutil.IsLocalOrLANRequest(r) {
-		httpx.Error(w, http.StatusForbidden, "Remote access is disabled for this user")
-		return
+	if !id.IsAPIKey && !netutil.IsLocalOrLANRequest(r) {
+		if !h.isGlobalRemoteAccessEnabled() {
+			httpx.Error(w, http.StatusForbidden, "Remote access is disabled on this server")
+			return
+		}
+		if id.User != nil && !id.User.Policy.EnableRemoteAccess {
+			httpx.Error(w, http.StatusForbidden, "Remote access is disabled for this user")
+			return
+		}
 	}
 
 	limit := h.maxClients
@@ -482,22 +640,37 @@ func (h *Hub) readLoop(ctx context.Context, client *clientConn) {
 		case "KeepAlive":
 			client.trySend(Message{MessageType: "KeepAlive"})
 		case "SessionsStart":
+			initDelay, interval := parseSubscriptionTiming(in.Data)
 			client.mu.Lock()
+			if client.sessionsTimer != nil {
+				client.sessionsTimer.Stop()
+				client.sessionsTimer = nil
+			}
 			client.subSessions = true
-			client.mu.Unlock()
-			if h.sessionMgr != nil {
-				sessions := h.sessionMgr.ListSessions()
-				if !client.isAdmin {
-					sessions = filterSessionsForUser(sessions, client.userID)
-				}
-				client.trySend(Message{
-					MessageType: "Sessions",
-					Data:        sessions,
+			client.sessionsInterval = interval
+			if initDelay > 0 {
+				client.sessionsPending = true
+				cRef := client
+				client.sessionsTimer = time.AfterFunc(initDelay, func() {
+					h.flushPendingSessions(cRef)
 				})
+				client.mu.Unlock()
+			} else {
+				client.sessionsPending = false
+				client.lastSessionsSent = time.Now()
+				client.mu.Unlock()
+				if h.sessionMgr != nil {
+					h.sendSessionsSnapshotToClient(client, h.sessionMgr.ListSessions())
+				}
 			}
 		case "SessionsStop":
 			client.mu.Lock()
 			client.subSessions = false
+			client.sessionsPending = false
+			if client.sessionsTimer != nil {
+				client.sessionsTimer.Stop()
+				client.sessionsTimer = nil
+			}
 			client.mu.Unlock()
 		case "ScheduledTasksInfoStart":
 			if !client.isAdmin {
@@ -565,8 +738,12 @@ func (h *Hub) tryRegister(c *clientConn, limit, perUserLimit int) bool {
 
 func (h *Hub) unregister(id string) {
 	h.mu.Lock()
+	c := h.clients[id]
 	delete(h.clients, id)
 	h.mu.Unlock()
+	if c != nil {
+		c.stopTimers()
+	}
 }
 
 func (h *Hub) Broadcast(msg Message) {
@@ -582,6 +759,32 @@ func (h *Hub) SendToUser(userID string, msg Message) {
 	h.mu.RLock()
 	for _, c := range h.clients {
 		if c.isAPIKey || guid.Normalize(c.userID) == norm {
+			c.trySend(msg)
+		}
+	}
+	h.mu.RUnlock()
+}
+
+// SendToUsers delivers msg to all active WebSocket connections belonging to any user in userIDs.
+func (h *Hub) SendToUsers(userIDs []string, msg Message) {
+	if h == nil || len(userIDs) == 0 {
+		return
+	}
+	targets := make(map[string]struct{}, len(userIDs))
+	for _, uid := range userIDs {
+		if norm := guid.Normalize(uid); norm != "" {
+			targets[norm] = struct{}{}
+		}
+	}
+	if len(targets) == 0 {
+		return
+	}
+	h.mu.RLock()
+	for _, c := range h.clients {
+		if c.isAPIKey {
+			continue
+		}
+		if _, ok := targets[guid.Normalize(c.userID)]; ok {
 			c.trySend(msg)
 		}
 	}
@@ -625,6 +828,7 @@ func (h *Hub) DisconnectDevice(deviceID string) {
 	h.mu.Unlock()
 
 	for _, c := range targets {
+		c.stopTimers()
 		c.cancel()
 		_ = c.conn.Close(websocket.StatusPolicyViolation, "device revoked")
 	}
@@ -647,6 +851,7 @@ func (h *Hub) DisconnectUserDevice(userID, deviceID string) {
 	h.mu.Unlock()
 
 	for _, c := range targets {
+		c.stopTimers()
 		c.cancel()
 		_ = c.conn.Close(websocket.StatusPolicyViolation, "device revoked")
 	}
@@ -670,6 +875,7 @@ func (h *Hub) DisconnectUserExceptToken(userID, keepToken string) {
 	h.mu.Unlock()
 
 	for _, c := range targets {
+		c.stopTimers()
 		c.cancel()
 		_ = c.conn.Close(websocket.StatusPolicyViolation, "user session revoked")
 	}
@@ -692,6 +898,7 @@ func (h *Hub) DisconnectUser(userID string) {
 	h.mu.Unlock()
 
 	for _, c := range targets {
+		c.stopTimers()
 		c.cancel()
 		_ = c.conn.Close(websocket.StatusPolicyViolation, "user session revoked")
 	}
@@ -714,6 +921,7 @@ func (h *Hub) DisconnectToken(token string) {
 	h.mu.Unlock()
 
 	for _, c := range targets {
+		c.stopTimers()
 		c.cancel()
 		_ = c.conn.Close(websocket.StatusPolicyViolation, "token revoked")
 	}
@@ -733,6 +941,7 @@ func (h *Hub) Close() {
 	h.mu.Unlock()
 
 	for _, c := range targets {
+		c.stopTimers()
 		if c.cancel != nil {
 			c.cancel()
 		}

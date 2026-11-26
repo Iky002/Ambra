@@ -160,3 +160,58 @@ func TestPlaybackLifecycleAndAutoPlayed(t *testing.T) {
 		}
 	}
 }
+
+func TestAdditionalUsersCoWatchPlayedAndRename(t *testing.T) {
+	mgr, _, repo, _, alice, itemID := setupSessionTest(t)
+	ctx := context.Background()
+	client := auth.ClientInfo{Client: "Ambra Web", Device: "TV", DeviceID: "dev-tv", Version: "1.0"}
+
+	bob := &sqlite.UserRecord{
+		ID:     guid.New(),
+		Name:   "bob",
+		Policy: sqlite.DefaultUserPolicy(false),
+		Config: sqlite.DefaultUserConfig(),
+	}
+	if err := repo.CreateUser(ctx, bob); err != nil {
+		t.Fatal(err)
+	}
+
+	sess := mgr.TouchSession(alice, client)
+	found, err := mgr.AddAdditionalUser(ctx, sess.Id, bob.ID)
+	if err != nil || !found {
+		t.Fatalf("AddAdditionalUser: found=%v err=%v", found, err)
+	}
+
+	got, ok := mgr.GetSession(sess.Id)
+	if !ok || len(got.AdditionalUsers) != 1 || got.AdditionalUsers[0].UserId != bob.ID || got.AdditionalUsers[0].UserName != "bob" {
+		t.Fatalf("expected bob in AdditionalUsers, got %+v", got.AdditionalUsers)
+	}
+
+	// Rename both primary and co-watching users (L-03)
+	mgr.UpdateUserName(alice.ID, "AliceRenamed")
+	mgr.UpdateUserName(bob.ID, "BobRenamed")
+	got, _ = mgr.GetSession(sess.Id)
+	if got.UserName != "AliceRenamed" || got.AdditionalUsers[0].UserName != "BobRenamed" {
+		t.Fatalf("expected updated names in session, got user=%q additional=%+v", got.UserName, got.AdditionalUsers)
+	}
+
+	// Completing playback marks item Played for BOTH primary user and AdditionalUsers member
+	if err := mgr.ReportPlaybackStopped(ctx, alice, client, PlaybackStoppedRequest{
+		ItemId:        itemID,
+		PositionTicks: 9500,
+	}); err != nil {
+		t.Fatalf("ReportPlaybackStopped: %v", err)
+	}
+	bobUD, err := repo.GetUserItemData(ctx, bob.ID, itemID)
+	if err != nil || !bobUD.Played || bobUD.PlayCount != 1 {
+		t.Fatalf("expected co-watching user bob to be marked played, got %+v err=%v", bobUD, err)
+	}
+
+	if !mgr.RemoveAdditionalUser(sess.Id, bob.ID) {
+		t.Fatal("expected RemoveAdditionalUser to succeed")
+	}
+	got, _ = mgr.GetSession(sess.Id)
+	if len(got.AdditionalUsers) != 0 {
+		t.Fatalf("expected empty AdditionalUsers after remove, got %+v", got.AdditionalUsers)
+	}
+}

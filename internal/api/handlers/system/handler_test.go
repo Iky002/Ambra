@@ -109,7 +109,7 @@ func TestPublicSystemRoutes(t *testing.T) {
 		}
 	}
 
-	// Localization, Registrations, Features
+	// Localization, Registrations, ConfigurationPages (public); /Features moved to RequireAdmin (H-09)
 	for _, path := range []string{
 		"/Branding/Configuration",
 		"/Branding/Css",
@@ -119,13 +119,22 @@ func TestPublicSystemRoutes(t *testing.T) {
 		"/Localization/Options",
 		"/Localization/ParentalRatings",
 		"/Registrations/Ambra",
-		"/Features",
+		"/web/ConfigurationPages",
 	} {
 		rec = httptest.NewRecorder()
 		r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 		if rec.Code != http.StatusOK {
 			t.Errorf("GET %s: expected 200, got %d", path, rec.Code)
 		}
+	}
+
+	// Host header sanitization on /System/Info/Public (L-03)
+	reqBadHost := httptest.NewRequest(http.MethodGet, "/System/Info/Public", nil)
+	reqBadHost.Host = "evil.example.com/../../phish?x=1"
+	recBadHost := httptest.NewRecorder()
+	r.ServeHTTP(recBadHost, reqBadHost)
+	if recBadHost.Code != http.StatusOK || !strings.Contains(recBadHost.Body.String(), `"LocalAddress":"http://localhost:8096"`) {
+		t.Fatalf("expected invalid Host fallback to localhost:8096, got %d %s", recBadHost.Code, recBadHost.Body.String())
 	}
 }
 
@@ -242,20 +251,43 @@ func TestAuthenticatedAndAdminSystemRoutes(t *testing.T) {
 		t.Fatalf("Branding/Css mismatch: %q", rec.Body.String())
 	}
 
-	// ActivityLogEntries
+	// ActivityLogEntries (with Severity & SearchTerm filters)
 	_ = userRepo.CreateActivityLog(ctx, &sqlite.ActivityLogRecord{
 		Name: "Login", Type: "Auth", Severity: "Info",
 	})
+	_ = userRepo.CreateActivityLog(ctx, &sqlite.ActivityLogRecord{
+		Name: "DiskAlert", Type: "Storage", Severity: "Error",
+	})
 	minDate := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
-	req = httptest.NewRequest(http.MethodGet, "/System/ActivityLog/Entries?StartIndex=0&Limit=10&MinDate="+minDate, nil)
+	req = httptest.NewRequest(http.MethodGet, "/System/ActivityLog/Entries?StartIndex=0&Limit=10&MinDate="+minDate+"&Severity=Error&SearchTerm=Disk", nil)
 	req.Header.Set("X-Emby-Token", adminTok)
 	rec = httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Login") {
-		t.Fatalf("GetActivityLogEntries failed: %d %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "DiskAlert") || strings.Contains(rec.Body.String(), "Login") {
+		t.Fatalf("GetActivityLogEntries filtered failed: %d %s", rec.Code, rec.Body.String())
 	}
 
-	// GET /Plugins
+	// GET /Features & GET /Plugins require admin (H-09)
+	for _, adminPath := range []string{"/Features", "/Plugins"} {
+		req = httptest.NewRequest(http.MethodGet, adminPath, nil)
+		req.Header.Set("X-Emby-Token", viewerTok)
+		rec = httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 for viewer on %s, got %d", adminPath, rec.Code)
+		}
+	}
+
+	// GET /Features as admin -> 200
+	req = httptest.NewRequest(http.MethodGet, "/Features", nil)
+	req.Header.Set("X-Emby-Token", adminTok)
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for admin /Features, got %d", rec.Code)
+	}
+
+	// GET /Plugins as admin -> 200
 	req = httptest.NewRequest(http.MethodGet, "/Plugins", nil)
 	req.Header.Set("X-Emby-Token", adminTok)
 	rec = httptest.NewRecorder()
@@ -350,7 +382,7 @@ func TestSystemConfigMaskingAndActivityLogAdminOnly(t *testing.T) {
 		t.Fatalf("expected TMDBApiKey masked for non-admin, got %q", viewerCfg.TMDBApiKey)
 	}
 
-	// Admin GET /System/Configuration receives the configured TMDBApiKey.
+	// Admin GET /System/Configuration masks TMDBApiKey as "********" + HasTMDBApiKey=true (H-13).
 	req = httptest.NewRequest(http.MethodGet, "/System/Configuration", nil)
 	req.Header.Set("X-Emby-Token", adminTok)
 	rec = httptest.NewRecorder()
@@ -362,8 +394,25 @@ func TestSystemConfigMaskingAndActivityLogAdminOnly(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &adminCfg); err != nil {
 		t.Fatal(err)
 	}
-	if adminCfg.TMDBApiKey != "secret-tmdb-key" {
-		t.Fatalf("expected TMDBApiKey=secret-tmdb-key for admin, got %q", adminCfg.TMDBApiKey)
+	if adminCfg.TMDBApiKey != "********" || !adminCfg.HasTMDBApiKey {
+		t.Fatalf("expected masked TMDBApiKey=******** and HasTMDBApiKey=true for admin, got key=%q has=%v", adminCfg.TMDBApiKey, adminCfg.HasTMDBApiKey)
+	}
+
+	// Posting "********" via /System/Configuration/Partial preserves original TMDBApiKey and updates new fields
+	req = httptest.NewRequest(http.MethodPost, "/System/Configuration/Partial", bytes.NewBufferString(`{"TMDBApiKey":"********","EnableDLNA":true,"SimultaneousStreamLimit":4}`))
+	req.Header.Set("X-Emby-Token", adminTok)
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("POST /System/Configuration/Partial expected 204, got %d %s", rec.Code, rec.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodGet, "/System/Configuration", nil)
+	req.Header.Set("X-Emby-Token", adminTok)
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	_ = json.Unmarshal(rec.Body.Bytes(), &adminCfg)
+	if !adminCfg.HasTMDBApiKey || !adminCfg.EnableDLNA || adminCfg.SimultaneousStreamLimit != 4 {
+		t.Fatalf("unexpected config after Partial update: %+v", adminCfg)
 	}
 
 	// ActivityLog must be admin-only: viewer -> 403, admin -> 200.

@@ -884,7 +884,8 @@ func (s *Service) CollectHealth(ctx context.Context) (*SystemHealthReport, error
 	}
 
 	if s.cfg != nil {
-		dbPath := s.cfg.DBPath()
+		snap := s.cfg.Snapshot()
+		dbPath := (&snap).DBPath()
 		dbSize := fileSizeOrZero(dbPath)
 		walSize := fileSizeOrZero(dbPath + "-wal")
 		shmSize := fileSizeOrZero(dbPath + "-shm")
@@ -896,11 +897,11 @@ func (s *Service) CollectHealth(ctx context.Context) (*SystemHealthReport, error
 			TotalBytes: dbSize + walSize + shmSize,
 		}
 
-		imgSize := dirSizeBytes(s.cfg.ImageCacheDir())
-		chapSize := dirSizeBytes(s.cfg.ChapterCacheDir())
-		bifSize := dirSizeBytes(s.cfg.BifCacheDir())
-		subSize := dirSizeBytes(s.cfg.SubtitleCacheDir())
-		transSize := dirSizeBytes(s.cfg.TranscodeTempDir())
+		imgSize := dirSizeBytes((&snap).ImageCacheDir())
+		chapSize := dirSizeBytes((&snap).ChapterCacheDir())
+		bifSize := dirSizeBytes((&snap).BifCacheDir())
+		subSize := dirSizeBytes((&snap).SubtitleCacheDir())
+		transSize := dirSizeBytes((&snap).TranscodeTempDir())
 		report.Cache = CacheHealth{
 			ImagesBytes:    imgSize,
 			ChaptersBytes:  chapSize,
@@ -910,7 +911,7 @@ func (s *Service) CollectHealth(ctx context.Context) (*SystemHealthReport, error
 			TotalBytes:     imgSize + chapSize + bifSize + subSize + transSize,
 		}
 
-		report.Disk = collectDiskHealth(s.cfg.DataDir)
+		report.Disk = collectDiskHealth(snap.DataDir)
 	}
 
 	if err := s.collectLibraryStats(ctx, &report.Library); err != nil {

@@ -1,6 +1,9 @@
 package ops
 
 import (
+	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -40,12 +43,12 @@ type PackageVersionInfo struct {
 }
 
 type PackageInfo struct {
-	Id          string               `json:"id"`
-	Name        string               `json:"name"`
-	Category    string               `json:"category"`
-	Overview    string               `json:"overview"`
-	Owner       string               `json:"owner"`
-	Versions    []PackageVersionInfo `json:"versions"`
+	Id       string               `json:"id"`
+	Name     string               `json:"name"`
+	Category string               `json:"category"`
+	Overview string               `json:"overview"`
+	Owner    string               `json:"owner"`
+	Versions []PackageVersionInfo `json:"versions"`
 }
 
 type InstallationInfo struct {
@@ -85,16 +88,71 @@ var builtinCatalog = []PackageInfo{
 
 // --- Startup Wizard ---
 
+func (h *Handler) loadSystemExtraLocked(ctx context.Context) map[string]any {
+	extra := map[string]any{}
+	if h.store == nil || h.store.Reader == nil {
+		return extra
+	}
+	var raw string
+	err := h.store.Reader.QueryRowContext(ctx,
+		`SELECT value_json FROM server_config WHERE key = ?`, systemExtraConfigKey,
+	).Scan(&raw)
+	if err == nil && raw != "" {
+		_ = json.Unmarshal([]byte(raw), &extra)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return extra
+	}
+	return extra
+}
+
+func (h *Handler) saveSystemExtraLocked(ctx context.Context, extra map[string]any) {
+	if h.store == nil || h.store.Writer == nil || extra == nil {
+		return
+	}
+	raw, err := json.Marshal(extra)
+	if err != nil {
+		return
+	}
+	_, _ = h.store.Writer.ExecContext(ctx, `
+		INSERT INTO server_config (key, value_json, updated_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(key) DO UPDATE SET
+			value_json = excluded.value_json,
+			updated_at = excluded.updated_at`,
+		systemExtraConfigKey, string(raw), time.Now().UTC().Unix(),
+	)
+}
+
 func (h *Handler) handleGetStartupConfig(w http.ResponseWriter, r *http.Request) {
 	h.mu.RLock()
-	cfg := h.state.Startup
+	stCfg := h.state.Startup
+	extra := h.loadSystemExtraLocked(r.Context())
 	h.mu.RUnlock()
-	httpx.JSON(w, http.StatusOK, cfg)
+
+	if h.cfg != nil {
+		snap := h.cfg.Snapshot()
+		if snap.ServerName != "" {
+			stCfg.ServerName = snap.ServerName
+		}
+		if snap.TMDBLanguage != "" {
+			stCfg.PreferredMetadataLanguage = snap.TMDBLanguage
+		}
+	}
+	if v, ok := extra["UICulture"].(string); ok && v != "" {
+		stCfg.UICulture = v
+	}
+	if v, ok := extra["MetadataCountryCode"].(string); ok && v != "" {
+		stCfg.MetadataCountryCode = v
+	}
+	if v, ok := extra["PreferredMetadataLanguage"].(string); ok && v != "" {
+		stCfg.PreferredMetadataLanguage = v
+	}
+	httpx.JSON(w, http.StatusOK, stCfg)
 }
 
 func (h *Handler) handleUpdateStartupConfig(w http.ResponseWriter, r *http.Request) {
 	var req StartupConfiguration
-	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 64<<10); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid startup configuration payload")
 		return
 	}
@@ -121,6 +179,17 @@ func (h *Handler) handleUpdateStartupConfig(w http.ResponseWriter, r *http.Reque
 			}
 		})
 	}
+	extra := h.loadSystemExtraLocked(r.Context())
+	if req.UICulture != "" {
+		extra["UICulture"] = req.UICulture
+	}
+	if req.MetadataCountryCode != "" {
+		extra["MetadataCountryCode"] = req.MetadataCountryCode
+	}
+	if req.PreferredMetadataLanguage != "" {
+		extra["PreferredMetadataLanguage"] = req.PreferredMetadataLanguage
+	}
+	h.saveSystemExtraLocked(r.Context(), extra)
 	_ = h.saveStateLocked(r.Context())
 	if h.cfg != nil {
 		_ = h.cfg.Save()
@@ -147,8 +216,12 @@ func (h *Handler) handleUpdateStartupUser(w http.ResponseWriter, r *http.Request
 		Name     string `json:"Name"`
 		Password string `json:"Password"`
 	}
-	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 64<<10); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid startup user payload")
+		return
+	}
+	if auth.ContainsControlChar(req.Name) {
+		httpx.Error(w, http.StatusBadRequest, "username must not contain control characters")
 		return
 	}
 	name := strings.TrimSpace(req.Name)
@@ -223,18 +296,42 @@ func (h *Handler) handleUpdateStartupUser(w http.ResponseWriter, r *http.Request
 
 func (h *Handler) handleUpdateRemoteAccess(w http.ResponseWriter, r *http.Request) {
 	var req RemoteAccessConfig
-	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 64<<10); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid remote access payload")
 		return
 	}
 	h.mu.Lock()
 	h.state.RemoteAccess = req
+	if h.cfg != nil {
+		enableRemote := req.EnableRemoteAccess
+		h.cfg.Update(func(c *config.Config) {
+			b := enableRemote
+			c.EnableRemoteAccessGlobal = &b
+		})
+		_ = h.cfg.Save()
+	}
+	extra := h.loadSystemExtraLocked(r.Context())
+	extra["EnableAutomaticPortMapping"] = req.EnableAutomaticPortMapping
+	h.saveSystemExtraLocked(r.Context(), extra)
 	_ = h.saveStateLocked(r.Context())
 	h.mu.Unlock()
 	httpx.NoContent(w)
 }
 
 func (h *Handler) handleStartupComplete(w http.ResponseWriter, r *http.Request) {
+	if h.userRepo == nil {
+		httpx.Error(w, http.StatusBadRequest, "at least one user must be created before completing startup wizard")
+		return
+	}
+	count, err := h.userRepo.CountUsers(r.Context())
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to check existing users")
+		return
+	}
+	if count <= 0 {
+		httpx.Error(w, http.StatusBadRequest, "at least one user must be created before completing startup wizard")
+		return
+	}
 	h.mu.Lock()
 	if h.cfg != nil {
 		h.cfg.Update(func(c *config.Config) {

@@ -71,6 +71,11 @@ func TestSystemStorageInfoRequiresAdmin(t *testing.T) {
 }
 
 func TestForgotPasswordRateLimitAndFilePruning(t *testing.T) {
+	netutil.SetLocalNetworkSubnets([]string{"10.0.0.0/8", "192.168.0.0/16"})
+	t.Cleanup(func() {
+		netutil.SetLocalNetworkSubnets(nil)
+		netutil.SetTrustedProxies(nil)
+	})
 	env := newTestEnv(t)
 
 	// 1. Pre-create 12 old passwordreset-*.txt files to verify pruning caps at 10 newest.
@@ -98,29 +103,31 @@ func TestForgotPasswordRateLimitAndFilePruning(t *testing.T) {
 		return rec
 	}
 
-	// 5 requests from same IP succeed; 6th returns 429 Too Many Requests.
+	// 5 requests from same LAN IP succeed; 6th returns 429 Too Many Requests.
 	for i := 0; i < forgotPasswordRateLimit; i++ {
-		rec := doFP("198.51.100.1:1234", "", "")
+		rec := doFP("192.168.1.10:1234", "", "")
 		if rec.Code != http.StatusOK {
 			t.Fatalf("request %d expected 200, got %d", i+1, rec.Code)
 		}
 	}
-	rec6 := doFP("198.51.100.1:5678", "", "")
+	rec6 := doFP("192.168.1.10:5678", "", "")
 	if rec6.Code != http.StatusTooManyRequests {
 		t.Fatalf("6th request from same IP expected 429, got %d", rec6.Code)
 	}
 
-	// Different IP via X-Forwarded-For is still allowed.
-	recXFF := doFP("10.0.0.1:1111", "bad-ip, 203.0.113.42, 10.0.0.1", "")
+	// Different LAN IP via trusted proxy X-Forwarded-For is still allowed.
+	netutil.SetTrustedProxies([]string{"10.0.0.1/32"})
+	recXFF := doFP("10.0.0.1:1111", "bad-ip, 192.168.1.42, 10.0.0.1", "")
 	if recXFF.Code != http.StatusOK {
-		t.Fatalf("request with different X-Forwarded-For IP expected 200, got %d", recXFF.Code)
+		t.Fatalf("request with different X-Forwarded-For LAN IP expected 200, got %d", recXFF.Code)
 	}
 
-	// Different IP via X-Real-IP is still allowed.
-	recXRI := doFP("10.0.0.1:1111", "", "203.0.113.99")
+	// Different LAN IP via trusted proxy X-Real-IP is still allowed.
+	recXRI := doFP("10.0.0.1:1111", "", "192.168.1.99")
 	if recXRI.Code != http.StatusOK {
-		t.Fatalf("request with different X-Real-IP expected 200, got %d", recXRI.Code)
+		t.Fatalf("request with different X-Real-IP LAN IP expected 200, got %d", recXRI.Code)
 	}
+	netutil.SetTrustedProxies(nil)
 
 	// Verify passwordreset-*.txt count on disk is capped at forgotPasswordMaxPinFiles (10).
 	entries, err := os.ReadDir(env.cfg.DataDir)
@@ -139,9 +146,9 @@ func TestForgotPasswordRateLimitAndFilePruning(t *testing.T) {
 
 	// Cover expired rate-limit entry pruning and nil forgotRates re-init.
 	env.handler.mu.Lock()
-	env.handler.forgotRates["198.51.100.250"] = []time.Time{time.Now().UTC().Add(-2 * time.Minute)}
+	env.handler.forgotRates["192.168.1.250"] = []time.Time{time.Now().UTC().Add(-2 * time.Minute)}
 	env.handler.mu.Unlock()
-	recPrune := doFP("198.51.100.250:1234", "", "")
+	recPrune := doFP("192.168.1.250:1234", "", "")
 	if recPrune.Code != http.StatusOK {
 		t.Fatalf("expired window IP expected 200, got %d", recPrune.Code)
 	}

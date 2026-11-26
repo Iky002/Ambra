@@ -113,6 +113,19 @@ func (h *Handler) isEnabled() bool {
 	return cfg.Snapshot().EnableQuickConnect
 }
 
+func (h *Handler) isGlobalRemoteAccessEnabled() bool {
+	h.mu.Lock()
+	cfg := h.cfg
+	h.mu.Unlock()
+	if cfg == nil && h.authSvc != nil {
+		cfg = h.authSvc.Config()
+	}
+	if cfg == nil {
+		return true
+	}
+	return cfg.Snapshot().IsGlobalRemoteAccessEnabled()
+}
+
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, authFuncs AuthFuncs) {
 	h.auth = authFuncs
 	wrapAuth := authFuncs.RequireAuth
@@ -148,6 +161,10 @@ func (h *Handler) countPendingForIPLocked(ip string) int {
 func (h *Handler) handleInitiate(w http.ResponseWriter, r *http.Request) {
 	if !h.isEnabled() {
 		httpx.Error(w, http.StatusForbidden, "quickconnect is disabled")
+		return
+	}
+	if !h.isGlobalRemoteAccessEnabled() && !netutil.IsLocalOrLANRequest(r) {
+		httpx.Error(w, http.StatusForbidden, "remote access is disabled on this server")
 		return
 	}
 	client := middleware.ExtractClientInfo(r)
@@ -246,6 +263,10 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusForbidden, "quickconnect is disabled")
 		return
 	}
+	if !h.isGlobalRemoteAccessEnabled() && !netutil.IsLocalOrLANRequest(r) {
+		httpx.Error(w, http.StatusForbidden, "remote access is disabled on this server")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	secret := strings.TrimSpace(q.Get("secret"))
 	if secret == "" {
@@ -275,6 +296,10 @@ func (h *Handler) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	}
 	ac, hasAC := middleware.AuthFromContext(r.Context())
 	isAPIKey := hasAC && ac != nil && ac.IsAPIKey
+	if !isAPIKey && !h.isGlobalRemoteAccessEnabled() && !netutil.IsLocalOrLANRequest(r) {
+		httpx.Error(w, http.StatusForbidden, "remote access is disabled on this server")
+		return
+	}
 	callerID := h.callerUserID(r)
 	if callerID == "" && !isAPIKey {
 		httpx.Error(w, http.StatusUnauthorized, "user authentication required")
@@ -382,6 +407,10 @@ func (h *Handler) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusForbidden, "quickconnect is disabled")
 		return
 	}
+	if !h.isGlobalRemoteAccessEnabled() && !netutil.IsLocalOrLANRequest(r) {
+		httpx.Error(w, http.StatusForbidden, "remote access is disabled on this server")
+		return
+	}
 	var body struct {
 		Secret string `json:"Secret"`
 	}
@@ -420,9 +449,15 @@ func (h *Handler) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "failed to load user")
 		return
 	}
-	if !u.Policy.EnableRemoteAccess && !netutil.IsLocalOrLANRequest(r) {
-		httpx.Error(w, http.StatusForbidden, "remote access is disabled for this user")
-		return
+	if !netutil.IsLocalOrLANRequest(r) {
+		if !h.isGlobalRemoteAccessEnabled() {
+			httpx.Error(w, http.StatusForbidden, "remote access is disabled on this server")
+			return
+		}
+		if !u.Policy.EnableRemoteAccess {
+			httpx.Error(w, http.StatusForbidden, "remote access is disabled for this user")
+			return
+		}
 	}
 
 	client := middleware.ExtractClientInfo(r)

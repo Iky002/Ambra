@@ -30,22 +30,24 @@ type AuthFuncs struct {
 }
 
 const (
-	forgotPinMaxAttempts      = 5
-	forgotPasswordRateLimit   = 5
-	forgotPasswordRateWindow  = time.Minute
-	forgotPasswordMaxPinFiles = 10
-	forgotPinsMaxEntries      = 256
-	authByIDRateLimit         = 30
-	authByIDRateWindow        = time.Minute
-	maxRateLimitBuckets       = 4096
-	maxSessionUsersEntries    = 500
-	maxCameraUploadsEntries   = 500
-	maxHomeSectionsEntries    = 500
-	maxSearchedItemsEntries   = 50
-	maxPartyMessageBytes      = 64 << 10
-	maxKVJSONBodyBytes        = 64 << 10
-	maxTypedSettingKeyLen     = 128
-	maxUserTypedSettingsKeys  = 100
+	forgotPinMaxAttempts        = 5
+	forgotPasswordRateLimit     = 5
+	forgotPasswordRateWindow    = time.Minute
+	forgotPasswordMaxPinFiles   = 10
+	forgotPinsMaxEntries        = 256
+	authByIDRateLimit           = 30
+	authByIDRateWindow          = time.Minute
+	maxRateLimitBuckets         = 4096
+	maxCameraUploadsEntries     = 500
+	maxCameraUploadBytes        = 512 << 20 // 512 MiB
+	maxHomeSectionsEntries      = 500
+	maxSearchedItemsEntries     = 50
+	maxPartyMessageBytes        = 64 << 10
+	maxKVJSONBodyBytes          = 64 << 10
+	maxSessionCommandBodyBytes  = 64 << 10
+	maxTypedSettingKeyLen       = 128
+	maxUserTypedSettingsKeys    = 100
+	maxDirectoryContentsEntries = 2000
 )
 
 type forgotPinEntry struct {
@@ -54,15 +56,6 @@ type forgotPinEntry struct {
 	Pin       string
 	PinFile   string
 	ExpiresAt time.Time
-	Attempts  int
-}
-
-type remoteCommandRecord struct {
-	SessionID string
-	Kind      string
-	Command   string
-	Payload   map[string]any
-	At        time.Time
 }
 
 // WSSender pushes Emby WebSocket messages to connected user devices.
@@ -89,14 +82,15 @@ type Handler struct {
 	forgotRates       map[string][]time.Time
 	forgotPinRates    map[string][]time.Time
 	authByIDRates     map[string][]time.Time
-	authByIDUserRates map[string][]time.Time
-	sessionUsers      map[string]map[string]bool
-	remoteCommands    []remoteCommandRecord
 	restartRequested  bool
 	shutdownRequested bool
 	onRestart         func()
 	onShutdown        func()
 	taskStopper       func(id string) bool
+	onUserDeleted     func(ctx context.Context, userID string)
+	restoreHandler    http.HandlerFunc
+	partyLeaveHandler http.HandlerFunc
+	partyMsgHandler   http.HandlerFunc
 }
 
 // New constructs a compatcore Handler.
@@ -109,30 +103,39 @@ func New(
 	registry *plugins.Registry,
 ) *Handler {
 	return &Handler{
-		cfg:               cfg,
-		store:             store,
-		userRepo:          userRepo,
-		libRepo:           libRepo,
-		sessions:          sessions,
-		registry:          registry,
-		memKV:             make(map[string]string),
-		forgotPins:        make(map[string]forgotPinEntry),
-		forgotRates:       make(map[string][]time.Time),
-		forgotPinRates:    make(map[string][]time.Time),
-		authByIDRates:     make(map[string][]time.Time),
-		authByIDUserRates: make(map[string][]time.Time),
-		sessionUsers:      make(map[string]map[string]bool),
+		cfg:            cfg,
+		store:          store,
+		userRepo:       userRepo,
+		libRepo:        libRepo,
+		sessions:       sessions,
+		registry:       registry,
+		memKV:          make(map[string]string),
+		forgotPins:     make(map[string]forgotPinEntry),
+		forgotRates:    make(map[string][]time.Time),
+		forgotPinRates: make(map[string][]time.Time),
+		authByIDRates:  make(map[string][]time.Time),
 	}
 }
 
 // SetWSHub attaches a WebSocket hub for forwarding remote control commands to target devices.
 func (h *Handler) SetWSHub(hub WSSender) {
+	h.mu.Lock()
 	h.wsHub = hub
+	h.mu.Unlock()
+}
+
+func (h *Handler) getWSHub() WSSender {
+	h.mu.RLock()
+	hub := h.wsHub
+	h.mu.RUnlock()
+	return hub
 }
 
 // SetAuthService attaches the authentication service for password reset flows.
 func (h *Handler) SetAuthService(a *auth.Service) {
+	h.mu.Lock()
 	h.authSvc = a
+	h.mu.Unlock()
 }
 
 // SetLifecycleHooks wires callbacks invoked asynchronously on /System/Restart and /System/Shutdown.
@@ -147,6 +150,28 @@ func (h *Handler) SetLifecycleHooks(onRestart, onShutdown func()) {
 func (h *Handler) SetTaskStopper(stopFn func(id string) bool) {
 	h.mu.Lock()
 	h.taskStopper = stopFn
+	h.mu.Unlock()
+}
+
+// SetOnUserDeleted registers a cleanup callback invoked when a user account is deleted.
+func (h *Handler) SetOnUserDeleted(fn func(ctx context.Context, userID string)) {
+	h.mu.Lock()
+	h.onUserDeleted = fn
+	h.mu.Unlock()
+}
+
+// SetRestoreHandler delegates POST /BackupRestore/RestoreData to the real ops backup restorer.
+func (h *Handler) SetRestoreHandler(fn http.HandlerFunc) {
+	h.mu.Lock()
+	h.restoreHandler = fn
+	h.mu.Unlock()
+}
+
+// SetPartyHandlers delegates /Parties/Leave and /Parties/Messages to the canonical ops party handlers.
+func (h *Handler) SetPartyHandlers(leaveFn, messagesFn http.HandlerFunc) {
+	h.mu.Lock()
+	h.partyLeaveHandler = leaveFn
+	h.partyMsgHandler = messagesFn
 	h.mu.Unlock()
 }
 
@@ -179,9 +204,6 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 	r.Group(func(pr chi.Router) {
 		pr.Use(wrapAuth)
 
-		// /Auth
-		pr.Get("/Auth/Providers", h.getAuthProviders)
-
 		// /Connect
 		pr.Get("/Connect/Exchange", h.connectExchange)
 
@@ -192,7 +214,7 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 		pr.Get("/Devices/CameraUploads", h.getDeviceCameraUploads)
 		pr.Post("/Devices/CameraUploads", h.postDeviceCameraUploads)
 
-		// /Parties
+		// /Parties (delegated to ops when wired, fallback when standalone)
 		pr.Post("/Parties/Leave", h.postPartiesLeave)
 		pr.Post("/Parties/Messages", h.postPartiesMessages)
 
@@ -267,12 +289,6 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 		pr.Delete("/Users/{Id}/Images/{Type}/{Index}", h.deleteUserImage)
 		pr.Post("/Users/{Id}/Images/{Type}/Delete", h.deleteUserImage)
 		pr.Post("/Users/{Id}/Images/{Type}/{Index}/Delete", h.deleteUserImage)
-		pr.Post("/Users/{Id}/Connect/Link", h.postUserConnectLink)
-		pr.Delete("/Users/{Id}/Connect/Link", h.deleteUserConnectLink)
-		pr.Post("/Users/{Id}/Connect/Link/Delete", h.deleteUserConnectLink)
-
-		// /Webhooks
-		pr.Get("/Webhooks/Sample", h.getWebhooksSample)
 	})
 
 	// Admin endpoints
@@ -283,6 +299,7 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 		ar.Post("/Appstore/Register", h.postAppstoreRegister)
 
 		// /Auth
+		ar.Get("/Auth/Providers", h.getAuthProviders)
 		ar.Post("/Auth/Keys/{Key}/Delete", h.deleteAuthKey)
 
 		// /BackupRestore
@@ -316,6 +333,12 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 		// /Users
 		ar.Post("/Users/{Id}/Delete", h.deleteUser)
 		ar.Post("/Users/{UserId}/CopyData", h.copyUserData)
+		ar.Post("/Users/{Id}/Connect/Link", h.postUserConnectLink)
+		ar.Delete("/Users/{Id}/Connect/Link", h.deleteUserConnectLink)
+		ar.Post("/Users/{Id}/Connect/Link/Delete", h.deleteUserConnectLink)
+
+		// /Webhooks
+		ar.Get("/Webhooks/Sample", h.getWebhooksSample)
 	})
 
 	return r
@@ -364,9 +387,6 @@ func decodeOptionalJSON(r *http.Request, dst any) error {
 }
 
 func (h *Handler) loadKV(ctx context.Context, key string, dst any) (bool, error) {
-	if h.userRepo != nil {
-		return h.loadKVLocked(ctx, key, dst)
-	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return h.loadKVLocked(ctx, key, dst)
@@ -386,6 +406,9 @@ func (h *Handler) loadKVLocked(ctx context.Context, key string, dst any) (bool, 
 		}
 		return false, nil
 	}
+	if h.memKV == nil {
+		return false, nil
+	}
 	raw, ok := h.memKV[key]
 	if !ok {
 		return false, nil
@@ -397,9 +420,6 @@ func (h *Handler) loadKVLocked(ctx context.Context, key string, dst any) (bool, 
 }
 
 func (h *Handler) saveKV(ctx context.Context, key string, val any) error {
-	if h.userRepo != nil {
-		return h.saveKVLocked(ctx, key, val)
-	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.saveKVLocked(ctx, key, val)
@@ -412,6 +432,9 @@ func (h *Handler) saveKVLocked(ctx context.Context, key string, val any) error {
 	}
 	if h.userRepo != nil {
 		return h.userRepo.SetServerConfig(ctx, key, string(raw))
+	}
+	if h.memKV == nil {
+		h.memKV = make(map[string]string)
 	}
 	h.memKV[key] = string(raw)
 	return nil
@@ -428,13 +451,17 @@ func (h *Handler) kvStore() *sqlite.Store {
 }
 
 func (h *Handler) deleteKV(ctx context.Context, key string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.deleteKVLocked(ctx, key)
+}
+
+func (h *Handler) deleteKVLocked(ctx context.Context, key string) error {
 	if st := h.kvStore(); st != nil && st.Writer != nil {
 		_, err := st.Writer.ExecContext(ctx, `DELETE FROM server_config WHERE key = ?`, key)
 		return err
 	}
-	h.mu.Lock()
 	delete(h.memKV, key)
-	h.mu.Unlock()
 	return nil
 }
 

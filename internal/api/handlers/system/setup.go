@@ -5,7 +5,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/netip"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -13,7 +15,49 @@ import (
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/auth"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 )
+
+const (
+	setupAdminRateLimit  = 30
+	setupAdminRateWindow = time.Minute
+)
+
+func (h *Handler) checkSetupRateLimit(r *http.Request) bool {
+	ip := strings.TrimSpace(netutil.ClientIP(r))
+	if ip == "" {
+		return true
+	}
+	if addr, err := netip.ParseAddr(ip); err == nil && addr.Unmap().IsLoopback() {
+		return true
+	}
+	now := time.Now().UTC()
+	cutoff := now.Add(-setupAdminRateWindow)
+
+	h.setupRateMu.Lock()
+	defer h.setupRateMu.Unlock()
+	if h.setupRates == nil {
+		h.setupRates = make(map[string][]time.Time)
+	}
+	for k, ts := range h.setupRates {
+		kept := ts[:0]
+		for _, t := range ts {
+			if t.After(cutoff) {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) == 0 {
+			delete(h.setupRates, k)
+		} else {
+			h.setupRates[k] = kept
+		}
+	}
+	if len(h.setupRates[ip]) >= setupAdminRateLimit {
+		return false
+	}
+	h.setupRates[ip] = append(h.setupRates[ip], now)
+	return true
+}
 
 const (
 	tmdbPluginID = "ambra.builtin.tmdb"
@@ -116,6 +160,10 @@ func (h *Handler) GetSetupStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "private, no-store")
+	if !h.checkSetupRateLimit(r) {
+		httpx.Error(w, http.StatusTooManyRequests, "too many setup attempts")
+		return
+	}
 	h.setupMu.Lock()
 	defer h.setupMu.Unlock()
 
@@ -149,6 +197,10 @@ func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if auth.ContainsControlChar(req.Username) || auth.ContainsControlChar(req.ServerName) {
+		httpx.Error(w, http.StatusBadRequest, "invalid control characters in username or server name")
+		return
+	}
 	username := strings.TrimSpace(req.Username)
 	if username == "" || len([]rune(username)) > 64 {
 		httpx.Error(w, http.StatusBadRequest, "username is required")
@@ -234,6 +286,13 @@ func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) CompleteSetup(w http.ResponseWriter, r *http.Request) {
+	if h.userRepo != nil {
+		count, err := h.userRepo.CountUsers(r.Context())
+		if err == nil && count == 0 {
+			httpx.Error(w, http.StatusBadRequest, "at least one administrator account must be created before completing setup")
+			return
+		}
+	}
 	var req SetupCompleteRequest
 	if r.Body != nil {
 		if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil && !errors.Is(err, io.EOF) {
@@ -243,11 +302,13 @@ func (h *Handler) CompleteSetup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.cfg.Update(func(c *config.Config) {
-		if name := strings.TrimSpace(req.ServerName); name != "" {
+		if name := strings.TrimSpace(req.ServerName); name != "" && !auth.ContainsControlChar(name) {
 			c.ServerName = name
 		}
 		if req.TMDBApiKey != nil {
-			c.TMDBApiKey = strings.TrimSpace(*req.TMDBApiKey)
+			if trimmed := strings.TrimSpace(*req.TMDBApiKey); trimmed != maskedSecretPlaceholder {
+				c.TMDBApiKey = trimmed
+			}
 		}
 		if lang := strings.TrimSpace(req.TMDBLanguage); lang != "" {
 			c.TMDBLanguage = lang
