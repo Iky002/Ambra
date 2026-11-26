@@ -290,6 +290,8 @@
   "admin.settings.remoteAccessDesc": "비활성화 시 로컬호스트 및 지정된 LAN 서브넷에서만 서버에 접근할 수 있습니다",
   "admin.settings.quickConnectLabel": "Quick Connect 빠른 인증 사용",
   "admin.settings.quickConnectDesc": "TV 및 클라이언트 기기에서 일회용 코드로 비밀번호 없이 로그인할 수 있게 합니다",
+  "admin.settings.loginUserListLabel": "로그인 페이지에 공개 사용자 목록 표시 (EnableLoginUserList)",
+  "admin.settings.loginUserListDesc": "미인증 방문자의 계정 및 프로필 사진 열거를 방지하기 위해 기본 꺼짐. 활성화하면 숨김 처리되지 않은 계정을 로그인 화면에 표시합니다",
   "admin.settings.dlnaLabel": "DLNA 네트워크 검색 및 캐스팅 사용",
   "admin.settings.dlnaDesc": "기본 꺼짐. 활성화 시 LAN 내 스마트 TV에서 선택한 계정 권한으로 미디어를 탐색합니다",
   "admin.settings.dlnaDefaultUserLabel": "DLNA 기본 권한 계정",

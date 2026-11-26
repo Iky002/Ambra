@@ -4,11 +4,9 @@ import tailwindcss from '@tailwindcss/vite'
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, '.', 'VITE_')
-  const isDemoBuild =
-    mode === 'demo' || env.VITE_DEMO_MODE === 'true' || env.VITE_DEMO === 'true'
 
   return {
-    base: isDemoBuild ? '/' : './',
+    base: env.VITE_BASE_PATH || './',
     plugins: [react(), tailwindcss()],
     optimizeDeps: {
       exclude: ['jassub', '@ffmpeg/ffmpeg', '@ffmpeg/util'],

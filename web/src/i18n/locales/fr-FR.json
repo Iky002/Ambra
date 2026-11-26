@@ -290,6 +290,8 @@
   "admin.settings.remoteAccessDesc": "Si désactivé, seuls localhost et les sous-réseaux LAN autorisés peuvent accéder au serveur",
   "admin.settings.quickConnectLabel": "Activer Quick Connect",
   "admin.settings.quickConnectDesc": "Permet aux téléviseurs et clients de se connecter via un code numérique à usage unique",
+  "admin.settings.loginUserListLabel": "Afficher la liste publique des utilisateurs sur la page de connexion (EnableLoginUserList)",
+  "admin.settings.loginUserListDesc": "Désactivé par défaut pour empêcher l'énumération des comptes et avatars sans authentification ; une fois activé, affiche les comptes non masqués",
   "admin.settings.dlnaLabel": "Activer la découverte et diffusion DLNA",
   "admin.settings.dlnaDesc": "Désactivé par défaut ; expose les médias sur le réseau local via SSDP/UPnP avec le profil choisi",
   "admin.settings.dlnaDefaultUserLabel": "Utilisateur DLNA par défaut",

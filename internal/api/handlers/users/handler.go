@@ -331,6 +331,11 @@ func RegisterRoutes(r chi.Router, authMW *middleware.Auth, h *Handler) {
 // --- Users & Auth ---
 
 func (h *Handler) ListPublicUsers(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "private, no-store")
+	if !h.isLoginUserListEnabled() {
+		httpx.JSON(w, http.StatusOK, []dto.UserDto{})
+		return
+	}
 	users, err := h.userRepo.ListPublicUsers(r.Context())
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to list public users")
@@ -348,6 +353,17 @@ func (h *Handler) ListPublicUsers(w http.ResponseWriter, r *http.Request) {
 		out = append(out, d)
 	}
 	httpx.JSON(w, http.StatusOK, out)
+}
+
+func (h *Handler) isLoginUserListEnabled() bool {
+	cfg := h.cfg
+	if cfg == nil && h.authSvc != nil {
+		cfg = h.authSvc.Config()
+	}
+	if cfg == nil {
+		return false
+	}
+	return cfg.Snapshot().EnableLoginUserList
 }
 
 type authenticateByNameRequest struct {

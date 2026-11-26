@@ -290,6 +290,8 @@
   "admin.settings.remoteAccessDesc": "オフにすると、ローカルホストと指定した LAN サブネットからの接続のみ許可します",
   "admin.settings.quickConnectLabel": "Quick Connect クイック認証を有効化",
   "admin.settings.quickConnectDesc": "テレビやアプリからワンタイム認証コードでパスワードなしログインを許可します",
+  "admin.settings.loginUserListLabel": "ログイン画面に公開ユーザー一覧を表示 (EnableLoginUserList)",
+  "admin.settings.loginUserListDesc": "未認証アクセスによるユーザー名・アイコン列挙を防ぐため既定でオフ。オンにすると非表示でないアカウントをログイン画面に表示します",
   "admin.settings.dlnaLabel": "DLNA ネットワーク検出とキャストを有効化",
   "admin.settings.dlnaDesc": "既定でオフ。オンにすると LAN 内の対応テレビ等から指定ユーザーの権限で閲覧できます",
   "admin.settings.dlnaDefaultUserLabel": "DLNA 既定ユーザーアカウント",

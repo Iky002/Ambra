@@ -422,7 +422,21 @@ func TestAll582APIsAuthEnforcementMatrix(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Errorf("public GET %s: expected 200 OK, got %d (body=%q)", ep, w.Code, strings.TrimSpace(w.Body.String()))
 		}
+		if ep == "/emby/Users/Public" && strings.TrimSpace(w.Body.String()) != "[]" {
+			t.Errorf("public GET /emby/Users/Public should default to [] when EnableLoginUserList=false, got %s", strings.TrimSpace(w.Body.String()))
+		}
 	}
+
+	// 3b. Admin toggling EnableLoginUserList=true exposes sanitized public users, and setting false hides them again
+	wEnableList := sendCompatRequest(srv.Handler, http.MethodPost, "/emby/System/Configuration", adminToken, []byte(`{"EnableLoginUserList":true}`))
+	if wEnableList.Code != http.StatusNoContent {
+		t.Fatalf("admin POST /emby/System/Configuration EnableLoginUserList=true got %d", wEnableList.Code)
+	}
+	wPubEnabled := sendCompatRequest(srv.Handler, http.MethodGet, "/emby/Users/Public", "", nil)
+	if wPubEnabled.Code != http.StatusOK || !strings.Contains(wPubEnabled.Body.String(), `"Name":"admin"`) {
+		t.Errorf("expected admin in /emby/Users/Public when EnableLoginUserList=true, got %d %s", wPubEnabled.Code, wPubEnabled.Body.String())
+	}
+	_ = sendCompatRequest(srv.Handler, http.MethodPost, "/emby/System/Configuration", adminToken, []byte(`{"EnableLoginUserList":false}`))
 
 	// 4. DLNA description.xml defaults to disabled (403 even on LAN), and once enabled is restricted to LAN (403 from public IP, 200 from LAN)
 	dlnaDescPath := "/Dlna/" + cfg.ServerID + "/description.xml"

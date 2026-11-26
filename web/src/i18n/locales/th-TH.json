@@ -290,6 +290,8 @@
   "admin.settings.remoteAccessDesc": "เมื่อปิดใช้งาน จะอนุญาตเฉพาะเครื่องโลคัลและซับเน็ต LAN ที่กำหนดไว้เท่านั้น",
   "admin.settings.quickConnectLabel": "เปิดใช้งาน Quick Connect",
   "admin.settings.quickConnectDesc": "อนุญาตให้ทีวีและแอปเข้าสู่ระบบด้วยรหัสตัวเลขครั้งเดียวโดยไม่ต้องพิมพ์รหัสผ่าน",
+  "admin.settings.loginUserListLabel": "แสดงรายชื่อผู้ใช้สาธารณะในหน้าเข้าสู่ระบบ (EnableLoginUserList)",
+  "admin.settings.loginUserListDesc": "ปิดเป็นค่าเริ่มต้นเพื่อป้องกันผู้เยี่ยมชมที่ยังไม่ได้เข้าสู่ระบบเห็นรายชื่อบัญชีและรูปโปรไฟล์ เมื่อเปิดจะแสดงบัญชีที่ไม่ได้ซ่อนไว้",
   "admin.settings.dlnaLabel": "เปิดใช้งานการค้นหาและแคสต์ผ่าน DLNA",
   "admin.settings.dlnaDesc": "ปิดเป็นค่าเริ่มต้น เมื่อเปิด สมาร์ททีวีในวงแลนจะเรียกดูสื่อตามสิทธิ์ผู้ใช้ที่เลือกได้",
   "admin.settings.dlnaDefaultUserLabel": "บัญชีผู้ใช้เริ่มต้นสำหรับ DLNA",

@@ -507,6 +507,9 @@ describe('Admin Console Enhancements, Bug Fixes & 10-Locale i18n', () => {
     expect(within(nav).getByText('Health & Backup')).toBeInTheDocument()
     expect(within(nav).getByText('Diagnostics · Audit · Hot Backup')).toBeInTheDocument()
     expect(await screen.findByText('Network, Remote Access & Protocols')).toBeInTheDocument()
+    expect(
+      screen.getByText('Show Public User List on Sign-In Page (EnableLoginUserList)'),
+    ).toBeInTheDocument()
     expect(screen.getByText('Transcoding & Hardware Acceleration')).toBeInTheDocument()
     expect(/[\u4e00-\u9fff]/.test(nav.textContent || '')).toBe(false)
     unmount()
@@ -523,5 +526,38 @@ describe('Admin Console Enhancements, Bug Fixes & 10-Locale i18n', () => {
     expect(
       await screen.findByText('トランスコードとハードウェアアクセラレーション'),
     ).toBeInTheDocument()
+  })
+
+  it('SettingsTab 默认关闭登录页公开用户列表，管理员切换后保存会把 EnableLoginUserList=true 提交给后端', async () => {
+    vi.spyOn(api, 'getServerConfig').mockResolvedValue({
+      ServerName: 'Ambra Private',
+      TMDBLanguage: 'zh-CN',
+      EnableSTRM302: true,
+      EnableLoginUserList: false,
+      PlayedThreshold: 0.9,
+    })
+    vi.spyOn(api, 'getUsers').mockResolvedValue([])
+    vi.spyOn(clientModule, 'embyFetch').mockResolvedValue(null)
+    const updateSpy = vi.spyOn(api, 'updateServerConfig').mockResolvedValue(undefined)
+
+    renderAdminUi(<SettingsTab />, { locale: 'zh-CN' })
+
+    const toggle = await screen.findByRole('switch', {
+      name: /登录页显示公开用户列表 \(EnableLoginUserList\)/,
+    })
+    expect(toggle).toHaveAttribute('aria-checked', 'false')
+
+    fireEvent.click(toggle)
+    expect(toggle).toHaveAttribute('aria-checked', 'true')
+
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
+    await waitFor(() => {
+      expect(updateSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ServerName: 'Ambra Private',
+          EnableLoginUserList: true,
+        }),
+      )
+    })
   })
 })

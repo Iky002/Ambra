@@ -35,6 +35,8 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - name: Install dependencies and build demo
+        env:
+          VITE_BASE_PATH: /${{ github.event.repository.name }}/
         run: cd web && npm ci && npm run build:demo
 
       - name: Setup Pages

@@ -86,8 +86,15 @@ func TestUsersV0104SecurityRemediations(t *testing.T) {
 		return rec
 	}
 
-	// 1. GET /Users/Public strips Policy & Configuration fields
+	// 1. GET /Users/Public returns [] by default (EnableLoginUserList=false), and strips Policy & Configuration when enabled
 	rec := doReq("", http.MethodGet, "/Users/Public", "", "")
+	if rec.Code != http.StatusOK || strings.TrimSpace(rec.Body.String()) != "[]" {
+		t.Fatalf("GET /Users/Public default expected 200 [], got %d %s", rec.Code, rec.Body.String())
+	}
+	cfg.Update(func(c *config.Config) {
+		c.EnableLoginUserList = true
+	})
+	rec = doReq("", http.MethodGet, "/Users/Public", "", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /Users/Public got %d", rec.Code)
 	}

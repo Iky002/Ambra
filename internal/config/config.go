@@ -24,7 +24,7 @@ const (
 )
 
 // AmbraVersion is the Ambra application release version (overridden at build time via -ldflags).
-var AmbraVersion = "v0.11.0"
+var AmbraVersion = "v0.11.1"
 
 type envOverrideFlags struct {
 	httpAddr            bool
@@ -33,6 +33,7 @@ type envOverrideFlags struct {
 	enableDLNA          bool
 	dlnaDefaultUserID   bool
 	enableQuickConnect  bool
+	enableLoginUserList bool
 	allowedOrigins      bool
 	trustedProxies      bool
 	localNetworkSubnets bool
@@ -47,6 +48,7 @@ type diskBaseline struct {
 	enableDLNA          bool
 	dlnaDefaultUserID   string
 	enableQuickConnect  bool
+	enableLoginUserList bool
 	allowedOrigins      []string
 	trustedProxies      []string
 	localNetworkSubnets []string
@@ -73,6 +75,7 @@ type Config struct {
 	EnableDLNA               bool     `json:"enable_dlna"`
 	DLNADefaultUserID        string   `json:"dlna_default_user_id,omitempty"`
 	EnableQuickConnect       bool     `json:"enable_quick_connect"`
+	EnableLoginUserList      bool     `json:"enable_login_user_list"`
 	EnableRemoteAccessGlobal *bool    `json:"enable_remote_access,omitempty"`
 	AllowedOrigins           []string `json:"allowed_origins,omitempty"`
 	TrustedProxies           []string `json:"trusted_proxies,omitempty"`
@@ -98,6 +101,7 @@ func Default(dataDir string) *Config {
 		EnableSTRM302:            true,
 		EnableDLNA:               false,
 		EnableQuickConnect:       true,
+		EnableLoginUserList:      false,
 		PlayedThreshold:          0.90,
 		IsStartupWizardCompleted: false,
 	}
@@ -170,6 +174,7 @@ func Load(dataDir string) (*Config, error) {
 		enableDLNA:          cfg.EnableDLNA,
 		dlnaDefaultUserID:   cfg.DLNADefaultUserID,
 		enableQuickConnect:  cfg.EnableQuickConnect,
+		enableLoginUserList: cfg.EnableLoginUserList,
 		allowedOrigins:      append([]string(nil), cfg.AllowedOrigins...),
 		trustedProxies:      append([]string(nil), cfg.TrustedProxies...),
 		localNetworkSubnets: append([]string(nil), cfg.LocalNetworkSubnets...),
@@ -212,6 +217,16 @@ func Load(dataDir string) (*Config, error) {
 		case "true", "1", "on", "yes":
 			cfg.EnableQuickConnect = true
 			cfg.envFlags.enableQuickConnect = true
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("AMBRA_ENABLE_LOGIN_USER_LIST")); v != "" {
+		switch strings.ToLower(v) {
+		case "false", "0", "off", "no":
+			cfg.EnableLoginUserList = false
+			cfg.envFlags.enableLoginUserList = true
+		case "true", "1", "on", "yes":
+			cfg.EnableLoginUserList = true
+			cfg.envFlags.enableLoginUserList = true
 		}
 	}
 	if v := strings.TrimSpace(os.Getenv("AMBRA_ALLOWED_ORIGINS")); v != "" {
@@ -315,6 +330,7 @@ func (c *Config) Update(fn func(*Config)) {
 	prevDLNA := c.EnableDLNA
 	prevDLNAUser := c.DLNADefaultUserID
 	prevQC := c.EnableQuickConnect
+	prevLoginUserList := c.EnableLoginUserList
 	prevOrigins := append([]string(nil), c.AllowedOrigins...)
 	prevProxies := append([]string(nil), c.TrustedProxies...)
 	prevSubnets := append([]string(nil), c.LocalNetworkSubnets...)
@@ -340,6 +356,9 @@ func (c *Config) Update(fn func(*Config)) {
 	}
 	if c.EnableQuickConnect != prevQC {
 		c.envFlags.enableQuickConnect = false
+	}
+	if c.EnableLoginUserList != prevLoginUserList {
+		c.envFlags.enableLoginUserList = false
 	}
 	if !stringSlicesEqual(c.AllowedOrigins, prevOrigins) {
 		c.envFlags.allowedOrigins = false
@@ -387,6 +406,7 @@ func (c *Config) Snapshot() Config {
 		EnableDLNA:               c.EnableDLNA,
 		DLNADefaultUserID:        c.DLNADefaultUserID,
 		EnableQuickConnect:       c.EnableQuickConnect,
+		EnableLoginUserList:      c.EnableLoginUserList,
 		EnableRemoteAccessGlobal: cloneBoolPtr(c.EnableRemoteAccessGlobal),
 		SimultaneousStreamLimit:  c.SimultaneousStreamLimit,
 		RemoteClientBitrateLimit: c.RemoteClientBitrateLimit,
@@ -432,6 +452,7 @@ func (c *Config) Save() error {
 		EnableDLNA:               c.EnableDLNA,
 		DLNADefaultUserID:        c.DLNADefaultUserID,
 		EnableQuickConnect:       c.EnableQuickConnect,
+		EnableLoginUserList:      c.EnableLoginUserList,
 		EnableRemoteAccessGlobal: cloneBoolPtr(c.EnableRemoteAccessGlobal),
 		AllowedOrigins:           append([]string(nil), c.AllowedOrigins...),
 		TrustedProxies:           append([]string(nil), c.TrustedProxies...),
@@ -458,6 +479,9 @@ func (c *Config) Save() error {
 	}
 	if c.envFlags.enableQuickConnect {
 		toSave.EnableQuickConnect = c.baseline.enableQuickConnect
+	}
+	if c.envFlags.enableLoginUserList {
+		toSave.EnableLoginUserList = c.baseline.enableLoginUserList
 	}
 	if c.envFlags.allowedOrigins {
 		toSave.AllowedOrigins = append([]string(nil), c.baseline.allowedOrigins...)

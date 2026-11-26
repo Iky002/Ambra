@@ -254,6 +254,7 @@ function createInitialServerConfig(): ServerConfiguration {
     EnableDLNA: false,
     DLNADefaultUserID: '',
     EnableQuickConnect: true,
+    EnableLoginUserList: false,
     EnableRemoteAccess: true,
     LocalNetworkSubnets: ['192.168.0.0/16', '10.0.0.0/8'],
     TrustedProxies: ['127.0.0.1', '::1'],
@@ -750,7 +751,7 @@ function createInitialDemoNotifications(): DemoNotificationRecord[] {
     {
       Id: 'notif-demo-01',
       Date: new Date(now - 15 * 60_000).toISOString(),
-      Name: '欢迎体验 Ambra v0.11.0',
+      Name: '欢迎体验 Ambra v0.11.1',
       Description: '已上线应用内通知中心、家长控制分级过滤与 Quick Connect 设备授权码登录。',
       Level: 'Normal',
       readByUsers: new Set(),
@@ -1733,6 +1734,9 @@ export async function demoFetch<T>(
       if (typeof body.EnableQuickConnect === 'boolean') {
         demoServerConfig.EnableQuickConnect = body.EnableQuickConnect
       }
+      if (typeof body.EnableLoginUserList === 'boolean') {
+        demoServerConfig.EnableLoginUserList = body.EnableLoginUserList
+      }
       if (typeof body.EnableRemoteAccess === 'boolean') {
         demoServerConfig.EnableRemoteAccess = body.EnableRemoteAccess
       }
@@ -1861,9 +1865,16 @@ export async function demoFetch<T>(
   }
 
   if (pathname === '/emby/Users/Public' && method === 'GET') {
+    if (!demoServerConfig.EnableLoginUserList) {
+      return [] as unknown as T
+    }
     return store.users
       .filter((u) => !u.user.Policy?.IsDisabled && !u.user.Policy?.IsHidden)
-      .map((u) => ({ ...u.user })) as T
+      .map((u) => ({
+        ...u.user,
+        Configuration: {},
+        Policy: { EnabledFolders: [], BlockedTags: [] },
+      })) as T
   }
 
   // ==================== 2. 认证登录 ====================
@@ -3121,7 +3132,7 @@ export async function demoFetch<T>(
           UserId: sessionUserId,
           UserName: caller.user?.Name || sessionUserId,
           Client: 'Ambra Web',
-          ApplicationVersion: '0.11.0',
+          ApplicationVersion: '0.11.1',
           DeviceName: 'Web Browser (Demo)',
           DeviceId: `dev-web-${sessionUserId}`,
           LastActivityDate: new Date().toISOString(),
@@ -5865,7 +5876,7 @@ export async function demoFetch<T>(
       DeviceId: 'dev-demo-web-01',
       DeviceName: 'Ambra Web Demo',
       AppName: 'Ambra Web',
-      AppVersion: '0.11.0',
+      AppVersion: '0.11.1',
       DateAdded: new Date().toISOString(),
     }
     demoQuickConnectSessions.set(secret, session)

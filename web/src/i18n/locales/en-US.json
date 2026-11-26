@@ -290,6 +290,8 @@
   "admin.settings.remoteAccessDesc": "When disabled, only localhost and configured LAN subnets can access this server",
   "admin.settings.quickConnectLabel": "Enable Quick Connect",
   "admin.settings.quickConnectDesc": "Allow TV and mobile clients to sign in using a one-time numeric pairing code",
+  "admin.settings.loginUserListLabel": "Show Public User List on Sign-In Page (EnableLoginUserList)",
+  "admin.settings.loginUserListDesc": "Disabled by default to prevent unauthenticated visitors from enumerating usernames and avatars; when enabled, non-hidden accounts appear on the sign-in screen",
   "admin.settings.dlnaLabel": "Enable DLNA Discovery & Casting",
   "admin.settings.dlnaDesc": "Disabled by default; exposes visible libraries over LAN SSDP/UPnP under the selected DLNA user",
   "admin.settings.dlnaDefaultUserLabel": "DLNA Default User Account",
