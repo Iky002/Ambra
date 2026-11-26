@@ -271,11 +271,23 @@ func TestCompatCoreAuditRemediationsFullSuite(t *testing.T) {
 		t.Fatalf("L-03: expected active session UserName updated to renamed_guest, got %+v", updatedSess)
 	}
 
-	// Upload avatar for user2, mark IsHidden=true -> anonymous GET returns 404 while authenticated GET returns 200
+	// Upload avatar for user2: when EnableLoginUserList=false (default), anonymous GET returns 404 even for non-hidden user
 	pngB64 := base64.StdEncoding.EncodeToString([]byte("\x89PNG\r\n\x1a\nhiddenavatar"))
 	if r := call(adminAuth.AccessToken, http.MethodPost, "/Users/"+env.user2.ID+"/Images/Primary", pngB64, ""); r.Code != http.StatusNoContent {
 		t.Fatalf("upload avatar failed: %d", r.Code)
 	}
+	if rAnonDefault := call("", http.MethodGet, "/Users/"+env.user2.ID+"/Images/Primary", "", ""); rAnonDefault.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 on anonymous GET avatar when EnableLoginUserList=false, got %d", rAnonDefault.Code)
+	}
+
+	// Enable EnableLoginUserList=true: non-hidden user avatar is now accessible anonymously (200), while IsHidden=true still returns 404
+	env.cfg.Update(func(c *config.Config) {
+		c.EnableLoginUserList = true
+	})
+	if rAnonPublic := call("", http.MethodGet, "/Users/"+env.user2.ID+"/Images/Primary", "", ""); rAnonPublic.Code != http.StatusOK {
+		t.Fatalf("expected 200 on anonymous GET avatar of visible user when EnableLoginUserList=true, got %d", rAnonPublic.Code)
+	}
+
 	hidPol := reducedPol
 	hidPol.IsHidden = true
 	hidBody, _ := json.Marshal(map[string]any{"Policy": hidPol})

@@ -204,11 +204,14 @@ describe('v0.10.9 Stream 5 全量修复回归测试', () => {
     expect(getStoredAuth()).toBeNull()
   })
 
-  it('H-18 & H-19 & M-45: CSP media-src 包含 data:，vite.config.ts 代理 /api 且按 Demo/普通模式区分 base', async () => {
+  it('H-18 & H-19 & M-45: CSP media-src 包含 data:，vite.config.ts 代理 /api 且支持 VITE_BASE_PATH 兼容 GitHub Pages 二级子路径与 Vercel 根路径', async () => {
     const webRoot = path.resolve(__dirname, '../../..')
+    const repoRoot = path.resolve(webRoot, '..')
     const vercel = JSON.parse(fs.readFileSync(path.join(webRoot, 'vercel.json'), 'utf8')) as {
+      buildCommand?: string
       headers: Array<{ source: string; headers: Array<{ key: string; value: string }> }>
     }
+    expect(vercel.buildCommand).toBe('VITE_BASE_PATH=/ npm run build:demo')
     const vercelCsp =
       vercel.headers
         .find((r) => r.source === '/(.*)')
@@ -221,18 +224,20 @@ describe('v0.10.9 Stream 5 全量修复回归测试', () => {
     const viteConfigSrc = fs.readFileSync(path.join(webRoot, 'vite.config.ts'), 'utf8')
     expect(viteConfigSrc).toContain("'/api'")
     expect(viteConfigSrc).toContain("target: 'http://localhost:8096'")
-    expect(viteConfigSrc).toContain("mode === 'demo'")
-    expect(viteConfigSrc).toContain("base: isDemoBuild ? '/' : './'")
+    expect(viteConfigSrc).toContain('VITE_BASE_PATH')
+    expect(viteConfigSrc).toContain("'./'")
+    expect(viteConfigSrc).not.toContain("isDemoBuild ? '/' : './'")
+
+    const pagesWorkflow = fs.readFileSync(
+      path.join(repoRoot, '.github/workflows/pages.yml'),
+      'utf8',
+    )
+    expect(pagesWorkflow).toContain('VITE_BASE_PATH: /${{ github.event.repository.name }}/')
 
     const distHtmlPath = path.join(webRoot, 'dist/index.html')
     if (fs.existsSync(distHtmlPath)) {
       const distHtml = fs.readFileSync(distHtmlPath, 'utf8')
       expect(distHtml).toContain('src="./assets/')
-    }
-    const distDemoHtmlPath = path.join(webRoot, 'dist-demo/index.html')
-    if (fs.existsSync(distDemoHtmlPath)) {
-      const distDemoHtml = fs.readFileSync(distDemoHtmlPath, 'utf8')
-      expect(distDemoHtml).toContain('src="/assets/')
     }
   })
 

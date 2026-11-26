@@ -22,6 +22,7 @@ export interface ServerConfiguration {
   EnableDLNA?: boolean
   DLNADefaultUserID?: string
   EnableQuickConnect?: boolean
+  EnableLoginUserList?: boolean
   EnableRemoteAccess?: boolean
   AllowedOrigins?: string[]
   TrustedProxies?: string[]

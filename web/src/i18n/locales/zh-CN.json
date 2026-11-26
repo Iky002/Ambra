@@ -290,6 +290,8 @@
   "admin.settings.remoteAccessDesc": "关闭后仅允许本地回环与下方配置的局域网子网访问服务器",
   "admin.settings.quickConnectLabel": "启用 Quick Connect 快捷授权",
   "admin.settings.quickConnectDesc": "允许电视端与客户端通过一次性数字授权码免输密码登录",
+  "admin.settings.loginUserListLabel": "登录页显示公开用户列表 (EnableLoginUserList)",
+  "admin.settings.loginUserListDesc": "默认关闭以防止未登录访客枚举账号与头像；开启后登录页将展示未隐藏账号供点击快速填入",
   "admin.settings.dlnaLabel": "启用 DLNA 局域网发现与投屏",
   "admin.settings.dlnaDesc": "默认关闭；开启后智能电视与局域网播放器可通过 SSDP/UPnP 免密浏览指定账号可见媒体",
   "admin.settings.dlnaDefaultUserLabel": "DLNA 默认权限账号",

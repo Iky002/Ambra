@@ -270,7 +270,7 @@ export function DashboardTab() {
               <StatusTile
                 label={t('admin.dashboard.tileVersion')}
                 value={
-                  sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.11.0')
+                  sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.11.1')
                 }
                 sub={t('admin.dashboard.tileCompatPort', {
                   version: sysInfo?.Version || '4.10.2.0',

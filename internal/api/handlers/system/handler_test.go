@@ -401,9 +401,12 @@ func TestSystemConfigMaskingAndActivityLogAdminOnly(t *testing.T) {
 	if adminCfg.TMDBApiKey != "********" || !adminCfg.HasTMDBApiKey {
 		t.Fatalf("expected masked TMDBApiKey=******** and HasTMDBApiKey=true for admin, got key=%q has=%v", adminCfg.TMDBApiKey, adminCfg.HasTMDBApiKey)
 	}
+	if adminCfg.EnableLoginUserList {
+		t.Fatalf("expected EnableLoginUserList=false by default, got true")
+	}
 
 	// Posting "********" via /System/Configuration/Partial preserves original TMDBApiKey and updates new fields
-	req = httptest.NewRequest(http.MethodPost, "/System/Configuration/Partial", bytes.NewBufferString(`{"TMDBApiKey":"********","EnableDLNA":true,"SimultaneousStreamLimit":4}`))
+	req = httptest.NewRequest(http.MethodPost, "/System/Configuration/Partial", bytes.NewBufferString(`{"TMDBApiKey":"********","EnableDLNA":true,"EnableLoginUserList":true,"SimultaneousStreamLimit":4}`))
 	req.Header.Set("X-Emby-Token", adminTok)
 	rec = httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -415,7 +418,7 @@ func TestSystemConfigMaskingAndActivityLogAdminOnly(t *testing.T) {
 	rec = httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	_ = json.Unmarshal(rec.Body.Bytes(), &adminCfg)
-	if !adminCfg.HasTMDBApiKey || !adminCfg.EnableDLNA || adminCfg.SimultaneousStreamLimit != 4 {
+	if !adminCfg.HasTMDBApiKey || !adminCfg.EnableDLNA || !adminCfg.EnableLoginUserList || adminCfg.SimultaneousStreamLimit != 4 {
 		t.Fatalf("unexpected config after Partial update: %+v", adminCfg)
 	}
 

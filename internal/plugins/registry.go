@@ -283,7 +283,10 @@ func (r *Registry) List() []Manifest {
 		if out[i].Priority != out[j].Priority {
 			return out[i].Priority < out[j].Priority
 		}
-		return out[i].Name < out[j].Name
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].ID < out[j].ID
 	})
 	return out
 }
@@ -347,7 +350,10 @@ func (r *Registry) MetadataProvidersWithFilter(enabledNamesOrIDs []string, order
 		if mi.Priority != mj.Priority {
 			return mi.Priority < mj.Priority
 		}
-		return mi.Name < mj.Name
+		if mi.Name != mj.Name {
+			return mi.Name < mj.Name
+		}
+		return mi.ID < mj.ID
 	})
 	return out
 }
@@ -382,6 +388,16 @@ func lookupProviderRank(mf Manifest, ranks map[string]int) (int, bool) {
 	return 0, false
 }
 
+func manifestLess(mi, mj Manifest) bool {
+	if mi.Priority != mj.Priority {
+		return mi.Priority < mj.Priority
+	}
+	if mi.Name != mj.Name {
+		return mi.Name < mj.Name
+	}
+	return mi.ID < mj.ID
+}
+
 func (r *Registry) StreamResolvers() []StreamResolver {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -395,7 +411,7 @@ func (r *Registry) StreamResolvers() []StreamResolver {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
-		return out[i].Manifest().Priority < out[j].Manifest().Priority
+		return manifestLess(out[i].Manifest(), out[j].Manifest())
 	})
 	return out
 }
@@ -413,7 +429,7 @@ func (r *Registry) SubtitleProviders() []SubtitleProvider {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
-		return out[i].Manifest().Priority < out[j].Manifest().Priority
+		return manifestLess(out[i].Manifest(), out[j].Manifest())
 	})
 	return out
 }
@@ -431,7 +447,7 @@ func (r *Registry) ImageProviders() []ImageProvider {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
-		return out[i].Manifest().Priority < out[j].Manifest().Priority
+		return manifestLess(out[i].Manifest(), out[j].Manifest())
 	})
 	return out
 }
@@ -449,7 +465,7 @@ func (r *Registry) Notifiers() []Notifier {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
-		return out[i].Manifest().Priority < out[j].Manifest().Priority
+		return manifestLess(out[i].Manifest(), out[j].Manifest())
 	})
 	return out
 }

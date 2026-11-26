@@ -107,10 +107,18 @@ func doReq(r http.Handler, method, path, token, body string) *httptest.ResponseR
 func TestUsersAuthAndCRUD(t *testing.T) {
 	env := setupUsersEnv(t)
 
-	// GET /Users/Public
+	// GET /Users/Public defaults to hidden empty array [] when EnableLoginUserList is false
 	rec := doReq(env.router, http.MethodGet, "/Users/Public", "", "")
+	if rec.Code != http.StatusOK || strings.TrimSpace(rec.Body.String()) != "[]" {
+		t.Fatalf("ListPublicUsers (default hidden): expected 200 [], got %d %s", rec.Code, rec.Body.String())
+	}
+	// Once enabled by admin, GET /Users/Public exposes non-hidden accounts
+	env.handler.cfg.Update(func(c *config.Config) {
+		c.EnableLoginUserList = true
+	})
+	rec = doReq(env.router, http.MethodGet, "/Users/Public", "", "")
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "admin") {
-		t.Fatalf("ListPublicUsers: %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("ListPublicUsers (enabled): %d %s", rec.Code, rec.Body.String())
 	}
 
 	// POST /Users/AuthenticateByName: bad JSON -> 400
@@ -378,6 +386,9 @@ func TestUsersHandlerEdgeAndErrorBranches(t *testing.T) {
 	}
 
 	// Close underlying SQLite store to exercise 500 internal error paths cleanly.
+	env.handler.cfg.Update(func(c *config.Config) {
+		c.EnableLoginUserList = true
+	})
 	_ = env.store.Close()
 
 	adminCtx := &middleware.AuthContext{User: env.admin, IsAPIKey: true}

@@ -288,6 +288,7 @@ type ServerConfigurationDto struct {
 	EnableDLNA                bool     `json:"EnableDLNA"`
 	DLNADefaultUserID         string   `json:"DLNADefaultUserID,omitempty"`
 	EnableQuickConnect        bool     `json:"EnableQuickConnect"`
+	EnableLoginUserList       bool     `json:"EnableLoginUserList"`
 	EnableRemoteAccess        bool     `json:"EnableRemoteAccess"`
 	AllowedOrigins            []string `json:"AllowedOrigins,omitempty"`
 	TrustedProxies            []string `json:"TrustedProxies,omitempty"`
@@ -434,6 +435,7 @@ func (h *Handler) GetConfiguration(w http.ResponseWriter, r *http.Request) {
 		out["EnableDLNA"] = snap.EnableDLNA
 		out["DLNADefaultUserID"] = snap.DLNADefaultUserID
 		out["EnableQuickConnect"] = snap.EnableQuickConnect
+		out["EnableLoginUserList"] = snap.EnableLoginUserList
 		out["EnableRemoteAccess"] = snap.IsGlobalRemoteAccessEnabled()
 		out["AllowedOrigins"] = nonNilStrings(snap.AllowedOrigins)
 		out["TrustedProxies"] = nonNilStrings(snap.TrustedProxies)
@@ -461,7 +463,7 @@ func isTypedServerConfigKey(k string) bool {
 	switch k {
 	case "ServerName", "IsStartupWizardCompleted", "TMDBApiKey", "HasTMDBApiKey", "TMDBLanguage",
 		"EnableSTRM302", "PlayedThreshold", "EnableDLNA", "DLNADefaultUserID", "EnableQuickConnect",
-		"EnableRemoteAccess", "AllowedOrigins", "TrustedProxies", "LocalNetworkSubnets",
+		"EnableLoginUserList", "EnableRemoteAccess", "AllowedOrigins", "TrustedProxies", "LocalNetworkSubnets",
 		"SimultaneousStreamLimit", "RemoteClientBitrateLimit", "FFmpegPath", "FFprobePath":
 		return true
 	default:
@@ -524,6 +526,9 @@ func (h *Handler) applyConfigurationUpdate(w http.ResponseWriter, r *http.Reques
 		}
 		if v, ok := body["EnableQuickConnect"].(bool); ok {
 			c.EnableQuickConnect = v
+		}
+		if v, ok := body["EnableLoginUserList"].(bool); ok {
+			c.EnableLoginUserList = v
 		}
 		if v, ok := body["EnableRemoteAccess"].(bool); ok {
 			b := v

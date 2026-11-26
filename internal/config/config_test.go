@@ -23,6 +23,9 @@ func TestDefault(t *testing.T) {
 	if cfg.TMDBLanguage != "zh-CN" || !cfg.EnableSTRM302 || cfg.PlayedThreshold != 0.90 {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
+	if cfg.EnableDLNA || cfg.EnableLoginUserList || !cfg.EnableQuickConnect {
+		t.Fatalf("unexpected security defaults: DLNA=%v LoginUserList=%v QC=%v", cfg.EnableDLNA, cfg.EnableLoginUserList, cfg.EnableQuickConnect)
+	}
 
 	cfg2 := Default("/custom/dir")
 	if cfg2.DataDir != "/custom/dir" {
@@ -258,6 +261,7 @@ func TestLoadEmptyDataDirAndAllEnvOverrides(t *testing.T) {
 
 	t.Setenv("AMBRA_ENABLE_DLNA", "false")
 	t.Setenv("AMBRA_ENABLE_QUICK_CONNECT", "0")
+	t.Setenv("AMBRA_ENABLE_LOGIN_USER_LIST", "true")
 	t.Setenv("AMBRA_ALLOWED_ORIGINS", " https://a.example.com , , https://b.example.com ")
 	t.Setenv("AMBRA_TRUSTED_PROXIES", "10.0.0.1, 172.16.0.0/12, ")
 	t.Setenv("AMBRA_TMDB_API_KEY", "env-only-secret")
@@ -275,6 +279,9 @@ func TestLoadEmptyDataDirAndAllEnvOverrides(t *testing.T) {
 	if cfg.EnableQuickConnect {
 		t.Fatal("expected EnableQuickConnect=false from env")
 	}
+	if !cfg.EnableLoginUserList {
+		t.Fatal("expected EnableLoginUserList=true from env")
+	}
 	if len(cfg.AllowedOrigins) != 2 || cfg.AllowedOrigins[0] != "https://a.example.com" || cfg.AllowedOrigins[1] != "https://b.example.com" {
 		t.Fatalf("unexpected AllowedOrigins: %#v", cfg.AllowedOrigins)
 	}
@@ -285,7 +292,7 @@ func TestLoadEmptyDataDirAndAllEnvOverrides(t *testing.T) {
 		t.Fatalf("expected TMDBApiKey in memory, got %q", cfg.TMDBApiKey)
 	}
 
-	// Save MUST NOT persist env-provided TMDBApiKey to disk.
+	// Save MUST NOT persist env-provided TMDBApiKey or ephemeral AMBRA_ENABLE_LOGIN_USER_LIST to disk.
 	if err := cfg.Save(); err != nil {
 		t.Fatalf("Save failed: %v", err)
 	}
@@ -296,20 +303,27 @@ func TestLoadEmptyDataDirAndAllEnvOverrides(t *testing.T) {
 	if string(raw) == "" {
 		t.Fatal("expected non-empty saved ambra.json")
 	}
-	if got := string(raw); filepath.Base(cfg.DBPath()) != "ambra.db" || containsString(got, "env-only-secret") {
-		t.Fatalf("env TMDB key must not be persisted to disk: %s", got)
+	if got := string(raw); filepath.Base(cfg.DBPath()) != "ambra.db" || containsString(got, "env-only-secret") || containsString(got, `"enable_login_user_list": true`) {
+		t.Fatalf("env overrides must not be persisted to disk: %s", got)
 	}
 
-	// Verify positive boolean env overrides ("yes", "on") on top of persisted false values.
+	// Verify positive/negative boolean env overrides on top of persisted baseline values.
 	t.Setenv("AMBRA_ENABLE_DLNA", "yes")
 	t.Setenv("AMBRA_ENABLE_QUICK_CONNECT", "on")
+	t.Setenv("AMBRA_ENABLE_LOGIN_USER_LIST", "false")
 	t.Setenv("AMBRA_TMDB_API_KEY", "")
 	cfgTrue, err := Load("")
 	if err != nil {
 		t.Fatalf("reload Load(\"\") failed: %v", err)
 	}
-	if !cfgTrue.EnableDLNA || !cfgTrue.EnableQuickConnect {
-		t.Fatalf("expected true env overrides, got DLNA=%v QC=%v", cfgTrue.EnableDLNA, cfgTrue.EnableQuickConnect)
+	if !cfgTrue.EnableDLNA || !cfgTrue.EnableQuickConnect || cfgTrue.EnableLoginUserList {
+		t.Fatalf("expected DLNA=true QC=true LoginUserList=false, got DLNA=%v QC=%v LoginUserList=%v", cfgTrue.EnableDLNA, cfgTrue.EnableQuickConnect, cfgTrue.EnableLoginUserList)
+	}
+	cfgTrue.Update(func(c *Config) {
+		c.EnableLoginUserList = true
+	})
+	if err := cfgTrue.Save(); err != nil {
+		t.Fatalf("Save after Update EnableLoginUserList: %v", err)
 	}
 	if cfgTrue.TMDBApiKey != "" {
 		t.Fatalf("expected empty TMDBApiKey after reloading without env, got %q", cfgTrue.TMDBApiKey)

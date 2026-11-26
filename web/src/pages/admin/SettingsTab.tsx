@@ -79,6 +79,7 @@ export function SettingsTab() {
   const [showApiKey, setShowApiKey] = useState(false)
   const [tmdbLanguage, setTmdbLanguage] = useState('zh-CN')
   const [enableStrm302, setEnableStrm302] = useState(true)
+  const [enableLoginUserList, setEnableLoginUserList] = useState(false)
   const [playedThresholdPct, setPlayedThresholdPct] = useState(90)
 
   // 网络、远程访问与协议配置状态
@@ -160,6 +161,7 @@ export function SettingsTab() {
 
     setTmdbLanguage(config.TMDBLanguage || 'zh-CN')
     setEnableStrm302(config.EnableSTRM302 ?? true)
+    setEnableLoginUserList(config.EnableLoginUserList ?? false)
     const rawPct =
       typeof config.PlayedThreshold === 'number' && config.PlayedThreshold > 0
         ? Math.round(config.PlayedThreshold * 100)
@@ -261,6 +263,7 @@ export function SettingsTab() {
         TMDBApiKey: resolveNextTmdbKey(),
         TMDBLanguage: tmdbLanguage,
         EnableSTRM302: enableStrm302,
+        EnableLoginUserList: enableLoginUserList,
         PlayedThreshold: Number((playedThresholdPct / 100).toFixed(2)),
         EnableRemoteAccess: enableRemoteAccess,
         EnableQuickConnect: enableQuickConnect,
@@ -276,6 +279,7 @@ export function SettingsTab() {
         queryClient.invalidateQueries({ queryKey: ['admin', 'serverConfig'] }),
         queryClient.invalidateQueries({ queryKey: ['admin', 'plugins'] }),
         queryClient.invalidateQueries({ queryKey: ['publicSystemInfo'] }),
+        queryClient.invalidateQueries({ queryKey: ['publicUsers'] }),
         queryClient.invalidateQueries({ queryKey: ['admin', 'systemInfo'] }),
       ])
       setFeedback({ type: 'success', message: t('admin.settings.savedSuccess') })
@@ -502,6 +506,13 @@ export function SettingsTab() {
                 onChange={setEnableStrm302}
                 label={t('admin.settings.strm302Label')}
                 description={t('admin.settings.strm302Desc')}
+              />
+
+              <ToggleSwitch
+                checked={enableLoginUserList}
+                onChange={setEnableLoginUserList}
+                label={t('admin.settings.loginUserListLabel')}
+                description={t('admin.settings.loginUserListDesc')}
               />
 
               <div className="rounded-xl border border-white/8 bg-white/[0.02] px-4 py-3.5">

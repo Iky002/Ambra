@@ -117,10 +117,11 @@ describe('Stream 4 (v0.9.3): QuickConnect Login, Profile Device Authorization & 
       </Routes>,
     )
 
-    // 验证回退版本号更新为 v0.11.0
+    // 验证回退版本号更新为 v0.11.1，且默认隐藏公开用户列表时不渲染快捷选号区
     await waitFor(() => {
-      expect(screen.getByText(/v0\.11\.0/)).toBeInTheDocument()
+      expect(screen.getByText(/v0\.11\.1/)).toBeInTheDocument()
     })
+    expect(screen.queryByText('选择账号快速登录')).not.toBeInTheDocument()
 
     // 显示 Quick Connect 按钮
     const qcButton = await screen.findByRole('button', { name: /Quick Connect 授权码登录/ })

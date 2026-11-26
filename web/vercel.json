@@ -1,5 +1,5 @@
 {
-  "buildCommand": "npm run build:demo",
+  "buildCommand": "VITE_BASE_PATH=/ npm run build:demo",
   "outputDirectory": "dist-demo",
   "framework": "vite",
   "headers": [

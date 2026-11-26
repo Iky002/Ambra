@@ -2523,7 +2523,7 @@ func (h *Handler) isRequestAuthenticated(r *http.Request) bool {
 func (h *Handler) serveUserImage(w http.ResponseWriter, r *http.Request, headOnly bool) {
 	uid := h.resolveUserID(r, "Id")
 	if !h.isRequestAuthenticated(r) && h.userRepo != nil {
-		if uid == "" {
+		if (h.cfg != nil && !h.cfg.Snapshot().EnableLoginUserList) || uid == "" {
 			writeJSONError(w, r, http.StatusNotFound, "user image not found")
 			return
 		}

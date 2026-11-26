@@ -290,6 +290,8 @@
   "admin.settings.remoteAccessDesc": "關閉後僅允許本機與下方設定的區域網路子網路存取伺服器",
   "admin.settings.quickConnectLabel": "啟用 Quick Connect 快速授權",
   "admin.settings.quickConnectDesc": "允許電視端與用戶端透過一次性數字授權碼免輸入密碼登入",
+  "admin.settings.loginUserListLabel": "登入頁顯示公開使用者清單 (EnableLoginUserList)",
+  "admin.settings.loginUserListDesc": "預設關閉以防止未登入訪客列舉帳號與頭像；開啟後登入頁將顯示未隱藏帳號供點擊快速帶入",
   "admin.settings.dlnaLabel": "啟用 DLNA 區域網路探索與投放",
   "admin.settings.dlnaDesc": "預設關閉；開啟後智慧電視與區域網路播放器可透過 SSDP/UPnP 瀏覽指定帳號可見媒體",
   "admin.settings.dlnaDefaultUserLabel": "DLNA 預設權限帳號",

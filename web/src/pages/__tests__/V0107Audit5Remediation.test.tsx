@@ -768,8 +768,12 @@ describe('v0.10.7 Audit 5 Web 全量修复回归测试', () => {
     })
   })
 
-  it('M-19: Demo Mock 同步 v0.11.0 版本号、ChapterCachePath/BifCachePath、264MB 缓存、/Attachments、/index.bif 与真实字幕格式', async () => {
+  it('M-19: Demo Mock 同步 v0.11.1 版本号、默认隐藏公开用户列表、ChapterCachePath/BifCachePath、264MB 缓存、/Attachments 与 /index.bif', async () => {
     setDemoModeOverride(true)
+    // 默认 EnableLoginUserList=false，匿名获取公开用户列表应返回空数组 []
+    const pubBefore = await api.getPublicUsers()
+    expect(pubBefore).toEqual([])
+
     const authRes = await api.authenticateByName('admin', '')
     saveAuth({
       accessToken: authRes.AccessToken,
@@ -780,8 +784,16 @@ describe('v0.10.7 Audit 5 Web 全量修复回归测试', () => {
       deviceId: 'dev-demo',
     })
 
+    // 管理员开启 EnableLoginUserList=true 后，公开用户列表返回脱敏的非隐藏用户
+    await api.updateServerConfig({ EnableLoginUserList: true })
+    const pubAfter = await api.getPublicUsers()
+    expect(pubAfter.length).toBeGreaterThan(0)
+    expect(pubAfter.some((u) => u.Name === 'admin')).toBe(true)
+    expect(pubAfter[0].Policy?.IsAdministrator).toBeUndefined()
+    await api.updateServerConfig({ EnableLoginUserList: false })
+
     const sysInfo = await api.getSystemInfo()
-    expect(sysInfo.Version).toBe('0.11.0-demo')
+    expect(sysInfo.Version).toBe('0.11.1-demo')
     expect(sysInfo.ChapterCachePath).toBe('/var/lib/ambra/cache/chapters')
     expect(sysInfo.BifCachePath).toBe('/var/lib/ambra/cache/bif')
 
