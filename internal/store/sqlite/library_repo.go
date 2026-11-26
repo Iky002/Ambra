@@ -86,6 +86,7 @@ type ItemExtra struct {
 	Chapters                []ChapterRecord   `json:"chapters,omitempty"`
 	LockedFields            []string          `json:"LockedFields,omitempty"`
 	LockData                bool              `json:"LockData,omitempty"`
+	PreventAutoMerge        bool              `json:"prevent_auto_merge,omitempty"`
 }
 
 // ItemRecord represents a row in the items table.
@@ -199,6 +200,7 @@ type UserItemDataRecord struct {
 	PlayCount             int
 	PlaybackPositionTicks int64
 	IsFavorite            bool
+	Likes                 *bool
 	LastPlayedDate        *int64
 	AudioStreamIndex      *int
 	SubtitleStreamIndex   *int
@@ -206,36 +208,42 @@ type UserItemDataRecord struct {
 
 // ItemFilter holds query parameters for QueryItems.
 type ItemFilter struct {
-	ServerID               string
-	UserID                 string
-	ParentID               string
-	LibraryID              string
-	AllowedLibraryIDs      []string
-	MaxParentalRating      *int
-	BlockedTags            []string
-	SeriesID               string
-	SeasonID               string
-	Recursive              bool
-	IncludeItemTypes       []string
-	ExcludeItemTypes       []string
-	IDs                    []string
-	ExcludeItemIDs         []string
-	Genres                 []string
-	GenreIDs               []string
-	Studios                []string
-	StudioIDs              []string
-	Tags                   []string
-	OfficialRatings        []string
-	MinCommunityRating     *float64
-	PersonIDs              []string
-	Persons                []string
-	Years                  []int
-	IsHD                   *bool
-	Is4K                   *bool
-	HasSubtitles           *bool
-	IsPlayed               *bool
-	IsUnplayed             *bool
+	ServerID                string
+	UserID                  string
+	ParentID                string
+	LibraryID               string
+	AllowedLibraryIDs       []string
+	MaxParentalRating       *int
+	BlockUnratedItems       []string
+	BlockedTags             []string
+	AllowedTags             []string
+	SeriesID                string
+	SeasonID                string
+	Recursive               bool
+	IncludeItemTypes        []string
+	ExcludeItemTypes        []string
+	IDs                     []string
+	ExcludeItemIDs          []string
+	Genres                  []string
+	GenreIDs                []string
+	Studios                 []string
+	StudioIDs               []string
+	Tags                    []string
+	OfficialRatings         []string
+	VideoCodecs             []string
+	VideoRanges             []string
+	MinCommunityRating      *float64
+	PersonIDs               []string
+	Persons                 []string
+	Years                   []int
+	IsHD                    *bool
+	Is4K                    *bool
+	IsHDR                   *bool
+	HasSubtitles            *bool
+	IsPlayed                *bool
+	IsUnplayed              *bool
 	IsFavorite              *bool
+	IsLiked                 *bool
 	IsResumable             *bool
 	ExcludeHiddenResume     bool
 	SearchTerm              string
@@ -243,11 +251,11 @@ type ItemFilter struct {
 	NameStartsWithOrGreater string
 	NameLessThan            string
 	SortBy                  []string
-	SortOrder              string
-	StartIndex             int
-	Limit                  int
-	Fields                 []string
-	EnableTotalRecordCount *bool
+	SortOrder               string
+	StartIndex              int
+	Limit                   int
+	Fields                  []string
+	EnableTotalRecordCount  *bool
 }
 
 // SearchHintFilter holds parameters for SearchHints.
@@ -256,7 +264,9 @@ type SearchHintFilter struct {
 	ParentID          string
 	AllowedLibraryIDs []string
 	MaxParentalRating *int
+	BlockUnratedItems []string
 	BlockedTags       []string
+	AllowedTags       []string
 	SearchTerm        string
 	IncludeItemTypes  []string
 	Limit             int

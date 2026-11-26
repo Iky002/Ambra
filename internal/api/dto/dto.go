@@ -45,23 +45,25 @@ type SystemInfo struct {
 
 // UserPolicy matches Emby UserPolicy.
 type UserPolicy struct {
-	IsAdministrator                  bool     `json:"IsAdministrator"`
-	IsHidden                         bool     `json:"IsHidden"`
-	IsDisabled                       bool     `json:"IsDisabled"`
-	EnableAllFolders                 bool     `json:"EnableAllFolders"`
-	EnabledFolders                   []string `json:"EnabledFolders"`
-	EnableMediaPlayback              bool     `json:"EnableMediaPlayback"`
-	EnableAudioPlaybackTranscoding   bool     `json:"EnableAudioPlaybackTranscoding"`
-	EnableVideoPlaybackTranscoding   bool     `json:"EnableVideoPlaybackTranscoding"`
-	EnablePlaybackRemuxing           bool     `json:"EnablePlaybackRemuxing"`
-	EnableContentDeletion            bool     `json:"EnableContentDeletion"`
-	EnableContentDownloading         bool     `json:"EnableContentDownloading"`
-	EnableRemoteAccess               bool     `json:"EnableRemoteAccess"`
-	EnableLiveTvAccess               bool     `json:"EnableLiveTvAccess"`
-	EnableLiveTvManagement           bool     `json:"EnableLiveTvManagement"`
-	MaxParentalRating                *int     `json:"MaxParentalRating,omitempty"`
-	BlockedTags                      []string `json:"BlockedTags"`
-	AuthenticationProviderId         string   `json:"AuthenticationProviderId"`
+	IsAdministrator                bool     `json:"IsAdministrator"`
+	IsHidden                       bool     `json:"IsHidden"`
+	IsDisabled                     bool     `json:"IsDisabled"`
+	EnableAllFolders               bool     `json:"EnableAllFolders"`
+	EnabledFolders                 []string `json:"EnabledFolders"`
+	EnableMediaPlayback            bool     `json:"EnableMediaPlayback"`
+	EnableAudioPlaybackTranscoding bool     `json:"EnableAudioPlaybackTranscoding"`
+	EnableVideoPlaybackTranscoding bool     `json:"EnableVideoPlaybackTranscoding"`
+	EnablePlaybackRemuxing         bool     `json:"EnablePlaybackRemuxing"`
+	EnableContentDeletion          bool     `json:"EnableContentDeletion"`
+	EnableContentDownloading       bool     `json:"EnableContentDownloading"`
+	EnableRemoteAccess             bool     `json:"EnableRemoteAccess"`
+	EnableLiveTvAccess             bool     `json:"EnableLiveTvAccess"`
+	EnableLiveTvManagement         bool     `json:"EnableLiveTvManagement"`
+	MaxParentalRating              *int     `json:"MaxParentalRating,omitempty"`
+	BlockUnratedItems              []string `json:"BlockUnratedItems,omitempty"`
+	BlockedTags                    []string `json:"BlockedTags"`
+	AllowedTags                    []string `json:"AllowedTags,omitempty"`
+	AuthenticationProviderId       string   `json:"AuthenticationProviderId"`
 }
 
 // UserConfiguration matches Emby UserConfiguration.
@@ -69,6 +71,7 @@ type UserConfiguration struct {
 	PlayDefaultAudioTrack      bool     `json:"PlayDefaultAudioTrack"`
 	SubtitleLanguagePreference string   `json:"SubtitleLanguagePreference,omitempty"`
 	AudioLanguagePreference    string   `json:"AudioLanguagePreference,omitempty"`
+	UICulture                  string   `json:"UICulture,omitempty"`
 	DisplayMissingEpisodes     bool     `json:"DisplayMissingEpisodes"`
 	SubtitleMode               string   `json:"SubtitleMode"`
 	EnableLocalPassword        bool     `json:"EnableLocalPassword"`
@@ -109,21 +112,27 @@ type PlayerStateInfo struct {
 	RepeatMode          string `json:"RepeatMode"`
 }
 
+type SessionUserInfo struct {
+	UserId   string `json:"UserId"`
+	UserName string `json:"UserName,omitempty"`
+}
+
 type SessionInfo struct {
-	Id                    string           `json:"Id"`
-	ServerId              string           `json:"ServerId"`
-	UserId                string           `json:"UserId"`
-	UserName              string           `json:"UserName"`
-	Client                string           `json:"Client"`
-	LastActivityDate      time.Time        `json:"LastActivityDate"`
-	DeviceName            string           `json:"DeviceName"`
-	DeviceId              string           `json:"DeviceId"`
-	ApplicationVersion    string           `json:"ApplicationVersion"`
-	SupportsRemoteControl bool             `json:"SupportsRemoteControl"`
-	PlayState             PlayerStateInfo  `json:"PlayState"`
-	NowPlayingItem        *BaseItemDto     `json:"NowPlayingItem,omitempty"`
-	PlayableMediaTypes    []string         `json:"PlayableMediaTypes"`
-	SupportedCommands     []string         `json:"SupportedCommands"`
+	Id                    string            `json:"Id"`
+	ServerId              string            `json:"ServerId"`
+	UserId                string            `json:"UserId"`
+	UserName              string            `json:"UserName"`
+	Client                string            `json:"Client"`
+	LastActivityDate      time.Time         `json:"LastActivityDate"`
+	DeviceName            string            `json:"DeviceName"`
+	DeviceId              string            `json:"DeviceId"`
+	ApplicationVersion    string            `json:"ApplicationVersion"`
+	SupportsRemoteControl bool              `json:"SupportsRemoteControl"`
+	PlayState             PlayerStateInfo   `json:"PlayState"`
+	NowPlayingItem        *BaseItemDto      `json:"NowPlayingItem,omitempty"`
+	PlayableMediaTypes    []string          `json:"PlayableMediaTypes"`
+	SupportedCommands     []string          `json:"SupportedCommands"`
+	AdditionalUsers       []SessionUserInfo `json:"AdditionalUsers,omitempty"`
 }
 
 type AuthenticationResult struct {
@@ -137,6 +146,7 @@ type UserItemDataDto struct {
 	PlaybackPositionTicks int64      `json:"PlaybackPositionTicks"`
 	PlayCount             int        `json:"PlayCount"`
 	IsFavorite            bool       `json:"IsFavorite"`
+	Likes                 *bool      `json:"Likes,omitempty"`
 	Played                bool       `json:"Played"`
 	UnplayedItemCount     *int       `json:"UnplayedItemCount,omitempty"`
 	PlayedPercentage      *float64   `json:"PlayedPercentage,omitempty"`
@@ -268,6 +278,7 @@ type BaseItemDto struct {
 	BackdropImageTags       []string          `json:"BackdropImageTags"`
 	PrimaryImageAspectRatio *float64          `json:"PrimaryImageAspectRatio,omitempty"`
 	LocationType            string            `json:"LocationType,omitempty"`
+	PlaylistItemId          string            `json:"PlaylistItemId,omitempty"`
 }
 
 type PlaybackInfoResponse struct {

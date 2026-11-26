@@ -16,8 +16,20 @@ export interface ServerConfiguration {
   ServerName: string
   IsStartupWizardCompleted?: boolean
   TMDBApiKey?: string
+  HasTMDBApiKey?: boolean
   TMDBLanguage?: string
   EnableSTRM302?: boolean
+  EnableDLNA?: boolean
+  DLNADefaultUserID?: string
+  EnableQuickConnect?: boolean
+  EnableRemoteAccess?: boolean
+  AllowedOrigins?: string[]
+  TrustedProxies?: string[]
+  LocalNetworkSubnets?: string[]
+  SimultaneousStreamLimit?: number
+  RemoteClientBitrateLimit?: number
+  FFmpegPath?: string
+  FFprobePath?: string
   PlayedThreshold?: number
   PreferredMetadataLanguage?: string
   MetadataCountryCode?: string
@@ -64,7 +76,9 @@ export interface UserPolicy {
   EnableLiveTvAccess?: boolean
   EnableLiveTvManagement?: boolean
   MaxParentalRating?: number
+  BlockUnratedItems?: string[]
   BlockedTags?: string[]
+  AllowedTags?: string[]
   AuthenticationProviderId?: string
 }
 
@@ -72,6 +86,7 @@ export interface UserConfiguration {
   PlayDefaultAudioTrack?: boolean
   SubtitleLanguagePreference?: string
   AudioLanguagePreference?: string
+  UICulture?: string
   DisplayMissingEpisodes?: boolean
   SubtitleMode?: string
   EnableLocalPassword?: boolean
@@ -111,6 +126,7 @@ export interface UserItemDataDto {
   PlaybackPositionTicks: number
   PlayCount: number
   IsFavorite: boolean
+  Likes?: boolean
   Played: boolean
   UnplayedItemCount?: number
   PlayedPercentage?: number
@@ -381,6 +397,7 @@ export interface BaseItemDto {
   BackdropImageTags?: string[]
   PrimaryImageAspectRatio?: number
   LocationType?: string
+  PlaylistItemId?: string
   LockedFields?: string[]
   LockData?: boolean
 }
@@ -522,10 +539,93 @@ export interface DeviceInfo {
 }
 
 export interface ApiKeyInfo {
+  Id?: string
   AccessToken: string
+  MaskedToken?: string
   AppName: string
   DateCreated?: string
   IsActive?: boolean
+}
+
+export type RemoteSearchItemType =
+  | 'Movie'
+  | 'Series'
+  | 'BoxSet'
+  | 'MusicAlbum'
+  | 'MusicArtist'
+  | 'MusicVideo'
+  | 'Person'
+  | 'Book'
+  | 'Game'
+  | 'Trailer'
+
+export interface RemoteSubtitleInfo {
+  Id: string
+  Name: string
+  ProviderName?: string
+  Language?: string
+  ThreeLetterISOLanguageName?: string
+  Format?: string
+  Comment?: string
+  Author?: string
+  CommunityRating?: number
+  DownloadCount?: number
+  IsHashMatch?: boolean
+}
+
+export interface EncodingFfmpegOptions {
+  HardwareAccelerationMode?: number
+  EnableThrottling?: boolean
+  ThrottleBufferSize?: number
+  ThrottleHysteresis?: number
+  H264Crf?: number
+  H264Preset?: string
+  EnableHardwareEncoding?: boolean
+  AllowHevcEncoding?: boolean
+  EnableSubtitleExtraction?: boolean
+  TranscodingTempPath?: string
+  EncoderAppPathDisplay?: string
+}
+
+export interface ToneMapOptions {
+  EnableToneMapping?: boolean
+  ToneMappingAlgorithm?: string
+  ToneMappingMode?: string
+  ToneMappingDesat?: number
+  ToneMappingParam?: number
+  ToneMappingPeak?: number
+}
+
+export interface LiveTvSeriesTimerInfo {
+  Id?: string
+  ChannelId?: string
+  ProgramId?: string
+  SeriesId?: string
+  Name: string
+  Overview?: string
+  RecordAnyTime?: boolean
+  RecordAnyChannel?: boolean
+  RecordNewOnly?: boolean
+  Days?: string[]
+  PrePaddingSeconds?: number
+  PostPaddingSeconds?: number
+}
+
+export interface LiveTvChannelMapping {
+  ProviderId?: string
+  TunerChannelId: string
+  ProviderChannelId: string
+  TunerChannelName?: string
+  ProviderChannelName?: string
+}
+
+export interface ItemFilters2Response {
+  Genres?: string[]
+  Tags?: string[]
+  OfficialRatings?: string[]
+  Years?: number[]
+  VideoTypes?: string[]
+  Codecs?: string[]
 }
 
 export interface ScheduledTaskExecutionResult {
