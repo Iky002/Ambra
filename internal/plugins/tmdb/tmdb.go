@@ -3,8 +3,10 @@ package tmdb
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -22,9 +24,12 @@ const (
 	defaultProfileImageBaseURL = "https://image.tmdb.org/t/p/w185"
 	defaultPosterThumbBaseURL  = "https://image.tmdb.org/t/p/w342"
 	defaultBackdropThumbURL    = "https://image.tmdb.org/t/p/w500"
+	defaultPriority            = 20
 	maxSearchCandidates        = 10
 	maxResponseBytes           = 16 << 20 // 16 MiB
 )
+
+var _ plugins.DefaultConfigExporter = (*Provider)(nil)
 
 // RemoteImageCandidate represents a single remote artwork candidate from TMDB.
 type RemoteImageCandidate struct {
@@ -49,7 +54,9 @@ type Provider struct {
 	baseURL       string
 	imageBaseURL  string
 	enabled       bool
+	priority      int
 	client        *http.Client
+	customClient  bool
 }
 
 type providerConfig struct {
@@ -58,6 +65,7 @@ type providerConfig struct {
 	baseURL      string
 	imageBaseURL string
 	enabled      bool
+	priority     int
 	client       *http.Client
 }
 
@@ -74,6 +82,7 @@ func (p *Provider) snapshot() providerConfig {
 		baseURL:      p.baseURL,
 		imageBaseURL: p.imageBaseURL,
 		enabled:      p.enabled,
+		priority:     p.priority,
 		client:       p.client,
 	}
 }
@@ -88,6 +97,7 @@ func New(apiKey, language string) *Provider {
 		baseURL:      defaultBaseURL,
 		imageBaseURL: defaultImageBaseURL,
 		enabled:      true,
+		priority:     defaultPriority,
 		client:       netutil.NewSafeHTTPClient(10*time.Second, false),
 	}
 }
@@ -108,6 +118,7 @@ func (p *Provider) SetHTTPClient(c *http.Client) {
 	}
 	p.mu.Lock()
 	p.client = c
+	p.customClient = true
 	p.mu.Unlock()
 }
 
@@ -121,16 +132,40 @@ func (p *Provider) Manifest() plugins.Manifest {
 		Author:      "Ambra",
 		BuiltIn:     true,
 		Enabled:     snap.enabled,
-		Priority:    20,
+		Priority:    snap.priority,
 		Kinds:       []plugins.Kind{plugins.KindMetadata, plugins.KindImage},
 	}
 }
 
-func validateHTTPBaseURL(raw string) (string, error) {
+func (p *Provider) DefaultConfig() map[string]any {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := map[string]any{
+		"enabled":        p.enabled,
+		"priority":       p.priority,
+		"language":       p.language,
+		"base_url":       p.baseURL,
+		"image_base_url": p.imageBaseURL,
+	}
+	if p.apiKey != "" {
+		out["api_key"] = p.apiKey
+	}
+	return out
+}
+
+func validateHTTPBaseURL(raw, currentValidated string, allowTestLoopback bool) (string, error) {
 	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
 	u, err := url.Parse(trimmed)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return "", fmt.Errorf("invalid url %q: must use http or https scheme with host", raw)
+	}
+	if trimmed != currentValidated {
+		if err := netutil.ValidateRemoteURL(trimmed, allowTestLoopback); err != nil {
+			var dnsErr *net.DNSError
+			if !errors.As(err, &dnsErr) {
+				return "", fmt.Errorf("unsafe url %q: %w", raw, err)
+			}
+		}
 	}
 	return trimmed, nil
 }
@@ -155,6 +190,7 @@ func (p *Provider) Configure(cfg map[string]any) error {
 	nextBaseURL := p.baseURL
 	nextImageBaseURL := p.imageBaseURL
 	nextEnabled := p.enabled
+	nextPriority := p.priority
 
 	hasNewAPIKey := false
 	if v, ok := cfg["api_key"].(string); ok {
@@ -166,28 +202,49 @@ func (p *Provider) Configure(cfg map[string]any) error {
 	}
 	if v, ok := cfg["language"].(string); ok && v != "" {
 		nextLanguage = v
+	} else if v, ok := cfg["Language"].(string); ok && v != "" {
+		nextLanguage = v
 	}
-	if v, ok := cfg["base_url"].(string); ok && strings.TrimSpace(v) != "" {
-		valid, err := validateHTTPBaseURL(v)
-		if err != nil {
-			return fmt.Errorf("tmdb base_url: %w", err)
+	for _, k := range []string{"base_url", "BaseUrl", "BaseURL"} {
+		if v, ok := cfg[k].(string); ok && strings.TrimSpace(v) != "" {
+			valid, err := validateHTTPBaseURL(v, p.baseURL, p.customClient)
+			if err != nil {
+				return fmt.Errorf("tmdb base_url: %w", err)
+			}
+			if urlHostLower(valid) != urlHostLower(p.baseURL) && !hasNewAPIKey {
+				nextAPIKey = ""
+			}
+			nextBaseURL = valid
+			break
 		}
-		if urlHostLower(valid) != urlHostLower(p.baseURL) && !hasNewAPIKey {
-			nextAPIKey = ""
-		}
-		nextBaseURL = valid
 	}
-	if v, ok := cfg["image_base_url"].(string); ok && strings.TrimSpace(v) != "" {
-		valid, err := validateHTTPBaseURL(v)
-		if err != nil {
-			return fmt.Errorf("tmdb image_base_url: %w", err)
+	for _, k := range []string{"image_base_url", "ImageBaseUrl", "ImageBaseURL"} {
+		if v, ok := cfg[k].(string); ok && strings.TrimSpace(v) != "" {
+			valid, err := validateHTTPBaseURL(v, p.imageBaseURL, p.customClient)
+			if err != nil {
+				return fmt.Errorf("tmdb image_base_url: %w", err)
+			}
+			nextImageBaseURL = valid
+			break
 		}
-		nextImageBaseURL = valid
 	}
 	if v, ok := cfg["enabled"].(bool); ok {
 		nextEnabled = v
 	} else if v, ok := cfg["Enabled"].(bool); ok {
 		nextEnabled = v
+	}
+	for _, k := range []string{"priority", "Priority"} {
+		if raw, exists := cfg[k]; exists {
+			switch n := raw.(type) {
+			case int:
+				nextPriority = n
+			case int64:
+				nextPriority = int(n)
+			case float64:
+				nextPriority = int(n)
+			}
+			break
+		}
 	}
 
 	p.apiKey = nextAPIKey
@@ -195,6 +252,7 @@ func (p *Provider) Configure(cfg map[string]any) error {
 	p.baseURL = nextBaseURL
 	p.imageBaseURL = nextImageBaseURL
 	p.enabled = nextEnabled
+	p.priority = nextPriority
 	return nil
 }
 

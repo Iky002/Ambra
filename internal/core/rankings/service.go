@@ -18,14 +18,15 @@ import (
 )
 
 type chartIndex struct {
-	imdbIDs      map[string]struct{}
-	doubanIDs    map[string]struct{}
-	tmdbIDsAny   map[string]struct{}
-	tmdbIDsMovie map[string]struct{}
-	tmdbIDsTV    map[string]struct{}
-	titlesAny    map[string][]int // normalized title -> slice of years (0 if unknown)
-	titlesMovie  map[string][]int
-	titlesTV     map[string][]int
+	imdbIDs                       map[string]struct{}
+	doubanIDs                     map[string]struct{}
+	tmdbIDsAny                    map[string]struct{}
+	tmdbIDsMovie                  map[string]struct{}
+	tmdbIDsTV                     map[string]struct{}
+	titlesAny                     map[string][]int // normalized title -> slice of years (0 if unknown)
+	titlesMovie                   map[string][]int
+	titlesTV                      map[string][]int
+	requireRecentYearWhenDateless bool
 }
 
 func normalizeChartMediaType(mt string) string {
@@ -85,6 +86,12 @@ func buildChartIndex(entries []ChartEntry) *chartIndex {
 	return idx
 }
 
+func buildTrendingChartIndex(entries []ChartEntry) *chartIndex {
+	idx := buildChartIndex(entries)
+	idx.requireRecentYearWhenDateless = true
+	return idx
+}
+
 func (idx *chartIndex) match(mediaNS, name, originalTitle string, year int, imdbID, doubanID, tmdbID string) bool {
 	if idx == nil {
 		return false
@@ -104,10 +111,14 @@ func (idx *chartIndex) match(mediaNS, name, originalTitle string, year int, imdb
 			return true
 		}
 	}
-	if idx.matchTitle(mediaNS, NormalizeTitle(name), year) {
+	minYearWhenDateless := 0
+	if idx.requireRecentYearWhenDateless {
+		minYearWhenDateless = time.Now().Year() - 1
+	}
+	if idx.matchTitleWithMinYear(mediaNS, NormalizeTitle(name), year, minYearWhenDateless) {
 		return true
 	}
-	if idx.matchTitle(mediaNS, NormalizeTitle(originalTitle), year) {
+	if idx.matchTitleWithMinYear(mediaNS, NormalizeTitle(originalTitle), year, minYearWhenDateless) {
 		return true
 	}
 	return false
@@ -134,24 +145,32 @@ func (idx *chartIndex) matchTMDB(mediaNS, tmdbID string) bool {
 }
 
 func (idx *chartIndex) matchTitle(mediaNS, norm string, year int) bool {
+	return idx.matchTitleWithMinYear(mediaNS, norm, year, 0)
+}
+
+func (idx *chartIndex) matchTitleWithMinYear(mediaNS, norm string, year, minYearWhenDateless int) bool {
 	if norm == "" {
 		return false
 	}
-	if matchNormalizedTitle(idx.titlesAny, norm, year) {
+	if matchNormalizedTitleWithMinYear(idx.titlesAny, norm, year, minYearWhenDateless) {
 		return true
 	}
 	switch mediaNS {
 	case "movie":
-		return matchNormalizedTitle(idx.titlesMovie, norm, year)
+		return matchNormalizedTitleWithMinYear(idx.titlesMovie, norm, year, minYearWhenDateless)
 	case "tv":
-		return matchNormalizedTitle(idx.titlesTV, norm, year)
+		return matchNormalizedTitleWithMinYear(idx.titlesTV, norm, year, minYearWhenDateless)
 	default:
-		return matchNormalizedTitle(idx.titlesMovie, norm, year) ||
-			matchNormalizedTitle(idx.titlesTV, norm, year)
+		return matchNormalizedTitleWithMinYear(idx.titlesMovie, norm, year, minYearWhenDateless) ||
+			matchNormalizedTitleWithMinYear(idx.titlesTV, norm, year, minYearWhenDateless)
 	}
 }
 
 func matchNormalizedTitle(titles map[string][]int, norm string, year int) bool {
+	return matchNormalizedTitleWithMinYear(titles, norm, year, 0)
+}
+
+func matchNormalizedTitleWithMinYear(titles map[string][]int, norm string, year, minYearWhenDateless int) bool {
 	if norm == "" {
 		return false
 	}
@@ -160,7 +179,13 @@ func matchNormalizedTitle(titles map[string][]int, norm string, year int) bool {
 		return false
 	}
 	for _, ey := range years {
-		if year == 0 || ey == 0 {
+		if ey == 0 {
+			if minYearWhenDateless > 0 && year < minYearWhenDateless {
+				continue
+			}
+			return true
+		}
+		if year == 0 {
 			return true
 		}
 		diff := year - ey
@@ -266,11 +291,11 @@ func (s *Service) LoadCache(ctx context.Context) error {
 	}
 	if doubanMovieSnap != nil {
 		s.doubanTrendingMovie = doubanMovieSnap
-		s.doubanTrendingMovieIdx = buildChartIndex(doubanMovieSnap.Entries)
+		s.doubanTrendingMovieIdx = buildTrendingChartIndex(doubanMovieSnap.Entries)
 	}
 	if doubanTVSnap != nil {
 		s.doubanTrendingTV = doubanTVSnap
-		s.doubanTrendingTVIdx = buildChartIndex(doubanTVSnap.Entries)
+		s.doubanTrendingTVIdx = buildTrendingChartIndex(doubanTVSnap.Entries)
 	}
 	s.mu.Unlock()
 	return nil
@@ -470,11 +495,26 @@ func (s *Service) ApplyTagsToLibrary(ctx context.Context) (matchedItems int, tag
 	}
 
 	var plans []itemTagPlan
+	lockedItemIDs := make(map[string]struct{})
 	activeByDynamicTag := map[string]map[string]struct{}{
 		TagTMDBTrending:         {},
 		TagTMDBTrendingSpecific: {},
 		TagDoubanTrendingMovie:  {},
 		TagDoubanTrendingTV:     {},
+	}
+	isItemTagsLocked := func(extra *sqlite.ItemExtra) bool {
+		if extra == nil {
+			return false
+		}
+		if extra.LockData {
+			return true
+		}
+		for _, f := range extra.LockedFields {
+			if strings.EqualFold(strings.TrimSpace(f), "Tags") {
+				return true
+			}
+		}
+		return false
 	}
 	for rows.Next() {
 		var id, itemType, name, originalTitle, extraJSON string
@@ -486,6 +526,10 @@ func (s *Service) ApplyTagsToLibrary(ctx context.Context) (matchedItems int, tag
 		var extra sqlite.ItemExtra
 		if extraJSON != "" && extraJSON != "{}" {
 			_ = json.Unmarshal([]byte(extraJSON), &extra)
+		}
+		if isItemTagsLocked(&extra) {
+			lockedItemIDs[id] = struct{}{}
+			continue
 		}
 		tags := s.MatchTagsForTypedItem(itemType, name, originalTitle, year, extra.ProviderIDs)
 		if len(tags) > 0 {
@@ -558,6 +602,9 @@ func (s *Service) ApplyTagsToLibrary(ctx context.Context) (matchedItems int, tag
 			if err := curRows.Scan(&itemID); err != nil {
 				curRows.Close()
 				return 0, err
+			}
+			if _, locked := lockedItemIDs[itemID]; locked {
+				continue
 			}
 			if _, stillOnChart := activeSet[itemID]; !stillOnChart {
 				toRemove = append(toRemove, itemID)
@@ -736,7 +783,7 @@ func (s *Service) SyncAndApply(ctx context.Context) (SyncSummary, error) {
 			}
 			s.mu.Lock()
 			s.doubanTrendingMovie = snap
-			s.doubanTrendingMovieIdx = buildChartIndex(snap.Entries)
+			s.doubanTrendingMovieIdx = buildTrendingChartIndex(snap.Entries)
 			s.mu.Unlock()
 		}
 	}
@@ -757,7 +804,7 @@ func (s *Service) SyncAndApply(ctx context.Context) (SyncSummary, error) {
 			}
 			s.mu.Lock()
 			s.doubanTrendingTV = snap
-			s.doubanTrendingTVIdx = buildChartIndex(snap.Entries)
+			s.doubanTrendingTVIdx = buildTrendingChartIndex(snap.Entries)
 			s.mu.Unlock()
 		}
 	}

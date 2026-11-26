@@ -87,17 +87,8 @@ func (s *Scanner) lockPicDest(destPath string) func() {
 }
 
 func (s *Scanner) upsertLocalImagesPreservingExisting(ctx context.Context, itemID string, imgs []sqlite.ImageRecord) error {
-	if len(imgs) == 0 || s.repo == nil {
-		return nil
-	}
-	for i := range imgs {
-		img := imgs[i]
-		img.ItemID = itemID
-		if err := s.repo.UpsertImage(ctx, &img); err != nil {
-			return err
-		}
-	}
-	return nil
+	_, err := s.upsertLocalImagesWithOption(ctx, itemID, imgs, false)
+	return err
 }
 
 func preserveExistingItemOnRescan(existing, rec *sqlite.ItemRecord) {
@@ -105,10 +96,11 @@ func preserveExistingItemOnRescan(existing, rec *sqlite.ItemRecord) {
 		return
 	}
 	rec.Extra.LockData = existing.Extra.LockData
+	rec.Extra.PreventAutoMerge = existing.Extra.PreventAutoMerge || rec.Extra.PreventAutoMerge
 	if len(existing.Extra.LockedFields) > 0 {
 		rec.Extra.LockedFields = append([]string(nil), existing.Extra.LockedFields...)
 	}
-	if existing.DateCreated > 0 && rec.DateCreated == 0 {
+	if existing.DateCreated > 0 {
 		rec.DateCreated = existing.DateCreated
 	}
 	if len(rec.Extra.Chapters) == 0 && len(existing.Extra.Chapters) > 0 {
@@ -133,11 +125,22 @@ func preserveExistingItemOnRescan(existing, rec *sqlite.ItemRecord) {
 		if existing.Extra.SeasonName != "" {
 			rec.Extra.SeasonName = existing.Extra.SeasonName
 		}
+		rec.Extra.Album = existing.Extra.Album
+		if existing.Extra.AlbumID != "" {
+			rec.Extra.AlbumID = existing.Extra.AlbumID
+		}
+		rec.Extra.AlbumArtist = existing.Extra.AlbumArtist
+		rec.Extra.Artists = append([]string(nil), existing.Extra.Artists...)
+		if existing.Extra.ExtraType != "" {
+			rec.Extra.ExtraType = existing.Extra.ExtraType
+		}
 		return
 	}
 
 	if isFieldLocked(existing, "Name") {
 		rec.Name = existing.Name
+	}
+	if isFieldLocked(existing, "SortName") || (isFieldLocked(existing, "Name") && existing.SortName != "") {
 		rec.SortName = existing.SortName
 	}
 	if isFieldLocked(existing, "OriginalTitle") || (rec.OriginalTitle == "" && existing.OriginalTitle != "") {
@@ -163,6 +166,15 @@ func preserveExistingItemOnRescan(existing, rec *sqlite.ItemRecord) {
 	}
 	if isFieldLocked(existing, "OfficialRating") || (rec.OfficialRating == "" && existing.OfficialRating != "") {
 		rec.OfficialRating = existing.OfficialRating
+	}
+	if isFieldLocked(existing, "Album") || (rec.Extra.Album == "" && existing.Extra.Album != "") {
+		rec.Extra.Album = existing.Extra.Album
+	}
+	if isFieldLocked(existing, "AlbumArtist") || (rec.Extra.AlbumArtist == "" && existing.Extra.AlbumArtist != "") {
+		rec.Extra.AlbumArtist = existing.Extra.AlbumArtist
+	}
+	if isFieldLocked(existing, "Artists") || (len(rec.Extra.Artists) == 0 && len(existing.Extra.Artists) > 0) {
+		rec.Extra.Artists = append([]string(nil), existing.Extra.Artists...)
 	}
 	if len(existing.Extra.ProviderIDs) > 0 {
 		if rec.Extra.ProviderIDs == nil {
@@ -278,7 +290,7 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 
 	prober := s.getProber()
 	needProbe := !isStrm && prober.IsEnabled()
-	needOnline := s.hasOnlineMetadataProviders()
+	needOnline := s.hasLibraryOnlineMetadataProviders(lib, "Movie")
 
 	libRoot := findContainingRoot(lib.Paths, mediaPath)
 	if libRoot == "" {
@@ -387,10 +399,11 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 		ProviderIDs:   cloneStringMap(parsed.ProviderIDs),
 		Language:      s.language(),
 	}
-	meta := s.fetchMetadataFiltered(ctx, query, true)
+	meta := s.fetchLibraryMetadataFiltered(ctx, lib, query, true)
 
-	// Auto-merge into existing movie if this is a new file matching an existing item by TMDB/IMDB ID or same-dir title.
-	if existing == nil {
+	// Auto-merge into existing movie if this is a new file matching an existing item by TMDB/IMDB ID or same-dir title,
+	// unless any candidate has PreventAutoMerge set.
+	if existing == nil && (meta == nil || !meta.LockData) {
 		if batch != nil {
 			var checkProviderIDs map[string]string
 			if meta != nil && len(meta.ProviderIDs) > 0 {
@@ -402,20 +415,7 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 				return false, false, nil, flushErr
 			}
 		}
-		var mergeTarget *sqlite.ItemRecord
-		if meta != nil && len(meta.ProviderIDs) > 0 {
-			if tmdbID := getProviderID(meta.ProviderIDs, "Tmdb"); tmdbID != "" {
-				mergeTarget, _ = s.repo.FindItemByProviderID(ctx, lib.ID, "Movie", "Tmdb", tmdbID)
-			}
-			if mergeTarget == nil {
-				if imdbID := getProviderID(meta.ProviderIDs, "Imdb"); imdbID != "" {
-					mergeTarget, _ = s.repo.FindItemByProviderID(ctx, lib.ID, "Movie", "Imdb", imdbID)
-				}
-			}
-		}
-		if mergeTarget == nil {
-			mergeTarget, _ = s.repo.FindMovieInDirByBaseTitle(ctx, lib.ID, filepath.Dir(mediaPath), title)
-		}
+		mergeTarget := s.findAutoMergeMovieTarget(ctx, lib.ID, filepath.Dir(mediaPath), title, meta)
 		if mergeTarget != nil {
 			ms := s.buildMediaSourceInRoot(libRoot, mergeTarget, mediaPath, size, mtime, isStrm, container, nil)
 			if err := s.repo.UpsertMediaSourceAndStreams(ctx, mergeTarget.ID, ms); err != nil {
@@ -610,7 +610,7 @@ func (s *Scanner) indexEpisode(
 
 	prober := s.getProber()
 	needProbe := !isStrm && prober.IsEnabled()
-	needOnline := s.hasOnlineMetadataProviders()
+	needOnline := s.hasLibraryOnlineMetadataProviders(lib, "Episode")
 	libRoot := findContainingRoot(lib.Paths, mediaPath)
 	if libRoot == "" {
 		libRoot = filepath.Dir(mediaPath)
@@ -788,7 +788,7 @@ func (s *Scanner) indexEpisode(
 				return false, false, nil, flushErr
 			}
 		}
-		if mergeTarget, err := s.repo.FindEpisodeByNumber(ctx, seriesRec.ID, epInfo.SeasonNumber, epInfo.EpisodeNumber); err == nil && mergeTarget != nil {
+		if mergeTarget, err := s.repo.FindEpisodeByNumber(ctx, seriesRec.ID, epInfo.SeasonNumber, epInfo.EpisodeNumber); err == nil && mergeTarget != nil && !mergeTarget.Extra.PreventAutoMerge {
 			ms := s.buildMediaSourceInRoot(libRoot, mergeTarget, mediaPath, size, mtime, isStrm, container, nil)
 			if err := s.repo.UpsertMediaSourceAndStreams(ctx, mergeTarget.ID, ms); err != nil {
 				return false, false, nil, err
@@ -822,7 +822,7 @@ func (s *Scanner) indexEpisode(
 		ProviderIDs:   cloneStringMap(seriesRec.Extra.ProviderIDs),
 		Language:      s.language(),
 	}
-	meta := s.fetchMetadataFiltered(ctx, query, true)
+	meta := s.fetchLibraryMetadataFiltered(ctx, lib, query, true)
 
 	itemID := guid.New()
 	if existing != nil {
@@ -963,7 +963,7 @@ func (s *Scanner) ensureSeries(
 		cache[epInfo.SeriesDir] = existing
 		s.scanAndIndexExtras(ctx, lib, existing, epInfo.SeriesDir, "")
 		var backfillTask *enrichTask
-		if s.hasOnlineMetadataProviders() && s.isMissingPrimaryImage(ctx, existing.ID) {
+		if s.hasLibraryOnlineMetadataProviders(lib, "Series") && s.isMissingPrimaryImage(ctx, existing.ID) {
 			if _, dup := seenEnrich[existing.ID]; !dup {
 				seenEnrich[existing.ID] = struct{}{}
 				var year int
@@ -1018,7 +1018,7 @@ func (s *Scanner) ensureSeries(
 		ProviderIDs:   cloneStringMap(epInfo.SeriesProviderIDs),
 		Language:      s.language(),
 	}
-	meta := s.fetchMetadataFiltered(ctx, query, true)
+	meta := s.fetchLibraryMetadataFiltered(ctx, lib, query, true)
 
 	// Cross-directory auto-merge for Series sharing the same TMDB/IMDB ID.
 	mergeProviderIDs := cloneStringMap(epInfo.SeriesProviderIDs)
@@ -1040,7 +1040,7 @@ func (s *Scanner) ensureSeries(
 				matched, _ = s.repo.FindItemByProviderID(ctx, lib.ID, "Series", "Imdb", imdbID)
 			}
 		}
-		if matched != nil {
+		if matched != nil && !matched.Extra.PreventAutoMerge {
 			cache[epInfo.SeriesDir] = matched
 			return matched, nil, nil
 		}
@@ -1095,7 +1095,7 @@ func (s *Scanner) ensureSeries(
 	hasLocalTitle := meta != nil && strings.TrimSpace(meta.Name) != ""
 
 	var task *enrichTask
-	if s.hasOnlineMetadataProviders() {
+	if s.hasLibraryOnlineMetadataProviders(lib, "Series") {
 		if _, dup := seenEnrich[rec.ID]; !dup {
 			seenEnrich[rec.ID] = struct{}{}
 			if len(rec.Extra.ProviderIDs) > 0 {
@@ -1145,7 +1145,7 @@ func (s *Scanner) ensureSeason(
 			}
 		}
 		var task *enrichTask
-		if s.hasOnlineMetadataProviders() && s.isMissingPrimaryImage(ctx, existingByNum.ID) {
+		if s.hasLibraryOnlineMetadataProviders(lib, "Season") && s.isMissingPrimaryImage(ctx, existingByNum.ID) {
 			task = s.maybeBuildSeasonEnrichTask(lib.ID, series, existingByNum, epInfo.SeasonNumber, seenEnrich)
 		}
 		return existingByNum, task, nil
@@ -1164,7 +1164,7 @@ func (s *Scanner) ensureSeason(
 			}
 		}
 		var task *enrichTask
-		if s.hasOnlineMetadataProviders() && s.isMissingPrimaryImage(ctx, existing.ID) {
+		if s.hasLibraryOnlineMetadataProviders(lib, "Season") && s.isMissingPrimaryImage(ctx, existing.ID) {
 			task = s.maybeBuildSeasonEnrichTask(lib.ID, series, existing, epInfo.SeasonNumber, seenEnrich)
 		}
 		return existing, task, nil
@@ -1207,7 +1207,7 @@ func (s *Scanner) ensureSeason(
 	cache[key] = rec
 
 	var task *enrichTask
-	if s.hasOnlineMetadataProviders() {
+	if s.hasLibraryOnlineMetadataProviders(lib, "Season") {
 		task = s.maybeBuildSeasonEnrichTask(lib.ID, series, rec, epInfo.SeasonNumber, seenEnrich)
 	}
 	return rec, task, nil
@@ -1877,13 +1877,58 @@ func mergeMetadata(dst, src *plugins.MetadataResult) {
 	}
 }
 
+func (s *Scanner) findAutoMergeMovieTarget(ctx context.Context, libID, dir, title string, meta *plugins.MetadataResult) *sqlite.ItemRecord {
+	if s.repo == nil {
+		return nil
+	}
+	pickProviderTarget := func(key, val string) (*sqlite.ItemRecord, bool) {
+		matches, err := s.repo.FindItemsByProviderID(ctx, libID, "Movie", key, val)
+		if err != nil || len(matches) == 0 {
+			return nil, false
+		}
+		for _, m := range matches {
+			if m.Extra.PreventAutoMerge {
+				return nil, true
+			}
+		}
+		return matches[0], false
+	}
+
+	if meta != nil && len(meta.ProviderIDs) > 0 {
+		if tmdbID := getProviderID(meta.ProviderIDs, "Tmdb"); tmdbID != "" {
+			if target, blocked := pickProviderTarget("Tmdb", tmdbID); blocked {
+				return nil
+			} else if target != nil {
+				return target
+			}
+		}
+		if imdbID := getProviderID(meta.ProviderIDs, "Imdb"); imdbID != "" {
+			if target, blocked := pickProviderTarget("Imdb", imdbID); blocked {
+				return nil
+			} else if target != nil {
+				return target
+			}
+		}
+	}
+
+	if target, err := s.repo.FindMovieInDirByBaseTitle(ctx, libID, dir, title); err == nil && target != nil {
+		if target.Extra.PreventAutoMerge {
+			return nil
+		}
+		return target
+	}
+	return nil
+}
+
 func applyMetadataToItem(rec *sqlite.ItemRecord, meta *plugins.MetadataResult) {
-	if meta == nil {
+	if meta == nil || rec == nil || rec.Extra.LockData {
 		return
 	}
-	if meta.Name != "" {
+	if meta.Name != "" && !isExtraFieldLocked(&rec.Extra, "Name") {
 		rec.Name = meta.Name
-		rec.SortName = strings.ToLower(meta.Name)
+		if !isExtraFieldLocked(&rec.Extra, "SortName") {
+			rec.SortName = strings.ToLower(meta.Name)
+		}
 	}
 	if meta.OriginalTitle != "" {
 		rec.OriginalTitle = meta.OriginalTitle

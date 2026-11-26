@@ -379,6 +379,7 @@ func (s *Scanner) scanLibrary(ctx context.Context, libraryID string, asyncPhaseB
 	s.cancels[libraryID] = cancel
 	s.mu.Unlock()
 
+	unlockLib := s.lockLibraryPathOp(libraryID)
 	releaseScan := func() {
 		cancel()
 		s.mu.Lock()
@@ -386,6 +387,7 @@ func (s *Scanner) scanLibrary(ctx context.Context, libraryID string, asyncPhaseB
 		delete(s.cancels, libraryID)
 		delete(s.progress, libraryID)
 		s.mu.Unlock()
+		unlockLib()
 	}
 
 	lib, err := s.repo.GetLibrary(scanCtx, libraryID)
@@ -435,6 +437,7 @@ func (s *Scanner) scanLibrary(ctx context.Context, libraryID string, asyncPhaseB
 				delete(s.cancels, libraryID)
 				delete(s.progress, libraryID)
 				s.mu.Unlock()
+				unlockLib()
 			}()
 			bgStats.ItemsUpdated += s.runPhaseB(bgCtx, lib.ID, tasks)
 			s.notifyScanComplete(bgCtx, lib.ID, bgStats)
@@ -562,12 +565,43 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 	info, err := os.Stat(cleanTarget)
 	if err != nil {
 		if os.IsNotExist(err) {
-			deletedCount, delErr := s.repo.DeleteItemsByPathPrefix(ctx, lib.ID, cleanTarget)
+			// 1. Try single-path multi-version-safe removal first (promotes remaining version if primary was deleted).
+			deleted, delErr := s.repo.DeleteItemByPath(ctx, lib.ID, cleanTarget)
 			if delErr != nil {
 				return stats, delErr
 			}
-			if deletedCount > 0 {
-				stats.ItemsDeleted += int(deletedCount)
+			if deleted {
+				stats.ItemsDeleted++
+				s.publishLibraryChanged(ctx, lib.ID, stats, "cleanup")
+				return stats, nil
+			}
+
+			// 2. If deleted file was an external subtitle, refresh sibling video items' subtitle streams.
+			if changed, _ := s.handleCompanionFileChange(ctx, lib, cleanTarget, true); changed {
+				stats.ItemsUpdated++
+				s.publishLibraryChanged(ctx, lib.ID, stats, "cleanup")
+				return stats, nil
+			}
+
+			// 3. Directory deletion: detach/remove each media source under the directory prefix individually,
+			// then clean up any remaining empty directory container records.
+			if itemPaths, listErr := s.repo.ListLibraryItemPaths(ctx, lib.ID); listErr == nil {
+				prefix := cleanTarget + string(filepath.Separator)
+				for p := range itemPaths {
+					cp := filepath.Clean(p)
+					if cp == cleanTarget || strings.HasPrefix(cp, prefix) {
+						if ok, _ := s.repo.DeleteItemByPath(ctx, lib.ID, p); ok {
+							stats.ItemsDeleted++
+						}
+					}
+				}
+			}
+			deletedCount, prefixErr := s.repo.DeleteItemsByPathPrefix(ctx, lib.ID, cleanTarget)
+			if prefixErr != nil {
+				return stats, prefixErr
+			}
+			stats.ItemsDeleted += int(deletedCount)
+			if stats.ItemsDeleted > 0 {
 				s.publishLibraryChanged(ctx, lib.ID, stats, "cleanup")
 			}
 			return stats, nil
@@ -584,28 +618,34 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 
 	var tasks []enrichTask
 	if !info.IsDir() {
-		if !strings.HasPrefix(filepath.Base(cleanTarget), ".") && (IsVideoFile(cleanTarget) || IsStrmFile(cleanTarget) || IsAudioFile(cleanTarget)) {
-			if !strings.EqualFold(lib.CollectionType, "music") {
-				if _, isExtra := ClassifyExtraFile(root, cleanTarget); isExtra {
-					if err := s.waitIfPaused(ctx); err != nil {
-						return stats, err
+		if !strings.HasPrefix(filepath.Base(cleanTarget), ".") {
+			if IsVideoFile(cleanTarget) || IsStrmFile(cleanTarget) || IsAudioFile(cleanTarget) {
+				if !strings.EqualFold(lib.CollectionType, "music") {
+					if _, isExtra := ClassifyExtraFile(root, cleanTarget); isExtra {
+						if err := s.waitIfPaused(ctx); err != nil {
+							return stats, err
+						}
+						if s.reindexExtraParent(ctx, lib, root, cleanTarget) {
+							stats.ItemsUpdated++
+							s.publishLibraryChanged(ctx, lib.ID, stats, "discovery")
+							s.notifyScanComplete(ctx, lib.ID, stats)
+						}
+						return stats, nil
 					}
-					if s.reindexExtraParent(ctx, lib, root, cleanTarget) {
-						stats.ItemsUpdated++
-						s.publishLibraryChanged(ctx, lib.ID, stats, "discovery")
-						s.notifyScanComplete(ctx, lib.ID, stats)
-					}
-					return stats, nil
 				}
+				if err := s.waitIfPaused(ctx); err != nil {
+					return stats, err
+				}
+				itemTasks, procErr := s.processDiscoveredFileWithProgress(ctx, lib, root, cleanTarget, forceTV, seriesCache, seasonCache, artistCache, albumCache, seenSeriesEnrich, seenSeriesExtras, nil, &stats, false)
+				if procErr != nil {
+					return stats, procErr
+				}
+				tasks = append(tasks, itemTasks...)
+			} else if changed, compErr := s.handleCompanionFileChange(ctx, lib, cleanTarget, false); compErr != nil {
+				return stats, compErr
+			} else if changed {
+				stats.ItemsUpdated++
 			}
-			if err := s.waitIfPaused(ctx); err != nil {
-				return stats, err
-			}
-			itemTasks, procErr := s.processDiscoveredFileWithProgress(ctx, lib, root, cleanTarget, forceTV, seriesCache, seasonCache, artistCache, albumCache, seenSeriesEnrich, seenSeriesExtras, nil, &stats, false)
-			if procErr != nil {
-				return stats, procErr
-			}
-			tasks = append(tasks, itemTasks...)
 		}
 	} else {
 		dirTasks, _, err := s.runPhaseAWithRootAndDepth(ctx, lib, root, cleanTarget, hops, nil, &stats, false)
@@ -753,7 +793,7 @@ func (s *Scanner) runPhaseAWithRootAndDepth(ctx context.Context, lib *sqlite.Lib
 
 	var tasks []enrichTask
 	batch := newPhaseABatchWithProgress(s, lib.ID, stats, &tasks, trackProgress)
-	walkErr := WalkSafeWithStartDepth(walkRoot, startDepth, policy, func(path string, info os.FileInfo) error {
+	walkErr := WalkSafeWithinRoot(logicalRoot, walkRoot, startDepth, policy, func(path string, info os.FileInfo) error {
 		if err := s.waitIfPaused(ctx); err != nil {
 			return err
 		}
@@ -1048,6 +1088,9 @@ func (s *Scanner) enrichItemWithProgress(ctx context.Context, task enrichTask, t
 					if applyAudioProbeTags(rec, probeRes.Tags) {
 						recDirty = true
 					}
+					if s.applyAudioProbeRelations(ctx, rec, probeRes.Tags) {
+						updated = true
+					}
 				}
 				if recDirty {
 					if err := s.repo.UpsertItem(ctx, rec); err == nil {
@@ -1079,14 +1122,18 @@ func (s *Scanner) enrichItemWithProgress(ctx context.Context, task enrichTask, t
 		if (strings.EqualFold(task.ItemType, "Season") || strings.EqualFold(task.ItemType, "Episode")) && task.ParentSeriesID != "" {
 			s.applyParentSeriesQueryContext(ctx, task.ParentSeriesID, &task.Query)
 		}
-		onlineMeta := s.fetchMetadataFiltered(ctx, task.Query, false)
+		var lib *sqlite.LibraryRecord
+		if s.repo != nil && strings.TrimSpace(task.LibraryID) != "" {
+			lib, _ = s.repo.GetLibrary(ctx, task.LibraryID)
+		}
+		onlineMeta := s.fetchLibraryMetadataFiltered(ctx, lib, task.Query, false)
 		if onlineMeta != nil {
 			rec, err := s.repo.GetItemRecordByID(ctx, task.ItemID)
 			if err == nil && rec != nil && !rec.Extra.LockData {
 				applyOnlineMetadataToItem(rec, onlineMeta, task.HasLocalTitle)
 				if err := s.repo.UpsertItem(ctx, rec); err == nil {
 					mergedAway := false
-					if strings.EqualFold(rec.Type, "Movie") && !rec.Extra.LockData {
+					if strings.EqualFold(rec.Type, "Movie") && !rec.Extra.LockData && !rec.Extra.PreventAutoMerge {
 						mergedAway = s.tryAutoMergeMovieByProviderID(ctx, rec)
 					}
 					if !mergedAway {
@@ -1242,6 +1289,9 @@ func (s *Scanner) extractAudioAttachedPic(ctx context.Context, rec *sqlite.ItemR
 }
 
 func (s *Scanner) tryAutoMergeMovieByProviderID(ctx context.Context, rec *sqlite.ItemRecord) bool {
+	if rec == nil || rec.Extra.PreventAutoMerge || rec.Extra.LockData {
+		return false
+	}
 	tmdbID := getProviderID(rec.Extra.ProviderIDs, "Tmdb")
 	if tmdbID == "" {
 		return false
@@ -1252,6 +1302,11 @@ func (s *Scanner) tryAutoMergeMovieByProviderID(ctx context.Context, rec *sqlite
 	matches, err := s.repo.FindItemsByProviderID(ctx, rec.LibraryID, "Movie", "Tmdb", tmdbID)
 	if err != nil {
 		return false
+	}
+	for _, m := range matches {
+		if m.Extra.PreventAutoMerge {
+			return false
+		}
 	}
 	if len(matches) < 2 {
 		for _, m := range matches {
@@ -1266,8 +1321,7 @@ func (s *Scanner) tryAutoMergeMovieByProviderID(ctx context.Context, rec *sqlite
 	}
 
 	ids := make([]string, 0, len(matches))
-	ids = append(ids, matches[0].ID)
-	for _, m := range matches[1:] {
+	for _, m := range matches {
 		if m.Extra.LockData {
 			continue
 		}
@@ -1416,15 +1470,7 @@ func isFieldLocked(rec *sqlite.ItemRecord, field string) bool {
 	if rec == nil {
 		return false
 	}
-	if rec.Extra.LockData {
-		return true
-	}
-	for _, f := range rec.Extra.LockedFields {
-		if strings.EqualFold(strings.TrimSpace(f), field) {
-			return true
-		}
-	}
-	return false
+	return isExtraFieldLocked(&rec.Extra, field)
 }
 
 // applyOnlineMetadataToItem applies online metadata fields while respecting local NFO titles and locked fields.
@@ -1432,9 +1478,11 @@ func applyOnlineMetadataToItem(rec *sqlite.ItemRecord, meta *plugins.MetadataRes
 	if rec == nil || meta == nil || rec.Extra.LockData {
 		return
 	}
-	if meta.Name != "" && !hasLocalTitle && !isFieldLocked(rec, "Name") {
+	if meta.Name != "" && !hasLocalTitle && !isExtraFieldLocked(&rec.Extra, "Name") {
 		rec.Name = meta.Name
-		rec.SortName = strings.ToLower(meta.Name)
+		if !isExtraFieldLocked(&rec.Extra, "SortName") {
+			rec.SortName = strings.ToLower(meta.Name)
+		}
 	}
 	if meta.OriginalTitle != "" && rec.OriginalTitle == "" && !isFieldLocked(rec, "OriginalTitle") {
 		rec.OriginalTitle = meta.OriginalTitle
