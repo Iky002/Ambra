@@ -35,7 +35,7 @@ import {
 import type { LiveTvRecordingInfo, LiveTvSeriesTimerInfo } from '../api/types'
 import { QueryErrorState } from '../components/QueryErrorState'
 import { useAuth } from '../context/AuthContext'
-import { getCachedDemoServer } from '../demo/demoLoader'
+import { getCachedDemoServer, loadDemoServer } from '../demo/demoLoader'
 import { isDemoMode } from '../demo/demoMode'
 import { getActiveLocale, useI18n } from '../i18n/I18nContext'
 
@@ -510,9 +510,9 @@ export function LiveTvPage() {
         }
       }
       let cancelled = false
-      void import('../demo/demoMedia').then(({ DEMO_VIDEO_DATA_URL }) => {
+      void loadDemoServer().then((srv) => {
         if (cancelled) return
-        video.src = DEMO_VIDEO_DATA_URL
+        video.src = srv.getDemoVideoUrl()
         video.load()
       })
       return () => {

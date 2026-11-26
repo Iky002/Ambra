@@ -28,6 +28,13 @@ export async function loadDemoServer(): Promise<DemoServerBindings> {
   if (cachedDemoServer) {
     return cachedDemoServer
   }
+  if (
+    import.meta.env.VITE_DEMO_MODE !== 'true' &&
+    !import.meta.env.DEV &&
+    import.meta.env.MODE !== 'test'
+  ) {
+    return Promise.reject(new Error('Demo server is disabled in production builds'))
+  }
   if (!pendingDemoLoad) {
     pendingDemoLoad = import('./mockServer')
       .then((mod) => {
