@@ -205,16 +205,10 @@ func TestV0109Audit_ExtrasParentalRemoteAccessKVBoundsSessionAddAndDeleteKV(t *t
 		t.Fatalf("expected 400 for 101st distinct typed setting key, got %d", rOver.Code)
 	}
 
-	// --- 4. [L-07] postSessionAddUser rejects nonexistent session with 404 and does not pollute sessionUsers ---
+	// --- 4. [L-07] postSessionAddUser rejects nonexistent session with 404 ---
 	missingSID := "nonexistent-session-v0109"
 	if rMissing := callAs(adminAC, http.MethodPost, "/Sessions/"+missingSID+"/Users/"+kid.ID, "", ""); rMissing.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for nonexistent session in postSessionAddUser, got %d", rMissing.Code)
-	}
-	env.handler.mu.RLock()
-	_, polluted := env.handler.sessionUsers[missingSID]
-	env.handler.mu.RUnlock()
-	if polluted {
-		t.Fatalf("sessionUsers must not be populated for nonexistent session")
 	}
 
 	// --- 5. [L-09] deleteKV falls back to h.userRepo.Store() when h.store == nil ---

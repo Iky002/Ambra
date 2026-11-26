@@ -29,7 +29,9 @@ const (
 	StatusFailed    = "failed"
 
 	defaultBatchSize = 500
+	maxBatchSize     = 1000
 	defaultPageSize  = 200
+	maxReportEntries = 500
 	checkpointPrefix = "migration:checkpoint:"
 )
 
@@ -144,11 +146,14 @@ type Migrator struct {
 	clientFactory ClientFactory
 	pageSize      int
 
-	mu       sync.RWMutex
-	running  bool
-	cancelFn context.CancelFunc
-	status   MigrationReport
-	wg       sync.WaitGroup
+	mu             sync.RWMutex
+	running        bool
+	cancelFn       context.CancelFunc
+	status         MigrationReport
+	wg             sync.WaitGroup
+	onUserUpdated  func(userID string)
+	selfListenAddr string
+	selfServerID   string
 }
 
 // NewMigrator creates a new Migrator backed by the given SQLite store and UserRepo.
@@ -156,11 +161,23 @@ func NewMigrator(store *sqlite.Store, userRepo *sqlite.UserRepo, opts ...Migrato
 	if userRepo == nil && store != nil {
 		userRepo = sqlite.NewUserRepo(store)
 	}
-	m := &Migrator{
+	var m *Migrator
+	m = &Migrator{
 		store:    store,
 		userRepo: userRepo,
 		clientFactory: func(baseURL, apiKey string) (*SourceClient, error) {
-			return NewSourceClient(baseURL, apiKey)
+			m.mu.RLock()
+			addr := m.selfListenAddr
+			srvID := m.selfServerID
+			m.mu.RUnlock()
+			var cOpts []ClientOption
+			if addr != "" {
+				cOpts = append(cOpts, WithSelfListenAddr(addr))
+			}
+			if srvID != "" {
+				cOpts = append(cOpts, WithSelfServerID(srvID))
+			}
+			return NewSourceClient(baseURL, apiKey, cOpts...)
 		},
 		pageSize: defaultPageSize,
 		status: MigrationReport{
@@ -175,6 +192,29 @@ func NewMigrator(store *sqlite.Store, userRepo *sqlite.UserRepo, opts ...Migrato
 		}
 	}
 	return m
+}
+
+// SetOnUserUpdated installs an optional callback invoked whenever a local user's policy/config is created or updated
+// (e.g. authSvc.InvalidateUserCache).
+func (m *Migrator) SetOnUserUpdated(fn func(userID string)) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.onUserUpdated = fn
+	m.mu.Unlock()
+}
+
+// SetSelfServer configures the current Ambra HTTP listen address and ServerID to prevent self-migration loops.
+func (m *Migrator) SetSelfServer(httpAddr, serverID string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.selfListenAddr = strings.TrimSpace(httpAddr)
+	m.selfServerID = strings.TrimSpace(serverID)
+	m.mu.Unlock()
+	SetSelfServerIdentity(httpAddr, serverID)
 }
 
 // TestSource connects to the legacy Emby server and retrieves its server info, users, and libraries.
@@ -305,6 +345,8 @@ func (m *Migrator) execute(ctx context.Context, client *SourceClient, req Migrat
 	batchSize := req.BatchSize
 	if batchSize <= 0 {
 		batchSize = defaultBatchSize
+	} else if batchSize > maxBatchSize {
+		batchSize = maxBatchSize
 	}
 
 	report := m.Status()
@@ -314,7 +356,7 @@ func (m *Migrator) execute(ctx context.Context, client *SourceClient, req Migrat
 		report.CompletedAt = &now
 		report.CurrentUser = ""
 		if runErr != nil && status == StatusFailed {
-			report.Errors = append(report.Errors, runErr.Error())
+			report.Errors = appendBoundedString(report.Errors, runErr.Error())
 		}
 		m.setStatus(report)
 		out := cloneReport(report)
@@ -328,6 +370,12 @@ func (m *Migrator) execute(ctx context.Context, client *SourceClient, req Migrat
 		}
 		return finish(StatusFailed, fmt.Errorf("connect source server: %w", err))
 	}
+	m.mu.RLock()
+	selfSrvID := m.selfServerID
+	m.mu.RUnlock()
+	if selfSrvID != "" && serverInfo.ID != "" && guid.Normalize(serverInfo.ID) == guid.Normalize(selfSrvID) {
+		return finish(StatusFailed, ErrSelfSourceServer)
+	}
 	report.SourceServerName = serverInfo.ServerName
 	m.setStatus(report)
 
@@ -338,6 +386,9 @@ func (m *Migrator) execute(ctx context.Context, client *SourceClient, req Migrat
 		}
 		return finish(StatusFailed, fmt.Errorf("list source users: %w", err))
 	}
+
+	sourceFolders, _ := client.ListVirtualFolders(ctx)
+	folderMap := m.buildLibraryFolderMapper(ctx, sourceFolders)
 
 	selectedUsers := filterSourceUsers(sourceUsers, req.UserIDs)
 	report.TotalUsers = len(selectedUsers)
@@ -382,15 +433,23 @@ func (m *Migrator) execute(ctx context.Context, client *SourceClient, req Migrat
 		report.CurrentUser = srcUser.Name
 		m.setStatus(report)
 
+		if !srcUser.Policy.EnableAllFolders && folderMap != nil {
+			mappedFolders, unmapped := folderMap.mapEnabledFolders(srcUser.Policy.EnabledFolders)
+			srcUser.Policy.EnabledFolders = mappedFolders
+			if unmapped > 0 {
+				report.Notices = appendBoundedString(report.Notices, fmt.Sprintf("user %q had %d source library folder(s) without a matching local library", srcUser.Name, unmapped))
+			}
+		}
+
 		targetUserID, matched, created, conflict, notice, err := m.resolveOrCreateUser(ctx, srcUser, req.MigrateUsers, req.DryRun)
 		if err != nil {
-			report.Errors = append(report.Errors, fmt.Sprintf("user %s: %v", srcUser.Name, err))
+			report.Errors = appendBoundedString(report.Errors, fmt.Sprintf("user %s: %v", srcUser.Name, err))
 			report.ProcessedUsers++
 			m.setStatus(report)
 			continue
 		}
 		if notice != "" {
-			report.Notices = append(report.Notices, notice)
+			report.Notices = appendBoundedString(report.Notices, notice)
 		}
 		if matched {
 			report.UsersMatched++
@@ -399,7 +458,7 @@ func (m *Migrator) execute(ctx context.Context, client *SourceClient, req Migrat
 			report.UsersCreated++
 		}
 		if conflict != nil {
-			report.Conflicts = append(report.Conflicts, *conflict)
+			report.Conflicts = appendBoundedConflict(report.Conflicts, *conflict)
 			report.ProcessedUsers++
 			if !req.DryRun {
 				cp.CompletedUserIDs = appendUnique(cp.CompletedUserIDs, srcUser.ID)
@@ -409,6 +468,14 @@ func (m *Migrator) execute(ctx context.Context, client *SourceClient, req Migrat
 			}
 			m.setStatus(report)
 			continue
+		}
+		if !req.DryRun && req.MigrateUsers && targetUserID != "" {
+			m.mu.RLock()
+			onUpdated := m.onUserUpdated
+			m.mu.RUnlock()
+			if onUpdated != nil {
+				onUpdated(targetUserID)
+			}
 		}
 
 		if needItemData {
@@ -470,7 +537,7 @@ func (m *Migrator) execute(ctx context.Context, client *SourceClient, req Migrat
 					localID, conflictReason := idx.match(item)
 					if conflictReason != "" {
 						report.ItemsSkipped++
-						report.Conflicts = append(report.Conflicts, ConflictEntry{
+						report.Conflicts = appendBoundedConflict(report.Conflicts, ConflictEntry{
 							UserName:     srcUser.Name,
 							SourceItemID: item.ID,
 							ItemName:     item.Name,
@@ -1028,6 +1095,150 @@ func normalizeTitle(s string) string {
 
 func episodeKey(normSeries string, season, episode int) string {
 	return normSeries + "|s" + strconv.Itoa(season) + "|e" + strconv.Itoa(episode)
+}
+
+type libraryFolderMapper struct {
+	localIDs    map[string]string
+	bySourceKey map[string][]string
+}
+
+func normalizeFolderLocation(p string) string {
+	s := strings.TrimSpace(strings.ReplaceAll(p, "\\", "/"))
+	s = strings.TrimRight(s, "/")
+	return strings.ToLower(s)
+}
+
+func (m *Migrator) buildLibraryFolderMapper(ctx context.Context, srcFolders []SourceVirtualFolder) *libraryFolderMapper {
+	if m.store == nil || m.store.Reader == nil {
+		return nil
+	}
+	rows, err := m.store.Reader.QueryContext(ctx, `SELECT id, name, COALESCE(paths_json, '[]') FROM libraries`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	type localLib struct {
+		id    string
+		name  string
+		paths []string
+	}
+	var locals []localLib
+	localIDs := make(map[string]string)
+	byPath := make(map[string][]string)
+	byName := make(map[string][]string)
+
+	for rows.Next() {
+		var l localLib
+		var pathsJSON string
+		if scanErr := rows.Scan(&l.id, &l.name, &pathsJSON); scanErr != nil {
+			continue
+		}
+		_ = json.Unmarshal([]byte(pathsJSON), &l.paths)
+		normID := guid.Normalize(l.id)
+		localIDs[normID] = l.id
+		localIDs[strings.ToLower(strings.TrimSpace(l.id))] = l.id
+		if n := strings.ToLower(strings.TrimSpace(l.name)); n != "" {
+			byName[n] = appendUnique(byName[n], l.id)
+		}
+		for _, p := range l.paths {
+			if np := normalizeFolderLocation(p); np != "" {
+				byPath[np] = appendUnique(byPath[np], l.id)
+			}
+		}
+		locals = append(locals, l)
+	}
+	_ = locals
+
+	bySourceKey := make(map[string][]string)
+	for _, sf := range srcFolders {
+		var matched []string
+		for _, loc := range sf.Locations {
+			if np := normalizeFolderLocation(loc); np != "" {
+				for _, lid := range byPath[np] {
+					matched = appendUnique(matched, lid)
+				}
+			}
+		}
+		if len(matched) == 0 {
+			if n := strings.ToLower(strings.TrimSpace(sf.Name)); n != "" {
+				for _, lid := range byName[n] {
+					matched = appendUnique(matched, lid)
+				}
+			}
+		}
+		if len(matched) > 0 {
+			if k := guid.Normalize(sf.ItemID); k != "" {
+				bySourceKey[k] = append(bySourceKey[k], matched...)
+			}
+			if k := strings.ToLower(strings.TrimSpace(sf.ItemID)); k != "" {
+				bySourceKey[k] = append(bySourceKey[k], matched...)
+			}
+			if k := strings.ToLower(strings.TrimSpace(sf.Name)); k != "" {
+				bySourceKey[k] = append(bySourceKey[k], matched...)
+			}
+		}
+	}
+
+	return &libraryFolderMapper{
+		localIDs:    localIDs,
+		bySourceKey: bySourceKey,
+	}
+}
+
+func (fm *libraryFolderMapper) mapEnabledFolders(srcIDs []string) ([]string, int) {
+	if fm == nil || len(srcIDs) == 0 {
+		return []string{}, 0
+	}
+	var out []string
+	unmapped := 0
+	for _, raw := range srcIDs {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+		norm := guid.Normalize(trimmed)
+		lower := strings.ToLower(trimmed)
+		if lids := fm.bySourceKey[norm]; len(lids) > 0 {
+			for _, id := range lids {
+				out = appendUnique(out, id)
+			}
+			continue
+		}
+		if lids := fm.bySourceKey[lower]; len(lids) > 0 {
+			for _, id := range lids {
+				out = appendUnique(out, id)
+			}
+			continue
+		}
+		if direct, ok := fm.localIDs[norm]; ok {
+			out = appendUnique(out, direct)
+			continue
+		}
+		if direct, ok := fm.localIDs[lower]; ok {
+			out = appendUnique(out, direct)
+			continue
+		}
+		unmapped++
+	}
+	if out == nil {
+		out = []string{}
+	}
+	return out, unmapped
+}
+
+func appendBoundedConflict(slice []ConflictEntry, entry ConflictEntry) []ConflictEntry {
+	if len(slice) >= maxReportEntries {
+		return slice
+	}
+	return append(slice, entry)
+}
+
+func appendBoundedString(slice []string, val string) []string {
+	if len(slice) >= maxReportEntries {
+		return slice
+	}
+	return append(slice, val)
 }
 
 func appendUnique(slice []string, val string) []string {

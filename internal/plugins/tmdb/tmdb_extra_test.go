@@ -20,16 +20,20 @@ func TestTMDBManifestConfigureAndDefaults(t *testing.T) {
 	if m.ID != "ambra.builtin.tmdb" || !m.Enabled || !m.BuiltIn {
 		t.Fatalf("unexpected manifest: %+v", m)
 	}
+	// Loopback base_url must be rejected by SSRF validation when no test HTTP client is injected
+	if err := p.Configure(map[string]any{"base_url": "http://localhost:9999/"}); err == nil {
+		t.Fatal("expected localhost base_url to be rejected by SSRF validation")
+	}
 	if err := p.Configure(map[string]any{
 		"api_key":        " key2 ",
 		"language":       "en-US",
-		"base_url":       "http://localhost:9999/",
-		"image_base_url": "http://img.local/",
+		"base_url":       "https://93.184.216.34/",
+		"image_base_url": "http://1.1.1.1/",
 		"enabled":        false,
 	}); err != nil {
 		t.Fatalf("Configure failed: %v", err)
 	}
-	if p.apiKey != "key2" || p.language != "en-US" || p.baseURL != "http://localhost:9999" || p.imageBaseURL != "http://img.local" || p.Manifest().Enabled {
+	if p.apiKey != "key2" || p.language != "en-US" || p.baseURL != "https://93.184.216.34" || p.imageBaseURL != "http://1.1.1.1" || p.Manifest().Enabled {
 		t.Fatalf("Configure did not apply all fields")
 	}
 }

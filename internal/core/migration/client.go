@@ -6,15 +6,43 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ambra-media/ambra/internal/api/dto"
+	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
 )
+
+// ErrSelfSourceServer is returned when a migration source URL points to the running Ambra server itself.
+var ErrSelfSourceServer = errors.New("source server URL cannot point to this Ambra instance")
+
+var (
+	selfIdentityMu sync.RWMutex
+	selfListenAddr string
+	selfServerID   string
+)
+
+// SetSelfServerIdentity records the running Ambra instance's HTTP listen address and ServerID
+// so NewSourceClient and TestConnection reject self-referential migration loops.
+func SetSelfServerIdentity(httpAddr, serverID string) {
+	selfIdentityMu.Lock()
+	selfListenAddr = strings.TrimSpace(httpAddr)
+	selfServerID = strings.TrimSpace(serverID)
+	selfIdentityMu.Unlock()
+}
+
+func getSelfServerIdentity() (string, string) {
+	selfIdentityMu.RLock()
+	defer selfIdentityMu.RUnlock()
+	return selfListenAddr, selfServerID
+}
 
 const (
 	defaultHTTPTimeout = 20 * time.Second
@@ -143,15 +171,109 @@ func WithSleepFunc(fn func(ctx context.Context, d time.Duration) error) ClientOp
 	}
 }
 
+// WithSelfListenAddr sets the current Ambra HTTP listen address to block self-connections.
+func WithSelfListenAddr(httpAddr string) ClientOption {
+	return func(sc *SourceClient) {
+		sc.selfListenAddr = strings.TrimSpace(httpAddr)
+	}
+}
+
+// WithSelfServerID sets the current Ambra ServerID to block self-connections during TestConnection.
+func WithSelfServerID(serverID string) ClientOption {
+	return func(sc *SourceClient) {
+		sc.selfServerID = strings.TrimSpace(serverID)
+	}
+}
+
 // SourceClient communicates with a legacy Emby server over HTTP with automatic
 // exponential backoff retry on rate-limit / transient availability responses (429/503).
 type SourceClient struct {
-	baseURL     string
-	apiKey      string
-	httpClient  *http.Client
-	maxRetries  int
-	baseBackoff time.Duration
-	sleepFn     func(ctx context.Context, d time.Duration) error
+	baseURL        string
+	apiKey         string
+	httpClient     *http.Client
+	maxRetries     int
+	baseBackoff    time.Duration
+	sleepFn        func(ctx context.Context, d time.Duration) error
+	selfListenAddr string
+	selfServerID   string
+}
+
+func isSelfListenTarget(parsed *url.URL, listenAddr string) bool {
+	listenAddr = strings.TrimSpace(listenAddr)
+	if parsed == nil || listenAddr == "" {
+		return false
+	}
+	listenHost, listenPortStr, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return false
+	}
+	listenPort, err := strconv.Atoi(listenPortStr)
+	if err != nil || listenPort <= 0 {
+		return false
+	}
+
+	targetPort := 80
+	if strings.EqualFold(parsed.Scheme, "https") {
+		targetPort = 443
+	}
+	if p := parsed.Port(); p != "" {
+		tp, pErr := strconv.Atoi(p)
+		if pErr != nil || tp <= 0 {
+			return false
+		}
+		targetPort = tp
+	}
+	if targetPort != listenPort {
+		return false
+	}
+
+	targetHost := strings.Trim(strings.ToLower(strings.TrimSpace(parsed.Hostname())), "[]")
+	listenHost = strings.Trim(strings.ToLower(strings.TrimSpace(listenHost)), "[]")
+
+	isWildcardListen := listenHost == "" || listenHost == "0.0.0.0" || listenHost == "::"
+	if targetHost == "localhost" || targetHost == "0.0.0.0" || targetHost == "::" {
+		if isWildcardListen || listenHost == "localhost" || listenHost == "127.0.0.1" || listenHost == "::1" {
+			return true
+		}
+	}
+	if targetHost == listenHost && listenHost != "" {
+		return true
+	}
+	if targetIP, ipErr := netip.ParseAddr(targetHost); ipErr == nil {
+		targetIP = targetIP.WithZone("").Unmap()
+		if listenIP, lErr := netip.ParseAddr(listenHost); lErr == nil {
+			listenIP = listenIP.WithZone("").Unmap()
+			if targetIP == listenIP || (targetIP.IsLoopback() && listenIP.IsLoopback()) {
+				return true
+			}
+		}
+		if isWildcardListen {
+			if targetIP.IsLoopback() || targetIP.IsUnspecified() {
+				return true
+			}
+			if ifaces, iErr := net.Interfaces(); iErr == nil {
+				for _, iface := range ifaces {
+					addrs, aErr := iface.Addrs()
+					if aErr != nil {
+						continue
+					}
+					for _, raw := range addrs {
+						var ip net.IP
+						switch v := raw.(type) {
+						case *net.IPNet:
+							ip = v.IP
+						case *net.IPAddr:
+							ip = v.IP
+						}
+						if addr, ok := netip.AddrFromSlice(ip); ok && addr.WithZone("").Unmap() == targetIP {
+							return true
+						}
+					}
+				}
+			}
+		}
+	}
+	return false
 }
 
 // NewSourceClient validates the source Emby URL and API key and constructs a SourceClient.
@@ -170,18 +292,24 @@ func NewSourceClient(baseURL, apiKey string, opts ...ClientOption) (*SourceClien
 	}
 	normalized := strings.TrimRight(parsed.String(), "/")
 
+	defAddr, defSrvID := getSelfServerIdentity()
 	sc := &SourceClient{
-		baseURL:     normalized,
-		apiKey:      apiKey,
-		httpClient:  netutil.NewSafeHTTPClient(defaultHTTPTimeout, true),
-		maxRetries:  defaultMaxRetries,
-		baseBackoff: defaultBaseBackoff,
-		sleepFn:     defaultSleep,
+		baseURL:        normalized,
+		apiKey:         apiKey,
+		httpClient:     netutil.NewSafeHTTPClient(defaultHTTPTimeout, true),
+		maxRetries:     defaultMaxRetries,
+		baseBackoff:    defaultBaseBackoff,
+		sleepFn:        defaultSleep,
+		selfListenAddr: defAddr,
+		selfServerID:   defSrvID,
 	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(sc)
 		}
+	}
+	if isSelfListenTarget(parsed, sc.selfListenAddr) {
+		return nil, ErrSelfSourceServer
 	}
 	return sc, nil
 }
@@ -207,6 +335,9 @@ func (c *SourceClient) TestConnection(ctx context.Context) (*SourceServerInfo, e
 	var info SourceServerInfo
 	if err := c.doJSON(ctx, "/System/Info", nil, &info); err != nil {
 		return nil, err
+	}
+	if c.selfServerID != "" && info.ID != "" && guid.Normalize(info.ID) == guid.Normalize(c.selfServerID) {
+		return nil, ErrSelfSourceServer
 	}
 	info.Status = "ok"
 	return &info, nil

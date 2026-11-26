@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -112,6 +113,62 @@ func clampImageDim(v int) int {
 	return v
 }
 
+type privateImageResponseWriter struct {
+	http.ResponseWriter
+}
+
+func (pw *privateImageResponseWriter) WriteHeader(code int) {
+	if code == http.StatusOK || code == http.StatusNotModified {
+		pw.Header().Set("Cache-Control", "private, max-age=86400")
+	}
+	pw.ResponseWriter.WriteHeader(code)
+}
+
+func (pw *privateImageResponseWriter) Write(b []byte) (int, error) {
+	cc := strings.ToLower(strings.TrimSpace(pw.Header().Get("Cache-Control")))
+	if cc == "" || strings.HasPrefix(cc, "public") {
+		pw.Header().Set("Cache-Control", "private, max-age=86400")
+	}
+	return pw.ResponseWriter.Write(b)
+}
+
+func computeSyntheticLibraryCoverTag(libraryID, childTag string) string {
+	normLib := guid.Normalize(libraryID)
+	childTag = strings.TrimSpace(childTag)
+	if normLib == "" || childTag == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("ambra-libcover:" + normLib + ":" + childTag))
+	return hex.EncodeToString(sum[:8])
+}
+
+func computeChapterImageTag(itemID string, idx int, startTicks int64) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("chapter:%s:%d:%d", guid.Normalize(itemID), idx, startTicks)))
+	return hex.EncodeToString(sum[:8])
+}
+
+func constantTimeTagEqual(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == "" || b == "" || len(a) != len(b) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func extractAnonymousTagParam(r *http.Request) string {
+	if qTag := strings.TrimSpace(httpx.ParseQuery(r).Get("tag")); qTag != "" {
+		return qTag
+	}
+	pTag := strings.TrimSpace(chi.URLParam(r, "Tag"))
+	switch strings.ToLower(pTag) {
+	case "", "0", "-", "null", "none", "undefined":
+		return ""
+	default:
+		return pTag
+	}
+}
+
 func (h *Handler) handleServeItemImageFull(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	imageType := chi.URLParam(r, "Type")
@@ -133,7 +190,51 @@ func (h *Handler) handleServeItemImageFull(w http.ResponseWriter, r *http.Reques
 		httpx.Error(w, http.StatusNotFound, "image service unavailable")
 		return
 	}
-	if err := h.imaging.ServeHTTPWithOptions(w, r, itemID, imageType, idx, opts); err != nil {
+
+	if h.isAuthenticated(r) {
+		if h.repo != nil {
+			itemRec, itemErr := h.repo.GetItemRecordByID(r.Context(), itemID)
+			if itemErr != nil && !errors.Is(itemErr, sqlite.ErrNotFound) {
+				slog.Error("failed to verify item access for image", "item_id", itemID, "error", itemErr)
+				httpx.Error(w, http.StatusInternalServerError, "failed to serve item image")
+				return
+			}
+			if itemRec != nil && !h.canAccessItem(r, itemRec) {
+				httpx.Error(w, http.StatusForbidden, "access denied")
+				return
+			}
+		}
+	} else if h.repo != nil {
+		reqTag := extractAnonymousTagParam(r)
+		if reqTag == "" {
+			httpx.Error(w, http.StatusNotFound, "image not found")
+			return
+		}
+		imgRec, imgErr := h.repo.GetImageByItemAndType(r.Context(), itemID, imageType, idx)
+		if imgErr != nil && !errors.Is(imgErr, sqlite.ErrNotFound) {
+			slog.Error("failed to query image record", "item_id", itemID, "image_type", imageType, "error", imgErr)
+			httpx.Error(w, http.StatusInternalServerError, "failed to serve item image")
+			return
+		}
+		if errors.Is(imgErr, sqlite.ErrNotFound) || imgRec == nil {
+			httpx.Error(w, http.StatusNotFound, "image not found")
+			return
+		}
+		tagMatched := constantTimeTagEqual(reqTag, imgRec.Tag)
+		if !tagMatched && strings.EqualFold(imageType, "Chapter") {
+			if itemRec, rErr := h.repo.GetItemRecordByID(r.Context(), itemID); rErr == nil && itemRec != nil && idx < len(itemRec.Extra.Chapters) {
+				expectedChTag := computeChapterImageTag(itemRec.ID, idx, itemRec.Extra.Chapters[idx].StartPositionTicks)
+				tagMatched = constantTimeTagEqual(reqTag, expectedChTag)
+			}
+		}
+		if !tagMatched {
+			httpx.Error(w, http.StatusNotFound, "image not found")
+			return
+		}
+	}
+
+	pw := &privateImageResponseWriter{ResponseWriter: w}
+	if err := h.imaging.ServeHTTPWithOptions(pw, r, itemID, imageType, idx, opts); err != nil {
 		if errors.Is(err, sqlite.ErrNotFound) || os.IsNotExist(err) {
 			// Chapter thumbnails are generated exclusively by the scheduled task; never extract on page load.
 			httpx.Error(w, http.StatusNotFound, "image not found")
@@ -968,6 +1069,41 @@ func (h *Handler) handleEntityImage(kind string) http.HandlerFunc {
 			return
 		}
 		q := httpx.ParseQuery(r)
+		if h.isAuthenticated(r) {
+			if h.isNonAdminCaller(r) {
+				allowed := h.allowedLibrariesForRequest(r, "")
+				maxRating, blockedTags := h.userParentalPolicyForRequest(r, "")
+				switch kind {
+				case "person":
+					if !h.isPersonAccessible(r, entityID, allowed, maxRating, blockedTags) {
+						httpx.Error(w, http.StatusNotFound, "image not found")
+						return
+					}
+				case "artist":
+					if !h.canAccessItemID(r, entityID) && !h.isTaxonomyAccessible(r, entityID, allowed, maxRating, blockedTags) {
+						httpx.Error(w, http.StatusNotFound, "image not found")
+						return
+					}
+				default:
+					if !h.isTaxonomyAccessible(r, entityID, allowed, maxRating, blockedTags) {
+						httpx.Error(w, http.StatusNotFound, "image not found")
+						return
+					}
+				}
+			}
+		} else if h.repo != nil {
+			reqTag := strings.TrimSpace(q.Get("tag"))
+			if reqTag == "" {
+				httpx.Error(w, http.StatusNotFound, "image not found")
+				return
+			}
+			imgRec, imgErr := h.repo.GetImageByItemAndType(r.Context(), entityID, imageType, idx)
+			if imgErr != nil || imgRec == nil || !constantTimeTagEqual(reqTag, imgRec.Tag) {
+				httpx.Error(w, http.StatusNotFound, "image not found")
+				return
+			}
+		}
+
 		opts := imaging.Options{
 			MaxWidth:   clampImageDim(q.Int("maxWidth", 0)),
 			MaxHeight:  clampImageDim(q.Int("maxHeight", 0)),
@@ -978,7 +1114,8 @@ func (h *Handler) handleEntityImage(kind string) http.HandlerFunc {
 			Quality:    q.Int("quality", 0),
 			Format:     q.Get("format"),
 		}
-		if err := h.imaging.ServeHTTPWithOptions(w, r, entityID, imageType, idx, opts); err != nil {
+		pw := &privateImageResponseWriter{ResponseWriter: w}
+		if err := h.imaging.ServeHTTPWithOptions(pw, r, entityID, imageType, idx, opts); err != nil {
 			if errors.Is(err, sqlite.ErrNotFound) || os.IsNotExist(err) {
 				httpx.Error(w, http.StatusNotFound, "image not found")
 				return

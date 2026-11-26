@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -17,6 +18,8 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/core/transcode"
+	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
 // Mirror structures for reading/updating shared livetv:state stored in server_config.
@@ -576,9 +579,190 @@ func (h *Handler) handleLiveRecordingHLS(headOnly bool) http.HandlerFunc {
 			http.ServeFile(w, r, resolved)
 			return
 		}
+
+		h.mu.RLock()
+		tcMgr := h.transcodeMgr
+		libRepo := h.libRepo
+		h.mu.RUnlock()
+
+		if tcMgr != nil {
+			h.serveLiveRecordingDynamicHLS(w, r, tcMgr, libRepo, rec, resolved, headOnly)
+			return
+		}
+
 		target := appendRawQuery("/LiveTv/LiveRecordings/"+url.PathEscape(rec.Id)+"/stream", r.URL.RawQuery)
 		http.Redirect(w, r, target, http.StatusFound)
 	}
+}
+
+func (h *Handler) serveLiveRecordingDynamicHLS(
+	w http.ResponseWriter,
+	r *http.Request,
+	tcMgr *transcode.Manager,
+	libRepo *sqlite.LibraryRepo,
+	rec liveTVRecording,
+	resolvedPath string,
+	headOnly bool,
+) {
+	q := r.URL.Query()
+	segContainer := strings.ToLower(strings.TrimSpace(q.Get("SegmentContainer")))
+	if segContainer != "mp4" && segContainer != "m4s" {
+		segContainer = "ts"
+	}
+	vCodec := strings.ToLower(strings.TrimSpace(q.Get("VideoCodec")))
+	if vCodec == "" {
+		vCodec = "h264"
+	}
+	aCodec := strings.ToLower(strings.TrimSpace(q.Get("AudioCodec")))
+	if aCodec == "" {
+		aCodec = "aac"
+	}
+	videoBR, _ := strconv.Atoi(strings.TrimSpace(q.Get("VideoBitrate")))
+	if videoBR <= 0 {
+		videoBR = 4_000_000
+	}
+	audioBR, _ := strconv.Atoi(strings.TrimSpace(q.Get("AudioBitrate")))
+	if audioBR <= 0 {
+		audioBR = 192_000
+	}
+	maxW, _ := strconv.Atoi(strings.TrimSpace(q.Get("MaxWidth")))
+	maxH, _ := strconv.Atoi(strings.TrimSpace(q.Get("MaxHeight")))
+
+	durSec := 0.0
+	if libRepo != nil {
+		if itemRec, err := libRepo.GetItemRecordByID(r.Context(), rec.Id); err == nil && itemRec != nil && itemRec.RuntimeTicks != nil && *itemRec.RuntimeTicks > 0 {
+			durSec = float64(*itemRec.RuntimeTicks) / float64(transcode.TicksPerSecond)
+		}
+	}
+	if durSec <= 0 && !rec.StartDate.IsZero() && rec.EndDate.After(rec.StartDate) {
+		durSec = rec.EndDate.Sub(rec.StartDate).Seconds()
+	}
+	if durSec <= 0 {
+		durSec = 60
+	}
+
+	callerID, _ := h.callerIdentity(r)
+	playSessionID := strings.TrimSpace(q.Get("PlaySessionId"))
+	if playSessionID == "" {
+		playSessionID = "liverec-" + rec.Id
+	}
+	sessParams := transcode.SessionParams{
+		PlaySessionID:    playSessionID,
+		DeviceID:         strings.TrimSpace(q.Get("DeviceId")),
+		UserID:           callerID,
+		ItemID:           rec.Id,
+		MediaSourceID:    rec.Id,
+		InputPath:        resolvedPath,
+		VideoCodec:       vCodec,
+		AudioCodec:       aCodec,
+		VideoBitrate:     videoBR,
+		AudioBitrate:     audioBR,
+		MaxWidth:         maxW,
+		MaxHeight:        maxH,
+		SegmentDuration:  transcode.DefaultSegmentDuration,
+		SegmentContainer: segContainer,
+		DurationSec:      durSec,
+	}
+
+	preservedQuery := make(url.Values)
+	for k, vals := range q {
+		preservedQuery[k] = append([]string(nil), vals...)
+	}
+	plParams := transcode.PlaylistParams{
+		ItemID:           rec.Id,
+		PlaylistID:       "main",
+		DurationSec:      durSec,
+		SegmentDuration:  transcode.DefaultSegmentDuration,
+		SegmentContainer: segContainer,
+		Bandwidth:        videoBR + audioBR,
+		Width:            maxW,
+		Height:           maxH,
+		VideoCodec:       vCodec,
+		AudioCodec:       aCodec,
+		Query:            preservedQuery,
+	}
+
+	segParam := strings.TrimSpace(chi.URLParam(r, "Segment"))
+	lowerPath := strings.ToLower(r.URL.Path)
+
+	if segParam == "" && strings.HasSuffix(lowerPath, "/master.m3u8") {
+		_, _ = tcMgr.RegisterSession(sessParams)
+		master := transcode.BuildMasterPlaylist(plParams)
+		master = strings.Replace(master, "\nmain.m3u8", "\nlive.m3u8", 1)
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		w.Header().Set("Cache-Control", "no-cache, no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if headOnly {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(master)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(master))
+		return
+	}
+
+	if (segParam == "" && strings.HasSuffix(lowerPath, "/live.m3u8")) || strings.EqualFold(segParam, "main.m3u8") || strings.EqualFold(segParam, "live.m3u8") {
+		_, _ = tcMgr.RegisterSession(sessParams)
+		mediaPL := transcode.BuildMediaPlaylist(plParams)
+		mediaPL = strings.ReplaceAll(mediaPL, "hls1/main/", "")
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		w.Header().Set("Cache-Control", "no-cache, no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if headOnly {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(mediaPL)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(mediaPL))
+		return
+	}
+
+	if strings.EqualFold(segParam, "init.mp4") {
+		if headOnly {
+			w.Header().Set("Content-Type", "video/mp4")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		initPath, err := tcMgr.GetInitSegment(r.Context(), sessParams)
+		if err != nil {
+			httpx.Error(w, http.StatusBadGateway, fmt.Sprintf("recording hls init segment failed: %v", err))
+			return
+		}
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		http.ServeFile(w, r, initPath)
+		return
+	}
+
+	segIdx, segExt, parseErr := transcode.ParseSegmentID(segParam)
+	if parseErr != nil {
+		if headOnly {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		httpx.Error(w, http.StatusBadRequest, "invalid hls segment identifier")
+		return
+	}
+	sessParams.SegmentContainer = segExt
+	segCT := "video/mp2t"
+	if segExt == "mp4" || segExt == "m4s" {
+		segCT = "video/mp4"
+	}
+	if headOnly {
+		w.Header().Set("Content-Type", segCT)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	segPath, err := tcMgr.GetSegment(r.Context(), sessParams, segIdx)
+	if err != nil {
+		httpx.Error(w, http.StatusBadGateway, fmt.Sprintf("recording hls segment failed: %v", err))
+		return
+	}
+	w.Header().Set("Content-Type", segCT)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	http.ServeFile(w, r, segPath)
 }
 
 func (h *Handler) handleAvailableRecordingOptions(w http.ResponseWriter, r *http.Request) {
@@ -1193,10 +1377,14 @@ func (h *Handler) handleSetChannelMapping(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		h.state = snapshot
 	}
+	lt := h.liveTV
 	h.mu.Unlock()
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to persist channel mapping")
 		return
+	}
+	if lt != nil {
+		_ = lt.RefreshAllGuides(r.Context())
 	}
 
 	httpx.JSON(w, http.StatusOK, map[string]any{
@@ -1206,6 +1394,38 @@ func (h *Handler) handleSetChannelMapping(w http.ResponseWriter, r *http.Request
 }
 
 func (h *Handler) handleDiscoverTuners(w http.ResponseWriter, r *http.Request) {
+	q := httpx.ParseQuery(r)
+	probeURL := strings.TrimSpace(q.Get("Url"))
+	if probeURL == "" {
+		probeURL = strings.TrimSpace(q.Get("url"))
+	}
+	if probeURL == "" {
+		probeURL = strings.TrimSpace(q.Get("Address"))
+	}
+	h.mu.RLock()
+	lt := h.liveTV
+	h.mu.RUnlock()
+	if lt != nil {
+		discovered := lt.DiscoverTuners(r.Context(), probeURL)
+		out := make([]liveTVTunerHost, len(discovered))
+		for i, t := range discovered {
+			out[i] = liveTVTunerHost{
+				Id:                   t.Id,
+				Url:                  t.Url,
+				Type:                 t.Type,
+				DeviceId:             t.DeviceId,
+				FriendlyName:         t.FriendlyName,
+				ImportFavoritesOnly:  t.ImportFavoritesOnly,
+				AllowHWTranscoding:   t.AllowHWTranscoding,
+				AllowPrivateNetwork:  t.AllowPrivateNetwork,
+				TunerCount:           t.TunerCount,
+				UserAgent:            t.UserAgent,
+				ImportedChannelCount: t.ImportedChannelCount,
+			}
+		}
+		httpx.JSON(w, http.StatusOK, out)
+		return
+	}
 	httpx.JSON(w, http.StatusOK, h.snapshotLiveTVTunerHosts(r.Context()))
 }
 

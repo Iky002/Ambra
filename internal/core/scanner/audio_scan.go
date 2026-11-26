@@ -135,6 +135,10 @@ func (s *Scanner) indexAudio(
 		y := parsed.Year
 		rec.ProductionYear = &y
 	}
+	if existing != nil {
+		rec.DateCreated = existing.DateCreated
+		preserveExistingItemOnRescan(existing, rec)
+	}
 
 	if err := s.repo.UpsertItem(ctx, rec); err != nil {
 		return false, nil, err
@@ -148,8 +152,16 @@ func (s *Scanner) indexAudio(
 		return false, nil, err
 	}
 
-	titleTokens := TokenizeForFTS(rec.Name, parsed.Album, parsed.Artist)
-	_ = s.repo.UpsertSearchFTS(ctx, rec.ID, rec.Name, titleTokens, "", "", parsed.Artist)
+	artistForFTS := strings.Join(rec.Extra.Artists, " ")
+	if artistForFTS == "" {
+		artistForFTS = parsed.Artist
+	}
+	albumForFTS := rec.Extra.Album
+	if albumForFTS == "" {
+		albumForFTS = parsed.Album
+	}
+	titleTokens := TokenizeForFTS(rec.Name, albumForFTS, artistForFTS)
+	_ = s.repo.UpsertSearchFTS(ctx, rec.ID, rec.Name, titleTokens, "", "", artistForFTS)
 
 	var task *enrichTask
 	if needProbe {
@@ -431,30 +443,32 @@ func applyAudioProbeTags(rec *sqlite.ItemRecord, tags map[string]string) bool {
 	}
 	changed := false
 
-	if title := tagValue(tags, "title"); title != "" && !isFieldLocked(rec, "Name") {
+	if title := tagValue(tags, "title"); title != "" && !isExtraFieldLocked(&rec.Extra, "Name") {
 		if rec.Name != title {
 			rec.Name = title
-			if rec.IndexNumber != nil && *rec.IndexNumber > 0 {
-				dn := 0
-				if rec.ParentIndexNumber != nil {
-					dn = *rec.ParentIndexNumber
+			if !isExtraFieldLocked(&rec.Extra, "SortName") {
+				if rec.IndexNumber != nil && *rec.IndexNumber > 0 {
+					dn := 0
+					if rec.ParentIndexNumber != nil {
+						dn = *rec.ParentIndexNumber
+					}
+					rec.SortName = fmt.Sprintf("%02d-%04d-%s", dn, *rec.IndexNumber, strings.ToLower(title))
+				} else {
+					rec.SortName = strings.ToLower(title)
 				}
-				rec.SortName = fmt.Sprintf("%02d-%04d-%s", dn, *rec.IndexNumber, strings.ToLower(title))
-			} else {
-				rec.SortName = strings.ToLower(title)
 			}
 			changed = true
 		}
 	}
 
-	if album := tagValue(tags, "album"); album != "" {
+	if album := tagValue(tags, "album"); album != "" && !isExtraFieldLocked(&rec.Extra, "Album") {
 		if rec.Extra.Album != album {
 			rec.Extra.Album = album
 			changed = true
 		}
 	}
 
-	if artistRaw := tagValue(tags, "artist"); artistRaw != "" {
+	if artistRaw := tagValue(tags, "artist"); artistRaw != "" && !isExtraFieldLocked(&rec.Extra, "Artists") {
 		var artists []string
 		for _, part := range strings.FieldsFunc(artistRaw, func(r rune) bool { return r == ';' || r == '/' }) {
 			if s := strings.TrimSpace(part); s != "" {
@@ -463,22 +477,24 @@ func applyAudioProbeTags(rec *sqlite.ItemRecord, tags map[string]string) bool {
 		}
 		if len(artists) > 0 {
 			rec.Extra.Artists = artists
-			if rec.Extra.AlbumArtist == "" {
+			if rec.Extra.AlbumArtist == "" && !isExtraFieldLocked(&rec.Extra, "AlbumArtist") {
 				rec.Extra.AlbumArtist = artists[0]
 			}
 			changed = true
 		}
 	}
 
-	if albumArtist := tagValue(tags, "album_artist"); albumArtist != "" {
-		if rec.Extra.AlbumArtist != albumArtist {
-			rec.Extra.AlbumArtist = albumArtist
-			changed = true
-		}
-	} else if albumArtist := tagValue(tags, "albumartist"); albumArtist != "" {
-		if rec.Extra.AlbumArtist != albumArtist {
-			rec.Extra.AlbumArtist = albumArtist
-			changed = true
+	if !isExtraFieldLocked(&rec.Extra, "AlbumArtist") {
+		if albumArtist := tagValue(tags, "album_artist"); albumArtist != "" {
+			if rec.Extra.AlbumArtist != albumArtist {
+				rec.Extra.AlbumArtist = albumArtist
+				changed = true
+			}
+		} else if albumArtist := tagValue(tags, "albumartist"); albumArtist != "" {
+			if rec.Extra.AlbumArtist != albumArtist {
+				rec.Extra.AlbumArtist = albumArtist
+				changed = true
+			}
 		}
 	}
 
@@ -518,4 +534,47 @@ func applyAudioProbeTags(rec *sqlite.ItemRecord, tags map[string]string) bool {
 	}
 
 	return changed
+}
+
+func (s *Scanner) applyAudioProbeRelations(ctx context.Context, rec *sqlite.ItemRecord, tags map[string]string) bool {
+	if s.repo == nil || rec == nil || rec.Extra.LockData || len(tags) == 0 {
+		return false
+	}
+	updated := false
+	if genreRaw := tagValue(tags, "genre"); genreRaw != "" && !isExtraFieldLocked(&rec.Extra, "Genres") {
+		var genres []string
+		for _, part := range strings.FieldsFunc(genreRaw, func(r rune) bool { return r == ';' || r == '/' || r == ',' }) {
+			if g := strings.TrimSpace(part); g != "" {
+				genres = append(genres, g)
+			}
+		}
+		if len(genres) > 0 {
+			if err := s.repo.ReplaceItemTaxonomies(ctx, rec.ID, "genre", genres); err == nil {
+				updated = true
+			}
+		}
+	}
+	if artistRaw := tagValue(tags, "artist"); artistRaw != "" &&
+		!isExtraFieldLocked(&rec.Extra, "People") &&
+		!isExtraFieldLocked(&rec.Extra, "Cast") &&
+		!isExtraFieldLocked(&rec.Extra, "Artists") {
+		var people []sqlite.PersonInput
+		idx := 0
+		for _, part := range strings.FieldsFunc(artistRaw, func(r rune) bool { return r == ';' || r == '/' }) {
+			if a := strings.TrimSpace(part); a != "" {
+				people = append(people, sqlite.PersonInput{
+					Name:      a,
+					Type:      "Artist",
+					SortOrder: idx,
+				})
+				idx++
+			}
+		}
+		if len(people) > 0 {
+			if err := s.repo.ReplaceItemPeople(ctx, rec.ID, people); err == nil {
+				updated = true
+			}
+		}
+	}
+	return updated
 }

@@ -97,10 +97,14 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 }
 
 func (h *Handler) logDir() string {
-	if h.cfg == nil || h.cfg.DataDir == "" {
+	if h.cfg == nil {
 		return ""
 	}
-	return filepath.Join(h.cfg.DataDir, "logs")
+	dataDir := h.cfg.Snapshot().DataDir
+	if dataDir == "" {
+		return ""
+	}
+	return filepath.Join(dataDir, "logs")
 }
 
 func (h *Handler) listLogFiles() []LogFileDto {

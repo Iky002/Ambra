@@ -150,4 +150,12 @@ func TestAPIKeyAndRevokeDevice(t *testing.T) {
 	if _, err := svc.ValidateToken(ctx, res.AccessToken); err != ErrUnauthorized {
 		t.Fatalf("expected ErrUnauthorized after RevokeDevice, got %v", err)
 	}
+
+	// Reject usernames containing Unicode control characters (L-03)
+	if _, err := svc.CreateUser(ctx, "bad\x00user", "pw", false); err != ErrInvalidUsername {
+		t.Fatalf("expected ErrInvalidUsername for NUL control char, got %v", err)
+	}
+	if _, err := svc.CreateUser(ctx, "bad\nname", "pw", false); err != ErrInvalidUsername {
+		t.Fatalf("expected ErrInvalidUsername for newline control char, got %v", err)
+	}
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -28,20 +29,24 @@ const (
 	maxEpisodePages  = 25
 )
 
-var errUnauthorized = errors.New("tvdb unauthorized")
+var (
+	errUnauthorized                 = errors.New("tvdb unauthorized")
+	_               plugins.DefaultConfigExporter = (*Provider)(nil)
+)
 
 // Provider implements plugins.MetadataProvider using TheTVDB v4 REST API.
 type Provider struct {
-	mu          sync.RWMutex
-	enabled     bool
-	apiKey      string
-	pin         string
-	language    string
-	priority    int
-	baseURL     string
-	token       string
-	tokenExpiry time.Time
-	tokenEpoch  uint64
+	mu           sync.RWMutex
+	enabled      bool
+	apiKey       string
+	pin          string
+	language     string
+	priority     int
+	baseURL      string
+	token        string
+	tokenExpiry  time.Time
+	tokenEpoch   uint64
+	customClient bool
 
 	loginMu sync.Mutex
 	client  *http.Client
@@ -89,7 +94,26 @@ func (p *Provider) SetHTTPClient(c *http.Client) {
 	}
 	p.mu.Lock()
 	p.client = c
+	p.customClient = true
 	p.mu.Unlock()
+}
+
+func (p *Provider) DefaultConfig() map[string]any {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := map[string]any{
+		"enabled":  p.enabled,
+		"priority": p.priority,
+		"language": p.language,
+		"base_url": p.baseURL,
+	}
+	if p.apiKey != "" {
+		out["api_key"] = p.apiKey
+	}
+	if p.pin != "" {
+		out["pin"] = p.pin
+	}
+	return out
 }
 
 func (p *Provider) Manifest() plugins.Manifest {
@@ -158,11 +182,19 @@ func (p *Provider) Configure(cfg map[string]any) error {
 	if v, ok := getInt(cfg, "priority", "Priority"); ok {
 		nextPriority = v
 	}
-	if v, ok := getString(cfg, "base_url", "BaseURL"); ok && strings.TrimSpace(v) != "" {
+	if v, ok := getString(cfg, "base_url", "BaseURL", "BaseUrl"); ok && strings.TrimSpace(v) != "" {
 		trimmed := strings.TrimRight(strings.TrimSpace(v), "/")
 		u, err := url.Parse(trimmed)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return fmt.Errorf("tvdb: invalid base_url %q: must use http or https scheme with host", v)
+		}
+		if trimmed != p.baseURL {
+			if err := netutil.ValidateRemoteURL(trimmed, p.customClient); err != nil {
+				var dnsErr *net.DNSError
+				if !errors.As(err, &dnsErr) {
+					return fmt.Errorf("tvdb: unsafe base_url %q: %w", v, err)
+				}
+			}
 		}
 		if urlHostLower(trimmed) != urlHostLower(p.baseURL) {
 			if !hasNewKey {
@@ -226,6 +258,8 @@ func getInt(cfg map[string]any, keys ...string) (int, bool) {
 			switch v := raw.(type) {
 			case int:
 				return v, true
+			case int64:
+				return int(v), true
 			case float64:
 				return int(v), true
 			}

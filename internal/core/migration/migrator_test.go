@@ -1018,3 +1018,119 @@ func TestMigratorProtectsExistingLocalAdminFromDowngradeAndDisable(t *testing.T)
 		t.Fatalf("expected protection notice in Notices, got %+v", rep.Notices)
 	}
 }
+
+func TestMigratorM05SelfLoopEnabledFoldersMappingBatchClampAndCaps(t *testing.T) {
+	st, userRepo, libRepo := openTestStore(t)
+	ctx := context.Background()
+
+	localMovies, err := libRepo.CreateLibrary(ctx, "MoviesLib", "movies", []string{"/mnt/nas/movies"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	localAnime, err := libRepo.CreateLibrary(ctx, "AnimeLib", "tvshows", []string{"/mnt/nas/anime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	userPolicy := sqlite.DefaultUserPolicy(false)
+	userPolicy.EnableAllFolders = false
+	userPolicy.EnabledFolders = []string{"src-guid-movies", "src-guid-anime", "src-guid-unmapped"}
+
+	// Create 520 ambiguous items to verify 500-entry report cap on Conflicts
+	for i := 0; i < 2; i++ {
+		_ = libRepo.UpsertItem(ctx, &sqlite.ItemRecord{
+			LibraryID: localMovies.ID,
+			Type:      "Movie",
+			Name:      "DupCapMovie",
+			Extra:     sqlite.ItemExtra{ProviderIDs: map[string]string{"Tmdb": "777777"}},
+		})
+	}
+	manyItems := make([]SourceItem, 520)
+	for i := range manyItems {
+		manyItems[i] = SourceItem{
+			ID:          "src-cap-" + strconv.Itoa(i),
+			Name:        "DupCapMovie",
+			Type:        "Movie",
+			ProviderIDs: map[string]string{"Tmdb": "777777"},
+			UserData:    &SourceUserData{Played: true},
+		}
+	}
+
+	fake := &fakeEmbyServer{
+		apiKey:     "k",
+		serverInfo: SourceServerInfo{ID: "src-srv-m05", ServerName: "SourceEmby"},
+		users: []SourceUser{
+			{ID: "u-mapped", Name: "MappedUser", Policy: userPolicy, Configuration: sqlite.DefaultUserConfig()},
+		},
+		folders: []SourceVirtualFolder{
+			{Name: "DifferentName", ItemID: "src-guid-movies", CollectionType: "movies", Locations: []string{"/mnt/nas/movies"}},
+			{Name: "animelib", ItemID: "src-guid-anime", CollectionType: "tvshows", Locations: []string{"/old/path/anime"}},
+			{Name: "UnmappedVault", ItemID: "src-guid-unmapped", CollectionType: "movies", Locations: []string{"/nonexistent/vault"}},
+		},
+		itemsByUser: map[string][]SourceItem{
+			"u-mapped": manyItems,
+		},
+	}
+	srv := newFakeEmbyServer(t, fake)
+
+	// 1. Self-connection prevention by listen address and by ServerID
+	if _, err := NewSourceClient(srv.URL, "k", WithHTTPClient(srv.Client()), WithSelfListenAddr(strings.TrimPrefix(srv.URL, "http://"))); !errors.Is(err, ErrSelfSourceServer) {
+		t.Fatalf("expected ErrSelfSourceServer on self listen address, got %v", err)
+	}
+	selfIDClient, err := NewSourceClient(srv.URL, "k", WithHTTPClient(srv.Client()), WithSelfServerID("src-srv-m05"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := selfIDClient.TestConnection(ctx); !errors.Is(err, ErrSelfSourceServer) {
+		t.Fatalf("expected ErrSelfSourceServer on matching ServerID, got %v", err)
+	}
+
+	// 2. EnabledFolders mapping + SetOnUserUpdated callback + BatchSize > 1000 clamp + 500-conflict cap
+	var updatedUsers []string
+	m := NewMigrator(st, userRepo, WithClientFactory(func(baseURL, apiKey string) (*SourceClient, error) {
+		return NewSourceClient(baseURL, apiKey, WithHTTPClient(srv.Client()))
+	}))
+	m.SetSelfServer(":65531", "ambra-local-id")
+	t.Cleanup(func() { SetSelfServerIdentity("", "") })
+	m.SetOnUserUpdated(func(uid string) {
+		updatedUsers = append(updatedUsers, uid)
+	})
+
+	rep, err := m.Run(ctx, MigrationRequest{
+		SourceURL:     srv.URL,
+		APIKey:        "k",
+		MigrateUsers:  true,
+		MigratePlayed: true,
+		BatchSize:     99999,
+	})
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if len(rep.Conflicts) != maxReportEntries {
+		t.Fatalf("expected Conflicts capped at %d, got %d", maxReportEntries, len(rep.Conflicts))
+	}
+
+	uRec, err := userRepo.GetUserByName(ctx, "MappedUser")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uRec.Policy.EnableAllFolders {
+		t.Fatal("expected EnableAllFolders=false preserved")
+	}
+	if len(uRec.Policy.EnabledFolders) != 2 || uRec.Policy.EnabledFolders[0] != localMovies.ID || uRec.Policy.EnabledFolders[1] != localAnime.ID {
+		t.Fatalf("expected EnabledFolders mapped to [%s, %s], got %v", localMovies.ID, localAnime.ID, uRec.Policy.EnabledFolders)
+	}
+
+	// Re-run against existing user to trigger UpdateUserPolicy + SetOnUserUpdated
+	updatedUsers = nil
+	if _, err := m.Run(ctx, MigrationRequest{
+		SourceURL:    srv.URL,
+		APIKey:       "k",
+		MigrateUsers: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(updatedUsers) != 1 || updatedUsers[0] != uRec.ID {
+		t.Fatalf("expected SetOnUserUpdated invoked with %s, got %v", uRec.ID, updatedUsers)
+	}
+}

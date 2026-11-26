@@ -38,7 +38,7 @@
   - Home dashboard featuring **Hero Carousel, Continue Watching, Next Up, Trending Charts (TMDB / Douban / IMDb), and Latest Added**;
   - **Cross-directory multi-version auto-merging**, **TMDB Auto Box Sets (Collections)**, playlist queue auto-play, and global Music Player with LRC lyrics;
   - Client-side **ASS/SSA subtitle rendering (JASSUB)** and **Blu-ray PGS Canvas rendering**, **STRM 302 direct redirect** with automatic proxy/HLS fallback, streaming MKV remuxing, and hardware-accelerated HLS transcoding (VideoToolbox / NVENC / QSV / VAAPI / AMF).
-- **Complete home server & power-user features**: Multi-user RBAC & Parental Controls (rating/tag blocking), Quick Connect login, Live TV (M3U + XMLTV EPG + DVR recording), DLNA UPnP/SSDP casting, Notification Center, Webhooks, Scheduled Tasks, and one-click SQLite hot Backup & Restore.
+- **Complete home server & power-user features**: Multi-user RBAC & Parental Controls (rating/tag blocking), Quick Connect login, Live TV (M3U + XMLTV EPG + DVR recording), DLNA UPnP/SSDP casting (disabled by default, opt-in on demand), Notification Center, Webhooks, Scheduled Tasks, and full archive Backup & Restore.
 
 ---
 
@@ -120,6 +120,10 @@ make build        # Build pure-Go binary (bin/ambra)
 | `AMBRA_ADMIN_PASS` | Headless initial admin password on first start (when unset, use the `/setup` wizard) | `""` |
 | `AMBRA_TMDB_API_KEY` | Custom TMDB API Key (uses built-in default key when empty) | Built-in default |
 | `AMBRA_WEB_DIR` | External Web UI directory override (empty = embedded UI) | `""` |
+| `AMBRA_ENABLE_DLNA` | Enable DLNA / UPnP discovery and casting (disabled by default, opt-in) | `false` |
+| `AMBRA_TRUSTED_PROXIES` | Comma-separated trusted reverse proxy IPs or CIDRs (`none` disables forwarded header trust) | Loopback only |
+| `AMBRA_LOCAL_NETWORK_SUBNETS` | Comma-separated custom LAN subnet CIDRs (auto-detects local private NIC subnets when empty) | Auto-detect local subnets |
+| `AMBRA_ALLOWED_ORIGINS` | Comma-separated allowed CORS / WebSocket origins | Same-origin only |
 | `AMBRA_FFMPEG_PATH` | Custom `ffmpeg` binary path | Auto-detect |
 | `AMBRA_FFPROBE_PATH` | Custom `ffprobe` binary path | Auto-detect |
 

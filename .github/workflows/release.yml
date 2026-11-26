@@ -11,6 +11,9 @@ on:
         required: false
         default: ''
 
+permissions:
+  contents: read
+
 jobs:
   release-binaries:
     name: Build & Publish Release Binaries (Lite + Full w/ FFmpeg)
@@ -80,23 +83,27 @@ jobs:
 
       - name: Bundle Full packages WITH static FFmpeg & FFprobe
         env:
-          # BtbN rolling release base; switch to an immutable autobuild tag and populate the
-          # optional BTBN_SHA256_* pin vars below to lock exact archive digests end-to-end.
-          BTBN_RELEASE_BASE: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest
+          # Deterministic monthly-retained BtbN release tag (override via repo variable BTBN_RELEASE_TAG if upgrading).
+          BTBN_RELEASE_TAG: ${{ vars.BTBN_RELEASE_TAG || 'autobuild-2026-02-28-14-26' }}
           BTBN_FFMPEG_BRANCH: n8.1
-          BTBN_SHA256_LINUX64: ''
-          BTBN_SHA256_LINUXARM64: ''
-          BTBN_SHA256_WIN64: ''
+          BTBN_SHA256_LINUX64: ${{ vars.BTBN_SHA256_LINUX64 || '' }}
+          BTBN_SHA256_LINUXARM64: ${{ vars.BTBN_SHA256_LINUXARM64 || '' }}
+          BTBN_SHA256_WIN64: ${{ vars.BTBN_SHA256_WIN64 || '' }}
           MACOS_FFMPEG_BASE: https://ffmpeg.martin-riedl.de/download/macos/arm64/1795207104_9.1
           MACOS_FFMPEG_SHA256: 1f66e9a690a7f1c9e60b012379f8869c11818d1797f45b21dbb2f2564ba61ae1
           MACOS_FFPROBE_SHA256: 6ef2df5f575042923a28537ab37adf936f28bf3e7b85de23a1447ed447ec1dbd
         run: |
           set -euo pipefail
+          if [[ ! "${BTBN_RELEASE_TAG}" =~ ^autobuild-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "ERROR: BTBN_RELEASE_TAG must be a deterministic autobuild-YYYY-MM-DD-HH-MM tag, got '${BTBN_RELEASE_TAG}'" >&2
+            exit 1
+          fi
+          BTBN_RELEASE_BASE="https://github.com/BtbN/FFmpeg-Builds/releases/download/${BTBN_RELEASE_TAG}"
           sudo apt-get update && sudo apt-get install -y --no-install-recommends xz-utils zip unzip file
           WORK="/tmp/ffmpeg-bundle"
           mkdir -p "${WORK}"
 
-          # Download upstream SHA-256 manifest from BtbN once, validate its format strictly,
+          # Download upstream SHA-256 manifest from pinned BtbN release once, validate its format strictly,
           # and verify every downloaded archive against it (fail-closed, no branch fallback).
           BTBN_CHECKSUMS="${WORK}/btbn-checksums.sha256"
           curl -fsSL -o "${BTBN_CHECKSUMS}" "${BTBN_RELEASE_BASE}/checksums.sha256"
@@ -112,8 +119,15 @@ jobs:
           verify_binary() {
             local bin_path="$1"
             local expected_pattern="$2"
-            if [ ! -s "${bin_path}" ]; then
-              echo "ERROR: missing or empty binary ${bin_path}" >&2
+            local min_bytes="${3:-1048576}"
+            if [ -L "${bin_path}" ] || [ ! -f "${bin_path}" ] || [ ! -s "${bin_path}" ]; then
+              echo "ERROR: missing, symlink, or empty binary ${bin_path}" >&2
+              exit 1
+            fi
+            local bin_size
+            bin_size="$(stat -c '%s' "${bin_path}")"
+            if [ "${bin_size}" -lt "${min_bytes}" ]; then
+              echo "ERROR: truncated binary ${bin_path} (${bin_size} bytes < ${min_bytes})" >&2
               exit 1
             fi
             local info
@@ -135,6 +149,8 @@ jobs:
             local expected_file_re="$7"
             local pinned_sha="$8"
 
+            verify_binary "${lite_bin}" "${expected_file_re}" 1048576
+
             local stage="${WORK}/${platform}"
             mkdir -p "${stage}/pkg"
 
@@ -143,7 +159,7 @@ jobs:
             local branch_ver="${BTBN_FFMPEG_BRANCH#n}"
             local branch_ver_re="${branch_ver//./\\.}"
             local matches
-            matches="$(grep -E "^[0-9a-fA-F]{64}  ffmpeg-${BTBN_FFMPEG_BRANCH}-latest-${arch_tag}-gpl-${branch_ver_re}\.${ext}$" "${BTBN_CHECKSUMS}" || true)"
+            matches="$(grep -E "^[0-9a-fA-F]{64}  ffmpeg-${BTBN_FFMPEG_BRANCH}-[A-Za-z0-9._-]+-${arch_tag}-gpl-${branch_ver_re}\.${ext}$" "${BTBN_CHECKSUMS}" || true)"
             local match_count
             match_count="$(printf '%s\n' "${matches}" | sed '/^$/d' | wc -l | tr -d ' ')"
             if [ "${match_count}" != "1" ]; then
@@ -170,26 +186,40 @@ jobs:
             fi
             local archive_path="${stage}/${asset_name}"
 
-            echo "Downloading ${asset_name} for ${platform} (sha256=${expected_sha})..."
+            echo "Downloading ${asset_name} for ${platform} (tag=${BTBN_RELEASE_TAG}, sha256=${expected_sha})..."
             curl -fsSL -o "${archive_path}" "${BTBN_RELEASE_BASE}/${asset_name}"
             echo "${expected_sha}  ${archive_path}" | sha256sum -c -
 
             if [ "${is_win}" = "1" ]; then
               unzip -q "${archive_path}" -d "${stage}/extract"
+              local found_ffmpeg found_ffprobe
+              found_ffmpeg="$(find "${stage}/extract" -type f -name 'ffmpeg.exe' | head -n 1)"
+              found_ffprobe="$(find "${stage}/extract" -type f -name 'ffprobe.exe' | head -n 1)"
+              if [ -z "${found_ffmpeg}" ] || [ -z "${found_ffprobe}" ]; then
+                echo "ERROR: ffmpeg.exe or ffprobe.exe missing from ${asset_name}" >&2
+                exit 1
+              fi
               cp "${lite_bin}" "${stage}/pkg/ambra.exe"
-              cp "$(find "${stage}/extract" -type f -name 'ffmpeg.exe' | head -n 1)" "${stage}/pkg/ffmpeg.exe"
-              cp "$(find "${stage}/extract" -type f -name 'ffprobe.exe' | head -n 1)" "${stage}/pkg/ffprobe.exe"
-              verify_binary "${stage}/pkg/ffmpeg.exe" "${expected_file_re}"
-              verify_binary "${stage}/pkg/ffprobe.exe" "${expected_file_re}"
+              cp "${found_ffmpeg}" "${stage}/pkg/ffmpeg.exe"
+              cp "${found_ffprobe}" "${stage}/pkg/ffprobe.exe"
+              verify_binary "${stage}/pkg/ffmpeg.exe" "${expected_file_re}" 1048576
+              verify_binary "${stage}/pkg/ffprobe.exe" "${expected_file_re}" 1048576
               (cd "${stage}/pkg" && zip -q -r "${GITHUB_WORKSPACE}/dist/full/${out_archive}" .)
             else
               tar -xJf "${archive_path}" -C "${stage}" --one-top-level=extract
+              local found_ffmpeg found_ffprobe
+              found_ffmpeg="$(find "${stage}/extract" -type f -name 'ffmpeg' | head -n 1)"
+              found_ffprobe="$(find "${stage}/extract" -type f -name 'ffprobe' | head -n 1)"
+              if [ -z "${found_ffmpeg}" ] || [ -z "${found_ffprobe}" ]; then
+                echo "ERROR: ffmpeg or ffprobe missing from ${asset_name}" >&2
+                exit 1
+              fi
               cp "${lite_bin}" "${stage}/pkg/ambra"
-              cp "$(find "${stage}/extract" -type f -name 'ffmpeg' | head -n 1)" "${stage}/pkg/ffmpeg"
-              cp "$(find "${stage}/extract" -type f -name 'ffprobe' | head -n 1)" "${stage}/pkg/ffprobe"
+              cp "${found_ffmpeg}" "${stage}/pkg/ffmpeg"
+              cp "${found_ffprobe}" "${stage}/pkg/ffprobe"
               chmod +x "${stage}/pkg/ambra" "${stage}/pkg/ffmpeg" "${stage}/pkg/ffprobe"
-              verify_binary "${stage}/pkg/ffmpeg" "${expected_file_re}"
-              verify_binary "${stage}/pkg/ffprobe" "${expected_file_re}"
+              verify_binary "${stage}/pkg/ffmpeg" "${expected_file_re}" 1048576
+              verify_binary "${stage}/pkg/ffprobe" "${expected_file_re}" 1048576
               tar -czf "${GITHUB_WORKSPACE}/dist/full/${out_archive}" -C "${stage}/pkg" .
             fi
           }

@@ -16,7 +16,7 @@ func TestAuditV0107_H9_HostChangeClearsKeyAndLoaderSecurityLimits(t *testing.T) 
 	p, err := NewHTTPPlugin(ExternalManifest{
 		ID:       "ext.hostchange",
 		Name:     "Host Change Plugin",
-		Endpoint: "https://trusted.example.com/api",
+		Endpoint: "https://93.184.216.34/api",
 		APIKey:   "secret-ext-key",
 	})
 	if err != nil {
@@ -25,7 +25,7 @@ func TestAuditV0107_H9_HostChangeClearsKeyAndLoaderSecurityLimits(t *testing.T) 
 	p.SetHTTPClient(nil)
 	p.SetHTTPClient(&http.Client{})
 
-	if err := p.Configure(map[string]any{"Endpoint": "https://attacker.example.com/api"}); err != nil {
+	if err := p.Configure(map[string]any{"Endpoint": "https://1.1.1.1/api"}); err != nil {
 		t.Fatalf("Configure host change: %v", err)
 	}
 	p.mu.RLock()

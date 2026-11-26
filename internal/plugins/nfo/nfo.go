@@ -14,16 +14,23 @@ import (
 	"github.com/ambra-media/ambra/internal/plugins"
 )
 
-const maxNFOFileSize = 2 << 20 // 2 MiB
+const (
+	maxNFOFileSize  = 2 << 20 // 2 MiB
+	defaultPriority = 10
+)
+
+var _ plugins.DefaultConfigExporter = (*Provider)(nil)
 
 // Provider implements plugins.MetadataProvider for local Kodi/Emby .nfo files.
 type Provider struct {
-	enabled atomic.Bool
+	enabled  atomic.Bool
+	priority atomic.Int64
 }
 
 func New() *Provider {
 	p := &Provider{}
 	p.enabled.Store(true)
+	p.priority.Store(defaultPriority)
 	return p
 }
 
@@ -36,16 +43,39 @@ func (p *Provider) Manifest() plugins.Manifest {
 		Author:      "Ambra",
 		BuiltIn:     true,
 		Enabled:     p.enabled.Load(),
-		Priority:    10,
+		Priority:    int(p.priority.Load()),
 		Kinds:       []plugins.Kind{plugins.KindMetadata},
 	}
 }
 
+func (p *Provider) DefaultConfig() map[string]any {
+	return map[string]any{
+		"enabled":  p.enabled.Load(),
+		"priority": int(p.priority.Load()),
+	}
+}
+
 func (p *Provider) Configure(cfg map[string]any) error {
+	if cfg == nil {
+		return nil
+	}
 	if v, ok := cfg["enabled"].(bool); ok {
 		p.enabled.Store(v)
 	} else if v, ok := cfg["Enabled"].(bool); ok {
 		p.enabled.Store(v)
+	}
+	for _, k := range []string{"priority", "Priority"} {
+		if raw, exists := cfg[k]; exists {
+			switch n := raw.(type) {
+			case int:
+				p.priority.Store(int64(n))
+			case int64:
+				p.priority.Store(n)
+			case float64:
+				p.priority.Store(int64(n))
+			}
+			break
+		}
 	}
 	return nil
 }

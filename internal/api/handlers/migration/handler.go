@@ -258,7 +258,9 @@ func writeMigrationError(w http.ResponseWriter, err error) {
 		httpx.Error(w, http.StatusBadGateway, sanitizeErrorMessage(apiErr.Error()))
 		return
 	}
-	if strings.Contains(err.Error(), "invalid source server URL") ||
+	if errors.Is(err, coremigration.ErrSelfSourceServer) ||
+		strings.Contains(err.Error(), "cannot point to this Ambra instance") ||
+		strings.Contains(err.Error(), "invalid source server URL") ||
 		strings.Contains(err.Error(), "is required") {
 		httpx.Error(w, http.StatusBadRequest, sanitizeErrorMessage(err.Error()))
 		return

@@ -1,7 +1,13 @@
+import { getStoredAuth } from '../api/client'
 import type { MediaStream, UserConfiguration } from '../api/types'
 import { detectChineseVariant } from './subtitleUtils'
 
-const PLAYBACK_PREFS_KEY = 'ambra_web_playback_prefs_v1'
+export const PLAYBACK_PREFS_KEY = 'ambra_web_playback_prefs_v1'
+
+export function getPlaybackPrefsStorageKey(userId?: string | null): string {
+  const effectiveUserId = (userId ?? getStoredAuth()?.userId ?? '').trim()
+  return effectiveUserId ? `${PLAYBACK_PREFS_KEY}:${effectiveUserId}` : PLAYBACK_PREFS_KEY
+}
 
 export type SubtitleModeOption = 'Default' | 'Smart' | 'OnlyForced' | 'Always' | 'None'
 
@@ -76,9 +82,9 @@ export function localeToTrackLang(locale?: string): string {
   return dash > 0 ? l.slice(0, dash) : l
 }
 
-export function loadPlaybackPrefs(): PlaybackPrefs {
+export function loadPlaybackPrefs(userId?: string | null): PlaybackPrefs {
   try {
-    const raw = localStorage.getItem(PLAYBACK_PREFS_KEY)
+    const raw = localStorage.getItem(getPlaybackPrefsStorageKey(userId))
     if (!raw) return { ...DEFAULT_PLAYBACK_PREFS }
     const parsed = JSON.parse(raw) as Partial<PlaybackPrefs>
     return {
@@ -104,8 +110,11 @@ export function loadPlaybackPrefs(): PlaybackPrefs {
   }
 }
 
-export function savePlaybackPrefs(patch: Partial<PlaybackPrefs>): PlaybackPrefs {
-  const current = loadPlaybackPrefs()
+export function savePlaybackPrefs(
+  patch: Partial<PlaybackPrefs>,
+  userId?: string | null,
+): PlaybackPrefs {
+  const current = loadPlaybackPrefs(userId)
   const next: PlaybackPrefs = {
     autoPlayNextEpisode:
       typeof patch.autoPlayNextEpisode === 'boolean'
@@ -125,31 +134,44 @@ export function savePlaybackPrefs(patch: Partial<PlaybackPrefs>): PlaybackPrefs 
         : current.subtitleMode,
   }
   try {
-    localStorage.setItem(PLAYBACK_PREFS_KEY, JSON.stringify(next))
+    localStorage.setItem(getPlaybackPrefsStorageKey(userId), JSON.stringify(next))
   } catch {
     // 忽略存储异常
   }
   return next
 }
 
-export function syncPlaybackPrefsFromUserConfig(cfg?: UserConfiguration | null): PlaybackPrefs {
-  if (!cfg) return loadPlaybackPrefs()
-  const patch: Partial<PlaybackPrefs> = {}
-  if (typeof cfg.EnableNextEpisodeAutoPlay === 'boolean') {
-    patch.autoPlayNextEpisode = cfg.EnableNextEpisodeAutoPlay
+export function syncPlaybackPrefsFromUserConfig(
+  cfg?: UserConfiguration | null,
+  userId?: string | null,
+): PlaybackPrefs {
+  if (!cfg) return loadPlaybackPrefs(userId)
+  const next: PlaybackPrefs = {
+    autoPlayNextEpisode:
+      typeof cfg.EnableNextEpisodeAutoPlay === 'boolean'
+        ? cfg.EnableNextEpisodeAutoPlay
+        : DEFAULT_PLAYBACK_PREFS.autoPlayNextEpisode,
+    preferredAudioLang:
+      cfg.PlayDefaultAudioTrack === true
+        ? 'media'
+        : cfg.AudioLanguagePreference !== undefined
+          ? normalizeAudioPref(cfg.AudioLanguagePreference)
+          : DEFAULT_PLAYBACK_PREFS.preferredAudioLang,
+    preferredSubtitleLang:
+      cfg.SubtitleLanguagePreference !== undefined
+        ? normalizeSubtitlePref(cfg.SubtitleLanguagePreference)
+        : DEFAULT_PLAYBACK_PREFS.preferredSubtitleLang,
+    subtitleMode:
+      cfg.SubtitleMode !== undefined
+        ? normalizeSubtitleMode(cfg.SubtitleMode)
+        : DEFAULT_PLAYBACK_PREFS.subtitleMode,
   }
-  if (cfg.PlayDefaultAudioTrack === true) {
-    patch.preferredAudioLang = 'media'
-  } else if (cfg.AudioLanguagePreference !== undefined) {
-    patch.preferredAudioLang = normalizeAudioPref(cfg.AudioLanguagePreference)
+  try {
+    localStorage.setItem(getPlaybackPrefsStorageKey(userId), JSON.stringify(next))
+  } catch {
+    // 忽略存储异常
   }
-  if (cfg.SubtitleLanguagePreference !== undefined) {
-    patch.preferredSubtitleLang = normalizeSubtitlePref(cfg.SubtitleLanguagePreference)
-  }
-  if (cfg.SubtitleMode !== undefined) {
-    patch.subtitleMode = normalizeSubtitleMode(cfg.SubtitleMode)
-  }
-  return savePlaybackPrefs(patch)
+  return next
 }
 
 export function playbackPrefsToUserConfig(

@@ -1,6 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { QueryClientContext } from '@tanstack/react-query'
-import { api, clearAuth, getDeviceId, getStoredAuth, saveAuth } from '../api/client'
+import { api, clearAuth, getAuthStorageKey, getDeviceId, getStoredAuth, saveAuth } from '../api/client'
 import type { AuthSession, AuthenticationResult, UserDto } from '../api/types'
 import { isDemoMode } from '../demo/demoMode'
 import { syncPlaybackPrefsFromUserConfig } from '../player/playbackPrefs'
@@ -30,6 +30,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [userError, setUserError] = useState<string | null>(null)
   const skipNextRefreshUserIdRef = useRef<string | null>(null)
   const refreshSeqRef = useRef(0)
+  const authRef = useRef<AuthSession | null>(auth)
+  authRef.current = auth
 
   const logout = useCallback(() => {
     refreshSeqRef.current += 1
@@ -69,7 +71,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
       setUser(freshUser)
       setUserError(null)
-      syncPlaybackPrefsFromUserConfig(freshUser.Configuration)
+      syncPlaybackPrefsFromUserConfig(freshUser.Configuration, freshUser.Id)
       const freshIsAdmin = Boolean(freshUser.Policy?.IsAdministrator)
       if (current.isAdmin !== freshIsAdmin || current.userName !== freshUser.Name) {
         const updated: AuthSession = {
@@ -120,7 +122,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setAuth(session)
       setUser(res.User)
       setUserError(null)
-      syncPlaybackPrefsFromUserConfig(res.User.Configuration)
+      syncPlaybackPrefsFromUserConfig(res.User.Configuration, res.User.Id)
       setUserLoading(false)
     },
     [queryClient],
@@ -184,6 +186,40 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => window.removeEventListener('ambra:unauthorized', onUnauthorized)
   }, [queryClient])
 
+  // 监听跨标签页 localStorage 变更，同步登出与切号状态并清空缓存
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== null && e.key !== getAuthStorageKey()) return
+      const nextStored = getStoredAuth()
+      const currentAuth = authRef.current
+      if (!nextStored) {
+        if (!currentAuth) return
+        refreshSeqRef.current += 1
+        skipNextRefreshUserIdRef.current = null
+        queryClient?.clear()
+        setAuth(null)
+        setUser(null)
+        setUserError(null)
+        setUserLoading(false)
+        return
+      }
+      if (
+        nextStored.accessToken !== currentAuth?.accessToken ||
+        nextStored.userId !== currentAuth?.userId
+      ) {
+        refreshSeqRef.current += 1
+        skipNextRefreshUserIdRef.current = null
+        queryClient?.clear()
+        setUser(null)
+        setUserError(null)
+        setUserLoading(true)
+        setAuth(nextStored)
+      }
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [queryClient])
+
   // 严格以服务端验证或登录响应返回的 User.Policy.IsAdministrator 为准，不信任本地缓存的 auth.isAdmin
   const isAdmin = Boolean(user?.Policy?.IsAdministrator)
 
@@ -205,6 +241,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       {children}
     </AuthContext.Provider>
   )
+}
+
+export function useOptionalAuth(): AuthContextValue | null {
+  return useContext(AuthContext)
 }
 
 export function useAuth(): AuthContextValue {

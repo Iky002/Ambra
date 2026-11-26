@@ -1,11 +1,17 @@
 package compatcore
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"mime"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/go-chi/chi/v5"
 
@@ -13,25 +19,36 @@ import (
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/api/ws"
+	"github.com/ambra-media/ambra/internal/core/auth"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
-// --- /Sessions ---
-
-func (h *Handler) recordRemoteCommand(sessionID, kind, command string, payload map[string]any) {
-	h.mu.Lock()
-	h.remoteCommands = append(h.remoteCommands, remoteCommandRecord{
-		SessionID: sessionID,
-		Kind:      kind,
-		Command:   command,
-		Payload:   payload,
-		At:        time.Now().UTC(),
-	})
-	if len(h.remoteCommands) > 200 {
-		h.remoteCommands = h.remoteCommands[len(h.remoteCommands)-200:]
-	}
-	h.mu.Unlock()
+var allowedCameraUploadExts = map[string]bool{
+	".jpg":  true,
+	".jpeg": true,
+	".png":  true,
+	".webp": true,
+	".gif":  true,
+	".heic": true,
+	".heif": true,
+	".bmp":  true,
+	".avif": true,
+	".tif":  true,
+	".tiff": true,
+	".dng":  true,
+	".mp4":  true,
+	".mov":  true,
+	".m4v":  true,
+	".mkv":  true,
+	".webm": true,
+	".avi":  true,
+	".3gp":  true,
+	".mts":  true,
+	".m2ts": true,
 }
+
+// --- /Sessions ---
 
 func (h *Handler) getSessionPlayQueue(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
@@ -77,12 +94,22 @@ func (h *Handler) getSessionPlayQueue(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) authorizeSessionTarget(r *http.Request, sid string) (dto.SessionInfo, bool, bool) {
-	if h.sessions == nil || sid == "" {
+	if h.sessions == nil {
 		return dto.SessionInfo{}, false, true
+	}
+	sid = strings.TrimSpace(sid)
+	if sid == "" {
+		if h.isCallerAdmin(r) {
+			return dto.SessionInfo{}, false, true
+		}
+		return dto.SessionInfo{}, false, false
 	}
 	target, ok := h.sessions.GetSession(sid)
 	if !ok {
-		return dto.SessionInfo{}, false, true
+		if h.isCallerAdmin(r) {
+			return dto.SessionInfo{}, false, true
+		}
+		return dto.SessionInfo{}, false, false
 	}
 	if target.UserId != "" {
 		if ac, hasAuth := middleware.AuthFromContext(r.Context()); hasAuth && ac != nil && (ac.User != nil || ac.IsAPIKey) {
@@ -102,10 +129,11 @@ func (h *Handler) authorizeSessionTarget(r *http.Request, sid string) (dto.Sessi
 }
 
 func (h *Handler) pushSessionWS(target dto.SessionInfo, found bool, msgType string, data any) {
-	if !found || h.wsHub == nil || target.DeviceId == "" || target.UserId == "" {
+	wsHub := h.getWSHub()
+	if !found || wsHub == nil || target.DeviceId == "" || target.UserId == "" {
 		return
 	}
-	h.wsHub.SendToUserDevice(target.UserId, target.DeviceId, ws.Message{
+	wsHub.SendToUserDevice(target.UserId, target.DeviceId, ws.Message{
 		MessageType: msgType,
 		Data:        data,
 	})
@@ -118,12 +146,11 @@ func (h *Handler) postSessionViewing(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
-	q := httpx.ParseQuery(r)
-	payload := map[string]any{
-		"ItemId":   q.Get("ItemId"),
-		"ItemName": q.Get("ItemName"),
+	if h.sessions != nil && !found {
+		writeJSONError(w, r, http.StatusNotFound, "session not found")
+		return
 	}
-	h.recordRemoteCommand(sid, "Viewing", q.Get("ItemType"), payload)
+	q := httpx.ParseQuery(r)
 	h.pushSessionWS(target, found, "GeneralCommand", map[string]any{
 		"Name": "DisplayContent",
 		"Arguments": map[string]any{
@@ -142,9 +169,20 @@ func (h *Handler) postSessionPlaying(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
+	if h.sessions != nil && !found {
+		writeJSONError(w, r, http.StatusNotFound, "session not found")
+		return
+	}
+	if r.ContentLength > maxSessionCommandBodyBytes {
+		httpx.Error(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	var body map[string]any
-	_ = decodeOptionalJSON(r, &body)
+	if err := decodeOptionalJSONLimit(r, &body, maxSessionCommandBodyBytes); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid or oversized request body")
+		return
+	}
 	if body == nil {
 		body = map[string]any{}
 	}
@@ -154,7 +192,6 @@ func (h *Handler) postSessionPlaying(w http.ResponseWriter, r *http.Request) {
 	if cmd := q.Get("PlayCommand"); cmd != "" {
 		body["PlayCommand"] = cmd
 	}
-	h.recordRemoteCommand(sid, "Playing", q.Get("PlayCommand"), body)
 	h.pushSessionWS(target, found, "Play", body)
 	httpx.NoContent(w)
 }
@@ -166,10 +203,20 @@ func (h *Handler) postSessionPlayingCommand(w http.ResponseWriter, r *http.Reque
 		httpx.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
+	if h.sessions != nil && !found {
+		writeJSONError(w, r, http.StatusNotFound, "session not found")
+		return
+	}
+	if r.ContentLength > maxSessionCommandBodyBytes {
+		httpx.Error(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
 	cmd := chi.URLParam(r, "Command")
 	var body map[string]any
-	_ = decodeOptionalJSON(r, &body)
-	h.recordRemoteCommand(sid, "PlayingCommand", cmd, body)
+	if err := decodeOptionalJSONLimit(r, &body, maxSessionCommandBodyBytes); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid or oversized request body")
+		return
+	}
 	wsPayload := map[string]any{
 		"Command": cmd,
 	}
@@ -194,8 +241,11 @@ func (h *Handler) postSessionSystemCommand(w http.ResponseWriter, r *http.Reques
 		httpx.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
+	if h.sessions != nil && !found {
+		writeJSONError(w, r, http.StatusNotFound, "session not found")
+		return
+	}
 	cmd := chi.URLParam(r, "Command")
-	h.recordRemoteCommand(sid, "SystemCommand", cmd, nil)
 	h.pushSessionWS(target, found, "GeneralCommand", map[string]any{
 		"Name": cmd,
 	})
@@ -209,15 +259,25 @@ func (h *Handler) postSessionCommand(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
+	if h.sessions != nil && !found {
+		writeJSONError(w, r, http.StatusNotFound, "session not found")
+		return
+	}
+	if r.ContentLength > maxSessionCommandBodyBytes {
+		httpx.Error(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
 	cmd := chi.URLParam(r, "Command")
 	var body map[string]any
-	_ = decodeOptionalJSON(r, &body)
+	if err := decodeOptionalJSONLimit(r, &body, maxSessionCommandBodyBytes); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid or oversized request body")
+		return
+	}
 	if cmd == "" && body != nil {
 		if name, ok := body["Name"].(string); ok {
 			cmd = name
 		}
 	}
-	h.recordRemoteCommand(sid, "GeneralCommand", cmd, body)
 	wsPayload := map[string]any{}
 	for k, v := range body {
 		wsPayload[k] = v
@@ -236,9 +296,20 @@ func (h *Handler) postSessionMessage(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
+	if h.sessions != nil && !found {
+		writeJSONError(w, r, http.StatusNotFound, "session not found")
+		return
+	}
+	if r.ContentLength > maxSessionCommandBodyBytes {
+		httpx.Error(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	var body map[string]any
-	_ = decodeOptionalJSON(r, &body)
+	if err := decodeOptionalJSONLimit(r, &body, maxSessionCommandBodyBytes); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid or oversized request body")
+		return
+	}
 	if body == nil {
 		body = map[string]any{}
 	}
@@ -248,7 +319,6 @@ func (h *Handler) postSessionMessage(w http.ResponseWriter, r *http.Request) {
 	if txt := q.Get("Text"); txt != "" {
 		body["Text"] = txt
 	}
-	h.recordRemoteCommand(sid, "Message", "DisplayMessage", body)
 	h.pushSessionWS(target, found, "GeneralCommand", map[string]any{
 		"Name":      "DisplayMessage",
 		"Arguments": body,
@@ -263,41 +333,52 @@ func (h *Handler) postSessionAddUser(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
-	if !found {
+	if h.sessions != nil && !found {
 		writeJSONError(w, r, http.StatusNotFound, "session not found")
 		return
 	}
 	uid := guid.Normalize(chi.URLParam(r, "UserId"))
-	h.mu.Lock()
-	if h.sessionUsers[sid] == nil {
-		if len(h.sessionUsers) >= maxSessionUsersEntries {
-			// Evict an entry to bound memory usage.
-			for k := range h.sessionUsers {
-				delete(h.sessionUsers, k)
-				break
+	if uid == "" {
+		httpx.Error(w, http.StatusBadRequest, "UserId is required")
+		return
+	}
+	if h.sessions != nil {
+		foundSess, err := h.sessions.AddAdditionalUser(r.Context(), sid, uid)
+		if err != nil {
+			if errors.Is(err, sqlite.ErrNotFound) {
+				writeJSONError(w, r, http.StatusNotFound, "user not found")
+				return
 			}
+			if errors.Is(err, auth.ErrUserDisabled) {
+				httpx.Error(w, http.StatusForbidden, "user is disabled")
+				return
+			}
+			httpx.Error(w, http.StatusInternalServerError, "failed to add additional user to session")
+			return
 		}
-		h.sessionUsers[sid] = make(map[string]bool)
+		if !foundSess {
+			writeJSONError(w, r, http.StatusNotFound, "session not found")
+			return
+		}
 	}
-	if len(h.sessionUsers[sid]) < maxSessionUsersEntries || h.sessionUsers[sid][uid] {
-		h.sessionUsers[sid][uid] = true
-	}
-	h.mu.Unlock()
 	httpx.NoContent(w)
 }
 
 func (h *Handler) deleteSessionUser(w http.ResponseWriter, r *http.Request) {
 	sid := chi.URLParam(r, "Id")
-	if _, _, allowed := h.authorizeSessionTarget(r, sid); !allowed {
+	_, found, allowed := h.authorizeSessionTarget(r, sid)
+	if !allowed {
 		httpx.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
-	uid := guid.Normalize(chi.URLParam(r, "UserId"))
-	h.mu.Lock()
-	if users, ok := h.sessionUsers[sid]; ok {
-		delete(users, uid)
+	if h.sessions != nil && !found {
+		writeJSONError(w, r, http.StatusNotFound, "session not found")
+		return
 	}
-	h.mu.Unlock()
+	uid := guid.Normalize(chi.URLParam(r, "UserId"))
+	if h.sessions != nil && uid != "" {
+		_ = h.sessions.RemoveAdditionalUser(sid, uid)
+	}
 	httpx.NoContent(w)
 }
 
@@ -425,6 +506,7 @@ func (h *Handler) postDevicesDelete(w http.ResponseWriter, r *http.Request) {
 		deviceID = strings.TrimSpace(body.Id)
 	}
 	if deviceID != "" {
+		wsHub := h.getWSHub()
 		if !h.isCallerAdmin(r) {
 			callerID := h.callerUserID(r)
 			if callerID == "" || !h.canAccessDevice(r, deviceID) {
@@ -441,8 +523,8 @@ func (h *Handler) postDevicesDelete(w http.ResponseWriter, r *http.Request) {
 			if h.sessions != nil {
 				h.sessions.RemoveSession(callerID, deviceID)
 			}
-			if h.wsHub != nil {
-				if disc, ok := h.wsHub.(interface{ DisconnectUserDevice(string, string) }); ok {
+			if wsHub != nil {
+				if disc, ok := wsHub.(interface{ DisconnectUserDevice(string, string) }); ok {
 					disc.DisconnectUserDevice(callerID, deviceID)
 				}
 			}
@@ -454,11 +536,14 @@ func (h *Handler) postDevicesDelete(w http.ResponseWriter, r *http.Request) {
 		} else if h.userRepo != nil {
 			_ = h.userRepo.DeleteTokensByDevice(r.Context(), deviceID)
 		}
+		if h.userRepo != nil {
+			_ = h.userRepo.DeleteDeviceArtifacts(r.Context(), deviceID)
+		}
 		if h.sessions != nil {
 			h.sessions.RemoveSessionByDevice(deviceID)
 		}
-		if h.wsHub != nil {
-			if disc, ok := h.wsHub.(interface{ DisconnectDevice(string) }); ok {
+		if wsHub != nil {
+			if disc, ok := wsHub.(interface{ DisconnectDevice(string) }); ok {
 				disc.DisconnectDevice(deviceID)
 			}
 		}
@@ -466,18 +551,112 @@ func (h *Handler) postDevicesDelete(w http.ResponseWriter, r *http.Request) {
 	httpx.NoContent(w)
 }
 
+func sanitizeCameraSegment(raw string, maxRunes int) (string, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" || s == "." || s == ".." || strings.Contains(s, "..") || strings.ContainsAny(s, `/\`) {
+		return "", false
+	}
+	var b strings.Builder
+	count := 0
+	for _, r := range s {
+		if unicode.IsControl(r) || r == 0 {
+			return "", false
+		}
+		switch {
+		case unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '_' || r == '.' || r == ' ':
+			b.WriteRune(r)
+			count++
+		default:
+			b.WriteRune('_')
+			count++
+		}
+		if maxRunes > 0 && count > maxRunes {
+			return "", false
+		}
+	}
+	out := strings.Trim(strings.TrimSpace(b.String()), ".")
+	if out == "" || out == "." || out == ".." {
+		return "", false
+	}
+	return out, true
+}
+
+func validateCameraUploadFilename(rawName string) (string, string, error) {
+	trimmed := strings.TrimSpace(rawName)
+	if trimmed == "" || strings.Contains(trimmed, "..") || strings.ContainsAny(trimmed, `/\`) {
+		return "", "", errors.New("invalid upload file Name")
+	}
+	for _, r := range trimmed {
+		if unicode.IsControl(r) || r == 0 {
+			return "", "", errors.New("upload file Name contains control characters")
+		}
+	}
+	ext := strings.ToLower(filepath.Ext(trimmed))
+	if !allowedCameraUploadExts[ext] {
+		return "", "", fmt.Errorf("unsupported camera upload file extension %q", ext)
+	}
+	stem := strings.TrimSuffix(trimmed, filepath.Ext(trimmed))
+	safeStem, ok := sanitizeCameraSegment(stem, 180)
+	if !ok {
+		return "", "", errors.New("invalid upload file Name")
+	}
+	return safeStem + ext, ext, nil
+}
+
+func (h *Handler) cameraUploadsRootDir() string {
+	if h.cfg != nil {
+		if dd := strings.TrimSpace(h.cfg.Snapshot().DataDir); dd != "" {
+			return filepath.Join(dd, "camera-uploads")
+		}
+	}
+	return filepath.Join(os.TempDir(), "ambra-camera-uploads")
+}
+
 func (h *Handler) getDeviceCameraUploads(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	deviceID := strings.TrimSpace(q.Get("DeviceId"))
+	if deviceID == "" {
+		httpx.Error(w, http.StatusBadRequest, "DeviceId is required")
+		return
+	}
 	if !h.canAccessDevice(r, deviceID) {
 		httpx.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
-	var files []map[string]any
-	_, _ = h.loadKV(r.Context(), "device_camera_uploads:"+deviceID, &files)
-	if files == nil {
-		files = []map[string]any{}
+	callerUID := h.callerUserID(r)
+	if callerUID == "" {
+		callerUID = h.resolveUserID(r, "")
 	}
+	if callerUID == "" {
+		writeJSONError(w, r, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	files := []map[string]any{}
+	if h.userRepo != nil {
+		records, err := h.userRepo.ListCameraUploads(r.Context(), callerUID, deviceID)
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to list camera uploads")
+			return
+		}
+		files = make([]map[string]any, 0, len(records))
+		for _, rec := range records {
+			files = append(files, map[string]any{
+				"Id":         rec.FileID,
+				"Name":       rec.Name,
+				"Album":      rec.Album,
+				"MimeType":   rec.MimeType,
+				"Size":       rec.FileSize,
+				"UploadedAt": rec.CreatedAt.UTC().Format(time.RFC3339),
+			})
+		}
+	} else {
+		_, _ = h.loadKV(r.Context(), "device_camera_uploads:"+callerUID+":"+deviceID, &files)
+		if files == nil {
+			files = []map[string]any{}
+		}
+	}
+
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"DeviceId":      deviceID,
 		"FilesUploaded": files,
@@ -487,27 +666,172 @@ func (h *Handler) getDeviceCameraUploads(w http.ResponseWriter, r *http.Request)
 func (h *Handler) postDeviceCameraUploads(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	deviceID := strings.TrimSpace(q.Get("DeviceId"))
+	if deviceID == "" {
+		httpx.Error(w, http.StatusBadRequest, "DeviceId is required")
+		return
+	}
 	if !h.canAccessDevice(r, deviceID) {
 		httpx.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
-	key := "device_camera_uploads:" + deviceID
-	entry := map[string]any{
-		"Id":         q.Get("Id"),
-		"Name":       q.Get("Name"),
-		"Album":      q.Get("Album"),
-		"UploadedAt": time.Now().UTC().Format(time.RFC3339),
+	callerUID := h.callerUserID(r)
+	if callerUID == "" {
+		callerUID = h.resolveUserID(r, "")
 	}
-	h.mu.Lock()
-	var files []map[string]any
-	_, _ = h.loadKVLocked(r.Context(), key, &files)
-	files = append(files, entry)
-	if len(files) > maxCameraUploadsEntries {
-		files = files[len(files)-maxCameraUploadsEntries:]
+	if callerUID == "" {
+		writeJSONError(w, r, http.StatusUnauthorized, "authentication required")
+		return
 	}
-	_ = h.saveKVLocked(r.Context(), key, files)
-	h.mu.Unlock()
+
+	safeName, ext, err := validateCameraUploadFilename(q.Get("Name"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	rawAlbum := strings.TrimSpace(q.Get("Album"))
+	if rawAlbum == "" {
+		rawAlbum = "Camera Roll"
+	}
+	safeAlbum, ok := sanitizeCameraSegment(rawAlbum, 128)
+	if !ok {
+		httpx.Error(w, http.StatusBadRequest, "invalid camera upload Album")
+		return
+	}
+	fileID := strings.TrimSpace(q.Get("Id"))
+	if fileID == "" {
+		fileID = safeName
+	}
+	if len([]rune(fileID)) > 256 || authControlCharsPresent(fileID) {
+		httpx.Error(w, http.StatusBadRequest, "invalid camera upload Id")
+		return
+	}
+
+	if r.ContentLength > maxCameraUploadBytes {
+		httpx.Error(w, http.StatusRequestEntityTooLarge, "camera upload exceeds 512 MiB limit")
+		return
+	}
+	if r.Body == nil {
+		httpx.Error(w, http.StatusBadRequest, "camera upload body cannot be empty")
+		return
+	}
+
+	safeUserDir := sanitizeFilename(callerUID)
+	rootDir := h.cameraUploadsRootDir()
+	albumDir := filepath.Join(rootDir, safeUserDir, safeAlbum)
+	relCheck, relErr := filepath.Rel(rootDir, albumDir)
+	if relErr != nil || strings.HasPrefix(relCheck, "..") {
+		httpx.Error(w, http.StatusBadRequest, "unsafe upload destination")
+		return
+	}
+	if err := os.MkdirAll(albumDir, 0o750); err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to prepare camera upload directory")
+		return
+	}
+
+	tmpFile, err := os.CreateTemp(albumDir, ".upload-*.tmp")
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to create temporary upload file")
+		return
+	}
+	tmpPath := tmpFile.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	_ = tmpFile.Chmod(0o600)
+
+	limitedBody := http.MaxBytesReader(w, r.Body, maxCameraUploadBytes)
+	written, copyErr := io.Copy(tmpFile, limitedBody)
+	syncErr := tmpFile.Sync()
+	closeErr := tmpFile.Close()
+	if copyErr != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(copyErr, &maxErr) {
+			httpx.Error(w, http.StatusRequestEntityTooLarge, "camera upload exceeds 512 MiB limit")
+			return
+		}
+		httpx.Error(w, http.StatusBadRequest, "failed to read camera upload stream")
+		return
+	}
+	if written <= 0 {
+		httpx.Error(w, http.StatusBadRequest, "camera upload body cannot be empty")
+		return
+	}
+	if syncErr != nil || closeErr != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to flush camera upload file")
+		return
+	}
+
+	finalPath := filepath.Join(albumDir, safeName)
+	relFileCheck, relFileErr := filepath.Rel(albumDir, finalPath)
+	if relFileErr != nil || strings.HasPrefix(relFileCheck, "..") || strings.ContainsAny(relFileCheck, `/\`) {
+		httpx.Error(w, http.StatusBadRequest, "unsafe upload file name")
+		return
+	}
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to finalize camera upload file")
+		return
+	}
+	cleanupTmp = false
+
+	contentType := strings.TrimSpace(r.Header.Get("Content-Type"))
+	if contentType == "" || strings.HasPrefix(strings.ToLower(contentType), "application/json") {
+		if guessed := mime.TypeByExtension(ext); guessed != "" {
+			contentType = guessed
+		} else {
+			contentType = "application/octet-stream"
+		}
+	}
+	relPath := filepath.ToSlash(filepath.Join("camera-uploads", safeUserDir, safeAlbum, safeName))
+
+	if h.userRepo != nil {
+		if err := h.userRepo.UpsertCameraUpload(r.Context(), &sqlite.CameraUploadRecord{
+			UserID:   callerUID,
+			DeviceID: deviceID,
+			FileID:   fileID,
+			Name:     safeName,
+			Album:    safeAlbum,
+			MimeType: contentType,
+			FilePath: relPath,
+			FileSize: written,
+		}); err != nil {
+			_ = os.Remove(finalPath)
+			httpx.Error(w, http.StatusInternalServerError, "failed to record camera upload")
+			return
+		}
+	} else {
+		kvKey := "device_camera_uploads:" + callerUID + ":" + deviceID
+		entry := map[string]any{
+			"Id":         fileID,
+			"Name":       safeName,
+			"Album":      safeAlbum,
+			"MimeType":   contentType,
+			"Size":       written,
+			"UploadedAt": time.Now().UTC().Format(time.RFC3339),
+		}
+		h.mu.Lock()
+		var files []map[string]any
+		_, _ = h.loadKVLocked(r.Context(), kvKey, &files)
+		files = append(files, entry)
+		if len(files) > maxCameraUploadsEntries {
+			files = files[len(files)-maxCameraUploadsEntries:]
+		}
+		_ = h.saveKVLocked(r.Context(), kvKey, files)
+		h.mu.Unlock()
+	}
+
 	httpx.NoContent(w)
+}
+
+func authControlCharsPresent(s string) bool {
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			return true
+		}
+	}
+	return false
 }
 
 // --- /Auth ---
@@ -521,10 +845,24 @@ func (h *Handler) getAuthProviders(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) deleteAuthKey(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimSpace(chi.URLParam(r, "Key"))
 	if key != "" {
-		if h.authSvc != nil {
+		var deletedToken string
+		if h.userRepo != nil {
+			deletedToken, _ = h.userRepo.DeleteAPIKeyByIDOrToken(r.Context(), key)
+		} else if h.authSvc != nil {
 			_ = h.authSvc.RevokeAPIKey(r.Context(), key)
-		} else if h.userRepo != nil {
-			_ = h.userRepo.DeleteAPIKey(r.Context(), key)
+			deletedToken = key
+		}
+		evictTok := deletedToken
+		if evictTok == "" {
+			evictTok = key
+		}
+		if h.authSvc != nil {
+			h.authSvc.InvalidateAPIKey(evictTok)
+		}
+		if wsHub := h.getWSHub(); wsHub != nil {
+			if disc, ok := wsHub.(interface{ DisconnectToken(string) }); ok {
+				disc.DisconnectToken(evictTok)
+			}
 		}
 	}
 	httpx.NoContent(w)

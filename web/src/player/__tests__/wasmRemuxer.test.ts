@@ -8,6 +8,9 @@ import {
   formatBytes,
   getPreferWasmRemux,
   needsClientRemux,
+  probeLocalCoreAvailable,
+  resetLocalCoreProbeCache,
+  resolveLocalCoreBase,
   setPreferWasmRemux,
   WASM_REMUX_PREF_KEY,
   WasmRemuxer,
@@ -315,6 +318,39 @@ describe('wasmRemuxer - H-07 完整性校验、HTML/404 快速失败与 VFS 泄�
     expect(deleteFileSpy).toHaveBeenCalledWith('input.ts')
     expect(deleteFileSpy).toHaveBeenCalledWith('output.mp4')
 
+    remuxer.dispose()
+  })
+
+  it('[H-01 & L-08] resolveLocalCoreBase 适配 BASE_URL，probeLocalCoreAvailable 优雅探测缓存，且跨源重定向被立即阻断', async () => {
+    expect(resolveLocalCoreBase('/')).toBe('/ffmpeg')
+    expect(resolveLocalCoreBase('/web/')).toBe('/web/ffmpeg')
+    expect(resolveLocalCoreBase('./')).toBe('./ffmpeg')
+
+    resetLocalCoreProbeCache()
+    const headSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(
+        new Response(null, {
+          status: 200,
+          headers: { 'content-type': 'text/html' }, // SPA fallback HTML -> not available
+        }),
+      )
+    expect(await probeLocalCoreAvailable('/ffmpeg')).toBe(false)
+    // 命中缓存，不重复发 HEAD 请求
+    expect(await probeLocalCoreAvailable('/ffmpeg')).toBe(false)
+    expect(headSpy).toHaveBeenCalledTimes(1)
+    resetLocalCoreProbeCache()
+
+    // 跨源重定向阻断测试
+    const redirectedRes = new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 })
+    Object.defineProperty(redirectedRes, 'redirected', { value: true })
+    Object.defineProperty(redirectedRes, 'url', { value: 'https://thirdparty.example.org/v.ts' })
+    headSpy.mockResolvedValueOnce(redirectedRes)
+
+    const remuxer = new WasmRemuxer()
+    await expect(remuxer.remuxToMP4('/emby/Videos/strm/stream')).rejects.toSatisfy(
+      (err: unknown) => err instanceof WasmRemuxFallbackError && err.reason === 'fetch_failed',
+    )
     remuxer.dispose()
   })
 })

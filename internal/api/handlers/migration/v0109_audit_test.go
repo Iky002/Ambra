@@ -7,9 +7,9 @@ import (
 
 func TestMigrationV0109AuditL15RedactPasswordWithAtSign(t *testing.T) {
 	cases := []struct {
-		in      string
-		want    string
-		forbid  []string
+		in     string
+		want   string
+		forbid []string
 	}{
 		{
 			in:     `dial failed: Get "https://admin:p@ss@w0rd@emby.example.com:8096/System/Info": EOF`,

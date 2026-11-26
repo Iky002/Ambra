@@ -1,8 +1,12 @@
 package notifications
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,13 +24,16 @@ import (
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/pkg/i18n"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
 const (
-	stateConfigKey        = "notifications:state"
-	maxNotifications      = 500
-	maxAdminNotifications = 200
+	stateConfigKey           = "notifications:state"
+	compatExtStateConfigKey  = "compatext:state"
+	maxNotifications         = 500
+	maxAdminNotifications    = 200
+	notifHTTPDeliveryTimeout = 10 * time.Second
 )
 
 // AuthFuncs decouples route registration from the concrete middleware package.
@@ -37,11 +44,11 @@ type AuthFuncs struct {
 }
 
 type NotificationTypeInfo struct {
-	Type        string `json:"Type"`
-	Name        string `json:"Name"`
-	Enabled     bool   `json:"Enabled"`
-	Category    string `json:"Category"`
-	IsBasedOn   bool   `json:"IsBasedOnUserEvent"`
+	Type      string `json:"Type"`
+	Name      string `json:"Name"`
+	Enabled   bool   `json:"Enabled"`
+	Category  string `json:"Category"`
+	IsBasedOn bool   `json:"IsBasedOnUserEvent"`
 }
 
 type NameIdPair struct {
@@ -78,8 +85,16 @@ type notificationsState struct {
 }
 
 type Handler struct {
-	store *sqlite.Store
-	auth  AuthFuncs
+	store            *sqlite.Store
+	auth             AuthFuncs
+	httpClient       *http.Client
+	customHTTPClient bool
+
+	dispatchMu     sync.Mutex
+	dispatchClosed bool
+	dispatchCtx    context.Context
+	dispatchCancel context.CancelFunc
+	dispatchWG     sync.WaitGroup
 
 	mu                   sync.RWMutex
 	state                notificationsState
@@ -87,12 +102,72 @@ type Handler struct {
 }
 
 func New(store *sqlite.Store) *Handler {
+	ctx, cancel := context.WithCancel(context.Background())
 	h := &Handler{
 		store:                store,
+		httpClient:           netutil.NewSafeHTTPClientNoLoopback(notifHTTPDeliveryTimeout, true),
+		dispatchCtx:          ctx,
+		dispatchCancel:       cancel,
 		notifiedTaskFailures: make(map[string]struct{}),
 	}
 	h.loadState(context.Background())
 	return h
+}
+
+// SetHTTPClient overrides the HTTP client used for outbound notification service delivery (primarily for testing).
+func (h *Handler) SetHTTPClient(client *http.Client) {
+	if client == nil {
+		return
+	}
+	h.mu.Lock()
+	h.httpClient = client
+	h.customHTTPClient = true
+	h.mu.Unlock()
+}
+
+// Close cancels any in-flight outbound HTTP notification deliveries and waits for completion.
+func (h *Handler) Close() {
+	h.dispatchMu.Lock()
+	if h.dispatchClosed {
+		h.dispatchMu.Unlock()
+		return
+	}
+	h.dispatchClosed = true
+	cancel := h.dispatchCancel
+	h.dispatchCancel = nil
+	h.dispatchMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	h.dispatchWG.Wait()
+}
+
+// PurgeUser removes in-memory and persisted notifications targeted to userID and strips userID from ReadBy lists.
+func (h *Handler) PurgeUser(ctx context.Context, userID string) {
+	norm := guid.Normalize(userID)
+	if norm == "" {
+		return
+	}
+	h.mu.Lock()
+	changed := false
+	kept := make([]Notification, 0, len(h.state.Items))
+	for _, n := range h.state.Items {
+		if n.UserId != "" && guid.Normalize(n.UserId) == norm {
+			changed = true
+			continue
+		}
+		if len(n.ReadBy) > 0 && containsString(n.ReadBy, norm) {
+			n.ReadBy = setReadBy(n.ReadBy, norm, false)
+			changed = true
+		}
+		kept = append(kept, n)
+	}
+	if changed {
+		h.state.Items = kept
+		_ = h.saveStateLocked(ctx)
+	}
+	h.mu.Unlock()
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
@@ -450,6 +525,10 @@ func (h *Handler) handleSendAdmin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) appendNotification(ctx context.Context, n Notification) error {
+	return h.appendNotificationWithEvent(ctx, n, "")
+}
+
+func (h *Handler) appendNotificationWithEvent(ctx context.Context, n Notification, eventName string) error {
 	if n.Id == "" {
 		n.Id = guid.New()
 	}
@@ -467,7 +546,161 @@ func (h *Handler) appendNotification(ctx context.Context, n Notification) error 
 		h.state = snapshot
 	}
 	h.mu.Unlock()
+	if err == nil {
+		h.dispatchConfiguredNotificationServices(ctx, n, eventName)
+	}
 	return err
+}
+
+type configuredNotifService struct {
+	Id          string            `json:"Id"`
+	Name        string            `json:"Name"`
+	ServiceType string            `json:"ServiceType"`
+	UserId      string            `json:"UserId"`
+	Enabled     bool              `json:"Enabled"`
+	Events      []string          `json:"Events"`
+	Options     map[string]string `json:"Options"`
+}
+
+func configuredServiceURL(opts map[string]string) string {
+	for _, k := range []string{"Url", "url", "WebhookUrl", "webhookUrl", "Endpoint", "endpoint"} {
+		if v := strings.TrimSpace(opts[k]); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func matchesConfiguredEvents(events []string, eventName, notifName string) bool {
+	if len(events) == 0 {
+		return true
+	}
+	for _, ev := range events {
+		ev = strings.TrimSpace(ev)
+		if ev == "*" || (eventName != "" && strings.EqualFold(ev, eventName)) || strings.EqualFold(ev, notifName) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) dispatchConfiguredNotificationServices(ctx context.Context, n Notification, eventName string) {
+	if h.store == nil || h.store.Reader == nil {
+		return
+	}
+	var raw string
+	err := h.store.Reader.QueryRowContext(ctx,
+		`SELECT value_json FROM server_config WHERE key = ?`, compatExtStateConfigKey,
+	).Scan(&raw)
+	if err != nil || raw == "" {
+		return
+	}
+	var st struct {
+		NotificationServices []configuredNotifService `json:"notification_services"`
+	}
+	if err := json.Unmarshal([]byte(raw), &st); err != nil || len(st.NotificationServices) == 0 {
+		return
+	}
+
+	h.mu.RLock()
+	client := h.httpClient
+	customClient := h.customHTTPClient
+	h.mu.RUnlock()
+	if client == nil {
+		client = netutil.NewSafeHTTPClientNoLoopback(notifHTTPDeliveryTimeout, true)
+	}
+
+	var targets []configuredNotifService
+	for _, svc := range st.NotificationServices {
+		if !svc.Enabled {
+			continue
+		}
+		targetURL := configuredServiceURL(svc.Options)
+		if targetURL == "" {
+			continue
+		}
+		if n.AdminOnly && svc.UserId != "" {
+			continue
+		}
+		if n.UserId != "" && svc.UserId != "" && guid.Normalize(svc.UserId) != guid.Normalize(n.UserId) {
+			continue
+		}
+		if !matchesConfiguredEvents(svc.Events, eventName, n.Name) {
+			continue
+		}
+		if customClient {
+			if err := netutil.ValidateRemoteURL(targetURL, true); err != nil {
+				continue
+			}
+		} else {
+			if err := netutil.ValidateRemoteURLNoLoopback(targetURL, true); err != nil {
+				continue
+			}
+		}
+		targets = append(targets, svc)
+	}
+	if len(targets) == 0 {
+		return
+	}
+
+	evType := eventName
+	if evType == "" {
+		evType = "AdminNotification"
+	}
+	payloadBytes, err := json.Marshal(map[string]any{
+		"Event":       evType,
+		"Id":          n.Id,
+		"Title":       n.Name,
+		"Name":        n.Name,
+		"Description": n.Description,
+		"Level":       n.Level,
+		"Date":        n.Date.Format(time.RFC3339),
+		"Url":         n.Url,
+	})
+	if err != nil {
+		return
+	}
+
+	h.dispatchMu.Lock()
+	if h.dispatchClosed {
+		h.dispatchMu.Unlock()
+		return
+	}
+	baseCtx := h.dispatchCtx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	h.dispatchWG.Add(len(targets))
+	h.dispatchMu.Unlock()
+
+	for _, svc := range targets {
+		svcCopy := svc
+		go func() {
+			defer h.dispatchWG.Done()
+			reqCtx, cancel := context.WithTimeout(baseCtx, notifHTTPDeliveryTimeout)
+			defer cancel()
+			targetURL := configuredServiceURL(svcCopy.Options)
+			req, reqErr := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, bytes.NewReader(payloadBytes))
+			if reqErr != nil {
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Ambra-Notification", evType)
+			if secret := strings.TrimSpace(svcCopy.Options["Secret"]); secret != "" {
+				mac := hmac.New(sha256.New, []byte(secret))
+				mac.Write(payloadBytes)
+				req.Header.Set("X-Ambra-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+			} else if tok := strings.TrimSpace(svcCopy.Options["Token"]); tok != "" {
+				req.Header.Set("Authorization", "Bearer "+tok)
+			}
+			resp, doErr := client.Do(req)
+			if doErr != nil {
+				return
+			}
+			defer resp.Body.Close()
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		}()
+	}
 }
 
 func (h *Handler) trimNotificationsLocked() {
@@ -529,12 +762,12 @@ func (h *Handler) SubscribeEvents(bus *eventbus.Bus) {
 				desc = fmt.Sprintf("Library updated: %d added, %d updated, %d deleted", added, updated, deleted)
 			}
 		}
-		h.appendNotification(ctx, Notification{
+		_ = h.appendNotificationWithEvent(ctx, Notification{
 			Name:        "Library Updated",
 			Description: desc,
 			Level:       "Normal",
 			AdminOnly:   true,
-		})
+		}, string(eventbus.EventLibraryChanged))
 	})
 
 	bus.Subscribe(eventbus.EventTaskProgress, func(ctx context.Context, e eventbus.Event) {
@@ -585,12 +818,12 @@ func (h *Handler) SubscribeEvents(bus *eventbus.Bus) {
 			if desc == "" {
 				desc = name + " failed"
 			}
-			_ = h.appendNotification(ctx, Notification{
+			_ = h.appendNotificationWithEvent(ctx, Notification{
 				Name:        name + " Failed",
 				Description: desc,
 				Level:       "Error",
 				AdminOnly:   true,
-			})
+			}, "TaskFailed")
 		}
 	})
 
@@ -614,12 +847,12 @@ func (h *Handler) SubscribeEvents(bus *eventbus.Bus) {
 			}
 			desc, _ := p["Description"].(string)
 			level, _ := p["Level"].(string)
-			_ = h.appendNotification(ctx, Notification{
+			_ = h.appendNotificationWithEvent(ctx, Notification{
 				UserId:      normUID,
 				Name:        strings.TrimSpace(name),
 				Description: strings.TrimSpace(desc),
 				Level:       level,
-			})
+			}, string(eventbus.EventUserDataChanged))
 		}
 	})
 }
@@ -644,12 +877,12 @@ func (h *Handler) recordUserDataChangedNotification(ctx context.Context, p sessi
 			desc = fmt.Sprintf("Updated user data for item %s", entry.ItemId)
 		}
 	}
-	_ = h.appendNotification(ctx, Notification{
+	_ = h.appendNotificationWithEvent(ctx, Notification{
 		UserId:      normUID,
 		Name:        name,
 		Description: desc,
 		Level:       "Normal",
-	})
+	}, string(eventbus.EventUserDataChanged))
 }
 
 func toInt(v any) int {

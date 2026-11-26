@@ -2,7 +2,12 @@ package dvr
 
 import (
 	"context"
+	"net"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestAuditV0109_H05_DenyPrivateLANEnforced(t *testing.T) {
@@ -31,5 +36,30 @@ func TestAuditV0109_H05_DenyPrivateLANEnforced(t *testing.T) {
 		DenyPrivateLAN: false,
 	}); err != nil {
 		t.Fatalf("expected private LAN URL to be allowed when DenyPrivateLAN=false, got: %v", err)
+	}
+}
+
+func TestC02_RealFFmpegAcceptsMaxRedirects(t *testing.T) {
+	ffmpegPath, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg not found in PATH")
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	args := DefaultArgsBuilder(RecordingJob{
+		TimerID:   "smoke",
+		StreamURL: "http://" + addr + "/closed.ts",
+		Duration:  time.Second,
+	}, filepath.Join(t.TempDir(), "out.mkv"))
+	out, _ := exec.CommandContext(ctx, ffmpegPath, args...).CombinedOutput()
+	if strings.Contains(string(out), "Unrecognized option") || strings.Contains(string(out), "Option not found") {
+		t.Fatalf("ffmpeg rejected DVR DefaultArgsBuilder options: %s", string(out))
 	}
 }

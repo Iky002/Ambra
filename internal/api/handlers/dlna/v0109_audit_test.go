@@ -14,8 +14,15 @@ import (
 	"time"
 
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
+
+type roundTripFuncDLNA func(*http.Request) (*http.Response, error)
+
+func (f roundTripFuncDLNA) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
 
 func TestDLNAV0109AuditM21M22M28(t *testing.T) {
 	h, mux, libRepo, store := setupDLNATestEnv(t)
@@ -132,8 +139,14 @@ func TestDLNAV0109AuditM21M22M28(t *testing.T) {
 		t.Fatalf("M-22: expected 404 for directory target, got %d", rec.Code)
 	}
 
-	// 4. M-22: Optional default user policy filtering (EnabledFolders & BlockedTags)
+	// 4. M-22 & H-02: Unauthenticated least-privilege intersection when DLNADefaultUserID is NOT set!
 	userRepo := sqlite.NewUserRepo(store)
+	adminUser := &sqlite.UserRecord{
+		Name:    "admin_dlna",
+		IsAdmin: true,
+		Policy:  sqlite.DefaultUserPolicy(true),
+		Config:  sqlite.DefaultUserConfig(),
+	}
 	kidUser := &sqlite.UserRecord{
 		Name:   "kid_dlna",
 		Policy: sqlite.DefaultUserPolicy(false),
@@ -141,9 +154,12 @@ func TestDLNAV0109AuditM21M22M28(t *testing.T) {
 	}
 	kidUser.Policy.EnableAllFolders = false
 	kidUser.Policy.EnabledFolders = []string{libAllowed.ID}
+	maxPG := 5
+	kidUser.Policy.MaxParentalRating = &maxPG
+	_ = userRepo.CreateUser(ctx, adminUser)
 	_ = userRepo.CreateUser(ctx, kidUser)
 	h.SetUserRepo(userRepo)
-	h.SetDefaultUserID(kidUser.ID)
+	// Note: even BEFORE SetDefaultUserID is called, H-02 intersection policy restricts unauthenticated DLNA to Kids only!
 
 	sendSOAP := func(ip, action, body string) *httptest.ResponseRecorder {
 		envelope := fmt.Sprintf(`<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:%s xmlns:u="%s">%s</u:%s></s:Body></s:Envelope>`,
@@ -156,12 +172,108 @@ func TestDLNAV0109AuditM21M22M28(t *testing.T) {
 		return rec
 	}
 
+	recIntersect := sendSOAP("192.168.1.39", "Browse", `<ObjectID>0</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><StartingIndex>0</StartingIndex><RequestedCount>10</RequestedCount>`)
+	if recIntersect.Code != http.StatusOK || !strings.Contains(recIntersect.Body.String(), "Kids") || strings.Contains(recIntersect.Body.String(), "Adults") {
+		t.Fatalf("H-02: expected strictest intersection policy (without DLNADefaultUserID) to expose Kids only, got %d %s", recIntersect.Code, recIntersect.Body.String())
+	}
+
+	// Explicit SetDefaultUserID also continues to work
+	h.SetDefaultUserID(kidUser.ID)
+
 	recRoot := sendSOAP("192.168.1.40", "Browse", `<ObjectID>0</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><StartingIndex>0</StartingIndex><RequestedCount>10</RequestedCount>`)
 	if recRoot.Code != http.StatusOK || !strings.Contains(recRoot.Body.String(), "Kids") || strings.Contains(recRoot.Body.String(), "Adults") {
 		t.Fatalf("M-22: expected default user policy to filter root libraries to Kids only, got %d %s", recRoot.Code, recRoot.Body.String())
 	}
 	if rec := streamItem(adultItem.ID); rec.Code != http.StatusNotFound {
 		t.Fatalf("M-22: expected 404 streaming restricted library item under default user policy, got %d", rec.Code)
+	}
+
+	// 4b. [H-02 & L-01] .strm server-side Range reverse-proxy (no 302 leak), albumArtURI, BoxSet/Playlist browse, and GENA NOTIFY
+	upstreamPayload := []byte("0123456789STRMPROXY")
+	upstreamStrmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "cloud.mp4", time.Now(), bytes.NewReader(upstreamPayload))
+	}))
+	defer upstreamStrmSrv.Close()
+	h.SetProxyClient(upstreamStrmSrv.Client())
+	h.SetStreamResolverWithHeaders(func(_ context.Context, rawPath string) (*plugins.StreamResolveResult, error) {
+		if strings.HasSuffix(rawPath, "valid_cloud.strm") {
+			return &plugins.StreamResolveResult{URL: upstreamStrmSrv.URL + "/signed/cloud.mp4?token=secret", Is302: true}, nil
+		}
+		return nil, fmt.Errorf("unexpected strm")
+	})
+	// Note: ValidateRemoteURL blocks loopback unless resolved or tested; use public IP URL with custom RoundTripper
+	h.SetStreamResolverWithHeaders(func(_ context.Context, rawPath string) (*plugins.StreamResolveResult, error) {
+		if strings.HasSuffix(rawPath, "valid_cloud.strm") {
+			return &plugins.StreamResolveResult{URL: "https://93.184.216.34/signed/cloud.mp4?token=secret", Is302: true}, nil
+		}
+		return nil, fmt.Errorf("unexpected strm")
+	})
+	h.SetProxyClient(&http.Client{
+		Transport: roundTripFuncDLNA(func(req *http.Request) (*http.Response, error) {
+			rec := httptest.NewRecorder()
+			http.ServeContent(rec, req, "cloud.mp4", time.Unix(1700000000, 0), bytes.NewReader(upstreamPayload))
+			return rec.Result(), nil
+		}),
+	})
+	validStrmPath := filepath.Join(libDir, "valid_cloud.strm")
+	_ = os.WriteFile(validStrmPath, []byte("https://93.184.216.34/signed/cloud.mp4?token=secret\n"), 0o644)
+	validStrmItem := &sqlite.ItemRecord{ID: guid.New(), LibraryID: libAllowed.ID, ParentID: libAllowed.ID, Type: "Movie", MediaType: "Video", Name: "Cloud Film", OfficialRating: "G", Path: validStrmPath, IsStrm: true}
+	_ = libRepo.UpsertItem(ctx, validStrmItem)
+	_ = libRepo.UpsertImage(ctx, &sqlite.ImageRecord{ItemID: okItem.ID, ImageType: "Primary", ImageIndex: 0, Path: okFile, Tag: "arttag99"})
+
+	exp := time.Now().UTC().Add(time.Hour).Unix()
+	sigCloud := h.signStreamToken(validStrmItem.ID, exp)
+	reqCloud := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/Dlna/srv-1/stream/%s?exp=%d&sig=%s", validStrmItem.ID, exp, sigCloud), nil)
+	reqCloud.RemoteAddr = "192.168.1.50:23456"
+	reqCloud.Header.Set("Range", "bytes=10-18")
+	recCloud := httptest.NewRecorder()
+	mux.ServeHTTP(recCloud, reqCloud)
+	if recCloud.Code != http.StatusPartialContent || recCloud.Body.String() != "STRMPROXY" || recCloud.Header().Get("Location") != "" {
+		t.Fatalf("H-02: expected 206 server-side reverse proxy without 302 Location, got code=%d loc=%q body=%q", recCloud.Code, recCloud.Header().Get("Location"), recCloud.Body.String())
+	}
+
+	// BoxSet BrowseDirectChildren + albumArtURI with tag
+	box, _ := libRepo.CreateCollection(ctx, "Kids Box", "", []string{okItem.ID, adultItem.ID})
+	recBox := sendSOAP("192.168.1.42", "Browse", fmt.Sprintf(`<ObjectID>%s</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><StartingIndex>0</StartingIndex><RequestedCount>10</RequestedCount>`, box.ID))
+	if recBox.Code != http.StatusOK || !strings.Contains(recBox.Body.String(), "Kids Film") || strings.Contains(recBox.Body.String(), "Adult Film") || !strings.Contains(recBox.Body.String(), "albumArtURI") || !strings.Contains(recBox.Body.String(), "tag=arttag99") {
+		t.Fatalf("L-01: expected BoxSet browse to return Kids Film with albumArtURI tag and hide Adult Film, got %d %s", recBox.Code, recBox.Body.String())
+	}
+
+	// GENA NOTIFY callback delivery & loopback/public callback rejection
+	for _, rejectedCB := range []string{"<http://127.0.0.1:9000/cb>", "<http://93.184.216.34:9000/cb>"} {
+		if isValidDLNACallback(rejectedCB) {
+			t.Fatalf("L-01: expected callback %s to be rejected (only private LAN IPs allowed)", rejectedCB)
+		}
+	}
+	notifyCh := make(chan string, 2)
+	h.SetNotifyClient(&http.Client{
+		Transport: roundTripFuncDLNA(func(req *http.Request) (*http.Response, error) {
+			if req.Method == "NOTIFY" && req.Header.Get("NT") == "upnp:event" && req.Header.Get("NTS") == "upnp:propchange" {
+				var buf bytes.Buffer
+				_, _ = buf.ReadFrom(req.Body)
+				notifyCh <- buf.String()
+			}
+			rec := httptest.NewRecorder()
+			rec.WriteHeader(http.StatusOK)
+			return rec.Result(), nil
+		}),
+	})
+	reqNotifySub := httptest.NewRequest("SUBSCRIBE", "/Dlna/srv-1/contentdirectory/events", nil)
+	reqNotifySub.RemoteAddr = "192.168.1.88:5000"
+	reqNotifySub.Header.Set("CALLBACK", "<http://192.168.1.88:8888/upnp/event>")
+	recNotifySub := httptest.NewRecorder()
+	mux.ServeHTTP(recNotifySub, reqNotifySub)
+	if recNotifySub.Code != http.StatusOK {
+		t.Fatalf("SUBSCRIBE for notify test got %d", recNotifySub.Code)
+	}
+	newUID := h.BumpSystemUpdate()
+	select {
+	case notifyBody := <-notifyCh:
+		if !strings.Contains(notifyBody, fmt.Sprintf("<SystemUpdateID>%d</SystemUpdateID>", newUID)) {
+			t.Fatalf("unexpected GENA NOTIFY XML body: %s", notifyBody)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for async GENA NOTIFY callback")
 	}
 
 	// 5. M-21: SOAP per-IP rate limiting

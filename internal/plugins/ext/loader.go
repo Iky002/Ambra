@@ -24,6 +24,7 @@ type ExternalManifest struct {
 	Description string         `json:"Description"`
 	Author      string         `json:"Author,omitempty"`
 	Endpoint    string         `json:"Endpoint"`
+	WasmFile    string         `json:"WasmFile,omitempty"`
 	APIKey      string         `json:"ApiKey,omitempty"`
 	TimeoutMs   int            `json:"TimeoutMs,omitempty"`
 	Priority    int            `json:"Priority"`
@@ -94,6 +95,9 @@ func (l *Loader) LoadFromDir(dir string, reg *plugins.Registry) (int, error) {
 		var m ExternalManifest
 		if err := json.Unmarshal(raw, &m); err != nil {
 			errs = append(errs, fmt.Errorf("parse %s: %w", manifestPath, err))
+			continue
+		}
+		if strings.TrimSpace(m.WasmFile) != "" && strings.TrimSpace(m.Endpoint) == "" {
 			continue
 		}
 

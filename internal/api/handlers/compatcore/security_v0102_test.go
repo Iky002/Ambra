@@ -13,6 +13,7 @@ import (
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/auth"
 	"github.com/ambra-media/ambra/internal/core/session"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -89,12 +90,24 @@ func TestDeviceIDSpoofingAndPublicRateLimitBypassBlocked(t *testing.T) {
 		t.Fatalf("alice own device info expected 200, got %d", recOwn.Code)
 	}
 
-	// 2. Direct public IP spoofing different X-Forwarded-For/X-Real-IP on every request MUST still hit 429
+	// 2a. Public IP spoofing X-Forwarded-For: 127.0.0.1 MUST be rejected by LAN gate (403)
+	reqPubSpoof := httptest.NewRequest(http.MethodPost, "/Users/ForgotPassword", strings.NewReader(`{"EnteredUsername":"alice"}`))
+	reqPubSpoof.RemoteAddr = "203.0.113.88:50000"
+	reqPubSpoof.Header.Set("X-Forwarded-For", "127.0.0.1")
+	recPubSpoof := httptest.NewRecorder()
+	router.ServeHTTP(recPubSpoof, reqPubSpoof)
+	if recPubSpoof.Code != http.StatusForbidden {
+		t.Fatalf("public IP spoofing X-Forwarded-For must be blocked with 403, got %d", recPubSpoof.Code)
+	}
+
+	// 2b. Untrusted LAN IP spoofing different X-Forwarded-For/X-Real-IP on every request MUST still hit 429
+	netutil.SetLocalNetworkSubnets([]string{"192.168.0.0/16"})
+	t.Cleanup(func() { netutil.SetLocalNetworkSubnets(nil) })
 	for i := 0; i < forgotPasswordRateLimit; i++ {
 		req := httptest.NewRequest(http.MethodPost, "/Users/ForgotPassword", strings.NewReader(`{"EnteredUsername":"alice"}`))
-		req.RemoteAddr = "203.0.113.88:50000"
-		req.Header.Set("X-Forwarded-For", fmt.Sprintf("198.51.100.%d", i+1))
-		req.Header.Set("X-Real-IP", fmt.Sprintf("198.51.100.%d", i+100))
+		req.RemoteAddr = "192.168.1.88:50000"
+		req.Header.Set("X-Forwarded-For", fmt.Sprintf("192.168.1.%d", i+1))
+		req.Header.Set("X-Real-IP", fmt.Sprintf("192.168.1.%d", i+100))
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
@@ -102,11 +115,11 @@ func TestDeviceIDSpoofingAndPublicRateLimitBypassBlocked(t *testing.T) {
 		}
 	}
 	reqBlocked := httptest.NewRequest(http.MethodPost, "/Users/ForgotPassword", strings.NewReader(`{"EnteredUsername":"alice"}`))
-	reqBlocked.RemoteAddr = "203.0.113.88:50001"
-	reqBlocked.Header.Set("X-Forwarded-For", "198.51.100.250")
+	reqBlocked.RemoteAddr = "192.168.1.88:50001"
+	reqBlocked.Header.Set("X-Forwarded-For", "192.168.1.250")
 	recBlocked := httptest.NewRecorder()
 	router.ServeHTTP(recBlocked, reqBlocked)
 	if recBlocked.Code != http.StatusTooManyRequests {
-		t.Fatalf("public IP spoofing X-Forwarded-For must still be rate-limited (429), got %d", recBlocked.Code)
+		t.Fatalf("untrusted LAN IP spoofing X-Forwarded-For must still be rate-limited (429), got %d", recBlocked.Code)
 	}
 }

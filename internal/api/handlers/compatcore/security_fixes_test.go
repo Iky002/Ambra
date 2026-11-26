@@ -120,8 +120,12 @@ func TestUserPrivilegeEscalationAndIDORBlocked(t *testing.T) {
 	if rec := doAuthReq(guestAuth.AccessToken, http.MethodGet, "/Connect/Exchange?ConnectUserId=c1", ""); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for unlinked GET /Connect/Exchange, got %d", rec.Code)
 	}
-	if rec := doAuthReq(guestAuth.AccessToken, http.MethodPost, "/Users/"+env.user2.ID+"/Connect/Link?ConnectUsername=c1", ""); rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 linking connect user, got %d", rec.Code)
+	// H-09: Connect/Link requires Admin (403 for non-admin, 200 for admin)
+	if rec := doAuthReq(guestAuth.AccessToken, http.MethodPost, "/Users/"+env.user2.ID+"/Connect/Link?ConnectUsername=c1", ""); rec.Code != http.StatusForbidden {
+		t.Fatalf("H-09: expected 403 for non-admin linking connect user, got %d", rec.Code)
+	}
+	if rec := doAuthReq(adminAuth.AccessToken, http.MethodPost, "/Users/"+env.user2.ID+"/Connect/Link?ConnectUsername=c1", ""); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for admin linking connect user, got %d", rec.Code)
 	}
 	exRec := doAuthReq(guestAuth.AccessToken, http.MethodGet, "/Connect/Exchange?ConnectUserId=c1", "")
 	if exRec.Code != http.StatusOK {

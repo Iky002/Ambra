@@ -86,6 +86,7 @@ type ItemExtra struct {
 	Chapters                []ChapterRecord   `json:"chapters,omitempty"`
 	LockedFields            []string          `json:"LockedFields,omitempty"`
 	LockData                bool              `json:"LockData,omitempty"`
+	PreventAutoMerge        bool              `json:"prevent_auto_merge,omitempty"`
 }
 
 // ItemRecord represents a row in the items table.
@@ -199,6 +200,7 @@ type UserItemDataRecord struct {
 	PlayCount             int
 	PlaybackPositionTicks int64
 	IsFavorite            bool
+	Likes                 *bool
 	LastPlayedDate        *int64
 	AudioStreamIndex      *int
 	SubtitleStreamIndex   *int
@@ -206,36 +208,42 @@ type UserItemDataRecord struct {
 
 // ItemFilter holds query parameters for QueryItems.
 type ItemFilter struct {
-	ServerID               string
-	UserID                 string
-	ParentID               string
-	LibraryID              string
-	AllowedLibraryIDs      []string
-	MaxParentalRating      *int
-	BlockedTags            []string
-	SeriesID               string
-	SeasonID               string
-	Recursive              bool
-	IncludeItemTypes       []string
-	ExcludeItemTypes       []string
-	IDs                    []string
-	ExcludeItemIDs         []string
-	Genres                 []string
-	GenreIDs               []string
-	Studios                []string
-	StudioIDs              []string
-	Tags                   []string
-	OfficialRatings        []string
-	MinCommunityRating     *float64
-	PersonIDs              []string
-	Persons                []string
-	Years                  []int
-	IsHD                   *bool
-	Is4K                   *bool
-	HasSubtitles           *bool
-	IsPlayed               *bool
-	IsUnplayed             *bool
+	ServerID                string
+	UserID                  string
+	ParentID                string
+	LibraryID               string
+	AllowedLibraryIDs       []string
+	MaxParentalRating       *int
+	BlockUnratedItems       []string
+	BlockedTags             []string
+	AllowedTags             []string
+	SeriesID                string
+	SeasonID                string
+	Recursive               bool
+	IncludeItemTypes        []string
+	ExcludeItemTypes        []string
+	IDs                     []string
+	ExcludeItemIDs          []string
+	Genres                  []string
+	GenreIDs                []string
+	Studios                 []string
+	StudioIDs               []string
+	Tags                    []string
+	OfficialRatings         []string
+	VideoCodecs             []string
+	VideoRanges             []string
+	MinCommunityRating      *float64
+	PersonIDs               []string
+	Persons                 []string
+	Years                   []int
+	IsHD                    *bool
+	Is4K                    *bool
+	IsHDR                   *bool
+	HasSubtitles            *bool
+	IsPlayed                *bool
+	IsUnplayed              *bool
 	IsFavorite              *bool
+	IsLiked                 *bool
 	IsResumable             *bool
 	ExcludeHiddenResume     bool
 	SearchTerm              string
@@ -243,11 +251,11 @@ type ItemFilter struct {
 	NameStartsWithOrGreater string
 	NameLessThan            string
 	SortBy                  []string
-	SortOrder              string
-	StartIndex             int
-	Limit                  int
-	Fields                 []string
-	EnableTotalRecordCount *bool
+	SortOrder               string
+	StartIndex              int
+	Limit                   int
+	Fields                  []string
+	EnableTotalRecordCount  *bool
 }
 
 // SearchHintFilter holds parameters for SearchHints.
@@ -256,7 +264,9 @@ type SearchHintFilter struct {
 	ParentID          string
 	AllowedLibraryIDs []string
 	MaxParentalRating *int
+	BlockUnratedItems []string
 	BlockedTags       []string
+	AllowedTags       []string
 	SearchTerm        string
 	IncludeItemTypes  []string
 	Limit             int
@@ -319,7 +329,14 @@ var parentalRatingScores = map[string]int{
 	"M18":          9,
 	"FSK-16":       9,
 	"FSK-18":       9,
+	"R+":           9,
+	"NR":           9,
+	"UNRATED":      9,
+	"NOT-RATED":    9,
+	"NOT RATED":    9,
 	"R18+":         9,
+	"19":           10,
+	"19+":          10,
 	"R-18":         10,
 	"R18":          10,
 	"R-18+":        10,
@@ -374,13 +391,16 @@ func ParentalRatingScore(rating string) (int, bool) {
 }
 
 // ParseParentalRatingValue maps a parental rating label (case-insensitive) to its
-// numeric rank, returning 0 for empty or unrecognized ratings.
+// numeric rank. Truly empty ratings return 0 (controlled separately by BlockUnratedItems),
+// whereas non-empty unrecognized rating labels return 100 (fail-closed).
 func ParseParentalRatingValue(rating string) int {
-	score, ok := ParentalRatingScore(rating)
-	if !ok {
+	if strings.TrimSpace(rating) == "" {
 		return 0
 	}
-	return score
+	if score, ok := ParentalRatingScore(rating); ok {
+		return score
+	}
+	return 100
 }
 
 // ExceedingParentalRatings returns a sorted slice of uppercase rating strings whose
@@ -416,13 +436,133 @@ func normalizeBlockedTags(tags []string) []string {
 	return out
 }
 
-func appendParentalFilterSQL(alias string, maxRating *int, blockedTags []string) ([]string, []any) {
+type parentalPolicy struct {
+	MaxParentalRating *int
+	BlockUnratedItems []string
+	BlockedTags       []string
+	AllowedTags       []string
+}
+
+func (p parentalPolicy) hasRestriction() bool {
+	return p.MaxParentalRating != nil ||
+		len(normalizeBlockedTags(p.BlockUnratedItems)) > 0 ||
+		len(normalizeBlockedTags(p.BlockedTags)) > 0 ||
+		len(normalizeBlockedTags(p.AllowedTags)) > 0
+}
+
+func policyFromFilter(f ItemFilter) parentalPolicy {
+	return parentalPolicy{
+		MaxParentalRating: f.MaxParentalRating,
+		BlockUnratedItems: f.BlockUnratedItems,
+		BlockedTags:       f.BlockedTags,
+		AllowedTags:       f.AllowedTags,
+	}
+}
+
+func policyFromSearchFilter(f SearchHintFilter) parentalPolicy {
+	return parentalPolicy{
+		MaxParentalRating: f.MaxParentalRating,
+		BlockUnratedItems: f.BlockUnratedItems,
+		BlockedTags:       f.BlockedTags,
+		AllowedTags:       f.AllowedTags,
+	}
+}
+
+func policyFromUserPolicy(p dto.UserPolicy) parentalPolicy {
+	if p.IsAdministrator {
+		return parentalPolicy{}
+	}
+	return parentalPolicy{
+		MaxParentalRating: p.MaxParentalRating,
+		BlockUnratedItems: p.BlockUnratedItems,
+		BlockedTags:       p.BlockedTags,
+		AllowedTags:       p.AllowedTags,
+	}
+}
+
+func expandUnratedBlockedTypes(rawTypes []string) (blockAll bool, blockSeriesDescendants bool, blockTrailers bool, exactTypes []string) {
+	norm := normalizeBlockedTags(rawTypes)
+	if len(norm) == 0 {
+		return false, false, false, nil
+	}
+	seen := make(map[string]struct{}, len(norm)+4)
+	addExact := func(t string) {
+		if _, ok := seen[t]; !ok {
+			seen[t] = struct{}{}
+			exactTypes = append(exactTypes, t)
+		}
+	}
+	for _, u := range norm {
+		switch u {
+		case "all", "true", "*":
+			return true, true, true, nil
+		case "series":
+			blockSeriesDescendants = true
+			addExact("series")
+		case "trailer":
+			blockTrailers = true
+			addExact("trailer")
+		case "music":
+			addExact("music")
+			addExact("audio")
+			addExact("musicalbum")
+			addExact("musicartist")
+		default:
+			addExact(u)
+		}
+	}
+	return false, blockSeriesDescendants, blockTrailers, exactTypes
+}
+
+func appendBlockUnratedSQL(alias string, rawTypes []string) ([]string, []any) {
+	blockAll, blockSeriesDesc, blockTrailers, exactTypes := expandUnratedBlockedTypes(rawTypes)
+	if !blockAll && !blockSeriesDesc && !blockTrailers && len(exactTypes) == 0 {
+		return nil, nil
+	}
+	if blockAll {
+		// An item is considered rated if it has a non-empty official_rating, or if it is an Episode/Season
+		// inheriting a non-empty official_rating from its parent Series.
+		return []string{fmt.Sprintf(
+			`(COALESCE(TRIM(%s.official_rating), '') != '' OR (LOWER(%s.type) IN ('episode', 'season') AND COALESCE(%s.series_id, '') != '' AND EXISTS (SELECT 1 FROM items ps WHERE ps.id = %s.series_id AND COALESCE(TRIM(ps.official_rating), '') != '')))`,
+			alias, alias, alias, alias,
+		)}, nil
+	}
+
+	var clauses []string
+	var args []any
+	if len(exactTypes) > 0 {
+		ph := make([]string, len(exactTypes))
+		for i, t := range exactTypes {
+			ph[i] = "?"
+			args = append(args, t)
+		}
+		clauses = append(clauses, fmt.Sprintf(
+			`(LOWER(%s.type) NOT IN (%s) OR COALESCE(TRIM(%s.official_rating), '') != '')`,
+			alias, strings.Join(ph, ","), alias,
+		))
+	}
+	if blockTrailers {
+		clauses = append(clauses, fmt.Sprintf(
+			`(LOWER(COALESCE(%s.extra_type, '')) != 'trailer' OR COALESCE(TRIM(%s.official_rating), '') != '')`,
+			alias, alias,
+		))
+	}
+	if blockSeriesDesc {
+		clauses = append(clauses, fmt.Sprintf(
+			`(LOWER(%s.type) NOT IN ('episode', 'season') OR COALESCE(TRIM(%s.official_rating), '') != '' OR (COALESCE(%s.series_id, '') != '' AND EXISTS (SELECT 1 FROM items ps WHERE ps.id = %s.series_id AND COALESCE(TRIM(ps.official_rating), '') != '')))`,
+			alias, alias, alias, alias,
+		))
+	}
+	return clauses, args
+}
+
+func appendParentalPolicySQL(alias string, p parentalPolicy) ([]string, []any) {
 	var (
 		clauses []string
 		args    []any
 	)
-	if maxRating != nil {
-		maxVal := *maxRating
+	if p.MaxParentalRating != nil {
+		maxVal := *p.MaxParentalRating
 		if maxVal < 0 {
 			maxVal = 0
 		}
@@ -432,7 +572,11 @@ func appendParentalFilterSQL(alias string, maxRating *int, blockedTags []string)
 		))
 		args = append(args, maxVal, maxVal)
 	}
-	if normTags := normalizeBlockedTags(blockedTags); len(normTags) > 0 {
+	if uClauses, uArgs := appendBlockUnratedSQL(alias, p.BlockUnratedItems); len(uClauses) > 0 {
+		clauses = append(clauses, uClauses...)
+		args = append(args, uArgs...)
+	}
+	if normTags := normalizeBlockedTags(p.BlockedTags); len(normTags) > 0 {
 		ph := make([]string, len(normTags))
 		for i, t := range normTags {
 			ph[i] = "?"
@@ -446,20 +590,219 @@ func appendParentalFilterSQL(alias string, maxRating *int, blockedTags []string)
 			  AND lower(t.name) IN (%s)
 		)`, alias, alias, strings.Join(ph, ",")))
 	}
+	if normAllowed := normalizeBlockedTags(p.AllowedTags); len(normAllowed) > 0 {
+		ph := make([]string, len(normAllowed))
+		for i, t := range normAllowed {
+			ph[i] = "?"
+			args = append(args, t)
+		}
+		clauses = append(clauses, fmt.Sprintf(`EXISTS (
+			SELECT 1 FROM item_taxonomies it
+			JOIN taxonomies t ON t.id = it.taxonomy_id
+			WHERE it.item_id IN (%s.id, COALESCE(%s.series_id, ''))
+			  AND lower(t.kind) = 'tag'
+			  AND lower(t.name) IN (%s)
+		)`, alias, alias, strings.Join(ph, ",")))
+	}
 	return clauses, args
+}
+
+func appendParentalFilterSQL(alias string, maxRating *int, blockedTags []string) ([]string, []any) {
+	return appendParentalPolicySQL(alias, parentalPolicy{
+		MaxParentalRating: maxRating,
+		BlockedTags:       blockedTags,
+	})
+}
+
+func buildBoxSetVisibleChildExistsSQL(containerAlias string, allowedLibraryIDs []string, p parentalPolicy) (string, []any) {
+	conds := []string{
+		fmt.Sprintf("ic_vis.container_id = %s.id", containerAlias),
+		"child_vis.extra_type = ''",
+	}
+	var args []any
+	if len(allowedLibraryIDs) > 0 {
+		ph := make([]string, len(allowedLibraryIDs))
+		for idx, lid := range allowedLibraryIDs {
+			ph[idx] = "?"
+			args = append(args, guid.Normalize(lid))
+		}
+		conds = append(conds, fmt.Sprintf("child_vis.library_id IN (%s)", strings.Join(ph, ",")))
+	}
+	if pClauses, pArgs := appendParentalPolicySQL("child_vis", p); len(pClauses) > 0 {
+		conds = append(conds, pClauses...)
+		args = append(args, pArgs...)
+	}
+	sqlExpr := `EXISTS (
+		SELECT 1 FROM item_collections ic_vis
+		JOIN items child_vis ON child_vis.id = ic_vis.item_id
+		WHERE ` + strings.Join(conds, " AND ") + `
+	)`
+	return sqlExpr, args
+}
+
+// buildLibraryAndPolicyWhere constructs SQL WHERE predicates for AllowedLibraryIDs and
+// parental controls, allowing BoxSets (library_id = 'collections') to participate as
+// candidates while enforcing that restricted users only see BoxSets containing >= 1
+// child item permitted by both AllowedLibraryIDs and the full parental policy.
+func buildLibraryAndPolicyWhere(alias string, allowedLibraryIDs []string, p parentalPolicy) ([]string, []any) {
+	hasLibs := len(allowedLibraryIDs) > 0
+	hasParental := p.hasRestriction()
+	if !hasLibs && !hasParental {
+		return nil, nil
+	}
+
+	var where []string
+	var args []any
+
+	if hasLibs {
+		ph := make([]string, len(allowedLibraryIDs))
+		for idx, lid := range allowedLibraryIDs {
+			ph[idx] = "?"
+			args = append(args, guid.Normalize(lid))
+		}
+		visSQL, visArgs := buildBoxSetVisibleChildExistsSQL(alias, allowedLibraryIDs, p)
+		where = append(where, fmt.Sprintf(
+			`(%s.library_id IN (%s) OR (%s.library_id = 'collections' AND %s))`,
+			alias, strings.Join(ph, ","), alias, visSQL,
+		))
+		args = append(args, visArgs...)
+	}
+
+	if hasParental {
+		normalClauses, normalArgs := appendParentalPolicySQL(alias, p)
+		normalSQL := "1=1"
+		if len(normalClauses) > 0 {
+			normalSQL = strings.Join(normalClauses, " AND ")
+		}
+
+		// For BoxSet itself: enforce MaxParentalRating, BlockedTags, and explicit "BoxSet" in BlockUnratedItems,
+		// while delegating child-level rating/unrated/AllowedTags visibility to the child EXISTS subquery.
+		boxSelfPolicy := parentalPolicy{
+			MaxParentalRating: p.MaxParentalRating,
+			BlockedTags:       p.BlockedTags,
+		}
+		for _, u := range normalizeBlockedTags(p.BlockUnratedItems) {
+			if u == "boxset" {
+				boxSelfPolicy.BlockUnratedItems = []string{"boxset"}
+				break
+			}
+		}
+		selfClauses, selfArgs := appendParentalPolicySQL(alias, boxSelfPolicy)
+		visSQL, visArgs := buildBoxSetVisibleChildExistsSQL(alias, allowedLibraryIDs, p)
+		boxParts := append(selfClauses, visSQL)
+		boxSQL := strings.Join(boxParts, " AND ")
+
+		where = append(where, fmt.Sprintf(
+			`((NOT (LOWER(%s.type) = 'boxset' AND %s.library_id = 'collections') AND (%s)) OR (LOWER(%s.type) = 'boxset' AND %s.library_id = 'collections' AND (%s)))`,
+			alias, alias, normalSQL, alias, alias, boxSQL,
+		))
+		args = append(args, normalArgs...)
+		args = append(args, selfArgs...)
+		args = append(args, visArgs...)
+	}
+
+	return where, args
 }
 
 // IsItemBlockedByParentalPolicy reports whether rec is blocked by maxRating or blockedTags.
 func (r *LibraryRepo) IsItemBlockedByParentalPolicy(ctx context.Context, rec *ItemRecord, maxRating *int, blockedTags []string) (bool, error) {
-	if rec == nil {
+	return r.IsItemBlockedByPolicy(ctx, rec, dto.UserPolicy{
+		EnableAllFolders:  true,
+		MaxParentalRating: maxRating,
+		BlockedTags:       blockedTags,
+	})
+}
+
+// IsItemBlockedByPolicy reports whether rec is blocked by the user's parental and tag policy
+// (MaxParentalRating, BlockUnratedItems, BlockedTags, AllowedTags, and BoxSet child visibility).
+func (r *LibraryRepo) IsItemBlockedByPolicy(ctx context.Context, rec *ItemRecord, policy dto.UserPolicy) (bool, error) {
+	if rec == nil || policy.IsAdministrator {
 		return false, nil
 	}
-	if maxRating != nil {
-		maxVal := *maxRating
+
+	p := policyFromUserPolicy(policy)
+	var allowedLibs []string
+	if !policy.EnableAllFolders && policy.EnabledFolders != nil {
+		allowedLibs = policy.EnabledFolders
+	}
+
+	if strings.EqualFold(rec.Type, "BoxSet") {
+		if p.MaxParentalRating != nil {
+			maxVal := *p.MaxParentalRating
+			if maxVal < 0 {
+				maxVal = 0
+			}
+			if ParseParentalRatingValue(rec.OfficialRating) > maxVal {
+				return true, nil
+			}
+		}
+		for _, u := range normalizeBlockedTags(p.BlockUnratedItems) {
+			if u == "boxset" && strings.TrimSpace(rec.OfficialRating) == "" {
+				return true, nil
+			}
+		}
+		if normTags := normalizeBlockedTags(p.BlockedTags); len(normTags) > 0 {
+			if hit, err := r.itemMatchesTagSet(ctx, rec, normTags); err != nil || hit {
+				return hit, err
+			}
+		}
+		if allowedLibs != nil || p.hasRestriction() {
+			if allowedLibs != nil && len(allowedLibs) == 0 {
+				return true, nil
+			}
+			// Create dummy alias check via item_collections
+			conds := []string{"ic_vis.container_id = ?", "child_vis.extra_type = ''"}
+			args := []any{guid.Normalize(rec.ID)}
+			if len(allowedLibs) > 0 {
+				ph := make([]string, len(allowedLibs))
+				for idx, lid := range allowedLibs {
+					ph[idx] = "?"
+					args = append(args, guid.Normalize(lid))
+				}
+				conds = append(conds, fmt.Sprintf("child_vis.library_id IN (%s)", strings.Join(ph, ",")))
+			}
+			if pClauses, pArgs := appendParentalPolicySQL("child_vis", p); len(pClauses) > 0 {
+				conds = append(conds, pClauses...)
+				args = append(args, pArgs...)
+			}
+			var hasVisibleChild int
+			err := r.store.Reader.QueryRowContext(ctx,
+				`SELECT EXISTS (
+					SELECT 1 FROM item_collections ic_vis
+					JOIN items child_vis ON child_vis.id = ic_vis.item_id
+					WHERE `+strings.Join(conds, " AND ")+`
+				)`, args...,
+			).Scan(&hasVisibleChild)
+			if err != nil {
+				return false, err
+			}
+			if hasVisibleChild == 0 {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+
+	if allowedLibs != nil && rec.LibraryID != "" && rec.LibraryID != "playlists" {
+		normLib := guid.Normalize(rec.LibraryID)
+		permitted := false
+		for _, lid := range allowedLibs {
+			if guid.Normalize(lid) == normLib {
+				permitted = true
+				break
+			}
+		}
+		if !permitted {
+			return true, nil
+		}
+	}
+
+	if p.MaxParentalRating != nil {
+		maxVal := *p.MaxParentalRating
 		if maxVal < 0 {
 			maxVal = 0
 		}
-		if score, ok := ParentalRatingScore(rec.OfficialRating); ok && score > maxVal {
+		if ParseParentalRatingValue(rec.OfficialRating) > maxVal {
 			return true, nil
 		}
 		if sid := guid.Normalize(rec.SeriesID); sid != "" {
@@ -469,32 +812,131 @@ func (r *LibraryRepo) IsItemBlockedByParentalPolicy(ctx context.Context, rec *It
 			}
 		}
 	}
-	if normTags := normalizeBlockedTags(blockedTags); len(normTags) > 0 {
-		ph := make([]string, len(normTags))
-		args := make([]any, 0, len(normTags)+2)
-		args = append(args, guid.Normalize(rec.ID), guid.Normalize(rec.SeriesID))
-		for i, t := range normTags {
-			ph[i] = "?"
-			args = append(args, t)
+
+	if len(p.BlockUnratedItems) > 0 {
+		blocked, err := r.isItemBlockedAsUnrated(ctx, rec, p.BlockUnratedItems)
+		if err != nil || blocked {
+			return blocked, err
 		}
-		var blocked int
-		err := r.store.Reader.QueryRowContext(ctx, fmt.Sprintf(`
-			SELECT EXISTS (
-				SELECT 1 FROM item_taxonomies it
-				JOIN taxonomies t ON t.id = it.taxonomy_id
-				WHERE it.item_id IN (?, ?)
-				  AND lower(t.kind) = 'tag'
-				  AND lower(t.name) IN (%s)
-			)`, strings.Join(ph, ",")), args...,
-		).Scan(&blocked)
+	}
+
+	if normTags := normalizeBlockedTags(p.BlockedTags); len(normTags) > 0 {
+		if hit, err := r.itemMatchesTagSet(ctx, rec, normTags); err != nil || hit {
+			return hit, err
+		}
+	}
+
+	if normAllowed := normalizeBlockedTags(p.AllowedTags); len(normAllowed) > 0 {
+		hit, err := r.itemMatchesTagSet(ctx, rec, normAllowed)
 		if err != nil {
 			return false, err
 		}
-		if blocked == 1 {
+		if !hit {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func (r *LibraryRepo) isItemBlockedAsUnrated(ctx context.Context, rec *ItemRecord, rawTypes []string) (bool, error) {
+	if strings.TrimSpace(rec.OfficialRating) != "" {
+		return false, nil
+	}
+	blockAll, blockSeriesDesc, blockTrailers, exactTypes := expandUnratedBlockedTypes(rawTypes)
+	itemType := strings.ToLower(strings.TrimSpace(rec.Type))
+
+	seriesHasRating := func() (bool, error) {
+		sid := guid.Normalize(rec.SeriesID)
+		if sid == "" {
+			return false, nil
+		}
+		var sr sql.NullString
+		err := r.store.Reader.QueryRowContext(ctx, `SELECT official_rating FROM items WHERE id = ?`, sid).Scan(&sr)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return strings.TrimSpace(sr.String) != "", nil
+	}
+
+	if blockAll {
+		if itemType == "episode" || itemType == "season" {
+			rated, err := seriesHasRating()
+			if err != nil {
+				return false, err
+			}
+			return !rated, nil
+		}
+		return true, nil
+	}
+	for _, t := range exactTypes {
+		if itemType == t {
+			return true, nil
+		}
+	}
+	if blockTrailers && strings.EqualFold(rec.Extra.ExtraType, "trailer") {
+		return true, nil
+	}
+	if blockSeriesDesc && (itemType == "episode" || itemType == "season") {
+		rated, err := seriesHasRating()
+		if err != nil {
+			return false, err
+		}
+		if !rated {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+func (r *LibraryRepo) itemMatchesTagSet(ctx context.Context, rec *ItemRecord, normTags []string) (bool, error) {
+	ph := make([]string, len(normTags))
+	args := make([]any, 0, len(normTags)+2)
+	args = append(args, guid.Normalize(rec.ID), guid.Normalize(rec.SeriesID))
+	for i, t := range normTags {
+		ph[i] = "?"
+		args = append(args, t)
+	}
+	var matched int
+	err := r.store.Reader.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT EXISTS (
+			SELECT 1 FROM item_taxonomies it
+			JOIN taxonomies t ON t.id = it.taxonomy_id
+			WHERE it.item_id IN (?, ?)
+			  AND lower(t.kind) = 'tag'
+			  AND lower(t.name) IN (%s)
+		)`, strings.Join(ph, ",")), args...,
+	).Scan(&matched)
+	if err != nil {
+		return false, err
+	}
+	return matched == 1, nil
+}
+
+func (r *LibraryRepo) loadRestrictedUserPolicy(ctx context.Context, userID string) (parentalPolicy, []string, bool) {
+	uid := guid.Normalize(userID)
+	if uid == "" {
+		return parentalPolicy{}, nil, false
+	}
+	var isAdmin int
+	var policyRaw string
+	err := r.store.Reader.QueryRowContext(ctx, `SELECT is_admin, COALESCE(policy_json, '{}') FROM users WHERE id = ?`, uid).Scan(&isAdmin, &policyRaw)
+	if err != nil || isAdmin == 1 {
+		return parentalPolicy{}, nil, false
+	}
+	var pol dto.UserPolicy
+	if err := json.Unmarshal([]byte(policyRaw), &pol); err != nil || pol.IsAdministrator {
+		return parentalPolicy{}, nil, false
+	}
+	p := policyFromUserPolicy(pol)
+	var allowedLibs []string
+	if !pol.EnableAllFolders && pol.EnabledFolders != nil {
+		allowedLibs = pol.EnabledFolders
+	}
+	return p, allowedLibs, p.hasRestriction() || allowedLibs != nil
 }
 
 // ItemCounts holds aggregate item counts by type.
@@ -1531,7 +1973,9 @@ func queryItemsCountCacheKey(f ItemFilter) (string, bool) {
 		strings.TrimSpace(f.NameStartsWithOrGreater) != "" ||
 		strings.TrimSpace(f.NameLessThan) != "" ||
 		f.MaxParentalRating != nil ||
+		len(f.BlockUnratedItems) > 0 ||
 		len(f.BlockedTags) > 0 ||
+		len(f.AllowedTags) > 0 ||
 		f.SeriesID != "" ||
 		f.SeasonID != "" ||
 		len(f.IDs) > 0 ||
@@ -1542,16 +1986,20 @@ func queryItemsCountCacheKey(f ItemFilter) (string, bool) {
 		len(f.StudioIDs) > 0 ||
 		len(f.Tags) > 0 ||
 		len(f.OfficialRatings) > 0 ||
+		len(f.VideoCodecs) > 0 ||
+		len(f.VideoRanges) > 0 ||
 		f.MinCommunityRating != nil ||
 		len(f.PersonIDs) > 0 ||
 		len(f.Persons) > 0 ||
 		len(f.Years) > 0 ||
 		f.IsHD != nil ||
 		f.Is4K != nil ||
+		f.IsHDR != nil ||
 		f.HasSubtitles != nil ||
 		f.IsPlayed != nil ||
 		f.IsUnplayed != nil ||
 		f.IsFavorite != nil ||
+		f.IsLiked != nil ||
 		f.IsResumable != nil ||
 		f.ExcludeHiddenResume {
 		return "", false
@@ -1652,17 +2100,10 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 		where = append(where, `i.library_id = ?`)
 		args = append(args, guid.Normalize(f.LibraryID))
 	}
-	if len(f.AllowedLibraryIDs) > 0 {
-		placeholders := make([]string, len(f.AllowedLibraryIDs))
-		for idx, lid := range f.AllowedLibraryIDs {
-			placeholders[idx] = "?"
-			args = append(args, guid.Normalize(lid))
-		}
-		where = append(where, fmt.Sprintf(`i.library_id IN (%s)`, strings.Join(placeholders, ",")))
-	}
-	if pClauses, pArgs := appendParentalFilterSQL("i", f.MaxParentalRating, f.BlockedTags); len(pClauses) > 0 {
-		where = append(where, pClauses...)
-		args = append(args, pArgs...)
+	pFilter := policyFromFilter(f)
+	if lpClauses, lpArgs := buildLibraryAndPolicyWhere("i", f.AllowedLibraryIDs, pFilter); len(lpClauses) > 0 {
+		where = append(where, lpClauses...)
+		args = append(args, lpArgs...)
 	}
 	if f.SeriesID != "" {
 		where = append(where, `i.series_id = ?`)
@@ -1835,6 +2276,47 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 			)`)
 		}
 	}
+	if f.IsHDR != nil {
+		if *f.IsHDR {
+			where = append(where, `EXISTS (
+				SELECT 1 FROM item_media_streams ms
+				WHERE ms.item_id = i.id AND lower(ms.stream_type) = 'video'
+				  AND COALESCE(trim(ms.video_range), '') != ''
+				  AND upper(trim(ms.video_range)) != 'SDR'
+			)`)
+		} else {
+			where = append(where, `NOT EXISTS (
+				SELECT 1 FROM item_media_streams ms
+				WHERE ms.item_id = i.id AND lower(ms.stream_type) = 'video'
+				  AND COALESCE(trim(ms.video_range), '') != ''
+				  AND upper(trim(ms.video_range)) != 'SDR'
+			)`)
+		}
+	}
+	if normCodecs := normalizeBlockedTags(f.VideoCodecs); len(normCodecs) > 0 {
+		ph := make([]string, len(normCodecs))
+		for idx, c := range normCodecs {
+			ph[idx] = "?"
+			args = append(args, c)
+		}
+		where = append(where, fmt.Sprintf(`EXISTS (
+			SELECT 1 FROM item_media_streams ms
+			WHERE ms.item_id = i.id AND lower(ms.stream_type) = 'video'
+			  AND lower(trim(COALESCE(ms.codec, ''))) IN (%s)
+		)`, strings.Join(ph, ",")))
+	}
+	if normRanges := normalizeBlockedTags(f.VideoRanges); len(normRanges) > 0 {
+		ph := make([]string, len(normRanges))
+		for idx, vr := range normRanges {
+			ph[idx] = "?"
+			args = append(args, vr)
+		}
+		where = append(where, fmt.Sprintf(`EXISTS (
+			SELECT 1 FROM item_media_streams ms
+			WHERE ms.item_id = i.id AND lower(ms.stream_type) = 'video'
+			  AND lower(trim(COALESCE(ms.video_range, ''))) IN (%s)
+		)`, strings.Join(ph, ",")))
+	}
 	if f.HasSubtitles != nil {
 		if *f.HasSubtitles {
 			where = append(where, `EXISTS (
@@ -1903,6 +2385,13 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 				where = append(where, `COALESCE(u.is_favorite, 0) = 1`)
 			} else {
 				where = append(where, `COALESCE(u.is_favorite, 0) = 0`)
+			}
+		}
+		if f.IsLiked != nil {
+			if *f.IsLiked {
+				where = append(where, `u.likes = 1`)
+			} else {
+				where = append(where, `u.likes = 0`)
 			}
 		}
 		if f.IsResumable != nil {
@@ -1974,7 +2463,7 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 		i.runtime_ticks, i.container, i.path, i.file_size, i.file_mtime,
 		i.etag, i.extra_json, i.date_created, i.date_modified`
 	if userID != "" {
-		selectCols += `, COALESCE(u.played, 0), COALESCE(u.play_count, 0), COALESCE(u.playback_position_ticks, 0), COALESCE(u.is_favorite, 0), u.last_played_date`
+		selectCols += `, COALESCE(u.played, 0), COALESCE(u.play_count, 0), COALESCE(u.playback_position_ticks, 0), COALESCE(u.is_favorite, 0), u.likes, u.last_played_date`
 	}
 
 	querySQL := `SELECT ` + selectCols + ` ` + fromClause + whereClause + ` ` + orderClause
@@ -2010,7 +2499,7 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 	if !countEnabled {
 		total = len(recs)
 	}
-	dtos, err := r.hydrateDTOs(ctx, recs, userDataList, f.ServerID, userID, f.Fields, false)
+	dtos, err := r.hydrateDTOsWithPolicy(ctx, recs, userDataList, f.ServerID, userID, f.Fields, false, pFilter, f.AllowedLibraryIDs)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -2034,7 +2523,7 @@ func (r *LibraryRepo) GetItemByID(ctx context.Context, serverID, userID, itemID 
 			       i.premiere_date, i.end_date, i.community_rating, i.critic_rating, i.official_rating,
 			       i.runtime_ticks, i.container, i.path, i.file_size, i.file_mtime,
 			       i.etag, i.extra_json, i.date_created, i.date_modified,
-			       COALESCE(u.played, 0), COALESCE(u.play_count, 0), COALESCE(u.playback_position_ticks, 0), COALESCE(u.is_favorite, 0), u.last_played_date
+			       COALESCE(u.played, 0), COALESCE(u.play_count, 0), COALESCE(u.playback_position_ticks, 0), COALESCE(u.is_favorite, 0), u.likes, u.last_played_date
 			FROM items i
 			LEFT JOIN user_item_data u ON u.item_id = i.id AND u.user_id = ?
 			WHERE i.id = ?`
@@ -2066,7 +2555,11 @@ func (r *LibraryRepo) GetItemByID(ctx context.Context, serverID, userID, itemID 
 	if err != nil {
 		return nil, err
 	}
-	dtos, err := r.hydrateDTOs(ctx, []ItemRecord{rec}, []*dto.UserItemDataDto{ud}, serverID, userID, nil, true)
+	var userPol parentalPolicy
+	if userID != "" {
+		userPol, _, _ = r.loadRestrictedUserPolicy(ctx, userID)
+	}
+	dtos, err := r.hydrateDTOsWithPolicy(ctx, []ItemRecord{rec}, []*dto.UserItemDataDto{ud}, serverID, userID, nil, true, userPol, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -2197,7 +2690,21 @@ func (r *LibraryRepo) GetNextUpEpisodesWithPolicy(ctx context.Context, serverID,
 		}
 		extraCond.WriteString(" AND i.library_id IN (" + strings.Join(ph, ",") + ")")
 	}
-	if pClauses, pArgs := appendParentalFilterSQL("i", maxParentalRating, blockedTags); len(pClauses) > 0 {
+	pPolicy := parentalPolicy{
+		MaxParentalRating: maxParentalRating,
+		BlockedTags:       blockedTags,
+	}
+	if userID != "" {
+		if uPol, _, ok := r.loadRestrictedUserPolicy(ctx, userID); ok {
+			if len(uPol.BlockUnratedItems) > 0 {
+				pPolicy.BlockUnratedItems = uPol.BlockUnratedItems
+			}
+			if len(uPol.AllowedTags) > 0 {
+				pPolicy.AllowedTags = uPol.AllowedTags
+			}
+		}
+	}
+	if pClauses, pArgs := appendParentalPolicySQL("i", pPolicy); len(pClauses) > 0 {
 		for _, cl := range pClauses {
 			extraCond.WriteString(" AND " + cl)
 		}
@@ -2229,6 +2736,7 @@ func (r *LibraryRepo) GetNextUpEpisodesWithPolicy(ctx context.Context, serverID,
 			       COALESCE(u.play_count, 0) AS u_play_count,
 			       COALESCE(u.playback_position_ticks, 0) AS u_pos,
 			       COALESCE(u.is_favorite, 0) AS u_fav,
+			       u.likes AS u_likes,
 			       u.last_played_date AS u_last_played,
 			       CASE WHEN sa.series_id IS NOT NULL THEN 1 ELSE 0 END AS is_started,
 			       COALESCE(sa.last_played, 0) AS series_last_played,
@@ -2248,7 +2756,7 @@ func (r *LibraryRepo) GetNextUpEpisodesWithPolicy(ctx context.Context, serverID,
 		       premiere_date, end_date, community_rating, critic_rating, official_rating,
 		       runtime_ticks, container, path, file_size, file_mtime,
 		       etag, extra_json, date_created, date_modified,
-		       u_played, u_play_count, u_pos, u_fav, u_last_played,
+		       u_played, u_play_count, u_pos, u_fav, u_likes, u_last_played,
 		       COUNT(*) OVER () AS total_count
 		FROM ranked
 		WHERE rn = 1
@@ -2276,7 +2784,7 @@ func (r *LibraryRepo) GetNextUpEpisodesWithPolicy(ctx context.Context, serverID,
 	if err := rows.Err(); err != nil {
 		return nil, 0, err
 	}
-	dtos, err := r.hydrateDTOs(ctx, recs, uds, serverID, userID, fields, false)
+	dtos, err := r.hydrateDTOsWithPolicy(ctx, recs, uds, serverID, userID, fields, false, pPolicy, allowedLibraryIDs)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -2313,17 +2821,9 @@ func (r *LibraryRepo) SearchHints(ctx context.Context, f SearchHintFilter) ([]dt
 		where = append(where, `anc.ancestor_id = ? AND anc.depth > 0`)
 		args = append(args, guid.Normalize(f.ParentID))
 	}
-	if len(f.AllowedLibraryIDs) > 0 {
-		ph := make([]string, len(f.AllowedLibraryIDs))
-		for idx, lid := range f.AllowedLibraryIDs {
-			ph[idx] = "?"
-			args = append(args, guid.Normalize(lid))
-		}
-		where = append(where, fmt.Sprintf(`i.library_id IN (%s)`, strings.Join(ph, ",")))
-	}
-	if pClauses, pArgs := appendParentalFilterSQL("i", f.MaxParentalRating, f.BlockedTags); len(pClauses) > 0 {
-		where = append(where, pClauses...)
-		args = append(args, pArgs...)
+	if lpClauses, lpArgs := buildLibraryAndPolicyWhere("i", f.AllowedLibraryIDs, policyFromSearchFilter(f)); len(lpClauses) > 0 {
+		where = append(where, lpClauses...)
+		args = append(args, lpArgs...)
 	}
 	if len(f.IncludeItemTypes) > 0 {
 		ph := make([]string, len(f.IncludeItemTypes))
@@ -2620,10 +3120,21 @@ func (r *LibraryRepo) GetItemCountsWithAllowedLibraries(ctx context.Context, all
 // GetItemCountsFiltered counts items grouped by type and trailers, optionally restricted to
 // allowedLibraryIDs and maxParentalRating.
 func (r *LibraryRepo) GetItemCountsFiltered(ctx context.Context, allowedLibraryIDs []string, maxParentalRating *int) (*ItemCounts, error) {
+	return r.GetItemCountsWithPolicy(ctx, allowedLibraryIDs, dto.UserPolicy{
+		EnableAllFolders:  allowedLibraryIDs == nil,
+		MaxParentalRating: maxParentalRating,
+	})
+}
+
+// GetItemCountsWithPolicy counts items grouped by type and trailers while enforcing
+// allowedLibraryIDs and the full user parental policy (MaxParentalRating, BlockUnratedItems,
+// BlockedTags, AllowedTags, and BoxSet child visibility).
+func (r *LibraryRepo) GetItemCountsWithPolicy(ctx context.Context, allowedLibraryIDs []string, policy dto.UserPolicy) (*ItemCounts, error) {
 	if allowedLibraryIDs != nil && len(allowedLibraryIDs) == 0 {
 		return &ItemCounts{}, nil
 	}
-	unfiltered := allowedLibraryIDs == nil && maxParentalRating == nil
+	pPolicy := policyFromUserPolicy(policy)
+	unfiltered := allowedLibraryIDs == nil && !pPolicy.hasRestriction()
 	var epoch uint64
 	if unfiltered {
 		r.countMu.RLock()
@@ -2636,21 +3147,7 @@ func (r *LibraryRepo) GetItemCountsFiltered(ctx context.Context, allowedLibraryI
 		r.countMu.RUnlock()
 	}
 
-	var filterClauses []string
-	var filterArgs []any
-	if len(allowedLibraryIDs) > 0 {
-		ph := make([]string, len(allowedLibraryIDs))
-		for i, id := range allowedLibraryIDs {
-			ph[i] = "?"
-			filterArgs = append(filterArgs, guid.Normalize(id))
-		}
-		filterClauses = append(filterClauses, `i.library_id IN (`+strings.Join(ph, ",")+`)`)
-	}
-	if maxParentalRating != nil {
-		pClauses, pArgs := appendParentalFilterSQL("i", maxParentalRating, nil)
-		filterClauses = append(filterClauses, pClauses...)
-		filterArgs = append(filterArgs, pArgs...)
-	}
+	filterClauses, filterArgs := buildLibraryAndPolicyWhere("i", allowedLibraryIDs, pPolicy)
 	filterSuffix := ""
 	if len(filterClauses) > 0 {
 		filterSuffix = ` AND ` + strings.Join(filterClauses, " AND ")
@@ -2721,13 +3218,14 @@ func (r *LibraryRepo) GetUserItemData(ctx context.Context, userID, itemID string
 		played, fav int
 		playCount   int
 		pos         int64
+		likes       sql.NullInt64
 		lastPlayed  sql.NullInt64
 	)
 	err := r.store.Reader.QueryRowContext(ctx, `
-		SELECT played, play_count, playback_position_ticks, is_favorite, last_played_date
+		SELECT played, play_count, playback_position_ticks, is_favorite, likes, last_played_date
 		FROM user_item_data WHERE user_id = ? AND item_id = ?`,
 		userID, itemID,
-	).Scan(&played, &playCount, &pos, &fav, &lastPlayed)
+	).Scan(&played, &playCount, &pos, &fav, &likes, &lastPlayed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return &dto.UserItemDataDto{Key: itemID}, nil
 	}
@@ -2740,6 +3238,10 @@ func (r *LibraryRepo) GetUserItemData(ctx context.Context, userID, itemID string
 		IsFavorite:            fav == 1,
 		Played:                played == 1,
 		Key:                   itemID,
+	}
+	if likes.Valid {
+		liked := likes.Int64 != 0
+		ud.Likes = &liked
 	}
 	if lastPlayed.Valid && lastPlayed.Int64 > 0 {
 		t := time.Unix(lastPlayed.Int64, 0).UTC()
@@ -3114,7 +3616,7 @@ func (r *LibraryRepo) GetItemExtras(ctx context.Context, serverID, userID, paren
 		i.etag, i.extra_json, i.date_created, i.date_modified`
 	if userID != "" {
 		joins = `LEFT JOIN user_item_data u ON u.item_id = i.id AND u.user_id = ?`
-		selectCols += `, COALESCE(u.played, 0), COALESCE(u.play_count, 0), COALESCE(u.playback_position_ticks, 0), COALESCE(u.is_favorite, 0), u.last_played_date`
+		selectCols += `, COALESCE(u.played, 0), COALESCE(u.play_count, 0), COALESCE(u.playback_position_ticks, 0), COALESCE(u.is_favorite, 0), u.likes, u.last_played_date`
 		args = append(args, userID)
 	}
 
@@ -3301,21 +3803,62 @@ type containerPlayStats struct {
 }
 
 func (r *LibraryRepo) loadSeriesSeasonStatsBatch(ctx context.Context, userID string, seriesIDs, seasonIDs []string) (map[string]*containerPlayStats, error) {
+	return r.loadSeriesSeasonStatsBatchWithPolicy(ctx, userID, seriesIDs, seasonIDs, parentalPolicy{}, nil)
+}
+
+func (r *LibraryRepo) loadSeriesSeasonStatsBatchWithPolicy(
+	ctx context.Context,
+	userID string,
+	seriesIDs, seasonIDs []string,
+	p parentalPolicy,
+	allowedLibraryIDs []string,
+) (map[string]*containerPlayStats, error) {
 	out := make(map[string]*containerPlayStats, len(seriesIDs)+len(seasonIDs))
+	if allowedLibraryIDs != nil && len(allowedLibraryIDs) == 0 {
+		for _, id := range seriesIDs {
+			out[id] = &containerPlayStats{}
+		}
+		for _, id := range seasonIDs {
+			out[id] = &containerPlayStats{}
+		}
+		return out, nil
+	}
+
+	var extraConds []string
+	var extraArgs []any
+	if len(allowedLibraryIDs) > 0 {
+		ph := make([]string, len(allowedLibraryIDs))
+		for idx, lid := range allowedLibraryIDs {
+			ph[idx] = "?"
+			extraArgs = append(extraArgs, guid.Normalize(lid))
+		}
+		extraConds = append(extraConds, `i.library_id IN (`+strings.Join(ph, ",")+`)`)
+	}
+	if pClauses, pArgs := appendParentalPolicySQL("i", p); len(pClauses) > 0 {
+		extraConds = append(extraConds, pClauses...)
+		extraArgs = append(extraArgs, pArgs...)
+	}
+	extraSuffix := ""
+	if len(extraConds) > 0 {
+		extraSuffix = " AND " + strings.Join(extraConds, " AND ")
+	}
+
 	for _, chunk := range chunkStrings(seriesIDs, sqliteInChunkSize) {
 		ph := make([]string, len(chunk))
-		args := make([]any, len(chunk))
+		args := make([]any, 0, len(chunk)+len(extraArgs))
 		for i, id := range chunk {
 			ph[i] = "?"
-			args[i] = id
+			args = append(args, id)
 			out[id] = &containerPlayStats{}
 		}
 		inClause := strings.Join(ph, ",")
 
-		// Direct season count per series
+		// Direct season count per series (respecting library and parental policy)
+		seasonQueryArgs := append([]any(nil), args...)
+		seasonQueryArgs = append(seasonQueryArgs, extraArgs...)
 		sRows, err := r.store.Reader.QueryContext(ctx,
-			`SELECT series_id, COUNT(*) FROM items WHERE type = 'Season' AND extra_type = '' AND series_id IN (`+inClause+`) GROUP BY series_id`,
-			args...,
+			`SELECT i.series_id, COUNT(*) FROM items i WHERE i.type = 'Season' AND i.extra_type = '' AND i.series_id IN (`+inClause+`)`+extraSuffix+` GROUP BY i.series_id`,
+			seasonQueryArgs...,
 		)
 		if err != nil {
 			return nil, err
@@ -3337,15 +3880,16 @@ func (r *LibraryRepo) loadSeriesSeasonStatsBatch(ctx context.Context, userID str
 		}
 		sRows.Close()
 
-		// Episode total & unplayed count per series
-		epArgs := make([]any, 0, len(chunk)+1)
+		// Episode total & unplayed count per series (respecting library and parental policy)
+		epArgs := make([]any, 0, 1+len(chunk)+len(extraArgs))
 		epArgs = append(epArgs, userID)
 		epArgs = append(epArgs, args...)
+		epArgs = append(epArgs, extraArgs...)
 		epRows, err := r.store.Reader.QueryContext(ctx,
 			`SELECT i.series_id, COUNT(*), SUM(CASE WHEN COALESCE(u.played, 0) = 0 THEN 1 ELSE 0 END)
 			 FROM items i
 			 LEFT JOIN user_item_data u ON u.item_id = i.id AND u.user_id = ?
-			 WHERE i.type = 'Episode' AND i.extra_type = '' AND i.series_id IN (`+inClause+`)
+			 WHERE i.type = 'Episode' AND i.extra_type = '' AND i.series_id IN (`+inClause+`)`+extraSuffix+`
 			 GROUP BY i.series_id`,
 			epArgs...,
 		)
@@ -3373,20 +3917,21 @@ func (r *LibraryRepo) loadSeriesSeasonStatsBatch(ctx context.Context, userID str
 
 	for _, chunk := range chunkStrings(seasonIDs, sqliteInChunkSize) {
 		ph := make([]string, len(chunk))
-		epArgs := make([]any, 0, len(chunk)+1)
+		epArgs := make([]any, 0, 1+len(chunk)+len(extraArgs))
 		epArgs = append(epArgs, userID)
 		for i, id := range chunk {
 			ph[i] = "?"
 			epArgs = append(epArgs, id)
 			out[id] = &containerPlayStats{}
 		}
+		epArgs = append(epArgs, extraArgs...)
 		inClause := strings.Join(ph, ",")
 
 		epRows, err := r.store.Reader.QueryContext(ctx,
 			`SELECT i.season_id, COUNT(*), SUM(CASE WHEN COALESCE(u.played, 0) = 0 THEN 1 ELSE 0 END)
 			 FROM items i
 			 LEFT JOIN user_item_data u ON u.item_id = i.id AND u.user_id = ?
-			 WHERE i.type = 'Episode' AND i.extra_type = '' AND i.season_id IN (`+inClause+`)
+			 WHERE i.type = 'Episode' AND i.extra_type = '' AND i.season_id IN (`+inClause+`)`+extraSuffix+`
 			 GROUP BY i.season_id`,
 			epArgs...,
 		)
@@ -3417,6 +3962,19 @@ func (r *LibraryRepo) loadSeriesSeasonStatsBatch(ctx context.Context, userID str
 }
 
 func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []*dto.UserItemDataDto, serverID, userID string, fields []string, fullDetail bool) ([]dto.BaseItemDto, error) {
+	return r.hydrateDTOsWithPolicy(ctx, recs, uds, serverID, userID, fields, fullDetail, parentalPolicy{}, nil)
+}
+
+func (r *LibraryRepo) hydrateDTOsWithPolicy(
+	ctx context.Context,
+	recs []ItemRecord,
+	uds []*dto.UserItemDataDto,
+	serverID, userID string,
+	fields []string,
+	fullDetail bool,
+	p parentalPolicy,
+	allowedLibraryIDs []string,
+) ([]dto.BaseItemDto, error) {
 	if len(recs) == 0 {
 		return []dto.BaseItemDto{}, nil
 	}
@@ -3480,7 +4038,7 @@ func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []
 
 	var statsMap map[string]*containerPlayStats
 	if len(seriesIDs) > 0 || len(seasonIDs) > 0 {
-		statsMap, err = r.loadSeriesSeasonStatsBatch(ctx, userID, seriesIDs, seasonIDs)
+		statsMap, err = r.loadSeriesSeasonStatsBatchWithPolicy(ctx, userID, seriesIDs, seasonIDs, p, allowedLibraryIDs)
 		if err != nil {
 			return nil, err
 		}
@@ -4073,6 +4631,7 @@ func scanItemRow(rows *sql.Rows, hasUser bool) (ItemRecord, *dto.UserItemDataDto
 		var (
 			played, playCount, fav int
 			pos                    int64
+			likes                  sql.NullInt64
 			lastPlayed             sql.NullInt64
 		)
 		err := rows.Scan(
@@ -4083,7 +4642,7 @@ func scanItemRow(rows *sql.Rows, hasUser bool) (ItemRecord, *dto.UserItemDataDto
 			&rec.PremiereDate, &rec.EndDate, &rec.CommunityRating, &rec.CriticRating, &offRate,
 			&rec.RuntimeTicks, &container, &path, &rec.FileSize, &rec.FileMtime,
 			&rec.Etag, &extraRaw, &rec.DateCreated, &rec.DateModified,
-			&played, &playCount, &pos, &fav, &lastPlayed,
+			&played, &playCount, &pos, &fav, &likes, &lastPlayed,
 		)
 		if err != nil {
 			return rec, nil, err
@@ -4094,6 +4653,10 @@ func scanItemRow(rows *sql.Rows, hasUser bool) (ItemRecord, *dto.UserItemDataDto
 			IsFavorite:            fav == 1,
 			Played:                played == 1,
 			Key:                   rec.ID,
+		}
+		if likes.Valid {
+			liked := likes.Int64 != 0
+			ud.Likes = &liked
 		}
 		if lastPlayed.Valid && lastPlayed.Int64 > 0 {
 			t := time.Unix(lastPlayed.Int64, 0).UTC()
@@ -4136,6 +4699,7 @@ func scanItemRowWithTotal(rows *sql.Rows) (ItemRecord, *dto.UserItemDataDto, int
 		extraRaw                                                    string
 		played, playCount, fav                                      int
 		pos                                                         int64
+		likes                                                       sql.NullInt64
 		lastPlayed                                                  sql.NullInt64
 		totalCount                                                  int
 	)
@@ -4147,7 +4711,7 @@ func scanItemRowWithTotal(rows *sql.Rows) (ItemRecord, *dto.UserItemDataDto, int
 		&rec.PremiereDate, &rec.EndDate, &rec.CommunityRating, &rec.CriticRating, &offRate,
 		&rec.RuntimeTicks, &container, &path, &rec.FileSize, &rec.FileMtime,
 		&rec.Etag, &extraRaw, &rec.DateCreated, &rec.DateModified,
-		&played, &playCount, &pos, &fav, &lastPlayed,
+		&played, &playCount, &pos, &fav, &likes, &lastPlayed,
 		&totalCount,
 	)
 	if err != nil {
@@ -4159,6 +4723,10 @@ func scanItemRowWithTotal(rows *sql.Rows) (ItemRecord, *dto.UserItemDataDto, int
 		IsFavorite:            fav == 1,
 		Played:                played == 1,
 		Key:                   rec.ID,
+	}
+	if likes.Valid {
+		liked := likes.Int64 != 0
+		ud.Likes = &liked
 	}
 	if lastPlayed.Valid && lastPlayed.Int64 > 0 {
 		t := time.Unix(lastPlayed.Int64, 0).UTC()

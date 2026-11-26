@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/auth"
 	"github.com/ambra-media/ambra/internal/core/session"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
@@ -59,13 +60,41 @@ func WithAuthContext(ctx context.Context, ac *AuthContext) context.Context {
 type Auth struct {
 	svc      *auth.Service
 	sessions *session.Manager
+	cfg      *config.Config
 }
 
 func NewAuth(svc *auth.Service, sessions *session.Manager) *Auth {
+	var cfg *config.Config
+	if svc != nil {
+		cfg = svc.Config()
+	}
 	return &Auth{
 		svc:      svc,
 		sessions: sessions,
+		cfg:      cfg,
 	}
+}
+
+// SetConfig injects the server configuration for server-wide remote access enforcement.
+func (a *Auth) SetConfig(cfg *config.Config) {
+	if a == nil {
+		return
+	}
+	a.cfg = cfg
+}
+
+func (a *Auth) isGlobalRemoteAccessEnabled() bool {
+	if a == nil {
+		return true
+	}
+	cfg := a.cfg
+	if cfg == nil && a.svc != nil {
+		cfg = a.svc.Config()
+	}
+	if cfg == nil {
+		return true
+	}
+	return cfg.Snapshot().IsGlobalRemoteAccessEnabled()
 }
 
 // ParseAuth extracts client metadata and validates any present token without blocking anonymous requests.
@@ -87,9 +116,15 @@ func (a *Auth) RequireAuth(next http.Handler) http.Handler {
 			httpx.Error(w, http.StatusUnauthorized, "Authentication required")
 			return
 		}
-		if !ac.IsAPIKey && ac.User != nil && !ac.User.Policy.EnableRemoteAccess && !netutil.IsLocalOrLANRequest(r) {
-			httpx.Error(w, http.StatusForbidden, "Remote access is disabled for this user")
-			return
+		if !ac.IsAPIKey && !netutil.IsLocalOrLANRequest(r) {
+			if !a.isGlobalRemoteAccessEnabled() {
+				httpx.Error(w, http.StatusForbidden, "Remote access is disabled on this server")
+				return
+			}
+			if ac.User != nil && !ac.User.Policy.EnableRemoteAccess {
+				httpx.Error(w, http.StatusForbidden, "Remote access is disabled for this user")
+				return
+			}
 		}
 		next.ServeHTTP(w, r.WithContext(WithAuthContext(r.Context(), ac)))
 	})
@@ -142,7 +177,7 @@ func (a *Auth) resolve(r *http.Request) *AuthContext {
 	}
 
 	if a.sessions != nil && ac.User != nil {
-		if ac.IsAPIKey || ac.User.Policy.EnableRemoteAccess || netutil.IsLocalOrLANRequest(r) {
+		if ac.IsAPIKey || netutil.IsLocalOrLANRequest(r) || (a.isGlobalRemoteAccessEnabled() && ac.User.Policy.EnableRemoteAccess) {
 			a.sessions.TouchSession(ac.User, ac.Client)
 		}
 	}

@@ -19,6 +19,7 @@ import {
   Play,
   RotateCcw,
   RotateCw,
+  Search,
   Settings,
   SkipBack,
   SkipForward,
@@ -35,11 +36,13 @@ import {
   buildEmbyAuthHeader,
   getBifUrl,
   getStoredAuth,
+  getUniversalAudioTranscodeUrl,
   isSameOriginUrl,
   resolveApiUrl,
 } from '../api/client'
 import type { MediaSourceInfo, MediaStream } from '../api/types'
 import { AmbraLogo } from '../components/AmbraLogo'
+import { RemoteSubtitleModal } from '../components/media/RemoteSubtitleModal'
 import { useAudioPlayer } from '../context/AudioPlayerContext'
 import { useAuth } from '../context/AuthContext'
 import { useWebSocket } from '../context/WebSocketContext'
@@ -74,6 +77,7 @@ import {
 } from '../player/subtitleUtils'
 import {
   canStreamMkvRemux,
+  canStreamMkvVideoOnly,
   isMkvContainer,
   StreamMkvFallbackError,
   StreamMkvRemuxer,
@@ -225,6 +229,8 @@ function parseNonNegativeIntParam(raw: string | null): number | undefined {
   return Number.isInteger(n) && n >= 0 ? n : undefined
 }
 
+const INTRO_CHAPTER_RE = /^(intro|opening|op|片头|片頭|オープニング)/i
+
 interface WasmProgressState {
   stage: WasmRemuxStage
   percent: number
@@ -269,6 +275,8 @@ export function PlayerPage() {
 
   const containerRef = useRef<HTMLDivElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
+  const hybridAudioRef = useRef<HTMLAudioElement>(null)
+  const hybridAudioBaseSecRef = useRef(0)
   const assCanvasRef = useRef<HTMLCanvasElement>(null)
   const pgsCanvasRef = useRef<HTMLCanvasElement>(null)
 
@@ -413,20 +421,28 @@ export function PlayerPage() {
     }
   }, [id])
 
-  // WebVTT / SRT 文本字幕状态 & 字幕微调偏好
+  // WebVTT / SRT 文本字幕状态 & 字幕微调偏好（按 userId 作用域隔离）
   const [textCues, setTextCues] = useState<TextSubtitleCue[]>([])
-  const [subtitlePrefs, setSubtitlePrefs] = useState<SubtitlePrefs>(() => loadSubtitlePrefs())
+  const [subtitlePrefs, setSubtitlePrefs] = useState<SubtitlePrefs>(() => loadSubtitlePrefs(userId))
   const subtitlePrefsRef = useRef<SubtitlePrefs>(subtitlePrefs)
   subtitlePrefsRef.current = subtitlePrefs
   const [loadedFontCount, setLoadedFontCount] = useState(0)
+  const [remoteSubModalOpen, setRemoteSubModalOpen] = useState(false)
 
-  const updateSubtitlePrefs = useCallback((patch: Partial<SubtitlePrefs>) => {
-    setSubtitlePrefs((prev) => saveSubtitlePrefs({ ...prev, ...patch }))
-  }, [])
+  useEffect(() => {
+    setSubtitlePrefs(loadSubtitlePrefs(userId))
+  }, [userId])
+
+  const updateSubtitlePrefs = useCallback(
+    (patch: Partial<SubtitlePrefs>) => {
+      setSubtitlePrefs((prev) => saveSubtitlePrefs({ ...prev, ...patch }, userId))
+    },
+    [userId],
+  )
 
   const handleResetSubtitlePrefs = useCallback(() => {
-    setSubtitlePrefs(resetSubtitlePrefs())
-  }, [])
+    setSubtitlePrefs(resetSubtitlePrefs(userId))
+  }, [userId])
 
   const { data: item } = useQuery({
     queryKey: ['item', userId, id],
@@ -557,20 +573,20 @@ export function PlayerPage() {
   const effectiveAudioIndex = useMemo(() => {
     if (audioIndex !== undefined) return audioIndex
     if (!activeSource || episodeIdSynced !== id) return undefined
-    const prefs = loadPlaybackPrefs()
+    const prefs = loadPlaybackPrefs(userId)
     return pickPreferredAudioIndex(
       audioStreams,
       prefs.preferredAudioLang,
       activeSource.DefaultAudioStreamIndex,
       locale,
     )
-  }, [audioIndex, activeSource, episodeIdSynced, id, audioStreams, locale])
+  }, [audioIndex, activeSource, episodeIdSynced, id, audioStreams, locale, userId])
 
   // 初始化默认音轨与字幕轨（优先用户偏好语言，其次服务端默认；每个媒体源仅初始化一次，避免用户关闭字幕后回弹）
   useEffect(() => {
     if (!activeSource || episodeIdSynced !== id) return
     if (selectedSourceId === undefined) setSelectedSourceId(activeSource.Id)
-    const prefs = loadPlaybackPrefs()
+    const prefs = loadPlaybackPrefs(userId)
     let resolvedAudioIdx = audioIndex
     if (initializedAudioSourceIdRef.current !== activeSource.Id) {
       initializedAudioSourceIdRef.current = activeSource.Id
@@ -625,6 +641,7 @@ export function PlayerPage() {
     audioStreams,
     subtitleStreams,
     locale,
+    userId,
   ])
 
   // 计算生效的起播位置（显式传 startTicks >= 0 时直接使用；未传参时从 item.UserData.PlaybackPositionTicks 自动续播）
@@ -779,16 +796,32 @@ export function PlayerPage() {
             ? resolveApiUrl(activeSource.DirectStreamUrl)
             : fallbackMasterHlsUrl
 
-    const requiresRemux = needsClientRemux(activeSource.Container, activeAudioStream?.Codec)
+    const looksLikeMkvStrm =
+      isStrm &&
+      /\.mkv(?:$|[?#\s])/i.test(
+        `${activeSource.Path || ''} ${activeSource.DirectStreamUrl || ''} ${activeSource.Name || ''}`,
+      )
+    const effectiveContainer =
+      isMkvContainer(activeSource.Container) || looksLikeMkvStrm
+        ? 'mkv'
+        : activeSource.Container
+
+    const requiresRemux = needsClientRemux(effectiveContainer, activeAudioStream?.Codec)
     const sizeBytes = activeSource.Size
     const withinWasmThreshold = sizeBytes === undefined || sizeBytes <= DEFAULT_WASM_MAX_BYTES
     const mkvStreamEligible =
-      isMkvContainer(activeSource.Container) &&
-      canStreamMkvRemux(videoStream?.Codec, activeAudioStream?.Codec, activeSource.Container)
+      isMkvContainer(effectiveContainer) &&
+      canStreamMkvRemux(videoStream?.Codec, activeAudioStream?.Codec, effectiveContainer)
+    const mkvVideoOnlyEligible =
+      isMkvContainer(effectiveContainer) &&
+      canStreamMkvVideoOnly(videoStream?.Codec, effectiveContainer) &&
+      !mkvStreamEligible &&
+      audioStreams.length > 0
 
     if (qualityPreset !== 'auto' || forceServerHls) {
       return {
         strategy: 'hls' as const,
+        videoOnly: false,
         directUrl,
         proxyDirectUrl,
         hlsUrl,
@@ -799,10 +832,11 @@ export function PlayerPage() {
       }
     }
 
-    // 0. STRM 直连失败后，先尝试服务端反代直出 (&proxy=1，支持 Range)
-    if (useProxyDirect && isStrm && !needsTrackSwitchRemux) {
+    // 0. STRM 直连失败后，仅在容器与音轨原生兼容时尝试服务端反代直出 (&proxy=1)；对 MKV 或不支持音轨优先走反代解复用
+    if (useProxyDirect && isStrm && !requiresRemux && !needsTrackSwitchRemux) {
       return {
         strategy: 'proxy-direct' as const,
+        videoOnly: false,
         directUrl,
         proxyDirectUrl,
         hlsUrl,
@@ -821,6 +855,7 @@ export function PlayerPage() {
     ) {
       return {
         strategy: 'direct' as const,
+        videoOnly: false,
         directUrl,
         proxyDirectUrl,
         hlsUrl,
@@ -831,10 +866,11 @@ export function PlayerPage() {
       }
     }
 
-    // 2. 非原生 MKV 或选中非默认内封音轨的 MKV 且浏览器 MSE 支持该音视频编码 -> 优先流式 Range + MSE（支持指定音轨）
+    // 2. 非原生 MKV 或选中非默认内封音轨的 MKV 且浏览器 MSE 支持该音视频编码 -> 优先流式 Range + MSE（STRM 自动经同源反代）
     if ((requiresRemux || needsTrackSwitchRemux) && preferWasmRemux && mkvStreamEligible) {
       return {
         strategy: 'stream-mkv' as const,
+        videoOnly: false,
         directUrl,
         proxyDirectUrl,
         hlsUrl,
@@ -849,6 +885,7 @@ export function PlayerPage() {
     if (needsTrackSwitchRemux && !requiresRemux) {
       return {
         strategy: 'hls' as const,
+        videoOnly: false,
         directUrl,
         proxyDirectUrl,
         hlsUrl,
@@ -859,7 +896,7 @@ export function PlayerPage() {
       }
     }
 
-    // 3. 其他非原生容器 / 需音频转码（AC3/DTS 等）-> 尝试客户端 ffmpeg.wasm（<= 150MB）
+    // 3. 小体积非原生容器 / 需音频转码（<= 150MB）-> 尝试客户端 ffmpeg.wasm
     if (
       requiresRemux &&
       preferWasmRemux &&
@@ -868,6 +905,22 @@ export function PlayerPage() {
     ) {
       return {
         strategy: 'wasm' as const,
+        videoOnly: false,
+        directUrl,
+        proxyDirectUrl,
+        hlsUrl,
+        isStrm,
+        requiresRemux,
+        withinWasmThreshold,
+        skipReason: null as string | null,
+      }
+    }
+
+    // 3.5 大体积 (>150MB) 杜比 AC3/EAC3/DTS/TrueHD MKV 电影零视频重编码：MSE 仅解复用直通视频轨 + 隐藏同步 <audio> 播放服务端轻量 AAC 音轨流
+    if ((requiresRemux || needsTrackSwitchRemux) && preferWasmRemux && mkvVideoOnlyEligible) {
+      return {
+        strategy: 'stream-mkv' as const,
+        videoOnly: true,
         directUrl,
         proxyDirectUrl,
         hlsUrl,
@@ -892,6 +945,7 @@ export function PlayerPage() {
 
     return {
       strategy: 'hls' as const,
+      videoOnly: false,
       directUrl,
       proxyDirectUrl,
       hlsUrl,
@@ -908,6 +962,7 @@ export function PlayerPage() {
     playbackInfo?.PlaySessionId,
     videoStream?.Codec,
     activeAudioStream?.Codec,
+    audioStreams.length,
     preferWasmRemux,
     useProxyDirect,
     forceServerHls,
@@ -916,12 +971,18 @@ export function PlayerPage() {
     browserSupportsHls,
   ])
 
+  const isHybridVideoOnly = Boolean(
+    streamPlan?.strategy === 'stream-mkv' && streamPlan.videoOnly && !forceServerHls,
+  )
+
   // 挂载视频流 (DirectPlay / Stream MKV (MSE) / Client WASM Remux / Server HLS 自动降级)
   useEffect(() => {
     const video = videoRef.current
+    const hybridAudio = hybridAudioRef.current
     if (!video || !streamPlan) return
 
     let cancelled = false
+    let playbackStarted = false
     const abortController = new AbortController()
 
     setPlayerError(null)
@@ -945,9 +1006,16 @@ export function PlayerPage() {
       wasmRemuxerRef.current.dispose()
       wasmRemuxerRef.current = null
     }
+    if (hybridAudio) {
+      hybridAudio.pause()
+      hybridAudio.removeAttribute('src')
+      hybridAudio.load()
+    }
+    hybridAudioBaseSecRef.current = 0
 
     const startPlayback = () => {
       if (cancelled) return
+      playbackStarted = true
       if (
         resumeSecRef.current !== null &&
         Number.isFinite(resumeSecRef.current) &&
@@ -971,6 +1039,13 @@ export function PlayerPage() {
       if (Number.isFinite(playbackRateRef.current) && playbackRateRef.current > 0) {
         video.playbackRate = playbackRateRef.current
       }
+      if (hybridAudio && streamPlan.strategy === 'stream-mkv' && streamPlan.videoOnly) {
+        hybridAudio.volume = volumeRef.current
+        hybridAudio.muted = mutedRef.current
+        if (Number.isFinite(playbackRateRef.current) && playbackRateRef.current > 0) {
+          hybridAudio.playbackRate = playbackRateRef.current
+        }
+      }
       // 在支持原生 HTMLMediaElement.audioTracks 的浏览器（如 Safari）下，DirectPlay 同步切换对应音轨
       const nativeAudioTracks = (
         video as HTMLVideoElement & {
@@ -990,6 +1065,11 @@ export function PlayerPage() {
       video.play().catch(() => {
         // 浏览器自动播放策略阻止时保持暂停状态让用户点击
       })
+      if (hybridAudio && streamPlan.strategy === 'stream-mkv' && streamPlan.videoOnly && hybridAudio.src) {
+        hybridAudio.play().catch(() => {
+          // 随主视频 onPlay 事件再次触发播放
+        })
+      }
     }
 
     const buildAuthHeaders = (targetUrl: string): Record<string, string> => {
@@ -997,14 +1077,12 @@ export function PlayerPage() {
         return {}
       }
       const storedAuth = getStoredAuth()
-      const headers: Record<string, string> = {
-        'X-Emby-Authorization': buildEmbyAuthHeader(storedAuth?.accessToken),
+      return {
+        Authorization: buildEmbyAuthHeader(storedAuth?.accessToken),
       }
-      if (storedAuth?.accessToken) {
-        headers['X-Emby-Token'] = storedAuth.accessToken
-      }
-      return headers
     }
+
+    const remuxSourceUrl = streamPlan.isStrm ? streamPlan.proxyDirectUrl : streamPlan.directUrl
 
     const mountServerHls = (url: string) => {
       if (cancelled) return
@@ -1072,7 +1150,7 @@ export function PlayerPage() {
       wasmRemuxerRef.current = remuxer
 
       void remuxer
-        .remuxToMP4(streamPlan.directUrl, buildAuthHeaders(streamPlan.directUrl), {
+        .remuxToMP4(remuxSourceUrl, buildAuthHeaders(remuxSourceUrl), {
           maxBytes: DEFAULT_WASM_MAX_BYTES,
           knownSizeBytes: activeSource?.Size,
           container: activeSource?.Container,
@@ -1124,17 +1202,39 @@ export function PlayerPage() {
         })
     }
 
-    const fallbackFromStreamMkv = (reasonMsg: string) => {
+    const fallbackFromStreamMkv = (err: unknown, duringPlayback = false) => {
       if (cancelled) return
+      captureResumePosition()
       if (streamMkvRef.current) {
         streamMkvRef.current.dispose()
         streamMkvRef.current = null
       }
-      if (streamPlan.withinWasmThreshold && canUseWasmRemux({ enabled: preferWasmRemux })) {
+      if (hybridAudio) {
+        hybridAudio.pause()
+        hybridAudio.removeAttribute('src')
+        hybridAudio.load()
+      }
+      const reasonMsg =
+        err instanceof StreamMkvFallbackError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : typeof err === 'string'
+              ? err
+              : '流式 MKV 解复用异常'
+      const isFetchOrRedirectFailure =
+        err instanceof StreamMkvFallbackError && err.reason === 'fetch_failed'
+      if (
+        !duringPlayback &&
+        !playbackStarted &&
+        !isFetchOrRedirectFailure &&
+        !streamPlan.videoOnly &&
+        streamPlan.withinWasmThreshold &&
+        canUseWasmRemux({ enabled: preferWasmRemux })
+      ) {
         setWasmFallbackNotice(`${reasonMsg}，已自动回退客户端 WASM 转封装`)
         mountWasmRemux()
       } else {
-        captureResumePosition()
         setWasmFallbackNotice(`${reasonMsg}，已自动切换服务端 HLS`)
         setForceServerHls(true)
       }
@@ -1151,17 +1251,38 @@ export function PlayerPage() {
     } else if (streamPlan.strategy === 'hls') {
       mountServerHls(streamPlan.hlsUrl)
     } else if (streamPlan.strategy === 'stream-mkv') {
-      // 大体积 MKV 流式解复用路径（HTTP Range + 纯 TS EBML/fMP4 + MSE）
+      // 大体积 MKV 流式解复用路径（HTTP Range + 纯 TS EBML/fMP4 + MSE；STRM 自动走 proxyDirectUrl）
       setPlayMethod('Stream MKV (MSE)')
       const streamMkv = new StreamMkvRemuxer()
       streamMkvRef.current = streamMkv
 
+      if (streamPlan.videoOnly && hybridAudio && id) {
+        const initSec =
+          resumeSecRef.current !== null &&
+          Number.isFinite(resumeSecRef.current) &&
+          resumeSecRef.current > 0
+            ? resumeSecRef.current
+            : !initialSeekDoneRef.current && effectiveStartTicksRef.current > 0
+              ? effectiveStartTicksRef.current / 10_000_000
+              : 0
+        hybridAudioBaseSecRef.current = initSec
+        hybridAudio.src = getUniversalAudioTranscodeUrl(id, {
+          mediaSourceId: activeSource?.Id,
+          audioStreamIndex: effectiveAudioIndex,
+          startTimeTicks: Math.floor(initSec * 10_000_000),
+          isStrm: streamPlan.isStrm,
+          userId,
+        })
+        hybridAudio.load()
+      }
+
       void streamMkv
-        .attach(video, streamPlan.directUrl, buildAuthHeaders(streamPlan.directUrl), {
+        .attach(video, remuxSourceUrl, buildAuthHeaders(remuxSourceUrl), {
           audioTrackIndex: selectedAudioOrdinal,
+          videoOnly: streamPlan.videoOnly,
           signal: abortController.signal,
           onError: (err) => {
-            fallbackFromStreamMkv(err.message || '流式 MKV 解复用异常')
+            fallbackFromStreamMkv(err, true)
           },
         })
         .then(() => {
@@ -1171,13 +1292,7 @@ export function PlayerPage() {
         })
         .catch((err: unknown) => {
           if (cancelled) return
-          const reasonMsg =
-            err instanceof StreamMkvFallbackError
-              ? err.message
-              : err instanceof Error
-                ? err.message
-                : '流式 MKV 解复用初始化失败'
-          fallbackFromStreamMkv(reasonMsg)
+          fallbackFromStreamMkv(err, false)
         })
     } else {
       // Client WASM Remux 路径：失败/超阈值/超时时自动无感回退服务端 HLS
@@ -1200,14 +1315,23 @@ export function PlayerPage() {
         wasmRemuxerRef.current.dispose()
         wasmRemuxerRef.current = null
       }
+      if (hybridAudio) {
+        hybridAudio.pause()
+        hybridAudio.removeAttribute('src')
+        hybridAudio.load()
+      }
       video.pause()
       video.removeAttribute('src')
       video.load()
     }
   }, [
     streamPlan,
+    activeSource?.Id,
     activeSource?.Size,
     activeSource?.Container,
+    effectiveAudioIndex,
+    id,
+    userId,
     initialStartTicks,
     useProxyDirect,
     forceServerHls,
@@ -1248,10 +1372,7 @@ export function PlayerPage() {
           const storedAuth = getStoredAuth()
           const headers: Record<string, string> = {}
           if (isSameOriginUrl(bifUrl)) {
-            headers['X-Emby-Authorization'] = buildEmbyAuthHeader(storedAuth?.accessToken)
-            if (storedAuth?.accessToken) {
-              headers['X-Emby-Token'] = storedAuth.accessToken
-            }
+            headers['Authorization'] = buildEmbyAuthHeader(storedAuth?.accessToken)
           }
           const res = await fetch(bifUrl, {
             method: 'GET',
@@ -1565,8 +1686,7 @@ export function PlayerPage() {
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
         Accept: 'application/json',
-        'X-Emby-Authorization': buildEmbyAuthHeader(token),
-        'X-Emby-Token': token,
+        Authorization: buildEmbyAuthHeader(token),
       }
       try {
         void fetch('/emby/Sessions/Playing/Stopped', {
@@ -1708,9 +1828,16 @@ export function PlayerPage() {
     pokeOsd()
   }, [pipSupported, pokeOsd])
 
-  // 订阅 WebSocket 远端播控指令 (Pause / Unpause / PlayPause / Stop / Seek)
+  // 订阅 WebSocket 远端播控指令 (Pause / Unpause / PlayPause / Stop / Seek)，校验 PlaySessionId
   useEffect(() => {
     return subscribePlaystate((cmd) => {
+      if (
+        cmd.PlaySessionId &&
+        playbackMetaRef.current.playSessionId &&
+        cmd.PlaySessionId !== playbackMetaRef.current.playSessionId
+      ) {
+        return
+      }
       const v = videoRef.current
       switch (cmd.Command) {
         case 'Pause':
@@ -1782,6 +1909,29 @@ export function PlayerPage() {
     return idx
   }, [chapters, currentTime])
 
+  const introSkipTarget = useMemo(() => {
+    if (chapters.length === 0) return null
+    for (let i = 0; i < chapters.length; i++) {
+      const name = (chapters[i].Name || '').trim()
+      if (!INTRO_CHAPTER_RE.test(name)) continue
+      const startSec = chapters[i].StartPositionTicks / 10_000_000
+      if (!Number.isFinite(startSec) || startSec < 0) continue
+      const nextChapter = chapters[i + 1]
+      const endSec = nextChapter
+        ? nextChapter.StartPositionTicks / 10_000_000
+        : effectiveDurationSec > startSec + 30
+          ? Math.min(effectiveDurationSec, startSec + 90)
+          : 0
+      if (endSec > startSec && currentTime >= startSec && currentTime < endSec) {
+        return {
+          targetTicks: nextChapter ? nextChapter.StartPositionTicks : Math.floor(endSec * 10_000_000),
+          label: name || '片头',
+        }
+      }
+    }
+    return null
+  }, [chapters, currentTime, effectiveDurationSec])
+
   const seekToChapter = useCallback(
     (startTicks: number) => {
       const v = videoRef.current
@@ -1838,12 +1988,24 @@ export function PlayerPage() {
     const nextMuted = !v.muted && !muted
     if (!nextMuted && v.volume === 0) {
       v.volume = 0.5
+      if (hybridAudioRef.current) hybridAudioRef.current.volume = 0.5
       setVolume(0.5)
     }
     v.muted = nextMuted
+    if (hybridAudioRef.current) hybridAudioRef.current.muted = nextMuted
     setMuted(nextMuted)
     pokeOsd()
   }, [muted, pokeOsd])
+
+  useEffect(() => {
+    const a = hybridAudioRef.current
+    if (!a) return
+    a.volume = volume
+    a.muted = muted
+    if (Number.isFinite(playbackRate) && playbackRate > 0) {
+      a.playbackRate = playbackRate
+    }
+  }, [volume, muted, playbackRate])
 
   // 监听全屏与画中画状态变化
   useEffect(() => {
@@ -1878,6 +2040,9 @@ export function PlayerPage() {
         e.target instanceof HTMLSelectElement ||
         (e.target instanceof HTMLElement && e.target.isContentEditable)
       ) {
+        return
+      }
+      if (remoteSubModalOpen) {
         return
       }
       if (showShortcuts) {
@@ -1939,7 +2104,10 @@ export function PlayerPage() {
         e.preventDefault()
         setShowShortcuts((s) => !s)
       } else if (e.key === 'Escape') {
-        if (showShortcuts) {
+        if (remoteSubModalOpen) {
+        return
+      }
+      if (showShortcuts) {
           setShowShortcuts(false)
         } else if (activePanel !== 'none') {
           setActivePanel('none')
@@ -1958,6 +2126,7 @@ export function PlayerPage() {
     togglePip,
     cycleSubtitle,
     cycleAudio,
+    remoteSubModalOpen,
     showShortcuts,
     activePanel,
     handleExit,
@@ -1974,8 +2143,10 @@ export function PlayerPage() {
       .join('\n')
   }, [textCues, currentTime, subtitlePrefs.offsetSec])
 
-  const progressPct = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0
-  const bufferedPct = duration > 0 ? Math.min(100, (bufferedEnd / duration) * 100) : 0
+  const progressPct =
+    effectiveDurationSec > 0 ? Math.min(100, (currentTime / effectiveDurationSec) * 100) : 0
+  const bufferedPct =
+    effectiveDurationSec > 0 ? Math.min(100, (bufferedEnd / effectiveDurationSec) * 100) : 0
   const hoverBifFrame = useMemo(() => {
     if (!hoverSeek || !bifArchive) return null
     return bifArchive.getFrameUrl(hoverSeek.timeSec)
@@ -2022,18 +2193,75 @@ export function PlayerPage() {
           stopReportedRef.current = false
           setPlaying(true)
           setBuffering(false)
+          if (isHybridVideoOnly && hybridAudioRef.current?.src) {
+            hybridAudioRef.current.play().catch(() => undefined)
+          }
           reportState('progress', 'Unpause')
         }}
         onPause={() => {
           setPlaying(false)
           setOsdVisible(true)
+          if (isHybridVideoOnly && hybridAudioRef.current) {
+            hybridAudioRef.current.pause()
+          }
           reportState('progress', 'Pause')
         }}
-        onWaiting={() => setBuffering(true)}
-        onPlaying={() => setBuffering(false)}
-        onLoadedMetadata={(e) => {
-          setDuration(e.currentTarget.duration || 0)
+        onWaiting={() => {
+          setBuffering(true)
+          if (isHybridVideoOnly && hybridAudioRef.current) {
+            hybridAudioRef.current.pause()
+          }
+        }}
+        onPlaying={() => {
           setBuffering(false)
+          if (isHybridVideoOnly && hybridAudioRef.current?.src && !videoRef.current?.paused) {
+            hybridAudioRef.current.play().catch(() => undefined)
+          }
+        }}
+        onSeeked={(e) => {
+          if (!isHybridVideoOnly || !hybridAudioRef.current || !id) return
+          const targetSec = Math.max(0, e.currentTarget.currentTime || 0)
+          const a = hybridAudioRef.current
+          const localSec = targetSec - hybridAudioBaseSecRef.current
+          let withinBuffered = false
+          if (localSec >= 0 && a.buffered) {
+            for (let i = 0; i < a.buffered.length; i++) {
+              if (localSec >= a.buffered.start(i) && localSec <= a.buffered.end(i)) {
+                withinBuffered = true
+                break
+              }
+            }
+          }
+          if (withinBuffered) {
+            a.currentTime = localSec
+            if (!e.currentTarget.paused) {
+              a.play().catch(() => undefined)
+            }
+          } else {
+            hybridAudioBaseSecRef.current = targetSec
+            a.src = getUniversalAudioTranscodeUrl(id, {
+              mediaSourceId: activeSource?.Id,
+              audioStreamIndex: effectiveAudioIndex,
+              startTimeTicks: Math.floor(targetSec * 10_000_000),
+              isStrm: Boolean(streamPlan?.isStrm),
+              userId,
+            })
+            a.load()
+            if (!e.currentTarget.paused) {
+              a.play().catch(() => undefined)
+            }
+          }
+        }}
+        onLoadedMetadata={(e) => {
+          const d = e.currentTarget.duration
+          setDuration(Number.isFinite(d) && d > 0 ? d : 0)
+          setBuffering(false)
+        }}
+        onDurationChange={(e) => {
+          const d = e.currentTarget.duration
+          if (Number.isFinite(d) && d > 0) {
+            setDuration(d)
+          }
         }}
         onTimeUpdate={(e) => {
           const v = e.currentTarget
@@ -2041,12 +2269,33 @@ export function PlayerPage() {
           if (v.buffered.length > 0) {
             setBufferedEnd(v.buffered.end(v.buffered.length - 1))
           }
+          if (
+            isHybridVideoOnly &&
+            !v.paused &&
+            hybridAudioRef.current &&
+            !hybridAudioRef.current.paused
+          ) {
+            const a = hybridAudioRef.current
+            const expectedLocal = Math.max(0, v.currentTime - hybridAudioBaseSecRef.current)
+            const drift = expectedLocal - a.currentTime
+            if (Math.abs(drift) > 0.35 && Math.abs(drift) < 5) {
+              for (let i = 0; i < a.buffered.length; i++) {
+                if (expectedLocal >= a.buffered.start(i) && expectedLocal <= a.buffered.end(i)) {
+                  a.currentTime = expectedLocal
+                  break
+                }
+              }
+            }
+          }
         }}
         onEnded={() => {
           setPlaying(false)
           setOsdVisible(true)
+          if (hybridAudioRef.current) {
+            hybridAudioRef.current.pause()
+          }
           reportState('stop')
-          if (nextQueueItem && (playlistId || loadPlaybackPrefs().autoPlayNextEpisode)) {
+          if (nextQueueItem && (playlistId || loadPlaybackPrefs(userId).autoPlayNextEpisode)) {
             setNextUpCountdown(8)
           }
         }}
@@ -2083,6 +2332,20 @@ export function PlayerPage() {
           setPlayerError(t('player.loadError'))
         }}
         className={`h-full w-full ${aspectMode === 'cover' ? 'object-cover' : 'object-contain'}`}
+      />
+
+      {/* 混合双流模式隐藏同步音频（大体积杜比 AC3/EAC3/DTS MKV 零视频重编码） */}
+      <audio
+        ref={hybridAudioRef}
+        data-testid="hybrid-audio-element"
+        className="hidden"
+        onError={() => {
+          if (isHybridVideoOnly && !forceServerHls) {
+            captureResumePosition()
+            setWasmFallbackNotice('独立音频转码流加载失败，已自动切换服务端 HLS')
+            setForceServerHls(true)
+          }
+        }}
       />
 
       {/* JASSUB (libass WASM) ASS/SSA 特效字幕覆盖 Canvas */}
@@ -2222,6 +2485,22 @@ export function PlayerPage() {
         </div>
       )}
 
+      {/* 跳过片头 (Intro Skip) 浮层按钮 */}
+      {introSkipTarget && nextUpCountdown === null && !playerError && !infoError && (
+        <button
+          type="button"
+          data-testid="skip-intro-button"
+          onClick={(e) => {
+            e.stopPropagation()
+            seekToChapter(introSkipTarget.targetTicks)
+          }}
+          className="absolute bottom-24 right-6 z-30 inline-flex items-center gap-2 rounded-xl border border-amber-400/50 bg-zinc-950/90 px-4 py-2.5 text-xs font-semibold text-amber-300 shadow-2xl backdrop-blur-xl transition-all hover:bg-amber-500 hover:text-zinc-950"
+        >
+          <SkipForward className="h-4 w-4" />
+          <span>跳过片头</span>
+        </button>
+      )}
+
       {/* 自动连播下一集 / 下一项 8 秒倒计时浮层 */}
       {nextUpCountdown !== null && nextQueueItem && (
         <div
@@ -2299,7 +2578,9 @@ export function PlayerPage() {
               label="客户端解复用"
               value={
                 playMethod === 'Stream MKV (MSE)'
-                  ? '流式 Range + MSE（支持 GB 级 MKV）'
+                  ? isHybridVideoOnly
+                    ? 'MSE 视频零转码直通 + 同步 AAC 音轨'
+                    : '流式 Range + MSE（支持 GB 级 MKV）'
                   : playMethod === 'Client WASM Remux'
                     ? 'WASM 已启用（单线程兼容）'
                     : !wasmSupported
@@ -2345,7 +2626,7 @@ export function PlayerPage() {
             )}
             <StatRow
               label="缓冲进度"
-              value={`${formatSeconds(bufferedEnd)} / ${formatSeconds(duration)}`}
+              value={`${formatSeconds(bufferedEnd)} / ${formatSeconds(effectiveDurationSec)}`}
             />
             {wasmFallbackNotice && (
               <p className="rounded-lg border border-sky-400/20 bg-sky-500/10 px-2.5 py-1.5 font-sans text-[11px] leading-relaxed text-sky-200">
@@ -2475,15 +2756,15 @@ export function PlayerPage() {
         <div
           className="group/bar relative mb-3 flex items-center py-2"
           onMouseMove={(e) => {
-            if (duration <= 0) return
+            if (effectiveDurationSec <= 0) return
             const rect = e.currentTarget.getBoundingClientRect()
             if (rect.width <= 0) return
             const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width))
-            setHoverSeek({ timeSec: ratio * duration, pct: ratio * 100 })
+            setHoverSeek({ timeSec: ratio * effectiveDurationSec, pct: ratio * 100 })
           }}
           onMouseLeave={() => setHoverSeek(null)}
         >
-          {hoverSeek && duration > 0 && (
+          {hoverSeek && effectiveDurationSec > 0 && (
             <div
               data-testid="bif-preview-tooltip"
               className="pointer-events-none absolute bottom-8 z-30 -translate-x-1/2 overflow-hidden rounded-xl border border-white/15 bg-zinc-950/95 p-1.5 text-center shadow-2xl backdrop-blur-md"
@@ -2517,11 +2798,12 @@ export function PlayerPage() {
               style={{ width: `${progressPct}%` }}
             />
             {chapters.length > 0 &&
-              duration > 0 &&
+              effectiveDurationSec > 0 &&
               chapters.map((ch, idx) => {
                 const startSec = ch.StartPositionTicks / 10_000_000
-                if (!Number.isFinite(startSec) || startSec < 0 || startSec > duration) return null
-                const pct = (startSec / duration) * 100
+                if (!Number.isFinite(startSec) || startSec < 0 || startSec > effectiveDurationSec)
+                  return null
+                const pct = (startSec / effectiveDurationSec) * 100
                 return (
                   <span
                     key={`${ch.StartPositionTicks}-${idx}`}
@@ -2536,15 +2818,18 @@ export function PlayerPage() {
           <input
             type="range"
             min={0}
-            max={duration || 100}
+            max={effectiveDurationSec || 100}
             step={0.5}
             value={currentTime}
             onChange={(e) => {
               const t = Number(e.target.value)
               if (videoRef.current) videoRef.current.currentTime = t
               setCurrentTime(t)
-              if (duration > 0) {
-                setHoverSeek({ timeSec: t, pct: Math.min(100, Math.max(0, (t / duration) * 100)) })
+              if (effectiveDurationSec > 0) {
+                setHoverSeek({
+                  timeSec: t,
+                  pct: Math.min(100, Math.max(0, (t / effectiveDurationSec) * 100)),
+                })
               }
             }}
             onPointerUp={() => {
@@ -2646,6 +2931,10 @@ export function PlayerPage() {
                     videoRef.current.volume = val
                     videoRef.current.muted = val === 0
                   }
+                  if (hybridAudioRef.current) {
+                    hybridAudioRef.current.volume = val
+                    hybridAudioRef.current.muted = val === 0
+                  }
                   setVolume(val)
                   setMuted(val === 0)
                 }}
@@ -2655,7 +2944,7 @@ export function PlayerPage() {
 
             <span className="ml-1 font-mono text-xs text-zinc-300">
               {formatSeconds(currentTime)} <span className="text-zinc-500">/</span>{' '}
-              {formatSeconds(duration)}
+              {formatSeconds(effectiveDurationSec)}
             </span>
           </div>
 
@@ -2742,7 +3031,7 @@ export function PlayerPage() {
                           onClick={() => {
                             if (src.Id !== activeSource?.Id) {
                               captureResumePosition()
-                              const prefs = loadPlaybackPrefs()
+                              const prefs = loadPlaybackPrefs(userId)
                               const nextStreams = src.MediaStreams || []
                               const nextAudioList = nextStreams.filter((s) => s.Type === 'Audio')
                               const nextAudio = pickPreferredAudioIndex(
@@ -2960,6 +3249,20 @@ export function PlayerPage() {
                       )
                     })}
                   </div>
+                  <div className="mt-1.5 border-t border-white/10 pt-1.5">
+                    <button
+                      type="button"
+                      data-testid="open-remote-subtitle-modal"
+                      onClick={() => {
+                        setActivePanel('none')
+                        setRemoteSubModalOpen(true)
+                      }}
+                      className="flex w-full items-center justify-center gap-1.5 rounded-xl border border-amber-500/30 bg-amber-500/12 px-2.5 py-2 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
+                    >
+                      <Search className="h-3.5 w-3.5" />
+                      <span>在线搜索字幕</span>
+                    </button>
+                  </div>
                 </div>
               )}
             </div>
@@ -3146,6 +3449,7 @@ export function PlayerPage() {
                       onClick={() => {
                         setPlaybackRate(r)
                         if (videoRef.current) videoRef.current.playbackRate = r
+                        if (hybridAudioRef.current) hybridAudioRef.current.playbackRate = r
                         setActivePanel('none')
                       }}
                       className={`block w-full rounded-xl px-3 py-1.5 text-center text-xs ${
@@ -3278,6 +3582,16 @@ export function PlayerPage() {
           </div>
         </div>
       </div>
+
+      <RemoteSubtitleModal
+        open={remoteSubModalOpen}
+        itemId={id || ''}
+        itemName={item?.Name}
+        onClose={() => setRemoteSubModalOpen(false)}
+        onDownloaded={() => {
+          void refetchPlaybackInfo()
+        }}
+      />
     </div>
   )
 }

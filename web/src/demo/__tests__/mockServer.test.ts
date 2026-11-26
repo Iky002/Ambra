@@ -265,16 +265,21 @@ describe('Demo Mock 引擎 - Serverless 完整闭环测试', () => {
     const libsAfterDelete = await api.getVirtualFolders()
     expect(libsAfterDelete.some((l) => l.ItemId === newLib.ItemId)).toBe(false)
 
-    // 3. 创建与吊销 API Key
+    // 3. 创建与吊销 API Key（一次性完整 Token + 历史列表脱敏掩码 + 支持 Id/AccessToken 吊销）
     const newKey = await api.createApiKey('Infuse Sync')
     expect(newKey.AppName).toBe('Infuse Sync')
+    expect(newKey.Id).toBeTruthy()
     expect(newKey.AccessToken).toBeTruthy()
+    expect(newKey.AccessToken.includes('*')).toBe(false)
     const keysAfterCreate = await api.getApiKeys()
-    expect(keysAfterCreate.Items.some((k) => k.AccessToken === newKey.AccessToken)).toBe(true)
+    const listedKey = keysAfterCreate.Items.find((k) => k.Id === newKey.Id)
+    expect(listedKey).toBeDefined()
+    expect(listedKey?.AccessToken).not.toBe(newKey.AccessToken)
+    expect(listedKey?.MaskedToken || listedKey?.AccessToken).toMatch(/[•*]/)
 
-    await api.deleteApiKey(newKey.AccessToken)
+    await api.deleteApiKey(newKey.Id || newKey.AccessToken)
     const keysAfterDelete = await api.getApiKeys()
-    expect(keysAfterDelete.Items.some((k) => k.AccessToken === newKey.AccessToken)).toBe(false)
+    expect(keysAfterDelete.Items.some((k) => k.Id === newKey.Id)).toBe(false)
 
     // 4. 插件配置可写 & 计划任务 & 日志
     await api.updatePluginConfiguration('ambra.metadata.tmdb', {
@@ -594,5 +599,299 @@ describe('Demo Mock 引擎 - Serverless 完整闭环测试', () => {
     await api.movePlaylistItem(pl.Id, 'item-oppenheimer', 0)
     const plItems = await api.getPlaylistItems(pl.Id, uid)
     expect(plItems.Items.map((i) => i.Id)).toEqual(['item-oppenheimer', 'item-dune-2'])
+  })
+
+  it('M-22: 多用户观看进度、收藏、已看状态与实时播放会话完全隔离，切号不串号', async () => {
+    const adminAuth = await loginAsDemo('admin')
+    const adminId = adminAuth.User.Id
+
+    // Admin 修改 item-dune-2 状态并上报播放会话
+    await api.toggleFavorite(adminId, 'item-dune-2', false)
+    await api.reportProgress({
+      ItemId: 'item-dune-2',
+      PositionTicks: 25 * 60 * 10_000_000,
+      IsPaused: false,
+      PlayMethod: 'DirectPlay',
+    })
+    const adminDune = await api.getItem(adminId, 'item-dune-2')
+    expect(adminDune.UserData?.IsFavorite).toBe(true)
+    expect(adminDune.UserData?.PlaybackPositionTicks).toBe(25 * 60 * 10_000_000)
+
+    // 切换为 guest 账号，验证 item-dune-2 未受 admin 影响
+    const guestAuth = await loginAsDemo('guest')
+    const guestId = guestAuth.User.Id
+    const guestDune = await api.getItem(guestId, 'item-dune-2')
+    expect(guestDune.UserData?.IsFavorite).toBe(false)
+    expect(guestDune.UserData?.PlaybackPositionTicks || 0).toBe(0)
+
+    const guestResume = await api.getResumeItems(guestId, 20)
+    expect(guestResume.Items.some((i) => i.Id === 'item-dune-2')).toBe(false)
+
+    // Guest 独立操作 item-interstellar 并上报播放进度
+    await api.togglePlayed(guestId, 'item-interstellar', false)
+    await api.reportProgress({
+      ItemId: 'item-oppenheimer',
+      PositionTicks: 15 * 60 * 10_000_000,
+      IsPaused: true,
+      PlayMethod: 'DirectStream',
+    })
+
+    // 切回 admin 验证两者会话同时存在且各自观看状态独立
+    await loginAsDemo('admin')
+    const adminInterstellar = await api.getItem(adminId, 'item-interstellar')
+    expect(adminInterstellar.UserData?.Played).toBe(false)
+
+    const sessions = await api.getSessions()
+    const adminSess = sessions.find((s) => s.UserId === adminId && s.NowPlayingItem)
+    const guestSess = sessions.find((s) => s.UserId === guestId && s.NowPlayingItem)
+    expect(adminSess?.NowPlayingItem?.Id).toBe('item-dune-2')
+    expect(guestSess?.NowPlayingItem?.Id).toBe('item-oppenheimer')
+  })
+
+  it('M-22: 管理端写接口对非管理员强制返回 403，且仅在开启 EnableContentDeletion 时放行删片', async () => {
+    const guestAuth = await loginAsDemo('guest')
+    const guestId = guestAuth.User.Id
+
+    await expect(
+      api.createVirtualFolder({ Name: 'Hack', CollectionType: 'movies', Paths: ['/media/movies'] }),
+    ).rejects.toMatchObject({ status: 403 })
+    await expect(api.createUser({ Name: 'hacker' })).rejects.toMatchObject({ status: 403 })
+    await expect(
+      api.updateUserPolicy('user-demo-admin', { IsAdministrator: false }),
+    ).rejects.toMatchObject({ status: 403 })
+    await expect(api.updateServerConfig({ ServerName: 'Owned' })).rejects.toMatchObject({
+      status: 403,
+    })
+    await expect(
+      api.updatePluginConfiguration('ambra.metadata.tmdb', { Enabled: false }),
+    ).rejects.toMatchObject({ status: 403 })
+    await expect(
+      api.saveWebhook({ Name: 'Hook', Url: 'https://example.com/hook', Events: ['*'] }),
+    ).rejects.toMatchObject({ status: 403 })
+    await expect(api.runScheduledTask('task-scan-libraries')).rejects.toMatchObject({ status: 403 })
+    await expect(api.createBackup()).rejects.toMatchObject({ status: 403 })
+    await expect(
+      embyFetch('/api/admin/migration/status'),
+    ).rejects.toMatchObject({ status: 403 })
+    await expect(api.deleteItem('item-dune-2')).rejects.toMatchObject({ status: 403 })
+
+    // 管理员授予 guest EnableContentDeletion 后，guest 可删除其有权访问的条目
+    await loginAsDemo('admin')
+    await api.updateUserPolicy(guestId, {
+      IsAdministrator: false,
+      EnableAllFolders: true,
+      EnabledFolders: [],
+      EnableContentDeletion: true,
+    })
+
+    await loginAsDemo('guest')
+    await expect(api.deleteItem('item-dune-2')).resolves.toBeUndefined()
+  })
+
+  it('M-22: 媒体库白名单与家长控制 (MaxParentalRating / BlockUnratedItems / BlockedTags / AllowedTags) 全路由生效且局部更新不丢分级', async () => {
+    await loginAsDemo('admin')
+    const allLibs = await api.getVirtualFolders()
+    const tvLibId =
+      allLibs.find((l) => l.CollectionType === 'tvshows')?.ItemId || 'lib-series'
+
+    // 将 item-wandering-earth-2 设为无分级以验证 BlockUnratedItems
+    await api.updateItemMetadata('item-wandering-earth-2', { OfficialRating: '' })
+
+    // 先配置媒体库白名单仅限电影库 + 最高 PG-13 (7) + 拦截未分级电影
+    await api.updateUserPolicy('user-demo-guest', {
+      IsAdministrator: false,
+      EnableAllFolders: false,
+      EnabledFolders: ['lib-movies'],
+      MaxParentalRating: 7,
+      BlockUnratedItems: ['Movie'],
+      BlockedTags: [],
+      AllowedTags: ['IMDb Top250'],
+    })
+
+    // 单独局部更新 BlockedTags 时，不应清除已有的 MaxParentalRating
+    await embyFetch('/emby/Users/user-demo-guest/Policy', {
+      method: 'POST',
+      body: JSON.stringify({ BlockedTags: ['豆瓣热门电影'] }),
+    })
+    const guestProfile = await api.getUser('user-demo-guest')
+    expect(guestProfile.Policy?.MaxParentalRating).toBe(7)
+    expect(guestProfile.Policy?.BlockedTags).toEqual(['豆瓣热门电影'])
+
+    // 切换为 guest，验证 Items / Resume / Latest / NextUp / Search / Collections / 单条目详情全部受控
+    const guestAuth = await loginAsDemo('guest')
+    const gid = guestAuth.User.Id
+
+    const items = await api.getItems(gid, { includeItemTypes: 'Movie,Series', limit: 50 })
+    // R 级电影（如肖申克的救赎/教父/奥本海默）、未分级电影（流浪地球 2）及剧集库条目均不应出现
+    expect(items.Items.some((i) => i.Id === 'item-shawshank-redemption')).toBe(false)
+    expect(items.Items.some((i) => i.Id === 'item-wandering-earth-2')).toBe(false)
+    expect(items.Items.some((i) => i.Type === 'Series')).toBe(false)
+    // PG-13 且带 IMDb Top250 标签的盗梦空间/星际穿越允许访问
+    expect(items.Items.some((i) => i.Id === 'item-inception')).toBe(true)
+
+    const nextUp = await api.getNextUp(gid, 10)
+    expect(nextUp.Items).toHaveLength(0)
+
+    const latestTv = await api.getLatestItems(gid, tvLibId, 10)
+    expect(latestTv).toHaveLength(0)
+
+    const hints = await api.searchHints('肖申克', gid)
+    expect(hints.SearchHints).toHaveLength(0)
+
+    await expect(api.getItem(gid, 'item-shawshank-redemption')).rejects.toMatchObject({
+      status: 403,
+    })
+
+    const cols = await embyFetch<{ Items: Array<{ Id: string; ChildCount?: number }> }>(
+      `/emby/Collections?UserId=${encodeURIComponent(gid)}`,
+    )
+    const scifiCol = cols.Items.find((c) => c.Id === 'boxset-scifi-epics')
+    if (scifiCol) {
+      const colChildren = await embyFetch<{ Items: Array<{ Id: string }> }>(
+        `/emby/Collections/${scifiCol.Id}/Items?UserId=${encodeURIComponent(gid)}`,
+      )
+      expect(colChildren.Items.some((i) => i.Id === 'item-wandering-earth-2')).toBe(false)
+    }
+  })
+
+  it('M-22: 支持标准 Authorization 头、配置与插件双向同步、6位 Hex PIN、Webhook URL 校验及迁移/转码新增路由', async () => {
+    const adminAuth = await loginAsDemo('admin')
+    const token = adminAuth.AccessToken
+
+    // 1. 标准 Authorization 头解析
+    clearAuth()
+    const sysViaStdAuth = await embyFetch<{ Id: string }>('/emby/System/Info', {
+      headers: { Authorization: `MediaBrowser Token="${token}"` },
+    })
+    expect(sysViaStdAuth.Id).toBeTruthy()
+
+    // 恢复登录态继续测试
+    await loginAsDemo('admin')
+
+    // 2. /System/Configuration 返回掩码并与内置插件配置双向联动
+    const cfg1 = await api.getServerConfig()
+    expect(cfg1.TMDBApiKey).toBe('********')
+    await api.updateServerConfig({
+      ServerName: 'Ambra Pro',
+      TMDBApiKey: '********',
+      TMDBLanguage: 'ja-JP',
+      EnableSTRM302: false,
+      PlayedThreshold: 0.85,
+      EnableDLNA: true,
+      LocalNetworkSubnets: ['192.168.1.0/24'],
+    })
+    const tmdbPluginCfg = await api.getPluginConfiguration('ambra.metadata.tmdb')
+    expect(tmdbPluginCfg.Language || tmdbPluginCfg.language).toBe('ja-JP')
+    expect(tmdbPluginCfg.ApiKey || tmdbPluginCfg.api_key).toBe('********')
+
+    await api.updatePluginConfiguration('ambra.metadata.tmdb', {
+      Enabled: true,
+      Priority: 8,
+      ApiKey: '********',
+      Language: 'ko-KR',
+    })
+    const cfg2 = await api.getServerConfig()
+    expect(cfg2.TMDBLanguage).toBe('ko-KR')
+    expect(cfg2.EnableDLNA).toBe(true)
+
+    // 3. 找回密码支持 6 位十六进制 PIN，拒绝非法字符
+    await expect(
+      embyFetch('/emby/Users/ForgotPassword/Pin', {
+        method: 'POST',
+        body: JSON.stringify({ Pin: 'ZZZZZZ' }),
+      }),
+    ).rejects.toMatchObject({ status: 400 })
+    const pinRes = await embyFetch<{ Success: boolean }>('/emby/Users/ForgotPassword/Pin', {
+      method: 'POST',
+      body: JSON.stringify({ Pin: 'A1B2F9' }),
+    })
+    expect(pinRes.Success).toBe(true)
+
+    // 4. Webhook 测试校验合法 HTTP(S) URL 协议
+    await expect(
+      api.testWebhook({ Name: 'Bad', Url: 'ftp://internal.local/hook' }),
+    ).rejects.toMatchObject({ status: 400 })
+
+    // 5. Encoding FfmpegOptions & FullToneMapOptions 读写闭环
+    await embyFetch('/emby/Encoding/FfmpegOptions', {
+      method: 'POST',
+      body: JSON.stringify({
+        HardwareAccelerationMode: 5,
+        EnableHardwareEncoding: true,
+        AllowHevcEncoding: true,
+        H264Crf: 20,
+        H264Preset: 'fast',
+        EnableThrottling: true,
+        ThrottleBufferSize: 180,
+        TranscodingTempPath: '/dev/shm/ambra-transcode',
+      }),
+    })
+    const ffmpegOpts = await embyFetch<{ HardwareAccelerationMode: number; H264Preset: string }>(
+      '/emby/Encoding/FfmpegOptions',
+    )
+    expect(ffmpegOpts.HardwareAccelerationMode).toBe(5)
+    expect(ffmpegOpts.H264Preset).toBe('fast')
+
+    await embyFetch('/emby/Encoding/FullToneMapOptions', {
+      method: 'POST',
+      body: JSON.stringify({ EnableToneMapping: true, ToneMappingAlgorithm: 'mobius' }),
+    })
+    const toneOpts = await embyFetch<{ EnableToneMapping: boolean; ToneMappingAlgorithm: string }>(
+      '/emby/Encoding/FullToneMapOptions',
+    )
+    expect(toneOpts.EnableToneMapping).toBe(true)
+    expect(toneOpts.ToneMappingAlgorithm).toBe('mobius')
+
+    // 6. 迁移 5 路由完整闭环 (/api/admin/migration/{status,test,dry-run,start,cancel})
+    const testConn = await embyFetch<{ users: Array<{ Id: string }> }>('/api/admin/migration/test', {
+      method: 'POST',
+      body: JSON.stringify({ source_url: 'http://192.168.1.88:8096', api_key: 'legacy-key' }),
+    })
+    expect(testConn.users.length).toBeGreaterThan(0)
+
+    const dryRep = await embyFetch<{ dry_run: boolean; items_matched: number }>(
+      '/api/admin/migration/dry-run',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          source_url: 'http://192.168.1.88:8096',
+          api_key: 'legacy-key',
+          user_ids: testConn.users.map((u) => u.Id),
+          migrate_users: true,
+          migrate_played: true,
+          migrate_favorites: true,
+          migrate_resume: true,
+        }),
+      },
+    )
+    expect(dryRep.dry_run).toBe(true)
+    expect(dryRep.items_matched).toBeGreaterThan(0)
+
+    const startRep = await embyFetch<{ status: string }>('/api/admin/migration/start', {
+      method: 'POST',
+      body: JSON.stringify({
+        source_url: 'http://192.168.1.88:8096',
+        api_key: 'legacy-key',
+        user_ids: testConn.users.map((u) => u.Id),
+      }),
+    })
+    expect(startRep.status).toBe('running')
+
+    const cancelRes = await embyFetch<{ cancelled: boolean; report: { status: string } }>(
+      '/api/admin/migration/cancel',
+      { method: 'POST' },
+    )
+    expect(cancelRes.cancelled).toBe(true)
+    expect(cancelRes.report.status).toBe('cancelled')
+
+    // 7. LiveTv SeriesTimers / ChannelMappings 与在线字幕搜索模拟路由
+    const seriesTimers = await embyFetch<{ Items: unknown[] }>('/emby/LiveTv/SeriesTimers')
+    expect(Array.isArray(seriesTimers.Items)).toBe(true)
+    const mappings = await embyFetch<unknown[]>('/emby/LiveTv/ChannelMappings')
+    expect(Array.isArray(mappings)).toBe(true)
+    const remoteSubs = await embyFetch<Array<{ Id: string }>>(
+      '/emby/Items/item-dune-2/RemoteSearch/Subtitles/zh-CN',
+    )
+    expect(remoteSubs.length).toBeGreaterThan(0)
   })
 })

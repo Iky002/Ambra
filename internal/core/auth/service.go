@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/config"
@@ -25,7 +26,18 @@ var (
 	ErrUnauthorized       = errors.New("unauthorized")
 	ErrUserExists         = errors.New("user already exists")
 	ErrUserNotFound       = errors.New("user not found")
+	ErrInvalidUsername    = errors.New("invalid username")
 )
+
+// ContainsControlChar reports whether s contains any Unicode control character.
+func ContainsControlChar(s string) bool {
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			return true
+		}
+	}
+	return false
+}
 
 const (
 	tokenCacheTTL       = 5 * time.Minute
@@ -56,9 +68,9 @@ type TokenIdentity struct {
 }
 
 type cachedToken struct {
-	identity   *TokenIdentity
-	expiresAt  time.Time
-	lastFlush  time.Time
+	identity  *TokenIdentity
+	expiresAt time.Time
+	lastFlush time.Time
 }
 
 type Service struct {
@@ -76,6 +88,14 @@ func NewService(repo *sqlite.UserRepo, cfg *config.Config) *Service {
 		cfg:   cfg,
 		cache: make(map[string]*cachedToken),
 	}
+}
+
+// Config returns the underlying server configuration pointer (may be nil in isolated tests).
+func (s *Service) Config() *config.Config {
+	if s == nil {
+		return nil
+	}
+	return s.cfg
 }
 
 // EnsureDefaultAdmin creates an initial administrator user when the users table is empty
@@ -110,9 +130,12 @@ func (s *Service) EnsureDefaultAdmin(ctx context.Context) error {
 }
 
 func (s *Service) CreateUser(ctx context.Context, name, password string, isAdmin bool) (*sqlite.UserRecord, error) {
+	if ContainsControlChar(name) {
+		return nil, ErrInvalidUsername
+	}
 	name = strings.TrimSpace(name)
 	if name == "" {
-		return nil, errors.New("username cannot be empty")
+		return nil, ErrInvalidUsername
 	}
 	if existing, err := s.repo.GetUserByName(ctx, name); err == nil && existing != nil {
 		return nil, ErrUserExists
@@ -239,9 +262,14 @@ func (s *Service) IssueSessionForUser(ctx context.Context, u *sqlite.UserRecord,
 	}
 	s.putCache(token, identity, now)
 
+	var serverID string
+	if s.cfg != nil {
+		serverID = s.cfg.Snapshot().ServerID
+	}
+
 	sessInfo := dto.SessionInfo{
 		Id:                 SessionID(u.ID, deviceID),
-		ServerId:           s.cfg.ServerID,
+		ServerId:           serverID,
 		UserId:             u.ID,
 		UserName:           u.Name,
 		Client:             appName,
@@ -260,7 +288,7 @@ func (s *Service) IssueSessionForUser(ctx context.Context, u *sqlite.UserRecord,
 		User:        s.ToUserDto(u),
 		SessionInfo: sessInfo,
 		AccessToken: token,
-		ServerId:    s.cfg.ServerID,
+		ServerId:    serverID,
 	}, nil
 }
 
@@ -381,12 +409,25 @@ func (s *Service) ListAPIKeys(ctx context.Context) ([]sqlite.APIKeyRecord, error
 	return s.repo.ListAPIKeys(ctx)
 }
 
-func (s *Service) RevokeAPIKey(ctx context.Context, token string) error {
-	if err := s.repo.DeleteAPIKey(ctx, token); err != nil {
+func (s *Service) RevokeAPIKey(ctx context.Context, idOrToken string) error {
+	deletedToken, err := s.repo.DeleteAPIKeyByIDOrToken(ctx, idOrToken)
+	if err != nil {
 		return err
 	}
-	s.InvalidateTokenCache(token)
+	if deletedToken != "" {
+		s.InvalidateAPIKey(deletedToken)
+	} else {
+		s.InvalidateAPIKey(idOrToken)
+	}
 	return nil
+}
+
+// InvalidateAPIKey evicts a revoked API key token from the in-memory auth cache.
+func (s *Service) InvalidateAPIKey(token string) {
+	if s == nil {
+		return
+	}
+	s.InvalidateTokenCache(token)
 }
 
 func (s *Service) RevokeToken(ctx context.Context, token string) error {
@@ -503,8 +544,9 @@ func (s *Service) ToUserDto(u *sqlite.UserRecord) dto.UserDto {
 	hasPw := u.PasswordHash != ""
 	var dataDir, serverID string
 	if s.cfg != nil {
-		dataDir = s.cfg.DataDir
-		serverID = s.cfg.ServerID
+		snap := s.cfg.Snapshot()
+		dataDir = snap.DataDir
+		serverID = snap.ServerID
 	}
 	return dto.UserDto{
 		Name:                      u.Name,

@@ -58,6 +58,7 @@ export function MetadataEditorModal({
   const [name, setName] = useState('')
   const [originalTitle, setOriginalTitle] = useState('')
   const [sortName, setSortName] = useState('')
+  const [sortNameTouched, setSortNameTouched] = useState(false)
   const [productionYear, setProductionYear] = useState('')
   const [communityRating, setCommunityRating] = useState('')
   const [officialRating, setOfficialRating] = useState('')
@@ -95,6 +96,7 @@ export function MetadataEditorModal({
     setName(item.Name || '')
     setOriginalTitle(item.OriginalTitle || '')
     setSortName(item.SortName || '')
+    setSortNameTouched(false)
     setProductionYear(item.ProductionYear != null ? String(item.ProductionYear) : '')
     setCommunityRating(item.CommunityRating != null ? String(item.CommunityRating) : '')
     setOfficialRating(item.OfficialRating || '')
@@ -247,10 +249,21 @@ export function MetadataEditorModal({
     if (doubanId.trim()) providerIds.Douban = doubanId.trim()
     else delete providerIds.Douban
 
+    const trimmedSortName = sortName.trim()
+    const nameChanged = trimmedName !== (item.Name || '').trim()
+    const isIndexedItemType =
+      item.Type === 'Episode' || item.Type === 'Season' || item.Type === 'Audio'
+    const hasIndexPrefix =
+      /^\d{2,4}[\s\-_.:]/.test(trimmedSortName) || /^s\d+e\d+/i.test(trimmedSortName)
+    const effectiveSortName =
+      nameChanged && !sortNameTouched && !isIndexedItemType && !hasIndexPrefix
+        ? trimmedName.toLowerCase()
+        : trimmedSortName || trimmedName.toLowerCase()
+
     const payload: ItemMetadataUpdatePayload = {
       Name: trimmedName,
       OriginalTitle: originalTitle.trim(),
-      SortName: sortName.trim() || trimmedName.toLowerCase(),
+      SortName: effectiveSortName,
       ProductionYear: Number.isFinite(parsedYear) ? parsedYear : undefined,
       CommunityRating: Number.isFinite(parsedRating) ? parsedRating : undefined,
       OfficialRating: officialRating.trim(),
@@ -304,7 +317,10 @@ export function MetadataEditorModal({
             <input
               type="text"
               value={sortName}
-              onChange={(e) => setSortName(e.target.value)}
+              onChange={(e) => {
+                setSortName(e.target.value)
+                setSortNameTouched(true)
+              }}
               placeholder="用于拼音/字母排序"
               className="w-full rounded-xl border border-white/10 bg-zinc-900/90 px-3.5 py-2 text-sm text-zinc-100 outline-none transition-colors focus:border-amber-400/60"
             />

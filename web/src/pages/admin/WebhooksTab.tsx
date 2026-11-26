@@ -18,26 +18,43 @@ import { useI18n } from '../../i18n/I18nContext'
 import { AdminModal, FeedbackBanner, ToggleSwitch } from './adminUtils'
 
 export const WEBHOOK_EVENT_OPTIONS = [
-  { id: '*', label: '全部事件 (*)', desc: '接收所有系统与播放事件推送' },
-  { id: 'LibraryChanged', label: '媒体库变更 (LibraryChanged)', desc: '新媒体入库或元数据更新时触发' },
-  { id: 'UserDataChanged', label: '用户数据变更 (UserDataChanged)', desc: '收藏、已看状态或进度变更时触发' },
-  { id: 'PlaybackStart', label: '开始播放 (PlaybackStart)', desc: '用户开始播放音视频时触发' },
-  { id: 'PlaybackProgress', label: '播放进度 (PlaybackProgress)', desc: '用户播放进度更新或暂停恢复时触发' },
-  { id: 'PlaybackStop', label: '停止播放 (PlaybackStop)', desc: '用户停止播放或播完时触发' },
-  { id: 'SessionUpdated', label: '会话状态更新 (SessionUpdated)', desc: '客户端会话建立、活跃状态或设备变更时触发' },
-  { id: 'TaskProgress', label: '计划任务进度 (TaskProgress)', desc: '后台计划任务执行状态变更时触发' },
+  { id: '*', labelKey: 'admin.webhooks.eventAllLabel', descKey: 'admin.webhooks.eventAllDesc' },
+  {
+    id: 'LibraryChanged',
+    labelKey: 'admin.webhooks.eventLibLabel',
+    descKey: 'admin.webhooks.eventLibDesc',
+  },
+  {
+    id: 'UserDataChanged',
+    labelKey: 'admin.webhooks.eventUserDataLabel',
+    descKey: 'admin.webhooks.eventUserDataDesc',
+  },
+  {
+    id: 'PlaybackStart',
+    labelKey: 'admin.webhooks.eventPlayStartLabel',
+    descKey: 'admin.webhooks.eventPlayStartDesc',
+  },
+  {
+    id: 'PlaybackProgress',
+    labelKey: 'admin.webhooks.eventPlayProgLabel',
+    descKey: 'admin.webhooks.eventPlayProgDesc',
+  },
+  {
+    id: 'PlaybackStop',
+    labelKey: 'admin.webhooks.eventPlayStopLabel',
+    descKey: 'admin.webhooks.eventPlayStopDesc',
+  },
+  {
+    id: 'SessionUpdated',
+    labelKey: 'admin.webhooks.eventSessionLabel',
+    descKey: 'admin.webhooks.eventSessionDesc',
+  },
+  {
+    id: 'TaskProgress',
+    labelKey: 'admin.webhooks.eventTaskLabel',
+    descKey: 'admin.webhooks.eventTaskDesc',
+  },
 ] as const
-
-const EVENT_LABEL_MAP: Record<string, string> = {
-  '*': '全部事件 (*)',
-  LibraryChanged: 'LibraryChanged',
-  UserDataChanged: 'UserDataChanged',
-  PlaybackStart: 'PlaybackStart',
-  PlaybackProgress: 'PlaybackProgress',
-  PlaybackStop: 'PlaybackStop',
-  SessionUpdated: 'SessionUpdated',
-  TaskProgress: 'TaskProgress',
-}
 
 export function WebhooksTab() {
   const queryClient = useQueryClient()
@@ -47,7 +64,6 @@ export function WebhooksTab() {
     null,
   )
 
-  // 新增 / 编辑弹窗状态
   const [modalOpen, setModalOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editingHasSecret, setEditingHasSecret] = useState(false)
@@ -60,11 +76,9 @@ export function WebhooksTab() {
   const [saving, setSaving] = useState(false)
   const [modalError, setModalError] = useState<string | null>(null)
 
-  // 发送测试状态与每条 Webhook 的最近测试结果
   const [testingId, setTestingId] = useState<string | null>(null)
   const [testResults, setTestResults] = useState<Record<string, WebhookTestResult>>({})
 
-  // 删除确认弹窗状态
   const [deleteTarget, setDeleteTarget] = useState<WebhookInfo | null>(null)
   const [deleting, setDeleting] = useState(false)
 
@@ -142,15 +156,15 @@ export function WebhooksTab() {
     const trimmedName = name.trim()
     const trimmedUrl = url.trim()
     if (!trimmedName) {
-      setModalError('请输入 Webhook 名称')
+      setModalError(t('admin.webhooks.errNameRequired'))
       return
     }
     if (!trimmedUrl) {
-      setModalError('请输入目标推送 URL')
+      setModalError(t('admin.webhooks.errUrlRequired'))
       return
     }
     if (events.length === 0) {
-      setModalError('请至少选择一个订阅事件')
+      setModalError(t('admin.webhooks.errEventsRequired'))
       return
     }
 
@@ -176,14 +190,35 @@ export function WebhooksTab() {
       setFeedback({
         type: 'success',
         message: editingId
-          ? `已更新 Webhook「${trimmedName}」`
-          : `已创建 Webhook「${trimmedName}」`,
+          ? t('admin.webhooks.updatedSuccess', { name: trimmedName })
+          : t('admin.webhooks.createdSuccess', { name: trimmedName }),
       })
     } catch (err) {
-      setModalError(err instanceof Error ? err.message : '保存 Webhook 失败')
+      setModalError(err instanceof Error ? err.message : t('admin.webhooks.saveFailed'))
     } finally {
       setSaving(false)
     }
+  }
+
+  const formatFailureDetail = (res: WebhookTestResult): string => {
+    const parts: string[] = []
+    const reason =
+      res.Error?.trim() ||
+      (res.StatusCode !== undefined && res.StatusCode > 0
+        ? `HTTP ${res.StatusCode}`
+        : t('admin.webhooks.unknownEndpointError'))
+    parts.push(reason)
+    if (
+      res.StatusCode !== undefined &&
+      res.StatusCode > 0 &&
+      !reason.includes(`HTTP ${res.StatusCode}`)
+    ) {
+      parts.push(`HTTP ${res.StatusCode}`)
+    }
+    if (res.DurationMs !== undefined) {
+      parts.push(`${res.DurationMs} ms`)
+    }
+    return parts.join(' · ')
   }
 
   const handleTest = async (wh: WebhookInfo) => {
@@ -198,27 +233,35 @@ export function WebhooksTab() {
       })
       setTestResults((prev) => ({ ...prev, [wh.Id]: res }))
       if (res.Success) {
-        const statusPart = res.StatusCode !== undefined ? `HTTP ${res.StatusCode}` : '成功'
+        const statusPart =
+          res.StatusCode !== undefined ? `HTTP ${res.StatusCode}` : t('admin.webhooks.testSuccessBadge')
         const durationPart = res.DurationMs !== undefined ? ` · ${res.DurationMs} ms` : ''
         setFeedback({
           type: 'success',
-          message: `Webhook「${wh.Name}」测试推送成功（${statusPart}${durationPart}）`,
+          message: t('admin.webhooks.testPushSuccess', {
+            name: wh.Name,
+            detail: `${statusPart}${durationPart}`,
+          }),
         })
       } else {
-        const statusPart = res.StatusCode !== undefined ? `HTTP ${res.StatusCode}` : ''
-        const durationPart = res.DurationMs !== undefined ? ` · ${res.DurationMs} ms` : ''
         setFeedback({
           type: 'error',
-          message: `Webhook「${wh.Name}」测试推送失败：${res.Error || statusPart || '目标端点返回异常'}${durationPart}`,
+          message: t('admin.webhooks.testPushFailed', {
+            name: wh.Name,
+            detail: formatFailureDetail(res),
+          }),
         })
       }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : '发送测试请求失败'
+      const msg = err instanceof Error ? err.message : t('admin.webhooks.unknownEndpointError')
       setTestResults((prev) => ({
         ...prev,
         [wh.Id]: { Success: false, Error: msg },
       }))
-      setFeedback({ type: 'error', message: `Webhook「${wh.Name}」测试失败：${msg}` })
+      setFeedback({
+        type: 'error',
+        message: t('admin.webhooks.testPushFailed', { name: wh.Name, detail: msg }),
+      })
     } finally {
       setTestingId(null)
     }
@@ -237,11 +280,14 @@ export function WebhooksTab() {
         delete next[deleteTarget.Id]
         return next
       })
-      setFeedback({ type: 'success', message: `已删除 Webhook「${deleteTarget.Name}」` })
+      setFeedback({
+        type: 'success',
+        message: t('admin.webhooks.deletedSuccess', { name: deleteTarget.Name }),
+      })
       setDeleteTarget(null)
       setModalError(null)
     } catch (err) {
-      setModalError(err instanceof Error ? err.message : '删除 Webhook 失败')
+      setModalError(err instanceof Error ? err.message : t('admin.webhooks.deleteFailed'))
     } finally {
       setDeleting(false)
     }
@@ -255,9 +301,7 @@ export function WebhooksTab() {
             <Webhook className="h-4 w-4 text-amber-400" />
             <span>{t('admin.webhooksTitle')}</span>
           </h2>
-          <p className="mt-1 text-xs text-zinc-400">
-            将媒体库入库、播放启停与系统任务事件通过 HTTP POST 实时推送至 Discord、Slack 或自建服务
-          </p>
+          <p className="mt-1 text-xs text-zinc-400">{t('admin.webhooks.subtitle')}</p>
         </div>
 
         <button
@@ -283,26 +327,24 @@ export function WebhooksTab() {
       ) : isError ? (
         <QueryErrorState
           compact
-          title="无法加载 Webhook 列表"
+          title={t('admin.webhooks.loadError')}
           error={error}
-          onRetry={() => refetch()}
+          onRetry={() => void refetch()}
         />
       ) : webhooks.length === 0 ? (
         <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-white/12 bg-white/[0.02] px-6 py-12 text-center">
           <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-amber-500/10 text-amber-400 ring-1 ring-amber-500/20">
             <Webhook className="h-6 w-6" />
           </div>
-          <p className="text-sm font-semibold text-zinc-100">尚未配置任何 Webhook 通知</p>
-          <p className="mt-1 max-w-md text-xs text-zinc-400">
-            添加 Webhook 端点后，Ambra 可在媒体库更新或用户播放时自动发送带可选 HMAC-SHA256 签名的 JSON 回调。
-          </p>
+          <p className="text-sm font-semibold text-zinc-100">{t('admin.webhooks.emptyTitle')}</p>
+          <p className="mt-1 max-w-md text-xs text-zinc-400">{t('admin.webhooks.emptyDesc')}</p>
           <button
             type="button"
             onClick={openCreateModal}
             className="mt-4 inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400"
           >
             <Plus className="h-3.5 w-3.5" />
-            <span>添加第一个 Webhook</span>
+            <span>{t('admin.webhooks.addFirstBtn')}</span>
           </button>
         </div>
       ) : (
@@ -322,17 +364,17 @@ export function WebhooksTab() {
                       <h3 className="truncate text-sm font-semibold text-zinc-100">{wh.Name}</h3>
                       {wh.Enabled ? (
                         <span className="inline-flex items-center gap-1 rounded-md bg-emerald-500/15 px-2 py-0.5 text-[11px] font-medium text-emerald-300 ring-1 ring-emerald-500/30">
-                          已启用
+                          {t('admin.plugins.statusEnabled')}
                         </span>
                       ) : (
                         <span className="inline-flex items-center gap-1 rounded-md bg-zinc-800 px-2 py-0.5 text-[11px] font-medium text-zinc-400 ring-1 ring-white/10">
-                          已停用
+                          {t('admin.plugins.statusDisabled')}
                         </span>
                       )}
                       {(wh.HasSecret || Boolean(wh.Secret)) && (
                         <span className="inline-flex items-center gap-1 rounded-md bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300 ring-1 ring-amber-500/20">
                           <Lock className="h-3 w-3" />
-                          HMAC 签名
+                          <span>{t('admin.webhooks.hmacBadge')}</span>
                         </span>
                       )}
                     </div>
@@ -347,7 +389,7 @@ export function WebhooksTab() {
                           key={ev}
                           className="rounded-md border border-white/8 bg-white/[0.04] px-2 py-0.5 text-[11px] text-zinc-300"
                         >
-                          {EVENT_LABEL_MAP[ev] || ev}
+                          {ev === '*' ? t('admin.webhooks.eventAllLabel') : ev}
                         </span>
                       ))}
                     </div>
@@ -355,7 +397,7 @@ export function WebhooksTab() {
                     {lastTest && (
                       <div
                         data-testid={`webhook-test-result-${wh.Id}`}
-                        className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs ${
+                        className={`inline-flex flex-wrap items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs ${
                           lastTest.Success
                             ? 'border-emerald-500/25 bg-emerald-500/10 text-emerald-300'
                             : 'border-red-500/25 bg-red-500/10 text-red-300'
@@ -366,11 +408,23 @@ export function WebhooksTab() {
                         ) : (
                           <XCircle className="h-3.5 w-3.5 shrink-0" />
                         )}
-                        <span>
-                          {lastTest.Success ? '测试成功' : `测试失败${lastTest.Error ? `: ${lastTest.Error}` : ''}`}
-                          {lastTest.StatusCode !== undefined ? ` · HTTP ${lastTest.StatusCode}` : ''}
-                          {lastTest.DurationMs !== undefined ? ` · ${lastTest.DurationMs} ms` : ''}
-                        </span>
+                        {lastTest.Success ? (
+                          <span>
+                            {t('admin.webhooks.testSuccessBadge')}
+                            {lastTest.StatusCode !== undefined
+                              ? ` · HTTP ${lastTest.StatusCode}`
+                              : ''}
+                            {lastTest.DurationMs !== undefined
+                              ? ` · ${lastTest.DurationMs} ms`
+                              : ''}
+                          </span>
+                        ) : (
+                          <span>
+                            {t('admin.webhooks.testFailedReason', {
+                              reason: formatFailureDetail(lastTest),
+                            })}
+                          </span>
+                        )}
                       </div>
                     )}
                   </div>
@@ -379,7 +433,7 @@ export function WebhooksTab() {
                     <button
                       type="button"
                       disabled={isTesting}
-                      onClick={() => handleTest(wh)}
+                      onClick={() => void handleTest(wh)}
                       className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/20 disabled:opacity-60"
                     >
                       {isTesting ? (
@@ -387,7 +441,7 @@ export function WebhooksTab() {
                       ) : (
                         <Send className="h-3.5 w-3.5" />
                       )}
-                      <span>发送测试</span>
+                      <span>{t('admin.webhooks.sendTestBtn')}</span>
                     </button>
 
                     <button
@@ -396,7 +450,7 @@ export function WebhooksTab() {
                       className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.05] px-3 py-1.5 text-xs font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:text-amber-300"
                     >
                       <Edit3 className="h-3.5 w-3.5" />
-                      <span>编辑</span>
+                      <span>{t('common.edit')}</span>
                     </button>
 
                     <button
@@ -405,7 +459,7 @@ export function WebhooksTab() {
                       className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20"
                     >
                       <Trash2 className="h-3.5 w-3.5" />
-                      <span>删除</span>
+                      <span>{t('common.delete')}</span>
                     </button>
                   </div>
                 </div>
@@ -418,8 +472,8 @@ export function WebhooksTab() {
       {/* 新增 / 编辑 Webhook 弹窗 */}
       <AdminModal
         open={modalOpen}
-        title={editingId ? '编辑 Webhook' : '新增 Webhook'}
-        subtitle="配置目标推送地址、可选签名密钥以及需要监听的事件类型"
+        title={editingId ? t('admin.webhooks.editModalTitle') : t('admin.createWebhook')}
+        subtitle={t('admin.webhooks.modalSubtitle')}
         maxWidthClass="max-w-xl"
         onClose={closeEditModal}
       >
@@ -438,7 +492,7 @@ export function WebhooksTab() {
               htmlFor="webhook-name-input"
               className="mb-1.5 block text-xs font-medium text-zinc-400"
             >
-              名称 *
+              {t('admin.webhooks.nameLabel')}
             </label>
             <input
               id="webhook-name-input"
@@ -446,7 +500,7 @@ export function WebhooksTab() {
               required
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="例如: Discord 入库通知"
+              placeholder={t('admin.webhooks.namePlaceholder')}
               className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
             />
           </div>
@@ -456,7 +510,7 @@ export function WebhooksTab() {
               htmlFor="webhook-url-input"
               className="mb-1.5 block text-xs font-medium text-zinc-400"
             >
-              推送 URL *
+              {t('admin.webhooks.urlLabel')}
             </label>
             <input
               id="webhook-url-input"
@@ -474,7 +528,7 @@ export function WebhooksTab() {
               htmlFor="webhook-secret-input"
               className="mb-1.5 block text-xs font-medium text-zinc-400"
             >
-              HMAC 密钥（可选）
+              {t('admin.webhooks.secretLabel')}
             </label>
             <input
               id="webhook-secret-input"
@@ -485,9 +539,9 @@ export function WebhooksTab() {
               placeholder={
                 editingId && editingHasSecret
                   ? clearSecret
-                    ? '保存后将清除已有签名密钥'
-                    : '已配置密钥，留空保留原密钥；输入新密钥将覆盖原值'
-                  : '留空不签名；填写后将附带 X-Ambra-Signature 请求头'
+                    ? t('admin.webhooks.secretClearedPlaceholder')
+                    : t('admin.webhooks.secretConfiguredPlaceholder')
+                  : t('admin.webhooks.secretEmptyPlaceholder')
               }
               className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60 disabled:cursor-not-allowed disabled:opacity-50"
             />
@@ -508,12 +562,12 @@ export function WebhooksTab() {
                     }}
                     className="h-3.5 w-3.5 rounded accent-amber-500"
                   />
-                  <span>清除已有 HMAC 签名密钥</span>
+                  <span>{t('admin.webhooks.clearSecretLabel')}</span>
                 </label>
                 <p className="text-[11px] text-amber-300/80">
                   {clearSecret
-                    ? '保存后将清空已有 HMAC 签名密钥，不再附带 X-Ambra-Signature 请求头。'
-                    : '当前 Webhook 已配置 HMAC 签名密钥：留空保留原密钥，输入新内容则更新密钥，或勾选上方选项清空密钥。'}
+                    ? t('admin.webhooks.clearSecretActiveHint')
+                    : t('admin.webhooks.clearSecretKeepHint')}
                 </p>
               </div>
             )}
@@ -522,12 +576,14 @@ export function WebhooksTab() {
           <ToggleSwitch
             checked={enabled}
             onChange={setEnabled}
-            label="启用此 Webhook"
-            description="关闭后将暂停向该端点发送事件推送"
+            label={t('admin.webhooks.enableWebhookLabel')}
+            description={t('admin.webhooks.enableWebhookDesc')}
           />
 
           <div className="rounded-xl border border-white/8 bg-white/[0.02] p-4">
-            <p className="mb-2.5 text-xs font-semibold text-zinc-200">订阅事件 *</p>
+            <p className="mb-2.5 text-xs font-semibold text-zinc-200">
+              {t('admin.webhooks.eventsTitle')}
+            </p>
             <div className="grid gap-2 sm:grid-cols-2">
               {WEBHOOK_EVENT_OPTIONS.map((ev) => {
                 const checked = events.includes(ev.id)
@@ -547,8 +603,8 @@ export function WebhooksTab() {
                       className="mt-0.5 h-4 w-4 rounded accent-amber-500"
                     />
                     <div className="min-w-0">
-                      <p className="truncate font-medium">{ev.label}</p>
-                      <p className="mt-0.5 text-[11px] text-zinc-400">{ev.desc}</p>
+                      <p className="truncate font-medium">{t(ev.labelKey)}</p>
+                      <p className="mt-0.5 text-[11px] text-zinc-400">{t(ev.descKey)}</p>
                     </div>
                   </label>
                 )
@@ -562,7 +618,7 @@ export function WebhooksTab() {
               onClick={closeEditModal}
               className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
             >
-              取消
+              {t('common.cancel')}
             </button>
             <button
               type="submit"
@@ -570,7 +626,11 @@ export function WebhooksTab() {
               className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 hover:bg-amber-400 disabled:opacity-60"
             >
               {saving && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-              <span>{editingId ? '保存修改' : '创建 Webhook'}</span>
+              <span>
+                {editingId
+                  ? t('admin.webhooks.saveChangesBtn')
+                  : t('admin.webhooks.createConfirmBtn')}
+              </span>
             </button>
           </div>
         </form>
@@ -579,8 +639,8 @@ export function WebhooksTab() {
       {/* 删除确认弹窗 */}
       <AdminModal
         open={Boolean(deleteTarget)}
-        title="确认删除 Webhook"
-        subtitle="删除后将不再向此端点发送任何事件通知"
+        title={t('admin.webhooks.deleteModalTitle')}
+        subtitle={t('admin.webhooks.deleteModalSubtitle')}
         maxWidthClass="max-w-md"
         onClose={closeDeleteModal}
       >
@@ -594,8 +654,7 @@ export function WebhooksTab() {
           </div>
         )}
         <p className="text-sm text-zinc-300">
-          确定要删除 Webhook <span className="font-semibold text-white">{deleteTarget?.Name}</span>{' '}
-          吗？
+          {t('admin.webhooks.deleteConfirmPrompt', { name: deleteTarget?.Name || '' })}
         </p>
         <div className="mt-6 flex justify-end gap-2">
           <button
@@ -603,16 +662,16 @@ export function WebhooksTab() {
             onClick={closeDeleteModal}
             className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
           >
-            取消
+            {t('common.cancel')}
           </button>
           <button
             type="button"
             disabled={deleting}
-            onClick={handleDelete}
+            onClick={() => void handleDelete()}
             className="inline-flex items-center gap-2 rounded-xl bg-red-500 px-4 py-2 text-xs font-semibold text-white hover:bg-red-400 disabled:opacity-60"
           >
             {deleting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-            <span>确认删除</span>
+            <span>{t('admin.users.confirmDelete')}</span>
           </button>
         </div>
       </AdminModal>

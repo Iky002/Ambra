@@ -201,18 +201,55 @@ func (h *Handler) handleMetadataEditor(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleItemRefresh(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	q := httpx.ParseQuery(r)
-	replaceMeta := strings.EqualFold(q.Get("MetadataRefreshMode"), "FullRefresh")
+	metaMode := strings.TrimSpace(q.Get("MetadataRefreshMode"))
+	imgMode := strings.TrimSpace(q.Get("ImageRefreshMode"))
+	replaceMeta := strings.EqualFold(metaMode, "FullRefresh")
 	if b := q.Bool("ReplaceAllMetadata"); b != nil && *b {
 		replaceMeta = true
 	}
-	replaceImages := strings.EqualFold(q.Get("ImageRefreshMode"), "FullRefresh")
+	replaceImages := strings.EqualFold(imgMode, "FullRefresh")
 	if b := q.Bool("ReplaceAllImages"); b != nil && *b {
 		replaceImages = true
+	}
+	if r.Body != nil {
+		var body struct {
+			MetadataRefreshMode string `json:"MetadataRefreshMode"`
+			ImageRefreshMode    string `json:"ImageRefreshMode"`
+			ReplaceAllMetadata  *bool  `json:"ReplaceAllMetadata"`
+			ReplaceAllImages    *bool  `json:"ReplaceAllImages"`
+		}
+		if err := httpx.DecodeJSONLimit(r, &body, 0); err == nil {
+			if strings.EqualFold(strings.TrimSpace(body.MetadataRefreshMode), "FullRefresh") {
+				replaceMeta = true
+			}
+			if strings.EqualFold(strings.TrimSpace(body.ImageRefreshMode), "FullRefresh") {
+				replaceImages = true
+			}
+			if body.ReplaceAllMetadata != nil && *body.ReplaceAllMetadata {
+				replaceMeta = true
+			}
+			if body.ReplaceAllImages != nil && *body.ReplaceAllImages {
+				replaceImages = true
+			}
+		}
 	}
 
 	if h.scanner != nil {
 		refreshCtx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
 		defer cancel()
+		// In forced overwrite mode, temporarily clear whole-item LockData (e.g. from local NFO)
+		// while preserving per-field manual LockedFields so non-locked fields & images refresh cleanly.
+		if (replaceMeta || replaceImages) && h.repo != nil {
+			rec, err := h.repo.GetItemRecordByID(refreshCtx, itemID)
+			if errors.Is(err, sqlite.ErrNotFound) {
+				httpx.Error(w, http.StatusNotFound, "item not found")
+				return
+			}
+			if err == nil && rec != nil && rec.Extra.LockData {
+				rec.Extra.LockData = false
+				_ = h.repo.UpsertItem(refreshCtx, rec)
+			}
+		}
 		if err := h.scanner.RefreshItem(refreshCtx, itemID, replaceMeta, replaceImages); err != nil {
 			if errors.Is(err, sqlite.ErrNotFound) {
 				httpx.Error(w, http.StatusNotFound, "item not found")
@@ -276,14 +313,369 @@ func (h *Handler) handleMetadataReset(w http.ResponseWriter, r *http.Request) {
 	httpx.NoContent(w)
 }
 
+var errDeleteForbidden = errors.New("delete forbidden")
+
+func (h *Handler) canDeleteItems(r *http.Request) (allowed bool, isAdmin bool) {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.IsAdmin() || ac.IsAPIKey {
+			return true, true
+		}
+		if h.userRepo != nil {
+			u, err := h.userRepo.GetUserByID(r.Context(), guid.Normalize(ac.UserID()))
+			if err != nil || u == nil {
+				return false, false
+			}
+			if u.IsAdmin || u.Policy.IsAdministrator {
+				return true, true
+			}
+			return u.Policy.EnableContentDeletion, false
+		}
+		if ac.User != nil {
+			if ac.User.IsAdmin || ac.User.Policy.IsAdministrator {
+				return true, true
+			}
+			return ac.User.Policy.EnableContentDeletion, false
+		}
+		return false, false
+	}
+	if h.auth.UserIDFromCtx != nil {
+		uid := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if uid != "" {
+			if h.userRepo != nil {
+				u, err := h.userRepo.GetUserByID(r.Context(), uid)
+				if err != nil || u == nil {
+					return false, false
+				}
+				if u.IsAdmin || u.Policy.IsAdministrator {
+					return true, true
+				}
+				return u.Policy.EnableContentDeletion, false
+			}
+			// Unit tests without UserRepo configured
+			return true, true
+		}
+	}
+	if h.userRepo != nil {
+		return false, false
+	}
+	return true, true
+}
+
+func isVirtualNonDiskItemType(itemType string) bool {
+	switch strings.ToLower(strings.TrimSpace(itemType)) {
+	case "boxset", "playlist", "person", "genre", "musicgenre", "gamegenre", "studio", "collectionfolder", "userview", "channel", "livetvchannel", "livetvprogram":
+		return true
+	default:
+		return false
+	}
+}
+
+func isRealPathStrictlyInsideLibraryRoots(realTarget string, realRoots []string) bool {
+	if realTarget == "" || len(realRoots) == 0 {
+		return false
+	}
+	cleanTarget := filepath.Clean(realTarget)
+	for _, root := range realRoots {
+		cleanRoot := filepath.Clean(root)
+		if cleanRoot == "" || cleanRoot == "." || cleanTarget == cleanRoot {
+			continue
+		}
+		rel, err := filepath.Rel(cleanRoot, cleanTarget)
+		if err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveLibraryRealRoots(lib *sqlite.LibraryRecord) []string {
+	if lib == nil {
+		return nil
+	}
+	var out []string
+	for _, p := range lib.Paths {
+		trimmed := strings.TrimSpace(p)
+		if trimmed == "" {
+			continue
+		}
+		if realRoot, err := filepath.EvalSymlinks(filepath.Clean(trimmed)); err == nil && realRoot != "" {
+			out = append(out, filepath.Clean(realRoot))
+		} else {
+			out = append(out, filepath.Clean(trimmed))
+		}
+	}
+	return out
+}
+
+func isControlledSidecarFilename(candidateName, mediaStem string) bool {
+	if mediaStem == "" || candidateName == "" {
+		return false
+	}
+	lowerName := strings.ToLower(candidateName)
+	lowerStem := strings.ToLower(mediaStem)
+	if !strings.HasPrefix(lowerName, lowerStem) {
+		return false
+	}
+	rest := lowerName[len(lowerStem):]
+	ext := strings.ToLower(filepath.Ext(lowerName))
+
+	// Exact same stem: <stem>.nfo, <stem>.srt, <stem>.lrc, <stem>.bif, <stem>.jpg, etc.
+	if rest == ext {
+		switch ext {
+		case ".nfo", ".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".sup", ".lrc", ".bif",
+			".jpg", ".jpeg", ".png", ".webp", ".tbn":
+			return true
+		}
+		return false
+	}
+
+	// Dot-qualified subtitle/lyrics sidecars: <stem>.<lang/flags>.<sub_ext>
+	if strings.HasPrefix(rest, ".") {
+		switch ext {
+		case ".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".sup", ".lrc":
+			return true
+		}
+		return false
+	}
+
+	// Hyphen-qualified artwork or BIF sidecars: <stem>-poster.jpg, <stem>-fanart.png, <stem>-320-10.bif
+	if strings.HasPrefix(rest, "-") {
+		if ext == ".bif" {
+			return true
+		}
+		switch ext {
+		case ".jpg", ".jpeg", ".png", ".webp", ".tbn":
+			suffixNoExt := strings.TrimSuffix(rest[1:], ext)
+			switch suffixNoExt {
+			case "poster", "fanart", "backdrop", "logo", "clearlogo", "thumb", "landscape", "banner", "disc", "clearart", "folder":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (h *Handler) collectDescendantRecords(ctx context.Context, rootRec *sqlite.ItemRecord) []*sqlite.ItemRecord {
+	if rootRec == nil {
+		return nil
+	}
+	records := []*sqlite.ItemRecord{rootRec}
+	if h.store == nil || h.repo == nil {
+		return records
+	}
+	seen := map[string]bool{guid.Normalize(rootRec.ID): true}
+	rows, err := h.store.Reader.QueryContext(ctx,
+		`SELECT descendant_id FROM item_ancestors WHERE ancestor_id = ?`, guid.Normalize(rootRec.ID))
+	if err == nil {
+		var ids []string
+		for rows.Next() {
+			var did string
+			if err := rows.Scan(&did); err == nil && !seen[guid.Normalize(did)] {
+				seen[guid.Normalize(did)] = true
+				ids = append(ids, did)
+			}
+		}
+		rows.Close()
+		for _, did := range ids {
+			if childRec, cErr := h.repo.GetItemRecordByID(ctx, did); cErr == nil && childRec != nil {
+				records = append(records, childRec)
+			}
+		}
+	}
+	return records
+}
+
+func (h *Handler) collectItemPhysicalDeletePaths(ctx context.Context, rootRec *sqlite.ItemRecord) []string {
+	if rootRec == nil || h.repo == nil || isVirtualNonDiskItemType(rootRec.Type) {
+		return nil
+	}
+	targets := h.collectDescendantRecords(ctx, rootRec)
+	libRootsCache := make(map[string][]string)
+	getRoots := func(libID string) []string {
+		norm := guid.Normalize(libID)
+		if norm == "" {
+			return nil
+		}
+		if roots, ok := libRootsCache[norm]; ok {
+			return roots
+		}
+		lib, err := h.repo.GetLibrary(ctx, norm)
+		if err != nil || lib == nil {
+			libRootsCache[norm] = nil
+			return nil
+		}
+		roots := resolveLibraryRealRoots(lib)
+		libRootsCache[norm] = roots
+		return roots
+	}
+
+	seen := make(map[string]bool)
+	var out []string
+	addVerifiedExistingFile := func(candidatePath string, realRoots []string) (string, bool) {
+		trimmed := strings.TrimSpace(candidatePath)
+		if trimmed == "" || isHTTPURL(trimmed) || len(realRoots) == 0 {
+			return "", false
+		}
+		lfi, err := os.Lstat(trimmed)
+		if err != nil || lfi.IsDir() {
+			return "", false
+		}
+		// Never delete symlinks whose target escapes library roots; resolve via EvalSymlinks.
+		realFile, err := filepath.EvalSymlinks(trimmed)
+		if err != nil || realFile == "" {
+			return "", false
+		}
+		rfi, err := os.Stat(realFile)
+		if err != nil || rfi.IsDir() {
+			return "", false
+		}
+		if !isRealPathStrictlyInsideLibraryRoots(realFile, realRoots) {
+			slog.Warn("skipping physical file deletion outside library root", "path", trimmed, "real_path", realFile)
+			return "", false
+		}
+		// If the candidate itself was a symlink inside the library pointing to another valid file inside the library,
+		// also verify the symlink's parent directory is inside the library.
+		if lfi.Mode()&os.ModeSymlink != 0 {
+			parentReal, pErr := filepath.EvalSymlinks(filepath.Dir(trimmed))
+			if pErr != nil || (!isRealPathStrictlyInsideLibraryRoots(filepath.Join(parentReal, filepath.Base(trimmed)), realRoots)) {
+				return "", false
+			}
+			cleanLink := filepath.Clean(trimmed)
+			if !seen[cleanLink] {
+				seen[cleanLink] = true
+				out = append(out, cleanLink)
+			}
+			return "", false
+		}
+		cleanReal := filepath.Clean(realFile)
+		if !seen[cleanReal] {
+			seen[cleanReal] = true
+			out = append(out, cleanReal)
+		}
+		return cleanReal, true
+	}
+
+	for _, rec := range targets {
+		if rec == nil || isVirtualNonDiskItemType(rec.Type) {
+			continue
+		}
+		realRoots := getRoots(rec.LibraryID)
+		if len(realRoots) == 0 {
+			continue
+		}
+
+		var mediaCandidates []string
+		if !rec.IsFolder && strings.TrimSpace(rec.Path) != "" {
+			mediaCandidates = append(mediaCandidates, rec.Path)
+		}
+		if sources, err := h.repo.GetMediaSourcesByItemID(ctx, rec.ID); err == nil {
+			for _, src := range sources {
+				if strings.TrimSpace(src.Path) != "" {
+					mediaCandidates = append(mediaCandidates, src.Path)
+				}
+				for _, st := range src.Streams {
+					if st.IsExternal && strings.TrimSpace(st.Path) != "" {
+						addVerifiedExistingFile(st.Path, realRoots)
+					}
+				}
+			}
+		}
+
+		for _, mp := range mediaCandidates {
+			realMedia, ok := addVerifiedExistingFile(mp, realRoots)
+			if !ok || realMedia == "" {
+				continue
+			}
+			mediaDir := filepath.Dir(realMedia)
+			mediaBase := filepath.Base(realMedia)
+			mediaStem := strings.TrimSuffix(mediaBase, filepath.Ext(mediaBase))
+			if mediaStem == "" {
+				continue
+			}
+			entries, err := os.ReadDir(mediaDir)
+			if err != nil {
+				continue
+			}
+			for _, ent := range entries {
+				if ent.IsDir() {
+					continue
+				}
+				if isControlledSidecarFilename(ent.Name(), mediaStem) {
+					addVerifiedExistingFile(filepath.Join(mediaDir, ent.Name()), realRoots)
+				}
+			}
+		}
+	}
+	return out
+}
+
+func (h *Handler) deleteSingleItemWithDiskCleanup(ctx context.Context, r *http.Request, itemID string, isAdmin bool) error {
+	normID := guid.Normalize(itemID)
+	if normID == "" {
+		return sqlite.ErrNotFound
+	}
+	rec, err := h.repo.GetItemRecordByID(ctx, normID)
+	if err != nil {
+		return err
+	}
+	if !isAdmin {
+		if !h.canAccessItem(r, rec) {
+			return errDeleteForbidden
+		}
+		callerID, _ := h.callerIdentity(r)
+		if strings.EqualFold(rec.Type, "Playlist") {
+			if callerID == "" || guid.Normalize(rec.ParentID) != callerID {
+				return errDeleteForbidden
+			}
+		} else if isVirtualNonDiskItemType(rec.Type) || rec.LibraryID == "" {
+			return errDeleteForbidden
+		} else {
+			for _, desc := range h.collectDescendantRecords(ctx, rec) {
+				if !h.canAccessItem(r, desc) {
+					return errDeleteForbidden
+				}
+			}
+		}
+	}
+
+	pathsToDelete := h.collectItemPhysicalDeletePaths(ctx, rec)
+	for _, p := range pathsToDelete {
+		if rmErr := os.Remove(p); rmErr != nil && !os.IsNotExist(rmErr) {
+			slog.Warn("failed to remove media file during item deletion", "item_id", normID, "path", p, "error", rmErr)
+		}
+	}
+
+	// Clean managed metadata images directory if present under DataDir/metadata/images/<itemID>.
+	if dataDir := h.configDataDir(); dataDir != "" {
+		managedRoot := filepath.Clean(filepath.Join(dataDir, "metadata", "images"))
+		itemImgDir := filepath.Clean(filepath.Join(managedRoot, normID))
+		if rel, relErr := filepath.Rel(managedRoot, itemImgDir); relErr == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			_ = os.RemoveAll(itemImgDir)
+		}
+	}
+
+	return h.repo.DeleteItem(ctx, normID)
+}
+
 // --- Delete & DeleteInfo ---
 
 func (h *Handler) handleDeleteItem(w http.ResponseWriter, r *http.Request) {
+	canDel, isAdmin := h.canDeleteItems(r)
+	if !canDel {
+		httpx.Error(w, http.StatusForbidden, "content deletion is disabled")
+		return
+	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
-	if err := h.repo.DeleteItem(r.Context(), itemID); errors.Is(err, sqlite.ErrNotFound) {
+	err := h.deleteSingleItemWithDiskCleanup(r.Context(), r, itemID, isAdmin)
+	if errors.Is(err, errDeleteForbidden) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
+	if errors.Is(err, sqlite.ErrNotFound) {
 		httpx.Error(w, http.StatusNotFound, "item not found")
 		return
-	} else if err != nil {
+	}
+	if err != nil {
 		slog.Error("failed to delete item", "item_id", itemID, "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "failed to delete item")
 		return
@@ -292,6 +684,11 @@ func (h *Handler) handleDeleteItem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleDeleteItemsBatch(w http.ResponseWriter, r *http.Request) {
+	canDel, isAdmin := h.canDeleteItems(r)
+	if !canDel {
+		httpx.Error(w, http.StatusForbidden, "content deletion is disabled")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	ids := q.List("Ids")
 	if len(ids) == 0 && r.Body != nil {
@@ -302,14 +699,18 @@ func (h *Handler) handleDeleteItemsBatch(w http.ResponseWriter, r *http.Request)
 		ids = body.Ids
 	}
 	for _, id := range ids {
-		_ = h.repo.DeleteItem(r.Context(), id)
+		if err := h.deleteSingleItemWithDiskCleanup(r.Context(), r, id, isAdmin); errors.Is(err, errDeleteForbidden) {
+			httpx.Error(w, http.StatusForbidden, "access denied")
+			return
+		}
 	}
 	httpx.NoContent(w)
 }
 
 func (h *Handler) handleItemDeleteInfo(w http.ResponseWriter, r *http.Request) {
-	if h.isNonAdminCaller(r) {
-		httpx.Error(w, http.StatusForbidden, "admin privileges required")
+	canDel, isAdmin := h.canDeleteItems(r)
+	if !canDel {
+		httpx.Error(w, http.StatusForbidden, "content deletion is disabled")
 		return
 	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
@@ -318,8 +719,17 @@ func (h *Handler) handleItemDeleteInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	paths := []string{}
-	if rec, err := h.repo.GetItemRecordByID(r.Context(), itemID); err == nil && rec.Path != "" {
-		paths = append(paths, rec.Path)
+	if rec, err := h.repo.GetItemRecordByID(r.Context(), itemID); err == nil && rec != nil {
+		if !isAdmin && isVirtualNonDiskItemType(rec.Type) && !strings.EqualFold(rec.Type, "Playlist") {
+			httpx.Error(w, http.StatusForbidden, "access denied")
+			return
+		}
+		collected := h.collectItemPhysicalDeletePaths(r.Context(), rec)
+		if len(collected) > 0 {
+			paths = collected
+		} else if !isVirtualNonDiskItemType(rec.Type) && strings.TrimSpace(rec.Path) != "" && h.isPathWithinLibraryRoots(r.Context(), rec.Path) {
+			paths = append(paths, rec.Path)
+		}
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"Paths": paths,
@@ -674,6 +1084,85 @@ func (h *Handler) handleItemAncestors(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, ancestors)
 }
 
+func matchesBlockUnratedItemType(itemType, mediaType string, blockUnrated []string) bool {
+	if strings.EqualFold(itemType, "CollectionFolder") ||
+		strings.EqualFold(itemType, "Folder") ||
+		strings.EqualFold(itemType, "UserView") ||
+		strings.EqualFold(itemType, "Person") ||
+		strings.EqualFold(itemType, "Genre") ||
+		strings.EqualFold(itemType, "MusicGenre") ||
+		strings.EqualFold(itemType, "GameGenre") ||
+		strings.EqualFold(itemType, "Studio") {
+		return false
+	}
+	for _, b := range blockUnrated {
+		t := strings.TrimSpace(b)
+		if t == "" {
+			continue
+		}
+		if t == "*" || strings.EqualFold(t, "All") || strings.EqualFold(t, itemType) || (mediaType != "" && strings.EqualFold(t, mediaType)) {
+			return true
+		}
+		if strings.EqualFold(t, "Series") && (strings.EqualFold(itemType, "Season") || strings.EqualFold(itemType, "Episode")) {
+			return true
+		}
+		if strings.EqualFold(t, "Music") && (strings.EqualFold(itemType, "Audio") || strings.EqualFold(itemType, "MusicAlbum") || strings.EqualFold(itemType, "MusicArtist") || strings.EqualFold(mediaType, "Audio")) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) isItemBlockedByExtendedPolicy(ctx context.Context, item *sqlite.ItemRecord, pol dto.UserPolicy) bool {
+	if item == nil || h.repo == nil || pol.IsAdministrator {
+		return false
+	}
+	if len(pol.BlockUnratedItems) > 0 && matchesBlockUnratedItemType(item.Type, item.MediaType, pol.BlockUnratedItems) {
+		rating := strings.TrimSpace(item.OfficialRating)
+		if rating == "" && item.SeriesID != "" {
+			if sRec, err := h.repo.GetItemRecordByID(ctx, item.SeriesID); err == nil && sRec != nil {
+				rating = strings.TrimSpace(sRec.OfficialRating)
+			}
+		}
+		if rating == "" {
+			return true
+		}
+	}
+	if len(pol.AllowedTags) > 0 {
+		allowSet := make(map[string]bool, len(pol.AllowedTags))
+		for _, t := range pol.AllowedTags {
+			if s := strings.ToLower(strings.TrimSpace(t)); s != "" {
+				allowSet[s] = true
+			}
+		}
+		if len(allowSet) > 0 {
+			matched := false
+			checkIDs := []string{item.ID}
+			if item.SeriesID != "" {
+				checkIDs = append(checkIDs, item.SeriesID)
+			}
+			for _, cid := range checkIDs {
+				_, _, tags, err := h.repo.GetTaxonomiesByItemID(ctx, cid)
+				if err == nil {
+					for _, tg := range tags {
+						if allowSet[strings.ToLower(strings.TrimSpace(tg))] {
+							matched = true
+							break
+						}
+					}
+				}
+				if matched {
+					break
+				}
+			}
+			if !matched {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (h *Handler) canAccessItem(r *http.Request, item *sqlite.ItemRecord) bool {
 	if item == nil {
 		return true
@@ -689,9 +1178,14 @@ func (h *Handler) canAccessItem(r *http.Request, item *sqlite.ItemRecord) bool {
 		}
 	}
 	if h.repo != nil {
-		maxRating, blockedTags := h.userParentalPolicyForRequest(r, "")
-		if maxRating != nil || len(blockedTags) > 0 {
-			if blocked, err := h.repo.IsItemBlockedByParentalPolicy(r.Context(), item, maxRating, blockedTags); err != nil || blocked {
+		pol := h.userExtendedPolicyForRequest(r, "")
+		if !pol.IsAdministrator {
+			if pol.MaxParentalRating != nil || len(pol.BlockedTags) > 0 {
+				if blocked, err := h.repo.IsItemBlockedByParentalPolicy(r.Context(), item, pol.MaxParentalRating, pol.BlockedTags); err != nil || blocked {
+					return false
+				}
+			}
+			if h.isItemBlockedByExtendedPolicy(r.Context(), item, pol) {
 				return false
 			}
 		}
@@ -1498,15 +1992,313 @@ func (h *Handler) handleDeleteSubtitle(w http.ResponseWriter, r *http.Request) {
 	httpx.NoContent(w)
 }
 
-func (h *Handler) handleRemoteSearchSubtitles(w http.ResponseWriter, _ *http.Request) {
-	httpx.JSON(w, http.StatusOK, []any{})
+func (h *Handler) saveSubtitleBytesAndRegisterStream(
+	ctx context.Context,
+	itemID string,
+	requestedMSID string,
+	mediaSourceID string,
+	mediaPath string,
+	lang string,
+	format string,
+	isForced bool,
+	data []byte,
+	allowCacheFallback bool,
+) error {
+	lang = sanitizeSubtitleLang(lang)
+	format = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(format)), ".")
+	if !allowedSubtitleFormats[format] {
+		format = "srt"
+	}
+
+	var destPath string
+	if strings.TrimSpace(mediaPath) != "" && !isHTTPURL(mediaPath) && !strings.EqualFold(filepath.Ext(mediaPath), ".strm") {
+		videoDir := filepath.Dir(mediaPath)
+		videoBase := strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath))
+		candidate := filepath.Join(videoDir, fmt.Sprintf("%s.%s.%s", videoBase, lang, format))
+		if h.isPathWithinLibraryRoots(ctx, candidate) {
+			destPath = candidate
+		} else if !allowCacheFallback {
+			return errDeleteForbidden
+		}
+	}
+	if destPath == "" {
+		if !allowCacheFallback {
+			return errDeleteForbidden
+		}
+		cacheDir := filepath.Join(os.TempDir(), "ambra-subtitles", itemID)
+		if h.cfg != nil && strings.TrimSpace(h.cfg.SubtitleCacheDir()) != "" {
+			cacheDir = filepath.Join(h.cfg.SubtitleCacheDir(), "downloaded", itemID)
+		}
+		if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+			return err
+		}
+		destPath = filepath.Join(cacheDir, fmt.Sprintf("%s.%s.%s", itemID, lang, format))
+	}
+
+	tmpPath := destPath + ".tmp." + guid.New()[:8]
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+
+	if h.store == nil {
+		return nil
+	}
+	if mediaSourceID == "" && requestedMSID != "" {
+		mediaSourceID = requestedMSID
+	}
+	if mediaSourceID == "" {
+		_ = h.store.Reader.QueryRowContext(ctx,
+			`SELECT id FROM item_media_sources WHERE item_id = ? ORDER BY rowid ASC LIMIT 1`,
+			itemID,
+		).Scan(&mediaSourceID)
+	}
+	if mediaSourceID == "" {
+		mediaSourceID = itemID
+	}
+
+	cls := scanner.ClassifySubtitle(filepath.Base(destPath), format)
+	streamLang := lang
+	if cls.Language != "" && cls.Language != "und" {
+		streamLang = cls.Language
+	}
+	isForcedInt := 0
+	if isForced || cls.IsForced {
+		isForcedInt = 1
+	}
+
+	tx, txErr := h.store.Writer.BeginTx(ctx, nil)
+	if txErr != nil {
+		return txErr
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var existingIdx int
+	qErr := tx.QueryRowContext(ctx, `
+		SELECT stream_index FROM item_media_streams
+		WHERE media_source_id = ? AND path = ? AND LOWER(stream_type) = 'subtitle' AND is_external = 1
+		LIMIT 1`,
+		mediaSourceID, destPath,
+	).Scan(&existingIdx)
+
+	if qErr == nil {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE item_media_streams
+			SET codec = ?, language = ?, sub_variant = ?, display_title = ?, title = ?, is_forced = ?
+			WHERE media_source_id = ? AND stream_index = ? AND path = ?`,
+			format, streamLang, cls.SubVariant, cls.DisplayTitle, filepath.Base(destPath), isForcedInt,
+			mediaSourceID, existingIdx, destPath,
+		); err != nil {
+			return err
+		}
+	} else if errors.Is(qErr, sql.ErrNoRows) {
+		var maxIdx int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COALESCE(MAX(stream_index), -1) FROM item_media_streams WHERE item_id = ?`,
+			itemID,
+		).Scan(&maxIdx); err != nil {
+			return err
+		}
+		nextIdx := maxIdx + 1
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO item_media_streams (
+				media_source_id, item_id, stream_index, stream_type, codec, language, sub_variant,
+				display_title, title, width, height, video_range, audio_layout, channels,
+				sample_rate, bitrate, is_default, is_forced, is_external, path
+			) VALUES (?, ?, ?, 'Subtitle', ?, ?, ?, ?, ?, 0, 0, NULL, NULL, 0, 0, 0, 0, ?, 1, ?)`,
+			mediaSourceID, itemID, nextIdx, format, streamLang, cls.SubVariant,
+			cls.DisplayTitle, filepath.Base(destPath), isForcedInt, destPath,
+		); err != nil {
+			return err
+		}
+	} else {
+		return qErr
+	}
+	return tx.Commit()
 }
 
-func (h *Handler) handleDownloadRemoteSubtitle(w http.ResponseWriter, _ *http.Request) {
+func (h *Handler) handleRemoteSearchSubtitles(w http.ResponseWriter, r *http.Request) {
+	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	language := strings.TrimSpace(chi.URLParam(r, "Language"))
+	if h.repo != nil && itemID != "" {
+		rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
+		if errors.Is(err, sqlite.ErrNotFound) {
+			httpx.JSON(w, http.StatusOK, []plugins.RemoteSubtitleInfo{})
+			return
+		}
+		if err != nil {
+			slog.Error("failed to load item for remote subtitle search", "item_id", itemID, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to load item")
+			return
+		}
+		if !h.canAccessItem(r, rec) {
+			httpx.Error(w, http.StatusForbidden, "access denied")
+			return
+		}
+		if h.registry == nil {
+			httpx.JSON(w, http.StatusOK, []plugins.RemoteSubtitleInfo{})
+			return
+		}
+		providers := h.registry.SubtitleProviders()
+		if len(providers) == 0 {
+			httpx.JSON(w, http.StatusOK, []plugins.RemoteSubtitleInfo{})
+			return
+		}
+		sq := plugins.SubtitleSearchQuery{
+			ItemID:        rec.ID,
+			ItemType:      rec.Type,
+			Title:         rec.Name,
+			OriginalTitle: rec.OriginalTitle,
+			Language:      language,
+			ProviderIDs:   rec.Extra.ProviderIDs,
+			MediaPath:     h.resolveMediaSourcePath(r.Context(), rec.ID, ""),
+		}
+		if rec.ProductionYear != nil {
+			sq.Year = *rec.ProductionYear
+		}
+		if rec.ParentIndexNumber != nil {
+			sq.SeasonNumber = *rec.ParentIndexNumber
+		}
+		if rec.IndexNumber != nil {
+			sq.EpisodeNumber = *rec.IndexNumber
+		}
+		out := make([]plugins.RemoteSubtitleInfo, 0)
+		for _, sp := range providers {
+			mf := sp.Manifest()
+			hits, sErr := sp.SearchSubtitles(r.Context(), sq)
+			if sErr != nil {
+				slog.Warn("subtitle provider search failed", "provider", mf.ID, "item_id", itemID, "error", sErr)
+				continue
+			}
+			for _, hit := range hits {
+				if hit.ProviderName == "" {
+					hit.ProviderName = mf.Name
+				}
+				if hit.ID != "" && !strings.Contains(hit.ID, ":") && mf.ID != "" {
+					hit.ID = mf.ID + ":" + hit.ID
+				}
+				out = append(out, hit)
+			}
+		}
+		httpx.JSON(w, http.StatusOK, out)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, []plugins.RemoteSubtitleInfo{})
+}
+
+func (h *Handler) downloadSubtitleFromRegistry(ctx context.Context, subtitleID string) (*plugins.SubtitleDownloadResult, error) {
+	if h.registry == nil {
+		return nil, sqlite.ErrNotFound
+	}
+	providers := h.registry.SubtitleProviders()
+	if len(providers) == 0 {
+		return nil, sqlite.ErrNotFound
+	}
+	subtitleID = strings.TrimSpace(subtitleID)
+	if idx := strings.IndexByte(subtitleID, ':'); idx > 0 {
+		provPrefix := subtitleID[:idx]
+		rawSubID := subtitleID[idx+1:]
+		for _, sp := range providers {
+			mf := sp.Manifest()
+			if strings.EqualFold(mf.ID, provPrefix) || strings.EqualFold(mf.Name, provPrefix) {
+				if res, err := sp.DownloadSubtitle(ctx, rawSubID); err == nil && res != nil {
+					return res, nil
+				} else if err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	var lastErr error
+	for _, sp := range providers {
+		res, err := sp.DownloadSubtitle(ctx, subtitleID)
+		if err == nil && res != nil {
+			return res, nil
+		}
+		if err != nil {
+			lastErr = err
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, sqlite.ErrNotFound
+}
+
+func (h *Handler) handleDownloadRemoteSubtitle(w http.ResponseWriter, r *http.Request) {
+	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	subtitleID := strings.TrimSpace(chi.URLParam(r, "SubtitleId"))
+	if h.registry == nil || len(h.registry.SubtitleProviders()) == 0 {
+		httpx.NoContent(w)
+		return
+	}
+	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		httpx.Error(w, http.StatusNotFound, "item not found")
+		return
+	}
+	if err != nil {
+		slog.Error("failed to load item for subtitle download", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to load item")
+		return
+	}
+	if !h.canAccessItem(r, rec) {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
+
+	dlRes, err := h.downloadSubtitleFromRegistry(r.Context(), subtitleID)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		httpx.Error(w, http.StatusNotFound, "subtitle not found")
+		return
+	}
+	if err != nil || dlRes == nil {
+		slog.Error("failed to download remote subtitle", "item_id", itemID, "subtitle_id", subtitleID, "error", err)
+		httpx.Error(w, http.StatusBadGateway, "failed to download subtitle")
+		return
+	}
+	if len(dlRes.Content) == 0 {
+		httpx.Error(w, http.StatusBadGateway, "downloaded subtitle is empty")
+		return
+	}
+	if len(dlRes.Content) > maxSubtitleUploadBytes {
+		httpx.Error(w, http.StatusRequestEntityTooLarge, "subtitle exceeds 5MB limit")
+		return
+	}
+	format := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(dlRes.Format)), ".")
+	if format == "" {
+		format = "srt"
+	}
+	if !allowedSubtitleFormats[format] {
+		httpx.Error(w, http.StatusBadRequest, "unsupported subtitle format")
+		return
+	}
+
+	q := httpx.ParseQuery(r)
+	reqMSID := guid.Normalize(q.Get("MediaSourceId"))
+	mediaPath := h.resolveMediaSourcePath(r.Context(), itemID, reqMSID)
+	if err := h.saveSubtitleBytesAndRegisterStream(r.Context(), itemID, reqMSID, "", mediaPath, dlRes.Language, format, false, dlRes.Content, true); err != nil {
+		slog.Error("failed to persist downloaded subtitle", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to save subtitle")
+		return
+	}
 	httpx.NoContent(w)
 }
 
-func (h *Handler) handleProviderSubtitleDownload(w http.ResponseWriter, _ *http.Request) {
+func (h *Handler) handleProviderSubtitleDownload(w http.ResponseWriter, r *http.Request) {
+	subID := strings.TrimSpace(chi.URLParam(r, "Id"))
+	if subID != "" && h.registry != nil && len(h.registry.SubtitleProviders()) > 0 {
+		if dlRes, err := h.downloadSubtitleFromRegistry(r.Context(), subID); err == nil && dlRes != nil && len(dlRes.Content) > 0 && len(dlRes.Content) <= maxSubtitleUploadBytes {
+			w.Header().Set("Content-Type", subtitleContentType(dlRes.Format))
+			w.Header().Set("Cache-Control", "private, max-age=3600")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(dlRes.Content)
+			return
+		}
+	}
 	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("WEBVTT\n\n"))
@@ -1574,7 +2366,8 @@ func (h *Handler) handleSubtitleStream(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusNotFound, "media file not found for subtitle extraction")
 			return
 		}
-		mediaPath, err = h.resolveExtractionMediaPath(r.Context(), mediaPath)
+		var extractHeaders map[string]string
+		mediaPath, extractHeaders, err = h.resolveExtractionMediaTarget(r.Context(), mediaPath)
 		if err != nil {
 			slog.Error("failed to resolve strm for subtitle extraction", "item_id", itemID, "error", err)
 			httpx.Error(w, http.StatusBadGateway, "failed to resolve strm stream")
@@ -1584,7 +2377,7 @@ func (h *Handler) handleSubtitleStream(w http.ResponseWriter, r *http.Request) {
 		if extractExt == "" {
 			extractExt = codec.String
 		}
-		extractedPath, err := h.extractor.ExtractSubtitle(r.Context(), mediaPath, itemID, effectiveMSID, idx, extractExt)
+		extractedPath, err := h.extractor.ExtractSubtitleWithHeaders(r.Context(), mediaPath, extractHeaders, itemID, effectiveMSID, idx, extractExt)
 		if err != nil {
 			if errors.Is(err, os.ErrPermission) {
 				logAndWritePermissionDenied(w, mediaPath, err)
@@ -1713,34 +2506,49 @@ func readFirstLineStrmURL(strmPath string) (string, error) {
 }
 
 func (h *Handler) resolveExtractionMediaPath(ctx context.Context, mediaPath string) (string, error) {
+	u, _, err := h.resolveExtractionMediaTarget(ctx, mediaPath)
+	return u, err
+}
+
+func (h *Handler) resolveExtractionMediaTarget(ctx context.Context, mediaPath string) (string, map[string]string, error) {
 	if strings.EqualFold(filepath.Ext(mediaPath), ".strm") {
 		var (
 			resolved string
+			headers  map[string]string
 			err      error
 		)
-		if h.streamResolver != nil {
+		if h.streamResolverWithHeaders != nil {
+			res, rErr := h.streamResolverWithHeaders(ctx, mediaPath)
+			if rErr != nil {
+				return "", nil, rErr
+			}
+			if res != nil {
+				resolved = res.URL
+				headers = res.Headers
+			}
+		} else if h.streamResolver != nil {
 			resolved, err = h.streamResolver(ctx, mediaPath)
 		} else {
 			resolved, err = readFirstLineStrmURL(mediaPath)
 		}
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 		resolved = strings.TrimSpace(resolved)
 		if !isHTTPURL(resolved) {
-			return "", errors.New("invalid strm target url")
+			return "", nil, errors.New("invalid strm target url")
 		}
 		if err := netutil.ValidateRemoteURL(resolved, true); err != nil {
-			return "", err
+			return "", nil, err
 		}
-		return resolved, nil
+		return resolved, headers, nil
 	}
 	if isHTTPURL(mediaPath) {
 		if err := netutil.ValidateRemoteURL(mediaPath, true); err != nil {
-			return "", err
+			return "", nil, err
 		}
 	}
-	return mediaPath, nil
+	return mediaPath, nil, nil
 }
 
 func (h *Handler) handleListVideoAttachments(w http.ResponseWriter, r *http.Request) {
@@ -1920,30 +2728,163 @@ func (h *Handler) handleDeleteActiveEncodings(w http.ResponseWriter, r *http.Req
 	httpx.NoContent(w)
 }
 
-func (h *Handler) handleVideoHlsSegment(w http.ResponseWriter, r *http.Request) {
+func parseCompatHLSSegmentName(raw string) (segIdx int, ext string, isInit bool, ok bool) {
+	name := strings.TrimSpace(raw)
+	if strings.EqualFold(name, "init.mp4") {
+		return 0, "m4s", true, true
+	}
+	dot := strings.LastIndexByte(name, '.')
+	if dot <= 0 {
+		return 0, "", false, false
+	}
+	base := name[:dot]
+	ext = strings.ToLower(name[dot+1:])
+	switch ext {
+	case "ts", "m4s", "mp4", "aac":
+	default:
+		return 0, "", false, false
+	}
+	base = strings.TrimPrefix(base, "seg_")
+	base = strings.TrimPrefix(base, "segment")
+	idx, err := strconv.Atoi(base)
+	if err != nil || idx < 0 {
+		return 0, "", false, false
+	}
+	if ext == "aac" {
+		ext = "ts"
+	}
+	return idx, ext, false, true
+}
+
+func (h *Handler) serveCompatDynamicHLSSegment(w http.ResponseWriter, r *http.Request, audioOnly bool, notFoundMsg string) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	if !h.canAccessItemID(r, itemID) {
-		httpx.Error(w, http.StatusNotFound, "hls segment not available")
+		httpx.Error(w, http.StatusNotFound, notFoundMsg)
 		return
 	}
-	if _, err := h.repo.GetItemRecordByID(r.Context(), itemID); errors.Is(err, sqlite.ErrNotFound) {
-		httpx.Error(w, http.StatusNotFound, "hls segment not available")
+	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
+	if errors.Is(err, sqlite.ErrNotFound) || err != nil || rec == nil {
+		httpx.Error(w, http.StatusNotFound, notFoundMsg)
 		return
 	}
-	httpx.Error(w, http.StatusNotFound, "hls segment not available")
+	if h.transcodeMgr == nil {
+		httpx.Error(w, http.StatusNotFound, notFoundMsg)
+		return
+	}
+	q := httpx.ParseQuery(r)
+	mediaSourceID := guid.Normalize(q.Get("MediaSourceId"))
+	rawMediaPath := h.resolveMediaSourcePath(r.Context(), itemID, mediaSourceID)
+	if strings.TrimSpace(rawMediaPath) == "" {
+		httpx.Error(w, http.StatusNotFound, notFoundMsg)
+		return
+	}
+	if !isHTTPURL(rawMediaPath) {
+		if fi, stErr := os.Stat(rawMediaPath); stErr != nil || fi.IsDir() {
+			httpx.Error(w, http.StatusNotFound, notFoundMsg)
+			return
+		}
+	}
+	inputPath, inputHeaders, rErr := h.resolveExtractionMediaTarget(r.Context(), rawMediaPath)
+	if rErr != nil || strings.TrimSpace(inputPath) == "" {
+		httpx.Error(w, http.StatusNotFound, notFoundMsg)
+		return
+	}
+
+	segIdx, segExt, isInit, ok := parseCompatHLSSegmentName(chi.URLParam(r, "Segment"))
+	if !ok {
+		httpx.Error(w, http.StatusNotFound, notFoundMsg)
+		return
+	}
+
+	pol := h.userExtendedPolicyForRequest(r, "")
+	if !pol.IsAdministrator {
+		if audioOnly && !pol.EnableAudioPlaybackTranscoding {
+			httpx.Error(w, http.StatusForbidden, "audio playback transcoding is disabled for this user")
+			return
+		}
+		if !audioOnly && !pol.EnableVideoPlaybackTranscoding {
+			httpx.Error(w, http.StatusForbidden, "video playback transcoding is disabled for this user")
+			return
+		}
+	}
+
+	callerID, isAdmin := h.callerIdentity(r)
+	playlistID := strings.TrimSpace(chi.URLParam(r, "PlaylistId"))
+	rawPS := nonEmpty(q.Get("PlaySessionId"), playlistID)
+	params := transcode.SessionParams{
+		PlaySessionID:    scopePlaySessionID(rawPS, callerID, isAdmin),
+		DeviceID:         h.resolveDeviceID(r, q),
+		UserID:           callerID,
+		ItemID:           itemID,
+		MediaSourceID:    nonEmpty(mediaSourceID, itemID),
+		InputPath:        inputPath,
+		InputHeaders:     inputHeaders,
+		VideoCodec:       q.Get("VideoCodec"),
+		AudioCodec:       nonEmpty(q.Get("AudioCodec"), "aac"),
+		VideoBitrate:     q.Int("VideoBitrate", 0),
+		AudioBitrate:     q.Int("AudioBitrate", 192_000),
+		AudioChannels:    q.Int("TranscodingMaxAudioChannels", q.Int("AudioChannels", 2)),
+		MaxWidth:         q.Int("MaxWidth", 0),
+		MaxHeight:        q.Int("MaxHeight", 0),
+		SegmentDuration:  q.Int("SegmentLength", transcode.DefaultSegmentDuration),
+		SegmentContainer: segExt,
+		AudioOnly:        audioOnly,
+	}
+	if audioOnly {
+		params.VideoCodec = "none"
+	}
+
+	if h.cfg != nil {
+		if limit := h.cfg.Snapshot().SimultaneousStreamLimit; limit > 0 {
+			if _, allowed := h.transcodeMgr.TryAcquireStreamSlot(limit, transcode.SessionKey(params)); !allowed {
+				httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
+				return
+			}
+		}
+	}
+
+	var segPath string
+	if isInit {
+		segPath, err = h.transcodeMgr.GetInitSegment(r.Context(), params)
+	} else {
+		segPath, err = h.transcodeMgr.GetSegment(r.Context(), params, segIdx)
+	}
+	if err != nil {
+		httpx.Error(w, http.StatusNotFound, notFoundMsg)
+		return
+	}
+	f, err := os.Open(segPath)
+	if err != nil {
+		httpx.Error(w, http.StatusNotFound, notFoundMsg)
+		return
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.IsDir() {
+		httpx.Error(w, http.StatusNotFound, notFoundMsg)
+		return
+	}
+	ct := "video/mp2t"
+	if isInit || segExt == "mp4" || segExt == "m4s" {
+		if audioOnly {
+			ct = "audio/mp4"
+		} else {
+			ct = "video/mp4"
+		}
+	} else if audioOnly {
+		ct = "audio/mp2t"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Cache-Control", "private, max-age=3600")
+	http.ServeContent(w, r, st.Name(), st.ModTime(), f)
+}
+
+func (h *Handler) handleVideoHlsSegment(w http.ResponseWriter, r *http.Request) {
+	h.serveCompatDynamicHLSSegment(w, r, false, "hls segment not available")
 }
 
 func (h *Handler) handleAudioHlsSegment(w http.ResponseWriter, r *http.Request) {
-	itemID := guid.Normalize(chi.URLParam(r, "Id"))
-	if !h.canAccessItemID(r, itemID) {
-		httpx.Error(w, http.StatusNotFound, "audio hls segment not available")
-		return
-	}
-	if _, err := h.repo.GetItemRecordByID(r.Context(), itemID); errors.Is(err, sqlite.ErrNotFound) {
-		httpx.Error(w, http.StatusNotFound, "audio hls segment not available")
-		return
-	}
-	httpx.Error(w, http.StatusNotFound, "audio hls segment not available")
+	h.serveCompatDynamicHLSSegment(w, r, true, "audio hls segment not available")
 }
 
 func parseEmbyDate(raw string) (int64, error) {

@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/hmac"
@@ -16,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -28,12 +30,20 @@ import (
 )
 
 const (
-	webhookQueueSize       = 256
-	webhookWorkerCount     = 4
-	webhookDeliveryTimeout = 10 * time.Second
+	webhookQueueSize           = 256
+	webhookWorkerCount         = 4
+	webhookDeliveryTimeout     = 10 * time.Second
+	maxWebhooks                = 50
+	maxBackupZipEntries        = 10000
+	maxBackupRestoreTotalBytes = 2 << 30 // 2 GiB
+	maxBackupConfigFileBytes   = 16 << 20
+	maxBackupSingleMetaBytes   = 64 << 20
 )
 
-var sqliteMagicHeader = []byte("SQLite format 3\x00")
+var (
+	sqliteMagicHeader = []byte("SQLite format 3\x00")
+	zipMagicHeader    = []byte("PK\x03\x04")
+)
 
 type webhookDispatchJob struct {
 	cfg     WebhookConfig
@@ -58,6 +68,13 @@ type WebhookPayload struct {
 	Data      any       `json:"Data,omitempty"`
 }
 
+type WebhookTestResult struct {
+	Success    bool   `json:"Success"`
+	StatusCode int    `json:"StatusCode,omitempty"`
+	DurationMs int64  `json:"DurationMs"`
+	Error      string `json:"Error,omitempty"`
+}
+
 type BackupFileInfo struct {
 	Name        string    `json:"Name"`
 	Path        string    `json:"Path"`
@@ -68,6 +85,113 @@ type BackupFileInfo struct {
 type BackupInfoResponse struct {
 	BackupDirectory string           `json:"BackupDirectory"`
 	Backups         []BackupFileInfo `json:"Backups"`
+}
+
+// --- Webhooks SQLite Persistence & Auto-Migration ---
+
+func (h *Handler) migrateAndLoadWebhooksLocked(ctx context.Context) {
+	if h.store == nil || h.store.Reader == nil {
+		return
+	}
+	dbItems, err := h.queryWebhooksFromDBLocked(ctx)
+	if err != nil {
+		return
+	}
+	if len(dbItems) == 0 && len(h.state.Webhooks) > 0 && h.store.Writer != nil {
+		migrated := true
+		for _, wh := range h.state.Webhooks {
+			if wh.Id == "" {
+				wh.Id = guid.New()
+			}
+			if wh.Events == nil {
+				wh.Events = []string{"*"}
+			}
+			if err := h.upsertWebhookDBLocked(ctx, wh); err != nil {
+				migrated = false
+				break
+			}
+		}
+		if migrated {
+			if reloaded, rErr := h.queryWebhooksFromDBLocked(ctx); rErr == nil && len(reloaded) > 0 {
+				dbItems = reloaded
+			}
+		}
+	}
+	if len(dbItems) > 0 {
+		h.state.Webhooks = dbItems
+	}
+}
+
+func (h *Handler) queryWebhooksFromDBLocked(ctx context.Context) ([]WebhookConfig, error) {
+	if h.store == nil || h.store.Reader == nil {
+		return nil, nil
+	}
+	rows, err := h.store.Reader.QueryContext(ctx, `
+		SELECT id, name, url, secret, events_json, enabled
+		FROM webhooks
+		ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []WebhookConfig
+	for rows.Next() {
+		var (
+			wh         WebhookConfig
+			eventsJSON string
+			enabledInt int
+		)
+		if err := rows.Scan(&wh.Id, &wh.Name, &wh.Url, &wh.Secret, &eventsJSON, &enabledInt); err != nil {
+			return nil, err
+		}
+		if eventsJSON != "" {
+			_ = json.Unmarshal([]byte(eventsJSON), &wh.Events)
+		}
+		if wh.Events == nil {
+			wh.Events = []string{"*"}
+		}
+		wh.Enabled = enabledInt != 0
+		wh.HasSecret = wh.Secret != ""
+		out = append(out, wh)
+	}
+	return out, rows.Err()
+}
+
+func (h *Handler) upsertWebhookDBLocked(ctx context.Context, wh WebhookConfig) error {
+	if h.store == nil || h.store.Writer == nil {
+		return nil
+	}
+	eventsRaw, err := json.Marshal(wh.Events)
+	if err != nil {
+		return err
+	}
+	enabledInt := 0
+	if wh.Enabled {
+		enabledInt = 1
+	}
+	nowUnix := time.Now().UTC().Unix()
+	_, err = h.store.Writer.ExecContext(ctx, `
+		INSERT INTO webhooks (id, name, url, secret, events_json, enabled, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			name = excluded.name,
+			url = excluded.url,
+			secret = excluded.secret,
+			events_json = excluded.events_json,
+			enabled = excluded.enabled,
+			updated_at = excluded.updated_at`,
+		wh.Id, wh.Name, wh.Url, wh.Secret, string(eventsRaw), enabledInt, nowUnix, nowUnix,
+	)
+	return err
+}
+
+func (h *Handler) deleteWebhookDBLocked(ctx context.Context, id string) error {
+	if h.store == nil || h.store.Writer == nil {
+		return nil
+	}
+	_, err := h.store.Writer.ExecContext(ctx, `DELETE FROM webhooks WHERE id = ?`, id)
+	return err
 }
 
 // --- Webhooks ---
@@ -151,8 +275,52 @@ func (h *Handler) validateWebhookURL(rawURL string) error {
 	return netutil.ValidateRemoteURLNoLoopback(rawURL, true)
 }
 
+func isSensitivePathFieldKey(k string) bool {
+	switch strings.ToLower(strings.TrimSpace(k)) {
+	case "path", "output_path", "outputpath", "file_path", "filepath",
+		"programdatapath", "cachepath", "logpath", "internalmetadatapath",
+		"transcodingtemppath", "locations":
+		return true
+	default:
+		return false
+	}
+}
+
+func stripSensitivePathsValue(v any) any {
+	switch typed := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for k, val := range typed {
+			if isSensitivePathFieldKey(k) {
+				continue
+			}
+			out[k] = stripSensitivePathsValue(val)
+		}
+		return out
+	case map[string]string:
+		out := make(map[string]string, len(typed))
+		for k, val := range typed {
+			if isSensitivePathFieldKey(k) {
+				continue
+			}
+			out[k] = val
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, elem := range typed {
+			out[i] = stripSensitivePathsValue(elem)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
 func sanitizeWebhookPayloadData(data any) any {
 	switch v := data.(type) {
+	case nil:
+		return nil
 	case Party:
 		return sanitizePartyForEvent(v)
 	case *Party:
@@ -161,8 +329,18 @@ func sanitizeWebhookPayloadData(data any) any {
 		}
 		cp := sanitizePartyForEvent(*v)
 		return &cp
-	default:
+	case string, bool, int, int64, float64:
 		return data
+	default:
+		raw, err := json.Marshal(data)
+		if err != nil {
+			return data
+		}
+		var generic any
+		if err := json.Unmarshal(raw, &generic); err != nil {
+			return data
+		}
+		return stripSensitivePathsValue(generic)
 	}
 }
 
@@ -263,17 +441,28 @@ func (h *Handler) handleListWebhooks(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, items)
 }
 
-func webhookURLHostLower(raw string) string {
-	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil {
-		return ""
+func webhookURLSameOriginAndPath(oldRaw, newRaw string) bool {
+	uOld, err1 := url.Parse(strings.TrimSpace(oldRaw))
+	uNew, err2 := url.Parse(strings.TrimSpace(newRaw))
+	if err1 != nil || err2 != nil {
+		return false
 	}
-	return strings.ToLower(strings.TrimSpace(u.Host))
+	oldScheme := strings.ToLower(strings.TrimSpace(uOld.Scheme))
+	newScheme := strings.ToLower(strings.TrimSpace(uNew.Scheme))
+	if oldScheme == "" || newScheme == "" || oldScheme != newScheme {
+		return false
+	}
+	oldHost := strings.ToLower(strings.TrimSpace(uOld.Host))
+	newHost := strings.ToLower(strings.TrimSpace(uNew.Host))
+	if oldHost == "" || newHost == "" || oldHost != newHost {
+		return false
+	}
+	return uOld.Path == uNew.Path
 }
 
 func (h *Handler) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
 	var wh WebhookConfig
-	if err := httpx.DecodeJSONLimit(r, &wh, 0); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &wh, 64<<10); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid webhook payload")
 		return
 	}
@@ -305,10 +494,10 @@ func (h *Handler) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
 			if clearSecret {
 				wh.Secret = ""
 			} else if wh.Secret == "" {
-				if webhookURLHostLower(existing.Url) != webhookURLHostLower(wh.Url) {
-					wh.Secret = ""
-				} else {
+				if webhookURLSameOriginAndPath(existing.Url, wh.Url) {
 					wh.Secret = existing.Secret
+				} else {
+					wh.Secret = ""
 				}
 			}
 			wh.HasSecret = wh.Secret != ""
@@ -318,13 +507,21 @@ func (h *Handler) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !replaced {
+		if len(h.state.Webhooks) >= maxWebhooks {
+			h.mu.Unlock()
+			httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("maximum number of webhooks (%d) reached", maxWebhooks))
+			return
+		}
 		if clearSecret {
 			wh.Secret = ""
 		}
 		wh.HasSecret = wh.Secret != ""
 		h.state.Webhooks = append(h.state.Webhooks, wh)
 	}
-	err := h.saveStateLocked(r.Context())
+	err := h.upsertWebhookDBLocked(r.Context(), wh)
+	if err == nil {
+		err = h.saveStateLocked(r.Context())
+	}
 	if err != nil {
 		h.state = snapshot
 	}
@@ -344,7 +541,10 @@ func (h *Handler) handleDeleteWebhook(w http.ResponseWriter, r *http.Request) {
 		if wh.Id == id {
 			snapshot := cloneOpsState(h.state)
 			h.state.Webhooks = append(h.state.Webhooks[:i], h.state.Webhooks[i+1:]...)
-			err := h.saveStateLocked(r.Context())
+			err := h.deleteWebhookDBLocked(r.Context(), id)
+			if err == nil {
+				err = h.saveStateLocked(r.Context())
+			}
 			if err != nil {
 				h.state = snapshot
 				h.mu.Unlock()
@@ -366,7 +566,7 @@ func (h *Handler) handleTestWebhook(w http.ResponseWriter, r *http.Request) {
 		Url    string `json:"Url"`
 		Secret string `json:"Secret"`
 	}
-	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 64<<10); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid webhook test payload")
 		return
 	}
@@ -385,12 +585,17 @@ func (h *Handler) handleTestWebhook(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "webhook Id or Url is required")
 		return
 	}
+
+	start := time.Now()
 	if err := h.validateWebhookURL(target.Url); err != nil {
-		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("unsafe webhook url: %v", err))
+		httpx.JSON(w, http.StatusOK, WebhookTestResult{
+			Success:    false,
+			DurationMs: time.Since(start).Milliseconds(),
+			Error:      err.Error(),
+		})
 		return
 	}
 
-	start := time.Now()
 	statusCode, err := h.sendWebhook(r.Context(), target, WebhookPayload{
 		Event:     "WebhookTest",
 		ServerId:  h.serverID(),
@@ -398,13 +603,24 @@ func (h *Handler) handleTestWebhook(w http.ResponseWriter, r *http.Request) {
 		Data:      map[string]any{"Message": "Ambra webhook connectivity test"},
 	})
 	if err != nil {
-		httpx.Error(w, http.StatusBadGateway, fmt.Sprintf("webhook delivery failed: %v", err))
+		httpx.JSON(w, http.StatusOK, WebhookTestResult{
+			Success:    false,
+			StatusCode: statusCode,
+			DurationMs: time.Since(start).Milliseconds(),
+			Error:      err.Error(),
+		})
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{
-		"StatusCode": statusCode,
-		"DurationMs": time.Since(start).Milliseconds(),
-		"Success":    statusCode >= 200 && statusCode < 300,
+	ok := statusCode >= 200 && statusCode < 300
+	errMsg := ""
+	if !ok {
+		errMsg = fmt.Sprintf("HTTP %d", statusCode)
+	}
+	httpx.JSON(w, http.StatusOK, WebhookTestResult{
+		Success:    ok,
+		StatusCode: statusCode,
+		DurationMs: time.Since(start).Milliseconds(),
+		Error:      errMsg,
 	})
 }
 
@@ -416,7 +632,7 @@ func (h *Handler) handleBackupInfo(w http.ResponseWriter, r *http.Request) {
 	backups := make([]BackupFileInfo, 0)
 	if err == nil {
 		for _, entry := range entries {
-			if entry.IsDir() {
+			if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 				continue
 			}
 			info, err := entry.Info()
@@ -440,6 +656,34 @@ func (h *Handler) handleBackupInfo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func writeFileIntoZip(zw *zip.Writer, archiveName, srcPath string) error {
+	info, err := os.Lstat(srcPath)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil
+	}
+	in, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	hdr, err := zip.FileInfoHeader(info)
+	if err != nil {
+		return err
+	}
+	hdr.Name = filepath.ToSlash(archiveName)
+	hdr.Method = zip.Deflate
+	w, err := zw.CreateHeader(hdr)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(w, in)
+	return err
+}
+
 func (h *Handler) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
 	if (h.store == nil || h.store.Writer == nil) && h.cfg == nil {
 		httpx.Error(w, http.StatusInternalServerError, "no database store or path configured")
@@ -458,23 +702,107 @@ func (h *Handler) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
 
 	var randSuffix [4]byte
 	_, _ = rand.Read(randSuffix[:])
-	name := fmt.Sprintf("ambra-backup-%s-%s.db", time.Now().UTC().Format("20060102-150405.000"), hex.EncodeToString(randSuffix[:]))
-	dst := filepath.Join(dir, name)
-	_ = os.Remove(dst)
+	stamp := fmt.Sprintf("%s-%s", time.Now().UTC().Format("20060102-150405.000"), hex.EncodeToString(randSuffix[:]))
+	tmpDBPath := filepath.Join(dir, fmt.Sprintf(".ambra-snapshot-%s.db.tmp", stamp))
+	_ = os.Remove(tmpDBPath)
+	defer func() { _ = os.Remove(tmpDBPath) }()
 
 	if h.store != nil && h.store.Writer != nil {
-		escaped := strings.ReplaceAll(dst, "'", "''")
+		escaped := strings.ReplaceAll(tmpDBPath, "'", "''")
 		if _, err := h.store.Writer.ExecContext(r.Context(), fmt.Sprintf("VACUUM INTO '%s'", escaped)); err != nil {
 			httpx.Error(w, http.StatusInternalServerError, fmt.Sprintf("sqlite vacuum backup failed: %v", err))
 			return
 		}
-		_ = os.Chmod(dst, 0o600)
+		_ = os.Chmod(tmpDBPath, 0o600)
 	} else {
-		if err := copyFileAtomic(h.cfg.DBPath(), dst, 0o600); err != nil {
+		snap := h.cfg.Snapshot()
+		if err := copyFileAtomic(snap.DBPath(), tmpDBPath, 0o600); err != nil {
 			httpx.Error(w, http.StatusInternalServerError, fmt.Sprintf("file backup failed: %v", err))
 			return
 		}
 	}
+
+	name := fmt.Sprintf("ambra-backup-%s.zip", stamp)
+	dst := filepath.Join(dir, name)
+	tmpZip, err := os.CreateTemp(dir, ".ambra-backup-*.zip.tmp")
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, fmt.Sprintf("create backup archive failed: %v", err))
+		return
+	}
+	tmpZipPath := tmpZip.Name()
+	cleanupZip := true
+	defer func() {
+		if cleanupZip {
+			_ = os.Remove(tmpZipPath)
+		}
+	}()
+	if err := tmpZip.Chmod(0o600); err != nil {
+		_ = tmpZip.Close()
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	zw := zip.NewWriter(tmpZip)
+	if err := writeFileIntoZip(zw, "ambra.db", tmpDBPath); err != nil {
+		_ = zw.Close()
+		_ = tmpZip.Close()
+		httpx.Error(w, http.StatusInternalServerError, fmt.Sprintf("archive sqlite snapshot failed: %v", err))
+		return
+	}
+
+	dataDir := h.dataDir()
+	cfgFile := filepath.Join(dataDir, "config", "ambra.json")
+	if info, statErr := os.Lstat(cfgFile); statErr == nil && info.Mode().IsRegular() {
+		if err := writeFileIntoZip(zw, "config/ambra.json", cfgFile); err != nil {
+			_ = zw.Close()
+			_ = tmpZip.Close()
+			httpx.Error(w, http.StatusInternalServerError, fmt.Sprintf("archive config failed: %v", err))
+			return
+		}
+	}
+
+	usersMetaDir := filepath.Join(dataDir, "metadata", "users")
+	if info, statErr := os.Lstat(usersMetaDir); statErr == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+		_ = filepath.WalkDir(usersMetaDir, func(curPath string, d os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return nil
+			}
+			if d.Type()&os.ModeSymlink != 0 {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if d.IsDir() {
+				return nil
+			}
+			rel, relErr := filepath.Rel(dataDir, curPath)
+			if relErr != nil {
+				return nil
+			}
+			return writeFileIntoZip(zw, filepath.ToSlash(rel), curPath)
+		})
+	}
+
+	if err := zw.Close(); err != nil {
+		_ = tmpZip.Close()
+		httpx.Error(w, http.StatusInternalServerError, fmt.Sprintf("finalize backup archive failed: %v", err))
+		return
+	}
+	if err := tmpZip.Sync(); err != nil {
+		_ = tmpZip.Close()
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := tmpZip.Close(); err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := os.Rename(tmpZipPath, dst); err != nil {
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	cleanupZip = false
 
 	info, err := os.Stat(dst)
 	if err != nil {
@@ -489,16 +817,25 @@ func (h *Handler) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// HandleRestoreBackup exposes backup restoration so compatcore (/BackupRestore/RestoreData) can delegate to it.
+func (h *Handler) HandleRestoreBackup(w http.ResponseWriter, r *http.Request) {
+	h.handleRestoreBackup(w, r)
+}
+
 func (h *Handler) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name string `json:"Name"`
-		Path string `json:"Path"`
+		Name       string `json:"Name"`
+		BackupName string `json:"BackupName"`
+		Path       string `json:"Path"`
 	}
-	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
+	if err := httpx.DecodeJSONLimit(r, &req, 64<<10); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid restore payload")
 		return
 	}
 	backupName := strings.TrimSpace(req.Name)
+	if backupName == "" {
+		backupName = strings.TrimSpace(req.BackupName)
+	}
 	if backupName == "" && strings.TrimSpace(req.Path) != "" {
 		backupName = filepath.Base(req.Path)
 	}
@@ -524,6 +861,32 @@ func (h *Handler) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusNotFound, "backup file not found")
 		return
 	}
+
+	isZip, err := isZipArchive(src, backupName)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("invalid backup file: %v", err))
+		return
+	}
+	if isZip {
+		stagedDB, err := h.restoreZipBackupLocked(r.Context(), src)
+		if err != nil {
+			var statusErr *restoreValidationError
+			if errors.As(err, &statusErr) {
+				httpx.Error(w, http.StatusBadRequest, statusErr.Error())
+				return
+			}
+			httpx.Error(w, http.StatusInternalServerError, fmt.Sprintf("stage restore failed: %v", err))
+			return
+		}
+		httpx.JSON(w, http.StatusOK, map[string]any{
+			"Restored":        true,
+			"BackupName":      backupName,
+			"StagedPath":      stagedDB,
+			"RequiresRestart": true,
+		})
+		return
+	}
+
 	if err := verifySQLiteHeader(src); err != nil {
 		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("invalid sqlite backup file: %v", err))
 		return
@@ -546,6 +909,200 @@ func (h *Handler) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 		"StagedPath":      stagedDst,
 		"RequiresRestart": true,
 	})
+}
+
+type restoreValidationError struct {
+	msg string
+}
+
+func (e *restoreValidationError) Error() string { return e.msg }
+
+func isZipArchive(filePath, backupName string) (bool, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	hdr := make([]byte, 4)
+	n, _ := io.ReadFull(f, hdr)
+	if n == 4 && bytes.Equal(hdr, zipMagicHeader) {
+		return true, nil
+	}
+	if strings.HasSuffix(strings.ToLower(backupName), ".zip") {
+		return true, nil
+	}
+	return false, nil
+}
+
+func validateSafeZipEntryName(raw string) (string, error) {
+	if raw == "" || strings.ContainsRune(raw, 0) {
+		return "", &restoreValidationError{msg: "archive contains invalid entry name"}
+	}
+	slashed := strings.ReplaceAll(raw, "\\", "/")
+	if strings.HasPrefix(slashed, "/") {
+		return "", &restoreValidationError{msg: "archive contains absolute path entry"}
+	}
+	for _, part := range strings.Split(slashed, "/") {
+		if part == ".." {
+			return "", &restoreValidationError{msg: "archive contains path traversal entry"}
+		}
+	}
+	clean := path.Clean(slashed)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") || strings.HasPrefix(clean, "/") {
+		return "", &restoreValidationError{msg: "archive contains unsafe entry path"}
+	}
+	return clean, nil
+}
+
+func extractZipEntryToFile(zf *zip.File, dstPath string, perm os.FileMode, maxBytes int64, totalRead *int64) error {
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0o700); err != nil {
+		return err
+	}
+	rc, err := zf.Open()
+	if err != nil {
+		return &restoreValidationError{msg: fmt.Sprintf("open archive entry %q: %v", zf.Name, err)}
+	}
+	defer rc.Close()
+
+	out, err := os.OpenFile(dstPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
+	if err != nil {
+		return err
+	}
+	limited := io.LimitReader(rc, maxBytes+1)
+	written, copyErr := io.Copy(out, limited)
+	syncErr := out.Sync()
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.Remove(dstPath)
+		return &restoreValidationError{msg: fmt.Sprintf("read archive entry %q: %v", zf.Name, copyErr)}
+	}
+	if written > maxBytes {
+		_ = os.Remove(dstPath)
+		return &restoreValidationError{msg: fmt.Sprintf("archive entry %q exceeds size limit", zf.Name)}
+	}
+	*totalRead += written
+	if *totalRead > maxBackupRestoreTotalBytes {
+		_ = os.Remove(dstPath)
+		return &restoreValidationError{msg: "backup archive exceeds maximum total uncompressed size"}
+	}
+	if syncErr != nil {
+		_ = os.Remove(dstPath)
+		return syncErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(dstPath)
+		return closeErr
+	}
+	return nil
+}
+
+func (h *Handler) restoreZipBackupLocked(ctx context.Context, srcZip string) (string, error) {
+	zr, err := zip.OpenReader(srcZip)
+	if err != nil {
+		return "", &restoreValidationError{msg: fmt.Sprintf("invalid zip backup archive: %v", err)}
+	}
+	defer zr.Close()
+
+	if len(zr.File) == 0 || len(zr.File) > maxBackupZipEntries {
+		return "", &restoreValidationError{msg: "invalid zip backup entry count"}
+	}
+
+	dataDir := h.dataDir()
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return "", err
+	}
+	stageRoot, err := os.MkdirTemp(dataDir, ".ambra-restore-stage-*")
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = os.RemoveAll(stageRoot) }()
+
+	var (
+		totalRead   int64
+		hasDB       bool
+		hasConfig   bool
+		hasMetadata bool
+		stageDB     = filepath.Join(stageRoot, "ambra.db")
+		stageCfg    = filepath.Join(stageRoot, "ambra.json")
+		stageMeta   = filepath.Join(stageRoot, "metadata")
+	)
+
+	for _, zf := range zr.File {
+		if zf.Mode()&os.ModeSymlink != 0 {
+			return "", &restoreValidationError{msg: "backup archive symlinks are not allowed"}
+		}
+		cleanName, err := validateSafeZipEntryName(zf.Name)
+		if err != nil {
+			return "", err
+		}
+		if zf.FileInfo().IsDir() {
+			continue
+		}
+		switch {
+		case cleanName == "ambra.db":
+			if hasDB {
+				return "", &restoreValidationError{msg: "duplicate ambra.db entry in backup archive"}
+			}
+			if err := extractZipEntryToFile(zf, stageDB, 0o600, maxBackupRestoreTotalBytes, &totalRead); err != nil {
+				return "", err
+			}
+			hasDB = true
+		case cleanName == "config/ambra.json":
+			if hasConfig {
+				return "", &restoreValidationError{msg: "duplicate config/ambra.json entry in backup archive"}
+			}
+			if err := extractZipEntryToFile(zf, stageCfg, 0o600, maxBackupConfigFileBytes, &totalRead); err != nil {
+				return "", err
+			}
+			rawCfg, readErr := os.ReadFile(stageCfg)
+			if readErr != nil || !json.Valid(rawCfg) {
+				return "", &restoreValidationError{msg: "invalid config/ambra.json in backup archive"}
+			}
+			hasConfig = true
+		case strings.HasPrefix(cleanName, "metadata/users/"):
+			relMeta := strings.TrimPrefix(cleanName, "metadata/")
+			targetMeta := filepath.Join(stageMeta, filepath.FromSlash(relMeta))
+			relCheck, relErr := filepath.Rel(stageMeta, targetMeta)
+			if relErr != nil || strings.HasPrefix(relCheck, "..") {
+				return "", &restoreValidationError{msg: "unsafe metadata entry path in backup archive"}
+			}
+			if err := extractZipEntryToFile(zf, targetMeta, 0o644, maxBackupSingleMetaBytes, &totalRead); err != nil {
+				return "", err
+			}
+			hasMetadata = true
+		default:
+			return "", &restoreValidationError{msg: fmt.Sprintf("disallowed entry %q in backup archive", cleanName)}
+		}
+	}
+
+	if !hasDB {
+		return "", &restoreValidationError{msg: "backup archive missing ambra.db"}
+	}
+	if err := verifySQLiteHeader(stageDB); err != nil {
+		return "", &restoreValidationError{msg: fmt.Sprintf("invalid sqlite database in archive: %v", err)}
+	}
+	if err := verifySQLiteIntegrity(ctx, stageDB); err != nil {
+		return "", &restoreValidationError{msg: fmt.Sprintf("corrupted sqlite database in archive: %v", err)}
+	}
+
+	stagedDBDst := filepath.Join(dataDir, "ambra.db.restore")
+	if err := copyFileAtomic(stageDB, stagedDBDst, 0o600); err != nil {
+		return "", err
+	}
+	if hasConfig {
+		stagedCfgDst := filepath.Join(dataDir, "config", "ambra.json.restore")
+		if err := copyFileAtomic(stageCfg, stagedCfgDst, 0o600); err != nil {
+			return "", err
+		}
+	}
+	if hasMetadata {
+		stagedMetaDst := filepath.Join(dataDir, "metadata.restore")
+		_ = os.RemoveAll(stagedMetaDst)
+		if err := os.Rename(stageMeta, stagedMetaDst); err != nil {
+			return "", err
+		}
+	}
+	return stagedDBDst, nil
 }
 
 func verifySQLiteHeader(path string) error {

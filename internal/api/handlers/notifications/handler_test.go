@@ -460,7 +460,7 @@ func TestNotificationsLocalization(t *testing.T) {
 		if res.Notifications[2].Name != i18n.T(loc, "notif.task_failed.name") || res.Notifications[2].Description != i18n.T(loc, "notif.task_failed.desc") {
 			t.Fatalf("locale %s task failed = %+v", loc, res.Notifications[2])
 		}
-	if localized := res.Notifications[3]; localized.Name != i18n.T(loc, "notif.library_updated.name") || localized.Description != i18n.T(loc, "notif.library_updated.desc") {
+		if localized := res.Notifications[3]; localized.Name != i18n.T(loc, "notif.library_updated.name") || localized.Description != i18n.T(loc, "notif.library_updated.desc") {
 			t.Fatalf("locale %s library updated = %+v", loc, res.Notifications[3])
 		}
 	}
@@ -529,4 +529,68 @@ func TestNotificationsSecurityHardeningV0103(t *testing.T) {
 	if after != before+1 {
 		t.Fatalf("expected exactly 1 deduplicated task failure notification, before=%d after=%d", before, after)
 	}
+}
+
+func TestNotificationsPurgeUserAndConfiguredHTTPChannelDelivery(t *testing.T) {
+	h, mux, st := setupNotifTest(t)
+	t.Cleanup(h.Close)
+	ctx := context.Background()
+
+	var receivedBody bytes.Buffer
+	var receivedSig string
+	doneCh := make(chan struct{}, 2)
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := json.Marshal(r.Header.Get("X-Ambra-Signature"))
+		_ = json.Unmarshal(raw, &receivedSig)
+		_, _ = receivedBody.ReadFrom(r.Body)
+		select {
+		case doneCh <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer receiver.Close()
+
+	h.SetHTTPClient(receiver.Client())
+
+	// Seed compatext:state with an enabled HTTP notification service
+	svcState := fmt.Sprintf(`{"notification_services":[{"Id":"svc-1","Name":"Webhook","Enabled":true,"Events":["LibraryChanged","AdminNotification"],"Options":{"Url":%q,"Secret":"notif-secret"}}]}`, receiver.URL)
+	if _, err := st.Writer.ExecContext(ctx, `INSERT OR REPLACE INTO server_config(key, value_json, updated_at) VALUES('compatext:state', ?, 1)`, svcState); err != nil {
+		t.Fatal(err)
+	}
+
+	bus := eventbus.New()
+	h.SubscribeEvents(bus)
+	bus.Publish(ctx, eventbus.Event{
+		Type:    eventbus.EventLibraryChanged,
+		Payload: map[string]any{"ItemsAdded": 5},
+	})
+
+	select {
+	case <-doneCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for HTTP notification delivery from EventBus")
+	}
+	if !bytes.HasPrefix([]byte(receivedSig), []byte("sha256=")) {
+		t.Fatalf("expected HMAC sha256 signature on notification HTTP POST, got %q", receivedSig)
+	}
+
+	// Test PurgeUser removes user-targeted notifications and strips ReadBy
+	_ = doReq(t, mux, http.MethodPost, "/Notifications/Admin", map[string]any{"Name": "GlobalAlert", "AdminOnly": false})
+	_ = doReq(t, mux, http.MethodPost, "/Notifications/Admin", map[string]any{"Name": "PrivateToDel", "UserId": "del-user"})
+	_ = doReq(t, mux, http.MethodPost, "/Notifications/del-user/Read", nil)
+
+	h.PurgeUser(ctx, "del-user")
+	h.mu.RLock()
+	for _, item := range h.state.Items {
+		if item.UserId == "deluser" {
+			h.mu.RUnlock()
+			t.Fatal("expected deleted user's private notifications purged")
+		}
+		if containsString(item.ReadBy, "deluser") {
+			h.mu.RUnlock()
+			t.Fatal("expected deleted user stripped from ReadBy")
+		}
+	}
+	h.mu.RUnlock()
 }

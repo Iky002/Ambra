@@ -13,6 +13,7 @@ import type {
   SessionInfo,
   SystemInfo,
   UserDto,
+  UserItemDataDto,
   VirtualFolderInfo,
 } from '../api/types'
 import {
@@ -138,6 +139,7 @@ export interface DemoState {
   libraries: VirtualFolderInfo[]
   libraryItems: Map<string, string[]> // libraryId -> top-level itemIds
   items: Map<string, BaseItemDto>
+  userDataByUser: Map<string, Map<string, UserItemDataDto>>
   seasonsBySeries: Map<string, BaseItemDto[]>
   episodesBySeason: Map<string, BaseItemDto[]>
   localTrailersByItemId: Map<string, BaseItemDto[]>
@@ -2595,8 +2597,8 @@ export function createInitialDemoState(): DemoState {
     Id: DEMO_SERVER_ID,
     ServerName: 'Ambra Serverless Demo',
     ProductName: 'Ambra',
-    Version: '0.10.9-demo',
-    AmbraVersion: '0.10.9-demo',
+    Version: '0.11.0-demo',
+    AmbraVersion: '0.11.0-demo',
     LocalAddress: 'https://demo.ambra.local (Browser Memory)',
     OperatingSystem: 'WebAssembly / Browser Sandbox',
     OperatingSystemDisplayName: 'Serverless Demo Engine',
@@ -2621,7 +2623,7 @@ export function createInitialDemoState(): DemoState {
       UserId: 'user-demo-admin',
       UserName: 'admin',
       Client: 'Ambra Web',
-      ApplicationVersion: '0.10.9',
+      ApplicationVersion: '0.11.0',
       DeviceName: 'Chrome on macOS (Demo)',
       DeviceId: 'dev-demo-web-01',
       LastActivityDate: isoAgo(1),
@@ -2655,7 +2657,7 @@ export function createInitialDemoState(): DemoState {
       Id: 'dev-demo-web-01',
       Name: 'Chrome on macOS (Demo)',
       AppName: 'Ambra Web',
-      AppVersion: '0.10.9',
+      AppVersion: '0.11.0',
       LastUserId: 'user-demo-admin',
       LastUserName: 'admin',
       DateLastActivity: isoAgo(1),
@@ -2682,13 +2684,17 @@ export function createInitialDemoState(): DemoState {
 
   const apiKeys: ApiKeyInfo[] = [
     {
+      Id: 'apikey-demo-moviepilot',
       AccessToken: 'ambra_demo_key_moviepilot_9f2a8c4e1d7b',
+      MaskedToken: 'ambra_de••••••••••••••••1d7b',
       AppName: 'MoviePilot',
       DateCreated: isoAgo(2880),
       IsActive: true,
     },
     {
+      Id: 'apikey-demo-sonarr',
       AccessToken: 'ambra_demo_key_sonarr_3b7e5a90c14f',
+      MaskedToken: 'ambra_de••••••••••••••••c14f',
       AppName: 'Sonarr',
       DateCreated: isoAgo(1440),
       IsActive: true,
@@ -2933,7 +2939,7 @@ export function createInitialDemoState(): DemoState {
     [
       'ambra-server-2026-11-24.log',
       [
-        '2026-11-24T08:00:01Z INFO  [server] Ambra Media Server v0.10.9-demo starting (Serverless Memory Engine)',
+        '2026-11-24T08:00:01Z INFO  [server] Ambra Media Server v0.11.0-demo starting (Serverless Memory Engine)',
         '2026-11-24T08:00:01Z INFO  [db]     Loaded 3 virtual folders, 14 curated titles, 2 users (admin, guest)',
         '2026-11-24T08:00:02Z INFO  [search] Chinese out-of-order fuzzy search index ready (CJK + Pinyin + Cast)',
         '2026-11-24T08:00:02Z INFO  [plugin] Enabled: ambra.metadata.tmdb (priority=10), ambra.stream.strm302 (priority=20)',
@@ -2987,12 +2993,39 @@ export function createInitialDemoState(): DemoState {
     ],
   }
 
+  // 初始化按用户完全隔离的观看进度 / 收藏 / 已看状态 (userId -> itemId -> UserItemDataDto)
+  const adminUserData = new Map<string, UserItemDataDto>()
+  for (const it of items.values()) {
+    if (it.UserData) {
+      adminUserData.set(it.Id, { ...it.UserData })
+      delete it.UserData
+    }
+  }
+  const guestUserData = new Map<string, UserItemDataDto>([
+    [
+      'item-inside-out-2',
+      {
+        PlaybackPositionTicks: 24 * MIN_TICKS,
+        PlayCount: 0,
+        IsFavorite: false,
+        Played: false,
+        PlayedPercentage: 25,
+        LastPlayedDate: isoAgo(45),
+      },
+    ],
+  ])
+  const userDataByUser = new Map<string, Map<string, UserItemDataDto>>([
+    ['user-demo-admin', adminUserData],
+    ['user-demo-guest', guestUserData],
+  ])
+
   return {
     systemInfo,
     users,
     libraries,
     libraryItems,
     items,
+    userDataByUser,
     seasonsBySeries,
     episodesBySeason,
     localTrailersByItemId,

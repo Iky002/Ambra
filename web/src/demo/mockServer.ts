@@ -6,12 +6,15 @@ import type {
   BackupInfoResponse,
   BackupRestoreResult,
   BaseItemDto,
+  EncodingFfmpegOptions,
   ItemImageInfo,
   LibraryScanProgress,
   LiveTvChannelInfo,
+  LiveTvChannelMapping,
   LiveTvInfo,
   LiveTvListingProviderInfo,
   LiveTvRecordingInfo,
+  LiveTvSeriesTimerInfo,
   LiveTvTimerInfo,
   LiveTvTunerHostInfo,
   NotificationItem,
@@ -27,12 +30,15 @@ import type {
   RemoteImageInfo,
   RemoteImageResult,
   RemoteSearchResult,
+  RemoteSubtitleInfo,
   ScanProgressSnapshot,
   SearchHint,
   SearchHintResult,
   ServerConfiguration,
+  SessionInfo,
   SetupStatus,
   TaskTriggerInfo,
+  ToneMapOptions,
   UserDto,
   UserItemDataDto,
   UserPolicy,
@@ -42,7 +48,7 @@ import type {
   WebhookTestResult,
 } from '../api/types'
 import { registerDemoServer } from './demoLoader'
-import { DEMO_VIDEO_DATA_URL, makeDemoAudioDataUrl, makeDemoBifBuffer } from './demoMedia'
+import { DEMO_VIDEO_DATA_URL, makeDemoAudioDataUrl, makeDemoBifBuffer, makeDemoVttDataUrl } from './demoMedia'
 import { createInitialDemoState, DEMO_SERVER_ID, type DemoState } from './mockData'
 import { makeAvatarDataUrl, makeLibraryThumbDataUrl, makePosterDataUrl } from './svgArt'
 
@@ -87,8 +93,34 @@ function getDemoSortKey(raw: string): string {
   return trimmed.toLowerCase()
 }
 
+const DEMO_MASKED_SECRET = '********'
+
+function maskApiKeyToken(token: string): string {
+  if (!token) return ''
+  if (token.includes('•') || token.includes('*')) return token
+  if (token.length <= 12) {
+    return `${token.slice(0, 3)}••••••••${token.slice(-2)}`
+  }
+  return `${token.slice(0, 8)}••••••••••••••••${token.slice(-4)}`
+}
+
 let store: DemoState = createInitialDemoState()
 const demoTraktAccounts = new Map<string, UserTraktStatus>()
+const demoTokenUserMap = new Map<string, string>()
+const demoRawApiKeys = new Map<string, string>()
+
+function seedInitialApiKeys(): void {
+  demoRawApiKeys.clear()
+  for (const key of store.apiKeys) {
+    const id = key.Id || `apikey-${key.AppName.toLowerCase()}`
+    key.Id = id
+    const raw = key.AccessToken
+    demoRawApiKeys.set(id, raw)
+    const masked = key.MaskedToken || maskApiKeyToken(raw)
+    key.MaskedToken = masked
+  }
+}
+seedInitialApiKeys()
 
 interface DemoRankingsState {
   doubanUpdatedAt: string
@@ -124,6 +156,7 @@ interface DemoScanState {
 let activeDemoScan: DemoScanState | null = null
 let demoSetupCompleted = true
 let demoDefaultLanguage = 'zh-CN'
+let demoRawTmdbApiKey = 'demo_tmdb_v3_key_xxxxxxxx'
 
 interface DemoOrphanItem {
   Id: string
@@ -214,9 +247,19 @@ function createInitialServerConfig(): ServerConfiguration {
   return {
     ServerName: store.systemInfo.ServerName,
     IsStartupWizardCompleted: true,
-    TMDBApiKey: 'demo-tmdb-key-ambra',
+    TMDBApiKey: DEMO_MASKED_SECRET,
+    HasTMDBApiKey: true,
     TMDBLanguage: 'zh-CN',
     EnableSTRM302: true,
+    EnableDLNA: false,
+    DLNADefaultUserID: '',
+    EnableQuickConnect: true,
+    EnableRemoteAccess: true,
+    LocalNetworkSubnets: ['192.168.0.0/16', '10.0.0.0/8'],
+    TrustedProxies: ['127.0.0.1', '::1'],
+    AllowedOrigins: [],
+    SimultaneousStreamLimit: 0,
+    RemoteClientBitrateLimit: 0,
     PlayedThreshold: 0.9,
     PreferredMetadataLanguage: 'zh',
     MetadataCountryCode: 'CN',
@@ -224,7 +267,127 @@ function createInitialServerConfig(): ServerConfiguration {
   }
 }
 
+function createInitialFfmpegOptions(): EncodingFfmpegOptions {
+  return {
+    HardwareAccelerationMode: 1,
+    EnableThrottling: true,
+    ThrottleBufferSize: 120,
+    ThrottleHysteresis: 8,
+    H264Crf: 23,
+    H264Preset: 'veryfast',
+    EnableHardwareEncoding: true,
+    AllowHevcEncoding: true,
+    EnableSubtitleExtraction: true,
+    TranscodingTempPath: store.systemInfo.TranscodingTempPath || '/tmp/ambra-transcode',
+    EncoderAppPathDisplay: 'ffmpeg',
+  }
+}
+
+function createInitialToneMapOptions(): ToneMapOptions {
+  return {
+    EnableToneMapping: true,
+    ToneMappingAlgorithm: 'hable',
+    ToneMappingMode: 'auto',
+    ToneMappingDesat: 0,
+    ToneMappingParam: 0,
+    ToneMappingPeak: 100,
+  }
+}
+
 let demoServerConfig: ServerConfiguration = createInitialServerConfig()
+let demoFfmpegOptions: EncodingFfmpegOptions = createInitialFfmpegOptions()
+let demoToneMapOptions: ToneMapOptions = createInitialToneMapOptions()
+
+interface DemoMigrationConflict {
+  user_name?: string
+  source_item_id?: string
+  item_name?: string
+  item_type?: string
+  reason: string
+}
+
+interface DemoMigrationReport {
+  status: 'idle' | 'running' | 'completed' | 'cancelled' | 'failed'
+  dry_run: boolean
+  source_url?: string
+  source_server_name?: string
+  started_at?: string
+  completed_at?: string
+  total_users: number
+  processed_users: number
+  current_user?: string
+  users_matched: number
+  users_created: number
+  items_scanned: number
+  items_matched: number
+  items_skipped: number
+  played_migrated: number
+  favorites_migrated: number
+  resume_migrated: number
+  conflicts: DemoMigrationConflict[]
+  errors: string[]
+  resumed_from_checkpoint: boolean
+  checkpoint_key?: string
+}
+
+interface DemoMigrationState {
+  report: DemoMigrationReport
+  migrateUsers: boolean
+  migratePlayed: boolean
+  migrateFavorites: boolean
+  migrateResume: boolean
+  checkpointByUrl: Map<string, { checkpointKey: string; processedUsers: number }>
+}
+
+const DEMO_MIGRATION_SOURCE_USERS = [
+  {
+    Id: 'demo-u-1',
+    Name: 'Admin',
+    Policy: { IsAdministrator: true, IsDisabled: false },
+    LastActivityDate: new Date(Date.now() - 3600_000).toISOString(),
+  },
+  {
+    Id: 'demo-u-2',
+    Name: '家庭观影',
+    Policy: { IsAdministrator: false, IsDisabled: false },
+    LastActivityDate: new Date(Date.now() - 86400_000).toISOString(),
+  },
+  {
+    Id: 'demo-u-3',
+    Name: '访客账号',
+    Policy: { IsAdministrator: false, IsDisabled: false },
+    LastActivityDate: new Date(Date.now() - 7 * 86400_000).toISOString(),
+  },
+]
+
+function createInitialMigrationState(): DemoMigrationState {
+  return {
+    report: {
+      status: 'idle',
+      dry_run: false,
+      total_users: 0,
+      processed_users: 0,
+      users_matched: 0,
+      users_created: 0,
+      items_scanned: 0,
+      items_matched: 0,
+      items_skipped: 0,
+      played_migrated: 0,
+      favorites_migrated: 0,
+      resume_migrated: 0,
+      conflicts: [],
+      errors: [],
+      resumed_from_checkpoint: false,
+    },
+    migrateUsers: true,
+    migratePlayed: true,
+    migrateFavorites: true,
+    migrateResume: true,
+    checkpointByUrl: new Map(),
+  }
+}
+
+let demoMigrationState: DemoMigrationState = createInitialMigrationState()
 
 function createInitialTunerHosts(): LiveTvTunerHostInfo[] {
   return [
@@ -301,6 +464,42 @@ function createInitialLiveTvTimers(): LiveTvTimerInfo[] {
   ]
 }
 
+function createInitialLiveTvSeriesTimers(): LiveTvSeriesTimerInfo[] {
+  return [
+    {
+      Id: 'stimer-demo-01',
+      ChannelId: 'ch-demo-01',
+      Name: '新闻联播每日连录',
+      Overview: '自动按 EPG 节目单匹配并录制最新一期节目',
+      RecordAnyTime: false,
+      RecordAnyChannel: false,
+      RecordNewOnly: true,
+      Days: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'],
+      PrePaddingSeconds: 60,
+      PostPaddingSeconds: 180,
+    },
+  ]
+}
+
+function createInitialLiveTvChannelMappings(): LiveTvChannelMapping[] {
+  return [
+    {
+      ProviderId: 'epg-demo-01',
+      TunerChannelId: 'ch-demo-01',
+      TunerChannelName: 'CCTV-1 综合高清',
+      ProviderChannelId: 'cctv1.cn',
+      ProviderChannelName: 'CCTV-1 HD (XMLTV)',
+    },
+    {
+      ProviderId: 'epg-demo-01',
+      TunerChannelId: 'ch-demo-02',
+      TunerChannelName: 'CCTV-6 电影频道',
+      ProviderChannelId: 'cctv6.cn',
+      ProviderChannelName: 'CCTV-6 Movies (XMLTV)',
+    },
+  ]
+}
+
 function createInitialLiveTvRecordings(): LiveTvRecordingInfo[] {
   const start = new Date(Date.now() - 26 * 3600_000)
   const end = new Date(Date.now() - 24 * 3600_000)
@@ -328,7 +527,22 @@ function sanitizeWebhookForResponse(w: WebhookInfo): WebhookInfo {
   }
 }
 
-const DEMO_MASKED_SECRET = '********'
+function validateHttpUrl(rawUrl: string, label: string): string {
+  const trimmed = rawUrl.trim()
+  if (!trimmed) {
+    throw new ApiError(400, `${label}不能为空`)
+  }
+  let parsed: URL
+  try {
+    parsed = new URL(trimmed)
+  } catch {
+    throw new ApiError(400, `${label}格式无效，必须为合法的 http:// 或 https:// 地址`)
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new ApiError(400, `${label}必须使用 http:// 或 https:// 协议`)
+  }
+  return trimmed
+}
 
 function isSensitivePluginConfigKey(key: string): boolean {
   const lower = key.trim().toLowerCase()
@@ -429,6 +643,18 @@ function mergePluginConfigForSave(
   return merged
 }
 
+function resolveCanonicalPluginId(pluginId: string): string {
+  const lower = pluginId.toLowerCase()
+  if (lower === 'ambra.builtin.tmdb') return 'ambra.metadata.tmdb'
+  if (lower === 'ambra.builtin.strm302' || lower === 'ambra.builtin.strm') {
+    return 'ambra.stream.strm302'
+  }
+  if (lower === 'ambra.builtin.chinese-subtitle' || lower === 'ambra.builtin.subtitle') {
+    return 'ambra.subtitle.chinese-variant'
+  }
+  return pluginId
+}
+
 function createInitialDemoWebhooks(): WebhookInfo[] {
   return [
     {
@@ -445,6 +671,8 @@ function createInitialDemoWebhooks(): WebhookInfo[] {
 }
 
 let demoLiveTvTimers: LiveTvTimerInfo[] = createInitialLiveTvTimers()
+let demoLiveTvSeriesTimers: LiveTvSeriesTimerInfo[] = createInitialLiveTvSeriesTimers()
+let demoLiveTvChannelMappings: LiveTvChannelMapping[] = createInitialLiveTvChannelMappings()
 let demoLiveTvRecordings: LiveTvRecordingInfo[] = createInitialLiveTvRecordings()
 let demoWebhooks: WebhookInfo[] = createInitialDemoWebhooks()
 
@@ -455,6 +683,31 @@ const DEMO_PARENTAL_RATINGS: ParentalRatingOption[] = [
   { Name: 'R', Value: 9 },
   { Name: 'NC-17', Value: 10 },
 ]
+
+function parseParentalRatingValue(raw?: string): number | null {
+  if (!raw) return null
+  const upper = raw.trim().toUpperCase()
+  if (!upper || upper === 'NR' || upper === 'UNRATED' || upper === 'NOT RATED') {
+    return null
+  }
+  if (upper === 'G' || upper === 'TV-Y' || upper === 'TV-G' || upper === 'ALL' || upper === '0+') {
+    return 1
+  }
+  if (upper === 'PG' || upper === 'TV-Y7' || upper === 'TV-PG' || upper === '7+' || upper === '6+') {
+    return 5
+  }
+  if (upper === 'PG-13' || upper === 'TV-14' || upper === '12' || upper === '12+' || upper === '13+') {
+    return 7
+  }
+  if (upper === 'R' || upper === 'TV-MA' || upper === '15' || upper === '16+' || upper === '18') {
+    return 9
+  }
+  if (upper === 'NC-17' || upper === '18+' || upper === 'X' || upper === 'AO') {
+    return 10
+  }
+  const matched = DEMO_PARENTAL_RATINGS.find((r) => r.Name.toUpperCase() === upper)
+  return matched ? matched.Value : null
+}
 
 function createInitialDemoBackups(): BackupFileInfo[] {
   return [
@@ -497,7 +750,7 @@ function createInitialDemoNotifications(): DemoNotificationRecord[] {
     {
       Id: 'notif-demo-01',
       Date: new Date(now - 15 * 60_000).toISOString(),
-      Name: '欢迎体验 Ambra v0.10.9',
+      Name: '欢迎体验 Ambra v0.11.0',
       Description: '已上线应用内通知中心、家长控制分级过滤与 Quick Connect 设备授权码登录。',
       Level: 'Normal',
       readByUsers: new Set(),
@@ -587,17 +840,25 @@ const DEMO_IMDB_TOP250_TMDB_IDS = new Set([
 export function resetDemoStore(): void {
   store = createInitialDemoState()
   demoTraktAccounts.clear()
+  demoTokenUserMap.clear()
+  seedInitialApiKeys()
   rankingsState = createInitialRankingsState()
   activeDemoScan = null
   demoSetupCompleted = true
   demoDefaultLanguage = 'zh-CN'
+  demoRawTmdbApiKey = 'demo_tmdb_v3_key_xxxxxxxx'
   demoServerConfig = createInitialServerConfig()
+  demoFfmpegOptions = createInitialFfmpegOptions()
+  demoToneMapOptions = createInitialToneMapOptions()
+  demoMigrationState = createInitialMigrationState()
   demoOrphans = createInitialDemoOrphans()
   demoReviews = createInitialDemoReviews()
   demoTunerHosts = createInitialTunerHosts()
   demoListingProviders = createInitialListingProviders()
   demoLiveTvChannels = createInitialLiveTvChannels()
   demoLiveTvTimers = createInitialLiveTvTimers()
+  demoLiveTvSeriesTimers = createInitialLiveTvSeriesTimers()
+  demoLiveTvChannelMappings = createInitialLiveTvChannelMappings()
   demoLiveTvRecordings = createInitialLiveTvRecordings()
   demoWebhooks = createInitialDemoWebhooks()
   demoBackups = createInitialDemoBackups()
@@ -682,12 +943,10 @@ export function matchesFuzzySearch(item: BaseItemDto, rawTerm: string): boolean 
     return tokens.every((tok) => haystack.includes(tok))
   }
 
-  // 单词直接子串命中
   if (haystack.includes(trimmed)) {
     return true
   }
 
-  // 中文无空格乱序/跳字兜底（如“地球流浪”“诺兰梦”）
   const chars = Array.from(trimmed).filter((ch) => !/\s/.test(ch))
   if (chars.length >= 2 && /[\u4e00-\u9fff]/.test(trimmed)) {
     return chars.every((ch) => haystack.includes(ch))
@@ -706,7 +965,13 @@ function parseJsonBody(options?: RequestInit): Record<string, unknown> {
   }
 }
 
-function pushActivity(name: string, type: string, shortOverview?: string, userId?: string): void {
+function pushActivity(
+  name: string,
+  type: string,
+  shortOverview?: string,
+  userId?: string,
+  severity = 'Info',
+): void {
   store.activityLogs.unshift({
     Id: store.nextActivityId++,
     Name: name,
@@ -714,8 +979,450 @@ function pushActivity(name: string, type: string, shortOverview?: string, userId
     Type: type,
     Date: new Date().toISOString(),
     UserId: userId,
-    Severity: 'Info',
+    Severity: severity,
   })
+}
+
+function extractTokenFromAuthHeader(rawHeader: string | null): string | null {
+  if (!rawHeader) return null
+  const trimmed = rawHeader.trim()
+  if (!trimmed) return null
+  const tokenParamMatch = trimmed.match(/Token="([^"]+)"/i) || trimmed.match(/Token=([^,\s"]+)/i)
+  if (tokenParamMatch?.[1]) {
+    return tokenParamMatch[1].trim()
+  }
+  const bearerMatch = trimmed.match(/^Bearer\s+(.+)$/i)
+  if (bearerMatch?.[1]) {
+    return bearerMatch[1].trim()
+  }
+  return null
+}
+
+function extractDemoToken(options: RequestInit, qs: URLSearchParams): {
+  token: string | null
+  fromExplicitHeaderOrQuery: boolean
+} {
+  const headers = new Headers(options.headers || {})
+  const stdAuthToken = extractTokenFromAuthHeader(headers.get('Authorization'))
+  if (stdAuthToken) {
+    return { token: stdAuthToken, fromExplicitHeaderOrQuery: true }
+  }
+  const embyAuthToken = extractTokenFromAuthHeader(headers.get('X-Emby-Authorization'))
+  if (embyAuthToken) {
+    return { token: embyAuthToken, fromExplicitHeaderOrQuery: true }
+  }
+  const directHeaderToken =
+    headers.get('X-Emby-Token')?.trim() || headers.get('X-MediaBrowser-Token')?.trim()
+  if (directHeaderToken) {
+    return { token: directHeaderToken, fromExplicitHeaderOrQuery: true }
+  }
+  const queryToken = qs.get('api_key')?.trim() || qs.get('ApiKey')?.trim()
+  if (queryToken) {
+    return { token: queryToken, fromExplicitHeaderOrQuery: true }
+  }
+  const stored = getStoredAuth()
+  if (stored?.accessToken) {
+    return { token: stored.accessToken, fromExplicitHeaderOrQuery: false }
+  }
+  return { token: null, fromExplicitHeaderOrQuery: false }
+}
+
+interface DemoCaller {
+  token: string | null
+  userId: string
+  user?: UserDto
+  isAdmin: boolean
+  isApiKey?: boolean
+}
+
+function resolveDemoCaller(options: RequestInit, qs: URLSearchParams): DemoCaller {
+  const { token, fromExplicitHeaderOrQuery } = extractDemoToken(options, qs)
+  const stored = getStoredAuth()
+
+  if (token) {
+    // 1. 服务端签发的登录会话 Token
+    const mappedUserId = demoTokenUserMap.get(token)
+    if (mappedUserId) {
+      const rec = store.users.find((u) => u.user.Id === mappedUserId)
+      if (rec) {
+        return {
+          token,
+          userId: rec.user.Id,
+          user: rec.user,
+          isAdmin: Boolean(rec.user.Policy?.IsAdministrator),
+        }
+      }
+    }
+
+    // 2. 服务端签发的管理员 API Key
+    for (const apiKey of store.apiKeys) {
+      const raw = (apiKey.Id && demoRawApiKeys.get(apiKey.Id)) || apiKey.AccessToken
+      if (apiKey.IsActive !== false && raw && raw === token) {
+        const adminRec = store.users.find((u) => u.user.Policy?.IsAdministrator) || store.users[0]
+        return {
+          token,
+          userId: adminRec?.user.Id || 'user-demo-admin',
+          user: adminRec?.user,
+          isAdmin: true,
+          isApiKey: true,
+        }
+      }
+    }
+
+    // 3. Token 内嵌已知 userId（例如 reset 前后或单测构造的 demo_tok_<userId>）
+    for (const rec of store.users) {
+      if (token.includes(rec.user.Id)) {
+        return {
+          token,
+          userId: rec.user.Id,
+          user: rec.user,
+          isAdmin: Boolean(rec.user.Policy?.IsAdministrator),
+        }
+      }
+    }
+
+    // 4. 若与 localStorage 当前会话匹配，优先从 store.users 读取权威角色（杜绝篡改 localStorage 越权）
+    if (!fromExplicitHeaderOrQuery || (stored && stored.accessToken === token)) {
+      if (stored?.userId) {
+        const rec = store.users.find((u) => u.user.Id === stored.userId)
+        if (rec) {
+          return {
+            token,
+            userId: rec.user.Id,
+            user: rec.user,
+            isAdmin: Boolean(rec.user.Policy?.IsAdministrator),
+          }
+        }
+        // 兼容测试中构造的虚拟 userId（如 user-admin）
+        return {
+          token,
+          userId: stored.userId,
+          user: undefined,
+          isAdmin: Boolean(stored.isAdmin),
+        }
+      }
+    }
+
+    // 5. 显式传入的测试 Header Token 兜底（如 Authorization: MediaBrowser Token="guest-tok"）
+    const lowerTok = token.toLowerCase()
+    if (lowerTok.includes('guest')) {
+      const guestRec = store.users.find((u) => u.user.Id === 'user-demo-guest')
+      if (guestRec) {
+        return {
+          token,
+          userId: guestRec.user.Id,
+          user: guestRec.user,
+          isAdmin: Boolean(guestRec.user.Policy?.IsAdministrator),
+        }
+      }
+    }
+    if (lowerTok.includes('admin')) {
+      const adminRec = store.users.find((u) => u.user.Id === 'user-demo-admin')
+      if (adminRec) {
+        return {
+          token,
+          userId: adminRec.user.Id,
+          user: adminRec.user,
+          isAdmin: Boolean(adminRec.user.Policy?.IsAdministrator),
+        }
+      }
+    }
+
+    // 未知显式 Token 若 stored 存在且同源会话则回退
+    if (stored?.userId) {
+      const rec = store.users.find((u) => u.user.Id === stored.userId)
+      if (rec) {
+        return {
+          token,
+          userId: rec.user.Id,
+          user: rec.user,
+          isAdmin: Boolean(rec.user.Policy?.IsAdministrator),
+        }
+      }
+      return {
+        token,
+        userId: stored.userId,
+        user: undefined,
+        isAdmin: Boolean(stored.isAdmin),
+      }
+    }
+  }
+
+  return {
+    token: null,
+    userId: '',
+    user: undefined,
+    isAdmin: false,
+  }
+}
+
+function requireDemoAdmin(caller: DemoCaller): void {
+  if (!caller.isAdmin) {
+    throw new ApiError(403, '需要管理员权限 (403 Forbidden)')
+  }
+}
+
+function requireSelfOrAdmin(caller: DemoCaller, targetUserId: string): void {
+  if (!targetUserId) return
+  if (!caller.isAdmin && caller.userId !== targetUserId) {
+    throw new ApiError(403, '无权访问或修改其他用户的数据 (403 Forbidden)')
+  }
+}
+
+function resolveUserDto(userId: string, fallbackCaller: DemoCaller): UserDto | undefined {
+  if (userId) {
+    const rec = store.users.find((u) => u.user.Id === userId)
+    if (rec) return rec.user
+  }
+  return fallbackCaller.user
+}
+
+function getUserDataMap(userId: string): Map<string, UserItemDataDto> {
+  const effectiveUserId = userId || 'user-demo-admin'
+  let map = store.userDataByUser.get(effectiveUserId)
+  if (!map) {
+    map = new Map<string, UserItemDataDto>()
+    store.userDataByUser.set(effectiveUserId, map)
+  }
+  return map
+}
+
+function ensureUserDataForUser(userId: string, itemId: string): UserItemDataDto {
+  const map = getUserDataMap(userId)
+  let ud = map.get(itemId)
+  if (!ud) {
+    ud = {
+      PlaybackPositionTicks: 0,
+      PlayCount: 0,
+      IsFavorite: false,
+      Played: false,
+    }
+    map.set(itemId, ud)
+  }
+  return ud
+}
+
+function getUserDataSnapshot(userId: string, itemId: string): UserItemDataDto {
+  const existing = store.userDataByUser.get(userId || 'user-demo-admin')?.get(itemId)
+  if (existing) {
+    return { ...existing }
+  }
+  return {
+    PlaybackPositionTicks: 0,
+    PlayCount: 0,
+    IsFavorite: false,
+    Played: false,
+  }
+}
+
+function projectItemForUser(item: BaseItemDto, userId: string): BaseItemDto {
+  const uid = userId || 'user-demo-admin'
+  const ud = getUserDataSnapshot(uid, item.Id)
+
+  if (item.Type === 'Series') {
+    const seasons = store.seasonsBySeries.get(item.Id) || []
+    const allEps = seasons.flatMap((s) => store.episodesBySeason.get(s.Id) || [])
+    if (allEps.length > 0) {
+      const unplayed = allEps.filter((ep) => !getUserDataSnapshot(uid, ep.Id).Played).length
+      ud.UnplayedItemCount = unplayed
+    }
+  } else if (item.Type === 'Season') {
+    const eps = store.episodesBySeason.get(item.Id) || []
+    if (eps.length > 0) {
+      const unplayed = eps.filter((ep) => !getUserDataSnapshot(uid, ep.Id).Played).length
+      ud.UnplayedItemCount = unplayed
+    }
+  }
+
+  return {
+    ...item,
+    UserData: ud,
+  }
+}
+
+function getItemLibraryIds(item: BaseItemDto, visited = new Set<string>()): Set<string> {
+  const result = new Set<string>()
+  if (visited.has(item.Id)) return result
+  visited.add(item.Id)
+
+  const knownLibIds = new Set(store.libraries.map((l) => l.ItemId))
+
+  for (const lib of store.libraries) {
+    const ids = store.libraryItems.get(lib.ItemId)
+    if (ids?.includes(item.Id)) {
+      result.add(lib.ItemId)
+    }
+  }
+
+  const parentCandidates = [item.ParentId, item.SeriesId, item.SeasonId, item.AlbumId].filter(
+    (x): x is string => Boolean(x),
+  )
+
+  for (const pid of parentCandidates) {
+    if (knownLibIds.has(pid)) {
+      result.add(pid)
+    } else {
+      const parentItem = store.items.get(pid)
+      if (parentItem) {
+        for (const subLib of getItemLibraryIds(parentItem, visited)) {
+          result.add(subLib)
+        }
+      }
+    }
+  }
+
+  if (result.size === 0 && item.Type === 'MusicArtist' && knownLibIds.has('lib-music')) {
+    result.add('lib-music')
+  }
+
+  return result
+}
+
+function getEffectiveOfficialRating(item: BaseItemDto): string | undefined {
+  if (item.OfficialRating && item.OfficialRating.trim()) {
+    return item.OfficialRating.trim()
+  }
+  if (item.SeriesId) {
+    const series = store.items.get(item.SeriesId)
+    if (series?.OfficialRating && series.OfficialRating.trim()) {
+      return series.OfficialRating.trim()
+    }
+  }
+  if (item.ParentId) {
+    const parent = store.items.get(item.ParentId)
+    if (parent?.OfficialRating && parent.OfficialRating.trim()) {
+      return parent.OfficialRating.trim()
+    }
+  }
+  return undefined
+}
+
+function getEffectiveItemTags(item: BaseItemDto): Set<string> {
+  const set = new Set<string>()
+  for (const t of item.Tags || []) {
+    if (t && t.trim()) set.add(t.trim().toLowerCase())
+  }
+  if (item.SeriesId) {
+    const series = store.items.get(item.SeriesId)
+    for (const t of series?.Tags || []) {
+      if (t && t.trim()) set.add(t.trim().toLowerCase())
+    }
+  }
+  if (item.ParentId) {
+    const parent = store.items.get(item.ParentId)
+    for (const t of parent?.Tags || []) {
+      if (t && t.trim()) set.add(t.trim().toLowerCase())
+    }
+  }
+  return set
+}
+
+function isUnratedBlockedByPolicy(item: BaseItemDto, blockUnrated: string[]): boolean {
+  const blockedTypes = new Set(blockUnrated.map((s) => s.trim().toLowerCase()).filter(Boolean))
+  if (blockedTypes.size === 0) return false
+  const itemTypeLower = item.Type.toLowerCase()
+  if (blockedTypes.has(itemTypeLower)) return true
+  if (
+    blockedTypes.has('video') &&
+    (item.MediaType === 'Video' ||
+      ['movie', 'series', 'season', 'episode', 'video', 'trailer', 'extra'].includes(itemTypeLower))
+  ) {
+    return true
+  }
+  if (blockedTypes.has('series') && (itemTypeLower === 'season' || itemTypeLower === 'episode')) {
+    return true
+  }
+  return false
+}
+
+export function canDemoUserAccessItem(
+  user: UserDto | undefined,
+  item: BaseItemDto,
+  visitedContainer = new Set<string>(),
+): boolean {
+  const policy = user?.Policy
+  if (!policy) return true
+
+  // BoxSet / Playlist 容器按子项可见性及自身标签判定
+  if (item.Type === 'BoxSet' || item.Type === 'Playlist') {
+    if (visitedContainer.has(item.Id)) return true
+    visitedContainer.add(item.Id)
+    const childIds = store.libraryItems.get(item.Id) || []
+    if (policy.BlockedTags && policy.BlockedTags.length > 0) {
+      const ownTags = getEffectiveItemTags(item)
+      if (policy.BlockedTags.some((bt) => bt.trim() && ownTags.has(bt.trim().toLowerCase()))) {
+        return false
+      }
+    }
+    if (childIds.length === 0) {
+      return true
+    }
+    return childIds.some((cid) => {
+      const child = store.items.get(cid)
+      return child ? canDemoUserAccessItem(user, child, visitedContainer) : false
+    })
+  }
+
+  // 1. 媒体库白名单 (EnableAllFolders === false)
+  if (policy.EnableAllFolders === false) {
+    const allowedFolders = new Set(policy.EnabledFolders || [])
+    const itemLibs = getItemLibraryIds(item)
+    if (itemLibs.size > 0) {
+      let hasAllowedLib = false
+      for (const libId of itemLibs) {
+        if (allowedFolders.has(libId)) {
+          hasAllowedLib = true
+          break
+        }
+      }
+      if (!hasAllowedLib) return false
+    } else {
+      return false
+    }
+  }
+
+  // 2. 未分级内容拦截 (BlockUnratedItems) & 最高分级 (MaxParentalRating)
+  const effectiveRating = getEffectiveOfficialRating(item)
+  const ratingVal = parseParentalRatingValue(effectiveRating)
+  if (ratingVal === null) {
+    if (
+      Array.isArray(policy.BlockUnratedItems) &&
+      policy.BlockUnratedItems.length > 0 &&
+      isUnratedBlockedByPolicy(item, policy.BlockUnratedItems)
+    ) {
+      return false
+    }
+  } else if (typeof policy.MaxParentalRating === 'number' && ratingVal > policy.MaxParentalRating) {
+    return false
+  }
+
+  // 3. 屏蔽标签黑名单 (BlockedTags)
+  const effectiveTags = getEffectiveItemTags(item)
+  if (Array.isArray(policy.BlockedTags) && policy.BlockedTags.length > 0) {
+    for (const bt of policy.BlockedTags) {
+      const normalized = bt.trim().toLowerCase()
+      if (normalized && effectiveTags.has(normalized)) {
+        return false
+      }
+    }
+  }
+
+  // 4. 白名单允许标签 (AllowedTags)
+  if (Array.isArray(policy.AllowedTags)) {
+    const allowedTags = policy.AllowedTags.map((t) => t.trim().toLowerCase()).filter(Boolean)
+    if (allowedTags.length > 0) {
+      const hasAllowedTag = allowedTags.some((at) => effectiveTags.has(at))
+      if (!hasAllowedTag) return false
+    }
+  }
+
+  return true
+}
+
+function isLibraryAllowedForUser(user: UserDto | undefined, libraryId: string): boolean {
+  const policy = user?.Policy
+  if (!policy || policy.EnableAllFolders !== false) return true
+  return (policy.EnabledFolders || []).includes(libraryId)
 }
 
 function getVisibleLibrariesForUser(userId: string): VirtualFolderInfo[] {
@@ -738,18 +1445,6 @@ function libraryToViewDto(lib: VirtualFolderInfo): BaseItemDto {
     IsFolder: true,
     ImageTags: { Primary: 'demo-lib' },
   }
-}
-
-function ensureUserData(item: BaseItemDto): UserItemDataDto {
-  if (!item.UserData) {
-    item.UserData = {
-      PlaybackPositionTicks: 0,
-      PlayCount: 0,
-      IsFavorite: false,
-      Played: false,
-    }
-  }
-  return item.UserData
 }
 
 function sortItems(items: BaseItemDto[], sortBy: string, sortOrder: string): BaseItemDto[] {
@@ -786,6 +1481,34 @@ function sortItems(items: BaseItemDto[], sortBy: string, sortOrder: string): Bas
   })
 }
 
+function syncTmdbPluginFromServerConfig(): void {
+  const prev = store.pluginConfigs.get('ambra.metadata.tmdb') || {}
+  store.pluginConfigs.set('ambra.metadata.tmdb', {
+    ...prev,
+    ApiKey: demoRawTmdbApiKey,
+    api_key: demoRawTmdbApiKey,
+    Language: demoServerConfig.TMDBLanguage || 'zh-CN',
+    language: demoServerConfig.TMDBLanguage || 'zh-CN',
+  })
+}
+
+function syncStrmPluginFromServerConfig(): void {
+  const enabled = Boolean(demoServerConfig.EnableSTRM302)
+  const prev = store.pluginConfigs.get('ambra.stream.strm302') || {}
+  store.pluginConfigs.set('ambra.stream.strm302', {
+    ...prev,
+    Enabled: enabled,
+    enabled,
+    Enable302: enabled,
+    enable_302: enabled,
+  })
+  const plugin = store.plugins.find((p) => p.Id === 'ambra.stream.strm302')
+  if (plugin) {
+    plugin.Enabled = enabled
+    plugin.Status = enabled ? 'Active' : 'Disabled'
+  }
+}
+
 /**
  * 纯前端内存态 Emby Mock 请求引擎。
  * 由 src/api/client.ts 的 embyFetch 在 isDemoMode() === true 时直接调用。
@@ -795,43 +1518,57 @@ export async function demoFetch<T>(
   options: RequestInit = {},
   requireAuth = true,
 ): Promise<T> {
-  const auth = getStoredAuth()
-  if (requireAuth && !auth?.accessToken) {
-    throw new ApiError(401, '未登录或登录已过期')
-  }
-
   const method = (options.method || 'GET').toUpperCase()
   const url = new URL(path.startsWith('/') ? path : `/${path}`, 'http://ambra.demo')
-  const pathname = url.pathname
+  const rawPathname = url.pathname
+  const pathname =
+    rawPathname.startsWith('/api/') || rawPathname.startsWith('/emby/')
+      ? rawPathname
+      : `/emby${rawPathname}`
   const qs = url.searchParams
 
+  const caller = resolveDemoCaller(options, qs)
+  if (requireAuth && !caller.token) {
+    throw new ApiError(401, '未登录或登录已过期')
+  }
+  if (requireAuth && caller.user?.Policy?.IsDisabled) {
+    throw new ApiError(403, `账号「${caller.user.Name}」已被管理员禁用`)
+  }
+
   if (pathname === '/emby/Users/Me/Trakt') {
-    if (!auth?.userId) throw new ApiError(403, 'A personal user session is required')
+    if (!caller.userId) throw new ApiError(403, 'A personal user session is required')
     const enabled = store.plugins.find((p) => p.Id === 'ambra.builtin.trakt')?.Enabled === true
     if (method === 'DELETE') {
-      demoTraktAccounts.delete(auth.userId)
+      demoTraktAccounts.delete(caller.userId)
       return undefined as T
     }
     const status: UserTraktStatus = {
-      Configured: false, ClientId: '', AccessTokenConfigured: false,
-      ScrobblePlayback: true, SyncWatched: true,
-      ...demoTraktAccounts.get(auth.userId), Enabled: enabled,
+      Configured: false,
+      ClientId: '',
+      AccessTokenConfigured: false,
+      ScrobblePlayback: true,
+      SyncWatched: true,
+      ...demoTraktAccounts.get(caller.userId),
+      Enabled: enabled,
     }
     if (method === 'POST') {
       if (!enabled) throw new ApiError(403, 'Trakt is disabled by the administrator')
       const body = parseJsonBody(options)
       const clientId = String(body.ClientId ?? status.ClientId).trim()
       const token = typeof body.AccessToken === 'string' ? body.AccessToken.trim() : undefined
-      if (!clientId || (token === undefined && (!status.Configured || clientId !== status.ClientId)) ||
-        token === '' || token === '********') {
+      if (
+        !clientId ||
+        (token === undefined && (!status.Configured || clientId !== status.ClientId)) ||
+        token === '' ||
+        token === DEMO_MASKED_SECRET
+      ) {
         throw new ApiError(400, 'A valid Client ID and Access Token are required')
       }
       status.ClientId = clientId
       status.Configured = status.AccessTokenConfigured = true
       if (typeof body.ScrobblePlayback === 'boolean') status.ScrobblePlayback = body.ScrobblePlayback
       if (typeof body.SyncWatched === 'boolean') status.SyncWatched = body.SyncWatched
-      // Demo simulates binding without retaining OAuth credentials.
-      demoTraktAccounts.set(auth.userId, { ...status })
+      demoTraktAccounts.set(caller.userId, { ...status })
     }
     return status as T
   }
@@ -843,12 +1580,15 @@ export async function demoFetch<T>(
       server_name: store.systemInfo.ServerName,
       default_language: demoDefaultLanguage,
       has_users: store.users.length > 0,
-      has_tmdb_key: true,
+      has_tmdb_key: Boolean(demoRawTmdbApiKey),
     }
     return status as T
   }
 
   if (pathname === '/api/setup/admin' && method === 'POST') {
+    if (demoSetupCompleted && caller.token && !caller.isAdmin) {
+      throw new ApiError(403, '初始化向导已完成，普通用户无权重新配置管理员')
+    }
     const body = parseJsonBody(options)
     const serverName = String(body.server_name || '').trim()
     const language = String(body.language || '').trim()
@@ -860,6 +1600,7 @@ export async function demoFetch<T>(
     }
     if (serverName) {
       store.systemInfo.ServerName = serverName
+      demoServerConfig.ServerName = serverName
     }
     if (language) {
       demoDefaultLanguage = language
@@ -899,6 +1640,7 @@ export async function demoFetch<T>(
     }
 
     const token = `demo_tok_setup_${rec.user.Id}_${Date.now().toString(36)}`
+    demoTokenUserMap.set(token, rec.user.Id)
     pushActivity(`初始化向导创建管理员「${rec.user.Name}」`, 'UserCreated', '系统初始化', rec.user.Id)
     const result: AuthenticationResult = {
       User: { ...rec.user, Policy: { ...rec.user.Policy } },
@@ -913,14 +1655,27 @@ export async function demoFetch<T>(
   }
 
   if (pathname === '/api/setup/complete' && method === 'POST') {
+    if (demoSetupCompleted && caller.token && !caller.isAdmin) {
+      throw new ApiError(403, '需要管理员权限')
+    }
     const body = parseJsonBody(options)
     const serverName = String(body.server_name || '').trim()
     const tmdbLanguage = String(body.tmdb_language || '').trim()
     if (serverName) {
       store.systemInfo.ServerName = serverName
+      demoServerConfig.ServerName = serverName
     }
     if (tmdbLanguage) {
       demoDefaultLanguage = tmdbLanguage
+      demoServerConfig.TMDBLanguage = tmdbLanguage
+    }
+    if (typeof body.tmdb_api_key === 'string' && body.tmdb_api_key.trim()) {
+      demoRawTmdbApiKey = body.tmdb_api_key.trim()
+      syncTmdbPluginFromServerConfig()
+    }
+    if (typeof body.enable_strm_302 === 'boolean') {
+      demoServerConfig.EnableSTRM302 = body.enable_strm_302
+      syncStrmPluginFromServerConfig()
     }
     demoSetupCompleted = true
     store.systemInfo.StartupWizardCompleted = true
@@ -928,12 +1683,19 @@ export async function demoFetch<T>(
     return { completed: true } as T
   }
 
-  // ==================== 1. 系统与公开信息 ====================
+  // ==================== 1. 系统配置、转码配置与公开信息 ====================
   if (pathname === '/emby/System/Configuration') {
+    requireDemoAdmin(caller)
     if (method === 'GET') {
+      const hasKey = demoRawTmdbApiKey.trim().length > 0
       return {
         ...demoServerConfig,
         ServerName: store.systemInfo.ServerName,
+        TMDBApiKey: hasKey ? DEMO_MASKED_SECRET : '',
+        HasTMDBApiKey: hasKey,
+        LocalNetworkSubnets: [...(demoServerConfig.LocalNetworkSubnets || [])],
+        TrustedProxies: [...(demoServerConfig.TrustedProxies || [])],
+        AllowedOrigins: [...(demoServerConfig.AllowedOrigins || [])],
       } as T
     }
     if (method === 'POST') {
@@ -944,7 +1706,10 @@ export async function demoFetch<T>(
         store.systemInfo.ServerName = nextName
       }
       if (typeof body.TMDBApiKey === 'string') {
-        demoServerConfig.TMDBApiKey = body.TMDBApiKey.trim()
+        const trimmedKey = body.TMDBApiKey.trim()
+        if (trimmedKey !== DEMO_MASKED_SECRET) {
+          demoRawTmdbApiKey = trimmedKey
+        }
       }
       if (typeof body.TMDBLanguage === 'string' && body.TMDBLanguage.trim()) {
         demoServerConfig.TMDBLanguage = body.TMDBLanguage.trim()
@@ -953,10 +1718,128 @@ export async function demoFetch<T>(
       if (typeof body.EnableSTRM302 === 'boolean') {
         demoServerConfig.EnableSTRM302 = body.EnableSTRM302
       }
-      if (typeof body.PlayedThreshold === 'number' && body.PlayedThreshold > 0 && body.PlayedThreshold <= 1) {
+      if (typeof body.PlayedThreshold === 'number') {
+        if (body.PlayedThreshold < 0.5 || body.PlayedThreshold > 0.99) {
+          throw new ApiError(400, 'PlayedThreshold 必须在 0.50 到 0.99 之间')
+        }
         demoServerConfig.PlayedThreshold = body.PlayedThreshold
       }
-      pushActivity('已更新服务器常规设置', 'ServerConfigUpdated')
+      if (typeof body.EnableDLNA === 'boolean') {
+        demoServerConfig.EnableDLNA = body.EnableDLNA
+      }
+      if (typeof body.DLNADefaultUserID === 'string') {
+        demoServerConfig.DLNADefaultUserID = body.DLNADefaultUserID.trim()
+      }
+      if (typeof body.EnableQuickConnect === 'boolean') {
+        demoServerConfig.EnableQuickConnect = body.EnableQuickConnect
+      }
+      if (typeof body.EnableRemoteAccess === 'boolean') {
+        demoServerConfig.EnableRemoteAccess = body.EnableRemoteAccess
+      }
+      if (Array.isArray(body.LocalNetworkSubnets)) {
+        demoServerConfig.LocalNetworkSubnets = body.LocalNetworkSubnets.map((s) =>
+          String(s).trim(),
+        ).filter(Boolean)
+      }
+      if (Array.isArray(body.TrustedProxies)) {
+        demoServerConfig.TrustedProxies = body.TrustedProxies.map((s) => String(s).trim()).filter(
+          Boolean,
+        )
+      }
+      if (Array.isArray(body.AllowedOrigins)) {
+        demoServerConfig.AllowedOrigins = body.AllowedOrigins.map((s) => String(s).trim()).filter(
+          Boolean,
+        )
+      }
+      if (typeof body.SimultaneousStreamLimit === 'number') {
+        demoServerConfig.SimultaneousStreamLimit = Math.max(
+          0,
+          Math.floor(body.SimultaneousStreamLimit),
+        )
+      }
+      if (typeof body.RemoteClientBitrateLimit === 'number') {
+        demoServerConfig.RemoteClientBitrateLimit = Math.max(
+          0,
+          Math.floor(body.RemoteClientBitrateLimit),
+        )
+      }
+      syncTmdbPluginFromServerConfig()
+      syncStrmPluginFromServerConfig()
+      pushActivity('已更新服务器常规与网络设置', 'ServerConfigUpdated', undefined, caller.userId)
+      return undefined as T
+    }
+  }
+
+  if (pathname === '/emby/Encoding/FfmpegOptions') {
+    requireDemoAdmin(caller)
+    if (method === 'GET') {
+      return { ...demoFfmpegOptions } as T
+    }
+    if (method === 'POST') {
+      const body = parseJsonBody(options)
+      if (typeof body.HardwareAccelerationMode === 'number') {
+        demoFfmpegOptions.HardwareAccelerationMode = body.HardwareAccelerationMode
+      }
+      if (typeof body.EnableHardwareEncoding === 'boolean') {
+        demoFfmpegOptions.EnableHardwareEncoding = body.EnableHardwareEncoding
+      }
+      if (typeof body.AllowHevcEncoding === 'boolean') {
+        demoFfmpegOptions.AllowHevcEncoding = body.AllowHevcEncoding
+      }
+      if (typeof body.H264Crf === 'number') {
+        demoFfmpegOptions.H264Crf = Math.min(51, Math.max(0, Math.round(body.H264Crf)))
+      }
+      if (typeof body.H264Preset === 'string' && body.H264Preset.trim()) {
+        demoFfmpegOptions.H264Preset = body.H264Preset.trim()
+      }
+      if (typeof body.EnableThrottling === 'boolean') {
+        demoFfmpegOptions.EnableThrottling = body.EnableThrottling
+      }
+      if (typeof body.ThrottleBufferSize === 'number') {
+        demoFfmpegOptions.ThrottleBufferSize = Math.max(10, Math.round(body.ThrottleBufferSize))
+      }
+      if (typeof body.ThrottleHysteresis === 'number') {
+        demoFfmpegOptions.ThrottleHysteresis = Math.max(1, Math.round(body.ThrottleHysteresis))
+      }
+      if (typeof body.EnableSubtitleExtraction === 'boolean') {
+        demoFfmpegOptions.EnableSubtitleExtraction = body.EnableSubtitleExtraction
+      }
+      if (typeof body.TranscodingTempPath === 'string') {
+        demoFfmpegOptions.TranscodingTempPath = body.TranscodingTempPath.trim()
+        store.systemInfo.TranscodingTempPath =
+          demoFfmpegOptions.TranscodingTempPath || '/tmp/ambra-transcode'
+      }
+      pushActivity('已更新 FFmpeg 转码与硬件加速配置', 'EncodingConfigUpdated', undefined, caller.userId)
+      return undefined as T
+    }
+  }
+
+  if (pathname === '/emby/Encoding/FullToneMapOptions') {
+    requireDemoAdmin(caller)
+    if (method === 'GET') {
+      return { ...demoToneMapOptions } as T
+    }
+    if (method === 'POST') {
+      const body = parseJsonBody(options)
+      if (typeof body.EnableToneMapping === 'boolean') {
+        demoToneMapOptions.EnableToneMapping = body.EnableToneMapping
+      }
+      if (typeof body.ToneMappingAlgorithm === 'string' && body.ToneMappingAlgorithm.trim()) {
+        demoToneMapOptions.ToneMappingAlgorithm = body.ToneMappingAlgorithm.trim()
+      }
+      if (typeof body.ToneMappingMode === 'string' && body.ToneMappingMode.trim()) {
+        demoToneMapOptions.ToneMappingMode = body.ToneMappingMode.trim()
+      }
+      if (typeof body.ToneMappingDesat === 'number') {
+        demoToneMapOptions.ToneMappingDesat = body.ToneMappingDesat
+      }
+      if (typeof body.ToneMappingParam === 'number') {
+        demoToneMapOptions.ToneMappingParam = body.ToneMappingParam
+      }
+      if (typeof body.ToneMappingPeak === 'number') {
+        demoToneMapOptions.ToneMappingPeak = body.ToneMappingPeak
+      }
+      pushActivity('已更新 HDR 色调映射配置', 'ToneMapConfigUpdated', undefined, caller.userId)
       return undefined as T
     }
   }
@@ -973,6 +1856,7 @@ export async function demoFetch<T>(
   }
 
   if (pathname === '/emby/System/Info' && method === 'GET') {
+    requireDemoAdmin(caller)
     return { ...store.systemInfo } as T
   }
 
@@ -1004,6 +1888,7 @@ export async function demoFetch<T>(
     rec.user.LastLoginDate = now
     rec.user.LastActivityDate = now
     const token = `demo_tok_${rec.user.Id}_${Date.now().toString(36)}`
+    demoTokenUserMap.set(token, rec.user.Id)
     pushActivity(
       `${rec.user.Name} 登录了 Ambra Serverless Demo`,
       'AuthenticationSucceeded',
@@ -1024,10 +1909,13 @@ export async function demoFetch<T>(
   }
 
   if (pathname === '/emby/Sessions/Logout' && method === 'POST') {
+    if (caller.token) {
+      demoTokenUserMap.delete(caller.token)
+    }
     return undefined as T
   }
 
-  // 忘记密码 & PIN 重置（Demo 模式：绝不将 PIN 写入文件名）
+  // 忘记密码 & PIN 重置（支持 6 位十六进制 PIN /^[0-9A-Fa-f]{6}$/）
   if (pathname === '/emby/Users/ForgotPassword' && method === 'POST') {
     const body = parseJsonBody(options)
     const entered = String(body.EnteredUsername || '').trim()
@@ -1045,8 +1933,8 @@ export async function demoFetch<T>(
   if (pathname === '/emby/Users/ForgotPassword/Pin' && method === 'POST') {
     const body = parseJsonBody(options)
     const pin = String(body.Pin || '').trim()
-    if (pin !== '123456' && !/^\d{6}$/.test(pin)) {
-      throw new ApiError(400, 'PIN 验证码无效，请输入 6 位数字（Demo 可使用 123456）')
+    if (!/^[0-9A-Fa-f]{6}$/.test(pin)) {
+      throw new ApiError(400, 'PIN 验证码无效，请输入 6 位十六进制字符（Demo 可使用 123456 或 A1B2C3）')
     }
     pushActivity('已通过 PIN 码完成密码重置（Demo 模式）', 'ForgotPasswordReset')
     return {
@@ -1057,10 +1945,12 @@ export async function demoFetch<T>(
 
   // ==================== 3. 用户与权限管理 ====================
   if (pathname === '/emby/Users' && method === 'GET') {
+    requireDemoAdmin(caller)
     return store.users.map((u) => ({ ...u.user, Policy: { ...u.user.Policy } })) as T
   }
 
   if (pathname === '/emby/Users/New' && method === 'POST') {
+    requireDemoAdmin(caller)
     const body = parseJsonBody(options)
     const name = String(body.Name || '').trim()
     if (!name) throw new ApiError(400, '用户名不能为空')
@@ -1093,14 +1983,21 @@ export async function demoFetch<T>(
       },
     }
     store.users.push({ user: newUser, password })
+    store.userDataByUser.set(id, new Map())
     store.userAvatarById.set(id, makeAvatarDataUrl(name, ['#7c3aed', '#2e1065']))
-    pushActivity(`管理员创建了新用户「${name}」`, 'UserCreated', isAdmin ? '管理员权限' : '普通用户')
+    pushActivity(
+      `管理员创建了新用户「${name}」`,
+      'UserCreated',
+      isAdmin ? '管理员权限' : '普通用户',
+      caller.userId,
+    )
     return { ...newUser } as T
   }
 
   const userConfigMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Configuration$/)
   if (userConfigMatch && method === 'POST') {
     const userId = decodeURIComponent(userConfigMatch[1])
+    requireSelfOrAdmin(caller, userId)
     const rec = store.users.find((u) => u.user.Id === userId)
     if (!rec) throw new ApiError(404, '用户不存在')
     const patch = parseJsonBody(options) as Record<string, unknown>
@@ -1110,25 +2007,34 @@ export async function demoFetch<T>(
 
   const userPolicyMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Policy$/)
   if (userPolicyMatch && method === 'POST') {
+    requireDemoAdmin(caller)
     const userId = decodeURIComponent(userPolicyMatch[1])
     const rec = store.users.find((u) => u.user.Id === userId)
     if (!rec) throw new ApiError(404, '用户不存在')
-    const patch = parseJsonBody(options) as UserPolicy
+    const rawBody = parseJsonBody(options)
+    const patch = rawBody as UserPolicy
     const nextPolicy: UserPolicy = { ...rec.user.Policy, ...patch }
+
+    // 显式传 null/空串，或完整表单提交（含 EnableAllFolders）但省略了 MaxParentalRating 时清除分级限制；
+    // 仅局部更新 BlockedTags / AllowedTags 等单字段时，绝不误删已有的 MaxParentalRating！
     if (
-      patch.MaxParentalRating === null ||
-      (patch.MaxParentalRating === undefined && Array.isArray(patch.BlockedTags))
+      ('MaxParentalRating' in rawBody &&
+        (rawBody.MaxParentalRating === null ||
+          rawBody.MaxParentalRating === undefined ||
+          rawBody.MaxParentalRating === '')) ||
+      (!('MaxParentalRating' in rawBody) && 'EnableAllFolders' in rawBody)
     ) {
       delete nextPolicy.MaxParentalRating
     }
     rec.user.Policy = nextPolicy
-    pushActivity(`已更新用户「${rec.user.Name}」的权限策略`, 'UserPolicyUpdated')
+    pushActivity(`已更新用户「${rec.user.Name}」的权限策略`, 'UserPolicyUpdated', undefined, caller.userId)
     return undefined as T
   }
 
   const userPasswordMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Password$/)
   if (userPasswordMatch && method === 'POST') {
     const userId = decodeURIComponent(userPasswordMatch[1])
+    requireSelfOrAdmin(caller, userId)
     const rec = store.users.find((u) => u.user.Id === userId)
     if (!rec) throw new ApiError(404, '用户不存在')
     const body = parseJsonBody(options)
@@ -1137,18 +2043,25 @@ export async function demoFetch<T>(
       rec.user.HasPassword = false
       rec.user.HasConfiguredPassword = false
     } else {
+      if (!caller.isAdmin && rec.password) {
+        const currentPw = String(body.CurrentPw ?? '')
+        if (currentPw !== rec.password) {
+          throw new ApiError(401, '当前密码不正确')
+        }
+      }
       const nextPw = String(body.NewPw ?? '')
       rec.password = nextPw
       rec.user.HasPassword = nextPw.length > 0
       rec.user.HasConfiguredPassword = nextPw.length > 0
     }
-    pushActivity(`已更新用户「${rec.user.Name}」的登录密码`, 'UserPasswordChanged')
+    pushActivity(`已更新用户「${rec.user.Name}」的登录密码`, 'UserPasswordChanged', undefined, caller.userId)
     return undefined as T
   }
 
   const userImageMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Images\/Primary(?:\/0)?$/)
   if (userImageMatch) {
     const userId = decodeURIComponent(userImageMatch[1])
+    requireSelfOrAdmin(caller, userId)
     const rec = store.users.find((u) => u.user.Id === userId)
     if (!rec) throw new ApiError(404, '用户不存在')
     if (method === 'POST') {
@@ -1160,13 +2073,13 @@ export async function demoFetch<T>(
         : `data:${contentType};base64,${rawBody}`
       store.userAvatarById.set(userId, dataUrl)
       rec.user.PrimaryImageTag = `avatar-${Date.now().toString(36)}`
-      pushActivity(`用户「${rec.user.Name}」更新了个人头像`, 'UserImageUpdated')
+      pushActivity(`用户「${rec.user.Name}」更新了个人头像`, 'UserImageUpdated', undefined, caller.userId)
       return undefined as T
     }
     if (method === 'DELETE') {
       store.userAvatarById.delete(userId)
       delete rec.user.PrimaryImageTag
-      pushActivity(`用户「${rec.user.Name}」移除了个人头像`, 'UserImageDeleted')
+      pushActivity(`用户「${rec.user.Name}」移除了个人头像`, 'UserImageDeleted', undefined, caller.userId)
       return undefined as T
     }
   }
@@ -1175,6 +2088,7 @@ export async function demoFetch<T>(
   const userViewsMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Views$/)
   if (userViewsMatch && method === 'GET') {
     const userId = decodeURIComponent(userViewsMatch[1])
+    requireSelfOrAdmin(caller, userId)
     const visible = getVisibleLibrariesForUser(userId).map(libraryToViewDto)
     const res: QueryResult<BaseItemDto> = {
       Items: visible,
@@ -1185,11 +2099,16 @@ export async function demoFetch<T>(
 
   const userResumeMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Items\/Resume$/)
   if (userResumeMatch && method === 'GET') {
+    const userId = decodeURIComponent(userResumeMatch[1])
+    requireSelfOrAdmin(caller, userId)
+    const targetUser = resolveUserDto(userId, caller)
     const limit = Number(qs.get('Limit') || 12)
     const resumable = Array.from(store.items.values())
+      .filter((it) => it.Type === 'Movie' || it.Type === 'Episode')
+      .filter((it) => canDemoUserAccessItem(targetUser, it))
+      .map((it) => projectItemForUser(it, userId))
       .filter(
         (it) =>
-          (it.Type === 'Movie' || it.Type === 'Episode') &&
           (it.UserData?.PlaybackPositionTicks || 0) > 0 &&
           !it.UserData?.Played,
       )
@@ -1204,8 +2123,18 @@ export async function demoFetch<T>(
 
   const userLatestMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Items\/Latest$/)
   if (userLatestMatch && method === 'GET') {
+    const userId = decodeURIComponent(userLatestMatch[1])
+    requireSelfOrAdmin(caller, userId)
+    const targetUser = resolveUserDto(userId, caller)
     const parentId = qs.get('ParentId') || ''
     const limit = Number(qs.get('Limit') || 16)
+    if (
+      parentId &&
+      store.libraries.some((l) => l.ItemId === parentId) &&
+      !isLibraryAllowedForUser(targetUser, parentId)
+    ) {
+      return [] as unknown as T
+    }
     let list: BaseItemDto[] = []
     if (parentId && store.libraryItems.has(parentId)) {
       list = (store.libraryItems.get(parentId) || [])
@@ -1216,17 +2145,31 @@ export async function demoFetch<T>(
         (it) => it.Type === 'Movie' || it.Type === 'Series',
       )
     }
-    return sortItems(list, 'DateCreated', 'Descending').slice(0, limit) as T
+    const filtered = list
+      .filter((it) => canDemoUserAccessItem(targetUser, it))
+      .map((it) => projectItemForUser(it, userId))
+    return sortItems(filtered, 'DateCreated', 'Descending').slice(0, limit) as T
   }
 
-  if ((pathname === '/emby/Tags' || pathname === '/Tags') && method === 'GET') {
+  if (pathname === '/emby/Tags' && method === 'GET') {
+    const qUserId = qs.get('UserId') || caller.userId
+    if (qs.get('UserId')) requireSelfOrAdmin(caller, qUserId)
+    const targetUser = resolveUserDto(qUserId, caller)
     const parentId = qs.get('ParentId') || ''
-    const pool =
+    if (
+      parentId &&
+      store.libraries.some((l) => l.ItemId === parentId) &&
+      !isLibraryAllowedForUser(targetUser, parentId)
+    ) {
+      return { Items: [], TotalRecordCount: 0 } as T
+    }
+    const pool = (
       parentId && store.libraryItems.has(parentId)
         ? (store.libraryItems.get(parentId) || [])
             .map((id) => store.items.get(id))
             .filter((it): it is BaseItemDto => Boolean(it))
         : Array.from(store.items.values())
+    ).filter((it) => canDemoUserAccessItem(targetUser, it))
 
     const tagSet = new Set<string>()
     for (const it of pool) {
@@ -1240,14 +2183,25 @@ export async function demoFetch<T>(
     return { Items: items, TotalRecordCount: items.length } as T
   }
 
-  if ((pathname === '/emby/Genres' || pathname === '/Genres') && method === 'GET') {
+  if (pathname === '/emby/Genres' && method === 'GET') {
+    const qUserId = qs.get('UserId') || caller.userId
+    if (qs.get('UserId')) requireSelfOrAdmin(caller, qUserId)
+    const targetUser = resolveUserDto(qUserId, caller)
     const parentId = qs.get('ParentId') || ''
-    const pool =
+    if (
+      parentId &&
+      store.libraries.some((l) => l.ItemId === parentId) &&
+      !isLibraryAllowedForUser(targetUser, parentId)
+    ) {
+      return { Items: [], TotalRecordCount: 0 } as T
+    }
+    const pool = (
       parentId && store.libraryItems.has(parentId)
         ? (store.libraryItems.get(parentId) || [])
             .map((id) => store.items.get(id))
             .filter((it): it is BaseItemDto => Boolean(it))
         : Array.from(store.items.values())
+    ).filter((it) => canDemoUserAccessItem(targetUser, it))
 
     const genreSet = new Set<string>()
     for (const it of pool) {
@@ -1261,14 +2215,25 @@ export async function demoFetch<T>(
     return { Items: items, TotalRecordCount: items.length } as T
   }
 
-  if ((pathname === '/emby/Years' || pathname === '/Years') && method === 'GET') {
+  if (pathname === '/emby/Years' && method === 'GET') {
+    const qUserId = qs.get('UserId') || caller.userId
+    if (qs.get('UserId')) requireSelfOrAdmin(caller, qUserId)
+    const targetUser = resolveUserDto(qUserId, caller)
     const parentId = qs.get('ParentId') || ''
-    const pool =
+    if (
+      parentId &&
+      store.libraries.some((l) => l.ItemId === parentId) &&
+      !isLibraryAllowedForUser(targetUser, parentId)
+    ) {
+      return { Items: [], TotalRecordCount: 0 } as T
+    }
+    const pool = (
       parentId && store.libraryItems.has(parentId)
         ? (store.libraryItems.get(parentId) || [])
             .map((id) => store.items.get(id))
             .filter((it): it is BaseItemDto => Boolean(it))
         : Array.from(store.items.values())
+    ).filter((it) => canDemoUserAccessItem(targetUser, it))
 
     const yearSet = new Set<number>()
     for (const it of pool) {
@@ -1281,13 +2246,13 @@ export async function demoFetch<T>(
   }
 
   if (
-    (pathname === '/emby/Items/Filters' ||
-      pathname === '/Items/Filters' ||
-      pathname === '/emby/Items/Filters2' ||
-      pathname === '/Items/Filters2') &&
+    (pathname === '/emby/Items/Filters' || pathname === '/emby/Items/Filters2') &&
     method === 'GET'
   ) {
     const isV2 = pathname.endsWith('/Filters2')
+    const qUserId = qs.get('UserId') || caller.userId
+    if (qs.get('UserId')) requireSelfOrAdmin(caller, qUserId)
+    const targetUser = resolveUserDto(qUserId, caller)
     const parentId = qs.get('ParentId') || ''
     const includeTypesRaw = qs.get('IncludeItemTypes') || ''
     const includeTypes = includeTypesRaw
@@ -1295,12 +2260,17 @@ export async function demoFetch<T>(
       : null
 
     let pool: BaseItemDto[] =
-      parentId && store.libraryItems.has(parentId)
-        ? (store.libraryItems.get(parentId) || [])
-            .map((id) => store.items.get(id))
-            .filter((it): it is BaseItemDto => Boolean(it))
-        : Array.from(store.items.values())
+      parentId &&
+      store.libraries.some((l) => l.ItemId === parentId) &&
+      !isLibraryAllowedForUser(targetUser, parentId)
+        ? []
+        : parentId && store.libraryItems.has(parentId)
+          ? (store.libraryItems.get(parentId) || [])
+              .map((id) => store.items.get(id))
+              .filter((it): it is BaseItemDto => Boolean(it))
+          : Array.from(store.items.values())
 
+    pool = pool.filter((it) => canDemoUserAccessItem(targetUser, it))
     if (includeTypes) {
       pool = pool.filter((it) => includeTypes.has(it.Type))
     }
@@ -1351,8 +2321,15 @@ export async function demoFetch<T>(
   }
 
   const userItemsMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Items$/)
-  const isGlobalItemsQuery = pathname === '/emby/Items' || pathname === '/Items'
+  const isGlobalItemsQuery = pathname === '/emby/Items'
   if ((userItemsMatch || isGlobalItemsQuery) && method === 'GET') {
+    const targetUserId = userItemsMatch
+      ? decodeURIComponent(userItemsMatch[1])
+      : qs.get('UserId') || caller.userId
+    if (userItemsMatch || qs.get('UserId')) {
+      requireSelfOrAdmin(caller, targetUserId)
+    }
+    const targetUser = resolveUserDto(targetUserId, caller)
     const parentId = qs.get('ParentId') || ''
     const includeTypesRaw = qs.get('IncludeItemTypes') || ''
     const includeTypes = includeTypesRaw
@@ -1388,6 +2365,14 @@ export async function demoFetch<T>(
     const sortOrder = qs.get('SortOrder') || 'Descending'
     const startIndex = Number(qs.get('StartIndex') || 0)
     const limit = Number(qs.get('Limit') || 50)
+
+    if (
+      parentId &&
+      store.libraries.some((l) => l.ItemId === parentId) &&
+      !isLibraryAllowedForUser(targetUser, parentId)
+    ) {
+      return { Items: [], TotalRecordCount: 0 } as T
+    }
 
     let pool: BaseItemDto[]
     if (parentId && store.libraryItems.has(parentId)) {
@@ -1451,6 +2436,10 @@ export async function demoFetch<T>(
       pool = Array.from(store.items.values())
     }
 
+    pool = pool
+      .filter((it) => canDemoUserAccessItem(targetUser, it))
+      .map((it) => projectItemForUser(it, targetUserId))
+
     if (includeTypes) {
       pool = pool.filter((it) => includeTypes.has(it.Type))
     }
@@ -1469,7 +2458,9 @@ export async function demoFetch<T>(
       )
     }
     if (yearsParam.length > 0) {
-      pool = pool.filter((it) => it.ProductionYear != null && yearsParam.includes(String(it.ProductionYear)))
+      pool = pool.filter(
+        (it) => it.ProductionYear != null && yearsParam.includes(String(it.ProductionYear)),
+      )
     }
     if (tagsParam.length > 0) {
       pool = pool.filter((it) =>
@@ -1536,17 +2527,32 @@ export async function demoFetch<T>(
 
   const userSingleItemMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Items\/([^/]+)$/)
   if (userSingleItemMatch && method === 'GET') {
+    const userId = decodeURIComponent(userSingleItemMatch[1])
     const itemId = decodeURIComponent(userSingleItemMatch[2])
-    const item = store.items.get(itemId)
-    if (item) return { ...item } as T
-    const lib = store.libraries.find((l) => l.ItemId === itemId)
-    if (lib) return libraryToViewDto(lib) as T
+    requireSelfOrAdmin(caller, userId)
+    const targetUser = resolveUserDto(userId, caller)
 
-    // 若 ID 命中任意作品的演职员，则合成 Person DTO 返回
+    const item = store.items.get(itemId)
+    if (item) {
+      if (!canDemoUserAccessItem(targetUser, item)) {
+        throw new ApiError(403, '受家长控制或媒体库访问权限限制，无权查看该条目')
+      }
+      return projectItemForUser(item, userId) as T
+    }
+    const lib = store.libraries.find((l) => l.ItemId === itemId)
+    if (lib) {
+      if (!isLibraryAllowedForUser(targetUser, lib.ItemId)) {
+        throw new ApiError(403, '无权访问该媒体库')
+      }
+      return libraryToViewDto(lib) as T
+    }
+
+    // 若 ID 命中任意可访问作品的演职员，则合成 Person DTO 返回
     let matchedPerson: { Id: string; Name: string; Type: string; PrimaryImageTag?: string } | null =
       null
     const knownTitles: string[] = []
     for (const it of store.items.values()) {
+      if (!canDemoUserAccessItem(targetUser, it)) continue
       for (const p of it.People || []) {
         if (p.Id === itemId || p.Name === itemId) {
           if (!matchedPerson) {
@@ -1580,13 +2586,21 @@ export async function demoFetch<T>(
 
   // ==================== 5. 剧集季、分集与 NextUp ====================
   if (pathname === '/emby/Shows/NextUp' && method === 'GET') {
+    const qUserId = qs.get('UserId') || caller.userId
+    if (qs.get('UserId')) requireSelfOrAdmin(caller, qUserId)
+    const targetUser = resolveUserDto(qUserId, caller)
     const seriesId = qs.get('SeriesId') || ''
     const limit = Number(qs.get('Limit') || 12)
     const targetSeriesIds = seriesId ? [seriesId] : Array.from(store.seasonsBySeries.keys())
     const nextUpList: BaseItemDto[] = []
     for (const sid of targetSeriesIds) {
+      const series = store.items.get(sid)
+      if (series && !canDemoUserAccessItem(targetUser, series)) continue
       const seasons = store.seasonsBySeries.get(sid) || []
-      const allEps = seasons.flatMap((s) => store.episodesBySeason.get(s.Id) || [])
+      const allEps = seasons
+        .flatMap((s) => store.episodesBySeason.get(s.Id) || [])
+        .filter((ep) => canDemoUserAccessItem(targetUser, ep))
+        .map((ep) => projectItemForUser(ep, qUserId))
       const nextEp =
         allEps.find((ep) => !ep.UserData?.Played && (ep.UserData?.PlaybackPositionTicks || 0) > 0) ||
         allEps.find((ep) => !ep.UserData?.Played) ||
@@ -1600,15 +2614,24 @@ export async function demoFetch<T>(
   const similarMatch = pathname.match(/^\/emby\/Items\/([^/]+)\/Similar$/)
   if (similarMatch && method === 'GET') {
     const itemId = decodeURIComponent(similarMatch[1])
+    const qUserId = qs.get('UserId') || caller.userId
+    if (qs.get('UserId')) requireSelfOrAdmin(caller, qUserId)
+    const targetUser = resolveUserDto(qUserId, caller)
     const limit = Number(qs.get('Limit') || 12)
     const source = store.items.get(itemId)
-    if (!source) return { Items: [], TotalRecordCount: 0 } as T
+    if (!source || !canDemoUserAccessItem(targetUser, source)) {
+      return { Items: [], TotalRecordCount: 0 } as T
+    }
     const srcGenres = new Set((source.Genres || []).map((g) => g.toLowerCase()))
     const candidates = Array.from(store.items.values())
       .filter((it) => it.Id !== itemId && it.Type === source.Type)
+      .filter((it) => canDemoUserAccessItem(targetUser, it))
       .map((it) => {
         const overlap = (it.Genres || []).filter((g) => srcGenres.has(g.toLowerCase())).length
-        return { item: it, score: overlap * 10 + (it.CommunityRating || 0) }
+        return {
+          item: projectItemForUser(it, qUserId),
+          score: overlap * 10 + (it.CommunityRating || 0),
+        }
       })
       .sort((a, b) => b.score - a.score)
       .slice(0, limit)
@@ -1617,7 +2640,34 @@ export async function demoFetch<T>(
   }
 
   // ==================== 5b. 合集 (Collections) & 播放列表 (Playlists) CRUD ====================
+  if (pathname === '/emby/Collections' && method === 'GET') {
+    const qUserId = qs.get('UserId') || caller.userId
+    if (qs.get('UserId')) requireSelfOrAdmin(caller, qUserId)
+    const targetUser = resolveUserDto(qUserId, caller)
+    const startIndex = Number(qs.get('StartIndex') || 0)
+    const limit = Number(qs.get('Limit') || 50)
+
+    const collections = Array.from(store.items.values())
+      .filter((it) => it.Type === 'BoxSet')
+      .filter((it) => canDemoUserAccessItem(targetUser, it))
+      .map((col) => {
+        const childIds = store.libraryItems.get(col.Id) || []
+        const visibleCount = childIds.filter((cid) => {
+          const child = store.items.get(cid)
+          return child ? canDemoUserAccessItem(targetUser, child) : false
+        }).length
+        return {
+          ...projectItemForUser(col, qUserId),
+          ChildCount: visibleCount,
+        }
+      })
+
+    const paged = collections.slice(startIndex, startIndex + limit)
+    return { Items: paged, TotalRecordCount: collections.length } as T
+  }
+
   if (pathname === '/emby/Collections' && method === 'POST') {
+    requireDemoAdmin(caller)
     const body = parseJsonBody(options)
     const name = String(qs.get('Name') || body.Name || '').trim()
     if (!name) throw new ApiError(400, '合集名称不能为空')
@@ -1639,7 +2689,7 @@ export async function demoFetch<T>(
     }
     store.items.set(id, dto)
     store.libraryItems.set(id, Array.from(new Set(ids)))
-    pushActivity(`已创建合集「${name}」`, 'CollectionCreated')
+    pushActivity(`已创建合集「${name}」`, 'CollectionCreated', undefined, caller.userId)
     return { Id: id, Name: name } as T
   }
 
@@ -1666,12 +2716,12 @@ export async function demoFetch<T>(
     }
     store.items.set(id, dto)
     store.libraryItems.set(id, Array.from(new Set(ids)))
-    pushActivity(`已创建播放列表「${name}」`, 'PlaylistCreated')
+    pushActivity(`已创建播放列表「${name}」`, 'PlaylistCreated', undefined, caller.userId)
     return { Id: id, Name: name } as T
   }
 
   const movePlaylistItemMatch = pathname.match(
-    /^\/(?:emby\/)?Playlists\/([^/]+)\/Items\/([^/]+)\/Move\/(-?\d+)$/,
+    /^\/emby\/Playlists\/([^/]+)\/Items\/([^/]+)\/Move\/(-?\d+)$/,
   )
   if (movePlaylistItemMatch && method === 'POST') {
     const playlistId = decodeURIComponent(movePlaylistItemMatch[1])
@@ -1695,17 +2745,24 @@ export async function demoFetch<T>(
 
   const containerItemsMatch = pathname.match(/^\/emby\/(Collections|Playlists)\/([^/]+)\/Items$/)
   if (containerItemsMatch) {
+    const containerKind = containerItemsMatch[1]
     const containerId = decodeURIComponent(containerItemsMatch[2])
     const container = store.items.get(containerId)
     if (!container) throw new ApiError(404, '合集或播放列表不存在')
     if (method === 'GET') {
+      const qUserId = qs.get('UserId') || caller.userId
+      if (qs.get('UserId')) requireSelfOrAdmin(caller, qUserId)
+      const targetUser = resolveUserDto(qUserId, caller)
       const ids = store.libraryItems.get(containerId) || []
       const items = ids
         .map((mid) => store.items.get(mid))
         .filter((it): it is BaseItemDto => Boolean(it))
+        .filter((it) => canDemoUserAccessItem(targetUser, it))
+        .map((it) => projectItemForUser(it, qUserId))
       return { Items: items, TotalRecordCount: items.length } as T
     }
     if (method === 'POST') {
+      if (containerKind === 'Collections') requireDemoAdmin(caller)
       const body = parseJsonBody(options)
       const idsRaw = qs.get('Ids') || (Array.isArray(body.Ids) ? body.Ids.join(',') : '')
       const toAdd = idsRaw
@@ -1719,6 +2776,7 @@ export async function demoFetch<T>(
       return undefined as T
     }
     if (method === 'DELETE') {
+      if (containerKind === 'Collections') requireDemoAdmin(caller)
       const idsRaw = qs.get('EntryIds') || qs.get('Ids') || ''
       const toRemove = new Set(
         idsRaw
@@ -1736,12 +2794,15 @@ export async function demoFetch<T>(
 
   const deleteContainerMatch = pathname.match(/^\/emby\/(Collections|Playlists)\/([^/]+)$/)
   if (deleteContainerMatch && method === 'DELETE') {
+    if (deleteContainerMatch[1] === 'Collections') {
+      requireDemoAdmin(caller)
+    }
     const containerId = decodeURIComponent(deleteContainerMatch[2])
     const container = store.items.get(containerId)
     if (container) {
       store.items.delete(containerId)
       store.libraryItems.delete(containerId)
-      pushActivity(`已删除「${container.Name}」`, 'ContainerDeleted')
+      pushActivity(`已删除「${container.Name}」`, 'ContainerDeleted', undefined, caller.userId)
     }
     return undefined as T
   }
@@ -1749,13 +2810,29 @@ export async function demoFetch<T>(
   const seasonsMatch = pathname.match(/^\/emby\/Shows\/([^/]+)\/Seasons$/)
   if (seasonsMatch && method === 'GET') {
     const seriesId = decodeURIComponent(seasonsMatch[1])
-    const seasons = store.seasonsBySeries.get(seriesId) || []
+    const qUserId = qs.get('UserId') || caller.userId
+    if (qs.get('UserId')) requireSelfOrAdmin(caller, qUserId)
+    const targetUser = resolveUserDto(qUserId, caller)
+    const series = store.items.get(seriesId)
+    if (series && !canDemoUserAccessItem(targetUser, series)) {
+      return { Items: [], TotalRecordCount: 0 } as T
+    }
+    const seasons = (store.seasonsBySeries.get(seriesId) || [])
+      .filter((s) => canDemoUserAccessItem(targetUser, s))
+      .map((s) => projectItemForUser(s, qUserId))
     return { Items: seasons, TotalRecordCount: seasons.length } as T
   }
 
   const episodesMatch = pathname.match(/^\/emby\/Shows\/([^/]+)\/Episodes$/)
   if (episodesMatch && method === 'GET') {
     const seriesId = decodeURIComponent(episodesMatch[1])
+    const qUserId = qs.get('UserId') || caller.userId
+    if (qs.get('UserId')) requireSelfOrAdmin(caller, qUserId)
+    const targetUser = resolveUserDto(qUserId, caller)
+    const series = store.items.get(seriesId)
+    if (series && !canDemoUserAccessItem(targetUser, series)) {
+      return { Items: [], TotalRecordCount: 0 } as T
+    }
     const seasonId = qs.get('SeasonId') || ''
     let eps: BaseItemDto[] = []
     if (seasonId && store.episodesBySeason.has(seasonId)) {
@@ -1764,11 +2841,17 @@ export async function demoFetch<T>(
       const seasons = store.seasonsBySeries.get(seriesId) || []
       eps = seasons.flatMap((s) => store.episodesBySeason.get(s.Id) || [])
     }
-    return { Items: eps, TotalRecordCount: eps.length } as T
+    const filtered = eps
+      .filter((ep) => canDemoUserAccessItem(targetUser, ep))
+      .map((ep) => projectItemForUser(ep, qUserId))
+    return { Items: filtered, TotalRecordCount: filtered.length } as T
   }
 
   // ==================== 6. 中文乱序模糊搜索 ====================
   if (pathname === '/emby/Search/Hints' && method === 'GET') {
+    const qUserId = qs.get('UserId') || caller.userId
+    if (qs.get('UserId')) requireSelfOrAdmin(caller, qUserId)
+    const targetUser = resolveUserDto(qUserId, caller)
     const term = qs.get('SearchTerm') || ''
     const limit = Number(qs.get('Limit') || 20)
     const matched = Array.from(store.items.values())
@@ -1780,6 +2863,7 @@ export async function demoFetch<T>(
           it.Type === 'MusicAlbum' ||
           it.Type === 'Audio',
       )
+      .filter((it) => canDemoUserAccessItem(targetUser, it))
       .filter((it) => matchesFuzzySearch(it, term))
       .slice(0, limit)
 
@@ -1807,15 +2891,17 @@ export async function demoFetch<T>(
     return res as T
   }
 
-  // ==================== 7. 收藏 / 已看 / 从继续观看移除 ====================
+  // ==================== 7. 按用户隔离的收藏 / 赞踩 / 已看 / 继续观看移除 ====================
   const hideResumeMatch = pathname.match(
     /^\/emby\/Users\/([^/]+)\/Items\/([^/]+)\/HideFromResume$/,
   )
   if (hideResumeMatch && method === 'POST') {
+    const userId = decodeURIComponent(hideResumeMatch[1])
     const itemId = decodeURIComponent(hideResumeMatch[2])
+    requireSelfOrAdmin(caller, userId)
     const item = store.items.get(itemId)
     if (!item) throw new ApiError(404, '项目不存在')
-    const ud = ensureUserData(item)
+    const ud = ensureUserDataForUser(userId, itemId)
     const hide = qs.get('Hide') !== 'false'
     if (hide) {
       ud.PlaybackPositionTicks = 0
@@ -1824,22 +2910,43 @@ export async function demoFetch<T>(
     return { ...ud } as T
   }
 
-  const favMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/FavoriteItems\/([^/]+)$/)
-  if (favMatch && (method === 'POST' || method === 'DELETE')) {
-    const itemId = decodeURIComponent(favMatch[2])
+  const userItemRatingMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Items\/([^/]+)\/Rating$/)
+  if (userItemRatingMatch && (method === 'POST' || method === 'DELETE')) {
+    const userId = decodeURIComponent(userItemRatingMatch[1])
+    const itemId = decodeURIComponent(userItemRatingMatch[2])
+    requireSelfOrAdmin(caller, userId)
     const item = store.items.get(itemId)
     if (!item) throw new ApiError(404, '项目不存在')
-    const ud = ensureUserData(item)
+    const ud = ensureUserDataForUser(userId, itemId)
+    if (method === 'DELETE') {
+      delete ud.Likes
+    } else {
+      const likesParam = qs.get('Likes')
+      ud.Likes = likesParam === null ? true : likesParam.toLowerCase() === 'true'
+    }
+    return { ...ud } as T
+  }
+
+  const favMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/FavoriteItems\/([^/]+)$/)
+  if (favMatch && (method === 'POST' || method === 'DELETE')) {
+    const userId = decodeURIComponent(favMatch[1])
+    const itemId = decodeURIComponent(favMatch[2])
+    requireSelfOrAdmin(caller, userId)
+    const item = store.items.get(itemId)
+    if (!item) throw new ApiError(404, '项目不存在')
+    const ud = ensureUserDataForUser(userId, itemId)
     ud.IsFavorite = method === 'POST'
     return { ...ud } as T
   }
 
   const playedMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/PlayedItems\/([^/]+)$/)
   if (playedMatch && (method === 'POST' || method === 'DELETE')) {
+    const userId = decodeURIComponent(playedMatch[1])
     const itemId = decodeURIComponent(playedMatch[2])
+    requireSelfOrAdmin(caller, userId)
     const item = store.items.get(itemId)
     if (!item) throw new ApiError(404, '项目不存在')
-    const ud = ensureUserData(item)
+    const ud = ensureUserDataForUser(userId, itemId)
     ud.Played = method === 'POST'
     if (ud.Played) {
       ud.PlayCount = Math.max(1, ud.PlayCount + 1)
@@ -1853,7 +2960,7 @@ export async function demoFetch<T>(
       const seasons = store.seasonsBySeries.get(itemId) || []
       let totalEps = 0
       for (const season of seasons) {
-        const sUd = ensureUserData(season)
+        const sUd = ensureUserDataForUser(userId, season.Id)
         sUd.Played = ud.Played
         sUd.PlayedPercentage = ud.Played ? 100 : 0
         if (ud.Played) sUd.PlaybackPositionTicks = 0
@@ -1861,7 +2968,7 @@ export async function demoFetch<T>(
         totalEps += eps.length
         sUd.UnplayedItemCount = ud.Played ? 0 : eps.length
         for (const ep of eps) {
-          const epUd = ensureUserData(ep)
+          const epUd = ensureUserDataForUser(userId, ep.Id)
           epUd.Played = ud.Played
           epUd.PlayedPercentage = ud.Played ? 100 : 0
           if (ud.Played) {
@@ -1875,7 +2982,7 @@ export async function demoFetch<T>(
     } else if (item.Type === 'Season') {
       const eps = store.episodesBySeason.get(itemId) || []
       for (const ep of eps) {
-        const epUd = ensureUserData(ep)
+        const epUd = ensureUserDataForUser(userId, ep.Id)
         epUd.Played = ud.Played
         epUd.PlayedPercentage = ud.Played ? 100 : 0
         if (ud.Played) {
@@ -1891,21 +2998,25 @@ export async function demoFetch<T>(
 
   const localTrailersMatch = pathname.match(/^\/emby\/Users\/([^/]+)\/Items\/([^/]+)\/LocalTrailers$/)
   if (localTrailersMatch && method === 'GET') {
+    const userId = decodeURIComponent(localTrailersMatch[1])
     const itemId = decodeURIComponent(localTrailersMatch[2])
+    requireSelfOrAdmin(caller, userId)
     const trailers = store.localTrailersByItemId.get(itemId) || []
-    return trailers.map((t) => ({ ...t })) as T
+    return trailers.map((t) => projectItemForUser(t, userId)) as T
   }
 
   const specialFeaturesMatch = pathname.match(
     /^\/emby\/Users\/([^/]+)\/Items\/([^/]+)\/SpecialFeatures$/,
   )
   if (specialFeaturesMatch && method === 'GET') {
+    const userId = decodeURIComponent(specialFeaturesMatch[1])
     const itemId = decodeURIComponent(specialFeaturesMatch[2])
+    requireSelfOrAdmin(caller, userId)
     const extras = store.specialFeaturesByItemId.get(itemId) || []
-    return extras.map((e) => ({ ...e })) as T
+    return extras.map((e) => projectItemForUser(e, userId)) as T
   }
 
-  // ==================== 8. PlaybackInfo、音频歌词 & 播放状态上报 ====================
+  // ==================== 8. PlaybackInfo、音频歌词 & 播放状态上报（按用户隔离） ====================
   const audioLyricsMatch = pathname.match(/^\/emby\/Audio\/([^/]+)\/Lyrics$/)
   if (audioLyricsMatch && method === 'GET') {
     const itemId = decodeURIComponent(audioLyricsMatch[1])
@@ -1919,8 +3030,18 @@ export async function demoFetch<T>(
   const playbackMatch = pathname.match(/^\/emby\/Items\/([^/]+)\/PlaybackInfo$/)
   if (playbackMatch && method === 'POST') {
     const itemId = decodeURIComponent(playbackMatch[1])
+    const body = parseJsonBody(options)
+    const qUserId = String(qs.get('UserId') || body.UserId || caller.userId || '')
+    if (qUserId) requireSelfOrAdmin(caller, qUserId)
+    const targetUser = resolveUserDto(qUserId, caller)
+    if (targetUser?.Policy?.EnableMediaPlayback === false) {
+      throw new ApiError(403, '当前账号已被禁止播放媒体')
+    }
     const item = store.items.get(itemId)
     if (!item) throw new ApiError(404, '找不到可播放的媒体')
+    if (!canDemoUserAccessItem(targetUser, item)) {
+      throw new ApiError(403, '受家长控制或媒体库访问权限限制，无权播放该媒体')
+    }
     const sources = item.MediaSources || []
     const res: PlaybackInfoResponse = {
       MediaSources: sources,
@@ -1929,7 +3050,6 @@ export async function demoFetch<T>(
     return res as T
   }
 
-  // 视频内封附件（字体列表）与 BIF 预览图 / ThumbnailSet（v0.10.6 兼容路由）
   const videoAttachmentsMatch = pathname.match(/^\/emby\/Videos\/([^/]+)\/([^/]+)\/Attachments$/)
   if (videoAttachmentsMatch && method === 'GET') {
     const itemId = decodeURIComponent(videoAttachmentsMatch[1])
@@ -1972,37 +3092,257 @@ export async function demoFetch<T>(
     const body = parseJsonBody(options)
     const itemId = String(body.ItemId || '')
     const posTicks = Number(body.PositionTicks || 0)
+    const sessionUserId = caller.userId || 'user-demo-admin'
     const item = store.items.get(itemId)
     if (item) {
-      const ud = ensureUserData(item)
+      const ud = ensureUserDataForUser(sessionUserId, itemId)
       ud.PlaybackPositionTicks = posTicks
       ud.LastPlayedDate = new Date().toISOString()
       if (item.RunTimeTicks && item.RunTimeTicks > 0) {
-        ud.PlayedPercentage = Math.min(100, Math.round((posTicks / item.RunTimeTicks) * 100))
-      }
-      const webSess = store.sessions[0]
-      if (webSess) {
-        webSess.LastActivityDate = new Date().toISOString()
-        if (pathname.endsWith('/Stopped')) {
-          webSess.NowPlayingItem = undefined
-          webSess.PlayState = undefined
-        } else {
-          webSess.NowPlayingItem = item
-          webSess.PlayState = {
-            PositionTicks: posTicks,
-            IsPaused: Boolean(body.IsPaused),
-            IsMuted: Boolean(body.IsMuted),
-            VolumeLevel: typeof body.VolumeLevel === 'number' ? body.VolumeLevel : 100,
-            PlayMethod: String(body.PlayMethod || 'DirectPlay'),
-            CanSeek: true,
+        const ratio = posTicks / item.RunTimeTicks
+        ud.PlayedPercentage = Math.min(100, Math.round(ratio * 100))
+        const threshold = demoServerConfig.PlayedThreshold || 0.9
+        if (ratio >= threshold) {
+          ud.Played = true
+          ud.PlayCount = Math.max(1, (ud.PlayCount || 0) + 1)
+          if (pathname.endsWith('/Stopped')) {
+            ud.PlaybackPositionTicks = 0
+            ud.PlayedPercentage = 100
           }
+        }
+      }
+
+      // 按当前请求用户隔离会话状态，绝不覆盖其他用户的播放会话
+      let userSess = store.sessions.find((s) => s.UserId === sessionUserId)
+      if (!userSess) {
+        userSess = {
+          Id: `sess-web-${sessionUserId}`,
+          ServerId: DEMO_SERVER_ID,
+          UserId: sessionUserId,
+          UserName: caller.user?.Name || sessionUserId,
+          Client: 'Ambra Web',
+          ApplicationVersion: '0.11.0',
+          DeviceName: 'Web Browser (Demo)',
+          DeviceId: `dev-web-${sessionUserId}`,
+          LastActivityDate: new Date().toISOString(),
+          SupportsRemoteControl: true,
+        }
+        store.sessions.push(userSess)
+      }
+      userSess.LastActivityDate = new Date().toISOString()
+      if (pathname.endsWith('/Stopped')) {
+        userSess.NowPlayingItem = undefined
+        userSess.PlayState = undefined
+      } else {
+        userSess.NowPlayingItem = projectItemForUser(item, sessionUserId)
+        userSess.PlayState = {
+          PositionTicks: posTicks,
+          IsPaused: Boolean(body.IsPaused),
+          IsMuted: Boolean(body.IsMuted),
+          VolumeLevel: typeof body.VolumeLevel === 'number' ? body.VolumeLevel : 100,
+          PlayMethod: String(body.PlayMethod || 'DirectPlay'),
+          CanSeek: true,
         }
       }
     }
     return undefined as T
   }
 
-  // ==================== 9. 媒体库管理与模拟目录浏览器 ====================
+  // ==================== 9. 扫描控制、健康治理与一键迁移 (/api/admin/**) ====================
+  if (pathname.startsWith('/api/admin/')) {
+    requireDemoAdmin(caller)
+  }
+
+  if (pathname === '/api/admin/migration/status' && method === 'GET') {
+    const rep = demoMigrationState.report
+    if (rep.status === 'running') {
+      const nextProcessed = Math.min(rep.total_users, rep.processed_users + 1)
+      const done = nextProcessed >= rep.total_users
+      rep.processed_users = nextProcessed
+      rep.current_user = done ? '' : DEMO_MIGRATION_SOURCE_USERS[nextProcessed]?.Name || ''
+      rep.users_matched = Math.min(1, nextProcessed)
+      rep.users_created = demoMigrationState.migrateUsers ? Math.max(0, nextProcessed - 1) : 0
+      rep.items_scanned = nextProcessed * 142
+      rep.items_matched = nextProcessed * 134
+      rep.items_skipped = nextProcessed * 8
+      rep.played_migrated = demoMigrationState.migratePlayed ? nextProcessed * 96 : 0
+      rep.favorites_migrated = demoMigrationState.migrateFavorites ? nextProcessed * 24 : 0
+      rep.resume_migrated = demoMigrationState.migrateResume ? nextProcessed * 14 : 0
+      if (done) {
+        rep.status = 'completed'
+        rep.completed_at = new Date().toISOString()
+        rep.conflicts = [
+          {
+            user_name: 'Admin',
+            item_name: '沙丘 (2021)',
+            item_type: 'Movie',
+            reason: '本地存在多版本重复条目，已安全跳过',
+          },
+        ]
+        if (rep.source_url) {
+          demoMigrationState.checkpointByUrl.delete(rep.source_url)
+        }
+        pushActivity('已完成旧 Emby 数据迁移任务', 'MigrationCompleted', undefined, caller.userId)
+      }
+    }
+    return {
+      ...rep,
+      conflicts: [...rep.conflicts],
+      errors: [...rep.errors],
+    } as T
+  }
+
+  if (pathname === '/api/admin/migration/test' && method === 'POST') {
+    const body = parseJsonBody(options)
+    const sourceUrl = validateHttpUrl(String(body.source_url || ''), '旧 Emby 服务器地址')
+    const apiKey = String(body.api_key || '').trim()
+    if (!apiKey) {
+      throw new ApiError(400, '旧 Emby 管理员 API Key 不能为空')
+    }
+    return {
+      server: {
+        Id: 'demo-legacy-emby-01',
+        ServerName: '旧 Emby NAS 影院 (Demo)',
+        Version: '4.8.10.0',
+        ProductName: 'Emby Server',
+        OperatingSystem: 'Linux',
+        LocalAddress: sourceUrl,
+        Status: 'ok',
+      },
+      users: DEMO_MIGRATION_SOURCE_USERS.map((u) => ({ ...u, Policy: { ...u.Policy } })),
+      virtual_folders: [
+        { ItemId: 'src-lib-1', Name: '4K 电影', CollectionType: 'movies', Locations: ['/volume1/media/movies'] },
+        { ItemId: 'src-lib-2', Name: '精选剧集', CollectionType: 'tvshows', Locations: ['/volume1/media/tv'] },
+        { ItemId: 'src-lib-3', Name: '动画番剧', CollectionType: 'tvshows', Locations: ['/volume1/media/anime'] },
+      ],
+    } as T
+  }
+
+  if (pathname === '/api/admin/migration/dry-run' && method === 'POST') {
+    const body = parseJsonBody(options)
+    const sourceUrl = validateHttpUrl(String(body.source_url || ''), '旧 Emby 服务器地址')
+    const apiKey = String(body.api_key || '').trim()
+    if (!apiKey) {
+      throw new ApiError(400, '旧 Emby 管理员 API Key 不能为空')
+    }
+    const userIds = Array.isArray(body.user_ids) ? body.user_ids.map((x) => String(x)) : []
+    const userCount = Math.max(1, userIds.length || DEMO_MIGRATION_SOURCE_USERS.length)
+    const migUsers = body.migrate_users !== false
+    const migPlayed = body.migrate_played !== false
+    const migFavs = body.migrate_favorites !== false
+    const migResume = body.migrate_resume !== false
+    const hasCp = !body.reset_checkpoint && demoMigrationState.checkpointByUrl.has(sourceUrl)
+    const nowIso = new Date().toISOString()
+
+    const dryReport: DemoMigrationReport = {
+      status: 'completed',
+      dry_run: true,
+      source_url: sourceUrl,
+      source_server_name: '旧 Emby NAS 影院 (Demo)',
+      started_at: nowIso,
+      completed_at: nowIso,
+      total_users: userCount,
+      processed_users: userCount,
+      users_matched: 1,
+      users_created: migUsers ? Math.max(0, userCount - 1) : 0,
+      items_scanned: userCount * 142,
+      items_matched: userCount * 134,
+      items_skipped: userCount * 8,
+      played_migrated: migPlayed ? userCount * 96 : 0,
+      favorites_migrated: migFavs ? userCount * 24 : 0,
+      resume_migrated: migResume ? userCount * 14 : 0,
+      conflicts: [
+        {
+          user_name: 'Admin',
+          item_name: '沙丘 (2021)',
+          item_type: 'Movie',
+          reason: '本地存在多版本重复条目，已安全跳过',
+        },
+      ],
+      errors: [],
+      resumed_from_checkpoint: hasCp,
+      checkpoint_key: hasCp
+        ? demoMigrationState.checkpointByUrl.get(sourceUrl)?.checkpointKey
+        : undefined,
+    }
+    return dryReport as T
+  }
+
+  if (pathname === '/api/admin/migration/start' && method === 'POST') {
+    const body = parseJsonBody(options)
+    const sourceUrl = validateHttpUrl(String(body.source_url || ''), '旧 Emby 服务器地址')
+    const apiKey = String(body.api_key || '').trim()
+    if (!apiKey) {
+      throw new ApiError(400, '旧 Emby 管理员 API Key 不能为空')
+    }
+    const userIds = Array.isArray(body.user_ids) ? body.user_ids.map((x) => String(x)) : []
+    const totalUsers = Math.max(1, userIds.length || DEMO_MIGRATION_SOURCE_USERS.length)
+    const resetCp = Boolean(body.reset_checkpoint)
+    if (resetCp) {
+      demoMigrationState.checkpointByUrl.delete(sourceUrl)
+    }
+    const savedCp = !resetCp ? demoMigrationState.checkpointByUrl.get(sourceUrl) : undefined
+    const initialProcessed = savedCp ? Math.min(totalUsers - 1, savedCp.processedUsers) : 0
+
+    demoMigrationState.migrateUsers = body.migrate_users !== false
+    demoMigrationState.migratePlayed = body.migrate_played !== false
+    demoMigrationState.migrateFavorites = body.migrate_favorites !== false
+    demoMigrationState.migrateResume = body.migrate_resume !== false
+
+    const startedReport: DemoMigrationReport = {
+      status: 'running',
+      dry_run: false,
+      source_url: sourceUrl,
+      source_server_name: '旧 Emby NAS 影院 (Demo)',
+      started_at: new Date().toISOString(),
+      total_users: totalUsers,
+      processed_users: initialProcessed,
+      current_user: DEMO_MIGRATION_SOURCE_USERS[initialProcessed]?.Name || 'Admin',
+      users_matched: initialProcessed > 0 ? 1 : 0,
+      users_created: demoMigrationState.migrateUsers ? Math.max(0, initialProcessed - 1) : 0,
+      items_scanned: initialProcessed * 142,
+      items_matched: initialProcessed * 134,
+      items_skipped: initialProcessed * 8,
+      played_migrated: demoMigrationState.migratePlayed ? initialProcessed * 96 : 0,
+      favorites_migrated: demoMigrationState.migrateFavorites ? initialProcessed * 24 : 0,
+      resume_migrated: demoMigrationState.migrateResume ? initialProcessed * 14 : 0,
+      conflicts: [],
+      errors: [],
+      resumed_from_checkpoint: Boolean(savedCp),
+      checkpoint_key: savedCp?.checkpointKey,
+    }
+    demoMigrationState.report = startedReport
+    pushActivity('已启动旧 Emby 数据迁移任务', 'MigrationStarted', sourceUrl, caller.userId)
+    return { ...startedReport, conflicts: [], errors: [] } as T
+  }
+
+  if (pathname === '/api/admin/migration/cancel' && method === 'POST') {
+    const rep = demoMigrationState.report
+    if (rep.status === 'running') {
+      const processed = Math.max(1, rep.processed_users)
+      const cpKey = `cp-${Date.now().toString(36)}`
+      rep.status = 'cancelled'
+      rep.processed_users = processed
+      rep.completed_at = new Date().toISOString()
+      rep.checkpoint_key = cpKey
+      if (rep.source_url) {
+        demoMigrationState.checkpointByUrl.set(rep.source_url, {
+          checkpointKey: cpKey,
+          processedUsers: processed,
+        })
+      }
+      pushActivity('已取消迁移任务并持久化断点', 'MigrationCancelled', rep.source_url, caller.userId)
+      return {
+        cancelled: true,
+        report: { ...rep, conflicts: [...rep.conflicts], errors: [...rep.errors] },
+      } as T
+    }
+    return {
+      cancelled: false,
+      report: { ...rep, conflicts: [...rep.conflicts], errors: [...rep.errors] },
+    } as T
+  }
+
   if (pathname === '/api/admin/scanner/progress' && method === 'GET') {
     const nowMs = Date.now()
     const nowIso = new Date(nowMs).toISOString()
@@ -2114,7 +3454,7 @@ export async function demoFetch<T>(
     if (activeDemoScan && !activeDemoScan.paused) {
       activeDemoScan.paused = true
       activeDemoScan.pausedAtMs = Date.now()
-      pushActivity('已暂停媒体库扫描任务', 'LibraryScanPaused')
+      pushActivity('已暂停媒体库扫描任务', 'LibraryScanPaused', undefined, caller.userId)
     }
     return undefined as T
   }
@@ -2125,7 +3465,7 @@ export async function demoFetch<T>(
       activeDemoScan.startedAtMs += pausedDelta
       activeDemoScan.paused = false
       activeDemoScan.pausedAtMs = undefined
-      pushActivity('已恢复媒体库扫描任务', 'LibraryScanResumed')
+      pushActivity('已恢复媒体库扫描任务', 'LibraryScanResumed', undefined, caller.userId)
     }
     return undefined as T
   }
@@ -2133,7 +3473,7 @@ export async function demoFetch<T>(
   if (pathname === '/api/admin/scanner/cancel' && method === 'POST') {
     if (activeDemoScan) {
       activeDemoScan = null
-      pushActivity('已取消当前媒体库扫描任务', 'LibraryScanCancelled')
+      pushActivity('已取消当前媒体库扫描任务', 'LibraryScanCancelled', undefined, caller.userId)
     }
     return undefined as T
   }
@@ -2292,7 +3632,12 @@ export async function demoFetch<T>(
       }
     }
     primary.MediaSources = mergedSources
-    pushActivity(`已合并 ${removedIds.length + 1} 个重复条目至「${primary.Name}」`, 'DuplicatesMerged')
+    pushActivity(
+      `已合并 ${removedIds.length + 1} 个重复条目至「${primary.Name}」`,
+      'DuplicatesMerged',
+      undefined,
+      caller.userId,
+    )
     return {
       PrimaryItemId: primaryId,
       MergedCount: removedIds.length + 1,
@@ -2365,7 +3710,7 @@ export async function demoFetch<T>(
         deletedIds.push(id)
       }
     }
-    pushActivity(`已清理 ${deletedIds.length} 条磁盘孤立记录`, 'OrphansCleaned')
+    pushActivity(`已清理 ${deletedIds.length} 条磁盘孤立记录`, 'OrphansCleaned', undefined, caller.userId)
     return {
       Requested: ids.length,
       Deleted: deletedIds.length,
@@ -2414,7 +3759,7 @@ export async function demoFetch<T>(
     }
     audit.Status = 'approved'
     audit.UpdatedAt = Math.floor(Date.now() / 1000)
-    pushActivity(`已通过审校项「${audit.ItemName}」`, 'ScrapeReviewApproved')
+    pushActivity(`已通过审校项「${audit.ItemName}」`, 'ScrapeReviewApproved', undefined, caller.userId)
     return { ...audit } as T
   }
 
@@ -2427,7 +3772,7 @@ export async function demoFetch<T>(
     if (!audit) throw new ApiError(404, '审校记录不存在')
     audit.Status = 'dismissed'
     audit.UpdatedAt = Math.floor(Date.now() / 1000)
-    pushActivity(`已忽略审校项「${audit.ItemName}」`, 'ScrapeReviewDismissed')
+    pushActivity(`已忽略审校项「${audit.ItemName}」`, 'ScrapeReviewDismissed', undefined, caller.userId)
     return { ...audit } as T
   }
 
@@ -2462,7 +3807,7 @@ export async function demoFetch<T>(
     const lockAll = Boolean(body.LockData ?? body.lock_data)
     item.LockedFields = fields
     item.LockData = lockAll
-    pushActivity(`已更新「${item.Name}」的元数据锁定配置`, 'ItemFieldsLocked')
+    pushActivity(`已更新「${item.Name}」的元数据锁定配置`, 'ItemFieldsLocked', undefined, caller.userId)
     return {
       ItemId: itemId,
       LockedFields: fields,
@@ -2483,7 +3828,7 @@ export async function demoFetch<T>(
     const nfoPath = item.Path
       ? item.Path.replace(/\.[^/.]+$/, '.nfo')
       : `/media/${item.Name}/${rootTag}.nfo`
-    pushActivity(`已原子回写「${item.Name}」的 NFO 文件`, 'ItemNfoWritten', nfoPath)
+    pushActivity(`已原子回写「${item.Name}」的 NFO 文件`, 'ItemNfoWritten', nfoPath, caller.userId)
     return {
       ItemId: itemId,
       NfoPath: nfoPath,
@@ -2496,6 +3841,7 @@ export async function demoFetch<T>(
   }
 
   if (pathname === '/emby/Library/Refresh' && method === 'POST') {
+    requireDemoAdmin(caller)
     const parentId = qs.get('ParentId')
     const lib = parentId ? store.libraries.find((l) => l.ItemId === parentId) : null
     const targetItems = lib
@@ -2518,30 +3864,37 @@ export async function demoFetch<T>(
       lib ? `已触发媒体库「${lib.Name}」扫描任务` : '已触发全部媒体库扫描任务',
       'LibraryScan',
       `正在扫描与刮削 ${activeDemoScan.items.length} 个媒体条目`,
+      caller.userId,
     )
     return undefined as T
   }
 
   if (pathname === '/emby/Library/VirtualFolders/Name' && method === 'POST') {
+    requireDemoAdmin(caller)
     const body = parseJsonBody(options)
     const oldName = String(qs.get('Name') || qs.get('name') || body.Name || '').trim()
     const newName = String(qs.get('NewName') || qs.get('newName') || body.NewName || '').trim()
     const id = String(body.Id || qs.get('Id') || '').trim()
     if (!newName) throw new ApiError(400, '新名称不能为空')
-    const lib = store.libraries.find((l) => (id && l.ItemId === id) || (oldName && l.Name === oldName))
+    const lib = store.libraries.find(
+      (l) => (id && l.ItemId === id) || (oldName && l.Name === oldName),
+    )
     if (!lib) throw new ApiError(404, '媒体库不存在')
     const prevName = lib.Name
     lib.Name = newName
-    pushActivity(`已将媒体库「${prevName}」重命名为「${newName}」`, 'LibraryRenamed')
+    pushActivity(`已将媒体库「${prevName}」重命名为「${newName}」`, 'LibraryRenamed', undefined, caller.userId)
     return undefined as T
   }
 
   if (pathname === '/emby/Library/VirtualFolders/Paths') {
+    requireDemoAdmin(caller)
     if (method === 'POST') {
       const body = parseJsonBody(options)
       const name = String(body.Name || qs.get('Name') || qs.get('name') || '').trim()
       const id = String(body.Id || qs.get('Id') || '').trim()
-      const targetPath = String(body.Path || (body.PathInfo as { Path?: string } | undefined)?.Path || '').trim()
+      const targetPath = String(
+        body.Path || (body.PathInfo as { Path?: string } | undefined)?.Path || '',
+      ).trim()
       if (!targetPath) throw new ApiError(400, '路径不能为空')
       const lib = store.libraries.find((l) => (id && l.ItemId === id) || (name && l.Name === name))
       if (!lib) throw new ApiError(404, '媒体库不存在')
@@ -2549,7 +3902,7 @@ export async function demoFetch<T>(
       if (!locations.includes(targetPath)) {
         lib.Locations = [...locations, targetPath]
       }
-      pushActivity(`为媒体库「${lib.Name}」添加路径`, 'LibraryPathAdded', targetPath)
+      pushActivity(`为媒体库「${lib.Name}」添加路径`, 'LibraryPathAdded', targetPath, caller.userId)
       return undefined as T
     }
     if (method === 'DELETE') {
@@ -2559,12 +3912,13 @@ export async function demoFetch<T>(
       const lib = store.libraries.find((l) => (id && l.ItemId === id) || (name && l.Name === name))
       if (!lib) throw new ApiError(404, '媒体库不存在')
       lib.Locations = (lib.Locations || []).filter((p) => p !== targetPath)
-      pushActivity(`从媒体库「${lib.Name}」移除路径`, 'LibraryPathRemoved', targetPath)
+      pushActivity(`从媒体库「${lib.Name}」移除路径`, 'LibraryPathRemoved', targetPath, caller.userId)
       return undefined as T
     }
   }
 
   if (pathname === '/emby/Library/VirtualFolders/LibraryOptions' && method === 'POST') {
+    requireDemoAdmin(caller)
     const body = parseJsonBody(options)
     const id = String(body.Id || qs.get('id') || '').trim()
     const lib = store.libraries.find((l) => l.ItemId === id)
@@ -2579,11 +3933,13 @@ export async function demoFetch<T>(
       `更新媒体库「${lib.Name}」元数据选项`,
       'LibraryOptionsUpdated',
       `保存本地 NFO/图片：${lib.LibraryOptions.SaveLocalMetadata === false ? '关闭' : '开启'}`,
+      caller.userId,
     )
     return undefined as T
   }
 
   if (pathname === '/emby/Library/VirtualFolders') {
+    requireDemoAdmin(caller)
     if (method === 'GET') {
       return store.libraries.map((l) => ({
         ...l,
@@ -2598,9 +3954,7 @@ export async function demoFetch<T>(
       const body = parseJsonBody(options)
       const name = String(body.Name || qs.get('name') || '').trim()
       const collectionType = String(body.CollectionType || qs.get('collectionType') || 'movies')
-      const paths = Array.isArray(body.Paths)
-        ? body.Paths.map((p) => String(p))
-        : []
+      const paths = Array.isArray(body.Paths) ? body.Paths.map((p) => String(p)) : []
       if (!name) throw new ApiError(400, '媒体库名称不能为空')
       const incomingOpts = (body.LibraryOptions || {}) as Record<string, unknown>
       const newLib: VirtualFolderInfo = {
@@ -2623,7 +3977,12 @@ export async function demoFetch<T>(
         '#f59e0b',
       ])
       store.artById.set(newLib.ItemId, { poster: thumb, backdrop: thumb })
-      pushActivity(`新建媒体库「${name}」`, 'LibraryCreated', `挂载目录：${paths.join(', ')}`)
+      pushActivity(
+        `新建媒体库「${name}」`,
+        'LibraryCreated',
+        `挂载目录：${paths.join(', ')}`,
+        caller.userId,
+      )
       return newLib as T
     }
     if (method === 'DELETE') {
@@ -2635,17 +3994,19 @@ export async function demoFetch<T>(
       if (idx >= 0) {
         const [removed] = store.libraries.splice(idx, 1)
         store.libraryItems.delete(removed.ItemId)
-        pushActivity(`已移除媒体库「${removed.Name}」`, 'LibraryDeleted')
+        pushActivity(`已移除媒体库「${removed.Name}」`, 'LibraryDeleted', undefined, caller.userId)
       }
       return undefined as T
     }
   }
 
   if (pathname === '/emby/Environment/Drives' && method === 'GET') {
+    requireDemoAdmin(caller)
     return [...store.fsDrives] as T
   }
 
   if (pathname === '/emby/Environment/DirectoryContents' && method === 'GET') {
+    requireDemoAdmin(caller)
     const rawPath = (qs.get('path') || '/').replace(/\/+$/, '') || '/'
     const entries = store.fsDirs[rawPath] || []
     return [...entries] as T
@@ -2653,11 +4014,21 @@ export async function demoFetch<T>(
 
   // ==================== 10. 会话、远程控制、活动日志、设备与 API Key ====================
   if (pathname === '/emby/Sessions' && method === 'GET') {
-    return [...store.sessions] as T
+    const visibleSessions = caller.isAdmin
+      ? store.sessions
+      : store.sessions.filter((s) => s.UserId === caller.userId)
+    return visibleSessions.map((s) => ({
+      ...s,
+      NowPlayingItem: s.NowPlayingItem
+        ? projectItemForUser(s.NowPlayingItem, s.UserId || caller.userId)
+        : undefined,
+      PlayState: s.PlayState ? { ...s.PlayState } : undefined,
+    })) as T
   }
 
   const sessionPlaystateMatch = pathname.match(/^\/emby\/Sessions\/([^/]+)\/Playing\/([^/]+)$/)
   if (sessionPlaystateMatch && method === 'POST') {
+    requireDemoAdmin(caller)
     const sessionId = decodeURIComponent(sessionPlaystateMatch[1])
     const command = decodeURIComponent(sessionPlaystateMatch[2])
     const sess = store.sessions.find((s) => s.Id === sessionId)
@@ -2679,6 +4050,8 @@ export async function demoFetch<T>(
     pushActivity(
       `已向会话「${sess.DeviceName || sess.Id}」发送远程指令：${command}`,
       'SessionRemoteControl',
+      undefined,
+      caller.userId,
     )
     if (typeof window !== 'undefined') {
       window.dispatchEvent(
@@ -2698,6 +4071,7 @@ export async function demoFetch<T>(
 
   const sessionMessageMatch = pathname.match(/^\/emby\/Sessions\/([^/]+)\/Message$/)
   if (sessionMessageMatch && method === 'POST') {
+    requireDemoAdmin(caller)
     const sessionId = decodeURIComponent(sessionMessageMatch[1])
     const sess = store.sessions.find((s) => s.Id === sessionId)
     if (!sess) throw new ApiError(404, '会话不存在')
@@ -2710,6 +4084,7 @@ export async function demoFetch<T>(
       `已向会话「${sess.DeviceName || sess.Id}」发送消息：${header}`,
       'SessionMessageSent',
       text,
+      caller.userId,
     )
     if (typeof window !== 'undefined') {
       window.dispatchEvent(
@@ -2732,15 +4107,40 @@ export async function demoFetch<T>(
   }
 
   if (pathname === '/emby/System/ActivityLog/Entries' && method === 'GET') {
-    const startIndex = Number(qs.get('StartIndex') || 0)
-    const limit = Number(qs.get('Limit') || 50)
+    requireDemoAdmin(caller)
+    const startIndex = Math.max(0, Number(qs.get('StartIndex') || 0))
+    const limit = Math.max(1, Number(qs.get('Limit') || 50))
+    const severityRaw = (qs.get('Severity') || '').trim().toLowerCase()
+    const searchRaw = (qs.get('SearchTerm') || '').trim().toLowerCase()
+
+    let filtered = store.activityLogs
+    if (severityRaw && severityRaw !== 'all') {
+      filtered = filtered.filter((entry) => {
+        const entrySev = (entry.Severity || 'Info').toLowerCase()
+        if (severityRaw === 'warn' || severityRaw === 'warning') {
+          return entrySev === 'warn' || entrySev === 'warning'
+        }
+        return entrySev === severityRaw
+      })
+    }
+    if (searchRaw) {
+      filtered = filtered.filter((entry) => {
+        const haystack = [entry.Name, entry.ShortOverview, entry.Overview, entry.Type]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase()
+        return haystack.includes(searchRaw)
+      })
+    }
+
     return {
-      Items: store.activityLogs.slice(startIndex, startIndex + limit),
-      TotalRecordCount: store.activityLogs.length,
+      Items: filtered.slice(startIndex, startIndex + limit),
+      TotalRecordCount: filtered.length,
     } as T
   }
 
   if (pathname === '/emby/Devices') {
+    requireDemoAdmin(caller)
     if (method === 'GET') {
       return { Items: [...store.devices], TotalRecordCount: store.devices.length } as T
     }
@@ -2750,62 +4150,92 @@ export async function demoFetch<T>(
       if (idx >= 0) {
         const [removed] = store.devices.splice(idx, 1)
         store.sessions = store.sessions.filter((s) => s.DeviceId !== devId)
-        pushActivity(`已注销并踢出设备「${removed.Name}」`, 'DeviceRevoked')
+        pushActivity(`已注销并踢出设备「${removed.Name}」`, 'DeviceRevoked', undefined, caller.userId)
       }
       return undefined as T
     }
   }
 
   if (pathname === '/emby/Auth/Keys') {
+    requireDemoAdmin(caller)
     if (method === 'GET') {
-      return { Items: [...store.apiKeys], TotalRecordCount: store.apiKeys.length } as T
+      const items: ApiKeyInfo[] = store.apiKeys.map((k) => {
+        const masked = k.MaskedToken || maskApiKeyToken(k.AccessToken)
+        return {
+          ...k,
+          AccessToken: masked,
+          MaskedToken: masked,
+        }
+      })
+      return { Items: items, TotalRecordCount: items.length } as T
     }
     if (method === 'POST') {
       const body = parseJsonBody(options)
       const appName = String(body.AppName || body.App || qs.get('app') || '').trim()
       if (!appName) throw new ApiError(400, '应用名称不能为空')
+      const id = `apikey-demo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
       const token =
         'ambra_demo_' +
         Math.random().toString(36).slice(2, 10) +
         Date.now().toString(36)
-      const info: ApiKeyInfo = {
-        AccessToken: token,
+      const masked = maskApiKeyToken(token)
+      const storedRecord: ApiKeyInfo = {
+        Id: id,
+        AccessToken: masked,
+        MaskedToken: masked,
         AppName: appName,
         DateCreated: new Date().toISOString(),
         IsActive: true,
       }
-      store.apiKeys.unshift(info)
-      pushActivity(`为「${appName}」签发了新的 API Key`, 'ApiKeyCreated')
-      return info as T
+      demoRawApiKeys.set(id, token)
+      store.apiKeys.unshift(storedRecord)
+      pushActivity(`为「${appName}」签发了新的 API Key`, 'ApiKeyCreated', undefined, caller.userId)
+      // 一次性返回完整 AccessToken 供前端复制
+      return {
+        ...storedRecord,
+        AccessToken: token,
+      } as T
     }
   }
 
-  const deleteKeyMatch = pathname.match(/^\/emby\/Auth\/Keys\/([^/]+)$/)
-  if (deleteKeyMatch && method === 'DELETE') {
+  const deleteKeyMatch = pathname.match(/^\/emby\/Auth\/Keys\/([^/]+)(?:\/Delete)?$/)
+  if (deleteKeyMatch && (method === 'DELETE' || method === 'POST')) {
+    requireDemoAdmin(caller)
     const key = decodeURIComponent(deleteKeyMatch[1])
-    store.apiKeys = store.apiKeys.filter((k) => k.AccessToken !== key)
-    pushActivity('已吊销一个第三方 API Key', 'ApiKeyRevoked')
+    store.apiKeys = store.apiKeys.filter((k) => {
+      const raw = k.Id ? demoRawApiKeys.get(k.Id) : undefined
+      const match =
+        k.Id === key || k.AccessToken === key || k.MaskedToken === key || (raw && raw === key)
+      if (match && k.Id) {
+        demoRawApiKeys.delete(k.Id)
+      }
+      return !match
+    })
+    pushActivity('已吊销一个第三方 API Key', 'ApiKeyRevoked', undefined, caller.userId)
     return undefined as T
   }
 
-  // ==================== 11. 插件配置 ====================
+  // ==================== 11. 插件管理（支持双向联动、优先级更新与外部插件卸载） ====================
   if (pathname === '/emby/Plugins' && method === 'GET') {
+    requireDemoAdmin(caller)
     return store.plugins.map((p) => ({ ...p })) as T
   }
 
   const pluginCfgMatch = pathname.match(/^\/emby\/Plugins\/([^/]+)\/Configuration$/)
   if (pluginCfgMatch) {
-    const pluginId = decodeURIComponent(pluginCfgMatch[1])
-    const personalTrakt = pluginId === 'ambra.builtin.trakt'
-    if (personalTrakt && !store.users.find((u) => u.user.Id === auth?.userId)?.user.Policy?.IsAdministrator) {
-      throw new ApiError(403, 'Administrator privileges required')
-    }
+    requireDemoAdmin(caller)
+    const rawPluginId = decodeURIComponent(pluginCfgMatch[1])
+    const canonicalId = resolveCanonicalPluginId(rawPluginId)
+    const personalTrakt = canonicalId === 'ambra.builtin.trakt'
+
     if (method === 'GET') {
-      return maskPluginConfigForResponse(store.pluginConfigs.get(pluginId) || {}) as T
+      const cfg = store.pluginConfigs.get(canonicalId) || store.pluginConfigs.get(rawPluginId) || {}
+      return maskPluginConfigForResponse(cfg) as T
     }
     if (method === 'POST') {
       const body = parseJsonBody(options)
-      const prevCfg = store.pluginConfigs.get(pluginId) || {}
+      const prevCfg =
+        store.pluginConfigs.get(canonicalId) || store.pluginConfigs.get(rawPluginId) || {}
       const nextCfg = personalTrakt
         ? Object.fromEntries(
             Object.entries(body).filter(([key]) =>
@@ -2813,21 +4243,78 @@ export async function demoFetch<T>(
             ),
           )
         : mergePluginConfigForSave(prevCfg, body)
-      store.pluginConfigs.set(pluginId, nextCfg)
-      const plugin = store.plugins.find((p) => p.Id === pluginId)
+      store.pluginConfigs.set(canonicalId, nextCfg)
+
+      const plugin = store.plugins.find((p) => p.Id === canonicalId || p.Id === rawPluginId)
       if (plugin) {
         if (typeof nextCfg.enabled === 'boolean') plugin.Enabled = nextCfg.enabled
         else if (typeof nextCfg.Enabled === 'boolean') plugin.Enabled = nextCfg.Enabled
+        plugin.Status = plugin.Enabled ? 'Active' : 'Disabled'
         if (typeof nextCfg.priority === 'number') plugin.Priority = nextCfg.priority
         else if (typeof nextCfg.Priority === 'number') plugin.Priority = nextCfg.Priority
-        pushActivity(`更新了插件「${plugin.Name}」的配置`, 'PluginConfigured')
+        pushActivity(`更新了插件「${plugin.Name}」的配置`, 'PluginConfigured', undefined, caller.userId)
+      }
+
+      // 与 /System/Configuration 双向联动
+      if (canonicalId === 'ambra.metadata.tmdb') {
+        const keyCandidate =
+          typeof nextCfg.api_key === 'string'
+            ? nextCfg.api_key
+            : typeof nextCfg.ApiKey === 'string'
+              ? nextCfg.ApiKey
+              : undefined
+        if (keyCandidate !== undefined) {
+          demoRawTmdbApiKey = keyCandidate.trim()
+        }
+        const langCandidate =
+          typeof nextCfg.language === 'string'
+            ? nextCfg.language
+            : typeof nextCfg.Language === 'string'
+              ? nextCfg.Language
+              : undefined
+        if (langCandidate && langCandidate.trim()) {
+          demoServerConfig.TMDBLanguage = langCandidate.trim()
+          demoDefaultLanguage = langCandidate.trim()
+        }
+      } else if (canonicalId === 'ambra.stream.strm302') {
+        const strmEnabled =
+          typeof nextCfg.enable_302 === 'boolean'
+            ? nextCfg.enable_302
+            : typeof nextCfg.Enable302 === 'boolean'
+              ? nextCfg.Enable302
+              : typeof nextCfg.enabled === 'boolean'
+                ? nextCfg.enabled
+                : typeof nextCfg.Enabled === 'boolean'
+                  ? nextCfg.Enabled
+                  : undefined
+        if (strmEnabled !== undefined) {
+          demoServerConfig.EnableSTRM302 = strmEnabled
+        }
       }
       return undefined as T
     }
   }
 
+  const pluginDeleteMatch = pathname.match(/^\/emby\/Plugins\/([^/]+)$/)
+  if (pluginDeleteMatch && method === 'DELETE') {
+    requireDemoAdmin(caller)
+    const pluginId = decodeURIComponent(pluginDeleteMatch[1])
+    const idx = store.plugins.findIndex((p) => p.Id === pluginId)
+    if (idx < 0) {
+      throw new ApiError(404, '插件不存在')
+    }
+    if (store.plugins[idx].BuiltIn !== false) {
+      throw new ApiError(400, '内置插件不可卸载')
+    }
+    const [removed] = store.plugins.splice(idx, 1)
+    store.pluginConfigs.delete(pluginId)
+    pushActivity(`已卸载外部插件「${removed.Name}」`, 'PluginUninstalled', pluginId, caller.userId)
+    return undefined as T
+  }
+
   // ==================== 12. 计划任务、触发规则、Live TV 与服务器日志 ====================
   if (pathname === '/emby/ScheduledTasks' && method === 'GET') {
+    requireDemoAdmin(caller)
     return store.scheduledTasks.map((t) => ({
       ...t,
       Triggers: t.Triggers ? t.Triggers.map((tr) => ({ ...tr })) : [],
@@ -2836,6 +4323,7 @@ export async function demoFetch<T>(
 
   const taskTriggersMatch = pathname.match(/^\/emby\/ScheduledTasks\/([^/]+)\/Triggers$/)
   if (taskTriggersMatch && method === 'POST') {
+    requireDemoAdmin(caller)
     const taskId = decodeURIComponent(taskTriggersMatch[1])
     const task = store.scheduledTasks.find((t) => t.Id === taskId)
     if (!task) throw new ApiError(404, '计划任务不存在')
@@ -2854,21 +4342,28 @@ export async function demoFetch<T>(
     pushActivity(
       `已更新计划任务「${task.Name}」的触发规则（${parsedTriggers.length} 条）`,
       'ScheduledTaskTriggersUpdated',
+      undefined,
+      caller.userId,
     )
     return undefined as T
   }
 
-  // Live TV (M3U Tuner Hosts / XMLTV EPG / Channels)
+  // Live TV (M3U Tuner Hosts / XMLTV EPG / Channels / ChannelMappings / Timers / SeriesTimers)
   if (pathname === '/emby/LiveTv/Info' && method === 'GET') {
     const info: LiveTvInfo = {
       IsEnabled: true,
       Services: [{ Name: 'Ambra M3U / XMLTV', Status: 'Ok' }],
-      EnabledUsers: store.users.map((u) => u.user.Id),
+      EnabledUsers: store.users
+        .filter((u) => u.user.Policy?.EnableLiveTvAccess !== false)
+        .map((u) => u.user.Id),
     }
     return info as T
   }
 
   if (pathname === '/emby/LiveTv/Channels' && method === 'GET') {
+    if (caller.user?.Policy?.EnableLiveTvAccess === false) {
+      throw new ApiError(403, '当前账号无 Live TV 访问权限')
+    }
     const limit = Number(qs.get('Limit') || 100)
     const sliced = demoLiveTvChannels.slice(0, limit)
     return { Items: sliced, TotalRecordCount: demoLiveTvChannels.length } as T
@@ -2876,6 +4371,9 @@ export async function demoFetch<T>(
 
   const liveTvStreamMatch = pathname.match(/^\/emby\/LiveTv\/Channels\/([^/]+)\/Stream$/)
   if (liveTvStreamMatch && method === 'GET') {
+    if (caller.user?.Policy?.EnableLiveTvAccess === false) {
+      throw new ApiError(403, '当前账号无 Live TV 访问权限')
+    }
     const channelId = decodeURIComponent(liveTvStreamMatch[1])
     const channel = demoLiveTvChannels.find((ch) => ch.Id === channelId)
     if (!channel) {
@@ -2991,6 +4489,7 @@ export async function demoFetch<T>(
   }
 
   if (pathname === '/emby/LiveTv/TunerHosts') {
+    requireDemoAdmin(caller)
     if (method === 'GET') {
       return demoTunerHosts.map((h) => ({ ...h })) as T
     }
@@ -3006,7 +4505,12 @@ export async function demoFetch<T>(
         TunerCount: typeof body.TunerCount === 'number' ? body.TunerCount : 4,
       }
       demoTunerHosts.push(created)
-      pushActivity(`已添加 Live TV 直播源「${created.FriendlyName}」`, 'LiveTvTunerAdded', urlVal)
+      pushActivity(
+        `已添加 Live TV 直播源「${created.FriendlyName}」`,
+        'LiveTvTunerAdded',
+        urlVal,
+        caller.userId,
+      )
       return { ...created } as T
     }
     if (method === 'DELETE') {
@@ -3014,13 +4518,19 @@ export async function demoFetch<T>(
       const idx = demoTunerHosts.findIndex((h) => h.Id === id)
       if (idx >= 0) {
         const [removed] = demoTunerHosts.splice(idx, 1)
-        pushActivity(`已删除 Live TV 直播源「${removed.FriendlyName || id}」`, 'LiveTvTunerDeleted')
+        pushActivity(
+          `已删除 Live TV 直播源「${removed.FriendlyName || id}」`,
+          'LiveTvTunerDeleted',
+          undefined,
+          caller.userId,
+        )
       }
       return undefined as T
     }
   }
 
   if (pathname === '/emby/LiveTv/ListingProviders') {
+    requireDemoAdmin(caller)
     if (method === 'GET') {
       return demoListingProviders.map((p) => ({ ...p })) as T
     }
@@ -3034,7 +4544,7 @@ export async function demoFetch<T>(
         Path: pathVal,
       }
       demoListingProviders.push(created)
-      pushActivity(`已添加 XMLTV EPG 节目单来源`, 'LiveTvEpgAdded', pathVal)
+      pushActivity(`已添加 XMLTV EPG 节目单来源`, 'LiveTvEpgAdded', pathVal, caller.userId)
       return { ...created } as T
     }
     if (method === 'DELETE') {
@@ -3042,8 +4552,99 @@ export async function demoFetch<T>(
       const idx = demoListingProviders.findIndex((p) => p.Id === id)
       if (idx >= 0) {
         demoListingProviders.splice(idx, 1)
-        pushActivity(`已删除 XMLTV EPG 节目单来源`, 'LiveTvEpgDeleted')
+        pushActivity(`已删除 XMLTV EPG 节目单来源`, 'LiveTvEpgDeleted', undefined, caller.userId)
       }
+      return undefined as T
+    }
+  }
+
+  if (pathname === '/emby/LiveTv/ChannelMappings') {
+    requireDemoAdmin(caller)
+    if (method === 'GET') {
+      return demoLiveTvChannelMappings.map((m) => ({ ...m })) as T
+    }
+    if (method === 'POST') {
+      const body = parseJsonBody(options)
+      const tunerChannelId = String(body.TunerChannelId || '').trim()
+      const providerChannelId = String(body.ProviderChannelId || '').trim()
+      if (!tunerChannelId || !providerChannelId) {
+        throw new ApiError(400, 'TunerChannelId 与 ProviderChannelId 不能为空')
+      }
+      const ch = demoLiveTvChannels.find((c) => c.Id === tunerChannelId)
+      const mapping: LiveTvChannelMapping = {
+        ProviderId: String(body.ProviderId || demoListingProviders[0]?.Id || 'epg-demo-01'),
+        TunerChannelId: tunerChannelId,
+        TunerChannelName: String(body.TunerChannelName || ch?.Name || tunerChannelId),
+        ProviderChannelId: providerChannelId,
+        ProviderChannelName: String(body.ProviderChannelName || providerChannelId),
+      }
+      const existingIdx = demoLiveTvChannelMappings.findIndex(
+        (m) => m.TunerChannelId === tunerChannelId,
+      )
+      if (existingIdx >= 0) {
+        demoLiveTvChannelMappings[existingIdx] = mapping
+      } else {
+        demoLiveTvChannelMappings.push(mapping)
+      }
+      pushActivity(
+        `已更新频道映射「${mapping.TunerChannelName} -> ${mapping.ProviderChannelId}」`,
+        'LiveTvChannelMapped',
+        undefined,
+        caller.userId,
+      )
+      return { ...mapping } as T
+    }
+  }
+
+  const canManageDvr = caller.isAdmin || Boolean(caller.user?.Policy?.EnableLiveTvManagement)
+
+  // Live TV DVR 系列录制规则 (SeriesTimers)
+  if (pathname === '/emby/LiveTv/SeriesTimers') {
+    if (method === 'GET') {
+      const items = demoLiveTvSeriesTimers.map((t) => ({
+        ...t,
+        Days: t.Days ? [...t.Days] : [],
+      }))
+      return { Items: items, TotalRecordCount: items.length } as T
+    }
+    if (method === 'POST') {
+      if (!canManageDvr) throw new ApiError(403, '需要管理员或 DVR 录制管理权限')
+      const body = parseJsonBody(options)
+      const name = String(body.Name || '').trim()
+      if (!name) throw new ApiError(400, '系列录制名称不能为空')
+      const created: LiveTvSeriesTimerInfo = {
+        Id: `stimer-demo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`,
+        ChannelId: body.ChannelId ? String(body.ChannelId) : undefined,
+        ProgramId: body.ProgramId ? String(body.ProgramId) : undefined,
+        SeriesId: body.SeriesId ? String(body.SeriesId) : undefined,
+        Name: name,
+        Overview: body.Overview ? String(body.Overview) : undefined,
+        RecordAnyTime: Boolean(body.RecordAnyTime),
+        RecordAnyChannel: Boolean(body.RecordAnyChannel),
+        RecordNewOnly: body.RecordNewOnly !== false,
+        Days: Array.isArray(body.Days) ? body.Days.map((d) => String(d)) : [],
+        PrePaddingSeconds: typeof body.PrePaddingSeconds === 'number' ? body.PrePaddingSeconds : 60,
+        PostPaddingSeconds:
+          typeof body.PostPaddingSeconds === 'number' ? body.PostPaddingSeconds : 180,
+      }
+      demoLiveTvSeriesTimers.push(created)
+      pushActivity(`已创建系列录制规则「${created.Name}」`, 'LiveTvSeriesTimerCreated', undefined, caller.userId)
+      return { ...created } as T
+    }
+    if (method === 'DELETE') {
+      if (!canManageDvr) throw new ApiError(403, '需要管理员或 DVR 录制管理权限')
+      const id = qs.get('id') || qs.get('Id') || ''
+      demoLiveTvSeriesTimers = demoLiveTvSeriesTimers.filter((t) => t.Id !== id)
+      return undefined as T
+    }
+  }
+
+  const seriesTimerSingleMatch = pathname.match(/^\/emby\/LiveTv\/SeriesTimers\/([^/]+)(?:\/Delete)?$/)
+  if (seriesTimerSingleMatch && (method === 'DELETE' || method === 'POST')) {
+    if (!canManageDvr) throw new ApiError(403, '需要管理员或 DVR 录制管理权限')
+    const id = decodeURIComponent(seriesTimerSingleMatch[1])
+    if (method === 'DELETE' || pathname.endsWith('/Delete')) {
+      demoLiveTvSeriesTimers = demoLiveTvSeriesTimers.filter((t) => t.Id !== id)
       return undefined as T
     }
   }
@@ -3055,6 +4656,7 @@ export async function demoFetch<T>(
       return { Items: items, TotalRecordCount: items.length } as T
     }
     if (method === 'POST') {
+      if (!canManageDvr) throw new ApiError(403, '需要管理员或 DVR 录制管理权限')
       const body = parseJsonBody(options)
       const channelId = String(body.ChannelId || '').trim()
       const name = String(body.Name || '').trim()
@@ -3078,15 +4680,16 @@ export async function demoFetch<T>(
           typeof body.PostPaddingSeconds === 'number' ? body.PostPaddingSeconds : 0,
       }
       demoLiveTvTimers.push(created)
-      pushActivity(`已创建 DVR 录制计划「${created.Name}」`, 'LiveTvTimerCreated')
+      pushActivity(`已创建 DVR 录制计划「${created.Name}」`, 'LiveTvTimerCreated', undefined, caller.userId)
       return { ...created } as T
     }
     if (method === 'DELETE') {
+      if (!canManageDvr) throw new ApiError(403, '需要管理员或 DVR 录制管理权限')
       const id = qs.get('id') || qs.get('Id') || ''
       const idx = demoLiveTvTimers.findIndex((t) => t.Id === id)
       if (idx >= 0) {
         const [removed] = demoLiveTvTimers.splice(idx, 1)
-        pushActivity(`已取消 DVR 录制计划「${removed.Name}」`, 'LiveTvTimerDeleted')
+        pushActivity(`已取消 DVR 录制计划「${removed.Name}」`, 'LiveTvTimerDeleted', undefined, caller.userId)
       }
       return undefined as T
     }
@@ -3094,11 +4697,12 @@ export async function demoFetch<T>(
 
   const liveTvTimerDeleteMatch = pathname.match(/^\/emby\/LiveTv\/Timers\/([^/]+)$/)
   if (liveTvTimerDeleteMatch && method === 'DELETE') {
+    if (!canManageDvr) throw new ApiError(403, '需要管理员或 DVR 录制管理权限')
     const id = decodeURIComponent(liveTvTimerDeleteMatch[1])
     const idx = demoLiveTvTimers.findIndex((t) => t.Id === id)
     if (idx >= 0) {
       const [removed] = demoLiveTvTimers.splice(idx, 1)
-      pushActivity(`已取消 DVR 录制计划「${removed.Name}」`, 'LiveTvTimerDeleted')
+      pushActivity(`已取消 DVR 录制计划「${removed.Name}」`, 'LiveTvTimerDeleted', undefined, caller.userId)
     }
     return undefined as T
   }
@@ -3110,11 +4714,12 @@ export async function demoFetch<T>(
       return { Items: items, TotalRecordCount: items.length } as T
     }
     if (method === 'DELETE') {
+      if (!canManageDvr) throw new ApiError(403, '需要管理员或 DVR 录制管理权限')
       const id = qs.get('id') || qs.get('Id') || ''
       const idx = demoLiveTvRecordings.findIndex((r) => r.Id === id)
       if (idx >= 0) {
         const [removed] = demoLiveTvRecordings.splice(idx, 1)
-        pushActivity(`已删除 DVR 录制文件「${removed.Name}」`, 'LiveTvRecordingDeleted')
+        pushActivity(`已删除 DVR 录制文件「${removed.Name}」`, 'LiveTvRecordingDeleted', undefined, caller.userId)
       }
       return undefined as T
     }
@@ -3122,27 +4727,30 @@ export async function demoFetch<T>(
 
   const liveTvRecordingDeleteMatch = pathname.match(/^\/emby\/LiveTv\/Recordings\/([^/]+)$/)
   if (liveTvRecordingDeleteMatch && method === 'DELETE') {
+    if (!canManageDvr) throw new ApiError(403, '需要管理员或 DVR 录制管理权限')
     const id = decodeURIComponent(liveTvRecordingDeleteMatch[1])
     const idx = demoLiveTvRecordings.findIndex((r) => r.Id === id)
     if (idx >= 0) {
       const [removed] = demoLiveTvRecordings.splice(idx, 1)
-      pushActivity(`已删除 DVR 录制文件「${removed.Name}」`, 'LiveTvRecordingDeleted')
+      pushActivity(`已删除 DVR 录制文件「${removed.Name}」`, 'LiveTvRecordingDeleted', undefined, caller.userId)
     }
     return undefined as T
   }
 
-  // Webhooks 事件通知管理
+  // Webhooks 事件通知管理（含合法 http/https 协议校验）
   if (pathname === '/emby/Webhooks') {
+    requireDemoAdmin(caller)
     if (method === 'GET') {
       return demoWebhooks.map((w) => sanitizeWebhookForResponse(w)) as T
     }
     if (method === 'POST') {
       const body = parseJsonBody(options)
       const name = String(body.Name || '').trim()
-      const urlVal = String(body.Url || '').trim()
-      if (!name || !urlVal) {
+      const rawUrl = String(body.Url || '').trim()
+      if (!name || !rawUrl) {
         throw new ApiError(400, 'Webhook 名称与推送 URL 不能为空')
       }
+      const urlVal = validateHttpUrl(rawUrl, 'Webhook 推送 URL')
       const events = Array.isArray(body.Events)
         ? body.Events.map((e) => String(e).trim()).filter(Boolean)
         : ['*']
@@ -3166,7 +4774,7 @@ export async function demoFetch<T>(
           Enabled: enabledVal,
         }
         demoWebhooks[existingIdx] = updated
-        pushActivity(`已更新 Webhook「${updated.Name}」`, 'WebhookUpdated')
+        pushActivity(`已更新 Webhook「${updated.Name}」`, 'WebhookUpdated', undefined, caller.userId)
         return sanitizeWebhookForResponse(updated) as T
       }
 
@@ -3181,12 +4789,27 @@ export async function demoFetch<T>(
         CreatedAt: Math.floor(Date.now() / 1000),
       }
       demoWebhooks.push(created)
-      pushActivity(`已创建 Webhook「${created.Name}」`, 'WebhookCreated')
+      pushActivity(`已创建 Webhook「${created.Name}」`, 'WebhookCreated', undefined, caller.userId)
       return sanitizeWebhookForResponse(created) as T
     }
   }
 
   if (pathname === '/emby/Webhooks/Test' && method === 'POST') {
+    requireDemoAdmin(caller)
+    const body = parseJsonBody(options)
+    const id = typeof body.Id === 'string' ? body.Id.trim() : ''
+    const existing = id ? demoWebhooks.find((w) => w.Id === id) : undefined
+    const rawTargetUrl = String(body.Url || existing?.Url || '').trim()
+    const targetUrl = validateHttpUrl(rawTargetUrl, 'Webhook 测试 URL')
+    if (targetUrl.includes('fail.invalid') || targetUrl.includes('/fail-test')) {
+      const failRes: WebhookTestResult = {
+        Success: false,
+        StatusCode: 502,
+        DurationMs: 128,
+        Error: '远端 Webhook 端点返回 502 Bad Gateway',
+      }
+      return failRes as T
+    }
     const res: WebhookTestResult = {
       Success: true,
       StatusCode: 200,
@@ -3197,11 +4820,12 @@ export async function demoFetch<T>(
 
   const webhookDeleteMatch = pathname.match(/^\/emby\/Webhooks\/([^/]+)$/)
   if (webhookDeleteMatch && method === 'DELETE') {
+    requireDemoAdmin(caller)
     const id = decodeURIComponent(webhookDeleteMatch[1])
     const idx = demoWebhooks.findIndex((w) => w.Id === id)
     if (idx >= 0) {
       const [removed] = demoWebhooks.splice(idx, 1)
-      pushActivity(`已删除 Webhook「${removed.Name}」`, 'WebhookDeleted')
+      pushActivity(`已删除 Webhook「${removed.Name}」`, 'WebhookDeleted', undefined, caller.userId)
     }
     return undefined as T
   }
@@ -3213,6 +4837,7 @@ export async function demoFetch<T>(
 
   const runTaskMatch = pathname.match(/^\/emby\/ScheduledTasks\/Running\/([^/]+)$/)
   if (runTaskMatch && method === 'POST') {
+    requireDemoAdmin(caller)
     const taskId = decodeURIComponent(runTaskMatch[1])
     const task = store.scheduledTasks.find((t) => t.Id === taskId)
     if (!task) throw new ApiError(404, '计划任务不存在')
@@ -3224,11 +4849,12 @@ export async function demoFetch<T>(
       StartTimeUtc: now,
       EndTimeUtc: now,
     }
-    pushActivity(`手动执行计划任务「${task.Name}」完成`, 'ScheduledTaskCompleted')
+    pushActivity(`手动执行计划任务「${task.Name}」完成`, 'ScheduledTaskCompleted', undefined, caller.userId)
     return undefined as T
   }
 
   if (runTaskMatch && method === 'DELETE') {
+    requireDemoAdmin(caller)
     const taskId = decodeURIComponent(runTaskMatch[1])
     const task = store.scheduledTasks.find((t) => t.Id === taskId)
     if (!task) throw new ApiError(404, '计划任务不存在')
@@ -3240,16 +4866,18 @@ export async function demoFetch<T>(
       StartTimeUtc: now,
       EndTimeUtc: now,
     }
-    pushActivity(`已手动停止计划任务「${task.Name}」`, 'ScheduledTaskStopped')
+    pushActivity(`已手动停止计划任务「${task.Name}」`, 'ScheduledTaskStopped', undefined, caller.userId)
     return undefined as T
   }
 
   if (pathname === '/emby/System/Logs/Query' && method === 'GET') {
+    requireDemoAdmin(caller)
     return [...store.serverLogs] as T
   }
 
   const logContentMatch = pathname.match(/^\/emby\/System\/Logs\/([^/]+)$/)
   if (logContentMatch && method === 'GET') {
+    requireDemoAdmin(caller)
     const name = decodeURIComponent(logContentMatch[1])
     const content = store.serverLogContents.get(name)
     if (content === undefined) throw new ApiError(404, `日志文件 ${name} 不存在`)
@@ -3294,6 +4922,7 @@ export async function demoFetch<T>(
   }
 
   if (pathname === '/emby/System/Rankings/Refresh' && method === 'POST') {
+    requireDemoAdmin(caller)
     const now = new Date().toISOString()
     rankingsState.doubanUpdatedAt = now
     rankingsState.imdbUpdatedAt = now
@@ -3361,6 +4990,7 @@ export async function demoFetch<T>(
       '已同步豆瓣 Top 250 / IMDb Top 250 / TMDB 热门 / 豆瓣热门电影与剧集缓存',
       'RankingsSynced',
       `命中 ${matchedItems} 部影片，新增标签 ${tagsAdded} 个`,
+      caller.userId,
     )
 
     const result: RankingsRefreshResult = {
@@ -3376,9 +5006,75 @@ export async function demoFetch<T>(
     return result as T
   }
 
-  // ==================== 14. 媒体元数据、图片管理、远端识别与多版本拆分 ====================
+  // ==================== 14. 媒体元数据、图片、远端字幕搜索下载、远端识别与多版本 ====================
+  const remoteSubtitlesMatch = pathname.match(
+    /^\/emby\/Items\/([^/]+)\/RemoteSearch\/Subtitles\/([^/]+)$/,
+  )
+  if (remoteSubtitlesMatch) {
+    const itemId = decodeURIComponent(remoteSubtitlesMatch[1])
+    const param = decodeURIComponent(remoteSubtitlesMatch[2])
+    const item = store.items.get(itemId)
+    if (!item) throw new ApiError(404, '项目不存在')
+
+    if (method === 'GET') {
+      const lang = param || 'chi'
+      const results: RemoteSubtitleInfo[] = [
+        {
+          Id: `sub-remote-${itemId}-${lang}-1`,
+          Name: `${item.Name}.${lang}.简体中英双语.srt`,
+          ProviderName: 'OpenSubtitles (Demo)',
+          Language: lang,
+          ThreeLetterISOLanguageName: lang,
+          Format: 'srt',
+          CommunityRating: 9.4,
+          DownloadCount: 1280,
+          IsHashMatch: true,
+        },
+        {
+          Id: `sub-remote-${itemId}-${lang}-2`,
+          Name: `${item.Name}.${lang}.特效字幕.ass`,
+          ProviderName: 'Assrt (Demo)',
+          Language: lang,
+          ThreeLetterISOLanguageName: lang,
+          Format: 'ass',
+          CommunityRating: 9.1,
+          DownloadCount: 640,
+          IsHashMatch: false,
+        },
+      ]
+      return results as T
+    }
+    if (method === 'POST') {
+      requireDemoAdmin(caller)
+      const subtitleId = param
+      const src = item.MediaSources?.[0]
+      if (src) {
+        const streams = src.MediaStreams || []
+        const nextIdx = streams.reduce((max, s) => Math.max(max, s.Index), -1) + 1
+        streams.push({
+          Type: 'Subtitle',
+          Index: nextIdx,
+          Codec: 'vtt',
+          Language: 'chi',
+          DisplayLanguage: '简体中文',
+          Title: `远端下载字幕 (${subtitleId})`,
+          DisplayTitle: '远端下载字幕',
+          SubVariant: 'chs',
+          IsDefault: false,
+          IsExternal: true,
+          DeliveryMethod: 'External',
+          DeliveryUrl: makeDemoVttDataUrl(item.Name),
+        })
+        src.MediaStreams = streams
+      }
+      pushActivity(`已为「${item.Name}」下载远端字幕`, 'RemoteSubtitleDownloaded', subtitleId, caller.userId)
+      return undefined as T
+    }
+  }
+
   const remoteSearchMatch = pathname.match(/^\/emby\/Items\/RemoteSearch\/(Movie|Series)$/)
   if (remoteSearchMatch && method === 'POST') {
+    requireDemoAdmin(caller)
     const itemType = remoteSearchMatch[1]
     const body = parseJsonBody(options)
     const searchInfo = (body.SearchInfo && typeof body.SearchInfo === 'object'
@@ -3410,7 +5106,10 @@ export async function demoFetch<T>(
 
     const topItems =
       scored.filter((s) => s.score > 0).length > 0
-        ? scored.filter((s) => s.score > 0).slice(0, 5).map((s) => s.item)
+        ? scored
+            .filter((s) => s.score > 0)
+            .slice(0, 5)
+            .map((s) => s.item)
         : pool.slice(0, 4)
 
     const results: RemoteSearchResult[] = topItems.map((it) => {
@@ -3427,7 +5126,6 @@ export async function demoFetch<T>(
       }
     })
 
-    // 若用户输入了自定义搜索词且未完全精确命中，额外附带一条精确命名的高清候选方便演示
     if (qName && !results.some((r) => r.Name.toLowerCase() === qName.toLowerCase())) {
       const donor = topItems[0] || pool[0]
       const donorArt = donor ? store.artById.get(donor.Id) : undefined
@@ -3450,6 +5148,7 @@ export async function demoFetch<T>(
 
   const remoteApplyMatch = pathname.match(/^\/emby\/Items\/RemoteSearch\/Apply\/([^/]+)$/)
   if (remoteApplyMatch && method === 'POST') {
+    requireDemoAdmin(caller)
     const itemId = decodeURIComponent(remoteApplyMatch[1])
     const item = store.items.get(itemId)
     if (!item) throw new ApiError(404, '项目不存在')
@@ -3488,7 +5187,7 @@ export async function demoFetch<T>(
       }
     }
     item.Etag = `etag-${Date.now().toString(36)}`
-    pushActivity(`已将远端识别结果应用于「${item.Name}」`, 'ItemIdentified')
+    pushActivity(`已将远端识别结果应用于「${item.Name}」`, 'ItemIdentified', undefined, caller.userId)
     return undefined as T
   }
 
@@ -3496,7 +5195,7 @@ export async function demoFetch<T>(
   if (itemThemeSongsMatch && method === 'GET') {
     const itemId = decodeURIComponent(itemThemeSongsMatch[1])
     const item = store.items.get(itemId)
-    if (!item) {
+    if (!item || !canDemoUserAccessItem(caller.user, item)) {
       return { Items: [], TotalRecordCount: 0 } as T
     }
     const themeSong: BaseItemDto = {
@@ -3516,11 +5215,15 @@ export async function demoFetch<T>(
   const itemInstantMixMatch = pathname.match(/^\/emby\/Items\/([^/]+)\/InstantMix$/)
   if (itemInstantMixMatch && method === 'GET') {
     const itemId = decodeURIComponent(itemInstantMixMatch[1])
+    const qUserId = qs.get('UserId') || caller.userId
+    if (qs.get('UserId')) requireSelfOrAdmin(caller, qUserId)
+    const targetUser = resolveUserDto(qUserId, caller)
     const limit = Math.max(1, Number(qs.get('Limit') || 50))
     const seed = store.items.get(itemId)
-    const audioItems = Array.from(store.items.values()).filter(
-      (it) => it.Type === 'Audio' || it.MediaType === 'Audio',
-    )
+    const audioItems = Array.from(store.items.values())
+      .filter((it) => it.Type === 'Audio' || it.MediaType === 'Audio')
+      .filter((it) => canDemoUserAccessItem(targetUser, it))
+      .map((it) => projectItemForUser(it, qUserId))
     const ordered = [...audioItems].sort((a, b) => {
       const aSeed = a.Id === itemId ? -1 : 0
       const bSeed = b.Id === itemId ? -1 : 0
@@ -3537,11 +5240,12 @@ export async function demoFetch<T>(
 
   const itemRefreshMatch = pathname.match(/^\/emby\/Items\/([^/]+)\/Refresh$/)
   if (itemRefreshMatch && method === 'POST') {
+    requireDemoAdmin(caller)
     const itemId = decodeURIComponent(itemRefreshMatch[1])
     const item = store.items.get(itemId)
     if (!item) throw new ApiError(404, '项目不存在')
     item.Etag = `etag-${Date.now().toString(36)}`
-    pushActivity(`已刷新「${item.Name}」的元数据`, 'ItemRefreshed')
+    pushActivity(`已刷新「${item.Name}」的元数据`, 'ItemRefreshed', undefined, caller.userId)
     return undefined as T
   }
 
@@ -3581,6 +5285,7 @@ export async function demoFetch<T>(
     /^\/emby\/Items\/([^/]+)\/RemoteImages\/Download$/,
   )
   if (remoteImagesDownloadMatch && method === 'POST') {
+    requireDemoAdmin(caller)
     const itemId = decodeURIComponent(remoteImagesDownloadMatch[1])
     const item = store.items.get(itemId)
     if (!item) throw new ApiError(404, '项目不存在')
@@ -3597,12 +5302,13 @@ export async function demoFetch<T>(
       store.artById.set(itemId, { ...prevArt, poster: imageUrl })
       item.ImageTags = { ...(item.ImageTags || {}), Primary: nextTag }
     }
-    pushActivity(`已为「${item.Name}」替换远端 ${imgType} 图片`, 'ItemImageUpdated')
+    pushActivity(`已为「${item.Name}」替换远端 ${imgType} 图片`, 'ItemImageUpdated', undefined, caller.userId)
     return undefined as T
   }
 
   const remoteImagesMatch = pathname.match(/^\/emby\/Items\/([^/]+)\/RemoteImages$/)
   if (remoteImagesMatch && method === 'GET') {
+    requireDemoAdmin(caller)
     const itemId = decodeURIComponent(remoteImagesMatch[1])
     const item = store.items.get(itemId)
     if (!item) throw new ApiError(404, '项目不存在')
@@ -3611,7 +5317,6 @@ export async function demoFetch<T>(
     const images: RemoteImageInfo[] = []
     const seenUrls = new Set<string>()
 
-    // 优先放入当前项目与库内其它已验证 TMDB 高清图
     const candidateIds = [
       itemId,
       ...Array.from(store.items.values())
@@ -3675,6 +5380,7 @@ export async function demoFetch<T>(
     /^\/emby\/Items\/([^/]+)\/Images\/([^/]+)(?:\/(\d+))?\/Url$/,
   )
   if (imageByUrlMatch && method === 'POST') {
+    requireDemoAdmin(caller)
     const itemId = decodeURIComponent(imageByUrlMatch[1])
     const imgType = decodeURIComponent(imageByUrlMatch[2])
     const item = store.items.get(itemId)
@@ -3692,7 +5398,7 @@ export async function demoFetch<T>(
       store.artById.set(itemId, { ...prevArt, poster: targetUrl })
       item.ImageTags = { ...(item.ImageTags || {}), Primary: nextTag }
     }
-    pushActivity(`已通过 URL 更新「${item.Name}」的 ${imgType} 图片`, 'ItemImageUpdated')
+    pushActivity(`已通过 URL 更新「${item.Name}」的 ${imgType} 图片`, 'ItemImageUpdated', undefined, caller.userId)
     return undefined as T
   }
 
@@ -3700,6 +5406,7 @@ export async function demoFetch<T>(
     /^\/emby\/Items\/([^/]+)\/Images\/([^/]+)(?:\/(\d+))?$/,
   )
   if (itemImageDeleteMatch && method === 'DELETE') {
+    requireDemoAdmin(caller)
     const itemId = decodeURIComponent(itemImageDeleteMatch[1])
     const imgType = decodeURIComponent(itemImageDeleteMatch[2])
     const item = store.items.get(itemId)
@@ -3716,7 +5423,7 @@ export async function demoFetch<T>(
         item.ImageTags = nextTags
       }
     }
-    pushActivity(`已删除「${item.Name}」的 ${imgType} 图片`, 'ItemImageDeleted')
+    pushActivity(`已删除「${item.Name}」的 ${imgType} 图片`, 'ItemImageDeleted', undefined, caller.userId)
     return undefined as T
   }
 
@@ -3724,6 +5431,7 @@ export async function demoFetch<T>(
     /^\/emby\/Items\/([^/]+)\/Images\/([^/]+)(?:\/(\d+))?$/,
   )
   if (itemImageUploadMatch && method === 'POST') {
+    requireDemoAdmin(caller)
     const itemId = decodeURIComponent(itemImageUploadMatch[1])
     const imgType = decodeURIComponent(itemImageUploadMatch[2])
     const item = store.items.get(itemId)
@@ -3746,12 +5454,13 @@ export async function demoFetch<T>(
       store.artById.set(itemId, { ...prevArt, poster: dataUrl })
       item.ImageTags = { ...(item.ImageTags || {}), Primary: nextTag }
     }
-    pushActivity(`已上传「${item.Name}」的 ${imgType} 图片`, 'ItemImageUploaded')
+    pushActivity(`已上传「${item.Name}」的 ${imgType} 图片`, 'ItemImageUploaded', undefined, caller.userId)
     return undefined as T
   }
 
   const uploadSubtitleMatch = pathname.match(/^\/emby\/Videos\/([^/]+)\/Subtitles$/)
   if (uploadSubtitleMatch && method === 'POST') {
+    requireDemoAdmin(caller)
     const itemId = decodeURIComponent(uploadSubtitleMatch[1])
     const item = store.items.get(itemId)
     if (!item) throw new ApiError(404, '项目不存在')
@@ -3778,12 +5487,18 @@ export async function demoFetch<T>(
       })
       src.MediaStreams = streams
     }
-    pushActivity(`已为「${item.Name}」上传外挂字幕 (${format.toUpperCase()})`, 'SubtitleUploaded')
+    pushActivity(
+      `已为「${item.Name}」上传外挂字幕 (${format.toUpperCase()})`,
+      'SubtitleUploaded',
+      undefined,
+      caller.userId,
+    )
     return undefined as T
   }
 
   const deleteSubtitleMatch = pathname.match(/^\/emby\/Videos\/([^/]+)\/Subtitles\/(\d+)$/)
   if (deleteSubtitleMatch && method === 'DELETE') {
+    requireDemoAdmin(caller)
     const itemId = decodeURIComponent(deleteSubtitleMatch[1])
     const subIdx = Number(deleteSubtitleMatch[2])
     const item = store.items.get(itemId)
@@ -3795,12 +5510,13 @@ export async function demoFetch<T>(
         )
       }
     }
-    pushActivity(`已删除「${item.Name}」的外挂字幕 #${subIdx}`, 'SubtitleDeleted')
+    pushActivity(`已删除「${item.Name}」的外挂字幕 #${subIdx}`, 'SubtitleDeleted', undefined, caller.userId)
     return undefined as T
   }
 
   const splitVersionsMatch = pathname.match(/^\/emby\/Videos\/([^/]+)\/AlternateSources$/)
   if (splitVersionsMatch && method === 'DELETE') {
+    requireDemoAdmin(caller)
     const itemId = decodeURIComponent(splitVersionsMatch[1])
     const item = store.items.get(itemId)
     if (!item) throw new ApiError(404, '项目不存在')
@@ -3821,10 +5537,10 @@ export async function demoFetch<T>(
         SortName: `${item.SortName || item.Name} ${i + 1}`,
         MediaSources: [src],
         DateCreated: new Date().toISOString(),
-        UserData: item.UserData ? { ...item.UserData } : undefined,
         ImageTags: item.ImageTags ? { ...item.ImageTags } : undefined,
         BackdropImageTags: item.BackdropImageTags ? [...item.BackdropImageTags] : undefined,
       }
+      delete cloned.UserData
       store.items.set(newId, cloned)
       if (parentArt) {
         store.artById.set(newId, { ...parentArt })
@@ -3839,11 +5555,14 @@ export async function demoFetch<T>(
     pushActivity(
       `已拆分「${item.Name}」的 ${sources.length} 个多版本为独立条目`,
       'ItemVersionsSplit',
+      undefined,
+      caller.userId,
     )
     return undefined as T
   }
 
   if (pathname === '/emby/Videos/MergeVersions' && method === 'POST') {
+    requireDemoAdmin(caller)
     const ids = (qs.get('Ids') || '')
       .split(',')
       .map((s) => s.trim())
@@ -3865,14 +5584,21 @@ export async function demoFetch<T>(
           }
         }
         primary.MediaSources = mergedSources
-        pushActivity(`已将 ${ids.length} 个媒体合并为多版本「${primary.Name}」`, 'ItemVersionsMerged')
+        pushActivity(
+          `已将 ${ids.length} 个媒体合并为多版本「${primary.Name}」`,
+          'ItemVersionsMerged',
+          undefined,
+          caller.userId,
+        )
       }
     }
     return undefined as T
   }
 
+  const singleItemDeletePostMatch = pathname.match(/^\/emby\/Items\/([^/]+)\/Delete$/)
   const singleItemMutationMatch = pathname.match(/^\/emby\/Items\/([^/]+)$/)
   if (singleItemMutationMatch && method === 'POST') {
+    requireDemoAdmin(caller)
     const itemId = decodeURIComponent(singleItemMutationMatch[1])
     const item = store.items.get(itemId)
     if (!item) throw new ApiError(404, '项目不存在')
@@ -3887,10 +5613,18 @@ export async function demoFetch<T>(
     if (typeof body.SortName === 'string') {
       item.SortName = body.SortName
     }
-    if (body.ProductionYear !== undefined && body.ProductionYear !== null && body.ProductionYear !== '') {
+    if (
+      body.ProductionYear !== undefined &&
+      body.ProductionYear !== null &&
+      body.ProductionYear !== ''
+    ) {
       item.ProductionYear = Number(body.ProductionYear)
     }
-    if (body.CommunityRating !== undefined && body.CommunityRating !== null && body.CommunityRating !== '') {
+    if (
+      body.CommunityRating !== undefined &&
+      body.CommunityRating !== null &&
+      body.CommunityRating !== ''
+    ) {
       item.CommunityRating = Number(body.CommunityRating)
     }
     if (typeof body.OfficialRating === 'string') {
@@ -3914,13 +5648,27 @@ export async function demoFetch<T>(
       item.ProviderIds = nextProviders
     }
     item.Etag = `etag-${Date.now().toString(36)}`
-    pushActivity(`已更新「${item.Name}」的元数据`, 'ItemMetadataUpdated')
+    pushActivity(`已更新「${item.Name}」的元数据`, 'ItemMetadataUpdated', undefined, caller.userId)
     return undefined as T
   }
 
-  if (singleItemMutationMatch && method === 'DELETE') {
-    const itemId = decodeURIComponent(singleItemMutationMatch[1])
+  if (
+    (singleItemMutationMatch && method === 'DELETE') ||
+    (singleItemDeletePostMatch && method === 'POST')
+  ) {
+    const rawId = singleItemMutationMatch
+      ? singleItemMutationMatch[1]
+      : singleItemDeletePostMatch![1]
+    const itemId = decodeURIComponent(rawId)
     const item = store.items.get(itemId)
+    if (!caller.isAdmin) {
+      const canUserDelete =
+        Boolean(caller.user?.Policy?.EnableContentDeletion) &&
+        (!item || canDemoUserAccessItem(caller.user, item))
+      if (!canUserDelete) {
+        throw new ApiError(403, '无权删除媒体内容（需要管理员或 EnableContentDeletion 权限）')
+      }
+    }
     if (item) {
       store.items.delete(itemId)
       store.artById.delete(itemId)
@@ -3941,13 +5689,14 @@ export async function demoFetch<T>(
           libIds.filter((id) => id !== itemId),
         )
       }
-      pushActivity(`已删除媒体「${item.Name}」`, 'ItemDeleted')
+      pushActivity(`已删除媒体「${item.Name}」`, 'ItemDeleted', undefined, caller.userId)
     }
     return undefined as T
   }
 
   // ==================== 14.5 数据库备份与恢复 (BackupRestore) ====================
   if (pathname === '/emby/BackupRestore/BackupInfo' && method === 'GET') {
+    requireDemoAdmin(caller)
     const res: BackupInfoResponse = {
       BackupDirectory: '/data/backups',
       Backups: demoBackups.map((b) => ({ ...b })),
@@ -3956,6 +5705,7 @@ export async function demoFetch<T>(
   }
 
   if (pathname === '/emby/BackupRestore/Backup' && method === 'POST') {
+    requireDemoAdmin(caller)
     const now = new Date()
     const pad = (n: number) => String(n).padStart(2, '0')
     const stamp = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}-${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}`
@@ -3967,17 +5717,18 @@ export async function demoFetch<T>(
       DateCreated: now.toISOString(),
     }
     demoBackups.unshift(created)
-    pushActivity(`已创建数据库热备份「${name}」`, 'BackupCreated')
+    pushActivity(`已创建数据库热备份「${name}」`, 'BackupCreated', undefined, caller.userId)
     return { ...created } as T
   }
 
   if (pathname === '/emby/BackupRestore/Restore' && method === 'POST') {
+    requireDemoAdmin(caller)
     const body = parseJsonBody(options)
     const name = String(body.Name || '').trim()
     if (!name) throw new ApiError(400, '请指定要恢复的备份文件名')
     const exists = demoBackups.find((b) => b.Name === name)
     if (!exists) throw new ApiError(404, `备份文件「${name}」不存在`)
-    pushActivity(`已暂存数据库备份恢复「${name}」（重启后生效）`, 'BackupRestoreStaged')
+    pushActivity(`已暂存数据库备份恢复「${name}」（重启后生效）`, 'BackupRestoreStaged', undefined, caller.userId)
     const res: BackupRestoreResult = {
       Restored: true,
       BackupName: name,
@@ -3989,6 +5740,7 @@ export async function demoFetch<T>(
 
   // ==================== 14.6 应用内通知中心 (Notifications) ====================
   if (pathname === '/emby/Notifications/Admin' && method === 'POST') {
+    requireDemoAdmin(caller)
     const body = parseJsonBody(options)
     const name = String(body.Name || '').trim()
     if (!name) {
@@ -4014,7 +5766,7 @@ export async function demoFetch<T>(
       readByUsers: new Set(),
     }
     demoNotifications.unshift(record)
-    pushActivity(`管理员发送了系统通知「${name}」`, 'NotificationSent', description, auth?.userId)
+    pushActivity(`管理员发送了系统通知「${name}」`, 'NotificationSent', description, caller.userId)
 
     const item: NotificationItem = {
       Id: record.Id,
@@ -4032,6 +5784,7 @@ export async function demoFetch<T>(
   const notifSummaryMatch = pathname.match(/^\/emby\/Notifications\/([^/]+)\/Summary$/)
   if (notifSummaryMatch && method === 'GET') {
     const userId = decodeURIComponent(notifSummaryMatch[1])
+    requireSelfOrAdmin(caller, userId)
     const visible = demoNotifications.filter((n) => !n.UserId || n.UserId === userId)
     const unread = visible.filter((n) => !n.defaultRead && !n.readByUsers.has(userId))
     let maxLevel: 'Normal' | 'Warning' | 'Error' = 'Normal'
@@ -4050,6 +5803,7 @@ export async function demoFetch<T>(
   const notifReadMatch = pathname.match(/^\/emby\/Notifications\/([^/]+)\/Read$/)
   if (notifReadMatch && method === 'POST') {
     const userId = decodeURIComponent(notifReadMatch[1])
+    requireSelfOrAdmin(caller, userId)
     const body = parseJsonBody(options)
     const qsIds = (qs.get('Ids') || '')
       .split(',')
@@ -4072,6 +5826,7 @@ export async function demoFetch<T>(
   const notifListMatch = pathname.match(/^\/emby\/Notifications\/([^/]+)$/)
   if (notifListMatch && method === 'GET') {
     const userId = decodeURIComponent(notifListMatch[1])
+    requireSelfOrAdmin(caller, userId)
     const startIndex = Math.max(0, Number(qs.get('StartIndex') || '0') || 0)
     const limit = Math.max(1, Number(qs.get('Limit') || '20') || 20)
     const visible = demoNotifications.filter((n) => !n.UserId || n.UserId === userId)
@@ -4094,10 +5849,13 @@ export async function demoFetch<T>(
 
   // ==================== 14.7 Quick Connect 设备授权码登录 ====================
   if (pathname === '/emby/QuickConnect/Enabled' && method === 'GET') {
-    return true as T
+    return (demoServerConfig.EnableQuickConnect !== false) as T
   }
 
   if (pathname === '/emby/QuickConnect/Initiate' && method === 'POST') {
+    if (demoServerConfig.EnableQuickConnect === false) {
+      throw new ApiError(403, 'Quick Connect 已在服务器设置中禁用')
+    }
     const code = String(Math.floor(100000 + Math.random() * 900000))
     const secret = `qc-demo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
     const session: DemoQuickConnectSession = {
@@ -4107,7 +5865,7 @@ export async function demoFetch<T>(
       DeviceId: 'dev-demo-web-01',
       DeviceName: 'Ambra Web Demo',
       AppName: 'Ambra Web',
-      AppVersion: '0.10.9',
+      AppVersion: '0.11.0',
       DateAdded: new Date().toISOString(),
     }
     demoQuickConnectSessions.set(secret, session)
@@ -4124,7 +5882,7 @@ export async function demoFetch<T>(
     const demoApprove = qs.get('demoApprove')
     if (demoApprove === '1' || demoApprove === 'true') {
       session.Authenticated = true
-      session.AuthorizedUserId = auth?.userId || store.users[0]?.user.Id || 'user-demo-admin'
+      session.AuthorizedUserId = caller.userId || store.users[0]?.user.Id || 'user-demo-admin'
     }
     const { AuthorizedUserId: _ignored, ...pub } = session
     return pub as T
@@ -4147,12 +5905,12 @@ export async function demoFetch<T>(
     }
     if (matched) {
       matched.Authenticated = true
-      matched.AuthorizedUserId = auth?.userId || store.users[0]?.user.Id || 'user-demo-admin'
+      matched.AuthorizedUserId = caller.userId || store.users[0]?.user.Id || 'user-demo-admin'
       pushActivity(
         `已通过 Quick Connect 授权新设备登录（授权码 ${code}）`,
         'QuickConnectAuthorized',
         undefined,
-        auth?.userId,
+        caller.userId,
       )
       return true as T
     }
@@ -4161,7 +5919,7 @@ export async function demoFetch<T>(
         '已通过 Quick Connect 授权演示设备登录（授权码 123456）',
         'QuickConnectAuthorized',
         undefined,
-        auth?.userId,
+        caller.userId,
       )
       return true as T
     }
@@ -4187,6 +5945,7 @@ export async function demoFetch<T>(
     rec.user.LastLoginDate = now
     rec.user.LastActivityDate = now
     const token = `demo_tok_qc_${rec.user.Id}_${Date.now().toString(36)}`
+    demoTokenUserMap.set(token, rec.user.Id)
     pushActivity(
       `${rec.user.Name} 通过 Quick Connect 登录了 Ambra Serverless Demo`,
       'AuthenticationSucceeded',
@@ -4210,15 +5969,18 @@ export async function demoFetch<T>(
   if (singleUserMatch) {
     const userId = decodeURIComponent(singleUserMatch[1])
     if (method === 'GET') {
+      requireSelfOrAdmin(caller, userId)
       const rec = store.users.find((u) => u.user.Id === userId)
       if (!rec) throw new ApiError(404, '用户不存在')
       return { ...rec.user, Policy: { ...rec.user.Policy } } as T
     }
     if (method === 'DELETE') {
+      requireDemoAdmin(caller)
       const idx = store.users.findIndex((u) => u.user.Id === userId)
       if (idx >= 0) {
         const [removed] = store.users.splice(idx, 1)
-        pushActivity(`已删除用户「${removed.user.Name}」`, 'UserDeleted')
+        store.userDataByUser.delete(userId)
+        pushActivity(`已删除用户「${removed.user.Name}」`, 'UserDeleted', undefined, caller.userId)
       }
       return undefined as T
     }

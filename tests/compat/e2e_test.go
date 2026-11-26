@@ -316,6 +316,7 @@ func TestAmbraEndToEndEmbyCompatibility(t *testing.T) {
 	}
 
 	// 14. Phase 4-6 endpoints: LiveTV, Sync, Notifications, Startup, Webhooks, BackupRestore, OpenAPI, Parties, DLNA
+	cfg.Update(func(c *config.Config) { c.EnableDLNA = true })
 	for _, ep := range []string{
 		"/emby/LiveTv/Info",
 		"/emby/Sync/Targets",
@@ -335,9 +336,21 @@ func TestAmbraEndToEndEmbyCompatibility(t *testing.T) {
 		}
 	}
 
-	// UPnP SUBSCRIBE verb on DLNA events
+	// UPnP SUBSCRIBE verb on DLNA events (loopback callback blocked for SSRF defense -> 412; LAN callback -> 200 + SID)
+	loopbackSubReq, _ := http.NewRequest("SUBSCRIBE", ts.URL+"/Dlna/"+cfg.ServerID+"/contentdirectory/events", nil)
+	loopbackSubReq.Header.Set("CALLBACK", "<http://127.0.0.1:9999/notify>")
+	loopbackSubReq.Header.Set("NT", "upnp:event")
+	resp, err = client.Do(loopbackSubReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("expected 412 on loopback DLNA SUBSCRIBE callback, got status=%d", resp.StatusCode)
+	}
+
 	subReq, _ := http.NewRequest("SUBSCRIBE", ts.URL+"/Dlna/"+cfg.ServerID+"/contentdirectory/events", nil)
-	subReq.Header.Set("CALLBACK", "<http://127.0.0.1:9999/notify>")
+	subReq.Header.Set("CALLBACK", "<http://192.168.1.99:9999/notify>")
 	subReq.Header.Set("NT", "upnp:event")
 	resp, err = client.Do(subReq)
 	if err != nil {

@@ -3,6 +3,7 @@ package compatcore
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -10,7 +11,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -138,7 +141,22 @@ func appendRateBucketLocked(bucket map[string][]time.Time, key string, now time.
 	bucket[key] = append(bucket[key], now)
 }
 
+func generateSixDigitPin() string {
+	n, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
+	if err != nil {
+		var b [4]byte
+		_, _ = rand.Read(b[:])
+		v := (int(b[0])<<24 | int(b[1])<<16 | int(b[2])<<8 | int(b[3])) & 0x7fffffff
+		return fmt.Sprintf("%06d", v%1_000_000)
+	}
+	return fmt.Sprintf("%06d", n.Int64())
+}
+
 func (h *Handler) forgotPassword(w http.ResponseWriter, r *http.Request) {
+	if !netutil.IsLocalOrLANRequest(r) {
+		writeJSONError(w, r, http.StatusForbidden, "password reset is only available on the local network")
+		return
+	}
 	now := time.Now().UTC()
 	ip := forgotClientIP(r)
 
@@ -162,9 +180,7 @@ func (h *Handler) forgotPassword(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = decodeOptionalJSON(r, &body)
 
-	pinBytes := make([]byte, 3)
-	_, _ = rand.Read(pinBytes)
-	pin := strings.ToUpper(hex.EncodeToString(pinBytes))
+	pin := generateSixDigitPin()
 	expiresAt := now.Add(30 * time.Minute)
 
 	uid := ""
@@ -188,7 +204,7 @@ func (h *Handler) forgotPassword(w http.ResponseWriter, r *http.Request) {
 	var expiredFiles []string
 	h.mu.Lock()
 	for k, existing := range h.forgotPins {
-		if !now.Before(existing.ExpiresAt) {
+		if !now.Before(existing.ExpiresAt) || (uid != "" && existing.UserID == uid) {
 			if existing.PinFile != "" {
 				expiredFiles = append(expiredFiles, existing.PinFile)
 			}
@@ -196,6 +212,12 @@ func (h *Handler) forgotPassword(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if uid != "" {
+		for {
+			if _, collision := h.forgotPins[pin]; !collision {
+				break
+			}
+			pin = generateSixDigitPin()
+		}
 		if len(h.forgotPins) >= forgotPinsMaxEntries {
 			var oldestKey string
 			var oldestExp time.Time
@@ -256,6 +278,10 @@ func (h *Handler) checkIPRateLimit(bucket map[string][]time.Time, ip string, now
 }
 
 func (h *Handler) forgotPasswordPin(w http.ResponseWriter, r *http.Request) {
+	if !netutil.IsLocalOrLANRequest(r) {
+		writeJSONError(w, r, http.StatusForbidden, "password reset is only available on the local network")
+		return
+	}
 	now := time.Now().UTC()
 	ip := forgotClientIP(r)
 
@@ -274,7 +300,7 @@ func (h *Handler) forgotPasswordPin(w http.ResponseWriter, r *http.Request) {
 		Pin string `json:"Pin"`
 	}
 	_ = decodeOptionalJSON(r, &body)
-	pin := strings.ToUpper(strings.TrimSpace(body.Pin))
+	pin := strings.TrimSpace(body.Pin)
 
 	var (
 		matched      *forgotPinEntry
@@ -282,7 +308,7 @@ func (h *Handler) forgotPasswordPin(w http.ResponseWriter, r *http.Request) {
 	)
 
 	h.mu.Lock()
-	// Prune expired entries first.
+	// Prune expired entries first (each PIN entry is isolated to its own expiry window).
 	for k, e := range h.forgotPins {
 		if !now.Before(e.ExpiresAt) {
 			if e.PinFile != "" {
@@ -292,27 +318,15 @@ func (h *Handler) forgotPasswordPin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if pin != "" {
-		if entry, ok := h.forgotPins[pin]; ok && entry.UserID != "" {
-			cp := entry
-			matched = &cp
-			delete(h.forgotPins, pin)
-			if entry.PinFile != "" {
-				filesToClean = append(filesToClean, entry.PinFile)
-			}
-		}
-	}
-	if matched == nil {
-		// Increment global per-PIN attempt counter regardless of client IP;
-		// destroy any active PIN immediately once it accumulates 5 failed guesses.
-		for k, e := range h.forgotPins {
-			e.Attempts++
-			if e.Attempts >= forgotPinMaxAttempts {
-				if e.PinFile != "" {
-					filesToClean = append(filesToClean, e.PinFile)
-				}
+		for k, entry := range h.forgotPins {
+			if entry.UserID != "" && len(pin) == len(k) && subtle.ConstantTimeCompare([]byte(pin), []byte(k)) == 1 {
+				cp := entry
+				matched = &cp
 				delete(h.forgotPins, k)
-			} else {
-				h.forgotPins[k] = e
+				if entry.PinFile != "" {
+					filesToClean = append(filesToClean, entry.PinFile)
+				}
+				break
 			}
 		}
 	}
@@ -365,37 +379,97 @@ func verifyUserPassword(u *sqlite.UserRecord, pw, legacySHA1 string) bool {
 	return err == nil && ok
 }
 
+func isLoopbackIPString(raw string) bool {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return false
+	}
+	addr, err := netip.ParseAddr(s)
+	if err != nil {
+		return false
+	}
+	return addr.WithZone("").Unmap().IsLoopback()
+}
+
+func normalizeAuthByIDRateKey(ip, uid string) string {
+	normIP := strings.TrimSpace(ip)
+	if addr, err := netip.ParseAddr(normIP); err == nil {
+		addr = addr.WithZone("").Unmap()
+		if addr.Is6() {
+			normIP = netip.PrefixFrom(addr, 64).Masked().String()
+		} else {
+			normIP = addr.String()
+		}
+	}
+	normUID := strings.ToLower(strings.TrimSpace(uid))
+	if normUID == "" {
+		return normIP
+	}
+	return normIP + "|" + normUID
+}
+
+func (h *Handler) isAuthByIDRateLimited(ip, uid string, now time.Time) bool {
+	ip = strings.TrimSpace(ip)
+	if ip == "" || isLoopbackIPString(ip) {
+		return false
+	}
+	compKey := normalizeAuthByIDRateKey(ip, uid)
+	ipKey := normalizeAuthByIDRateKey(ip, "")
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.authByIDRates == nil {
+		return false
+	}
+	pruneRateBucketLocked(h.authByIDRates, now.Add(-authByIDRateWindow), maxRateLimitBuckets)
+	if len(h.authByIDRates[compKey]) >= authByIDRateLimit {
+		return true
+	}
+	if uid != "" && len(h.authByIDRates[ipKey]) >= authByIDRateLimit {
+		return true
+	}
+	return false
+}
+
+func (h *Handler) recordAuthByIDFailure(ip, uid string, now time.Time) {
+	ip = strings.TrimSpace(ip)
+	if ip == "" || isLoopbackIPString(ip) {
+		return
+	}
+	compKey := normalizeAuthByIDRateKey(ip, uid)
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.authByIDRates == nil {
+		h.authByIDRates = make(map[string][]time.Time)
+	}
+	pruneRateBucketLocked(h.authByIDRates, now.Add(-authByIDRateWindow), maxRateLimitBuckets)
+	appendRateBucketLocked(h.authByIDRates, compKey, now, maxRateLimitBuckets)
+}
+
+func (h *Handler) isGlobalRemoteAccessEnabled() bool {
+	if h.cfg != nil {
+		return h.cfg.Snapshot().IsGlobalRemoteAccessEnabled()
+	}
+	if h.authSvc != nil && h.authSvc.Config() != nil {
+		return h.authSvc.Config().Snapshot().IsGlobalRemoteAccessEnabled()
+	}
+	return true
+}
+
 func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "private, no-store")
 	now := time.Now().UTC()
 	ip := netutil.ClientIP(r)
 	uid := h.resolveUserID(r, "Id")
 
-	h.mu.Lock()
-	if h.authByIDRates == nil {
-		h.authByIDRates = make(map[string][]time.Time)
-	}
-	if h.authByIDUserRates == nil {
-		h.authByIDUserRates = make(map[string][]time.Time)
-	}
-	cutoff := now.Add(-authByIDRateWindow)
-	pruneRateBucketLocked(h.authByIDRates, cutoff, maxRateLimitBuckets)
-	pruneRateBucketLocked(h.authByIDUserRates, cutoff, maxRateLimitBuckets)
-	if (ip != "" && len(h.authByIDRates[ip]) >= authByIDRateLimit) ||
-		(uid != "" && len(h.authByIDUserRates[uid]) >= authByIDRateLimit) {
-		h.mu.Unlock()
+	if h.isAuthByIDRateLimited(ip, uid, now) {
 		httpx.Error(w, http.StatusTooManyRequests, "too many authentication attempts")
 		return
 	}
-	if ip != "" {
-		appendRateBucketLocked(h.authByIDRates, ip, now, maxRateLimitBuckets)
-	}
-	if uid != "" {
-		appendRateBucketLocked(h.authByIDUserRates, uid, now, maxRateLimitBuckets)
-	}
-	h.mu.Unlock()
 
 	if h.userRepo == nil || uid == "" {
+		h.recordAuthByIDFailure(ip, uid, now)
 		writeJSONError(w, r, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
@@ -403,16 +477,19 @@ func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 		Pw       string `json:"Pw"`
 		Password string `json:"Password"`
 	}
-	if err := decodeOptionalJSON(r, &body); err != nil {
+	if err := decodeOptionalJSONLimit(r, &body, maxKVJSONBodyBytes); err != nil {
+		h.recordAuthByIDFailure(ip, uid, now)
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	u, err := h.userRepo.GetUserByID(r.Context(), uid)
 	if err != nil {
+		h.recordAuthByIDFailure(ip, uid, now)
 		writeJSONError(w, r, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
 
+	globalRemoteAllowed := h.isGlobalRemoteAccessEnabled()
 	client := middleware.ExtractClientInfo(r)
 	if h.authSvc != nil {
 		pw := body.Pw
@@ -420,8 +497,9 @@ func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 		if pw == "" && body.Password != "" && u.PasswordHash != "" {
 			pw = body.Password
 		}
-		if !u.Policy.EnableRemoteAccess && !netutil.IsLocalOrLANRequest(r) {
+		if (!globalRemoteAllowed || !u.Policy.EnableRemoteAccess) && !netutil.IsLocalOrLANRequest(r) {
 			if !verifyUserPassword(u, pw, legacySHA1) {
+				h.recordAuthByIDFailure(ip, uid, now)
 				_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
 					Name:     u.Name + " failed to log in",
 					Type:     "AuthenticationFailed",
@@ -447,13 +525,18 @@ func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 				UserID:   u.ID,
 				Severity: "Warning",
 			})
-			writeJSONError(w, r, http.StatusForbidden, "Remote access is disabled for this user")
+			if !globalRemoteAllowed {
+				writeJSONError(w, r, http.StatusForbidden, "Remote access is disabled on this server")
+			} else {
+				writeJSONError(w, r, http.StatusForbidden, "Remote access is disabled for this user")
+			}
 			return
 		}
 		res, authErr := h.authSvc.AuthenticateByName(r.Context(), u.Name, pw, legacySHA1, client)
 		if authErr != nil {
 			switch {
 			case errors.Is(authErr, auth.ErrInvalidCredentials):
+				h.recordAuthByIDFailure(ip, uid, now)
 				_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
 					Name:     u.Name + " failed to log in",
 					Type:     "AuthenticationFailed",
@@ -497,6 +580,7 @@ func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 		pw = body.Password
 	}
 	if !verifyUserPassword(u, pw, legacySHA1) {
+		h.recordAuthByIDFailure(ip, uid, now)
 		writeJSONError(w, r, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
@@ -504,8 +588,12 @@ func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, r, http.StatusForbidden, "user is disabled")
 		return
 	}
-	if !u.Policy.EnableRemoteAccess && !netutil.IsLocalOrLANRequest(r) {
-		writeJSONError(w, r, http.StatusForbidden, "Remote access is disabled for this user")
+	if (!globalRemoteAllowed || !u.Policy.EnableRemoteAccess) && !netutil.IsLocalOrLANRequest(r) {
+		if !globalRemoteAllowed {
+			writeJSONError(w, r, http.StatusForbidden, "Remote access is disabled on this server")
+		} else {
+			writeJSONError(w, r, http.StatusForbidden, "Remote access is disabled for this user")
+		}
 		return
 	}
 
@@ -716,6 +804,18 @@ func (h *Handler) getUserPrefixes(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, out)
 }
 
+func (h *Handler) disconnectUserWS(userID string) {
+	norm := guid.Normalize(userID)
+	if norm == "" {
+		return
+	}
+	if wsHub := h.getWSHub(); wsHub != nil {
+		if disc, ok := wsHub.(interface{ DisconnectUser(string) }); ok {
+			disc.DisconnectUser(norm)
+		}
+	}
+}
+
 func (h *Handler) disconnectUserSessions(userID string) {
 	norm := guid.Normalize(userID)
 	if norm == "" {
@@ -724,10 +824,68 @@ func (h *Handler) disconnectUserSessions(userID string) {
 	if h.sessions != nil {
 		h.sessions.RemoveSessionsByUser(norm)
 	}
-	if h.wsHub != nil {
-		if disc, ok := h.wsHub.(interface{ DisconnectUser(string) }); ok {
-			disc.DisconnectUser(norm)
+	h.disconnectUserWS(norm)
+}
+
+func hasRemovedFolder(oldFolders, newFolders []string) bool {
+	if len(oldFolders) == 0 {
+		return false
+	}
+	newSet := make(map[string]struct{}, len(newFolders))
+	for _, f := range newFolders {
+		if norm := guid.Normalize(f); norm != "" {
+			newSet[norm] = struct{}{}
 		}
+	}
+	for _, f := range oldFolders {
+		norm := guid.Normalize(f)
+		if norm == "" {
+			continue
+		}
+		if _, ok := newSet[norm]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
+func policyRequiresWSDisconnect(oldPol dto.UserPolicy, wasAdmin bool, newPol dto.UserPolicy) bool {
+	if newPol.IsDisabled {
+		return true
+	}
+	if wasAdmin && !newPol.IsAdministrator {
+		return true
+	}
+	if oldPol.EnableRemoteAccess && !newPol.EnableRemoteAccess {
+		return true
+	}
+	if oldPol.EnableLiveTvAccess && !newPol.EnableLiveTvAccess {
+		return true
+	}
+	if oldPol.EnableAllFolders && !newPol.EnableAllFolders {
+		return true
+	}
+	if !oldPol.EnableAllFolders && !newPol.EnableAllFolders && hasRemovedFolder(oldPol.EnabledFolders, newPol.EnabledFolders) {
+		return true
+	}
+	return false
+}
+
+func (h *Handler) removeUserDiskArtifacts(userID string) {
+	if h.cfg == nil {
+		return
+	}
+	dataDir := strings.TrimSpace(h.cfg.Snapshot().DataDir)
+	safeUID := sanitizeFilename(guid.Normalize(userID))
+	if dataDir == "" || safeUID == "" || safeUID == "default" {
+		return
+	}
+	for _, rel := range []string{
+		filepath.Join("metadata", "users", safeUID),
+		filepath.Join("users", safeUID),
+		filepath.Join("camera-uploads", safeUID),
+	} {
+		_ = os.RemoveAll(filepath.Join(dataDir, rel))
 	}
 }
 
@@ -775,6 +933,10 @@ func (h *Handler) updateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.Name != "" {
+		if auth.ContainsControlChar(body.Name) {
+			httpx.Error(w, http.StatusBadRequest, "username must not contain control characters")
+			return
+		}
 		trimmedName := strings.TrimSpace(body.Name)
 		if trimmedName == "" || len([]rune(trimmedName)) > 64 {
 			httpx.Error(w, http.StatusBadRequest, "invalid username")
@@ -794,6 +956,9 @@ func (h *Handler) updateUser(w http.ResponseWriter, r *http.Request) {
 					httpx.Error(w, http.StatusInternalServerError, "failed to update user name")
 					return
 				}
+			}
+			if h.sessions != nil {
+				h.sessions.UpdateUserName(u.ID, trimmedName)
 			}
 		}
 	}
@@ -821,6 +986,8 @@ func (h *Handler) updateUser(w http.ResponseWriter, r *http.Request) {
 			h.revokeAndDisconnectUser(r.Context(), u.ID)
 		} else if wasAdmin && !body.Policy.IsAdministrator {
 			h.disconnectUserSessions(u.ID)
+		} else if policyRequiresWSDisconnect(u.Policy, wasAdmin, *body.Policy) {
+			h.disconnectUserWS(u.ID)
 		}
 	}
 	if h.authSvc != nil {
@@ -852,6 +1019,13 @@ func (h *Handler) deleteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.revokeAndDisconnectUser(r.Context(), uid)
+	h.removeUserDiskArtifacts(uid)
+	h.mu.RLock()
+	onDeleted := h.onUserDeleted
+	h.mu.RUnlock()
+	if onDeleted != nil {
+		onDeleted(r.Context(), uid)
+	}
 	httpx.NoContent(w)
 }
 
@@ -947,8 +1121,10 @@ func (h *Handler) copyUserData(w http.ResponseWriter, r *http.Request) {
 				}
 				if copyPolicy {
 					wasAdmin := false
+					var oldPol dto.UserPolicy
 					if existing, getErr := h.userRepo.GetUserByID(r.Context(), tid); getErr == nil && existing != nil {
 						wasAdmin = existing.IsAdmin || existing.Policy.IsAdministrator
+						oldPol = existing.Policy
 					}
 					if err := h.userRepo.UpdateUserPolicySafe(r.Context(), tid, src.Policy); err != nil {
 						if errors.Is(err, sqlite.ErrLastAdmin) {
@@ -964,6 +1140,8 @@ func (h *Handler) copyUserData(w http.ResponseWriter, r *http.Request) {
 							h.revokeAndDisconnectUser(r.Context(), tid)
 						} else if wasAdmin && !src.Policy.IsAdministrator {
 							h.disconnectUserSessions(tid)
+						} else if policyRequiresWSDisconnect(oldPol, wasAdmin, src.Policy) {
+							h.disconnectUserWS(tid)
 						}
 					}
 				}
@@ -1971,6 +2149,30 @@ func userItemDataWithLikes(ud dto.UserItemDataDto, likes *bool) map[string]any {
 	return out
 }
 
+func userItemDataDtoFromRecord(rec *sqlite.UserItemDataRecord, fallbackKey string) dto.UserItemDataDto {
+	if rec == nil {
+		return dto.UserItemDataDto{Key: fallbackKey}
+	}
+	var lastPlayed *time.Time
+	if rec.LastPlayedDate != nil {
+		t := time.Unix(*rec.LastPlayedDate, 0).UTC()
+		lastPlayed = &t
+	}
+	key := rec.ItemID
+	if key == "" {
+		key = fallbackKey
+	}
+	return dto.UserItemDataDto{
+		PlaybackPositionTicks: rec.PlaybackPositionTicks,
+		PlayCount:             rec.PlayCount,
+		IsFavorite:            rec.IsFavorite,
+		LastPlayedDate:        lastPlayed,
+		Played:                rec.Played,
+		Key:                   key,
+		Likes:                 rec.Likes,
+	}
+}
+
 func (h *Handler) postUserItemRating(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
 	if !h.canModifyUser(r, uid) {
@@ -1988,8 +2190,22 @@ func (h *Handler) postUserItemRating(w http.ResponseWriter, r *http.Request) {
 	if likes != nil {
 		val = *likes
 	}
-	_ = h.saveKV(r.Context(), fmt.Sprintf("user_rating:%s:%s", uid, itemID), map[string]any{"Likes": val})
 
+	if h.userRepo != nil && uid != "" && itemID != "" {
+		rec, err := h.userRepo.SetUserItemLikes(r.Context(), uid, itemID, &val)
+		if errors.Is(err, sqlite.ErrNotFound) {
+			writeJSONError(w, r, http.StatusNotFound, "item not found")
+			return
+		}
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to update item rating")
+			return
+		}
+		httpx.JSON(w, http.StatusOK, userItemDataDtoFromRecord(rec, itemID))
+		return
+	}
+
+	_ = h.saveKV(r.Context(), fmt.Sprintf("user_rating:%s:%s", uid, itemID), map[string]any{"Likes": val})
 	ud := dto.UserItemDataDto{Key: itemID}
 	if h.libRepo != nil && uid != "" && itemID != "" {
 		if existing, err := h.libRepo.GetUserItemData(r.Context(), uid, itemID); err == nil && existing != nil {
@@ -2010,8 +2226,23 @@ func (h *Handler) deleteUserItemRating(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, r, http.StatusForbidden, "access denied")
 		return
 	}
-	_ = h.deleteKV(r.Context(), fmt.Sprintf("user_rating:%s:%s", uid, itemID))
 
+	if h.userRepo != nil && uid != "" && itemID != "" {
+		rec, err := h.userRepo.SetUserItemLikes(r.Context(), uid, itemID, nil)
+		if errors.Is(err, sqlite.ErrNotFound) {
+			writeJSONError(w, r, http.StatusNotFound, "item not found")
+			return
+		}
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to delete item rating")
+			return
+		}
+		_ = h.deleteKV(r.Context(), fmt.Sprintf("user_rating:%s:%s", uid, itemID))
+		httpx.JSON(w, http.StatusOK, userItemDataDtoFromRecord(rec, itemID))
+		return
+	}
+
+	_ = h.deleteKV(r.Context(), fmt.Sprintf("user_rating:%s:%s", uid, itemID))
 	ud := dto.UserItemDataDto{Key: itemID}
 	if h.libRepo != nil && uid != "" && itemID != "" {
 		if existing, err := h.libRepo.GetUserItemData(r.Context(), uid, itemID); err == nil && existing != nil {
@@ -2265,8 +2496,43 @@ func isSafeRasterImageType(ct string) bool {
 	}
 }
 
+func (h *Handler) isRequestAuthenticated(r *http.Request) bool {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		return true
+	}
+	if h.auth.UserIDFromCtx != nil && strings.TrimSpace(h.auth.UserIDFromCtx(r.Context())) != "" {
+		return true
+	}
+	if tok := strings.TrimSpace(middleware.ExtractClientInfo(r).Token); tok != "" {
+		if h.authSvc != nil {
+			if _, err := h.authSvc.ValidateToken(r.Context(), tok); err == nil {
+				return true
+			}
+		} else if h.userRepo != nil {
+			if _, err := h.userRepo.GetAccessToken(r.Context(), tok); err == nil {
+				return true
+			}
+			if _, err := h.userRepo.GetAPIKey(r.Context(), tok); err == nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (h *Handler) serveUserImage(w http.ResponseWriter, r *http.Request, headOnly bool) {
 	uid := h.resolveUserID(r, "Id")
+	if !h.isRequestAuthenticated(r) && h.userRepo != nil {
+		if uid == "" {
+			writeJSONError(w, r, http.StatusNotFound, "user image not found")
+			return
+		}
+		u, err := h.userRepo.GetUserByID(r.Context(), uid)
+		if err != nil || u == nil || u.IsDisabled || u.Policy.IsDisabled || u.Policy.IsHidden {
+			writeJSONError(w, r, http.StatusNotFound, "user image not found")
+			return
+		}
+	}
 	imgType := chi.URLParam(r, "Type")
 	idx := chi.URLParam(r, "Index")
 	p := h.userImagePath(uid, imgType, idx)
@@ -2421,8 +2687,8 @@ func (h *Handler) postUserConnectLink(w http.ResponseWriter, r *http.Request) {
 		"LinkedAt":        time.Now().UTC().Format(time.RFC3339),
 	})
 	httpx.JSON(w, http.StatusOK, map[string]any{
-		"GuestDisplayName": connectUser,
-		"IsPending":        false,
+		"GuestDisplayName":    connectUser,
+		"IsPending":           false,
 		"IsNewUserInvitation": false,
 	})
 }

@@ -505,7 +505,7 @@ func isPathContainedInRealRoot(realRoot, target string) bool {
 	if err != nil {
 		return false
 	}
-	return rel == "." || (!strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel))
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel))
 }
 
 func isWithinAnyRoot(roots []string, target string) bool {

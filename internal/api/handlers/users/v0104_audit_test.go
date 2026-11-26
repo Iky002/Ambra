@@ -199,27 +199,31 @@ func TestUsersV0104SecurityRemediations(t *testing.T) {
 		t.Fatal("expected admin's session on shared-dev to remain intact")
 	}
 
-	// 6. Login rate limiter enforces per-username limit across distributed IPs
-	for i := 0; i < authByNameUserRateLimit; i++ {
-		ip := "203.0.113." + string(rune('1'+(i%9))) + "0:1234"
-		if i >= 9 {
-			ip = "198.51.100." + string(rune('1'+(i%9))) + "1:1234"
-		}
-		if i >= 18 {
-			ip = "192.0.2." + string(rune('1'+(i%9))) + "2:1234"
-		}
-		if i >= 27 {
-			ip = "203.0.113." + string(rune('1'+(i%9))) + "9:1234"
-		}
-		rec = doReq("", http.MethodPost, "/Users/AuthenticateByName", `{"Username":"TargetUser","Pw":"bad"}`, ip)
+	// 6. [M-03] Login rate limiter uses composite (ClientIP, NormalizedUser) on failed attempts only,
+	// with loopback exemption so external traffic cannot lock out local administrator logins.
+	attackerIP := "203.0.113.200:1234"
+	for i := 0; i < authByNameRateLimit; i++ {
+		rec = doReq("", http.MethodPost, "/Users/AuthenticateByName", `{"Username":"admin","Pw":"bad"}`, attackerIP)
 		if rec.Code != http.StatusUnauthorized {
-			t.Fatalf("distributed username attempt %d expected 401, got %d", i+1, rec.Code)
+			t.Fatalf("attacker attempt %d expected 401, got %d", i+1, rec.Code)
 		}
 	}
-	// Next attempt for same username (different casing & brand new IP) MUST hit 429
-	rec = doReq("", http.MethodPost, "/Users/AuthenticateByName", `{"Username":"  targetuser  ","Pw":"bad"}`, "198.51.100.250:9999")
+	// Next attempt for same (attackerIP, normalizedUser) MUST hit 429
+	rec = doReq("", http.MethodPost, "/Users/AuthenticateByName", `{"Username":"  ADMIN  ","Pw":"bad"}`, attackerIP)
 	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("expected 429 for distributed brute-force against same username, got %d", rec.Code)
+		t.Fatalf("expected 429 for repeated failed attempts on (ClientIP, NormalizedUser), got %d", rec.Code)
+	}
+	// Meanwhile, local loopback admin login MUST NOT be locked out by the external attacker!
+	rec = doReq("", http.MethodPost, "/Users/AuthenticateByName", `{"Username":"admin","Pw":"adminpass123"}`, "127.0.0.1:9999")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected loopback admin login to remain unaffected (200), got %d (%s)", rec.Code, rec.Body.String())
+	}
+	// Legitimate external login from a different IP also succeeds and does not accumulate failure counters
+	for i := 0; i < 5; i++ {
+		rec = doReq("", http.MethodPost, "/Users/AuthenticateByName", `{"Username":"admin","Pw":"adminpass123"}`, "198.51.100.250:9999")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected valid login from clean IP to succeed, got %d", rec.Code)
+		}
 	}
 
 	// 7. [H-03] DeleteUserSafe protects last active admin via API key

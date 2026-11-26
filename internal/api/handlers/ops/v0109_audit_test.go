@@ -83,27 +83,73 @@ func TestOpsV0109AuditH12M23M28L15L16(t *testing.T) {
 	if recWh.Code != http.StatusOK {
 		t.Fatalf("create webhook failed: %d %s", recWh.Code, recWh.Body.String())
 	}
-	// Same host, empty secret -> preserves secret
-	recSameHost := doReq(t, mux2, http.MethodPost, "/Webhooks", map[string]any{
+	// Same scheme + host + path (even with query), empty secret -> preserves secret
+	recSameOriginPath := doReq(t, mux2, http.MethodPost, "/Webhooks", map[string]any{
 		"Id":      "wh-host-test",
 		"Name":    "Hook",
-		"Url":     "https://93.184.216.34/b",
+		"Url":     "https://93.184.216.34/a?keep=1",
 		"Enabled": true,
 	})
-	if recSameHost.Code != http.StatusOK {
-		t.Fatalf("update same-host webhook failed: %d", recSameHost.Code)
+	if recSameOriginPath.Code != http.StatusOK {
+		t.Fatalf("update same-origin-path webhook failed: %d", recSameOriginPath.Code)
 	}
 	h2.mu.RLock()
 	sameSecret := h2.state.Webhooks[0].Secret
 	h2.mu.RUnlock()
 	if sameSecret != "top-secret-token" {
-		t.Fatalf("expected secret preserved on same-host update, got %q", sameSecret)
+		t.Fatalf("expected secret preserved on identical scheme+host+path update, got %q", sameSecret)
 	}
-	// Different host, empty secret -> clears secret
+	// Changed path, empty secret -> clears secret (M-04)
+	recDiffPath := doReq(t, mux2, http.MethodPost, "/Webhooks", map[string]any{
+		"Id":      "wh-host-test",
+		"Name":    "Hook",
+		"Url":     "https://93.184.216.34/b",
+		"Enabled": true,
+	})
+	if recDiffPath.Code != http.StatusOK {
+		t.Fatalf("update diff-path webhook failed: %d", recDiffPath.Code)
+	}
+	h2.mu.RLock()
+	pathClearedSecret := h2.state.Webhooks[0].Secret
+	h2.mu.RUnlock()
+	if pathClearedSecret != "" {
+		t.Fatalf("M-04: expected secret cleared on path change, got %q", pathClearedSecret)
+	}
+	// Re-arm secret, then verify https -> http downgrade clears secret
+	_ = doReq(t, mux2, http.MethodPost, "/Webhooks", map[string]any{
+		"Id":      "wh-host-test",
+		"Name":    "Hook",
+		"Url":     "https://93.184.216.34/a",
+		"Secret":  "top-secret-token-2",
+		"Enabled": true,
+	})
+	recDowngrade := doReq(t, mux2, http.MethodPost, "/Webhooks", map[string]any{
+		"Id":      "wh-host-test",
+		"Name":    "Hook",
+		"Url":     "http://93.184.216.34/a",
+		"Enabled": true,
+	})
+	if recDowngrade.Code != http.StatusOK {
+		t.Fatalf("update scheme-downgrade webhook failed: %d", recDowngrade.Code)
+	}
+	h2.mu.RLock()
+	downgradeSecret := h2.state.Webhooks[0].Secret
+	h2.mu.RUnlock()
+	if downgradeSecret != "" {
+		t.Fatalf("M-04: expected secret cleared on https->http downgrade, got %q", downgradeSecret)
+	}
+	// Re-arm secret, then verify different host clears secret
+	_ = doReq(t, mux2, http.MethodPost, "/Webhooks", map[string]any{
+		"Id":      "wh-host-test",
+		"Name":    "Hook",
+		"Url":     "https://93.184.216.34/a",
+		"Secret":  "top-secret-token-3",
+		"Enabled": true,
+	})
 	recDiffHost := doReq(t, mux2, http.MethodPost, "/Webhooks", map[string]any{
 		"Id":      "wh-host-test",
 		"Name":    "Hook",
-		"Url":     "https://93.184.216.35/steal",
+		"Url":     "https://93.184.216.35/a",
 		"Enabled": true,
 	})
 	if recDiffHost.Code != http.StatusOK {

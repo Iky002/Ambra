@@ -38,10 +38,18 @@ export function formatAudioTime(seconds: number): string {
 }
 
 export function parseLrcText(raw: string): ParsedLyricLine[] {
-  const lines: ParsedLyricLine[] = []
-  const timeTagRegex = /\[(\d{1,3}):(\d{2})(?:\.(\d{1,3}))?\]/g
+  const leadingMetaLines: ParsedLyricLine[] = []
+  const timedAndTrailingLines: Array<{
+    line: ParsedLyricLine
+    order: number
+    anchorTime: number | null
+  }> = []
+  const timeTagRegex = /\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]/g
   const offsetRegex = /^\[offset:\s*([+-]?\d+)\s*\]$/i
   let offsetMs = 0
+  let seenTimedLine = false
+  let lastTimedSec: number | null = null
+  let orderCounter = 0
 
   for (const rawLine of raw.split(/\r?\n/)) {
     const trimmed = rawLine.trim()
@@ -60,6 +68,7 @@ export function parseLrcText(raw: string): ParsedLyricLine[] {
     const text = trimmed.replace(timeTagRegex, '').trim()
 
     if (matches.length > 0) {
+      seenTimedLine = true
       for (const m of matches) {
         const min = Number(m[1])
         const sec = Number(m[2])
@@ -67,19 +76,35 @@ export function parseLrcText(raw: string): ParsedLyricLine[] {
         const frac = Number(msRaw) / Math.pow(10, msRaw.length)
         // LRC 标准：[offset:+ms] 使歌词提前显示（时间戳减去 offsetMs/1000）
         const adjustedSec = Math.max(0, min * 60 + sec + frac - offsetMs / 1000)
-        lines.push({ timeSec: adjustedSec, text })
+        lastTimedSec = adjustedSec
+        timedAndTrailingLines.push({
+          line: { timeSec: adjustedSec, text },
+          order: orderCounter++,
+          anchorTime: adjustedSec,
+        })
       }
     } else if (!/^\[[a-zA-Z]+:.*\]$/.test(trimmed)) {
-      lines.push({ timeSec: null, text: trimmed })
+      if (!seenTimedLine) {
+        leadingMetaLines.push({ timeSec: null, text: trimmed })
+      } else {
+        timedAndTrailingLines.push({
+          line: { timeSec: null, text: trimmed },
+          order: orderCounter++,
+          anchorTime: lastTimedSec,
+        })
+      }
     }
   }
 
-  return lines.sort((a, b) => {
-    if (a.timeSec == null && b.timeSec == null) return 0
-    if (a.timeSec == null) return 1
-    if (b.timeSec == null) return -1
-    return a.timeSec - b.timeSec
+  timedAndTrailingLines.sort((a, b) => {
+    if (a.anchorTime == null && b.anchorTime == null) return a.order - b.order
+    if (a.anchorTime == null) return 1
+    if (b.anchorTime == null) return -1
+    if (a.anchorTime !== b.anchorTime) return a.anchorTime - b.anchorTime
+    return a.order - b.order
   })
+
+  return [...leadingMetaLines, ...timedAndTrailingLines.map((item) => item.line)]
 }
 
 export function normalizeLyricsResponse(
@@ -180,17 +205,24 @@ export function AudioPlayerBar() {
 
   const parsedLyrics = useMemo(() => normalizeLyricsResponse(lyricsData), [lyricsData])
 
-  const activeLyricIndex = useMemo(() => {
-    if (parsedLyrics.length === 0) return -1
-    let idx = -1
+  const activeLyricTimeSec = useMemo(() => {
+    if (parsedLyrics.length === 0) return null
+    let matchedTime: number | null = null
     for (let i = 0; i < parsedLyrics.length; i++) {
       const t = parsedLyrics[i].timeSec
       if (t != null && t <= currentTime + 0.15) {
-        idx = i
+        matchedTime = t
       }
     }
-    return idx
+    return matchedTime
   }, [parsedLyrics, currentTime])
+
+  const activeLyricIndex = useMemo(() => {
+    if (activeLyricTimeSec == null) return -1
+    return parsedLyrics.findIndex(
+      (line) => line.timeSec != null && Math.abs(line.timeSec - activeLyricTimeSec) < 0.005,
+    )
+  }, [parsedLyrics, activeLyricTimeSec])
 
   // 当前歌词行变化时平滑滚动至居中
   useEffect(() => {
@@ -258,12 +290,17 @@ export function AudioPlayerBar() {
                 <p className="py-8 text-xs text-zinc-500">暂无同步歌词</p>
               ) : (
                 parsedLyrics.map((line, idx) => {
-                  const isActive = idx === activeLyricIndex
+                  const isActive =
+                    activeLyricTimeSec != null &&
+                    line.timeSec != null &&
+                    Math.abs(line.timeSec - activeLyricTimeSec) < 0.005
+                  const isScrollAnchor = idx === activeLyricIndex
                   return (
                     <button
                       key={`${idx}-${line.timeSec ?? 'plain'}`}
-                      ref={isActive ? activeLyricRef : null}
+                      ref={isScrollAnchor ? activeLyricRef : null}
                       type="button"
+                      aria-current={isActive ? 'true' : undefined}
                       disabled={line.timeSec == null}
                       onClick={() => {
                         if (line.timeSec != null) {

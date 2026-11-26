@@ -22,7 +22,7 @@ func TestAuditV0107_H9_HostChangeClearsCredentialsAndFetchSeason(t *testing.T) {
 
 	// Host change without new credentials must clear apiKey and pin
 	if err := p.Configure(map[string]any{
-		"base_url": "https://attacker.example.com/v4",
+		"base_url": "https://93.184.216.34/v4",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -35,12 +35,12 @@ func TestAuditV0107_H9_HostChangeClearsCredentialsAndFetchSeason(t *testing.T) {
 	if err := p.Configure(map[string]any{
 		"api_key":  "k2",
 		"pin":      "p2",
-		"base_url": "https://attacker.example.com/v4",
+		"base_url": "https://93.184.216.34/v4",
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := p.Configure(map[string]any{
-		"base_url": "https://attacker.example.com/v4-alt",
+		"base_url": "https://93.184.216.34/v4-alt",
 	}); err != nil {
 		t.Fatal(err)
 	}
