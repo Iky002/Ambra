@@ -390,11 +390,20 @@ func (h *Handler) lookupRecording(ctx context.Context, id string) (liveTVRecordi
 }
 
 func isHLSStreamURL(raw string) bool {
-	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil {
-		return strings.HasSuffix(strings.ToLower(strings.TrimSpace(raw)), ".m3u8")
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return false
 	}
-	return strings.HasSuffix(strings.ToLower(u.Path), ".m3u8")
+	lowerRaw := strings.ToLower(trimmed)
+	lowerPath := lowerRaw
+	if u, err := url.Parse(trimmed); err == nil && u.Path != "" {
+		lowerPath = strings.ToLower(u.Path)
+	}
+	return strings.HasSuffix(lowerPath, ".m3u8") ||
+		strings.HasSuffix(lowerPath, ".m3u") ||
+		strings.Contains(lowerPath, ".m3u8") ||
+		strings.Contains(lowerRaw, "format=m3u8") ||
+		strings.Contains(lowerRaw, "type=m3u8")
 }
 
 func appendRawQuery(targetPath, rawQuery string) string {
@@ -668,10 +677,18 @@ func (h *Handler) handleSetChannelDisabled(w http.ResponseWriter, r *http.Reques
 
 	h.mu.Lock()
 	h.ensureMapsLocked()
+	snapshot := cloneCompatExtState(h.state)
 	h.state.ChannelDisabled[id] = disabled
-	h.saveStateLocked(r.Context())
+	err := h.saveStateLocked(r.Context())
+	if err != nil {
+		h.state = snapshot
+	}
 	lt := h.liveTV
 	h.mu.Unlock()
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to persist channel state")
+		return
+	}
 
 	if lt != nil {
 		_ = lt.SetChannelDisabled(r.Context(), id, disabled)
@@ -690,7 +707,10 @@ func (h *Handler) handleSetChannelDisabled(w http.ResponseWriter, r *http.Reques
 			}
 		}
 		if changed {
-			h.writeConfigJSON(r.Context(), liveTVConfigKey, st)
+			if err := h.writeConfigJSON(r.Context(), liveTVConfigKey, st); err != nil {
+				httpx.Error(w, http.StatusInternalServerError, "failed to persist livetv state")
+				return
+			}
 		}
 	}
 	httpx.NoContent(w)
@@ -723,10 +743,18 @@ func (h *Handler) handleSetChannelSortIndex(w http.ResponseWriter, r *http.Reque
 
 	h.mu.Lock()
 	h.ensureMapsLocked()
+	snapshot := cloneCompatExtState(h.state)
 	h.state.ChannelSortIndex[id] = newIdx
-	h.saveStateLocked(r.Context())
+	err := h.saveStateLocked(r.Context())
+	if err != nil {
+		h.state = snapshot
+	}
 	lt := h.liveTV
 	h.mu.Unlock()
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to persist channel sort index")
+		return
+	}
 
 	if lt != nil {
 		_ = lt.SetChannelSortIndex(r.Context(), id, newIdx)
@@ -745,7 +773,10 @@ func (h *Handler) handleSetChannelSortIndex(w http.ResponseWriter, r *http.Reque
 			}
 		}
 		if changed {
-			h.writeConfigJSON(r.Context(), liveTVConfigKey, st)
+			if err := h.writeConfigJSON(r.Context(), liveTVConfigKey, st); err != nil {
+				httpx.Error(w, http.StatusInternalServerError, "failed to persist livetv state")
+				return
+			}
 		}
 	}
 	httpx.NoContent(w)
@@ -766,9 +797,17 @@ func (h *Handler) handleResetTuner(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "Id")
 	h.mu.Lock()
 	h.ensureMapsLocked()
+	snapshot := cloneCompatExtState(h.state)
 	h.state.TunerResetAt[id] = time.Now().UTC().Unix()
-	h.saveStateLocked(r.Context())
+	err := h.saveStateLocked(r.Context())
+	if err != nil {
+		h.state = snapshot
+	}
 	h.mu.Unlock()
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to persist tuner reset")
+		return
+	}
 	httpx.NoContent(w)
 }
 
@@ -845,7 +884,10 @@ func (h *Handler) handleDeleteRecordingPost(w http.ResponseWriter, r *http.Reque
 			}
 		}
 		st.Recordings = filtered
-		h.writeConfigJSON(r.Context(), liveTVConfigKey, st)
+		if err := h.writeConfigJSON(r.Context(), liveTVConfigKey, st); err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to persist recording deletion")
+			return
+		}
 	}
 	for _, p := range removedPaths {
 		if resolved, ok := h.resolveRecordingPath(p); ok {
@@ -876,7 +918,10 @@ func (h *Handler) handleDeleteTimerPost(w http.ResponseWriter, r *http.Request) 
 	var st sharedLiveTVState
 	if h.readConfigJSON(r.Context(), liveTVConfigKey, &st) {
 		st.Timers = filterRawByID(st.Timers, id)
-		h.writeConfigJSON(r.Context(), liveTVConfigKey, st)
+		if err := h.writeConfigJSON(r.Context(), liveTVConfigKey, st); err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to persist timer deletion")
+			return
+		}
 	}
 	if rec != nil {
 		_ = rec.CancelRecording(id)
@@ -901,7 +946,10 @@ func (h *Handler) handleDeleteSeriesTimerPost(w http.ResponseWriter, r *http.Req
 	var st sharedLiveTVState
 	if h.readConfigJSON(r.Context(), liveTVConfigKey, &st) {
 		st.SeriesTimers = filterRawByID(st.SeriesTimers, id)
-		h.writeConfigJSON(r.Context(), liveTVConfigKey, st)
+		if err := h.writeConfigJSON(r.Context(), liveTVConfigKey, st); err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to persist series timer deletion")
+			return
+		}
 	}
 	httpx.NoContent(w)
 }
@@ -956,7 +1004,10 @@ func (h *Handler) handleDeleteTunerHostPost(w http.ResponseWriter, r *http.Reque
 			}
 		}
 		st.TunerHosts = filtered
-		h.writeConfigJSON(r.Context(), liveTVConfigKey, st)
+		if err := h.writeConfigJSON(r.Context(), liveTVConfigKey, st); err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to persist tuner host deletion")
+			return
+		}
 	}
 	httpx.NoContent(w)
 }
@@ -1000,7 +1051,10 @@ func (h *Handler) handleDeleteListingProviderPost(w http.ResponseWriter, r *http
 			}
 		}
 		st.ListingProviders = filtered
-		h.writeConfigJSON(r.Context(), liveTVConfigKey, st)
+		if err := h.writeConfigJSON(r.Context(), liveTVConfigKey, st); err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to persist listing provider deletion")
+			return
+		}
 	}
 	httpx.NoContent(w)
 }
@@ -1121,7 +1175,8 @@ func (h *Handler) handleSetChannelMapping(w http.ResponseWriter, r *http.Request
 
 	h.mu.Lock()
 	h.ensureMapsLocked()
-	list := h.state.ChannelMappings[req.ProviderId]
+	snapshot := cloneCompatExtState(h.state)
+	list := append([]ChannelMapping(nil), h.state.ChannelMappings[req.ProviderId]...)
 	updated := false
 	for i := range list {
 		if list[i].Name == mapping.Name {
@@ -1134,8 +1189,15 @@ func (h *Handler) handleSetChannelMapping(w http.ResponseWriter, r *http.Request
 		list = append(list, mapping)
 	}
 	h.state.ChannelMappings[req.ProviderId] = list
-	h.saveStateLocked(r.Context())
+	err := h.saveStateLocked(r.Context())
+	if err != nil {
+		h.state = snapshot
+	}
 	h.mu.Unlock()
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to persist channel mapping")
+		return
+	}
 
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"TunerChannelId":    req.TunerChannelId,

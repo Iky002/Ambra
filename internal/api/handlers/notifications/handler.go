@@ -364,6 +364,7 @@ func (h *Handler) handleMarkRead(read bool) http.HandlerFunc {
 		}
 
 		h.mu.Lock()
+		snapshot := cloneNotificationsState(h.state)
 		for i := range h.state.Items {
 			n := &h.state.Items[i]
 			if n.AdminOnly && !isAdmin {
@@ -382,8 +383,15 @@ func (h *Handler) handleMarkRead(read bool) http.HandlerFunc {
 				n.IsRead = read
 			}
 		}
-		_ = h.saveStateLocked(r.Context())
+		err := h.saveStateLocked(r.Context())
+		if err != nil {
+			h.state = snapshot
+		}
 		h.mu.Unlock()
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to persist notification read state")
+			return
+		}
 		httpx.NoContent(w)
 	}
 }
@@ -396,7 +404,7 @@ func (h *Handler) handleSendAdmin(w http.ResponseWriter, r *http.Request) {
 		Url         string `json:"Url"`
 		Level       string `json:"Level"`
 		UserId      string `json:"UserId"`
-		AdminOnly   bool   `json:"AdminOnly"`
+		AdminOnly   *bool  `json:"AdminOnly"`
 	}
 	if err := httpx.DecodeJSONLimit(r, &req, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid notification payload")
@@ -414,10 +422,15 @@ func (h *Handler) handleSendAdmin(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid notification ImageUrl scheme")
 		return
 	}
+	targetUserID := guid.Normalize(req.UserId)
+	adminOnly := targetUserID == ""
+	if req.AdminOnly != nil {
+		adminOnly = *req.AdminOnly
+	}
 	level := normalizeLevel(req.Level)
 	n := Notification{
 		Id:          guid.New(),
-		UserId:      guid.Normalize(req.UserId),
+		UserId:      targetUserID,
 		Date:        time.Now().UTC(),
 		IsRead:      false,
 		Name:        req.Name,
@@ -425,7 +438,7 @@ func (h *Handler) handleSendAdmin(w http.ResponseWriter, r *http.Request) {
 		Url:         strings.TrimSpace(req.Url),
 		ImageUrl:    strings.TrimSpace(req.ImageUrl),
 		Level:       level,
-		AdminOnly:   req.AdminOnly,
+		AdminOnly:   adminOnly,
 	}
 
 	if err := h.appendNotification(r.Context(), n); err != nil {
@@ -446,9 +459,13 @@ func (h *Handler) appendNotification(ctx context.Context, n Notification) error 
 	n.Level = normalizeLevel(n.Level)
 
 	h.mu.Lock()
+	snapshot := cloneNotificationsState(h.state)
 	h.state.Items = append([]Notification{n}, h.state.Items...)
 	h.trimNotificationsLocked()
 	err := h.saveStateLocked(ctx)
+	if err != nil {
+		h.state = snapshot
+	}
 	h.mu.Unlock()
 	return err
 }
@@ -587,6 +604,10 @@ func (h *Handler) SubscribeEvents(bus *eventbus.Bus) {
 			}
 		case map[string]any:
 			uid, _ := p["UserId"].(string)
+			normUID := guid.Normalize(uid)
+			if normUID == "" {
+				return
+			}
 			name, _ := p["Name"].(string)
 			if strings.TrimSpace(name) == "" {
 				return
@@ -594,7 +615,7 @@ func (h *Handler) SubscribeEvents(bus *eventbus.Bus) {
 			desc, _ := p["Description"].(string)
 			level, _ := p["Level"].(string)
 			_ = h.appendNotification(ctx, Notification{
-				UserId:      guid.Normalize(uid),
+				UserId:      normUID,
 				Name:        strings.TrimSpace(name),
 				Description: strings.TrimSpace(desc),
 				Level:       level,
@@ -604,7 +625,8 @@ func (h *Handler) SubscribeEvents(bus *eventbus.Bus) {
 }
 
 func (h *Handler) recordUserDataChangedNotification(ctx context.Context, p session.UserDataChangedPayload) {
-	if len(p.UserDataList) == 0 {
+	normUID := guid.Normalize(p.UserId)
+	if normUID == "" || len(p.UserDataList) == 0 {
 		return
 	}
 	name := "User Data Updated"
@@ -623,7 +645,7 @@ func (h *Handler) recordUserDataChangedNotification(ctx context.Context, p sessi
 		}
 	}
 	_ = h.appendNotification(ctx, Notification{
-		UserId:      guid.Normalize(p.UserId),
+		UserId:      normUID,
 		Name:        name,
 		Description: desc,
 		Level:       "Normal",
@@ -689,6 +711,22 @@ func (h *Handler) loadState(ctx context.Context) {
 		h.state = st
 		h.mu.Unlock()
 	}
+}
+
+func cloneNotificationsState(st notificationsState) notificationsState {
+	if st.Items == nil {
+		return notificationsState{}
+	}
+	out := notificationsState{
+		Items: make([]Notification, len(st.Items)),
+	}
+	copy(out.Items, st.Items)
+	for i := range out.Items {
+		if st.Items[i].ReadBy != nil {
+			out.Items[i].ReadBy = append([]string(nil), st.Items[i].ReadBy...)
+		}
+	}
+	return out
 }
 
 func (h *Handler) saveStateLocked(ctx context.Context) error {

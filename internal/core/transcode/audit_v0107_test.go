@@ -84,21 +84,18 @@ exit 0
 		t.Fatalf("expected explicit stream-indexed -dump_attachment args, got: %s", ffLogStr)
 	}
 
-	// Missing ffprobe gracefully returns empty slice and writes .extracted marker
+	// Missing ffprobe returns an error and does NOT write .extracted marker (H-15).
 	cfgNoProbe := config.Default(t.TempDir())
 	cfgNoProbe.FFmpegPath = fakeFFmpeg
 	cfgNoProbe.FFprobePath = filepath.Join(tmp, "does-not-exist-ffprobe")
 	extNoProbe := NewExtractor(cfgNoProbe)
 	emptyFonts, err := extNoProbe.ExtractFonts(context.Background(), filepath.Join(tmp, "movie.mkv"), "item-noprobe", "ms-noprobe")
-	if err != nil {
-		t.Fatalf("expected graceful empty result without ffprobe, got err=%v", err)
-	}
-	if len(emptyFonts) != 0 {
-		t.Fatalf("expected 0 fonts without ffprobe, got %v", emptyFonts)
+	if err == nil {
+		t.Fatalf("expected error without ffprobe, got fonts=%v", emptyFonts)
 	}
 	marker := filepath.Join(cfgNoProbe.SubtitleCacheDir(), "fonts", "item-noprobe_ms-noprobe", ".extracted")
-	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("expected .extracted marker written even without ffprobe: %v", err)
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatalf("expected .extracted marker NOT written on probe failure: %v", statErr)
 	}
 
 	// Remote HTTP media uses strict remoteProtocolWhitelist (no file,pipe) and -follow_redirects 0

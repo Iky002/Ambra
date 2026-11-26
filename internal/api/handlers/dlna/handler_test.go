@@ -905,10 +905,11 @@ func TestDLNASignedStreamAndGENACap(t *testing.T) {
 		}
 	}
 
-	// 3. GENA subscription cap (256) and expiry pruning
+	// 3. GENA subscription cap (256) and expiry pruning (using distinct LAN IPs to respect per-IP cap)
 	var firstSID string
 	for i := 0; i < maxDLNASubscriptions; i++ {
 		req := httptest.NewRequest("SUBSCRIBE", "/Dlna/srv/contentdirectory/events", nil)
+		req.RemoteAddr = "192.168." + strconv.Itoa(1+i/maxDLNASubscriptionsPerIP) + "." + strconv.Itoa(10+i%maxDLNASubscriptionsPerIP) + ":9000"
 		req.Header.Set("CALLBACK", "<http://192.168.1.50:9000/notify>")
 		req.Header.Set("TIMEOUT", "Second-600")
 		recSub := httptest.NewRecorder()
@@ -926,6 +927,7 @@ func TestDLNASignedStreamAndGENACap(t *testing.T) {
 
 	// 257th subscription must be rejected with 503 Service Unavailable
 	reqOverflow := httptest.NewRequest("SUBSCRIBE", "/Dlna/srv/contentdirectory/events", nil)
+	reqOverflow.RemoteAddr = "192.168.250.10:9000"
 	reqOverflow.Header.Set("CALLBACK", "<http://192.168.1.50:9000/notify>")
 	recOverflow := httptest.NewRecorder()
 	mux.ServeHTTP(recOverflow, reqOverflow)

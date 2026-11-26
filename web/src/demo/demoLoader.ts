@@ -29,18 +29,23 @@ export async function loadDemoServer(): Promise<DemoServerBindings> {
     return cachedDemoServer
   }
   if (!pendingDemoLoad) {
-    pendingDemoLoad = import('./mockServer').then((mod) => {
-      const bindings: DemoServerBindings = {
-        demoFetch: mod.demoFetch,
-        getDemoImageUrl: mod.getDemoImageUrl,
-        getDemoFallbackImageUrl: mod.getDemoFallbackImageUrl,
-        getDemoUserImageUrl: mod.getDemoUserImageUrl,
-        getDemoAudioUrl: mod.getDemoAudioUrl,
-        getDemoVideoUrl: mod.getDemoVideoUrl,
-      }
-      cachedDemoServer = bindings
-      return bindings
-    })
+    pendingDemoLoad = import('./mockServer')
+      .then((mod) => {
+        const bindings: DemoServerBindings = {
+          demoFetch: mod.demoFetch,
+          getDemoImageUrl: mod.getDemoImageUrl,
+          getDemoFallbackImageUrl: mod.getDemoFallbackImageUrl,
+          getDemoUserImageUrl: mod.getDemoUserImageUrl,
+          getDemoAudioUrl: mod.getDemoAudioUrl,
+          getDemoVideoUrl: mod.getDemoVideoUrl,
+        }
+        cachedDemoServer = bindings
+        return bindings
+      })
+      .catch((err) => {
+        pendingDemoLoad = null
+        throw err
+      })
   }
   return pendingDemoLoad
 }

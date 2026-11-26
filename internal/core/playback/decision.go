@@ -248,11 +248,11 @@ func (e *Engine) decideOne(
 		}
 		method := decideSubtitleDeliveryMethod(st, req.DeviceProfile)
 		st.DeliveryMethod = method
-		if method == "External" {
+		if strings.EqualFold(method, "External") {
 			ext := subtitleStreamFormatForProfile(st.Codec, req.DeviceProfile)
 			st.DeliveryUrl = fmt.Sprintf("/Videos/%s/%s/Subtitles/%d/Stream.%s", item.ID, msDTO.Id, st.Index, ext)
 		}
-		if selectedSub != nil && st.Index == selectedSub.Index && method == "Encode" {
+		if selectedSub != nil && st.Index == selectedSub.Index && strings.EqualFold(method, "Encode") {
 			subtitleNeedsBurnIn = true
 		}
 	}
@@ -548,7 +548,6 @@ func supportsClientWASM(profile *DeviceProfile) bool {
 		return false
 	}
 	return strings.Contains(lowerName, "ambra web") ||
-		strings.Contains(lowerName, "emby web") ||
 		strings.Contains(lowerName, "wasm")
 }
 
@@ -577,6 +576,23 @@ func subtitleStreamFormatForProfile(codec string, profile *DeviceProfile) string
 	return ext
 }
 
+func normalizeSubtitleDeliveryMethod(method string) string {
+	switch strings.ToLower(strings.TrimSpace(method)) {
+	case "", "external":
+		return "External"
+	case "embed":
+		return "Embed"
+	case "encode":
+		return "Encode"
+	case "hls":
+		return "Hls"
+	case "drop":
+		return "Drop"
+	default:
+		return strings.TrimSpace(method)
+	}
+}
+
 // decideSubtitleDeliveryMethod inspects DeviceProfile.SubtitleProfiles so that clients declaring
 // ass/ssa/pgssub as External (e.g. JASSUB / PGS Canvas) NEVER trigger video transcoding.
 func decideSubtitleDeliveryMethod(st *dto.MediaStream, profile *DeviceProfile) string {
@@ -590,10 +606,7 @@ func decideSubtitleDeliveryMethod(st *dto.MediaStream, profile *DeviceProfile) s
 
 	for _, sp := range profile.SubtitleProfiles {
 		if normalizeSubCodec(sp.Format) == codec {
-			method := sp.Method
-			if method == "" {
-				method = "External"
-			}
+			method := normalizeSubtitleDeliveryMethod(sp.Method)
 			// Prefer External for external subtitle files when client declares External or Embed
 			if st.IsExternal && strings.EqualFold(method, "Embed") {
 				return "External"

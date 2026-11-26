@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -164,9 +165,105 @@ func (r *LibraryRepo) DeleteItem(ctx context.Context, itemID string) error {
 		return err
 	}
 
-	// Collect itemID and all descendant IDs via parent_id/series_id/season_id and item_ancestors.
-	ids := []string{itemID}
-	seen := map[string]struct{}{itemID: {}}
+	if _, err := deleteItemIDsTx(ctx, tx, []string{itemID}); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	r.InvalidateCountCache()
+	return nil
+}
+
+// DeleteItemsByPathPrefix removes all items in libraryID whose path equals dirPath or lies under dirPath,
+// along with their descendants and associated index/image/ancestor records, inside a single write transaction.
+func (r *LibraryRepo) DeleteItemsByPathPrefix(ctx context.Context, libraryID, dirPath string) (int64, error) {
+	libID := guid.Normalize(libraryID)
+	trimmedDir := strings.TrimSpace(dirPath)
+	if libID == "" || trimmedDir == "" {
+		return 0, nil
+	}
+
+	cleanDir := filepath.Clean(trimmedDir)
+	slashDir := filepath.ToSlash(cleanDir)
+	osPrefix := cleanDir
+	if !strings.HasSuffix(osPrefix, string(filepath.Separator)) {
+		osPrefix += string(filepath.Separator)
+	}
+	slashPrefix := slashDir
+	if !strings.HasSuffix(slashPrefix, "/") {
+		slashPrefix += "/"
+	}
+
+	tx, err := r.store.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id FROM items
+		WHERE library_id = ?
+		  AND (path = ? OR path = ? OR path LIKE ? ESCAPE '\' OR path LIKE ? ESCAPE '\')`,
+		libID, cleanDir, slashDir,
+		escapeLikePattern(osPrefix)+"%",
+		escapeLikePattern(slashPrefix)+"%",
+	)
+	if err != nil {
+		return 0, err
+	}
+	var seedIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		seedIDs = append(seedIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+
+	if len(seedIDs) == 0 {
+		return 0, nil
+	}
+
+	deleted, err := deleteItemIDsTx(ctx, tx, seedIDs)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	if deleted > 0 {
+		r.InvalidateCountCache()
+	}
+	return deleted, nil
+}
+
+func deleteItemIDsTx(ctx context.Context, tx *sql.Tx, seedIDs []string) (int64, error) {
+	seen := make(map[string]struct{}, len(seedIDs))
+	ids := make([]string, 0, len(seedIDs))
+	for _, raw := range seedIDs {
+		id := guid.Normalize(raw)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+
+	// Collect all descendant IDs via parent_id/series_id/season_id and item_ancestors.
 	for i := 0; i < len(ids); i++ {
 		cur := ids[i]
 		rows, err := tx.QueryContext(ctx,
@@ -176,13 +273,13 @@ func (r *LibraryRepo) DeleteItem(ctx context.Context, itemID string) error {
 			cur, cur, cur, cur,
 		)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		for rows.Next() {
 			var childID string
 			if err := rows.Scan(&childID); err != nil {
 				rows.Close()
-				return err
+				return 0, err
 			}
 			if _, ok := seen[childID]; !ok {
 				seen[childID] = struct{}{}
@@ -191,13 +288,14 @@ func (r *LibraryRepo) DeleteItem(ctx context.Context, itemID string) error {
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
-			return err
+			return 0, err
 		}
 		rows.Close()
 	}
 
 	// Chunk deletes to stay well below SQLite's bind parameter limit.
 	const chunkSize = 400
+	var deleted int64
 	for start := 0; start < len(ids); start += chunkSize {
 		end := start + chunkSize
 		if end > len(ids) {
@@ -211,27 +309,26 @@ func (r *LibraryRepo) DeleteItem(ctx context.Context, itemID string) error {
 		}
 
 		if _, err := tx.ExecContext(ctx, `DELETE FROM item_images WHERE item_id IN (`+placeholders+`)`, args...); err != nil {
-			return err
+			return 0, err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM item_search_fts WHERE item_id IN (`+placeholders+`)`, args...); err != nil {
-			return err
+			return 0, err
 		}
 		doubleArgs := make([]any, 0, len(batch)*2)
 		doubleArgs = append(doubleArgs, args...)
 		doubleArgs = append(doubleArgs, args...)
 		if _, err := tx.ExecContext(ctx, `DELETE FROM item_ancestors WHERE ancestor_id IN (`+placeholders+`) OR descendant_id IN (`+placeholders+`)`, doubleArgs...); err != nil {
-			return err
+			return 0, err
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM items WHERE id IN (`+placeholders+`)`, args...); err != nil {
-			return err
+		res, err := tx.ExecContext(ctx, `DELETE FROM items WHERE id IN (`+placeholders+`)`, args...)
+		if err != nil {
+			return 0, err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			deleted += n
 		}
 	}
-
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	r.InvalidateCountCache()
-	return nil
+	return deleted, nil
 }
 
 // ListLibraryItemPaths returns a map of media file path -> itemID for all Movie, Episode, and Audio

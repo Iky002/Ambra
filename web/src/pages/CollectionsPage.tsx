@@ -342,7 +342,7 @@ export function CollectionsPage() {
               <div key={member.Id} className="group/member relative">
                 <MediaCard item={member} />
                 {isSelectedPlaylist && members.length > 1 && (
-                  <div className="absolute left-2 top-2 z-20 flex items-center gap-1 opacity-0 transition-opacity group-hover/member:opacity-100 focus-within:opacity-100">
+                  <div className="absolute left-2 top-2 z-20 flex items-center gap-1 opacity-100 transition-opacity [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/member:opacity-100 [@media(hover:hover)]:focus-within:opacity-100">
                     <button
                       type="button"
                       disabled={idx === 0 || moveMemberMutation.isPending}
@@ -384,7 +384,7 @@ export function CollectionsPage() {
                     }}
                     title="移出列表"
                     aria-label={`移出 ${member.Name}`}
-                    className="absolute right-2 top-2 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-200 opacity-0 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-red-500 hover:text-white group-hover/member:opacity-100 focus:opacity-100"
+                    className="absolute right-2 top-2 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-200 opacity-100 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-red-500 hover:text-white [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/member:opacity-100 [@media(hover:hover)]:focus:opacity-100"
                   >
                     <X className="h-3.5 w-3.5" />
                   </button>
@@ -579,7 +579,7 @@ export function CollectionsPage() {
                     }}
                     title={`删除 ${col.Name}`}
                     aria-label={`删除 ${col.Name}`}
-                    className="absolute right-2 top-2 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-300 opacity-0 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-red-500 hover:text-white group-hover/col:opacity-100 focus:opacity-100"
+                    className="absolute right-2 top-2 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-300 opacity-100 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-red-500 hover:text-white [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/col:opacity-100 [@media(hover:hover)]:focus:opacity-100"
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>

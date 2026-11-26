@@ -28,8 +28,9 @@ import (
 )
 
 const (
-	webhookQueueSize   = 256
-	webhookWorkerCount = 4
+	webhookQueueSize       = 256
+	webhookWorkerCount     = 4
+	webhookDeliveryTimeout = 10 * time.Second
 )
 
 var sqliteMagicHeader = []byte("SQLite format 3\x00")
@@ -92,6 +93,10 @@ func (h *Handler) ensureWebhookWorkersLocked() {
 	if h.webhookCh != nil || h.webhookClosed {
 		return
 	}
+	if h.webhookCtx == nil {
+		h.webhookCtx, h.webhookCancel = context.WithCancel(context.Background())
+	}
+	ctx := h.webhookCtx
 	ch := make(chan webhookDispatchJob, webhookQueueSize)
 	h.webhookCh = ch
 	h.webhookWG.Add(webhookWorkerCount)
@@ -99,7 +104,10 @@ func (h *Handler) ensureWebhookWorkersLocked() {
 		go func() {
 			defer h.webhookWG.Done()
 			for job := range ch {
-				_, _ = h.sendWebhook(context.Background(), job.cfg, job.payload)
+				if ctx.Err() != nil {
+					return
+				}
+				_, _ = h.sendWebhook(ctx, job.cfg, job.payload)
 			}
 		}()
 	}
@@ -113,10 +121,15 @@ func (h *Handler) Close() {
 		return
 	}
 	h.webhookClosed = true
+	cancel := h.webhookCancel
+	h.webhookCancel = nil
 	ch := h.webhookCh
 	h.webhookCh = nil
 	h.webhookMu.Unlock()
 
+	if cancel != nil {
+		cancel()
+	}
 	if ch != nil {
 		close(ch)
 	}
@@ -207,11 +220,20 @@ func matchesWebhookEvent(events []string, eventType string) bool {
 }
 
 func (h *Handler) sendWebhook(ctx context.Context, wh WebhookConfig, payload WebhookPayload) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, webhookDeliveryTimeout)
+	defer cancel()
+
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return 0, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, wh.Url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, wh.Url, bytes.NewReader(body))
 	if err != nil {
 		return 0, err
 	}
@@ -241,6 +263,14 @@ func (h *Handler) handleListWebhooks(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, items)
 }
 
+func webhookURLHostLower(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(u.Host))
+}
+
 func (h *Handler) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
 	var wh WebhookConfig
 	if err := httpx.DecodeJSONLimit(r, &wh, 0); err != nil {
@@ -266,6 +296,7 @@ func (h *Handler) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.Lock()
+	snapshot := cloneOpsState(h.state)
 	replaced := false
 	clearSecret := wh.ClearSecret
 	wh.ClearSecret = false
@@ -274,7 +305,11 @@ func (h *Handler) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
 			if clearSecret {
 				wh.Secret = ""
 			} else if wh.Secret == "" {
-				wh.Secret = existing.Secret
+				if webhookURLHostLower(existing.Url) != webhookURLHostLower(wh.Url) {
+					wh.Secret = ""
+				} else {
+					wh.Secret = existing.Secret
+				}
 			}
 			wh.HasSecret = wh.Secret != ""
 			h.state.Webhooks[i] = wh
@@ -290,6 +325,9 @@ func (h *Handler) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
 		h.state.Webhooks = append(h.state.Webhooks, wh)
 	}
 	err := h.saveStateLocked(r.Context())
+	if err != nil {
+		h.state = snapshot
+	}
 	h.mu.Unlock()
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to persist webhook")
@@ -304,8 +342,15 @@ func (h *Handler) handleDeleteWebhook(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	for i, wh := range h.state.Webhooks {
 		if wh.Id == id {
+			snapshot := cloneOpsState(h.state)
 			h.state.Webhooks = append(h.state.Webhooks[:i], h.state.Webhooks[i+1:]...)
-			_ = h.saveStateLocked(r.Context())
+			err := h.saveStateLocked(r.Context())
+			if err != nil {
+				h.state = snapshot
+				h.mu.Unlock()
+				httpx.Error(w, http.StatusInternalServerError, "failed to persist webhook deletion")
+				return
+			}
 			h.mu.Unlock()
 			httpx.NoContent(w)
 			return
@@ -462,6 +507,9 @@ func (h *Handler) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.backupMu.Lock()
+	defer h.backupMu.Unlock()
+
 	src := filepath.Join(h.backupsDir(), backupName)
 	info, err := os.Lstat(src)
 	if err != nil {
@@ -485,10 +533,8 @@ func (h *Handler) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.backupMu.Lock()
 	stagedDst := filepath.Join(h.dataDir(), "ambra.db.restore")
 	err = copyFileAtomic(src, stagedDst, 0o600)
-	h.backupMu.Unlock()
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, fmt.Sprintf("stage restore failed: %v", err))
 		return
@@ -519,11 +565,12 @@ func verifySQLiteHeader(path string) error {
 }
 
 func verifySQLiteIntegrity(ctx context.Context, path string) error {
-	escaped := strings.ReplaceAll(filepath.ToSlash(path), "?", "%3F")
-	escaped = strings.ReplaceAll(escaped, "#", "%23")
-	u := url.URL{Scheme: "file", Path: escaped}
-	dsn := u.String() + "?mode=ro&_pragma=immutable(1)"
-	db, err := sql.Open("sqlite", dsn)
+	u := url.URL{
+		Scheme:   "file",
+		Path:     filepath.ToSlash(path),
+		RawQuery: "mode=ro&_pragma=immutable(1)",
+	}
+	db, err := sql.Open("sqlite", u.String())
 	if err != nil {
 		return fmt.Errorf("open backup sqlite: %w", err)
 	}

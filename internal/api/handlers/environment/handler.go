@@ -296,6 +296,10 @@ func (h *Handler) handleValidatePath(w http.ResponseWriter, r *http.Request) {
 			_ = probe.Close()
 			_ = os.Remove(probeName)
 		} else {
+			if !info.Mode().IsRegular() {
+				httpx.Error(w, http.StatusBadRequest, "path is not a regular file")
+				return
+			}
 			f, err := os.OpenFile(clean, os.O_WRONLY|os.O_APPEND, 0)
 			if err != nil {
 				httpx.Error(w, http.StatusForbidden, "path is not writable")

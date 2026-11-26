@@ -258,8 +258,13 @@ func (h *Handler) postSessionMessage(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) postSessionAddUser(w http.ResponseWriter, r *http.Request) {
 	sid := chi.URLParam(r, "Id")
-	if _, _, allowed := h.authorizeSessionTarget(r, sid); !allowed {
+	_, found, allowed := h.authorizeSessionTarget(r, sid)
+	if !allowed {
 		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	if !found {
+		writeJSONError(w, r, http.StatusNotFound, "session not found")
 		return
 	}
 	uid := guid.Normalize(chi.URLParam(r, "UserId"))
@@ -396,8 +401,12 @@ func (h *Handler) postDeviceOptions(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
+	if r.ContentLength > maxKVJSONBodyBytes {
+		httpx.Error(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
 	body := map[string]any{}
-	if err := decodeOptionalJSON(r, &body); err != nil {
+	if err := decodeOptionalJSONLimit(r, &body, maxKVJSONBodyBytes); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -524,6 +533,7 @@ func (h *Handler) deleteAuthKey(w http.ResponseWriter, r *http.Request) {
 // --- /Connect ---
 
 func (h *Handler) connectExchange(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "private, no-store")
 	q := httpx.ParseQuery(r)
 	connectUserID := strings.TrimSpace(q.Get("ConnectUserId"))
 	localUserID := h.resolveUserID(r, "")

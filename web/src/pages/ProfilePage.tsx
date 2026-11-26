@@ -40,6 +40,11 @@ const AUDIO_LANG_OPTIONS = [
   { value: 'eng', label: '英语 (English)' },
   { value: 'jpn', label: '日语 (日本語)' },
   { value: 'kor', label: '韩语 (한국어)' },
+  { value: 'spa', label: '西班牙语 (Español)' },
+  { value: 'ger', label: '德语 (Deutsch)' },
+  { value: 'fre', label: '法语 (Français)' },
+  { value: 'por', label: '葡萄牙语 (Português)' },
+  { value: 'tha', label: '泰语 (ไทย)' },
 ]
 
 const SUBTITLE_LANG_OPTIONS = [
@@ -51,6 +56,11 @@ const SUBTITLE_LANG_OPTIONS = [
   { value: 'eng', label: '英语 (English)' },
   { value: 'jpn', label: '日语 (日本語)' },
   { value: 'kor', label: '韩语 (한국어)' },
+  { value: 'spa', label: '西班牙语 (Español)' },
+  { value: 'ger', label: '德语 (Deutsch)' },
+  { value: 'fre', label: '法语 (Français)' },
+  { value: 'por', label: '葡萄牙语 (Português)' },
+  { value: 'tha', label: '泰语 (ไทย)' },
   { value: 'off', label: '默认关闭字幕' },
 ]
 
@@ -70,6 +80,10 @@ export function ProfilePage() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const prefsSeqRef = useRef(0)
   const prefsInFlightRef = useRef(0)
+  const prefsQueueRef = useRef<{ nextPrefs: PlaybackPrefs; seq: number } | null>(null)
+  const prefsDrainingRef = useRef(false)
+  const userConfigRef = useRef(user?.Configuration)
+  userConfigRef.current = user?.Configuration
 
   const [avatarError, setAvatarError] = useState(false)
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
@@ -225,39 +239,51 @@ export function ProfilePage() {
     quickConnectMutation.mutate(trimmed)
   }
 
-  const prefsMutation = useMutation({
-    mutationFn: async ({ nextPrefs }: { nextPrefs: PlaybackPrefs; seq: number }) => {
-      if (!userId) return
-      const nextCfg = playbackPrefsToUserConfig(nextPrefs, user?.Configuration)
-      await api.updateUserConfiguration(userId, nextCfg)
-    },
-    onSuccess: async (_data, { seq }) => {
-      if (seq !== prefsSeqRef.current) return
-      await refreshUser()
-      if (seq !== prefsSeqRef.current) return
-      setFeedback({ type: 'success', message: '播放偏好已保存并同步至账号' })
-    },
-    onError: (err, { seq }) => {
-      if (seq !== prefsSeqRef.current) return
-      setFeedback({
-        type: 'error',
-        message:
-          err instanceof Error
-            ? `播放偏好已保存本地，同步账号失败：${err.message}`
-            : '播放偏好已保存本地，同步账号失败',
-      })
-    },
-    onSettled: () => {
-      prefsInFlightRef.current = Math.max(0, prefsInFlightRef.current - 1)
-    },
-  })
+  const drainPrefsQueue = async () => {
+    if (prefsDrainingRef.current) return
+    prefsDrainingRef.current = true
+    try {
+      while (prefsQueueRef.current) {
+        const currentTask = prefsQueueRef.current
+        prefsQueueRef.current = null
+        prefsInFlightRef.current += 1
+        try {
+          if (userId) {
+            const nextCfg = playbackPrefsToUserConfig(currentTask.nextPrefs, userConfigRef.current)
+            await api.updateUserConfiguration(userId, nextCfg)
+            userConfigRef.current = nextCfg
+          }
+          if (!prefsQueueRef.current && currentTask.seq === prefsSeqRef.current) {
+            await refreshUser()
+            if (!prefsQueueRef.current && currentTask.seq === prefsSeqRef.current) {
+              setFeedback({ type: 'success', message: '播放偏好已保存并同步至账号' })
+            }
+          }
+        } catch (err) {
+          if (!prefsQueueRef.current && currentTask.seq === prefsSeqRef.current) {
+            setFeedback({
+              type: 'error',
+              message:
+                err instanceof Error
+                  ? `播放偏好已保存本地，同步账号失败：${err.message}`
+                  : '播放偏好已保存本地，同步账号失败',
+            })
+          }
+        } finally {
+          prefsInFlightRef.current = Math.max(0, prefsInFlightRef.current - 1)
+        }
+      }
+    } finally {
+      prefsDrainingRef.current = false
+    }
+  }
 
   const handlePrefsChange = (patch: Partial<PlaybackPrefs>) => {
     const seq = ++prefsSeqRef.current
-    prefsInFlightRef.current += 1
     const updated = savePlaybackPrefs(patch)
     setPrefs(updated)
-    prefsMutation.mutate({ nextPrefs: updated, seq })
+    prefsQueueRef.current = { nextPrefs: updated, seq }
+    void drainPrefsQueue()
   }
 
   if (!auth) return null

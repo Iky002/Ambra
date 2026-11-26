@@ -28,7 +28,7 @@ func TestAudioHandlerExtraBranches(t *testing.T) {
 	cfg := config.Default(tmp)
 
 	// Nil repo check
-	if _, _, err := New(nil, cfg).resolveAudioPath(ctx, "x", ""); err != sqlite.ErrNotFound {
+	if _, _, _, err := New(nil, cfg).resolveAudioPath(ctx, "x", ""); err != sqlite.ErrNotFound {
 		t.Fatalf("expected ErrNotFound for nil repo")
 	}
 

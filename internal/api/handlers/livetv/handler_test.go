@@ -600,8 +600,9 @@ func TestDueRecordingJobsAndDVRIntegration(t *testing.T) {
 		"#EXTINF:-1 tvg-id=\"good\",Good TV\nhttp://192.168.1.50:18080/live.ts\n" +
 		"#EXTINF:-1 tvg-id=\"bad\",Bad TV\nhttp://169.254.169.254/live.ts\n"
 	res := doJSON(t, mux, http.MethodPost, "/LiveTv/TunerHosts", map[string]any{
-		"Type":       "m3u",
-		"M3UContent": m3u,
+		"Type":                "m3u",
+		"AllowPrivateNetwork": true,
+		"M3UContent":          m3u,
 	})
 	if res.Code != http.StatusOK {
 		t.Fatalf("seed tuner: %d", res.Code)

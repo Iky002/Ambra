@@ -24,7 +24,7 @@ const (
 )
 
 // AmbraVersion is the Ambra application release version (overridden at build time via -ldflags).
-var AmbraVersion = "v0.10.8"
+var AmbraVersion = "v0.10.9"
 
 type envOverrideFlags struct {
 	httpAddr           bool
@@ -217,7 +217,7 @@ func Load(dataDir string) (*Config, error) {
 		cfg.envFlags.ffprobePath = true
 	}
 	exePath, _ := executablePathFn()
-	cfg.FFmpegPath, cfg.FFprobePath = ffmpegbin.Resolve(ffmpegbin.ResolveOptions{
+	resolvedFFmpeg, resolvedFFprobe := ffmpegbin.Resolve(ffmpegbin.ResolveOptions{
 		DataDir:        cfg.DataDir,
 		ConfigFFmpeg:   cfg.FFmpegPath,
 		ConfigFFprobe:  cfg.FFprobePath,
@@ -225,6 +225,15 @@ func Load(dataDir string) (*Config, error) {
 		EnvFFprobe:     envFFprobe,
 		ExecutablePath: exePath,
 	})
+	// Preserve disk baseline on Save() when ffmpegbin.Resolve auto-discovers an absolute path
+	// from default names ("ffmpeg"/"ffprobe"), unless explicitly updated via Update().
+	if !cfg.envFlags.ffmpegPath && resolvedFFmpeg != cfg.baseline.ffmpegPath {
+		cfg.envFlags.ffmpegPath = true
+	}
+	if !cfg.envFlags.ffprobePath && resolvedFFprobe != cfg.baseline.ffprobePath {
+		cfg.envFlags.ffprobePath = true
+	}
+	cfg.FFmpegPath, cfg.FFprobePath = resolvedFFmpeg, resolvedFFprobe
 	return cfg, nil
 }
 
@@ -248,6 +257,28 @@ func stringSlicesEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// MarkHTTPAddrRuntimeOverride marks the current HTTPAddr as an ephemeral runtime override
+// (e.g. from CLI -addr) so Save() preserves the disk baseline until explicitly changed via Update().
+func (c *Config) MarkHTTPAddrRuntimeOverride() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.envFlags.httpAddr = true
+	c.mu.Unlock()
+}
+
+// MarkWebDirRuntimeOverride marks the current WebDir as an ephemeral runtime override
+// (e.g. from CLI -web) so Save() preserves the disk baseline until explicitly changed via Update().
+func (c *Config) MarkWebDirRuntimeOverride() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.envFlags.webDir = true
+	c.mu.Unlock()
 }
 
 // Update safely mutates configuration fields under the internal mutex.

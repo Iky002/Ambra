@@ -408,6 +408,7 @@ func (h *Handler) handleCreateCollection(w http.ResponseWriter, r *http.Request)
 	if len(ids) == 0 {
 		ids = body.Ids
 	}
+	ids = h.filterAccessibleItemIDs(r, "", ids)
 
 	rec, err := h.repo.CreateCollection(r.Context(), name, parentID, ids)
 	if err != nil {

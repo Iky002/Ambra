@@ -279,27 +279,27 @@ func TestSyncExportedDelegationHelpers(t *testing.T) {
 	}
 
 	// SetJobItemRemovalForCaller
-	if found, allowed := h.SetJobItemRemovalForCaller(ctx, ji1, true, "bob", false); !found || allowed {
-		t.Fatalf("expected forbidden for bob mark removal: found=%v allowed=%v", found, allowed)
+	if found, allowed, err := h.SetJobItemRemovalForCaller(ctx, ji1, true, "bob", false); err != nil || !found || allowed {
+		t.Fatalf("expected forbidden for bob mark removal: found=%v allowed=%v err=%v", found, allowed, err)
 	}
-	if found, allowed := h.SetJobItemRemovalForCaller(ctx, ji1, true, "user-1", false); !found || !allowed {
-		t.Fatalf("expected user-1 mark removal ok: found=%v allowed=%v", found, allowed)
+	if found, allowed, err := h.SetJobItemRemovalForCaller(ctx, ji1, true, "user-1", false); err != nil || !found || !allowed {
+		t.Fatalf("expected user-1 mark removal ok: found=%v allowed=%v err=%v", found, allowed, err)
 	}
-	if found, allowed := h.SetJobItemRemovalForCaller(ctx, ji1, false, "user-1", false); !found || !allowed {
-		t.Fatalf("expected user-1 unmark removal ok: found=%v allowed=%v", found, allowed)
+	if found, allowed, err := h.SetJobItemRemovalForCaller(ctx, ji1, false, "user-1", false); err != nil || !found || !allowed {
+		t.Fatalf("expected user-1 unmark removal ok: found=%v allowed=%v err=%v", found, allowed, err)
 	}
-	if found, _ := h.SetJobItemRemovalForCaller(ctx, "missing", true, "user-1", false); found {
+	if found, _, err := h.SetJobItemRemovalForCaller(ctx, "missing", true, "user-1", false); err != nil || found {
 		t.Fatal("expected missing mark removal found=false")
 	}
 
 	// DeleteJobItemForCaller
-	if found, allowed := h.DeleteJobItemForCaller(ctx, ji1, "bob", false); !found || allowed {
-		t.Fatalf("expected forbidden for bob delete item: found=%v allowed=%v", found, allowed)
+	if found, allowed, err := h.DeleteJobItemForCaller(ctx, ji1, "bob", false); err != nil || !found || allowed {
+		t.Fatalf("expected forbidden for bob delete item: found=%v allowed=%v err=%v", found, allowed, err)
 	}
-	if found, allowed := h.DeleteJobItemForCaller(ctx, ji1, "user-1", false); !found || !allowed {
-		t.Fatalf("expected user-1 delete ji1 ok: found=%v allowed=%v", found, allowed)
+	if found, allowed, err := h.DeleteJobItemForCaller(ctx, ji1, "user-1", false); err != nil || !found || !allowed {
+		t.Fatalf("expected user-1 delete ji1 ok: found=%v allowed=%v err=%v", found, allowed, err)
 	}
-	if found, _ := h.DeleteJobItemForCaller(ctx, "missing", "user-1", false); found {
+	if found, _, err := h.DeleteJobItemForCaller(ctx, "missing", "user-1", false); err != nil || found {
 		t.Fatal("expected missing delete found=false")
 	}
 

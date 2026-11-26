@@ -319,6 +319,116 @@ function createInitialLiveTvRecordings(): LiveTvRecordingInfo[] {
   ]
 }
 
+function sanitizeWebhookForResponse(w: WebhookInfo): WebhookInfo {
+  const { Secret: _secret, ...rest } = w
+  return {
+    ...rest,
+    HasSecret: Boolean(w.Secret || w.HasSecret),
+    Events: [...w.Events],
+  }
+}
+
+const DEMO_MASKED_SECRET = '********'
+
+function isSensitivePluginConfigKey(key: string): boolean {
+  const lower = key.trim().toLowerCase()
+  return (
+    lower === 'api_key' ||
+    lower === 'apikey' ||
+    lower === 'tmdb_api_key' ||
+    lower === 'tvdb_api_key' ||
+    lower === 'pin' ||
+    lower === 'tvdb_pin' ||
+    lower === 'secret' ||
+    lower === 'token' ||
+    lower === 'access_token' ||
+    lower === 'accesstoken' ||
+    lower === 'password' ||
+    lower === 'bot_token' ||
+    lower.endsWith('_secret') ||
+    lower.endsWith('_token') ||
+    lower.endsWith('_key') ||
+    lower.endsWith('secret') ||
+    lower.endsWith('token') ||
+    lower.endsWith('apikey') ||
+    lower.endsWith('password')
+  )
+}
+
+function maskPluginConfigForResponse(cfg: Record<string, unknown>): Record<string, unknown> {
+  const masked: Record<string, unknown> = {}
+  for (const [key, val] of Object.entries(cfg)) {
+    if (isSensitivePluginConfigKey(key) && typeof val === 'string' && val.trim() !== '') {
+      masked[key] = DEMO_MASKED_SECRET
+    } else {
+      masked[key] = val
+    }
+  }
+  return masked
+}
+
+function mergePluginConfigForSave(
+  prev: Record<string, unknown>,
+  incoming: Record<string, unknown>,
+): Record<string, unknown> {
+  const prevLowerMap = new Map<string, string>()
+  for (const [k, v] of Object.entries(prev)) {
+    if (typeof v === 'string' && v.trim() !== '') {
+      prevLowerMap.set(k.toLowerCase(), v)
+    }
+  }
+  const merged: Record<string, unknown> = {}
+  for (const [key, val] of Object.entries(incoming)) {
+    if (isSensitivePluginConfigKey(key) && typeof val === 'string') {
+      const trimmed = val.trim()
+      if (trimmed === DEMO_MASKED_SECRET) {
+        const lower = key.toLowerCase()
+        const existing =
+          (typeof prev[key] === 'string' && (prev[key] as string).trim() !== ''
+            ? (prev[key] as string)
+            : prevLowerMap.get(lower)) ||
+          (lower.includes('key')
+            ? prevLowerMap.get('apikey') || prevLowerMap.get('api_key')
+            : undefined) ||
+          (lower.includes('pin')
+            ? prevLowerMap.get('pin') || prevLowerMap.get('tvdb_pin')
+            : undefined)
+        merged[key] = existing || ''
+      } else if (trimmed === '') {
+        merged[key] = ''
+      } else {
+        merged[key] = trimmed
+      }
+    } else {
+      merged[key] = val
+    }
+  }
+  for (const [key, val] of Object.entries(prev)) {
+    if (
+      !(key in merged) &&
+      isSensitivePluginConfigKey(key) &&
+      typeof val === 'string' &&
+      val.trim() !== ''
+    ) {
+      const lower = key.toLowerCase()
+      const explicitlyCleared = Object.entries(incoming).some(
+        ([ik, iv]) =>
+          typeof iv === 'string' &&
+          iv.trim() === '' &&
+          (ik.toLowerCase() === lower ||
+            (lower.includes('key') &&
+              (ik.toLowerCase() === 'api_key' || ik.toLowerCase() === 'apikey')) ||
+            (lower.includes('pin') &&
+              (ik.toLowerCase() === 'pin' || ik.toLowerCase() === 'tvdb_pin'))),
+      )
+      if (!explicitlyCleared) {
+        merged[key] = val
+      }
+    }
+  }
+  return merged
+}
+
 function createInitialDemoWebhooks(): WebhookInfo[] {
   return [
     {
@@ -387,7 +497,7 @@ function createInitialDemoNotifications(): DemoNotificationRecord[] {
     {
       Id: 'notif-demo-01',
       Date: new Date(now - 15 * 60_000).toISOString(),
-      Name: '欢迎体验 Ambra v0.10.6',
+      Name: '欢迎体验 Ambra v0.10.9',
       Description: '已上线应用内通知中心、家长控制分级过滤与 Quick Connect 设备授权码登录。',
       Level: 'Normal',
       readByUsers: new Set(),
@@ -2691,13 +2801,18 @@ export async function demoFetch<T>(
       throw new ApiError(403, 'Administrator privileges required')
     }
     if (method === 'GET') {
-      return { ...(store.pluginConfigs.get(pluginId) || {}) } as T
+      return maskPluginConfigForResponse(store.pluginConfigs.get(pluginId) || {}) as T
     }
     if (method === 'POST') {
       const body = parseJsonBody(options)
-      const nextCfg = personalTrakt ? Object.fromEntries(
-        Object.entries(body).filter(([key]) => ['Enabled', 'enabled', 'Priority', 'priority'].includes(key)),
-      ) : body
+      const prevCfg = store.pluginConfigs.get(pluginId) || {}
+      const nextCfg = personalTrakt
+        ? Object.fromEntries(
+            Object.entries(body).filter(([key]) =>
+              ['Enabled', 'enabled', 'Priority', 'priority'].includes(key),
+            ),
+          )
+        : mergePluginConfigForSave(prevCfg, body)
       store.pluginConfigs.set(pluginId, nextCfg)
       const plugin = store.plugins.find((p) => p.Id === pluginId)
       if (plugin) {
@@ -3019,7 +3134,7 @@ export async function demoFetch<T>(
   // Webhooks 事件通知管理
   if (pathname === '/emby/Webhooks') {
     if (method === 'GET') {
-      return demoWebhooks.map((w) => ({ ...w, Events: [...w.Events] })) as T
+      return demoWebhooks.map((w) => sanitizeWebhookForResponse(w)) as T
     }
     if (method === 'POST') {
       const body = parseJsonBody(options)
@@ -3052,7 +3167,7 @@ export async function demoFetch<T>(
         }
         demoWebhooks[existingIdx] = updated
         pushActivity(`已更新 Webhook「${updated.Name}」`, 'WebhookUpdated')
-        return { ...updated, Events: [...updated.Events] } as T
+        return sanitizeWebhookForResponse(updated) as T
       }
 
       const created: WebhookInfo = {
@@ -3067,7 +3182,7 @@ export async function demoFetch<T>(
       }
       demoWebhooks.push(created)
       pushActivity(`已创建 Webhook「${created.Name}」`, 'WebhookCreated')
-      return { ...created, Events: [...created.Events] } as T
+      return sanitizeWebhookForResponse(created) as T
     }
   }
 
@@ -3992,7 +4107,7 @@ export async function demoFetch<T>(
       DeviceId: 'dev-demo-web-01',
       DeviceName: 'Ambra Web Demo',
       AppName: 'Ambra Web',
-      AppVersion: '0.10.6',
+      AppVersion: '0.10.9',
       DateAdded: new Date().toISOString(),
     }
     demoQuickConnectSessions.set(secret, session)

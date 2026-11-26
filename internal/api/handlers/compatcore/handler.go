@@ -44,6 +44,8 @@ const (
 	maxSearchedItemsEntries   = 50
 	maxPartyMessageBytes      = 64 << 10
 	maxKVJSONBodyBytes        = 64 << 10
+	maxTypedSettingKeyLen     = 128
+	maxUserTypedSettingsKeys  = 100
 )
 
 type forgotPinEntry struct {
@@ -415,9 +417,19 @@ func (h *Handler) saveKVLocked(ctx context.Context, key string, val any) error {
 	return nil
 }
 
+func (h *Handler) kvStore() *sqlite.Store {
+	if h.store != nil {
+		return h.store
+	}
+	if h.userRepo != nil {
+		return h.userRepo.Store()
+	}
+	return nil
+}
+
 func (h *Handler) deleteKV(ctx context.Context, key string) error {
-	if h.store != nil && h.store.Writer != nil {
-		_, err := h.store.Writer.ExecContext(ctx, `DELETE FROM server_config WHERE key = ?`, key)
+	if st := h.kvStore(); st != nil && st.Writer != nil {
+		_, err := st.Writer.ExecContext(ctx, `DELETE FROM server_config WHERE key = ?`, key)
 		return err
 	}
 	h.mu.Lock()

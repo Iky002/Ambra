@@ -1115,6 +1115,9 @@ func (h *Handler) handleSearchHints(w http.ResponseWriter, r *http.Request) {
 	if reqLimit <= 0 {
 		reqLimit = 24
 	}
+	if reqLimit > 200 {
+		reqLimit = 200
+	}
 	nonAdmin := h.isNonAdminCaller(r)
 	var hiddenSet map[string]bool
 	fetchLimit := reqLimit

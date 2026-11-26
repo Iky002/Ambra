@@ -15,28 +15,20 @@ import (
 )
 
 func TestAuditV0107_H9_HostChangeClearsCredsAndM17_NoAutoBindAndDedupRace(t *testing.T) {
-	// 1. H-9: Host change without new creds clears clientID and accessToken
+	// 1. M-32: Configure ignores runtime base_url overrides so user OAuth tokens cannot be redirected.
 	p := New()
 	p.SetHTTPClient(nil)
 	if err := p.Configure(map[string]any{
 		"enabled":      true,
 		"client_id":    "cid-secret",
 		"access_token": "tok-secret",
-		"base_url":     "https://api.trakt.tv",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := p.Configure(map[string]any{
-		"base_url": "https://attacker.example.com",
+		"base_url":     "https://attacker.example.com",
 	}); err != nil {
 		t.Fatal(err)
 	}
 	snap := p.snapshot()
-	if snap.clientID != "" || snap.accessToken != "" {
-		t.Fatalf("expected clientID and accessToken cleared on host change, got cid=%q tok=%q", snap.clientID, snap.accessToken)
-	}
-	if urlHostLower("://bad") != "" {
-		t.Fatal("expected empty host on invalid URL")
+	if snap.clientID != "" || snap.accessToken != "" || snap.baseURL != defaultBaseURL {
+		t.Fatalf("expected default baseURL and no global creds, got %+v", snap)
 	}
 
 	// 2. M-17a: Without explicit user_id, plugin does NOT silently bind to random first user

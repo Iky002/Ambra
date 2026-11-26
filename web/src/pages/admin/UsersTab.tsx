@@ -31,6 +31,7 @@ export function UsersTab() {
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
     null,
   )
+  const [modalError, setModalError] = useState<string | null>(null)
 
   // 新建用户弹窗状态
   const [createOpen, setCreateOpen] = useState(false)
@@ -103,10 +104,11 @@ export function UsersTab() {
   const handleCreateUser = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!newName.trim()) {
-      setFeedback({ type: 'error', message: '请输入用户名' })
+      setModalError('请输入用户名')
       return
     }
     setCreating(true)
+    setModalError(null)
     setFeedback(null)
     try {
       await api.createUser({
@@ -119,12 +121,10 @@ export function UsersTab() {
       setNewName('')
       setNewPassword('')
       setNewIsAdmin(false)
+      setModalError(null)
       setFeedback({ type: 'success', message: `用户「${newName.trim()}」创建成功` })
     } catch (err) {
-      setFeedback({
-        type: 'error',
-        message: err instanceof Error ? err.message : '创建用户失败',
-      })
+      setModalError(err instanceof Error ? err.message : '创建用户失败')
     } finally {
       setCreating(false)
     }
@@ -133,23 +133,23 @@ export function UsersTab() {
   const handleDeleteUser = async () => {
     if (!deleteTarget) return
     setDeleting(true)
+    setModalError(null)
     setFeedback(null)
     try {
       await api.deleteUser(deleteTarget.Id)
       await invalidateUsers()
       setFeedback({ type: 'success', message: `已删除用户「${deleteTarget.Name}」` })
       setDeleteTarget(null)
+      setModalError(null)
     } catch (err) {
-      setFeedback({
-        type: 'error',
-        message: err instanceof Error ? err.message : '删除用户失败',
-      })
+      setModalError(err instanceof Error ? err.message : '删除用户失败')
     } finally {
       setDeleting(false)
     }
   }
 
   const openPasswordModal = (u: UserDto) => {
+    setModalError(null)
     setPwTarget(u)
     setCurrentPw('')
     setNextPw('')
@@ -161,6 +161,7 @@ export function UsersTab() {
     if (!pwTarget) return
     const isSelf = pwTarget.Id === auth?.userId
     setSavingPw(true)
+    setModalError(null)
     setFeedback(null)
     try {
       await api.updateUserPassword(pwTarget.Id, {
@@ -180,19 +181,18 @@ export function UsersTab() {
             : `已更新用户「${pwTarget.Name}」的密码`,
       })
       setPwTarget(null)
+      setModalError(null)
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         setPwTarget(null)
+        setModalError(null)
         setFeedback({
           type: 'error',
           message: '当前登录会话已失效，请重新登录',
         })
         return
       }
-      setFeedback({
-        type: 'error',
-        message: err instanceof Error ? err.message : '更新密码失败',
-      })
+      setModalError(err instanceof Error ? err.message : '更新密码失败')
     } finally {
       setSavingPw(false)
     }
@@ -220,6 +220,7 @@ export function UsersTab() {
   const openPolicyModal = (u: UserDto) => {
     const p = u.Policy || {}
     const blockedTags = Array.isArray(p.BlockedTags) ? [...p.BlockedTags] : []
+    setModalError(null)
     setPolicyTarget(u)
     setBlockedTagsInput(blockedTags.join(', '))
     setDraftPolicy({
@@ -257,6 +258,7 @@ export function UsersTab() {
     e.preventDefault()
     if (!policyTarget) return
     setSavingPolicy(true)
+    setModalError(null)
     setFeedback(null)
     try {
       const nextPolicy: UserPolicy = {
@@ -271,11 +273,9 @@ export function UsersTab() {
       }
       setFeedback({ type: 'success', message: `已更新「${policyTarget.Name}」的权限策略` })
       setPolicyTarget(null)
+      setModalError(null)
     } catch (err) {
-      setFeedback({
-        type: 'error',
-        message: err instanceof Error ? err.message : '保存权限策略失败',
-      })
+      setModalError(err instanceof Error ? err.message : '保存权限策略失败')
     } finally {
       setSavingPolicy(false)
     }
@@ -296,7 +296,10 @@ export function UsersTab() {
 
         <button
           type="button"
-          onClick={() => setCreateOpen(true)}
+          onClick={() => {
+            setModalError(null)
+            setCreateOpen(true)
+          }}
           className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-4 py-2 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/20 transition-colors hover:bg-amber-400"
         >
           <UserPlus className="h-4 w-4" />
@@ -435,7 +438,10 @@ export function UsersTab() {
                   <button
                     type="button"
                     disabled={isSelf}
-                    onClick={() => setDeleteTarget(u)}
+                    onClick={() => {
+                      setModalError(null)
+                      setDeleteTarget(u)
+                    }}
                     title={isSelf ? '不能删除当前登录账号' : '删除用户'}
                     className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-35"
                   >
@@ -454,9 +460,17 @@ export function UsersTab() {
         open={createOpen}
         title="新建用户"
         subtitle="创建一个新的 Ambra 媒体服务器账号"
-        onClose={() => setCreateOpen(false)}
+        onClose={() => {
+          setCreateOpen(false)
+          setModalError(null)
+        }}
       >
         <form onSubmit={handleCreateUser} className="space-y-4">
+          <FeedbackBanner
+            message={modalError ?? undefined}
+            type="error"
+            onClose={() => setModalError(null)}
+          />
           <div>
             <label className="mb-1.5 block text-xs font-medium text-zinc-400">用户名 *</label>
             <input
@@ -489,7 +503,10 @@ export function UsersTab() {
           <div className="flex justify-end gap-2 pt-2">
             <button
               type="button"
-              onClick={() => setCreateOpen(false)}
+              onClick={() => {
+                setCreateOpen(false)
+                setModalError(null)
+              }}
               className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
             >
               取消
@@ -511,9 +528,17 @@ export function UsersTab() {
         open={Boolean(pwTarget)}
         title={`修改密码 · ${pwTarget?.Name || ''}`}
         subtitle="管理员可直接为其他用户设置新密码或重置为空密码"
-        onClose={() => setPwTarget(null)}
+        onClose={() => {
+          setPwTarget(null)
+          setModalError(null)
+        }}
       >
         <form onSubmit={handleUpdatePassword} className="space-y-4">
+          <FeedbackBanner
+            message={modalError ?? undefined}
+            type="error"
+            onClose={() => setModalError(null)}
+          />
           {pwTarget?.Id === auth?.userId && (
             <div>
               <label className="mb-1.5 block text-xs font-medium text-zinc-400">
@@ -552,7 +577,10 @@ export function UsersTab() {
           <div className="flex justify-end gap-2 pt-2">
             <button
               type="button"
-              onClick={() => setPwTarget(null)}
+              onClick={() => {
+                setPwTarget(null)
+                setModalError(null)
+              }}
               className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
             >
               取消
@@ -575,9 +603,17 @@ export function UsersTab() {
         title={`权限策略 · ${policyTarget?.Name || ''}`}
         subtitle="精细配置账号角色、媒体库可见范围与播放/管理权限"
         maxWidthClass="max-w-xl"
-        onClose={() => setPolicyTarget(null)}
+        onClose={() => {
+          setPolicyTarget(null)
+          setModalError(null)
+        }}
       >
         <form onSubmit={handleSavePolicy} className="space-y-3">
+          <FeedbackBanner
+            message={modalError ?? undefined}
+            type="error"
+            onClose={() => setModalError(null)}
+          />
           <ToggleSwitch
             checked={Boolean(draftPolicy.IsAdministrator)}
             onChange={(v) => setDraftPolicy((p) => ({ ...p, IsAdministrator: v }))}
@@ -740,7 +776,10 @@ export function UsersTab() {
           <div className="flex justify-end gap-2 pt-3">
             <button
               type="button"
-              onClick={() => setPolicyTarget(null)}
+              onClick={() => {
+                setPolicyTarget(null)
+                setModalError(null)
+              }}
               className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
             >
               取消
@@ -763,29 +802,42 @@ export function UsersTab() {
         title="确认删除用户"
         subtitle="此操作不可恢复，将清除该用户的登录凭证与个人数据"
         maxWidthClass="max-w-md"
-        onClose={() => setDeleteTarget(null)}
+        onClose={() => {
+          setDeleteTarget(null)
+          setModalError(null)
+        }}
       >
-        <p className="text-sm text-zinc-300">
-          确定要永久删除用户 <span className="font-semibold text-white">{deleteTarget?.Name}</span>{' '}
-          吗？
-        </p>
-        <div className="mt-6 flex justify-end gap-2">
-          <button
-            type="button"
-            onClick={() => setDeleteTarget(null)}
-            className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
-          >
-            取消
-          </button>
-          <button
-            type="button"
-            disabled={deleting}
-            onClick={handleDeleteUser}
-            className="inline-flex items-center gap-2 rounded-xl bg-red-500 px-4 py-2 text-xs font-semibold text-white hover:bg-red-400 disabled:opacity-60"
-          >
-            {deleting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-            <span>确认删除</span>
-          </button>
+        <div className="space-y-4">
+          <FeedbackBanner
+            message={modalError ?? undefined}
+            type="error"
+            onClose={() => setModalError(null)}
+          />
+          <p className="text-sm text-zinc-300">
+            确定要永久删除用户 <span className="font-semibold text-white">{deleteTarget?.Name}</span>{' '}
+            吗？
+          </p>
+          <div className="mt-6 flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                setDeleteTarget(null)
+                setModalError(null)
+              }}
+              className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              disabled={deleting}
+              onClick={handleDeleteUser}
+              className="inline-flex items-center gap-2 rounded-xl bg-red-500 px-4 py-2 text-xs font-semibold text-white hover:bg-red-400 disabled:opacity-60"
+            >
+              {deleting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+              <span>确认删除</span>
+            </button>
+          </div>
         </div>
       </AdminModal>
     </div>

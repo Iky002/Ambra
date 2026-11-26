@@ -44,6 +44,8 @@ func (p *Provider) Manifest() plugins.Manifest {
 func (p *Provider) Configure(cfg map[string]any) error {
 	if v, ok := cfg["enabled"].(bool); ok {
 		p.enabled.Store(v)
+	} else if v, ok := cfg["Enabled"].(bool); ok {
+		p.enabled.Store(v)
 	}
 	return nil
 }

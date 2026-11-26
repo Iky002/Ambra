@@ -475,24 +475,37 @@ func tokenizeForFTS(text string) string {
 }
 
 func syncItemSearchFTSTx(ctx context.Context, tx *sql.Tx, itemID, name, originalTitle string) error {
-	var peopleNames string
-	_ = tx.QueryRowContext(ctx,
-		`SELECT COALESCE(people_names, '') FROM item_search_fts WHERE item_id = ? LIMIT 1`,
-		itemID,
-	).Scan(&peopleNames)
+	var rawPeople []string
+	pRows, pErr := tx.QueryContext(ctx, `
+		SELECT p.name
+		FROM item_people ip
+		JOIN people p ON p.id = ip.person_id
+		WHERE ip.item_id = ?
+		ORDER BY ip.sort_order ASC, p.sort_name ASC`, itemID,
+	)
+	if pErr == nil {
+		for pRows.Next() {
+			var pName string
+			if err := pRows.Scan(&pName); err == nil {
+				if trimmed := strings.TrimSpace(pName); trimmed != "" {
+					rawPeople = append(rawPeople, trimmed)
+				}
+			}
+		}
+		_ = pRows.Close()
+	}
 
 	titleRaw := strings.TrimSpace(name)
 	if orig := strings.TrimSpace(originalTitle); orig != "" && !strings.EqualFold(orig, titleRaw) {
 		titleRaw = strings.TrimSpace(titleRaw + " " + orig)
 	}
 	titleRaw = sqlite.TradToSimp(titleRaw)
-	peopleRaw := sqlite.TradToSimp(peopleNames)
+	peopleRaw := sqlite.TradToSimp(strings.Join(rawPeople, " "))
 	titleTokens := tokenizeForFTS(titleRaw)
 	pinyinFull, pinyinInitials := sqlite.ToPinyin(strings.TrimSpace(titleRaw + " " + peopleRaw))
+	peopleNames := ""
 	if strings.TrimSpace(peopleRaw) != "" {
 		peopleNames = tokenizeForFTS(peopleRaw)
-	} else {
-		peopleNames = ""
 	}
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM item_search_fts WHERE item_id = ?`, itemID); err != nil {
@@ -505,16 +518,22 @@ func syncItemSearchFTSTx(ctx context.Context, tx *sql.Tx, itemID, name, original
 	return err
 }
 
-// DismissAudit marks a scrape audit queue item as dismissed without modifying the item.
+// DismissAudit marks a pending scrape audit queue item as dismissed within a transaction.
 func (s *Service) DismissAudit(ctx context.Context, auditID string) (*ScrapeAuditItem, error) {
 	auditID = strings.TrimSpace(auditID)
 	if auditID == "" {
 		return nil, fmt.Errorf("%w: audit id is required", ErrInvalidArgument)
 	}
 
+	tx, err := s.store.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
 	var rec ScrapeAuditItem
 	var candRaw string
-	err := s.store.Reader.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, `
 		SELECT id, item_id, item_name, item_type, path, confidence, candidates_json, status, created_at, updated_at
 		FROM scrape_audit_queue WHERE id = ?`, auditID,
 	).Scan(
@@ -527,16 +546,26 @@ func (s *Service) DismissAudit(ctx context.Context, auditID string) (*ScrapeAudi
 	if err != nil {
 		return nil, err
 	}
+	if rec.Status != AuditStatusPending {
+		return nil, fmt.Errorf("%w: audit item %s is not pending (status=%s)", ErrInvalidArgument, rec.ID, rec.Status)
+	}
 	_ = json.Unmarshal([]byte(candRaw), &rec.Candidates)
 	if rec.Candidates == nil {
 		rec.Candidates = []ScrapeCandidate{}
 	}
 
 	now := time.Now().Unix()
-	if _, err := s.store.Writer.ExecContext(ctx,
-		`UPDATE scrape_audit_queue SET status = ?, updated_at = ? WHERE id = ?`,
-		AuditStatusDismissed, now, rec.ID,
-	); err != nil {
+	res, err := tx.ExecContext(ctx,
+		`UPDATE scrape_audit_queue SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
+		AuditStatusDismissed, now, rec.ID, AuditStatusPending,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		return nil, fmt.Errorf("%w: audit item %s is no longer pending", ErrInvalidArgument, rec.ID)
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	rec.Status = AuditStatusDismissed
@@ -556,20 +585,27 @@ func (s *Service) RunLibraryAudit(ctx context.Context) (*LibraryAuditReport, err
 		OrphanItems:    []AuditIssueItem{},
 	}
 
-	// Build a set of item IDs that have a Primary image.
+	// Build a set of item IDs that have an existing, non-empty Primary image file on disk.
 	hasPrimary := make(map[string]struct{})
 	imgRows, err := s.store.Reader.QueryContext(ctx,
-		`SELECT DISTINCT item_id FROM item_images WHERE lower(image_type) = 'primary'`)
+		`SELECT item_id, path FROM item_images WHERE lower(image_type) = 'primary'`)
 	if err != nil {
 		return nil, err
 	}
 	for imgRows.Next() {
 		var id string
-		if err := imgRows.Scan(&id); err != nil {
+		var imgPath sql.NullString
+		if err := imgRows.Scan(&id, &imgPath); err != nil {
 			_ = imgRows.Close()
 			return nil, err
 		}
-		hasPrimary[id] = struct{}{}
+		p := strings.TrimSpace(imgPath.String)
+		if p == "" {
+			continue
+		}
+		if info, statErr := os.Stat(p); statErr == nil && !info.IsDir() && info.Size() > 0 {
+			hasPrimary[id] = struct{}{}
+		}
 	}
 	if err := imgRows.Err(); err != nil {
 		_ = imgRows.Close()
@@ -796,6 +832,9 @@ func (s *Service) CleanupOrphans(ctx context.Context, itemIDs []string) (*Orphan
 			continue
 		}
 
+		if _, err := tx.ExecContext(ctx, `DELETE FROM item_images WHERE item_id = ?`, id); err != nil {
+			return nil, err
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM item_search_fts WHERE item_id = ?`, id); err != nil {
 			return nil, err
 		}

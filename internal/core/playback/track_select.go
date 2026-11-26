@@ -367,8 +367,39 @@ func isTextSubtitleCodec(codec string) bool {
 	}
 }
 
+// extractSubtitlePathSuffix extracts only trailing language/variant suffix segments
+// from an external subtitle filename (e.g. "Movie.SC.2024.chs.default.srt" -> "chs default")
+// so tokens inside the main video title cannot cause false Chinese variant detection.
+func extractSubtitlePathSuffix(rawPath string) string {
+	p := strings.TrimSpace(rawPath)
+	if p == "" {
+		return ""
+	}
+	base := filepath.Base(strings.ReplaceAll(p, "\\", "/"))
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	if stem == "" {
+		return ""
+	}
+	parts := strings.Split(stem, ".")
+	if len(parts) <= 1 {
+		return stem
+	}
+	// Take up to the last 2 dot-separated suffix segments (e.g. ".zh-cn.forced", ".chs.default"),
+	// skipping the leading video title segment(s).
+	start := len(parts) - 2
+	if start < 1 {
+		start = 1
+	}
+	return strings.Join(parts[start:], " ")
+}
+
 // detectSubChineseVariant returns "chs", "cht", "bilingual", or "".
 func detectSubChineseVariant(st dto.MediaStream) string {
+	if isExplicitNonChineseLang(st.Language) {
+		return ""
+	}
+
 	sv := strings.ToLower(strings.TrimSpace(st.SubVariant))
 	switch sv {
 	case "chs", "sc", "zh-cn", "zh-hans":
@@ -379,12 +410,9 @@ func detectSubChineseVariant(st dto.MediaStream) string {
 		return "bilingual"
 	}
 
-	basePath := strings.TrimSpace(st.Path)
-	if basePath != "" {
-		basePath = filepath.Base(strings.ReplaceAll(basePath, "\\", "/"))
-	}
+	pathSuffix := extractSubtitlePathSuffix(st.Path)
 	combined := strings.ToLower(strings.Join([]string{
-		st.Language, st.DisplayLanguage, st.Title, st.DisplayTitle, basePath,
+		st.Language, st.DisplayLanguage, st.Title, st.DisplayTitle, pathSuffix,
 	}, " "))
 
 	hasBilingual := strings.Contains(combined, "双语") ||
@@ -397,7 +425,7 @@ func detectSubChineseVariant(st dto.MediaStream) string {
 		strings.Contains(combined, "簡繁") ||
 		strings.Contains(combined, "bilingual")
 
-	allowShortTokens := !isExplicitNonChineseLang(st.Language) && !hasExplicitNonChineseSubtitleMarker(combined)
+	allowShortTokens := !hasExplicitNonChineseSubtitleMarker(combined)
 	shortTokenText := stripNonChineseRegionPairs(combined)
 
 	hasCHS := strings.Contains(combined, "简体") ||

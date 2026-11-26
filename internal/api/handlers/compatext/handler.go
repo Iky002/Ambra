@@ -436,15 +436,61 @@ func (h *Handler) loadState(ctx context.Context) {
 	}
 }
 
-func (h *Handler) saveStateLocked(ctx context.Context) {
+func cloneCompatExtState(st compatExtState) compatExtState {
+	out := compatExtState{
+		ChannelDisabled:   make(map[string]bool, len(st.ChannelDisabled)),
+		ChannelSortIndex:  make(map[string]int, len(st.ChannelSortIndex)),
+		ChannelMappings:   make(map[string][]ChannelMapping, len(st.ChannelMappings)),
+		TunerResetAt:      make(map[string]int64, len(st.TunerResetAt)),
+		RemovedJobItems:   make(map[string]bool, len(st.RemovedJobItems)),
+		LastTestNotifUnix: st.LastTestNotifUnix,
+	}
+	for k, v := range st.ChannelDisabled {
+		out.ChannelDisabled[k] = v
+	}
+	for k, v := range st.ChannelSortIndex {
+		out.ChannelSortIndex[k] = v
+	}
+	for k, v := range st.ChannelMappings {
+		out.ChannelMappings[k] = append([]ChannelMapping(nil), v...)
+	}
+	for k, v := range st.TunerResetAt {
+		out.TunerResetAt[k] = v
+	}
+	for k, v := range st.RemovedJobItems {
+		out.RemovedJobItems[k] = v
+	}
+	if st.OfflineActions != nil {
+		out.OfflineActions = append([]OfflineAction(nil), st.OfflineActions...)
+	}
+	if st.NotificationServices != nil {
+		out.NotificationServices = make([]NotificationServiceConfig, len(st.NotificationServices))
+		for i, svc := range st.NotificationServices {
+			cp := svc
+			if svc.Events != nil {
+				cp.Events = append([]string(nil), svc.Events...)
+			}
+			if svc.Options != nil {
+				cp.Options = make(map[string]string, len(svc.Options))
+				for k, v := range svc.Options {
+					cp.Options[k] = v
+				}
+			}
+			out.NotificationServices[i] = cp
+		}
+	}
+	return out
+}
+
+func (h *Handler) saveStateLocked(ctx context.Context) error {
 	if h.store == nil {
-		return
+		return nil
 	}
 	raw, err := json.Marshal(h.state)
 	if err != nil {
-		return
+		return err
 	}
-	_, _ = h.store.Writer.ExecContext(ctx, `
+	_, err = h.store.Writer.ExecContext(ctx, `
 		INSERT INTO server_config (key, value_json, updated_at)
 		VALUES (?, ?, ?)
 		ON CONFLICT(key) DO UPDATE SET
@@ -452,6 +498,7 @@ func (h *Handler) saveStateLocked(ctx context.Context) {
 			updated_at = excluded.updated_at`,
 		stateConfigKey, string(raw), time.Now().UTC().Unix(),
 	)
+	return err
 }
 
 func (h *Handler) readConfigJSON(ctx context.Context, key string, dst any) bool {
@@ -468,15 +515,15 @@ func (h *Handler) readConfigJSON(ctx context.Context, key string, dst any) bool 
 	return json.Unmarshal([]byte(raw), dst) == nil
 }
 
-func (h *Handler) writeConfigJSON(ctx context.Context, key string, src any) {
+func (h *Handler) writeConfigJSON(ctx context.Context, key string, src any) error {
 	if h.store == nil {
-		return
+		return nil
 	}
 	raw, err := json.Marshal(src)
 	if err != nil {
-		return
+		return err
 	}
-	_, _ = h.store.Writer.ExecContext(ctx, `
+	_, err = h.store.Writer.ExecContext(ctx, `
 		INSERT INTO server_config (key, value_json, updated_at)
 		VALUES (?, ?, ?)
 		ON CONFLICT(key) DO UPDATE SET
@@ -484,6 +531,7 @@ func (h *Handler) writeConfigJSON(ctx context.Context, key string, src any) {
 			updated_at = excluded.updated_at`,
 		key, string(raw), time.Now().UTC().Unix(),
 	)
+	return err
 }
 
 func paginate[T any](items []T, startIndex, limit int) ([]T, int) {

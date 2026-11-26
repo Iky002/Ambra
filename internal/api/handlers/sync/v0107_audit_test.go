@@ -184,10 +184,10 @@ func TestSyncV0107AuditPlaylistQuotasValidationAndRollback(t *testing.T) {
 		t.Fatalf("delete job with closed DB expected 500, got %d", r.Code)
 	}
 	// Exported caller methods also roll back on persistence failure
-	_, _ = h.SetJobItemRemovalForCaller(ctx, jiID, true, alice.ID, true)
-	_, _ = h.DeleteJobItemForCaller(ctx, jiID, alice.ID, true)
-	_, _ = h.DeleteJobForCaller(ctx, ownJobRes.Job.Id, alice.ID, true)
-	if err := h.CancelItemsForCaller(ctx, ownJobRes.Job.TargetId, []string{aliceOwnPl.ID}, alice.ID, true); err == nil {
+	_, _, _ = h.SetJobItemRemovalForCaller(ctx, jiID, true, alice.ID, true)
+	_, _, _ = h.DeleteJobItemForCaller(ctx, jiID, alice.ID, true)
+	_, _, _ = h.DeleteJobForCaller(ctx, ownJobRes.Job.Id, alice.ID, true)
+	if err := h.CancelItemsForCaller(ctx, ownJobRes.Job.TargetId, []string{ownJobRes.JobItems[0].ItemId}, alice.ID, true); err == nil {
 		t.Fatal("expected CancelItemsForCaller to return error when DB closed")
 	}
 

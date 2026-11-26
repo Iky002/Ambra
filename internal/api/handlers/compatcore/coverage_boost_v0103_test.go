@@ -240,13 +240,18 @@ func TestCompatCoreCoverageBoostV0103(t *testing.T) {
 			t.Fatalf("expected 401 for empty access token in connectExchange, got %d", recCE2.Code)
 		}
 
-		// postSessionAddUser eviction branch when len(sessionUsers) >= maxSessionUsersEntries
+		// postSessionAddUser: nonexistent session -> 404; existing session exercises eviction branch
+		recMissing := callAs(adminAC, http.MethodPost, "/Sessions/new-evict-sid/Users/"+env.user2.ID, "", "")
+		if recMissing.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 on postSessionAddUser for nonexistent session, got %d", recMissing.Code)
+		}
+		evictSess := env.sessions.TouchSession(env.admin, auth.ClientInfo{DeviceID: "evict-dev", Client: "Web"})
 		env.handler.mu.Lock()
 		for i := 0; i < maxSessionUsersEntries; i++ {
 			env.handler.sessionUsers[guid.New()] = map[string]bool{"u": true}
 		}
 		env.handler.mu.Unlock()
-		recAdd := callAs(adminAC, http.MethodPost, "/Sessions/new-evict-sid/Users/"+env.user2.ID, "", "")
+		recAdd := callAs(adminAC, http.MethodPost, "/Sessions/"+evictSess.Id+"/Users/"+env.user2.ID, "", "")
 		if recAdd.Code != http.StatusNoContent {
 			t.Fatalf("expected 204 on postSessionAddUser eviction, got %d", recAdd.Code)
 		}

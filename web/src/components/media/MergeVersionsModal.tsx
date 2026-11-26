@@ -132,9 +132,10 @@ export function MergeVersionsModal({
                 <button
                   key={cand.Id}
                   type="button"
+                  disabled={mergeMutation.isPending}
                   onClick={() => toggleCandidate(cand.Id)}
                   aria-pressed={checked}
-                  className={`flex w-full items-center gap-3.5 rounded-xl border p-2.5 text-left transition-all ${
+                  className={`flex w-full items-center gap-3.5 rounded-xl border p-2.5 text-left transition-all disabled:cursor-not-allowed disabled:opacity-60 ${
                     checked
                       ? 'border-amber-400/70 bg-amber-500/10 ring-1 ring-amber-400/30'
                       : 'border-white/8 bg-white/[0.025] hover:border-white/20 hover:bg-white/[0.05]'

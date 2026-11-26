@@ -158,6 +158,10 @@ func TestServerNewInvalidPath(t *testing.T) {
 	}
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
 func TestServerBuiltinTMDBKeyWiring(t *testing.T) {
 	t.Setenv("AMBRA_TMDB_API_KEY", "")
 	cfg, err := config.Load(t.TempDir())
@@ -179,9 +183,38 @@ func TestServerBuiltinTMDBKeyWiring(t *testing.T) {
 		t.Fatalf("expected *tmdb.Provider, got %T", p)
 	}
 
-	var seenKey string
+	// Default official TMDB host receives the built-in fallback key when no user key is set.
+	var seenOfficialKey, seenOfficialHost string
+	tmdbProvider.SetHTTPClient(&http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			seenOfficialHost = r.URL.Host
+			seenOfficialKey = r.URL.Query().Get("api_key")
+			rec := httptest.NewRecorder()
+			rec.WriteHeader(http.StatusOK)
+			_, _ = rec.WriteString(`{"id":550,"title":"Fight Club","release_date":"1999-10-15"}`)
+			return rec.Result(), nil
+		}),
+	})
+	res, err := tmdbProvider.FetchMetadata(context.Background(), plugins.MediaQuery{
+		ItemType:    "Movie",
+		ProviderIDs: map[string]string{"tmdb": "550"},
+	})
+	if err != nil || res == nil {
+		t.Fatalf("FetchMetadata with built-in key failed: res=%+v err=%v", res, err)
+	}
+	if seenOfficialHost != "api.themoviedb.org" {
+		t.Fatalf("expected official host api.themoviedb.org, got %q", seenOfficialHost)
+	}
+	if seenOfficialKey != config.DefaultTMDBApiKey {
+		t.Fatalf("expected built-in key %q, got %q", config.DefaultTMDBApiKey, seenOfficialKey)
+	}
+
+	// Switching base_url to a non-default host must NOT leak the built-in fallback key (H-04).
+	var seenCustomHostKey string
+	var customHostHits int
 	mockTMDB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seenKey = r.URL.Query().Get("api_key")
+		customHostHits++
+		seenCustomHostKey = r.URL.Query().Get("api_key")
 		_, _ = w.Write([]byte(`{"id":550,"title":"Fight Club","release_date":"1999-10-15"}`))
 	}))
 	defer mockTMDB.Close()
@@ -190,18 +223,15 @@ func TestServerBuiltinTMDBKeyWiring(t *testing.T) {
 	if err := tmdbProvider.Configure(map[string]any{"base_url": mockTMDB.URL}); err != nil {
 		t.Fatalf("Configure base_url: %v", err)
 	}
-	res, err := tmdbProvider.FetchMetadata(context.Background(), plugins.MediaQuery{
+	resCustom, err := tmdbProvider.FetchMetadata(context.Background(), plugins.MediaQuery{
 		ItemType:    "Movie",
 		ProviderIDs: map[string]string{"tmdb": "550"},
 	})
-	if err != nil || res == nil {
-		t.Fatalf("FetchMetadata with built-in key failed: res=%+v err=%v", res, err)
-	}
-	if seenKey != config.DefaultTMDBApiKey {
-		t.Fatalf("expected built-in key %q, got %q", config.DefaultTMDBApiKey, seenKey)
+	if err != nil || resCustom != nil || customHostHits != 0 {
+		t.Fatalf("expected built-in key to not be sent to custom host: res=%+v err=%v hits=%d", resCustom, err, customHostHits)
 	}
 
-	// Custom user key overrides built-in default
+	// Custom user key explicitly configured works against the custom base_url.
 	if err := tmdbProvider.Configure(map[string]any{"api_key": "custom-server-key"}); err != nil {
 		t.Fatalf("Configure custom api_key: %v", err)
 	}
@@ -211,8 +241,8 @@ func TestServerBuiltinTMDBKeyWiring(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("FetchMetadata with custom key failed: %v", err)
 	}
-	if seenKey != "custom-server-key" {
-		t.Fatalf("expected custom-server-key, got %q", seenKey)
+	if seenCustomHostKey != "custom-server-key" {
+		t.Fatalf("expected custom-server-key, got %q", seenCustomHostKey)
 	}
 }
 

@@ -284,7 +284,7 @@ describe('Demo Mock 引擎 - Serverless 完整闭环测试', () => {
       Language: 'zh-TW',
     })
     const cfg = await api.getPluginConfiguration('ambra.metadata.tmdb')
-    expect(cfg.ApiKey).toBe('new-tmdb-key')
+    expect(cfg.ApiKey).toBe('********')
     expect(cfg.Language).toBe('zh-TW')
 
     await api.runScheduledTask('task-scan-libraries')
