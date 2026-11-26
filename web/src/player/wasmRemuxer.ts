@@ -1,4 +1,5 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg'
+import { isSameOriginUrl } from '../api/client'
 
 /** localStorage 键：是否优先启用客户端 WASM 解复用/转封装 */
 export const WASM_REMUX_PREF_KEY = 'ambra_player_prefer_wasm_remux'
@@ -13,17 +14,64 @@ export const FFMPEG_CORE_SHA256 = {
   'ffmpeg-core.wasm': '2390efa7fb66e7e42dbae15427571a5ffc96b829480904c30f471f0a78967f61',
 } as const
 
+/** 基于 Vite BASE_URL 计算本地自托管 @ffmpeg/core 路径 */
+export function resolveLocalCoreBase(explicitBaseUrl?: string): string {
+  const rawBase =
+    explicitBaseUrl ??
+    (typeof import.meta !== 'undefined' && import.meta.env?.BASE_URL
+      ? import.meta.env.BASE_URL
+      : '/')
+  if (!rawBase || rawBase === './' || rawBase === '.') {
+    if (typeof window !== 'undefined' && window.location?.pathname?.startsWith('/web/')) {
+      return '/web/ffmpeg'
+    }
+    return './ffmpeg'
+  }
+  const trimmed = rawBase.replace(/\/+$/, '')
+  return `${trimmed}/ffmpeg`
+}
+
+function isLocalCoreBase(base: string): boolean {
+  return base.startsWith('/') || base.startsWith('./') || base.startsWith('../')
+}
+
+let localCoreProbeState: 'unknown' | 'available' | 'unavailable' = 'unknown'
+
+export function resetLocalCoreProbeCache(): void {
+  localCoreProbeState = 'unknown'
+}
+
+export async function probeLocalCoreAvailable(base: string, signal?: AbortSignal): Promise<boolean> {
+  if (localCoreProbeState === 'available') return true
+  if (localCoreProbeState === 'unavailable') return false
+  try {
+    const res = await fetch(`${base}/ffmpeg-core.js`, { method: 'HEAD', signal })
+    if (!res.ok) {
+      localCoreProbeState = 'unavailable'
+      return false
+    }
+    const ct = (res.headers.get('content-type') || '').toLowerCase()
+    if (ct.includes('text/html') || ct.includes('application/xhtml')) {
+      localCoreProbeState = 'unavailable'
+      return false
+    }
+    localCoreProbeState = 'available'
+    return true
+  } catch {
+    localCoreProbeState = 'unavailable'
+    return false
+  }
+}
+
 /** 默认加载与转封装超时时间（本地自托管快速探测，CDN 缩短超时避免卡死 25 秒） */
-const LOCAL_CORE_BASE = '/web/ffmpeg'
 const DEFAULT_LOCAL_LOAD_TIMEOUT_MS = 4_000
 const DEFAULT_CDN_LOAD_TIMEOUT_MS = 10_000
 const DEFAULT_REMUX_TIMEOUT_MS = 120_000
 
 /**
- * 单线程 @ffmpeg/core 源列表（优先同源本地自托管支持离线 NAS，失败后回退 CDN；不依赖 SharedArrayBuffer）
+ * 单线程 @ffmpeg/core 公网 CDN 源列表（不依赖 SharedArrayBuffer）
  */
-const SINGLE_THREAD_CORE_BASES = [
-  LOCAL_CORE_BASE,
+const CDN_SINGLE_THREAD_CORE_BASES = [
   `https://unpkg.com/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/esm`,
   `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/esm`,
 ]
@@ -325,8 +373,8 @@ function resolveExpectedCoreSha256(
   base: string,
   assetName: keyof typeof FFMPEG_CORE_SHA256,
 ): string | undefined {
-  if (base.startsWith('/')) {
-    // 同源本地自托管 /web/ffmpeg 允许管理员替换自定义编译版本，由 HTTP 状态 + MIME + 魔数校验
+  if (isLocalCoreBase(base)) {
+    // 同源本地自托管允许管理员替换自定义编译版本，由 HTTP 状态 + MIME + 魔数校验
     return undefined
   }
   // 远端公网 CDN 强校验固定版本 SHA-256
@@ -402,16 +450,23 @@ export class WasmRemuxer {
     this.loadingPromise = (async () => {
       opts?.onProgress?.('init', 10, '正在初始化 FFmpeg WASM 引擎...')
       const ffmpeg = new FFmpeg()
-      const bases = opts?.coreBaseUrl
-        ? [opts.coreBaseUrl.replace(/\/+$/, ''), ...SINGLE_THREAD_CORE_BASES]
-        : SINGLE_THREAD_CORE_BASES
+      const defaultLocalBase = resolveLocalCoreBase()
+      let bases: string[]
+      if (opts?.coreBaseUrl) {
+        bases = [opts.coreBaseUrl.replace(/\/+$/, ''), ...CDN_SINGLE_THREAD_CORE_BASES]
+      } else {
+        const hasLocal = await probeLocalCoreAvailable(defaultLocalBase, opts?.signal)
+        bases = hasLocal
+          ? [defaultLocalBase, ...CDN_SINGLE_THREAD_CORE_BASES]
+          : [...CDN_SINGLE_THREAD_CORE_BASES]
+      }
 
       let lastErr: unknown = null
       for (const base of bases) {
         if (opts?.signal?.aborted || this.disposed) {
           throw new WasmRemuxFallbackError('aborted', '已取消 WASM 引擎加载')
         }
-        const isLocalBase = base.startsWith('/')
+        const isLocalBase = isLocalCoreBase(base)
         const loadTimeoutMs = isLocalBase ? DEFAULT_LOCAL_LOAD_TIMEOUT_MS : DEFAULT_CDN_LOAD_TIMEOUT_MS
         const pendingBlobUrls: string[] = []
         try {
@@ -655,6 +710,14 @@ export class WasmRemuxer {
       }
       const msg = err instanceof Error ? err.message : '网络请求失败'
       throw new WasmRemuxFallbackError('fetch_failed', `拉取媒体流失败: ${msg}`)
+    }
+
+    if (res.redirected && res.url && !isSameOriginUrl(res.url)) {
+      res.body?.cancel().catch(() => undefined)
+      throw new WasmRemuxFallbackError(
+        'fetch_failed',
+        '检测到跨源重定向响应，已中止客户端拉流并安全回退',
+      )
     }
 
     if (!res.ok) {

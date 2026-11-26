@@ -1,7 +1,10 @@
 import { Globe } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import { api, getStoredAuth } from '../api/client'
+import { useOptionalAuth } from '../context/AuthContext'
 import { useI18n } from '../i18n/I18nContext'
 import { SUPPORTED_LOCALES, type LocaleCode } from '../i18n/types'
+import { loadPlaybackPrefs, playbackPrefsToUserConfig } from '../player/playbackPrefs'
 
 interface LanguageSwitcherProps {
   compact?: boolean
@@ -10,6 +13,7 @@ interface LanguageSwitcherProps {
 
 export function LanguageSwitcher({ compact = false, align = 'right' }: LanguageSwitcherProps) {
   const { locale, localeMeta, setLocale, t } = useI18n()
+  const authCtx = useOptionalAuth()
   const [open, setOpen] = useState(false)
   const containerRef = useRef<HTMLDivElement>(null)
 
@@ -34,6 +38,27 @@ export function LanguageSwitcher({ compact = false, align = 'right' }: LanguageS
   const handleSelect = (code: LocaleCode) => {
     setLocale(code)
     setOpen(false)
+
+    const activeSession = authCtx?.auth ?? getStoredAuth()
+    if (activeSession?.userId && activeSession.accessToken) {
+      const targetUserId = activeSession.userId
+      const existingCfg = authCtx?.user?.Configuration
+      const syncCulture = async () => {
+        const baseCfg =
+          existingCfg ??
+          (await api
+            .getUser(targetUserId)
+            .then((u) => u.Configuration)
+            .catch(() => undefined))
+        const mergedCfg = {
+          ...playbackPrefsToUserConfig(loadPlaybackPrefs(targetUserId), baseCfg),
+          UICulture: code,
+        }
+        await api.updateUserConfiguration(targetUserId, mergedCfg)
+        await authCtx?.refreshUser()
+      }
+      void syncCulture().catch(() => undefined)
+    }
   }
 
   return (

@@ -141,4 +141,21 @@ describe('playbackPrefs', () => {
     expect(pickPreferredSubtitleIndex(subsWithoutForced, 'auto', undefined, 'zh-CN', 'Smart', jpnAudio)).toBe(3)
     expect(pickPreferredSubtitleIndex(subsWithForced, 'eng', undefined, 'zh-CN', 'Smart', jpnAudio)).toBe(5)
   })
+
+  it('[M-02] isolates playback preferences per userId and resets base to DEFAULT_PLAYBACK_PREFS on sync', () => {
+    savePlaybackPrefs(
+      { preferredAudioLang: 'jpn', preferredSubtitleLang: 'cht', autoPlayNextEpisode: false },
+      'user-a',
+    )
+    expect(loadPlaybackPrefs('user-a').preferredAudioLang).toBe('jpn')
+    expect(loadPlaybackPrefs('user-b')).toEqual(DEFAULT_PLAYBACK_PREFS)
+
+    // user-b 服务端配置未设置 AudioLanguagePreference 时，以 DEFAULT_PLAYBACK_PREFS 为基底，绝不继承上一账号残留
+    const syncedB = syncPlaybackPrefsFromUserConfig({ SubtitleMode: 'Always' }, 'user-b')
+    expect(syncedB).toEqual({
+      ...DEFAULT_PLAYBACK_PREFS,
+      subtitleMode: 'Always',
+    })
+    expect(loadPlaybackPrefs('user-a').preferredAudioLang).toBe('jpn')
+  })
 })

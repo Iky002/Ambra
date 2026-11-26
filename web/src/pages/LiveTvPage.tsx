@@ -8,10 +8,14 @@ import {
   CircleDot,
   Download,
   Film,
+  Link2,
   Loader2,
   Play,
+  Plus,
   Radio,
   RefreshCw,
+  Repeat,
+  Save,
   Search,
   Settings,
   Trash2,
@@ -23,18 +27,25 @@ import {
   api,
   buildEmbyAuthHeader,
   getLiveTvChannelStreamUrl,
+  getLiveTvRecordingHlsUrl,
   getLiveTvRecordingStreamUrl,
   getStoredAuth,
   isSameOriginUrl,
 } from '../api/client'
-import type { LiveTvRecordingInfo } from '../api/types'
+import type { LiveTvRecordingInfo, LiveTvSeriesTimerInfo } from '../api/types'
 import { QueryErrorState } from '../components/QueryErrorState'
 import { useAuth } from '../context/AuthContext'
 import { getCachedDemoServer } from '../demo/demoLoader'
 import { isDemoMode } from '../demo/demoMode'
 import { getActiveLocale, useI18n } from '../i18n/I18nContext'
 
-type LiveTvSubTab = 'channels' | 'timers' | 'recordings'
+type LiveTvSubTab = 'channels' | 'timers' | 'seriesTimers' | 'recordings' | 'mappings'
+
+function attachEmbyHlsAuth(xhr: XMLHttpRequest, requestUrl: string): void {
+  if (!isSameOriginUrl(requestUrl)) return
+  const storedAuth = getStoredAuth()
+  xhr.setRequestHeader('Authorization', buildEmbyAuthHeader(storedAuth?.accessToken))
+}
 
 interface LiveTvProgramItem {
   Id: string
@@ -101,10 +112,21 @@ export function LiveTvPage() {
     message: string
   } | null>(null)
   const [schedulingProgramId, setSchedulingProgramId] = useState<string | null>(null)
+  const [schedulingSeriesProgramId, setSchedulingSeriesProgramId] = useState<string | null>(null)
+  const [recordNewOnlyPref, setRecordNewOnlyPref] = useState(true)
+  const [newSeriesName, setNewSeriesName] = useState('')
+  const [newSeriesChannelId, setNewSeriesChannelId] = useState('')
+  const [newSeriesRecordNewOnly, setNewSeriesRecordNewOnly] = useState(true)
+  const [selectedMappingProviderId, setSelectedMappingProviderId] = useState('')
+  const [draftMappings, setDraftMappings] = useState<Record<string, string>>({})
+  const [savingMappingChannelId, setSavingMappingChannelId] = useState<string | null>(null)
   const [playingRecording, setPlayingRecording] = useState<LiveTvRecordingInfo | null>(null)
+  const [recordingFallbackDirect, setRecordingFallbackDirect] = useState(false)
   const [recordingPlaybackError, setRecordingPlaybackError] = useState<string | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
+  const recordingVideoRef = useRef<HTMLVideoElement | null>(null)
   const hlsRef = useRef<Hls | null>(null)
+  const recordingHlsRef = useRef<Hls | null>(null)
   const mediaRecoveryCountRef = useRef(0)
   const demoActive = isDemoMode()
 
@@ -170,6 +192,138 @@ export function LiveTvPage() {
   })
 
   const recordings = useMemo(() => recordingsData?.Items || [], [recordingsData])
+
+  const {
+    data: seriesTimersData,
+    isLoading: seriesTimersLoading,
+    isError: seriesTimersError,
+    error: seriesTimersErr,
+    refetch: refetchSeriesTimers,
+  } = useQuery({
+    queryKey: ['liveTv', 'seriesTimers'],
+    queryFn: () => api.getSeriesTimers(),
+    enabled: activeSubTab === 'seriesTimers' || (canManageLiveTv && channels.length > 0),
+  })
+
+  const seriesTimers = useMemo(() => seriesTimersData?.Items || [], [seriesTimersData])
+
+  const scheduledSeriesNames = useMemo(
+    () =>
+      new Set(
+        seriesTimers
+          .map((st) => (st.Name || '').trim().toLowerCase())
+          .filter((name) => name.length > 0),
+      ),
+    [seriesTimers],
+  )
+
+  const { data: listingProvidersData } = useQuery({
+    queryKey: ['liveTv', 'listingProviders'],
+    queryFn: () => api.getListingProviders(),
+    enabled: activeSubTab === 'mappings' && canManageLiveTv,
+  })
+
+  const listingProviders = useMemo(() => listingProvidersData || [], [listingProvidersData])
+
+  useEffect(() => {
+    if (
+      activeSubTab === 'mappings' &&
+      !selectedMappingProviderId &&
+      listingProviders.length > 0 &&
+      listingProviders[0].Id
+    ) {
+      setSelectedMappingProviderId(listingProviders[0].Id)
+    }
+  }, [activeSubTab, selectedMappingProviderId, listingProviders])
+
+  const {
+    data: channelMappingsData,
+    isLoading: mappingsLoading,
+    isError: mappingsError,
+    error: mappingsErr,
+    refetch: refetchMappings,
+  } = useQuery({
+    queryKey: ['liveTv', 'channelMappings', selectedMappingProviderId],
+    queryFn: () => api.getChannelMappings(selectedMappingProviderId),
+    enabled: activeSubTab === 'mappings' && canManageLiveTv,
+  })
+
+  const createSeriesTimerMutation = useMutation({
+    mutationFn: (payload: LiveTvSeriesTimerInfo) => api.createSeriesTimer(payload),
+    onMutate: (payload) => {
+      if (payload.ProgramId) {
+        setSchedulingSeriesProgramId(payload.ProgramId)
+      }
+      setDvrFeedback(null)
+    },
+    onSuccess: async (_created, payload) => {
+      setNewSeriesName('')
+      setDvrFeedback({
+        type: 'success',
+        message: `已创建系列追录「${payload.Name}」${payload.RecordNewOnly ? '（仅录新集）' : ''}`,
+      })
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['liveTv', 'seriesTimers'] }),
+        queryClient.invalidateQueries({ queryKey: ['liveTv', 'timers'] }),
+      ])
+    },
+    onError: (err) => {
+      setDvrFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : '创建系列追录失败，请稍后重试',
+      })
+    },
+    onSettled: () => {
+      setSchedulingSeriesProgramId(null)
+    },
+  })
+
+  const deleteSeriesTimerMutation = useMutation({
+    mutationFn: (seriesTimerId: string) => api.deleteSeriesTimer(seriesTimerId),
+    onSuccess: async () => {
+      setDvrFeedback({ type: 'success', message: '已取消系列追录计划' })
+      await queryClient.invalidateQueries({ queryKey: ['liveTv', 'seriesTimers'] })
+    },
+    onError: (err) => {
+      setDvrFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : '取消系列追录失败，请稍后重试',
+      })
+    },
+  })
+
+  const setChannelMappingMutation = useMutation({
+    mutationFn: (payload: {
+      providerId: string
+      tunerChannelId: string
+      providerChannelId: string
+    }) =>
+      api.setChannelMapping({
+        ProviderId: payload.providerId || undefined,
+        TunerChannelId: payload.tunerChannelId,
+        ProviderChannelId: payload.providerChannelId,
+      }),
+    onMutate: (payload) => {
+      setSavingMappingChannelId(payload.tunerChannelId)
+      setDvrFeedback(null)
+    },
+    onSuccess: async () => {
+      setDvrFeedback({ type: 'success', message: '已保存频道 EPG 映射' })
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['liveTv', 'channelMappings'] }),
+        queryClient.invalidateQueries({ queryKey: ['liveTv', 'programs'] }),
+      ])
+    },
+    onError: (err) => {
+      setDvrFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : '保存频道映射失败',
+      })
+    },
+    onSettled: () => {
+      setSavingMappingChannelId(null)
+    },
+  })
 
   const createTimerMutation = useMutation({
     mutationFn: ({
@@ -386,17 +540,7 @@ export function LiveTvPage() {
       hls = new Hls({
         enableWorker: true,
         lowLatencyMode: true,
-        xhrSetup: (xhr, requestUrl) => {
-          if (!isSameOriginUrl(requestUrl)) return
-          const storedAuth = getStoredAuth()
-          xhr.setRequestHeader(
-            'X-Emby-Authorization',
-            buildEmbyAuthHeader(storedAuth?.accessToken),
-          )
-          if (storedAuth?.accessToken) {
-            xhr.setRequestHeader('X-Emby-Token', storedAuth.accessToken)
-          }
-        },
+        xhrSetup: attachEmbyHlsAuth,
       })
       hlsRef.current = hls
       hls.loadSource(streamUrl)
@@ -431,6 +575,51 @@ export function LiveTvPage() {
       video.removeAttribute('src')
     }
   }, [activeChannel, activeLooksLikeHls, activeStreamUrl, activeSubTab, demoActive, forceHls, streamRetryTick])
+
+  const shouldUseRecordingHls = Boolean(
+    activeSubTab === 'recordings' &&
+      playingRecording &&
+      !demoActive &&
+      !recordingFallbackDirect &&
+      Hls.isSupported(),
+  )
+
+  // DVR 录像在线回看优先接入 HLS 流 (/emby/LiveTv/LiveRecordings/{id}/hls/master.m3u8)，以支持 .ts/.mkv 录像浏览器直接播放；失败时自动降级直出流
+  useEffect(() => {
+    const video = recordingVideoRef.current
+    if (!shouldUseRecordingHls || !video || !playingRecording) return
+
+    let hls: Hls | null = new Hls({
+      enableWorker: true,
+      lowLatencyMode: false,
+      xhrSetup: attachEmbyHlsAuth,
+    })
+    recordingHlsRef.current = hls
+    const hlsUrl = getLiveTvRecordingHlsUrl(playingRecording.Id)
+    hls.loadSource(hlsUrl)
+    hls.attachMedia(video)
+    hls.on(Hls.Events.ERROR, (_evt, data) => {
+      if (!data.fatal) return
+      if (hls) {
+        hls.destroy()
+        if (recordingHlsRef.current === hls) {
+          recordingHlsRef.current = null
+        }
+        hls = null
+      }
+      setRecordingFallbackDirect(true)
+    })
+
+    return () => {
+      if (hls) {
+        hls.destroy()
+        if (recordingHlsRef.current === hls) {
+          recordingHlsRef.current = null
+        }
+        hls = null
+      }
+    }
+  }, [shouldUseRecordingHls, playingRecording])
 
   if (channelsLoading) {
     return (
@@ -472,30 +661,44 @@ export function LiveTvPage() {
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
-          {/* 子标签切换：直播频道 / 预约计划 / 已录节目 */}
+          {/* 子标签切换：直播频道 / 预约计划 / 系列追录 / 已录节目 / 频道映射 */}
           <div
             role="tablist"
             aria-label="电视直播功能标签"
-            className="inline-flex items-center gap-1 rounded-xl border border-white/10 bg-zinc-950/80 p-1"
+            className="inline-flex flex-wrap items-center gap-1 rounded-xl border border-white/10 bg-zinc-950/80 p-1"
           >
             {(
               [
                 {
-                  key: 'channels',
+                  key: 'channels' as LiveTvSubTab,
                   label: locale === 'zh-CN' ? '直播频道' : t('livetv.channels'),
                   icon: Tv,
                 },
                 {
-                  key: 'timers',
+                  key: 'timers' as LiveTvSubTab,
                   label: locale === 'zh-CN' ? '预约计划' : t('livetv.timers'),
                   icon: CalendarClock,
                 },
                 {
-                  key: 'recordings',
+                  key: 'seriesTimers' as LiveTvSubTab,
+                  label: '系列追录',
+                  icon: Repeat,
+                },
+                {
+                  key: 'recordings' as LiveTvSubTab,
                   label: locale === 'zh-CN' ? '已录节目' : t('livetv.recordings'),
                   icon: Film,
                 },
-              ] as const
+                ...(canManageLiveTv
+                  ? [
+                      {
+                        key: 'mappings' as LiveTvSubTab,
+                        label: '频道映射',
+                        icon: Link2,
+                      },
+                    ]
+                  : []),
+              ]
             ).map(({ key, label, icon: Icon }) => {
               const selected = activeSubTab === key
               return (
@@ -661,15 +864,26 @@ export function LiveTvPage() {
                     <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-500/15 font-mono text-xs font-bold text-amber-300 ring-1 ring-amber-500/30">
                       {activeChannel.Number || 'TV'}
                     </div>
-                    <div>
-                      <h2 className="text-base font-semibold text-white">{activeChannel.Name}</h2>
-                      <p className="text-[11px] text-zinc-400">
-                        {activeChannel.ChannelType || 'TV'}
-                        {demoActive ? ' · Demo 离线演示流' : ' · 实时直播流'}
-                      </p>
+                      <div>
+                        <h2 className="text-base font-semibold text-white">{activeChannel.Name}</h2>
+                        <p className="text-[11px] text-zinc-400">
+                          {activeChannel.ChannelType || 'TV'}
+                          {demoActive ? ' · Demo 离线演示流' : ' · 实时直播流'}
+                        </p>
+                      </div>
                     </div>
+                    {canManageLiveTv && (
+                      <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1 text-[11px] text-zinc-300">
+                        <input
+                          type="checkbox"
+                          checked={recordNewOnlyPref}
+                          onChange={(e) => setRecordNewOnlyPref(e.target.checked)}
+                          className="h-3.5 w-3.5 accent-amber-500"
+                        />
+                        <span>追录仅限新集</span>
+                      </label>
+                    )}
                   </div>
-                </div>
 
                 {currentProgram ? (
                   <div className="space-y-2.5">
@@ -687,36 +901,73 @@ export function LiveTvPage() {
                           {formatTimeRange(currentProgram.StartDate, currentProgram.EndDate)}
                         </span>
                         {canManageLiveTv && (
-                          <button
-                            type="button"
-                            disabled={
-                              schedulingProgramId === currentProgram.Id ||
-                              scheduledProgramIds.includes(currentProgram.Id)
-                            }
-                            onClick={() =>
-                              createTimerMutation.mutate({
-                                program: currentProgram,
-                                channelId: activeChannel.Id,
-                                channelName: activeChannel.Name,
-                              })
-                            }
-                            className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors disabled:opacity-60 ${
-                              scheduledProgramIds.includes(currentProgram.Id)
-                                ? 'border-emerald-500/35 bg-emerald-500/15 text-emerald-300'
-                                : 'border-amber-500/35 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20'
-                            }`}
-                          >
-                            {schedulingProgramId === currentProgram.Id ? (
-                              <Loader2 className="h-3 w-3 animate-spin" />
-                            ) : (
-                              <CircleDot className="h-3 w-3" />
-                            )}
-                            <span>
-                              {scheduledProgramIds.includes(currentProgram.Id)
-                                ? '已预约'
-                                : '预约录制'}
-                            </span>
-                          </button>
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <button
+                              type="button"
+                              disabled={
+                                schedulingProgramId === currentProgram.Id ||
+                                scheduledProgramIds.includes(currentProgram.Id)
+                              }
+                              onClick={() =>
+                                createTimerMutation.mutate({
+                                  program: currentProgram,
+                                  channelId: activeChannel.Id,
+                                  channelName: activeChannel.Name,
+                                })
+                              }
+                              className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors disabled:opacity-60 ${
+                                scheduledProgramIds.includes(currentProgram.Id)
+                                  ? 'border-emerald-500/35 bg-emerald-500/15 text-emerald-300'
+                                  : 'border-amber-500/35 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20'
+                              }`}
+                            >
+                              {schedulingProgramId === currentProgram.Id ? (
+                                <Loader2 className="h-3 w-3 animate-spin" />
+                              ) : (
+                                <CircleDot className="h-3 w-3" />
+                              )}
+                              <span>
+                                {scheduledProgramIds.includes(currentProgram.Id)
+                                  ? '已预约'
+                                  : '预约录制'}
+                              </span>
+                            </button>
+
+                            <button
+                              type="button"
+                              disabled={
+                                schedulingSeriesProgramId === currentProgram.Id ||
+                                scheduledSeriesNames.has(currentProgram.Name.trim().toLowerCase())
+                              }
+                              onClick={() =>
+                                createSeriesTimerMutation.mutate({
+                                  Name: currentProgram.Name,
+                                  ChannelId: activeChannel.Id,
+                                  ProgramId: currentProgram.Id,
+                                  Overview: currentProgram.Overview,
+                                  RecordAnyTime: true,
+                                  RecordAnyChannel: false,
+                                  RecordNewOnly: recordNewOnlyPref,
+                                })
+                              }
+                              className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors disabled:opacity-60 ${
+                                scheduledSeriesNames.has(currentProgram.Name.trim().toLowerCase())
+                                  ? 'border-emerald-500/35 bg-emerald-500/15 text-emerald-300'
+                                  : 'border-sky-500/35 bg-sky-500/10 text-sky-300 hover:bg-sky-500/20'
+                              }`}
+                            >
+                              {schedulingSeriesProgramId === currentProgram.Id ? (
+                                <Loader2 className="h-3 w-3 animate-spin" />
+                              ) : (
+                                <Repeat className="h-3 w-3" />
+                              )}
+                              <span>
+                                {scheduledSeriesNames.has(currentProgram.Name.trim().toLowerCase())
+                                  ? '已追录'
+                                  : '系列追录'}
+                              </span>
+                            </button>
+                          </div>
                         )}
                       </div>
                     </div>
@@ -768,29 +1019,66 @@ export function LiveTvPage() {
                                 {formatTimeRange(prog.StartDate, prog.EndDate)}
                               </span>
                               {canManageLiveTv && (
-                                <button
-                                  type="button"
-                                  disabled={isScheduling || isScheduled}
-                                  onClick={() =>
-                                    createTimerMutation.mutate({
-                                      program: prog,
-                                      channelId: activeChannel.Id,
-                                      channelName: activeChannel.Name,
-                                    })
-                                  }
-                                  className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors disabled:opacity-60 ${
-                                    isScheduled
-                                      ? 'border-emerald-500/35 bg-emerald-500/15 text-emerald-300'
-                                      : 'border-amber-500/35 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20'
-                                  }`}
-                                >
-                                  {isScheduling ? (
-                                    <Loader2 className="h-3 w-3 animate-spin" />
-                                  ) : (
-                                    <CircleDot className="h-3 w-3" />
-                                  )}
-                                  <span>{isScheduled ? '已预约' : '预约录制'}</span>
-                                </button>
+                                <div className="flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    disabled={isScheduling || isScheduled}
+                                    onClick={() =>
+                                      createTimerMutation.mutate({
+                                        program: prog,
+                                        channelId: activeChannel.Id,
+                                        channelName: activeChannel.Name,
+                                      })
+                                    }
+                                    className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors disabled:opacity-60 ${
+                                      isScheduled
+                                        ? 'border-emerald-500/35 bg-emerald-500/15 text-emerald-300'
+                                        : 'border-amber-500/35 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20'
+                                    }`}
+                                  >
+                                    {isScheduling ? (
+                                      <Loader2 className="h-3 w-3 animate-spin" />
+                                    ) : (
+                                      <CircleDot className="h-3 w-3" />
+                                    )}
+                                    <span>{isScheduled ? '已预约' : '预约录制'}</span>
+                                  </button>
+
+                                  <button
+                                    type="button"
+                                    disabled={
+                                      schedulingSeriesProgramId === prog.Id ||
+                                      scheduledSeriesNames.has(prog.Name.trim().toLowerCase())
+                                    }
+                                    onClick={() =>
+                                      createSeriesTimerMutation.mutate({
+                                        Name: prog.Name,
+                                        ChannelId: activeChannel.Id,
+                                        ProgramId: prog.Id,
+                                        Overview: prog.Overview,
+                                        RecordAnyTime: true,
+                                        RecordAnyChannel: false,
+                                        RecordNewOnly: recordNewOnlyPref,
+                                      })
+                                    }
+                                    className={`inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[11px] font-medium transition-colors disabled:opacity-60 ${
+                                      scheduledSeriesNames.has(prog.Name.trim().toLowerCase())
+                                        ? 'border-emerald-500/35 bg-emerald-500/15 text-emerald-300'
+                                        : 'border-sky-500/35 bg-sky-500/10 text-sky-300 hover:bg-sky-500/20'
+                                    }`}
+                                  >
+                                    {schedulingSeriesProgramId === prog.Id ? (
+                                      <Loader2 className="h-3 w-3 animate-spin" />
+                                    ) : (
+                                      <Repeat className="h-3 w-3" />
+                                    )}
+                                    <span>
+                                      {scheduledSeriesNames.has(prog.Name.trim().toLowerCase())
+                                        ? '已追录'
+                                        : '追录'}
+                                    </span>
+                                  </button>
+                                </div>
                               )}
                             </div>
                           </div>
@@ -964,6 +1252,331 @@ export function LiveTvPage() {
         </section>
       )}
 
+      {activeSubTab === 'seriesTimers' && (
+        <section
+          data-testid="livetv-series-timers-panel"
+          className="space-y-4 rounded-2xl border border-white/8 bg-white/[0.02] p-5"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/8 pb-3">
+            <h2 className="flex items-center gap-2 text-sm font-semibold text-zinc-100">
+              <Repeat className="h-4 w-4 text-amber-400" />
+              <span>系列追录规则</span>
+              <span className="rounded-md bg-white/8 px-2 py-0.5 font-mono text-[11px] text-zinc-400">
+                {seriesTimers.length}
+              </span>
+            </h2>
+            <button
+              type="button"
+              onClick={() => void refetchSeriesTimers()}
+              className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-xs text-zinc-300 hover:border-amber-400/40 hover:text-amber-300"
+            >
+              <RefreshCw className="h-3 w-3" />
+              <span>刷新</span>
+            </button>
+          </div>
+
+          {canManageLiveTv && (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault()
+                const trimmed = newSeriesName.trim()
+                if (!trimmed) return
+                createSeriesTimerMutation.mutate({
+                  Name: trimmed,
+                  ChannelId: newSeriesChannelId || undefined,
+                  RecordAnyTime: true,
+                  RecordAnyChannel: !newSeriesChannelId,
+                  RecordNewOnly: newSeriesRecordNewOnly,
+                })
+              }}
+              className="flex flex-wrap items-end gap-3 rounded-xl border border-white/8 bg-black/25 p-4"
+            >
+              <label className="min-w-[200px] flex-1 space-y-1 text-xs">
+                <span className="block text-[11px] text-zinc-400">追录节目名称匹配</span>
+                <input
+                  type="text"
+                  aria-label="追录节目名称"
+                  value={newSeriesName}
+                  onChange={(e) => setNewSeriesName(e.target.value)}
+                  placeholder="输入要自动追录的剧集或栏目名称..."
+                  className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/50"
+                />
+              </label>
+
+              <label className="min-w-[160px] space-y-1 text-xs">
+                <span className="block text-[11px] text-zinc-400">限定频道</span>
+                <select
+                  aria-label="追录频道范围"
+                  value={newSeriesChannelId}
+                  onChange={(e) => setNewSeriesChannelId(e.target.value)}
+                  className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
+                >
+                  <option value="">任意频道</option>
+                  {channels.map((ch) => (
+                    <option key={ch.Id} value={ch.Id}>
+                      {ch.Name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-200">
+                <input
+                  type="checkbox"
+                  aria-label="仅录制新集"
+                  checked={newSeriesRecordNewOnly}
+                  onChange={(e) => setNewSeriesRecordNewOnly(e.target.checked)}
+                  className="h-3.5 w-3.5 accent-amber-500"
+                />
+                <span>仅录新集 (RecordNewOnly)</span>
+              </label>
+
+              <button
+                type="submit"
+                disabled={!newSeriesName.trim() || createSeriesTimerMutation.isPending}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-50"
+              >
+                {createSeriesTimerMutation.isPending ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Plus className="h-3.5 w-3.5" />
+                )}
+                <span>添加追录</span>
+              </button>
+            </form>
+          )}
+
+          {seriesTimersLoading ? (
+            <div className="flex h-36 items-center justify-center">
+              <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
+            </div>
+          ) : seriesTimersError ? (
+            <QueryErrorState
+              title="无法加载系列追录计划"
+              error={seriesTimersErr}
+              onRetry={() => void refetchSeriesTimers()}
+            />
+          ) : seriesTimers.length === 0 ? (
+            <div className="py-12 text-center text-xs text-zinc-500">
+              暂无系列追录规则，可在「直播频道」节目单点击「系列追录」或在上方添加
+            </div>
+          ) : (
+            <div className="divide-y divide-white/6 rounded-xl border border-white/8 bg-black/20">
+              {seriesTimers.map((st, idx) => {
+                const channelLabel = st.ChannelId
+                  ? channels.find((c) => c.Id === st.ChannelId)?.Name || st.ChannelId
+                  : '任意频道'
+                return (
+                  <div
+                    key={st.Id || `${st.Name}-${idx}`}
+                    className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 text-xs"
+                  >
+                    <div className="min-w-0 flex-1 space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-semibold text-zinc-100">{st.Name}</span>
+                        <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300">
+                          {channelLabel}
+                        </span>
+                        <span
+                          className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                            st.RecordNewOnly
+                              ? 'bg-emerald-500/15 text-emerald-300'
+                              : 'bg-white/10 text-zinc-300'
+                          }`}
+                        >
+                          {st.RecordNewOnly ? '仅录新集' : '包含重播'}
+                        </span>
+                      </div>
+                      {st.Overview && (
+                        <p className="truncate text-[11px] text-zinc-500">{st.Overview}</p>
+                      )}
+                    </div>
+                    {canManageLiveTv && st.Id && (
+                      <button
+                        type="button"
+                        disabled={
+                          deleteSeriesTimerMutation.isPending &&
+                          deleteSeriesTimerMutation.variables === st.Id
+                        }
+                        onClick={() => deleteSeriesTimerMutation.mutate(st.Id!)}
+                        className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
+                      >
+                        {deleteSeriesTimerMutation.isPending &&
+                        deleteSeriesTimerMutation.variables === st.Id ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Trash2 className="h-3.5 w-3.5" />
+                        )}
+                        <span>取消追录</span>
+                      </button>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </section>
+      )}
+
+      {activeSubTab === 'mappings' && canManageLiveTv && (
+        <section
+          data-testid="livetv-mappings-panel"
+          className="space-y-4 rounded-2xl border border-white/8 bg-white/[0.02] p-5"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/8 pb-3">
+            <div className="flex items-center gap-2">
+              <Link2 className="h-4 w-4 text-amber-400" />
+              <h2 className="text-sm font-semibold text-zinc-100">EPG 频道映射配置</h2>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              {listingProviders.length > 0 && (
+                <select
+                  aria-label="选择节目单源"
+                  value={selectedMappingProviderId}
+                  onChange={(e) => setSelectedMappingProviderId(e.target.value)}
+                  className="rounded-xl border border-white/10 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
+                >
+                  {listingProviders.map((prov, idx) => (
+                    <option key={prov.Id || idx} value={prov.Id || ''}>
+                      {prov.Type || 'XMLTV'} · {prov.Path}
+                    </option>
+                  ))}
+                </select>
+              )}
+              <button
+                type="button"
+                onClick={() => void refetchMappings()}
+                className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-xs text-zinc-300 hover:border-amber-400/40 hover:text-amber-300"
+              >
+                <RefreshCw className="h-3 w-3" />
+                <span>刷新</span>
+              </button>
+            </div>
+          </div>
+
+          {mappingsLoading ? (
+            <div className="flex h-36 items-center justify-center">
+              <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
+            </div>
+          ) : mappingsError ? (
+            <QueryErrorState
+              title="无法加载频道映射选项"
+              error={mappingsErr}
+              onRetry={() => void refetchMappings()}
+            />
+          ) : (
+            (() => {
+              const tunerList =
+                channelMappingsData?.TunerChannels && channelMappingsData.TunerChannels.length > 0
+                  ? channelMappingsData.TunerChannels
+                  : channels.map((c) => ({ Id: c.Id, Name: c.Name, Number: c.Number }))
+              const providerChannelOptions = channelMappingsData?.ProviderChannels || []
+              const existingMap = new Map(
+                (channelMappingsData?.Mappings || []).map((m) => [
+                  m.TunerChannelId,
+                  m.ProviderChannelId,
+                ]),
+              )
+
+              if (tunerList.length === 0) {
+                return (
+                  <div className="py-12 text-center text-xs text-zinc-500">
+                    暂无可映射的调谐器频道，请先导入 M3U 直播源与 XMLTV 节目单
+                  </div>
+                )
+              }
+
+              return (
+                <div className="divide-y divide-white/6 rounded-xl border border-white/8 bg-black/20">
+                  {tunerList.map((tunerCh) => {
+                    const currentMapped =
+                      draftMappings[tunerCh.Id] ??
+                      existingMap.get(tunerCh.Id) ??
+                      ('ProviderChannelId' in tunerCh && tunerCh.ProviderChannelId
+                        ? tunerCh.ProviderChannelId
+                        : '')
+                    const isSaving = savingMappingChannelId === tunerCh.Id
+                    return (
+                      <div
+                        key={tunerCh.Id}
+                        className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 text-xs"
+                      >
+                        <div className="min-w-[180px] flex-1">
+                          <span className="font-semibold text-zinc-100">{tunerCh.Name}</span>
+                          {tunerCh.Number && (
+                            <span className="ml-2 font-mono text-[11px] text-amber-300">
+                              #{tunerCh.Number}
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-2">
+                          {providerChannelOptions.length > 0 ? (
+                            <select
+                              aria-label={`${tunerCh.Name} EPG 频道映射`}
+                              value={currentMapped}
+                              onChange={(e) =>
+                                setDraftMappings((prev) => ({
+                                  ...prev,
+                                  [tunerCh.Id]: e.target.value,
+                                }))
+                              }
+                              className="min-w-[200px] rounded-xl border border-white/10 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
+                            >
+                              <option value="">-- 未绑定 EPG 频道 --</option>
+                              {providerChannelOptions.map((opt) => (
+                                <option key={opt.Id} value={opt.Id}>
+                                  {opt.Name} ({opt.Id})
+                                </option>
+                              ))}
+                            </select>
+                          ) : (
+                            <input
+                              type="text"
+                              aria-label={`${tunerCh.Name} EPG 频道映射`}
+                              value={currentMapped}
+                              onChange={(e) =>
+                                setDraftMappings((prev) => ({
+                                  ...prev,
+                                  [tunerCh.Id]: e.target.value,
+                                }))
+                              }
+                              placeholder="输入 XMLTV EPG 频道 ID..."
+                              className="min-w-[200px] rounded-xl border border-white/10 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/50"
+                            />
+                          )}
+
+                          <button
+                            type="button"
+                            disabled={!currentMapped || isSaving}
+                            onClick={() =>
+                              setChannelMappingMutation.mutate({
+                                providerId: selectedMappingProviderId,
+                                tunerChannelId: tunerCh.Id,
+                                providerChannelId: currentMapped,
+                              })
+                            }
+                            className="inline-flex items-center gap-1 rounded-xl bg-amber-500 px-3 py-1.5 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-50"
+                          >
+                            {isSaving ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Save className="h-3.5 w-3.5" />
+                            )}
+                            <span>保存映射</span>
+                          </button>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )
+            })()
+          )}
+        </section>
+      )}
+
       {activeSubTab === 'recordings' && (
         <section
           data-testid="livetv-recordings-panel"
@@ -1020,6 +1633,7 @@ export function LiveTvPage() {
 
               <div className="aspect-video w-full bg-zinc-950">
                 <video
+                  ref={recordingVideoRef}
                   key={playingRecording.Id}
                   data-testid="dvr-recording-video"
                   controls
@@ -1028,7 +1642,9 @@ export function LiveTvPage() {
                   src={
                     demoActive
                       ? getCachedDemoServer()?.getDemoVideoUrl() || ''
-                      : getLiveTvRecordingStreamUrl(playingRecording.Id)
+                      : shouldUseRecordingHls
+                        ? undefined
+                        : getLiveTvRecordingStreamUrl(playingRecording.Id)
                   }
                   onError={(e) => {
                     if (demoActive) return
@@ -1122,6 +1738,7 @@ export function LiveTvPage() {
                         type="button"
                         onClick={() => {
                           setRecordingPlaybackError(null)
+                          setRecordingFallbackDirect(false)
                           setPlayingRecording(rec)
                         }}
                         className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-amber-500/35 bg-amber-500/15 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/25"

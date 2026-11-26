@@ -3,6 +3,8 @@
  * 无需将整文件拉入内存，突破浏览器 WASM 150MB 内存上限，支持 GB 级 MKV 边下边播与基于 Cues 的精确 Seek。
  */
 
+import { isSameOriginUrl } from '../api/client'
+
 // ==================== EBML / Matroska Element IDs ====================
 
 export const EBML_ID = {
@@ -66,6 +68,7 @@ export const DEFAULT_TIMECODE_SCALE_NS = 1_000_000
 export const DEFAULT_INITIAL_HEADER_BYTES = 512 * 1024 // 512 KB (bytes=0-524287)
 export const DEFAULT_STREAM_CHUNK_BYTES = 2 * 1024 * 1024 // 2 MB Range chunk
 export const DEFAULT_MAX_BUFFER_AHEAD_SEC = 30
+export const MAX_SINGLE_FRAME_BYTES = 32 * 1024 * 1024 // 32 MB 单帧硬上限（兼容 4K UHD Remux 超大 IDR 帧）
 
 // ==================== 类型定义 ====================
 
@@ -146,6 +149,8 @@ export interface ClusterParseResult {
   frames: MkvFrame[]
   consumedBytes: number
   lastClusterTimecode: number
+  /** 当前停在未收齐顶层/Cluster 子元素处所需的完整元素字节数（header + payload） */
+  neededBytes?: number
 }
 
 export type StreamMkvFallbackReason =
@@ -185,6 +190,8 @@ export interface StreamMkvOptions {
   maxBufferAheadSec?: number
   /** 目标音轨索引（0-based 音轨序号，或回退匹配 MKV TrackNumber；未指定则默认选择第一条音轨） */
   audioTrackIndex?: number
+  /** 仅解复用直通视频轨（用于 AC3/EAC3/DTS/TrueHD 等大体积 MKV 配合外挂轻量单音轨流同步播放） */
+  videoOnly?: boolean
   /** 自定义 fetch 实现（方便单元测试注入） */
   fetchImpl?: typeof fetch
   /** 外部取消信号 */
@@ -694,10 +701,16 @@ export function parseClusterFrames(
 
   let pos = opts.startOffset ?? 0
   let consumedBytes = pos
+  let neededBytes: number | undefined
 
   while (pos < data.length) {
     const el = readElementHeader(data, pos)
-    if (!el) break
+    if (!el) {
+      if (data[pos] !== 0 && data.length - pos < 16) {
+        neededBytes = 16
+      }
+      break
+    }
 
     if (el.id === EBML_ID.Cluster) {
       // 进入 Cluster 内部元素流式扫描（兼容 unknown size 的直播/大文件 Cluster）
@@ -706,8 +719,9 @@ export function parseClusterFrames(
       continue
     }
 
-    // 非 Cluster 容器元素且负载尚未在当前分块中完整到达 -> 等待下一块拼接
+    // 非 Cluster 容器元素且负载尚未在当前分块中完整到达 -> 记录所需字节数等待下一块拼接
     if (!el.isUnknown && el.endOffset > data.length) {
+      neededBytes = el.endOffset - pos
       break
     }
 
@@ -766,6 +780,7 @@ export function parseClusterFrames(
     frames,
     consumedBytes,
     lastClusterTimecode: clusterTimecode,
+    neededBytes,
   }
 }
 
@@ -987,6 +1002,100 @@ function buildEsdsBox(audioConfig?: Uint8Array): Uint8Array {
   return makeFullBox('esds', 0, 0, out)
 }
 
+export function buildAudioSampleEntry(track: MkvTrackInfo): Uint8Array {
+  const codecUpper = track.codecId.toUpperCase()
+  const sampleRate = Math.round(track.sampleRate || 48000)
+  const channels = track.channels || 2
+  const entryHeader = new Uint8Array(28)
+  const v = new DataView(entryHeader.buffer)
+  v.setUint16(6, 1, false) // data_reference_index
+  v.setUint16(16, channels, false)
+  v.setUint16(18, track.bitDepth || 16, false)
+  v.setUint32(24, (sampleRate << 16) >>> 0, false)
+
+  if (codecUpper.includes('OPUS')) {
+    const cp = track.codecPrivate
+    const hasOpusMagic =
+      cp !== undefined && cp.byteLength >= 19 && readAsciiString(cp, 0, 8) === 'OpusHead'
+
+    if (hasOpusMagic && cp) {
+      const cpView = new DataView(cp.buffer, cp.byteOffset, cp.byteLength)
+      const outChannels = cp[9] || channels
+      if (outChannels <= 0) {
+        throw new StreamMkvFallbackError('unsupported_codec', 'Opus 声道数无效')
+      }
+      const preSkip = cpView.getUint16(10, true)
+      const inputSampleRate = cpView.getUint32(12, true) || sampleRate
+      const outputGain = cpView.getInt16(16, true)
+      const family = cp[18]
+
+      v.setUint16(16, outChannels, false)
+
+      if (family === 0) {
+        if (outChannels > 2) {
+          throw new StreamMkvFallbackError(
+            'unsupported_codec',
+            `Opus MappingFamily 0 不支持 ${outChannels} 声道`,
+          )
+        }
+        const dOpsBody = new Uint8Array(11)
+        const dv = new DataView(dOpsBody.buffer)
+        dOpsBody[0] = 0 // ISO BMFF dOps Version = 0
+        dOpsBody[1] = outChannels
+        dv.setUint16(2, preSkip, false) // Big-Endian
+        dv.setUint32(4, inputSampleRate, false) // Big-Endian
+        dv.setInt16(8, outputGain, false) // Big-Endian
+        dOpsBody[10] = 0
+        return makeBox('Opus', entryHeader, makeBox('dOps', dOpsBody))
+      }
+
+      const requiredLen = 21 + outChannels
+      if (cp.byteLength < requiredLen) {
+        throw new StreamMkvFallbackError(
+          'unsupported_codec',
+          'Opus 多声道 OpusHead 缺少完整的声道映射表',
+        )
+      }
+      const streamCount = cp[19]
+      const coupledCount = cp[20]
+      if (streamCount <= 0) {
+        throw new StreamMkvFallbackError('unsupported_codec', 'Opus StreamCount 无效')
+      }
+      const dOpsBody = new Uint8Array(13 + outChannels)
+      const dv = new DataView(dOpsBody.buffer)
+      dOpsBody[0] = 0 // ISO BMFF dOps Version = 0
+      dOpsBody[1] = outChannels
+      dv.setUint16(2, preSkip, false) // Big-Endian
+      dv.setUint32(4, inputSampleRate, false) // Big-Endian
+      dv.setInt16(8, outputGain, false) // Big-Endian
+      dOpsBody[10] = family
+      dOpsBody[11] = streamCount
+      dOpsBody[12] = coupledCount
+      dOpsBody.set(cp.subarray(21, 21 + outChannels), 13)
+      return makeBox('Opus', entryHeader, makeBox('dOps', dOpsBody))
+    }
+
+    if (channels > 2) {
+      throw new StreamMkvFallbackError(
+        'unsupported_codec',
+        `多声道 Opus (${channels}ch) 缺少合法 OpusHead，回退服务端 HLS`,
+      )
+    }
+
+    const dOpsBody = new Uint8Array(11)
+    const dv = new DataView(dOpsBody.buffer)
+    dOpsBody[0] = 0 // Version
+    dOpsBody[1] = channels
+    dv.setUint16(2, 312, false) // PreSkip
+    dv.setUint32(4, sampleRate, false)
+    dv.setInt16(8, 0, false) // OutputGain
+    dOpsBody[10] = 0 // ChannelMappingFamily
+    return makeBox('Opus', entryHeader, makeBox('dOps', dOpsBody))
+  }
+
+  return makeBox('mp4a', entryHeader, buildEsdsBox(track.codecPrivate))
+}
+
 function buildSampleEntryBox(track: MkvTrackInfo): Uint8Array {
   const codecUpper = track.codecId.toUpperCase()
   if (track.trackType === 'video') {
@@ -1014,29 +1123,7 @@ function buildSampleEntryBox(track: MkvTrackInfo): Uint8Array {
     return makeBox(boxType, entryHeader, cfgBox)
   }
 
-  // Audio sample entry
-  const sampleRate = Math.round(track.sampleRate || 48000)
-  const channels = track.channels || 2
-  const entryHeader = new Uint8Array(28)
-  const v = new DataView(entryHeader.buffer)
-  v.setUint16(6, 1, false) // data_reference_index
-  v.setUint16(16, channels, false)
-  v.setUint16(18, track.bitDepth || 16, false)
-  v.setUint32(24, (sampleRate << 16) >>> 0, false)
-
-  if (codecUpper.includes('OPUS')) {
-    const dOpsBody = new Uint8Array(11)
-    const dv = new DataView(dOpsBody.buffer)
-    dOpsBody[0] = 0 // Version
-    dOpsBody[1] = channels
-    dv.setUint16(2, 312, false) // PreSkip
-    dv.setUint32(4, sampleRate, false)
-    dv.setInt16(8, 0, false) // OutputGain
-    dOpsBody[10] = 0 // ChannelMappingFamily
-    return makeBox('Opus', entryHeader, makeBox('dOps', dOpsBody))
-  }
-
-  return makeBox('mp4a', entryHeader, buildEsdsBox(track.codecPrivate))
+  return buildAudioSampleEntry(track)
 }
 
 function buildTrakBox(track: MkvTrackInfo, timescale: number, durationTicks: number): Uint8Array {
@@ -1385,7 +1472,20 @@ export function canStreamMkvRemux(
   return true
 }
 
-// ==================== Content-Range 工具 ====================
+/**
+ * 检测当前浏览器是否支持通过 MSE 仅流式解复用直通 MKV 的视频轨（忽略不兼容音轨，供双流混合播放模式使用）。
+ */
+export function canStreamMkvVideoOnly(videoCodec?: string, container?: string): boolean {
+  if (container !== undefined && !isMkvContainer(container)) {
+    return false
+  }
+  if (typeof MediaSource === 'undefined' || typeof MediaSource.isTypeSupported !== 'function') {
+    return false
+  }
+  const vCodec = mapVideoCodecToMime(videoCodec)
+  if (!vCodec) return false
+  return MediaSource.isTypeSupported(`video/mp4; codecs="${vCodec}"`)
+}
 
 export function parseContentRangeTotal(header: string | null): number {
   if (!header) return 0
@@ -1635,7 +1735,9 @@ export class StreamMkvRemuxer {
     this.cues = cues
     this.videoTrack = tracks.find((t) => t.trackType === 'video')
     const audioTracks = tracks.filter((t) => t.trackType === 'audio')
-    if (
+    if (opts.videoOnly) {
+      this.audioTrack = undefined
+    } else if (
       opts.audioTrackIndex !== undefined &&
       Number.isInteger(opts.audioTrackIndex) &&
       opts.audioTrackIndex >= 0
@@ -2011,12 +2113,55 @@ export class StreamMkvRemuxer {
         })
         lastClusterTimecode = parsed.lastClusterTimecode
 
-        // 保留未能完整解析的尾部字节（限制最大保留 4MB 防止异常文件导致内存增长）
+        // 处理跨分块未收齐的尾部字节（支持高达 32MB 的 4K UHD Remux 大关键帧拼接；超限精确对齐跳过或抛错回退 HLS，严禁原地清空停在帧中间）
         const remainingLen = combined.byteLength - parsed.consumedBytes
-        leftover =
-          remainingLen > 0 && remainingLen <= 4 * 1024 * 1024
-            ? combined.slice(parsed.consumedBytes)
-            : new Uint8Array(0)
+        if (remainingLen <= 0) {
+          leftover = new Uint8Array(0)
+        } else if (
+          parsed.neededBytes !== undefined &&
+          parsed.neededBytes > 0 &&
+          parsed.neededBytes <= MAX_SINGLE_FRAME_BYTES &&
+          remainingLen <= MAX_SINGLE_FRAME_BYTES
+        ) {
+          leftover = combined.slice(parsed.consumedBytes)
+        } else if (
+          (parsed.neededBytes !== undefined && parsed.neededBytes > MAX_SINGLE_FRAME_BYTES) ||
+          remainingLen > MAX_SINGLE_FRAME_BYTES
+        ) {
+          const oversizedEl = readElementHeader(combined, parsed.consumedBytes)
+          const isMediaBlock =
+            oversizedEl?.id === EBML_ID.SimpleBlock || oversizedEl?.id === EBML_ID.BlockGroup
+          if (
+            oversizedEl &&
+            !oversizedEl.isUnknown &&
+            !isMediaBlock &&
+            this.totalBytes > 0
+          ) {
+            const elementFileStart = this.currentByteOffset - remainingLen
+            const skipOffset = elementFileStart + oversizedEl.endOffset
+            if (skipOffset > this.currentByteOffset && skipOffset <= this.totalBytes) {
+              this.currentByteOffset = skipOffset
+              leftover = new Uint8Array(0)
+            } else {
+              throw new StreamMkvFallbackError(
+                'invalid_mkv',
+                'MKV 元素体积超过 32MB 安全上限，已回退服务端 HLS',
+              )
+            }
+          } else {
+            throw new StreamMkvFallbackError(
+              'invalid_mkv',
+              'MKV 单帧体积超过 32MB 硬上限，已平滑回退服务端 HLS',
+            )
+          }
+        } else if (remainingLen <= 4 * 1024 * 1024 && parsed.consumedBytes > 0) {
+          leftover = combined.slice(parsed.consumedBytes)
+        } else {
+          throw new StreamMkvFallbackError(
+            'invalid_mkv',
+            'MKV Cluster 数据流无法同步解析，已安全回退服务端 HLS',
+          )
+        }
 
         if (generation !== this.pumpGeneration || this.disposed) break
 
@@ -2142,6 +2287,14 @@ export class StreamMkvRemuxer {
       throw new StreamMkvFallbackError('fetch_failed', `Range 拉取失败: ${msg}`)
     }
 
+    if (res.redirected && res.url && !isSameOriginUrl(res.url)) {
+      res.body?.cancel().catch(() => undefined)
+      throw new StreamMkvFallbackError(
+        'fetch_failed',
+        '检测到跨源重定向响应，已中止流式拉取并安全回退',
+      )
+    }
+
     const expectedLen = Math.max(1, end - start + 1)
 
     if (res.status === 206) {
@@ -2240,7 +2393,38 @@ export class StreamMkvRemuxer {
     throw new StreamMkvFallbackError('fetch_failed', `Range 请求返回 HTTP ${res.status}`)
   }
 
-  private appendToBuffer(sb: SourceBuffer, data: Uint8Array): Promise<void> {
+  private isQuotaExceeded(err: unknown): boolean {
+    if (!err || typeof err !== 'object') return false
+    const name = 'name' in err ? String((err as { name?: unknown }).name) : ''
+    const code = 'code' in err ? Number((err as { code?: unknown }).code) : 0
+    const msg = 'message' in err ? String((err as { message?: unknown }).message) : ''
+    return name === 'QuotaExceededError' || code === 22 || /quotaexceeded/i.test(msg)
+  }
+
+  private async evictForQuotaRecovery(targetSb: SourceBuffer): Promise<void> {
+    if (this.disposed) return
+    this.maxBufferAheadSec = Math.max(5, Math.floor(this.maxBufferAheadSec / 2))
+    const curTime = this.videoEl?.currentTime ?? 0
+    const evictEnd = curTime - 5
+    const buffers = Array.from(
+      new Set([targetSb, this.videoSb, this.audioSb].filter((b): b is SourceBuffer => Boolean(b))),
+    )
+    for (const sb of buffers) {
+      if (this.disposed) return
+      try {
+        const buffered = sb.buffered
+        if (!buffered || buffered.length === 0) continue
+        const rangeStart = buffered.start(0)
+        if (Number.isFinite(evictEnd) && evictEnd > rangeStart) {
+          await this.removeFromBuffer(sb, rangeStart, evictEnd)
+        }
+      } catch {
+        // 忽略缓冲驱逐竞态
+      }
+    }
+  }
+
+  private appendBufferOnce(sb: SourceBuffer, data: Uint8Array): Promise<void> {
     if (this.disposed) return Promise.resolve()
     return new Promise<void>((resolve, reject) => {
       const doAppend = () => {
@@ -2267,12 +2451,7 @@ export class StreamMkvRemuxer {
         } catch (err) {
           sb.removeEventListener('updateend', onEnd)
           sb.removeEventListener('error', onErr)
-          reject(
-            new StreamMkvFallbackError(
-              'mse_error',
-              err instanceof Error ? err.message : 'SourceBuffer appendBuffer 异常',
-            ),
-          )
+          reject(err)
         }
       }
 
@@ -2282,6 +2461,33 @@ export class StreamMkvRemuxer {
         doAppend()
       }
     })
+  }
+
+  private async appendToBuffer(sb: SourceBuffer, data: Uint8Array): Promise<void> {
+    if (this.disposed) return
+    try {
+      await this.appendBufferOnce(sb, data)
+    } catch (err) {
+      if (!this.disposed && this.isQuotaExceeded(err)) {
+        await this.evictForQuotaRecovery(sb)
+        await this.waitForBufferIdle(sb)
+        try {
+          await this.appendBufferOnce(sb, data)
+          return
+        } catch (retryErr) {
+          if (retryErr instanceof StreamMkvFallbackError) throw retryErr
+          throw new StreamMkvFallbackError(
+            'mse_error',
+            retryErr instanceof Error ? retryErr.message : 'SourceBuffer QuotaExceeded 重试失败',
+          )
+        }
+      }
+      if (err instanceof StreamMkvFallbackError) throw err
+      throw new StreamMkvFallbackError(
+        'mse_error',
+        err instanceof Error ? err.message : 'SourceBuffer appendBuffer 异常',
+      )
+    }
   }
 
   /** 中止所有 Range 拉取、移除事件监听并释放 MediaSource ObjectURL */

@@ -2,8 +2,28 @@ import { useEffect, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { CheckCircle2, Film, Loader2, Search, Sparkles } from 'lucide-react'
 import { api } from '../../api/client'
-import type { BaseItemDto, RemoteSearchResult } from '../../api/types'
+import type { BaseItemDto, RemoteSearchItemType, RemoteSearchResult } from '../../api/types'
 import { AdminModal, FeedbackBanner } from '../../pages/admin/adminUtils'
+
+const SUPPORTED_REMOTE_SEARCH_TYPES = new Set<RemoteSearchItemType>([
+  'Movie',
+  'Series',
+  'BoxSet',
+  'MusicAlbum',
+  'MusicArtist',
+  'MusicVideo',
+  'Person',
+  'Book',
+  'Game',
+  'Trailer',
+])
+
+export function resolveRemoteSearchItemType(rawType?: string): RemoteSearchItemType {
+  if (rawType && SUPPORTED_REMOTE_SEARCH_TYPES.has(rawType as RemoteSearchItemType)) {
+    return rawType as RemoteSearchItemType
+  }
+  return 'Movie'
+}
 
 export interface IdentifyModalProps {
   open: boolean
@@ -44,7 +64,7 @@ export function IdentifyModal({
   const searchMutation = useMutation({
     mutationFn: async () => {
       if (!item) return []
-      const itemType: 'Movie' | 'Series' = item.Type === 'Series' ? 'Series' : 'Movie'
+      const itemType = resolveRemoteSearchItemType(item.Type)
       const providerIds: Record<string, string> = {}
       if (tmdbId.trim()) providerIds.Tmdb = tmdbId.trim()
       if (imdbId.trim()) providerIds.Imdb = imdbId.trim()

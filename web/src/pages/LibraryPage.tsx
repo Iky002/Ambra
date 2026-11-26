@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowDownWideNarrow,
@@ -7,6 +7,8 @@ import {
   Calendar,
   Check,
   CheckSquare,
+  ChevronDown,
+  ChevronUp,
   Clock,
   Disc3,
   Eye,
@@ -14,12 +16,15 @@ import {
   Film,
   Filter,
   FolderPlus,
+  Heart,
   LayoutGrid,
   List,
   Loader2,
   Mic2,
   Music,
   RotateCcw,
+  SlidersHorizontal,
+  Sparkles,
   Star,
   Tag,
   Tags,
@@ -27,7 +32,7 @@ import {
 } from 'lucide-react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { api, getFallbackImageUrl, getImageUrl } from '../api/client'
-import type { BaseItemDto } from '../api/types'
+import type { BaseItemDto, NameIdPair } from '../api/types'
 import { MediaCard } from '../components/MediaCard'
 import { AddToCollectionModal } from '../components/media/AddToCollectionModal'
 import { QueryErrorState } from '../components/QueryErrorState'
@@ -61,8 +66,29 @@ const MUSIC_SUB_TABS: Array<{ id: MusicSubTab; i18nKey: string; icon: typeof Dis
 ]
 
 const PAGE_SIZE = 36
+const VIRTUALIZE_GRID_THRESHOLD = 120
+const ESTIMATED_GRID_ROW_HEIGHT = 320
+const VIRTUAL_OVERSCAN_ROWS = 3
 const VIEW_MODE_STORAGE_KEY = 'ambra_library_view_mode'
 const ALPHABET_LETTERS = ['全部', '#', ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('')] as const
+
+function extractFilterString(entry: string | NameIdPair | number | null | undefined): string {
+  if (entry === null || entry === undefined) return ''
+  if (typeof entry === 'number') return Number.isFinite(entry) ? String(entry) : ''
+  if (typeof entry === 'string') return entry.trim()
+  if (typeof entry === 'object' && typeof entry.Name === 'string') return entry.Name.trim()
+  return ''
+}
+
+function getResponsiveGridCols(viewportWidth: number): number {
+  if (!Number.isFinite(viewportWidth) || viewportWidth <= 0) return 6
+  if (viewportWidth < 640) return 2
+  if (viewportWidth < 768) return 3
+  if (viewportWidth < 1024) return 4
+  if (viewportWidth < 1280) return 5
+  if (viewportWidth < 1536) return 6
+  return 7
+}
 
 type LibraryViewMode = 'grid' | 'list'
 
@@ -93,6 +119,13 @@ export function LibraryPage() {
   const [yearFilter, setYearFilter] = useState(() => searchParams.get('year') || '')
   const [tagFilter, setTagFilter] = useState(() => searchParams.get('tag') || '')
   const [studioFilter, setStudioFilter] = useState(() => searchParams.get('studio') || '')
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [resolutionFilter, setResolutionFilter] = useState<'' | '4K' | 'HD'>('')
+  const [hdrOnly, setHdrOnly] = useState(false)
+  const [videoCodecFilter, setVideoCodecFilter] = useState('')
+  const [minRatingFilter, setMinRatingFilter] = useState('')
+  const [likedOnly, setLikedOnly] = useState(false)
+  const [pageSize, setPageSize] = useState<number>(PAGE_SIZE)
   const [musicSubTab, setMusicSubTab] = useState<MusicSubTab>('MusicAlbum')
   const [page, setPage] = useState(0)
 
@@ -128,6 +161,11 @@ export function LibraryPage() {
   useEffect(() => {
     setMusicSubTab('MusicAlbum')
     setStatusFilter('')
+    setResolutionFilter('')
+    setHdrOnly(false)
+    setVideoCodecFilter('')
+    setMinRatingFilter('')
+    setLikedOnly(false)
     setSelectMode(false)
     setSelectedIds(new Set())
     setBatchFeedback(null)
@@ -136,7 +174,20 @@ export function LibraryPage() {
   // 切换任何筛选条件或音乐子标签时清空已选集合，避免隐藏项被误包含进批量操作
   useEffect(() => {
     setSelectedIds(new Set())
-  }, [musicSubTab, statusFilter, genreFilter, yearFilter, tagFilter, studioFilter, letterFilter])
+  }, [
+    musicSubTab,
+    statusFilter,
+    genreFilter,
+    yearFilter,
+    tagFilter,
+    studioFilter,
+    letterFilter,
+    resolutionFilter,
+    hdrOnly,
+    videoCodecFilter,
+    minRatingFilter,
+    likedOnly,
+  ])
 
   const updateUrlParam = (key: 'genre' | 'year' | 'tag' | 'studio' | 'letter', value: string) => {
     const next = new URLSearchParams(searchParams)
@@ -176,34 +227,95 @@ export function LibraryPage() {
     staleTime: 60_000,
   })
 
-  const genreOptions = useMemo(() => {
-    const list = (genresData?.Items || []).map((g) => g.Name).filter(Boolean)
-    if (genreFilter && !list.includes(genreFilter)) {
-      return [genreFilter, ...list]
-    }
-    return list
-  }, [genresData, genreFilter])
-
-  const yearOptions = useMemo(() => {
-    const list = (yearsData?.Items || []).map((y) => y.Name).filter(Boolean)
-    if (yearFilter && !list.includes(yearFilter)) {
-      return [yearFilter, ...list]
-    }
-    return list
-  }, [yearsData, yearFilter])
-
-  const tagOptions = useMemo(() => {
-    const list = (tagsData?.Items || []).map((t) => t.Name).filter(Boolean)
-    if (tagFilter && !list.includes(tagFilter)) {
-      return [tagFilter, ...list]
-    }
-    return list
-  }, [tagsData, tagFilter])
-
   const isMusicLibrary = (libraryInfo?.CollectionType || '').toLowerCase() === 'music'
   const includeItemTypes = isMusicLibrary
     ? musicSubTab
     : 'Movie,Series,MusicAlbum,Video'
+
+  const { data: filters2Data } = useQuery({
+    queryKey: ['itemFilters2', userId, id, includeItemTypes],
+    queryFn: () =>
+      api
+        .getItemFilters2({ userId, parentId: id, includeItemTypes })
+        .catch(() => ({ Genres: [], Tags: [], Years: [], Codecs: [] })),
+    enabled: Boolean(id && (libraryInfo || libraryInfoFetched)),
+    staleTime: 60_000,
+  })
+
+  const genreOptions = useMemo(() => {
+    const merged = new Set<string>()
+    for (const g of genresData?.Items || []) {
+      const name = extractFilterString(g)
+      if (name) merged.add(name)
+    }
+    for (const g of (filters2Data?.Genres || []) as Array<string | NameIdPair>) {
+      const name = extractFilterString(g)
+      if (name) merged.add(name)
+    }
+    const list = Array.from(merged)
+    if (genreFilter && !list.includes(genreFilter)) {
+      return [genreFilter, ...list]
+    }
+    return list
+  }, [genresData, filters2Data?.Genres, genreFilter])
+
+  const yearOptions = useMemo(() => {
+    const merged = new Set<string>()
+    for (const y of yearsData?.Items || []) {
+      const name = extractFilterString(y)
+      if (name) merged.add(name)
+    }
+    for (const y of filters2Data?.Years || []) {
+      const name = extractFilterString(y)
+      if (name) merged.add(name)
+    }
+    const list = Array.from(merged).sort((a, b) => Number(b) - Number(a))
+    if (yearFilter && !list.includes(yearFilter)) {
+      return [yearFilter, ...list]
+    }
+    return list
+  }, [yearsData, filters2Data?.Years, yearFilter])
+
+  const tagOptions = useMemo(() => {
+    const merged = new Set<string>()
+    for (const tItem of tagsData?.Items || []) {
+      const name = extractFilterString(tItem)
+      if (name) merged.add(name)
+    }
+    for (const tItem of (filters2Data?.Tags || []) as Array<string | NameIdPair>) {
+      const name = extractFilterString(tItem)
+      if (name) merged.add(name)
+    }
+    const list = Array.from(merged)
+    if (tagFilter && !list.includes(tagFilter)) {
+      return [tagFilter, ...list]
+    }
+    return list
+  }, [tagsData, filters2Data?.Tags, tagFilter])
+
+  const codecOptions = useMemo(() => {
+    const defaults = ['hevc', 'h264', 'av1', 'vp9']
+    const merged = new Set<string>(defaults)
+    for (const c of filters2Data?.Codecs || []) {
+      const normalized = extractFilterString(c).toLowerCase()
+      if (normalized) merged.add(normalized)
+    }
+    if (videoCodecFilter && !merged.has(videoCodecFilter.toLowerCase())) {
+      merged.add(videoCodecFilter.toLowerCase())
+    }
+    return Array.from(merged)
+  }, [filters2Data?.Codecs, videoCodecFilter])
+
+  const combinedFilters = useMemo(() => {
+    const parts = [statusFilter, likedOnly ? 'IsLiked' : ''].filter(Boolean)
+    return parts.length > 0 ? parts.join(',') : undefined
+  }, [statusFilter, likedOnly])
+
+  const parsedMinRating = useMemo(() => {
+    if (!minRatingFilter) return undefined
+    const n = Number(minRatingFilter)
+    return Number.isFinite(n) && n > 0 ? n : undefined
+  }, [minRatingFilter])
 
   const { data, isLoading, isFetching, isError, error, refetch } = useQuery({
     queryKey: [
@@ -219,6 +331,12 @@ export function LibraryPage() {
       yearFilter,
       tagFilter,
       studioFilter,
+      resolutionFilter,
+      hdrOnly,
+      videoCodecFilter,
+      minRatingFilter,
+      likedOnly,
+      pageSize,
       page,
     ],
     queryFn: () =>
@@ -227,16 +345,22 @@ export function LibraryPage() {
         includeItemTypes,
         sortBy,
         sortOrder,
-        filters: statusFilter || undefined,
+        filters: combinedFilters,
         genres: genreFilter || undefined,
         years: yearFilter || undefined,
         tags: tagFilter || undefined,
         studios: studioFilter || undefined,
+        is4K: resolutionFilter === '4K' ? true : undefined,
+        isHD: resolutionFilter === 'HD' ? true : undefined,
+        isHDR: hdrOnly ? true : undefined,
+        videoCodecs: videoCodecFilter || undefined,
+        minCommunityRating: parsedMinRating,
+        isLiked: likedOnly ? true : undefined,
         nameLessThan: letterFilter === '#' ? 'a' : undefined,
         nameStartsWith:
           letterFilter && letterFilter !== '#' ? letterFilter.toLowerCase() : undefined,
-        startIndex: page * PAGE_SIZE,
-        limit: PAGE_SIZE,
+        startIndex: page * pageSize,
+        limit: pageSize,
       }),
     enabled: Boolean(id && (libraryInfo || libraryInfoFetched)),
     placeholderData: (prev) => prev,
@@ -245,9 +369,24 @@ export function LibraryPage() {
   const items = data?.Items || []
   const total = data?.TotalRecordCount ?? items.length
 
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  const advancedActiveCount = useMemo(() => {
+    let count = 0
+    if (resolutionFilter) count += 1
+    if (hdrOnly) count += 1
+    if (videoCodecFilter) count += 1
+    if (minRatingFilter) count += 1
+    if (likedOnly) count += 1
+    return count
+  }, [resolutionFilter, hdrOnly, videoCodecFilter, minRatingFilter, likedOnly])
   const hasActiveFilters = Boolean(
-    statusFilter || letterFilter || genreFilter || yearFilter || tagFilter || studioFilter,
+    statusFilter ||
+      letterFilter ||
+      genreFilter ||
+      yearFilter ||
+      tagFilter ||
+      studioFilter ||
+      advancedActiveCount > 0,
   )
 
   const handleResetFilters = () => {
@@ -257,6 +396,11 @@ export function LibraryPage() {
     setYearFilter('')
     setTagFilter('')
     setStudioFilter('')
+    setResolutionFilter('')
+    setHdrOnly(false)
+    setVideoCodecFilter('')
+    setMinRatingFilter('')
+    setLikedOnly(false)
     setSearchParams({}, { replace: true })
     setPage(0)
   }
@@ -529,6 +673,55 @@ export function LibraryPage() {
             <span>{locale === 'zh-CN' ? '多选' : t('library.multiSelect')}</span>
           </button>
 
+          {/* 高级筛选折叠开关 */}
+          <button
+            type="button"
+            data-testid="toggle-advanced-filters"
+            aria-expanded={advancedOpen}
+            onClick={() => setAdvancedOpen((prev) => !prev)}
+            className={`flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-medium transition-colors ${
+              advancedOpen || advancedActiveCount > 0
+                ? 'border-amber-400/50 bg-amber-500/15 text-amber-300'
+                : 'border-white/10 bg-white/[0.04] text-zinc-200 hover:bg-white/10'
+            }`}
+          >
+            <SlidersHorizontal className="h-3.5 w-3.5 text-amber-400" />
+            <span>高级筛选</span>
+            {advancedActiveCount > 0 && (
+              <span className="rounded-full bg-amber-500 px-1.5 py-0.2 text-[10px] font-bold text-zinc-950">
+                {advancedActiveCount}
+              </span>
+            )}
+            {advancedOpen ? (
+              <ChevronUp className="h-3.5 w-3.5" />
+            ) : (
+              <ChevronDown className="h-3.5 w-3.5" />
+            )}
+          </button>
+
+          {/* 每页容量切换（支持大画幅虚拟滚动浏览） */}
+          <div className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-xs">
+            <select
+              aria-label="每页数量"
+              value={pageSize}
+              onChange={(e) => {
+                setPageSize(Number(e.target.value) || PAGE_SIZE)
+                setPage(0)
+              }}
+              className="bg-transparent text-zinc-200 outline-none"
+            >
+              <option value={36} className="bg-zinc-900 text-zinc-100">
+                36 / 页
+              </option>
+              <option value={150} className="bg-zinc-900 text-zinc-100">
+                150 / 页
+              </option>
+              <option value={300} className="bg-zinc-900 text-zinc-100">
+                300 / 页
+              </option>
+            </select>
+          </div>
+
           {studioFilter && (
             <span className="inline-flex items-center gap-1.5 rounded-xl border border-amber-400/35 bg-amber-500/15 px-3 py-1.5 text-xs font-medium text-amber-200">
               <Building2 className="h-3.5 w-3.5 text-amber-400" />
@@ -561,6 +754,148 @@ export function LibraryPage() {
           )}
         </div>
       </div>
+
+      {/* 可折叠高级多维筛选栏（对接 /emby/Items/Filters2） */}
+      {advancedOpen && (
+        <div
+          data-testid="advanced-filters-panel"
+          className="grid grid-cols-1 gap-3 rounded-2xl border border-amber-500/20 bg-zinc-950/75 p-4 backdrop-blur-md sm:grid-cols-2 lg:grid-cols-6"
+        >
+          <label className="space-y-1 text-xs">
+            <span className="block text-[11px] font-medium text-zinc-400">流派</span>
+            <select
+              aria-label="高级筛选流派"
+              value={genreFilter}
+              onChange={(e) => {
+                setGenreFilter(e.target.value)
+                updateUrlParam('genre', e.target.value)
+              }}
+              className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
+            >
+              <option value="">全部流派</option>
+              {genreOptions.map((g) => (
+                <option key={g} value={g}>
+                  {g}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="space-y-1 text-xs">
+            <span className="block text-[11px] font-medium text-zinc-400">年份</span>
+            <select
+              aria-label="高级筛选年份"
+              value={yearFilter}
+              onChange={(e) => {
+                setYearFilter(e.target.value)
+                updateUrlParam('year', e.target.value)
+              }}
+              className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
+            >
+              <option value="">全部年份</option>
+              {yearOptions.map((y) => (
+                <option key={y} value={y}>
+                  {y}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="space-y-1 text-xs">
+            <span className="block text-[11px] font-medium text-zinc-400">分辨率规格</span>
+            <select
+              aria-label="按分辨率筛选"
+              value={resolutionFilter}
+              onChange={(e) => {
+                setResolutionFilter((e.target.value as '' | '4K' | 'HD') || '')
+                setPage(0)
+              }}
+              className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
+            >
+              <option value="">全部分辨率</option>
+              <option value="4K">4K 超高清 (UHD)</option>
+              <option value="HD">高清 (HD 1080p/720p)</option>
+            </select>
+          </label>
+
+          <label className="space-y-1 text-xs">
+            <span className="block text-[11px] font-medium text-zinc-400">视频编码</span>
+            <select
+              aria-label="按视频编码筛选"
+              value={videoCodecFilter}
+              onChange={(e) => {
+                setVideoCodecFilter(e.target.value)
+                setPage(0)
+              }}
+              className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
+            >
+              <option value="">全部编码</option>
+              {codecOptions.map((codec) => (
+                <option key={codec} value={codec}>
+                  {codec.toUpperCase()}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="space-y-1 text-xs">
+            <span className="block text-[11px] font-medium text-zinc-400">最低评分</span>
+            <select
+              aria-label="按最低评分筛选"
+              value={minRatingFilter}
+              onChange={(e) => {
+                setMinRatingFilter(e.target.value)
+                setPage(0)
+              }}
+              className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
+            >
+              <option value="">不限评分</option>
+              <option value="9">≥ 9.0 分</option>
+              <option value="8">≥ 8.0 分</option>
+              <option value="7">≥ 7.0 分</option>
+              <option value="6">≥ 6.0 分</option>
+            </select>
+          </label>
+
+          <div className="flex items-end gap-2">
+            <button
+              type="button"
+              data-testid="filter-hdr-toggle"
+              aria-pressed={hdrOnly}
+              onClick={() => {
+                setHdrOnly((v) => !v)
+                setPage(0)
+              }}
+              className={`flex flex-1 items-center justify-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-semibold transition-colors ${
+                hdrOnly
+                  ? 'border-amber-400/60 bg-amber-500/20 text-amber-300'
+                  : 'border-white/10 bg-zinc-900 text-zinc-300 hover:bg-white/8'
+              }`}
+            >
+              <Sparkles className="h-3.5 w-3.5" />
+              <span>HDR</span>
+            </button>
+
+            <button
+              type="button"
+              data-testid="filter-liked-toggle"
+              aria-pressed={likedOnly}
+              onClick={() => {
+                setLikedOnly((v) => !v)
+                setPage(0)
+              }}
+              className={`flex flex-1 items-center justify-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-semibold transition-colors ${
+                likedOnly
+                  ? 'border-rose-400/60 bg-rose-500/20 text-rose-300'
+                  : 'border-white/10 bg-zinc-900 text-zinc-300 hover:bg-white/8'
+              }`}
+            >
+              <Heart className={`h-3.5 w-3.5 ${likedOnly ? 'fill-current' : ''}`} />
+              <span>已赞</span>
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* 字母快速索引条 */}
       <div
@@ -657,6 +992,13 @@ export function LibraryPage() {
             />
           ))}
         </div>
+      ) : items.length > VIRTUALIZE_GRID_THRESHOLD ? (
+        <VirtualizedLibraryGrid
+          items={items}
+          selectable={selectMode}
+          selectedIds={selectedIds}
+          onToggleSelect={toggleSelectItem}
+        />
       ) : (
         <div
           data-testid="library-grid-view"
@@ -794,6 +1136,97 @@ export function LibraryPage() {
           setSelectedIds(new Set())
         }}
       />
+    </div>
+  )
+}
+
+function VirtualizedLibraryGrid({
+  items,
+  selectable,
+  selectedIds,
+  onToggleSelect,
+}: {
+  items: BaseItemDto[]
+  selectable: boolean
+  selectedIds: Set<string>
+  onToggleSelect: (item: BaseItemDto) => void
+}) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const [cols, setCols] = useState(() =>
+    typeof window !== 'undefined' ? getResponsiveGridCols(window.innerWidth) : 6,
+  )
+  const [scrollState, setScrollState] = useState({ offsetTop: 0, viewportHeight: 900 })
+
+  useEffect(() => {
+    const updateViewport = () => {
+      if (typeof window === 'undefined') return
+      const nextCols = getResponsiveGridCols(window.innerWidth)
+      setCols(nextCols)
+      const rectTop = containerRef.current?.getBoundingClientRect().top ?? 0
+      const offsetTop = Math.max(0, -rectTop)
+      const viewportHeight = window.innerHeight > 0 ? window.innerHeight : 900
+      setScrollState((prev) =>
+        prev.offsetTop === offsetTop && prev.viewportHeight === viewportHeight
+          ? prev
+          : { offsetTop, viewportHeight },
+      )
+    }
+
+    updateViewport()
+    window.addEventListener('scroll', updateViewport, { passive: true })
+    window.addEventListener('resize', updateViewport, { passive: true })
+    return () => {
+      window.removeEventListener('scroll', updateViewport)
+      window.removeEventListener('resize', updateViewport)
+    }
+  }, [items.length])
+
+  const totalRows = Math.ceil(items.length / cols)
+  const startRow = Math.max(
+    0,
+    Math.floor(scrollState.offsetTop / ESTIMATED_GRID_ROW_HEIGHT) - VIRTUAL_OVERSCAN_ROWS,
+  )
+  const visibleRowCount =
+    Math.ceil(scrollState.viewportHeight / ESTIMATED_GRID_ROW_HEIGHT) + VIRTUAL_OVERSCAN_ROWS * 2
+  const endRow = Math.min(totalRows, startRow + visibleRowCount)
+
+  const startIdx = startRow * cols
+  const endIdx = Math.min(items.length, endRow * cols)
+  const visibleItems = items.slice(startIdx, endIdx)
+
+  const topSpacerHeight = startRow * ESTIMATED_GRID_ROW_HEIGHT
+  const bottomSpacerHeight = Math.max(0, (totalRows - endRow) * ESTIMATED_GRID_ROW_HEIGHT)
+
+  return (
+    <div ref={containerRef} data-testid="library-virtual-scroll">
+      {topSpacerHeight > 0 && (
+        <div
+          data-testid="virtual-grid-top-spacer"
+          style={{ height: `${topSpacerHeight}px` }}
+          aria-hidden="true"
+        />
+      )}
+      <div
+        data-testid="library-grid-view"
+        className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7"
+      >
+        {visibleItems.map((item) => (
+          <MediaCard
+            key={item.Id}
+            item={item}
+            selectable={selectable}
+            selected={selectedIds.has(item.Id)}
+            onToggleSelect={onToggleSelect}
+          />
+        ))}
+      </div>
+      {bottomSpacerHeight > 0 && (
+        <div
+          data-testid="virtual-grid-bottom-spacer"
+          style={{ height: `${bottomSpacerHeight}px` }}
+          aria-hidden="true"
+        />
+      )}
     </div>
   )
 }

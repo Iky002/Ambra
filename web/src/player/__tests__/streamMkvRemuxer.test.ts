@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  buildAudioSampleEntry,
   buildFmp4InitSegment,
   buildFmp4MediaSegment,
   canStreamMkvRemux,
+  canStreamMkvVideoOnly,
   EBML_ID,
   findNextClusterOffset,
   isMkvContainer,
@@ -926,6 +928,243 @@ describe('StreamMkvRemuxer Controller (Range + MSE + Seek + Dispose)', () => {
     const baseDecodeMs = tfdtView.getUint32(0, false) * 0x100000000 + tfdtView.getUint32(4, false)
     expect(baseDecodeMs).toBe(50040)
     expect(videoEl.currentTime).toBeCloseTo(50.04, 2)
+
+    remuxer.dispose()
+  })
+
+  it('[H-14] parses 5.1/7.1 OpusHead CodecPrivate into big-endian ISO BMFF dOps with channel mapping and rejects >2ch without OpusHead', () => {
+    // 构造 5.1 (6 声道, family = 1) OpusHead (小端序):
+    // Magic "OpusHead"(8) + Version(1)=1 + Channels(1)=6 + PreSkip(2, LE)=312(0x0138 -> [0x38,0x01])
+    // + InputSampleRate(4, LE)=48000(0x0000BB80 -> [0x80,0xbb,0x00,0x00])
+    // + OutputGain(2, LE)=-256(0xFF00 -> [0x00,0xff])
+    // + MappingFamily(1)=1 + StreamCount(1)=4 + CoupledCount(1)=2 + Mapping(6)=[0,4,1,2,3,5]
+    const opusHead51 = new Uint8Array([
+      0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64,
+      1,
+      6,
+      0x38, 0x01,
+      0x80, 0xbb, 0x00, 0x00,
+      0x00, 0xff,
+      1,
+      4,
+      2,
+      0, 4, 1, 2, 3, 5,
+    ])
+
+    const sampleEntry = buildAudioSampleEntry({
+      trackNumber: 2,
+      trackType: 'audio',
+      codecId: 'A_OPUS',
+      channels: 6,
+      sampleRate: 48000,
+      codecPrivate: opusHead51,
+    })
+
+    expect(readBoxType(sampleEntry, 0)).toBe('Opus')
+    const dOps = findChildBox(sampleEntry, 36, sampleEntry.byteLength, 'dOps')
+    expect(dOps).not.toBeNull()
+    const dOpsBody = sampleEntry.subarray(dOps!.offset + 8, dOps!.offset + dOps!.size)
+    const dv = new DataView(dOpsBody.buffer, dOpsBody.byteOffset, dOpsBody.byteLength)
+
+    expect(dv.getUint8(0)).toBe(0) // dOps Version = 0
+    expect(dv.getUint8(1)).toBe(6) // OutputChannelCount = 6
+    expect(dv.getUint16(2, false)).toBe(312) // PreSkip big-endian
+    expect(dv.getUint32(4, false)).toBe(48000) // InputSampleRate big-endian
+    expect(dv.getInt16(8, false)).toBe(-256) // OutputGain big-endian
+    expect(dv.getUint8(10)).toBe(1) // ChannelMappingFamily = 1
+    expect(dv.getUint8(11)).toBe(4) // StreamCount
+    expect(dv.getUint8(12)).toBe(2) // CoupledCount
+    expect(Array.from(dOpsBody.subarray(13, 19))).toEqual([0, 4, 1, 2, 3, 5])
+
+    // 缺少 OpusHead 且 channels > 2 时必须抛出 StreamMkvFallbackError 平滑回退
+    expect(() =>
+      buildAudioSampleEntry({
+        trackNumber: 2,
+        trackType: 'audio',
+        codecId: 'A_OPUS',
+        channels: 6,
+        sampleRate: 48000,
+      }),
+    ).toThrow(StreamMkvFallbackError)
+  })
+
+  it('[H-14] reassembles >4MB single UHD IDR SimpleBlock across Range chunks without losing sync', async () => {
+    const ebmlHeader = ebmlEl(EBML_ID.EBML, ebmlEl(EBML_ID.DocType, strBytes('matroska')))
+    const info = ebmlEl(
+      EBML_ID.Info,
+      ebmlEl(EBML_ID.TimecodeScale, uintBytes(1_000_000)),
+      ebmlEl(EBML_ID.Duration, float64Bytes(10_000)),
+    )
+    const avcC = new Uint8Array([0x01, 0x64, 0x00, 0x28, 0xff, 0xe1, 0x00, 0x04, 0x67, 0x64, 0x00, 0x28])
+    const tracks = ebmlEl(
+      EBML_ID.Tracks,
+      ebmlEl(
+        EBML_ID.TrackEntry,
+        ebmlEl(EBML_ID.TrackNumber, uintBytes(1)),
+        ebmlEl(EBML_ID.TrackType, uintBytes(1)),
+        ebmlEl(EBML_ID.CodecID, strBytes('V_MPEG4/ISO/AVC')),
+        ebmlEl(EBML_ID.CodecPrivate, avcC),
+      ),
+    )
+
+    // 构造 5MB 单帧（超过旧 4MB MAX_LEFTOVER_BYTES 限制，小于 32MB 硬上限）
+    const fiveMbPayload = new Uint8Array(5 * 1024 * 1024)
+    fiveMbPayload[0] = 0x65
+    fiveMbPayload[fiveMbPayload.byteLength - 1] = 0xab
+    const cluster = ebmlEl(
+      EBML_ID.Cluster,
+      ebmlEl(EBML_ID.Timecode, uintBytes(0)),
+      makeSimpleBlock(1, 0, 0x80, fiveMbPayload),
+      makeSimpleBlock(1, 40, 0x00, new Uint8Array([0x41, 0x02])),
+    )
+
+    // 先验证 parseClusterFrames 对截断的大帧精确返回 neededBytes
+    const partial = cluster.subarray(0, 1024 * 1024)
+    const partialRes = parseClusterFrames(partial)
+    expect(partialRes.consumedBytes).toBeGreaterThan(0) // Cluster header + Timecode consumed
+    const remainingBlockStart = cluster.subarray(partialRes.consumedBytes, 1024 * 1024)
+    const blockRes = parseClusterFrames(remainingBlockStart)
+    expect(blockRes.consumedBytes).toBe(0)
+    expect(blockRes.neededBytes).toBeGreaterThan(5 * 1024 * 1024)
+
+    // 再验证完整泵循环跨多个 1MB Range 请求成功拼齐并推入 MSE
+    const segment = ebmlEl(EBML_ID.Segment, concat(info, tracks, cluster))
+    const bytes = concat(ebmlHeader, segment)
+    const { appendedByMime } = installMockMSE()
+    const onError = vi.fn()
+
+    const mockFetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = (init?.headers || {}) as Record<string, string>
+      const range = headers.Range || headers.range || ''
+      const match = /bytes=(\d+)-(\d+)/.exec(range)
+      const start = match ? Number(match[1]) : 0
+      const end = match ? Math.min(bytes.byteLength - 1, Number(match[2])) : bytes.byteLength - 1
+      const slice = bytes.slice(start, end + 1)
+      return new Response(slice, {
+        status: 206,
+        headers: {
+          'Content-Range': `bytes ${start}-${end}/${bytes.byteLength}`,
+          'Content-Length': String(slice.byteLength),
+        },
+      })
+    }) as unknown as typeof fetch
+
+    const videoEl = document.createElement('video')
+    Object.defineProperty(videoEl, 'buffered', {
+      configurable: true,
+      value: { length: 0, start: () => 0, end: () => 0 },
+    })
+
+    const remuxer = new StreamMkvRemuxer()
+    await remuxer.attach(videoEl, '/emby/Videos/uhd-5mb/stream', {}, {
+      fetchImpl: mockFetch,
+      initialHeaderBytes: 64 * 1024,
+      chunkSizeBytes: 1024 * 1024, // 每次仅拉 1MB，需要连续拼接 6 次才能收齐 5MB IDR 帧
+      onError,
+    })
+
+    await new Promise((r) => setTimeout(r, 80))
+    expect(onError).not.toHaveBeenCalled()
+    const videoChunks = appendedByMime.get('video/mp4; codecs="avc1.640028"') || []
+    expect(videoChunks.length).toBeGreaterThanOrEqual(2)
+    expect(videoChunks[1].byteLength).toBeGreaterThan(5 * 1024 * 1024)
+
+    remuxer.dispose()
+  })
+
+  it('[M-18, H-01, H-14] recovers from MSE QuotaExceededError, supports videoOnly mode for AC3 MKV, and aborts cross-origin 302 redirects', async () => {
+    const { bytes } = buildSyntheticMkvFile({ audioCodecId: 'A_AC3' })
+    const { appendedByMime } = installMockMSE()
+
+    expect(canStreamMkvVideoOnly('h264', 'mkv')).toBe(true)
+
+    // 1. 跨源重定向必须在 StreamMkvRemuxer.fetchRange 中立即拦截抛出 fetch_failed
+    const crossOriginRes = new Response(bytes.subarray(0, 1024), { status: 206 })
+    Object.defineProperty(crossOriginRes, 'redirected', { value: true })
+    Object.defineProperty(crossOriginRes, 'url', { value: 'https://evil-cdn.example.com/movie.mkv' })
+    const redirectFetch = vi.fn(async () => crossOriginRes) as unknown as typeof fetch
+
+    const videoRedirect = document.createElement('video')
+    const redirectRemuxer = new StreamMkvRemuxer()
+    await expect(
+      redirectRemuxer.attach(videoRedirect, '/emby/Videos/strm/stream', {}, { fetchImpl: redirectFetch }),
+    ).rejects.toSatisfy(
+      (err: unknown) => err instanceof StreamMkvFallbackError && err.reason === 'fetch_failed',
+    )
+    redirectRemuxer.dispose()
+
+    // 2. videoOnly 模式忽略不兼容的 A_AC3 音轨，且遇到 QuotaExceededError 时驱逐 currentTime - 5 之前的已播缓冲并重试
+    const mockFetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = (init?.headers || {}) as Record<string, string>
+      const range = headers.Range || headers.range || ''
+      const match = /bytes=(\d+)-(\d+)/.exec(range)
+      const start = match ? Number(match[1]) : 0
+      const end = match ? Math.min(bytes.byteLength - 1, Number(match[2])) : bytes.byteLength - 1
+      const slice = bytes.slice(start, end + 1)
+      return new Response(slice, {
+        status: 206,
+        headers: {
+          'Content-Range': `bytes ${start}-${end}/${bytes.byteLength}`,
+          'Content-Length': String(slice.byteLength),
+        },
+      })
+    }) as unknown as typeof fetch
+
+    const removedRanges: Array<[number, number]> = []
+    let throwQuotaOnce = true
+    const OrigMediaSource = globalThis.MediaSource
+    class QuotaMediaSource extends OrigMediaSource {
+      addSourceBuffer(mime: string) {
+        const sb = super.addSourceBuffer(mime) as unknown as SourceBuffer & EventTarget
+        Object.defineProperty(sb, 'buffered', {
+          configurable: true,
+          value: {
+            length: 1,
+            start: () => 0,
+            end: () => 20,
+          },
+        })
+        sb.remove = vi.fn((start: number, end: number) => {
+          removedRanges.push([start, end])
+          Object.defineProperty(sb, 'updating', { configurable: true, writable: true, value: true })
+          queueMicrotask(() => {
+            Object.defineProperty(sb, 'updating', { configurable: true, writable: true, value: false })
+            sb.dispatchEvent(new Event('updateend'))
+          })
+        })
+        const origAppend = sb.appendBuffer.bind(sb)
+        sb.appendBuffer = (data: BufferSource) => {
+          if (throwQuotaOnce) {
+            throwQuotaOnce = false
+            const quotaErr = new DOMException('Buffer full', 'QuotaExceededError')
+            throw quotaErr
+          }
+          origAppend(data)
+        }
+        return sb
+      }
+    }
+    globalThis.MediaSource = QuotaMediaSource
+
+    const videoEl = document.createElement('video')
+    Object.defineProperty(videoEl, 'currentTime', { configurable: true, writable: true, value: 18 })
+    Object.defineProperty(videoEl, 'buffered', {
+      configurable: true,
+      value: { length: 1, start: () => 0, end: () => 20 },
+    })
+
+    const remuxer = new StreamMkvRemuxer()
+    const meta = await remuxer.attach(videoEl, '/emby/Videos/ac3-mkv/stream', {}, {
+      fetchImpl: mockFetch,
+      videoOnly: true,
+    })
+
+    expect(meta.audioTrack).toBeFalsy()
+    await new Promise((r) => setTimeout(r, 40))
+
+    // 验证 QuotaExceededError 触发了 remove(0, 13) (currentTime 18 - 5 = 13，不受 30s 限制) 并成功重试写入
+    expect(removedRanges).toEqual([[0, 13]])
+    expect((appendedByMime.get('video/mp4; codecs="avc1.640028"') || []).length).toBeGreaterThanOrEqual(2)
 
     remuxer.dispose()
   })

@@ -62,7 +62,7 @@ describe('api/client - 凭证管理、请求头注入与 401 处理', () => {
     expect(getStoredAuth()).toBeNull()
   })
 
-  it('embyFetch 注入 X-Emby-Token 与 X-Emby-Authorization 请求头', async () => {
+  it('embyFetch 注入标准 HTTP Authorization 头，不再发送自定义 X-Emby-Token 或 X-Emby-Authorization', async () => {
     saveAuth(TEST_AUTH)
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')
@@ -75,8 +75,10 @@ describe('api/client - 凭证管理、请求头注入与 401 处理', () => {
     const [url, init] = fetchSpy.mock.calls[0]
     expect(url).toBe('/emby/System/Info')
     const headers = init?.headers as Headers
-    expect(headers.get('X-Emby-Token')).toBe(TEST_AUTH.accessToken)
-    expect(headers.get('X-Emby-Authorization')).toContain(`Token="${TEST_AUTH.accessToken}"`)
+    expect(headers.get('Authorization')).toContain('MediaBrowser ')
+    expect(headers.get('Authorization')).toContain(`Token="${TEST_AUTH.accessToken}"`)
+    expect(headers.get('X-Emby-Token')).toBeNull()
+    expect(headers.get('X-Emby-Authorization')).toBeNull()
     expect(headers.get('Accept')).toBe('application/json')
   })
 
@@ -148,11 +150,12 @@ describe('api/client - 凭证管理、请求头注入与 401 处理', () => {
         }),
       )
 
-    await api.setupAdmin('admin', 'StrongPass123!')
+    await api.setupAdmin({ username: 'admin', password: 'StrongPass123!' })
     const [, init] = fetchSpy.mock.calls[0]
     const headers = init?.headers as Headers
-    expect(headers.get('X-Emby-Token')).toBe(TEST_AUTH.accessToken)
-    expect(headers.get('X-Emby-Authorization')).toContain(`Token="${TEST_AUTH.accessToken}"`)
+    expect(headers.get('Authorization')).toContain(`Token="${TEST_AUTH.accessToken}"`)
+    expect(headers.get('X-Emby-Token')).toBeNull()
+    expect(headers.get('X-Emby-Authorization')).toBeNull()
 
     // Demo 模式切换后写入独立存储键，不影响真实会话
     setDemoModeOverride(true)
@@ -385,5 +388,51 @@ describe('api/client - 管理控制台全部 API 方法', () => {
     await expect(api.getServerLogs()).resolves.toEqual(sampleLogs)
     await expect(api.getServerLogs()).resolves.toEqual(sampleLogs)
     await expect(api.getServerLogs()).resolves.toEqual([])
+  })
+
+  it('覆盖 Filters2、在线字幕搜索下载、SeriesTimers、ChannelMappings 与歌单 EntryIds 精确移除接口', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input)
+      if (url.startsWith('/emby/LiveTv/ChannelMappingOptions')) {
+        return mockJsonResponse({
+          TunerChannels: [{ Id: 'ch-1', Name: 'CCTV-1' }],
+          ProviderChannels: [{ Id: 'epg-1', Name: 'CCTV1 综合' }],
+          Mappings: [{ Name: 'ch-1', Value: 'epg-1' }],
+          ProviderName: 'xmltv-1',
+        })
+      }
+      return mockJsonResponse({}, 200)
+    })
+
+    await api.getItemFilters2({ userId: 'u1', parentId: 'lib-1', includeItemTypes: 'Movie' })
+    await api.searchRemoteSubtitles('movie-1', 'chi')
+    await api.downloadRemoteSubtitle('movie-1', 'sub-abc')
+    await api.getSeriesTimers()
+    await api.createSeriesTimer({ Name: '新闻联播', ChannelId: 'ch-1', RecordNewOnly: true })
+    await api.deleteSeriesTimer('st-1')
+    const mappingRes = await api.getChannelMappings('prov-1')
+    expect(mappingRes.Mappings[0]).toMatchObject({
+      TunerChannelId: 'ch-1',
+      ProviderChannelId: 'epg-1',
+    })
+    await api.setChannelMapping({
+      ProviderId: 'prov-1',
+      TunerChannelId: 'ch-1',
+      ProviderChannelId: 'epg-1',
+    })
+    await api.removePlaylistItems('pl-1', ['entry-dup-2'], { isPlaylistItemId: true })
+
+    const endpoints = fetchSpy.mock.calls.map(([u, init]) => `${init?.method || 'GET'} ${u}`)
+    expect(endpoints).toEqual([
+      'GET /emby/Items/Filters2?UserId=u1&ParentId=lib-1&IncludeItemTypes=Movie',
+      'GET /emby/Items/movie-1/RemoteSearch/Subtitles/chi',
+      'POST /emby/Items/movie-1/RemoteSearch/Subtitles/sub-abc',
+      'GET /emby/LiveTv/SeriesTimers',
+      'POST /emby/LiveTv/SeriesTimers',
+      'DELETE /emby/LiveTv/SeriesTimers/st-1',
+      'GET /emby/LiveTv/ChannelMappingOptions?providerId=prov-1',
+      'POST /emby/LiveTv/ChannelMappings',
+      'DELETE /emby/Playlists/pl-1/Items?EntryIds=entry-dup-2',
+    ])
   })
 })
