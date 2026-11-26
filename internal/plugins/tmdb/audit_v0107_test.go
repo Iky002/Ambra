@@ -15,7 +15,7 @@ func TestAuditV0107_H9_HostChangeClearsKeyAndSingleSnapshotRedaction(t *testing.
 	p := New("secret-user-key-123", "zh-CN")
 
 	// Changing host without providing new api_key clears existing p.apiKey
-	if err := p.Configure(map[string]any{"base_url": "https://attacker.example.com/3"}); err != nil {
+	if err := p.Configure(map[string]any{"base_url": "https://93.184.216.34/3"}); err != nil {
 		t.Fatalf("Configure host change: %v", err)
 	}
 	if got := p.snapshot().apiKey; got != "" {
@@ -23,10 +23,10 @@ func TestAuditV0107_H9_HostChangeClearsKeyAndSingleSnapshotRedaction(t *testing.
 	}
 
 	// Same host path change preserves api_key
-	if err := p.Configure(map[string]any{"api_key": "keep-key", "base_url": "https://attacker.example.com/v3"}); err != nil {
+	if err := p.Configure(map[string]any{"api_key": "keep-key", "base_url": "https://93.184.216.34/v3"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Configure(map[string]any{"base_url": "https://attacker.example.com/v3-alt"}); err != nil {
+	if err := p.Configure(map[string]any{"base_url": "https://93.184.216.34/v3-alt"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := p.snapshot().apiKey; got != "keep-key" {

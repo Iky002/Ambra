@@ -96,7 +96,7 @@ func TestPluginAdminV0109AuditH03M18M27L19(t *testing.T) {
 
 	// Change host and omit api_key -> old api_key must be cleared from saved config and plugin memory.
 	if rec := postCfg(tp.Manifest().ID, map[string]any{
-		"base_url": "https://mirror.example.com/3",
+		"base_url": "https://93.184.216.34/3",
 	}); rec.Code != http.StatusOK {
 		t.Fatalf("host change config failed: %d %s", rec.Code, rec.Body.String())
 	}
@@ -115,7 +115,7 @@ func TestPluginAdminV0109AuditH03M18M27L19(t *testing.T) {
 		t.Fatalf("re-seed api_key failed: %d", rec.Code)
 	}
 	if rec := postCfg(tp.Manifest().ID, map[string]any{
-		"BaseUrl": "https://attacker.example.org/3",
+		"BaseUrl": "https://1.1.1.1/3",
 		"api_key": maskedSecret,
 	}); rec.Code != http.StatusOK {
 		t.Fatalf("host change with masked secret failed: %d %s", rec.Code, rec.Body.String())
@@ -127,7 +127,7 @@ func TestPluginAdminV0109AuditH03M18M27L19(t *testing.T) {
 
 	// Changing host WITH an explicit new non-masked secret preserves the new secret.
 	if rec := postCfg(tp.Manifest().ID, map[string]any{
-		"base_url": "https://trusted.example.net/3",
+		"base_url": "https://8.8.8.8/3",
 		"api_key":  "brand-new-secret",
 	}); rec.Code != http.StatusOK {
 		t.Fatalf("host change with explicit new key failed: %d", rec.Code)

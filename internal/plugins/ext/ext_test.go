@@ -325,7 +325,7 @@ func TestHTTPPluginConfigureAndValidation(t *testing.T) {
 
 	// Update all supported fields (including float64 from JSON)
 	err = p.Configure(map[string]any{
-		"Endpoint":  "https://plugin.example.com/",
+		"Endpoint":  "https://93.184.216.34/",
 		"APIKey":    "k-999",
 		"Enabled":   false,
 		"Priority":  float64(42),

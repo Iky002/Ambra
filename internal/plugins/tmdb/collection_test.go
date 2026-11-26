@@ -39,11 +39,13 @@ func TestFetchMovieBelongsToCollection(t *testing.T) {
 
 	p := New("test-key", "zh-CN")
 	p.SetHTTPClient(srv.Client())
-	_ = p.Configure(map[string]any{
+	if err := p.Configure(map[string]any{
 		"base_url":       srv.URL,
 		"api_key":        "test-key",
-		"image_base_url": "https://img.example.com",
-	})
+		"image_base_url": "https://93.184.216.34",
+	}); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
 
 	res, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
 		ItemType:    "Movie",
@@ -58,8 +60,8 @@ func TestFetchMovieBelongsToCollection(t *testing.T) {
 	if res.Collection.ID != "10" || res.Collection.Name != "Star Wars Collection" {
 		t.Fatalf("unexpected Collection: %+v", res.Collection)
 	}
-	if res.Collection.PosterURL != "https://img.example.com/col_poster.jpg" ||
-		res.Collection.BackdropURL != "https://img.example.com/col_backdrop.jpg" {
+	if res.Collection.PosterURL != "https://93.184.216.34/col_poster.jpg" ||
+		res.Collection.BackdropURL != "https://93.184.216.34/col_backdrop.jpg" {
 		t.Fatalf("unexpected Collection URLs: %+v", res.Collection)
 	}
 
