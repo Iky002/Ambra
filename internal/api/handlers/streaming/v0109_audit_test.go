@@ -144,15 +144,43 @@ func TestV0109Audit_LibraryCoverPolicyTagAndPlaybackInfoCacheControl(t *testing.
 		t.Fatalf("expected 404 for disallowed library cover, got %d", recLibB.Code)
 	}
 
-	// 4. [M-09] Unauthenticated request with ?tag=tag-g prioritizes matching child cover instead of R-rated first item
-	reqTagG := httptest.NewRequest(http.MethodGet, "/Items/"+libA.ID+"/Images/Primary?tag=tag-g", nil)
+	// 4. [H-03 & H-09] Unauthenticated request without tag or with wrong tag returns 404 (no privilege inversion);
+	// unauthenticated request with valid matching tag returns matching cover with private Cache-Control.
+	for _, badURL := range []string{
+		"/Items/" + libB.ID + "/Images/Primary",
+		"/Items/" + libB.ID + "/Images/Primary?tag=wrong-tag",
+		"/Items/" + libA.ID + "/Images/Primary",
+		"/Items/" + libA.ID + "/Images/Primary?tag=wrong-tag",
+		"/Items/" + movieB.ID + "/Images/Backdrop",
+		"/Items/" + movieB.ID + "/Images/Backdrop?tag=wrong-tag",
+	} {
+		recAnonBad := httptest.NewRecorder()
+		mux.ServeHTTP(recAnonBad, httptest.NewRequest(http.MethodGet, badURL, nil))
+		if recAnonBad.Code != http.StatusNotFound {
+			t.Fatalf("anonymous %s expected 404, got %d", badURL, recAnonBad.Code)
+		}
+	}
+	// Authenticated kid requesting movieB image directly -> 403 Forbidden
+	reqKidMovieB := httptest.NewRequest(http.MethodGet, "/Items/"+movieB.ID+"/Images/Backdrop/0?tag=tag-b", nil)
+	reqKidMovieB = reqKidMovieB.WithContext(middleware.WithAuthContext(reqKidMovieB.Context(), kidAC))
+	recKidMovieB := httptest.NewRecorder()
+	mux.ServeHTTP(recKidMovieB, reqKidMovieB)
+	if recKidMovieB.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for authenticated kid on forbidden item image, got %d", recKidMovieB.Code)
+	}
+
+	synTagG := computeSyntheticLibraryCoverTag(libA.ID, "tag-g")
+	reqTagG := httptest.NewRequest(http.MethodGet, "/Items/"+libA.ID+"/Images/Primary?tag="+synTagG, nil)
 	recTagG := httptest.NewRecorder()
 	mux.ServeHTTP(recTagG, reqTagG)
 	if recTagG.Code != http.StatusOK || !bytes.Equal(recTagG.Body.Bytes(), gPayload) {
-		t.Fatalf("expected tag-g matched cover, got status=%d body=%q", recTagG.Code, recTagG.Body.String())
+		t.Fatalf("expected synthetic tag-g matched cover, got status=%d body=%q", recTagG.Code, recTagG.Body.String())
+	}
+	if cc := recTagG.Header().Get("Cache-Control"); cc != "private, max-age=86400" {
+		t.Fatalf("expected private Cache-Control on library cover, got %q", cc)
 	}
 
-	// 5. [M-14] PlaybackInfo sets Cache-Control: private, no-store
+	// 5. [M-14 & H-05] PlaybackInfo sets Cache-Control: private, no-store & enforces EnableVideoPlaybackTranscoding + RemoteClientBitrateLimit
 	reqPI := httptest.NewRequest(http.MethodPost, "/Items/"+movieG.ID+"/PlaybackInfo", bytes.NewBufferString(`{}`))
 	reqPI = reqPI.WithContext(middleware.WithAuthContext(reqPI.Context(), kidAC))
 	recPI := httptest.NewRecorder()
@@ -162,5 +190,25 @@ func TestV0109Audit_LibraryCoverPolicyTagAndPlaybackInfoCacheControl(t *testing.
 	}
 	if cc := recPI.Header().Get("Cache-Control"); cc != "private, no-store" {
 		t.Fatalf("expected PlaybackInfo Cache-Control=private, no-store, got %q", cc)
+	}
+
+	// [H-05] Disable video transcoding for kid and set RemoteClientBitrateLimit -> SupportsTranscoding must be false
+	_ = libRepo.ReplaceMediaSourcesAndStreams(ctx, movieG.ID, []sqlite.MediaSourceRecord{{
+		ID: guid.New(), ItemID: movieG.ID, Name: "safe.mp4", Path: videoFile, Container: "mkv", Bitrate: 20_000_000,
+		Streams: []sqlite.MediaStreamRecord{{StreamIndex: 0, StreamType: "Video", Codec: "hevc", Width: 1920, Height: 1080}},
+	}})
+	cfg.Update(func(c *config.Config) { c.RemoteClientBitrateLimit = 2_000_000 })
+	kidNoTC := kidPolicy
+	kidNoTC.EnableVideoPlaybackTranscoding = false
+	_ = userRepo.UpdateUserPolicy(ctx, kid.ID, kidNoTC)
+	kid.Policy = kidNoTC
+
+	reqPINoTC := httptest.NewRequest(http.MethodPost, "/Items/"+movieG.ID+"/PlaybackInfo", bytes.NewBufferString(`{"EnableTranscoding":true,"MaxStreamingBitrate":50000000}`))
+	reqPINoTC.RemoteAddr = "203.0.113.50:54321"
+	reqPINoTC = reqPINoTC.WithContext(middleware.WithAuthContext(reqPINoTC.Context(), kidAC))
+	recPINoTC := httptest.NewRecorder()
+	mux.ServeHTTP(recPINoTC, reqPINoTC)
+	if recPINoTC.Code != http.StatusOK || bytes.Contains(recPINoTC.Body.Bytes(), []byte(`"SupportsTranscoding":true`)) {
+		t.Fatalf("expected SupportsTranscoding=false when EnableVideoPlaybackTranscoding=false, got %d %s", recPINoTC.Code, recPINoTC.Body.String())
 	}
 }

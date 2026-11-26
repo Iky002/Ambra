@@ -19,7 +19,7 @@ type M3UChannel struct {
 }
 
 // maxM3UChannels caps the number of channels parsed from a single M3U playlist to prevent OOM.
-const maxM3UChannels = 20000
+const maxM3UChannels = 10000
 
 // ParseM3U parses an M3U/M3U8 playlist from r and extracts channel metadata and stream URLs.
 func ParseM3U(r io.Reader) ([]M3UChannel, error) {

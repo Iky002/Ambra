@@ -157,9 +157,9 @@ exit 0
 		t.Fatalf("expected Chapter image stored under %q, got rec=%+v err=%v", cfg.ChapterCacheDir(), imgRec, err)
 	}
 
-	// Now GET /Items/{Id}/Images/Chapter/1 serves 200 OK directly from cache.
+	// Now GET /Items/{Id}/Images/Chapter/1?tag=<tag> serves 200 OK directly from cache.
 	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Chapter/1", nil))
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Chapter/1?tag="+imgRec.Tag, nil))
 	if rec.Code != http.StatusOK || !strings.HasPrefix(rec.Header().Get("Content-Type"), "image/jpeg") {
 		t.Fatalf("expected 200 image/jpeg for cached chapter thumbnail, got %d ct=%q", rec.Code, rec.Header().Get("Content-Type"))
 	}

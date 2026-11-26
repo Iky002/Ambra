@@ -2,12 +2,16 @@ package streaming
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"mime"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -168,8 +172,142 @@ func (h *Handler) canDownloadContent(r *http.Request) bool {
 	return u.Policy.EnableContentDownloading
 }
 
+func (h *Handler) callerPolicy(r *http.Request) (*dto.UserPolicy, bool) {
+	callerID, isAdmin := h.callerIdentity(r)
+	if isAdmin {
+		return nil, true
+	}
+	if h.userRepo != nil && callerID != "" {
+		if u, err := h.userRepo.GetUserByID(r.Context(), callerID); err == nil && u != nil {
+			if u.IsAdmin || u.Policy.IsAdministrator {
+				return nil, true
+			}
+			pol := u.Policy
+			return &pol, false
+		}
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil {
+		if ac.IsAdmin() {
+			return nil, true
+		}
+		pol := ac.User.Policy
+		return &pol, false
+	}
+	return nil, false
+}
+
+func matchesBlockUnratedType(itemType, mediaType string, blockUnrated []string) bool {
+	if strings.EqualFold(itemType, "CollectionFolder") ||
+		strings.EqualFold(itemType, "Folder") ||
+		strings.EqualFold(itemType, "UserView") ||
+		strings.EqualFold(itemType, "Person") ||
+		strings.EqualFold(itemType, "Genre") ||
+		strings.EqualFold(itemType, "MusicGenre") ||
+		strings.EqualFold(itemType, "GameGenre") ||
+		strings.EqualFold(itemType, "Studio") {
+		return false
+	}
+	for _, b := range blockUnrated {
+		t := strings.TrimSpace(b)
+		if t == "" {
+			continue
+		}
+		if t == "*" || strings.EqualFold(t, "All") || strings.EqualFold(t, itemType) || (mediaType != "" && strings.EqualFold(t, mediaType)) {
+			return true
+		}
+		if strings.EqualFold(t, "Series") && (strings.EqualFold(itemType, "Season") || strings.EqualFold(itemType, "Episode")) {
+			return true
+		}
+		if strings.EqualFold(t, "Music") && (strings.EqualFold(itemType, "Audio") || strings.EqualFold(itemType, "MusicAlbum") || strings.EqualFold(itemType, "MusicArtist") || strings.EqualFold(mediaType, "Audio")) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) isBlockedByExtendedPolicy(ctx context.Context, rec *sqlite.ItemRecord, pol dto.UserPolicy) bool {
+	if rec == nil || h.repo == nil {
+		return false
+	}
+	if len(pol.BlockUnratedItems) > 0 && matchesBlockUnratedType(rec.Type, rec.MediaType, pol.BlockUnratedItems) {
+		rating := strings.TrimSpace(rec.OfficialRating)
+		if rating == "" && rec.SeriesID != "" {
+			if sRec, err := h.repo.GetItemRecordByID(ctx, rec.SeriesID); err == nil && sRec != nil {
+				rating = strings.TrimSpace(sRec.OfficialRating)
+			}
+		}
+		if rating == "" {
+			return true
+		}
+	}
+	if len(pol.AllowedTags) > 0 {
+		allowSet := make(map[string]bool, len(pol.AllowedTags))
+		for _, t := range pol.AllowedTags {
+			if s := strings.ToLower(strings.TrimSpace(t)); s != "" {
+				allowSet[s] = true
+			}
+		}
+		if len(allowSet) > 0 {
+			matched := false
+			checkIDs := []string{rec.ID}
+			if rec.SeriesID != "" {
+				checkIDs = append(checkIDs, rec.SeriesID)
+			}
+			for _, cid := range checkIDs {
+				_, _, tags, err := h.repo.GetTaxonomiesByItemID(ctx, cid)
+				if err == nil {
+					for _, tg := range tags {
+						if allowSet[strings.ToLower(strings.TrimSpace(tg))] {
+							matched = true
+							break
+						}
+					}
+				}
+				if matched {
+					break
+				}
+			}
+			if !matched {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (h *Handler) canAccessItem(r *http.Request, itemID string) bool {
-	if h.userRepo == nil || h.repo == nil {
+	if h.repo == nil {
+		return true
+	}
+	if h.userRepo == nil {
+		if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil && !ac.IsAdmin() {
+			rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
+			if errors.Is(err, sqlite.ErrNotFound) {
+				return true
+			}
+			if err != nil || rec == nil {
+				return false
+			}
+			pol := ac.User.Policy
+			if rec.LibraryID != "" && !pol.EnableAllFolders {
+				allowed := false
+				normLib := guid.Normalize(rec.LibraryID)
+				for _, fid := range pol.EnabledFolders {
+					if guid.Normalize(fid) == normLib {
+						allowed = true
+						break
+					}
+				}
+				if !allowed {
+					return false
+				}
+			}
+			blocked, err := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, pol.MaxParentalRating, pol.BlockedTags)
+			if err != nil || blocked {
+				return false
+			}
+			return !h.isBlockedByExtendedPolicy(r.Context(), rec, pol)
+		}
 		return true
 	}
 	callerID, isAdmin := h.callerIdentity(r)
@@ -197,10 +335,39 @@ func (h *Handler) canAccessItem(r *http.Request, itemID string) bool {
 		return true
 	}
 	blocked, err := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, u.Policy.MaxParentalRating, u.Policy.BlockedTags)
+	if err != nil || blocked {
+		return false
+	}
+	return !h.isBlockedByExtendedPolicy(r.Context(), rec, u.Policy)
+}
+
+func isLocalOrSubnetRequest(r *http.Request, customSubnets []string) bool {
+	if netutil.IsLocalOrLANRequest(r) {
+		return true
+	}
+	if len(customSubnets) == 0 {
+		return false
+	}
+	ipStr := netutil.ClientIP(r)
+	addr, err := netip.ParseAddr(ipStr)
 	if err != nil {
 		return false
 	}
-	return !blocked
+	addr = addr.Unmap()
+	for _, raw := range customSubnets {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			continue
+		}
+		if pfx, err := netip.ParsePrefix(s); err == nil {
+			if pfx.Contains(addr) {
+				return true
+			}
+		} else if single, err := netip.ParseAddr(s); err == nil && single.Unmap() == addr {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
@@ -283,6 +450,37 @@ func (h *Handler) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.EnableTranscoding == nil {
 		req.EnableTranscoding = q.Bool("EnableTranscoding")
+	}
+
+	// [H-05] Clamp MaxStreamingBitrate for remote non-LAN clients when RemoteClientBitrateLimit > 0.
+	if h.engine != nil && h.engine.Config() != nil {
+		snap := h.engine.Config().Snapshot()
+		if snap.RemoteClientBitrateLimit > 0 && !isLocalOrSubnetRequest(r, snap.LocalNetworkSubnets) {
+			if req.MaxStreamingBitrate <= 0 || req.MaxStreamingBitrate > snap.RemoteClientBitrateLimit {
+				req.MaxStreamingBitrate = snap.RemoteClientBitrateLimit
+			}
+			if req.DeviceProfile != nil && (req.DeviceProfile.MaxStreamingBitrate <= 0 || req.DeviceProfile.MaxStreamingBitrate > snap.RemoteClientBitrateLimit) {
+				req.DeviceProfile.MaxStreamingBitrate = snap.RemoteClientBitrateLimit
+			}
+		}
+	}
+
+	// [H-05] Enforce per-user transcoding & remuxing policy flags on non-admin callers.
+	if pol, isAdmin := h.callerPolicy(r); !isAdmin && pol != nil {
+		isAudio := false
+		if h.repo != nil {
+			if rec, recErr := h.repo.GetItemRecordByID(r.Context(), itemID); recErr == nil && rec != nil {
+				isAudio = strings.EqualFold(rec.Type, "Audio") || strings.EqualFold(rec.Type, "AudioBook") || strings.EqualFold(rec.MediaType, "Audio")
+			}
+		}
+		if (isAudio && !pol.EnableAudioPlaybackTranscoding) || (!isAudio && !pol.EnableVideoPlaybackTranscoding) {
+			f := false
+			req.EnableTranscoding = &f
+		}
+		if !pol.EnablePlaybackRemuxing {
+			f := false
+			req.EnableDirectStream = &f
+		}
 	}
 
 	resp, _, err := h.engine.Decide(r.Context(), itemID, req)
@@ -437,6 +635,7 @@ func (h *Handler) serveMediaFile(w http.ResponseWriter, r *http.Request, asAttac
 	if b := q.Bool("proxy"); b != nil && *b {
 		forceProxy = true
 	}
+	var resolvedHeaders map[string]string
 	if strings.EqualFold(filepath.Ext(mediaPath), ".strm") {
 		if h.engine == nil {
 			httpx.Error(w, http.StatusBadGateway, "strm resolver unavailable")
@@ -458,7 +657,8 @@ func (h *Handler) serveMediaFile(w http.ResponseWriter, r *http.Request, asAttac
 			httpx.Error(w, http.StatusBadGateway, "blocked upstream stream url")
 			return
 		}
-		if resolved.Is302 && !forceProxy {
+		resolvedHeaders = resolved.Headers
+		if resolved.Is302 && !forceProxy && len(resolvedHeaders) == 0 {
 			w.Header().Set("Cache-Control", "no-store")
 			http.Redirect(w, r, targetURL, http.StatusFound)
 			return
@@ -466,9 +666,9 @@ func (h *Handler) serveMediaFile(w http.ResponseWriter, r *http.Request, asAttac
 		mediaPath = targetURL
 	}
 
-	// Reverse-proxy remote HTTP(S) streams (e.g. non-302 STRM or explicit proxy=1/true)
+	// Reverse-proxy remote HTTP(S) streams (e.g. non-302 STRM, custom upstream headers, or explicit proxy=1/true)
 	if isHTTPURL(mediaPath) {
-		h.proxyRemoteMedia(w, r, mediaPath, asAttachment)
+		h.proxyRemoteMediaWithHeaders(w, r, mediaPath, resolvedHeaders, asAttachment)
 		return
 	}
 
@@ -598,7 +798,8 @@ func (h *Handler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusNotFound, "media file not found for subtitle extraction")
 			return
 		}
-		mediaPath, err = h.resolveExtractionMediaPath(r.Context(), mediaPath)
+		var extractHeaders map[string]string
+		mediaPath, extractHeaders, err = h.resolveExtractionMediaTarget(r.Context(), mediaPath)
 		if err != nil {
 			slog.Error("failed to resolve strm for subtitle extraction", "item_id", itemID, "error", err)
 			httpx.Error(w, http.StatusBadGateway, "failed to resolve strm stream")
@@ -608,7 +809,7 @@ func (h *Handler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		if extractExt == "" {
 			extractExt = foundStream.Codec
 		}
-		extractedPath, err := h.extractor.ExtractSubtitle(r.Context(), mediaPath, itemID, sourceID, foundStream.StreamIndex, extractExt)
+		extractedPath, err := h.extractor.ExtractSubtitleWithHeaders(r.Context(), mediaPath, extractHeaders, itemID, sourceID, foundStream.StreamIndex, extractExt)
 		if err != nil {
 			if errors.Is(err, os.ErrPermission) {
 				logAndWritePermissionDenied(w, mediaPath, err)
@@ -647,6 +848,49 @@ func (h *Handler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
+type privateImageResponseWriter struct {
+	http.ResponseWriter
+}
+
+func (pw *privateImageResponseWriter) WriteHeader(code int) {
+	if code == http.StatusOK || code == http.StatusNotModified {
+		pw.Header().Set("Cache-Control", "private, max-age=86400")
+	}
+	pw.ResponseWriter.WriteHeader(code)
+}
+
+func (pw *privateImageResponseWriter) Write(b []byte) (int, error) {
+	cc := strings.ToLower(strings.TrimSpace(pw.Header().Get("Cache-Control")))
+	if cc == "" || strings.HasPrefix(cc, "public") {
+		pw.Header().Set("Cache-Control", "private, max-age=86400")
+	}
+	return pw.ResponseWriter.Write(b)
+}
+
+func computeSyntheticLibraryCoverTag(libraryID, childTag string) string {
+	normLib := guid.Normalize(libraryID)
+	childTag = strings.TrimSpace(childTag)
+	if normLib == "" || childTag == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("ambra-libcover:" + normLib + ":" + childTag))
+	return hex.EncodeToString(sum[:8])
+}
+
+func computeChapterImageTag(itemID string, idx int, startTicks int64) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("chapter:%s:%d:%d", guid.Normalize(itemID), idx, startTicks)))
+	return hex.EncodeToString(sum[:8])
+}
+
+func constantTimeTagEqual(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == "" || b == "" || len(a) != len(b) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
 func (h *Handler) handleImage(w http.ResponseWriter, r *http.Request) {
 	itemID := r.PathValue("Id")
 	imgType := r.PathValue("Type")
@@ -657,6 +901,7 @@ func (h *Handler) handleImage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	q := httpx.ParseQuery(r)
+	reqTag := strings.TrimSpace(q.Get("tag"))
 	opts := imaging.Options{
 		MaxWidth:   clampImageDim(q.Int("maxWidth", 0)),
 		MaxHeight:  clampImageDim(q.Int("maxHeight", 0)),
@@ -667,7 +912,54 @@ func (h *Handler) handleImage(w http.ResponseWriter, r *http.Request) {
 		Quality:    q.Int("quality", 0),
 		Format:     q.Get("format"),
 	}
-	err := h.imaging.ServeHTTPWithOptions(w, r, itemID, imgType, idx, opts)
+
+	authed := h.isAuthenticated(r)
+	if authed {
+		if h.repo != nil {
+			itemRec, itemErr := h.repo.GetItemRecordByID(r.Context(), itemID)
+			if itemErr != nil && !errors.Is(itemErr, sqlite.ErrNotFound) {
+				slog.Error("failed to verify item access for image", "item_id", itemID, "error", itemErr)
+				httpx.Error(w, http.StatusInternalServerError, "failed to serve image")
+				return
+			}
+			if itemRec != nil && !h.canAccessItem(r, itemID) {
+				httpx.Error(w, http.StatusForbidden, "access denied")
+				return
+			}
+		}
+	} else if h.repo != nil {
+		imgRec, imgErr := h.repo.GetImageByItemAndType(r.Context(), itemID, imgType, idx)
+		if imgErr != nil && !errors.Is(imgErr, sqlite.ErrNotFound) {
+			slog.Error("failed to query image record", "item_id", itemID, "image_type", imgType, "error", imgErr)
+			httpx.Error(w, http.StatusInternalServerError, "failed to serve image")
+			return
+		}
+		if errors.Is(imgErr, sqlite.ErrNotFound) || imgRec == nil {
+			if !strings.EqualFold(imgType, "Chapter") && h.tryServeLibraryCover(w, r, itemID, opts) {
+				return
+			}
+			httpx.Error(w, http.StatusNotFound, "image not found")
+			return
+		}
+		if reqTag == "" {
+			httpx.Error(w, http.StatusNotFound, "image not found")
+			return
+		}
+		tagMatched := constantTimeTagEqual(reqTag, imgRec.Tag)
+		if !tagMatched && strings.EqualFold(imgType, "Chapter") {
+			if itemRec, rErr := h.repo.GetItemRecordByID(r.Context(), itemID); rErr == nil && itemRec != nil && idx >= 0 && idx < len(itemRec.Extra.Chapters) {
+				expectedChTag := computeChapterImageTag(itemRec.ID, idx, itemRec.Extra.Chapters[idx].StartPositionTicks)
+				tagMatched = constantTimeTagEqual(reqTag, expectedChTag)
+			}
+		}
+		if !tagMatched {
+			httpx.Error(w, http.StatusNotFound, "image not found")
+			return
+		}
+	}
+
+	pw := &privateImageResponseWriter{ResponseWriter: w}
+	err := h.imaging.ServeHTTPWithOptions(pw, r, itemID, imgType, idx, opts)
 	if errors.Is(err, sqlite.ErrNotFound) || os.IsNotExist(err) {
 		// Chapter thumbnails are extracted exclusively by the scheduled ExtractChapterImages task
 		// into the dedicated cache/chapters directory; never invoke FFmpeg during page visits.
@@ -699,11 +991,22 @@ func (h *Handler) tryServeLibraryCover(w http.ResponseWriter, r *http.Request, l
 	if err != nil || lib == nil {
 		return false
 	}
+	reqTag := strings.TrimSpace(httpx.ParseQuery(r).Get("tag"))
+	authed := h.isAuthenticated(r)
+
+	// [H-03 & H-09] Anonymous requests MUST carry a valid deterministic library-cover tag;
+	// never synthesize a library cover for anonymous callers without a matching tag.
+	if !authed && reqTag == "" {
+		return false
+	}
+
 	var (
-		maxRating   *int
-		blockedTags []string
+		maxRating         *int
+		blockedTags       []string
+		blockUnratedItems []string
+		allowedTags       []string
 	)
-	if h.isAuthenticated(r) {
+	if authed {
 		callerID, isAdmin := h.callerIdentity(r)
 		if !isAdmin {
 			if h.userRepo != nil {
@@ -717,6 +1020,8 @@ func (h *Handler) tryServeLibraryCover(w http.ResponseWriter, r *http.Request, l
 				if !u.IsAdmin && !u.Policy.IsAdministrator {
 					maxRating = u.Policy.MaxParentalRating
 					blockedTags = u.Policy.BlockedTags
+					blockUnratedItems = u.Policy.BlockUnratedItems
+					allowedTags = u.Policy.AllowedTags
 				}
 			} else if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil {
 				if !ac.User.Policy.EnableAllFolders {
@@ -734,10 +1039,11 @@ func (h *Handler) tryServeLibraryCover(w http.ResponseWriter, r *http.Request, l
 				}
 				maxRating = ac.User.Policy.MaxParentalRating
 				blockedTags = ac.User.Policy.BlockedTags
+				blockUnratedItems = ac.User.Policy.BlockUnratedItems
+				allowedTags = ac.User.Policy.AllowedTags
 			}
 		}
 	}
-	reqTag := strings.TrimSpace(httpx.ParseQuery(r).Get("tag"))
 	queryLimit := 12
 	if reqTag != "" {
 		queryLimit = 100
@@ -746,6 +1052,8 @@ func (h *Handler) tryServeLibraryCover(w http.ResponseWriter, r *http.Request, l
 		LibraryID:         lib.ID,
 		MaxParentalRating: maxRating,
 		BlockedTags:       blockedTags,
+		BlockUnratedItems: blockUnratedItems,
+		AllowedTags:       allowedTags,
 		IncludeItemTypes:  []string{"Movie", "Series", "MusicAlbum", "Video"},
 		Recursive:         true,
 		Limit:             queryLimit,
@@ -753,34 +1061,61 @@ func (h *Handler) tryServeLibraryCover(w http.ResponseWriter, r *http.Request, l
 	if err != nil || len(children) == 0 {
 		return false
 	}
+
+	// Post-filter children for BlockUnratedItems / AllowedTags in case SQL layer has not filtered them yet.
+	if authed && (len(blockUnratedItems) > 0 || len(allowedTags) > 0) {
+		pol := dto.UserPolicy{BlockUnratedItems: blockUnratedItems, AllowedTags: allowedTags}
+		filtered := make([]dto.BaseItemDto, 0, len(children))
+		for _, it := range children {
+			if rec, rErr := h.repo.GetItemRecordByID(r.Context(), it.Id); rErr == nil && rec != nil {
+				if h.isBlockedByExtendedPolicy(r.Context(), rec, pol) {
+					continue
+				}
+			}
+			filtered = append(filtered, it)
+		}
+		children = filtered
+		if len(children) == 0 {
+			return false
+		}
+	}
+
+	pw := &privateImageResponseWriter{ResponseWriter: w}
 	if reqTag != "" {
 		for _, it := range children {
 			for i, tag := range it.BackdropImageTags {
-				if tag == reqTag {
-					if err := h.imaging.ServeHTTPWithOptions(w, r, it.Id, "Backdrop", i, opts); err == nil {
+				syn := computeSyntheticLibraryCoverTag(lib.ID, tag)
+				if constantTimeTagEqual(reqTag, syn) || constantTimeTagEqual(reqTag, tag) {
+					if err := h.imaging.ServeHTTPWithOptions(pw, r, it.Id, "Backdrop", i, opts); err == nil {
 						return true
 					}
 				}
 			}
 		}
 		for _, it := range children {
-			if it.ImageTags["Primary"] == reqTag {
-				if err := h.imaging.ServeHTTPWithOptions(w, r, it.Id, "Primary", 0, opts); err == nil {
+			primTag := it.ImageTags["Primary"]
+			syn := computeSyntheticLibraryCoverTag(lib.ID, primTag)
+			if constantTimeTagEqual(reqTag, syn) || constantTimeTagEqual(reqTag, primTag) {
+				if err := h.imaging.ServeHTTPWithOptions(pw, r, it.Id, "Primary", 0, opts); err == nil {
 					return true
 				}
 			}
 		}
+		if !authed {
+			return false
+		}
 	}
+
 	for _, it := range children {
 		if len(it.BackdropImageTags) > 0 {
-			if err := h.imaging.ServeHTTPWithOptions(w, r, it.Id, "Backdrop", 0, opts); err == nil {
+			if err := h.imaging.ServeHTTPWithOptions(pw, r, it.Id, "Backdrop", 0, opts); err == nil {
 				return true
 			}
 		}
 	}
 	for _, it := range children {
 		if it.ImageTags["Primary"] != "" {
-			if err := h.imaging.ServeHTTPWithOptions(w, r, it.Id, "Primary", 0, opts); err == nil {
+			if err := h.imaging.ServeHTTPWithOptions(pw, r, it.Id, "Primary", 0, opts); err == nil {
 				return true
 			}
 		}
@@ -789,6 +1124,10 @@ func (h *Handler) tryServeLibraryCover(w http.ResponseWriter, r *http.Request, l
 }
 
 func (h *Handler) proxyRemoteMedia(w http.ResponseWriter, r *http.Request, targetURL string, asAttachment bool) {
+	h.proxyRemoteMediaWithHeaders(w, r, targetURL, nil, asAttachment)
+}
+
+func (h *Handler) proxyRemoteMediaWithHeaders(w http.ResponseWriter, r *http.Request, targetURL string, customHeaders map[string]string, asAttachment bool) {
 	if err := netutil.ValidateRemoteURL(targetURL, true); err != nil {
 		slog.Error("blocked upstream stream url", "url", targetURL, "error", err)
 		httpx.Error(w, http.StatusBadGateway, "blocked upstream stream url")
@@ -800,17 +1139,30 @@ func (h *Handler) proxyRemoteMedia(w http.ResponseWriter, r *http.Request, targe
 		httpx.Error(w, http.StatusBadGateway, "invalid upstream stream url")
 		return
 	}
+	for k, v := range customHeaders {
+		key := strings.TrimSpace(k)
+		val := strings.TrimSpace(v)
+		if key == "" || val == "" || strings.ContainsAny(key, "\r\n\x00") || strings.ContainsAny(val, "\r\n\x00") {
+			continue
+		}
+		switch strings.ToLower(key) {
+		case "user-agent", "referer", "cookie", "authorization", "origin":
+			upReq.Header.Set(key, val)
+		}
+	}
 	if rng := r.Header.Get("Range"); rng != "" {
 		upReq.Header.Set("Range", rng)
 	}
 	if ifRange := r.Header.Get("If-Range"); ifRange != "" {
 		upReq.Header.Set("If-Range", ifRange)
 	}
-	ua := r.Header.Get("User-Agent")
-	if ua == "" {
-		ua = defaultBrowserUA
+	if upReq.Header.Get("User-Agent") == "" {
+		ua := r.Header.Get("User-Agent")
+		if ua == "" {
+			ua = defaultBrowserUA
+		}
+		upReq.Header.Set("User-Agent", ua)
 	}
-	upReq.Header.Set("User-Agent", ua)
 
 	resp, err := h.httpClient.Do(upReq)
 	if err != nil {
@@ -896,24 +1248,29 @@ func sanitizeContentDispositionFilename(name string) string {
 }
 
 func (h *Handler) resolveExtractionMediaPath(ctx context.Context, mediaPath string) (string, error) {
+	u, _, err := h.resolveExtractionMediaTarget(ctx, mediaPath)
+	return u, err
+}
+
+func (h *Handler) resolveExtractionMediaTarget(ctx context.Context, mediaPath string) (string, map[string]string, error) {
 	if !strings.EqualFold(filepath.Ext(mediaPath), ".strm") {
-		return mediaPath, nil
+		return mediaPath, nil, nil
 	}
 	if h.engine == nil {
-		return "", errors.New("strm resolver unavailable")
+		return "", nil, errors.New("strm resolver unavailable")
 	}
 	resolved, err := h.engine.ResolveStream(ctx, mediaPath)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if resolved == nil || !isHTTPURL(resolved.URL) {
-		return "", errors.New("invalid strm target url")
+		return "", nil, errors.New("invalid strm target url")
 	}
 	targetURL := strings.TrimSpace(resolved.URL)
 	if err := netutil.ValidateRemoteURL(targetURL, true); err != nil {
-		return "", err
+		return "", nil, err
 	}
-	return targetURL, nil
+	return targetURL, resolved.Headers, nil
 }
 
 func isHTTPURL(s string) bool {

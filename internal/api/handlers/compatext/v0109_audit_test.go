@@ -11,9 +11,11 @@ import (
 	"testing"
 
 	syncapi "github.com/ambra-media/ambra/internal/api/handlers/sync"
+	"github.com/ambra-media/ambra/internal/api/handlers/livetv"
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/auth"
+	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
@@ -211,4 +213,131 @@ func TestCompatExtV0109AuditM19M25L12L18(t *testing.T) {
 		}
 	}
 	h.mu.RUnlock()
+}
+
+func TestCompatExtSyncCacheDownloadSubtitlesAndRecordingHLS(t *testing.T) {
+	tmp := t.TempDir()
+	libDir := filepath.Join(tmp, "library")
+	recDir := filepath.Join(tmp, "recordings")
+	_ = os.MkdirAll(libDir, 0o755)
+	_ = os.MkdirAll(recDir, 0o755)
+
+	store, err := sqlite.Open(filepath.Join(tmp, "ce_real.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	cfg := config.Default(tmp)
+
+	// Mock ffmpeg that generates segment 0 when invoked by transcode.Manager
+	mockFFmpeg := filepath.Join(tmp, "mock-ffmpeg.sh")
+	ffScript := `#!/bin/sh
+for last; do true; done
+dir=$(dirname "$last")
+printf 'TS-SEGMENT-ZERO' > "$dir/seg_0.ts"
+`
+	if err := os.WriteFile(mockFFmpeg, []byte(ffScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg.FFmpegPath = mockFFmpeg
+
+	tcMgr := transcode.NewManager(cfg)
+	defer tcMgr.Close()
+
+	userRepo := sqlite.NewUserRepo(store)
+	libRepo := sqlite.NewLibraryRepo(store)
+	authSvc := auth.NewService(userRepo, cfg)
+	alice, _ := authSvc.CreateUser(ctx, "alice_real", "pass1234", false)
+	aliceAuth, _ := authSvc.AuthenticateByName(ctx, "alice_real", "pass1234", "", auth.ClientInfo{DeviceID: "d-ar"})
+
+	lib, _ := libRepo.CreateLibrary(ctx, "Movies", "movies", []string{libDir})
+	srcMovie := filepath.Join(libDir, "film.mkv")
+	extSrt := filepath.Join(libDir, "film.zh.srt")
+	_ = os.WriteFile(srcMovie, []byte("MKV-RAW"), 0o644)
+	_ = os.WriteFile(extSrt, []byte("1\n00:00:01,250 --> 00:00:03,500\n你好世界\n"), 0o644)
+
+	movieItem := &sqlite.ItemRecord{
+		ID: guid.New(), LibraryID: lib.ID, ParentID: lib.ID,
+		Type: "Movie", MediaType: "Video", Name: "Film", Path: srcMovie,
+	}
+	_ = libRepo.UpsertItem(ctx, movieItem)
+	_ = libRepo.ReplaceMediaSourcesAndStreams(ctx, movieItem.ID, []sqlite.MediaSourceRecord{
+		{
+			ID: movieItem.ID, ItemID: movieItem.ID, Name: "film.mkv", Path: srcMovie, Container: "mkv",
+			Streams: []sqlite.MediaStreamRecord{
+				{StreamIndex: 2, StreamType: "Subtitle", Codec: "srt", Language: "zh", IsExternal: true, Path: extSrt},
+			},
+		},
+	})
+
+	// Stage a transcoded sync output inside <DataDir>/cache/sync/job-1/ji-tc.mp4
+	syncCacheFile := filepath.Join(tmp, "cache", "sync", "job-1", "ji-tc.mp4")
+	_ = os.MkdirAll(filepath.Dir(syncCacheFile), 0o755)
+	_ = os.WriteFile(syncCacheFile, []byte("TRANSCODED-CACHE-MP4"), 0o644)
+
+	// Stage a completed Live TV recording inside <DataDir>/recordings/rec1.ts
+	recFile := filepath.Join(recDir, "rec1.ts")
+	_ = os.WriteFile(recFile, []byte("RAW-RECORDING-TS"), 0o644)
+
+	lt := livetv.New(store, cfg)
+	defer lt.Close()
+	addedRec := lt.AddRecording(ctx, livetv.RecordingInfo{
+		Id:   "rec-hls-1",
+		Name: "Recorded Match",
+		Path: recFile,
+	})
+
+	h := New(store, cfg)
+	h.SetLibraryRepo(libRepo)
+	h.SetUserRepo(userRepo)
+	h.SetLiveTV(lt)
+	h.SetTranscodeManager(tcMgr)
+
+	_ = h.writeConfigJSON(ctx, syncConfigKey, sharedSyncState{
+		Jobs: []sharedSyncJob{{Id: "job-1", UserId: alice.ID, TargetId: "dev-1"}},
+		JobItems: []sharedSyncJobItem{
+			{Id: "ji-tc", JobId: "job-1", ItemId: movieItem.ID, OutputPath: syncCacheFile, Status: "ReadyToTransfer"},
+		},
+	})
+
+	authMW := middleware.NewAuth(authSvc, nil)
+	router := h.BuildRouter(AuthFuncs{
+		RequireAuth:  authMW.RequireAuth,
+		RequireAdmin: authMW.RequireAdmin,
+	})
+	doReq := func(method, target string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, nil)
+		req.Header.Set("X-Emby-Token", aliceAuth.AccessToken)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. Download transcoded sync output from <DataDir>/cache/sync/ succeeds (200)
+	recFileDL := doReq(http.MethodGet, "/Sync/JobItems/ji-tc/File")
+	if recFileDL.Code != http.StatusOK || recFileDL.Body.String() != "TRANSCODED-CACHE-MP4" {
+		t.Fatalf("expected 200 downloading transcoded sync cache file, got %d %q", recFileDL.Code, recFileDL.Body.String())
+	}
+
+	// 2. AdditionalFiles serves real external subtitle and converts SRT timestamps to WebVTT when .vtt requested
+	recSubVTT := doReq(http.MethodGet, "/Sync/JobItems/ji-tc/AdditionalFiles?Name=sub.zh.vtt&StreamIndex=2")
+	if recSubVTT.Code != http.StatusOK || !strings.HasPrefix(recSubVTT.Body.String(), "WEBVTT") || !strings.Contains(recSubVTT.Body.String(), "00:00:01.250 --> 00:00:03.500") || !strings.Contains(recSubVTT.Body.String(), "你好世界") {
+		t.Fatalf("expected converted WebVTT subtitle from AdditionalFiles, got %d %q", recSubVTT.Code, recSubVTT.Body.String())
+	}
+
+	// 3. LiveRecordings HLS serves real master.m3u8, live.m3u8, and segment 0.ts via transcode.Manager!
+	recMaster := doReq(http.MethodGet, "/LiveTv/LiveRecordings/"+addedRec.Id+"/hls/master.m3u8")
+	if recMaster.Code != http.StatusOK || !strings.Contains(recMaster.Body.String(), "#EXTM3U") || !strings.Contains(recMaster.Body.String(), "live.m3u8") {
+		t.Fatalf("expected 200 HLS master playlist for recording, got %d %q", recMaster.Code, recMaster.Body.String())
+	}
+	recLive := doReq(http.MethodGet, "/LiveTv/LiveRecordings/"+addedRec.Id+"/hls/live.m3u8")
+	if recLive.Code != http.StatusOK || !strings.Contains(recLive.Body.String(), "0.ts") {
+		t.Fatalf("expected 200 HLS media playlist for recording, got %d %q", recLive.Code, recLive.Body.String())
+	}
+	recSeg := doReq(http.MethodGet, "/LiveTv/LiveRecordings/"+addedRec.Id+"/hls/0.ts")
+	if recSeg.Code != http.StatusOK || recSeg.Body.String() != "TS-SEGMENT-ZERO" {
+		t.Fatalf("expected 200 HLS segment 0.ts via transcode.Manager, got %d %q", recSeg.Code, recSeg.Body.String())
+	}
 }

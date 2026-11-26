@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +18,7 @@ import (
 
 	syncapi "github.com/ambra-media/ambra/internal/api/handlers/sync"
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
@@ -159,6 +163,7 @@ func (h *Handler) handleDeleteSyncJobPost(w http.ResponseWriter, r *http.Request
 	}
 
 	var removedItemIDs []string
+	var removedCachePaths []string
 	var st sharedSyncState
 	if h.readConfigJSON(r.Context(), syncConfigKey, &st) {
 		jobs := make([]sharedSyncJob, 0, len(st.Jobs))
@@ -178,6 +183,9 @@ func (h *Handler) handleDeleteSyncJobPost(w http.ResponseWriter, r *http.Request
 				items = append(items, it)
 			} else {
 				removedItemIDs = append(removedItemIDs, it.Id)
+				if it.OutputPath != "" {
+					removedCachePaths = append(removedCachePaths, it.OutputPath)
+				}
 			}
 		}
 		st.Jobs = jobs
@@ -187,6 +195,8 @@ func (h *Handler) handleDeleteSyncJobPost(w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
+	h.cleanupSyncCacheFiles(removedCachePaths...)
+	h.cleanupSyncJobCacheDir(id)
 	h.cleanupRemovedJobItems(r, removedItemIDs)
 	httpx.NoContent(w)
 }
@@ -350,6 +360,7 @@ func (h *Handler) handleDeleteSyncJobItemPost(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	var removedCachePath string
 	var st sharedSyncState
 	if h.readConfigJSON(r.Context(), syncConfigKey, &st) {
 		items := make([]sharedSyncJobItem, 0, len(st.JobItems))
@@ -362,6 +373,7 @@ func (h *Handler) handleDeleteSyncJobItemPost(w http.ResponseWriter, r *http.Req
 						return
 					}
 				}
+				removedCachePath = it.OutputPath
 				continue
 			}
 			items = append(items, it)
@@ -371,6 +383,9 @@ func (h *Handler) handleDeleteSyncJobItemPost(w http.ResponseWriter, r *http.Req
 			httpx.Error(w, http.StatusInternalServerError, "failed to persist sync job item deletion")
 			return
 		}
+	}
+	if removedCachePath != "" {
+		h.cleanupSyncCacheFiles(removedCachePath)
 	}
 	h.cleanupRemovedJobItems(r, []string{id})
 	httpx.NoContent(w)
@@ -429,6 +444,7 @@ func (h *Handler) handleCancelSyncItems(w http.ResponseWriter, r *http.Request) 
 		remaining := make([]sharedSyncJobItem, 0, len(st.JobItems))
 		removedCount := 0
 		deniedCount := 0
+		var removedCachePaths []string
 		for _, it := range st.JobItems {
 			targetMatch := targetID == "" || it.TargetId == targetID
 			_, itemMatch := idSet[guid.Normalize(it.ItemId)]
@@ -442,6 +458,9 @@ func (h *Handler) handleCancelSyncItems(w http.ResponseWriter, r *http.Request) 
 					}
 				}
 				removedCount++
+				if it.OutputPath != "" {
+					removedCachePaths = append(removedCachePaths, it.OutputPath)
+				}
 				continue
 			}
 			remaining = append(remaining, it)
@@ -456,6 +475,7 @@ func (h *Handler) handleCancelSyncItems(w http.ResponseWriter, r *http.Request) 
 				httpx.Error(w, http.StatusInternalServerError, "failed to persist sync cancellation")
 				return
 			}
+			h.cleanupSyncCacheFiles(removedCachePaths...)
 		}
 	}
 	httpx.NoContent(w)
@@ -619,7 +639,7 @@ func (h *Handler) handleSyncJobItemFile(headOnly bool) http.HandlerFunc {
 			httpx.Error(w, http.StatusForbidden, "downloading .strm files is not allowed")
 			return
 		}
-		if libRepo != nil && itemRec != nil {
+		if libRepo != nil && itemRec != nil && !h.isPathWithinSyncCache(realOut) {
 			recPath := strings.TrimSpace(itemRec.Path)
 			if recPath == "" {
 				if headOnly {
@@ -750,9 +770,11 @@ func (h *Handler) handleSyncJobItemAdditionalFiles(w http.ResponseWriter, r *htt
 		httpx.Error(w, http.StatusForbidden, "access denied")
 		return
 	}
+	var itemRec *sqlite.ItemRecord
+	var libRepo *sqlite.LibraryRepo
 	if targetItemID != "" {
 		h.mu.RLock()
-		libRepo := h.libRepo
+		libRepo = h.libRepo
 		h.mu.RUnlock()
 		if libRepo != nil {
 			rec, err := libRepo.GetItemRecordByID(r.Context(), guid.Normalize(targetItemID))
@@ -760,12 +782,28 @@ func (h *Handler) handleSyncJobItemAdditionalFiles(w http.ResponseWriter, r *htt
 				httpx.Error(w, http.StatusNotFound, "sync item not found")
 				return
 			}
+			itemRec = rec
 		}
 	}
 
 	q := httpx.ParseQuery(r)
-	name := strings.ToLower(q.Get("Name"))
-	if strings.HasSuffix(name, ".vtt") {
+	rawName := strings.TrimSpace(q.Get("Name"))
+	lowerName := strings.ToLower(rawName)
+	wantVTT := strings.HasSuffix(lowerName, ".vtt")
+
+	if libRepo != nil && itemRec != nil {
+		if body, ct, ok := h.resolveSyncAdditionalSubtitle(r.Context(), libRepo, itemRec, rawName, q.Get("StreamIndex"), q.Get("Index")); ok {
+			w.Header().Set("Content-Type", ct)
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("Content-Security-Policy", "sandbox")
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+			return
+		}
+	}
+
+	if wantVTT {
 		w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("WEBVTT\n\n"))
@@ -774,6 +812,257 @@ func (h *Handler) handleSyncJobItemAdditionalFiles(w http.ResponseWriter, r *htt
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", "0")
 	w.WriteHeader(http.StatusOK)
+}
+
+var srtTimestampLineRe = regexp.MustCompile(`(\d{2}:\d{2}:\d{2}),(\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}),(\d{3})`)
+
+func convertSRTBytesToWebVTT(raw []byte) []byte {
+	text := strings.TrimPrefix(string(raw), "\uFEFF")
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	if strings.HasPrefix(strings.TrimSpace(text), "WEBVTT") {
+		return []byte(text)
+	}
+	converted := srtTimestampLineRe.ReplaceAllString(text, "$1.$2 --> $3.$4")
+	return []byte("WEBVTT\n\n" + converted)
+}
+
+func subtitleContentTypeForExt(ext string) string {
+	switch strings.ToLower(strings.TrimPrefix(ext, ".")) {
+	case "vtt", "webvtt":
+		return "text/vtt; charset=utf-8"
+	case "srt", "subrip":
+		return "application/x-subrip; charset=utf-8"
+	case "ass", "ssa":
+		return "text/x-ssa; charset=utf-8"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+func (h *Handler) syncCacheDirPath() string {
+	if h.cfg == nil {
+		return ""
+	}
+	dataDir := strings.TrimSpace(h.cfg.Snapshot().DataDir)
+	if dataDir == "" {
+		dataDir = strings.TrimSpace(h.cfg.DataDir)
+	}
+	if dataDir == "" {
+		return ""
+	}
+	return filepath.Join(dataDir, "cache", "sync")
+}
+
+func (h *Handler) isPathWithinSyncCache(realTarget string) bool {
+	cacheDir := h.syncCacheDirPath()
+	if cacheDir == "" || realTarget == "" {
+		return false
+	}
+	realCache, err := filepath.EvalSymlinks(cacheDir)
+	if err != nil {
+		return false
+	}
+	realCache = filepath.Clean(realCache)
+	cleanTarget := filepath.Clean(realTarget)
+	rel, err := filepath.Rel(realCache, cleanTarget)
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+}
+
+func (h *Handler) isPathWithinSubtitleCache(realTarget string) bool {
+	if h.cfg == nil || realTarget == "" {
+		return false
+	}
+	dataDir := strings.TrimSpace(h.cfg.Snapshot().DataDir)
+	if dataDir == "" {
+		dataDir = strings.TrimSpace(h.cfg.DataDir)
+	}
+	if dataDir == "" {
+		return false
+	}
+	subDir := filepath.Join(dataDir, "cache", "subtitles")
+	realSub, err := filepath.EvalSymlinks(subDir)
+	if err != nil {
+		return false
+	}
+	realSub = filepath.Clean(realSub)
+	rel, err := filepath.Rel(realSub, filepath.Clean(realTarget))
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+}
+
+func (h *Handler) cleanupSyncCacheFiles(paths ...string) {
+	for _, raw := range paths {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		realTarget, err := filepath.EvalSymlinks(raw)
+		if err != nil {
+			continue
+		}
+		if h.isPathWithinSyncCache(realTarget) {
+			_ = os.Remove(realTarget)
+			_ = os.Remove(realTarget + ".tmp")
+		}
+	}
+}
+
+func (h *Handler) cleanupSyncJobCacheDir(jobID string) {
+	cacheDir := h.syncCacheDirPath()
+	jobID = strings.TrimSpace(jobID)
+	if cacheDir == "" || jobID == "" || strings.ContainsAny(jobID, `/\`) || jobID == "." || jobID == ".." {
+		return
+	}
+	jobDir := filepath.Join(cacheDir, jobID)
+	realJobDir, err := filepath.EvalSymlinks(jobDir)
+	if err != nil {
+		return
+	}
+	if h.isPathWithinSyncCache(realJobDir) {
+		_ = os.RemoveAll(realJobDir)
+	}
+}
+
+func (h *Handler) resolveSyncAdditionalSubtitle(
+	ctx context.Context,
+	libRepo *sqlite.LibraryRepo,
+	itemRec *sqlite.ItemRecord,
+	reqName string,
+	rawStreamIdx string,
+	rawIdx string,
+) ([]byte, string, bool) {
+	const maxSubtitleBytes = 10 << 20
+
+	lowerReq := strings.ToLower(strings.TrimSpace(reqName))
+	reqExt := strings.ToLower(strings.TrimPrefix(filepath.Ext(lowerReq), "."))
+	// Only intercept subtitle requests or explicit stream index requests.
+	if rawStreamIdx == "" && rawIdx == "" {
+		switch reqExt {
+		case "vtt", "srt", "ass", "ssa", "sub":
+		default:
+			return nil, "", false
+		}
+	}
+
+	var wantIdx *int
+	for _, raw := range []string{rawStreamIdx, rawIdx} {
+		if s := strings.TrimSpace(raw); s != "" {
+			if n, err := strconv.Atoi(s); err == nil && n >= 0 {
+				wantIdx = &n
+				break
+			}
+		}
+	}
+
+	sources, _ := libRepo.GetMediaSourcesByItemID(ctx, itemRec.ID)
+	var subStreams []sqlite.MediaStreamRecord
+	var mediaPath string
+	for _, src := range sources {
+		if mediaPath == "" && strings.TrimSpace(src.Path) != "" {
+			mediaPath = src.Path
+		}
+		for _, st := range src.Streams {
+			if strings.EqualFold(st.StreamType, "Subtitle") {
+				subStreams = append(subStreams, st)
+			}
+		}
+	}
+	if mediaPath == "" {
+		mediaPath = itemRec.Path
+	}
+
+	var chosen *sqlite.MediaStreamRecord
+	if wantIdx != nil {
+		for i := range subStreams {
+			if subStreams[i].StreamIndex == *wantIdx {
+				chosen = &subStreams[i]
+				break
+			}
+		}
+	}
+	if chosen == nil && lowerReq != "" {
+		reqBase := strings.TrimSuffix(filepath.Base(lowerReq), filepath.Ext(lowerReq))
+		for i := range subStreams {
+			stBase := strings.ToLower(filepath.Base(subStreams[i].Path))
+			if stBase != "" && (stBase == filepath.Base(lowerReq) || strings.TrimSuffix(stBase, filepath.Ext(stBase)) == reqBase) {
+				chosen = &subStreams[i]
+				break
+			}
+			if lang := strings.ToLower(strings.TrimSpace(subStreams[i].Language)); lang != "" && strings.Contains(reqBase, lang) {
+				chosen = &subStreams[i]
+				break
+			}
+		}
+	}
+	if chosen == nil && len(subStreams) > 0 {
+		chosen = &subStreams[0]
+	}
+	if chosen == nil {
+		return nil, "", false
+	}
+
+	wantVTT := reqExt == "vtt"
+	if chosen.IsExternal && strings.TrimSpace(chosen.Path) != "" {
+		realSub, err := filepath.EvalSymlinks(chosen.Path)
+		if err != nil {
+			return nil, "", false
+		}
+		realSub = filepath.Clean(realSub)
+		if !isPathWithinRegisteredLibraries(ctx, libRepo, realSub) && !h.isPathWithinSubtitleCache(realSub) {
+			return nil, "", false
+		}
+		f, err := os.Open(realSub)
+		if err != nil {
+			return nil, "", false
+		}
+		data, err := io.ReadAll(io.LimitReader(f, maxSubtitleBytes))
+		_ = f.Close()
+		if err != nil {
+			return nil, "", false
+		}
+		srcExt := strings.ToLower(strings.TrimPrefix(filepath.Ext(realSub), "."))
+		if wantVTT && srcExt != "vtt" {
+			return convertSRTBytesToWebVTT(data), "text/vtt; charset=utf-8", true
+		}
+		outExt := reqExt
+		if outExt == "" {
+			outExt = srcExt
+		}
+		return data, subtitleContentTypeForExt(outExt), true
+	}
+
+	// Embedded subtitle extraction via transcode.Extractor.
+	if strings.TrimSpace(mediaPath) != "" && h.cfg != nil {
+		format := "webvtt"
+		ct := "text/vtt; charset=utf-8"
+		if reqExt == "srt" {
+			format = "srt"
+			ct = "application/x-subrip; charset=utf-8"
+		} else if reqExt == "ass" || reqExt == "ssa" {
+			format = "ass"
+			ct = "text/x-ssa; charset=utf-8"
+		}
+		mediaSourceID := itemRec.ID
+		if len(sources) > 0 && strings.TrimSpace(sources[0].ID) != "" {
+			mediaSourceID = strings.TrimSpace(sources[0].ID)
+		}
+		ext := transcode.NewExtractor(h.cfg)
+		if outFile, err := ext.ExtractSubtitle(ctx, mediaPath, itemRec.ID, mediaSourceID, chosen.StreamIndex, format); err == nil && strings.TrimSpace(outFile) != "" {
+			if f, oErr := os.Open(outFile); oErr == nil {
+				data, rErr := io.ReadAll(io.LimitReader(f, maxSubtitleBytes))
+				_ = f.Close()
+				if rErr == nil && len(data) > 0 {
+					return data, ct, true
+				}
+			}
+		}
+	}
+	return nil, "", false
 }
 
 func (h *Handler) handleSyncOfflineActions(w http.ResponseWriter, r *http.Request) {

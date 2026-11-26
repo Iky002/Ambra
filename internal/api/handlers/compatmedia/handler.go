@@ -49,10 +49,11 @@ type Handler struct {
 	registry          *plugins.Registry
 	store             *sqlite.Store
 	cfg               *config.Config
-	extractor         *transcode.Extractor
-	transcodeMgr      *transcode.Manager
-	streamResolver    func(ctx context.Context, rawPath string) (string, error)
-	httpClient        *http.Client
+	extractor                 *transcode.Extractor
+	transcodeMgr              *transcode.Manager
+	streamResolver            func(ctx context.Context, rawPath string) (string, error)
+	streamResolverWithHeaders func(ctx context.Context, rawPath string) (*plugins.StreamResolveResult, error)
+	httpClient                *http.Client
 	defaultHTTPClient *http.Client
 	clientOnce        sync.Once
 	auth              AuthFuncs
@@ -102,6 +103,11 @@ func (h *Handler) SetTranscodeManager(mgr *transcode.Manager) {
 // SetStreamResolver attaches a resolver (e.g. playback.Engine.ResolveStream) for .strm files.
 func (h *Handler) SetStreamResolver(fn func(ctx context.Context, rawPath string) (string, error)) {
 	h.streamResolver = fn
+}
+
+// SetStreamResolverWithHeaders attaches a full .strm resolver returning both URL and custom HTTP headers.
+func (h *Handler) SetStreamResolverWithHeaders(fn func(ctx context.Context, rawPath string) (*plugins.StreamResolveResult, error)) {
+	h.streamResolverWithHeaders = fn
 }
 
 // SetHTTPClient overrides the HTTP client used for remote image downloading and proxying.
@@ -204,7 +210,7 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 	r.Head("/Genres/{Name}/Images/{Type}/{Index}", h.handleEntityImage("genre"))
 
 	// --- /Images (1 route) ---
-	r.Get("/Images/Remote", authFn(h.handleRemoteImageProxy))
+	r.Get("/Images/Remote", adminFn(h.handleRemoteImageProxy))
 
 	// --- /Items (60 missing + 3 extra item relation routes) ---
 	r.Get("/Items/{Id}/ExternalIdInfos", authFn(h.handleExternalIDInfos))
@@ -222,8 +228,8 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 	r.Post("/Items/RemoteSearch/Apply/{Id}", adminFn(h.handleRemoteSearchApply))
 	r.Post("/Items/Metadata/Reset", adminFn(h.handleMetadataReset))
 	r.Post("/Items/{Id}/Refresh", adminFn(h.handleItemRefresh))
-	r.Post("/Items/Delete", adminFn(h.handleDeleteItemsBatch))
-	r.Delete("/Items", adminFn(h.handleDeleteItemsBatch))
+	r.Post("/Items/Delete", authFn(h.handleDeleteItemsBatch))
+	r.Delete("/Items", authFn(h.handleDeleteItemsBatch))
 	r.Post("/Items/Access", adminFn(h.handleItemsAccess))
 	r.Post("/Items/Shared/Leave", authFn(h.handleSharedLeave))
 	r.Post("/Items/{ItemId}", adminFn(h.handleUpdateItem))
@@ -249,12 +255,12 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 	r.Get("/Items/{Id}/LocalTrailers", authFn(h.handleLocalTrailers))
 	r.Get("/Items/{Id}/SpecialFeatures", authFn(h.handleSpecialFeatures))
 	r.Get("/Items/{Id}/Intros", authFn(h.handleEmptyQueryResult))
-	r.Post("/Items/{Id}/Delete", adminFn(h.handleDeleteItem))
-	r.Delete("/Items/{Id}", adminFn(h.handleDeleteItem))
+	r.Post("/Items/{Id}/Delete", authFn(h.handleDeleteItem))
+	r.Delete("/Items/{Id}", authFn(h.handleDeleteItem))
 	r.Get("/Items/{Id}/Ancestors", authFn(h.handleItemAncestors))
 	r.Get("/Items/{Id}/File", authFn(h.handleItemFile))
 	r.Get("/Items/{Id}/Similar", authFn(h.handleSimilar))
-	r.Get("/Items/{Id}/DeleteInfo", adminFn(h.handleItemDeleteInfo))
+	r.Get("/Items/{Id}/DeleteInfo", authFn(h.handleItemDeleteInfo))
 	r.Get("/Items/{Id}/Images", authFn(h.handleListItemImages))
 	r.Get("/Items/{Id}/Images/{Type}/{Index}/{Tag}/{Format}/{MaxWidth}/{MaxHeight}/{PercentPlayed}/{UnPlayedCount}", h.handleServeItemImageFull)
 	r.Head("/Items/{Id}/Images/{Type}/{Index}/{Tag}/{Format}/{MaxWidth}/{MaxHeight}/{PercentPlayed}/{UnPlayedCount}", h.handleServeItemImageFull)
@@ -490,9 +496,14 @@ func isLibraryAllowed(libID string, allowed []string) bool {
 }
 
 func (h *Handler) userParentalPolicyForRequest(r *http.Request, fallbackUserID string) (*int, []string) {
+	pol := h.userExtendedPolicyForRequest(r, fallbackUserID)
+	return pol.MaxParentalRating, pol.BlockedTags
+}
+
+func (h *Handler) userExtendedPolicyForRequest(r *http.Request, fallbackUserID string) dto.UserPolicy {
 	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil {
 		if ac.IsAPIKey || ac.IsAdmin() {
-			return nil, nil
+			return dto.UserPolicy{IsAdministrator: true, EnableAllFolders: true}
 		}
 	}
 	uid := ""
@@ -507,18 +518,31 @@ func (h *Handler) userParentalPolicyForRequest(r *http.Request, fallbackUserID s
 	if uid == "" {
 		uid = guid.Normalize(fallbackUserID)
 	}
-	if h.userRepo == nil || uid == "" {
-		return nil, nil
+	if h.userRepo != nil && uid != "" {
+		u, err := h.userRepo.GetUserByID(r.Context(), uid)
+		if err != nil || u == nil {
+			zero := 0
+			return dto.UserPolicy{MaxParentalRating: &zero}
+		}
+		if u.IsAdmin || u.Policy.IsAdministrator {
+			return dto.UserPolicy{IsAdministrator: true, EnableAllFolders: true}
+		}
+		return u.Policy
 	}
-	u, err := h.userRepo.GetUserByID(r.Context(), uid)
-	if err != nil || u == nil {
-		zero := 0
-		return &zero, nil
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil {
+		return ac.User.Policy
 	}
-	if u.IsAdmin || u.Policy.IsAdministrator {
-		return nil, nil
+	return dto.UserPolicy{IsAdministrator: true, EnableAllFolders: true}
+}
+
+func (h *Handler) isAuthenticated(r *http.Request) bool {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		return true
 	}
-	return u.Policy.MaxParentalRating, u.Policy.BlockedTags
+	if h.auth.UserIDFromCtx != nil && strings.TrimSpace(h.auth.UserIDFromCtx(r.Context())) != "" {
+		return true
+	}
+	return false
 }
 
 func (h *Handler) isPlaylistPublic(ctx context.Context, playlistID string) bool {

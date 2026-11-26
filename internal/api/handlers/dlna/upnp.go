@@ -289,14 +289,14 @@ func (h *Handler) handleBrowse(ctx context.Context, r *http.Request, params map[
 
 	switch browseFlag {
 	case "BrowseMetadata":
-		entry, err := h.browseMetadata(ctx, objectID, baseURL, serverUUID)
+		entry, err := h.browseMetadataForRequest(ctx, r, objectID, baseURL, serverUUID)
 		if err != nil {
 			return "", err
 		}
 		didlEntries = append(didlEntries, entry)
 		totalMatches = 1
 	default:
-		entries, total, err := h.browseDirectChildren(ctx, objectID, startIdx, reqCount, sortCriteria, baseURL, serverUUID)
+		entries, total, err := h.browseDirectChildrenForRequest(ctx, r, objectID, startIdx, reqCount, sortCriteria, baseURL, serverUUID)
 		if err != nil {
 			return "", err
 		}
@@ -348,7 +348,7 @@ func (h *Handler) handleSearch(ctx context.Context, r *http.Request, params map[
 	totalMatches := 0
 
 	if h.libRepo != nil {
-		policy, denyAll := h.resolveDefaultUserPolicy(ctx)
+		policy, denyAll := h.resolvePolicyForRequest(ctx, r)
 		if denyAll {
 			didl := `<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"></DIDL-Lite>`
 			h.mu.RLock()
@@ -361,7 +361,7 @@ func (h *Handler) handleSearch(ctx context.Context, r *http.Request, params map[
 		}
 		if containerID != "0" {
 			if rec, recErr := h.libRepo.GetItemRecordByID(ctx, containerID); recErr == nil && rec != nil {
-				if !h.isDLNAVisibleItem(ctx, rec.Type, rec.ID) || !h.isItemAllowedByDefaultPolicy(ctx, rec) {
+				if !h.isDLNAVisibleItem(ctx, rec.Type, rec.ID) || !h.isItemAllowedByPolicy(ctx, rec, policy) {
 					didl := `<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"></DIDL-Lite>`
 					h.mu.RLock()
 					uid := h.systemUpdate
@@ -377,6 +377,12 @@ func (h *Handler) handleSearch(ctx context.Context, r *http.Request, params map[
 		titleQuery, itemTypes := parseSearchCriteria(searchCriteria)
 		sortBy, sortOrder := parseSortCriteria(sortCriteria)
 		privatePlaylists := h.privatePlaylistIDs(ctx, snap.ServerID)
+		needExtraFilter := policy != nil && (len(policy.BlockUnratedItems) > 0 || len(policy.AllowedTags) > 0)
+
+		fetchStart, fetchLimit := startIdx, reqCount
+		if needExtraFilter {
+			fetchStart, fetchLimit = 0, maxDLNARequestedCount*2
+		}
 
 		filter := sqlite.ItemFilter{
 			ServerID:         snap.ServerID,
@@ -385,8 +391,8 @@ func (h *Handler) handleSearch(ctx context.Context, r *http.Request, params map[
 			ExcludeItemIDs:   privatePlaylists,
 			SortBy:           sortBy,
 			SortOrder:        sortOrder,
-			StartIndex:       startIdx,
-			Limit:            reqCount,
+			StartIndex:       fetchStart,
+			Limit:            fetchLimit,
 		}
 		if policy != nil {
 			if !policy.EnableAllFolders {
@@ -404,6 +410,8 @@ func (h *Handler) handleSearch(ctx context.Context, r *http.Request, params map[
 			}
 			filter.MaxParentalRating = policy.MaxParentalRating
 			filter.BlockedTags = policy.BlockedTags
+			filter.BlockUnratedItems = policy.BlockUnratedItems
+			filter.AllowedTags = policy.AllowedTags
 		}
 		if containerID != "0" {
 			if _, libErr := h.libRepo.GetLibrary(ctx, containerID); libErr == nil {
@@ -428,6 +436,27 @@ func (h *Handler) handleSearch(ctx context.Context, r *http.Request, params map[
 		if err != nil {
 			return "", err
 		}
+		if needExtraFilter && len(items) > 0 {
+			filtered := make([]dto.BaseItemDto, 0, len(items))
+			for _, it := range items {
+				if rec, rErr := h.libRepo.GetItemRecordByID(ctx, it.Id); rErr == nil && rec != nil {
+					if !h.isItemAllowedByPolicy(ctx, rec, policy) {
+						continue
+					}
+				}
+				filtered = append(filtered, it)
+			}
+			total = len(filtered)
+			if startIdx >= total {
+				items = nil
+			} else {
+				end := total
+				if reqCount > 0 && startIdx+reqCount < end {
+					end = startIdx + reqCount
+				}
+				items = filtered[startIdx:end]
+			}
+		}
 		// Fallback to case-insensitive substring match on Name when FTS index is empty or misses mid-word substrings.
 		if total == 0 && titleQuery != "" {
 			fallbackFilter := filter
@@ -443,6 +472,11 @@ func (h *Handler) handleSearch(ctx context.Context, r *http.Request, params map[
 			for _, it := range allItems {
 				if !h.isDLNAVisibleItem(ctx, it.Type, it.Id) {
 					continue
+				}
+				if needExtraFilter {
+					if rec, rErr := h.libRepo.GetItemRecordByID(ctx, it.Id); rErr == nil && rec != nil && !h.isItemAllowedByPolicy(ctx, rec, policy) {
+						continue
+					}
 				}
 				if strings.Contains(strings.ToLower(it.Name), needle) ||
 					strings.Contains(strings.ToLower(it.OriginalTitle), needle) {
@@ -545,6 +579,10 @@ func parseSortCriteria(criteria string) (sortBy []string, sortOrder string) {
 }
 
 func (h *Handler) browseMetadata(ctx context.Context, objectID, baseURL, serverUUID string) (string, error) {
+	return h.browseMetadataForRequest(ctx, nil, objectID, baseURL, serverUUID)
+}
+
+func (h *Handler) browseMetadataForRequest(ctx context.Context, r *http.Request, objectID, baseURL, serverUUID string) (string, error) {
 	snap := h.cfgSnapshot()
 	if objectID == "0" {
 		return fmt.Sprintf(
@@ -555,7 +593,7 @@ func (h *Handler) browseMetadata(ctx context.Context, objectID, baseURL, serverU
 	if h.libRepo == nil {
 		return "", fmt.Errorf("object not found")
 	}
-	policy, denyAll := h.resolveDefaultUserPolicy(ctx)
+	policy, denyAll := h.resolvePolicyForRequest(ctx, r)
 	if denyAll {
 		return "", fmt.Errorf("object not found")
 	}
@@ -566,7 +604,7 @@ func (h *Handler) browseMetadata(ctx context.Context, objectID, baseURL, serverU
 		return libraryToDIDL(*lib), nil
 	}
 	if rec, recErr := h.libRepo.GetItemRecordByID(ctx, objectID); recErr == nil && rec != nil {
-		if !h.isItemAllowedByDefaultPolicy(ctx, rec) {
+		if !h.isItemAllowedByPolicy(ctx, rec, policy) {
 			return "", fmt.Errorf("object not found")
 		}
 	}
@@ -581,11 +619,15 @@ func (h *Handler) browseMetadata(ctx context.Context, objectID, baseURL, serverU
 }
 
 func (h *Handler) browseDirectChildren(ctx context.Context, objectID string, startIdx, reqCount int, sortCriteria, baseURL, serverUUID string) ([]string, int, error) {
+	return h.browseDirectChildrenForRequest(ctx, nil, objectID, startIdx, reqCount, sortCriteria, baseURL, serverUUID)
+}
+
+func (h *Handler) browseDirectChildrenForRequest(ctx context.Context, r *http.Request, objectID string, startIdx, reqCount int, sortCriteria, baseURL, serverUUID string) ([]string, int, error) {
 	if h.libRepo == nil {
 		return nil, 0, nil
 	}
 
-	policy, denyAll := h.resolveDefaultUserPolicy(ctx)
+	policy, denyAll := h.resolvePolicyForRequest(ctx, r)
 	if denyAll {
 		return nil, 0, nil
 	}
@@ -634,11 +676,58 @@ func (h *Handler) browseDirectChildren(ctx context.Context, objectID string, sta
 		return nil, 0, fmt.Errorf("object not found")
 	}
 	if rec, recErr := h.libRepo.GetItemRecordByID(ctx, objectID); recErr == nil && rec != nil {
-		if !h.isDLNAVisibleItem(ctx, rec.Type, rec.ID) || !h.isItemAllowedByDefaultPolicy(ctx, rec) {
+		if !h.isDLNAVisibleItem(ctx, rec.Type, rec.ID) || !h.isItemAllowedByPolicy(ctx, rec, policy) {
 			return nil, 0, fmt.Errorf("object not found")
+		}
+		// [L-01] BoxSet and public Playlist store children in container_items rather than ParentID.
+		if strings.EqualFold(rec.Type, "BoxSet") || strings.EqualFold(rec.Type, "Playlist") {
+			cItems, _, cErr := h.libRepo.GetContainerItems(ctx, snap.ServerID, "", rec.ID, 0, 0, nil)
+			if cErr != nil {
+				return nil, 0, cErr
+			}
+			visible := make([]dto.BaseItemDto, 0, len(cItems))
+			for _, ci := range cItems {
+				if !h.isDLNAVisibleItem(ctx, ci.Type, ci.Id) {
+					continue
+				}
+				childRec, crErr := h.libRepo.GetItemRecordByID(ctx, ci.Id)
+				if crErr != nil || childRec == nil || !h.isItemAllowedByPolicy(ctx, childRec, policy) {
+					continue
+				}
+				ci.BaseItemDto.ParentId = rec.ID
+				visible = append(visible, ci.BaseItemDto)
+			}
+			if len(sortBy) > 0 && sortBy[0] == "SortName" {
+				desc := strings.EqualFold(sortOrder, "Descending")
+				sort.Slice(visible, func(i, j int) bool {
+					li, lj := strings.ToLower(visible[i].Name), strings.ToLower(visible[j].Name)
+					if desc {
+						return li > lj
+					}
+					return li < lj
+				})
+			}
+			total := len(visible)
+			if startIdx >= total {
+				return nil, total, nil
+			}
+			end := total
+			if reqCount > 0 && startIdx+reqCount < end {
+				end = startIdx + reqCount
+			}
+			out := make([]string, 0, end-startIdx)
+			for _, it := range visible[startIdx:end] {
+				out = append(out, h.itemToDIDL(it, baseURL, serverUUID))
+			}
+			return out, total, nil
 		}
 	}
 	privatePlaylists := h.privatePlaylistIDs(ctx, snap.ServerID)
+	needExtraFilter := policy != nil && (len(policy.BlockUnratedItems) > 0 || len(policy.AllowedTags) > 0)
+	fetchStart, fetchLimit := startIdx, reqCount
+	if needExtraFilter {
+		fetchStart, fetchLimit = 0, maxDLNARequestedCount*2
+	}
 
 	baseFilter := sqlite.ItemFilter{
 		ServerID:       snap.ServerID,
@@ -646,8 +735,8 @@ func (h *Handler) browseDirectChildren(ctx context.Context, objectID string, sta
 		ExcludeItemIDs: privatePlaylists,
 		SortBy:         sortBy,
 		SortOrder:      sortOrder,
-		StartIndex:     startIdx,
-		Limit:          reqCount,
+		StartIndex:     fetchStart,
+		Limit:          fetchLimit,
 	}
 	if policy != nil {
 		if !policy.EnableAllFolders {
@@ -658,6 +747,8 @@ func (h *Handler) browseDirectChildren(ctx context.Context, objectID string, sta
 		}
 		baseFilter.MaxParentalRating = policy.MaxParentalRating
 		baseFilter.BlockedTags = policy.BlockedTags
+		baseFilter.BlockUnratedItems = policy.BlockUnratedItems
+		baseFilter.AllowedTags = policy.AllowedTags
 	}
 
 	items, total, err := h.libRepo.QueryItems(ctx, baseFilter)
@@ -674,6 +765,26 @@ func (h *Handler) browseDirectChildren(ctx context.Context, objectID string, sta
 			if err != nil {
 				return nil, 0, err
 			}
+		}
+	}
+
+	if needExtraFilter && len(items) > 0 {
+		filtered := make([]dto.BaseItemDto, 0, len(items))
+		for _, it := range items {
+			if rec, rErr := h.libRepo.GetItemRecordByID(ctx, it.Id); rErr == nil && rec != nil && !h.isItemAllowedByPolicy(ctx, rec, policy) {
+				continue
+			}
+			filtered = append(filtered, it)
+		}
+		total = len(filtered)
+		if startIdx >= total {
+			items = nil
+		} else {
+			end := total
+			if reqCount > 0 && startIdx+reqCount < end {
+				end = startIdx + reqCount
+			}
+			items = filtered[startIdx:end]
 		}
 	}
 
@@ -695,22 +806,70 @@ func libraryToDIDL(lib sqlite.LibraryRecord) string {
 	)
 }
 
+func (h *Handler) buildDIDLAlbumArtXML(it dto.BaseItemDto, baseURL string) string {
+	artID := it.Id
+	artTag := ""
+	if it.ImageTags != nil {
+		artTag = strings.TrimSpace(it.ImageTags["Primary"])
+	}
+	if artTag == "" && it.AlbumId != "" && h.libRepo != nil {
+		if img, err := h.libRepo.GetImageByItemAndType(context.Background(), it.AlbumId, "Primary", 0); err == nil && img != nil && strings.TrimSpace(img.Tag) != "" {
+			artID = it.AlbumId
+			artTag = strings.TrimSpace(img.Tag)
+		}
+	}
+	if artTag == "" && it.SeriesId != "" && strings.TrimSpace(it.SeriesPrimaryImageTag) != "" {
+		artID = it.SeriesId
+		artTag = strings.TrimSpace(it.SeriesPrimaryImageTag)
+	}
+	if artID == "" || artTag == "" {
+		return ""
+	}
+	artURL := fmt.Sprintf("%s/Items/%s/Images/Primary?maxWidth=480&tag=%s", baseURL, url.PathEscape(artID), url.QueryEscape(artTag))
+	return fmt.Sprintf(`<upnp:albumArtURI>%s</upnp:albumArtURI>`, xmlEscape(artURL))
+}
+
+func isUncommonDLNAContainer(container string, mediaType string) bool {
+	c := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(container), "."))
+	if c == "" {
+		return false
+	}
+	if strings.EqualFold(mediaType, "Audio") {
+		switch c {
+		case "mp3", "flac", "aac", "m4a", "ogg", "wav":
+			return false
+		default:
+			return true
+		}
+	}
+	switch c {
+	case "mp4", "m4v", "mkv", "webm", "mov", "ts", "m2ts":
+		return false
+	default:
+		return true
+	}
+}
+
 func (h *Handler) itemToDIDL(it dto.BaseItemDto, baseURL, serverUUID string) string {
 	parentID := it.ParentId
 	if parentID == "" {
 		parentID = "0"
 	}
-	if it.IsFolder {
+	albumArtXML := h.buildDIDLAlbumArtXML(it, baseURL)
+	if it.IsFolder || strings.EqualFold(it.Type, "BoxSet") || strings.EqualFold(it.Type, "Playlist") {
 		upnpClass := "object.container.storageFolder"
 		if strings.EqualFold(it.Type, "MusicAlbum") {
 			upnpClass = "object.container.album.musicAlbum"
+		} else if strings.EqualFold(it.Type, "Playlist") {
+			upnpClass = "object.container.playlistContainer"
 		}
 		return fmt.Sprintf(
-			`<container id="%s" parentID="%s" restricted="1"><dc:title>%s</dc:title><upnp:class>%s</upnp:class></container>`,
+			`<container id="%s" parentID="%s" restricted="1"><dc:title>%s</dc:title><upnp:class>%s</upnp:class>%s</container>`,
 			xmlEscape(it.Id),
 			xmlEscape(parentID),
 			xmlEscape(it.Name),
 			upnpClass,
+			albumArtXML,
 		)
 	}
 
@@ -722,21 +881,35 @@ func (h *Handler) itemToDIDL(it dto.BaseItemDto, baseURL, serverUUID string) str
 	sig := h.signStreamToken(it.Id, exp)
 	resURL := fmt.Sprintf("%s/Dlna/%s/stream/%s?exp=%d&sig=%s", baseURL, url.PathEscape(serverUUID), url.PathEscape(it.Id), exp, sig)
 	attrs := fmt.Sprintf(`protocolInfo="http-get:*:%s:*"`, mimeType)
+	durAttr := ""
 	if it.RunTimeTicks != nil && *it.RunTimeTicks > 0 {
-		attrs += fmt.Sprintf(` duration="%s"`, formatUPnPDuration(*it.RunTimeTicks))
+		durAttr = fmt.Sprintf(` duration="%s"`, formatUPnPDuration(*it.RunTimeTicks))
+		attrs += durAttr
 	}
 	if len(it.MediaSources) > 0 && it.MediaSources[0].Size > 0 {
 		attrs += fmt.Sprintf(` size="%d"`, it.MediaSources[0].Size)
 	}
 
+	fallbackResXML := ""
+	if isUncommonDLNAContainer(it.Container, it.MediaType) {
+		fbMime := "video/mp2t"
+		if strings.EqualFold(it.MediaType, "Audio") {
+			fbMime = "audio/mpeg"
+		}
+		fbURL := resURL + "&transcode=1"
+		fallbackResXML = fmt.Sprintf(`<res protocolInfo="http-get:*:%s:*"%s>%s</res>`, fbMime, durAttr, xmlEscape(fbURL))
+	}
+
 	return fmt.Sprintf(
-		`<item id="%s" parentID="%s" restricted="1"><dc:title>%s</dc:title><upnp:class>%s</upnp:class><res %s>%s</res></item>`,
+		`<item id="%s" parentID="%s" restricted="1"><dc:title>%s</dc:title><upnp:class>%s</upnp:class>%s<res %s>%s</res>%s</item>`,
 		xmlEscape(it.Id),
 		xmlEscape(parentID),
 		xmlEscape(it.Name),
 		upnpClass,
+		albumArtXML,
 		attrs,
 		xmlEscape(resURL),
+		fallbackResXML,
 	)
 }
 

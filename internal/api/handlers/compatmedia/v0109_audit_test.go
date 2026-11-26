@@ -256,4 +256,58 @@ func TestV0109Audit_CompatMediaSecurityAndReliability(t *testing.T) {
 	if r := doAs(adminAC, http.MethodPost, "/Items/"+movie.ID+"/RemoteSearch/Subtitles/sub123", ""); r.Code != http.StatusNoContent {
 		t.Fatalf("expected 204 for admin RemoteSearch/Subtitles download, got %d", r.Code)
 	}
+
+	// --- 9. [M-12 & EnableContentDeletion] Physical media + sidecar deletion within Library.Paths & symlink containment ---
+	delDir := t.TempDir()
+	outsideDir := t.TempDir()
+	delLib, _ := env.repo.CreateLibrary(ctx, "DelMovies", "movies", []string{delDir})
+	physVideo := filepath.Join(delDir, "Avatar (2009).mkv")
+	physNFO := filepath.Join(delDir, "Avatar (2009).nfo")
+	physSub := filepath.Join(delDir, "Avatar (2009).zh.srt")
+	physPoster := filepath.Join(delDir, "Avatar (2009)-poster.jpg")
+	keepOther := filepath.Join(delDir, "OtherMovie.mkv")
+	outsideSecret := filepath.Join(outsideDir, "secret.mkv")
+	for _, f := range []string{physVideo, physNFO, physSub, physPoster, keepOther, outsideSecret} {
+		if err := os.WriteFile(f, []byte("DATA"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	escapeLink := filepath.Join(delDir, "Avatar (2009)-fanart.jpg")
+	_ = os.Symlink(outsideSecret, escapeLink)
+
+	delMovie := &sqlite.ItemRecord{
+		ID: guid.New(), LibraryID: delLib.ID, ParentID: delLib.ID,
+		Type: "Movie", MediaType: "Video", Name: "Avatar", OfficialRating: "PG", Path: physVideo,
+	}
+	_ = env.repo.UpsertItem(ctx, delMovie)
+	_ = env.repo.ReplaceMediaSourcesAndStreams(ctx, delMovie.ID, []sqlite.MediaSourceRecord{{
+		ID: guid.New(), ItemID: delMovie.ID, Path: physVideo, Container: "mkv",
+	}})
+
+	// Default non-admin alice cannot delete (EnableContentDeletion=false) -> 403
+	if r := doAs(aliceAC, http.MethodDelete, "/Items/"+delMovie.ID, ""); r.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when EnableContentDeletion=false, got %d", r.Code)
+	}
+	// Grant EnableContentDeletion to alice -> DeleteInfo 200 & DELETE removes media + controlled sidecars, preserves outsideSecret & keepOther
+	aliceDelPol := alice.Policy
+	aliceDelPol.EnableContentDeletion = true
+	_ = userRepo.UpdateUserPolicy(ctx, alice.ID, aliceDelPol)
+	alice.Policy = aliceDelPol
+
+	if r := doAs(aliceAC, http.MethodGet, "/Items/"+delMovie.ID+"/DeleteInfo", ""); r.Code != http.StatusOK {
+		t.Fatalf("expected 200 on DeleteInfo with EnableContentDeletion=true, got %d", r.Code)
+	}
+	if r := doAs(aliceAC, http.MethodDelete, "/Items/"+delMovie.ID, ""); r.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 deleting physical item with EnableContentDeletion=true, got %d %s", r.Code, r.Body.String())
+	}
+	for _, gone := range []string{physVideo, physNFO, physSub, physPoster} {
+		if _, err := os.Stat(gone); !os.IsNotExist(err) {
+			t.Fatalf("expected physical file %s to be deleted, stat err=%v", gone, err)
+		}
+	}
+	for _, mustExist := range []string{keepOther, outsideSecret} {
+		if _, err := os.Stat(mustExist); err != nil {
+			t.Fatalf("expected %s to remain untouched, err=%v", mustExist, err)
+		}
+	}
 }

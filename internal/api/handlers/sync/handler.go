@@ -18,7 +18,9 @@ import (
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/core/budget"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -123,6 +125,9 @@ type SyncJobItem struct {
 	Status      string  `json:"Status"`
 	Progress    float64 `json:"Progress"`
 	OutputPath  string  `json:"OutputPath,omitempty"`
+	SourcePath  string  `json:"SourcePath,omitempty"`
+	MediaType   string  `json:"MediaType,omitempty"`
+	Transcoded  bool    `json:"Transcoded,omitempty"`
 	MediaSource string  `json:"MediaSourceId,omitempty"`
 }
 
@@ -147,14 +152,24 @@ type syncState struct {
 }
 
 type Handler struct {
-	store    *sqlite.Store
-	cfg      *config.Config
-	libRepo  *sqlite.LibraryRepo
-	userRepo *sqlite.UserRepo
-	auth     AuthFuncs
+	store                     *sqlite.Store
+	cfg                       *config.Config
+	libRepo                   *sqlite.LibraryRepo
+	userRepo                  *sqlite.UserRepo
+	budgetPool                *budget.Pool
+	ffmpegPath                string
+	streamResolverWithHeaders func(ctx context.Context, rawPath string) (*plugins.StreamResolveResult, error)
+	auth                      AuthFuncs
 
 	mu    gosync.RWMutex
 	state syncState
+
+	workerMu      gosync.Mutex
+	workerRunning bool
+	workerCancel  context.CancelFunc
+	workerWake    chan struct{}
+	workerWg      gosync.WaitGroup
+	activeCancels map[string]context.CancelFunc
 }
 
 func New(store *sqlite.Store, cfg *config.Config) *Handler {
@@ -270,8 +285,6 @@ func (h *Handler) JobItemIDsForJob(jobID string) []string {
 // DeleteJobForCaller removes a sync job and its job items if the caller owns the job or is admin.
 func (h *Handler) DeleteJobForCaller(ctx context.Context, jobID, callerID string, isAdmin bool) (found, allowed bool, err error) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
 	idx := -1
 	for i, j := range h.state.Jobs {
 		if j.Id == jobID {
@@ -280,51 +293,71 @@ func (h *Handler) DeleteJobForCaller(ctx context.Context, jobID, callerID string
 		}
 	}
 	if idx < 0 {
+		h.mu.Unlock()
 		return false, true, nil
 	}
 	if !callerCanAccessJob(h.state.Jobs[idx], callerID, isAdmin) {
+		h.mu.Unlock()
 		return true, false, nil
 	}
 	snapshot := cloneSyncState(h.state)
 	h.state.Jobs = append(h.state.Jobs[:idx], h.state.Jobs[idx+1:]...)
 	keptItems := make([]SyncJobItem, 0, len(h.state.JobItems))
+	var removedItemIDs []string
+	var removedPaths []string
 	for _, ji := range h.state.JobItems {
 		if ji.JobId != jobID {
 			keptItems = append(keptItems, ji)
+		} else {
+			removedItemIDs = append(removedItemIDs, ji.Id)
+			if ji.OutputPath != "" {
+				removedPaths = append(removedPaths, ji.OutputPath)
+			}
 		}
 	}
 	h.state.JobItems = keptItems
 	if err := h.saveStateLocked(ctx); err != nil {
 		h.state = snapshot
+		h.mu.Unlock()
 		return true, true, err
 	}
+	h.mu.Unlock()
+
+	h.cancelActiveTranscodeItems(removedItemIDs...)
+	h.cleanupSyncCacheFiles(removedPaths...)
+	h.cleanupSyncJobCacheDir(jobID)
 	return true, true, nil
 }
 
 // DeleteJobItemForCaller removes a sync job item if the caller owns its parent job or is admin.
 func (h *Handler) DeleteJobItemForCaller(ctx context.Context, itemID, callerID string, isAdmin bool) (found, allowed bool, err error) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
 	for i, ji := range h.state.JobItems {
 		if ji.Id == itemID {
 			jobID := ji.JobId
 			if !isAdmin {
 				j, ok := h.findJobLocked(jobID)
 				if !ok || !callerCanAccessJob(j, callerID, isAdmin) {
+					h.mu.Unlock()
 					return true, false, nil
 				}
 			}
+			outPath := ji.OutputPath
 			snapshot := cloneSyncState(h.state)
 			h.state.JobItems = append(h.state.JobItems[:i], h.state.JobItems[i+1:]...)
 			h.recomputeJobLocked(jobID)
 			if err := h.saveStateLocked(ctx); err != nil {
 				h.state = snapshot
+				h.mu.Unlock()
 				return true, true, err
 			}
+			h.mu.Unlock()
+			h.cancelActiveTranscodeItems(itemID)
+			h.cleanupSyncCacheFiles(outPath)
 			return true, true, nil
 		}
 	}
+	h.mu.Unlock()
 	return false, true, nil
 }
 
@@ -374,8 +407,6 @@ func (h *Handler) CancelItemsForCaller(ctx context.Context, targetID string, ite
 	}
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
 	jobByID := make(map[string]SyncJob, len(h.state.Jobs))
 	for _, j := range h.state.Jobs {
 		jobByID[j.Id] = j
@@ -385,6 +416,8 @@ func (h *Handler) CancelItemsForCaller(ctx context.Context, targetID string, ite
 	affectedJobs := make(map[string]struct{})
 	removedCount := 0
 	deniedCount := 0
+	var removedItemIDs []string
+	var removedPaths []string
 
 	for _, it := range h.state.JobItems {
 		targetMatch := targetID == "" || it.TargetId == targetID
@@ -399,6 +432,10 @@ func (h *Handler) CancelItemsForCaller(ctx context.Context, targetID string, ite
 				}
 			}
 			removedCount++
+			removedItemIDs = append(removedItemIDs, it.Id)
+			if it.OutputPath != "" {
+				removedPaths = append(removedPaths, it.OutputPath)
+			}
 			affectedJobs[it.JobId] = struct{}{}
 			continue
 		}
@@ -413,8 +450,14 @@ func (h *Handler) CancelItemsForCaller(ctx context.Context, targetID string, ite
 		}
 		if err := h.saveStateLocked(ctx); err != nil {
 			h.state = snapshot
+			h.mu.Unlock()
 			return err
 		}
+	}
+	h.mu.Unlock()
+	if removedCount > 0 {
+		h.cancelActiveTranscodeItems(removedItemIDs...)
+		h.cleanupSyncCacheFiles(removedPaths...)
 	}
 	if removedCount == 0 && deniedCount > 0 {
 		return ErrForbidden
@@ -683,9 +726,16 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 
 	libRepo := h.getLibraryRepo()
 	serverID := h.serverID()
+	wantTranscode, _ := needsSyncTranscode(job.Quality, job.Bitrate)
+	queuedAny := false
+	matchedAnyLibraryItem := false
 	createdItems := make([]SyncJobItem, 0, len(req.ItemIds))
 	if libRepo == nil {
-		for i, itemID := range req.ItemIds {
+		itemList := req.ItemIds
+		if job.ItemLimit > 0 && len(itemList) > job.ItemLimit {
+			itemList = itemList[:job.ItemLimit]
+		}
+		for i, itemID := range itemList {
 			createdItems = append(createdItems, SyncJobItem{
 				Id:       guid.New(),
 				JobId:    job.Id,
@@ -725,9 +775,63 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// Also support ParentId container expansion when ItemIds is empty.
+		if len(req.ItemIds) == 0 && strings.TrimSpace(req.ParentId) != "" {
+			pID := strings.TrimSpace(req.ParentId)
+			if pRec, pErr := libRepo.GetItemRecordByID(r.Context(), pID); pErr == nil && pRec != nil {
+				if callerUser != nil && !callerUser.IsAdmin && !callerUser.Policy.IsAdministrator && !h.canUserAccessItemRecord(r.Context(), libRepo, callerUser, pRec) {
+					httpx.Error(w, http.StatusForbidden, "access denied to requested parent container")
+					return
+				}
+				if isSyncContainerType(pRec.Type) {
+					h.expandSyncContainer(r.Context(), libRepo, serverID, job.UserId, callerUser, pRec, visitedContainers, seenExpanded, &expandedIDs)
+				}
+			} else if pLib, lErr := libRepo.GetLibrary(r.Context(), pID); lErr == nil && pLib != nil {
+				if callerUser != nil && !callerUser.IsAdmin && !callerUser.Policy.IsAdministrator && !callerUser.Policy.EnableAllFolders {
+					normLib := guid.Normalize(pLib.ID)
+					allowed := false
+					for _, fid := range callerUser.Policy.EnabledFolders {
+						if guid.Normalize(fid) == normLib {
+							allowed = true
+							break
+						}
+					}
+					if !allowed {
+						httpx.Error(w, http.StatusForbidden, "access denied to requested library")
+						return
+					}
+				}
+				if libItems, _, qErr := libRepo.QueryItems(r.Context(), sqlite.ItemFilter{
+					ServerID:  serverID,
+					LibraryID: pLib.ID,
+					Recursive: true,
+					Limit:     maxSyncJobItemIDs,
+				}); qErr == nil {
+					for _, li := range libItems {
+						cRec, rErr := libRepo.GetItemRecordByID(r.Context(), li.Id)
+						if rErr != nil || cRec == nil || isSyncContainerType(cRec.Type) || cRec.IsStrm || strings.EqualFold(filepath.Ext(cRec.Path), ".strm") {
+							continue
+						}
+						if callerUser != nil && !callerUser.IsAdmin && !callerUser.Policy.IsAdministrator && !h.canUserAccessItemRecord(r.Context(), libRepo, callerUser, cRec) {
+							continue
+						}
+						norm := guid.Normalize(cRec.ID)
+						if _, dup := seenExpanded[norm]; !dup && len(expandedIDs) < maxSyncJobItemIDs {
+							seenExpanded[norm] = struct{}{}
+							expandedIDs = append(expandedIDs, cRec.ID)
+						}
+					}
+				}
+			}
+		}
+
+		matchedAnyLibraryItem = len(expandedIDs) > 0
 		for i, itemID := range expandedIDs {
+			if job.ItemLimit > 0 && len(createdItems) >= job.ItemLimit {
+				break
+			}
 			itemName := "Item " + strconv.Itoa(i+1)
-			outputPath := ""
+			srcPath := ""
 			mediaSourceID := ""
 			itemDTO, err := libRepo.GetItemByID(r.Context(), serverID, job.UserId, itemID)
 			if err != nil || itemDTO == nil {
@@ -737,34 +841,55 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 				httpx.Error(w, http.StatusBadRequest, "STRM items cannot be synced")
 				return
 			}
+			if job.UnwatchedOnly && h.isItemWatchedByUser(r.Context(), libRepo, job.UserId, itemID, itemDTO) {
+				continue
+			}
 			if itemDTO.Name != "" {
 				itemName = itemDTO.Name
 			}
 			if itemDTO.Path != "" {
-				outputPath = itemDTO.Path
+				srcPath = itemDTO.Path
 			}
 			if len(itemDTO.MediaSources) > 0 && itemDTO.MediaSources[0].Id != "" {
 				mediaSourceID = itemDTO.MediaSources[0].Id
 			} else if itemDTO.Id != "" {
 				mediaSourceID = itemDTO.Id
 			}
-			createdItems = append(createdItems, SyncJobItem{
+			ji := SyncJobItem{
 				Id:          guid.New(),
 				JobId:       job.Id,
 				ItemId:      itemID,
 				ItemName:    itemName,
 				TargetId:    job.TargetId,
 				Status:      "ReadyToTransfer",
-				OutputPath:  outputPath,
+				OutputPath:  srcPath,
+				SourcePath:  srcPath,
+				MediaType:   itemDTO.MediaType,
 				MediaSource: mediaSourceID,
-			})
+			}
+			if wantTranscode && h.canQueueTranscode(srcPath) {
+				ji.Status = "Queued"
+				ji.OutputPath = ""
+				queuedAny = true
+			}
+			createdItems = append(createdItems, ji)
 		}
 	}
-	if libRepo != nil && len(req.ItemIds) > 0 && len(createdItems) == 0 {
+	if libRepo != nil && len(req.ItemIds) > 0 && !matchedAnyLibraryItem && len(createdItems) == 0 {
 		httpx.Error(w, http.StatusNotFound, "no matching library items found")
 		return
 	}
 	job.ItemCount = len(createdItems)
+	if queuedAny {
+		job.Status = "Queued"
+	} else if len(createdItems) == 0 && matchedAnyLibraryItem {
+		job.Status = "Completed"
+		job.Progress = 100
+	} else if len(createdItems) == 0 {
+		job.Status = "Queued"
+	} else {
+		job.Status = "ReadyToTransfer"
+	}
 
 	h.mu.Lock()
 	if job.UserId != "" {
@@ -792,12 +917,16 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "failed to persist sync job")
 		return
 	}
+	if queuedAny {
+		h.wakeWorker()
+	}
 
 	respItems := make([]SyncJobItem, len(createdItems))
 	copy(respItems, createdItems)
 	if hasAuth && !isAdmin {
 		for i := range respItems {
 			respItems[i].OutputPath = ""
+			respItems[i].SourcePath = ""
 		}
 	}
 
@@ -936,9 +1065,16 @@ func (h *Handler) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 	h.state.Jobs = keptJobs
 
 	keptItems := make([]SyncJobItem, 0, len(h.state.JobItems))
+	var removedItemIDs []string
+	var removedPaths []string
 	for _, ji := range h.state.JobItems {
 		if ji.JobId != id {
 			keptItems = append(keptItems, ji)
+		} else {
+			removedItemIDs = append(removedItemIDs, ji.Id)
+			if ji.OutputPath != "" {
+				removedPaths = append(removedPaths, ji.OutputPath)
+			}
 		}
 	}
 	h.state.JobItems = keptItems
@@ -951,6 +1087,9 @@ func (h *Handler) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "failed to persist sync state")
 		return
 	}
+	h.cancelActiveTranscodeItems(removedItemIDs...)
+	h.cleanupSyncCacheFiles(removedPaths...)
+	h.cleanupSyncJobCacheDir(id)
 	httpx.NoContent(w)
 }
 
@@ -998,6 +1137,7 @@ func (h *Handler) handleListJobItems(w http.ResponseWriter, r *http.Request) {
 		}
 		if hasAuth && !isAdmin {
 			ji.OutputPath = ""
+			ji.SourcePath = ""
 		}
 		filtered = append(filtered, ji)
 	}
@@ -1025,6 +1165,7 @@ func (h *Handler) handleDeleteJobItem(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+			outPath := ji.OutputPath
 			snapshot := cloneSyncState(h.state)
 			h.state.JobItems = append(h.state.JobItems[:i], h.state.JobItems[i+1:]...)
 			h.recomputeJobLocked(jobID)
@@ -1037,6 +1178,8 @@ func (h *Handler) handleDeleteJobItem(w http.ResponseWriter, r *http.Request) {
 				httpx.Error(w, http.StatusInternalServerError, "failed to persist sync state")
 				return
 			}
+			h.cancelActiveTranscodeItems(id)
+			h.cleanupSyncCacheFiles(outPath)
 			httpx.NoContent(w)
 			return
 		}
@@ -1059,9 +1202,14 @@ func (h *Handler) handleMarkTransferred(w http.ResponseWriter, r *http.Request) 
 					return
 				}
 			}
+			prevOutPath := h.state.JobItems[i].OutputPath
+			_, isTempCacheFile := h.resolveSafeSyncCacheTarget(prevOutPath)
 			snapshot := cloneSyncState(h.state)
 			h.state.JobItems[i].Status = "Synced"
 			h.state.JobItems[i].Progress = 100
+			if isTempCacheFile {
+				h.state.JobItems[i].OutputPath = ""
+			}
 			h.recomputeJobLocked(h.state.JobItems[i].JobId)
 			err := h.saveStateLocked(r.Context())
 			if err != nil {
@@ -1071,6 +1219,9 @@ func (h *Handler) handleMarkTransferred(w http.ResponseWriter, r *http.Request) 
 			if err != nil {
 				httpx.Error(w, http.StatusInternalServerError, "failed to persist sync state")
 				return
+			}
+			if isTempCacheFile {
+				h.cleanupSyncCacheFiles(prevOutPath)
 			}
 			httpx.NoContent(w)
 			return
@@ -1186,6 +1337,39 @@ func (h *Handler) canUserAccessItemRecord(ctx context.Context, libRepo *sqlite.L
 		blocked, err := libRepo.IsItemBlockedByParentalPolicy(ctx, rec, callerUser.Policy.MaxParentalRating, callerUser.Policy.BlockedTags)
 		if err != nil || blocked {
 			return false
+		}
+		if len(callerUser.Policy.BlockUnratedItems) > 0 && !isSyncContainerType(rec.Type) {
+			for _, bu := range callerUser.Policy.BlockUnratedItems {
+				t := strings.TrimSpace(bu)
+				if t == "*" || strings.EqualFold(t, "All") || strings.EqualFold(t, rec.Type) || (rec.MediaType != "" && strings.EqualFold(t, rec.MediaType)) {
+					if strings.TrimSpace(rec.OfficialRating) == "" {
+						return false
+					}
+					break
+				}
+			}
+		}
+		if len(callerUser.Policy.AllowedTags) > 0 {
+			allowSet := make(map[string]bool, len(callerUser.Policy.AllowedTags))
+			for _, at := range callerUser.Policy.AllowedTags {
+				if s := strings.ToLower(strings.TrimSpace(at)); s != "" {
+					allowSet[s] = true
+				}
+			}
+			if len(allowSet) > 0 {
+				matched := false
+				if _, _, tags, tErr := libRepo.GetTaxonomiesByItemID(ctx, rec.ID); tErr == nil {
+					for _, tg := range tags {
+						if allowSet[strings.ToLower(strings.TrimSpace(tg))] {
+							matched = true
+							break
+						}
+					}
+				}
+				if !matched {
+					return false
+				}
+			}
 		}
 	}
 	return true
@@ -1464,11 +1648,21 @@ func (h *Handler) handleSyncData(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) recomputeJobLocked(jobID string) {
 	total := 0
 	synced := 0
+	converting := 0
+	queued := 0
+	failed := 0
 	for _, ji := range h.state.JobItems {
 		if ji.JobId == jobID {
 			total++
-			if ji.Status == "Synced" {
+			switch ji.Status {
+			case "Synced":
 				synced++
+			case "Converting":
+				converting++
+			case "Queued":
+				queued++
+			case "Failed":
+				failed++
 			}
 		}
 	}
@@ -1481,9 +1675,16 @@ func (h *Handler) recomputeJobLocked(jobID string) {
 				h.state.Jobs[i].Status = "Completed"
 			} else {
 				h.state.Jobs[i].Progress = float64(synced) * 100.0 / float64(total)
-				if synced == total {
+				switch {
+				case synced == total:
 					h.state.Jobs[i].Status = "Completed"
-				} else {
+				case converting > 0:
+					h.state.Jobs[i].Status = "Converting"
+				case queued > 0:
+					h.state.Jobs[i].Status = "Queued"
+				case failed == total:
+					h.state.Jobs[i].Status = "Failed"
+				default:
 					h.state.Jobs[i].Status = "ReadyToTransfer"
 				}
 			}

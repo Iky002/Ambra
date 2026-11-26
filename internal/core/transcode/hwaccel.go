@@ -17,6 +17,53 @@ import (
 // It returns sorted matching paths when found, or nil otherwise. Injectable for unit tests.
 var checkFileFn = defaultCheckFile
 
+// probeEncoderFn executes a minimal 1-frame 64x64 nullsrc encode to verify that a candidate
+// hardware encoder's underlying driver/device actually works on this host. Injectable for unit tests.
+var probeEncoderFn = defaultProbeEncoder
+
+func defaultProbeEncoder(ctx context.Context, ffmpegPath, encoder, vaapiDevice string) bool {
+	if strings.TrimSpace(ffmpegPath) == "" {
+		ffmpegPath = "ffmpeg"
+	}
+	tCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	var args []string
+	switch {
+	case strings.HasSuffix(encoder, "_vaapi"):
+		dev := strings.TrimSpace(vaapiDevice)
+		if dev == "" {
+			dev = "/dev/dri/renderD128"
+		}
+		args = []string{
+			"-hide_banner", "-loglevel", "error",
+			"-vaapi_device", dev,
+			"-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
+			"-vf", "format=nv12,hwupload",
+			"-frames:v", "1", "-c:v", encoder,
+			"-f", "null", "-",
+		}
+	case strings.HasSuffix(encoder, "_qsv"):
+		args = []string{
+			"-hide_banner", "-loglevel", "error",
+			"-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
+			"-pix_fmt", "nv12",
+			"-frames:v", "1", "-c:v", encoder,
+			"-f", "null", "-",
+		}
+	default:
+		args = []string{
+			"-hide_banner", "-loglevel", "error",
+			"-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
+			"-pix_fmt", "yuv420p",
+			"-frames:v", "1", "-c:v", encoder,
+			"-f", "null", "-",
+		}
+	}
+	cmd := exec.CommandContext(tCtx, ffmpegPath, args...)
+	return cmd.Run() == nil
+}
+
 func defaultCheckFile(pattern string) []string {
 	if strings.ContainsAny(pattern, "*?[") {
 		matches, err := filepath.Glob(pattern)
@@ -166,6 +213,31 @@ func ProbeHardware(ctx context.Context, ffmpegPath string) *HWCapabilities {
 	accels := ParseHWAccels(hwOut)
 	encoders := ParseEncoders(encOut)
 	caps := BuildHWCapabilities(accels, encoders, runtime.GOOS)
+
+	// Verify candidate hardware encoders with a 1-frame 64x64 nullsrc self-check so broken
+	// GPU drivers downgrade immediately at probe time instead of crashing every first playback.
+	if probeEncoderFn != nil {
+		var failedHW []string
+		for _, ci := range caps.Codecs {
+			if !ci.IsHardwareCodec {
+				continue
+			}
+			if !probeEncoderFn(probeCtx, ffmpegPath, ci.ShortName, caps.VAAPIDevice) {
+				failedHW = append(failedHW, ci.ShortName)
+			}
+		}
+		if len(failedHW) > 0 {
+			filtered := make(map[string]bool, len(encoders))
+			for k, v := range encoders {
+				filtered[k] = v
+			}
+			for _, bad := range failedHW {
+				delete(filtered, strings.ToLower(bad))
+			}
+			caps = BuildHWCapabilities(accels, filtered, runtime.GOOS)
+		}
+	}
+
 	caps.FFmpegAvailable = true
 	return caps
 }

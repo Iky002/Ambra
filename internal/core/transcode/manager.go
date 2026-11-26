@@ -2,20 +2,25 @@ package transcode
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
+	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
 // ErrSessionClosed is returned when operations are attempted on a destroyed transcode session.
@@ -94,10 +99,18 @@ type SessionParams struct {
 	SubtitleMethod        string // "Encode" for burn-in
 	SubtitleCodec         string // e.g. "ass", "srt", "pgssub", "dvd_subtitle"
 	SubtitlePath          string // external subtitle path when IsExternal
-	IsHDR                 bool   // true when source video is HDR (enables tonemap filter when transcoding)
-	SegmentDuration       int    // seconds, default 6
-	SegmentContainer      string // "ts" (default), "mp4", "m4s"
+	IsHDR                 bool              // true when source video is HDR (enables tonemap filter when transcoding)
+	SegmentDuration       int               // seconds, default 6
+	SegmentContainer      string            // "ts" (default), "mp4", "m4s"
 	DurationSec           float64
+	InputHeaders          map[string]string // optional upstream HTTP headers (Cookie/Referer/User-Agent/Authorization)
+	SoftwareCRF           int               // optional x264/x265 CRF override (1..51)
+	SoftwarePreset        string            // optional x264/x265 preset override
+	DisableToneMapping    bool              // disables HDR tonemapping when true
+	ToneMappingAlgorithm  string            // optional tonemap algorithm override
+	ToneMappingPeak       float64           // optional tonemap peak npl override
+	FMP4InitFilename      string            // optional custom fMP4 init filename inside outDir
+	AudioOnly             bool              // true for audio-only HLS (-vn)
 }
 
 func (p *SessionParams) normalize() {
@@ -175,15 +188,20 @@ func BuildFFmpegArgs(params SessionParams, startSeg int, outDir string, caps *HW
 	isBitmapSub := burnIn && isBitmapSubtitleCodec(params.SubtitleCodec) &&
 		subPath == "" &&
 		params.SubtitleStreamIndex != nil && *params.SubtitleStreamIndex >= 0
-	// Never pass raw http(s):// URLs into FFmpeg's subtitles= filter (bypasses -follow_redirects 0).
+	// Never pass raw http(s):// URLs into FFmpeg's subtitles= filter (bypasses -max_redirects 0).
 	if burnIn && !isBitmapSub && (isHTTPInput(subPath) || (subPath == "" && isHTTPInput(inputPath))) {
 		burnIn = false
 	}
+	isAudioOnly := params.AudioOnly || strings.EqualFold(strings.TrimSpace(params.VideoCodec), "none")
+	if isAudioOnly {
+		burnIn = false
+		isBitmapSub = false
+	}
 	textBurnInSeek := burnIn && !isBitmapSub && startSec > 0
 
-	isVideoCopy := strings.EqualFold(params.VideoCodec, "copy") && !burnIn
+	isVideoCopy := !isAudioOnly && strings.EqualFold(params.VideoCodec, "copy") && !burnIn
 	var encoder string
-	if !isVideoCopy {
+	if !isAudioOnly && !isVideoCopy {
 		vCodec := params.VideoCodec
 		if strings.EqualFold(vCodec, "copy") {
 			vCodec = "h264"
@@ -218,7 +236,7 @@ func BuildFFmpegArgs(params SessionParams, startSeg int, outDir string, caps *HW
 	if isRemoteHTTP {
 		args = append(args,
 			"-protocol_whitelist", "http,https,tcp,tls,crypto",
-			"-follow_redirects", "0",
+			"-max_redirects", "0",
 			"-reconnect", "1",
 			"-reconnect_streamed", "1",
 			"-reconnect_delay_max", "5",
@@ -235,19 +253,28 @@ func BuildFFmpegArgs(params SessionParams, startSeg int, outDir string, caps *HW
 
 	// Build video filter parts for tonemapping, subtitle burn-in, scaling, and VAAPI hardware upload.
 	var vfParts []string
-	if !isVideoCopy {
+	if !isAudioOnly && !isVideoCopy {
 		var vaapiTonemap string
-		if params.IsHDR {
+		if params.IsHDR && !params.DisableToneMapping {
+			customTM := strings.TrimSpace(params.ToneMappingAlgorithm) != "" || params.ToneMappingPeak > 0
+			swYuvTM := softwareTonemapFilter
+			swNv12TM := qsvSoftwareTonemapFilter
+			if customTM {
+				swYuvTM = buildSoftwareTonemapFilter(params.ToneMappingAlgorithm, params.ToneMappingPeak, "yuv420p")
+				swNv12TM = buildSoftwareTonemapFilter(params.ToneMappingAlgorithm, params.ToneMappingPeak, "nv12")
+			}
 			tm := caps.TonemapFilterForEncoder(encoder)
 			switch {
 			case strings.HasSuffix(encoder, "_vaapi") && strings.Contains(tm, "vaapi"):
 				vaapiTonemap = tm
-			case strings.HasSuffix(encoder, "_nvenc") && (tm == "" || strings.Contains(tm, "tonemap_cuda") || strings.Contains(tm, "_cuda")):
+			case strings.HasSuffix(encoder, "_nvenc") && (tm == "" || strings.Contains(tm, "tonemap_cuda") || strings.Contains(tm, "_cuda") || customTM):
 				// BuildFFmpegArgs uses CPU decode; use valid software zscale+tonemap before NVENC encode.
-				vfParts = append(vfParts, softwareTonemapFilter)
-			case strings.HasSuffix(encoder, "_qsv") && (tm == "" || strings.Contains(tm, "vpp_qsv") || strings.Contains(tm, "_qsv")):
+				vfParts = append(vfParts, swYuvTM)
+			case strings.HasSuffix(encoder, "_qsv") && (tm == "" || strings.Contains(tm, "vpp_qsv") || strings.Contains(tm, "_qsv") || customTM):
 				// BuildFFmpegArgs uses CPU decode; use valid software zscale+tonemap -> nv12 for QSV encode.
-				vfParts = append(vfParts, qsvSoftwareTonemapFilter)
+				vfParts = append(vfParts, swNv12TM)
+			case customTM:
+				vfParts = append(vfParts, swYuvTM)
 			case tm != "":
 				vfParts = append(vfParts, tm)
 			}
@@ -285,59 +312,72 @@ func BuildFFmpegArgs(params SessionParams, startSeg int, outDir string, caps *HW
 	}
 
 	// Stream mapping: video (or bitmap subtitle overlay) + selected (or first) audio stream; disable muxed subtitle tracks.
-	if isBitmapSub {
-		filterGraph := fmt.Sprintf("[0:v:0][0:%d]overlay", *params.SubtitleStreamIndex)
-		if len(vfParts) > 0 {
-			filterGraph += "," + strings.Join(vfParts, ",")
+	if isAudioOnly {
+		if params.AudioStreamIndex != nil && *params.AudioStreamIndex >= 0 {
+			args = append(args, "-map", fmt.Sprintf("0:%d", *params.AudioStreamIndex))
+		} else {
+			args = append(args, "-map", "0:a:0")
 		}
-		filterGraph += "[v]"
-		args = append(args, "-filter_complex", filterGraph, "-map", "[v]")
+		args = append(args, "-vn", "-sn")
 	} else {
-		args = append(args, "-map", "0:v:0")
-	}
-	if params.AudioStreamIndex != nil && *params.AudioStreamIndex >= 0 {
-		args = append(args, "-map", fmt.Sprintf("0:%d?", *params.AudioStreamIndex))
-	} else {
-		args = append(args, "-map", "0:a:0?")
-	}
-	args = append(args, "-sn")
-
-	// Video encoding: DirectStream (-c:v copy) vs Transcode
-	if isVideoCopy {
-		args = append(args, "-c:v", "copy")
-	} else {
-		args = append(args, "-c:v", encoder)
-
-		if !isBitmapSub && len(vfParts) > 0 {
-			args = append(args, "-vf", strings.Join(vfParts, ","))
+		if isBitmapSub {
+			filterGraph := fmt.Sprintf("[0:v:0][0:%d]overlay", *params.SubtitleStreamIndex)
+			if len(vfParts) > 0 {
+				filterGraph += "," + strings.Join(vfParts, ",")
+			}
+			filterGraph += "[v]"
+			args = append(args, "-filter_complex", filterGraph, "-map", "[v]")
+		} else {
+			args = append(args, "-map", "0:v:0")
 		}
+		if params.AudioStreamIndex != nil && *params.AudioStreamIndex >= 0 {
+			args = append(args, "-map", fmt.Sprintf("0:%d?", *params.AudioStreamIndex))
+		} else {
+			args = append(args, "-map", "0:a:0?")
+		}
+		args = append(args, "-sn")
 
-		// Pixel format & encoder presets
-		switch {
-		case strings.HasPrefix(encoder, "libx"):
-			args = append(args, "-preset", "veryfast", "-pix_fmt", "yuv420p")
-		case strings.HasSuffix(encoder, "_videotoolbox"):
-			args = append(args, "-pix_fmt", "yuv420p")
-		case strings.HasSuffix(encoder, "_nvenc"):
-			args = append(args, "-preset", "p4", "-pix_fmt", "yuv420p")
-		case strings.HasSuffix(encoder, "_qsv"):
-			args = append(args, "-pix_fmt", "nv12")
-		}
+		// Video encoding: DirectStream (-c:v copy) vs Transcode
+		if isVideoCopy {
+			args = append(args, "-c:v", "copy")
+		} else {
+			args = append(args, "-c:v", encoder)
 
-		vBitrate := params.VideoBitrate
-		if vBitrate <= 0 {
-			vBitrate = 4_000_000
+			if !isBitmapSub && len(vfParts) > 0 {
+				args = append(args, "-vf", strings.Join(vfParts, ","))
+			}
+
+			// Pixel format & encoder presets
+			switch {
+			case strings.HasPrefix(encoder, "libx"):
+				preset := normalizeX264Preset(params.SoftwarePreset)
+				args = append(args, "-preset", preset, "-pix_fmt", "yuv420p")
+				if params.SoftwareCRF > 0 && params.SoftwareCRF <= 51 {
+					args = append(args, "-crf", strconv.Itoa(params.SoftwareCRF))
+				}
+			case strings.HasSuffix(encoder, "_videotoolbox"):
+				args = append(args, "-pix_fmt", "yuv420p")
+			case strings.HasSuffix(encoder, "_nvenc"):
+				args = append(args, "-preset", "p4", "-pix_fmt", "yuv420p")
+			case strings.HasSuffix(encoder, "_qsv"):
+				args = append(args, "-pix_fmt", "nv12")
+			}
+
+			vBitrate := params.VideoBitrate
+			if vBitrate <= 0 {
+				vBitrate = 4_000_000
+			}
+			keyframeExpr := fmt.Sprintf("expr:gte(t,n_forced*%d)", segDur)
+			if textBurnInSeek && startSec > 0 {
+				keyframeExpr = fmt.Sprintf("expr:gte(t-%d,n_forced*%d)", startSec, segDur)
+			}
+			args = append(args,
+				"-b:v", strconv.Itoa(vBitrate),
+				"-maxrate", strconv.Itoa(vBitrate),
+				"-bufsize", strconv.Itoa(vBitrate*2),
+				"-force_key_frames", keyframeExpr,
+			)
 		}
-		keyframeExpr := fmt.Sprintf("expr:gte(t,n_forced*%d)", segDur)
-		if textBurnInSeek && startSec > 0 {
-			keyframeExpr = fmt.Sprintf("expr:gte(t-%d,n_forced*%d)", startSec, segDur)
-		}
-		args = append(args,
-			"-b:v", strconv.Itoa(vBitrate),
-			"-maxrate", strconv.Itoa(vBitrate),
-			"-bufsize", strconv.Itoa(vBitrate*2),
-			"-force_key_frames", keyframeExpr,
-		)
 	}
 
 	// Audio encoding
@@ -368,7 +408,11 @@ func BuildFFmpegArgs(params SessionParams, startSeg int, outDir string, caps *HW
 		"-hls_flags", "temp_file",
 	)
 	if ext == "mp4" || ext == "m4s" {
-		args = append(args, "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4")
+		initName := filepath.Base(strings.TrimSpace(params.FMP4InitFilename))
+		if initName == "" || initName == "." || initName == "/" {
+			initName = "init.mp4"
+		}
+		args = append(args, "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", initName)
 	}
 	if startSec > 0 && ext == "ts" && !textBurnInSeek {
 		args = append(args, "-output_ts_offset", strconv.Itoa(startSec))
@@ -426,6 +470,29 @@ func WithMaxSessionsPerUser(maxPerUser int) ManagerOption {
 	}
 }
 
+// WithMaxCacheBytes configures the total disk byte cap across all transcode session working directories.
+func WithMaxCacheBytes(maxBytes int64) ManagerOption {
+	return func(m *Manager) {
+		if maxBytes > 0 {
+			m.maxCacheBytes = maxBytes
+		}
+	}
+}
+
+// WithThrottleConfig configures lead-buffer process throttling parameters.
+func WithThrottleConfig(enabled bool, bufferSec, hysteresisSec int) ManagerOption {
+	return func(m *Manager) {
+		m.encOpts.EnableThrottling = enabled
+		if bufferSec > 0 {
+			m.encOpts.ThrottleBufferSize = bufferSec
+		}
+		if hysteresisSec >= 0 {
+			m.encOpts.ThrottleHysteresis = hysteresisSec
+		}
+		m.throttleOverridden = true
+	}
+}
+
 // Manager orchestrates active FFmpeg dynamic HLS transcoding sessions.
 type Manager struct {
 	cfg                *config.Config
@@ -434,10 +501,18 @@ type Manager struct {
 	cleanupInterval    time.Duration
 	maxSessions        int
 	maxSessionsPerUser int
+	maxCacheBytes      int64
 
-	mu       sync.Mutex
-	sessions map[string]*transcodeSession
-	closed   bool
+	encMu              sync.RWMutex
+	store              *sqlite.Store
+	encOpts            EncodingOptions
+	encLoadedFromStore bool
+	throttleOverridden bool
+
+	mu              sync.Mutex
+	sessions        map[string]*transcodeSession
+	externalStreams atomic.Int64
+	closed          bool
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
@@ -457,6 +532,8 @@ func NewManager(cfg *config.Config, opts ...ManagerOption) *Manager {
 		cleanupInterval:    defaultCleanupTick,
 		maxSessions:        defaultMaxSessions,
 		maxSessionsPerUser: defaultMaxSessionsPerUser,
+		maxCacheBytes:      defaultMaxTranscodeCacheSize,
+		encOpts:            DefaultEncodingOptions(),
 		sessions:           make(map[string]*transcodeSession),
 		stopCh:             make(chan struct{}),
 	}
@@ -469,9 +546,88 @@ func NewManager(cfg *config.Config, opts ...ManagerOption) *Manager {
 	return m
 }
 
-// Capabilities returns the cached hardware acceleration capabilities.
+// Capabilities returns the cached hardware acceleration capabilities (or software-only when
+// hardware acceleration/encoding is disabled in /Encoding/FfmpegOptions).
 func (m *Manager) Capabilities(ctx context.Context) *HWCapabilities {
+	if !m.EncodingOptionsSnapshot().isHardwareAllowed() {
+		return SoftwareOnlyCapabilities()
+	}
 	return m.detector.Detect(ctx)
+}
+
+// HasSession reports whether a live session with the given key already exists.
+func (m *Manager) HasSession(key string) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sess, ok := m.sessions[key]
+	return ok && sess != nil && !sess.isDestroyed()
+}
+
+// ActiveSessionCount returns the number of currently tracked transcode sessions.
+func (m *Manager) ActiveSessionCount() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.sessions)
+}
+
+// TotalActiveTranscodes returns the combined count of active HLS sessions and external stream transcodes (e.g. Audio).
+func (m *Manager) TotalActiveTranscodes() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	hlsCount := len(m.sessions)
+	m.mu.Unlock()
+	ext := int(m.externalStreams.Load())
+	if ext < 0 {
+		ext = 0
+	}
+	return hlsCount + ext
+}
+
+// TryAcquireStreamSlot checks SimultaneousStreamLimit across both HLS sessions and external stream transcodes.
+// When existingSessionKey is non-empty (HLS), existing sessions always pass without incrementing externalStreams.
+// When existingSessionKey is empty (pipe transcodes such as Audio), an external slot is reserved until release() is called.
+func (m *Manager) TryAcquireStreamSlot(limit int, existingSessionKey string) (release func(), allowed bool) {
+	noop := func() {}
+	if m == nil || limit <= 0 {
+		return noop, true
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existingSessionKey != "" {
+		if sess, ok := m.sessions[existingSessionKey]; ok && sess != nil && !sess.isDestroyed() {
+			return noop, true
+		}
+		ext := int(m.externalStreams.Load())
+		if ext < 0 {
+			ext = 0
+		}
+		if len(m.sessions)+ext >= limit {
+			return nil, false
+		}
+		return noop, true
+	}
+	ext := int(m.externalStreams.Load())
+	if ext < 0 {
+		ext = 0
+	}
+	if len(m.sessions)+ext >= limit {
+		return nil, false
+	}
+	m.externalStreams.Add(1)
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.externalStreams.Add(-1)
+		})
+	}, true
 }
 
 // SessionKey derives a stable, user- and media-scoped session map key so that
@@ -519,6 +675,7 @@ func (m *Manager) GetSegment(ctx context.Context, params SessionParams, segIndex
 	if segIndex < 0 {
 		return "", errors.New("segment index must be non-negative")
 	}
+	params = m.applyEncodingOptionsToParams(params)
 	params.normalize()
 	if err := validateSessionPaths(params, true); err != nil {
 		return "", err
@@ -528,13 +685,18 @@ func (m *Manager) GetSegment(ctx context.Context, params SessionParams, segIndex
 	if err != nil {
 		return "", err
 	}
-	return sess.getSegment(ctx, segIndex, func() *HWCapabilities {
+	segPath, err := sess.getSegment(ctx, segIndex, func() *HWCapabilities {
 		return m.Capabilities(ctx)
 	})
+	if err == nil && m.maxCacheBytes > 0 {
+		m.EnforceCacheBytesLimit()
+	}
+	return segPath, err
 }
 
 // GetInitSegment ensures the fMP4 transcode session is running and waits for workDir/init.mp4 to be ready.
 func (m *Manager) GetInitSegment(ctx context.Context, params SessionParams) (string, error) {
+	params = m.applyEncodingOptionsToParams(params)
 	params.normalize()
 	if err := validateSessionPaths(params, true); err != nil {
 		return "", err
@@ -559,6 +721,18 @@ func intPtrEqual(a, b *int) bool {
 	return *a == *b
 }
 
+func headersDiffer(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return true
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return true
+		}
+	}
+	return false
+}
+
 func sessionParamsDiffer(a, b SessionParams) bool {
 	return strings.TrimSpace(a.UserID) != strings.TrimSpace(b.UserID) ||
 		strings.TrimSpace(a.ItemID) != strings.TrimSpace(b.ItemID) ||
@@ -572,6 +746,13 @@ func sessionParamsDiffer(a, b SessionParams) bool {
 		a.IsHDR != b.IsHDR ||
 		a.SubtitleRelativeIndex != b.SubtitleRelativeIndex ||
 		a.SegmentDuration != b.SegmentDuration ||
+		a.SoftwareCRF != b.SoftwareCRF ||
+		a.SoftwarePreset != b.SoftwarePreset ||
+		a.DisableToneMapping != b.DisableToneMapping ||
+		a.ToneMappingAlgorithm != b.ToneMappingAlgorithm ||
+		a.ToneMappingPeak != b.ToneMappingPeak ||
+		a.AudioOnly != b.AudioOnly ||
+		headersDiffer(a.InputHeaders, b.InputHeaders) ||
 		!strings.EqualFold(strings.TrimSpace(a.SegmentContainer), strings.TrimSpace(b.SegmentContainer)) ||
 		!strings.EqualFold(strings.TrimSpace(a.VideoCodec), strings.TrimSpace(b.VideoCodec)) ||
 		!strings.EqualFold(strings.TrimSpace(a.AudioCodec), strings.TrimSpace(b.AudioCodec)) ||
@@ -665,10 +846,7 @@ func (m *Manager) getOrCreateSession(params SessionParams) (*transcodeSession, e
 			}
 		}
 
-		baseDir := filepath.Join(os.TempDir(), "ambra-transcode")
-		if m.cfg != nil {
-			baseDir = m.cfg.TranscodeTempDir()
-		}
+		baseDir := m.effectiveTranscodeBaseDir()
 		if err := os.MkdirAll(baseDir, 0o700); err != nil {
 			m.mu.Unlock()
 			for _, ev := range evicted {
@@ -695,12 +873,14 @@ func (m *Manager) getOrCreateSession(params SessionParams) (*transcodeSession, e
 		}
 
 		sess := &transcodeSession{
-			key:        key,
-			ffmpegPath: ffmpegPath,
-			params:     params,
-			workDir:    workDir,
-			startSeg:   -1,
-			lastAccess: time.Now(),
+			mgr:              m,
+			key:              key,
+			ffmpegPath:       ffmpegPath,
+			params:           params,
+			workDir:          workDir,
+			startSeg:         -1,
+			lastRequestedSeg: 0,
+			lastAccess:       time.Now(),
 		}
 		m.sessions[key] = sess
 		m.mu.Unlock()
@@ -714,6 +894,7 @@ func (m *Manager) getOrCreateSession(params SessionParams) (*transcodeSession, e
 
 // RegisterSession pre-registers a session without starting FFmpeg yet (e.g., on master.m3u8).
 func (m *Manager) RegisterSession(params SessionParams) (*SessionSnapshot, error) {
+	params = m.applyEncodingOptionsToParams(params)
 	params.normalize()
 	if err := validateSessionPaths(params, false); err != nil {
 		return nil, err
@@ -840,7 +1021,127 @@ func (m *Manager) reaperLoop() {
 			return
 		case <-ticker.C:
 			m.reapIdleSessions(time.Now())
+			m.EnforceCacheBytesLimit()
 		}
+	}
+}
+
+// EnforceCacheBytesLimit enforces maxCacheBytes across all active transcode session directories,
+// pruning already-played old segments first and evicting least-recently-used sessions if still over limit.
+func (m *Manager) EnforceCacheBytesLimit() {
+	if m == nil || m.maxCacheBytes <= 0 {
+		return
+	}
+	type segCandidate struct {
+		path    string
+		size    int64
+		segIdx  int
+		modTime time.Time
+	}
+	type sessUsage struct {
+		key        string
+		sess       *transcodeSession
+		lastAccess time.Time
+		bytes      int64
+	}
+
+	m.mu.Lock()
+	snapshotList := make([]sessUsage, 0, len(m.sessions))
+	for k, s := range m.sessions {
+		snapshotList = append(snapshotList, sessUsage{
+			key:        k,
+			sess:       s,
+			lastAccess: s.lastAccessTime(),
+		})
+	}
+	m.mu.Unlock()
+	if len(snapshotList) == 0 {
+		return
+	}
+
+	var (
+		totalBytes int64
+		oldSegs    []segCandidate
+	)
+	for i := range snapshotList {
+		su := &snapshotList[i]
+		su.sess.mu.Lock()
+		workDir := su.sess.workDir
+		lastReq := su.sess.lastRequestedSeg
+		ext := su.sess.params.SegmentContainer
+		su.sess.mu.Unlock()
+		if workDir == "" {
+			continue
+		}
+		suffix := "." + ext
+		_ = filepath.WalkDir(workDir, func(p string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			info, statErr := d.Info()
+			if statErr != nil || info.Mode()&os.ModeSymlink != 0 {
+				return nil
+			}
+			sz := info.Size()
+			totalBytes += sz
+			su.bytes += sz
+
+			name := d.Name()
+			if strings.HasPrefix(name, "seg_") && strings.HasSuffix(name, suffix) {
+				numStr := strings.TrimSuffix(strings.TrimPrefix(name, "seg_"), suffix)
+				if idx, convErr := strconv.Atoi(numStr); convErr == nil && idx < lastReq-2 {
+					oldSegs = append(oldSegs, segCandidate{
+						path:    p,
+						size:    sz,
+						segIdx:  idx,
+						modTime: info.ModTime(),
+					})
+				}
+			}
+			return nil
+		})
+	}
+
+	if totalBytes <= m.maxCacheBytes {
+		return
+	}
+
+	// Stage 1: delete already-played historical segments (idx < lastRequestedSeg - 2) oldest first.
+	sort.Slice(oldSegs, func(i, j int) bool {
+		if !oldSegs[i].modTime.Equal(oldSegs[j].modTime) {
+			return oldSegs[i].modTime.Before(oldSegs[j].modTime)
+		}
+		return oldSegs[i].segIdx < oldSegs[j].segIdx
+	})
+	for _, seg := range oldSegs {
+		if totalBytes <= m.maxCacheBytes {
+			return
+		}
+		if err := os.Remove(seg.path); err == nil {
+			totalBytes -= seg.size
+		}
+	}
+	if totalBytes <= m.maxCacheBytes {
+		return
+	}
+
+	// Stage 2: evict least-recently-used sessions (keeping the single most recently accessed session alive).
+	sort.Slice(snapshotList, func(i, j int) bool {
+		return snapshotList[i].lastAccess.Before(snapshotList[j].lastAccess)
+	})
+	var toDestroy []*transcodeSession
+	m.mu.Lock()
+	for i := 0; i < len(snapshotList)-1 && totalBytes > m.maxCacheBytes; i++ {
+		cand := snapshotList[i]
+		if cur, ok := m.sessions[cand.key]; ok && cur == cand.sess {
+			delete(m.sessions, cand.key)
+			toDestroy = append(toDestroy, cur)
+			totalBytes -= cand.bytes
+		}
+	}
+	m.mu.Unlock()
+	for _, s := range toDestroy {
+		s.destroy()
 	}
 }
 
@@ -862,24 +1163,30 @@ func (m *Manager) reapIdleSessions(now time.Time) int {
 }
 
 type transcodeSession struct {
+	mgr                *Manager
 	key                string
 	ffmpegPath         string
 	params             SessionParams
 	workDir            string
 	segmentWaitTimeout time.Duration
 
-	mu            sync.Mutex
-	cmd           *exec.Cmd
-	cancel        context.CancelFunc
-	doneCh        chan struct{}
-	lastErr       error
-	stderrBuf     *safeRingBuffer
-	startSeg      int
-	running       bool
-	destroyed     bool
-	usingHW       bool
-	forceSoftware bool
-	lastAccess    time.Time
+	mu               sync.Mutex
+	cmd              *exec.Cmd
+	inputProxy       *LoopbackStreamProxy
+	cancel           context.CancelFunc
+	doneCh           chan struct{}
+	lastErr          error
+	stderrBuf        *safeRingBuffer
+	startSeg         int
+	lastRequestedSeg int
+	throttled        bool
+	procGen          int
+	activeInitGen    string
+	running          bool
+	destroyed        bool
+	usingHW          bool
+	forceSoftware    bool
+	lastAccess       time.Time
 }
 
 func (s *transcodeSession) isDestroyed() bool {
@@ -888,8 +1195,86 @@ func (s *transcodeSession) isDestroyed() bool {
 	return s.destroyed
 }
 
+func (s *transcodeSession) IsThrottled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.throttled
+}
+
 func (s *transcodeSession) initSegmentPath() string {
 	return filepath.Join(s.workDir, "init.mp4")
+}
+
+func isMP4InitComplete(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || fi.IsDir() || fi.Size() < 16 {
+		return false
+	}
+	fileSize := fi.Size()
+	var (
+		offset  int64
+		hasFtyp bool
+		hasMoov bool
+		hdr     [16]byte
+	)
+	for offset+8 <= fileSize {
+		if _, err := f.ReadAt(hdr[:8], offset); err != nil {
+			return false
+		}
+		boxSize := int64(binary.BigEndian.Uint32(hdr[0:4]))
+		boxType := string(hdr[4:8])
+		if boxSize == 1 {
+			if offset+16 > fileSize {
+				return false
+			}
+			if _, err := f.ReadAt(hdr[8:16], offset+8); err != nil {
+				return false
+			}
+			boxSize = int64(binary.BigEndian.Uint64(hdr[8:16]))
+		} else if boxSize == 0 {
+			return false
+		}
+		if boxSize < 8 || offset+boxSize > fileSize {
+			return false
+		}
+		switch boxType {
+		case "ftyp", "styp":
+			hasFtyp = true
+		case "moov":
+			hasMoov = true
+		}
+		offset += boxSize
+		if hasFtyp && hasMoov {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *transcodeSession) tryPromoteStagedInit() {
+	s.mu.Lock()
+	genName := s.activeInitGen
+	workDir := s.workDir
+	running := s.running
+	startSeg := s.startSeg
+	s.mu.Unlock()
+
+	if genName == "" || workDir == "" {
+		return
+	}
+	genPath := filepath.Join(workDir, genName)
+	if !fileReady(genPath) {
+		return
+	}
+	firstSegReady := startSeg >= 0 && fileReady(s.segmentPath(startSeg))
+	if !running || firstSegReady || isMP4InitComplete(genPath) {
+		_ = os.Rename(genPath, filepath.Join(workDir, "init.mp4"))
+	}
 }
 
 func (s *transcodeSession) touch() {
@@ -923,31 +1308,111 @@ func (s *transcodeSession) segmentPath(segIndex int) string {
 	return filepath.Join(s.workDir, fmt.Sprintf("seg_%d.%s", segIndex, s.params.SegmentContainer))
 }
 
+// highestReadySegmentLocked scans contiguous ready segments starting from s.startSeg
+// and stops immediately at the first missing/unready segment gap (H-10).
 func (s *transcodeSession) highestReadySegmentLocked() int {
-	highest := s.startSeg - 1
-	entries, err := os.ReadDir(s.workDir)
-	if err != nil {
-		return highest
+	if s.startSeg < 0 {
+		return -1
 	}
-	suffix := "." + s.params.SegmentContainer
-	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasPrefix(name, "seg_") || !strings.HasSuffix(name, suffix) {
-			continue
+	cur := s.startSeg
+	for {
+		if !fileReady(s.segmentPath(cur)) {
+			return cur - 1
 		}
-		numStr := strings.TrimSuffix(strings.TrimPrefix(name, "seg_"), suffix)
-		if idx, err := strconv.Atoi(numStr); err == nil && idx > highest {
-			highest = idx
+		cur++
+	}
+}
+
+func (s *transcodeSession) onSegmentRequested(segIndex int) {
+	var encOpts EncodingOptions
+	if s.mgr != nil {
+		encOpts = s.mgr.EncodingOptionsSnapshot()
+	} else {
+		encOpts = DefaultEncodingOptions()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastAccess = time.Now()
+	s.lastRequestedSeg = segIndex
+	if s.throttled && s.running && s.cmd != nil {
+		segDur := s.params.SegmentDuration
+		if segDur <= 0 {
+			segDur = DefaultSegmentDuration
+		}
+		head := s.highestReadySegmentLocked()
+		leadSec := (head - segIndex) * segDur
+		resumeThresh := encOpts.ThrottleBufferSize - encOpts.ThrottleHysteresis
+		if resumeThresh < 0 {
+			resumeThresh = 0
+		}
+		if !encOpts.EnableThrottling || segIndex < s.startSeg || segIndex > head || leadSec <= resumeThresh {
+			_ = resumeProcess(s.cmd)
+			s.throttled = false
 		}
 	}
-	return highest
+}
+
+func (s *transcodeSession) evaluateThrottle(encOpts EncodingOptions) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.destroyed || !s.running || s.cmd == nil {
+		return
+	}
+	if !encOpts.EnableThrottling || encOpts.ThrottleBufferSize <= 0 {
+		if s.throttled {
+			_ = resumeProcess(s.cmd)
+			s.throttled = false
+		}
+		return
+	}
+	segDur := s.params.SegmentDuration
+	if segDur <= 0 {
+		segDur = DefaultSegmentDuration
+	}
+	head := s.highestReadySegmentLocked()
+	if head < s.startSeg {
+		return
+	}
+	leadSec := (head - s.lastRequestedSeg) * segDur
+	if !s.throttled {
+		if leadSec > encOpts.ThrottleBufferSize {
+			if suspendProcess(s.cmd) == nil {
+				s.throttled = true
+			}
+		}
+	} else {
+		resumeThresh := encOpts.ThrottleBufferSize - encOpts.ThrottleHysteresis
+		if resumeThresh < 0 {
+			resumeThresh = 0
+		}
+		if leadSec <= resumeThresh {
+			_ = resumeProcess(s.cmd)
+			s.throttled = false
+		}
+	}
+}
+
+func (s *transcodeSession) throttleMonitorLoop(doneCh <-chan struct{}) {
+	ticker := time.NewTicker(150 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-doneCh:
+			return
+		case <-ticker.C:
+			s.tryPromoteStagedInit()
+			if s.mgr != nil {
+				s.evaluateThrottle(s.mgr.EncodingOptionsSnapshot())
+			}
+		}
+	}
 }
 
 func (s *transcodeSession) getSegment(ctx context.Context, segIndex int, getCaps func() *HWCapabilities) (string, error) {
 	if s.isDestroyed() {
 		return "", ErrSessionClosed
 	}
-	s.touch()
+	s.onSegmentRequested(segIndex)
 	targetPath := s.segmentPath(segIndex)
 
 	// Fast path: segment already written on disk (atomic via -hls_flags temp_file)
@@ -1092,6 +1557,9 @@ func (s *transcodeSession) waitForFile(ctx context.Context, targetPath string, r
 
 	retriedSoftware := false
 	for {
+		if label == "init.mp4" {
+			s.tryPromoteStagedInit()
+		}
 		if fileReady(targetPath) {
 			s.touch()
 			return targetPath, nil
@@ -1105,6 +1573,9 @@ func (s *transcodeSession) waitForFile(ctx context.Context, targetPath string, r
 		case <-waitTimer.C:
 			return "", fmt.Errorf("timed out waiting for %s after %s", label, waitTimeout)
 		case <-doneCh:
+			if label == "init.mp4" {
+				s.tryPromoteStagedInit()
+			}
 			// FFmpeg exited; check one final time if the file finished writing right before exit
 			if fileReady(targetPath) {
 				s.touch()
@@ -1293,7 +1764,7 @@ func downloadRemoteSubtitleAtomic(rawURL, dst string, client *http.Client) error
 	return nil
 }
 
-func extractRemoteEmbeddedSubtitle(ffmpegPath, mediaURL string, streamIndex int, subCodec, dst string) error {
+func extractRemoteEmbeddedSubtitle(ffmpegPath, mediaURL string, headers map[string]string, streamIndex int, subCodec, dst string) error {
 	if strings.TrimSpace(ffmpegPath) == "" {
 		ffmpegPath = "ffmpeg"
 	}
@@ -1309,9 +1780,15 @@ func extractRemoteEmbeddedSubtitle(ffmpegPath, mediaURL string, streamIndex int,
 	_ = tmpFile.Close()
 	defer os.Remove(tmpPath)
 
+	ffInput, closeProxy, err := startExtractorInputProxy(mediaURL, headers)
+	if err != nil {
+		return err
+	}
+	defer closeProxy()
+
 	ctx, cancel := context.WithTimeout(context.Background(), defaultExtractTimeout)
 	defer cancel()
-	args := BuildSubtitleExtractArgs(mediaURL, streamIndex, ext, tmpPath)
+	args := BuildSubtitleExtractArgs(ffInput, streamIndex, ext, tmpPath)
 	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
 	if err := cmd.Run(); err != nil {
 		return err
@@ -1378,7 +1855,7 @@ func stageBurnInFilesWithDeps(params SessionParams, workDir, ffmpegPath string, 
 				params.SubtitlePath = dst
 				return params
 			}
-			if err := extractRemoteEmbeddedSubtitle(ffmpegPath, inputPath, *params.SubtitleStreamIndex, params.SubtitleCodec, dst); err == nil {
+			if err := extractRemoteEmbeddedSubtitle(ffmpegPath, inputPath, params.InputHeaders, *params.SubtitleStreamIndex, params.SubtitleCodec, dst); err == nil {
 				params.SubtitlePath = dst
 				return params
 			}
@@ -1412,11 +1889,23 @@ func (s *transcodeSession) startProcessLocked(startSeg int, caps *HWCapabilities
 	if err := os.MkdirAll(s.workDir, 0o755); err != nil {
 		return err
 	}
-	// Clean any stale .tmp files from previous interrupted runs
+	s.procGen++
+	ext := s.params.SegmentContainer
+	suffix := "." + ext
+
+	// Clean any stale .tmp files, old staged init_gen_*.mp4 files, and stale residual segments idx >= startSeg (H-10).
 	if entries, err := os.ReadDir(s.workDir); err == nil {
 		for _, e := range entries {
-			if strings.HasSuffix(e.Name(), ".tmp") {
-				_ = os.Remove(filepath.Join(s.workDir, e.Name()))
+			name := e.Name()
+			if strings.HasSuffix(name, ".tmp") || strings.HasPrefix(name, "init_gen_") {
+				_ = os.Remove(filepath.Join(s.workDir, name))
+				continue
+			}
+			if strings.HasPrefix(name, "seg_") && strings.HasSuffix(name, suffix) {
+				numStr := strings.TrimSuffix(strings.TrimPrefix(name, "seg_"), suffix)
+				if idx, convErr := strconv.Atoi(numStr); convErr == nil && idx >= startSeg {
+					_ = os.Remove(filepath.Join(s.workDir, name))
+				}
 			}
 		}
 	}
@@ -1429,10 +1918,38 @@ func (s *transcodeSession) startProcessLocked(startSeg int, caps *HWCapabilities
 	if strings.EqualFold(vCodec, "copy") {
 		vCodec = "h264"
 	}
-	usingHW := (!strings.EqualFold(s.params.VideoCodec, "copy") || strings.EqualFold(strings.TrimSpace(s.params.SubtitleMethod), "Encode")) &&
+	usingHW := !s.params.AudioOnly && !strings.EqualFold(s.params.VideoCodec, "none") &&
+		(!strings.EqualFold(s.params.VideoCodec, "copy") || strings.EqualFold(strings.TrimSpace(s.params.SubtitleMethod), "Encode")) &&
 		isHardwareEncoder(effectiveCaps.SelectVideoEncoder(vCodec))
 
 	effectiveParams := stageBurnInFilesWithDeps(s.params, s.workDir, s.ffmpegPath, nil)
+
+	// Avoid in-place O_TRUNC overwriting an active init.mp4 being read concurrently by clients (H-10).
+	s.activeInitGen = ""
+	if ext == "mp4" || ext == "m4s" {
+		s.activeInitGen = fmt.Sprintf("init_gen_%d.mp4", s.procGen)
+		effectiveParams.FMP4InitFilename = s.activeInitGen
+	}
+
+	// Route remote HTTP(S) inputs through a pinned-IP loopback stream proxy (C-02).
+	var streamProxy *LoopbackStreamProxy
+	rawIn := strings.TrimSpace(effectiveParams.InputPath)
+	if isHTTPInput(rawIn) {
+		lowerNoQuery := strings.ToLower(strings.SplitN(rawIn, "?", 2)[0])
+		if !strings.HasSuffix(lowerNoQuery, ".m3u8") {
+			proxy, proxyErr := StartLoopbackStreamProxy(LoopbackProxyOptions{
+				TargetURL:       rawIn,
+				Headers:         effectiveParams.InputHeaders,
+				AllowPrivateLAN: true,
+			})
+			if proxyErr != nil {
+				return fmt.Errorf("start loopback stream proxy: %w", proxyErr)
+			}
+			streamProxy = proxy
+			effectiveParams.InputPath = proxy.URL()
+		}
+	}
+
 	args := BuildFFmpegArgs(effectiveParams, startSeg, s.workDir, effectiveCaps)
 	procCtx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(procCtx, s.ffmpegPath, args...)
@@ -1441,29 +1958,41 @@ func (s *transcodeSession) startProcessLocked(startSeg int, caps *HWCapabilities
 	cmd.Stderr = stderrBuf
 
 	if err := cmd.Start(); err != nil {
+		if streamProxy != nil {
+			_ = streamProxy.Close()
+		}
 		cancel()
 		return fmt.Errorf("start ffmpeg: %w", err)
 	}
 
 	doneCh := make(chan struct{})
 	s.cmd = cmd
+	s.inputProxy = streamProxy
 	s.cancel = cancel
 	s.doneCh = doneCh
 	s.stderrBuf = stderrBuf
 	s.startSeg = startSeg
+	s.throttled = false
 	s.running = true
 	s.usingHW = usingHW
 	s.lastErr = nil
 	s.lastAccess = time.Now()
 
+	go s.throttleMonitorLoop(doneCh)
+
 	go func() {
 		err := cmd.Wait()
+		if streamProxy != nil {
+			_ = streamProxy.Close()
+		}
 		s.mu.Lock()
 		if s.cmd == cmd {
 			s.running = false
+			s.throttled = false
 			s.lastErr = err
 		}
 		s.mu.Unlock()
+		s.tryPromoteStagedInit()
 		close(doneCh)
 	}()
 
@@ -1471,6 +2000,14 @@ func (s *transcodeSession) startProcessLocked(startSeg int, caps *HWCapabilities
 }
 
 func (s *transcodeSession) stopProcessLocked() {
+	if s.throttled && s.cmd != nil {
+		_ = resumeProcess(s.cmd)
+		s.throttled = false
+	}
+	if s.inputProxy != nil {
+		_ = s.inputProxy.Close()
+		s.inputProxy = nil
+	}
 	if s.cancel != nil {
 		s.cancel()
 	}

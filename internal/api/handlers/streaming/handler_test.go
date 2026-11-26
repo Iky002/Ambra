@@ -294,8 +294,16 @@ func TestStreamingLibraryCoverFallback(t *testing.T) {
 		Tag:        "primtag1",
 	}})
 
+	// Anonymous without tag -> 404 (H-03 / H-09)
+	recNoTag := httptest.NewRecorder()
+	mux.ServeHTTP(recNoTag, httptest.NewRequest(http.MethodGet, "/Items/"+lib.ID+"/Images/Primary", nil))
+	if recNoTag.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for anonymous library cover without tag, got %d", recNoTag.Code)
+	}
+
+	synPrim := computeSyntheticLibraryCoverTag(lib.ID, "primtag1")
 	rec = httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Items/"+lib.ID+"/Images/Primary", nil))
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Items/"+lib.ID+"/Images/Primary?tag="+synPrim, nil))
 	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), primaryBytes) {
 		t.Fatalf("expected 200 Primary fallback, got code=%d body=%q", rec.Code, rec.Body.String())
 	}
@@ -309,8 +317,9 @@ func TestStreamingLibraryCoverFallback(t *testing.T) {
 		{ItemID: movieID, ImageType: "Backdrop", ImageIndex: 0, Path: backdropPath, Tag: "bdtag1"},
 	})
 
+	synBD := computeSyntheticLibraryCoverTag(lib.ID, "bdtag1")
 	rec = httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Items/"+lib.ID+"/Images/Primary", nil))
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Items/"+lib.ID+"/Images/Primary?tag="+synBD, nil))
 	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), backdropBytes) {
 		t.Fatalf("expected 200 Backdrop fallback, got code=%d body=%q", rec.Code, rec.Body.String())
 	}

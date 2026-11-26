@@ -56,12 +56,13 @@ type liveStreamEntry struct {
 
 // Handler serves dynamic HLS playlists/segments, encoding capabilities/defaults, and LiveStreams APIs.
 type Handler struct {
-	repo           *sqlite.LibraryRepo
-	userRepo       *sqlite.UserRepo
-	mgr            *transcode.Manager
-	cfg            *config.Config
-	auth           AuthFuncs
-	streamResolver func(ctx context.Context, rawPath string) (string, error)
+	repo                      *sqlite.LibraryRepo
+	userRepo                  *sqlite.UserRepo
+	mgr                       *transcode.Manager
+	cfg                       *config.Config
+	auth                      AuthFuncs
+	streamResolver            func(ctx context.Context, rawPath string) (string, error)
+	streamResolverWithHeaders func(ctx context.Context, rawPath string) (string, map[string]string, error)
 
 	liveMu      sync.RWMutex
 	liveStreams map[string]*liveStreamEntry
@@ -85,6 +86,11 @@ func (h *Handler) SetUserRepo(r *sqlite.UserRepo) {
 // SetStreamResolver attaches a resolver (e.g. playback.Engine.ResolveStream) for .strm files.
 func (h *Handler) SetStreamResolver(fn func(ctx context.Context, rawPath string) (string, error)) {
 	h.streamResolver = fn
+}
+
+// SetStreamResolverWithHeaders attaches a resolver returning (targetURL, headers, err) for .strm files.
+func (h *Handler) SetStreamResolverWithHeaders(fn func(ctx context.Context, rawPath string) (string, map[string]string, error)) {
+	h.streamResolverWithHeaders = fn
 }
 
 func (h *Handler) callerIdentity(r *http.Request) (userID string, isAdmin bool) {
@@ -181,6 +187,172 @@ func (h *Handler) canAccessItem(r *http.Request, item *sqlite.ItemRecord) bool {
 		if err != nil || blocked {
 			return false
 		}
+		if h.isItemBlockedByExtraPolicy(r.Context(), item, u.Policy.BlockUnratedItems, u.Policy.AllowedTags) {
+			return false
+		}
+	}
+	return true
+}
+
+func (h *Handler) isItemBlockedByExtraPolicy(ctx context.Context, rec *sqlite.ItemRecord, blockUnrated, allowedTags []string) bool {
+	if rec == nil || h.repo == nil {
+		return false
+	}
+	if len(blockUnrated) > 0 && matchesUnratedType(rec.Type, rec.MediaType, blockUnrated) {
+		rating := strings.TrimSpace(rec.OfficialRating)
+		if rating == "" && rec.SeriesID != "" {
+			if sRec, err := h.repo.GetItemRecordByID(ctx, rec.SeriesID); err == nil && sRec != nil {
+				rating = strings.TrimSpace(sRec.OfficialRating)
+			}
+		}
+		if rating == "" {
+			return true
+		}
+	}
+	if len(allowedTags) > 0 {
+		if !itemHasAnyAllowedTag(ctx, h.repo, rec, allowedTags) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesUnratedType(itemType, mediaType string, blocked []string) bool {
+	if strings.EqualFold(itemType, "CollectionFolder") || strings.EqualFold(itemType, "Folder") || strings.EqualFold(itemType, "UserView") {
+		return false
+	}
+	for _, b := range blocked {
+		t := strings.TrimSpace(b)
+		if t == "" {
+			continue
+		}
+		if t == "*" || strings.EqualFold(t, "All") || strings.EqualFold(t, itemType) || (mediaType != "" && strings.EqualFold(t, mediaType)) {
+			return true
+		}
+		if strings.EqualFold(t, "Series") && (strings.EqualFold(itemType, "Season") || strings.EqualFold(itemType, "Episode")) {
+			return true
+		}
+		if strings.EqualFold(t, "Music") && (strings.EqualFold(itemType, "Audio") || strings.EqualFold(itemType, "MusicAlbum") || strings.EqualFold(mediaType, "Audio")) {
+			return true
+		}
+	}
+	return false
+}
+
+func itemHasAnyAllowedTag(ctx context.Context, repo *sqlite.LibraryRepo, rec *sqlite.ItemRecord, allowedTags []string) bool {
+	allowSet := make(map[string]bool, len(allowedTags))
+	for _, t := range allowedTags {
+		if s := strings.ToLower(strings.TrimSpace(t)); s != "" {
+			allowSet[s] = true
+		}
+	}
+	if len(allowSet) == 0 {
+		return true
+	}
+	checkDTO := func(id string) bool {
+		if strings.TrimSpace(id) == "" {
+			return false
+		}
+		it, err := repo.GetItemByID(ctx, "", "", id)
+		if err != nil || it == nil {
+			return false
+		}
+		for _, tg := range it.Tags {
+			if allowSet[strings.ToLower(strings.TrimSpace(tg))] {
+				return true
+			}
+		}
+		return false
+	}
+	if checkDTO(rec.ID) {
+		return true
+	}
+	if rec.SeriesID != "" && checkDTO(rec.SeriesID) {
+		return true
+	}
+	return false
+}
+
+func (h *Handler) callerPolicy(r *http.Request) (*dto.UserPolicy, bool) {
+	uid, isAdmin := h.callerIdentity(r)
+	if isAdmin {
+		return nil, true
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.IsAPIKey {
+		return nil, true
+	}
+	if h.userRepo != nil && uid != "" {
+		if u, err := h.userRepo.GetUserByID(r.Context(), uid); err == nil && u != nil {
+			if u.IsAdmin || u.Policy.IsAdministrator {
+				return nil, true
+			}
+			pol := u.Policy
+			return &pol, false
+		}
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil {
+		if ac.IsAdmin() {
+			return nil, true
+		}
+		pol := ac.User.Policy
+		return &pol, false
+	}
+	return nil, false
+}
+
+func (h *Handler) authorizeAndAcquireHLS(w http.ResponseWriter, r *http.Request, item *sqlite.ItemRecord, params transcode.SessionParams) bool {
+	if pol, isAdmin := h.callerPolicy(r); !isAdmin && pol != nil {
+		isAudio := item != nil && (strings.EqualFold(item.Type, "Audio") || strings.EqualFold(item.MediaType, "Audio"))
+		if isAudio {
+			if !pol.EnableAudioPlaybackTranscoding {
+				httpx.Error(w, http.StatusForbidden, "audio playback transcoding is disabled for this user")
+				return false
+			}
+		} else {
+			isRemuxOnly := strings.EqualFold(strings.TrimSpace(params.VideoCodec), "copy") &&
+				!strings.EqualFold(strings.TrimSpace(params.SubtitleMethod), "Encode")
+			if isRemuxOnly {
+				if !pol.EnablePlaybackRemuxing && !pol.EnableVideoPlaybackTranscoding {
+					httpx.Error(w, http.StatusForbidden, "playback remuxing and video transcoding are disabled for this user")
+					return false
+				}
+			} else if !pol.EnableVideoPlaybackTranscoding {
+				httpx.Error(w, http.StatusForbidden, "video playback transcoding is disabled for this user")
+				return false
+			}
+		}
+	}
+	if h.cfg != nil && h.mgr != nil {
+		if limit := h.cfg.Snapshot().SimultaneousStreamLimit; limit > 0 {
+			if _, ok := h.mgr.TryAcquireStreamSlot(limit, transcode.SessionKey(params)); !ok {
+				httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isRemoteClientRequest(r *http.Request, cfg *config.Config) bool {
+	if netutil.IsLocalOrLANRequest(r) {
+		return false
+	}
+	if cfg != nil {
+		subnets := cfg.Snapshot().LocalNetworkSubnets
+		if len(subnets) > 0 {
+			if ip, err := netip.ParseAddr(netutil.ClientIP(r)); err == nil {
+				ip = ip.Unmap()
+				for _, raw := range subnets {
+					s := strings.TrimSpace(raw)
+					if pfx, pErr := netip.ParsePrefix(s); pErr == nil && pfx.Contains(ip) {
+						return false
+					}
+					if a, aErr := netip.ParseAddr(s); aErr == nil && a.Unmap() == ip {
+						return false
+					}
+				}
+			}
+		}
 	}
 	return true
 }
@@ -273,6 +445,9 @@ func (h *Handler) handleMasterPlaylist(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadGateway, "failed to resolve stream url")
 		return
 	}
+	if !h.authorizeAndAcquireHLS(w, r, item, params) {
+		return
+	}
 
 	width, height := extractVideoDimensions(src)
 	if params.MaxWidth > 0 && (width == 0 || params.MaxWidth < width) {
@@ -330,6 +505,9 @@ func (h *Handler) handleMediaPlaylist(w http.ResponseWriter, r *http.Request) {
 	if strmErr != nil {
 		slog.Error("failed to resolve hls stream source", "item_id", item.ID, "error", strmErr)
 		httpx.Error(w, http.StatusBadGateway, "failed to resolve stream url")
+		return
+	}
+	if !h.authorizeAndAcquireHLS(w, r, item, params) {
 		return
 	}
 	if h.mgr != nil {
@@ -494,6 +672,9 @@ func (h *Handler) handleSegment(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadGateway, "failed to resolve stream url")
 		return
 	}
+	if !h.authorizeAndAcquireHLS(w, r, item, params) {
+		return
+	}
 	params.SegmentContainer = ext
 
 	segPath, err := h.mgr.GetSegment(r.Context(), params, segIdx)
@@ -546,6 +727,9 @@ func (h *Handler) handleInitSegment(w http.ResponseWriter, r *http.Request) {
 	if strmErr != nil {
 		slog.Error("failed to resolve hls stream source", "item_id", item.ID, "error", strmErr)
 		httpx.Error(w, http.StatusBadGateway, "failed to resolve stream url")
+		return
+	}
+	if !h.authorizeAndAcquireHLS(w, r, item, params) {
 		return
 	}
 	if sc := strings.ToLower(strings.TrimSpace(params.SegmentContainer)); sc != "mp4" && sc != "m4s" {
@@ -955,10 +1139,19 @@ func (h *Handler) buildSessionParamsChecked(r *http.Request, item *sqlite.ItemRe
 		}
 	}
 	var strmErr error
+	var inputHeaders map[string]string
 	// Resolve .strm file to its target URL for FFmpeg input
 	if strings.EqualFold(filepath.Ext(inputPath), ".strm") {
 		var resolved string
-		if h.streamResolver != nil {
+		if h.streamResolverWithHeaders != nil {
+			u, hdrs, err := h.streamResolverWithHeaders(r.Context(), inputPath)
+			if err != nil {
+				strmErr = err
+			} else {
+				resolved = strings.TrimSpace(u)
+				inputHeaders = hdrs
+			}
+		} else if h.streamResolver != nil {
 			u, err := h.streamResolver(r.Context(), inputPath)
 			if err != nil {
 				strmErr = err
@@ -999,13 +1192,27 @@ func (h *Handler) buildSessionParamsChecked(r *http.Request, item *sqlite.ItemRe
 	if audioBitrate > maxHLSAudioBitrate {
 		audioBitrate = maxHLSAudioBitrate
 	}
-	videoBitrate := q.Int("VideoBitrate", 0)
-	if videoBitrate <= 0 {
-		if maxStreamingBitrate := q.Int("MaxStreamingBitrate", 0); maxStreamingBitrate > 0 {
-			videoBitrate = maxStreamingBitrate - audioBitrate
-			if videoBitrate < 256_000 {
-				videoBitrate = 256_000
+	maxStreamingBitrate := q.Int("MaxStreamingBitrate", 0)
+	if h.cfg != nil {
+		if remoteLimit := h.cfg.Snapshot().RemoteClientBitrateLimit; remoteLimit > 0 && isRemoteClientRequest(r, h.cfg) {
+			if maxStreamingBitrate <= 0 || maxStreamingBitrate > remoteLimit {
+				maxStreamingBitrate = remoteLimit
 			}
+		}
+	}
+	videoBitrate := q.Int("VideoBitrate", 0)
+	if videoBitrate <= 0 && maxStreamingBitrate > 0 {
+		videoBitrate = maxStreamingBitrate - audioBitrate
+		if videoBitrate < 256_000 {
+			videoBitrate = 256_000
+		}
+	} else if maxStreamingBitrate > 0 && videoBitrate+audioBitrate > maxStreamingBitrate {
+		capped := maxStreamingBitrate - audioBitrate
+		if capped < 256_000 {
+			capped = 256_000
+		}
+		if capped < videoBitrate {
+			videoBitrate = capped
 		}
 	}
 	if videoBitrate > maxHLSVideoBitrate {
@@ -1099,6 +1306,7 @@ func (h *Handler) buildSessionParamsChecked(r *http.Request, item *sqlite.ItemRe
 		SegmentDuration:       segDur,
 		SegmentContainer:      q.Get("SegmentContainer"),
 		DurationSec:           float64(runtimeTicks) / float64(transcode.TicksPerSecond),
+		InputHeaders:          inputHeaders,
 	}, strmErr
 }
 

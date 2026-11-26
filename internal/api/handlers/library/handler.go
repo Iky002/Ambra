@@ -405,7 +405,7 @@ func (h *Handler) handleUserViews(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
-	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	pol := h.userExtendedPolicyForRequest(r, userID)
 
 	libs, err := h.repo.ListLibraries(r.Context())
 	if err != nil {
@@ -418,7 +418,7 @@ func (h *Handler) handleUserViews(w http.ResponseWriter, r *http.Request) {
 		if !isLibraryAllowed(lib.ID, allowed) {
 			continue
 		}
-		items = append(items, h.libraryToViewDto(r.Context(), lib, maxRating, blockedTags))
+		items = append(items, h.libraryToViewDto(r.Context(), lib, pol))
 	}
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
 		Items:            items,
@@ -426,20 +426,30 @@ func (h *Handler) handleUserViews(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handler) libraryToViewDto(ctx context.Context, lib sqlite.LibraryRecord, maxRating *int, blockedTags []string) dto.BaseItemDto {
+func (h *Handler) libraryToViewDto(ctx context.Context, lib sqlite.LibraryRecord, pol extendedParentalPolicy) dto.BaseItemDto {
 	imageTags := map[string]string{}
 	if img, err := h.repo.GetImageByItemAndType(ctx, lib.ID, "Primary", 0); err == nil && img != nil && img.Tag != "" {
 		imageTags["Primary"] = img.Tag
 	}
 	if imageTags["Primary"] == "" {
+		fields := []string(nil)
+		if len(pol.allowedTags) > 0 {
+			fields = []string{"Tags"}
+		}
 		if children, _, err := h.repo.QueryItems(ctx, sqlite.ItemFilter{
 			LibraryID:         lib.ID,
-			MaxParentalRating: maxRating,
-			BlockedTags:       blockedTags,
+			MaxParentalRating: pol.maxRating,
+			BlockUnratedItems: pol.blockUnratedItems,
+			BlockedTags:       pol.blockedTags,
+			AllowedTags:       pol.allowedTags,
 			IncludeItemTypes:  []string{"Movie", "Series", "MusicAlbum", "Video"},
 			Recursive:         true,
-			Limit:             12,
+			Limit:             24,
+			Fields:            fields,
 		}); err == nil {
+			if pol.hasExtraPolicy() {
+				children = h.filterDTOItemsPost(ctx, "", children, pol, nil, nil, nil, nil)
+			}
 			for _, it := range children {
 				if len(it.BackdropImageTags) > 0 && it.BackdropImageTags[0] != "" {
 					imageTags["Primary"] = it.BackdropImageTags[0]
@@ -495,9 +505,11 @@ func (h *Handler) handleQueryItems(w http.ResponseWriter, r *http.Request) {
 	isPlayed := q.Bool("IsPlayed")
 	isUnplayed := q.Bool("IsUnplayed")
 	isFav := q.Bool("IsFavorite")
+	isLiked := q.Bool("IsLiked")
 	isResumable := q.Bool("IsResumable")
 	for _, flt := range q.List("Filters") {
 		t := true
+		f := false
 		switch strings.ToLower(flt) {
 		case "isplayed":
 			isPlayed = &t
@@ -505,6 +517,10 @@ func (h *Handler) handleQueryItems(w http.ResponseWriter, r *http.Request) {
 			isUnplayed = &t
 		case "isfavorite":
 			isFav = &t
+		case "islikes", "isliked":
+			isLiked = &t
+		case "isdislikes":
+			isLiked = &f
 		case "isresumable":
 			isResumable = &t
 		}
@@ -532,7 +548,8 @@ func (h *Handler) handleQueryItems(w http.ResponseWriter, r *http.Request) {
 		return out
 	}
 
-	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	pol := h.userExtendedPolicyForRequest(r, userID)
+	isHDR, videoRanges, videoCodecs := parseVideoRangeAndHDRQuery(q, splitMulti)
 	includeTypes := q.List("IncludeItemTypes")
 	excludeTypes := q.List("ExcludeItemTypes")
 	allowedLibs := h.allowedLibrariesForRequest(r, userID)
@@ -546,13 +563,32 @@ func (h *Handler) handleQueryItems(w http.ResponseWriter, r *http.Request) {
 			excludeItemIDs = append(excludeItemIDs, hidden...)
 		}
 	}
+
+	reqStart := q.Int("StartIndex", 0)
+	reqLimit := q.Int("Limit", 0)
+	reqFields := q.List("Fields")
+	needExtraPostFilter := pol.hasExtraPolicy() || isLiked != nil || isHDR != nil || len(videoRanges) > 0 || len(videoCodecs) > 0
+	fetchStart, fetchLimit := reqStart, reqLimit
+	fetchFields := reqFields
+	if needExtraPostFilter {
+		fetchStart, fetchLimit = 0, 0
+		if len(pol.allowedTags) > 0 {
+			fetchFields = ensureFields(fetchFields, "Tags")
+		}
+		if isHDR != nil || len(videoRanges) > 0 || len(videoCodecs) > 0 {
+			fetchFields = ensureFields(fetchFields, "MediaStreams")
+		}
+	}
+
 	filter := sqlite.ItemFilter{
 		ServerID:                h.serverID(),
 		UserID:                  userID,
 		ParentID:                q.Get("ParentId"),
 		AllowedLibraryIDs:       allowedLibs,
-		MaxParentalRating:       maxRating,
-		BlockedTags:             blockedTags,
+		MaxParentalRating:       pol.maxRating,
+		BlockUnratedItems:       pol.blockUnratedItems,
+		BlockedTags:             pol.blockedTags,
+		AllowedTags:             pol.allowedTags,
 		Recursive:               rec,
 		IncludeItemTypes:        includeTypes,
 		ExcludeItemTypes:        excludeTypes,
@@ -564,16 +600,20 @@ func (h *Handler) handleQueryItems(w http.ResponseWriter, r *http.Request) {
 		StudioIDs:               splitMulti(q.List("StudioIds")),
 		Tags:                    splitMulti(q.List("Tags")),
 		OfficialRatings:         splitMulti(q.List("OfficialRatings")),
+		VideoCodecs:             videoCodecs,
+		VideoRanges:             videoRanges,
 		MinCommunityRating:      minCommunityRating,
 		PersonIDs:               q.List("PersonIds"),
 		Persons:                 q.List("Person"),
 		Years:                   years,
 		IsHD:                    q.Bool("IsHD"),
 		Is4K:                    q.Bool("Is4K"),
+		IsHDR:                   isHDR,
 		HasSubtitles:            q.Bool("HasSubtitles"),
 		IsPlayed:                isPlayed,
 		IsUnplayed:              isUnplayed,
 		IsFavorite:              isFav,
+		IsLiked:                 isLiked,
 		IsResumable:             isResumable,
 		SearchTerm:              q.Get("SearchTerm"),
 		NameStartsWith:          q.Get("NameStartsWith"),
@@ -581,9 +621,9 @@ func (h *Handler) handleQueryItems(w http.ResponseWriter, r *http.Request) {
 		NameLessThan:            q.Get("NameLessThan"),
 		SortBy:                  q.List("SortBy"),
 		SortOrder:               q.Get("SortOrder"),
-		StartIndex:              q.Int("StartIndex", 0),
-		Limit:                   q.Int("Limit", 0),
-		Fields:                  q.List("Fields"),
+		StartIndex:              fetchStart,
+		Limit:                   fetchLimit,
+		Fields:                  fetchFields,
 		EnableTotalRecordCount:  q.Bool("EnableTotalRecordCount"),
 	}
 
@@ -592,6 +632,18 @@ func (h *Handler) handleQueryItems(w http.ResponseWriter, r *http.Request) {
 		slog.Error("internal error in library handler", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
+	}
+	if needExtraPostFilter {
+		items = h.filterDTOItemsPost(r.Context(), userID, items, pol, isLiked, isHDR, videoRanges, videoCodecs)
+		total = len(items)
+		if reqStart > len(items) {
+			items = []dto.BaseItemDto{}
+		} else if reqStart > 0 {
+			items = items[reqStart:]
+		}
+		if reqLimit > 0 && len(items) > reqLimit {
+			items = items[:reqLimit]
+		}
 	}
 	if mayReturnPlaylists && h.isNonAdminCaller(r) {
 		filtered := make([]dto.BaseItemDto, 0, len(items))
@@ -634,23 +686,41 @@ func (h *Handler) handleLatestItems(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
-	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	pol := h.userExtendedPolicyForRequest(r, userID)
+	reqLimit := q.Int("Limit", 16)
+	fetchLimit := reqLimit
+	fields := q.List("Fields")
+	if pol.hasExtraPolicy() {
+		fetchLimit = reqLimit * 4
+		if fetchLimit < 64 {
+			fetchLimit = 64
+		}
+		if len(pol.allowedTags) > 0 {
+			fields = ensureFields(fields, "Tags")
+		}
+	}
 	items, err := h.repo.GetLatestItemsWithPolicy(
 		r.Context(),
 		h.serverID(),
 		userID,
 		q.Get("ParentId"),
 		q.List("IncludeItemTypes"),
-		q.Int("Limit", 16),
-		q.List("Fields"),
+		fetchLimit,
+		fields,
 		allowed,
-		maxRating,
-		blockedTags,
+		pol.maxRating,
+		pol.blockedTags,
 	)
 	if err != nil {
 		slog.Error("internal error in library handler", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
+	}
+	if pol.hasExtraPolicy() {
+		items = h.filterDTOItemsPost(r.Context(), userID, items, pol, nil, nil, nil, nil)
+		if reqLimit > 0 && len(items) > reqLimit {
+			items = items[:reqLimit]
+		}
 	}
 	// Emby /Items/Latest returns a bare JSON array
 	h.sanitizeItemsPathsForCaller(r, items)
@@ -665,24 +735,46 @@ func (h *Handler) handleResumeItems(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
-	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	pol := h.userExtendedPolicyForRequest(r, userID)
+	reqStart := q.Int("StartIndex", 0)
+	reqLimit := q.Int("Limit", 20)
+	fetchStart, fetchLimit := reqStart, reqLimit
+	fields := q.List("Fields")
+	if pol.hasExtraPolicy() {
+		fetchStart, fetchLimit = 0, 200
+		if len(pol.allowedTags) > 0 {
+			fields = ensureFields(fields, "Tags")
+		}
+	}
 	items, total, err := h.repo.GetResumeItemsWithPolicy(
 		r.Context(),
 		h.serverID(),
 		userID,
 		q.Get("ParentId"),
 		q.List("IncludeItemTypes"),
-		q.Int("StartIndex", 0),
-		q.Int("Limit", 20),
-		q.List("Fields"),
+		fetchStart,
+		fetchLimit,
+		fields,
 		allowed,
-		maxRating,
-		blockedTags,
+		pol.maxRating,
+		pol.blockedTags,
 	)
 	if err != nil {
 		slog.Error("internal error in library handler", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
+	}
+	if pol.hasExtraPolicy() {
+		items = h.filterDTOItemsPost(r.Context(), userID, items, pol, nil, nil, nil, nil)
+		total = len(items)
+		if reqStart > len(items) {
+			items = []dto.BaseItemDto{}
+		} else if reqStart > 0 {
+			items = items[reqStart:]
+		}
+		if reqLimit > 0 && len(items) > reqLimit {
+			items = items[:reqLimit]
+		}
 	}
 	h.sanitizeItemsPathsForCaller(r, items)
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
@@ -704,7 +796,7 @@ func (h *Handler) handleGetItem(w http.ResponseWriter, r *http.Request) {
 	userID := h.resolveUserID(r, q)
 	itemID := r.PathValue("Id")
 	allowed := h.allowedLibrariesForRequest(r, userID)
-	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	pol := h.userExtendedPolicyForRequest(r, userID)
 	item, err := h.repo.GetItemByID(r.Context(), h.serverID(), userID, itemID)
 	if errors.Is(err, sqlite.ErrNotFound) {
 		if lib, libErr := h.repo.GetLibrary(r.Context(), itemID); libErr == nil && lib != nil {
@@ -712,7 +804,7 @@ func (h *Handler) handleGetItem(w http.ResponseWriter, r *http.Request) {
 				httpx.Error(w, http.StatusForbidden, "access denied")
 				return
 			}
-			httpx.JSON(w, http.StatusOK, h.libraryToViewDto(r.Context(), *lib, maxRating, blockedTags))
+			httpx.JSON(w, http.StatusOK, h.libraryToViewDto(r.Context(), *lib, pol))
 			return
 		}
 		httpx.Error(w, http.StatusNotFound, "item not found")
@@ -739,8 +831,8 @@ func (h *Handler) handleGetItem(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusForbidden, "access denied")
 			return
 		}
-		if maxRating != nil || len(blockedTags) > 0 {
-			if blocked, blockErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags); blockErr != nil {
+		if pol.maxRating != nil || len(pol.blockedTags) > 0 {
+			if blocked, blockErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, pol.maxRating, pol.blockedTags); blockErr != nil {
 				slog.Error("failed to check parental policy", "item_id", rec.ID, "error", blockErr)
 				httpx.Error(w, http.StatusInternalServerError, "failed to verify item access")
 				return
@@ -748,6 +840,10 @@ func (h *Handler) handleGetItem(w http.ResponseWriter, r *http.Request) {
 				httpx.Error(w, http.StatusForbidden, "access denied")
 				return
 			}
+		}
+		if h.isRecordBlockedByExtraPolicy(r.Context(), rec, pol) {
+			httpx.Error(w, http.StatusForbidden, "access denied")
+			return
 		}
 	}
 	if item != nil && len(item.MediaSources) > 0 {
@@ -782,10 +878,11 @@ func (h *Handler) handleItemCounts(w http.ResponseWriter, r *http.Request) {
 	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
-	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	pol := h.userExtendedPolicyForRequest(r, userID)
 	isFav := q.Bool("IsFavorite")
+	isLiked := q.Bool("IsLiked")
 
-	if maxRating == nil && len(blockedTags) == 0 && isFav == nil {
+	if pol.maxRating == nil && len(pol.blockedTags) == 0 && !pol.hasExtraPolicy() && isFav == nil && isLiked == nil {
 		counts, err := h.repo.GetItemCountsWithAllowedLibraries(r.Context(), allowed)
 		if err != nil {
 			slog.Error("internal error in library handler", "error", err)
@@ -797,21 +894,32 @@ func (h *Handler) handleItemCounts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	disableTotal := false
+	var countFields []string
+	if len(pol.allowedTags) > 0 {
+		countFields = []string{"Tags"}
+	}
 	items, _, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
 		ServerID:               h.serverID(),
 		UserID:                 userID,
 		AllowedLibraryIDs:      allowed,
-		MaxParentalRating:      maxRating,
-		BlockedTags:            blockedTags,
+		MaxParentalRating:      pol.maxRating,
+		BlockUnratedItems:      pol.blockUnratedItems,
+		BlockedTags:            pol.blockedTags,
+		AllowedTags:            pol.allowedTags,
 		IsFavorite:             isFav,
+		IsLiked:                isLiked,
 		Recursive:              true,
 		Limit:                  maxItemCountsScan,
+		Fields:                 countFields,
 		EnableTotalRecordCount: &disableTotal,
 	})
 	if err != nil {
 		slog.Error("internal error in library handler", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
+	}
+	if pol.hasExtraPolicy() || isLiked != nil {
+		items = h.filterDTOItemsPost(r.Context(), userID, items, pol, isLiked, nil, nil, nil)
 	}
 	c := &sqlite.ItemCounts{}
 	for _, it := range items {
@@ -856,15 +964,15 @@ func (h *Handler) handleShowSeasons(w http.ResponseWriter, r *http.Request) {
 	seriesID := r.PathValue("Id")
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
-	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
-	if allowed != nil || maxRating != nil || len(blockedTags) > 0 {
+	pol := h.userExtendedPolicyForRequest(r, userID)
+	if allowed != nil || pol.maxRating != nil || len(pol.blockedTags) > 0 || pol.hasExtraPolicy() {
 		if rec, recErr := h.repo.GetItemRecordByID(r.Context(), seriesID); recErr == nil && rec != nil {
 			if allowed != nil && rec.LibraryID != "" && !isLibraryAllowed(rec.LibraryID, allowed) {
 				httpx.Error(w, http.StatusForbidden, "access denied")
 				return
 			}
-			if maxRating != nil || len(blockedTags) > 0 {
-				if blocked, blockErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags); blockErr != nil {
+			if pol.maxRating != nil || len(pol.blockedTags) > 0 {
+				if blocked, blockErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, pol.maxRating, pol.blockedTags); blockErr != nil {
 					slog.Error("failed to check parental policy", "item_id", rec.ID, "error", blockErr)
 					httpx.Error(w, http.StatusInternalServerError, "failed to verify item access")
 					return
@@ -873,52 +981,67 @@ func (h *Handler) handleShowSeasons(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+			if h.isRecordBlockedByExtraPolicy(r.Context(), rec, pol) {
+				httpx.Error(w, http.StatusForbidden, "access denied")
+				return
+			}
 		}
 	}
 	startIndex := q.Int("StartIndex", 0)
 	limit := q.Int("Limit", 0)
 	isSpecial := q.Bool("IsSpecialSeason")
 	fetchStart, fetchLimit := startIndex, limit
-	if isSpecial != nil {
+	if isSpecial != nil || pol.hasExtraPolicy() {
 		fetchStart, fetchLimit = 0, 0
+	}
+	fields := q.List("Fields")
+	if len(pol.allowedTags) > 0 {
+		fields = ensureFields(fields, "Tags")
 	}
 	items, total, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
 		ServerID:          h.serverID(),
 		UserID:            userID,
 		SeriesID:          seriesID,
 		AllowedLibraryIDs: allowed,
-		MaxParentalRating: maxRating,
-		BlockedTags:       blockedTags,
+		MaxParentalRating: pol.maxRating,
+		BlockUnratedItems: pol.blockUnratedItems,
+		BlockedTags:       pol.blockedTags,
+		AllowedTags:       pol.allowedTags,
 		IncludeItemTypes:  []string{"Season"},
 		SortBy:            []string{"IndexNumber"},
 		SortOrder:         "Ascending",
 		StartIndex:        fetchStart,
 		Limit:             fetchLimit,
-		Fields:            q.List("Fields"),
+		Fields:            fields,
 	})
 	if err != nil {
 		slog.Error("internal error in library handler", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
-	if isSpecial != nil {
-		filtered := make([]dto.BaseItemDto, 0, len(items))
-		for _, it := range items {
-			special := it.IndexNumber != nil && *it.IndexNumber == 0
-			if special == *isSpecial {
-				filtered = append(filtered, it)
+	if isSpecial != nil || pol.hasExtraPolicy() {
+		if pol.hasExtraPolicy() {
+			items = h.filterDTOItemsPost(r.Context(), userID, items, pol, nil, nil, nil, nil)
+		}
+		if isSpecial != nil {
+			filtered := make([]dto.BaseItemDto, 0, len(items))
+			for _, it := range items {
+				special := it.IndexNumber != nil && *it.IndexNumber == 0
+				if special == *isSpecial {
+					filtered = append(filtered, it)
+				}
 			}
+			items = filtered
 		}
-		total = len(filtered)
-		if startIndex > len(filtered) {
-			filtered = []dto.BaseItemDto{}
+		total = len(items)
+		if startIndex > len(items) {
+			items = []dto.BaseItemDto{}
 		} else if startIndex > 0 {
-			filtered = filtered[startIndex:]
+			items = items[startIndex:]
 		}
-		if limit > 0 && len(filtered) > limit {
-			filtered = filtered[:limit]
+		if limit > 0 && len(items) > limit {
+			items = items[:limit]
 		}
-		items = filtered
 	}
 	h.sanitizeItemsPathsForCaller(r, items)
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
@@ -936,15 +1059,15 @@ func (h *Handler) handleShowEpisodes(w http.ResponseWriter, r *http.Request) {
 	seriesID := r.PathValue("Id")
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
-	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
-	if allowed != nil || maxRating != nil || len(blockedTags) > 0 {
+	pol := h.userExtendedPolicyForRequest(r, userID)
+	if allowed != nil || pol.maxRating != nil || len(pol.blockedTags) > 0 || pol.hasExtraPolicy() {
 		if rec, recErr := h.repo.GetItemRecordByID(r.Context(), seriesID); recErr == nil && rec != nil {
 			if allowed != nil && rec.LibraryID != "" && !isLibraryAllowed(rec.LibraryID, allowed) {
 				httpx.Error(w, http.StatusForbidden, "access denied")
 				return
 			}
-			if maxRating != nil || len(blockedTags) > 0 {
-				if blocked, blockErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags); blockErr != nil {
+			if pol.maxRating != nil || len(pol.blockedTags) > 0 {
+				if blocked, blockErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, pol.maxRating, pol.blockedTags); blockErr != nil {
 					slog.Error("failed to check parental policy", "item_id", rec.ID, "error", blockErr)
 					httpx.Error(w, http.StatusInternalServerError, "failed to verify item access")
 					return
@@ -952,6 +1075,10 @@ func (h *Handler) handleShowEpisodes(w http.ResponseWriter, r *http.Request) {
 					httpx.Error(w, http.StatusForbidden, "access denied")
 					return
 				}
+			}
+			if h.isRecordBlockedByExtraPolicy(r.Context(), rec, pol) {
+				httpx.Error(w, http.StatusForbidden, "access denied")
+				return
 			}
 		}
 	}
@@ -975,11 +1102,15 @@ func (h *Handler) handleShowEpisodes(w http.ResponseWriter, r *http.Request) {
 	startItemID := guid.Normalize(q.Get("StartItemId"))
 	startIndex := q.Int("StartIndex", 0)
 	limit := q.Int("Limit", 0)
-	needPostFilter := seasonFilter != nil || adjacentTo != "" || startItemID != ""
+	needPostFilter := seasonFilter != nil || adjacentTo != "" || startItemID != "" || pol.hasExtraPolicy()
 
 	fetchStart, fetchLimit := startIndex, limit
 	if needPostFilter {
 		fetchStart, fetchLimit = 0, 0
+	}
+	epFields := q.List("Fields")
+	if len(pol.allowedTags) > 0 {
+		epFields = ensureFields(epFields, "Tags")
 	}
 
 	items, total, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
@@ -988,14 +1119,16 @@ func (h *Handler) handleShowEpisodes(w http.ResponseWriter, r *http.Request) {
 		SeriesID:          seriesID,
 		SeasonID:          q.Get("SeasonId"),
 		AllowedLibraryIDs: allowed,
-		MaxParentalRating: maxRating,
-		BlockedTags:       blockedTags,
+		MaxParentalRating: pol.maxRating,
+		BlockUnratedItems: pol.blockUnratedItems,
+		BlockedTags:       pol.blockedTags,
+		AllowedTags:       pol.allowedTags,
 		IncludeItemTypes:  []string{"Episode"},
 		SortBy:            sortBy,
 		SortOrder:         sortOrder,
 		StartIndex:        fetchStart,
 		Limit:             fetchLimit,
-		Fields:            q.List("Fields"),
+		Fields:            epFields,
 	})
 	if err != nil {
 		slog.Error("internal error in library handler", "error", err)
@@ -1004,6 +1137,9 @@ func (h *Handler) handleShowEpisodes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if needPostFilter {
+		if pol.hasExtraPolicy() {
+			items = h.filterDTOItemsPost(r.Context(), userID, items, pol, nil, nil, nil, nil)
+		}
 		if seasonFilter != nil {
 			filtered := make([]dto.BaseItemDto, 0, len(items))
 			for _, it := range items {
@@ -1073,22 +1209,41 @@ func (h *Handler) handleNextUp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := h.resolveUserID(r, q)
-	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	pol := h.userExtendedPolicyForRequest(r, userID)
+	reqLimit := q.Int("Limit", 20)
+	fetchLimit := reqLimit
+	fields := q.List("Fields")
+	if pol.hasExtraPolicy() {
+		fetchLimit = reqLimit * 4
+		if fetchLimit < 80 {
+			fetchLimit = 80
+		}
+		if len(pol.allowedTags) > 0 {
+			fields = ensureFields(fields, "Tags")
+		}
+	}
 	items, total, err := h.repo.GetNextUpEpisodesWithPolicy(
 		r.Context(),
 		h.serverID(),
 		userID,
 		q.Get("SeriesId"),
-		q.Int("Limit", 20),
-		q.List("Fields"),
+		fetchLimit,
+		fields,
 		h.allowedLibrariesForRequest(r, userID),
-		maxRating,
-		blockedTags,
+		pol.maxRating,
+		pol.blockedTags,
 	)
 	if err != nil {
 		slog.Error("internal error in library handler", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
+	}
+	if pol.hasExtraPolicy() {
+		items = h.filterDTOItemsPost(r.Context(), userID, items, pol, nil, nil, nil, nil)
+		total = len(items)
+		if reqLimit > 0 && len(items) > reqLimit {
+			items = items[:reqLimit]
+		}
 	}
 	h.sanitizeItemsPathsForCaller(r, items)
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
@@ -1104,7 +1259,7 @@ func (h *Handler) handleSearchHints(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := h.resolveUserID(r, q)
-	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	pol := h.userExtendedPolicyForRequest(r, userID)
 	includeTypes := q.List("IncludeItemTypes")
 	allowedLibs := h.allowedLibrariesForRequest(r, userID)
 	mayReturnPlaylists := queryIncludesPlaylists(includeTypes, nil)
@@ -1131,12 +1286,17 @@ func (h *Handler) handleSearchHints(w http.ResponseWriter, r *http.Request) {
 			fetchLimit = reqLimit + len(hidden)
 		}
 	}
+	if pol.hasExtraPolicy() {
+		fetchLimit = 200
+	}
 	hints, total, err := h.repo.SearchHints(r.Context(), sqlite.SearchHintFilter{
 		UserID:            userID,
 		ParentID:          q.Get("ParentId"),
 		AllowedLibraryIDs: allowedLibs,
-		MaxParentalRating: maxRating,
-		BlockedTags:       blockedTags,
+		MaxParentalRating: pol.maxRating,
+		BlockUnratedItems: pol.blockUnratedItems,
+		BlockedTags:       pol.blockedTags,
+		AllowedTags:       pol.allowedTags,
 		SearchTerm:        q.Get("SearchTerm"),
 		IncludeItemTypes:  includeTypes,
 		Limit:             fetchLimit,
@@ -1146,28 +1306,35 @@ func (h *Handler) handleSearchHints(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "failed to search hints")
 		return
 	}
-	if nonAdmin {
+	if nonAdmin || pol.hasExtraPolicy() {
 		filtered := make([]dto.SearchHint, 0, len(hints))
 		for _, hint := range hints {
-			if strings.EqualFold(hint.Type, "Playlist") {
+			var rec *sqlite.ItemRecord
+			if strings.EqualFold(hint.Type, "Playlist") || pol.hasExtraPolicy() {
+				rec, _ = h.repo.GetItemRecordByID(r.Context(), hint.Id)
+			}
+			if nonAdmin && strings.EqualFold(hint.Type, "Playlist") {
 				if hiddenSet[guid.Normalize(hint.Id)] {
 					continue
 				}
 				parentID := ""
-				if rec, recErr := h.repo.GetItemRecordByID(r.Context(), hint.Id); recErr == nil && rec != nil {
+				if rec != nil {
 					parentID = rec.ParentID
 				}
 				if !h.canViewPlaylist(r, hint.Id, parentID) {
 					continue
 				}
 			}
+			if pol.hasExtraPolicy() && rec != nil && h.isRecordBlockedByExtraPolicy(r.Context(), rec, pol) {
+				continue
+			}
 			filtered = append(filtered, hint)
 		}
+		total = len(filtered)
 		if len(filtered) > reqLimit {
 			filtered = filtered[:reqLimit]
 		}
 		hints = filtered
-		total = len(hints)
 	}
 	httpx.JSON(w, http.StatusOK, dto.SearchHintResult{
 		SearchHints:      hints,
@@ -1302,9 +1469,9 @@ func (h *Handler) canAccessItem(r *http.Request, fallbackUserID, itemID string) 
 		return true, nil
 	}
 	allowed := h.allowedLibrariesForRequest(r, fallbackUserID)
-	maxRating, blockedTags := h.userParentalPolicyForRequest(r, fallbackUserID)
+	pol := h.userExtendedPolicyForRequest(r, fallbackUserID)
 	nonAdmin := h.isNonAdminCaller(r)
-	if !nonAdmin && allowed == nil && maxRating == nil && len(blockedTags) == 0 {
+	if !nonAdmin && allowed == nil && pol.maxRating == nil && len(pol.blockedTags) == 0 && !pol.hasExtraPolicy() {
 		return true, nil
 	}
 	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
@@ -1324,14 +1491,17 @@ func (h *Handler) canAccessItem(r *http.Request, fallbackUserID, itemID string) 
 	} else if allowed != nil && rec.LibraryID != "" && !isLibraryAllowed(rec.LibraryID, allowed) {
 		return false, nil
 	}
-	if maxRating != nil || len(blockedTags) > 0 {
-		blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags)
+	if pol.maxRating != nil || len(pol.blockedTags) > 0 {
+		blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, pol.maxRating, pol.blockedTags)
 		if bErr != nil {
 			return false, bErr
 		}
 		if blocked {
 			return false, nil
 		}
+	}
+	if h.isRecordBlockedByExtraPolicy(r.Context(), rec, pol) {
+		return false, nil
 	}
 	return true, nil
 }
