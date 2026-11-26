@@ -153,14 +153,30 @@ export function MigrationTab() {
   const [cancelling, setCancelling] = useState(false)
   const [liveReport, setLiveReport] = useState<MigrationReport | null>(null)
   const demoTimerRef = useRef<number | null>(null)
+  const pollSeqRef = useRef(0)
+
+  const validateSourceUrl = (rawUrl: string): string | null => {
+    const trimmed = rawUrl.trim()
+    if (!trimmed) return '请先填写旧 Emby 服务器地址和 API Key'
+    try {
+      const parsed = new URL(trimmed)
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return '旧 Emby 服务器地址必须使用 http:// 或 https:// 协议'
+      }
+      return null
+    } catch {
+      return '旧 Emby 服务器地址格式无效，请填写完整的 http:// 或 https:// 地址'
+    }
+  }
 
   // 初始拉取当前后端迁移状态（如果有正在进行或最近完成的任务）
   useEffect(() => {
     if (demo) return
     let mounted = true
+    const reqSeq = ++pollSeqRef.current
     embyFetch<MigrationReport>('/api/admin/migration/status')
       .then((rep) => {
-        if (!mounted || !rep || rep.status === 'idle') return
+        if (!mounted || reqSeq !== pollSeqRef.current || !rep || rep.status === 'idle') return
         setLiveReport(rep)
         if (rep.status === 'running') {
           setStep(3)
@@ -177,9 +193,12 @@ export function MigrationTab() {
   // 运行中轮询进度
   useEffect(() => {
     if (demo || !liveReport || liveReport.status !== 'running') return
+    let cancelled = false
     const timer = window.setInterval(() => {
+      const reqSeq = ++pollSeqRef.current
       embyFetch<MigrationReport>('/api/admin/migration/status')
         .then((rep) => {
+          if (cancelled || reqSeq !== pollSeqRef.current) return
           setLiveReport(rep)
           if (rep.status === 'completed') {
             setFeedback({
@@ -197,7 +216,10 @@ export function MigrationTab() {
           // 忽略单次轮询波动
         })
     }, 1200)
-    return () => window.clearInterval(timer)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
   }, [demo, liveReport?.status])
 
   useEffect(() => {
@@ -241,6 +263,11 @@ export function MigrationTab() {
       setFeedback({ type: 'error', message: '请先填写旧 Emby 服务器地址和 API Key' })
       return
     }
+    const urlErr = validateSourceUrl(sourceURL)
+    if (urlErr) {
+      setFeedback({ type: 'error', message: urlErr })
+      return
+    }
     setTesting(true)
     try {
       let res: SourceTestResult
@@ -272,6 +299,11 @@ export function MigrationTab() {
 
   const handleDryRun = async () => {
     setFeedback(null)
+    const urlErr = validateSourceUrl(sourceURL)
+    if (urlErr) {
+      setFeedback({ type: 'error', message: urlErr })
+      return
+    }
     if (selectedUserIDs.length === 0) {
       setFeedback({ type: 'error', message: '请至少勾选一个需要迁移的用户' })
       return
@@ -333,10 +365,16 @@ export function MigrationTab() {
 
   const handleStartMigration = async () => {
     setFeedback(null)
+    const urlErr = validateSourceUrl(sourceURL)
+    if (urlErr) {
+      setFeedback({ type: 'error', message: urlErr })
+      return
+    }
     if (selectedUserIDs.length === 0) {
       setFeedback({ type: 'error', message: '请至少勾选一个需要迁移的用户' })
       return
     }
+    pollSeqRef.current += 1
     setStarting(true)
     setStep(3)
     try {
@@ -432,6 +470,7 @@ export function MigrationTab() {
   }
 
   const handleCancelMigration = async () => {
+    pollSeqRef.current += 1
     setCancelling(true)
     try {
       if (demo) {
@@ -450,6 +489,7 @@ export function MigrationTab() {
           '/api/admin/migration/cancel',
           { method: 'POST' },
         )
+        pollSeqRef.current += 1
         setLiveReport(res.report)
         setFeedback({
           type: 'success',

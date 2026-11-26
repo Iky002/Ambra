@@ -102,6 +102,7 @@ type Server struct {
 
 	dvrCancel        context.CancelFunc
 	dvrDone          chan struct{}
+	stopTrakt        func()
 	opsHandler       *ops.Handler
 	migrationHandler *migrationhandler.Handler
 }
@@ -139,10 +140,13 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	userRepo := sqlite.NewUserRepo(store)
 	traktPlugin.SetUserConfigStore(userRepo)
 	libRepo := sqlite.NewLibraryRepo(store)
-	traktPlugin.SubscribeEvents(bus, libRepo)
+	stopTrakt := traktPlugin.SubscribeEvents(bus, libRepo)
 
 	authSvc := auth.NewService(userRepo, cfg)
 	if err := authSvc.EnsureDefaultAdmin(ctx); err != nil {
+		if stopTrakt != nil {
+			stopTrakt()
+		}
 		if wHost != nil {
 			_ = wHost.Close(context.Background())
 		}
@@ -438,6 +442,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 
 	// Phase 6: DLNA UPnP MediaServer, Rankings, Migration & Governance Admin APIs
 	dlnaH := dlna.New(cfg, libRepo, store)
+	dlnaH.SetUserRepo(userRepo)
 	bus.Subscribe(eventbus.EventLibraryChanged, func(context.Context, eventbus.Event) {
 		dlnaH.BumpSystemUpdate()
 	})
@@ -463,6 +468,9 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		BudgetPool: bgBudget,
 	})
 	if err != nil {
+		if stopTrakt != nil {
+			stopTrakt()
+		}
 		if libWatcher != nil {
 			_ = libWatcher.Close()
 		}
@@ -596,6 +604,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		Handler:      r,
 		dvrCancel:        dvrCancel,
 		dvrDone:          dvrDone,
+		stopTrakt:        stopTrakt,
 		opsHandler:       opsH,
 		migrationHandler: migrationH,
 	}, nil
@@ -720,6 +729,14 @@ func (s *Server) Close() error {
 	if s.Transcode != nil {
 		s.Transcode.Close()
 	}
+	if s.stopTrakt != nil {
+		s.stopTrakt()
+	}
+	if s.Scheduler != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = s.Scheduler.Shutdown(shutdownCtx)
+		cancel()
+	}
 	if s.WasmHost != nil {
 		_ = s.WasmHost.Close(context.Background())
 	}
@@ -842,11 +859,17 @@ func buildWSLibraryChangeFilter(userRepo *sqlite.UserRepo, libRepo *sqlite.Libra
 			return nil, false
 		}
 
+		hasContentPolicy := user.Policy.MaxParentalRating != nil || len(user.Policy.BlockedTags) > 0
+
 		// Filter any explicit item ID slices so restricted item IDs are never disclosed.
+		// ItemsRemoved cannot be checked via itemChecker because the rows are already deleted;
+		// preserve removed IDs only when the user has library access and no parental/tag restrictions,
+		// otherwise clear ItemsRemoved while preserving the library-level refresh signal.
 		hasIDLists := false
 		filteredLists := make(map[string][]string)
 		anyVisibleID := false
-		for _, key := range []string{"ItemsAdded", "ItemsUpdated", "ItemsRemoved"} {
+		keepRemovedSignal := false
+		for _, key := range []string{"ItemsAdded", "ItemsUpdated"} {
 			rawIDs, ok := m[key].([]string)
 			if !ok {
 				continue
@@ -863,8 +886,23 @@ func buildWSLibraryChangeFilter(userRepo *sqlite.UserRepo, libRepo *sqlite.Libra
 				anyVisibleID = true
 			}
 		}
+		if rawRemoved, ok := m["ItemsRemoved"].([]string); ok {
+			hasIDLists = true
+			canKnowLibraryScope := libID != "" || user.Policy.EnableAllFolders
+			if len(rawRemoved) > 0 && canKnowLibraryScope {
+				if !hasContentPolicy {
+					filteredLists["ItemsRemoved"] = append([]string(nil), rawRemoved...)
+					anyVisibleID = true
+				} else {
+					filteredLists["ItemsRemoved"] = []string{}
+					keepRemovedSignal = true
+				}
+			} else {
+				filteredLists["ItemsRemoved"] = []string{}
+			}
+		}
 		if hasIDLists {
-			if !anyVisibleID {
+			if !anyVisibleID && !keepRemovedSignal {
 				return nil, false
 			}
 			out := make(map[string]any, len(filteredLists)+1)
@@ -879,7 +917,6 @@ func buildWSLibraryChangeFilter(userRepo *sqlite.UserRepo, libRepo *sqlite.Libra
 
 		// For library-scoped scan summaries, emit only safe metadata without restricted counts when parental/tag policies apply.
 		if libID != "" {
-			hasContentPolicy := user.Policy.MaxParentalRating != nil || len(user.Policy.BlockedTags) > 0
 			if hasContentPolicy {
 				out := map[string]any{"LibraryId": libID}
 				if phase, ok := m["Phase"].(string); ok && phase != "" {

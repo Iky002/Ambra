@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
@@ -34,15 +36,20 @@ import (
 )
 
 const (
-	profilesStoreKey      = "dlna:profiles"
-	defaultProfileID      = "default"
-	defaultSubTimeout     = 1800
-	minSubTimeout         = 60
-	maxSubTimeout         = 86400
-	maxDLNASubscriptions  = 256
-	maxDLNARequestedCount = 500
-	dlnaStreamTokenTTL    = 24 * time.Hour
-	defaultServerHeader   = "Ambra/4.10.2.0 UPnP/1.0 DLNADOC/1.50"
+	profilesStoreKey          = "dlna:profiles"
+	defaultProfileID          = "default"
+	defaultSubTimeout         = 1800
+	minSubTimeout             = 60
+	maxSubTimeout             = 86400
+	maxDLNASubscriptions      = 256
+	maxDLNASubscriptionsPerIP = 16
+	maxDLNACallbackLen        = 1024
+	maxDLNASOAPPerIPPerMin    = 120
+	dlnaSOAPRateWindow        = time.Minute
+	maxDLNARateBuckets        = 4096
+	maxDLNARequestedCount     = 500
+	dlnaStreamTokenTTL        = 24 * time.Hour
+	defaultServerHeader       = "Ambra/4.10.2.0 UPnP/1.0 DLNADOC/1.50"
 )
 
 // AuthFuncs decouples route registration from the concrete middleware package.
@@ -91,16 +98,27 @@ type eventSubscription struct {
 	Service   string
 	UUID      string
 	Callback  string
+	ClientIP  string
 	ExpiresAt time.Time
+}
+
+type dlnaRateWindow struct {
+	count   int
+	resetAt time.Time
 }
 
 // Handler implements Emby-compatible DLNA Profile management and UPnP MediaServer:1 endpoints.
 type Handler struct {
-	cfg          *config.Config
-	libRepo      *sqlite.LibraryRepo
-	store        *sqlite.Store
-	auth         AuthFuncs
-	streamSecret []byte
+	cfg           *config.Config
+	libRepo       *sqlite.LibraryRepo
+	store         *sqlite.Store
+	userRepo      *sqlite.UserRepo
+	defaultUserID string
+	auth          AuthFuncs
+	streamSecret  []byte
+
+	soapRateMu sync.Mutex
+	soapRates  map[string]*dlnaRateWindow
 
 	mu            sync.RWMutex
 	profiles      map[string]DlnaProfile
@@ -124,6 +142,7 @@ func New(cfg *config.Config, libRepo *sqlite.LibraryRepo, store *sqlite.Store) *
 		libRepo:       libRepo,
 		store:         store,
 		streamSecret:  secretSum[:],
+		soapRates:     make(map[string]*dlnaRateWindow),
 		profiles:      make(map[string]DlnaProfile),
 		subscriptions: make(map[string]eventSubscription),
 		systemUpdate:  1,
@@ -132,6 +151,20 @@ func New(cfg *config.Config, libRepo *sqlite.LibraryRepo, store *sqlite.Store) *
 	h.profiles[def.Id] = def
 	h.loadPersistedProfiles(context.Background())
 	return h
+}
+
+// SetUserRepo attaches a UserRepo for optional default-user DLNA policy filtering.
+func (h *Handler) SetUserRepo(r *sqlite.UserRepo) {
+	h.mu.Lock()
+	h.userRepo = r
+	h.mu.Unlock()
+}
+
+// SetDefaultUserID binds an optional default user whose folder/parental/tag policy is enforced for DLNA browsing & streaming.
+func (h *Handler) SetDefaultUserID(userID string) {
+	h.mu.Lock()
+	h.defaultUserID = guid.Normalize(userID)
+	h.mu.Unlock()
 }
 
 // DefaultProfile returns the built-in default DLNA device profile.
@@ -334,8 +367,16 @@ func (h *Handler) handleCreateProfile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.Lock()
+	prev, hadPrev := h.profiles[p.Id]
 	h.profiles[p.Id] = p
 	err := h.persistProfilesLocked(r.Context())
+	if err != nil {
+		if hadPrev {
+			h.profiles[p.Id] = prev
+		} else {
+			delete(h.profiles, p.Id)
+		}
+	}
 	h.mu.Unlock()
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -396,13 +437,17 @@ func (h *Handler) handleDeleteProfile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.Lock()
-	if _, ok := h.profiles[id]; !ok {
+	existing, ok := h.profiles[id]
+	if !ok {
 		h.mu.Unlock()
 		httpx.Error(w, http.StatusNotFound, "dlna profile not found")
 		return
 	}
 	delete(h.profiles, id)
 	err := h.persistProfilesLocked(r.Context())
+	if err != nil {
+		h.profiles[id] = existing
+	}
 	h.mu.Unlock()
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -541,7 +586,7 @@ func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mediaPath, err := h.resolveDLNAMediaPath(r.Context(), itemID)
+	item, mediaPath, err := h.resolveDLNAMediaPath(r.Context(), itemID)
 	if errors.Is(err, sqlite.ErrNotFound) {
 		httpx.Error(w, http.StatusNotFound, "media item not found")
 		return
@@ -551,12 +596,31 @@ func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "failed to load media item")
 		return
 	}
-	if strings.EqualFold(filepath.Ext(mediaPath), ".strm") {
+	if (item != nil && item.IsStrm) || strings.EqualFold(filepath.Ext(mediaPath), ".strm") {
 		httpx.Error(w, http.StatusForbidden, "direct download of .strm files is not permitted")
 		return
 	}
 
-	f, err := os.Open(mediaPath)
+	realPath, err := filepath.EvalSymlinks(mediaPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			httpx.Error(w, http.StatusNotFound, "media file missing on disk")
+			return
+		}
+		httpx.Error(w, http.StatusForbidden, "media file path is not accessible")
+		return
+	}
+	realPath = filepath.Clean(realPath)
+	if strings.EqualFold(filepath.Ext(realPath), ".strm") {
+		httpx.Error(w, http.StatusForbidden, "direct download of .strm files is not permitted")
+		return
+	}
+	if !h.isPathWithinRegisteredLibraries(r.Context(), realPath) {
+		httpx.Error(w, http.StatusForbidden, "media file path is outside registered libraries")
+		return
+	}
+
+	f, err := os.Open(realPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			httpx.Error(w, http.StatusNotFound, "media file missing on disk")
@@ -578,29 +642,127 @@ func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "failed to stat media file")
 		return
 	}
-	if ct := dlnaMediaContentType(mediaPath); ct != "" {
+	if stat.IsDir() || !stat.Mode().IsRegular() {
+		httpx.Error(w, http.StatusNotFound, "media file not found")
+		return
+	}
+	if ct := dlnaMediaContentType(realPath); ct != "" {
 		w.Header().Set("Content-Type", ct)
 	}
 	w.Header().Set("SERVER", defaultServerHeader)
 	http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
 }
 
-func (h *Handler) resolveDLNAMediaPath(ctx context.Context, itemID string) (string, error) {
+func (h *Handler) resolveDLNAMediaPath(ctx context.Context, itemID string) (*sqlite.ItemRecord, string, error) {
 	item, itemErr := h.libRepo.GetItemRecordByID(ctx, itemID)
-	if itemErr == nil && item != nil && !h.isDLNAVisibleItem(ctx, item.Type, item.ID) {
-		return "", sqlite.ErrNotFound
+	if itemErr == nil && item != nil {
+		if !h.isDLNAVisibleItem(ctx, item.Type, item.ID) || !h.isItemAllowedByDefaultPolicy(ctx, item) {
+			return nil, "", sqlite.ErrNotFound
+		}
 	}
 	sources, err := h.libRepo.GetMediaSourcesByItemID(ctx, itemID)
 	if err == nil && len(sources) > 0 && strings.TrimSpace(sources[0].Path) != "" {
-		return sources[0].Path, nil
+		return item, sources[0].Path, nil
 	}
 	if itemErr != nil {
-		return "", itemErr
+		return nil, "", itemErr
 	}
 	if item == nil || strings.TrimSpace(item.Path) == "" {
-		return "", sqlite.ErrNotFound
+		return nil, "", sqlite.ErrNotFound
 	}
-	return item.Path, nil
+	return item, item.Path, nil
+}
+
+func (h *Handler) isPathWithinRegisteredLibraries(ctx context.Context, realTarget string) bool {
+	if h.libRepo == nil || realTarget == "" {
+		return false
+	}
+	libs, err := h.libRepo.ListLibraries(ctx)
+	if err != nil {
+		return false
+	}
+	cleanTarget := filepath.Clean(realTarget)
+	for _, lib := range libs {
+		for _, rawRoot := range lib.Paths {
+			rawRoot = strings.TrimSpace(rawRoot)
+			if rawRoot == "" {
+				continue
+			}
+			realRoot, err := filepath.EvalSymlinks(rawRoot)
+			if err != nil {
+				realRoot, err = filepath.Abs(rawRoot)
+				if err != nil {
+					continue
+				}
+			}
+			realRoot = filepath.Clean(realRoot)
+			rel, err := filepath.Rel(realRoot, cleanTarget)
+			if err != nil {
+				continue
+			}
+			if rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (h *Handler) resolveDefaultUserPolicy(ctx context.Context) (policy *dto.UserPolicy, denyAll bool) {
+	h.mu.RLock()
+	uid := h.defaultUserID
+	ur := h.userRepo
+	h.mu.RUnlock()
+	if uid == "" || ur == nil {
+		return nil, false
+	}
+	u, err := ur.GetUserByID(ctx, uid)
+	if err != nil || u == nil || u.IsDisabled {
+		return nil, true
+	}
+	if u.IsAdmin || u.Policy.IsAdministrator {
+		return nil, false
+	}
+	p := u.Policy
+	return &p, false
+}
+
+func (h *Handler) isLibraryAllowedByPolicy(libID string, policy *dto.UserPolicy) bool {
+	if policy == nil || policy.EnableAllFolders {
+		return true
+	}
+	normLib := guid.Normalize(libID)
+	if normLib == "" {
+		return false
+	}
+	for _, fid := range policy.EnabledFolders {
+		if guid.Normalize(fid) == normLib {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) isItemAllowedByDefaultPolicy(ctx context.Context, rec *sqlite.ItemRecord) bool {
+	if rec == nil {
+		return false
+	}
+	policy, denyAll := h.resolveDefaultUserPolicy(ctx)
+	if denyAll {
+		return false
+	}
+	if policy == nil {
+		return true
+	}
+	if rec.LibraryID != "" && !h.isLibraryAllowedByPolicy(rec.LibraryID, policy) {
+		return false
+	}
+	if h.libRepo != nil && (policy.MaxParentalRating != nil || len(policy.BlockedTags) > 0) {
+		if blocked, err := h.libRepo.IsItemBlockedByParentalPolicy(ctx, rec, policy.MaxParentalRating, policy.BlockedTags); err != nil || blocked {
+			return false
+		}
+	}
+	return true
 }
 
 func dlnaMediaContentType(path string) string {
@@ -642,11 +804,89 @@ func dlnaMediaContentType(path string) string {
 
 // --- UPnP GENA Event Subscriptions ---
 
+func normalizeDLNARateIP(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	addr, err := netip.ParseAddr(s)
+	if err != nil {
+		return s
+	}
+	addr = addr.WithZone("").Unmap()
+	if addr.Is6() {
+		return netip.PrefixFrom(addr, 64).Masked().String()
+	}
+	return addr.String()
+}
+
+func isValidDLNACallback(raw string) bool {
+	s := strings.TrimSpace(raw)
+	if s == "" || len(s) > maxDLNACallbackLen {
+		return false
+	}
+	found := 0
+	for len(s) > 0 {
+		s = strings.TrimSpace(s)
+		if !strings.HasPrefix(s, "<") {
+			return false
+		}
+		end := strings.IndexByte(s, '>')
+		if end <= 1 {
+			return false
+		}
+		rawURL := strings.TrimSpace(s[1:end])
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			return false
+		}
+		scheme := strings.ToLower(u.Scheme)
+		if (scheme != "http" && scheme != "https") || u.Host == "" {
+			return false
+		}
+		found++
+		s = s[end+1:]
+	}
+	return found > 0
+}
+
+func (h *Handler) allowSOAPRequest(r *http.Request) bool {
+	ip := normalizeDLNARateIP(netutil.ClientIP(r))
+	if ip == "" {
+		return true
+	}
+	now := time.Now().UTC()
+	h.soapRateMu.Lock()
+	defer h.soapRateMu.Unlock()
+	if h.soapRates == nil {
+		h.soapRates = make(map[string]*dlnaRateWindow)
+	}
+	for k, w := range h.soapRates {
+		if !now.Before(w.resetAt) {
+			delete(h.soapRates, k)
+		}
+	}
+	w := h.soapRates[ip]
+	if w == nil || !now.Before(w.resetAt) {
+		if w == nil && len(h.soapRates) >= maxDLNARateBuckets {
+			return false
+		}
+		w = &dlnaRateWindow{count: 0, resetAt: now.Add(dlnaSOAPRateWindow)}
+		h.soapRates[ip] = w
+	}
+	if w.count >= maxDLNASOAPPerIPPerMin {
+		return false
+	}
+	w.count++
+	return true
+}
+
 func (h *Handler) handleEventSubscribe(service string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uuid := r.PathValue("UuId")
 		timeoutSec := parseTimeoutHeader(r.Header.Get("TIMEOUT"))
 		sid := strings.TrimSpace(r.Header.Get("SID"))
+		clientIP := normalizeDLNARateIP(netutil.ClientIP(r))
 		now := time.Now().UTC()
 
 		h.mu.Lock()
@@ -671,13 +911,25 @@ func (h *Handler) handleEventSubscribe(service string) http.HandlerFunc {
 		} else {
 			// Initial subscription
 			callback := strings.TrimSpace(r.Header.Get("CALLBACK"))
-			if callback == "" {
-				http.Error(w, "missing CALLBACK header", http.StatusPreconditionFailed)
+			if !isValidDLNACallback(callback) {
+				http.Error(w, "invalid or missing CALLBACK header", http.StatusPreconditionFailed)
 				return
 			}
 			if len(h.subscriptions) >= maxDLNASubscriptions {
 				http.Error(w, "too many active subscriptions", http.StatusServiceUnavailable)
 				return
+			}
+			if clientIP != "" {
+				ipCount := 0
+				for _, sub := range h.subscriptions {
+					if sub.ClientIP == clientIP {
+						ipCount++
+					}
+				}
+				if ipCount >= maxDLNASubscriptionsPerIP {
+					http.Error(w, "too many active subscriptions for this ip", http.StatusTooManyRequests)
+					return
+				}
 			}
 			sid = "uuid:" + guid.New()
 			h.subscriptions[sid] = eventSubscription{
@@ -685,6 +937,7 @@ func (h *Handler) handleEventSubscribe(service string) http.HandlerFunc {
 				Service:   service,
 				UUID:      uuid,
 				Callback:  callback,
+				ClientIP:  clientIP,
 				ExpiresAt: now.Add(time.Duration(timeoutSec) * time.Second),
 			}
 		}

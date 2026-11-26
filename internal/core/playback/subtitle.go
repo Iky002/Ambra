@@ -135,37 +135,32 @@ func subtitleContentType(ext string) string {
 func parseSRTOrVTT(content string, offsetTicks int64) []SubtitleTrackEvent {
 	content = strings.TrimPrefix(content, "\xef\xbb\xbf")
 	content = strings.ReplaceAll(content, "\r\n", "\n")
-	blocks := strings.Split(content, "\n\n")
+	content = strings.ReplaceAll(content, "\r", "\n")
 
 	var events []SubtitleTrackEvent
 	seq := 1
-	for _, block := range blocks {
-		lines := strings.Split(strings.TrimSpace(block), "\n")
-		if len(lines) < 2 {
-			continue
+	inCue := false
+	var startMs, endMs int64
+	var textLines []string
+
+	flushCue := func() {
+		if !inCue {
+			return
 		}
-		timeLineIdx := -1
-		var startMs, endMs int64
-		for i, line := range lines {
-			if m := reSRTTime.FindStringSubmatch(line); m != nil {
-				startMs = hmsmsToMs(m[1], m[2], m[3], m[4])
-				endMs = hmsmsToMs(m[5], m[6], m[7], m[8])
-				timeLineIdx = i
-				break
-			}
-		}
-		if timeLineIdx == -1 || timeLineIdx+1 >= len(lines) {
-			continue
+		inCue = false
+		if len(textLines) == 0 {
+			return
 		}
 		startTicks := startMs*10_000 - offsetTicks
 		endTicks := endMs*10_000 - offsetTicks
+		text := strings.Join(textLines, "\n")
+		textLines = textLines[:0]
 		if endTicks <= 0 {
-			continue
+			return
 		}
 		if startTicks < 0 {
 			startTicks = 0
 		}
-		text := strings.Join(lines[timeLineIdx+1:], "\n")
 		events = append(events, SubtitleTrackEvent{
 			ID:                 strconv.Itoa(seq),
 			Text:               text,
@@ -174,7 +169,69 @@ func parseSRTOrVTT(content string, offsetTicks int64) []SubtitleTrackEvent {
 		})
 		seq++
 	}
+
+	for _, rawLine := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(rawLine)
+		if trimmed == "" {
+			flushCue()
+			continue
+		}
+		if !inCue {
+			if m := reSRTTime.FindStringSubmatch(trimmed); m != nil {
+				startMs = hmsmsToMs(m[1], m[2], m[3], m[4])
+				endMs = hmsmsToMs(m[5], m[6], m[7], m[8])
+				inCue = true
+				textLines = textLines[:0]
+			}
+			continue
+		}
+		// If a malformed file omits a blank line between cues and starts a new timestamp directly:
+		if m := reSRTTime.FindStringSubmatch(trimmed); m != nil {
+			flushCue()
+			startMs = hmsmsToMs(m[1], m[2], m[3], m[4])
+			endMs = hmsmsToMs(m[5], m[6], m[7], m[8])
+			inCue = true
+			textLines = textLines[:0]
+			continue
+		}
+		textLines = append(textLines, rawLine)
+	}
+	flushCue()
 	return events
+}
+
+type assEventFormat struct {
+	startIdx   int
+	endIdx     int
+	textIdx    int
+	fieldCount int
+}
+
+func defaultASSEventFormat() assEventFormat {
+	return assEventFormat{startIdx: 1, endIdx: 2, textIdx: 9, fieldCount: 10}
+}
+
+func parseASSEventFormat(line string) (assEventFormat, bool) {
+	body := strings.TrimSpace(strings.TrimPrefix(line, "Format:"))
+	if body == "" {
+		return assEventFormat{}, false
+	}
+	cols := strings.Split(body, ",")
+	fmtSpec := assEventFormat{startIdx: -1, endIdx: -1, textIdx: -1, fieldCount: len(cols)}
+	for i, c := range cols {
+		switch strings.ToLower(strings.TrimSpace(c)) {
+		case "start":
+			fmtSpec.startIdx = i
+		case "end":
+			fmtSpec.endIdx = i
+		case "text":
+			fmtSpec.textIdx = i
+		}
+	}
+	if fmtSpec.startIdx < 0 || fmtSpec.endIdx < 0 || fmtSpec.textIdx < 0 {
+		return assEventFormat{}, false
+	}
+	return fmtSpec, true
 }
 
 func parseASS(content string, offsetTicks int64) ([]SubtitleTrackEvent, error) {
@@ -183,19 +240,31 @@ func parseASS(content string, offsetTicks int64) ([]SubtitleTrackEvent, error) {
 	sc.Buffer(make([]byte, 0, 64*1024), maxSubtitleLineSize)
 	var events []SubtitleTrackEvent
 	seq := 1
+	inEvents := false
+	evFmt := defaultASSEventFormat()
+
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			inEvents = strings.EqualFold(line, "[Events]")
+			continue
+		}
+		if inEvents && strings.HasPrefix(line, "Format:") {
+			if parsed, ok := parseASSEventFormat(line); ok {
+				evFmt = parsed
+			}
+			continue
+		}
 		if !strings.HasPrefix(line, "Dialogue:") {
 			continue
 		}
 		body := strings.TrimSpace(strings.TrimPrefix(line, "Dialogue:"))
-		// Standard ASS Dialogue has 10 comma-separated fields; Text is the 10th (index 9)
-		parts := strings.SplitN(body, ",", 10)
-		if len(parts) < 10 {
+		parts := strings.SplitN(body, ",", evFmt.fieldCount)
+		if len(parts) < evFmt.fieldCount {
 			continue
 		}
-		startMs := parseASSTimeMs(parts[1])
-		endMs := parseASSTimeMs(parts[2])
+		startMs := parseASSTimeMs(parts[evFmt.startIdx])
+		endMs := parseASSTimeMs(parts[evFmt.endIdx])
 		startTicks := startMs*10_000 - offsetTicks
 		endTicks := endMs*10_000 - offsetTicks
 		if endTicks <= 0 {
@@ -204,7 +273,7 @@ func parseASS(content string, offsetTicks int64) ([]SubtitleTrackEvent, error) {
 		if startTicks < 0 {
 			startTicks = 0
 		}
-		text := reASSTags.ReplaceAllString(parts[9], "")
+		text := reASSTags.ReplaceAllString(parts[evFmt.textIdx], "")
 		text = strings.ReplaceAll(text, `\N`, "\n")
 		text = strings.ReplaceAll(text, `\n`, "\n")
 		text = strings.TrimSpace(text)
@@ -234,23 +303,39 @@ func shiftASS(content string, offsetTicks int64) (string, error) {
 	if hasBOM {
 		b.WriteString("\xef\xbb\xbf")
 	}
+	inEvents := false
+	evFmt := defaultASSEventFormat()
 	for sc.Scan() {
 		rawLine := sc.Text()
 		trimmed := strings.TrimSpace(rawLine)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			inEvents = strings.EqualFold(trimmed, "[Events]")
+			b.WriteString(rawLine)
+			b.WriteByte('\n')
+			continue
+		}
+		if inEvents && strings.HasPrefix(trimmed, "Format:") {
+			if parsed, ok := parseASSEventFormat(trimmed); ok {
+				evFmt = parsed
+			}
+			b.WriteString(rawLine)
+			b.WriteByte('\n')
+			continue
+		}
 		if !strings.HasPrefix(trimmed, "Dialogue:") {
 			b.WriteString(rawLine)
 			b.WriteByte('\n')
 			continue
 		}
 		body := strings.TrimSpace(strings.TrimPrefix(trimmed, "Dialogue:"))
-		parts := strings.SplitN(body, ",", 10)
-		if len(parts) < 10 {
+		parts := strings.SplitN(body, ",", evFmt.fieldCount)
+		if len(parts) < evFmt.fieldCount {
 			b.WriteString(rawLine)
 			b.WriteByte('\n')
 			continue
 		}
-		startMs := parseASSTimeMs(parts[1])
-		endMs := parseASSTimeMs(parts[2])
+		startMs := parseASSTimeMs(parts[evFmt.startIdx])
+		endMs := parseASSTimeMs(parts[evFmt.endIdx])
 		startTicks := startMs*10_000 - offsetTicks
 		endTicks := endMs*10_000 - offsetTicks
 		if endTicks <= 0 {
@@ -259,8 +344,8 @@ func shiftASS(content string, offsetTicks int64) (string, error) {
 		if startTicks < 0 {
 			startTicks = 0
 		}
-		parts[1] = formatASSTime(startTicks / 10_000)
-		parts[2] = formatASSTime(endTicks / 10_000)
+		parts[evFmt.startIdx] = formatASSTime(startTicks / 10_000)
+		parts[evFmt.endIdx] = formatASSTime(endTicks / 10_000)
 		b.WriteString("Dialogue: ")
 		b.WriteString(strings.Join(parts, ","))
 		b.WriteByte('\n')
@@ -333,14 +418,27 @@ func hmsmsToMs(h, m, s, ms string) int64 {
 }
 
 func parseASSTimeMs(s string) int64 {
-	// Format: H:MM:SS.cc (centiseconds)
+	// Format: H:MM:SS.c / H:MM:SS.cc / H:MM:SS.mmm
 	s = strings.TrimSpace(s)
-	dot := strings.IndexByte(s, '.')
-	var cs int64
+	dot := strings.IndexAny(s, ".,")
+	var fracMs int64
 	hms := s
 	if dot != -1 {
-		cs, _ = strconv.ParseInt(s[dot+1:], 10, 64)
+		fracStr := strings.TrimSpace(s[dot+1:])
 		hms = s[:dot]
+		if len(fracStr) > 3 {
+			fracStr = fracStr[:3]
+		}
+		if v, err := strconv.ParseInt(fracStr, 10, 64); err == nil && v > 0 {
+			switch len(fracStr) {
+			case 1:
+				fracMs = v * 100
+			case 2:
+				fracMs = v * 10
+			default:
+				fracMs = v
+			}
+		}
 	}
 	parts := strings.Split(hms, ":")
 	if len(parts) != 3 {
@@ -349,7 +447,7 @@ func parseASSTimeMs(s string) int64 {
 	hh, _ := strconv.ParseInt(parts[0], 10, 64)
 	mm, _ := strconv.ParseInt(parts[1], 10, 64)
 	ss, _ := strconv.ParseInt(parts[2], 10, 64)
-	return ((hh*60+mm)*60+ss)*1000 + cs*10
+	return ((hh*60+mm)*60+ss)*1000 + fracMs
 }
 
 func formatVTTTime(ms int64) string {

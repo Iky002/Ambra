@@ -14,6 +14,8 @@ import (
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
+const maxInstallations = 100
+
 type StartupConfiguration struct {
 	ServerName                string `json:"ServerName"`
 	UICulture                 string `json:"UICulture"`
@@ -304,9 +306,20 @@ func (h *Handler) handleInstallPackage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.Lock()
+	snapshot := cloneOpsState(h.state)
 	h.state.Installations = append(h.state.Installations, inst)
-	h.saveStateLocked(r.Context())
+	if len(h.state.Installations) > maxInstallations {
+		h.state.Installations = append([]InstallationInfo(nil), h.state.Installations[len(h.state.Installations)-maxInstallations:]...)
+	}
+	err := h.saveStateLocked(r.Context())
+	if err != nil {
+		h.state = snapshot
+	}
 	h.mu.Unlock()
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to persist package installation")
+		return
+	}
 
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"Id":              inst.Id,
@@ -323,8 +336,14 @@ func (h *Handler) handleCancelInstall(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	for i, inst := range h.state.Installations {
 		if inst.Id == id {
+			snapshot := cloneOpsState(h.state)
 			h.state.Installations = append(h.state.Installations[:i], h.state.Installations[i+1:]...)
-			h.saveStateLocked(r.Context())
+			if err := h.saveStateLocked(r.Context()); err != nil {
+				h.state = snapshot
+				h.mu.Unlock()
+				httpx.Error(w, http.StatusInternalServerError, "failed to persist cancellation")
+				return
+			}
 			h.mu.Unlock()
 			httpx.NoContent(w)
 			return

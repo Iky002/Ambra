@@ -162,9 +162,16 @@ func (p *HTTPPlugin) Configure(cfg map[string]any) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	nextAPIKey := p.apiKey
+	nextEndpoint := p.endpoint
+	nextEnabled := p.enabled
+	nextPriority := p.priority
+	nextTimeout := p.timeout
+	timeoutChanged := false
+
 	hasNewAPIKey := false
 	if raw, ok := lookupString(cfg, "APIKey", "ApiKey", "api_key"); ok {
-		p.apiKey = strings.TrimSpace(raw)
+		nextAPIKey = strings.TrimSpace(raw)
 		hasNewAPIKey = true
 	}
 	if raw, ok := lookupString(cfg, "Endpoint", "endpoint"); ok {
@@ -173,17 +180,17 @@ func (p *HTTPPlugin) Configure(cfg map[string]any) error {
 			return err
 		}
 		if urlHostLower(ep) != urlHostLower(p.endpoint) && !hasNewAPIKey {
-			p.apiKey = ""
+			nextAPIKey = ""
 		}
-		p.endpoint = ep
+		nextEndpoint = ep
 	}
 	if b, ok := lookupBool(cfg, "Enabled", "enabled"); ok {
-		p.enabled = b
+		nextEnabled = b
 	}
 	if prio, ok, err := lookupInt(cfg, "Priority", "priority"); err != nil {
 		return err
 	} else if ok {
-		p.priority = prio
+		nextPriority = prio
 	}
 	if tms, ok, err := lookupInt(cfg, "TimeoutMs", "timeout_ms"); err != nil {
 		return err
@@ -194,7 +201,16 @@ func (p *HTTPPlugin) Configure(cfg map[string]any) error {
 		if tms > maxTimeoutMs {
 			tms = maxTimeoutMs
 		}
-		p.timeout = time.Duration(tms) * time.Millisecond
+		nextTimeout = time.Duration(tms) * time.Millisecond
+		timeoutChanged = true
+	}
+
+	p.apiKey = nextAPIKey
+	p.endpoint = nextEndpoint
+	p.enabled = nextEnabled
+	p.priority = nextPriority
+	if timeoutChanged {
+		p.timeout = nextTimeout
 		p.client = netutil.NewSafeHTTPClient(p.timeout, true)
 	}
 	return nil

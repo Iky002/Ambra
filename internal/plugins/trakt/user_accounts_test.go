@@ -38,6 +38,9 @@ func configureTestPlugin(t *testing.T, p *Plugin, cfg map[string]any) error {
 	if err := p.Configure(cfg); err != nil {
 		return err
 	}
+	if v, ok := firstString(cfg, "base_url", "BaseUrl"); ok && v != "" {
+		p.SetBaseURL(v)
+	}
 	store, ok := p.userConfigs.(*testUserConfigStore)
 	if !ok {
 		store = &testUserConfigStore{configs: make(map[string]sqlite.TraktConfig)}

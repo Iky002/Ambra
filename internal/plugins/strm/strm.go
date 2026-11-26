@@ -46,8 +46,12 @@ func (r *Resolver) Manifest() plugins.Manifest {
 func (r *Resolver) Configure(cfg map[string]any) error {
 	if v, ok := cfg["enabled"].(bool); ok {
 		r.enabled.Store(v)
+	} else if v, ok := cfg["Enabled"].(bool); ok {
+		r.enabled.Store(v)
 	}
 	if v, ok := cfg["enable_302"].(bool); ok {
+		r.enable302.Store(v)
+	} else if v, ok := cfg["Enable302"].(bool); ok {
 		r.enable302.Store(v)
 	}
 	return nil

@@ -68,17 +68,17 @@ type Watcher struct {
 	debounce      time.Duration
 	symlinkPolicy SymlinkPolicy
 
-	mu       sync.Mutex
-	dirToLib map[string]string
-	libDirs  map[string]map[string]struct{}
-	libRoots map[string][]string
-	pending  map[string]*pendingBatch
-	nextGen  uint64
-	started  bool
-	closed   bool
-	runCtx   context.Context
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
+	mu        sync.Mutex
+	dirToLibs map[string]map[string]struct{}
+	libDirs   map[string]map[string]struct{}
+	libRoots  map[string][]string
+	pending   map[string]*pendingBatch
+	nextGen   uint64
+	started   bool
+	closed    bool
+	runCtx    context.Context
+	stopCh    chan struct{}
+	wg        sync.WaitGroup
 }
 
 // New creates a new Watcher with the given ChangeHandler and options.
@@ -92,7 +92,7 @@ func New(onChange ChangeHandler, opts ...Option) (*Watcher, error) {
 		onChange:      onChange,
 		debounce:      DefaultDebounce,
 		symlinkPolicy: SymlinkFollowDirect,
-		dirToLib:      make(map[string]string),
+		dirToLibs:     make(map[string]map[string]struct{}),
 		libDirs:       make(map[string]map[string]struct{}),
 		libRoots:      make(map[string][]string),
 		pending:       make(map[string]*pendingBatch),
@@ -167,8 +167,7 @@ func (w *Watcher) UnwatchLibrary(libraryID string) error {
 		return nil
 	}
 	for dir := range dirs {
-		_ = w.fsw.Remove(dir)
-		delete(w.dirToLib, dir)
+		w.detachDirFromLibLocked(libraryID, dir)
 	}
 	delete(w.libDirs, libraryID)
 	return nil
@@ -262,35 +261,57 @@ func (w *Watcher) handleEvent(ev fsnotify.Event) {
 	}
 
 	w.mu.Lock()
-	libID := w.lookupLibraryLocked(cleanPath)
-	if libID == "" {
+	libIDs := w.lookupLibrariesLocked(cleanPath)
+	if len(libIDs) == 0 {
 		w.mu.Unlock()
 		return
 	}
-	roots := append([]string(nil), w.libRoots[libID]...)
+	rootsByLib := make(map[string][]string, len(libIDs))
+	for _, id := range libIDs {
+		rootsByLib[id] = append([]string(nil), w.libRoots[id]...)
+	}
 	policy := w.symlinkPolicy
 	w.mu.Unlock()
 
-	// Enforce SymlinkPolicy and EvalSymlinks root containment on newly created/modified paths.
-	var subdirs []string
-	if ev.Op&(fsnotify.Create|fsnotify.Write) != 0 {
-		if linfo, lerr := os.Lstat(cleanPath); lerr == nil {
-			if linfo.Mode()&os.ModeSymlink != 0 {
-				if policy == SymlinkIgnore || !isWithinAnyRoot(roots, cleanPath) {
-					return
+	type libAction struct {
+		libID   string
+		subdirs []string
+	}
+	var actions []libAction
+	for _, libID := range libIDs {
+		roots := rootsByLib[libID]
+		matchedRoot := findMatchingRoot(roots, cleanPath)
+		hops := countSymlinkHopsUnderRoot(matchedRoot, cleanPath)
+
+		// Enforce SymlinkPolicy (including depth 1 limit for SymlinkFollowDirect) and EvalSymlinks containment.
+		if ev.Op&(fsnotify.Create|fsnotify.Write) != 0 {
+			if hops > 0 {
+				if policy == SymlinkIgnore {
+					continue
+				}
+				if policy == SymlinkFollowDirect && hops > 1 {
+					continue
+				}
+				if !isWithinAnyRoot(roots, cleanPath) {
+					continue
 				}
 			}
 		}
-	}
-	if ev.Op&fsnotify.Create != 0 {
-		if info, err := os.Stat(cleanPath); err == nil && info.IsDir() {
-			realRoot := findRealRootForPath(roots, cleanPath)
-			startDepth := 0
-			if linfo, lerr := os.Lstat(cleanPath); lerr == nil && linfo.Mode()&os.ModeSymlink != 0 {
-				startDepth = 1
+
+		var subdirs []string
+		if ev.Op&fsnotify.Create != 0 {
+			if info, err := os.Stat(cleanPath); err == nil && info.IsDir() {
+				if policy == SymlinkFollowDirect && hops > 1 {
+					continue
+				}
+				realRoot := findRealRootForPath(roots, cleanPath)
+				collectDirsSafeWithPolicy(cleanPath, realRoot, hops, policy, make(map[string]struct{}), &subdirs)
 			}
-			collectDirsSafeWithPolicy(cleanPath, realRoot, startDepth, policy, make(map[string]struct{}), &subdirs)
 		}
+		actions = append(actions, libAction{libID: libID, subdirs: subdirs})
+	}
+	if len(actions) == 0 {
+		return
 	}
 
 	w.mu.Lock()
@@ -298,21 +319,18 @@ func (w *Watcher) handleEvent(ev fsnotify.Event) {
 		w.mu.Unlock()
 		return
 	}
-	// Re-verify library association under lock.
-	if curLib := w.lookupLibraryLocked(cleanPath); curLib == "" {
-		w.mu.Unlock()
-		return
-	} else {
-		libID = curLib
+	for _, act := range actions {
+		if !w.hasLibraryLocked(act.libID, cleanPath) {
+			continue
+		}
+		for _, d := range act.subdirs {
+			_ = w.addDirLocked(act.libID, d)
+		}
+		if ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+			w.removeDirTreeLocked(act.libID, cleanPath)
+		}
+		w.scheduleDebounceLocked(act.libID, cleanPath)
 	}
-	for _, d := range subdirs {
-		_ = w.addDirLocked(libID, d)
-	}
-	if ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
-		w.removeDirTreeLocked(libID, cleanPath)
-	}
-
-	w.scheduleDebounceLocked(libID, cleanPath)
 	w.mu.Unlock()
 }
 
@@ -324,33 +342,70 @@ func isTempFileName(base string) bool {
 		strings.HasSuffix(lower, "~")
 }
 
-func (w *Watcher) lookupLibraryLocked(path string) string {
-	if libID, ok := w.dirToLib[path]; ok {
-		return libID
+func (w *Watcher) lookupLibrariesLocked(path string) []string {
+	seen := make(map[string]struct{})
+	for _, candidate := range []string{path, filepath.Dir(path)} {
+		if libs, ok := w.dirToLibs[candidate]; ok {
+			for id := range libs {
+				seen[id] = struct{}{}
+			}
+		}
 	}
-	parent := filepath.Dir(path)
-	if libID, ok := w.dirToLib[parent]; ok {
-		return libID
+	if len(seen) == 0 {
+		return nil
 	}
-	return ""
+	out := make([]string, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (w *Watcher) hasLibraryLocked(libraryID, path string) bool {
+	if libs, ok := w.dirToLibs[path]; ok {
+		if _, exists := libs[libraryID]; exists {
+			return true
+		}
+	}
+	if libs, ok := w.dirToLibs[filepath.Dir(path)]; ok {
+		if _, exists := libs[libraryID]; exists {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *Watcher) addDirLocked(libraryID, dir string) error {
-	if _, exists := w.dirToLib[dir]; exists {
-		return nil
+	libs, exists := w.dirToLibs[dir]
+	if !exists {
+		if len(w.dirToLibs) >= maxWatchedDirs {
+			return fmt.Errorf("watcher: max watched directories limit (%d) reached", maxWatchedDirs)
+		}
+		if err := w.fsw.Add(dir); err != nil {
+			return err
+		}
+		libs = make(map[string]struct{})
+		w.dirToLibs[dir] = libs
 	}
-	if len(w.dirToLib) >= maxWatchedDirs {
-		return fmt.Errorf("watcher: max watched directories limit (%d) reached", maxWatchedDirs)
-	}
-	if err := w.fsw.Add(dir); err != nil {
-		return err
-	}
-	w.dirToLib[dir] = libraryID
+	libs[libraryID] = struct{}{}
 	if w.libDirs[libraryID] == nil {
 		w.libDirs[libraryID] = make(map[string]struct{})
 	}
 	w.libDirs[libraryID][dir] = struct{}{}
 	return nil
+}
+
+func (w *Watcher) detachDirFromLibLocked(libraryID, dir string) {
+	libs, ok := w.dirToLibs[dir]
+	if !ok {
+		return
+	}
+	delete(libs, libraryID)
+	if len(libs) == 0 {
+		_ = w.fsw.Remove(dir)
+		delete(w.dirToLibs, dir)
+	}
 }
 
 func (w *Watcher) removeDirTreeLocked(libraryID, target string) {
@@ -361,9 +416,8 @@ func (w *Watcher) removeDirTreeLocked(libraryID, target string) {
 	prefix := target + string(filepath.Separator)
 	for d := range dirs {
 		if d == target || strings.HasPrefix(d, prefix) {
-			_ = w.fsw.Remove(d)
 			delete(dirs, d)
-			delete(w.dirToLib, d)
+			w.detachDirFromLibLocked(libraryID, d)
 		}
 	}
 }
@@ -461,6 +515,56 @@ func isWithinAnyRoot(roots []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func findMatchingRoot(roots []string, target string) string {
+	cleanTarget := filepath.Clean(target)
+	best := ""
+	for _, r := range roots {
+		cr := filepath.Clean(strings.TrimSpace(r))
+		if cr == "" {
+			continue
+		}
+		if cleanTarget == cr || strings.HasPrefix(cleanTarget, cr+string(filepath.Separator)) {
+			if len(cr) > len(best) {
+				best = cr
+			}
+		}
+	}
+	return best
+}
+
+func countSymlinkHopsUnderRoot(root, target string) int {
+	cleanRoot := filepath.Clean(strings.TrimSpace(root))
+	cleanTarget := filepath.Clean(strings.TrimSpace(target))
+	if cleanTarget == "" {
+		return 0
+	}
+	if cleanRoot == "" || cleanRoot == "." {
+		if linfo, err := os.Lstat(cleanTarget); err == nil && linfo.Mode()&os.ModeSymlink != 0 {
+			return 1
+		}
+		return 0
+	}
+	rel, err := filepath.Rel(cleanRoot, cleanTarget)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		if linfo, lerr := os.Lstat(cleanTarget); lerr == nil && linfo.Mode()&os.ModeSymlink != 0 {
+			return 1
+		}
+		return 0
+	}
+	hops := 0
+	cur := cleanRoot
+	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
+		if part == "" || part == "." {
+			continue
+		}
+		cur = filepath.Join(cur, part)
+		if linfo, lerr := os.Lstat(cur); lerr == nil && linfo.Mode()&os.ModeSymlink != 0 {
+			hops++
+		}
+	}
+	return hops
 }
 
 func findRealRootForPath(roots []string, target string) string {

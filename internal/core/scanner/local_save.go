@@ -165,7 +165,27 @@ func (s *Scanner) resolveLocalImagePath(ctx context.Context, lib *sqlite.Library
 	if dir == "" || filename == "" || !isExistingDirPath(dir) {
 		return "", false
 	}
+	if lib == nil && s.repo != nil && strings.TrimSpace(rec.LibraryID) != "" {
+		if fetched, err := s.repo.GetLibrary(ctx, rec.LibraryID); err == nil {
+			lib = fetched
+		}
+	}
+	if lib != nil && len(lib.Paths) > 0 && !isDirWithinLibraryRoots(dir, lib) {
+		return "", false
+	}
 	return filepath.Join(dir, filename), true
+}
+
+func isDirWithinLibraryRoots(dir string, lib *sqlite.LibraryRecord) bool {
+	if lib == nil || len(lib.Paths) == 0 || strings.TrimSpace(dir) == "" {
+		return false
+	}
+	for _, root := range lib.Paths {
+		if isPathWithinRoot(root, dir) {
+			return true
+		}
+	}
+	return false
 }
 
 func standardArtworkFilename(imgType, ext string) string {
@@ -407,16 +427,17 @@ func (s *Scanner) resolveLocalNFOTarget(ctx context.Context, rec *sqlite.ItemRec
 	itemPath = filepath.Clean(itemPath)
 	itemType := strings.ToLower(strings.TrimSpace(rec.Type))
 
+	var dir string
 	switch itemType {
 	case "series":
-		dir := itemPath
+		dir = itemPath
 		if !isExistingDirPath(dir) {
 			dir = filepath.Dir(itemPath)
 		}
 		if !isExistingDirPath(dir) {
 			return "", "", false
 		}
-		return "tvshow", filepath.Join(dir, "tvshow.nfo"), true
+		rootTag, nfoPath = "tvshow", filepath.Join(dir, "tvshow.nfo")
 
 	case "season":
 		seasonDir := itemPath
@@ -429,43 +450,57 @@ func (s *Scanner) resolveLocalNFOTarget(ctx context.Context, rec *sqlite.ItemRec
 			// so multiple seasons never overwrite one another.
 			return "", "", false
 		}
-		return "season", filepath.Join(seasonDir, "season.nfo"), true
+		dir = seasonDir
+		rootTag, nfoPath = "season", filepath.Join(seasonDir, "season.nfo")
 
 	case "episode":
-		dir := filepath.Dir(itemPath)
+		dir = filepath.Dir(itemPath)
 		if !isExistingDirPath(dir) {
 			return "", "", false
 		}
-		return "episodedetails", replacePathExtWithNFO(itemPath), true
+		rootTag, nfoPath = "episodedetails", replacePathExtWithNFO(itemPath)
 
 	case "movie":
 		if rec.IsFolder || isExistingDirPath(itemPath) {
 			if !isExistingDirPath(itemPath) {
 				return "", "", false
 			}
-			return "movie", filepath.Join(itemPath, "movie.nfo"), true
+			dir = itemPath
+			rootTag, nfoPath = "movie", filepath.Join(itemPath, "movie.nfo")
+		} else {
+			dir = filepath.Dir(itemPath)
+			if !isExistingDirPath(dir) {
+				return "", "", false
+			}
+			rootTag, nfoPath = "movie", replacePathExtWithNFO(itemPath)
 		}
-		dir := filepath.Dir(itemPath)
-		if !isExistingDirPath(dir) {
-			return "", "", false
-		}
-		return "movie", replacePathExtWithNFO(itemPath), true
 
 	case "musicartist":
 		if !isExistingDirPath(itemPath) {
 			return "", "", false
 		}
-		return "artist", filepath.Join(itemPath, "artist.nfo"), true
+		dir = itemPath
+		rootTag, nfoPath = "artist", filepath.Join(itemPath, "artist.nfo")
 
 	case "musicalbum":
 		if !isExistingDirPath(itemPath) {
 			return "", "", false
 		}
-		return "album", filepath.Join(itemPath, "album.nfo"), true
+		dir = itemPath
+		rootTag, nfoPath = "album", filepath.Join(itemPath, "album.nfo")
 
 	default:
 		return "", "", false
 	}
+
+	if s.repo != nil && strings.TrimSpace(rec.LibraryID) != "" {
+		if lib, err := s.repo.GetLibrary(ctx, rec.LibraryID); err == nil && lib != nil && len(lib.Paths) > 0 {
+			if !isDirWithinLibraryRoots(dir, lib) {
+				return "", "", false
+			}
+		}
+	}
+	return rootTag, nfoPath, true
 }
 
 func replacePathExtWithNFO(p string) string {

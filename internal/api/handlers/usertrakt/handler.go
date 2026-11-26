@@ -57,14 +57,42 @@ func (h *Handler) handle(w http.ResponseWriter, r *http.Request) {
 		httpx.NoContent(w)
 		return
 	}
-	if r.Method == http.MethodPost && !h.plugin.Manifest().Enabled {
-		httpx.Error(w, http.StatusForbidden, "Trakt is disabled by the administrator")
-		return
+	var input struct {
+		ClientID         *string `json:"ClientId"`
+		AccessToken      *string `json:"AccessToken"`
+		ScrobblePlayback *bool   `json:"ScrobblePlayback"`
+		SyncWatched      *bool   `json:"SyncWatched"`
 	}
+	var trimmedClientID, trimmedAccessToken string
+	if r.Method == http.MethodPost {
+		if !h.plugin.Manifest().Enabled {
+			httpx.Error(w, http.StatusForbidden, "Trakt is disabled by the administrator")
+			return
+		}
+		if err := httpx.DecodeJSONLimit(r, &input, 16<<10); err != nil {
+			httpx.Error(w, http.StatusBadRequest, "Invalid Trakt configuration")
+			return
+		}
+		if input.ClientID != nil {
+			trimmedClientID = strings.TrimSpace(*input.ClientID)
+			if trimmedClientID == "" || len(trimmedClientID) > 256 || strings.ContainsAny(trimmedClientID, "\r\n\x00") {
+				httpx.Error(w, http.StatusBadRequest, "A valid Client ID and Access Token are required")
+				return
+			}
+		}
+		if input.AccessToken != nil {
+			trimmedAccessToken = strings.TrimSpace(*input.AccessToken)
+			if trimmedAccessToken == "" || trimmedAccessToken == "********" || len(trimmedAccessToken) > 4096 || strings.ContainsAny(trimmedAccessToken, "\r\n\x00") {
+				httpx.Error(w, http.StatusBadRequest, "A valid Client ID and Access Token are required")
+				return
+			}
+		}
+	}
+
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	cfg, err := h.users.GetUserTraktConfig(r.Context(), userID)
 	if err != nil {
+		h.mu.Unlock()
 		httpx.Error(w, http.StatusInternalServerError, "Unable to load Trakt binding")
 		return
 	}
@@ -72,26 +100,16 @@ func (h *Handler) handle(w http.ResponseWriter, r *http.Request) {
 		cfg = &sqlite.TraktConfig{ScrobblePlayback: true, SyncWatched: true}
 	}
 	if r.Method == http.MethodPost {
-		var input struct {
-			ClientID         *string `json:"ClientId"`
-			AccessToken      *string `json:"AccessToken"`
-			ScrobblePlayback *bool   `json:"ScrobblePlayback"`
-			SyncWatched      *bool   `json:"SyncWatched"`
-		}
-		if err := httpx.DecodeJSONLimit(r, &input, 16<<10); err != nil {
-			httpx.Error(w, http.StatusBadRequest, "Invalid Trakt configuration")
-			return
-		}
 		if input.ClientID != nil {
-			clientID := strings.TrimSpace(*input.ClientID)
-			if clientID != cfg.ClientID && input.AccessToken == nil {
+			if trimmedClientID != cfg.ClientID && input.AccessToken == nil {
+				h.mu.Unlock()
 				httpx.Error(w, http.StatusBadRequest, "A new Client ID requires a new Access Token")
 				return
 			}
-			cfg.ClientID = clientID
+			cfg.ClientID = trimmedClientID
 		}
 		if input.AccessToken != nil {
-			cfg.AccessToken = strings.TrimSpace(*input.AccessToken)
+			cfg.AccessToken = trimmedAccessToken
 		}
 		if input.ScrobblePlayback != nil {
 			cfg.ScrobblePlayback = *input.ScrobblePlayback
@@ -102,14 +120,17 @@ func (h *Handler) handle(w http.ResponseWriter, r *http.Request) {
 		if cfg.ClientID == "" || cfg.AccessToken == "" || cfg.AccessToken == "********" ||
 			len(cfg.ClientID) > 256 || len(cfg.AccessToken) > 4096 ||
 			strings.ContainsAny(cfg.ClientID+cfg.AccessToken, "\r\n\x00") {
+			h.mu.Unlock()
 			httpx.Error(w, http.StatusBadRequest, "A valid Client ID and Access Token are required")
 			return
 		}
 		if err := h.users.SaveUserTraktConfig(r.Context(), userID, *cfg); err != nil {
+			h.mu.Unlock()
 			httpx.Error(w, http.StatusInternalServerError, "Unable to save Trakt binding")
 			return
 		}
 	}
+	h.mu.Unlock()
 	httpx.JSON(w, http.StatusOK, Status{
 		Enabled: h.plugin.Manifest().Enabled, Configured: cfg.ClientID != "" && cfg.AccessToken != "",
 		ClientID: cfg.ClientID, AccessTokenConfigured: cfg.AccessToken != "",

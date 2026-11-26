@@ -235,6 +235,7 @@ export function MediaCard({
           <button
             type="button"
             title="立即播放"
+            aria-label={`播放 ${item.Name}`}
             onClick={(e) => {
               e.stopPropagation()
               if (isAudioItem) {
@@ -243,7 +244,7 @@ export function MediaCard({
                 navigate(directPlayUrl)
               }
             }}
-            className="absolute left-1/2 top-1/2 z-10 flex h-12 w-12 -translate-x-1/2 -translate-y-1/2 scale-75 items-center justify-center rounded-full bg-amber-500 text-zinc-950 opacity-0 shadow-lg shadow-amber-500/35 transition-all duration-300 ease-out hover:bg-amber-400 group-hover:scale-100 group-hover:opacity-100 focus-visible:scale-100 focus-visible:opacity-100 active:scale-95"
+            className="absolute left-1/2 top-1/2 z-10 flex h-12 w-12 -translate-x-1/2 -translate-y-1/2 scale-95 items-center justify-center rounded-full bg-amber-500 text-zinc-950 opacity-95 shadow-lg shadow-amber-500/35 transition-all duration-300 ease-out hover:bg-amber-400 [@media(hover:hover)]:scale-75 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover:scale-100 [@media(hover:hover)]:group-hover:opacity-100 focus-visible:scale-100 focus-visible:opacity-100 active:scale-95"
           >
             <Play className="ml-0.5 h-5 w-5 fill-current" />
           </button>
@@ -251,7 +252,7 @@ export function MediaCard({
 
         {/* 同级右上角快捷操作按钮 */}
         {!selectable && (onMarkPlayed || onHideFromResume) && (
-          <div className="absolute right-2 top-2 z-20 flex items-center gap-1 opacity-100 sm:opacity-0 sm:pointer-events-none sm:group-hover:opacity-100 sm:group-hover:pointer-events-auto sm:focus-within:opacity-100 sm:focus-within:pointer-events-auto transition-opacity duration-200">
+          <div className="absolute right-2 top-2 z-20 flex items-center gap-1 opacity-100 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:pointer-events-none [@media(hover:hover)]:group-hover:opacity-100 [@media(hover:hover)]:group-hover:pointer-events-auto [@media(hover:hover)]:focus-within:opacity-100 [@media(hover:hover)]:focus-within:pointer-events-auto transition-opacity duration-200">
             {onMarkPlayed && (
               <button
                 type="button"

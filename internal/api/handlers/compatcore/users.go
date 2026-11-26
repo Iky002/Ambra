@@ -352,7 +352,21 @@ func (h *Handler) forgotPasswordPin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+const emptyPasswordSHA1 = "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+
+func verifyUserPassword(u *sqlite.UserRecord, pw, legacySHA1 string) bool {
+	if u == nil {
+		return false
+	}
+	if u.PasswordHash == "" {
+		return pw == "" && (legacySHA1 == "" || strings.EqualFold(legacySHA1, emptyPasswordSHA1))
+	}
+	ok, err := auth.VerifyPassword(pw, u.PasswordHash)
+	return err == nil && ok
+}
+
 func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "private, no-store")
 	now := time.Now().UTC()
 	ip := netutil.ClientIP(r)
 	uid := h.resolveUserID(r, "Id")
@@ -406,6 +420,36 @@ func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 		if pw == "" && body.Password != "" && u.PasswordHash != "" {
 			pw = body.Password
 		}
+		if !u.Policy.EnableRemoteAccess && !netutil.IsLocalOrLANRequest(r) {
+			if !verifyUserPassword(u, pw, legacySHA1) {
+				_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+					Name:     u.Name + " failed to log in",
+					Type:     "AuthenticationFailed",
+					UserID:   u.ID,
+					Severity: "Warning",
+				})
+				writeJSONError(w, r, http.StatusUnauthorized, "invalid username or password")
+				return
+			}
+			if u.IsDisabled || u.Policy.IsDisabled {
+				_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+					Name:     u.Name + " failed to log in (account disabled)",
+					Type:     "AuthenticationFailed",
+					UserID:   u.ID,
+					Severity: "Warning",
+				})
+				writeJSONError(w, r, http.StatusForbidden, "user is disabled")
+				return
+			}
+			_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+				Name:     u.Name + " failed to log in (remote access disabled)",
+				Type:     "AuthenticationFailed",
+				UserID:   u.ID,
+				Severity: "Warning",
+			})
+			writeJSONError(w, r, http.StatusForbidden, "Remote access is disabled for this user")
+			return
+		}
 		res, authErr := h.authSvc.AuthenticateByName(r.Context(), u.Name, pw, legacySHA1, client)
 		if authErr != nil {
 			switch {
@@ -448,17 +492,20 @@ func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pw := body.Pw
-	if pw == "" && body.Password != "" {
+	legacySHA1 := body.Password
+	if pw == "" && body.Password != "" && u.PasswordHash != "" {
 		pw = body.Password
+	}
+	if !verifyUserPassword(u, pw, legacySHA1) {
+		writeJSONError(w, r, http.StatusUnauthorized, "invalid username or password")
+		return
 	}
 	if u.IsDisabled || u.Policy.IsDisabled {
 		writeJSONError(w, r, http.StatusForbidden, "user is disabled")
 		return
 	}
-
-	ok, err := auth.VerifyPassword(pw, u.PasswordHash)
-	if err != nil || !ok {
-		writeJSONError(w, r, http.StatusUnauthorized, "invalid username or password")
+	if !u.Policy.EnableRemoteAccess && !netutil.IsLocalOrLANRequest(r) {
+		writeJSONError(w, r, http.StatusForbidden, "Remote access is disabled for this user")
 		return
 	}
 
@@ -1010,12 +1057,48 @@ func (h *Handler) postUserTypedSettings(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	settingKey := strings.TrimSpace(chi.URLParam(r, "Key"))
+	if settingKey == "" || len([]rune(settingKey)) > maxTypedSettingKeyLen {
+		httpx.Error(w, http.StatusBadRequest, "invalid setting key")
+		return
+	}
+	if r.ContentLength > maxKVJSONBodyBytes {
+		httpx.Error(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
 	body := map[string]any{}
-	if err := decodeOptionalJSON(r, &body); err != nil {
+	if err := decodeOptionalJSONLimit(r, &body, maxKVJSONBodyBytes); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	_ = h.saveKV(r.Context(), fmt.Sprintf("user_typed_settings:%s:%s", uid, settingKey), body)
+	prefix := fmt.Sprintf("user_typed_settings:%s:", uid)
+	fullKey := prefix + settingKey
+
+	h.mu.Lock()
+	var existing map[string]any
+	exists, _ := h.loadKVLocked(r.Context(), fullKey, &existing)
+	if !exists {
+		keyCount := 0
+		if st := h.kvStore(); st != nil && st.Reader != nil {
+			_ = st.Reader.QueryRowContext(
+				r.Context(),
+				`SELECT COUNT(*) FROM server_config WHERE substr(key, 1, ?) = ?`,
+				len(prefix), prefix,
+			).Scan(&keyCount)
+		} else {
+			for k := range h.memKV {
+				if strings.HasPrefix(k, prefix) {
+					keyCount++
+				}
+			}
+		}
+		if keyCount >= maxUserTypedSettingsKeys {
+			h.mu.Unlock()
+			httpx.Error(w, http.StatusBadRequest, "typed settings key limit reached")
+			return
+		}
+	}
+	_ = h.saveKVLocked(r.Context(), fullKey, body)
+	h.mu.Unlock()
 	httpx.NoContent(w)
 }
 
@@ -1824,6 +1907,20 @@ func (h *Handler) serveUserItemExtras(w http.ResponseWriter, r *http.Request, ex
 		httpx.Error(w, http.StatusInternalServerError, "failed to load item extras")
 		return
 	}
+	if (maxRating != nil || len(blockedTags) > 0) && len(items) > 0 {
+		filtered := make([]dto.BaseItemDto, 0, len(items))
+		for _, it := range items {
+			exRec, rErr := h.libRepo.GetItemRecordByID(r.Context(), it.Id)
+			if rErr != nil || exRec == nil {
+				continue
+			}
+			if blocked, bErr := h.libRepo.IsItemBlockedByParentalPolicy(r.Context(), exRec, maxRating, blockedTags); bErr != nil || blocked {
+				continue
+			}
+			filtered = append(filtered, it)
+		}
+		items = filtered
+	}
 	if items == nil {
 		items = []dto.BaseItemDto{}
 	}
@@ -2359,8 +2456,12 @@ func (h *Handler) postUserSettings(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, r, http.StatusForbidden, "forbidden")
 		return
 	}
+	if r.ContentLength > maxKVJSONBodyBytes {
+		httpx.Error(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
 	body := map[string]any{}
-	if err := decodeOptionalJSON(r, &body); err != nil {
+	if err := decodeOptionalJSONLimit(r, &body, maxKVJSONBodyBytes); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -2374,8 +2475,12 @@ func (h *Handler) postUserSettingsPartial(w http.ResponseWriter, r *http.Request
 		writeJSONError(w, r, http.StatusForbidden, "forbidden")
 		return
 	}
+	if r.ContentLength > maxKVJSONBodyBytes {
+		httpx.Error(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
 	patch := map[string]any{}
-	if err := decodeOptionalJSON(r, &patch); err != nil {
+	if err := decodeOptionalJSONLimit(r, &patch, maxKVJSONBodyBytes); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -2384,6 +2489,17 @@ func (h *Handler) postUserSettingsPartial(w http.ResponseWriter, r *http.Request
 	_, _ = h.loadKVLocked(r.Context(), "user_settings:"+uid, &current)
 	for k, v := range patch {
 		current[k] = v
+	}
+	rawMerged, err := json.Marshal(current)
+	if err != nil {
+		h.mu.Unlock()
+		httpx.Error(w, http.StatusInternalServerError, "failed to encode user settings")
+		return
+	}
+	if len(rawMerged) > maxKVJSONBodyBytes {
+		h.mu.Unlock()
+		httpx.Error(w, http.StatusRequestEntityTooLarge, "user settings payload too large")
+		return
 	}
 	_ = h.saveKVLocked(r.Context(), "user_settings:"+uid, current)
 	h.mu.Unlock()

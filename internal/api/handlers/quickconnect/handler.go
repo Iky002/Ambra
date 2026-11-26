@@ -121,6 +121,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authFuncs AuthFuncs) {
 	}
 
 	mux.HandleFunc("GET /QuickConnect/Enabled", h.handleEnabled)
+	mux.HandleFunc("GET /QuickConnect/Initiate", h.handleInitiate)
 	mux.HandleFunc("POST /QuickConnect/Initiate", h.handleInitiate)
 	mux.HandleFunc("GET /QuickConnect/Connect", h.handleConnect)
 	mux.Handle("POST /QuickConnect/Authorize", wrapAuth(http.HandlerFunc(h.handleAuthorize)))
@@ -419,7 +420,7 @@ func (h *Handler) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "failed to load user")
 		return
 	}
-	if !u.IsAdmin && !u.Policy.IsAdministrator && !u.Policy.EnableRemoteAccess && !netutil.IsLocalOrLANRequest(r) {
+	if !u.Policy.EnableRemoteAccess && !netutil.IsLocalOrLANRequest(r) {
 		httpx.Error(w, http.StatusForbidden, "remote access is disabled for this user")
 		return
 	}

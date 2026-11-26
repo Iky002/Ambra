@@ -1,8 +1,10 @@
 package compatext
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -23,6 +25,7 @@ const (
 	maxNotificationServices        = 500
 	maxNotificationServicesPerUser = 50
 	maxNotificationBodyBytes       = 64 << 10
+	maskedOptionValue              = "********"
 )
 
 // Mirror structures for reading/updating shared sync:state stored in server_config.
@@ -118,6 +121,7 @@ func (h *Handler) cleanupRemovedJobItems(r *http.Request, ids []string) {
 		return
 	}
 	h.mu.Lock()
+	snapshot := cloneCompatExtState(h.state)
 	changed := false
 	for _, id := range ids {
 		if h.state.RemovedJobItems[id] {
@@ -126,7 +130,9 @@ func (h *Handler) cleanupRemovedJobItems(r *http.Request, ids []string) {
 		}
 	}
 	if changed {
-		h.saveStateLocked(r.Context())
+		if err := h.saveStateLocked(r.Context()); err != nil {
+			h.state = snapshot
+		}
 	}
 	h.mu.Unlock()
 }
@@ -136,9 +142,13 @@ func (h *Handler) handleDeleteSyncJobPost(w http.ResponseWriter, r *http.Request
 	callerID, isAdmin, hasAuth := h.syncCallerIdentity(r)
 	if sh := h.getSyncHandler(); sh != nil {
 		removedItemIDs := sh.JobItemIDsForJob(id)
-		found, allowed := sh.DeleteJobForCaller(r.Context(), id, callerID, isAdmin || !hasAuth)
+		found, allowed, err := sh.DeleteJobForCaller(r.Context(), id, callerID, isAdmin || !hasAuth)
 		if !allowed {
 			httpx.Error(w, http.StatusForbidden, "access denied")
+			return
+		}
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to persist sync job deletion")
 			return
 		}
 		if found {
@@ -172,7 +182,10 @@ func (h *Handler) handleDeleteSyncJobPost(w http.ResponseWriter, r *http.Request
 		}
 		st.Jobs = jobs
 		st.JobItems = items
-		h.writeConfigJSON(r.Context(), syncConfigKey, st)
+		if err := h.writeConfigJSON(r.Context(), syncConfigKey, st); err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to persist sync job deletion")
+			return
+		}
 	}
 	h.cleanupRemovedJobItems(r, removedItemIDs)
 	httpx.NoContent(w)
@@ -247,9 +260,14 @@ func (h *Handler) handleMarkJobItemRemoval(mark bool) http.HandlerFunc {
 
 		if sh := h.getSyncHandler(); sh != nil {
 			var allowed bool
-			found, allowed = sh.SetJobItemRemovalForCaller(r.Context(), id, mark, callerID, isAdmin || !hasAuth)
+			var err error
+			found, allowed, err = sh.SetJobItemRemovalForCaller(r.Context(), id, mark, callerID, isAdmin || !hasAuth)
 			if !allowed {
 				httpx.Error(w, http.StatusForbidden, "access denied")
+				return
+			}
+			if err != nil {
+				httpx.Error(w, http.StatusInternalServerError, "failed to persist sync job item status")
 				return
 			}
 		} else {
@@ -273,13 +291,18 @@ func (h *Handler) handleMarkJobItemRemoval(mark bool) http.HandlerFunc {
 					}
 				}
 				if found {
-					h.writeConfigJSON(r.Context(), syncConfigKey, st)
+					if err := h.writeConfigJSON(r.Context(), syncConfigKey, st); err != nil {
+						httpx.Error(w, http.StatusInternalServerError, "failed to persist sync job item status")
+						return
+					}
 				}
 			}
 		}
 
 		h.mu.Lock()
 		h.ensureMapsLocked()
+		snapshot := cloneCompatExtState(h.state)
+		var saveErr error
 		if mark {
 			if found {
 				if !h.state.RemovedJobItems[id] && len(h.state.RemovedJobItems) >= maxRemovedJobItems {
@@ -288,15 +311,22 @@ func (h *Handler) handleMarkJobItemRemoval(mark bool) http.HandlerFunc {
 					return
 				}
 				h.state.RemovedJobItems[id] = true
-				h.saveStateLocked(r.Context())
+				saveErr = h.saveStateLocked(r.Context())
 			}
 		} else {
 			if h.state.RemovedJobItems[id] {
 				delete(h.state.RemovedJobItems, id)
-				h.saveStateLocked(r.Context())
+				saveErr = h.saveStateLocked(r.Context())
 			}
 		}
+		if saveErr != nil {
+			h.state = snapshot
+		}
 		h.mu.Unlock()
+		if saveErr != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to persist removal mark")
+			return
+		}
 
 		httpx.NoContent(w)
 	}
@@ -306,8 +336,13 @@ func (h *Handler) handleDeleteSyncJobItemPost(w http.ResponseWriter, r *http.Req
 	id := chi.URLParam(r, "Id")
 	callerID, isAdmin, hasAuth := h.syncCallerIdentity(r)
 	if sh := h.getSyncHandler(); sh != nil {
-		if _, allowed := sh.DeleteJobItemForCaller(r.Context(), id, callerID, isAdmin || !hasAuth); !allowed {
+		_, allowed, err := sh.DeleteJobItemForCaller(r.Context(), id, callerID, isAdmin || !hasAuth)
+		if !allowed {
 			httpx.Error(w, http.StatusForbidden, "access denied")
+			return
+		}
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to persist sync job item deletion")
 			return
 		}
 		h.cleanupRemovedJobItems(r, []string{id})
@@ -332,7 +367,10 @@ func (h *Handler) handleDeleteSyncJobItemPost(w http.ResponseWriter, r *http.Req
 			items = append(items, it)
 		}
 		st.JobItems = items
-		h.writeConfigJSON(r.Context(), syncConfigKey, st)
+		if err := h.writeConfigJSON(r.Context(), syncConfigKey, st); err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to persist sync job item deletion")
+			return
+		}
 	}
 	h.cleanupRemovedJobItems(r, []string{id})
 	httpx.NoContent(w)
@@ -361,9 +399,9 @@ func (h *Handler) handleCancelSyncItems(w http.ResponseWriter, r *http.Request) 
 	cleanedItemIDs := make([]string, 0, len(itemIDs))
 	idSet := make(map[string]struct{}, len(itemIDs))
 	for _, id := range itemIDs {
-		if trimmed := strings.TrimSpace(id); trimmed != "" {
-			cleanedItemIDs = append(cleanedItemIDs, trimmed)
-			idSet[trimmed] = struct{}{}
+		if norm := guid.Normalize(id); norm != "" {
+			cleanedItemIDs = append(cleanedItemIDs, norm)
+			idSet[norm] = struct{}{}
 		}
 	}
 	// Never wipe all sync items when neither TargetId nor ItemIds is specified.
@@ -374,8 +412,12 @@ func (h *Handler) handleCancelSyncItems(w http.ResponseWriter, r *http.Request) 
 
 	callerID, isAdmin, hasAuth := h.syncCallerIdentity(r)
 	if sh := h.getSyncHandler(); sh != nil {
-		if err := sh.CancelItemsForCaller(r.Context(), targetID, cleanedItemIDs, callerID, isAdmin || !hasAuth); errors.Is(err, syncapi.ErrForbidden) {
-			httpx.Error(w, http.StatusForbidden, "access denied")
+		if err := sh.CancelItemsForCaller(r.Context(), targetID, cleanedItemIDs, callerID, isAdmin || !hasAuth); err != nil {
+			if errors.Is(err, syncapi.ErrForbidden) {
+				httpx.Error(w, http.StatusForbidden, "access denied")
+				return
+			}
+			httpx.Error(w, http.StatusInternalServerError, "failed to persist sync cancellation")
 			return
 		}
 		httpx.NoContent(w)
@@ -389,7 +431,7 @@ func (h *Handler) handleCancelSyncItems(w http.ResponseWriter, r *http.Request) 
 		deniedCount := 0
 		for _, it := range st.JobItems {
 			targetMatch := targetID == "" || it.TargetId == targetID
-			_, itemMatch := idSet[it.ItemId]
+			_, itemMatch := idSet[guid.Normalize(it.ItemId)]
 			if targetMatch && (len(idSet) == 0 || itemMatch) {
 				if hasAuth && !isAdmin {
 					ownerID := sharedJobOwner(st.Jobs, it.JobId)
@@ -410,7 +452,10 @@ func (h *Handler) handleCancelSyncItems(w http.ResponseWriter, r *http.Request) 
 		}
 		if removedCount > 0 {
 			st.JobItems = remaining
-			h.writeConfigJSON(r.Context(), syncConfigKey, st)
+			if err := h.writeConfigJSON(r.Context(), syncConfigKey, st); err != nil {
+				httpx.Error(w, http.StatusInternalServerError, "failed to persist sync cancellation")
+				return
+			}
 		}
 	}
 	httpx.NoContent(w)
@@ -512,9 +557,11 @@ func (h *Handler) handleSyncJobItemFile(headOnly bool) http.HandlerFunc {
 			httpx.Error(w, http.StatusForbidden, "downloading .strm files is not allowed")
 			return
 		}
+		var itemRec *sqlite.ItemRecord
+		var libRepo *sqlite.LibraryRepo
 		if targetItemID != "" {
 			h.mu.RLock()
-			libRepo := h.libRepo
+			libRepo = h.libRepo
 			h.mu.RUnlock()
 			if libRepo != nil {
 				rec, err := libRepo.GetItemRecordByID(r.Context(), guid.Normalize(targetItemID))
@@ -534,6 +581,7 @@ func (h *Handler) handleSyncJobItemFile(headOnly bool) http.HandlerFunc {
 					httpx.Error(w, http.StatusForbidden, "downloading .strm files is not allowed")
 					return
 				}
+				itemRec = rec
 			}
 		}
 
@@ -545,8 +593,63 @@ func (h *Handler) handleSyncJobItemFile(headOnly bool) http.HandlerFunc {
 			httpx.Error(w, http.StatusNotFound, "sync file not available")
 			return
 		}
-		fi, err := os.Stat(outPath)
-		if err != nil || fi.IsDir() {
+		realOut, err := filepath.EvalSymlinks(outPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				if headOnly {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				httpx.Error(w, http.StatusNotFound, "sync file not found")
+				return
+			}
+			if headOnly {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			httpx.Error(w, http.StatusForbidden, "sync file path is not accessible")
+			return
+		}
+		realOut = filepath.Clean(realOut)
+		if strings.EqualFold(filepath.Ext(realOut), ".strm") {
+			if headOnly {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			httpx.Error(w, http.StatusForbidden, "downloading .strm files is not allowed")
+			return
+		}
+		if libRepo != nil && itemRec != nil {
+			recPath := strings.TrimSpace(itemRec.Path)
+			if recPath == "" {
+				if headOnly {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				httpx.Error(w, http.StatusForbidden, "sync file path mismatch")
+				return
+			}
+			realRecPath, recErr := filepath.EvalSymlinks(recPath)
+			if recErr != nil || filepath.Clean(realRecPath) != realOut {
+				if headOnly {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				httpx.Error(w, http.StatusForbidden, "sync file path mismatch")
+				return
+			}
+			if !isPathWithinRegisteredLibraries(r.Context(), libRepo, realOut) {
+				if headOnly {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				httpx.Error(w, http.StatusForbidden, "sync file path is outside registered media libraries")
+				return
+			}
+		}
+
+		fi, err := os.Stat(realOut)
+		if err != nil || fi.IsDir() || !fi.Mode().IsRegular() {
 			if headOnly {
 				w.WriteHeader(http.StatusNotFound)
 				return
@@ -554,8 +657,46 @@ func (h *Handler) handleSyncJobItemFile(headOnly bool) http.HandlerFunc {
 			httpx.Error(w, http.StatusNotFound, "sync file not found")
 			return
 		}
-		http.ServeFile(w, r, outPath)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Content-Security-Policy", "sandbox")
+		w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filepath.Base(realOut)}))
+		http.ServeFile(w, r, realOut)
 	}
+}
+
+func isPathWithinRegisteredLibraries(ctx context.Context, libRepo *sqlite.LibraryRepo, realTarget string) bool {
+	if libRepo == nil || realTarget == "" {
+		return false
+	}
+	libs, err := libRepo.ListLibraries(ctx)
+	if err != nil {
+		return false
+	}
+	cleanTarget := filepath.Clean(realTarget)
+	for _, lib := range libs {
+		for _, rawRoot := range lib.Paths {
+			rawRoot = strings.TrimSpace(rawRoot)
+			if rawRoot == "" {
+				continue
+			}
+			realRoot, err := filepath.EvalSymlinks(rawRoot)
+			if err != nil {
+				realRoot, err = filepath.Abs(rawRoot)
+				if err != nil {
+					continue
+				}
+			}
+			realRoot = filepath.Clean(realRoot)
+			rel, err := filepath.Rel(realRoot, cleanTarget)
+			if err != nil {
+				continue
+			}
+			if rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (h *Handler) handleSyncJobItemAdditionalFiles(w http.ResponseWriter, r *http.Request) {
@@ -666,14 +807,22 @@ func (h *Handler) handleSyncOfflineActions(w http.ResponseWriter, r *http.Reques
 					return
 				}
 				h.mu.Lock()
+				snapshot := cloneCompatExtState(h.state)
 				h.state.OfflineActions = append(h.state.OfflineActions, allowedActions...)
 				if len(h.state.OfflineActions) > maxOfflineActions {
 					h.state.OfflineActions = append([]OfflineAction(nil), h.state.OfflineActions[len(h.state.OfflineActions)-maxOfflineActions:]...)
 				}
-				h.saveStateLocked(r.Context())
+				saveErr := h.saveStateLocked(r.Context())
+				if saveErr != nil {
+					h.state = snapshot
+				}
 				libRepo := h.libRepo
 				userRepo := h.userRepo
 				h.mu.Unlock()
+				if saveErr != nil {
+					httpx.Error(w, http.StatusInternalServerError, "failed to persist offline actions")
+					return
+				}
 
 				if libRepo != nil {
 					callerID, isAdmin := h.callerIdentity(r)
@@ -737,6 +886,59 @@ func (h *Handler) handleSyncOfflineActions(w http.ResponseWriter, r *http.Reques
 	httpx.NoContent(w)
 }
 
+func isSensitiveNotificationOptionKey(k string) bool {
+	lk := strings.ToLower(strings.TrimSpace(k))
+	if strings.Contains(lk, "key") ||
+		strings.Contains(lk, "secret") ||
+		strings.Contains(lk, "token") ||
+		strings.Contains(lk, "password") ||
+		strings.Contains(lk, "credential") ||
+		strings.Contains(lk, "authorization") ||
+		strings.Contains(lk, "cookie") ||
+		strings.Contains(lk, "webhook") {
+		return true
+	}
+	return lk == "pin" || strings.HasSuffix(lk, "_pin") || strings.HasSuffix(lk, "-pin")
+}
+
+func maskNotificationServiceConfig(svc NotificationServiceConfig) NotificationServiceConfig {
+	cp := svc
+	if svc.Events != nil {
+		cp.Events = append([]string(nil), svc.Events...)
+	}
+	if svc.Options != nil {
+		masked := make(map[string]string, len(svc.Options))
+		for k, v := range svc.Options {
+			if isSensitiveNotificationOptionKey(k) && strings.TrimSpace(v) != "" {
+				masked[k] = maskedOptionValue
+			} else {
+				masked[k] = v
+			}
+		}
+		cp.Options = masked
+	}
+	return cp
+}
+
+func mergeNotificationOptions(prev, incoming map[string]string) map[string]string {
+	if incoming == nil {
+		return nil
+	}
+	out := make(map[string]string, len(incoming))
+	for k, v := range incoming {
+		if isSensitiveNotificationOptionKey(k) && strings.TrimSpace(v) == maskedOptionValue {
+			if prev != nil {
+				if oldVal := prev[k]; strings.TrimSpace(oldVal) != "" {
+					out[k] = oldVal
+				}
+			}
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
 func (h *Handler) handleGetConfiguredNotifications(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	userID := guid.Normalize(q.Get("UserId"))
@@ -756,7 +958,7 @@ func (h *Handler) handleGetConfiguredNotifications(w http.ResponseWriter, r *htt
 		if userID != "" && guid.Normalize(svc.UserId) != userID {
 			continue
 		}
-		out = append(out, svc)
+		out = append(out, maskNotificationServiceConfig(svc))
 	}
 	h.mu.RUnlock()
 
@@ -795,6 +997,7 @@ func (h *Handler) handleSaveConfiguredNotification(w http.ResponseWriter, r *htt
 	}
 
 	h.mu.Lock()
+	snapshot := cloneCompatExtState(h.state)
 	updated := false
 	for i := range h.state.NotificationServices {
 		if h.state.NotificationServices[i].Id == svc.Id {
@@ -803,6 +1006,7 @@ func (h *Handler) handleSaveConfiguredNotification(w http.ResponseWriter, r *htt
 				httpx.Error(w, http.StatusForbidden, "access denied")
 				return
 			}
+			svc.Options = mergeNotificationOptions(h.state.NotificationServices[i].Options, svc.Options)
 			h.state.NotificationServices[i] = svc
 			updated = true
 			break
@@ -827,12 +1031,20 @@ func (h *Handler) handleSaveConfiguredNotification(w http.ResponseWriter, r *htt
 				return
 			}
 		}
+		svc.Options = mergeNotificationOptions(nil, svc.Options)
 		h.state.NotificationServices = append(h.state.NotificationServices, svc)
 	}
-	h.saveStateLocked(r.Context())
+	saveErr := h.saveStateLocked(r.Context())
+	if saveErr != nil {
+		h.state = snapshot
+	}
 	h.mu.Unlock()
+	if saveErr != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to persist notification service")
+		return
+	}
 
-	httpx.JSON(w, http.StatusOK, svc)
+	httpx.JSON(w, http.StatusOK, maskNotificationServiceConfig(svc))
 }
 
 func (h *Handler) handleNotificationServiceDefaults(w http.ResponseWriter, r *http.Request) {
@@ -848,9 +1060,54 @@ func (h *Handler) handleNotificationServiceDefaults(w http.ResponseWriter, r *ht
 }
 
 func (h *Handler) handleTestNotificationService(w http.ResponseWriter, r *http.Request) {
+	q := httpx.ParseQuery(r)
+	targetID := strings.TrimSpace(q.Get("Id"))
+	targetUserID := strings.TrimSpace(q.Get("UserId"))
+	if r.Body != nil {
+		var body struct {
+			Id     string `json:"Id"`
+			UserId string `json:"UserId"`
+		}
+		if err := httpx.DecodeJSONLimit(r, &body, maxNotificationBodyBytes); err == nil {
+			if targetID == "" {
+				targetID = strings.TrimSpace(body.Id)
+			}
+			if targetUserID == "" {
+				targetUserID = strings.TrimSpace(body.UserId)
+			}
+		}
+	}
+
+	callerID, isAdmin := h.callerIdentity(r)
 	h.mu.Lock()
+	if !isAdmin && callerID != "" {
+		if targetUserID != "" && guid.Normalize(targetUserID) != callerID {
+			h.mu.Unlock()
+			httpx.Error(w, http.StatusForbidden, "access denied")
+			return
+		}
+		if targetID != "" {
+			found := false
+			for _, svc := range h.state.NotificationServices {
+				if svc.Id == targetID {
+					found = true
+					if guid.Normalize(svc.UserId) != callerID {
+						h.mu.Unlock()
+						httpx.Error(w, http.StatusForbidden, "access denied")
+						return
+					}
+					break
+				}
+			}
+			if !found {
+				h.mu.Unlock()
+				httpx.Error(w, http.StatusNotFound, "notification service not found")
+				return
+			}
+		}
+	}
+	// Record last test timestamp in memory without unconditional SQLite write on every test call.
 	h.state.LastTestNotifUnix = time.Now().UTC().Unix()
-	h.saveStateLocked(r.Context())
 	h.mu.Unlock()
 	httpx.NoContent(w)
 }
@@ -860,6 +1117,7 @@ func (h *Handler) handleDeleteConfiguredNotification(w http.ResponseWriter, r *h
 	if id != "" {
 		callerID, isAdmin := h.callerIdentity(r)
 		h.mu.Lock()
+		snapshot := cloneCompatExtState(h.state)
 		filtered := make([]NotificationServiceConfig, 0, len(h.state.NotificationServices))
 		for _, svc := range h.state.NotificationServices {
 			if svc.Id == id {
@@ -873,8 +1131,15 @@ func (h *Handler) handleDeleteConfiguredNotification(w http.ResponseWriter, r *h
 			filtered = append(filtered, svc)
 		}
 		h.state.NotificationServices = filtered
-		h.saveStateLocked(r.Context())
+		saveErr := h.saveStateLocked(r.Context())
+		if saveErr != nil {
+			h.state = snapshot
+		}
 		h.mu.Unlock()
+		if saveErr != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to persist notification service deletion")
+			return
+		}
 	}
 	httpx.NoContent(w)
 }

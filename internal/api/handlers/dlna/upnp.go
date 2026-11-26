@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ambra-media/ambra/internal/api/dto"
+	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
@@ -109,6 +110,10 @@ func buildDescriptionXML(friendlyName, uuid, baseURL string) string {
 // --- SOAP Control Handlers ---
 
 func (h *Handler) handleContentDirectoryControl(w http.ResponseWriter, r *http.Request) {
+	if !h.allowSOAPRequest(r) {
+		httpx.Error(w, http.StatusTooManyRequests, "too many DLNA SOAP requests")
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		writeSOAPFault(w, r, 501, "Action Failed")
@@ -154,6 +159,10 @@ func (h *Handler) handleContentDirectoryControl(w http.ResponseWriter, r *http.R
 }
 
 func (h *Handler) handleConnectionManagerControl(w http.ResponseWriter, r *http.Request) {
+	if !h.allowSOAPRequest(r) {
+		httpx.Error(w, http.StatusTooManyRequests, "too many DLNA SOAP requests")
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		writeSOAPFault(w, r, 501, "Action Failed")
@@ -214,22 +223,39 @@ func (h *Handler) isDLNAVisibleItem(ctx context.Context, itemType, itemID string
 	return true
 }
 
-func (h *Handler) privatePlaylistIDs(ctx context.Context, serverID string) []string {
-	if h.libRepo == nil {
+func (h *Handler) privatePlaylistIDs(ctx context.Context, _ string) []string {
+	if h.store == nil {
 		return nil
 	}
-	playlists, _, err := h.libRepo.QueryItems(ctx, sqlite.ItemFilter{
-		ServerID:         serverID,
-		IncludeItemTypes: []string{"Playlist"},
-		Limit:            maxDLNARequestedCount * 4,
-	})
-	if err != nil || len(playlists) == 0 {
+	rows, err := h.store.Reader.QueryContext(ctx, `
+		SELECT i.id, COALESCE(sc.value_json, '')
+		FROM items i
+		LEFT JOIN server_config sc
+			ON sc.key = 'item_visibility_' || lower(replace(i.id, '-', ''))
+		WHERE lower(i.type) = 'playlist'
+	`)
+	if err != nil {
 		return nil
 	}
+	defer rows.Close()
+
 	var privateIDs []string
-	for _, pl := range playlists {
-		if !h.isPublicPlaylist(ctx, pl.Id) {
-			privateIDs = append(privateIDs, pl.Id)
+	for rows.Next() {
+		var id, rawVis string
+		if err := rows.Scan(&id, &rawVis); err != nil {
+			continue
+		}
+		isPublic := false
+		if rawVis != "" {
+			var vis struct {
+				IsPublic bool `json:"IsPublic"`
+			}
+			if json.Unmarshal([]byte(rawVis), &vis) == nil && vis.IsPublic {
+				isPublic = true
+			}
+		}
+		if !isPublic {
+			privateIDs = append(privateIDs, id)
 		}
 	}
 	return privateIDs
@@ -322,16 +348,29 @@ func (h *Handler) handleSearch(ctx context.Context, r *http.Request, params map[
 	totalMatches := 0
 
 	if h.libRepo != nil {
+		policy, denyAll := h.resolveDefaultUserPolicy(ctx)
+		if denyAll {
+			didl := `<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"></DIDL-Lite>`
+			h.mu.RLock()
+			uid := h.systemUpdate
+			h.mu.RUnlock()
+			return fmt.Sprintf(
+				"<Result>%s</Result><NumberReturned>0</NumberReturned><TotalMatches>0</TotalMatches><UpdateID>%d</UpdateID>",
+				xmlEscape(didl), uid,
+			), nil
+		}
 		if containerID != "0" {
-			if rec, recErr := h.libRepo.GetItemRecordByID(ctx, containerID); recErr == nil && rec != nil && !h.isDLNAVisibleItem(ctx, rec.Type, rec.ID) {
-				didl := `<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"></DIDL-Lite>`
-				h.mu.RLock()
-				uid := h.systemUpdate
-				h.mu.RUnlock()
-				return fmt.Sprintf(
-					"<Result>%s</Result><NumberReturned>0</NumberReturned><TotalMatches>0</TotalMatches><UpdateID>%d</UpdateID>",
-					xmlEscape(didl), uid,
-				), nil
+			if rec, recErr := h.libRepo.GetItemRecordByID(ctx, containerID); recErr == nil && rec != nil {
+				if !h.isDLNAVisibleItem(ctx, rec.Type, rec.ID) || !h.isItemAllowedByDefaultPolicy(ctx, rec) {
+					didl := `<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"></DIDL-Lite>`
+					h.mu.RLock()
+					uid := h.systemUpdate
+					h.mu.RUnlock()
+					return fmt.Sprintf(
+						"<Result>%s</Result><NumberReturned>0</NumberReturned><TotalMatches>0</TotalMatches><UpdateID>%d</UpdateID>",
+						xmlEscape(didl), uid,
+					), nil
+				}
 			}
 		}
 
@@ -349,8 +388,35 @@ func (h *Handler) handleSearch(ctx context.Context, r *http.Request, params map[
 			StartIndex:       startIdx,
 			Limit:            reqCount,
 		}
+		if policy != nil {
+			if !policy.EnableAllFolders {
+				if len(policy.EnabledFolders) == 0 {
+					didl := `<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"></DIDL-Lite>`
+					h.mu.RLock()
+					uid := h.systemUpdate
+					h.mu.RUnlock()
+					return fmt.Sprintf(
+						"<Result>%s</Result><NumberReturned>0</NumberReturned><TotalMatches>0</TotalMatches><UpdateID>%d</UpdateID>",
+						xmlEscape(didl), uid,
+					), nil
+				}
+				filter.AllowedLibraryIDs = policy.EnabledFolders
+			}
+			filter.MaxParentalRating = policy.MaxParentalRating
+			filter.BlockedTags = policy.BlockedTags
+		}
 		if containerID != "0" {
 			if _, libErr := h.libRepo.GetLibrary(ctx, containerID); libErr == nil {
+				if !h.isLibraryAllowedByPolicy(containerID, policy) {
+					didl := `<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"></DIDL-Lite>`
+					h.mu.RLock()
+					uid := h.systemUpdate
+					h.mu.RUnlock()
+					return fmt.Sprintf(
+						"<Result>%s</Result><NumberReturned>0</NumberReturned><TotalMatches>0</TotalMatches><UpdateID>%d</UpdateID>",
+						xmlEscape(didl), uid,
+					), nil
+				}
 				filter.LibraryID = containerID
 			} else {
 				filter.ParentID = containerID
@@ -489,8 +555,20 @@ func (h *Handler) browseMetadata(ctx context.Context, objectID, baseURL, serverU
 	if h.libRepo == nil {
 		return "", fmt.Errorf("object not found")
 	}
+	policy, denyAll := h.resolveDefaultUserPolicy(ctx)
+	if denyAll {
+		return "", fmt.Errorf("object not found")
+	}
 	if lib, err := h.libRepo.GetLibrary(ctx, objectID); err == nil {
+		if !h.isLibraryAllowedByPolicy(lib.ID, policy) {
+			return "", fmt.Errorf("object not found")
+		}
 		return libraryToDIDL(*lib), nil
+	}
+	if rec, recErr := h.libRepo.GetItemRecordByID(ctx, objectID); recErr == nil && rec != nil {
+		if !h.isItemAllowedByDefaultPolicy(ctx, rec) {
+			return "", fmt.Errorf("object not found")
+		}
 	}
 	item, err := h.libRepo.GetItemByID(ctx, snap.ServerID, "", objectID)
 	if err != nil {
@@ -507,14 +585,25 @@ func (h *Handler) browseDirectChildren(ctx context.Context, objectID string, sta
 		return nil, 0, nil
 	}
 
+	policy, denyAll := h.resolveDefaultUserPolicy(ctx)
+	if denyAll {
+		return nil, 0, nil
+	}
+
 	snap := h.cfgSnapshot()
 	reqCount = clampRequestedCount(reqCount)
 	sortBy, sortOrder := parseSortCriteria(sortCriteria)
 
 	if objectID == "0" {
-		libs, err := h.libRepo.ListLibraries(ctx)
+		allLibs, err := h.libRepo.ListLibraries(ctx)
 		if err != nil {
 			return nil, 0, err
+		}
+		libs := make([]sqlite.LibraryRecord, 0, len(allLibs))
+		for _, lib := range allLibs {
+			if h.isLibraryAllowedByPolicy(lib.ID, policy) {
+				libs = append(libs, lib)
+			}
 		}
 		if len(sortBy) > 0 && sortBy[0] == "SortName" {
 			desc := strings.EqualFold(sortOrder, "Descending")
@@ -541,12 +630,17 @@ func (h *Handler) browseDirectChildren(ctx context.Context, objectID string, sta
 		return out, total, nil
 	}
 
-	if rec, recErr := h.libRepo.GetItemRecordByID(ctx, objectID); recErr == nil && rec != nil && !h.isDLNAVisibleItem(ctx, rec.Type, rec.ID) {
+	if _, libErr := h.libRepo.GetLibrary(ctx, objectID); libErr == nil && !h.isLibraryAllowedByPolicy(objectID, policy) {
 		return nil, 0, fmt.Errorf("object not found")
+	}
+	if rec, recErr := h.libRepo.GetItemRecordByID(ctx, objectID); recErr == nil && rec != nil {
+		if !h.isDLNAVisibleItem(ctx, rec.Type, rec.ID) || !h.isItemAllowedByDefaultPolicy(ctx, rec) {
+			return nil, 0, fmt.Errorf("object not found")
+		}
 	}
 	privatePlaylists := h.privatePlaylistIDs(ctx, snap.ServerID)
 
-	items, total, err := h.libRepo.QueryItems(ctx, sqlite.ItemFilter{
+	baseFilter := sqlite.ItemFilter{
 		ServerID:       snap.ServerID,
 		ParentID:       objectID,
 		ExcludeItemIDs: privatePlaylists,
@@ -554,22 +648,29 @@ func (h *Handler) browseDirectChildren(ctx context.Context, objectID string, sta
 		SortOrder:      sortOrder,
 		StartIndex:     startIdx,
 		Limit:          reqCount,
-	})
+	}
+	if policy != nil {
+		if !policy.EnableAllFolders {
+			if len(policy.EnabledFolders) == 0 {
+				return nil, 0, nil
+			}
+			baseFilter.AllowedLibraryIDs = policy.EnabledFolders
+		}
+		baseFilter.MaxParentalRating = policy.MaxParentalRating
+		baseFilter.BlockedTags = policy.BlockedTags
+	}
+
+	items, total, err := h.libRepo.QueryItems(ctx, baseFilter)
 	if err != nil {
 		return nil, 0, err
 	}
 	// Fallback: if browsing a library root whose top-level items only set library_id
 	if total == 0 {
 		if _, libErr := h.libRepo.GetLibrary(ctx, objectID); libErr == nil {
-			items, total, err = h.libRepo.QueryItems(ctx, sqlite.ItemFilter{
-				ServerID:       snap.ServerID,
-				LibraryID:      objectID,
-				ExcludeItemIDs: privatePlaylists,
-				SortBy:         sortBy,
-				SortOrder:      sortOrder,
-				StartIndex:     startIdx,
-				Limit:          reqCount,
-			})
+			libFilter := baseFilter
+			libFilter.ParentID = ""
+			libFilter.LibraryID = objectID
+			items, total, err = h.libRepo.QueryItems(ctx, libFilter)
 			if err != nil {
 				return nil, 0, err
 			}

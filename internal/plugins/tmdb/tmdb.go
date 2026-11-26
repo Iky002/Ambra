@@ -65,7 +65,7 @@ func (p *Provider) snapshot() providerConfig {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	apiKey := p.apiKey
-	if apiKey == "" {
+	if apiKey == "" && urlHostLower(p.baseURL) == urlHostLower(defaultBaseURL) {
 		apiKey = p.defaultAPIKey
 	}
 	return providerConfig{
@@ -144,18 +144,28 @@ func urlHostLower(raw string) string {
 }
 
 func (p *Provider) Configure(cfg map[string]any) error {
+	if cfg == nil {
+		return nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	nextAPIKey := p.apiKey
+	nextLanguage := p.language
+	nextBaseURL := p.baseURL
+	nextImageBaseURL := p.imageBaseURL
+	nextEnabled := p.enabled
+
 	hasNewAPIKey := false
 	if v, ok := cfg["api_key"].(string); ok {
-		p.apiKey = strings.TrimSpace(v)
+		nextAPIKey = strings.TrimSpace(v)
 		hasNewAPIKey = true
 	} else if v, ok := cfg["ApiKey"].(string); ok {
-		p.apiKey = strings.TrimSpace(v)
+		nextAPIKey = strings.TrimSpace(v)
 		hasNewAPIKey = true
 	}
 	if v, ok := cfg["language"].(string); ok && v != "" {
-		p.language = v
+		nextLanguage = v
 	}
 	if v, ok := cfg["base_url"].(string); ok && strings.TrimSpace(v) != "" {
 		valid, err := validateHTTPBaseURL(v)
@@ -163,20 +173,28 @@ func (p *Provider) Configure(cfg map[string]any) error {
 			return fmt.Errorf("tmdb base_url: %w", err)
 		}
 		if urlHostLower(valid) != urlHostLower(p.baseURL) && !hasNewAPIKey {
-			p.apiKey = ""
+			nextAPIKey = ""
 		}
-		p.baseURL = valid
+		nextBaseURL = valid
 	}
 	if v, ok := cfg["image_base_url"].(string); ok && strings.TrimSpace(v) != "" {
 		valid, err := validateHTTPBaseURL(v)
 		if err != nil {
 			return fmt.Errorf("tmdb image_base_url: %w", err)
 		}
-		p.imageBaseURL = valid
+		nextImageBaseURL = valid
 	}
 	if v, ok := cfg["enabled"].(bool); ok {
-		p.enabled = v
+		nextEnabled = v
+	} else if v, ok := cfg["Enabled"].(bool); ok {
+		nextEnabled = v
 	}
+
+	p.apiKey = nextAPIKey
+	p.language = nextLanguage
+	p.baseURL = nextBaseURL
+	p.imageBaseURL = nextImageBaseURL
+	p.enabled = nextEnabled
 	return nil
 }
 

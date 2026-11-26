@@ -94,6 +94,22 @@ func (e *Extractor) FindExistingBIF(mediaPath, itemID string, width int) string 
 // and packs them into a standard Roku/Emby BIF v0 archive under <BifCacheDir>/<itemID>/index_<width>.bif.
 // Remote HTTP/STRM inputs are intentionally skipped.
 func (e *Extractor) GenerateBIF(ctx context.Context, mediaPath, itemID string, width, intervalSec int) (string, error) {
+	return e.generateBIF(ctx, mediaPath, itemID, width, intervalSec, false)
+}
+
+// GenerateBIFWithContext is identical to GenerateBIF except that cancellation of ctx
+// immediately terminates the underlying FFmpeg process (suitable for scheduled batch jobs and shutdown).
+func (e *Extractor) GenerateBIFWithContext(ctx context.Context, mediaPath, itemID string, width, intervalSec int) (string, error) {
+	return e.generateBIF(ctx, mediaPath, itemID, width, intervalSec, true)
+}
+
+func (e *Extractor) generateBIF(ctx context.Context, mediaPath, itemID string, width, intervalSec int, respectCancel bool) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if respectCancel && ctx.Err() != nil {
+		return "", ctx.Err()
+	}
 	if width <= 0 {
 		width = DefaultBIFWidth
 	}
@@ -135,7 +151,11 @@ func (e *Extractor) GenerateBIF(ctx context.Context, mediaPath, itemID string, w
 		}
 		defer os.RemoveAll(stageDir)
 
-		runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultBIFTimeout)
+		parentCtx := context.WithoutCancel(ctx)
+		if respectCancel {
+			parentCtx = ctx
+		}
+		runCtx, cancel := context.WithTimeout(parentCtx, defaultBIFTimeout)
 		defer cancel()
 
 		framePattern := filepath.Join(stageDir, "frame_%06d.jpg")

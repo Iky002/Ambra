@@ -12,6 +12,7 @@ interface AuthContextValue {
   user: UserDto | null
   isAdmin: boolean
   userLoading: boolean
+  userError?: string | null
   login: (username: string, password: string) => Promise<void>
   applyAuthResult: (res: AuthenticationResult) => void
   logout: () => void
@@ -26,9 +27,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [auth, setAuth] = useState<AuthSession | null>(() => getStoredAuth())
   const [user, setUser] = useState<UserDto | null>(null)
   const [userLoading, setUserLoading] = useState<boolean>(() => Boolean(getStoredAuth()))
+  const [userError, setUserError] = useState<string | null>(null)
   const skipNextRefreshUserIdRef = useRef<string | null>(null)
+  const refreshSeqRef = useRef(0)
 
   const logout = useCallback(() => {
+    refreshSeqRef.current += 1
     skipNextRefreshUserIdRef.current = null
     if (isDemoMode()) {
       try {
@@ -44,20 +48,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     queryClient?.clear()
     setAuth(null)
     setUser(null)
+    setUserError(null)
     setUserLoading(false)
   }, [queryClient])
 
   const refreshUser = useCallback(async () => {
+    const seq = ++refreshSeqRef.current
     const current = getStoredAuth()
     if (!current?.userId) {
       setUser(null)
+      setUserError(null)
       setUserLoading(false)
       return
     }
     setUserLoading(true)
     try {
       const freshUser = await api.getUser(current.userId)
+      if (seq !== refreshSeqRef.current || getStoredAuth()?.accessToken !== current.accessToken) {
+        return
+      }
       setUser(freshUser)
+      setUserError(null)
       syncPlaybackPrefsFromUserConfig(freshUser.Configuration)
       const freshIsAdmin = Boolean(freshUser.Policy?.IsAdministrator)
       if (current.isAdmin !== freshIsAdmin || current.userName !== freshUser.Name) {
@@ -69,15 +80,23 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         saveAuth(updated)
         setAuth(updated)
       }
-    } catch {
-      // 如果因 401 失效，embyFetch 会触发 ambra:unauthorized 事件清空 auth
+    } catch (err) {
+      if (seq !== refreshSeqRef.current || getStoredAuth()?.accessToken !== current.accessToken) {
+        return
+      }
+      // 401 失效时 embyFetch 会触发 ambra:unauthorized 事件清空 auth/user；
+      // 非 401 网络/500 错误保留既有已验证 user 与重试能力，仅记录错误状态
+      setUserError(err instanceof Error ? err.message : '用户信息加载失败')
     } finally {
-      setUserLoading(false)
+      if (seq === refreshSeqRef.current) {
+        setUserLoading(false)
+      }
     }
   }, [])
 
   const applyAuthResult = useCallback(
     (res: AuthenticationResult) => {
+      refreshSeqRef.current += 1
       const isAdminFlag = Boolean(res.User.Policy?.IsAdministrator)
       const session: AuthSession = {
         accessToken: res.AccessToken,
@@ -100,6 +119,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       saveAuth(session)
       setAuth(session)
       setUser(res.User)
+      setUserError(null)
       syncPlaybackPrefsFromUserConfig(res.User.Configuration)
       setUserLoading(false)
     },
@@ -152,10 +172,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     const onUnauthorized = () => {
+      refreshSeqRef.current += 1
       skipNextRefreshUserIdRef.current = null
       queryClient?.clear()
       setAuth(null)
       setUser(null)
+      setUserError(null)
       setUserLoading(false)
     }
     window.addEventListener('ambra:unauthorized', onUnauthorized)
@@ -172,6 +194,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         user,
         isAdmin,
         userLoading,
+        userError,
         login,
         applyAuthResult,
         logout,

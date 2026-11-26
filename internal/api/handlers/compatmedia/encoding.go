@@ -1385,7 +1385,7 @@ func (h *Handler) handleCollectionProviderItems(w http.ResponseWriter, r *http.R
 	}
 	startIndex := q.Int("StartIndex", 0)
 	limit := q.Int("Limit", 0)
-	needFilter := allowed != nil || maxRating != nil || len(blockedTags) > 0
+	needFilter := h.isNonAdminCaller(r) || allowed != nil || maxRating != nil || len(blockedTags) > 0
 
 	fetchStart, fetchLimit := startIndex, limit
 	if needFilter {
@@ -1420,7 +1420,11 @@ func (h *Handler) handleCollectionProviderItems(w http.ResponseWriter, r *http.R
 			if recErr != nil || rec == nil {
 				continue
 			}
-			if allowed != nil && rec.LibraryID != "" && !isLibraryAllowed(rec.LibraryID, allowed) {
+			if strings.EqualFold(rec.Type, "Playlist") {
+				if !h.canViewPlaylist(r, rec.ID, rec.ParentID) {
+					continue
+				}
+			} else if allowed != nil && rec.LibraryID != "" && !isLibraryAllowed(rec.LibraryID, allowed) {
 				continue
 			}
 			if maxRating != nil || len(blockedTags) > 0 {
@@ -1518,22 +1522,30 @@ func (h *Handler) handleAddToPlaylistInfo(w http.ResponseWriter, r *http.Request
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
 
-	if rec, err := h.repo.GetItemRecordByID(r.Context(), playlistID); err == nil && rec != nil {
-		if strings.EqualFold(rec.Type, "Playlist") {
-			callerID, isAdmin := h.callerIdentity(r)
-			if (callerID != "" || isAdmin) && !isAdmin {
-				ownerID := guid.Normalize(rec.ParentID)
-				if ownerID != "" && ownerID != callerID {
-					var vis struct {
-						IsPublic bool `json:"IsPublic"`
-					}
-					ok, _ := h.getConfigJSON(r.Context(), "item_visibility_"+rec.ID, &vis)
-					if !ok || !vis.IsPublic {
-						httpx.Error(w, http.StatusForbidden, "forbidden")
-						return
-					}
-				}
-			}
+	rec, err := h.repo.GetItemRecordByID(r.Context(), playlistID)
+	if errors.Is(err, sqlite.ErrNotFound) || (err == nil && (rec == nil || !strings.EqualFold(rec.Type, "Playlist"))) {
+		httpx.Error(w, http.StatusNotFound, "playlist not found")
+		return
+	}
+	if err != nil {
+		slog.Error("internal error in compatmedia encoding handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	if !h.canViewPlaylist(r, rec.ID, rec.ParentID) {
+		httpx.Error(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	if maxRating != nil || len(blockedTags) > 0 {
+		blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags)
+		if bErr != nil {
+			slog.Error("failed to verify parental policy", "playlist_id", playlistID, "error", bErr)
+			httpx.Error(w, http.StatusInternalServerError, "failed to verify item access")
+			return
+		}
+		if blocked {
+			httpx.Error(w, http.StatusForbidden, "access denied")
+			return
 		}
 	}
 

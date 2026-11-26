@@ -116,11 +116,21 @@ func urlHostLower(raw string) string {
 }
 
 func (p *Provider) Configure(cfg map[string]any) error {
+	if cfg == nil {
+		return nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	nextEnabled := p.enabled
+	nextAPIKey := p.apiKey
+	nextPin := p.pin
+	nextLanguage := p.language
+	nextPriority := p.priority
+	nextBaseURL := p.baseURL
+
 	if v, ok := getBool(cfg, "enabled", "Enabled"); ok {
-		p.enabled = v
+		nextEnabled = v
 	}
 
 	authChanged := false
@@ -129,24 +139,24 @@ func (p *Provider) Configure(cfg map[string]any) error {
 	if v, ok := getString(cfg, "api_key", "ApiKey", "tvdb_api_key"); ok {
 		hasNewKey = true
 		trimmed := strings.TrimSpace(v)
-		if trimmed != p.apiKey {
-			p.apiKey = trimmed
+		if trimmed != nextAPIKey {
+			nextAPIKey = trimmed
 			authChanged = true
 		}
 	}
 	if v, ok := getString(cfg, "pin", "Pin", "tvdb_pin"); ok {
 		hasNewPin = true
 		trimmed := strings.TrimSpace(v)
-		if trimmed != p.pin {
-			p.pin = trimmed
+		if trimmed != nextPin {
+			nextPin = trimmed
 			authChanged = true
 		}
 	}
 	if v, ok := getString(cfg, "language", "Language"); ok && strings.TrimSpace(v) != "" {
-		p.language = strings.TrimSpace(v)
+		nextLanguage = strings.TrimSpace(v)
 	}
 	if v, ok := getInt(cfg, "priority", "Priority"); ok {
-		p.priority = v
+		nextPriority = v
 	}
 	if v, ok := getString(cfg, "base_url", "BaseURL"); ok && strings.TrimSpace(v) != "" {
 		trimmed := strings.TrimRight(strings.TrimSpace(v), "/")
@@ -156,18 +166,30 @@ func (p *Provider) Configure(cfg map[string]any) error {
 		}
 		if urlHostLower(trimmed) != urlHostLower(p.baseURL) {
 			if !hasNewKey {
-				p.apiKey = ""
+				if nextAPIKey != "" {
+					authChanged = true
+				}
+				nextAPIKey = ""
 			}
 			if !hasNewPin {
-				p.pin = ""
+				if nextPin != "" {
+					authChanged = true
+				}
+				nextPin = ""
 			}
 		}
 		if trimmed != p.baseURL {
-			p.baseURL = trimmed
+			nextBaseURL = trimmed
 			authChanged = true
 		}
 	}
 
+	p.enabled = nextEnabled
+	p.apiKey = nextAPIKey
+	p.pin = nextPin
+	p.language = nextLanguage
+	p.priority = nextPriority
+	p.baseURL = nextBaseURL
 	if authChanged {
 		p.token = ""
 		p.tokenExpiry = time.Time{}

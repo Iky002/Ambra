@@ -517,6 +517,7 @@ type ItemCounts struct {
 type LibraryRepo struct {
 	store            *Store
 	countMu          sync.RWMutex
+	countEpoch       uint64
 	countCache       map[string]int
 	cachedItemCounts *ItemCounts
 }
@@ -531,6 +532,7 @@ func NewLibraryRepo(store *Store) *LibraryRepo {
 // InvalidateCountCache clears cached COUNT(*) and GetItemCounts results.
 func (r *LibraryRepo) InvalidateCountCache() {
 	r.countMu.Lock()
+	r.countEpoch++
 	r.countCache = make(map[string]int)
 	r.cachedItemCounts = nil
 	r.countMu.Unlock()
@@ -1930,8 +1932,10 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 	if countEnabled {
 		cacheKey, cacheable := queryItemsCountCacheKey(f)
 		cacheHit := false
+		var epoch uint64
 		if cacheable {
 			r.countMu.RLock()
+			epoch = r.countEpoch
 			if v, ok := r.countCache[cacheKey]; ok {
 				total = v
 				cacheHit = true
@@ -1945,13 +1949,15 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 			}
 			if cacheable {
 				r.countMu.Lock()
-				if r.countCache == nil {
-					r.countCache = make(map[string]int)
+				if r.countEpoch == epoch {
+					if r.countCache == nil {
+						r.countCache = make(map[string]int)
+					}
+					if _, exists := r.countCache[cacheKey]; !exists && len(r.countCache) >= maxCountCacheEntries {
+						r.countCache = make(map[string]int)
+					}
+					r.countCache[cacheKey] = total
 				}
-				if _, exists := r.countCache[cacheKey]; !exists && len(r.countCache) >= maxCountCacheEntries {
-					r.countCache = make(map[string]int)
-				}
-				r.countCache[cacheKey] = total
 				r.countMu.Unlock()
 			}
 		}
@@ -2618,8 +2624,10 @@ func (r *LibraryRepo) GetItemCountsFiltered(ctx context.Context, allowedLibraryI
 		return &ItemCounts{}, nil
 	}
 	unfiltered := allowedLibraryIDs == nil && maxParentalRating == nil
+	var epoch uint64
 	if unfiltered {
 		r.countMu.RLock()
+		epoch = r.countEpoch
 		if r.cachedItemCounts != nil {
 			cp := *r.cachedItemCounts
 			r.countMu.RUnlock()
@@ -2695,8 +2703,10 @@ func (r *LibraryRepo) GetItemCountsFiltered(ctx context.Context, allowedLibraryI
 
 	if unfiltered {
 		r.countMu.Lock()
-		cp := *c
-		r.cachedItemCounts = &cp
+		if r.countEpoch == epoch {
+			cp := *c
+			r.cachedItemCounts = &cp
+		}
 		r.countMu.Unlock()
 	}
 	return c, nil
@@ -2911,13 +2921,30 @@ func (r *LibraryRepo) MarkUnplayed(ctx context.Context, userID, itemID string) (
 func (r *LibraryRepo) MarkFavorite(ctx context.Context, userID, itemID string) (*dto.UserItemDataDto, error) {
 	userID = guid.Normalize(userID)
 	itemID = guid.Normalize(itemID)
-	_, err := r.store.Writer.ExecContext(ctx, `
+
+	tx, err := r.store.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM items WHERE id = ?`, itemID).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO user_item_data (user_id, item_id, is_favorite)
 		VALUES (?, ?, 1)
 		ON CONFLICT(user_id, item_id) DO UPDATE SET is_favorite = 1`,
 		userID, itemID,
-	)
-	if err != nil {
+	); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return r.GetUserItemData(ctx, userID, itemID)
@@ -2926,13 +2953,30 @@ func (r *LibraryRepo) MarkFavorite(ctx context.Context, userID, itemID string) (
 func (r *LibraryRepo) UnmarkFavorite(ctx context.Context, userID, itemID string) (*dto.UserItemDataDto, error) {
 	userID = guid.Normalize(userID)
 	itemID = guid.Normalize(itemID)
-	_, err := r.store.Writer.ExecContext(ctx, `
+
+	tx, err := r.store.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM items WHERE id = ?`, itemID).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO user_item_data (user_id, item_id, is_favorite)
 		VALUES (?, ?, 0)
 		ON CONFLICT(user_id, item_id) DO UPDATE SET is_favorite = 0`,
 		userID, itemID,
-	)
-	if err != nil {
+	); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return r.GetUserItemData(ctx, userID, itemID)

@@ -236,7 +236,7 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 	r.Delete("/Items/{Id}/Subtitles/{Index}", adminFn(h.handleDeleteSubtitle))
 	r.Post("/Items/{Id}/Subtitles/{Index}/Delete", adminFn(h.handleDeleteSubtitle))
 	r.Get("/Items/{Id}/RemoteSearch/Subtitles/{Language}", authFn(h.handleRemoteSearchSubtitles))
-	r.Post("/Items/{Id}/RemoteSearch/Subtitles/{SubtitleId}", authFn(h.handleDownloadRemoteSubtitle))
+	r.Post("/Items/{Id}/RemoteSearch/Subtitles/{SubtitleId}", adminFn(h.handleDownloadRemoteSubtitle))
 	r.Get("/Items/{Id}/{MediaSourceId}/Subtitles/{Index}/{StreamFile}", authFn(h.handleSubtitleStream))
 	r.Head("/Items/{Id}/{MediaSourceId}/Subtitles/{Index}/{StreamFile}", authFn(h.handleSubtitleStream))
 	r.Get("/Items/{Id}/{MediaSourceId}/Subtitles/{Index}/{StartPositionTicks}/{StreamFile}", authFn(h.handleSubtitleStream))

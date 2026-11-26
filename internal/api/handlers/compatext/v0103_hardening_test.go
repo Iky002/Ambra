@@ -46,8 +46,12 @@ func TestCompatExtV0103Hardening(t *testing.T) {
 	authSvc.InvalidateUserCache(noTV.ID)
 
 	// restricted: EnableLiveTvAccess = true, EnableContentDownloading = true, restricted to libAllowed
-	libAllowed, _ := libRepo.CreateLibrary(ctx, "Allowed", "movies", []string{filepath.Join(tmp, "allowed")})
-	libSecret, _ := libRepo.CreateLibrary(ctx, "Secret", "movies", []string{filepath.Join(tmp, "secret")})
+	allowedDir := filepath.Join(tmp, "allowed")
+	secretDir := filepath.Join(tmp, "secret")
+	_ = os.MkdirAll(allowedDir, 0o755)
+	_ = os.MkdirAll(secretDir, 0o755)
+	libAllowed, _ := libRepo.CreateLibrary(ctx, "Allowed", "movies", []string{allowedDir})
+	libSecret, _ := libRepo.CreateLibrary(ctx, "Secret", "movies", []string{secretDir})
 
 	pRest := restricted.Policy
 	pRest.EnableLiveTvAccess = true
@@ -57,8 +61,8 @@ func TestCompatExtV0103Hardening(t *testing.T) {
 	_ = userRepo.UpdateUserPolicy(ctx, restricted.ID, pRest)
 	authSvc.InvalidateUserCache(restricted.ID)
 
-	mp4Path := filepath.Join(tmp, "safe.mp4")
-	strmPath := filepath.Join(tmp, "cloud.strm")
+	mp4Path := filepath.Join(allowedDir, "safe.mp4")
+	strmPath := filepath.Join(allowedDir, "cloud.strm")
 	_ = os.WriteFile(mp4Path, []byte("MP4BYTES"), 0o600)
 	_ = os.WriteFile(strmPath, []byte("https://93.184.216.34/a.mkv"), 0o600)
 

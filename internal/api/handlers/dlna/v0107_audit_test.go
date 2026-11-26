@@ -23,11 +23,12 @@ func TestDLNAV0107AuditSecurityHardening(t *testing.T) {
 	ctx := context.Background()
 
 	// Seed a library with a regular movie, a private playlist, and a public playlist
-	lib, err := libRepo.CreateLibrary(ctx, "Movies", "movies", []string{t.TempDir()})
+	libDir := t.TempDir()
+	lib, err := libRepo.CreateLibrary(ctx, "Movies", "movies", []string{libDir})
 	if err != nil {
 		t.Fatal(err)
 	}
-	mediaFile := filepath.Join(t.TempDir(), "movie.mp4")
+	mediaFile := filepath.Join(libDir, "movie.mp4")
 	_ = os.WriteFile(mediaFile, []byte("MP4BYTES"), 0o644)
 
 	movie := &sqlite.ItemRecord{
@@ -168,7 +169,7 @@ func TestDLNAV0107AuditSecurityHardening(t *testing.T) {
 
 	// 5. H-12: handleDLNAStream redacts absolute paths on 500 error (including os.ErrPermission)
 	if os.Geteuid() != 0 {
-		noPermFile := filepath.Join(t.TempDir(), "secret_no_perm_file.mp4")
+		noPermFile := filepath.Join(libDir, "secret_no_perm_file.mp4")
 		_ = os.WriteFile(noPermFile, []byte("SECRET"), 0o000)
 		defer func() { _ = os.Chmod(noPermFile, 0o600) }()
 		noPermItem := &sqlite.ItemRecord{

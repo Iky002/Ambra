@@ -122,7 +122,6 @@ func TestServeSubtitleSupportsShortWebVTTTimestamps(t *testing.T) {
 func TestSupportsClientWASMOnlyForWebClients(t *testing.T) {
 	webCases := []*DeviceProfile{
 		{Name: "Ambra Web"},
-		{Name: "Emby Web"},
 		{Name: "Chrome Browser", SupportsClientWASM: true},
 		{Name: "Custom WASM Player"},
 	}
@@ -135,6 +134,7 @@ func TestSupportsClientWASMOnlyForWebClients(t *testing.T) {
 	nativeCases := []*DeviceProfile{
 		nil,
 		{Name: ""},
+		{Name: "Emby Web"},
 		{Name: "Ambra iOS", SupportsClientWASM: true},
 		{Name: "Ambra Android", SupportsClientWASM: true},
 		{Name: "Apple TV", SupportsClientWASM: true},

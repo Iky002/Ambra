@@ -584,9 +584,6 @@ export function PlayerPage() {
         resolvedAudioIdx = pickedAudio
         if (pickedAudio !== undefined) {
           setAudioIndex(pickedAudio)
-          if (pickedAudio !== activeSource.DefaultAudioStreamIndex) {
-            setQueryAudioIndex(pickedAudio)
-          }
         }
       }
     }
@@ -1116,13 +1113,14 @@ export function PlayerPage() {
               : err instanceof Error
                 ? err.message
                 : '客户端 WASM 转封装失败'
-          // 清理 WASM 内存后无感回退服务端 HLS master.m3u8
+          // 清理 WASM 内存后无感回退服务端 HLS master.m3u8，并同步锁定 forceServerHls 防止重复重试 WASM
           remuxer.dispose()
           if (wasmRemuxerRef.current === remuxer) {
             wasmRemuxerRef.current = null
           }
+          captureResumePosition()
           setWasmFallbackNotice(`${reasonMsg}，已自动切换服务端 HLS`)
-          mountServerHls(streamPlan.hlsUrl)
+          setForceServerHls(true)
         })
     }
 
@@ -1136,8 +1134,9 @@ export function PlayerPage() {
         setWasmFallbackNotice(`${reasonMsg}，已自动回退客户端 WASM 转封装`)
         mountWasmRemux()
       } else {
+        captureResumePosition()
         setWasmFallbackNotice(`${reasonMsg}，已自动切换服务端 HLS`)
-        mountServerHls(streamPlan.hlsUrl)
+        setForceServerHls(true)
       }
     }
 
@@ -1219,7 +1218,7 @@ export function PlayerPage() {
 
   // 异步静默拉取 BIF 视频预览图归档（404 或不可用时静默降级，不影响播放；卸载或切片时释放全部 ObjectURL）
   useEffect(() => {
-    if (!id || !activeSource?.Id || infoIsPlaceholder) {
+    if (!id || !activeSource?.Id) {
       if (bifArchiveRef.current) {
         bifArchiveRef.current.dispose()
         bifArchiveRef.current = null
@@ -1291,7 +1290,7 @@ export function PlayerPage() {
       }
       setBifArchive(null)
     }
-  }, [id, activeSource?.Id, infoIsPlaceholder])
+  }, [id, activeSource?.Id])
 
   // 构建外挂字幕直出 URL（仅同源附加 api_key，跨域字幕不泄露会话令牌）
   const resolveSubtitleUrl = useCallback(
@@ -1434,7 +1433,7 @@ export function PlayerPage() {
 
   // 将音轨 / 字幕 / 播放模式 / 会话元数据保存在 ref 中，避免切换轨道或回退 HLS 时重建 reportState 触发多余的 Stopped -> Playing 循环
   const playbackMetaRef = useRef({
-    audioIndex,
+    audioIndex: effectiveAudioIndex,
     subtitleIndex,
     playMethod,
     mediaSourceId: activeSource?.Id,
@@ -1442,7 +1441,7 @@ export function PlayerPage() {
     effectiveStartTicks,
   })
   playbackMetaRef.current = {
-    audioIndex,
+    audioIndex: effectiveAudioIndex,
     subtitleIndex,
     playMethod,
     mediaSourceId: activeSource?.Id,
@@ -1635,16 +1634,27 @@ export function PlayerPage() {
     pokeOsd()
   }, [pokeOsd])
 
+  const effectiveDurationSec = useMemo(() => {
+    if (Number.isFinite(duration) && duration > 0) return duration
+    const runtimeTicks = activeSource?.RunTimeTicks ?? item?.RunTimeTicks ?? 0
+    return Number.isFinite(runtimeTicks) && runtimeTicks > 0 ? runtimeTicks / 10_000_000 : 0
+  }, [duration, activeSource?.RunTimeTicks, item?.RunTimeTicks])
+
   const seekBy = useCallback(
     (delta: number) => {
       const v = videoRef.current
       if (!v) return
-      v.currentTime = Math.max(0, Math.min(v.duration || 0, v.currentTime + delta))
+      const maxDuration =
+        Number.isFinite(v.duration) && v.duration > 0 ? v.duration : effectiveDurationSec
+      const baseTime = Number.isFinite(v.currentTime) ? v.currentTime : 0
+      const target = baseTime + delta
+      v.currentTime =
+        maxDuration > 0 ? Math.max(0, Math.min(maxDuration, target)) : Math.max(0, target)
       setCurrentTime(v.currentTime)
       reportState('progress', 'timeupdate')
       pokeOsd()
     },
-    [pokeOsd, reportState],
+    [effectiveDurationSec, pokeOsd, reportState],
   )
 
   const toggleFullscreen = useCallback(() => {

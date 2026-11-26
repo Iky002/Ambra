@@ -214,7 +214,7 @@ func TestAuditV0107_M19_NFOVirtualPathRejectionAndCoreFieldsPreserved(t *testing
 	}
 	xmlStr := string(raw)
 	for _, want := range []string{
-		"<premiered>2024-05-10</premiered>",
+		"<aired>2024-05-10</aired>",
 		"<tagline>One last ride</tagline>",
 		"<studio>HBO</studio>",
 		"<director>Jane Director</director>",

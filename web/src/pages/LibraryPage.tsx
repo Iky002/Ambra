@@ -242,29 +242,8 @@ export function LibraryPage() {
     placeholderData: (prev) => prev,
   })
 
-  const { items, total } = useMemo(() => {
-    const rawItems = data?.Items || []
-    if (!studioFilter) {
-      return { items: rawItems, total: data?.TotalRecordCount ?? rawItems.length }
-    }
-    const targetStudio = studioFilter.trim().toLowerCase()
-    const hasStudioMismatch = rawItems.some(
-      (item) =>
-        item.Studios &&
-        item.Studios.length > 0 &&
-        !item.Studios.some((s) => s.Name.trim().toLowerCase() === targetStudio),
-    )
-    if (!hasStudioMismatch) {
-      return { items: rawItems, total: data?.TotalRecordCount ?? rawItems.length }
-    }
-    const matched = rawItems.filter((item) =>
-      item.Studios?.some((s) => s.Name.trim().toLowerCase() === targetStudio),
-    )
-    return {
-      items: matched,
-      total: matched.length,
-    }
-  }, [data, studioFilter])
+  const items = data?.Items || []
+  const total = data?.TotalRecordCount ?? items.length
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const hasActiveFilters = Boolean(

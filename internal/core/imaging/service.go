@@ -63,6 +63,8 @@ type Service struct {
 	maxCacheBytes    int64
 	sem              chan struct{}
 	pruneMu          sync.Mutex
+	pruneRunning     atomic.Bool
+	cacheDirGen      atomic.Uint64
 	approxCacheBytes atomic.Int64
 	sf               singleflight.Group
 	processCount     atomic.Int64
@@ -74,12 +76,14 @@ func New(repo *sqlite.LibraryRepo) *Service {
 	if workers < 4 {
 		workers = 4
 	}
-	return &Service{
+	s := &Service{
 		repo:          repo,
 		cacheDir:      filepath.Join(os.TempDir(), "ambra-image-cache"),
 		maxCacheBytes: defaultMaxCacheBytes,
 		sem:           make(chan struct{}, workers),
 	}
+	s.scanExistingCacheSizeAsync(s.cacheDir)
+	return s
 }
 
 // WithMaxCacheBytes sets the maximum disk cache size in bytes before LRU/oldest-file pruning triggers.
@@ -110,13 +114,37 @@ func (s *Service) WithCacheDir(dir string) *Service {
 
 // SetCacheDir updates the disk cache directory. An empty path falls back to os.TempDir().
 func (s *Service) SetCacheDir(dir string) {
+	resolved := strings.TrimSpace(dir)
+	if resolved == "" {
+		resolved = filepath.Join(os.TempDir(), "ambra-image-cache")
+	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.cacheDir = resolved
+	s.mu.Unlock()
+	s.approxCacheBytes.Store(0)
+	s.scanExistingCacheSizeAsync(resolved)
+}
+
+func (s *Service) scanExistingCacheSizeAsync(dir string) {
+	gen := s.cacheDirGen.Add(1)
 	if strings.TrimSpace(dir) == "" {
-		s.cacheDir = filepath.Join(os.TempDir(), "ambra-image-cache")
 		return
 	}
-	s.cacheDir = dir
+	go func() {
+		var total int64
+		_ = filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() || strings.HasSuffix(d.Name(), ".tmp") {
+				return nil
+			}
+			if info, statErr := d.Info(); statErr == nil {
+				total += info.Size()
+			}
+			return nil
+		})
+		if s.cacheDirGen.Load() == gen {
+			s.approxCacheBytes.Add(total)
+		}
+	}()
 }
 
 // CacheDir returns the active disk cache directory.
@@ -285,7 +313,11 @@ func (s *Service) ServeHTTPWithOptions(w http.ResponseWriter, r *http.Request, i
 	}
 	w.Header().Set("Content-Type", payload.ContentType)
 	w.Header().Set("ETag", payload.ETag)
-	if tag := r.URL.Query().Get("tag"); tag != "" && tag == rec.Tag {
+	tag := r.URL.Query().Get("tag")
+	if tag == "" {
+		tag = r.URL.Query().Get("Tag")
+	}
+	if tag != "" && tag == rec.Tag {
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	} else {
 		w.Header().Set("Cache-Control", "public, max-age=86400")
@@ -398,9 +430,19 @@ func (s *Service) writeDiskCache(cacheKey, contentType string, data []byte) erro
 	limit := s.maxCacheBytes
 	s.mu.RUnlock()
 	if limit > 0 && s.approxCacheBytes.Add(int64(len(data))) > limit {
-		s.PruneCache()
+		s.triggerPruneAsync()
 	}
 	return nil
+}
+
+func (s *Service) triggerPruneAsync() {
+	if !s.pruneRunning.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer s.pruneRunning.Store(false)
+		s.PruneCache()
+	}()
 }
 
 // PruneCache enforces maxCacheBytes by removing the oldest cached image files until usage is within limit.

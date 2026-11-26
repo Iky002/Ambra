@@ -48,6 +48,7 @@ type Scanner struct {
 	scanning       map[string]bool
 	cancels        map[string]context.CancelFunc
 	progress       map[string]*LibraryScanProgress
+	libPathMu      map[string]*sync.Mutex
 
 	pauseMu  sync.Mutex
 	paused   bool
@@ -55,6 +56,22 @@ type Scanner struct {
 
 	mergeMu       sync.Mutex
 	picLockShards [64]sync.Mutex
+}
+
+func (s *Scanner) lockLibraryPathOp(libraryID string) func() {
+	libraryID = guid.Normalize(libraryID)
+	s.mu.Lock()
+	if s.libPathMu == nil {
+		s.libPathMu = make(map[string]*sync.Mutex)
+	}
+	mu := s.libPathMu[libraryID]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		s.libPathMu[libraryID] = mu
+	}
+	s.mu.Unlock()
+	mu.Lock()
+	return mu.Unlock
 }
 
 func (s *Scanner) lockPicDest(destPath string) func() {

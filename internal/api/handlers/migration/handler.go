@@ -13,7 +13,7 @@ import (
 
 const maxUpstreamErrorBytes = 512
 
-var urlCredentialsRe = regexp.MustCompile(`(?i)(https?://)([^/\s@]+)@`)
+var urlTokenRe = regexp.MustCompile(`(?i)https?://[^\s"'<>]+`)
 
 // AuthFuncs decouples route registration from the concrete middleware package.
 type AuthFuncs struct {
@@ -34,10 +34,11 @@ func New(migrator *coremigration.Migrator) *Handler {
 	}
 }
 
-// Close cancels any in-flight migration job during server shutdown.
+// Close cancels any in-flight migration job and waits for it to exit during server shutdown.
 func (h *Handler) Close() {
 	if h != nil && h.migrator != nil {
 		h.migrator.Cancel()
+		h.migrator.Wait()
 	}
 }
 
@@ -167,7 +168,7 @@ func stripURLUserinfo(raw string) string {
 	}
 	u, err := url.Parse(trimmed)
 	if err != nil {
-		return trimmed
+		return redactURLCredentials(trimmed)
 	}
 	u.User = nil
 	u.RawQuery = ""
@@ -179,7 +180,30 @@ func redactURLCredentials(msg string) string {
 	if msg == "" || !strings.Contains(msg, "@") {
 		return msg
 	}
-	return urlCredentialsRe.ReplaceAllString(msg, "${1}***@")
+	return urlTokenRe.ReplaceAllStringFunc(msg, func(rawURL string) string {
+		schemeIdx := strings.Index(rawURL, "://")
+		if schemeIdx < 0 {
+			return rawURL
+		}
+		prefix := rawURL[:schemeIdx+3]
+		rest := rawURL[schemeIdx+3:]
+		// Isolate the authority component up to the first path/query/fragment delimiter.
+		authEnd := strings.IndexAny(rest, "/?#")
+		authority := rest
+		suffix := ""
+		if authEnd >= 0 {
+			authority = rest[:authEnd]
+			suffix = rest[authEnd:]
+		}
+		if lastAt := strings.LastIndex(authority, "@"); lastAt >= 0 {
+			return prefix + "***@" + authority[lastAt+1:] + suffix
+		}
+		if u, err := url.Parse(rawURL); err == nil && u.User != nil {
+			u.User = nil
+			return u.String()
+		}
+		return rawURL
+	})
 }
 
 func truncateErrorMsg(msg string, maxRunes int) string {

@@ -2,6 +2,7 @@ package tmdb
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -380,22 +381,27 @@ func TestTMDBV4BearerLogoAndOfficialRating(t *testing.T) {
 
 func TestTMDBDefaultAPIKeyFallbackAndOverride(t *testing.T) {
 	var seenKeys []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seenKeys = append(seenKeys, r.URL.Query().Get("api_key"))
-		if r.URL.Path == "/movie/550" {
-			_, _ = w.Write([]byte(`{"id":550,"title":"搏击俱乐部","original_title":"Fight Club","release_date":"1999-10-15"}`))
-			return
+	var seenHosts []string
+	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		seenHosts = append(seenHosts, req.URL.Host)
+		seenKeys = append(seenKeys, req.URL.Query().Get("api_key"))
+		if strings.HasSuffix(req.URL.Path, "/movie/550") {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"id":550,"title":"搏击俱乐部","original_title":"Fight Club","release_date":"1999-10-15"}`)),
+			}, nil
 		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer srv.Close()
+		return &http.Response{
+			StatusCode: http.StatusNotFound,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{}`)),
+		}, nil
+	})
 
-	// 1. No user key -> uses built-in defaultAPIKey
+	// 1. No user key on default TMDB host -> uses built-in defaultAPIKey
 	p := New("", "zh-CN").WithDefaultAPIKey("builtin-default-tmdb-key")
-	p.SetHTTPClient(srv.Client())
-	if err := p.Configure(map[string]any{"base_url": srv.URL}); err != nil {
-		t.Fatalf("Configure base_url: %v", err)
-	}
+	p.SetHTTPClient(&http.Client{Transport: rt})
 	res, err := p.FetchMetadata(context.Background(), plugins.MediaQuery{
 		ItemType:    "Movie",
 		ProviderIDs: map[string]string{"tmdb": "550"},
@@ -403,8 +409,8 @@ func TestTMDBDefaultAPIKeyFallbackAndOverride(t *testing.T) {
 	if err != nil || res == nil || res.Name != "搏击俱乐部" {
 		t.Fatalf("expected metadata fetch via default key, got res=%+v err=%v", res, err)
 	}
-	if len(seenKeys) != 1 || seenKeys[0] != "builtin-default-tmdb-key" {
-		t.Fatalf("expected default api_key sent, got %v", seenKeys)
+	if len(seenKeys) != 1 || seenKeys[0] != "builtin-default-tmdb-key" || seenHosts[0] != "api.themoviedb.org" {
+		t.Fatalf("expected default api_key sent to api.themoviedb.org, got keys=%v hosts=%v", seenKeys, seenHosts)
 	}
 
 	// 2. User sets custom api_key -> overrides built-in default
@@ -435,7 +441,7 @@ func TestTMDBDefaultAPIKeyFallbackAndOverride(t *testing.T) {
 		t.Fatalf("expected pascal-custom-key sent, got %v", seenKeys)
 	}
 
-	// 4. User clears api_key -> falls back to built-in default again
+	// 4. User clears api_key on default host -> falls back to built-in default again
 	if err := p.Configure(map[string]any{"api_key": ""}); err != nil {
 		t.Fatalf("Configure clear key: %v", err)
 	}
@@ -463,3 +469,7 @@ func TestTMDBDefaultAPIKeyFallbackAndOverride(t *testing.T) {
 		t.Fatalf("expected no extra HTTP requests while disabled, got %v", seenKeys)
 	}
 }
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

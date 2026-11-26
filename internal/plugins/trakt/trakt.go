@@ -8,7 +8,6 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,6 +39,20 @@ const (
 
 var _ plugins.Plugin = (*Plugin)(nil)
 
+type stopBarrier struct {
+	ch   chan struct{}
+	once sync.Once
+}
+
+func (b *stopBarrier) close() {
+	if b == nil {
+		return
+	}
+	b.once.Do(func() {
+		close(b.ch)
+	})
+}
+
 // Plugin implements a built-in Trakt.tv scrobble and watched-history sync notifier.
 type Plugin struct {
 	mu          sync.RWMutex
@@ -52,7 +65,7 @@ type Plugin struct {
 	stateMu             sync.Mutex
 	pausedAt            map[string]time.Time
 	completedAt         map[string]time.Time
-	stopInFlight        map[string]chan struct{}
+	stopInFlight        map[string]*stopBarrier
 	pauseThrottleWindow time.Duration
 	completeDedupWindow time.Duration
 	nowFunc             func() time.Time
@@ -88,11 +101,22 @@ func New() *Plugin {
 		client:              netutil.NewSafeHTTPClient(defaultTimeout, false),
 		pausedAt:            make(map[string]time.Time),
 		completedAt:         make(map[string]time.Time),
-		stopInFlight:        make(map[string]chan struct{}),
+		stopInFlight:        make(map[string]*stopBarrier),
 		pauseThrottleWindow: defaultPauseThrottleWindow,
 		completeDedupWindow: defaultCompleteDedupWindow,
 		nowFunc:             time.Now,
 	}
+}
+
+// SetBaseURL overrides the Trakt API base URL (intended for tests).
+func (p *Plugin) SetBaseURL(raw string) {
+	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if trimmed == "" {
+		return
+	}
+	p.mu.Lock()
+	p.baseURL = trimmed
+	p.mu.Unlock()
 }
 
 // SetHTTPClient overrides the HTTP client used for Trakt API calls (useful in tests).
@@ -148,15 +172,9 @@ func (p *Plugin) Manifest() plugins.Manifest {
 	}
 }
 
-func urlHostLower(raw string) string {
-	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil {
-		return ""
-	}
-	return strings.ToLower(strings.TrimSpace(u.Host))
-}
-
 // Configure updates plugin configuration in a thread-safe manner.
+// Runtime modification of base_url is intentionally disallowed so user OAuth
+// tokens can never be redirected to an arbitrary host.
 func (p *Plugin) Configure(cfg map[string]any) error {
 	if cfg == nil {
 		return nil
@@ -169,15 +187,6 @@ func (p *Plugin) Configure(cfg map[string]any) error {
 	}
 	if v, ok := firstInt(cfg, "priority", "Priority"); ok {
 		p.priority = v
-	}
-	if v, ok := firstString(cfg, "base_url", "BaseUrl"); ok {
-		if trimmed := strings.TrimRight(strings.TrimSpace(v), "/"); trimmed != "" {
-			u, err := url.Parse(trimmed)
-			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-				return fmt.Errorf("trakt: invalid base_url %q: must be http(s) URL", v)
-			}
-			p.baseURL = trimmed
-		}
 	}
 	return nil
 }
@@ -273,6 +282,10 @@ func (p *Plugin) scrobble(ctx context.Context, userID, endpoint string, item *sq
 	if err != nil {
 		return err
 	}
+	return p.scrobbleWithSnapshot(ctx, snap, endpoint, item, series, progressPct)
+}
+
+func (p *Plugin) scrobbleWithSnapshot(ctx context.Context, snap configSnapshot, endpoint string, item *sqlite.ItemRecord, series *sqlite.ItemRecord, progressPct float64) error {
 	if !snap.enabled || !snap.scrobblePlayback || snap.clientID == "" || snap.accessToken == "" {
 		return nil
 	}
@@ -289,6 +302,10 @@ func (p *Plugin) SyncWatched(ctx context.Context, userID string, item *sqlite.It
 	if err != nil {
 		return err
 	}
+	return p.syncWatchedWithSnapshot(ctx, snap, item, series)
+}
+
+func (p *Plugin) syncWatchedWithSnapshot(ctx context.Context, snap configSnapshot, item *sqlite.ItemRecord, series *sqlite.ItemRecord) error {
 	if !snap.enabled || !snap.syncWatched || snap.clientID == "" || snap.accessToken == "" {
 		return nil
 	}
@@ -561,43 +578,50 @@ func (p *Plugin) wasRecentlyScrobbleCompleted(userID, itemID string) bool {
 
 func (p *Plugin) beginInFlightStop(userID, itemID string) func() {
 	key := userItemKey(userID, itemID)
-	ch := make(chan struct{})
+	b := &stopBarrier{ch: make(chan struct{})}
 	p.stateMu.Lock()
 	if p.stopInFlight == nil {
-		p.stopInFlight = make(map[string]chan struct{})
+		p.stopInFlight = make(map[string]*stopBarrier)
 	}
 	prev := p.stopInFlight[key]
-	p.stopInFlight[key] = ch
+	p.stopInFlight[key] = b
 	p.stateMu.Unlock()
 	if prev != nil {
-		select {
-		case <-prev:
-		default:
-		}
+		prev.close()
 	}
-	var once sync.Once
 	return func() {
-		once.Do(func() {
-			p.stateMu.Lock()
-			if p.stopInFlight[key] == ch {
-				delete(p.stopInFlight, key)
-			}
-			p.stateMu.Unlock()
-			close(ch)
-		})
+		p.stateMu.Lock()
+		if p.stopInFlight[key] == b {
+			delete(p.stopInFlight, key)
+		}
+		p.stateMu.Unlock()
+		b.close()
+	}
+}
+
+func (p *Plugin) closeAllInFlightStops() {
+	p.stateMu.Lock()
+	barriers := make([]*stopBarrier, 0, len(p.stopInFlight))
+	for k, b := range p.stopInFlight {
+		barriers = append(barriers, b)
+		delete(p.stopInFlight, k)
+	}
+	p.stateMu.Unlock()
+	for _, b := range barriers {
+		b.close()
 	}
 }
 
 func (p *Plugin) waitInFlightStop(ctx context.Context, userID, itemID string) {
 	key := userItemKey(userID, itemID)
 	p.stateMu.Lock()
-	ch := p.stopInFlight[key]
+	b := p.stopInFlight[key]
 	p.stateMu.Unlock()
-	if ch == nil {
+	if b == nil {
 		return
 	}
 	select {
-	case <-ch:
+	case <-b.ch:
 	case <-ctx.Done():
 	}
 }
@@ -654,19 +678,23 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 			return
 		}
 		ev, ok := parsePlaybackEvent(e.Payload)
-		if !ok || ev.itemID == "" || !p.shouldReportForUser(ev.userID) {
+		if !ok || ev.itemID == "" || ev.userID == "" {
 			return
 		}
-		p.clearPaused(ev.userID, ev.itemID)
 		enqueue(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 			defer cancel()
+			snap, err := p.snapshotForUser(ctx, ev.userID)
+			if err != nil || !snap.enabled || !snap.scrobblePlayback || snap.clientID == "" || snap.accessToken == "" {
+				return
+			}
+			p.clearPaused(ev.userID, ev.itemID)
 			item, series := lookupItemAndSeries(ctx, repo, ev.itemID)
 			if item == nil {
 				return
 			}
 			pct := computeProgress(ev.positionTicks, ev.runtimeTicks, item.RuntimeTicks)
-			_ = p.ScrobbleStart(ctx, ev.userID, item, series, pct)
+			_ = p.scrobbleWithSnapshot(ctx, snap, "/scrobble/start", item, series, pct)
 		})
 	})
 
@@ -675,25 +703,29 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 			return
 		}
 		ev, ok := parsePlaybackEvent(e.Payload)
-		if !ok || ev.itemID == "" || !p.shouldReportForUser(ev.userID) {
+		if !ok || ev.itemID == "" || ev.userID == "" {
 			return
 		}
 		if !ev.isPaused {
 			p.clearPaused(ev.userID, ev.itemID)
 			return
 		}
-		if !p.allowPauseScrobble(ev.userID, ev.itemID) {
-			return
-		}
 		enqueue(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 			defer cancel()
+			snap, err := p.snapshotForUser(ctx, ev.userID)
+			if err != nil || !snap.enabled || !snap.scrobblePlayback || snap.clientID == "" || snap.accessToken == "" {
+				return
+			}
+			if !p.allowPauseScrobble(ev.userID, ev.itemID) {
+				return
+			}
 			item, series := lookupItemAndSeries(ctx, repo, ev.itemID)
 			if item == nil {
 				return
 			}
 			pct := computeProgress(ev.positionTicks, ev.runtimeTicks, item.RuntimeTicks)
-			_ = p.ScrobblePause(ctx, ev.userID, item, series, pct)
+			_ = p.scrobbleWithSnapshot(ctx, snap, "/scrobble/pause", item, series, pct)
 		})
 	})
 
@@ -702,22 +734,19 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 			return
 		}
 		ev, ok := parsePlaybackEvent(e.Payload)
-		if !ok || ev.itemID == "" || !p.shouldReportForUser(ev.userID) {
+		if !ok || ev.itemID == "" || ev.userID == "" {
 			return
-		}
-		snap, err := p.snapshotForUser(context.Background(), ev.userID)
-		if err != nil || !snap.scrobblePlayback {
-			return
-		}
-		p.clearPaused(ev.userID, ev.itemID)
-		if ev.played || computeProgress(ev.positionTicks, ev.runtimeTicks, nil) >= scrobbleCompletionPct {
-			p.markScrobbleCompleted(ev.userID, ev.itemID)
 		}
 		finishStop := p.beginInFlightStop(ev.userID, ev.itemID)
 		if !enqueue(func() {
 			defer finishStop()
 			ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 			defer cancel()
+			snap, err := p.snapshotForUser(ctx, ev.userID)
+			if err != nil || !snap.enabled || !snap.scrobblePlayback || snap.clientID == "" || snap.accessToken == "" {
+				return
+			}
+			p.clearPaused(ev.userID, ev.itemID)
 			item, series := lookupItemAndSeries(ctx, repo, ev.itemID)
 			if item == nil {
 				return
@@ -728,10 +757,11 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 			} else {
 				pct = computeProgress(ev.positionTicks, ev.runtimeTicks, item.RuntimeTicks)
 			}
-			if pct >= scrobbleCompletionPct {
-				p.markScrobbleCompleted(ev.userID, ev.itemID)
+			if err := p.scrobbleWithSnapshot(ctx, snap, "/scrobble/stop", item, series, pct); err == nil {
+				if ev.played || pct >= scrobbleCompletionPct {
+					p.markScrobbleCompleted(ev.userID, ev.itemID)
+				}
 			}
-			_ = p.ScrobbleStop(ctx, ev.userID, item, series, pct)
 		}) {
 			finishStop()
 		}
@@ -743,7 +773,7 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 		}
 		entries := parseUserDataChangedEvent(e.Payload)
 		for _, entry := range entries {
-			if !entry.played || entry.itemID == "" || !p.shouldReportForUser(entry.userID) {
+			if !entry.played || entry.itemID == "" || entry.userID == "" {
 				continue
 			}
 			if p.wasRecentlyScrobbleCompleted(entry.userID, entry.itemID) {
@@ -768,14 +798,21 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 					return
 				}
 				p.waitInFlightStop(ctx, userID, itemID)
+				if unsubscribed.Load() {
+					return
+				}
 				if p.wasRecentlyScrobbleCompleted(userID, itemID) {
+					return
+				}
+				snap, err := p.snapshotForUser(ctx, userID)
+				if err != nil || !snap.enabled || !snap.syncWatched || snap.clientID == "" || snap.accessToken == "" {
 					return
 				}
 				item, series := lookupItemAndSeries(ctx, repo, itemID)
 				if item == nil {
 					return
 				}
-				_ = p.SyncWatched(ctx, userID, item, series)
+				_ = p.syncWatchedWithSnapshot(ctx, snap, item, series)
 			})
 		}
 	})
@@ -785,6 +822,7 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 		stopOnce.Do(func() {
 			close(stopCh)
 		})
+		p.closeAllInFlightStops()
 	}
 }
 

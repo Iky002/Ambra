@@ -476,6 +476,26 @@ func (r *LibraryRepo) MergeItemVersions(ctx context.Context, itemIDs []string) (
 			return "", 0, err
 		}
 
+		// Migrate local extras (trailers, special features, theme media) attached to otherID onto primaryID
+		// and update their item_ancestors reference before deleting otherID.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE OR IGNORE item_ancestors
+			SET ancestor_id = ?
+			WHERE ancestor_id = ?
+			  AND descendant_id IN (SELECT id FROM items WHERE parent_id = ? AND extra_type != '')`,
+			primaryID, otherID, otherID,
+		); err != nil {
+			return "", 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE items
+			SET parent_id = ?
+			WHERE parent_id = ? AND extra_type != ''`,
+			primaryID, otherID,
+		); err != nil {
+			return "", 0, err
+		}
+
 		if _, err := tx.ExecContext(ctx, `DELETE FROM item_search_fts WHERE item_id = ?`, otherID); err != nil {
 			return "", 0, err
 		}

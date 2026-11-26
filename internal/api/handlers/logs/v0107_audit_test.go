@@ -41,7 +41,7 @@ func TestLogsV0107AuditLongLineOver4MiB(t *testing.T) {
 	if res.TotalRecordCount != 3 || len(res.Items) != 3 {
 		t.Fatalf("expected 3 lines, got total=%d len=%d", res.TotalRecordCount, len(res.Items))
 	}
-	if res.Items[0] != "first-line" || len(res.Items[1]) != len(hugeLine) || res.Items[2] != "last-line" {
+	if res.Items[0] != "first-line" || len(res.Items[1]) != maxLogLineBytes || res.Items[2] != "last-line" {
 		t.Fatalf("unexpected parsed lines: first=%q len1=%d last=%q", res.Items[0], len(res.Items[1]), res.Items[2])
 	}
 }

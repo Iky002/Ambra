@@ -57,6 +57,7 @@ function HorizontalRow({
           <button
             type="button"
             onClick={() => scroll('left')}
+            aria-label={`向左滚动 ${title}`}
             className="rounded-lg border border-white/10 bg-white/[0.04] p-1.5 text-zinc-300 transition-colors hover:bg-white/10"
           >
             <ChevronLeft className="h-4 w-4" />
@@ -64,6 +65,7 @@ function HorizontalRow({
           <button
             type="button"
             onClick={() => scroll('right')}
+            aria-label={`向右滚动 ${title}`}
             className="rounded-lg border border-white/10 bg-white/[0.04] p-1.5 text-zinc-300 transition-colors hover:bg-white/10"
           >
             <ChevronRight className="h-4 w-4" />

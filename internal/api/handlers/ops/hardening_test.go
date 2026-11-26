@@ -187,12 +187,12 @@ func TestPartiesAuthSpoofingRBACAndEventBus(t *testing.T) {
 		t.Fatalf("expected member ID %q, got %+v", member.UserID(), party.Members)
 	}
 
-	// Outsider cannot see party in GET /Parties or GET /Parties/{Id} (403).
+	// Outsider cannot see party in GET /Parties or GET /Parties/{Id} (404 unified with missing party).
 	if r := doAuthReq(t, mux, outsider, http.MethodGet, "/Parties", nil); r.Code != http.StatusOK || strings.Contains(r.Body.String(), party.Id) {
 		t.Fatalf("expected outsider GET /Parties not to leak party, got %d %s", r.Code, r.Body.String())
 	}
-	if r := doAuthReq(t, mux, outsider, http.MethodGet, "/Parties/"+party.Id, nil); r.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 for outsider GET /Parties/{Id}, got %d", r.Code)
+	if r := doAuthReq(t, mux, outsider, http.MethodGet, "/Parties/"+party.Id, nil); r.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for outsider GET /Parties/{Id}, got %d", r.Code)
 	}
 	// Member and Admin CAN view GET /Parties and GET /Parties/{Id}.
 	if r := doAuthReq(t, mux, member, http.MethodGet, "/Parties", nil); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), party.Id) {

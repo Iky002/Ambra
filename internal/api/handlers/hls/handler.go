@@ -3,6 +3,7 @@ package hls
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -104,12 +105,48 @@ func (h *Handler) callerIdentity(r *http.Request) (userID string, isAdmin bool) 
 	return "", false
 }
 
+func (h *Handler) isPlaylistPublic(ctx context.Context, playlistID string) bool {
+	normID := guid.Normalize(playlistID)
+	if normID == "" || h.userRepo == nil {
+		return false
+	}
+	raw, err := h.userRepo.GetServerConfig(ctx, "item_visibility_"+normID)
+	if err != nil || raw == "" {
+		return false
+	}
+	var vis struct {
+		IsPublic bool `json:"IsPublic"`
+	}
+	if err := json.Unmarshal([]byte(raw), &vis); err != nil {
+		return false
+	}
+	return vis.IsPublic
+}
+
+func (h *Handler) canViewPlaylist(r *http.Request, playlistID, parentID string) bool {
+	uid, isAdmin := h.callerIdentity(r)
+	if isAdmin {
+		return true
+	}
+	ownerID := guid.Normalize(parentID)
+	if ownerID == "" || h.isPlaylistPublic(r.Context(), playlistID) {
+		return true
+	}
+	return uid != "" && uid == ownerID
+}
+
 func (h *Handler) canAccessItem(r *http.Request, item *sqlite.ItemRecord) bool {
-	if item == nil || h.userRepo == nil {
+	if item == nil {
 		return true
 	}
 	uid, isAdmin := h.callerIdentity(r)
 	if isAdmin {
+		return true
+	}
+	if h.userRepo == nil {
+		if strings.EqualFold(item.Type, "Playlist") && uid != "" {
+			return h.canViewPlaylist(r, item.ID, item.ParentID)
+		}
 		return true
 	}
 	if uid == "" {
@@ -122,7 +159,11 @@ func (h *Handler) canAccessItem(r *http.Request, item *sqlite.ItemRecord) bool {
 	if u.IsAdmin || u.Policy.IsAdministrator {
 		return true
 	}
-	if item.LibraryID != "" && !u.Policy.EnableAllFolders {
+	if strings.EqualFold(item.Type, "Playlist") {
+		if !h.canViewPlaylist(r, item.ID, item.ParentID) {
+			return false
+		}
+	} else if item.LibraryID != "" && !u.Policy.EnableAllFolders {
 		normLib := guid.Normalize(item.LibraryID)
 		allowed := false
 		for _, fid := range u.Policy.EnabledFolders {
@@ -145,12 +186,17 @@ func (h *Handler) canAccessItem(r *http.Request, item *sqlite.ItemRecord) bool {
 }
 
 func (h *Handler) resolveDeviceID(r *http.Request, q httpx.Query) string {
+	queryDev := strings.TrimSpace(q.Get("DeviceId"))
+	_, isAdmin := h.callerIdentity(r)
+	if isAdmin && queryDev != "" {
+		return queryDev
+	}
 	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil {
 		if boundDev := strings.TrimSpace(ac.Client.DeviceID); boundDev != "" {
 			return boundDev
 		}
 	}
-	return strings.TrimSpace(q.Get("DeviceId"))
+	return queryDev
 }
 
 func scopePlaySessionID(playSessionID, callerUserID string, isAdmin bool) string {
@@ -256,7 +302,7 @@ func (h *Handler) handleMasterPlaylist(w http.ResponseWriter, r *http.Request) {
 	})
 
 	w.Header().Set("Content-Type", "application/x-mpegURL; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "private, no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(m3u8))
 }
@@ -301,7 +347,7 @@ func (h *Handler) handleMediaPlaylist(w http.ResponseWriter, r *http.Request) {
 	})
 
 	w.Header().Set("Content-Type", "application/x-mpegURL; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "private, no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(m3u8))
 }
@@ -345,7 +391,7 @@ func (h *Handler) handleSubtitlePlaylist(w http.ResponseWriter, r *http.Request)
 	m3u8 := transcode.BuildSubtitlePlaylist(durSec, vttURI)
 
 	w.Header().Set("Content-Type", "application/x-mpegURL; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "private, no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(m3u8))
 }
@@ -562,8 +608,12 @@ func serveHLSFile(w http.ResponseWriter, r *http.Request, filePath string) {
 func (h *Handler) handleDeleteActiveEncodings(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	callerUserID, isAdmin := h.callerIdentity(r)
-	deviceID := h.resolveDeviceID(r, q)
 	rawPlaySessionID := strings.TrimSpace(q.Get("PlaySessionId"))
+	rawDeviceID := strings.TrimSpace(q.Get("DeviceId"))
+	deviceID := ""
+	if rawPlaySessionID == "" || rawDeviceID != "" {
+		deviceID = h.resolveDeviceID(r, q)
+	}
 	playSessionID := scopePlaySessionID(rawPlaySessionID, callerUserID, isAdmin)
 	if h.mgr != nil {
 		h.mgr.StopSessionsScoped(callerUserID, playSessionID, deviceID, isAdmin)

@@ -22,6 +22,7 @@ import (
 const (
 	defaultRuntimeLogName = "ambra-runtime.log"
 	maxLogLinesLimit      = 2000
+	maxLogLineBytes       = 64 * 1024
 )
 
 var errInvalidLogName = errors.New("invalid log file name")
@@ -248,13 +249,11 @@ func (h *Handler) readLogLinesPage(name string, start, limit int) ([]string, int
 	total := 0
 	reader := bufio.NewReaderSize(f, 64*1024)
 	for {
-		line, readErr := reader.ReadString('\n')
+		line, hasLine, readErr := readBoundedLine(reader, maxLogLineBytes)
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
 			return nil, 0, readErr
 		}
-		if len(line) > 0 {
-			line = strings.TrimSuffix(line, "\n")
-			line = strings.TrimSuffix(line, "\r")
+		if hasLine {
 			if total >= start && len(page) < limit {
 				page = append(page, escapeLogControlChars(line))
 			}
@@ -265,6 +264,34 @@ func (h *Handler) readLogLinesPage(name string, start, limit int) ([]string, int
 		}
 	}
 	return page, total, nil
+}
+
+func readBoundedLine(r *bufio.Reader, maxBytes int) (string, bool, error) {
+	var buf []byte
+	gotData := false
+	for {
+		chunk, isPrefix, err := r.ReadLine()
+		if len(chunk) > 0 {
+			gotData = true
+			if len(buf) < maxBytes {
+				rem := maxBytes - len(buf)
+				if len(chunk) > rem {
+					buf = append(buf, chunk[:rem]...)
+				} else {
+					buf = append(buf, chunk...)
+				}
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return string(buf), gotData, io.EOF
+			}
+			return "", false, err
+		}
+		if !isPrefix {
+			return string(buf), true, nil
+		}
+	}
 }
 
 func (h *Handler) handleListLogs(w http.ResponseWriter, r *http.Request) {
@@ -316,6 +343,7 @@ func (h *Handler) serveLogByName(w http.ResponseWriter, name string) {
 		lines := append([]string(nil), h.runtimeLines...)
 		h.mu.RUnlock()
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(strings.Join(lines, "\n")))
 		if len(lines) > 0 {
@@ -344,6 +372,7 @@ func (h *Handler) serveLogByName(w http.ResponseWriter, name string) {
 	defer f.Close()
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, f)
 }

@@ -210,8 +210,12 @@ func (h *Handler) handleCreateParty(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	snapshot := cloneOpsState(h.state)
 	h.state.Parties = append(h.state.Parties, party)
 	err := h.saveStateLocked(r.Context())
+	if err != nil {
+		h.state = snapshot
+	}
 	h.mu.Unlock()
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to persist party")
@@ -229,7 +233,7 @@ func (h *Handler) handleGetParty(w http.ResponseWriter, r *http.Request) {
 	for _, p := range h.state.Parties {
 		if p.Id == id {
 			if hasAuth && !isAdmin && !p.IsPublic && (callerID == "" || (guid.Normalize(p.HostUserId) != callerID && !isPartyMember(p.Members, callerID))) {
-				httpx.Error(w, http.StatusForbidden, "only party members, host, or an administrator can view this party")
+				httpx.Error(w, http.StatusNotFound, "party not found")
 				return
 			}
 			httpx.JSON(w, http.StatusOK, sanitizePartyForCaller(p, callerID, isAdmin, hasAuth))
@@ -251,8 +255,15 @@ func (h *Handler) handleDeleteParty(w http.ResponseWriter, r *http.Request) {
 				httpx.Error(w, http.StatusForbidden, "only the party host or an administrator can delete this party")
 				return
 			}
+			snapshot := cloneOpsState(h.state)
 			h.state.Parties = append(h.state.Parties[:i], h.state.Parties[i+1:]...)
-			h.saveStateLocked(r.Context())
+			err := h.saveStateLocked(r.Context())
+			if err != nil {
+				h.state = snapshot
+				h.mu.Unlock()
+				httpx.Error(w, http.StatusInternalServerError, "failed to persist party deletion")
+				return
+			}
 			h.mu.Unlock()
 			httpx.NoContent(w)
 			return
@@ -260,6 +271,22 @@ func (h *Handler) handleDeleteParty(w http.ResponseWriter, r *http.Request) {
 	}
 	h.mu.Unlock()
 	httpx.Error(w, http.StatusNotFound, "party not found")
+}
+
+func (h *Handler) recordPartyJoinFailureLocked(failKey string, now time.Time) bool {
+	if h.partyJoinFails == nil {
+		h.partyJoinFails = make(map[string]*partyFailWindow)
+	}
+	fw := h.partyJoinFails[failKey]
+	if fw == nil || !now.Before(fw.resetAt) {
+		if fw == nil && len(h.partyJoinFails) >= maxPartyFailBuckets {
+			return false
+		}
+		fw = &partyFailWindow{count: 0, resetAt: now.Add(partyJoinFailWindow)}
+		h.partyJoinFails[failKey] = fw
+	}
+	fw.count++
+	return true
 }
 
 func (h *Handler) handleJoinParty(w http.ResponseWriter, r *http.Request) {
@@ -286,6 +313,7 @@ func (h *Handler) handleJoinParty(w http.ResponseWriter, r *http.Request) {
 	}
 	callerID, isAdmin, hasAuth := callerAuth(r)
 	failKey := userID + ":" + id
+	missingKey := userID + ":__missing__"
 	now := time.Now().UTC()
 
 	h.mu.Lock()
@@ -306,20 +334,11 @@ func (h *Handler) handleJoinParty(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				if p.InviteCode == "" || subtle.ConstantTimeCompare([]byte(inviteCode), []byte(p.InviteCode)) != 1 {
-					if h.partyJoinFails == nil {
-						h.partyJoinFails = make(map[string]*partyFailWindow)
+					if !h.recordPartyJoinFailureLocked(failKey, now) {
+						h.mu.Unlock()
+						httpx.Error(w, http.StatusTooManyRequests, "too many failed party join attempts")
+						return
 					}
-					fw := h.partyJoinFails[failKey]
-					if fw == nil || !now.Before(fw.resetAt) {
-						if fw == nil && len(h.partyJoinFails) >= maxPartyFailBuckets {
-							h.mu.Unlock()
-							httpx.Error(w, http.StatusTooManyRequests, "too many failed party join attempts")
-							return
-						}
-						fw = &partyFailWindow{count: 0, resetAt: now.Add(partyJoinFailWindow)}
-						h.partyJoinFails[failKey] = fw
-					}
-					fw.count++
 					h.mu.Unlock()
 					httpx.Error(w, http.StatusForbidden, "valid InviteCode is required to join this party")
 					return
@@ -334,12 +353,30 @@ func (h *Handler) handleJoinParty(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if !exists {
+				snapshot := cloneOpsState(h.state)
 				p.Members = append(p.Members, userID)
-				_ = h.saveStateLocked(r.Context())
+				if err := h.saveStateLocked(r.Context()); err != nil {
+					h.state = snapshot
+					h.mu.Unlock()
+					httpx.Error(w, http.StatusInternalServerError, "failed to persist party membership")
+					return
+				}
 			}
 			party := sanitizePartyForCaller(*p, callerID, isAdmin, hasAuth)
 			h.mu.Unlock()
 			httpx.JSON(w, http.StatusOK, party)
+			return
+		}
+	}
+	if !isAdmin {
+		if fw := h.partyJoinFails[missingKey]; fw != nil && now.Before(fw.resetAt) && fw.count >= maxPartyJoinFails {
+			h.mu.Unlock()
+			httpx.Error(w, http.StatusTooManyRequests, "too many failed party join attempts")
+			return
+		}
+		if !h.recordPartyJoinFailureLocked(missingKey, now) {
+			h.mu.Unlock()
+			httpx.Error(w, http.StatusTooManyRequests, "too many failed party join attempts")
 			return
 		}
 	}
@@ -379,6 +416,7 @@ func (h *Handler) handleLeaveParty(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+			snapshot := cloneOpsState(h.state)
 			kept := make([]string, 0, len(p.Members))
 			for _, m := range p.Members {
 				if guid.Normalize(m) != userID {
@@ -393,7 +431,12 @@ func (h *Handler) handleLeaveParty(w http.ResponseWriter, r *http.Request) {
 					h.state.Parties[i].HostUserId = kept[0]
 				}
 			}
-			_ = h.saveStateLocked(r.Context())
+			if err := h.saveStateLocked(r.Context()); err != nil {
+				h.state = snapshot
+				h.mu.Unlock()
+				httpx.Error(w, http.StatusInternalServerError, "failed to persist party leave")
+				return
+			}
 			h.mu.Unlock()
 			httpx.NoContent(w)
 			return
@@ -443,6 +486,7 @@ func (h *Handler) handleUpdatePartyState(w http.ResponseWriter, r *http.Request)
 				httpx.Error(w, http.StatusForbidden, "only party members, host, or an administrator can update party state")
 				return
 			}
+			snapshot := cloneOpsState(h.state)
 			st := &p.State
 			if itemID != "" {
 				st.ItemId = itemID
@@ -459,7 +503,12 @@ func (h *Handler) handleUpdatePartyState(w http.ResponseWriter, r *http.Request)
 			st.UpdatedAt = time.Now().UTC()
 			respParty := sanitizePartyForCaller(*p, callerID, isAdmin, hasAuth)
 			eventParty := sanitizePartyForEvent(*p)
-			_ = h.saveStateLocked(r.Context())
+			if err := h.saveStateLocked(r.Context()); err != nil {
+				h.state = snapshot
+				h.mu.Unlock()
+				httpx.Error(w, http.StatusInternalServerError, "failed to persist party state")
+				return
+			}
 			h.mu.Unlock()
 
 			if h.bus != nil {

@@ -115,6 +115,7 @@ func (h *Handler) GetSetupStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "private, no-store")
 	h.setupMu.Lock()
 	defer h.setupMu.Unlock()
 
@@ -173,9 +174,11 @@ func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if country := strings.TrimSpace(req.Country); country != "" && h.userRepo != nil {
-		extra := h.loadExtraConfig(r.Context())
+		h.extraConfigMu.Lock()
+		extra := h.loadExtraConfigLocked(r.Context())
 		extra["MetadataCountryCode"] = strings.ToUpper(country)
-		_ = h.saveExtraConfig(r.Context(), extra)
+		_ = h.saveExtraConfigLocked(r.Context(), extra)
+		h.extraConfigMu.Unlock()
 	}
 	if tmdbLangChanged {
 		h.syncTMDBPlugin()

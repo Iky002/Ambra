@@ -198,10 +198,11 @@ func TestNotificationsIDORAndPerUserReadBy(t *testing.T) {
 	}
 	apiKeyAuth := &middleware.AuthContext{IsAPIKey: true}
 
-	// Admin sends a global broadcast (UserId == "")
+	// Admin sends a global broadcast (UserId == "", AdminOnly == false)
 	rBroadcast := doReqWithAuth(t, mux, adminAuth, http.MethodPost, "/Notifications/Admin", map[string]any{
-		"Name":  "Server Upgrade",
-		"Level": "Warning",
+		"Name":      "Server Upgrade",
+		"Level":     "Warning",
+		"AdminOnly": false,
 	})
 	if rBroadcast.Code != http.StatusOK {
 		t.Fatalf("broadcast status=%d", rBroadcast.Code)

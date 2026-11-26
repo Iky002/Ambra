@@ -48,6 +48,11 @@ jobs:
             exit 1
           fi
           echo "version=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          if [[ "${RELEASE_TAG}" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
           if [ -f "docs/releases/${RELEASE_TAG}.md" ]; then
             echo "notes=docs/releases/${RELEASE_TAG}.md" >> "$GITHUB_OUTPUT"
           fi
@@ -75,8 +80,13 @@ jobs:
 
       - name: Bundle Full packages WITH static FFmpeg & FFprobe
         env:
+          # BtbN rolling release base; switch to an immutable autobuild tag and populate the
+          # optional BTBN_SHA256_* pin vars below to lock exact archive digests end-to-end.
           BTBN_RELEASE_BASE: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest
           BTBN_FFMPEG_BRANCH: n8.1
+          BTBN_SHA256_LINUX64: ''
+          BTBN_SHA256_LINUXARM64: ''
+          BTBN_SHA256_WIN64: ''
           MACOS_FFMPEG_BASE: https://ffmpeg.martin-riedl.de/download/macos/arm64/1795207104_9.1
           MACOS_FFMPEG_SHA256: 1f66e9a690a7f1c9e60b012379f8869c11818d1797f45b21dbb2f2564ba61ae1
           MACOS_FFPROBE_SHA256: 6ef2df5f575042923a28537ab37adf936f28bf3e7b85de23a1447ed447ec1dbd
@@ -86,11 +96,16 @@ jobs:
           WORK="/tmp/ffmpeg-bundle"
           mkdir -p "${WORK}"
 
-          # Download upstream SHA-256 manifest from BtbN once and verify every downloaded archive against it.
+          # Download upstream SHA-256 manifest from BtbN once, validate its format strictly,
+          # and verify every downloaded archive against it (fail-closed, no branch fallback).
           BTBN_CHECKSUMS="${WORK}/btbn-checksums.sha256"
           curl -fsSL -o "${BTBN_CHECKSUMS}" "${BTBN_RELEASE_BASE}/checksums.sha256"
           if [ ! -s "${BTBN_CHECKSUMS}" ]; then
             echo "ERROR: empty BtbN checksums.sha256" >&2
+            exit 1
+          fi
+          if grep -Evq '^[0-9a-fA-F]{64}  [A-Za-z0-9._-]+$' "${BTBN_CHECKSUMS}"; then
+            echo "ERROR: malformed line detected in BtbN checksums.sha256 (fail-closed)" >&2
             exit 1
           fi
 
@@ -118,24 +133,41 @@ jobs:
             local out_archive="$5"
             local is_win="$6"
             local expected_file_re="$7"
+            local pinned_sha="$8"
 
             local stage="${WORK}/${platform}"
             mkdir -p "${stage}/pkg"
 
-            # Resolve pinned release branch archive name + SHA256 from upstream checksums.sha256.
-            local entry
-            entry="$(grep -E "^[0-9a-fA-F]{64}  ffmpeg-${BTBN_FFMPEG_BRANCH}-latest-${arch_tag}-gpl-[0-9]+\.[0-9]+\.${ext}$" "${BTBN_CHECKSUMS}" | head -n 1 || true)"
-            if [ -z "${entry}" ]; then
-              entry="$(grep -E "^[0-9a-fA-F]{64}  ffmpeg-n[0-9]+\.[0-9]+-latest-${arch_tag}-gpl-[0-9]+\.[0-9]+\.${ext}$" "${BTBN_CHECKSUMS}" | sort -k2,2V | tail -n 1 || true)"
-            fi
-            if [ -z "${entry}" ]; then
-              echo "ERROR: could not find release branch archive for ${platform} in checksums.sha256" >&2
+            # Resolve exact pinned release branch archive name + SHA256 from upstream checksums.sha256.
+            # Fail closed if the exact BTBN_FFMPEG_BRANCH target is absent or ambiguous (no silent fallback).
+            local branch_ver="${BTBN_FFMPEG_BRANCH#n}"
+            local branch_ver_re="${branch_ver//./\\.}"
+            local matches
+            matches="$(grep -E "^[0-9a-fA-F]{64}  ffmpeg-${BTBN_FFMPEG_BRANCH}-latest-${arch_tag}-gpl-${branch_ver_re}\.${ext}$" "${BTBN_CHECKSUMS}" || true)"
+            local match_count
+            match_count="$(printf '%s\n' "${matches}" | sed '/^$/d' | wc -l | tr -d ' ')"
+            if [ "${match_count}" != "1" ]; then
+              echo "ERROR: expected exactly 1 ${BTBN_FFMPEG_BRANCH} archive entry for ${platform} in checksums.sha256, found ${match_count} (fail-closed)" >&2
               exit 1
             fi
 
             local expected_sha asset_name
-            expected_sha="$(echo "${entry}" | awk '{print $1}')"
-            asset_name="$(echo "${entry}" | awk '{print $2}')"
+            expected_sha="$(echo "${matches}" | awk '{print $1}')"
+            asset_name="$(echo "${matches}" | awk '{print $2}')"
+            if [[ ! "${expected_sha}" =~ ^[0-9a-fA-F]{64}$ ]] || [[ ! "${asset_name}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "ERROR: invalid checksum manifest entry for ${platform}: ${matches}" >&2
+              exit 1
+            fi
+            if [ -n "${pinned_sha}" ]; then
+              if [[ ! "${pinned_sha}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+                echo "ERROR: invalid pinned SHA-256 format for ${platform}: ${pinned_sha}" >&2
+                exit 1
+              fi
+              if [ "${expected_sha,,}" != "${pinned_sha,,}" ]; then
+                echo "ERROR: upstream SHA-256 mismatch against pinned digest for ${platform}: got ${expected_sha}, want ${pinned_sha}" >&2
+                exit 1
+              fi
+            fi
             local archive_path="${stage}/${asset_name}"
 
             echo "Downloading ${asset_name} for ${platform} (sha256=${expected_sha})..."
@@ -184,17 +216,17 @@ jobs:
           pids=()
           bundle_btbn "linux-amd64" "linux64" "tar.xz" \
             "dist/lite/ambra-lite-linux-amd64" \
-            "ambra-full-linux-amd64.tar.gz" "0" "ELF.*x86-64" &
+            "ambra-full-linux-amd64.tar.gz" "0" "ELF.*x86-64" "${BTBN_SHA256_LINUX64}" &
           pids+=($!)
 
           bundle_btbn "linux-arm64" "linuxarm64" "tar.xz" \
             "dist/lite/ambra-lite-linux-arm64" \
-            "ambra-full-linux-arm64.tar.gz" "0" "ELF.*aarch64" &
+            "ambra-full-linux-arm64.tar.gz" "0" "ELF.*aarch64" "${BTBN_SHA256_LINUXARM64}" &
           pids+=($!)
 
           bundle_btbn "windows-amd64" "win64" "zip" \
             "dist/lite/ambra-lite-windows-amd64.exe" \
-            "ambra-full-windows-amd64.zip" "1" "PE32\+" &
+            "ambra-full-windows-amd64.zip" "1" "PE32\+" "${BTBN_SHA256_WIN64}" &
           pids+=($!)
 
           bundle_macos &
@@ -226,6 +258,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.build-lite.outputs.version }}
+          prerelease: ${{ steps.build-lite.outputs.prerelease == 'true' }}
           body_path: ${{ steps.build-lite.outputs.notes }}
           generate_release_notes: true
           files: dist/release/*
@@ -273,21 +306,30 @@ jobs:
             exit 1
           fi
           echo "version=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          IS_PRERELEASE=false
+          if [[ "${RELEASE_TAG}" == *-* ]]; then
+            IS_PRERELEASE=true
+          fi
+          echo "prerelease=${IS_PRERELEASE}" >> "$GITHUB_OUTPUT"
           {
             echo "tags<<EOF"
             if [ "${VARIANT}" = "full" ]; then
               echo "type=semver,pattern={{version}},value=${RELEASE_TAG}"
               echo "type=semver,pattern={{version}}-full,value=${RELEASE_TAG}"
-              echo "type=semver,pattern={{major}}.{{minor}},value=${RELEASE_TAG}"
-              echo "type=semver,pattern={{major}},value=${RELEASE_TAG}"
               echo "type=sha,prefix=sha-"
-              echo "type=raw,value=latest"
-              echo "type=raw,value=full"
+              if [ "${IS_PRERELEASE}" = "false" ]; then
+                echo "type=semver,pattern={{major}}.{{minor}},value=${RELEASE_TAG}"
+                echo "type=semver,pattern={{major}},value=${RELEASE_TAG}"
+                echo "type=raw,value=latest"
+                echo "type=raw,value=full"
+              fi
             else
               echo "type=semver,pattern={{version}}-lite,value=${RELEASE_TAG}"
-              echo "type=semver,pattern={{major}}.{{minor}}-lite,value=${RELEASE_TAG}"
               echo "type=sha,prefix=sha-,suffix=-lite"
-              echo "type=raw,value=lite"
+              if [ "${IS_PRERELEASE}" = "false" ]; then
+                echo "type=semver,pattern={{major}}.{{minor}}-lite,value=${RELEASE_TAG}"
+                echo "type=raw,value=lite"
+              fi
             fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"

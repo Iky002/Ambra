@@ -208,7 +208,7 @@ func (h *Handler) handleDirectStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := httpx.ParseQuery(r)
-	mediaPath, _, err := h.resolveAudioPath(r.Context(), itemID, q.Get("MediaSourceId"))
+	mediaPath, _, _, err := h.resolveAudioPath(r.Context(), itemID, q.Get("MediaSourceId"))
 	if errors.Is(err, sqlite.ErrNotFound) {
 		httpx.Error(w, http.StatusNotFound, "audio item not found")
 		return
@@ -250,7 +250,7 @@ func (h *Handler) handleUniversal(w http.ResponseWriter, r *http.Request, urlExt
 		return
 	}
 	q := httpx.ParseQuery(r)
-	mediaPath, srcBitrate, err := h.resolveAudioPath(r.Context(), itemID, q.Get("MediaSourceId"))
+	mediaPath, srcBitrate, srcContainer, err := h.resolveAudioPath(r.Context(), itemID, q.Get("MediaSourceId"))
 	if errors.Is(err, sqlite.ErrNotFound) {
 		httpx.Error(w, http.StatusNotFound, "audio item not found")
 		return
@@ -279,9 +279,13 @@ func (h *Handler) handleUniversal(w http.ResponseWriter, r *http.Request, urlExt
 	isRemote := isHTTPURL(mediaPath)
 	srcExt := strings.ToLower(strings.TrimPrefix(filepath.Ext(mediaPath), "."))
 	if isRemote {
+		srcExt = ""
 		if u, parseErr := url.Parse(mediaPath); parseErr == nil {
 			srcExt = strings.ToLower(strings.TrimPrefix(filepath.Ext(u.Path), "."))
 		}
+	}
+	if srcExt == "" && srcContainer != "" {
+		srcExt = srcContainer
 	}
 	allowedContainers := q.List("Container")
 	maxBitrate := q.Int("MaxStreamingBitrate", 0)
@@ -290,9 +294,12 @@ func (h *Handler) handleUniversal(w http.ResponseWriter, r *http.Request, urlExt
 	}
 	startTimeTicks := q.Int64("StartTimeTicks", 0)
 
-	// Direct play if no seek offset is requested, source container is supported by client, and within bitrate limit
+	// Direct play if no seek offset is requested, source container is supported by client, and within bitrate limit.
+	// For extensionless remote STRM 302 signed URLs without seek or bitrate limits, prefer 302 redirect over FFmpeg transcode.
 	bitrateOK := maxBitrate <= 0 || srcBitrate <= 0 || srcBitrate <= maxBitrate
-	if startTimeTicks <= 0 && bitrateOK && isContainerAllowed(srcExt, allowedContainers) && (urlExt == "" || urlExt == srcExt) {
+	directContainerOK := isContainerAllowed(srcExt, allowedContainers) && (urlExt == "" || urlExt == srcExt)
+	extensionless302OK := isRemote && is302 && !forceProxy && srcExt == ""
+	if startTimeTicks <= 0 && bitrateOK && (directContainerOK || extensionless302OK) {
 		if isRemote {
 			if is302 && !forceProxy {
 				w.Header().Set("Cache-Control", "no-store")
@@ -426,12 +433,18 @@ func buildAudioFFmpegArgs(mediaPath, muxFmt, encoder string, bitrate int, startT
 		audioSampleRate = maxAudioSampleRate
 	}
 	args := []string{"-hide_banner", "-loglevel", "error"}
+	if isHTTPURL(mediaPath) {
+		args = append(args,
+			"-protocol_whitelist", "http,https,tcp,tls,crypto",
+			"-follow_redirects", "0",
+			"-rw_timeout", "15000000",
+		)
+	} else {
+		args = append(args, "-protocol_whitelist", "file,crypto,data")
+	}
 	if startTimeTicks > 0 {
 		secs := float64(startTimeTicks) / float64(ticksPerSecond)
 		args = append(args, "-ss", strconv.FormatFloat(secs, 'f', 3, 64))
-	}
-	if isHTTPURL(mediaPath) {
-		args = append(args, "-protocol_whitelist", "http,https,tcp,tls,crypto")
 	}
 	args = append(args,
 		"-i", mediaPath,
@@ -459,7 +472,7 @@ func (h *Handler) handleLyrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := httpx.ParseQuery(r)
-	mediaPath, _, err := h.resolveAudioPath(r.Context(), itemID, q.Get("MediaSourceId"))
+	mediaPath, _, _, err := h.resolveAudioPath(r.Context(), itemID, q.Get("MediaSourceId"))
 	if errors.Is(err, sqlite.ErrNotFound) {
 		httpx.Error(w, http.StatusNotFound, "audio item not found")
 		return
@@ -493,30 +506,39 @@ func (h *Handler) handleLyrics(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, dto)
 }
 
-func (h *Handler) resolveAudioPath(ctx context.Context, itemID, mediaSourceID string) (string, int, error) {
+func (h *Handler) resolveAudioPath(ctx context.Context, itemID, mediaSourceID string) (string, int, string, error) {
 	if h.repo == nil {
-		return "", 0, sqlite.ErrNotFound
+		return "", 0, "", sqlite.ErrNotFound
 	}
 	sources, err := h.repo.GetMediaSourcesByItemID(ctx, itemID)
 	if err == nil && len(sources) > 0 {
+		selected := sources[0]
 		normMS := guid.Normalize(mediaSourceID)
 		if normMS != "" {
 			for _, s := range sources {
 				if guid.Normalize(s.ID) == normMS {
-					return s.Path, s.Bitrate, nil
+					selected = s
+					break
 				}
 			}
 		}
-		return sources[0].Path, sources[0].Bitrate, nil
+		container := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(selected.Container), "."))
+		if container == "" {
+			if item, iErr := h.repo.GetItemRecordByID(ctx, itemID); iErr == nil && item != nil {
+				container = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(item.Container), "."))
+			}
+		}
+		return selected.Path, selected.Bitrate, container, nil
 	}
 	item, err := h.repo.GetItemRecordByID(ctx, itemID)
 	if err != nil {
-		return "", 0, err
+		return "", 0, "", err
 	}
 	if item.Path == "" {
-		return "", 0, sqlite.ErrNotFound
+		return "", 0, "", sqlite.ErrNotFound
 	}
-	return item.Path, 0, nil
+	container := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(item.Container), "."))
+	return item.Path, 0, container, nil
 }
 
 func serveAudioFile(w http.ResponseWriter, r *http.Request, mediaPath string) {

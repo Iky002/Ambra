@@ -445,6 +445,8 @@ func TestRunLibraryAuditAndCleanupOrphans(t *testing.T) {
 	// 1. Healthy movie: exists on disk, has Primary image, has TMDB ID
 	okPath := filepath.Join(mediaDir, "healthy.mkv")
 	_ = os.WriteFile(okPath, []byte("ok"), 0o644)
+	healthyPoster := filepath.Join(mediaDir, "poster.jpg")
+	_ = os.WriteFile(healthyPoster, []byte("jpg"), 0o644)
 	healthy := &sqlite.ItemRecord{
 		LibraryID: lib.ID,
 		Type:      "Movie",
@@ -454,7 +456,7 @@ func TestRunLibraryAuditAndCleanupOrphans(t *testing.T) {
 	}
 	_ = repo.UpsertItem(ctx, healthy)
 	_ = repo.ReplaceItemImages(ctx, healthy.ID, []sqlite.ImageRecord{
-		{ItemID: healthy.ID, ImageType: "Primary", Path: filepath.Join(mediaDir, "poster.jpg")},
+		{ItemID: healthy.ID, ImageType: "Primary", Path: healthyPoster},
 	})
 
 	// 2. Missing poster + missing TMDB, exists on disk
@@ -470,6 +472,8 @@ func TestRunLibraryAuditAndCleanupOrphans(t *testing.T) {
 	_ = repo.UpsertItem(ctx, unscraped)
 
 	// 3. Orphan non-STRM movie (file deleted on disk)
+	orphanPoster := filepath.Join(mediaDir, "orphan-poster.jpg")
+	_ = os.WriteFile(orphanPoster, []byte("jpg"), 0o644)
 	orphan := &sqlite.ItemRecord{
 		LibraryID: lib.ID,
 		Type:      "Movie",
@@ -479,12 +483,14 @@ func TestRunLibraryAuditAndCleanupOrphans(t *testing.T) {
 	}
 	_ = repo.UpsertItem(ctx, orphan)
 	_ = repo.ReplaceItemImages(ctx, orphan.ID, []sqlite.ImageRecord{
-		{ItemID: orphan.ID, ImageType: "Primary", Path: "/tmp/p.jpg"},
+		{ItemID: orphan.ID, ImageType: "Primary", Path: orphanPoster},
 	})
 	_ = repo.ReplaceItemAncestors(ctx, orphan.ID, []sqlite.AncestorLink{{AncestorID: lib.ID, Depth: 1}})
 	_ = repo.UpsertSearchFTS(ctx, orphan.ID, orphan.Name, "", "", "", "")
 
 	// 4. STRM item whose path doesn't exist locally -> must NOT be flagged as orphan
+	strmPoster := filepath.Join(mediaDir, "strm-poster.jpg")
+	_ = os.WriteFile(strmPoster, []byte("jpg"), 0o644)
 	strmItem := &sqlite.ItemRecord{
 		LibraryID: lib.ID,
 		Type:      "Movie",
@@ -495,7 +501,7 @@ func TestRunLibraryAuditAndCleanupOrphans(t *testing.T) {
 	}
 	_ = repo.UpsertItem(ctx, strmItem)
 	_ = repo.ReplaceItemImages(ctx, strmItem.ID, []sqlite.ImageRecord{
-		{ItemID: strmItem.ID, ImageType: "Primary", Path: "/tmp/s.jpg"},
+		{ItemID: strmItem.ID, ImageType: "Primary", Path: strmPoster},
 	})
 
 	report, err := svc.RunLibraryAudit(ctx)
@@ -641,13 +647,13 @@ func TestHelpersEdgeCases(t *testing.T) {
 
 	// Series non-folder path & Movie folder path
 	dir := t.TempDir()
-	tag, p := resolveNFOTarget("Series", false, filepath.Join(dir, "show.mkv"))
-	if tag != "tvshow" || p != filepath.Join(dir, "tvshow.nfo") {
-		t.Fatalf("unexpected series file target: %s %s", tag, p)
+	tag, p, err := resolveNFOTarget("Series", false, filepath.Join(dir, "show.mkv"))
+	if err != nil || tag != "tvshow" || p != filepath.Join(dir, "tvshow.nfo") {
+		t.Fatalf("unexpected series file target: %s %s err=%v", tag, p, err)
 	}
-	tag, p = resolveNFOTarget("Movie", true, dir)
-	if tag != "movie" || p != filepath.Join(dir, "movie.nfo") {
-		t.Fatalf("unexpected movie folder target: %s %s", tag, p)
+	tag, p, err = resolveNFOTarget("Movie", true, dir)
+	if err != nil || tag != "movie" || p != filepath.Join(dir, "movie.nfo") {
+		t.Fatalf("unexpected movie folder target: %s %s err=%v", tag, p, err)
 	}
 
 	// extractProviderIDs & lookupProviderID case-insensitive
@@ -788,6 +794,11 @@ func TestGovernanceSecurityHardeningAndAuditEdges(t *testing.T) {
 		Path:      existingFile,
 	}
 	if err := repo.UpsertItem(ctx, movie); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceItemPeople(ctx, movie.ID, []sqlite.PersonInput{
+		{Name: "Actor One", Type: "Actor"},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := repo.UpsertSearchFTS(ctx, movie.ID, "Raw File", "", "rawfile", "rf", "Actor One"); err != nil {

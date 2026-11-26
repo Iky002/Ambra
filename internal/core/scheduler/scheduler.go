@@ -112,6 +112,7 @@ type Manager struct {
 	tickInterval          time.Duration
 	nowFn                 func() time.Time
 	started               atomic.Bool
+	taskWG                sync.WaitGroup
 }
 
 func New(bus *eventbus.Bus) *Manager {
@@ -233,6 +234,26 @@ func (m *Manager) StopAll() int {
 	return len(cancels)
 }
 
+// Shutdown cancels all running scheduled tasks and waits for them to finish or ctx to expire.
+func (m *Manager) Shutdown(ctx context.Context) error {
+	m.StopAll()
+	done := make(chan struct{})
+	go func() {
+		m.taskWG.Wait()
+		close(done)
+	}()
+	if ctx == nil {
+		<-done
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (m *Manager) evaluateAndRunDue() {
 	m.mu.RLock()
 	nowFn := m.nowFn
@@ -283,20 +304,25 @@ func taskIsDueLocked(mt *managedTask, now time.Time) bool {
 			if tr.TimeOfDayTicks == nil || *tr.TimeOfDayTicks < 0 {
 				continue
 			}
-			scheduled := dailyTriggerTime(now, *tr.TimeOfDayTicks)
-			if !now.Before(scheduled) && now.Sub(scheduled) < 5*time.Minute && lastRun.Before(scheduled) {
-				return true
+			for _, day := range []time.Time{now, now.AddDate(0, 0, -1)} {
+				scheduled := dailyTriggerTime(day, *tr.TimeOfDayTicks)
+				if !now.Before(scheduled) && now.Sub(scheduled) < 5*time.Minute && lastRun.Before(scheduled) {
+					return true
+				}
 			}
 		case "WeeklyTrigger":
 			if tr.TimeOfDayTicks == nil || *tr.TimeOfDayTicks < 0 {
 				continue
 			}
-			if !strings.EqualFold(strings.TrimSpace(tr.DayOfWeek), now.Weekday().String()) {
-				continue
-			}
-			scheduled := dailyTriggerTime(now, *tr.TimeOfDayTicks)
-			if !now.Before(scheduled) && now.Sub(scheduled) < 5*time.Minute && lastRun.Before(scheduled) {
-				return true
+			wantDay := strings.TrimSpace(tr.DayOfWeek)
+			for _, day := range []time.Time{now, now.AddDate(0, 0, -1)} {
+				if !strings.EqualFold(wantDay, day.Weekday().String()) {
+					continue
+				}
+				scheduled := dailyTriggerTime(day, *tr.TimeOfDayTicks)
+				if !now.Before(scheduled) && now.Sub(scheduled) < 5*time.Minute && lastRun.Before(scheduled) {
+					return true
+				}
 			}
 		}
 	}
@@ -359,6 +385,7 @@ func (m *Manager) LoadPersistedTriggers(ctx context.Context) error {
 }
 
 // Register adds or replaces a task definition in the scheduler.
+// If replacing an existing running task, its previous run context is cancelled cleanly.
 func (m *Manager) Register(def TaskDefinition) {
 	if def.ID == "" {
 		def.ID = def.Key
@@ -370,12 +397,22 @@ func (m *Manager) Register(def TaskDefinition) {
 		def.Triggers = []TaskTriggerInfo{}
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	var oldCancel context.CancelFunc
+	if existing, ok := m.tasks[def.ID]; ok && existing != nil {
+		if existing.state != StateIdle && existing.cancel != nil {
+			existing.state = StateCancelling
+			oldCancel = existing.cancel
+		}
+	}
 	now := m.nowFn()
 	m.tasks[def.ID] = &managedTask{
 		def:       def,
 		state:     StateIdle,
 		createdAt: now,
+	}
+	m.mu.Unlock()
+	if oldCancel != nil {
+		oldCancel()
 	}
 }
 
@@ -574,11 +611,13 @@ func (m *Manager) Run(id string) error {
 
 	runFn := mt.def.Run
 	snap := snapshotLocked(mt)
+	m.taskWG.Add(1)
 	m.mu.Unlock()
 
 	m.publishProgress(snap)
 
 	go func() {
+		defer m.taskWG.Done()
 		defer close(doneCh)
 		startTime := time.Now().UTC()
 

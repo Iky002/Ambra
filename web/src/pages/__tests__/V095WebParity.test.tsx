@@ -70,22 +70,31 @@ describe('v0.9.5 Web UI Bug Fixes & Emby Parity', () => {
     vi.spyOn(api, 'getYears').mockResolvedValue({ Items: [], TotalRecordCount: 0 })
     vi.spyOn(api, 'getTags').mockResolvedValue({ Items: [], TotalRecordCount: 0 })
 
-    const getItemsSpy = vi.spyOn(api, 'getItems').mockResolvedValue({
-      Items: [
-        {
-          Id: 'm-1',
-          Name: 'Arrival',
-          Type: 'Movie',
-          Studios: [{ Id: 'st-1', Name: 'Paramount Pictures' }],
-        },
-        {
-          Id: 'm-2',
-          Name: 'Alien',
-          Type: 'Movie',
-          Studios: [{ Id: 'st-2', Name: '20th Century Fox' }],
-        },
-      ],
-      TotalRecordCount: 2,
+    const allMockItems: BaseItemDto[] = [
+      {
+        Id: 'm-1',
+        Name: 'Arrival',
+        Type: 'Movie',
+        Studios: [{ Id: 'st-1', Name: 'Paramount Pictures' }],
+      },
+      {
+        Id: 'm-2',
+        Name: 'Alien',
+        Type: 'Movie',
+        Studios: [{ Id: 'st-2', Name: '20th Century Fox' }],
+      },
+    ]
+    const getItemsSpy = vi.spyOn(api, 'getItems').mockImplementation(async (_uid, params) => {
+      const studio = params?.studios?.toLowerCase()
+      const filtered = studio
+        ? allMockItems.filter((it) =>
+            it.Studios?.some((s) => s.Name.toLowerCase() === studio),
+          )
+        : allMockItems
+      return {
+        Items: filtered,
+        TotalRecordCount: filtered.length,
+      }
     })
 
     const Wrapper = createWrapper('/library/lib-movies?letter=A&studio=Paramount%20Pictures')
@@ -101,7 +110,7 @@ describe('v0.9.5 Web UI Bug Fixes & Emby Parity', () => {
     expect(screen.queryByText('Alien')).not.toBeInTheDocument()
     expect(screen.getByText('制片厂：Paramount Pictures')).toBeInTheDocument()
 
-    // 确认 A 字母按钮处于选中态且 getItems 收到了 nameStartsWith: 'a'
+    // 确认 A 字母按钮处于选中态且 getItems 收到了 nameStartsWith: 'a' 与 studios: 'Paramount Pictures'
     const letterABtn = screen.getByRole('button', { name: 'A' })
     expect(letterABtn).toHaveAttribute('aria-pressed', 'true')
     await waitFor(() => {
@@ -110,6 +119,7 @@ describe('v0.9.5 Web UI Bug Fixes & Emby Parity', () => {
         expect.objectContaining({
           parentId: 'lib-movies',
           nameStartsWith: 'a',
+          studios: 'Paramount Pictures',
         }),
       )
     })

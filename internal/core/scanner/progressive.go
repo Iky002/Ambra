@@ -30,12 +30,13 @@ type pendingPhaseAItem struct {
 }
 
 type phaseABatch struct {
-	scanner *Scanner
-	libID   string
-	maxSize int
-	items   []pendingPhaseAItem
-	stats   *ScanStats
-	tasks   *[]enrichTask
+	scanner       *Scanner
+	libID         string
+	maxSize       int
+	items         []pendingPhaseAItem
+	stats         *ScanStats
+	tasks         *[]enrichTask
+	trackProgress bool
 
 	// In-memory collision sets for unflushed items so multi-version auto-merge
 	// within the same batch flushes before querying SQLite.
@@ -45,6 +46,10 @@ type phaseABatch struct {
 }
 
 func newPhaseABatch(s *Scanner, libID string, stats *ScanStats, tasks *[]enrichTask) *phaseABatch {
+	return newPhaseABatchWithProgress(s, libID, stats, tasks, true)
+}
+
+func newPhaseABatchWithProgress(s *Scanner, libID string, stats *ScanStats, tasks *[]enrichTask, trackProgress bool) *phaseABatch {
 	return &phaseABatch{
 		scanner:       s,
 		libID:         libID,
@@ -52,6 +57,7 @@ func newPhaseABatch(s *Scanner, libID string, stats *ScanStats, tasks *[]enrichT
 		items:         make([]pendingPhaseAItem, 0, phaseABatchSize),
 		stats:         stats,
 		tasks:         tasks,
+		trackProgress: trackProgress,
 		movieDirTitle: make(map[string]struct{}),
 		movieProvider: make(map[string]struct{}),
 		episodeKeys:   make(map[string]struct{}),
@@ -167,7 +173,9 @@ func (b *phaseABatch) flush(ctx context.Context) error {
 	if err := b.scanner.repo.UpsertItemsBatch(ctx, inputs); err != nil {
 		for _, item := range pending {
 			b.stats.Errors++
-			b.scanner.recordDiscoveryItem(b.libID, item.displayFileName, false, false, true)
+			if b.trackProgress {
+				b.scanner.recordDiscoveryItem(b.libID, item.displayFileName, false, false, true)
+			}
 		}
 		return err
 	}
@@ -179,12 +187,16 @@ func (b *phaseABatch) flush(ctx context.Context) error {
 		if item.postHook != nil {
 			if err := item.postHook(ctx); err != nil {
 				b.stats.Errors++
-				b.scanner.recordDiscoveryItem(b.libID, item.displayFileName, false, false, true)
+				if b.trackProgress {
+					b.scanner.recordDiscoveryItem(b.libID, item.displayFileName, false, false, true)
+				}
 				continue
 			}
 		}
 		b.stats.ItemsAdded++
-		b.scanner.recordDiscoveryItem(b.libID, item.displayFileName, true, false, false)
+		if b.trackProgress {
+			b.scanner.recordDiscoveryItem(b.libID, item.displayFileName, true, false, false)
+		}
 		if len(item.tasks) > 0 {
 			*b.tasks = append(*b.tasks, item.tasks...)
 		}
@@ -508,6 +520,9 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 	if targetPath == "" {
 		return stats, nil
 	}
+	unlock := s.lockLibraryPathOp(libraryID)
+	defer unlock()
+
 	lib, err := s.repo.GetLibrary(ctx, libraryID)
 	if err != nil {
 		return stats, err
@@ -519,9 +534,13 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 		return stats, fmt.Errorf("scanner: path %q is outside library %s roots", cleanTarget, lib.ID)
 	}
 	policy := s.currentSymlinkPolicy()
+	hops := countSymlinkHopsUnderRoot(root, cleanTarget)
 	linfo, lerr := os.Lstat(cleanTarget)
 	if lerr == nil {
-		if policy == SymlinkIgnore && (linfo.Mode()&os.ModeSymlink != 0 || hasSymlinkComponentUnderRoot(root, cleanTarget)) {
+		if policy == SymlinkIgnore && (linfo.Mode()&os.ModeSymlink != 0 || hops > 0) {
+			return stats, nil
+		}
+		if policy == SymlinkFollowDirect && hops > 1 {
 			return stats, nil
 		}
 		if !isPathWithinRoot(root, cleanTarget) {
@@ -529,8 +548,11 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 		}
 	} else if !os.IsNotExist(lerr) {
 		return stats, lerr
-	} else if hasSymlinkComponentUnderRoot(root, cleanTarget) {
+	} else if hops > 0 {
 		if policy == SymlinkIgnore {
+			return stats, nil
+		}
+		if policy == SymlinkFollowDirect && hops > 1 {
 			return stats, nil
 		}
 		if !isPathWithinRoot(root, cleanTarget) {
@@ -540,12 +562,12 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 	info, err := os.Stat(cleanTarget)
 	if err != nil {
 		if os.IsNotExist(err) {
-			deleted, delErr := s.repo.DeleteItemByPath(ctx, lib.ID, cleanTarget)
+			deletedCount, delErr := s.repo.DeleteItemsByPathPrefix(ctx, lib.ID, cleanTarget)
 			if delErr != nil {
 				return stats, delErr
 			}
-			if deleted {
-				stats.ItemsDeleted++
+			if deletedCount > 0 {
+				stats.ItemsDeleted += int(deletedCount)
 				s.publishLibraryChanged(ctx, lib.ID, stats, "cleanup")
 			}
 			return stats, nil
@@ -579,14 +601,14 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 			if err := s.waitIfPaused(ctx); err != nil {
 				return stats, err
 			}
-			itemTasks, procErr := s.processDiscoveredFile(ctx, lib, root, cleanTarget, forceTV, seriesCache, seasonCache, artistCache, albumCache, seenSeriesEnrich, seenSeriesExtras, nil, &stats)
+			itemTasks, procErr := s.processDiscoveredFileWithProgress(ctx, lib, root, cleanTarget, forceTV, seriesCache, seasonCache, artistCache, albumCache, seenSeriesEnrich, seenSeriesExtras, nil, &stats, false)
 			if procErr != nil {
 				return stats, procErr
 			}
 			tasks = append(tasks, itemTasks...)
 		}
 	} else {
-		dirTasks, _, err := s.runPhaseAWithRoot(ctx, lib, root, cleanTarget, nil, &stats)
+		dirTasks, _, err := s.runPhaseAWithRootAndDepth(ctx, lib, root, cleanTarget, hops, nil, &stats, false)
 		if err != nil {
 			return stats, err
 		}
@@ -597,7 +619,7 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 		s.publishLibraryChanged(ctx, lib.ID, stats, "discovery")
 	}
 	if len(tasks) > 0 {
-		stats.ItemsUpdated += s.runPhaseB(ctx, lib.ID, tasks)
+		stats.ItemsUpdated += s.runPhaseBWithOptions(ctx, lib.ID, tasks, false)
 	}
 	s.notifyScanComplete(ctx, lib.ID, stats)
 	return stats, nil
@@ -716,6 +738,10 @@ func (s *Scanner) runPhaseA(ctx context.Context, lib *sqlite.LibraryRecord, root
 }
 
 func (s *Scanner) runPhaseAWithRoot(ctx context.Context, lib *sqlite.LibraryRecord, logicalRoot, walkRoot string, discovered map[string]struct{}, stats *ScanStats) ([]enrichTask, bool, error) {
+	return s.runPhaseAWithRootAndDepth(ctx, lib, logicalRoot, walkRoot, 0, discovered, stats, true)
+}
+
+func (s *Scanner) runPhaseAWithRootAndDepth(ctx context.Context, lib *sqlite.LibraryRecord, logicalRoot, walkRoot string, startDepth int, discovered map[string]struct{}, stats *ScanStats, trackProgress bool) ([]enrichTask, bool, error) {
 	forceTV := strings.EqualFold(lib.CollectionType, "tvshows")
 	seriesCache := make(map[string]*sqlite.ItemRecord)
 	seasonCache := make(map[string]*sqlite.ItemRecord)
@@ -726,8 +752,8 @@ func (s *Scanner) runPhaseAWithRoot(ctx context.Context, lib *sqlite.LibraryReco
 	policy := s.currentSymlinkPolicy()
 
 	var tasks []enrichTask
-	batch := newPhaseABatch(s, lib.ID, stats, &tasks)
-	walkErr := WalkSafe(walkRoot, policy, func(path string, info os.FileInfo) error {
+	batch := newPhaseABatchWithProgress(s, lib.ID, stats, &tasks, trackProgress)
+	walkErr := WalkSafeWithStartDepth(walkRoot, startDepth, policy, func(path string, info os.FileInfo) error {
 		if err := s.waitIfPaused(ctx); err != nil {
 			return err
 		}
@@ -772,7 +798,7 @@ func (s *Scanner) runPhaseAWithRoot(ctx context.Context, lib *sqlite.LibraryReco
 		if discovered != nil {
 			discovered[filepath.Clean(path)] = struct{}{}
 		}
-		itemTasks, err := s.processDiscoveredFile(ctx, lib, logicalRoot, path, forceTV, seriesCache, seasonCache, artistCache, albumCache, seenSeriesEnrich, seenSeriesExtras, batch, stats)
+		itemTasks, err := s.processDiscoveredFileWithProgress(ctx, lib, logicalRoot, path, forceTV, seriesCache, seasonCache, artistCache, albumCache, seenSeriesEnrich, seenSeriesExtras, batch, stats, trackProgress)
 		if err != nil {
 			return err
 		}
@@ -808,6 +834,21 @@ func (s *Scanner) processDiscoveredFile(
 	batch *phaseABatch,
 	stats *ScanStats,
 ) ([]enrichTask, error) {
+	return s.processDiscoveredFileWithProgress(ctx, lib, root, path, forceTV, seriesCache, seasonCache, artistCache, albumCache, seenSeriesEnrich, seenSeriesExtras, batch, stats, true)
+}
+
+func (s *Scanner) processDiscoveredFileWithProgress(
+	ctx context.Context,
+	lib *sqlite.LibraryRecord,
+	root, path string,
+	forceTV bool,
+	seriesCache, seasonCache, artistCache, albumCache map[string]*sqlite.ItemRecord,
+	seenSeriesEnrich map[string]struct{},
+	seenSeriesExtras map[string]struct{},
+	batch *phaseABatch,
+	stats *ScanStats,
+	trackProgress bool,
+) ([]enrichTask, error) {
 	var (
 		changed  bool
 		deferred bool
@@ -840,25 +881,37 @@ func (s *Scanner) processDiscoveredFile(
 	}
 	if err != nil {
 		stats.Errors++
-		s.recordDiscoveryItem(lib.ID, filepath.Base(path), false, false, true)
+		if trackProgress {
+			s.recordDiscoveryItem(lib.ID, filepath.Base(path), false, false, true)
+		}
 		return nil, nil
 	}
 	if changed {
 		stats.ItemsAdded++
-		s.recordDiscoveryItem(lib.ID, filepath.Base(path), true, false, false)
+		if trackProgress {
+			s.recordDiscoveryItem(lib.ID, filepath.Base(path), true, false, false)
+		}
 	} else {
 		stats.ItemsSkipped++
-		s.recordDiscoveryItem(lib.ID, filepath.Base(path), false, true, false)
+		if trackProgress {
+			s.recordDiscoveryItem(lib.ID, filepath.Base(path), false, true, false)
+		}
 	}
 	return tasks, nil
 }
 
 func (s *Scanner) runPhaseB(ctx context.Context, libraryID string, tasks []enrichTask) int {
+	return s.runPhaseBWithOptions(ctx, libraryID, tasks, true)
+}
+
+func (s *Scanner) runPhaseBWithOptions(ctx context.Context, libraryID string, tasks []enrichTask, trackProgress bool) int {
 	if len(tasks) == 0 {
 		return 0
 	}
 
-	s.startEnrichPhase(libraryID, len(tasks))
+	if trackProgress {
+		s.startEnrichPhase(libraryID, len(tasks))
+	}
 
 	var wave1, wave2 []enrichTask
 	for _, t := range tasks {
@@ -873,11 +926,11 @@ func (s *Scanner) runPhaseB(ctx context.Context, libraryID string, tasks []enric
 	var enriched atomic.Int64
 
 	// Wave 1: Series and Movie tasks (populates parent Series TMDB IDs in SQLite).
-	s.runEnrichWave(ctx, libraryID, pool, wave1, &enriched)
+	s.runEnrichWave(ctx, libraryID, pool, wave1, &enriched, trackProgress)
 
 	// Wave 2: Season and Episode tasks (can read parent Series TMDB IDs from SQLite).
 	if ctx.Err() == nil {
-		s.runEnrichWave(ctx, libraryID, pool, wave2, &enriched)
+		s.runEnrichWave(ctx, libraryID, pool, wave2, &enriched, trackProgress)
 	}
 
 	n := int(enriched.Load())
@@ -890,7 +943,7 @@ func (s *Scanner) runPhaseB(ctx context.Context, libraryID string, tasks []enric
 	return n
 }
 
-func (s *Scanner) runEnrichWave(ctx context.Context, libraryID string, pool *budget.Pool, tasks []enrichTask, enriched *atomic.Int64) {
+func (s *Scanner) runEnrichWave(ctx context.Context, libraryID string, pool *budget.Pool, tasks []enrichTask, enriched *atomic.Int64, trackProgress bool) {
 	if len(tasks) == 0 {
 		return
 	}
@@ -921,11 +974,13 @@ func (s *Scanner) runEnrichWave(ctx context.Context, libraryID string, pool *bud
 					return
 				}
 				err := pool.Do(ctx, 1, func(workCtx context.Context) error {
-					itemUpdated := s.enrichItem(workCtx, task)
+					itemUpdated := s.enrichItemWithProgress(workCtx, task, trackProgress)
 					if itemUpdated {
 						enriched.Add(1)
 					}
-					s.recordEnrichDone(libraryID, itemUpdated)
+					if trackProgress {
+						s.recordEnrichDone(libraryID, itemUpdated)
+					}
 					return nil
 				})
 				if err != nil {
@@ -938,6 +993,10 @@ func (s *Scanner) runEnrichWave(ctx context.Context, libraryID string, pool *bud
 }
 
 func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
+	return s.enrichItemWithProgress(ctx, task, true)
+}
+
+func (s *Scanner) enrichItemWithProgress(ctx context.Context, task enrichTask, trackProgress bool) bool {
 	if ctx.Err() != nil {
 		return false
 	}
@@ -954,7 +1013,9 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 
 	var probeRes *ProbeResult
 	if task.NeedProbe {
-		s.updateEnrichCurrent(task.LibraryID, itemLabel, "探测媒体流信息")
+		if trackProgress {
+			s.updateEnrichCurrent(task.LibraryID, itemLabel, "探测媒体流信息")
+		}
 		probeRes = s.probeMedia(ctx, task.MediaPath, task.IsStrm)
 		if probeRes != nil && (len(probeRes.Streams) > 0 || len(probeRes.Tags) > 0 || probeRes.HasAttachedPic || len(probeRes.Chapters) > 0) {
 			rec, err := s.repo.GetItemRecordByID(ctx, task.ItemID)
@@ -1012,7 +1073,9 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 		if err == nil && existingRec != nil && existingRec.Extra.LockData {
 			return updated
 		}
-		s.updateEnrichCurrent(task.LibraryID, itemLabel, "刮削元数据与下载海报")
+		if trackProgress {
+			s.updateEnrichCurrent(task.LibraryID, itemLabel, "刮削元数据与下载海报")
+		}
 		if (strings.EqualFold(task.ItemType, "Season") || strings.EqualFold(task.ItemType, "Episode")) && task.ParentSeriesID != "" {
 			s.applyParentSeriesQueryContext(ctx, task.ParentSeriesID, &task.Query)
 		}
@@ -1187,7 +1250,18 @@ func (s *Scanner) tryAutoMergeMovieByProviderID(ctx context.Context, rec *sqlite
 	defer s.mergeMu.Unlock()
 
 	matches, err := s.repo.FindItemsByProviderID(ctx, rec.LibraryID, "Movie", "Tmdb", tmdbID)
-	if err != nil || len(matches) < 2 {
+	if err != nil {
+		return false
+	}
+	if len(matches) < 2 {
+		for _, m := range matches {
+			if m.ID == rec.ID {
+				return false
+			}
+		}
+		if existing, getErr := s.repo.GetItemRecordByID(ctx, rec.ID); getErr != nil || existing == nil {
+			return true
+		}
 		return false
 	}
 

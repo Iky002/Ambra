@@ -442,13 +442,15 @@ func (m *Manager) ReportPlaybackStart(ctx context.Context, user *sqlite.UserReco
 	now := time.Now().UTC()
 
 	var nowPlaying *dto.BaseItemDto
-	if itemID != "" && m.hasLibraryRepo() {
-		// Always construct NowPlayingItem from authoritative server metadata instead of trusting client req.Item.
-		nowPlaying = &dto.BaseItemDto{
-			Id:       itemID,
-			ServerId: m.serverID(),
+	if m.hasLibraryRepo() {
+		if itemID != "" {
+			// Always construct NowPlayingItem from authoritative server metadata instead of trusting client req.Item.
+			nowPlaying = &dto.BaseItemDto{
+				Id:       itemID,
+				ServerId: m.serverID(),
+			}
+			m.hydrateNowPlayingItem(ctx, user, nowPlaying, itemID)
 		}
-		m.hydrateNowPlayingItem(ctx, user, nowPlaying, itemID)
 	} else if req.Item != nil {
 		itemCopy := cloneBaseItemDto(req.Item)
 		if itemCopy.Id == "" {
@@ -534,21 +536,37 @@ func (m *Manager) ReportPlaybackProgress(ctx context.Context, user *sqlite.UserR
 	if user == nil {
 		return nil
 	}
+	deviceIDForLookup := client.DeviceID
+	if deviceIDForLookup == "" {
+		deviceIDForLookup = "default-device"
+	}
+	sidForLookup := auth.SessionID(user.ID, deviceIDForLookup)
 	itemID := guid.Normalize(req.ItemId)
+	needHydrate := false
+	m.mu.RLock()
+	existing, hasExisting := m.sessions[sidForLookup]
 	if itemID == "" {
-		deviceID := client.DeviceID
-		if deviceID == "" {
-			deviceID = "default-device"
-		}
-		sid := auth.SessionID(user.ID, deviceID)
-		m.mu.RLock()
-		if existing, ok := m.sessions[sid]; ok && existing.info.NowPlayingItem != nil {
+		if hasExisting && existing.info.NowPlayingItem != nil {
 			itemID = guid.Normalize(existing.info.NowPlayingItem.Id)
 		}
-		m.mu.RUnlock()
 	}
+	if itemID != "" {
+		if !hasExisting || existing.info.NowPlayingItem == nil || guid.Normalize(existing.info.NowPlayingItem.Id) != itemID {
+			needHydrate = true
+		}
+	}
+	m.mu.RUnlock()
 	if err := m.checkItemAccess(ctx, user, itemID); err != nil {
 		return err
+	}
+
+	var hydratedNowPlaying *dto.BaseItemDto
+	if needHydrate {
+		hydratedNowPlaying = &dto.BaseItemDto{
+			Id:       itemID,
+			ServerId: m.serverID(),
+		}
+		m.hydrateNowPlayingItem(ctx, user, hydratedNowPlaying, itemID)
 	}
 	now := time.Now().UTC()
 
@@ -562,10 +580,14 @@ func (m *Manager) ReportPlaybackProgress(ctx context.Context, user *sqlite.UserR
 	if req.PlaySessionId != "" {
 		entry.playSessionID = req.PlaySessionId
 	}
-	if itemID != "" && entry.info.NowPlayingItem == nil {
-		entry.info.NowPlayingItem = &dto.BaseItemDto{
-			Id:       itemID,
-			ServerId: m.serverID(),
+	if itemID != "" && (entry.info.NowPlayingItem == nil || guid.Normalize(entry.info.NowPlayingItem.Id) != itemID) {
+		if hydratedNowPlaying != nil {
+			entry.info.NowPlayingItem = hydratedNowPlaying
+		} else {
+			entry.info.NowPlayingItem = &dto.BaseItemDto{
+				Id:       itemID,
+				ServerId: m.serverID(),
+			}
 		}
 	}
 	if itemID == "" && entry.info.NowPlayingItem != nil {

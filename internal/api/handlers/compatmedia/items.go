@@ -3,7 +3,6 @@ package compatmedia
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -900,6 +899,24 @@ var specialFeatureExtraTypes = []string{
 	"Clip", "Featurette", "BehindTheScenes", "DeletedScene", "Interview", "Scene", "Short", "Extra",
 }
 
+func (h *Handler) filterExtrasByParentalPolicy(ctx context.Context, items []dto.BaseItemDto, maxRating *int, blockedTags []string) []dto.BaseItemDto {
+	if h.repo == nil || (maxRating == nil && len(blockedTags) == 0) || len(items) == 0 {
+		return items
+	}
+	filtered := make([]dto.BaseItemDto, 0, len(items))
+	for _, it := range items {
+		rec, err := h.repo.GetItemRecordByID(ctx, it.Id)
+		if err != nil || rec == nil {
+			continue
+		}
+		if blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(ctx, rec, maxRating, blockedTags); bErr != nil || blocked {
+			continue
+		}
+		filtered = append(filtered, it)
+	}
+	return filtered
+}
+
 func (h *Handler) handleLocalTrailers(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	if targetUID := q.Get("UserId"); targetUID != "" && !h.canAccessUserData(r, targetUID) {
@@ -915,11 +932,17 @@ func (h *Handler) handleLocalTrailers(w http.ResponseWriter, r *http.Request) {
 		httpx.JSON(w, http.StatusOK, []dto.BaseItemDto{})
 		return
 	}
-	items, err := h.repo.GetItemExtras(r.Context(), h.serverID(), h.resolveUserID(r, q), itemID, []string{"Trailer"})
+	userID := h.resolveUserID(r, q)
+	items, err := h.repo.GetItemExtras(r.Context(), h.serverID(), userID, itemID, []string{"Trailer"})
 	if err != nil {
 		slog.Error("internal error in compatmedia item handler", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
+	}
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	items = h.filterExtrasByParentalPolicy(r.Context(), items, maxRating, blockedTags)
+	if items == nil {
+		items = []dto.BaseItemDto{}
 	}
 	h.sanitizeItemsPathsForCaller(r, items)
 	httpx.JSON(w, http.StatusOK, items)
@@ -940,11 +963,17 @@ func (h *Handler) handleSpecialFeatures(w http.ResponseWriter, r *http.Request) 
 		httpx.JSON(w, http.StatusOK, []dto.BaseItemDto{})
 		return
 	}
-	items, err := h.repo.GetItemExtras(r.Context(), h.serverID(), h.resolveUserID(r, q), itemID, specialFeatureExtraTypes)
+	userID := h.resolveUserID(r, q)
+	items, err := h.repo.GetItemExtras(r.Context(), h.serverID(), userID, itemID, specialFeatureExtraTypes)
 	if err != nil {
 		slog.Error("internal error in compatmedia item handler", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
+	}
+	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	items = h.filterExtrasByParentalPolicy(r.Context(), items, maxRating, blockedTags)
+	if items == nil {
+		items = []dto.BaseItemDto{}
 	}
 	h.sanitizeItemsPathsForCaller(r, items)
 	httpx.JSON(w, http.StatusOK, items)
@@ -971,12 +1000,18 @@ func (h *Handler) serveThemeMediaByTypes(w http.ResponseWriter, r *http.Request,
 	}
 	items := []dto.BaseItemDto{}
 	if h.repo != nil && ownerID != "" {
+		userID := h.resolveUserID(r, q)
 		var err error
-		items, err = h.repo.GetItemExtras(r.Context(), h.serverID(), h.resolveUserID(r, q), ownerID, extraTypes)
+		items, err = h.repo.GetItemExtras(r.Context(), h.serverID(), userID, ownerID, extraTypes)
 		if err != nil {
 			slog.Error("internal error in compatmedia item handler", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal server error")
 			return
+		}
+		maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+		items = h.filterExtrasByParentalPolicy(r.Context(), items, maxRating, blockedTags)
+		if items == nil {
+			items = []dto.BaseItemDto{}
 		}
 	}
 	h.sanitizeItemsPathsForCaller(r, items)
@@ -1008,6 +1043,8 @@ func (h *Handler) handleAllThemeMedia(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusInternalServerError, "internal server error")
 			return
 		}
+		maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+		allThemes = h.filterExtrasByParentalPolicy(r.Context(), allThemes, maxRating, blockedTags)
 		h.sanitizeItemsPathsForCaller(r, allThemes)
 		for _, it := range allThemes {
 			if strings.EqualFold(it.ExtraType, "ThemeSong") {
@@ -1324,8 +1361,16 @@ func (h *Handler) handleUploadSubtitle(w http.ResponseWriter, r *http.Request) {
 			isForcedInt = 1
 		}
 
+		tx, txErr := h.store.Writer.BeginTx(r.Context(), nil)
+		if txErr != nil {
+			slog.Error("failed to begin subtitle metadata transaction", "item_id", itemID, "error", txErr)
+			httpx.Error(w, http.StatusInternalServerError, "failed to save subtitle metadata")
+			return
+		}
+		defer func() { _ = tx.Rollback() }()
+
 		var existingIdx int
-		qErr := h.store.Reader.QueryRowContext(r.Context(), `
+		qErr := tx.QueryRowContext(r.Context(), `
 			SELECT stream_index FROM item_media_streams
 			WHERE media_source_id = ? AND path = ? AND LOWER(stream_type) = 'subtitle' AND is_external = 1
 			LIMIT 1`,
@@ -1333,7 +1378,7 @@ func (h *Handler) handleUploadSubtitle(w http.ResponseWriter, r *http.Request) {
 		).Scan(&existingIdx)
 
 		if qErr == nil {
-			if _, err := h.store.Writer.ExecContext(r.Context(), `
+			if _, err := tx.ExecContext(r.Context(), `
 				UPDATE item_media_streams
 				SET codec = ?, language = ?, sub_variant = ?, display_title = ?, title = ?, is_forced = ?
 				WHERE media_source_id = ? AND stream_index = ? AND path = ?`,
@@ -1346,13 +1391,17 @@ func (h *Handler) handleUploadSubtitle(w http.ResponseWriter, r *http.Request) {
 			}
 		} else if errors.Is(qErr, sql.ErrNoRows) {
 			var maxIdx int
-			_ = h.store.Reader.QueryRowContext(r.Context(),
+			if err := tx.QueryRowContext(r.Context(),
 				`SELECT COALESCE(MAX(stream_index), -1) FROM item_media_streams WHERE item_id = ?`,
 				itemID,
-			).Scan(&maxIdx)
+			).Scan(&maxIdx); err != nil {
+				slog.Error("failed to query max subtitle stream index", "item_id", itemID, "error", err)
+				httpx.Error(w, http.StatusInternalServerError, "failed to save subtitle metadata")
+				return
+			}
 			nextIdx := maxIdx + 1
 
-			if _, err := h.store.Writer.ExecContext(r.Context(), `
+			if _, err := tx.ExecContext(r.Context(), `
 				INSERT INTO item_media_streams (
 					media_source_id, item_id, stream_index, stream_type, codec, language, sub_variant,
 					display_title, title, width, height, video_range, audio_layout, channels,
@@ -1368,6 +1417,11 @@ func (h *Handler) handleUploadSubtitle(w http.ResponseWriter, r *http.Request) {
 		} else {
 			slog.Error("failed to query existing subtitle stream", "item_id", itemID, "error", qErr)
 			httpx.Error(w, http.StatusInternalServerError, "failed to load subtitle metadata")
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			slog.Error("failed to commit subtitle stream record", "item_id", itemID, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to save subtitle metadata")
 			return
 		}
 	}
@@ -1754,7 +1808,7 @@ func (h *Handler) handleVideoAttachmentStream(w http.ResponseWriter, r *http.Req
 		return
 	}
 	fontPath := fonts[idx]
-	data, err := os.ReadFile(fontPath)
+	f, err := os.Open(fontPath)
 	if err != nil {
 		if errors.Is(err, os.ErrPermission) {
 			logAndWritePermissionDenied(w, fontPath, err)
@@ -1763,21 +1817,18 @@ func (h *Handler) handleVideoAttachmentStream(w http.ResponseWriter, r *http.Req
 		httpx.Error(w, http.StatusNotFound, "attachment file not found")
 		return
 	}
-	sum := sha256.Sum256(data)
-	etag := fmt.Sprintf(`"%x"`, sum[:8])
+	defer f.Close()
+	stat, err := f.Stat()
+	if err != nil || stat.IsDir() {
+		httpx.Error(w, http.StatusNotFound, "attachment file not found")
+		return
+	}
+	etag := fmt.Sprintf(`"%x-%x"`, stat.ModTime().UnixNano(), stat.Size())
 
 	w.Header().Set("Content-Type", fontContentType(fontPath))
 	w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
 	w.Header().Set("ETag", etag)
-	if inm := strings.TrimSpace(r.Header.Get("If-None-Match")); inm != "" && inm == etag {
-		w.WriteHeader(http.StatusNotModified)
-		return
-	}
-	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-	w.WriteHeader(http.StatusOK)
-	if r.Method != http.MethodHead {
-		_, _ = w.Write(data)
-	}
+	http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
 }
 
 func (h *Handler) handleDeleteAlternateSources(w http.ResponseWriter, r *http.Request) {
@@ -1820,12 +1871,17 @@ func (h *Handler) handleMergeVersions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) resolveDeviceID(r *http.Request, q httpx.Query) string {
+	queryDev := strings.TrimSpace(q.Get("DeviceId"))
+	_, isAdmin := h.callerIdentity(r)
+	if isAdmin && queryDev != "" {
+		return queryDev
+	}
 	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil {
 		if boundDev := strings.TrimSpace(ac.Client.DeviceID); boundDev != "" {
 			return boundDev
 		}
 	}
-	return strings.TrimSpace(q.Get("DeviceId"))
+	return queryDev
 }
 
 func scopePlaySessionID(playSessionID, callerUserID string, isAdmin bool) string {
@@ -1843,8 +1899,12 @@ func scopePlaySessionID(playSessionID, callerUserID string, isAdmin bool) string
 func (h *Handler) handleDeleteActiveEncodings(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	callerUserID, isAdmin := h.callerIdentity(r)
-	deviceID := h.resolveDeviceID(r, q)
 	rawPlaySessionID := strings.TrimSpace(q.Get("PlaySessionId"))
+	rawDeviceID := strings.TrimSpace(q.Get("DeviceId"))
+	deviceID := ""
+	if rawPlaySessionID == "" || rawDeviceID != "" {
+		deviceID = h.resolveDeviceID(r, q)
+	}
 	playSessionID := scopePlaySessionID(rawPlaySessionID, callerUserID, isAdmin)
 	if h.transcodeMgr != nil {
 		h.transcodeMgr.StopSessionsScoped(callerUserID, playSessionID, deviceID, isAdmin)
@@ -1862,8 +1922,12 @@ func (h *Handler) handleDeleteActiveEncodings(w http.ResponseWriter, r *http.Req
 
 func (h *Handler) handleVideoHlsSegment(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	if !h.canAccessItemID(r, itemID) {
+		httpx.Error(w, http.StatusNotFound, "hls segment not available")
+		return
+	}
 	if _, err := h.repo.GetItemRecordByID(r.Context(), itemID); errors.Is(err, sqlite.ErrNotFound) {
-		httpx.Error(w, http.StatusNotFound, "video item not found")
+		httpx.Error(w, http.StatusNotFound, "hls segment not available")
 		return
 	}
 	httpx.Error(w, http.StatusNotFound, "hls segment not available")
@@ -1871,8 +1935,12 @@ func (h *Handler) handleVideoHlsSegment(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) handleAudioHlsSegment(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	if !h.canAccessItemID(r, itemID) {
+		httpx.Error(w, http.StatusNotFound, "audio hls segment not available")
+		return
+	}
 	if _, err := h.repo.GetItemRecordByID(r.Context(), itemID); errors.Is(err, sqlite.ErrNotFound) {
-		httpx.Error(w, http.StatusNotFound, "audio item not found")
+		httpx.Error(w, http.StatusNotFound, "audio hls segment not available")
 		return
 	}
 	httpx.Error(w, http.StatusNotFound, "audio hls segment not available")
