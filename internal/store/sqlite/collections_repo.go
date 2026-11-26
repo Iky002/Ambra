@@ -92,7 +92,7 @@ func (r *LibraryRepo) CreateCollection(ctx context.Context, name, parentID strin
 	if err := r.upsertContainerAncestors(ctx, rec); err != nil {
 		return nil, err
 	}
-	_ = r.UpsertSearchFTS(ctx, rec.ID, rec.Name, rec.Name, "", "", "")
+	_ = r.UpsertSearchFTS(ctx, rec.ID, rec.Name, "", "", "", "")
 	if len(itemIDs) > 0 {
 		if _, err := r.AddItemsToContainer(ctx, rec.ID, itemIDs, true); err != nil {
 			return nil, err
@@ -137,7 +137,7 @@ func (r *LibraryRepo) CreatePlaylist(ctx context.Context, name, mediaType, userI
 	if err := r.upsertContainerAncestors(ctx, rec); err != nil {
 		return nil, err
 	}
-	_ = r.UpsertSearchFTS(ctx, rec.ID, rec.Name, rec.Name, "", "", "")
+	_ = r.UpsertSearchFTS(ctx, rec.ID, rec.Name, "", "", "", "")
 	if len(itemIDs) > 0 {
 		if _, err := r.AddItemsToContainer(ctx, rec.ID, itemIDs, false); err != nil {
 			return nil, err

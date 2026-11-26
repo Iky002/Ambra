@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -211,7 +212,8 @@ func (h *Handler) handleMasterPlaylist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to resolve media item for master playlist", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to resolve media item")
 		return
 	}
 	if !h.canAccessItem(r, item) {
@@ -219,7 +221,12 @@ func (h *Handler) handleMasterPlaylist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	params := h.buildSessionParams(r, item, src, q)
+	params, strmErr := h.buildSessionParamsChecked(r, item, src, q)
+	if strmErr != nil {
+		slog.Error("failed to resolve hls stream source", "item_id", item.ID, "error", strmErr)
+		httpx.Error(w, http.StatusBadGateway, "failed to resolve stream url")
+		return
+	}
 
 	width, height := extractVideoDimensions(src)
 	if params.MaxWidth > 0 && (width == 0 || params.MaxWidth < width) {
@@ -264,7 +271,8 @@ func (h *Handler) handleMediaPlaylist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to resolve media item for master playlist", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to resolve media item")
 		return
 	}
 	if !h.canAccessItem(r, item) {
@@ -272,7 +280,12 @@ func (h *Handler) handleMediaPlaylist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	params := h.buildSessionParams(r, item, src, q)
+	params, strmErr := h.buildSessionParamsChecked(r, item, src, q)
+	if strmErr != nil {
+		slog.Error("failed to resolve hls stream source", "item_id", item.ID, "error", strmErr)
+		httpx.Error(w, http.StatusBadGateway, "failed to resolve stream url")
+		return
+	}
 	if h.mgr != nil {
 		_, _ = h.mgr.RegisterSession(params)
 	}
@@ -308,7 +321,8 @@ func (h *Handler) handleSubtitlePlaylist(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to resolve media item for subtitle playlist", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to resolve media item")
 		return
 	}
 	if !h.canAccessItem(r, item) {
@@ -402,7 +416,7 @@ func (h *Handler) handleSegment(w http.ResponseWriter, r *http.Request) {
 	segRaw := r.PathValue("Segment")
 	segIdx, ext, err := transcode.ParseSegmentID(segRaw)
 	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, err.Error())
+		httpx.Error(w, http.StatusBadRequest, "invalid segment id")
 		return
 	}
 	switch ext {
@@ -419,7 +433,8 @@ func (h *Handler) handleSegment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to resolve media item for master playlist", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to resolve media item")
 		return
 	}
 	if !h.canAccessItem(r, item) {
@@ -427,7 +442,12 @@ func (h *Handler) handleSegment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	params := h.buildSessionParams(r, item, src, q)
+	params, strmErr := h.buildSessionParamsChecked(r, item, src, q)
+	if strmErr != nil {
+		slog.Error("failed to resolve hls stream source", "item_id", item.ID, "error", strmErr)
+		httpx.Error(w, http.StatusBadGateway, "failed to resolve stream url")
+		return
+	}
 	params.SegmentContainer = ext
 
 	segPath, err := h.mgr.GetSegment(r.Context(), params, segIdx)
@@ -435,7 +455,12 @@ func (h *Handler) handleSegment(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, context.Canceled) {
 			return
 		}
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		if errors.Is(err, os.ErrPermission) {
+			logAndWritePermissionDenied(w, params.InputPath, err)
+			return
+		}
+		slog.Error("failed to generate hls segment", "item_id", itemID, "segment", segIdx, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to generate hls segment")
 		return
 	}
 
@@ -446,7 +471,7 @@ func (h *Handler) handleSegment(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "video/mp2t")
 	}
 	w.Header().Set("Cache-Control", "private, max-age=3600")
-	http.ServeFile(w, r, segPath)
+	serveHLSFile(w, r, segPath)
 }
 
 func (h *Handler) handleInitSegment(w http.ResponseWriter, r *http.Request) {
@@ -462,7 +487,8 @@ func (h *Handler) handleInitSegment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to resolve media item for init segment", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to resolve media item")
 		return
 	}
 	if !h.canAccessItem(r, item) {
@@ -470,7 +496,12 @@ func (h *Handler) handleInitSegment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	params := h.buildSessionParams(r, item, src, q)
+	params, strmErr := h.buildSessionParamsChecked(r, item, src, q)
+	if strmErr != nil {
+		slog.Error("failed to resolve hls stream source", "item_id", item.ID, "error", strmErr)
+		httpx.Error(w, http.StatusBadGateway, "failed to resolve stream url")
+		return
+	}
 	if sc := strings.ToLower(strings.TrimSpace(params.SegmentContainer)); sc != "mp4" && sc != "m4s" {
 		params.SegmentContainer = "m4s"
 	}
@@ -480,13 +511,52 @@ func (h *Handler) handleInitSegment(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, context.Canceled) {
 			return
 		}
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		if errors.Is(err, os.ErrPermission) {
+			logAndWritePermissionDenied(w, params.InputPath, err)
+			return
+		}
+		slog.Error("failed to generate hls init segment", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to generate hls init segment")
 		return
 	}
 
 	w.Header().Set("Content-Type", "video/mp4")
 	w.Header().Set("Cache-Control", "private, max-age=3600")
-	http.ServeFile(w, r, initPath)
+	serveHLSFile(w, r, initPath)
+}
+
+func logAndWritePermissionDenied(w http.ResponseWriter, path string, err error) {
+	slog.Error("permission denied reading media file",
+		"path", path,
+		"uid", os.Geteuid(),
+		"gid", os.Getegid(),
+		"error", err,
+	)
+	httpx.Error(w, http.StatusForbidden, "permission denied reading media file")
+}
+
+func serveHLSFile(w http.ResponseWriter, r *http.Request, filePath string) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			logAndWritePermissionDenied(w, filePath, err)
+			return
+		}
+		if os.IsNotExist(err) {
+			httpx.Error(w, http.StatusNotFound, "hls segment not found")
+			return
+		}
+		slog.Error("failed to open hls segment", "path", filePath, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to read hls segment")
+		return
+	}
+	defer f.Close()
+	stat, err := f.Stat()
+	if err != nil || stat.IsDir() {
+		httpx.Error(w, http.StatusNotFound, "hls segment not found")
+		return
+	}
+	http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
 }
 
 func (h *Handler) handleDeleteActiveEncodings(w http.ResponseWriter, r *http.Request) {
@@ -613,7 +683,8 @@ func (h *Handler) handleLiveStreamOpen(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("failed to resolve live stream item", "item_id", req.ItemId, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to resolve media item")
 			return
 		}
 		if item != nil && !h.canAccessItem(r, item) {
@@ -818,6 +889,11 @@ func (h *Handler) resolveItemAndSource(ctx context.Context, itemID, mediaSourceI
 }
 
 func (h *Handler) buildSessionParams(r *http.Request, item *sqlite.ItemRecord, src *sqlite.MediaSourceRecord, q httpx.Query) transcode.SessionParams {
+	params, _ := h.buildSessionParamsChecked(r, item, src, q)
+	return params
+}
+
+func (h *Handler) buildSessionParamsChecked(r *http.Request, item *sqlite.ItemRecord, src *sqlite.MediaSourceRecord, q httpx.Query) (transcode.SessionParams, error) {
 	inputPath := item.Path
 	msID := item.ID
 	if src != nil {
@@ -828,23 +904,31 @@ func (h *Handler) buildSessionParams(r *http.Request, item *sqlite.ItemRecord, s
 			msID = src.ID
 		}
 	}
+	var strmErr error
 	// Resolve .strm file to its target URL for FFmpeg input
 	if strings.EqualFold(filepath.Ext(inputPath), ".strm") {
 		var resolved string
 		if h.streamResolver != nil {
-			if u, err := h.streamResolver(r.Context(), inputPath); err == nil {
+			u, err := h.streamResolver(r.Context(), inputPath)
+			if err != nil {
+				strmErr = err
+			} else {
 				resolved = strings.TrimSpace(u)
 			}
 		} else {
 			resolved = readFirstLineURL(inputPath)
 		}
-		if resolved != "" && isSafeStrmURL(resolved) {
+		if strmErr == nil && resolved != "" && isSafeStrmURL(resolved) {
 			inputPath = resolved
 		} else {
 			inputPath = ""
+			if strmErr == nil {
+				strmErr = errors.New("invalid or blocked strm target url")
+			}
 		}
 	} else if isHTTPURL(inputPath) && !isSafeStrmURL(inputPath) {
 		inputPath = ""
+		strmErr = errors.New("blocked upstream stream url")
 	}
 
 	segDur := q.Int("SegmentLength", transcode.DefaultSegmentDuration)
@@ -965,7 +1049,7 @@ func (h *Handler) buildSessionParams(r *http.Request, item *sqlite.ItemRecord, s
 		SegmentDuration:       segDur,
 		SegmentContainer:      q.Get("SegmentContainer"),
 		DurationSec:           float64(runtimeTicks) / float64(transcode.TicksPerSecond),
-	}
+	}, strmErr
 }
 
 func isHTTPURL(s string) bool {

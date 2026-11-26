@@ -336,10 +336,25 @@ export function TrendingPage() {
         parts.push(`豆瓣热门电影 ${res.douban_trending_movie_count} 条`)
       if (res.douban_trending_tv_count) parts.push(`豆瓣热门剧集 ${res.douban_trending_tv_count} 条`)
       const summarySuffix = parts.length > 0 ? `（${parts.join(' / ')}）` : ''
-      setFeedback({
-        type: 'success',
-        message: `热门榜同步完成${summarySuffix}：库内命中 ${res.matched_items} 部媒体，新增打标 ${res.tags_added} 次`,
-      })
+      const partialErrors: string[] = []
+      if (res.tmdb_trending_error) partialErrors.push(`TMDB 热门：${res.tmdb_trending_error}`)
+      if (res.douban_trending_movie_error)
+        partialErrors.push(`豆瓣热门电影：${res.douban_trending_movie_error}`)
+      if (res.douban_trending_tv_error)
+        partialErrors.push(`豆瓣热门剧集：${res.douban_trending_tv_error}`)
+      if (res.douban_error) partialErrors.push(`豆瓣 Top250：${res.douban_error}`)
+      if (res.imdb_error) partialErrors.push(`IMDb Top250：${res.imdb_error}`)
+      if (partialErrors.length > 0) {
+        setFeedback({
+          type: 'error',
+          message: `部分榜单同步失败（${partialErrors.join('；')}）${summarySuffix}，库内命中 ${res.matched_items} 部媒体`,
+        })
+      } else {
+        setFeedback({
+          type: 'success',
+          message: `热门榜同步完成${summarySuffix}：库内命中 ${res.matched_items} 部媒体，新增打标 ${res.tags_added} 次`,
+        })
+      }
     },
     onError: (err) => {
       setFeedback({

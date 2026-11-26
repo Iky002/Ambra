@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react'
+import React, { useEffect, useId } from 'react'
 import { createPortal } from 'react-dom'
 import { AlertCircle, CheckCircle2, X } from 'lucide-react'
 import { getActiveLocale } from '../../i18n/I18nContext'
@@ -117,6 +117,8 @@ export function AdminModal({
   onClose,
   children,
 }: AdminModalProps) {
+  const titleId = useId()
+
   useEffect(() => {
     if (!open) return
     const onKeyDown = (e: KeyboardEvent) => {
@@ -132,15 +134,21 @@ export function AdminModal({
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="fixed inset-0 bg-black/75 backdrop-blur-sm" onClick={onClose} />
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
         className={`animate-modal-enter relative z-10 flex max-h-[90vh] w-full flex-col overflow-hidden rounded-2xl border border-white/12 bg-[#111118] shadow-2xl ${maxWidthClass}`}
       >
         <div className="flex items-start justify-between gap-4 border-b border-white/8 px-6 py-4">
           <div className="min-w-0">
-            <h3 className="text-base font-semibold text-zinc-100">{title}</h3>
+            <h3 id={titleId} className="text-base font-semibold text-zinc-100">
+              {title}
+            </h3>
             {subtitle && <p className="mt-0.5 text-xs text-zinc-400">{subtitle}</p>}
           </div>
           <button
             type="button"
+            aria-label="关闭弹窗"
             onClick={onClose}
             className="rounded-lg p-1.5 text-zinc-400 transition-colors hover:bg-white/8 hover:text-zinc-100"
           >

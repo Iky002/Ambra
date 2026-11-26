@@ -440,7 +440,7 @@ func TestLiveTVChannelsProgramsTimersAndRecordingsCoverage(t *testing.T) {
 	// Closed DB persistence errors (500) across Timer, UpdateTimer, SeriesTimer, UpdateSeriesTimer, TunerHost, ListingProvider, loadState, saveStateLocked(nil store)
 	_ = st.Close()
 	h.loadState(context.Background())
-	if r := doJSON(t, mux, http.MethodPost, "/LiveTv/Timers", map[string]any{"Name": "Fail"}); r.Code != http.StatusInternalServerError {
+	if r := doJSON(t, mux, http.MethodPost, "/LiveTv/Timers", map[string]any{"Name": "Fail", "ChannelId": "ch-1"}); r.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 create timer on closed DB, got %d", r.Code)
 	}
 	if r := doJSON(t, mux, http.MethodPost, "/LiveTv/Timers/"+createdTimer.Id, map[string]any{"Name": "FailUpd"}); r.Code != http.StatusInternalServerError {

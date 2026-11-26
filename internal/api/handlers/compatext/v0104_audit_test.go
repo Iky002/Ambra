@@ -78,13 +78,32 @@ func TestCompatExtV0104FailClosedAndKVCaps(t *testing.T) {
 		t.Fatal("expected canDownloadContent fail-closed (false) on cancelled DB ctx")
 	}
 
-	// 2. RemovedJobItems 500-entry cap
+	// 2. RemovedJobItems: non-existent job items are NOT inserted; real job items enforce 500-entry cap
 	h.mu.Lock()
 	for i := 0; i < maxRemovedJobItems; i++ {
 		h.state.RemovedJobItems[fmt.Sprintf("job-item-%d", i)] = true
 	}
 	h.mu.Unlock()
 
+	reqGhost := httptest.NewRequest(http.MethodPost, "/Sync/JobItems/ghost-item/MarkForRemoval", nil)
+	reqGhost.Header.Set("X-Emby-Token", aliceAuth.AccessToken)
+	recGhost := httptest.NewRecorder()
+	router.ServeHTTP(recGhost, reqGhost)
+	if recGhost.Code != http.StatusNoContent {
+		t.Fatalf("non-existent MarkForRemoval expected 204 no-op, got %d", recGhost.Code)
+	}
+	h.mu.RLock()
+	if h.state.RemovedJobItems["ghost-item"] {
+		h.mu.RUnlock()
+		t.Fatal("non-existent job item must not be inserted into RemovedJobItems")
+	}
+	h.mu.RUnlock()
+
+	// Seed a real sync job item owned by alice, then 501st RemovedJobItems entry returns 400
+	h.writeConfigJSON(ctx, syncConfigKey, sharedSyncState{
+		Jobs:     []sharedSyncJob{{Id: "j-ovf", UserId: alice.ID}},
+		JobItems: []sharedSyncJobItem{{Id: "job-item-overflow", JobId: "j-ovf", ItemId: movie.ID}},
+	})
 	reqOverflow := httptest.NewRequest(http.MethodPost, "/Sync/JobItems/job-item-overflow/MarkForRemoval", nil)
 	reqOverflow.Header.Set("X-Emby-Token", aliceAuth.AccessToken)
 	rec := httptest.NewRecorder()

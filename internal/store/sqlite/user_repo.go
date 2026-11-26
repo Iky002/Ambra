@@ -176,7 +176,21 @@ func (r *UserRepo) CreateUser(ctx context.Context, u *UserRecord) error {
 		string(policyJSON), string(configJSON),
 		nullableUnix(u.LastLoginAt), nullableUnix(u.LastActiveAt), u.CreatedAt.Unix(),
 	)
-	return err
+	if err != nil {
+		if isUniqueConstraintErr(err) {
+			return ErrUserExists
+		}
+		return err
+	}
+	return nil
+}
+
+func isUniqueConstraintErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unique constraint failed") || strings.Contains(msg, "constraint failed: unique")
 }
 
 func (r *UserRepo) GetUserByID(ctx context.Context, id string) (*UserRecord, error) {
@@ -316,6 +330,9 @@ func (r *UserRepo) UpdateLastActive(ctx context.Context, id string, at time.Time
 // ErrLastAdmin is returned when an operation would delete, disable, or demote
 // the last active administrator account.
 var ErrLastAdmin = errors.New("cannot remove or disable the last active administrator")
+
+// ErrUserExists is returned when inserting a user violates the case-insensitive unique username constraint.
+var ErrUserExists = errors.New("user already exists")
 
 func (r *UserRepo) DeleteUser(ctx context.Context, id string) error {
 	norm := guid.Normalize(id)
@@ -804,6 +821,10 @@ func (r *UserRepo) UpsertPlaybackProgress(
 		)
 		if err != nil {
 			return nil, err
+		}
+		if positionTicks > 0 {
+			hideKey := fmt.Sprintf("user_hide_resume:%s:%s", uid, iid)
+			_, _ = r.store.Writer.ExecContext(ctx, `DELETE FROM server_config WHERE key = ?`, hideKey)
 		}
 	}
 

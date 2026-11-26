@@ -325,16 +325,18 @@ export function ItemDetailPage() {
       const first = mediaSources[0]
       const prefs = loadPlaybackPrefs()
       const firstStreams = first.MediaStreams || []
+      const firstAudioStreams = firstStreams.filter((s) => s.Type === 'Audio')
+      const pickedAudioIdx = pickPreferredAudioIndex(
+        firstAudioStreams,
+        prefs.preferredAudioLang,
+        first.DefaultAudioStreamIndex,
+        locale,
+      )
+      const pickedAudioStream =
+        firstAudioStreams.find((s) => s.Index === pickedAudioIdx) || firstAudioStreams[0]
       setSelectedSourceId(first.Id)
       setUserExplicitlyDisabledSub(false)
-      setSelectedAudioIdx(
-        pickPreferredAudioIndex(
-          firstStreams.filter((s) => s.Type === 'Audio'),
-          prefs.preferredAudioLang,
-          first.DefaultAudioStreamIndex,
-          locale,
-        ),
-      )
+      setSelectedAudioIdx(pickedAudioIdx)
       setSelectedSubIdx(
         pickPreferredSubtitleIndex(
           firstStreams.filter((s) => s.Type === 'Subtitle'),
@@ -342,6 +344,7 @@ export function ItemDetailPage() {
           first.DefaultSubtitleStreamIndex,
           locale,
           prefs.subtitleMode,
+          pickedAudioStream,
         ),
       )
     }
@@ -765,10 +768,12 @@ export function ItemDetailPage() {
     }
   }
 
-  const handlePlay = (targetId = item.Id, startTicks = 0) => {
+  const handlePlay = (targetId = item.Id, startTicks?: number) => {
     stopThemeSong()
     const params = new URLSearchParams()
-    if (startTicks > 0) params.set('startTicks', String(startTicks))
+    if (startTicks !== undefined && Number.isFinite(startTicks) && startTicks >= 0) {
+      params.set('startTicks', String(startTicks))
+    }
     if (targetId === item.Id) {
       const prefs = loadPlaybackPrefs()
       const prefDisabledSub =
@@ -1033,7 +1038,7 @@ export function ItemDetailPage() {
                   <>
                     <button
                       type="button"
-                      onClick={() => handlePlay(item.Id, hasResume ? resumeTicks : 0)}
+                      onClick={() => handlePlay(item.Id, hasResume ? resumeTicks : undefined)}
                       className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all duration-200 hover:-translate-y-0.5 hover:bg-amber-400 active:scale-[0.97]"
                     >
                       <Play className="h-4 w-4 fill-current" />
@@ -1055,7 +1060,7 @@ export function ItemDetailPage() {
                     onClick={() =>
                       handlePlay(
                         primarySeriesTarget.Id,
-                        primarySeriesTarget.UserData?.PlaybackPositionTicks || 0,
+                        primarySeriesTarget.UserData?.PlaybackPositionTicks || undefined,
                       )
                     }
                     className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-6 py-3 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all duration-200 hover:-translate-y-0.5 hover:bg-amber-400 active:scale-[0.97]"
@@ -1258,18 +1263,21 @@ export function ItemDetailPage() {
                           const next = mediaSources.find((s) => s.Id === e.target.value)
                           const prefs = loadPlaybackPrefs()
                           const nextStreams = next?.MediaStreams || []
+                          const nextAudioStreams = nextStreams.filter((s) => s.Type === 'Audio')
+                          const pickedAudioIdx = next
+                            ? pickPreferredAudioIndex(
+                                nextAudioStreams,
+                                prefs.preferredAudioLang,
+                                next.DefaultAudioStreamIndex,
+                                locale,
+                              )
+                            : undefined
+                          const pickedAudioStream =
+                            nextAudioStreams.find((s) => s.Index === pickedAudioIdx) ||
+                            nextAudioStreams[0]
                           setSelectedSourceId(e.target.value)
                           setUserExplicitlyDisabledSub(false)
-                          setSelectedAudioIdx(
-                            next
-                              ? pickPreferredAudioIndex(
-                                  nextStreams.filter((s) => s.Type === 'Audio'),
-                                  prefs.preferredAudioLang,
-                                  next.DefaultAudioStreamIndex,
-                                  locale,
-                                )
-                              : undefined,
-                          )
+                          setSelectedAudioIdx(pickedAudioIdx)
                           setSelectedSubIdx(
                             next
                               ? pickPreferredSubtitleIndex(
@@ -1278,6 +1286,7 @@ export function ItemDetailPage() {
                                   next.DefaultSubtitleStreamIndex,
                                   locale,
                                   prefs.subtitleMode,
+                                  pickedAudioStream,
                                 )
                               : undefined,
                           )
@@ -1706,7 +1715,7 @@ export function ItemDetailPage() {
                 return (
                   <div
                     key={ep.Id}
-                    onClick={() => handlePlay(ep.Id, ep.UserData?.PlaybackPositionTicks || 0)}
+                    onClick={() => handlePlay(ep.Id, ep.UserData?.PlaybackPositionTicks || undefined)}
                     className="group flex cursor-pointer gap-4 overflow-hidden rounded-2xl border border-white/8 bg-white/[0.03] p-3 transition-all duration-200 ease-out hover:translate-x-1 hover:border-amber-400/50 hover:bg-white/[0.06] hover:shadow-[0_8px_24px_rgba(0,0,0,0.4)]"
                   >
                     <div className="relative aspect-video w-40 shrink-0 overflow-hidden rounded-xl bg-zinc-900">

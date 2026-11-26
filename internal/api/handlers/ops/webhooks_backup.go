@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -38,13 +40,14 @@ type webhookDispatchJob struct {
 }
 
 type WebhookConfig struct {
-	Id        string   `json:"Id"`
-	Name      string   `json:"Name"`
-	Url       string   `json:"Url"`
-	Events    []string `json:"Events"`
-	Secret    string   `json:"Secret,omitempty"`
-	HasSecret bool     `json:"HasSecret,omitempty"`
-	Enabled   bool     `json:"Enabled"`
+	Id          string   `json:"Id"`
+	Name        string   `json:"Name"`
+	Url         string   `json:"Url"`
+	Events      []string `json:"Events"`
+	Secret      string   `json:"Secret,omitempty"`
+	ClearSecret bool     `json:"ClearSecret,omitempty"`
+	HasSecret   bool     `json:"HasSecret,omitempty"`
+	Enabled     bool     `json:"Enabled"`
 }
 
 type WebhookPayload struct {
@@ -85,17 +88,39 @@ func (h *Handler) subscribeWebhooks(bus *eventbus.Bus) {
 	}
 }
 
-func (h *Handler) ensureWebhookWorkers() {
-	h.webhookOnce.Do(func() {
-		h.webhookCh = make(chan webhookDispatchJob, webhookQueueSize)
-		for i := 0; i < webhookWorkerCount; i++ {
-			go func() {
-				for job := range h.webhookCh {
-					_, _ = h.sendWebhook(context.Background(), job.cfg, job.payload)
-				}
-			}()
-		}
-	})
+func (h *Handler) ensureWebhookWorkersLocked() {
+	if h.webhookCh != nil || h.webhookClosed {
+		return
+	}
+	ch := make(chan webhookDispatchJob, webhookQueueSize)
+	h.webhookCh = ch
+	h.webhookWG.Add(webhookWorkerCount)
+	for i := 0; i < webhookWorkerCount; i++ {
+		go func() {
+			defer h.webhookWG.Done()
+			for job := range ch {
+				_, _ = h.sendWebhook(context.Background(), job.cfg, job.payload)
+			}
+		}()
+	}
+}
+
+// Close gracefully shuts down webhook dispatcher workers. It is idempotent and safe to call multiple times.
+func (h *Handler) Close() {
+	h.webhookMu.Lock()
+	if h.webhookClosed {
+		h.webhookMu.Unlock()
+		return
+	}
+	h.webhookClosed = true
+	ch := h.webhookCh
+	h.webhookCh = nil
+	h.webhookMu.Unlock()
+
+	if ch != nil {
+		close(ch)
+	}
+	h.webhookWG.Wait()
 }
 
 func sanitizeWebhookConfig(wh WebhookConfig) WebhookConfig {
@@ -144,7 +169,6 @@ func (h *Handler) dispatchWebhooks(ctx context.Context, e eventbus.Event) {
 	if len(targets) == 0 {
 		return
 	}
-	h.ensureWebhookWorkers()
 
 	payload := WebhookPayload{
 		Event:     string(e.Type),
@@ -152,13 +176,22 @@ func (h *Handler) dispatchWebhooks(ctx context.Context, e eventbus.Event) {
 		Timestamp: time.Now().UTC(),
 		Data:      sanitizeWebhookPayloadData(e.Payload),
 	}
+
+	h.webhookMu.Lock()
+	if h.webhookClosed {
+		h.webhookMu.Unlock()
+		return
+	}
+	h.ensureWebhookWorkersLocked()
+	ch := h.webhookCh
 	for _, wh := range targets {
 		select {
-		case h.webhookCh <- webhookDispatchJob{cfg: wh, payload: payload}:
+		case ch <- webhookDispatchJob{cfg: wh, payload: payload}:
 		default:
 			slog.Warn("ops: webhook dispatch queue full, dropping event", "webhookId", wh.Id, "event", payload.Event)
 		}
 	}
+	h.webhookMu.Unlock()
 }
 
 func matchesWebhookEvent(events []string, eventType string) bool {
@@ -234,9 +267,13 @@ func (h *Handler) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
 
 	h.mu.Lock()
 	replaced := false
+	clearSecret := wh.ClearSecret
+	wh.ClearSecret = false
 	for i, existing := range h.state.Webhooks {
 		if existing.Id == wh.Id {
-			if wh.Secret == "" {
+			if clearSecret {
+				wh.Secret = ""
+			} else if wh.Secret == "" {
 				wh.Secret = existing.Secret
 			}
 			wh.HasSecret = wh.Secret != ""
@@ -246,6 +283,9 @@ func (h *Handler) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !replaced {
+		if clearSecret {
+			wh.Secret = ""
+		}
 		wh.HasSecret = wh.Secret != ""
 		h.state.Webhooks = append(h.state.Webhooks, wh)
 	}
@@ -440,6 +480,10 @@ func (h *Handler) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("invalid sqlite backup file: %v", err))
 		return
 	}
+	if err := verifySQLiteIntegrity(r.Context(), src); err != nil {
+		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("invalid sqlite backup file: %v", err))
+		return
+	}
 
 	h.backupMu.Lock()
 	stagedDst := filepath.Join(h.dataDir(), "ambra.db.restore")
@@ -470,6 +514,43 @@ func verifySQLiteHeader(path string) error {
 	}
 	if !bytes.Equal(hdr, sqliteMagicHeader) {
 		return errors.New("missing SQLite magic header")
+	}
+	return nil
+}
+
+func verifySQLiteIntegrity(ctx context.Context, path string) error {
+	escaped := strings.ReplaceAll(filepath.ToSlash(path), "?", "%3F")
+	escaped = strings.ReplaceAll(escaped, "#", "%23")
+	u := url.URL{Scheme: "file", Path: escaped}
+	dsn := u.String() + "?mode=ro&_pragma=immutable(1)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return fmt.Errorf("open backup sqlite: %w", err)
+	}
+	defer db.Close()
+
+	rows, err := db.QueryContext(ctx, "PRAGMA quick_check")
+	if err != nil {
+		return fmt.Errorf("quick_check failed: %w", err)
+	}
+	defer rows.Close()
+
+	checked := false
+	for rows.Next() {
+		var result string
+		if err := rows.Scan(&result); err != nil {
+			return fmt.Errorf("quick_check scan failed: %w", err)
+		}
+		checked = true
+		if !strings.EqualFold(strings.TrimSpace(result), "ok") {
+			return fmt.Errorf("quick_check reported: %s", result)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("quick_check iteration failed: %w", err)
+	}
+	if !checked {
+		return errors.New("quick_check returned no result")
 	}
 	return nil
 }

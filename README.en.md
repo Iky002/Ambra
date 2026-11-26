@@ -88,12 +88,12 @@ docker run -d \
 > **📁 Host / NAS Volume Permissions (Important)**
 > - By default, the container runs as non-root **`PUID=1000` / `PGID=1000`** and automatically fixes `/data` ownership on startup (official Emby `UID` / `GID` env names are also supported).
 > - If you encounter `Permission denied` on mounted media folders, run `stat -c '%u:%g' /path/to/media` or `id` on your host/NAS and set **`PUID` / `PGID`** accordingly (e.g. `1026:100` on Synology, `99:100` on Unraid). Use **`GIDLIST`** (comma-separated GIDs or group names) if multiple supplementary groups are needed.
-> - **Mixed-ownership directories**: If your mounted media folders have mixed owners/permissions, set **`PUID=0` and `PGID=0`** (i.e. `0:0` root mode, or `--user 0:0`) so Ambra can access all mapped folders cleanly.
+> - **Mixed-ownership directories**: If your mounted media folders have mixed owners/permissions, set **`PUID=0` and `PGID=0`** (or **`UID=0` and `GID=0`**) via environment variables to run in `0:0` root mode. Note: Docker's `--user` / Compose `user:` is only suitable for non-root UIDs/GIDs — do not use `--user 0:0` in place of `PUID=0 / PGID=0` because the entrypoint drops privileges to `1000:1000` by default when running as UID 0.
 
 ### 4. First-Time Setup
 
 Open **`http://<your-ip>:8096/web/`** in your browser:
-1. Complete the **Setup Wizard** (if skipped, the default admin account is `admin` / `admin` — please change it promptly);
+1. Complete the **`/setup` Setup Wizard** on first launch to create your administrator account and password (since v0.10.5, no default `admin / admin` account is created; for headless bootstrap, set `AMBRA_ADMIN_PASS` and optionally `AMBRA_ADMIN_USER` before first start);
 2. Go to **Admin Console → Libraries** to mount your movies, TV shows, music, or `.strm` folders;
 3. Add your `TMDB API Key` in **Settings / Plugins** to automatically fetch posters, backdrops, cast, and collections.
 
@@ -116,6 +116,8 @@ make build        # Build pure-Go binary (bin/ambra)
 | `GIDLIST` | Comma-separated supplementary GIDs or group names (e.g. `100,44,109`) | `""` |
 | `UMASK` | File creation mask inside Docker (e.g. `002`, `022`) | System default |
 | `AMBRA_HTTP_ADDR` | HTTP listen address | `:8096` |
+| `AMBRA_ADMIN_USER` | Headless initial admin username on first start (used with `AMBRA_ADMIN_PASS`) | `admin` |
+| `AMBRA_ADMIN_PASS` | Headless initial admin password on first start (when unset, use the `/setup` wizard) | `""` |
 | `AMBRA_TMDB_API_KEY` | Custom TMDB API Key (uses built-in default key when empty) | Built-in default |
 | `AMBRA_WEB_DIR` | External Web UI directory override (empty = embedded UI) | `""` |
 | `AMBRA_FFMPEG_PATH` | Custom `ffmpeg` binary path | Auto-detect |

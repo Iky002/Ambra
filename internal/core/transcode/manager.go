@@ -646,9 +646,19 @@ func (m *Manager) getOrCreateSession(params SessionParams) (*transcodeSession, e
 		if m.cfg != nil {
 			baseDir = m.cfg.TranscodeTempDir()
 		}
+		if err := os.MkdirAll(baseDir, 0o700); err != nil {
+			m.mu.Unlock()
+			for _, ev := range evicted {
+				ev.destroy()
+			}
+			return nil, fmt.Errorf("create transcode base dir: %w", err)
+		}
 		safeKey := sanitizePathSegment(key)
-		workDir := filepath.Join(baseDir, safeKey)
-		if err := os.MkdirAll(workDir, 0o700); err != nil {
+		if len(safeKey) > 80 {
+			safeKey = safeKey[:80]
+		}
+		workDir, err := os.MkdirTemp(baseDir, safeKey+"-*")
+		if err != nil {
 			m.mu.Unlock()
 			for _, ev := range evicted {
 				ev.destroy()
@@ -745,41 +755,10 @@ func (m *Manager) StopByDevice(deviceID, playSessionID string) int {
 }
 
 // StopByDeviceForUser stops and cleans up active transcoding sessions matching playSessionID or deviceID
-// that are owned by callerUserID (or any matching session if isAdmin is true or the session has no owner).
+// with strict caller authorization by delegating to StopSessionsScoped.
 // Returns the number of sessions stopped.
 func (m *Manager) StopByDeviceForUser(deviceID, playSessionID, callerUserID string, isAdmin bool) int {
-	deviceID = strings.TrimSpace(deviceID)
-	playSessionID = strings.TrimSpace(playSessionID)
-	callerUserID = strings.TrimSpace(callerUserID)
-	if deviceID == "" && playSessionID == "" {
-		return 0
-	}
-
-	var toStop []*transcodeSession
-	m.mu.Lock()
-	for key, sess := range m.sessions {
-		match := false
-		if playSessionID != "" && (sess.params.PlaySessionID == playSessionID || key == playSessionID) {
-			match = true
-		} else if deviceID != "" && sess.params.DeviceID == deviceID {
-			match = true
-		}
-		if !match {
-			continue
-		}
-		owner := strings.TrimSpace(sess.params.UserID)
-		if !isAdmin && owner != "" && owner != callerUserID {
-			continue
-		}
-		toStop = append(toStop, sess)
-		delete(m.sessions, key)
-	}
-	m.mu.Unlock()
-
-	for _, sess := range toStop {
-		sess.destroy()
-	}
-	return len(toStop)
+	return m.StopSessionsScoped(callerUserID, playSessionID, deviceID, isAdmin)
 }
 
 // ActiveSessions returns snapshots of all currently tracked transcoding sessions.
@@ -952,6 +931,10 @@ func (s *transcodeSession) getSegment(ctx context.Context, segIndex int, getCaps
 		return targetPath, nil
 	}
 
+	var (
+		caps       *HWCapabilities
+		capsLoaded bool
+	)
 	s.mu.Lock()
 	for {
 		if s.destroyed {
@@ -985,7 +968,15 @@ func (s *transcodeSession) getSegment(ctx context.Context, segIndex int, getCaps
 			// and destroy() during stopProcessLocked is honored immediately.
 			continue
 		}
-		caps := getCaps()
+		if !capsLoaded {
+			s.mu.Unlock()
+			if getCaps != nil {
+				caps = getCaps()
+			}
+			capsLoaded = true
+			s.mu.Lock()
+			continue
+		}
 		if err := s.startProcessLocked(segIndex, caps); err != nil {
 			s.mu.Unlock()
 			return "", err
@@ -1016,6 +1007,10 @@ func (s *transcodeSession) getInitSegment(ctx context.Context, getCaps func() *H
 		return targetPath, nil
 	}
 
+	var (
+		caps       *HWCapabilities
+		capsLoaded bool
+	)
 	s.mu.Lock()
 	for {
 		if s.destroyed {
@@ -1031,7 +1026,15 @@ func (s *transcodeSession) getInitSegment(ctx context.Context, getCaps func() *H
 				s.stopProcessLocked()
 				continue
 			}
-			caps := getCaps()
+			if !capsLoaded {
+				s.mu.Unlock()
+				if getCaps != nil {
+					caps = getCaps()
+				}
+				capsLoaded = true
+				s.mu.Lock()
+				continue
+			}
 			if err := s.startProcessLocked(0, caps); err != nil {
 				s.mu.Unlock()
 				return "", err

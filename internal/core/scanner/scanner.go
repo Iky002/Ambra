@@ -53,7 +53,110 @@ type Scanner struct {
 	paused   bool
 	resumeCh chan struct{}
 
-	mergeMu sync.Mutex
+	mergeMu       sync.Mutex
+	picLockShards [64]sync.Mutex
+}
+
+func (s *Scanner) lockPicDest(destPath string) func() {
+	clean := filepath.Clean(strings.TrimSpace(destPath))
+	var h uint32 = 2166136261
+	for i := 0; i < len(clean); i++ {
+		h ^= uint32(clean[i])
+		h *= 16777619
+	}
+	shard := &s.picLockShards[int(h)%len(s.picLockShards)]
+	shard.Lock()
+	return shard.Unlock
+}
+
+func (s *Scanner) upsertLocalImagesPreservingExisting(ctx context.Context, itemID string, imgs []sqlite.ImageRecord) error {
+	if len(imgs) == 0 || s.repo == nil {
+		return nil
+	}
+	for i := range imgs {
+		img := imgs[i]
+		img.ItemID = itemID
+		if err := s.repo.UpsertImage(ctx, &img); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func preserveExistingItemOnRescan(existing, rec *sqlite.ItemRecord) {
+	if existing == nil || rec == nil {
+		return
+	}
+	rec.Extra.LockData = existing.Extra.LockData
+	if len(existing.Extra.LockedFields) > 0 {
+		rec.Extra.LockedFields = append([]string(nil), existing.Extra.LockedFields...)
+	}
+	if existing.DateCreated > 0 && rec.DateCreated == 0 {
+		rec.DateCreated = existing.DateCreated
+	}
+	if len(rec.Extra.Chapters) == 0 && len(existing.Extra.Chapters) > 0 {
+		rec.Extra.Chapters = append([]sqlite.ChapterRecord(nil), existing.Extra.Chapters...)
+	}
+
+	if existing.Extra.LockData {
+		rec.Name = existing.Name
+		rec.OriginalTitle = existing.OriginalTitle
+		rec.SortName = existing.SortName
+		rec.ProductionYear = existing.ProductionYear
+		rec.PremiereDate = existing.PremiereDate
+		rec.CommunityRating = existing.CommunityRating
+		rec.CriticRating = existing.CriticRating
+		rec.OfficialRating = existing.OfficialRating
+		rec.Extra.Overview = existing.Extra.Overview
+		rec.Extra.Taglines = append([]string(nil), existing.Extra.Taglines...)
+		rec.Extra.ProviderIDs = cloneStringMap(existing.Extra.ProviderIDs)
+		if existing.Extra.SeriesName != "" {
+			rec.Extra.SeriesName = existing.Extra.SeriesName
+		}
+		if existing.Extra.SeasonName != "" {
+			rec.Extra.SeasonName = existing.Extra.SeasonName
+		}
+		return
+	}
+
+	if isFieldLocked(existing, "Name") {
+		rec.Name = existing.Name
+		rec.SortName = existing.SortName
+	}
+	if isFieldLocked(existing, "OriginalTitle") || (rec.OriginalTitle == "" && existing.OriginalTitle != "") {
+		rec.OriginalTitle = existing.OriginalTitle
+	}
+	if isFieldLocked(existing, "Overview") || (rec.Extra.Overview == "" && existing.Extra.Overview != "") {
+		rec.Extra.Overview = existing.Extra.Overview
+	}
+	if isFieldLocked(existing, "Taglines") || (len(rec.Extra.Taglines) == 0 && len(existing.Extra.Taglines) > 0) {
+		rec.Extra.Taglines = append([]string(nil), existing.Extra.Taglines...)
+	}
+	if isFieldLocked(existing, "ProductionYear") || (rec.ProductionYear == nil && existing.ProductionYear != nil) {
+		rec.ProductionYear = existing.ProductionYear
+	}
+	if isFieldLocked(existing, "PremiereDate") || (rec.PremiereDate == nil && existing.PremiereDate != nil) {
+		rec.PremiereDate = existing.PremiereDate
+	}
+	if isFieldLocked(existing, "CommunityRating") || (rec.CommunityRating == nil && existing.CommunityRating != nil) {
+		rec.CommunityRating = existing.CommunityRating
+	}
+	if rec.CriticRating == nil && existing.CriticRating != nil {
+		rec.CriticRating = existing.CriticRating
+	}
+	if isFieldLocked(existing, "OfficialRating") || (rec.OfficialRating == "" && existing.OfficialRating != "") {
+		rec.OfficialRating = existing.OfficialRating
+	}
+	if len(existing.Extra.ProviderIDs) > 0 {
+		if rec.Extra.ProviderIDs == nil {
+			rec.Extra.ProviderIDs = make(map[string]string, len(existing.Extra.ProviderIDs))
+		}
+		for k, v := range existing.Extra.ProviderIDs {
+			if getProviderID(rec.Extra.ProviderIDs, k) == "" && strings.TrimSpace(v) != "" {
+				rec.Extra.ProviderIDs[k] = strings.TrimSpace(v)
+			}
+		}
+	}
 }
 
 func New(repo *sqlite.LibraryRepo, registry *plugins.Registry, bus *eventbus.Bus, cfg *config.Config) *Scanner {
@@ -160,6 +263,11 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 	needProbe := !isStrm && prober.IsEnabled()
 	needOnline := s.hasOnlineMetadataProviders()
 
+	libRoot := findContainingRoot(lib.Paths, mediaPath)
+	if libRoot == "" {
+		libRoot = filepath.Dir(mediaPath)
+	}
+
 	existing, err := s.repo.FindItemByMediaSourcePath(ctx, lib.ID, mediaPath)
 	if err == nil && existing != nil {
 		if s.isMediaSourceUnchanged(ctx, existing, mediaPath, size, mtime) {
@@ -175,7 +283,7 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 				// If previously unscraped (no TMDB ID) and unlocked, re-parse from path
 				// so improved filename/folder recognition heals previously mis-parsed titles.
 				if !existing.Extra.LockData && getProviderID(queryIDs, "tmdb") == "" {
-					reparsed := ParseMoviePath(findContainingRoot(lib.Paths, mediaPath), mediaPath)
+					reparsed := ParseMoviePath(libRoot, mediaPath)
 					if reparsed.Title != "" {
 						queryTitle = reparsed.Title
 					}
@@ -189,7 +297,7 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 						if queryIDs == nil {
 							queryIDs = make(map[string]string)
 						}
-						if _, exists := queryIDs[k]; !exists {
+						if getProviderID(queryIDs, k) == "" {
 							queryIDs[k] = v
 						}
 					}
@@ -206,6 +314,7 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 				return false, false, &enrichTask{
 					ItemID:         existing.ID,
 					LibraryID:      lib.ID,
+					LibRoot:        libRoot,
 					ItemType:       "Movie",
 					MediaPath:      mediaPath,
 					Size:           size,
@@ -222,7 +331,7 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 			return false, false, nil, nil
 		}
 		if existing.Path != mediaPath {
-			ms := s.buildMediaSource(existing, mediaPath, size, mtime, isStrm, container, nil)
+			ms := s.buildMediaSourceInRoot(libRoot, existing, mediaPath, size, mtime, isStrm, container, nil)
 			if err := s.repo.UpsertMediaSourceAndStreams(ctx, existing.ID, ms); err != nil {
 				return false, false, nil, err
 			}
@@ -231,6 +340,7 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 				task = &enrichTask{
 					ItemID:           existing.ID,
 					LibraryID:        lib.ID,
+					LibRoot:          libRoot,
 					ItemType:         "Movie",
 					MediaPath:        mediaPath,
 					Size:             size,
@@ -245,7 +355,7 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 		}
 	}
 
-	parsed := ParseMoviePath(findContainingRoot(lib.Paths, mediaPath), mediaPath)
+	parsed := ParseMoviePath(libRoot, mediaPath)
 	title := parsed.Title
 	if title == "" {
 		title = strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath))
@@ -290,7 +400,7 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 			mergeTarget, _ = s.repo.FindMovieInDirByBaseTitle(ctx, lib.ID, filepath.Dir(mediaPath), title)
 		}
 		if mergeTarget != nil {
-			ms := s.buildMediaSource(mergeTarget, mediaPath, size, mtime, isStrm, container, nil)
+			ms := s.buildMediaSourceInRoot(libRoot, mergeTarget, mediaPath, size, mtime, isStrm, container, nil)
 			if err := s.repo.UpsertMediaSourceAndStreams(ctx, mergeTarget.ID, ms); err != nil {
 				return false, false, nil, err
 			}
@@ -299,6 +409,7 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 				task = &enrichTask{
 					ItemID:           mergeTarget.ID,
 					LibraryID:        lib.ID,
+					LibRoot:          libRoot,
 					ItemType:         "Movie",
 					MediaPath:        mediaPath,
 					Size:             size,
@@ -343,16 +454,20 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 		rec.ProductionYear = &y
 	}
 	applyMetadataToItem(rec, meta)
+	if existing != nil {
+		preserveExistingItemOnRescan(existing, rec)
+	}
 
 	hasLocalTitle := meta != nil && strings.TrimSpace(meta.Name) != ""
 	var task *enrichTask
-	if needProbe || needOnline {
+	if needProbe || (needOnline && !rec.Extra.LockData) {
 		if len(rec.Extra.ProviderIDs) > 0 {
 			query.ProviderIDs = rec.Extra.ProviderIDs
 		}
 		task = &enrichTask{
 			ItemID:         rec.ID,
 			LibraryID:      lib.ID,
+			LibRoot:        libRoot,
 			ItemType:       "Movie",
 			MediaPath:      mediaPath,
 			Size:           size,
@@ -361,19 +476,25 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 			Container:      container,
 			Query:          query,
 			NeedProbe:      needProbe,
-			NeedOnlineMeta: needOnline,
+			NeedOnlineMeta: needOnline && !rec.Extra.LockData,
 			HasLocalTitle:  hasLocalTitle,
 			DisplayName:    rec.Name,
 		}
 	}
 
-	ms := s.buildMediaSource(rec, mediaPath, size, mtime, isStrm, container, nil)
-	imgs := discoverLocalImages(rec.ID, mediaPath, filepath.Dir(mediaPath), false)
+	ms := s.buildMediaSourceInRoot(libRoot, rec, mediaPath, size, mtime, isStrm, container, nil)
+	imgs := discoverLocalImagesWithPolicy(libRoot, rec.ID, mediaPath, filepath.Dir(mediaPath), false, s.currentSymlinkPolicy())
 	mediaDir := filepath.Dir(mediaPath)
 	mediaBaseName := strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath))
+	relMeta := meta
+	if existing != nil && existing.Extra.LockData {
+		relMeta = nil
+	} else if meta != nil {
+		relMeta = filterLockedRelations(rec, meta)
+	}
 
 	if batch != nil {
-		titleRaw, titleTokens, peopleTokens := buildFTSFields(rec, extractMetaPeopleNames(meta))
+		titleRaw, titleTokens, peopleTokens := buildFTSFields(rec, extractMetaPeopleNames(relMeta))
 		var pendingTasks []enrichTask
 		if task != nil {
 			pendingTasks = []enrichTask{*task}
@@ -392,15 +513,15 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 				if err := s.repo.UpsertMediaSourceAndStreams(hookCtx, rec.ID, ms); err != nil {
 					return err
 				}
-				if err := s.repo.ReplaceItemImages(hookCtx, rec.ID, imgs); err != nil {
+				if err := s.upsertLocalImagesPreservingExisting(hookCtx, rec.ID, imgs); err != nil {
 					return err
 				}
-				if meta != nil {
-					s.downloadAndSaveRemoteImages(hookCtx, rec, meta)
+				if relMeta != nil {
+					s.downloadAndSaveRemoteImages(hookCtx, rec, relMeta)
 				}
-				s.persistMetaRelations(hookCtx, rec, meta)
-				if meta != nil && meta.Collection != nil {
-					s.ensureAutoBoxSet(hookCtx, rec, meta.Collection)
+				s.persistMetaRelations(hookCtx, rec, relMeta)
+				if relMeta != nil && relMeta.Collection != nil {
+					s.ensureAutoBoxSet(hookCtx, rec, relMeta.Collection)
 				}
 				s.scanAndIndexExtras(hookCtx, lib, rec, mediaDir, mediaBaseName)
 				return nil
@@ -426,18 +547,18 @@ func (s *Scanner) indexMovie(ctx context.Context, lib *sqlite.LibraryRecord, med
 		return false, false, nil, err
 	}
 
-	// Local images
-	if err := s.repo.ReplaceItemImages(ctx, rec.ID, imgs); err != nil {
+	// Local images (non-destructively preserves Chapter thumbnails and remote artwork on rescan)
+	if err := s.upsertLocalImagesPreservingExisting(ctx, rec.ID, imgs); err != nil {
 		return false, false, nil, err
 	}
-	if meta != nil {
-		s.downloadAndSaveRemoteImages(ctx, rec, meta)
+	if relMeta != nil {
+		s.downloadAndSaveRemoteImages(ctx, rec, relMeta)
 	}
 
 	// Taxonomies, People & FTS5
-	s.persistMetaRelationsAndFTS(ctx, rec, meta)
-	if meta != nil && meta.Collection != nil {
-		s.ensureAutoBoxSet(ctx, rec, meta.Collection)
+	s.persistMetaRelationsAndFTS(ctx, rec, relMeta)
+	if relMeta != nil && relMeta.Collection != nil {
+		s.ensureAutoBoxSet(ctx, rec, relMeta.Collection)
 	}
 
 	// Local Trailers, Special Features & Theme Songs
@@ -473,6 +594,10 @@ func (s *Scanner) indexEpisode(
 	prober := s.getProber()
 	needProbe := !isStrm && prober.IsEnabled()
 	needOnline := s.hasOnlineMetadataProviders()
+	libRoot := findContainingRoot(lib.Paths, mediaPath)
+	if libRoot == "" {
+		libRoot = filepath.Dir(mediaPath)
+	}
 
 	existing, err := s.repo.FindItemByMediaSourcePath(ctx, lib.ID, mediaPath)
 	if err == nil && existing != nil {
@@ -592,7 +717,7 @@ func (s *Scanner) indexEpisode(
 			return false, false, nil, nil
 		}
 		if existing.Path != mediaPath {
-			ms := s.buildMediaSource(existing, mediaPath, size, mtime, isStrm, container, nil)
+			ms := s.buildMediaSourceInRoot(libRoot, existing, mediaPath, size, mtime, isStrm, container, nil)
 			if err := s.repo.UpsertMediaSourceAndStreams(ctx, existing.ID, ms); err != nil {
 				return false, false, nil, err
 			}
@@ -601,6 +726,7 @@ func (s *Scanner) indexEpisode(
 				tasks = append(tasks, enrichTask{
 					ItemID:           existing.ID,
 					LibraryID:        lib.ID,
+					LibRoot:          libRoot,
 					ItemType:         "Episode",
 					MediaPath:        mediaPath,
 					Size:             size,
@@ -646,7 +772,7 @@ func (s *Scanner) indexEpisode(
 			}
 		}
 		if mergeTarget, err := s.repo.FindEpisodeByNumber(ctx, seriesRec.ID, epInfo.SeasonNumber, epInfo.EpisodeNumber); err == nil && mergeTarget != nil {
-			ms := s.buildMediaSource(mergeTarget, mediaPath, size, mtime, isStrm, container, nil)
+			ms := s.buildMediaSourceInRoot(libRoot, mergeTarget, mediaPath, size, mtime, isStrm, container, nil)
 			if err := s.repo.UpsertMediaSourceAndStreams(ctx, mergeTarget.ID, ms); err != nil {
 				return false, false, nil, err
 			}
@@ -654,6 +780,7 @@ func (s *Scanner) indexEpisode(
 				tasks = append(tasks, enrichTask{
 					ItemID:           mergeTarget.ID,
 					LibraryID:        lib.ID,
+					LibRoot:          libRoot,
 					ItemType:         "Episode",
 					MediaPath:        mediaPath,
 					Size:             size,
@@ -717,12 +844,16 @@ func (s *Scanner) indexEpisode(
 		},
 	}
 	applyMetadataToItem(rec, meta)
+	if existing != nil {
+		preserveExistingItemOnRescan(existing, rec)
+	}
 
 	hasLocalTitle := meta != nil && strings.TrimSpace(meta.Name) != ""
-	if needProbe || needOnline {
+	if needProbe || (needOnline && !rec.Extra.LockData) {
 		tasks = append(tasks, enrichTask{
 			ItemID:         rec.ID,
 			LibraryID:      lib.ID,
+			LibRoot:        libRoot,
 			ItemType:       "Episode",
 			ParentSeriesID: seriesRec.ID,
 			MediaPath:      mediaPath,
@@ -732,17 +863,23 @@ func (s *Scanner) indexEpisode(
 			Container:      container,
 			Query:          query,
 			NeedProbe:      needProbe,
-			NeedOnlineMeta: needOnline,
+			NeedOnlineMeta: needOnline && !rec.Extra.LockData,
 			HasLocalTitle:  hasLocalTitle,
 			DisplayName:    rec.Name,
 		})
 	}
 
-	ms := s.buildMediaSource(rec, mediaPath, size, mtime, isStrm, container, nil)
-	imgs := discoverLocalImages(rec.ID, mediaPath, filepath.Dir(mediaPath), true)
+	ms := s.buildMediaSourceInRoot(libRoot, rec, mediaPath, size, mtime, isStrm, container, nil)
+	imgs := discoverLocalImagesWithPolicy(libRoot, rec.ID, mediaPath, filepath.Dir(mediaPath), true, s.currentSymlinkPolicy())
+	relMeta := meta
+	if existing != nil && existing.Extra.LockData {
+		relMeta = nil
+	} else if meta != nil {
+		relMeta = filterLockedRelations(rec, meta)
+	}
 
 	if batch != nil {
-		titleRaw, titleTokens, peopleTokens := buildFTSFields(rec, extractMetaPeopleNames(meta))
+		titleRaw, titleTokens, peopleTokens := buildFTSFields(rec, extractMetaPeopleNames(relMeta))
 		pending := pendingPhaseAItem{
 			input: sqlite.BatchItemInput{
 				Item:           rec,
@@ -758,9 +895,9 @@ func (s *Scanner) indexEpisode(
 					return err
 				}
 				if len(imgs) > 0 {
-					_ = s.repo.ReplaceItemImages(hookCtx, rec.ID, imgs)
+					_ = s.upsertLocalImagesPreservingExisting(hookCtx, rec.ID, imgs)
 				}
-				s.persistMetaRelations(hookCtx, rec, meta)
+				s.persistMetaRelations(hookCtx, rec, relMeta)
 				return nil
 			},
 			displayFileName: filepath.Base(mediaPath),
@@ -786,10 +923,10 @@ func (s *Scanner) indexEpisode(
 	}
 
 	if len(imgs) > 0 {
-		_ = s.repo.ReplaceItemImages(ctx, rec.ID, imgs)
+		_ = s.upsertLocalImagesPreservingExisting(ctx, rec.ID, imgs)
 	}
 
-	s.persistMetaRelationsAndFTS(ctx, rec, meta)
+	s.persistMetaRelationsAndFTS(ctx, rec, relMeta)
 
 	return true, false, tasks, nil
 }
@@ -922,9 +1059,13 @@ func (s *Scanner) ensureSeries(
 		return nil, nil, err
 	}
 
-	imgs := discoverLocalImages(rec.ID, "", epInfo.SeriesDir, false)
+	seriesLibRoot := findContainingRoot(lib.Paths, epInfo.SeriesDir)
+	if seriesLibRoot == "" {
+		seriesLibRoot = epInfo.SeriesDir
+	}
+	imgs := discoverLocalImagesWithPolicy(seriesLibRoot, rec.ID, "", epInfo.SeriesDir, false, s.currentSymlinkPolicy())
 	if len(imgs) > 0 {
-		_ = s.repo.ReplaceItemImages(ctx, rec.ID, imgs)
+		_ = s.upsertLocalImagesPreservingExisting(ctx, rec.ID, imgs)
 	}
 	if meta != nil {
 		s.downloadAndSaveRemoteImages(ctx, rec, meta)
@@ -974,11 +1115,16 @@ func (s *Scanner) ensureSeason(
 	if seriesDir == "" {
 		seriesDir = series.Path
 	}
+	seasonLibRoot := findContainingRoot(lib.Paths, seriesDir)
+	if seasonLibRoot == "" {
+		seasonLibRoot = seriesDir
+	}
+	policy := s.currentSymlinkPolicy()
 	if existingByNum, err := s.repo.FindSeasonByNumber(ctx, series.ID, epInfo.SeasonNumber); err == nil && existingByNum != nil {
 		cache[key] = existingByNum
 		if s.isMissingPrimaryImage(ctx, existingByNum.ID) {
-			if imgs := discoverSeasonImages(existingByNum.ID, epInfo.SeasonNumber, epInfo.SeasonDir, seriesDir); len(imgs) > 0 {
-				_ = s.repo.ReplaceItemImages(ctx, existingByNum.ID, imgs)
+			if imgs := discoverSeasonImagesWithPolicy(seasonLibRoot, existingByNum.ID, epInfo.SeasonNumber, epInfo.SeasonDir, seriesDir, policy); len(imgs) > 0 {
+				_ = s.upsertLocalImagesPreservingExisting(ctx, existingByNum.ID, imgs)
 			}
 		}
 		var task *enrichTask
@@ -996,8 +1142,8 @@ func (s *Scanner) ensureSeason(
 	if err == nil && existing != nil {
 		cache[key] = existing
 		if s.isMissingPrimaryImage(ctx, existing.ID) {
-			if imgs := discoverSeasonImages(existing.ID, epInfo.SeasonNumber, epInfo.SeasonDir, seriesDir); len(imgs) > 0 {
-				_ = s.repo.ReplaceItemImages(ctx, existing.ID, imgs)
+			if imgs := discoverSeasonImagesWithPolicy(seasonLibRoot, existing.ID, epInfo.SeasonNumber, epInfo.SeasonDir, seriesDir, policy); len(imgs) > 0 {
+				_ = s.upsertLocalImagesPreservingExisting(ctx, existing.ID, imgs)
 			}
 		}
 		var task *enrichTask
@@ -1037,9 +1183,9 @@ func (s *Scanner) ensureSeason(
 	}); err != nil {
 		return nil, nil, err
 	}
-	imgs := discoverSeasonImages(rec.ID, epInfo.SeasonNumber, epInfo.SeasonDir, seriesDir)
+	imgs := discoverSeasonImagesWithPolicy(seasonLibRoot, rec.ID, epInfo.SeasonNumber, epInfo.SeasonDir, seriesDir, policy)
 	if len(imgs) > 0 {
-		_ = s.repo.ReplaceItemImages(ctx, rec.ID, imgs)
+		_ = s.upsertLocalImagesPreservingExisting(ctx, rec.ID, imgs)
 	}
 	cache[key] = rec
 
@@ -1094,6 +1240,10 @@ func (s *Scanner) probeMedia(ctx context.Context, mediaPath string, isStrm bool)
 }
 
 func (s *Scanner) buildMediaSource(item *sqlite.ItemRecord, mediaPath string, size, mtime int64, isStrm bool, container string, probeRes *ProbeResult) sqlite.MediaSourceRecord {
+	return s.buildMediaSourceInRoot(filepath.Dir(mediaPath), item, mediaPath, size, mtime, isStrm, container, probeRes)
+}
+
+func (s *Scanner) buildMediaSourceInRoot(libRoot string, item *sqlite.ItemRecord, mediaPath string, size, mtime int64, isStrm bool, container string, probeRes *ProbeResult) sqlite.MediaSourceRecord {
 	msID := guid.New()
 	proto := "File"
 	if isStrm {
@@ -1200,7 +1350,7 @@ func (s *Scanner) buildMediaSource(item *sqlite.ItemRecord, mediaPath string, si
 				nextIdx = st.StreamIndex + 1
 			}
 		}
-		extSubs := discoverExternalSubtitles(mediaPath, msID, item.ID, nextIdx)
+		extSubs := discoverExternalSubtitlesWithPolicy(libRoot, mediaPath, msID, item.ID, nextIdx, s.currentSymlinkPolicy())
 		streams = append(streams, extSubs...)
 	}
 
@@ -1364,7 +1514,14 @@ func buildVersionDisplayName(mediaPath, container string, isStrm bool, probeRes 
 }
 
 func discoverExternalSubtitles(mediaPath, mediaSourceID, itemID string, startIndex int) []sqlite.MediaStreamRecord {
+	return discoverExternalSubtitlesWithPolicy(filepath.Dir(mediaPath), mediaPath, mediaSourceID, itemID, startIndex, SymlinkFollowDirect)
+}
+
+func discoverExternalSubtitlesWithPolicy(libRoot, mediaPath, mediaSourceID, itemID string, startIndex int, policy SymlinkPolicy) []sqlite.MediaStreamRecord {
 	dir := filepath.Dir(mediaPath)
+	if strings.TrimSpace(libRoot) == "" {
+		libRoot = dir
+	}
 	mediaStem := strings.ToLower(strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath)))
 
 	entries, err := os.ReadDir(dir)
@@ -1390,6 +1547,16 @@ func discoverExternalSubtitles(mediaPath, mediaSourceID, itemID string, startInd
 		if !isValidSubtitleSuffixBoundary(suffix) {
 			continue
 		}
+		fullPath := filepath.Join(dir, name)
+		allowed, isSym := isSymlinkAllowedInRoot(libRoot, fullPath, policy)
+		if !allowed {
+			continue
+		}
+		if isSym {
+			if st, statErr := os.Stat(fullPath); statErr != nil || st.IsDir() {
+				continue
+			}
+		}
 		cls := ClassifySubtitle(suffix, codec)
 		out = append(out, sqlite.MediaStreamRecord{
 			MediaSourceID: mediaSourceID,
@@ -1404,7 +1571,7 @@ func discoverExternalSubtitles(mediaPath, mediaSourceID, itemID string, startInd
 			IsDefault:     cls.IsDefault,
 			IsForced:      cls.IsForced,
 			IsExternal:    true,
-			Path:          filepath.Join(dir, name),
+			Path:          fullPath,
 		})
 		idx++
 	}
@@ -1438,9 +1605,16 @@ func isValidSubtitleSuffixBoundary(suffix string) bool {
 }
 
 func discoverLocalImages(itemID, mediaPath, dir string, episodeOnly bool) []sqlite.ImageRecord {
+	return discoverLocalImagesWithPolicy(dir, itemID, mediaPath, dir, episodeOnly, SymlinkFollowDirect)
+}
+
+func discoverLocalImagesWithPolicy(libRoot, itemID, mediaPath, dir string, episodeOnly bool, policy SymlinkPolicy) []sqlite.ImageRecord {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
+	}
+	if strings.TrimSpace(libRoot) == "" {
+		libRoot = dir
 	}
 	mediaStem := ""
 	if mediaPath != "" {
@@ -1452,7 +1626,7 @@ func discoverLocalImages(itemID, mediaPath, dir string, episodeOnly bool) []sqli
 
 	addImg := func(imgType, fullPath string) {
 		info, err := os.Stat(fullPath)
-		if err != nil {
+		if err != nil || info.IsDir() {
 			return
 		}
 		idx := seenType[imgType]
@@ -1475,6 +1649,10 @@ func discoverLocalImages(itemID, mediaPath, dir string, episodeOnly bool) []sqli
 			continue
 		}
 		fullPath := filepath.Join(dir, entry.Name())
+		allowed, _ := isSymlinkAllowedInRoot(libRoot, fullPath, policy)
+		if !allowed {
+			continue
+		}
 		stem := strings.ToLower(strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name())))
 
 		if episodeOnly {
@@ -1502,11 +1680,18 @@ func discoverLocalImages(itemID, mediaPath, dir string, episodeOnly bool) []sqli
 // and the parent Series directory for Kodi/Emby season artwork naming conventions:
 // season{NN}-poster.*, season-specials-poster.*, season{NN}-fanart.*, etc.
 func discoverSeasonImages(itemID string, seasonNum int, seasonDir, seriesDir string) []sqlite.ImageRecord {
+	return discoverSeasonImagesWithPolicy(seriesDir, itemID, seasonNum, seasonDir, seriesDir, SymlinkFollowDirect)
+}
+
+func discoverSeasonImagesWithPolicy(libRoot, itemID string, seasonNum int, seasonDir, seriesDir string, policy SymlinkPolicy) []sqlite.ImageRecord {
 	var out []sqlite.ImageRecord
 	seenType := make(map[string]int)
+	if strings.TrimSpace(libRoot) == "" {
+		libRoot = seriesDir
+	}
 
 	if seasonDir != "" && filepath.Clean(seasonDir) != filepath.Clean(seriesDir) {
-		for _, img := range discoverLocalImages(itemID, "", seasonDir, false) {
+		for _, img := range discoverLocalImagesWithPolicy(libRoot, itemID, "", seasonDir, false, policy) {
 			out = append(out, img)
 			if img.ImageIndex+1 > seenType[img.ImageType] {
 				seenType[img.ImageType] = img.ImageIndex + 1
@@ -1524,7 +1709,7 @@ func discoverSeasonImages(itemID string, seasonNum int, seasonDir, seriesDir str
 
 	addImg := func(imgType, fullPath string) {
 		info, err := os.Stat(fullPath)
-		if err != nil {
+		if err != nil || info.IsDir() {
 			return
 		}
 		idx := seenType[imgType]
@@ -1559,6 +1744,10 @@ func discoverSeasonImages(itemID string, seasonNum int, seasonDir, seriesDir str
 		}
 		stem := strings.ToLower(strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name())))
 		fullPath := filepath.Join(seriesDir, entry.Name())
+		allowed, _ := isSymlinkAllowedInRoot(libRoot, fullPath, policy)
+		if !allowed {
+			continue
+		}
 		for _, pfx := range prefixes {
 			switch stem {
 			case pfx + "-poster":
@@ -1649,8 +1838,8 @@ func mergeMetadata(dst, src *plugins.MetadataResult) {
 		dst.People = src.People
 	}
 	for k, v := range src.ProviderIDs {
-		if _, exists := dst.ProviderIDs[k]; !exists {
-			dst.ProviderIDs[k] = v
+		if getProviderID(dst.ProviderIDs, k) == "" && strings.TrimSpace(v) != "" {
+			dst.ProviderIDs[k] = strings.TrimSpace(v)
 		}
 	}
 	if dst.PosterURL == "" {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,7 @@ const (
 	maxFailedAttempts       = 5
 	maxInitiatesPerIPPerMin = 10
 	initiateRateWindow      = time.Minute
+	maxRateLimitBuckets     = 4096
 )
 
 // AuthFuncs decouples route registration from the concrete middleware package.
@@ -153,6 +155,11 @@ func (h *Handler) handleInitiate(w http.ResponseWriter, r *http.Request) {
 
 	h.mu.Lock()
 	h.pruneExpiredLocked(now)
+	if len(h.bySecret) >= maxPendingSessions {
+		h.mu.Unlock()
+		httpx.Error(w, http.StatusTooManyRequests, "too many pending quickconnect sessions")
+		return
+	}
 	if ip != "" {
 		if h.countPendingForIPLocked(ip) >= maxPendingPerIP {
 			h.mu.Unlock()
@@ -166,15 +173,15 @@ func (h *Handler) handleInitiate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if rw == nil || !now.Before(rw.resetAt) {
+			if rw == nil && len(h.initiateRates) >= maxRateLimitBuckets {
+				h.mu.Unlock()
+				httpx.Error(w, http.StatusTooManyRequests, "too many quickconnect initiate requests")
+				return
+			}
 			rw = &failWindow{count: 0, resetAt: now.Add(initiateRateWindow)}
 			h.initiateRates[ip] = rw
 		}
 		rw.count++
-	}
-	if len(h.bySecret) >= maxPendingSessions {
-		h.mu.Unlock()
-		httpx.Error(w, http.StatusTooManyRequests, "too many pending quickconnect sessions")
-		return
 	}
 	h.mu.Unlock()
 
@@ -346,6 +353,11 @@ func (h *Handler) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	entry, ok := h.byCode[code]
 	if !ok || code == "" {
 		if fw == nil || !now.Before(fw.resetAt) {
+			if fw == nil && len(h.failedAttempts) >= maxRateLimitBuckets {
+				h.mu.Unlock()
+				httpx.Error(w, http.StatusTooManyRequests, "too many failed quickconnect authorize attempts")
+				return
+			}
 			fw = &failWindow{count: 0, resetAt: now.Add(h.ttl)}
 			h.failedAttempts[rateKey] = fw
 		}
@@ -405,6 +417,10 @@ func (h *Handler) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		httpx.Error(w, http.StatusInternalServerError, "failed to load user")
+		return
+	}
+	if !u.IsAdmin && !u.Policy.IsAdministrator && !u.Policy.EnableRemoteAccess && !netutil.IsLocalOrLANRequest(r) {
+		httpx.Error(w, http.StatusForbidden, "remote access is disabled for this user")
 		return
 	}
 
@@ -485,7 +501,23 @@ func (h *Handler) pruneExpiredLocked(now time.Time) {
 }
 
 func clientIP(r *http.Request) string {
-	return netutil.ClientIP(r)
+	return normalizeRateLimitIP(netutil.ClientIP(r))
+}
+
+func normalizeRateLimitIP(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	addr, err := netip.ParseAddr(s)
+	if err != nil {
+		return s
+	}
+	addr = addr.WithZone("").Unmap()
+	if addr.Is6() {
+		return netip.PrefixFrom(addr, 64).Masked().String()
+	}
+	return addr.String()
 }
 
 func generateSecret() (string, error) {

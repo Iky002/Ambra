@@ -76,8 +76,12 @@ func TestLiveTVTimerRBAC(t *testing.T) {
 		t.Fatalf("expected 403 for viewer POST /LiveTv/SeriesTimers, got %d", r.Code)
 	}
 
+	h.mu.Lock()
+	h.state.Channels = []ChannelInfo{{Id: "ch-rbac", Name: "RBAC Ch", Type: "TvChannel", ChannelType: "TV"}}
+	h.mu.Unlock()
+
 	// User with EnableLiveTvManagement=true can create & update & delete timers.
-	rec := doLiveTVAuthReq(t, mux, dvrMgr, http.MethodPost, "/LiveTv/Timers", map[string]any{"Name": "T1"})
+	rec := doLiveTVAuthReq(t, mux, dvrMgr, http.MethodPost, "/LiveTv/Timers", map[string]any{"Name": "T1", "ChannelId": "ch-rbac"})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 for dvrMgr POST /LiveTv/Timers, got %d", rec.Code)
 	}
@@ -228,6 +232,12 @@ func TestLiveTVProgramsFilteringSortingAndSeriesTimerAutoSchedule(t *testing.T) 
 	}
 
 	// POST /LiveTv/SeriesTimers auto-schedules matching non-ended EPG programs on ch-1 (prog-now + prog-future, NOT prog-past, NOT prog-other-ch).
+	h.mu.Lock()
+	h.state.Channels = []ChannelInfo{
+		{Id: "ch-1", Name: "Ch 1", Type: "TvChannel", ChannelType: "TV"},
+		{Id: "ch-2", Name: "Ch 2", Type: "TvChannel", ChannelType: "TV"},
+	}
+	h.mu.Unlock()
 	rec = doJSON(t, mux, http.MethodPost, "/LiveTv/SeriesTimers", map[string]any{
 		"Name":             "Evening News",
 		"ChannelId":        "ch-1",
@@ -296,27 +306,31 @@ func TestLiveTVAccessPolicyEnforcement(t *testing.T) {
 
 	noAccessPol := sqlite.DefaultUserPolicy(false)
 	noAccessPol.EnableLiveTvAccess = false
-	noAccessUser := &middleware.AuthContext{
-		User: &sqlite.UserRecord{
-			ID:      guid.Normalize("no-tv-1"),
-			Name:    "notv",
-			IsAdmin: false,
-			Policy:  noAccessPol,
-		},
+	noAccessRec := &sqlite.UserRecord{
+		ID:      guid.Normalize("no-tv-1"),
+		Name:    "notv",
+		IsAdmin: false,
+		Policy:  noAccessPol,
+		Config:  sqlite.DefaultUserConfig(),
 	}
+	_ = userRepo.CreateUser(context.Background(), noAccessRec)
+	noAccessUser := &middleware.AuthContext{User: noAccessRec}
 
 	okUser := makeLiveTVAuth("tv-ok-1", "tvok", false, false)
+	okUser.User.Config = sqlite.DefaultUserConfig()
+	_ = userRepo.CreateUser(context.Background(), okUser.User)
 
 	adminNoFlagPol := sqlite.DefaultUserPolicy(true)
 	adminNoFlagPol.EnableLiveTvAccess = false
-	adminUser := &middleware.AuthContext{
-		User: &sqlite.UserRecord{
-			ID:      guid.Normalize("admin-tv-1"),
-			Name:    "admin",
-			IsAdmin: true,
-			Policy:  adminNoFlagPol,
-		},
+	adminRec := &sqlite.UserRecord{
+		ID:      guid.Normalize("admin-tv-1"),
+		Name:    "admin",
+		IsAdmin: true,
+		Policy:  adminNoFlagPol,
+		Config:  sqlite.DefaultUserConfig(),
 	}
+	_ = userRepo.CreateUser(context.Background(), adminRec)
+	adminUser := &middleware.AuthContext{User: adminRec}
 
 	endpoints := []struct {
 		method string

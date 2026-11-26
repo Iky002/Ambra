@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -82,7 +83,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 
 func (h *Handler) serverID() string {
 	if h.cfg != nil {
-		return h.cfg.ServerID
+		return h.cfg.Snapshot().ServerID
 	}
 	return ""
 }
@@ -293,7 +294,8 @@ func (h *Handler) handleItemsFilters(w http.ResponseWriter, r *http.Request) {
 		BlockedTags:       blockedTags,
 	})
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in catalog handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	genreNames := make([]string, 0, len(res.Genres))
@@ -326,7 +328,8 @@ func (h *Handler) handleItemsFilters2(w http.ResponseWriter, r *http.Request) {
 		BlockedTags:       blockedTags,
 	})
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in catalog handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	httpx.JSON(w, http.StatusOK, queryFilters2Response{
@@ -373,7 +376,8 @@ func (h *Handler) handleMovieRecommendations(w http.ResponseWriter, r *http.Requ
 		blockedTags,
 	)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in catalog handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if h.isNonAdminCaller(r) {
@@ -446,7 +450,8 @@ func (h *Handler) handleSimilar(w http.ResponseWriter, r *http.Request) {
 	seedID := r.PathValue("Id")
 	ok, err := h.canAccessItem(r, userID, seedID)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in catalog handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if !ok {
@@ -467,7 +472,8 @@ func (h *Handler) handleSimilar(w http.ResponseWriter, r *http.Request) {
 		blockedTags,
 	)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in catalog handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if h.isNonAdminCaller(r) {
@@ -489,7 +495,8 @@ func (h *Handler) handleInstantMix(w http.ResponseWriter, r *http.Request) {
 	seedID := r.PathValue("Id")
 	ok, err := h.canAccessItem(r, userID, seedID)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in catalog handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if !ok {
@@ -510,7 +517,8 @@ func (h *Handler) handleInstantMix(w http.ResponseWriter, r *http.Request) {
 		blockedTags,
 	)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in catalog handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if h.isNonAdminCaller(r) {
@@ -546,6 +554,12 @@ func (h *Handler) handleTrailers(w http.ResponseWriter, r *http.Request) {
 	}
 	fields := q.List("Fields")
 
+	const (
+		maxStandaloneTrailers = 500
+		maxTrailerParentsScan = 200
+		maxMergedTrailers     = 500
+	)
+
 	// 1. Standalone Trailer items (type = 'Trailer', extra_type = '')
 	standalone, _, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
 		ServerID:          h.serverID(),
@@ -561,10 +575,12 @@ func (h *Handler) handleTrailers(w http.ResponseWriter, r *http.Request) {
 		SearchTerm:        searchTerm,
 		SortBy:            q.List("SortBy"),
 		SortOrder:         q.Get("SortOrder"),
+		Limit:             maxStandaloneTrailers,
 		Fields:            fields,
 	})
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to query standalone trailers", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to query trailers")
 		return
 	}
 
@@ -575,39 +591,82 @@ func (h *Handler) handleTrailers(w http.ResponseWriter, r *http.Request) {
 		merged = append(merged, it)
 	}
 
-	// 2. Local trailer extras (extra_type = 'trailer') attached to accessible parent items
-	disableTotal := false
-	parents, _, pErr := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
-		ServerID:               h.serverID(),
-		UserID:                 userID,
-		ParentID:               parentID,
-		AllowedLibraryIDs:      allowed,
-		MaxParentalRating:      maxRating,
-		BlockedTags:            blockedTags,
-		Recursive:              true,
-		IncludeItemTypes:       []string{"Movie", "Series", "MusicVideo", "Video"},
-		Genres:                 genres,
-		Tags:                   tags,
-		Limit:                  1000,
-		EnableTotalRecordCount: &disableTotal,
-	})
-	if pErr == nil {
-		for _, parent := range parents {
-			extras, exErr := h.repo.GetItemExtras(r.Context(), h.serverID(), userID, parent.Id, []string{"Trailer"})
-			if exErr != nil {
-				continue
+	// 2. Local trailer extras (extra_type = 'trailer') attached to accessible parent items.
+	// Pre-filter to parent IDs that actually have trailer extras when the backing store is available,
+	// avoiding unbounded N+1 GetItemExtras queries across parents with no trailers.
+	var trailerParentIDs []string
+	hasPreFilteredParents := false
+	if h.userRepo != nil && h.userRepo.Store() != nil {
+		rows, qErr := h.userRepo.Store().Reader.QueryContext(r.Context(),
+			`SELECT DISTINCT parent_id FROM items WHERE extra_type = 'trailer' AND parent_id != '' LIMIT ?`,
+			maxTrailerParentsScan,
+		)
+		if qErr == nil {
+			hasPreFilteredParents = true
+			for rows.Next() {
+				var pid string
+				if sErr := rows.Scan(&pid); sErr == nil && pid != "" {
+					trailerParentIDs = append(trailerParentIDs, pid)
+				}
 			}
-			for _, tr := range extras {
-				if seen[tr.Id] {
+			rows.Close()
+		}
+	}
+
+	if !hasPreFilteredParents || len(trailerParentIDs) > 0 {
+		disableTotal := false
+		parentFilter := sqlite.ItemFilter{
+			ServerID:               h.serverID(),
+			UserID:                 userID,
+			ParentID:               parentID,
+			AllowedLibraryIDs:      allowed,
+			MaxParentalRating:      maxRating,
+			BlockedTags:            blockedTags,
+			Recursive:              true,
+			IncludeItemTypes:       []string{"Movie", "Series", "MusicVideo", "Video"},
+			Genres:                 genres,
+			Tags:                   tags,
+			Limit:                  maxTrailerParentsScan,
+			EnableTotalRecordCount: &disableTotal,
+		}
+		if hasPreFilteredParents {
+			parentFilter.IDs = trailerParentIDs
+		}
+		parents, _, pErr := h.repo.QueryItems(r.Context(), parentFilter)
+		if pErr == nil {
+			checkParental := maxRating != nil || len(blockedTags) > 0
+			for _, parent := range parents {
+				if len(merged) >= maxMergedTrailers {
+					break
+				}
+				extras, exErr := h.repo.GetItemExtras(r.Context(), h.serverID(), userID, parent.Id, []string{"Trailer"})
+				if exErr != nil {
 					continue
 				}
-				if lowerSearch != "" &&
-					!strings.Contains(strings.ToLower(tr.Name), lowerSearch) &&
-					!strings.Contains(strings.ToLower(tr.OriginalTitle), lowerSearch) {
-					continue
+				for _, tr := range extras {
+					if len(merged) >= maxMergedTrailers {
+						break
+					}
+					if seen[tr.Id] {
+						continue
+					}
+					if lowerSearch != "" &&
+						!strings.Contains(strings.ToLower(tr.Name), lowerSearch) &&
+						!strings.Contains(strings.ToLower(tr.OriginalTitle), lowerSearch) {
+						continue
+					}
+					if checkParental {
+						trRec, rErr := h.repo.GetItemRecordByID(r.Context(), tr.Id)
+						if rErr != nil || trRec == nil {
+							continue
+						}
+						if blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), trRec, maxRating, blockedTags); bErr != nil || blocked {
+							continue
+						}
+					}
+					seen[tr.Id] = true
+					merged = append(merged, tr)
 				}
-				seen[tr.Id] = true
-				merged = append(merged, tr)
 			}
 		}
 	}
@@ -661,7 +720,8 @@ func (h *Handler) handleItemsByType(itemTypes []string) http.HandlerFunc {
 			Fields:            q.List("Fields"),
 		})
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("internal error in catalog handler", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal server error")
 			return
 		}
 		if h.isNonAdminCaller(r) {
@@ -688,7 +748,8 @@ func (h *Handler) handleChannelItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in catalog handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if chRec == nil || !strings.EqualFold(chRec.Type, "Channel") {
@@ -697,7 +758,8 @@ func (h *Handler) handleChannelItems(w http.ResponseWriter, r *http.Request) {
 	}
 	ok, accessErr := h.canAccessItem(r, userID, chRec.ID)
 	if accessErr != nil {
-		httpx.Error(w, http.StatusInternalServerError, accessErr.Error())
+		slog.Error("failed to verify channel access", "channel_id", chRec.ID, "error", accessErr)
+		httpx.Error(w, http.StatusInternalServerError, "failed to verify item access")
 		return
 	}
 	if !ok {
@@ -721,7 +783,8 @@ func (h *Handler) handleChannelItems(w http.ResponseWriter, r *http.Request) {
 		Fields:            q.List("Fields"),
 	})
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in catalog handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if h.isNonAdminCaller(r) {
@@ -756,7 +819,8 @@ func (h *Handler) handleFilterDimension(dimension string) http.HandlerFunc {
 			blockedTags,
 		)
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("internal error in catalog handler", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal server error")
 			return
 		}
 		if h.isNonAdminCaller(r) {

@@ -87,9 +87,9 @@ func TestOpsWebhooksLoopbackAndDispatchCoverage(t *testing.T) {
 	}
 
 	// dispatchWebhooks: skips disabled webhook and drops gracefully when queue is full.
-	h.webhookOnce.Do(func() {
-		h.webhookCh = make(chan webhookDispatchJob, 1)
-	})
+	h.webhookMu.Lock()
+	h.webhookCh = make(chan webhookDispatchJob, 1)
+	h.webhookMu.Unlock()
 	h.webhookCh <- webhookDispatchJob{} // fill queue so dispatch hits default/drop branch
 	h.dispatchWebhooks(context.Background(), eventbus.Event{Type: eventbus.EventPlaybackStart})
 	<-h.webhookCh // drain
@@ -177,7 +177,7 @@ func TestOpsPartiesAndHandlerEdgeCoverage(t *testing.T) {
 	if r := doReq(t, mux, http.MethodPost, "/Parties", map[string]any{"Name": "FailPersist"}); r.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 on create party with closed DB, got %d", r.Code)
 	}
-	if r := doReq(t, mux, http.MethodPost, "/Startup/User", map[string]any{"Name": "admin", "Password": "pw"}); r.Code != http.StatusInternalServerError {
+	if r := doReq(t, mux, http.MethodPost, "/Startup/User", map[string]any{"Name": "admin", "Password": "pw1234"}); r.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 on /Startup/User with closed DB, got %d", r.Code)
 	}
 	// loadState on closed DB safely returns without panic.

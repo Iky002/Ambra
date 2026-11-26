@@ -28,7 +28,7 @@ func TestOpenEscapedURIPathAndMigrationV4Indexes(t *testing.T) {
 	}
 
 	for _, idxName := range []string{
-		"idx_users_name_nocase",
+		"idx_users_name_nocase_unique",
 		"idx_activity_logs_created_at",
 		"idx_item_collections_item_id",
 	} {

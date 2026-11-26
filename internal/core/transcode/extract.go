@@ -1,7 +1,9 @@
 package transcode
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -17,9 +19,10 @@ import (
 )
 
 const (
-	defaultExtractTimeout    = 45 * time.Second
-	localProtocolWhitelist   = "file,pipe"
-	remoteProtocolWhitelist  = "file,pipe,http,https,tcp,tls,crypto"
+	defaultExtractTimeout   = 45 * time.Second
+	localProtocolWhitelist  = "file,pipe"
+	remoteProtocolWhitelist = "http,https,tcp,tls,crypto"
+	maxProbeAttachmentBytes = 4 << 20 // 4 MiB
 )
 
 func protocolWhitelistForInput(mediaPath string) string {
@@ -53,20 +56,28 @@ func resolveMediaInputPath(mediaPath string) (string, error) {
 // Extractor extracts embedded subtitle tracks and font attachments from media containers
 // on demand, caching results under cfg.SubtitleCacheDir() and deduplicating concurrent requests.
 type Extractor struct {
-	cfg        *config.Config
-	ffmpegPath string
-	sf         singleflight.Group
+	cfg         *config.Config
+	ffmpegPath  string
+	ffprobePath string
+	sf          singleflight.Group
 }
 
 // NewExtractor creates an Extractor backed by the given config.
 func NewExtractor(cfg *config.Config) *Extractor {
 	ffmpegPath := "ffmpeg"
-	if cfg != nil && cfg.FFmpegPath != "" {
-		ffmpegPath = cfg.FFmpegPath
+	ffprobePath := "ffprobe"
+	if cfg != nil {
+		if strings.TrimSpace(cfg.FFmpegPath) != "" {
+			ffmpegPath = cfg.FFmpegPath
+		}
+		if strings.TrimSpace(cfg.FFprobePath) != "" {
+			ffprobePath = cfg.FFprobePath
+		}
 	}
 	return &Extractor{
-		cfg:        cfg,
-		ffmpegPath: ffmpegPath,
+		cfg:         cfg,
+		ffmpegPath:  ffmpegPath,
+		ffprobePath: ffprobePath,
 	}
 }
 
@@ -205,37 +216,42 @@ func (e *Extractor) ExtractFonts(ctx context.Context, mediaPath, itemID, mediaSo
 		runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultExtractTimeout)
 		defer cancel()
 
-		// ffmpeg -dump_attachment:t "" dumps all attachment streams into cmd.Dir.
-		// Extract into an isolated staging directory first to reject unsafe filenames.
-		fontArgs := []string{
-			"-hide_banner", "-loglevel", "error", "-y",
-			"-protocol_whitelist", protocolWhitelistForInput(resolvedMedia),
-		}
-		if isHTTPInput(resolvedMedia) {
-			fontArgs = append(fontArgs, "-follow_redirects", "0")
-		}
-		fontArgs = append(fontArgs,
-			"-dump_attachment:t", "",
-			"-i", resolvedMedia,
-		)
-		cmd := exec.CommandContext(runCtx, e.ffmpegPath, fontArgs...)
-		cmd.Dir = stageDir
-		_ = cmd.Run()
+		// Step 1: Probe attachment streams with ffprobe and filter safe font filenames in Go.
+		// Never use `ffmpeg -dump_attachment:t ""` because untrusted container attachment filenames
+		// can contain path traversal sequences that FFmpeg writes outside the staging directory.
+		targets := e.probeSafeFontAttachments(runCtx, resolvedMedia)
 
 		if err := os.MkdirAll(fontDir, 0o700); err != nil {
 			return nil, fmt.Errorf("create font cache dir: %w", err)
 		}
-		if entries, err := os.ReadDir(stageDir); err == nil {
-			for _, ent := range entries {
-				name := ent.Name()
-				if ent.IsDir() || ent.Type()&os.ModeSymlink != 0 || !isSafeAttachmentFilename(name) {
+
+		// Step 2: Explicitly dump each validated font attachment stream to a safe path inside stageDir.
+		if len(targets) > 0 {
+			fontArgs := []string{
+				"-hide_banner", "-loglevel", "error", "-y",
+				"-protocol_whitelist", protocolWhitelistForInput(resolvedMedia),
+			}
+			if isHTTPInput(resolvedMedia) {
+				fontArgs = append(fontArgs, "-follow_redirects", "0")
+			}
+			for _, t := range targets {
+				fontArgs = append(fontArgs,
+					fmt.Sprintf("-dump_attachment:%d", t.streamIndex),
+					filepath.Join(stageDir, t.safeName),
+				)
+			}
+			fontArgs = append(fontArgs, "-i", resolvedMedia)
+			cmd := exec.CommandContext(runCtx, e.ffmpegPath, fontArgs...)
+			cmd.Dir = stageDir
+			_ = cmd.Run()
+
+			for _, t := range targets {
+				src := filepath.Join(stageDir, t.safeName)
+				info, statErr := os.Lstat(src)
+				if statErr != nil || info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Size() == 0 {
 					continue
 				}
-				if !isFontExt(filepath.Ext(name)) {
-					continue
-				}
-				src := filepath.Join(stageDir, name)
-				dst := filepath.Join(fontDir, name)
+				dst := filepath.Join(fontDir, t.safeName)
 				_ = os.Rename(src, dst)
 			}
 		}
@@ -247,6 +263,115 @@ func (e *Extractor) ExtractFonts(ctx context.Context, mediaPath, itemID, mediaSo
 		return nil, err
 	}
 	return res.([]string), nil
+}
+
+type fontAttachmentTarget struct {
+	streamIndex int
+	safeName    string
+}
+
+type limitedBuffer struct {
+	buf       bytes.Buffer
+	max       int
+	truncated bool
+}
+
+func (l *limitedBuffer) Write(p []byte) (int, error) {
+	if l.max <= 0 {
+		l.truncated = true
+		return len(p), nil
+	}
+	rem := l.max - l.buf.Len()
+	if rem <= 0 {
+		l.truncated = true
+		return len(p), nil
+	}
+	if len(p) > rem {
+		_, _ = l.buf.Write(p[:rem])
+		l.truncated = true
+		return len(p), nil
+	}
+	_, _ = l.buf.Write(p)
+	return len(p), nil
+}
+
+func (e *Extractor) probeSafeFontAttachments(ctx context.Context, resolvedMedia string) []fontAttachmentTarget {
+	if strings.TrimSpace(e.ffprobePath) == "" {
+		return nil
+	}
+	probeArgs := []string{
+		"-v", "error",
+		"-protocol_whitelist", protocolWhitelistForInput(resolvedMedia),
+	}
+	if isHTTPInput(resolvedMedia) {
+		probeArgs = append(probeArgs, "-follow_redirects", "0")
+	}
+	probeArgs = append(probeArgs,
+		"-select_streams", "t",
+		"-show_entries", "stream=index:stream_tags=filename",
+		"-of", "json",
+		resolvedMedia,
+	)
+
+	cmd := exec.CommandContext(ctx, e.ffprobePath, probeArgs...)
+	stdout := &limitedBuffer{max: maxProbeAttachmentBytes}
+	cmd.Stdout = stdout
+	if err := cmd.Run(); err != nil || stdout.truncated {
+		return nil
+	}
+
+	var parsed struct {
+		Streams []struct {
+			Index int               `json:"index"`
+			Tags  map[string]string `json:"tags"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(stdout.buf.Bytes(), &parsed); err != nil {
+		return nil
+	}
+
+	usedNames := make(map[string]struct{}, len(parsed.Streams))
+	targets := make([]fontAttachmentTarget, 0, len(parsed.Streams))
+	for _, s := range parsed.Streams {
+		if s.Index < 0 {
+			continue
+		}
+		var filename string
+		for k, v := range s.Tags {
+			if strings.EqualFold(k, "filename") {
+				filename = strings.TrimSpace(v)
+				break
+			}
+		}
+		if !isSafeAttachmentFilename(filename) || !isFontExt(filepath.Ext(filename)) {
+			continue
+		}
+		safeName := deduplicateAttachmentName(filename, s.Index, usedNames)
+		usedNames[strings.ToLower(safeName)] = struct{}{}
+		targets = append(targets, fontAttachmentTarget{
+			streamIndex: s.Index,
+			safeName:    safeName,
+		})
+	}
+	return targets
+}
+
+func deduplicateAttachmentName(name string, streamIdx int, used map[string]struct{}) string {
+	if _, exists := used[strings.ToLower(name)]; !exists {
+		return name
+	}
+	ext := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	candidate := fmt.Sprintf("%s_%d%s", stem, streamIdx, ext)
+	if _, exists := used[strings.ToLower(candidate)]; !exists {
+		return candidate
+	}
+	for n := 1; ; n++ {
+		alt := fmt.Sprintf("%s_%d_%d%s", stem, streamIdx, n, ext)
+		if _, exists := used[strings.ToLower(alt)]; !exists {
+			return alt
+		}
+	}
 }
 
 func isSafeAttachmentFilename(name string) bool {
@@ -315,7 +440,7 @@ func (e *Extractor) ExtractChapterThumbnail(ctx context.Context, mediaPath, item
 		if sec < 0 {
 			sec = 0
 		}
-		runCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 		defer cancel()
 
 		args := []string{

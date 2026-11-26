@@ -644,8 +644,27 @@ func ClassifySubtitle(filename, codec string) SubtitleClassification {
 	isDefault := containsToken(lower, "default")
 	isForced := containsToken(lower, "forced")
 
-	hasCHS := containsChineseMarker(lower, []string{"chs", "sc", "gb", "hans", "zh-cn", "zh_cn", "zh-hans", "zh_hans", "简体", "简中", "简日", "简英", "简"})
-	hasCHT := containsChineseMarker(lower, []string{"cht", "tc", "big5", "hant", "zh-tw", "zh_tw", "zh-hk", "zh_hk", "zh-hant", "zh_hant", "繁体", "繁體", "繁中", "繁日", "繁英", "繁"})
+	lowerNoNonZHRegion := nonZHRegionReplacer.Replace(lower)
+	hasExplicitUnambiguousZH := containsChineseMarker(lower, []string{
+		"chs", "cht", "hans", "hant", "big5",
+		"zh-cn", "zh_cn", "zh-hans", "zh_hans",
+		"zh-tw", "zh_tw", "zh-hk", "zh_hk", "zh-hant", "zh_hant",
+		"简体", "简中", "简日", "简英", "简",
+		"繁体", "繁體", "繁中", "繁日", "繁英", "繁",
+		"中文", "双语", "雙語", "简繁", "繁简",
+	}) || containsToken(lower, "chi") || containsToken(lower, "zho") || containsToken(lower, "zh")
+	hasExplicitNonZH := containsToken(lower, "eng") || containsToken(lower, "en") || strings.Contains(lower, "english") ||
+		containsToken(lower, "jpn") || containsToken(lower, "ja") || containsToken(lower, "jp") ||
+		containsToken(lower, "kor") || containsToken(lower, "ko") ||
+		containsToken(lower, "fre") || containsToken(lower, "fra") || containsToken(lower, "fr") ||
+		containsToken(lower, "ger") || containsToken(lower, "deu") || containsToken(lower, "de") ||
+		containsToken(lower, "spa") || containsToken(lower, "es")
+	allowShortZHVariant := hasExplicitUnambiguousZH || !hasExplicitNonZH
+
+	hasCHS := containsChineseMarker(lower, []string{"chs", "hans", "zh-cn", "zh_cn", "zh-hans", "zh_hans", "简体", "简中", "简日", "简英", "简"}) ||
+		(allowShortZHVariant && containsChineseMarker(lowerNoNonZHRegion, []string{"sc", "gb"}))
+	hasCHT := containsChineseMarker(lower, []string{"cht", "big5", "hant", "zh-tw", "zh_tw", "zh-hk", "zh_hk", "zh-hant", "zh_hant", "繁体", "繁體", "繁中", "繁日", "繁英", "繁"}) ||
+		(allowShortZHVariant && containsChineseMarker(lowerNoNonZHRegion, []string{"tc"}))
 	hasSimpTrad := strings.Contains(lower, "简繁") || strings.Contains(lower, "繁简")
 	hasBilingual := strings.Contains(lower, "双语") || strings.Contains(lower, "雙語") || strings.Contains(lower, "bilingual") ||
 		hasSimpTrad ||
@@ -723,6 +742,18 @@ func subtitleFormatLabel(codec string) string {
 		return strings.ToUpper(codec)
 	}
 }
+
+var nonZHRegionReplacer = strings.NewReplacer(
+	"en-gb", " ",
+	"en_gb", " ",
+	"en.gb", " ",
+	"cy-gb", " ",
+	"cy_gb", " ",
+	"gd-gb", " ",
+	"gd_gb", " ",
+	"kw-gb", " ",
+	"kw_gb", " ",
+)
 
 func containsChineseMarker(lower string, markers []string) bool {
 	for _, m := range markers {

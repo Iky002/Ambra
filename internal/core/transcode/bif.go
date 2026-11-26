@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,10 +22,12 @@ const (
 	// DefaultBIFIntervalSec is the default frame interval in seconds (10s = 10000ms).
 	DefaultBIFIntervalSec = 10
 
-	bifHeaderSize      = 64
-	bifIndexEntrySize  = 8
-	bifEndIndexMarker  = 0xffffffff
-	defaultBIFTimeout  = 10 * time.Minute
+	bifHeaderSize     = 64
+	bifIndexEntrySize = 8
+	bifEndIndexMarker = 0xffffffff
+	defaultBIFTimeout = 10 * time.Minute
+	maxBIFFrames      = 10_000
+	maxBIFTotalBytes  = int64(256 << 20) // 256 MiB
 )
 
 var bifMagic = [8]byte{0x89, 'B', 'I', 'F', '\r', '\n', 0x1a, '\n'}
@@ -132,7 +135,7 @@ func (e *Extractor) GenerateBIF(ctx context.Context, mediaPath, itemID string, w
 		}
 		defer os.RemoveAll(stageDir)
 
-		runCtx, cancel := context.WithTimeout(ctx, defaultBIFTimeout)
+		runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultBIFTimeout)
 		defer cancel()
 
 		framePattern := filepath.Join(stageDir, "frame_%06d.jpg")
@@ -147,6 +150,7 @@ func (e *Extractor) GenerateBIF(ctx context.Context, mediaPath, itemID string, w
 			"-sn",
 			"-dn",
 			"-vf", vf,
+			"-frames:v", strconv.Itoa(maxBIFFrames),
 			"-q:v", "6",
 			framePattern,
 		}
@@ -171,20 +175,15 @@ func (e *Extractor) GenerateBIF(ctx context.Context, mediaPath, itemID string, w
 		if len(names) == 0 {
 			return "", fmt.Errorf("ffmpeg produced 0 frames for BIF")
 		}
+		if len(names) > maxBIFFrames {
+			names = names[:maxBIFFrames]
+		}
 
-		frames := make([][]byte, 0, len(names))
+		framePaths := make([]string, 0, len(names))
 		for _, name := range names {
-			data, readErr := os.ReadFile(filepath.Join(stageDir, name))
-			if readErr != nil || len(data) == 0 {
-				continue
-			}
-			frames = append(frames, data)
+			framePaths = append(framePaths, filepath.Join(stageDir, name))
 		}
-		if len(frames) == 0 {
-			return "", fmt.Errorf("no non-empty frames available for BIF")
-		}
-
-		if err := WriteBIF(outPath, uint32(intervalSec*1000), frames); err != nil {
+		if err := writeBIFFromFiles(outPath, uint32(intervalSec*1000), framePaths, maxBIFTotalBytes); err != nil {
 			return "", err
 		}
 		return outPath, nil
@@ -193,6 +192,116 @@ func (e *Extractor) GenerateBIF(ctx context.Context, mediaPath, itemID string, w
 		return "", err
 	}
 	return res.(string), nil
+}
+
+type bifFrameFile struct {
+	path string
+	size int64
+}
+
+// writeBIFFromFiles streams JPEG frame files into a standard BIF v0 archive in two passes
+// (Pass 1: stat sizes & write header/index; Pass 2: stream-copy each frame) so full JPEG payloads
+// are never retained in memory simultaneously.
+func writeBIFFromFiles(outPath string, intervalMs uint32, paths []string, maxTotalBytes int64) error {
+	if intervalMs == 0 {
+		intervalMs = DefaultBIFIntervalSec * 1000
+	}
+	if maxTotalBytes <= 0 {
+		maxTotalBytes = maxBIFTotalBytes
+	}
+
+	valid := make([]bifFrameFile, 0, len(paths))
+	var totalBytes int64
+	for _, p := range paths {
+		info, err := os.Lstat(p)
+		if err != nil || info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Size() <= 0 {
+			continue
+		}
+		totalBytes += info.Size()
+		if totalBytes > maxTotalBytes {
+			return fmt.Errorf("bif total frame bytes %d exceeds limit %d", totalBytes, maxTotalBytes)
+		}
+		valid = append(valid, bifFrameFile{path: p, size: info.Size()})
+	}
+	if len(valid) == 0 {
+		return fmt.Errorf("no non-empty frames available for BIF")
+	}
+
+	dataOffset64 := uint64(bifHeaderSize) + uint64(len(valid)+1)*uint64(bifIndexEntrySize)
+	if dataOffset64+uint64(totalBytes) > math.MaxUint32 {
+		return fmt.Errorf("bif archive size exceeds 32-bit offset limit")
+	}
+
+	if err := os.MkdirAll(filepath.Dir(outPath), 0o700); err != nil {
+		return fmt.Errorf("create bif output dir: %w", err)
+	}
+	tmpFile, err := os.CreateTemp(filepath.Dir(outPath), ".ambra-bif-*.bif.tmp")
+	if err != nil {
+		return fmt.Errorf("create bif temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	var header [bifHeaderSize]byte
+	copy(header[0:8], bifMagic[:])
+	binary.LittleEndian.PutUint32(header[8:12], 0)
+	binary.LittleEndian.PutUint32(header[12:16], uint32(len(valid)))
+	binary.LittleEndian.PutUint32(header[16:20], intervalMs)
+
+	if _, err := tmpFile.Write(header[:]); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("write bif header: %w", err)
+	}
+
+	indexBuf := make([]byte, (len(valid)+1)*bifIndexEntrySize)
+	curOffset := uint32(dataOffset64)
+	for i, ff := range valid {
+		pos := i * bifIndexEntrySize
+		binary.LittleEndian.PutUint32(indexBuf[pos:pos+4], uint32(i))
+		binary.LittleEndian.PutUint32(indexBuf[pos+4:pos+8], curOffset)
+		curOffset += uint32(ff.size)
+	}
+	endPos := len(valid) * bifIndexEntrySize
+	binary.LittleEndian.PutUint32(indexBuf[endPos:endPos+4], bifEndIndexMarker)
+	binary.LittleEndian.PutUint32(indexBuf[endPos+4:endPos+8], curOffset)
+
+	if _, err := tmpFile.Write(indexBuf); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("write bif index table: %w", err)
+	}
+
+	copyBuf := make([]byte, 32*1024)
+	for _, ff := range valid {
+		in, openErr := os.Open(ff.path)
+		if openErr != nil {
+			_ = tmpFile.Close()
+			return fmt.Errorf("open bif frame %s: %w", filepath.Base(ff.path), openErr)
+		}
+		written, copyErr := io.CopyBuffer(tmpFile, io.LimitReader(in, ff.size), copyBuf)
+		_ = in.Close()
+		if copyErr != nil {
+			_ = tmpFile.Close()
+			return fmt.Errorf("copy bif frame %s: %w", filepath.Base(ff.path), copyErr)
+		}
+		if written != ff.size {
+			_ = tmpFile.Close()
+			return fmt.Errorf("short read on bif frame %s: wrote %d of %d", filepath.Base(ff.path), written, ff.size)
+		}
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close bif temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, outPath); err != nil {
+		return fmt.Errorf("commit bif file: %w", err)
+	}
+	cleanup = false
+	return nil
 }
 
 // WriteBIF atomically writes a standard Roku/Emby BIF v0 archive to outPath.

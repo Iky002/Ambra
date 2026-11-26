@@ -1,7 +1,28 @@
 import { useLayoutEffect } from 'react'
 import { useLocation, useNavigationType } from 'react-router-dom'
 
+const MAX_SCROLL_POSITIONS = 100
 const scrollPositions = new Map<string, number>()
+
+function recordScrollPosition(key: string, top: number) {
+  if (scrollPositions.has(key)) {
+    scrollPositions.delete(key)
+  }
+  scrollPositions.set(key, top)
+  while (scrollPositions.size > MAX_SCROLL_POSITIONS) {
+    const oldestKey = scrollPositions.keys().next().value
+    if (oldestKey === undefined) break
+    scrollPositions.delete(oldestKey)
+  }
+}
+
+export function getScrollPositionsCount(): number {
+  return scrollPositions.size
+}
+
+export function clearScrollPositions(): void {
+  scrollPositions.clear()
+}
 
 function scrollWindowTo(top: number) {
   try {
@@ -31,6 +52,7 @@ export function ScrollToTop() {
 
     if (navigationType === 'POP' && scrollPositions.has(key)) {
       const savedTop = scrollPositions.get(key) ?? 0
+      recordScrollPosition(key, savedTop)
       scrollWindowTo(savedTop)
     } else {
       scrollWindowTo(0)
@@ -42,7 +64,7 @@ export function ScrollToTop() {
         document.documentElement?.scrollTop ||
         document.body?.scrollTop ||
         0
-      scrollPositions.set(key, currentY)
+      recordScrollPosition(key, currentY)
     }
   }, [location.key, location.pathname, location.search, navigationType])
 

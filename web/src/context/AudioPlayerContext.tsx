@@ -143,6 +143,8 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
   const currentTrackFallbackDuration = currentTrack?.RunTimeTicks
     ? currentTrack.RunTimeTicks / 10_000_000
     : 0
+  const currentTrackFallbackDurationRef = useRef(currentTrackFallbackDuration)
+  currentTrackFallbackDurationRef.current = currentTrackFallbackDuration
 
   // 切换曲目时加载音频流并自动播放
   useEffect(() => {
@@ -165,11 +167,11 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
     audio.src = streamUrl
     audio.currentTime = 0
     setCurrentTime(0)
-    setDuration(currentTrackFallbackDuration)
+    setDuration(currentTrackFallbackDurationRef.current)
     setPlaybackError(null)
 
     triggerAudioPlay(audio)
-  }, [currentTrackId, currentTrackFallbackDuration, triggerAudioPlay])
+  }, [currentTrackId, triggerAudioPlay])
 
   // 同步音量与静音状态
   useEffect(() => {

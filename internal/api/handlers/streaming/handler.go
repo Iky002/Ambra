@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
 	"net/url"
@@ -274,6 +275,15 @@ func (h *Handler) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 		v := q.Int("SubtitleStreamIndex", 0)
 		req.SubtitleStreamIndex = &v
 	}
+	if req.EnableDirectPlay == nil {
+		req.EnableDirectPlay = q.Bool("EnableDirectPlay")
+	}
+	if req.EnableDirectStream == nil {
+		req.EnableDirectStream = q.Bool("EnableDirectStream")
+	}
+	if req.EnableTranscoding == nil {
+		req.EnableTranscoding = q.Bool("EnableTranscoding")
+	}
 
 	resp, _, err := h.engine.Decide(r.Context(), itemID, req)
 	if errors.Is(err, sqlite.ErrNotFound) {
@@ -281,7 +291,8 @@ func (h *Handler) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to determine playback info", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to determine playback info")
 		return
 	}
 	if _, isAdmin := h.callerIdentity(r); h.isAuthenticated(r) && !isAdmin {
@@ -364,6 +375,10 @@ func (h *Handler) handleVideoBIF(w http.ResponseWriter, r *http.Request) {
 	}
 	f, err := os.Open(bifPath)
 	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			logAndWritePermissionDenied(w, bifPath, err)
+			return
+		}
 		httpx.Error(w, http.StatusNotFound, "bif not found")
 		return
 	}
@@ -374,8 +389,18 @@ func (h *Handler) handleVideoBIF(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Header().Set("Cache-Control", "private, max-age=86400")
 	http.ServeContent(w, r, "index.bif", stat.ModTime(), f)
+}
+
+func logAndWritePermissionDenied(w http.ResponseWriter, path string, err error) {
+	slog.Error("permission denied reading media file",
+		"path", path,
+		"uid", os.Geteuid(),
+		"gid", os.Getegid(),
+		"error", err,
+	)
+	httpx.Error(w, http.StatusForbidden, "permission denied reading media file")
 }
 
 func (h *Handler) handleDownload(w http.ResponseWriter, r *http.Request) {
@@ -401,7 +426,8 @@ func (h *Handler) serveMediaFile(w http.ResponseWriter, r *http.Request, asAttac
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to resolve media path", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to resolve media path")
 		return
 	}
 
@@ -417,7 +443,8 @@ func (h *Handler) serveMediaFile(w http.ResponseWriter, r *http.Request, asAttac
 		}
 		resolved, err := h.engine.ResolveStream(r.Context(), mediaPath)
 		if err != nil {
-			httpx.Error(w, http.StatusBadGateway, "failed to resolve strm: "+err.Error())
+			slog.Error("failed to resolve strm", "path", mediaPath, "error", err)
+			httpx.Error(w, http.StatusBadGateway, "failed to resolve strm stream")
 			return
 		}
 		if resolved == nil || !isHTTPURL(resolved.URL) {
@@ -426,7 +453,8 @@ func (h *Handler) serveMediaFile(w http.ResponseWriter, r *http.Request, asAttac
 		}
 		targetURL := strings.TrimSpace(resolved.URL)
 		if err := netutil.ValidateRemoteURL(targetURL, true); err != nil {
-			httpx.Error(w, http.StatusBadGateway, "blocked upstream stream url: "+err.Error())
+			slog.Error("blocked upstream stream url", "url", targetURL, "error", err)
+			httpx.Error(w, http.StatusBadGateway, "blocked upstream stream url")
 			return
 		}
 		if resolved.Is302 && !forceProxy {
@@ -445,18 +473,28 @@ func (h *Handler) serveMediaFile(w http.ResponseWriter, r *http.Request, asAttac
 
 	f, err := os.Open(mediaPath)
 	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			logAndWritePermissionDenied(w, mediaPath, err)
+			return
+		}
 		if os.IsNotExist(err) {
 			httpx.Error(w, http.StatusNotFound, "media file missing on disk")
 			return
 		}
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to open media file", "path", mediaPath, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to open media file")
 		return
 	}
 	defer f.Close()
 
 	stat, err := f.Stat()
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to stat media file", "path", mediaPath, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to read media file")
+		return
+	}
+	if stat.IsDir() {
+		httpx.Error(w, http.StatusNotFound, "media file missing on disk")
 		return
 	}
 
@@ -513,7 +551,8 @@ func (h *Handler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 
 	sources, err := h.repo.GetMediaSourcesByItemID(r.Context(), itemID)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to load media sources", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to load media sources")
 		return
 	}
 	var (
@@ -560,7 +599,8 @@ func (h *Handler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		}
 		mediaPath, err = h.resolveExtractionMediaPath(r.Context(), mediaPath)
 		if err != nil {
-			httpx.Error(w, http.StatusBadGateway, "failed to resolve strm: "+err.Error())
+			slog.Error("failed to resolve strm for subtitle extraction", "item_id", itemID, "error", err)
+			httpx.Error(w, http.StatusBadGateway, "failed to resolve strm stream")
 			return
 		}
 		extractExt := targetFormat
@@ -569,7 +609,12 @@ func (h *Handler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		}
 		extractedPath, err := h.extractor.ExtractSubtitle(r.Context(), mediaPath, itemID, sourceID, foundStream.StreamIndex, extractExt)
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			if errors.Is(err, os.ErrPermission) {
+				logAndWritePermissionDenied(w, mediaPath, err)
+				return
+			}
+			slog.Error("failed to extract subtitle", "item_id", itemID, "path", mediaPath, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to extract subtitle")
 			return
 		}
 		subPath = extractedPath
@@ -583,11 +628,16 @@ func (h *Handler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 	startTicks := q.Int64("StartPositionTicks", 0)
 	ct, data, err := playback.ServeSubtitle(subPath, targetFormat, startTicks)
 	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			logAndWritePermissionDenied(w, subPath, err)
+			return
+		}
 		if os.IsNotExist(err) {
 			httpx.Error(w, http.StatusNotFound, "subtitle file missing")
 			return
 		}
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to serve subtitle", "path", subPath, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to serve subtitle")
 		return
 	}
 	w.Header().Set("Content-Type", ct)
@@ -627,7 +677,18 @@ func (h *Handler) handleImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		if errors.Is(err, os.ErrPermission) {
+			imgPath := itemID
+			if h.repo != nil {
+				if rec, rErr := h.repo.GetImageByItemAndType(r.Context(), itemID, imgType, idx); rErr == nil && rec != nil && rec.Path != "" {
+					imgPath = rec.Path
+				}
+			}
+			logAndWritePermissionDenied(w, imgPath, err)
+			return
+		}
+		slog.Error("failed to serve image", "item_id", itemID, "image_type", imgType, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to serve image")
 		return
 	}
 }
@@ -665,12 +726,14 @@ func (h *Handler) tryServeLibraryCover(w http.ResponseWriter, r *http.Request, l
 
 func (h *Handler) proxyRemoteMedia(w http.ResponseWriter, r *http.Request, targetURL string, asAttachment bool) {
 	if err := netutil.ValidateRemoteURL(targetURL, true); err != nil {
-		httpx.Error(w, http.StatusBadGateway, "blocked upstream stream url: "+err.Error())
+		slog.Error("blocked upstream stream url", "url", targetURL, "error", err)
+		httpx.Error(w, http.StatusBadGateway, "blocked upstream stream url")
 		return
 	}
 	upReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, nil)
 	if err != nil {
-		httpx.Error(w, http.StatusBadGateway, "invalid upstream stream url: "+err.Error())
+		slog.Error("invalid upstream stream url", "url", targetURL, "error", err)
+		httpx.Error(w, http.StatusBadGateway, "invalid upstream stream url")
 		return
 	}
 	if rng := r.Header.Get("Range"); rng != "" {
@@ -687,7 +750,8 @@ func (h *Handler) proxyRemoteMedia(w http.ResponseWriter, r *http.Request, targe
 
 	resp, err := h.httpClient.Do(upReq)
 	if err != nil {
-		httpx.Error(w, http.StatusBadGateway, "upstream stream error: "+err.Error())
+		slog.Error("upstream stream request failed", "url", targetURL, "error", err)
+		httpx.Error(w, http.StatusBadGateway, "upstream stream error")
 		return
 	}
 	defer resp.Body.Close()

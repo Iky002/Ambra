@@ -48,9 +48,15 @@ export function IdentifyModal({
       const providerIds: Record<string, string> = {}
       if (tmdbId.trim()) providerIds.Tmdb = tmdbId.trim()
       if (imdbId.trim()) providerIds.Imdb = imdbId.trim()
+      const trimmedYear = year.trim()
+      const parsedYear = trimmedYear ? Number(trimmedYear) : undefined
+      const validYear =
+        parsedYear !== undefined && Number.isInteger(parsedYear) && parsedYear > 1800
+          ? parsedYear
+          : undefined
       return api.remoteSearch(itemType, {
         Name: name.trim() || undefined,
-        Year: year.trim() ? Number(year.trim()) : undefined,
+        Year: validYear,
         ProviderIds: Object.keys(providerIds).length > 0 ? providerIds : undefined,
       })
     },
@@ -93,6 +99,14 @@ export function IdentifyModal({
     if (!name.trim() && !tmdbId.trim() && !imdbId.trim()) {
       setError('请至少输入片名、TMDB ID 或 IMDb ID 之一')
       return
+    }
+    const trimmedYear = year.trim()
+    if (trimmedYear) {
+      const parsed = Number(trimmedYear)
+      if (!Number.isInteger(parsed) || parsed <= 1800) {
+        setError('请输入有效的发行年份（需为大于 1800 的整数）')
+        return
+      }
     }
     setError(null)
     searchMutation.mutate()

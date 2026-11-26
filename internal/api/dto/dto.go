@@ -231,6 +231,7 @@ type BaseItemDto struct {
 	Genres                  []string          `json:"Genres,omitempty"`
 	GenreItems              []NameIdPair      `json:"GenreItems,omitempty"`
 	CommunityRating         *float64          `json:"CommunityRating,omitempty"`
+	CriticRating            *float64          `json:"CriticRating,omitempty"`
 	RunTimeTicks            *int64            `json:"RunTimeTicks,omitempty"`
 	ProductionYear          *int              `json:"ProductionYear,omitempty"`
 	IndexNumber             *int              `json:"IndexNumber,omitempty"`

@@ -9,6 +9,7 @@ import { AudioPlayerProvider, useAudioPlayer } from '../../context/AudioPlayerCo
 import { AuthProvider } from '../../context/AuthContext'
 import { setDemoModeOverride } from '../../demo/demoMode'
 import { resetDemoStore } from '../../demo/mockServer'
+import { formatDateTimeForLocale } from '../../i18n/I18nContext'
 import { ItemDetailPage } from '../ItemDetailPage'
 import { LiveTvPage } from '../LiveTvPage'
 import { LoginPage } from '../LoginPage'
@@ -405,6 +406,8 @@ describe('Stream 3 (v0.9.2): LiveTv HLS/DVR/EPG, Cache Invalidation, InstantMix 
       qc,
     )
 
+    // 等待服务端验证管理员权限后切换到「合集」标签
+    await screen.findByRole('tab', { name: /合集/ })
     const colBtn = await screen.findByRole('button', { name: /科幻精选/ })
     fireEvent.click(colBtn)
 
@@ -533,9 +536,9 @@ describe('Stream 3 (v0.9.2): LiveTv HLS/DVR/EPG, Cache Invalidation, InstantMix 
     fireEvent.keyDown(window, { key: 'Escape' })
     expect(screen.getByRole('dialog')).toBeTruthy()
 
-    // 完成请求 -> 展示本地化后的过期时间
+    // 完成请求 -> 展示本地化后的过期时间（使用 i18n formatDateTime）
     const isoDate = '2026-11-25T12:30:00.000Z'
-    const expectedFormatted = new Date(isoDate).toLocaleString('zh-CN')
+    const expectedFormatted = formatDateTimeForLocale('zh-CN', isoDate)
     await act(async () => {
       resolveForgot({
         Action: 'PinCode',

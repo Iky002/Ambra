@@ -117,6 +117,7 @@ func newTMDBTestEnv(t *testing.T) (*testEnv, *httptest.Server, []byte, []byte) {
 	_ = tp.Configure(map[string]any{
 		"base_url":       srv.URL,
 		"image_base_url": srv.URL,
+		"api_key":        "test-key",
 	})
 	reg.Register(tp)
 

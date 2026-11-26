@@ -21,13 +21,25 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
 
   useEffect(() => {
     if (open) {
-      setTimeout(() => inputRef.current?.focus(), 30)
-    } else {
-      setQuery('')
-      setHints([])
-      setActiveIndex(0)
+      const focusTimer = window.setTimeout(() => inputRef.current?.focus(), 30)
+      return () => window.clearTimeout(focusTimer)
     }
+    setQuery('')
+    setHints([])
+    setActiveIndex(0)
   }, [open])
+
+  useEffect(() => {
+    if (!open) return
+    const onWinKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        onClose()
+      }
+    }
+    window.addEventListener('keydown', onWinKeyDown)
+    return () => window.removeEventListener('keydown', onWinKeyDown)
+  }, [open, onClose])
 
   useEffect(() => {
     if (!open) return
@@ -102,6 +114,9 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
       onClick={onClose}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="全局搜索"
         className="animate-modal-enter w-full max-w-2xl overflow-hidden rounded-2xl border border-white/12 bg-zinc-950/95 shadow-2xl shadow-black/80"
         onClick={(e) => e.stopPropagation()}
         onKeyDown={handleKeyDown}
@@ -119,6 +134,7 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
           {loading && <Loader2 className="h-4 w-4 animate-spin text-amber-400" />}
           <button
             type="button"
+            aria-label="关闭搜索弹窗"
             onClick={onClose}
             className="rounded-lg p-1 text-zinc-400 hover:bg-white/10 hover:text-zinc-100"
           >

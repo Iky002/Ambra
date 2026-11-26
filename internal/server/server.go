@@ -7,10 +7,12 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -97,8 +99,10 @@ type Server struct {
 	WSHub        *ws.Hub
 	Handler      http.Handler
 
-	dvrCancel context.CancelFunc
-	dvrDone   chan struct{}
+	dvrCancel        context.CancelFunc
+	dvrDone          chan struct{}
+	opsHandler       *ops.Handler
+	migrationHandler *migrationhandler.Handler
 }
 
 func New(ctx context.Context, cfg *config.Config) (*Server, error) {
@@ -137,6 +141,9 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 
 	authSvc := auth.NewService(userRepo, cfg)
 	if err := authSvc.EnsureDefaultAdmin(ctx); err != nil {
+		if wHost != nil {
+			_ = wHost.Close(context.Background())
+		}
 		_ = store.Close()
 		return nil, fmt.Errorf("ensure default admin: %w", err)
 	}
@@ -188,6 +195,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 			ServerID:      cfg.ServerID,
 			ServerName:    cfg.ServerName,
 			ServerVersion: config.ServerVersion,
+			Port:          parseHTTPPort(cfg.HTTPAddr),
 		})
 	}
 
@@ -379,6 +387,13 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	audioH := audio.New(libRepo, cfg)
 	audioH.SetUserRepo(userRepo)
 	audioH.SetStreamResolver(resolveStreamURL)
+	audioH.SetStreamResolverFull(func(c context.Context, rawPath string) (string, bool, error) {
+		res, err := pb.ResolveStream(c, rawPath)
+		if err != nil || res == nil {
+			return "", false, err
+		}
+		return res.URL, res.Is302, nil
+	})
 	audioH.RegisterRoutes(mediaMux, audio.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
@@ -410,7 +425,8 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
 	})
-	ops.New(store, cfg, userRepo, bus).RegisterRoutes(mediaMux, ops.AuthFuncs{
+	opsH := ops.New(store, cfg, userRepo, bus)
+	opsH.RegisterRoutes(mediaMux, ops.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
@@ -431,7 +447,8 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		RequireAdmin: authMW.RequireAdmin,
 	})
 	migrator := migration.NewMigrator(store, userRepo)
-	migrationhandler.New(migrator).RegisterRoutes(mediaMux, migrationhandler.AuthFuncs{
+	migrationH := migrationhandler.New(migrator)
+	migrationH.RegisterRoutes(mediaMux, migrationhandler.AuthFuncs{
 		RequireAuth:  authMW.RequireAuth,
 		RequireAdmin: authMW.RequireAdmin,
 	})
@@ -470,6 +487,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	compatMediaSvc.SetWatcher(libWatcher)
 	compatMediaSvc.SetTranscodeManager(transcodeMgr)
 	compatMediaSvc.SetUserRepo(userRepo)
+	compatMediaSvc.SetStreamResolver(resolveStreamURL)
 	compatMediaH := compatMediaSvc.BuildRouter(compatmedia.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
@@ -572,8 +590,10 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		Logs:         logsH,
 		WSHub:        wsHub,
 		Handler:      r,
-		dvrCancel:    dvrCancel,
-		dvrDone:      dvrDone,
+		dvrCancel:        dvrCancel,
+		dvrDone:          dvrDone,
+		opsHandler:       opsH,
+		migrationHandler: migrationH,
 	}, nil
 }
 
@@ -611,6 +631,7 @@ func applyPendingDatabaseRestore(dataDir, dbPath string) error {
 
 	backupPath := dbPath + ".pre-restore.bak"
 	hadExistingDB := false
+	movedSidecars := make([]string, 0, 2)
 	if _, err := os.Stat(dbPath); err == nil {
 		hadExistingDB = true
 		_ = os.Remove(backupPath)
@@ -618,29 +639,34 @@ func applyPendingDatabaseRestore(dataDir, dbPath string) error {
 			slog.Warn("failed to back up existing database before restore", "dbPath", dbPath, "backupPath", backupPath, "error", err)
 			return fmt.Errorf("backup existing db: %w", err)
 		}
-		// Preserve WAL/SHM sidecars alongside backup so pre-restore backup stays intact.
-		for _, suffix := range []string{"-wal", "-shm"} {
-			sidecar := dbPath + suffix
-			sidecarBak := backupPath + suffix
-			_ = os.Remove(sidecarBak)
-			if _, sErr := os.Stat(sidecar); sErr == nil {
-				if rErr := os.Rename(sidecar, sidecarBak); rErr != nil {
-					slog.Warn("failed to back up sqlite sidecar before restore", "path", sidecar, "error", rErr)
-				}
-			}
-		}
 	} else if !os.IsNotExist(err) {
 		slog.Warn("failed to stat existing database before restore", "dbPath", dbPath, "error", err)
 		return fmt.Errorf("stat existing db: %w", err)
+	}
+
+	// Always back up / clear any lingering WAL/SHM sidecars regardless of whether dbPath existed,
+	// so stale WAL frames can never corrupt the restored database.
+	for _, suffix := range []string{"-wal", "-shm"} {
+		sidecar := dbPath + suffix
+		sidecarBak := backupPath + suffix
+		_ = os.Remove(sidecarBak)
+		if _, sErr := os.Stat(sidecar); sErr == nil {
+			if rErr := os.Rename(sidecar, sidecarBak); rErr != nil {
+				slog.Warn("failed to back up sqlite sidecar before restore; removing", "path", sidecar, "error", rErr)
+				_ = os.Remove(sidecar)
+			} else {
+				movedSidecars = append(movedSidecars, suffix)
+			}
+		}
 	}
 
 	if err := os.Rename(restorePath, dbPath); err != nil {
 		slog.Warn("failed to promote pending database restore", "restorePath", restorePath, "dbPath", dbPath, "error", err)
 		if hadExistingDB {
 			_ = os.Rename(backupPath, dbPath)
-			for _, suffix := range []string{"-wal", "-shm"} {
-				_ = os.Rename(backupPath+suffix, dbPath+suffix)
-			}
+		}
+		for _, suffix := range movedSidecars {
+			_ = os.Rename(backupPath+suffix, dbPath+suffix)
 		}
 		return fmt.Errorf("promote restore db: %w", err)
 	}
@@ -649,7 +675,32 @@ func applyPendingDatabaseRestore(dataDir, dbPath string) error {
 	return nil
 }
 
+func parseHTTPPort(addr string) int {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return 8096
+	}
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 8096
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return 8096
+	}
+	return port
+}
+
 func (s *Server) Close() error {
+	if s.WSHub != nil {
+		s.WSHub.Close()
+	}
+	if s.opsHandler != nil {
+		s.opsHandler.Close()
+	}
+	if s.migrationHandler != nil {
+		s.migrationHandler.Close()
+	}
 	if s.Watcher != nil {
 		_ = s.Watcher.Close()
 	}

@@ -44,9 +44,13 @@ func TestStopByDeviceForUser(t *testing.T) {
 		t.Fatalf("expected 1 stopped for owner, got %d", stopped)
 	}
 
-	// Non-admin can stop an unowned session (UserID == "").
-	if stopped := mgr.StopByDeviceForUser("dev-anon", "ps-anon", "user-a", false); stopped != 1 {
-		t.Fatalf("expected 1 stopped for unowned session, got %d", stopped)
+	// Non-admin must NOT stop an unowned session (UserID == "").
+	if stopped := mgr.StopByDeviceForUser("dev-anon", "ps-anon", "user-a", false); stopped != 0 {
+		t.Fatalf("expected 0 stopped for unowned session by non-admin, got %d", stopped)
+	}
+	// Admin can stop an unowned session.
+	if stopped := mgr.StopByDeviceForUser("dev-anon", "ps-anon", "admin-1", true); stopped != 1 {
+		t.Fatalf("expected 1 stopped for unowned session by admin, got %d", stopped)
 	}
 
 	// Admin can stop user-b's session.

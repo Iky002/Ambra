@@ -12,7 +12,38 @@ import (
 	"github.com/ambra-media/ambra/internal/pkg/i18n"
 )
 
-const ticksPerDay int64 = 86400 * 10_000_000
+const (
+	ticksPerDay        int64 = 86400 * 10_000_000
+	minIntervalTicks   int64 = 60 * 10_000_000 // 1 minute
+	maxTriggersPerTask       = 32
+)
+
+var extraTaskLocalizations = map[string]map[string][2]string{
+	"ExtractChapterImages": {
+		"zh-CN": {"提取章节缩略图", "为媒体库中的视频文件提取章节预览缩略图。"},
+		"zh-TW": {"擷取章節縮圖", "為媒體庫中的視訊檔案擷取章節預覽縮圖。"},
+		"en-US": {"Extract Chapter Images", "Extract chapter preview thumbnails for video files in the media library."},
+		"ja-JP": {"チャプター画像を抽出", "メディアライブラリ内の動画ファイルのチャプターサムネイルを抽出します。"},
+		"ko-KR": {"챕터 이미지 추출", "미디어 라이브러리의 비디오 파일에서 챕터 미리보기 썸네일을 추출합니다."},
+		"es-ES": {"Extraer imágenes de capítulos", "Extrae miniaturas de vista previa de capítulos para los videos de la biblioteca."},
+		"de-DE": {"Kapitelbilder extrahieren", "Extrahiert Kapitel-Vorschaubilder für Videodateien in der Mediathek."},
+		"fr-FR": {"Extraire les images de chapitres", "Extrait les vignettes d'aperçu des chapitres pour les vidéos de la médiathèque."},
+		"pt-BR": {"Extrair imagens de capítulos", "Extrai miniaturas de pré-visualização de capítulos para os vídeos da biblioteca."},
+		"th-TH": {"ดึงภาพตัวอย่างบท", "ดึงภาพขนาดย่อของบทสำหรับไฟล์วิดีโอในคลังสื่อ"},
+	},
+	"GenerateBifThumbnails": {
+		"zh-CN": {"生成进度条缩略图 (BIF)", "为媒体库中的视频生成进度条拖动预览缩略图索引文件。"},
+		"zh-TW": {"產生進度條縮圖 (BIF)", "為媒體庫中的視訊產生進度條拖曳預覽縮圖索引檔案。"},
+		"en-US": {"Generate BIF Thumbnails", "Generate seek-bar preview thumbnail index (BIF) files for videos in the library."},
+		"ja-JP": {"BIF サムネイルを生成", "ライブラリ内の動画のシークバープレビュー用 BIF サムネイルを生成します。"},
+		"ko-KR": {"BIF 썸네일 생성", "라이브러리의 비디오에 대한 탐색 막대 미리보기 BIF 썸네일을 생성합니다."},
+		"es-ES": {"Generar miniaturas BIF", "Genera archivos de miniaturas BIF de vista previa para los videos de la biblioteca."},
+		"de-DE": {"BIF-Vorschaubilder erstellen", "Erstellt BIF-Vorschaubilder für die Zeitleiste von Videos in der Mediathek."},
+		"fr-FR": {"Générer les vignettes BIF", "Génère les fichiers de vignettes BIF d'aperçu pour les vidéos de la médiathèque."},
+		"pt-BR": {"Gerar miniaturas BIF", "Gera arquivos de miniaturas BIF de pré-visualização para os vídeos da biblioteca."},
+		"th-TH": {"สร้างภาพขนาดย่อ BIF", "สร้างไฟล์ภาพขนาดย่อ BIF สำหรับแสดงตัวอย่างแถบเวลาของวิดีโอในคลังสื่อ"},
+	},
+}
 
 // AuthFuncs decouples route registration from the concrete middleware package.
 type AuthFuncs struct {
@@ -115,6 +146,16 @@ func localizeTaskInfo(info scheduler.TaskInfo, locale string) scheduler.TaskInfo
 		nameKey, descKey = "task.vacuum_db.name", "task.vacuum_db.desc"
 	case "SyncRankings":
 		nameKey, descKey = "task.sync_rankings.name", "task.sync_rankings.desc"
+	case "ExtractChapterImages", "GenerateBifThumbnails":
+		if byLocale, ok := extraTaskLocalizations[key]; ok {
+			pair, okLoc := byLocale[locale]
+			if !okLoc {
+				pair = byLocale["en-US"]
+			}
+			info.Name = pair[0]
+			info.Description = pair[1]
+		}
+		return info
 	default:
 		return info
 	}
@@ -169,18 +210,49 @@ func (h *Handler) handleStopTask(w http.ResponseWriter, r *http.Request) {
 	httpx.NoContent(w)
 }
 
+func isValidDayOfWeek(day string) bool {
+	switch strings.ToLower(strings.TrimSpace(day)) {
+	case "sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday":
+		return true
+	default:
+		return false
+	}
+}
+
 func validateTriggers(triggers []scheduler.TaskTriggerInfo) error {
+	if len(triggers) > maxTriggersPerTask {
+		return fmt.Errorf("too many triggers: maximum %d allowed per task", maxTriggersPerTask)
+	}
 	for i, tr := range triggers {
-		switch strings.TrimSpace(tr.Type) {
-		case "IntervalTrigger", "DailyTrigger", "WeeklyTrigger", "StartupTrigger", "SystemEventTrigger":
+		tType := strings.TrimSpace(tr.Type)
+		switch tType {
+		case "IntervalTrigger":
+			if tr.IntervalTicks == nil {
+				return fmt.Errorf("trigger[%d]: IntervalTicks is required for IntervalTrigger", i)
+			}
+		case "DailyTrigger":
+			if tr.TimeOfDayTicks == nil {
+				return fmt.Errorf("trigger[%d]: TimeOfDayTicks is required for DailyTrigger", i)
+			}
+		case "WeeklyTrigger":
+			if tr.TimeOfDayTicks == nil {
+				return fmt.Errorf("trigger[%d]: TimeOfDayTicks is required for WeeklyTrigger", i)
+			}
+			if !isValidDayOfWeek(tr.DayOfWeek) {
+				return fmt.Errorf("trigger[%d]: valid DayOfWeek is required for WeeklyTrigger", i)
+			}
+		case "StartupTrigger", "SystemEventTrigger":
 		default:
 			return fmt.Errorf("trigger[%d]: unsupported trigger type %q", i, tr.Type)
+		}
+		if strings.TrimSpace(tr.DayOfWeek) != "" && !isValidDayOfWeek(tr.DayOfWeek) {
+			return fmt.Errorf("trigger[%d]: invalid DayOfWeek %q", i, tr.DayOfWeek)
 		}
 		if tr.TimeOfDayTicks != nil && (*tr.TimeOfDayTicks < 0 || *tr.TimeOfDayTicks >= ticksPerDay) {
 			return fmt.Errorf("trigger[%d]: TimeOfDayTicks must be between 0 and %d", i, ticksPerDay-1)
 		}
-		if tr.IntervalTicks != nil && *tr.IntervalTicks <= 0 {
-			return fmt.Errorf("trigger[%d]: IntervalTicks must be positive", i)
+		if tr.IntervalTicks != nil && *tr.IntervalTicks < minIntervalTicks {
+			return fmt.Errorf("trigger[%d]: IntervalTicks must be at least %d (1 minute)", i, minIntervalTicks)
 		}
 		if tr.MaxRuntimeTicks != nil && *tr.MaxRuntimeTicks < 0 {
 			return fmt.Errorf("trigger[%d]: MaxRuntimeTicks must be non-negative", i)

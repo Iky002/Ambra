@@ -47,6 +47,34 @@ func isSymlinkAllowedInRoot(root, target string, policy SymlinkPolicy) (allowed 
 	return isPathWithinRoot(root, target), true
 }
 
+// hasSymlinkComponentUnderRoot reports whether any path component strictly beneath root
+// up to and including target is a symbolic link.
+func hasSymlinkComponentUnderRoot(root, target string) bool {
+	cleanRoot := filepath.Clean(strings.TrimSpace(root))
+	cleanTarget := filepath.Clean(strings.TrimSpace(target))
+	if cleanRoot == "" || cleanTarget == "" {
+		return false
+	}
+	rel, err := filepath.Rel(cleanRoot, cleanTarget)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+		if linfo, lerr := os.Lstat(cleanTarget); lerr == nil && linfo.Mode()&os.ModeSymlink != 0 {
+			return true
+		}
+		return false
+	}
+	cur := cleanRoot
+	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
+		if part == "" || part == "." {
+			continue
+		}
+		cur = filepath.Join(cur, part)
+		if linfo, lerr := os.Lstat(cur); lerr == nil && linfo.Mode()&os.ModeSymlink != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // SymlinkPolicy controls how WalkSafe handles symbolic links during directory traversal.
 type SymlinkPolicy int
 

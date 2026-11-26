@@ -85,7 +85,7 @@ func TestTMDBMovieExtraBranches(t *testing.T) {
 
 	p := New("k", "zh-CN")
 	p.SetHTTPClient(srv.Client())
-	_ = p.Configure(map[string]any{"base_url": srv.URL})
+	_ = p.Configure(map[string]any{"base_url": srv.URL, "api_key": "k"})
 	ctx := context.Background()
 
 	// Direct fetch by ProviderIDs + explicit language
@@ -178,7 +178,7 @@ func TestTMDBSeriesAndEpisode(t *testing.T) {
 
 	p := New("k", "zh-CN")
 	p.SetHTTPClient(srv.Client())
-	_ = p.Configure(map[string]any{"base_url": srv.URL})
+	_ = p.Configure(map[string]any{"base_url": srv.URL, "api_key": "k"})
 	ctx := context.Background()
 
 	// Series via search + year
@@ -244,7 +244,7 @@ func TestTMDBSeriesAndEpisode(t *testing.T) {
 
 	// getJSON invalid URL and network error
 	pBad := New("k", "zh-CN")
-	_ = pBad.Configure(map[string]any{"base_url": "http://[::1]:namedport"})
+	_ = pBad.Configure(map[string]any{"base_url": "http://[::1]:namedport", "api_key": "k"})
 	if _, err := pBad.FetchMetadata(ctx, plugins.MediaQuery{ItemType: "Movie", ProviderIDs: map[string]string{"tmdb": "1"}}); err == nil {
 		t.Fatalf("expected error for invalid base URL")
 	}
@@ -252,7 +252,7 @@ func TestTMDBSeriesAndEpisode(t *testing.T) {
 	srvClosed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	srvClosed.Close()
 	pBad.SetHTTPClient(srvClosed.Client())
-	_ = pBad.Configure(map[string]any{"base_url": srvClosed.URL})
+	_ = pBad.Configure(map[string]any{"base_url": srvClosed.URL, "api_key": "k"})
 	if _, err := pBad.FetchMetadata(ctx, plugins.MediaQuery{ItemType: "Movie", ProviderIDs: map[string]string{"tmdb": "1"}}); err == nil {
 		t.Fatalf("expected error for closed server")
 	}

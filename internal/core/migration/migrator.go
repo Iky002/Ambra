@@ -638,6 +638,9 @@ func (m *Migrator) resolveOrCreateUser(
 		passwordHash = hashed
 		policy.IsDisabled = true
 		notice = fmt.Sprintf("user %q had a password on source server; created disabled with high-entropy random password and requires admin password reset", name)
+	} else if policy.IsAdministrator {
+		policy.IsDisabled = true
+		notice = fmt.Sprintf("administrator %q had no password on source server; created disabled for security and requires setting a password before enabling", name)
 	}
 
 	rec := &sqlite.UserRecord{

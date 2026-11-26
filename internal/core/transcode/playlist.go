@@ -13,6 +13,8 @@ const (
 	TicksPerSecond = 10_000_000
 	// DefaultSegmentDuration is the default HLS segment duration in seconds.
 	DefaultSegmentDuration = 6
+	// maxPlaylistSegments caps generated virtual HLS playlist segments to prevent unbounded allocation.
+	maxPlaylistSegments = 100_000
 )
 
 // SubtitleTrackInfo describes a WebVTT subtitle track exposed in an HLS master playlist.
@@ -48,13 +50,18 @@ func SegmentDurations(durationSec float64, segDur int) []float64 {
 	if segDur <= 0 {
 		segDur = DefaultSegmentDuration
 	}
-	if durationSec <= 0 {
+	if math.IsNaN(durationSec) || math.IsInf(durationSec, 0) || durationSec <= 0 {
 		return nil
 	}
 	s := float64(segDur)
-	count := int(math.Ceil(durationSec / s))
-	if count <= 0 {
+	countFloat := math.Ceil(durationSec / s)
+	if countFloat <= 0 {
 		return nil
+	}
+	count := int(countFloat)
+	if countFloat > maxPlaylistSegments {
+		count = maxPlaylistSegments
+		durationSec = float64(maxPlaylistSegments) * s
 	}
 	out := make([]float64, 0, count)
 	remaining := durationSec

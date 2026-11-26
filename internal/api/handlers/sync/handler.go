@@ -23,9 +23,37 @@ import (
 )
 
 const (
-	stateConfigKey    = "sync:state"
-	maxSyncJobItemIDs = 500
+	stateConfigKey     = "sync:state"
+	maxSyncJobItemIDs  = 500
+	maxSyncJobsPerUser = 100
+	maxSyncJobNameLen  = 256
+	maxSyncFieldLen    = 128
+	maxSyncQualityLen  = 64
 )
+
+func isValidSyncJobStatus(status string) bool {
+	switch status {
+	case "Queued", "Converting", "ReadyToTransfer", "Transferring", "Synced", "Completed", "Cancelled", "Failed", "Removing":
+		return true
+	default:
+		return false
+	}
+}
+
+func cloneSyncState(st syncState) syncState {
+	out := syncState{
+		Jobs:     make([]SyncJob, len(st.Jobs)),
+		JobItems: make([]SyncJobItem, len(st.JobItems)),
+	}
+	copy(out.Jobs, st.Jobs)
+	for i := range out.Jobs {
+		if len(out.Jobs[i].RequestedItemIds) > 0 {
+			out.Jobs[i].RequestedItemIds = append([]string(nil), out.Jobs[i].RequestedItemIds...)
+		}
+	}
+	copy(out.JobItems, st.JobItems)
+	return out
+}
 
 // ErrForbidden is returned when a caller attempts to mutate or access another user's sync resources.
 var ErrForbidden = errors.New("forbidden")
@@ -226,6 +254,19 @@ func callerCanAccessJob(job SyncJob, callerID string, isAdmin bool) bool {
 	return guid.Normalize(job.UserId) == normCaller
 }
 
+// JobItemIDsForJob returns all job item IDs belonging to jobID.
+func (h *Handler) JobItemIDsForJob(jobID string) []string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	var ids []string
+	for _, ji := range h.state.JobItems {
+		if ji.JobId == jobID {
+			ids = append(ids, ji.Id)
+		}
+	}
+	return ids
+}
+
 // DeleteJobForCaller removes a sync job and its job items if the caller owns the job or is admin.
 func (h *Handler) DeleteJobForCaller(ctx context.Context, jobID, callerID string, isAdmin bool) (found, allowed bool) {
 	h.mu.Lock()
@@ -244,6 +285,7 @@ func (h *Handler) DeleteJobForCaller(ctx context.Context, jobID, callerID string
 	if !callerCanAccessJob(h.state.Jobs[idx], callerID, isAdmin) {
 		return true, false
 	}
+	snapshot := cloneSyncState(h.state)
 	h.state.Jobs = append(h.state.Jobs[:idx], h.state.Jobs[idx+1:]...)
 	keptItems := make([]SyncJobItem, 0, len(h.state.JobItems))
 	for _, ji := range h.state.JobItems {
@@ -252,7 +294,9 @@ func (h *Handler) DeleteJobForCaller(ctx context.Context, jobID, callerID string
 		}
 	}
 	h.state.JobItems = keptItems
-	h.saveStateLocked(ctx)
+	if err := h.saveStateLocked(ctx); err != nil {
+		h.state = snapshot
+	}
 	return true, true
 }
 
@@ -270,9 +314,12 @@ func (h *Handler) DeleteJobItemForCaller(ctx context.Context, itemID, callerID s
 					return true, false
 				}
 			}
+			snapshot := cloneSyncState(h.state)
 			h.state.JobItems = append(h.state.JobItems[:i], h.state.JobItems[i+1:]...)
 			h.recomputeJobLocked(jobID)
-			h.saveStateLocked(ctx)
+			if err := h.saveStateLocked(ctx); err != nil {
+				h.state = snapshot
+			}
 			return true, true
 		}
 	}
@@ -293,13 +340,16 @@ func (h *Handler) SetJobItemRemovalForCaller(ctx context.Context, itemID string,
 					return true, false
 				}
 			}
+			snapshot := cloneSyncState(h.state)
 			if remove {
 				h.state.JobItems[i].Status = "Removing"
 			} else {
 				h.state.JobItems[i].Status = "Synced"
 			}
 			h.recomputeJobLocked(jobID)
-			h.saveStateLocked(ctx)
+			if err := h.saveStateLocked(ctx); err != nil {
+				h.state = snapshot
+			}
 			return true, true
 		}
 	}
@@ -353,11 +403,15 @@ func (h *Handler) CancelItemsForCaller(ctx context.Context, targetID string, ite
 	}
 
 	if removedCount > 0 {
+		snapshot := cloneSyncState(h.state)
 		h.state.JobItems = remaining
 		for jid := range affectedJobs {
 			h.recomputeJobLocked(jid)
 		}
-		h.saveStateLocked(ctx)
+		if err := h.saveStateLocked(ctx); err != nil {
+			h.state = snapshot
+			return err
+		}
 	}
 	if removedCount == 0 && deniedCount > 0 {
 		return ErrForbidden
@@ -528,6 +582,19 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("ItemIds exceeds maximum limit of %d per sync job", maxSyncJobItemIDs))
 		return
 	}
+	if len([]rune(strings.TrimSpace(req.Name))) > maxSyncJobNameLen ||
+		len([]rune(strings.TrimSpace(req.TargetId))) > maxSyncFieldLen ||
+		len([]rune(strings.TrimSpace(req.Category))) > maxSyncFieldLen ||
+		len([]rune(strings.TrimSpace(req.ParentId))) > maxSyncFieldLen ||
+		len([]rune(strings.TrimSpace(req.Quality))) > maxSyncQualityLen ||
+		len([]rune(strings.TrimSpace(req.Profile))) > maxSyncQualityLen {
+		httpx.Error(w, http.StatusBadRequest, "sync job field exceeds maximum length")
+		return
+	}
+	if req.Bitrate < 0 || req.ItemLimit < 0 {
+		httpx.Error(w, http.StatusBadRequest, "Bitrate and ItemLimit must be non-negative")
+		return
+	}
 	if req.TargetId == "" {
 		req.TargetId = "local-device"
 	}
@@ -613,23 +680,8 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if callerUser != nil && !callerUser.IsAdmin && !callerUser.Policy.IsAdministrator {
-				if rec.LibraryID != "" && !callerUser.Policy.EnableAllFolders {
-					normLib := guid.Normalize(rec.LibraryID)
-					allowed := false
-					for _, fid := range callerUser.Policy.EnabledFolders {
-						if guid.Normalize(fid) == normLib {
-							allowed = true
-							break
-						}
-					}
-					if !allowed {
-						httpx.Error(w, http.StatusForbidden, "access denied to item library")
-						return
-					}
-				}
-				blocked, bErr := libRepo.IsItemBlockedByParentalPolicy(r.Context(), rec, callerUser.Policy.MaxParentalRating, callerUser.Policy.BlockedTags)
-				if bErr != nil || blocked {
-					httpx.Error(w, http.StatusForbidden, "item blocked by parental control policy")
+				if !h.canUserAccessItemRecord(r.Context(), libRepo, callerUser, rec) {
+					httpx.Error(w, http.StatusForbidden, "access denied to requested item")
 					return
 				}
 			}
@@ -671,9 +723,26 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	job.ItemCount = len(createdItems)
 
 	h.mu.Lock()
+	if job.UserId != "" {
+		userJobCount := 0
+		for _, existing := range h.state.Jobs {
+			if guid.Normalize(existing.UserId) == job.UserId {
+				userJobCount++
+			}
+		}
+		if userJobCount >= maxSyncJobsPerUser {
+			h.mu.Unlock()
+			httpx.Error(w, http.StatusTooManyRequests, fmt.Sprintf("maximum number of sync jobs (%d) per user reached", maxSyncJobsPerUser))
+			return
+		}
+	}
+	snapshot := cloneSyncState(h.state)
 	h.state.Jobs = append(h.state.Jobs, job)
 	h.state.JobItems = append(h.state.JobItems, createdItems...)
 	err := h.saveStateLocked(r.Context())
+	if err != nil {
+		h.state = snapshot
+	}
 	h.mu.Unlock()
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to persist sync job")
@@ -727,6 +796,23 @@ func (h *Handler) handleUpdateJob(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid sync job update payload")
 		return
 	}
+	if len([]rune(strings.TrimSpace(req.Name))) > maxSyncJobNameLen ||
+		len([]rune(strings.TrimSpace(req.Quality))) > maxSyncQualityLen {
+		httpx.Error(w, http.StatusBadRequest, "sync job field exceeds maximum length")
+		return
+	}
+	if req.Bitrate != nil && *req.Bitrate < 0 {
+		httpx.Error(w, http.StatusBadRequest, "Bitrate must be non-negative")
+		return
+	}
+	if req.ItemLimit != nil && *req.ItemLimit < 0 {
+		httpx.Error(w, http.StatusBadRequest, "ItemLimit must be non-negative")
+		return
+	}
+	if req.Status != "" && !isValidSyncJobStatus(req.Status) {
+		httpx.Error(w, http.StatusBadRequest, "invalid sync job Status")
+		return
+	}
 
 	callerID, isAdmin, hasAuth := callerAuth(r)
 
@@ -738,6 +824,7 @@ func (h *Handler) handleUpdateJob(w http.ResponseWriter, r *http.Request) {
 				httpx.Error(w, http.StatusForbidden, "forbidden")
 				return
 			}
+			prevJob := h.state.Jobs[i]
 			if req.Name != "" {
 				h.state.Jobs[i].Name = req.Name
 			}
@@ -762,6 +849,9 @@ func (h *Handler) handleUpdateJob(w http.ResponseWriter, r *http.Request) {
 			h.state.Jobs[i].DateLastModified = time.Now().UTC()
 			updated := h.state.Jobs[i]
 			err := h.saveStateLocked(r.Context())
+			if err != nil {
+				h.state.Jobs[i] = prevJob
+			}
 			h.mu.Unlock()
 			if err != nil {
 				httpx.Error(w, http.StatusInternalServerError, "failed to persist sync job")
@@ -798,6 +888,7 @@ func (h *Handler) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusNotFound, "sync job not found")
 		return
 	}
+	snapshot := cloneSyncState(h.state)
 	h.state.Jobs = keptJobs
 
 	keptItems := make([]SyncJobItem, 0, len(h.state.JobItems))
@@ -807,8 +898,15 @@ func (h *Handler) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	h.state.JobItems = keptItems
-	h.saveStateLocked(r.Context())
+	err := h.saveStateLocked(r.Context())
+	if err != nil {
+		h.state = snapshot
+	}
 	h.mu.Unlock()
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to persist sync state")
+		return
+	}
 	httpx.NoContent(w)
 }
 
@@ -883,10 +981,18 @@ func (h *Handler) handleDeleteJobItem(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+			snapshot := cloneSyncState(h.state)
 			h.state.JobItems = append(h.state.JobItems[:i], h.state.JobItems[i+1:]...)
 			h.recomputeJobLocked(jobID)
-			h.saveStateLocked(r.Context())
+			err := h.saveStateLocked(r.Context())
+			if err != nil {
+				h.state = snapshot
+			}
 			h.mu.Unlock()
+			if err != nil {
+				httpx.Error(w, http.StatusInternalServerError, "failed to persist sync state")
+				return
+			}
 			httpx.NoContent(w)
 			return
 		}
@@ -909,11 +1015,19 @@ func (h *Handler) handleMarkTransferred(w http.ResponseWriter, r *http.Request) 
 					return
 				}
 			}
+			snapshot := cloneSyncState(h.state)
 			h.state.JobItems[i].Status = "Synced"
 			h.state.JobItems[i].Progress = 100
 			h.recomputeJobLocked(h.state.JobItems[i].JobId)
-			h.saveStateLocked(r.Context())
+			err := h.saveStateLocked(r.Context())
+			if err != nil {
+				h.state = snapshot
+			}
 			h.mu.Unlock()
+			if err != nil {
+				httpx.Error(w, http.StatusInternalServerError, "failed to persist sync state")
+				return
+			}
 			httpx.NoContent(w)
 			return
 		}
@@ -936,11 +1050,19 @@ func (h *Handler) handleEnableJobItem(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+			snapshot := cloneSyncState(h.state)
 			h.state.JobItems[i].Status = "ReadyToTransfer"
 			h.state.JobItems[i].Progress = 0
 			h.recomputeJobLocked(h.state.JobItems[i].JobId)
-			h.saveStateLocked(r.Context())
+			err := h.saveStateLocked(r.Context())
+			if err != nil {
+				h.state = snapshot
+			}
 			h.mu.Unlock()
+			if err != nil {
+				httpx.Error(w, http.StatusInternalServerError, "failed to persist sync state")
+				return
+			}
 			httpx.NoContent(w)
 			return
 		}
@@ -969,11 +1091,41 @@ func (h *Handler) resolveCallerUserForSync(r *http.Request, callerID string) (*s
 	return nil, false
 }
 
-func canUserAccessItemRecord(ctx context.Context, libRepo *sqlite.LibraryRepo, callerUser *sqlite.UserRecord, rec *sqlite.ItemRecord) bool {
+func (h *Handler) isPlaylistPublic(ctx context.Context, itemID string) bool {
+	if h.store == nil {
+		return false
+	}
+	normID := guid.Normalize(itemID)
+	if normID == "" {
+		return false
+	}
+	var raw string
+	err := h.store.Reader.QueryRowContext(ctx,
+		`SELECT value_json FROM server_config WHERE key = ?`,
+		"item_visibility_"+normID,
+	).Scan(&raw)
+	if err != nil {
+		return false
+	}
+	var vis struct {
+		IsPublic bool `json:"IsPublic"`
+	}
+	return json.Unmarshal([]byte(raw), &vis) == nil && vis.IsPublic
+}
+
+func (h *Handler) canUserAccessItemRecord(ctx context.Context, libRepo *sqlite.LibraryRepo, callerUser *sqlite.UserRecord, rec *sqlite.ItemRecord) bool {
 	if callerUser == nil || rec == nil || callerUser.IsAdmin || callerUser.Policy.IsAdministrator {
 		return true
 	}
-	if rec.LibraryID != "" && !callerUser.Policy.EnableAllFolders {
+	if strings.EqualFold(rec.Type, "Playlist") {
+		ownerID := guid.Normalize(rec.ParentID)
+		callerID := guid.Normalize(callerUser.ID)
+		if ownerID != callerID {
+			if !h.isPlaylistPublic(ctx, rec.ID) {
+				return false
+			}
+		}
+	} else if rec.LibraryID != "" && !callerUser.Policy.EnableAllFolders {
 		normLib := guid.Normalize(rec.LibraryID)
 		allowed := false
 		for _, fid := range callerUser.Policy.EnabledFolders {
@@ -1004,6 +1156,10 @@ func (h *Handler) handleReadyItems(w http.ResponseWriter, r *http.Request) {
 		u, ok := h.resolveCallerUserForSync(r, callerID)
 		if !ok {
 			httpx.Error(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		if !u.IsAdmin && !u.Policy.IsAdministrator && !u.Policy.EnableContentDownloading {
+			httpx.Error(w, http.StatusForbidden, "content downloading is disabled")
 			return
 		}
 		callerUser = u
@@ -1058,7 +1214,7 @@ func (h *Handler) handleReadyItems(w http.ResponseWriter, r *http.Request) {
 		if libRepo != nil {
 			if hasAuth && !isAdmin {
 				rec, recErr := libRepo.GetItemRecordByID(r.Context(), entry.ItemId)
-				if recErr != nil || rec == nil || !canUserAccessItemRecord(r.Context(), libRepo, callerUser, rec) {
+				if recErr != nil || rec == nil || !h.canUserAccessItemRecord(r.Context(), libRepo, callerUser, rec) {
 					continue
 				}
 			}

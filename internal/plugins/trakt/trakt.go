@@ -29,6 +29,7 @@ const (
 	defaultTimeout             = 10 * time.Second
 	defaultPauseThrottleWindow = 60 * time.Second
 	defaultCompleteDedupWindow = 2 * time.Minute
+	defaultUserDataSettleDelay = 50 * time.Millisecond
 	scrobbleCompletionPct      = 80.0
 	traktAPIVersion            = "2"
 	maxErrBodyPreview          = 1024
@@ -46,7 +47,6 @@ type Plugin struct {
 	clientID         string
 	accessToken      string
 	allowedUserID    string
-	boundUserID      string
 	scrobblePlayback bool
 	syncWatched      bool
 	priority         int
@@ -56,6 +56,7 @@ type Plugin struct {
 	stateMu             sync.Mutex
 	pausedAt            map[string]time.Time
 	completedAt         map[string]time.Time
+	stopInFlight        map[string]chan struct{}
 	pauseThrottleWindow time.Duration
 	completeDedupWindow time.Duration
 	nowFunc             func() time.Time
@@ -84,6 +85,7 @@ func New() *Plugin {
 		client:              netutil.NewSafeHTTPClient(defaultTimeout, false),
 		pausedAt:            make(map[string]time.Time),
 		completedAt:         make(map[string]time.Time),
+		stopInFlight:        make(map[string]chan struct{}),
 		pauseThrottleWindow: defaultPauseThrottleWindow,
 		completeDedupWindow: defaultCompleteDedupWindow,
 		nowFunc:             time.Now,
@@ -131,6 +133,14 @@ func (p *Plugin) Manifest() plugins.Manifest {
 	}
 }
 
+func urlHostLower(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(u.Host))
+}
+
 // Configure updates plugin configuration in a thread-safe manner.
 func (p *Plugin) Configure(cfg map[string]any) error {
 	if cfg == nil {
@@ -142,15 +152,18 @@ func (p *Plugin) Configure(cfg map[string]any) error {
 	if v, ok := firstBool(cfg, "enabled", "Enabled"); ok {
 		p.enabled = v
 	}
+	hasNewClientID := false
+	hasNewAccessToken := false
 	if v, ok := firstString(cfg, "client_id", "ClientId", "trakt_client_id"); ok {
 		p.clientID = strings.TrimSpace(v)
+		hasNewClientID = true
 	}
 	if v, ok := firstString(cfg, "access_token", "AccessToken", "trakt_access_token"); ok {
 		p.accessToken = strings.TrimSpace(v)
+		hasNewAccessToken = true
 	}
 	if v, ok := firstString(cfg, "user_id", "UserId", "UserID", "allowed_user_id", "AllowedUserId"); ok {
 		p.allowedUserID = strings.TrimSpace(v)
-		p.boundUserID = ""
 	}
 	if v, ok := firstBool(cfg, "scrobble_playback", "ScrobblePlayback"); ok {
 		p.scrobblePlayback = v
@@ -166,6 +179,14 @@ func (p *Plugin) Configure(cfg map[string]any) error {
 			u, err := url.Parse(trimmed)
 			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 				return fmt.Errorf("trakt: invalid base_url %q: must be http(s) URL", v)
+			}
+			if urlHostLower(trimmed) != urlHostLower(p.baseURL) {
+				if !hasNewClientID {
+					p.clientID = ""
+				}
+				if !hasNewAccessToken {
+					p.accessToken = ""
+				}
 			}
 			p.baseURL = trimmed
 		}
@@ -444,19 +465,15 @@ func postTrakt(ctx context.Context, snap configSnapshot, endpoint string, payloa
 
 func (p *Plugin) shouldReportForUser(userID string) bool {
 	uid := strings.TrimSpace(userID)
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.allowedUserID != "" {
-		return uid != "" && strings.EqualFold(uid, p.allowedUserID)
+	p.mu.RLock()
+	allowed := p.allowedUserID
+	p.mu.RUnlock()
+	if allowed == "" {
+		// Require an explicit user_id binding rather than silently binding to whichever
+		// user happens to play first after a restart.
+		return false
 	}
-	if uid == "" {
-		return true
-	}
-	if p.boundUserID == "" {
-		p.boundUserID = uid
-		return true
-	}
-	return strings.EqualFold(uid, p.boundUserID)
+	return uid != "" && strings.EqualFold(uid, allowed)
 }
 
 func userItemKey(userID, itemID string) string {
@@ -543,6 +560,49 @@ func (p *Plugin) wasRecentlyScrobbleCompleted(userID, itemID string) bool {
 	return false
 }
 
+func (p *Plugin) beginInFlightStop(userID, itemID string) func() {
+	key := userItemKey(userID, itemID)
+	ch := make(chan struct{})
+	p.stateMu.Lock()
+	if p.stopInFlight == nil {
+		p.stopInFlight = make(map[string]chan struct{})
+	}
+	prev := p.stopInFlight[key]
+	p.stopInFlight[key] = ch
+	p.stateMu.Unlock()
+	if prev != nil {
+		select {
+		case <-prev:
+		default:
+		}
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			p.stateMu.Lock()
+			if p.stopInFlight[key] == ch {
+				delete(p.stopInFlight, key)
+			}
+			p.stateMu.Unlock()
+			close(ch)
+		})
+	}
+}
+
+func (p *Plugin) waitInFlightStop(ctx context.Context, userID, itemID string) {
+	key := userItemKey(userID, itemID)
+	p.stateMu.Lock()
+	ch := p.stopInFlight[key]
+	p.stateMu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ch:
+	case <-ctx.Done():
+	}
+}
+
 // SubscribeEvents registers EventBus handlers for playback scrobbling and watched-history sync.
 // Calling the returned function stops the plugin from processing subsequent events.
 func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) func() {
@@ -569,14 +629,16 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 		}()
 	}
 
-	enqueue := func(fn func()) {
+	enqueue := func(fn func()) bool {
 		if unsubscribed.Load() {
-			return
+			return false
 		}
 		select {
 		case jobs <- fn:
+			return true
 		default:
 			// Drop when queue is saturated rather than spawning unbounded goroutines.
+			return false
 		}
 	}
 
@@ -648,7 +710,9 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 		if ev.played || computeProgress(ev.positionTicks, ev.runtimeTicks, nil) >= scrobbleCompletionPct {
 			p.markScrobbleCompleted(ev.userID, ev.itemID)
 		}
-		enqueue(func() {
+		finishStop := p.beginInFlightStop(ev.userID, ev.itemID)
+		if !enqueue(func() {
+			defer finishStop()
 			ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 			defer cancel()
 			item, series := lookupItemAndSeries(ctx, repo, ev.itemID)
@@ -665,7 +729,9 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 				p.markScrobbleCompleted(ev.userID, ev.itemID)
 			}
 			_ = p.ScrobbleStop(ctx, item, series, pct)
-		})
+		}) {
+			finishStop()
+		}
 	})
 
 	bus.Subscribe(eventbus.EventUserDataChanged, func(_ context.Context, e eventbus.Event) {
@@ -680,10 +746,28 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 			if p.wasRecentlyScrobbleCompleted(entry.userID, entry.itemID) {
 				continue
 			}
+			userID := entry.userID
 			itemID := entry.itemID
 			enqueue(func() {
 				ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 				defer cancel()
+				// EventBus dispatches EventPlaybackStop and EventUserDataChanged in independent
+				// goroutines. Briefly settle so a concurrent EventPlaybackStop handler can
+				// register its in-flight stop marker or completion timestamp before we check dedup.
+				timer := time.NewTimer(defaultUserDataSettleDelay)
+				select {
+				case <-timer.C:
+				case <-stopCh:
+					timer.Stop()
+					return
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				}
+				p.waitInFlightStop(ctx, userID, itemID)
+				if p.wasRecentlyScrobbleCompleted(userID, itemID) {
+					return
+				}
 				item, series := lookupItemAndSeries(ctx, repo, itemID)
 				if item == nil {
 					return

@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query'
 import { Loader2, ShieldAlert } from 'lucide-react'
-import { HashRouter, Link, Navigate, Route, Routes } from 'react-router-dom'
+import { HashRouter, Link, Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { api } from './api/client'
 import { Layout } from './components/Layout'
 import { ScrollToTop } from './components/ScrollToTop'
@@ -97,7 +97,9 @@ function RequireAdmin({ children }: { children: React.ReactNode }) {
 
 function AppRoutes() {
   const { auth } = useAuth()
+  const location = useLocation()
   const demoActive = isDemoMode()
+  const isSwitchAccount = new URLSearchParams(location.search).get('switch') === '1'
 
   const { data: setupStatus, isLoading: setupLoading } = useQuery({
     queryKey: ['setupStatus'],
@@ -115,7 +117,7 @@ function AppRoutes() {
       <Route
         path="/login"
         element={
-          auth ? (
+          auth && !isSwitchAccount ? (
             <Navigate to="/" replace />
           ) : waitingSetupStatus ? (
             <SetupLoadingScreen />

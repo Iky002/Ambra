@@ -226,6 +226,16 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 	}
+
+	var v5 int
+	if err := s.Writer.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 5`).Scan(&v5); err != nil {
+		return err
+	}
+	if v5 == 0 {
+		if err := s.applyMigrationV5(ctx); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -329,6 +339,74 @@ func (s *Store) applyMigrationV4(ctx context.Context) error {
 		time.Now().Unix(),
 	); err != nil {
 		return fmt.Errorf("migration 004 record version: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+func (s *Store) applyMigrationV5(ctx context.Context) error {
+	tx, err := s.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Safely deduplicate any pre-existing case-insensitive duplicate usernames before adding unique index.
+	type userRow struct {
+		rowid int64
+		id    string
+		name  string
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT rowid, id, name FROM users ORDER BY created_at ASC, rowid ASC`)
+	if err != nil {
+		return fmt.Errorf("migration 005 list users: %w", err)
+	}
+	var allUsers []userRow
+	for rows.Next() {
+		var u userRow
+		if err := rows.Scan(&u.rowid, &u.id, &u.name); err != nil {
+			rows.Close()
+			return fmt.Errorf("migration 005 scan user: %w", err)
+		}
+		allUsers = append(allUsers, u)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("migration 005 iter users: %w", err)
+	}
+	rows.Close()
+
+	seenLower := make(map[string]struct{}, len(allUsers))
+	for _, u := range allUsers {
+		low := strings.ToLower(u.name)
+		if _, dup := seenLower[low]; !dup {
+			seenLower[low] = struct{}{}
+			continue
+		}
+		candidate := fmt.Sprintf("%s_dup_%d", u.name, u.rowid)
+		for suffix := 1; ; suffix++ {
+			if _, exists := seenLower[strings.ToLower(candidate)]; !exists {
+				break
+			}
+			candidate = fmt.Sprintf("%s_dup_%d_%d", u.name, u.rowid, suffix)
+		}
+		seenLower[strings.ToLower(candidate)] = struct{}{}
+		if _, err := tx.ExecContext(ctx, `UPDATE users SET name = ? WHERE id = ?`, candidate, u.id); err != nil {
+			return fmt.Errorf("migration 005 rename duplicate user %s: %w", u.id, err)
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `DROP INDEX IF EXISTS idx_users_name_nocase`); err != nil {
+		return fmt.Errorf("migration 005 drop old index: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_users_name_nocase_unique ON users(LOWER(name))`); err != nil {
+		return fmt.Errorf("migration 005 create unique index: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (5, ?)`,
+		time.Now().Unix(),
+	); err != nil {
+		return fmt.Errorf("migration 005 record version: %w", err)
 	}
 
 	return tx.Commit()

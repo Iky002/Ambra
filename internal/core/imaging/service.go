@@ -200,7 +200,7 @@ func (s *Service) getImageFromRecord(ctx context.Context, rec *sqlite.ImageRecor
 			return payload, nil
 		}
 
-		release, err := s.acquireDecodeSlot(ctx)
+		release, err := s.acquireDecodeSlot(context.WithoutCancel(ctx))
 		if err != nil {
 			return nil, err
 		}

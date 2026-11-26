@@ -68,11 +68,15 @@ type Handler struct {
 	auth             AuthFuncs
 
 	backupMu      sync.Mutex
-	webhookOnce   sync.Once
+	setupMu       sync.Mutex
+	webhookMu     sync.Mutex
+	webhookClosed bool
+	webhookWG     sync.WaitGroup
 	webhookCh     chan webhookDispatchJob
 
-	mu    sync.RWMutex
-	state opsState
+	mu             sync.RWMutex
+	state          opsState
+	partyJoinFails map[string]*partyFailWindow
 }
 
 func New(store *sqlite.Store, cfg *config.Config, userRepo *sqlite.UserRepo, bus *eventbus.Bus) *Handler {
@@ -81,7 +85,8 @@ func New(store *sqlite.Store, cfg *config.Config, userRepo *sqlite.UserRepo, bus
 		cfg:        cfg,
 		userRepo:   userRepo,
 		bus:        bus,
-		httpClient: netutil.NewSafeHTTPClientNoLoopback(10*time.Second, true),
+		httpClient:     netutil.NewSafeHTTPClientNoLoopback(10*time.Second, true),
+		partyJoinFails: make(map[string]*partyFailWindow),
 		state: opsState{
 			Startup: StartupConfiguration{
 				ServerName:                "Ambra Media Server",

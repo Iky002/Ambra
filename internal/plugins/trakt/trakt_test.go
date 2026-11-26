@@ -513,18 +513,20 @@ func TestSubscribeEventsIntegration(t *testing.T) {
 	})
 	assertNoReq(t, ch, 100*time.Millisecond)
 
-	// Enable plugin
+	// Enable plugin (explicitly bound to user u1)
 	_ = p.Configure(map[string]any{
 		"enabled":      true,
 		"client_id":    "bus-cid",
 		"access_token": "bus-tok",
 		"base_url":     srv.URL,
+		"user_id":      "u1",
 	})
 
 	// 1. EventPlaybackStart (session.PlaybackEventPayload) for Movie at 25%
 	bus.Publish(ctx, eventbus.Event{
 		Type: eventbus.EventPlaybackStart,
 		Payload: session.PlaybackEventPayload{
+			UserId:        "u1",
 			ItemId:        movie.ID,
 			PositionTicks: 2_500_000_000,
 		},
@@ -539,6 +541,7 @@ func TestSubscribeEventsIntegration(t *testing.T) {
 	bus.Publish(ctx, eventbus.Event{
 		Type: eventbus.EventPlaybackProgress,
 		Payload: session.PlaybackEventPayload{
+			UserId:        "u1",
 			ItemId:        ep.ID,
 			PositionTicks: 1_800_000_000,
 			RuntimeTicks:  3_600_000_000,
@@ -559,6 +562,7 @@ func TestSubscribeEventsIntegration(t *testing.T) {
 	bus.Publish(ctx, eventbus.Event{
 		Type: eventbus.EventPlaybackProgress,
 		Payload: map[string]any{
+			"user_id":        "u1",
 			"item_id":        ep.ID,
 			"position_ticks": int64(2_000_000_000),
 			"is_paused":      false,
@@ -570,6 +574,7 @@ func TestSubscribeEventsIntegration(t *testing.T) {
 	bus.Publish(ctx, eventbus.Event{
 		Type: eventbus.EventPlaybackStop,
 		Payload: &session.PlaybackEventPayload{
+			UserId:        "u1",
 			ItemId:        movie.ID,
 			PositionTicks: 0,
 			Played:        true,
@@ -605,6 +610,7 @@ func TestSubscribeEventsIntegration(t *testing.T) {
 	bus.Publish(ctx, eventbus.Event{
 		Type: eventbus.EventUserDataChanged,
 		Payload: map[string]any{
+			"user_id": "u1",
 			"item_id": movie.ID,
 			"played":  true,
 		},
@@ -627,6 +633,7 @@ func TestSubscribeEventsIntegration(t *testing.T) {
 	bus.Publish(ctx, eventbus.Event{
 		Type: eventbus.EventUserDataChanged,
 		Payload: map[string]any{
+			"user_id": "u1",
 			"item_id": movie2.ID,
 			"played":  true,
 		},

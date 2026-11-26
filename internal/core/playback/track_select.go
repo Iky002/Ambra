@@ -1,6 +1,7 @@
 package playback
 
 import (
+	"path/filepath"
 	"strings"
 
 	"github.com/ambra-media/ambra/internal/api/dto"
@@ -137,9 +138,11 @@ func selectAudioTrack(
 	if cfg != nil {
 		rawPref := strings.ToLower(strings.TrimSpace(cfg.AudioLanguagePreference))
 		if rawPref != "" && rawPref != "media" {
-			targetLang := rawPref
+			var targetLang string
 			if rawPref == "auto" {
 				targetLang = LocaleToTrackLang(serverDefaultLang)
+			} else {
+				targetLang = LocaleToTrackLang(rawPref)
 			}
 			if targetLang != "" {
 				if picked := pickBestAudioByLang(streams, targetLang); picked != nil {
@@ -376,8 +379,12 @@ func detectSubChineseVariant(st dto.MediaStream) string {
 		return "bilingual"
 	}
 
+	basePath := strings.TrimSpace(st.Path)
+	if basePath != "" {
+		basePath = filepath.Base(strings.ReplaceAll(basePath, "\\", "/"))
+	}
 	combined := strings.ToLower(strings.Join([]string{
-		st.Language, st.DisplayLanguage, st.Title, st.DisplayTitle, st.Path,
+		st.Language, st.DisplayLanguage, st.Title, st.DisplayTitle, basePath,
 	}, " "))
 
 	hasBilingual := strings.Contains(combined, "双语") ||
@@ -390,6 +397,9 @@ func detectSubChineseVariant(st dto.MediaStream) string {
 		strings.Contains(combined, "簡繁") ||
 		strings.Contains(combined, "bilingual")
 
+	allowShortTokens := !isExplicitNonChineseLang(st.Language) && !hasExplicitNonChineseSubtitleMarker(combined)
+	shortTokenText := stripNonChineseRegionPairs(combined)
+
 	hasCHS := strings.Contains(combined, "简体") ||
 		strings.Contains(combined, "簡體") ||
 		strings.Contains(combined, "简中") ||
@@ -397,9 +407,8 @@ func detectSubChineseVariant(st dto.MediaStream) string {
 		strings.Contains(combined, "zh-hans") ||
 		strings.Contains(combined, "zh-sg") ||
 		containsWordToken(combined, "chs") ||
-		containsWordToken(combined, "sc") ||
-		containsWordToken(combined, "gb") ||
-		containsWordToken(combined, "hans")
+		containsWordToken(combined, "hans") ||
+		(allowShortTokens && (containsWordToken(shortTokenText, "sc") || containsWordToken(shortTokenText, "gb")))
 
 	hasCHT := strings.Contains(combined, "繁体") ||
 		strings.Contains(combined, "繁體") ||
@@ -410,9 +419,9 @@ func detectSubChineseVariant(st dto.MediaStream) string {
 		strings.Contains(combined, "zh-hk") ||
 		strings.Contains(combined, "zh-hant") ||
 		containsWordToken(combined, "cht") ||
-		containsWordToken(combined, "tc") ||
 		containsWordToken(combined, "big5") ||
-		containsWordToken(combined, "hant")
+		containsWordToken(combined, "hant") ||
+		(allowShortTokens && containsWordToken(shortTokenText, "tc"))
 
 	if hasBilingual {
 		return "bilingual"
@@ -427,6 +436,49 @@ func detectSubChineseVariant(st dto.MediaStream) string {
 		return "bilingual"
 	}
 	return ""
+}
+
+func isExplicitNonChineseLang(lang string) bool {
+	l := strings.ToLower(strings.TrimSpace(lang))
+	if l == "" || l == "und" || l == "mul" || l == "unknown" || l == "zxx" {
+		return false
+	}
+	switch LocaleToTrackLang(l) {
+	case "", "chs", "cht", "chi", "zho", "zh", "cmn", "yue", "und", "mul", "unknown":
+		return false
+	default:
+		return true
+	}
+}
+
+func hasExplicitNonChineseSubtitleMarker(combined string) bool {
+	if strings.Contains(combined, "中文") || strings.Contains(combined, "chinese") ||
+		strings.Contains(combined, "国语") || strings.Contains(combined, "國語") ||
+		strings.Contains(combined, "粤语") || strings.Contains(combined, "粵語") {
+		return false
+	}
+	for _, kw := range []string{"en-gb", "en_gb", "en.gb", "english", "japanese", "korean", "french", "german", "spanish"} {
+		if strings.Contains(combined, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+var nonChineseRegionReplacer = strings.NewReplacer(
+	"en-gb", " ",
+	"en_gb", " ",
+	"en.gb", " ",
+	"cy-gb", " ",
+	"cy_gb", " ",
+	"gd-gb", " ",
+	"gd_gb", " ",
+	"kw-gb", " ",
+	"kw_gb", " ",
+)
+
+func stripNonChineseRegionPairs(s string) string {
+	return nonChineseRegionReplacer.Replace(s)
 }
 
 func matchesTrackLanguage(st dto.MediaStream, targetLang string) bool {

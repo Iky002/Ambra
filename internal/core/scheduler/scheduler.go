@@ -141,8 +141,9 @@ func (m *Manager) SetTickInterval(d time.Duration) {
 	m.tickInterval = d
 }
 
-// Start launches the background scheduling loop that periodically evaluates IntervalTrigger,
-// DailyTrigger, and WeeklyTrigger definitions and executes due tasks until ctx is cancelled.
+// Start launches the background scheduling loop that fires StartupTrigger tasks on launch
+// and periodically evaluates IntervalTrigger, DailyTrigger, and WeeklyTrigger definitions
+// until ctx is cancelled.
 func (m *Manager) Start(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -159,6 +160,12 @@ func (m *Manager) Start(ctx context.Context) {
 
 	go func() {
 		defer m.started.Store(false)
+		if ctx.Err() != nil {
+			m.StopAll()
+			return
+		}
+		m.runStartupTasks()
+
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
@@ -172,6 +179,33 @@ func (m *Manager) Start(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+func (m *Manager) runStartupTasks() {
+	m.mu.RLock()
+	nowFn := m.nowFn
+	m.mu.RUnlock()
+	now := nowFn()
+
+	var startupIDs []string
+	m.mu.Lock()
+	for _, mt := range m.tasks {
+		if mt.state != StateIdle {
+			continue
+		}
+		for _, tr := range mt.def.Triggers {
+			if strings.TrimSpace(tr.Type) == "StartupTrigger" {
+				mt.lastScheduledAt = now
+				startupIDs = append(startupIDs, mt.def.ID)
+				break
+			}
+		}
+	}
+	m.mu.Unlock()
+
+	for _, id := range startupIDs {
+		_ = m.Run(id)
+	}
 }
 
 // StopAll cancels the context of every currently running scheduled task.

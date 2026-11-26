@@ -24,6 +24,7 @@ import { useI18n } from '../i18n/I18nContext'
 import { AdminModal, FeedbackBanner } from './admin/adminUtils'
 
 type CollectionTab = 'BoxSet' | 'Playlist'
+const COLLECTIONS_PAGE_SIZE = 48
 
 export function CollectionsPage() {
   const { id: selectedId } = useParams<{ id: string }>()
@@ -35,6 +36,8 @@ export function CollectionsPage() {
   const queryClient = useQueryClient()
 
   const [activeTab, setActiveTab] = useState<CollectionTab>('BoxSet')
+  const [boxSetLimit, setBoxSetLimit] = useState(COLLECTIONS_PAGE_SIZE)
+  const [playlistLimit, setPlaylistLimit] = useState(COLLECTIONS_PAGE_SIZE)
   const [createOpen, setCreateOpen] = useState(false)
   const [createType, setCreateType] = useState<CollectionTab>('BoxSet')
   const [newName, setNewName] = useState('')
@@ -46,37 +49,43 @@ export function CollectionsPage() {
   const {
     data: boxSetsData,
     isLoading: boxSetsLoading,
+    isFetching: boxSetsFetching,
     isError: boxSetsError,
     error: boxSetsErr,
     refetch: refetchBoxSets,
   } = useQuery({
-    queryKey: ['collections', userId, 'BoxSet'],
+    queryKey: ['collections', userId, 'BoxSet', boxSetLimit],
     queryFn: () =>
       api.getItems(userId, {
         includeItemTypes: 'BoxSet',
         recursive: true,
         sortBy: 'SortName',
         sortOrder: 'Ascending',
-        limit: 100,
+        startIndex: 0,
+        limit: boxSetLimit,
       }),
+    placeholderData: (prev) => prev,
   })
 
   const {
     data: playlistsData,
     isLoading: playlistsLoading,
+    isFetching: playlistsFetching,
     isError: playlistsError,
     error: playlistsErr,
     refetch: refetchPlaylists,
   } = useQuery({
-    queryKey: ['collections', userId, 'Playlist'],
+    queryKey: ['collections', userId, 'Playlist', playlistLimit],
     queryFn: () =>
       api.getItems(userId, {
         includeItemTypes: 'Playlist',
         recursive: true,
         sortBy: 'SortName',
         sortOrder: 'Ascending',
-        limit: 100,
+        startIndex: 0,
+        limit: playlistLimit,
       }),
+    placeholderData: (prev) => prev,
   })
 
   // 详情视图：查询当前选中的合集或播放列表元数据及其成员条目
@@ -245,7 +254,8 @@ export function CollectionsPage() {
                 {selectedContainer?.Name || t('common.loading')}
               </h1>
               <span className="rounded-full bg-white/10 px-2.5 py-0.5 text-xs text-zinc-300">
-                {isSelectedPlaylist ? t('collections.playlists') : t('collections.boxSets')} · {members.length} 部
+                {isSelectedPlaylist ? t('collections.playlists') : t('collections.boxSets')} ·{' '}
+                {memberData?.TotalRecordCount ?? members.length} 部
               </span>
             </div>
             {selectedContainer?.Overview && (
@@ -420,12 +430,17 @@ export function CollectionsPage() {
 
   // ==================== 列表视图 (/collections) ====================
   const boxSets = boxSetsData?.Items || []
+  const boxSetsTotal = boxSetsData?.TotalRecordCount ?? boxSets.length
   const playlists = playlistsData?.Items || []
+  const playlistsTotal = playlistsData?.TotalRecordCount ?? playlists.length
   const activeItems = activeTab === 'BoxSet' ? boxSets : playlists
+  const activeTotal = activeTab === 'BoxSet' ? boxSetsTotal : playlistsTotal
   const isLoading = activeTab === 'BoxSet' ? boxSetsLoading : playlistsLoading
+  const isFetching = activeTab === 'BoxSet' ? boxSetsFetching : playlistsFetching
   const activeIsError = activeTab === 'BoxSet' ? boxSetsError : playlistsError
   const activeError = activeTab === 'BoxSet' ? boxSetsErr : playlistsErr
   const activeRefetch = activeTab === 'BoxSet' ? refetchBoxSets : refetchPlaylists
+  const hasMoreActive = activeItems.length < activeTotal
 
   return (
     <div className="space-y-6 px-4 pt-6 lg:px-8">
@@ -459,7 +474,7 @@ export function CollectionsPage() {
                   activeTab === 'BoxSet' ? 'bg-black/20 text-zinc-950' : 'bg-white/10 text-zinc-300'
                 }`}
               >
-                {boxSets.length}
+                {boxSetsTotal}
               </span>
             </button>
 
@@ -481,7 +496,7 @@ export function CollectionsPage() {
                     : 'bg-white/10 text-zinc-300'
                 }`}
               >
-                {playlists.length}
+                {playlistsTotal}
               </span>
             </button>
           </div>
@@ -544,32 +559,55 @@ export function CollectionsPage() {
           </p>
         </div>
       ) : (
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
-          {activeItems.map((col) => (
-            <div key={col.Id} className="group/col relative">
-              <MediaCard item={col} linkTo={`/collections/${col.Id}`} />
-              {typeof col.ChildCount === 'number' && col.ChildCount > 0 && (
-                <div className="pointer-events-none absolute left-2 top-2 rounded-full bg-black/75 px-2 py-0.5 text-[10px] font-semibold text-amber-300 ring-1 ring-amber-400/40 backdrop-blur-md">
-                  {col.ChildCount} 部
-                </div>
-              )}
-              {(col.Type === 'Playlist' || isAdmin) && (
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.preventDefault()
-                    e.stopPropagation()
-                    setDeleteTarget(col)
-                  }}
-                  title={`删除 ${col.Name}`}
-                  aria-label={`删除 ${col.Name}`}
-                  className="absolute right-2 top-2 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-300 opacity-0 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-red-500 hover:text-white group-hover/col:opacity-100 focus:opacity-100"
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                </button>
-              )}
+        <div className="space-y-6">
+          <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
+            {activeItems.map((col) => (
+              <div key={col.Id} className="group/col relative">
+                <MediaCard item={col} linkTo={`/collections/${col.Id}`} />
+                {typeof col.ChildCount === 'number' && col.ChildCount > 0 && (
+                  <div className="pointer-events-none absolute left-2 top-2 rounded-full bg-black/75 px-2 py-0.5 text-[10px] font-semibold text-amber-300 ring-1 ring-amber-400/40 backdrop-blur-md">
+                    {col.ChildCount} 部
+                  </div>
+                )}
+                {(col.Type === 'Playlist' || isAdmin) && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      setDeleteTarget(col)
+                    }}
+                    title={`删除 ${col.Name}`}
+                    aria-label={`删除 ${col.Name}`}
+                    className="absolute right-2 top-2 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-300 opacity-0 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-red-500 hover:text-white group-hover/col:opacity-100 focus:opacity-100"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+          {hasMoreActive && (
+            <div className="flex justify-center pt-2">
+              <button
+                type="button"
+                disabled={isFetching}
+                onClick={() => {
+                  if (activeTab === 'BoxSet') {
+                    setBoxSetLimit((prev) => prev + COLLECTIONS_PAGE_SIZE)
+                  } else {
+                    setPlaylistLimit((prev) => prev + COLLECTIONS_PAGE_SIZE)
+                  }
+                }}
+                className="inline-flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.05] px-5 py-2.5 text-xs font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:bg-white/10 disabled:opacity-50"
+              >
+                {isFetching && <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-400" />}
+                <span>
+                  加载更多（已显示 {activeItems.length} / {activeTotal}）
+                </span>
+              </button>
             </div>
-          ))}
+          )}
         </div>
       )}
 

@@ -3,6 +3,7 @@ package dlna
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -176,6 +178,63 @@ func (h *Handler) handleConnectionManagerControl(w http.ResponseWriter, r *http.
 	}
 }
 
+func clampRequestedCount(n int) int {
+	if n <= 0 || n > maxDLNARequestedCount {
+		return maxDLNARequestedCount
+	}
+	return n
+}
+
+func (h *Handler) isPublicPlaylist(ctx context.Context, itemID string) bool {
+	if h.store == nil {
+		return false
+	}
+	normID := guid.Normalize(itemID)
+	if normID == "" {
+		return false
+	}
+	var raw string
+	err := h.store.Reader.QueryRowContext(ctx,
+		`SELECT value_json FROM server_config WHERE key = ?`,
+		"item_visibility_"+normID,
+	).Scan(&raw)
+	if err != nil {
+		return false
+	}
+	var vis struct {
+		IsPublic bool `json:"IsPublic"`
+	}
+	return json.Unmarshal([]byte(raw), &vis) == nil && vis.IsPublic
+}
+
+func (h *Handler) isDLNAVisibleItem(ctx context.Context, itemType, itemID string) bool {
+	if strings.EqualFold(strings.TrimSpace(itemType), "Playlist") {
+		return h.isPublicPlaylist(ctx, itemID)
+	}
+	return true
+}
+
+func (h *Handler) privatePlaylistIDs(ctx context.Context, serverID string) []string {
+	if h.libRepo == nil {
+		return nil
+	}
+	playlists, _, err := h.libRepo.QueryItems(ctx, sqlite.ItemFilter{
+		ServerID:         serverID,
+		IncludeItemTypes: []string{"Playlist"},
+		Limit:            maxDLNARequestedCount * 4,
+	})
+	if err != nil || len(playlists) == 0 {
+		return nil
+	}
+	var privateIDs []string
+	for _, pl := range playlists {
+		if !h.isPublicPlaylist(ctx, pl.Id) {
+			privateIDs = append(privateIDs, pl.Id)
+		}
+	}
+	return privateIDs
+}
+
 func (h *Handler) handleBrowse(ctx context.Context, r *http.Request, params map[string]string) (string, error) {
 	objectID := strings.TrimSpace(params["ObjectID"])
 	if objectID == "" {
@@ -190,11 +249,13 @@ func (h *Handler) handleBrowse(ctx context.Context, r *http.Request, params map[
 		startIdx = 0
 	}
 	reqCount, _ := strconv.Atoi(strings.TrimSpace(params["RequestedCount"]))
+	reqCount = clampRequestedCount(reqCount)
 	sortCriteria := strings.TrimSpace(params["SortCriteria"])
 	baseURL := h.baseURL(r)
+	snap := h.cfgSnapshot()
 	serverUUID := strings.TrimSpace(r.PathValue("UuId"))
 	if serverUUID == "" {
-		serverUUID = h.cfg.ServerID
+		serverUUID = snap.ServerID
 	}
 
 	var didlEntries []string
@@ -248,24 +309,41 @@ func (h *Handler) handleSearch(ctx context.Context, r *http.Request, params map[
 		startIdx = 0
 	}
 	reqCount, _ := strconv.Atoi(strings.TrimSpace(params["RequestedCount"]))
+	reqCount = clampRequestedCount(reqCount)
 	sortCriteria := strings.TrimSpace(params["SortCriteria"])
 	baseURL := h.baseURL(r)
+	snap := h.cfgSnapshot()
 	serverUUID := strings.TrimSpace(r.PathValue("UuId"))
 	if serverUUID == "" {
-		serverUUID = h.cfg.ServerID
+		serverUUID = snap.ServerID
 	}
 
 	var didlEntries []string
 	totalMatches := 0
 
 	if h.libRepo != nil {
+		if containerID != "0" {
+			if rec, recErr := h.libRepo.GetItemRecordByID(ctx, containerID); recErr == nil && rec != nil && !h.isDLNAVisibleItem(ctx, rec.Type, rec.ID) {
+				didl := `<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"></DIDL-Lite>`
+				h.mu.RLock()
+				uid := h.systemUpdate
+				h.mu.RUnlock()
+				return fmt.Sprintf(
+					"<Result>%s</Result><NumberReturned>0</NumberReturned><TotalMatches>0</TotalMatches><UpdateID>%d</UpdateID>",
+					xmlEscape(didl), uid,
+				), nil
+			}
+		}
+
 		titleQuery, itemTypes := parseSearchCriteria(searchCriteria)
 		sortBy, sortOrder := parseSortCriteria(sortCriteria)
+		privatePlaylists := h.privatePlaylistIDs(ctx, snap.ServerID)
 
 		filter := sqlite.ItemFilter{
-			ServerID:         h.cfg.ServerID,
+			ServerID:         snap.ServerID,
 			SearchTerm:       titleQuery,
 			IncludeItemTypes: itemTypes,
+			ExcludeItemIDs:   privatePlaylists,
 			SortBy:           sortBy,
 			SortOrder:        sortOrder,
 			StartIndex:       startIdx,
@@ -289,7 +367,7 @@ func (h *Handler) handleSearch(ctx context.Context, r *http.Request, params map[
 			fallbackFilter := filter
 			fallbackFilter.SearchTerm = ""
 			fallbackFilter.StartIndex = 0
-			fallbackFilter.Limit = 1000
+			fallbackFilter.Limit = maxDLNARequestedCount * 2
 			allItems, _, fbErr := h.libRepo.QueryItems(ctx, fallbackFilter)
 			if fbErr != nil {
 				return "", fbErr
@@ -297,6 +375,9 @@ func (h *Handler) handleSearch(ctx context.Context, r *http.Request, params map[
 			needle := strings.ToLower(titleQuery)
 			matched := make([]dto.BaseItemDto, 0, len(allItems))
 			for _, it := range allItems {
+				if !h.isDLNAVisibleItem(ctx, it.Type, it.Id) {
+					continue
+				}
 				if strings.Contains(strings.ToLower(it.Name), needle) ||
 					strings.Contains(strings.ToLower(it.OriginalTitle), needle) {
 					matched = append(matched, it)
@@ -315,6 +396,9 @@ func (h *Handler) handleSearch(ctx context.Context, r *http.Request, params map[
 		}
 		didlEntries = make([]string, 0, len(items))
 		for _, it := range items {
+			if !h.isDLNAVisibleItem(ctx, it.Type, it.Id) {
+				continue
+			}
 			didlEntries = append(didlEntries, h.itemToDIDL(it, baseURL, serverUUID))
 		}
 		totalMatches = total
@@ -359,7 +443,7 @@ func parseSearchCriteria(criteria string) (titleQuery string, itemTypes []string
 		case cls == "object.container.album.musicalbum":
 			itemTypes = []string{"MusicAlbum"}
 		case strings.HasPrefix(cls, "object.container"):
-			itemTypes = []string{"Folder", "Series", "Season", "MusicAlbum", "MusicArtist", "BoxSet", "Playlist"}
+			itemTypes = []string{"Folder", "Series", "Season", "MusicAlbum", "MusicArtist", "BoxSet"}
 		}
 	}
 	return titleQuery, itemTypes
@@ -395,10 +479,11 @@ func parseSortCriteria(criteria string) (sortBy []string, sortOrder string) {
 }
 
 func (h *Handler) browseMetadata(ctx context.Context, objectID, baseURL, serverUUID string) (string, error) {
+	snap := h.cfgSnapshot()
 	if objectID == "0" {
 		return fmt.Sprintf(
 			`<container id="0" parentID="-1" restricted="1"><dc:title>%s</dc:title><upnp:class>object.container.storageFolder</upnp:class></container>`,
-			xmlEscape(h.cfg.ServerName),
+			xmlEscape(snap.ServerName),
 		), nil
 	}
 	if h.libRepo == nil {
@@ -407,9 +492,12 @@ func (h *Handler) browseMetadata(ctx context.Context, objectID, baseURL, serverU
 	if lib, err := h.libRepo.GetLibrary(ctx, objectID); err == nil {
 		return libraryToDIDL(*lib), nil
 	}
-	item, err := h.libRepo.GetItemByID(ctx, h.cfg.ServerID, "", objectID)
+	item, err := h.libRepo.GetItemByID(ctx, snap.ServerID, "", objectID)
 	if err != nil {
 		return "", err
+	}
+	if !h.isDLNAVisibleItem(ctx, item.Type, item.Id) {
+		return "", fmt.Errorf("object not found")
 	}
 	return h.itemToDIDL(*item, baseURL, serverUUID), nil
 }
@@ -419,6 +507,8 @@ func (h *Handler) browseDirectChildren(ctx context.Context, objectID string, sta
 		return nil, 0, nil
 	}
 
+	snap := h.cfgSnapshot()
+	reqCount = clampRequestedCount(reqCount)
 	sortBy, sortOrder := parseSortCriteria(sortCriteria)
 
 	if objectID == "0" {
@@ -451,13 +541,19 @@ func (h *Handler) browseDirectChildren(ctx context.Context, objectID string, sta
 		return out, total, nil
 	}
 
+	if rec, recErr := h.libRepo.GetItemRecordByID(ctx, objectID); recErr == nil && rec != nil && !h.isDLNAVisibleItem(ctx, rec.Type, rec.ID) {
+		return nil, 0, fmt.Errorf("object not found")
+	}
+	privatePlaylists := h.privatePlaylistIDs(ctx, snap.ServerID)
+
 	items, total, err := h.libRepo.QueryItems(ctx, sqlite.ItemFilter{
-		ServerID:   h.cfg.ServerID,
-		ParentID:   objectID,
-		SortBy:     sortBy,
-		SortOrder:  sortOrder,
-		StartIndex: startIdx,
-		Limit:      reqCount,
+		ServerID:       snap.ServerID,
+		ParentID:       objectID,
+		ExcludeItemIDs: privatePlaylists,
+		SortBy:         sortBy,
+		SortOrder:      sortOrder,
+		StartIndex:     startIdx,
+		Limit:          reqCount,
 	})
 	if err != nil {
 		return nil, 0, err
@@ -466,12 +562,13 @@ func (h *Handler) browseDirectChildren(ctx context.Context, objectID string, sta
 	if total == 0 {
 		if _, libErr := h.libRepo.GetLibrary(ctx, objectID); libErr == nil {
 			items, total, err = h.libRepo.QueryItems(ctx, sqlite.ItemFilter{
-				ServerID:   h.cfg.ServerID,
-				LibraryID:  objectID,
-				SortBy:     sortBy,
-				SortOrder:  sortOrder,
-				StartIndex: startIdx,
-				Limit:      reqCount,
+				ServerID:       snap.ServerID,
+				LibraryID:      objectID,
+				ExcludeItemIDs: privatePlaylists,
+				SortBy:         sortBy,
+				SortOrder:      sortOrder,
+				StartIndex:     startIdx,
+				Limit:          reqCount,
 			})
 			if err != nil {
 				return nil, 0, err
@@ -481,6 +578,9 @@ func (h *Handler) browseDirectChildren(ctx context.Context, objectID string, sta
 
 	out := make([]string, 0, len(items))
 	for _, it := range items {
+		if !h.isDLNAVisibleItem(ctx, it.Type, it.Id) {
+			continue
+		}
 		out = append(out, h.itemToDIDL(it, baseURL, serverUUID))
 	}
 	return out, total, nil
@@ -515,7 +615,7 @@ func (h *Handler) itemToDIDL(it dto.BaseItemDto, baseURL, serverUUID string) str
 
 	upnpClass, mimeType, _ := mediaMetadataForItem(it)
 	if strings.TrimSpace(serverUUID) == "" {
-		serverUUID = h.cfg.ServerID
+		serverUUID = h.cfgSnapshot().ServerID
 	}
 	exp := time.Now().UTC().Add(dlnaStreamTokenTTL).Unix()
 	sig := h.signStreamToken(it.Id, exp)
