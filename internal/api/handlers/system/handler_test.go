@@ -109,7 +109,7 @@ func TestPublicSystemRoutes(t *testing.T) {
 		}
 	}
 
-	// Localization, Registrations, ConfigurationPages (public); /Features moved to RequireAdmin (H-09)
+	// Localization & Registrations (public); /web/ConfigurationPages requires auth; /Features moved to RequireAdmin (H-09)
 	for _, path := range []string{
 		"/Branding/Configuration",
 		"/Branding/Css",
@@ -119,13 +119,17 @@ func TestPublicSystemRoutes(t *testing.T) {
 		"/Localization/Options",
 		"/Localization/ParentalRatings",
 		"/Registrations/Ambra",
-		"/web/ConfigurationPages",
 	} {
 		rec = httptest.NewRecorder()
 		r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 		if rec.Code != http.StatusOK {
 			t.Errorf("GET %s: expected 200, got %d", path, rec.Code)
 		}
+	}
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/web/ConfigurationPages", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("GET /web/ConfigurationPages without auth: expected 401, got %d", rec.Code)
 	}
 
 	// Host header sanitization on /System/Info/Public (L-03)

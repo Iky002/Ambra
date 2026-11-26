@@ -424,14 +424,20 @@ func TestAll582APIsAuthEnforcementMatrix(t *testing.T) {
 		}
 	}
 
-	// 4. DLNA description.xml is restricted to LAN (403 from public IP, 200 from LAN)
+	// 4. DLNA description.xml defaults to disabled (403 even on LAN), and once enabled is restricted to LAN (403 from public IP, 200 from LAN)
 	dlnaDescPath := "/Dlna/" + cfg.ServerID + "/description.xml"
-	if w := sendCompatRequest(srv.Handler, http.MethodGet, dlnaDescPath, "", nil); w.Code != http.StatusForbidden {
-		t.Errorf("public IP GET %s: expected 403 Forbidden, got %d", dlnaDescPath, w.Code)
-	}
 	lanReq := httptest.NewRequest(http.MethodGet, dlnaDescPath, nil)
 	lanReq.RemoteAddr = "127.0.0.1:12345"
 	lanW := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(lanW, lanReq)
+	if lanW.Code != http.StatusForbidden {
+		t.Errorf("LAN GET %s when DLNA disabled by default: expected 403 Forbidden, got %d", dlnaDescPath, lanW.Code)
+	}
+	cfg.Update(func(c *config.Config) { c.EnableDLNA = true })
+	if w := sendCompatRequest(srv.Handler, http.MethodGet, dlnaDescPath, "", nil); w.Code != http.StatusForbidden {
+		t.Errorf("public IP GET %s: expected 403 Forbidden, got %d", dlnaDescPath, w.Code)
+	}
+	lanW = httptest.NewRecorder()
 	srv.Handler.ServeHTTP(lanW, lanReq)
 	if lanW.Code != http.StatusOK {
 		t.Errorf("LAN GET %s: expected 200 OK, got %d", dlnaDescPath, lanW.Code)

@@ -295,15 +295,23 @@ func (h *Handler) handleUpdateStartupUser(w http.ResponseWriter, r *http.Request
 }
 
 func (h *Handler) handleUpdateRemoteAccess(w http.ResponseWriter, r *http.Request) {
-	var req RemoteAccessConfig
-	if err := httpx.DecodeJSONLimit(r, &req, 64<<10); err != nil {
+	var payload struct {
+		EnableRemoteAccess         *bool `json:"EnableRemoteAccess"`
+		EnableAutomaticPortMapping *bool `json:"EnableAutomaticPortMapping"`
+	}
+	if err := httpx.DecodeJSONLimit(r, &payload, 64<<10); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid remote access payload")
 		return
 	}
 	h.mu.Lock()
-	h.state.RemoteAccess = req
-	if h.cfg != nil {
-		enableRemote := req.EnableRemoteAccess
+	if payload.EnableRemoteAccess != nil {
+		h.state.RemoteAccess.EnableRemoteAccess = *payload.EnableRemoteAccess
+	}
+	if payload.EnableAutomaticPortMapping != nil {
+		h.state.RemoteAccess.EnableAutomaticPortMapping = *payload.EnableAutomaticPortMapping
+	}
+	if h.cfg != nil && payload.EnableRemoteAccess != nil {
+		enableRemote := *payload.EnableRemoteAccess
 		h.cfg.Update(func(c *config.Config) {
 			b := enableRemote
 			c.EnableRemoteAccessGlobal = &b
@@ -311,7 +319,9 @@ func (h *Handler) handleUpdateRemoteAccess(w http.ResponseWriter, r *http.Reques
 		_ = h.cfg.Save()
 	}
 	extra := h.loadSystemExtraLocked(r.Context())
-	extra["EnableAutomaticPortMapping"] = req.EnableAutomaticPortMapping
+	if payload.EnableAutomaticPortMapping != nil {
+		extra["EnableAutomaticPortMapping"] = *payload.EnableAutomaticPortMapping
+	}
 	h.saveSystemExtraLocked(r.Context(), extra)
 	_ = h.saveStateLocked(r.Context())
 	h.mu.Unlock()

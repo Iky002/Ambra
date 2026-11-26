@@ -157,7 +157,6 @@ func RegisterRoutes(r chi.Router, authMW *middleware.Auth, h *Handler) {
 	r.Get("/System/Ping", h.Ping)
 	r.Head("/System/Ping", h.Ping)
 	r.Post("/System/Ping", h.Ping)
-	r.Get("/web/ConfigurationPages", h.GetConfigurationPages)
 
 	r.Get("/Branding/Configuration", h.GetBrandingConfiguration)
 	r.Get("/Branding/Css", h.GetBrandingCSS)
@@ -175,6 +174,7 @@ func RegisterRoutes(r chi.Router, authMW *middleware.Auth, h *Handler) {
 		pr.Use(authMW.RequireAuth)
 		pr.Get("/System/Info", h.GetSystemInfo)
 		pr.Get("/System/Configuration", h.GetConfiguration)
+		pr.Get("/web/ConfigurationPages", h.GetConfigurationPages)
 	})
 
 	// Admin-only system routes

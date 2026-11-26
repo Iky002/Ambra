@@ -997,6 +997,17 @@ func (r *UserRepo) UpsertPlaybackProgress(
 func (r *UserRepo) SetUserItemLikes(ctx context.Context, userID, itemID string, likes *bool) (*UserItemDataRecord, error) {
 	uid := guid.Normalize(userID)
 	iid := guid.Normalize(itemID)
+	var canonicalID string
+	err := r.store.Reader.QueryRowContext(ctx,
+		`SELECT id FROM items WHERE id = ? OR id = ? LIMIT 1`,
+		iid, itemID,
+	).Scan(&canonicalID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
 	var likesVal any
 	if likes != nil {
 		if *likes {
@@ -1005,17 +1016,17 @@ func (r *UserRepo) SetUserItemLikes(ctx context.Context, userID, itemID string, 
 			likesVal = 0
 		}
 	}
-	_, err := r.store.Writer.ExecContext(ctx, `
+	_, err = r.store.Writer.ExecContext(ctx, `
 		INSERT INTO user_item_data (user_id, item_id, likes)
 		VALUES (?, ?, ?)
 		ON CONFLICT(user_id, item_id) DO UPDATE SET
 			likes = excluded.likes`,
-		uid, iid, likesVal,
+		uid, canonicalID, likesVal,
 	)
 	if err != nil {
 		return nil, err
 	}
-	return r.GetUserItemData(ctx, uid, iid)
+	return r.GetUserItemData(ctx, uid, canonicalID)
 }
 
 func (r *UserRepo) GetUserItemData(ctx context.Context, userID, itemID string) (*UserItemDataRecord, error) {

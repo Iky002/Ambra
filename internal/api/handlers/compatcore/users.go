@@ -2193,6 +2193,10 @@ func (h *Handler) postUserItemRating(w http.ResponseWriter, r *http.Request) {
 
 	if h.userRepo != nil && uid != "" && itemID != "" {
 		rec, err := h.userRepo.SetUserItemLikes(r.Context(), uid, itemID, &val)
+		if errors.Is(err, sqlite.ErrNotFound) {
+			writeJSONError(w, r, http.StatusNotFound, "item not found")
+			return
+		}
 		if err != nil {
 			httpx.Error(w, http.StatusInternalServerError, "failed to update item rating")
 			return
@@ -2225,6 +2229,10 @@ func (h *Handler) deleteUserItemRating(w http.ResponseWriter, r *http.Request) {
 
 	if h.userRepo != nil && uid != "" && itemID != "" {
 		rec, err := h.userRepo.SetUserItemLikes(r.Context(), uid, itemID, nil)
+		if errors.Is(err, sqlite.ErrNotFound) {
+			writeJSONError(w, r, http.StatusNotFound, "item not found")
+			return
+		}
 		if err != nil {
 			httpx.Error(w, http.StatusInternalServerError, "failed to delete item rating")
 			return

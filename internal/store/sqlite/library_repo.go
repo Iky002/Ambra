@@ -693,8 +693,8 @@ func buildLibraryAndPolicyWhere(alias string, allowedLibraryIDs []string, p pare
 		boxSQL := strings.Join(boxParts, " AND ")
 
 		where = append(where, fmt.Sprintf(
-			`((LOWER(%s.type) != 'boxset' AND (%s)) OR (LOWER(%s.type) = 'boxset' AND (%s)))`,
-			alias, normalSQL, alias, boxSQL,
+			`((NOT (LOWER(%s.type) = 'boxset' AND %s.library_id = 'collections') AND (%s)) OR (LOWER(%s.type) = 'boxset' AND %s.library_id = 'collections' AND (%s)))`,
+			alias, alias, normalSQL, alias, alias, boxSQL,
 		))
 		args = append(args, normalArgs...)
 		args = append(args, selfArgs...)
