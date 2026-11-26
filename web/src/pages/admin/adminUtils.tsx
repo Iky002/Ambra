@@ -1,7 +1,7 @@
 import React, { useEffect, useId } from 'react'
 import { createPortal } from 'react-dom'
 import { AlertCircle, CheckCircle2, X } from 'lucide-react'
-import { getActiveLocale } from '../../i18n/I18nContext'
+import { getActiveLocale, translateForLocale } from '../../i18n/I18nContext'
 
 function isZeroDate(d: Date): boolean {
   return d.getUTCFullYear() <= 1970
@@ -24,16 +24,23 @@ export function formatDateTime(iso?: string): string {
 }
 
 export function formatRelativeTime(iso?: string): string {
-  if (!iso) return '从未'
+  const locale = getActiveLocale()
+  if (!iso) return translateForLocale(locale, 'admin.timeNever')
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return iso
-  if (isZeroDate(d)) return '尚未同步'
+  if (isZeroDate(d)) return translateForLocale(locale, 'admin.timeNotSynced')
   const diffSec = Math.floor((Date.now() - d.getTime()) / 1000)
   if (diffSec < 0) return formatDateTime(iso)
-  if (diffSec < 60) return '刚刚'
-  if (diffSec < 3600) return `${Math.floor(diffSec / 60)} 分钟前`
-  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)} 小时前`
-  if (diffSec < 86400 * 30) return `${Math.floor(diffSec / 86400)} 天前`
+  if (diffSec < 60) return translateForLocale(locale, 'admin.timeJustNow')
+  if (diffSec < 3600) {
+    return translateForLocale(locale, 'admin.timeMinutesAgo', { count: Math.floor(diffSec / 60) })
+  }
+  if (diffSec < 86400) {
+    return translateForLocale(locale, 'admin.timeHoursAgo', { count: Math.floor(diffSec / 3600) })
+  }
+  if (diffSec < 86400 * 30) {
+    return translateForLocale(locale, 'admin.timeDaysAgo', { count: Math.floor(diffSec / 86400) })
+  }
   return formatDateTime(iso)
 }
 
@@ -148,7 +155,7 @@ export function AdminModal({
           </div>
           <button
             type="button"
-            aria-label="关闭弹窗"
+            aria-label={translateForLocale(getActiveLocale(), 'admin.closeModal')}
             onClick={onClose}
             className="rounded-lg p-1.5 text-zinc-400 transition-colors hover:bg-white/8 hover:text-zinc-100"
           >

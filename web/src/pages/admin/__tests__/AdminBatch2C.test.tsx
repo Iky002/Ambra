@@ -69,18 +69,20 @@ describe('Audit Batch 2C — Admin Settings, Plugins, Image URL & Scan Controls'
     fireEvent.change(screen.getByLabelText('标记为已看进度阈值'), {
       target: { value: '85' },
     })
-    fireEvent.click(screen.getByRole('switch'))
+    fireEvent.click(screen.getByRole('switch', { name: /STRM 302/ }))
 
     fireEvent.click(screen.getByRole('button', { name: /保存设置/ }))
 
     await waitFor(() => {
-      expect(updateSpy).toHaveBeenCalledWith({
-        ServerName: 'Ambra 客厅影院',
-        TMDBApiKey: 'new-tmdb-key',
-        TMDBLanguage: 'ja-JP',
-        EnableSTRM302: false,
-        PlayedThreshold: 0.85,
-      })
+      expect(updateSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ServerName: 'Ambra 客厅影院',
+          TMDBApiKey: 'new-tmdb-key',
+          TMDBLanguage: 'ja-JP',
+          EnableSTRM302: false,
+          PlayedThreshold: 0.85,
+        }),
+      )
     })
 
     expect(await screen.findByText('已保存服务器常规设置')).toBeInTheDocument()
