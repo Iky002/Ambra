@@ -343,8 +343,8 @@ func TestServerLiveTVAndDVRWiring(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	// Add channel via /LiveTv/TunerHosts
-	m3uBody := `{"Type":"m3u","M3UContent":"#EXTM3U\n#EXTINF:-1,E2E Channel\n` + upstream.URL + `/live.ts\n"}`
+	// Add channel via /LiveTv/TunerHosts (opt-in AllowPrivateNetwork for local test upstream)
+	m3uBody := `{"Type":"m3u","AllowPrivateNetwork":true,"M3UContent":"#EXTM3U\n#EXTINF:-1,E2E Channel\n` + upstream.URL + `/live.ts\n"}`
 	req := httptest.NewRequest(http.MethodPost, "/LiveTv/TunerHosts", strings.NewReader(m3uBody))
 	req.Header.Set("X-Emby-Token", token)
 	req.Header.Set("Content-Type", "application/json")

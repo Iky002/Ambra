@@ -115,51 +115,127 @@ export function MediaCard({
 
   return (
     <div className={`group relative flex flex-col ${className}`}>
-      <Link
-        to={targetUrl}
-        onClick={handleCardClick}
-        aria-pressed={selectable ? selected : undefined}
-        className={`relative block overflow-hidden rounded-xl border bg-zinc-900/90 transition-all duration-300 ease-out ${
+      <div
+        className={`relative overflow-hidden rounded-xl border bg-zinc-900/90 transition-all duration-300 ease-out ${
           selected
             ? 'border-amber-400 ring-2 ring-amber-400/90 shadow-[0_0_24px_rgba(245,158,11,0.32)]'
             : 'border-white/10 group-hover:-translate-y-1 group-hover:border-amber-400/75 group-hover:shadow-[0_14px_34px_rgba(0,0,0,0.65),0_0_20px_rgba(245,158,11,0.16)]'
         } ${isLandscape ? 'aspect-video' : 'aspect-[2/3]'}`}
       >
-        {imgUrl && !imgFailed ? (
-          <img
-            src={imgUrl}
-            alt={item.Name}
-            loading="lazy"
-            onError={(e) => {
-              const el = e.currentTarget
-              if (fallbackUrl && !el.dataset.fallbackApplied && el.src !== fallbackUrl) {
-                el.dataset.fallbackApplied = '1'
-                el.src = fallbackUrl
-                return
-              }
-              setImgFailed(true)
-            }}
-            className="h-full w-full object-cover transition-transform duration-500 ease-out group-hover:scale-[1.06]"
-          />
-        ) : (
-          <div className="flex h-full w-full flex-col items-center justify-center bg-gradient-to-br from-zinc-800 to-zinc-950 text-zinc-600">
-            {isMusicItem ? (
-              <Music className="h-10 w-10 opacity-40" />
-            ) : (
-              <Film className="h-10 w-10 opacity-40" />
-            )}
-          </div>
-        )}
+        <Link
+          to={targetUrl}
+          onClick={handleCardClick}
+          aria-pressed={selectable ? selected : undefined}
+          aria-label={item.Name}
+          className="relative block h-full w-full"
+        >
+          {imgUrl && !imgFailed ? (
+            <img
+              src={imgUrl}
+              alt={item.Name}
+              loading="lazy"
+              onError={(e) => {
+                const el = e.currentTarget
+                if (fallbackUrl && !el.dataset.fallbackApplied && el.src !== fallbackUrl) {
+                  el.dataset.fallbackApplied = '1'
+                  el.src = fallbackUrl
+                  return
+                }
+                setImgFailed(true)
+              }}
+              className="h-full w-full object-cover transition-transform duration-500 ease-out group-hover:scale-[1.06]"
+            />
+          ) : (
+            <div className="flex h-full w-full flex-col items-center justify-center bg-gradient-to-br from-zinc-800 to-zinc-950 text-zinc-600">
+              {isMusicItem ? (
+                <Music className="h-10 w-10 opacity-40" />
+              ) : (
+                <Film className="h-10 w-10 opacity-40" />
+              )}
+            </div>
+          )}
 
-        {/* 暗色悬停遮罩与快速播放按钮 */}
-        <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/15 to-transparent opacity-0 transition-opacity duration-300 group-hover:opacity-100" />
+          {/* 暗色悬停遮罩 */}
+          <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/85 via-black/15 to-transparent opacity-0 transition-opacity duration-300 group-hover:opacity-100" />
 
+          {/* 左上角评分 */}
+          {item.CommunityRating ? (
+            <div className="pointer-events-none absolute left-2 top-2 flex items-center gap-1 rounded-md bg-black/70 px-1.5 py-0.5 text-[11px] font-semibold text-amber-400 backdrop-blur-md">
+              <Star className="h-3 w-3 fill-amber-400" />
+              <span>{item.CommunityRating.toFixed(1)}</span>
+            </div>
+          ) : null}
+
+          {/* 右上角选择复选框或已看/未看状态 */}
+          {selectable ? (
+            <div
+              aria-label={selected ? '已选中' : '未选中'}
+              className={`absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-full border-2 shadow-md transition-all ${
+                selected
+                  ? 'border-amber-300 bg-amber-400 text-zinc-950 scale-105'
+                  : 'border-white/70 bg-black/55 text-transparent backdrop-blur-sm'
+              }`}
+            >
+              <Check className="h-4 w-4 stroke-[3]" />
+            </div>
+          ) : !(onMarkPlayed || onHideFromResume) && item.UserData?.Played ? (
+            <div
+              title="已观看"
+              className="pointer-events-none absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-full bg-emerald-500/90 text-zinc-950 shadow-md"
+            >
+              <Check className="h-3.5 w-3.5 stroke-[3]" />
+            </div>
+          ) : !(onMarkPlayed || onHideFromResume) &&
+            item.UserData?.UnplayedItemCount &&
+            item.UserData.UnplayedItemCount > 0 ? (
+            <div className="pointer-events-none absolute right-2 top-2 rounded-full bg-amber-500/90 px-2 py-0.5 text-[11px] font-bold text-zinc-950 shadow-md">
+              {item.UserData.UnplayedItemCount}
+            </div>
+          ) : null}
+
+          {/* 左下角榜单与热门徽章（热门 / 豆瓣 Top250 / IMDb Top250） */}
+          {(hasTrending || hasDoubanTop250 || hasImdbTop250) && (
+            <div
+              className={`pointer-events-none absolute left-2 right-2 flex flex-wrap items-center gap-1 ${
+                hasProgressBar ? 'bottom-3' : 'bottom-2'
+              }`}
+            >
+              {hasTrending && (
+                <span className="inline-flex items-center gap-0.5 rounded-md border border-orange-400/55 bg-gradient-to-r from-orange-950/90 via-amber-900/85 to-orange-950/90 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-orange-200 shadow-[0_2px_8px_rgba(0,0,0,0.45)] backdrop-blur-md">
+                  <Flame className="h-2.5 w-2.5 text-orange-400" />
+                  <span>热门</span>
+                </span>
+              )}
+              {hasDoubanTop250 && (
+                <span className="inline-flex items-center rounded-md border border-emerald-400/50 bg-gradient-to-r from-emerald-950/90 via-emerald-900/85 to-teal-950/90 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-emerald-200 shadow-[0_2px_8px_rgba(0,0,0,0.45)] backdrop-blur-md">
+                  豆瓣 Top250
+                </span>
+              )}
+              {hasImdbTop250 && (
+                <span className="inline-flex items-center rounded-md border border-amber-400/55 bg-gradient-to-r from-amber-950/90 via-yellow-900/80 to-amber-950/90 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-amber-200 shadow-[0_2px_8px_rgba(0,0,0,0.45)] backdrop-blur-md">
+                  IMDb Top250
+                </span>
+              )}
+            </div>
+          )}
+
+          {/* 底部播放进度条 */}
+          {hasProgressBar && (
+            <div className="pointer-events-none absolute inset-x-0 bottom-0 h-1.5 bg-black/60">
+              <div
+                className="h-full bg-gradient-to-r from-amber-500 to-orange-400 transition-all"
+                style={{ width: `${Math.max(3, Math.min(100, progress))}%` }}
+              />
+            </div>
+          )}
+        </Link>
+
+        {/* 同级快速播放按钮（避免 <Link> 内嵌套 <button>） */}
         {canDirectPlay && (
           <button
             type="button"
             title="立即播放"
             onClick={(e) => {
-              e.preventDefault()
               e.stopPropagation()
               if (isAudioItem) {
                 playTrack(item)
@@ -167,41 +243,21 @@ export function MediaCard({
                 navigate(directPlayUrl)
               }
             }}
-            className="absolute left-1/2 top-1/2 flex h-12 w-12 -translate-x-1/2 -translate-y-1/2 scale-75 items-center justify-center rounded-full bg-amber-500 text-zinc-950 opacity-0 shadow-lg shadow-amber-500/35 transition-all duration-300 ease-out hover:bg-amber-400 group-hover:scale-100 group-hover:opacity-100 active:scale-95"
+            className="absolute left-1/2 top-1/2 z-10 flex h-12 w-12 -translate-x-1/2 -translate-y-1/2 scale-75 items-center justify-center rounded-full bg-amber-500 text-zinc-950 opacity-0 shadow-lg shadow-amber-500/35 transition-all duration-300 ease-out hover:bg-amber-400 group-hover:scale-100 group-hover:opacity-100 focus-visible:scale-100 focus-visible:opacity-100 active:scale-95"
           >
             <Play className="ml-0.5 h-5 w-5 fill-current" />
           </button>
         )}
 
-        {/* 左上角评分 */}
-        {item.CommunityRating ? (
-          <div className="absolute left-2 top-2 flex items-center gap-1 rounded-md bg-black/70 px-1.5 py-0.5 text-[11px] font-semibold text-amber-400 backdrop-blur-md">
-            <Star className="h-3 w-3 fill-amber-400" />
-            <span>{item.CommunityRating.toFixed(1)}</span>
-          </div>
-        ) : null}
-
-        {/* 右上角选择复选框、快捷操作或已看/未看数量 */}
-        {selectable ? (
-          <div
-            aria-label={selected ? '已选中' : '未选中'}
-            className={`absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-full border-2 shadow-md transition-all ${
-              selected
-                ? 'border-amber-300 bg-amber-400 text-zinc-950 scale-105'
-                : 'border-white/70 bg-black/55 text-transparent backdrop-blur-sm'
-            }`}
-          >
-            <Check className="h-4 w-4 stroke-[3]" />
-          </div>
-        ) : onMarkPlayed || onHideFromResume ? (
-          <div className="absolute right-2 top-2 z-10 flex items-center gap-1 opacity-100 sm:opacity-0 sm:pointer-events-none sm:group-hover:opacity-100 sm:group-hover:pointer-events-auto sm:focus-within:opacity-100 sm:focus-within:pointer-events-auto transition-opacity duration-200">
+        {/* 同级右上角快捷操作按钮 */}
+        {!selectable && (onMarkPlayed || onHideFromResume) && (
+          <div className="absolute right-2 top-2 z-20 flex items-center gap-1 opacity-100 sm:opacity-0 sm:pointer-events-none sm:group-hover:opacity-100 sm:group-hover:pointer-events-auto sm:focus-within:opacity-100 sm:focus-within:pointer-events-auto transition-opacity duration-200">
             {onMarkPlayed && (
               <button
                 type="button"
                 title="标记已看"
                 aria-label="标记已看"
                 onClick={(e) => {
-                  e.preventDefault()
                   e.stopPropagation()
                   onMarkPlayed(item)
                 }}
@@ -216,7 +272,6 @@ export function MediaCard({
                 title="从继续观看移除"
                 aria-label="从继续观看移除"
                 onClick={(e) => {
-                  e.preventDefault()
                   e.stopPropagation()
                   onHideFromResume(item)
                 }}
@@ -226,55 +281,8 @@ export function MediaCard({
               </button>
             )}
           </div>
-        ) : item.UserData?.Played ? (
-          <div
-            title="已观看"
-            className="absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-full bg-emerald-500/90 text-zinc-950 shadow-md"
-          >
-            <Check className="h-3.5 w-3.5 stroke-[3]" />
-          </div>
-        ) : item.UserData?.UnplayedItemCount && item.UserData.UnplayedItemCount > 0 ? (
-          <div className="absolute right-2 top-2 rounded-full bg-amber-500/90 px-2 py-0.5 text-[11px] font-bold text-zinc-950 shadow-md">
-            {item.UserData.UnplayedItemCount}
-          </div>
-        ) : null}
-
-        {/* 左下角榜单与热门徽章（热门 / 豆瓣 Top250 / IMDb Top250） */}
-        {(hasTrending || hasDoubanTop250 || hasImdbTop250) && (
-          <div
-            className={`pointer-events-none absolute left-2 right-2 flex flex-wrap items-center gap-1 ${
-              hasProgressBar ? 'bottom-3' : 'bottom-2'
-            }`}
-          >
-            {hasTrending && (
-              <span className="inline-flex items-center gap-0.5 rounded-md border border-orange-400/55 bg-gradient-to-r from-orange-950/90 via-amber-900/85 to-orange-950/90 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-orange-200 shadow-[0_2px_8px_rgba(0,0,0,0.45)] backdrop-blur-md">
-                <Flame className="h-2.5 w-2.5 text-orange-400" />
-                <span>热门</span>
-              </span>
-            )}
-            {hasDoubanTop250 && (
-              <span className="inline-flex items-center rounded-md border border-emerald-400/50 bg-gradient-to-r from-emerald-950/90 via-emerald-900/85 to-teal-950/90 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-emerald-200 shadow-[0_2px_8px_rgba(0,0,0,0.45)] backdrop-blur-md">
-                豆瓣 Top250
-              </span>
-            )}
-            {hasImdbTop250 && (
-              <span className="inline-flex items-center rounded-md border border-amber-400/55 bg-gradient-to-r from-amber-950/90 via-yellow-900/80 to-amber-950/90 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-amber-200 shadow-[0_2px_8px_rgba(0,0,0,0.45)] backdrop-blur-md">
-                IMDb Top250
-              </span>
-            )}
-          </div>
         )}
-
-        {/* 底部播放进度条 */}
-        {hasProgressBar && (
-          <div className="absolute inset-x-0 bottom-0 h-1.5 bg-black/60">
-            <div
-              className="h-full bg-gradient-to-r from-amber-500 to-orange-400 transition-all"
-              style={{ width: `${Math.max(3, Math.min(100, progress))}%` }}
-            />
-          </div>
-        )}
-      </Link>
+      </div>
 
       <div className="mt-2.5 px-0.5">
         <Link

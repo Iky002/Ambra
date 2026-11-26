@@ -707,6 +707,16 @@ export interface SetupAdminRequest {
   password: string
 }
 
+export interface ThumbnailSetItem {
+  PositionTicks: number
+  ImageTag: string
+}
+
+export interface ThumbnailSetResponse {
+  AspectRatio: number
+  Thumbnails: ThumbnailSetItem[]
+}
+
 export interface SetupCompleteRequest {
   server_name?: string
   tmdb_api_key?: string

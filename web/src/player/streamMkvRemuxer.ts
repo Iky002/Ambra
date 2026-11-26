@@ -2082,6 +2082,7 @@ export class StreamMkvRemuxer {
                 : 0
             this.nextVideoDtsMs = segStartDts + segSpan + defaultVideoDur
             await this.appendToBuffer(this.videoSb, seg)
+            if (generation !== this.pumpGeneration || this.disposed) break
           }
 
           if (this.audioTrack && this.audioSb && aFrames.length > 0) {

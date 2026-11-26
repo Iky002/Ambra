@@ -642,7 +642,16 @@ func (r *LibraryRepo) SplitItemVersions(ctx context.Context, itemID string) ([]s
 			return nil, err
 		}
 
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR REPLACE INTO item_ancestors (ancestor_id, descendant_id, depth) VALUES (?, ?, 0)`,
+			newID, newID,
+		); err != nil {
+			return nil, err
+		}
 		for _, a := range ancestors {
+			if guid.Normalize(a.AncestorID) == itemID || a.Depth == 0 {
+				continue
+			}
 			if _, err := tx.ExecContext(ctx,
 				`INSERT OR REPLACE INTO item_ancestors (ancestor_id, descendant_id, depth) VALUES (?, ?, ?)`,
 				a.AncestorID, newID, a.Depth,

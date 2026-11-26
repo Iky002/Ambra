@@ -237,6 +237,7 @@ type ItemFilter struct {
 	IsUnplayed             *bool
 	IsFavorite              *bool
 	IsResumable             *bool
+	ExcludeHiddenResume     bool
 	SearchTerm              string
 	NameStartsWith          string
 	NameStartsWithOrGreater string
@@ -1096,7 +1097,11 @@ func (r *LibraryRepo) ReplaceItemAncestors(ctx context.Context, itemID string, a
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	r.InvalidateCountCache()
+	return nil
 }
 
 func (r *LibraryRepo) ReplaceMediaSourcesAndStreams(ctx context.Context, itemID string, sources []MediaSourceRecord) error {
@@ -1545,7 +1550,8 @@ func queryItemsCountCacheKey(f ItemFilter) (string, bool) {
 		f.IsPlayed != nil ||
 		f.IsUnplayed != nil ||
 		f.IsFavorite != nil ||
-		f.IsResumable != nil {
+		f.IsResumable != nil ||
+		f.ExcludeHiddenResume {
 		return "", false
 	}
 
@@ -1899,10 +1905,14 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 		}
 		if f.IsResumable != nil {
 			if *f.IsResumable {
-				where = append(where, `COALESCE(u.playback_position_ticks, 0) > 0 AND COALESCE(u.played, 0) = 0`)
+				where = append(where, `COALESCE(u.playback_position_ticks, 0) > 0`)
 			} else {
-				where = append(where, `(COALESCE(u.playback_position_ticks, 0) = 0 OR COALESCE(u.played, 0) = 1)`)
+				where = append(where, `COALESCE(u.playback_position_ticks, 0) = 0`)
 			}
+		}
+		if f.ExcludeHiddenResume {
+			where = append(where, `NOT EXISTS (SELECT 1 FROM server_config sc WHERE sc.key = 'user_hide_resume:' || ? || ':' || i.id)`)
+			args = append(args, userID)
 		}
 	}
 
@@ -2136,9 +2146,10 @@ func (r *LibraryRepo) GetResumeItemsWithPolicy(ctx context.Context, serverID, us
 		MaxParentalRating: maxParentalRating,
 		BlockedTags:       blockedTags,
 		Recursive:         parentID != "",
-		IncludeItemTypes:  includeTypes,
-		IsResumable:       &isResumable,
-		SortBy:            []string{"DatePlayed"},
+		IncludeItemTypes:    includeTypes,
+		IsResumable:         &isResumable,
+		ExcludeHiddenResume: true,
+		SortBy:              []string{"DatePlayed"},
 		SortOrder:         "Descending",
 		StartIndex:        startIndex,
 		Limit:             limit,
@@ -2222,7 +2233,7 @@ func (r *LibraryRepo) GetNextUpEpisodesWithPolicy(ctx context.Context, serverID,
 			FROM items i
 			LEFT JOIN user_item_data u ON u.item_id = i.id AND u.user_id = ?
 			LEFT JOIN series_activity sa ON sa.series_id = i.series_id
-			WHERE i.type = 'Episode' AND i.extra_type = '' AND COALESCE(u.played, 0) = 0` + extraCond.String() + `
+			WHERE i.type = 'Episode' AND i.extra_type = '' AND COALESCE(i.parent_index_number, 0) > 0 AND COALESCE(u.played, 0) = 0` + extraCond.String() + `
 		)
 		SELECT id, library_id, parent_id, series_id, season_id,
 		       type, media_type, is_folder, is_strm,
@@ -2231,7 +2242,8 @@ func (r *LibraryRepo) GetNextUpEpisodesWithPolicy(ctx context.Context, serverID,
 		       premiere_date, end_date, community_rating, critic_rating, official_rating,
 		       runtime_ticks, container, path, file_size, file_mtime,
 		       etag, extra_json, date_created, date_modified,
-		       u_played, u_play_count, u_pos, u_fav, u_last_played
+		       u_played, u_play_count, u_pos, u_fav, u_last_played,
+		       COUNT(*) OVER () AS total_count
 		FROM ranked
 		WHERE rn = 1
 		ORDER BY is_started DESC, series_last_played DESC, date_created DESC, series_id ASC
@@ -2245,11 +2257,13 @@ func (r *LibraryRepo) GetNextUpEpisodesWithPolicy(ctx context.Context, serverID,
 
 	var recs []ItemRecord
 	var uds []*dto.UserItemDataDto
+	totalCount := 0
 	for rows.Next() {
-		rec, ud, err := scanItemRow(rows, true)
+		rec, ud, rowTotal, err := scanItemRowWithTotal(rows)
 		if err != nil {
 			return nil, 0, err
 		}
+		totalCount = rowTotal
 		recs = append(recs, rec)
 		uds = append(uds, ud)
 	}
@@ -2260,7 +2274,7 @@ func (r *LibraryRepo) GetNextUpEpisodesWithPolicy(ctx context.Context, serverID,
 	if err != nil {
 		return nil, 0, err
 	}
-	return dtos, len(dtos), nil
+	return dtos, totalCount, nil
 }
 
 func (r *LibraryRepo) SearchHints(ctx context.Context, f SearchHintFilter) ([]dto.SearchHint, int, error) {
@@ -2465,29 +2479,25 @@ func (r *LibraryRepo) ListTaxonomiesWithPolicy(ctx context.Context, serverID, ki
 	case "person", "persons":
 		var (
 			args  []any
-			where string
+			joins = []string{"JOIN items i ON i.id = ip.item_id"}
+			conds = []string{"ip.person_id = p.id", "i.extra_type = ''"}
 		)
-		if parentID != "" || len(allowedLibraryIDs) > 0 || hasParental {
-			var joins, conds []string
-			conds = append(conds, "ip.person_id = p.id")
-			if parentID != "" {
-				joins = append(joins, "JOIN item_ancestors anc ON anc.descendant_id = ip.item_id")
-				conds = append(conds, "anc.ancestor_id = ? AND anc.depth > 0")
-				args = append(args, parentID)
-			}
-			if len(allowedLibraryIDs) > 0 || hasParental {
-				joins = append(joins, "JOIN items i ON i.id = ip.item_id")
-				if clause, vals := libInClause("i.library_id"); clause != "" {
-					conds = append(conds, clause)
-					args = append(args, vals...)
-				}
-				if pClauses, pArgs := appendParentalFilterSQL("i", maxParentalRating, blockedTags); len(pClauses) > 0 {
-					conds = append(conds, pClauses...)
-					args = append(args, pArgs...)
-				}
-			}
-			where = `WHERE EXISTS (SELECT 1 FROM item_people ip ` + strings.Join(joins, " ") + ` WHERE ` + strings.Join(conds, " AND ") + `)`
+		if parentID != "" {
+			joins = append(joins, "JOIN item_ancestors anc ON anc.descendant_id = ip.item_id")
+			conds = append(conds, "anc.ancestor_id = ? AND anc.depth > 0")
+			args = append(args, parentID)
 		}
+		if clause, vals := libInClause("i.library_id"); clause != "" {
+			conds = append(conds, clause)
+			args = append(args, vals...)
+		}
+		if hasParental {
+			if pClauses, pArgs := appendParentalFilterSQL("i", maxParentalRating, blockedTags); len(pClauses) > 0 {
+				conds = append(conds, pClauses...)
+				args = append(args, pArgs...)
+			}
+		}
+		where := `WHERE EXISTS (SELECT 1 FROM item_people ip ` + strings.Join(joins, " ") + ` WHERE ` + strings.Join(conds, " AND ") + `)`
 		var total int
 		if err := r.store.Reader.QueryRowContext(ctx, `SELECT COUNT(*) FROM people p `+where, args...).Scan(&total); err != nil {
 			return nil, 0, err
@@ -2539,29 +2549,25 @@ func (r *LibraryRepo) ListTaxonomiesWithPolicy(ctx context.Context, serverID, ki
 		}
 		var (
 			args  = []any{taxKind}
-			extra string
+			joins = []string{"JOIN items i ON i.id = it.item_id"}
+			conds = []string{"it.taxonomy_id = t.id", "i.extra_type = ''"}
 		)
-		if parentID != "" || len(allowedLibraryIDs) > 0 || hasParental {
-			var joins, conds []string
-			conds = append(conds, "it.taxonomy_id = t.id")
-			if parentID != "" {
-				joins = append(joins, "JOIN item_ancestors anc ON anc.descendant_id = it.item_id")
-				conds = append(conds, "anc.ancestor_id = ? AND anc.depth > 0")
-				args = append(args, parentID)
-			}
-			if len(allowedLibraryIDs) > 0 || hasParental {
-				joins = append(joins, "JOIN items i ON i.id = it.item_id")
-				if clause, vals := libInClause("i.library_id"); clause != "" {
-					conds = append(conds, clause)
-					args = append(args, vals...)
-				}
-				if pClauses, pArgs := appendParentalFilterSQL("i", maxParentalRating, blockedTags); len(pClauses) > 0 {
-					conds = append(conds, pClauses...)
-					args = append(args, pArgs...)
-				}
-			}
-			extra = ` AND EXISTS (SELECT 1 FROM item_taxonomies it ` + strings.Join(joins, " ") + ` WHERE ` + strings.Join(conds, " AND ") + `)`
+		if parentID != "" {
+			joins = append(joins, "JOIN item_ancestors anc ON anc.descendant_id = it.item_id")
+			conds = append(conds, "anc.ancestor_id = ? AND anc.depth > 0")
+			args = append(args, parentID)
 		}
+		if clause, vals := libInClause("i.library_id"); clause != "" {
+			conds = append(conds, clause)
+			args = append(args, vals...)
+		}
+		if hasParental {
+			if pClauses, pArgs := appendParentalFilterSQL("i", maxParentalRating, blockedTags); len(pClauses) > 0 {
+				conds = append(conds, pClauses...)
+				args = append(args, pArgs...)
+			}
+		}
+		extra := ` AND EXISTS (SELECT 1 FROM item_taxonomies it ` + strings.Join(joins, " ") + ` WHERE ` + strings.Join(conds, " AND ") + `)`
 		var total int
 		if err := r.store.Reader.QueryRowContext(ctx, `SELECT COUNT(*) FROM taxonomies t WHERE t.kind = ?`+extra, args...).Scan(&total); err != nil {
 			return nil, 0, err
@@ -3474,6 +3480,7 @@ func (r *LibraryRepo) hydrateDTOs(ctx context.Context, recs []ItemRecord, uds []
 			SortName:                rec.SortName,
 			OfficialRating:          rec.OfficialRating,
 			CommunityRating:         rec.CommunityRating,
+			CriticRating:            rec.CriticRating,
 			RunTimeTicks:            rec.RuntimeTicks,
 			ProductionYear:          rec.ProductionYear,
 			IndexNumber:             rec.IndexNumber,
@@ -4076,6 +4083,57 @@ func scanItemRow(rows *sql.Rows, hasUser bool) (ItemRecord, *dto.UserItemDataDto
 	return rec, nil, nil
 }
 
+func scanItemRowWithTotal(rows *sql.Rows) (ItemRecord, *dto.UserItemDataDto, int, error) {
+	var (
+		rec                                                         ItemRecord
+		parentID, seriesID, seasonID, mediaType, origTitle, offRate sql.NullString
+		container, path                                             sql.NullString
+		isFolder, isStrm                                            int
+		extraRaw                                                    string
+		played, playCount, fav                                      int
+		pos                                                         int64
+		lastPlayed                                                  sql.NullInt64
+		totalCount                                                  int
+	)
+	err := rows.Scan(
+		&rec.ID, &rec.LibraryID, &parentID, &seriesID, &seasonID,
+		&rec.Type, &mediaType, &isFolder, &isStrm,
+		&rec.Name, &origTitle, &rec.SortName,
+		&rec.IndexNumber, &rec.ParentIndexNumber, &rec.ProductionYear,
+		&rec.PremiereDate, &rec.EndDate, &rec.CommunityRating, &rec.CriticRating, &offRate,
+		&rec.RuntimeTicks, &container, &path, &rec.FileSize, &rec.FileMtime,
+		&rec.Etag, &extraRaw, &rec.DateCreated, &rec.DateModified,
+		&played, &playCount, &pos, &fav, &lastPlayed,
+		&totalCount,
+	)
+	if err != nil {
+		return rec, nil, 0, err
+	}
+	ud := &dto.UserItemDataDto{
+		PlaybackPositionTicks: pos,
+		PlayCount:             playCount,
+		IsFavorite:            fav == 1,
+		Played:                played == 1,
+		Key:                   rec.ID,
+	}
+	if lastPlayed.Valid && lastPlayed.Int64 > 0 {
+		t := time.Unix(lastPlayed.Int64, 0).UTC()
+		ud.LastPlayedDate = &t
+	}
+	rec.ParentID = parentID.String
+	rec.SeriesID = seriesID.String
+	rec.SeasonID = seasonID.String
+	rec.MediaType = mediaType.String
+	rec.OriginalTitle = origTitle.String
+	rec.OfficialRating = offRate.String
+	rec.Container = container.String
+	rec.Path = path.String
+	rec.IsFolder = isFolder == 1
+	rec.IsStrm = isStrm == 1
+	_ = json.Unmarshal([]byte(extraRaw), &rec.Extra)
+	return rec, ud, totalCount, nil
+}
+
 func nullStr(s string) sql.NullString {
 	if s == "" {
 		return sql.NullString{}
@@ -4104,16 +4162,24 @@ type BIFCandidate struct {
 }
 
 // ListChapterExtractionCandidates returns all video items that have persisted chapters.
+// Local non-remote, non-.strm media sources are prioritized ahead of remote/STRM sources.
 func (r *LibraryRepo) ListChapterExtractionCandidates(ctx context.Context) ([]ChapterExtractionCandidate, error) {
 	rows, err := r.store.Reader.QueryContext(ctx, `
 		SELECT i.id,
-		       COALESCE(NULLIF(ms.path, ''), i.path, ''),
+		       COALESCE(NULLIF(TRIM(ms.path), ''), TRIM(COALESCE(i.path, '')), ''),
 		       COALESCE(i.extra_json, '{}')
 		FROM items i
 		LEFT JOIN item_media_sources ms ON ms.item_id = i.id
 		WHERE LOWER(COALESCE(i.media_type, '')) = 'video'
 		  AND i.extra_json LIKE '%"chapters"%'
-		ORDER BY i.id ASC, ms.rowid ASC`)
+		ORDER BY i.id ASC,
+		         CASE WHEN COALESCE(NULLIF(TRIM(ms.path), ''), TRIM(COALESCE(i.path, '')), '') = '' THEN 1 ELSE 0 END ASC,
+		         CASE WHEN COALESCE(ms.is_remote, i.is_strm, 0) != 0
+		                   OR LOWER(COALESCE(NULLIF(TRIM(ms.path), ''), TRIM(COALESCE(i.path, '')), '')) LIKE '%.strm'
+		                   OR LOWER(COALESCE(NULLIF(TRIM(ms.path), ''), TRIM(COALESCE(i.path, '')), '')) LIKE 'http://%'
+		                   OR LOWER(COALESCE(NULLIF(TRIM(ms.path), ''), TRIM(COALESCE(i.path, '')), '')) LIKE 'https://%'
+		              THEN 1 ELSE 0 END ASC,
+		         ms.rowid ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -4125,6 +4191,10 @@ func (r *LibraryRepo) ListChapterExtractionCandidates(ctx context.Context) ([]Ch
 		var id, mediaPath, extraRaw string
 		if err := rows.Scan(&id, &mediaPath, &extraRaw); err != nil {
 			return nil, err
+		}
+		mediaPath = strings.TrimSpace(mediaPath)
+		if mediaPath == "" {
+			continue
 		}
 		if _, ok := seen[id]; ok {
 			continue
@@ -4139,7 +4209,7 @@ func (r *LibraryRepo) ListChapterExtractionCandidates(ctx context.Context) ([]Ch
 		}
 		out = append(out, ChapterExtractionCandidate{
 			ItemID:    id,
-			MediaPath: strings.TrimSpace(mediaPath),
+			MediaPath: mediaPath,
 			Chapters:  extra.Chapters,
 		})
 	}
@@ -4150,15 +4220,23 @@ func (r *LibraryRepo) ListChapterExtractionCandidates(ctx context.Context) ([]Ch
 }
 
 // ListBIFCandidates returns all video items eligible for scheduled BIF preview generation.
+// Local non-remote, non-.strm media sources are prioritized ahead of remote/STRM sources.
 func (r *LibraryRepo) ListBIFCandidates(ctx context.Context) ([]BIFCandidate, error) {
 	rows, err := r.store.Reader.QueryContext(ctx, `
 		SELECT i.id,
-		       COALESCE(NULLIF(ms.path, ''), i.path, '')
+		       COALESCE(NULLIF(TRIM(ms.path), ''), TRIM(COALESCE(i.path, '')), '')
 		FROM items i
 		LEFT JOIN item_media_sources ms ON ms.item_id = i.id
 		WHERE LOWER(COALESCE(i.media_type, '')) = 'video'
 		  AND i.type IN ('Movie', 'Episode', 'Video', 'MusicVideo', 'Trailer')
-		ORDER BY i.id ASC, ms.rowid ASC`)
+		ORDER BY i.id ASC,
+		         CASE WHEN COALESCE(NULLIF(TRIM(ms.path), ''), TRIM(COALESCE(i.path, '')), '') = '' THEN 1 ELSE 0 END ASC,
+		         CASE WHEN COALESCE(ms.is_remote, i.is_strm, 0) != 0
+		                   OR LOWER(COALESCE(NULLIF(TRIM(ms.path), ''), TRIM(COALESCE(i.path, '')), '')) LIKE '%.strm'
+		                   OR LOWER(COALESCE(NULLIF(TRIM(ms.path), ''), TRIM(COALESCE(i.path, '')), '')) LIKE 'http://%'
+		                   OR LOWER(COALESCE(NULLIF(TRIM(ms.path), ''), TRIM(COALESCE(i.path, '')), '')) LIKE 'https://%'
+		              THEN 1 ELSE 0 END ASC,
+		         ms.rowid ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -4171,16 +4249,17 @@ func (r *LibraryRepo) ListBIFCandidates(ctx context.Context) ([]BIFCandidate, er
 		if err := rows.Scan(&id, &mediaPath); err != nil {
 			return nil, err
 		}
+		mediaPath = strings.TrimSpace(mediaPath)
+		if mediaPath == "" {
+			continue
+		}
 		if _, ok := seen[id]; ok {
 			continue
 		}
 		seen[id] = struct{}{}
-		if strings.TrimSpace(mediaPath) == "" {
-			continue
-		}
 		out = append(out, BIFCandidate{
 			ItemID:    id,
-			MediaPath: strings.TrimSpace(mediaPath),
+			MediaPath: mediaPath,
 		})
 	}
 	if err := rows.Err(); err != nil {

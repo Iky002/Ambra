@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/auth"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
@@ -149,16 +150,36 @@ func (h *Handler) handleUpdateStartupUser(w http.ResponseWriter, r *http.Request
 		return
 	}
 	name := strings.TrimSpace(req.Name)
-	if name == "" {
-		httpx.Error(w, http.StatusBadRequest, "username is required")
+	if name == "" || len([]rune(name)) > 128 {
+		httpx.Error(w, http.StatusBadRequest, "username must be between 1 and 128 characters")
 		return
 	}
 	if strings.TrimSpace(req.Password) == "" {
 		httpx.Error(w, http.StatusBadRequest, "password is required")
 		return
 	}
+	if len([]rune(req.Password)) < 4 {
+		httpx.Error(w, http.StatusBadRequest, "password must be at least 4 characters")
+		return
+	}
 
 	if h.userRepo != nil {
+		h.setupMu.Lock()
+		defer h.setupMu.Unlock()
+
+		count, err := h.userRepo.CountUsers(r.Context())
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to check existing users")
+			return
+		}
+		if count > 0 && (h.auth.RequireAdmin != nil || h.auth.RequireAuth != nil) {
+			ac, ok := middleware.AuthFromContext(r.Context())
+			if !ok || ac == nil || !ac.IsAdmin() {
+				httpx.Error(w, http.StatusForbidden, "initial setup already completed")
+				return
+			}
+		}
+
 		hash, err := auth.HashPassword(req.Password)
 		if err != nil {
 			httpx.Error(w, http.StatusInternalServerError, "failed to hash password")

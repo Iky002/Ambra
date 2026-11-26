@@ -458,42 +458,46 @@ export function DashboardTab() {
             error={logsError}
             onRetry={() => void refetchLogs()}
           />
-        ) : activityItems.length === 0 ? (
+        ) : activityItems.length === 0 && totalActivityCount === 0 ? (
           <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-10 text-center text-xs text-zinc-500">
             暂无活动日志记录
           </div>
-        ) : filteredActivityItems.length === 0 ? (
-          <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-10 text-center text-xs text-zinc-500">
-            当前筛选条件下无匹配的活动日志
-          </div>
         ) : (
           <div className="overflow-hidden rounded-2xl border border-white/8 bg-white/[0.02]">
-            <div className="divide-y divide-white/6">
-              {filteredActivityItems.map((entry) => (
-                <div
-                  key={entry.Id}
-                  className="flex flex-col gap-1.5 px-4 py-3 text-xs sm:flex-row sm:items-center sm:justify-between"
-                >
-                  <div className="flex min-w-0 items-start gap-2.5">
-                    <SeverityBadge severity={entry.Severity} />
-                    <div className="min-w-0">
-                      <p className="font-medium text-zinc-200">{entry.Name}</p>
-                      {(entry.ShortOverview || entry.Overview) && (
-                        <p className="mt-0.5 truncate text-zinc-400">
-                          {entry.ShortOverview || entry.Overview}
-                        </p>
-                      )}
+            {filteredActivityItems.length === 0 ? (
+              <div className="py-10 text-center text-xs text-zinc-500">
+                当前页筛选条件下无匹配的活动日志
+              </div>
+            ) : (
+              <div className="divide-y divide-white/6">
+                {filteredActivityItems.map((entry) => (
+                  <div
+                    key={entry.Id}
+                    className="flex flex-col gap-1.5 px-4 py-3 text-xs sm:flex-row sm:items-center sm:justify-between"
+                  >
+                    <div className="flex min-w-0 items-start gap-2.5">
+                      <SeverityBadge severity={entry.Severity} />
+                      <div className="min-w-0">
+                        <p className="font-medium text-zinc-200">{entry.Name}</p>
+                        {(entry.ShortOverview || entry.Overview) && (
+                          <p className="mt-0.5 truncate text-zinc-400">
+                            {entry.ShortOverview || entry.Overview}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2 text-[11px] text-zinc-500">
+                      <span className="rounded bg-white/5 px-1.5 py-0.5 font-mono text-zinc-400">
+                        {entry.Type}
+                      </span>
+                      <span title={formatDateTime(entry.Date)}>
+                        {formatRelativeTime(entry.Date)}
+                      </span>
                     </div>
                   </div>
-                  <div className="flex shrink-0 items-center gap-2 text-[11px] text-zinc-500">
-                    <span className="rounded bg-white/5 px-1.5 py-0.5 font-mono text-zinc-400">
-                      {entry.Type}
-                    </span>
-                    <span title={formatDateTime(entry.Date)}>{formatRelativeTime(entry.Date)}</span>
-                  </div>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            )}
 
             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-white/8 bg-white/[0.02] px-4 py-2.5 text-xs text-zinc-400">
               <span>

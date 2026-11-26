@@ -103,6 +103,7 @@ func TestPhaseBWaveOrderSeasonEpisodeAndActorAvatars(t *testing.T) {
 	tmdbProv.SetHTTPClient(srv.Client())
 	_ = tmdbProv.Configure(map[string]any{
 		"base_url":       srv.URL,
+		"api_key":        "test-api-key",
 		"image_base_url": srv.URL,
 	})
 	reg.Register(tmdbProv)

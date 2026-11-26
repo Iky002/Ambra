@@ -50,7 +50,10 @@ export function ScanProgressBar({
     queryFn: () => api.getScanProgress(),
     enabled,
     retry: false,
-    refetchInterval: (query) => (query.state.data?.running ? 1000 : 8000),
+    refetchInterval: (query) => {
+      if (query.state.status === 'error') return 30_000
+      return query.state.data?.running ? 1000 : 8000
+    },
   })
 
   useEffect(() => {

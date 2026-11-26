@@ -316,7 +316,14 @@ describe('v0.9.5 Admin Error States, Modals, ActivityLog, WeeklyTrigger & Demo M
     fireEvent.click(downloadBtn)
     expect(createObjectURLSpy).toHaveBeenCalledTimes(1)
     expect(anchorClickSpy).toHaveBeenCalledTimes(1)
-    expect(revokeObjectURLSpy).toHaveBeenCalledWith('blob:mock-log-url')
+    // M-18: 延迟 1000ms 释放 ObjectURL，防止慢速下载被提前中止
+    expect(revokeObjectURLSpy).not.toHaveBeenCalled()
+    await waitFor(
+      () => {
+        expect(revokeObjectURLSpy).toHaveBeenCalledWith('blob:mock-log-url')
+      },
+      { timeout: 2000 },
+    )
   })
 
   it('LibrariesTab / PluginsTab / SettingsTab 查询失败时渲染 QueryErrorState 而非空状态', async () => {

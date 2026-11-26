@@ -538,16 +538,29 @@ func TestCompatExtUnifiedStateRBACAndOfflineActionsCap(t *testing.T) {
 		t.Fatalf("alice delete own sync job: %d", w.Code)
 	}
 
-	// 4. OfflineActions capped to latest 500 entries
-	actions := make([]OfflineAction, 550)
-	for i := range actions {
-		actions[i] = OfflineAction{ItemId: "item-" + string(rune('0'+i%10)), Type: "Played"}
+	// 4. OfflineActions rejects >500 per request (400) and caps total stored entries at 500 across batches
+	tooMany := make([]OfflineAction, maxOfflineActions+1)
+	for i := range tooMany {
+		tooMany[i] = OfflineAction{ItemId: "item-" + string(rune('0'+i%10)), Type: "Played"}
 	}
-	rawActions, _ := json.Marshal(actions)
+	rawTooMany, _ := json.Marshal(tooMany)
 	w = httptest.NewRecorder()
-	router.ServeHTTP(w, withUser(httptest.NewRequest(http.MethodPost, "/Sync/OfflineActions", strings.NewReader(string(rawActions))), alice))
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("offline actions bulk: %d", w.Code)
+	router.ServeHTTP(w, withUser(httptest.NewRequest(http.MethodPost, "/Sync/OfflineActions", strings.NewReader(string(rawTooMany))), alice))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for >500 offline actions in one request, got %d", w.Code)
+	}
+
+	batch := make([]OfflineAction, 300)
+	for i := range batch {
+		batch[i] = OfflineAction{ItemId: "item-" + string(rune('0'+i%10)), Type: "Played"}
+	}
+	rawBatch, _ := json.Marshal(batch)
+	for b := 0; b < 2; b++ {
+		w = httptest.NewRecorder()
+		router.ServeHTTP(w, withUser(httptest.NewRequest(http.MethodPost, "/Sync/OfflineActions", strings.NewReader(string(rawBatch))), alice))
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("offline actions batch %d: %d", b, w.Code)
+		}
 	}
 	h.mu.RLock()
 	actionCount := len(h.state.OfflineActions)

@@ -523,8 +523,8 @@ func TestApplyTagsToLibraryNonDestructiveIdempotentAndEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SyncAndApply: %v", err)
 	}
-	if summary.MatchedItems != 2 || summary.TagsAdded != 5 {
-		t.Fatalf("expected matched=2, tagsAdded=5, got %+v", summary)
+	if summary.MatchedItems != 2 || summary.TagsAdded != 4 {
+		t.Fatalf("expected matched=2, tagsAdded=4, got %+v", summary)
 	}
 
 	// Verify user custom tags were preserved alongside new ranking tags.
@@ -533,8 +533,9 @@ func TestApplyTagsToLibraryNonDestructiveIdempotentAndEvent(t *testing.T) {
 	if strings.Join(m1Tags, ",") != wantM1 {
 		t.Fatalf("movie1 tags = %q, want %q", strings.Join(m1Tags, ","), wantM1)
 	}
+	// Series must NOT receive movie-only IMDb Top250 tag.
 	s1Tags := getItemTags(t, store, series1.ID)
-	wantS1 := TagIMDbTop250 + "," + TagTMDBTrendingSpecific + "," + TagTMDBTrending
+	wantS1 := TagTMDBTrendingSpecific + "," + TagTMDBTrending
 	if strings.Join(s1Tags, ",") != wantS1 {
 		t.Fatalf("series1 tags = %v, want %q", s1Tags, wantS1)
 	}

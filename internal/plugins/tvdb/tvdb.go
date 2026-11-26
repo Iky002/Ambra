@@ -107,6 +107,14 @@ func (p *Provider) Manifest() plugins.Manifest {
 	}
 }
 
+func urlHostLower(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(u.Host))
+}
+
 func (p *Provider) Configure(cfg map[string]any) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -116,7 +124,10 @@ func (p *Provider) Configure(cfg map[string]any) error {
 	}
 
 	authChanged := false
+	hasNewKey := false
+	hasNewPin := false
 	if v, ok := getString(cfg, "api_key", "ApiKey", "tvdb_api_key"); ok {
+		hasNewKey = true
 		trimmed := strings.TrimSpace(v)
 		if trimmed != p.apiKey {
 			p.apiKey = trimmed
@@ -124,6 +135,7 @@ func (p *Provider) Configure(cfg map[string]any) error {
 		}
 	}
 	if v, ok := getString(cfg, "pin", "Pin", "tvdb_pin"); ok {
+		hasNewPin = true
 		trimmed := strings.TrimSpace(v)
 		if trimmed != p.pin {
 			p.pin = trimmed
@@ -141,6 +153,14 @@ func (p *Provider) Configure(cfg map[string]any) error {
 		u, err := url.Parse(trimmed)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return fmt.Errorf("tvdb: invalid base_url %q: must use http or https scheme with host", v)
+		}
+		if urlHostLower(trimmed) != urlHostLower(p.baseURL) {
+			if !hasNewKey {
+				p.apiKey = ""
+			}
+			if !hasNewPin {
+				p.pin = ""
+			}
 		}
 		if trimmed != p.baseURL {
 			p.baseURL = trimmed

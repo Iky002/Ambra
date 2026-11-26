@@ -34,6 +34,17 @@ export function ImageManagerModal({
 }: ImageManagerModalProps) {
   const queryClient = useQueryClient()
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const mountedRef = useRef(true)
+  const activeReaderRef = useRef<FileReader | null>(null)
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      activeReaderRef.current?.abort()
+      activeReaderRef.current = null
+    }
+  }, [])
 
   const [activeTab, setActiveTab] = useState<ModalTab>('current')
   const [remoteType, setRemoteType] = useState<ImageKind>('Primary')
@@ -47,6 +58,10 @@ export function ImageManagerModal({
   const itemId = item?.Id || ''
 
   useEffect(() => {
+    if (!open) {
+      activeReaderRef.current?.abort()
+      activeReaderRef.current = null
+    }
     setActiveTab('current')
     setRemoteType('Primary')
     setUploadType('Primary')
@@ -159,8 +174,12 @@ export function ImageManagerModal({
       setFeedback({ type: 'error', message: '图片文件过大，请选择不超过 15 MB 的图片' })
       return
     }
+    activeReaderRef.current?.abort()
     const reader = new FileReader()
+    activeReaderRef.current = reader
     reader.onload = () => {
+      if (!mountedRef.current || activeReaderRef.current !== reader) return
+      activeReaderRef.current = null
       const result = typeof reader.result === 'string' ? reader.result : ''
       if (!result) {
         setFeedback({ type: 'error', message: '读取本地图片失败' })
@@ -173,6 +192,8 @@ export function ImageManagerModal({
       })
     }
     reader.onerror = () => {
+      if (!mountedRef.current || activeReaderRef.current !== reader) return
+      activeReaderRef.current = null
       setFeedback({ type: 'error', message: '读取本地图片失败' })
     }
     reader.readAsDataURL(file)

@@ -109,9 +109,27 @@ func (h *Handler) handleListReviews(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	total := len(items)
+	start := q.Int("StartIndex", 0)
+	limit := q.Int("Limit", 0)
+	if start < 0 {
+		start = 0
+	}
+	page := items
+	if start > 0 || limit > 0 {
+		if start >= total {
+			page = items[:0]
+		} else {
+			end := total
+			if limit > 0 && start+limit < end {
+				end = start + limit
+			}
+			page = items[start:end]
+		}
+	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
-		"Items":            items,
-		"TotalRecordCount": len(items),
+		"Items":            page,
+		"TotalRecordCount": total,
 	})
 }
 

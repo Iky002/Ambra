@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -33,7 +34,7 @@ type Handler struct {
 	store    *sqlite.Store
 	auth     AuthFuncs
 
-	cfgMu   sync.Mutex
+	cfgMu   sync.RWMutex
 	mu      sync.RWMutex
 	tracked map[string]plugins.Plugin
 	configs map[string]map[string]any
@@ -177,7 +178,11 @@ func (h *Handler) handleGetConfiguration(w http.ResponseWriter, r *http.Request)
 		httpx.Error(w, http.StatusNotFound, "plugin not found")
 		return
 	}
+	h.cfgMu.RLock()
 	manifest := p.Manifest()
+	saved, err := h.loadSavedConfig(r.Context(), id)
+	h.cfgMu.RUnlock()
+
 	out := map[string]any{
 		"id":       manifest.ID,
 		"name":     manifest.Name,
@@ -189,7 +194,6 @@ func (h *Handler) handleGetConfiguration(w http.ResponseWriter, r *http.Request)
 		"Priority": manifest.Priority,
 	}
 
-	saved, err := h.loadSavedConfig(r.Context(), id)
 	if err == nil {
 		for k, v := range maskSensitiveMap(saved) {
 			out[k] = v
@@ -426,7 +430,13 @@ func mergePluginConfigInternal(prev, incoming map[string]any, forceSensitive boo
 		existingByLower[strings.ToLower(k)] = k
 		existingByNorm[normalizeConfigKeyLookup(k)] = k
 	}
-	for k, v := range incoming {
+	keys := make([]string, 0, len(incoming))
+	for k := range incoming {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := incoming[k]
 		targetKey := k
 		if ek, ok := existingByLower[strings.ToLower(k)]; ok {
 			targetKey = ek

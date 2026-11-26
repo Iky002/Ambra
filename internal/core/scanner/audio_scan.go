@@ -186,8 +186,12 @@ func (s *Scanner) ensureMusicArtist(
 	if err == nil && existing != nil {
 		cache[artistPath] = existing
 		if parsed.ArtistDir != "" && s.isMissingPrimaryImage(ctx, existing.ID) {
-			if imgs := discoverMusicDirImages(existing.ID, parsed.ArtistDir, []string{"artist", "folder", "poster", "cover"}); len(imgs) > 0 {
-				_ = s.repo.ReplaceItemImages(ctx, existing.ID, imgs)
+			libRoot := findContainingRoot(lib.Paths, parsed.ArtistDir)
+			if libRoot == "" {
+				libRoot = parsed.ArtistDir
+			}
+			if imgs := discoverMusicDirImagesWithPolicy(libRoot, existing.ID, parsed.ArtistDir, []string{"artist", "folder", "poster", "cover"}, s.currentSymlinkPolicy()); len(imgs) > 0 {
+				_ = s.upsertLocalImagesPreservingExisting(ctx, existing.ID, imgs)
 			}
 		}
 		return existing, nil
@@ -216,8 +220,12 @@ func (s *Scanner) ensureMusicArtist(
 		return nil, err
 	}
 	if parsed.ArtistDir != "" {
-		if imgs := discoverMusicDirImages(rec.ID, parsed.ArtistDir, []string{"artist", "folder", "poster", "cover"}); len(imgs) > 0 {
-			_ = s.repo.ReplaceItemImages(ctx, rec.ID, imgs)
+		libRoot := findContainingRoot(lib.Paths, parsed.ArtistDir)
+		if libRoot == "" {
+			libRoot = parsed.ArtistDir
+		}
+		if imgs := discoverMusicDirImagesWithPolicy(libRoot, rec.ID, parsed.ArtistDir, []string{"artist", "folder", "poster", "cover"}, s.currentSymlinkPolicy()); len(imgs) > 0 {
+			_ = s.upsertLocalImagesPreservingExisting(ctx, rec.ID, imgs)
 		}
 	}
 	_ = s.repo.UpsertSearchFTS(ctx, rec.ID, rec.Name, TokenizeForFTS(rec.Name), "", "", "")
@@ -245,8 +253,12 @@ func (s *Scanner) ensureMusicAlbum(
 	if err == nil && existing != nil {
 		cache[albumPath] = existing
 		if parsed.AlbumDir != "" && s.isMissingPrimaryImage(ctx, existing.ID) {
-			if imgs := discoverMusicDirImages(existing.ID, parsed.AlbumDir, []string{"cover", "folder", "front", "album", "poster"}); len(imgs) > 0 {
-				_ = s.repo.ReplaceItemImages(ctx, existing.ID, imgs)
+			libRoot := findContainingRoot(lib.Paths, parsed.AlbumDir)
+			if libRoot == "" {
+				libRoot = parsed.AlbumDir
+			}
+			if imgs := discoverMusicDirImagesWithPolicy(libRoot, existing.ID, parsed.AlbumDir, []string{"cover", "folder", "front", "album", "poster"}, s.currentSymlinkPolicy()); len(imgs) > 0 {
+				_ = s.upsertLocalImagesPreservingExisting(ctx, existing.ID, imgs)
 			}
 		}
 		return existing, nil
@@ -298,8 +310,12 @@ func (s *Scanner) ensureMusicAlbum(
 		return nil, err
 	}
 	if parsed.AlbumDir != "" {
-		if imgs := discoverMusicDirImages(rec.ID, parsed.AlbumDir, []string{"cover", "folder", "front", "album", "poster"}); len(imgs) > 0 {
-			_ = s.repo.ReplaceItemImages(ctx, rec.ID, imgs)
+		libRoot := findContainingRoot(lib.Paths, parsed.AlbumDir)
+		if libRoot == "" {
+			libRoot = parsed.AlbumDir
+		}
+		if imgs := discoverMusicDirImagesWithPolicy(libRoot, rec.ID, parsed.AlbumDir, []string{"cover", "folder", "front", "album", "poster"}, s.currentSymlinkPolicy()); len(imgs) > 0 {
+			_ = s.upsertLocalImagesPreservingExisting(ctx, rec.ID, imgs)
 		}
 	}
 	_ = s.repo.UpsertSearchFTS(ctx, rec.ID, rec.Name, TokenizeForFTS(rec.Name, parsed.Artist), "", "", parsed.Artist)
@@ -309,9 +325,16 @@ func (s *Scanner) ensureMusicAlbum(
 }
 
 func discoverMusicDirImages(itemID, dir string, primaryStems []string) []sqlite.ImageRecord {
+	return discoverMusicDirImagesWithPolicy(dir, itemID, dir, primaryStems, SymlinkFollowDirect)
+}
+
+func discoverMusicDirImagesWithPolicy(libRoot, itemID, dir string, primaryStems []string, policy SymlinkPolicy) []sqlite.ImageRecord {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
+	}
+	if strings.TrimSpace(libRoot) == "" {
+		libRoot = dir
 	}
 
 	byStem := make(map[string]string)
@@ -321,8 +344,17 @@ func discoverMusicDirImages(itemID, dir string, primaryStems []string) []sqlite.
 			continue
 		}
 		name := entry.Name()
-		stem := strings.ToLower(strings.TrimSuffix(name, filepath.Ext(name)))
 		fullPath := filepath.Join(dir, name)
+		allowed, isSym := isSymlinkAllowedInRoot(libRoot, fullPath, policy)
+		if !allowed {
+			continue
+		}
+		if isSym {
+			if st, statErr := os.Stat(fullPath); statErr != nil || st.IsDir() {
+				continue
+			}
+		}
+		stem := strings.ToLower(strings.TrimSuffix(name, filepath.Ext(name)))
 		if _, exists := byStem[stem]; !exists {
 			byStem[stem] = fullPath
 		}

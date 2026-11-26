@@ -224,6 +224,31 @@ func (m *Manager) shouldRecordActivityLog(userID, itemID, eventType string, now 
 	return true
 }
 
+func (m *Manager) serverID() string {
+	if m == nil || m.cfg == nil {
+		return ""
+	}
+	return m.cfg.Snapshot().ServerID
+}
+
+func (m *Manager) playedThreshold() float64 {
+	if m == nil || m.cfg == nil {
+		return defaultPlayedThreshold
+	}
+	threshold := m.cfg.Snapshot().PlayedThreshold
+	if threshold <= 0 || threshold > 1 {
+		return defaultPlayedThreshold
+	}
+	return threshold
+}
+
+func (m *Manager) hasLibraryRepo() bool {
+	m.mu.RLock()
+	has := m.libRepo != nil
+	m.mu.RUnlock()
+	return has
+}
+
 func (m *Manager) touchSessionLocked(user *sqlite.UserRecord, client auth.ClientInfo, now time.Time) *sessionEntry {
 	deviceID := client.DeviceID
 	if deviceID == "" {
@@ -237,7 +262,7 @@ func (m *Manager) touchSessionLocked(user *sqlite.UserRecord, client auth.Client
 		entry = &sessionEntry{
 			info: dto.SessionInfo{
 				Id:                 sid,
-				ServerId:           m.cfg.ServerID,
+				ServerId:           m.serverID(),
 				UserId:             user.ID,
 				UserName:           user.Name,
 				Client:             fallback(client.Client, "Ambra Client"),
@@ -417,26 +442,29 @@ func (m *Manager) ReportPlaybackStart(ctx context.Context, user *sqlite.UserReco
 	now := time.Now().UTC()
 
 	var nowPlaying *dto.BaseItemDto
-	if req.Item != nil {
-		itemCopy := *req.Item
+	if itemID != "" && m.hasLibraryRepo() {
+		// Always construct NowPlayingItem from authoritative server metadata instead of trusting client req.Item.
+		nowPlaying = &dto.BaseItemDto{
+			Id:       itemID,
+			ServerId: m.serverID(),
+		}
+		m.hydrateNowPlayingItem(ctx, user, nowPlaying, itemID)
+	} else if req.Item != nil {
+		itemCopy := cloneBaseItemDto(req.Item)
 		if itemCopy.Id == "" {
 			itemCopy.Id = itemID
 		} else if itemID == "" {
 			itemID = guid.Normalize(itemCopy.Id)
 		}
 		if itemCopy.ServerId == "" {
-			itemCopy.ServerId = m.cfg.ServerID
+			itemCopy.ServerId = m.serverID()
 		}
-		if itemCopy.Name == "" && itemID != "" {
-			m.hydrateNowPlayingItem(ctx, user, &itemCopy, itemID)
-		}
-		nowPlaying = &itemCopy
+		nowPlaying = itemCopy
 	} else if itemID != "" {
 		nowPlaying = &dto.BaseItemDto{
 			Id:       itemID,
-			ServerId: m.cfg.ServerID,
+			ServerId: m.serverID(),
 		}
-		m.hydrateNowPlayingItem(ctx, user, nowPlaying, itemID)
 	}
 
 	var runtimeTicks int64
@@ -537,7 +565,7 @@ func (m *Manager) ReportPlaybackProgress(ctx context.Context, user *sqlite.UserR
 	if itemID != "" && entry.info.NowPlayingItem == nil {
 		entry.info.NowPlayingItem = &dto.BaseItemDto{
 			Id:       itemID,
-			ServerId: m.cfg.ServerID,
+			ServerId: m.serverID(),
 		}
 	}
 	if itemID == "" && entry.info.NowPlayingItem != nil {
@@ -676,10 +704,7 @@ func (m *Manager) ReportPlaybackStopped(ctx context.Context, user *sqlite.UserRe
 		runtimeTicks = req.RuntimeTicks
 	}
 
-	threshold := m.cfg.PlayedThreshold
-	if threshold <= 0 || threshold > 1 {
-		threshold = defaultPlayedThreshold
-	}
+	threshold := m.playedThreshold()
 
 	pos := req.PositionTicks
 	if pos < 0 {
@@ -851,11 +876,89 @@ func (m *Manager) publishUserDataChanged(ctx context.Context, userID string, ud 
 	})
 }
 
+func cloneBaseItemDto(in *dto.BaseItemDto) *dto.BaseItemDto {
+	if in == nil {
+		return nil
+	}
+	cp := *in
+	if in.Taglines != nil {
+		cp.Taglines = append([]string(nil), in.Taglines...)
+	}
+	if in.Tags != nil {
+		cp.Tags = append([]string(nil), in.Tags...)
+	}
+	if in.Genres != nil {
+		cp.Genres = append([]string(nil), in.Genres...)
+	}
+	if in.GenreItems != nil {
+		cp.GenreItems = append([]dto.NameIdPair(nil), in.GenreItems...)
+	}
+	if in.ProviderIds != nil {
+		cp.ProviderIds = make(map[string]string, len(in.ProviderIds))
+		for k, v := range in.ProviderIds {
+			cp.ProviderIds[k] = v
+		}
+	}
+	if in.ParentBackdropImageTags != nil {
+		cp.ParentBackdropImageTags = append([]string(nil), in.ParentBackdropImageTags...)
+	}
+	if in.Artists != nil {
+		cp.Artists = append([]string(nil), in.Artists...)
+	}
+	if in.Studios != nil {
+		cp.Studios = append([]dto.NameIdPair(nil), in.Studios...)
+	}
+	if in.People != nil {
+		cp.People = append([]dto.BaseItemPerson(nil), in.People...)
+	}
+	if in.Chapters != nil {
+		cp.Chapters = append([]dto.ChapterInfo(nil), in.Chapters...)
+	}
+	if in.MediaSources != nil {
+		cp.MediaSources = make([]dto.MediaSourceInfo, len(in.MediaSources))
+		for i, ms := range in.MediaSources {
+			msCopy := ms
+			if ms.MediaStreams != nil {
+				msCopy.MediaStreams = append([]dto.MediaStream(nil), ms.MediaStreams...)
+			}
+			if ms.DefaultAudioStreamIndex != nil {
+				v := *ms.DefaultAudioStreamIndex
+				msCopy.DefaultAudioStreamIndex = &v
+			}
+			if ms.DefaultSubtitleStreamIndex != nil {
+				v := *ms.DefaultSubtitleStreamIndex
+				msCopy.DefaultSubtitleStreamIndex = &v
+			}
+			cp.MediaSources[i] = msCopy
+		}
+	}
+	if in.MediaStreams != nil {
+		cp.MediaStreams = append([]dto.MediaStream(nil), in.MediaStreams...)
+	}
+	if in.ImageTags != nil {
+		cp.ImageTags = make(map[string]string, len(in.ImageTags))
+		for k, v := range in.ImageTags {
+			cp.ImageTags[k] = v
+		}
+	}
+	if in.BackdropImageTags != nil {
+		cp.BackdropImageTags = append([]string(nil), in.BackdropImageTags...)
+	}
+	return &cp
+}
+
 func cloneSession(in dto.SessionInfo) dto.SessionInfo {
 	out := in
+	if in.PlayState.AudioStreamIndex != nil {
+		v := *in.PlayState.AudioStreamIndex
+		out.PlayState.AudioStreamIndex = &v
+	}
+	if in.PlayState.SubtitleStreamIndex != nil {
+		v := *in.PlayState.SubtitleStreamIndex
+		out.PlayState.SubtitleStreamIndex = &v
+	}
 	if in.NowPlayingItem != nil {
-		itemCopy := *in.NowPlayingItem
-		out.NowPlayingItem = &itemCopy
+		out.NowPlayingItem = cloneBaseItemDto(in.NowPlayingItem)
 	}
 	if in.PlayableMediaTypes != nil {
 		out.PlayableMediaTypes = append([]string(nil), in.PlayableMediaTypes...)

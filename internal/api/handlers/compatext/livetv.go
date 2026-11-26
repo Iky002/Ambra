@@ -77,6 +77,7 @@ type liveTVTunerHost struct {
 	FriendlyName         string `json:"FriendlyName,omitempty"`
 	ImportFavoritesOnly  bool   `json:"ImportFavoritesOnly,omitempty"`
 	AllowHWTranscoding   bool   `json:"AllowHWTranscoding,omitempty"`
+	AllowPrivateNetwork  bool   `json:"AllowPrivateNetwork,omitempty"`
 	TunerCount           int    `json:"TunerCount,omitempty"`
 	UserAgent            string `json:"UserAgent,omitempty"`
 	M3UContent           string `json:"M3UContent,omitempty"`
@@ -142,8 +143,9 @@ func (h *Handler) registerLiveTVRoutes(r chi.Router, wrapAuth, wrapAdmin func(ht
 		r.Get("/LiveTv/LiveStreamFiles/{Id}/hls/{Segment}", h.handleLiveStreamHLS(false))
 		r.Head("/LiveTv/LiveStreamFiles/{Id}/hls/{Segment}", h.handleLiveStreamHLS(true))
 
-		// LiveRecordings (7 routes)
+		// LiveRecordings (8 routes)
 		r.Get("/LiveTv/LiveRecordings/{Id}/stream", h.handleLiveRecordingStream)
+		r.Head("/LiveTv/LiveRecordings/{Id}/stream", h.handleLiveRecordingStream)
 		r.Get("/LiveTv/LiveRecordings/{Id}/hls/master.m3u8", h.handleLiveRecordingHLS(false))
 		r.Head("/LiveTv/LiveRecordings/{Id}/hls/master.m3u8", h.handleLiveRecordingHLS(true))
 		r.Get("/LiveTv/LiveRecordings/{Id}/hls/live.m3u8", h.handleLiveRecordingHLS(false))
@@ -234,7 +236,148 @@ func (h *Handler) lookupChannel(ctx context.Context, id string) (liveTVChannel, 
 	return liveTVChannel{}, false
 }
 
+func (h *Handler) snapshotLiveTVChannels(ctx context.Context) []liveTVChannel {
+	h.mu.RLock()
+	lt := h.liveTV
+	h.mu.RUnlock()
+	if lt != nil {
+		src := lt.SnapshotChannels()
+		out := make([]liveTVChannel, len(src))
+		for i, ch := range src {
+			out[i] = liveTVChannel{
+				Id:          ch.Id,
+				Name:        ch.Name,
+				ServerId:    ch.ServerId,
+				Type:        ch.Type,
+				ChannelType: ch.ChannelType,
+				Number:      ch.Number,
+				TvgId:       ch.TvgId,
+				LogoUrl:     ch.LogoUrl,
+				GroupTitle:  ch.GroupTitle,
+				StreamUrl:   ch.StreamUrl,
+				TunerHostId: ch.TunerHostId,
+				Disabled:    ch.Disabled,
+				SortIndex:   ch.SortIndex,
+			}
+		}
+		return out
+	}
+	var st sharedLiveTVState
+	_ = h.readConfigJSON(ctx, liveTVConfigKey, &st)
+	return st.Channels
+}
+
+func (h *Handler) snapshotLiveTVPrograms(ctx context.Context) []liveTVProgram {
+	h.mu.RLock()
+	lt := h.liveTV
+	h.mu.RUnlock()
+	if lt != nil {
+		src := lt.SnapshotPrograms()
+		out := make([]liveTVProgram, len(src))
+		for i, p := range src {
+			out[i] = liveTVProgram{
+				Id:          p.Id,
+				Name:        p.Name,
+				ServerId:    p.ServerId,
+				Type:        p.Type,
+				ChannelId:   p.ChannelId,
+				ChannelName: p.ChannelName,
+				Overview:    p.Overview,
+				StartDate:   p.StartDate,
+				EndDate:     p.EndDate,
+				IsMovie:     p.IsMovie,
+				IsSeries:    p.IsSeries,
+				IsLive:      p.IsLive,
+			}
+		}
+		return out
+	}
+	var st sharedLiveTVState
+	_ = h.readConfigJSON(ctx, liveTVConfigKey, &st)
+	return st.Programs
+}
+
+func (h *Handler) snapshotLiveTVTunerHosts(ctx context.Context) []liveTVTunerHost {
+	h.mu.RLock()
+	lt := h.liveTV
+	h.mu.RUnlock()
+	if lt != nil {
+		src := lt.SnapshotTunerHosts()
+		out := make([]liveTVTunerHost, len(src))
+		for i, t := range src {
+			out[i] = liveTVTunerHost{
+				Id:                   t.Id,
+				Url:                  t.Url,
+				Type:                 t.Type,
+				DeviceId:             t.DeviceId,
+				FriendlyName:         t.FriendlyName,
+				ImportFavoritesOnly:  t.ImportFavoritesOnly,
+				AllowHWTranscoding:   t.AllowHWTranscoding,
+				AllowPrivateNetwork:  t.AllowPrivateNetwork,
+				TunerCount:           t.TunerCount,
+				UserAgent:            t.UserAgent,
+				M3UContent:           t.M3UContent,
+				ImportedChannelCount: t.ImportedChannelCount,
+			}
+		}
+		return out
+	}
+	var st sharedLiveTVState
+	_ = h.readConfigJSON(ctx, liveTVConfigKey, &st)
+	if st.TunerHosts == nil {
+		return []liveTVTunerHost{}
+	}
+	return st.TunerHosts
+}
+
+func (h *Handler) snapshotLiveTVListingProviders(ctx context.Context) []liveTVListingProvider {
+	h.mu.RLock()
+	lt := h.liveTV
+	h.mu.RUnlock()
+	if lt != nil {
+		src := lt.SnapshotListingProviders()
+		out := make([]liveTVListingProvider, len(src))
+		for i, lp := range src {
+			out[i] = liveTVListingProvider{
+				Id:       lp.Id,
+				Type:     lp.Type,
+				Path:     lp.Path,
+				Username: lp.Username,
+				Listings: lp.Listings,
+				Country:  lp.Country,
+			}
+		}
+		return out
+	}
+	var st sharedLiveTVState
+	_ = h.readConfigJSON(ctx, liveTVConfigKey, &st)
+	if st.ListingProviders == nil {
+		return []liveTVListingProvider{}
+	}
+	return st.ListingProviders
+}
+
 func (h *Handler) lookupRecording(ctx context.Context, id string) (liveTVRecording, bool) {
+	h.mu.RLock()
+	lt := h.liveTV
+	h.mu.RUnlock()
+	if lt != nil {
+		if rec, ok := lt.GetRecordingByID(id); ok && rec != nil {
+			return liveTVRecording{
+				Id:          rec.Id,
+				Name:        rec.Name,
+				ServerId:    rec.ServerId,
+				Type:        rec.Type,
+				ChannelId:   rec.ChannelId,
+				ChannelName: rec.ChannelName,
+				ProgramId:   rec.ProgramId,
+				Status:      rec.Status,
+				StartDate:   rec.StartDate,
+				EndDate:     rec.EndDate,
+				Path:        rec.Path,
+			}, true
+		}
+	}
 	var st sharedLiveTVState
 	if h.readConfigJSON(ctx, liveTVConfigKey, &st) {
 		for _, rec := range st.Recordings {
@@ -452,11 +595,10 @@ func (h *Handler) handleEPG(w http.ResponseWriter, r *http.Request) {
 		channelFilter[cid] = struct{}{}
 	}
 
-	var st sharedLiveTVState
-	_ = h.readConfigJSON(r.Context(), liveTVConfigKey, &st)
+	programs := h.snapshotLiveTVPrograms(r.Context())
 
-	items := make([]liveTVProgram, 0, len(st.Programs))
-	for _, p := range st.Programs {
+	items := make([]liveTVProgram, 0, len(programs))
+	for _, p := range programs {
 		if len(channelFilter) > 0 {
 			if _, ok := channelFilter[p.ChannelId]; !ok {
 				continue
@@ -473,12 +615,11 @@ func (h *Handler) handleEPG(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleManageChannels(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
-	var st sharedLiveTVState
-	_ = h.readConfigJSON(r.Context(), liveTVConfigKey, &st)
+	channels := h.snapshotLiveTVChannels(r.Context())
 
 	h.mu.RLock()
-	out := make([]ChannelManagementInfo, 0, len(st.Channels))
-	for i, ch := range st.Channels {
+	out := make([]ChannelManagementInfo, 0, len(channels))
+	for i, ch := range channels {
 		sortIdx := i
 		if ch.SortIndex != 0 {
 			sortIdx = ch.SortIndex
@@ -632,11 +773,10 @@ func (h *Handler) handleResetTuner(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) collectChannelTags(r *http.Request) []string {
-	var st sharedLiveTVState
-	_ = h.readConfigJSON(r.Context(), liveTVConfigKey, &st)
+	channels := h.snapshotLiveTVChannels(r.Context())
 	seen := make(map[string]struct{})
 	var tags []string
-	for _, ch := range st.Channels {
+	for _, ch := range channels {
 		tag := strings.TrimSpace(ch.GroupTitle)
 		if tag == "" {
 			continue
@@ -779,12 +919,7 @@ func filterRawByID(items []json.RawMessage, removeID string) []json.RawMessage {
 }
 
 func (h *Handler) handleGetTunerHosts(w http.ResponseWriter, r *http.Request) {
-	var st sharedLiveTVState
-	_ = h.readConfigJSON(r.Context(), liveTVConfigKey, &st)
-	if st.TunerHosts == nil {
-		st.TunerHosts = []liveTVTunerHost{}
-	}
-	httpx.JSON(w, http.StatusOK, st.TunerHosts)
+	httpx.JSON(w, http.StatusOK, h.snapshotLiveTVTunerHosts(r.Context()))
 }
 
 func (h *Handler) handleDefaultTunerHost(w http.ResponseWriter, r *http.Request) {
@@ -841,12 +976,7 @@ func (h *Handler) handleAvailableListingProviders(w http.ResponseWriter, r *http
 }
 
 func (h *Handler) handleGetListingProviders(w http.ResponseWriter, r *http.Request) {
-	var st sharedLiveTVState
-	_ = h.readConfigJSON(r.Context(), liveTVConfigKey, &st)
-	if st.ListingProviders == nil {
-		st.ListingProviders = []liveTVListingProvider{}
-	}
-	httpx.JSON(w, http.StatusOK, st.ListingProviders)
+	httpx.JSON(w, http.StatusOK, h.snapshotLiveTVListingProviders(r.Context()))
 }
 
 func (h *Handler) handleDeleteListingProviderPost(w http.ResponseWriter, r *http.Request) {
@@ -883,13 +1013,13 @@ func (h *Handler) handleChannelMappingOptions(w http.ResponseWriter, r *http.Req
 	q := httpx.ParseQuery(r)
 	providerID := q.Get("ProviderId")
 
-	var st sharedLiveTVState
-	_ = h.readConfigJSON(r.Context(), liveTVConfigKey, &st)
+	channels := h.snapshotLiveTVChannels(r.Context())
+	programs := h.snapshotLiveTVPrograms(r.Context())
 
-	tunerChannels := make([]map[string]any, 0, len(st.Channels))
+	tunerChannels := make([]map[string]any, 0, len(channels))
 	providerSeen := make(map[string]struct{})
-	providerChannels := make([]NameIdPair, 0, len(st.Channels))
-	for _, ch := range st.Channels {
+	providerChannels := make([]NameIdPair, 0, len(channels))
+	for _, ch := range channels {
 		tunerChannels = append(tunerChannels, map[string]any{
 			"Id":     ch.Id,
 			"Name":   ch.Name,
@@ -914,7 +1044,7 @@ func (h *Handler) handleChannelMappingOptions(w http.ResponseWriter, r *http.Req
 			}
 		}
 	}
-	for _, prog := range st.Programs {
+	for _, prog := range programs {
 		epgID := strings.TrimSpace(prog.ChannelId)
 		if epgID == "" {
 			continue
@@ -1014,12 +1144,7 @@ func (h *Handler) handleSetChannelMapping(w http.ResponseWriter, r *http.Request
 }
 
 func (h *Handler) handleDiscoverTuners(w http.ResponseWriter, r *http.Request) {
-	var st sharedLiveTVState
-	_ = h.readConfigJSON(r.Context(), liveTVConfigKey, &st)
-	if st.TunerHosts == nil {
-		st.TunerHosts = []liveTVTunerHost{}
-	}
-	httpx.JSON(w, http.StatusOK, st.TunerHosts)
+	httpx.JSON(w, http.StatusOK, h.snapshotLiveTVTunerHosts(r.Context()))
 }
 
 func extractIDParam(r *http.Request) string {

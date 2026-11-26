@@ -300,7 +300,7 @@ func (h *Handler) postSessionPlayingPing(w http.ResponseWriter, r *http.Request)
 	uid := h.resolveUserID(r, "")
 	if h.sessions != nil && h.userRepo != nil && uid != "" {
 		if u, err := h.userRepo.GetUserByID(r.Context(), uid); err == nil && u != nil {
-			h.sessions.TouchSession(u, middleware.ExtractClientInfo(r))
+			h.sessions.TouchSession(u, h.clientInfoForRequest(r))
 		}
 	}
 	httpx.NoContent(w)
@@ -483,19 +483,21 @@ func (h *Handler) postDeviceCameraUploads(w http.ResponseWriter, r *http.Request
 		return
 	}
 	key := "device_camera_uploads:" + deviceID
-	var files []map[string]any
-	_, _ = h.loadKV(r.Context(), key, &files)
 	entry := map[string]any{
 		"Id":         q.Get("Id"),
 		"Name":       q.Get("Name"),
 		"Album":      q.Get("Album"),
 		"UploadedAt": time.Now().UTC().Format(time.RFC3339),
 	}
+	h.mu.Lock()
+	var files []map[string]any
+	_, _ = h.loadKVLocked(r.Context(), key, &files)
 	files = append(files, entry)
 	if len(files) > maxCameraUploadsEntries {
 		files = files[len(files)-maxCameraUploadsEntries:]
 	}
-	_ = h.saveKV(r.Context(), key, files)
+	_ = h.saveKVLocked(r.Context(), key, files)
+	h.mu.Unlock()
 	httpx.NoContent(w)
 }
 

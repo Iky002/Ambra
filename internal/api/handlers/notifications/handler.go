@@ -24,8 +24,9 @@ import (
 )
 
 const (
-	stateConfigKey   = "notifications:state"
-	maxNotifications = 500
+	stateConfigKey        = "notifications:state"
+	maxNotifications      = 500
+	maxAdminNotifications = 200
 )
 
 // AuthFuncs decouples route registration from the concrete middleware package.
@@ -446,12 +447,53 @@ func (h *Handler) appendNotification(ctx context.Context, n Notification) error 
 
 	h.mu.Lock()
 	h.state.Items = append([]Notification{n}, h.state.Items...)
-	if len(h.state.Items) > maxNotifications {
-		h.state.Items = h.state.Items[:maxNotifications]
-	}
+	h.trimNotificationsLocked()
 	err := h.saveStateLocked(ctx)
 	h.mu.Unlock()
 	return err
+}
+
+func (h *Handler) trimNotificationsLocked() {
+	if len(h.state.Items) <= maxNotifications {
+		// Still enforce maxAdminNotifications cap for AdminOnly bucket.
+		adminCount := 0
+		for _, item := range h.state.Items {
+			if item.AdminOnly {
+				adminCount++
+			}
+		}
+		if adminCount <= maxAdminNotifications {
+			return
+		}
+	}
+	// First reserve up to maxAdminNotifications AdminOnly items so user events cannot evict admin alerts.
+	adminKept := 0
+	for _, item := range h.state.Items {
+		if item.AdminOnly && adminKept < maxAdminNotifications {
+			adminKept++
+		}
+	}
+	userQuota := maxNotifications - adminKept
+	if userQuota < 0 {
+		userQuota = 0
+	}
+	kept := make([]Notification, 0, maxNotifications)
+	adminSeen := 0
+	userSeen := 0
+	for _, item := range h.state.Items {
+		if item.AdminOnly {
+			if adminSeen < maxAdminNotifications {
+				kept = append(kept, item)
+				adminSeen++
+			}
+		} else {
+			if userSeen < userQuota {
+				kept = append(kept, item)
+				userSeen++
+			}
+		}
+	}
+	h.state.Items = kept
 }
 
 // SubscribeEvents subscribes the notifications handler to system eventbus events
@@ -474,6 +516,7 @@ func (h *Handler) SubscribeEvents(bus *eventbus.Bus) {
 			Name:        "Library Updated",
 			Description: desc,
 			Level:       "Normal",
+			AdminOnly:   true,
 		})
 	})
 
@@ -595,6 +638,10 @@ func toInt(v any) int {
 		return int(n)
 	case float64:
 		return int(n)
+	case []string:
+		return len(n)
+	case []any:
+		return len(n)
 	default:
 		return 0
 	}

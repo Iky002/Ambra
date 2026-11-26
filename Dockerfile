@@ -19,7 +19,7 @@ FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS go-builder
 
 ARG TARGETOS
 ARG TARGETARCH
-ARG AMBRA_VERSION=v0.10.6
+ARG AMBRA_VERSION=v0.10.7
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -43,8 +43,6 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM alpine:3.21 AS runtime-lite
 
 ENV TZ=Asia/Shanghai \
-    PUID=1000 \
-    PGID=1000 \
     AMBRA_HTTP_ADDR=:8096
 
 RUN apk add --no-cache ca-certificates curl setpriv tzdata \
@@ -61,7 +59,7 @@ EXPOSE 8096/tcp 1900/udp
 VOLUME ["/data"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8096/System/Ping || exit 1
+    CMD port="${AMBRA_HTTP_ADDR##*:}"; case "$port" in ''|*[!0-9]*) port=8096 ;; esac; curl -fsS "http://127.0.0.1:${port}/System/Ping" || exit 1
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["/usr/local/bin/ambra", "-data", "/data"]
@@ -74,8 +72,6 @@ FROM debian:bookworm-slim AS runtime-full
 
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=Asia/Shanghai \
-    PUID=1000 \
-    PGID=1000 \
     AMBRA_HTTP_ADDR=:8096 \
     AMBRA_FFMPEG_PATH=/usr/bin/ffmpeg \
     AMBRA_FFPROBE_PATH=/usr/bin/ffprobe
@@ -99,7 +95,7 @@ EXPOSE 8096/tcp 1900/udp
 VOLUME ["/data"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8096/System/Ping || exit 1
+    CMD port="${AMBRA_HTTP_ADDR##*:}"; case "$port" in ''|*[!0-9]*) port=8096 ;; esac; curl -fsS "http://127.0.0.1:${port}/System/Ping" || exit 1
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["/usr/local/bin/ambra", "-data", "/data"]

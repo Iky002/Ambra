@@ -62,15 +62,6 @@ type clientConn struct {
 	subActivity bool
 }
 
-func (c *clientConn) hasLibraryRestrictions() bool {
-	if c == nil || c.isAdmin || c.isAPIKey || c.user == nil {
-		return false
-	}
-	return !c.user.Policy.EnableAllFolders ||
-		c.user.Policy.MaxParentalRating != nil ||
-		len(c.user.Policy.BlockedTags) > 0
-}
-
 func (c *clientConn) trySend(msg Message) {
 	if msg.MessageId == "" {
 		msg.MessageId = guid.New()
@@ -188,7 +179,7 @@ func (h *Hub) subscribeEvents() {
 			Data:        e.Payload,
 		}
 		for _, c := range snapshot {
-			if !c.hasLibraryRestrictions() {
+			if c.isAdmin || c.isAPIKey {
 				c.trySend(fullMsg)
 				continue
 			}
@@ -320,10 +311,22 @@ func filterSessionsForUser(sessions []dto.SessionInfo, userID string) []dto.Sess
 }
 
 func defaultFilterLibraryChange(user *sqlite.UserRecord, payload any) (any, bool) {
-	if user == nil {
+	if user == nil || user.IsDisabled || user.Policy.IsDisabled {
 		return nil, false
 	}
 	if m, ok := payload.(map[string]any); ok {
+		if src, _ := m["source"].(string); strings.EqualFold(src, "dvr") {
+			if !user.Policy.EnableLiveTvAccess {
+				return nil, false
+			}
+			return map[string]any{"Source": "dvr"}, true
+		}
+		if _, hasOutputPath := m["output_path"]; hasOutputPath {
+			if !user.Policy.EnableLiveTvAccess {
+				return nil, false
+			}
+			return map[string]any{"LibraryChanged": true}, true
+		}
 		libID := ""
 		if v, ok := m["LibraryId"].(string); ok {
 			libID = guid.Normalize(v)
@@ -713,6 +716,29 @@ func (h *Hub) DisconnectToken(token string) {
 	for _, c := range targets {
 		c.cancel()
 		_ = c.conn.Close(websocket.StatusPolicyViolation, "token revoked")
+	}
+}
+
+// Close closes all active WebSocket connections managed by the hub.
+func (h *Hub) Close() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	targets := make([]*clientConn, 0, len(h.clients))
+	for id, c := range h.clients {
+		targets = append(targets, c)
+		delete(h.clients, id)
+	}
+	h.mu.Unlock()
+
+	for _, c := range targets {
+		if c.cancel != nil {
+			c.cancel()
+		}
+		if c.conn != nil {
+			_ = c.conn.Close(websocket.StatusGoingAway, "server shutting down")
+		}
 	}
 }
 

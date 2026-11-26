@@ -27,6 +27,7 @@ import type { BaseItemDto } from '../../api/types'
 import { IdentifyModal } from '../../components/media/IdentifyModal'
 import { ImageManagerModal } from '../../components/media/ImageManagerModal'
 import { MetadataEditorModal } from '../../components/media/MetadataEditorModal'
+import { QueryErrorState } from '../../components/QueryErrorState'
 import { useAuth } from '../../context/AuthContext'
 import { AdminModal, FeedbackBanner, formatDateTime, formatRelativeTime } from './adminUtils'
 
@@ -88,6 +89,9 @@ export function MetadataTab() {
     data: itemsData,
     isLoading: itemsLoading,
     isFetching: itemsFetching,
+    isError: itemsIsError,
+    error: itemsError,
+    refetch: refetchItems,
   } = useQuery({
     queryKey: [
       'admin-metadata-items',
@@ -160,10 +164,25 @@ export function MetadataTab() {
       if (res.douban_trending_tv_count !== undefined) {
         parts.push(`豆瓣热门剧集 (${res.douban_trending_tv_count} 条)`)
       }
-      setFeedback({
-        type: 'success',
-        message: `榜单同步完成：${parts.join(' / ')}，命中 ${res.matched_items} 部媒体，新增打标 ${res.tags_added} 次`,
-      })
+      const partialErrors: string[] = []
+      if (res.douban_error) partialErrors.push(`豆瓣 Top250：${res.douban_error}`)
+      if (res.imdb_error) partialErrors.push(`IMDb Top250：${res.imdb_error}`)
+      if (res.tmdb_trending_error) partialErrors.push(`TMDB 热门：${res.tmdb_trending_error}`)
+      if (res.douban_trending_movie_error)
+        partialErrors.push(`豆瓣热门电影：${res.douban_trending_movie_error}`)
+      if (res.douban_trending_tv_error)
+        partialErrors.push(`豆瓣热门剧集：${res.douban_trending_tv_error}`)
+      if (partialErrors.length > 0) {
+        setFeedback({
+          type: 'error',
+          message: `部分榜单同步失败（${partialErrors.join('；')}），其余已同步：${parts.join(' / ')}，命中 ${res.matched_items} 部媒体`,
+        })
+      } else {
+        setFeedback({
+          type: 'success',
+          message: `榜单同步完成：${parts.join(' / ')}，命中 ${res.matched_items} 部媒体，新增打标 ${res.tags_added} 次`,
+        })
+      }
     },
     onError: (err) => {
       setFeedback({
@@ -193,10 +212,11 @@ export function MetadataTab() {
     setWritingNfoId(item.Id)
     try {
       const res = await api.writeItemNfo(item.Id)
+      const nfoPath = res?.NfoPath || res?.path
       setFeedback({
         type: 'success',
-        message: res?.path
-          ? `已原子回写「${item.Name}」的 NFO：${res.path}`
+        message: nfoPath
+          ? `已原子回写「${item.Name}」的 NFO：${nfoPath}`
           : `已成功回写「${item.Name}」的 .nfo 文件`,
       })
     } catch (err) {
@@ -507,6 +527,13 @@ export function MetadataTab() {
           <div className="flex h-44 items-center justify-center">
             <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
           </div>
+        ) : itemsIsError ? (
+          <QueryErrorState
+            compact
+            title="无法加载媒体元数据列表"
+            error={itemsError}
+            onRetry={() => void refetchItems()}
+          />
         ) : items.length === 0 ? (
           <div className="rounded-2xl border border-dashed border-white/10 bg-white/[0.02] py-12 text-center text-sm text-zinc-400">
             没有符合当前筛选条件的媒体条目

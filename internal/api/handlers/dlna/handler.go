@@ -14,7 +14,10 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,14 +34,15 @@ import (
 )
 
 const (
-	profilesStoreKey     = "dlna:profiles"
-	defaultProfileID     = "default"
-	defaultSubTimeout    = 1800
-	minSubTimeout        = 60
-	maxSubTimeout        = 86400
-	maxDLNASubscriptions = 256
-	dlnaStreamTokenTTL   = 24 * time.Hour
-	defaultServerHeader  = "Ambra/4.10.2.0 UPnP/1.0 DLNADOC/1.50"
+	profilesStoreKey      = "dlna:profiles"
+	defaultProfileID      = "default"
+	defaultSubTimeout     = 1800
+	minSubTimeout         = 60
+	maxSubTimeout         = 86400
+	maxDLNASubscriptions  = 256
+	maxDLNARequestedCount = 500
+	dlnaStreamTokenTTL    = 24 * time.Hour
+	defaultServerHeader   = "Ambra/4.10.2.0 UPnP/1.0 DLNADOC/1.50"
 )
 
 // AuthFuncs decouples route registration from the concrete middleware package.
@@ -111,7 +115,8 @@ func New(cfg *config.Config, libRepo *sqlite.LibraryRepo, store *sqlite.Store) *
 	}
 	randBytes := make([]byte, 32)
 	_, _ = rand.Read(randBytes)
-	secretInput := append([]byte(cfg.ServerID+":"), randBytes...)
+	snap := cfg.Snapshot()
+	secretInput := append([]byte(snap.ServerID+":"), randBytes...)
 	secretSum := sha256.Sum256(secretInput)
 
 	h := &Handler{
@@ -226,8 +231,15 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	mux.HandleFunc("UNSUBSCRIBE /Dlna/{UuId}/connectionmanager/events", h.requireDLNALANAccess(h.handleEventUnsubscribe("connectionmanager")))
 }
 
+func (h *Handler) cfgSnapshot() config.Config {
+	if h.cfg == nil {
+		return config.Config{}
+	}
+	return h.cfg.Snapshot()
+}
+
 func (h *Handler) checkDLNAAccess(w http.ResponseWriter, r *http.Request) bool {
-	if h.cfg != nil && !h.cfg.EnableDLNA {
+	if h.cfg != nil && !h.cfg.Snapshot().EnableDLNA {
 		httpx.Error(w, http.StatusForbidden, "DLNA is disabled")
 		return false
 	}
@@ -335,6 +347,10 @@ func (h *Handler) handleCreateProfile(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleUpdateProfile(w http.ResponseWriter, r *http.Request) {
 	id := canonicalProfileID(r.PathValue("Id"))
+	if id == defaultProfileID {
+		httpx.Error(w, http.StatusBadRequest, "cannot overwrite built-in default profile")
+		return
+	}
 	var p DlnaProfile
 	if err := httpx.DecodeJSONLimit(r, &p, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid dlna profile payload")
@@ -347,7 +363,13 @@ func (h *Handler) handleUpdateProfile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.Lock()
-	if existing, ok := h.profiles[id]; ok && p.Type == "" {
+	existing, ok := h.profiles[id]
+	if !ok {
+		h.mu.Unlock()
+		httpx.Error(w, http.StatusNotFound, "dlna profile not found")
+		return
+	}
+	if p.Type == "" {
 		p.Type = existing.Type
 	}
 	if p.Type == "" {
@@ -355,6 +377,9 @@ func (h *Handler) handleUpdateProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	h.profiles[id] = p
 	err := h.persistProfilesLocked(r.Context())
+	if err != nil {
+		h.profiles[id] = existing
+	}
 	h.mu.Unlock()
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
@@ -439,10 +464,11 @@ func (h *Handler) persistProfilesLocked(ctx context.Context) error {
 // --- UPnP Description / SCPD / Icons ---
 
 func (h *Handler) serveDescriptionXML(w http.ResponseWriter, r *http.Request, uuid string) {
+	snap := h.cfgSnapshot()
 	if strings.TrimSpace(uuid) == "" {
-		uuid = h.cfg.ServerID
+		uuid = snap.ServerID
 	}
-	doc := buildDescriptionXML(h.cfg.ServerName, uuid, h.baseURL(r))
+	doc := buildDescriptionXML(snap.ServerName, uuid, h.baseURL(r))
 	writeXML(w, r, http.StatusOK, doc)
 }
 
@@ -521,7 +547,8 @@ func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("dlna: failed to resolve media path", "itemId", itemID, "err", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to load media item")
 		return
 	}
 	if strings.EqualFold(filepath.Ext(mediaPath), ".strm") {
@@ -535,14 +562,20 @@ func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusNotFound, "media file missing on disk")
 			return
 		}
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		if errors.Is(err, os.ErrPermission) {
+			slog.Error("dlna: permission denied opening media file", "itemId", itemID, "uid", os.Getuid(), "gid", os.Getgid(), "err", err)
+		} else {
+			slog.Error("dlna: failed to open media file", "itemId", itemID, "err", err)
+		}
+		httpx.Error(w, http.StatusInternalServerError, "failed to open media file")
 		return
 	}
 	defer f.Close()
 
 	stat, err := f.Stat()
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("dlna: failed to stat media file", "itemId", itemID, "err", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to stat media file")
 		return
 	}
 	if ct := dlnaMediaContentType(mediaPath); ct != "" {
@@ -553,13 +586,16 @@ func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) resolveDLNAMediaPath(ctx context.Context, itemID string) (string, error) {
+	item, itemErr := h.libRepo.GetItemRecordByID(ctx, itemID)
+	if itemErr == nil && item != nil && !h.isDLNAVisibleItem(ctx, item.Type, item.ID) {
+		return "", sqlite.ErrNotFound
+	}
 	sources, err := h.libRepo.GetMediaSourcesByItemID(ctx, itemID)
 	if err == nil && len(sources) > 0 && strings.TrimSpace(sources[0].Path) != "" {
 		return sources[0].Path, nil
 	}
-	item, err := h.libRepo.GetItemRecordByID(ctx, itemID)
-	if err != nil {
-		return "", err
+	if itemErr != nil {
+		return "", itemErr
 	}
 	if item == nil || strings.TrimSpace(item.Path) == "" {
 		return "", sqlite.ErrNotFound
@@ -722,14 +758,34 @@ func parseTimeoutHeader(raw string) int {
 
 func (h *Handler) baseURL(r *http.Request) string {
 	scheme := "http"
-	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+	if r.TLS != nil {
 		scheme = "https"
+	} else if strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		if addr, ok := parseRemoteAddr(r.RemoteAddr); ok && netutil.IsTrustedProxyIP(addr) {
+			scheme = "https"
+		}
 	}
 	host := r.Host
 	if host == "" {
 		host = "127.0.0.1:8096"
 	}
 	return scheme + "://" + host
+}
+
+func parseRemoteAddr(raw string) (netip.Addr, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return netip.Addr{}, false
+	}
+	if host, _, err := net.SplitHostPort(s); err == nil {
+		s = host
+	}
+	s = strings.Trim(s, "[]")
+	addr, err := netip.ParseAddr(s)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return addr.WithZone("").Unmap(), true
 }
 
 func writeXML(w http.ResponseWriter, r *http.Request, status int, body string) {

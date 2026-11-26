@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -452,13 +453,18 @@ func (h *Handler) CreateUser(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	if strings.TrimSpace(req.Name) == "" {
+		httpx.Error(w, http.StatusBadRequest, "username cannot be empty")
+		return
+	}
 	u, err := h.authSvc.CreateUser(r.Context(), req.Name, req.Password, req.IsAdmin)
 	if err != nil {
 		if errors.Is(err, auth.ErrUserExists) {
 			httpx.Error(w, http.StatusConflict, "User already exists")
 			return
 		}
-		httpx.Error(w, http.StatusBadRequest, err.Error())
+		slog.Error("failed to create user", "username", req.Name, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to create user")
 		return
 	}
 	if h.userRepo != nil {

@@ -42,7 +42,7 @@ func TestDefaultArgsBuilderAndDefaults(t *testing.T) {
 		Duration:    90 * time.Second,
 	}
 	got := DefaultArgsBuilder(job, "/tmp/out.mkv")
-	want := []string{"-y", "-protocol_whitelist", "http,https,tcp,tls,crypto", "-i", "http://example.com/live.m3u8", "-t", "90", "-c", "copy", "/tmp/out.mkv"}
+	want := []string{"-y", "-protocol_whitelist", "http,https,tcp,tls,crypto", "-follow_redirects", "0", "-rw_timeout", "15000000", "-i", "http://example.com/live.m3u8", "-t", "90", "-c", "copy", "/tmp/out.mkv"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("DefaultArgsBuilder got %v, want %v", got, want)
 	}
@@ -51,7 +51,7 @@ func TestDefaultArgsBuilderAndDefaults(t *testing.T) {
 	jobShort := job
 	jobShort.Duration = 200 * time.Millisecond
 	gotShort := DefaultArgsBuilder(jobShort, "/tmp/out.mkv")
-	if gotShort[6] != "1" {
+	if gotShort[10] != "1" {
 		t.Fatalf("expected 1s duration, got %v", gotShort)
 	}
 
@@ -59,7 +59,7 @@ func TestDefaultArgsBuilderAndDefaults(t *testing.T) {
 	jobUnlimited := job
 	jobUnlimited.Duration = 0
 	gotUnlimited := DefaultArgsBuilder(jobUnlimited, "/tmp/out.mkv")
-	wantUnlimited := []string{"-y", "-protocol_whitelist", "http,https,tcp,tls,crypto", "-i", "http://example.com/live.m3u8", "-c", "copy", "/tmp/out.mkv"}
+	wantUnlimited := []string{"-y", "-protocol_whitelist", "http,https,tcp,tls,crypto", "-follow_redirects", "0", "-rw_timeout", "15000000", "-i", "http://example.com/live.m3u8", "-c", "copy", "/tmp/out.mkv"}
 	if !reflect.DeepEqual(gotUnlimited, wantUnlimited) {
 		t.Fatalf("unlimited DefaultArgsBuilder got %v, want %v", gotUnlimited, wantUnlimited)
 	}

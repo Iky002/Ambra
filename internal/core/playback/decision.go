@@ -222,7 +222,11 @@ func (e *Engine) decideOne(
 				defaultAudioCodec = codecLower
 			}
 		case "Subtitle":
-			if req.SubtitleStreamIndex != nil && st.Index == *req.SubtitleStreamIndex {
+			if req.SubtitleStreamIndex != nil {
+				if st.Index == *req.SubtitleStreamIndex {
+					selectedSub = st
+				}
+			} else if msDTO.DefaultSubtitleStreamIndex != nil && st.Index == *msDTO.DefaultSubtitleStreamIndex {
 				selectedSub = st
 			}
 		}
@@ -362,7 +366,7 @@ func (e *Engine) decideOne(
 		msDTO.SupportsDirectStream = true
 		msDTO.SupportsTranscoding = allowTranscoding
 		baseURL := fmt.Sprintf("/Videos/%s/master.m3u8?MediaSourceId=%s&PlaySessionId=%s&VideoCodec=copy&AudioCodec=aac", item.ID, msDTO.Id, sessionID)
-		msDTO.TranscodingUrl = appendTranscodeQueryParams(baseURL, req, maxBitrate)
+		msDTO.TranscodingUrl = appendTranscodeQueryParams(baseURL, req, msDTO.DefaultAudioStreamIndex, maxBitrate)
 		return msDTO, DecisionDetail{
 			MediaSourceID: msDTO.Id,
 			PlayMethod:    PlayMethodDirectStream,
@@ -386,7 +390,7 @@ func (e *Engine) decideOne(
 	msDTO.SupportsDirectStream = false
 	msDTO.SupportsTranscoding = true
 	baseURL := fmt.Sprintf("/Videos/%s/master.m3u8?MediaSourceId=%s&PlaySessionId=%s&VideoCodec=h264&AudioCodec=aac", item.ID, msDTO.Id, sessionID)
-	transcodingURL := appendTranscodeQueryParams(baseURL, req, maxBitrate)
+	transcodingURL := appendTranscodeQueryParams(baseURL, req, msDTO.DefaultAudioStreamIndex, maxBitrate)
 	if subtitleNeedsBurnIn && selectedSub != nil {
 		transcodingURL += fmt.Sprintf("&SubtitleStreamIndex=%d&SubtitleMethod=Encode", selectedSub.Index)
 	}
@@ -425,14 +429,18 @@ func buildDirectStreamURL(kind, itemID, container, mediaSourceID, sessionID stri
 	return fmt.Sprintf("/%s/%s/stream?Static=true&MediaSourceId=%s&PlaySessionId=%s", kind, itemID, mediaSourceID, sessionID)
 }
 
-func appendTranscodeQueryParams(baseURL string, req PlaybackInfoRequest, maxBitrate int) string {
+func appendTranscodeQueryParams(baseURL string, req PlaybackInfoRequest, defaultAudioIdx *int, maxBitrate int) string {
 	const (
 		defaultAudioBitrate = 192_000
 		minVideoBitrate     = 256_000
 	)
 	out := baseURL
-	if req.AudioStreamIndex != nil && *req.AudioStreamIndex >= 0 {
-		out += fmt.Sprintf("&AudioStreamIndex=%d", *req.AudioStreamIndex)
+	audioIdx := req.AudioStreamIndex
+	if audioIdx == nil {
+		audioIdx = defaultAudioIdx
+	}
+	if audioIdx != nil && *audioIdx >= 0 {
+		out += fmt.Sprintf("&AudioStreamIndex=%d", *audioIdx)
 	}
 	if maxBitrate > 0 {
 		videoBitrate := maxBitrate - defaultAudioBitrate
@@ -603,8 +611,8 @@ func decideSubtitleDeliveryMethod(st *dto.MediaStream, profile *DeviceProfile) s
 		}
 	}
 
-	// Fallback: if client has a strict SubtitleProfiles list and explicitly omits ass/pgssub, burn in
-	if codec == "pgssub" || codec == "ass" || codec == "ssa" {
+	// Fallback: if client has a strict SubtitleProfiles list and explicitly omits bitmap or styled subtitles, burn in
+	if codec == "pgssub" || codec == "dvdsub" || codec == "dvbsub" || codec == "ass" || codec == "ssa" {
 		return "Encode"
 	}
 	return "External"
@@ -622,6 +630,10 @@ func normalizeSubCodec(c string) string {
 		return "ssa"
 	case "sup", "pgs", "pgssub", "hdmv_pgs_subtitle":
 		return "pgssub"
+	case "dvd_subtitle", "dvdsub", "vobsub":
+		return "dvdsub"
+	case "dvb_subtitle", "dvbsub":
+		return "dvbsub"
 	default:
 		return strings.ToLower(strings.TrimSpace(c))
 	}

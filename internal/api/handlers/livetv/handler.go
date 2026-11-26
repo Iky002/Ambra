@@ -13,7 +13,9 @@ import (
 	"io"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -39,7 +41,9 @@ const (
 	maxM3UPlaylistBytes = 20 << 20
 	maxTimerDuration    = 24 * time.Hour
 	maxPaddingSeconds   = 3600
-	proxyTargetTTL      = 6 * time.Hour
+	proxyTargetTTL      = 30 * time.Minute
+	maxTimers           = 1000
+	maxSeriesTimers     = 200
 )
 
 // AuthFuncs decouples route registration from the concrete middleware package.
@@ -147,17 +151,18 @@ type SeriesTimerInfo struct {
 }
 
 type TunerHostInfo struct {
-	Id                      string `json:"Id"`
-	Url                     string `json:"Url,omitempty"`
-	Type                    string `json:"Type"`
-	DeviceId                string `json:"DeviceId,omitempty"`
-	FriendlyName            string `json:"FriendlyName,omitempty"`
-	ImportFavoritesOnly     bool   `json:"ImportFavoritesOnly,omitempty"`
-	AllowHWTranscoding      bool   `json:"AllowHWTranscoding,omitempty"`
-	TunerCount              int    `json:"TunerCount,omitempty"`
-	UserAgent               string `json:"UserAgent,omitempty"`
-	M3UContent              string `json:"M3UContent,omitempty"`
-	ImportedChannelCount    int    `json:"ImportedChannelCount,omitempty"`
+	Id                   string `json:"Id"`
+	Url                  string `json:"Url,omitempty"`
+	Type                 string `json:"Type"`
+	DeviceId             string `json:"DeviceId,omitempty"`
+	FriendlyName         string `json:"FriendlyName,omitempty"`
+	ImportFavoritesOnly  bool   `json:"ImportFavoritesOnly,omitempty"`
+	AllowHWTranscoding   bool   `json:"AllowHWTranscoding,omitempty"`
+	AllowPrivateNetwork  bool   `json:"AllowPrivateNetwork,omitempty"`
+	TunerCount           int    `json:"TunerCount,omitempty"`
+	UserAgent            string `json:"UserAgent,omitempty"`
+	M3UContent           string `json:"M3UContent,omitempty"`
+	ImportedChannelCount int    `json:"ImportedChannelCount,omitempty"`
 }
 
 type ListingProviderInfo struct {
@@ -253,6 +258,64 @@ func (h *Handler) GetChannelByID(id string) (*ChannelInfo, bool) {
 		}
 	}
 	return nil, false
+}
+
+// SnapshotChannels returns a copy of all channels in memory.
+func (h *Handler) SnapshotChannels() []ChannelInfo {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make([]ChannelInfo, len(h.state.Channels))
+	copy(out, h.state.Channels)
+	return out
+}
+
+// SnapshotPrograms returns a copy of all EPG programs in memory.
+func (h *Handler) SnapshotPrograms() []ProgramInfo {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make([]ProgramInfo, len(h.state.Programs))
+	copy(out, h.state.Programs)
+	return out
+}
+
+// SnapshotRecordings returns a copy of all recordings in memory.
+func (h *Handler) SnapshotRecordings() []RecordingInfo {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make([]RecordingInfo, len(h.state.Recordings))
+	copy(out, h.state.Recordings)
+	return out
+}
+
+// GetRecordingByID returns a copy of the recording with the given ID if it exists.
+func (h *Handler) GetRecordingByID(id string) (*RecordingInfo, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for i := range h.state.Recordings {
+		if h.state.Recordings[i].Id == id {
+			rec := h.state.Recordings[i]
+			return &rec, true
+		}
+	}
+	return nil, false
+}
+
+// SnapshotTunerHosts returns a copy of all tuner hosts in memory.
+func (h *Handler) SnapshotTunerHosts() []TunerHostInfo {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make([]TunerHostInfo, len(h.state.TunerHosts))
+	copy(out, h.state.TunerHosts)
+	return out
+}
+
+// SnapshotListingProviders returns a copy of all listing providers in memory.
+func (h *Handler) SnapshotListingProviders() []ListingProviderInfo {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make([]ListingProviderInfo, len(h.state.ListingProviders))
+	copy(out, h.state.ListingProviders)
+	return out
 }
 
 // SetChannelDisabled updates a channel's disabled state in memory and persists state to SQLite.
@@ -572,7 +635,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	handleAuth("GET /LiveTv/Info", h.handleInfo)
 	handleLiveTvAccess("GET /LiveTv/Channels", h.handleListChannels)
 	handleLiveTvAccess("GET /LiveTv/Channels/{Id}", h.handleGetChannel)
-	handleLiveTvAccess("GET /LiveTv/Channels/{Id}/Stream", h.handleStreamChannel)
+	mux.Handle("GET /LiveTv/Channels/{Id}/Stream", h.requireLiveTvStreamAccess(wrapAuth)(http.HandlerFunc(h.handleStreamChannel)))
 	handleLiveTvAccess("GET /LiveTv/Programs", h.handleListPrograms)
 	handleLiveTvAccess("POST /LiveTv/Programs", h.handleQueryProgramsPost)
 	handleLiveTvAccess("GET /LiveTv/Programs/Recommended", h.handleRecommendedPrograms)
@@ -608,32 +671,90 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	handleLiveTvAccess("GET /LiveTv/GuideInfo", h.handleGuideInfo)
 }
 
+func (h *Handler) hasValidSignedStreamTarget(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	id := r.PathValue("Id")
+	if id == "" {
+		return false
+	}
+	q := r.URL.Query()
+	target := strings.TrimSpace(q.Get("target"))
+	sig := strings.TrimSpace(q.Get("sig"))
+	expStr := strings.TrimSpace(q.Get("exp"))
+	lanParam := strings.TrimSpace(q.Get("lan"))
+	if target == "" || sig == "" || expStr == "" || (lanParam != "0" && lanParam != "1") {
+		return false
+	}
+	reqAllowLAN := lanParam == "1"
+	if !h.verifyProxyTarget(id, target, reqAllowLAN, expStr, sig) {
+		return false
+	}
+	ch, ok := h.GetChannelByID(id)
+	if !ok || ch.Disabled {
+		return false
+	}
+	if reqAllowLAN && !h.channelAllowsPrivateLANForChannel(ch) {
+		return false
+	}
+	return true
+}
+
+func (h *Handler) requireLiveTvStreamAccess(wrapAuth func(http.Handler) http.Handler) func(http.Handler) http.Handler {
+	authGuarded := h.requireLiveTvAccess(wrapAuth)
+	return func(next http.Handler) http.Handler {
+		guarded := authGuarded(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if h.hasValidSignedStreamTarget(r) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			guarded.ServeHTTP(w, r)
+		})
+	}
+}
+
 func (h *Handler) requireLiveTvAccess(wrapAuth func(http.Handler) http.Handler) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return wrapAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
-				if !ac.IsAdmin() {
-					if ac.User == nil || !ac.User.Policy.EnableLiveTvAccess {
+				if !ac.IsAPIKey {
+					if ac.User == nil || ac.User.IsDisabled {
 						httpx.Error(w, http.StatusForbidden, "Live TV access is disabled for this user")
 						return
 					}
-					if ur := h.getUserRepo(); ur != nil && ac.User.ID != "" {
-						if u, err := ur.GetUserByID(r.Context(), ac.User.ID); err == nil && u != nil {
-							if !u.IsAdmin && !u.Policy.IsAdministrator && !u.Policy.EnableLiveTvAccess {
-								httpx.Error(w, http.StatusForbidden, "Live TV access is disabled for this user")
-								return
-							}
+					if ur := h.getUserRepo(); ur != nil {
+						uid := guid.Normalize(ac.User.ID)
+						if uid == "" {
+							httpx.Error(w, http.StatusForbidden, "Live TV access is disabled for this user")
+							return
 						}
+						u, err := ur.GetUserByID(r.Context(), uid)
+						if err != nil || u == nil || u.IsDisabled {
+							httpx.Error(w, http.StatusForbidden, "Live TV access is disabled for this user")
+							return
+						}
+						if !u.IsAdmin && !u.Policy.IsAdministrator && !u.Policy.EnableLiveTvAccess {
+							httpx.Error(w, http.StatusForbidden, "Live TV access is disabled for this user")
+							return
+						}
+					} else if !ac.IsAdmin() && !ac.User.Policy.EnableLiveTvAccess {
+						httpx.Error(w, http.StatusForbidden, "Live TV access is disabled for this user")
+						return
 					}
 				}
 			} else if h.auth.UserIDFromCtx != nil {
 				if ur := h.getUserRepo(); ur != nil {
 					if uid := guid.Normalize(h.auth.UserIDFromCtx(r.Context())); uid != "" {
-						if u, err := ur.GetUserByID(r.Context(), uid); err == nil && u != nil {
-							if !u.IsAdmin && !u.Policy.IsAdministrator && !u.Policy.EnableLiveTvAccess {
-								httpx.Error(w, http.StatusForbidden, "Live TV access is disabled for this user")
-								return
-							}
+						u, err := ur.GetUserByID(r.Context(), uid)
+						if err != nil || u == nil || u.IsDisabled {
+							httpx.Error(w, http.StatusForbidden, "Live TV access is disabled for this user")
+							return
+						}
+						if !u.IsAdmin && !u.Policy.IsAdministrator && !u.Policy.EnableLiveTvAccess {
+							httpx.Error(w, http.StatusForbidden, "Live TV access is disabled for this user")
+							return
 						}
 					}
 				}
@@ -870,17 +991,92 @@ func (h *Handler) validateStreamURL(rawURL string, allowPrivateLAN bool) error {
 	return netutil.ValidateRemoteURLNoLoopback(rawURL, allowPrivateLAN)
 }
 
-func (h *Handler) channelAllowsPrivateLAN(channelURL string) bool {
-	trimmed := strings.TrimSpace(channelURL)
+func isPrivateLANAddr(addr netip.Addr, allowLoopback bool) bool {
+	if !addr.IsValid() {
+		return false
+	}
+	addr = addr.WithZone("").Unmap()
+	if addr.IsUnspecified() || (addr.Is4() && addr.As4()[0] == 0) ||
+		addr.IsLinkLocalUnicast() ||
+		addr.IsMulticast() || addr.IsLinkLocalMulticast() || addr.IsInterfaceLocalMulticast() {
+		return false
+	}
+	if addr.IsLoopback() {
+		return allowLoopback
+	}
+	return addr.IsPrivate()
+}
+
+func isStrictPrivateLANURL(rawURL string, allowLoopback bool) bool {
+	trimmed := strings.TrimSpace(rawURL)
 	if trimmed == "" {
 		return false
 	}
-	// Public channels (valid under allowPrivateLAN=false) MUST NOT access RFC1918 private LAN.
-	if netutil.ValidateRemoteURL(trimmed, false) == nil {
+	u, err := url.Parse(trimmed)
+	if err != nil {
 		return false
 	}
-	// Private LAN channels are allowed LAN access, never loopback in production.
-	return h.validateStreamURL(trimmed, true) == nil
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return false
+	}
+	host := strings.TrimSpace(u.Hostname())
+	if host == "" {
+		return false
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return isPrivateLANAddr(addr, allowLoopback)
+	}
+	lowerHost := strings.ToLower(strings.TrimSuffix(host, "."))
+	if !allowLoopback && (lowerHost == "localhost" || strings.HasSuffix(lowerHost, ".localhost")) {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ipAddrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil || len(ipAddrs) == 0 {
+		return false
+	}
+	for _, ia := range ipAddrs {
+		addr, ok := netip.AddrFromSlice(ia.IP)
+		if !ok || !isPrivateLANAddr(addr, allowLoopback) {
+			return false
+		}
+	}
+	return true
+}
+
+func (h *Handler) channelAllowsPrivateLAN(channelURL string) bool {
+	if !isStrictPrivateLANURL(channelURL, h.customStreamClient) {
+		return false
+	}
+	return h.validateStreamURL(channelURL, true) == nil
+}
+
+func (h *Handler) tunerAllowsPrivateNetwork(tunerHostID string) (allow bool, found bool) {
+	if strings.TrimSpace(tunerHostID) == "" {
+		return false, false
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, th := range h.state.TunerHosts {
+		if th.Id == tunerHostID {
+			return th.AllowPrivateNetwork, true
+		}
+	}
+	return false, false
+}
+
+func (h *Handler) channelAllowsPrivateLANForChannel(ch *ChannelInfo) bool {
+	if ch == nil {
+		return false
+	}
+	if ch.TunerHostId != "" {
+		if allow, found := h.tunerAllowsPrivateNetwork(ch.TunerHostId); found && !allow {
+			return false
+		}
+	}
+	return h.channelAllowsPrivateLAN(ch.StreamUrl)
 }
 
 func (h *Handler) handleStreamChannel(w http.ResponseWriter, r *http.Request) {
@@ -894,7 +1090,7 @@ func (h *Handler) handleStreamChannel(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusForbidden, "channel is disabled")
 		return
 	}
-	channelAllowLAN := h.channelAllowsPrivateLAN(ch.StreamUrl)
+	channelAllowLAN := h.channelAllowsPrivateLANForChannel(ch)
 	streamURL := ch.StreamUrl
 	allowPrivateLAN := channelAllowLAN
 	if target := strings.TrimSpace(r.URL.Query().Get("target")); target != "" {
@@ -950,7 +1146,7 @@ func (h *Handler) ProxyChannelStream(w http.ResponseWriter, r *http.Request, cha
 	allowLAN := h.channelAllowsPrivateLAN(streamURL)
 	if channelID != "" {
 		if ch, ok := h.GetChannelByID(channelID); ok && strings.TrimSpace(ch.StreamUrl) != "" {
-			allowLAN = h.channelAllowsPrivateLAN(ch.StreamUrl)
+			allowLAN = h.channelAllowsPrivateLANForChannel(ch)
 		}
 	}
 	h.proxyChannelStreamWithPolicy(w, r, channelID, streamURL, allowLAN)
@@ -1024,12 +1220,10 @@ func (h *Handler) proxyChannelStreamWithPolicy(w http.ResponseWriter, r *http.Re
 			return
 		}
 
-		token := extractRequestToken(r)
-		proxyBase := "Stream"
-		if r != nil && strings.Contains(strings.ToLower(r.URL.Path), "/livestreamfiles/") {
-			proxyBase = "../../Channels/" + url.PathEscape(channelID) + "/Stream"
-		}
-		rewritten := h.rewriteHLSPlaylistWithPolicy(string(raw), baseURL, channelID, proxyBase, token, allowPrivateLAN)
+		proxyBase := computeHLSProxyBase(r, channelID)
+		// Do not inject primary session tokens or admin API keys into rewritten HLS URLs;
+		// signed short-lived proxy tokens authenticate segment requests directly.
+		rewritten := h.rewriteHLSPlaylistWithPolicy(string(raw), baseURL, channelID, proxyBase, "", allowPrivateLAN)
 		safeCT := sanitizeLiveTVProxyContentType(ct, "application/vnd.apple.mpegurl")
 		w.Header().Set("Content-Type", safeCT)
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -1103,6 +1297,21 @@ func (h *Handler) rewriteHLSPlaylist(playlist string, baseURL *url.URL, channelI
 	return h.rewriteHLSPlaylistWithPolicy(playlist, baseURL, channelID, proxyBase, token, allowPrivateLAN)
 }
 
+func computeHLSProxyBase(r *http.Request, channelID string) string {
+	if r == nil || r.URL == nil {
+		return "Stream"
+	}
+	lowerPath := strings.ToLower(r.URL.Path)
+	const marker = "/livestreamfiles/"
+	idx := strings.Index(lowerPath, marker)
+	if idx < 0 {
+		return "Stream"
+	}
+	rest := strings.TrimPrefix(lowerPath[idx+len(marker):], "/")
+	ups := strings.Count(rest, "/") + 1
+	return strings.Repeat("../", ups) + "Channels/" + url.PathEscape(channelID) + "/Stream"
+}
+
 func (h *Handler) rewriteHLSPlaylistWithPolicy(playlist string, baseURL *url.URL, channelID, proxyBase, token string, allowPrivateLAN bool) string {
 	if proxyBase == "" {
 		proxyBase = "Stream"
@@ -1112,34 +1321,38 @@ func (h *Handler) rewriteHLSPlaylistWithPolicy(playlist string, baseURL *url.URL
 	if allowPrivateLAN {
 		lanFlag = "1"
 	}
-	rewriteURI := func(rawURI string) string {
+	rewriteURI := func(rawURI string) (string, bool) {
 		trimmed := strings.TrimSpace(rawURI)
-		if trimmed == "" || baseURL == nil {
-			return rawURI
+		if trimmed == "" {
+			return "", false
+		}
+		if baseURL == nil {
+			return rawURI, true
 		}
 		ref, err := url.Parse(trimmed)
 		if err != nil {
-			return rawURI
+			return "", false
 		}
 		resolved := baseURL.ResolveReference(ref)
 		scheme := strings.ToLower(resolved.Scheme)
 		if scheme != "http" && scheme != "https" {
-			return rawURI
+			return "", false
 		}
 		resolvedStr := resolved.String()
 		if err := h.validateStreamURL(resolvedStr, allowPrivateLAN); err != nil {
-			return rawURI
+			return "", false
 		}
 		sig := h.signProxyTarget(channelID, resolvedStr, allowPrivateLAN, exp)
 		proxied := proxyBase + "?target=" + url.QueryEscape(resolvedStr) + "&exp=" + strconv.FormatInt(exp, 10) + "&lan=" + lanFlag + "&sig=" + sig
 		if token != "" {
 			proxied += "&api_key=" + url.QueryEscape(token)
 		}
-		return proxied
+		return proxied, true
 	}
 
 	lines := strings.Split(playlist, "\n")
-	for i, line := range lines {
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
 		cr := ""
 		if strings.HasSuffix(line, "\r") {
 			cr = "\r"
@@ -1147,23 +1360,46 @@ func (h *Handler) rewriteHLSPlaylistWithPolicy(playlist string, baseURL *url.URL
 		}
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
+			out = append(out, line+cr)
 			continue
 		}
 		if strings.HasPrefix(trimmed, "#") {
 			if strings.Contains(line, `URI="`) {
-				lines[i] = hlsURIAttributeRe.ReplaceAllStringFunc(line, func(match string) string {
+				invalidURI := false
+				replaced := hlsURIAttributeRe.ReplaceAllStringFunc(line, func(match string) string {
 					sub := hlsURIAttributeRe.FindStringSubmatch(match)
 					if len(sub) < 2 {
 						return match
 					}
-					return `URI="` + rewriteURI(sub[1]) + `"`
-				}) + cr
+					if strings.TrimSpace(sub[1]) == "" {
+						return match
+					}
+					rewritten, ok := rewriteURI(sub[1])
+					if !ok {
+						invalidURI = true
+						return match
+					}
+					return `URI="` + rewritten + `"`
+				})
+				if invalidURI {
+					continue
+				}
+				out = append(out, replaced+cr)
+				continue
+			}
+			out = append(out, line+cr)
+			continue
+		}
+		rewritten, ok := rewriteURI(trimmed)
+		if !ok {
+			if len(out) > 0 && strings.HasPrefix(strings.TrimSpace(out[len(out)-1]), "#EXTINF:") {
+				out = out[:len(out)-1]
 			}
 			continue
 		}
-		lines[i] = rewriteURI(trimmed) + cr
+		out = append(out, rewritten+cr)
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(out, "\n")
 }
 
 func extractRequestToken(r *http.Request) string {
@@ -1666,15 +1902,26 @@ func validateTimerBounds(start, end time.Time, prePad, postPad int) error {
 	return nil
 }
 
+func (h *Handler) channelExistsLocked(channelID string) bool {
+	for _, ch := range h.state.Channels {
+		if ch.Id == channelID {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *Handler) handleCreateTimer(w http.ResponseWriter, r *http.Request) {
 	var t TimerInfo
 	if err := httpx.DecodeJSONLimit(r, &t, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid timer payload")
 		return
 	}
+	t.Id = strings.TrimSpace(t.Id)
 	if t.Id == "" {
 		t.Id = guid.New()
 	}
+	t.ChannelId = strings.TrimSpace(t.ChannelId)
 	t.ServerId = h.serverID()
 	if t.Status == "" {
 		t.Status = "New"
@@ -1691,8 +1938,28 @@ func (h *Handler) handleCreateTimer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.Lock()
+	if len(h.state.Timers) >= maxTimers {
+		h.mu.Unlock()
+		httpx.Error(w, http.StatusTooManyRequests, "maximum number of timers reached")
+		return
+	}
+	for _, existing := range h.state.Timers {
+		if existing.Id == t.Id {
+			h.mu.Unlock()
+			httpx.Error(w, http.StatusConflict, "timer id already exists")
+			return
+		}
+	}
+	if t.ChannelId == "" || !h.channelExistsLocked(t.ChannelId) {
+		h.mu.Unlock()
+		httpx.Error(w, http.StatusBadRequest, "valid existing ChannelId is required")
+		return
+	}
 	h.state.Timers = append(h.state.Timers, t)
 	err := h.saveStateLocked(r.Context())
+	if err != nil {
+		h.state.Timers = h.state.Timers[:len(h.state.Timers)-1]
+	}
 	h.mu.Unlock()
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to persist timer")
@@ -1726,6 +1993,14 @@ func (h *Handler) handleUpdateTimer(w http.ResponseWriter, r *http.Request) {
 		if existing.Id == id {
 			upd.Id = id
 			upd.ServerId = h.serverID()
+			upd.ChannelId = strings.TrimSpace(upd.ChannelId)
+			if upd.ChannelId == "" {
+				upd.ChannelId = existing.ChannelId
+			} else if !h.channelExistsLocked(upd.ChannelId) {
+				h.mu.Unlock()
+				httpx.Error(w, http.StatusBadRequest, "valid existing ChannelId is required")
+				return
+			}
 			if upd.Status == "" {
 				upd.Status = existing.Status
 			}
@@ -1742,6 +2017,9 @@ func (h *Handler) handleUpdateTimer(w http.ResponseWriter, r *http.Request) {
 			}
 			h.state.Timers[i] = upd
 			err := h.saveStateLocked(r.Context())
+			if err != nil {
+				h.state.Timers[i] = existing
+			}
 			h.mu.Unlock()
 			if err != nil {
 				httpx.Error(w, http.StatusInternalServerError, "failed to persist timer")
@@ -1836,18 +2114,43 @@ func (h *Handler) handleCreateSeriesTimer(w http.ResponseWriter, r *http.Request
 		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("padding seconds must be between 0 and %d", maxPaddingSeconds))
 		return
 	}
+	st.Id = strings.TrimSpace(st.Id)
 	if st.Id == "" {
 		st.Id = guid.New()
 	}
+	st.ChannelId = strings.TrimSpace(st.ChannelId)
 	st.ServerId = h.serverID()
 	if st.Days == nil {
 		st.Days = []string{}
 	}
 
 	h.mu.Lock()
+	if len(h.state.SeriesTimers) >= maxSeriesTimers {
+		h.mu.Unlock()
+		httpx.Error(w, http.StatusTooManyRequests, "maximum number of series timers reached")
+		return
+	}
+	for _, existing := range h.state.SeriesTimers {
+		if existing.Id == st.Id {
+			h.mu.Unlock()
+			httpx.Error(w, http.StatusConflict, "series timer id already exists")
+			return
+		}
+	}
+	if !st.RecordAnyChannel && st.ChannelId != "" && !h.channelExistsLocked(st.ChannelId) {
+		h.mu.Unlock()
+		httpx.Error(w, http.StatusBadRequest, "valid existing ChannelId is required")
+		return
+	}
+	prevSeriesLen := len(h.state.SeriesTimers)
+	prevTimersLen := len(h.state.Timers)
 	h.state.SeriesTimers = append(h.state.SeriesTimers, st)
 	h.scheduleTimersForSeriesLocked(st)
 	err := h.saveStateLocked(r.Context())
+	if err != nil {
+		h.state.SeriesTimers = h.state.SeriesTimers[:prevSeriesLen]
+		h.state.Timers = h.state.Timers[:prevTimersLen]
+	}
 	h.mu.Unlock()
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to persist series timer")
@@ -1971,12 +2274,23 @@ func (h *Handler) handleUpdateSeriesTimer(w http.ResponseWriter, r *http.Request
 		if existing.Id == id {
 			upd.Id = id
 			upd.ServerId = h.serverID()
+			upd.ChannelId = strings.TrimSpace(upd.ChannelId)
+			if !upd.RecordAnyChannel && upd.ChannelId != "" && !h.channelExistsLocked(upd.ChannelId) {
+				h.mu.Unlock()
+				httpx.Error(w, http.StatusBadRequest, "valid existing ChannelId is required")
+				return
+			}
 			if upd.Days == nil {
 				upd.Days = []string{}
 			}
+			prevTimersLen := len(h.state.Timers)
 			h.state.SeriesTimers[i] = upd
 			h.scheduleTimersForSeriesLocked(upd)
 			err := h.saveStateLocked(r.Context())
+			if err != nil {
+				h.state.SeriesTimers[i] = existing
+				h.state.Timers = h.state.Timers[:prevTimersLen]
+			}
 			h.mu.Unlock()
 			if err != nil {
 				httpx.Error(w, http.StatusInternalServerError, "failed to persist series timer")
@@ -1990,7 +2304,8 @@ func (h *Handler) handleUpdateSeriesTimer(w http.ResponseWriter, r *http.Request
 	httpx.Error(w, http.StatusNotFound, "series timer not found")
 }
 
-// DeleteSeriesTimer removes a series timer by ID, cascade-deletes its pending single timers, and persists state.
+// DeleteSeriesTimer removes a series timer by ID, cascade-deletes its pending single timers,
+// cancels any in-progress recordings belonging to it, and persists state.
 func (h *Handler) DeleteSeriesTimer(ctx context.Context, id string) bool {
 	h.mu.Lock()
 	idx := -1
@@ -2004,17 +2319,31 @@ func (h *Handler) DeleteSeriesTimer(ctx context.Context, id string) bool {
 		h.mu.Unlock()
 		return false
 	}
+	recorder := h.recorder
+	var cancelIDs []string
 	h.state.SeriesTimers = append(h.state.SeriesTimers[:idx], h.state.SeriesTimers[idx+1:]...)
 	keptTimers := make([]TimerInfo, 0, len(h.state.Timers))
 	for _, t := range h.state.Timers {
-		if t.SeriesTimerId == id && (t.Status == "" || t.Status == "New") {
-			continue
+		if t.SeriesTimerId == id {
+			if t.Status == "" || t.Status == "New" {
+				continue
+			}
+			if strings.EqualFold(t.Status, "InProgress") {
+				cancelIDs = append(cancelIDs, t.Id)
+				continue
+			}
 		}
 		keptTimers = append(keptTimers, t)
 	}
 	h.state.Timers = keptTimers
 	h.saveStateLocked(ctx)
 	h.mu.Unlock()
+
+	if recorder != nil {
+		for _, tid := range cancelIDs {
+			_ = recorder.CancelRecording(tid)
+		}
+	}
 	return true
 }
 
@@ -2024,6 +2353,18 @@ func (h *Handler) handleDeleteSeriesTimer(w http.ResponseWriter, r *http.Request
 		return
 	}
 	httpx.NoContent(w)
+}
+
+func deterministicChannelID(tunerID string, m M3UChannel, seq int) string {
+	identity := strings.ToLower(strings.TrimSpace(m.TvgID))
+	if identity == "" {
+		identity = strings.ToLower(strings.TrimSpace(m.Name)) + "\x00" + strings.TrimSpace(m.URL)
+	}
+	if seq > 0 {
+		identity += "\x00#" + strconv.Itoa(seq)
+	}
+	sum := sha256.Sum256([]byte("ambra:livetv:ch:" + tunerID + "\x00" + identity))
+	return hex.EncodeToString(sum[:16])
 }
 
 func (h *Handler) handleSaveTunerHost(w http.ResponseWriter, r *http.Request) {
@@ -2039,12 +2380,30 @@ func (h *Handler) handleSaveTunerHost(w http.ResponseWriter, r *http.Request) {
 		host.Id = guid.New()
 	}
 
+	rawURL := strings.TrimSpace(host.Url)
+	rawM3U := strings.TrimSpace(host.M3UContent)
+	if rawURL != "" {
+		if u, err := url.Parse(rawURL); err == nil && (strings.EqualFold(u.Scheme, "http") || strings.EqualFold(u.Scheme, "https")) {
+			if isStrictPrivateLANURL(rawURL, h.customHTTPClient) {
+				host.AllowPrivateNetwork = true
+			} else {
+				// Never automatically widen a public M3U source to RFC1918 private LAN proxying.
+				host.AllowPrivateNetwork = false
+			}
+		} else {
+			// Local filesystem M3U file managed by server admin.
+			host.AllowPrivateNetwork = true
+		}
+	} else if rawM3U != "" && h.customStreamClient {
+		host.AllowPrivateNetwork = true
+	}
+
 	var parsed []M3UChannel
 	if strings.EqualFold(host.Type, "m3u") {
 		var err error
-		if strings.TrimSpace(host.M3UContent) != "" {
+		if rawM3U != "" {
 			parsed, err = ParseM3UString(host.M3UContent)
-		} else if strings.TrimSpace(host.Url) != "" {
+		} else if rawURL != "" {
 			parsed, err = h.loadM3UFromSource(r.Context(), host.Url, host.UserAgent)
 		}
 		if err != nil {
@@ -2071,27 +2430,32 @@ func (h *Handler) handleSaveTunerHost(w http.ResponseWriter, r *http.Request) {
 		h.state.TunerHosts = append(h.state.TunerHosts, host)
 	}
 
-	// Replace channels and placeholder programs for this tuner host if M3U channels were parsed.
+	// Replace channels for this tuner host using deterministic channel IDs to preserve Timer/EPG/mapping links.
 	if len(parsed) > 0 {
+		prevByID := make(map[string]ChannelInfo)
 		keptChannels := make([]ChannelInfo, 0, len(h.state.Channels))
 		removedChannelIDs := make(map[string]struct{})
 		for _, ch := range h.state.Channels {
 			if ch.TunerHostId == host.Id {
+				prevByID[ch.Id] = ch
 				removedChannelIDs[ch.Id] = struct{}{}
 				continue
 			}
 			keptChannels = append(keptChannels, ch)
 		}
-		keptPrograms := make([]ProgramInfo, 0, len(h.state.Programs))
-		for _, p := range h.state.Programs {
-			if _, drop := removedChannelIDs[p.ChannelId]; !drop {
-				keptPrograms = append(keptPrograms, p)
-			}
-		}
 
 		now := time.Now().UTC().Truncate(time.Hour)
+		usedIDs := make(map[string]int, len(parsed))
+		newChannelIDs := make(map[string]struct{}, len(parsed))
+		newChannels := make([]ChannelInfo, 0, len(parsed))
 		for _, m := range parsed {
-			chID := guid.New()
+			baseID := deterministicChannelID(host.Id, m, 0)
+			seq := usedIDs[baseID]
+			usedIDs[baseID] = seq + 1
+			chID := baseID
+			if seq > 0 {
+				chID = deterministicChannelID(host.Id, m, seq)
+			}
 			ch := ChannelInfo{
 				Id:          chID,
 				Name:        m.Name,
@@ -2105,18 +2469,42 @@ func (h *Handler) handleSaveTunerHost(w http.ResponseWriter, r *http.Request) {
 				StreamUrl:   m.URL,
 				TunerHostId: host.Id,
 			}
+			if prev, ok := prevByID[chID]; ok {
+				ch.Disabled = prev.Disabled
+				ch.SortIndex = prev.SortIndex
+			}
+			newChannelIDs[chID] = struct{}{}
+			delete(removedChannelIDs, chID)
+			newChannels = append(newChannels, ch)
+		}
+
+		existingProgramsByCh := make(map[string]bool)
+		keptPrograms := make([]ProgramInfo, 0, len(h.state.Programs))
+		for _, p := range h.state.Programs {
+			if _, drop := removedChannelIDs[p.ChannelId]; drop {
+				continue
+			}
+			keptPrograms = append(keptPrograms, p)
+			if _, ok := newChannelIDs[p.ChannelId]; ok {
+				existingProgramsByCh[p.ChannelId] = true
+			}
+		}
+
+		for _, ch := range newChannels {
 			keptChannels = append(keptChannels, ch)
-			keptPrograms = append(keptPrograms, ProgramInfo{
-				Id:          guid.New(),
-				Name:        ch.Name + " Live",
-				ServerId:    h.serverID(),
-				Type:        "Program",
-				ChannelId:   ch.Id,
-				ChannelName: ch.Name,
-				StartDate:   now,
-				EndDate:     now.Add(24 * time.Hour),
-				IsLive:      true,
-			})
+			if !existingProgramsByCh[ch.Id] {
+				keptPrograms = append(keptPrograms, ProgramInfo{
+					Id:          guid.New(),
+					Name:        ch.Name + " Live",
+					ServerId:    h.serverID(),
+					Type:        "Program",
+					ChannelId:   ch.Id,
+					ChannelName: ch.Name,
+					StartDate:   now,
+					EndDate:     now.Add(24 * time.Hour),
+					IsLive:      true,
+				})
+			}
 		}
 		h.state.Channels = keptChannels
 		h.state.Programs = keptPrograms

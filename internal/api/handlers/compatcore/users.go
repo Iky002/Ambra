@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -35,7 +36,7 @@ func (h *Handler) toUserDto(u *sqlite.UserRecord) dto.UserDto {
 	hasPw := u.PasswordHash != ""
 	var dataDir string
 	if h.cfg != nil {
-		dataDir = h.cfg.DataDir
+		dataDir = h.cfg.Snapshot().DataDir
 	}
 	return dto.UserDto{
 		Name:                      u.Name,
@@ -101,6 +102,42 @@ func prunePasswordResetFiles(dataDir string, maxKeep int) {
 	}
 }
 
+func pruneRateBucketLocked(bucket map[string][]time.Time, cutoff time.Time, maxEntries int) {
+	for k, ts := range bucket {
+		kept := ts[:0]
+		for _, t := range ts {
+			if t.After(cutoff) {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) == 0 {
+			delete(bucket, k)
+		} else {
+			bucket[k] = kept
+		}
+	}
+	if maxEntries > 0 && len(bucket) > maxEntries {
+		excess := len(bucket) - maxEntries
+		for k := range bucket {
+			if excess <= 0 {
+				break
+			}
+			delete(bucket, k)
+			excess--
+		}
+	}
+}
+
+func appendRateBucketLocked(bucket map[string][]time.Time, key string, now time.Time, maxEntries int) {
+	if _, exists := bucket[key]; !exists && maxEntries > 0 && len(bucket) >= maxEntries {
+		for k := range bucket {
+			delete(bucket, k)
+			break
+		}
+	}
+	bucket[key] = append(bucket[key], now)
+}
+
 func (h *Handler) forgotPassword(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	ip := forgotClientIP(r)
@@ -109,27 +146,14 @@ func (h *Handler) forgotPassword(w http.ResponseWriter, r *http.Request) {
 	if h.forgotRates == nil {
 		h.forgotRates = make(map[string][]time.Time)
 	}
-	cutoff := now.Add(-forgotPasswordRateWindow)
-	for k, ts := range h.forgotRates {
-		kept := ts[:0]
-		for _, t := range ts {
-			if t.After(cutoff) {
-				kept = append(kept, t)
-			}
-		}
-		if len(kept) == 0 {
-			delete(h.forgotRates, k)
-		} else {
-			h.forgotRates[k] = kept
-		}
-	}
+	pruneRateBucketLocked(h.forgotRates, now.Add(-forgotPasswordRateWindow), maxRateLimitBuckets)
 	if ip != "" {
 		if len(h.forgotRates[ip]) >= forgotPasswordRateLimit {
 			h.mu.Unlock()
 			httpx.Error(w, http.StatusTooManyRequests, "too many password reset requests")
 			return
 		}
-		h.forgotRates[ip] = append(h.forgotRates[ip], now)
+		appendRateBucketLocked(h.forgotRates, ip, now, maxRateLimitBuckets)
 	}
 	h.mu.Unlock()
 
@@ -152,9 +176,13 @@ func (h *Handler) forgotPassword(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	dataDir := ""
+	if h.cfg != nil {
+		dataDir = h.cfg.Snapshot().DataDir
+	}
 	pinFile := ""
-	if h.cfg != nil && h.cfg.DataDir != "" {
-		pinFile = filepath.Join(h.cfg.DataDir, "passwordreset-"+guid.New()[:12]+".txt")
+	if dataDir != "" {
+		pinFile = filepath.Join(dataDir, "passwordreset-"+guid.New()[:12]+".txt")
 	}
 
 	var expiredFiles []string
@@ -201,7 +229,7 @@ func (h *Handler) forgotPassword(w http.ResponseWriter, r *http.Request) {
 	if uid != "" && pinFile != "" {
 		content := fmt.Sprintf("Ambra Password Reset PIN\nUser: %s\nPIN: %s\nExpiresAt: %s\n", uname, pin, expiresAt.Format(time.RFC3339))
 		_ = os.WriteFile(pinFile, []byte(content), 0o600)
-		prunePasswordResetFiles(h.cfg.DataDir, forgotPasswordMaxPinFiles)
+		prunePasswordResetFiles(dataDir, forgotPasswordMaxPinFiles)
 	}
 
 	publicPinFile := ""
@@ -219,24 +247,11 @@ func (h *Handler) checkIPRateLimit(bucket map[string][]time.Time, ip string, now
 	if ip == "" {
 		return true
 	}
-	cutoff := now.Add(-window)
-	for k, ts := range bucket {
-		kept := ts[:0]
-		for _, t := range ts {
-			if t.After(cutoff) {
-				kept = append(kept, t)
-			}
-		}
-		if len(kept) == 0 {
-			delete(bucket, k)
-		} else {
-			bucket[k] = kept
-		}
-	}
+	pruneRateBucketLocked(bucket, now.Add(-window), maxRateLimitBuckets)
 	if len(bucket[ip]) >= limit {
 		return false
 	}
-	bucket[ip] = append(bucket[ip], now)
+	appendRateBucketLocked(bucket, ip, now, maxRateLimitBuckets)
 	return true
 }
 
@@ -350,23 +365,8 @@ func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 		h.authByIDUserRates = make(map[string][]time.Time)
 	}
 	cutoff := now.Add(-authByIDRateWindow)
-	pruneBucket := func(bucket map[string][]time.Time) {
-		for k, ts := range bucket {
-			kept := ts[:0]
-			for _, t := range ts {
-				if t.After(cutoff) {
-					kept = append(kept, t)
-				}
-			}
-			if len(kept) == 0 {
-				delete(bucket, k)
-			} else {
-				bucket[k] = kept
-			}
-		}
-	}
-	pruneBucket(h.authByIDRates)
-	pruneBucket(h.authByIDUserRates)
+	pruneRateBucketLocked(h.authByIDRates, cutoff, maxRateLimitBuckets)
+	pruneRateBucketLocked(h.authByIDUserRates, cutoff, maxRateLimitBuckets)
 	if (ip != "" && len(h.authByIDRates[ip]) >= authByIDRateLimit) ||
 		(uid != "" && len(h.authByIDUserRates[uid]) >= authByIDRateLimit) {
 		h.mu.Unlock()
@@ -374,10 +374,10 @@ func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if ip != "" {
-		h.authByIDRates[ip] = append(h.authByIDRates[ip], now)
+		appendRateBucketLocked(h.authByIDRates, ip, now, maxRateLimitBuckets)
 	}
 	if uid != "" {
-		h.authByIDUserRates[uid] = append(h.authByIDUserRates[uid], now)
+		appendRateBucketLocked(h.authByIDUserRates, uid, now, maxRateLimitBuckets)
 	}
 	h.mu.Unlock()
 
@@ -975,17 +975,19 @@ func (h *Handler) postUserSearchedItems(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	key := "user_searched_items:" + uid
-	var items []map[string]any
-	_, _ = h.loadKV(r.Context(), key, &items)
 	if payload == nil {
 		payload = map[string]any{}
 	}
 	payload["SearchedAt"] = time.Now().UTC().Format(time.RFC3339)
+	h.mu.Lock()
+	var items []map[string]any
+	_, _ = h.loadKVLocked(r.Context(), key, &items)
 	items = append(items, payload)
 	if len(items) > maxSearchedItemsEntries {
 		items = items[len(items)-maxSearchedItemsEntries:]
 	}
-	_ = h.saveKV(r.Context(), key, items)
+	_ = h.saveKVLocked(r.Context(), key, items)
+	h.mu.Unlock()
 	httpx.NoContent(w)
 }
 
@@ -1063,8 +1065,9 @@ func (h *Handler) postUserHomeSections(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	h.mu.Lock()
 	var sections []homeSection
-	found, _ := h.loadKV(r.Context(), "user_home_sections:"+uid, &sections)
+	found, _ := h.loadKVLocked(r.Context(), "user_home_sections:"+uid, &sections)
 	if !found {
 		sections = defaultHomeSections()
 	}
@@ -1084,13 +1087,15 @@ func (h *Handler) postUserHomeSections(w http.ResponseWriter, r *http.Request) {
 	}
 	if !replaced {
 		if len(sections) >= maxHomeSectionsEntries {
+			h.mu.Unlock()
 			httpx.Error(w, http.StatusBadRequest, "home sections limit reached")
 			return
 		}
 		sec.SortOrder = len(sections)
 		sections = append(sections, sec)
 	}
-	_ = h.saveKV(r.Context(), "user_home_sections:"+uid, sections)
+	_ = h.saveKVLocked(r.Context(), "user_home_sections:"+uid, sections)
+	h.mu.Unlock()
 	httpx.JSON(w, http.StatusOK, sec)
 }
 
@@ -1113,8 +1118,9 @@ func (h *Handler) deleteUserHomeSections(w http.ResponseWriter, r *http.Request)
 		removeSet[id] = true
 	}
 
+	h.mu.Lock()
 	var sections []homeSection
-	found, _ := h.loadKV(r.Context(), "user_home_sections:"+uid, &sections)
+	found, _ := h.loadKVLocked(r.Context(), "user_home_sections:"+uid, &sections)
 	if !found {
 		sections = defaultHomeSections()
 	}
@@ -1124,7 +1130,8 @@ func (h *Handler) deleteUserHomeSections(w http.ResponseWriter, r *http.Request)
 			next = append(next, s)
 		}
 	}
-	_ = h.saveKV(r.Context(), "user_home_sections:"+uid, next)
+	_ = h.saveKVLocked(r.Context(), "user_home_sections:"+uid, next)
+	h.mu.Unlock()
 	httpx.NoContent(w)
 }
 
@@ -1147,8 +1154,9 @@ func (h *Handler) moveUserHomeSection(w http.ResponseWriter, r *http.Request) {
 		body.NewIndex = q.Int("NewIndex", body.NewIndex)
 	}
 
+	h.mu.Lock()
 	var sections []homeSection
-	found, _ := h.loadKV(r.Context(), "user_home_sections:"+uid, &sections)
+	found, _ := h.loadKVLocked(r.Context(), "user_home_sections:"+uid, &sections)
 	if !found {
 		sections = defaultHomeSections()
 	}
@@ -1173,8 +1181,9 @@ func (h *Handler) moveUserHomeSection(w http.ResponseWriter, r *http.Request) {
 		for i := range sections {
 			sections[i].SortOrder = i
 		}
-		_ = h.saveKV(r.Context(), "user_home_sections:"+uid, sections)
+		_ = h.saveKVLocked(r.Context(), "user_home_sections:"+uid, sections)
 	}
+	h.mu.Unlock()
 	httpx.NoContent(w)
 }
 
@@ -1791,7 +1800,8 @@ func (h *Handler) serveUserItemExtras(w http.ResponseWriter, r *http.Request, ex
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to load item for extras", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to load item")
 		return
 	}
 	allowedLibs, maxRating, blockedTags := h.userPolicyForRequest(r, uid)
@@ -1810,7 +1820,8 @@ func (h *Handler) serveUserItemExtras(w http.ResponseWriter, r *http.Request, ex
 	}
 	items, err := h.libRepo.GetItemExtras(r.Context(), h.serverID(), uid, itemID, extraTypes)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to load item extras", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to load item extras")
 		return
 	}
 	if items == nil {
@@ -2013,6 +2024,15 @@ func (h *Handler) deleteUserPlayedItem(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, dto.UserItemDataDto{Played: false, Key: itemID})
 }
 
+func (h *Handler) clientInfoForRequest(r *http.Request) auth.ClientInfo {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.Client.DeviceID != "" || !ac.IsAdmin() {
+			return ac.Client
+		}
+	}
+	return middleware.ExtractClientInfo(r)
+}
+
 func (h *Handler) postUserPlayingItemStart(w http.ResponseWriter, r *http.Request) {
 	uid := h.resolveUserID(r, "UserId")
 	if !h.canModifyUser(r, uid) {
@@ -2027,7 +2047,7 @@ func (h *Handler) postUserPlayingItemStart(w http.ResponseWriter, r *http.Reques
 	q := httpx.ParseQuery(r)
 	if h.sessions != nil && h.userRepo != nil && uid != "" {
 		if u, err := h.userRepo.GetUserByID(r.Context(), uid); err == nil && u != nil {
-			client := middleware.ExtractClientInfo(r)
+			client := h.clientInfoForRequest(r)
 			_ = h.sessions.ReportPlaybackStart(r.Context(), u, client, session.PlaybackStartRequest{
 				ItemId:        itemID,
 				MediaSourceId: q.Get("MediaSourceId"),
@@ -2055,7 +2075,7 @@ func (h *Handler) postUserPlayingItemProgress(w http.ResponseWriter, r *http.Req
 	q := httpx.ParseQuery(r)
 	if h.sessions != nil && h.userRepo != nil && uid != "" {
 		if u, err := h.userRepo.GetUserByID(r.Context(), uid); err == nil && u != nil {
-			client := middleware.ExtractClientInfo(r)
+			client := h.clientInfoForRequest(r)
 			isPaused := q.Bool("IsPaused") != nil && *q.Bool("IsPaused")
 			isMuted := q.Bool("IsMuted") != nil && *q.Bool("IsMuted")
 			_ = h.sessions.ReportPlaybackProgress(r.Context(), u, client, session.PlaybackProgressRequest{
@@ -2088,7 +2108,7 @@ func (h *Handler) deleteUserPlayingItem(w http.ResponseWriter, r *http.Request) 
 	q := httpx.ParseQuery(r)
 	if h.sessions != nil && h.userRepo != nil && uid != "" {
 		if u, err := h.userRepo.GetUserByID(r.Context(), uid); err == nil && u != nil {
-			client := middleware.ExtractClientInfo(r)
+			client := h.clientInfoForRequest(r)
 			_ = h.sessions.ReportPlaybackStopped(r.Context(), u, client, session.PlaybackStoppedRequest{
 				ItemId:        itemID,
 				MediaSourceId: q.Get("MediaSourceId"),
@@ -2104,8 +2124,10 @@ func (h *Handler) deleteUserPlayingItem(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) userImagePath(uid, imgType, idx string) string {
 	baseDir := os.TempDir()
-	if h.cfg != nil && h.cfg.DataDir != "" {
-		baseDir = filepath.Join(h.cfg.DataDir, "metadata", "users")
+	if h.cfg != nil {
+		if dd := h.cfg.Snapshot().DataDir; dd != "" {
+			baseDir = filepath.Join(dd, "metadata", "users")
+		}
 	}
 	if idx == "" {
 		idx = "0"
@@ -2154,6 +2176,16 @@ func (h *Handler) serveUserImage(w http.ResponseWriter, r *http.Request, headOnl
 
 	data, err := os.ReadFile(p)
 	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			slog.Error("permission denied reading media file",
+				"path", p,
+				"uid", os.Geteuid(),
+				"gid", os.Getegid(),
+				"error", err,
+			)
+			writeJSONError(w, r, http.StatusForbidden, "permission denied reading media file")
+			return
+		}
 		writeJSONError(w, r, http.StatusNotFound, "user image not found")
 		return
 	}
@@ -2347,11 +2379,13 @@ func (h *Handler) postUserSettingsPartial(w http.ResponseWriter, r *http.Request
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	h.mu.Lock()
 	current := map[string]any{}
-	_, _ = h.loadKV(r.Context(), "user_settings:"+uid, &current)
+	_, _ = h.loadKVLocked(r.Context(), "user_settings:"+uid, &current)
 	for k, v := range patch {
 		current[k] = v
 	}
-	_ = h.saveKV(r.Context(), "user_settings:"+uid, current)
+	_ = h.saveKVLocked(r.Context(), "user_settings:"+uid, current)
+	h.mu.Unlock()
 	httpx.NoContent(w)
 }

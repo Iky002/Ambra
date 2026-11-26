@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useEffect, useState } from 'react'
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { QueryClientContext } from '@tanstack/react-query'
 import { api, clearAuth, getDeviceId, getStoredAuth, saveAuth } from '../api/client'
 import type { AuthSession, AuthenticationResult, UserDto } from '../api/types'
@@ -26,8 +26,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [auth, setAuth] = useState<AuthSession | null>(() => getStoredAuth())
   const [user, setUser] = useState<UserDto | null>(null)
   const [userLoading, setUserLoading] = useState<boolean>(() => Boolean(getStoredAuth()))
+  const skipNextRefreshUserIdRef = useRef<string | null>(null)
 
   const logout = useCallback(() => {
+    skipNextRefreshUserIdRef.current = null
     if (isDemoMode()) {
       try {
         sessionStorage.setItem(DEMO_LOGGED_OUT_KEY, '1')
@@ -94,6 +96,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
       // 登录或切换账号时清空 React Query 内存缓存，防止跨账号数据残留
       queryClient?.clear()
+      skipNextRefreshUserIdRef.current = res.User.Id
       saveAuth(session)
       setAuth(session)
       setUser(res.User)
@@ -135,8 +138,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (auth?.userId) {
+      if (skipNextRefreshUserIdRef.current === auth.userId) {
+        skipNextRefreshUserIdRef.current = null
+        return
+      }
       void refreshUser()
     } else {
+      skipNextRefreshUserIdRef.current = null
       setUser(null)
       setUserLoading(false)
     }
@@ -144,6 +152,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     const onUnauthorized = () => {
+      skipNextRefreshUserIdRef.current = null
       queryClient?.clear()
       setAuth(null)
       setUser(null)
@@ -153,8 +162,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => window.removeEventListener('ambra:unauthorized', onUnauthorized)
   }, [queryClient])
 
-  // 严格以当前用户 Policy.IsAdministrator 为准；用户资料尚未加载完时回退至登录会话中的 isAdmin
-  const isAdmin = user ? Boolean(user.Policy?.IsAdministrator) : Boolean(auth?.isAdmin)
+  // 严格以服务端验证或登录响应返回的 User.Policy.IsAdministrator 为准，不信任本地缓存的 auth.isAdmin
+  const isAdmin = Boolean(user?.Policy?.IsAdministrator)
 
   return (
     <AuthContext.Provider

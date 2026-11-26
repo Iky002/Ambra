@@ -200,6 +200,7 @@ func (b *phaseABatch) flush(ctx context.Context) error {
 type enrichTask struct {
 	ItemID           string
 	LibraryID        string
+	LibRoot          string
 	ItemType         string
 	ParentSeriesID   string
 	MediaPath        string
@@ -518,12 +519,22 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 		return stats, fmt.Errorf("scanner: path %q is outside library %s roots", cleanTarget, lib.ID)
 	}
 	policy := s.currentSymlinkPolicy()
-	if linfo, lerr := os.Lstat(cleanTarget); lerr == nil && linfo.Mode()&os.ModeSymlink != 0 {
+	linfo, lerr := os.Lstat(cleanTarget)
+	if lerr == nil {
+		if policy == SymlinkIgnore && (linfo.Mode()&os.ModeSymlink != 0 || hasSymlinkComponentUnderRoot(root, cleanTarget)) {
+			return stats, nil
+		}
+		if !isPathWithinRoot(root, cleanTarget) {
+			return stats, fmt.Errorf("scanner: path %q escapes library %s root", cleanTarget, lib.ID)
+		}
+	} else if !os.IsNotExist(lerr) {
+		return stats, lerr
+	} else if hasSymlinkComponentUnderRoot(root, cleanTarget) {
 		if policy == SymlinkIgnore {
 			return stats, nil
 		}
 		if !isPathWithinRoot(root, cleanTarget) {
-			return stats, fmt.Errorf("scanner: symlink %q escapes library %s root", cleanTarget, lib.ID)
+			return stats, fmt.Errorf("scanner: path %q escapes library %s root", cleanTarget, lib.ID)
 		}
 	}
 	info, err := os.Stat(cleanTarget)
@@ -949,7 +960,7 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 			rec, err := s.repo.GetItemRecordByID(ctx, task.ItemID)
 			if err == nil && rec != nil {
 				if len(probeRes.Streams) > 0 {
-					ms := s.buildMediaSource(rec, task.MediaPath, task.Size, task.Mtime, task.IsStrm, task.Container, probeRes)
+					ms := s.buildMediaSourceInRoot(task.LibRoot, rec, task.MediaPath, task.Size, task.Mtime, task.IsStrm, task.Container, probeRes)
 					if err := s.repo.UpsertMediaSourceAndStreams(ctx, rec.ID, ms); err == nil {
 						updated = true
 					}
@@ -1002,21 +1013,8 @@ func (s *Scanner) enrichItem(ctx context.Context, task enrichTask) bool {
 			return updated
 		}
 		s.updateEnrichCurrent(task.LibraryID, itemLabel, "刮削元数据与下载海报")
-		if (strings.EqualFold(task.ItemType, "Season") || strings.EqualFold(task.ItemType, "Episode")) &&
-			task.ParentSeriesID != "" && getProviderID(task.Query.ProviderIDs, "tmdb") == "" {
-			if parent, err := s.repo.GetItemRecordByID(ctx, task.ParentSeriesID); err == nil && parent != nil && len(parent.Extra.ProviderIDs) > 0 {
-				ids := cloneStringMap(task.Query.ProviderIDs)
-				if ids == nil {
-					ids = make(map[string]string, len(parent.Extra.ProviderIDs)+1)
-				}
-				for k, v := range parent.Extra.ProviderIDs {
-					ids[k] = v
-				}
-				if tmdbID := getProviderID(parent.Extra.ProviderIDs, "tmdb"); tmdbID != "" {
-					ids["tmdb"] = tmdbID
-				}
-				task.Query.ProviderIDs = ids
-			}
+		if (strings.EqualFold(task.ItemType, "Season") || strings.EqualFold(task.ItemType, "Episode")) && task.ParentSeriesID != "" {
+			s.applyParentSeriesQueryContext(ctx, task.ParentSeriesID, &task.Query)
 		}
 		onlineMeta := s.fetchMetadataFiltered(ctx, task.Query, false)
 		if onlineMeta != nil {
@@ -1086,6 +1084,33 @@ func (s *Scanner) extractAudioAttachedPic(ctx context.Context, rec *sqlite.ItemR
 		return false
 	}
 
+	absMedia, err := filepath.Abs(strings.TrimSpace(mediaPath))
+	if err != nil {
+		return false
+	}
+
+	unlock := s.lockPicDest(destPath)
+	defer unlock()
+
+	if linfo, lerr := os.Lstat(destPath); lerr == nil {
+		if linfo.IsDir() || linfo.Mode()&os.ModeSymlink != 0 {
+			return false
+		}
+	}
+
+	tmpFile, err := os.CreateTemp(filepath.Dir(destPath), ".ambra-pic-*.jpg")
+	if err != nil {
+		return false
+	}
+	tmpPath := tmpFile.Name()
+	_ = tmpFile.Close()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
 	ffmpegPath := "ffmpeg"
 	if s.cfg != nil && strings.TrimSpace(s.cfg.FFmpegPath) != "" {
 		ffmpegPath = s.cfg.FFmpegPath
@@ -1100,14 +1125,27 @@ func (s *Scanner) extractAudioAttachedPic(ctx context.Context, rec *sqlite.ItemR
 		"-hide_banner",
 		"-loglevel", "error",
 		"-y",
-		"-i", mediaPath,
+		"-protocol_whitelist", probeLocalProtocolWhitelist,
+		"-i", absMedia,
 		"-map", "0:v:0",
 		"-frames:v", "1",
-		destPath,
+		tmpPath,
 	)
 	if err := cmd.Run(); err != nil {
 		return false
 	}
+	tmpInfo, err := os.Stat(tmpPath)
+	if err != nil || tmpInfo.IsDir() || tmpInfo.Size() == 0 {
+		return false
+	}
+	if linfo, lerr := os.Lstat(destPath); lerr == nil && (linfo.IsDir() || linfo.Mode()&os.ModeSymlink != 0) {
+		return false
+	}
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		return false
+	}
+	cleanupTmp = false
+
 	info, err := os.Stat(destPath)
 	if err != nil || info.IsDir() || info.Size() == 0 {
 		return false
@@ -1355,8 +1393,8 @@ func applyOnlineMetadataToItem(rec *sqlite.ItemRecord, meta *plugins.MetadataRes
 			rec.Extra.ProviderIDs = make(map[string]string)
 		}
 		for k, v := range meta.ProviderIDs {
-			if _, exists := rec.Extra.ProviderIDs[k]; !exists {
-				rec.Extra.ProviderIDs[k] = v
+			if getProviderID(rec.Extra.ProviderIDs, k) == "" && strings.TrimSpace(v) != "" {
+				rec.Extra.ProviderIDs[k] = strings.TrimSpace(v)
 			}
 		}
 	}

@@ -1,6 +1,7 @@
 package compatmedia
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -8,7 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -24,6 +27,7 @@ import (
 	"github.com/ambra-media/ambra/internal/core/scanner"
 	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
@@ -63,7 +67,8 @@ func (h *Handler) handleUpdateItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia item handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 
@@ -126,7 +131,8 @@ func (h *Handler) handleUpdateItem(w http.ResponseWriter, r *http.Request) {
 	rec.Etag = guid.New()[:16]
 
 	if err := h.repo.UpsertItem(r.Context(), rec); err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to update item", "item_id", rec.ID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to update item")
 		return
 	}
 	if req.Genres != nil {
@@ -213,7 +219,8 @@ func (h *Handler) handleItemRefresh(w http.ResponseWriter, r *http.Request) {
 				httpx.Error(w, http.StatusNotFound, "item not found")
 				return
 			}
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("failed to refresh item", "item_id", itemID, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to refresh item")
 			return
 		}
 	}
@@ -278,7 +285,8 @@ func (h *Handler) handleDeleteItem(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusNotFound, "item not found")
 		return
 	} else if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to delete item", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to delete item")
 		return
 	}
 	httpx.NoContent(w)
@@ -392,7 +400,8 @@ func (h *Handler) handleItemVisibility(isPublic bool) http.HandlerFunc {
 			return
 		}
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("internal error in compatmedia item handler", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal server error")
 			return
 		}
 		callerID, isAdmin := h.callerIdentity(r)
@@ -466,8 +475,10 @@ func (h *Handler) handleRemoteSearch(itemType string) http.HandlerFunc {
 		results := make([]remoteSearchResult, 0)
 		if h.registry != nil && (req.SearchInfo.Name != "" || len(req.SearchInfo.ProviderIds) > 0) {
 			lang := "zh-CN"
-			if h.cfg != nil && h.cfg.TMDBLanguage != "" {
-				lang = h.cfg.TMDBLanguage
+			if h.cfg != nil {
+				if cfgLang := h.cfg.Snapshot().TMDBLanguage; cfgLang != "" {
+					lang = cfgLang
+				}
 			}
 			mq := plugins.MediaQuery{
 				ItemType:    itemType,
@@ -550,7 +561,8 @@ func (h *Handler) handleRemoteSearchApply(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia item handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 
@@ -570,7 +582,8 @@ func (h *Handler) handleRemoteSearchApply(w http.ResponseWriter, r *http.Request
 	rec.DateModified = time.Now().Unix()
 	rec.Etag = guid.New()[:16]
 	if err := h.repo.UpsertItem(r.Context(), rec); err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to update item", "item_id", rec.ID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to update item")
 		return
 	}
 
@@ -719,6 +732,27 @@ func (h *Handler) callerIdentity(r *http.Request) (userID string, isAdmin bool) 
 	return "", false
 }
 
+func logAndWritePermissionDenied(w http.ResponseWriter, path string, err error) {
+	slog.Error("permission denied reading media file",
+		"path", path,
+		"uid", os.Geteuid(),
+		"gid", os.Getegid(),
+		"error", err,
+	)
+	httpx.Error(w, http.StatusForbidden, "permission denied reading media file")
+}
+
+func sanitizeContentDispositionFilename(name string) string {
+	name = strings.ReplaceAll(name, "\r", "")
+	name = strings.ReplaceAll(name, "\n", "")
+	name = strings.ReplaceAll(name, "\\", "\\\\")
+	name = strings.ReplaceAll(name, `"`, `\"`)
+	if name == "" {
+		return "file"
+	}
+	return name
+}
+
 func (h *Handler) handleItemFile(w http.ResponseWriter, r *http.Request) {
 	if !h.canDownloadContent(r) {
 		httpx.Error(w, http.StatusForbidden, "content downloading is disabled")
@@ -726,28 +760,59 @@ func (h *Handler) handleItemFile(w http.ResponseWriter, r *http.Request) {
 	}
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	rec, err := h.repo.GetItemRecordByID(r.Context(), itemID)
-	if errors.Is(err, sqlite.ErrNotFound) || rec.Path == "" {
+	if errors.Is(err, sqlite.ErrNotFound) || (err == nil && rec.Path == "") {
 		httpx.Error(w, http.StatusNotFound, "item file not found")
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to load item for file download", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to load item")
 		return
 	}
 	if !h.canAccessItem(r, rec) {
 		httpx.Error(w, http.StatusForbidden, "access denied")
 		return
 	}
+	if rec.IsFolder {
+		httpx.Error(w, http.StatusBadRequest, "cannot download folder")
+		return
+	}
 	if rec.IsStrm || strings.EqualFold(filepath.Ext(rec.Path), ".strm") {
 		httpx.Error(w, http.StatusForbidden, "downloading .strm files is not allowed")
 		return
 	}
-	if _, err := os.Stat(rec.Path); err != nil {
+	fi, err := os.Stat(rec.Path)
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			logAndWritePermissionDenied(w, rec.Path, err)
+			return
+		}
 		httpx.Error(w, http.StatusNotFound, "file not found on disk")
 		return
 	}
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, filepath.Base(rec.Path)))
-	http.ServeFile(w, r, rec.Path)
+	if fi.IsDir() {
+		httpx.Error(w, http.StatusBadRequest, "cannot download directory")
+		return
+	}
+	f, err := os.Open(rec.Path)
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			logAndWritePermissionDenied(w, rec.Path, err)
+			return
+		}
+		if os.IsNotExist(err) {
+			httpx.Error(w, http.StatusNotFound, "file not found on disk")
+			return
+		}
+		slog.Error("failed to open item file", "path", rec.Path, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to open item file")
+		return
+	}
+	defer f.Close()
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, sanitizeContentDispositionFilename(filepath.Base(rec.Path))))
+	http.ServeContent(w, r, fi.Name(), fi.ModTime(), f)
 }
 
 func (h *Handler) handleSimilar(w http.ResponseWriter, r *http.Request) {
@@ -776,7 +841,8 @@ func (h *Handler) handleSimilar(w http.ResponseWriter, r *http.Request) {
 		blockedTags,
 	)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia item handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	h.sanitizeItemsPathsForCaller(r, items)
@@ -812,7 +878,8 @@ func (h *Handler) handleItemInstantMix(w http.ResponseWriter, r *http.Request) {
 		blockedTags,
 	)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia item handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	h.sanitizeItemsPathsForCaller(r, items)
@@ -850,7 +917,8 @@ func (h *Handler) handleLocalTrailers(w http.ResponseWriter, r *http.Request) {
 	}
 	items, err := h.repo.GetItemExtras(r.Context(), h.serverID(), h.resolveUserID(r, q), itemID, []string{"Trailer"})
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia item handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	h.sanitizeItemsPathsForCaller(r, items)
@@ -874,7 +942,8 @@ func (h *Handler) handleSpecialFeatures(w http.ResponseWriter, r *http.Request) 
 	}
 	items, err := h.repo.GetItemExtras(r.Context(), h.serverID(), h.resolveUserID(r, q), itemID, specialFeatureExtraTypes)
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia item handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	h.sanitizeItemsPathsForCaller(r, items)
@@ -905,7 +974,8 @@ func (h *Handler) serveThemeMediaByTypes(w http.ResponseWriter, r *http.Request,
 		var err error
 		items, err = h.repo.GetItemExtras(r.Context(), h.serverID(), h.resolveUserID(r, q), ownerID, extraTypes)
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("internal error in compatmedia item handler", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal server error")
 			return
 		}
 	}
@@ -934,7 +1004,8 @@ func (h *Handler) handleAllThemeMedia(w http.ResponseWriter, r *http.Request) {
 		userID := h.resolveUserID(r, q)
 		allThemes, err := h.repo.GetItemExtras(r.Context(), h.serverID(), userID, ownerID, []string{"ThemeSong", "ThemeVideo"})
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			slog.Error("internal error in compatmedia item handler", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal server error")
 			return
 		}
 		h.sanitizeItemsPathsForCaller(r, allThemes)
@@ -965,14 +1036,42 @@ func (h *Handler) handleAllThemeMedia(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handler) buildThumbnailSetPayload(r *http.Request) map[string]any {
+func (h *Handler) buildThumbnailSetPayload(r *http.Request) (map[string]any, bool) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
+	if itemID != "" && !h.canAccessItemID(r, itemID) {
+		return nil, false
+	}
 	q := httpx.ParseQuery(r)
+	mediaSourceID := guid.Normalize(q.Get("MediaSourceId"))
 	width := transcode.ParseBIFWidthParam(q.Get("Width"))
 	thumbs := []map[string]any{}
+	aspectRatio := 1.777
 
-	if h.extractor != nil && itemID != "" && h.canAccessItemID(r, itemID) {
-		mediaPath := h.resolveMediaSourcePath(r.Context(), itemID, guid.Normalize(q.Get("MediaSourceId")))
+	if h.repo != nil && itemID != "" {
+		if sources, err := h.repo.GetMediaSourcesByItemID(r.Context(), itemID); err == nil && len(sources) > 0 {
+			var selected *sqlite.MediaSourceRecord
+			if mediaSourceID != "" {
+				for i := range sources {
+					if guid.Normalize(sources[i].ID) == mediaSourceID {
+						selected = &sources[i]
+						break
+					}
+				}
+			}
+			if selected == nil {
+				selected = &sources[0]
+			}
+			for _, st := range selected.Streams {
+				if strings.EqualFold(st.StreamType, "Video") && st.Width > 0 && st.Height > 0 {
+					aspectRatio = float64(st.Width) / float64(st.Height)
+					break
+				}
+			}
+		}
+	}
+
+	if h.extractor != nil && itemID != "" {
+		mediaPath := h.resolveMediaSourcePath(r.Context(), itemID, mediaSourceID)
 		if bifPath := h.extractor.FindExistingBIF(mediaPath, itemID, width); bifPath != "" {
 			if meta, err := transcode.ReadBIFMetadata(bifPath); err == nil && len(meta.FrameTimestampsMs) > 0 {
 				thumbs = make([]map[string]any, 0, len(meta.FrameTimestampsMs))
@@ -986,17 +1085,27 @@ func (h *Handler) buildThumbnailSetPayload(r *http.Request) map[string]any {
 		}
 	}
 	return map[string]any{
-		"AspectRatio": 1.777,
+		"AspectRatio": aspectRatio,
 		"Thumbnails":  thumbs,
-	}
+	}, true
 }
 
 func (h *Handler) handleItemThumbnails(w http.ResponseWriter, r *http.Request) {
-	httpx.JSON(w, http.StatusOK, h.buildThumbnailSetPayload(r))
+	payload, ok := h.buildThumbnailSetPayload(r)
+	if !ok {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, payload)
 }
 
 func (h *Handler) handleItemThumbnailSet(w http.ResponseWriter, r *http.Request) {
-	httpx.JSON(w, http.StatusOK, h.buildThumbnailSetPayload(r))
+	payload, ok := h.buildThumbnailSetPayload(r)
+	if !ok {
+		httpx.Error(w, http.StatusForbidden, "access denied")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, payload)
 }
 
 // --- Subtitles, Videos & Audio HLS ---
@@ -1083,7 +1192,8 @@ func (h *Handler) handleUploadSubtitle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia item handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if !h.canAccessItem(r, rec) {
@@ -1135,7 +1245,36 @@ func (h *Handler) handleUploadSubtitle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mediaPath := h.resolveMediaSourcePath(r.Context(), itemID, "")
+	q := httpx.ParseQuery(r)
+	requestedMSID := guid.Normalize(q.Get("MediaSourceId"))
+	var (
+		mediaSourceID string
+		mediaPath     string
+	)
+	if requestedMSID != "" && h.store != nil {
+		var p sql.NullString
+		msErr := h.store.Reader.QueryRowContext(r.Context(),
+			`SELECT id, path FROM item_media_sources WHERE item_id = ? AND id = ? LIMIT 1`,
+			itemID, requestedMSID,
+		).Scan(&mediaSourceID, &p)
+		if errors.Is(msErr, sql.ErrNoRows) {
+			if requestedMSID == itemID && strings.TrimSpace(rec.Path) != "" {
+				mediaSourceID = itemID
+				mediaPath = rec.Path
+			} else {
+				httpx.Error(w, http.StatusNotFound, "media source not found")
+				return
+			}
+		} else if msErr != nil {
+			slog.Error("failed to look up media source for subtitle upload", "item_id", itemID, "media_source_id", requestedMSID, "error", msErr)
+			httpx.Error(w, http.StatusInternalServerError, "failed to load media source")
+			return
+		} else {
+			mediaPath = strings.TrimSpace(p.String)
+		}
+	} else {
+		mediaPath = h.resolveMediaSourcePath(r.Context(), itemID, requestedMSID)
+	}
 	if strings.TrimSpace(mediaPath) == "" {
 		httpx.Error(w, http.StatusBadRequest, "item has no media file path")
 		return
@@ -1153,21 +1292,24 @@ func (h *Handler) handleUploadSubtitle(w http.ResponseWriter, r *http.Request) {
 
 	tmpPath := destPath + ".tmp." + guid.New()[:8]
 	if err := os.WriteFile(tmpPath, decoded, 0o644); err != nil {
-		httpx.Error(w, http.StatusInternalServerError, fmt.Sprintf("write subtitle: %v", err))
+		slog.Error("failed to write uploaded subtitle", "path", tmpPath, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to save subtitle file")
 		return
 	}
 	if err := os.Rename(tmpPath, destPath); err != nil {
 		_ = os.Remove(tmpPath)
-		httpx.Error(w, http.StatusInternalServerError, fmt.Sprintf("save subtitle: %v", err))
+		slog.Error("failed to rename uploaded subtitle", "path", destPath, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to save subtitle file")
 		return
 	}
 
 	if h.store != nil {
-		var mediaSourceID string
-		_ = h.store.Reader.QueryRowContext(r.Context(),
-			`SELECT id FROM item_media_sources WHERE item_id = ? ORDER BY rowid ASC LIMIT 1`,
-			itemID,
-		).Scan(&mediaSourceID)
+		if mediaSourceID == "" {
+			_ = h.store.Reader.QueryRowContext(r.Context(),
+				`SELECT id FROM item_media_sources WHERE item_id = ? ORDER BY rowid ASC LIMIT 1`,
+				itemID,
+			).Scan(&mediaSourceID)
+		}
 		if mediaSourceID == "" {
 			mediaSourceID = itemID
 		}
@@ -1198,7 +1340,8 @@ func (h *Handler) handleUploadSubtitle(w http.ResponseWriter, r *http.Request) {
 				format, streamLang, cls.SubVariant, cls.DisplayTitle, filepath.Base(destPath), isForcedInt,
 				mediaSourceID, existingIdx, destPath,
 			); err != nil {
-				httpx.Error(w, http.StatusInternalServerError, err.Error())
+				slog.Error("failed to update subtitle stream record", "item_id", itemID, "error", err)
+				httpx.Error(w, http.StatusInternalServerError, "failed to save subtitle metadata")
 				return
 			}
 		} else if errors.Is(qErr, sql.ErrNoRows) {
@@ -1218,11 +1361,13 @@ func (h *Handler) handleUploadSubtitle(w http.ResponseWriter, r *http.Request) {
 				mediaSourceID, itemID, nextIdx, format, streamLang, cls.SubVariant,
 				cls.DisplayTitle, filepath.Base(destPath), isForcedInt, destPath,
 			); err != nil {
-				httpx.Error(w, http.StatusInternalServerError, err.Error())
+				slog.Error("failed to insert subtitle stream record", "item_id", itemID, "error", err)
+				httpx.Error(w, http.StatusInternalServerError, "failed to save subtitle metadata")
 				return
 			}
 		} else {
-			httpx.Error(w, http.StatusInternalServerError, qErr.Error())
+			slog.Error("failed to query existing subtitle stream", "item_id", itemID, "error", qErr)
+			httpx.Error(w, http.StatusInternalServerError, "failed to load subtitle metadata")
 			return
 		}
 	}
@@ -1264,7 +1409,8 @@ func (h *Handler) handleDeleteSubtitle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("internal error in compatmedia item handler", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 	if isExternal == 0 {
@@ -1279,7 +1425,8 @@ func (h *Handler) handleDeleteSubtitle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := os.Remove(cleanPath); err != nil && !os.IsNotExist(err) {
-			httpx.Error(w, http.StatusInternalServerError, fmt.Sprintf("delete subtitle file: %v", err))
+			slog.Error("failed to delete subtitle file", "path", cleanPath, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to delete subtitle file")
 			return
 		}
 	}
@@ -1290,7 +1437,8 @@ func (h *Handler) handleDeleteSubtitle(w http.ResponseWriter, r *http.Request) {
 		  AND (? = '' OR media_source_id = ?)`,
 		itemID, idx, mediaSourceID, mediaSourceID,
 	); err != nil {
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to delete subtitle stream record", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to delete subtitle metadata")
 		return
 	}
 	httpx.NoContent(w)
@@ -1372,13 +1520,24 @@ func (h *Handler) handleSubtitleStream(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusNotFound, "media file not found for subtitle extraction")
 			return
 		}
+		mediaPath, err = h.resolveExtractionMediaPath(r.Context(), mediaPath)
+		if err != nil {
+			slog.Error("failed to resolve strm for subtitle extraction", "item_id", itemID, "error", err)
+			httpx.Error(w, http.StatusBadGateway, "failed to resolve strm stream")
+			return
+		}
 		extractExt := format
 		if extractExt == "" {
 			extractExt = codec.String
 		}
 		extractedPath, err := h.extractor.ExtractSubtitle(r.Context(), mediaPath, itemID, effectiveMSID, idx, extractExt)
 		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			if errors.Is(err, os.ErrPermission) {
+				logAndWritePermissionDenied(w, mediaPath, err)
+				return
+			}
+			slog.Error("failed to extract subtitle", "item_id", itemID, "path", mediaPath, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "failed to extract subtitle")
 			return
 		}
 		subPath = extractedPath
@@ -1390,16 +1549,21 @@ func (h *Handler) handleSubtitleStream(w http.ResponseWriter, r *http.Request) {
 
 	ct, data, err := playback.ServeSubtitle(subPath, format, startTicks)
 	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			logAndWritePermissionDenied(w, subPath, err)
+			return
+		}
 		if os.IsNotExist(err) {
 			httpx.Error(w, http.StatusNotFound, "subtitle file missing")
 			return
 		}
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		slog.Error("failed to serve subtitle", "path", subPath, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to serve subtitle")
 		return
 	}
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.Header().Set("Cache-Control", "private, max-age=3600")
 	w.WriteHeader(http.StatusOK)
 	if r.Method != http.MethodHead {
 		_, _ = w.Write(data)
@@ -1462,6 +1626,69 @@ func (h *Handler) resolveMediaSourcePath(ctx context.Context, itemID, mediaSourc
 	return ""
 }
 
+func isHTTPURL(s string) bool {
+	lower := strings.ToLower(strings.TrimSpace(s))
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
+}
+
+func readFirstLineStrmURL(strmPath string) (string, error) {
+	f, err := os.Open(strmPath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimPrefix(sc.Text(), "\uFEFF")
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "#") {
+			candidate := strings.ReplaceAll(line, " ", "%20")
+			if !isHTTPURL(candidate) {
+				return "", errors.New("strm target must be an http/https url")
+			}
+			if _, parseErr := url.Parse(candidate); parseErr != nil {
+				return "", parseErr
+			}
+			return candidate, nil
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return "", err
+	}
+	return "", errors.New("empty strm file")
+}
+
+func (h *Handler) resolveExtractionMediaPath(ctx context.Context, mediaPath string) (string, error) {
+	if strings.EqualFold(filepath.Ext(mediaPath), ".strm") {
+		var (
+			resolved string
+			err      error
+		)
+		if h.streamResolver != nil {
+			resolved, err = h.streamResolver(ctx, mediaPath)
+		} else {
+			resolved, err = readFirstLineStrmURL(mediaPath)
+		}
+		if err != nil {
+			return "", err
+		}
+		resolved = strings.TrimSpace(resolved)
+		if !isHTTPURL(resolved) {
+			return "", errors.New("invalid strm target url")
+		}
+		if err := netutil.ValidateRemoteURL(resolved, true); err != nil {
+			return "", err
+		}
+		return resolved, nil
+	}
+	if isHTTPURL(mediaPath) {
+		if err := netutil.ValidateRemoteURL(mediaPath, true); err != nil {
+			return "", err
+		}
+	}
+	return mediaPath, nil
+}
+
 func (h *Handler) handleListVideoAttachments(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	mediaSourceID := guid.Normalize(chi.URLParam(r, "MediaSourceId"))
@@ -1472,6 +1699,12 @@ func (h *Handler) handleListVideoAttachments(w http.ResponseWriter, r *http.Requ
 	mediaPath := h.resolveMediaSourcePath(r.Context(), itemID, mediaSourceID)
 	if mediaPath == "" || h.extractor == nil {
 		httpx.JSON(w, http.StatusOK, []videoAttachmentDTO{})
+		return
+	}
+	mediaPath, err := h.resolveExtractionMediaPath(r.Context(), mediaPath)
+	if err != nil {
+		slog.Error("failed to resolve strm for attachment listing", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusBadGateway, "failed to resolve strm stream")
 		return
 	}
 	fonts, err := h.extractor.ExtractFonts(r.Context(), mediaPath, itemID, mediaSourceID)
@@ -1509,6 +1742,12 @@ func (h *Handler) handleVideoAttachmentStream(w http.ResponseWriter, r *http.Req
 		httpx.Error(w, http.StatusNotFound, "attachment stream not found")
 		return
 	}
+	mediaPath, err = h.resolveExtractionMediaPath(r.Context(), mediaPath)
+	if err != nil {
+		slog.Error("failed to resolve strm for attachment stream", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusBadGateway, "failed to resolve strm stream")
+		return
+	}
 	fonts, err := h.extractor.ExtractFonts(r.Context(), mediaPath, itemID, mediaSourceID)
 	if err != nil || idx >= len(fonts) {
 		httpx.Error(w, http.StatusNotFound, "attachment stream not found")
@@ -1517,6 +1756,10 @@ func (h *Handler) handleVideoAttachmentStream(w http.ResponseWriter, r *http.Req
 	fontPath := fonts[idx]
 	data, err := os.ReadFile(fontPath)
 	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			logAndWritePermissionDenied(w, fontPath, err)
+			return
+		}
 		httpx.Error(w, http.StatusNotFound, "attachment file not found")
 		return
 	}
@@ -1524,7 +1767,7 @@ func (h *Handler) handleVideoAttachmentStream(w http.ResponseWriter, r *http.Req
 	etag := fmt.Sprintf(`"%x"`, sum[:8])
 
 	w.Header().Set("Content-Type", fontContentType(fontPath))
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
 	w.Header().Set("ETag", etag)
 	if inm := strings.TrimSpace(r.Header.Get("If-None-Match")); inm != "" && inm == etag {
 		w.WriteHeader(http.StatusNotModified)
@@ -1539,25 +1782,80 @@ func (h *Handler) handleVideoAttachmentStream(w http.ResponseWriter, r *http.Req
 
 func (h *Handler) handleDeleteAlternateSources(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
-	_, _ = h.repo.SplitItemVersions(r.Context(), itemID)
+	if _, err := h.repo.SplitItemVersions(r.Context(), itemID); err != nil {
+		if errors.Is(err, sqlite.ErrNotFound) {
+			httpx.Error(w, http.StatusNotFound, "item not found")
+			return
+		}
+		slog.Error("failed to split item versions", "item_id", itemID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to split item versions")
+		return
+	}
 	httpx.NoContent(w)
 }
 
 func (h *Handler) handleMergeVersions(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
-	if ids := q.List("Ids"); len(ids) >= 2 {
-		_, _, _ = h.repo.MergeItemVersions(r.Context(), ids)
+	ids := q.List("Ids")
+	if len(ids) < 2 {
+		httpx.Error(w, http.StatusBadRequest, "at least two item ids are required")
+		return
+	}
+	if _, _, err := h.repo.MergeItemVersions(r.Context(), ids); err != nil {
+		if errors.Is(err, sqlite.ErrNotFound) {
+			httpx.Error(w, http.StatusNotFound, "item not found")
+			return
+		}
+		lowerMsg := strings.ToLower(err.Error())
+		if strings.Contains(lowerMsg, "at least 2") ||
+			strings.Contains(lowerMsg, "cannot merge") {
+			httpx.Error(w, http.StatusBadRequest, "invalid items for version merge")
+			return
+		}
+		slog.Error("failed to merge item versions", "ids", ids, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "failed to merge item versions")
+		return
 	}
 	httpx.NoContent(w)
 }
 
+func (h *Handler) resolveDeviceID(r *http.Request, q httpx.Query) string {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil {
+		if boundDev := strings.TrimSpace(ac.Client.DeviceID); boundDev != "" {
+			return boundDev
+		}
+	}
+	return strings.TrimSpace(q.Get("DeviceId"))
+}
+
+func scopePlaySessionID(playSessionID, callerUserID string, isAdmin bool) string {
+	playSessionID = strings.TrimSpace(playSessionID)
+	if playSessionID == "" || isAdmin || callerUserID == "" {
+		return playSessionID
+	}
+	prefix := callerUserID + ":"
+	if strings.HasPrefix(playSessionID, prefix) {
+		return playSessionID
+	}
+	return prefix + playSessionID
+}
+
 func (h *Handler) handleDeleteActiveEncodings(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
-	deviceID := q.Get("DeviceId")
-	playSessionID := q.Get("PlaySessionId")
 	callerUserID, isAdmin := h.callerIdentity(r)
+	deviceID := h.resolveDeviceID(r, q)
+	rawPlaySessionID := strings.TrimSpace(q.Get("PlaySessionId"))
+	playSessionID := scopePlaySessionID(rawPlaySessionID, callerUserID, isAdmin)
 	if h.transcodeMgr != nil {
-		h.transcodeMgr.StopByDeviceForUser(deviceID, playSessionID, callerUserID, isAdmin)
+		h.transcodeMgr.StopSessionsScoped(callerUserID, playSessionID, deviceID, isAdmin)
+		if isAdmin && rawPlaySessionID != "" {
+			suffix := ":" + rawPlaySessionID
+			for _, snap := range h.transcodeMgr.ActiveSessions() {
+				if strings.HasSuffix(snap.PlaySessionID, suffix) {
+					h.transcodeMgr.StopSessionsScoped(callerUserID, snap.PlaySessionID, "", true)
+				}
+			}
+		}
 	}
 	httpx.NoContent(w)
 }

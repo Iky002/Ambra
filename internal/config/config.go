@@ -24,12 +24,37 @@ const (
 )
 
 // AmbraVersion is the Ambra application release version (overridden at build time via -ldflags).
-var AmbraVersion = "v0.10.6"
+var AmbraVersion = "v0.10.7"
+
+type envOverrideFlags struct {
+	httpAddr           bool
+	webDir             bool
+	tmdbKey            bool
+	enableDLNA         bool
+	enableQuickConnect bool
+	allowedOrigins     bool
+	trustedProxies     bool
+	ffmpegPath         bool
+	ffprobePath        bool
+}
+
+type diskBaseline struct {
+	httpAddr           string
+	webDir             string
+	tmdbKey            string
+	enableDLNA         bool
+	enableQuickConnect bool
+	allowedOrigins     []string
+	trustedProxies     []string
+	ffmpegPath         string
+	ffprobePath        string
+}
 
 type Config struct {
-	mu            sync.RWMutex
-	saveMu        sync.Mutex
-	envTMDBKeySet bool
+	mu       sync.RWMutex
+	saveMu   sync.Mutex
+	envFlags envOverrideFlags
+	baseline diskBaseline
 
 	ServerID                 string   `json:"server_id"`
 	ServerName               string   `json:"server_name"`
@@ -110,10 +135,13 @@ func Load(dataDir string) (*Config, error) {
 		if err := json.Unmarshal(raw, cfg); err != nil {
 			return nil, err
 		}
+		cfg.DataDir = resolvedDataDir
 		if cfg.ServerID == "" {
 			cfg.ServerID = guid.New()
+			if err := cfg.Save(); err != nil {
+				return nil, err
+			}
 		}
-		cfg.DataDir = resolvedDataDir
 	} else if os.IsNotExist(err) {
 		if err := cfg.Save(); err != nil {
 			return nil, err
@@ -122,49 +150,79 @@ func Load(dataDir string) (*Config, error) {
 		return nil, err
 	}
 
+	// Capture persisted disk baseline before applying ephemeral environment overrides
+	// so Save() does not permanently bake temporary env vars into ambra.json.
+	cfg.baseline = diskBaseline{
+		httpAddr:           cfg.HTTPAddr,
+		webDir:             cfg.WebDir,
+		tmdbKey:            cfg.TMDBApiKey,
+		enableDLNA:         cfg.EnableDLNA,
+		enableQuickConnect: cfg.EnableQuickConnect,
+		allowedOrigins:     append([]string(nil), cfg.AllowedOrigins...),
+		trustedProxies:     append([]string(nil), cfg.TrustedProxies...),
+		ffmpegPath:         cfg.FFmpegPath,
+		ffprobePath:        cfg.FFprobePath,
+	}
+
 	// Environment variable overrides (highest priority)
 	if v := os.Getenv("AMBRA_HTTP_ADDR"); v != "" {
 		cfg.HTTPAddr = v
+		cfg.envFlags.httpAddr = true
 	}
 	if v := os.Getenv("AMBRA_WEB_DIR"); v != "" {
 		cfg.WebDir = v
+		cfg.envFlags.webDir = true
 	}
 	if v := os.Getenv("AMBRA_TMDB_API_KEY"); v != "" {
 		cfg.TMDBApiKey = v
-		cfg.envTMDBKeySet = true
+		cfg.envFlags.tmdbKey = true
 	}
 	if v := strings.TrimSpace(os.Getenv("AMBRA_ENABLE_DLNA")); v != "" {
 		switch strings.ToLower(v) {
 		case "false", "0", "off", "no":
 			cfg.EnableDLNA = false
+			cfg.envFlags.enableDLNA = true
 		case "true", "1", "on", "yes":
 			cfg.EnableDLNA = true
+			cfg.envFlags.enableDLNA = true
 		}
 	}
 	if v := strings.TrimSpace(os.Getenv("AMBRA_ENABLE_QUICK_CONNECT")); v != "" {
 		switch strings.ToLower(v) {
 		case "false", "0", "off", "no":
 			cfg.EnableQuickConnect = false
+			cfg.envFlags.enableQuickConnect = true
 		case "true", "1", "on", "yes":
 			cfg.EnableQuickConnect = true
+			cfg.envFlags.enableQuickConnect = true
 		}
 	}
 	if v := strings.TrimSpace(os.Getenv("AMBRA_ALLOWED_ORIGINS")); v != "" {
 		cfg.AllowedOrigins = splitCSVEnv(v)
+		cfg.envFlags.allowedOrigins = true
 	}
 	if v := strings.TrimSpace(os.Getenv("AMBRA_TRUSTED_PROXIES")); v != "" {
 		cfg.TrustedProxies = splitCSVEnv(v)
+		cfg.envFlags.trustedProxies = true
 	}
 
 	// Resolve ffmpeg/ffprobe paths via ffmpegbin manager:
 	// env override > custom config path > embedded binary > sibling dir > <DataDir>/bin > PATH.
+	envFFmpeg := os.Getenv("AMBRA_FFMPEG_PATH")
+	envFFprobe := os.Getenv("AMBRA_FFPROBE_PATH")
+	if envFFmpeg != "" {
+		cfg.envFlags.ffmpegPath = true
+	}
+	if envFFprobe != "" {
+		cfg.envFlags.ffprobePath = true
+	}
 	exePath, _ := executablePathFn()
 	cfg.FFmpegPath, cfg.FFprobePath = ffmpegbin.Resolve(ffmpegbin.ResolveOptions{
 		DataDir:        cfg.DataDir,
 		ConfigFFmpeg:   cfg.FFmpegPath,
 		ConfigFFprobe:  cfg.FFprobePath,
-		EnvFFmpeg:      os.Getenv("AMBRA_FFMPEG_PATH"),
-		EnvFFprobe:     os.Getenv("AMBRA_FFPROBE_PATH"),
+		EnvFFmpeg:      envFFmpeg,
+		EnvFFprobe:     envFFprobe,
 		ExecutablePath: exePath,
 	})
 	return cfg, nil
@@ -180,6 +238,18 @@ func splitCSVEnv(v string) []string {
 	return out
 }
 
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // Update safely mutates configuration fields under the internal mutex.
 func (c *Config) Update(fn func(*Config)) {
 	if c == nil || fn == nil {
@@ -187,10 +257,44 @@ func (c *Config) Update(fn func(*Config)) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	prevHTTPAddr := c.HTTPAddr
+	prevWebDir := c.WebDir
 	prevTMDB := c.TMDBApiKey
+	prevDLNA := c.EnableDLNA
+	prevQC := c.EnableQuickConnect
+	prevOrigins := append([]string(nil), c.AllowedOrigins...)
+	prevProxies := append([]string(nil), c.TrustedProxies...)
+	prevFFmpeg := c.FFmpegPath
+	prevFFprobe := c.FFprobePath
+
 	fn(c)
+
+	if c.HTTPAddr != prevHTTPAddr {
+		c.envFlags.httpAddr = false
+	}
+	if c.WebDir != prevWebDir {
+		c.envFlags.webDir = false
+	}
 	if c.TMDBApiKey != prevTMDB {
-		c.envTMDBKeySet = false
+		c.envFlags.tmdbKey = false
+	}
+	if c.EnableDLNA != prevDLNA {
+		c.envFlags.enableDLNA = false
+	}
+	if c.EnableQuickConnect != prevQC {
+		c.envFlags.enableQuickConnect = false
+	}
+	if !stringSlicesEqual(c.AllowedOrigins, prevOrigins) {
+		c.envFlags.allowedOrigins = false
+	}
+	if !stringSlicesEqual(c.TrustedProxies, prevProxies) {
+		c.envFlags.trustedProxies = false
+	}
+	if c.FFmpegPath != prevFFmpeg {
+		c.envFlags.ffmpegPath = false
+	}
+	if c.FFprobePath != prevFFprobe {
+		c.envFlags.ffprobePath = false
 	}
 }
 
@@ -249,8 +353,32 @@ func (c *Config) Save() error {
 		PlayedThreshold:          c.PlayedThreshold,
 		IsStartupWizardCompleted: c.IsStartupWizardCompleted,
 	}
-	if c.envTMDBKeySet {
-		toSave.TMDBApiKey = ""
+	if c.envFlags.httpAddr {
+		toSave.HTTPAddr = c.baseline.httpAddr
+	}
+	if c.envFlags.webDir {
+		toSave.WebDir = c.baseline.webDir
+	}
+	if c.envFlags.tmdbKey {
+		toSave.TMDBApiKey = c.baseline.tmdbKey
+	}
+	if c.envFlags.enableDLNA {
+		toSave.EnableDLNA = c.baseline.enableDLNA
+	}
+	if c.envFlags.enableQuickConnect {
+		toSave.EnableQuickConnect = c.baseline.enableQuickConnect
+	}
+	if c.envFlags.allowedOrigins {
+		toSave.AllowedOrigins = append([]string(nil), c.baseline.allowedOrigins...)
+	}
+	if c.envFlags.trustedProxies {
+		toSave.TrustedProxies = append([]string(nil), c.baseline.trustedProxies...)
+	}
+	if c.envFlags.ffmpegPath {
+		toSave.FFmpegPath = c.baseline.ffmpegPath
+	}
+	if c.envFlags.ffprobePath {
+		toSave.FFprobePath = c.baseline.ffprobePath
 	}
 	dataDir := c.DataDir
 	c.mu.RUnlock()

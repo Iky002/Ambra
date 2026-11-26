@@ -133,6 +133,9 @@ func (s *Service) CreateUser(ctx context.Context, name, password string, isAdmin
 		CreatedAt:    time.Now().UTC(),
 	}
 	if err := s.repo.CreateUser(ctx, u); err != nil {
+		if errors.Is(err, sqlite.ErrUserExists) {
+			return nil, ErrUserExists
+		}
 		return nil, err
 	}
 	return u, nil
@@ -148,23 +151,27 @@ func (s *Service) AuthenticateByName(ctx context.Context, username, password, le
 		}
 		return nil, err
 	}
-	if u.IsDisabled || u.Policy.IsDisabled {
-		return nil, ErrUserDisabled
-	}
 
 	ok := false
 	if u.PasswordHash == "" {
 		// Empty password user: accept empty pw or SHA1("") from legacy clients
 		emptySHA1 := sha1Hex("")
 		ok = password == "" && (legacySHA1 == "" || strings.EqualFold(legacySHA1, emptySHA1))
+		if !ok {
+			dummyPasswordWork(password)
+		}
 	} else {
 		ok, err = VerifyPassword(password, u.PasswordHash)
 		if err != nil {
+			dummyPasswordWork(password)
 			return nil, ErrInvalidCredentials
 		}
 	}
 	if !ok {
 		return nil, ErrInvalidCredentials
+	}
+	if u.IsDisabled || u.Policy.IsDisabled {
+		return nil, ErrUserDisabled
 	}
 
 	return s.IssueSessionForUser(ctx, u, client)

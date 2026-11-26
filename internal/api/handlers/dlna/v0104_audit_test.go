@@ -25,20 +25,20 @@ func TestDLNAV0104DefaultProfileCaseInsensitiveDedup(t *testing.T) {
 		t.Fatalf("expected canonical id %q, got %q", defaultProfileID, p.Id)
 	}
 
-	// 2. POST /Dlna/Profiles/Default updates canonical "default" in place without duplicating!
+	// 2. POST /Dlna/Profiles/Default is rejected with 400 (built-in default profile cannot be overwritten)
 	updBody, _ := json.Marshal(DlnaProfile{Name: "Custom Default", FriendlyName: "Updated Default"})
 	recUpd := httptest.NewRecorder()
 	mux.ServeHTTP(recUpd, httptest.NewRequest(http.MethodPost, "/Dlna/Profiles/Default", bytes.NewReader(updBody)))
-	if recUpd.Code != http.StatusNoContent {
-		t.Fatalf("POST /Dlna/Profiles/Default status=%d body=%s", recUpd.Code, recUpd.Body.String())
+	if recUpd.Code != http.StatusBadRequest {
+		t.Fatalf("POST /Dlna/Profiles/Default expected 400, got status=%d body=%s", recUpd.Code, recUpd.Body.String())
 	}
 
 	recList := httptest.NewRecorder()
 	mux.ServeHTTP(recList, httptest.NewRequest(http.MethodGet, "/Dlna/ProfileInfos", nil))
 	var list []DlnaProfile
 	_ = json.Unmarshal(recList.Body.Bytes(), &list)
-	if len(list) != 1 || list[0].Id != defaultProfileID || list[0].Name != "Custom Default" {
-		t.Fatalf("expected single deduplicated default profile, got %+v", list)
+	if len(list) != 1 || list[0].Id != defaultProfileID || list[0].Name != "Default" {
+		t.Fatalf("expected single untouched default profile, got %+v", list)
 	}
 
 	// 3. DELETE /Dlna/Profiles/Default and /Dlna/Profiles/DEFAULT rejected with 400

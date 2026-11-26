@@ -49,9 +49,9 @@ export function SearchPage() {
   const [debounced, setDebounced] = useState(urlQuery.trim())
   const [typeFilter, setTypeFilter] = useState<SearchTypeFilter>('all')
 
-  // 同步外部 URL ?q= 变化（例如在 /search 页通过 ⌘K 触发新搜索）
+  // 同步外部 URL ?q= 变化（仅在 URL 查询与当前输入 trim 不一致时同步，保留多关键词尾随空格）
   useEffect(() => {
-    setInput(urlQuery)
+    setInput((prev) => (urlQuery !== prev.trim() ? urlQuery : prev))
     setDebounced(urlQuery.trim())
   }, [urlQuery])
 

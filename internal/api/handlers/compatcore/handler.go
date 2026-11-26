@@ -37,6 +37,7 @@ const (
 	forgotPinsMaxEntries      = 256
 	authByIDRateLimit         = 30
 	authByIDRateWindow        = time.Minute
+	maxRateLimitBuckets       = 4096
 	maxSessionUsersEntries    = 500
 	maxCameraUploadsEntries   = 500
 	maxHomeSectionsEntries    = 500
@@ -323,8 +324,10 @@ func passthroughMiddleware(next http.Handler) http.Handler {
 }
 
 func (h *Handler) serverID() string {
-	if h.cfg != nil && h.cfg.ServerID != "" {
-		return h.cfg.ServerID
+	if h.cfg != nil {
+		if sid := h.cfg.Snapshot().ServerID; sid != "" {
+			return sid
+		}
 	}
 	return "ambra-server"
 }
@@ -360,6 +363,15 @@ func decodeOptionalJSON(r *http.Request, dst any) error {
 
 func (h *Handler) loadKV(ctx context.Context, key string, dst any) (bool, error) {
 	if h.userRepo != nil {
+		return h.loadKVLocked(ctx, key, dst)
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.loadKVLocked(ctx, key, dst)
+}
+
+func (h *Handler) loadKVLocked(ctx context.Context, key string, dst any) (bool, error) {
+	if h.userRepo != nil {
 		raw, err := h.userRepo.GetServerConfig(ctx, key)
 		if err == nil {
 			if err := json.Unmarshal([]byte(raw), dst); err != nil {
@@ -372,9 +384,7 @@ func (h *Handler) loadKV(ctx context.Context, key string, dst any) (bool, error)
 		}
 		return false, nil
 	}
-	h.mu.RLock()
 	raw, ok := h.memKV[key]
-	h.mu.RUnlock()
 	if !ok {
 		return false, nil
 	}
@@ -385,6 +395,15 @@ func (h *Handler) loadKV(ctx context.Context, key string, dst any) (bool, error)
 }
 
 func (h *Handler) saveKV(ctx context.Context, key string, val any) error {
+	if h.userRepo != nil {
+		return h.saveKVLocked(ctx, key, val)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.saveKVLocked(ctx, key, val)
+}
+
+func (h *Handler) saveKVLocked(ctx context.Context, key string, val any) error {
 	raw, err := json.Marshal(val)
 	if err != nil {
 		return err
@@ -392,9 +411,7 @@ func (h *Handler) saveKV(ctx context.Context, key string, val any) error {
 	if h.userRepo != nil {
 		return h.userRepo.SetServerConfig(ctx, key, string(raw))
 	}
-	h.mu.Lock()
 	h.memKV[key] = string(raw)
-	h.mu.Unlock()
 	return nil
 }
 

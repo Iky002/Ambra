@@ -291,6 +291,9 @@ func TestLiveTVRecordingsTimersSeriesTimersAndListingProviders(t *testing.T) {
 	}
 
 	// Timers CRUD
+	h.mu.Lock()
+	h.state.Channels = append(h.state.Channels, ChannelInfo{Id: "ch1", Name: "Channel 1", Type: "TvChannel", ChannelType: "TV"})
+	h.mu.Unlock()
 	if r := doJSON(t, mux, http.MethodPost, "/LiveTv/Timers", "{bad"); r.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", r.Code)
 	}
@@ -774,7 +777,7 @@ func TestHLSPlaylistURIRewritingAndTargetSSRF(t *testing.T) {
 	_ = json.Unmarshal(doJSON(t, mux, http.MethodGet, "/LiveTv/Channels", nil).Body.Bytes(), &chRes)
 	chID := chRes.Items[0].Id
 
-	// 1. Request master playlist with api_key query param -> relative signed Stream?target=...&exp=...&lan=1&sig=...
+	// 1. Request master playlist with api_key query param -> relative signed Stream?target=...&exp=...&lan=1&sig=... WITHOUT leaking primary api_key
 	req := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?api_key=tok-query", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -785,9 +788,11 @@ func TestHLSPlaylistURIRewritingAndTargetSSRF(t *testing.T) {
 	audioTarget := upstream.URL + "/hls/audio/eng.m3u8"
 	subTarget := upstream.URL + "/hls/sub/720p.m3u8"
 	if !strings.Contains(body, `URI="Stream?target=`+url.QueryEscape(audioTarget)+`&exp=`) ||
-		!strings.Contains(body, `&lan=1&sig=`) ||
-		!strings.Contains(body, `&api_key=tok-query"`) {
+		!strings.Contains(body, `&lan=1&sig=`) {
 		t.Fatalf("expected rewritten EXT-X-MEDIA URI in:\n%s", body)
+	}
+	if strings.Contains(body, "api_key=tok-query") {
+		t.Fatalf("rewritten HLS playlist must NOT leak primary api_key in segment URLs:\n%s", body)
 	}
 	if !strings.Contains(body, "Stream?target="+url.QueryEscape(subTarget)+"&exp=") {
 		t.Fatalf("expected rewritten sub-playlist URI in:\n%s", body)
@@ -799,7 +804,7 @@ func TestHLSPlaylistURIRewritingAndTargetSSRF(t *testing.T) {
 	exp := time.Now().UTC().Add(time.Hour).Unix()
 	expStr := strconv.FormatInt(exp, 10)
 
-	// 2. Request sub-playlist via signed target query param + X-Emby-Token header
+	// 2. Request sub-playlist via signed target query param + X-Emby-Token header -> signed URIs without leaking header token
 	subReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?target="+url.QueryEscape(subTarget)+"&exp="+expStr+"&lan=1&sig="+h.signProxyTarget(chID, subTarget, true, exp), nil)
 	subReq.Header.Set("X-Emby-Token", "tok-header")
 	subRec := httptest.NewRecorder()
@@ -817,20 +822,22 @@ func TestHLSPlaylistURIRewritingAndTargetSSRF(t *testing.T) {
 		`URI="Stream?target=` + url.QueryEscape(mapTarget) + `&exp=`,
 		"Stream?target=" + url.QueryEscape(seg0Target) + "&exp=",
 		"Stream?target=" + url.QueryEscape(seg1Target) + "&exp=",
-		"&api_key=tok-header",
 	} {
 		if !strings.Contains(subBody, want) {
 			t.Fatalf("expected %q in rewritten sub-playlist:\n%s", want, subBody)
 		}
 	}
+	if strings.Contains(subBody, "tok-header") {
+		t.Fatalf("rewritten sub-playlist must NOT leak X-Emby-Token:\n%s", subBody)
+	}
 
-	// 3. Request with Authorization header token
+	// 3. Request with Authorization header token -> succeeds without leaking Authorization token into rewritten URLs
 	authReq := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream", nil)
 	authReq.Header.Set("Authorization", `MediaBrowser Client="Test", Token="tok-auth"`)
 	authRec := httptest.NewRecorder()
 	mux.ServeHTTP(authRec, authReq)
-	if authRec.Code != http.StatusOK || !strings.Contains(authRec.Body.String(), "&api_key=tok-auth") {
-		t.Fatalf("expected Authorization token preserved, got %d:\n%s", authRec.Code, authRec.Body.String())
+	if authRec.Code != http.StatusOK || strings.Contains(authRec.Body.String(), "tok-auth") || !strings.Contains(authRec.Body.String(), "&sig=") {
+		t.Fatalf("expected signed HLS rewrite without leaking Authorization token, got %d:\n%s", authRec.Code, authRec.Body.String())
 	}
 
 	// 4. Proxy actual TS segment via signed target param
@@ -909,6 +916,12 @@ func TestDVRCompletionCallbackUpdatesTimerAndCreatesRecording(t *testing.T) {
 	rec.SetOnFinished(h.OnRecordingFinished)
 
 	// Create two timers: one will succeed, one will fail
+	h.mu.Lock()
+	h.state.Channels = []ChannelInfo{
+		{Id: "ch-1", Name: "CCTV 1", Type: "TvChannel", ChannelType: "TV"},
+		{Id: "ch-2", Name: "CCTV 2", Type: "TvChannel", ChannelType: "TV"},
+	}
+	h.mu.Unlock()
 	r1 := doJSON(t, mux, http.MethodPost, "/LiveTv/Timers", map[string]any{
 		"Id":          "ok-timer",
 		"Name":        "Evening News",
@@ -1167,6 +1180,9 @@ func TestDVRStartFailureTransitionsTimerToFailed(t *testing.T) {
 	h.SetRecorder(rec)
 	rec.SetOnFinished(h.OnRecordingFinished)
 
+	h.mu.Lock()
+	h.state.Channels = []ChannelInfo{{Id: "ch-1", Name: "CCTV 1", Type: "TvChannel", ChannelType: "TV"}}
+	h.mu.Unlock()
 	res := doJSON(t, mux, http.MethodPost, "/LiveTv/Timers", map[string]any{
 		"Id":        "start-fail-timer",
 		"Name":      "Missing Binary Show",

@@ -41,7 +41,7 @@ import type {
   WebhookTestResult,
 } from '../api/types'
 import { registerDemoServer } from './demoLoader'
-import { DEMO_VIDEO_DATA_URL, makeDemoAudioDataUrl } from './demoMedia'
+import { DEMO_VIDEO_DATA_URL, makeDemoAudioDataUrl, makeDemoBifBuffer } from './demoMedia'
 import { createInitialDemoState, DEMO_SERVER_ID, type DemoState } from './mockData'
 import { makeAvatarDataUrl, makeLibraryThumbDataUrl, makePosterDataUrl } from './svgArt'
 
@@ -324,6 +324,7 @@ function createInitialDemoWebhooks(): WebhookInfo[] {
       Name: 'Discord 媒体入库通知',
       Url: 'https://discord.com/api/webhooks/demo/ambra-notify',
       Secret: 'demo-hmac-secret',
+      HasSecret: true,
       Events: ['LibraryChanged', 'PlaybackStart'],
       Enabled: true,
       CreatedAt: Math.floor(Date.now() / 1000) - 86400,
@@ -1784,6 +1785,40 @@ export async function demoFetch<T>(
     return res as T
   }
 
+  // 视频内封附件（字体列表）与 BIF 预览图 / ThumbnailSet（v0.10.6 兼容路由）
+  const videoAttachmentsMatch = pathname.match(/^\/emby\/Videos\/([^/]+)\/([^/]+)\/Attachments$/)
+  if (videoAttachmentsMatch && method === 'GET') {
+    const itemId = decodeURIComponent(videoAttachmentsMatch[1])
+    if (!store.items.has(itemId)) {
+      throw new ApiError(404, '项目不存在')
+    }
+    return [] as T
+  }
+
+  const videoBifMatch = pathname.match(/^\/emby\/Videos\/([^/]+)\/index\.bif$/)
+  if (videoBifMatch && method === 'GET') {
+    const itemId = decodeURIComponent(videoBifMatch[1])
+    if (!store.items.has(itemId)) {
+      throw new ApiError(404, 'BIF 预览图不存在')
+    }
+    return makeDemoBifBuffer() as T
+  }
+
+  const thumbnailSetMatch = pathname.match(/^\/emby\/Items\/([^/]+)\/ThumbnailSet$/)
+  if (thumbnailSetMatch && method === 'GET') {
+    const itemId = decodeURIComponent(thumbnailSetMatch[1])
+    if (!store.items.has(itemId)) {
+      throw new ApiError(404, '缩略图集不存在')
+    }
+    return {
+      AspectRatio: 1.777,
+      Thumbnails: [0, 5, 10, 15, 20].map((sec, idx) => ({
+        PositionTicks: sec * 10_000_000,
+        ImageTag: `demo-bif-${idx}`,
+      })),
+    } as T
+  }
+
   if (
     (pathname === '/emby/Sessions/Playing' ||
       pathname === '/emby/Sessions/Playing/Progress' ||
@@ -2043,7 +2078,7 @@ export async function demoFetch<T>(
     return {
       GeneratedAt: Math.floor(Date.now() / 1000),
       TotalMediaBytes: totalMediaBytes,
-      CacheBytes: 198 * 1024 * 1024,
+      CacheBytes: 264 * 1024 * 1024,
       DatabaseBytes: 28 * 1024 * 1024,
       Libraries: librariesBreakdown,
     } as T
@@ -2955,17 +2990,22 @@ export async function demoFetch<T>(
       const events = Array.isArray(body.Events)
         ? body.Events.map((e) => String(e).trim()).filter(Boolean)
         : ['*']
-      const secretVal = typeof body.Secret === 'string' && body.Secret.trim() ? body.Secret.trim() : undefined
+      const clearSecret = Boolean(body.ClearSecret)
+      const incomingSecret =
+        typeof body.Secret === 'string' && body.Secret.trim() ? body.Secret.trim() : undefined
       const enabledVal = body.Enabled !== undefined ? Boolean(body.Enabled) : true
       const existingId = typeof body.Id === 'string' ? body.Id.trim() : ''
       const existingIdx = existingId ? demoWebhooks.findIndex((w) => w.Id === existingId) : -1
 
       if (existingIdx >= 0) {
+        const prev = demoWebhooks[existingIdx]
+        const nextSecret = clearSecret ? undefined : (incomingSecret ?? prev.Secret)
         const updated: WebhookInfo = {
-          ...demoWebhooks[existingIdx],
+          ...prev,
           Name: name,
           Url: urlVal,
-          Secret: secretVal,
+          Secret: nextSecret,
+          HasSecret: Boolean(nextSecret),
           Events: events.length > 0 ? events : ['*'],
           Enabled: enabledVal,
         }
@@ -2978,7 +3018,8 @@ export async function demoFetch<T>(
         Id: `wh-demo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`,
         Name: name,
         Url: urlVal,
-        Secret: secretVal,
+        Secret: incomingSecret,
+        HasSecret: Boolean(incomingSecret),
         Events: events.length > 0 ? events : ['*'],
         Enabled: enabledVal,
         CreatedAt: Math.floor(Date.now() / 1000),

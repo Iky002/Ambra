@@ -1057,8 +1057,8 @@ func TestVideoFontAttachments(t *testing.T) {
 	if ct := w.Header().Get("Content-Type"); ct != "font/ttf" {
 		t.Fatalf("expected Content-Type font/ttf, got %q", ct)
 	}
-	if cc := w.Header().Get("Cache-Control"); cc != "public, max-age=31536000, immutable" {
-		t.Fatalf("expected immutable Cache-Control, got %q", cc)
+	if cc := w.Header().Get("Cache-Control"); cc != "private, max-age=31536000, immutable" {
+		t.Fatalf("expected private immutable Cache-Control, got %q", cc)
 	}
 	etag := w.Header().Get("ETag")
 	if etag == "" {

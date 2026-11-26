@@ -4,8 +4,8 @@ package ffmpegbin
 
 import (
 	"embed"
-	"io/fs"
 	"path"
+	"runtime"
 )
 
 //go:embed bin/ffmpeg*
@@ -26,18 +26,11 @@ func HasEmbedded() bool {
 }
 
 func loadFirstEmbedded(fsys embed.FS, prefix string) []byte {
-	entries, err := fs.ReadDir(fsys, "bin")
-	if err != nil {
-		return nil
+	candidates := []string{prefix, prefix + ".exe"}
+	if runtime.GOOS == "windows" {
+		candidates = []string{prefix + ".exe", prefix}
 	}
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if name != prefix && name != prefix+".exe" {
-			continue
-		}
+	for _, name := range candidates {
 		data, err := fsys.ReadFile(path.Join("bin", name))
 		if err == nil && len(data) > 0 {
 			return data

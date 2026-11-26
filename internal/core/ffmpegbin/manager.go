@@ -85,7 +85,9 @@ func extractEmbeddedForOS(targetDir string, ffmpegBytes, ffprobeBytes []byte, go
 func extractOne(targetDir, name string, data []byte) (string, error) {
 	dest := filepath.Join(targetDir, name)
 	if info, err := os.Stat(dest); err == nil && !info.IsDir() && info.Size() == int64(len(data)) {
-		return dest, nil
+		if runtime.GOOS == "windows" || info.Mode().Perm()&0o111 != 0 {
+			return dest, nil
+		}
 	}
 	if err := atomicWriteExecutable(targetDir, dest, name, func(w io.Writer) (int64, error) {
 		n, err := w.Write(data)

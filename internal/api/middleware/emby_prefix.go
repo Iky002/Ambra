@@ -455,11 +455,37 @@ func EmbyPrefixAndCase(next http.Handler) http.Handler {
 	})
 }
 
+func isDynamicSegment(parts []string, idx int) bool {
+	if idx < 2 || len(parts) <= idx {
+		return false
+	}
+	p1 := strings.ToLower(parts[1])
+	switch idx {
+	case 2:
+		switch p1 {
+		case "genres", "studios", "persons", "displaypreferences":
+			return true
+		case "plugins":
+			seg := strings.ToLower(parts[2])
+			return seg != "securityinfo" && seg != "registrationrecords"
+		}
+	case 3:
+		p2 := strings.ToLower(parts[2])
+		if p1 == "auth" && p2 == "keys" {
+			return true
+		}
+		if p1 == "plugins" && p2 == "registrationrecords" {
+			return true
+		}
+	}
+	return false
+}
+
 func canonicalizePathSegments(p string) string {
 	parts := strings.Split(p, "/")
 	changed := false
 	for i := 1; i < len(parts); i++ {
-		if parts[i] == "" {
+		if parts[i] == "" || isDynamicSegment(parts, i) {
 			continue
 		}
 		if canon, ok := canonicalSegments[strings.ToLower(parts[i])]; ok && canon != parts[i] {

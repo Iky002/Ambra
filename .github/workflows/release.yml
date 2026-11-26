@@ -123,7 +123,7 @@ jobs:
             local entry
             entry="$(grep -E "^[0-9a-fA-F]{64}  ffmpeg-${BTBN_FFMPEG_BRANCH}-latest-${arch_tag}-gpl-[0-9]+\.[0-9]+\.${ext}$" "${BTBN_CHECKSUMS}" | head -n 1 || true)"
             if [ -z "${entry}" ]; then
-              entry="$(grep -E "^[0-9a-fA-F]{64}  ffmpeg-n[0-9]+\.[0-9]+-latest-${arch_tag}-gpl-[0-9]+\.[0-9]+\.${ext}$" "${BTBN_CHECKSUMS}" | sort -V | tail -n 1 || true)"
+              entry="$(grep -E "^[0-9a-fA-F]{64}  ffmpeg-n[0-9]+\.[0-9]+-latest-${arch_tag}-gpl-[0-9]+\.[0-9]+\.${ext}$" "${BTBN_CHECKSUMS}" | sort -k2,2V | tail -n 1 || true)"
             fi
             if [ -z "${entry}" ]; then
               echo "ERROR: could not find release branch archive for ${platform} in checksums.sha256" >&2
@@ -238,21 +238,8 @@ jobs:
         include:
           - variant: full
             target: runtime-full
-            tags: |
-              type=semver,pattern={{version}}
-              type=semver,pattern={{version}}-full
-              type=semver,pattern={{major}}.{{minor}}
-              type=semver,pattern={{major}}
-              type=sha,prefix=sha-
-              type=raw,value=latest
-              type=raw,value=full
           - variant: lite
             target: runtime-lite
-            tags: |
-              type=semver,pattern={{version}}-lite
-              type=semver,pattern={{major}}.{{minor}}-lite
-              type=sha,prefix=sha-,suffix=-lite
-              type=raw,value=lite
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -270,17 +257,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata (${{ matrix.variant }})
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: ${{ matrix.tags }}
-
       - name: Validate release tag
         id: validate-tag
         env:
           RELEASE_TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
+          VARIANT: ${{ matrix.variant }}
         run: |
           set -euo pipefail
           if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
@@ -288,6 +269,31 @@ jobs:
             exit 1
           fi
           echo "version=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<EOF"
+            if [ "${VARIANT}" = "full" ]; then
+              echo "type=semver,pattern={{version}},value=${RELEASE_TAG}"
+              echo "type=semver,pattern={{version}}-full,value=${RELEASE_TAG}"
+              echo "type=semver,pattern={{major}}.{{minor}},value=${RELEASE_TAG}"
+              echo "type=semver,pattern={{major}},value=${RELEASE_TAG}"
+              echo "type=sha,prefix=sha-"
+              echo "type=raw,value=latest"
+              echo "type=raw,value=full"
+            else
+              echo "type=semver,pattern={{version}}-lite,value=${RELEASE_TAG}"
+              echo "type=semver,pattern={{major}}.{{minor}}-lite,value=${RELEASE_TAG}"
+              echo "type=sha,prefix=sha-,suffix=-lite"
+              echo "type=raw,value=lite"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Extract Docker metadata (${{ matrix.variant }})
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: ${{ steps.validate-tag.outputs.tags }}
 
       - name: Build and push multi-arch image (${{ matrix.variant }})
         uses: docker/build-push-action@v6
