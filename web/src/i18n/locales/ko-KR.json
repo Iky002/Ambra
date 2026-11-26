@@ -220,5 +220,20 @@
   "admin.createUser": "새 사용자",
   "admin.pluginsTitle": "플러그인 및 스크래퍼 관리",
   "admin.webhooksTitle": "Webhook 이벤트 알림",
-  "admin.createWebhook": "Webhook 추가"
+  "admin.createWebhook": "Webhook 추가",
+  "trakt.title": "Trakt 계정",
+  "trakt.configured": "연결 설정됨",
+  "trakt.description": "본인의 Trakt 계정을 설정합니다. 현재 Ambra 사용자의 재생 진행률과 시청 기록만 동기화합니다.",
+  "trakt.disabled": "관리자가 Trakt를 비활성화했습니다. 기존 연결은 해제할 수 있습니다.",
+  "trakt.keepToken": "저장됨. 비워 두면 기존 토큰 유지",
+  "trakt.tokenPlaceholder": "본인의 OAuth Access Token 입력",
+  "trakt.credentialsHelp": "Trakt 인증으로 받은 Client ID와 Access Token을 입력하세요. 만료된 토큰은 갱신해야 합니다. 저장된 토큰은 다시 표시되지 않습니다.",
+  "trakt.scrobble": "재생 진행률 동기화 (Scrobble)",
+  "trakt.watched": "시청 기록 동기화",
+  "trakt.save": "연결 및 설정 저장",
+  "trakt.disconnect": "연결 해제",
+  "trakt.saved": "Trakt 연결 및 설정을 저장했습니다",
+  "trakt.disconnected": "Trakt 연결을 해제했습니다",
+  "trakt.retry": "Trakt 설정을 불러올 수 없습니다. 재시도",
+  "trakt.adminDescription": "관리자는 Trakt 사용 여부를 설정합니다. 각 사용자는 프로필 → Trakt 계정에서 본인의 인증 정보와 동기화 설정을 관리합니다."
 }

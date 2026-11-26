@@ -41,8 +41,8 @@ type Handler struct {
 }
 
 // New constructs a plugin administration handler.
-// It automatically discovers registered MetadataProviders and StreamResolvers from registry
-// so they remain controllable even after being disabled.
+// It discovers every registered plugin, including notifier-only plugins such as
+// Trakt, so they remain configurable even while disabled.
 func New(registry *plugins.Registry, store *sqlite.Store) *Handler {
 	h := &Handler{
 		registry: registry,
@@ -71,11 +71,10 @@ func (h *Handler) syncFromRegistry() {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for _, p := range h.registry.MetadataProviders() {
-		h.tracked[p.Manifest().ID] = p
-	}
-	for _, p := range h.registry.StreamResolvers() {
-		h.tracked[p.Manifest().ID] = p
+	for _, manifest := range h.registry.List() {
+		if p, ok := h.registry.Get(manifest.ID); ok {
+			h.tracked[manifest.ID] = p
+		}
 	}
 }
 
@@ -135,6 +134,16 @@ func (h *Handler) ApplySavedConfigs(ctx context.Context) error {
 
 	var errs []error
 	for _, e := range entries {
+		if p, ok := h.findPlugin(e.pluginID); ok {
+			if filter, ok := p.(plugins.ServerConfigFilter); ok {
+				e.cfg = filter.FilterServerConfig(e.cfg)
+				// Remove legacy server-wide credentials from persisted configuration.
+				if err := h.saveConfig(ctx, e.pluginID, e.cfg); err != nil {
+					errs = append(errs, err)
+					continue
+				}
+			}
+		}
 		h.mu.Lock()
 		h.configs[e.pluginID] = cloneMap(e.cfg)
 		p := h.tracked[e.pluginID]
@@ -195,6 +204,9 @@ func (h *Handler) handleGetConfiguration(w http.ResponseWriter, r *http.Request)
 	}
 
 	if err == nil {
+		if filter, ok := p.(plugins.ServerConfigFilter); ok {
+			saved = filter.FilterServerConfig(saved)
+		}
 		for k, v := range maskSensitiveMap(saved) {
 			out[k] = v
 		}
@@ -236,6 +248,9 @@ func (h *Handler) handleUpdateConfiguration(w http.ResponseWriter, r *http.Reque
 		prev = map[string]any{}
 	}
 	merged := mergePluginConfig(prev, incoming)
+	if filter, ok := p.(plugins.ServerConfigFilter); ok {
+		merged = filter.FilterServerConfig(merged)
+	}
 
 	if err := p.Configure(cloneMap(merged)); err != nil {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
@@ -350,6 +365,11 @@ func (h *Handler) loadSavedConfig(ctx context.Context, id string) (map[string]an
 }
 
 func (h *Handler) saveConfig(ctx context.Context, id string, cfg map[string]any) error {
+	if p, ok := h.findPlugin(id); ok {
+		if filter, ok := p.(plugins.ServerConfigFilter); ok {
+			cfg = filter.FilterServerConfig(cfg)
+		}
+	}
 	if h.store != nil {
 		raw, err := json.Marshal(cfg)
 		if err != nil {

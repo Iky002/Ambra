@@ -198,81 +198,25 @@ describe('v0.9.9 PluginsTab TVDB & Trakt Configuration', () => {
     })
   })
 
-  it('打开 Trakt 配置弹窗并保存 enabled、client_id、access_token、scrobble_playback、sync_watched，同时剥离 extraJson 中的 Trakt 字段', async () => {
+  it('Trakt 管理员配置只保存可用性，不再包含账号凭据或个人同步偏好', async () => {
     vi.spyOn(api, 'getPlugins').mockResolvedValue(MOCK_PLUGINS)
     vi.spyOn(api, 'getPluginConfiguration').mockResolvedValue({
-      enabled: false,
-      priority: 40,
-      client_id: 'old-client-id',
-      ClientId: 'old-client-id-pascal',
-      access_token: 'old-secret-token',
-      AccessToken: 'old-secret-token-pascal',
-      scrobble_playback: true,
-      ScrobblePlayback: true,
-      sync_watched: true,
-      SyncWatched: true,
-      trakt_extra: 'keep-me',
+      enabled: false, priority: 40, client_id: 'legacy-client',
+      access_token: 'legacy-secret', sync_watched: true,
     })
     const updateSpy = vi.spyOn(api, 'updatePluginConfiguration').mockResolvedValue(undefined)
-
     renderWithQueryClient(<PluginsTab />)
-
-    const traktHeading = await screen.findByText('Trakt Scrobble & Sync')
-    const traktCard = traktHeading.closest('div.rounded-2xl') as HTMLElement
-    fireEvent.click(within(traktCard).getByRole('button', { name: '编辑配置' }))
-
-    expect(
-      await screen.findByText('默认关闭；启用后自动将播放进度与已看状态同步至 Trakt.tv'),
-    ).toBeInTheDocument()
-
-    // 验证 Access Token 为密码输入框
-    const accessTokenInput = screen.getByLabelText('Access Token') as HTMLInputElement
-    expect(accessTokenInput.type).toBe('password')
-
-    // 验证 extraJson 已剥离 Trakt 专属字段，但保留 trakt_extra
-    const textareaEl = document.querySelector('textarea') as HTMLTextAreaElement
-    expect(textareaEl.value).toContain('"trakt_extra": "keep-me"')
-    expect(textareaEl.value).not.toContain('client_id')
-    expect(textareaEl.value).not.toContain('ClientId')
-    expect(textareaEl.value).not.toContain('access_token')
-    expect(textareaEl.value).not.toContain('AccessToken')
-    expect(textareaEl.value).not.toContain('scrobble_playback')
-    expect(textareaEl.value).not.toContain('ScrobblePlayback')
-    expect(textareaEl.value).not.toContain('sync_watched')
-    expect(textareaEl.value).not.toContain('SyncWatched')
-
-    // 验证两个同步开关默认开启
-    const scrobbleSwitch = screen.getByRole('switch', { name: /实时同步播放进度 \(Scrobble\)/ })
-    const watchedSwitch = screen.getByRole('switch', { name: /同步已观看历史 \(Watched Sync\)/ })
-    expect(scrobbleSwitch).toHaveAttribute('aria-checked', 'true')
-    expect(watchedSwitch).toHaveAttribute('aria-checked', 'true')
-
-    // 启用插件、修改字段并关闭 sync_watched
+    const heading = await screen.findByText('Trakt Scrobble & Sync')
+    fireEvent.click(within(heading.closest('div.rounded-2xl') as HTMLElement)
+      .getByRole('button', { name: '编辑配置' }))
+    expect(await screen.findByText(/管理员控制是否向用户开放 Trakt/)).toBeInTheDocument()
+    expect(screen.queryByLabelText('Client ID')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Access Token')).not.toBeInTheDocument()
+    expect(document.querySelector('textarea')).toBeNull()
     fireEvent.click(screen.getByRole('switch', { name: /启用插件/ }))
-    fireEvent.change(screen.getByLabelText('Client ID'), {
-      target: { value: 'trakt-client-abc' },
-    })
-    fireEvent.change(accessTokenInput, {
-      target: { value: 'trakt-token-xyz' },
-    })
-    fireEvent.click(watchedSwitch)
-
     fireEvent.click(screen.getByRole('button', { name: '保存配置' }))
-
-    await waitFor(() => {
-      expect(updateSpy).toHaveBeenCalledWith(
-        'ambra.builtin.trakt',
-        expect.objectContaining({
-          enabled: true,
-          Enabled: true,
-          priority: 40,
-          client_id: 'trakt-client-abc',
-          access_token: 'trakt-token-xyz',
-          scrobble_playback: true,
-          sync_watched: false,
-          trakt_extra: 'keep-me',
-        }),
-      )
-    })
+    await waitFor(() => expect(updateSpy).toHaveBeenCalledWith('ambra.builtin.trakt', {
+      enabled: true, Enabled: true, priority: 40, Priority: 40,
+    }))
   })
 })

@@ -220,5 +220,20 @@
   "admin.createUser": "Novo usuário",
   "admin.pluginsTitle": "Plugins e scrapers",
   "admin.webhooksTitle": "Notificações Webhook",
-  "admin.createWebhook": "Adicionar Webhook"
+  "admin.createWebhook": "Adicionar Webhook",
+  "trakt.title": "Conta Trakt",
+  "trakt.configured": "Vínculo configurado",
+  "trakt.description": "Vincule sua conta Trakt. Apenas o progresso e o histórico deste usuário Ambra serão sincronizados.",
+  "trakt.disabled": "O administrador desativou o Trakt. Você ainda pode remover um vínculo existente.",
+  "trakt.keepToken": "Token salvo; deixe vazio para mantê-lo",
+  "trakt.tokenPlaceholder": "Digite seu OAuth Access Token",
+  "trakt.credentialsHelp": "Informe o Client ID e o Access Token da sua autorização Trakt. Atualize tokens expirados aqui. Tokens salvos nunca são exibidos.",
+  "trakt.scrobble": "Sincronizar progresso (Scrobble)",
+  "trakt.watched": "Sincronizar histórico assistido",
+  "trakt.save": "Salvar conta e preferências",
+  "trakt.disconnect": "Desvincular",
+  "trakt.saved": "Conta Trakt e preferências salvas",
+  "trakt.disconnected": "Conta Trakt desvinculada",
+  "trakt.retry": "Não foi possível carregar o Trakt. Tentar novamente",
+  "trakt.adminDescription": "Controla a disponibilidade do Trakt. Cada usuário configura suas credenciais e preferências em Perfil → Conta Trakt. Nenhuma conta global é salva aqui."
 }
