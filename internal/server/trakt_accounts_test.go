@@ -75,7 +75,7 @@ func TestTraktPersonalBindingAPIAndGlobalAvailability(t *testing.T) {
 	for _, method := range []string{"GET", "POST", "DELETE"} {
 		// API keys may administer plugins, but cannot impersonate a personal account.
 		key := "personal-api-key-test"
-		if _, err := srv.Store.Writer.Exec(`INSERT OR IGNORE INTO api_keys VALUES (?, 'test', 1)`, key); err != nil {
+		if _, err := srv.Store.Writer.Exec(`INSERT OR IGNORE INTO api_keys (token, app_name, created_at, key_id) VALUES (?, 'test', 1, 'trakt-test-key')`, key); err != nil {
 			t.Fatal(err)
 		}
 		request(method, personal, key, `{}`, 403)

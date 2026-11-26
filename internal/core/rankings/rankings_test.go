@@ -1447,11 +1447,15 @@ func TestDoubanTrendingPersistenceTypedAutoTaggingAndEndpoints(t *testing.T) {
 		t.Fatalf("LoadCache: %v", err)
 	}
 
-	// Unspecified type MatchTagsForItem matches both movie & tv charts for "同名作品"
-	untypedTags := svc2.MatchTagsForItem("同名作品", "", 2024, nil)
+	// Unspecified type MatchTagsForItem matches both movie & tv charts for "同名作品" (recent release)
+	untypedTags := svc2.MatchTagsForItem("同名作品", "", time.Now().Year(), nil)
 	wantUntyped := strings.Join([]string{TagTMDBTrending, TagDoubanTrendingMovie, TagDoubanTrendingTV}, ",")
 	if strings.Join(untypedTags, ",") != wantUntyped {
 		t.Fatalf("untyped MatchTagsForItem = %v, want %q", untypedTags, wantUntyped)
+	}
+	// Old classic movie with same title and no matching external ID must NOT match dateless Douban Trending
+	if oldTags := svc2.MatchTagsForItem("同名作品", "", 1994, nil); len(oldTags) != 0 {
+		t.Fatalf("1994 movie without external ID must not match dateless Douban Trending, got %v", oldTags)
 	}
 
 	// Verify GET /System/Rankings?includeEntries=true and GET /System/Rankings/Trending

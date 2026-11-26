@@ -7,19 +7,27 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/ws"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
-const stateConfigKey = "ops:state"
+const (
+	stateConfigKey        = "ops:state"
+	systemExtraConfigKey  = "system:config_extra"
+	startupRateLimit      = 30
+	startupRateWindow     = time.Minute
+	startupRateMaxBuckets = 2048
+)
 
 // AuthFuncs decouples route registration from the concrete middleware package.
 type AuthFuncs struct {
@@ -29,13 +37,13 @@ type AuthFuncs struct {
 }
 
 type opsState struct {
-	Startup      StartupConfiguration `json:"startup"`
-	StartupUser  StartupUserState     `json:"startup_user"`
-	RemoteAccess RemoteAccessConfig   `json:"remote_access"`
-	Installations []InstallationInfo  `json:"installations"`
-	Webhooks     []WebhookConfig      `json:"webhooks"`
-	Parties      []Party              `json:"parties"`
-	ConnectLinks []ConnectPending     `json:"connect_links"`
+	Startup       StartupConfiguration `json:"startup"`
+	StartupUser   StartupUserState     `json:"startup_user"`
+	RemoteAccess  RemoteAccessConfig   `json:"remote_access"`
+	Installations []InstallationInfo   `json:"installations"`
+	Webhooks      []WebhookConfig      `json:"webhooks"`
+	Parties       []Party              `json:"parties"`
+	ConnectLinks  []ConnectPending     `json:"connect_links"`
 }
 
 type ConnectPending struct {
@@ -63,12 +71,15 @@ type Handler struct {
 	cfg              *config.Config
 	userRepo         *sqlite.UserRepo
 	bus              *eventbus.Bus
+	wsHub            *ws.Hub
 	httpClient       *http.Client
 	customHTTPClient bool
 	auth             AuthFuncs
 
 	backupMu      sync.Mutex
 	setupMu       sync.Mutex
+	startupRateMu sync.Mutex
+	startupRates  map[string][]time.Time
 	webhookMu     sync.Mutex
 	webhookClosed bool
 	webhookCtx    context.Context
@@ -83,11 +94,12 @@ type Handler struct {
 
 func New(store *sqlite.Store, cfg *config.Config, userRepo *sqlite.UserRepo, bus *eventbus.Bus) *Handler {
 	h := &Handler{
-		store:      store,
-		cfg:        cfg,
-		userRepo:   userRepo,
-		bus:        bus,
+		store:          store,
+		cfg:            cfg,
+		userRepo:       userRepo,
+		bus:            bus,
 		httpClient:     netutil.NewSafeHTTPClientNoLoopback(10*time.Second, true),
+		startupRates:   make(map[string][]time.Time),
 		partyJoinFails: make(map[string]*partyFailWindow),
 		state: opsState{
 			Startup: StartupConfiguration{
@@ -103,18 +115,34 @@ func New(store *sqlite.Store, cfg *config.Config, userRepo *sqlite.UserRepo, bus
 		},
 	}
 	if cfg != nil {
-		if cfg.ServerName != "" {
-			h.state.Startup.ServerName = cfg.ServerName
+		snap := cfg.Snapshot()
+		if snap.ServerName != "" {
+			h.state.Startup.ServerName = snap.ServerName
 		}
-		if cfg.TMDBLanguage != "" {
-			h.state.Startup.PreferredMetadataLanguage = cfg.TMDBLanguage
+		if snap.TMDBLanguage != "" {
+			h.state.Startup.PreferredMetadataLanguage = snap.TMDBLanguage
 		}
+		h.state.RemoteAccess.EnableRemoteAccess = snap.IsGlobalRemoteAccessEnabled()
 	}
 	h.loadState(context.Background())
 	if bus != nil {
 		h.subscribeWebhooks(bus)
 	}
 	return h
+}
+
+// SetWSHub attaches the WebSocket hub for real-time Watch-Together party playstate & chat pushes.
+func (h *Handler) SetWSHub(hub *ws.Hub) {
+	h.mu.Lock()
+	h.wsHub = hub
+	h.mu.Unlock()
+}
+
+func (h *Handler) getWSHub() *ws.Hub {
+	h.mu.RLock()
+	hub := h.wsHub
+	h.mu.RUnlock()
+	return hub
 }
 
 // SetHTTPClient overrides the HTTP client used for webhook delivery (primarily for testing).
@@ -176,7 +204,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 
 	// Packages
 	handleAuth("GET /Packages", h.handleListPackages)
-	handleAuth("GET /Packages/Updates", h.handlePackageUpdates)
+	handleAdmin("GET /Packages/Updates", h.handlePackageUpdates)
 	handleAuth("GET /Packages/{Name}", h.handleGetPackage)
 	handleAdmin("POST /Packages/Installed/{Name}", h.handleInstallPackage)
 	handleAdmin("DELETE /Packages/Installing/{Id}", h.handleCancelInstall)
@@ -199,13 +227,17 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	mux.HandleFunc("GET /swagger", h.handleOpenAPIUI)
 	mux.HandleFunc("GET /robots.txt", h.handleRobotsTxt)
 
-	// GenericUI
-	handleAuth("GET /UI/View", h.handleUIView)
-	handleAuth("POST /UI/Command", h.handleUICommand)
+	// GenericUI (admin-only)
+	handleAdmin("GET /UI/View", h.handleUIView)
+	handleAdmin("POST /UI/Command", h.handleUICommand)
 
-	// Parties
+	// Parties (register static sub-routes before /Parties/{Id})
 	handleAuth("GET /Parties", h.handleListParties)
 	handleAuth("POST /Parties", h.handleCreateParty)
+	handleAuth("GET /Parties/Info", h.handleGetCurrentPartyInfo)
+	handleAuth("GET /Parties/Messages", h.handleListPartyMessages)
+	handleAuth("POST /Parties/Messages", h.handlePostPartyMessage)
+	handleAuth("POST /Parties/Leave", h.handleLeaveCurrentParty)
 	handleAuth("GET /Parties/{Id}", h.handleGetParty)
 	handleAuth("DELETE /Parties/{Id}", h.handleDeleteParty)
 	handleAuth("POST /Parties/{Id}/Join", h.handleJoinParty)
@@ -217,10 +249,67 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	handleAuth("POST /Connect/Exchange", h.handleConnectExchange)
 }
 
+func (h *Handler) checkStartupIPRateLimit(ip string, now time.Time) bool {
+	s := strings.TrimSpace(ip)
+	if s == "" {
+		return true
+	}
+	if addr, err := netip.ParseAddr(s); err == nil {
+		addr = addr.WithZone("").Unmap()
+		if addr.IsLoopback() {
+			return true
+		}
+		if addr.Is6() {
+			s = netip.PrefixFrom(addr, 64).Masked().String()
+		} else {
+			s = addr.String()
+		}
+	}
+	h.startupRateMu.Lock()
+	defer h.startupRateMu.Unlock()
+	if h.startupRates == nil {
+		h.startupRates = make(map[string][]time.Time)
+	}
+	cutoff := now.Add(-startupRateWindow)
+	for k, ts := range h.startupRates {
+		kept := ts[:0]
+		for _, t := range ts {
+			if t.After(cutoff) {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) == 0 {
+			delete(h.startupRates, k)
+		} else {
+			h.startupRates[k] = kept
+		}
+	}
+	if len(h.startupRates[s]) >= startupRateLimit {
+		return false
+	}
+	if _, ok := h.startupRates[s]; !ok && len(h.startupRates) >= startupRateMaxBuckets {
+		for k := range h.startupRates {
+			delete(h.startupRates, k)
+			break
+		}
+	}
+	h.startupRates[s] = append(h.startupRates[s], now)
+	return true
+}
+
 func (h *Handler) requireSetupOrAdmin(wrapAdmin func(http.Handler) http.Handler) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		adminWrapped := wrapAdmin(next)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !h.checkStartupIPRateLimit(netutil.ClientIP(r), time.Now().UTC()) {
+				httpx.Error(w, http.StatusTooManyRequests, "too many startup wizard requests")
+				return
+			}
+			wizardCompleted := h.cfg != nil && h.cfg.Snapshot().IsStartupWizardCompleted
+			if wizardCompleted {
+				adminWrapped.ServeHTTP(w, r)
+				return
+			}
 			if h.userRepo == nil {
 				next.ServeHTTP(w, r)
 				return
@@ -237,14 +326,16 @@ func (h *Handler) requireSetupOrAdmin(wrapAdmin func(http.Handler) http.Handler)
 
 func (h *Handler) serverID() string {
 	if h.cfg != nil {
-		return h.cfg.ServerID
+		return h.cfg.Snapshot().ServerID
 	}
 	return ""
 }
 
 func (h *Handler) dataDir() string {
-	if h.cfg != nil && h.cfg.DataDir != "" {
-		return h.cfg.DataDir
+	if h.cfg != nil {
+		if dd := h.cfg.Snapshot().DataDir; dd != "" {
+			return dd
+		}
 	}
 	return "./data"
 }
@@ -264,12 +355,12 @@ func (h *Handler) handleOpenAPIJSON(w http.ResponseWriter, r *http.Request) {
 			"description": "Emby 4.10.2.0 compatible media server REST API",
 		},
 		"paths": map[string]any{
-			"/System/Info/Public": map[string]any{"get": map[string]any{"summary": "Get public system info"}},
-			"/LiveTv/Info":        map[string]any{"get": map[string]any{"summary": "Get Live TV info"}},
-			"/Sync/Jobs":          map[string]any{"get": map[string]any{"summary": "List sync jobs"}},
+			"/System/Info/Public":  map[string]any{"get": map[string]any{"summary": "Get public system info"}},
+			"/LiveTv/Info":         map[string]any{"get": map[string]any{"summary": "Get Live TV info"}},
+			"/Sync/Jobs":           map[string]any{"get": map[string]any{"summary": "List sync jobs"}},
 			"/Notifications/Types": map[string]any{"get": map[string]any{"summary": "List notification types"}},
-			"/Webhooks":           map[string]any{"get": map[string]any{"summary": "List webhooks"}},
-			"/Parties":            map[string]any{"get": map[string]any{"summary": "List watch parties"}},
+			"/Webhooks":            map[string]any{"get": map[string]any{"summary": "List webhooks"}},
+			"/Parties":             map[string]any{"get": map[string]any{"summary": "List watch parties"}},
 		},
 	}
 	httpx.JSON(w, http.StatusOK, spec)
@@ -378,25 +469,30 @@ func (h *Handler) handleConnectExchange(w http.ResponseWriter, r *http.Request) 
 // --- Persistence ---
 
 func (h *Handler) loadState(ctx context.Context) {
-	if h.store == nil {
+	if h.store == nil || h.store.Reader == nil {
 		return
 	}
 	var raw string
 	err := h.store.Reader.QueryRowContext(ctx,
 		`SELECT value_json FROM server_config WHERE key = ?`, stateConfigKey,
 	).Scan(&raw)
-	if err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			return
-		}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return
 	}
 	var st opsState
-	if err := json.Unmarshal([]byte(raw), &st); err == nil {
-		h.mu.Lock()
-		h.state = st
-		h.mu.Unlock()
+	hasLegacyState := false
+	if err == nil {
+		if uErr := json.Unmarshal([]byte(raw), &st); uErr == nil {
+			hasLegacyState = true
+		}
 	}
+
+	h.mu.Lock()
+	if hasLegacyState {
+		h.state = st
+	}
+	h.migrateAndLoadWebhooksLocked(ctx)
+	h.mu.Unlock()
 }
 
 func cloneOpsState(st opsState) opsState {
@@ -419,6 +515,9 @@ func cloneOpsState(st opsState) opsState {
 		for i := range out.Parties {
 			if st.Parties[i].Members != nil {
 				out.Parties[i].Members = append([]string(nil), st.Parties[i].Members...)
+			}
+			if st.Parties[i].Messages != nil {
+				out.Parties[i].Messages = append([]PartyMessage(nil), st.Parties[i].Messages...)
 			}
 		}
 	}

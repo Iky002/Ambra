@@ -248,12 +248,23 @@ func TestAPIKeysSessionsDevicesAndDisplayPrefs(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Bazarr") {
 		t.Fatalf("CreateAPIKey body AppName: %d %s", rec.Code, rec.Body.String())
 	}
+	var key3 APIKeyDto
+	_ = json.Unmarshal(rec.Body.Bytes(), &key3)
+	if key1.Id == "" || key3.Id == "" {
+		t.Fatalf("expected non-empty KeyID on created API keys: %+v %+v", key1, key3)
+	}
 	rec = doReq(env.router, http.MethodGet, "/Auth/Keys", env.adminTok, "")
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Sonarr") {
 		t.Fatalf("ListAPIKeys: %d %s", rec.Code, rec.Body.String())
 	}
+	if strings.Contains(rec.Body.String(), key1.AccessToken) {
+		t.Fatalf("GET /Auth/Keys must mask plaintext AccessToken (M-08), got %s", rec.Body.String())
+	}
 	if rec := doReq(env.router, http.MethodDelete, "/Auth/Keys/"+key1.AccessToken, env.adminTok, ""); rec.Code != http.StatusNoContent {
-		t.Fatalf("DeleteAPIKey: %d", rec.Code)
+		t.Fatalf("DeleteAPIKey by token: %d", rec.Code)
+	}
+	if rec := doReq(env.router, http.MethodDelete, "/Auth/Keys/"+key3.Id, env.adminTok, ""); rec.Code != http.StatusNoContent {
+		t.Fatalf("DeleteAPIKey by KeyID: %d", rec.Code)
 	}
 
 	// Sessions & Playback

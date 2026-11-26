@@ -7,6 +7,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -42,7 +45,7 @@ type Handler struct {
 
 	mu            sync.Mutex
 	authRates     map[string][]time.Time
-	authUserRates map[string][]time.Time
+	onUserDeleted func(ctx context.Context, userID string)
 }
 
 func NewHandler(
@@ -53,13 +56,12 @@ func NewHandler(
 	cfg *config.Config,
 ) *Handler {
 	return &Handler{
-		authSvc:       authSvc,
-		userRepo:      userRepo,
-		sessionMgr:    sessionMgr,
-		wsHub:         wsHub,
-		cfg:           cfg,
-		authRates:     make(map[string][]time.Time),
-		authUserRates: make(map[string][]time.Time),
+		authSvc:    authSvc,
+		userRepo:   userRepo,
+		sessionMgr: sessionMgr,
+		wsHub:      wsHub,
+		cfg:        cfg,
+		authRates:  make(map[string][]time.Time),
 	}
 }
 
@@ -67,6 +69,14 @@ func NewHandler(
 func (h *Handler) SetLibraryRepo(libRepo *sqlite.LibraryRepo) {
 	h.mu.Lock()
 	h.libRepo = libRepo
+	h.mu.Unlock()
+}
+
+// SetOnUserDeleted registers a cleanup callback invoked when a user account is deleted
+// (used to purge in-memory/DB notifications and Watch-Together party rooms).
+func (h *Handler) SetOnUserDeleted(fn func(ctx context.Context, userID string)) {
+	h.mu.Lock()
+	h.onUserDeleted = fn
 	h.mu.Unlock()
 }
 
@@ -102,53 +112,80 @@ func pruneRateBucketsLocked(buckets map[string][]time.Time, cutoff time.Time) {
 	}
 }
 
-func (h *Handler) isIPRateLimited(ip string, now time.Time) bool {
-	if ip == "" {
+func isLoopbackClientIP(raw string) bool {
+	s := strings.TrimSpace(raw)
+	if s == "" {
 		return false
 	}
+	addr, err := netip.ParseAddr(s)
+	if err != nil {
+		return false
+	}
+	return addr.WithZone("").Unmap().IsLoopback()
+}
+
+func normalizeLoginRateKey(ip, username string) string {
+	normIP := strings.TrimSpace(ip)
+	if addr, err := netip.ParseAddr(normIP); err == nil {
+		addr = addr.WithZone("").Unmap()
+		if addr.Is6() {
+			normIP = netip.PrefixFrom(addr, 64).Masked().String()
+		} else {
+			normIP = addr.String()
+		}
+	}
+	normUser := strings.ToLower(strings.TrimSpace(username))
+	if normUser == "" {
+		return normIP
+	}
+	return normIP + "|" + normUser
+}
+
+func (h *Handler) checkAuthRateLimit(ip string, now time.Time) bool {
+	if h.isLoginRateLimited(ip, "", now) {
+		return false
+	}
+	h.recordLoginFailure(ip, "", now)
+	return true
+}
+
+func (h *Handler) isLoginRateLimited(ip, username string, now time.Time) bool {
+	ip = strings.TrimSpace(ip)
+	if ip == "" || isLoopbackClientIP(ip) {
+		return false
+	}
+	key := normalizeLoginRateKey(ip, username)
+	emptyKey := normalizeLoginRateKey(ip, "")
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.authRates == nil {
 		return false
 	}
 	pruneRateBucketsLocked(h.authRates, now.Add(-authByNameRateWindow))
-	return len(h.authRates[ip]) >= authByNameRateLimit
-}
-
-func (h *Handler) checkAuthRateLimit(ip string, now time.Time) bool {
-	return h.checkAuthRateLimitForLogin(ip, "", now)
-}
-
-func (h *Handler) checkAuthRateLimitForLogin(ip, username string, now time.Time) bool {
-	ip = strings.TrimSpace(ip)
-	uname := strings.ToLower(strings.TrimSpace(username))
-	if ip == "" && uname == "" {
+	if len(h.authRates[key]) >= authByNameRateLimit {
 		return true
 	}
+	if username != "" && len(h.authRates[emptyKey]) >= authByNameRateLimit {
+		return true
+	}
+	return false
+}
+
+func (h *Handler) recordLoginFailure(ip, username string, now time.Time) {
+	ip = strings.TrimSpace(ip)
+	if ip == "" || isLoopbackClientIP(ip) {
+		return
+	}
+	key := normalizeLoginRateKey(ip, username)
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.authRates == nil {
 		h.authRates = make(map[string][]time.Time)
 	}
-	if h.authUserRates == nil {
-		h.authUserRates = make(map[string][]time.Time)
-	}
-	cutoff := now.Add(-authByNameRateWindow)
-	pruneRateBucketsLocked(h.authRates, cutoff)
-	pruneRateBucketsLocked(h.authUserRates, cutoff)
-	if ip != "" && len(h.authRates[ip]) >= authByNameRateLimit {
-		return false
-	}
-	if uname != "" && len(h.authUserRates[uname]) >= authByNameUserRateLimit {
-		return false
-	}
-	if ip != "" {
-		h.authRates[ip] = append(h.authRates[ip], now)
-	}
-	if uname != "" {
-		h.authUserRates[uname] = append(h.authUserRates[uname], now)
-	}
-	return true
+	pruneRateBucketsLocked(h.authRates, now.Add(-authByNameRateWindow))
+	h.authRates[key] = append(h.authRates[key], now)
 }
 
 func (h *Handler) canAccessItem(ctx context.Context, ac *middleware.AuthContext, itemID string) (bool, error) {
@@ -332,27 +369,41 @@ func verifyUserPassword(u *sqlite.UserRecord, pw, legacySHA1 string) bool {
 	return err == nil && ok
 }
 
+func (h *Handler) isGlobalRemoteAccessEnabled() bool {
+	cfg := h.cfg
+	if cfg == nil && h.authSvc != nil {
+		cfg = h.authSvc.Config()
+	}
+	if cfg == nil {
+		return true
+	}
+	return cfg.Snapshot().IsGlobalRemoteAccessEnabled()
+}
+
 func (h *Handler) AuthenticateByName(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "private, no-store")
 	now := time.Now().UTC()
 	ip := netutil.ClientIP(r)
-	if h.isIPRateLimited(ip, now) {
+	if h.isLoginRateLimited(ip, "", now) {
 		httpx.Error(w, http.StatusTooManyRequests, "Too many authentication attempts")
 		return
 	}
 	var req authenticateByNameRequest
 	if err := httpx.DecodeJSONLimit(r, &req, 64<<10); err != nil {
-		_ = h.checkAuthRateLimitForLogin(ip, "", now)
+		h.recordLoginFailure(ip, "", now)
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if !h.checkAuthRateLimitForLogin(ip, req.Username, now) {
+	if h.isLoginRateLimited(ip, req.Username, now) {
 		httpx.Error(w, http.StatusTooManyRequests, "Too many authentication attempts")
 		return
 	}
+	globalRemoteAllowed := h.isGlobalRemoteAccessEnabled()
 	if h.userRepo != nil && !netutil.IsLocalOrLANRequest(r) {
-		if u, lookupErr := h.userRepo.GetUserByName(r.Context(), strings.TrimSpace(req.Username)); lookupErr == nil && u != nil && !u.Policy.EnableRemoteAccess {
+		u, lookupErr := h.userRepo.GetUserByName(r.Context(), strings.TrimSpace(req.Username))
+		if lookupErr == nil && u != nil && (!globalRemoteAllowed || !u.Policy.EnableRemoteAccess) {
 			if !verifyUserPassword(u, req.Pw, req.Password) {
+				h.recordLoginFailure(ip, req.Username, now)
 				_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
 					Name:     u.Name + " failed to log in",
 					Type:     "AuthenticationFailed",
@@ -378,7 +429,11 @@ func (h *Handler) AuthenticateByName(w http.ResponseWriter, r *http.Request) {
 				UserID:   u.ID,
 				Severity: "Warning",
 			})
-			httpx.Error(w, http.StatusForbidden, "Remote access is disabled for this user")
+			if !globalRemoteAllowed {
+				httpx.Error(w, http.StatusForbidden, "Remote access is disabled on this server")
+			} else {
+				httpx.Error(w, http.StatusForbidden, "Remote access is disabled for this user")
+			}
 			return
 		}
 	}
@@ -387,6 +442,7 @@ func (h *Handler) AuthenticateByName(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, auth.ErrInvalidCredentials):
+			h.recordLoginFailure(ip, req.Username, now)
 			if h.userRepo != nil {
 				uname := strings.TrimSpace(req.Username)
 				if uname == "" {
@@ -499,12 +555,16 @@ func (h *Handler) CreateUser(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if strings.TrimSpace(req.Name) == "" {
-		httpx.Error(w, http.StatusBadRequest, "username cannot be empty")
+	if auth.ContainsControlChar(req.Name) || strings.TrimSpace(req.Name) == "" {
+		httpx.Error(w, http.StatusBadRequest, "username is invalid or empty")
 		return
 	}
 	u, err := h.authSvc.CreateUser(r.Context(), req.Name, req.Password, req.IsAdmin)
 	if err != nil {
+		if errors.Is(err, auth.ErrInvalidUsername) {
+			httpx.Error(w, http.StatusBadRequest, "username is invalid")
+			return
+		}
 		if errors.Is(err, auth.ErrUserExists) {
 			httpx.Error(w, http.StatusConflict, "User already exists")
 			return
@@ -554,6 +614,13 @@ func (h *Handler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 		_ = h.userRepo.DeleteTokensByUser(r.Context(), targetID)
 	}
 	h.disconnectUserSessions(r.Context(), targetID)
+	h.removeUserDiskArtifacts(targetID)
+	h.mu.Lock()
+	onDeleted := h.onUserDeleted
+	h.mu.Unlock()
+	if onDeleted != nil {
+		onDeleted(r.Context(), targetID)
+	}
 	_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
 		Name:     "User " + targetID + " was deleted",
 		Type:     "UserDeleted",
@@ -561,6 +628,39 @@ func (h *Handler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 		Severity: "Info",
 	})
 	httpx.NoContent(w)
+}
+
+func safeSingleSegmentUserDir(userID string) string {
+	norm := guid.Normalize(userID)
+	var b strings.Builder
+	for _, r := range norm {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func (h *Handler) removeUserDiskArtifacts(userID string) {
+	cfg := h.cfg
+	if cfg == nil && h.authSvc != nil {
+		cfg = h.authSvc.Config()
+	}
+	if cfg == nil {
+		return
+	}
+	dataDir := strings.TrimSpace(cfg.Snapshot().DataDir)
+	safeUID := safeSingleSegmentUserDir(userID)
+	if dataDir == "" || safeUID == "" {
+		return
+	}
+	for _, rel := range []string{
+		filepath.Join("metadata", "users", safeUID),
+		filepath.Join("users", safeUID),
+		filepath.Join("camera-uploads", safeUID),
+	} {
+		_ = os.RemoveAll(filepath.Join(dataDir, rel))
+	}
 }
 
 type updatePasswordRequest struct {
@@ -623,6 +723,50 @@ func (h *Handler) UpdateUserPassword(w http.ResponseWriter, r *http.Request) {
 	httpx.NoContent(w)
 }
 
+func hasRemovedEnabledFolder(oldFolders, newFolders []string) bool {
+	if len(oldFolders) == 0 {
+		return false
+	}
+	newSet := make(map[string]struct{}, len(newFolders))
+	for _, f := range newFolders {
+		if norm := guid.Normalize(f); norm != "" {
+			newSet[norm] = struct{}{}
+		}
+	}
+	for _, f := range oldFolders {
+		norm := guid.Normalize(f)
+		if norm == "" {
+			continue
+		}
+		if _, ok := newSet[norm]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
+func policyRequiresWSDisconnect(oldPol dto.UserPolicy, wasAdmin bool, newPol dto.UserPolicy) bool {
+	if newPol.IsDisabled {
+		return true
+	}
+	if wasAdmin && !newPol.IsAdministrator {
+		return true
+	}
+	if oldPol.EnableRemoteAccess && !newPol.EnableRemoteAccess {
+		return true
+	}
+	if oldPol.EnableLiveTvAccess && !newPol.EnableLiveTvAccess {
+		return true
+	}
+	if oldPol.EnableAllFolders && !newPol.EnableAllFolders {
+		return true
+	}
+	if !oldPol.EnableAllFolders && !newPol.EnableAllFolders && hasRemovedEnabledFolder(oldPol.EnabledFolders, newPol.EnabledFolders) {
+		return true
+	}
+	return false
+}
+
 func (h *Handler) UpdateUserPolicy(w http.ResponseWriter, r *http.Request) {
 	targetID := guid.Normalize(chi.URLParam(r, "Id"))
 	var policy dto.UserPolicy
@@ -662,6 +806,10 @@ func (h *Handler) UpdateUserPolicy(w http.ResponseWriter, r *http.Request) {
 		h.disconnectUserSessions(r.Context(), targetID)
 	} else if demoted {
 		h.disconnectUserSessions(r.Context(), targetID)
+	} else if policyRequiresWSDisconnect(existing.Policy, wasAdmin, policy) {
+		if h.wsHub != nil {
+			h.wsHub.DisconnectUser(targetID)
+		}
 	}
 	if h.authSvc != nil {
 		h.authSvc.InvalidateUserCache(targetID)
@@ -700,7 +848,9 @@ func (h *Handler) UpdateUserConfiguration(w http.ResponseWriter, r *http.Request
 // --- API Keys ---
 
 type APIKeyDto struct {
+	Id          string    `json:"Id,omitempty"`
 	AccessToken string    `json:"AccessToken"`
+	MaskedToken string    `json:"MaskedToken,omitempty"`
 	AppName     string    `json:"AppName"`
 	DateCreated time.Time `json:"DateCreated"`
 	IsActive    bool      `json:"IsActive"`
@@ -715,8 +865,11 @@ func (h *Handler) ListAPIKeys(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]APIKeyDto, 0, len(keys))
 	for _, k := range keys {
+		masked := sqlite.MaskAPIKey(k.Token)
 		items = append(items, APIKeyDto{
-			AccessToken: k.Token,
+			Id:          k.KeyID,
+			AccessToken: masked,
+			MaskedToken: masked,
 			AppName:     k.AppName,
 			DateCreated: k.CreatedAt,
 			IsActive:    true,
@@ -751,7 +904,9 @@ func (h *Handler) CreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, APIKeyDto{
+		Id:          rec.KeyID,
 		AccessToken: rec.Token,
+		MaskedToken: sqlite.MaskAPIKey(rec.Token),
 		AppName:     rec.AppName,
 		DateCreated: rec.CreatedAt,
 		IsActive:    true,
@@ -759,10 +914,31 @@ func (h *Handler) CreateAPIKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) DeleteAPIKey(w http.ResponseWriter, r *http.Request) {
-	key := chi.URLParam(r, "Key")
-	if err := h.authSvc.RevokeAPIKey(r.Context(), key); err != nil {
-		httpx.Error(w, http.StatusInternalServerError, "failed to delete api key")
-		return
+	key := strings.TrimSpace(chi.URLParam(r, "Key"))
+	var deletedToken string
+	if h.userRepo != nil {
+		var err error
+		deletedToken, err = h.userRepo.DeleteAPIKeyByIDOrToken(r.Context(), key)
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to delete api key")
+			return
+		}
+	} else if h.authSvc != nil {
+		if err := h.authSvc.RevokeAPIKey(r.Context(), key); err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "failed to delete api key")
+			return
+		}
+		deletedToken = key
+	}
+	evictTok := deletedToken
+	if evictTok == "" {
+		evictTok = key
+	}
+	if h.authSvc != nil {
+		h.authSvc.InvalidateAPIKey(evictTok)
+	}
+	if h.wsHub != nil {
+		h.wsHub.DisconnectToken(evictTok)
 	}
 	httpx.NoContent(w)
 }
@@ -1055,6 +1231,9 @@ func (h *Handler) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "failed to revoke device")
 		return
 	}
+	if h.userRepo != nil {
+		_ = h.userRepo.DeleteDeviceArtifacts(r.Context(), deviceID)
+	}
 	if h.sessionMgr != nil {
 		h.sessionMgr.RemoveSessionByDevice(deviceID)
 	}
@@ -1067,18 +1246,18 @@ func (h *Handler) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 // --- Display Preferences ---
 
 type DisplayPreferencesDto struct {
-	Id                  string            `json:"Id"`
-	SortBy              string            `json:"SortBy"`
-	SortOrder           string            `json:"SortOrder"`
-	Client              string            `json:"Client"`
-	CustomPrefs         map[string]string `json:"CustomPrefs"`
-	PrimaryImageHeight  int               `json:"PrimaryImageHeight"`
-	PrimaryImageWidth   int               `json:"PrimaryImageWidth"`
-	ScrollDirection     string            `json:"ScrollDirection"`
-	ShowBackdrop        bool              `json:"ShowBackdrop"`
-	RememberIndexing    bool              `json:"RememberIndexing"`
-	RememberSorting     bool              `json:"RememberSorting"`
-	ShowSidebar         bool              `json:"ShowSidebar"`
+	Id                 string            `json:"Id"`
+	SortBy             string            `json:"SortBy"`
+	SortOrder          string            `json:"SortOrder"`
+	Client             string            `json:"Client"`
+	CustomPrefs        map[string]string `json:"CustomPrefs"`
+	PrimaryImageHeight int               `json:"PrimaryImageHeight"`
+	PrimaryImageWidth  int               `json:"PrimaryImageWidth"`
+	ScrollDirection    string            `json:"ScrollDirection"`
+	ShowBackdrop       bool              `json:"ShowBackdrop"`
+	RememberIndexing   bool              `json:"RememberIndexing"`
+	RememberSorting    bool              `json:"RememberSorting"`
+	ShowSidebar        bool              `json:"ShowSidebar"`
 }
 
 func (h *Handler) GetDisplayPreferences(w http.ResponseWriter, r *http.Request) {

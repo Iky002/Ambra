@@ -29,15 +29,19 @@ const (
 	defaultPauseThrottleWindow = 60 * time.Second
 	defaultCompleteDedupWindow = 2 * time.Minute
 	defaultUserDataSettleDelay = 50 * time.Millisecond
+	defaultMinWriteInterval    = 1 * time.Second
 	scrobbleCompletionPct      = 80.0
 	traktAPIVersion            = "2"
 	maxErrBodyPreview          = 1024
 	maxDiscardRespBytes        = 1 << 20
 	traktWorkerPoolSize        = 8
-	traktWorkerQueueSize       = 128
+	traktWorkerQueueSize       = 512
 )
 
-var _ plugins.Plugin = (*Plugin)(nil)
+var (
+	_ plugins.Plugin                = (*Plugin)(nil)
+	_ plugins.DefaultConfigExporter = (*Plugin)(nil)
+)
 
 type stopBarrier struct {
 	ch   chan struct{}
@@ -69,6 +73,10 @@ type Plugin struct {
 	pauseThrottleWindow time.Duration
 	completeDedupWindow time.Duration
 	nowFunc             func() time.Time
+
+	writeRateMu      sync.Mutex
+	lastWriteAt      time.Time
+	minWriteInterval time.Duration
 }
 
 type configSnapshot struct {
@@ -92,6 +100,16 @@ func (p *Plugin) SetUserConfigStore(store UserConfigStore) {
 	p.mu.Unlock()
 }
 
+// SetMinWriteInterval configures the minimum interval between outgoing Trakt write requests (~1 req/s by default).
+func (p *Plugin) SetMinWriteInterval(d time.Duration) {
+	p.writeRateMu.Lock()
+	if d < 0 {
+		d = 0
+	}
+	p.minWriteInterval = d
+	p.writeRateMu.Unlock()
+}
+
 // New creates a new Trakt plugin instance (disabled by default).
 func New() *Plugin {
 	return &Plugin{
@@ -105,6 +123,7 @@ func New() *Plugin {
 		pauseThrottleWindow: defaultPauseThrottleWindow,
 		completeDedupWindow: defaultCompleteDedupWindow,
 		nowFunc:             time.Now,
+		minWriteInterval:    defaultMinWriteInterval,
 	}
 }
 
@@ -169,6 +188,14 @@ func (p *Plugin) Manifest() plugins.Manifest {
 		Enabled:     snap.enabled,
 		Priority:    snap.priority,
 		Kinds:       []plugins.Kind{plugins.KindNotifier},
+	}
+}
+
+func (p *Plugin) DefaultConfig() map[string]any {
+	snap := p.snapshot()
+	return map[string]any{
+		"enabled":  snap.enabled,
+		"priority": snap.priority,
 	}
 }
 
@@ -262,6 +289,53 @@ type syncHistoryPayload struct {
 	Shows  []historyShow `json:"shows,omitempty"`
 }
 
+type itemWithSeries struct {
+	item   *sqlite.ItemRecord
+	series *sqlite.ItemRecord
+}
+
+func (p *Plugin) throttleWrite(ctx context.Context, stopCh <-chan struct{}) error {
+	p.writeRateMu.Lock()
+	interval := p.minWriteInterval
+	if interval <= 0 {
+		p.writeRateMu.Unlock()
+		return nil
+	}
+	now := time.Now()
+	target := now
+	if !p.lastWriteAt.IsZero() {
+		nextAllowed := p.lastWriteAt.Add(interval)
+		if nextAllowed.After(now) {
+			target = nextAllowed
+		}
+	}
+	wait := target.Sub(now)
+	p.lastWriteAt = target
+	p.writeRateMu.Unlock()
+
+	if wait <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	if stopCh != nil {
+		select {
+		case <-timer.C:
+			return nil
+		case <-stopCh:
+			return context.Canceled
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // ScrobbleStart sends a POST /scrobble/start request to Trakt.
 func (p *Plugin) ScrobbleStart(ctx context.Context, userID string, item *sqlite.ItemRecord, series *sqlite.ItemRecord, progressPct float64) error {
 	return p.scrobble(ctx, userID, "/scrobble/start", item, series, progressPct)
@@ -282,16 +356,19 @@ func (p *Plugin) scrobble(ctx context.Context, userID, endpoint string, item *sq
 	if err != nil {
 		return err
 	}
-	return p.scrobbleWithSnapshot(ctx, snap, endpoint, item, series, progressPct)
+	return p.scrobbleWithSnapshot(ctx, nil, snap, endpoint, item, series, progressPct)
 }
 
-func (p *Plugin) scrobbleWithSnapshot(ctx context.Context, snap configSnapshot, endpoint string, item *sqlite.ItemRecord, series *sqlite.ItemRecord, progressPct float64) error {
+func (p *Plugin) scrobbleWithSnapshot(ctx context.Context, stopCh <-chan struct{}, snap configSnapshot, endpoint string, item *sqlite.ItemRecord, series *sqlite.ItemRecord, progressPct float64) error {
 	if !snap.enabled || !snap.scrobblePlayback || snap.clientID == "" || snap.accessToken == "" {
 		return nil
 	}
 	payload := buildScrobblePayload(item, series, progressPct)
 	if payload == nil {
 		return nil
+	}
+	if err := p.throttleWrite(ctx, stopCh); err != nil {
+		return err
 	}
 	return postTrakt(ctx, snap, endpoint, payload)
 }
@@ -302,16 +379,33 @@ func (p *Plugin) SyncWatched(ctx context.Context, userID string, item *sqlite.It
 	if err != nil {
 		return err
 	}
-	return p.syncWatchedWithSnapshot(ctx, snap, item, series)
+	return p.syncWatchedWithSnapshot(ctx, nil, snap, item, series)
 }
 
-func (p *Plugin) syncWatchedWithSnapshot(ctx context.Context, snap configSnapshot, item *sqlite.ItemRecord, series *sqlite.ItemRecord) error {
+func (p *Plugin) syncWatchedWithSnapshot(ctx context.Context, stopCh <-chan struct{}, snap configSnapshot, item *sqlite.ItemRecord, series *sqlite.ItemRecord) error {
 	if !snap.enabled || !snap.syncWatched || snap.clientID == "" || snap.accessToken == "" {
 		return nil
 	}
 	payload := buildSyncHistoryPayload(item, series)
 	if payload == nil {
 		return nil
+	}
+	if err := p.throttleWrite(ctx, stopCh); err != nil {
+		return err
+	}
+	return postTrakt(ctx, snap, "/sync/history", payload)
+}
+
+func (p *Plugin) syncWatchedBatchWithSnapshot(ctx context.Context, stopCh <-chan struct{}, snap configSnapshot, batch []itemWithSeries) error {
+	if !snap.enabled || !snap.syncWatched || snap.clientID == "" || snap.accessToken == "" {
+		return nil
+	}
+	payload := buildBatchSyncHistoryPayload(batch)
+	if payload == nil {
+		return nil
+	}
+	if err := p.throttleWrite(ctx, stopCh); err != nil {
+		return err
 	}
 	return postTrakt(ctx, snap, "/sync/history", payload)
 }
@@ -345,40 +439,117 @@ func buildSyncHistoryPayload(item *sqlite.ItemRecord, series *sqlite.ItemRecord)
 	if item == nil {
 		return nil
 	}
-	switch strings.ToLower(strings.TrimSpace(item.Type)) {
-	case "movie":
-		return &syncHistoryPayload{
-			Movies: []traktMovie{buildTraktMovie(item)},
+	return buildBatchSyncHistoryPayload([]itemWithSeries{{item: item, series: series}})
+}
+
+func showGroupingKey(item *sqlite.ItemRecord, series *sqlite.ItemRecord, show traktShow) string {
+	if series != nil && series.ID != "" {
+		return "id:" + series.ID
+	}
+	if item != nil && item.SeriesID != "" {
+		return "id:" + item.SeriesID
+	}
+	if show.IDs != nil {
+		if show.IDs.Tmdb > 0 {
+			return fmt.Sprintf("tmdb:%d", show.IDs.Tmdb)
 		}
-	case "episode":
-		show := buildTraktShow(item, series)
-		seasonNum := 0
-		if item.ParentIndexNumber != nil {
-			seasonNum = *item.ParentIndexNumber
+		if show.IDs.Tvdb > 0 {
+			return fmt.Sprintf("tvdb:%d", show.IDs.Tvdb)
 		}
-		epNum := 0
-		if item.IndexNumber != nil {
-			epNum = *item.IndexNumber
+		if show.IDs.Imdb != "" {
+			return "imdb:" + strings.ToLower(show.IDs.Imdb)
 		}
-		return &syncHistoryPayload{
-			Shows: []historyShow{
-				{
-					Title: show.Title,
-					Year:  show.Year,
-					IDs:   show.IDs,
-					Seasons: []historySeason{
-						{
-							Number: seasonNum,
-							Episodes: []historyEpisode{
-								{Number: epNum},
-							},
-						},
-					},
-				},
-			},
-		}
-	default:
+	}
+	return fmt.Sprintf("title:%s:%d", strings.ToLower(show.Title), show.Year)
+}
+
+func buildBatchSyncHistoryPayload(batch []itemWithSeries) *syncHistoryPayload {
+	if len(batch) == 0 {
 		return nil
+	}
+	var movies []traktMovie
+	type seasonBuilder struct {
+		number  int
+		epSeen  map[int]struct{}
+		epList  []historyEpisode
+	}
+	type showBuilder struct {
+		show        traktShow
+		seasonIndex map[int]int
+		seasons     []*seasonBuilder
+	}
+	var showList []*showBuilder
+	showIdxByKey := make(map[string]int)
+
+	for _, pair := range batch {
+		item := pair.item
+		if item == nil {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(item.Type)) {
+		case "movie":
+			movies = append(movies, buildTraktMovie(item))
+		case "episode":
+			show := buildTraktShow(item, pair.series)
+			key := showGroupingKey(item, pair.series, show)
+			sIdx, exists := showIdxByKey[key]
+			if !exists {
+				sIdx = len(showList)
+				showIdxByKey[key] = sIdx
+				showList = append(showList, &showBuilder{
+					show:        show,
+					seasonIndex: make(map[int]int),
+				})
+			}
+			sb := showList[sIdx]
+			seasonNum := 0
+			if item.ParentIndexNumber != nil {
+				seasonNum = *item.ParentIndexNumber
+			}
+			epNum := 0
+			if item.IndexNumber != nil {
+				epNum = *item.IndexNumber
+			}
+			seaIdx, sExists := sb.seasonIndex[seasonNum]
+			if !sExists {
+				seaIdx = len(sb.seasons)
+				sb.seasonIndex[seasonNum] = seaIdx
+				sb.seasons = append(sb.seasons, &seasonBuilder{
+					number: seasonNum,
+					epSeen: make(map[int]struct{}),
+				})
+			}
+			seab := sb.seasons[seaIdx]
+			if _, dup := seab.epSeen[epNum]; !dup {
+				seab.epSeen[epNum] = struct{}{}
+				seab.epList = append(seab.epList, historyEpisode{Number: epNum})
+			}
+		}
+	}
+
+	var shows []historyShow
+	for _, sb := range showList {
+		seasons := make([]historySeason, 0, len(sb.seasons))
+		for _, seab := range sb.seasons {
+			seasons = append(seasons, historySeason{
+				Number:   seab.number,
+				Episodes: seab.epList,
+			})
+		}
+		shows = append(shows, historyShow{
+			Title:   sb.show.Title,
+			Year:    sb.show.Year,
+			IDs:     sb.show.IDs,
+			Seasons: seasons,
+		})
+	}
+
+	if len(movies) == 0 && len(shows) == 0 {
+		return nil
+	}
+	return &syncHistoryPayload{
+		Movies: movies,
+		Shows:  shows,
 	}
 }
 
@@ -626,6 +797,13 @@ func (p *Plugin) waitInFlightStop(ctx context.Context, userID, itemID string) {
 	}
 }
 
+type traktTask struct {
+	userID  string
+	action  string
+	itemIDs []string
+	run     func()
+}
+
 // SubscribeEvents registers EventBus handlers for playback scrobbling and watched-history sync.
 // Calling the returned function stops the plugin from processing subsequent events.
 func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) func() {
@@ -634,7 +812,7 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 	}
 	var unsubscribed atomic.Bool
 	stopCh := make(chan struct{})
-	jobs := make(chan func(), traktWorkerQueueSize)
+	jobs := make(chan traktTask, traktWorkerQueueSize)
 	var stopOnce sync.Once
 
 	for i := 0; i < traktWorkerPoolSize; i++ {
@@ -643,21 +821,21 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 				select {
 				case <-stopCh:
 					return
-				case job := <-jobs:
-					if job != nil {
-						job()
+				case task := <-jobs:
+					if task.run != nil {
+						task.run()
 					}
 				}
 			}
 		}()
 	}
 
-	enqueue := func(fn func()) bool {
+	enqueueTask := func(t traktTask) bool {
 		if unsubscribed.Load() {
 			return false
 		}
 		select {
-		case jobs <- fn:
+		case jobs <- t:
 			return true
 		default:
 			// Drop when queue is saturated rather than spawning unbounded goroutines.
@@ -681,20 +859,25 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 		if !ok || ev.itemID == "" || ev.userID == "" {
 			return
 		}
-		enqueue(func() {
-			ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-			defer cancel()
-			snap, err := p.snapshotForUser(ctx, ev.userID)
-			if err != nil || !snap.enabled || !snap.scrobblePlayback || snap.clientID == "" || snap.accessToken == "" {
-				return
-			}
-			p.clearPaused(ev.userID, ev.itemID)
-			item, series := lookupItemAndSeries(ctx, repo, ev.itemID)
-			if item == nil {
-				return
-			}
-			pct := computeProgress(ev.positionTicks, ev.runtimeTicks, item.RuntimeTicks)
-			_ = p.scrobbleWithSnapshot(ctx, snap, "/scrobble/start", item, series, pct)
+		enqueueTask(traktTask{
+			userID:  ev.userID,
+			action:  "scrobble_start",
+			itemIDs: []string{ev.itemID},
+			run: func() {
+				ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout+5*time.Second)
+				defer cancel()
+				snap, err := p.snapshotForUser(ctx, ev.userID)
+				if err != nil || !snap.enabled || !snap.scrobblePlayback || snap.clientID == "" || snap.accessToken == "" {
+					return
+				}
+				p.clearPaused(ev.userID, ev.itemID)
+				item, series := lookupItemAndSeries(ctx, repo, ev.itemID)
+				if item == nil {
+					return
+				}
+				pct := computeProgress(ev.positionTicks, ev.runtimeTicks, item.RuntimeTicks)
+				_ = p.scrobbleWithSnapshot(ctx, stopCh, snap, "/scrobble/start", item, series, pct)
+			},
 		})
 	})
 
@@ -710,22 +893,27 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 			p.clearPaused(ev.userID, ev.itemID)
 			return
 		}
-		enqueue(func() {
-			ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-			defer cancel()
-			snap, err := p.snapshotForUser(ctx, ev.userID)
-			if err != nil || !snap.enabled || !snap.scrobblePlayback || snap.clientID == "" || snap.accessToken == "" {
-				return
-			}
-			if !p.allowPauseScrobble(ev.userID, ev.itemID) {
-				return
-			}
-			item, series := lookupItemAndSeries(ctx, repo, ev.itemID)
-			if item == nil {
-				return
-			}
-			pct := computeProgress(ev.positionTicks, ev.runtimeTicks, item.RuntimeTicks)
-			_ = p.scrobbleWithSnapshot(ctx, snap, "/scrobble/pause", item, series, pct)
+		enqueueTask(traktTask{
+			userID:  ev.userID,
+			action:  "scrobble_pause",
+			itemIDs: []string{ev.itemID},
+			run: func() {
+				ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout+5*time.Second)
+				defer cancel()
+				snap, err := p.snapshotForUser(ctx, ev.userID)
+				if err != nil || !snap.enabled || !snap.scrobblePlayback || snap.clientID == "" || snap.accessToken == "" {
+					return
+				}
+				if !p.allowPauseScrobble(ev.userID, ev.itemID) {
+					return
+				}
+				item, series := lookupItemAndSeries(ctx, repo, ev.itemID)
+				if item == nil {
+					return
+				}
+				pct := computeProgress(ev.positionTicks, ev.runtimeTicks, item.RuntimeTicks)
+				_ = p.scrobbleWithSnapshot(ctx, stopCh, snap, "/scrobble/pause", item, series, pct)
+			},
 		})
 	})
 
@@ -738,30 +926,35 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 			return
 		}
 		finishStop := p.beginInFlightStop(ev.userID, ev.itemID)
-		if !enqueue(func() {
-			defer finishStop()
-			ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-			defer cancel()
-			snap, err := p.snapshotForUser(ctx, ev.userID)
-			if err != nil || !snap.enabled || !snap.scrobblePlayback || snap.clientID == "" || snap.accessToken == "" {
-				return
-			}
-			p.clearPaused(ev.userID, ev.itemID)
-			item, series := lookupItemAndSeries(ctx, repo, ev.itemID)
-			if item == nil {
-				return
-			}
-			var pct float64
-			if ev.played && ev.positionTicks == 0 {
-				pct = 100
-			} else {
-				pct = computeProgress(ev.positionTicks, ev.runtimeTicks, item.RuntimeTicks)
-			}
-			if err := p.scrobbleWithSnapshot(ctx, snap, "/scrobble/stop", item, series, pct); err == nil {
-				if ev.played || pct >= scrobbleCompletionPct {
-					p.markScrobbleCompleted(ev.userID, ev.itemID)
+		if !enqueueTask(traktTask{
+			userID:  ev.userID,
+			action:  "scrobble_stop",
+			itemIDs: []string{ev.itemID},
+			run: func() {
+				defer finishStop()
+				ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout+5*time.Second)
+				defer cancel()
+				snap, err := p.snapshotForUser(ctx, ev.userID)
+				if err != nil || !snap.enabled || !snap.scrobblePlayback || snap.clientID == "" || snap.accessToken == "" {
+					return
 				}
-			}
+				p.clearPaused(ev.userID, ev.itemID)
+				item, series := lookupItemAndSeries(ctx, repo, ev.itemID)
+				if item == nil {
+					return
+				}
+				var pct float64
+				if ev.played && ev.positionTicks == 0 {
+					pct = 100
+				} else {
+					pct = computeProgress(ev.positionTicks, ev.runtimeTicks, item.RuntimeTicks)
+				}
+				if err := p.scrobbleWithSnapshot(ctx, stopCh, snap, "/scrobble/stop", item, series, pct); err == nil {
+					if ev.played || pct >= scrobbleCompletionPct {
+						p.markScrobbleCompleted(ev.userID, ev.itemID)
+					}
+				}
+			},
 		}) {
 			finishStop()
 		}
@@ -772,6 +965,26 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 			return
 		}
 		entries := parseUserDataChangedEvent(e.Payload)
+		if len(entries) == 0 {
+			return
+		}
+
+		// Aggregate bulk watched entries by (UserID, Action) into a single batch traktTask
+		// so marking an entire season/series (e.g. 200+ episodes) watched sends ONE batched
+		// /sync/history request rather than overflowing the worker queue or triggering 429s.
+		type batchKey struct {
+			userID string
+			action string
+		}
+		type batchGroup struct {
+			userID  string
+			action  string
+			seen    map[string]struct{}
+			itemIDs []string
+		}
+		var groups []*batchGroup
+		groupIndex := make(map[batchKey]int)
+
 		for _, entry := range entries {
 			if !entry.played || entry.itemID == "" || entry.userID == "" {
 				continue
@@ -779,40 +992,90 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 			if p.wasRecentlyScrobbleCompleted(entry.userID, entry.itemID) {
 				continue
 			}
-			userID := entry.userID
-			itemID := entry.itemID
-			enqueue(func() {
-				ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-				defer cancel()
-				// EventBus dispatches EventPlaybackStop and EventUserDataChanged in independent
-				// goroutines. Briefly settle so a concurrent EventPlaybackStop handler can
-				// register its in-flight stop marker or completion timestamp before we check dedup.
-				timer := time.NewTimer(defaultUserDataSettleDelay)
-				select {
-				case <-timer.C:
-				case <-stopCh:
-					timer.Stop()
-					return
-				case <-ctx.Done():
-					timer.Stop()
-					return
-				}
-				p.waitInFlightStop(ctx, userID, itemID)
-				if unsubscribed.Load() {
-					return
-				}
-				if p.wasRecentlyScrobbleCompleted(userID, itemID) {
-					return
-				}
-				snap, err := p.snapshotForUser(ctx, userID)
-				if err != nil || !snap.enabled || !snap.syncWatched || snap.clientID == "" || snap.accessToken == "" {
-					return
-				}
-				item, series := lookupItemAndSeries(ctx, repo, itemID)
-				if item == nil {
-					return
-				}
-				_ = p.syncWatchedWithSnapshot(ctx, snap, item, series)
+			bk := batchKey{userID: entry.userID, action: "sync_watched"}
+			idx, exists := groupIndex[bk]
+			if !exists {
+				idx = len(groups)
+				groupIndex[bk] = idx
+				groups = append(groups, &batchGroup{
+					userID: entry.userID,
+					action: "sync_watched",
+					seen:   make(map[string]struct{}),
+				})
+			}
+			g := groups[idx]
+			if _, dup := g.seen[entry.itemID]; !dup {
+				g.seen[entry.itemID] = struct{}{}
+				g.itemIDs = append(g.itemIDs, entry.itemID)
+			}
+		}
+
+		for _, g := range groups {
+			userID := g.userID
+			action := g.action
+			itemIDs := g.itemIDs
+			enqueueTask(traktTask{
+				userID:  userID,
+				action:  action,
+				itemIDs: itemIDs,
+				run: func() {
+					ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout+15*time.Second)
+					defer cancel()
+					// Briefly settle so a concurrent EventPlaybackStop handler can register its
+					// in-flight stop marker or completion timestamp before we check dedup.
+					timer := time.NewTimer(defaultUserDataSettleDelay)
+					select {
+					case <-timer.C:
+					case <-stopCh:
+						timer.Stop()
+						return
+					case <-ctx.Done():
+						timer.Stop()
+						return
+					}
+
+					var activeIDs []string
+					for _, id := range itemIDs {
+						p.waitInFlightStop(ctx, userID, id)
+						if unsubscribed.Load() {
+							return
+						}
+						if !p.wasRecentlyScrobbleCompleted(userID, id) {
+							activeIDs = append(activeIDs, id)
+						}
+					}
+					if len(activeIDs) == 0 {
+						return
+					}
+
+					snap, err := p.snapshotForUser(ctx, userID)
+					if err != nil || !snap.enabled || !snap.syncWatched || snap.clientID == "" || snap.accessToken == "" {
+						return
+					}
+
+					seriesCache := make(map[string]*sqlite.ItemRecord)
+					pairs := make([]itemWithSeries, 0, len(activeIDs))
+					for _, id := range activeIDs {
+						item, err := repo.GetItemRecordByID(ctx, id)
+						if err != nil || item == nil {
+							continue
+						}
+						var series *sqlite.ItemRecord
+						if strings.EqualFold(item.Type, "Episode") && item.SeriesID != "" {
+							if cached, ok := seriesCache[item.SeriesID]; ok {
+								series = cached
+							} else if s, sErr := repo.GetItemRecordByID(ctx, item.SeriesID); sErr == nil && s != nil {
+								series = s
+								seriesCache[item.SeriesID] = s
+							}
+						}
+						pairs = append(pairs, itemWithSeries{item: item, series: series})
+					}
+					if len(pairs) == 0 {
+						return
+					}
+					_ = p.syncWatchedBatchWithSnapshot(ctx, stopCh, snap, pairs)
+				},
 			})
 		}
 	})
@@ -1000,10 +1263,14 @@ func parseUserDataList(raw any, userID string) []userDataEventEntry {
 		if !ok {
 			continue
 		}
+		euid := userID
+		if u, hasU := firstString(em, "user_id", "UserId", "UserID"); hasU && strings.TrimSpace(u) != "" {
+			euid = strings.TrimSpace(u)
+		}
 		itemID, _ := firstString(em, "item_id", "ItemId", "ItemID")
 		played, _ := firstBool(em, "played", "Played")
 		if strings.TrimSpace(itemID) != "" {
-			out = append(out, userDataEventEntry{userID: userID, itemID: strings.TrimSpace(itemID), played: played})
+			out = append(out, userDataEventEntry{userID: euid, itemID: strings.TrimSpace(itemID), played: played})
 		}
 	}
 	return out

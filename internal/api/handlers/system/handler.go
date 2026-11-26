@@ -13,18 +13,89 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/middleware"
+	"github.com/ambra-media/ambra/internal/api/ws"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
+
+const maskedSecretPlaceholder = "********"
+
+var (
+	processLifecycleMu sync.RWMutex
+	processRestartFn   func()
+	processShutdownFn  func()
+	globalPendingRst   atomic.Bool
+	globalShuttingDown atomic.Bool
+)
+
+// RegisterProcessLifecycleController wires process-level hot-restart and graceful-shutdown callbacks
+// (used by cmd/ambra/main.go). Returns an unregister function that clears the callbacks.
+func RegisterProcessLifecycleController(onRestart, onShutdown func()) func() {
+	processLifecycleMu.Lock()
+	processRestartFn = onRestart
+	processShutdownFn = onShutdown
+	globalPendingRst.Store(false)
+	globalShuttingDown.Store(false)
+	processLifecycleMu.Unlock()
+
+	return func() {
+		processLifecycleMu.Lock()
+		processRestartFn = nil
+		processShutdownFn = nil
+		processLifecycleMu.Unlock()
+	}
+}
+
+// TriggerProcessRestart marks pending restart and asynchronously invokes any registered process restart hook.
+func TriggerProcessRestart() bool {
+	globalPendingRst.Store(true)
+	processLifecycleMu.RLock()
+	fn := processRestartFn
+	processLifecycleMu.RUnlock()
+	if fn == nil {
+		return false
+	}
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		fn()
+	}()
+	return true
+}
+
+// TriggerProcessShutdown marks shutting-down state and asynchronously invokes any registered process shutdown hook.
+func TriggerProcessShutdown() bool {
+	globalShuttingDown.Store(true)
+	processLifecycleMu.RLock()
+	fn := processShutdownFn
+	processLifecycleMu.RUnlock()
+	if fn == nil {
+		return false
+	}
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		fn()
+	}()
+	return true
+}
+
+// ProcessLifecycleState reports global (hasPendingRestart, isShuttingDown, canSelfRestart).
+func ProcessLifecycleState() (bool, bool, bool) {
+	processLifecycleMu.RLock()
+	canRestart := processRestartFn != nil
+	processLifecycleMu.RUnlock()
+	return globalPendingRst.Load(), globalShuttingDown.Load(), canRestart
+}
 
 type Handler struct {
 	setupMu       sync.Mutex
@@ -33,19 +104,51 @@ type Handler struct {
 	userRepo      *sqlite.UserRepo
 	registry      *plugins.Registry
 	setup         SetupDeps
+
+	lifecycleMu    sync.RWMutex
+	wsHub          *ws.Hub
+	onRestart      func()
+	onShutdown     func()
+	pendingRestart atomic.Bool
+	shuttingDown   atomic.Bool
+
+	setupRateMu sync.Mutex
+	setupRates  map[string][]time.Time
 }
 
 func NewHandler(cfg *config.Config, userRepo *sqlite.UserRepo, registry *plugins.Registry) *Handler {
 	return &Handler{
-		cfg:      cfg,
-		userRepo: userRepo,
-		registry: registry,
+		cfg:        cfg,
+		userRepo:   userRepo,
+		registry:   registry,
+		setupRates: make(map[string][]time.Time),
 	}
 }
 
 func (h *Handler) WithSetupDeps(deps SetupDeps) *Handler {
 	h.setup = deps
 	return h
+}
+
+// SetWSHub attaches the WebSocket hub for broadcasting ServerRestarting/ServerShuttingDown events
+// and hot-updating AllowedOrigins.
+func (h *Handler) SetWSHub(wsHub *ws.Hub) {
+	h.lifecycleMu.Lock()
+	h.wsHub = wsHub
+	h.lifecycleMu.Unlock()
+}
+
+// SetLifecycleHooks installs optional instance-level restart and shutdown hooks.
+func (h *Handler) SetLifecycleHooks(onRestart, onShutdown func()) {
+	h.lifecycleMu.Lock()
+	h.onRestart = onRestart
+	h.onShutdown = onShutdown
+	h.lifecycleMu.Unlock()
+}
+
+// SetPendingRestart toggles the instance-level HasPendingRestart flag.
+func (h *Handler) SetPendingRestart(v bool) {
+	h.pendingRestart.Store(v)
 }
 
 func RegisterRoutes(r chi.Router, authMW *middleware.Auth, h *Handler) {
@@ -65,23 +168,27 @@ func RegisterRoutes(r chi.Router, authMW *middleware.Auth, h *Handler) {
 	r.Get("/Localization/ParentalRatings", h.GetParentalRatings)
 
 	r.Get("/Registrations/{Name}", h.GetRegistration)
-	r.Get("/Features", h.GetFeatures)
 
 	// Authenticated system routes
 	r.Group(func(pr chi.Router) {
 		pr.Use(authMW.RequireAuth)
 		pr.Get("/System/Info", h.GetSystemInfo)
 		pr.Get("/System/Configuration", h.GetConfiguration)
-		pr.Get("/Plugins", h.GetPlugins)
+		pr.Get("/web/ConfigurationPages", h.GetConfigurationPages)
 	})
 
 	// Admin-only system routes
 	r.Group(func(ar chi.Router) {
 		ar.Use(authMW.RequireAdmin)
+		ar.Get("/Features", h.GetFeatures)
+		ar.Get("/Plugins", h.GetPlugins)
 		ar.Get("/System/ActivityLog/Entries", h.GetActivityLogEntries)
-		ar.Get("/System/Configuration/{Key}", h.GetNamedConfiguration)
 		ar.Post("/System/Configuration", h.UpdateConfiguration)
+		ar.Post("/System/Configuration/Partial", h.UpdateConfigurationPartial)
+		ar.Get("/System/Configuration/{Key}", h.GetNamedConfiguration)
 		ar.Post("/System/Configuration/{Key}", h.UpdateNamedConfiguration)
+		ar.Post("/System/Restart", h.RestartServer)
+		ar.Post("/System/Shutdown", h.ShutdownServer)
 	})
 }
 
@@ -125,16 +232,21 @@ func (h *Handler) GetSystemInfo(w http.ResponseWriter, r *http.Request) {
 	transcodeTempDir := (&snap).TranscodeTempDir()
 	wizardCompleted := snap.IsStartupWizardCompleted
 
+	procPending, procShutting, procCanRestart := ProcessLifecycleState()
+	h.lifecycleMu.RLock()
+	hasRestartHook := h.onRestart != nil
+	h.lifecycleMu.RUnlock()
+
 	port := parsePort(httpAddr, 8096)
 	info := systemInfoResponse{
 		PublicSystemInfo:           h.buildPublicInfo(r),
 		OperatingSystem:            runtime.GOOS,
 		OperatingSystemDisplayName: osDisplayName(runtime.GOOS),
-		HasPendingRestart:          false,
-		IsShuttingDown:             false,
+		HasPendingRestart:          h.pendingRestart.Load() || procPending,
+		IsShuttingDown:             h.shuttingDown.Load() || procShutting,
 		SupportsLibraryMonitor:     true,
 		WebSocketPortNumber:        port,
-		CanSelfRestart:             false,
+		CanSelfRestart:             hasRestartHook || procCanRestart,
 		CanSelfUpdate:              false,
 		CanLaunchWebBrowser:        false,
 		HttpServerPortNumber:       port,
@@ -167,15 +279,27 @@ func (h *Handler) Ping(w http.ResponseWriter, r *http.Request) {
 const systemExtraConfigKey = "system:config_extra"
 
 type ServerConfigurationDto struct {
-	ServerName                string  `json:"ServerName"`
-	IsStartupWizardCompleted  bool    `json:"IsStartupWizardCompleted"`
-	TMDBApiKey                string  `json:"TMDBApiKey,omitempty"`
-	TMDBLanguage              string  `json:"TMDBLanguage,omitempty"`
-	EnableSTRM302             bool    `json:"EnableSTRM302"`
-	PlayedThreshold           float64 `json:"PlayedThreshold"`
-	PreferredMetadataLanguage string  `json:"PreferredMetadataLanguage"`
-	MetadataCountryCode       string  `json:"MetadataCountryCode"`
-	UICulture                 string  `json:"UICulture"`
+	ServerName                string   `json:"ServerName"`
+	IsStartupWizardCompleted  bool     `json:"IsStartupWizardCompleted"`
+	TMDBApiKey                string   `json:"TMDBApiKey,omitempty"`
+	HasTMDBApiKey             bool     `json:"HasTMDBApiKey,omitempty"`
+	TMDBLanguage              string   `json:"TMDBLanguage,omitempty"`
+	EnableSTRM302             bool     `json:"EnableSTRM302"`
+	EnableDLNA                bool     `json:"EnableDLNA"`
+	DLNADefaultUserID         string   `json:"DLNADefaultUserID,omitempty"`
+	EnableQuickConnect        bool     `json:"EnableQuickConnect"`
+	EnableRemoteAccess        bool     `json:"EnableRemoteAccess"`
+	AllowedOrigins            []string `json:"AllowedOrigins,omitempty"`
+	TrustedProxies            []string `json:"TrustedProxies,omitempty"`
+	LocalNetworkSubnets       []string `json:"LocalNetworkSubnets,omitempty"`
+	SimultaneousStreamLimit   int      `json:"SimultaneousStreamLimit,omitempty"`
+	RemoteClientBitrateLimit  int      `json:"RemoteClientBitrateLimit,omitempty"`
+	FFmpegPath                string   `json:"FFmpegPath,omitempty"`
+	FFprobePath               string   `json:"FFprobePath,omitempty"`
+	PlayedThreshold           float64  `json:"PlayedThreshold"`
+	PreferredMetadataLanguage string   `json:"PreferredMetadataLanguage"`
+	MetadataCountryCode       string   `json:"MetadataCountryCode"`
+	UICulture                 string   `json:"UICulture"`
 }
 
 func (h *Handler) loadExtraConfigLocked(ctx context.Context) map[string]any {
@@ -219,6 +343,63 @@ func stringFromMap(m map[string]any, key, fallback string) string {
 	return fallback
 }
 
+func nonNilStrings(in []string) []string {
+	if len(in) == 0 {
+		return []string{}
+	}
+	return append([]string(nil), in...)
+}
+
+func parseStringSliceField(raw any) ([]string, bool) {
+	switch v := raw.(type) {
+	case nil:
+		return []string{}, true
+	case []string:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s := strings.TrimSpace(item); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out, true
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			s, ok := item.(string)
+			if !ok {
+				return nil, false
+			}
+			if trimmed := strings.TrimSpace(s); trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+		return out, true
+	case string:
+		out := make([]string, 0)
+		for _, part := range strings.Split(v, ",") {
+			if s := strings.TrimSpace(part); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func parseIntField(raw any) (int, bool) {
+	switch v := raw.(type) {
+	case float64:
+		return int(v), true
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	default:
+		return 0, false
+	}
+}
+
 func (h *Handler) GetConfiguration(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "private, no-store")
 	isAdmin := false
@@ -229,16 +410,13 @@ func (h *Handler) GetConfiguration(w http.ResponseWriter, r *http.Request) {
 	snap := h.cfg.Snapshot()
 	serverName := snap.ServerName
 	wizardCompleted := snap.IsStartupWizardCompleted
-	tmdbKey := ""
-	if isAdmin {
-		tmdbKey = snap.TMDBApiKey
-	}
+	hasTMDBKey := strings.TrimSpace(snap.TMDBApiKey) != ""
 	tmdbLang := snap.TMDBLanguage
 	enableSTRM302 := snap.EnableSTRM302
 	playedThreshold := snap.PlayedThreshold
 
 	extra := h.loadExtraConfig(r.Context())
-	out := make(map[string]any, 9)
+	out := make(map[string]any, 24)
 	if isAdmin {
 		for k, v := range extra {
 			out[k] = v
@@ -246,10 +424,27 @@ func (h *Handler) GetConfiguration(w http.ResponseWriter, r *http.Request) {
 	}
 	out["ServerName"] = serverName
 	out["IsStartupWizardCompleted"] = wizardCompleted
-	if isAdmin && tmdbKey != "" {
-		out["TMDBApiKey"] = tmdbKey
+	if isAdmin {
+		out["HasTMDBApiKey"] = hasTMDBKey
+		if hasTMDBKey {
+			out["TMDBApiKey"] = maskedSecretPlaceholder
+		} else {
+			delete(out, "TMDBApiKey")
+		}
+		out["EnableDLNA"] = snap.EnableDLNA
+		out["DLNADefaultUserID"] = snap.DLNADefaultUserID
+		out["EnableQuickConnect"] = snap.EnableQuickConnect
+		out["EnableRemoteAccess"] = snap.IsGlobalRemoteAccessEnabled()
+		out["AllowedOrigins"] = nonNilStrings(snap.AllowedOrigins)
+		out["TrustedProxies"] = nonNilStrings(snap.TrustedProxies)
+		out["LocalNetworkSubnets"] = nonNilStrings(snap.LocalNetworkSubnets)
+		out["SimultaneousStreamLimit"] = snap.SimultaneousStreamLimit
+		out["RemoteClientBitrateLimit"] = snap.RemoteClientBitrateLimit
+		out["FFmpegPath"] = snap.FFmpegPath
+		out["FFprobePath"] = snap.FFprobePath
 	} else {
 		delete(out, "TMDBApiKey")
+		delete(out, "HasTMDBApiKey")
 	}
 	if tmdbLang != "" {
 		out["TMDBLanguage"] = tmdbLang
@@ -262,7 +457,28 @@ func (h *Handler) GetConfiguration(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, out)
 }
 
+func isTypedServerConfigKey(k string) bool {
+	switch k {
+	case "ServerName", "IsStartupWizardCompleted", "TMDBApiKey", "HasTMDBApiKey", "TMDBLanguage",
+		"EnableSTRM302", "PlayedThreshold", "EnableDLNA", "DLNADefaultUserID", "EnableQuickConnect",
+		"EnableRemoteAccess", "AllowedOrigins", "TrustedProxies", "LocalNetworkSubnets",
+		"SimultaneousStreamLimit", "RemoteClientBitrateLimit", "FFmpegPath", "FFprobePath":
+		return true
+	default:
+		return false
+	}
+}
+
 func (h *Handler) UpdateConfiguration(w http.ResponseWriter, r *http.Request) {
+	h.applyConfigurationUpdate(w, r)
+}
+
+// UpdateConfigurationPartial handles POST /System/Configuration/Partial with incremental merge semantics.
+func (h *Handler) UpdateConfigurationPartial(w http.ResponseWriter, r *http.Request) {
+	h.applyConfigurationUpdate(w, r)
+}
+
+func (h *Handler) applyConfigurationUpdate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]any
 	if err := httpx.DecodeJSONLimit(r, &body, 0); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid json body")
@@ -270,17 +486,24 @@ func (h *Handler) UpdateConfiguration(w http.ResponseWriter, r *http.Request) {
 	}
 	tmdbChanged := false
 	strmChanged := false
+	proxiesChanged := false
+	subnetsChanged := false
+	originsChanged := false
+	var newProxies, newSubnets, newOrigins []string
 
 	h.cfg.Update(func(c *config.Config) {
-		if v, ok := body["ServerName"].(string); ok && strings.TrimSpace(v) != "" {
+		if v, ok := body["ServerName"].(string); ok && strings.TrimSpace(v) != "" && !containsControl(v) {
 			c.ServerName = strings.TrimSpace(v)
 		}
 		if v, ok := body["IsStartupWizardCompleted"].(bool); ok {
 			c.IsStartupWizardCompleted = v
 		}
 		if v, ok := body["TMDBApiKey"].(string); ok {
-			c.TMDBApiKey = strings.TrimSpace(v)
-			tmdbChanged = true
+			trimmed := strings.TrimSpace(v)
+			if trimmed != maskedSecretPlaceholder {
+				c.TMDBApiKey = trimmed
+				tmdbChanged = true
+			}
 		}
 		if v, ok := body["TMDBLanguage"].(string); ok && strings.TrimSpace(v) != "" {
 			c.TMDBLanguage = strings.TrimSpace(v)
@@ -293,6 +516,56 @@ func (h *Handler) UpdateConfiguration(w http.ResponseWriter, r *http.Request) {
 		if v, ok := body["PlayedThreshold"].(float64); ok && v > 0 && v <= 1 {
 			c.PlayedThreshold = v
 		}
+		if v, ok := body["EnableDLNA"].(bool); ok {
+			c.EnableDLNA = v
+		}
+		if v, ok := body["DLNADefaultUserID"].(string); ok && !containsControl(v) {
+			c.DLNADefaultUserID = strings.TrimSpace(v)
+		}
+		if v, ok := body["EnableQuickConnect"].(bool); ok {
+			c.EnableQuickConnect = v
+		}
+		if v, ok := body["EnableRemoteAccess"].(bool); ok {
+			b := v
+			c.EnableRemoteAccessGlobal = &b
+		}
+		if raw, exists := body["AllowedOrigins"]; exists {
+			if list, ok := parseStringSliceField(raw); ok {
+				c.AllowedOrigins = list
+				newOrigins = append([]string(nil), list...)
+				originsChanged = true
+			}
+		}
+		if raw, exists := body["TrustedProxies"]; exists {
+			if list, ok := parseStringSliceField(raw); ok {
+				c.TrustedProxies = list
+				newProxies = append([]string(nil), list...)
+				proxiesChanged = true
+			}
+		}
+		if raw, exists := body["LocalNetworkSubnets"]; exists {
+			if list, ok := parseStringSliceField(raw); ok {
+				c.LocalNetworkSubnets = list
+				newSubnets = append([]string(nil), list...)
+				subnetsChanged = true
+			}
+		}
+		if raw, exists := body["SimultaneousStreamLimit"]; exists {
+			if n, ok := parseIntField(raw); ok && n >= 0 {
+				c.SimultaneousStreamLimit = n
+			}
+		}
+		if raw, exists := body["RemoteClientBitrateLimit"]; exists {
+			if n, ok := parseIntField(raw); ok && n >= 0 {
+				c.RemoteClientBitrateLimit = n
+			}
+		}
+		if v, ok := body["FFmpegPath"].(string); ok && strings.TrimSpace(v) != "" && !containsControl(v) {
+			c.FFmpegPath = strings.TrimSpace(v)
+		}
+		if v, ok := body["FFprobePath"].(string); ok && strings.TrimSpace(v) != "" && !containsControl(v) {
+			c.FFprobePath = strings.TrimSpace(v)
+		}
 	})
 	saveErr := h.cfg.Save()
 
@@ -301,13 +574,33 @@ func (h *Handler) UpdateConfiguration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if proxiesChanged {
+		netutil.SetTrustedProxies(newProxies)
+	}
+	if subnetsChanged {
+		netutil.SetLocalNetworkSubnets(newSubnets)
+	}
+	if originsChanged {
+		h.lifecycleMu.RLock()
+		wsHub := h.wsHub
+		h.lifecycleMu.RUnlock()
+		if wsHub != nil {
+			wsHub.SetAllowedOrigins(newOrigins)
+		}
+	}
+
 	h.extraConfigMu.Lock()
 	extra := h.loadExtraConfigLocked(r.Context())
 	extraDirty := false
 	for k, v := range body {
-		switch k {
-		case "ServerName", "IsStartupWizardCompleted", "TMDBApiKey", "TMDBLanguage", "EnableSTRM302", "PlayedThreshold":
+		if isTypedServerConfigKey(k) {
+			if _, hadLegacy := extra[k]; hadLegacy {
+				delete(extra, k)
+				extraDirty = true
+			}
 			continue
+		}
+		switch k {
 		case "PreferredMetadataLanguage", "MetadataCountryCode", "UICulture":
 			if s, ok := v.(string); ok {
 				extra[k] = strings.TrimSpace(s)
@@ -365,6 +658,10 @@ func (h *Handler) UpdateNamedConfiguration(w http.ResponseWriter, r *http.Reques
 		httpx.Error(w, http.StatusBadRequest, "missing configuration key")
 		return
 	}
+	if key == "partial" {
+		h.UpdateConfigurationPartial(w, r)
+		return
+	}
 	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, "failed to read request body")
@@ -409,6 +706,12 @@ func (h *Handler) GetActivityLogEntries(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
+	severity := strings.TrimSpace(q.Get("Severity"))
+	searchTerm := strings.TrimSpace(q.Get("SearchTerm"))
+	if searchTerm == "" {
+		searchTerm = strings.TrimSpace(q.Get("q"))
+	}
+
 	if h.userRepo == nil {
 		httpx.JSON(w, http.StatusOK, dto.QueryResult[ActivityLogEntryDto]{
 			Items:            []ActivityLogEntryDto{},
@@ -417,7 +720,7 @@ func (h *Handler) GetActivityLogEntries(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	recs, total, err := h.userRepo.ListActivityLogs(r.Context(), startIndex, limit, minDate)
+	recs, total, err := h.userRepo.ListActivityLogsFiltered(r.Context(), startIndex, limit, minDate, severity, searchTerm)
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to query activity logs")
 		return
@@ -470,10 +773,10 @@ func (h *Handler) GetBrandingCSS(w http.ResponseWriter, r *http.Request) {
 }
 
 type CultureDto struct {
-	Name                     string   `json:"Name"`
-	DisplayName              string   `json:"DisplayName"`
-	TwoLetterISOLanguageName string   `json:"TwoLetterISOLanguageName"`
-	ThreeLetterISOLanguageName string `json:"ThreeLetterISOLanguageName"`
+	Name                        string   `json:"Name"`
+	DisplayName                 string   `json:"DisplayName"`
+	TwoLetterISOLanguageName    string   `json:"TwoLetterISOLanguageName"`
+	ThreeLetterISOLanguageName  string   `json:"ThreeLetterISOLanguageName"`
 	ThreeLetterISOLanguageNames []string `json:"ThreeLetterISOLanguageNames"`
 }
 
@@ -570,12 +873,152 @@ func (h *Handler) GetFeatures(w http.ResponseWriter, _ *http.Request) {
 	httpx.JSON(w, http.StatusOK, []map[string]any{})
 }
 
+// GetConfigurationPages serves GET /web/ConfigurationPages with a valid empty JSON array.
+func (h *Handler) GetConfigurationPages(w http.ResponseWriter, _ *http.Request) {
+	httpx.JSON(w, http.StatusOK, []map[string]any{})
+}
+
+// RestartServer handles POST /System/Restart: marks pending restart, broadcasts ServerRestarting,
+// and triggers any registered instance or process hot-reload callback.
+func (h *Handler) RestartServer(w http.ResponseWriter, r *http.Request) {
+	h.pendingRestart.Store(true)
+	if h.userRepo != nil {
+		_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+			Name:     "Server restart requested",
+			Type:     "ServerRestart",
+			Severity: "Info",
+		})
+	}
+	h.lifecycleMu.RLock()
+	wsHub := h.wsHub
+	onRestart := h.onRestart
+	h.lifecycleMu.RUnlock()
+	if wsHub != nil {
+		wsHub.Broadcast(ws.Message{MessageType: "ServerRestarting"})
+	}
+	if onRestart != nil {
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			onRestart()
+		}()
+	} else {
+		TriggerProcessRestart()
+	}
+	httpx.NoContent(w)
+}
+
+// ShutdownServer handles POST /System/Shutdown: marks shutting-down state, broadcasts ServerShuttingDown,
+// and triggers any registered instance or process shutdown callback.
+func (h *Handler) ShutdownServer(w http.ResponseWriter, r *http.Request) {
+	h.shuttingDown.Store(true)
+	if h.userRepo != nil {
+		_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+			Name:     "Server shutdown requested",
+			Type:     "ServerShutdown",
+			Severity: "Info",
+		})
+	}
+	h.lifecycleMu.RLock()
+	wsHub := h.wsHub
+	onShutdown := h.onShutdown
+	h.lifecycleMu.RUnlock()
+	if wsHub != nil {
+		wsHub.Broadcast(ws.Message{MessageType: "ServerShuttingDown"})
+	}
+	if onShutdown != nil {
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			onShutdown()
+		}()
+	} else {
+		TriggerProcessShutdown()
+	}
+	httpx.NoContent(w)
+}
+
 func (h *Handler) GetPlugins(w http.ResponseWriter, _ *http.Request) {
 	if h.registry == nil {
 		httpx.JSON(w, http.StatusOK, []plugins.Manifest{})
 		return
 	}
 	httpx.JSON(w, http.StatusOK, h.registry.List())
+}
+
+func containsControl(s string) bool {
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			return true
+		}
+	}
+	return false
+}
+
+func isValidDNSName(h string) bool {
+	if len(h) == 0 || len(h) > 253 {
+		return false
+	}
+	if strings.HasPrefix(h, ".") || strings.HasSuffix(h, ".") {
+		return false
+	}
+	labels := strings.Split(h, ".")
+	for _, lbl := range labels {
+		if len(lbl) == 0 || len(lbl) > 63 {
+			return false
+		}
+		if lbl[0] == '-' || lbl[len(lbl)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(lbl); i++ {
+			ch := lbl[i]
+			if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func sanitizeRequestHost(rawHost, fallbackHTTPAddr string) string {
+	fallback := "localhost:" + strconv.Itoa(parsePort(fallbackHTTPAddr, 8096))
+	s := strings.TrimSpace(rawHost)
+	if s == "" || len(s) > 255 || containsControl(s) {
+		return fallback
+	}
+	if strings.ContainsAny(s, " \t/@?#\\%'\"<>") {
+		return fallback
+	}
+
+	if hostPart, portPart, err := net.SplitHostPort(s); err == nil {
+		portNum, pErr := strconv.Atoi(portPart)
+		if pErr != nil || portNum < 1 || portNum > 65535 {
+			return fallback
+		}
+		if addr, ipErr := netip.ParseAddr(hostPart); ipErr == nil {
+			if addr.Is6() {
+				return "[" + addr.String() + "]:" + strconv.Itoa(portNum)
+			}
+			return addr.String() + ":" + strconv.Itoa(portNum)
+		}
+		if isValidDNSName(hostPart) {
+			return hostPart + ":" + strconv.Itoa(portNum)
+		}
+		return fallback
+	}
+
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		inner := s[1 : len(s)-1]
+		if addr, ipErr := netip.ParseAddr(inner); ipErr == nil && addr.Is6() {
+			return "[" + addr.String() + "]"
+		}
+		return fallback
+	}
+	if addr, ipErr := netip.ParseAddr(s); ipErr == nil && addr.Is4() {
+		return addr.String()
+	}
+	if isValidDNSName(s) {
+		return s
+	}
+	return fallback
 }
 
 func (h *Handler) buildPublicInfo(r *http.Request) dto.PublicSystemInfo {
@@ -597,10 +1040,7 @@ func (h *Handler) buildPublicInfo(r *http.Request) dto.PublicSystemInfo {
 			scheme = "https"
 		}
 	}
-	host := r.Host
-	if host == "" {
-		host = "localhost" + httpAddr
-	}
+	host := sanitizeRequestHost(r.Host, httpAddr)
 	return dto.PublicSystemInfo{
 		LocalAddress: scheme + "://" + host,
 		ServerName:   serverName,

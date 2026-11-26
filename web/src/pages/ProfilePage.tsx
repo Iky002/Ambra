@@ -103,13 +103,17 @@ export function ProfilePage() {
   } | null>(null)
 
   // 播放偏好（优先与账号 UserConfiguration 同步，localStorage 作本地缓存）
-  const [prefs, setPrefs] = useState<PlaybackPrefs>(() => loadPlaybackPrefs())
+  const [prefs, setPrefs] = useState<PlaybackPrefs>(() => loadPlaybackPrefs(userId))
+
+  useEffect(() => {
+    setPrefs(loadPlaybackPrefs(userId))
+  }, [userId])
 
   useEffect(() => {
     if (user?.Configuration && prefsInFlightRef.current === 0) {
-      setPrefs(syncPlaybackPrefsFromUserConfig(user.Configuration))
+      setPrefs(syncPlaybackPrefsFromUserConfig(user.Configuration, userId))
     }
-  }, [user?.Configuration])
+  }, [user?.Configuration, userId])
 
   useEffect(() => {
     setAvatarError(false)
@@ -280,10 +284,24 @@ export function ProfilePage() {
 
   const handlePrefsChange = (patch: Partial<PlaybackPrefs>) => {
     const seq = ++prefsSeqRef.current
-    const updated = savePlaybackPrefs(patch)
+    const updated = savePlaybackPrefs(patch, userId)
     setPrefs(updated)
     prefsQueueRef.current = { nextPrefs: updated, seq }
     void drainPrefsQueue()
+  }
+
+  const handleSelectLocale = (code: typeof locale) => {
+    setLocale(code)
+    if (!userId) return
+    const nextCfg = {
+      ...playbackPrefsToUserConfig(prefs, userConfigRef.current),
+      UICulture: code,
+    }
+    userConfigRef.current = nextCfg
+    void api
+      .updateUserConfiguration(userId, nextCfg)
+      .then(() => refreshUser())
+      .catch(() => undefined)
   }
 
   if (!auth) return null
@@ -420,7 +438,7 @@ export function ProfilePage() {
                 type="button"
                 role="radio"
                 aria-checked={active}
-                onClick={() => setLocale(item.code)}
+                onClick={() => handleSelectLocale(item.code)}
                 className={`inline-flex items-center gap-2 rounded-xl border px-3.5 py-2 text-xs font-medium transition-colors ${
                   active
                     ? 'border-amber-400/60 bg-amber-500/20 text-amber-200 ring-1 ring-amber-400/30'

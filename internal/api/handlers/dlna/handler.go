@@ -1,6 +1,7 @@
 package dlna
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/hmac"
@@ -14,12 +15,14 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -29,9 +32,12 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
+	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -99,6 +105,7 @@ type eventSubscription struct {
 	UUID      string
 	Callback  string
 	ClientIP  string
+	Seq       uint32
 	ExpiresAt time.Time
 }
 
@@ -109,13 +116,17 @@ type dlnaRateWindow struct {
 
 // Handler implements Emby-compatible DLNA Profile management and UPnP MediaServer:1 endpoints.
 type Handler struct {
-	cfg           *config.Config
-	libRepo       *sqlite.LibraryRepo
-	store         *sqlite.Store
-	userRepo      *sqlite.UserRepo
-	defaultUserID string
-	auth          AuthFuncs
-	streamSecret  []byte
+	cfg                       *config.Config
+	libRepo                   *sqlite.LibraryRepo
+	store                     *sqlite.Store
+	userRepo                  *sqlite.UserRepo
+	transcodeMgr              *transcode.Manager
+	defaultUserID             string
+	auth                      AuthFuncs
+	streamSecret              []byte
+	streamResolverWithHeaders func(ctx context.Context, rawPath string) (*plugins.StreamResolveResult, error)
+	proxyClient               *http.Client
+	notifyClient              *http.Client
 
 	soapRateMu sync.Mutex
 	soapRates  map[string]*dlnaRateWindow
@@ -124,12 +135,14 @@ type Handler struct {
 	profiles      map[string]DlnaProfile
 	subscriptions map[string]eventSubscription
 	systemUpdate  uint32
+	notifySem     chan struct{}
 }
 
 // New constructs a DLNA handler backed by LibraryRepo and optional SQLite Store for profile persistence.
 func New(cfg *config.Config, libRepo *sqlite.LibraryRepo, store *sqlite.Store) *Handler {
 	if cfg == nil {
 		cfg = config.Default("./data")
+		cfg.EnableDLNA = true
 	}
 	randBytes := make([]byte, 32)
 	_, _ = rand.Read(randBytes)
@@ -142,10 +155,13 @@ func New(cfg *config.Config, libRepo *sqlite.LibraryRepo, store *sqlite.Store) *
 		libRepo:       libRepo,
 		store:         store,
 		streamSecret:  secretSum[:],
+		proxyClient:   netutil.NewSafeHTTPClient(0, true),
+		notifyClient:  newDLNALANCallbackClient(3 * time.Second),
 		soapRates:     make(map[string]*dlnaRateWindow),
 		profiles:      make(map[string]DlnaProfile),
 		subscriptions: make(map[string]eventSubscription),
 		systemUpdate:  1,
+		notifySem:     make(chan struct{}, 8),
 	}
 	def := DefaultProfile()
 	h.profiles[def.Id] = def
@@ -165,6 +181,38 @@ func (h *Handler) SetDefaultUserID(userID string) {
 	h.mu.Lock()
 	h.defaultUserID = guid.Normalize(userID)
 	h.mu.Unlock()
+}
+
+// SetTranscodeManager attaches an optional transcode Manager for global stream limit coordination.
+func (h *Handler) SetTranscodeManager(mgr *transcode.Manager) {
+	h.mu.Lock()
+	h.transcodeMgr = mgr
+	h.mu.Unlock()
+}
+
+// SetStreamResolverWithHeaders attaches a .strm resolver returning target URL and custom HTTP headers.
+func (h *Handler) SetStreamResolverWithHeaders(fn func(ctx context.Context, rawPath string) (*plugins.StreamResolveResult, error)) {
+	h.mu.Lock()
+	h.streamResolverWithHeaders = fn
+	h.mu.Unlock()
+}
+
+// SetProxyClient overrides the HTTP client used for server-side .strm reverse-proxying (primarily for tests).
+func (h *Handler) SetProxyClient(client *http.Client) {
+	if client != nil {
+		h.mu.Lock()
+		h.proxyClient = client
+		h.mu.Unlock()
+	}
+}
+
+// SetNotifyClient overrides the HTTP client used for UPnP GENA NOTIFY callbacks (primarily for tests).
+func (h *Handler) SetNotifyClient(client *http.Client) {
+	if client != nil {
+		h.mu.Lock()
+		h.notifyClient = client
+		h.mu.Unlock()
+	}
 }
 
 // DefaultProfile returns the built-in default DLNA device profile.
@@ -586,7 +634,7 @@ func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	item, mediaPath, err := h.resolveDLNAMediaPath(r.Context(), itemID)
+	item, mediaPath, err := h.resolveDLNAMediaPathForRequest(r.Context(), r, itemID)
 	if errors.Is(err, sqlite.ErrNotFound) {
 		httpx.Error(w, http.StatusNotFound, "media item not found")
 		return
@@ -594,10 +642,6 @@ func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		slog.Error("dlna: failed to resolve media path", "itemId", itemID, "err", err)
 		httpx.Error(w, http.StatusInternalServerError, "failed to load media item")
-		return
-	}
-	if (item != nil && item.IsStrm) || strings.EqualFold(filepath.Ext(mediaPath), ".strm") {
-		httpx.Error(w, http.StatusForbidden, "direct download of .strm files is not permitted")
 		return
 	}
 
@@ -611,12 +655,38 @@ func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	realPath = filepath.Clean(realPath)
-	if strings.EqualFold(filepath.Ext(realPath), ".strm") {
-		httpx.Error(w, http.StatusForbidden, "direct download of .strm files is not permitted")
-		return
-	}
 	if !h.isPathWithinRegisteredLibraries(r.Context(), realPath) {
 		httpx.Error(w, http.StatusForbidden, "media file path is outside registered libraries")
+		return
+	}
+
+	wantTranscode := q.Get("transcode") == "1" || strings.EqualFold(q.Get("transcode"), "true")
+	if !wantTranscode && q.Get("profile") != "" {
+		wantTranscode = !h.profileSupportsContainer(q.Get("profile"), item, realPath)
+	}
+
+	// [H-02] Server-side safe reverse proxy for .strm files (never 302 redirect exposing signed upstream URLs).
+	if (item != nil && item.IsStrm) || strings.EqualFold(filepath.Ext(mediaPath), ".strm") || strings.EqualFold(filepath.Ext(realPath), ".strm") {
+		targetURL, headers, strmErr := h.resolveDLNAStrmTarget(r.Context(), realPath)
+		if strmErr != nil {
+			httpx.Error(w, http.StatusForbidden, "invalid or disallowed strm stream target")
+			return
+		}
+		if wantTranscode {
+			h.streamDLNATranscode(w, r, item, targetURL, headers)
+			return
+		}
+		h.proxyDLNARemoteStream(w, r, targetURL, headers)
+		return
+	}
+
+	if wantTranscode {
+		fi, stErr := os.Stat(realPath)
+		if stErr != nil || fi.IsDir() {
+			httpx.Error(w, http.StatusNotFound, "media file not found")
+			return
+		}
+		h.streamDLNATranscode(w, r, item, realPath, nil)
 		return
 	}
 
@@ -653,10 +723,240 @@ func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
 }
 
+func (h *Handler) resolveDLNAStrmTarget(ctx context.Context, realStrmPath string) (string, map[string]string, error) {
+	h.mu.RLock()
+	resolver := h.streamResolverWithHeaders
+	h.mu.RUnlock()
+
+	var (
+		targetURL string
+		headers   map[string]string
+	)
+	if resolver != nil {
+		res, err := resolver(ctx, realStrmPath)
+		if err != nil || res == nil {
+			return "", nil, errors.New("strm resolve failed")
+		}
+		targetURL = strings.TrimSpace(res.URL)
+		headers = res.Headers
+	} else {
+		f, err := os.Open(realStrmPath)
+		if err != nil {
+			return "", nil, err
+		}
+		defer f.Close()
+		sc := bufio.NewScanner(f)
+		for sc.Scan() {
+			line := strings.TrimSpace(strings.TrimPrefix(sc.Text(), "\uFEFF"))
+			if line != "" && !strings.HasPrefix(line, "#") {
+				targetURL = strings.ReplaceAll(line, " ", "%20")
+				break
+			}
+		}
+	}
+	parsed, err := url.Parse(targetURL)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", nil, errors.New("invalid strm url")
+	}
+	// Reject embedded URL userinfo credentials to prevent leaking or abusing basic-auth URLs.
+	if parsed.User != nil {
+		return "", nil, errors.New("embedded credentials in strm url are disallowed")
+	}
+	if err := netutil.ValidateRemoteURL(targetURL, true); err != nil {
+		return "", nil, err
+	}
+	return targetURL, headers, nil
+}
+
+func (h *Handler) proxyDLNARemoteStream(w http.ResponseWriter, r *http.Request, targetURL string, headers map[string]string) {
+	upReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, nil)
+	if err != nil {
+		httpx.Error(w, http.StatusBadGateway, "invalid upstream stream url")
+		return
+	}
+	for k, v := range headers {
+		key := strings.TrimSpace(k)
+		val := strings.TrimSpace(v)
+		if key == "" || val == "" || strings.ContainsAny(key, "\r\n\x00") || strings.ContainsAny(val, "\r\n\x00") {
+			continue
+		}
+		switch strings.ToLower(key) {
+		case "user-agent", "referer", "cookie", "authorization", "origin":
+			upReq.Header.Set(key, val)
+		}
+	}
+	if rng := r.Header.Get("Range"); rng != "" {
+		upReq.Header.Set("Range", rng)
+	}
+	if ifRange := r.Header.Get("If-Range"); ifRange != "" {
+		upReq.Header.Set("If-Range", ifRange)
+	}
+	if upReq.Header.Get("User-Agent") == "" {
+		upReq.Header.Set("User-Agent", "Ambra-DLNA-Proxy/1.0")
+	}
+
+	h.mu.RLock()
+	client := h.proxyClient
+	h.mu.RUnlock()
+	if client == nil {
+		client = netutil.NewSafeHTTPClient(0, true)
+	}
+
+	resp, err := client.Do(upReq)
+	if err != nil {
+		slog.Error("dlna: upstream strm proxy failed", "err", err)
+		httpx.Error(w, http.StatusBadGateway, "upstream stream error")
+		return
+	}
+	defer resp.Body.Close()
+
+	for _, hdr := range []string{"Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"} {
+		if val := resp.Header.Get(hdr); val != "" {
+			w.Header().Set(hdr, val)
+		}
+	}
+	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if ct == "" {
+		if u, uErr := url.Parse(targetURL); uErr == nil {
+			ct = dlnaMediaContentType(u.Path)
+		}
+	}
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("SERVER", defaultServerHeader)
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(resp.StatusCode)
+	if r.Method != http.MethodHead {
+		_, _ = io.Copy(w, resp.Body)
+	}
+}
+
+func (h *Handler) profileSupportsContainer(profileID string, item *sqlite.ItemRecord, mediaPath string) bool {
+	h.mu.RLock()
+	p, ok := h.profiles[canonicalProfileID(profileID)]
+	h.mu.RUnlock()
+	if !ok {
+		p = DefaultProfile()
+	}
+	if len(p.DirectPlayProfiles) == 0 {
+		return true
+	}
+	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(mediaPath), "."))
+	if ext == "" && item != nil {
+		ext = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(item.Container), "."))
+	}
+	if ext == "" {
+		return true
+	}
+	mediaType := "Video"
+	if item != nil && strings.TrimSpace(item.MediaType) != "" {
+		mediaType = item.MediaType
+	}
+	for _, dp := range p.DirectPlayProfiles {
+		dpType, _ := dp["Type"].(string)
+		if dpType != "" && !strings.EqualFold(dpType, mediaType) {
+			continue
+		}
+		containers, _ := dp["Container"].(string)
+		if containers == "" {
+			return true
+		}
+		for _, c := range strings.Split(containers, ",") {
+			c = strings.ToLower(strings.TrimSpace(c))
+			if c == "*" || c == ext {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (h *Handler) streamDLNATranscode(w http.ResponseWriter, r *http.Request, item *sqlite.ItemRecord, mediaInput string, headers map[string]string) {
+	isAudio := item != nil && (strings.EqualFold(item.MediaType, "Audio") || strings.EqualFold(item.Type, "Audio"))
+	ct := "video/mp2t"
+	if isAudio {
+		ct = "audio/mpeg"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("SERVER", defaultServerHeader)
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	h.mu.RLock()
+	mgr := h.transcodeMgr
+	h.mu.RUnlock()
+	if h.cfg != nil && mgr != nil {
+		if limit := h.cfg.Snapshot().SimultaneousStreamLimit; limit > 0 {
+			release, allowed := mgr.TryAcquireStreamSlot(limit, "")
+			if !allowed {
+				httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
+				return
+			}
+			defer release()
+		}
+	}
+
+	ffInput := mediaInput
+	if strings.HasPrefix(strings.ToLower(mediaInput), "http://") || strings.HasPrefix(strings.ToLower(mediaInput), "https://") {
+		proxy, err := transcode.StartLoopbackStreamProxy(transcode.LoopbackProxyOptions{
+			TargetURL:       mediaInput,
+			Headers:         headers,
+			AllowPrivateLAN: true,
+		})
+		if err != nil {
+			httpx.Error(w, http.StatusBadGateway, "blocked upstream stream url")
+			return
+		}
+		defer proxy.Close()
+		ffInput = proxy.URL()
+	}
+
+	ffmpegPath := "ffmpeg"
+	if h.cfg != nil && h.cfg.Snapshot().FFmpegPath != "" {
+		ffmpegPath = h.cfg.Snapshot().FFmpegPath
+	}
+
+	var args []string
+	if strings.HasPrefix(strings.ToLower(ffInput), "http://") || strings.HasPrefix(strings.ToLower(ffInput), "https://") {
+		args = append(args, "-hide_banner", "-loglevel", "error", "-protocol_whitelist", "http,https,tcp,tls,crypto", "-max_redirects", "0", "-rw_timeout", "15000000", "-i", ffInput)
+	} else {
+		args = append(args, "-hide_banner", "-loglevel", "error", "-protocol_whitelist", "file,crypto,data", "-i", ffInput)
+	}
+	if isAudio {
+		args = append(args, "-vn", "-c:a", "libmp3lame", "-b:a", "192000", "-f", "mp3", "pipe:1")
+	} else {
+		args = append(args, "-sn", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-b:v", "4000000", "-c:a", "aac", "-b:a", "192000", "-ac", "2", "-f", "mpegts", "pipe:1")
+	}
+
+	cmd := exec.CommandContext(r.Context(), ffmpegPath, args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to start dlna transcode")
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to start dlna transcode")
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, stdout)
+	_ = cmd.Wait()
+}
+
 func (h *Handler) resolveDLNAMediaPath(ctx context.Context, itemID string) (*sqlite.ItemRecord, string, error) {
+	return h.resolveDLNAMediaPathForRequest(ctx, nil, itemID)
+}
+
+func (h *Handler) resolveDLNAMediaPathForRequest(ctx context.Context, r *http.Request, itemID string) (*sqlite.ItemRecord, string, error) {
 	item, itemErr := h.libRepo.GetItemRecordByID(ctx, itemID)
 	if itemErr == nil && item != nil {
-		if !h.isDLNAVisibleItem(ctx, item.Type, item.ID) || !h.isItemAllowedByDefaultPolicy(ctx, item) {
+		policy, denyAll := h.resolvePolicyForRequest(ctx, r)
+		if denyAll || !h.isDLNAVisibleItem(ctx, item.Type, item.ID) || !h.isItemAllowedByPolicy(ctx, item, policy) {
 			return nil, "", sqlite.ErrNotFound
 		}
 	}
@@ -708,23 +1008,198 @@ func (h *Handler) isPathWithinRegisteredLibraries(ctx context.Context, realTarge
 	return false
 }
 
+func isRestrictedUserPolicy(p dto.UserPolicy) bool {
+	return !p.EnableAllFolders ||
+		p.MaxParentalRating != nil ||
+		len(p.BlockedTags) > 0 ||
+		len(p.BlockUnratedItems) > 0 ||
+		len(p.AllowedTags) > 0
+}
+
+// buildStrictestIntersectionPolicy computes the least-privilege intersection across all active users:
+//   - Only libraries accessible to ALL active users are allowed;
+//   - Minimum MaxParentalRating across all rated users;
+//   - Union of all BlockedTags and BlockUnratedItems;
+//   - Intersection of non-empty AllowedTags sets.
+func buildStrictestIntersectionPolicy(users []*sqlite.UserRecord) (*dto.UserPolicy, bool) {
+	var (
+		hasRestricted bool
+		activeCount   int
+		folderInit    bool
+		folderSet     map[string]bool
+		minRating     *int
+		blockedTags   = make(map[string]string)
+		blockUnrated  = make(map[string]string)
+		allowedInit   bool
+		allowedSet    map[string]string
+	)
+	for _, u := range users {
+		if u == nil || u.IsDisabled {
+			continue
+		}
+		activeCount++
+		if u.IsAdmin || u.Policy.IsAdministrator {
+			continue
+		}
+		if !isRestrictedUserPolicy(u.Policy) {
+			continue
+		}
+		hasRestricted = true
+		p := u.Policy
+		if !p.EnableAllFolders {
+			cur := make(map[string]bool, len(p.EnabledFolders))
+			for _, fid := range p.EnabledFolders {
+				if norm := guid.Normalize(fid); norm != "" {
+					cur[norm] = true
+				}
+			}
+			if !folderInit {
+				folderSet = cur
+				folderInit = true
+			} else {
+				for k := range folderSet {
+					if !cur[k] {
+						delete(folderSet, k)
+					}
+				}
+			}
+		}
+		if p.MaxParentalRating != nil {
+			val := *p.MaxParentalRating
+			if minRating == nil || val < *minRating {
+				vCopy := val
+				minRating = &vCopy
+			}
+		}
+		for _, t := range p.BlockedTags {
+			if s := strings.TrimSpace(t); s != "" {
+				blockedTags[strings.ToLower(s)] = s
+			}
+		}
+		for _, b := range p.BlockUnratedItems {
+			if s := strings.TrimSpace(b); s != "" {
+				blockUnrated[strings.ToLower(s)] = s
+			}
+		}
+		if len(p.AllowedTags) > 0 {
+			curAllow := make(map[string]string, len(p.AllowedTags))
+			for _, at := range p.AllowedTags {
+				if s := strings.TrimSpace(at); s != "" {
+					curAllow[strings.ToLower(s)] = s
+				}
+			}
+			if !allowedInit {
+				allowedSet = curAllow
+				allowedInit = true
+			} else {
+				for k := range allowedSet {
+					if _, ok := curAllow[k]; !ok {
+						delete(allowedSet, k)
+					}
+				}
+			}
+		}
+	}
+	if activeCount == 0 || !hasRestricted {
+		return nil, false
+	}
+	if allowedInit && len(allowedSet) == 0 {
+		return nil, true
+	}
+
+	out := dto.UserPolicy{
+		EnableAllFolders:  !folderInit,
+		MaxParentalRating: minRating,
+	}
+	if folderInit {
+		out.EnabledFolders = make([]string, 0, len(folderSet))
+		for k := range folderSet {
+			out.EnabledFolders = append(out.EnabledFolders, k)
+		}
+		sort.Strings(out.EnabledFolders)
+	}
+	for _, v := range blockedTags {
+		out.BlockedTags = append(out.BlockedTags, v)
+	}
+	sort.Strings(out.BlockedTags)
+	for _, v := range blockUnrated {
+		out.BlockUnratedItems = append(out.BlockUnratedItems, v)
+	}
+	sort.Strings(out.BlockUnratedItems)
+	if allowedInit {
+		for _, v := range allowedSet {
+			out.AllowedTags = append(out.AllowedTags, v)
+		}
+		sort.Strings(out.AllowedTags)
+	}
+	return &out, false
+}
+
+func (h *Handler) resolvePolicyForRequest(ctx context.Context, r *http.Request) (policy *dto.UserPolicy, denyAll bool) {
+	// 1. Check explicit authenticated token/user in request context first.
+	if r != nil {
+		if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+			if ac.IsAdmin() {
+				return nil, false
+			}
+			h.mu.RLock()
+			ur := h.userRepo
+			h.mu.RUnlock()
+			if ur != nil {
+				u, err := ur.GetUserByID(ctx, guid.Normalize(ac.UserID()))
+				if err != nil || u == nil || u.IsDisabled {
+					return nil, true
+				}
+				if u.IsAdmin || u.Policy.IsAdministrator {
+					return nil, false
+				}
+				p := u.Policy
+				return &p, false
+			}
+			if ac.User != nil {
+				if ac.User.IsDisabled {
+					return nil, true
+				}
+				p := ac.User.Policy
+				return &p, false
+			}
+		}
+	}
+	return h.resolveDefaultUserPolicy(ctx)
+}
+
 func (h *Handler) resolveDefaultUserPolicy(ctx context.Context) (policy *dto.UserPolicy, denyAll bool) {
 	h.mu.RLock()
 	uid := h.defaultUserID
 	ur := h.userRepo
 	h.mu.RUnlock()
-	if uid == "" || ur == nil {
+	if uid == "" {
+		uid = guid.Normalize(h.cfgSnapshot().DLNADefaultUserID)
+	}
+	if uid != "" {
+		if ur == nil {
+			return nil, true
+		}
+		u, err := ur.GetUserByID(ctx, uid)
+		if err != nil || u == nil || u.IsDisabled {
+			return nil, true
+		}
+		if u.IsAdmin || u.Policy.IsAdministrator {
+			return nil, false
+		}
+		p := u.Policy
+		return &p, false
+	}
+	// [H-02] Unauthenticated DLNA without configured DLNADefaultUserID:
+	// inspect all users and enforce the strictest intersection if any restricted non-admin user exists.
+	if ur == nil {
 		return nil, false
 	}
-	u, err := ur.GetUserByID(ctx, uid)
-	if err != nil || u == nil || u.IsDisabled {
+	users, err := ur.ListUsers(ctx)
+	if err != nil {
 		return nil, true
 	}
-	if u.IsAdmin || u.Policy.IsAdministrator {
-		return nil, false
-	}
-	p := u.Policy
-	return &p, false
+	return buildStrictestIntersectionPolicy(users)
 }
 
 func (h *Handler) isLibraryAllowedByPolicy(libID string, policy *dto.UserPolicy) bool {
@@ -743,6 +1218,91 @@ func (h *Handler) isLibraryAllowedByPolicy(libID string, policy *dto.UserPolicy)
 	return false
 }
 
+func matchesDLNABlockUnrated(itemType, mediaType string, blockUnrated []string) bool {
+	if strings.EqualFold(itemType, "CollectionFolder") ||
+		strings.EqualFold(itemType, "Folder") ||
+		strings.EqualFold(itemType, "UserView") {
+		return false
+	}
+	for _, b := range blockUnrated {
+		t := strings.TrimSpace(b)
+		if t == "" {
+			continue
+		}
+		if t == "*" || strings.EqualFold(t, "All") || strings.EqualFold(t, itemType) || (mediaType != "" && strings.EqualFold(t, mediaType)) {
+			return true
+		}
+		if strings.EqualFold(t, "Series") && (strings.EqualFold(itemType, "Season") || strings.EqualFold(itemType, "Episode")) {
+			return true
+		}
+		if strings.EqualFold(t, "Music") && (strings.EqualFold(itemType, "Audio") || strings.EqualFold(itemType, "MusicAlbum") || strings.EqualFold(itemType, "MusicArtist") || strings.EqualFold(mediaType, "Audio")) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) isItemAllowedByPolicy(ctx context.Context, rec *sqlite.ItemRecord, policy *dto.UserPolicy) bool {
+	if rec == nil {
+		return false
+	}
+	if policy == nil {
+		return true
+	}
+	if rec.LibraryID != "" && !strings.EqualFold(rec.Type, "Playlist") && !strings.EqualFold(rec.Type, "BoxSet") && !h.isLibraryAllowedByPolicy(rec.LibraryID, policy) {
+		return false
+	}
+	if h.libRepo != nil && (policy.MaxParentalRating != nil || len(policy.BlockedTags) > 0) {
+		if blocked, err := h.libRepo.IsItemBlockedByParentalPolicy(ctx, rec, policy.MaxParentalRating, policy.BlockedTags); err != nil || blocked {
+			return false
+		}
+	}
+	if len(policy.BlockUnratedItems) > 0 && matchesDLNABlockUnrated(rec.Type, rec.MediaType, policy.BlockUnratedItems) {
+		rating := strings.TrimSpace(rec.OfficialRating)
+		if rating == "" && rec.SeriesID != "" && h.libRepo != nil {
+			if sRec, sErr := h.libRepo.GetItemRecordByID(ctx, rec.SeriesID); sErr == nil && sRec != nil {
+				rating = strings.TrimSpace(sRec.OfficialRating)
+			}
+		}
+		if rating == "" {
+			return false
+		}
+	}
+	if len(policy.AllowedTags) > 0 && h.libRepo != nil {
+		allowSet := make(map[string]bool, len(policy.AllowedTags))
+		for _, at := range policy.AllowedTags {
+			if s := strings.ToLower(strings.TrimSpace(at)); s != "" {
+				allowSet[s] = true
+			}
+		}
+		if len(allowSet) > 0 {
+			matched := false
+			checkIDs := []string{rec.ID}
+			if rec.SeriesID != "" {
+				checkIDs = append(checkIDs, rec.SeriesID)
+			}
+			for _, cid := range checkIDs {
+				_, _, tags, err := h.libRepo.GetTaxonomiesByItemID(ctx, cid)
+				if err == nil {
+					for _, tg := range tags {
+						if allowSet[strings.ToLower(strings.TrimSpace(tg))] {
+							matched = true
+							break
+						}
+					}
+				}
+				if matched {
+					break
+				}
+			}
+			if !matched {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func (h *Handler) isItemAllowedByDefaultPolicy(ctx context.Context, rec *sqlite.ItemRecord) bool {
 	if rec == nil {
 		return false
@@ -751,18 +1311,7 @@ func (h *Handler) isItemAllowedByDefaultPolicy(ctx context.Context, rec *sqlite.
 	if denyAll {
 		return false
 	}
-	if policy == nil {
-		return true
-	}
-	if rec.LibraryID != "" && !h.isLibraryAllowedByPolicy(rec.LibraryID, policy) {
-		return false
-	}
-	if h.libRepo != nil && (policy.MaxParentalRating != nil || len(policy.BlockedTags) > 0) {
-		if blocked, err := h.libRepo.IsItemBlockedByParentalPolicy(ctx, rec, policy.MaxParentalRating, policy.BlockedTags); err != nil || blocked {
-			return false
-		}
-	}
-	return true
+	return h.isItemAllowedByPolicy(ctx, rec, policy)
 }
 
 func dlnaMediaContentType(path string) string {
@@ -820,34 +1369,98 @@ func normalizeDLNARateIP(raw string) string {
 	return addr.String()
 }
 
-func isValidDLNACallback(raw string) bool {
+func parseCallbackURLs(raw string) ([]string, bool) {
 	s := strings.TrimSpace(raw)
 	if s == "" || len(s) > maxDLNACallbackLen {
-		return false
+		return nil, false
 	}
-	found := 0
+	var urls []string
 	for len(s) > 0 {
 		s = strings.TrimSpace(s)
 		if !strings.HasPrefix(s, "<") {
-			return false
+			return nil, false
 		}
 		end := strings.IndexByte(s, '>')
 		if end <= 1 {
-			return false
+			return nil, false
 		}
 		rawURL := strings.TrimSpace(s[1:end])
 		u, err := url.Parse(rawURL)
 		if err != nil {
-			return false
+			return nil, false
 		}
 		scheme := strings.ToLower(u.Scheme)
-		if (scheme != "http" && scheme != "https") || u.Host == "" {
-			return false
+		if (scheme != "http" && scheme != "https") || u.Host == "" || u.User != nil {
+			return nil, false
 		}
-		found++
+		host := strings.Trim(strings.TrimSpace(u.Hostname()), "[]")
+		if host == "" || strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost") {
+			return nil, false
+		}
+		if addr, addrErr := netip.ParseAddr(host); addrErr == nil {
+			if err := validateDLNALANCallbackAddr(addr); err != nil {
+				return nil, false
+			}
+		}
+		urls = append(urls, rawURL)
 		s = s[end+1:]
 	}
-	return found > 0
+	return urls, len(urls) > 0
+}
+
+func isValidDLNACallback(raw string) bool {
+	_, ok := parseCallbackURLs(raw)
+	return ok
+}
+
+// validateDLNALANCallbackAddr enforces LAN-only UPnP GENA callbacks:
+// strictly requires private RFC1918 / IPv6 ULA addresses, blocking loopback, link-local metadata, multicast, and public IPs.
+func validateDLNALANCallbackAddr(addr netip.Addr) error {
+	addr = addr.WithZone("").Unmap()
+	if !addr.IsValid() || addr.IsUnspecified() || addr.IsLoopback() || addr.IsMulticast() {
+		return errors.New("dlna callback address cannot be loopback, unspecified, or multicast")
+	}
+	// Block cloud metadata 169.254.169.254 explicitly; allow only RFC1918 / RFC4193 private LAN addresses.
+	if !addr.IsPrivate() {
+		return errors.New("dlna callback address must be a private LAN IP")
+	}
+	return nil
+}
+
+func newDLNALANCallbackClient(timeout time.Duration) *http.Client {
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	dialer := &net.Dialer{Timeout: timeout}
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+			if err != nil || len(ips) == 0 {
+				return nil, fmt.Errorf("resolve callback host: %w", err)
+			}
+			for _, ip := range ips {
+				if vErr := validateDLNALANCallbackAddr(ip); vErr != nil {
+					return nil, vErr
+				}
+			}
+			target := net.JoinHostPort(ips[0].Unmap().String(), port)
+			return dialer.DialContext(ctx, network, target)
+		},
+		TLSHandshakeTimeout:   timeout,
+		ResponseHeaderTimeout: timeout,
+		DisableKeepAlives:     true,
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: tr,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }
 
 func (h *Handler) allowSOAPRequest(r *http.Request) bool {
@@ -892,9 +1505,9 @@ func (h *Handler) handleEventSubscribe(service string) http.HandlerFunc {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 
-		// Prune expired subscriptions before processing renewal or creation.
+		// Prune expired subscriptions before checking maxDLNASubscriptions or processing renewal.
 		for k, sub := range h.subscriptions {
-			if !sub.ExpiresAt.After(now) {
+			if now.After(sub.ExpiresAt) || sub.ExpiresAt.Equal(now) {
 				delete(h.subscriptions, k)
 			}
 		}
@@ -977,12 +1590,75 @@ func (h *Handler) ActiveSubscriptionCount() int {
 	return len(h.subscriptions)
 }
 
-// BumpSystemUpdate increments the UPnP ContentDirectory SystemUpdateID when library contents change.
+// BumpSystemUpdate increments the UPnP ContentDirectory SystemUpdateID when library contents change
+// and asynchronously dispatches UPnP GENA NOTIFY XML messages to active LAN ContentDirectory subscribers.
 func (h *Handler) BumpSystemUpdate() uint32 {
+	now := time.Now().UTC()
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	h.systemUpdate++
-	return h.systemUpdate
+	newID := h.systemUpdate
+	var targets []eventSubscription
+	for sid, sub := range h.subscriptions {
+		if now.After(sub.ExpiresAt) || sub.ExpiresAt.Equal(now) {
+			delete(h.subscriptions, sid)
+			continue
+		}
+		if sub.Service == "contentdirectory" {
+			currSeq := sub.Seq
+			sub.Seq++
+			h.subscriptions[sid] = sub
+			subCopy := sub
+			subCopy.Seq = currSeq
+			targets = append(targets, subCopy)
+		}
+	}
+	client := h.notifyClient
+	h.mu.Unlock()
+
+	if len(targets) > 0 {
+		if client == nil {
+			client = newDLNALANCallbackClient(3 * time.Second)
+		}
+		payload := fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>`+"\n"+
+			`<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">`+"\n"+
+			`  <e:property><SystemUpdateID>%d</SystemUpdateID></e:property>`+"\n"+
+			`</e:propertyset>`, newID)
+		for _, sub := range targets {
+			cbURLs, ok := parseCallbackURLs(sub.Callback)
+			if !ok || len(cbURLs) == 0 {
+				continue
+			}
+			targetURL := cbURLs[0]
+			subCopy := sub
+			go func() {
+				if h.notifySem != nil {
+					select {
+					case h.notifySem <- struct{}{}:
+						defer func() { <-h.notifySem }()
+					default:
+						return
+					}
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				req, err := http.NewRequestWithContext(ctx, "NOTIFY", targetURL, strings.NewReader(payload))
+				if err != nil {
+					return
+				}
+				req.Header.Set("CONTENT-TYPE", `text/xml; charset="utf-8"`)
+				req.Header.Set("NT", "upnp:event")
+				req.Header.Set("NTS", "upnp:propchange")
+				req.Header.Set("SID", subCopy.SID)
+				req.Header.Set("SEQ", strconv.FormatUint(uint64(subCopy.Seq), 10))
+				resp, err := client.Do(req)
+				if err == nil && resp != nil {
+					_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+					_ = resp.Body.Close()
+				}
+			}()
+		}
+	}
+	return newID
 }
 
 func parseTimeoutHeader(raw string) int {

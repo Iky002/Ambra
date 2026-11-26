@@ -142,20 +142,20 @@ func TestAuditV0104_H05_ProtocolWhitelistAndSSRF(t *testing.T) {
 	if idxWL < 0 || remoteExtract[idxWL+1] != "http,https,tcp,tls,crypto" {
 		t.Fatalf("expected remote extract protocol_whitelist, got %v", remoteExtract)
 	}
-	if idxFR := slices.Index(remoteExtract, "-follow_redirects"); idxFR < 0 || remoteExtract[idxFR+1] != "0" {
-		t.Fatalf("expected -follow_redirects 0 for remote extract, got %v", remoteExtract)
+	if idxFR := slices.Index(remoteExtract, "-max_redirects"); idxFR < 0 || remoteExtract[idxFR+1] != "0" {
+		t.Fatalf("expected -max_redirects 0 for remote extract, got %v", remoteExtract)
 	}
 
-	// 2. BuildFFmpegArgs carries -protocol_whitelist and -follow_redirects 0 for remote HTTP
+	// 2. BuildFFmpegArgs carries -protocol_whitelist and -max_redirects 0 for remote HTTP
 	remoteArgs := BuildFFmpegArgs(SessionParams{
 		InputPath:  "https://93.184.216.34/movie.mkv",
 		VideoCodec: "copy",
 		AudioCodec: "aac",
 	}, 0, "/tmp/out", SoftwareOnlyCapabilities())
-	idxFR := slices.Index(remoteArgs, "-follow_redirects")
+	idxFR := slices.Index(remoteArgs, "-max_redirects")
 	idxIn := slices.Index(remoteArgs, "-i")
 	if idxFR < 0 || idxFR >= idxIn || remoteArgs[idxFR+1] != "0" {
-		t.Fatalf("expected -follow_redirects 0 before -i, got %v", remoteArgs)
+		t.Fatalf("expected -max_redirects 0 before -i, got %v", remoteArgs)
 	}
 
 	// 3. Manager rejects SSRF metadata URLs in InputPath & SubtitlePath

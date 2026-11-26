@@ -18,20 +18,23 @@ import {
 import { api } from '../../api/client'
 import type { ScheduledTaskInfo, ServerLogFile, TaskTriggerInfo } from '../../api/types'
 import { QueryErrorState } from '../../components/QueryErrorState'
+import { useI18n, type TranslationVars } from '../../i18n/I18nContext'
 import { AdminModal, FeedbackBanner, formatBytes, formatDateTime } from './adminUtils'
 
 const TICKS_PER_MINUTE = 60 * 10_000_000
 const TICKS_PER_HOUR = 3600 * 10_000_000
 
-const DAYS_OF_WEEK = [
-  { value: 'Sunday', label: '周日 (Sunday)' },
-  { value: 'Monday', label: '周一 (Monday)' },
-  { value: 'Tuesday', label: '周二 (Tuesday)' },
-  { value: 'Wednesday', label: '周三 (Wednesday)' },
-  { value: 'Thursday', label: '周四 (Thursday)' },
-  { value: 'Friday', label: '周五 (Friday)' },
-  { value: 'Saturday', label: '周六 (Saturday)' },
-] as const
+const DAY_KEY_MAP: Record<string, string> = {
+  Sunday: 'admin.tasks.daySun',
+  Monday: 'admin.tasks.dayMon',
+  Tuesday: 'admin.tasks.dayTue',
+  Wednesday: 'admin.tasks.dayWed',
+  Thursday: 'admin.tasks.dayThu',
+  Friday: 'admin.tasks.dayFri',
+  Saturday: 'admin.tasks.daySat',
+}
+
+const DAY_ORDER = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'] as const
 
 function formatTicksToHHMM(ticks: number): string {
   const totalMins = Math.round(ticks / TICKS_PER_MINUTE)
@@ -40,36 +43,40 @@ function formatTicksToHHMM(ticks: number): string {
   return `${hh}:${mm}`
 }
 
-function formatTriggerLabel(trigger: TaskTriggerInfo): string {
+function formatTriggerLabel(
+  trigger: TaskTriggerInfo,
+  t: (key: string, vars?: TranslationVars) => string,
+): string {
   if (trigger.Type === 'StartupTrigger') {
-    return '服务器启动时触发'
+    return t('admin.tasks.triggerStartup')
   }
   if (trigger.Type === 'DailyTrigger') {
-    return `每日 ${formatTicksToHHMM(trigger.TimeOfDayTicks ?? 0)} 执行`
+    return t('admin.tasks.triggerDaily', {
+      time: formatTicksToHHMM(trigger.TimeOfDayTicks ?? 0),
+    })
   }
   if (trigger.Type === 'IntervalTrigger') {
     const hours = (trigger.IntervalTicks ?? 0) / TICKS_PER_HOUR
     if (hours >= 1 && Number.isInteger(hours)) {
-      return `每隔 ${hours} 小时执行`
+      return t('admin.tasks.triggerIntervalHours', { hours })
     }
     const mins = Math.max(1, Math.round((trigger.IntervalTicks ?? 0) / TICKS_PER_MINUTE))
-    return `每隔 ${mins} 分钟执行`
+    return t('admin.tasks.triggerIntervalMins', { mins })
   }
   if (trigger.Type === 'WeeklyTrigger') {
-    const dayLabel =
-      DAYS_OF_WEEK.find((d) => d.value === trigger.DayOfWeek)?.label ||
-      trigger.DayOfWeek ||
-      'Sunday'
+    const dayKey = trigger.DayOfWeek ? DAY_KEY_MAP[trigger.DayOfWeek] : undefined
+    const dayLabel = dayKey ? t(dayKey) : trigger.DayOfWeek || t('admin.tasks.daySun')
     const timeStr =
       typeof trigger.TimeOfDayTicks === 'number'
         ? ` ${formatTicksToHHMM(trigger.TimeOfDayTicks)}`
         : ''
-    return `每周 ${dayLabel}${timeStr} 执行`
+    return t('admin.tasks.triggerWeekly', { day: dayLabel, time: timeStr })
   }
   return trigger.Type
 }
 
 export function TasksLogsTab() {
+  const { t } = useI18n()
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
     null,
   )
@@ -78,7 +85,7 @@ export function TasksLogsTab() {
   const [selectedLog, setSelectedLog] = useState<string | null>(null)
   const [logFilter, setLogFilter] = useState('')
 
-  // 触发规则弹窗状态
+  // 多触发规则列表管理状态
   const [editingTriggersTask, setEditingTriggersTask] = useState<ScheduledTaskInfo | null>(null)
   const [draftTriggers, setDraftTriggers] = useState<TaskTriggerInfo[]>([])
   const [newTriggerType, setNewTriggerType] = useState<
@@ -112,7 +119,7 @@ export function TasksLogsTab() {
     queryFn: () => api.getScheduledTasks(),
     refetchInterval: (query) =>
       Array.isArray(query.state.data) &&
-      query.state.data.some((t) => t.State?.toLowerCase() === 'running')
+      query.state.data.some((item) => item.State?.toLowerCase() === 'running')
         ? 2000
         : false,
   })
@@ -162,12 +169,15 @@ export function TasksLogsTab() {
     setFeedback(null)
     try {
       await api.runScheduledTask(taskId)
-      setFeedback({ type: 'success', message: `已触发计划任务「${taskName}」` })
+      setFeedback({
+        type: 'success',
+        message: t('admin.tasks.taskTriggeredSuccess', { name: taskName }),
+      })
       scheduleRefetchTasks(600)
     } catch (err) {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '运行计划任务失败',
+        message: err instanceof Error ? err.message : t('admin.tasks.taskRunFailed'),
       })
     } finally {
       setRunningTaskId(null)
@@ -179,12 +189,15 @@ export function TasksLogsTab() {
     setFeedback(null)
     try {
       await api.stopScheduledTask(taskId)
-      setFeedback({ type: 'success', message: `已请求停止计划任务「${taskName}」` })
+      setFeedback({
+        type: 'success',
+        message: t('admin.tasks.taskStopSuccess', { name: taskName }),
+      })
       scheduleRefetchTasks(400)
     } catch (err) {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '停止计划任务失败',
+        message: err instanceof Error ? err.message : t('admin.tasks.taskStopFailed'),
       })
     } finally {
       setStoppingTaskId(null)
@@ -193,7 +206,10 @@ export function TasksLogsTab() {
 
   const handleOpenTriggers = (task: ScheduledTaskInfo) => {
     setEditingTriggersTask(task)
-    setDraftTriggers(Array.isArray(task.Triggers) ? task.Triggers.map((t) => ({ ...t })) : [])
+    // 深拷贝完整保留所有现有触发器（如 StartupTrigger、DailyTrigger、自定义触发器等），绝不截断为单条
+    setDraftTriggers(
+      Array.isArray(task.Triggers) ? task.Triggers.map((trigger) => ({ ...trigger })) : [],
+    )
     setNewTriggerType('DailyTrigger')
     setNewDailyTime('03:00')
     setNewWeeklyDay('Sunday')
@@ -259,17 +275,18 @@ export function TasksLogsTab() {
     setSavingTriggers(true)
     setFeedback(null)
     try {
-      await api.updateTaskTriggers(editingTriggersTask.Id, draftTriggers)
+      const triggersPayload = draftTriggers.map((item) => ({ ...item }))
+      await api.updateTaskTriggers(editingTriggersTask.Id, triggersPayload)
       setFeedback({
         type: 'success',
-        message: `已更新计划任务「${editingTriggersTask.Name}」的触发规则`,
+        message: t('admin.tasks.triggersSavedSuccess', { name: editingTriggersTask.Name }),
       })
       setEditingTriggersTask(null)
       void refetchTasks()
     } catch (err) {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '保存触发规则失败',
+        message: err instanceof Error ? err.message : t('admin.tasks.triggersSaveFailed'),
       })
     } finally {
       setSavingTriggers(false)
@@ -277,19 +294,13 @@ export function TasksLogsTab() {
   }
 
   const filteredLogText = useMemo(() => {
-    const raw =
-      typeof logContent === 'string'
-        ? logContent
-        : logContent
-          ? JSON.stringify(logContent, null, 2)
-          : ''
-    if (!logFilter.trim()) return raw
+    if (!logFilter.trim()) return rawLogText
     const keyword = logFilter.trim().toLowerCase()
-    return raw
+    return rawLogText
       .split('\n')
       .filter((line) => line.toLowerCase().includes(keyword))
       .join('\n')
-  }, [logContent, logFilter])
+  }, [rawLogText, logFilter])
 
   return (
     <div className="space-y-8">
@@ -305,11 +316,9 @@ export function TasksLogsTab() {
           <div>
             <h2 className="flex items-center gap-2 text-base font-semibold text-zinc-100">
               <CalendarClock className="h-4 w-4 text-amber-400" />
-              <span>计划任务</span>
+              <span>{t('admin.scheduledTasks')}</span>
             </h2>
-            <p className="mt-1 text-xs text-zinc-400">
-              查看系统维护与媒体索引任务状态，支持一键手动触发运行
-            </p>
+            <p className="mt-1 text-xs text-zinc-400">{t('admin.tasks.tasksSubtitle')}</p>
           </div>
           <button
             type="button"
@@ -317,7 +326,7 @@ export function TasksLogsTab() {
             className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-amber-400/40 hover:text-amber-300"
           >
             <RefreshCw className={`h-3.5 w-3.5 ${tasksFetching ? 'animate-spin' : ''}`} />
-            <span>刷新</span>
+            <span>{t('common.refresh')}</span>
           </button>
         </div>
 
@@ -328,13 +337,13 @@ export function TasksLogsTab() {
         ) : tasksIsError ? (
           <QueryErrorState
             compact
-            title="无法加载计划任务"
+            title={t('admin.tasks.tasksLoadError')}
             error={tasksError}
             onRetry={() => void refetchTasks()}
           />
         ) : tasks.length === 0 ? (
           <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-10 text-center text-xs text-zinc-500">
-            暂无计划任务
+            {t('admin.tasks.tasksEmpty')}
           </div>
         ) : (
           <div className="grid gap-3 md:grid-cols-2">
@@ -364,6 +373,20 @@ export function TasksLogsTab() {
                             {task.Description}
                           </p>
                         )}
+                        {(task.Triggers?.length ?? 0) > 0 &&
+                          editingTriggersTask?.Id !== task.Id && (
+                            <div className="mt-2.5 flex flex-wrap gap-1.5">
+                              {task.Triggers!.map((tr, idx) => (
+                                <span
+                                  key={`${tr.Type}-${idx}`}
+                                  className="inline-flex items-center gap-1 rounded-md bg-white/[0.05] px-2 py-0.5 text-[11px] text-zinc-300"
+                                >
+                                  <Clock className="h-3 w-3 text-amber-400/80" />
+                                  <span>{formatTriggerLabel(tr, t)}</span>
+                                </span>
+                              ))}
+                            </div>
+                          )}
                       </div>
 
                       <span
@@ -392,7 +415,9 @@ export function TasksLogsTab() {
                   <div className="mt-4 flex items-center justify-between border-t border-white/6 pt-3">
                     <span className="font-mono text-[11px] text-zinc-500">
                       {task.LastExecutionResult?.EndTimeUtc
-                        ? `上次结束: ${formatDateTime(task.LastExecutionResult.EndTimeUtc)}`
+                        ? t('admin.tasks.lastEnded', {
+                            time: formatDateTime(task.LastExecutionResult.EndTimeUtc),
+                          })
                         : `Key: ${task.Key || task.Id}`}
                     </span>
 
@@ -403,13 +428,13 @@ export function TasksLogsTab() {
                         className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-amber-400/40 hover:text-amber-300"
                       >
                         <Clock className="h-3.5 w-3.5" />
-                        <span>触发规则</span>
+                        <span>{t('admin.tasks.triggersBtn')}</span>
                       </button>
                       {isRunning && (
                         <button
                           type="button"
                           disabled={stoppingTaskId === task.Id}
-                          onClick={() => handleStopTask(task.Id, task.Name)}
+                          onClick={() => void handleStopTask(task.Id, task.Name)}
                           className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/30 bg-red-500/15 px-3 py-1.5 text-xs font-semibold text-red-300 transition-colors hover:bg-red-500/25 disabled:opacity-50"
                         >
                           {stoppingTaskId === task.Id ? (
@@ -417,13 +442,13 @@ export function TasksLogsTab() {
                           ) : (
                             <Square className="h-3 w-3 fill-current" />
                           )}
-                          <span>停止</span>
+                          <span>{t('admin.dashboard.stopBtn')}</span>
                         </button>
                       )}
                       <button
                         type="button"
                         disabled={isRunning || isTriggering}
-                        onClick={() => handleRunTask(task.Id, task.Name)}
+                        onClick={() => void handleRunTask(task.Id, task.Name)}
                         className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500/15 px-3 py-1.5 text-xs font-semibold text-amber-300 ring-1 ring-amber-500/30 transition-colors hover:bg-amber-500/25 disabled:opacity-50"
                       >
                         {isTriggering ? (
@@ -431,7 +456,7 @@ export function TasksLogsTab() {
                         ) : (
                           <Play className="h-3.5 w-3.5 fill-current" />
                         )}
-                        <span>立即运行</span>
+                        <span>{t('admin.tasks.runNowBtn')}</span>
                       </button>
                     </div>
                   </div>
@@ -448,11 +473,9 @@ export function TasksLogsTab() {
           <div>
             <h2 className="flex items-center gap-2 text-base font-semibold text-zinc-100">
               <Terminal className="h-4 w-4 text-amber-400" />
-              <span>服务器日志</span>
+              <span>{t('admin.serverLogs')}</span>
             </h2>
-            <p className="mt-1 text-xs text-zinc-400">
-              浏览 Ambra 服务端日志文件并实时在线查看输出内容
-            </p>
+            <p className="mt-1 text-xs text-zinc-400">{t('admin.tasks.logsSubtitle')}</p>
           </div>
           <button
             type="button"
@@ -460,7 +483,7 @@ export function TasksLogsTab() {
             className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-amber-400/40 hover:text-amber-300"
           >
             <RefreshCw className={`h-3.5 w-3.5 ${logsFetching ? 'animate-spin' : ''}`} />
-            <span>刷新列表</span>
+            <span>{t('admin.plugins.refreshList')}</span>
           </button>
         </div>
 
@@ -468,7 +491,7 @@ export function TasksLogsTab() {
           {/* 左侧文件列表 */}
           <div className="overflow-hidden rounded-2xl border border-white/8 bg-white/[0.02] lg:col-span-4">
             <div className="border-b border-white/8 px-4 py-2.5 text-xs font-semibold text-zinc-400">
-              日志文件 ({logFiles.length})
+              {t('admin.tasks.logFilesHeader', { count: logFiles.length })}
             </div>
 
             {logsLoading ? (
@@ -479,13 +502,15 @@ export function TasksLogsTab() {
               <div className="p-3">
                 <QueryErrorState
                   compact
-                  title="无法加载服务器日志列表"
+                  title={t('admin.tasks.logsLoadError')}
                   error={logsError}
                   onRetry={() => void refetchLogs()}
                 />
               </div>
             ) : logFiles.length === 0 ? (
-              <div className="py-12 text-center text-xs text-zinc-500">暂无服务器日志文件</div>
+              <div className="py-12 text-center text-xs text-zinc-500">
+                {t('admin.tasks.logsEmpty')}
+              </div>
             ) : (
               <div className="max-h-[420px] divide-y divide-white/6 overflow-y-auto">
                 {logFiles.map((file) => {
@@ -524,7 +549,7 @@ export function TasksLogsTab() {
           <div className="flex flex-col overflow-hidden rounded-2xl border border-white/8 bg-[#0b0b11] lg:col-span-8">
             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/8 bg-white/[0.02] px-4 py-2.5">
               <span className="truncate font-mono text-xs font-medium text-zinc-300">
-                {selectedLog || '请在左侧选择日志文件查看'}
+                {selectedLog || t('admin.tasks.selectLogPrompt')}
               </span>
 
               {selectedLog && (
@@ -535,7 +560,7 @@ export function TasksLogsTab() {
                       type="text"
                       value={logFilter}
                       onChange={(e) => setLogFilter(e.target.value)}
-                      placeholder="过滤日志关键词..."
+                      placeholder={t('admin.tasks.filterLogPlaceholder')}
                       className="w-40 rounded-lg border border-white/10 bg-black/40 py-1 pl-8 pr-2.5 text-xs text-zinc-200 placeholder-zinc-500 outline-none focus:border-amber-400/50 sm:w-52"
                     />
                   </div>
@@ -544,16 +569,16 @@ export function TasksLogsTab() {
                     disabled={contentLoading || Boolean(contentError)}
                     onClick={handleDownloadLog}
                     className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-xs font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:text-amber-300 disabled:cursor-not-allowed disabled:opacity-40"
-                    title="下载当前日志文件"
+                    title={t('admin.tasks.downloadLogTitle')}
                   >
                     <Download className="h-3.5 w-3.5" />
-                    <span>下载日志</span>
+                    <span>{t('admin.downloadLog')}</span>
                   </button>
                   <button
                     type="button"
                     onClick={() => void refetchLogContent()}
                     className="rounded-lg border border-white/10 bg-white/[0.04] p-1.5 text-zinc-400 hover:text-amber-300"
-                    title="重新加载日志"
+                    title={t('admin.tasks.reloadLogTitle')}
                   >
                     <RefreshCw className={`h-3.5 w-3.5 ${contentFetching ? 'animate-spin' : ''}`} />
                   </button>
@@ -564,7 +589,7 @@ export function TasksLogsTab() {
             <div className="h-[420px] overflow-auto p-4">
               {!selectedLog ? (
                 <div className="flex h-full items-center justify-center text-xs text-zinc-500">
-                  点击左侧日志文件名加载内容
+                  {t('admin.tasks.clickLogPrompt')}
                 </div>
               ) : contentLoading ? (
                 <div className="flex h-full items-center justify-center">
@@ -572,12 +597,13 @@ export function TasksLogsTab() {
                 </div>
               ) : contentError ? (
                 <div className="flex h-full items-center justify-center text-xs text-red-300">
-                  读取日志失败：
-                  {contentError instanceof Error ? contentError.message : '未知错误'}
+                  {t('admin.tasks.readLogFailed', {
+                    error: contentError instanceof Error ? contentError.message : 'Unknown error',
+                  })}
                 </div>
               ) : (
                 <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-zinc-300">
-                  {filteredLogText || '(日志内容为空或无匹配行)'}
+                  {filteredLogText || t('admin.tasks.emptyOrNoMatch')}
                 </pre>
               )}
             </div>
@@ -585,23 +611,23 @@ export function TasksLogsTab() {
         </div>
       </section>
 
-      {/* 触发规则管理弹窗 */}
+      {/* 多触发规则管理弹窗 */}
       <AdminModal
         open={Boolean(editingTriggersTask)}
-        title={`触发规则 · ${editingTriggersTask?.Name || ''}`}
-        subtitle="配置计划任务的定时、间隔或启动触发规则"
+        title={t('admin.tasks.triggersModalTitle', { name: editingTriggersTask?.Name || '' })}
+        subtitle={t('admin.tasks.triggersModalSubtitle')}
         maxWidthClass="max-w-lg"
         onClose={() => setEditingTriggersTask(null)}
       >
         <div className="space-y-5">
-          {/* 已有触发规则列表 */}
+          {/* 已有触发规则列表（保留 StartupTrigger 等所有既有规则并支持增删多条） */}
           <div className="space-y-2">
             <p className="text-xs font-medium text-zinc-400">
-              当前规则 ({draftTriggers.length})
+              {t('admin.tasks.currentRulesCount', { count: draftTriggers.length })}
             </p>
             {draftTriggers.length === 0 ? (
               <div className="rounded-xl border border-white/8 bg-white/[0.02] py-5 text-center text-xs text-zinc-500">
-                暂无自动触发规则（仅手动运行）
+                {t('admin.tasks.noAutoTriggers')}
               </div>
             ) : (
               <div className="divide-y divide-white/6 overflow-hidden rounded-xl border border-white/8 bg-white/[0.02]">
@@ -612,11 +638,11 @@ export function TasksLogsTab() {
                   >
                     <div className="flex items-center gap-2 text-zinc-200">
                       <Clock className="h-3.5 w-3.5 text-amber-400" />
-                      <span>{formatTriggerLabel(trigger)}</span>
+                      <span>{formatTriggerLabel(trigger, t)}</span>
                     </div>
                     <button
                       type="button"
-                      aria-label={`删除规则 ${idx + 1}`}
+                      aria-label={t('admin.tasks.deleteRuleAria', { index: idx + 1 })}
                       onClick={() =>
                         setDraftTriggers((prev) => prev.filter((_, i) => i !== idx))
                       }
@@ -632,11 +658,11 @@ export function TasksLogsTab() {
 
           {/* 新增触发规则 */}
           <div className="space-y-3 rounded-xl border border-white/8 bg-white/[0.02] p-3.5">
-            <p className="text-xs font-medium text-zinc-300">添加触发规则</p>
+            <p className="text-xs font-medium text-zinc-300">{t('admin.tasks.addRuleTitle')}</p>
             <div className="grid gap-3 sm:grid-cols-12">
               <div className="sm:col-span-5">
                 <select
-                  aria-label="触发类型"
+                  aria-label={t('admin.tasks.triggerTypeAria')}
                   value={newTriggerType}
                   onChange={(e) =>
                     setNewTriggerType(
@@ -649,17 +675,17 @@ export function TasksLogsTab() {
                   }
                   className="w-full rounded-lg border border-white/10 bg-[#181822] px-2.5 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/60"
                 >
-                  <option value="DailyTrigger">每日定时 (Daily)</option>
-                  <option value="WeeklyTrigger">每周定时 (Weekly)</option>
-                  <option value="IntervalTrigger">固定间隔 (Interval)</option>
-                  <option value="StartupTrigger">启动时触发 (Startup)</option>
+                  <option value="DailyTrigger">{t('admin.tasks.typeDaily')}</option>
+                  <option value="WeeklyTrigger">{t('admin.tasks.typeWeekly')}</option>
+                  <option value="IntervalTrigger">{t('admin.tasks.typeInterval')}</option>
+                  <option value="StartupTrigger">{t('admin.tasks.typeStartup')}</option>
                 </select>
               </div>
 
               <div className="sm:col-span-4">
                 {newTriggerType === 'DailyTrigger' ? (
                   <input
-                    aria-label="每日执行时间"
+                    aria-label={t('admin.tasks.dailyTimeAria')}
                     type="time"
                     value={newDailyTime}
                     onChange={(e) => setNewDailyTime(e.target.value)}
@@ -668,19 +694,19 @@ export function TasksLogsTab() {
                 ) : newTriggerType === 'WeeklyTrigger' ? (
                   <div className="flex flex-col gap-2">
                     <select
-                      aria-label="每周执行星期"
+                      aria-label={t('admin.tasks.weeklyDayAria')}
                       value={newWeeklyDay}
                       onChange={(e) => setNewWeeklyDay(e.target.value)}
                       className="w-full rounded-lg border border-white/10 bg-[#181822] px-2.5 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/60"
                     >
-                      {DAYS_OF_WEEK.map((d) => (
-                        <option key={d.value} value={d.value}>
-                          {d.label}
+                      {DAY_ORDER.map((dayVal) => (
+                        <option key={dayVal} value={dayVal}>
+                          {t(DAY_KEY_MAP[dayVal])}
                         </option>
                       ))}
                     </select>
                     <input
-                      aria-label="每周执行时间"
+                      aria-label={t('admin.tasks.weeklyTimeAria')}
                       type="time"
                       value={newDailyTime}
                       onChange={(e) => setNewDailyTime(e.target.value)}
@@ -690,7 +716,7 @@ export function TasksLogsTab() {
                 ) : newTriggerType === 'IntervalTrigger' ? (
                   <div className="flex items-center gap-1.5">
                     <input
-                      aria-label="间隔小时数"
+                      aria-label={t('admin.tasks.intervalHoursAria')}
                       type="number"
                       min={1}
                       max={168}
@@ -698,11 +724,13 @@ export function TasksLogsTab() {
                       onChange={(e) => setNewIntervalHours(Number(e.target.value))}
                       className="w-full rounded-lg border border-white/10 bg-zinc-900/90 px-2.5 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/60"
                     />
-                    <span className="shrink-0 text-xs text-zinc-400">小时</span>
+                    <span className="shrink-0 text-xs text-zinc-400">
+                      {t('admin.tasks.hoursUnit')}
+                    </span>
                   </div>
                 ) : (
                   <div className="flex h-full items-center text-xs text-zinc-500">
-                    服务启动自动运行
+                    {t('admin.tasks.startupAutoHint')}
                   </div>
                 )}
               </div>
@@ -714,25 +742,24 @@ export function TasksLogsTab() {
                   className="inline-flex w-full items-center justify-center gap-1 rounded-lg border border-amber-500/35 bg-amber-500/15 px-3 py-2 text-xs font-semibold text-amber-300 transition-colors hover:bg-amber-500/25"
                 >
                   <Plus className="h-3.5 w-3.5" />
-                  <span>添加</span>
+                  <span>{t('admin.tasks.addBtn')}</span>
                 </button>
               </div>
             </div>
           </div>
 
-          {/* 底部保存/取消 */}
           <div className="flex justify-end gap-2 pt-2">
             <button
               type="button"
               onClick={() => setEditingTriggersTask(null)}
               className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10"
             >
-              取消
+              {t('common.cancel')}
             </button>
             <button
               type="button"
               disabled={savingTriggers}
-              onClick={handleSaveTriggers}
+              onClick={() => void handleSaveTriggers()}
               className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-60"
             >
               {savingTriggers ? (
@@ -740,7 +767,7 @@ export function TasksLogsTab() {
               ) : (
                 <Save className="h-3.5 w-3.5" />
               )}
-              <span>保存规则</span>
+              <span>{t('admin.tasks.saveRulesBtn')}</span>
             </button>
           </div>
         </div>

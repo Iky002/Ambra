@@ -438,10 +438,10 @@ func TestDevicesSessionsAndAuthLifecycle(t *testing.T) {
 		t.Fatalf("GET Devices/Options got %d %s", rec.Code, rec.Body.String())
 	}
 
-	// Device CameraUploads roundtrip
-	rec = doReq(t, env.router, "POST", "/Devices/CameraUploads?DeviceId=dev-real-1&Id=p1&Name=img.jpg&Album=Trip", "")
+	// Device CameraUploads roundtrip (real stream written to disk + DB)
+	rec = doReq(t, env.router, "POST", "/Devices/CameraUploads?DeviceId=dev-real-1&Id=p1&Name=img.jpg&Album=Trip", "\xff\xd8\xff\xe0fake-jpeg-data")
 	if rec.Code != http.StatusNoContent {
-		t.Fatalf("POST CameraUploads got %d", rec.Code)
+		t.Fatalf("POST CameraUploads got %d %s", rec.Code, rec.Body.String())
 	}
 	rec = doReq(t, env.router, "GET", "/Devices/CameraUploads?DeviceId=dev-real-1", "")
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "img.jpg") {

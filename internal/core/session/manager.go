@@ -17,12 +17,12 @@ import (
 )
 
 const (
-	defaultPlayedThreshold       = 0.90
-	progressPersistWindow        = 15 * time.Second
-	maxSessions                  = 2048
-	sessionStaleTTL              = 24 * time.Hour
-	defaultActivityLogCooldown   = 30 * time.Second
-	maxActivityLogThrottleKeys   = 4096
+	defaultPlayedThreshold     = 0.90
+	progressPersistWindow      = 15 * time.Second
+	maxSessions                = 2048
+	sessionStaleTTL            = 24 * time.Hour
+	defaultActivityLogCooldown = 30 * time.Second
+	maxActivityLogThrottleKeys = 4096
 )
 
 // ErrItemAccessDenied is returned when a playback report references a missing or unauthorized item.
@@ -684,12 +684,16 @@ func (m *Manager) ReportPlaybackStopped(ctx context.Context, user *sqlite.UserRe
 
 	var audioIdx, subIdx *int
 	var nowPlayingRuntime int64
+	var additionalUsers []dto.SessionUserInfo
 
 	m.mu.Lock()
 	entry := m.touchSessionLocked(user, client, now)
 	sessionID := entry.info.Id
 	deviceID := entry.info.DeviceId
 	entry.info.LastActivityDate = now
+	if len(entry.info.AdditionalUsers) > 0 {
+		additionalUsers = append([]dto.SessionUserInfo(nil), entry.info.AdditionalUsers...)
+	}
 	if itemID == "" && entry.info.NowPlayingItem != nil {
 		itemID = guid.Normalize(entry.info.NowPlayingItem.Id)
 	}
@@ -755,6 +759,23 @@ func (m *Manager) ReportPlaybackStopped(ctx context.Context, user *sqlite.UserRe
 				Severity: "Info",
 			}); err != nil {
 				slog.Warn("session: failed to record playback stop activity log", "user_id", user.ID, "item_id", itemID, "err", err)
+			}
+		}
+		if markPlayed && len(additionalUsers) > 0 {
+			for _, au := range additionalUsers {
+				if guid.Normalize(au.UserId) == "" || guid.Normalize(au.UserId) == guid.Normalize(user.ID) {
+					continue
+				}
+				coUser, uErr := m.repo.GetUserByID(ctx, au.UserId)
+				if uErr != nil || coUser == nil || coUser.IsDisabled || coUser.Policy.IsDisabled {
+					continue
+				}
+				if err := m.checkItemAccess(ctx, coUser, itemID); err != nil {
+					continue
+				}
+				if coUD, pErr := m.repo.UpsertPlaybackProgress(ctx, coUser.ID, itemID, 0, true, nil, nil); pErr == nil && coUD != nil {
+					m.publishUserDataChanged(ctx, coUser.ID, coUD)
+				}
 			}
 		}
 	}
@@ -847,24 +868,170 @@ func (m *Manager) RemoveSessionByDevice(deviceID string) {
 	}
 }
 
-// RemoveSessionsByUser removes all active in-memory sessions belonging to userID.
+// RemoveSessionsByUser removes all active in-memory sessions belonging to userID
+// and detaches userID from any other session's AdditionalUsers list.
 func (m *Manager) RemoveSessionsByUser(userID string) {
 	norm := guid.Normalize(userID)
 	if norm == "" {
 		return
 	}
-	removed := false
+	changed := false
 	m.mu.Lock()
 	for sid, entry := range m.sessions {
 		if guid.Normalize(entry.info.UserId) == norm {
 			delete(m.sessions, sid)
-			removed = true
+			changed = true
+			continue
+		}
+		if len(entry.info.AdditionalUsers) > 0 {
+			kept := entry.info.AdditionalUsers[:0]
+			for _, au := range entry.info.AdditionalUsers {
+				if guid.Normalize(au.UserId) == norm {
+					changed = true
+					continue
+				}
+				kept = append(kept, au)
+			}
+			if len(kept) == 0 {
+				entry.info.AdditionalUsers = nil
+			} else {
+				entry.info.AdditionalUsers = kept
+			}
 		}
 	}
 	m.mu.Unlock()
-	if removed {
+	if changed {
 		m.publish(context.Background(), eventbus.EventSessionUpdated, nil)
 	}
+}
+
+// UpdateUserName updates the cached UserName across all active sessions and AdditionalUsers entries for userID.
+func (m *Manager) UpdateUserName(userID, newName string) {
+	if m == nil {
+		return
+	}
+	norm := guid.Normalize(userID)
+	if norm == "" || newName == "" {
+		return
+	}
+	changed := false
+	m.mu.Lock()
+	for _, entry := range m.sessions {
+		if guid.Normalize(entry.info.UserId) == norm && entry.info.UserName != newName {
+			entry.info.UserName = newName
+			changed = true
+		}
+		for i := range entry.info.AdditionalUsers {
+			if guid.Normalize(entry.info.AdditionalUsers[i].UserId) == norm && entry.info.AdditionalUsers[i].UserName != newName {
+				entry.info.AdditionalUsers[i].UserName = newName
+				changed = true
+			}
+		}
+	}
+	m.mu.Unlock()
+	if changed {
+		m.publish(context.Background(), eventbus.EventSessionUpdated, nil)
+	}
+}
+
+const maxAdditionalUsersPerSession = 32
+
+// AddAdditionalUser attaches an existing active user to sessionID's AdditionalUsers list.
+// Returns (foundSession, error).
+func (m *Manager) AddAdditionalUser(ctx context.Context, sessionID, userID string) (bool, error) {
+	if m == nil {
+		return false, nil
+	}
+	normUID := guid.Normalize(userID)
+	if normUID == "" {
+		return false, errors.New("userId is required")
+	}
+
+	resolvedID := normUID
+	resolvedName := ""
+	if m.repo != nil {
+		u, err := m.repo.GetUserByID(ctx, userID)
+		if err != nil {
+			return true, err
+		}
+		if u.IsDisabled || u.Policy.IsDisabled {
+			return true, auth.ErrUserDisabled
+		}
+		resolvedID = u.ID
+		resolvedName = u.Name
+	}
+
+	changed := false
+	m.mu.Lock()
+	entry, ok := m.sessions[sessionID]
+	if !ok {
+		m.mu.Unlock()
+		return false, nil
+	}
+	if guid.Normalize(entry.info.UserId) != normUID {
+		already := false
+		for i := range entry.info.AdditionalUsers {
+			if guid.Normalize(entry.info.AdditionalUsers[i].UserId) == normUID {
+				if resolvedName != "" && entry.info.AdditionalUsers[i].UserName != resolvedName {
+					entry.info.AdditionalUsers[i].UserName = resolvedName
+					changed = true
+				}
+				already = true
+				break
+			}
+		}
+		if !already && len(entry.info.AdditionalUsers) < maxAdditionalUsersPerSession {
+			entry.info.AdditionalUsers = append(entry.info.AdditionalUsers, dto.SessionUserInfo{
+				UserId:   resolvedID,
+				UserName: resolvedName,
+			})
+			changed = true
+		}
+	}
+	m.mu.Unlock()
+
+	if changed {
+		m.publish(ctx, eventbus.EventSessionUpdated, nil)
+	}
+	return true, nil
+}
+
+// RemoveAdditionalUser detaches userID from sessionID's AdditionalUsers list.
+// Returns false if sessionID does not exist.
+func (m *Manager) RemoveAdditionalUser(sessionID, userID string) bool {
+	if m == nil {
+		return false
+	}
+	normUID := guid.Normalize(userID)
+	changed := false
+
+	m.mu.Lock()
+	entry, ok := m.sessions[sessionID]
+	if !ok {
+		m.mu.Unlock()
+		return false
+	}
+	if normUID != "" && len(entry.info.AdditionalUsers) > 0 {
+		kept := make([]dto.SessionUserInfo, 0, len(entry.info.AdditionalUsers))
+		for _, au := range entry.info.AdditionalUsers {
+			if guid.Normalize(au.UserId) == normUID {
+				changed = true
+				continue
+			}
+			kept = append(kept, au)
+		}
+		if len(kept) == 0 {
+			entry.info.AdditionalUsers = nil
+		} else {
+			entry.info.AdditionalUsers = kept
+		}
+	}
+	m.mu.Unlock()
+
+	if changed {
+		m.publish(context.Background(), eventbus.EventSessionUpdated, nil)
+	}
+	return true
 }
 
 func (m *Manager) publish(ctx context.Context, evType eventbus.EventType, payload any) {
@@ -987,6 +1154,9 @@ func cloneSession(in dto.SessionInfo) dto.SessionInfo {
 	}
 	if in.SupportedCommands != nil {
 		out.SupportedCommands = append([]string(nil), in.SupportedCommands...)
+	}
+	if in.AdditionalUsers != nil {
+		out.AdditionalUsers = append([]dto.SessionUserInfo(nil), in.AdditionalUsers...)
 	}
 	return out
 }

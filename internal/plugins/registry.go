@@ -116,6 +116,88 @@ type StreamResolver interface {
 	ResolveStream(ctx context.Context, rawPath string) (*StreamResolveResult, error)
 }
 
+// SubtitleSearchQuery describes parameters for searching remote subtitles.
+type SubtitleSearchQuery struct {
+	ItemID        string
+	ItemType      string
+	Title         string
+	OriginalTitle string
+	Year          int
+	SeasonNumber  int
+	EpisodeNumber int
+	Language      string
+	ProviderIDs   map[string]string
+	MediaPath     string
+}
+
+// RemoteSubtitleInfo represents a subtitle search hit returned by a SubtitleProvider.
+type RemoteSubtitleInfo struct {
+	ID                string  `json:"Id"`
+	Name              string  `json:"Name"`
+	ProviderName      string  `json:"ProviderName"`
+	Language          string  `json:"Language,omitempty"`
+	ThreeLetterISOLang string `json:"ThreeLetterISOLanguageName,omitempty"`
+	Format            string  `json:"Format,omitempty"`
+	Comment           string  `json:"Comment,omitempty"`
+	Author            string  `json:"Author,omitempty"`
+	CommunityRating   float64 `json:"CommunityRating,omitempty"`
+	DownloadCount     int     `json:"DownloadCount,omitempty"`
+	IsHashMatch       bool    `json:"IsHashMatch,omitempty"`
+}
+
+// SubtitleDownloadResult holds the downloaded subtitle content and format.
+type SubtitleDownloadResult struct {
+	Language string
+	Format   string // srt / ass / ssa / vtt
+	Content  []byte
+}
+
+// SubtitleProvider searches and downloads external subtitles from remote services.
+type SubtitleProvider interface {
+	Plugin
+	SearchSubtitles(ctx context.Context, q SubtitleSearchQuery) ([]RemoteSubtitleInfo, error)
+	DownloadSubtitle(ctx context.Context, subtitleID string) (*SubtitleDownloadResult, error)
+}
+
+// RemoteImageHit represents an artwork candidate returned by an ImageProvider.
+type RemoteImageHit struct {
+	ProviderName string
+	URL          string
+	ThumbnailURL string
+	Type         string // Primary / Backdrop / Logo / Thumb / Banner
+	Language     string
+	Width        int
+	Height       int
+	Rating       float64
+}
+
+// ImageProvider fetches additional remote artwork for media items.
+type ImageProvider interface {
+	Plugin
+	FetchImages(ctx context.Context, q MediaQuery) ([]RemoteImageHit, error)
+}
+
+// NotificationPayload represents an outgoing notification event delivered to Notifier plugins.
+type NotificationPayload struct {
+	Event   string         `json:"event"`
+	Title   string         `json:"title"`
+	Message string         `json:"message"`
+	Level   string         `json:"level,omitempty"`
+	UserID  string         `json:"user_id,omitempty"`
+	Data    map[string]any `json:"data,omitempty"`
+}
+
+// Notifier delivers server events to external notification channels.
+type Notifier interface {
+	Plugin
+	Notify(ctx context.Context, payload NotificationPayload) error
+}
+
+// DefaultConfigExporter can be implemented by plugins to expose their active sanitized default configuration.
+type DefaultConfigExporter interface {
+	DefaultConfig() map[string]any
+}
+
 // Registry manages built-in and external plugins with priority ordering.
 type Registry struct {
 	mu      sync.RWMutex
@@ -150,11 +232,44 @@ func (r *Registry) Register(p Plugin) {
 	r.plugins[id] = p
 }
 
+// Unregister removes a non-built-in plugin from the registry. Built-in plugins cannot be unregistered.
+func (r *Registry) Unregister(id string) bool {
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" || IsBuiltInID(trimmed) {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	existing, ok := r.plugins[trimmed]
+	if !ok {
+		for k, p := range r.plugins {
+			if strings.EqualFold(k, trimmed) {
+				trimmed = k
+				existing = p
+				ok = true
+				break
+			}
+		}
+	}
+	if !ok || existing.Manifest().BuiltIn {
+		return false
+	}
+	delete(r.plugins, trimmed)
+	return true
+}
+
 func (r *Registry) Get(id string) (Plugin, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	p, ok := r.plugins[id]
-	return p, ok
+	if p, ok := r.plugins[id]; ok {
+		return p, true
+	}
+	for k, p := range r.plugins {
+		if strings.EqualFold(k, id) {
+			return p, true
+		}
+	}
+	return nil, false
 }
 
 func (r *Registry) List() []Manifest {
@@ -174,21 +289,97 @@ func (r *Registry) List() []Manifest {
 }
 
 func (r *Registry) MetadataProviders() []MetadataProvider {
+	return r.MetadataProvidersWithFilter(nil, nil)
+}
+
+// MetadataProvidersWithFilter returns enabled MetadataProviders, optionally filtered by enabledNamesOrIDs
+// (when non-nil; an empty non-nil slice disables all online providers unless NFO is included) and ordered by
+// orderedNamesOrIDs before falling back to plugin Priority.
+func (r *Registry) MetadataProvidersWithFilter(enabledNamesOrIDs []string, orderedNamesOrIDs []string) []MetadataProvider {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	var out []MetadataProvider
-	for _, p := range r.plugins {
-		if !p.Manifest().Enabled {
-			continue
-		}
-		if mp, ok := p.(MetadataProvider); ok {
-			out = append(out, mp)
+
+	hasFilter := enabledNamesOrIDs != nil
+	allowMap := make(map[string]bool, len(enabledNamesOrIDs))
+	for _, item := range enabledNamesOrIDs {
+		norm := normalizeProviderToken(item)
+		if norm != "" {
+			allowMap[norm] = true
 		}
 	}
+	orderRank := make(map[string]int, len(orderedNamesOrIDs))
+	for idx, item := range orderedNamesOrIDs {
+		norm := normalizeProviderToken(item)
+		if norm != "" {
+			if _, exists := orderRank[norm]; !exists {
+				orderRank[norm] = idx
+			}
+		}
+	}
+
+	var out []MetadataProvider
+	for _, p := range r.plugins {
+		mf := p.Manifest()
+		if !mf.Enabled {
+			continue
+		}
+		mp, ok := p.(MetadataProvider)
+		if !ok {
+			continue
+		}
+		if hasFilter && !matchesProviderMap(mf, allowMap) {
+			continue
+		}
+		out = append(out, mp)
+	}
 	sort.Slice(out, func(i, j int) bool {
-		return out[i].Manifest().Priority < out[j].Manifest().Priority
+		mi, mj := out[i].Manifest(), out[j].Manifest()
+		if len(orderRank) > 0 {
+			ri, oki := lookupProviderRank(mi, orderRank)
+			rj, okj := lookupProviderRank(mj, orderRank)
+			if oki && okj && ri != rj {
+				return ri < rj
+			}
+			if oki != okj {
+				return oki
+			}
+		}
+		if mi.Priority != mj.Priority {
+			return mi.Priority < mj.Priority
+		}
+		return mi.Name < mj.Name
 	})
 	return out
+}
+
+func normalizeProviderToken(s string) string {
+	low := strings.ToLower(strings.TrimSpace(s))
+	switch low {
+	case "themoviedb", "tmdb", "ambra.builtin.tmdb":
+		return "tmdb"
+	case "thetvdb", "tvdb", "ambra.builtin.tvdb":
+		return "tvdb"
+	case "nfo", "localnfo", "ambra.builtin.nfo":
+		return "nfo"
+	default:
+		return low
+	}
+}
+
+func matchesProviderMap(mf Manifest, m map[string]bool) bool {
+	if m[normalizeProviderToken(mf.ID)] || m[normalizeProviderToken(mf.Name)] || m[strings.ToLower(mf.ID)] || m[strings.ToLower(mf.Name)] {
+		return true
+	}
+	return false
+}
+
+func lookupProviderRank(mf Manifest, ranks map[string]int) (int, bool) {
+	for _, key := range []string{normalizeProviderToken(mf.ID), normalizeProviderToken(mf.Name), strings.ToLower(mf.ID), strings.ToLower(mf.Name)} {
+		if r, ok := ranks[key]; ok {
+			return r, true
+		}
+	}
+	return 0, false
 }
 
 func (r *Registry) StreamResolvers() []StreamResolver {
@@ -201,6 +392,60 @@ func (r *Registry) StreamResolvers() []StreamResolver {
 		}
 		if sr, ok := p.(StreamResolver); ok {
 			out = append(out, sr)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Manifest().Priority < out[j].Manifest().Priority
+	})
+	return out
+}
+
+func (r *Registry) SubtitleProviders() []SubtitleProvider {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []SubtitleProvider
+	for _, p := range r.plugins {
+		if !p.Manifest().Enabled {
+			continue
+		}
+		if sp, ok := p.(SubtitleProvider); ok {
+			out = append(out, sp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Manifest().Priority < out[j].Manifest().Priority
+	})
+	return out
+}
+
+func (r *Registry) ImageProviders() []ImageProvider {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []ImageProvider
+	for _, p := range r.plugins {
+		if !p.Manifest().Enabled {
+			continue
+		}
+		if ip, ok := p.(ImageProvider); ok {
+			out = append(out, ip)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Manifest().Priority < out[j].Manifest().Priority
+	})
+	return out
+}
+
+func (r *Registry) Notifiers() []Notifier {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []Notifier
+	for _, p := range r.plugins {
+		if !p.Manifest().Enabled {
+			continue
+		}
+		if np, ok := p.(Notifier); ok {
+			out = append(out, np)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {

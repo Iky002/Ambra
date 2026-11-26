@@ -48,9 +48,32 @@ type DeviceRecord struct {
 }
 
 type APIKeyRecord struct {
+	KeyID     string
 	Token     string
 	AppName   string
 	CreatedAt time.Time
+}
+
+type CameraUploadRecord struct {
+	UserID    string
+	DeviceID  string
+	FileID    string
+	Name      string
+	Album     string
+	MimeType  string
+	FilePath  string
+	FileSize  int64
+	ItemID    string
+	CreatedAt time.Time
+}
+
+// MaskAPIKey returns a safe display mask for an API key token without exposing the full secret.
+func MaskAPIKey(token string) string {
+	t := strings.TrimSpace(token)
+	if len(t) <= 8 {
+		return "********"
+	}
+	return t[:4] + "••••••••" + t[len(t)-4:]
 }
 
 type DisplayPreferencesRecord struct {
@@ -334,6 +357,34 @@ var ErrLastAdmin = errors.New("cannot remove or disable the last active administ
 // ErrUserExists is returned when inserting a user violates the case-insensitive unique username constraint.
 var ErrUserExists = errors.New("user already exists")
 
+func purgeUserScopedStateTx(ctx context.Context, tx *sql.Tx, norm, rawID string) {
+	_, _ = tx.ExecContext(ctx, `DELETE FROM display_preferences WHERE user_id = ? OR user_id = ?`, norm, rawID)
+	_, _ = tx.ExecContext(ctx, `DELETE FROM camera_uploads WHERE user_id = ? OR user_id = ?`, norm, rawID)
+	for _, uid := range []string{norm, rawID} {
+		if strings.TrimSpace(uid) == "" {
+			continue
+		}
+		exactKeys := []string{
+			"user_settings:" + uid,
+			"user_home_sections:" + uid,
+			"user_searched_items:" + uid,
+			"user_connect_link:" + uid,
+			"party:last_leave:" + uid,
+		}
+		for _, k := range exactKeys {
+			_, _ = tx.ExecContext(ctx, `DELETE FROM server_config WHERE key = ?`, k)
+		}
+		likePrefixes := []string{
+			"user_typed_settings:" + uid + ":%",
+			"user_rating:" + uid + ":%",
+			"user_hide_resume:" + uid + ":%",
+		}
+		for _, p := range likePrefixes {
+			_, _ = tx.ExecContext(ctx, `DELETE FROM server_config WHERE key LIKE ?`, p)
+		}
+	}
+}
+
 func (r *UserRepo) DeleteUser(ctx context.Context, id string) error {
 	norm := guid.Normalize(id)
 	tx, err := r.store.Writer.BeginTx(ctx, nil)
@@ -342,7 +393,7 @@ func (r *UserRepo) DeleteUser(ctx context.Context, id string) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	_, _ = tx.ExecContext(ctx, `DELETE FROM display_preferences WHERE user_id = ? OR user_id = ?`, norm, id)
+	purgeUserScopedStateTx(ctx, tx, norm, id)
 	res, err := tx.ExecContext(ctx, `DELETE FROM users WHERE id = ? OR id = ?`, norm, id)
 	if err != nil {
 		return err
@@ -389,7 +440,7 @@ func (r *UserRepo) DeleteUserSafe(ctx context.Context, id string) error {
 		}
 	}
 
-	_, _ = tx.ExecContext(ctx, `DELETE FROM display_preferences WHERE user_id = ? OR user_id = ?`, norm, targetID)
+	purgeUserScopedStateTx(ctx, tx, norm, targetID)
 	res, err := tx.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, targetID)
 	if err != nil {
 		return err
@@ -563,9 +614,12 @@ func (r *UserRepo) CreateAPIKey(ctx context.Context, k *APIKeyRecord) error {
 	if k.CreatedAt.IsZero() {
 		k.CreatedAt = time.Now().UTC()
 	}
+	if strings.TrimSpace(k.KeyID) == "" {
+		k.KeyID = guid.New()
+	}
 	_, err := r.store.Writer.ExecContext(ctx,
-		`INSERT INTO api_keys (token, app_name, created_at) VALUES (?, ?, ?)`,
-		k.Token, k.AppName, k.CreatedAt.Unix(),
+		`INSERT INTO api_keys (token, app_name, created_at, key_id) VALUES (?, ?, ?, ?)`,
+		k.Token, k.AppName, k.CreatedAt.Unix(), k.KeyID,
 	)
 	return err
 }
@@ -574,8 +628,8 @@ func (r *UserRepo) GetAPIKey(ctx context.Context, token string) (*APIKeyRecord, 
 	var rec APIKeyRecord
 	var createdAt int64
 	err := r.store.Reader.QueryRowContext(ctx,
-		`SELECT token, app_name, created_at FROM api_keys WHERE token = ?`, token,
-	).Scan(&rec.Token, &rec.AppName, &createdAt)
+		`SELECT COALESCE(key_id, ''), token, app_name, created_at FROM api_keys WHERE token = ?`, token,
+	).Scan(&rec.KeyID, &rec.Token, &rec.AppName, &createdAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -588,7 +642,7 @@ func (r *UserRepo) GetAPIKey(ctx context.Context, token string) (*APIKeyRecord, 
 
 func (r *UserRepo) ListAPIKeys(ctx context.Context) ([]APIKeyRecord, error) {
 	rows, err := r.store.Reader.QueryContext(ctx,
-		`SELECT token, app_name, created_at FROM api_keys ORDER BY created_at DESC`)
+		`SELECT COALESCE(key_id, ''), token, app_name, created_at FROM api_keys ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -598,7 +652,7 @@ func (r *UserRepo) ListAPIKeys(ctx context.Context) ([]APIKeyRecord, error) {
 	for rows.Next() {
 		var rec APIKeyRecord
 		var ts int64
-		if err := rows.Scan(&rec.Token, &rec.AppName, &ts); err != nil {
+		if err := rows.Scan(&rec.KeyID, &rec.Token, &rec.AppName, &ts); err != nil {
 			return nil, err
 		}
 		rec.CreatedAt = time.Unix(ts, 0).UTC()
@@ -608,8 +662,108 @@ func (r *UserRepo) ListAPIKeys(ctx context.Context) ([]APIKeyRecord, error) {
 }
 
 func (r *UserRepo) DeleteAPIKey(ctx context.Context, token string) error {
-	_, err := r.store.Writer.ExecContext(ctx, `DELETE FROM api_keys WHERE token = ?`, token)
+	_, err := r.DeleteAPIKeyByIDOrToken(ctx, token)
 	return err
+}
+
+// DeleteAPIKeyByIDOrToken deletes an API key matching either its KeyID or raw Token,
+// returning the deleted raw Token (empty if nothing matched) so callers can evict caches/WebSockets.
+func (r *UserRepo) DeleteAPIKeyByIDOrToken(ctx context.Context, idOrToken string) (string, error) {
+	key := strings.TrimSpace(idOrToken)
+	if key == "" {
+		return "", nil
+	}
+	tx, err := r.store.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var rawToken string
+	err = tx.QueryRowContext(ctx,
+		`SELECT token FROM api_keys WHERE token = ? OR key_id = ? LIMIT 1`,
+		key, key,
+	).Scan(&rawToken)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM api_keys WHERE token = ?`, rawToken); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return rawToken, nil
+}
+
+// --- Camera Uploads ---
+
+func (r *UserRepo) UpsertCameraUpload(ctx context.Context, rec *CameraUploadRecord) error {
+	if rec.CreatedAt.IsZero() {
+		rec.CreatedAt = time.Now().UTC()
+	}
+	_, err := r.store.Writer.ExecContext(ctx, `
+		INSERT INTO camera_uploads (user_id, device_id, file_id, name, album, mime_type, file_path, file_size, item_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(user_id, device_id, file_id) DO UPDATE SET
+			name = excluded.name,
+			album = excluded.album,
+			mime_type = excluded.mime_type,
+			file_path = excluded.file_path,
+			file_size = excluded.file_size,
+			item_id = excluded.item_id,
+			created_at = excluded.created_at`,
+		guid.Normalize(rec.UserID), strings.TrimSpace(rec.DeviceID), strings.TrimSpace(rec.FileID),
+		rec.Name, rec.Album, rec.MimeType, rec.FilePath, rec.FileSize, rec.ItemID, rec.CreatedAt.Unix(),
+	)
+	return err
+}
+
+func (r *UserRepo) ListCameraUploads(ctx context.Context, userID, deviceID string) ([]CameraUploadRecord, error) {
+	rows, err := r.store.Reader.QueryContext(ctx, `
+		SELECT user_id, device_id, file_id, name, album, mime_type, file_path, file_size, item_id, created_at
+		FROM camera_uploads
+		WHERE user_id = ? AND device_id = ?
+		ORDER BY created_at DESC`,
+		guid.Normalize(userID), strings.TrimSpace(deviceID),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []CameraUploadRecord
+	for rows.Next() {
+		var rec CameraUploadRecord
+		var ts int64
+		if err := rows.Scan(
+			&rec.UserID, &rec.DeviceID, &rec.FileID, &rec.Name, &rec.Album,
+			&rec.MimeType, &rec.FilePath, &rec.FileSize, &rec.ItemID, &ts,
+		); err != nil {
+			return nil, err
+		}
+		rec.CreatedAt = time.Unix(ts, 0).UTC()
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+func (r *UserRepo) DeleteDeviceArtifacts(ctx context.Context, deviceID string) error {
+	dev := strings.TrimSpace(deviceID)
+	if dev == "" {
+		return nil
+	}
+	tx, err := r.store.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	_, _ = tx.ExecContext(ctx, `DELETE FROM camera_uploads WHERE device_id = ?`, dev)
+	_, _ = tx.ExecContext(ctx, `DELETE FROM server_config WHERE key = ? OR key = ?`, "device_options:"+dev, "device_camera_uploads:"+dev)
+	return tx.Commit()
 }
 
 // --- Display Preferences ---
@@ -677,6 +831,10 @@ func (r *UserRepo) CreateActivityLog(ctx context.Context, entry *ActivityLogReco
 }
 
 func (r *UserRepo) ListActivityLogs(ctx context.Context, startIndex, limit int, minDate *time.Time) ([]ActivityLogRecord, int, error) {
+	return r.ListActivityLogsFiltered(ctx, startIndex, limit, minDate, "", "")
+}
+
+func (r *UserRepo) ListActivityLogsFiltered(ctx context.Context, startIndex, limit int, minDate *time.Time, severity, searchTerm string) ([]ActivityLogRecord, int, error) {
 	if startIndex < 0 {
 		startIndex = 0
 	}
@@ -684,34 +842,39 @@ func (r *UserRepo) ListActivityLogs(ctx context.Context, startIndex, limit int, 
 		limit = 50
 	}
 
-	var total int
-	var err error
+	var clauses []string
+	var args []any
 	if minDate != nil {
-		err = r.store.Reader.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM activity_logs WHERE created_at >= ?`, minDate.Unix(),
-		).Scan(&total)
-	} else {
-		err = r.store.Reader.QueryRowContext(ctx, `SELECT COUNT(*) FROM activity_logs`).Scan(&total)
+		clauses = append(clauses, `created_at >= ?`)
+		args = append(args, minDate.Unix())
 	}
-	if err != nil {
+	if sev := strings.TrimSpace(severity); sev != "" && !strings.EqualFold(sev, "all") {
+		clauses = append(clauses, `LOWER(severity) = LOWER(?)`)
+		args = append(args, sev)
+	}
+	if q := strings.TrimSpace(searchTerm); q != "" {
+		esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(strings.ToLower(q))
+		pat := "%" + esc + "%"
+		clauses = append(clauses, `(LOWER(name) LIKE ? ESCAPE '\' OR LOWER(COALESCE(overview,'')) LIKE ? ESCAPE '\' OR LOWER(COALESCE(short_overview,'')) LIKE ? ESCAPE '\' OR LOWER(type) LIKE ? ESCAPE '\')`)
+		args = append(args, pat, pat, pat, pat)
+	}
+
+	whereSQL := ""
+	if len(clauses) > 0 {
+		whereSQL = " WHERE " + strings.Join(clauses, " AND ")
+	}
+
+	var total int
+	if err := r.store.Reader.QueryRowContext(ctx, `SELECT COUNT(*) FROM activity_logs`+whereSQL, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
-	var rows *sql.Rows
-	if minDate != nil {
-		rows, err = r.store.Reader.QueryContext(ctx, `
-			SELECT id, name, COALESCE(overview,''), COALESCE(short_overview,''), type, COALESCE(item_id,''), COALESCE(user_id,''), severity, created_at
-			FROM activity_logs
-			WHERE created_at >= ?
-			ORDER BY created_at DESC, id DESC
-			LIMIT ? OFFSET ?`, minDate.Unix(), limit, startIndex)
-	} else {
-		rows, err = r.store.Reader.QueryContext(ctx, `
-			SELECT id, name, COALESCE(overview,''), COALESCE(short_overview,''), type, COALESCE(item_id,''), COALESCE(user_id,''), severity, created_at
-			FROM activity_logs
-			ORDER BY created_at DESC, id DESC
-			LIMIT ? OFFSET ?`, limit, startIndex)
-	}
+	queryArgs := append(append([]any(nil), args...), limit, startIndex)
+	rows, err := r.store.Reader.QueryContext(ctx, `
+		SELECT id, name, COALESCE(overview,''), COALESCE(short_overview,''), type, COALESCE(item_id,''), COALESCE(user_id,''), severity, created_at
+		FROM activity_logs`+whereSQL+`
+		ORDER BY created_at DESC, id DESC
+		LIMIT ? OFFSET ?`, queryArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -831,16 +994,51 @@ func (r *UserRepo) UpsertPlaybackProgress(
 	return r.GetUserItemData(ctx, uid, iid)
 }
 
+func (r *UserRepo) SetUserItemLikes(ctx context.Context, userID, itemID string, likes *bool) (*UserItemDataRecord, error) {
+	uid := guid.Normalize(userID)
+	iid := guid.Normalize(itemID)
+	var canonicalID string
+	err := r.store.Reader.QueryRowContext(ctx,
+		`SELECT id FROM items WHERE id = ? OR id = ? LIMIT 1`,
+		iid, itemID,
+	).Scan(&canonicalID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	var likesVal any
+	if likes != nil {
+		if *likes {
+			likesVal = 1
+		} else {
+			likesVal = 0
+		}
+	}
+	_, err = r.store.Writer.ExecContext(ctx, `
+		INSERT INTO user_item_data (user_id, item_id, likes)
+		VALUES (?, ?, ?)
+		ON CONFLICT(user_id, item_id) DO UPDATE SET
+			likes = excluded.likes`,
+		uid, canonicalID, likesVal,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return r.GetUserItemData(ctx, uid, canonicalID)
+}
+
 func (r *UserRepo) GetUserItemData(ctx context.Context, userID, itemID string) (*UserItemDataRecord, error) {
 	var rec UserItemDataRecord
 	var played, fav int
-	var lastPlayed, audioIdx, subIdx sql.NullInt64
+	var likes, lastPlayed, audioIdx, subIdx sql.NullInt64
 	err := r.store.Reader.QueryRowContext(ctx, `
-		SELECT user_id, item_id, played, play_count, playback_position_ticks, is_favorite, last_played_date, audio_stream_index, subtitle_stream_index
+		SELECT user_id, item_id, played, play_count, playback_position_ticks, is_favorite, likes, last_played_date, audio_stream_index, subtitle_stream_index
 		FROM user_item_data
 		WHERE user_id = ? AND item_id = ?`,
 		guid.Normalize(userID), guid.Normalize(itemID),
-	).Scan(&rec.UserID, &rec.ItemID, &played, &rec.PlayCount, &rec.PlaybackPositionTicks, &fav, &lastPlayed, &audioIdx, &subIdx)
+	).Scan(&rec.UserID, &rec.ItemID, &played, &rec.PlayCount, &rec.PlaybackPositionTicks, &fav, &likes, &lastPlayed, &audioIdx, &subIdx)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -849,6 +1047,10 @@ func (r *UserRepo) GetUserItemData(ctx context.Context, userID, itemID string) (
 	}
 	rec.Played = played != 0
 	rec.IsFavorite = fav != 0
+	if likes.Valid {
+		v := likes.Int64 != 0
+		rec.Likes = &v
+	}
 	if lastPlayed.Valid {
 		ts := lastPlayed.Int64
 		rec.LastPlayedDate = &ts

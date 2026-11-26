@@ -15,6 +15,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/ws"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
 )
@@ -25,7 +26,13 @@ func (h *Handler) postSystemRestart(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	h.restartRequested = true
 	cb := h.onRestart
+	wsHub := h.wsHub
 	h.mu.Unlock()
+	if wsHub != nil {
+		if bc, ok := wsHub.(interface{ Broadcast(ws.Message) }); ok {
+			bc.Broadcast(ws.Message{MessageType: "ServerRestarting", Data: ""})
+		}
+	}
 	if cb != nil {
 		go cb()
 	}
@@ -36,7 +43,13 @@ func (h *Handler) postSystemShutdown(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	h.shutdownRequested = true
 	cb := h.onShutdown
+	wsHub := h.wsHub
 	h.mu.Unlock()
+	if wsHub != nil {
+		if bc, ok := wsHub.(interface{ Broadcast(ws.Message) }); ok {
+			bc.Broadcast(ws.Message{MessageType: "ServerShuttingDown", Data: ""})
+		}
+	}
 	if cb != nil {
 		go cb()
 	}
@@ -46,12 +59,11 @@ func (h *Handler) postSystemShutdown(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) getSystemEndpoint(w http.ResponseWriter, r *http.Request) {
 	clientIP := netutil.ClientIP(r)
 	isLocal := false
-	isInNetwork := false
 	if addr, err := netip.ParseAddr(strings.TrimSpace(clientIP)); err == nil {
 		addr = addr.WithZone("").Unmap()
 		isLocal = addr.IsLoopback()
-		isInNetwork = netutil.IsLANIP(addr)
 	}
+	isInNetwork := netutil.IsLocalOrLANRequest(r)
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"IsLocal":     isLocal,
 		"IsInNetwork": isInNetwork,
@@ -212,14 +224,35 @@ func (h *Handler) postAppstoreRegister(w http.ResponseWriter, r *http.Request) {
 // --- /BackupRestore ---
 
 func (h *Handler) postBackupRestoreData(w http.ResponseWriter, r *http.Request) {
+	h.mu.RLock()
+	restoreFn := h.restoreHandler
+	h.mu.RUnlock()
+	if restoreFn != nil {
+		restoreFn(w, r)
+		return
+	}
 	body := map[string]any{}
 	if err := decodeOptionalJSON(r, &body); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	body["RestoredAt"] = time.Now().UTC().Format(time.RFC3339)
-	_ = h.saveKV(r.Context(), "backup:last_restore", body)
-	httpx.NoContent(w)
+	name, _ := body["Name"].(string)
+	if name == "" {
+		name, _ = body["BackupName"].(string)
+	}
+	if name == "" {
+		if p, ok := body["Path"].(string); ok && strings.TrimSpace(p) != "" {
+			name = filepath.Base(strings.TrimSpace(p))
+		}
+	}
+	if strings.TrimSpace(name) == "" {
+		// Compatibility probe when no backup archive name was supplied
+		body["RestoredAt"] = time.Now().UTC().Format(time.RFC3339)
+		_ = h.saveKV(r.Context(), "backup:last_restore", body)
+		httpx.NoContent(w)
+		return
+	}
+	httpx.Error(w, http.StatusNotFound, "backup restore handler not configured")
 }
 
 // --- /Environment ---
@@ -238,10 +271,13 @@ func (h *Handler) postEnvironmentDirectoryContents(w http.ResponseWriter, r *htt
 		IncludeDirectories bool   `json:"IncludeDirectories"`
 	}
 	body.IncludeDirectories = true
-	_ = decodeOptionalJSON(r, &body)
-	target := strings.TrimSpace(body.Path)
-	if target == "" {
-		target = strings.TrimSpace(q.Get("Path"))
+	if err := decodeOptionalJSONLimit(r, &body, maxKVJSONBodyBytes); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	explicitTarget := strings.TrimSpace(body.Path)
+	if explicitTarget == "" {
+		explicitTarget = strings.TrimSpace(q.Get("Path"))
 	}
 	if b := q.Bool("IncludeFiles"); b != nil {
 		body.IncludeFiles = *b
@@ -249,10 +285,22 @@ func (h *Handler) postEnvironmentDirectoryContents(w http.ResponseWriter, r *htt
 	if b := q.Bool("IncludeDirectories"); b != nil {
 		body.IncludeDirectories = *b
 	}
-	if target == "" {
+
+	target := explicitTarget
+	if target != "" {
+		if !filepath.IsAbs(target) {
+			httpx.Error(w, http.StatusBadRequest, "Path must be an absolute path")
+			return
+		}
+		target = filepath.Clean(target)
+	} else {
 		if h.cfg != nil {
-			if dd := h.cfg.Snapshot().DataDir; dd != "" {
-				target = dd
+			if dd := strings.TrimSpace(h.cfg.Snapshot().DataDir); dd != "" {
+				if absDD, err := filepath.Abs(dd); err == nil {
+					target = absDD
+				} else {
+					target = dd
+				}
 			}
 		}
 		if target == "" {
@@ -265,9 +313,22 @@ func (h *Handler) postEnvironmentDirectoryContents(w http.ResponseWriter, r *htt
 		httpx.JSON(w, http.StatusOK, []fileSystemEntry{})
 		return
 	}
-	out := make([]fileSystemEntry, 0, len(entries))
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name() < entries[j].Name()
+	})
+	capLen := len(entries)
+	if capLen > maxDirectoryContentsEntries {
+		capLen = maxDirectoryContentsEntries
+	}
+	out := make([]fileSystemEntry, 0, capLen)
 	for _, e := range entries {
+		fullPath := filepath.Join(target, e.Name())
 		isDir := e.IsDir()
+		if !isDir && e.Type()&os.ModeSymlink != 0 {
+			if st, statErr := os.Stat(fullPath); statErr == nil && st.IsDir() {
+				isDir = true
+			}
+		}
 		if isDir && !body.IncludeDirectories {
 			continue
 		}
@@ -280,13 +341,13 @@ func (h *Handler) postEnvironmentDirectoryContents(w http.ResponseWriter, r *htt
 		}
 		out = append(out, fileSystemEntry{
 			Name: e.Name(),
-			Path: filepath.Join(target, e.Name()),
+			Path: fullPath,
 			Type: kind,
 		})
+		if len(out) >= maxDirectoryContentsEntries {
+			break
+		}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].Name < out[j].Name
-	})
 	httpx.JSON(w, http.StatusOK, out)
 }
 
@@ -324,6 +385,13 @@ func (h *Handler) deleteInstallingPackage(w http.ResponseWriter, r *http.Request
 // --- /Parties ---
 
 func (h *Handler) postPartiesLeave(w http.ResponseWriter, r *http.Request) {
+	h.mu.RLock()
+	leaveFn := h.partyLeaveHandler
+	h.mu.RUnlock()
+	if leaveFn != nil {
+		leaveFn(w, r)
+		return
+	}
 	uid := h.resolveUserID(r, "")
 	_ = h.saveKV(r.Context(), "party:last_leave:"+uid, map[string]any{
 		"UserId": uid,
@@ -333,6 +401,13 @@ func (h *Handler) postPartiesLeave(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) postPartiesMessages(w http.ResponseWriter, r *http.Request) {
+	h.mu.RLock()
+	msgFn := h.partyMsgHandler
+	h.mu.RUnlock()
+	if msgFn != nil {
+		msgFn(w, r)
+		return
+	}
 	if r.ContentLength > maxPartyMessageBytes {
 		httpx.Error(w, http.StatusRequestEntityTooLarge, "message too large")
 		return

@@ -67,16 +67,12 @@ func TestCompatCoreV0107AuditDeviceLockRateCapSnapshotAndKVLock(t *testing.T) {
 		key := fmt.Sprintf("198.51.%d.%d", i/256, i%256)
 		appendRateBucketLocked(env.handler.forgotRates, key, now, maxRateLimitBuckets)
 		appendRateBucketLocked(env.handler.authByIDRates, key, now, maxRateLimitBuckets)
-		appendRateBucketLocked(env.handler.authByIDUserRates, "user-"+key, now, maxRateLimitBuckets)
 	}
 	if len(env.handler.forgotRates) > maxRateLimitBuckets {
 		t.Fatalf("M-8 forgotRates exceeded cap: %d", len(env.handler.forgotRates))
 	}
 	if len(env.handler.authByIDRates) > maxRateLimitBuckets {
 		t.Fatalf("M-8 authByIDRates exceeded cap: %d", len(env.handler.authByIDRates))
-	}
-	if len(env.handler.authByIDUserRates) > maxRateLimitBuckets {
-		t.Fatalf("M-8 authByIDUserRates exceeded cap: %d", len(env.handler.authByIDUserRates))
 	}
 	// Also test checkIPRateLimit cap on forgotPinRates
 	for i := 0; i < maxRateLimitBuckets+20; i++ {

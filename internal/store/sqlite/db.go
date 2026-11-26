@@ -260,7 +260,92 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 	}
+
+	var v7 int
+	if err := s.Writer.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 7`).Scan(&v7); err != nil {
+		return err
+	}
+	if v7 == 0 {
+		if err := s.applyMigrationV7(ctx); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (s *Store) tableColumns(ctx context.Context, table string) (map[string]bool, error) {
+	cols := make(map[string]bool)
+	rows, err := s.Writer.QueryContext(ctx, fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid        int
+			name, ctyp string
+			notnull    int
+			dflt       sql.NullString
+			pk         int
+		)
+		if err := rows.Scan(&cid, &name, &ctyp, &notnull, &dflt, &pk); err != nil {
+			return nil, err
+		}
+		cols[strings.ToLower(name)] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return cols, nil
+}
+
+func (s *Store) applyMigrationV7(ctx context.Context) error {
+	uidCols, err := s.tableColumns(ctx, "user_item_data")
+	if err != nil {
+		return fmt.Errorf("migration 007 user_item_data columns: %w", err)
+	}
+	keyCols, err := s.tableColumns(ctx, "api_keys")
+	if err != nil {
+		return fmt.Errorf("migration 007 api_keys columns: %w", err)
+	}
+
+	sqlBytes, err := migrationsFS.ReadFile("migrations/007_remediation.sql")
+	if err != nil {
+		return fmt.Errorf("read migration 007: %w", err)
+	}
+
+	tx, err := s.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if !uidCols["likes"] {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE user_item_data ADD COLUMN likes INTEGER NULL`); err != nil {
+			return fmt.Errorf("migration 007 add user_item_data.likes: %w", err)
+		}
+	}
+	if !keyCols["key_id"] {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE api_keys ADD COLUMN key_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("migration 007 add api_keys.key_id: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE api_keys SET key_id = lower(hex(randomblob(16))) WHERE COALESCE(key_id, '') = ''`); err != nil {
+		return fmt.Errorf("migration 007 backfill api_keys.key_id: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_api_keys_key_id ON api_keys(key_id)`); err != nil {
+		return fmt.Errorf("migration 007 index api_keys.key_id: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, string(sqlBytes)); err != nil {
+		return fmt.Errorf("apply migration 007 tables: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE items SET parental_rating_value = parental_rating_rank(official_rating)`); err != nil {
+		return fmt.Errorf("migration 007 refresh parental_rating_value: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (7, ?)`, time.Now().Unix()); err != nil {
+		return fmt.Errorf("migration 007 record version: %w", err)
+	}
+	return tx.Commit()
 }
 
 func (s *Store) applyMigrationV3(ctx context.Context) error {

@@ -245,14 +245,17 @@ func TestStreamingHandlerImageResizeAnd304(t *testing.T) {
 		{ItemID: itemID, ImageType: "Primary", ImageIndex: 0, Path: posterPath, Tag: "realtag"},
 	})
 
-	// 1. Dynamic resize via ?maxWidth=100&quality=75
+	// 1. Dynamic resize via ?tag=realtag&maxWidth=100&quality=75
 	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Primary?maxWidth=100&quality=75", nil))
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Primary?tag=realtag&maxWidth=100&quality=75", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 for resized image, got %d", rec.Code)
 	}
 	if rec.Header().Get("Content-Type") != "image/jpeg" {
 		t.Fatalf("expected image/jpeg, got %s", rec.Header().Get("Content-Type"))
+	}
+	if cc := rec.Header().Get("Cache-Control"); cc != "private, max-age=86400" {
+		t.Fatalf("expected Cache-Control private, max-age=86400, got %q", cc)
 	}
 	etag := rec.Header().Get("ETag")
 	if !strings.HasPrefix(etag, `"realtag-`) {
@@ -267,7 +270,7 @@ func TestStreamingHandlerImageResizeAnd304(t *testing.T) {
 	}
 
 	// 2. If-None-Match with returned ETag -> 304 Not Modified
-	req304 := httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Primary?maxWidth=100&quality=75", nil)
+	req304 := httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Primary?tag=realtag&maxWidth=100&quality=75", nil)
 	req304.Header.Set("If-None-Match", etag)
 	rec304 := httptest.NewRecorder()
 	mux.ServeHTTP(rec304, req304)
@@ -277,7 +280,7 @@ func TestStreamingHandlerImageResizeAnd304(t *testing.T) {
 
 	// 3. Fill center crop + PNG format -> 60x60 PNG with distinct ETag
 	recFill := httptest.NewRecorder()
-	mux.ServeHTTP(recFill, httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Primary?fillWidth=60&fillHeight=60&format=png", nil))
+	mux.ServeHTTP(recFill, httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Primary?tag=realtag&fillWidth=60&fillHeight=60&format=png", nil))
 	if recFill.Code != http.StatusOK || recFill.Header().Get("Content-Type") != "image/png" {
 		t.Fatalf("expected 200 image/png for fill crop, got code=%d ct=%s", recFill.Code, recFill.Header().Get("Content-Type"))
 	}
@@ -292,9 +295,14 @@ func TestStreamingHandlerImageResizeAnd304(t *testing.T) {
 		t.Fatalf("expected 60x60 fill image, got %dx%d", decFill.Bounds().Dx(), decFill.Bounds().Dy())
 	}
 
-	// 4. Original image (no query params) -> passthrough bytes & original ETag
+	// 4. Original image (with valid tag, no resize params) -> passthrough bytes & original ETag; missing/wrong tag -> 404
+	recNoTag := httptest.NewRecorder()
+	mux.ServeHTTP(recNoTag, httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Primary", nil))
+	if recNoTag.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for anonymous image without tag, got %d", recNoTag.Code)
+	}
 	recOrig := httptest.NewRecorder()
-	mux.ServeHTTP(recOrig, httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Primary", nil))
+	mux.ServeHTTP(recOrig, httptest.NewRequest(http.MethodGet, "/Items/"+itemID+"/Images/Primary?tag=realtag", nil))
 	if recOrig.Code != http.StatusOK || recOrig.Header().Get("ETag") != `"realtag"` || !bytes.Equal(recOrig.Body.Bytes(), buf.Bytes()) {
 		t.Fatalf("expected original passthrough image")
 	}

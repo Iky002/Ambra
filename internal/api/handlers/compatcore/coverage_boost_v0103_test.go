@@ -240,20 +240,18 @@ func TestCompatCoreCoverageBoostV0103(t *testing.T) {
 			t.Fatalf("expected 401 for empty access token in connectExchange, got %d", recCE2.Code)
 		}
 
-		// postSessionAddUser: nonexistent session -> 404; existing session exercises eviction branch
+		// postSessionAddUser: nonexistent session -> 404; existing session attaches AdditionalUsers
 		recMissing := callAs(adminAC, http.MethodPost, "/Sessions/new-evict-sid/Users/"+env.user2.ID, "", "")
 		if recMissing.Code != http.StatusNotFound {
 			t.Fatalf("expected 404 on postSessionAddUser for nonexistent session, got %d", recMissing.Code)
 		}
 		evictSess := env.sessions.TouchSession(env.admin, auth.ClientInfo{DeviceID: "evict-dev", Client: "Web"})
-		env.handler.mu.Lock()
-		for i := 0; i < maxSessionUsersEntries; i++ {
-			env.handler.sessionUsers[guid.New()] = map[string]bool{"u": true}
-		}
-		env.handler.mu.Unlock()
 		recAdd := callAs(adminAC, http.MethodPost, "/Sessions/"+evictSess.Id+"/Users/"+env.user2.ID, "", "")
 		if recAdd.Code != http.StatusNoContent {
-			t.Fatalf("expected 204 on postSessionAddUser eviction, got %d", recAdd.Code)
+			t.Fatalf("expected 204 on postSessionAddUser, got %d", recAdd.Code)
+		}
+		if gotSess, ok := env.sessions.GetSession(evictSess.Id); !ok || len(gotSess.AdditionalUsers) != 1 {
+			t.Fatalf("expected 1 AdditionalUser in session, got %+v", gotSess.AdditionalUsers)
 		}
 	})
 
@@ -328,7 +326,7 @@ func TestCompatCoreCoverageBoostV0103(t *testing.T) {
 		}
 		env.handler.mu.Unlock()
 
-		recFP := callAs(nil, http.MethodPost, "/Users/ForgotPassword", `{"EnteredUsername":"admin"}`, "198.51.100.77:1111")
+		recFP := callAs(nil, http.MethodPost, "/Users/ForgotPassword", `{"EnteredUsername":"admin"}`, "127.0.0.1:1111")
 		if recFP.Code != http.StatusOK {
 			t.Fatalf("ForgotPassword got %d: %s", recFP.Code, recFP.Body.String())
 		}
@@ -338,15 +336,15 @@ func TestCompatCoreCoverageBoostV0103(t *testing.T) {
 		_ = os.WriteFile(expFile, []byte("exp"), 0o600)
 		env.handler.mu.Lock()
 		env.handler.forgotPinRates = nil
-		env.handler.forgotPins["EXPPIN"] = forgotPinEntry{
+		env.handler.forgotPins["999991"] = forgotPinEntry{
 			UserID:    env.admin.ID,
 			UserName:  env.admin.Name,
-			Pin:       "EXPPIN",
+			Pin:       "999991",
 			PinFile:   expFile,
 			ExpiresAt: time.Now().UTC().Add(-time.Minute),
 		}
 		env.handler.mu.Unlock()
-		recPin := callAs(nil, http.MethodPost, "/Users/ForgotPassword/Pin", `{"Pin":"EXPPIN"}`, "198.51.100.78:1111")
+		recPin := callAs(nil, http.MethodPost, "/Users/ForgotPassword/Pin", `{"Pin":"999991"}`, "127.0.0.1:1111")
 		if recPin.Code != http.StatusOK {
 			t.Fatalf("ForgotPassword/Pin got %d: %s", recPin.Code, recPin.Body.String())
 		}

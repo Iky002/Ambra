@@ -104,12 +104,17 @@ type Server struct {
 	dvrDone          chan struct{}
 	stopTrakt        func()
 	opsHandler       *ops.Handler
+	notifHandler     *notifications.Handler
+	syncHandler      *syncapi.Handler
 	migrationHandler *migrationhandler.Handler
 }
 
 func New(ctx context.Context, cfg *config.Config) (*Server, error) {
-	netutil.SetTrustedProxies(cfg.TrustedProxies)
-	if err := applyPendingDatabaseRestore(cfg.DataDir, cfg.DBPath()); err != nil {
+	snap := cfg.Snapshot()
+	netutil.SetTrustedProxies(snap.TrustedProxies)
+	netutil.SetLocalNetworkSubnets(snap.LocalNetworkSubnets)
+	migration.SetSelfServerIdentity(snap.HTTPAddr, snap.ServerID)
+	if err := applyPendingDatabaseRestore(snap.DataDir, cfg.DBPath()); err != nil {
 		return nil, fmt.Errorf("apply pending database restore: %w", err)
 	}
 	store, err := sqlite.Open(cfg.DBPath())
@@ -121,20 +126,26 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	registry := plugins.NewRegistry()
 	// Register built-in official plugins
 	registry.Register(nfo.New())
-	registry.Register(tmdb.New(cfg.TMDBApiKey, cfg.TMDBLanguage).WithDefaultAPIKey(config.DefaultTMDBApiKey))
+	registry.Register(tmdb.New(snap.TMDBApiKey, snap.TMDBLanguage).WithDefaultAPIKey(config.DefaultTMDBApiKey))
 	registry.Register(tvdb.New())
-	registry.Register(strm.New(cfg.EnableSTRM302))
+	registry.Register(strm.New(snap.EnableSTRM302))
 	traktPlugin := trakt.New()
 	registry.Register(traktPlugin)
 
 	// Discover external HTTP & WASM (wazero) plugins in data/plugins/*
-	pluginsDir := filepath.Join(cfg.DataDir, "plugins")
+	pluginsDir := filepath.Join(snap.DataDir, "plugins")
 	extLoader := ext.NewLoader()
-	_, _ = extLoader.LoadFromDir(pluginsDir, registry)
+	if _, lErr := extLoader.LoadFromDir(pluginsDir, registry); lErr != nil {
+		slog.Warn("some external HTTP plugins failed to load", "dir", pluginsDir, "error", lErr)
+	}
 
 	wHost, err := wasmhost.NewHost(ctx)
 	if err == nil {
-		_, _ = wHost.LoadFromDir(ctx, pluginsDir, registry)
+		if _, wErr := wHost.LoadFromDir(ctx, pluginsDir, registry); wErr != nil {
+			slog.Warn("some WASM plugins failed to load", "dir", pluginsDir, "error", wErr)
+		}
+	} else {
+		slog.Warn("failed to initialize WASM plugin host", "error", err)
 	}
 
 	userRepo := sqlite.NewUserRepo(store)
@@ -157,8 +168,10 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	sessionMgr := session.NewManager(userRepo, cfg, bus)
 	sessionMgr.SetItemAccessChecker(buildSessionItemAccessChecker(libRepo))
 	authMW := middleware.NewAuth(authSvc, sessionMgr)
+	authMW.SetConfig(cfg)
 	wsHub := ws.NewHub(authSvc, sessionMgr, bus)
-	wsHub.SetAllowedOrigins(cfg.AllowedOrigins)
+	wsHub.SetConfig(cfg)
+	wsHub.SetAllowedOrigins(snap.AllowedOrigins)
 	wsHub.SetLibraryChangeFilter(buildWSLibraryChangeFilter(userRepo, libRepo))
 
 	bgBudget := budget.Global()
@@ -188,20 +201,22 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	})
 	pb := playback.New(libRepo, registry, cfg)
 	pb.SetUserRepo(userRepo)
-	imgSvc := imaging.New(libRepo).WithCacheDir(cfg.ImageCacheDir())
+	imgSvc := imaging.New(libRepo).WithCacheDir(cfg.ImageCacheDir()).WithFFmpegPath(snap.FFmpegPath)
 	transcodeMgr := transcode.NewManager(cfg)
+	transcodeMgr.SetStore(store)
+	transcodeMgr.ReloadEncodingOptions(ctx)
 	dvrRec := dvr.NewRecorder(dvr.Options{
-		DataDir:    cfg.DataDir,
-		FFmpegPath: cfg.FFmpegPath,
+		DataDir:    snap.DataDir,
+		FFmpegPath: snap.FFmpegPath,
 		Bus:        bus,
 	})
 	var ssdpB *ssdp.Broadcaster
-	if cfg.EnableDLNA {
+	if snap.EnableDLNA {
 		ssdpB = ssdp.NewBroadcaster(ssdp.Config{
-			ServerID:      cfg.ServerID,
-			ServerName:    cfg.ServerName,
+			ServerID:      snap.ServerID,
+			ServerName:    snap.ServerName,
 			ServerVersion: config.ServerVersion,
-			Port:          parseHTTPPort(cfg.HTTPAddr),
+			Port:          parseHTTPPort(snap.HTTPAddr),
 		})
 	}
 
@@ -293,6 +308,29 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	}
 
 	pluginAdminH := pluginadmin.New(registry, store)
+	pluginAdminH.SetOnConfigSaved(func(pluginID string, saved map[string]any) {
+		switch pluginID {
+		case "ambra.builtin.tmdb":
+			cfg.Update(func(c *config.Config) {
+				if v, ok := saved["api_key"].(string); ok {
+					c.TMDBApiKey = strings.TrimSpace(v)
+				}
+				if v, ok := saved["language"].(string); ok && strings.TrimSpace(v) != "" {
+					c.TMDBLanguage = strings.TrimSpace(v)
+				}
+			})
+			_ = cfg.Save()
+		case "ambra.builtin.strm":
+			cfg.Update(func(c *config.Config) {
+				if v, ok := saved["enable_302"].(bool); ok {
+					c.EnableSTRM302 = v
+				} else if v, ok := saved["enable_strm_302"].(bool); ok {
+					c.EnableSTRM302 = v
+				}
+			})
+			_ = cfg.Save()
+		}
+	})
 	if err := pluginAdminH.ApplySavedConfigs(ctx); err != nil {
 		slog.Warn("some saved plugin configs failed to apply", "error", err)
 	}
@@ -306,6 +344,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 			_, _ = rankingsSvc.SyncAndApply(c)
 		},
 	})
+	systemHandler.SetWSHub(wsHub)
 	usersHandler := users.NewHandler(authSvc, userRepo, sessionMgr, wsHub, cfg)
 	usersHandler.SetLibraryRepo(libRepo)
 
@@ -387,6 +426,13 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	hlsH := hls.New(libRepo, transcodeMgr, cfg)
 	hlsH.SetUserRepo(userRepo)
 	hlsH.SetStreamResolver(resolveStreamURL)
+	hlsH.SetStreamResolverWithHeaders(func(c context.Context, rawPath string) (string, map[string]string, error) {
+		res, rErr := pb.ResolveStream(c, rawPath)
+		if rErr != nil || res == nil {
+			return "", nil, rErr
+		}
+		return res.URL, res.Headers, nil
+	})
 	hlsH.RegisterRoutes(mediaMux, hls.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
@@ -394,14 +440,16 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	})
 	audioH := audio.New(libRepo, cfg)
 	audioH.SetUserRepo(userRepo)
+	audioH.SetTranscodeManager(transcodeMgr)
 	audioH.SetStreamResolver(resolveStreamURL)
 	audioH.SetStreamResolverFull(func(c context.Context, rawPath string) (string, bool, error) {
-		res, err := pb.ResolveStream(c, rawPath)
-		if err != nil || res == nil {
-			return "", false, err
+		res, rErr := pb.ResolveStream(c, rawPath)
+		if rErr != nil || res == nil {
+			return "", false, rErr
 		}
 		return res.URL, res.Is302, nil
 	})
+	audioH.SetStreamResolverWithHeaders(pb.ResolveStream)
 	audioH.RegisterRoutes(mediaMux, audio.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
@@ -411,6 +459,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	// Phase 4 & 5: LiveTV, Sync, Notifications, Startup, Packages, Webhooks, BackupRestore, OpenAPI, GenericUI, Parties, Connect
 	livetvH := livetv.New(store, cfg)
 	livetvH.SetUserRepo(userRepo)
+	livetvH.SetLibraryRepo(libRepo)
 	livetvH.SetRecorder(dvrRec)
 	dvrRec.SetOnFinished(livetvH.OnRecordingFinished)
 	livetvH.RegisterRoutes(mediaMux, livetv.AuthFuncs{
@@ -418,9 +467,30 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
 	})
+	halfDayTicks := int64(12 * 3600 * 10_000_000)
+	taskMgr.Register(scheduler.TaskDefinition{
+		ID:          "refresh-livetv-guides",
+		Key:         "RefreshGuide",
+		Name:        "刷新直播电视节目单 (XMLTV EPG)",
+		Category:    "LiveTV",
+		Description: "定期重新同步已配置的 XMLTV 电子节目单并自动清理过期节目数据",
+		Triggers: []scheduler.TaskTriggerInfo{
+			{Type: "IntervalTrigger", IntervalTicks: &halfDayTicks},
+		},
+		Run: func(c context.Context, reportProgress func(float64)) error {
+			reportProgress(10)
+			err := livetvH.RefreshAllGuides(c)
+			reportProgress(100)
+			return err
+		},
+	})
 	syncH := syncapi.New(store, cfg)
 	syncH.SetLibraryRepo(libRepo)
 	syncH.SetUserRepo(userRepo)
+	syncH.SetBudget(bgBudget)
+	syncH.SetFFmpegPath(snap.FFmpegPath)
+	syncH.SetStreamResolverWithHeaders(pb.ResolveStream)
+	syncH.SubscribeEvents(bus)
 	syncH.RegisterRoutes(mediaMux, syncapi.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
@@ -434,15 +504,25 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		UserIDFromCtx: userIDFromCtx,
 	})
 	opsH := ops.New(store, cfg, userRepo, bus)
+	opsH.SetWSHub(wsHub)
 	opsH.RegisterRoutes(mediaMux, ops.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
 	})
 
+	purgeUserArtifacts := func(c context.Context, userID string) {
+		notifH.PurgeUser(c, userID)
+		opsH.PurgeUser(c, userID)
+	}
+	usersHandler.SetOnUserDeleted(purgeUserArtifacts)
+
 	// Phase 6: DLNA UPnP MediaServer, Rankings, Migration & Governance Admin APIs
 	dlnaH := dlna.New(cfg, libRepo, store)
 	dlnaH.SetUserRepo(userRepo)
+	dlnaH.SetDefaultUserID(snap.DLNADefaultUserID)
+	dlnaH.SetTranscodeManager(transcodeMgr)
+	dlnaH.SetStreamResolverWithHeaders(pb.ResolveStream)
 	bus.Subscribe(eventbus.EventLibraryChanged, func(context.Context, eventbus.Event) {
 		dlnaH.BumpSystemUpdate()
 	})
@@ -456,6 +536,8 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		RequireAdmin: authMW.RequireAdmin,
 	})
 	migrator := migration.NewMigrator(store, userRepo)
+	migrator.SetSelfServer(snap.HTTPAddr, snap.ServerID)
+	migrator.SetOnUserUpdated(authSvc.InvalidateUserCache)
 	migrationH := migrationhandler.New(migrator)
 	migrationH.RegisterRoutes(mediaMux, migrationhandler.AuthFuncs{
 		RequireAuth:  authMW.RequireAuth,
@@ -468,6 +550,9 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		BudgetPool: bgBudget,
 	})
 	if err != nil {
+		notifH.Close()
+		opsH.Close()
+		livetvH.Close()
 		if stopTrakt != nil {
 			stopTrakt()
 		}
@@ -500,6 +585,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	compatMediaSvc.SetTranscodeManager(transcodeMgr)
 	compatMediaSvc.SetUserRepo(userRepo)
 	compatMediaSvc.SetStreamResolver(resolveStreamURL)
+	compatMediaSvc.SetStreamResolverWithHeaders(pb.ResolveStream)
 	compatMediaH := compatMediaSvc.BuildRouter(compatmedia.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
@@ -508,6 +594,13 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	compatCoreSvc := compatcore.New(cfg, store, userRepo, libRepo, sessionMgr, registry)
 	compatCoreSvc.SetAuthService(authSvc)
 	compatCoreSvc.SetWSHub(wsHub)
+	compatCoreSvc.SetOnUserDeleted(purgeUserArtifacts)
+	compatCoreSvc.SetRestoreHandler(opsH.HandleRestoreBackup)
+	compatCoreSvc.SetPartyHandlers(opsH.HandleLeaveCurrentParty, opsH.HandlePostPartyMessage)
+	compatCoreSvc.SetLifecycleHooks(
+		func() { _ = system.TriggerProcessRestart() },
+		func() { _ = system.TriggerProcessShutdown() },
+	)
 	compatCoreSvc.SetTaskStopper(func(id string) bool {
 		return taskMgr.Stop(id) == nil
 	})
@@ -519,6 +612,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	compatExtSvc := compatext.New(store, cfg)
 	compatExtSvc.SetLiveTV(livetvH)
 	compatExtSvc.SetSyncHandler(syncH)
+	compatExtSvc.SetTranscodeManager(transcodeMgr)
 	compatExtSvc.SetDVR(dvrRec)
 	compatExtSvc.SetLibraryRepo(libRepo)
 	compatExtSvc.SetUserRepo(userRepo)
@@ -572,6 +666,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	dvrCtx, dvrCancel := context.WithCancel(ctx)
 	dvrDone := make(chan struct{})
 	taskMgr.Start(dvrCtx)
+	syncH.StartWorker(dvrCtx)
 	go func() {
 		defer close(dvrDone)
 		dvrRec.SchedulerLoop(dvrCtx, 15*time.Second, livetvH.DueRecordingJobs)
@@ -606,6 +701,8 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		dvrDone:          dvrDone,
 		stopTrakt:        stopTrakt,
 		opsHandler:       opsH,
+		notifHandler:     notifH,
+		syncHandler:      syncH,
 		migrationHandler: migrationH,
 	}, nil
 }
@@ -711,6 +808,15 @@ func (s *Server) Close() error {
 	if s.opsHandler != nil {
 		s.opsHandler.Close()
 	}
+	if s.notifHandler != nil {
+		s.notifHandler.Close()
+	}
+	if s.syncHandler != nil {
+		s.syncHandler.StopWorker()
+	}
+	if s.LiveTV != nil {
+		s.LiveTV.Close()
+	}
 	if s.migrationHandler != nil {
 		s.migrationHandler.Close()
 	}
@@ -812,7 +918,7 @@ func buildSessionItemAccessChecker(libRepo *sqlite.LibraryRepo) func(ctx context
 		if !userCanAccessLibrary(user, rec.LibraryID) {
 			return false
 		}
-		blocked, err := libRepo.IsItemBlockedByParentalPolicy(ctx, rec, user.Policy.MaxParentalRating, user.Policy.BlockedTags)
+		blocked, err := libRepo.IsItemBlockedByPolicy(ctx, rec, user.Policy)
 		return err == nil && !blocked
 	}
 }
@@ -859,7 +965,10 @@ func buildWSLibraryChangeFilter(userRepo *sqlite.UserRepo, libRepo *sqlite.Libra
 			return nil, false
 		}
 
-		hasContentPolicy := user.Policy.MaxParentalRating != nil || len(user.Policy.BlockedTags) > 0
+		hasContentPolicy := user.Policy.MaxParentalRating != nil ||
+			len(user.Policy.BlockedTags) > 0 ||
+			len(user.Policy.BlockUnratedItems) > 0 ||
+			len(user.Policy.AllowedTags) > 0
 
 		// Filter any explicit item ID slices so restricted item IDs are never disclosed.
 		// ItemsRemoved cannot be checked via itemChecker because the rows are already deleted;

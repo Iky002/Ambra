@@ -77,8 +77,8 @@ func TestServerLifecycleAndRoutes(t *testing.T) {
 		t.Fatalf("expected SPA fallback to index.html, got %d", rec.Code)
 	}
 
-	// Public Phase 4-6 routes via delegated mediaMux (DLNA requires LAN origin)
-	for _, p := range []string{"/openapi.json", "/robots.txt", "/Dlna/test-uuid/description.xml"} {
+	// Public Phase 4-6 routes via delegated mediaMux (DLNA defaults to disabled -> 403 until enabled)
+	for _, p := range []string{"/openapi.json", "/robots.txt"} {
 		req := httptest.NewRequest(http.MethodGet, p, nil)
 		req.RemoteAddr = "127.0.0.1:12345"
 		rec = httptest.NewRecorder()
@@ -86,6 +86,19 @@ func TestServerLifecycleAndRoutes(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("expected 200 on %s, got %d", p, rec.Code)
 		}
+	}
+	dlnaReq := httptest.NewRequest(http.MethodGet, "/Dlna/test-uuid/description.xml", nil)
+	dlnaReq.RemoteAddr = "127.0.0.1:12345"
+	rec = httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rec, dlnaReq)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 on DLNA when disabled by default, got %d", rec.Code)
+	}
+	cfg.Update(func(c *config.Config) { c.EnableDLNA = true })
+	rec = httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rec, dlnaReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on DLNA after enabling, got %d", rec.Code)
 	}
 
 	// Compat chi router delegation & fallback 404

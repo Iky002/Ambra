@@ -44,8 +44,8 @@ func newTestEnv(t *testing.T) (*Service, *sqlite.Store, *sqlite.LibraryRepo, *co
 	return svc, store, sqlite.NewLibraryRepo(store), cfg, sched, pool
 }
 
-func intPtr(v int) *int             { return &v }
-func floatPtr(v float64) *float64   { return &v }
+func intPtr(v int) *int           { return &v }
+func floatPtr(v float64) *float64 { return &v }
 
 func TestNewServiceValidation(t *testing.T) {
 	if _, err := NewService(Options{}); !errors.Is(err, ErrInvalidArgument) {

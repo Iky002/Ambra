@@ -3,6 +3,9 @@ package playback
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/ambra-media/ambra/internal/api/dto"
@@ -96,6 +99,14 @@ func (e *Engine) SetUserRepo(r *sqlite.UserRepo) {
 	e.userRepo = r
 }
 
+// Config returns the underlying server configuration attached to this Engine.
+func (e *Engine) Config() *config.Config {
+	if e == nil {
+		return nil
+	}
+	return e.cfg
+}
+
 // ResolveStream runs registered StreamResolvers (e.g. STRM 302) against a media path.
 func (e *Engine) ResolveStream(ctx context.Context, rawPath string) (*plugins.StreamResolveResult, error) {
 	if e.registry == nil {
@@ -168,6 +179,24 @@ func (e *Engine) Decide(ctx context.Context, itemID string, req PlaybackInfoRequ
 		details = append(details, detail)
 	}
 
+	if len(outSources) > 1 {
+		order := make([]int, len(outSources))
+		for i := range order {
+			order[i] = i
+		}
+		sort.SliceStable(order, func(i, j int) bool {
+			return playMethodSortRank(details[order[i]].PlayMethod) < playMethodSortRank(details[order[j]].PlayMethod)
+		})
+		sortedSources := make([]dto.MediaSourceInfo, len(outSources))
+		sortedDetails := make([]DecisionDetail, len(details))
+		for i, idx := range order {
+			sortedSources[i] = outSources[idx]
+			sortedDetails[i] = details[idx]
+		}
+		outSources = sortedSources
+		details = sortedDetails
+	}
+
 	if outSources == nil {
 		outSources = []dto.MediaSourceInfo{}
 	}
@@ -175,6 +204,19 @@ func (e *Engine) Decide(ctx context.Context, itemID string, req PlaybackInfoRequ
 		MediaSources:  outSources,
 		PlaySessionId: sessionID,
 	}, details, nil
+}
+
+func playMethodSortRank(m PlayMethod) int {
+	switch m {
+	case PlayMethodSTRM302, PlayMethodDirectPlay, PlayMethodClientWASM:
+		return 1
+	case PlayMethodDirectStream:
+		return 2
+	case PlayMethodTranscode:
+		return 3
+	default:
+		return 4
+	}
 }
 
 func (e *Engine) decideOne(
@@ -257,28 +299,26 @@ func (e *Engine) decideOne(
 		}
 	}
 
-	// Tier 1: STRM 302 DirectPlay
+	// Resolve .strm stream metadata first, then evaluate client compatibility/bitrate/headers
+	// BEFORE deciding whether STRM 302 direct redirect is safe & compatible.
+	var resolved *plugins.StreamResolveResult
 	if item.IsStrm || strings.HasSuffix(strings.ToLower(src.Path), ".strm") {
-		if resolved, err := e.ResolveStream(ctx, src.Path); err == nil && resolved != nil && resolved.Is302 {
-			msDTO.Protocol = "Http"
-			msDTO.Path = resolved.URL
-			msDTO.IsRemote = true
-			msDTO.SupportsDirectPlay = true
-			msDTO.SupportsDirectStream = true
-			msDTO.SupportsTranscoding = false
-			if isAudio {
-				msDTO.DirectStreamUrl = buildDirectStreamURL("Audio", item.ID, src.Container, msDTO.Id, sessionID)
-			} else {
-				msDTO.DirectStreamUrl = buildDirectStreamURL("Videos", item.ID, src.Container, msDTO.Id, sessionID)
-			}
-			return msDTO, DecisionDetail{
-				MediaSourceID: msDTO.Id,
-				PlayMethod:    PlayMethodSTRM302,
-				RedirectURL:   resolved.URL,
-				Reason:        "STRM 302 direct redirect enabled",
-			}
+		if res, err := e.ResolveStream(ctx, src.Path); err == nil && res != nil && strings.TrimSpace(res.URL) != "" {
+			resolved = res
 		}
 	}
+
+	effectiveContainer := strings.TrimSpace(src.Container)
+	if strings.EqualFold(effectiveContainer, "strm") {
+		effectiveContainer = ""
+	}
+	if effectiveContainer == "" && resolved != nil {
+		if u, err := url.Parse(strings.TrimSpace(resolved.URL)); err == nil {
+			effectiveContainer = sanitizeContainerExt(filepath.Ext(u.Path))
+		}
+	}
+	needsHeaderInjection := resolved != nil && len(resolved.Headers) > 0
+	canSTRM302 := resolved != nil && resolved.Is302 && !needsHeaderInjection
 
 	allowDirectPlay := req.EnableDirectPlay == nil || *req.EnableDirectPlay
 	allowDirectStream := req.EnableDirectStream == nil || *req.EnableDirectStream
@@ -291,12 +331,33 @@ func (e *Engine) decideOne(
 	bitrateOK := maxBitrate <= 0 || src.Bitrate <= 0 || src.Bitrate <= maxBitrate
 
 	if isAudio {
-		audioDirectPlayOK := checkAudioProfileCompatibility(src.Container, audioCodec, req.DeviceProfile)
+		audioDirectPlayOK := checkAudioProfileCompatibility(effectiveContainer, audioCodec, req.DeviceProfile)
 		if allowDirectPlay && bitrateOK && audioDirectPlayOK {
+			if canSTRM302 {
+				msDTO.Protocol = "Http"
+				msDTO.Path = resolved.URL
+				msDTO.IsRemote = true
+				msDTO.SupportsDirectPlay = true
+				msDTO.SupportsDirectStream = true
+				msDTO.SupportsTranscoding = false
+				msDTO.DirectStreamUrl = buildDirectStreamURL("Audio", item.ID, src.Container, msDTO.Id, sessionID)
+				return msDTO, DecisionDetail{
+					MediaSourceID: msDTO.Id,
+					PlayMethod:    PlayMethodSTRM302,
+					RedirectURL:   resolved.URL,
+					Reason:        "STRM 302 direct redirect enabled",
+				}
+			}
 			msDTO.SupportsDirectPlay = true
 			msDTO.SupportsDirectStream = true
 			msDTO.SupportsTranscoding = allowTranscoding
-			msDTO.DirectStreamUrl = buildDirectStreamURL("Audio", item.ID, src.Container, msDTO.Id, sessionID)
+			dsURL := buildDirectStreamURL("Audio", item.ID, src.Container, msDTO.Id, sessionID)
+			if resolved != nil {
+				msDTO.Protocol = "Http"
+				msDTO.IsRemote = true
+				dsURL += "&proxy=true"
+			}
+			msDTO.DirectStreamUrl = dsURL
 			return msDTO, DecisionDetail{
 				MediaSourceID: msDTO.Id,
 				PlayMethod:    PlayMethodDirectPlay,
@@ -317,7 +378,14 @@ func (e *Engine) decideOne(
 		msDTO.SupportsDirectPlay = false
 		msDTO.SupportsDirectStream = false
 		msDTO.SupportsTranscoding = true
-		msDTO.TranscodingUrl = fmt.Sprintf("/Audio/%s/universal?MediaSourceId=%s&AudioCodec=aac&PlaySessionId=%s", item.ID, msDTO.Id, sessionID)
+		audioTC := fmt.Sprintf("/Audio/%s/universal?MediaSourceId=%s&AudioCodec=aac&PlaySessionId=%s", item.ID, msDTO.Id, sessionID)
+		if maxBitrate > 0 {
+			audioTC += fmt.Sprintf("&MaxStreamingBitrate=%d", maxBitrate)
+		}
+		if req.StartTimeTicks > 0 {
+			audioTC += fmt.Sprintf("&StartTimeTicks=%d", req.StartTimeTicks)
+		}
+		msDTO.TranscodingUrl = audioTC
 		return msDTO, DecisionDetail{
 			MediaSourceID: msDTO.Id,
 			PlayMethod:    PlayMethodTranscode,
@@ -325,7 +393,7 @@ func (e *Engine) decideOne(
 		}
 	}
 
-	directPlayOK, videoOK := checkProfileCompatibility(src.Container, videoCodec, audioCodec, req.DeviceProfile)
+	directPlayOK, videoOK := checkProfileCompatibility(effectiveContainer, videoCodec, audioCodec, req.DeviceProfile)
 	resOK := true
 	if req.MaxWidth > 0 && videoWidth > req.MaxWidth {
 		resOK = false
@@ -333,13 +401,37 @@ func (e *Engine) decideOne(
 	if req.MaxHeight > 0 && videoHeight > req.MaxHeight {
 		resOK = false
 	}
+	wasmOK := supportsClientWASM(req.DeviceProfile)
+
+	// Tier 1: STRM 302 DirectPlay (only when client supports DirectPlay and no custom upstream headers are needed)
+	if allowDirectPlay && bitrateOK && resOK && !subtitleNeedsBurnIn && (directPlayOK || wasmOK) && canSTRM302 {
+		msDTO.Protocol = "Http"
+		msDTO.Path = resolved.URL
+		msDTO.IsRemote = true
+		msDTO.SupportsDirectPlay = true
+		msDTO.SupportsDirectStream = true
+		msDTO.SupportsTranscoding = false
+		msDTO.DirectStreamUrl = buildDirectStreamURL("Videos", item.ID, src.Container, msDTO.Id, sessionID)
+		return msDTO, DecisionDetail{
+			MediaSourceID: msDTO.Id,
+			PlayMethod:    PlayMethodSTRM302,
+			RedirectURL:   resolved.URL,
+			Reason:        "STRM 302 direct redirect enabled",
+		}
+	}
 
 	// Tier 2: Native DirectPlay
 	if allowDirectPlay && bitrateOK && resOK && directPlayOK && !subtitleNeedsBurnIn {
 		msDTO.SupportsDirectPlay = true
 		msDTO.SupportsDirectStream = true
 		msDTO.SupportsTranscoding = allowTranscoding
-		msDTO.DirectStreamUrl = buildDirectStreamURL("Videos", item.ID, src.Container, msDTO.Id, sessionID)
+		dsURL := buildDirectStreamURL("Videos", item.ID, src.Container, msDTO.Id, sessionID)
+		if resolved != nil {
+			msDTO.Protocol = "Http"
+			msDTO.IsRemote = true
+			dsURL += "&proxy=true"
+		}
+		msDTO.DirectStreamUrl = dsURL
 		return msDTO, DecisionDetail{
 			MediaSourceID: msDTO.Id,
 			PlayMethod:    PlayMethodDirectPlay,
@@ -348,11 +440,17 @@ func (e *Engine) decideOne(
 	}
 
 	// Tier 3: Client WASM Enhanced DirectPlay (e.g. Ambra Web ffmpeg.wasm + WebCodecs + JASSUB/PGS)
-	if allowDirectPlay && bitrateOK && resOK && !subtitleNeedsBurnIn && supportsClientWASM(req.DeviceProfile) {
+	if allowDirectPlay && bitrateOK && resOK && !subtitleNeedsBurnIn && wasmOK {
 		msDTO.SupportsDirectPlay = true
 		msDTO.SupportsDirectStream = true
 		msDTO.SupportsTranscoding = allowTranscoding
-		msDTO.DirectStreamUrl = buildDirectStreamURL("Videos", item.ID, src.Container, msDTO.Id, sessionID)
+		dsURL := buildDirectStreamURL("Videos", item.ID, src.Container, msDTO.Id, sessionID)
+		if resolved != nil {
+			msDTO.Protocol = "Http"
+			msDTO.IsRemote = true
+			dsURL += "&proxy=true"
+		}
+		msDTO.DirectStreamUrl = dsURL
 		return msDTO, DecisionDetail{
 			MediaSourceID: msDTO.Id,
 			PlayMethod:    PlayMethodClientWASM,
@@ -454,6 +552,9 @@ func appendTranscodeQueryParams(baseURL string, req PlaybackInfoRequest, default
 	}
 	if req.MaxHeight > 0 {
 		out += fmt.Sprintf("&MaxHeight=%d", req.MaxHeight)
+	}
+	if req.StartTimeTicks > 0 {
+		out += fmt.Sprintf("&StartTimeTicks=%d", req.StartTimeTicks)
 	}
 	return out
 }

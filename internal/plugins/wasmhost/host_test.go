@@ -3,13 +3,20 @@ package wasmhost
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/ambra-media/ambra/internal/plugins"
+	"github.com/tetratelabs/wazero/sys"
 )
 
 // --- Minimal valid WebAssembly 1.0 binary builders for pure-Go wazero tests ---
@@ -702,4 +709,309 @@ func TestWasmHostAuditV0104Security(t *testing.T) {
 	for i := 0; i < cap(host.sem); i++ {
 		<-host.sem
 	}
+}
+
+// buildAmbraHTTPAndLogModule constructs a WebAssembly 1.0 binary that:
+// 1) calls ambra.log(1, logPtr, len(logMsg))
+// 2) calls ambra.http_request(reqPtr, len(reqJSON), respPtr, respCap)
+//    - if ret > 0: writes the returned JSON slice [respPtr..respPtr+ret] to stdout
+//    - if ret <= 0: calls wasi proc_exit(uint32(-ret)) so tests can assert exact negative status/length codes.
+func buildAmbraHTTPAndLogModule(logMsg, reqJSON string, respCap uint32) []byte {
+	wasm := []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00}
+
+	// Type section:
+	// 0: (i32,i32,i32,i32)->(i32) [fd_write]
+	// 1: (i32)->()                [proc_exit]
+	// 2: (i32,i32,i32)->()        [ambra.log]
+	// 3: (i32,i32,i32,i32)->(i32) [ambra.http_request]
+	// 4: ()->()                   [_start]
+	var typeSec []byte
+	typeSec = appendULEB128(typeSec, 5)
+	typeSec = append(typeSec, 0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f)
+	typeSec = append(typeSec, 0x60, 1, 0x7f, 0)
+	typeSec = append(typeSec, 0x60, 3, 0x7f, 0x7f, 0x7f, 0)
+	typeSec = append(typeSec, 0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f)
+	typeSec = append(typeSec, 0x60, 0, 0)
+	wasm = appendSection(wasm, 1, typeSec)
+
+	// Import section:
+	var importSec []byte
+	importSec = appendULEB128(importSec, 4)
+	importSec = appendStr(importSec, "wasi_snapshot_preview1")
+	importSec = appendStr(importSec, "fd_write")
+	importSec = append(importSec, 0x00, 0x00)
+	importSec = appendStr(importSec, "wasi_snapshot_preview1")
+	importSec = appendStr(importSec, "proc_exit")
+	importSec = append(importSec, 0x00, 0x01)
+	importSec = appendStr(importSec, "ambra")
+	importSec = appendStr(importSec, "log")
+	importSec = append(importSec, 0x00, 0x02)
+	importSec = appendStr(importSec, "ambra")
+	importSec = appendStr(importSec, "http_request")
+	importSec = append(importSec, 0x00, 0x03)
+	wasm = appendSection(wasm, 2, importSec)
+
+	// Function section: _start (func idx 4) has type 4
+	wasm = appendSection(wasm, 3, []byte{1, 4})
+
+	// Memory section: 1 memory, min 1 page (64 KiB)
+	wasm = appendSection(wasm, 5, []byte{1, 0x00, 1})
+
+	// Export section: "memory" and "_start"
+	var exportSec []byte
+	exportSec = appendULEB128(exportSec, 2)
+	exportSec = appendStr(exportSec, "memory")
+	exportSec = append(exportSec, 0x02, 0x00)
+	exportSec = appendStr(exportSec, "_start")
+	exportSec = append(exportSec, 0x00, 0x04)
+	wasm = appendSection(wasm, 7, exportSec)
+
+	const (
+		logPtr  = 32
+		respPtr = 2048
+	)
+	reqPtr := logPtr + len(logMsg)
+
+	var body []byte
+	body = append(body, 0x01, 0x01, 0x7f) // 1 local: i32 (local 0)
+
+	// ambra.log(1, logPtr, len(logMsg))
+	body = append(body, 0x41)
+	body = appendSLEB128(body, 1)
+	body = append(body, 0x41)
+	body = appendSLEB128(body, int32(logPtr))
+	body = append(body, 0x41)
+	body = appendSLEB128(body, int32(len(logMsg)))
+	body = append(body, 0x10, 0x02)
+
+	// local 0 = ambra.http_request(reqPtr, len(reqJSON), respPtr, respCap)
+	body = append(body, 0x41)
+	body = appendSLEB128(body, int32(reqPtr))
+	body = append(body, 0x41)
+	body = appendSLEB128(body, int32(len(reqJSON)))
+	body = append(body, 0x41)
+	body = appendSLEB128(body, int32(respPtr))
+	body = append(body, 0x41)
+	body = appendSLEB128(body, int32(respCap))
+	body = append(body, 0x10, 0x03)
+	body = append(body, 0x21, 0x00)
+
+	// if (local 0 > 0)
+	body = append(body, 0x20, 0x00, 0x41, 0x00, 0x4a, 0x04, 0x40)
+	// iovec.ptr (addr 0) = respPtr
+	body = append(body, 0x41, 0x00, 0x41)
+	body = appendSLEB128(body, int32(respPtr))
+	body = append(body, 0x36, 0x02, 0x00)
+	// iovec.len (addr 4) = local 0
+	body = append(body, 0x41, 0x04, 0x20, 0x00, 0x36, 0x02, 0x00)
+	// fd_write(1, 0, 1, 8)
+	body = append(body, 0x41, 0x01, 0x41, 0x00, 0x41, 0x01, 0x41, 0x08, 0x10, 0x00, 0x1a)
+	// else: proc_exit(0 - local 0)
+	body = append(body, 0x05, 0x41, 0x00, 0x20, 0x00, 0x6b, 0x10, 0x01)
+	// end if + end func
+	body = append(body, 0x0b, 0x0b)
+
+	var codeSec []byte
+	codeSec = appendULEB128(codeSec, 1)
+	codeSec = appendULEB128(codeSec, uint32(len(body)))
+	codeSec = append(codeSec, body...)
+	wasm = appendSection(wasm, 10, codeSec)
+
+	// Data section at offset 32: logMsg + reqJSON
+	initData := append([]byte(logMsg), []byte(reqJSON)...)
+	var dataSec []byte
+	dataSec = appendULEB128(dataSec, 1)
+	dataSec = append(dataSec, 0x00, 0x41)
+	dataSec = appendSLEB128(dataSec, int32(logPtr))
+	dataSec = append(dataSec, 0x0b)
+	dataSec = appendULEB128(dataSec, uint32(len(initData)))
+	dataSec = append(dataSec, initData...)
+	wasm = appendSection(wasm, 11, dataSec)
+
+	return wasm
+}
+
+func TestAmbraHostLogHTTPRequestSSRFAndSubtitleProvider(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Default strict Host: ambra.http_request MUST block 127.0.0.1 loopback SSRF AND non-allowlisted domains!
+	strictHost, err := NewHost(ctx)
+	if err != nil {
+		t.Fatalf("NewHost strict: %v", err)
+	}
+	defer strictHost.Close(ctx)
+
+	var logMu sync.Mutex
+	var logs []string
+	strictHost.mu.Lock()
+	strictHost.logHook = func(pluginID string, level uint32, msg string) {
+		logMu.Lock()
+		logs = append(logs, pluginID+":"+msg)
+		logMu.Unlock()
+	}
+	strictHost.mu.Unlock()
+
+	localTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Plugin-Test", "ok")
+		_, _ = w.Write([]byte(`{"Name":"RemoteWasmMovie","Year":2026}`))
+	}))
+	defer localTarget.Close()
+
+	// 1a. Loopback 127.0.0.1 blocked by NewSafeHTTPClientNoLoopback / ValidateRemoteURLNoLoopback even when host is in AllowedHosts
+	uLocal, _ := url.Parse(localTarget.URL)
+	loopbackReq, _ := json.Marshal(hostHTTPRequestPayload{Method: "GET", URL: localTarget.URL})
+	loopbackWasm := buildAmbraHTTPAndLogModule("attempting loopback", string(loopbackReq), 4096)
+	loopbackPlugin, err := strictHost.LoadModuleWithAllowedHosts(
+		ctx,
+		plugins.Manifest{ID: "ext.wasm.ssrf", Name: "SSRF Test", Enabled: true, Kinds: []plugins.Kind{plugins.KindMetadata}},
+		[]string{uLocal.Hostname()},
+		loopbackWasm,
+		2*time.Second,
+	)
+	if err != nil {
+		t.Fatalf("LoadModule loopback: %v", err)
+	}
+	_, err = loopbackPlugin.FetchMetadata(ctx, plugins.MediaQuery{Title: "SSRF"})
+	if err == nil {
+		t.Fatal("expected ambra.http_request to block 127.0.0.1 loopback SSRF")
+	}
+	var exitErr *sys.ExitError
+	if !errors.As(err, &exitErr) || int32(exitErr.ExitCode()) != -HostHTTPErrForbidden {
+		t.Fatalf("expected exit code %d (Forbidden) for loopback SSRF, got err=%v", -HostHTTPErrForbidden, err)
+	}
+
+	logMu.Lock()
+	gotLogCount := len(logs)
+	logMu.Unlock()
+	if gotLogCount != 1 || logs[0] != "ext.wasm.ssrf:attempting loopback" {
+		t.Fatalf("expected ambra.log captured once, got %v", logs)
+	}
+
+	// 1b. Non-allowlisted host blocked immediately by AllowedHosts check
+	disallowedReq, _ := json.Marshal(hostHTTPRequestPayload{Method: "GET", URL: "https://evil.example.org/steal"})
+	disallowedWasm := buildAmbraHTTPAndLogModule("disallowed host", string(disallowedReq), 4096)
+	disallowedPlugin, err := strictHost.LoadModuleWithAllowedHosts(
+		ctx,
+		plugins.Manifest{ID: "ext.wasm.allowlist", Name: "Allowlist Test", Enabled: true, Kinds: []plugins.Kind{plugins.KindMetadata}},
+		[]string{"api.trusted.example.com", "*.sub.example.com"},
+		disallowedWasm,
+		2*time.Second,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = disallowedPlugin.FetchMetadata(ctx, plugins.MediaQuery{Title: "BlockedHost"})
+	if !errors.As(err, &exitErr) || int32(exitErr.ExitCode()) != -HostHTTPErrForbidden {
+		t.Fatalf("expected exit code %d (Forbidden) for non-allowlisted domain, got %v", -HostHTTPErrForbidden, err)
+	}
+
+	// 2. Normal allowed HTTP round-trip + buffer-too-small negative required length check
+	roundTripHost, err := NewHost(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roundTripHost.Close(ctx)
+
+	// Route allowed.example.com to localTarget via custom test RoundTripper while keeping AllowedHosts enforcement active
+	roundTripHost.SetHTTPClient(&http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			redirected, _ := http.NewRequestWithContext(req.Context(), req.Method, localTarget.URL+req.URL.Path, req.Body)
+			redirected.Header = req.Header.Clone()
+			return localTarget.Client().Transport.RoundTrip(redirected)
+		}),
+	})
+
+	allowedReqBytes, _ := json.Marshal(hostHTTPRequestPayload{
+		Method:  "POST",
+		URL:     "https://sub.allowed.example.com/scrape",
+		Headers: map[string]string{"X-Token": "abc"},
+		Body:    `{"q":"dune"}`,
+	})
+
+	// 2a. Buffer too small (respCap = 8) -> returns negative required byte length (<= -12)
+	tinyBufWasm := buildAmbraHTTPAndLogModule("tiny buf", string(allowedReqBytes), 8)
+	tinyBufPlugin, err := roundTripHost.LoadModuleWithAllowedHosts(
+		ctx,
+		plugins.Manifest{ID: "ext.wasm.tinybuf", Name: "TinyBuf", Enabled: true},
+		[]string{"*.allowed.example.com"},
+		tinyBufWasm,
+		2*time.Second,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = tinyBufPlugin.invoke(ctx, Request{Action: "fetch_metadata"})
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() < 40 {
+		t.Fatalf("expected positive exitCode == requiredJSONLen (>=40) when respCap=8, got err=%v", err)
+	}
+
+	// 2b. Sufficient buffer (respCap = 4096) -> full JSON response written into WASM linear memory!
+	okWasm := buildAmbraHTTPAndLogModule("ok request", string(allowedReqBytes), 4096)
+	okPlugin, err := roundTripHost.LoadModuleWithAllowedHosts(
+		ctx,
+		plugins.Manifest{ID: "ext.wasm.httpok", Name: "HTTPOK", Enabled: true, Priority: 15},
+		[]string{"*.allowed.example.com"},
+		okWasm,
+		2*time.Second,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawStdout, err := okPlugin.invoke(ctx, Request{Action: "fetch_metadata"})
+	if err != nil {
+		t.Fatalf("expected successful ambra.http_request round-trip, got err=%v", err)
+	}
+	var hostResp hostHTTPResponsePayload
+	if err := json.Unmarshal(rawStdout, &hostResp); err != nil {
+		t.Fatalf("unmarshal hostHTTPResponsePayload: %v (raw=%s)", err, string(rawStdout))
+	}
+	if hostResp.Status != http.StatusOK || hostResp.Headers["X-Plugin-Test"] != "ok" || !strings.Contains(hostResp.Body, "RemoteWasmMovie") {
+		t.Fatalf("unexpected ambra.http_request response: %+v", hostResp)
+	}
+
+	// 3. WasmPlugin SubtitleProvider (SearchSubtitles & DownloadSubtitle) + dynamic Priority & DefaultConfig
+	subSearchJSON := `[{"Id":"sub-1","Name":"Dune.zh.srt","ProviderName":"WasmSub","Language":"zho","Format":"srt"}]`
+	subSearchPlugin, err := strictHost.LoadModule(
+		ctx,
+		plugins.Manifest{ID: "ext.wasm.subsearch", Name: "WasmSub", Enabled: true, Priority: 30, Kinds: []plugins.Kind{plugins.KindSubtitle}},
+		buildWasiOutputModule(1, subSearchJSON, false, 0),
+		time.Second,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := subSearchPlugin.Configure(map[string]any{"priority": float64(12), "enabled": true, "token": "xyz"}); err != nil {
+		t.Fatal(err)
+	}
+	if subSearchPlugin.Manifest().Priority != 12 {
+		t.Fatalf("expected updated Priority=12, got %d", subSearchPlugin.Manifest().Priority)
+	}
+	if def := subSearchPlugin.DefaultConfig(); def["priority"] != 12 || def["token"] != "xyz" {
+		t.Fatalf("unexpected DefaultConfig: %+v", def)
+	}
+	hits, err := subSearchPlugin.SearchSubtitles(ctx, plugins.SubtitleSearchQuery{Title: "Dune", Language: "zh"})
+	if err != nil || len(hits) != 1 || hits[0].ID != "sub-1" {
+		t.Fatalf("SearchSubtitles got (%+v, %v)", hits, err)
+	}
+
+	subDlJSON := `{"language":"zh-CN","format":"srt","content":"1\n00:00:01,000 --> 00:00:02,000\n你好\n"}`
+	subDlPlugin, err := strictHost.LoadModule(
+		ctx,
+		plugins.Manifest{ID: "ext.wasm.subdl", Name: "WasmSubDL", Enabled: true, Kinds: []plugins.Kind{plugins.KindSubtitle}},
+		buildWasiOutputModule(1, subDlJSON, false, 0),
+		time.Second,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dlRes, err := subDlPlugin.DownloadSubtitle(ctx, "sub-1")
+	if err != nil || dlRes == nil || dlRes.Format != "srt" || !strings.Contains(string(dlRes.Content), "你好") {
+		t.Fatalf("DownloadSubtitle got (%+v, %v)", dlRes, err)
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
 }

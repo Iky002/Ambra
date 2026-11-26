@@ -3,21 +3,21 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { CalendarDays, Loader2, Play, Plus, Radio, RefreshCw, Trash2, Tv } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { api } from '../../api/client'
+import { useI18n } from '../../i18n/I18nContext'
 import { FeedbackBanner } from './adminUtils'
 
 export function LiveTvTab() {
+  const { t } = useI18n()
   const queryClient = useQueryClient()
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
     null,
   )
 
-  // M3U Tuner Form State
   const [tunerName, setTunerName] = useState('')
   const [tunerUrl, setTunerUrl] = useState('')
   const [addingTuner, setAddingTuner] = useState(false)
   const [deletingTunerId, setDeletingTunerId] = useState<string | null>(null)
 
-  // XMLTV EPG Form State
   const [epgPath, setEpgPath] = useState('')
   const [addingEpg, setAddingEpg] = useState(false)
   const [deletingEpgId, setDeletingEpgId] = useState<string | null>(null)
@@ -70,7 +70,7 @@ export function LiveTvTab() {
     e.preventDefault()
     const trimmedUrl = tunerUrl.trim()
     if (!trimmedUrl) {
-      setFeedback({ type: 'error', message: '请输入 M3U 播放列表地址' })
+      setFeedback({ type: 'error', message: t('admin.livetv.errTunerUrlRequired') })
       return
     }
     setAddingTuner(true)
@@ -78,7 +78,7 @@ export function LiveTvTab() {
     try {
       await api.addTunerHost({
         Type: 'm3u',
-        FriendlyName: tunerName.trim() || 'M3U 直播源',
+        FriendlyName: tunerName.trim() || t('admin.livetv.defaultTunerName'),
         Url: trimmedUrl,
       })
       setTunerName('')
@@ -89,11 +89,11 @@ export function LiveTvTab() {
         queryClient.invalidateQueries({ queryKey: ['liveTvInfo'] }),
         queryClient.invalidateQueries({ queryKey: ['liveTv'] }),
       ])
-      setFeedback({ type: 'success', message: '已添加 M3U 直播源' })
+      setFeedback({ type: 'success', message: t('admin.livetv.tunerAddedSuccess') })
     } catch (err) {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '添加 M3U 直播源失败',
+        message: err instanceof Error ? err.message : t('admin.livetv.tunerAddFailed'),
       })
     } finally {
       setAddingTuner(false)
@@ -111,11 +111,14 @@ export function LiveTvTab() {
         queryClient.invalidateQueries({ queryKey: ['liveTvInfo'] }),
         queryClient.invalidateQueries({ queryKey: ['liveTv'] }),
       ])
-      setFeedback({ type: 'success', message: `已删除直播源「${name || id}」` })
+      setFeedback({
+        type: 'success',
+        message: t('admin.livetv.tunerDeletedSuccess', { name: name || id }),
+      })
     } catch (err) {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '删除直播源失败',
+        message: err instanceof Error ? err.message : t('admin.livetv.tunerDeleteFailed'),
       })
     } finally {
       setDeletingTunerId(null)
@@ -126,7 +129,7 @@ export function LiveTvTab() {
     e.preventDefault()
     const trimmedPath = epgPath.trim()
     if (!trimmedPath) {
-      setFeedback({ type: 'error', message: '请输入 XMLTV EPG 地址或本地路径' })
+      setFeedback({ type: 'error', message: t('admin.livetv.errEpgPathRequired') })
       return
     }
     setAddingEpg(true)
@@ -138,11 +141,11 @@ export function LiveTvTab() {
       })
       setEpgPath('')
       await queryClient.invalidateQueries({ queryKey: ['admin', 'liveTv', 'listingProviders'] })
-      setFeedback({ type: 'success', message: '已添加 XMLTV EPG 节目单来源' })
+      setFeedback({ type: 'success', message: t('admin.livetv.epgAddedSuccess') })
     } catch (err) {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '添加 XMLTV EPG 失败',
+        message: err instanceof Error ? err.message : t('admin.livetv.epgAddFailed'),
       })
     } finally {
       setAddingEpg(false)
@@ -155,11 +158,11 @@ export function LiveTvTab() {
     try {
       await api.deleteListingProvider(id)
       await queryClient.invalidateQueries({ queryKey: ['admin', 'liveTv', 'listingProviders'] })
-      setFeedback({ type: 'success', message: '已删除 XMLTV EPG 节目单来源' })
+      setFeedback({ type: 'success', message: t('admin.livetv.epgDeletedSuccess') })
     } catch (err) {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '删除 XMLTV EPG 失败',
+        message: err instanceof Error ? err.message : t('admin.livetv.epgDeleteFailed'),
       })
     } finally {
       setDeletingEpgId(null)
@@ -172,11 +175,9 @@ export function LiveTvTab() {
         <div>
           <h2 className="flex items-center gap-2 text-base font-semibold text-zinc-100">
             <Radio className="h-4 w-4 text-amber-400" />
-            <span>电视直播 (Live TV)</span>
+            <span>{t('admin.livetv.title')}</span>
           </h2>
-          <p className="mt-1 text-xs text-zinc-400">
-            管理 M3U 直播源调谐器、XMLTV 电子节目单（EPG）并预览已导入的电视频道
-          </p>
+          <p className="mt-1 text-xs text-zinc-400">{t('admin.livetv.subtitle')}</p>
         </div>
 
         <button
@@ -187,7 +188,7 @@ export function LiveTvTab() {
           <RefreshCw
             className={`h-3.5 w-3.5 ${tunersFetching || channelsFetching ? 'animate-spin' : ''}`}
           />
-          <span>刷新</span>
+          <span>{t('common.refresh')}</span>
         </button>
       </div>
 
@@ -197,12 +198,12 @@ export function LiveTvTab() {
         onClose={() => setFeedback(null)}
       />
 
-      {/* 1. M3U 直播源 (Tuner Hosts) */}
+      {/* 1. M3U Tuner Hosts */}
       <section className="space-y-4">
         <div className="flex items-center justify-between">
           <h3 className="flex items-center gap-2 text-sm font-semibold text-zinc-200">
             <Tv className="h-4 w-4 text-amber-400" />
-            <span>M3U 直播源 (Tuner Hosts)</span>
+            <span>{t('admin.livetv.tunerSectionTitle')}</span>
             <span className="rounded-md bg-white/8 px-2 py-0.5 text-xs font-medium text-zinc-300">
               {tunerHosts.length}
             </span>
@@ -215,20 +216,20 @@ export function LiveTvTab() {
         >
           <div className="sm:col-span-4">
             <label htmlFor="livetv-tuner-name" className="mb-1 block text-xs text-zinc-400">
-              源名称 (FriendlyName)
+              {t('admin.livetv.tunerNameLabel')}
             </label>
             <input
               id="livetv-tuner-name"
               type="text"
               value={tunerName}
               onChange={(e) => setTunerName(e.target.value)}
-              placeholder="例如：IPTV 高清源"
+              placeholder={t('admin.livetv.tunerNamePlaceholder')}
               className="w-full rounded-xl border border-white/10 bg-zinc-900/90 px-3 py-2 text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
             />
           </div>
           <div className="sm:col-span-6">
             <label htmlFor="livetv-tuner-url" className="mb-1 block text-xs text-zinc-400">
-              M3U 地址 (Url) *
+              {t('admin.livetv.tunerUrlLabel')}
             </label>
             <input
               id="livetv-tuner-url"
@@ -236,7 +237,7 @@ export function LiveTvTab() {
               required
               value={tunerUrl}
               onChange={(e) => setTunerUrl(e.target.value)}
-              placeholder="https://example.com/playlist.m3u 或 /data/iptv.m3u"
+              placeholder={t('admin.livetv.tunerUrlPlaceholder')}
               className="w-full rounded-xl border border-white/10 bg-zinc-900/90 px-3 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
             />
           </div>
@@ -251,7 +252,7 @@ export function LiveTvTab() {
               ) : (
                 <Plus className="h-3.5 w-3.5" />
               )}
-              <span>添加源</span>
+              <span>{t('admin.livetv.addTunerBtn')}</span>
             </button>
           </div>
         </form>
@@ -263,11 +264,13 @@ export function LiveTvTab() {
         ) : tunersError ? (
           <FeedbackBanner
             type="error"
-            message={`加载 M3U 直播源失败：${tunersErr instanceof Error ? tunersErr.message : '请稍后重试'}`}
+            message={t('admin.livetv.tunersLoadError', {
+              error: tunersErr instanceof Error ? tunersErr.message : t('admin.livetv.retryLater'),
+            })}
           />
         ) : tunerHosts.length === 0 ? (
           <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-8 text-center text-xs text-zinc-500">
-            暂未配置 M3U 直播源
+            {t('admin.livetv.tunersEmpty')}
           </div>
         ) : (
           <div className="divide-y divide-white/6 overflow-hidden rounded-2xl border border-white/8 bg-white/[0.02]">
@@ -279,7 +282,7 @@ export function LiveTvTab() {
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
                     <p className="truncate text-sm font-semibold text-zinc-100">
-                      {host.FriendlyName || 'M3U 调谐器'}
+                      {host.FriendlyName || t('admin.livetv.defaultTunerName')}
                     </p>
                     <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase text-amber-300">
                       {host.Type || 'm3u'}
@@ -301,7 +304,7 @@ export function LiveTvTab() {
                     ) : (
                       <Trash2 className="h-3.5 w-3.5" />
                     )}
-                    <span>删除</span>
+                    <span>{t('common.delete')}</span>
                   </button>
                 )}
               </div>
@@ -310,12 +313,12 @@ export function LiveTvTab() {
         )}
       </section>
 
-      {/* 2. XMLTV 节目单 (EPG Listing Providers) */}
+      {/* 2. XMLTV EPG Listing Providers */}
       <section className="space-y-4">
         <div className="flex items-center justify-between">
           <h3 className="flex items-center gap-2 text-sm font-semibold text-zinc-200">
             <CalendarDays className="h-4 w-4 text-amber-400" />
-            <span>XMLTV 节目单 (EPG Listing Providers)</span>
+            <span>{t('admin.livetv.epgSectionTitle')}</span>
             <span className="rounded-md bg-white/8 px-2 py-0.5 text-xs font-medium text-zinc-300">
               {listingProviders.length}
             </span>
@@ -328,7 +331,7 @@ export function LiveTvTab() {
         >
           <div className="sm:col-span-10">
             <label htmlFor="livetv-epg-path" className="mb-1 block text-xs text-zinc-400">
-              XMLTV EPG 地址或路径 (Path) *
+              {t('admin.livetv.epgPathLabel')}
             </label>
             <input
               id="livetv-epg-path"
@@ -336,7 +339,7 @@ export function LiveTvTab() {
               required
               value={epgPath}
               onChange={(e) => setEpgPath(e.target.value)}
-              placeholder="https://example.com/epg.xml 或 /data/epg.xml"
+              placeholder={t('admin.livetv.epgPathPlaceholder')}
               className="w-full rounded-xl border border-white/10 bg-zinc-900/90 px-3 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
             />
           </div>
@@ -351,7 +354,7 @@ export function LiveTvTab() {
               ) : (
                 <Plus className="h-3.5 w-3.5" />
               )}
-              <span>添加 EPG</span>
+              <span>{t('admin.livetv.addEpgBtn')}</span>
             </button>
           </div>
         </form>
@@ -363,11 +366,13 @@ export function LiveTvTab() {
         ) : epgError ? (
           <FeedbackBanner
             type="error"
-            message={`加载 XMLTV 节目单来源失败：${epgErr instanceof Error ? epgErr.message : '请稍后重试'}`}
+            message={t('admin.livetv.epgLoadError', {
+              error: epgErr instanceof Error ? epgErr.message : t('admin.livetv.retryLater'),
+            })}
           />
         ) : listingProviders.length === 0 ? (
           <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-8 text-center text-xs text-zinc-500">
-            暂未配置 XMLTV 节目单来源
+            {t('admin.livetv.epgEmpty')}
           </div>
         ) : (
           <div className="divide-y divide-white/6 overflow-hidden rounded-2xl border border-white/8 bg-white/[0.02]">
@@ -401,7 +406,7 @@ export function LiveTvTab() {
                     ) : (
                       <Trash2 className="h-3.5 w-3.5" />
                     )}
-                    <span>删除</span>
+                    <span>{t('common.delete')}</span>
                   </button>
                 )}
               </div>
@@ -410,17 +415,17 @@ export function LiveTvTab() {
         )}
       </section>
 
-      {/* 3. 已导入频道预览 */}
+      {/* 3. Imported Channels Preview */}
       <section className="space-y-4">
         <div className="flex items-center justify-between">
           <h3 className="flex items-center gap-2 text-sm font-semibold text-zinc-200">
             <Radio className="h-4 w-4 text-amber-400" />
-            <span>已导入频道预览</span>
+            <span>{t('admin.livetv.channelsSectionTitle')}</span>
             <span
               data-testid="livetv-channel-count"
               className="rounded-md bg-white/8 px-2 py-0.5 text-xs font-medium text-zinc-300"
             >
-              共 {totalChannels} 个频道
+              {t('admin.livetv.channelsCountBadge', { count: totalChannels })}
             </span>
           </h3>
         </div>
@@ -432,11 +437,14 @@ export function LiveTvTab() {
         ) : channelsError ? (
           <FeedbackBanner
             type="error"
-            message={`加载电视频道列表失败：${channelsErr instanceof Error ? channelsErr.message : '请稍后重试'}`}
+            message={t('admin.livetv.channelsLoadError', {
+              error:
+                channelsErr instanceof Error ? channelsErr.message : t('admin.livetv.retryLater'),
+            })}
           />
         ) : channels.length === 0 ? (
           <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-10 text-center text-xs text-zinc-500">
-            暂无已导入频道，添加 M3U 直播源后将自动解析频道列表
+            {t('admin.livetv.channelsEmpty')}
           </div>
         ) : (
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -460,7 +468,7 @@ export function LiveTvTab() {
                   className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-amber-500/35 bg-amber-500/10 px-2.5 py-1 text-[11px] font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
                 >
                   <Play className="h-3 w-3" />
-                  <span>观看</span>
+                  <span>{t('admin.livetv.watchBtn')}</span>
                 </Link>
               </div>
             ))}

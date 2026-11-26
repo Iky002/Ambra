@@ -189,4 +189,37 @@ func TestAuthMiddlewareRBAC(t *testing.T) {
 	if rec.Code != http.StatusNoContent || rec.Header().Get("Access-Control-Allow-Origin") != "http://localhost:3000" {
 		t.Fatalf("CORS preflight failed: status=%d header=%q", rec.Code, rec.Header().Get("Access-Control-Allow-Origin"))
 	}
+
+	// Global EnableRemoteAccess=false blocks external non-APIKey requests while allowing LAN and APIKey (C-01)
+	cfg.Update(func(c *config.Config) {
+		f := false
+		c.EnableRemoteAccessGlobal = &f
+	})
+	mw.SetConfig(cfg)
+
+	reqExt := httptest.NewRequest(http.MethodGet, "/me", nil)
+	reqExt.RemoteAddr = "203.0.113.77:54321"
+	reqExt.Header.Set("X-Emby-Token", adminRes.AccessToken)
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, reqExt)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for external user when global remote access disabled, got %d", rec.Code)
+	}
+
+	reqExtKey := httptest.NewRequest(http.MethodGet, "/admin-only?api_key="+apiKey.Token, nil)
+	reqExtKey.RemoteAddr = "203.0.113.77:54321"
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, reqExtKey)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for API key even from external IP, got %d", rec.Code)
+	}
+
+	reqLAN := httptest.NewRequest(http.MethodGet, "/me", nil)
+	reqLAN.RemoteAddr = "127.0.0.1:54321"
+	reqLAN.Header.Set("X-Emby-Token", adminRes.AccessToken)
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, reqLAN)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for loopback request when global remote access disabled, got %d", rec.Code)
+	}
 }

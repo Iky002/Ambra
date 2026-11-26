@@ -98,7 +98,7 @@ exit 0
 		t.Fatalf("expected .extracted marker NOT written on probe failure: %v", statErr)
 	}
 
-	// Remote HTTP media uses strict remoteProtocolWhitelist (no file,pipe) and -follow_redirects 0
+	// Remote HTTP media uses strict remoteProtocolWhitelist (no file,pipe) and -max_redirects 0
 	if strings.Contains(remoteProtocolWhitelist, "file") || strings.Contains(remoteProtocolWhitelist, "pipe") {
 		t.Fatalf("remoteProtocolWhitelist must not include file or pipe: %q", remoteProtocolWhitelist)
 	}
@@ -106,8 +106,8 @@ exit 0
 		t.Fatalf("remote ExtractFonts: %v", err)
 	}
 	rawProbeLog, _ := os.ReadFile(ffprobeLog)
-	if !strings.Contains(string(rawProbeLog), "-protocol_whitelist http,https,tcp,tls,crypto -follow_redirects 0") {
-		t.Fatalf("expected strict remote whitelist and -follow_redirects 0 in ffprobe args: %s", string(rawProbeLog))
+	if !strings.Contains(string(rawProbeLog), "-protocol_whitelist http,https,tcp,tls,crypto -max_redirects 0") {
+		t.Fatalf("expected strict remote whitelist and -max_redirects 0 in ffprobe args: %s", string(rawProbeLog))
 	}
 }
 

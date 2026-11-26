@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -562,14 +563,32 @@ func buildLocalNFODocument(rootTag string, rec *sqlite.ItemRecord, meta *plugins
 	doc.TMDBID = tmdbID
 	doc.IMDBID = imdbID
 	doc.TVDBID = tvdbID
-	if tmdbID != "" {
-		doc.UniqueIDs = append(doc.UniqueIDs, localNFOUniqueID{Type: "tmdb", Default: true, Value: tmdbID})
-	}
-	if imdbID != "" {
-		doc.UniqueIDs = append(doc.UniqueIDs, localNFOUniqueID{Type: "imdb", Default: tmdbID == "", Value: imdbID})
-	}
-	if tvdbID != "" {
-		doc.UniqueIDs = append(doc.UniqueIDs, localNFOUniqueID{Type: "tvdb", Value: tvdbID})
+
+	if len(rec.Extra.ProviderIDs) > 0 {
+		normIDs := make(map[string]string, len(rec.Extra.ProviderIDs))
+		for k, v := range rec.Extra.ProviderIDs {
+			nk := strings.ToLower(strings.TrimSpace(k))
+			nv := strings.TrimSpace(v)
+			if nk == "" || nv == "" {
+				continue
+			}
+			if _, exists := normIDs[nk]; !exists || k == nk {
+				normIDs[nk] = nv
+			}
+		}
+		keys := make([]string, 0, len(normIDs))
+		for k := range normIDs {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			isDefault := (k == "tmdb") || (k == "imdb" && tmdbID == "")
+			doc.UniqueIDs = append(doc.UniqueIDs, localNFOUniqueID{
+				Type:    k,
+				Default: isDefault,
+				Value:   normIDs[k],
+			})
+		}
 	}
 
 	if meta != nil {

@@ -38,6 +38,9 @@ export default defineConfig(({ mode }) => {
     },
     server: {
       port: 5173,
+      fs: {
+        strict: mode !== 'test',
+      },
       proxy: {
         '/api': {
           target: 'http://localhost:8096',

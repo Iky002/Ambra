@@ -226,8 +226,8 @@ func TestWebhooksAndEventBusDispatch(t *testing.T) {
 	if r := doReq(t, mux, http.MethodPost, "/Webhooks/Test", map[string]any{}); r.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 on missing target, got %d", r.Code)
 	}
-	if r := doReq(t, mux, http.MethodPost, "/Webhooks/Test", map[string]any{"Url": "http://127.0.0.1:1"}); r.Code != http.StatusBadGateway {
-		t.Fatalf("expected 502 on unreachable url, got %d", r.Code)
+	if r := doReq(t, mux, http.MethodPost, "/Webhooks/Test", map[string]any{"Url": "http://127.0.0.1:1"}); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"Success":false`) || !strings.Contains(r.Body.String(), `"Error":"`) {
+		t.Fatalf("expected 200 with Success=false on unreachable url, got %d %s", r.Code, r.Body.String())
 	}
 
 	// Publish matching & non-matching events via EventBus
@@ -487,8 +487,12 @@ func TestWebhooksSSRFHardening(t *testing.T) {
 			rec := doReq(t, mux, http.MethodPost, "/Webhooks/Test", map[string]any{
 				"Url": u,
 			})
-			if rec.Code != http.StatusBadRequest {
-				t.Fatalf("POST /Webhooks/Test with %q: got %d, want 400 (body=%s)", u, rec.Code, rec.Body.String())
+			if rec.Code != http.StatusOK {
+				t.Fatalf("POST /Webhooks/Test with %q: got %d, want 200 (body=%s)", u, rec.Code, rec.Body.String())
+			}
+			var res WebhookTestResult
+			if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil || res.Success || res.Error == "" {
+				t.Fatalf("POST /Webhooks/Test with %q: expected Success=false with Error, got %+v err=%v", u, res, err)
 			}
 		})
 	}
@@ -503,7 +507,11 @@ func TestWebhooksSSRFHardening(t *testing.T) {
 	rec := doReq(t, mux, http.MethodPost, "/Webhooks/Test", map[string]any{
 		"Url": redirector.URL,
 	})
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("expected 502 when webhook redirects to metadata IP, got %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with Success=false when webhook redirects to metadata IP, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var redirRes WebhookTestResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &redirRes); err != nil || redirRes.Success || redirRes.Error == "" {
+		t.Fatalf("expected Success=false with Error on metadata redirect, got %+v err=%v", redirRes, err)
 	}
 }

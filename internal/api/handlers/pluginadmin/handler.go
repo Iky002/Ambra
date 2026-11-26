@@ -35,10 +35,11 @@ type Handler struct {
 	store    *sqlite.Store
 	auth     AuthFuncs
 
-	cfgMu   sync.RWMutex
-	mu      sync.RWMutex
-	tracked map[string]plugins.Plugin
-	configs map[string]map[string]any
+	cfgMu         sync.RWMutex
+	mu            sync.RWMutex
+	tracked       map[string]plugins.Plugin
+	configs       map[string]map[string]any
+	onConfigSaved func(pluginID string, saved map[string]any)
 }
 
 // New constructs a plugin administration handler.
@@ -63,6 +64,23 @@ func (h *Handler) Track(ps ...plugins.Plugin) {
 		if p != nil {
 			h.tracked[p.Manifest().ID] = p
 		}
+	}
+}
+
+// SetOnConfigSaved registers an optional callback invoked after plugin configuration is persisted,
+// allowing the server to sync built-in plugin changes (e.g. TMDB, STRM) back to ambra.json.
+func (h *Handler) SetOnConfigSaved(fn func(pluginID string, saved map[string]any)) {
+	h.mu.Lock()
+	h.onConfigSaved = fn
+	h.mu.Unlock()
+}
+
+func (h *Handler) notifyConfigSaved(pluginID string, saved map[string]any) {
+	h.mu.RLock()
+	fn := h.onConfigSaved
+	h.mu.RUnlock()
+	if fn != nil {
+		fn(pluginID, cloneMap(saved))
 	}
 }
 
@@ -212,6 +230,16 @@ func (h *Handler) handleGetConfiguration(w http.ResponseWriter, r *http.Request)
 		"Priority": manifest.Priority,
 	}
 
+	if exporter, hasDefaults := p.(plugins.DefaultConfigExporter); hasDefaults {
+		defCfg := exporter.DefaultConfig()
+		if filter, ok := p.(plugins.ServerConfigFilter); ok {
+			defCfg = filter.FilterServerConfig(defCfg)
+		}
+		for k, v := range maskSensitiveMap(defCfg) {
+			out[k] = v
+		}
+	}
+
 	if err == nil {
 		if filter, ok := p.(plugins.ServerConfigFilter); ok {
 			saved = filter.FilterServerConfig(saved)
@@ -250,8 +278,6 @@ func (h *Handler) handleUpdateConfiguration(w http.ResponseWriter, r *http.Reque
 	}
 
 	h.cfgMu.Lock()
-	defer h.cfgMu.Unlock()
-
 	prev, err := h.loadSavedConfig(r.Context(), id)
 	if err != nil {
 		prev = map[string]any{}
@@ -278,14 +304,20 @@ func (h *Handler) handleUpdateConfiguration(w http.ResponseWriter, r *http.Reque
 
 	if err := p.Configure(cfgForConfigure); err != nil {
 		_ = p.Configure(cloneMap(prev))
+		h.cfgMu.Unlock()
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := h.saveConfig(r.Context(), id, merged); err != nil {
+	canonicalID := p.Manifest().ID
+	if err := h.saveConfig(r.Context(), canonicalID, merged); err != nil {
 		_ = p.Configure(cloneMap(prev))
+		h.cfgMu.Unlock()
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.cfgMu.Unlock()
+
+	h.notifyConfigSaved(canonicalID, merged)
 	httpx.JSON(w, http.StatusOK, maskSensitiveMap(merged))
 }
 
@@ -311,8 +343,6 @@ func (h *Handler) handleEnablePlugin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.cfgMu.Lock()
-	defer h.cfgMu.Unlock()
-
 	prev, err := h.loadSavedConfig(r.Context(), id)
 	if err != nil {
 		prev = map[string]any{}
@@ -322,17 +352,24 @@ func (h *Handler) handleEnablePlugin(w http.ResponseWriter, r *http.Request) {
 
 	if err := p.Configure(cloneMap(merged)); err != nil {
 		_ = p.Configure(cloneMap(prev))
+		h.cfgMu.Unlock()
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := h.saveConfig(r.Context(), id, merged); err != nil {
+	canonicalID := p.Manifest().ID
+	if err := h.saveConfig(r.Context(), canonicalID, merged); err != nil {
 		_ = p.Configure(cloneMap(prev))
+		h.cfgMu.Unlock()
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	enabledNow := p.Manifest().Enabled
+	h.cfgMu.Unlock()
+
+	h.notifyConfigSaved(canonicalID, merged)
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"Id":      id,
-		"Enabled": p.Manifest().Enabled,
+		"Enabled": enabledNow,
 	})
 }
 
@@ -345,8 +382,6 @@ func (h *Handler) handleDeletePlugin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.cfgMu.Lock()
-	defer h.cfgMu.Unlock()
-
 	prev, err := h.loadSavedConfig(r.Context(), id)
 	if err != nil {
 		prev = map[string]any{}
@@ -356,14 +391,57 @@ func (h *Handler) handleDeletePlugin(w http.ResponseWriter, r *http.Request) {
 
 	if err := p.Configure(cloneMap(merged)); err != nil {
 		_ = p.Configure(cloneMap(prev))
+		h.cfgMu.Unlock()
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := h.saveConfig(r.Context(), id, merged); err != nil {
+
+	mf := p.Manifest()
+	if !mf.BuiltIn {
+		// External plugin: unregister from registry and purge persisted server_config entry.
+		if h.store != nil {
+			if _, err := h.store.Writer.ExecContext(r.Context(),
+				`DELETE FROM server_config WHERE LOWER(key) = LOWER(?) OR LOWER(key) = LOWER(?)`,
+				configKeyPrefix+mf.ID, configKeyPrefix+id,
+			); err != nil {
+				_ = p.Configure(cloneMap(prev))
+				h.cfgMu.Unlock()
+				httpx.Error(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
+		if h.registry != nil {
+			h.registry.Unregister(mf.ID)
+			if !strings.EqualFold(mf.ID, id) {
+				h.registry.Unregister(id)
+			}
+		}
+		h.mu.Lock()
+		for k := range h.tracked {
+			if strings.EqualFold(k, mf.ID) || strings.EqualFold(k, id) {
+				delete(h.tracked, k)
+			}
+		}
+		for k := range h.configs {
+			if strings.EqualFold(k, mf.ID) || strings.EqualFold(k, id) {
+				delete(h.configs, k)
+			}
+		}
+		h.mu.Unlock()
+		h.cfgMu.Unlock()
+		httpx.NoContent(w)
+		return
+	}
+
+	if err := h.saveConfig(r.Context(), mf.ID, merged); err != nil {
 		_ = p.Configure(cloneMap(prev))
+		h.cfgMu.Unlock()
 		httpx.Error(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.cfgMu.Unlock()
+
+	h.notifyConfigSaved(mf.ID, merged)
 	httpx.NoContent(w)
 }
 

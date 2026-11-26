@@ -3,10 +3,12 @@ package ext
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -31,13 +33,16 @@ var ErrCircuitOpen = errors.New("external plugin circuit breaker open")
 
 // Compile-time interface assertions.
 var (
-	_ plugins.Plugin           = (*HTTPPlugin)(nil)
-	_ plugins.MetadataProvider = (*HTTPPlugin)(nil)
-	_ plugins.StreamResolver   = (*HTTPPlugin)(nil)
+	_ plugins.Plugin                = (*HTTPPlugin)(nil)
+	_ plugins.MetadataProvider      = (*HTTPPlugin)(nil)
+	_ plugins.StreamResolver        = (*HTTPPlugin)(nil)
+	_ plugins.SubtitleProvider      = (*HTTPPlugin)(nil)
+	_ plugins.Notifier              = (*HTTPPlugin)(nil)
+	_ plugins.DefaultConfigExporter = (*HTTPPlugin)(nil)
 )
 
-// HTTPPlugin proxies MetadataProvider and StreamResolver calls to an external HTTP service
-// with strict timeouts and a consecutive-failure circuit breaker.
+// HTTPPlugin proxies MetadataProvider, StreamResolver, SubtitleProvider, and Notifier calls
+// to an external HTTP service with strict timeouts and a consecutive-failure circuit breaker.
 type HTTPPlugin struct {
 	mu sync.RWMutex
 
@@ -52,8 +57,10 @@ type HTTPPlugin struct {
 	priority    int
 	kinds       []plugins.Kind
 
-	timeout time.Duration
-	client  *http.Client
+	timeout           time.Duration
+	client            *http.Client
+	runtimeNoLoopback bool
+	customClient      bool
 
 	failureThreshold int
 	resetTimeout     time.Duration
@@ -126,6 +133,7 @@ func (p *HTTPPlugin) SetHTTPClient(c *http.Client) {
 	}
 	p.mu.Lock()
 	p.client = c
+	p.customClient = true
 	p.mu.Unlock()
 }
 
@@ -146,6 +154,19 @@ func (p *HTTPPlugin) Manifest() plugins.Manifest {
 	}
 }
 
+// DefaultConfig exports the active plugin configuration (secrets masked downstream by pluginadmin).
+func (p *HTTPPlugin) DefaultConfig() map[string]any {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return map[string]any{
+		"endpoint":   p.endpoint,
+		"api_key":    p.apiKey,
+		"enabled":    p.enabled,
+		"priority":   p.priority,
+		"timeout_ms": int(p.timeout / time.Millisecond),
+	}
+}
+
 func urlHostLower(raw string) string {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
@@ -154,7 +175,24 @@ func urlHostLower(raw string) string {
 	return strings.ToLower(strings.TrimSpace(u.Host))
 }
 
+func validateRuntimeEndpointNoLoopback(raw string) (string, error) {
+	trimmed, err := validateEndpoint(raw)
+	if err != nil {
+		return "", err
+	}
+	if err := netutil.ValidateRemoteURLNoLoopback(trimmed, true); err != nil {
+		var dnsErr *net.DNSError
+		// Allow unresolved synthetic hostnames during offline configuration;
+		// SafeHTTPClientNoLoopback re-validates all resolved IPs before dialing.
+		if !errors.As(err, &dnsErr) {
+			return "", fmt.Errorf("unsafe runtime endpoint %q: %w", raw, err)
+		}
+	}
+	return trimmed, nil
+}
+
 // Configure dynamically updates Endpoint, APIKey, Enabled, Priority, and TimeoutMs.
+// Runtime Endpoint updates strictly forbid loopback addresses (127.0.0.1, ::1, localhost).
 func (p *HTTPPlugin) Configure(cfg map[string]any) error {
 	if cfg == nil {
 		return nil
@@ -168,6 +206,7 @@ func (p *HTTPPlugin) Configure(cfg map[string]any) error {
 	nextPriority := p.priority
 	nextTimeout := p.timeout
 	timeoutChanged := false
+	endpointChanged := false
 
 	hasNewAPIKey := false
 	if raw, ok := lookupString(cfg, "APIKey", "ApiKey", "api_key"); ok {
@@ -175,14 +214,24 @@ func (p *HTTPPlugin) Configure(cfg map[string]any) error {
 		hasNewAPIKey = true
 	}
 	if raw, ok := lookupString(cfg, "Endpoint", "endpoint"); ok {
-		ep, err := validateEndpoint(raw)
-		if err != nil {
-			return err
+		// If Endpoint is being modified at runtime (or explicitly passed via API), enforce no-loopback SSRF protection
+		// unless it is unchanged from the initial disk manifest endpoint.
+		trimmedCandidate := strings.TrimRight(strings.TrimSpace(raw), "/")
+		if trimmedCandidate != p.endpoint {
+			ep, err := validateRuntimeEndpointNoLoopback(raw)
+			if err != nil {
+				return err
+			}
+			if urlHostLower(ep) != urlHostLower(p.endpoint) && !hasNewAPIKey {
+				nextAPIKey = ""
+			}
+			nextEndpoint = ep
+			endpointChanged = true
+		} else {
+			if _, err := validateEndpoint(raw); err != nil {
+				return err
+			}
 		}
-		if urlHostLower(ep) != urlHostLower(p.endpoint) && !hasNewAPIKey {
-			nextAPIKey = ""
-		}
-		nextEndpoint = ep
 	}
 	if b, ok := lookupBool(cfg, "Enabled", "enabled"); ok {
 		nextEnabled = b
@@ -209,9 +258,21 @@ func (p *HTTPPlugin) Configure(cfg map[string]any) error {
 	p.endpoint = nextEndpoint
 	p.enabled = nextEnabled
 	p.priority = nextPriority
-	if timeoutChanged {
+	if endpointChanged {
+		p.runtimeNoLoopback = true
 		p.timeout = nextTimeout
-		p.client = netutil.NewSafeHTTPClient(p.timeout, true)
+		if !p.customClient {
+			p.client = netutil.NewSafeHTTPClientNoLoopback(p.timeout, true)
+		}
+	} else if timeoutChanged {
+		p.timeout = nextTimeout
+		if !p.customClient {
+			if p.runtimeNoLoopback {
+				p.client = netutil.NewSafeHTTPClientNoLoopback(p.timeout, true)
+			} else {
+				p.client = netutil.NewSafeHTTPClient(p.timeout, true)
+			}
+		}
 	}
 	return nil
 }
@@ -249,6 +310,104 @@ func (p *HTTPPlugin) ResolveStream(ctx context.Context, rawPath string) (*plugin
 	}
 	out.URL = resolvedURL
 	return &out, nil
+}
+
+// SearchSubtitles forwards subtitle search queries to <Endpoint>/search_subtitles when KindSubtitle is enabled.
+func (p *HTTPPlugin) SearchSubtitles(ctx context.Context, q plugins.SubtitleSearchQuery) ([]plugins.RemoteSubtitleInfo, error) {
+	if !p.supports(plugins.KindSubtitle) {
+		return nil, nil
+	}
+	var raw json.RawMessage
+	ok, err := p.postJSON(ctx, "/search_subtitles", q, &raw)
+	if err != nil || !ok || len(raw) == 0 {
+		return nil, err
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var list []plugins.RemoteSubtitleInfo
+		if err := json.Unmarshal(trimmed, &list); err != nil {
+			return nil, fmt.Errorf("decode plugin %s subtitle list: %w", p.id, err)
+		}
+		return list, nil
+	}
+	var wrapped struct {
+		Subtitles []plugins.RemoteSubtitleInfo `json:"subtitles"`
+		Results   []plugins.RemoteSubtitleInfo `json:"results"`
+	}
+	if err := json.Unmarshal(trimmed, &wrapped); err != nil {
+		return nil, fmt.Errorf("decode plugin %s subtitle response: %w", p.id, err)
+	}
+	if len(wrapped.Subtitles) > 0 {
+		return wrapped.Subtitles, nil
+	}
+	return wrapped.Results, nil
+}
+
+// DownloadSubtitle forwards subtitle download requests to <Endpoint>/download_subtitle when KindSubtitle is enabled.
+func (p *HTTPPlugin) DownloadSubtitle(ctx context.Context, subtitleID string) (*plugins.SubtitleDownloadResult, error) {
+	if !p.supports(plugins.KindSubtitle) {
+		return nil, nil
+	}
+	reqBody := map[string]string{
+		"subtitle_id": subtitleID,
+		"id":          subtitleID,
+	}
+	var resp struct {
+		Language      string `json:"language"`
+		LanguageUpper string `json:"Language"`
+		Format        string `json:"format"`
+		FormatUpper   string `json:"Format"`
+		Content       any    `json:"content"`
+		ContentUpper  any    `json:"Content"`
+		ContentBase64 string `json:"content_base64"`
+	}
+	ok, err := p.postJSON(ctx, "/download_subtitle", reqBody, &resp)
+	if err != nil || !ok {
+		return nil, err
+	}
+	lang := strings.TrimSpace(resp.Language)
+	if lang == "" {
+		lang = strings.TrimSpace(resp.LanguageUpper)
+	}
+	format := strings.TrimSpace(resp.Format)
+	if format == "" {
+		format = strings.TrimSpace(resp.FormatUpper)
+	}
+	var content []byte
+	if resp.ContentBase64 != "" {
+		decoded, decErr := base64.StdEncoding.DecodeString(resp.ContentBase64)
+		if decErr != nil {
+			return nil, fmt.Errorf("decode plugin %s base64 subtitle: %w", p.id, decErr)
+		}
+		content = decoded
+	} else {
+		rawContent := resp.Content
+		if rawContent == nil {
+			rawContent = resp.ContentUpper
+		}
+		if s, isStr := rawContent.(string); isStr {
+			if decoded, decErr := base64.StdEncoding.DecodeString(s); decErr == nil && len(decoded) > 0 && !strings.Contains(s, "-->") {
+				content = decoded
+			} else {
+				content = []byte(s)
+			}
+		}
+	}
+	return &plugins.SubtitleDownloadResult{
+		Language: lang,
+		Format:   format,
+		Content:  content,
+	}, nil
+}
+
+// Notify delivers outgoing notification events to <Endpoint>/notify when KindNotifier is enabled.
+func (p *HTTPPlugin) Notify(ctx context.Context, payload plugins.NotificationPayload) error {
+	if !p.supports(plugins.KindNotifier) {
+		return nil
+	}
+	var ack map[string]any
+	_, err := p.postJSON(ctx, "/notify", payload, &ack)
+	return err
 }
 
 // CircuitState reports whether the circuit breaker is currently open and the consecutive failure count.
@@ -347,9 +506,11 @@ func (p *HTTPPlugin) postJSON(ctx context.Context, suffix string, payload any, d
 		p.recordSuccess()
 		return false, nil
 	}
-	if err := json.Unmarshal(body, dst); err != nil {
-		p.recordFailure()
-		return false, fmt.Errorf("decode plugin %s response: %w", p.id, err)
+	if dst != nil {
+		if err := json.Unmarshal(body, dst); err != nil {
+			p.recordFailure()
+			return false, fmt.Errorf("decode plugin %s response: %w", p.id, err)
+		}
 	}
 
 	p.recordSuccess()

@@ -38,7 +38,7 @@
   - 首页聚合 **轮播推荐、继续观看、接下来播放 (Next Up)、热门趋势（TMDB / 豆瓣 / IMDb）与各库最新添加**；
   - 支持 **跨目录多版本自动合并**、**TMDB 自动合集 (BoxSet)**、片单队列连播、音乐播放器与 LRC 歌词；
   - 浏览器端原生支持 **ASS/SSA 特效字幕（JASSUB）与蓝光 PGS 图形字幕渲染**、**STRM 302 直链自动降级**、MKV 流式解复用与硬解 HLS 转码（VideoToolbox / NVENC / QSV / VAAPI / AMF）。
-- **完整家庭与进阶能力**：支持多用户与家长控制（分级/标签屏蔽）、Quick Connect 快捷登录、Live TV（M3U + XMLTV EPG + DVR 录播）、DLNA 局域网投屏、通知中心、Webhooks、计划任务与 SQLite 一键热备份还原。
+- **完整家庭与进阶能力**：支持多用户与家长控制（分级/标签屏蔽）、Quick Connect 快捷登录、Live TV（M3U + XMLTV EPG + DVR 录播）、DLNA 局域网投屏（默认关闭，可按需开启）、通知中心、Webhooks、计划任务与完整包备份还原。
 
 ---
 
@@ -120,6 +120,10 @@ make build        # 构建当前平台纯 Go 二进制 (bin/ambra)
 | `AMBRA_ADMIN_PASS` | 首次启动无人值守初始化管理员密码（未设置时通过 `/setup` 向导创建） | `""` |
 | `AMBRA_TMDB_API_KEY` | 自定义 TMDB API Key（留空自动使用内置默认密钥） | 内置默认密钥 |
 | `AMBRA_WEB_DIR` | 外部 Web UI 目录（留空使用内嵌前端） | `""` |
+| `AMBRA_ENABLE_DLNA` | 是否启用 DLNA / UPnP 局域网发现与投屏（默认关闭，按需开启） | `false` |
+| `AMBRA_TRUSTED_PROXIES` | 受信任反向代理 IP 或 CIDR 列表，逗号分隔（设为 `none` 禁用转发头信任） | 仅本机回环 |
+| `AMBRA_LOCAL_NETWORK_SUBNETS` | 自定义局域网（LAN）子网 CIDR 列表，逗号分隔（留空自动探测本机私有网卡子网） | 自动探测本机子网 |
+| `AMBRA_ALLOWED_ORIGINS` | 允许跨域访问（CORS / WebSocket）的 Origin 白名单，逗号分隔 | 仅允许同源 |
 | `AMBRA_FFMPEG_PATH` | 自定义 `ffmpeg` 路径 | 自动探测 |
 | `AMBRA_FFPROBE_PATH` | 自定义 `ffprobe` 路径 | 自动探测 |
 

@@ -94,4 +94,13 @@ describe('subtitlePrefs', () => {
     expect(formatSubtitleOffset(1.5)).toBe('+1.5s')
     expect(formatSubtitleOffset(-2)).toBe('-2.0s')
   })
+
+  it('[M-02] scopes subtitle preferences by userId so switching accounts does not leak offsets', () => {
+    saveSubtitlePrefs({ ...DEFAULT_SUBTITLE_PREFS, offsetSec: 2.5, fontScale: 1.3 }, 'user-1')
+    expect(loadSubtitlePrefs('user-1').offsetSec).toBe(2.5)
+    expect(loadSubtitlePrefs('user-2')).toEqual(DEFAULT_SUBTITLE_PREFS)
+
+    resetSubtitlePrefs('user-1')
+    expect(loadSubtitlePrefs('user-1')).toEqual(DEFAULT_SUBTITLE_PREFS)
+  })
 })

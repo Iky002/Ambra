@@ -679,7 +679,9 @@ export function LoginPage() {
                   <input
                     id="forgot-pin-input"
                     type="text"
-                    inputMode="numeric"
+                    autoCapitalize="characters"
+                    autoCorrect="off"
+                    spellCheck={false}
                     maxLength={12}
                     value={forgotPin}
                     onChange={(e) => setForgotPin(e.target.value)}

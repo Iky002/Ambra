@@ -20,21 +20,12 @@ import { api } from '../../api/client'
 import type { VirtualFolderInfo } from '../../api/types'
 import { QueryErrorState } from '../../components/QueryErrorState'
 import { ScanProgressBar } from '../../components/ScanProgressBar'
+import { useI18n } from '../../i18n/I18nContext'
 import { AdminModal, FeedbackBanner, ToggleSwitch } from './adminUtils'
-
-const COLLECTION_TYPES = [
-  { value: 'movies', label: '电影 (movies)' },
-  { value: 'tvshows', label: '剧集 (tvshows)' },
-  { value: 'music', label: '音乐 (music)' },
-  { value: 'mixed', label: '混合内容 (mixed)' },
-  { value: 'books', label: '图书 (books)' },
-  { value: 'homevideos', label: '家庭视频 (homevideos)' },
-]
 
 function getParentPath(path: string): string {
   const normalized = path.replace(/\\/g, '/').replace(/\/+$/, '')
   if (!normalized || normalized === '') return ''
-  // Windows drive root e.g. C:
   if (/^[A-Za-z]:$/.test(normalized)) return ''
   const idx = normalized.lastIndexOf('/')
   if (idx < 0) return ''
@@ -45,6 +36,7 @@ function getParentPath(path: string): string {
 }
 
 export function LibrariesTab() {
+  const { t } = useI18n()
   const queryClient = useQueryClient()
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
     null,
@@ -55,7 +47,6 @@ export function LibrariesTab() {
   } | null>(null)
   const [scanningId, setScanningId] = useState<string | null>(null)
 
-  // 新增媒体库弹窗
   const [createOpen, setCreateOpen] = useState(false)
   const [libName, setLibName] = useState('')
   const [libType, setLibType] = useState('movies')
@@ -65,11 +56,9 @@ export function LibrariesTab() {
   const [saveLocalMetadata, setSaveLocalMetadata] = useState(true)
   const [creating, setCreating] = useState(false)
 
-  // 服务器目录浏览器状态
   const [showBrowser, setShowBrowser] = useState(false)
   const [browsePath, setBrowsePath] = useState('')
 
-  // 编辑媒体库弹窗
   const [editTarget, setEditTarget] = useState<VirtualFolderInfo | null>(null)
   const [editName, setEditName] = useState('')
   const [editLocations, setEditLocations] = useState<string[]>([])
@@ -81,9 +70,17 @@ export function LibrariesTab() {
   const [renaming, setRenaming] = useState(false)
   const [pathBusy, setPathBusy] = useState<string | null>(null)
 
-  // 删除确认弹窗
   const [deleteTarget, setDeleteTarget] = useState<VirtualFolderInfo | null>(null)
   const [deleting, setDeleting] = useState(false)
+
+  const collectionTypes = [
+    { value: 'movies', label: t('admin.libraries.typeMovies') },
+    { value: 'tvshows', label: t('admin.libraries.typeTvShows') },
+    { value: 'music', label: t('admin.libraries.typeMusic') },
+    { value: 'mixed', label: t('admin.libraries.typeMixed') },
+    { value: 'books', label: t('admin.libraries.typeBooks') },
+    { value: 'homevideos', label: t('admin.libraries.typeHomeVideos') },
+  ]
 
   const {
     data: libraries = [],
@@ -129,12 +126,14 @@ export function LibrariesTab() {
       await queryClient.invalidateQueries({ queryKey: ['scanProgress'] })
       setFeedback({
         type: 'success',
-        message: lib ? `已触发媒体库「${lib.Name}」扫描任务` : '已触发全部媒体库扫描任务',
+        message: lib
+          ? t('admin.libraries.scanSingleSuccess', { name: lib.Name })
+          : t('admin.libraries.scanAllSuccess'),
       })
     } catch (err) {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '触发扫描失败',
+        message: err instanceof Error ? err.message : t('admin.scanTriggerFailed'),
       })
     } finally {
       setScanningId(null)
@@ -150,7 +149,7 @@ export function LibrariesTab() {
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!libName.trim()) {
-      setModalFeedback({ type: 'error', message: '请输入媒体库名称' })
+      setModalFeedback({ type: 'error', message: t('admin.libraries.errNameRequired') })
       return
     }
     const finalPaths = manualPath.trim()
@@ -158,7 +157,7 @@ export function LibrariesTab() {
       : paths
 
     if (finalPaths.length === 0) {
-      setModalFeedback({ type: 'error', message: '请至少添加一个服务器媒体目录路径' })
+      setModalFeedback({ type: 'error', message: t('admin.libraries.errPathRequired') })
       return
     }
 
@@ -179,7 +178,10 @@ export function LibrariesTab() {
           ? [queryClient.invalidateQueries({ queryKey: ['scanProgress'] })]
           : []),
       ])
-      setFeedback({ type: 'success', message: `已创建媒体库「${libName.trim()}」` })
+      setFeedback({
+        type: 'success',
+        message: t('admin.libraries.createdSuccess', { name: libName.trim() }),
+      })
       setModalFeedback(null)
       setCreateOpen(false)
       setLibName('')
@@ -192,7 +194,7 @@ export function LibrariesTab() {
     } catch (err) {
       setModalFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '创建媒体库失败',
+        message: err instanceof Error ? err.message : t('admin.libraries.createFailed'),
       })
     } finally {
       setCreating(false)
@@ -226,14 +228,14 @@ export function LibrariesTab() {
       setModalFeedback({
         type: 'success',
         message: next
-          ? `已开启「${editTarget.Name}」的本地 NFO 与图片保存`
-          : `已关闭「${editTarget.Name}」的本地 NFO 与图片保存`,
+          ? t('admin.libraries.nfoEnabledSuccess', { name: editTarget.Name })
+          : t('admin.libraries.nfoDisabledSuccess', { name: editTarget.Name }),
       })
     } catch (err) {
       setEditSaveLocalMetadata(!next)
       setModalFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '更新媒体库选项失败',
+        message: err instanceof Error ? err.message : t('admin.libraries.optionsUpdateFailed'),
       })
     } finally {
       setSavingOptions(false)
@@ -245,7 +247,7 @@ export function LibrariesTab() {
     if (!editTarget) return
     const nextName = editName.trim()
     if (!nextName) {
-      setModalFeedback({ type: 'error', message: '媒体库名称不能为空' })
+      setModalFeedback({ type: 'error', message: t('admin.libraries.errNameEmpty') })
       return
     }
     if (nextName === editTarget.Name) return
@@ -259,11 +261,14 @@ export function LibrariesTab() {
         queryClient.invalidateQueries({ queryKey: ['admin', 'virtualFolders'] }),
         queryClient.invalidateQueries({ queryKey: ['userViews'] }),
       ])
-      setModalFeedback({ type: 'success', message: `已将媒体库重命名为「${nextName}」` })
+      setModalFeedback({
+        type: 'success',
+        message: t('admin.libraries.renamedSuccess', { name: nextName }),
+      })
     } catch (err) {
       setModalFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '重命名媒体库失败',
+        message: err instanceof Error ? err.message : t('admin.libraries.renameFailed'),
       })
     } finally {
       setRenaming(false)
@@ -286,11 +291,14 @@ export function LibrariesTab() {
       setEditLocations((prev) => (prev.includes(cleaned) ? prev : [...prev, cleaned]))
       setEditNewPath('')
       await queryClient.invalidateQueries({ queryKey: ['admin', 'virtualFolders'] })
-      setModalFeedback({ type: 'success', message: `已为「${editTarget.Name}」添加挂载路径 ${cleaned}` })
+      setModalFeedback({
+        type: 'success',
+        message: t('admin.libraries.pathAddedSuccess', { name: editTarget.Name, path: cleaned }),
+      })
     } catch (err) {
       setModalFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '添加路径失败',
+        message: err instanceof Error ? err.message : t('admin.libraries.pathAddFailed'),
       })
     } finally {
       setPathBusy(null)
@@ -305,11 +313,14 @@ export function LibrariesTab() {
       await api.removeVirtualFolderPath(editTarget.Name, loc, editTarget.ItemId)
       setEditLocations((prev) => prev.filter((item) => item !== loc))
       await queryClient.invalidateQueries({ queryKey: ['admin', 'virtualFolders'] })
-      setModalFeedback({ type: 'success', message: `已从「${editTarget.Name}」移除路径 ${loc}` })
+      setModalFeedback({
+        type: 'success',
+        message: t('admin.libraries.pathRemovedSuccess', { name: editTarget.Name, path: loc }),
+      })
     } catch (err) {
       setModalFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '移除路径失败',
+        message: err instanceof Error ? err.message : t('admin.libraries.pathRemoveFailed'),
       })
     } finally {
       setPathBusy(null)
@@ -326,13 +337,16 @@ export function LibrariesTab() {
         queryClient.invalidateQueries({ queryKey: ['admin', 'virtualFolders'] }),
         queryClient.invalidateQueries({ queryKey: ['userViews'] }),
       ])
-      setFeedback({ type: 'success', message: `已删除媒体库「${deleteTarget.Name}」` })
+      setFeedback({
+        type: 'success',
+        message: t('admin.libraries.deletedSuccess', { name: deleteTarget.Name }),
+      })
       setModalFeedback(null)
       setDeleteTarget(null)
     } catch (err) {
       setModalFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '删除媒体库失败',
+        message: err instanceof Error ? err.message : t('admin.libraries.deleteFailed'),
       })
     } finally {
       setDeleting(false)
@@ -349,11 +363,9 @@ export function LibrariesTab() {
         <div>
           <h2 className="flex items-center gap-2 text-base font-semibold text-zinc-100">
             <FolderOpen className="h-4 w-4 text-amber-400" />
-            <span>媒体库管理</span>
+            <span>{t('admin.tabLibraries')}</span>
           </h2>
-          <p className="mt-1 text-xs text-zinc-400">
-            新增或移除虚拟媒体库，浏览服务器本地路径并按需触发扫描
-          </p>
+          <p className="mt-1 text-xs text-zinc-400">{t('admin.libraries.subtitle')}</p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -364,7 +376,7 @@ export function LibrariesTab() {
             className="inline-flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2 text-xs font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:text-amber-300 disabled:opacity-60"
           >
             <RefreshCw className={`h-3.5 w-3.5 ${scanningId === '__all__' ? 'animate-spin' : ''}`} />
-            <span>全库扫描</span>
+            <span>{t('admin.libraries.scanAllBtn')}</span>
           </button>
 
           <button
@@ -376,7 +388,7 @@ export function LibrariesTab() {
             className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-4 py-2 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/20 transition-colors hover:bg-amber-400"
           >
             <FolderPlus className="h-4 w-4" />
-            <span>新增媒体库</span>
+            <span>{t('admin.libraries.addLibBtn')}</span>
           </button>
         </div>
       </div>
@@ -396,15 +408,15 @@ export function LibrariesTab() {
       ) : isError ? (
         <QueryErrorState
           compact
-          title="无法加载媒体库列表"
+          title={t('admin.libraries.loadError')}
           error={error}
           onRetry={() => void refetch()}
         />
       ) : libraries.length === 0 ? (
         <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-14 text-center">
           <FolderOpen className="mx-auto mb-3 h-10 w-10 text-zinc-600" />
-          <p className="text-sm font-medium text-zinc-300">尚未添加任何媒体库</p>
-          <p className="mt-1 text-xs text-zinc-500">点击右上角「新增媒体库」挂载本地影视目录</p>
+          <p className="text-sm font-medium text-zinc-300">{t('admin.libraries.emptyTitle')}</p>
+          <p className="mt-1 text-xs text-zinc-500">{t('admin.libraries.emptyDesc')}</p>
         </div>
       ) : (
         <div className="grid gap-4 md:grid-cols-2">
@@ -419,13 +431,13 @@ export function LibrariesTab() {
                     <h3 className="truncate text-sm font-semibold text-zinc-100">{lib.Name}</h3>
                     <div className="mt-1 flex flex-wrap items-center gap-1.5">
                       <span className="inline-block rounded bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-amber-300">
-                        {COLLECTION_TYPES.find((t) => t.value === lib.CollectionType)?.label ||
+                        {collectionTypes.find((item) => item.value === lib.CollectionType)?.label ||
                           lib.CollectionType ||
                           'mixed'}
                       </span>
                       {(lib.LibraryOptions?.SaveLocalMetadata ?? true) && (
                         <span className="inline-block rounded bg-emerald-500/12 px-2 py-0.5 text-[10px] font-medium text-emerald-300">
-                          本地 NFO / 图片
+                          {t('admin.libraries.localNfoBadge')}
                         </span>
                       )}
                     </div>
@@ -436,7 +448,9 @@ export function LibrariesTab() {
                 </div>
 
                 <div className="mt-3 space-y-1.5">
-                  <p className="text-[11px] font-medium text-zinc-500">挂载路径</p>
+                  <p className="text-[11px] font-medium text-zinc-500">
+                    {t('admin.libraries.mountPathsLabel')}
+                  </p>
                   {lib.Locations && lib.Locations.length > 0 ? (
                     lib.Locations.map((loc) => (
                       <div
@@ -450,7 +464,7 @@ export function LibrariesTab() {
                       </div>
                     ))
                   ) : (
-                    <p className="text-xs text-zinc-500">未配置目录路径</p>
+                    <p className="text-xs text-zinc-500">{t('admin.libraries.noPathsConfigured')}</p>
                   )}
                 </div>
               </div>
@@ -466,7 +480,7 @@ export function LibrariesTab() {
                     <RefreshCw
                       className={`h-3.5 w-3.5 ${scanningId === lib.ItemId ? 'animate-spin' : ''}`}
                     />
-                    <span>扫描此库</span>
+                    <span>{t('admin.libraries.scanThisBtn')}</span>
                   </button>
 
                   <button
@@ -475,7 +489,7 @@ export function LibrariesTab() {
                     className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.05] px-3 py-1.5 text-xs font-medium text-zinc-200 transition-colors hover:border-amber-400/40 hover:text-amber-300"
                   >
                     <Pencil className="h-3.5 w-3.5" />
-                    <span>编辑</span>
+                    <span>{t('common.edit')}</span>
                   </button>
                 </div>
 
@@ -488,7 +502,7 @@ export function LibrariesTab() {
                   className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20"
                 >
                   <Trash2 className="h-3.5 w-3.5" />
-                  <span>删除</span>
+                  <span>{t('common.delete')}</span>
                 </button>
               </div>
             </div>
@@ -496,11 +510,11 @@ export function LibrariesTab() {
         </div>
       )}
 
-      {/* 新增媒体库弹窗 */}
+      {/* Create Library Modal */}
       <AdminModal
         open={createOpen}
-        title="新增媒体库"
-        subtitle="配置媒体库名称、类型并选择一个或多个服务器本地目录"
+        title={t('admin.libraries.addLibBtn')}
+        subtitle={t('admin.libraries.createModalSubtitle')}
         maxWidthClass="max-w-2xl"
         onClose={() => {
           setCreateOpen(false)
@@ -515,44 +529,53 @@ export function LibrariesTab() {
           />
           <div className="grid gap-4 sm:grid-cols-2">
             <div>
-              <label className="mb-1.5 block text-xs font-medium text-zinc-400">媒体库名称 *</label>
+              <label className="mb-1.5 block text-xs font-medium text-zinc-400">
+                {t('admin.libraries.libNameLabel')}
+              </label>
               <input
                 type="text"
                 required
                 value={libName}
                 onChange={(e) => setLibName(e.target.value)}
-                placeholder="例如: 4K 电影"
+                placeholder={t('admin.libraries.libNamePlaceholder')}
                 className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
               />
             </div>
 
             <div>
-              <label className="mb-1.5 block text-xs font-medium text-zinc-400">内容类型 *</label>
+              <label className="mb-1.5 block text-xs font-medium text-zinc-400">
+                {t('admin.libraries.libTypeLabel')}
+              </label>
               <select
                 value={libType}
                 onChange={(e) => setLibType(e.target.value)}
                 className="w-full rounded-xl border border-white/10 bg-[#181822] px-3.5 py-2.5 text-sm text-zinc-100 outline-none focus:border-amber-400/60"
               >
-                {COLLECTION_TYPES.map((t) => (
-                  <option key={t.value} value={t.value}>
-                    {t.label}
+                {collectionTypes.map((item) => (
+                  <option key={item.value} value={item.value}>
+                    {item.label}
                   </option>
                 ))}
               </select>
             </div>
           </div>
 
-          {/* 路径输入与浏览 */}
           <div className="space-y-2.5">
             <div className="flex items-center justify-between">
-              <label className="text-xs font-medium text-zinc-400">媒体目录路径 *</label>
+              <label className="text-xs font-medium text-zinc-400">
+                {t('admin.libraries.mediaDirLabel')}
+              </label>
               <button
                 type="button"
                 onClick={() => setShowBrowser((v) => !v)}
                 className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
               >
                 <HardDrive className="h-3.5 w-3.5" />
-                <span>{showBrowser ? '收起目录浏览器' : '浏览服务器目录'}</span>
+                <span>
+                  {showBrowser
+                    ? t('admin.libraries.collapseBrowser')
+                    : t('admin.libraries.browseServerDir')}
+                </span>
               </button>
             </div>
 
@@ -568,7 +591,7 @@ export function LibrariesTab() {
                     setManualPath('')
                   }
                 }}
-                placeholder="手动输入服务器路径，例如 /media/movies"
+                placeholder={t('admin.libraries.manualPathPlaceholder')}
                 className="flex-1 rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
               />
               <button
@@ -580,11 +603,10 @@ export function LibrariesTab() {
                 className="inline-flex items-center gap-1 rounded-xl border border-white/10 bg-white/[0.06] px-3 py-2 text-xs font-medium text-zinc-200 hover:bg-white/10"
               >
                 <Plus className="h-3.5 w-3.5" />
-                <span>添加</span>
+                <span>{t('admin.tasks.addBtn')}</span>
               </button>
             </div>
 
-            {/* 已选路径标签 */}
             {paths.length > 0 && (
               <div className="flex flex-wrap gap-2 pt-1">
                 {paths.map((p) => (
@@ -606,7 +628,6 @@ export function LibrariesTab() {
               </div>
             )}
 
-            {/* 内置服务器本地目录浏览器 */}
             {showBrowser && (
               <div className="overflow-hidden rounded-xl border border-white/10 bg-black/40">
                 <div className="flex items-center justify-between gap-2 border-b border-white/8 bg-white/[0.03] px-3 py-2">
@@ -618,17 +639,17 @@ export function LibrariesTab() {
                       className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.05] px-2 py-1 text-[11px] font-medium text-zinc-200 hover:bg-white/10 disabled:opacity-40"
                     >
                       <ArrowUp className="h-3 w-3" />
-                      <span>上级</span>
+                      <span>{t('admin.libraries.upLevel')}</span>
                     </button>
                     <button
                       type="button"
                       onClick={() => setBrowsePath('')}
                       className="rounded-lg px-2 py-1 text-[11px] text-zinc-400 hover:bg-white/8 hover:text-zinc-200"
                     >
-                      磁盘根列表
+                      {t('admin.libraries.diskRootList')}
                     </button>
                     <span className="truncate font-mono text-xs text-amber-300">
-                      {browsePath || '根目录 / 驱动器'}
+                      {browsePath || t('admin.libraries.rootDrives')}
                     </span>
                   </div>
 
@@ -639,7 +660,7 @@ export function LibrariesTab() {
                       className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-amber-500/20 px-2.5 py-1 text-[11px] font-semibold text-amber-300 hover:bg-amber-500/30"
                     >
                       <Check className="h-3 w-3" />
-                      <span>选择当前目录</span>
+                      <span>{t('admin.libraries.selectCurrentDir')}</span>
                     </button>
                   )}
                 </div>
@@ -651,12 +672,18 @@ export function LibrariesTab() {
                     </div>
                   ) : browserError ? (
                     <div className="px-3 py-6 text-center text-xs text-red-300">
-                      读取服务器目录失败：
-                      {browserError instanceof Error ? browserError.message : '接口暂不可用'}
-                      <p className="mt-1 text-zinc-500">您仍可在上方输入框中直接手动输入路径</p>
+                      {t('admin.libraries.browseDirFailed', {
+                        error:
+                          browserError instanceof Error
+                            ? browserError.message
+                            : t('admin.livetv.retryLater'),
+                      })}
+                      <p className="mt-1 text-zinc-500">{t('admin.libraries.manualFallbackHint')}</p>
                     </div>
                   ) : folderEntries.length === 0 ? (
-                    <div className="py-8 text-center text-xs text-zinc-500">当前目录下没有子文件夹</div>
+                    <div className="py-8 text-center text-xs text-zinc-500">
+                      {t('admin.libraries.noSubfolders')}
+                    </div>
                   ) : (
                     <div className="space-y-1">
                       {folderEntries.map((entry) => {
@@ -688,7 +715,9 @@ export function LibrariesTab() {
                                   : 'bg-white/8 text-zinc-300 hover:bg-amber-500/25 hover:text-amber-200'
                               }`}
                             >
-                              {isSelected ? '已添加' : '选中'}
+                              {isSelected
+                                ? t('admin.libraries.addedBadge')
+                                : t('admin.libraries.selectBtn')}
                             </button>
                           </div>
                         )
@@ -703,15 +732,15 @@ export function LibrariesTab() {
           <ToggleSwitch
             checked={saveLocalMetadata}
             onChange={setSaveLocalMetadata}
-            label="保存元数据与图片到媒体文件夹"
-            description="刮削完成后自动将 .nfo 与 poster.jpg / fanart.jpg 保存到媒体同目录（兼容 Emby / Kodi）"
+            label={t('admin.libraries.saveLocalMetaLabel')}
+            description={t('admin.libraries.saveLocalMetaDesc')}
           />
 
           <ToggleSwitch
             checked={refreshAfterCreate}
             onChange={setRefreshAfterCreate}
-            label="创建后立即触发扫描"
-            description="自动开始索引所选目录中的影音文件与元数据"
+            label={t('admin.libraries.scanAfterCreateLabel')}
+            description={t('admin.libraries.scanAfterCreateDesc')}
           />
 
           <div className="flex justify-end gap-2 pt-2">
@@ -723,7 +752,7 @@ export function LibrariesTab() {
               }}
               className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
             >
-              取消
+              {t('common.cancel')}
             </button>
             <button
               type="submit"
@@ -731,17 +760,21 @@ export function LibrariesTab() {
               className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 hover:bg-amber-400 disabled:opacity-60"
             >
               {creating && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-              <span>创建媒体库</span>
+              <span>{t('admin.libraries.createConfirmBtn')}</span>
             </button>
           </div>
         </form>
       </AdminModal>
 
-      {/* 编辑媒体库弹窗 */}
+      {/* Edit Library Modal */}
       <AdminModal
         open={Boolean(editTarget)}
-        title="编辑媒体库"
-        subtitle={editTarget ? `重命名「${editTarget.Name}」或增删已挂载的媒体目录` : undefined}
+        title={t('admin.libraries.editModalTitle')}
+        subtitle={
+          editTarget
+            ? t('admin.libraries.editModalSubtitle', { name: editTarget.Name })
+            : undefined
+        }
         maxWidthClass="max-w-2xl"
         onClose={() => {
           setEditTarget(null)
@@ -754,16 +787,17 @@ export function LibrariesTab() {
             type={modalFeedback?.type}
             onClose={() => setModalFeedback(null)}
           />
-          {/* 重命名表单 */}
           <form onSubmit={handleRename} className="space-y-2">
-            <label className="block text-xs font-medium text-zinc-400">媒体库名称</label>
+            <label className="block text-xs font-medium text-zinc-400">
+              {t('admin.libraries.libNameLabel').replace(/\s*\*$/, '')}
+            </label>
             <div className="flex gap-2">
               <input
                 type="text"
                 required
                 value={editName}
                 onChange={(e) => setEditName(e.target.value)}
-                placeholder="输入新的媒体库名称"
+                placeholder={t('admin.libraries.newNamePlaceholder')}
                 className="flex-1 rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
               />
               <button
@@ -776,16 +810,15 @@ export function LibrariesTab() {
                 ) : (
                   <Save className="h-3.5 w-3.5" />
                 )}
-                <span>保存名称</span>
+                <span>{t('admin.libraries.saveNameBtn')}</span>
               </button>
             </div>
           </form>
 
-          {/* 当前挂载路径列表 */}
           <div className="space-y-2.5 border-t border-white/8 pt-4">
             <div className="flex items-center justify-between">
               <label className="text-xs font-medium text-zinc-400">
-                已挂载目录 ({editLocations.length})
+                {t('admin.libraries.mountedDirsCount', { count: editLocations.length })}
               </label>
               <button
                 type="button"
@@ -793,13 +826,17 @@ export function LibrariesTab() {
                 className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
               >
                 <HardDrive className="h-3.5 w-3.5" />
-                <span>{editShowBrowser ? '收起目录浏览器' : '浏览服务器目录'}</span>
+                <span>
+                  {editShowBrowser
+                    ? t('admin.libraries.collapseBrowser')
+                    : t('admin.libraries.browseServerDir')}
+                </span>
               </button>
             </div>
 
             {editLocations.length === 0 ? (
               <p className="rounded-xl border border-dashed border-white/10 bg-white/[0.02] py-4 text-center text-xs text-zinc-500">
-                当前媒体库暂无挂载目录
+                {t('admin.libraries.noMountedDirs')}
               </p>
             ) : (
               <div className="space-y-1.5">
@@ -818,7 +855,7 @@ export function LibrariesTab() {
                       type="button"
                       disabled={pathBusy !== null}
                       onClick={() => void handleRemoveEditPath(loc)}
-                      aria-label={`移除路径 ${loc}`}
+                      aria-label={t('admin.libraries.removePathAria', { path: loc })}
                       className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-red-500/20 bg-red-500/10 px-2 py-1 text-[11px] font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
                     >
                       {pathBusy === `remove:${loc}` ? (
@@ -826,14 +863,13 @@ export function LibrariesTab() {
                       ) : (
                         <Trash2 className="h-3 w-3" />
                       )}
-                      <span>移除</span>
+                      <span>{t('admin.libraries.removeBtn')}</span>
                     </button>
                   </div>
                 ))}
               </div>
             )}
 
-            {/* 新增路径输入 */}
             <div className="flex gap-2 pt-1">
               <input
                 type="text"
@@ -845,7 +881,7 @@ export function LibrariesTab() {
                     void handleAddEditPath(editNewPath)
                   }
                 }}
-                placeholder="输入要新增的服务器目录路径，例如 /media/movies-4k"
+                placeholder={t('admin.libraries.addNewPathPlaceholder')}
                 className="flex-1 rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
               />
               <button
@@ -855,11 +891,10 @@ export function LibrariesTab() {
                 className="inline-flex items-center gap-1 rounded-xl border border-white/10 bg-white/[0.06] px-3 py-2 text-xs font-medium text-zinc-200 hover:bg-white/10 disabled:opacity-50"
               >
                 <Plus className="h-3.5 w-3.5" />
-                <span>添加路径</span>
+                <span>{t('admin.libraries.addPathBtn')}</span>
               </button>
             </div>
 
-            {/* 复用服务器目录浏览器 */}
             {editShowBrowser && (
               <div className="overflow-hidden rounded-xl border border-white/10 bg-black/40">
                 <div className="flex items-center justify-between gap-2 border-b border-white/8 bg-white/[0.03] px-3 py-2">
@@ -871,17 +906,17 @@ export function LibrariesTab() {
                       className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.05] px-2 py-1 text-[11px] font-medium text-zinc-200 hover:bg-white/10 disabled:opacity-40"
                     >
                       <ArrowUp className="h-3 w-3" />
-                      <span>上级</span>
+                      <span>{t('admin.libraries.upLevel')}</span>
                     </button>
                     <button
                       type="button"
                       onClick={() => setEditBrowsePath('')}
                       className="rounded-lg px-2 py-1 text-[11px] text-zinc-400 hover:bg-white/8 hover:text-zinc-200"
                     >
-                      磁盘根列表
+                      {t('admin.libraries.diskRootList')}
                     </button>
                     <span className="truncate font-mono text-xs text-amber-300">
-                      {editBrowsePath || '根目录 / 驱动器'}
+                      {editBrowsePath || t('admin.libraries.rootDrives')}
                     </span>
                   </div>
 
@@ -893,7 +928,7 @@ export function LibrariesTab() {
                       className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-amber-500/20 px-2.5 py-1 text-[11px] font-semibold text-amber-300 hover:bg-amber-500/30 disabled:opacity-50"
                     >
                       <Check className="h-3 w-3" />
-                      <span>添加当前目录</span>
+                      <span>{t('admin.libraries.addCurrentDir')}</span>
                     </button>
                   )}
                 </div>
@@ -905,11 +940,17 @@ export function LibrariesTab() {
                     </div>
                   ) : browserError ? (
                     <div className="px-3 py-6 text-center text-xs text-red-300">
-                      读取服务器目录失败：
-                      {browserError instanceof Error ? browserError.message : '接口暂不可用'}
+                      {t('admin.libraries.browseDirFailed', {
+                        error:
+                          browserError instanceof Error
+                            ? browserError.message
+                            : t('admin.livetv.retryLater'),
+                      })}
                     </div>
                   ) : folderEntries.length === 0 ? (
-                    <div className="py-8 text-center text-xs text-zinc-500">当前目录下没有子文件夹</div>
+                    <div className="py-8 text-center text-xs text-zinc-500">
+                      {t('admin.libraries.noSubfolders')}
+                    </div>
                   ) : (
                     <div className="space-y-1">
                       {folderEntries.map((entry) => {
@@ -942,7 +983,9 @@ export function LibrariesTab() {
                                   : 'bg-white/8 text-zinc-300 hover:bg-amber-500/25 hover:text-amber-200'
                               }`}
                             >
-                              {isSelected ? '已挂载' : '添加'}
+                              {isSelected
+                                ? t('admin.libraries.mountedBadge')
+                                : t('admin.tasks.addBtn')}
                             </button>
                           </div>
                         )
@@ -954,14 +997,15 @@ export function LibrariesTab() {
             )}
           </div>
 
-          {/* 刮削与元数据选项 */}
           <div className="space-y-2.5 border-t border-white/8 pt-4">
-            <label className="block text-xs font-medium text-zinc-400">元数据与刮削选项</label>
+            <label className="block text-xs font-medium text-zinc-400">
+              {t('admin.libraries.metaOptionsLabel')}
+            </label>
             <ToggleSwitch
               checked={editSaveLocalMetadata}
               onChange={(next) => void handleToggleEditSaveLocal(next)}
-              label="保存元数据与图片到媒体文件夹"
-              description="刮削完成后自动将 .nfo 与 poster.jpg / fanart.jpg 保存到媒体同目录（兼容 Emby / Kodi）"
+              label={t('admin.libraries.saveLocalMetaLabel')}
+              description={t('admin.libraries.saveLocalMetaDesc')}
             />
           </div>
 
@@ -974,17 +1018,17 @@ export function LibrariesTab() {
               }}
               className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
             >
-              完成
+              {t('admin.libraries.doneBtn')}
             </button>
           </div>
         </div>
       </AdminModal>
 
-      {/* 删除媒体库确认弹窗 */}
+      {/* Delete Library Confirm Modal */}
       <AdminModal
         open={Boolean(deleteTarget)}
-        title="确认删除媒体库"
-        subtitle="仅从 Ambra 数据库中移除索引记录，不会删除磁盘上的原始媒体文件"
+        title={t('admin.libraries.deleteModalTitle')}
+        subtitle={t('admin.libraries.deleteModalSubtitle')}
         maxWidthClass="max-w-md"
         onClose={() => {
           setDeleteTarget(null)
@@ -998,8 +1042,7 @@ export function LibrariesTab() {
             onClose={() => setModalFeedback(null)}
           />
           <p className="text-sm text-zinc-300">
-            确定要移除媒体库 <span className="font-semibold text-white">{deleteTarget?.Name}</span>{' '}
-            吗？
+            {t('admin.libraries.deleteConfirmPrompt', { name: deleteTarget?.Name || '' })}
           </p>
           <div className="mt-6 flex justify-end gap-2">
             <button
@@ -1010,7 +1053,7 @@ export function LibrariesTab() {
               }}
               className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
             >
-              取消
+              {t('common.cancel')}
             </button>
             <button
               type="button"
@@ -1019,7 +1062,7 @@ export function LibrariesTab() {
               className="inline-flex items-center gap-2 rounded-xl bg-red-500 px-4 py-2 text-xs font-semibold text-white hover:bg-red-400 disabled:opacity-60"
             >
               {deleting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-              <span>确认删除</span>
+              <span>{t('admin.users.confirmDelete')}</span>
             </button>
           </div>
         </div>

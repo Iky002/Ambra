@@ -82,6 +82,8 @@ if [ "$TARGET_UID" != "0" ] || [ "$TARGET_GID" != "0" ]; then
     "$DATA_DIR/cache/bif" \
     "$DATA_DIR/cache/subtitles" \
     "$DATA_DIR/cache/transcoding-temp" \
+    "$DATA_DIR/cache/sync" \
+    "$DATA_DIR/camera-uploads" \
     "$DATA_DIR/metadata" \
     "$DATA_DIR/plugins" \
     "$DATA_DIR/bin" \
@@ -89,7 +91,7 @@ if [ "$TARGET_UID" != "0" ] || [ "$TARGET_GID" != "0" ]; then
     "$DATA_DIR/ambra.db-wal" \
     "$DATA_DIR/ambra.db-shm"
   do
-    if [ -e "$p" ]; then
+    if [ -e "$p" ] || [ -L "$p" ]; then
       cur_owner="$(stat -c '%u:%g' "$p" 2>/dev/null || true)"
       if [ -n "$cur_owner" ] && [ "$cur_owner" != "${TARGET_UID}:${TARGET_GID}" ]; then
         needs_chown=1
@@ -98,7 +100,7 @@ if [ "$TARGET_UID" != "0" ] || [ "$TARGET_GID" != "0" ]; then
     fi
   done
   if [ "$needs_chown" = "1" ]; then
-    if ! chown -R "${TARGET_UID}:${TARGET_GID}" "$DATA_DIR"; then
+    if ! chown -RP -h "${TARGET_UID}:${TARGET_GID}" "$DATA_DIR"; then
       echo "ambra entrypoint: warning: failed to chown '${DATA_DIR}' to ${TARGET_UID}:${TARGET_GID}" >&2
     fi
   fi

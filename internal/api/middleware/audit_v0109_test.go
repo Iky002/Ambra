@@ -16,7 +16,9 @@ func TestEmbyPrefixDynamicSegmentsV0109(t *testing.T) {
 	r.Get("/Artists/AlbumArtists", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("static:AlbumArtists")) })
 	r.Get("/Artists/Prefixes", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("static:Prefixes")) })
 	r.Get("/Artists/InstantMix", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("static:InstantMix")) })
-	r.Get("/Artists/{Name}", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("artist:" + chi.URLParam(r, "Name"))) })
+	r.Get("/Artists/{Name}", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("artist:" + chi.URLParam(r, "Name")))
+	})
 	r.Get("/Artists/{Name}/Images/{Type}", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("artistimg:" + chi.URLParam(r, "Name") + ":" + chi.URLParam(r, "Type")))
 	})
@@ -24,22 +26,32 @@ func TestEmbyPrefixDynamicSegmentsV0109(t *testing.T) {
 	// MusicGenres & GameGenres
 	r.Get("/MusicGenres/InstantMix", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("static:MGInstantMix")) })
 	r.Get("/MusicGenres/{Name}", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("mg:" + chi.URLParam(r, "Name"))) })
-	r.Get("/MusicGenres/{Name}/InstantMix", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("mgmix:" + chi.URLParam(r, "Name"))) })
+	r.Get("/MusicGenres/{Name}/InstantMix", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("mgmix:" + chi.URLParam(r, "Name")))
+	})
 	r.Get("/GameGenres/{Name}", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("gg:" + chi.URLParam(r, "Name"))) })
 
 	// Packages & Registrations
 	r.Get("/Packages/Updates", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("static:PkgUpdates")) })
 	r.Get("/Packages/{Name}", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("pkg:" + chi.URLParam(r, "Name"))) })
-	r.Post("/Packages/Installed/{Name}", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("pkginst:" + chi.URLParam(r, "Name"))) })
-	r.Post("/Packages/Installing/{Id}/Delete", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("pkgdel:" + chi.URLParam(r, "Id"))) })
+	r.Post("/Packages/Installed/{Name}", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("pkginst:" + chi.URLParam(r, "Name")))
+	})
+	r.Post("/Packages/Installing/{Id}/Delete", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("pkgdel:" + chi.URLParam(r, "Id")))
+	})
 	r.Get("/Registrations/{Name}", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("reg:" + chi.URLParam(r, "Name"))) })
 
 	// System/Configuration & System/Logs
 	r.Get("/System/Configuration/{Key}", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("cfg:" + chi.URLParam(r, "Key"))) })
 	r.Get("/System/Logs/Query", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("static:LogsQuery")) })
-	r.Get("/System/Logs/Log", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("static:LogsLog:" + r.URL.Query().Get("name"))) })
+	r.Get("/System/Logs/Log", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("static:LogsLog:" + r.URL.Query().Get("name")))
+	})
 	r.Get("/System/Logs/{Name}", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("log:" + chi.URLParam(r, "Name"))) })
-	r.Get("/System/Logs/{Name}/Lines", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("loglines:" + chi.URLParam(r, "Name"))) })
+	r.Get("/System/Logs/{Name}/Lines", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("loglines:" + chi.URLParam(r, "Name")))
+	})
 
 	// Users/{UserId}/TypedSettings/{Key}
 	r.Get("/Users/{UserId}/TypedSettings/{Key}", func(w http.ResponseWriter, r *http.Request) {

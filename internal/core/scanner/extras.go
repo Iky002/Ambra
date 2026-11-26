@@ -302,6 +302,13 @@ func (s *Scanner) upsertExtraItem(ctx context.Context, lib *sqlite.LibraryRecord
 		rt := probeRes.RuntimeTicks
 		rec.RuntimeTicks = &rt
 	}
+	if existing != nil {
+		rec.DateCreated = existing.DateCreated
+		preserveExistingItemOnRescan(existing, rec)
+		if rec.Extra.ExtraType == "" {
+			rec.Extra.ExtraType = extraType
+		}
+	}
 
 	if err := s.repo.UpsertItem(ctx, rec); err != nil {
 		return

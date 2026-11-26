@@ -27,27 +27,31 @@ const (
 var AmbraVersion = "v0.10.9"
 
 type envOverrideFlags struct {
-	httpAddr           bool
-	webDir             bool
-	tmdbKey            bool
-	enableDLNA         bool
-	enableQuickConnect bool
-	allowedOrigins     bool
-	trustedProxies     bool
-	ffmpegPath         bool
-	ffprobePath        bool
+	httpAddr            bool
+	webDir              bool
+	tmdbKey             bool
+	enableDLNA          bool
+	dlnaDefaultUserID   bool
+	enableQuickConnect  bool
+	allowedOrigins      bool
+	trustedProxies      bool
+	localNetworkSubnets bool
+	ffmpegPath          bool
+	ffprobePath         bool
 }
 
 type diskBaseline struct {
-	httpAddr           string
-	webDir             string
-	tmdbKey            string
-	enableDLNA         bool
-	enableQuickConnect bool
-	allowedOrigins     []string
-	trustedProxies     []string
-	ffmpegPath         string
-	ffprobePath        string
+	httpAddr            string
+	webDir              string
+	tmdbKey             string
+	enableDLNA          bool
+	dlnaDefaultUserID   string
+	enableQuickConnect  bool
+	allowedOrigins      []string
+	trustedProxies      []string
+	localNetworkSubnets []string
+	ffmpegPath          string
+	ffprobePath         string
 }
 
 type Config struct {
@@ -67,9 +71,14 @@ type Config struct {
 	TMDBLanguage             string   `json:"tmdb_language"`
 	EnableSTRM302            bool     `json:"enable_strm_302"`
 	EnableDLNA               bool     `json:"enable_dlna"`
+	DLNADefaultUserID        string   `json:"dlna_default_user_id,omitempty"`
 	EnableQuickConnect       bool     `json:"enable_quick_connect"`
+	EnableRemoteAccessGlobal *bool    `json:"enable_remote_access,omitempty"`
 	AllowedOrigins           []string `json:"allowed_origins,omitempty"`
 	TrustedProxies           []string `json:"trusted_proxies,omitempty"`
+	LocalNetworkSubnets      []string `json:"local_network_subnets,omitempty"`
+	SimultaneousStreamLimit  int      `json:"simultaneous_stream_limit,omitempty"`
+	RemoteClientBitrateLimit int      `json:"remote_client_bitrate_limit,omitempty"`
 	PlayedThreshold          float64  `json:"played_threshold"`
 	IsStartupWizardCompleted bool     `json:"is_startup_wizard_completed"`
 }
@@ -87,7 +96,7 @@ func Default(dataDir string) *Config {
 		FFprobePath:              "ffprobe",
 		TMDBLanguage:             "zh-CN",
 		EnableSTRM302:            true,
-		EnableDLNA:               true,
+		EnableDLNA:               false,
 		EnableQuickConnect:       true,
 		PlayedThreshold:          0.90,
 		IsStartupWizardCompleted: false,
@@ -106,6 +115,8 @@ func Load(dataDir string) (*Config, error) {
 		"cache/bif",
 		"cache/subtitles",
 		"cache/transcoding-temp",
+		"cache/sync",
+		"camera-uploads",
 		"metadata",
 		"logs",
 		"plugins",
@@ -153,15 +164,17 @@ func Load(dataDir string) (*Config, error) {
 	// Capture persisted disk baseline before applying ephemeral environment overrides
 	// so Save() does not permanently bake temporary env vars into ambra.json.
 	cfg.baseline = diskBaseline{
-		httpAddr:           cfg.HTTPAddr,
-		webDir:             cfg.WebDir,
-		tmdbKey:            cfg.TMDBApiKey,
-		enableDLNA:         cfg.EnableDLNA,
-		enableQuickConnect: cfg.EnableQuickConnect,
-		allowedOrigins:     append([]string(nil), cfg.AllowedOrigins...),
-		trustedProxies:     append([]string(nil), cfg.TrustedProxies...),
-		ffmpegPath:         cfg.FFmpegPath,
-		ffprobePath:        cfg.FFprobePath,
+		httpAddr:            cfg.HTTPAddr,
+		webDir:              cfg.WebDir,
+		tmdbKey:             cfg.TMDBApiKey,
+		enableDLNA:          cfg.EnableDLNA,
+		dlnaDefaultUserID:   cfg.DLNADefaultUserID,
+		enableQuickConnect:  cfg.EnableQuickConnect,
+		allowedOrigins:      append([]string(nil), cfg.AllowedOrigins...),
+		trustedProxies:      append([]string(nil), cfg.TrustedProxies...),
+		localNetworkSubnets: append([]string(nil), cfg.LocalNetworkSubnets...),
+		ffmpegPath:          cfg.FFmpegPath,
+		ffprobePath:         cfg.FFprobePath,
 	}
 
 	// Environment variable overrides (highest priority)
@@ -187,6 +200,10 @@ func Load(dataDir string) (*Config, error) {
 			cfg.envFlags.enableDLNA = true
 		}
 	}
+	if v := strings.TrimSpace(os.Getenv("AMBRA_DLNA_DEFAULT_USER_ID")); v != "" {
+		cfg.DLNADefaultUserID = v
+		cfg.envFlags.dlnaDefaultUserID = true
+	}
 	if v := strings.TrimSpace(os.Getenv("AMBRA_ENABLE_QUICK_CONNECT")); v != "" {
 		switch strings.ToLower(v) {
 		case "false", "0", "off", "no":
@@ -204,6 +221,10 @@ func Load(dataDir string) (*Config, error) {
 	if v := strings.TrimSpace(os.Getenv("AMBRA_TRUSTED_PROXIES")); v != "" {
 		cfg.TrustedProxies = splitCSVEnv(v)
 		cfg.envFlags.trustedProxies = true
+	}
+	if v := strings.TrimSpace(os.Getenv("AMBRA_LOCAL_NETWORK_SUBNETS")); v != "" {
+		cfg.LocalNetworkSubnets = splitCSVEnv(v)
+		cfg.envFlags.localNetworkSubnets = true
 	}
 
 	// Resolve ffmpeg/ffprobe paths via ffmpegbin manager:
@@ -292,9 +313,11 @@ func (c *Config) Update(fn func(*Config)) {
 	prevWebDir := c.WebDir
 	prevTMDB := c.TMDBApiKey
 	prevDLNA := c.EnableDLNA
+	prevDLNAUser := c.DLNADefaultUserID
 	prevQC := c.EnableQuickConnect
 	prevOrigins := append([]string(nil), c.AllowedOrigins...)
 	prevProxies := append([]string(nil), c.TrustedProxies...)
+	prevSubnets := append([]string(nil), c.LocalNetworkSubnets...)
 	prevFFmpeg := c.FFmpegPath
 	prevFFprobe := c.FFprobePath
 
@@ -312,6 +335,9 @@ func (c *Config) Update(fn func(*Config)) {
 	if c.EnableDLNA != prevDLNA {
 		c.envFlags.enableDLNA = false
 	}
+	if c.DLNADefaultUserID != prevDLNAUser {
+		c.envFlags.dlnaDefaultUserID = false
+	}
 	if c.EnableQuickConnect != prevQC {
 		c.envFlags.enableQuickConnect = false
 	}
@@ -321,12 +347,23 @@ func (c *Config) Update(fn func(*Config)) {
 	if !stringSlicesEqual(c.TrustedProxies, prevProxies) {
 		c.envFlags.trustedProxies = false
 	}
+	if !stringSlicesEqual(c.LocalNetworkSubnets, prevSubnets) {
+		c.envFlags.localNetworkSubnets = false
+	}
 	if c.FFmpegPath != prevFFmpeg {
 		c.envFlags.ffmpegPath = false
 	}
 	if c.FFprobePath != prevFFprobe {
 		c.envFlags.ffprobePath = false
 	}
+}
+
+func cloneBoolPtr(p *bool) *bool {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
 }
 
 // Snapshot returns a thread-safe value copy of the current configuration.
@@ -348,7 +385,11 @@ func (c *Config) Snapshot() Config {
 		TMDBLanguage:             c.TMDBLanguage,
 		EnableSTRM302:            c.EnableSTRM302,
 		EnableDLNA:               c.EnableDLNA,
+		DLNADefaultUserID:        c.DLNADefaultUserID,
 		EnableQuickConnect:       c.EnableQuickConnect,
+		EnableRemoteAccessGlobal: cloneBoolPtr(c.EnableRemoteAccessGlobal),
+		SimultaneousStreamLimit:  c.SimultaneousStreamLimit,
+		RemoteClientBitrateLimit: c.RemoteClientBitrateLimit,
 		PlayedThreshold:          c.PlayedThreshold,
 		IsStartupWizardCompleted: c.IsStartupWizardCompleted,
 	}
@@ -358,7 +399,18 @@ func (c *Config) Snapshot() Config {
 	if len(c.TrustedProxies) > 0 {
 		cp.TrustedProxies = append([]string(nil), c.TrustedProxies...)
 	}
+	if len(c.LocalNetworkSubnets) > 0 {
+		cp.LocalNetworkSubnets = append([]string(nil), c.LocalNetworkSubnets...)
+	}
 	return cp
+}
+
+// IsGlobalRemoteAccessEnabled reports whether server-wide remote access is enabled (defaults to true when unset).
+func (c Config) IsGlobalRemoteAccessEnabled() bool {
+	if c.EnableRemoteAccessGlobal == nil {
+		return true
+	}
+	return *c.EnableRemoteAccessGlobal
 }
 
 func (c *Config) Save() error {
@@ -378,9 +430,14 @@ func (c *Config) Save() error {
 		TMDBLanguage:             c.TMDBLanguage,
 		EnableSTRM302:            c.EnableSTRM302,
 		EnableDLNA:               c.EnableDLNA,
+		DLNADefaultUserID:        c.DLNADefaultUserID,
 		EnableQuickConnect:       c.EnableQuickConnect,
+		EnableRemoteAccessGlobal: cloneBoolPtr(c.EnableRemoteAccessGlobal),
 		AllowedOrigins:           append([]string(nil), c.AllowedOrigins...),
 		TrustedProxies:           append([]string(nil), c.TrustedProxies...),
+		LocalNetworkSubnets:      append([]string(nil), c.LocalNetworkSubnets...),
+		SimultaneousStreamLimit:  c.SimultaneousStreamLimit,
+		RemoteClientBitrateLimit: c.RemoteClientBitrateLimit,
 		PlayedThreshold:          c.PlayedThreshold,
 		IsStartupWizardCompleted: c.IsStartupWizardCompleted,
 	}
@@ -396,6 +453,9 @@ func (c *Config) Save() error {
 	if c.envFlags.enableDLNA {
 		toSave.EnableDLNA = c.baseline.enableDLNA
 	}
+	if c.envFlags.dlnaDefaultUserID {
+		toSave.DLNADefaultUserID = c.baseline.dlnaDefaultUserID
+	}
 	if c.envFlags.enableQuickConnect {
 		toSave.EnableQuickConnect = c.baseline.enableQuickConnect
 	}
@@ -404,6 +464,9 @@ func (c *Config) Save() error {
 	}
 	if c.envFlags.trustedProxies {
 		toSave.TrustedProxies = append([]string(nil), c.baseline.trustedProxies...)
+	}
+	if c.envFlags.localNetworkSubnets {
+		toSave.LocalNetworkSubnets = append([]string(nil), c.baseline.localNetworkSubnets...)
 	}
 	if c.envFlags.ffmpegPath {
 		toSave.FFmpegPath = c.baseline.ffmpegPath
@@ -490,4 +553,12 @@ func (c *Config) SubtitleCacheDir() string {
 
 func (c *Config) TranscodeTempDir() string {
 	return filepath.Join(c.DataDir, "cache", "transcoding-temp")
+}
+
+func (c *Config) SyncCacheDir() string {
+	return filepath.Join(c.DataDir, "cache", "sync")
+}
+
+func (c *Config) CameraUploadsDir() string {
+	return filepath.Join(c.DataDir, "camera-uploads")
 }

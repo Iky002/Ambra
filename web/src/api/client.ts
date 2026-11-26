@@ -13,12 +13,15 @@ import type {
   BaseItemDto,
   DeviceInfo,
   FileSystemEntry,
+  ItemFilters2Response,
   ItemImageInfo,
   ItemMetadataUpdatePayload,
   LiveTvChannelInfo,
+  LiveTvChannelMapping,
   LiveTvInfo,
   LiveTvListingProviderInfo,
   LiveTvRecordingInfo,
+  LiveTvSeriesTimerInfo,
   LiveTvTimerInfo,
   LiveTvTunerHostInfo,
   MediaAttachmentInfo,
@@ -35,7 +38,9 @@ import type {
   RankingsRefreshResult,
   RankingsSummary,
   RemoteImageResult,
+  RemoteSearchItemType,
   RemoteSearchResult,
+  RemoteSubtitleInfo,
   ScanProgressSnapshot,
   ScheduledTaskInfo,
   SearchHintResult,
@@ -62,7 +67,7 @@ import type {
 const STORAGE_KEY = 'ambra_web_auth_v1'
 const DEVICE_ID_KEY = 'ambra_web_device_id'
 
-function getAuthStorageKey(): string {
+export function getAuthStorageKey(): string {
   return isDemoMode() ? DEMO_AUTH_STORAGE_KEY : STORAGE_KEY
 }
 
@@ -156,11 +161,11 @@ export async function embyFetch<T>(
   }
 
   const token = auth?.accessToken
-  headers.set('X-Emby-Authorization', buildEmbyAuthHeader(token))
-  if (token) {
-    headers.set('X-Emby-Token', token)
-  } else if (requireAuth) {
+  if (!token && requireAuth) {
     throw new ApiError(401, '未登录或登录已过期')
+  }
+  if (!headers.has('Authorization')) {
+    headers.set('Authorization', buildEmbyAuthHeader(token))
   }
 
   const res = await fetch(normalizedPath, {
@@ -209,7 +214,7 @@ export function resolveApiUrl(urlOrPath: string): string {
   if (!isSameOriginUrl(base)) {
     return base
   }
-  if (!token || base.includes('api_key=') || base.includes('X-Emby-Token=')) {
+  if (!token || base.includes('api_key=')) {
     return base
   }
   const sep = base.includes('?') ? '&' : '?'
@@ -381,6 +386,16 @@ export const api = {
       nameStartsWith?: string
       nameStartsWithOrGreater?: string
       nameLessThan?: string
+      minCommunityRating?: number
+      is4K?: boolean
+      isHD?: boolean
+      isHDR?: boolean
+      videoTypes?: string
+      videoCodecs?: string
+      codecs?: string
+      officialRatings?: string
+      hasSubtitles?: boolean
+      isLiked?: boolean
       fields?: string
     } = {},
   ) => {
@@ -404,6 +419,18 @@ export const api = {
     if (params.nameStartsWithOrGreater)
       q.set('NameStartsWithOrGreater', params.nameStartsWithOrGreater)
     if (params.nameLessThan) q.set('NameLessThan', params.nameLessThan)
+    if (params.minCommunityRating !== undefined && Number.isFinite(params.minCommunityRating)) {
+      q.set('MinCommunityRating', String(params.minCommunityRating))
+    }
+    if (params.is4K !== undefined) q.set('Is4K', String(params.is4K))
+    if (params.isHD !== undefined) q.set('IsHD', String(params.isHD))
+    if (params.isHDR !== undefined) q.set('IsHDR', String(params.isHDR))
+    if (params.videoTypes) q.set('VideoTypes', params.videoTypes)
+    if (params.videoCodecs) q.set('VideoCodecs', params.videoCodecs)
+    if (params.codecs) q.set('Codecs', params.codecs)
+    if (params.officialRatings) q.set('OfficialRatings', params.officialRatings)
+    if (params.hasSubtitles !== undefined) q.set('HasSubtitles', String(params.hasSubtitles))
+    if (params.isLiked !== undefined) q.set('IsLiked', String(params.isLiked))
     q.set(
       'Fields',
       params.fields ??
@@ -436,6 +463,19 @@ export const api = {
     if (params?.parentId) q.set('ParentId', params.parentId)
     const qs = q.toString()
     return embyFetch<QueryResult<NameIdPair>>(`/emby/Years${qs ? `?${qs}` : ''}`)
+  },
+
+  getItemFilters2: (params?: {
+    userId?: string
+    parentId?: string
+    includeItemTypes?: string
+  }) => {
+    const q = new URLSearchParams()
+    if (params?.userId) q.set('UserId', params.userId)
+    if (params?.parentId) q.set('ParentId', params.parentId)
+    if (params?.includeItemTypes) q.set('IncludeItemTypes', params.includeItemTypes)
+    const qs = q.toString()
+    return embyFetch<ItemFilters2Response>(`/emby/Items/Filters2${qs ? `?${qs}` : ''}`)
   },
 
   getNextUp: (
@@ -556,11 +596,17 @@ export const api = {
     )
   },
 
-  removePlaylistItems: (playlistId: string, itemIds: string[]) => {
+  removePlaylistItems: (
+    playlistId: string,
+    entryOrItemIds: string[],
+    options?: { isPlaylistItemId?: boolean },
+  ) => {
     const q = new URLSearchParams({
-      EntryIds: itemIds.join(','),
-      Ids: itemIds.join(','),
+      EntryIds: entryOrItemIds.join(','),
     })
+    if (options?.isPlaylistItemId === false) {
+      q.set('Ids', entryOrItemIds.join(','))
+    }
     return embyFetch<void>(
       `/emby/Playlists/${encodeURIComponent(playlistId)}/Items?${q.toString()}`,
       {
@@ -772,6 +818,42 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }).catch(() => undefined),
+
+  reportPlaybackStart: (payload: {
+    ItemId: string
+    MediaSourceId?: string
+    PlaySessionId?: string
+    PositionTicks: number
+    IsPaused: boolean
+    IsMuted?: boolean
+    VolumeLevel?: number
+    AudioStreamIndex?: number
+    SubtitleStreamIndex?: number
+    PlayMethod?: string
+  }) => api.reportPlaying(payload),
+
+  reportPlaybackProgress: (payload: {
+    ItemId: string
+    MediaSourceId?: string
+    PlaySessionId?: string
+    PositionTicks: number
+    IsPaused: boolean
+    IsMuted?: boolean
+    VolumeLevel?: number
+    AudioStreamIndex?: number
+    SubtitleStreamIndex?: number
+    PlayMethod?: string
+    EventName?: string
+  }) => api.reportProgress(payload),
+
+  reportPlaybackStopped: (payload: {
+    ItemId: string
+    MediaSourceId?: string
+    PlaySessionId?: string
+    PositionTicks: number
+    AudioStreamIndex?: number
+    SubtitleStreamIndex?: number
+  }) => api.reportStopped(payload),
 
   refreshLibrary: (parentId?: string) => {
     const q = parentId ? `?ParentId=${encodeURIComponent(parentId)}` : ''
@@ -1032,19 +1114,35 @@ export const api = {
     ),
 
   remoteSearch: (
-    itemType: 'Movie' | 'Series',
+    itemType: RemoteSearchItemType,
     query: { Name?: string; Year?: number; ProviderIds?: Record<string, string> },
   ) =>
-    embyFetch<RemoteSearchResult[]>(`/emby/Items/RemoteSearch/${itemType}`, {
-      method: 'POST',
-      body: JSON.stringify({
-        SearchInfo: {
-          Name: query.Name || undefined,
-          Year: query.Year || undefined,
-          ProviderIds: query.ProviderIds || undefined,
-        },
-      }),
-    }),
+    embyFetch<RemoteSearchResult[]>(
+      `/emby/Items/RemoteSearch/${encodeURIComponent(itemType)}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          SearchInfo: {
+            Name: query.Name || undefined,
+            Year: query.Year || undefined,
+            ProviderIds: query.ProviderIds || undefined,
+          },
+        }),
+      },
+    ),
+
+  searchRemoteSubtitles: (itemId: string, language = 'chi') =>
+    embyFetch<RemoteSubtitleInfo[]>(
+      `/emby/Items/${encodeURIComponent(itemId)}/RemoteSearch/Subtitles/${encodeURIComponent(language)}`,
+    ),
+
+  downloadRemoteSubtitle: (itemId: string, subtitleId: string) =>
+    embyFetch<void>(
+      `/emby/Items/${encodeURIComponent(itemId)}/RemoteSearch/Subtitles/${encodeURIComponent(subtitleId)}`,
+      {
+        method: 'POST',
+      },
+    ),
 
   applyRemoteSearch: (
     itemId: string,
@@ -1193,8 +1291,7 @@ export const api = {
     const auth = getStoredAuth()
     const headers: Record<string, string> = {}
     if (auth?.accessToken) {
-      headers['X-Emby-Authorization'] = buildEmbyAuthHeader(auth.accessToken)
-      headers['X-Emby-Token'] = auth.accessToken
+      headers['Authorization'] = buildEmbyAuthHeader(auth.accessToken)
     }
     return embyFetch<AuthenticationResult>(
       '/api/setup/admin',
@@ -1393,6 +1490,96 @@ export const api = {
       method: 'DELETE',
     }),
 
+  getSeriesTimers: () =>
+    embyFetch<QueryResult<LiveTvSeriesTimerInfo>>('/emby/LiveTv/SeriesTimers'),
+
+  createSeriesTimer: (timer: LiveTvSeriesTimerInfo) =>
+    embyFetch<LiveTvSeriesTimerInfo>('/emby/LiveTv/SeriesTimers', {
+      method: 'POST',
+      body: JSON.stringify(timer),
+    }),
+
+  deleteSeriesTimer: (id: string) =>
+    embyFetch<void>(`/emby/LiveTv/SeriesTimers/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+
+  getChannelMappings: async (
+    providerId = '',
+  ): Promise<{
+    TunerChannels: Array<{
+      Id: string
+      Name: string
+      Number?: string
+      ProviderChannelId?: string
+    }>
+    ProviderChannels: NameIdPair[]
+    Mappings: LiveTvChannelMapping[]
+    ProviderName?: string
+  }> => {
+    const q = new URLSearchParams()
+    if (providerId) q.set('providerId', providerId)
+    const qs = q.toString()
+    const raw = await embyFetch<{
+      TunerChannels?: Array<{
+        Id: string
+        Name: string
+        Number?: string
+        ProviderChannelId?: string
+      }>
+      ProviderChannels?: NameIdPair[]
+      Mappings?: Array<
+        | LiveTvChannelMapping
+        | {
+            Name?: string
+            Value?: string
+            TunerChannelId?: string
+            ProviderChannelId?: string
+          }
+      >
+      ProviderName?: string
+    }>(`/emby/LiveTv/ChannelMappingOptions${qs ? `?${qs}` : ''}`)
+
+    const tunerChannels = raw?.TunerChannels || []
+    const providerChannels = raw?.ProviderChannels || []
+    const normalizedMappings: LiveTvChannelMapping[] = (raw?.Mappings || []).map((m) => {
+      const tunerId =
+        ('TunerChannelId' in m && m.TunerChannelId) ||
+        ('Name' in m && m.Name) ||
+        ''
+      const provId =
+        ('ProviderChannelId' in m && m.ProviderChannelId) ||
+        ('Value' in m && m.Value) ||
+        ''
+      return {
+        ProviderId: providerId || raw?.ProviderName,
+        TunerChannelId: tunerId,
+        ProviderChannelId: provId,
+        TunerChannelName: tunerChannels.find((c) => c.Id === tunerId)?.Name,
+        ProviderChannelName: providerChannels.find((c) => c.Id === provId)?.Name,
+      }
+    })
+    return {
+      TunerChannels: tunerChannels,
+      ProviderChannels: providerChannels,
+      Mappings: normalizedMappings,
+      ProviderName: raw?.ProviderName,
+    }
+  },
+
+  setChannelMapping: (mapping: LiveTvChannelMapping) =>
+    embyFetch<{ TunerChannelId: string; ProviderChannelId: string }>(
+      '/emby/LiveTv/ChannelMappings',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          ProviderId: mapping.ProviderId || '',
+          TunerChannelId: mapping.TunerChannelId,
+          ProviderChannelId: mapping.ProviderChannelId,
+        }),
+      },
+    ),
+
   getLiveTvRecordings: () =>
     embyFetch<QueryResult<LiveTvRecordingInfo>>('/emby/LiveTv/Recordings'),
 
@@ -1527,6 +1714,44 @@ export function getLiveTvChannelStreamUrl(channelId: string): string {
 
 export function getLiveTvRecordingStreamUrl(recordingId: string): string {
   return resolveApiUrl(`/emby/LiveTv/LiveRecordings/${encodeURIComponent(recordingId)}/stream`)
+}
+
+export function getLiveTvRecordingHlsUrl(recordingId: string): string {
+  return resolveApiUrl(
+    `/emby/LiveTv/LiveRecordings/${encodeURIComponent(recordingId)}/hls/master.m3u8`,
+  )
+}
+
+export function getUniversalAudioTranscodeUrl(
+  itemId: string,
+  options?: {
+    mediaSourceId?: string
+    audioStreamIndex?: number
+    startTimeTicks?: number
+    isStrm?: boolean
+    userId?: string
+  },
+): string {
+  if (!itemId) return ''
+  const q = new URLSearchParams({
+    Container: 'aac,m4a,mp3',
+    TranscodingContainer: 'm4a',
+    AudioCodec: 'aac',
+    AudioBitrate: '192000',
+    MaxAudioChannels: '2',
+  })
+  if (options?.userId) q.set('UserId', options.userId)
+  if (options?.mediaSourceId) q.set('MediaSourceId', options.mediaSourceId)
+  if (options?.audioStreamIndex !== undefined) {
+    q.set('AudioStreamIndex', String(options.audioStreamIndex))
+  }
+  if (options?.startTimeTicks && options.startTimeTicks > 0) {
+    q.set('StartTimeTicks', String(Math.floor(options.startTimeTicks)))
+  }
+  if (options?.isStrm) {
+    q.set('proxy', '1')
+  }
+  return resolveApiUrl(`/emby/Audio/${encodeURIComponent(itemId)}/universal?${q.toString()}`)
 }
 
 export function getChapterImageUrl(
