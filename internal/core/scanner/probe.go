@@ -195,6 +195,7 @@ func (p *Prober) Probe(ctx context.Context, filePath string) (*ProbeResult, erro
 		"--",
 		probeTarget,
 	)
+	args = netutil.FilterFFmpegArgs(ffprobePath, args)
 	cmd := exec.CommandContext(probeCtx, ffprobePath, args...)
 	stdout := &limitedProbeBuffer{max: maxProbeOutputBytes}
 	cmd.Stdout = stdout

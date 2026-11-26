@@ -251,7 +251,7 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 	} else {
 		recCtx, cancel = context.WithCancel(ctx)
 	}
-	args := r.argsBuilder(jobForArgs, outFile)
+	args := netutil.FilterFFmpegArgs(r.ffmpegPath, r.argsBuilder(jobForArgs, outFile))
 	cmd := exec.Command(r.ffmpegPath, args...)
 	stdinPipe, _ := cmd.StdinPipe()
 

@@ -294,7 +294,7 @@ for arg in "$@"; do
 done
 seg=$(echo "$out" | sed "s/%d/$start/")
 echo "ts-payload-$start" > "$seg"
-sleep 2
+exec sleep 2
 `)
 	cfg := config.Default(tmp)
 	cfg.FFmpegPath = mockFF
@@ -372,7 +372,7 @@ sleep 2
 		t.Fatalf("expected error when ffmpeg exits 1")
 	}
 
-	sleepScript := writeMockScript(t, tmp, "ffmpeg_sleep.sh", `sleep 5`)
+	sleepScript := writeMockScript(t, tmp, "ffmpeg_sleep.sh", `exec sleep 5`)
 	cfgSleep := config.Default(t.TempDir())
 	cfgSleep.FFmpegPath = sleepScript
 	mgrSleep := NewManager(cfgSleep, WithCapabilities(&HWCapabilities{}))

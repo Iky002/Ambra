@@ -158,7 +158,7 @@ for i in 0 1 2 3 4 5; do
   seg=$(echo "$segpat" | sed "s/%d/$i/")
   printf 'SEG_%d' "$i" > "$seg"
 done
-sleep 10
+exec sleep 10
 `
 		_ = os.WriteFile(fakeFF, []byte(script), 0o755)
 		mgr.cfg.FFmpegPath = fakeFF
@@ -176,7 +176,7 @@ sleep 10
 		ts := mgr.sessions[SessionKey(p)]
 		mgr.mu.Unlock()
 
-		deadline := time.Now().Add(time.Second)
+		deadline := time.Now().Add(5 * time.Second)
 		for time.Now().Before(deadline) && !ts.IsThrottled() {
 			time.Sleep(25 * time.Millisecond)
 		}

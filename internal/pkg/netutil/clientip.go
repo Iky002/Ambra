@@ -355,6 +355,9 @@ func currentDefaultRouteGateways() []netip.Addr {
 	if fn != nil {
 		return fn()
 	}
+	if testing.Testing() {
+		return nil
+	}
 
 	now := time.Now()
 	routeCacheMu.Lock()

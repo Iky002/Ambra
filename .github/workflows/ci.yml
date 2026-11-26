@@ -67,7 +67,14 @@ jobs:
           sudo apt-get install -y --no-install-recommends ffmpeg
 
       - name: Run Go unit tests with race detector and coverage
-        run: go test -count=1 -race -coverprofile=coverage.out ./internal/...
+        run: |
+          set -o pipefail
+          if ! go test -count=1 -race -coverprofile=coverage.out ./internal/... 2>&1 | tee /tmp/go-unit.log; then
+            grep -E '(--- FAIL:|^FAIL[[:space:]]|WARNING: DATA RACE|^panic:)' /tmp/go-unit.log | head -n 20 | while IFS= read -r line; do
+              echo "::error::${line}"
+            done
+            exit 1
+          fi
 
       - name: Enforce >= 90% coverage gate
         run: |
@@ -75,13 +82,20 @@ jobs:
           echo "Total ./internal/... coverage: ${TOTAL_COV}%"
           awk -v cov="${TOTAL_COV}" 'BEGIN {
             if (cov + 0 < 90.0) {
-              printf "ERROR: coverage %.1f%% is below required 90.0%% gate\n", cov
+              printf "::error::coverage %.1f%% is below required 90.0%% gate\n", cov
               exit 1
             }
           }'
 
       - name: Run full compatibility and contract test suite
-        run: go test -v -count=1 ./tests/compat/...
+        run: |
+          set -o pipefail
+          if ! go test -v -count=1 ./tests/compat/... 2>&1 | tee /tmp/go-compat.log; then
+            grep -E '(--- FAIL:|^FAIL[[:space:]]|^panic:)' /tmp/go-compat.log | head -n 20 | while IFS= read -r line; do
+              echo "::error::${line}"
+            done
+            exit 1
+          fi
 
   docker-check:
     name: Docker Build Check (${{ matrix.target }})
