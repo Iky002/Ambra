@@ -19,12 +19,15 @@ type XMLTVChannel struct {
 
 // XMLTVProgramme represents a <programme> entry from an XMLTV EPG feed.
 type XMLTVProgramme struct {
-	Channel    string
-	Start      time.Time
-	Stop       time.Time
-	Title      string
-	Desc       string
-	Categories []string
+	Channel         string
+	Start           time.Time
+	Stop            time.Time
+	Title           string
+	SubTitle        string
+	EpisodeNum      string
+	Desc            string
+	Categories      []string
+	PreviouslyShown bool
 }
 
 // XMLTVGuide holds the parsed channels and programmes from an XMLTV feed.
@@ -70,13 +73,24 @@ func parseXMLTVWithLimits(r io.Reader, maxBytes int64, maxProgrammes int) (*XMLT
 		ID           string   `xml:"id,attr"`
 		DisplayNames []string `xml:"display-name"`
 	}
+	type rawEpisodeNum struct {
+		System string `xml:"system,attr"`
+		Value  string `xml:",chardata"`
+	}
+	type rawPreviouslyShown struct {
+		Start   string `xml:"start,attr"`
+		Channel string `xml:"channel,attr"`
+	}
 	type rawProgramme struct {
-		Start      string   `xml:"start,attr"`
-		Stop       string   `xml:"stop,attr"`
-		Channel    string   `xml:"channel,attr"`
-		Titles     []string `xml:"title"`
-		Descs      []string `xml:"desc"`
-		Categories []string `xml:"category"`
+		Start           string              `xml:"start,attr"`
+		Stop            string              `xml:"stop,attr"`
+		Channel         string              `xml:"channel,attr"`
+		Titles          []string            `xml:"title"`
+		SubTitles       []string            `xml:"sub-title"`
+		EpisodeNums     []rawEpisodeNum     `xml:"episode-num"`
+		Descs           []string            `xml:"desc"`
+		Categories      []string            `xml:"category"`
+		PreviouslyShown *rawPreviouslyShown `xml:"previously-shown"`
 	}
 
 	guide := &XMLTVGuide{}
@@ -159,13 +173,29 @@ func parseXMLTVWithLimits(r io.Reader, maxBytes int64, maxProgrammes int) (*XMLT
 					cats = append(cats, trimmed)
 				}
 			}
+			var epNum string
+			for _, en := range rp.EpisodeNums {
+				val := strings.TrimSpace(en.Value)
+				if val == "" {
+					continue
+				}
+				if strings.EqualFold(strings.TrimSpace(en.System), "xmltv_ns") || strings.EqualFold(strings.TrimSpace(en.System), "dd_progid") || epNum == "" {
+					epNum = val
+					if strings.EqualFold(strings.TrimSpace(en.System), "dd_progid") {
+						break
+					}
+				}
+			}
 			guide.Programmes = append(guide.Programmes, XMLTVProgramme{
-				Channel:    chID,
-				Start:      start,
-				Stop:       stop,
-				Title:      title,
-				Desc:       firstNonEmpty(rp.Descs),
-				Categories: cats,
+				Channel:         chID,
+				Start:           start,
+				Stop:            stop,
+				Title:           title,
+				SubTitle:        firstNonEmpty(rp.SubTitles),
+				EpisodeNum:      epNum,
+				Desc:            firstNonEmpty(rp.Descs),
+				Categories:      cats,
+				PreviouslyShown: rp.PreviouslyShown != nil,
 			})
 		}
 	}

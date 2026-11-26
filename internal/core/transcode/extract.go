@@ -96,9 +96,34 @@ func (e *Extractor) SubtitleCachePath(itemID, mediaSourceID string, streamIndex 
 	return filepath.Join(baseDir, name)
 }
 
+func startExtractorInputProxy(mediaPath string, headers map[string]string) (string, func(), error) {
+	if !isHTTPInput(mediaPath) {
+		return mediaPath, func() {}, nil
+	}
+	lowerNoQuery := strings.ToLower(strings.SplitN(mediaPath, "?", 2)[0])
+	if strings.HasSuffix(lowerNoQuery, ".m3u8") {
+		return mediaPath, func() {}, nil
+	}
+	proxy, err := StartLoopbackStreamProxy(LoopbackProxyOptions{
+		TargetURL:       mediaPath,
+		Headers:         headers,
+		AllowPrivateLAN: true,
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	return proxy.URL(), func() { _ = proxy.Close() }, nil
+}
+
 // ExtractSubtitle extracts an embedded subtitle track from mediaPath into cfg.SubtitleCacheDir().
 // Concurrent calls for the same track share a single FFmpeg invocation via singleflight.
 func (e *Extractor) ExtractSubtitle(ctx context.Context, mediaPath, itemID, mediaSourceID string, streamIndex int, targetExt string) (string, error) {
+	return e.ExtractSubtitleWithHeaders(ctx, mediaPath, nil, itemID, mediaSourceID, streamIndex, targetExt)
+}
+
+// ExtractSubtitleWithHeaders extracts an embedded subtitle track, routing remote HTTP(S) inputs
+// through a pinned-IP loopback stream proxy with optional upstream headers.
+func (e *Extractor) ExtractSubtitleWithHeaders(ctx context.Context, mediaPath string, headers map[string]string, itemID, mediaSourceID string, streamIndex int, targetExt string) (string, error) {
 	resolvedMedia, err := resolveMediaInputPath(mediaPath)
 	if err != nil {
 		return "", err
@@ -129,7 +154,13 @@ func (e *Extractor) ExtractSubtitle(ctx context.Context, mediaPath, itemID, medi
 		runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultExtractTimeout)
 		defer cancel()
 
-		args := BuildSubtitleExtractArgs(resolvedMedia, streamIndex, ext, tmpPath)
+		ffInput, closeProxy, proxyErr := startExtractorInputProxy(resolvedMedia, headers)
+		if proxyErr != nil {
+			return "", proxyErr
+		}
+		defer closeProxy()
+
+		args := BuildSubtitleExtractArgs(ffInput, streamIndex, ext, tmpPath)
 		cmd := exec.CommandContext(runCtx, e.ffmpegPath, args...)
 		stderr := newSafeRingBuffer(maxStderrBytes)
 		cmd.Stderr = stderr
@@ -173,7 +204,7 @@ func BuildSubtitleExtractArgs(mediaPath string, streamIndex int, targetExt, outP
 		"-protocol_whitelist", protocolWhitelistForInput(mediaPath),
 	}
 	if isHTTPInput(mediaPath) {
-		args = append(args, "-follow_redirects", "0")
+		args = append(args, "-max_redirects", "0")
 	}
 	args = append(args,
 		"-i", mediaPath,
@@ -220,10 +251,16 @@ func (e *Extractor) ExtractFonts(ctx context.Context, mediaPath, itemID, mediaSo
 		runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultExtractTimeout)
 		defer cancel()
 
+		ffInput, closeProxy, proxyErr := startExtractorInputProxy(resolvedMedia, nil)
+		if proxyErr != nil {
+			return nil, proxyErr
+		}
+		defer closeProxy()
+
 		// Step 1: Probe attachment streams with ffprobe and filter safe font filenames in Go.
 		// Never use `ffmpeg -dump_attachment:t ""` because untrusted container attachment filenames
 		// can contain path traversal sequences that FFmpeg writes outside the staging directory.
-		targets, probeErr := e.probeSafeFontAttachments(runCtx, resolvedMedia)
+		targets, probeErr := e.probeSafeFontAttachments(runCtx, ffInput)
 		if probeErr != nil {
 			return nil, fmt.Errorf("probe font attachments: %w", probeErr)
 		}
@@ -237,10 +274,10 @@ func (e *Extractor) ExtractFonts(ctx context.Context, mediaPath, itemID, mediaSo
 		if len(targets) > 0 {
 			fontArgs := []string{
 				"-hide_banner", "-loglevel", "error", "-y",
-				"-protocol_whitelist", protocolWhitelistForInput(resolvedMedia),
+				"-protocol_whitelist", protocolWhitelistForInput(ffInput),
 			}
-			if isHTTPInput(resolvedMedia) {
-				fontArgs = append(fontArgs, "-follow_redirects", "0")
+			if isHTTPInput(ffInput) {
+				fontArgs = append(fontArgs, "-max_redirects", "0")
 			}
 			for _, t := range targets {
 				fontArgs = append(fontArgs,
@@ -248,7 +285,7 @@ func (e *Extractor) ExtractFonts(ctx context.Context, mediaPath, itemID, mediaSo
 					filepath.Join(stageDir, t.safeName),
 				)
 			}
-			fontArgs = append(fontArgs, "-i", resolvedMedia)
+			fontArgs = append(fontArgs, "-i", ffInput)
 			cmd := exec.CommandContext(runCtx, e.ffmpegPath, fontArgs...)
 			cmd.Dir = stageDir
 			_ = cmd.Run()
@@ -325,7 +362,7 @@ func (e *Extractor) probeSafeFontAttachments(ctx context.Context, resolvedMedia 
 		"-protocol_whitelist", protocolWhitelistForInput(resolvedMedia),
 	}
 	if isHTTPInput(resolvedMedia) {
-		probeArgs = append(probeArgs, "-follow_redirects", "0")
+		probeArgs = append(probeArgs, "-max_redirects", "0")
 	}
 	probeArgs = append(probeArgs,
 		"-select_streams", "t",
@@ -475,18 +512,24 @@ func (e *Extractor) ExtractChapterThumbnail(ctx context.Context, mediaPath, item
 		runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 		defer cancel()
 
+		ffInput, closeProxy, proxyErr := startExtractorInputProxy(resolvedMedia, nil)
+		if proxyErr != nil {
+			return "", proxyErr
+		}
+		defer closeProxy()
+
 		args := []string{
 			"-hide_banner",
 			"-loglevel", "error",
 			"-y",
-			"-protocol_whitelist", protocolWhitelistForInput(resolvedMedia),
+			"-protocol_whitelist", protocolWhitelistForInput(ffInput),
 		}
-		if isHTTPInput(resolvedMedia) {
-			args = append(args, "-follow_redirects", "0")
+		if isHTTPInput(ffInput) {
+			args = append(args, "-max_redirects", "0")
 		}
 		args = append(args,
 			"-ss", strconv.FormatFloat(sec, 'f', 3, 64),
-			"-i", resolvedMedia,
+			"-i", ffInput,
 			"-frames:v", "1",
 			"-q:v", "4",
 			"-vf", "scale='min(640,iw)':-2",

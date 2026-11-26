@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
 )
@@ -74,6 +75,7 @@ type Options struct {
 type recordingEntry struct {
 	state     RecordingState
 	cmd       *exec.Cmd
+	proxy     *transcode.LoopbackStreamProxy
 	stdinMu   sync.Mutex
 	stdin     io.WriteCloser
 	cancel    context.CancelFunc
@@ -130,7 +132,7 @@ func DefaultArgsBuilder(job RecordingJob, outFile string) []string {
 	args := []string{
 		"-y",
 		"-protocol_whitelist", "http,https,tcp,tls,crypto",
-		"-follow_redirects", "0",
+		"-max_redirects", "0",
 		"-rw_timeout", "15000000",
 		"-i", job.StreamURL,
 	}
@@ -199,16 +201,41 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 		return nil, fmt.Errorf("dvr: create recordings dir: %w", err)
 	}
 
+	// Launch a loopback stream proxy for non-HLS continuous HTTP streams so FFmpeg never performs
+	// secondary DNS resolution on the remote host (HLS .m3u8 manifests use relative segment URLs
+	// and keep direct validated URL with -max_redirects 0).
+	var streamProxy *transcode.LoopbackStreamProxy
+	jobForArgs := job
+	lowerStream := strings.ToLower(strings.SplitN(job.StreamURL, "?", 2)[0])
+	if !strings.HasSuffix(lowerStream, ".m3u8") {
+		proxy, proxyErr := transcode.StartLoopbackStreamProxy(transcode.LoopbackProxyOptions{
+			TargetURL:        job.StreamURL,
+			AllowPrivateLAN:  !job.DenyPrivateLAN,
+			DisallowLoopback: true,
+		})
+		if proxyErr != nil {
+			return nil, fmt.Errorf("%w: invalid stream URL: %v", ErrInvalidJob, proxyErr)
+		}
+		streamProxy = proxy
+		jobForArgs.StreamURL = proxy.URL()
+	}
+
 	now := time.Now().UTC()
 	outFile := filepath.Join(r.recordingsDir, buildOutputFilename(job, now))
 
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
+		if streamProxy != nil {
+			_ = streamProxy.Close()
+		}
 		return nil, ErrRecorderClosed
 	}
 	if existing, ok := r.entries[job.TimerID]; ok && existing.state.Status == StatusRecording {
 		r.mu.Unlock()
+		if streamProxy != nil {
+			_ = streamProxy.Close()
+		}
 		return nil, ErrAlreadyRecording
 	}
 
@@ -224,7 +251,7 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 	} else {
 		recCtx, cancel = context.WithCancel(ctx)
 	}
-	args := r.argsBuilder(job, outFile)
+	args := r.argsBuilder(jobForArgs, outFile)
 	cmd := exec.Command(r.ffmpegPath, args...)
 	stdinPipe, _ := cmd.StdinPipe()
 
@@ -236,6 +263,7 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 			StartedAt:  now,
 		},
 		cmd:    cmd,
+		proxy:  streamProxy,
 		stdin:  stdinPipe,
 		cancel: cancel,
 		done:   make(chan struct{}),
@@ -244,6 +272,9 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 	if err := cmd.Start(); err != nil {
 		if stdinPipe != nil {
 			_ = stdinPipe.Close()
+		}
+		if streamProxy != nil {
+			_ = streamProxy.Close()
 		}
 		cancel()
 		entry.state.Status = StatusFailed
@@ -318,6 +349,9 @@ func (r *Recorder) waitRecording(recCtx context.Context, cmd *exec.Cmd, entry *r
 	defer entry.cancel()
 	defer close(entry.done)
 	defer entry.closeStdin()
+	if entry.proxy != nil {
+		defer entry.proxy.Close()
+	}
 
 	err := cmd.Wait()
 	endedAt := time.Now().UTC()

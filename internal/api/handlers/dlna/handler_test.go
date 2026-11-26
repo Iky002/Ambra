@@ -30,6 +30,7 @@ func setupDLNATestEnv(t *testing.T) (*Handler, http.Handler, *sqlite.LibraryRepo
 
 	libRepo := sqlite.NewLibraryRepo(store)
 	cfg := config.Default(t.TempDir())
+	cfg.EnableDLNA = true
 	cfg.ServerName = "Ambra Test Server"
 	cfg.ServerID = "server-uuid-1234"
 
@@ -976,6 +977,7 @@ func TestDLNALANRestrictionAndFeatureFlag(t *testing.T) {
 	_ = libRepo.UpsertItem(ctx, strmItem)
 
 	cfg := config.Default(tmp)
+	cfg.EnableDLNA = true
 	h := New(cfg, libRepo, store)
 	rawMux := http.NewServeMux()
 	h.RegisterRoutes(rawMux, AuthFuncs{})

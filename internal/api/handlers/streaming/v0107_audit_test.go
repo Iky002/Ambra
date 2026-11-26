@@ -141,7 +141,7 @@ func TestStreamingV0107AuditBIFPrivateCachePlaybackInfoQueryAndPermSanitize(t *t
 			{"video stream", "/Videos/" + itemID + "/stream", videoPath},
 			{"bif", "/Videos/" + itemID + "/index.bif?Width=320", bifPath},
 			{"subtitle", "/Videos/" + itemID + "/" + msID + "/Subtitles/2/Stream.vtt", subPath},
-			{"image", "/Items/" + itemID + "/Images/Primary", imgPath},
+			{"image", "/Items/" + itemID + "/Images/Primary?tag=tag1", imgPath},
 		} {
 			logBuf.Reset()
 			rec := httptest.NewRecorder()

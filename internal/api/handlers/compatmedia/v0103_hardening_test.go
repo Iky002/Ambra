@@ -118,12 +118,15 @@ func TestCompatMediaV0103Hardening(t *testing.T) {
 		return rec
 	}
 
-	// 1. RemoteImageProxy blocks SVG XSS and sets nosniff + CSP sandbox on valid PNG
-	rec := call(aliceAuth.AccessToken, http.MethodGet, "/Images/Remote?imageUrl="+remoteSrv.URL+"/xss.svg", nil, "")
+	// 1. RemoteImageProxy requires admin (H-03), blocks SVG XSS and sets nosniff + CSP sandbox on valid PNG
+	if recForbidden := call(aliceAuth.AccessToken, http.MethodGet, "/Images/Remote?imageUrl="+remoteSrv.URL+"/ok.png", nil, ""); recForbidden.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-admin /Images/Remote, got %d", recForbidden.Code)
+	}
+	rec := call(adminAuth.AccessToken, http.MethodGet, "/Images/Remote?imageUrl="+remoteSrv.URL+"/xss.svg", nil, "")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for SVG remote image proxy, got %d", rec.Code)
 	}
-	rec = call(aliceAuth.AccessToken, http.MethodGet, "/Images/Remote?imageUrl="+remoteSrv.URL+"/ok.png", nil, "")
+	rec = call(adminAuth.AccessToken, http.MethodGet, "/Images/Remote?imageUrl="+remoteSrv.URL+"/ok.png", nil, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 for PNG remote image proxy, got %d", rec.Code)
 	}

@@ -85,19 +85,22 @@ type ChannelInfo struct {
 }
 
 type ProgramInfo struct {
-	Id          string    `json:"Id"`
-	Name        string    `json:"Name"`
-	ServerId    string    `json:"ServerId,omitempty"`
-	Type        string    `json:"Type"`
-	ChannelId   string    `json:"ChannelId"`
-	ChannelName string    `json:"ChannelName,omitempty"`
-	SeriesId    string    `json:"SeriesId,omitempty"`
-	Overview    string    `json:"Overview,omitempty"`
-	StartDate   time.Time `json:"StartDate"`
-	EndDate     time.Time `json:"EndDate"`
-	IsMovie     bool      `json:"IsMovie,omitempty"`
-	IsSeries    bool      `json:"IsSeries,omitempty"`
-	IsLive      bool      `json:"IsLive,omitempty"`
+	Id            string    `json:"Id"`
+	Name          string    `json:"Name"`
+	EpisodeTitle  string    `json:"EpisodeTitle,omitempty"`
+	EpisodeNumber string    `json:"EpisodeNumber,omitempty"`
+	ServerId      string    `json:"ServerId,omitempty"`
+	Type          string    `json:"Type"`
+	ChannelId     string    `json:"ChannelId"`
+	ChannelName   string    `json:"ChannelName,omitempty"`
+	SeriesId      string    `json:"SeriesId,omitempty"`
+	Overview      string    `json:"Overview,omitempty"`
+	StartDate     time.Time `json:"StartDate"`
+	EndDate       time.Time `json:"EndDate"`
+	IsMovie       bool      `json:"IsMovie,omitempty"`
+	IsSeries      bool      `json:"IsSeries,omitempty"`
+	IsLive        bool      `json:"IsLive,omitempty"`
+	IsRepeat      bool      `json:"IsRepeat,omitempty"`
 }
 
 type RecordingInfo struct {
@@ -198,6 +201,7 @@ type Handler struct {
 	store              *sqlite.Store
 	cfg                *config.Config
 	userRepo           *sqlite.UserRepo
+	libRepo            *sqlite.LibraryRepo
 	httpClient         *http.Client
 	streamClient       *http.Client
 	publicStreamClient *http.Client
@@ -205,6 +209,7 @@ type Handler struct {
 	customStreamClient bool
 	proxySecret        []byte
 	recorder           *dvr.Recorder
+	streamHub          *LiveStreamHub
 	auth               AuthFuncs
 
 	mu    sync.RWMutex
@@ -221,9 +226,52 @@ func New(store *sqlite.Store, cfg *config.Config) *Handler {
 		streamClient:       netutil.NewSafeHTTPClientNoLoopback(0, true),
 		publicStreamClient: netutil.NewSafeHTTPClientNoLoopback(0, false),
 		proxySecret:        secret,
+		streamHub:          newLiveStreamHub(),
 	}
 	h.loadState(context.Background())
 	return h
+}
+
+// SetLibraryRepo attaches a LibraryRepo so completed DVR recordings are automatically registered as playable media items.
+func (h *Handler) SetLibraryRepo(r *sqlite.LibraryRepo) {
+	h.mu.Lock()
+	h.libRepo = r
+	h.mu.Unlock()
+}
+
+func (h *Handler) resolveLibraryRepo() *sqlite.LibraryRepo {
+	h.mu.RLock()
+	r := h.libRepo
+	st := h.store
+	h.mu.RUnlock()
+	if r != nil {
+		return r
+	}
+	if st != nil {
+		return sqlite.NewLibraryRepo(st)
+	}
+	return nil
+}
+
+// SetStreamIdleTimeout configures the upstream read idle timeout on the shared LiveStreamHub (default 30s).
+func (h *Handler) SetStreamIdleTimeout(d time.Duration) {
+	if h.streamHub != nil {
+		h.streamHub.setIdleTimeout(d)
+	}
+}
+
+// SetStreamGracePeriod configures the post-disconnect upstream teardown delay on the shared LiveStreamHub.
+func (h *Handler) SetStreamGracePeriod(d time.Duration) {
+	if h.streamHub != nil {
+		h.streamHub.setGracePeriod(d)
+	}
+}
+
+// Close releases any shared upstream live stream connections managed by this Handler.
+func (h *Handler) Close() {
+	if h.streamHub != nil {
+		h.streamHub.Close()
+	}
 }
 
 // SetUserRepo attaches a UserRepo for Live TV user access listing.
@@ -558,14 +606,13 @@ func (h *Handler) OnRecordingFinished(ctx context.Context, state dvr.RecordingSt
 	}
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
 	var (
-		changed     bool
-		channelID   string
-		channelName = state.Job.ChannelName
-		programID   string
-		recName     = state.Job.ProgramName
+		changed      bool
+		channelID    string
+		channelName  = state.Job.ChannelName
+		programID    string
+		recName      = state.Job.ProgramName
+		newRecording *RecordingInfo
 	)
 
 	for i := range h.state.Timers {
@@ -592,7 +639,7 @@ func (h *Handler) OnRecordingFinished(ctx context.Context, state dvr.RecordingSt
 				recName = "Recording"
 			}
 		}
-		h.state.Recordings = append(h.state.Recordings, RecordingInfo{
+		recEntry := RecordingInfo{
 			Id:          guid.New(),
 			Name:        recName,
 			ServerId:    h.serverID(),
@@ -604,13 +651,103 @@ func (h *Handler) OnRecordingFinished(ctx context.Context, state dvr.RecordingSt
 			StartDate:   state.StartedAt,
 			EndDate:     state.EndedAt,
 			Path:        state.OutputPath,
-		})
+		}
+		h.state.Recordings = append(h.state.Recordings, recEntry)
+		newRecording = &recEntry
 		changed = true
 	}
 
 	if changed {
 		h.saveStateLocked(ctx)
 	}
+	h.mu.Unlock()
+
+	if newRecording != nil && strings.TrimSpace(newRecording.Path) != "" {
+		h.registerCompletedRecordingMedia(ctx, *newRecording)
+	}
+}
+
+func (h *Handler) registerCompletedRecordingMedia(ctx context.Context, rec RecordingInfo) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	libRepo := h.resolveLibraryRepo()
+	if libRepo == nil {
+		return
+	}
+	outPath := strings.TrimSpace(rec.Path)
+	fi, err := os.Stat(outPath)
+	if err != nil || fi.IsDir() {
+		return
+	}
+
+	recDir := filepath.Dir(outPath)
+	if h.recorder != nil && strings.TrimSpace(h.recorder.RecordingsDir()) != "" {
+		recDir = h.recorder.RecordingsDir()
+	}
+
+	var libID string
+	if libs, err := libRepo.ListLibraries(ctx); err == nil {
+		for _, lib := range libs {
+			if strings.EqualFold(lib.CollectionType, "livetv") || strings.EqualFold(lib.Name, "Recordings") {
+				libID = lib.ID
+				break
+			}
+		}
+	}
+	if libID == "" {
+		if created, err := libRepo.CreateLibrary(ctx, "Recordings", "livetv", []string{recDir}); err == nil && created != nil {
+			libID = created.ID
+		}
+	}
+	if libID == "" {
+		return
+	}
+
+	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(outPath), "."))
+	if ext == "" {
+		ext = "ts"
+	}
+	var rtPtr *int64
+	if !rec.StartDate.IsZero() && rec.EndDate.After(rec.StartDate) {
+		ticks := int64(rec.EndDate.Sub(rec.StartDate).Seconds() * 10_000_000)
+		if ticks > 0 {
+			rtPtr = &ticks
+		}
+	}
+	var premPtr *int64
+	if !rec.StartDate.IsZero() {
+		ts := rec.StartDate.UTC().Unix()
+		premPtr = &ts
+	}
+
+	itemRec := &sqlite.ItemRecord{
+		ID:           rec.Id,
+		LibraryID:    libID,
+		ParentID:     libID,
+		Type:         "Video",
+		MediaType:    "Video",
+		Name:         rec.Name,
+		SortName:     strings.ToLower(rec.Name),
+		Path:         outPath,
+		Container:    ext,
+		RuntimeTicks: rtPtr,
+		PremiereDate: premPtr,
+	}
+	if err := libRepo.UpsertItem(ctx, itemRec); err != nil {
+		return
+	}
+	_ = libRepo.ReplaceMediaSourcesAndStreams(ctx, rec.Id, []sqlite.MediaSourceRecord{
+		{
+			ID:        rec.Id,
+			ItemID:    rec.Id,
+			Name:      filepath.Base(outPath),
+			Path:      outPath,
+			Protocol:  "File",
+			Container: ext,
+			Size:      fi.Size(),
+		},
+	})
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
@@ -1196,47 +1333,74 @@ func (h *Handler) proxyChannelStreamWithPolicy(w http.ResponseWriter, r *http.Re
 	h.proxyChannelStreamWithOptions(w, r, channelID, streamURL, allowPrivateLAN, 0)
 }
 
+func (h *Handler) selectStreamHTTPClient(allowPrivateLAN bool) *http.Client {
+	if allowPrivateLAN {
+		if h.streamClient != nil {
+			return h.streamClient
+		}
+		return netutil.NewSafeHTTPClientNoLoopback(0, true)
+	}
+	if h.publicStreamClient != nil {
+		return h.publicStreamClient
+	}
+	if h.customStreamClient && h.streamClient != nil {
+		return h.streamClient
+	}
+	return netutil.NewSafeHTTPClientNoLoopback(0, false)
+}
+
 func (h *Handler) proxyChannelStreamWithOptions(w http.ResponseWriter, r *http.Request, channelID, streamURL string, allowPrivateLAN bool, maxExp int64) {
 	trimmed := strings.TrimSpace(streamURL)
 	if err := h.validateStreamURL(trimmed, allowPrivateLAN); err != nil {
 		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("unsafe channel stream url: %v", err))
 		return
 	}
+	if _, err := http.NewRequestWithContext(r.Context(), http.MethodGet, trimmed, nil); err != nil {
+		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("invalid channel stream url: %v", err))
+		return
+	}
+	if r != nil && r.Context().Err() != nil {
+		return
+	}
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, trimmed, nil)
+	ua := h.channelUserAgent(channelID)
+	client := h.selectStreamHTTPClient(allowPrivateLAN)
+	isSignedSubTarget := r != nil && strings.TrimSpace(r.URL.Query().Get("target")) != ""
+
+	// Multiplex continuous named channel streams across concurrent viewers via LiveStreamHub.
+	if h.streamHub != nil && strings.TrimSpace(channelID) != "" && !isSignedSubTarget && !isHLSStreamURLForHub(trimmed) {
+		h.serveMultiplexedStream(w, r, channelID, trimmed, ua, allowPrivateLAN, maxExp, client)
+		return
+	}
+
+	idleTimeout := defaultStreamIdleTimeout
+	if h.streamHub != nil {
+		idleTimeout, _ = h.streamHub.getTimings()
+	}
+	upCtx, cancelUp := context.WithCancel(r.Context())
+	defer cancelUp()
+	watchdog := newIdleWatchdog(idleTimeout, cancelUp)
+	defer watchdog.Stop()
+
+	req, err := http.NewRequestWithContext(upCtx, http.MethodGet, trimmed, nil)
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("invalid channel stream url: %v", err))
 		return
 	}
-	if ua := h.channelUserAgent(channelID); ua != "" {
+	if ua != "" {
 		req.Header.Set("User-Agent", ua)
 	}
 
-	var client *http.Client
-	if allowPrivateLAN {
-		client = h.streamClient
-		if client == nil {
-			client = netutil.NewSafeHTTPClientNoLoopback(0, true)
-		}
-	} else {
-		client = h.publicStreamClient
-		if client == nil {
-			if h.customStreamClient && h.streamClient != nil {
-				client = h.streamClient
-			} else {
-				client = netutil.NewSafeHTTPClientNoLoopback(0, false)
-			}
-		}
-	}
 	resp, err := client.Do(req)
 	if err != nil {
-		if r.Context().Err() != nil {
+		if r.Context().Err() != nil && !watchdog.TimedOut() {
 			return
 		}
 		httpx.Error(w, http.StatusBadGateway, fmt.Sprintf("upstream stream error: %v", err))
 		return
 	}
 	defer resp.Body.Close()
+	watchdog.Touch()
 
 	if resp.StatusCode >= 400 {
 		httpx.Error(w, http.StatusBadGateway, fmt.Sprintf("upstream stream returned status %d", resp.StatusCode))
@@ -1249,10 +1413,11 @@ func (h *Handler) proxyChannelStreamWithOptions(w http.ResponseWriter, r *http.R
 	}
 
 	ct := resp.Header.Get("Content-Type")
+	bodyReader := &watchdogReader{r: resp.Body, wd: watchdog}
 	if channelID != "" && isHLSPlaylistResponse(ct, baseURL) {
-		raw, err := io.ReadAll(io.LimitReader(resp.Body, maxHLSPlaylistBytes+1))
+		raw, err := io.ReadAll(io.LimitReader(bodyReader, maxHLSPlaylistBytes+1))
 		if err != nil {
-			if r.Context().Err() != nil {
+			if r.Context().Err() != nil && !watchdog.TimedOut() {
 				return
 			}
 			httpx.Error(w, http.StatusBadGateway, fmt.Sprintf("upstream playlist read error: %v", err))
@@ -1264,8 +1429,6 @@ func (h *Handler) proxyChannelStreamWithOptions(w http.ResponseWriter, r *http.R
 		}
 
 		proxyBase := computeHLSProxyBase(r, channelID)
-		// Do not inject primary session tokens or admin API keys into rewritten HLS URLs;
-		// signed short-lived proxy tokens authenticate segment requests directly.
 		rewritten := h.rewriteHLSPlaylistWithPolicyAndExp(string(raw), baseURL, channelID, proxyBase, "", allowPrivateLAN, maxExp)
 		safeCT := sanitizeLiveTVProxyContentType(ct, "application/vnd.apple.mpegurl")
 		w.Header().Set("Content-Type", safeCT)
@@ -1289,7 +1452,110 @@ func (h *Handler) proxyChannelStreamWithOptions(w http.ResponseWriter, r *http.R
 	if f, ok := w.(http.Flusher); ok {
 		dst = flushWriter{w: w, f: f}
 	}
-	_, _ = io.Copy(dst, resp.Body)
+	_, _ = io.Copy(dst, bodyReader)
+}
+
+func isHLSStreamURLForHub(rawURL string) bool {
+	isHLS, _ := detectStreamFormat(rawURL)
+	return isHLS
+}
+
+func (h *Handler) serveMultiplexedStream(
+	w http.ResponseWriter,
+	r *http.Request,
+	channelID, streamURL, userAgent string,
+	allowPrivateLAN bool,
+	maxExp int64,
+	client *http.Client,
+) {
+	key := streamKeyForChannel(channelID, streamURL, allowPrivateLAN)
+	b, sub, err := h.streamHub.acquireOrCreate(key, streamURL, userAgent, client)
+	if err != nil {
+		httpx.Error(w, http.StatusBadGateway, fmt.Sprintf("live stream hub error: %v", err))
+		return
+	}
+	defer b.removeSubscriber(sub)
+
+	select {
+	case <-r.Context().Done():
+		return
+	case <-b.readyCh:
+	}
+
+	if b.initErr != nil {
+		if r.Context().Err() != nil {
+			return
+		}
+		httpx.Error(w, http.StatusBadGateway, fmt.Sprintf("upstream stream error: %v", b.initErr))
+		return
+	}
+
+	if b.isHLS {
+		if len(b.hlsRaw) > maxHLSPlaylistBytes {
+			httpx.Error(w, http.StatusBadGateway, "upstream HLS playlist exceeds 2 MiB limit")
+			return
+		}
+		if channelID != "" {
+			proxyBase := computeHLSProxyBase(r, channelID)
+			rewritten := h.rewriteHLSPlaylistWithPolicyAndExp(string(b.hlsRaw), b.baseURL, channelID, proxyBase, "", allowPrivateLAN, maxExp)
+			safeCT := sanitizeLiveTVProxyContentType(b.contentType, "application/vnd.apple.mpegurl")
+			w.Header().Set("Content-Type", safeCT)
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("Content-Security-Policy", "sandbox")
+			w.Header().Set("Cache-Control", "no-cache, no-store")
+			w.Header().Set("Content-Length", strconv.Itoa(len(rewritten)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, rewritten)
+			return
+		}
+		safeCT := sanitizeLiveTVProxyContentType(b.contentType, "application/vnd.apple.mpegurl")
+		w.Header().Set("Content-Type", safeCT)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Content-Security-Policy", "sandbox")
+		w.Header().Set("Cache-Control", "no-cache, no-store")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(b.hlsRaw)
+		return
+	}
+
+	safeCT := sanitizeLiveTVProxyContentType(b.contentType, "video/mp2t")
+	w.Header().Set("Content-Type", safeCT)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox")
+	w.Header().Set("Cache-Control", "no-cache, no-store")
+	w.WriteHeader(http.StatusOK)
+
+	var dst io.Writer = w
+	if f, ok := w.(http.Flusher); ok {
+		dst = flushWriter{w: w, f: f}
+	}
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case chunk := <-sub.ch:
+			if len(chunk) > 0 {
+				if _, wErr := dst.Write(chunk); wErr != nil {
+					return
+				}
+			}
+		case <-sub.done:
+			// Drain any buffered chunks written right before upstream closed.
+			for {
+				select {
+				case chunk := <-sub.ch:
+					if len(chunk) > 0 {
+						if _, wErr := dst.Write(chunk); wErr != nil {
+							return
+						}
+					}
+				default:
+					return
+				}
+			}
+		}
+	}
 }
 
 func sanitizeLiveTVProxyContentType(rawCT, fallbackCT string) string {
@@ -1855,6 +2121,9 @@ func (h *Handler) DeleteRecording(ctx context.Context, id string) bool {
 			}
 		}
 	}
+	if libRepo := h.resolveLibraryRepo(); libRepo != nil {
+		_ = libRepo.DeleteItem(ctx, id)
+	}
 	return true
 }
 
@@ -2261,6 +2530,9 @@ func (h *Handler) scheduleTimersForSeriesLocked(st SeriesTimerInfo) {
 				continue
 			}
 		}
+		if st.RecordNewOnly && h.shouldSkipSeriesProgramAsRepeatLocked(st, p) {
+			continue
+		}
 
 		// Avoid creating duplicate timers for the same program or time slot.
 		duplicate := false
@@ -2299,6 +2571,79 @@ func (h *Handler) scheduleTimersForSeriesLocked(st SeriesTimerInfo) {
 			IsPostPaddingRequired: st.IsPostPaddingRequired,
 		})
 	}
+}
+
+func programEpisodeIdentity(name, epNum, epTitle, overview string) string {
+	normName := strings.ToLower(strings.TrimSpace(name))
+	if normName == "" {
+		return ""
+	}
+	if en := strings.ToLower(strings.TrimSpace(epNum)); en != "" {
+		return normName + "\x00epnum:" + en
+	}
+	if et := strings.ToLower(strings.TrimSpace(epTitle)); et != "" {
+		return normName + "\x00eptitle:" + et
+	}
+	if ov := strings.ToLower(strings.TrimSpace(overview)); ov != "" {
+		return normName + "\x00ov:" + ov
+	}
+	return ""
+}
+
+func (h *Handler) shouldSkipSeriesProgramAsRepeatLocked(st SeriesTimerInfo, p ProgramInfo) bool {
+	if p.IsRepeat {
+		return true
+	}
+	progByID := make(map[string]ProgramInfo, len(h.state.Programs))
+	for _, ep := range h.state.Programs {
+		if ep.Id != "" {
+			progByID[ep.Id] = ep
+		}
+	}
+	candIdentity := programEpisodeIdentity(p.Name, p.EpisodeNumber, p.EpisodeTitle, p.Overview)
+
+	for _, rec := range h.state.Recordings {
+		if !strings.EqualFold(rec.Status, "Completed") && rec.Status != "" {
+			continue
+		}
+		if p.Id != "" && rec.ProgramId == p.Id {
+			return true
+		}
+		if candIdentity != "" {
+			if rp, ok := progByID[rec.ProgramId]; ok {
+				if programEpisodeIdentity(rp.Name, rp.EpisodeNumber, rp.EpisodeTitle, rp.Overview) == candIdentity {
+					return true
+				}
+			}
+		} else if strings.EqualFold(strings.TrimSpace(rec.Name), strings.TrimSpace(p.Name)) {
+			// When the EPG provides neither episode numbers/titles nor distinct overview,
+			// treat an already-completed recording of the exact same title as already recorded.
+			return true
+		}
+	}
+
+	for _, tm := range h.state.Timers {
+		if strings.EqualFold(tm.Status, "Cancelled") || strings.EqualFold(tm.Status, "Failed") {
+			continue
+		}
+		if p.Id != "" && tm.ProgramId == p.Id {
+			return true
+		}
+		if candIdentity != "" {
+			var tmIdentity string
+			if tp, ok := progByID[tm.ProgramId]; ok {
+				tmIdentity = programEpisodeIdentity(tp.Name, tp.EpisodeNumber, tp.EpisodeTitle, tp.Overview)
+			} else {
+				tmIdentity = programEpisodeIdentity(tm.Name, "", "", tm.Overview)
+			}
+			if tmIdentity != "" && tmIdentity == candIdentity {
+				return true
+			}
+		} else if tm.SeriesTimerId == st.Id && strings.EqualFold(strings.TrimSpace(tm.Name), strings.TrimSpace(p.Name)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) handleGetSeriesTimer(w http.ResponseWriter, r *http.Request) {
@@ -2475,6 +2820,28 @@ func (h *Handler) handleSaveTunerHost(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("failed to load m3u playlist: %v", err))
 			return
 		}
+	} else if strings.EqualFold(host.Type, "hdhomerun") {
+		if rawURL == "" {
+			httpx.Error(w, http.StatusBadRequest, "hdhomerun tuner url is required")
+			return
+		}
+		hdChannels, discovered, err := h.loadHDHomeRunFromSource(r.Context(), rawURL, host.UserAgent, host.ImportFavoritesOnly)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("failed to load hdhomerun lineup: %v", err))
+			return
+		}
+		parsed = hdChannels
+		if discovered != nil {
+			if host.FriendlyName == "" && discovered.FriendlyName != "" {
+				host.FriendlyName = discovered.FriendlyName
+			}
+			if host.DeviceId == "" && discovered.DeviceID != "" {
+				host.DeviceId = discovered.DeviceID
+			}
+			if host.TunerCount <= 0 && discovered.TunerCount > 0 {
+				host.TunerCount = discovered.TunerCount
+			}
+		}
 	}
 	// Do not persist raw inline M3U playlist content after parsing.
 	host.M3UContent = ""
@@ -2497,8 +2864,8 @@ func (h *Handler) handleSaveTunerHost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Replace channels for this tuner host using deterministic channel IDs to preserve Timer/EPG/mapping links.
-	// For M3U hosts with an explicit Url or M3UContent, also clear stale channels/programs when parsed is empty.
-	if len(parsed) > 0 || (strings.EqualFold(host.Type, "m3u") && (rawURL != "" || rawM3U != "")) {
+	// For M3U and HDHomeRun hosts with an explicit Url or M3UContent, also clear stale channels/programs when parsed is empty.
+	if len(parsed) > 0 || ((strings.EqualFold(host.Type, "m3u") || strings.EqualFold(host.Type, "hdhomerun")) && (rawURL != "" || rawM3U != "")) {
 		prevByID := make(map[string]ChannelInfo)
 		keptChannels := make([]ChannelInfo, 0, len(h.state.Channels))
 		removedChannelIDs := make(map[string]struct{})
@@ -2841,7 +3208,8 @@ func (h *Handler) handleSaveListingProvider(w http.ResponseWriter, r *http.Reque
 		h.state.ListingProviders = append(h.state.ListingProviders, lp)
 	}
 	if guide != nil && len(guide.Programmes) > 0 {
-		h.applyXMLTVGuideLocked(guide)
+		mappings := h.loadManualChannelMappings(r.Context())
+		h.applyXMLTVGuideWithMappingsLocked(guide, mappings)
 		for _, st := range h.state.SeriesTimers {
 			h.scheduleTimersForSeriesLocked(st)
 		}
@@ -2924,7 +3292,322 @@ func (h *Handler) validateLocalXMLTVPath(ctx context.Context, rawPath string) (s
 	return "", fmt.Errorf("local xmltv file path is outside allowed directories")
 }
 
+type hdHomeRunDiscoverPayload struct {
+	FriendlyName string `json:"FriendlyName"`
+	ModelNumber  string `json:"ModelNumber"`
+	DeviceID     string `json:"DeviceID"`
+	TunerCount   int    `json:"TunerCount"`
+	BaseURL      string `json:"BaseURL"`
+	LineupURL    string `json:"LineupURL"`
+}
+
+type hdHomeRunLineupEntry struct {
+	GuideNumber string `json:"GuideNumber"`
+	GuideName   string `json:"GuideName"`
+	URL         string `json:"URL"`
+	Favorite    int    `json:"Favorite"`
+	HD          int    `json:"HD"`
+}
+
+func normalizeHDHomeRunBaseURL(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", errors.New("hdhomerun url is empty")
+	}
+	if !strings.Contains(trimmed, "://") {
+		trimmed = "http://" + trimmed
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return "", err
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", fmt.Errorf("unsupported hdhomerun url scheme %q", u.Scheme)
+	}
+	if strings.TrimSpace(u.Hostname()) == "" {
+		return "", errors.New("hdhomerun host is empty")
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	u.Path = strings.TrimRight(u.Path, "/")
+	u.Path = strings.TrimSuffix(u.Path, "/discover.json")
+	u.Path = strings.TrimSuffix(u.Path, "/lineup.json")
+	return strings.TrimRight(u.String(), "/"), nil
+}
+
+func (h *Handler) fetchHDHomeRunJSON(ctx context.Context, targetURL, userAgent string, dst any) error {
+	if !h.customHTTPClient {
+		if err := netutil.ValidateRemoteURLNoLoopback(targetURL, true); err != nil {
+			return fmt.Errorf("blocked hdhomerun url: %w", err)
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return err
+	}
+	if userAgent != "" {
+		req.Header.Set("User-Agent", userAgent)
+	}
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, maxM3UPlaylistBytes)).Decode(dst)
+}
+
+func (h *Handler) loadHDHomeRunFromSource(ctx context.Context, rawURL, userAgent string, favoritesOnly bool) ([]M3UChannel, *hdHomeRunDiscoverPayload, error) {
+	baseURL, err := normalizeHDHomeRunBaseURL(rawURL)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var disc hdHomeRunDiscoverPayload
+	var discPtr *hdHomeRunDiscoverPayload
+	if dErr := h.fetchHDHomeRunJSON(ctx, baseURL+"/discover.json", userAgent, &disc); dErr == nil {
+		discPtr = &disc
+	}
+
+	lineupURL := baseURL + "/lineup.json"
+	if discPtr != nil && strings.TrimSpace(discPtr.LineupURL) != "" {
+		if parsedLU, lErr := url.Parse(strings.TrimSpace(discPtr.LineupURL)); lErr == nil && (strings.EqualFold(parsedLU.Scheme, "http") || strings.EqualFold(parsedLU.Scheme, "https")) {
+			lineupURL = parsedLU.String()
+		}
+	}
+
+	var lineup []hdHomeRunLineupEntry
+	if err := h.fetchHDHomeRunJSON(ctx, lineupURL, userAgent, &lineup); err != nil {
+		return nil, discPtr, err
+	}
+
+	channels := make([]M3UChannel, 0, min(len(lineup), maxM3UChannels))
+	for i, item := range lineup {
+		if len(channels) >= maxM3UChannels {
+			break
+		}
+		if favoritesOnly && item.Favorite != 1 {
+			continue
+		}
+		streamURL := strings.TrimSpace(item.URL)
+		if streamURL == "" {
+			continue
+		}
+		num := strings.TrimSpace(item.GuideNumber)
+		if num == "" {
+			num = strconv.Itoa(i + 1)
+		}
+		name := strings.TrimSpace(item.GuideName)
+		if name == "" {
+			name = "Channel " + num
+		}
+		group := ""
+		if item.HD == 1 {
+			group = "HD"
+		}
+		channels = append(channels, M3UChannel{
+			TvgID:      num,
+			TvgName:    name,
+			GroupTitle: group,
+			Number:     num,
+			Name:       name,
+			URL:        streamURL,
+		})
+	}
+	return channels, discPtr, nil
+}
+
+// DiscoverTuners returns configured tuner hosts enriched with live HDHomeRun discovery metadata,
+// and optionally probes probeURL (e.g. "http://192.168.1.50") for an unconfigured HDHomeRun device on the LAN.
+func (h *Handler) DiscoverTuners(ctx context.Context, probeURL string) []TunerHostInfo {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	existing := h.SnapshotTunerHosts()
+	seenURLs := make(map[string]bool, len(existing))
+	seenDevices := make(map[string]bool, len(existing))
+
+	for i := range existing {
+		normBase, err := normalizeHDHomeRunBaseURL(existing[i].Url)
+		if err == nil {
+			seenURLs[strings.ToLower(normBase)] = true
+		}
+		if existing[i].DeviceId != "" {
+			seenDevices[strings.ToLower(existing[i].DeviceId)] = true
+		}
+		if strings.EqualFold(existing[i].Type, "hdhomerun") && err == nil {
+			var disc hdHomeRunDiscoverPayload
+			if dErr := h.fetchHDHomeRunJSON(probeCtx, normBase+"/discover.json", existing[i].UserAgent, &disc); dErr == nil {
+				if existing[i].FriendlyName == "" && disc.FriendlyName != "" {
+					existing[i].FriendlyName = disc.FriendlyName
+				}
+				if existing[i].DeviceId == "" && disc.DeviceID != "" {
+					existing[i].DeviceId = disc.DeviceID
+					seenDevices[strings.ToLower(disc.DeviceID)] = true
+				}
+				if existing[i].TunerCount <= 0 && disc.TunerCount > 0 {
+					existing[i].TunerCount = disc.TunerCount
+				}
+			}
+		}
+	}
+
+	if strings.TrimSpace(probeURL) != "" {
+		if normBase, err := normalizeHDHomeRunBaseURL(probeURL); err == nil && !seenURLs[strings.ToLower(normBase)] {
+			var disc hdHomeRunDiscoverPayload
+			if dErr := h.fetchHDHomeRunJSON(probeCtx, normBase+"/discover.json", "", &disc); dErr == nil {
+				if disc.DeviceID == "" || !seenDevices[strings.ToLower(disc.DeviceID)] {
+					friendly := strings.TrimSpace(disc.FriendlyName)
+					if friendly == "" {
+						friendly = "HDHomeRun"
+					}
+					existing = append(existing, TunerHostInfo{
+						Url:                 normBase,
+						Type:                "hdhomerun",
+						DeviceId:            disc.DeviceID,
+						FriendlyName:        friendly,
+						TunerCount:          disc.TunerCount,
+						AllowHWTranscoding:  true,
+						AllowPrivateNetwork: isStrictPrivateLANURL(normBase, h.customHTTPClient),
+					})
+				}
+			}
+		}
+	}
+	if existing == nil {
+		return []TunerHostInfo{}
+	}
+	return existing
+}
+
+func (h *Handler) loadManualChannelMappings(ctx context.Context) map[string][]string {
+	if h.store == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var raw string
+	err := h.store.Reader.QueryRowContext(ctx,
+		`SELECT value_json FROM server_config WHERE key = ?`, "compatext:state",
+	).Scan(&raw)
+	if err != nil || strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var parsed struct {
+		ChannelMappings map[string][]struct {
+			Name  string `json:"Name"`  // TunerChannelId
+			Value string `json:"Value"` // ProviderChannelId
+		} `json:"channel_mappings"`
+	}
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil || len(parsed.ChannelMappings) == 0 {
+		return nil
+	}
+	// Build lookup: lowercase ProviderChannelId -> []TunerChannelId
+	byProviderCh := make(map[string][]string)
+	for _, list := range parsed.ChannelMappings {
+		for _, m := range list {
+			tunerChID := strings.TrimSpace(m.Name)
+			provChID := strings.ToLower(strings.TrimSpace(m.Value))
+			if tunerChID == "" || provChID == "" {
+				continue
+			}
+			dup := false
+			for _, existing := range byProviderCh[provChID] {
+				if strings.EqualFold(existing, tunerChID) {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				byProviderCh[provChID] = append(byProviderCh[provChID], tunerChID)
+			}
+		}
+	}
+	return byProviderCh
+}
+
+// RefreshAllGuides reloads all configured XMLTV listing providers, applies manual ChannelMappings first,
+// prunes historical programs that ended more than 24 hours ago, reschedules SeriesTimers, and persists state.
+func (h *Handler) RefreshAllGuides(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	providers := h.SnapshotListingProviders()
+	var guides []*XMLTVGuide
+	var firstErr error
+	for _, lp := range providers {
+		if !strings.EqualFold(lp.Type, "xmltv") || strings.TrimSpace(lp.Path) == "" {
+			continue
+		}
+		g, err := h.loadXMLTVFromSource(ctx, lp.Path)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if g != nil && len(g.Programmes) > 0 {
+			guides = append(guides, g)
+		}
+	}
+	mappings := h.loadManualChannelMappings(ctx)
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+
+	h.mu.Lock()
+	snapshot := cloneLiveTVState(h.state)
+	changed := false
+
+	for _, g := range guides {
+		h.applyXMLTVGuideWithMappingsLocked(g, mappings)
+		changed = true
+	}
+
+	// Prune historical EPG programs expired for more than 24 hours.
+	if len(h.state.Programs) > 0 {
+		kept := make([]ProgramInfo, 0, len(h.state.Programs))
+		for _, p := range h.state.Programs {
+			if !p.EndDate.IsZero() && p.EndDate.Before(cutoff) {
+				changed = true
+				continue
+			}
+			kept = append(kept, p)
+		}
+		h.state.Programs = kept
+	}
+
+	if changed && len(h.state.SeriesTimers) > 0 {
+		for _, st := range h.state.SeriesTimers {
+			h.scheduleTimersForSeriesLocked(st)
+		}
+	}
+
+	var saveErr error
+	if changed {
+		saveErr = h.saveStateLocked(ctx)
+		if saveErr != nil {
+			h.state = snapshot
+		}
+	}
+	h.mu.Unlock()
+
+	if saveErr != nil {
+		return saveErr
+	}
+	return firstErr
+}
+
 func (h *Handler) applyXMLTVGuideLocked(guide *XMLTVGuide) {
+	h.applyXMLTVGuideWithMappingsLocked(guide, h.loadManualChannelMappings(context.Background()))
+}
+
+func (h *Handler) applyXMLTVGuideWithMappingsLocked(guide *XMLTVGuide, manualByProviderCh map[string][]string) {
 	if guide == nil || len(guide.Programmes) == 0 || len(h.state.Channels) == 0 {
 		return
 	}
@@ -2932,6 +3615,7 @@ func (h *Handler) applyXMLTVGuideLocked(guide *XMLTVGuide) {
 	byTvgID := make(map[string]ChannelInfo, len(h.state.Channels))
 	byID := make(map[string]ChannelInfo, len(h.state.Channels))
 	byName := make(map[string]ChannelInfo, len(h.state.Channels))
+	mappedTunerSet := make(map[string]bool)
 	for _, ch := range h.state.Channels {
 		if k := strings.ToLower(strings.TrimSpace(ch.TvgId)); k != "" {
 			byTvgID[k] = ch
@@ -2943,6 +3627,11 @@ func (h *Handler) applyXMLTVGuideLocked(guide *XMLTVGuide) {
 			byName[k] = ch
 		}
 	}
+	for _, tunerIDs := range manualByProviderCh {
+		for _, tid := range tunerIDs {
+			mappedTunerSet[strings.ToLower(strings.TrimSpace(tid))] = true
+		}
+	}
 
 	xmlDisplayNames := make(map[string][]string, len(guide.Channels))
 	for _, xc := range guide.Channels {
@@ -2951,33 +3640,47 @@ func (h *Handler) applyXMLTVGuideLocked(guide *XMLTVGuide) {
 		}
 	}
 
-	matchChannel := func(xmlChID string) (ChannelInfo, bool) {
+	matchChannels := func(xmlChID string) []ChannelInfo {
 		key := strings.ToLower(strings.TrimSpace(xmlChID))
 		if key == "" {
-			return ChannelInfo{}, false
+			return nil
 		}
-		if ch, ok := byTvgID[key]; ok {
-			return ch, true
+		// Priority 1: explicit manual ChannelMappings (ProviderChannelId -> []TunerChannelId)
+		if tunerIDs, ok := manualByProviderCh[key]; ok && len(tunerIDs) > 0 {
+			var matched []ChannelInfo
+			for _, tid := range tunerIDs {
+				if ch, exists := byID[strings.ToLower(strings.TrimSpace(tid))]; exists {
+					matched = append(matched, ch)
+				}
+			}
+			if len(matched) > 0 {
+				return matched
+			}
 		}
-		if ch, ok := byID[key]; ok {
-			return ch, true
+		// Priority 2: automatic TvgId / Id / Name / XMLTV display-name matching
+		// (skip channels that the admin explicitly pinned to a different ProviderChannelId)
+		if ch, ok := byTvgID[key]; ok && !mappedTunerSet[strings.ToLower(ch.Id)] {
+			return []ChannelInfo{ch}
 		}
-		if ch, ok := byName[key]; ok {
-			return ch, true
+		if ch, ok := byID[key]; ok && !mappedTunerSet[strings.ToLower(ch.Id)] {
+			return []ChannelInfo{ch}
+		}
+		if ch, ok := byName[key]; ok && !mappedTunerSet[strings.ToLower(ch.Id)] {
+			return []ChannelInfo{ch}
 		}
 		for _, dn := range xmlDisplayNames[key] {
 			dnKey := strings.ToLower(strings.TrimSpace(dn))
 			if dnKey == "" {
 				continue
 			}
-			if ch, ok := byName[dnKey]; ok {
-				return ch, true
+			if ch, ok := byName[dnKey]; ok && !mappedTunerSet[strings.ToLower(ch.Id)] {
+				return []ChannelInfo{ch}
 			}
-			if ch, ok := byTvgID[dnKey]; ok {
-				return ch, true
+			if ch, ok := byTvgID[dnKey]; ok && !mappedTunerSet[strings.ToLower(ch.Id)] {
+				return []ChannelInfo{ch}
 			}
 		}
-		return ChannelInfo{}, false
+		return nil
 	}
 
 	matchedChannelIDs := make(map[string]struct{})
@@ -2985,25 +3688,33 @@ func (h *Handler) applyXMLTVGuideLocked(guide *XMLTVGuide) {
 	serverID := h.serverID()
 
 	for _, prog := range guide.Programmes {
-		ch, ok := matchChannel(prog.Channel)
-		if !ok {
+		chs := matchChannels(prog.Channel)
+		if len(chs) == 0 {
 			continue
 		}
-		matchedChannelIDs[ch.Id] = struct{}{}
 		isMovie, isSeries := classifyXMLTVCategories(prog.Categories)
-		newPrograms = append(newPrograms, ProgramInfo{
-			Id:          guid.New(),
-			Name:        prog.Title,
-			ServerId:    serverID,
-			Type:        "Program",
-			ChannelId:   ch.Id,
-			ChannelName: ch.Name,
-			Overview:    prog.Desc,
-			StartDate:   prog.Start,
-			EndDate:     prog.Stop,
-			IsMovie:     isMovie,
-			IsSeries:    isSeries,
-		})
+		if prog.EpisodeNum != "" || prog.SubTitle != "" {
+			isSeries = true
+		}
+		for _, ch := range chs {
+			matchedChannelIDs[ch.Id] = struct{}{}
+			newPrograms = append(newPrograms, ProgramInfo{
+				Id:            guid.New(),
+				Name:          prog.Title,
+				EpisodeTitle:  prog.SubTitle,
+				EpisodeNumber: prog.EpisodeNum,
+				ServerId:      serverID,
+				Type:          "Program",
+				ChannelId:     ch.Id,
+				ChannelName:   ch.Name,
+				Overview:      prog.Desc,
+				StartDate:     prog.Start,
+				EndDate:       prog.Stop,
+				IsMovie:       isMovie,
+				IsSeries:      isSeries,
+				IsRepeat:      prog.PreviouslyShown,
+			})
+		}
 	}
 
 	if len(matchedChannelIDs) == 0 {

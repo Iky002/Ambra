@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -339,4 +341,319 @@ func TestLiveTVV0109AuditH05H06M20M28L18(t *testing.T) {
 		t.Fatalf("M-28: expected listing provider rolled back on persistence error")
 	}
 	_ = json.Marshal
+}
+
+func TestLiveTVStreamHubHDHomeRunMappingsRefreshRecordNewOnlyAndMediaImport(t *testing.T) {
+	h, mux, st, cfg := setupLiveTVTest(t)
+	defer h.Close()
+	ctx := context.Background()
+	libRepo := sqlite.NewLibraryRepo(st)
+	userRepo := sqlite.NewUserRepo(st)
+	h.SetLibraryRepo(libRepo)
+	h.SetUserRepo(userRepo)
+	h.SetStreamGracePeriod(40 * time.Millisecond)
+
+	adminRec := &sqlite.UserRecord{Name: "adm_hub", IsAdmin: true, Policy: sqlite.DefaultUserPolicy(true), Config: sqlite.DefaultUserConfig()}
+	_ = userRepo.CreateUser(ctx, adminRec)
+	adminAC := &middleware.AuthContext{User: adminRec}
+
+	// 1. maxM3UChannels == 10,000 cap
+	if maxM3UChannels != 10000 {
+		t.Fatalf("expected maxM3UChannels == 10000, got %d", maxM3UChannels)
+	}
+	var bigM3U strings.Builder
+	bigM3U.WriteString("#EXTM3U\n")
+	for i := 0; i < 10050; i++ {
+		bigM3U.WriteString("#EXTINF:-1,Ch ")
+		bigM3U.WriteString(strconv.Itoa(i))
+		bigM3U.WriteString("\nhttp://tv.example/")
+		bigM3U.WriteString(strconv.Itoa(i))
+		bigM3U.WriteString(".ts\n")
+	}
+	cappedChs, err := ParseM3UString(bigM3U.String())
+	if err != nil || len(cappedChs) != 10000 {
+		t.Fatalf("expected ParseM3U capped at 10000 channels, got len=%d err=%v", len(cappedChs), err)
+	}
+
+	// 2. LiveStreamHub multiplexes concurrent viewers onto ONE upstream HTTP connection + disconnects upstream after viewers leave + idle timeout
+	var upstreamConns atomic.Int32
+	upstreamClosed := make(chan struct{})
+	gate := make(chan struct{})
+	tsUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/shared.ts":
+			n := upstreamConns.Add(1)
+			w.Header().Set("Content-Type", "video/mp2t")
+			w.WriteHeader(http.StatusOK)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-gate
+			for i := 0; i < 5; i++ {
+				_, _ = w.Write([]byte("MPEGTS-PKT;"))
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			// Hold open until LiveStreamHub closes upstream after viewers disconnect.
+			<-r.Context().Done()
+			if n == 1 {
+				close(upstreamClosed)
+			}
+		case "/stalled.ts":
+			w.Header().Set("Content-Type", "video/mp2t")
+			w.WriteHeader(http.StatusOK)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			_, _ = w.Write([]byte("INIT;"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done()
+		case "/discover.json":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"FriendlyName":"HDHomeRun CONNECT","DeviceID":"1040ABCD","TunerCount":4}`))
+		case "/lineup.json":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[
+				{"GuideNumber":"2.1","GuideName":"PBS HD","URL":"` + r.Host + `","Favorite":1,"HD":1},
+				{"GuideNumber":"5.1","GuideName":"Shopping","URL":"http://192.168.1.99:5004/auto/v5.1","Favorite":0,"HD":0}
+			]`))
+		}
+	}))
+	defer tsUpstream.Close()
+
+	h.SetHTTPClient(tsUpstream.Client())
+	h.SetStreamClient(tsUpstream.Client())
+
+	h.mu.Lock()
+	h.state.TunerHosts = []TunerHostInfo{{Id: "th-hub", Type: "m3u", AllowPrivateNetwork: true}}
+	h.state.Channels = []ChannelInfo{
+		{Id: "ch-shared", Name: "Shared TS", StreamUrl: tsUpstream.URL + "/shared.ts", TunerHostId: "th-hub"},
+		{Id: "ch-stall", Name: "Stall TS", StreamUrl: tsUpstream.URL + "/stalled.ts", TunerHostId: "th-hub"},
+	}
+	h.mu.Unlock()
+
+	viewerSrv := httptest.NewServer(mux)
+	defer viewerSrv.Close()
+
+	const numViewers = 3
+	var wg sync.WaitGroup
+	errCh := make(chan error, numViewers)
+	for i := 0; i < numViewers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			vCtx, vCancel := context.WithTimeout(ctx, 3*time.Second)
+			defer vCancel()
+			req, _ := http.NewRequestWithContext(vCtx, http.MethodGet, viewerSrv.URL+"/LiveTv/Channels/ch-shared/Stream", nil)
+			resp, err := viewerSrv.Client().Do(req)
+			if err != nil {
+				errCh <- fmt.Errorf("viewer %d request: %w", idx, err)
+				return
+			}
+			defer resp.Body.Close()
+			buf := make([]byte, len("MPEGTS-PKT;"))
+			if _, err := io.ReadFull(resp.Body, buf); err != nil {
+				errCh <- fmt.Errorf("viewer %d read: %w", idx, err)
+				return
+			}
+			if string(buf) != "MPEGTS-PKT;" {
+				errCh <- fmt.Errorf("viewer %d got %q", idx, string(buf))
+			}
+		}(i)
+	}
+	time.Sleep(40 * time.Millisecond)
+	close(gate)
+	wg.Wait()
+	close(errCh)
+	for vErr := range errCh {
+		t.Fatal(vErr)
+	}
+	if got := upstreamConns.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 shared upstream HTTP connection for %d concurrent viewers, got %d", numViewers, got)
+	}
+	select {
+	case <-upstreamClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected shared upstream connection closed automatically after all viewers disconnected")
+	}
+
+	// Verify idle read timeout disconnects stalled upstream stream automatically
+	h.SetStreamIdleTimeout(120 * time.Millisecond)
+	stallStart := time.Now()
+	stallRec := doJSON(t, mux, http.MethodGet, "/LiveTv/Channels/ch-stall/Stream", nil)
+	if stallRec.Code != http.StatusOK || !strings.HasPrefix(stallRec.Body.String(), "INIT;") || time.Since(stallStart) > 2*time.Second {
+		t.Fatalf("expected stalled upstream to terminate cleanly on idle timeout, code=%d elapsed=%v body=%q", stallRec.Code, time.Since(stallStart), stallRec.Body.String())
+	}
+	h.SetStreamIdleTimeout(defaultStreamIdleTimeout)
+
+	// 3. HDHomeRun tuner import (discover.json + lineup.json + ImportFavoritesOnly) & DiscoverTuners
+	hdSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/discover.json":
+			_, _ = w.Write([]byte(`{"FriendlyName":"LivingRoom HDHR","DeviceID":"HDHR-9988","TunerCount":2}`))
+		case "/lineup.json":
+			_, _ = w.Write([]byte(`[
+				{"GuideNumber":"10.1","GuideName":"NBC HD","URL":"http://192.168.1.88:5004/auto/v10.1","Favorite":1,"HD":1},
+				{"GuideNumber":"10.2","GuideName":"SubCh","URL":"http://192.168.1.88:5004/auto/v10.2","Favorite":0,"HD":0}
+			]`))
+		}
+	}))
+	defer hdSrv.Close()
+	h.SetHTTPClient(hdSrv.Client())
+
+	discoveredProbe := h.DiscoverTuners(ctx, hdSrv.URL)
+	foundProbe := false
+	for _, d := range discoveredProbe {
+		if d.DeviceId == "HDHR-9988" && d.FriendlyName == "LivingRoom HDHR" && d.TunerCount == 2 {
+			foundProbe = true
+		}
+	}
+	if !foundProbe {
+		t.Fatalf("expected DiscoverTuners to discover HDHR-9988, got %+v", discoveredProbe)
+	}
+
+	recHD := doJSON(t, mux, http.MethodPost, "/LiveTv/TunerHosts", map[string]any{
+		"Id":                  "th-hdhr",
+		"Type":                "hdhomerun",
+		"Url":                 hdSrv.URL,
+		"ImportFavoritesOnly": true,
+	})
+	if recHD.Code != http.StatusOK {
+		t.Fatalf("save hdhomerun tuner failed: %d %s", recHD.Code, recHD.Body.String())
+	}
+	var savedHD TunerHostInfo
+	_ = json.Unmarshal(recHD.Body.Bytes(), &savedHD)
+	if savedHD.ImportedChannelCount != 1 || savedHD.DeviceId != "HDHR-9988" || savedHD.TunerCount != 2 {
+		t.Fatalf("unexpected saved HDHomeRun tuner: %+v", savedHD)
+	}
+	var hdChID string
+	for _, ch := range h.SnapshotChannels() {
+		if ch.TunerHostId == "th-hdhr" {
+			hdChID = ch.Id
+		}
+	}
+	if hdChID == "" {
+		t.Fatal("expected imported HDHomeRun favorite channel")
+	}
+
+	// 4. Manual ChannelMappings priority + RefreshAllGuides (>24h expiry pruning) + SeriesTimer.RecordNewOnly
+	// Seed manual mapping in server_config ("compatext:state"): map hdChID -> provider channel "epg-custom-nbc"
+	_, err = st.Writer.ExecContext(ctx,
+		`INSERT INTO server_config (key, value_json, updated_at) VALUES (?, ?, ?)`,
+		"compatext:state",
+		fmt.Sprintf(`{"channel_mappings":{"lp-1":[{"Name":%q,"Value":"epg-custom-nbc"}]}}`, hdChID),
+		time.Now().UTC().Unix(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Minute)
+	fmtXMLTime := func(t time.Time) string { return t.UTC().Format("20060102150405 +0000") }
+	xmlPath := filepath.Join(cfg.DataDir, "mapped.xml")
+	xmlDoc := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<tv>
+  <channel id="epg-custom-nbc"><display-name>Custom EPG</display-name></channel>
+  <programme start="%s" stop="%s" channel="epg-custom-nbc">
+    <title>Old Expired News</title>
+  </programme>
+  <programme start="%s" stop="%s" channel="epg-custom-nbc">
+    <title>SciFi Odyssey</title>
+    <sub-title>Pilot</sub-title>
+    <episode-num system="xmltv_ns">0.0.</episode-num>
+  </programme>
+  <programme start="%s" stop="%s" channel="epg-custom-nbc">
+    <title>SciFi Odyssey</title>
+    <sub-title>Pilot</sub-title>
+    <episode-num system="xmltv_ns">0.0.</episode-num>
+  </programme>
+  <programme start="%s" stop="%s" channel="epg-custom-nbc">
+    <title>SciFi Odyssey</title>
+    <sub-title>Rerun Episode</sub-title>
+    <previously-shown />
+  </programme>
+</tv>`,
+		fmtXMLTime(now.Add(-30*time.Hour)), fmtXMLTime(now.Add(-29*time.Hour)),
+		fmtXMLTime(now.Add(1*time.Hour)), fmtXMLTime(now.Add(2*time.Hour)),
+		fmtXMLTime(now.Add(5*time.Hour)), fmtXMLTime(now.Add(6*time.Hour)),
+		fmtXMLTime(now.Add(7*time.Hour)), fmtXMLTime(now.Add(8*time.Hour)),
+	)
+	if err := os.WriteFile(xmlPath, []byte(xmlDoc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if recLP := doJSON(t, mux, http.MethodPost, "/LiveTv/ListingProviders", map[string]any{
+		"Id":   "lp-1",
+		"Type": "xmltv",
+		"Path": xmlPath,
+	}); recLP.Code != http.StatusOK {
+		t.Fatalf("save xmltv provider: %d %s", recLP.Code, recLP.Body.String())
+	}
+
+	// RefreshAllGuides reloads XMLTV and prunes "Old Expired News" (ended 29h ago > 24h cutoff)
+	if err := h.RefreshAllGuides(ctx); err != nil {
+		t.Fatalf("RefreshAllGuides failed: %v", err)
+	}
+	for _, p := range h.SnapshotPrograms() {
+		if p.Name == "Old Expired News" {
+			t.Fatal("expected RefreshAllGuides to prune >24h expired program")
+		}
+	}
+
+	// Create SeriesTimer with RecordNewOnly=true for "SciFi Odyssey":
+	// - First "Pilot" (0.0.) should be scheduled;
+	// - Second airing of "Pilot" (0.0.) 4h later must be deduplicated;
+	// - "Rerun Episode" with <previously-shown /> must be skipped!
+	recST := doLiveTVAuthReq(t, mux, adminAC, http.MethodPost, "/LiveTv/SeriesTimers", map[string]any{
+		"Id":            "st-new-only",
+		"Name":          "SciFi Odyssey",
+		"ChannelId":     hdChID,
+		"RecordNewOnly": true,
+	})
+	if recST.Code != http.StatusOK {
+		t.Fatalf("create series timer failed: %d %s", recST.Code, recST.Body.String())
+	}
+	h.mu.RLock()
+	var scheduledForSeries []TimerInfo
+	for _, tm := range h.state.Timers {
+		if tm.SeriesTimerId == "st-new-only" {
+			scheduledForSeries = append(scheduledForSeries, tm)
+		}
+	}
+	h.mu.RUnlock()
+	if len(scheduledForSeries) != 1 {
+		t.Fatalf("expected RecordNewOnly to schedule only 1 new episode (skipping duplicate epnum & <previously-shown>), got %d: %+v", len(scheduledForSeries), scheduledForSeries)
+	}
+
+	// 5. DVR OnRecordingFinished automatically registers completed recording into LibraryRepo
+	recOutPath := filepath.Join(cfg.DataDir, "recordings", "odyssey_s01e01.ts")
+	_ = os.MkdirAll(filepath.Dir(recOutPath), 0o755)
+	_ = os.WriteFile(recOutPath, []byte("RECORDED-TS-DATA"), 0o644)
+
+	h.OnRecordingFinished(ctx, dvr.RecordingState{
+		Job: dvr.RecordingJob{
+			TimerID:     scheduledForSeries[0].Id,
+			ChannelName: "NBC HD",
+			ProgramName: "SciFi Odyssey",
+		},
+		Status:     dvr.StatusCompleted,
+		OutputPath: recOutPath,
+		StartedAt:  now,
+		EndedAt:    now.Add(30 * time.Minute),
+	})
+
+	recs := h.SnapshotRecordings()
+	if len(recs) == 0 {
+		t.Fatal("expected completed recording in LiveTV state")
+	}
+	lastRec := recs[len(recs)-1]
+	libItem, err := libRepo.GetItemRecordByID(ctx, lastRec.Id)
+	if err != nil || libItem == nil || libItem.Path != recOutPath {
+		t.Fatalf("expected completed DVR recording imported into LibraryRepo, got item=%+v err=%v", libItem, err)
+	}
 }

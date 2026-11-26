@@ -101,6 +101,9 @@ func (h *Handler) handleSetEncodingConfig(key string) http.HandlerFunc {
 			httpx.Error(w, http.StatusInternalServerError, "failed to save encoding config")
 			return
 		}
+		if h.transcodeMgr != nil {
+			h.transcodeMgr.ReloadEncodingOptions(r.Context())
+		}
 		httpx.NoContent(w)
 	}
 }
@@ -133,6 +136,9 @@ func (h *Handler) handleSetCodecParameters(w http.ResponseWriter, r *http.Reques
 		slog.Error("failed to save codec parameters", "key", key, "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "failed to save codec parameters")
 		return
+	}
+	if h.transcodeMgr != nil {
+		h.transcodeMgr.ReloadEncodingOptions(r.Context())
 	}
 	httpx.NoContent(w)
 }
@@ -234,7 +240,9 @@ func (h *Handler) handleMediaFolders(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusForbidden, "forbidden")
 		return
 	}
-	allowed := h.allowedLibrariesForRequest(r, h.resolveUserID(r, q))
+	userID := h.resolveUserID(r, q)
+	allowed := h.allowedLibrariesForRequest(r, userID)
+	pol := h.userExtendedPolicyForRequest(r, userID)
 	libs, err := h.repo.ListLibraries(r.Context())
 	if err != nil {
 		slog.Error("internal error in compatmedia encoding handler", "error", err)
@@ -246,6 +254,37 @@ func (h *Handler) handleMediaFolders(w http.ResponseWriter, r *http.Request) {
 		if !isLibraryAllowed(lib.ID, allowed) {
 			continue
 		}
+		imageTags := map[string]string{}
+		if imgRec, imgErr := h.repo.GetImageByItemAndType(r.Context(), lib.ID, "Primary", 0); imgErr == nil && imgRec != nil && imgRec.Tag != "" {
+			imageTags["Primary"] = imgRec.Tag
+		} else {
+			children, _, cErr := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
+				LibraryID:         lib.ID,
+				MaxParentalRating: pol.MaxParentalRating,
+				BlockedTags:       pol.BlockedTags,
+				BlockUnratedItems: pol.BlockUnratedItems,
+				AllowedTags:       pol.AllowedTags,
+				IncludeItemTypes:  []string{"Movie", "Series", "MusicAlbum", "Video"},
+				Recursive:         true,
+				Limit:             12,
+			})
+			if cErr == nil {
+				for _, ch := range children {
+					if len(ch.BackdropImageTags) > 0 && ch.BackdropImageTags[0] != "" {
+						imageTags["Primary"] = computeSyntheticLibraryCoverTag(lib.ID, ch.BackdropImageTags[0])
+						break
+					}
+				}
+				if imageTags["Primary"] == "" {
+					for _, ch := range children {
+						if ch.ImageTags["Primary"] != "" {
+							imageTags["Primary"] = computeSyntheticLibraryCoverTag(lib.ID, ch.ImageTags["Primary"])
+							break
+						}
+					}
+				}
+			}
+		}
 		items = append(items, dto.BaseItemDto{
 			Id:                lib.ID,
 			Name:              lib.Name,
@@ -253,7 +292,7 @@ func (h *Handler) handleMediaFolders(w http.ResponseWriter, r *http.Request) {
 			Type:              "CollectionFolder",
 			CollectionType:    lib.CollectionType,
 			IsFolder:          true,
-			ImageTags:         map[string]string{},
+			ImageTags:         imageTags,
 			BackdropImageTags: []string{},
 		})
 	}
@@ -386,14 +425,33 @@ func (h *Handler) handleRenameVirtualFolder(w http.ResponseWriter, r *http.Reque
 		httpx.Error(w, http.StatusBadRequest, "id/name and newName are required")
 		return
 	}
+	var targetLib *sqlite.LibraryRecord
+	if h.repo != nil {
+		if lib, err := h.findLibraryByIDOrName(r, id, oldName); err == nil && lib != nil {
+			targetLib = lib
+		}
+	}
 	if h.store != nil {
 		now := time.Now().Unix()
-		if id != "" {
+		if targetLib != nil {
+			_, _ = h.store.Writer.ExecContext(r.Context(),
+				`UPDATE libraries SET name = ?, updated_at = ? WHERE id = ?`, newName, now, targetLib.ID)
+		} else if id != "" {
 			_, _ = h.store.Writer.ExecContext(r.Context(),
 				`UPDATE libraries SET name = ?, updated_at = ? WHERE id = ?`, newName, now, guid.Normalize(id))
 		} else {
 			_, _ = h.store.Writer.ExecContext(r.Context(),
 				`UPDATE libraries SET name = ?, updated_at = ? WHERE name = ?`, newName, now, oldName)
+		}
+	}
+	if h.repo != nil {
+		h.repo.InvalidateCountCache()
+	}
+	if h.watcher != nil && targetLib != nil {
+		if len(targetLib.Paths) == 0 {
+			_ = h.watcher.UnwatchLibrary(targetLib.ID)
+		} else {
+			_ = h.watcher.WatchLibrary(targetLib.ID, targetLib.Paths)
 		}
 	}
 	httpx.NoContent(w)
@@ -425,8 +483,11 @@ func (h *Handler) saveLibraryPaths(r *http.Request, libID string, paths []string
 	}
 	_, err = h.store.Writer.ExecContext(r.Context(),
 		`UPDATE libraries SET paths_json = ?, updated_at = ? WHERE id = ?`,
-		string(raw), time.Now().Unix(), libID,
+		string(raw), time.Now().Unix(), guid.Normalize(libID),
 	)
+	if err == nil && h.repo != nil {
+		h.repo.InvalidateCountCache()
+	}
 	return err
 }
 

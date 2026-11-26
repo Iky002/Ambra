@@ -19,6 +19,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/dvr"
+	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
@@ -81,17 +82,25 @@ type compatExtState struct {
 
 // Handler implements extended Emby 4.10.2.0 compatibility routes for LiveTv, Sync, and Notifications.
 type Handler struct {
-	store    *sqlite.Store
-	cfg      *config.Config
-	auth     AuthFuncs
-	liveTV   *livetv.Handler
-	syncH    *syncapi.Handler
-	dvrRec   *dvr.Recorder
-	libRepo  *sqlite.LibraryRepo
-	userRepo *sqlite.UserRepo
+	store        *sqlite.Store
+	cfg          *config.Config
+	auth         AuthFuncs
+	liveTV       *livetv.Handler
+	syncH        *syncapi.Handler
+	dvrRec       *dvr.Recorder
+	transcodeMgr *transcode.Manager
+	libRepo      *sqlite.LibraryRepo
+	userRepo     *sqlite.UserRepo
 
 	mu    sync.RWMutex
 	state compatExtState
+}
+
+// SetTranscodeManager wires the shared transcode Manager for Live TV recording HLS playback and subtitle extraction.
+func (h *Handler) SetTranscodeManager(mgr *transcode.Manager) {
+	h.mu.Lock()
+	h.transcodeMgr = mgr
+	h.mu.Unlock()
 }
 
 // SetLiveTV wires the primary Live TV handler for real channel stream proxying and unified state.
@@ -317,6 +326,39 @@ func (h *Handler) canAccessItemID(r *http.Request, itemID string) bool {
 	if policy.MaxParentalRating != nil || len(policy.BlockedTags) > 0 {
 		if blocked, bErr := libRepo.IsItemBlockedByParentalPolicy(r.Context(), rec, policy.MaxParentalRating, policy.BlockedTags); bErr != nil || blocked {
 			return false
+		}
+	}
+	if len(policy.BlockUnratedItems) > 0 {
+		for _, bu := range policy.BlockUnratedItems {
+			t := strings.TrimSpace(bu)
+			if t == "*" || strings.EqualFold(t, "All") || strings.EqualFold(t, rec.Type) || (rec.MediaType != "" && strings.EqualFold(t, rec.MediaType)) {
+				if strings.TrimSpace(rec.OfficialRating) == "" {
+					return false
+				}
+				break
+			}
+		}
+	}
+	if len(policy.AllowedTags) > 0 {
+		allowSet := make(map[string]bool, len(policy.AllowedTags))
+		for _, at := range policy.AllowedTags {
+			if s := strings.ToLower(strings.TrimSpace(at)); s != "" {
+				allowSet[s] = true
+			}
+		}
+		if len(allowSet) > 0 {
+			matched := false
+			if _, _, tags, tErr := libRepo.GetTaxonomiesByItemID(r.Context(), rec.ID); tErr == nil {
+				for _, tg := range tags {
+					if allowSet[strings.ToLower(strings.TrimSpace(tg))] {
+						matched = true
+						break
+					}
+				}
+			}
+			if !matched {
+				return false
+			}
 		}
 	}
 	return true
