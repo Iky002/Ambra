@@ -112,6 +112,17 @@ func (s *Service) WithCacheDir(dir string) *Service {
 	return s
 }
 
+// WithFFmpegPath configures a custom ffmpeg executable path for WebP decoding and returns the Service for chaining.
+func (s *Service) WithFFmpegPath(path string) *Service {
+	SetFFmpegPath(path)
+	return s
+}
+
+// SetFFmpegPath updates the ffmpeg executable path used for WebP decoding.
+func (s *Service) SetFFmpegPath(path string) {
+	SetFFmpegPath(path)
+}
+
 // SetCacheDir updates the disk cache directory. An empty path falls back to os.TempDir().
 func (s *Service) SetCacheDir(dir string) {
 	resolved := strings.TrimSpace(dir)

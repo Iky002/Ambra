@@ -3,11 +3,15 @@ package wasmhost
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +21,7 @@ import (
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/tetratelabs/wazero"
+	"github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 	"github.com/tetratelabs/wazero/sys"
 )
@@ -29,8 +34,25 @@ const (
 	maxWasmStdoutBytes        = 4 << 20
 	maxWasmStderrBytes        = 64 << 10
 	maxManifestBytes          = 1 << 20
+	maxHostLogMsgBytes        = 64 << 10
+	maxHostHTTPReqBytes       = 1 << 20
+	maxHostHTTPRespBytes      = 2 << 20 // 2 MiB max HTTP response body for ambra.http_request
 	defaultMaxConcurrentCalls = 8
+
+	// Host HTTP error status return codes (negative values in -1..-9; buffer-too-small returns -requiredLen <= -12).
+	HostHTTPErrMemory     int32 = -1
+	HostHTTPErrBadRequest int32 = -2
+	HostHTTPErrForbidden  int32 = -3
+	HostHTTPErrNetwork    int32 = -4
+	HostHTTPErrTooLarge   int32 = -5
 )
+
+type wasmCallCtxKey struct{}
+
+type wasmCallContext struct {
+	pluginID     string
+	allowedHosts []string
+}
 
 type limitedBuffer struct {
 	mu        sync.Mutex
@@ -84,16 +106,32 @@ func (l *limitedBuffer) isTruncated() bool {
 // PluginManifest extends plugins.Manifest with WASM runtime fields loaded from manifest.json.
 type PluginManifest struct {
 	plugins.Manifest
-	WasmFile  string `json:"WasmFile"`
-	TimeoutMs int    `json:"TimeoutMs,omitempty"`
+	WasmFile     string   `json:"WasmFile"`
+	TimeoutMs    int      `json:"TimeoutMs,omitempty"`
+	AllowedHosts []string `json:"AllowedHosts,omitempty"`
 }
 
 // Request is the JSON envelope written to a WASM plugin's WASI stdin.
 type Request struct {
-	Action  string              `json:"action"`
-	Config  map[string]any      `json:"config,omitempty"`
-	Query   *plugins.MediaQuery `json:"query,omitempty"`
-	RawPath string              `json:"raw_path,omitempty"`
+	Action        string                       `json:"action"`
+	Config        map[string]any               `json:"config,omitempty"`
+	Query         *plugins.MediaQuery          `json:"query,omitempty"`
+	RawPath       string                       `json:"raw_path,omitempty"`
+	SubtitleQuery *plugins.SubtitleSearchQuery `json:"subtitle_query,omitempty"`
+	SubtitleID    string                       `json:"subtitle_id,omitempty"`
+}
+
+type hostHTTPRequestPayload struct {
+	Method  string            `json:"method"`
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Body    string            `json:"body,omitempty"`
+}
+
+type hostHTTPResponsePayload struct {
+	Status  int               `json:"status"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Body    string            `json:"body"`
 }
 
 // Host owns a pure-Go wazero runtime for executing WASI-based Ambra plugins.
@@ -102,12 +140,16 @@ type Host struct {
 	defaultTimeout time.Duration
 	sem            chan struct{}
 
-	mu     sync.Mutex
-	closed bool
+	mu         sync.RWMutex
+	httpClient *http.Client
+	customHTTP bool
+	logHook    func(pluginID string, level uint32, msg string)
+	closed     bool
 }
 
 // NewHost initializes a pure-Go wazero runtime with WASI preview1 support,
-// memory page limit (64 MiB), concurrency limiting, and context-cancellation enforcement.
+// the "ambra" host module (log + restricted http_request), memory page limit (64 MiB),
+// concurrency limiting, and context-cancellation enforcement.
 func NewHost(ctx context.Context) (*Host, error) {
 	rtCfg := wazero.NewRuntimeConfig().
 		WithCloseOnContextDone(true).
@@ -117,11 +159,203 @@ func NewHost(ctx context.Context) (*Host, error) {
 		_ = rt.Close(ctx)
 		return nil, fmt.Errorf("wasmhost: instantiate wasi: %w", err)
 	}
-	return &Host{
+
+	h := &Host{
 		runtime:        rt,
 		defaultTimeout: DefaultTimeout,
 		sem:            make(chan struct{}, defaultMaxConcurrentCalls),
-	}, nil
+		httpClient:     netutil.NewSafeHTTPClientNoLoopback(10*time.Second, false),
+	}
+
+	if _, err := rt.NewHostModuleBuilder("ambra").
+		NewFunctionBuilder().
+		WithFunc(h.hostLog).
+		Export("log").
+		NewFunctionBuilder().
+		WithFunc(h.hostHTTPRequest).
+		Export("http_request").
+		Instantiate(ctx); err != nil {
+		_ = rt.Close(ctx)
+		return nil, fmt.Errorf("wasmhost: instantiate ambra host module: %w", err)
+	}
+
+	return h, nil
+}
+
+// SetHTTPClient overrides the HTTP client used by ambra.http_request (intended for isolated unit tests).
+func (h *Host) SetHTTPClient(c *http.Client) {
+	if c == nil {
+		return
+	}
+	h.mu.Lock()
+	h.httpClient = c
+	h.customHTTP = true
+	h.mu.Unlock()
+}
+
+func (h *Host) hostLog(ctx context.Context, m api.Module, level uint32, msgPtr uint32, msgLen uint32) {
+	mem := m.Memory()
+	if mem == nil || msgLen == 0 {
+		return
+	}
+	if msgLen > maxHostLogMsgBytes {
+		msgLen = maxHostLogMsgBytes
+	}
+	raw, ok := mem.Read(msgPtr, msgLen)
+	if !ok {
+		return
+	}
+	msg := strings.TrimSpace(string(raw))
+	pluginID := "unknown"
+	if cc, ok := ctx.Value(wasmCallCtxKey{}).(wasmCallContext); ok && cc.pluginID != "" {
+		pluginID = cc.pluginID
+	}
+
+	h.mu.RLock()
+	hook := h.logHook
+	h.mu.RUnlock()
+	if hook != nil {
+		hook(pluginID, level, msg)
+	}
+
+	switch level {
+	case 0:
+		slog.Debug("wasm plugin log", "plugin_id", pluginID, "msg", msg)
+	case 2:
+		slog.Warn("wasm plugin log", "plugin_id", pluginID, "msg", msg)
+	case 3:
+		slog.Error("wasm plugin log", "plugin_id", pluginID, "msg", msg)
+	default:
+		slog.Info("wasm plugin log", "plugin_id", pluginID, "msg", msg)
+	}
+}
+
+func matchAllowedHost(targetHost string, allowedHosts []string) bool {
+	target := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(targetHost), "."))
+	if target == "" {
+		return false
+	}
+	for _, rawPattern := range allowedHosts {
+		pat := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(rawPattern), "."))
+		if pat == "" {
+			continue
+		}
+		if pat == "*" || pat == target {
+			return true
+		}
+		if strings.HasPrefix(pat, "*.") {
+			suffix := pat[1:] // ".example.com"
+			if len(suffix) > 1 && strings.HasSuffix(target, suffix) && len(target) > len(suffix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (h *Host) hostHTTPRequest(ctx context.Context, m api.Module, reqPtr uint32, reqLen uint32, respPtr uint32, respCap uint32) int32 {
+	mem := m.Memory()
+	if mem == nil || reqLen == 0 || reqLen > maxHostHTTPReqBytes {
+		return HostHTTPErrMemory
+	}
+	reqBytes, ok := mem.Read(reqPtr, reqLen)
+	if !ok {
+		return HostHTTPErrMemory
+	}
+
+	var reqPayload hostHTTPRequestPayload
+	if err := json.Unmarshal(reqBytes, &reqPayload); err != nil {
+		return HostHTTPErrBadRequest
+	}
+	rawURL := strings.TrimSpace(reqPayload.URL)
+	if rawURL == "" {
+		return HostHTTPErrBadRequest
+	}
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Hostname() == "" {
+		return HostHTTPErrBadRequest
+	}
+
+	cc, _ := ctx.Value(wasmCallCtxKey{}).(wasmCallContext)
+	if len(cc.allowedHosts) > 0 && !matchAllowedHost(parsedURL.Hostname(), cc.allowedHosts) {
+		return HostHTTPErrForbidden
+	}
+
+	h.mu.RLock()
+	client := h.httpClient
+	customHTTP := h.customHTTP
+	h.mu.RUnlock()
+
+	if !customHTTP {
+		if err := netutil.ValidateRemoteURLNoLoopback(rawURL, false); err != nil {
+			return HostHTTPErrForbidden
+		}
+	} else if ip := net.ParseIP(parsedURL.Hostname()); ip != nil {
+		// Even in custom-client test mode, block cloud metadata / link-local / unspecified IP literals.
+		if err := netutil.ValidateIP(ip, true); err != nil {
+			return HostHTTPErrForbidden
+		}
+	}
+
+	method := strings.ToUpper(strings.TrimSpace(reqPayload.Method))
+	if method == "" {
+		method = http.MethodGet
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	var bodyReader io.Reader
+	if reqPayload.Body != "" {
+		bodyReader = strings.NewReader(reqPayload.Body)
+	}
+	httpReq, err := http.NewRequestWithContext(reqCtx, method, rawURL, bodyReader)
+	if err != nil {
+		return HostHTTPErrBadRequest
+	}
+	for k, v := range reqPayload.Headers {
+		if strings.TrimSpace(k) != "" {
+			httpReq.Header.Set(k, v)
+		}
+	}
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return HostHTTPErrNetwork
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxHostHTTPRespBytes+1))
+	if err != nil {
+		return HostHTTPErrNetwork
+	}
+	if len(respBody) > maxHostHTTPRespBytes {
+		return HostHTTPErrTooLarge
+	}
+
+	flatHeaders := make(map[string]string, len(resp.Header))
+	for k, vals := range resp.Header {
+		if len(vals) > 0 {
+			flatHeaders[k] = strings.Join(vals, ", ")
+		}
+	}
+
+	outBytes, err := json.Marshal(hostHTTPResponsePayload{
+		Status:  resp.StatusCode,
+		Headers: flatHeaders,
+		Body:    string(respBody),
+	})
+	if err != nil {
+		return HostHTTPErrNetwork
+	}
+
+	if uint32(len(outBytes)) > respCap {
+		return -int32(len(outBytes))
+	}
+	if !mem.Write(respPtr, outBytes) {
+		return HostHTTPErrMemory
+	}
+	return int32(len(outBytes))
 }
 
 // Close releases all compiled modules and runtime resources.
@@ -138,6 +372,11 @@ func (h *Host) Close(ctx context.Context) error {
 
 // LoadModule compiles a WASM binary in memory and returns an executable WasmPlugin.
 func (h *Host) LoadModule(ctx context.Context, manifest plugins.Manifest, wasmBytes []byte, timeout time.Duration) (*WasmPlugin, error) {
+	return h.LoadModuleWithAllowedHosts(ctx, manifest, nil, wasmBytes, timeout)
+}
+
+// LoadModuleWithAllowedHosts compiles a WASM binary with an optional host allowlist for ambra.http_request.
+func (h *Host) LoadModuleWithAllowedHosts(ctx context.Context, manifest plugins.Manifest, allowedHosts []string, wasmBytes []byte, timeout time.Duration) (*WasmPlugin, error) {
 	manifest.BuiltIn = false
 	if plugins.IsBuiltInID(manifest.ID) {
 		return nil, fmt.Errorf("wasmhost: external plugin id %q cannot use reserved prefix %q", manifest.ID, plugins.BuiltInIDPrefix)
@@ -158,13 +397,21 @@ func (h *Host) LoadModule(ctx context.Context, manifest plugins.Manifest, wasmBy
 	if timeout > maxPluginTimeout {
 		timeout = maxPluginTimeout
 	}
+	var cleanedHosts []string
+	for _, host := range allowedHosts {
+		if th := strings.TrimSpace(host); th != "" {
+			cleanedHosts = append(cleanedHosts, th)
+		}
+	}
 	return &WasmPlugin{
-		host:     h,
-		manifest: manifest,
-		compiled: compiled,
-		timeout:  timeout,
-		enabled:  manifest.Enabled,
-		config:   make(map[string]any),
+		host:         h,
+		manifest:     manifest,
+		allowedHosts: cleanedHosts,
+		compiled:     compiled,
+		timeout:      timeout,
+		enabled:      manifest.Enabled,
+		priority:     manifest.Priority,
+		config:       make(map[string]any),
 	}, nil
 }
 
@@ -310,7 +557,7 @@ func (h *Host) LoadFromDir(ctx context.Context, dir string, reg *plugins.Registr
 			timeout = time.Duration(ms) * time.Millisecond
 		}
 
-		wp, err := h.LoadModule(ctx, pm.Manifest, wasmBytes, timeout)
+		wp, err := h.LoadModuleWithAllowedHosts(ctx, pm.Manifest, pm.AllowedHosts, wasmBytes, timeout)
 		if err != nil {
 			slog.Warn("wasmhost: compile plugin failed, skipping", "plugin_id", pm.ID, "err", err)
 			continue
@@ -323,36 +570,59 @@ func (h *Host) LoadFromDir(ctx context.Context, dir string, reg *plugins.Registr
 	return loaded, nil
 }
 
-// WasmPlugin wraps a compiled WASM module implementing Plugin, MetadataProvider, and StreamResolver.
+// WasmPlugin wraps a compiled WASM module implementing Plugin, MetadataProvider, StreamResolver, and SubtitleProvider.
 type WasmPlugin struct {
-	host     *Host
-	manifest plugins.Manifest
-	compiled wazero.CompiledModule
-	timeout  time.Duration
+	host         *Host
+	manifest     plugins.Manifest
+	allowedHosts []string
+	compiled     wazero.CompiledModule
+	timeout      time.Duration
 
-	mu      sync.RWMutex
-	enabled bool
-	config  map[string]any
+	mu       sync.RWMutex
+	enabled  bool
+	priority int
+	config   map[string]any
 }
 
 var (
-	_ plugins.Plugin           = (*WasmPlugin)(nil)
-	_ plugins.MetadataProvider = (*WasmPlugin)(nil)
-	_ plugins.StreamResolver   = (*WasmPlugin)(nil)
+	_ plugins.Plugin                = (*WasmPlugin)(nil)
+	_ plugins.MetadataProvider      = (*WasmPlugin)(nil)
+	_ plugins.StreamResolver        = (*WasmPlugin)(nil)
+	_ plugins.SubtitleProvider      = (*WasmPlugin)(nil)
+	_ plugins.DefaultConfigExporter = (*WasmPlugin)(nil)
 )
 
-// Manifest returns the plugin's static metadata with current enabled status.
+// Manifest returns the plugin's metadata with current enabled status and priority.
 func (p *WasmPlugin) Manifest() plugins.Manifest {
 	p.mu.RLock()
 	enabled := p.enabled
+	priority := p.priority
 	p.mu.RUnlock()
 	m := p.manifest
 	m.Enabled = enabled
+	m.Priority = priority
+	m.Kinds = append([]plugins.Kind(nil), m.Kinds...)
 	return m
+}
+
+// DefaultConfig exports the active plugin configuration.
+func (p *WasmPlugin) DefaultConfig() map[string]any {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make(map[string]any, len(p.config)+2)
+	for k, v := range p.config {
+		out[k] = v
+	}
+	out["enabled"] = p.enabled
+	out["priority"] = p.priority
+	return out
 }
 
 // Configure replaces the runtime configuration passed to the WASM module on each invocation.
 func (p *WasmPlugin) Configure(cfg map[string]any) error {
+	if cfg == nil {
+		return nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	copied := make(map[string]any, len(cfg))
@@ -363,6 +633,19 @@ func (p *WasmPlugin) Configure(cfg map[string]any) error {
 		p.enabled = v
 	} else if v, ok := cfg["Enabled"].(bool); ok {
 		p.enabled = v
+	}
+	for _, k := range []string{"priority", "Priority"} {
+		if raw, exists := cfg[k]; exists {
+			switch n := raw.(type) {
+			case int:
+				p.priority = n
+			case int64:
+				p.priority = int(n)
+			case float64:
+				p.priority = int(n)
+			}
+			break
+		}
 	}
 	p.config = copied
 	return nil
@@ -440,6 +723,109 @@ func (p *WasmPlugin) ResolveStream(ctx context.Context, rawPath string) (*plugin
 	return &res, nil
 }
 
+// SearchSubtitles invokes the WASM plugin with Action="search_subtitles" when KindSubtitle is enabled.
+func (p *WasmPlugin) SearchSubtitles(ctx context.Context, q plugins.SubtitleSearchQuery) ([]plugins.RemoteSubtitleInfo, error) {
+	if !p.supports(plugins.KindSubtitle) {
+		return nil, nil
+	}
+	req := Request{
+		Action:        "search_subtitles",
+		Config:        p.snapshotConfig(),
+		SubtitleQuery: &q,
+	}
+	out, err := p.invoke(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	trimmed := bytes.TrimSpace(out)
+	if len(trimmed) == 0 {
+		return nil, nil
+	}
+	if trimmed[0] == '[' {
+		var list []plugins.RemoteSubtitleInfo
+		if err := json.Unmarshal(trimmed, &list); err != nil {
+			return nil, fmt.Errorf("wasmhost: decode subtitle list from %q: %w", p.manifest.ID, err)
+		}
+		return list, nil
+	}
+	var wrapped struct {
+		Subtitles []plugins.RemoteSubtitleInfo `json:"subtitles"`
+		Results   []plugins.RemoteSubtitleInfo `json:"results"`
+	}
+	if err := json.Unmarshal(trimmed, &wrapped); err != nil {
+		return nil, fmt.Errorf("wasmhost: decode subtitle response from %q: %w", p.manifest.ID, err)
+	}
+	if len(wrapped.Subtitles) > 0 {
+		return wrapped.Subtitles, nil
+	}
+	return wrapped.Results, nil
+}
+
+// DownloadSubtitle invokes the WASM plugin with Action="download_subtitle" when KindSubtitle is enabled.
+func (p *WasmPlugin) DownloadSubtitle(ctx context.Context, subtitleID string) (*plugins.SubtitleDownloadResult, error) {
+	if !p.supports(plugins.KindSubtitle) {
+		return nil, nil
+	}
+	req := Request{
+		Action:     "download_subtitle",
+		Config:     p.snapshotConfig(),
+		SubtitleID: subtitleID,
+	}
+	out, err := p.invoke(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	trimmed := bytes.TrimSpace(out)
+	if len(trimmed) == 0 {
+		return nil, nil
+	}
+	var resp struct {
+		Language      string `json:"language"`
+		LanguageUpper string `json:"Language"`
+		Format        string `json:"format"`
+		FormatUpper   string `json:"Format"`
+		Content       any    `json:"content"`
+		ContentUpper  any    `json:"Content"`
+		ContentBase64 string `json:"content_base64"`
+	}
+	if err := json.Unmarshal(trimmed, &resp); err != nil {
+		return nil, fmt.Errorf("wasmhost: decode subtitle download from %q: %w", p.manifest.ID, err)
+	}
+	lang := strings.TrimSpace(resp.Language)
+	if lang == "" {
+		lang = strings.TrimSpace(resp.LanguageUpper)
+	}
+	format := strings.TrimSpace(resp.Format)
+	if format == "" {
+		format = strings.TrimSpace(resp.FormatUpper)
+	}
+	var content []byte
+	if resp.ContentBase64 != "" {
+		decoded, decErr := base64.StdEncoding.DecodeString(resp.ContentBase64)
+		if decErr != nil {
+			return nil, fmt.Errorf("wasmhost: decode base64 subtitle from %q: %w", p.manifest.ID, decErr)
+		}
+		content = decoded
+	} else {
+		rawContent := resp.Content
+		if rawContent == nil {
+			rawContent = resp.ContentUpper
+		}
+		if s, isStr := rawContent.(string); isStr {
+			if decoded, decErr := base64.StdEncoding.DecodeString(s); decErr == nil && len(decoded) > 0 && !strings.Contains(s, "-->") {
+				content = decoded
+			} else {
+				content = []byte(s)
+			}
+		}
+	}
+	return &plugins.SubtitleDownloadResult{
+		Language: lang,
+		Format:   format,
+		Content:  content,
+	}, nil
+}
+
 func (p *WasmPlugin) snapshotConfig() map[string]any {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -468,7 +854,11 @@ func (p *WasmPlugin) invoke(ctx context.Context, req Request) ([]byte, error) {
 		}
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	ctxWithMeta := context.WithValue(ctx, wasmCallCtxKey{}, wasmCallContext{
+		pluginID:     p.manifest.ID,
+		allowedHosts: p.allowedHosts,
+	})
+	callCtx, cancel := context.WithTimeout(ctxWithMeta, p.timeout)
 	defer cancel()
 
 	stdout := &limitedBuffer{limit: maxWasmStdoutBytes, cancel: cancel}

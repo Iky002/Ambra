@@ -461,3 +461,101 @@ EOF
 		t.Fatalf("unexpected probed audio stream: %+v", srcs[0])
 	}
 }
+
+func TestAudioRescanPreservesLockedMetadata(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	repo := sqlite.NewLibraryRepo(store)
+	media := filepath.Join(dir, "music")
+	if err := os.MkdirAll(filepath.Join(media, "InitialArtist", "InitialAlbum"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(media, "InitialArtist", "InitialAlbum", "Original.mp3")
+	if err := os.WriteFile(p, []byte("audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	lib, err := repo.CreateLibrary(ctx, "Music", "music", []string{media})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := New(repo, nil, nil, config.Default(dir))
+	sc.SetProber(NewDisabledProber())
+	if _, err := sc.ScanLibrary(ctx, lib.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, err := repo.FindItemByPath(ctx, lib.ID, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origCreated := int64(1700001234)
+	rec.DateCreated = origCreated
+	rec.Name = "Manually Locked Title"
+	rec.SortName = "custom-sort-name"
+	rec.Extra.LockData = true
+	rec.Extra.LockedFields = []string{"Name", "SortName", "Album", "AlbumArtist", "Artists", "Genres", "People"}
+	rec.Extra.Album = "Manual Locked Album"
+	rec.Extra.AlbumArtist = "Manual Locked AlbumArtist"
+	rec.Extra.Artists = []string{"Manual Locked Artist"}
+	rec.Extra.ProviderIDs = map[string]string{"MusicBrainzTrack": "manual-id"}
+	if err := repo.UpsertItem(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Writer.ExecContext(ctx, `UPDATE items SET date_created = ? WHERE id = ?`, origCreated, rec.ID); err != nil {
+		t.Fatal(err)
+	}
+	_ = repo.ReplaceItemTaxonomies(ctx, rec.ID, "genre", []string{"CustomJazz"})
+	_ = repo.ReplaceItemPeople(ctx, rec.ID, []sqlite.PersonInput{{Name: "Custom Performer", Type: "Artist"}})
+
+	// 1. Rescan with LockData=true after file modification
+	if err := os.WriteFile(p, []byte("changed audio bytes v2"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sc.ScanPath(ctx, lib.ID, p); err != nil {
+		t.Fatal(err)
+	}
+	got, err := repo.GetItemRecordByID(ctx, rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "Manually Locked Title" || !got.Extra.LockData || got.Extra.ProviderIDs["MusicBrainzTrack"] != "manual-id" {
+		t.Fatalf("audio rescan overwrote locked manual metadata: %+v", got)
+	}
+	if got.DateCreated != origCreated || got.SortName != "custom-sort-name" {
+		t.Fatalf("expected DateCreated=%d SortName=custom-sort-name preserved, got DateCreated=%d SortName=%q", origCreated, got.DateCreated, got.SortName)
+	}
+	if got.Extra.Album != "Manual Locked Album" || got.Extra.AlbumArtist != "Manual Locked AlbumArtist" || len(got.Extra.Artists) != 1 || got.Extra.Artists[0] != "Manual Locked Artist" {
+		t.Fatalf("expected audio Extra fields preserved, got %+v", got.Extra)
+	}
+
+	// 2. Rescan & probe with LockData=false and field-level LockedFields
+	got.Extra.LockData = false
+	if err := repo.UpsertItem(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	applyAudioProbeTags(got, map[string]string{
+		"title":        "Probed Title",
+		"album":        "Probed Album",
+		"artist":       "Probed Artist",
+		"album_artist": "Probed AlbumArtist",
+	})
+	_ = sc.applyAudioProbeRelations(ctx, got, map[string]string{"genre": "Rock", "artist": "Probed Artist"})
+	if got.Name != "Manually Locked Title" || got.SortName != "custom-sort-name" || got.Extra.Album != "Manual Locked Album" || got.Extra.AlbumArtist != "Manual Locked AlbumArtist" || got.Extra.Artists[0] != "Manual Locked Artist" {
+		t.Fatalf("field-level audio locks failed against probe tags: %+v", got)
+	}
+	genres, _, _, _ := repo.GetTaxonomiesByItemID(ctx, got.ID)
+	people, _ := repo.GetPeopleByItemID(ctx, got.ID)
+	if len(genres) != 1 || genres[0] != "CustomJazz" {
+		t.Fatalf("expected locked Genres=[CustomJazz] preserved, got %v", genres)
+	}
+	if len(people) != 1 || people[0].Name != "Custom Performer" {
+		t.Fatalf("expected locked People=[Custom Performer] preserved, got %+v", people)
+	}
+}

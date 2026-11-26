@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -434,10 +435,10 @@ func (r *LibraryRepo) MergeItemVersions(ctx context.Context, itemIDs []string) (
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO user_item_data (
 				user_id, item_id, played, play_count, playback_position_ticks,
-				is_favorite, last_played_date, audio_stream_index, subtitle_stream_index
+				is_favorite, likes, last_played_date, audio_stream_index, subtitle_stream_index
 			)
 			SELECT user_id, ?, played, play_count, playback_position_ticks,
-			       is_favorite, last_played_date, audio_stream_index, subtitle_stream_index
+			       is_favorite, likes, last_played_date, audio_stream_index, subtitle_stream_index
 			FROM user_item_data
 			WHERE item_id = ?
 			ON CONFLICT(user_id, item_id) DO UPDATE SET
@@ -449,6 +450,7 @@ func (r *LibraryRepo) MergeItemVersions(ctx context.Context, itemIDs []string) (
 					ELSE MAX(user_item_data.playback_position_ticks, excluded.playback_position_ticks)
 				END,
 				is_favorite = MAX(user_item_data.is_favorite, excluded.is_favorite),
+				likes = COALESCE(user_item_data.likes, excluded.likes),
 				last_played_date = CASE
 					WHEN user_item_data.last_played_date IS NULL THEN excluded.last_played_date
 					WHEN excluded.last_played_date IS NULL THEN user_item_data.last_played_date
@@ -604,6 +606,7 @@ func (r *LibraryRepo) SplitItemVersions(ctx context.Context, itemID string) ([]s
 		itemID,
 	).Scan(&ftsTitleRaw, &ftsTitleTokens, &ftsPinyinFull, &ftsPinyinInit, &ftsPeople) == nil
 
+	primary.Extra.PreventAutoMerge = true
 	extraRaw, err := json.Marshal(primary.Extra)
 	if err != nil {
 		return nil, err
@@ -611,6 +614,17 @@ func (r *LibraryRepo) SplitItemVersions(ctx context.Context, itemID string) ([]s
 
 	now := time.Now().Unix()
 	createdIDs := make([]string, 0, len(sources)-1)
+
+	statFileMtime := func(p string, remote bool) *int64 {
+		if remote || strings.TrimSpace(p) == "" {
+			return nil
+		}
+		if st, stErr := os.Stat(p); stErr == nil && !st.IsDir() {
+			mt := st.ModTime().Unix()
+			return &mt
+		}
+		return nil
+	}
 
 	for _, src := range sources[1:] {
 		newID := guid.New()
@@ -625,6 +639,7 @@ func (r *LibraryRepo) SplitItemVersions(ctx context.Context, itemID string) ([]s
 			sz := src.Size
 			fileSize = &sz
 		}
+		fileMtime := statFileMtime(src.Path, src.IsRemote)
 		container := src.Container
 		if container == "" {
 			container = primary.Container
@@ -646,7 +661,7 @@ func (r *LibraryRepo) SplitItemVersions(ctx context.Context, itemID string) ([]s
 				?, ?, ?,
 				?, ?, ?,
 				?, ?, ?, ?, ?,
-				?, ?, ?, ?, NULL,
+				?, ?, ?, ?, ?,
 				?, ?, ?, ?,
 				?, ?, ?
 			)`,
@@ -655,7 +670,7 @@ func (r *LibraryRepo) SplitItemVersions(ctx context.Context, itemID string) ([]s
 			primary.Name, nullStr(primary.OriginalTitle), primary.SortName,
 			primary.IndexNumber, primary.ParentIndexNumber, primary.ProductionYear,
 			primary.PremiereDate, primary.EndDate, primary.CommunityRating, primary.CriticRating, nullStr(primary.OfficialRating),
-			rt, nullStr(container), nullStr(src.Path), fileSize,
+			rt, nullStr(container), nullStr(src.Path), fileSize, fileMtime,
 			guid.New()[:16], string(extraRaw), now, now,
 			sortKey, extraType, parentalRatingValue,
 		); err != nil {
@@ -739,11 +754,15 @@ func (r *LibraryRepo) SplitItemVersions(ctx context.Context, itemID string) ([]s
 		sz := firstSrc.Size
 		firstSize = &sz
 	}
+	firstMtime := statFileMtime(firstSrc.Path, firstSrc.IsRemote)
+	if firstMtime == nil && firstSrc.Path == primary.Path {
+		firstMtime = primary.FileMtime
+	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE items
-		SET path = ?, container = ?, file_size = ?, is_strm = ?, runtime_ticks = ?, date_modified = ?, etag = ?
+		SET path = ?, container = ?, file_size = ?, file_mtime = ?, is_strm = ?, runtime_ticks = ?, extra_json = ?, date_modified = ?, etag = ?
 		WHERE id = ?`,
-		nullStr(firstSrc.Path), nullStr(firstContainer), firstSize, boolToInt(firstIsStrm), firstRT,
+		nullStr(firstSrc.Path), nullStr(firstContainer), firstSize, firstMtime, boolToInt(firstIsStrm), firstRT, string(extraRaw),
 		now, guid.New()[:16], itemID,
 	); err != nil {
 		return nil, err

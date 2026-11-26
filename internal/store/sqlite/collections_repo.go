@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -99,7 +100,18 @@ func (r *LibraryRepo) CreateCollection(ctx context.Context, name, parentID strin
 			return nil, err
 		}
 	}
+	r.InvalidateCountCache()
 	return rec, nil
+}
+
+// ListCollections queries BoxSet collections visible to the caller, applying AllowedLibraryIDs
+// and parental control policies so restricted users see collections containing >= 1 accessible child.
+func (r *LibraryRepo) ListCollections(ctx context.Context, f ItemFilter) ([]dto.BaseItemDto, int, error) {
+	f.IncludeItemTypes = []string{"BoxSet"}
+	if f.LibraryID != "" && !strings.EqualFold(f.LibraryID, "collections") {
+		f.LibraryID = ""
+	}
+	return r.QueryItems(ctx, f)
 }
 
 // CreatePlaylist creates a new Playlist item and optionally populates it with initial items.
@@ -461,17 +473,25 @@ func (r *LibraryRepo) DeleteItemByPath(ctx context.Context, libraryID, path stri
 			newEtag := guid.New()[:16]
 			if item.Path == path {
 				isStrm := remaining.isRemote || strings.EqualFold(remaining.container, "strm")
+				var promotedMtime *int64
+				if !remaining.isRemote && strings.TrimSpace(remaining.path) != "" {
+					if st, stErr := os.Stat(remaining.path); stErr == nil && !st.IsDir() {
+						mt := st.ModTime().Unix()
+						promotedMtime = &mt
+					}
+				}
 				if _, err := tx.ExecContext(ctx, `
 					UPDATE items
 					SET path = ?,
 					    container = ?,
 					    file_size = ?,
+					    file_mtime = ?,
 					    is_strm = ?,
 					    etag = ?,
 					    runtime_ticks = CASE WHEN ? > 0 THEN ? ELSE runtime_ticks END,
 					    date_modified = ?
 					WHERE id = ?`,
-					remaining.path, nullStr(remaining.container), remaining.size,
+					remaining.path, nullStr(remaining.container), remaining.size, promotedMtime,
 					boolToInt(isStrm), newEtag, remaining.runtimeTicks, remaining.runtimeTicks,
 					now, item.ID,
 				); err != nil {
@@ -489,6 +509,7 @@ func (r *LibraryRepo) DeleteItemByPath(ctx context.Context, libraryID, path stri
 				return false, err
 			}
 			txActive = false
+			r.InvalidateCountCache()
 			return true, nil
 		}
 	}
@@ -576,6 +597,9 @@ func (r *LibraryRepo) AddItemsToContainer(ctx context.Context, containerID strin
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
+	if added > 0 {
+		r.InvalidateCountCache()
+	}
 	return added, nil
 }
 
@@ -621,6 +645,9 @@ func (r *LibraryRepo) RemoveItemsFromContainer(ctx context.Context, containerID 
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
+	}
+	if removed > 0 {
+		r.InvalidateCountCache()
 	}
 	return removed, nil
 }
@@ -763,6 +790,34 @@ func (r *LibraryRepo) GetContainerItemsWithPolicy(
 	maxParentalRating *int,
 	blockedTags []string,
 ) ([]PlaylistItemDto, int, error) {
+	pol := dto.UserPolicy{
+		EnableAllFolders:  allowedLibraryIDs == nil,
+		MaxParentalRating: maxParentalRating,
+		BlockedTags:       blockedTags,
+	}
+	if uid := guid.Normalize(userID); uid != "" {
+		if uPol, _, ok := r.loadRestrictedUserPolicy(ctx, uid); ok {
+			if len(uPol.BlockUnratedItems) > 0 {
+				pol.BlockUnratedItems = uPol.BlockUnratedItems
+			}
+			if len(uPol.AllowedTags) > 0 {
+				pol.AllowedTags = uPol.AllowedTags
+			}
+		}
+	}
+	return r.GetContainerItemsWithUserPolicy(ctx, serverID, userID, containerID, startIndex, limit, fields, allowedLibraryIDs, pol)
+}
+
+// GetContainerItemsWithUserPolicy returns ordered items belonging to a BoxSet or Playlist
+// while enforcing library RBAC and the full user parental policy.
+func (r *LibraryRepo) GetContainerItemsWithUserPolicy(
+	ctx context.Context,
+	serverID, userID, containerID string,
+	startIndex, limit int,
+	fields []string,
+	allowedLibraryIDs []string,
+	policy dto.UserPolicy,
+) ([]PlaylistItemDto, int, error) {
 	containerID = guid.Normalize(containerID)
 	var exists int
 	if err := r.store.Reader.QueryRowContext(ctx, `SELECT 1 FROM items WHERE id = ?`, containerID).Scan(&exists); err != nil {
@@ -775,22 +830,8 @@ func (r *LibraryRepo) GetContainerItemsWithPolicy(
 		return []PlaylistItemDto{}, 0, nil
 	}
 
-	var (
-		policyConds []string
-		policyArgs  []any
-	)
-	if len(allowedLibraryIDs) > 0 {
-		ph := make([]string, len(allowedLibraryIDs))
-		for i, lid := range allowedLibraryIDs {
-			ph[i] = "?"
-			policyArgs = append(policyArgs, guid.Normalize(lid))
-		}
-		policyConds = append(policyConds, fmt.Sprintf(`i.library_id IN (%s)`, strings.Join(ph, ",")))
-	}
-	if pClauses, pArgs := appendParentalFilterSQL("i", maxParentalRating, blockedTags); len(pClauses) > 0 {
-		policyConds = append(policyConds, pClauses...)
-		policyArgs = append(policyArgs, pArgs...)
-	}
+	pPolicy := policyFromUserPolicy(policy)
+	policyConds, policyArgs := buildLibraryAndPolicyWhere("i", allowedLibraryIDs, pPolicy)
 	policySQL := ""
 	if len(policyConds) > 0 {
 		policySQL = " AND " + strings.Join(policyConds, " AND ")
@@ -824,7 +865,7 @@ func (r *LibraryRepo) GetContainerItemsWithPolicy(
 			       i.runtime_ticks, i.container, i.path, i.file_size, i.file_mtime,
 			       i.etag, i.extra_json, i.date_created, i.date_modified,
 			       COALESCE(u.played, 0), COALESCE(u.play_count, 0), COALESCE(u.playback_position_ticks, 0),
-			       COALESCE(u.is_favorite, 0), u.last_played_date
+			       COALESCE(u.is_favorite, 0), u.likes, u.last_played_date
 			FROM item_collections ic
 			JOIN items i ON i.id = ic.item_id
 			LEFT JOIN user_item_data u ON u.item_id = i.id AND u.user_id = ?
@@ -882,7 +923,7 @@ func (r *LibraryRepo) GetContainerItemsWithPolicy(
 		return nil, 0, err
 	}
 
-	baseDTOs, err := r.hydrateDTOs(ctx, recs, uds, serverID, userID, fields, false)
+	baseDTOs, err := r.hydrateDTOsWithPolicy(ctx, recs, uds, serverID, userID, fields, false, pPolicy, allowedLibraryIDs)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -926,6 +967,7 @@ func scanContainerItemRow(rows *sql.Rows, hasUser bool) (string, ItemRecord, *dt
 	var (
 		played, playCount, fav int
 		pos                    int64
+		likes                  sql.NullInt64
 		lastPlayed             sql.NullInt64
 	)
 	err := rows.Scan(
@@ -937,7 +979,7 @@ func scanContainerItemRow(rows *sql.Rows, hasUser bool) (string, ItemRecord, *dt
 		&rec.PremiereDate, &rec.EndDate, &rec.CommunityRating, &rec.CriticRating, &offRate,
 		&rec.RuntimeTicks, &container, &path, &rec.FileSize, &rec.FileMtime,
 		&rec.Etag, &extraRaw, &rec.DateCreated, &rec.DateModified,
-		&played, &playCount, &pos, &fav, &lastPlayed,
+		&played, &playCount, &pos, &fav, &likes, &lastPlayed,
 	)
 	if err != nil {
 		return "", rec, nil, err
@@ -949,6 +991,10 @@ func scanContainerItemRow(rows *sql.Rows, hasUser bool) (string, ItemRecord, *dt
 		IsFavorite:            fav == 1,
 		Played:                played == 1,
 		Key:                   rec.ID,
+	}
+	if likes.Valid {
+		liked := likes.Int64 != 0
+		ud.Likes = &liked
 	}
 	if lastPlayed.Valid && lastPlayed.Int64 > 0 {
 		t := time.Unix(lastPlayed.Int64, 0).UTC()

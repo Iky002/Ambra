@@ -10,10 +10,25 @@ import (
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
-// RefreshItem refreshes metadata, relations, FTS index, and remote artwork for a single item.
+// RefreshOptions configures single-item metadata, subtitle, and image refresh behavior.
+type RefreshOptions struct {
+	ReplaceMetadata            bool
+	ReplaceImages              bool
+	ForceOverwriteCustomImages bool
+}
+
+// RefreshItem refreshes metadata, external subtitles, local/remote artwork, relations, and FTS index.
 // When replaceMetadata is true, non-locked fields are overwritten even if already populated.
 // When replaceImages is true, existing cached remote images are re-downloaded and replaced.
 func (s *Scanner) RefreshItem(ctx context.Context, itemID string, replaceMetadata, replaceImages bool) error {
+	return s.RefreshItemWithOptions(ctx, itemID, RefreshOptions{
+		ReplaceMetadata: replaceMetadata,
+		ReplaceImages:   replaceImages,
+	})
+}
+
+// RefreshItemWithOptions refreshes a single item with fine-grained overwrite options.
+func (s *Scanner) RefreshItemWithOptions(ctx context.Context, itemID string, opts RefreshOptions) error {
 	rec, err := s.repo.GetItemRecordByID(ctx, itemID)
 	if err != nil {
 		return err
@@ -21,6 +36,15 @@ func (s *Scanner) RefreshItem(ctx context.Context, itemID string, replaceMetadat
 	if rec.Extra.LockData {
 		return nil
 	}
+
+	var lib *sqlite.LibraryRecord
+	if strings.TrimSpace(rec.LibraryID) != "" {
+		lib, _ = s.repo.GetLibrary(ctx, rec.LibraryID)
+	}
+
+	// Always rediscover companion external subtitle streams and local artwork on refresh.
+	_, _ = s.rescanItemExternalSubtitles(ctx, lib, rec)
+	_, _ = s.rescanItemLocalImages(ctx, lib, rec, opts.ForceOverwriteCustomImages)
 
 	q := plugins.MediaQuery{
 		ItemType:      rec.Type,
@@ -37,7 +61,7 @@ func (s *Scanner) RefreshItem(ctx context.Context, itemID string, replaceMetadat
 	itemTypeLower := strings.ToLower(rec.Type)
 	if itemTypeLower == "movie" && rec.Path != "" && getProviderID(q.ProviderIDs, "tmdb") == "" {
 		var rootDir string
-		if lib, libErr := s.repo.GetLibrary(ctx, rec.LibraryID); libErr == nil && lib != nil {
+		if lib != nil {
 			rootDir = findContainingRoot(lib.Paths, rec.Path)
 		}
 		reparsed := ParseMoviePath(rootDir, rec.Path)
@@ -82,12 +106,53 @@ func (s *Scanner) RefreshItem(ctx context.Context, itemID string, replaceMetadat
 		}
 	}
 
-	meta := s.fetchMetadataFiltered(ctx, q, false)
+	var meta *plugins.MetadataResult
+	localMeta := s.fetchLibraryMetadataFiltered(ctx, lib, q, true)
+	if localMeta != nil && len(localMeta.ProviderIDs) > 0 {
+		if q.ProviderIDs == nil {
+			q.ProviderIDs = make(map[string]string)
+		}
+		for k, v := range localMeta.ProviderIDs {
+			if getProviderID(q.ProviderIDs, k) == "" && strings.TrimSpace(v) != "" {
+				q.ProviderIDs[k] = strings.TrimSpace(v)
+			}
+		}
+	}
+	onlineMeta := s.fetchLibraryMetadataFiltered(ctx, lib, q, false)
+	if opts.ReplaceMetadata {
+		// Online metadata takes precedence when replacing all metadata; fall back to local NFO if offline/no online match.
+		if onlineMeta != nil {
+			cp := *onlineMeta
+			if cp.ProviderIDs == nil {
+				cp.ProviderIDs = make(map[string]string)
+			}
+			if localMeta != nil {
+				mergeMetadata(&cp, localMeta)
+			}
+			meta = &cp
+		} else {
+			meta = localMeta
+		}
+	} else {
+		// When filling missing metadata, apply newly added/edited local NFO first, then fill missing from online.
+		if localMeta != nil {
+			cp := *localMeta
+			if cp.ProviderIDs == nil {
+				cp.ProviderIDs = make(map[string]string)
+			}
+			if onlineMeta != nil {
+				mergeMetadata(&cp, onlineMeta)
+			}
+			meta = &cp
+		} else {
+			meta = onlineMeta
+		}
+	}
 	if meta == nil {
 		return nil
 	}
 
-	applyRefreshMetadataToItem(rec, meta, replaceMetadata)
+	applyRefreshMetadataToItem(rec, meta, opts.ReplaceMetadata)
 	rec.DateModified = time.Now().Unix()
 	rec.Etag = guid.New()[:16]
 
@@ -97,8 +162,8 @@ func (s *Scanner) RefreshItem(ctx context.Context, itemID string, replaceMetadat
 
 	relMeta := filterLockedRelations(rec, meta)
 	s.persistMetaRelationsAndFTS(ctx, rec, relMeta)
-	s.downloadAndSaveRemoteImagesForce(ctx, rec, meta, replaceImages)
-	s.saveLocalNFOIfEnabled(ctx, rec, relMeta, replaceMetadata)
+	s.downloadAndSaveRemoteImagesForce(ctx, rec, meta, opts.ReplaceImages)
+	s.saveLocalNFOIfEnabled(ctx, rec, relMeta, opts.ReplaceMetadata)
 	if strings.EqualFold(rec.Type, "Movie") && meta.Collection != nil {
 		s.ensureAutoBoxSet(ctx, rec, meta.Collection)
 	}
@@ -115,9 +180,11 @@ func applyRefreshMetadataToItem(rec *sqlite.ItemRecord, meta *plugins.MetadataRe
 		return
 	}
 
-	if meta.Name != "" && !isFieldLocked(rec, "Name") {
+	if meta.Name != "" && !isExtraFieldLocked(&rec.Extra, "Name") {
 		rec.Name = meta.Name
-		rec.SortName = strings.ToLower(meta.Name)
+		if !isExtraFieldLocked(&rec.Extra, "SortName") {
+			rec.SortName = strings.ToLower(meta.Name)
+		}
 	}
 	if meta.OriginalTitle != "" && !isFieldLocked(rec, "OriginalTitle") {
 		rec.OriginalTitle = meta.OriginalTitle

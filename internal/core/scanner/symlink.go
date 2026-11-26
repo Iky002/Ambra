@@ -107,6 +107,16 @@ func WalkSafe(root string, policy SymlinkPolicy, fn func(path string, info os.Fi
 // WalkSafeWithStartDepth behaves like WalkSafe while starting symlink depth tracking
 // at startDepth (e.g. relative hop count from library root during incremental ScanPath).
 func WalkSafeWithStartDepth(root string, startDepth int, policy SymlinkPolicy, fn func(path string, info os.FileInfo) error) error {
+	return walkSafeInternal("", root, startDepth, policy, fn)
+}
+
+// WalkSafeWithinRoot traverses walkRoot while enforcing that every symbolic link encountered
+// resolves within boundaryRoot (when boundaryRoot is non-empty).
+func WalkSafeWithinRoot(boundaryRoot, walkRoot string, startDepth int, policy SymlinkPolicy, fn func(path string, info os.FileInfo) error) error {
+	return walkSafeInternal(boundaryRoot, walkRoot, startDepth, policy, fn)
+}
+
+func walkSafeInternal(boundaryRoot, root string, startDepth int, policy SymlinkPolicy, fn func(path string, info os.FileInfo) error) error {
 	if fn == nil {
 		return nil
 	}
@@ -114,6 +124,10 @@ func WalkSafeWithStartDepth(root string, startDepth int, policy SymlinkPolicy, f
 		startDepth = 0
 	}
 	root = filepath.Clean(root)
+	cleanBoundary := strings.TrimSpace(boundaryRoot)
+	if cleanBoundary != "" {
+		cleanBoundary = filepath.Clean(cleanBoundary)
+	}
 
 	var rootInfo os.FileInfo
 	var err error
@@ -126,6 +140,13 @@ func WalkSafeWithStartDepth(root string, startDepth int, policy SymlinkPolicy, f
 			return nil
 		}
 	} else {
+		if cleanBoundary != "" {
+			if linfo, lerr := os.Lstat(root); lerr == nil && linfo.Mode()&os.ModeSymlink != 0 {
+				if !isPathWithinRoot(cleanBoundary, root) {
+					return nil
+				}
+			}
+		}
 		rootInfo, err = os.Stat(root)
 		if err != nil {
 			return err
@@ -145,10 +166,10 @@ func WalkSafeWithStartDepth(root string, startDepth int, policy SymlinkPolicy, f
 	visited := map[string]struct{}{
 		dirIdentity(root, rootInfo): {},
 	}
-	return walkDirSafe(root, startDepth, policy, visited, fn)
+	return walkDirSafe(cleanBoundary, root, startDepth, policy, visited, fn)
 }
 
-func walkDirSafe(dir string, symlinkDepth int, policy SymlinkPolicy, visited map[string]struct{}, fn func(path string, info os.FileInfo) error) error {
+func walkDirSafe(boundaryRoot, dir string, symlinkDepth int, policy SymlinkPolicy, visited map[string]struct{}, fn func(path string, info os.FileInfo) error) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return err
@@ -164,6 +185,9 @@ func walkDirSafe(dir string, symlinkDepth int, policy SymlinkPolicy, visited map
 				continue
 			}
 			if policy == SymlinkFollowDirect && symlinkDepth >= 1 {
+				continue
+			}
+			if boundaryRoot != "" && !isPathWithinRoot(boundaryRoot, fullPath) {
 				continue
 			}
 			info, err = os.Stat(fullPath)
@@ -197,7 +221,7 @@ func walkDirSafe(dir string, symlinkDepth int, policy SymlinkPolicy, visited map
 			if isSymlink {
 				nextDepth++
 			}
-			if err := walkDirSafe(fullPath, nextDepth, policy, visited, fn); err != nil {
+			if err := walkDirSafe(boundaryRoot, fullPath, nextDepth, policy, visited, fn); err != nil {
 				if errors.Is(err, filepath.SkipDir) {
 					continue
 				}

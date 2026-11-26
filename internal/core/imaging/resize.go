@@ -329,7 +329,8 @@ func ProcessImage(srcData []byte, srcContentType string, opts Options) (outData 
 	}
 
 	needsResize := crop || dstW != srcW || dstH != srcH
-	needsTranscode := (opts.Format != "" && opts.Format != decodedFormat) ||
+	needsTranscode := decodedFormat == "webp" ||
+		(opts.Format != "" && opts.Format != decodedFormat) ||
 		(opts.Quality > 0 && outFormat == "jpeg")
 
 	if !needsResize && !needsTranscode {
