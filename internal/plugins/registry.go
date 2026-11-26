@@ -46,6 +46,12 @@ type Plugin interface {
 	Configure(cfg map[string]any) error
 }
 
+// ServerConfigFilter limits which settings belong in global plugin configuration.
+// Account credentials for plugins with personal bindings stay outside server_config.
+type ServerConfigFilter interface {
+	FilterServerConfig(map[string]any) map[string]any
+}
+
 // MediaQuery carries hints for metadata/image/subtitle providers.
 type MediaQuery struct {
 	ItemType      string // Movie / Series / Season / Episode

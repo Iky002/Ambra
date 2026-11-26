@@ -725,3 +725,19 @@ export interface SetupCompleteRequest {
   trigger_scan?: boolean
   sync_rankings?: boolean
 }
+
+export interface UserTraktStatus {
+  Enabled: boolean
+  Configured: boolean
+  ClientId: string
+  AccessTokenConfigured: boolean
+  ScrobblePlayback: boolean
+  SyncWatched: boolean
+}
+
+export interface UserTraktUpdate {
+  ClientId?: string
+  AccessToken?: string
+  ScrobblePlayback?: boolean
+  SyncWatched?: boolean
+}

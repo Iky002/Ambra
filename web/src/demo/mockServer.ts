@@ -36,6 +36,7 @@ import type {
   UserDto,
   UserItemDataDto,
   UserPolicy,
+  UserTraktStatus,
   VirtualFolderInfo,
   WebhookInfo,
   WebhookTestResult,
@@ -87,6 +88,7 @@ function getDemoSortKey(raw: string): string {
 }
 
 let store: DemoState = createInitialDemoState()
+const demoTraktAccounts = new Map<string, UserTraktStatus>()
 
 interface DemoRankingsState {
   doubanUpdatedAt: string
@@ -474,6 +476,7 @@ const DEMO_IMDB_TOP250_TMDB_IDS = new Set([
  */
 export function resetDemoStore(): void {
   store = createInitialDemoState()
+  demoTraktAccounts.clear()
   rankingsState = createInitialRankingsState()
   activeDemoScan = null
   demoSetupCompleted = true
@@ -691,6 +694,37 @@ export async function demoFetch<T>(
   const url = new URL(path.startsWith('/') ? path : `/${path}`, 'http://ambra.demo')
   const pathname = url.pathname
   const qs = url.searchParams
+
+  if (pathname === '/emby/Users/Me/Trakt') {
+    if (!auth?.userId) throw new ApiError(403, 'A personal user session is required')
+    const enabled = store.plugins.find((p) => p.Id === 'ambra.builtin.trakt')?.Enabled === true
+    if (method === 'DELETE') {
+      demoTraktAccounts.delete(auth.userId)
+      return undefined as T
+    }
+    const status: UserTraktStatus = {
+      Configured: false, ClientId: '', AccessTokenConfigured: false,
+      ScrobblePlayback: true, SyncWatched: true,
+      ...demoTraktAccounts.get(auth.userId), Enabled: enabled,
+    }
+    if (method === 'POST') {
+      if (!enabled) throw new ApiError(403, 'Trakt is disabled by the administrator')
+      const body = parseJsonBody(options)
+      const clientId = String(body.ClientId ?? status.ClientId).trim()
+      const token = typeof body.AccessToken === 'string' ? body.AccessToken.trim() : undefined
+      if (!clientId || (token === undefined && (!status.Configured || clientId !== status.ClientId)) ||
+        token === '' || token === '********') {
+        throw new ApiError(400, 'A valid Client ID and Access Token are required')
+      }
+      status.ClientId = clientId
+      status.Configured = status.AccessTokenConfigured = true
+      if (typeof body.ScrobblePlayback === 'boolean') status.ScrobblePlayback = body.ScrobblePlayback
+      if (typeof body.SyncWatched === 'boolean') status.SyncWatched = body.SyncWatched
+      // Demo simulates binding without retaining OAuth credentials.
+      demoTraktAccounts.set(auth.userId, { ...status })
+    }
+    return status as T
+  }
 
   // ==================== 0. 首次运行初始化向导 ====================
   if (pathname === '/api/setup/status' && method === 'GET') {
@@ -2652,11 +2686,18 @@ export async function demoFetch<T>(
   const pluginCfgMatch = pathname.match(/^\/emby\/Plugins\/([^/]+)\/Configuration$/)
   if (pluginCfgMatch) {
     const pluginId = decodeURIComponent(pluginCfgMatch[1])
+    const personalTrakt = pluginId === 'ambra.builtin.trakt'
+    if (personalTrakt && !store.users.find((u) => u.user.Id === auth?.userId)?.user.Policy?.IsAdministrator) {
+      throw new ApiError(403, 'Administrator privileges required')
+    }
     if (method === 'GET') {
       return { ...(store.pluginConfigs.get(pluginId) || {}) } as T
     }
     if (method === 'POST') {
-      const nextCfg = parseJsonBody(options)
+      const body = parseJsonBody(options)
+      const nextCfg = personalTrakt ? Object.fromEntries(
+        Object.entries(body).filter(([key]) => ['Enabled', 'enabled', 'Priority', 'priority'].includes(key)),
+      ) : body
       store.pluginConfigs.set(pluginId, nextCfg)
       const plugin = store.plugins.find((p) => p.Id === pluginId)
       if (plugin) {

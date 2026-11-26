@@ -52,6 +52,8 @@ import type {
   UserDto,
   UserItemDataDto,
   UserPolicy,
+  UserTraktStatus,
+  UserTraktUpdate,
   VirtualFolderInfo,
   WebhookInfo,
   WebhookTestResult,
@@ -112,7 +114,7 @@ export function buildEmbyAuthHeader(token?: string): string {
     'Client="Ambra Web"',
     'Device="Web Browser"',
     `DeviceId="${deviceId}"`,
-    'Version="0.10.6"',
+    'Version="0.10.8"',
   ]
   if (token) {
     parts.push(`Token="${token}"`)
@@ -294,6 +296,15 @@ export function getAudioStreamUrl(itemId: string): string {
 // ==================== API Endpoints ====================
 
 export const api = {
+  getUserTrakt: () => embyFetch<UserTraktStatus>('/emby/Users/Me/Trakt'),
+  updateUserTrakt: (config: UserTraktUpdate) =>
+    embyFetch<UserTraktStatus>('/emby/Users/Me/Trakt', {
+      method: 'POST',
+      body: JSON.stringify(config),
+    }),
+  disconnectUserTrakt: () =>
+    embyFetch<void>('/emby/Users/Me/Trakt', { method: 'DELETE' }),
+
   getPublicSystemInfo: () =>
     embyFetch<PublicSystemInfo>('/emby/System/Info/Public', {}, false),
 

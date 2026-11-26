@@ -41,6 +41,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/handlers/system"
 	"github.com/ambra-media/ambra/internal/api/handlers/tasks"
 	"github.com/ambra-media/ambra/internal/api/handlers/users"
+	"github.com/ambra-media/ambra/internal/api/handlers/usertrakt"
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/api/ws"
 	"github.com/ambra-media/ambra/internal/config"
@@ -136,6 +137,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	}
 
 	userRepo := sqlite.NewUserRepo(store)
+	traktPlugin.SetUserConfigStore(userRepo)
 	libRepo := sqlite.NewLibraryRepo(store)
 	traktPlugin.SubscribeEvents(bus, libRepo)
 
@@ -367,6 +369,8 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
 	})
+
+	usertrakt.New(traktPlugin, userRepo).RegisterRoutes(mediaMux, authMW.RequireAuth)
 
 	// Phase 3: FFmpeg Dynamic HLS, Encoding, LiveStreams & Audio
 	resolveStreamURL := func(c context.Context, rawPath string) (string, error) {

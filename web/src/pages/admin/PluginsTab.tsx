@@ -71,12 +71,6 @@ export function PluginsTab() {
   const [tvdbPinConfigured, setTvdbPinConfigured] = useState(false)
   const [tvdbPinCleared, setTvdbPinCleared] = useState(false)
   const [tvdbLanguage, setTvdbLanguage] = useState('zh-CN')
-  const [traktClientId, setTraktClientId] = useState('')
-  const [traktAccessToken, setTraktAccessToken] = useState('')
-  const [traktAccessTokenConfigured, setTraktAccessTokenConfigured] = useState(false)
-  const [traktAccessTokenCleared, setTraktAccessTokenCleared] = useState(false)
-  const [traktScrobblePlayback, setTraktScrobblePlayback] = useState(true)
-  const [traktSyncWatched, setTraktSyncWatched] = useState(true)
   const [enable302, setEnable302] = useState(true)
   const [extraJson, setExtraJson] = useState('{}')
 
@@ -119,12 +113,6 @@ export function PluginsTab() {
     setTvdbPinConfigured(false)
     setTvdbPinCleared(false)
     setTvdbLanguage('zh-CN')
-    setTraktClientId('')
-    setTraktAccessToken('')
-    setTraktAccessTokenConfigured(false)
-    setTraktAccessTokenCleared(false)
-    setTraktScrobblePlayback(true)
-    setTraktSyncWatched(true)
     setEnable302(true)
     setExtraJson('{}')
     setLoadingConfig(true)
@@ -192,38 +180,6 @@ export function PluginsTab() {
             (cfg.TVDBLanguage as string) ||
             ''
           if (tvdbLangVal) setTvdbLanguage(tvdbLangVal)
-        }
-
-        if (isTraktPlugin(plugin)) {
-          const clientIdVal =
-            (cfg.client_id as string) ||
-            (cfg.ClientId as string) ||
-            (cfg.ClientID as string) ||
-            ''
-          if (clientIdVal) setTraktClientId(clientIdVal)
-
-          const accessTokenVal =
-            (cfg.access_token as string) ||
-            (cfg.AccessToken as string) ||
-            ''
-          if (accessTokenVal === MASKED_PLUGIN_SECRET) {
-            setTraktAccessToken('')
-            setTraktAccessTokenConfigured(true)
-          } else if (accessTokenVal) {
-            setTraktAccessToken(accessTokenVal)
-          }
-
-          if (typeof cfg.scrobble_playback === 'boolean') {
-            setTraktScrobblePlayback(cfg.scrobble_playback)
-          } else if (typeof cfg.ScrobblePlayback === 'boolean') {
-            setTraktScrobblePlayback(cfg.ScrobblePlayback)
-          }
-
-          if (typeof cfg.sync_watched === 'boolean') {
-            setTraktSyncWatched(cfg.sync_watched)
-          } else if (typeof cfg.SyncWatched === 'boolean') {
-            setTraktSyncWatched(cfg.SyncWatched)
-          }
         }
 
         if (typeof cfg.enable_302 === 'boolean') setEnable302(cfg.enable_302)
@@ -329,19 +285,9 @@ export function PluginsTab() {
     }
 
     if (isTraktPlugin(editingPlugin)) {
-      const nextTraktToken = resolveSecretForSubmit(
-        traktAccessToken,
-        traktAccessTokenConfigured,
-        traktAccessTokenCleared,
-      )
-      payload.ClientId = traktClientId.trim()
-      payload.client_id = traktClientId.trim()
-      payload.AccessToken = nextTraktToken
-      payload.access_token = nextTraktToken
-      payload.ScrobblePlayback = traktScrobblePlayback
-      payload.scrobble_playback = traktScrobblePlayback
-      payload.SyncWatched = traktSyncWatched
-      payload.sync_watched = traktSyncWatched
+      for (const key of Object.keys(payload)) {
+        if (!['Enabled', 'enabled', 'Priority', 'priority'].includes(key)) delete payload[key]
+      }
     }
 
     if (isStrmPlugin(editingPlugin)) {
@@ -729,92 +675,8 @@ export function PluginsTab() {
             )}
 
             {isTraktPlugin(editingPlugin) && (
-              <div className="space-y-3 rounded-xl border border-rose-500/20 bg-rose-500/[0.04] p-4">
-                <p className="text-xs font-semibold text-rose-300">Trakt.tv 同步参数</p>
-                <p className="text-xs leading-relaxed text-zinc-400">
-                  默认关闭；启用后自动将播放进度与已看状态同步至 Trakt.tv
-                </p>
-                <div>
-                  <label
-                    htmlFor="trakt-client-id"
-                    className="mb-1.5 block text-xs font-medium text-zinc-400"
-                  >
-                    Client ID
-                  </label>
-                  <input
-                    id="trakt-client-id"
-                    type="text"
-                    value={traktClientId}
-                    onChange={(e) => setTraktClientId(e.target.value)}
-                    placeholder="输入 Trakt OAuth App Client ID"
-                    className="w-full rounded-xl border border-white/10 bg-black/40 px-3.5 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
-                  />
-                </div>
-                <div>
-                  <div className="mb-1.5 flex items-center justify-between gap-2">
-                    <label
-                      htmlFor="trakt-access-token"
-                      className="block text-xs font-medium text-zinc-400"
-                    >
-                      Access Token
-                    </label>
-                    {traktAccessTokenConfigured &&
-                      !traktAccessTokenCleared &&
-                      !traktAccessToken.trim() && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setTraktAccessToken('')
-                            setTraktAccessTokenCleared(true)
-                          }}
-                          className="inline-flex items-center gap-1 rounded-md border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-[11px] font-medium text-red-300 transition-colors hover:bg-red-500/20"
-                        >
-                          <Trash2 className="h-3 w-3" />
-                          <span>清除密钥</span>
-                        </button>
-                      )}
-                    {traktAccessTokenCleared && (
-                      <button
-                        type="button"
-                        onClick={() => setTraktAccessTokenCleared(false)}
-                        className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
-                      >
-                        <RotateCcw className="h-3 w-3" />
-                        <span>撤销清除</span>
-                      </button>
-                    )}
-                  </div>
-                  <input
-                    id="trakt-access-token"
-                    type="password"
-                    autoComplete="off"
-                    value={traktAccessToken}
-                    onChange={(e) => {
-                      setTraktAccessToken(e.target.value)
-                      if (e.target.value.trim()) setTraktAccessTokenCleared(false)
-                    }}
-                    placeholder={
-                      traktAccessTokenCleared
-                        ? '已标记清除密钥，保存后将清空原值'
-                        : traktAccessTokenConfigured
-                          ? '已配置密钥，留空保留原值'
-                          : '输入 Trakt OAuth Access Token'
-                    }
-                    className="w-full rounded-xl border border-white/10 bg-black/40 px-3.5 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
-                  />
-                </div>
-                <ToggleSwitch
-                  checked={traktScrobblePlayback}
-                  onChange={setTraktScrobblePlayback}
-                  label="实时同步播放进度 (Scrobble)"
-                  description="播放、暂停及停止时自动上报进度至 Trakt"
-                />
-                <ToggleSwitch
-                  checked={traktSyncWatched}
-                  onChange={setTraktSyncWatched}
-                  label="同步已观看历史 (Watched Sync)"
-                  description="影片或剧集标记为已看时同步至 Trakt 历史记录"
-                />
+              <div className="rounded-xl border border-rose-500/20 bg-rose-500/[0.04] p-4 text-xs leading-relaxed text-zinc-400">
+                {t('trakt.adminDescription')}
               </div>
             )}
 
@@ -827,6 +689,7 @@ export function PluginsTab() {
               />
             )}
 
+            {!isTraktPlugin(editingPlugin) && (
             <div>
               <label className="mb-1.5 block text-xs font-medium text-zinc-400">
                 扩展配置 (JSON)
@@ -839,6 +702,7 @@ export function PluginsTab() {
                 className="w-full rounded-xl border border-white/10 bg-black/40 p-3 font-mono text-xs text-zinc-200 outline-none focus:border-amber-400/60"
               />
             </div>
+            )}
 
             <div className="flex justify-end gap-2 pt-2">
               <button

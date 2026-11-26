@@ -42,16 +42,12 @@ var _ plugins.Plugin = (*Plugin)(nil)
 
 // Plugin implements a built-in Trakt.tv scrobble and watched-history sync notifier.
 type Plugin struct {
-	mu               sync.RWMutex
-	enabled          bool
-	clientID         string
-	accessToken      string
-	allowedUserID    string
-	scrobblePlayback bool
-	syncWatched      bool
-	priority         int
-	baseURL          string
-	client           *http.Client
+	mu          sync.RWMutex
+	enabled     bool
+	userConfigs UserConfigStore
+	priority    int
+	baseURL     string
+	client      *http.Client
 
 	stateMu             sync.Mutex
 	pausedAt            map[string]time.Time
@@ -66,7 +62,6 @@ type configSnapshot struct {
 	enabled          bool
 	clientID         string
 	accessToken      string
-	allowedUserID    string
 	scrobblePlayback bool
 	syncWatched      bool
 	priority         int
@@ -74,12 +69,20 @@ type configSnapshot struct {
 	client           *http.Client
 }
 
+type UserConfigStore interface {
+	GetUserTraktConfig(context.Context, string) (*sqlite.TraktConfig, error)
+}
+
+func (p *Plugin) SetUserConfigStore(store UserConfigStore) {
+	p.mu.Lock()
+	p.userConfigs = store
+	p.mu.Unlock()
+}
+
 // New creates a new Trakt plugin instance (disabled by default).
 func New() *Plugin {
 	return &Plugin{
 		enabled:             false,
-		scrobblePlayback:    true,
-		syncWatched:         true,
 		priority:            defaultPriority,
 		baseURL:             defaultBaseURL,
 		client:              netutil.NewSafeHTTPClient(defaultTimeout, false),
@@ -106,16 +109,28 @@ func (p *Plugin) snapshot() configSnapshot {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return configSnapshot{
-		enabled:          p.enabled,
-		clientID:         p.clientID,
-		accessToken:      p.accessToken,
-		allowedUserID:    p.allowedUserID,
-		scrobblePlayback: p.scrobblePlayback,
-		syncWatched:      p.syncWatched,
-		priority:         p.priority,
-		baseURL:          p.baseURL,
-		client:           p.client,
+		enabled:  p.enabled,
+		priority: p.priority,
+		baseURL:  p.baseURL,
+		client:   p.client,
 	}
+}
+
+func (p *Plugin) snapshotForUser(ctx context.Context, userID string) (configSnapshot, error) {
+	snap := p.snapshot()
+	p.mu.RLock()
+	store := p.userConfigs
+	p.mu.RUnlock()
+	if !snap.enabled || store == nil || strings.TrimSpace(userID) == "" {
+		return snap, nil
+	}
+	cfg, err := store.GetUserTraktConfig(ctx, userID)
+	if err != nil || cfg == nil {
+		return snap, err
+	}
+	snap.clientID, snap.accessToken = cfg.ClientID, cfg.AccessToken
+	snap.scrobblePlayback, snap.syncWatched = cfg.ScrobblePlayback, cfg.SyncWatched
+	return snap, nil
 }
 
 func (p *Plugin) Manifest() plugins.Manifest {
@@ -124,7 +139,7 @@ func (p *Plugin) Manifest() plugins.Manifest {
 		ID:          PluginID,
 		Name:        "Trakt Scrobble & Sync",
 		Version:     "1.0.0",
-		Description: "Scrobbles playback progress and syncs watched history to Trakt.tv (disabled by default)",
+		Description: "Allows each user to bind their own Trakt.tv account and sync playback and watched history (disabled by default)",
 		Author:      "Ambra",
 		BuiltIn:     true,
 		Enabled:     snap.enabled,
@@ -152,25 +167,6 @@ func (p *Plugin) Configure(cfg map[string]any) error {
 	if v, ok := firstBool(cfg, "enabled", "Enabled"); ok {
 		p.enabled = v
 	}
-	hasNewClientID := false
-	hasNewAccessToken := false
-	if v, ok := firstString(cfg, "client_id", "ClientId", "trakt_client_id"); ok {
-		p.clientID = strings.TrimSpace(v)
-		hasNewClientID = true
-	}
-	if v, ok := firstString(cfg, "access_token", "AccessToken", "trakt_access_token"); ok {
-		p.accessToken = strings.TrimSpace(v)
-		hasNewAccessToken = true
-	}
-	if v, ok := firstString(cfg, "user_id", "UserId", "UserID", "allowed_user_id", "AllowedUserId"); ok {
-		p.allowedUserID = strings.TrimSpace(v)
-	}
-	if v, ok := firstBool(cfg, "scrobble_playback", "ScrobblePlayback"); ok {
-		p.scrobblePlayback = v
-	}
-	if v, ok := firstBool(cfg, "sync_watched", "SyncWatched"); ok {
-		p.syncWatched = v
-	}
 	if v, ok := firstInt(cfg, "priority", "Priority"); ok {
 		p.priority = v
 	}
@@ -180,18 +176,23 @@ func (p *Plugin) Configure(cfg map[string]any) error {
 			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 				return fmt.Errorf("trakt: invalid base_url %q: must be http(s) URL", v)
 			}
-			if urlHostLower(trimmed) != urlHostLower(p.baseURL) {
-				if !hasNewClientID {
-					p.clientID = ""
-				}
-				if !hasNewAccessToken {
-					p.accessToken = ""
-				}
-			}
 			p.baseURL = trimmed
 		}
 	}
 	return nil
+}
+
+// Only availability and priority are server-wide. Legacy global account settings
+// are discarded, never copied to an arbitrary user's account.
+func (p *Plugin) FilterServerConfig(cfg map[string]any) map[string]any {
+	out := make(map[string]any)
+	if v, ok := firstBool(cfg, "enabled", "Enabled"); ok {
+		out["enabled"] = v
+	}
+	if v, ok := firstInt(cfg, "priority", "Priority"); ok {
+		out["priority"] = v
+	}
+	return out
 }
 
 // Trakt API v2 payload types.
@@ -253,22 +254,25 @@ type syncHistoryPayload struct {
 }
 
 // ScrobbleStart sends a POST /scrobble/start request to Trakt.
-func (p *Plugin) ScrobbleStart(ctx context.Context, item *sqlite.ItemRecord, series *sqlite.ItemRecord, progressPct float64) error {
-	return p.scrobble(ctx, "/scrobble/start", item, series, progressPct)
+func (p *Plugin) ScrobbleStart(ctx context.Context, userID string, item *sqlite.ItemRecord, series *sqlite.ItemRecord, progressPct float64) error {
+	return p.scrobble(ctx, userID, "/scrobble/start", item, series, progressPct)
 }
 
 // ScrobblePause sends a POST /scrobble/pause request to Trakt.
-func (p *Plugin) ScrobblePause(ctx context.Context, item *sqlite.ItemRecord, series *sqlite.ItemRecord, progressPct float64) error {
-	return p.scrobble(ctx, "/scrobble/pause", item, series, progressPct)
+func (p *Plugin) ScrobblePause(ctx context.Context, userID string, item *sqlite.ItemRecord, series *sqlite.ItemRecord, progressPct float64) error {
+	return p.scrobble(ctx, userID, "/scrobble/pause", item, series, progressPct)
 }
 
 // ScrobbleStop sends a POST /scrobble/stop request to Trakt.
-func (p *Plugin) ScrobbleStop(ctx context.Context, item *sqlite.ItemRecord, series *sqlite.ItemRecord, progressPct float64) error {
-	return p.scrobble(ctx, "/scrobble/stop", item, series, progressPct)
+func (p *Plugin) ScrobbleStop(ctx context.Context, userID string, item *sqlite.ItemRecord, series *sqlite.ItemRecord, progressPct float64) error {
+	return p.scrobble(ctx, userID, "/scrobble/stop", item, series, progressPct)
 }
 
-func (p *Plugin) scrobble(ctx context.Context, endpoint string, item *sqlite.ItemRecord, series *sqlite.ItemRecord, progressPct float64) error {
-	snap := p.snapshot()
+func (p *Plugin) scrobble(ctx context.Context, userID, endpoint string, item *sqlite.ItemRecord, series *sqlite.ItemRecord, progressPct float64) error {
+	snap, err := p.snapshotForUser(ctx, userID)
+	if err != nil {
+		return err
+	}
 	if !snap.enabled || !snap.scrobblePlayback || snap.clientID == "" || snap.accessToken == "" {
 		return nil
 	}
@@ -280,8 +284,11 @@ func (p *Plugin) scrobble(ctx context.Context, endpoint string, item *sqlite.Ite
 }
 
 // SyncWatched sends a POST /sync/history request to Trakt.
-func (p *Plugin) SyncWatched(ctx context.Context, item *sqlite.ItemRecord, series *sqlite.ItemRecord) error {
-	snap := p.snapshot()
+func (p *Plugin) SyncWatched(ctx context.Context, userID string, item *sqlite.ItemRecord, series *sqlite.ItemRecord) error {
+	snap, err := p.snapshotForUser(ctx, userID)
+	if err != nil {
+		return err
+	}
 	if !snap.enabled || !snap.syncWatched || snap.clientID == "" || snap.accessToken == "" {
 		return nil
 	}
@@ -464,16 +471,8 @@ func postTrakt(ctx context.Context, snap configSnapshot, endpoint string, payloa
 }
 
 func (p *Plugin) shouldReportForUser(userID string) bool {
-	uid := strings.TrimSpace(userID)
-	p.mu.RLock()
-	allowed := p.allowedUserID
-	p.mu.RUnlock()
-	if allowed == "" {
-		// Require an explicit user_id binding rather than silently binding to whichever
-		// user happens to play first after a restart.
-		return false
-	}
-	return uid != "" && strings.EqualFold(uid, allowed)
+	snap, err := p.snapshotForUser(context.Background(), userID)
+	return err == nil && snap.enabled && snap.clientID != "" && snap.accessToken != ""
 }
 
 func userItemKey(userID, itemID string) string {
@@ -647,7 +646,7 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 			return false
 		}
 		snap := p.snapshot()
-		return snap.enabled && snap.clientID != "" && snap.accessToken != ""
+		return snap.enabled
 	}
 
 	bus.Subscribe(eventbus.EventPlaybackStart, func(_ context.Context, e eventbus.Event) {
@@ -667,7 +666,7 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 				return
 			}
 			pct := computeProgress(ev.positionTicks, ev.runtimeTicks, item.RuntimeTicks)
-			_ = p.ScrobbleStart(ctx, item, series, pct)
+			_ = p.ScrobbleStart(ctx, ev.userID, item, series, pct)
 		})
 	})
 
@@ -694,7 +693,7 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 				return
 			}
 			pct := computeProgress(ev.positionTicks, ev.runtimeTicks, item.RuntimeTicks)
-			_ = p.ScrobblePause(ctx, item, series, pct)
+			_ = p.ScrobblePause(ctx, ev.userID, item, series, pct)
 		})
 	})
 
@@ -704,6 +703,10 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 		}
 		ev, ok := parsePlaybackEvent(e.Payload)
 		if !ok || ev.itemID == "" || !p.shouldReportForUser(ev.userID) {
+			return
+		}
+		snap, err := p.snapshotForUser(context.Background(), ev.userID)
+		if err != nil || !snap.scrobblePlayback {
 			return
 		}
 		p.clearPaused(ev.userID, ev.itemID)
@@ -728,7 +731,7 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 			if pct >= scrobbleCompletionPct {
 				p.markScrobbleCompleted(ev.userID, ev.itemID)
 			}
-			_ = p.ScrobbleStop(ctx, item, series, pct)
+			_ = p.ScrobbleStop(ctx, ev.userID, item, series, pct)
 		}) {
 			finishStop()
 		}
@@ -772,7 +775,7 @@ func (p *Plugin) SubscribeEvents(bus *eventbus.Bus, repo *sqlite.LibraryRepo) fu
 				if item == nil {
 					return
 				}
-				_ = p.SyncWatched(ctx, item, series)
+				_ = p.SyncWatched(ctx, userID, item, series)
 			})
 		}
 	})

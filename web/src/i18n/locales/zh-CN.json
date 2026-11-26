@@ -220,5 +220,20 @@
   "admin.createUser": "新建用户",
   "admin.pluginsTitle": "插件与刮削器管理",
   "admin.webhooksTitle": "Webhook 事件通知",
-  "admin.createWebhook": "新增 Webhook"
+  "admin.createWebhook": "新增 Webhook",
+  "trakt.title": "Trakt 账号",
+  "trakt.configured": "已配置绑定",
+  "trakt.description": "绑定你自己的 Trakt 账号，仅同步当前 Ambra 用户的播放进度与已看记录。",
+  "trakt.disabled": "管理员尚未启用 Trakt，暂时无法绑定或同步；已有绑定可随时解除。",
+  "trakt.keepToken": "已保存 Token，留空保留原值",
+  "trakt.tokenPlaceholder": "输入你自己的 OAuth Access Token",
+  "trakt.credentialsHelp": "填写你在 Trakt 授权后获得的 Client ID 和 Access Token；Token 失效后需要在此更新。绑定保存后不会回显 Token。",
+  "trakt.scrobble": "同步播放进度 (Scrobble)",
+  "trakt.watched": "同步已看记录",
+  "trakt.save": "保存绑定与偏好",
+  "trakt.disconnect": "解除绑定",
+  "trakt.saved": "Trakt 绑定与同步偏好已保存",
+  "trakt.disconnected": "已解除你的 Trakt 绑定",
+  "trakt.retry": "无法加载 Trakt 设置，点击重试",
+  "trakt.adminDescription": "管理员控制是否向用户开放 Trakt。启用后，每位用户在「个人中心 → Trakt 账号」配置自己的 Client ID、Access Token 和同步偏好；此处不再保存全局账号。"
 }

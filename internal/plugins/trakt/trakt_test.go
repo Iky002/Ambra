@@ -150,18 +150,18 @@ func TestConfigureAndConcurrency(t *testing.T) {
 		t.Fatalf("unexpected manifest after Configure: %+v", m)
 	}
 	snap := p.snapshot()
-	if snap.clientID != "cid-1" || snap.accessToken != "tok-1" || snap.scrobblePlayback || snap.syncWatched || snap.baseURL != "https://example.trakt.local" {
+	if snap.clientID != "" || snap.accessToken != "" || snap.scrobblePlayback || snap.syncWatched || snap.baseURL != "https://example.trakt.local" {
 		t.Fatalf("unexpected snapshot: %+v", snap)
 	}
 
 	// Test trakt_* and snake_case keys + int/int64 priority
 	if err := p.Configure(map[string]any{
-		"enabled":           true,
-		"trakt_client_id":   "cid-2",
+		"enabled":            true,
+		"trakt_client_id":    "cid-2",
 		"trakt_access_token": "tok-2",
-		"scrobble_playback": true,
-		"sync_watched":      true,
-		"priority":          int64(55),
+		"scrobble_playback":  true,
+		"sync_watched":       true,
+		"priority":           int64(55),
 	}); err != nil {
 		t.Fatalf("Configure snake_case: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestMovieScrobbleAndSyncWatched(t *testing.T) {
 	srv, ch := newMockTraktServer(t, http.StatusCreated, `{"id":1}`)
 	p := New()
 	p.SetHTTPClient(srv.Client())
-	_ = p.Configure(map[string]any{
+	_ = configureTestPlugin(t, p, map[string]any{
 		"enabled":      true,
 		"client_id":    "my-client-id",
 		"access_token": "my-access-token",
@@ -220,7 +220,7 @@ func TestMovieScrobbleAndSyncWatched(t *testing.T) {
 	ctx := context.Background()
 
 	// Start with negative progress -> clamped to 0
-	if err := p.ScrobbleStart(ctx, movie, nil, -15.5); err != nil {
+	if err := p.ScrobbleStart(ctx, "test-user", movie, nil, -15.5); err != nil {
 		t.Fatalf("ScrobbleStart: %v", err)
 	}
 	req := waitReq(t, ch)
@@ -241,7 +241,7 @@ func TestMovieScrobbleAndSyncWatched(t *testing.T) {
 	}
 
 	// Pause at 42.5%
-	if err := p.ScrobblePause(ctx, movie, nil, 42.5); err != nil {
+	if err := p.ScrobblePause(ctx, "test-user", movie, nil, 42.5); err != nil {
 		t.Fatalf("ScrobblePause: %v", err)
 	}
 	req = waitReq(t, ch)
@@ -250,7 +250,7 @@ func TestMovieScrobbleAndSyncWatched(t *testing.T) {
 	}
 
 	// Stop at >100% -> clamped to 100
-	if err := p.ScrobbleStop(ctx, movie, nil, 150.0); err != nil {
+	if err := p.ScrobbleStop(ctx, "test-user", movie, nil, 150.0); err != nil {
 		t.Fatalf("ScrobbleStop: %v", err)
 	}
 	req = waitReq(t, ch)
@@ -264,7 +264,7 @@ func TestMovieScrobbleAndSyncWatched(t *testing.T) {
 	}
 
 	// SyncWatched -> POST /sync/history
-	if err := p.SyncWatched(ctx, movie, nil); err != nil {
+	if err := p.SyncWatched(ctx, "test-user", movie, nil); err != nil {
 		t.Fatalf("SyncWatched: %v", err)
 	}
 	req = waitReq(t, ch)
@@ -285,7 +285,7 @@ func TestEpisodeScrobbleAndSyncWatched(t *testing.T) {
 	srv, ch := newMockTraktServer(t, http.StatusCreated, `{}`)
 	p := New()
 	p.SetHTTPClient(srv.Client())
-	_ = p.Configure(map[string]any{
+	_ = configureTestPlugin(t, p, map[string]any{
 		"enabled":      true,
 		"client_id":    "cid",
 		"access_token": "tok",
@@ -322,7 +322,7 @@ func TestEpisodeScrobbleAndSyncWatched(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	if err := p.ScrobbleStart(ctx, ep, series, 12.5); err != nil {
+	if err := p.ScrobbleStart(ctx, "test-user", ep, series, 12.5); err != nil {
 		t.Fatalf("ScrobbleStart episode: %v", err)
 	}
 	req := waitReq(t, ch)
@@ -347,7 +347,7 @@ func TestEpisodeScrobbleAndSyncWatched(t *testing.T) {
 	}
 
 	// SyncWatched for episode -> /sync/history with shows -> seasons -> episodes
-	if err := p.SyncWatched(ctx, ep, series); err != nil {
+	if err := p.SyncWatched(ctx, "test-user", ep, series); err != nil {
 		t.Fatalf("SyncWatched episode: %v", err)
 	}
 	req = waitReq(t, ch)
@@ -368,7 +368,7 @@ func TestEpisodeScrobbleAndSyncWatched(t *testing.T) {
 	}
 
 	// Episode with nil series falls back to item.Extra.SeriesName
-	if err := p.ScrobblePause(ctx, ep, nil, 50); err != nil {
+	if err := p.ScrobblePause(ctx, "test-user", ep, nil, 50); err != nil {
 		t.Fatalf("ScrobblePause nil series: %v", err)
 	}
 	req = waitReq(t, ch)
@@ -385,39 +385,39 @@ func TestNoOpWhenDisabledOrMissingCredsOrUnsupportedType(t *testing.T) {
 	movie := &sqlite.ItemRecord{ID: "m1", Type: "Movie", Name: "Test"}
 
 	// Disabled by default
-	if err := p.ScrobbleStart(ctx, movie, nil, 10); err != nil {
+	if err := p.ScrobbleStart(ctx, "test-user", movie, nil, 10); err != nil {
 		t.Fatalf("unexpected error when disabled: %v", err)
 	}
-	if err := p.SyncWatched(ctx, movie, nil); err != nil {
+	if err := p.SyncWatched(ctx, "test-user", movie, nil); err != nil {
 		t.Fatalf("unexpected error when disabled: %v", err)
 	}
 
 	// Enabled but missing creds
-	_ = p.Configure(map[string]any{"enabled": true, "base_url": srv.URL})
-	if err := p.ScrobbleStart(ctx, movie, nil, 10); err != nil {
+	_ = configureTestPlugin(t, p, map[string]any{"enabled": true, "base_url": srv.URL})
+	if err := p.ScrobbleStart(ctx, "test-user", movie, nil, 10); err != nil {
 		t.Fatalf("unexpected error with missing creds: %v", err)
 	}
 
 	// Creds present, but scrobble_playback=false and sync_watched=false
-	_ = p.Configure(map[string]any{
+	_ = configureTestPlugin(t, p, map[string]any{
 		"client_id":         "cid",
 		"access_token":      "tok",
 		"scrobble_playback": false,
 		"sync_watched":      false,
 	})
-	_ = p.ScrobbleStart(ctx, movie, nil, 10)
-	_ = p.SyncWatched(ctx, movie, nil)
+	_ = p.ScrobbleStart(ctx, "test-user", movie, nil, 10)
+	_ = p.SyncWatched(ctx, "test-user", movie, nil)
 
 	// Enable both, test nil item and unsupported item type (Audio)
-	_ = p.Configure(map[string]any{
+	_ = configureTestPlugin(t, p, map[string]any{
 		"scrobble_playback": true,
 		"sync_watched":      true,
 	})
-	_ = p.ScrobbleStart(ctx, nil, nil, 10)
-	_ = p.SyncWatched(ctx, nil, nil)
+	_ = p.ScrobbleStart(ctx, "test-user", nil, nil, 10)
+	_ = p.SyncWatched(ctx, "test-user", nil, nil)
 	audio := &sqlite.ItemRecord{ID: "a1", Type: "Audio", Name: "Song"}
-	_ = p.ScrobbleStart(ctx, audio, nil, 10)
-	_ = p.SyncWatched(ctx, audio, nil)
+	_ = p.ScrobbleStart(ctx, "test-user", audio, nil, 10)
+	_ = p.SyncWatched(ctx, "test-user", audio, nil)
 
 	assertNoReq(t, ch, 100*time.Millisecond)
 }
@@ -426,7 +426,7 @@ func TestUpstreamHTTPError(t *testing.T) {
 	srv, _ := newMockTraktServer(t, http.StatusUnauthorized, `{"error":"invalid_token"}`)
 	p := New()
 	p.SetHTTPClient(srv.Client())
-	_ = p.Configure(map[string]any{
+	_ = configureTestPlugin(t, p, map[string]any{
 		"enabled":      true,
 		"client_id":    "cid",
 		"access_token": "expired",
@@ -434,7 +434,7 @@ func TestUpstreamHTTPError(t *testing.T) {
 	})
 	movie := &sqlite.ItemRecord{ID: "m1", Type: "Movie", Name: "Matrix"}
 
-	err := p.ScrobbleStart(context.Background(), movie, nil, 5)
+	err := p.ScrobbleStart(context.Background(), "test-user", movie, nil, 5)
 	if err == nil || !strings.Contains(err.Error(), "401") || !strings.Contains(err.Error(), "invalid_token") {
 		t.Fatalf("expected 401 error with body, got: %v", err)
 	}
@@ -514,7 +514,7 @@ func TestSubscribeEventsIntegration(t *testing.T) {
 	assertNoReq(t, ch, 100*time.Millisecond)
 
 	// Enable plugin (explicitly bound to user u1)
-	_ = p.Configure(map[string]any{
+	_ = configureTestPlugin(t, p, map[string]any{
 		"enabled":      true,
 		"client_id":    "bus-cid",
 		"access_token": "bus-tok",
@@ -740,7 +740,7 @@ func TestTraktMultiUserIsolationPauseThrottleAndDedup(t *testing.T) {
 	bus := eventbus.New()
 	p := New()
 	p.SetHTTPClient(srv.Client())
-	_ = p.Configure(map[string]any{
+	_ = configureTestPlugin(t, p, map[string]any{
 		"enabled":         true,
 		"client_id":       "cid",
 		"access_token":    "tok",

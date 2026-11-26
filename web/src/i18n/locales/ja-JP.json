@@ -220,5 +220,20 @@
   "admin.createUser": "新規ユーザー",
   "admin.pluginsTitle": "プラグインとスクレイパー管理",
   "admin.webhooksTitle": "Webhook イベント通知",
-  "admin.createWebhook": "Webhook を追加"
+  "admin.createWebhook": "Webhook を追加",
+  "trakt.title": "Trakt アカウント",
+  "trakt.configured": "連携設定済み",
+  "trakt.description": "自分の Trakt アカウントを設定します。この Ambra ユーザーの再生状況と視聴履歴のみを同期します。",
+  "trakt.disabled": "管理者が Trakt を無効にしています。既存の連携は解除できます。",
+  "trakt.keepToken": "保存済み。空欄で現在のトークンを維持",
+  "trakt.tokenPlaceholder": "自分の OAuth Access Token を入力",
+  "trakt.credentialsHelp": "Trakt の認証で取得した Client ID と Access Token を入力してください。期限切れの場合は更新が必要です。保存後のトークンは表示されません。",
+  "trakt.scrobble": "再生状況を同期 (Scrobble)",
+  "trakt.watched": "視聴履歴を同期",
+  "trakt.save": "連携と設定を保存",
+  "trakt.disconnect": "連携を解除",
+  "trakt.saved": "Trakt の連携と設定を保存しました",
+  "trakt.disconnected": "Trakt の連携を解除しました",
+  "trakt.retry": "Trakt 設定を読み込めません。再試行",
+  "trakt.adminDescription": "管理者は Trakt の利用可否を設定します。各ユーザーは「プロフィール → Trakt アカウント」で自分の認証情報と同期設定を管理します。"
 }

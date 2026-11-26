@@ -236,6 +236,24 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 	}
+	tx, err := s.Writer.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	traktSQL, err := migrationsFS.ReadFile("migrations/006_user_trakt.sql")
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, string(traktSQL)); err != nil {
+		return fmt.Errorf("migration 006 user Trakt accounts: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (6, ?)`, time.Now().Unix()); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
 	return nil
 }
 

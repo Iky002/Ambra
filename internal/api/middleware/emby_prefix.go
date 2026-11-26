@@ -9,6 +9,8 @@ import (
 // canonicalSegments maps lowercase Emby static route segments (generated from all 582 Emby 4.10.2.0 routes)
 // to their canonical casing so static paths match case-insensitively across chi and ServeMux.
 var canonicalSegments = map[string]string{
+	"me": "Me",
+	"trakt": "Trakt",
 	"access": "Access",
 	"activeencodings": "ActiveEncodings",
 	"activitylog": "ActivityLog",

@@ -48,6 +48,9 @@ jobs:
             exit 1
           fi
           echo "version=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          if [ -f "docs/releases/${RELEASE_TAG}.md" ]; then
+            echo "notes=docs/releases/${RELEASE_TAG}.md" >> "$GITHUB_OUTPUT"
+          fi
           mkdir -p dist/lite dist/full
           AMBRA_VERSION="${RELEASE_TAG}"
           TARGETS=(
@@ -223,6 +226,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.build-lite.outputs.version }}
+          body_path: ${{ steps.build-lite.outputs.notes }}
           generate_release_notes: true
           files: dist/release/*
 

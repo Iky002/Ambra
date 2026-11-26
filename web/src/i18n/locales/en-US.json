@@ -220,5 +220,20 @@
   "admin.createUser": "New User",
   "admin.pluginsTitle": "Plugins & Scrapers",
   "admin.webhooksTitle": "Webhook Notifications",
-  "admin.createWebhook": "Add Webhook"
+  "admin.createWebhook": "Add Webhook",
+  "trakt.title": "Trakt account",
+  "trakt.configured": "Binding configured",
+  "trakt.description": "Bind your own Trakt account. Only this Ambra user’s playback and watched history will be synced.",
+  "trakt.disabled": "Trakt is disabled by the administrator. You can still remove an existing binding.",
+  "trakt.keepToken": "Token saved; leave blank to keep it",
+  "trakt.tokenPlaceholder": "Enter your own OAuth Access Token",
+  "trakt.credentialsHelp": "Enter the Client ID and Access Token obtained from your Trakt authorization. Update expired tokens here. Saved tokens are never returned.",
+  "trakt.scrobble": "Scrobble playback progress",
+  "trakt.watched": "Sync watched history",
+  "trakt.save": "Save binding and preferences",
+  "trakt.disconnect": "Disconnect",
+  "trakt.saved": "Trakt binding and preferences saved",
+  "trakt.disconnected": "Your Trakt account has been disconnected",
+  "trakt.retry": "Unable to load Trakt settings. Retry",
+  "trakt.adminDescription": "Control whether Trakt is available to users. Each user configures their own Client ID, Access Token and sync preferences under Profile → Trakt account. No global account is stored here."
 }
