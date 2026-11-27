@@ -174,8 +174,11 @@ export async function embyFetch<T>(
   })
 
   if (res.status === 401 && requireAuth) {
-    clearAuth()
-    window.dispatchEvent(new CustomEvent('ambra:unauthorized'))
+    const latestToken = getStoredAuth()?.accessToken
+    if (!token || !latestToken || latestToken === token) {
+      clearAuth()
+      window.dispatchEvent(new CustomEvent('ambra:unauthorized'))
+    }
     throw new ApiError(401, translateForLocale(getActiveLocale(), 'api.error.sessionExpired'))
   }
 

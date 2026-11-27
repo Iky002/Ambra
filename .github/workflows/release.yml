@@ -22,10 +22,10 @@ jobs:
       contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Node.js 24
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
           cache: 'npm'
@@ -35,7 +35,7 @@ jobs:
         run: cd web && npm ci && npm run build
 
       - name: Setup Go 1.26
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.26'
           cache: true
@@ -83,8 +83,8 @@ jobs:
 
       - name: Bundle Full packages WITH static FFmpeg & FFprobe
         env:
-          # Rolling BtbN release tag (override via repo variable BTBN_RELEASE_TAG if pinning a specific autobuild).
-          BTBN_RELEASE_TAG: ${{ vars.BTBN_RELEASE_TAG || 'latest' }}
+          # Pinned permanent month-end BtbN release snapshot (override via repo variable BTBN_RELEASE_TAG if updating).
+          BTBN_RELEASE_TAG: ${{ vars.BTBN_RELEASE_TAG || 'autobuild-2026-10-31-12-59' }}
           BTBN_FFMPEG_BRANCH: n8.1
           BTBN_SHA256_LINUX64: ${{ vars.BTBN_SHA256_LINUX64 || '' }}
           BTBN_SHA256_LINUXARM64: ${{ vars.BTBN_SHA256_LINUXARM64 || '' }}
@@ -97,6 +97,11 @@ jobs:
           if [[ ! "${BTBN_RELEASE_TAG}" =~ ^(latest|autobuild-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2})$ ]]; then
             echo "ERROR: BTBN_RELEASE_TAG must be 'latest' or 'autobuild-YYYY-MM-DD-HH-MM', got '${BTBN_RELEASE_TAG}'" >&2
             exit 1
+          fi
+          if [ "${BTBN_RELEASE_TAG}" = "autobuild-2026-10-31-12-59" ]; then
+            BTBN_SHA256_LINUX64="${BTBN_SHA256_LINUX64:-41e9c565594c390622cf968d82fa4135d9e9a11d06c1515644288cbc844e3380}"
+            BTBN_SHA256_LINUXARM64="${BTBN_SHA256_LINUXARM64:-a08c0ee6e1c4e02139344b303002dcc7c37cf125d639f1fbd15dabee40fcb525}"
+            BTBN_SHA256_WIN64="${BTBN_SHA256_WIN64:-401dffcf14c301082e1fc03b0bc876b92ea676bfc521fc56e80a1537d137034f}"
           fi
           BTBN_RELEASE_BASE="https://github.com/BtbN/FFmpeg-Builds/releases/download/${BTBN_RELEASE_TAG}"
           sudo apt-get update && sudo apt-get install -y --no-install-recommends xz-utils zip unzip file
@@ -186,7 +191,7 @@ jobs:
             local branch_ver="${BTBN_FFMPEG_BRANCH#n}"
             local branch_ver_re="${branch_ver//./\\.}"
             local matches
-            matches="$(grep -E "^[0-9a-fA-F]{64}  ffmpeg-${BTBN_FFMPEG_BRANCH}-[A-Za-z0-9._-]+-${arch_tag}-gpl-${branch_ver_re}\.${ext}$" "${BTBN_CHECKSUMS}" || true)"
+            matches="$(grep -E "^[0-9a-fA-F]{64}  ffmpeg-${BTBN_FFMPEG_BRANCH//./\\.}[.-][A-Za-z0-9._-]+-${arch_tag}-gpl-${branch_ver_re}\.${ext}$" "${BTBN_CHECKSUMS}" || true)"
             if [ -z "${matches}" ]; then
               echo "ERROR: missing ${BTBN_FFMPEG_BRANCH} archive entry for ${platform} in checksums.sha256 (fail-closed)" >&2
               exit 1
@@ -307,7 +312,7 @@ jobs:
           cat SHA256SUMS
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-binaries
           path: dist/release/*
@@ -316,7 +321,7 @@ jobs:
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ steps.build-lite.outputs.version }}
           prerelease: ${{ steps.build-lite.outputs.prerelease == 'true' }}
@@ -340,16 +345,16 @@ jobs:
             target: runtime-lite
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GitHub Container Registry (GHCR)
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -397,13 +402,13 @@ jobs:
 
       - name: Extract Docker metadata (${{ matrix.variant }})
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ghcr.io/${{ github.repository }}
           tags: ${{ steps.validate-tag.outputs.tags }}
 
       - name: Build and push multi-arch image (${{ matrix.variant }})
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: ./Dockerfile
