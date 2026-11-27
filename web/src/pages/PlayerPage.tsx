@@ -358,6 +358,8 @@ export function PlayerPage() {
   const [isPip, setIsPip] = useState(false)
   const [osdVisible, setOsdVisible] = useState(true)
   const [activePanel, setActivePanel] = useState<ActivePanel>('none')
+  const activePanelRef = useRef(activePanel)
+  activePanelRef.current = activePanel
   const [showStats, setShowStats] = useState(false)
   const [showShortcuts, setShowShortcuts] = useState(false)
   const [playerError, setPlayerError] = useState<string | null>(null)
@@ -1130,7 +1132,7 @@ export function PlayerPage() {
         hls.attachMedia(video)
         hls.on(Hls.Events.MANIFEST_PARSED, startPlayback)
         hls.on(Hls.Events.ERROR, (_evt, data) => {
-          if (!data.fatal || cancelled) return
+          if (!data.fatal || cancelled || hlsRef.current !== hls) return
           if (hlsRecoveryCountRef.current < 2) {
             if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
               hlsRecoveryCountRef.current += 1
@@ -1142,6 +1144,10 @@ export function PlayerPage() {
               hls.recoverMediaError()
               return
             }
+          }
+          hls.destroy()
+          if (hlsRef.current === hls) {
+            hlsRef.current = null
           }
           setBuffering(false)
           setPlayerError(tRef.current('playerUi.errHlsPlayback', { details: data.details }))
@@ -1550,7 +1556,11 @@ export function PlayerPage() {
           const renderer = new PgsCanvasRenderer(pgsCanvasRef.current)
           pgsRendererRef.current = renderer
           await renderer.loadFromUrl(subUrl)
-          if (!cancelled && videoRef.current) {
+          if (cancelled || pgsRendererRef.current !== renderer) {
+            renderer.destroy()
+            return
+          }
+          if (videoRef.current) {
             renderer.setTimeOffset(subtitlePrefsRef.current.offsetSec)
             renderer.renderAtTime(videoRef.current.currentTime)
           }
@@ -1736,6 +1746,10 @@ export function PlayerPage() {
     }
     const syncSameEpisodeTracks = () => {
       if (renderedItemIdRef.current !== sessionSnapshot.itemId) return
+      sessionSnapshot.initialStartTicks = Math.max(
+        sessionSnapshot.initialStartTicks,
+        playbackMetaRef.current.effectiveStartTicks,
+      )
       sessionSnapshot.audioIndex = playbackMetaRef.current.audioIndex
       sessionSnapshot.subtitleIndex = playbackMetaRef.current.subtitleIndex
       sessionSnapshot.subtitleExplicitlyOff = subtitleExplicitlyOffRef.current
@@ -1777,6 +1791,12 @@ export function PlayerPage() {
     const sendKeepaliveStop = () => {
       if (unloadReported || stopReportedRef.current) return
       const videoEl = videoRef.current
+      if (renderedItemIdRef.current === sessionSnapshot.itemId) {
+        sessionSnapshot.initialStartTicks = Math.max(
+          sessionSnapshot.initialStartTicks,
+          playbackMetaRef.current.effectiveStartTicks,
+        )
+      }
       if (!videoEl && lastVideoTimeSecRef.current <= 0 && sessionSnapshot.initialStartTicks <= 0) {
         return
       }
@@ -1851,11 +1871,11 @@ export function PlayerPage() {
     setOsdVisible(true)
     if (hideOsdTimerRef.current) window.clearTimeout(hideOsdTimerRef.current)
     hideOsdTimerRef.current = window.setTimeout(() => {
-      if (videoRef.current && !videoRef.current.paused && activePanel === 'none') {
+      if (videoRef.current && !videoRef.current.paused && activePanelRef.current === 'none') {
         setOsdVisible(false)
       }
     }, 3200)
-  }, [activePanel])
+  }, [])
 
   useEffect(() => {
     return () => {
@@ -2338,6 +2358,7 @@ export function PlayerPage() {
         }}
         onPlaying={() => {
           setBuffering(false)
+          setPlayerError(null)
           if (isHybridVideoOnly && hybridAudioRef.current?.src && !videoRef.current?.paused) {
             hybridAudioRef.current.play().catch(() => undefined)
           }
@@ -2439,6 +2460,7 @@ export function PlayerPage() {
           }
         }}
         onError={() => {
+          if (hlsRef.current) return
           // 1) STRM 源直连失败（如 302 跨域/Referer 限制或浏览器拒绝外链）时，优先尝试服务端代理直出 (&proxy=1)
           if (
             playMethod === 'DirectPlay' &&

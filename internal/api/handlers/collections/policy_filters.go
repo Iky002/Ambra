@@ -244,14 +244,40 @@ func (h *Handler) isChildVisibleToUser(r *http.Request, itemRec *sqlite.ItemReco
 	} else if allowed != nil && itemRec.LibraryID != "" && !isLibraryAllowed(itemRec.LibraryID, allowed) {
 		return false
 	}
-	uPol := dto.UserPolicy{
-		EnableAllFolders:   allowed == nil,
-		EnabledFolders:     allowed,
-		EnableLiveTvAccess: true,
-		MaxParentalRating:  pol.maxRating,
-		BlockedTags:        pol.blockedTags,
-		BlockUnratedItems:  pol.blockUnratedItems,
-		AllowedTags:        pol.allowedTags,
+	uPol := sqlite.DefaultUserPolicy(false)
+	if r != nil {
+		hasIdentity := false
+		if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.IsAPIKey || ac.User != nil || ac.UserID() != "") {
+			hasIdentity = true
+		} else if h.auth.UserIDFromCtx != nil && strings.TrimSpace(h.auth.UserIDFromCtx(r.Context())) != "" {
+			hasIdentity = true
+		}
+		if hasIdentity {
+			uPol = h.userPolicyForRequest(r, "")
+		}
+	}
+	if allowed != nil {
+		uPol.IsAdministrator = false
+		uPol.EnableAllFolders = false
+		uPol.EnabledFolders = allowed
+	} else if uPol.EnabledFolders == nil {
+		uPol.EnabledFolders = []string{}
+	}
+	if pol.maxRating != nil {
+		uPol.IsAdministrator = false
+		uPol.MaxParentalRating = pol.maxRating
+	}
+	if len(pol.blockedTags) > 0 {
+		uPol.IsAdministrator = false
+		uPol.BlockedTags = pol.blockedTags
+	}
+	if len(pol.blockUnratedItems) > 0 {
+		uPol.IsAdministrator = false
+		uPol.BlockUnratedItems = pol.blockUnratedItems
+	}
+	if len(pol.allowedTags) > 0 {
+		uPol.IsAdministrator = false
+		uPol.AllowedTags = pol.allowedTags
 	}
 	if blocked, bErr := h.repo.IsItemBlockedByPolicy(r.Context(), itemRec, uPol); bErr != nil || blocked {
 		return false

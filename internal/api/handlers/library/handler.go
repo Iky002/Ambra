@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -1767,9 +1768,11 @@ func (h *Handler) handleMediaUpdated(w http.ResponseWriter, r *http.Request) {
 			}
 			seen := make(map[scanTarget]bool)
 			for _, updPath := range updatePaths {
-				resolvedUpd := updPath
-				if sym, symErr := filepath.EvalSymlinks(updPath); symErr == nil {
-					resolvedUpd = filepath.Clean(sym)
+				resolvedUpd, symErr := filepath.EvalSymlinks(updPath)
+				if symErr == nil {
+					resolvedUpd = filepath.Clean(resolvedUpd)
+				} else if !os.IsNotExist(symErr) {
+					continue
 				}
 				for _, lib := range libs {
 					for _, root := range lib.Paths {
@@ -1777,7 +1780,18 @@ func (h *Handler) handleMediaUpdated(w http.ResponseWriter, r *http.Request) {
 						if symR, symRErr := filepath.EvalSymlinks(root); symRErr == nil {
 							resolvedRoot = filepath.Clean(symR)
 						}
-						if pathWithinRoot(updPath, root) || pathWithinRoot(resolvedUpd, resolvedRoot) {
+						within := false
+						if symErr == nil {
+							within = pathWithinRoot(resolvedUpd, resolvedRoot)
+						} else {
+							within = pathWithinRoot(updPath, root)
+							if within {
+								if symParent, pErr := filepath.EvalSymlinks(filepath.Dir(updPath)); pErr == nil {
+									within = pathWithinRoot(filepath.Clean(symParent), resolvedRoot)
+								}
+							}
+						}
+						if within {
 							t := scanTarget{libID: lib.ID, path: updPath}
 							if !seen[t] {
 								seen[t] = true

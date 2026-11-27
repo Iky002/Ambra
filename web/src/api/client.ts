@@ -119,7 +119,7 @@ export function buildEmbyAuthHeader(token?: string): string {
     'Client="Ambra Web"',
     'Device="Web Browser"',
     `DeviceId="${deviceId}"`,
-    'Version="0.12.0"',
+    'Version="0.12.1"',
   ]
   if (token) {
     parts.push(`Token="${token}"`)
@@ -174,8 +174,11 @@ export async function embyFetch<T>(
   })
 
   if (res.status === 401 && requireAuth) {
-    clearAuth()
-    window.dispatchEvent(new CustomEvent('ambra:unauthorized'))
+    const latestToken = getStoredAuth()?.accessToken
+    if (!token || !latestToken || latestToken === token) {
+      clearAuth()
+      window.dispatchEvent(new CustomEvent('ambra:unauthorized'))
+    }
     throw new ApiError(401, translateForLocale(getActiveLocale(), 'api.error.sessionExpired'))
   }
 

@@ -494,3 +494,252 @@ func TestOpsPartiesFullWatchTogetherLoopAndPurgeUser(t *testing.T) {
 		t.Fatalf("expected room cleaned up after PurgeUser, got %s", infoAfter.Body.String())
 	}
 }
+
+func TestBackupRestoreCleansStaleStagedArtifacts(t *testing.T) {
+	h, mux, st, cfg, _ := setupOpsTest(t)
+
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	avatarDir := filepath.Join(cfg.DataDir, "metadata", "users", "u1")
+	if err := os.MkdirAll(avatarDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(avatarDir, "primary_0.img"), []byte("avatar"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Create and stage a full zip backup -> ambra.db.restore, config/ambra.json.restore, and metadata.restore all exist.
+	bkRes := doReq(t, mux, http.MethodPost, "/BackupRestore/Backup", nil)
+	if bkRes.Code != http.StatusOK {
+		t.Fatalf("create backup failed: %d %s", bkRes.Code, bkRes.Body.String())
+	}
+	var bk BackupFileInfo
+	_ = json.Unmarshal(bkRes.Body.Bytes(), &bk)
+	if r := doReq(t, mux, http.MethodPost, "/BackupRestore/Restore", map[string]any{"Name": bk.Name}); r.Code != http.StatusOK {
+		t.Fatalf("restore full zip failed: %d %s", r.Code, r.Body.String())
+	}
+
+	stagedCfg := filepath.Join(cfg.DataDir, "config", "ambra.json.restore")
+	stagedMeta := filepath.Join(cfg.DataDir, "metadata.restore")
+	if _, err := os.Stat(stagedCfg); err != nil {
+		t.Fatalf("expected staged config restore file: %v", err)
+	}
+	if _, err := os.Stat(stagedMeta); err != nil {
+		t.Fatalf("expected staged metadata restore dir: %v", err)
+	}
+
+	// 2. Stage a DB-only zip backup (!hasConfig, !hasMetadata) -> stale config/ambra.json.restore and metadata.restore MUST be removed!
+	rawSnap := filepath.Join(h.backupsDir(), "dbonly-source.db")
+	escaped := strings.ReplaceAll(rawSnap, "'", "''")
+	if _, err := st.Writer.Exec(fmt.Sprintf("VACUUM INTO '%s'", escaped)); err != nil {
+		t.Fatal(err)
+	}
+	validDBBytes, err := os.ReadFile(rawSnap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbOnlyZip := filepath.Join(h.backupsDir(), "db-only.zip")
+	buildTestZipV0110(t, dbOnlyZip, map[string][]byte{"ambra.db": validDBBytes})
+	if r := doReq(t, mux, http.MethodPost, "/BackupRestore/Restore", map[string]any{"Name": "db-only.zip"}); r.Code != http.StatusOK {
+		t.Fatalf("restore db-only zip failed: %d %s", r.Code, r.Body.String())
+	}
+	if _, err := os.Stat(stagedCfg); !os.IsNotExist(err) {
+		t.Fatalf("expected stale ambra.json.restore removed on !hasConfig zip restore, err=%v", err)
+	}
+	if _, err := os.Stat(stagedMeta); !os.IsNotExist(err) {
+		t.Fatalf("expected stale metadata.restore removed on !hasMetadata zip restore, err=%v", err)
+	}
+
+	// 3. Re-stage full zip backup, then stage raw SQLite .db backup -> stale ambra.json.restore and metadata.restore MUST be removed!
+	if r := doReq(t, mux, http.MethodPost, "/BackupRestore/Restore", map[string]any{"Name": bk.Name}); r.Code != http.StatusOK {
+		t.Fatalf("re-restore full zip failed: %d", r.Code)
+	}
+	if _, err := os.Stat(stagedCfg); err != nil {
+		t.Fatalf("expected staged config restore recreated: %v", err)
+	}
+	if _, err := os.Stat(stagedMeta); err != nil {
+		t.Fatalf("expected staged metadata restore recreated: %v", err)
+	}
+	if r := doReq(t, mux, http.MethodPost, "/BackupRestore/Restore", map[string]any{"Name": "dbonly-source.db"}); r.Code != http.StatusOK {
+		t.Fatalf("restore raw sqlite db failed: %d %s", r.Code, r.Body.String())
+	}
+	if _, err := os.Stat(stagedCfg); !os.IsNotExist(err) {
+		t.Fatalf("expected stale ambra.json.restore removed on raw .db restore, err=%v", err)
+	}
+	if _, err := os.Stat(stagedMeta); !os.IsNotExist(err) {
+		t.Fatalf("expected stale metadata.restore removed on raw .db restore, err=%v", err)
+	}
+}
+
+func TestPartyJoinTOCTOUAndPlaystateWSMemberScrubbing(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := sqlite.Open(cfg.DBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	ctx := context.Background()
+	userRepo := sqlite.NewUserRepo(st)
+	authSvc := auth.NewService(userRepo, cfg)
+	bus := eventbus.New()
+	sessMgr := session.NewManager(userRepo, cfg, bus)
+	wsHub := ws.NewHub(authSvc, sessMgr, bus)
+
+	hostUser, _ := authSvc.CreateUser(ctx, "host_adult", "pass1234", false)
+	allowedMember, _ := authSvc.CreateUser(ctx, "member_adult", "pass1234", false)
+	restrictedKid, _ := authSvc.CreateUser(ctx, "member_kid", "pass1234", false)
+
+	adultAuth, err := authSvc.AuthenticateByName(ctx, "member_adult", "pass1234", "", auth.ClientInfo{DeviceID: "adult-tv", Client: "Web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kidAuth, err := authSvc.AuthenticateByName(ctx, "member_kid", "pass1234", "", auth.ClientInfo{DeviceID: "kid-tablet", Client: "Web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(st, cfg, userRepo, bus)
+	h.SetWSHub(wsHub)
+	t.Cleanup(h.Close)
+
+	var swapTriggered atomic.Bool
+	var targetPartyID atomic.Value
+	h.SetItemAccessChecker(func(_ context.Context, user *sqlite.UserRecord, itemID string) bool {
+		if user == nil {
+			return false
+		}
+		// Simulate concurrent host State.ItemId mutation while handleJoinParty released h.mu!
+		if user.Name == "member_kid" && itemID == "safe-cartoon" && swapTriggered.CompareAndSwap(false, true) {
+			if pid, _ := targetPartyID.Load().(string); pid != "" {
+				h.mu.Lock()
+				for i := range h.state.Parties {
+					if h.state.Parties[i].Id == pid {
+						h.state.Parties[i].State.ItemId = "restricted-r-movie"
+					}
+				}
+				h.mu.Unlock()
+			}
+			return true
+		}
+		if strings.HasPrefix(itemID, "restricted-") && user.Name == "member_kid" {
+			return false
+		}
+		return true
+	})
+
+	authMW := middleware.NewAuth(authSvc, sessMgr)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, AuthFuncs{
+		RequireAuth:  authMW.RequireAuth,
+		RequireAdmin: authMW.RequireAdmin,
+	})
+	mux.Handle("/embywebsocket", wsHub)
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dialWS := func(tok, devID string) *websocket.Conn {
+		t.Helper()
+		wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/embywebsocket?api_key=" + tok + "&deviceId=" + devID
+		dCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		conn, _, dialErr := websocket.Dial(dCtx, wsURL, nil)
+		if dialErr != nil {
+			t.Fatalf("dial ws %s: %v", devID, dialErr)
+		}
+		t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "done") })
+		var greeting ws.Message
+		rCtx, rCancel := context.WithTimeout(ctx, 2*time.Second)
+		defer rCancel()
+		if err := wsjson.Read(rCtx, conn, &greeting); err != nil {
+			t.Fatalf("ws greeting %s: %v", devID, err)
+		}
+		return conn
+	}
+	readNextNonKeepAlive := func(conn *websocket.Conn) ws.Message {
+		t.Helper()
+		for {
+			rCtx, rCancel := context.WithTimeout(ctx, 2*time.Second)
+			var msg ws.Message
+			err := wsjson.Read(rCtx, conn, &msg)
+			rCancel()
+			if err != nil {
+				t.Fatalf("read ws msg: %v", err)
+			}
+			if msg.MessageType == "ForceKeepAlive" || msg.MessageType == "KeepAlive" {
+				continue
+			}
+			return msg
+		}
+	}
+
+	hostAC := makeAuthCtx(hostUser.ID, hostUser.Name, false)
+	adultAC := makeAuthCtx(allowedMember.ID, allowedMember.Name, false)
+	kidAC := makeAuthCtx(restrictedKid.ID, restrictedKid.Name, false)
+
+	// 1. TOCTOU Join test: party starts on "safe-cartoon", but concurrently switches to "restricted-r-movie"
+	// while kid's Join item check has unlocked h.mu -> Join MUST re-verify and reject with 403!
+	cRec := doAuthReq(t, mux, hostAC, http.MethodPost, "/Parties", map[string]any{
+		"Name":   "Race Room",
+		"ItemId": "safe-cartoon",
+	})
+	var raceParty Party
+	_ = json.Unmarshal(cRec.Body.Bytes(), &raceParty)
+	targetPartyID.Store(raceParty.Id)
+
+	joinRaceRec := doAuthReq(t, mux, kidAC, http.MethodPost, "/Parties/"+raceParty.Id+"/Join", nil)
+	if joinRaceRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when party ItemId concurrently switched to restricted item during Join, got %d (%s)",
+			joinRaceRec.Code, joinRaceRec.Body.String())
+	}
+
+	// 2. Playstate WS broadcast scrubbing: create a party on "family-movie" where both adult and kid join,
+	// then host switches State.ItemId to "restricted-thriller" -> adult WS gets ItemId, kid WS gets ItemId==""!
+	cRec2 := doAuthReq(t, mux, hostAC, http.MethodPost, "/Parties", map[string]any{
+		"Name":   "Mixed Room",
+		"ItemId": "family-movie",
+	})
+	var mixedParty Party
+	_ = json.Unmarshal(cRec2.Body.Bytes(), &mixedParty)
+
+	adultConn := dialWS(adultAuth.AccessToken, "adult-tv")
+	kidConn := dialWS(kidAuth.AccessToken, "kid-tablet")
+
+	if r := doAuthReq(t, mux, adultAC, http.MethodPost, "/Parties/"+mixedParty.Id+"/Join", nil); r.Code != http.StatusOK {
+		t.Fatalf("adult join failed: %d", r.Code)
+	}
+	_ = readNextNonKeepAlive(adultConn) // PartyUpdated
+
+	if r := doAuthReq(t, mux, kidAC, http.MethodPost, "/Parties/"+mixedParty.Id+"/Join", nil); r.Code != http.StatusOK {
+		t.Fatalf("kid join failed: %d", r.Code)
+	}
+	_ = readNextNonKeepAlive(adultConn) // PartyUpdated
+	_ = readNextNonKeepAlive(kidConn)   // PartyUpdated
+
+	pos := int64(123456)
+	updRec := doAuthReq(t, mux, hostAC, http.MethodPost, "/Parties/"+mixedParty.Id+"/State", map[string]any{
+		"ItemId":        "restricted-thriller",
+		"PositionTicks": pos,
+		"IsPaused":      false,
+	})
+	if updRec.Code != http.StatusOK {
+		t.Fatalf("host update state failed: %d %s", updRec.Code, updRec.Body.String())
+	}
+
+	adultPlay := readNextNonKeepAlive(adultConn)
+	kidPlay := readNextNonKeepAlive(kidConn)
+	adultData, _ := adultPlay.Data.(map[string]any)
+	kidData, _ := kidPlay.Data.(map[string]any)
+	if adultPlay.MessageType != "Playstate" || adultData["ItemId"] != "restricted-thriller" {
+		t.Fatalf("expected adult member to receive Playstate with ItemId=restricted-thriller, got %+v", adultPlay)
+	}
+	if kidPlay.MessageType != "Playstate" || kidData["ItemId"] != "" {
+		t.Fatalf("expected restricted kid member to receive Playstate with scrubbed ItemId=\"\", got %+v", kidPlay)
+	}
+}

@@ -59,7 +59,18 @@ func (h *Handler) toUserDto(u *sqlite.UserRecord) dto.UserDto {
 // --- /Users public & management ---
 
 func forgotClientIP(r *http.Request) string {
-	return netutil.ClientIP(r)
+	ip := strings.TrimSpace(netutil.ClientIP(r))
+	if ip == "" {
+		return ""
+	}
+	if addr, err := netip.ParseAddr(ip); err == nil {
+		addr = addr.WithZone("").Unmap()
+		if addr.Is6() {
+			return netip.PrefixFrom(addr, 64).Masked().String()
+		}
+		return addr.String()
+	}
+	return ip
 }
 
 func prunePasswordResetFiles(dataDir string, maxKeep int) {
@@ -148,11 +159,68 @@ func pruneRateBucketLocked(bucket map[string][]time.Time, cutoff time.Time, maxE
 	}
 }
 
-func appendRateBucketLocked(bucket map[string][]time.Time, key string, now time.Time, maxEntries int) {
-	if _, exists := bucket[key]; !exists && maxEntries > 0 && len(bucket) >= maxEntries {
-		return
+func evictOldestRateKeyLocked(bucket map[string][]time.Time, lockLimit int) bool {
+	if len(bucket) == 0 {
+		return false
+	}
+	var oldestKey string
+	var oldestTime time.Time
+	foundUnlocked := false
+	if lockLimit > 0 {
+		for k, ts := range bucket {
+			if len(ts) >= lockLimit {
+				continue
+			}
+			last := bucketLastAttempt(ts)
+			if !foundUnlocked || last.Before(oldestTime) || (last.Equal(oldestTime) && k < oldestKey) {
+				oldestKey = k
+				oldestTime = last
+				foundUnlocked = true
+			}
+		}
+	}
+	if !foundUnlocked {
+		first := true
+		for k, ts := range bucket {
+			last := bucketLastAttempt(ts)
+			if first || last.Before(oldestTime) || (last.Equal(oldestTime) && k < oldestKey) {
+				oldestKey = k
+				oldestTime = last
+				first = false
+			}
+		}
+		if first {
+			return false
+		}
+	}
+	delete(bucket, oldestKey)
+	return true
+}
+
+func countIPSubBucketsLocked(bucket map[string][]time.Time, ipKey string) int {
+	prefix := ipKey + "|"
+	count := 0
+	for k := range bucket {
+		if strings.HasPrefix(k, prefix) {
+			count++
+		}
+	}
+	return count
+}
+
+func appendRateBucketWithEvictLocked(bucket map[string][]time.Time, key string, now time.Time, maxEntries, lockLimit int) {
+	if _, exists := bucket[key]; !exists && maxEntries > 0 {
+		for len(bucket) >= maxEntries {
+			if !evictOldestRateKeyLocked(bucket, lockLimit) {
+				break
+			}
+		}
 	}
 	bucket[key] = append(bucket[key], now)
+}
+
+func appendRateBucketLocked(bucket map[string][]time.Time, key string, now time.Time, maxEntries int) {
+	appendRateBucketWithEvictLocked(bucket, key, now, maxEntries, 0)
 }
 
 func generateSixDigitPin() string {
@@ -346,6 +414,19 @@ func (h *Handler) forgotPasswordPin(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if matched == nil && len(h.forgotPins) > 0 {
+		for k, entry := range h.forgotPins {
+			entry.failedAttempts++
+			if entry.failedAttempts >= forgotPinMaxFailedAttempts {
+				if entry.PinFile != "" {
+					filesToClean = append(filesToClean, entry.PinFile)
+				}
+				delete(h.forgotPins, k)
+			} else {
+				h.forgotPins[k] = entry
+			}
+		}
+	}
 	h.mu.Unlock()
 
 	for _, f := range filesToClean {
@@ -424,6 +505,22 @@ func normalizeAuthByIDRateKey(ip, uid string) string {
 	return normIP + "|" + normUID
 }
 
+func recordAuthByIDFailureBucketsLocked(compMap, ipMap map[string][]time.Time, compKey, ipKey string, now time.Time, compLimit, ipLimit int) {
+	appendRateBucketWithEvictLocked(ipMap, ipKey, now, maxRateLimitBuckets, ipLimit)
+	if compKey == ipKey {
+		appendRateBucketWithEvictLocked(compMap, compKey, now, maxRateLimitBuckets, compLimit)
+		return
+	}
+	if _, exists := compMap[compKey]; exists {
+		compMap[compKey] = append(compMap[compKey], now)
+		return
+	}
+	if countIPSubBucketsLocked(compMap, ipKey) >= maxSubBucketsPerIP {
+		return
+	}
+	appendRateBucketWithEvictLocked(compMap, compKey, now, maxRateLimitBuckets, compLimit)
+}
+
 func (h *Handler) isAuthByIDRateLimited(ip, uid string, now time.Time) bool {
 	ip = strings.TrimSpace(ip)
 	if ip == "" {
@@ -445,16 +542,10 @@ func (h *Handler) isAuthByIDRateLimited(ip, uid string, now time.Time) bool {
 			if uid != "" && len(h.loopbackAuthByIDRates[ipKey]) >= authByIDLoopbackRateLimit {
 				return true
 			}
-			if _, exists := h.loopbackAuthByIDRates[compKey]; !exists && len(h.loopbackAuthByIDRates) >= maxRateLimitBuckets {
-				return true
-			}
 		}
 		if h.loopbackAuthByIDIPRates != nil {
 			pruneRateBucketLocked(h.loopbackAuthByIDIPRates, cutoff, maxRateLimitBuckets)
 			if len(h.loopbackAuthByIDIPRates[ipKey]) >= authByIDLoopbackIPRateLimit {
-				return true
-			}
-			if _, exists := h.loopbackAuthByIDIPRates[ipKey]; !exists && len(h.loopbackAuthByIDIPRates) >= maxRateLimitBuckets {
 				return true
 			}
 		}
@@ -469,16 +560,10 @@ func (h *Handler) isAuthByIDRateLimited(ip, uid string, now time.Time) bool {
 		if uid != "" && len(h.authByIDRates[ipKey]) >= authByIDRateLimit {
 			return true
 		}
-		if _, exists := h.authByIDRates[compKey]; !exists && len(h.authByIDRates) >= maxRateLimitBuckets {
-			return true
-		}
 	}
 	if h.authByIDIPRates != nil {
 		pruneRateBucketLocked(h.authByIDIPRates, cutoff, maxRateLimitBuckets)
 		if len(h.authByIDIPRates[ipKey]) >= authByIDIPRateLimit {
-			return true
-		}
-		if _, exists := h.authByIDIPRates[ipKey]; !exists && len(h.authByIDIPRates) >= maxRateLimitBuckets {
 			return true
 		}
 	}
@@ -506,8 +591,7 @@ func (h *Handler) recordAuthByIDFailure(ip, uid string, now time.Time) {
 		cutoff := now.Add(-authByIDLoopbackRateWindow)
 		pruneRateBucketLocked(h.loopbackAuthByIDRates, cutoff, maxRateLimitBuckets)
 		pruneRateBucketLocked(h.loopbackAuthByIDIPRates, cutoff, maxRateLimitBuckets)
-		appendRateBucketLocked(h.loopbackAuthByIDRates, compKey, now, maxRateLimitBuckets)
-		appendRateBucketLocked(h.loopbackAuthByIDIPRates, ipKey, now, maxRateLimitBuckets)
+		recordAuthByIDFailureBucketsLocked(h.loopbackAuthByIDRates, h.loopbackAuthByIDIPRates, compKey, ipKey, now, authByIDLoopbackRateLimit, authByIDLoopbackIPRateLimit)
 		return
 	}
 	if h.authByIDRates == nil {
@@ -519,8 +603,7 @@ func (h *Handler) recordAuthByIDFailure(ip, uid string, now time.Time) {
 	cutoff := now.Add(-authByIDRateWindow)
 	pruneRateBucketLocked(h.authByIDRates, cutoff, maxRateLimitBuckets)
 	pruneRateBucketLocked(h.authByIDIPRates, cutoff, maxRateLimitBuckets)
-	appendRateBucketLocked(h.authByIDRates, compKey, now, maxRateLimitBuckets)
-	appendRateBucketLocked(h.authByIDIPRates, ipKey, now, maxRateLimitBuckets)
+	recordAuthByIDFailureBucketsLocked(h.authByIDRates, h.authByIDIPRates, compKey, ipKey, now, authByIDRateLimit, authByIDIPRateLimit)
 }
 
 func (h *Handler) isGlobalRemoteAccessEnabled() bool {
@@ -2659,34 +2742,98 @@ func isSafeRasterImageType(ct string) bool {
 	}
 }
 
-func (h *Handler) isRequestAuthenticated(r *http.Request) bool {
-	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
-		return true
+func (h *Handler) isRemoteAccessAllowed(u *sqlite.UserRecord) bool {
+	if !h.isGlobalRemoteAccessEnabled() {
+		return false
 	}
-	if h.auth.UserIDFromCtx != nil && strings.TrimSpace(h.auth.UserIDFromCtx(r.Context())) != "" {
-		return true
+	if u != nil && !u.Policy.EnableRemoteAccess {
+		return false
+	}
+	return true
+}
+
+func (h *Handler) resolveUserImageCaller(r *http.Request) (authed bool, remoteDenied bool, callerID string, isAdmin bool) {
+	isLocal := netutil.IsLocalOrLANRequest(r)
+	checkUser := func(u *sqlite.UserRecord) (bool, bool, string, bool) {
+		if u == nil || u.IsDisabled || u.Policy.IsDisabled {
+			return false, false, "", false
+		}
+		if !isLocal && !h.isRemoteAccessAllowed(u) {
+			return false, true, "", false
+		}
+		return true, false, guid.Normalize(u.ID), u.IsAdmin || u.Policy.IsAdministrator
+	}
+
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.IsAPIKey {
+			return true, false, guid.Normalize(ac.UserID()), true
+		}
+		return checkUser(ac.User)
+	}
+	if h.auth.UserIDFromCtx != nil {
+		if cid := strings.TrimSpace(h.auth.UserIDFromCtx(r.Context())); cid != "" {
+			normCID := guid.Normalize(cid)
+			if h.userRepo != nil {
+				if u, err := h.userRepo.GetUserByID(r.Context(), normCID); err == nil && u != nil {
+					return checkUser(u)
+				}
+			}
+			if !isLocal && !h.isGlobalRemoteAccessEnabled() {
+				return false, true, "", false
+			}
+			return true, false, normCID, false
+		}
 	}
 	if tok := strings.TrimSpace(middleware.ExtractClientInfo(r).Token); tok != "" {
 		if h.authSvc != nil {
-			if _, err := h.authSvc.ValidateToken(r.Context(), tok); err == nil {
-				return true
+			if id, err := h.authSvc.ValidateToken(r.Context(), tok); err == nil && id != nil {
+				if id.IsAPIKey {
+					return true, false, "", true
+				}
+				return checkUser(id.User)
 			}
 		} else if h.userRepo != nil {
-			if _, err := h.userRepo.GetAccessToken(r.Context(), tok); err == nil {
-				return true
+			if at, err := h.userRepo.GetAccessToken(r.Context(), tok); err == nil && at != nil {
+				if u, uErr := h.userRepo.GetUserByID(r.Context(), at.UserID); uErr == nil && u != nil {
+					return checkUser(u)
+				}
+				if !isLocal && !h.isGlobalRemoteAccessEnabled() {
+					return false, true, "", false
+				}
+				return true, false, guid.Normalize(at.UserID), false
 			}
 			if _, err := h.userRepo.GetAPIKey(r.Context(), tok); err == nil {
-				return true
+				return true, false, "", true
 			}
 		}
 	}
-	return false
+	return false, false, "", false
+}
+
+func (h *Handler) isRequestAuthenticated(r *http.Request) bool {
+	authed, _, _, _ := h.resolveUserImageCaller(r)
+	return authed
 }
 
 func (h *Handler) serveUserImage(w http.ResponseWriter, r *http.Request, headOnly bool) {
 	uid := h.resolveUserID(r, "Id")
-	if !h.isRequestAuthenticated(r) && h.userRepo != nil {
+	authed, remoteDenied, callerID, isAdmin := h.resolveUserImageCaller(r)
+	if remoteDenied {
+		writeJSONError(w, r, http.StatusForbidden, "Remote access is disabled")
+		return
+	}
+	if !authed && h.userRepo != nil {
 		if (h.cfg != nil && !h.cfg.Snapshot().EnableLoginUserList) || uid == "" {
+			writeJSONError(w, r, http.StatusNotFound, "user image not found")
+			return
+		}
+		u, err := h.userRepo.GetUserByID(r.Context(), uid)
+		if err != nil || u == nil || u.IsDisabled || u.Policy.IsDisabled || u.Policy.IsHidden {
+			writeJSONError(w, r, http.StatusNotFound, "user image not found")
+			return
+		}
+	} else if authed && !isAdmin && h.userRepo != nil && (uid == "" || guid.Normalize(callerID) != guid.Normalize(uid)) {
+		if uid == "" {
 			writeJSONError(w, r, http.StatusNotFound, "user image not found")
 			return
 		}

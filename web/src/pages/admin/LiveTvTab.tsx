@@ -61,7 +61,7 @@ export function LiveTvTab() {
   const [tunerName, setTunerName] = useState('')
   const [tunerUrl, setTunerUrl] = useState('')
   const [addingTuner, setAddingTuner] = useState(false)
-  const [refreshingTunerId, setRefreshingTunerId] = useState<string | null>(null)
+  const [refreshingTunerIds, setRefreshingTunerIds] = useState<Record<string, boolean>>({})
   const [deletingTunerId, setDeletingTunerId] = useState<string | null>(null)
   const [confirmDeleteTuner, setConfirmDeleteTuner] = useState<LiveTvTunerHostInfo | null>(null)
 
@@ -328,7 +328,7 @@ export function LiveTvTab() {
   const refreshTunerMutation = useMutation({
     mutationFn: (host: { Id: string; FriendlyName?: string }) => api.refreshTunerHost(host.Id),
     onMutate: (host) => {
-      setRefreshingTunerId(host.Id)
+      setRefreshingTunerIds((prev) => ({ ...prev, [host.Id]: true }))
       setFeedback(null)
     },
     onSuccess: async (updated, host) => {
@@ -356,8 +356,13 @@ export function LiveTvTab() {
         message: err instanceof Error ? err.message : t('admin.livetv.tunerRefreshFailed'),
       })
     },
-    onSettled: () => {
-      setRefreshingTunerId(null)
+    onSettled: (_data, _err, host) => {
+      setRefreshingTunerIds((prev) => {
+        if (!prev[host.Id]) return prev
+        const next = { ...prev }
+        delete next[host.Id]
+        return next
+      })
     },
   })
 
@@ -744,7 +749,9 @@ export function LiveTvTab() {
                       <button
                         type="button"
                         data-testid={`refresh-tuner-${host.Id}`}
-                        disabled={refreshingTunerId === host.Id || deletingTunerId === host.Id}
+                        disabled={
+                          Boolean(refreshingTunerIds[host.Id]) || deletingTunerId === host.Id
+                        }
                         onClick={() =>
                           refreshTunerMutation.mutate({
                             Id: host.Id!,
@@ -754,14 +761,14 @@ export function LiveTvTab() {
                         className="inline-flex items-center gap-1 rounded-lg border border-amber-500/25 bg-amber-500/10 px-2.5 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/20 disabled:opacity-50"
                       >
                         <RefreshCw
-                          className={`h-3.5 w-3.5 ${refreshingTunerId === host.Id ? 'animate-spin' : ''}`}
+                          className={`h-3.5 w-3.5 ${Boolean(refreshingTunerIds[host.Id]) ? 'animate-spin' : ''}`}
                         />
                         <span>{t('admin.livetv.refreshTunerBtn')}</span>
                       </button>
                     )}
                     <button
                       type="button"
-                      disabled={deletingTunerId === host.Id || refreshingTunerId === host.Id}
+                      disabled={deletingTunerId === host.Id || Boolean(refreshingTunerIds[host.Id])}
                       onClick={() => setConfirmDeleteTuner(host)}
                       className="inline-flex items-center gap-1 rounded-lg border border-red-500/25 bg-red-500/10 px-2.5 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
                     >

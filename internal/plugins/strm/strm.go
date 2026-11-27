@@ -88,6 +88,29 @@ func (r *Resolver) Configure(cfg map[string]any) error {
 	return nil
 }
 
+func resolveStrmSymlinkWithinDir(strmPath string) (string, bool) {
+	baseDir := filepath.Dir(filepath.Clean(strmPath))
+	realBase, err := filepath.EvalSymlinks(baseDir)
+	if err != nil {
+		realBase, err = filepath.Abs(baseDir)
+		if err != nil {
+			return "", false
+		}
+	}
+	realTarget, err := filepath.EvalSymlinks(filepath.Clean(strmPath))
+	if err != nil {
+		return "", false
+	}
+	rel, err := filepath.Rel(realBase, realTarget)
+	if err != nil {
+		return "", false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", false
+	}
+	return realTarget, true
+}
+
 func (r *Resolver) ResolveStream(_ context.Context, rawPath string) (*plugins.StreamResolveResult, error) {
 	if !r.enabled.Load() {
 		return nil, nil
@@ -95,7 +118,31 @@ func (r *Resolver) ResolveStream(_ context.Context, rawPath string) (*plugins.St
 	if !strings.EqualFold(filepath.Ext(rawPath), ".strm") {
 		return nil, nil
 	}
-	f, err := os.Open(rawPath)
+	fi, err := os.Lstat(rawPath)
+	if err != nil {
+		return nil, err
+	}
+	if fi.IsDir() {
+		return nil, fmt.Errorf("strm: path %q is a directory", rawPath)
+	}
+	openPath := rawPath
+	if fi.Mode()&os.ModeSymlink != 0 {
+		resolved, ok := resolveStrmSymlinkWithinDir(rawPath)
+		if !ok {
+			return nil, fmt.Errorf("strm: symlink %q escapes media directory", rawPath)
+		}
+		targetInfo, statErr := os.Stat(resolved)
+		if statErr != nil {
+			return nil, statErr
+		}
+		if !targetInfo.Mode().IsRegular() {
+			return nil, fmt.Errorf("strm: symlink target %q is not a regular file", resolved)
+		}
+		openPath = resolved
+	} else if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("strm: path %q is not a regular file", rawPath)
+	}
+	f, err := os.Open(openPath)
 	if err != nil {
 		return nil, err
 	}

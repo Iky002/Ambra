@@ -123,7 +123,7 @@ export function LiveTvPage() {
   const [playbackError, setPlaybackError] = useState<string | null>(null)
   const [nowMs, setNowMs] = useState(() => Date.now())
   const [streamRetryTick, setStreamRetryTick] = useState(0)
-  const [forceHls, setForceHls] = useState(false)
+  const [forceHlsChannelId, setForceHlsChannelId] = useState<string | null>(null)
   const [dvrFeedback, setDvrFeedback] = useState<{
     type: 'success' | 'error'
     message: string
@@ -175,7 +175,7 @@ export function LiveTvPage() {
   )
 
   const { data: programsData } = useQuery({
-    queryKey: ['liveTv', 'programs', channelIdsForEpg.length],
+    queryKey: ['liveTv', 'programs', channelIdsForEpg.join(',')],
     queryFn: () => {
       const baseNow = Date.now()
       const minEndDate = new Date(baseNow - 5 * 60_000).toISOString()
@@ -455,6 +455,7 @@ export function LiveTvPage() {
   }, [channels, requestedChannelId])
 
   const activeChannelId = activeChannel?.Id ?? ''
+  const forceHls = Boolean(activeChannelId && forceHlsChannelId === activeChannelId)
   const activeStreamUrl = activeChannelId ? getLiveTvChannelStreamUrl(activeChannelId) : ''
   const activeLooksLikeHls = useMemo(() => {
     if (!activeChannel) return false
@@ -465,16 +466,10 @@ export function LiveTvPage() {
     return hintUrl.includes('.m3u8') || hintUrl.includes('hls')
   }, [activeChannel, activeStreamUrl])
 
-  useEffect(() => {
-    setForceHls(false)
-    mediaRecoveryCountRef.current = 0
-    networkRecoveryCountRef.current = 0
-  }, [activeChannelId])
-
   const handleSelectChannel = (channelId: string) => {
     pauseGlobalAudio()
     setPlaybackError(null)
-    setForceHls(false)
+    setForceHlsChannelId(null)
     mediaRecoveryCountRef.current = 0
     networkRecoveryCountRef.current = 0
     const next = new URLSearchParams(searchParams)
@@ -584,15 +579,29 @@ export function LiveTvPage() {
 
     let cancelled = false
     let hls: Hls | null = null
-    let recoveryTimer: number | null = null
+    let mediaRecoveryTimer: number | null = null
+    let networkRecoveryTimer: number | null = null
     let stableResetTimer: number | null = null
     let lastFatalErrorAt = 0
+    let streamStalledOrPaused = false
 
-    const clearRecoveryTimer = () => {
-      if (recoveryTimer !== null) {
-        window.clearTimeout(recoveryTimer)
-        recoveryTimer = null
+    const clearMediaRecoveryTimer = () => {
+      if (mediaRecoveryTimer !== null) {
+        window.clearTimeout(mediaRecoveryTimer)
+        mediaRecoveryTimer = null
       }
+    }
+
+    const clearNetworkRecoveryTimer = () => {
+      if (networkRecoveryTimer !== null) {
+        window.clearTimeout(networkRecoveryTimer)
+        networkRecoveryTimer = null
+      }
+    }
+
+    const clearAllRecoveryTimers = () => {
+      clearMediaRecoveryTimer()
+      clearNetworkRecoveryTimer()
     }
 
     const clearStableResetTimer = () => {
@@ -603,7 +612,7 @@ export function LiveTvPage() {
     }
 
     const destroyHls = () => {
-      clearRecoveryTimer()
+      clearAllRecoveryTimers()
       clearStableResetTimer()
       if (hls) {
         hls.destroy()
@@ -615,7 +624,7 @@ export function LiveTvPage() {
     }
 
     const handleStablePlaybackSignal = () => {
-      if (cancelled || !hls || hlsRef.current !== hls) return
+      if (cancelled || !hls || hlsRef.current !== hls || streamStalledOrPaused) return
       if (mediaRecoveryCountRef.current === 0 && networkRecoveryCountRef.current === 0) return
 
       const elapsed = lastFatalErrorAt > 0 ? Date.now() - lastFatalErrorAt : 0
@@ -634,7 +643,7 @@ export function LiveTvPage() {
             : HLS_RECOVERY_RESET_MS
         stableResetTimer = window.setTimeout(() => {
           stableResetTimer = null
-          if (cancelled || !hls || hlsRef.current !== hls) return
+          if (cancelled || !hls || hlsRef.current !== hls || streamStalledOrPaused) return
           mediaRecoveryCountRef.current = 0
           networkRecoveryCountRef.current = 0
           lastFatalErrorAt = 0
@@ -642,8 +651,23 @@ export function LiveTvPage() {
       }
     }
 
-    const onPlaying = () => {
+    const markStableActivity = () => {
+      if (streamStalledOrPaused) {
+        streamStalledOrPaused = false
+        if (mediaRecoveryCountRef.current > 0 || networkRecoveryCountRef.current > 0) {
+          lastFatalErrorAt = Date.now()
+        }
+      }
       handleStablePlaybackSignal()
+    }
+
+    const onPlaying = () => {
+      markStableActivity()
+    }
+
+    const onStallOrPause = () => {
+      streamStalledOrPaused = true
+      clearStableResetTimer()
     }
 
     if (useHls) {
@@ -661,11 +685,14 @@ export function LiveTvPage() {
       })
       hlsRef.current = hls
       video.addEventListener('playing', onPlaying)
+      video.addEventListener('waiting', onStallOrPause)
+      video.addEventListener('stalled', onStallOrPause)
+      video.addEventListener('pause', onStallOrPause)
       hls.loadSource(streamUrl)
       hls.attachMedia(video)
       hls.on(Hls.Events.FRAG_BUFFERED, () => {
         if (cancelled || hlsRef.current !== hls) return
-        handleStablePlaybackSignal()
+        markStableActivity()
       })
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (cancelled || hlsRef.current !== hls) return
@@ -686,9 +713,9 @@ export function LiveTvPage() {
             mediaRecoveryCountRef.current += 1
             const attempt = mediaRecoveryCountRef.current
             const delay = Math.min(500 * attempt, 3000)
-            clearRecoveryTimer()
-            recoveryTimer = window.setTimeout(() => {
-              recoveryTimer = null
+            clearMediaRecoveryTimer()
+            mediaRecoveryTimer = window.setTimeout(() => {
+              mediaRecoveryTimer = null
               if (cancelled || !hls || hlsRef.current !== hls) return
               if (attempt % 2 === 0) {
                 hls.swapAudioCodec()
@@ -708,9 +735,9 @@ export function LiveTvPage() {
             networkRecoveryCountRef.current += 1
             const attempt = networkRecoveryCountRef.current
             const delay = Math.min(500 * attempt, 3000)
-            clearRecoveryTimer()
-            recoveryTimer = window.setTimeout(() => {
-              recoveryTimer = null
+            clearNetworkRecoveryTimer()
+            networkRecoveryTimer = window.setTimeout(() => {
+              networkRecoveryTimer = null
               if (cancelled || !hls || hlsRef.current !== hls) return
               hls.startLoad()
             }, delay)
@@ -732,9 +759,12 @@ export function LiveTvPage() {
 
     return () => {
       cancelled = true
-      clearRecoveryTimer()
+      clearAllRecoveryTimers()
       clearStableResetTimer()
       video.removeEventListener('playing', onPlaying)
+      video.removeEventListener('waiting', onStallOrPause)
+      video.removeEventListener('stalled', onStallOrPause)
+      video.removeEventListener('pause', onStallOrPause)
       destroyHls()
       video.pause()
       video.removeAttribute('src')
@@ -763,6 +793,7 @@ export function LiveTvPage() {
     const video = recordingVideoRef.current
     if (!shouldUseRecordingHls || !video || !playingRecording) return
 
+    let cancelled = false
     let hls: Hls | null = new Hls({
       enableWorker: true,
       lowLatencyMode: false,
@@ -773,6 +804,7 @@ export function LiveTvPage() {
     hls.loadSource(hlsUrl)
     hls.attachMedia(video)
     hls.on(Hls.Events.ERROR, (_evt, data) => {
+      if (cancelled || recordingHlsRef.current !== hls) return
       if (!data.fatal) return
       if (hls) {
         hls.destroy()
@@ -781,10 +813,12 @@ export function LiveTvPage() {
         }
         hls = null
       }
+      setRecordingPlaybackError(null)
       setRecordingFallbackDirect(true)
     })
 
     return () => {
+      cancelled = true
       if (hls) {
         hls.destroy()
         if (recordingHlsRef.current === hls) {
@@ -994,7 +1028,7 @@ export function LiveTvPage() {
                       !forceHls &&
                       Hls.isSupported()
                     ) {
-                      setForceHls(true)
+                      setForceHlsChannelId(activeChannelId)
                       return
                     }
                     setPlaybackError(t('liveTvUi.errStreamLoad'))
@@ -1850,8 +1884,10 @@ export function LiveTvPage() {
                         ? undefined
                         : getLiveTvRecordingStreamUrl(playingRecording.Id)
                   }
+                  onPlaying={() => setRecordingPlaybackError(null)}
                   onError={(e) => {
                     if (demoActive) return
+                    if (recordingHlsRef.current) return
                     const errCode = e.currentTarget.error?.code
                     const srcNotSupported =
                       typeof MediaError !== 'undefined'

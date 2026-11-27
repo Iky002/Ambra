@@ -12,6 +12,7 @@ import { LibraryPage } from '../LibraryPage'
 import { LiveTvPage } from '../LiveTvPage'
 import { HealthAndAuditTab } from '../admin/HealthAndAuditTab'
 import { LiveTvTab } from '../admin/LiveTvTab'
+import { SettingsTab } from '../admin/SettingsTab'
 
 const hlsInstances: Array<{
   config: Record<string, unknown>
@@ -692,6 +693,243 @@ describe('LiveTV Playback Hardening & Tuner Host Refresh UI', () => {
     expect(refreshed.ImportedChannelCount).toBeGreaterThanOrEqual(3)
 
     await expect(api.refreshTunerHost('tuner-nonexistent')).rejects.toThrow()
+  })
+
+  it('MEDIA_ERROR 与 NETWORK_ERROR 使用独立恢复定时器互不取消，且卡顿/暂停事件取消稳定重置计时器', async () => {
+    vi.spyOn(api, 'getLiveTvChannels').mockResolvedValue({
+      Items: [
+        {
+          Id: 'ch-dual-timer',
+          Name: '双定时器测试台',
+          Number: '88',
+          IsHls: true,
+          StreamUrl: 'https://example.com/live/dual.m3u8',
+        },
+      ],
+      TotalRecordCount: 1,
+    })
+
+    renderWithProviders(
+      <Routes>
+        <Route path="/livetv" element={<LiveTvPage />} />
+      </Routes>,
+      ['/livetv?channel=ch-dual-timer'],
+    )
+
+    const video = await screen.findByTestId('livetv-video')
+    expect(hlsInstances).toHaveLength(1)
+    const hls = hlsInstances[0]
+
+    vi.useFakeTimers()
+    // 同一时间窗先后触发 MEDIA_ERROR 与 NETWORK_ERROR：两者延迟恢复均必须执行，互不覆盖
+    act(() => {
+      hls.emit('hlsError', { fatal: true, type: 'mediaError', details: 'bufferStalledError' })
+      hls.emit('hlsError', { fatal: true, type: 'networkError', details: 'fragLoadError' })
+    })
+    act(() => {
+      vi.advanceTimersByTime(500)
+    })
+    expect(hls.recoverMediaError).toHaveBeenCalledTimes(1)
+    expect(hls.startLoad).toHaveBeenCalledTimes(1)
+
+    // 再触发 8 次 MEDIA_ERROR（总计 9 次），随后触发 playing 但紧接着进入 waiting 卡顿态
+    for (let i = 2; i <= 9; i += 1) {
+      act(() => {
+        hls.emit('hlsError', { fatal: true, type: 'mediaError', details: 'bufferStalledError' })
+      })
+      act(() => {
+        vi.advanceTimersByTime(Math.min(500 * i, 3000))
+      })
+    }
+    expect(hls.recoverMediaError).toHaveBeenCalledTimes(9)
+
+    act(() => {
+      fireEvent.playing(video)
+    })
+    act(() => {
+      vi.advanceTimersByTime(3_000)
+      fireEvent.waiting(video)
+      // 卡顿状态下即使经过 20 秒也不得重置恢复计数器
+      vi.advanceTimersByTime(20_000)
+    })
+
+    // 第 10 次仍可恢复，第 11 次因计数未在卡顿期间误清零而触发上限销毁
+    act(() => {
+      hls.emit('hlsError', { fatal: true, type: 'mediaError', details: 'bufferStalledError' })
+    })
+    act(() => {
+      vi.advanceTimersByTime(3_000)
+    })
+    expect(hls.recoverMediaError).toHaveBeenCalledTimes(10)
+    expect(hls.destroy).not.toHaveBeenCalled()
+
+    act(() => {
+      hls.emit('hlsError', { fatal: true, type: 'mediaError', details: 'bufferStalledError' })
+    })
+    vi.useRealTimers()
+    expect(hls.destroy).toHaveBeenCalledTimes(1)
+    expect(await screen.findByRole('alert')).toBeTruthy()
+  })
+
+  it('DVR 录像回看在 HLS 激活期间忽略原生 <video onError>，降级直出或恢复播放时清理错误横幅', async () => {
+    vi.spyOn(api, 'getLiveTvChannels').mockResolvedValue({
+      Items: [{ Id: 'ch-1', Name: 'CCTV-1', Number: '1', IsHls: true }],
+      TotalRecordCount: 1,
+    })
+    vi.spyOn(api, 'getLiveTvRecordings').mockResolvedValue({
+      Items: [
+        {
+          Id: 'rec-dvr-1',
+          Name: '晚间新闻录像',
+          ChannelName: 'CCTV-1',
+          Status: 'Completed',
+        },
+      ],
+      TotalRecordCount: 1,
+    })
+
+    renderWithProviders(
+      <Routes>
+        <Route path="/livetv" element={<LiveTvPage />} />
+      </Routes>,
+      ['/livetv'],
+    )
+
+    await screen.findByTestId('livetv-video')
+    fireEvent.click(screen.getByRole('tab', { name: /已录节目/ }))
+    const recPanel = await screen.findByTestId('livetv-recordings-panel')
+    fireEvent.click(await within(recPanel).findByRole('button', { name: '播放' }))
+
+    const hlsVideo = await screen.findByTestId('dvr-recording-video')
+    const recHls = hlsInstances[hlsInstances.length - 1]
+    expect(recHls).toBeTruthy()
+
+    // 1) recordingHlsRef 激活时，原生 <video onError> 不得误弹错误提示
+    fireEvent.error(hlsVideo)
+    expect(within(recPanel).queryByRole('alert')).toBeNull()
+
+    // 2) HLS fatal 错误触发降级直出流，不显示错误横幅
+    act(() => {
+      recHls.emit('hlsError', { fatal: true, type: 'mediaError', details: 'manifestIncompatibleCodecsError' })
+    })
+    expect(recHls.destroy).toHaveBeenCalledTimes(1)
+
+    const directVideo = await screen.findByTestId('dvr-recording-video')
+    expect(directVideo.getAttribute('src')).toContain('/emby/LiveTv/LiveRecordings/rec-dvr-1/stream')
+    expect(within(recPanel).queryByRole('alert')).toBeNull()
+
+    // 3) 直出流若偶发报错后又成功触发 onPlaying，自动清除错误横幅
+    fireEvent.error(directVideo)
+    expect(await within(recPanel).findByRole('alert')).toBeTruthy()
+    fireEvent.playing(directVideo)
+    await waitFor(() => {
+      expect(within(recPanel).queryByRole('alert')).toBeNull()
+    })
+  })
+
+  it('LiveTvTab 并发刷新多个调谐器时保持各自独立的加载状态，首个完成后不会提前清除第二个的禁用与旋转态', async () => {
+    vi.spyOn(api, 'getTunerHosts').mockResolvedValue([
+      {
+        Id: 'tuner-a',
+        Type: 'm3u',
+        FriendlyName: '直播源 A',
+        Url: 'https://example.com/a.m3u',
+      },
+      {
+        Id: 'tuner-b',
+        Type: 'm3u',
+        FriendlyName: '直播源 B',
+        Url: 'https://example.com/b.m3u',
+      },
+    ])
+    vi.spyOn(api, 'getListingProviders').mockResolvedValue([])
+    vi.spyOn(api, 'getLiveTvChannels').mockResolvedValue({ Items: [], TotalRecordCount: 0 })
+
+    let resolveA!: (v: { Id: string; ImportedChannelCount: number }) => void
+    let resolveB!: (v: { Id: string; ImportedChannelCount: number }) => void
+    vi.spyOn(api, 'refreshTunerHost').mockImplementation((id: string) => {
+      if (id === 'tuner-a') {
+        return new Promise((resolve) => {
+          resolveA = resolve
+        })
+      }
+      return new Promise((resolve) => {
+        resolveB = resolve
+      })
+    })
+
+    renderWithProviders(<LiveTvTab />, ['/admin/livetv'])
+
+    const btnA = (await screen.findByTestId('refresh-tuner-tuner-a')) as HTMLButtonElement
+    const btnB = (await screen.findByTestId('refresh-tuner-tuner-b')) as HTMLButtonElement
+
+    fireEvent.click(btnA)
+    fireEvent.click(btnB)
+
+    await waitFor(() => {
+      expect(btnA.disabled).toBe(true)
+      expect(btnB.disabled).toBe(true)
+    })
+    expect(btnA.querySelector('svg')?.getAttribute('class')).toContain('animate-spin')
+    expect(btnB.querySelector('svg')?.getAttribute('class')).toContain('animate-spin')
+
+    // 第一个调谐器刷新完成 -> 仅恢复 btnA，btnB 仍保持刷新中禁用与旋转态
+    await act(async () => {
+      resolveA({ Id: 'tuner-a', ImportedChannelCount: 10 })
+    })
+    await waitFor(() => {
+      expect(btnA.disabled).toBe(false)
+    })
+    expect(btnB.disabled).toBe(true)
+    expect(btnB.querySelector('svg')?.getAttribute('class')).toContain('animate-spin')
+
+    // 第二个调谐器刷新完成 -> btnB 恢复可用
+    await act(async () => {
+      resolveB({ Id: 'tuner-b', ImportedChannelCount: 25 })
+    })
+    await waitFor(() => {
+      expect(btnB.disabled).toBe(false)
+    })
+    expect(btnB.querySelector('svg')?.getAttribute('class')).not.toContain('animate-spin')
+  })
+
+  it('SettingsTab 清空完播阈值输入框不强制归零并在保存时友好校验，避免发送 NaN', async () => {
+    vi.spyOn(api, 'getServerConfig').mockResolvedValue({
+      ServerName: 'Ambra Server',
+      TMDBLanguage: 'zh-CN',
+      EnableSTRM302: true,
+      EnableLoginUserList: false,
+      PlayedThreshold: 0.9,
+      EnableRemoteAccess: true,
+      EnableQuickConnect: true,
+      EnableDLNA: false,
+    })
+    vi.spyOn(api, 'getUsers').mockResolvedValue([])
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      json: async () => ({}),
+      text: async () => '{}',
+    }) as Response)
+    const updateSpy = vi.spyOn(api, 'updateServerConfig').mockResolvedValue(undefined)
+
+    renderWithProviders(<SettingsTab />, ['/admin/settings'])
+
+    const badge = await screen.findByTestId('played-threshold-value')
+    const numInput = badge.parentElement?.querySelector('input[type="number"]') as HTMLInputElement
+    expect(numInput).toBeTruthy()
+    await waitFor(() => {
+      expect(numInput.value).toBe('90')
+    })
+
+    fireEvent.change(numInput, { target: { value: '' } })
+    expect(numInput.value).toBe('')
+    expect(screen.getByTestId('played-threshold-value').textContent).toBe('--%')
+
+    fireEvent.submit(numInput.closest('form')!)
+    expect(updateSpy).not.toHaveBeenCalled()
+    expect(await screen.findByText('标记为已看进度阈值必须在 50% 到 99% 之间')).toBeTruthy()
   })
 })
 

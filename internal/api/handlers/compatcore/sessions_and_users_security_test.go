@@ -336,8 +336,8 @@ func TestAuthByIDIPAggregateAndDeterministicCap(t *testing.T) {
 		t.Fatalf("expected 429 after %d authByID spray attempts from single IP, got %d", authByIDIPRateLimit, recBlocked.Code)
 	}
 
-	// 2. Bucket cap fail-closed: filling authByIDRates to maxRateLimitBuckets MUST NOT evict an existing
-	// ip|adminID lockout bucket, and new (ip, uid) pairs fail closed with 429.
+	// 2. Bucket cap eviction without global DoS: filling authByIDRates to maxRateLimitBuckets MUST NOT evict an existing
+	// ip|adminID lockout bucket, and unseen legitimate (ip, uid) pairs MUST NOT be blocked with 429!
 	now := time.Now().UTC()
 	hCap := New(env.cfg, env.store, env.userRepo, env.libRepo, env.sessions, nil)
 	adminIP := "203.0.113.88"
@@ -354,7 +354,7 @@ func TestAuthByIDIPAggregateAndDeterministicCap(t *testing.T) {
 	if !hCap.isAuthByIDRateLimited(adminIP, env.admin.ID, now.Add(2*time.Millisecond)) {
 		t.Fatal("expected ip|adminID lockout bucket to remain intact and never be evicted")
 	}
-	if !hCap.isAuthByIDRateLimited("203.0.113.251", "fresh-uid", now.Add(2*time.Millisecond)) {
-		t.Fatal("expected fail-closed rate limit when authByIDRates is at maxRateLimitBuckets")
+	if hCap.isAuthByIDRateLimited("203.0.113.251", "fresh-uid", now.Add(2*time.Millisecond)) {
+		t.Fatal("expected unseen legitimate (ip, uid) not to be globally rate-limited when authByIDRates is at maxRateLimitBuckets")
 	}
 }

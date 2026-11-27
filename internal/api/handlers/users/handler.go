@@ -37,6 +37,7 @@ const (
 	authByNameLoopbackIPRateLimit = 180
 	authByNameLoopbackRateWindow  = 5 * time.Minute
 	authRateMaxBuckets            = 4096
+	maxSubBucketsPerIP            = 8
 )
 
 type Handler struct {
@@ -139,11 +140,84 @@ func pruneRateBucketsLocked(buckets map[string][]time.Time, cutoff time.Time) {
 	}
 }
 
-func appendBoundedRateBucketLocked(buckets map[string][]time.Time, key string, now time.Time) {
-	if _, exists := buckets[key]; !exists && len(buckets) >= authRateMaxBuckets {
-		return
+func evictOldestRateBucketKeyLocked(buckets map[string][]time.Time, lockLimit int) bool {
+	if len(buckets) == 0 {
+		return false
+	}
+	var oldestKey string
+	var oldestTime time.Time
+	foundUnlocked := false
+	if lockLimit > 0 {
+		for k, ts := range buckets {
+			if len(ts) >= lockLimit {
+				continue
+			}
+			last := bucketLastAttempt(ts)
+			if !foundUnlocked || last.Before(oldestTime) || (last.Equal(oldestTime) && k < oldestKey) {
+				oldestKey = k
+				oldestTime = last
+				foundUnlocked = true
+			}
+		}
+	}
+	if !foundUnlocked {
+		first := true
+		for k, ts := range buckets {
+			last := bucketLastAttempt(ts)
+			if first || last.Before(oldestTime) || (last.Equal(oldestTime) && k < oldestKey) {
+				oldestKey = k
+				oldestTime = last
+				first = false
+			}
+		}
+		if first {
+			return false
+		}
+	}
+	delete(buckets, oldestKey)
+	return true
+}
+
+func countIPSubBucketsLocked(buckets map[string][]time.Time, ipKey string) int {
+	prefix := ipKey + "|"
+	count := 0
+	for k := range buckets {
+		if strings.HasPrefix(k, prefix) {
+			count++
+		}
+	}
+	return count
+}
+
+func appendRateBucketWithEvictLocked(buckets map[string][]time.Time, key string, now time.Time, lockLimit int) {
+	if _, exists := buckets[key]; !exists {
+		for len(buckets) >= authRateMaxBuckets {
+			if !evictOldestRateBucketKeyLocked(buckets, lockLimit) {
+				break
+			}
+		}
 	}
 	buckets[key] = append(buckets[key], now)
+}
+
+func appendBoundedRateBucketLocked(buckets map[string][]time.Time, key string, now time.Time) {
+	appendRateBucketWithEvictLocked(buckets, key, now, 0)
+}
+
+func recordAuthFailureBucketsLocked(compMap, ipMap map[string][]time.Time, compKey, ipKey string, now time.Time, compLimit, ipLimit int) {
+	appendRateBucketWithEvictLocked(ipMap, ipKey, now, ipLimit)
+	if compKey == ipKey {
+		appendRateBucketWithEvictLocked(compMap, compKey, now, compLimit)
+		return
+	}
+	if _, exists := compMap[compKey]; exists {
+		compMap[compKey] = append(compMap[compKey], now)
+		return
+	}
+	if countIPSubBucketsLocked(compMap, ipKey) >= maxSubBucketsPerIP {
+		return
+	}
+	appendRateBucketWithEvictLocked(compMap, compKey, now, compLimit)
 }
 
 func isLoopbackClientIP(raw string) bool {
@@ -204,16 +278,10 @@ func (h *Handler) isLoginRateLimited(ip, username string, now time.Time) bool {
 			if username != "" && len(h.loopbackAuthRates[ipKey]) >= authByNameLoopbackRateLimit {
 				return true
 			}
-			if _, exists := h.loopbackAuthRates[key]; !exists && len(h.loopbackAuthRates) >= authRateMaxBuckets {
-				return true
-			}
 		}
 		if h.loopbackAuthIPRates != nil {
 			pruneRateBucketsLocked(h.loopbackAuthIPRates, cutoff)
 			if len(h.loopbackAuthIPRates[ipKey]) >= authByNameLoopbackIPRateLimit {
-				return true
-			}
-			if _, exists := h.loopbackAuthIPRates[ipKey]; !exists && len(h.loopbackAuthIPRates) >= authRateMaxBuckets {
 				return true
 			}
 		}
@@ -228,16 +296,10 @@ func (h *Handler) isLoginRateLimited(ip, username string, now time.Time) bool {
 		if username != "" && len(h.authRates[ipKey]) >= authByNameRateLimit {
 			return true
 		}
-		if _, exists := h.authRates[key]; !exists && len(h.authRates) >= authRateMaxBuckets {
-			return true
-		}
 	}
 	if h.authIPRates != nil {
 		pruneRateBucketsLocked(h.authIPRates, cutoff)
 		if len(h.authIPRates[ipKey]) >= authByNameIPRateLimit {
-			return true
-		}
-		if _, exists := h.authIPRates[ipKey]; !exists && len(h.authIPRates) >= authRateMaxBuckets {
 			return true
 		}
 	}
@@ -265,8 +327,7 @@ func (h *Handler) recordLoginFailure(ip, username string, now time.Time) {
 		cutoff := now.Add(-authByNameLoopbackRateWindow)
 		pruneRateBucketsLocked(h.loopbackAuthRates, cutoff)
 		pruneRateBucketsLocked(h.loopbackAuthIPRates, cutoff)
-		appendBoundedRateBucketLocked(h.loopbackAuthRates, key, now)
-		appendBoundedRateBucketLocked(h.loopbackAuthIPRates, ipKey, now)
+		recordAuthFailureBucketsLocked(h.loopbackAuthRates, h.loopbackAuthIPRates, key, ipKey, now, authByNameLoopbackRateLimit, authByNameLoopbackIPRateLimit)
 		return
 	}
 	if h.authRates == nil {
@@ -278,8 +339,7 @@ func (h *Handler) recordLoginFailure(ip, username string, now time.Time) {
 	cutoff := now.Add(-authByNameRateWindow)
 	pruneRateBucketsLocked(h.authRates, cutoff)
 	pruneRateBucketsLocked(h.authIPRates, cutoff)
-	appendBoundedRateBucketLocked(h.authRates, key, now)
-	appendBoundedRateBucketLocked(h.authIPRates, ipKey, now)
+	recordAuthFailureBucketsLocked(h.authRates, h.authIPRates, key, ipKey, now, authByNameRateLimit, authByNameIPRateLimit)
 }
 
 func (h *Handler) canAccessItem(ctx context.Context, ac *middleware.AuthContext, itemID string) (bool, error) {

@@ -19,7 +19,7 @@ FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS go-builder
 
 ARG TARGETOS
 ARG TARGETARCH
-ARG AMBRA_VERSION=v0.12.0
+ARG AMBRA_VERSION=v0.12.1
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -61,6 +61,8 @@ VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD port="${AMBRA_HTTP_ADDR##*:}"; case "$port" in ''|*[!0-9]*) port=8096 ;; esac; curl -fsS "http://127.0.0.1:${port}/System/Ping" || exit 1
 
+# docker-entrypoint.sh drops privileges via setpriv to PUID:PGID (1000:1000 ambra by default)
+# and also supports --user 1000:1000 / Kubernetes runAsNonRoot: true (runAsUser: 1000) directly.
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["/usr/local/bin/ambra", "-data", "/data"]
 
@@ -97,5 +99,7 @@ VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD port="${AMBRA_HTTP_ADDR##*:}"; case "$port" in ''|*[!0-9]*) port=8096 ;; esac; curl -fsS "http://127.0.0.1:${port}/System/Ping" || exit 1
 
+# docker-entrypoint.sh drops privileges via setpriv to PUID:PGID (1000:1000 ambra by default)
+# and also supports --user 1000:1000 / Kubernetes runAsNonRoot: true (runAsUser: 1000) directly.
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["/usr/local/bin/ambra", "-data", "/data"]

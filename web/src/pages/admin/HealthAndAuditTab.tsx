@@ -226,7 +226,7 @@ export function HealthAndAuditTab() {
   }, [t])
 
   const fetchHealth = useCallback(
-    async (isManual = false) => {
+    async (isManual = false, silentError = false) => {
       if (isManual) {
         setHealthRefreshing(true)
       } else {
@@ -236,10 +236,12 @@ export function HealthAndAuditTab() {
         const data = await embyFetch<SystemHealthReport>('/api/admin/health')
         setHealth(data)
       } catch (err) {
-        setFeedback({
-          type: 'error',
-          message: err instanceof Error ? err.message : t('admin.health.healthFetchFailed'),
-        })
+        if (!silentError) {
+          setFeedback({
+            type: 'error',
+            message: err instanceof Error ? err.message : t('admin.health.healthFetchFailed'),
+          })
+        }
       } finally {
         setHealthLoading(false)
         setHealthRefreshing(false)
@@ -405,9 +407,13 @@ export function HealthAndAuditTab() {
         message: t('admin.health.orphansCleanedSuccess', { count: res.Deleted }),
       })
       setSelectedOrphans(new Set())
-      const refreshed = await embyFetch<LibraryAuditReport>('/api/admin/governance/audit')
-      setAuditReport(refreshed)
-      void fetchHealth(true)
+      try {
+        const refreshed = await embyFetch<LibraryAuditReport>('/api/admin/governance/audit')
+        setAuditReport(refreshed)
+      } catch {
+        /* keep cleanup success banner */
+      }
+      void fetchHealth(true, true)
     } catch (err) {
       setConfirmOrphanCleanupOpen(false)
       setFeedback({
