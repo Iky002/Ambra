@@ -13,7 +13,7 @@
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
-    "@ffmpeg/ffmpeg": "^0.12.25",
+    "@ffmpeg/ffmpeg": "^0.12.15",
     "@ffmpeg/util": "^0.12.2",
     "@tanstack/react-query": "^5.66.0",
     "hls.js": "^1.5.20",
