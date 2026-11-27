@@ -134,7 +134,7 @@ func TestHydrateDTOsEmbyParityFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	u := &UserRecord{Name: "hydrate-tester"}
+	u := &UserRecord{Name: "hydrate-tester", Policy: DefaultUserPolicy(false)}
 	if err := NewUserRepo(st).CreateUser(ctx, u); err != nil {
 		t.Fatal(err)
 	}
