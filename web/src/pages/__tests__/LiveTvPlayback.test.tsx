@@ -248,7 +248,7 @@ describe('Stream 4 (v0.9.1): Live TV Watch Page, Library Multi-Select Polish, Ba
     renderWithProviders(<HealthAndAuditTab />, ['/admin/health'])
 
     const backupCard = await screen.findByTestId('backup-restore-card')
-    await screen.findByText('ambra-backup-20261124-030000.db')
+    await screen.findByText('ambra-backup-20261124-030000.zip')
 
     // 创建备份 -> 反馈直接显示在 backup-restore-card 内部
     fireEvent.click(screen.getByRole('button', { name: '立即创建备份' }))

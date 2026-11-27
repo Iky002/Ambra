@@ -75,6 +75,8 @@ if [ "$TARGET_UID" != "0" ] || [ "$TARGET_GID" != "0" ]; then
     "$DATA_DIR" \
     "$DATA_DIR/config" \
     "$DATA_DIR/config/ambra.json" \
+    "$DATA_DIR/config/ambra.json.restore" \
+    "$DATA_DIR/config/backups" \
     "$DATA_DIR/logs" \
     "$DATA_DIR/cache" \
     "$DATA_DIR/cache/images" \
@@ -84,12 +86,15 @@ if [ "$TARGET_UID" != "0" ] || [ "$TARGET_GID" != "0" ]; then
     "$DATA_DIR/cache/transcoding-temp" \
     "$DATA_DIR/cache/sync" \
     "$DATA_DIR/camera-uploads" \
+    "$DATA_DIR/recordings" \
     "$DATA_DIR/metadata" \
+    "$DATA_DIR/metadata.restore" \
     "$DATA_DIR/plugins" \
     "$DATA_DIR/bin" \
     "$DATA_DIR/ambra.db" \
     "$DATA_DIR/ambra.db-wal" \
-    "$DATA_DIR/ambra.db-shm"
+    "$DATA_DIR/ambra.db-shm" \
+    "$DATA_DIR/ambra.db.restore"
   do
     if [ -e "$p" ] || [ -L "$p" ]; then
       cur_owner="$(stat -c '%u:%g' "$p" 2>/dev/null || true)"

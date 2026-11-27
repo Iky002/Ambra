@@ -553,10 +553,18 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
   // 订阅 WebSocket 远端控播指令 (Pause / Unpause / PlayPause / Stop / NextTrack / PreviousTrack / Seek)
   useEffect(() => {
     return subscribePlaystate((cmd) => {
+      if (cmd.PartyId) return
       const { currentIndex: idx, queue: q } = stateRef.current
       if (idx < 0 || idx >= q.length) return
+      const curTrack = q[idx]
+      if (cmd.ItemId && cmd.ItemId !== curTrack?.Id) return
       const activeSessionId = activeSessionRef.current?.playSessionId
       if (cmd.PlaySessionId && cmd.PlaySessionId !== activeSessionId) {
+        return
+      }
+      const onVideoPlayerRoute =
+        typeof window !== 'undefined' && window.location?.pathname?.startsWith('/play/')
+      if (onVideoPlayerRoute && (!cmd.PlaySessionId || cmd.PlaySessionId !== activeSessionId)) {
         return
       }
       switch (cmd.Command) {
@@ -567,6 +575,9 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
           const audio = audioRef.current
           if (audio) {
             setPlaybackError(null)
+            if (!activeSessionRef.current && curTrack) {
+              reportActiveStart(curTrack.Id)
+            }
             reportActiveProgress('Unpause', false)
             triggerAudioPlay(audio)
           }
@@ -605,6 +616,7 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
   }, [
     subscribePlaystate,
     pause,
+    reportActiveStart,
     reportActiveProgress,
     triggerAudioPlay,
     togglePlay,

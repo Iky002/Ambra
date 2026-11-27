@@ -140,7 +140,7 @@ export function TasksLogsTab() {
     error: tasksError,
     refetch: refetchTasks,
   } = useQuery({
-    queryKey: ['admin', 'scheduledTasks'],
+    queryKey: ['admin', 'scheduledTasks', locale],
     queryFn: () => api.getScheduledTasks(),
     refetchInterval: (query) =>
       Array.isArray(query.state.data) &&

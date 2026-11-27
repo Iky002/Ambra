@@ -162,24 +162,31 @@ export function parseBif(input: ArrayBuffer | Uint8Array): BifArchive {
     }
   }
 
+  const dataRegionStart = BIF_HEADER_SIZE + rawEntries.length * BIF_INDEX_ENTRY_SIZE
+  const MAX_BIF_FRAME_BYTES = 2 * 1024 * 1024
   const frames: BifFrameEntry[] = []
   const maxEntryIdx = Math.min(imageCount, rawEntries.length - 1)
   for (let i = 0; i < maxEntryIdx; i++) {
     const cur = rawEntries[i]
     if (cur.tsIdx === BIF_END_INDEX_MARKER) break
     const next = rawEntries[i + 1]
-    const endOffset = next && next.offset > 0 ? next.offset : data.byteLength
-    if (cur.offset < BIF_HEADER_SIZE || endOffset < cur.offset || endOffset > data.byteLength) {
+    if (!next || next.offset === 0 || next.offset < cur.offset) {
+      continue
+    }
+    const endOffset = next.offset
+    if (cur.offset < dataRegionStart || endOffset > data.byteLength) {
       continue
     }
     const length = endOffset - cur.offset
-    if (length <= 0) continue
+    if (length <= 0 || length > MAX_BIF_FRAME_BYTES) continue
     frames.push({
       timestampMs: cur.tsIdx * timestampMultiplierMs,
       offset: cur.offset,
       length,
     })
   }
+
+  frames.sort((a, b) => a.timestampMs - b.timestampMs)
 
   return new BifArchive(data, version, timestampMultiplierMs, frames)
 }
