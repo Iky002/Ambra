@@ -391,7 +391,7 @@ export function LoginPage() {
             <Server className="h-3.5 w-3.5 text-amber-400/80" />
             <span>
               {sysInfo?.ProductName || 'Ambra'}{' '}
-              {sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.11.1')}
+              {sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.11.2')}
             </span>
           </p>
         </div>
