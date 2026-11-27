@@ -819,6 +819,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 
 	// Tuners, ListingProviders & GuideInfo
 	handleAdmin("POST /LiveTv/TunerHosts", h.handleSaveTunerHost)
+	handleAdmin("POST /LiveTv/TunerHosts/{Id}/Refresh", h.handleRefreshTunerHost)
 	handleAdmin("DELETE /LiveTv/TunerHosts", h.handleDeleteTunerHost)
 	handleAuth("GET /LiveTv/TunerHosts/Types", h.handleTunerHostTypes)
 	handleAdmin("POST /LiveTv/ListingProviders", h.handleSaveListingProvider)
@@ -3028,82 +3029,7 @@ func (h *Handler) handleSaveTunerHost(w http.ResponseWriter, r *http.Request) {
 	// Replace channels for this tuner host using deterministic channel IDs to preserve Timer/EPG/mapping links.
 	// For M3U and HDHomeRun hosts with an explicit Url or M3UContent, also clear stale channels/programs when parsed is empty.
 	if len(parsed) > 0 || ((strings.EqualFold(host.Type, "m3u") || strings.EqualFold(host.Type, "hdhomerun")) && (rawURL != "" || rawM3U != "")) {
-		prevByID := make(map[string]ChannelInfo)
-		keptChannels := make([]ChannelInfo, 0, len(h.state.Channels))
-		removedChannelIDs := make(map[string]struct{})
-		for _, ch := range h.state.Channels {
-			if ch.TunerHostId == host.Id {
-				prevByID[ch.Id] = ch
-				removedChannelIDs[ch.Id] = struct{}{}
-				continue
-			}
-			keptChannels = append(keptChannels, ch)
-		}
-
-		now := time.Now().UTC().Truncate(time.Hour)
-		usedIDs := make(map[string]int, len(parsed))
-		newChannelIDs := make(map[string]struct{}, len(parsed))
-		newChannels := make([]ChannelInfo, 0, len(parsed))
-		for _, m := range parsed {
-			baseID := deterministicChannelID(host.Id, m, 0)
-			seq := usedIDs[baseID]
-			usedIDs[baseID] = seq + 1
-			chID := baseID
-			if seq > 0 {
-				chID = deterministicChannelID(host.Id, m, seq)
-			}
-			ch := ChannelInfo{
-				Id:          chID,
-				Name:        m.Name,
-				ServerId:    h.serverID(),
-				Type:        "TvChannel",
-				ChannelType: "TV",
-				Number:      m.Number,
-				TvgId:       m.TvgID,
-				LogoUrl:     m.TvgLogo,
-				GroupTitle:  m.GroupTitle,
-				StreamUrl:   m.URL,
-				TunerHostId: host.Id,
-			}
-			if prev, ok := prevByID[chID]; ok {
-				ch.Disabled = prev.Disabled
-				ch.SortIndex = prev.SortIndex
-			}
-			newChannelIDs[chID] = struct{}{}
-			delete(removedChannelIDs, chID)
-			newChannels = append(newChannels, ch)
-		}
-
-		existingProgramsByCh := make(map[string]bool)
-		keptPrograms := make([]ProgramInfo, 0, len(h.state.Programs))
-		for _, p := range h.state.Programs {
-			if _, drop := removedChannelIDs[p.ChannelId]; drop {
-				continue
-			}
-			keptPrograms = append(keptPrograms, p)
-			if _, ok := newChannelIDs[p.ChannelId]; ok {
-				existingProgramsByCh[p.ChannelId] = true
-			}
-		}
-
-		for _, ch := range newChannels {
-			keptChannels = append(keptChannels, ch)
-			if !existingProgramsByCh[ch.Id] {
-				keptPrograms = append(keptPrograms, ProgramInfo{
-					Id:          guid.New(),
-					Name:        ch.Name + " Live",
-					ServerId:    h.serverID(),
-					Type:        "Program",
-					ChannelId:   ch.Id,
-					ChannelName: ch.Name,
-					StartDate:   now,
-					EndDate:     now.Add(24 * time.Hour),
-					IsLive:      true,
-				})
-			}
-		}
-		h.state.Channels = keptChannels
-		h.state.Programs = keptPrograms
+		h.mergeTunerHostChannelsLocked(host.Id, parsed)
 	}
 	err := h.saveStateLocked(r.Context())
 	if err != nil {
@@ -3116,6 +3042,247 @@ func (h *Handler) handleSaveTunerHost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	httpx.JSON(w, http.StatusOK, host)
+}
+
+var (
+	errTunerHostNoURL           = errors.New("tuner host has no configured url to refresh")
+	errTunerHostUnsupportedType = errors.New("unsupported tuner host type for refresh")
+	errTunerHostEmptyRefresh    = errors.New("tuner host refresh returned 0 channels; keeping existing channels")
+	errTunerHostPersist         = errors.New("failed to persist refreshed tuner host")
+)
+
+// mergeTunerHostChannelsLocked replaces channels belonging to hostID with parsed channels
+// using deterministic channel IDs while preserving Disabled, SortIndex, existing Programs,
+// EPG mappings, and DVR timers. For channels without a tvg-id whose stream URL changed,
+// it falls back to inheriting Disabled and SortIndex when there was a unique previous channel
+// with the same trimmed lowercase Name under the same tuner host.
+func (h *Handler) mergeTunerHostChannelsLocked(hostID string, parsed []M3UChannel) {
+	prevByID := make(map[string]ChannelInfo)
+	prevByName := make(map[string]ChannelInfo)
+	prevByNameCount := make(map[string]int)
+	keptChannels := make([]ChannelInfo, 0, len(h.state.Channels))
+	removedChannelIDs := make(map[string]struct{})
+	for _, ch := range h.state.Channels {
+		if ch.TunerHostId == hostID {
+			prevByID[ch.Id] = ch
+			if nameKey := strings.ToLower(strings.TrimSpace(ch.Name)); nameKey != "" {
+				prevByNameCount[nameKey]++
+				prevByName[nameKey] = ch
+			}
+			removedChannelIDs[ch.Id] = struct{}{}
+			continue
+		}
+		keptChannels = append(keptChannels, ch)
+	}
+
+	now := time.Now().UTC().Truncate(time.Hour)
+	usedIDs := make(map[string]int, len(parsed))
+	newChannelIDs := make(map[string]struct{}, len(parsed))
+	newChannels := make([]ChannelInfo, 0, len(parsed))
+	for _, m := range parsed {
+		baseID := deterministicChannelID(hostID, m, 0)
+		seq := usedIDs[baseID]
+		usedIDs[baseID] = seq + 1
+		chID := baseID
+		if seq > 0 {
+			chID = deterministicChannelID(hostID, m, seq)
+		}
+		ch := ChannelInfo{
+			Id:          chID,
+			Name:        m.Name,
+			ServerId:    h.serverID(),
+			Type:        "TvChannel",
+			ChannelType: "TV",
+			Number:      m.Number,
+			TvgId:       m.TvgID,
+			LogoUrl:     m.TvgLogo,
+			GroupTitle:  m.GroupTitle,
+			StreamUrl:   m.URL,
+			TunerHostId: hostID,
+		}
+		if prev, ok := prevByID[chID]; ok {
+			ch.Disabled = prev.Disabled
+			ch.SortIndex = prev.SortIndex
+		} else if strings.TrimSpace(m.TvgID) == "" {
+			if nameKey := strings.ToLower(strings.TrimSpace(m.Name)); nameKey != "" && prevByNameCount[nameKey] == 1 {
+				prev := prevByName[nameKey]
+				ch.Disabled = prev.Disabled
+				ch.SortIndex = prev.SortIndex
+			}
+		}
+		newChannelIDs[chID] = struct{}{}
+		delete(removedChannelIDs, chID)
+		newChannels = append(newChannels, ch)
+	}
+
+	existingProgramsByCh := make(map[string]bool)
+	keptPrograms := make([]ProgramInfo, 0, len(h.state.Programs))
+	for _, p := range h.state.Programs {
+		if _, drop := removedChannelIDs[p.ChannelId]; drop {
+			continue
+		}
+		keptPrograms = append(keptPrograms, p)
+		if _, ok := newChannelIDs[p.ChannelId]; ok {
+			existingProgramsByCh[p.ChannelId] = true
+		}
+	}
+
+	for _, ch := range newChannels {
+		keptChannels = append(keptChannels, ch)
+		if !existingProgramsByCh[ch.Id] {
+			keptPrograms = append(keptPrograms, ProgramInfo{
+				Id:          guid.New(),
+				Name:        ch.Name + " Live",
+				ServerId:    h.serverID(),
+				Type:        "Program",
+				ChannelId:   ch.Id,
+				ChannelName: ch.Name,
+				StartDate:   now,
+				EndDate:     now.Add(24 * time.Hour),
+				IsLive:      true,
+			})
+		}
+	}
+	h.state.Channels = keptChannels
+	h.state.Programs = keptPrograms
+}
+
+// RefreshTunerHost reloads channels from the configured URL/file of a single M3U or HDHomeRun
+// tuner host and losslessly merges them into LiveTV state. Network and file I/O are performed
+// outside h.mu, and an empty upstream response preserves existing channels intact.
+func (h *Handler) RefreshTunerHost(ctx context.Context, id string) (TunerHostInfo, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return TunerHostInfo{}, fmt.Errorf("tuner host id is empty: %w", os.ErrNotExist)
+	}
+
+	h.mu.RLock()
+	var host TunerHostInfo
+	found := false
+	for _, existing := range h.state.TunerHosts {
+		if existing.Id == id {
+			host = existing
+			found = true
+			break
+		}
+	}
+	h.mu.RUnlock()
+	if !found {
+		return TunerHostInfo{}, fmt.Errorf("tuner host %q not found: %w", id, os.ErrNotExist)
+	}
+
+	rawURL := strings.TrimSpace(host.Url)
+	if rawURL == "" {
+		return TunerHostInfo{}, errTunerHostNoURL
+	}
+
+	var (
+		parsed     []M3UChannel
+		discovered *hdHomeRunDiscoverPayload
+		err        error
+	)
+	if strings.EqualFold(host.Type, "m3u") {
+		parsed, err = h.loadM3UFromSource(ctx, rawURL, host.UserAgent)
+		if err != nil {
+			return TunerHostInfo{}, fmt.Errorf("failed to load m3u playlist: %w", err)
+		}
+	} else if strings.EqualFold(host.Type, "hdhomerun") {
+		parsed, discovered, err = h.loadHDHomeRunFromSourceWithPolicy(ctx, rawURL, host.UserAgent, host.ImportFavoritesOnly, host.AllowPrivateNetwork)
+		if err != nil {
+			return TunerHostInfo{}, fmt.Errorf("failed to load hdhomerun lineup: %w", err)
+		}
+	} else {
+		return TunerHostInfo{}, fmt.Errorf("%w: %s", errTunerHostUnsupportedType, host.Type)
+	}
+
+	if len(parsed) == 0 {
+		return TunerHostInfo{}, errTunerHostEmptyRefresh
+	}
+
+	h.mu.Lock()
+	idx := -1
+	for i := range h.state.TunerHosts {
+		if h.state.TunerHosts[i].Id == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		h.mu.Unlock()
+		return TunerHostInfo{}, fmt.Errorf("tuner host %q not found: %w", id, os.ErrNotExist)
+	}
+
+	snapshot := cloneLiveTVState(h.state)
+	updated := h.state.TunerHosts[idx]
+	updated.ImportedChannelCount = len(parsed)
+	if discovered != nil {
+		if updated.FriendlyName == "" && discovered.FriendlyName != "" {
+			updated.FriendlyName = discovered.FriendlyName
+		}
+		if updated.DeviceId == "" && discovered.DeviceID != "" {
+			updated.DeviceId = discovered.DeviceID
+		}
+		if updated.TunerCount <= 0 && discovered.TunerCount > 0 {
+			updated.TunerCount = discovered.TunerCount
+		}
+	}
+	h.state.TunerHosts[idx] = updated
+	h.mergeTunerHostChannelsLocked(updated.Id, parsed)
+
+	saveErr := h.saveStateLocked(ctx)
+	if saveErr != nil {
+		h.state = snapshot
+	}
+	h.mu.Unlock()
+	if saveErr != nil {
+		return TunerHostInfo{}, fmt.Errorf("%w: %v", errTunerHostPersist, saveErr)
+	}
+	return updated, nil
+}
+
+// RefreshAllTunerHosts refreshes all configured M3U and HDHomeRun tuner hosts that have a
+// non-empty Url, skipping manual inline M3U hosts cleanly. If a host fails to refresh, its
+// existing channels are preserved and the remaining hosts continue to be refreshed.
+func (h *Handler) RefreshAllTunerHosts(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	hosts := h.SnapshotTunerHosts()
+	var errs []error
+	for _, host := range hosts {
+		if strings.TrimSpace(host.Url) == "" {
+			continue
+		}
+		if !strings.EqualFold(host.Type, "m3u") && !strings.EqualFold(host.Type, "hdhomerun") {
+			continue
+		}
+		if _, err := h.RefreshTunerHost(ctx, host.Id); err != nil {
+			errs = append(errs, fmt.Errorf("tuner host %s: %w", host.Id, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (h *Handler) handleRefreshTunerHost(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("Id"))
+	updated, err := h.RefreshTunerHost(r.Context(), id)
+	if err != nil {
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			httpx.Error(w, http.StatusNotFound, "tuner host not found")
+		case errors.Is(err, errTunerHostNoURL), errors.Is(err, errTunerHostUnsupportedType):
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, errTunerHostPersist):
+			httpx.Error(w, http.StatusInternalServerError, "failed to persist tuner host")
+		default:
+			httpx.Error(w, http.StatusBadGateway, err.Error())
+		}
+		return
+	}
+	httpx.JSON(w, http.StatusOK, updated)
 }
 
 func (h *Handler) loadM3UFromSource(ctx context.Context, src, userAgent string) ([]M3UChannel, error) {

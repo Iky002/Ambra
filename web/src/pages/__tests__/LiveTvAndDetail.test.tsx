@@ -20,35 +20,49 @@ const hlsInstances: Array<{
   loadSource: ReturnType<typeof vi.fn>
   attachMedia: ReturnType<typeof vi.fn>
   recoverMediaError: ReturnType<typeof vi.fn>
+  swapAudioCodec: ReturnType<typeof vi.fn>
+  startLoad: ReturnType<typeof vi.fn>
   destroy: ReturnType<typeof vi.fn>
   on: ReturnType<typeof vi.fn>
-  emitError: (data: { fatal: boolean; type: string }) => void
+  emitError: (data: { fatal: boolean; type: string; details?: string }) => void
 }> = []
 
 vi.mock('hls.js', () => {
   class MockHls {
     static isSupported = vi.fn(() => true)
-    static Events = { ERROR: 'hlsError' }
+    static Events = { ERROR: 'hlsError', FRAG_BUFFERED: 'hlsFragBuffered' }
     static ErrorTypes = {
       NETWORK_ERROR: 'networkError',
       MEDIA_ERROR: 'mediaError',
       OTHER_ERROR: 'otherError',
     }
 
-    private handlers = new Map<string, (event: string, data: { fatal: boolean; type: string }) => void>()
+    private handlers = new Map<
+      string,
+      (event: string, data: { fatal: boolean; type: string; details?: string }) => void
+    >()
     loadSource = vi.fn()
     attachMedia = vi.fn()
     recoverMediaError = vi.fn()
+    swapAudioCodec = vi.fn()
+    startLoad = vi.fn()
     destroy = vi.fn()
-    on = vi.fn((event: string, cb: (event: string, data: { fatal: boolean; type: string }) => void) => {
-      this.handlers.set(event, cb)
-    })
+    on = vi.fn(
+      (
+        event: string,
+        cb: (event: string, data: { fatal: boolean; type: string; details?: string }) => void,
+      ) => {
+        this.handlers.set(event, cb)
+      },
+    )
 
     constructor() {
       hlsInstances.push({
         loadSource: this.loadSource,
         attachMedia: this.attachMedia,
         recoverMediaError: this.recoverMediaError,
+        swapAudioCodec: this.swapAudioCodec,
+        startLoad: this.startLoad,
         destroy: this.destroy,
         on: this.on,
         emitError: (data) => {
@@ -135,7 +149,7 @@ describe('Stream 3 (v0.9.2): LiveTv HLS/DVR/EPG, Cache Invalidation, InstantMix 
     vi.restoreAllMocks()
   })
 
-  it('LiveTvPage: hls.js MEDIA_ERROR 最多恢复 2 次，第 3 次展示错误与「重试」按钮，且非 HLS 源触发 MEDIA_ERR_SRC_NOT_SUPPORTED 时自动回退 hls.js', async () => {
+  it('LiveTvPage: hls.js MEDIA_ERROR 最多恢复 10 次，第 11 次展示错误与「重试」按钮，且非 HLS 源触发 MEDIA_ERR_SRC_NOT_SUPPORTED 时自动回退 hls.js', async () => {
     setDemoModeOverride(false)
     vi.spyOn(api, 'getLiveTvChannels').mockResolvedValue({
       Items: [
@@ -167,22 +181,30 @@ describe('Stream 3 (v0.9.2): LiveTv HLS/DVR/EPG, Cache Invalidation, InstantMix 
     expect(hlsInstances.length).toBe(1)
     const firstHls = hlsInstances[0]
 
-    // 前 2 次 MEDIA_ERROR 触发 recoverMediaError
-    act(() => {
-      firstHls.emitError({ fatal: true, type: 'mediaError' })
-      firstHls.emitError({ fatal: true, type: 'mediaError' })
-    })
-    expect(firstHls.recoverMediaError).toHaveBeenCalledTimes(2)
+    vi.useFakeTimers()
+    // 前 10 次 MEDIA_ERROR 延迟触发 recoverMediaError
+    for (let attempt = 1; attempt <= 10; attempt += 1) {
+      act(() => {
+        firstHls.emitError({ fatal: true, type: 'mediaError', details: 'bufferStalledError' })
+      })
+      act(() => {
+        vi.advanceTimersByTime(Math.min(500 * attempt, 3000))
+      })
+    }
+    expect(firstHls.recoverMediaError).toHaveBeenCalledTimes(10)
+    expect(firstHls.swapAudioCodec).toHaveBeenCalledTimes(5)
     expect(screen.queryByRole('alert')).toBeNull()
 
-    // 第 3 次超过上限 -> destroy + 显示错误和「重试」按钮
+    // 第 11 次超过上限 -> destroy + 显示错误和「重试」按钮
     act(() => {
-      firstHls.emitError({ fatal: true, type: 'mediaError' })
+      firstHls.emitError({ fatal: true, type: 'mediaError', details: 'bufferStalledError' })
     })
-    expect(firstHls.recoverMediaError).toHaveBeenCalledTimes(2)
+    vi.useRealTimers()
+    expect(firstHls.recoverMediaError).toHaveBeenCalledTimes(10)
     expect(firstHls.destroy).toHaveBeenCalledTimes(1)
     const alert = await screen.findByRole('alert')
     expect(alert.textContent).toContain('媒体解码多次失败')
+    expect(alert.textContent).toContain('(bufferStalledError)')
 
     // 点击「重试」重新初始化 hls.js
     fireEvent.click(within(alert).getByRole('button', { name: '重试' }))
