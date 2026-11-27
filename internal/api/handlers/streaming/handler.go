@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -247,6 +248,27 @@ func matchesBlockUnratedType(itemType, mediaType string, blockUnrated []string) 
 
 func blockedOrEmpty(in []string) []string { return in }
 
+func (h *Handler) isPlaylistPublic(ctx context.Context, playlistID string) bool {
+	if h.userRepo == nil {
+		return false
+	}
+	normID := guid.Normalize(playlistID)
+	if normID == "" {
+		return false
+	}
+	raw, err := h.userRepo.GetServerConfig(ctx, "item_visibility_"+normID)
+	if err != nil || strings.TrimSpace(raw) == "" {
+		return false
+	}
+	var vis struct {
+		IsPublic bool `json:"IsPublic"`
+	}
+	if err := json.Unmarshal([]byte(raw), &vis); err != nil {
+		return false
+	}
+	return vis.IsPublic
+}
+
 func (h *Handler) canAccessItem(r *http.Request, itemID string) bool {
 	if h.repo == nil {
 		return true
@@ -259,6 +281,11 @@ func (h *Handler) canAccessItem(r *http.Request, itemID string) bool {
 			}
 			if err != nil || rec == nil {
 				return false
+			}
+			if strings.EqualFold(rec.Type, "Playlist") && strings.TrimSpace(rec.ParentID) != "" {
+				if guid.Normalize(rec.ParentID) != guid.Normalize(ac.User.ID) {
+					return false
+				}
 			}
 			pol := ac.User.Policy
 			if rec.LibraryID != "" && !h.repo.CanUserAccessLibrary(r.Context(), pol, rec.LibraryID) {
@@ -283,15 +310,20 @@ func (h *Handler) canAccessItem(r *http.Request, itemID string) bool {
 	if err != nil || rec == nil {
 		return false
 	}
-	if rec.LibraryID != "" && !h.CanAccessLibrary(r.Context(), callerID, rec.LibraryID) {
-		return false
-	}
 	u, err := h.userRepo.GetUserByID(r.Context(), callerID)
 	if err != nil || u == nil {
 		return false
 	}
 	if u.IsAdmin || u.Policy.IsAdministrator {
 		return true
+	}
+	if strings.EqualFold(rec.Type, "Playlist") && strings.TrimSpace(rec.ParentID) != "" && !h.isPlaylistPublic(r.Context(), rec.ID) {
+		if guid.Normalize(rec.ParentID) != guid.Normalize(callerID) {
+			return false
+		}
+	}
+	if rec.LibraryID != "" && !h.CanAccessLibrary(r.Context(), callerID, rec.LibraryID) {
+		return false
 	}
 	blocked, err := h.repo.IsItemBlockedByPolicy(r.Context(), rec, u.Policy)
 	return err == nil && !blocked

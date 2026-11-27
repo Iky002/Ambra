@@ -49,6 +49,7 @@ type RecordingJob struct {
 	ChannelName    string
 	ProgramName    string
 	StreamURL      string
+	UserAgent      string
 	Duration       time.Duration
 	DenyPrivateLAN bool
 }
@@ -194,29 +195,12 @@ func (r *Recorder) SetOnFinished(fn func(ctx context.Context, state RecordingSta
 
 // StartRecording launches an ffmpeg process to record the given job.
 func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*RecordingState, error) {
-	if strings.TrimSpace(job.TimerID) == "" || strings.TrimSpace(job.StreamURL) == "" {
+	if strings.TrimSpace(job.TimerID) == "" {
 		return nil, ErrInvalidJob
 	}
-	if err := netutil.ValidateRemoteURLNoLoopback(job.StreamURL, !job.DenyPrivateLAN); err != nil {
-		return nil, fmt.Errorf("%w: invalid stream URL: %v", ErrInvalidJob, err)
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	if err := os.MkdirAll(r.recordingsDir, 0o755); err != nil {
-		return nil, fmt.Errorf("dvr: create recordings dir: %w", err)
-	}
-
-	// Route ALL remote streams (including .m3u8 HLS manifests) through LoopbackStreamProxy
-	// so FFmpeg never performs secondary DNS resolution or fetches untrusted HLS sub-URIs directly (H-06).
-	proxy, proxyErr := transcode.StartLoopbackStreamProxy(transcode.LoopbackProxyOptions{
-		TargetURL:        job.StreamURL,
-		AllowPrivateLAN:  !job.DenyPrivateLAN,
-		DisallowLoopback: true,
-	})
-	if proxyErr != nil {
-		return nil, fmt.Errorf("%w: invalid stream URL: %v", ErrInvalidJob, proxyErr)
-	}
-	streamProxy := proxy
-	jobForArgs := job
-	jobForArgs.StreamURL = proxy.URL()
 
 	now := time.Now().UTC()
 	outFile := filepath.Join(r.recordingsDir, buildOutputFilename(job, now))
@@ -224,23 +208,115 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
-		if streamProxy != nil {
-			_ = streamProxy.Close()
-		}
 		return nil, ErrRecorderClosed
 	}
 	if existing, ok := r.entries[job.TimerID]; ok && existing.state.Status == StatusRecording {
 		r.mu.Unlock()
+		return nil, ErrAlreadyRecording
+	}
+	recCtx, cancel := context.WithCancel(ctx)
+	entry := &recordingEntry{
+		state: RecordingState{
+			Job:        job,
+			OutputPath: outFile,
+			Status:     StatusRecording,
+			StartedAt:  now,
+		},
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+	r.entries[job.TimerID] = entry
+	r.wg.Add(1)
+	r.mu.Unlock()
+
+	failStartup := func(err error, status Status, streamProxy *transcode.LoopbackStreamProxy, stdinPipe io.WriteCloser) {
+		if stdinPipe != nil {
+			_ = stdinPipe.Close()
+		}
 		if streamProxy != nil {
 			_ = streamProxy.Close()
 		}
-		return nil, ErrAlreadyRecording
+		cancel()
+		r.mu.Lock()
+		if status == "" {
+			if entry.cancelled || recCtx.Err() != nil {
+				status = StatusCancelled
+			} else {
+				status = StatusFailed
+			}
+		}
+		entry.state.Status = status
+		entry.state.EndedAt = time.Now().UTC()
+		if err != nil {
+			entry.state.Error = err.Error()
+		}
+		close(entry.done)
+		r.pruneFinishedLocked()
+		finalState := entry.state
+		onFinished := r.onFinished
+		r.mu.Unlock()
+		r.wg.Done()
+		if onFinished != nil {
+			onFinished(context.Background(), finalState)
+		}
 	}
 
-	if ctx == nil {
-		ctx = context.Background()
+	if strings.TrimSpace(job.StreamURL) == "" {
+		failStartup(ErrInvalidJob, StatusFailed, nil, nil)
+		return nil, ErrInvalidJob
 	}
-	recCtx, cancel := context.WithCancel(ctx)
+	if err := netutil.ValidateRemoteURLNoLoopback(job.StreamURL, !job.DenyPrivateLAN); err != nil {
+		wrapped := fmt.Errorf("%w: invalid stream URL: %v", ErrInvalidJob, err)
+		failStartup(wrapped, StatusFailed, nil, nil)
+		return nil, wrapped
+	}
+	if err := os.MkdirAll(r.recordingsDir, 0o755); err != nil {
+		wrapped := fmt.Errorf("dvr: create recordings dir: %w", err)
+		failStartup(wrapped, StatusFailed, nil, nil)
+		return nil, wrapped
+	}
+	if err := recCtx.Err(); err != nil {
+		failStartup(err, StatusCancelled, nil, nil)
+		return nil, err
+	}
+
+	// Route ALL remote streams (including .m3u8 HLS manifests) through LoopbackStreamProxy
+	// so FFmpeg never performs secondary DNS resolution or fetches untrusted HLS sub-URIs directly (H-06).
+	var proxyHeaders map[string]string
+	if ua := strings.TrimSpace(job.UserAgent); ua != "" {
+		proxyHeaders = map[string]string{"User-Agent": ua}
+	}
+	proxy, proxyErr := transcode.StartLoopbackStreamProxy(transcode.LoopbackProxyOptions{
+		TargetURL:        job.StreamURL,
+		Headers:          proxyHeaders,
+		AllowPrivateLAN:  !job.DenyPrivateLAN,
+		DisallowLoopback: true,
+	})
+	if proxyErr != nil {
+		wrapped := fmt.Errorf("%w: invalid stream URL: %v", ErrInvalidJob, proxyErr)
+		failStartup(wrapped, StatusFailed, nil, nil)
+		return nil, wrapped
+	}
+	streamProxy := proxy
+	jobForArgs := job
+	jobForArgs.StreamURL = proxy.URL()
+
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		failStartup(ErrRecorderClosed, StatusCancelled, streamProxy, nil)
+		return nil, ErrRecorderClosed
+	}
+	if entry.cancelled || recCtx.Err() != nil {
+		cancelErr := recCtx.Err()
+		if cancelErr == nil {
+			cancelErr = context.Canceled
+		}
+		r.mu.Unlock()
+		failStartup(cancelErr, StatusCancelled, streamProxy, nil)
+		return nil, cancelErr
+	}
+
 	var maxWallClock time.Duration
 	if job.Duration > 0 {
 		pad := r.deadlinePad
@@ -253,45 +329,19 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 	cmd := exec.Command(r.ffmpegPath, args...)
 	stdinPipe, _ := cmd.StdinPipe()
 
-	entry := &recordingEntry{
-		state: RecordingState{
-			Job:        job,
-			OutputPath: outFile,
-			Status:     StatusRecording,
-			StartedAt:  now,
-		},
-		cmd:    cmd,
-		proxy:  streamProxy,
-		stdin:  stdinPipe,
-		cancel: cancel,
-		done:   make(chan struct{}),
-	}
+	entry.cmd = cmd
+	entry.proxy = streamProxy
+	entry.stdin = stdinPipe
 
 	if err := cmd.Start(); err != nil {
-		if stdinPipe != nil {
-			_ = stdinPipe.Close()
-		}
-		if streamProxy != nil {
-			_ = streamProxy.Close()
-		}
-		cancel()
-		entry.state.Status = StatusFailed
-		entry.state.EndedAt = time.Now().UTC()
-		entry.state.Error = err.Error()
-		close(entry.done)
-		r.entries[job.TimerID] = entry
-		r.pruneFinishedLocked()
-		failedState := entry.state
-		onFinished := r.onFinished
 		r.mu.Unlock()
-		if onFinished != nil {
-			onFinished(context.Background(), failedState)
-		}
-		return nil, fmt.Errorf("dvr: start ffmpeg: %w", err)
+		wrapped := fmt.Errorf("dvr: start ffmpeg: %w", err)
+		failStartup(err, StatusFailed, streamProxy, stdinPipe)
+		return nil, wrapped
 	}
 
-	r.entries[job.TimerID] = entry
-	r.wg.Add(2)
+	// Add 1 more to wg (on top of the 1 added at pending registration) for the 2 goroutines below.
+	r.wg.Add(1)
 	snapshot := entry.state
 	r.mu.Unlock()
 

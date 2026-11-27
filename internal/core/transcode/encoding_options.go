@@ -246,14 +246,42 @@ func ValidateTranscodingTempPath(rawPath, dataDir string) (string, error) {
 	if isForbiddenSystemDir(resolved) {
 		return "", fmt.Errorf("transcoding temp path %q is a forbidden system directory", resolved)
 	}
+	if tmpDir := strings.TrimSpace(os.TempDir()); tmpDir != "" {
+		if absTmp, absErr := filepath.Abs(tmpDir); absErr == nil {
+			resolvedTmp, resErr := resolvePathOrNearestAncestor(filepath.Clean(absTmp))
+			if resErr != nil {
+				resolvedTmp = filepath.Clean(absTmp)
+			}
+			if resolved == resolvedTmp {
+				return "", fmt.Errorf("transcoding temp path %q must be a dedicated subdirectory, not the shared OS temp directory", resolved)
+			}
+		}
+	}
+	if homeDir, homeErr := os.UserHomeDir(); homeErr == nil && strings.TrimSpace(homeDir) != "" {
+		if absHome, absErr := filepath.Abs(strings.TrimSpace(homeDir)); absErr == nil {
+			resolvedHome, resErr := resolvePathOrNearestAncestor(filepath.Clean(absHome))
+			if resErr != nil {
+				resolvedHome = filepath.Clean(absHome)
+			}
+			if resolved == resolvedHome {
+				return "", fmt.Errorf("transcoding temp path %q cannot be the user home directory", resolved)
+			}
+		}
+	}
 	if strings.TrimSpace(dataDir) != "" {
 		if absData, absErr := filepath.Abs(strings.TrimSpace(dataDir)); absErr == nil {
 			resolvedData, resErr := resolvePathOrNearestAncestor(filepath.Clean(absData))
 			if resErr != nil {
 				resolvedData = filepath.Clean(absData)
 			}
-			if resolved == resolvedData || strings.HasPrefix(resolvedData, resolved+string(filepath.Separator)) {
+			sep := string(filepath.Separator)
+			defaultTemp := filepath.Join(resolvedData, "cache", "transcoding-temp")
+			if resolved == resolvedData || strings.HasPrefix(resolvedData, resolved+sep) {
 				return "", fmt.Errorf("transcoding temp path %q overlaps server data directory", resolved)
+			}
+			if strings.HasPrefix(resolved, resolvedData+sep) &&
+				resolved != defaultTemp && !strings.HasPrefix(resolved, defaultTemp+sep) {
+				return "", fmt.Errorf("transcoding temp path %q must not be inside server data directory outside %q", resolved, defaultTemp)
 			}
 		}
 	}

@@ -375,7 +375,7 @@ func (h *Handler) handleDirectStream(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method != http.MethodHead && h.cfg != nil && h.transcodeMgr != nil {
 		if limit := h.cfg.Snapshot().SimultaneousStreamLimit; limit > 0 {
-			releaseSlot, allowed := h.transcodeMgr.TryAcquireStreamSlot(limit, "")
+			releaseSlot, allowed := h.transcodeMgr.TryAcquireStreamSlot(limit, h.audioDirectStreamSlotKey(r, q, itemID))
 			if !allowed {
 				httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
 				return
@@ -388,6 +388,15 @@ func (h *Handler) handleDirectStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	serveAudioFile(w, r, mediaPath)
+}
+
+func (h *Handler) audioDirectStreamSlotKey(r *http.Request, q httpx.Query, itemID string) string {
+	_, callerID, _ := h.callerPolicy(r)
+	sessionScope := strings.TrimSpace(q.Get("PlaySessionId"))
+	if sessionScope == "" {
+		sessionScope = strings.TrimSpace(q.Get("DeviceId"))
+	}
+	return "audio:" + guid.Normalize(callerID) + ":" + guid.Normalize(itemID) + ":" + sessionScope
 }
 
 func (h *Handler) handleUniversal(w http.ResponseWriter, r *http.Request, urlExt string) {
@@ -468,7 +477,7 @@ func (h *Handler) handleUniversal(w http.ResponseWriter, r *http.Request, urlExt
 		}
 		if r.Method != http.MethodHead && h.cfg != nil && h.transcodeMgr != nil {
 			if limit := h.cfg.Snapshot().SimultaneousStreamLimit; limit > 0 {
-				releaseSlot, allowed := h.transcodeMgr.TryAcquireStreamSlot(limit, "")
+				releaseSlot, allowed := h.transcodeMgr.TryAcquireStreamSlot(limit, h.audioDirectStreamSlotKey(r, q, itemID))
 				if !allowed {
 					httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
 					return

@@ -880,8 +880,8 @@ func (h *Handler) itemToDIDL(it dto.BaseItemDto, baseURL, serverUUID string) str
 		serverUUID = h.cfgSnapshot().ServerID
 	}
 	exp := time.Now().UTC().Add(dlnaStreamTokenTTL).Unix()
-	sig := h.signStreamToken(it.Id, exp)
-	resURL := fmt.Sprintf("%s/Dlna/%s/stream/%s?exp=%d&sig=%s", baseURL, url.PathEscape(serverUUID), url.PathEscape(it.Id), exp, sig)
+	directSig := h.signStreamTokenForMode(it.Id, exp, false)
+	resURL := fmt.Sprintf("%s/Dlna/%s/stream/%s?exp=%d&sig=%s", baseURL, url.PathEscape(serverUUID), url.PathEscape(it.Id), exp, directSig)
 	attrs := fmt.Sprintf(`protocolInfo="http-get:*:%s:*"`, mimeType)
 	durAttr := ""
 	if it.RunTimeTicks != nil && *it.RunTimeTicks > 0 {
@@ -898,7 +898,8 @@ func (h *Handler) itemToDIDL(it dto.BaseItemDto, baseURL, serverUUID string) str
 		if strings.EqualFold(it.MediaType, "Audio") {
 			fbMime = "audio/mpeg"
 		}
-		fbURL := resURL + "&transcode=1"
+		tcSig := h.signStreamTokenForMode(it.Id, exp, true)
+		fbURL := fmt.Sprintf("%s/Dlna/%s/stream/%s?exp=%d&sig=%s&transcode=1", baseURL, url.PathEscape(serverUUID), url.PathEscape(it.Id), exp, tcSig)
 		fallbackResXML = fmt.Sprintf(`<res protocolInfo="http-get:*:%s:*"%s>%s</res>`, fbMime, durAttr, xmlEscape(fbURL))
 	}
 
