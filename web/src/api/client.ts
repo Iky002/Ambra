@@ -119,7 +119,7 @@ export function buildEmbyAuthHeader(token?: string): string {
     'Client="Ambra Web"',
     'Device="Web Browser"',
     `DeviceId="${deviceId}"`,
-    'Version="0.11.2"',
+    'Version="0.11.3"',
   ]
   if (token) {
     parts.push(`Token="${token}"`)
