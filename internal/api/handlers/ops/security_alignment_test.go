@@ -252,3 +252,100 @@ func TestH01M01M03M04M05And31_OpsHardeningAndAlignment(t *testing.T) {
 		t.Fatal("expected loopback startup request exceeding startupLoopbackRateLimit to be blocked")
 	}
 }
+
+func TestBackupRestoreStripsWebDirAndDataDir(t *testing.T) {
+	dir := t.TempDir()
+	st, err := sqlite.Open(filepath.Join(dir, "ops_restore.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	cfg := config.Default(dir)
+	userRepo := sqlite.NewUserRepo(st)
+	authSvc := auth.NewService(userRepo, cfg)
+	ctx := context.Background()
+	if _, err := authSvc.CreateUser(ctx, "admin", "adminpass123", true); err != nil {
+		t.Fatal(err)
+	}
+	adminAuth, err := authSvc.AuthenticateByName(ctx, "admin", "adminpass123", "", auth.ClientInfo{DeviceID: "d-adm"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sessMgr := session.NewManager(userRepo, cfg, eventbus.New())
+	authMW := middleware.NewAuth(authSvc, sessMgr)
+	h := New(st, cfg, userRepo, eventbus.New())
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, AuthFuncs{
+		RequireAuth:  authMW.RequireAuth,
+		RequireAdmin: authMW.RequireAdmin,
+	})
+
+	srcDBBytes, err := os.ReadFile(filepath.Join(dir, "ops_restore.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	backupsDir := filepath.Join(dir, "config", "backups")
+	if err := os.MkdirAll(backupsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	evilZip := filepath.Join(backupsDir, "evil-dirs.zip")
+	buildTestZipV0110(t, evilZip, map[string][]byte{
+		"ambra.db": srcDBBytes,
+		"config/ambra.json": []byte(`{
+			"server_name": "Restored Server",
+			"web_dir": "/data",
+			"WebDir": "/etc",
+			"data_dir": "/tmp/evil",
+			"DataDir": "/tmp/evil2"
+		}`),
+	})
+
+	doRestore := func() map[string]any {
+		req := httptest.NewRequest(http.MethodPost, "/BackupRestore/Restore", bytes.NewBufferString(`{"Name":"evil-dirs.zip"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Emby-Token", adminAuth.AccessToken)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("restore failed: %d %s", rec.Code, rec.Body.String())
+		}
+		stagedRaw, err := os.ReadFile(filepath.Join(dir, "config", "ambra.json.restore"))
+		if err != nil {
+			t.Fatalf("read staged ambra.json.restore: %v", err)
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal(stagedRaw, &parsed); err != nil {
+			t.Fatalf("unmarshal staged config: %v", err)
+		}
+		return parsed
+	}
+
+	// 1. Without existing local ambra.json -> malicious web_dir/data_dir keys are completely stripped.
+	parsedFresh := doRestore()
+	for _, forbidden := range []string{"web_dir", "WebDir", "data_dir", "DataDir"} {
+		if _, exists := parsedFresh[forbidden]; exists {
+			t.Fatalf("expected %s stripped from staged restore config, got %#v", forbidden, parsedFresh)
+		}
+	}
+
+	// 2. With existing local ambra.json containing host web_dir/data_dir -> host values preserved, attacker values stripped.
+	localCfgPath := filepath.Join(dir, "config", "ambra.json")
+	if err := os.WriteFile(localCfgPath, []byte(`{
+		"server_name": "Host",
+		"web_dir": "/opt/host-web",
+		"data_dir": "/var/lib/host-ambra"
+	}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	parsedHost := doRestore()
+	if parsedHost["web_dir"] != "/opt/host-web" || parsedHost["data_dir"] != "/var/lib/host-ambra" {
+		t.Fatalf("expected host web_dir/data_dir preserved, got %#v", parsedHost)
+	}
+	for _, alt := range []string{"WebDir", "DataDir"} {
+		if _, exists := parsedHost[alt]; exists {
+			t.Fatalf("expected %s stripped, got %#v", alt, parsedHost)
+		}
+	}
+}

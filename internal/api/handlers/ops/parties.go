@@ -158,6 +158,9 @@ func sanitizePartyForCaller(p Party, callerID string, isAdmin, hasAuth bool) Par
 	if hasAuth && !isAdmin && (callerID == "" || guid.Normalize(p.HostUserId) != callerID) {
 		p.InviteCode = ""
 	}
+	if hasAuth && !isAdmin && (callerID == "" || (guid.Normalize(p.HostUserId) != callerID && !isPartyMember(p.Members, callerID))) {
+		p.Messages = nil
+	}
 	return p
 }
 

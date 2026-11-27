@@ -3,11 +3,13 @@ package compatcore
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/middleware"
@@ -307,4 +309,52 @@ func TestCompatCoreV0104SecurityRemediations(t *testing.T) {
 	}
 	var dummy dto.UserDto
 	_ = json.Unmarshal([]byte(`{}`), &dummy)
+}
+
+func TestAuthByIDIPAggregateAndDeterministicCap(t *testing.T) {
+	env := newTestEnv(t)
+
+	// 1. Single IP spraying arbitrary distinct user IDs MUST hit 429 at authByIDIPRateLimit (60).
+	sprayIP := "198.51.100.222:40000"
+	for i := 0; i < authByIDIPRateLimit; i++ {
+		fakeUID := fmt.Sprintf("sprayuser%023d", i)
+		req := httptest.NewRequest(http.MethodPost, "/Users/"+fakeUID+"/Authenticate", strings.NewReader(`{"Pw":"wrong"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = sprayIP
+		rec := httptest.NewRecorder()
+		env.router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("authByID spray attempt %d expected 401, got %d", i+1, rec.Code)
+		}
+	}
+	reqBlocked := httptest.NewRequest(http.MethodPost, "/Users/brandnewuid000000000000000000000/Authenticate", strings.NewReader(`{"Pw":"wrong"}`))
+	reqBlocked.Header.Set("Content-Type", "application/json")
+	reqBlocked.RemoteAddr = sprayIP
+	recBlocked := httptest.NewRecorder()
+	env.router.ServeHTTP(recBlocked, reqBlocked)
+	if recBlocked.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 after %d authByID spray attempts from single IP, got %d", authByIDIPRateLimit, recBlocked.Code)
+	}
+
+	// 2. Bucket cap fail-closed: filling authByIDRates to maxRateLimitBuckets MUST NOT evict an existing
+	// ip|adminID lockout bucket, and new (ip, uid) pairs fail closed with 429.
+	now := time.Now().UTC()
+	hCap := New(env.cfg, env.store, env.userRepo, env.libRepo, env.sessions, nil)
+	adminIP := "203.0.113.88"
+	for i := 0; i < authByIDRateLimit; i++ {
+		hCap.recordAuthByIDFailure(adminIP, env.admin.ID, now)
+	}
+	if !hCap.isAuthByIDRateLimited(adminIP, env.admin.ID, now) {
+		t.Fatal("expected ip|adminID to be locked out")
+	}
+	for i := 0; i < maxRateLimitBuckets+50; i++ {
+		ip := fmt.Sprintf("198.51.%d.%d", (i/250)%256, (i%250)+1)
+		hCap.recordAuthByIDFailure(ip, fmt.Sprintf("uid-%d", i), now.Add(time.Millisecond))
+	}
+	if !hCap.isAuthByIDRateLimited(adminIP, env.admin.ID, now.Add(2*time.Millisecond)) {
+		t.Fatal("expected ip|adminID lockout bucket to remain intact and never be evicted")
+	}
+	if !hCap.isAuthByIDRateLimited("203.0.113.251", "fresh-uid", now.Add(2*time.Millisecond)) {
+		t.Fatal("expected fail-closed rate limit when authByIDRates is at maxRateLimitBuckets")
+	}
 }

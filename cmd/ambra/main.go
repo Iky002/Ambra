@@ -182,7 +182,8 @@ func validatePendingDBRestoreFile(restoreDBPath string) (present bool, valid boo
 
 func isExecutablePathConfigKey(k string) bool {
 	switch strings.ToLower(strings.TrimSpace(k)) {
-	case "ffmpeg_path", "ffprobe_path", "ffmpegpath", "ffprobepath":
+	case "ffmpeg_path", "ffprobe_path", "ffmpegpath", "ffprobepath",
+		"web_dir", "webdir", "data_dir", "datadir":
 		return true
 	default:
 		return false
@@ -197,7 +198,7 @@ func sanitizeRestoredConfigJSON(raw []byte, existingCfgPath string) ([]byte, boo
 	if err := json.Unmarshal(raw, &cfgMap); err != nil || cfgMap == nil {
 		return nil, false
 	}
-	// Security (M-03): Strip any ffmpeg/ffprobe executable paths from restored backup config.
+	// Security (M-03 / H-02): Strip any host executable or directory paths from restored backup config.
 	for k := range cfgMap {
 		if isExecutablePathConfigKey(k) {
 			delete(cfgMap, k)
@@ -207,7 +208,7 @@ func sanitizeRestoredConfigJSON(raw []byte, existingCfgPath string) ([]byte, boo
 		if existingRaw, rErr := os.ReadFile(existingCfgPath); rErr == nil {
 			var existingMap map[string]any
 			if json.Unmarshal(existingRaw, &existingMap) == nil && existingMap != nil {
-				var keepFFmpeg, keepFFprobe string
+				var keepFFmpeg, keepFFprobe, keepWebDir, keepDataDir string
 				for k, v := range existingMap {
 					s, ok := v.(string)
 					if !ok || strings.TrimSpace(s) == "" {
@@ -218,6 +219,10 @@ func sanitizeRestoredConfigJSON(raw []byte, existingCfgPath string) ([]byte, boo
 						keepFFmpeg = s
 					case "ffprobe_path", "ffprobepath":
 						keepFFprobe = s
+					case "web_dir", "webdir":
+						keepWebDir = s
+					case "data_dir", "datadir":
+						keepDataDir = s
 					}
 				}
 				if keepFFmpeg != "" {
@@ -225,6 +230,12 @@ func sanitizeRestoredConfigJSON(raw []byte, existingCfgPath string) ([]byte, boo
 				}
 				if keepFFprobe != "" {
 					cfgMap["ffprobe_path"] = keepFFprobe
+				}
+				if keepWebDir != "" {
+					cfgMap["web_dir"] = keepWebDir
+				}
+				if keepDataDir != "" {
+					cfgMap["data_dir"] = keepDataDir
 				}
 			}
 		}
