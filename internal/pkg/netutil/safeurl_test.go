@@ -294,3 +294,97 @@ func TestSafeURLSpecialPrefixesAndRedirectHardening(t *testing.T) {
 		t.Fatal("expected NewSafeHTTPClientNoLoopback to block dialing loopback server")
 	}
 }
+
+func TestCrossHostnameRedirectSSRFBlocking(t *testing.T) {
+	lanClient := NewSafeHTTPClient(5*time.Second, true)
+	defer lanClient.CloseIdleConnections()
+
+	// 1. Public origin redirecting to private LAN, CGNAT, or loopback must be blocked even with allowPrivateLAN=true.
+	pubOrigin := &http.Request{URL: &url.URL{Scheme: "http", Host: "93.184.216.34:80", Path: "/video.mp4"}}
+	for _, target := range []string{
+		"http://192.168.1.50:8080/admin",
+		"http://10.0.0.5/internal",
+		"http://100.64.0.1/tailscale",
+		"http://127.0.0.1:8096/System/Info",
+		"http://localhost:8096/System/Info",
+	} {
+		u, err := url.Parse(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nextReq := &http.Request{URL: u, Header: make(http.Header)}
+		if err := lanClient.CheckRedirect(nextReq, []*http.Request{pubOrigin}); err == nil {
+			t.Fatalf("expected cross-hostname redirect from public host to %s to be blocked", target)
+		}
+	}
+
+	// 2. Private LAN origin redirecting to a DIFFERENT private LAN host or loopback must be blocked.
+	lanOrigin := &http.Request{URL: &url.URL{Scheme: "http", Host: "192.168.1.10:5244", Path: "/d/movie.mkv"}}
+	for _, target := range []string{
+		"http://192.168.1.1/router",
+		"http://127.0.0.1:8096/System/Info",
+	} {
+		u, _ := url.Parse(target)
+		nextReq := &http.Request{URL: u, Header: make(http.Header)}
+		if err := lanClient.CheckRedirect(nextReq, []*http.Request{lanOrigin}); err == nil {
+			t.Fatalf("expected cross-hostname redirect from LAN host to %s to be blocked", target)
+		}
+	}
+
+	// 3. Same-hostname redirect on private LAN (including port change) remains allowed when allowPrivateLAN=true.
+	sameLANTarget, _ := url.Parse("http://192.168.1.10:9000/storage/movie.mkv")
+	sameLANReq := &http.Request{URL: sameLANTarget, Header: make(http.Header)}
+	if err := lanClient.CheckRedirect(sameLANReq, []*http.Request{lanOrigin}); err != nil {
+		t.Fatalf("expected same-hostname LAN redirect to succeed, got %v", err)
+	}
+	if isPublicOnlyRedirectCtx(sameLANReq.Context()) {
+		t.Fatal("expected same-hostname LAN redirect not to mark context public-only")
+	}
+
+	// 4. Private LAN origin redirecting to a public CDN IP is allowed and marks context public-only.
+	pubCDNURL, _ := url.Parse("http://93.184.216.34/cdn/movie.mkv")
+	pubCDNReq := &http.Request{URL: pubCDNURL, Header: make(http.Header)}
+	if err := lanClient.CheckRedirect(pubCDNReq, []*http.Request{lanOrigin}); err != nil {
+		t.Fatalf("expected cross-hostname redirect from LAN to public CDN IP to succeed, got %v", err)
+	}
+	if !isPublicOnlyRedirectCtx(pubCDNReq.Context()) {
+		t.Fatal("expected cross-hostname redirect to mark context with publicOnlyRedirectCtxKey")
+	}
+
+	// 5. Boomerang redirect (LAN -> public -> back to original LAN host) must be blocked.
+	boomerangURL, _ := url.Parse("http://192.168.1.10:5244/internal")
+	boomerangReq := (&http.Request{URL: boomerangURL, Header: make(http.Header)}).WithContext(pubCDNReq.Context())
+	if err := lanClient.CheckRedirect(boomerangReq, []*http.Request{lanOrigin, pubCDNReq}); err == nil {
+		t.Fatal("expected boomerang redirect back to private LAN host after crossing hostnames to be blocked")
+	}
+
+	// 6. DialContext enforces public-only validation when publicOnlyRedirectCtxKey is set (blocks DNS rebinding on redirect hop).
+	tr := lanClient.Transport.(*http.Transport)
+	pubRedirectCtx := context.WithValue(context.Background(), publicOnlyRedirectCtxKey{}, true)
+	if conn, err := tr.DialContext(pubRedirectCtx, "tcp", "127.0.0.1:80"); err == nil {
+		_ = conn.Close()
+		t.Fatal("expected DialContext with publicOnlyRedirectCtxKey to block loopback")
+	}
+	if conn, err := tr.DialContext(pubRedirectCtx, "tcp", "192.168.1.10:80"); err == nil {
+		_ = conn.Close()
+		t.Fatal("expected DialContext with publicOnlyRedirectCtxKey to block private LAN")
+	}
+
+	// Live HTTP server redirect from 127.0.0.1 to localhost (different hostname!) is blocked even with allowPrivateLAN=true.
+	secretSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer secretSrv.Close()
+	secretPort := strings.TrimPrefix(secretSrv.URL, "http://127.0.0.1:")
+
+	redirToLocalhostSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://localhost:"+secretPort+"/secret", http.StatusFound)
+	}))
+	defer redirToLocalhostSrv.Close()
+
+	if resp, err := lanClient.Get(redirToLocalhostSrv.URL + "/go"); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("expected live redirect from 127.0.0.1 to localhost (different hostname) to be blocked")
+	}
+}
+

@@ -195,6 +195,22 @@ func NewSafeHTTPClientNoLoopback(timeout time.Duration, allowPrivateLAN bool) *h
 	return newSafeHTTPClientWithOpts(timeout, allowPrivateLAN, false)
 }
 
+type publicOnlyRedirectCtxKey struct{}
+
+func isPublicOnlyRedirectCtx(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(publicOnlyRedirectCtxKey{}).(bool)
+	return v
+}
+
+func sameRedirectHostname(a, b string) bool {
+	na := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(a), "."))
+	nb := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(b), "."))
+	return na != "" && na == nb
+}
+
 func newSafeHTTPClientWithOpts(timeout time.Duration, allowPrivateLAN, allowLoopback bool) *http.Client {
 	dialer := &net.Dialer{
 		Timeout:   dialTimeout,
@@ -210,7 +226,11 @@ func newSafeHTTPClientWithOpts(timeout time.Duration, allowPrivateLAN, allowLoop
 			if err != nil {
 				return nil, fmt.Errorf("invalid dial address %q: %w", addr, err)
 			}
-			ips, err := resolveAndValidateHostWithOpts(ctx, host, allowPrivateLAN, allowLoopback)
+			effAllowLAN, effAllowLoop := allowPrivateLAN, allowLoopback
+			if isPublicOnlyRedirectCtx(ctx) {
+				effAllowLAN, effAllowLoop = false, false
+			}
+			ips, err := resolveAndValidateHostWithOpts(ctx, host, effAllowLAN, effAllowLoop)
 			if err != nil {
 				return nil, err
 			}
@@ -239,10 +259,17 @@ func newSafeHTTPClientWithOpts(timeout time.Duration, allowPrivateLAN, allowLoop
 			if req.URL == nil {
 				return errors.New("redirect target url is nil")
 			}
+			crossHostname := isPublicOnlyRedirectCtx(req.Context())
+			if len(via) > 0 && via[0].URL != nil && !sameRedirectHostname(via[0].URL.Hostname(), req.URL.Hostname()) {
+				crossHostname = true
+			}
 			if len(via) > 0 && via[len(via)-1].URL != nil {
 				prev := via[len(via)-1].URL
 				if strings.EqualFold(prev.Scheme, "https") && strings.EqualFold(req.URL.Scheme, "http") {
 					return errors.New("blocked redirect downgrade from https to http")
+				}
+				if !sameRedirectHostname(prev.Hostname(), req.URL.Hostname()) {
+					crossHostname = true
 				}
 				if !strings.EqualFold(prev.Host, req.URL.Host) {
 					for _, hdr := range []string{
@@ -254,6 +281,9 @@ func newSafeHTTPClientWithOpts(timeout time.Duration, allowPrivateLAN, allowLoop
 					}
 				}
 			}
+			if crossHostname {
+				*req = *req.WithContext(context.WithValue(req.Context(), publicOnlyRedirectCtxKey{}, true))
+			}
 			ctx, cancel := context.WithTimeout(req.Context(), dnsLookupTimeout)
 			defer cancel()
 			scheme := strings.ToLower(req.URL.Scheme)
@@ -264,7 +294,11 @@ func newSafeHTTPClientWithOpts(timeout time.Duration, allowPrivateLAN, allowLoop
 			if host == "" {
 				return errors.New("blocked redirect target: url host is empty")
 			}
-			if _, err := resolveAndValidateHostWithOpts(ctx, host, allowPrivateLAN, allowLoopback); err != nil {
+			effAllowLAN, effAllowLoop := allowPrivateLAN, allowLoopback
+			if crossHostname {
+				effAllowLAN, effAllowLoop = false, false
+			}
+			if _, err := resolveAndValidateHostWithOpts(ctx, host, effAllowLAN, effAllowLoop); err != nil {
 				return fmt.Errorf("blocked redirect target: %w", err)
 			}
 			return nil

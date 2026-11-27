@@ -211,8 +211,8 @@ func TestAuthenticateByNameIPAggregateAndDeterministicCap(t *testing.T) {
 		t.Fatalf("expected 429 after %d username-spray attempts from single IP, got %d", authByNameIPRateLimit, recBlocked.Code)
 	}
 
-	// 2. Bucket cap fail-closed: filling authRates to authRateMaxBuckets MUST NOT evict an existing
-	// ip|admin lockout bucket, and new (ip, user) pairs fail closed with 429.
+	// 2. Bucket cap eviction without global DoS: filling authRates to authRateMaxBuckets MUST NOT evict an existing
+	// ip|admin lockout bucket, and unseen legitimate (ip, user) pairs MUST NOT be blocked with 429!
 	now := time.Now().UTC()
 	hCap := NewHandler(authSvc, userRepo, sessMgr, wsHub, cfg)
 	adminIP := "203.0.113.55"
@@ -222,18 +222,35 @@ func TestAuthenticateByNameIPAggregateAndDeterministicCap(t *testing.T) {
 	if !hCap.isLoginRateLimited(adminIP, "admin", now) {
 		t.Fatal("expected ip|admin to be locked out")
 	}
-	// Fill remaining buckets up to authRateMaxBuckets with distinct IPs/users.
+	// 70 spraying IPs trying 59 usernames each MUST be capped to maxSubBucketsPerIP per IP
+	// and MUST NOT block an unrelated legitimate user/IP!
+	for ipIdx := 0; ipIdx < 70; ipIdx++ {
+		atkIP := fmt.Sprintf("198.18.0.%d", ipIdx+1)
+		for uIdx := 0; uIdx < authByNameIPRateLimit-1; uIdx++ {
+			hCap.recordLoginFailure(atkIP, fmt.Sprintf("spray-user-%d", uIdx), now.Add(time.Millisecond))
+		}
+		if gotSub := countIPSubBucketsLocked(hCap.authRates, atkIP); gotSub > maxSubBucketsPerIP {
+			t.Fatalf("expected <= %d composite sub-buckets for %s, got %d", maxSubBucketsPerIP, atkIP, gotSub)
+		}
+	}
+	if hCap.isLoginRateLimited("203.0.113.249", "legit-after-70-sprayers", now.Add(time.Millisecond)) {
+		t.Fatal("expected legitimate IP not to suffer global DoS after 70 username-spraying IPs")
+	}
+	// Fill remaining buckets beyond authRateMaxBuckets with distinct IPs/users.
 	for i := 0; i < authRateMaxBuckets+50; i++ {
 		ip := fmt.Sprintf("198.51.%d.%d", (i/250)%256, (i%250)+1)
-		hCap.recordLoginFailure(ip, fmt.Sprintf("u%d", i), now.Add(time.Millisecond))
+		hCap.recordLoginFailure(ip, fmt.Sprintf("u%d", i), now.Add(2*time.Millisecond))
+	}
+	if len(hCap.authRates) > authRateMaxBuckets || len(hCap.authIPRates) > authRateMaxBuckets {
+		t.Fatalf("expected rate maps bounded at %d, got authRates=%d authIPRates=%d", authRateMaxBuckets, len(hCap.authRates), len(hCap.authIPRates))
 	}
 	// Existing ip|admin lockout bucket MUST still be intact and rate-limited!
-	if !hCap.isLoginRateLimited(adminIP, "admin", now.Add(2*time.Millisecond)) {
+	if !hCap.isLoginRateLimited(adminIP, "admin", now.Add(3*time.Millisecond)) {
 		t.Fatal("expected ip|admin lockout bucket to remain intact and never be evicted")
 	}
-	// New unseen (ip, user) MUST fail closed (rate-limited = true) while map is at cap!
-	if !hCap.isLoginRateLimited("203.0.113.250", "freshuser", now.Add(2*time.Millisecond)) {
-		t.Fatal("expected fail-closed rate limit when authRates is at maxBuckets")
+	// Unseen legitimate (ip, user) MUST NOT fail closed with a global 429 DoS!
+	if hCap.isLoginRateLimited("203.0.113.250", "freshuser", now.Add(3*time.Millisecond)) {
+		t.Fatal("expected unseen legitimate (ip, user) not to be globally rate-limited when authRates is at cap")
 	}
 
 	// 3. Deterministic eviction in pruneRateBucketsLocked: if map exceeds cap, evicts oldest last-attempt first.

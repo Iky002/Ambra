@@ -478,6 +478,9 @@ func (m *Manager) RegisterBuiltinTasks(scanAll func(ctx context.Context) error, 
 				report(100)
 				return nil
 			}
+			if err := validateTranscodeCleanTargetDir(targetDir); err != nil {
+				return err
+			}
 			entries, err := os.ReadDir(targetDir)
 			if err != nil {
 				if os.IsNotExist(err) {
@@ -509,13 +512,11 @@ func (m *Manager) RegisterBuiltinTasks(scanAll func(ctx context.Context) error, 
 					}
 					continue
 				}
-				if entry.IsDir() {
-					if info, statErr := entry.Info(); statErr == nil && time.Since(info.ModTime()) < transcodeCleanMinAge {
-						if total > 0 {
-							report(10 + float64(i+1)/float64(total)*90)
-						}
-						continue
+				if info, statErr := entry.Info(); statErr == nil && time.Since(info.ModTime()) < transcodeCleanMinAge {
+					if total > 0 {
+						report(10 + float64(i+1)/float64(total)*90)
 					}
+					continue
 				}
 				_ = os.RemoveAll(fullPath)
 				if total > 0 {
@@ -835,4 +836,67 @@ func snapshotLocked(mt *managedTask) TaskInfo {
 		IsHidden:                  mt.def.IsHidden,
 		Key:                       mt.def.Key,
 	}
+}
+
+func validateTranscodeCleanTargetDir(targetDir string) error {
+	trimmed := strings.TrimSpace(targetDir)
+	if trimmed == "" || trimmed == "." {
+		return fmt.Errorf("unsafe transcode clean target directory %q", targetDir)
+	}
+	cleanDir := filepath.Clean(trimmed)
+	if abs, err := filepath.Abs(cleanDir); err == nil {
+		cleanDir = filepath.Clean(abs)
+	}
+
+	candidates := []string{cleanDir}
+	if sym, err := filepath.EvalSymlinks(cleanDir); err == nil {
+		candidates = append(candidates, filepath.Clean(sym))
+	} else if parentSym, pErr := filepath.EvalSymlinks(filepath.Dir(cleanDir)); pErr == nil {
+		candidates = append(candidates, filepath.Clean(filepath.Join(parentSym, filepath.Base(cleanDir))))
+	}
+
+	forbiddenExact := map[string]struct{}{
+		"/":      {},
+		"/etc":   {},
+		"/usr":   {},
+		"/var":   {},
+		"/bin":   {},
+		"/sbin":  {},
+		"/lib":   {},
+		"/lib64": {},
+		"/home":  {},
+		"/root":  {},
+		"/dev":   {},
+		"/proc":  {},
+		"/sys":   {},
+		"/boot":  {},
+	}
+	addForbidden := func(raw string) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return
+		}
+		c := filepath.Clean(raw)
+		forbiddenExact[c] = struct{}{}
+		if abs, err := filepath.Abs(c); err == nil {
+			forbiddenExact[filepath.Clean(abs)] = struct{}{}
+		}
+		if sym, err := filepath.EvalSymlinks(c); err == nil {
+			forbiddenExact[filepath.Clean(sym)] = struct{}{}
+		}
+	}
+	addForbidden(os.TempDir())
+	if homeDir, err := os.UserHomeDir(); err == nil {
+		addForbidden(homeDir)
+	}
+
+	for _, cand := range candidates {
+		if cand == "" || cand == "." || filepath.Dir(cand) == cand {
+			return fmt.Errorf("refusing to clean filesystem root %q", targetDir)
+		}
+		if _, blocked := forbiddenExact[cand]; blocked {
+			return fmt.Errorf("refusing to clean protected directory %q", targetDir)
+		}
+	}
+	return nil
 }

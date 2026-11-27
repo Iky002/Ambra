@@ -107,6 +107,40 @@ func (h *Handler) canAccessPartyItem(r *http.Request, explicitUserID, itemID str
 	return true
 }
 
+func (h *Handler) canMemberAccessPartyItem(r *http.Request, memberUserID, itemID string) bool {
+	trimmedItem := strings.TrimSpace(itemID)
+	if trimmedItem == "" {
+		return true
+	}
+	checker := h.getItemAccessChecker()
+	if checker == nil {
+		return true
+	}
+	uid := guid.Normalize(memberUserID)
+	if uid == "" {
+		return false
+	}
+	if h.userRepo != nil {
+		u, err := h.userRepo.GetUserByID(r.Context(), uid)
+		if err == nil && u != nil {
+			if u.IsDisabled || u.Policy.IsDisabled {
+				return false
+			}
+			if u.IsAdmin || u.Policy.IsAdministrator {
+				return true
+			}
+			return checker(r.Context(), u, trimmedItem)
+		}
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil && guid.Normalize(ac.User.ID) == uid {
+		if ac.IsAdmin() {
+			return true
+		}
+		return checker(r.Context(), ac.User, trimmedItem)
+	}
+	return false
+}
+
 func callerUserName(r *http.Request) string {
 	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil {
 		return ac.User.Name
@@ -782,13 +816,23 @@ func (h *Handler) handleJoinParty(w http.ResponseWriter, r *http.Request) {
 				}
 				delete(h.partyJoinFails, failKey)
 			}
-			partyItemID := p.State.ItemId
-			if partyItemID != "" {
+			verifiedItemID := ""
+			for {
+				partyItemID := strings.TrimSpace(p.State.ItemId)
+				if partyItemID == "" || partyItemID == verifiedItemID {
+					break
+				}
+				if r.Context().Err() != nil {
+					h.mu.Unlock()
+					httpx.Error(w, http.StatusRequestTimeout, "request cancelled")
+					return
+				}
 				h.mu.Unlock()
 				if !h.canAccessPartyItem(r, userID, partyItemID) {
 					httpx.Error(w, http.StatusForbidden, "access to party item denied")
 					return
 				}
+				verifiedItemID = partyItemID
 				h.mu.Lock()
 				// Re-find party after releasing lock for item access check.
 				foundIdx := -1
@@ -1002,6 +1046,10 @@ func (h *Handler) handleUpdatePartyState(w http.ResponseWriter, r *http.Request)
 			}
 			h.mu.Unlock()
 
+			if !isAdmin && respParty.State.ItemId != "" && !h.canAccessPartyItem(r, callerID, respParty.State.ItemId) {
+				respParty.State.ItemId = ""
+			}
+
 			if h.bus != nil {
 				h.bus.Publish(r.Context(), eventbus.Event{
 					Type:    eventbus.EventSessionUpdated,
@@ -1014,19 +1062,41 @@ func (h *Handler) handleUpdatePartyState(w http.ResponseWriter, r *http.Request)
 			} else if req.PositionTicks != nil {
 				playstateCmd = "Seek"
 			}
-			h.pushPartyWS(members, ws.Message{
-				MessageType: "Playstate",
-				Data: map[string]any{
-					"Command":           playstateCmd,
-					"SeekPositionTicks": stateCopy.PositionTicks,
-					"PositionTicks":     stateCopy.PositionTicks,
-					"IsPaused":          stateCopy.IsPaused,
-					"PlaybackRate":      stateCopy.PlaybackRate,
-					"ItemId":            stateCopy.ItemId,
-					"PartyId":           id,
-					"ControllingUserId": callerID,
-				},
-			})
+			makePlaystateMsg := func(msgItemID string) ws.Message {
+				return ws.Message{
+					MessageType: "Playstate",
+					Data: map[string]any{
+						"Command":           playstateCmd,
+						"SeekPositionTicks": stateCopy.PositionTicks,
+						"PositionTicks":     stateCopy.PositionTicks,
+						"IsPaused":          stateCopy.IsPaused,
+						"PlaybackRate":      stateCopy.PlaybackRate,
+						"ItemId":            msgItemID,
+						"PartyId":           id,
+						"ControllingUserId": callerID,
+					},
+				}
+			}
+			if hub := h.getWSHub(); hub != nil && len(members) > 0 {
+				if strings.TrimSpace(stateCopy.ItemId) != "" && h.getItemAccessChecker() != nil {
+					var allowedMembers, scrubbedMembers []string
+					for _, m := range members {
+						if h.canMemberAccessPartyItem(r, m, stateCopy.ItemId) {
+							allowedMembers = append(allowedMembers, m)
+						} else {
+							scrubbedMembers = append(scrubbedMembers, m)
+						}
+					}
+					if len(allowedMembers) > 0 {
+						hub.SendToUsers(allowedMembers, makePlaystateMsg(stateCopy.ItemId))
+					}
+					if len(scrubbedMembers) > 0 {
+						hub.SendToUsers(scrubbedMembers, makePlaystateMsg(""))
+					}
+				} else {
+					hub.SendToUsers(members, makePlaystateMsg(stateCopy.ItemId))
+				}
+			}
 			httpx.JSON(w, http.StatusOK, respParty)
 			return
 		}

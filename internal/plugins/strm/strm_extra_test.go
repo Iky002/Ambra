@@ -59,4 +59,37 @@ func TestResolveSTRMExtraBranches(t *testing.T) {
 			t.Fatalf("expected error for unsafe strm target %q, got res=%+v err=%v", unsafeTarget, res, err)
 		}
 	}
+
+	// Directory named .strm must be rejected
+	dirStrm := filepath.Join(dir, "folder.strm")
+	if err := os.MkdirAll(dirStrm, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := r.ResolveStream(ctx, dirStrm); err == nil || res != nil {
+		t.Fatalf("expected error for directory .strm path, got res=%+v err=%v", res, err)
+	}
+
+	// Symlink inside parent tree is allowed; symlink escaping parent directory is rejected
+	subDir := filepath.Join(dir, "nested")
+	outsideDir := t.TempDir()
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inTreeTarget := filepath.Join(subDir, "real.strm")
+	_ = os.WriteFile(inTreeTarget, []byte("https://93.184.216.34/ok.mp4\n"), 0o644)
+	inTreeLink := filepath.Join(dir, "linked-in-tree.strm")
+	if err := os.Symlink(inTreeTarget, inTreeLink); err == nil {
+		if res, err := r.ResolveStream(ctx, inTreeLink); err != nil || res == nil || res.URL != "https://93.184.216.34/ok.mp4" {
+			t.Fatalf("expected symlink within parent tree to resolve, got res=%+v err=%v", res, err)
+		}
+	}
+
+	outsideTarget := filepath.Join(outsideDir, "secret.strm")
+	_ = os.WriteFile(outsideTarget, []byte("https://93.184.216.34/escaped.mp4\n"), 0o644)
+	escapedLink := filepath.Join(dir, "escaped.strm")
+	if err := os.Symlink(outsideTarget, escapedLink); err == nil {
+		if res, err := r.ResolveStream(ctx, escapedLink); err == nil || res != nil {
+			t.Fatalf("expected escaping .strm symlink to be rejected, got res=%+v err=%v", res, err)
+		}
+	}
 }

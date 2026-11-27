@@ -609,7 +609,21 @@ func (h *Handler) signStreamToken(itemID string, exp int64) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
+func (h *Handler) signStreamTokenForMode(itemID string, exp int64, transcode bool) string {
+	mode := "0"
+	if transcode {
+		mode = "1"
+	}
+	mac := hmac.New(sha256.New, h.streamSecret)
+	_, _ = fmt.Fprintf(mac, "%s:%d:tc=%s", guid.Normalize(itemID), exp, mode)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 func (h *Handler) verifyStreamToken(itemID, expStr, sig string) bool {
+	return h.verifyStreamTokenForMode(itemID, expStr, sig, false, true)
+}
+
+func (h *Handler) verifyStreamTokenForMode(itemID, expStr, sig string, wantTranscode, allowLegacyUnscoped bool) bool {
 	expStr = strings.TrimSpace(expStr)
 	sig = strings.TrimSpace(sig)
 	if expStr == "" || sig == "" {
@@ -619,14 +633,74 @@ func (h *Handler) verifyStreamToken(itemID, expStr, sig string) bool {
 	if err != nil || exp <= time.Now().UTC().Unix() {
 		return false
 	}
-	expected := h.signStreamToken(itemID, exp)
-	return hmac.Equal([]byte(expected), []byte(strings.ToLower(sig)))
+	sigLower := []byte(strings.ToLower(sig))
+	scoped := h.signStreamTokenForMode(itemID, exp, wantTranscode)
+	if hmac.Equal([]byte(scoped), sigLower) {
+		return true
+	}
+	if allowLegacyUnscoped {
+		expected := h.signStreamToken(itemID, exp)
+		return hmac.Equal([]byte(expected), sigLower)
+	}
+	return false
+}
+
+func isDLNAAudioItem(item *sqlite.ItemRecord) bool {
+	if item == nil {
+		return false
+	}
+	return strings.EqualFold(item.MediaType, "Audio") ||
+		strings.EqualFold(item.Type, "Audio") ||
+		strings.EqualFold(item.Type, "AudioBook")
+}
+
+func isDLNAPhotoItem(item *sqlite.ItemRecord) bool {
+	if item == nil {
+		return false
+	}
+	return strings.EqualFold(item.MediaType, "Photo") || strings.EqualFold(item.Type, "Photo")
+}
+
+func (h *Handler) canDLNATranscodeItem(r *http.Request, item *sqlite.ItemRecord) bool {
+	if isDLNAPhotoItem(item) {
+		return false
+	}
+	pol, denyAll := h.resolvePolicyForRequest(r.Context(), r)
+	if denyAll {
+		return false
+	}
+	if pol == nil || pol.IsAdministrator {
+		return true
+	}
+	if !pol.EnableMediaPlayback {
+		return false
+	}
+	if isDLNAAudioItem(item) {
+		return pol.EnableAudioPlaybackTranscoding
+	}
+	return pol.EnableVideoPlaybackTranscoding
+}
+
+func (h *Handler) acquireDLNAStreamSlot() (func(), bool) {
+	noop := func() {}
+	h.mu.RLock()
+	mgr := h.transcodeMgr
+	h.mu.RUnlock()
+	if h.cfg == nil || mgr == nil {
+		return noop, true
+	}
+	limit := h.cfg.Snapshot().SimultaneousStreamLimit
+	if limit <= 0 {
+		return noop, true
+	}
+	return mgr.TryAcquireStreamSlot(limit, "dlna:"+guid.New())
 }
 
 func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(r.PathValue("Id"))
 	q := r.URL.Query()
-	if !h.verifyStreamToken(itemID, q.Get("exp"), q.Get("sig")) {
+	explicitTranscode := q.Get("transcode") == "1" || strings.EqualFold(q.Get("transcode"), "true")
+	if !h.verifyStreamTokenForMode(itemID, q.Get("exp"), q.Get("sig"), explicitTranscode, true) {
 		httpx.Error(w, http.StatusForbidden, "invalid or expired stream signature")
 		return
 	}
@@ -665,9 +739,17 @@ func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	wantTranscode := q.Get("transcode") == "1" || strings.EqualFold(q.Get("transcode"), "true")
+	wantTranscode := explicitTranscode
 	if !wantTranscode && q.Get("profile") != "" {
-		wantTranscode = !h.profileSupportsContainer(q.Get("profile"), item, realPath)
+		if !h.verifyStreamTokenForMode(itemID, q.Get("exp"), q.Get("sig"), true, true) {
+			wantTranscode = false
+		} else {
+			wantTranscode = !h.profileSupportsContainer(q.Get("profile"), item, realPath)
+		}
+	}
+	if wantTranscode && !h.canDLNATranscodeItem(r, item) {
+		httpx.Error(w, http.StatusForbidden, "Playback transcoding is disabled for this user")
+		return
 	}
 
 	// [H-02] Server-side safe reverse proxy for .strm files (never 302 redirect exposing signed upstream URLs).
@@ -680,6 +762,14 @@ func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
 		if wantTranscode {
 			h.streamDLNATranscode(w, r, item, targetURL, headers)
 			return
+		}
+		if r.Method != http.MethodHead {
+			release, allowed := h.acquireDLNAStreamSlot()
+			if !allowed {
+				httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
+				return
+			}
+			defer release()
 		}
 		h.proxyDLNARemoteStream(w, r, targetURL, headers)
 		return
@@ -720,6 +810,14 @@ func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
 	if stat.IsDir() || !stat.Mode().IsRegular() {
 		httpx.Error(w, http.StatusNotFound, "media file not found")
 		return
+	}
+	if r.Method != http.MethodHead {
+		release, allowed := h.acquireDLNAStreamSlot()
+		if !allowed {
+			httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
+			return
+		}
+		defer release()
 	}
 	if ct := dlnaMediaContentType(realPath); ct != "" {
 		w.Header().Set("Content-Type", ct)
@@ -826,6 +924,7 @@ func (h *Handler) proxyDLNARemoteStream(w http.ResponseWriter, r *http.Request, 
 	h.mu.RUnlock()
 	if client == nil {
 		client = netutil.NewSafeHTTPClient(0, true)
+		defer client.CloseIdleConnections()
 	}
 
 	resp, err := client.Do(upReq)
@@ -893,7 +992,11 @@ func (h *Handler) profileSupportsContainer(profileID string, item *sqlite.ItemRe
 }
 
 func (h *Handler) streamDLNATranscode(w http.ResponseWriter, r *http.Request, item *sqlite.ItemRecord, mediaInput string, headers map[string]string) {
-	isAudio := item != nil && (strings.EqualFold(item.MediaType, "Audio") || strings.EqualFold(item.Type, "Audio"))
+	if !h.canDLNATranscodeItem(r, item) {
+		httpx.Error(w, http.StatusForbidden, "Playback transcoding is disabled for this user")
+		return
+	}
+	isAudio := isDLNAAudioItem(item)
 	ct := "video/mp2t"
 	if isAudio {
 		ct = "audio/mpeg"
@@ -906,19 +1009,12 @@ func (h *Handler) streamDLNATranscode(w http.ResponseWriter, r *http.Request, it
 		return
 	}
 
-	h.mu.RLock()
-	mgr := h.transcodeMgr
-	h.mu.RUnlock()
-	if h.cfg != nil && mgr != nil {
-		if limit := h.cfg.Snapshot().SimultaneousStreamLimit; limit > 0 {
-			release, allowed := mgr.TryAcquireStreamSlot(limit, "")
-			if !allowed {
-				httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
-				return
-			}
-			defer release()
-		}
+	release, allowed := h.acquireDLNAStreamSlot()
+	if !allowed {
+		httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
+		return
 	}
+	defer release()
 
 	ffInput := mediaInput
 	if strings.HasPrefix(strings.ToLower(mediaInput), "http://") || strings.HasPrefix(strings.ToLower(mediaInput), "https://") {
@@ -1036,6 +1132,8 @@ func isRestrictedUserPolicy(p dto.UserPolicy) bool {
 	return !p.EnableAllFolders ||
 		!p.EnableMediaPlayback ||
 		!p.EnableLiveTvAccess ||
+		!p.EnableVideoPlaybackTranscoding ||
+		!p.EnableAudioPlaybackTranscoding ||
 		p.MaxParentalRating != nil ||
 		len(p.BlockedTags) > 0 ||
 		len(p.BlockUnratedItems) > 0 ||
@@ -1049,17 +1147,19 @@ func isRestrictedUserPolicy(p dto.UserPolicy) bool {
 //   - Intersection of non-empty AllowedTags sets.
 func buildStrictestIntersectionPolicy(users []*sqlite.UserRecord) (*dto.UserPolicy, bool) {
 	var (
-		hasRestricted       bool
-		activeCount         int
-		enableMediaPlayback = true
-		enableLiveTvAccess  = true
-		folderInit          bool
-		folderSet           map[string]bool
-		minRating           *int
-		blockedTags         = make(map[string]string)
-		blockUnrated        = make(map[string]string)
-		allowedInit         bool
-		allowedSet          map[string]string
+		hasRestricted          bool
+		activeCount            int
+		enableMediaPlayback    = true
+		enableLiveTvAccess     = true
+		enableVideoTranscoding = true
+		enableAudioTranscoding = true
+		folderInit             bool
+		folderSet              map[string]bool
+		minRating              *int
+		blockedTags            = make(map[string]string)
+		blockUnrated           = make(map[string]string)
+		allowedInit            bool
+		allowedSet             map[string]string
 	)
 	for _, u := range users {
 		if u == nil || u.IsDisabled {
@@ -1079,6 +1179,12 @@ func buildStrictestIntersectionPolicy(users []*sqlite.UserRecord) (*dto.UserPoli
 		}
 		if !p.EnableLiveTvAccess {
 			enableLiveTvAccess = false
+		}
+		if !p.EnableVideoPlaybackTranscoding {
+			enableVideoTranscoding = false
+		}
+		if !p.EnableAudioPlaybackTranscoding {
+			enableAudioTranscoding = false
 		}
 		if !p.EnableAllFolders {
 			cur := make(map[string]bool, len(p.EnabledFolders))
@@ -1142,10 +1248,12 @@ func buildStrictestIntersectionPolicy(users []*sqlite.UserRecord) (*dto.UserPoli
 	}
 
 	out := dto.UserPolicy{
-		EnableMediaPlayback: enableMediaPlayback,
-		EnableLiveTvAccess:  enableLiveTvAccess,
-		EnableAllFolders:    !folderInit,
-		MaxParentalRating:   minRating,
+		EnableMediaPlayback:            enableMediaPlayback,
+		EnableLiveTvAccess:             enableLiveTvAccess,
+		EnableVideoPlaybackTranscoding: enableVideoTranscoding,
+		EnableAudioPlaybackTranscoding: enableAudioTranscoding,
+		EnableAllFolders:               !folderInit,
+		MaxParentalRating:              minRating,
 	}
 	if folderInit {
 		out.EnabledFolders = make([]string, 0, len(folderSet))

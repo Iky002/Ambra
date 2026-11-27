@@ -4,7 +4,7 @@ import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from '../../App'
-import { getAuthStorageKey, saveAuth } from '../../api/client'
+import { ApiError, embyFetch, getAuthStorageKey, getStoredAuth, saveAuth } from '../../api/client'
 import { AuthProvider, useAuth } from '../../context/AuthContext'
 import { LoginPage } from '../LoginPage'
 
@@ -308,5 +308,50 @@ describe('App RBAC 路由守卫 - /admin 访问控制', () => {
       expect(screen.getByTestId('probe-loading').textContent).toBe('false')
     })
     expect(userFetchCount).toBe(2)
+  })
+
+  it('旧会话在途请求返回 401 时不会清除已切换的新登录令牌或误派发 ambra:unauthorized', async () => {
+    saveAuth({
+      accessToken: 'stale-old-token',
+      userId: 'user-old',
+      serverId: 'srv-1',
+      userName: 'OldUser',
+      isAdmin: false,
+      deviceId: 'dev-1',
+    })
+
+    let resolveInFlight!: (res: Response) => void
+    vi.spyOn(globalThis, 'fetch').mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveInFlight = resolve
+        }),
+    )
+
+    const onUnauthorized = vi.fn()
+    window.addEventListener('ambra:unauthorized', onUnauthorized)
+
+    try {
+      const pendingReq = embyFetch('/emby/Users/user-old')
+
+      // 用户在旧请求返回前已完成新账号登录并写入新 token
+      saveAuth({
+        accessToken: 'fresh-new-token',
+        userId: 'user-new',
+        serverId: 'srv-1',
+        userName: 'NewUser',
+        isAdmin: true,
+        deviceId: 'dev-1',
+      })
+
+      resolveInFlight(jsonRes('Unauthorized', 401))
+
+      await expect(pendingReq).rejects.toBeInstanceOf(ApiError)
+      expect(getStoredAuth()?.accessToken).toBe('fresh-new-token')
+      expect(getStoredAuth()?.userId).toBe('user-new')
+      expect(onUnauthorized).not.toHaveBeenCalled()
+    } finally {
+      window.removeEventListener('ambra:unauthorized', onUnauthorized)
+    }
   })
 })

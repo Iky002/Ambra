@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -28,6 +29,9 @@ const (
 	stateConfigKey              = "sync:state"
 	maxSyncJobItemIDs           = 500
 	maxSyncJobsPerUser          = 100
+	maxSyncTotalJobs            = 1000
+	maxSyncJobItemsPerUser      = 5000
+	maxSyncTotalJobItems        = 20000
 	maxSyncJobNameLen           = 256
 	maxSyncFieldLen             = 128
 	maxSyncQualityLen           = 64
@@ -962,17 +966,42 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.Lock()
+	if len(h.state.Jobs) >= maxSyncTotalJobs {
+		h.mu.Unlock()
+		httpx.Error(w, http.StatusTooManyRequests, fmt.Sprintf("maximum total number of sync jobs (%d) reached", maxSyncTotalJobs))
+		return
+	}
+	if len(createdItems) > 0 && len(h.state.JobItems)+len(createdItems) > maxSyncTotalJobItems {
+		h.mu.Unlock()
+		httpx.Error(w, http.StatusTooManyRequests, fmt.Sprintf("maximum total number of sync job items (%d) reached", maxSyncTotalJobItems))
+		return
+	}
 	if job.UserId != "" {
 		userJobCount := 0
+		userJobIDs := make(map[string]struct{})
 		for _, existing := range h.state.Jobs {
 			if guid.Normalize(existing.UserId) == job.UserId {
 				userJobCount++
+				userJobIDs[existing.Id] = struct{}{}
 			}
 		}
 		if userJobCount >= maxSyncJobsPerUser {
 			h.mu.Unlock()
 			httpx.Error(w, http.StatusTooManyRequests, fmt.Sprintf("maximum number of sync jobs (%d) per user reached", maxSyncJobsPerUser))
 			return
+		}
+		if len(createdItems) > 0 {
+			userItemCount := 0
+			for _, ji := range h.state.JobItems {
+				if _, ok := userJobIDs[ji.JobId]; ok {
+					userItemCount++
+				}
+			}
+			if userItemCount+len(createdItems) > maxSyncJobItemsPerUser {
+				h.mu.Unlock()
+				httpx.Error(w, http.StatusTooManyRequests, fmt.Sprintf("maximum number of sync job items (%d) per user reached", maxSyncJobItemsPerUser))
+				return
+			}
 		}
 	}
 	snapshot := cloneSyncState(h.state)
@@ -1319,6 +1348,70 @@ func (h *Handler) handleMarkTransferred(w http.ResponseWriter, r *http.Request) 
 func (h *Handler) handleEnableJobItem(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
 	callerID, isAdmin, hasAuth := callerAuth(r)
+	if hasAuth && isAdmin {
+		if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil && (ac.User.IsDisabled || ac.User.Policy.IsDisabled) {
+			httpx.Error(w, http.StatusForbidden, "forbidden")
+			return
+		}
+	}
+	var callerUser *sqlite.UserRecord
+	if hasAuth && !isAdmin {
+		u, ok := h.resolveCallerUserForSync(r, callerID)
+		if !ok {
+			httpx.Error(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		if !u.IsAdmin && !u.Policy.IsAdministrator && !u.Policy.EnableContentDownloading {
+			httpx.Error(w, http.StatusForbidden, "content downloading is disabled")
+			return
+		}
+		callerUser = u
+	}
+
+	h.mu.RLock()
+	var (
+		found      bool
+		jiSnapshot SyncJobItem
+		parentJob  SyncJob
+		hasJob     bool
+	)
+	for i := range h.state.JobItems {
+		if h.state.JobItems[i].Id == id {
+			found = true
+			jiSnapshot = h.state.JobItems[i]
+			parentJob, hasJob = h.findJobLocked(jiSnapshot.JobId)
+			break
+		}
+	}
+	h.mu.RUnlock()
+
+	if !found {
+		httpx.Error(w, http.StatusNotFound, "sync job item not found")
+		return
+	}
+	if hasAuth && !isAdmin {
+		if !hasJob || !canAccessJob(parentJob, callerID, isAdmin, hasAuth) {
+			httpx.Error(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		if libRepo := h.getLibraryRepo(); libRepo != nil && strings.TrimSpace(jiSnapshot.ItemId) != "" {
+			rec, recErr := libRepo.GetItemRecordByID(r.Context(), jiSnapshot.ItemId)
+			if recErr != nil || rec == nil || !h.canUserAccessItemRecord(r.Context(), libRepo, callerUser, rec) {
+				httpx.Error(w, http.StatusForbidden, "access denied to sync item")
+				return
+			}
+		}
+	}
+
+	outputExists := false
+	if strings.TrimSpace(jiSnapshot.OutputPath) != "" {
+		if fi, statErr := os.Stat(jiSnapshot.OutputPath); statErr == nil && !fi.IsDir() {
+			outputExists = true
+		}
+	}
+	transcodeConfigured := h.isWorkerRunning() && h.resolveFFmpegBinary() != ""
+
+	wake := false
 	h.mu.Lock()
 	for i := range h.state.JobItems {
 		if h.state.JobItems[i].Id == id {
@@ -1331,9 +1424,39 @@ func (h *Handler) handleEnableJobItem(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			snapshot := cloneSyncState(h.state)
-			h.state.JobItems[i].Status = "ReadyToTransfer"
-			h.state.JobItems[i].Progress = 0
-			h.recomputeJobLocked(h.state.JobItems[i].JobId)
+			ji := &h.state.JobItems[i]
+			switch ji.Status {
+			case "Converting", "Transferring", "ReadyToTransfer", "Synced":
+				// Keep active or completed safe state intact.
+			case "Queued":
+				wake = true
+			default:
+				wantTC := false
+				if j, ok := h.findJobLocked(ji.JobId); ok {
+					wantTC, _ = needsSyncTranscode(j.Quality, j.Bitrate)
+				}
+				curOutExists := false
+				if ji.OutputPath != "" {
+					if ji.OutputPath == jiSnapshot.OutputPath {
+						curOutExists = outputExists
+					} else if fi, statErr := os.Stat(ji.OutputPath); statErr == nil && !fi.IsDir() {
+						curOutExists = true
+					}
+				}
+				if (ji.OutputPath != "" && curOutExists) || !wantTC || !transcodeConfigured {
+					if !wantTC && ji.OutputPath == "" && ji.SourcePath != "" {
+						ji.OutputPath = ji.SourcePath
+					}
+					ji.Status = "ReadyToTransfer"
+					ji.Progress = 0
+				} else {
+					ji.OutputPath = ""
+					ji.Status = "Queued"
+					ji.Progress = 0
+					wake = true
+				}
+			}
+			h.recomputeJobLocked(ji.JobId)
 			err := h.saveStateLocked(r.Context())
 			if err != nil {
 				h.state = snapshot
@@ -1342,6 +1465,9 @@ func (h *Handler) handleEnableJobItem(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				httpx.Error(w, http.StatusInternalServerError, "failed to persist sync state")
 				return
+			}
+			if wake {
+				h.wakeWorker()
 			}
 			httpx.NoContent(w)
 			return
@@ -1357,13 +1483,13 @@ func (h *Handler) resolveCallerUserForSync(r *http.Request, callerID string) (*s
 			return nil, false
 		}
 		u, err := userRepo.GetUserByID(r.Context(), callerID)
-		if err != nil || u == nil || u.IsDisabled {
+		if err != nil || u == nil || u.IsDisabled || u.Policy.IsDisabled {
 			return nil, false
 		}
 		return u, true
 	}
 	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil {
-		if ac.User.IsDisabled {
+		if ac.User.IsDisabled || ac.User.Policy.IsDisabled {
 			return nil, false
 		}
 		return ac.User, true

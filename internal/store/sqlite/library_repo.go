@@ -860,7 +860,7 @@ func (r *LibraryRepo) IsItemBlockedByPolicy(ctx context.Context, rec *ItemRecord
 
 	p := policyFromUserPolicy(policy)
 	var allowedLibs []string
-	if !policy.EnableAllFolders && policy.EnabledFolders != nil {
+	if !policy.EnableAllFolders {
 		allowedLibs = r.AllowedLibraryIDsForPolicy(ctx, policy)
 	} else if !policy.EnableLiveTvAccess {
 		allowedLibs = r.excludeLiveTvFromAllowedLibraries(ctx, nil, policy)
@@ -1067,13 +1067,21 @@ func (r *LibraryRepo) loadRestrictedUserPolicy(ctx context.Context, userID strin
 	if err != nil || isAdmin == 1 {
 		return parentalPolicy{}, nil, false
 	}
-	var pol dto.UserPolicy
-	if err := json.Unmarshal([]byte(policyRaw), &pol); err != nil || pol.IsAdministrator {
+	pol := DefaultUserPolicy(false)
+	if trimmedRaw := strings.TrimSpace(policyRaw); trimmedRaw != "" && trimmedRaw != "{}" {
+		if err := json.Unmarshal([]byte(trimmedRaw), &pol); err != nil {
+			return parentalPolicy{}, nil, false
+		}
+	}
+	if pol.IsAdministrator {
 		return parentalPolicy{}, nil, false
+	}
+	if pol.EnabledFolders == nil {
+		pol.EnabledFolders = []string{}
 	}
 	p := policyFromUserPolicy(pol)
 	var allowedLibs []string
-	if !pol.EnableAllFolders && pol.EnabledFolders != nil {
+	if !pol.EnableAllFolders {
 		allowedLibs = r.AllowedLibraryIDsForPolicy(ctx, pol)
 	} else if !pol.EnableLiveTvAccess {
 		allowedLibs = r.excludeLiveTvFromAllowedLibraries(ctx, nil, pol)
@@ -3111,10 +3119,11 @@ func (r *LibraryRepo) GetItemByID(ctx context.Context, serverID, userID, itemID 
 		return nil, err
 	}
 	var userPol parentalPolicy
+	var allowedLibs []string
 	if userID != "" {
-		userPol, _, _ = r.loadRestrictedUserPolicy(ctx, userID)
+		userPol, allowedLibs, _ = r.loadRestrictedUserPolicy(ctx, userID)
 	}
-	dtos, err := r.hydrateDTOsWithPolicy(ctx, []ItemRecord{rec}, []*dto.UserItemDataDto{ud}, serverID, userID, nil, true, userPol, nil)
+	dtos, err := r.hydrateDTOsWithPolicy(ctx, []ItemRecord{rec}, []*dto.UserItemDataDto{ud}, serverID, userID, nil, true, userPol, allowedLibs)
 	if err != nil {
 		return nil, err
 	}
@@ -3422,13 +3431,9 @@ func (r *LibraryRepo) SearchHints(ctx context.Context, f SearchHintFilter) ([]dt
 		where = append(where, lpClauses...)
 		args = append(args, lpArgs...)
 	}
-	if len(f.IncludeItemTypes) > 0 {
-		ph := make([]string, len(f.IncludeItemTypes))
-		for idx, t := range f.IncludeItemTypes {
-			ph[idx] = "?"
-			args = append(args, t)
-		}
-		where = append(where, fmt.Sprintf(`i.type IN (%s)`, strings.Join(ph, ",")))
+	if incClause, incArgs := appendSafeStringSetSQL("i.type", f.IncludeItemTypes, false, false); incClause != "" {
+		where = append(where, incClause)
+		args = append(args, incArgs...)
 	}
 
 	querySQL := `

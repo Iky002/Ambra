@@ -460,6 +460,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	livetvH := livetv.New(store, cfg)
 	livetvH.SetUserRepo(userRepo)
 	livetvH.SetLibraryRepo(libRepo)
+	livetvH.SetTranscodeManager(transcodeMgr)
 	livetvH.SetRecorder(dvrRec)
 	dvrRec.SetOnFinished(livetvH.OnRecordingFinished)
 	livetvH.RegisterRoutes(mediaMux, livetv.AuthFuncs{

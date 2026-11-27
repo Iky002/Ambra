@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import Hls from 'hls.js'
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { saveAuth } from '../../api/client'
@@ -681,6 +682,131 @@ describe('Stream C: PlayerPage 综合修复 (P0-1/P0-2/P0-3/P1-10/P1-11/P0-5)', 
 
     await waitFor(() => {
       expect(screen.getByTestId('audio-playing-state')).toHaveTextContent('paused')
+    })
+  })
+
+  it('Server HLS 激活期间忽略原生 <video onError>，且 fatal 重试耗尽时先调用 hls.destroy() 再展示错误', async () => {
+    let hlsErrorHandler:
+      | ((evt: string, data: { fatal: boolean; type: string; details: string }) => void)
+      | null = null
+
+    vi.spyOn(Hls, 'isSupported').mockReturnValue(true)
+    vi.spyOn(Hls.prototype, 'loadSource').mockImplementation(() => undefined)
+    vi.spyOn(Hls.prototype, 'attachMedia').mockImplementation(() => undefined)
+    const startLoadSpy = vi.spyOn(Hls.prototype, 'startLoad').mockImplementation(() => undefined)
+    const recoverMediaSpy = vi
+      .spyOn(Hls.prototype, 'recoverMediaError')
+      .mockImplementation(() => undefined)
+    const destroySpy = vi.spyOn(Hls.prototype, 'destroy').mockImplementation(() => undefined)
+    vi.spyOn(Hls.prototype, 'on').mockImplementation(function (
+      this: Hls,
+      event: string,
+      cb: (...args: unknown[]) => void,
+    ) {
+      if (event === Hls.Events.ERROR) {
+        hlsErrorHandler = cb as (
+          evt: string,
+          data: { fatal: boolean; type: string; details: string },
+        ) => void
+      }
+      return this
+    } as unknown as Hls['on'])
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input)
+      if (url === '/emby/Users/u-1') {
+        return jsonRes({ Id: 'u-1', Name: 'Tester', Policy: { IsAdministrator: true } })
+      }
+      if (url === '/emby/Users/u-1/Items/hls-only-1') {
+        return jsonRes({ Id: 'hls-only-1', Name: 'HLS 测试片', Type: 'Movie' })
+      }
+      if (url.startsWith('/emby/Items/hls-only-1/PlaybackInfo')) {
+        return jsonRes({
+          PlaySessionId: 'sess-hls-only',
+          MediaSources: [
+            {
+              Id: 'src-hls-only',
+              Container: 'ts',
+              SupportsDirectPlay: false,
+              SupportsDirectStream: false,
+              SupportsTranscoding: true,
+              TranscodingUrl: '/emby/Videos/hls-only-1/master.m3u8?MediaSourceId=src-hls-only',
+              MediaStreams: [{ Index: 0, Type: 'Video', Codec: 'hevc' }],
+            },
+          ],
+        })
+      }
+      if (url.startsWith('/emby/Sessions/Playing')) {
+        return {
+          ok: true,
+          status: 204,
+          headers: new Headers(),
+          json: async () => undefined,
+          text: async () => '',
+        } as Response
+      }
+      return jsonRes({})
+    })
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { container } = render(
+      <QueryClientProvider client={qc}>
+        <AuthProvider>
+          <AudioPlayerProvider>
+            <MemoryRouter initialEntries={['/play/hls-only-1']}>
+              <Routes>
+                <Route path="/play/:id" element={<PlayerPage />} />
+              </Routes>
+            </MemoryRouter>
+          </AudioPlayerProvider>
+        </AuthProvider>
+      </QueryClientProvider>,
+    )
+
+    await waitFor(() => {
+      expect(hlsErrorHandler).not.toBeNull()
+    })
+
+    const video = container.querySelector('video') as HTMLVideoElement
+    expect(video).toBeTruthy()
+
+    // 1) hls.js 激活期间触发原生 <video onError>：必须被忽略，不提前弹出播放失败浮层
+    fireEvent.error(video)
+    expect(screen.queryByText('无法播放该媒体')).not.toBeInTheDocument()
+    expect(destroySpy).not.toHaveBeenCalled()
+
+    // 2) 前 2 次可恢复 fatal 错误分别调用 startLoad / recoverMediaError，不销毁实例
+    act(() => {
+      hlsErrorHandler!(Hls.Events.ERROR, {
+        fatal: true,
+        type: Hls.ErrorTypes.NETWORK_ERROR,
+        details: 'fragLoadError',
+      })
+      hlsErrorHandler!(Hls.Events.ERROR, {
+        fatal: true,
+        type: Hls.ErrorTypes.MEDIA_ERROR,
+        details: 'bufferAppendError',
+      })
+    })
+    expect(startLoadSpy).toHaveBeenCalledTimes(1)
+    expect(recoverMediaSpy).toHaveBeenCalledTimes(1)
+    expect(destroySpy).not.toHaveBeenCalled()
+    expect(screen.queryByText('无法播放该媒体')).not.toBeInTheDocument()
+
+    // 3) 第 3 次耗尽重试：先 destroy 实例再展示 HLS 错误，随后 <video onPlaying> 可清理错误状态
+    act(() => {
+      hlsErrorHandler!(Hls.Events.ERROR, {
+        fatal: true,
+        type: Hls.ErrorTypes.MEDIA_ERROR,
+        details: 'bufferStalledError',
+      })
+    })
+    expect(destroySpy).toHaveBeenCalledTimes(1)
+    expect(await screen.findByText('无法播放该媒体')).toBeInTheDocument()
+
+    fireEvent.playing(video)
+    await waitFor(() => {
+      expect(screen.queryByText('无法播放该媒体')).not.toBeInTheDocument()
     })
   })
 })

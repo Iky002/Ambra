@@ -554,14 +554,18 @@ export function SettingsTab() {
                       type="number"
                       aria-label={t('admin.settings.playedThresholdInputAria')}
                       value={Number.isNaN(playedThresholdPct) ? '' : playedThresholdPct}
-                      onChange={(e) => setPlayedThresholdPct(Number(e.target.value))}
+                      onChange={(e) =>
+                        setPlayedThresholdPct(
+                          e.target.value === '' ? Number.NaN : Number(e.target.value),
+                        )
+                      }
                       className="w-16 rounded-lg border border-white/10 bg-zinc-900/90 px-2 py-1 text-center font-mono text-xs text-zinc-100 outline-none focus:border-amber-400/60"
                     />
                     <span
                       data-testid="played-threshold-value"
                       className="shrink-0 rounded-lg border border-amber-500/30 bg-amber-500/15 px-2.5 py-1 font-mono text-xs font-semibold text-amber-300"
                     >
-                      {playedThresholdPct}%
+                      {Number.isNaN(playedThresholdPct) ? '--' : playedThresholdPct}%
                     </span>
                   </div>
                 </div>
@@ -573,7 +577,10 @@ export function SettingsTab() {
                     min={50}
                     max={99}
                     step={1}
-                    value={Math.min(99, Math.max(50, Number(playedThresholdPct) || 90))}
+                    value={Math.min(
+                      99,
+                      Math.max(50, Number.isFinite(playedThresholdPct) ? playedThresholdPct : 90),
+                    )}
                     onChange={(e) => setPlayedThresholdPct(Number(e.target.value))}
                     className="h-1.5 flex-1 cursor-pointer appearance-none rounded-lg bg-white/15 accent-amber-500"
                   />

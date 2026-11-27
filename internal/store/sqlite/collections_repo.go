@@ -1743,21 +1743,13 @@ func (r *LibraryRepo) GetQueryFilters(ctx context.Context, f QueryFiltersFilter)
 		conds = append(conds, `(i.library_id = ? OR i.parent_id = ? OR EXISTS (SELECT 1 FROM item_ancestors ia WHERE ia.ancestor_id = ? AND ia.descendant_id = i.id AND ia.depth > 0))`)
 		args = append(args, parentID, parentID, parentID)
 	}
-	if len(f.IncludeItemTypes) > 0 {
-		ph := make([]string, len(f.IncludeItemTypes))
-		for idx, t := range f.IncludeItemTypes {
-			ph[idx] = "?"
-			args = append(args, t)
-		}
-		conds = append(conds, fmt.Sprintf(`i.type IN (%s)`, strings.Join(ph, ",")))
+	if incClause, incArgs := appendSafeStringSetSQL("i.type", f.IncludeItemTypes, false, false); incClause != "" {
+		conds = append(conds, incClause)
+		args = append(args, incArgs...)
 	}
-	if len(f.AllowedLibraryIDs) > 0 {
-		ph := make([]string, len(f.AllowedLibraryIDs))
-		for idx, lid := range f.AllowedLibraryIDs {
-			ph[idx] = "?"
-			args = append(args, guid.Normalize(lid))
-		}
-		conds = append(conds, fmt.Sprintf(`i.library_id IN (%s)`, strings.Join(ph, ",")))
+	if alClause, alArgs := appendSafeIDSetSQL("i.library_id", f.AllowedLibraryIDs, false); alClause != "" {
+		conds = append(conds, alClause)
+		args = append(args, alArgs...)
 	}
 	if pClauses, pArgs := appendParentalPolicySQL("i", parentalPolicy{
 		MaxParentalRating: f.MaxParentalRating,
@@ -1956,21 +1948,13 @@ func (r *LibraryRepo) ListFilterValuesWithUserPolicy(
 			conds = append(conds, fmt.Sprintf(`(%s.library_id = ? OR %s.parent_id = ? OR EXISTS (SELECT 1 FROM item_ancestors ia WHERE ia.ancestor_id = ? AND ia.descendant_id = %s.id AND ia.depth > 0))`, alias, alias, alias))
 			a = append(a, parentID, parentID, parentID)
 		}
-		if len(includeItemTypes) > 0 {
-			ph := make([]string, len(includeItemTypes))
-			for i, t := range includeItemTypes {
-				ph[i] = "?"
-				a = append(a, t)
-			}
-			conds = append(conds, fmt.Sprintf(`%s.type IN (%s)`, alias, strings.Join(ph, ",")))
+		if incClause, incArgs := appendSafeStringSetSQL(alias+".type", includeItemTypes, false, false); incClause != "" {
+			conds = append(conds, incClause)
+			a = append(a, incArgs...)
 		}
-		if len(allowedLibraryIDs) > 0 {
-			ph := make([]string, len(allowedLibraryIDs))
-			for i, lid := range allowedLibraryIDs {
-				ph[i] = "?"
-				a = append(a, guid.Normalize(lid))
-			}
-			conds = append(conds, fmt.Sprintf(`%s.library_id IN (%s)`, alias, strings.Join(ph, ",")))
+		if alClause, alArgs := appendSafeIDSetSQL(alias+".library_id", allowedLibraryIDs, false); alClause != "" {
+			conds = append(conds, alClause)
+			a = append(a, alArgs...)
 		}
 		if pClauses, pArgs := appendParentalPolicySQL(alias, pPol); len(pClauses) > 0 {
 			conds = append(conds, pClauses...)

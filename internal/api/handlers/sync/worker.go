@@ -829,9 +829,13 @@ func (h *Handler) OnLibraryItemAdded(ctx context.Context, itemIDs ...string) {
 
 		existingSet := existingByJob[job.Id]
 		curCount := activeCountByJob[job.Id]
+		totalJobItemsCount := len(existingSet)
 		wantTC, _ := needsSyncTranscode(job.Quality, job.Bitrate)
 
 		for _, cid := range candidateIDs {
+			if totalJobItemsCount >= maxSyncJobItemIDs {
+				break
+			}
 			if job.ItemLimit > 0 && curCount >= job.ItemLimit {
 				break
 			}
@@ -876,6 +880,7 @@ func (h *Handler) OnLibraryItemAdded(ctx context.Context, itemIDs ...string) {
 			}
 			existingSet[normCID] = struct{}{}
 			curCount++
+			totalJobItemsCount++
 			allAdded = append(allAdded, ji)
 			affectedJobs[job.Id] = struct{}{}
 		}
@@ -887,17 +892,36 @@ func (h *Handler) OnLibraryItemAdded(ctx context.Context, itemIDs ...string) {
 
 	h.mu.Lock()
 	activeJobMap := make(map[string]bool, len(h.state.Jobs))
+	jobUserByID := make(map[string]string, len(h.state.Jobs))
+	jobLimitByID := make(map[string]int, len(h.state.Jobs))
 	existingPair := make(map[string]struct{}, len(h.state.JobItems))
+	itemsPerJob := make(map[string]int, len(h.state.Jobs))
+	activeItemsPerJob := make(map[string]int, len(h.state.Jobs))
+	itemsPerUser := make(map[string]int)
 	for _, j := range h.state.Jobs {
+		jobUserByID[j.Id] = guid.Normalize(j.UserId)
+		jobLimitByID[j.Id] = j.ItemLimit
 		if j.SyncNewContent && !strings.EqualFold(j.Status, "Cancelled") {
 			activeJobMap[j.Id] = true
 		}
 	}
 	for _, ji := range h.state.JobItems {
 		existingPair[ji.JobId+":"+guid.Normalize(ji.ItemId)] = struct{}{}
+		itemsPerJob[ji.JobId]++
+		if !strings.EqualFold(ji.Status, "Cancelled") && !strings.EqualFold(ji.Status, "Removing") {
+			activeItemsPerJob[ji.JobId]++
+		}
+		if uid := jobUserByID[ji.JobId]; uid != "" {
+			itemsPerUser[uid]++
+		}
 	}
-	inserted := false
+	totalJobItems := len(h.state.JobItems)
+	insertedJobs := make(map[string]struct{})
+	queuedInserted := false
 	for _, ji := range allAdded {
+		if totalJobItems >= maxSyncTotalJobItems {
+			break
+		}
 		key := ji.JobId + ":" + guid.Normalize(ji.ItemId)
 		if !activeJobMap[ji.JobId] {
 			continue
@@ -905,19 +929,38 @@ func (h *Handler) OnLibraryItemAdded(ctx context.Context, itemIDs ...string) {
 		if _, dup := existingPair[key]; dup {
 			continue
 		}
+		if itemsPerJob[ji.JobId] >= maxSyncJobItemIDs {
+			continue
+		}
+		if lim := jobLimitByID[ji.JobId]; lim > 0 && activeItemsPerJob[ji.JobId] >= lim {
+			continue
+		}
+		uid := jobUserByID[ji.JobId]
+		if uid != "" && itemsPerUser[uid] >= maxSyncJobItemsPerUser {
+			continue
+		}
 		existingPair[key] = struct{}{}
+		itemsPerJob[ji.JobId]++
+		activeItemsPerJob[ji.JobId]++
+		if uid != "" {
+			itemsPerUser[uid]++
+		}
+		totalJobItems++
 		h.state.JobItems = append(h.state.JobItems, ji)
-		inserted = true
+		insertedJobs[ji.JobId] = struct{}{}
+		if ji.Status == "Queued" {
+			queuedInserted = true
+		}
 	}
-	if inserted {
-		for jid := range affectedJobs {
+	if len(insertedJobs) > 0 {
+		for jid := range insertedJobs {
 			h.recomputeJobLocked(jid)
 		}
 		_ = h.saveStateLocked(ctx)
 	}
 	h.mu.Unlock()
 
-	if inserted && queuedAny {
+	if len(insertedJobs) > 0 && queuedAny && queuedInserted {
 		h.wakeWorker()
 	}
 }

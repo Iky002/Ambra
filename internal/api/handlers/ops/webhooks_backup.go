@@ -896,12 +896,15 @@ func (h *Handler) handleRestoreBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stagedDst := filepath.Join(h.dataDir(), "ambra.db.restore")
+	dataDir := h.dataDir()
+	stagedDst := filepath.Join(dataDir, "ambra.db.restore")
 	err = copyFileAtomic(src, stagedDst, 0o600)
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, fmt.Sprintf("stage restore failed: %v", err))
 		return
 	}
+	_ = os.Remove(filepath.Join(dataDir, "config", "ambra.json.restore"))
+	_ = os.RemoveAll(filepath.Join(dataDir, "metadata.restore"))
 
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"Restored":        true,
@@ -1152,15 +1155,17 @@ func (h *Handler) restoreZipBackupLocked(ctx context.Context, srcZip string) (st
 	if err := copyFileAtomic(stageDB, stagedDBDst, 0o600); err != nil {
 		return "", err
 	}
+	stagedCfgDst := filepath.Join(dataDir, "config", "ambra.json.restore")
 	if hasConfig {
-		stagedCfgDst := filepath.Join(dataDir, "config", "ambra.json.restore")
 		if err := copyFileAtomic(stageCfg, stagedCfgDst, 0o600); err != nil {
 			return "", err
 		}
+	} else {
+		_ = os.Remove(stagedCfgDst)
 	}
+	stagedMetaDst := filepath.Join(dataDir, "metadata.restore")
+	_ = os.RemoveAll(stagedMetaDst)
 	if hasMetadata {
-		stagedMetaDst := filepath.Join(dataDir, "metadata.restore")
-		_ = os.RemoveAll(stagedMetaDst)
 		if err := os.Rename(stageMeta, stagedMetaDst); err != nil {
 			return "", err
 		}

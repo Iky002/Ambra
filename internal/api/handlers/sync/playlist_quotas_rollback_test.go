@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -197,4 +198,200 @@ func TestSyncV0107AuditPlaylistQuotasValidationAndRollback(t *testing.T) {
 		t.Fatalf("expected in-memory state rolled back after DB failures, got jobs=%+v items=%+v", h.state.Jobs, h.state.JobItems)
 	}
 	h.mu.RUnlock()
+}
+
+func TestEnableJobItemRBACStateTransitionsAndLibraryItemQuotas(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default(dir)
+	st, err := sqlite.Open(cfg.DBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	userRepo := sqlite.NewUserRepo(st)
+	libRepo := sqlite.NewLibraryRepo(st)
+
+	srcFile := filepath.Join(dir, "source.mkv")
+	if err := os.WriteFile(srcFile, []byte("VIDEO-DATA"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fakeFFmpeg := filepath.Join(dir, "fake-ffmpeg.sh")
+	ffScript := "#!/bin/sh\nlast=\"\"\nfor a in \"$@\"; do last=\"$a\"; done\nprintf 'TRANSCODED' > \"$last\"\n"
+	if err := os.WriteFile(fakeFFmpeg, []byte(ffScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	libAllowed, _ := libRepo.CreateLibrary(ctx, "Allowed", "movies", []string{dir})
+	libSecret, _ := libRepo.CreateLibrary(ctx, "Secret", "movies", []string{dir})
+	movieOK := &sqlite.ItemRecord{
+		ID: guid.New(), LibraryID: libAllowed.ID, ParentID: libAllowed.ID,
+		Type: "Movie", MediaType: "Video", Name: "Movie OK", Path: srcFile, OfficialRating: "G",
+	}
+	movieExtra := &sqlite.ItemRecord{
+		ID: guid.New(), LibraryID: libAllowed.ID, ParentID: libAllowed.ID,
+		Type: "Movie", MediaType: "Video", Name: "Movie Extra", Path: srcFile, OfficialRating: "G",
+	}
+	for _, it := range []*sqlite.ItemRecord{movieOK, movieExtra} {
+		_ = libRepo.UpsertItem(ctx, it)
+	}
+
+	pol := sqlite.DefaultUserPolicy(false)
+	pol.EnableAllFolders = false
+	pol.EnabledFolders = []string{libAllowed.ID}
+	pol.EnableContentDownloading = true
+	alice := &sqlite.UserRecord{ID: guid.New(), Name: "alice_enable", Policy: pol, Config: sqlite.DefaultUserConfig()}
+	_ = userRepo.CreateUser(ctx, alice)
+
+	h := New(st, cfg)
+	h.SetLibraryRepo(libRepo)
+	h.SetUserRepo(userRepo)
+	h.SetFFmpegPath(fakeFFmpeg)
+	h.StartWorker(ctx)
+	defer h.StopWorker()
+
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, AuthFuncs{})
+
+	doAs := func(u *sqlite.UserRecord, method, path string, body any) *httptest.ResponseRecorder {
+		t.Helper()
+		var rdr *bytes.Reader
+		if body != nil {
+			b, _ := json.Marshal(body)
+			rdr = bytes.NewReader(b)
+		} else {
+			rdr = bytes.NewReader(nil)
+		}
+		req := httptest.NewRequest(method, path, rdr)
+		if u != nil {
+			req = req.WithContext(middleware.WithAuthContext(req.Context(), &middleware.AuthContext{User: u}))
+		}
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Create a transcoding job for Alice and seed item states to test RBAC + state transitions.
+	h.mu.Lock()
+	jobID := guid.New()
+	h.state.Jobs = append(h.state.Jobs, SyncJob{
+		Id:             jobID,
+		UserId:         guid.Normalize(alice.ID),
+		TargetId:       "dev-alice",
+		Name:           "Transcode Sync",
+		Quality:        "medium",
+		Status:         "Failed",
+		SyncNewContent: true,
+		ParentId:       libAllowed.ID,
+	})
+	convertingID := guid.New()
+	failedNeedTCID := guid.New()
+	cachedFile := filepath.Join(dir, "existing-out.mp4")
+	_ = os.WriteFile(cachedFile, []byte("CACHED-MP4"), 0o644)
+	disabledHasFileID := guid.New()
+	h.state.JobItems = append(h.state.JobItems,
+		SyncJobItem{
+			Id: convertingID, JobId: jobID, ItemId: movieOK.ID, TargetId: "dev-alice",
+			Status: "Converting", Progress: 67.5, SourcePath: srcFile,
+		},
+		SyncJobItem{
+			Id: failedNeedTCID, JobId: jobID, ItemId: movieOK.ID, TargetId: "dev-alice",
+			Status: "Failed", Progress: 12, SourcePath: srcFile, OutputPath: "",
+		},
+		SyncJobItem{
+			Id: disabledHasFileID, JobId: jobID, ItemId: movieOK.ID, TargetId: "dev-alice",
+			Status: "Disabled", Progress: 0, SourcePath: srcFile, OutputPath: cachedFile,
+		},
+	)
+	h.mu.Unlock()
+
+	// 1. Revoking EnableContentDownloading -> 403 on POST /Sync/JobItems/{Id}/Enable
+	noDL := pol
+	noDL.EnableContentDownloading = false
+	_ = userRepo.UpdateUserPolicy(ctx, alice.ID, noDL)
+	if r := doAs(alice, http.MethodPost, "/Sync/JobItems/"+failedNeedTCID+"/Enable", nil); r.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when EnableContentDownloading=false, got %d", r.Code)
+	}
+
+	// 2. Disabling user -> 403 on POST /Sync/JobItems/{Id}/Enable
+	disPol := pol
+	disPol.IsDisabled = true
+	_ = userRepo.UpdateUserPolicy(ctx, alice.ID, disPol)
+	if r := doAs(alice, http.MethodPost, "/Sync/JobItems/"+failedNeedTCID+"/Enable", nil); r.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when caller user is disabled, got %d", r.Code)
+	}
+
+	// 3. Revoking library access to item -> 403 on POST /Sync/JobItems/{Id}/Enable
+	secretOnlyPol := pol
+	secretOnlyPol.EnabledFolders = []string{libSecret.ID}
+	_ = userRepo.UpdateUserPolicy(ctx, alice.ID, secretOnlyPol)
+	if r := doAs(alice, http.MethodPost, "/Sync/JobItems/"+failedNeedTCID+"/Enable", nil); r.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when caller lost library access to item, got %d", r.Code)
+	}
+
+	// Restore Alice's valid policy.
+	_ = userRepo.UpdateUserPolicy(ctx, alice.ID, pol)
+
+	// 4. Enabling an active "Converting" item MUST preserve Status="Converting" and Progress=67.5!
+	if r := doAs(alice, http.MethodPost, "/Sync/JobItems/"+convertingID+"/Enable", nil); r.Code != http.StatusNoContent {
+		t.Fatalf("enable converting item got %d", r.Code)
+	}
+	if it, _, _ := h.GetJobItemForCaller(convertingID, alice.ID, true); it == nil || it.Status != "Converting" || it.Progress != 67.5 {
+		t.Fatalf("expected Converting/67.5 preserved, got %+v", it)
+	}
+
+	// 5. Enabling a "Disabled" item whose OutputPath already exists on disk transitions directly to "ReadyToTransfer".
+	if r := doAs(alice, http.MethodPost, "/Sync/JobItems/"+disabledHasFileID+"/Enable", nil); r.Code != http.StatusNoContent {
+		t.Fatalf("enable cached item got %d", r.Code)
+	}
+	if it, _, _ := h.GetJobItemForCaller(disabledHasFileID, alice.ID, true); it == nil || it.Status != "ReadyToTransfer" {
+		t.Fatalf("expected ReadyToTransfer when OutputPath exists on disk, got %+v", it)
+	}
+
+	// 6. Enabling a "Failed" item with OutputPath=="" on a transcode job queues and wakes worker -> settles at ReadyToTransfer!
+	if r := doAs(alice, http.MethodPost, "/Sync/JobItems/"+failedNeedTCID+"/Enable", nil); r.Code != http.StatusNoContent {
+		t.Fatalf("enable failed item got %d", r.Code)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		it, _, _ := h.GetJobItemForCaller(failedNeedTCID, alice.ID, true)
+		if it != nil && it.Status == "ReadyToTransfer" && it.OutputPath != "" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if it, _, _ := h.GetJobItemForCaller(failedNeedTCID, alice.ID, true); it == nil || it.Status != "ReadyToTransfer" || it.OutputPath == "" {
+		t.Fatalf("expected re-enabled Failed item to be Queued and transcoded to ReadyToTransfer, got %+v", it)
+	}
+
+	// 7. OnLibraryItemAdded enforces per-user SyncJobItem quota (maxSyncJobItemsPerUser) and per-job cap (maxSyncJobItemIDs).
+	fillerJobID := guid.New()
+	h.mu.Lock()
+	h.state.Jobs = append(h.state.Jobs, SyncJob{
+		Id:     fillerJobID,
+		UserId: guid.Normalize(alice.ID),
+		Name:   "Quota Filler",
+		Status: "ReadyToTransfer",
+	})
+	for len(h.state.JobItems) < maxSyncJobItemsPerUser {
+		h.state.JobItems = append(h.state.JobItems, SyncJobItem{
+			Id:     fmt.Sprintf("fill-ji-%d", len(h.state.JobItems)),
+			JobId:  fillerJobID,
+			ItemId: fmt.Sprintf("fill-item-%d", len(h.state.JobItems)),
+			Status: "Synced",
+		})
+	}
+	beforeCount := len(h.state.JobItems)
+	h.mu.Unlock()
+
+	h.OnLibraryItemAdded(ctx, movieExtra.ID)
+
+	h.mu.RLock()
+	afterCount := len(h.state.JobItems)
+	h.mu.RUnlock()
+	if afterCount != beforeCount {
+		t.Fatalf("expected OnLibraryItemAdded to enforce maxSyncJobItemsPerUser (%d), got %d -> %d",
+			maxSyncJobItemsPerUser, beforeCount, afterCount)
+	}
 }

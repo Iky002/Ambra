@@ -649,4 +649,33 @@ func TestCollectionsCovV0112_ExtraPolicyChildVisibilityAndHelpers(t *testing.T) 
 	if wDelAgain.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 deleting already-deleted collection, got %d", wDelAgain.Code)
 	}
+
+	// Verify isChildVisibleToUser honors caller's EnableLiveTvAccess=false instead of hardcoding EnableLiveTvAccess=true
+	liveLib, err := libRepo.CreateLibrary(ctx, "Live TV", "livetv", []string{filepath.Join(tmp, "livetv")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	liveChanID := guid.New()
+	_ = libRepo.UpsertItem(ctx, &sqlite.ItemRecord{
+		ID:        liveChanID,
+		LibraryID: liveLib.ID,
+		Type:      "TvChannel",
+		Name:      "News HD",
+	})
+	liveChanRec, _ := libRepo.GetItemRecordByID(ctx, liveChanID)
+
+	noLivePol := sqlite.DefaultUserPolicy(false)
+	noLivePol.EnableLiveTvAccess = false
+	noLiveUser := &sqlite.UserRecord{
+		ID:     guid.New(),
+		Name:   "NoLiveViewer",
+		Policy: noLivePol,
+	}
+	_ = userRepo.CreateUser(ctx, noLiveUser)
+	reqNoLive := httptest.NewRequest(http.MethodGet, "/Collections", nil).WithContext(
+		middleware.WithAuthContext(ctx, &middleware.AuthContext{User: noLiveUser}),
+	)
+	if h.isChildVisibleToUser(reqNoLive, liveChanRec, nil, extendedParentalPolicy{}) {
+		t.Fatal("expected LiveTV item to be hidden in isChildVisibleToUser when caller EnableLiveTvAccess=false")
+	}
 }

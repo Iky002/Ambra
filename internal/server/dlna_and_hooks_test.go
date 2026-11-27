@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/config"
@@ -215,6 +216,10 @@ func TestAuditV0112_DynamicDLNA_LiveTVWSFilter_NotifBridge_AndHooks(t *testing.T
 	}
 	staleSeg := filepath.Join(customTemp, "stale-seg.ts")
 	if err := os.WriteFile(staleSeg, []byte("ts"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().Add(-4 * time.Hour)
+	if err := os.Chtimes(staleSeg, oldTime, oldTime); err != nil {
 		t.Fatal(err)
 	}
 	if err := srv.Scheduler.Run("CleanTranscodeCache"); err != nil {

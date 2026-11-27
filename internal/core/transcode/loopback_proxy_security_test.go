@@ -607,3 +607,73 @@ func TestLoopbackStreamProxyCrossHostRedirectSecurity(t *testing.T) {
 		}
 	}
 }
+
+func TestLoopbackStreamProxyCrossOriginSubPrivateLANBlocked(t *testing.T) {
+	originSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n" +
+			"#EXT-X-KEY:METHOD=AES-128,URI=\"http://192.168.1.1/router-secret\"\n" +
+			"#EXTINF:6.0,\nhttp://10.0.0.5:8080/internal-seg.ts\n" +
+			"#EXTINF:6.0,\nhttp://100.64.0.1/cgnat-seg.ts\n#EXT-X-ENDLIST\n"))
+	}))
+	defer originSrv.Close()
+
+	for _, withCustomClient := range []bool{false, true} {
+		opts := LoopbackProxyOptions{
+			TargetURL:       originSrv.URL + "/live.m3u8",
+			AllowPrivateLAN: true,
+		}
+		if withCustomClient {
+			opts.Client = originSrv.Client()
+		}
+		proxy, err := StartLoopbackStreamProxy(opts)
+		if err != nil {
+			t.Fatalf("StartLoopbackStreamProxy(customClient=%v): %v", withCustomClient, err)
+		}
+		resp, err := http.Get(proxy.URL())
+		if err != nil {
+			_ = proxy.Close()
+			t.Fatalf("GET manifest(customClient=%v): %v", withCustomClient, err)
+		}
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			_ = proxy.Close()
+			t.Fatalf("expected 200 rewritten manifest, got %d", resp.StatusCode)
+		}
+
+		var subURLs []string
+		sc := bufio.NewScanner(strings.NewReader(string(bodyBytes)))
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if idx := strings.Index(line, `URI="`); idx >= 0 {
+				rest := line[idx+5:]
+				if end := strings.IndexByte(rest, '"'); end > 0 {
+					subURLs = append(subURLs, rest[:end])
+				}
+			} else if strings.Contains(line, "/sub?u=") {
+				subURLs = append(subURLs, line)
+			}
+		}
+		if len(subURLs) != 3 {
+			_ = proxy.Close()
+			t.Fatalf("expected 3 rewritten /sub URLs, got %v\n%s", subURLs, string(bodyBytes))
+		}
+		for _, su := range subURLs {
+			subResp, sErr := http.Get(su)
+			if sErr != nil {
+				_ = proxy.Close()
+				t.Fatalf("GET /sub %s: %v", su, sErr)
+			}
+			_, _ = io.ReadAll(subResp.Body)
+			_ = subResp.Body.Close()
+			if subResp.StatusCode != http.StatusForbidden {
+				_ = proxy.Close()
+				t.Fatalf("customClient=%v: expected 403 blocking cross-origin private LAN /sub %s, got %d",
+					withCustomClient, su, subResp.StatusCode)
+			}
+		}
+		_ = proxy.Close()
+	}
+}
+

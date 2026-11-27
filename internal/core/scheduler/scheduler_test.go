@@ -92,6 +92,14 @@ func TestBuiltinTasksCleanTranscodeCache(t *testing.T) {
 	if err := os.WriteFile(dummy, []byte("tsdata"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	old := time.Now().Add(-4 * time.Hour)
+	if err := os.Chtimes(dummy, old, old); err != nil {
+		t.Fatal(err)
+	}
+	recent := filepath.Join(tmp, "seg_recent.ts")
+	if err := os.WriteFile(recent, []byte("tsdata-recent"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	var scanned atomic.Bool
 	mgr := New(nil)
@@ -109,7 +117,10 @@ func TestBuiltinTasksCleanTranscodeCache(t *testing.T) {
 	}
 	mgr.Wait("CleanTranscodeCache")
 	if _, err := os.Stat(dummy); !os.IsNotExist(err) {
-		t.Fatalf("expected transcode temp file to be deleted, stat err=%v", err)
+		t.Fatalf("expected stale transcode temp file to be deleted, stat err=%v", err)
+	}
+	if _, err := os.Stat(recent); err != nil {
+		t.Fatalf("expected recent (<2h) transcode temp file to be preserved, err=%v", err)
 	}
 
 	if err := mgr.Run("RefreshLibrary"); err != nil {
