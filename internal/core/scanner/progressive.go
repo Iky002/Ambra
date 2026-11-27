@@ -1226,8 +1226,8 @@ func (s *Scanner) extractAudioAttachedPic(ctx context.Context, rec *sqlite.ItemR
 	}()
 
 	ffmpegPath := "ffmpeg"
-	if s.cfg != nil && strings.TrimSpace(s.cfg.FFmpegPath) != "" {
-		ffmpegPath = s.cfg.FFmpegPath
+	if snap := s.cfg.Snapshot(); strings.TrimSpace(snap.FFmpegPath) != "" {
+		ffmpegPath = snap.FFmpegPath
 	}
 
 	extractCtx, cancel := context.WithTimeout(ctx, 10*time.Second)

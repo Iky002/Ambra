@@ -827,11 +827,12 @@ func (h *Handler) handleItemCounts(w http.ResponseWriter, r *http.Request) {
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
 	userPol := h.userPolicyForRequest(r, userID)
+	viewerUID, viewerIsAdmin := h.playlistViewerForRequest(r)
 	isFav := q.Bool("IsFavorite")
 	isLiked := q.Bool("IsLiked")
 
 	if isFav == nil && isLiked == nil {
-		counts, err := h.repo.GetItemCountsWithPolicy(r.Context(), allowed, userPol)
+		counts, err := h.repo.GetItemCountsForUser(r.Context(), viewerUID, viewerIsAdmin, allowed, userPol)
 		if err != nil {
 			slog.Error("internal error in library handler", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal server error")
@@ -854,6 +855,8 @@ func (h *Handler) handleItemCounts(w http.ResponseWriter, r *http.Request) {
 	items, _, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
 		ServerID:               h.serverID(),
 		UserID:                 userID,
+		PlaylistViewerUserID:   viewerUID,
+		PlaylistViewerIsAdmin:  viewerIsAdmin,
 		AllowedLibraryIDs:      allowed,
 		MaxParentalRating:      maxRating,
 		BlockUnratedItems:      blockUnrated,

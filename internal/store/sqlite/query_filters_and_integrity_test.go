@@ -887,3 +887,80 @@ func TestUserSafeDeleteUpdatePolicyAndDisplayPreferencesCleanup(t *testing.T) {
 		t.Fatalf("expected ErrNotFound for missing user UpdateUserPolicySafe, got %v", err)
 	}
 }
+
+func TestQueryItemsLargeListFiltersAvoidBindParameterLimit(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "large_list_filters.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	repo := NewLibraryRepo(store)
+	lib, err := repo.CreateLibrary(ctx, "Movies", "movies", []string{"/movies"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	yr := 2024
+	mov := &ItemRecord{
+		ID:             guid.New(),
+		LibraryID:      lib.ID,
+		ParentID:       lib.ID,
+		Type:           "Movie",
+		MediaType:      "Video",
+		Container:      "mkv",
+		Name:           "Huge Filter Match",
+		OfficialRating: "PG-13",
+		ProductionYear: &yr,
+		Path:           "/movies/huge.mkv",
+	}
+	if err := repo.UpsertItem(ctx, mov); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceItemTaxonomies(ctx, mov.ID, "genre", []string{"Sci-Fi"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceItemTaxonomies(ctx, mov.ID, "studio", []string{"A24"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceItemTaxonomies(ctx, mov.ID, "tag", []string{"featured"}); err != nil {
+		t.Fatal(err)
+	}
+
+	const hugeN = 40005
+	containers := make([]string, hugeN)
+	genres := make([]string, hugeN)
+	tags := make([]string, hugeN)
+	years := make([]int, hugeN)
+	excludeTags := make([]string, hugeN)
+	for i := 0; i < hugeN; i++ {
+		containers[i] = fmt.Sprintf("fmt%d", i)
+		genres[i] = fmt.Sprintf("Genre-%d", i)
+		tags[i] = fmt.Sprintf("tag-%d", i)
+		years[i] = 3000 + i
+		excludeTags[i] = fmt.Sprintf("blocked-%d", i)
+	}
+	containers[hugeN/2] = "mkv"
+	genres[hugeN/2] = "Sci-Fi"
+	tags[hugeN/2] = "Featured"
+	years[hugeN/2] = 2024
+
+	items, total, err := repo.QueryItems(ctx, ItemFilter{
+		ServerID:    "srv",
+		LibraryID:   lib.ID,
+		Containers:  containers,
+		Genres:      genres,
+		Tags:        tags,
+		Years:       years,
+		ExcludeTags: excludeTags,
+		Limit:       10,
+	})
+	if err != nil {
+		t.Fatalf("QueryItems with >40,000 list filter values failed: %v", err)
+	}
+	if total != 1 || len(items) != 1 || guid.Normalize(items[0].Id) != guid.Normalize(mov.ID) {
+		t.Fatalf("expected 1 matching item, got total=%d len=%d items=%+v", total, len(items), items)
+	}
+}
+
