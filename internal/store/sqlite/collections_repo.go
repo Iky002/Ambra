@@ -821,7 +821,7 @@ func (r *LibraryRepo) GetContainerItemsWithUserPolicy(
 	pPolicy := policyFromUserPolicy(policy)
 	policyConds, policyArgs := buildLibraryAndPolicyWhere("i", allowedLibraryIDs, pPolicy)
 	if !policy.IsAdministrator && uid != "" {
-		if plClause, plArgs := appendPlaylistVisibilitySQL("i", uid, false); plClause != "" {
+		if plClause, plArgs := appendPlaylistVisibilitySQL("i", uid, false, false); plClause != "" {
 			policyConds = append(policyConds, plClause)
 			policyArgs = append(policyArgs, plArgs...)
 		}
@@ -1134,6 +1134,15 @@ func (r *LibraryRepo) GetSimilarItemsWithUserPolicy(
 	}
 	seedType := seedRec.Type
 	pPol := policyFromUserPolicy(policy)
+	normViewer := guid.Normalize(userID)
+	viewerIsAdmin := policy.IsAdministrator
+	if !viewerIsAdmin && normViewer != "" {
+		var isAdmin int
+		if err := r.store.Reader.QueryRowContext(ctx, `SELECT is_admin FROM users WHERE id = ? OR id = ?`, normViewer, strings.TrimSpace(userID)).Scan(&isAdmin); err == nil && isAdmin == 1 {
+			viewerIsAdmin = true
+		}
+	}
+	playlistPublicOnly := !viewerIsAdmin && normViewer == ""
 
 	// Find genres of seed item
 	gRows, err := r.store.Reader.QueryContext(ctx, `
@@ -1163,19 +1172,22 @@ func (r *LibraryRepo) GetSimilarItemsWithUserPolicy(
 
 	if len(genres) > 0 {
 		items, _, err := r.QueryItems(ctx, ItemFilter{
-			ServerID:          serverID,
-			UserID:            userID,
-			AllowedLibraryIDs: allowedLibraryIDs,
-			MaxParentalRating: pPol.MaxParentalRating,
-			BlockUnratedItems: pPol.BlockUnratedItems,
-			BlockedTags:       pPol.BlockedTags,
-			AllowedTags:       pPol.AllowedTags,
-			IncludeItemTypes:  []string{seedType},
-			Genres:            genres,
-			SortBy:            []string{"CommunityRating", "DateCreated"},
-			SortOrder:         "Descending",
-			Limit:             limit + 1,
-			Fields:            fields,
+			ServerID:              serverID,
+			UserID:                userID,
+			PlaylistViewerUserID:  normViewer,
+			PlaylistViewerIsAdmin: viewerIsAdmin,
+			PlaylistPublicOnly:    playlistPublicOnly,
+			AllowedLibraryIDs:     allowedLibraryIDs,
+			MaxParentalRating:     pPol.MaxParentalRating,
+			BlockUnratedItems:     pPol.BlockUnratedItems,
+			BlockedTags:           pPol.BlockedTags,
+			AllowedTags:           pPol.AllowedTags,
+			IncludeItemTypes:      []string{seedType},
+			Genres:                genres,
+			SortBy:                []string{"CommunityRating", "DateCreated"},
+			SortOrder:             "Descending",
+			Limit:                 limit + 1,
+			Fields:                fields,
 		})
 		if err != nil {
 			return nil, 0, err
@@ -1194,18 +1206,21 @@ func (r *LibraryRepo) GetSimilarItemsWithUserPolicy(
 
 	if len(result) < limit {
 		items, _, err := r.QueryItems(ctx, ItemFilter{
-			ServerID:          serverID,
-			UserID:            userID,
-			AllowedLibraryIDs: allowedLibraryIDs,
-			MaxParentalRating: pPol.MaxParentalRating,
-			BlockUnratedItems: pPol.BlockUnratedItems,
-			BlockedTags:       pPol.BlockedTags,
-			AllowedTags:       pPol.AllowedTags,
-			IncludeItemTypes:  []string{seedType},
-			SortBy:            []string{"DateCreated"},
-			SortOrder:         "Descending",
-			Limit:             limit + len(seen),
-			Fields:            fields,
+			ServerID:              serverID,
+			UserID:                userID,
+			PlaylistViewerUserID:  normViewer,
+			PlaylistViewerIsAdmin: viewerIsAdmin,
+			PlaylistPublicOnly:    playlistPublicOnly,
+			AllowedLibraryIDs:     allowedLibraryIDs,
+			MaxParentalRating:     pPol.MaxParentalRating,
+			BlockUnratedItems:     pPol.BlockUnratedItems,
+			BlockedTags:           pPol.BlockedTags,
+			AllowedTags:           pPol.AllowedTags,
+			IncludeItemTypes:      []string{seedType},
+			SortBy:                []string{"DateCreated"},
+			SortOrder:             "Descending",
+			Limit:                 limit + len(seen),
+			Fields:                fields,
 		})
 		if err != nil {
 			return nil, 0, err

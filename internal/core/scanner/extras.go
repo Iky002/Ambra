@@ -278,11 +278,16 @@ func (s *Scanner) upsertExtraItem(ctx context.Context, lib *sqlite.LibraryRecord
 		probeRes = s.probeMedia(ctx, extraPath, false)
 	}
 
+	seriesID := ""
+	if strings.EqualFold(parent.Type, "Series") {
+		seriesID = parent.ID
+	}
 	name := cleanExtraDisplayName(extraPath)
 	rec := &sqlite.ItemRecord{
 		ID:        itemID,
 		LibraryID: lib.ID,
 		ParentID:  parent.ID,
+		SeriesID:  seriesID,
 		Type:      itemType,
 		MediaType: mediaType,
 		IsFolder:  false,

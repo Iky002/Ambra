@@ -128,4 +128,33 @@ func TestAuditV0112_DynamicTranscodeTempDirCleanCache(t *testing.T) {
 	if err := validateTranscodeCleanTargetDir(dynDir1); err != nil {
 		t.Fatalf("expected subdirectory inside os.TempDir() (%q) to be allowed: %v", dynDir1, err)
 	}
+
+	// 5. Prefix-based system directory protection rejects descendants too.
+	for _, unsafeDesc := range []string{"/etc/ambra", "/usr/local/bin", "/var/lib/ambra", "/var/log/ambra", "/proc/self", "/sys/fs", "/dev/shm"} {
+		if err := validateTranscodeCleanTargetDir(unsafeDesc); err == nil {
+			t.Fatalf("expected validateTranscodeCleanTargetDir(%q) to reject system descendant", unsafeDesc)
+		}
+	}
+
+	// 6. DataDir & media library root overlap protection.
+	dataDir := filepath.Join(t.TempDir(), "data")
+	allowedTranscodeSub := filepath.Join(dataDir, "cache", "transcoding-temp")
+	forbiddenDataSub := filepath.Join(dataDir, "db")
+	mediaRoot := filepath.Join(t.TempDir(), "movies")
+	mediaSub := filepath.Join(mediaRoot, "action")
+	for _, d := range []string{allowedTranscodeSub, forbiddenDataSub, mediaSub} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := validateTranscodeCleanTargetDirWithScope(allowedTranscodeSub, dataDir, []string{mediaRoot}); err != nil {
+		t.Fatalf("expected DataDir/cache/transcoding-temp to be allowed, got: %v", err)
+	}
+	for _, bad := range []string{dataDir, filepath.Dir(dataDir), forbiddenDataSub, mediaRoot, mediaSub, filepath.Dir(mediaRoot)} {
+		if err := validateTranscodeCleanTargetDirWithScope(bad, dataDir, []string{mediaRoot}); err == nil {
+			t.Fatalf("expected validateTranscodeCleanTargetDirWithScope(%q) to fail", bad)
+		}
+	}
 }
+

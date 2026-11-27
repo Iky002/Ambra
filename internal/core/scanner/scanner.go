@@ -50,6 +50,9 @@ type Scanner struct {
 	cancels        map[string]context.CancelFunc
 	progress       map[string]*LibraryScanProgress
 	libPathMu      map[string]*sync.Mutex
+	pathScanSem    chan struct{}
+	baseCtx        context.Context
+	baseCancel     context.CancelFunc
 	asyncInFlight  atomic.Int64
 
 	pauseMu  sync.Mutex
@@ -241,26 +244,52 @@ func (s *Scanner) ScanAll(ctx context.Context) ([]ScanStats, error) {
 	return all, nil
 }
 
+func (s *Scanner) asyncBaseContext() context.Context {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.baseCtx == nil {
+		s.baseCtx, s.baseCancel = context.WithCancel(context.Background())
+	}
+	return s.baseCtx
+}
+
+func (s *Scanner) pathScanSemaphore() chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pathScanSem == nil {
+		s.pathScanSem = make(chan struct{}, 8)
+	}
+	return s.pathScanSem
+}
+
 // ScanLibraryAsync starts an asynchronous scan for a single library (or all if libraryID == "").
 func (s *Scanner) ScanLibraryAsync(libraryID string) {
+	baseCtx := s.asyncBaseContext()
 	s.asyncInFlight.Add(1)
 	go func() {
 		defer s.asyncInFlight.Add(-1)
-		ctx := context.Background()
 		if libraryID == "" {
-			_, _ = s.ScanAll(ctx)
+			_, _ = s.ScanAll(baseCtx)
 			return
 		}
-		_, _ = s.ScanLibrary(ctx, libraryID)
+		_, _ = s.ScanLibrary(baseCtx, libraryID)
 	}()
 }
 
 // ScanPathAsync starts an asynchronous targeted scan for a specific path within libraryID.
 func (s *Scanner) ScanPathAsync(libraryID, targetPath string) {
+	baseCtx := s.asyncBaseContext()
+	sem := s.pathScanSemaphore()
 	s.asyncInFlight.Add(1)
 	go func() {
 		defer s.asyncInFlight.Add(-1)
-		_, _ = s.ScanPath(context.Background(), libraryID, targetPath)
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+		case <-baseCtx.Done():
+			return
+		}
+		_, _ = s.ScanPath(baseCtx, libraryID, targetPath)
 	}()
 }
 

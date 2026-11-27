@@ -730,29 +730,24 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		req.TargetId = "local-device"
 	}
 	callerID, isAdmin, hasAuth := callerAuth(r)
-	var callerUser *sqlite.UserRecord
-	if hasAuth && !isAdmin {
-		if userRepo := h.getUserRepo(); userRepo != nil {
-			if callerID == "" {
-				httpx.Error(w, http.StatusForbidden, "forbidden")
-				return
-			}
-			u, err := userRepo.GetUserByID(r.Context(), callerID)
-			if err != nil || u == nil || u.IsDisabled {
-				httpx.Error(w, http.StatusForbidden, "forbidden")
-				return
-			}
-			callerUser = u
-		} else if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil {
-			callerUser = ac.User
-		} else {
+	if hasAuth && isAdmin {
+		if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil && (ac.User.IsDisabled || ac.User.Policy.IsDisabled) {
 			httpx.Error(w, http.StatusForbidden, "forbidden")
 			return
 		}
-		if !callerUser.IsAdmin && !callerUser.Policy.IsAdministrator && !callerUser.Policy.EnableContentDownloading {
+	}
+	var callerUser *sqlite.UserRecord
+	if hasAuth && !isAdmin {
+		u, ok := h.resolveCallerUserForSync(r, callerID)
+		if !ok {
+			httpx.Error(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		if !u.IsAdmin && !u.Policy.IsAdministrator && !u.Policy.EnableContentDownloading {
 			httpx.Error(w, http.StatusForbidden, "content downloading is disabled")
 			return
 		}
+		callerUser = u
 		req.UserId = callerID
 	} else if hasAuth && req.UserId == "" {
 		req.UserId = callerID
@@ -815,6 +810,11 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	matchedAnyLibraryItem := false
 	createdItems := make([]SyncJobItem, 0, len(req.ItemIds))
 	if libRepo == nil {
+		if wantTranscode && callerUser != nil && !callerUser.IsAdmin && !callerUser.Policy.IsAdministrator &&
+			!callerUser.Policy.EnableVideoPlaybackTranscoding && !callerUser.Policy.EnableAudioPlaybackTranscoding {
+			httpx.Error(w, http.StatusForbidden, "transcoding is disabled by user policy")
+			return
+		}
 		itemList := req.ItemIds
 		if job.ItemLimit > 0 && len(itemList) > job.ItemLimit {
 			itemList = itemList[:job.ItemLimit]
@@ -875,12 +875,14 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 					httpx.Error(w, http.StatusForbidden, "access denied to requested library")
 					return
 				}
-				if libItems, _, qErr := libRepo.QueryItems(r.Context(), sqlite.ItemFilter{
+				libFilter := sqlite.ItemFilter{
 					ServerID:  serverID,
 					LibraryID: pLib.ID,
 					Recursive: true,
 					Limit:     maxSyncJobItemIDs,
-				}); qErr == nil {
+				}
+				applySyncUserPolicyToFilter(r.Context(), libRepo, callerUser, &libFilter)
+				if libItems, _, qErr := libRepo.QueryItems(r.Context(), libFilter); qErr == nil {
 					for _, li := range libItems {
 						cRec, rErr := libRepo.GetItemRecordByID(r.Context(), li.Id)
 						if rErr != nil || cRec == nil || isSyncContainerType(cRec.Type) || cRec.IsStrm || strings.EqualFold(filepath.Ext(cRec.Path), ".strm") {
@@ -899,6 +901,12 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		if wantTranscode && len(expandedIDs) == 0 && callerUser != nil && !callerUser.IsAdmin && !callerUser.Policy.IsAdministrator &&
+			!callerUser.Policy.EnableVideoPlaybackTranscoding && !callerUser.Policy.EnableAudioPlaybackTranscoding {
+			httpx.Error(w, http.StatusForbidden, "transcoding is disabled by user policy")
+			return
+		}
+
 		matchedAnyLibraryItem = len(expandedIDs) > 0
 		for i, itemID := range expandedIDs {
 			if job.ItemLimit > 0 && len(createdItems) >= job.ItemLimit {
@@ -910,6 +918,10 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 			itemDTO, err := libRepo.GetItemByID(r.Context(), serverID, job.UserId, itemID)
 			if err != nil || itemDTO == nil {
 				continue
+			}
+			if wantTranscode && callerUser != nil && !canUserTranscodeSyncMedia(callerUser, itemDTO.MediaType) {
+				httpx.Error(w, http.StatusForbidden, "transcoding is disabled by user policy")
+				return
 			}
 			if strings.EqualFold(filepath.Ext(itemDTO.Path), ".strm") {
 				httpx.Error(w, http.StatusBadRequest, "STRM items cannot be synced")
@@ -1087,16 +1099,24 @@ func (h *Handler) handleUpdateJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	callerID, isAdmin, hasAuth := callerAuth(r)
+	if hasAuth && isAdmin {
+		if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil && (ac.User.IsDisabled || ac.User.Policy.IsDisabled) {
+			httpx.Error(w, http.StatusForbidden, "forbidden")
+			return
+		}
+	}
+	var callerUser *sqlite.UserRecord
 	if hasAuth && !isAdmin {
-		callerUser, ok := h.resolveCallerUserForSync(r, callerID)
+		u, ok := h.resolveCallerUserForSync(r, callerID)
 		if !ok {
 			httpx.Error(w, http.StatusForbidden, "forbidden")
 			return
 		}
-		if !callerUser.IsAdmin && !callerUser.Policy.IsAdministrator && !callerUser.Policy.EnableContentDownloading {
+		if !u.IsAdmin && !u.Policy.IsAdministrator && !u.Policy.EnableContentDownloading {
 			httpx.Error(w, http.StatusForbidden, "content downloading is disabled")
 			return
 		}
+		callerUser = u
 	}
 
 	h.mu.Lock()
@@ -1108,6 +1128,26 @@ func (h *Handler) handleUpdateJob(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			prevJob := h.state.Jobs[i]
+			effQuality := prevJob.Quality
+			if req.Quality != "" {
+				effQuality = req.Quality
+			}
+			effBitrate := prevJob.Bitrate
+			if req.Bitrate != nil {
+				effBitrate = *req.Bitrate
+				if effBitrate > maxSyncBitrate {
+					effBitrate = maxSyncBitrate
+				}
+			}
+			if callerUser != nil && !callerUser.IsAdmin && !callerUser.Policy.IsAdministrator {
+				if wantTC, _ := needsSyncTranscode(effQuality, effBitrate); wantTC {
+					if !callerUser.Policy.EnableVideoPlaybackTranscoding && !callerUser.Policy.EnableAudioPlaybackTranscoding {
+						h.mu.Unlock()
+						httpx.Error(w, http.StatusForbidden, "transcoding is disabled by user policy")
+						return
+					}
+				}
+			}
 			if req.Name != "" {
 				h.state.Jobs[i].Name = req.Name
 			}
@@ -1115,11 +1155,7 @@ func (h *Handler) handleUpdateJob(w http.ResponseWriter, r *http.Request) {
 				h.state.Jobs[i].Quality = req.Quality
 			}
 			if req.Bitrate != nil {
-				br := *req.Bitrate
-				if br > maxSyncBitrate {
-					br = maxSyncBitrate
-				}
-				h.state.Jobs[i].Bitrate = br
+				h.state.Jobs[i].Bitrate = effBitrate
 			}
 			if req.UnwatchedOnly != nil {
 				h.state.Jobs[i].UnwatchedOnly = *req.UnwatchedOnly
@@ -1389,6 +1425,7 @@ func (h *Handler) handleEnableJobItem(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusNotFound, "sync job item not found")
 		return
 	}
+	itemMediaType := ""
 	if hasAuth && !isAdmin {
 		if !hasJob || !canAccessJob(parentJob, callerID, isAdmin, hasAuth) {
 			httpx.Error(w, http.StatusForbidden, "forbidden")
@@ -1398,6 +1435,13 @@ func (h *Handler) handleEnableJobItem(w http.ResponseWriter, r *http.Request) {
 			rec, recErr := libRepo.GetItemRecordByID(r.Context(), jiSnapshot.ItemId)
 			if recErr != nil || rec == nil || !h.canUserAccessItemRecord(r.Context(), libRepo, callerUser, rec) {
 				httpx.Error(w, http.StatusForbidden, "access denied to sync item")
+				return
+			}
+			itemMediaType = rec.MediaType
+		}
+		if wantTC, _ := needsSyncTranscode(parentJob.Quality, parentJob.Bitrate); wantTC {
+			if !canUserTranscodeSyncMedia(callerUser, itemMediaType) {
+				httpx.Error(w, http.StatusForbidden, "transcoding is disabled by user policy")
 				return
 			}
 		}
@@ -1415,9 +1459,9 @@ func (h *Handler) handleEnableJobItem(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	for i := range h.state.JobItems {
 		if h.state.JobItems[i].Id == id {
+			j, hasParent := h.findJobLocked(h.state.JobItems[i].JobId)
 			if hasAuth && !isAdmin {
-				j, ok := h.findJobLocked(h.state.JobItems[i].JobId)
-				if !ok || !canAccessJob(j, callerID, isAdmin, hasAuth) {
+				if !hasParent || !canAccessJob(j, callerID, isAdmin, hasAuth) {
 					h.mu.Unlock()
 					httpx.Error(w, http.StatusForbidden, "forbidden")
 					return
@@ -1431,10 +1475,26 @@ func (h *Handler) handleEnableJobItem(w http.ResponseWriter, r *http.Request) {
 			case "Queued":
 				wake = true
 			default:
-				wantTC := false
-				if j, ok := h.findJobLocked(ji.JobId); ok {
-					wantTC, _ = needsSyncTranscode(j.Quality, j.Bitrate)
+				if !hasParent || strings.EqualFold(j.Status, "Cancelled") {
+					h.mu.Unlock()
+					httpx.Error(w, http.StatusConflict, "cannot enable item of a cancelled sync job")
+					return
 				}
+				if j.ItemLimit > 0 {
+					activeCount := 0
+					for _, other := range h.state.JobItems {
+						if other.JobId == ji.JobId && other.Id != ji.Id &&
+							!strings.EqualFold(other.Status, "Cancelled") && !strings.EqualFold(other.Status, "Removing") {
+							activeCount++
+						}
+					}
+					if activeCount >= j.ItemLimit {
+						h.mu.Unlock()
+						httpx.Error(w, http.StatusConflict, "sync job item limit reached")
+						return
+					}
+				}
+				wantTC, _ := needsSyncTranscode(j.Quality, j.Bitrate)
 				curOutExists := false
 				if ji.OutputPath != "" {
 					if ji.OutputPath == jiSnapshot.OutputPath {
@@ -1444,7 +1504,7 @@ func (h *Handler) handleEnableJobItem(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 				if (ji.OutputPath != "" && curOutExists) || !wantTC || !transcodeConfigured {
-					if !wantTC && ji.OutputPath == "" && ji.SourcePath != "" {
+					if (!wantTC || !transcodeConfigured) && ji.OutputPath == "" && ji.SourcePath != "" {
 						ji.OutputPath = ji.SourcePath
 					}
 					ji.Status = "ReadyToTransfer"
@@ -1495,6 +1555,29 @@ func (h *Handler) resolveCallerUserForSync(r *http.Request, callerID string) (*s
 		return ac.User, true
 	}
 	return nil, false
+}
+
+func canUserTranscodeSyncMedia(u *sqlite.UserRecord, mediaType string) bool {
+	if u == nil || u.IsAdmin || u.Policy.IsAdministrator {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(mediaType), "Audio") {
+		return u.Policy.EnableAudioPlaybackTranscoding
+	}
+	return u.Policy.EnableVideoPlaybackTranscoding
+}
+
+func applySyncUserPolicyToFilter(ctx context.Context, libRepo *sqlite.LibraryRepo, user *sqlite.UserRecord, f *sqlite.ItemFilter) {
+	if f == nil || libRepo == nil || user == nil || user.IsAdmin || user.Policy.IsAdministrator {
+		return
+	}
+	f.AllowedLibraryIDs = libRepo.AllowedLibraryIDsForPolicy(ctx, user.Policy)
+	f.MaxParentalRating = user.Policy.MaxParentalRating
+	f.BlockUnratedItems = user.Policy.BlockUnratedItems
+	f.BlockedTags = user.Policy.BlockedTags
+	f.AllowedTags = user.Policy.AllowedTags
+	f.PlaylistViewerUserID = guid.Normalize(user.ID)
+	f.PlaylistViewerIsAdmin = false
 }
 
 func (h *Handler) isPlaylistPublic(ctx context.Context, itemID string) bool {
@@ -1692,58 +1775,78 @@ func (h *Handler) expandSyncContainer(
 
 	switch strings.ToLower(strings.TrimSpace(container.Type)) {
 	case "playlist", "boxset":
-		if entries, _, err := libRepo.GetContainerItems(ctx, serverID, userID, container.ID, 0, maxSyncJobItemIDs, nil); err == nil {
+		var (
+			entries []sqlite.PlaylistItemDto
+			err     error
+		)
+		if callerUser != nil && !callerUser.IsAdmin && !callerUser.Policy.IsAdministrator {
+			allowedLibs := libRepo.AllowedLibraryIDsForPolicy(ctx, callerUser.Policy)
+			entries, _, err = libRepo.GetContainerItemsWithUserPolicy(ctx, serverID, userID, container.ID, 0, maxSyncJobItemIDs, nil, allowedLibs, callerUser.Policy)
+		} else {
+			entries, _, err = libRepo.GetContainerItems(ctx, serverID, userID, container.ID, 0, maxSyncJobItemIDs, nil)
+		}
+		if err == nil {
 			for _, e := range entries {
 				addChildID(e.Id)
 			}
 		}
 	case "series":
-		if items, _, err := libRepo.QueryItems(ctx, sqlite.ItemFilter{
+		f1 := sqlite.ItemFilter{
 			ServerID: serverID,
 			SeriesID: container.ID,
 			Limit:    maxSyncJobItemIDs,
-		}); err == nil {
+		}
+		applySyncUserPolicyToFilter(ctx, libRepo, callerUser, &f1)
+		if items, _, err := libRepo.QueryItems(ctx, f1); err == nil {
 			for _, it := range items {
 				addChildID(it.Id)
 			}
 		}
-		if items, _, err := libRepo.QueryItems(ctx, sqlite.ItemFilter{
+		f2 := sqlite.ItemFilter{
 			ServerID:  serverID,
 			ParentID:  container.ID,
 			Recursive: true,
 			Limit:     maxSyncJobItemIDs,
-		}); err == nil {
+		}
+		applySyncUserPolicyToFilter(ctx, libRepo, callerUser, &f2)
+		if items, _, err := libRepo.QueryItems(ctx, f2); err == nil {
 			for _, it := range items {
 				addChildID(it.Id)
 			}
 		}
 	case "season":
-		if items, _, err := libRepo.QueryItems(ctx, sqlite.ItemFilter{
+		f1 := sqlite.ItemFilter{
 			ServerID: serverID,
 			SeasonID: container.ID,
 			Limit:    maxSyncJobItemIDs,
-		}); err == nil {
+		}
+		applySyncUserPolicyToFilter(ctx, libRepo, callerUser, &f1)
+		if items, _, err := libRepo.QueryItems(ctx, f1); err == nil {
 			for _, it := range items {
 				addChildID(it.Id)
 			}
 		}
-		if items, _, err := libRepo.QueryItems(ctx, sqlite.ItemFilter{
+		f2 := sqlite.ItemFilter{
 			ServerID:  serverID,
 			ParentID:  container.ID,
 			Recursive: true,
 			Limit:     maxSyncJobItemIDs,
-		}); err == nil {
+		}
+		applySyncUserPolicyToFilter(ctx, libRepo, callerUser, &f2)
+		if items, _, err := libRepo.QueryItems(ctx, f2); err == nil {
 			for _, it := range items {
 				addChildID(it.Id)
 			}
 		}
 	default:
-		if items, _, err := libRepo.QueryItems(ctx, sqlite.ItemFilter{
+		f := sqlite.ItemFilter{
 			ServerID:  serverID,
 			ParentID:  container.ID,
 			Recursive: true,
 			Limit:     maxSyncJobItemIDs,
-		}); err == nil {
+		}
+		applySyncUserPolicyToFilter(ctx, libRepo, callerUser, &f)
+		if items, _, err := libRepo.QueryItems(ctx, f); err == nil {
 			for _, it := range items {
 				addChildID(it.Id)
 			}
