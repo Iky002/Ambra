@@ -484,6 +484,23 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 			return err
 		},
 	})
+	sixHoursTicks := int64(6 * 3600 * 10_000_000)
+	taskMgr.Register(scheduler.TaskDefinition{
+		ID:          "refresh-livetv-tuners",
+		Key:         "RefreshTunerHosts",
+		Name:        "刷新直播电视频道源 (M3U / HDHomeRun)",
+		Category:    "LiveTV",
+		Description: "定期重新同步已配置 URL 的 M3U 与 HDHomeRun 频道源，无损更新流地址并保留频道排序、禁用状态与 EPG 映射",
+		Triggers: []scheduler.TaskTriggerInfo{
+			{Type: "IntervalTrigger", IntervalTicks: &sixHoursTicks},
+		},
+		Run: func(c context.Context, reportProgress func(float64)) error {
+			reportProgress(10)
+			err := livetvH.RefreshAllTunerHosts(c)
+			reportProgress(100)
+			return err
+		},
+	})
 	syncH := syncapi.New(store, cfg)
 	syncH.SetLibraryRepo(libRepo)
 	syncH.SetUserRepo(userRepo)

@@ -119,7 +119,7 @@ export function buildEmbyAuthHeader(token?: string): string {
     'Client="Ambra Web"',
     'Device="Web Browser"',
     `DeviceId="${deviceId}"`,
-    'Version="0.11.3"',
+    'Version="0.12.0"',
   ]
   if (token) {
     parts.push(`Token="${token}"`)
@@ -1392,6 +1392,11 @@ export const api = {
   deleteTunerHost: (id: string) =>
     embyFetch<void>(`/emby/LiveTv/TunerHosts?id=${encodeURIComponent(id)}`, {
       method: 'DELETE',
+    }),
+
+  refreshTunerHost: (id: string) =>
+    embyFetch<LiveTvTunerHostInfo>(`/emby/LiveTv/TunerHosts/${encodeURIComponent(id)}/Refresh`, {
+      method: 'POST',
     }),
 
   getListingProviders: () =>

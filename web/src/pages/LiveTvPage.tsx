@@ -57,8 +57,19 @@ interface LiveTvProgramItem {
   EndDate?: string
 }
 
-const MAX_HLS_MEDIA_RECOVERIES = 2
+const MAX_HLS_MEDIA_RECOVERIES = 10
+const MAX_HLS_NETWORK_RECOVERIES = 10
+const HLS_RECOVERY_RESET_MS = 15_000
+const UNRECOVERABLE_CODEC_DETAILS = new Set([
+  'bufferAddCodecError',
+  'manifestIncompatibleCodecsError',
+])
 const MEDIA_ERR_SRC_NOT_SUPPORTED = 4
+
+function formatHlsError(msg: string, details?: string): string {
+  const trimmed = details?.trim()
+  return trimmed ? `${msg} (${trimmed})` : msg
+}
 
 function formatTimeRange(startIso?: string, endIso?: string): string {
   if (!startIso && !endIso) return ''
@@ -103,6 +114,8 @@ export function LiveTvPage() {
   pauseGlobalAudioRef.current = pauseGlobalAudio
   const canManageLiveTv = isAdmin || Boolean(user?.Policy?.EnableLiveTvManagement)
   const { t } = useI18n()
+  const tRef = useRef(t)
+  tRef.current = t
   const queryClient = useQueryClient()
   const [searchParams, setSearchParams] = useSearchParams()
   const [activeSubTab, setActiveSubTab] = useState<LiveTvSubTab>('channels')
@@ -132,6 +145,8 @@ export function LiveTvPage() {
   const hlsRef = useRef<Hls | null>(null)
   const recordingHlsRef = useRef<Hls | null>(null)
   const mediaRecoveryCountRef = useRef(0)
+  const networkRecoveryCountRef = useRef(0)
+  const volumePrefsRef = useRef<{ volume: number; muted: boolean } | null>(null)
   const demoActive = isDemoMode()
 
   // 每 30 秒刷新当前时间戳，驱动 EPG「正在播出 / 即将播出」与进度条实时更新
@@ -439,7 +454,8 @@ export function LiveTvPage() {
     return channels[0]
   }, [channels, requestedChannelId])
 
-  const activeStreamUrl = activeChannel ? getLiveTvChannelStreamUrl(activeChannel.Id) : ''
+  const activeChannelId = activeChannel?.Id ?? ''
+  const activeStreamUrl = activeChannelId ? getLiveTvChannelStreamUrl(activeChannelId) : ''
   const activeLooksLikeHls = useMemo(() => {
     if (!activeChannel) return false
     if (activeChannel.IsHls === true) return true
@@ -452,13 +468,15 @@ export function LiveTvPage() {
   useEffect(() => {
     setForceHls(false)
     mediaRecoveryCountRef.current = 0
-  }, [activeChannel?.Id])
+    networkRecoveryCountRef.current = 0
+  }, [activeChannelId])
 
   const handleSelectChannel = (channelId: string) => {
     pauseGlobalAudio()
     setPlaybackError(null)
     setForceHls(false)
     mediaRecoveryCountRef.current = 0
+    networkRecoveryCountRef.current = 0
     const next = new URLSearchParams(searchParams)
     next.set('channel', channelId)
     setSearchParams(next, { replace: true })
@@ -468,6 +486,7 @@ export function LiveTvPage() {
     pauseGlobalAudio()
     setPlaybackError(null)
     mediaRecoveryCountRef.current = 0
+    networkRecoveryCountRef.current = 0
     setStreamRetryTick((tick) => tick + 1)
   }
 
@@ -527,11 +546,17 @@ export function LiveTvPage() {
   useEffect(() => {
     if (activeSubTab !== 'channels') return
     const video = videoRef.current
-    if (!video || !activeChannel) return
+    if (!video || !activeChannelId) return
+
+    if (volumePrefsRef.current) {
+      video.volume = volumePrefsRef.current.volume
+      video.muted = volumePrefsRef.current.muted
+    }
 
     pauseGlobalAudioRef.current()
     setPlaybackError(null)
     mediaRecoveryCountRef.current = 0
+    networkRecoveryCountRef.current = 0
 
     if (demoActive) {
       const cachedUrl = getCachedDemoServer()?.getDemoVideoUrl()
@@ -557,9 +582,29 @@ export function LiveTvPage() {
     const streamUrl = activeStreamUrl
     const useHls = (activeLooksLikeHls || forceHls) && Hls.isSupported()
 
+    let cancelled = false
     let hls: Hls | null = null
+    let recoveryTimer: number | null = null
+    let stableResetTimer: number | null = null
+    let lastFatalErrorAt = 0
+
+    const clearRecoveryTimer = () => {
+      if (recoveryTimer !== null) {
+        window.clearTimeout(recoveryTimer)
+        recoveryTimer = null
+      }
+    }
+
+    const clearStableResetTimer = () => {
+      if (stableResetTimer !== null) {
+        window.clearTimeout(stableResetTimer)
+        stableResetTimer = null
+      }
+    }
 
     const destroyHls = () => {
+      clearRecoveryTimer()
+      clearStableResetTimer()
       if (hls) {
         hls.destroy()
         if (hlsRef.current === hls) {
@@ -569,32 +614,115 @@ export function LiveTvPage() {
       }
     }
 
+    const handleStablePlaybackSignal = () => {
+      if (cancelled || !hls || hlsRef.current !== hls) return
+      if (mediaRecoveryCountRef.current === 0 && networkRecoveryCountRef.current === 0) return
+
+      const elapsed = lastFatalErrorAt > 0 ? Date.now() - lastFatalErrorAt : 0
+      if (lastFatalErrorAt > 0 && elapsed >= HLS_RECOVERY_RESET_MS) {
+        mediaRecoveryCountRef.current = 0
+        networkRecoveryCountRef.current = 0
+        lastFatalErrorAt = 0
+        clearStableResetTimer()
+        return
+      }
+
+      if (stableResetTimer === null) {
+        const remaining =
+          lastFatalErrorAt > 0
+            ? Math.max(0, HLS_RECOVERY_RESET_MS - elapsed)
+            : HLS_RECOVERY_RESET_MS
+        stableResetTimer = window.setTimeout(() => {
+          stableResetTimer = null
+          if (cancelled || !hls || hlsRef.current !== hls) return
+          mediaRecoveryCountRef.current = 0
+          networkRecoveryCountRef.current = 0
+          lastFatalErrorAt = 0
+        }, remaining)
+      }
+    }
+
+    const onPlaying = () => {
+      handleStablePlaybackSignal()
+    }
+
     if (useHls) {
       hls = new Hls({
         enableWorker: true,
-        lowLatencyMode: true,
+        lowLatencyMode: false,
+        liveSyncDurationCount: 3,
+        liveMaxLatencyDurationCount: 10,
+        maxBufferLength: 30,
+        backBufferLength: 30,
+        manifestLoadingMaxRetry: 4,
+        levelLoadingMaxRetry: 4,
+        fragLoadingMaxRetry: 6,
         xhrSetup: attachEmbyHlsAuth,
       })
       hlsRef.current = hls
+      video.addEventListener('playing', onPlaying)
       hls.loadSource(streamUrl)
       hls.attachMedia(video)
+      hls.on(Hls.Events.FRAG_BUFFERED, () => {
+        if (cancelled || hlsRef.current !== hls) return
+        handleStablePlaybackSignal()
+      })
       hls.on(Hls.Events.ERROR, (_event, data) => {
-        if (data.fatal) {
-          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-            destroyHls()
-            setPlaybackError(t('liveTvUi.errHlsNetwork'))
-          } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-            if (mediaRecoveryCountRef.current < MAX_HLS_MEDIA_RECOVERIES) {
-              mediaRecoveryCountRef.current += 1
-              hls?.recoverMediaError()
-            } else {
-              destroyHls()
-              setPlaybackError(t('liveTvUi.errHlsMediaDecode'))
-            }
+        if (cancelled || hlsRef.current !== hls) return
+        if (!data.fatal) return
+
+        if (data.details && UNRECOVERABLE_CODEC_DETAILS.has(data.details)) {
+          destroyHls()
+          setPlaybackError(
+            formatHlsError(tRef.current('liveTvUi.errHlsUnsupportedCodec'), data.details),
+          )
+          return
+        }
+
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          lastFatalErrorAt = Date.now()
+          clearStableResetTimer()
+          if (mediaRecoveryCountRef.current < MAX_HLS_MEDIA_RECOVERIES) {
+            mediaRecoveryCountRef.current += 1
+            const attempt = mediaRecoveryCountRef.current
+            const delay = Math.min(500 * attempt, 3000)
+            clearRecoveryTimer()
+            recoveryTimer = window.setTimeout(() => {
+              recoveryTimer = null
+              if (cancelled || !hls || hlsRef.current !== hls) return
+              if (attempt % 2 === 0) {
+                hls.swapAudioCodec()
+              }
+              hls.recoverMediaError()
+            }, delay)
           } else {
             destroyHls()
-            setPlaybackError(t('liveTvUi.errHlsFatal'))
+            setPlaybackError(
+              formatHlsError(tRef.current('liveTvUi.errHlsMediaDecode'), data.details),
+            )
           }
+        } else if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          lastFatalErrorAt = Date.now()
+          clearStableResetTimer()
+          if (networkRecoveryCountRef.current < MAX_HLS_NETWORK_RECOVERIES) {
+            networkRecoveryCountRef.current += 1
+            const attempt = networkRecoveryCountRef.current
+            const delay = Math.min(500 * attempt, 3000)
+            clearRecoveryTimer()
+            recoveryTimer = window.setTimeout(() => {
+              recoveryTimer = null
+              if (cancelled || !hls || hlsRef.current !== hls) return
+              hls.startLoad()
+            }, delay)
+          } else {
+            destroyHls()
+            setPlaybackError(
+              formatHlsError(tRef.current('liveTvUi.errHlsNetwork'), data.details),
+            )
+          }
+        } else {
+          destroyHls()
+          setPlaybackError(formatHlsError(tRef.current('liveTvUi.errHlsFatal'), data.details))
         }
       })
     } else {
@@ -603,11 +731,24 @@ export function LiveTvPage() {
     }
 
     return () => {
+      cancelled = true
+      clearRecoveryTimer()
+      clearStableResetTimer()
+      video.removeEventListener('playing', onPlaying)
       destroyHls()
       video.pause()
       video.removeAttribute('src')
+      video.load()
     }
-  }, [activeChannel, activeLooksLikeHls, activeStreamUrl, activeSubTab, demoActive, forceHls, streamRetryTick, t])
+  }, [
+    activeChannelId,
+    activeLooksLikeHls,
+    activeStreamUrl,
+    activeSubTab,
+    demoActive,
+    forceHls,
+    streamRetryTick,
+  ])
 
   const shouldUseRecordingHls = Boolean(
     activeSubTab === 'recordings' &&
@@ -827,13 +968,21 @@ export function LiveTvPage() {
             <div className="overflow-hidden rounded-2xl border border-white/10 bg-black shadow-2xl">
               <div className="relative aspect-video w-full bg-zinc-950">
                 <video
+                  key={`${activeChannelId || 'none'}-${forceHls ? 'hls' : 'auto'}-${streamRetryTick}`}
                   ref={videoRef}
                   data-testid="livetv-video"
                   controls
                   playsInline
                   autoPlay
+                  onVolumeChange={(e) => {
+                    volumePrefsRef.current = {
+                      volume: e.currentTarget.volume,
+                      muted: e.currentTarget.muted,
+                    }
+                  }}
                   onError={(e) => {
                     if (demoActive) return
+                    if (hlsRef.current) return
                     const errCode = e.currentTarget.error?.code
                     const srcNotSupported =
                       typeof MediaError !== 'undefined'

@@ -24,7 +24,7 @@ const (
 )
 
 // AmbraVersion is the Ambra application release version (overridden at build time via -ldflags).
-var AmbraVersion = "v0.11.3"
+var AmbraVersion = "v0.12.0"
 
 type envOverrideFlags struct {
 	httpAddr            bool

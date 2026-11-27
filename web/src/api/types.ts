@@ -209,6 +209,7 @@ export interface LiveTvTunerHostInfo {
   UserAgent?: string
   ImportFavoritesOnly?: boolean
   TunerCount?: number
+  ImportedChannelCount?: number
 }
 
 export interface LiveTvListingProviderInfo {

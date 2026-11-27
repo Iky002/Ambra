@@ -848,7 +848,9 @@ describe('v0.10.9 Stream 5 全量修复回归测试', () => {
       expect(errorHandler).toBeDefined()
     })
     act(() => {
-      errorHandler!(Hls.Events.ERROR, { fatal: true, type: Hls.ErrorTypes.NETWORK_ERROR })
+      for (let i = 0; i < 11; i += 1) {
+        errorHandler!(Hls.Events.ERROR, { fatal: true, type: Hls.ErrorTypes.NETWORK_ERROR })
+      }
     })
     expect(hlsDestroySpy).toHaveBeenCalledTimes(1)
     expect(await screen.findByText(/直播流网络连接失败/)).toBeInTheDocument()

@@ -804,7 +804,7 @@ function createInitialDemoNotifications(): DemoNotificationRecord[] {
     {
       Id: 'notif-demo-01',
       Date: new Date(now - 15 * 60_000).toISOString(),
-      Name: '欢迎体验 Ambra v0.11.3',
+      Name: '欢迎体验 Ambra v0.12.0',
       Description: '已上线应用内通知中心、家长控制分级过滤与 Quick Connect 设备授权码登录。',
       Level: 'Normal',
       readByUsers: new Set(),
@@ -3209,7 +3209,7 @@ export async function demoFetch<T>(
           UserId: sessionUserId,
           UserName: caller.user?.Name || sessionUserId,
           Client: 'Ambra Web',
-          ApplicationVersion: '0.11.3',
+          ApplicationVersion: '0.12.0',
           DeviceName: 'Web Browser (Demo)',
           DeviceId: `dev-web-${sessionUserId}`,
           LastActivityDate: new Date().toISOString(),
@@ -4653,6 +4653,30 @@ export async function demoFetch<T>(
       }
       return undefined as T
     }
+  }
+
+  const refreshTunerMatch = pathname.match(/^\/emby\/LiveTv\/TunerHosts\/([^/]+)\/Refresh$/)
+  if (refreshTunerMatch && method === 'POST') {
+    requireDemoAdmin(caller)
+    const id = decodeURIComponent(refreshTunerMatch[1])
+    const host = demoTunerHosts.find((h) => h.Id === id)
+    if (!host) {
+      throw new ApiError(404, '未找到指定的 Live TV 直播源')
+    }
+    if (!host.Url || !host.Url.trim()) {
+      throw new ApiError(400, '该直播源未配置可刷新的远程地址')
+    }
+    const updated: LiveTvTunerHostInfo = {
+      ...host,
+      ImportedChannelCount: demoLiveTvChannels.length,
+    }
+    pushActivity(
+      `已刷新 Live TV 直播源「${host.FriendlyName || id}」`,
+      'LiveTvTunerRefreshed',
+      `${demoLiveTvChannels.length} channels`,
+      caller.userId,
+    )
+    return updated as T
   }
 
   if (pathname === '/emby/LiveTv/ListingProviders') {
@@ -6163,7 +6187,7 @@ export async function demoFetch<T>(
       DeviceId: 'dev-demo-web-01',
       DeviceName: 'Ambra Web Demo',
       AppName: 'Ambra Web',
-      AppVersion: '0.11.3',
+      AppVersion: '0.12.0',
       DateAdded: new Date().toISOString(),
     }
     demoQuickConnectSessions.set(secret, session)

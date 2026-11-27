@@ -276,6 +276,73 @@ func (b *liveStreamBroadcaster) broadcastChunk(chunk []byte) {
 	}
 }
 
+const (
+	tsPacketSize = 188
+	tsSyncByte   = 0x47
+)
+
+// alignRingReplayToTSSync aligns the initial ring replay buffer to the first valid
+// 188-byte MPEG-TS packet sync boundary (0x47) so mid-stream joiners do not start on
+// partial/garbage TS bytes. Non-TS streams or buffers without a valid sync sequence
+// are returned untouched.
+func alignRingReplayToTSSync(ring [][]byte) [][]byte {
+	if len(ring) == 0 {
+		return ring
+	}
+	total := 0
+	for _, c := range ring {
+		total += len(c)
+	}
+	if total < tsPacketSize+1 {
+		return ring
+	}
+
+	buf := make([]byte, 0, total)
+	for _, c := range ring {
+		buf = append(buf, c...)
+	}
+
+	syncOffset := -1
+	if len(buf) >= 2*tsPacketSize+1 {
+		limit := len(buf) - 2*tsPacketSize
+		for i := 0; i < limit; i++ {
+			if buf[i] == tsSyncByte && buf[i+tsPacketSize] == tsSyncByte && buf[i+2*tsPacketSize] == tsSyncByte {
+				syncOffset = i
+				break
+			}
+		}
+	}
+	if syncOffset < 0 && len(buf) < 3*tsPacketSize {
+		limit := len(buf) - tsPacketSize
+		for i := 0; i < limit; i++ {
+			if buf[i] == tsSyncByte && buf[i+tsPacketSize] == tsSyncByte {
+				syncOffset = i
+				break
+			}
+		}
+	}
+
+	if syncOffset <= 0 {
+		return ring
+	}
+
+	remaining := syncOffset
+	aligned := make([][]byte, 0, len(ring))
+	for _, c := range ring {
+		if remaining >= len(c) {
+			remaining -= len(c)
+			continue
+		}
+		if remaining > 0 {
+			aligned = append(aligned, c[remaining:])
+			remaining = 0
+		} else {
+			aligned = append(aligned, c)
+		}
+	}
+	return aligned
+}
+
 func (b *liveStreamBroadcaster) addSubscriber() (*liveStreamSubscriber, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -286,11 +353,12 @@ func (b *liveStreamBroadcaster) addSubscriber() (*liveStreamSubscriber, bool) {
 		b.graceTimer.Stop()
 		b.graceTimer = nil
 	}
+	initialChunks := alignRingReplayToTSSync(b.ring)
 	sub := &liveStreamSubscriber{
-		ch:   make(chan []byte, streamSubQueueDepth+len(b.ring)),
+		ch:   make(chan []byte, streamSubQueueDepth+len(initialChunks)),
 		done: make(chan struct{}),
 	}
-	for _, initial := range b.ring {
+	for _, initial := range initialChunks {
 		sub.ch <- initial
 	}
 	b.subs[sub] = struct{}{}
