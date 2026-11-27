@@ -1058,6 +1058,52 @@ func (h *Handler) restoreZipBackupLocked(ctx context.Context, srcZip string) (st
 			if readErr != nil || !json.Valid(rawCfg) {
 				return "", &restoreValidationError{msg: "invalid config/ambra.json in backup archive"}
 			}
+			var cfgMap map[string]any
+			if err := json.Unmarshal(rawCfg, &cfgMap); err != nil || cfgMap == nil {
+				return "", &restoreValidationError{msg: "invalid config/ambra.json in backup archive"}
+			}
+			// Security (M-03): Never allow a backup archive to overwrite host executable paths.
+			for k := range cfgMap {
+				if strings.EqualFold(k, "ffmpeg_path") || strings.EqualFold(k, "ffprobe_path") ||
+					strings.EqualFold(k, "ffmpegpath") || strings.EqualFold(k, "ffprobepath") {
+					delete(cfgMap, k)
+				}
+			}
+			var keepFFmpeg, keepFFprobe string
+			existingCfgPath := filepath.Join(dataDir, "config", "ambra.json")
+			if existingRaw, exErr := os.ReadFile(existingCfgPath); exErr == nil {
+				var existingMap map[string]any
+				if json.Unmarshal(existingRaw, &existingMap) == nil && existingMap != nil {
+					if v, ok := existingMap["ffmpeg_path"].(string); ok && strings.TrimSpace(v) != "" {
+						keepFFmpeg = v
+					}
+					if v, ok := existingMap["ffprobe_path"].(string); ok && strings.TrimSpace(v) != "" {
+						keepFFprobe = v
+					}
+				}
+			}
+			if h.cfg != nil {
+				snap := h.cfg.Snapshot()
+				if keepFFmpeg == "" && strings.TrimSpace(snap.FFmpegPath) != "" {
+					keepFFmpeg = snap.FFmpegPath
+				}
+				if keepFFprobe == "" && strings.TrimSpace(snap.FFprobePath) != "" {
+					keepFFprobe = snap.FFprobePath
+				}
+			}
+			if keepFFmpeg != "" {
+				cfgMap["ffmpeg_path"] = keepFFmpeg
+			}
+			if keepFFprobe != "" {
+				cfgMap["ffprobe_path"] = keepFFprobe
+			}
+			sanitizedCfg, marshalErr := json.MarshalIndent(cfgMap, "", "  ")
+			if marshalErr != nil {
+				return "", marshalErr
+			}
+			if writeErr := os.WriteFile(stageCfg, sanitizedCfg, 0o600); writeErr != nil {
+				return "", writeErr
+			}
 			hasConfig = true
 		case strings.HasPrefix(cleanName, "metadata/users/"):
 			relMeta := strings.TrimPrefix(cleanName, "metadata/")

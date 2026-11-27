@@ -109,6 +109,7 @@ type Manager struct {
 	loadTriggers          func(ctx context.Context) (map[string][]TaskTriggerInfo, error)
 	saveTriggers          func(ctx context.Context, triggers map[string][]TaskTriggerInfo) error
 	activeTranscodeDirsFn func() []string
+	transcodeTempDirFn    func() string
 	tickInterval          time.Duration
 	nowFn                 func() time.Time
 	started               atomic.Bool
@@ -130,6 +131,14 @@ func (m *Manager) SetActiveTranscodeDirsFn(fn func() []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.activeTranscodeDirsFn = fn
+}
+
+// SetTranscodeTempDirFn registers a callback returning the active TranscodingTempPath
+// so CleanTranscodeCache dynamically queries the current transcode temp directory on each run.
+func (m *Manager) SetTranscodeTempDirFn(fn func() string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.transcodeTempDirFn = fn
 }
 
 // SetTickInterval configures how frequently Start polls task triggers (defaults to 15s).
@@ -454,11 +463,22 @@ func (m *Manager) RegisterBuiltinTasks(scanAll func(ctx context.Context) error, 
 		},
 		Run: func(ctx context.Context, report func(float64)) error {
 			report(10)
-			if transcodeTempDir == "" {
+			m.mu.RLock()
+			tempDirFn := m.transcodeTempDirFn
+			activeFn := m.activeTranscodeDirsFn
+			m.mu.RUnlock()
+
+			targetDir := strings.TrimSpace(transcodeTempDir)
+			if tempDirFn != nil {
+				if dyn := strings.TrimSpace(tempDirFn()); dyn != "" {
+					targetDir = dyn
+				}
+			}
+			if targetDir == "" {
 				report(100)
 				return nil
 			}
-			entries, err := os.ReadDir(transcodeTempDir)
+			entries, err := os.ReadDir(targetDir)
 			if err != nil {
 				if os.IsNotExist(err) {
 					report(100)
@@ -466,9 +486,6 @@ func (m *Manager) RegisterBuiltinTasks(scanAll func(ctx context.Context) error, 
 				}
 				return err
 			}
-			m.mu.RLock()
-			activeFn := m.activeTranscodeDirsFn
-			m.mu.RUnlock()
 			activeDirs := make(map[string]struct{})
 			if activeFn != nil {
 				for _, d := range activeFn() {
@@ -485,7 +502,7 @@ func (m *Manager) RegisterBuiltinTasks(scanAll func(ctx context.Context) error, 
 					return ctx.Err()
 				default:
 				}
-				fullPath := filepath.Join(transcodeTempDir, entry.Name())
+				fullPath := filepath.Join(targetDir, entry.Name())
 				if _, active := activeDirs[filepath.Clean(fullPath)]; active {
 					if total > 0 {
 						report(10 + float64(i+1)/float64(total)*90)

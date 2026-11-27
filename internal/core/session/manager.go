@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,6 +21,7 @@ const (
 	defaultPlayedThreshold     = 0.90
 	progressPersistWindow      = 15 * time.Second
 	maxSessions                = 2048
+	maxPlayQueueItems          = 1000
 	sessionStaleTTL            = 24 * time.Hour
 	defaultActivityLogCooldown = 30 * time.Second
 	maxActivityLogThrottleKeys = 4096
@@ -27,6 +29,12 @@ const (
 
 // ErrItemAccessDenied is returned when a playback report references a missing or unauthorized item.
 var ErrItemAccessDenied = errors.New("session: item not found or access denied")
+
+// QueueItem represents an entry in a client's reported NowPlayingQueue.
+type QueueItem struct {
+	Id             string `json:"Id"`
+	PlaylistItemId string `json:"PlaylistItemId,omitempty"`
+}
 
 type PlaybackStartRequest struct {
 	ItemId              string           `json:"ItemId"`
@@ -42,22 +50,26 @@ type PlaybackStartRequest struct {
 	AudioStreamIndex    *int             `json:"AudioStreamIndex"`
 	SubtitleStreamIndex *int             `json:"SubtitleStreamIndex"`
 	RepeatMode          string           `json:"RepeatMode"`
+	QueueItemIds        []string         `json:"QueueItemIds,omitempty"`
+	NowPlayingQueue     []QueueItem      `json:"NowPlayingQueue,omitempty"`
 }
 
 type PlaybackProgressRequest struct {
-	ItemId              string `json:"ItemId"`
-	MediaSourceId       string `json:"MediaSourceId"`
-	PlaySessionId       string `json:"PlaySessionId"`
-	PlayMethod          string `json:"PlayMethod"`
-	PositionTicks       int64  `json:"PositionTicks"`
-	CanSeek             bool   `json:"CanSeek"`
-	IsPaused            bool   `json:"IsPaused"`
-	IsMuted             bool   `json:"IsMuted"`
-	VolumeLevel         int    `json:"VolumeLevel"`
-	AudioStreamIndex    *int   `json:"AudioStreamIndex"`
-	SubtitleStreamIndex *int   `json:"SubtitleStreamIndex"`
-	RepeatMode          string `json:"RepeatMode"`
-	EventName           string `json:"EventName"`
+	ItemId              string      `json:"ItemId"`
+	MediaSourceId       string      `json:"MediaSourceId"`
+	PlaySessionId       string      `json:"PlaySessionId"`
+	PlayMethod          string      `json:"PlayMethod"`
+	PositionTicks       int64       `json:"PositionTicks"`
+	CanSeek             bool        `json:"CanSeek"`
+	IsPaused            bool        `json:"IsPaused"`
+	IsMuted             bool        `json:"IsMuted"`
+	VolumeLevel         int         `json:"VolumeLevel"`
+	AudioStreamIndex    *int        `json:"AudioStreamIndex"`
+	SubtitleStreamIndex *int        `json:"SubtitleStreamIndex"`
+	RepeatMode          string      `json:"RepeatMode"`
+	EventName           string      `json:"EventName"`
+	QueueItemIds        []string    `json:"QueueItemIds,omitempty"`
+	NowPlayingQueue     []QueueItem `json:"NowPlayingQueue,omitempty"`
 }
 
 type PlaybackStoppedRequest struct {
@@ -109,6 +121,7 @@ type sessionEntry struct {
 	lastPersistAt   time.Time
 	lastPausedState bool
 	playSessionID   string
+	playQueueIDs    []string
 }
 
 type activityThrottleKey struct {
@@ -161,6 +174,36 @@ func (m *Manager) SetItemAccessChecker(fn func(ctx context.Context, user *sqlite
 	m.mu.Unlock()
 }
 
+func extractNormalizedQueueIDs(queueItemIDs []string, nowPlayingQueue []QueueItem) []string {
+	total := len(queueItemIDs) + len(nowPlayingQueue)
+	if total == 0 {
+		return nil
+	}
+	out := make([]string, 0, total)
+	seen := make(map[string]struct{}, total)
+	add := func(raw string) {
+		if len(out) >= maxPlayQueueItems {
+			return
+		}
+		norm := guid.Normalize(raw)
+		if norm == "" {
+			return
+		}
+		if _, dup := seen[norm]; dup {
+			return
+		}
+		seen[norm] = struct{}{}
+		out = append(out, norm)
+	}
+	for _, id := range queueItemIDs {
+		add(id)
+	}
+	for _, qi := range nowPlayingQueue {
+		add(qi.Id)
+	}
+	return out
+}
+
 func (m *Manager) checkItemAccess(ctx context.Context, user *sqlite.UserRecord, itemID string) error {
 	if itemID == "" {
 		return nil
@@ -174,13 +217,6 @@ func (m *Manager) checkItemAccess(ctx context.Context, user *sqlite.UserRecord, 
 		if !checker(ctx, user, itemID) {
 			return ErrItemAccessDenied
 		}
-		if libRepo != nil {
-			rec, err := libRepo.GetItemRecordByID(ctx, itemID)
-			if err != nil || rec == nil {
-				return ErrItemAccessDenied
-			}
-		}
-		return nil
 	}
 	if libRepo != nil {
 		rec, err := libRepo.GetItemRecordByID(ctx, itemID)
@@ -350,12 +386,27 @@ func (m *Manager) UpdateCapabilities(user *sqlite.UserRecord, client auth.Client
 	m.publish(context.Background(), eventbus.EventSessionUpdated, nil)
 }
 
-func userCanAccessLibrary(user *sqlite.UserRecord, libraryID string) bool {
-	if user == nil || user.IsAdmin || user.Policy.IsAdministrator || user.Policy.EnableAllFolders {
+// UserCanAccessLibrary checks whether user may access libraryID, enforcing both
+// folder ACLs and LiveTV DVR library restrictions (!EnableLiveTvAccess denies
+// libraries with CollectionType=="livetv" even when EnableAllFolders is true).
+func UserCanAccessLibrary(ctx context.Context, libRepo *sqlite.LibraryRepo, user *sqlite.UserRecord, libraryID string) bool {
+	if user == nil || user.IsAdmin || user.Policy.IsAdministrator {
 		return true
 	}
 	normLib := guid.Normalize(libraryID)
 	if normLib == "" || normLib == "collections" || normLib == "playlists" {
+		return true
+	}
+	if !user.Policy.EnableLiveTvAccess && libRepo != nil {
+		lib, err := libRepo.GetLibrary(ctx, libraryID)
+		if (err != nil || lib == nil) && normLib != libraryID {
+			lib, err = libRepo.GetLibrary(ctx, normLib)
+		}
+		if err == nil && lib != nil && strings.EqualFold(lib.CollectionType, "livetv") {
+			return false
+		}
+	}
+	if user.Policy.EnableAllFolders {
 		return true
 	}
 	for _, allowed := range user.Policy.EnabledFolders {
@@ -381,10 +432,10 @@ func (m *Manager) hydrateNowPlayingItem(ctx context.Context, user *sqlite.UserRe
 		return
 	}
 	if user != nil && !user.IsAdmin && !user.Policy.IsAdministrator {
-		if !userCanAccessLibrary(user, rec.LibraryID) {
+		if !UserCanAccessLibrary(ctx, libRepo, user, rec.LibraryID) {
 			return
 		}
-		blocked, err := libRepo.IsItemBlockedByParentalPolicy(ctx, rec, user.Policy.MaxParentalRating, user.Policy.BlockedTags)
+		blocked, err := libRepo.IsItemBlockedByPolicy(ctx, rec, user.Policy)
 		if err != nil || blocked {
 			return
 		}
@@ -474,6 +525,11 @@ func (m *Manager) ReportPlaybackStart(ctx context.Context, user *sqlite.UserReco
 		runtimeTicks = *nowPlaying.RunTimeTicks
 	}
 
+	queueIDs := extractNormalizedQueueIDs(req.QueueItemIds, req.NowPlayingQueue)
+	if len(queueIDs) == 0 && itemID != "" {
+		queueIDs = []string{itemID}
+	}
+
 	m.mu.Lock()
 	entry := m.touchSessionLocked(user, client, now)
 	sessionID := entry.info.Id
@@ -482,6 +538,7 @@ func (m *Manager) ReportPlaybackStart(ctx context.Context, user *sqlite.UserReco
 	entry.playSessionID = req.PlaySessionId
 	entry.lastPausedState = req.IsPaused
 	entry.lastPersistAt = now
+	entry.playQueueIDs = queueIDs
 	if nowPlaying != nil {
 		entry.info.NowPlayingItem = nowPlaying
 	}
@@ -569,6 +626,7 @@ func (m *Manager) ReportPlaybackProgress(ctx context.Context, user *sqlite.UserR
 		m.hydrateNowPlayingItem(ctx, user, hydratedNowPlaying, itemID)
 	}
 	now := time.Now().UTC()
+	reportedQueue := extractNormalizedQueueIDs(req.QueueItemIds, req.NowPlayingQueue)
 
 	shouldPersist := false
 	var runtimeTicks int64
@@ -592,6 +650,11 @@ func (m *Manager) ReportPlaybackProgress(ctx context.Context, user *sqlite.UserR
 	}
 	if itemID == "" && entry.info.NowPlayingItem != nil {
 		itemID = guid.Normalize(entry.info.NowPlayingItem.Id)
+	}
+	if len(reportedQueue) > 0 {
+		entry.playQueueIDs = reportedQueue
+	} else if len(entry.playQueueIDs) == 0 && itemID != "" {
+		entry.playQueueIDs = []string{itemID}
 	}
 	if entry.info.NowPlayingItem != nil && entry.info.NowPlayingItem.RunTimeTicks != nil {
 		runtimeTicks = *entry.info.NowPlayingItem.RunTimeTicks
@@ -714,6 +777,7 @@ func (m *Manager) ReportPlaybackStopped(ctx context.Context, user *sqlite.UserRe
 		RepeatMode: "RepeatNone",
 	}
 	entry.playSessionID = ""
+	entry.playQueueIDs = nil
 	m.mu.Unlock()
 
 	// Prefer authoritative DB runtime_ticks when available instead of trusting client-supplied req.RuntimeTicks.
@@ -840,6 +904,75 @@ func (m *Manager) GetSession(sessionID string) (dto.SessionInfo, bool) {
 
 func (m *Manager) GetSessionByUserDevice(userID, deviceID string) (dto.SessionInfo, bool) {
 	return m.GetSession(auth.SessionID(userID, deviceID))
+}
+
+// SetSessionPlayQueue updates the tracked play queue item IDs for sessionID.
+// When playCommand is "PlayNext" or "PlayLast", itemIDs are merged into the existing queue;
+// otherwise the queue is replaced with itemIDs.
+func (m *Manager) SetSessionPlayQueue(sessionID string, itemIDs []string, playCommand string) bool {
+	if m == nil || sessionID == "" {
+		return false
+	}
+	normIDs := extractNormalizedQueueIDs(itemIDs, nil)
+	m.mu.Lock()
+	entry, ok := m.sessions[sessionID]
+	if !ok {
+		m.mu.Unlock()
+		return false
+	}
+	switch {
+	case strings.EqualFold(playCommand, "PlayLast"):
+		entry.playQueueIDs = extractNormalizedQueueIDs(append(append([]string(nil), entry.playQueueIDs...), normIDs...), nil)
+	case strings.EqualFold(playCommand, "PlayNext"):
+		curID := ""
+		if entry.info.NowPlayingItem != nil {
+			curID = guid.Normalize(entry.info.NowPlayingItem.Id)
+		}
+		inserted := false
+		if curID != "" && len(entry.playQueueIDs) > 0 {
+			for i, qid := range entry.playQueueIDs {
+				if qid == curID {
+					merged := make([]string, 0, len(entry.playQueueIDs)+len(normIDs))
+					merged = append(merged, entry.playQueueIDs[:i+1]...)
+					merged = append(merged, normIDs...)
+					merged = append(merged, entry.playQueueIDs[i+1:]...)
+					entry.playQueueIDs = extractNormalizedQueueIDs(merged, nil)
+					inserted = true
+					break
+				}
+			}
+		}
+		if !inserted {
+			merged := append(append([]string(nil), normIDs...), entry.playQueueIDs...)
+			entry.playQueueIDs = extractNormalizedQueueIDs(merged, nil)
+		}
+	default:
+		entry.playQueueIDs = normIDs
+	}
+	m.mu.Unlock()
+	return true
+}
+
+// GetSessionPlayQueueIDs returns the ordered normalized item IDs in sessionID's active play queue.
+func (m *Manager) GetSessionPlayQueueIDs(sessionID string) []string {
+	if m == nil || sessionID == "" {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	entry, ok := m.sessions[sessionID]
+	if !ok {
+		return nil
+	}
+	if len(entry.playQueueIDs) > 0 {
+		return append([]string(nil), entry.playQueueIDs...)
+	}
+	if entry.info.NowPlayingItem != nil && entry.info.NowPlayingItem.Id != "" {
+		if norm := guid.Normalize(entry.info.NowPlayingItem.Id); norm != "" {
+			return []string{norm}
+		}
+	}
+	return nil
 }
 
 func (m *Manager) RemoveSession(userID, deviceID string) {

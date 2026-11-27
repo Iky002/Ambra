@@ -96,18 +96,23 @@ err="$(cat "${TMP_DIR}/default_fallback.err")"
 assert_contains "$out" "SETPRIV|HOME=${TMP_DIR}/data_default_fallback|ARGS=--reuid=1000 --regid=1000 --clear-groups -- fake-ambra -data ${TMP_DIR}/data_default_fallback" "default_fallback exec"
 assert_contains "$err" "ambra entrypoint: running as uid=1000 gid=1000" "default_fallback log"
 
-# 2. PUID=0 PGID=0 -> 0:0 direct exec
+# 2. PUID=0 PGID=0 -> 0:0 direct exec with HOME=$DATA_DIR
 run_case puid_root MOCK_ID_U=0 MOCK_ID_G=0 MOCK_ID_GROUPS=0 PUID=0 PGID=0
 out="$(cat "${TMP_DIR}/puid_root.out")"
 err="$(cat "${TMP_DIR}/puid_root.err")"
-assert_contains "$out" "DIRECT|" "puid_root exec"
+assert_contains "$out" "DIRECT|HOME=${TMP_DIR}/data_puid_root|ARGS=-data ${TMP_DIR}/data_puid_root" "puid_root exec"
 assert_contains "$err" "ambra entrypoint: running as uid=0 gid=0" "puid_root log"
 
-# 3. UID=0 GID=0 (without PUID/PGID) -> 0:0 direct exec
+# 2b. PUID=0 PGID=0 with GIDLIST -> setpriv 0:0 with HOME=$DATA_DIR
+run_case puid_root_gidlist MOCK_ID_U=0 MOCK_ID_G=0 MOCK_ID_GROUPS=0 PUID=0 PGID=0 GIDLIST=44
+out="$(cat "${TMP_DIR}/puid_root_gidlist.out")"
+assert_contains "$out" "SETPRIV|HOME=${TMP_DIR}/data_puid_root_gidlist|ARGS=--reuid=0 --regid=0 --groups=0,44 -- fake-ambra -data ${TMP_DIR}/data_puid_root_gidlist" "puid_root_gidlist exec"
+
+# 3. UID=0 GID=0 (without PUID/PGID) -> 0:0 direct exec with HOME=$DATA_DIR
 run_case env_uid_root MOCK_ID_U=0 MOCK_ID_G=0 MOCK_ID_GROUPS=0 UID=0 GID=0
 out="$(cat "${TMP_DIR}/env_uid_root.out")"
 err="$(cat "${TMP_DIR}/env_uid_root.err")"
-assert_contains "$out" "DIRECT|" "env_uid_root exec"
+assert_contains "$out" "DIRECT|HOME=${TMP_DIR}/data_env_uid_root|ARGS=-data ${TMP_DIR}/data_env_uid_root" "env_uid_root exec"
 assert_contains "$err" "ambra entrypoint: running as uid=0 gid=0" "env_uid_root log"
 
 # 4. PUID=1026 PGID=100 GIDLIST=44,109 -> 1026:100 with supplementary groups 44,109

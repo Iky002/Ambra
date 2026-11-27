@@ -163,6 +163,8 @@ fi
 
 echo "ambra entrypoint: running as uid=${TARGET_UID} gid=${TARGET_GID} (override via PUID/PGID or UID/GID)" >&2
 
+export HOME="$DATA_DIR"
+
 # Run directly as root when PUID=0 and PGID=0 (ideal for mixed-permission media mounts)
 if [ "$TARGET_UID" = "0" ] && [ "$TARGET_GID" = "0" ]; then
   if [ -n "${GIDLIST:-}" ] && [ -n "$SUPP_GROUPS" ]; then
@@ -170,8 +172,6 @@ if [ "$TARGET_UID" = "0" ] && [ "$TARGET_GID" = "0" ]; then
   fi
   exec "$@"
 fi
-
-export HOME="$DATA_DIR"
 
 if [ -n "$SUPP_GROUPS" ]; then
   exec setpriv --reuid="$TARGET_UID" --regid="$TARGET_GID" --groups="$SUPP_GROUPS" -- "$@"

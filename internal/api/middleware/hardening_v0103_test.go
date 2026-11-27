@@ -124,16 +124,25 @@ func TestCORSAndCORSWithOriginsCredentialsPolicy(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	// Default CORS reflects Origin WITHOUT Access-Control-Allow-Credentials.
+	// Default CORS rejects cross-origin Origin and allows same-origin WITHOUT Access-Control-Allow-Credentials.
 	req := httptest.NewRequest(http.MethodGet, "/ping", nil)
+	req.Host = "ambra.local:8096"
 	req.Header.Set("Origin", "https://evil.example")
 	rec := httptest.NewRecorder()
 	CORS(okHandler).ServeHTTP(rec, req)
-	if rec.Header().Get("Access-Control-Allow-Origin") != "https://evil.example" {
-		t.Fatalf("expected reflected origin, got %q", rec.Header().Get("Access-Control-Allow-Origin"))
+	if rec.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("default CORS must NOT reflect cross-origin, got %q", rec.Header().Get("Access-Control-Allow-Origin"))
 	}
-	if rec.Header().Get("Access-Control-Allow-Credentials") != "" {
-		t.Fatalf("default CORS must NOT set Allow-Credentials, got %q", rec.Header().Get("Access-Control-Allow-Credentials"))
+	reqSame := httptest.NewRequest(http.MethodGet, "/ping", nil)
+	reqSame.Host = "ambra.local:8096"
+	reqSame.Header.Set("Origin", "http://ambra.local:8096")
+	recSame := httptest.NewRecorder()
+	CORS(okHandler).ServeHTTP(recSame, reqSame)
+	if recSame.Header().Get("Access-Control-Allow-Origin") != "http://ambra.local:8096" {
+		t.Fatalf("expected same-origin allowed, got %q", recSame.Header().Get("Access-Control-Allow-Origin"))
+	}
+	if recSame.Header().Get("Access-Control-Allow-Credentials") != "" {
+		t.Fatalf("default same-origin CORS must NOT set Allow-Credentials, got %q", recSame.Header().Get("Access-Control-Allow-Credentials"))
 	}
 
 	// Explicit allowlist sets Allow-Credentials ONLY for allowed origins.

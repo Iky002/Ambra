@@ -59,13 +59,13 @@ func TestV0109Audit_RemoteAccessEnforcementAndCacheControl(t *testing.T) {
 		t.Fatalf("expected 401 for wrong password on remote-disabled user, got %d", recWrong.Code)
 	}
 
-	// 2. [M-11] Correct password from public IP -> 403 Forbidden AND no token minted
+	// 2. [M-02] Correct password from public IP for per-user remote-disabled user -> uniform 401 (no password oracle) AND no token minted
 	reqRemote := httptest.NewRequest(http.MethodPost, "/Users/AuthenticateByName", bytes.NewBufferString(`{"Username":"lanonly","Pw":"secret123"}`))
 	reqRemote.RemoteAddr = "203.0.113.10:12345"
 	recRemote := httptest.NewRecorder()
 	r.ServeHTTP(recRemote, reqRemote)
-	if recRemote.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 for remote-disabled user from public IP, got %d body=%s", recRemote.Code, recRemote.Body.String())
+	if recRemote.Code != http.StatusUnauthorized {
+		t.Fatalf("expected uniform 401 for remote-disabled user from public IP, got %d body=%s", recRemote.Code, recRemote.Body.String())
 	}
 	if cc := recRemote.Header().Get("Cache-Control"); cc != "private, no-store" {
 		t.Fatalf("expected Cache-Control=private, no-store, got %q", cc)

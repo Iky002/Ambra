@@ -29,10 +29,12 @@ import (
 )
 
 const (
-	authByNameRateLimit     = 30
-	authByNameUserRateLimit = 30
-	authByNameRateWindow    = time.Minute
-	authRateMaxBuckets      = 4096
+	authByNameRateLimit          = 30
+	authByNameUserRateLimit      = 30
+	authByNameRateWindow         = time.Minute
+	authByNameLoopbackRateLimit  = 60
+	authByNameLoopbackRateWindow = 5 * time.Minute
+	authRateMaxBuckets           = 4096
 )
 
 type Handler struct {
@@ -43,9 +45,10 @@ type Handler struct {
 	wsHub      *ws.Hub
 	cfg        *config.Config
 
-	mu            sync.Mutex
-	authRates     map[string][]time.Time
-	onUserDeleted func(ctx context.Context, userID string)
+	mu                sync.Mutex
+	authRates         map[string][]time.Time
+	loopbackAuthRates map[string][]time.Time
+	onUserDeleted     func(ctx context.Context, userID string)
 }
 
 func NewHandler(
@@ -56,12 +59,13 @@ func NewHandler(
 	cfg *config.Config,
 ) *Handler {
 	return &Handler{
-		authSvc:    authSvc,
-		userRepo:   userRepo,
-		sessionMgr: sessionMgr,
-		wsHub:      wsHub,
-		cfg:        cfg,
-		authRates:  make(map[string][]time.Time),
+		authSvc:           authSvc,
+		userRepo:          userRepo,
+		sessionMgr:        sessionMgr,
+		wsHub:             wsHub,
+		cfg:               cfg,
+		authRates:         make(map[string][]time.Time),
+		loopbackAuthRates: make(map[string][]time.Time),
 	}
 }
 
@@ -151,14 +155,28 @@ func (h *Handler) checkAuthRateLimit(ip string, now time.Time) bool {
 
 func (h *Handler) isLoginRateLimited(ip, username string, now time.Time) bool {
 	ip = strings.TrimSpace(ip)
-	if ip == "" || isLoopbackClientIP(ip) {
+	if ip == "" {
 		return false
 	}
+	loopback := isLoopbackClientIP(ip)
 	key := normalizeLoginRateKey(ip, username)
 	emptyKey := normalizeLoginRateKey(ip, "")
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if loopback {
+		if h.loopbackAuthRates == nil {
+			return false
+		}
+		pruneRateBucketsLocked(h.loopbackAuthRates, now.Add(-authByNameLoopbackRateWindow))
+		if len(h.loopbackAuthRates[key]) >= authByNameLoopbackRateLimit {
+			return true
+		}
+		if username != "" && len(h.loopbackAuthRates[emptyKey]) >= authByNameLoopbackRateLimit {
+			return true
+		}
+		return false
+	}
 	if h.authRates == nil {
 		return false
 	}
@@ -174,13 +192,22 @@ func (h *Handler) isLoginRateLimited(ip, username string, now time.Time) bool {
 
 func (h *Handler) recordLoginFailure(ip, username string, now time.Time) {
 	ip = strings.TrimSpace(ip)
-	if ip == "" || isLoopbackClientIP(ip) {
+	if ip == "" {
 		return
 	}
+	loopback := isLoopbackClientIP(ip)
 	key := normalizeLoginRateKey(ip, username)
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if loopback {
+		if h.loopbackAuthRates == nil {
+			h.loopbackAuthRates = make(map[string][]time.Time)
+		}
+		pruneRateBucketsLocked(h.loopbackAuthRates, now.Add(-authByNameLoopbackRateWindow))
+		h.loopbackAuthRates[key] = append(h.loopbackAuthRates[key], now)
+		return
+	}
 	if h.authRates == nil {
 		h.authRates = make(map[string][]time.Time)
 	}
@@ -213,20 +240,10 @@ func (h *Handler) canAccessItem(ctx context.Context, ac *middleware.AuthContext,
 	if ac.User == nil {
 		return false, nil
 	}
-	if !ac.User.Policy.EnableAllFolders {
-		allowed := false
-		recLib := guid.Normalize(rec.LibraryID)
-		for _, fid := range ac.User.Policy.EnabledFolders {
-			if guid.Normalize(fid) == recLib {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			return false, nil
-		}
+	if !session.UserCanAccessLibrary(ctx, libRepo, ac.User, rec.LibraryID) {
+		return false, nil
 	}
-	blocked, err := libRepo.IsItemBlockedByParentalPolicy(ctx, rec, ac.User.Policy.MaxParentalRating, ac.User.Policy.BlockedTags)
+	blocked, err := libRepo.IsItemBlockedByPolicy(ctx, rec, ac.User.Policy)
 	if err != nil {
 		return false, err
 	}
@@ -398,6 +415,11 @@ func (h *Handler) isGlobalRemoteAccessEnabled() bool {
 
 func (h *Handler) AuthenticateByName(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "private, no-store")
+	isLocal := netutil.IsLocalOrLANRequest(r)
+	if !isLocal && !h.isGlobalRemoteAccessEnabled() {
+		httpx.Error(w, http.StatusForbidden, "Remote access is disabled on this server")
+		return
+	}
 	now := time.Now().UTC()
 	ip := netutil.ClientIP(r)
 	if h.isLoginRateLimited(ip, "", now) {
@@ -414,42 +436,22 @@ func (h *Handler) AuthenticateByName(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusTooManyRequests, "Too many authentication attempts")
 		return
 	}
-	globalRemoteAllowed := h.isGlobalRemoteAccessEnabled()
-	if h.userRepo != nil && !netutil.IsLocalOrLANRequest(r) {
+	if h.userRepo != nil && !isLocal {
 		u, lookupErr := h.userRepo.GetUserByName(r.Context(), strings.TrimSpace(req.Username))
-		if lookupErr == nil && u != nil && (!globalRemoteAllowed || !u.Policy.EnableRemoteAccess) {
-			if !verifyUserPassword(u, req.Pw, req.Password) {
-				h.recordLoginFailure(ip, req.Username, now)
-				_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
-					Name:     u.Name + " failed to log in",
-					Type:     "AuthenticationFailed",
-					UserID:   u.ID,
-					Severity: "Warning",
-				})
-				httpx.Error(w, http.StatusUnauthorized, "Invalid username or password")
-				return
+		if lookupErr == nil && u != nil && !u.Policy.EnableRemoteAccess {
+			if u.PasswordHash == "" {
+				auth.DummyPasswordWork(req.Pw)
+			} else {
+				_, _ = auth.VerifyPassword(req.Pw, u.PasswordHash)
 			}
-			if u.IsDisabled || u.Policy.IsDisabled {
-				_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
-					Name:     u.Name + " failed to log in (account disabled)",
-					Type:     "AuthenticationFailed",
-					UserID:   u.ID,
-					Severity: "Warning",
-				})
-				httpx.Error(w, http.StatusForbidden, "User account is disabled")
-				return
-			}
+			h.recordLoginFailure(ip, req.Username, now)
 			_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
 				Name:     u.Name + " failed to log in (remote access disabled)",
 				Type:     "AuthenticationFailed",
 				UserID:   u.ID,
 				Severity: "Warning",
 			})
-			if !globalRemoteAllowed {
-				httpx.Error(w, http.StatusForbidden, "Remote access is disabled on this server")
-			} else {
-				httpx.Error(w, http.StatusForbidden, "Remote access is disabled for this user")
-			}
+			httpx.Error(w, http.StatusUnauthorized, "Invalid username or password")
 			return
 		}
 	}

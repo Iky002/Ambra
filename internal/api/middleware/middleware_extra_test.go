@@ -195,13 +195,20 @@ func TestParseAuthAndSessionTouchAndNilService(t *testing.T) {
 }
 
 func TestCORSWithoutOriginAndEmbyPrefixEdgeCases(t *testing.T) {
-	// CORS without Origin sets *
+	// Default CORS without Origin does not emit wildcard; explicit "*" allowlist sets *
 	rec := httptest.NewRecorder()
 	CORS(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ping", nil))
-	if rec.Header().Get("Access-Control-Allow-Origin") != "*" {
-		t.Fatalf("expected *, got %q", rec.Header().Get("Access-Control-Allow-Origin"))
+	if rec.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("expected empty ACAO on default CORS without Origin, got %q", rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+	recWildcard := httptest.NewRecorder()
+	CORSWithOrigins([]string{"*"})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})).ServeHTTP(recWildcard, httptest.NewRequest(http.MethodGet, "/ping", nil))
+	if recWildcard.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatalf("expected * on explicit wildcard CORS, got %q", recWildcard.Header().Get("Access-Control-Allow-Origin"))
 	}
 
 	// EmbyPrefixAndCase edge cases

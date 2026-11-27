@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/api/ws"
@@ -72,6 +73,38 @@ func callerAuth(r *http.Request) (callerID string, isAdmin bool, hasAuth bool) {
 		return "", false, false
 	}
 	return guid.Normalize(ac.UserID()), ac.IsAdmin(), true
+}
+
+func (h *Handler) canAccessPartyItem(r *http.Request, explicitUserID, itemID string) bool {
+	trimmedItem := strings.TrimSpace(itemID)
+	if trimmedItem == "" {
+		return true
+	}
+	checker := h.getItemAccessChecker()
+	if checker == nil {
+		return true
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.IsAdmin() {
+			return true
+		}
+		if ac.User != nil {
+			return checker(r.Context(), ac.User, trimmedItem)
+		}
+		return false
+	}
+	uid := h.resolveUserID(r, explicitUserID)
+	if uid != "" && h.userRepo != nil {
+		u, err := h.userRepo.GetUserByID(r.Context(), uid)
+		if err != nil || u == nil {
+			return false
+		}
+		if u.IsAdmin || u.Policy.IsAdministrator {
+			return true
+		}
+		return checker(r.Context(), u, trimmedItem)
+	}
+	return true
 }
 
 func callerUserName(r *http.Request) string {
@@ -186,14 +219,24 @@ func (h *Handler) pushPartyWS(members []string, msg ws.Message) {
 func (h *Handler) handleListParties(w http.ResponseWriter, r *http.Request) {
 	callerID, isAdmin, hasAuth := callerAuth(r)
 	h.mu.RLock()
-	items := make([]Party, 0, len(h.state.Parties))
-	for _, p := range h.state.Parties {
-		if hasAuth && !isAdmin && !p.IsPublic && (callerID == "" || (guid.Normalize(p.HostUserId) != callerID && !isPartyMember(p.Members, callerID))) {
+	snapshot := make([]Party, len(h.state.Parties))
+	copy(snapshot, h.state.Parties)
+	h.mu.RUnlock()
+
+	items := make([]Party, 0, len(snapshot))
+	for _, p := range snapshot {
+		isHostOrMember := callerID != "" && (guid.Normalize(p.HostUserId) == callerID || isPartyMember(p.Members, callerID))
+		if hasAuth && !isAdmin && !p.IsPublic && !isHostOrMember {
 			continue
+		}
+		if p.State.ItemId != "" && !h.canAccessPartyItem(r, callerID, p.State.ItemId) {
+			if !isHostOrMember {
+				continue
+			}
+			p.State.ItemId = ""
 		}
 		items = append(items, sanitizePartyForCaller(p, callerID, isAdmin, hasAuth))
 	}
-	h.mu.RUnlock()
 	httpx.JSON(w, http.StatusOK, items)
 }
 
@@ -210,19 +253,26 @@ func (h *Handler) handleGetCurrentPartyInfo(w http.ResponseWriter, r *http.Reque
 	}
 
 	h.mu.RLock()
+	var found *Party
 	for i := len(h.state.Parties) - 1; i >= 0; i-- {
 		p := h.state.Parties[i]
 		if userID != "" && (guid.Normalize(p.HostUserId) == userID || isPartyMember(p.Members, userID)) {
 			san := sanitizePartyForCaller(p, callerID, isAdmin, hasAuth)
-			h.mu.RUnlock()
-			httpx.JSON(w, http.StatusOK, map[string]any{
-				"InParty": true,
-				"Party":   san,
-			})
-			return
+			found = &san
+			break
 		}
 	}
 	h.mu.RUnlock()
+	if found != nil {
+		if found.State.ItemId != "" && !h.canAccessPartyItem(r, userID, found.State.ItemId) {
+			found.State.ItemId = ""
+		}
+		httpx.JSON(w, http.StatusOK, map[string]any{
+			"InParty": true,
+			"Party":   *found,
+		})
+		return
+	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"InParty": false,
 		"Party":   nil,
@@ -235,7 +285,13 @@ func (h *Handler) HandleListPartyMessages(w http.ResponseWriter, r *http.Request
 }
 
 func (h *Handler) handleListPartyMessages(w http.ResponseWriter, r *http.Request) {
-	partyID := strings.TrimSpace(httpx.ParseQuery(r).Get("PartyId"))
+	q := httpx.ParseQuery(r)
+	partyID := strings.TrimSpace(q.Get("PartyId"))
+	startIndex := q.Int("StartIndex", 0)
+	if startIndex < 0 {
+		startIndex = 0
+	}
+	limit := q.Int("Limit", 0)
 	callerID, isAdmin, hasAuth := callerAuth(r)
 	userID := h.resolveUserID(r, "")
 	if callerID == "" {
@@ -257,18 +313,34 @@ func (h *Handler) handleListPartyMessages(w http.ResponseWriter, r *http.Request
 			httpx.Error(w, http.StatusForbidden, "only party members can view party messages")
 			return
 		}
-		msgs := append([]PartyMessage(nil), p.Messages...)
+		allMsgs := append([]PartyMessage(nil), p.Messages...)
+		total := len(allMsgs)
+		var msgs []PartyMessage
+		if startIndex >= total {
+			msgs = []PartyMessage{}
+		} else {
+			msgs = allMsgs[startIndex:]
+			if limit > 0 && len(msgs) > limit {
+				msgs = msgs[:limit]
+			}
+		}
 		if msgs == nil {
 			msgs = []PartyMessage{}
 		}
-		httpx.JSON(w, http.StatusOK, msgs)
+		httpx.JSON(w, http.StatusOK, dto.QueryResult[PartyMessage]{
+			Items:            msgs,
+			TotalRecordCount: total,
+		})
 		return
 	}
 	if partyID != "" {
 		httpx.Error(w, http.StatusNotFound, "party not found")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, []PartyMessage{})
+	httpx.JSON(w, http.StatusOK, dto.QueryResult[PartyMessage]{
+		Items:            []PartyMessage{},
+		TotalRecordCount: 0,
+	})
 }
 
 // HandlePostPartyMessage exposes POST /Parties/Messages so compatcore can delegate to it.
@@ -510,6 +582,10 @@ func (h *Handler) handleCreateParty(w http.ResponseWriter, r *http.Request) {
 	}
 	_, isAdmin, _ := callerAuth(r)
 	hostID := h.resolveUserID(r, req.HostUserId)
+	if itemID != "" && !h.canAccessPartyItem(r, hostID, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access to party item denied")
+		return
+	}
 	members := []string{}
 	if hostID != "" {
 		members = append(members, hostID)
@@ -577,18 +653,28 @@ func (h *Handler) handleGetParty(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
 	callerID, isAdmin, hasAuth := callerAuth(r)
 	h.mu.RLock()
-	defer h.mu.RUnlock()
+	var found *Party
 	for _, p := range h.state.Parties {
 		if p.Id == id {
-			if hasAuth && !isAdmin && !p.IsPublic && (callerID == "" || (guid.Normalize(p.HostUserId) != callerID && !isPartyMember(p.Members, callerID))) {
-				httpx.Error(w, http.StatusNotFound, "party not found")
-				return
-			}
-			httpx.JSON(w, http.StatusOK, sanitizePartyForCaller(p, callerID, isAdmin, hasAuth))
-			return
+			cp := p
+			found = &cp
+			break
 		}
 	}
-	httpx.Error(w, http.StatusNotFound, "party not found")
+	h.mu.RUnlock()
+	if found == nil {
+		httpx.Error(w, http.StatusNotFound, "party not found")
+		return
+	}
+	if hasAuth && !isAdmin && !found.IsPublic && (callerID == "" || (guid.Normalize(found.HostUserId) != callerID && !isPartyMember(found.Members, callerID))) {
+		httpx.Error(w, http.StatusNotFound, "party not found")
+		return
+	}
+	if found.State.ItemId != "" && !h.canAccessPartyItem(r, callerID, found.State.ItemId) {
+		httpx.Error(w, http.StatusForbidden, "access to party item denied")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, sanitizePartyForCaller(*found, callerID, isAdmin, hasAuth))
 }
 
 func (h *Handler) handleDeleteParty(w http.ResponseWriter, r *http.Request) {
@@ -692,6 +778,29 @@ func (h *Handler) handleJoinParty(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				delete(h.partyJoinFails, failKey)
+			}
+			partyItemID := p.State.ItemId
+			if partyItemID != "" {
+				h.mu.Unlock()
+				if !h.canAccessPartyItem(r, userID, partyItemID) {
+					httpx.Error(w, http.StatusForbidden, "access to party item denied")
+					return
+				}
+				h.mu.Lock()
+				// Re-find party after releasing lock for item access check.
+				foundIdx := -1
+				for j := range h.state.Parties {
+					if h.state.Parties[j].Id == id {
+						foundIdx = j
+						break
+					}
+				}
+				if foundIdx < 0 {
+					h.mu.Unlock()
+					httpx.Error(w, http.StatusNotFound, "party not found")
+					return
+				}
+				p = &h.state.Parties[foundIdx]
 			}
 			exists := false
 			for _, m := range p.Members {
@@ -848,6 +957,10 @@ func (h *Handler) handleUpdatePartyState(w http.ResponseWriter, r *http.Request)
 	actorID := h.resolveUserID(r, "")
 	if callerID == "" {
 		callerID = actorID
+	}
+	if itemID != "" && !h.canAccessPartyItem(r, callerID, itemID) {
+		httpx.Error(w, http.StatusForbidden, "access to party item denied")
+		return
 	}
 
 	h.mu.Lock()

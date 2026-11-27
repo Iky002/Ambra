@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -17,13 +18,14 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/handlers/logs"
 	"github.com/ambra-media/ambra/internal/api/handlers/system"
-	"github.com/ambra-media/ambra/internal/api/ws"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/migration"
 	"github.com/ambra-media/ambra/internal/core/rankings"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/server"
 )
+
+const sqliteRestoreMagicHeader = "SQLite format 3\x00"
 
 func main() {
 	os.Exit(run())
@@ -77,22 +79,255 @@ func run() int {
 	}
 }
 
-func applyPendingConfigAndMetadataRestore(dataDir string) {
-	if strings.TrimSpace(dataDir) == "" {
+type pendingRestoreState struct {
+	dataDir string
+
+	hasPendingDB   bool
+	dbPath         string
+	dbBakPath      string
+	hadExistingDB  bool
+	hadExistingWAL bool
+	hadExistingSHM bool
+
+	promotedCfg    bool
+	cfgPath        string
+	cfgBakPath     string
+	hadExistingCfg bool
+
+	promotedUsersMeta    bool
+	usersMetaPath        string
+	usersMetaBakPath     string
+	hadExistingUsersMeta bool
+}
+
+func (s *pendingRestoreState) commit() {
+	if s == nil {
 		return
 	}
+	if s.usersMetaBakPath != "" {
+		_ = os.RemoveAll(s.usersMetaBakPath)
+	}
+}
+
+func (s *pendingRestoreState) rollback() {
+	if s == nil {
+		return
+	}
+	if s.promotedCfg {
+		_ = os.Remove(s.cfgPath)
+		if s.hadExistingCfg {
+			_ = os.Rename(s.cfgBakPath, s.cfgPath)
+		} else {
+			_ = os.Remove(s.cfgBakPath)
+		}
+	}
+	if s.promotedUsersMeta {
+		_ = os.RemoveAll(s.usersMetaPath)
+		if s.hadExistingUsersMeta {
+			_ = os.Rename(s.usersMetaBakPath, s.usersMetaPath)
+		} else {
+			_ = os.RemoveAll(s.usersMetaBakPath)
+		}
+	}
+	if s.hasPendingDB {
+		restoreDBPath := filepath.Join(s.dataDir, "ambra.db.restore")
+		if _, err := os.Lstat(restoreDBPath); err == nil {
+			// server.New did not promote ambra.db.restore yet; discard the staged restore file.
+			_ = os.Remove(restoreDBPath)
+		} else if os.IsNotExist(err) {
+			// ambra.db.restore was promoted over ambra.db before server.New failed; restore backup.
+			_ = os.Remove(s.dbPath)
+			_ = os.Remove(s.dbPath + "-wal")
+			_ = os.Remove(s.dbPath + "-shm")
+			if s.hadExistingDB {
+				_ = os.Rename(s.dbBakPath, s.dbPath)
+			}
+			if s.hadExistingWAL {
+				_ = os.Rename(s.dbBakPath+"-wal", s.dbPath+"-wal")
+			} else {
+				_ = os.Remove(s.dbBakPath + "-wal")
+			}
+			if s.hadExistingSHM {
+				_ = os.Rename(s.dbBakPath+"-shm", s.dbPath+"-shm")
+			} else {
+				_ = os.Remove(s.dbBakPath + "-shm")
+			}
+		}
+	}
+	slog.Warn("rolled back pending backup restore after server initialization failure", "dataDir", s.dataDir)
+}
+
+func validatePendingDBRestoreFile(restoreDBPath string) (present bool, valid bool) {
+	info, err := os.Lstat(restoreDBPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, true
+		}
+		return true, false
+	}
+	if !info.Mode().IsRegular() || info.Size() <= 0 {
+		return true, false
+	}
+	f, err := os.Open(restoreDBPath)
+	if err != nil {
+		return true, false
+	}
+	defer f.Close()
+	var hdr [16]byte
+	if _, err := io.ReadFull(f, hdr[:]); err != nil {
+		return true, false
+	}
+	return true, string(hdr[:]) == sqliteRestoreMagicHeader
+}
+
+func isExecutablePathConfigKey(k string) bool {
+	switch strings.ToLower(strings.TrimSpace(k)) {
+	case "ffmpeg_path", "ffprobe_path", "ffmpegpath", "ffprobepath":
+		return true
+	default:
+		return false
+	}
+}
+
+func sanitizeRestoredConfigJSON(raw []byte, existingCfgPath string) ([]byte, bool) {
+	if !json.Valid(raw) {
+		return nil, false
+	}
+	var cfgMap map[string]any
+	if err := json.Unmarshal(raw, &cfgMap); err != nil || cfgMap == nil {
+		return nil, false
+	}
+	// Security (M-03): Strip any ffmpeg/ffprobe executable paths from restored backup config.
+	for k := range cfgMap {
+		if isExecutablePathConfigKey(k) {
+			delete(cfgMap, k)
+		}
+	}
+	if info, err := os.Lstat(existingCfgPath); err == nil && info.Mode().IsRegular() {
+		if existingRaw, rErr := os.ReadFile(existingCfgPath); rErr == nil {
+			var existingMap map[string]any
+			if json.Unmarshal(existingRaw, &existingMap) == nil && existingMap != nil {
+				var keepFFmpeg, keepFFprobe string
+				for k, v := range existingMap {
+					s, ok := v.(string)
+					if !ok || strings.TrimSpace(s) == "" {
+						continue
+					}
+					switch strings.ToLower(strings.TrimSpace(k)) {
+					case "ffmpeg_path", "ffmpegpath":
+						keepFFmpeg = s
+					case "ffprobe_path", "ffprobepath":
+						keepFFprobe = s
+					}
+				}
+				if keepFFmpeg != "" {
+					cfgMap["ffmpeg_path"] = keepFFmpeg
+				}
+				if keepFFprobe != "" {
+					cfgMap["ffprobe_path"] = keepFFprobe
+				}
+			}
+		}
+	}
+	out, err := json.MarshalIndent(cfgMap, "", "  ")
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+func writeConfigFileAtomic(targetPath string, content []byte) error {
+	dir := filepath.Dir(targetPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".ambra-restore-cfg-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(content); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, targetPath); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
+func stagePendingRestore(dataDir string) *pendingRestoreState {
+	if strings.TrimSpace(dataDir) == "" {
+		return nil
+	}
+	restoreDBPath := filepath.Join(dataDir, "ambra.db.restore")
+	hasPendingDB, dbValid := validatePendingDBRestoreFile(restoreDBPath)
+	if hasPendingDB && !dbValid {
+		slog.Warn("aborting pending configuration and metadata restore: invalid ambra.db.restore", "path", restoreDBPath)
+		return nil
+	}
+
+	st := &pendingRestoreState{dataDir: dataDir}
+	if hasPendingDB {
+		st.hasPendingDB = true
+		st.dbPath = filepath.Join(dataDir, "ambra.db")
+		st.dbBakPath = st.dbPath + ".pre-restore.bak"
+		if _, err := os.Lstat(st.dbPath); err == nil {
+			st.hadExistingDB = true
+		}
+		if _, err := os.Lstat(st.dbPath + "-wal"); err == nil {
+			st.hadExistingWAL = true
+		}
+		if _, err := os.Lstat(st.dbPath + "-shm"); err == nil {
+			st.hadExistingSHM = true
+		}
+	}
+
 	cfgDir := filepath.Join(dataDir, "config")
 	restoreCfg := filepath.Join(cfgDir, "ambra.json.restore")
 	if info, err := os.Lstat(restoreCfg); err == nil && info.Mode().IsRegular() && info.Size() > 0 && info.Size() <= (4<<20) {
-		if raw, readErr := os.ReadFile(restoreCfg); readErr == nil && json.Valid(raw) {
-			target := filepath.Join(cfgDir, "ambra.json")
-			_ = os.MkdirAll(cfgDir, 0o700)
-			if _, stErr := os.Stat(target); stErr == nil {
-				_ = os.Rename(target, target+".pre-restore.bak")
-			}
-			if renErr := os.Rename(restoreCfg, target); renErr == nil {
-				_ = os.Chmod(target, 0o600)
-				slog.Info("applied pending configuration restore", "path", target)
+		target := filepath.Join(cfgDir, "ambra.json")
+		if raw, readErr := os.ReadFile(restoreCfg); readErr == nil {
+			if sanitized, ok := sanitizeRestoredConfigJSON(raw, target); ok {
+				_ = os.MkdirAll(cfgDir, 0o700)
+				bakPath := target + ".pre-restore.bak"
+				_ = os.Remove(bakPath)
+				hadExistingCfg := false
+				if _, stErr := os.Lstat(target); stErr == nil {
+					if renErr := os.Rename(target, bakPath); renErr == nil {
+						hadExistingCfg = true
+					}
+				}
+				if wErr := writeConfigFileAtomic(target, sanitized); wErr == nil {
+					_ = os.Remove(restoreCfg)
+					st.promotedCfg = true
+					st.cfgPath = target
+					st.cfgBakPath = bakPath
+					st.hadExistingCfg = hadExistingCfg
+					slog.Info("applied pending configuration restore", "path", target)
+				} else if hadExistingCfg {
+					_ = os.Rename(bakPath, target)
+				}
+			} else {
+				_ = os.Remove(restoreCfg)
 			}
 		} else {
 			_ = os.Remove(restoreCfg)
@@ -107,16 +342,29 @@ func applyPendingConfigAndMetadataRestore(dataDir string) {
 			_ = os.MkdirAll(filepath.Join(dataDir, "metadata"), 0o755)
 			bakDir := targetUsersMeta + ".pre-restore.bak"
 			_ = os.RemoveAll(bakDir)
+			hadExistingUsers := false
 			if _, tErr := os.Lstat(targetUsersMeta); tErr == nil {
-				_ = os.Rename(targetUsersMeta, bakDir)
+				if renErr := os.Rename(targetUsersMeta, bakDir); renErr == nil {
+					hadExistingUsers = true
+				}
 			}
 			if renErr := os.Rename(stagedUsersMeta, targetUsersMeta); renErr == nil {
-				_ = os.RemoveAll(bakDir)
+				st.promotedUsersMeta = true
+				st.usersMetaPath = targetUsersMeta
+				st.usersMetaBakPath = bakDir
+				st.hadExistingUsersMeta = hadExistingUsers
 				slog.Info("applied pending user metadata restore", "path", targetUsersMeta)
+			} else if hadExistingUsers {
+				_ = os.Rename(bakDir, targetUsersMeta)
 			}
 		}
 		_ = os.RemoveAll(restoreMeta)
 	}
+
+	if !st.hasPendingDB && !st.promotedCfg && !st.promotedUsersMeta {
+		return nil
+	}
+	return st
 }
 
 func runServerInstance(
@@ -124,10 +372,13 @@ func runServerInstance(
 	dataDir, cliHTTPAddr, cliWebDir string,
 	restartCh, shutdownCh <-chan struct{},
 ) (bool, int) {
-	applyPendingConfigAndMetadataRestore(dataDir)
+	restoreState := stagePendingRestore(dataDir)
 
 	cfg, err := config.Load(dataDir)
 	if err != nil {
+		if restoreState != nil {
+			restoreState.rollback()
+		}
 		slog.Error("failed to load config", "error", err)
 		return false, 1
 	}
@@ -145,8 +396,12 @@ func runServerInstance(
 	netutil.SetLocalNetworkSubnets(snap.LocalNetworkSubnets)
 	migration.SetSelfServerIdentity(snap.HTTPAddr, snap.ServerID)
 
+	fallbackLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	logBridge := logs.NewMultiSlogHandler(os.Stdout, nil, logs.DailyLogFilePath(snap.DataDir, time.Now().UTC()))
-	defer func() { _ = logBridge.Close() }()
+	defer func() {
+		slog.SetDefault(fallbackLogger)
+		_ = logBridge.Close()
+	}()
 	slog.SetDefault(slog.New(logBridge))
 
 	bgCtx, bgCancel := context.WithCancel(context.Background())
@@ -154,8 +409,14 @@ func runServerInstance(
 
 	srv, err := server.New(bgCtx, cfg)
 	if err != nil {
+		if restoreState != nil {
+			restoreState.rollback()
+		}
 		slog.Error("failed to initialize Ambra server", "error", err)
 		return false, 1
+	}
+	if restoreState != nil {
+		restoreState.commit()
 	}
 	defer func() {
 		bgCancel()
@@ -169,9 +430,6 @@ func runServerInstance(
 		}
 	}
 
-	if srv.SSDP != nil {
-		go func() { _ = srv.SSDP.Start(bgCtx) }()
-	}
 	if srv.Rankings != nil {
 		srv.Rankings.StartPeriodicSync(bgCtx, rankings.DefaultSyncInterval)
 	}
@@ -214,14 +472,8 @@ func runServerInstance(
 	case <-restartCh:
 		shouldRestart = true
 		slog.Info("restarting Ambra Media Server...")
-		if srv.WSHub != nil {
-			srv.WSHub.Broadcast(ws.Message{MessageType: "ServerRestarting"})
-		}
 	case <-shutdownCh:
 		slog.Info("shutting down Ambra Media Server via API...")
-		if srv.WSHub != nil {
-			srv.WSHub.Broadcast(ws.Message{MessageType: "ServerShuttingDown"})
-		}
 	case <-sigCtx.Done():
 		slog.Info("shutting down Ambra Media Server...")
 	case serveErr = <-serveErrCh:

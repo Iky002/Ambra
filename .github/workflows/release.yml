@@ -105,8 +105,10 @@ jobs:
 
           # Download upstream SHA-256 manifest from pinned BtbN release once, validate its format strictly,
           # and verify every downloaded archive against it (fail-closed, no branch fallback).
+          BTBN_CHECKSUMS_RAW="${WORK}/btbn-checksums.raw.sha256"
           BTBN_CHECKSUMS="${WORK}/btbn-checksums.sha256"
-          curl -fsSL -o "${BTBN_CHECKSUMS}" "${BTBN_RELEASE_BASE}/checksums.sha256"
+          curl -fsSL -o "${BTBN_CHECKSUMS_RAW}" "${BTBN_RELEASE_BASE}/checksums.sha256"
+          tr -d '\r' < "${BTBN_CHECKSUMS_RAW}" > "${BTBN_CHECKSUMS}"
           if [ ! -s "${BTBN_CHECKSUMS}" ]; then
             echo "ERROR: empty BtbN checksums.sha256" >&2
             exit 1
@@ -115,6 +117,31 @@ jobs:
             echo "ERROR: malformed line detected in BtbN checksums.sha256 (fail-closed)" >&2
             exit 1
           fi
+          if [ "$(grep -Ec '^[0-9a-fA-F]{64}  [A-Za-z0-9._-]+$' "${BTBN_CHECKSUMS}")" -lt 1 ]; then
+            echo "ERROR: no valid SHA-256 entries found in BtbN checksums.sha256 (fail-closed)" >&2
+            exit 1
+          fi
+
+          verify_sha256_strict() {
+            local file_path="$1"
+            local expected_sha="$2"
+            local label="$3"
+            if [ -z "${expected_sha}" ] || [[ ! "${expected_sha}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+              echo "ERROR: missing or invalid expected SHA-256 for ${label}: '${expected_sha}' (fail-closed)" >&2
+              exit 1
+            fi
+            if [ -L "${file_path}" ] || [ ! -f "${file_path}" ] || [ ! -s "${file_path}" ]; then
+              echo "ERROR: missing, symlink, or empty archive ${file_path} for ${label}" >&2
+              exit 1
+            fi
+            printf '%s  %s\n' "${expected_sha}" "${file_path}" | sha256sum --strict -c -
+            local actual_sha
+            actual_sha="$(sha256sum "${file_path}" | awk '{print $1}')"
+            if [ -z "${actual_sha}" ] || [ "${actual_sha,,}" != "${expected_sha,,}" ]; then
+              echo "ERROR: SHA-256 digest mismatch for ${label}: got '${actual_sha}', want '${expected_sha}'" >&2
+              exit 1
+            fi
+          }
 
           verify_binary() {
             local bin_path="$1"
@@ -155,22 +182,26 @@ jobs:
             mkdir -p "${stage}/pkg"
 
             # Resolve exact pinned release branch archive name + SHA256 from upstream checksums.sha256.
-            # Fail closed if the exact BTBN_FFMPEG_BRANCH target is absent or ambiguous (no silent fallback).
+            # Fail closed immediately if the exact BTBN_FFMPEG_BRANCH target is missing, empty, or ambiguous.
             local branch_ver="${BTBN_FFMPEG_BRANCH#n}"
             local branch_ver_re="${branch_ver//./\\.}"
             local matches
             matches="$(grep -E "^[0-9a-fA-F]{64}  ffmpeg-${BTBN_FFMPEG_BRANCH}-[A-Za-z0-9._-]+-${arch_tag}-gpl-${branch_ver_re}\.${ext}$" "${BTBN_CHECKSUMS}" || true)"
+            if [ -z "${matches}" ]; then
+              echo "ERROR: missing ${BTBN_FFMPEG_BRANCH} archive entry for ${platform} in checksums.sha256 (fail-closed)" >&2
+              exit 1
+            fi
             local match_count
-            match_count="$(printf '%s\n' "${matches}" | sed '/^$/d' | wc -l | tr -d ' ')"
+            match_count="$(printf '%s\n' "${matches}" | grep -c '^')"
             if [ "${match_count}" != "1" ]; then
               echo "ERROR: expected exactly 1 ${BTBN_FFMPEG_BRANCH} archive entry for ${platform} in checksums.sha256, found ${match_count} (fail-closed)" >&2
               exit 1
             fi
 
             local expected_sha asset_name
-            expected_sha="$(echo "${matches}" | awk '{print $1}')"
-            asset_name="$(echo "${matches}" | awk '{print $2}')"
-            if [[ ! "${expected_sha}" =~ ^[0-9a-fA-F]{64}$ ]] || [[ ! "${asset_name}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            expected_sha="$(printf '%s\n' "${matches}" | awk '{print $1}')"
+            asset_name="$(printf '%s\n' "${matches}" | awk '{print $2}')"
+            if [ -z "${expected_sha}" ] || [ -z "${asset_name}" ] || [[ ! "${expected_sha}" =~ ^[0-9a-fA-F]{64}$ ]] || [[ ! "${asset_name}" =~ ^[A-Za-z0-9._-]+$ ]]; then
               echo "ERROR: invalid checksum manifest entry for ${platform}: ${matches}" >&2
               exit 1
             fi
@@ -188,7 +219,7 @@ jobs:
 
             echo "Downloading ${asset_name} for ${platform} (tag=${BTBN_RELEASE_TAG}, sha256=${expected_sha})..."
             curl -fsSL -o "${archive_path}" "${BTBN_RELEASE_BASE}/${asset_name}"
-            echo "${expected_sha}  ${archive_path}" | sha256sum -c -
+            verify_sha256_strict "${archive_path}" "${expected_sha}" "${platform}/${asset_name}"
 
             if [ "${is_win}" = "1" ]; then
               unzip -q "${archive_path}" -d "${stage}/extract"
@@ -233,7 +264,7 @@ jobs:
               local tool="${pair%%:*}"
               local expected_sha="${pair#*:}"
               curl -fsSL -o "${stage}/${tool}.zip" "${MACOS_FFMPEG_BASE}/${tool}.zip"
-              echo "${expected_sha}  ${stage}/${tool}.zip" | sha256sum -c -
+              verify_sha256_strict "${stage}/${tool}.zip" "${expected_sha}" "darwin-arm64/${tool}.zip"
               unzip -q "${stage}/${tool}.zip" -d "${stage}/pkg"
             done
             chmod +x "${stage}/pkg/ambra" "${stage}/pkg/ffmpeg" "${stage}/pkg/ffprobe"

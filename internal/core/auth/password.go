@@ -98,14 +98,18 @@ func VerifyPassword(password, encodedHash string) (bool, error) {
 
 var dummyTimingSalt = []byte("ambra-timing-pad")
 
-// dummyPasswordWork performs an Argon2id derivation with the same cost parameters as
-// VerifyPassword to mitigate username enumeration via response timing differences.
-func dummyPasswordWork(password string) {
+// DummyPasswordWork performs an Argon2id derivation with the same cost parameters as
+// VerifyPassword to mitigate username/policy enumeration via response timing differences.
+func DummyPasswordWork(password string) {
 	pw := password
 	if pw == "" {
 		pw = "ambra-dummy-password"
 	}
 	_ = argon2.IDKey([]byte(pw), dummyTimingSalt, argonIterations, argonMemory, argonParallelism, argonKeyLen)
+}
+
+func dummyPasswordWork(password string) {
+	DummyPasswordWork(password)
 }
 
 // GenerateToken returns a cryptographically random 32-byte hex string (64 chars).

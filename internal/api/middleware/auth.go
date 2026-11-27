@@ -231,6 +231,8 @@ func ExtractClientInfo(r *http.Request) auth.ClientInfo {
 		q := httpx.ParseQuery(r)
 		if v := strings.TrimSpace(q.Get("api_key")); v != "" {
 			info.Token = v
+		} else if v := strings.TrimSpace(q.Get("X-Emby-Token")); v != "" {
+			info.Token = v
 		}
 		if info.DeviceID == "" {
 			if v := strings.TrimSpace(q.Get("deviceId")); v != "" {
