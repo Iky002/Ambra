@@ -1394,6 +1394,11 @@ export const api = {
       method: 'DELETE',
     }),
 
+  refreshTunerHost: (id: string) =>
+    embyFetch<LiveTvTunerHostInfo>(`/emby/LiveTv/TunerHosts/${encodeURIComponent(id)}/Refresh`, {
+      method: 'POST',
+    }),
+
   getListingProviders: () =>
     embyFetch<LiveTvListingProviderInfo[]>('/emby/LiveTv/ListingProviders'),
 

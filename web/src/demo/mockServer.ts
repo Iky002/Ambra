@@ -4655,6 +4655,30 @@ export async function demoFetch<T>(
     }
   }
 
+  const refreshTunerMatch = pathname.match(/^\/emby\/LiveTv\/TunerHosts\/([^/]+)\/Refresh$/)
+  if (refreshTunerMatch && method === 'POST') {
+    requireDemoAdmin(caller)
+    const id = decodeURIComponent(refreshTunerMatch[1])
+    const host = demoTunerHosts.find((h) => h.Id === id)
+    if (!host) {
+      throw new ApiError(404, '未找到指定的 Live TV 直播源')
+    }
+    if (!host.Url || !host.Url.trim()) {
+      throw new ApiError(400, '该直播源未配置可刷新的远程地址')
+    }
+    const updated: LiveTvTunerHostInfo = {
+      ...host,
+      ImportedChannelCount: demoLiveTvChannels.length,
+    }
+    pushActivity(
+      `已刷新 Live TV 直播源「${host.FriendlyName || id}」`,
+      'LiveTvTunerRefreshed',
+      `${demoLiveTvChannels.length} channels`,
+      caller.userId,
+    )
+    return updated as T
+  }
+
   if (pathname === '/emby/LiveTv/ListingProviders') {
     requireDemoAdmin(caller)
     if (method === 'GET') {

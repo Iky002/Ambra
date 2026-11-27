@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
   CalendarDays,
@@ -61,6 +61,7 @@ export function LiveTvTab() {
   const [tunerName, setTunerName] = useState('')
   const [tunerUrl, setTunerUrl] = useState('')
   const [addingTuner, setAddingTuner] = useState(false)
+  const [refreshingTunerId, setRefreshingTunerId] = useState<string | null>(null)
   const [deletingTunerId, setDeletingTunerId] = useState<string | null>(null)
   const [confirmDeleteTuner, setConfirmDeleteTuner] = useState<LiveTvTunerHostInfo | null>(null)
 
@@ -323,6 +324,42 @@ export function LiveTvTab() {
       setDeletingTunerId(null)
     }
   }
+
+  const refreshTunerMutation = useMutation({
+    mutationFn: (host: { Id: string; FriendlyName?: string }) => api.refreshTunerHost(host.Id),
+    onMutate: (host) => {
+      setRefreshingTunerId(host.Id)
+      setFeedback(null)
+    },
+    onSuccess: async (updated, host) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['admin', 'liveTv', 'tunerHosts'] }),
+        queryClient.invalidateQueries({ queryKey: ['admin', 'liveTv', 'channels'] }),
+        queryClient.invalidateQueries({ queryKey: ['admin', 'liveTv', 'channelMappingOptions'] }),
+        queryClient.invalidateQueries({ queryKey: ['liveTvInfo'] }),
+        queryClient.invalidateQueries({ queryKey: ['liveTv', 'channels'] }),
+        queryClient.invalidateQueries({ queryKey: ['liveTv'] }),
+      ])
+      const displayName = updated?.FriendlyName || host.FriendlyName || host.Id
+      const count = updated?.ImportedChannelCount
+      setFeedback({
+        type: 'success',
+        message:
+          typeof count === 'number'
+            ? t('admin.livetv.tunerRefreshedSuccessWithCount', { name: displayName, count })
+            : t('admin.livetv.tunerRefreshedSuccess', { name: displayName }),
+      })
+    },
+    onError: (err) => {
+      setFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : t('admin.livetv.tunerRefreshFailed'),
+      })
+    },
+    onSettled: () => {
+      setRefreshingTunerId(null)
+    },
+  })
 
   const handleSaveChannelMapping = async (tunerChannelId: string) => {
     const providerChannelId = (
@@ -702,19 +739,40 @@ export function LiveTvTab() {
                   </p>
                 </div>
                 {host.Id && (
-                  <button
-                    type="button"
-                    disabled={deletingTunerId === host.Id}
-                    onClick={() => setConfirmDeleteTuner(host)}
-                    className="inline-flex items-center gap-1 rounded-lg border border-red-500/25 bg-red-500/10 px-2.5 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
-                  >
-                    {deletingTunerId === host.Id ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <Trash2 className="h-3.5 w-3.5" />
+                  <div className="flex items-center gap-2">
+                    {host.Url?.trim() && (
+                      <button
+                        type="button"
+                        data-testid={`refresh-tuner-${host.Id}`}
+                        disabled={refreshingTunerId === host.Id || deletingTunerId === host.Id}
+                        onClick={() =>
+                          refreshTunerMutation.mutate({
+                            Id: host.Id!,
+                            FriendlyName: host.FriendlyName,
+                          })
+                        }
+                        className="inline-flex items-center gap-1 rounded-lg border border-amber-500/25 bg-amber-500/10 px-2.5 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/20 disabled:opacity-50"
+                      >
+                        <RefreshCw
+                          className={`h-3.5 w-3.5 ${refreshingTunerId === host.Id ? 'animate-spin' : ''}`}
+                        />
+                        <span>{t('admin.livetv.refreshTunerBtn')}</span>
+                      </button>
                     )}
-                    <span>{t('common.delete')}</span>
-                  </button>
+                    <button
+                      type="button"
+                      disabled={deletingTunerId === host.Id || refreshingTunerId === host.Id}
+                      onClick={() => setConfirmDeleteTuner(host)}
+                      className="inline-flex items-center gap-1 rounded-lg border border-red-500/25 bg-red-500/10 px-2.5 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
+                    >
+                      {deletingTunerId === host.Id ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Trash2 className="h-3.5 w-3.5" />
+                      )}
+                      <span>{t('common.delete')}</span>
+                    </button>
+                  </div>
                 )}
               </div>
             ))}
