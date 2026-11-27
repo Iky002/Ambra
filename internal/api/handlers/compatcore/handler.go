@@ -37,6 +37,8 @@ const (
 	forgotPinsMaxEntries        = 256
 	authByIDRateLimit           = 30
 	authByIDRateWindow          = time.Minute
+	authByIDLoopbackRateLimit   = 60
+	authByIDLoopbackRateWindow  = 5 * time.Minute
 	maxRateLimitBuckets         = 4096
 	maxCameraUploadsEntries     = 500
 	maxCameraUploadBytes        = 512 << 20 // 512 MiB
@@ -76,21 +78,24 @@ type Handler struct {
 	wsHub    WSSender
 	auth     AuthFuncs
 
-	mu                sync.RWMutex
-	memKV             map[string]string
-	forgotPins        map[string]forgotPinEntry
-	forgotRates       map[string][]time.Time
-	forgotPinRates    map[string][]time.Time
-	authByIDRates     map[string][]time.Time
-	restartRequested  bool
-	shutdownRequested bool
-	onRestart         func()
-	onShutdown        func()
-	taskStopper       func(id string) bool
-	onUserDeleted     func(ctx context.Context, userID string)
-	restoreHandler    http.HandlerFunc
-	partyLeaveHandler http.HandlerFunc
-	partyMsgHandler   http.HandlerFunc
+	mu                    sync.RWMutex
+	memKV                 map[string]string
+	forgotPins            map[string]forgotPinEntry
+	forgotRates           map[string][]time.Time
+	forgotPinRates        map[string][]time.Time
+	authByIDRates         map[string][]time.Time
+	loopbackAuthByIDRates map[string][]time.Time
+	restartRequested      bool
+	shutdownRequested     bool
+	onRestart             func()
+	onShutdown            func()
+	taskStopper           func(id string) bool
+	packageCanceller      func(id string) bool
+	pluginUninstaller     func(ctx context.Context, id string) error
+	onUserDeleted         func(ctx context.Context, userID string)
+	restoreHandler        http.HandlerFunc
+	partyLeaveHandler     http.HandlerFunc
+	partyMsgHandler       http.HandlerFunc
 }
 
 // New constructs a compatcore Handler.
@@ -103,17 +108,18 @@ func New(
 	registry *plugins.Registry,
 ) *Handler {
 	return &Handler{
-		cfg:            cfg,
-		store:          store,
-		userRepo:       userRepo,
-		libRepo:        libRepo,
-		sessions:       sessions,
-		registry:       registry,
-		memKV:          make(map[string]string),
-		forgotPins:     make(map[string]forgotPinEntry),
-		forgotRates:    make(map[string][]time.Time),
-		forgotPinRates: make(map[string][]time.Time),
-		authByIDRates:  make(map[string][]time.Time),
+		cfg:                   cfg,
+		store:                 store,
+		userRepo:              userRepo,
+		libRepo:               libRepo,
+		sessions:              sessions,
+		registry:              registry,
+		memKV:                 make(map[string]string),
+		forgotPins:            make(map[string]forgotPinEntry),
+		forgotRates:           make(map[string][]time.Time),
+		forgotPinRates:        make(map[string][]time.Time),
+		authByIDRates:         make(map[string][]time.Time),
+		loopbackAuthByIDRates: make(map[string][]time.Time),
 	}
 }
 
@@ -150,6 +156,20 @@ func (h *Handler) SetLifecycleHooks(onRestart, onShutdown func()) {
 func (h *Handler) SetTaskStopper(stopFn func(id string) bool) {
 	h.mu.Lock()
 	h.taskStopper = stopFn
+	h.mu.Unlock()
+}
+
+// SetPackageCanceller wires a callback to cancel an active/queued package installation by ID.
+func (h *Handler) SetPackageCanceller(cancelFn func(id string) bool) {
+	h.mu.Lock()
+	h.packageCanceller = cancelFn
+	h.mu.Unlock()
+}
+
+// SetPluginUninstaller wires a callback to uninstall/disable a plugin by ID on POST /Plugins/{Id}/Delete and /Uninstall.
+func (h *Handler) SetPluginUninstaller(uninstallFn func(ctx context.Context, id string) error) {
+	h.mu.Lock()
+	h.pluginUninstaller = uninstallFn
 	h.mu.Unlock()
 }
 

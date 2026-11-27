@@ -180,9 +180,13 @@ func (m *Manager) ReloadEncodingOptions(ctx context.Context) {
 		}
 		if v, exists := ffMap["TranscodingTempPath"]; exists {
 			rawPath := strings.TrimSpace(anyToString(v, ""))
-			if rawPath != "" && !hasControlChars(rawPath) {
-				if abs, err := filepath.Abs(rawPath); err == nil {
-					opts.TranscodingTempPath = abs
+			if rawPath != "" {
+				dataDir := ""
+				if m.cfg != nil {
+					dataDir = m.cfg.DataDir
+				}
+				if validated, err := ValidateTranscodingTempPath(rawPath, dataDir); err == nil {
+					opts.TranscodingTempPath = validated
 				}
 			}
 		}
@@ -220,6 +224,85 @@ func (m *Manager) ReloadEncodingOptions(ctx context.Context) {
 	for _, s := range sessions {
 		s.evaluateThrottle(opts)
 	}
+}
+
+// ValidateTranscodingTempPath validates a configured transcode temp directory, rejecting relative paths,
+// control characters, root (/), OS system directories, and paths equal to or containing DataDir.
+func ValidateTranscodingTempPath(rawPath, dataDir string) (string, error) {
+	trimmed := strings.TrimSpace(rawPath)
+	if trimmed == "" {
+		return "", errors.New("transcoding temp path is empty")
+	}
+	if hasControlChars(trimmed) {
+		return "", errors.New("transcoding temp path contains forbidden control characters")
+	}
+	if !filepath.IsAbs(trimmed) {
+		return "", errors.New("transcoding temp path must be an absolute path")
+	}
+	resolved, err := resolvePathOrNearestAncestor(filepath.Clean(trimmed))
+	if err != nil {
+		return "", fmt.Errorf("resolve transcoding temp path: %w", err)
+	}
+	if isForbiddenSystemDir(resolved) {
+		return "", fmt.Errorf("transcoding temp path %q is a forbidden system directory", resolved)
+	}
+	if strings.TrimSpace(dataDir) != "" {
+		if absData, absErr := filepath.Abs(strings.TrimSpace(dataDir)); absErr == nil {
+			resolvedData, resErr := resolvePathOrNearestAncestor(filepath.Clean(absData))
+			if resErr != nil {
+				resolvedData = filepath.Clean(absData)
+			}
+			if resolved == resolvedData || strings.HasPrefix(resolvedData, resolved+string(filepath.Separator)) {
+				return "", fmt.Errorf("transcoding temp path %q overlaps server data directory", resolved)
+			}
+		}
+	}
+	return resolved, nil
+}
+
+func resolvePathOrNearestAncestor(cleanAbs string) (string, error) {
+	cur := cleanAbs
+	var tail []string
+	for {
+		if realCur, err := filepath.EvalSymlinks(cur); err == nil {
+			out := realCur
+			for i := len(tail) - 1; i >= 0; i-- {
+				out = filepath.Join(out, tail[i])
+			}
+			return filepath.Clean(out), nil
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return filepath.Clean(cleanAbs), nil
+		}
+		tail = append(tail, filepath.Base(cur))
+		cur = parent
+	}
+}
+
+func isForbiddenSystemDir(cleanResolved string) bool {
+	p := filepath.ToSlash(filepath.Clean(cleanResolved))
+	if p == "/" || p == "." {
+		return true
+	}
+	for _, sys := range []string{
+		"/etc", "/proc", "/sys", "/dev", "/boot", "/root",
+		"/bin", "/sbin", "/usr", "/lib", "/lib64",
+		"/private/etc",
+	} {
+		if p == sys || strings.HasPrefix(p, sys+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// CurrentTempDir returns the currently effective transcode base directory (honoring runtime TranscodingTempPath).
+func (m *Manager) CurrentTempDir() string {
+	if m == nil {
+		return filepath.Join(os.TempDir(), "ambra-transcode")
+	}
+	return m.effectiveTranscodeBaseDir()
 }
 
 func (m *Manager) applyEncodingOptionsToParams(p SessionParams) SessionParams {

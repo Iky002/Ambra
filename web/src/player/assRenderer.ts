@@ -32,6 +32,31 @@ export class AssJassubRenderer {
   private timeOffset = 0
   private abortController: AbortController | null = null
   private destroyed = false
+  private mountSeq = 0
+  private destroyedInstances = new WeakSet<object>()
+
+  private async safeDestroyInstance(inst: JassubInstanceWithExtras | null): Promise<void> {
+    if (!inst || this.destroyedInstances.has(inst)) return
+    this.destroyedInstances.add(inst)
+    try {
+      await inst.destroy()
+    } catch {
+      // ignore teardown errors
+    }
+  }
+
+  private async teardownActive(): Promise<void> {
+    if (this.abortController) {
+      this.abortController.abort()
+      this.abortController = null
+    }
+    this.video = null
+    if (this.instance) {
+      const inst = this.instance
+      this.instance = null
+      await this.safeDestroyInstance(inst)
+    }
+  }
 
   async mount(
     video: HTMLVideoElement,
@@ -39,8 +64,13 @@ export class AssJassubRenderer {
     subtitleUrl: string,
     options?: AssMountOptions | string[],
   ): Promise<void> {
-    await this.destroy()
+    const seq = ++this.mountSeq
     this.destroyed = false
+    await this.teardownActive()
+    if (seq !== this.mountSeq || this.destroyed) {
+      return
+    }
+
     const abortController = new AbortController()
     this.abortController = abortController
     const { signal } = abortController
@@ -51,11 +81,14 @@ export class AssJassubRenderer {
     const attachmentFonts = (opts.fonts ?? []).filter((u) => typeof u === 'string' && u.length > 0)
 
     const res = await fetch(subtitleUrl, { signal })
+    if (seq !== this.mountSeq || signal.aborted || this.destroyed) {
+      return
+    }
     if (!res.ok) {
       throw new Error(`加载 ASS/SSA 字幕失败 (${res.status})`)
     }
     const subContent = await res.text()
-    if (signal.aborted || this.destroyed) {
+    if (seq !== this.mountSeq || signal.aborted || this.destroyed) {
       return
     }
 
@@ -76,20 +109,32 @@ export class AssJassubRenderer {
       offscreenRender: false,
     }
     const instance = new JASSUB(jassubOptions) as JassubInstanceWithExtras
+    if (seq !== this.mountSeq || signal.aborted || this.destroyed) {
+      await this.safeDestroyInstance(instance)
+      return
+    }
     this.instance = instance
 
-    if (instance.ready) {
-      await instance.ready
-    }
-    if (signal.aborted || this.destroyed) {
+    try {
+      if (instance.ready) {
+        await instance.ready
+      }
+    } catch (err) {
       if (this.instance === instance) {
         this.instance = null
       }
-      try {
-        await instance.destroy()
-      } catch {
-        // ignore teardown errors
+      await this.safeDestroyInstance(instance)
+      if (seq === this.mountSeq && !signal.aborted && !this.destroyed) {
+        throw err
       }
+      return
+    }
+
+    if (seq !== this.mountSeq || signal.aborted || this.destroyed) {
+      if (this.instance === instance) {
+        this.instance = null
+      }
+      await this.safeDestroyInstance(instance)
     }
   }
 
@@ -122,21 +167,9 @@ export class AssJassubRenderer {
   }
 
   async destroy(): Promise<void> {
+    this.mountSeq += 1
     this.destroyed = true
-    if (this.abortController) {
-      this.abortController.abort()
-      this.abortController = null
-    }
-    this.video = null
-    if (this.instance) {
-      const inst = this.instance
-      this.instance = null
-      try {
-        await inst.destroy()
-      } catch {
-        // ignore teardown errors
-      }
-    }
+    await this.teardownActive()
   }
 }
 

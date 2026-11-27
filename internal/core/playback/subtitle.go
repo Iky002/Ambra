@@ -54,9 +54,56 @@ var (
 	reASSTags = regexp.MustCompile(`\{[^}]*\}`)
 )
 
+const vttHLSTimestampMapLine = "X-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000"
+
+// InjectVTTTimestampMap ensures a WebVTT payload includes the RFC 8216 X-TIMESTAMP-MAP header
+// immediately after the WEBVTT signature line for HLS subtitle synchronization.
+func InjectVTTTimestampMap(vtt []byte) []byte {
+	text := string(vtt)
+	hasBOM := strings.HasPrefix(text, "\xef\xbb\xbf")
+	trimmed := strings.TrimPrefix(text, "\xef\xbb\xbf")
+	normalized := strings.ReplaceAll(trimmed, "\r\n", "\n")
+	head := normalized
+	if len(head) > 512 {
+		head = head[:512]
+	}
+	if strings.Contains(head, "X-TIMESTAMP-MAP") {
+		return vtt
+	}
+	var out strings.Builder
+	if hasBOM {
+		out.WriteString("\xef\xbb\xbf")
+	}
+	if idx := strings.IndexByte(normalized, '\n'); idx >= 0 && strings.HasPrefix(strings.TrimSpace(normalized[:idx]), "WEBVTT") {
+		out.WriteString(normalized[:idx])
+		out.WriteByte('\n')
+		out.WriteString(vttHLSTimestampMapLine)
+		out.WriteString(normalized[idx:])
+		return []byte(out.String())
+	}
+	if strings.HasPrefix(strings.TrimSpace(normalized), "WEBVTT") {
+		out.WriteString(normalized)
+		out.WriteByte('\n')
+		out.WriteString(vttHLSTimestampMapLine)
+		out.WriteString("\n\n")
+		return []byte(out.String())
+	}
+	out.WriteString("WEBVTT\n")
+	out.WriteString(vttHLSTimestampMapLine)
+	out.WriteString("\n\n")
+	out.WriteString(normalized)
+	return []byte(out.String())
+}
+
 // ServeSubtitle loads a subtitle file from disk and converts it on the fly if targetFormat differs.
 // Supports passthrough (.ass/.ssa/.sup/.srt/.vtt), SRT/ASS -> WebVTT, and Emby .js JSON.
 func ServeSubtitle(filePath, targetFormat string, startPositionTicks int64) (string, []byte, error) {
+	return ServeSubtitleWithVTTTimeMap(filePath, targetFormat, startPositionTicks, false)
+}
+
+// ServeSubtitleWithVTTTimeMap loads and converts a subtitle file, optionally injecting
+// X-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000 when serving WebVTT for HLS playback.
+func ServeSubtitleWithVTTTimeMap(filePath, targetFormat string, startPositionTicks int64, addVttTimeMap bool) (string, []byte, error) {
 	raw, err := readLimitedSubtitleFile(filePath)
 	if err != nil {
 		return "", nil, err
@@ -70,6 +117,9 @@ func ServeSubtitle(filePath, targetFormat string, startPositionTicks int64) (str
 
 	// Passthrough when source and target formats match (and no time offset requested)
 	if dst == srcExt && startPositionTicks == 0 {
+		if addVttTimeMap && (dst == "vtt" || dst == "webvtt") {
+			return subtitleContentType(dst), InjectVTTTimestampMap(raw), nil
+		}
 		return subtitleContentType(dst), raw, nil
 	}
 	// Binary PGS (.sup) is always served verbatim
@@ -104,7 +154,11 @@ func ServeSubtitle(filePath, targetFormat string, startPositionTicks int64) (str
 
 	switch dst {
 	case "vtt", "webvtt":
-		return "text/vtt; charset=utf-8", []byte(renderWebVTT(events)), nil
+		rendered := []byte(renderWebVTT(events))
+		if addVttTimeMap {
+			rendered = InjectVTTTimestampMap(rendered)
+		}
+		return "text/vtt; charset=utf-8", rendered, nil
 	case "srt", "subrip":
 		return "application/x-subrip; charset=utf-8", []byte(renderSRT(events)), nil
 	case "js", "json":

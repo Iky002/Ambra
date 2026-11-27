@@ -154,8 +154,8 @@ func TestCollectionsAndPlaylistsRBACAndTypeSafety(t *testing.T) {
 	}
 
 	// 8. Alice can modify and delete her own Playlist -> 204
-	if rec := doReq(aliceAuth.AccessToken, http.MethodPost, fmt.Sprintf("/Playlists/%s/Items?Ids=%s", pl.Id, movie.ID)); rec.Code != http.StatusNoContent {
-		t.Fatalf("expected 204 for alice adding to own playlist, got %d", rec.Code)
+	if rec := doReq(aliceAuth.AccessToken, http.MethodPost, fmt.Sprintf("/Playlists/%s/Items?Ids=%s", pl.Id, movie.ID)); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for alice adding to own playlist, got %d", rec.Code)
 	}
 	if rec := doReq(aliceAuth.AccessToken, http.MethodDelete, fmt.Sprintf("/Playlists/%s", pl.Id)); rec.Code != http.StatusNoContent {
 		t.Fatalf("expected 204 for alice deleting own playlist, got %d", rec.Code)

@@ -298,25 +298,83 @@ describe('wasmRemuxer - H-07 完整性校验、HTML/404 快速失败与 VFS 泄�
     internal.ffmpeg = fakeFfmpeg
     internal.loaded = true
 
-    // 1) 非零退出码 -> 必须清理 input.mkv 与 output.mp4
+    // 1) 非零退出码 -> 必须清理独立 input_<jobId>.mkv 与 output_<jobId>.mp4
     await expect(
       remuxer.remuxToMP4('/emby/Videos/fail-1/stream', undefined, { container: 'mkv' }),
     ).rejects.toSatisfy(
       (err: unknown) => err instanceof WasmRemuxFallbackError && err.reason === 'exec_failed',
     )
-    expect(deleteFileSpy).toHaveBeenCalledWith('input.mkv')
-    expect(deleteFileSpy).toHaveBeenCalledWith('output.mp4')
+    expect(deleteFileSpy).toHaveBeenCalledWith(expect.stringMatching(/^input_\d+\.mkv$/))
+    expect(deleteFileSpy).toHaveBeenCalledWith(expect.stringMatching(/^output_\d+\.mp4$/))
 
     deleteFileSpy.mockClear()
 
-    // 2) exec 抛错 -> 依然清理 input.ts 与 output.mp4
+    // 2) exec 抛错 -> 依然清理独立 input_<jobId>.ts 与 output_<jobId>.mp4
     await expect(
       remuxer.remuxToMP4('/emby/Videos/fail-2/stream', undefined, { container: 'ts' }),
     ).rejects.toSatisfy(
       (err: unknown) => err instanceof WasmRemuxFallbackError && err.reason === 'exec_failed',
     )
-    expect(deleteFileSpy).toHaveBeenCalledWith('input.ts')
-    expect(deleteFileSpy).toHaveBeenCalledWith('output.mp4')
+    expect(deleteFileSpy).toHaveBeenCalledWith(expect.stringMatching(/^input_\d+\.ts$/))
+    expect(deleteFileSpy).toHaveBeenCalledWith(expect.stringMatching(/^output_\d+\.mp4$/))
+
+    remuxer.dispose()
+  })
+
+  it('[L-11] 并发调用 remuxToMP4 时通过异步互斥锁串行执行并使用隔离的 MEMFS 文件名', async () => {
+    const events: string[] = []
+    const writtenFiles: string[] = []
+    const deletedFiles: string[] = []
+    const fakeFfmpeg = {
+      on: vi.fn(),
+      off: vi.fn(),
+      writeFile: vi.fn().mockImplementation(async (name: string) => {
+        writtenFiles.push(name)
+        events.push(`write:${name}`)
+      }),
+      exec: vi.fn().mockImplementation(async (args: string[]) => {
+        const inFile = args[1]
+        events.push(`exec-start:${inFile}`)
+        await new Promise((r) => setTimeout(r, 15))
+        events.push(`exec-end:${inFile}`)
+        return 0
+      }),
+      readFile: vi.fn().mockResolvedValue(new Uint8Array([0x00, 0x00, 0x00, 0x18])),
+      deleteFile: vi.fn().mockImplementation(async (name: string) => {
+        deletedFiles.push(name)
+      }),
+      terminate: vi.fn(),
+    }
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(new Uint8Array([1, 2, 3, 4]), {
+        status: 200,
+        headers: { 'content-length': '4' },
+      }),
+    )
+    vi.spyOn(URL, 'createObjectURL').mockImplementation(() => `blob:test-${Math.random()}`)
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+
+    const remuxer = new WasmRemuxer()
+    const internal = remuxer as unknown as { ffmpeg: unknown; loaded: boolean }
+    internal.ffmpeg = fakeFfmpeg
+    internal.loaded = true
+
+    const [res1, res2] = await Promise.all([
+      remuxer.remuxToMP4('/emby/Videos/job-1/stream', undefined, { container: 'mkv' }),
+      remuxer.remuxToMP4('/emby/Videos/job-2/stream', undefined, { container: 'mkv' }),
+    ])
+
+    expect(res1.url).toContain('blob:test-')
+    expect(res2.url).toContain('blob:test-')
+    expect(writtenFiles).toHaveLength(2)
+    expect(writtenFiles[0]).not.toBe(writtenFiles[1])
+    // 第一个任务必须完整 exec-end 后第二个任务才开始 write
+    const firstEndIdx = events.findIndex((e) => e.startsWith('exec-end:'))
+    const secondWriteIdx = events.findIndex((e, idx) => idx > 0 && e.startsWith('write:'))
+    expect(firstEndIdx).toBeGreaterThanOrEqual(0)
+    expect(secondWriteIdx).toBeGreaterThan(firstEndIdx)
+    expect(deletedFiles).toHaveLength(4)
 
     remuxer.dispose()
   })

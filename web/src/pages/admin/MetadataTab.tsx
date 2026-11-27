@@ -22,7 +22,7 @@ import {
   Tv,
 } from 'lucide-react'
 import { Link } from 'react-router-dom'
-import { api, getFallbackImageUrl, getImageUrl } from '../../api/client'
+import { api, embyFetch, getFallbackImageUrl, getImageUrl } from '../../api/client'
 import type { BaseItemDto } from '../../api/types'
 import { IdentifyModal } from '../../components/media/IdentifyModal'
 import { ImageManagerModal } from '../../components/media/ImageManagerModal'
@@ -30,7 +30,13 @@ import { MetadataEditorModal } from '../../components/media/MetadataEditorModal'
 import { QueryErrorState } from '../../components/QueryErrorState'
 import { useAuth } from '../../context/AuthContext'
 import { useI18n } from '../../i18n/I18nContext'
-import { AdminModal, FeedbackBanner, formatDateTime, formatRelativeTime } from './adminUtils'
+import {
+  AdminModal,
+  adminLabel,
+  FeedbackBanner,
+  formatDateTime,
+  formatRelativeTime,
+} from './adminUtils'
 
 type TypeFilter = 'ALL' | 'Movie' | 'Series'
 
@@ -64,7 +70,7 @@ function buildPageNumbers(current: number, totalPages: number): Array<number | '
 }
 
 export function MetadataTab() {
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const { auth } = useAuth()
   const queryClient = useQueryClient()
   const userId = auth!.userId
@@ -286,6 +292,24 @@ export function MetadataTab() {
       setWritingNfoId(null)
     }
   }
+
+  const {
+    data: deleteInfo,
+    isLoading: deleteInfoLoading,
+    isError: deleteInfoError,
+  } = useQuery({
+    queryKey: ['admin-item-delete-info', deletingItem?.Id],
+    queryFn: () =>
+      embyFetch<{ Paths?: string[] }>(
+        `/emby/Items/${encodeURIComponent(deletingItem!.Id)}/DeleteInfo`,
+      ),
+    enabled: Boolean(deletingItem?.Id),
+  })
+
+  const deleteInfoPaths = useMemo(() => {
+    if (!Array.isArray(deleteInfo?.Paths)) return []
+    return deleteInfo.Paths.map((p) => (typeof p === 'string' ? p.trim() : '')).filter(Boolean)
+  }, [deleteInfo])
 
   const deleteMutation = useMutation({
     mutationFn: (itemId: string) => api.deleteItem(itemId),
@@ -922,26 +946,136 @@ export function MetadataTab() {
         open={Boolean(deletingItem)}
         title={t('admin.metadata.deleteModalTitle')}
         subtitle={t('admin.metadata.deleteModalSubtitle')}
-        maxWidthClass="max-w-md"
-        onClose={() => setDeletingItem(null)}
+        maxWidthClass="max-w-lg"
+        onClose={() => {
+          if (!deleteMutation.isPending) setDeletingItem(null)
+        }}
       >
-        <div className="space-y-5">
-          <div className="flex items-start gap-3 rounded-xl border border-red-500/25 bg-red-500/10 p-4 text-sm text-red-200">
+        <div className="space-y-4">
+          <div
+            role="alert"
+            data-testid="metadata-physical-delete-warning"
+            className="flex items-start gap-3 rounded-xl border border-red-500/40 bg-red-500/15 p-4 text-sm text-red-100"
+          >
             <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-red-400" />
-            <div>
-              <p className="font-semibold">
-                {t('admin.metadata.deleteConfirmTitle', { name: deletingItem?.Name || '' })}
+            <div className="min-w-0 space-y-1.5">
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="font-semibold text-red-100">
+                  {t('admin.metadata.deleteConfirmTitle', { name: deletingItem?.Name || '' })}
+                </p>
+                <span className="rounded bg-red-600/35 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-red-200 ring-1 ring-red-400/40">
+                  {adminLabel(
+                    t,
+                    locale,
+                    'admin.metadata.deletePhysicalBadge',
+                    '永久磁盘删除 · 不可撤销',
+                    'Permanent Disk Deletion · Cannot Be Undone',
+                  )}
+                </span>
+              </div>
+              <p className="text-xs leading-relaxed text-red-100/90">
+                {adminLabel(
+                  t,
+                  locale,
+                  'admin.metadata.deletePhysicalWarnDesc',
+                  '高危操作：确认后将从磁盘永久物理删除原始媒体文件、关联的外挂字幕 / NFO / 海报剧照以及数据库索引记录（若删除剧集 Series 或分季 Season，将递归删除磁盘上所有分集视频文件），此操作不可撤销！',
+                  'DANGER: Confirming will permanently delete the original media file(s) from disk, sidecar subtitles/NFO/artwork, and database records (for a Series or Season, ALL episode video files on disk will be recursively deleted). This action CANNOT be undone!',
+                )}
               </p>
-              <p className="mt-1 text-xs leading-relaxed text-red-200/80">
-                {t('admin.metadata.deleteConfirmDesc')}
-              </p>
+              {(deletingItem?.Type === 'Series' || deletingItem?.Type === 'Season') && (
+                <p className="rounded-lg border border-red-400/30 bg-red-950/50 px-2.5 py-1.5 text-[11px] font-medium text-red-200">
+                  {adminLabel(
+                    t,
+                    locale,
+                    'admin.metadata.deleteSeriesRecursiveWarn',
+                    '当前所选为整部剧集或分季，确认后其下属全部剧集视频文件均会从磁盘永久删除！',
+                    'Selected item is a Series or Season: all child episode video files on disk will be recursively deleted!',
+                  )}
+                </p>
+              )}
             </div>
           </div>
+
+          <div
+            data-testid="delete-info-paths"
+            className="rounded-xl border border-white/10 bg-black/40 p-3.5 text-xs"
+          >
+            {deleteInfoLoading ? (
+              <div className="flex items-center gap-2 py-2 text-zinc-400">
+                <Loader2 className="h-4 w-4 animate-spin text-amber-400" />
+                <span>
+                  {adminLabel(
+                    t,
+                    locale,
+                    'admin.metadata.deleteInfoLoading',
+                    '正在读取即将从磁盘删除的文件路径列表...',
+                    'Loading physical disk paths to be deleted...',
+                  )}
+                </span>
+              </div>
+            ) : deleteInfoPaths.length > 0 ? (
+              <div className="space-y-2">
+                <p className="font-semibold text-red-300">
+                  {adminLabel(
+                    t,
+                    locale,
+                    'admin.metadata.deleteInfoPathsCount',
+                    '即将从磁盘永久删除以下文件 / 目录（共 {{count}} 项）：',
+                    'Physical files / directories to be permanently deleted ({{count}}):',
+                    { count: deleteInfoPaths.length },
+                  )}
+                </p>
+                <ul className="max-h-44 space-y-1 overflow-y-auto rounded-lg border border-red-500/20 bg-zinc-950/80 p-2.5 font-mono text-[11px] text-zinc-200">
+                  {deleteInfoPaths.map((p, idx) => (
+                    <li key={`${p}-${idx}`} className="break-all">
+                      {p}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : deleteInfoError ? (
+              <div className="space-y-1 text-amber-200/90">
+                <p>
+                  {adminLabel(
+                    t,
+                    locale,
+                    'admin.metadata.deleteInfoErrorFallback',
+                    '无法加载待删除磁盘路径预览；确认删除仍会清理服务端关联的原始媒体文件与数据库记录。',
+                    'Unable to preview affected disk paths; confirming will still delete associated media files on disk and database records.',
+                  )}
+                </p>
+                {deletingItem?.Path && (
+                  <p className="break-all font-mono text-[11px] text-zinc-400">
+                    {deletingItem.Path}
+                  </p>
+                )}
+              </div>
+            ) : (
+              <div className="space-y-1 text-zinc-400">
+                <p>
+                  {adminLabel(
+                    t,
+                    locale,
+                    'admin.metadata.deleteInfoEmptyFallback',
+                    '服务端未返回可删除的媒体库内物理文件路径（若存在关联文件与元数据记录将一并清理）。',
+                    'No physical disk paths reported for this item (associated files within library roots and database records will be removed).',
+                  )}
+                </p>
+                {deletingItem?.Path && (
+                  <p className="break-all font-mono text-[11px] text-zinc-300">
+                    {deletingItem.Path}
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+
           <div className="flex items-center justify-end gap-3">
             <button
               type="button"
+              disabled={deleteMutation.isPending}
               onClick={() => setDeletingItem(null)}
-              className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-sm font-medium text-zinc-300 hover:bg-white/10"
+              className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-sm font-medium text-zinc-300 hover:bg-white/10 disabled:opacity-50"
             >
               {t('common.cancel')}
             </button>

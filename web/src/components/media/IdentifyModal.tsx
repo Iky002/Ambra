@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { CheckCircle2, Film, Loader2, Search, Sparkles } from 'lucide-react'
 import { api } from '../../api/client'
 import type { BaseItemDto, RemoteSearchItemType, RemoteSearchResult } from '../../api/types'
+import { useI18n } from '../../i18n/I18nContext'
 import { AdminModal, FeedbackBanner } from '../../pages/admin/adminUtils'
 
 const SUPPORTED_REMOTE_SEARCH_TYPES = new Set<RemoteSearchItemType>([
@@ -38,6 +39,7 @@ export function IdentifyModal({
   onClose,
   onApplied,
 }: IdentifyModalProps) {
+  const { t } = useI18n()
   const queryClient = useQueryClient()
 
   const [name, setName] = useState('')
@@ -86,7 +88,7 @@ export function IdentifyModal({
       setError(null)
     },
     onError: (err) => {
-      setError(err instanceof Error ? err.message : '远端识别搜索失败')
+      setError(err instanceof Error ? err.message : t('modal.identify.searchError'))
     },
   })
 
@@ -106,25 +108,25 @@ export function IdentifyModal({
         queryClient.invalidateQueries({ queryKey: ['latestItems'] }),
         queryClient.invalidateQueries({ queryKey: ['admin-metadata-items'] }),
       ])
-      onApplied?.(`已应用远端匹配「${candidate?.Name || item.Name}」`)
+      onApplied?.(t('modal.identify.applySuccess', { name: candidate?.Name || item.Name }))
       onClose()
     },
     onError: (err) => {
-      setError(err instanceof Error ? err.message : '应用远端匹配失败')
+      setError(err instanceof Error ? err.message : t('modal.identify.applyError'))
     },
   })
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault()
     if (!name.trim() && !tmdbId.trim() && !imdbId.trim()) {
-      setError('请至少输入片名、TMDB ID 或 IMDb ID 之一')
+      setError(t('modal.identify.missingCriteria'))
       return
     }
     const trimmedYear = year.trim()
     if (trimmedYear) {
       const parsed = Number(trimmedYear)
       if (!Number.isInteger(parsed) || parsed <= 1800) {
-        setError('请输入有效的发行年份（需为大于 1800 的整数）')
+        setError(t('modal.identify.invalidYear'))
         return
       }
     }
@@ -135,8 +137,8 @@ export function IdentifyModal({
   return (
     <AdminModal
       open={open}
-      title="识别（Identify）"
-      subtitle={item ? `为「${item.Name}」搜索并匹配 TMDB / IMDb 远端元数据` : undefined}
+      title={t('modal.identify.title')}
+      subtitle={item ? t('modal.identify.subtitle', { name: item.Name }) : undefined}
       maxWidthClass="max-w-3xl"
       onClose={onClose}
     >
@@ -146,32 +148,38 @@ export function IdentifyModal({
         <form onSubmit={handleSearch} className="space-y-4">
           <div className="grid gap-3 sm:grid-cols-4">
             <label className="block space-y-1 sm:col-span-2">
-              <span className="text-xs font-medium text-zinc-300">片名 / 剧集名</span>
+              <span className="text-xs font-medium text-zinc-300">
+                {t('modal.identify.fieldName')}
+              </span>
               <input
                 type="text"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                placeholder="输入中英文片名"
+                placeholder={t('modal.identify.fieldNamePlaceholder')}
                 className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3.5 py-2 text-sm text-zinc-100 outline-none focus:border-amber-400/60"
               />
             </label>
             <label className="block space-y-1">
-              <span className="text-xs font-medium text-zinc-300">年份</span>
+              <span className="text-xs font-medium text-zinc-300">
+                {t('modal.identify.fieldYear')}
+              </span>
               <input
                 type="number"
                 value={year}
                 onChange={(e) => setYear(e.target.value)}
-                placeholder="例如：2010"
+                placeholder={t('modal.identify.fieldYearPlaceholder')}
                 className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3.5 py-2 text-sm text-zinc-100 outline-none focus:border-amber-400/60"
               />
             </label>
             <label className="block space-y-1">
-              <span className="text-xs font-medium text-zinc-300">TMDB ID</span>
+              <span className="text-xs font-medium text-zinc-300">
+                {t('modal.identify.fieldTmdbId')}
+              </span>
               <input
                 type="text"
                 value={tmdbId}
                 onChange={(e) => setTmdbId(e.target.value)}
-                placeholder="例如：27205"
+                placeholder={t('modal.identify.fieldTmdbIdPlaceholder')}
                 className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3.5 py-2 text-sm text-zinc-100 outline-none focus:border-amber-400/60"
               />
             </label>
@@ -180,7 +188,7 @@ export function IdentifyModal({
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex flex-wrap items-center gap-4">
               <label className="flex items-center gap-2 text-xs text-zinc-300">
-                <span>IMDb ID：</span>
+                <span>{t('modal.identify.fieldImdbIdLabel')}</span>
                 <input
                   type="text"
                   value={imdbId}
@@ -197,7 +205,7 @@ export function IdentifyModal({
                   onChange={(e) => setReplaceAllImages(e.target.checked)}
                   className="h-4 w-4 rounded border-white/20 bg-zinc-900 accent-amber-500"
                 />
-                <span>同时替换图片</span>
+                <span>{t('modal.identify.replaceImages')}</span>
               </label>
             </div>
 
@@ -211,7 +219,7 @@ export function IdentifyModal({
               ) : (
                 <Search className="h-4 w-4" />
               )}
-              <span>搜索候选匹配</span>
+              <span>{t('modal.identify.searchBtn')}</span>
             </button>
           </div>
         </form>
@@ -220,12 +228,12 @@ export function IdentifyModal({
         {searched && (
           <div className="space-y-3 border-t border-white/8 pt-4">
             <p className="text-xs font-medium text-zinc-400">
-              找到 {results.length} 个远端候选结果
+              {t('modal.identify.resultsCount', { count: results.length })}
             </p>
 
             {results.length === 0 ? (
               <div className="rounded-2xl border border-dashed border-white/12 bg-white/[0.02] py-10 text-center text-sm text-zinc-400">
-                未找到匹配结果，请尝试更换片名或填写 TMDB / IMDb ID
+                {t('modal.identify.emptyResults')}
               </div>
             ) : (
               <div className="space-y-3">
@@ -296,7 +304,7 @@ export function IdentifyModal({
                         ) : (
                           <CheckCircle2 className="h-3.5 w-3.5" />
                         )}
-                        <span>应用此匹配</span>
+                        <span>{t('modal.identify.applyBtn')}</span>
                       </button>
                     </div>
                   </div>

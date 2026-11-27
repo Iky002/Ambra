@@ -52,13 +52,14 @@ type AuthFuncs struct {
 }
 
 type Handler struct {
-	repo       *sqlite.LibraryRepo
-	userRepo   *sqlite.UserRepo
-	engine     *playback.Engine
-	imaging    *imaging.Service
-	extractor  *transcode.Extractor
-	httpClient *http.Client
-	auth       AuthFuncs
+	repo         *sqlite.LibraryRepo
+	userRepo     *sqlite.UserRepo
+	engine       *playback.Engine
+	imaging      *imaging.Service
+	extractor    *transcode.Extractor
+	transcodeMgr *transcode.Manager
+	httpClient   *http.Client
+	auth         AuthFuncs
 }
 
 func New(repo *sqlite.LibraryRepo, engine *playback.Engine, img *imaging.Service) *Handler {
@@ -82,6 +83,11 @@ func (h *Handler) SetExtractor(ext *transcode.Extractor) {
 	h.extractor = ext
 }
 
+// SetTranscodeManager attaches a transcode.Manager to enforce global SimultaneousStreamLimit on direct streams.
+func (h *Handler) SetTranscodeManager(tm *transcode.Manager) {
+	h.transcodeMgr = tm
+}
+
 // SetUserRepo attaches a UserRepo for per-user library access control on playback/streaming/download/subtitles.
 func (h *Handler) SetUserRepo(userRepo *sqlite.UserRepo) {
 	h.userRepo = userRepo
@@ -99,7 +105,13 @@ func (h *Handler) CanAccessLibrary(ctx context.Context, userID, libraryID string
 	if err != nil || u == nil {
 		return false
 	}
-	if u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableAllFolders {
+	if u.IsAdmin || u.Policy.IsAdministrator {
+		return true
+	}
+	if h.repo != nil {
+		return h.repo.CanUserAccessLibrary(ctx, u.Policy, libraryID)
+	}
+	if u.Policy.EnableAllFolders {
 		return true
 	}
 	normLib := guid.Normalize(libraryID)
@@ -196,6 +208,14 @@ func (h *Handler) callerPolicy(r *http.Request) (*dto.UserPolicy, bool) {
 	return nil, false
 }
 
+func (h *Handler) canPlayMedia(r *http.Request) bool {
+	pol, isAdmin := h.callerPolicy(r)
+	if isAdmin || pol == nil {
+		return true
+	}
+	return pol.EnableMediaPlayback
+}
+
 func matchesBlockUnratedType(itemType, mediaType string, blockUnrated []string) bool {
 	if strings.EqualFold(itemType, "CollectionFolder") ||
 		strings.EqualFold(itemType, "Folder") ||
@@ -207,7 +227,7 @@ func matchesBlockUnratedType(itemType, mediaType string, blockUnrated []string) 
 		strings.EqualFold(itemType, "Studio") {
 		return false
 	}
-	for _, b := range blockUnrated {
+	for _, b := range blockedOrEmpty(blockUnrated) {
 		t := strings.TrimSpace(b)
 		if t == "" {
 			continue
@@ -225,55 +245,7 @@ func matchesBlockUnratedType(itemType, mediaType string, blockUnrated []string) 
 	return false
 }
 
-func (h *Handler) isBlockedByExtendedPolicy(ctx context.Context, rec *sqlite.ItemRecord, pol dto.UserPolicy) bool {
-	if rec == nil || h.repo == nil {
-		return false
-	}
-	if len(pol.BlockUnratedItems) > 0 && matchesBlockUnratedType(rec.Type, rec.MediaType, pol.BlockUnratedItems) {
-		rating := strings.TrimSpace(rec.OfficialRating)
-		if rating == "" && rec.SeriesID != "" {
-			if sRec, err := h.repo.GetItemRecordByID(ctx, rec.SeriesID); err == nil && sRec != nil {
-				rating = strings.TrimSpace(sRec.OfficialRating)
-			}
-		}
-		if rating == "" {
-			return true
-		}
-	}
-	if len(pol.AllowedTags) > 0 {
-		allowSet := make(map[string]bool, len(pol.AllowedTags))
-		for _, t := range pol.AllowedTags {
-			if s := strings.ToLower(strings.TrimSpace(t)); s != "" {
-				allowSet[s] = true
-			}
-		}
-		if len(allowSet) > 0 {
-			matched := false
-			checkIDs := []string{rec.ID}
-			if rec.SeriesID != "" {
-				checkIDs = append(checkIDs, rec.SeriesID)
-			}
-			for _, cid := range checkIDs {
-				_, _, tags, err := h.repo.GetTaxonomiesByItemID(ctx, cid)
-				if err == nil {
-					for _, tg := range tags {
-						if allowSet[strings.ToLower(strings.TrimSpace(tg))] {
-							matched = true
-							break
-						}
-					}
-				}
-				if matched {
-					break
-				}
-			}
-			if !matched {
-				return true
-			}
-		}
-	}
-	return false
-}
+func blockedOrEmpty(in []string) []string { return in }
 
 func (h *Handler) canAccessItem(r *http.Request, itemID string) bool {
 	if h.repo == nil {
@@ -289,24 +261,11 @@ func (h *Handler) canAccessItem(r *http.Request, itemID string) bool {
 				return false
 			}
 			pol := ac.User.Policy
-			if rec.LibraryID != "" && !pol.EnableAllFolders {
-				allowed := false
-				normLib := guid.Normalize(rec.LibraryID)
-				for _, fid := range pol.EnabledFolders {
-					if guid.Normalize(fid) == normLib {
-						allowed = true
-						break
-					}
-				}
-				if !allowed {
-					return false
-				}
-			}
-			blocked, err := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, pol.MaxParentalRating, pol.BlockedTags)
-			if err != nil || blocked {
+			if rec.LibraryID != "" && !h.repo.CanUserAccessLibrary(r.Context(), pol, rec.LibraryID) {
 				return false
 			}
-			return !h.isBlockedByExtendedPolicy(r.Context(), rec, pol)
+			blocked, err := h.repo.IsItemBlockedByPolicy(r.Context(), rec, pol)
+			return err == nil && !blocked
 		}
 		return true
 	}
@@ -334,11 +293,8 @@ func (h *Handler) canAccessItem(r *http.Request, itemID string) bool {
 	if u.IsAdmin || u.Policy.IsAdministrator {
 		return true
 	}
-	blocked, err := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, u.Policy.MaxParentalRating, u.Policy.BlockedTags)
-	if err != nil || blocked {
-		return false
-	}
-	return !h.isBlockedByExtendedPolicy(r.Context(), rec, u.Policy)
+	blocked, err := h.repo.IsItemBlockedByPolicy(r.Context(), rec, u.Policy)
+	return err == nil && !blocked
 }
 
 func isLocalOrSubnetRequest(r *http.Request, customSubnets []string) bool {
@@ -399,6 +355,10 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 
 func (h *Handler) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 	itemID := r.PathValue("Id")
+	if !h.canPlayMedia(r) {
+		httpx.Error(w, http.StatusForbidden, "media playback is disabled")
+		return
+	}
 	if !h.canAccessItem(r, itemID) {
 		httpx.Error(w, http.StatusForbidden, "access denied")
 		return
@@ -484,6 +444,10 @@ func (h *Handler) handlePlaybackInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp, _, err := h.engine.Decide(r.Context(), itemID, req)
+	if errors.Is(err, playback.ErrPlaybackForbidden) {
+		httpx.Error(w, http.StatusForbidden, "media playback is disabled")
+		return
+	}
 	if errors.Is(err, sqlite.ErrNotFound) {
 		httpx.Error(w, http.StatusNotFound, "item not found")
 		return
@@ -612,6 +576,10 @@ func (h *Handler) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) serveMediaFile(w http.ResponseWriter, r *http.Request, asAttachment bool) {
 	itemID := guid.Normalize(r.PathValue("Id"))
+	if !asAttachment && !h.canPlayMedia(r) {
+		httpx.Error(w, http.StatusForbidden, "media playback is disabled")
+		return
+	}
 	if !h.canAccessItem(r, itemID) {
 		httpx.Error(w, http.StatusForbidden, "access denied")
 		return
@@ -664,6 +632,23 @@ func (h *Handler) serveMediaFile(w http.ResponseWriter, r *http.Request, asAttac
 			return
 		}
 		mediaPath = targetURL
+	}
+
+	// [3.1-3] Enforce SimultaneousStreamLimit on active DirectPlay / DirectStream deliveries.
+	if !asAttachment && r.Method != http.MethodHead && h.transcodeMgr != nil && h.engine != nil && h.engine.Config() != nil {
+		if limit := h.engine.Config().Snapshot().SimultaneousStreamLimit; limit > 0 {
+			slotKey := ""
+			if ps := strings.TrimSpace(q.Get("PlaySessionId")); ps != "" {
+				callerID, _ := h.callerIdentity(r)
+				slotKey = "direct:" + callerID + ":" + itemID + ":" + ps
+			}
+			release, allowed := h.transcodeMgr.TryAcquireStreamSlot(limit, slotKey)
+			if !allowed {
+				httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
+				return
+			}
+			defer release()
+		}
 	}
 
 	// Reverse-proxy remote HTTP(S) streams (e.g. non-302 STRM, custom upstream headers, or explicit proxy=1/true)
@@ -828,7 +813,11 @@ func (h *Handler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 
 	q := httpx.ParseQuery(r)
 	startTicks := q.Int64("StartPositionTicks", 0)
-	ct, data, err := playback.ServeSubtitle(subPath, targetFormat, startTicks)
+	addVttTimeMap := false
+	if b := q.Bool("addVttTimeMap"); b != nil && *b {
+		addVttTimeMap = true
+	}
+	ct, data, err := playback.ServeSubtitleWithVTTTimeMap(subPath, targetFormat, startTicks, addVttTimeMap)
 	if err != nil {
 		if errors.Is(err, os.ErrPermission) {
 			logAndWritePermissionDenied(w, subPath, err)
@@ -1024,18 +1013,8 @@ func (h *Handler) tryServeLibraryCover(w http.ResponseWriter, r *http.Request, l
 					allowedTags = u.Policy.AllowedTags
 				}
 			} else if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil {
-				if !ac.User.Policy.EnableAllFolders {
-					allowed := false
-					normLib := guid.Normalize(lib.ID)
-					for _, fid := range ac.User.Policy.EnabledFolders {
-						if guid.Normalize(fid) == normLib {
-							allowed = true
-							break
-						}
-					}
-					if !allowed {
-						return false
-					}
+				if !h.repo.CanUserAccessLibrary(r.Context(), ac.User.Policy, lib.ID) {
+					return false
 				}
 				maxRating = ac.User.Policy.MaxParentalRating
 				blockedTags = ac.User.Policy.BlockedTags
@@ -1062,13 +1041,20 @@ func (h *Handler) tryServeLibraryCover(w http.ResponseWriter, r *http.Request, l
 		return false
 	}
 
-	// Post-filter children for BlockUnratedItems / AllowedTags in case SQL layer has not filtered them yet.
+	// Post-filter children via IsItemBlockedByPolicy for complete Series inheritance & tag checks.
 	if authed && (len(blockUnratedItems) > 0 || len(allowedTags) > 0) {
-		pol := dto.UserPolicy{BlockUnratedItems: blockUnratedItems, AllowedTags: allowedTags}
+		pol := dto.UserPolicy{
+			EnableAllFolders:   true,
+			EnableLiveTvAccess: true,
+			MaxParentalRating:  maxRating,
+			BlockedTags:        blockedTags,
+			BlockUnratedItems:  blockUnratedItems,
+			AllowedTags:        allowedTags,
+		}
 		filtered := make([]dto.BaseItemDto, 0, len(children))
 		for _, it := range children {
 			if rec, rErr := h.repo.GetItemRecordByID(r.Context(), it.Id); rErr == nil && rec != nil {
-				if h.isBlockedByExtendedPolicy(r.Context(), rec, pol) {
+				if blocked, bErr := h.repo.IsItemBlockedByPolicy(r.Context(), rec, pol); bErr != nil || blocked {
 					continue
 				}
 			}

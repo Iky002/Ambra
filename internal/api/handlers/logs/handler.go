@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -18,6 +20,66 @@ import (
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/config"
 )
+
+var (
+	reLogKVToken     = regexp.MustCompile(`(?i)\b(api_key|x-emby-token|x-mediabrowser-token|access_token|tmdb_api_key)(\s*[:=]\s*"?)([^\s&"',;\r\n]+)`)
+	reLogAuthToken   = regexp.MustCompile(`(?i)(\bToken\s*=\s*")([^"]+)(")`)
+	reLogJSONToken   = regexp.MustCompile(`(?i)"(AccessToken|X-Emby-Token|X-MediaBrowser-Token|api_key|Secret|Password|Pw)"(\s*:\s*")([^"]+)(")`)
+	reLogBearer      = regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+`)
+	reLogEmail       = regexp.MustCompile(`[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`)
+	reLogBracketIPv6 = regexp.MustCompile(`\[([0-9a-fA-F:.%]+)\](:\d{1,5})?`)
+	reLogIPv4        = regexp.MustCompile(`\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(:\d{1,5})?\b`)
+	reLogRawIPv6     = regexp.MustCompile(`(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}(?:%[A-Za-z0-9_.-]+)?(?:\.[0-9]{1,3}){0,3}`)
+)
+
+// SanitizeLogLine redacts tokens, Bearer credentials, email addresses, and non-loopback IPv4/IPv6 addresses.
+func SanitizeLogLine(line string) string {
+	s := reLogKVToken.ReplaceAllString(line, "${1}${2}[REDACTED]")
+	s = reLogAuthToken.ReplaceAllString(s, "${1}[REDACTED]${3}")
+	s = reLogJSONToken.ReplaceAllString(s, `"${1}"${2}[REDACTED]${4}`)
+	s = reLogBearer.ReplaceAllString(s, "Bearer [REDACTED]")
+	s = reLogEmail.ReplaceAllString(s, "[REDACTED_EMAIL]")
+	s = reLogBracketIPv6.ReplaceAllStringFunc(s, func(match string) string {
+		sub := reLogBracketIPv6.FindStringSubmatch(match)
+		if len(sub) < 2 {
+			return match
+		}
+		addr, err := netip.ParseAddr(sub[1])
+		if err != nil {
+			return match
+		}
+		if addr.WithZone("").Unmap().IsLoopback() {
+			return match
+		}
+		return "[REDACTED_IP]"
+	})
+	s = reLogRawIPv6.ReplaceAllStringFunc(s, func(match string) string {
+		addr, err := netip.ParseAddr(match)
+		if err != nil {
+			return match
+		}
+		if addr.WithZone("").Unmap().IsLoopback() {
+			return match
+		}
+		return "[REDACTED_IP]"
+	})
+	s = reLogIPv4.ReplaceAllStringFunc(s, func(match string) string {
+		sub := reLogIPv4.FindStringSubmatch(match)
+		if len(sub) < 2 {
+			return match
+		}
+		ipPart := sub[1]
+		if ipPart == config.ServerVersion {
+			return match
+		}
+		addr, err := netip.ParseAddr(ipPart)
+		if err != nil || addr.IsLoopback() {
+			return match
+		}
+		return "[REDACTED_IP]"
+	})
+	return s
+}
 
 const (
 	defaultRuntimeLogName = "ambra-runtime.log"
@@ -208,7 +270,7 @@ func (h *Handler) resolveSafeLogPath(name string) (string, error) {
 	return realTarget, nil
 }
 
-func (h *Handler) readLogLinesPage(name string, start, limit int) ([]string, int, error) {
+func (h *Handler) readLogLinesPage(name string, start, limit int, sanitize bool) ([]string, int, error) {
 	if start < 0 {
 		start = 0
 	}
@@ -230,6 +292,11 @@ func (h *Handler) readLogLinesPage(name string, start, limit int) ([]string, int
 			page = append([]string(nil), h.runtimeLines[start:end]...)
 		}
 		h.mu.RUnlock()
+		if sanitize {
+			for i := range page {
+				page[i] = SanitizeLogLine(page[i])
+			}
+		}
 		return page, total, nil
 	}
 
@@ -259,7 +326,11 @@ func (h *Handler) readLogLinesPage(name string, start, limit int) ([]string, int
 		}
 		if hasLine {
 			if total >= start && len(page) < limit {
-				page = append(page, escapeLogControlChars(line))
+				clean := escapeLogControlChars(line)
+				if sanitize {
+					clean = SanitizeLogLine(clean)
+				}
+				page = append(page, clean)
 			}
 			total++
 		}
@@ -334,18 +405,26 @@ func (h *Handler) handleGetLogByQuery(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "missing log file name")
 		return
 	}
-	h.serveLogByName(w, name)
+	sanitize := q.Bool("Sanitize") != nil && *q.Bool("Sanitize")
+	h.serveLogByName(w, name, sanitize)
 }
 
 func (h *Handler) handleGetLog(w http.ResponseWriter, r *http.Request) {
-	h.serveLogByName(w, r.PathValue("Name"))
+	q := httpx.ParseQuery(r)
+	sanitize := q.Bool("Sanitize") != nil && *q.Bool("Sanitize")
+	h.serveLogByName(w, r.PathValue("Name"), sanitize)
 }
 
-func (h *Handler) serveLogByName(w http.ResponseWriter, name string) {
+func (h *Handler) serveLogByName(w http.ResponseWriter, name string, sanitize bool) {
 	serveRuntime := func() {
 		h.mu.RLock()
 		lines := append([]string(nil), h.runtimeLines...)
 		h.mu.RUnlock()
+		if sanitize {
+			for i := range lines {
+				lines[i] = SanitizeLogLine(lines[i])
+			}
+		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.WriteHeader(http.StatusOK)
@@ -378,7 +457,20 @@ func (h *Handler) serveLogByName(w http.ResponseWriter, name string) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
-	_, _ = io.Copy(w, f)
+	if !sanitize {
+		_, _ = io.Copy(w, f)
+		return
+	}
+	reader := bufio.NewReaderSize(f, 64*1024)
+	for {
+		line, hasLine, readErr := readBoundedLine(reader, maxLogLineBytes)
+		if hasLine {
+			_, _ = io.WriteString(w, SanitizeLogLine(line)+"\n")
+		}
+		if readErr != nil {
+			break
+		}
+	}
 }
 
 func (h *Handler) handleGetLogLines(w http.ResponseWriter, r *http.Request) {
@@ -386,7 +478,8 @@ func (h *Handler) handleGetLogLines(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("Name")
 	start := q.Int("StartIndex", 0)
 	limit := q.Int("Limit", 100)
-	page, total, err := h.readLogLinesPage(name, start, limit)
+	sanitize := q.Bool("Sanitize") != nil && *q.Bool("Sanitize")
+	page, total, err := h.readLogLinesPage(name, start, limit, sanitize)
 	if err != nil {
 		writeLogError(w, err)
 		return

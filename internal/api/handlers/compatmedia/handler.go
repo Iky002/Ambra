@@ -163,10 +163,11 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 	r.Get("/Artists/{Name}/Images/{Type}/{Index}", h.handleEntityImage("artist"))
 	r.Head("/Artists/{Name}/Images/{Type}/{Index}", h.handleEntityImage("artist"))
 
-	// --- /Audio (3 routes) ---
+	// --- /Audio (4 routes) ---
 	r.Get("/Audio/{Id}/hls1/{PlaylistId}/{Segment}", authFn(h.handleAudioHlsSegment))
 	r.Head("/Audio/{Id}/hls1/{PlaylistId}/{Segment}", authFn(h.handleAudioHlsSegment))
 	r.Get("/Audio/{Id}/hls/{PlaylistId}/{Segment}", authFn(h.handleAudioHlsSegment))
+	r.Head("/Audio/{Id}/hls/{PlaylistId}/{Segment}", authFn(h.handleAudioHlsSegment))
 
 	// --- /AudioBooks (1 route) ---
 	r.Get("/AudioBooks/NextUp", authFn(h.handleAudioBooksNextUp))
@@ -321,7 +322,7 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 	r.Post("/Playlists/{Id}/Items/Delete", authFn(h.handleContainerItemsDelete("Playlist", true)))
 
 	// --- /Providers (1 route) ---
-	r.Get("/Providers/Subtitles/Subtitles/{Id}", authFn(h.handleProviderSubtitleDownload))
+	r.Get("/Providers/Subtitles/Subtitles/{Id}", adminFn(h.handleProviderSubtitleDownload))
 
 	// --- /Shows (3 routes) ---
 	r.Get("/Shows/Missing", authFn(h.handleEmptyQueryResult))
@@ -338,7 +339,7 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 	// --- /Trailers (1 route) ---
 	r.Get("/Trailers/{Id}/Similar", authFn(h.handleSimilar))
 
-	// --- /Videos (10 routes) ---
+	// --- /Videos (11 routes) ---
 	r.Delete("/Videos/{Id}/AlternateSources", adminFn(h.handleDeleteAlternateSources))
 	r.Post("/Videos/{Id}/AlternateSources/Delete", adminFn(h.handleDeleteAlternateSources))
 	r.Post("/Videos/MergeVersions", adminFn(h.handleMergeVersions))
@@ -354,6 +355,7 @@ func (h *Handler) BuildRouter(auth AuthFuncs) http.Handler {
 	r.Head("/Videos/{Id}/{MediaSourceId}/Attachments/{Index}/Stream", authFn(h.handleVideoAttachmentStream))
 	r.Post("/Videos/ActiveEncodings/Delete", authFn(h.handleDeleteActiveEncodings))
 	r.Get("/Videos/{Id}/hls/{PlaylistId}/{Segment}", authFn(h.handleVideoHlsSegment))
+	r.Head("/Videos/{Id}/hls/{PlaylistId}/{Segment}", authFn(h.handleVideoHlsSegment))
 
 	return r
 }
@@ -444,6 +446,14 @@ func (h *Handler) canDownloadContent(r *http.Request) bool {
 // or a non-nil slice of normalized library IDs (possibly empty) if restricted.
 func (h *Handler) allowedLibrariesForRequest(r *http.Request, fallbackUserID string) []string {
 	if h.userRepo == nil {
+		if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil && !ac.IsAdmin() {
+			if ac.User.IsDisabled {
+				return []string{}
+			}
+			if h.repo != nil {
+				return h.repo.AllowedLibraryIDsForPolicy(r.Context(), ac.User.Policy)
+			}
+		}
 		return nil
 	}
 	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
@@ -467,10 +477,16 @@ func (h *Handler) allowedLibrariesForUser(ctx context.Context, userID string) []
 		return nil
 	}
 	u, err := h.userRepo.GetUserByID(ctx, userID)
-	if err != nil || u == nil {
+	if err != nil || u == nil || u.IsDisabled {
 		return []string{}
 	}
-	if u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableAllFolders {
+	if u.IsAdmin || u.Policy.IsAdministrator {
+		return nil
+	}
+	if h.repo != nil {
+		return h.repo.AllowedLibraryIDsForPolicy(ctx, u.Policy)
+	}
+	if u.Policy.EnableAllFolders {
 		return nil
 	}
 	allowed := make([]string, 0, len(u.Policy.EnabledFolders))
@@ -503,7 +519,7 @@ func (h *Handler) userParentalPolicyForRequest(r *http.Request, fallbackUserID s
 func (h *Handler) userExtendedPolicyForRequest(r *http.Request, fallbackUserID string) dto.UserPolicy {
 	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil {
 		if ac.IsAPIKey || ac.IsAdmin() {
-			return dto.UserPolicy{IsAdministrator: true, EnableAllFolders: true}
+			return sqlite.DefaultUserPolicy(true)
 		}
 	}
 	uid := ""
@@ -520,19 +536,23 @@ func (h *Handler) userExtendedPolicyForRequest(r *http.Request, fallbackUserID s
 	}
 	if h.userRepo != nil && uid != "" {
 		u, err := h.userRepo.GetUserByID(r.Context(), uid)
-		if err != nil || u == nil {
+		if err != nil || u == nil || u.IsDisabled {
 			zero := 0
 			return dto.UserPolicy{MaxParentalRating: &zero}
 		}
 		if u.IsAdmin || u.Policy.IsAdministrator {
-			return dto.UserPolicy{IsAdministrator: true, EnableAllFolders: true}
+			return sqlite.DefaultUserPolicy(true)
 		}
 		return u.Policy
 	}
 	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil {
+		if ac.User.IsDisabled {
+			zero := 0
+			return dto.UserPolicy{MaxParentalRating: &zero}
+		}
 		return ac.User.Policy
 	}
-	return dto.UserPolicy{IsAdministrator: true, EnableAllFolders: true}
+	return sqlite.DefaultUserPolicy(true)
 }
 
 func (h *Handler) isAuthenticated(r *http.Request) bool {

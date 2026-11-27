@@ -212,7 +212,7 @@ func applyRefreshMetadataToItem(rec *sqlite.ItemRecord, meta *plugins.MetadataRe
 	if meta.OfficialRating != "" && !isFieldLocked(rec, "OfficialRating") {
 		rec.OfficialRating = meta.OfficialRating
 	}
-	if len(meta.ProviderIDs) > 0 && !rec.Extra.LockData {
+	if len(meta.ProviderIDs) > 0 && !rec.Extra.LockData && !isFieldLocked(rec, "ProviderIds") {
 		if rec.Extra.ProviderIDs == nil {
 			rec.Extra.ProviderIDs = make(map[string]string, len(meta.ProviderIDs))
 		}

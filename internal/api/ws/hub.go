@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -108,6 +109,7 @@ type Hub struct {
 
 	mu                  sync.RWMutex
 	clients             map[string]*clientConn
+	originsConfigured   bool
 	allowedOrigins      map[string]struct{}
 	allowWildcardOrigin bool
 	libraryChangeFilter LibraryChangeFilterFunc
@@ -159,7 +161,7 @@ func (h *Hub) isGlobalRemoteAccessEnabled() bool {
 }
 
 // SetAllowedOrigins configures an optional Origin allowlist for browser WebSocket handshakes.
-// Empty Origin headers (native clients) are always permitted.
+// Empty Origin headers (native clients) and same-origin requests are always permitted.
 func (h *Hub) SetAllowedOrigins(origins []string) {
 	allowedSet := make(map[string]struct{}, len(origins))
 	wildcard := false
@@ -175,6 +177,7 @@ func (h *Hub) SetAllowedOrigins(origins []string) {
 		allowedSet[norm] = struct{}{}
 	}
 	h.mu.Lock()
+	h.originsConfigured = true
 	h.allowedOrigins = allowedSet
 	h.allowWildcardOrigin = wildcard
 	h.mu.Unlock()
@@ -187,23 +190,75 @@ func (h *Hub) SetLibraryChangeFilter(fn func(ctx context.Context, userID string,
 	h.mu.Unlock()
 }
 
-func (h *Hub) isOriginAllowed(origin string) bool {
-	origin = strings.TrimSpace(origin)
+func escapeWSOriginHostPattern(host string) string {
+	var b strings.Builder
+	for i := 0; i < len(host); i++ {
+		switch host[i] {
+		case '[', ']', '*', '?', '\\':
+			b.WriteByte('\\')
+		}
+		b.WriteByte(host[i])
+	}
+	return b.String()
+}
+
+func (h *Hub) checkWSOrigin(r *http.Request) (bool, []string) {
+	if r == nil {
+		return false, nil
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
 	if origin == "" {
 		// Allow native Emby clients that do not send an Origin header.
-		return true
+		return true, nil
 	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" || u.User != nil {
+		return false, nil
+	}
+	scheme := strings.ToLower(strings.TrimSpace(u.Scheme))
+	if scheme != "http" && scheme != "https" {
+		return false, nil
+	}
+	if middleware.IsSameOrigin(origin, r) {
+		return true, []string{escapeWSOriginHostPattern(u.Host)}
+	}
+
 	h.mu.RLock()
+	configured := h.originsConfigured
 	allowedSet := h.allowedOrigins
 	wildcard := h.allowWildcardOrigin
+	cfg := h.cfg
 	h.mu.RUnlock()
 
-	if len(allowedSet) == 0 || wildcard {
-		return true
+	if !configured {
+		if cfg == nil && h.authSvc != nil {
+			cfg = h.authSvc.Config()
+		}
+		if cfg != nil {
+			raw := cfg.Snapshot().AllowedOrigins
+			allowedSet = make(map[string]struct{}, len(raw))
+			for _, item := range raw {
+				norm := strings.ToLower(strings.TrimRight(strings.TrimSpace(item), "/"))
+				if norm == "" {
+					continue
+				}
+				if norm == "*" {
+					wildcard = true
+					continue
+				}
+				allowedSet[norm] = struct{}{}
+			}
+		}
+	}
+
+	if wildcard {
+		return true, []string{"*"}
 	}
 	norm := strings.ToLower(strings.TrimRight(origin, "/"))
-	_, ok := allowedSet[norm]
-	return ok
+	if _, ok := allowedSet[norm]; ok {
+		return true, []string{escapeWSOriginHostPattern(u.Host)}
+	}
+	return false, nil
 }
 
 func (h *Hub) RegisterRoutes(r chi.Router) {
@@ -506,7 +561,8 @@ func defaultFilterLibraryChange(user *sqlite.UserRecord, payload any) (any, bool
 }
 
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !h.isOriginAllowed(r.Header.Get("Origin")) {
+	allowedOrigin, originPatterns := h.checkWSOrigin(r)
+	if !allowedOrigin {
 		httpx.Error(w, http.StatusForbidden, "origin not allowed")
 		return
 	}
@@ -565,7 +621,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: true,
+		OriginPatterns: originPatterns,
 	})
 	if err != nil {
 		return
@@ -756,9 +812,12 @@ func (h *Hub) Broadcast(msg Message) {
 
 func (h *Hub) SendToUser(userID string, msg Message) {
 	norm := guid.Normalize(userID)
+	if norm == "" {
+		return
+	}
 	h.mu.RLock()
 	for _, c := range h.clients {
-		if c.isAPIKey || guid.Normalize(c.userID) == norm {
+		if !c.isAPIKey && guid.Normalize(c.userID) == norm {
 			c.trySend(msg)
 		}
 	}

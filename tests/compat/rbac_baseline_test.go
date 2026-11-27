@@ -36,6 +36,13 @@ func isScopedSelfServiceRoute(method, tmpl string) bool {
 	}
 }
 
+func isHardenedAdminOnlyRoute(method, tmpl string) bool {
+	if method == http.MethodGet && tmpl == "/Providers/Subtitles/Subtitles/{Id}" {
+		return true
+	}
+	return false
+}
+
 func TestRBACBaselineEnforcement(t *testing.T) {
 	srv, cfg, adminToken, adminID := newCompatTestServer(t)
 	defer srv.Close()
@@ -61,7 +68,9 @@ func TestRBACBaselineEnforcement(t *testing.T) {
 				}
 			}
 
-			if strings.Contains(strings.ToLower(rt.Roles), "admin") && !isScopedSelfServiceRoute(method, rt.Path) {
+			requiresAdmin := (strings.Contains(strings.ToLower(rt.Roles), "admin") && !isScopedSelfServiceRoute(method, rt.Path)) ||
+				isHardenedAdminOnlyRoute(method, rt.Path)
+			if requiresAdmin {
 				w := sendCompatRequest(srv.Handler, method, path, readerToken, nil)
 				if w.Code != http.StatusForbidden {
 					t.Errorf("NON-ADMIN %s %s (roles=%q): expected 403, got %d (%s)", method, rt.Path, rt.Roles, w.Code, strings.TrimSpace(w.Body.String()))

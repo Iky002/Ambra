@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertCircle,
@@ -42,11 +42,11 @@ interface AddedLibraryPreview {
   paths: string[]
 }
 
-const STEPS: { id: WizardStep; title: string; subtitle: string; icon: typeof Server }[] = [
-  { id: 1, title: '服务器设置', subtitle: '名称与语言', icon: Server },
-  { id: 2, title: '管理员账号', subtitle: '创建超级管理员', icon: ShieldCheck },
-  { id: 3, title: '添加媒体库', subtitle: '挂载影视目录', icon: FolderPlus },
-  { id: 4, title: '刮削与偏好', subtitle: 'TMDB 与榜单', icon: Sparkles },
+const STEPS: { id: WizardStep; titleKey: string; subtitleKey: string; icon: typeof Server }[] = [
+  { id: 1, titleKey: 'setupUi.step1NavTitle', subtitleKey: 'setupUi.step1NavSub', icon: Server },
+  { id: 2, titleKey: 'setupUi.step2NavTitle', subtitleKey: 'setupUi.step2NavSub', icon: ShieldCheck },
+  { id: 3, titleKey: 'setupUi.step3NavTitle', subtitleKey: 'setupUi.step3NavSub', icon: FolderPlus },
+  { id: 4, titleKey: 'setupUi.step4NavTitle', subtitleKey: 'setupUi.step4NavSub', icon: Sparkles },
 ]
 
 const LANGUAGE_OPTIONS = [
@@ -54,21 +54,33 @@ const LANGUAGE_OPTIONS = [
   { value: 'zh-TW', label: '繁體中文 (zh-TW)' },
   { value: 'en-US', label: 'English (en-US)' },
   { value: 'ja-JP', label: '日本語 (ja-JP)' },
+  { value: 'ko-KR', label: '한국어 (ko-KR)' },
+  { value: 'es-ES', label: 'Español (es-ES)' },
+  { value: 'de-DE', label: 'Deutsch (de-DE)' },
+  { value: 'fr-FR', label: 'Français (fr-FR)' },
+  { value: 'pt-BR', label: 'Português (pt-BR)' },
+  { value: 'th-TH', label: 'ไทย (th-TH)' },
 ]
 
 const COUNTRY_OPTIONS = [
-  { value: 'CN', label: '中国大陆 (CN)' },
-  { value: 'HK', label: '中国香港 (HK)' },
-  { value: 'TW', label: '中国台湾 (TW)' },
-  { value: 'US', label: '美国 (US)' },
-  { value: 'JP', label: '日本 (JP)' },
+  { value: 'CN', labelKey: 'setupUi.countryCN' },
+  { value: 'HK', labelKey: 'setupUi.countryHK' },
+  { value: 'TW', labelKey: 'setupUi.countryTW' },
+  { value: 'US', labelKey: 'setupUi.countryUS' },
+  { value: 'JP', labelKey: 'setupUi.countryJP' },
+  { value: 'KR', labelKey: 'setupUi.countryKR' },
+  { value: 'ES', labelKey: 'setupUi.countryES' },
+  { value: 'DE', labelKey: 'setupUi.countryDE' },
+  { value: 'FR', labelKey: 'setupUi.countryFR' },
+  { value: 'BR', labelKey: 'setupUi.countryBR' },
+  { value: 'TH', labelKey: 'setupUi.countryTH' },
 ]
 
 const COLLECTION_TYPES = [
-  { value: 'movies', label: '电影', icon: Film },
-  { value: 'tvshows', label: '剧集', icon: Tv },
-  { value: 'music', label: '音乐', icon: Music },
-  { value: 'mixed', label: '混合内容', icon: Folder },
+  { value: 'movies', labelKey: 'setupUi.colTypeMovies', icon: Film },
+  { value: 'tvshows', labelKey: 'setupUi.colTypeTvShows', icon: Tv },
+  { value: 'music', labelKey: 'setupUi.colTypeMusic', icon: Music },
+  { value: 'mixed', labelKey: 'setupUi.colTypeMixed', icon: Folder },
 ]
 
 function getParentPath(path: string): string {
@@ -85,7 +97,7 @@ function getParentPath(path: string): string {
 
 export function SetupWizardPage() {
   const { auth, isAdmin, userLoading, applyAuthResult, logout } = useAuth()
-  const { locale, t } = useI18n()
+  const { t } = useI18n()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
 
@@ -97,6 +109,7 @@ export function SetupWizardPage() {
   const [step, setStep] = useState<WizardStep>(1)
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const skippedSetupAdminRef = useRef(false)
 
   // Step 1: 服务器设置
   const [serverName, setServerName] = useState('Ambra')
@@ -186,7 +199,7 @@ export function SetupWizardPage() {
   const handleStep1Next = (e: React.FormEvent) => {
     e.preventDefault()
     if (!serverName.trim()) {
-      setError('请输入服务器名称')
+      setError(t('setupUi.errServerNameRequired'))
       return
     }
     setError('')
@@ -196,32 +209,53 @@ export function SetupWizardPage() {
     setStep(2)
   }
 
+  const handleStep2SkipWithExistingAdmin = async () => {
+    if (!isAdmin) return
+    setError('')
+    setSubmitting(true)
+    skippedSetupAdminRef.current = true
+    try {
+      await api.updateServerConfig({
+        ServerName: serverName.trim() || 'Ambra',
+        TMDBLanguage: language,
+        PreferredMetadataLanguage: language,
+        MetadataCountryCode: country,
+      })
+      setStep(3)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('setupUi.errSaveLangCountryFailed'))
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
   const handleStep2Submit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (setupStatus?.has_users === true && !isAdmin) {
-      setError('服务器已创建用户，请先使用管理员账号登录后再继续初始化配置')
+      setError(t('setupUi.errUsersExistLoginAdmin'))
       return
     }
     const trimmedUser = username.trim()
     if (!trimmedUser) {
-      setError('请输入管理员用户名')
+      setError(t('setupUi.errAdminUsernameRequired'))
       return
     }
     if (!password) {
-      setError('请输入管理员密码')
+      setError(t('setupUi.errAdminPasswordRequired'))
       return
     }
-    if (password.length < 4) {
-      setError('管理员密码长度至少为 4 位')
+    if (password.length < 6) {
+      setError(t('setupUi.errAdminPasswordTooShort'))
       return
     }
     if (password !== confirmPassword) {
-      setError('两次输入的密码不一致，请重新确认')
+      setError(t('setupUi.errPasswordMismatch'))
       return
     }
 
     setError('')
     setSubmitting(true)
+    skippedSetupAdminRef.current = false
     try {
       const res = await api.setupAdmin({
         server_name: serverName.trim(),
@@ -233,7 +267,7 @@ export function SetupWizardPage() {
       applyAuthResult(res)
       setStep(3)
     } catch (err) {
-      setError(err instanceof Error ? err.message : '创建管理员账号失败，请重试')
+      setError(err instanceof Error ? err.message : t('setupUi.errCreateAdminFailed'))
     } finally {
       setSubmitting(false)
     }
@@ -242,17 +276,17 @@ export function SetupWizardPage() {
   const handleAddLibrary = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!isAdmin) {
-      setError('仅管理员可执行媒体库挂载配置，请使用管理员账号登录')
+      setError(t('setupUi.errAdminOnlyLibrary'))
       return
     }
     const trimmedName = libName.trim()
     const trimmedPath = libPath.trim()
     if (!trimmedName) {
-      setError('请输入媒体库名称')
+      setError(t('setupUi.errLibNameRequired'))
       return
     }
     if (!trimmedPath) {
-      setError('请输入或浏览选择一个服务器目录路径')
+      setError(t('setupUi.errLibPathRequired'))
       return
     }
 
@@ -279,9 +313,9 @@ export function SetupWizardPage() {
       setTriggerScan(true)
       setLibName('')
       setLibPath('')
-      setLibraryFeedback(`已添加媒体库「${trimmedName}」`)
+      setLibraryFeedback(t('setupUi.libAddedFeedback', { name: trimmedName }))
     } catch (err) {
-      setError(err instanceof Error ? err.message : '添加媒体库失败，请检查路径后重试')
+      setError(err instanceof Error ? err.message : t('setupUi.errAddLibFailed'))
     } finally {
       setAddingLibrary(false)
     }
@@ -297,14 +331,23 @@ export function SetupWizardPage() {
   const handleCompleteSetup = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!isAdmin) {
-      setError('仅管理员可完成服务器初始化配置，请使用管理员账号登录')
+      setError(t('setupUi.errAdminOnlyComplete'))
       return
     }
     setError('')
     setSubmitting(true)
     try {
+      if (skippedSetupAdminRef.current) {
+        await api.updateServerConfig({
+          ServerName: serverName.trim() || 'Ambra',
+          TMDBLanguage: tmdbLanguage || language,
+          PreferredMetadataLanguage: language,
+          MetadataCountryCode: country,
+        })
+      }
       await api.completeSetup({
         server_name: serverName.trim() || 'Ambra',
+        ...(skippedSetupAdminRef.current ? { language, country } : {}),
         tmdb_api_key: tmdbApiKey.trim() || undefined,
         tmdb_language: tmdbLanguage,
         enable_strm_302: enableStrm302,
@@ -318,7 +361,7 @@ export function SetupWizardPage() {
       ])
       navigate('/', { replace: true })
     } catch (err) {
-      setError(err instanceof Error ? err.message : '完成初始化失败，请重试')
+      setError(err instanceof Error ? err.message : t('setupUi.errCompleteFailed'))
     } finally {
       setSubmitting(false)
     }
@@ -346,15 +389,11 @@ export function SetupWizardPage() {
             <AmbraLogo size={54} />
           </div>
           <h1 className="text-2xl font-bold tracking-tight text-zinc-50">{t('setup.title')}</h1>
-          <p className="mt-1.5 text-xs text-zinc-400">
-            {locale === 'zh-CN'
-              ? '首次运行初始化向导 · 只需 4 步完成你的专属私人影院部署'
-              : t('setup.subtitle')}
-          </p>
+          <p className="mt-1.5 text-xs text-zinc-400">{t('setupUi.wizardBannerSubtitle')}</p>
         </div>
 
         {/* 4 步水平进度条 */}
-        <div className="mb-6 grid grid-cols-4 gap-2 sm:gap-3" aria-label="初始化步骤">
+        <div className="mb-6 grid grid-cols-4 gap-2 sm:gap-3" aria-label={t('setupUi.stepsAria')}>
           {STEPS.map((s) => {
             const Icon = s.icon
             const isDone = step > s.id
@@ -386,10 +425,10 @@ export function SetupWizardPage() {
                     isCurrent ? 'text-amber-200' : isDone ? 'text-emerald-200' : 'text-zinc-400'
                   }`}
                 >
-                  {s.title}
+                  {t(s.titleKey)}
                 </span>
                 <span className="mt-0.5 hidden text-[10px] text-zinc-500 sm:block">
-                  {s.subtitle}
+                  {t(s.subtitleKey)}
                 </span>
               </div>
             )
@@ -403,10 +442,8 @@ export function SetupWizardPage() {
             className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-red-500/35 bg-red-500/10 px-4 py-3 text-xs text-red-200"
           >
             <div className="min-w-0 flex-1">
-              <p className="font-semibold text-red-100">当前账号不具备管理员权限</p>
-              <p className="mt-0.5 text-[11px] text-red-200/80">
-                普通成员账号无权执行服务器初始化向导及媒体库/刮削配置，请切换至管理员账号登录。
-              </p>
+              <p className="font-semibold text-red-100">{t('setupUi.nonAdminAlertTitle')}</p>
+              <p className="mt-0.5 text-[11px] text-red-200/80">{t('setupUi.nonAdminAlertDesc')}</p>
             </div>
             <button
               type="button"
@@ -414,7 +451,7 @@ export function SetupWizardPage() {
               className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-amber-500 px-3.5 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400"
             >
               <LogIn className="h-3.5 w-3.5" />
-              <span>切换管理员登录</span>
+              <span>{t('setupUi.switchAdminLoginBtn')}</span>
             </button>
           </div>
         )}
@@ -423,9 +460,9 @@ export function SetupWizardPage() {
         {setupStatus?.has_users === true && !auth && (
           <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-200">
             <div className="min-w-0 flex-1">
-              <p className="font-semibold text-amber-100">检测到服务器已创建管理员账号</p>
+              <p className="font-semibold text-amber-100">{t('setupUi.existingAdminAlertTitle')}</p>
               <p className="mt-0.5 text-[11px] text-amber-200/80">
-                如果此前已创建管理员但尚未完成初始化，请先登录已有管理员账号再继续配置。
+                {t('setupUi.existingAdminAlertDesc')}
               </p>
             </div>
             <Link
@@ -433,7 +470,7 @@ export function SetupWizardPage() {
               className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-amber-500 px-3.5 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400"
             >
               <LogIn className="h-3.5 w-3.5" />
-              <span>使用已有管理员登录</span>
+              <span>{t('setupUi.loginExistingAdminBtn')}</span>
             </Link>
           </div>
         )}
@@ -454,10 +491,8 @@ export function SetupWizardPage() {
           {step === 1 && (
             <form onSubmit={handleStep1Next} className="space-y-5">
               <div>
-                <h2 className="text-lg font-semibold text-zinc-100">第 1 步 · 服务器基础设置</h2>
-                <p className="mt-1 text-xs text-zinc-400">
-                  为你的影院服务器命名，并选择默认的元数据刮削语言与地区
-                </p>
+                <h2 className="text-lg font-semibold text-zinc-100">{t('setupUi.step1Heading')}</h2>
+                <p className="mt-1 text-xs text-zinc-400">{t('setupUi.step1Desc')}</p>
               </div>
 
               <div className="space-y-4">
@@ -478,7 +513,7 @@ export function SetupWizardPage() {
                         setServerName(e.target.value)
                         setServerNameTouched(true)
                       }}
-                      placeholder="例如：Ambra 家庭影院"
+                      placeholder={t('setupUi.serverNamePlaceholder')}
                       className="w-full rounded-xl border border-white/10 bg-white/[0.04] py-2.5 pl-10 pr-4 text-sm text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-amber-400/60 focus:bg-white/[0.06]"
                     />
                   </div>
@@ -490,7 +525,7 @@ export function SetupWizardPage() {
                       htmlFor="setup-language"
                       className="mb-1.5 block text-xs font-medium text-zinc-400"
                     >
-                      {locale === 'zh-CN' ? '首选刮削语言' : t('setup.tmdbLanguage')}
+                      {t('setupUi.preferredScrapeLang')}
                     </label>
                     <div className="relative">
                       <Globe className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500" />
@@ -517,7 +552,7 @@ export function SetupWizardPage() {
                       htmlFor="setup-country"
                       className="mb-1.5 block text-xs font-medium text-zinc-400"
                     >
-                      国家 / 地区
+                      {t('setupUi.countryRegionLabel')}
                     </label>
                     <select
                       id="setup-country"
@@ -527,7 +562,7 @@ export function SetupWizardPage() {
                     >
                       {COUNTRY_OPTIONS.map((opt) => (
                         <option key={opt.value} value={opt.value}>
-                          {opt.label}
+                          {t(opt.labelKey)}
                         </option>
                       ))}
                     </select>
@@ -540,7 +575,7 @@ export function SetupWizardPage() {
                   type="submit"
                   className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 px-6 py-2.5 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all hover:from-amber-400 hover:to-orange-400"
                 >
-                  <span>下一步：创建管理员</span>
+                  <span>{t('setupUi.nextCreateAdminBtn')}</span>
                   <ArrowRight className="h-4 w-4" />
                 </button>
               </div>
@@ -551,12 +586,8 @@ export function SetupWizardPage() {
           {step === 2 && (
             <form onSubmit={handleStep2Submit} className="space-y-5">
               <div>
-                <h2 className="text-lg font-semibold text-zinc-100">
-                  {locale === 'zh-CN' ? '第 2 步 · 创建管理员账号' : t('setup.createAdmin')}
-                </h2>
-                <p className="mt-1 text-xs text-zinc-400">
-                  此账号拥有服务器完整管理权限，创建完成后将自动为您登录
-                </p>
+                <h2 className="text-lg font-semibold text-zinc-100">{t('setupUi.step2Heading')}</h2>
+                <p className="mt-1 text-xs text-zinc-400">{t('setupUi.step2Desc')}</p>
               </div>
 
               <div className="space-y-4">
@@ -565,7 +596,7 @@ export function SetupWizardPage() {
                     htmlFor="setup-admin-username"
                     className="mb-1.5 block text-xs font-medium text-zinc-400"
                   >
-                    管理员用户名
+                    {t('setupUi.adminUsernameLabel')}
                   </label>
                   <div className="relative">
                     <User className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500" />
@@ -575,7 +606,7 @@ export function SetupWizardPage() {
                       autoComplete="username"
                       value={username}
                       onChange={(e) => setUsername(e.target.value)}
-                      placeholder="输入管理员用户名"
+                      placeholder={t('setupUi.adminUsernamePlaceholder')}
                       className="w-full rounded-xl border border-white/10 bg-white/[0.04] py-2.5 pl-10 pr-4 text-sm text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-amber-400/60 focus:bg-white/[0.06]"
                     />
                   </div>
@@ -587,7 +618,7 @@ export function SetupWizardPage() {
                       htmlFor="setup-admin-password"
                       className="mb-1.5 block text-xs font-medium text-zinc-400"
                     >
-                      管理员密码（至少 4 位）
+                      {t('setupUi.adminPasswordLabel')}
                     </label>
                     <div className="relative">
                       <Lock className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500" />
@@ -597,7 +628,7 @@ export function SetupWizardPage() {
                         autoComplete="new-password"
                         value={password}
                         onChange={(e) => setPassword(e.target.value)}
-                        placeholder="设置登录密码"
+                        placeholder={t('setupUi.adminPasswordPlaceholder')}
                         className="w-full rounded-xl border border-white/10 bg-white/[0.04] py-2.5 pl-10 pr-4 text-sm text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-amber-400/60 focus:bg-white/[0.06]"
                       />
                     </div>
@@ -608,7 +639,7 @@ export function SetupWizardPage() {
                       htmlFor="setup-admin-confirm"
                       className="mb-1.5 block text-xs font-medium text-zinc-400"
                     >
-                      确认密码
+                      {t('setupUi.confirmPasswordLabel')}
                     </label>
                     <div className="relative">
                       <Lock className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500" />
@@ -618,7 +649,7 @@ export function SetupWizardPage() {
                         autoComplete="new-password"
                         value={confirmPassword}
                         onChange={(e) => setConfirmPassword(e.target.value)}
-                        placeholder="再次输入密码"
+                        placeholder={t('setupUi.confirmPasswordPlaceholder')}
                         className="w-full rounded-xl border border-white/10 bg-white/[0.04] py-2.5 pl-10 pr-4 text-sm text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-amber-400/60 focus:bg-white/[0.06]"
                       />
                     </div>
@@ -637,7 +668,7 @@ export function SetupWizardPage() {
                   className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-white/[0.08] disabled:opacity-50"
                 >
                   <ArrowLeft className="h-4 w-4" />
-                  <span>上一步</span>
+                  <span>{t('setupUi.prevStepBtn')}</span>
                 </button>
 
                 <div className="flex flex-wrap items-center gap-2">
@@ -647,19 +678,17 @@ export function SetupWizardPage() {
                       className="inline-flex items-center gap-1.5 rounded-xl border border-amber-400/40 bg-amber-500/15 px-4 py-2.5 text-xs font-semibold text-amber-200 transition-colors hover:bg-amber-500/25"
                     >
                       <LogIn className="h-3.5 w-3.5" />
-                      <span>使用已有管理员登录</span>
+                      <span>{t('setupUi.loginExistingAdminBtn')}</span>
                     </Link>
                   )}
                   {setupStatus?.has_users === true && auth && isAdmin && (
                     <button
                       type="button"
-                      onClick={() => {
-                        setError('')
-                        setStep(3)
-                      }}
-                      className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-400/40 bg-emerald-500/15 px-4 py-2.5 text-xs font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/25"
+                      disabled={submitting}
+                      onClick={() => void handleStep2SkipWithExistingAdmin()}
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-400/40 bg-emerald-500/15 px-4 py-2.5 text-xs font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/25 disabled:opacity-50"
                     >
-                      <span>已登录，直接下一步</span>
+                      <span>{t('setupUi.loggedInSkipBtn')}</span>
                       <ArrowRight className="h-3.5 w-3.5" />
                     </button>
                   )}
@@ -671,11 +700,11 @@ export function SetupWizardPage() {
                     {submitting ? (
                       <>
                         <Loader2 className="h-4 w-4 animate-spin" />
-                        <span>正在创建管理员...</span>
+                        <span>{t('setupUi.creatingAdmin')}</span>
                       </>
                     ) : (
                       <>
-                        <span>创建并继续</span>
+                        <span>{t('setupUi.createAndContinueBtn')}</span>
                         <ArrowRight className="h-4 w-4" />
                       </>
                     )}
@@ -692,10 +721,10 @@ export function SetupWizardPage() {
                 <ShieldCheck className="h-6 w-6" />
               </div>
               <h2 className="text-base font-semibold text-zinc-100">
-                需要管理员权限才能继续配置
+                {t('setupUi.adminRequiredTitle')}
               </h2>
               <p className="mx-auto max-w-md text-xs leading-relaxed text-zinc-400">
-                媒体库挂载与服务器初始化配置仅限管理员账号执行。请使用管理员账号登录后继续。
+                {t('setupUi.adminRequiredDesc')}
               </p>
               <div className="flex items-center justify-center gap-3 pt-2">
                 <button
@@ -704,13 +733,13 @@ export function SetupWizardPage() {
                   className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-5 py-2.5 text-xs font-semibold text-zinc-950 hover:bg-amber-400"
                 >
                   <LogIn className="h-3.5 w-3.5" />
-                  <span>切换管理员登录</span>
+                  <span>{t('setupUi.switchAdminLoginBtn')}</span>
                 </button>
                 <Link
                   to="/"
                   className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2.5 text-xs font-medium text-zinc-300 hover:bg-white/[0.08]"
                 >
-                  <span>返回首页</span>
+                  <span>{t('auth.backHome')}</span>
                 </Link>
               </div>
             </div>
@@ -720,10 +749,8 @@ export function SetupWizardPage() {
           {step === 3 && !blockedByRole && (
             <div className="space-y-5">
               <div>
-                <h2 className="text-lg font-semibold text-zinc-100">第 3 步 · 添加媒体库</h2>
-                <p className="mt-1 text-xs text-zinc-400">
-                  挂载你的电影、剧集或音乐目录（支持连续添加多个，也可暂时跳过稍后在管理控制台添加）
-                </p>
+                <h2 className="text-lg font-semibold text-zinc-100">{t('setupUi.step3Heading')}</h2>
+                <p className="mt-1 text-xs text-zinc-400">{t('setupUi.step3Desc')}</p>
               </div>
 
               {libraryFeedback && (
@@ -737,11 +764,13 @@ export function SetupWizardPage() {
               {addedLibraries.length > 0 && (
                 <div className="space-y-2">
                   <p className="text-xs font-medium text-zinc-400">
-                    已添加的媒体库（{addedLibraries.length}）
+                    {t('setupUi.addedLibsHeader', { count: addedLibraries.length })}
                   </p>
                   <div className="space-y-2">
                     {addedLibraries.map((lib) => {
-                      const typeInfo = COLLECTION_TYPES.find((t) => t.value === lib.collectionType)
+                      const typeInfo = COLLECTION_TYPES.find(
+                        (ct) => ct.value === lib.collectionType,
+                      )
                       return (
                         <div
                           key={lib.id}
@@ -753,7 +782,7 @@ export function SetupWizardPage() {
                                 {lib.name}
                               </span>
                               <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300">
-                                {typeInfo?.label || lib.collectionType}
+                                {typeInfo ? t(typeInfo.labelKey) : lib.collectionType}
                               </span>
                             </div>
                             <p className="mt-0.5 truncate font-mono text-xs text-zinc-400">
@@ -779,14 +808,14 @@ export function SetupWizardPage() {
                       htmlFor="setup-lib-name"
                       className="mb-1.5 block text-xs font-medium text-zinc-400"
                     >
-                      媒体库名称
+                      {t('setupUi.libNameLabel')}
                     </label>
                     <input
                       id="setup-lib-name"
                       type="text"
                       value={libName}
                       onChange={(e) => setLibName(e.target.value)}
-                      placeholder="例如：4K 电影"
+                      placeholder={t('setupUi.libNamePlaceholder')}
                       className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
                     />
                   </div>
@@ -796,7 +825,7 @@ export function SetupWizardPage() {
                       htmlFor="setup-lib-type"
                       className="mb-1.5 block text-xs font-medium text-zinc-400"
                     >
-                      内容类型
+                      {t('setupUi.libTypeLabel')}
                     </label>
                     <select
                       id="setup-lib-type"
@@ -804,9 +833,9 @@ export function SetupWizardPage() {
                       onChange={(e) => setLibType(e.target.value)}
                       className="w-full rounded-xl border border-white/10 bg-[#14141d] px-3.5 py-2 text-sm text-zinc-100 outline-none focus:border-amber-400/60"
                     >
-                      {COLLECTION_TYPES.map((t) => (
-                        <option key={t.value} value={t.value}>
-                          {t.label}
+                      {COLLECTION_TYPES.map((ct) => (
+                        <option key={ct.value} value={ct.value}>
+                          {t(ct.labelKey)}
                         </option>
                       ))}
                     </select>
@@ -818,7 +847,7 @@ export function SetupWizardPage() {
                     htmlFor="setup-lib-path"
                     className="mb-1.5 block text-xs font-medium text-zinc-400"
                   >
-                    服务器目录路径
+                    {t('setupUi.serverDirPathLabel')}
                   </label>
                   <div className="flex gap-2">
                     <input
@@ -826,7 +855,7 @@ export function SetupWizardPage() {
                       type="text"
                       value={libPath}
                       onChange={(e) => setLibPath(e.target.value)}
-                      placeholder="输入路径如 /media/movies，或点击右侧浏览"
+                      placeholder={t('setupUi.serverDirPathPlaceholder')}
                       className="flex-1 rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
                     />
                     <button
@@ -838,7 +867,7 @@ export function SetupWizardPage() {
                       className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
                     >
                       <HardDrive className="h-3.5 w-3.5" />
-                      <span>浏览目录</span>
+                      <span>{t('setupUi.browseDirBtn')}</span>
                     </button>
                   </div>
                 </div>
@@ -846,8 +875,8 @@ export function SetupWizardPage() {
                 <ToggleSwitch
                   checked={saveLocalMetadata}
                   onChange={setSaveLocalMetadata}
-                  label="保存元数据与图片到媒体文件夹"
-                  description="刮削完成后自动将 .nfo 与 poster.jpg / fanart.jpg 保存到媒体同目录（兼容 Emby / Kodi）"
+                  label={t('setupUi.saveLocalMetaLabel')}
+                  description={t('setupUi.saveLocalMetaDesc')}
                 />
 
                 <div className="flex justify-end">
@@ -861,7 +890,7 @@ export function SetupWizardPage() {
                     ) : (
                       <Plus className="h-3.5 w-3.5" />
                     )}
-                    <span>添加此媒体库</span>
+                    <span>{t('setupUi.addThisLibBtn')}</span>
                   </button>
                 </div>
               </form>
@@ -869,15 +898,19 @@ export function SetupWizardPage() {
               <div className="flex items-center justify-between pt-2">
                 <span className="text-xs text-zinc-500">
                   {addedLibraries.length === 0
-                    ? '也可以稍后在管理控制台添加媒体库'
-                    : `已就绪 ${addedLibraries.length} 个媒体库`}
+                    ? t('setupUi.canAddLaterHint')
+                    : t('setupUi.readyLibsCount', { count: addedLibraries.length })}
                 </span>
                 <button
                   type="button"
                   onClick={handleStep3Next}
                   className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 px-6 py-2.5 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/25 transition-all hover:from-amber-400 hover:to-orange-400"
                 >
-                  <span>{addedLibraries.length > 0 ? '下一步：刮削设置' : '暂时跳过'}</span>
+                  <span>
+                    {addedLibraries.length > 0
+                      ? t('setupUi.nextScraperSettingsBtn')
+                      : t('setupUi.skipForNowBtn')}
+                  </span>
                   <ArrowRight className="h-4 w-4" />
                 </button>
               </div>
@@ -888,10 +921,8 @@ export function SetupWizardPage() {
           {step === 4 && !blockedByRole && (
             <form onSubmit={handleCompleteSetup} className="space-y-5">
               <div>
-                <h2 className="text-lg font-semibold text-zinc-100">第 4 步 · 刮削与偏好设置</h2>
-                <p className="mt-1 text-xs text-zinc-400">
-                  配置 TMDB 元数据刮削与影院偏好，完成后即可进入 Ambra 首页
-                </p>
+                <h2 className="text-lg font-semibold text-zinc-100">{t('setupUi.step4Heading')}</h2>
+                <p className="mt-1 text-xs text-zinc-400">{t('setupUi.step4Desc')}</p>
               </div>
 
               <div className="space-y-4">
@@ -909,12 +940,12 @@ export function SetupWizardPage() {
                       type="text"
                       value={tmdbApiKey}
                       onChange={(e) => setTmdbApiKey(e.target.value)}
-                      placeholder="留空将使用内置默认密钥，或输入自定义 TMDB v3 API Key / Read Access Token"
+                      placeholder={t('setupUi.tmdbKeyPlaceholder')}
                       className="w-full rounded-xl border border-white/10 bg-white/[0.04] py-2.5 pl-10 pr-4 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-amber-400/60 focus:bg-white/[0.06]"
                     />
                   </div>
                   <p className="mt-1.5 text-[11px] leading-relaxed text-zinc-500">
-                    留空即自动使用内置 TMDB 密钥刮削中文元数据与高清海报；填写自定义密钥将优先使用，也可稍后在管理控制台修改
+                    {t('setupUi.tmdbKeyHint')}
                   </p>
                 </div>
 
@@ -923,7 +954,7 @@ export function SetupWizardPage() {
                     htmlFor="setup-tmdb-language"
                     className="mb-1.5 block text-xs font-medium text-zinc-400"
                   >
-                    刮削语言确认
+                    {t('setupUi.confirmScraperLangLabel')}
                   </label>
                   <select
                     id="setup-tmdb-language"
@@ -946,22 +977,22 @@ export function SetupWizardPage() {
                   <ToggleSwitch
                     checked={enableStrm302}
                     onChange={setEnableStrm302}
-                    label="启用 STRM 302 直链重定向"
-                    description="播放 .strm 云盘/网盘文件时直接 302 重定向到源站，节省服务器带宽"
+                    label={t('setupUi.strm302Label')}
+                    description={t('setupUi.strm302Desc')}
                   />
 
                   <ToggleSwitch
                     checked={triggerScan}
                     onChange={setTriggerScan}
-                    label="完成后立即扫描媒体库"
-                    description="自动索引刚添加的媒体目录并拉取影片海报与演职员信息"
+                    label={t('setupUi.scanOnCompleteLabel')}
+                    description={t('setupUi.scanOnCompleteDesc')}
                   />
 
                   <ToggleSwitch
                     checked={syncRankings}
                     onChange={setSyncRankings}
-                    label="完成后同步豆瓣 / IMDb / TMDB 热门榜单"
-                    description="自动在后台同步高分经典与近期热门榜单，丰富首页影单推荐"
+                    label={t('setupUi.syncRankingsLabel')}
+                    description={t('setupUi.syncRankingsDesc')}
                   />
                 </div>
               </div>
@@ -977,7 +1008,7 @@ export function SetupWizardPage() {
                   className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-white/[0.08] disabled:opacity-50"
                 >
                   <ArrowLeft className="h-4 w-4" />
-                  <span>上一步</span>
+                  <span>{t('setupUi.prevStepBtn')}</span>
                 </button>
 
                 <button
@@ -988,14 +1019,12 @@ export function SetupWizardPage() {
                   {submitting ? (
                     <>
                       <Loader2 className="h-4 w-4 animate-spin" />
-                      <span>正在完成初始化...</span>
+                      <span>{t('setupUi.completingSetup')}</span>
                     </>
                   ) : (
                     <>
                       <Sparkles className="h-4 w-4" />
-                      <span>
-                        {locale === 'zh-CN' ? '完成初始化并进入 Ambra' : t('setup.complete')}
-                      </span>
+                      <span>{t('setupUi.completeAndEnterBtn')}</span>
                     </>
                   )}
                 </button>
@@ -1008,8 +1037,8 @@ export function SetupWizardPage() {
       {/* 服务器目录浏览弹窗 */}
       <AdminModal
         open={browserOpen}
-        title="浏览服务器目录"
-        subtitle="点击文件夹进入下一级，选择目标目录作为媒体库路径"
+        title={t('setupUi.browserModalTitle')}
+        subtitle={t('setupUi.browserModalSubtitle')}
         maxWidthClass="max-w-xl"
         onClose={() => setBrowserOpen(false)}
       >
@@ -1023,17 +1052,17 @@ export function SetupWizardPage() {
                 className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.05] px-2 py-1 text-[11px] font-medium text-zinc-200 hover:bg-white/10 disabled:opacity-40"
               >
                 <ArrowUp className="h-3 w-3" />
-                <span>上级</span>
+                <span>{t('setupUi.browserUpLevel')}</span>
               </button>
               <button
                 type="button"
                 onClick={() => setBrowsePath('')}
                 className="rounded-lg px-2 py-1 text-[11px] text-zinc-400 hover:bg-white/8 hover:text-zinc-200"
               >
-                磁盘根列表
+                {t('setupUi.browserDiskRoots')}
               </button>
               <span className="truncate font-mono text-xs text-amber-300">
-                {browsePath || '根目录 / 驱动器'}
+                {browsePath || t('setupUi.browserRootDrives')}
               </span>
             </div>
 
@@ -1047,7 +1076,7 @@ export function SetupWizardPage() {
                 className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-amber-500/20 px-2.5 py-1 text-[11px] font-semibold text-amber-300 hover:bg-amber-500/30"
               >
                 <Check className="h-3 w-3" />
-                <span>选择当前目录</span>
+                <span>{t('setupUi.browserSelectCurrent')}</span>
               </button>
             )}
           </div>
@@ -1059,12 +1088,18 @@ export function SetupWizardPage() {
               </div>
             ) : browserError ? (
               <div className="px-3 py-8 text-center text-xs text-red-300">
-                读取服务器目录失败：
-                {browserError instanceof Error ? browserError.message : '接口暂不可用'}
-                <p className="mt-1 text-zinc-500">您仍可关闭弹窗并手动输入路径</p>
+                {t('setupUi.browserReadError', {
+                  error:
+                    browserError instanceof Error
+                      ? browserError.message
+                      : t('setupUi.browserApiUnavailable'),
+                })}
+                <p className="mt-1 text-zinc-500">{t('setupUi.browserManualInputHint')}</p>
               </div>
             ) : folderEntries.length === 0 ? (
-              <div className="py-10 text-center text-xs text-zinc-500">当前目录下没有子文件夹</div>
+              <div className="py-10 text-center text-xs text-zinc-500">
+                {t('setupUi.browserNoSubfolders')}
+              </div>
             ) : (
               <div className="space-y-1">
                 {folderEntries.map((entry) => (
@@ -1093,7 +1128,7 @@ export function SetupWizardPage() {
                       }}
                       className="shrink-0 rounded-md bg-white/8 px-2.5 py-1 text-[11px] font-medium text-zinc-300 transition-colors hover:bg-amber-500/25 hover:text-amber-200"
                     >
-                      选中
+                      {t('setupUi.browserSelectBtn')}
                     </button>
                   </div>
                 ))}

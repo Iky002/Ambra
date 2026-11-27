@@ -23,7 +23,7 @@ import {
 import { api, embyFetch } from '../../api/client'
 import type { BackupFileInfo, BackupInfoResponse } from '../../api/types'
 import { useI18n } from '../../i18n/I18nContext'
-import { AdminModal, FeedbackBanner, formatBytes, formatDateTime } from './adminUtils'
+import { AdminModal, adminLabel, FeedbackBanner, formatBytes, formatDateTime } from './adminUtils'
 
 interface MemoryHealth {
   AllocBytes: number
@@ -176,7 +176,7 @@ function getStatusBadge(status: string | undefined, t: (key: string) => string) 
 }
 
 export function HealthAndAuditTab() {
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
     null,
   )
@@ -190,6 +190,7 @@ export function HealthAndAuditTab() {
   const [auditSubTab, setAuditSubTab] = useState<AuditSubTab>('missingPosters')
   const [selectedOrphans, setSelectedOrphans] = useState<Set<string>>(new Set())
   const [cleaningOrphans, setCleaningOrphans] = useState(false)
+  const [confirmOrphanCleanupOpen, setConfirmOrphanCleanupOpen] = useState(false)
 
   const [reviewStatus, setReviewStatus] = useState<ReviewStatusFilter>('pending')
   const [reviews, setReviews] = useState<ScrapeAuditItem[]>([])
@@ -398,6 +399,7 @@ export function HealthAndAuditTab() {
         method: 'POST',
         body: JSON.stringify({ ItemIds: ids }),
       })
+      setConfirmOrphanCleanupOpen(false)
       setFeedback({
         type: 'success',
         message: t('admin.health.orphansCleanedSuccess', { count: res.Deleted }),
@@ -407,6 +409,7 @@ export function HealthAndAuditTab() {
       setAuditReport(refreshed)
       void fetchHealth(true)
     } catch (err) {
+      setConfirmOrphanCleanupOpen(false)
       setFeedback({
         type: 'error',
         message: err instanceof Error ? err.message : t('admin.health.orphansCleanFailed'),
@@ -795,7 +798,7 @@ export function HealthAndAuditTab() {
                 <button
                   type="button"
                   disabled={selectedOrphans.size === 0 || cleaningOrphans}
-                  onClick={() => void handleCleanupOrphans()}
+                  onClick={() => setConfirmOrphanCleanupOpen(true)}
                   className="inline-flex items-center gap-1.5 rounded-lg bg-red-500/20 px-3 py-1 text-xs font-semibold text-red-300 ring-1 ring-red-500/40 transition-colors hover:bg-red-500/30 disabled:opacity-40"
                 >
                   {cleaningOrphans ? (
@@ -1209,6 +1212,93 @@ export function HealthAndAuditTab() {
                 <RotateCcw className="h-3.5 w-3.5" />
               )}
               <span>{t('admin.health.confirmRestoreBtn')}</span>
+            </button>
+          </div>
+        </div>
+      </AdminModal>
+
+      <AdminModal
+        open={confirmOrphanCleanupOpen}
+        title={adminLabel(
+          t,
+          locale,
+          'admin.health.orphanCleanupModalTitle',
+          '确认清理磁盘孤立记录',
+          'Confirm Orphaned Records Cleanup',
+        )}
+        subtitle={adminLabel(
+          t,
+          locale,
+          'admin.health.orphanCleanupModalSubtitle',
+          '已选中 {{count}} 条孤立媒体记录',
+          '{{count}} orphaned media record(s) selected',
+          { count: selectedOrphans.size },
+        )}
+        maxWidthClass="max-w-md"
+        onClose={() => {
+          if (!cleaningOrphans) setConfirmOrphanCleanupOpen(false)
+        }}
+      >
+        <div className="space-y-4">
+          <div
+            role="alert"
+            data-testid="orphan-cleanup-nas-warning"
+            className="flex items-start gap-3 rounded-xl border border-red-500/35 bg-red-500/12 p-3.5 text-xs leading-relaxed text-red-100"
+          >
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-400" />
+            <div className="space-y-1.5">
+              <p className="font-semibold text-red-100">
+                {adminLabel(
+                  t,
+                  locale,
+                  'admin.health.orphanCleanupNasWarnTitle',
+                  '请先确认 NAS / 网络存储挂载已正常在线！',
+                  'Verify NAS / Network Drives Are Mounted & Online First!',
+                )}
+              </p>
+              <p className="text-red-200/90">
+                {adminLabel(
+                  t,
+                  locale,
+                  'admin.health.orphanCleanupNasWarnDesc',
+                  '若 SMB / NFS / 云盘挂载点因掉线或未挂载导致路径暂时不可访问，正常影片也会被判定为孤立项。继续执行将从数据库中永久移除这 {{count}} 条媒体记录及其关联观看数据！',
+                  'If an SMB / NFS / cloud mount is temporarily offline or unmounted, valid media files may appear missing. Proceeding will permanently remove {{count}} media record(s) and associated watch metadata from the database!',
+                  { count: selectedOrphans.size },
+                )}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex justify-end gap-2 pt-2">
+            <button
+              type="button"
+              disabled={cleaningOrphans}
+              onClick={() => setConfirmOrphanCleanupOpen(false)}
+              className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10 disabled:opacity-50"
+            >
+              {t('common.cancel')}
+            </button>
+            <button
+              type="button"
+              disabled={cleaningOrphans || selectedOrphans.size === 0}
+              onClick={() => void handleCleanupOrphans()}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-red-600 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-red-500 disabled:opacity-60"
+            >
+              {cleaningOrphans ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Trash2 className="h-3.5 w-3.5" />
+              )}
+              <span>
+                {adminLabel(
+                  t,
+                  locale,
+                  'admin.health.confirmCleanupOrphansBtn',
+                  '确认清理 ({{count}})',
+                  'Confirm Cleanup ({{count}})',
+                  { count: selectedOrphans.size },
+                )}
+              </span>
             </button>
           </div>
         </div>

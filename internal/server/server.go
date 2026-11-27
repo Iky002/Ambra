@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -100,6 +101,11 @@ type Server struct {
 	WSHub        *ws.Hub
 	Handler      http.Handler
 
+	ssdpMu           sync.Mutex
+	ssdpCtx          context.Context
+	ssdpCancel       context.CancelFunc
+	ssdpDone         chan struct{}
+	ssdpClosed       bool
 	dvrCancel        context.CancelFunc
 	dvrDone          chan struct{}
 	stopTrakt        func()
@@ -210,18 +216,10 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		FFmpegPath: snap.FFmpegPath,
 		Bus:        bus,
 	})
-	var ssdpB *ssdp.Broadcaster
-	if snap.EnableDLNA {
-		ssdpB = ssdp.NewBroadcaster(ssdp.Config{
-			ServerID:      snap.ServerID,
-			ServerName:    snap.ServerName,
-			ServerVersion: config.ServerVersion,
-			Port:          parseHTTPPort(snap.HTTPAddr),
-		})
-	}
 
 	taskMgr := scheduler.New(bus)
 	taskMgr.SetActiveTranscodeDirsFn(transcodeMgr.ActiveWorkDirs)
+	taskMgr.SetTranscodeTempDirFn(transcodeMgr.CurrentTempDir)
 	taskMgr.RegisterBuiltinTasks(
 		func(c context.Context) error {
 			if _, err := sc.ScanAll(c); err != nil {
@@ -308,6 +306,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	}
 
 	pluginAdminH := pluginadmin.New(registry, store)
+	pluginAdminH.SetPluginsDir(pluginsDir)
 	pluginAdminH.SetOnConfigSaved(func(pluginID string, saved map[string]any) {
 		switch pluginID {
 		case "ambra.builtin.tmdb":
@@ -369,6 +368,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	streamH := streaming.New(libRepo, pb, imgSvc)
 	streamH.SetExtractor(subExtractor)
 	streamH.SetUserRepo(userRepo)
+	streamH.SetTranscodeManager(transcodeMgr)
 	streamH.RegisterRoutes(mediaMux, streaming.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
@@ -505,6 +505,8 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	})
 	opsH := ops.New(store, cfg, userRepo, bus)
 	opsH.SetWSHub(wsHub)
+	opsH.SetItemAccessChecker(buildSessionItemAccessChecker(libRepo))
+	opsH.SetAuthDeps(authSvc, sessionMgr)
 	opsH.RegisterRoutes(mediaMux, ops.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
@@ -514,6 +516,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	purgeUserArtifacts := func(c context.Context, userID string) {
 		notifH.PurgeUser(c, userID)
 		opsH.PurgeUser(c, userID)
+		syncH.PurgeUser(c, userID)
 	}
 	usersHandler.SetOnUserDeleted(purgeUserArtifacts)
 
@@ -544,10 +547,11 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		RequireAdmin: authMW.RequireAdmin,
 	})
 	govSvc, err := governance.NewService(governance.Options{
-		Store:      store,
-		Config:     cfg,
-		Scheduler:  taskMgr,
-		BudgetPool: bgBudget,
+		Store:       store,
+		LibraryRepo: libRepo,
+		Config:      cfg,
+		Scheduler:   taskMgr,
+		BudgetPool:  bgBudget,
 	})
 	if err != nil {
 		notifH.Close()
@@ -597,6 +601,8 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	compatCoreSvc.SetOnUserDeleted(purgeUserArtifacts)
 	compatCoreSvc.SetRestoreHandler(opsH.HandleRestoreBackup)
 	compatCoreSvc.SetPartyHandlers(opsH.HandleLeaveCurrentParty, opsH.HandlePostPartyMessage)
+	compatCoreSvc.SetPackageCanceller(opsH.CancelPackageInstall)
+	compatCoreSvc.SetPluginUninstaller(pluginAdminH.UninstallPlugin)
 	compatCoreSvc.SetLifecycleHooks(
 		func() { _ = system.TriggerProcessRestart() },
 		func() { _ = system.TriggerProcessShutdown() },
@@ -616,6 +622,22 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	compatExtSvc.SetDVR(dvrRec)
 	compatExtSvc.SetLibraryRepo(libRepo)
 	compatExtSvc.SetUserRepo(userRepo)
+	compatExtSvc.SetNotificationTester(func(c context.Context, title, description string) error {
+		callerID := userIDFromCtx(c)
+		payload := plugins.NotificationPayload{
+			Event:   "NotificationTest",
+			Title:   title,
+			Message: description,
+			Level:   "Normal",
+			UserID:  callerID,
+		}
+		for _, n := range registry.Notifiers() {
+			if err := n.Notify(c, payload); err != nil {
+				return err
+			}
+		}
+		return notifH.SendTestNotification(c, callerID, title, description)
+	})
 	compatExtH := compatExtSvc.BuildRouter(compatext.AuthFuncs{
 		RequireAuth:   authMW.RequireAuth,
 		RequireAdmin:  authMW.RequireAdmin,
@@ -628,7 +650,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	webHandler := buildWebHandler(cfg.WebDir)
 
 	r := chi.NewRouter()
-	r.Use(middleware.CORSWithOrigins(cfg.AllowedOrigins))
+	r.Use(middleware.CORSWithDynamicOrigins(func() []string { return cfg.Snapshot().AllowedOrigins }))
 	r.Use(middleware.Gzip)
 	r.Use(middleware.EmbyPrefixAndCase)
 	r.Use(authMW.ParseAuth)
@@ -672,31 +694,31 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		dvrRec.SchedulerLoop(dvrCtx, 15*time.Second, livetvH.DueRecordingJobs)
 	}()
 
-	return &Server{
-		Config:       cfg,
-		Store:        store,
-		Bus:          bus,
-		Registry:     registry,
-		PluginLoader: extLoader,
-		WasmHost:     wHost,
-		Auth:         authSvc,
-		Sessions:     sessionMgr,
-		Scanner:      sc,
-		Watcher:      libWatcher,
-		Budget:       bgBudget,
-		Scheduler:    taskMgr,
-		Rankings:     rankingsSvc,
-		Migrator:     migrator,
-		Governance:   govSvc,
-		Playback:     pb,
-		Transcode:    transcodeMgr,
-		DVR:          dvrRec,
-		LiveTV:       livetvH,
-		SSDP:         ssdpB,
-		Imaging:      imgSvc,
-		Logs:         logsH,
-		WSHub:        wsHub,
-		Handler:      r,
+	srv := &Server{
+		Config:           cfg,
+		Store:            store,
+		Bus:              bus,
+		Registry:         registry,
+		PluginLoader:     extLoader,
+		WasmHost:         wHost,
+		Auth:             authSvc,
+		Sessions:         sessionMgr,
+		Scanner:          sc,
+		Watcher:          libWatcher,
+		Budget:           bgBudget,
+		Scheduler:        taskMgr,
+		Rankings:         rankingsSvc,
+		Migrator:         migrator,
+		Governance:       govSvc,
+		Playback:         pb,
+		Transcode:        transcodeMgr,
+		DVR:              dvrRec,
+		LiveTV:           livetvH,
+		Imaging:          imgSvc,
+		Logs:             logsH,
+		WSHub:            wsHub,
+		Handler:          r,
+		ssdpCtx:          dvrCtx,
 		dvrCancel:        dvrCancel,
 		dvrDone:          dvrDone,
 		stopTrakt:        stopTrakt,
@@ -704,7 +726,13 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		notifHandler:     notifH,
 		syncHandler:      syncH,
 		migrationHandler: migrationH,
-	}, nil
+	}
+	srv.applyDLNAState(snap.EnableDLNA)
+	systemHandler.SetOnDLNAConfigChanged(func(enabled bool, defaultUserID string) {
+		dlnaH.SetDefaultUserID(defaultUserID)
+		srv.applyDLNAState(enabled)
+	})
+	return srv, nil
 }
 
 func applyPendingDatabaseRestore(dataDir, dbPath string) error {
@@ -801,7 +829,79 @@ func parseHTTPPort(addr string) int {
 	return port
 }
 
+// SSDPBroadcaster returns the currently active SSDP broadcaster under lock, or nil when DLNA is disabled.
+func (s *Server) SSDPBroadcaster() *ssdp.Broadcaster {
+	s.ssdpMu.Lock()
+	defer s.ssdpMu.Unlock()
+	return s.SSDP
+}
+
+func (s *Server) applyDLNAState(enabled bool) {
+	s.ssdpMu.Lock()
+	defer s.ssdpMu.Unlock()
+	if s.ssdpClosed {
+		return
+	}
+	if !enabled {
+		if s.ssdpCancel != nil {
+			s.ssdpCancel()
+			s.ssdpCancel = nil
+		}
+		if s.ssdpDone != nil {
+			<-s.ssdpDone
+			s.ssdpDone = nil
+		}
+		s.SSDP = nil
+		return
+	}
+	if s.ssdpCancel != nil && s.SSDP != nil {
+		return
+	}
+	parentCtx := s.ssdpCtx
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	if parentCtx.Err() != nil {
+		return
+	}
+	var snap config.Config
+	if s.Config != nil {
+		snap = s.Config.Snapshot()
+	}
+	b := ssdp.NewBroadcaster(ssdp.Config{
+		ServerID:      snap.ServerID,
+		ServerName:    snap.ServerName,
+		ServerVersion: config.ServerVersion,
+		Port:          parseHTTPPort(snap.HTTPAddr),
+	})
+	instCtx, instCancel := context.WithCancel(parentCtx)
+	doneCh := make(chan struct{})
+	s.SSDP = b
+	s.ssdpCancel = instCancel
+	s.ssdpDone = doneCh
+	go func() {
+		defer close(doneCh)
+		_ = b.Start(instCtx)
+	}()
+}
+
+func (s *Server) stopSSDP() {
+	s.ssdpMu.Lock()
+	defer s.ssdpMu.Unlock()
+	s.ssdpClosed = true
+	if s.ssdpCancel != nil {
+		s.ssdpCancel()
+		s.ssdpCancel = nil
+	}
+	if s.ssdpDone != nil {
+		<-s.ssdpDone
+		s.ssdpDone = nil
+	}
+	s.SSDP = nil
+}
+
 func (s *Server) Close() error {
+	s.stopSSDP()
 	if s.WSHub != nil {
 		s.WSHub.Close()
 	}
@@ -877,7 +977,7 @@ func dispatchMuxAndCompat(mux *http.ServeMux, routers ...http.Handler) http.Hand
 	})
 }
 
-const webContentSecurityPolicy = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; media-src 'self' blob: https: http:; connect-src 'self' ws: wss: https:; worker-src 'self' blob:; font-src 'self' data:; object-src 'none'; frame-ancestors 'self'; base-uri 'self'"
+const webContentSecurityPolicy = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; media-src 'self' blob: https: http:; connect-src 'self' ws: wss: https: blob: data:; worker-src 'self' blob:; font-src 'self' data: blob:; object-src 'none'; frame-ancestors 'self'; base-uri 'self'"
 
 func setWebSecurityHeaders(w http.ResponseWriter) {
 	h := w.Header()
@@ -885,22 +985,6 @@ func setWebSecurityHeaders(w http.ResponseWriter) {
 	h.Set("X-Frame-Options", "SAMEORIGIN")
 	h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
 	h.Set("Content-Security-Policy", webContentSecurityPolicy)
-}
-
-func userCanAccessLibrary(user *sqlite.UserRecord, libraryID string) bool {
-	if user == nil || user.IsAdmin || user.Policy.IsAdministrator || user.Policy.EnableAllFolders {
-		return true
-	}
-	normLib := guid.Normalize(libraryID)
-	if normLib == "" || normLib == "collections" || normLib == "playlists" {
-		return true
-	}
-	for _, allowed := range user.Policy.EnabledFolders {
-		if guid.Normalize(allowed) == normLib {
-			return true
-		}
-	}
-	return false
 }
 
 func buildSessionItemAccessChecker(libRepo *sqlite.LibraryRepo) func(ctx context.Context, user *sqlite.UserRecord, itemID string) bool {
@@ -915,7 +999,7 @@ func buildSessionItemAccessChecker(libRepo *sqlite.LibraryRepo) func(ctx context
 		if user == nil || user.IsAdmin || user.Policy.IsAdministrator {
 			return true
 		}
-		if !userCanAccessLibrary(user, rec.LibraryID) {
+		if !session.UserCanAccessLibrary(ctx, libRepo, user, rec.LibraryID) {
 			return false
 		}
 		blocked, err := libRepo.IsItemBlockedByPolicy(ctx, rec, user.Policy)
@@ -961,7 +1045,7 @@ func buildWSLibraryChangeFilter(userRepo *sqlite.UserRepo, libRepo *sqlite.Libra
 		} else if v, ok := m["library_id"].(string); ok {
 			libID = guid.Normalize(v)
 		}
-		if libID != "" && !userCanAccessLibrary(user, libID) {
+		if libID != "" && !session.UserCanAccessLibrary(ctx, libRepo, user, libID) {
 			return nil, false
 		}
 

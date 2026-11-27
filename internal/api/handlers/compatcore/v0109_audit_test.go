@@ -122,10 +122,10 @@ func TestV0109Audit_ExtrasParentalRemoteAccessKVBoundsSessionAddAndDeleteKV(t *t
 	if recAuthWrong.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for wrong pw on remote-disabled user, got %d", recAuthWrong.Code)
 	}
-	// Correct password from public IP -> 403 + no token minted + Cache-Control: private, no-store
+	// Correct password from public IP for per-user remote-disabled user -> uniform 401 + no token minted + Cache-Control: private, no-store (M-02)
 	recAuthRemote := callAs(nil, http.MethodPost, "/Users/"+lanOnly.ID+"/Authenticate", `{"Pw":"lanpass"}`, "203.0.113.5:9999")
-	if recAuthRemote.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 for remote-disabled user from public IP, got %d body=%s", recAuthRemote.Code, recAuthRemote.Body.String())
+	if recAuthRemote.Code != http.StatusUnauthorized {
+		t.Fatalf("expected uniform 401 for remote-disabled user from public IP, got %d body=%s", recAuthRemote.Code, recAuthRemote.Body.String())
 	}
 	if cc := recAuthRemote.Header().Get("Cache-Control"); cc != "private, no-store" {
 		t.Fatalf("expected Cache-Control=private, no-store on authenticate, got %q", cc)
@@ -144,15 +144,15 @@ func TestV0109Audit_ExtrasParentalRemoteAccessKVBoundsSessionAddAndDeleteKV(t *t
 		t.Fatalf("expected Cache-Control=private, no-store on LAN authenticate, got %q", cc)
 	}
 
-	// Fallback path (authSvc == nil) also enforces EnableRemoteAccess after password check
+	// Fallback path (authSvc == nil) also enforces uniform 401 for per-user EnableRemoteAccess=false
 	hNoSvc := New(env.cfg, env.store, env.userRepo, env.libRepo, env.sessions, env.registry)
 	rNoSvc := hNoSvc.BuildRouter(AuthFuncs{})
 	reqNoSvc := httptest.NewRequest(http.MethodPost, "/Users/"+lanOnly.ID+"/Authenticate", bytes.NewBufferString(`{"Pw":"lanpass"}`))
 	reqNoSvc.RemoteAddr = "203.0.113.6:1234"
 	recNoSvc := httptest.NewRecorder()
 	rNoSvc.ServeHTTP(recNoSvc, reqNoSvc)
-	if recNoSvc.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 in fallback authSvc==nil path for remote-disabled user, got %d", recNoSvc.Code)
+	if recNoSvc.Code != http.StatusUnauthorized {
+		t.Fatalf("expected uniform 401 in fallback authSvc==nil path for remote-disabled user, got %d", recNoSvc.Code)
 	}
 
 	// [M-14] GET /Connect/Exchange sets Cache-Control: private, no-store

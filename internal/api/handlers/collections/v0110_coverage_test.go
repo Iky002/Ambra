@@ -176,7 +176,7 @@ func TestV0110_CollectionsExtendedPolicyReorderAndPermissions(t *testing.T) {
 	kidPol.EnableAllFolders = false
 	kidPol.EnabledFolders = []string{libAllowed.ID}
 	kidPol.MaxParentalRating = &maxPG
-	kidPol.BlockUnratedItems = []string{"Movie", "Series"}
+	kidPol.BlockUnratedItems = []string{"Movie", "Series", "BoxSet"}
 	kidPol.AllowedTags = []string{"kidsallowed"}
 
 	kid := &sqlite.UserRecord{

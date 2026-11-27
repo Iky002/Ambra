@@ -23,6 +23,7 @@ import { Link } from 'react-router-dom'
 import { api, getFallbackImageUrl, getImageUrl } from '../api/client'
 import type { AudioLyricsResponse, BaseItemDto } from '../api/types'
 import { useAudioPlayer } from '../context/AudioPlayerContext'
+import { useI18n } from '../i18n/I18nContext'
 
 export interface ParsedLyricLine {
   timeSec: number | null
@@ -151,14 +152,15 @@ function getTrackArtwork(track: BaseItemDto): { primary: string; fallback: strin
   return { primary: '', fallback: null }
 }
 
-function getTrackArtist(track: BaseItemDto): string {
+function getTrackArtist(track: BaseItemDto, unknownArtistLabel: string): string {
   if (track.Artists && track.Artists.length > 0) {
     return track.Artists.join(' / ')
   }
-  return track.AlbumArtist || '未知艺术家'
+  return track.AlbumArtist || unknownArtistLabel
 }
 
 export function AudioPlayerBar() {
+  const { t } = useI18n()
   const {
     queue,
     currentIndex,
@@ -209,9 +211,9 @@ export function AudioPlayerBar() {
     if (parsedLyrics.length === 0) return null
     let matchedTime: number | null = null
     for (let i = 0; i < parsedLyrics.length; i++) {
-      const t = parsedLyrics[i].timeSec
-      if (t != null && t <= currentTime + 0.15) {
-        matchedTime = t
+      const lineTime = parsedLyrics[i].timeSec
+      if (lineTime != null && lineTime <= currentTime + 0.15) {
+        matchedTime = lineTime
       }
     }
     return matchedTime
@@ -237,16 +239,17 @@ export function AudioPlayerBar() {
     return null
   }
 
+  const unknownArtistLabel = t('audioBar.unknownArtist')
   const art = getTrackArtwork(currentTrack)
-  const artistName = getTrackArtist(currentTrack)
+  const artistName = getTrackArtist(currentTrack, unknownArtistLabel)
   const effectiveDuration =
     duration > 0 ? duration : currentTrack.RunTimeTicks ? currentTrack.RunTimeTicks / 10_000_000 : 0
   const repeatLabel =
     repeatMode === 'one'
-      ? '单曲循环'
+      ? t('audioBar.repeatOne')
       : repeatMode === 'all'
-        ? '列表循环'
-        : '关闭循环'
+        ? t('audioBar.repeatAll')
+        : t('audioBar.repeatOff')
 
   return (
     <div
@@ -263,7 +266,7 @@ export function AudioPlayerBar() {
             <div className="mb-3 flex items-center justify-between border-b border-white/8 pb-2.5">
               <div className="min-w-0">
                 <h3 className="truncate text-sm font-semibold text-zinc-100">
-                  同步歌词 · {currentTrack.Name}
+                  {t('audioBar.syncedLyricsTitle', { name: currentTrack.Name })}
                 </h3>
                 <p className="truncate text-xs text-zinc-400">
                   {artistName}
@@ -273,7 +276,7 @@ export function AudioPlayerBar() {
               <button
                 type="button"
                 onClick={() => setLyricsOpen(false)}
-                aria-label="收起歌词面板"
+                aria-label={t('audioBar.collapseLyrics')}
                 className="rounded-lg p-1.5 text-zinc-400 transition-colors hover:bg-white/10 hover:text-zinc-100"
               >
                 <X className="h-4 w-4" />
@@ -284,10 +287,10 @@ export function AudioPlayerBar() {
               {lyricsLoading ? (
                 <div className="flex items-center justify-center gap-2 py-8 text-xs text-zinc-400">
                   <Loader2 className="h-4 w-4 animate-spin text-amber-400" />
-                  <span>正在加载同步歌词...</span>
+                  <span>{t('audioBar.loadingLyrics')}</span>
                 </div>
               ) : parsedLyrics.length === 0 ? (
-                <p className="py-8 text-xs text-zinc-500">暂无同步歌词</p>
+                <p className="py-8 text-xs text-zinc-500">{t('audioBar.noLyrics')}</p>
               ) : (
                 parsedLyrics.map((line, idx) => {
                   const isActive =
@@ -333,13 +336,13 @@ export function AudioPlayerBar() {
             <div className="flex items-center gap-2">
               <ListMusic className="h-4 w-4 text-amber-400" />
               <span className="text-sm font-semibold text-zinc-100">
-                播放队列 ({queue.length})
+                {t('audioBar.queueCount', { count: queue.length })}
               </span>
             </div>
             <button
               type="button"
               onClick={() => setQueueOpen(false)}
-              aria-label="关闭播放队列"
+              aria-label={t('audioBar.closeQueue')}
               className="rounded-lg p-1 text-zinc-400 hover:bg-white/10 hover:text-zinc-100"
             >
               <X className="h-4 w-4" />
@@ -368,7 +371,7 @@ export function AudioPlayerBar() {
                     <div className="min-w-0 flex-1">
                       <p className="truncate text-xs font-medium">{track.Name}</p>
                       <p className="truncate text-[11px] text-zinc-500">
-                        {getTrackArtist(track)}
+                        {getTrackArtist(track, unknownArtistLabel)}
                       </p>
                     </div>
                   </button>
@@ -380,7 +383,7 @@ export function AudioPlayerBar() {
                   <button
                     type="button"
                     onClick={() => removeFromQueue(idx)}
-                    aria-label={`从队列移除 ${track.Name}`}
+                    aria-label={t('audioBar.removeFromQueue', { name: track.Name })}
                     className="rounded-md p-1 text-zinc-500 opacity-70 transition-opacity hover:bg-red-500/15 hover:text-red-400 sm:opacity-0 sm:group-hover:opacity-100"
                   >
                     <Trash2 className="h-3.5 w-3.5" />
@@ -410,12 +413,12 @@ export function AudioPlayerBar() {
               className="inline-flex items-center gap-1 rounded-md bg-red-500/20 px-2 py-0.5 text-[11px] font-medium text-red-100 transition-colors hover:bg-red-500/35"
             >
               <RotateCw className="h-3 w-3" />
-              <span>重试</span>
+              <span>{t('audioBar.retry')}</span>
             </button>
             <button
               type="button"
               onClick={clearError}
-              aria-label="关闭错误提示"
+              aria-label={t('audioBar.dismissError')}
               className="rounded-md p-0.5 text-red-300 transition-colors hover:bg-red-500/20 hover:text-red-100"
             >
               <X className="h-3.5 w-3.5" />
@@ -469,8 +472,8 @@ export function AudioPlayerBar() {
             <button
               type="button"
               onClick={toggleShuffle}
-              aria-label="随机播放"
-              title={shuffle ? '已开启随机播放' : '开启随机播放'}
+              aria-label={t('audioBar.shuffle')}
+              title={shuffle ? t('audioBar.shuffleEnabled') : t('audioBar.enableShuffle')}
               className={`rounded-lg p-1.5 transition-colors ${
                 shuffle
                   ? 'bg-amber-500/15 text-amber-400'
@@ -482,8 +485,8 @@ export function AudioPlayerBar() {
             <button
               type="button"
               onClick={prev}
-              aria-label="上一曲"
-              title="上一曲"
+              aria-label={t('audioBar.prevTrack')}
+              title={t('audioBar.prevTrack')}
               className="rounded-lg p-1.5 text-zinc-300 transition-colors hover:bg-white/8 hover:text-white"
             >
               <SkipBack className="h-4 w-4" />
@@ -491,8 +494,8 @@ export function AudioPlayerBar() {
             <button
               type="button"
               onClick={togglePlay}
-              aria-label={isPlaying ? '暂停' : '播放'}
-              title={isPlaying ? '暂停' : '播放'}
+              aria-label={isPlaying ? t('audioBar.pause') : t('audioBar.play')}
+              title={isPlaying ? t('audioBar.pause') : t('audioBar.play')}
               className="flex h-9 w-9 items-center justify-center rounded-full bg-amber-500 text-zinc-950 shadow-md shadow-amber-500/30 transition-transform hover:bg-amber-400 active:scale-95"
             >
               {isPlaying ? (
@@ -504,8 +507,8 @@ export function AudioPlayerBar() {
             <button
               type="button"
               onClick={next}
-              aria-label="下一曲"
-              title="下一曲"
+              aria-label={t('audioBar.nextTrack')}
+              title={t('audioBar.nextTrack')}
               className="rounded-lg p-1.5 text-zinc-300 transition-colors hover:bg-white/8 hover:text-white"
             >
               <SkipForward className="h-4 w-4" />
@@ -513,7 +516,7 @@ export function AudioPlayerBar() {
             <button
               type="button"
               onClick={cycleRepeatMode}
-              aria-label={`循环模式：${repeatLabel}`}
+              aria-label={t('audioBar.repeatModeAria', { mode: repeatLabel })}
               title={repeatLabel}
               className={`rounded-lg p-1.5 transition-colors ${
                 repeatMode !== 'off'
@@ -533,7 +536,7 @@ export function AudioPlayerBar() {
             <span className="w-10 text-right">{formatAudioTime(currentTime)}</span>
             <input
               type="range"
-              aria-label="播放进度"
+              aria-label={t('audioBar.seekProgress')}
               min={0}
               max={effectiveDuration > 0 ? effectiveDuration : 100}
               step={0.5}
@@ -556,8 +559,8 @@ export function AudioPlayerBar() {
                 return nextOpen
               })
             }}
-            aria-label="同步歌词"
-            title="同步歌词"
+            aria-label={t('audioBar.syncedLyrics')}
+            title={t('audioBar.syncedLyrics')}
             className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors ${
               lyricsOpen
                 ? 'bg-amber-500/20 text-amber-300 ring-1 ring-amber-400/40'
@@ -565,7 +568,7 @@ export function AudioPlayerBar() {
             }`}
           >
             <FileText className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">歌词</span>
+            <span className="hidden sm:inline">{t('audioBar.lyricsShort')}</span>
           </button>
 
           <button
@@ -577,8 +580,8 @@ export function AudioPlayerBar() {
                 return nextOpen
               })
             }}
-            aria-label="播放队列"
-            title="播放队列"
+            aria-label={t('audioBar.queue')}
+            title={t('audioBar.queue')}
             className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors ${
               queueOpen
                 ? 'bg-amber-500/20 text-amber-300 ring-1 ring-amber-400/40'
@@ -593,8 +596,8 @@ export function AudioPlayerBar() {
             <button
               type="button"
               onClick={toggleMute}
-              aria-label={muted || volume === 0 ? '取消静音' : '静音'}
-              title={muted || volume === 0 ? '取消静音' : '静音'}
+              aria-label={muted || volume === 0 ? t('audioBar.unmute') : t('audioBar.mute')}
+              title={muted || volume === 0 ? t('audioBar.unmute') : t('audioBar.mute')}
               className="rounded-lg p-1.5 text-zinc-400 transition-colors hover:bg-white/8 hover:text-zinc-100"
             >
               {muted || volume === 0 ? (
@@ -605,7 +608,7 @@ export function AudioPlayerBar() {
             </button>
             <input
               type="range"
-              aria-label="音量"
+              aria-label={t('audioBar.volume')}
               min={0}
               max={1}
               step={0.05}
@@ -618,8 +621,8 @@ export function AudioPlayerBar() {
           <button
             type="button"
             onClick={close}
-            aria-label="关闭音乐播放器"
-            title="关闭播放器"
+            aria-label={t('audioBar.closePlayerAria')}
+            title={t('audioBar.closePlayerTitle')}
             className="rounded-lg p-1.5 text-zinc-400 transition-colors hover:bg-red-500/15 hover:text-red-400"
           >
             <X className="h-4 w-4" />

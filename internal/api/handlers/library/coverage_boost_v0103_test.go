@@ -251,7 +251,7 @@ func TestLibraryCoverageBoostV0103(t *testing.T) {
 		}
 		if counts.ArtistCount != 1 || counts.SongCount != 1 || counts.AlbumCount != 1 ||
 			counts.MusicVideoCount != 1 || counts.BoxSetCount != 1 || counts.BookCount != 1 ||
-			counts.TrailerCount != 1 || counts.ProgramCount != 1 {
+			counts.TrailerCount != 2 || counts.ProgramCount != 1 {
 			t.Fatalf("unexpected counts: %+v", counts)
 		}
 	})

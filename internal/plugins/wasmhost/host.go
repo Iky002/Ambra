@@ -119,7 +119,10 @@ type Request struct {
 	RawPath       string                       `json:"raw_path,omitempty"`
 	SubtitleQuery *plugins.SubtitleSearchQuery `json:"subtitle_query,omitempty"`
 	SubtitleID    string                       `json:"subtitle_id,omitempty"`
+	Notification  *plugins.NotificationPayload `json:"notification,omitempty"`
 }
+
+var errRedirectHostForbidden = errors.New("wasmhost: redirect host is not in AllowedHosts")
 
 type hostHTTPRequestPayload struct {
 	Method  string            `json:"method"`
@@ -147,6 +150,48 @@ type Host struct {
 	closed     bool
 }
 
+func wrapWasmHTTPClient(base *http.Client, customHTTP bool) *http.Client {
+	if base == nil {
+		base = netutil.NewSafeHTTPClientNoLoopback(10*time.Second, false)
+	}
+	cloned := *base
+	prevCheck := base.CheckRedirect
+	cloned.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("wasmhost: stopped after 10 redirects")
+		}
+		if req == nil || req.URL == nil || (req.URL.Scheme != "http" && req.URL.Scheme != "https") || req.URL.Hostname() == "" {
+			return errRedirectHostForbidden
+		}
+		if cc, ok := req.Context().Value(wasmCallCtxKey{}).(wasmCallContext); ok && len(cc.allowedHosts) > 0 {
+			if !matchAllowedHost(req.URL.Hostname(), cc.allowedHosts) {
+				return fmt.Errorf("%w: %s", errRedirectHostForbidden, req.URL.Hostname())
+			}
+		}
+		if !customHTTP {
+			if err := netutil.ValidateRemoteURLNoLoopback(req.URL.String(), false); err != nil {
+				return fmt.Errorf("%w: %v", errRedirectHostForbidden, err)
+			}
+		} else if ip := net.ParseIP(req.URL.Hostname()); ip != nil {
+			if err := netutil.ValidateIP(ip, true); err != nil {
+				return fmt.Errorf("%w: %v", errRedirectHostForbidden, err)
+			}
+		}
+		if prevCheck != nil {
+			return prevCheck(req, via)
+		}
+		if len(via) > 0 && !strings.EqualFold(req.URL.Host, via[0].URL.Host) {
+			req.Header.Del("Authorization")
+			req.Header.Del("Cookie")
+			req.Header.Del("Proxy-Authorization")
+			req.Header.Del("X-Emby-Token")
+			req.Header.Del("X-MediaBrowser-Token")
+		}
+		return nil
+	}
+	return &cloned
+}
+
 // NewHost initializes a pure-Go wazero runtime with WASI preview1 support,
 // the "ambra" host module (log + restricted http_request), memory page limit (64 MiB),
 // concurrency limiting, and context-cancellation enforcement.
@@ -164,7 +209,7 @@ func NewHost(ctx context.Context) (*Host, error) {
 		runtime:        rt,
 		defaultTimeout: DefaultTimeout,
 		sem:            make(chan struct{}, defaultMaxConcurrentCalls),
-		httpClient:     netutil.NewSafeHTTPClientNoLoopback(10*time.Second, false),
+		httpClient:     wrapWasmHTTPClient(netutil.NewSafeHTTPClientNoLoopback(10*time.Second, false), false),
 	}
 
 	if _, err := rt.NewHostModuleBuilder("ambra").
@@ -188,7 +233,7 @@ func (h *Host) SetHTTPClient(c *http.Client) {
 		return
 	}
 	h.mu.Lock()
-	h.httpClient = c
+	h.httpClient = wrapWasmHTTPClient(c, true)
 	h.customHTTP = true
 	h.mu.Unlock()
 }
@@ -302,7 +347,8 @@ func (h *Host) hostHTTPRequest(ctx context.Context, m api.Module, reqPtr uint32,
 		method = http.MethodGet
 	}
 
-	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctxWithCall := context.WithValue(ctx, wasmCallCtxKey{}, cc)
+	reqCtx, cancel := context.WithTimeout(ctxWithCall, 10*time.Second)
 	defer cancel()
 
 	var bodyReader io.Reader
@@ -321,6 +367,9 @@ func (h *Host) hostHTTPRequest(ctx context.Context, m api.Module, reqPtr uint32,
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
+		if errors.Is(err, errRedirectHostForbidden) {
+			return HostHTTPErrForbidden
+		}
 		return HostHTTPErrNetwork
 	}
 	defer resp.Body.Close()
@@ -589,6 +638,7 @@ var (
 	_ plugins.MetadataProvider      = (*WasmPlugin)(nil)
 	_ plugins.StreamResolver        = (*WasmPlugin)(nil)
 	_ plugins.SubtitleProvider      = (*WasmPlugin)(nil)
+	_ plugins.Notifier              = (*WasmPlugin)(nil)
 	_ plugins.DefaultConfigExporter = (*WasmPlugin)(nil)
 )
 
@@ -824,6 +874,122 @@ func (p *WasmPlugin) DownloadSubtitle(ctx context.Context, subtitleID string) (*
 		Format:   format,
 		Content:  content,
 	}, nil
+}
+
+// Notify implements plugins.Notifier by invoking the WASM module's exported "ambra_notify"
+// function when present (forwarding the JSON notification envelope via WASI stdin and/or linear memory).
+// Modules that do not export "ambra_notify" (or disabled plugins) return nil cleanly.
+func (p *WasmPlugin) Notify(ctx context.Context, event plugins.NotificationPayload) error {
+	p.mu.RLock()
+	enabled := p.enabled
+	p.mu.RUnlock()
+	if !enabled || p.compiled == nil {
+		return nil
+	}
+
+	exported := p.compiled.ExportedFunctions()
+	if _, ok := exported["ambra_notify"]; !ok {
+		return nil
+	}
+
+	req := Request{
+		Action:       "notify",
+		Config:       p.snapshotConfig(),
+		Notification: &event,
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("wasmhost: marshal notification: %w", err)
+	}
+
+	if p.host.sem != nil {
+		select {
+		case p.host.sem <- struct{}{}:
+			defer func() { <-p.host.sem }()
+		case <-ctx.Done():
+			return fmt.Errorf("wasmhost: plugin %q cancelled waiting for execution slot: %w", p.manifest.ID, ctx.Err())
+		}
+	}
+
+	ctxWithMeta := context.WithValue(ctx, wasmCallCtxKey{}, wasmCallContext{
+		pluginID:     p.manifest.ID,
+		allowedHosts: p.allowedHosts,
+	})
+	callCtx, cancel := context.WithTimeout(ctxWithMeta, p.timeout)
+	defer cancel()
+
+	stdout := &limitedBuffer{limit: maxWasmStdoutBytes, cancel: cancel}
+	stderr := &limitedBuffer{limit: maxWasmStderrBytes, cancel: cancel}
+	modCfg := wazero.NewModuleConfig().
+		WithName("").
+		WithStartFunctions().
+		WithStdin(bytes.NewReader(payload)).
+		WithStdout(stdout).
+		WithStderr(stderr)
+
+	mod, err := p.host.runtime.InstantiateModule(callCtx, p.compiled, modCfg)
+	if err != nil {
+		return fmt.Errorf("wasmhost: instantiate module %q for ambra_notify: %w", p.manifest.ID, err)
+	}
+	defer func() {
+		_ = mod.Close(context.Background())
+	}()
+
+	fn := mod.ExportedFunction("ambra_notify")
+	if fn == nil {
+		return nil
+	}
+
+	var callRes []uint64
+	var callErr error
+	paramTypes := fn.Definition().ParamTypes()
+	switch len(paramTypes) {
+	case 0:
+		callRes, callErr = fn.Call(callCtx)
+	case 2:
+		var ptr uint32
+		allocated := false
+		for _, allocName := range []string{"ambra_alloc", "malloc", "alloc"} {
+			if allocFn := mod.ExportedFunction(allocName); allocFn != nil && len(allocFn.Definition().ParamTypes()) == 1 {
+				if aRes, aErr := allocFn.Call(callCtx, uint64(len(payload))); aErr == nil && len(aRes) > 0 {
+					ptr = uint32(aRes[0])
+					allocated = true
+					break
+				}
+			}
+		}
+		if mem := mod.Memory(); mem != nil {
+			if !allocated && mem.Size() >= uint32(len(payload)) {
+				// Use top of initial memory page if no allocator is exported.
+				ptr = mem.Size() - uint32(len(payload))
+			}
+			if !mem.Write(ptr, payload) {
+				return fmt.Errorf("wasmhost: write notification payload to %q memory failed", p.manifest.ID)
+			}
+		}
+		callRes, callErr = fn.Call(callCtx, uint64(ptr), uint64(len(payload)))
+	default:
+		return fmt.Errorf("wasmhost: unsupported ambra_notify signature on plugin %q (%d params)", p.manifest.ID, len(paramTypes))
+	}
+
+	if callErr != nil {
+		var exitErr *sys.ExitError
+		if errors.As(callErr, &exitErr) && exitErr.ExitCode() == 0 {
+			return nil
+		}
+		if callCtx.Err() != nil {
+			return fmt.Errorf("wasmhost: plugin %q ambra_notify timed out or cancelled: %w", p.manifest.ID, callCtx.Err())
+		}
+		errMsg := strings.TrimSpace(stderr.String())
+		if errMsg != "" {
+			return fmt.Errorf("wasmhost: plugin %q ambra_notify failed (%s): %w", p.manifest.ID, errMsg, callErr)
+		}
+		return fmt.Errorf("wasmhost: plugin %q ambra_notify failed: %w", p.manifest.ID, callErr)
+	}
+	if len(callRes) > 0 && int32(callRes[0]) < 0 {
+		return fmt.Errorf("wasmhost: plugin %q ambra_notify returned error code %d", p.manifest.ID, int32(callRes[0]))
+	}
+	return nil
 }
 
 func (p *WasmPlugin) snapshotConfig() map[string]any {

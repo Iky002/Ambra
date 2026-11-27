@@ -105,12 +105,13 @@ type Handler struct {
 	registry      *plugins.Registry
 	setup         SetupDeps
 
-	lifecycleMu    sync.RWMutex
-	wsHub          *ws.Hub
-	onRestart      func()
-	onShutdown     func()
-	pendingRestart atomic.Bool
-	shuttingDown   atomic.Bool
+	lifecycleMu         sync.RWMutex
+	wsHub               *ws.Hub
+	onRestart           func()
+	onShutdown          func()
+	onDLNAConfigChanged func(enabled bool, defaultUserID string)
+	pendingRestart      atomic.Bool
+	shuttingDown        atomic.Bool
 
 	setupRateMu sync.Mutex
 	setupRates  map[string][]time.Time
@@ -143,6 +144,14 @@ func (h *Handler) SetLifecycleHooks(onRestart, onShutdown func()) {
 	h.lifecycleMu.Lock()
 	h.onRestart = onRestart
 	h.onShutdown = onShutdown
+	h.lifecycleMu.Unlock()
+}
+
+// SetOnDLNAConfigChanged installs an optional hook invoked when EnableDLNA or DLNADefaultUserID changes.
+// When unset, changing DLNA settings sets HasPendingRestart=true.
+func (h *Handler) SetOnDLNAConfigChanged(fn func(enabled bool, defaultUserID string)) {
+	h.lifecycleMu.Lock()
+	h.onDLNAConfigChanged = fn
 	h.lifecycleMu.Unlock()
 }
 
@@ -464,7 +473,8 @@ func isTypedServerConfigKey(k string) bool {
 	case "ServerName", "IsStartupWizardCompleted", "TMDBApiKey", "HasTMDBApiKey", "TMDBLanguage",
 		"EnableSTRM302", "PlayedThreshold", "EnableDLNA", "DLNADefaultUserID", "EnableQuickConnect",
 		"EnableLoginUserList", "EnableRemoteAccess", "AllowedOrigins", "TrustedProxies", "LocalNetworkSubnets",
-		"SimultaneousStreamLimit", "RemoteClientBitrateLimit", "FFmpegPath", "FFprobePath":
+		"SimultaneousStreamLimit", "RemoteClientBitrateLimit", "FFmpegPath", "FFprobePath",
+		"HTTPAddr", "HttpServerPortNumber":
 		return true
 	default:
 		return false
@@ -491,6 +501,10 @@ func (h *Handler) applyConfigurationUpdate(w http.ResponseWriter, r *http.Reques
 	proxiesChanged := false
 	subnetsChanged := false
 	originsChanged := false
+	httpAddrChanged := false
+	dlnaChanged := false
+	var newEnableDLNA bool
+	var newDLNADefaultUserID string
 	var newProxies, newSubnets, newOrigins []string
 
 	h.cfg.Update(func(c *config.Config) {
@@ -518,12 +532,40 @@ func (h *Handler) applyConfigurationUpdate(w http.ResponseWriter, r *http.Reques
 		if v, ok := body["PlayedThreshold"].(float64); ok && v > 0 && v <= 1 {
 			c.PlayedThreshold = v
 		}
+		if v, ok := body["HTTPAddr"].(string); ok {
+			trimmed := strings.TrimSpace(v)
+			if trimmed != "" && !containsControl(trimmed) && trimmed != c.HTTPAddr {
+				c.HTTPAddr = trimmed
+				httpAddrChanged = true
+			}
+		}
+		if raw, exists := body["HttpServerPortNumber"]; exists {
+			if port, ok := parseIntField(raw); ok && port > 0 && port <= 65535 {
+				if port != parsePort(c.HTTPAddr, 8096) {
+					host := ""
+					if hPart, _, err := net.SplitHostPort(c.HTTPAddr); err == nil {
+						host = hPart
+					}
+					c.HTTPAddr = net.JoinHostPort(host, strconv.Itoa(port))
+					httpAddrChanged = true
+				}
+			}
+		}
 		if v, ok := body["EnableDLNA"].(bool); ok {
-			c.EnableDLNA = v
+			if c.EnableDLNA != v {
+				c.EnableDLNA = v
+				dlnaChanged = true
+			}
 		}
 		if v, ok := body["DLNADefaultUserID"].(string); ok && !containsControl(v) {
-			c.DLNADefaultUserID = strings.TrimSpace(v)
+			trimmed := strings.TrimSpace(v)
+			if c.DLNADefaultUserID != trimmed {
+				c.DLNADefaultUserID = trimmed
+				dlnaChanged = true
+			}
 		}
+		newEnableDLNA = c.EnableDLNA
+		newDLNADefaultUserID = c.DLNADefaultUserID
 		if v, ok := body["EnableQuickConnect"].(bool); ok {
 			c.EnableQuickConnect = v
 		}
@@ -565,12 +607,8 @@ func (h *Handler) applyConfigurationUpdate(w http.ResponseWriter, r *http.Reques
 				c.RemoteClientBitrateLimit = n
 			}
 		}
-		if v, ok := body["FFmpegPath"].(string); ok && strings.TrimSpace(v) != "" && !containsControl(v) {
-			c.FFmpegPath = strings.TrimSpace(v)
-		}
-		if v, ok := body["FFprobePath"].(string); ok && strings.TrimSpace(v) != "" && !containsControl(v) {
-			c.FFprobePath = strings.TrimSpace(v)
-		}
+		// Security (M-03): FFmpegPath and FFprobePath are intentionally read-only via HTTP API
+		// (only configurable via CLI flags, environment variables, or local config file).
 	})
 	saveErr := h.cfg.Save()
 
@@ -579,6 +617,19 @@ func (h *Handler) applyConfigurationUpdate(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	if httpAddrChanged {
+		h.SetPendingRestart(true)
+	}
+	if dlnaChanged {
+		h.lifecycleMu.RLock()
+		dlnaFn := h.onDLNAConfigChanged
+		h.lifecycleMu.RUnlock()
+		if dlnaFn != nil {
+			dlnaFn(newEnableDLNA, newDLNADefaultUserID)
+		} else {
+			h.SetPendingRestart(true)
+		}
+	}
 	if proxiesChanged {
 		netutil.SetTrustedProxies(newProxies)
 	}

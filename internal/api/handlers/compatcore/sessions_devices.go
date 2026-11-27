@@ -50,9 +50,35 @@ var allowedCameraUploadExts = map[string]bool{
 
 // --- /Sessions ---
 
+func parseSessionQueueItemIDs(raw any) []string {
+	switch v := raw.(type) {
+	case []string:
+		return v
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, elem := range v {
+			if s, ok := elem.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	case string:
+		out := make([]string, 0)
+		for _, part := range strings.Split(v, ",") {
+			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
 func (h *Handler) getSessionPlayQueue(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	filterID := strings.TrimSpace(q.Get("Id"))
+	fields := q.List("Fields")
 	startIndex := q.Int("StartIndex", 0)
 	if startIndex < 0 {
 		startIndex = 0
@@ -63,12 +89,52 @@ func (h *Handler) getSessionPlayQueue(w http.ResponseWriter, r *http.Request) {
 	isAdmin := h.isCallerAdmin(r)
 	if h.sessions != nil {
 		callerID := h.callerUserID(r)
+		var hiddenPlaylists []string
+		if h.libRepo != nil {
+			hiddenPlaylists = h.hiddenPrivatePlaylistIDs(r)
+		}
 		for _, s := range h.sessions.ListSessions() {
 			if !isAdmin && (callerID == "" || guid.Normalize(s.UserId) != callerID) {
 				continue
 			}
 			if filterID != "" && s.Id != filterID && s.DeviceId != filterID {
 				continue
+			}
+			queueIDs := h.sessions.GetSessionPlayQueueIDs(s.Id)
+			if len(queueIDs) > 0 && h.libRepo != nil {
+				polUID := guid.Normalize(s.UserId)
+				if !isAdmin && callerID != "" {
+					polUID = callerID
+				}
+				allowedLibs, pol := h.fullUserPolicyForUser(r, polUID)
+				queried, _, err := h.libRepo.QueryItems(r.Context(), sqlite.ItemFilter{
+					ServerID:          h.serverID(),
+					UserID:            polUID,
+					IDs:               queueIDs,
+					ExcludeItemIDs:    hiddenPlaylists,
+					AllowedLibraryIDs: allowedLibs,
+					MaxParentalRating: pol.MaxParentalRating,
+					BlockedTags:       pol.BlockedTags,
+					BlockUnratedItems: pol.BlockUnratedItems,
+					AllowedTags:       pol.AllowedTags,
+					Fields:            fields,
+				})
+				if err == nil {
+					byID := make(map[string]dto.BaseItemDto, len(queried))
+					for _, it := range queried {
+						byID[guid.Normalize(it.Id)] = it
+					}
+					for _, qid := range queueIDs {
+						if it, ok := byID[qid]; ok {
+							items = append(items, it)
+						} else if s.NowPlayingItem != nil && guid.Normalize(s.NowPlayingItem.Id) == qid {
+							if _, recErr := h.libRepo.GetItemRecordByID(r.Context(), qid); errors.Is(recErr, sqlite.ErrNotFound) {
+								items = append(items, *s.NowPlayingItem)
+							}
+						}
+					}
+					continue
+				}
 			}
 			if s.NowPlayingItem != nil {
 				items = append(items, *s.NowPlayingItem)
@@ -191,6 +257,13 @@ func (h *Handler) postSessionPlaying(w http.ResponseWriter, r *http.Request) {
 	}
 	if cmd := q.Get("PlayCommand"); cmd != "" {
 		body["PlayCommand"] = cmd
+	}
+	if found && h.sessions != nil {
+		queueIDs := parseSessionQueueItemIDs(body["ItemIds"])
+		playCmd, _ := body["PlayCommand"].(string)
+		if len(queueIDs) > 0 {
+			h.sessions.SetSessionPlayQueue(target.Id, queueIDs, playCmd)
+		}
 	}
 	h.pushSessionWS(target, found, "Play", body)
 	httpx.NoContent(w)
@@ -342,6 +415,15 @@ func (h *Handler) postSessionAddUser(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "UserId is required")
 		return
 	}
+	// Security (H-02): Non-admin callers may only attach themselves; reject cross-user IDs
+	// BEFORE querying userRepo via AddAdditionalUser so user existence/disabled status cannot be enumerated.
+	if !h.isCallerAdmin(r) {
+		callerUID := h.callerUserID(r)
+		if callerUID == "" || uid != callerUID {
+			httpx.Error(w, http.StatusForbidden, "forbidden")
+			return
+		}
+	}
 	if h.sessions != nil {
 		foundSess, err := h.sessions.AddAdditionalUser(r.Context(), sid, uid)
 		if err != nil {
@@ -364,6 +446,10 @@ func (h *Handler) postSessionAddUser(w http.ResponseWriter, r *http.Request) {
 	httpx.NoContent(w)
 }
 
+func (h *Handler) deleteSessionRemoveUser(w http.ResponseWriter, r *http.Request) {
+	h.deleteSessionUser(w, r)
+}
+
 func (h *Handler) deleteSessionUser(w http.ResponseWriter, r *http.Request) {
 	sid := chi.URLParam(r, "Id")
 	_, found, allowed := h.authorizeSessionTarget(r, sid)
@@ -376,6 +462,13 @@ func (h *Handler) deleteSessionUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	uid := guid.Normalize(chi.URLParam(r, "UserId"))
+	if !h.isCallerAdmin(r) {
+		callerUID := h.callerUserID(r)
+		if callerUID == "" || uid == "" || uid != callerUID {
+			httpx.Error(w, http.StatusForbidden, "forbidden")
+			return
+		}
+	}
 	if h.sessions != nil && uid != "" {
 		_ = h.sessions.RemoveAdditionalUser(sid, uid)
 	}

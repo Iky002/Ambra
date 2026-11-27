@@ -656,10 +656,13 @@ type tvdbRemoteID struct {
 }
 
 type tvdbArtwork struct {
-	Image    string  `json:"image"`
-	Type     int     `json:"type"`
-	Score    float64 `json:"score"`
-	Language string  `json:"language"`
+	Image     string  `json:"image"`
+	Thumbnail string  `json:"thumbnail"`
+	Type      int     `json:"type"`
+	Score     float64 `json:"score"`
+	Language  string  `json:"language"`
+	Width     int     `json:"width"`
+	Height    int     `json:"height"`
 }
 
 type tvdbNameTranslation struct {
@@ -1200,4 +1203,103 @@ func (p *Provider) fetchMovie(ctx context.Context, q plugins.MediaQuery, tvdbLan
 		}
 	}
 	return res, nil
+}
+
+var _ plugins.ImageProvider = (*Provider)(nil)
+
+func mapTVDBArtworkType(artType int) string {
+	switch artType {
+	case 2, 7, 14:
+		return "Primary"
+	case 3, 8, 15:
+		return "Backdrop"
+	case 23, 25:
+		return "Logo"
+	case 1, 6, 16:
+		return "Banner"
+	case 11, 12, 13:
+		return "Thumb"
+	default:
+		return ""
+	}
+}
+
+// FetchImages implements plugins.ImageProvider for TheTVDB v4 series and movies.
+func (p *Provider) FetchImages(ctx context.Context, q plugins.MediaQuery) ([]plugins.RemoteImageHit, error) {
+	snap := p.snapshot()
+	if !snap.enabled || snap.apiKey == "" {
+		return nil, nil
+	}
+
+	itemKind := "movie"
+	switch strings.ToLower(strings.TrimSpace(q.ItemType)) {
+	case "series", "tv", "season", "episode":
+		itemKind = "series"
+	case "movie", "":
+		itemKind = "movie"
+	default:
+		return nil, nil
+	}
+
+	tvdbID := providerID(q.ProviderIDs, "Tvdb")
+	if tvdbID == "" {
+		if strings.TrimSpace(q.Title) == "" && strings.TrimSpace(q.OriginalTitle) == "" {
+			return nil, nil
+		}
+		var err error
+		tvdbID, err = p.searchTVDBWithFallbacks(ctx, itemKind, q)
+		if err != nil || tvdbID == "" {
+			return nil, err
+		}
+	}
+
+	var resp struct {
+		Data struct {
+			Image    string        `json:"image"`
+			Artworks []tvdbArtwork `json:"artworks"`
+		} `json:"data"`
+	}
+	endpoint := "/movies/" + url.PathEscape(tvdbID) + "/extended"
+	if itemKind == "series" {
+		endpoint = "/series/" + url.PathEscape(tvdbID) + "/extended"
+	}
+	if err := p.getJSON(ctx, endpoint, nil, &resp); err != nil {
+		return nil, err
+	}
+
+	hits := make([]plugins.RemoteImageHit, 0, len(resp.Data.Artworks)+1)
+	for _, a := range resp.Data.Artworks {
+		imgURL := strings.TrimSpace(a.Image)
+		if imgURL == "" {
+			continue
+		}
+		mappedType := mapTVDBArtworkType(a.Type)
+		if mappedType == "" {
+			continue
+		}
+		thumb := strings.TrimSpace(a.Thumbnail)
+		if thumb == "" {
+			thumb = imgURL
+		}
+		hits = append(hits, plugins.RemoteImageHit{
+			ProviderName: "TheTVDB",
+			URL:          imgURL,
+			ThumbnailURL: thumb,
+			Type:         mappedType,
+			Language:     strings.TrimSpace(a.Language),
+			Width:        a.Width,
+			Height:       a.Height,
+			Rating:       a.Score,
+		})
+	}
+	if len(hits) == 0 && strings.TrimSpace(resp.Data.Image) != "" {
+		imgURL := strings.TrimSpace(resp.Data.Image)
+		hits = append(hits, plugins.RemoteImageHit{
+			ProviderName: "TheTVDB",
+			URL:          imgURL,
+			ThumbnailURL: imgURL,
+			Type:         "Primary",
+		})
+	}
+	return hits, nil
 }

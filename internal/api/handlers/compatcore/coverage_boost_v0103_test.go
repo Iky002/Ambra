@@ -417,12 +417,12 @@ func TestCompatCoreCoverageBoostV0103(t *testing.T) {
 		}
 
 		// preferredGenresForUser: empty uid -> nil; >5 genres sorted & capped at 5
-		if got := env.handler.preferredGenresForUser(ctx, "", nil, nil, nil); got != nil {
+		if got := env.handler.preferredGenresForUser(ctx, "", nil, dto.UserPolicy{}); got != nil {
 			t.Fatalf("expected nil for empty uid, got %v", got)
 		}
 		_ = env.libRepo.ReplaceItemTaxonomies(ctx, env.itemID, "Genre", []string{"Action", "SciFi", "Drama", "Comedy", "Thriller", "Horror", "Fantasy"})
 		_, _ = env.libRepo.MarkFavorite(ctx, env.admin.ID, env.itemID)
-		genres := env.handler.preferredGenresForUser(ctx, env.admin.ID, nil, nil, nil)
+		genres := env.handler.preferredGenresForUser(ctx, env.admin.ID, nil, dto.UserPolicy{})
 		if len(genres) != 5 {
 			t.Fatalf("expected preferred genres capped at 5, got %v", genres)
 		}

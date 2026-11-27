@@ -31,6 +31,7 @@ import (
 	"github.com/ambra-media/ambra/internal/core/imaging"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
+	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/plugins/tmdb"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
@@ -42,6 +43,10 @@ const (
 
 type remoteImageFetcher interface {
 	FetchImages(ctx context.Context, itemType, tmdbID string) ([]tmdb.RemoteImageCandidate, error)
+}
+
+type remoteImageByTMDBIDFetcher interface {
+	FetchImagesByTMDBID(ctx context.Context, itemType, tmdbID string) ([]tmdb.RemoteImageCandidate, error)
 }
 
 type imageInfoDTO struct {
@@ -655,24 +660,101 @@ func (h *Handler) handleRemoteImages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	filterProvider := strings.TrimSpace(q.Get("ProviderName"))
 	tmdbID := lookupProviderID(rec.Extra.ProviderIDs, "tmdb")
 	hasTMDBProvider := false
+	seenURLs := make(map[string]struct{})
+	queriedPluginIDs := make(map[string]bool)
+
+	appendCand := func(c tmdb.RemoteImageCandidate) {
+		if filterType != "" && !strings.EqualFold(c.Type, filterType) {
+			return
+		}
+		if filterProvider != "" && !strings.EqualFold(c.ProviderName, filterProvider) {
+			return
+		}
+		if c.Url != "" {
+			if _, dup := seenURLs[c.Url]; dup {
+				return
+			}
+			seenURLs[c.Url] = struct{}{}
+		}
+		images = append(images, c)
+	}
+
 	if h.registry != nil && tmdbID != "" {
 		for _, p := range h.registry.MetadataProviders() {
-			fetcher, ok := p.(remoteImageFetcher)
+			var (
+				cands []tmdb.RemoteImageCandidate
+				fErr  error
+				ok    bool
+			)
+			if byID, okByID := p.(remoteImageByTMDBIDFetcher); okByID {
+				ok = true
+				cands, fErr = byID.FetchImagesByTMDBID(r.Context(), rec.Type, tmdbID)
+			} else if legacy, okLegacy := p.(remoteImageFetcher); okLegacy {
+				ok = true
+				cands, fErr = legacy.FetchImages(r.Context(), rec.Type, tmdbID)
+			}
 			if !ok {
 				continue
 			}
 			hasTMDBProvider = true
-			cands, fErr := fetcher.FetchImages(r.Context(), rec.Type, tmdbID)
+			queriedPluginIDs[p.Manifest().ID] = true
 			if fErr != nil {
 				continue
 			}
 			for _, c := range cands {
-				if filterType != "" && !strings.EqualFold(c.Type, filterType) {
-					continue
+				appendCand(c)
+			}
+		}
+	}
+	if h.registry != nil {
+		mq := plugins.MediaQuery{
+			ItemType:      rec.Type,
+			Title:         rec.Name,
+			OriginalTitle: rec.OriginalTitle,
+			Path:          rec.Path,
+			ProviderIDs:   rec.Extra.ProviderIDs,
+		}
+		if rec.ProductionYear != nil {
+			mq.Year = *rec.ProductionYear
+		}
+		if rec.ParentIndexNumber != nil {
+			mq.SeasonNumber = *rec.ParentIndexNumber
+		}
+		if rec.IndexNumber != nil {
+			mq.EpisodeNumber = *rec.IndexNumber
+		}
+		for _, ip := range h.registry.ImageProviders() {
+			manifest := ip.Manifest()
+			if strings.Contains(strings.ToLower(manifest.ID), "tmdb") {
+				hasTMDBProvider = true
+			}
+			if queriedPluginIDs[manifest.ID] {
+				continue
+			}
+			hits, fErr := ip.FetchImages(r.Context(), mq)
+			if fErr != nil {
+				continue
+			}
+			for _, hit := range hits {
+				provName := strings.TrimSpace(hit.ProviderName)
+				if provName == "" {
+					provName = manifest.Name
 				}
-				images = append(images, c)
+				providers = ensureProviderName(providers, provName)
+				appendCand(tmdb.RemoteImageCandidate{
+					ProviderName:    provName,
+					Url:             hit.URL,
+					ThumbnailUrl:    hit.ThumbnailURL,
+					Width:           hit.Width,
+					Height:          hit.Height,
+					Language:        hit.Language,
+					VoteAverage:     hit.Rating,
+					CommunityRating: hit.Rating,
+					Type:            hit.Type,
+				})
 			}
 		}
 	}
@@ -1072,20 +1154,20 @@ func (h *Handler) handleEntityImage(kind string) http.HandlerFunc {
 		if h.isAuthenticated(r) {
 			if h.isNonAdminCaller(r) {
 				allowed := h.allowedLibrariesForRequest(r, "")
-				maxRating, blockedTags := h.userParentalPolicyForRequest(r, "")
+				pol := h.userExtendedPolicyForRequest(r, "")
 				switch kind {
 				case "person":
-					if !h.isPersonAccessible(r, entityID, allowed, maxRating, blockedTags) {
+					if !h.isPersonAccessibleByPolicy(r, entityID, allowed, pol) {
 						httpx.Error(w, http.StatusNotFound, "image not found")
 						return
 					}
 				case "artist":
-					if !h.canAccessItemID(r, entityID) && !h.isTaxonomyAccessible(r, entityID, allowed, maxRating, blockedTags) {
+					if !h.canAccessItemID(r, entityID) && !h.isTaxonomyAccessibleByPolicy(r, entityID, allowed, pol) {
 						httpx.Error(w, http.StatusNotFound, "image not found")
 						return
 					}
 				default:
-					if !h.isTaxonomyAccessible(r, entityID, allowed, maxRating, blockedTags) {
+					if !h.isTaxonomyAccessibleByPolicy(r, entityID, allowed, pol) {
 						httpx.Error(w, http.StatusNotFound, "image not found")
 						return
 					}

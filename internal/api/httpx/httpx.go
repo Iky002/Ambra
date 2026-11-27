@@ -2,6 +2,8 @@ package httpx
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -13,7 +15,22 @@ import (
 // DefaultMaxJSONBodyBytes caps untrusted JSON request bodies at 4 MiB.
 const DefaultMaxJSONBodyBytes int64 = 4 << 20
 
+// ErrBodyTooLarge is returned when a JSON request body exceeds maxBytes.
+var ErrBodyTooLarge = errors.New("request body exceeds maximum allowed size")
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
 // DecodeJSONLimit decodes a JSON request body bounded by maxBytes (defaults to 4 MiB).
+// If the body exceeds maxBytes bytes, ErrBodyTooLarge is returned explicitly.
 func DecodeJSONLimit(r *http.Request, dst any, maxBytes int64) error {
 	if r == nil || r.Body == nil {
 		return io.EOF
@@ -21,7 +38,49 @@ func DecodeJSONLimit(r *http.Request, dst any, maxBytes int64) error {
 	if maxBytes <= 0 {
 		maxBytes = DefaultMaxJSONBodyBytes
 	}
-	return json.NewDecoder(io.LimitReader(r.Body, maxBytes)).Decode(dst)
+	cr := &countingReader{r: io.LimitReader(r.Body, maxBytes+1)}
+	err := json.NewDecoder(cr).Decode(dst)
+	if cr.n > maxBytes {
+		return ErrBodyTooLarge
+	}
+	if err != nil {
+		return err
+	}
+	if _, copyErr := io.Copy(io.Discard, cr); copyErr != nil {
+		return copyErr
+	}
+	if cr.n > maxBytes {
+		return ErrBodyTooLarge
+	}
+	return nil
+}
+
+// DecodeJSONMaxBytes wraps r.Body in http.MaxBytesReader and decodes the JSON payload into dst.
+// Oversized bodies return an error matching both errors.Is(err, ErrBodyTooLarge) and *http.MaxBytesError.
+func DecodeJSONMaxBytes(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64) error {
+	if r == nil || r.Body == nil {
+		return io.EOF
+	}
+	if maxBytes <= 0 {
+		maxBytes = DefaultMaxJSONBodyBytes
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	err := json.NewDecoder(r.Body).Decode(dst)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			return fmt.Errorf("%w: %w", ErrBodyTooLarge, err)
+		}
+		return err
+	}
+	if _, copyErr := io.Copy(io.Discard, r.Body); copyErr != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(copyErr, &maxErr) {
+			return fmt.Errorf("%w: %w", ErrBodyTooLarge, copyErr)
+		}
+		return copyErr
+	}
+	return nil
 }
 
 func JSON(w http.ResponseWriter, status int, v any) {

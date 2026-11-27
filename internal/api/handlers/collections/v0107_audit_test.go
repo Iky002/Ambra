@@ -84,7 +84,7 @@ func TestCollectionsV0107AuditH3PlaylistNestingAndPrivateFilter(t *testing.T) {
 
 	// 2. [H-3] Adding bobPrivPl or nested aliceOwnPl to existing playlist is also rejected
 	recAdd := doAs(alice, http.MethodPost, "/Playlists/"+created.Id+"/Items?Ids="+bobPrivPl.ID+","+aliceOwnPl.ID, "")
-	if recAdd.Code != http.StatusNoContent {
+	if recAdd.Code != http.StatusOK {
 		t.Fatalf("add playlist items got %d", recAdd.Code)
 	}
 	recItems2 := doAs(alice, http.MethodGet, "/Playlists/"+created.Id+"/Items", "")

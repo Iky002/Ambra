@@ -1,5 +1,6 @@
 import { AlertTriangle, ArrowLeft, RefreshCw } from 'lucide-react'
 import { Link } from 'react-router-dom'
+import { getActiveLocale, translateForLocale, useI18n } from '../i18n/I18nContext'
 
 export interface QueryErrorStateProps {
   title?: string
@@ -11,7 +12,10 @@ export interface QueryErrorStateProps {
   compact?: boolean
 }
 
-export function extractErrorMessage(error: unknown, fallback = '请求失败，请检查网络连接后重试'): string {
+export function extractErrorMessage(
+  error: unknown,
+  fallback = translateForLocale(getActiveLocale(), 'queryError.defaultMessage'),
+): string {
   if (error instanceof Error && error.message.trim()) {
     return error.message
   }
@@ -22,15 +26,18 @@ export function extractErrorMessage(error: unknown, fallback = '请求失败，�
 }
 
 export function QueryErrorState({
-  title = '加载失败',
+  title,
   error,
   message,
   onRetry,
   backTo,
-  backLabel = '返回首页',
+  backLabel,
   compact = false,
 }: QueryErrorStateProps) {
-  const detail = message || extractErrorMessage(error)
+  const { t } = useI18n()
+  const resolvedTitle = title ?? t('queryError.defaultTitle')
+  const resolvedBackLabel = backLabel ?? t('queryError.backHome')
+  const detail = message || extractErrorMessage(error, t('queryError.defaultMessage'))
 
   return (
     <div
@@ -57,7 +64,7 @@ export function QueryErrorState({
           <AlertTriangle className={compact ? 'h-5 w-5' : 'h-6 w-6'} />
         </div>
         <h2 className={compact ? 'text-sm font-semibold text-white' : 'text-lg font-semibold text-white'}>
-          {title}
+          {resolvedTitle}
         </h2>
         <p className={compact ? 'text-xs text-zinc-400' : 'mt-2 text-sm text-zinc-400'}>
           {detail}
@@ -71,7 +78,7 @@ export function QueryErrorState({
                 className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-5 py-2.5 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400"
               >
                 <RefreshCw className="h-3.5 w-3.5" />
-                <span>重试</span>
+                <span>{t('queryError.retry')}</span>
               </button>
             )}
             {backTo && (
@@ -80,7 +87,7 @@ export function QueryErrorState({
                 className="inline-flex items-center gap-1.5 rounded-xl border border-white/12 bg-white/[0.05] px-5 py-2.5 text-xs font-medium text-zinc-200 transition-colors hover:bg-white/10"
               >
                 <ArrowLeft className="h-3.5 w-3.5" />
-                <span>{backLabel}</span>
+                <span>{resolvedBackLabel}</span>
               </Link>
             )}
           </div>

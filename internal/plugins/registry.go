@@ -187,6 +187,9 @@ type NotificationPayload struct {
 	Data    map[string]any `json:"data,omitempty"`
 }
 
+// NotificationEvent is an alias for NotificationPayload.
+type NotificationEvent = NotificationPayload
+
 // Notifier delivers server events to external notification channels.
 type Notifier interface {
 	Plugin

@@ -311,7 +311,36 @@ func NewSourceClient(baseURL, apiKey string, opts ...ClientOption) (*SourceClien
 	if isSelfListenTarget(parsed, sc.selfListenAddr) {
 		return nil, ErrSelfSourceServer
 	}
+	sc.httpClient = wrapSourceHTTPClient(sc.httpClient, sc.selfListenAddr)
 	return sc, nil
+}
+
+func wrapSourceHTTPClient(base *http.Client, selfAddr string) *http.Client {
+	if base == nil {
+		base = netutil.NewSafeHTTPClient(defaultHTTPTimeout, true)
+	}
+	cloned := *base
+	prevCheck := base.CheckRedirect
+	cloned.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		if req != nil && req.URL != nil && isSelfListenTarget(req.URL, selfAddr) {
+			return ErrSelfSourceServer
+		}
+		if prevCheck != nil {
+			return prevCheck(req, via)
+		}
+		if req != nil && req.URL != nil && len(via) > 0 && !strings.EqualFold(req.URL.Host, via[0].URL.Host) {
+			req.Header.Del("Authorization")
+			req.Header.Del("Cookie")
+			req.Header.Del("Proxy-Authorization")
+			req.Header.Del("X-Emby-Token")
+			req.Header.Del("X-MediaBrowser-Token")
+		}
+		return nil
+	}
+	return &cloned
 }
 
 func defaultSleep(ctx context.Context, d time.Duration) error {
@@ -420,6 +449,9 @@ func (c *SourceClient) doJSON(ctx context.Context, path string, query url.Values
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
+			if errors.Is(err, ErrSelfSourceServer) {
+				return ErrSelfSourceServer
+			}
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}

@@ -357,24 +357,6 @@ func TestSQLitePersistenceAndSharedState(t *testing.T) {
 		t.Fatalf("channel tag prefixes: %d %s", w.Code, w.Body.String())
 	}
 
-	// 5. ChannelMappings create & update & read
-	w = httptest.NewRecorder()
-	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/LiveTv/ChannelMappings", strings.NewReader(`{"ProviderId":"lp-1","TunerChannelId":"ch-1","ProviderChannelId":"epg-1"}`)))
-	if w.Code != http.StatusOK {
-		t.Fatalf("create mapping: %d", w.Code)
-	}
-	w = httptest.NewRecorder()
-	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/LiveTv/ChannelMappings", strings.NewReader(`{"ProviderId":"lp-1","TunerChannelId":"ch-1","ProviderChannelId":"epg-2"}`)))
-	if w.Code != http.StatusOK {
-		t.Fatalf("update mapping: %d", w.Code)
-	}
-	w = httptest.NewRecorder()
-	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/LiveTv/ChannelMappingOptions?ProviderId=lp-1", nil))
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "epg-2") {
-		t.Fatalf("mapping options: %d %s", w.Code, w.Body.String())
-	}
-
-	// 6. Delete Recording, Timer, SeriesTimer, TunerHost, ListingProvider (admin context for timer deletion)
 	adminAC := &middleware.AuthContext{
 		User: &sqlite.UserRecord{
 			ID:      guid.Normalize("admin-1"),
@@ -383,6 +365,28 @@ func TestSQLitePersistenceAndSharedState(t *testing.T) {
 			Policy:  sqlite.DefaultUserPolicy(true),
 		},
 	}
+
+	// 5. ChannelMappings create & update & read
+	w = httptest.NewRecorder()
+	reqMap1 := httptest.NewRequest(http.MethodPost, "/LiveTv/ChannelMappings", strings.NewReader(`{"ProviderId":"lp-1","TunerChannelId":"ch-1","ProviderChannelId":"epg-1"}`))
+	router.ServeHTTP(w, reqMap1.WithContext(middleware.WithAuthContext(reqMap1.Context(), adminAC)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("create mapping: %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	reqMap2 := httptest.NewRequest(http.MethodPost, "/LiveTv/ChannelMappings", strings.NewReader(`{"ProviderId":"lp-1","TunerChannelId":"ch-1","ProviderChannelId":"epg-2"}`))
+	router.ServeHTTP(w, reqMap2.WithContext(middleware.WithAuthContext(reqMap2.Context(), adminAC)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("update mapping: %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	reqMapOpt := httptest.NewRequest(http.MethodGet, "/LiveTv/ChannelMappingOptions?ProviderId=lp-1", nil)
+	router.ServeHTTP(w, reqMapOpt.WithContext(middleware.WithAuthContext(reqMapOpt.Context(), adminAC)))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "epg-2") {
+		t.Fatalf("mapping options: %d %s", w.Code, w.Body.String())
+	}
+
+	// 6. Delete Recording, Timer, SeriesTimer, TunerHost, ListingProvider (admin context for timer deletion)
 	for _, p := range []string{
 		"/LiveTv/Recordings/rec-2/Delete",
 		"/LiveTv/Timers/t-1/Delete",

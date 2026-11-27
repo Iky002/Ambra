@@ -455,11 +455,51 @@ func parseAddrString(raw string) (netip.Addr, bool) {
 	return addr.WithZone("").Unmap(), true
 }
 
+var proxyForwardingHeaderNames = []string{
+	"X-Forwarded-For",
+	"X-Real-IP",
+	"Forwarded",
+	"CF-Connecting-IP",
+}
+
+func hasProxyForwardingHeaders(r *http.Request) bool {
+	if r == nil || len(r.Header) == 0 {
+		return false
+	}
+	for _, h := range proxyForwardingHeaderNames {
+		for _, v := range r.Header.Values(h) {
+			if strings.TrimSpace(v) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func extractForwardedForAddrs(vals []string) []netip.Addr {
+	var out []netip.Addr
+	for _, rawVal := range vals {
+		for _, elem := range strings.Split(rawVal, ",") {
+			for _, param := range strings.Split(elem, ";") {
+				kv := strings.SplitN(strings.TrimSpace(param), "=", 2)
+				if len(kv) != 2 || !strings.EqualFold(strings.TrimSpace(kv[0]), "for") {
+					continue
+				}
+				forVal := strings.Trim(strings.TrimSpace(kv[1]), `"`)
+				if addr, ok := parseAddrString(forVal); ok {
+					out = append(out, addr)
+				}
+			}
+		}
+	}
+	return out
+}
+
 // ClientIP returns the effective client IP for rate-limiting and access checks.
-// X-Forwarded-For and X-Real-IP headers are ONLY consulted when r.RemoteAddr is
-// itself a trusted reverse proxy; direct public connections cannot spoof
-// forwarded headers. All X-Forwarded-For header instances are merged and scanned
-// right-to-left to resist multi-header spoofing.
+// X-Forwarded-For, X-Real-IP, Forwarded, and CF-Connecting-IP headers are ONLY
+// consulted when r.RemoteAddr is itself a trusted reverse proxy; direct public
+// connections cannot spoof forwarded headers. All X-Forwarded-For and Forwarded
+// header instances are merged and scanned right-to-left to resist multi-header spoofing.
 func ClientIP(r *http.Request) string {
 	if r == nil {
 		return ""
@@ -476,6 +516,11 @@ func ClientIP(r *http.Request) string {
 	var hasRealIP bool
 	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
 		realIPAddr, hasRealIP = parseAddrString(xri)
+	}
+	var cfIPAddr netip.Addr
+	var hasCFIP bool
+	if cf := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cf != "" {
+		cfIPAddr, hasCFIP = parseAddrString(cf)
 	}
 
 	if xffVals := r.Header.Values("X-Forwarded-For"); len(xffVals) > 0 {
@@ -495,15 +540,44 @@ func ClientIP(r *http.Request) string {
 			}
 		}
 		// If every XFF hop looked like a trusted proxy, do not fall back to a
-		// spoofable leftmost 127.0.0.1 when X-Real-IP carries a non-trusted public IP.
+		// spoofable leftmost 127.0.0.1 when X-Real-IP or CF-Connecting-IP carries a non-trusted IP.
 		if hasRealIP && !IsTrustedProxyIP(realIPAddr) {
 			return realIPAddr.String()
+		}
+		if hasCFIP && !IsTrustedProxyIP(cfIPAddr) {
+			return cfIPAddr.String()
 		}
 		if rightmostValid.IsValid() {
 			return rightmostValid.String()
 		}
 	}
 
+	if fwdVals := r.Header.Values("Forwarded"); len(fwdVals) > 0 {
+		fwdAddrs := extractForwardedForAddrs(fwdVals)
+		var rightmostValid netip.Addr
+		for i := len(fwdAddrs) - 1; i >= 0; i-- {
+			addr := fwdAddrs[i]
+			if !rightmostValid.IsValid() {
+				rightmostValid = addr
+			}
+			if !IsTrustedProxyIP(addr) {
+				return addr.String()
+			}
+		}
+		if hasRealIP && !IsTrustedProxyIP(realIPAddr) {
+			return realIPAddr.String()
+		}
+		if hasCFIP && !IsTrustedProxyIP(cfIPAddr) {
+			return cfIPAddr.String()
+		}
+		if rightmostValid.IsValid() {
+			return rightmostValid.String()
+		}
+	}
+
+	if hasCFIP {
+		return cfIPAddr.String()
+	}
 	if hasRealIP {
 		return realIPAddr.String()
 	}
@@ -513,21 +587,50 @@ func ClientIP(r *http.Request) string {
 
 // IsLocalOrLANRequest reports whether the request originates from a local or
 // private LAN client (accounting for trusted reverse proxies via ClientIP).
-// If the direct peer equals a default route gateway IP (such as a Docker bridge
-// gateway 172.17.0.1 / 172.18.0.1) and is NOT an explicitly trusted proxy, the
-// connection is treated as NAT-masqueraded external traffic (returns false).
+//   - If the direct peer is NOT a trusted proxy yet carries proxy forwarding
+//     headers (X-Forwarded-For, X-Real-IP, Forwarded, CF-Connecting-IP) or equals
+//     a default route gateway IP (such as a Docker bridge gateway 172.17.0.1),
+//     the connection is treated as proxied/NAT-masqueraded external traffic (returns false).
 func IsLocalOrLANRequest(r *http.Request) bool {
 	if r == nil {
 		return false
 	}
-	if remoteAddr, ok := parseAddrString(r.RemoteAddr); ok {
-		if !IsTrustedProxyIP(remoteAddr) && isDefaultRouteGatewayIP(remoteAddr) {
-			return false
+	remoteAddr, hasRemote := parseAddrString(r.RemoteAddr)
+	if hasRemote {
+		if !IsTrustedProxyIP(remoteAddr) {
+			if isDefaultRouteGatewayIP(remoteAddr) || hasProxyForwardingHeaders(r) {
+				return false
+			}
 		}
 	}
-	addr, ok := parseAddrString(ClientIP(r))
+	resolved := ClientIP(r)
+	addr, ok := parseAddrString(resolved)
 	if !ok {
 		return false
+	}
+	// If a trusted proxy sent forwarding headers whose values were all unparseable
+	// (e.g. Forwarded: for=unknown), fail closed rather than falling back to loopback/LAN proxy IP.
+	if hasRemote && IsTrustedProxyIP(remoteAddr) && hasProxyForwardingHeaders(r) && addr == remoteAddr {
+		hasAnyValidForwarded := false
+		for _, raw := range r.Header.Values("X-Forwarded-For") {
+			for _, p := range strings.Split(raw, ",") {
+				if _, v := parseAddrString(p); v {
+					hasAnyValidForwarded = true
+				}
+			}
+		}
+		if _, v := parseAddrString(r.Header.Get("X-Real-IP")); v {
+			hasAnyValidForwarded = true
+		}
+		if _, v := parseAddrString(r.Header.Get("CF-Connecting-IP")); v {
+			hasAnyValidForwarded = true
+		}
+		if len(extractForwardedForAddrs(r.Header.Values("Forwarded"))) > 0 {
+			hasAnyValidForwarded = true
+		}
+		if !hasAnyValidForwarded {
+			return false
+		}
 	}
 	return IsLANIP(addr)
 }

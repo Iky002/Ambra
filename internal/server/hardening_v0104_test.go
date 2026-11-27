@@ -87,7 +87,14 @@ func TestBuildWebHandlerSecurityHeadersAndStaticRouteBlocking(t *testing.T) {
 			t.Fatalf("%s: Referrer-Policy=%q", path, got)
 		}
 		csp := rec.Header().Get("Content-Security-Policy")
-		for _, want := range []string{"default-src 'self'", "'wasm-unsafe-eval'", "frame-ancestors 'self'", "object-src 'none'"} {
+		for _, want := range []string{
+			"default-src 'self'",
+			"'wasm-unsafe-eval'",
+			"connect-src 'self' ws: wss: https: blob: data:;",
+			"font-src 'self' data: blob:;",
+			"frame-ancestors 'self'",
+			"object-src 'none'",
+		} {
 			if !strings.Contains(csp, want) {
 				t.Fatalf("%s: CSP missing %q: %q", path, want, csp)
 			}
@@ -288,7 +295,7 @@ func TestServerWiringWSOriginsLibraryFilterAndSessionRBAC(t *testing.T) {
 	if !checker(ctx, adminUser, itemAdult.ID) {
 		t.Fatal("admin should access all existing items")
 	}
-	if !userCanAccessLibrary(kid, "collections") || !userCanAccessLibrary(kid, "playlists") || !userCanAccessLibrary(kid, "") {
+	if !session.UserCanAccessLibrary(ctx, libRepo, kid, "collections") || !session.UserCanAccessLibrary(ctx, libRepo, kid, "playlists") || !session.UserCanAccessLibrary(ctx, libRepo, kid, "") {
 		t.Fatal("collections/playlists/empty library should be accessible")
 	}
 

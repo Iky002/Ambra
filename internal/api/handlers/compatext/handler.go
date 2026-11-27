@@ -91,9 +91,17 @@ type Handler struct {
 	transcodeMgr *transcode.Manager
 	libRepo      *sqlite.LibraryRepo
 	userRepo     *sqlite.UserRepo
+	notifTester  func(ctx context.Context, title, description string) error
 
 	mu    sync.RWMutex
 	state compatExtState
+}
+
+// SetNotificationTester wires a notification dispatch callback invoked by POST /Notifications/Services/Test.
+func (h *Handler) SetNotificationTester(fn func(ctx context.Context, title, description string) error) {
+	h.mu.Lock()
+	h.notifTester = fn
+	h.mu.Unlock()
 }
 
 // SetTranscodeManager wires the shared transcode Manager for Live TV recording HLS playback and subtitle extraction.
@@ -143,6 +151,55 @@ func (h *Handler) SetUserRepo(r *sqlite.UserRepo) {
 	h.mu.Lock()
 	h.userRepo = r
 	h.mu.Unlock()
+}
+
+func (h *Handler) callerPolicy(r *http.Request) (policy dto.UserPolicy, isAdmin bool, hasAuth bool) {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.IsAdmin() || ac.IsAPIKey {
+			return sqlite.DefaultUserPolicy(true), true, true
+		}
+		if ur := h.resolveUserRepo(); ur != nil {
+			u, err := ur.GetUserByID(r.Context(), guid.Normalize(ac.UserID()))
+			if err != nil || u == nil {
+				return dto.UserPolicy{}, false, true
+			}
+			if u.IsAdmin || u.Policy.IsAdministrator {
+				return sqlite.DefaultUserPolicy(true), true, true
+			}
+			return u.Policy, false, true
+		}
+		if ac.User != nil {
+			if ac.User.IsAdmin || ac.User.Policy.IsAdministrator {
+				return sqlite.DefaultUserPolicy(true), true, true
+			}
+			return ac.User.Policy, false, true
+		}
+		return dto.UserPolicy{}, false, true
+	}
+	if h.auth.UserIDFromCtx != nil {
+		if uid := guid.Normalize(h.auth.UserIDFromCtx(r.Context())); uid != "" {
+			if ur := h.resolveUserRepo(); ur != nil {
+				u, err := ur.GetUserByID(r.Context(), uid)
+				if err != nil || u == nil {
+					return dto.UserPolicy{}, false, true
+				}
+				if u.IsAdmin || u.Policy.IsAdministrator {
+					return sqlite.DefaultUserPolicy(true), true, true
+				}
+				return u.Policy, false, true
+			}
+			return sqlite.DefaultUserPolicy(false), false, true
+		}
+	}
+	return sqlite.DefaultUserPolicy(true), false, false
+}
+
+func (h *Handler) canPlayMedia(r *http.Request) bool {
+	pol, isAdmin, hasAuth := h.callerPolicy(r)
+	if !hasAuth || isAdmin {
+		return true
+	}
+	return pol.EnableMediaPlayback
 }
 
 func (h *Handler) callerIdentity(r *http.Request) (userID string, isAdmin bool) {
@@ -310,56 +367,13 @@ func (h *Handler) canAccessItemID(r *http.Request, itemID string) bool {
 				return false
 			}
 		}
-	} else if !policy.EnableAllFolders && rec.LibraryID != "" {
-		normLib := guid.Normalize(rec.LibraryID)
-		allowed := false
-		for _, fid := range policy.EnabledFolders {
-			if guid.Normalize(fid) == normLib {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
+	} else if rec.LibraryID != "" {
+		if !libRepo.CanUserAccessLibrary(r.Context(), *policy, rec.LibraryID) {
 			return false
 		}
 	}
-	if policy.MaxParentalRating != nil || len(policy.BlockedTags) > 0 {
-		if blocked, bErr := libRepo.IsItemBlockedByParentalPolicy(r.Context(), rec, policy.MaxParentalRating, policy.BlockedTags); bErr != nil || blocked {
-			return false
-		}
-	}
-	if len(policy.BlockUnratedItems) > 0 {
-		for _, bu := range policy.BlockUnratedItems {
-			t := strings.TrimSpace(bu)
-			if t == "*" || strings.EqualFold(t, "All") || strings.EqualFold(t, rec.Type) || (rec.MediaType != "" && strings.EqualFold(t, rec.MediaType)) {
-				if strings.TrimSpace(rec.OfficialRating) == "" {
-					return false
-				}
-				break
-			}
-		}
-	}
-	if len(policy.AllowedTags) > 0 {
-		allowSet := make(map[string]bool, len(policy.AllowedTags))
-		for _, at := range policy.AllowedTags {
-			if s := strings.ToLower(strings.TrimSpace(at)); s != "" {
-				allowSet[s] = true
-			}
-		}
-		if len(allowSet) > 0 {
-			matched := false
-			if _, _, tags, tErr := libRepo.GetTaxonomiesByItemID(r.Context(), rec.ID); tErr == nil {
-				for _, tg := range tags {
-					if allowSet[strings.ToLower(strings.TrimSpace(tg))] {
-						matched = true
-						break
-					}
-				}
-			}
-			if !matched {
-				return false
-			}
-		}
+	if blocked, bErr := libRepo.IsItemBlockedByPolicy(r.Context(), rec, *policy); bErr != nil || blocked {
+		return false
 	}
 	return true
 }

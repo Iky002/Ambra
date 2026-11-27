@@ -3,6 +3,7 @@ import { Loader2, ShieldAlert } from 'lucide-react'
 import { HashRouter, Link, Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { api } from './api/client'
 import { Layout } from './components/Layout'
+import { QueryErrorState } from './components/QueryErrorState'
 import { ScrollToTop } from './components/ScrollToTop'
 import { AudioPlayerProvider } from './context/AudioPlayerContext'
 import { AuthProvider, useAuth } from './context/AuthContext'
@@ -60,14 +61,24 @@ function RequireAuth({
   return <>{children}</>
 }
 
-function RequireAdmin({ children }: { children: React.ReactNode }) {
-  const { isAdmin, userLoading } = useAuth()
+export function RequireAdmin({ children }: { children: React.ReactNode }) {
+  const { user, isAdmin, userLoading, userError, refreshUser } = useAuth()
   const { t } = useI18n()
   if (userLoading) {
     return (
       <div className="flex min-h-[60vh] items-center justify-center text-sm text-zinc-400">
         {t('auth.verifyingAdmin')}
       </div>
+    )
+  }
+  if (!user && userError) {
+    return (
+      <QueryErrorState
+        error={userError}
+        onRetry={() => void refreshUser()}
+        backTo="/"
+        backLabel={t('auth.backHome')}
+      />
     )
   }
   if (!isAdmin) {

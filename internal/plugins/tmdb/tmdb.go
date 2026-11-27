@@ -884,8 +884,73 @@ func (p *Provider) SearchCandidates(ctx context.Context, itemType, query string,
 	return out, nil
 }
 
-// FetchImages queries TMDB /movie/{id}/images or /tv/{id}/images and returns Primary and Backdrop candidates.
-func (p *Provider) FetchImages(ctx context.Context, itemType, tmdbID string) ([]RemoteImageCandidate, error) {
+var _ plugins.ImageProvider = (*Provider)(nil)
+
+// FetchImages implements plugins.ImageProvider by resolving a TMDB ID from q.ProviderIDs
+// (or via title/year search when ProviderIDs lacks TMDB) and returning RemoteImageHit candidates.
+func (p *Provider) FetchImages(ctx context.Context, q plugins.MediaQuery) ([]plugins.RemoteImageHit, error) {
+	snap := p.snapshot()
+	if !snap.enabled || snap.apiKey == "" {
+		return nil, nil
+	}
+	tmdbID := ""
+	for k, v := range q.ProviderIDs {
+		if strings.EqualFold(strings.TrimSpace(k), "tmdb") {
+			if tv := strings.TrimSpace(v); tv != "" {
+				tmdbID = tv
+				break
+			}
+		}
+	}
+	if tmdbID == "" {
+		title := strings.TrimSpace(q.Title)
+		if title == "" {
+			title = strings.TrimSpace(q.OriginalTitle)
+		}
+		if title == "" {
+			return nil, nil
+		}
+		cands, err := p.SearchCandidates(ctx, q.ItemType, title, q.Year, q.Language)
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range cands {
+			for k, v := range c.ProviderIDs {
+				if strings.EqualFold(strings.TrimSpace(k), "tmdb") && strings.TrimSpace(v) != "" {
+					tmdbID = strings.TrimSpace(v)
+					break
+				}
+			}
+			if tmdbID != "" {
+				break
+			}
+		}
+		if tmdbID == "" {
+			return nil, nil
+		}
+	}
+	cands, err := p.FetchImagesByTMDBID(ctx, q.ItemType, tmdbID)
+	if err != nil || len(cands) == 0 {
+		return nil, err
+	}
+	hits := make([]plugins.RemoteImageHit, 0, len(cands))
+	for _, c := range cands {
+		hits = append(hits, plugins.RemoteImageHit{
+			ProviderName: c.ProviderName,
+			URL:          c.Url,
+			ThumbnailURL: c.ThumbnailUrl,
+			Type:         c.Type,
+			Language:     c.Language,
+			Width:        c.Width,
+			Height:       c.Height,
+			Rating:       c.VoteAverage,
+		})
+	}
+	return hits, nil
+}
+
+// FetchImagesByTMDBID queries TMDB /movie/{id}/images or /tv/{id}/images and returns Primary and Backdrop candidates.
+func (p *Provider) FetchImagesByTMDBID(ctx context.Context, itemType, tmdbID string) ([]RemoteImageCandidate, error) {
 	tmdbID = strings.TrimSpace(tmdbID)
 	snap := p.snapshot()
 	if !snap.enabled || snap.apiKey == "" || tmdbID == "" {

@@ -428,6 +428,8 @@ export class WasmRemuxer {
   private activeObjectUrls = new Set<string>()
   private coreBlobUrls: string[] = []
   private activeAbortController: AbortController | null = null
+  private remuxMutex: Promise<void> = Promise.resolve()
+  private jobCounter = 0
   private disposed = false
 
   /** 懒加载单线程 @ffmpeg/core（自动多源回退，避免强依赖 SharedArrayBuffer） */
@@ -553,18 +555,31 @@ export class WasmRemuxer {
       )
     }
 
+    const jobId = ++this.jobCounter
+    const prevLock = this.remuxMutex
+    let releaseMutex!: () => void
+    this.remuxMutex = new Promise<void>((resolve) => {
+      releaseMutex = resolve
+    })
+
+    await prevLock
+
     const startedAt = performance.now()
     const localAbort = new AbortController()
     this.activeAbortController = localAbort
     const signal = mergeAbortSignals(localAbort.signal, opts.signal)
 
     const inputExt = resolveInputExtension(opts.container)
-    const inputName = `input.${inputExt}`
-    const outputName = 'output.mp4'
+    const inputName = `input_${jobId}.${inputExt}`
+    const outputName = `output_${jobId}.mp4`
     let loadedFfmpeg: FFmpeg | null = null
     let vfsDirty = false
 
     try {
+      if (signal?.aborted || this.disposed) {
+        throw new WasmRemuxFallbackError('aborted', '已取消客户端转封装')
+      }
+
       // 1. 先检查与流式拉取媒体数据（实时上报进度并动态检测体积上限）
       opts.onProgress?.('fetch', 0, '正在连接媒体流...')
       const inputBytes = await this.fetchStreamWithLimit(
@@ -676,7 +691,7 @@ export class WasmRemuxer {
       const message = err instanceof Error ? err.message : String(err)
       throw new WasmRemuxFallbackError('exec_failed', `客户端 WASM 转封装失败: ${message}`)
     } finally {
-      // 无论成功、失败、抛错还是超时，均清理 WASM 虚拟文件系统中的临时输入/输出文件，防止高达 150MB 内存泄漏
+      // 无论成功、失败、抛错还是超时，均清理 WASM 虚拟文件系统中的唯一临时输入/输出文件，防止高达 150MB 内存泄漏
       if (loadedFfmpeg && vfsDirty) {
         await Promise.allSettled([
           loadedFfmpeg.deleteFile(inputName),
@@ -686,6 +701,7 @@ export class WasmRemuxer {
       if (this.activeAbortController === localAbort) {
         this.activeAbortController = null
       }
+      releaseMutex()
     }
   }
 

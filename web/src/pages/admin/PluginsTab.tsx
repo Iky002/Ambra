@@ -1,11 +1,19 @@
 import { useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Loader2, Puzzle, RefreshCw, RotateCcw, SlidersHorizontal, Trash2 } from 'lucide-react'
+import {
+  AlertTriangle,
+  Loader2,
+  Puzzle,
+  RefreshCw,
+  RotateCcw,
+  SlidersHorizontal,
+  Trash2,
+} from 'lucide-react'
 import { api, embyFetch } from '../../api/client'
 import type { PluginInfo } from '../../api/types'
 import { QueryErrorState } from '../../components/QueryErrorState'
 import { useI18n } from '../../i18n/I18nContext'
-import { AdminModal, FeedbackBanner, ToggleSwitch } from './adminUtils'
+import { AdminModal, adminLabel, FeedbackBanner, ToggleSwitch } from './adminUtils'
 
 export const MASKED_PLUGIN_SECRET = '********'
 
@@ -42,13 +50,14 @@ const TVDB_LANGUAGES = TMDB_LANGUAGES
 
 export function PluginsTab() {
   const queryClient = useQueryClient()
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
     null,
   )
 
   const [editingPlugin, setEditingPlugin] = useState<PluginInfo | null>(null)
-  const [loadingConfig, setLoadingConfig] = useState(false)
+  const [configLoading, setConfigLoading] = useState(false)
+  const [configLoadError, setConfigLoadError] = useState<string | null>(null)
   const [savingConfig, setSavingConfig] = useState(false)
   const [modalError, setModalError] = useState<string | null>(null)
   const loadSeqRef = useRef(0)
@@ -100,13 +109,15 @@ export function PluginsTab() {
   const closeConfigModal = () => {
     loadSeqRef.current += 1
     setEditingPlugin(null)
-    setLoadingConfig(false)
+    setConfigLoading(false)
+    setConfigLoadError(null)
     setModalError(null)
   }
 
   const openConfigModal = async (plugin: PluginInfo) => {
     const seq = ++loadSeqRef.current
     setEditingPlugin(plugin)
+    setConfigLoadError(null)
     setModalError(null)
     setEnabled(plugin.Enabled !== false)
     setPriority(plugin.Priority ?? 10)
@@ -123,7 +134,7 @@ export function PluginsTab() {
     setTvdbLanguage('zh-CN')
     setEnable302(true)
     setExtraJson('{}')
-    setLoadingConfig(true)
+    setConfigLoading(true)
 
     try {
       const cfg = await api.getPluginConfiguration(plugin.Id)
@@ -241,18 +252,29 @@ export function PluginsTab() {
         }
         setExtraJson(Object.keys(rest).length > 0 ? JSON.stringify(rest, null, 2) : '{}')
       }
-    } catch {
+    } catch (err) {
       if (seq !== loadSeqRef.current) return
+      setConfigLoadError(
+        err instanceof Error && err.message
+          ? err.message
+          : adminLabel(
+              t,
+              locale,
+              'admin.plugins.configLoadFailed',
+              '无法加载插件配置',
+              'Failed to load plugin configuration',
+            ),
+      )
     } finally {
       if (seq === loadSeqRef.current) {
-        setLoadingConfig(false)
+        setConfigLoading(false)
       }
     }
   }
 
   const handleSaveConfig = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!editingPlugin) return
+    if (!editingPlugin || configLoading || configLoadError) return
 
     let parsedExtra: Record<string, unknown> = {}
     if (extraJson.trim()) {
@@ -520,269 +542,311 @@ export function PluginsTab() {
         maxWidthClass="max-w-lg"
         onClose={closeConfigModal}
       >
-        {loadingConfig ? (
+        {configLoading ? (
           <div className="flex h-36 items-center justify-center">
             <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
           </div>
         ) : (
           <form onSubmit={handleSaveConfig} className="space-y-4">
+            {configLoadError && (
+              <div
+                role="alert"
+                data-testid="plugin-config-load-error"
+                className="flex flex-col gap-3 rounded-xl border border-red-500/35 bg-red-500/10 p-4 text-xs text-red-200 sm:flex-row sm:items-center sm:justify-between"
+              >
+                <div className="flex items-start gap-2.5">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-400" />
+                  <div className="space-y-1">
+                    <p className="font-semibold text-red-100">
+                      {adminLabel(
+                        t,
+                        locale,
+                        'admin.plugins.configLoadErrorTitle',
+                        '插件配置加载失败，已禁止保存以防覆盖已有密钥',
+                        'Failed to load plugin configuration; saving is disabled to protect existing secrets',
+                      )}
+                    </p>
+                    <p className="text-red-200/85">{configLoadError}</p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => editingPlugin && void openConfigModal(editingPlugin)}
+                  className="inline-flex shrink-0 items-center gap-1.5 self-end rounded-lg border border-red-400/35 bg-red-500/20 px-3 py-1.5 text-xs font-semibold text-red-100 transition-colors hover:bg-red-500/30 sm:self-center"
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  <span>{t('common.retry')}</span>
+                </button>
+              </div>
+            )}
             <FeedbackBanner
               message={modalError ?? undefined}
               type="error"
               onClose={() => setModalError(null)}
             />
-            <ToggleSwitch
-              checked={enabled}
-              onChange={setEnabled}
-              label={t('admin.plugins.enablePluginLabel')}
-              description={t('admin.plugins.enablePluginDesc')}
-            />
+            {!configLoadError && (
+              <>
+                <ToggleSwitch
+                  checked={enabled}
+                  onChange={setEnabled}
+                  label={t('admin.plugins.enablePluginLabel')}
+                  description={t('admin.plugins.enablePluginDesc')}
+                />
 
-            <div>
-              <label
-                htmlFor="plugin-priority-input"
-                className="mb-1.5 block text-xs font-medium text-zinc-400"
-              >
-                {t('admin.plugins.priorityInputLabel')}
-              </label>
-              <input
-                id="plugin-priority-input"
-                type="number"
-                value={priority}
-                onChange={(e) => setPriority(Number(e.target.value))}
-                className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2 text-sm text-zinc-100 outline-none focus:border-amber-400/60"
-              />
-            </div>
-
-            {isTmdbPlugin(editingPlugin) && (
-              <div className="space-y-3 rounded-xl border border-amber-500/20 bg-amber-500/[0.04] p-4">
-                <p className="text-xs font-semibold text-amber-300">
-                  {t('admin.plugins.tmdbSectionTitle')}
-                </p>
-                <div>
-                  <div className="mb-1.5 flex items-center justify-between gap-2">
-                    <label htmlFor="tmdb-api-key" className="block text-xs font-medium text-zinc-400">
-                      {t('admin.settings.tmdbKeyLabel')}
-                    </label>
-                    {tmdbApiKeyConfigured && !tmdbApiKeyCleared && !tmdbApiKey.trim() && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setTmdbApiKey('')
-                          setTmdbApiKeyCleared(true)
-                        }}
-                        className="inline-flex items-center gap-1 rounded-md border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-[11px] font-medium text-red-300 transition-colors hover:bg-red-500/20"
-                      >
-                        <Trash2 className="h-3 w-3" />
-                        <span>{t('admin.plugins.clearSecret')}</span>
-                      </button>
-                    )}
-                    {tmdbApiKeyCleared && (
-                      <button
-                        type="button"
-                        onClick={() => setTmdbApiKeyCleared(false)}
-                        className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
-                      >
-                        <RotateCcw className="h-3 w-3" />
-                        <span>{t('admin.plugins.undoClearSecret')}</span>
-                      </button>
-                    )}
-                  </div>
-                  <input
-                    id="tmdb-api-key"
-                    type="password"
-                    autoComplete="off"
-                    value={tmdbApiKey}
-                    onChange={(e) => {
-                      setTmdbApiKey(e.target.value)
-                      if (e.target.value.trim()) setTmdbApiKeyCleared(false)
-                    }}
-                    placeholder={
-                      tmdbApiKeyCleared
-                        ? t('admin.settings.tmdbKeyClearedPlaceholder')
-                        : tmdbApiKeyConfigured
-                          ? t('admin.plugins.secretConfiguredPlaceholder')
-                          : t('admin.plugins.tmdbEmptyPlaceholder')
-                    }
-                    className="w-full rounded-xl border border-white/10 bg-black/40 px-3.5 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
-                  />
-                </div>
-                <div>
-                  <label className="mb-1.5 block text-xs font-medium text-zinc-400">
-                    {t('admin.plugins.preferredMetaLang')}
-                  </label>
-                  <select
-                    value={tmdbLanguage}
-                    onChange={(e) => setTmdbLanguage(e.target.value)}
-                    className="w-full rounded-xl border border-white/10 bg-[#181822] px-3.5 py-2 text-sm text-zinc-100 outline-none focus:border-amber-400/60"
-                  >
-                    {TMDB_LANGUAGES.map((lang) => (
-                      <option key={lang.value} value={lang.value}>
-                        {lang.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-            )}
-
-            {isTvdbPlugin(editingPlugin) && (
-              <div className="space-y-3 rounded-xl border border-sky-500/20 bg-sky-500/[0.04] p-4">
-                <p className="text-xs font-semibold text-sky-300">
-                  {t('admin.plugins.tvdbSectionTitle')}
-                </p>
-                <p className="text-xs leading-relaxed text-zinc-400">
-                  {t('admin.plugins.tvdbSectionDesc')}
-                </p>
-                <div>
-                  <div className="mb-1.5 flex items-center justify-between gap-2">
-                    <label
-                      htmlFor="tvdb-api-key"
-                      className="block text-xs font-medium text-zinc-400"
-                    >
-                      API Key
-                    </label>
-                    {tvdbApiKeyConfigured && !tvdbApiKeyCleared && !tvdbApiKey.trim() && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setTvdbApiKey('')
-                          setTvdbApiKeyCleared(true)
-                        }}
-                        className="inline-flex items-center gap-1 rounded-md border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-[11px] font-medium text-red-300 transition-colors hover:bg-red-500/20"
-                      >
-                        <Trash2 className="h-3 w-3" />
-                        <span>{t('admin.plugins.clearSecret')}</span>
-                      </button>
-                    )}
-                    {tvdbApiKeyCleared && (
-                      <button
-                        type="button"
-                        onClick={() => setTvdbApiKeyCleared(false)}
-                        className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
-                      >
-                        <RotateCcw className="h-3 w-3" />
-                        <span>{t('admin.plugins.undoClearSecret')}</span>
-                      </button>
-                    )}
-                  </div>
-                  <input
-                    id="tvdb-api-key"
-                    type="password"
-                    autoComplete="off"
-                    value={tvdbApiKey}
-                    onChange={(e) => {
-                      setTvdbApiKey(e.target.value)
-                      if (e.target.value.trim()) setTvdbApiKeyCleared(false)
-                    }}
-                    placeholder={
-                      tvdbApiKeyCleared
-                        ? t('admin.plugins.apiKeyClearedPlaceholder')
-                        : tvdbApiKeyConfigured
-                          ? t('admin.plugins.secretConfiguredPlaceholder')
-                          : t('admin.plugins.tvdbKeyEmptyPlaceholder')
-                    }
-                    className="w-full rounded-xl border border-white/10 bg-black/40 px-3.5 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
-                  />
-                </div>
-                <div>
-                  <div className="mb-1.5 flex items-center justify-between gap-2">
-                    <label htmlFor="tvdb-pin" className="block text-xs font-medium text-zinc-400">
-                      {t('admin.plugins.tvdbPinLabel')}
-                    </label>
-                    {tvdbPinConfigured && !tvdbPinCleared && !tvdbPin.trim() && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setTvdbPin('')
-                          setTvdbPinCleared(true)
-                        }}
-                        className="inline-flex items-center gap-1 rounded-md border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-[11px] font-medium text-red-300 transition-colors hover:bg-red-500/20"
-                      >
-                        <Trash2 className="h-3 w-3" />
-                        <span>{t('admin.plugins.clearSecret')}</span>
-                      </button>
-                    )}
-                    {tvdbPinCleared && (
-                      <button
-                        type="button"
-                        onClick={() => setTvdbPinCleared(false)}
-                        className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
-                      >
-                        <RotateCcw className="h-3 w-3" />
-                        <span>{t('admin.plugins.undoClearSecret')}</span>
-                      </button>
-                    )}
-                  </div>
-                  <input
-                    id="tvdb-pin"
-                    type="text"
-                    value={tvdbPin}
-                    onChange={(e) => {
-                      setTvdbPin(e.target.value)
-                      if (e.target.value.trim()) setTvdbPinCleared(false)
-                    }}
-                    placeholder={
-                      tvdbPinCleared
-                        ? t('admin.plugins.apiKeyClearedPlaceholder')
-                        : tvdbPinConfigured
-                          ? t('admin.plugins.secretConfiguredPlaceholder')
-                          : t('admin.plugins.tvdbPinEmptyPlaceholder')
-                    }
-                    className="w-full rounded-xl border border-white/10 bg-black/40 px-3.5 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
-                  />
-                </div>
                 <div>
                   <label
-                    htmlFor="tvdb-language"
+                    htmlFor="plugin-priority-input"
                     className="mb-1.5 block text-xs font-medium text-zinc-400"
                   >
-                    {t('admin.plugins.scrapeLangLabel')}
+                    {t('admin.plugins.priorityInputLabel')}
                   </label>
-                  <select
-                    id="tvdb-language"
-                    value={tvdbLanguage}
-                    onChange={(e) => setTvdbLanguage(e.target.value)}
-                    className="w-full rounded-xl border border-white/10 bg-[#181822] px-3.5 py-2 text-sm text-zinc-100 outline-none focus:border-amber-400/60"
-                  >
-                    {TVDB_LANGUAGES.map((lang) => (
-                      <option key={lang.value} value={lang.value}>
-                        {lang.label}
-                      </option>
-                    ))}
-                  </select>
+                  <input
+                    id="plugin-priority-input"
+                    type="number"
+                    value={priority}
+                    onChange={(e) => setPriority(Number(e.target.value))}
+                    className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2 text-sm text-zinc-100 outline-none focus:border-amber-400/60"
+                  />
                 </div>
-              </div>
-            )}
 
-            {isTraktPlugin(editingPlugin) && (
-              <div className="rounded-xl border border-rose-500/20 bg-rose-500/[0.04] p-4 text-xs leading-relaxed text-zinc-400">
-                {t('trakt.adminDescription')}
-              </div>
-            )}
+                {isTmdbPlugin(editingPlugin) && (
+                  <div className="space-y-3 rounded-xl border border-amber-500/20 bg-amber-500/[0.04] p-4">
+                    <p className="text-xs font-semibold text-amber-300">
+                      {t('admin.plugins.tmdbSectionTitle')}
+                    </p>
+                    <div>
+                      <div className="mb-1.5 flex items-center justify-between gap-2">
+                        <label
+                          htmlFor="tmdb-api-key"
+                          className="block text-xs font-medium text-zinc-400"
+                        >
+                          {t('admin.settings.tmdbKeyLabel')}
+                        </label>
+                        {tmdbApiKeyConfigured && !tmdbApiKeyCleared && !tmdbApiKey.trim() && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setTmdbApiKey('')
+                              setTmdbApiKeyCleared(true)
+                            }}
+                            className="inline-flex items-center gap-1 rounded-md border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-[11px] font-medium text-red-300 transition-colors hover:bg-red-500/20"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                            <span>{t('admin.plugins.clearSecret')}</span>
+                          </button>
+                        )}
+                        {tmdbApiKeyCleared && (
+                          <button
+                            type="button"
+                            onClick={() => setTmdbApiKeyCleared(false)}
+                            className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
+                          >
+                            <RotateCcw className="h-3 w-3" />
+                            <span>{t('admin.plugins.undoClearSecret')}</span>
+                          </button>
+                        )}
+                      </div>
+                      <input
+                        id="tmdb-api-key"
+                        type="password"
+                        autoComplete="off"
+                        value={tmdbApiKey}
+                        onChange={(e) => {
+                          setTmdbApiKey(e.target.value)
+                          if (e.target.value.trim()) setTmdbApiKeyCleared(false)
+                        }}
+                        placeholder={
+                          tmdbApiKeyCleared
+                            ? t('admin.settings.tmdbKeyClearedPlaceholder')
+                            : tmdbApiKeyConfigured
+                              ? t('admin.plugins.secretConfiguredPlaceholder')
+                              : t('admin.plugins.tmdbEmptyPlaceholder')
+                        }
+                        className="w-full rounded-xl border border-white/10 bg-black/40 px-3.5 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-1.5 block text-xs font-medium text-zinc-400">
+                        {t('admin.plugins.preferredMetaLang')}
+                      </label>
+                      <select
+                        value={tmdbLanguage}
+                        onChange={(e) => setTmdbLanguage(e.target.value)}
+                        className="w-full rounded-xl border border-white/10 bg-[#181822] px-3.5 py-2 text-sm text-zinc-100 outline-none focus:border-amber-400/60"
+                      >
+                        {TMDB_LANGUAGES.map((lang) => (
+                          <option key={lang.value} value={lang.value}>
+                            {lang.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                )}
 
-            {isStrmPlugin(editingPlugin) && (
-              <ToggleSwitch
-                checked={enable302}
-                onChange={setEnable302}
-                label={t('admin.settings.strm302Label')}
-                description={t('admin.plugins.strmDesc')}
-              />
-            )}
+                {isTvdbPlugin(editingPlugin) && (
+                  <div className="space-y-3 rounded-xl border border-sky-500/20 bg-sky-500/[0.04] p-4">
+                    <p className="text-xs font-semibold text-sky-300">
+                      {t('admin.plugins.tvdbSectionTitle')}
+                    </p>
+                    <p className="text-xs leading-relaxed text-zinc-400">
+                      {t('admin.plugins.tvdbSectionDesc')}
+                    </p>
+                    <div>
+                      <div className="mb-1.5 flex items-center justify-between gap-2">
+                        <label
+                          htmlFor="tvdb-api-key"
+                          className="block text-xs font-medium text-zinc-400"
+                        >
+                          API Key
+                        </label>
+                        {tvdbApiKeyConfigured && !tvdbApiKeyCleared && !tvdbApiKey.trim() && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setTvdbApiKey('')
+                              setTvdbApiKeyCleared(true)
+                            }}
+                            className="inline-flex items-center gap-1 rounded-md border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-[11px] font-medium text-red-300 transition-colors hover:bg-red-500/20"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                            <span>{t('admin.plugins.clearSecret')}</span>
+                          </button>
+                        )}
+                        {tvdbApiKeyCleared && (
+                          <button
+                            type="button"
+                            onClick={() => setTvdbApiKeyCleared(false)}
+                            className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
+                          >
+                            <RotateCcw className="h-3 w-3" />
+                            <span>{t('admin.plugins.undoClearSecret')}</span>
+                          </button>
+                        )}
+                      </div>
+                      <input
+                        id="tvdb-api-key"
+                        type="password"
+                        autoComplete="off"
+                        value={tvdbApiKey}
+                        onChange={(e) => {
+                          setTvdbApiKey(e.target.value)
+                          if (e.target.value.trim()) setTvdbApiKeyCleared(false)
+                        }}
+                        placeholder={
+                          tvdbApiKeyCleared
+                            ? t('admin.plugins.apiKeyClearedPlaceholder')
+                            : tvdbApiKeyConfigured
+                              ? t('admin.plugins.secretConfiguredPlaceholder')
+                              : t('admin.plugins.tvdbKeyEmptyPlaceholder')
+                        }
+                        className="w-full rounded-xl border border-white/10 bg-black/40 px-3.5 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
+                      />
+                    </div>
+                    <div>
+                      <div className="mb-1.5 flex items-center justify-between gap-2">
+                        <label
+                          htmlFor="tvdb-pin"
+                          className="block text-xs font-medium text-zinc-400"
+                        >
+                          {t('admin.plugins.tvdbPinLabel')}
+                        </label>
+                        {tvdbPinConfigured && !tvdbPinCleared && !tvdbPin.trim() && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setTvdbPin('')
+                              setTvdbPinCleared(true)
+                            }}
+                            className="inline-flex items-center gap-1 rounded-md border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-[11px] font-medium text-red-300 transition-colors hover:bg-red-500/20"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                            <span>{t('admin.plugins.clearSecret')}</span>
+                          </button>
+                        )}
+                        {tvdbPinCleared && (
+                          <button
+                            type="button"
+                            onClick={() => setTvdbPinCleared(false)}
+                            className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
+                          >
+                            <RotateCcw className="h-3 w-3" />
+                            <span>{t('admin.plugins.undoClearSecret')}</span>
+                          </button>
+                        )}
+                      </div>
+                      <input
+                        id="tvdb-pin"
+                        type="password"
+                        autoComplete="new-password"
+                        value={tvdbPin}
+                        onChange={(e) => {
+                          setTvdbPin(e.target.value)
+                          if (e.target.value.trim()) setTvdbPinCleared(false)
+                        }}
+                        placeholder={
+                          tvdbPinCleared
+                            ? t('admin.plugins.apiKeyClearedPlaceholder')
+                            : tvdbPinConfigured
+                              ? t('admin.plugins.secretConfiguredPlaceholder')
+                              : t('admin.plugins.tvdbPinEmptyPlaceholder')
+                        }
+                        className="w-full rounded-xl border border-white/10 bg-black/40 px-3.5 py-2 font-mono text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
+                      />
+                    </div>
+                    <div>
+                      <label
+                        htmlFor="tvdb-language"
+                        className="mb-1.5 block text-xs font-medium text-zinc-400"
+                      >
+                        {t('admin.plugins.scrapeLangLabel')}
+                      </label>
+                      <select
+                        id="tvdb-language"
+                        value={tvdbLanguage}
+                        onChange={(e) => setTvdbLanguage(e.target.value)}
+                        className="w-full rounded-xl border border-white/10 bg-[#181822] px-3.5 py-2 text-sm text-zinc-100 outline-none focus:border-amber-400/60"
+                      >
+                        {TVDB_LANGUAGES.map((lang) => (
+                          <option key={lang.value} value={lang.value}>
+                            {lang.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                )}
 
-            {!isTraktPlugin(editingPlugin) && (
-              <div>
-                <label className="mb-1.5 block text-xs font-medium text-zinc-400">
-                  {t('admin.plugins.extraJsonLabel')}
-                </label>
-                <textarea
-                  rows={4}
-                  value={extraJson}
-                  onChange={(e) => setExtraJson(e.target.value)}
-                  spellCheck={false}
-                  className="w-full rounded-xl border border-white/10 bg-black/40 p-3 font-mono text-xs text-zinc-200 outline-none focus:border-amber-400/60"
-                />
-              </div>
+                {isTraktPlugin(editingPlugin) && (
+                  <div className="rounded-xl border border-rose-500/20 bg-rose-500/[0.04] p-4 text-xs leading-relaxed text-zinc-400">
+                    {t('trakt.adminDescription')}
+                  </div>
+                )}
+
+                {isStrmPlugin(editingPlugin) && (
+                  <ToggleSwitch
+                    checked={enable302}
+                    onChange={setEnable302}
+                    label={t('admin.settings.strm302Label')}
+                    description={t('admin.plugins.strmDesc')}
+                  />
+                )}
+
+                {!isTraktPlugin(editingPlugin) && (
+                  <div>
+                    <label className="mb-1.5 block text-xs font-medium text-zinc-400">
+                      {t('admin.plugins.extraJsonLabel')}
+                    </label>
+                    <textarea
+                      rows={4}
+                      value={extraJson}
+                      onChange={(e) => setExtraJson(e.target.value)}
+                      spellCheck={false}
+                      className="w-full rounded-xl border border-white/10 bg-black/40 p-3 font-mono text-xs text-zinc-200 outline-none focus:border-amber-400/60"
+                    />
+                  </div>
+                )}
+              </>
             )}
 
             <div className="flex justify-end gap-2 pt-2">
@@ -795,8 +859,8 @@ export function PluginsTab() {
               </button>
               <button
                 type="submit"
-                disabled={savingConfig}
-                className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 hover:bg-amber-400 disabled:opacity-60"
+                disabled={configLoading || Boolean(configLoadError) || savingConfig}
+                className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {savingConfig && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
                 <span>{t('admin.plugins.saveConfigBtn')}</span>

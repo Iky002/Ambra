@@ -1,7 +1,28 @@
 import React, { useEffect, useId } from 'react'
 import { createPortal } from 'react-dom'
 import { AlertCircle, CheckCircle2, X } from 'lucide-react'
-import { getActiveLocale, translateForLocale } from '../../i18n/I18nContext'
+import { getActiveLocale, translateForLocale, type TranslationVars } from '../../i18n/I18nContext'
+
+export function adminLabel(
+  t: (key: string, vars?: TranslationVars) => string,
+  locale: string,
+  key: string,
+  zhFallback: string,
+  enFallback: string,
+  vars?: TranslationVars,
+): string {
+  const translated = t(key, vars)
+  if (translated && translated !== key) {
+    return translated
+  }
+  let tpl = locale.toLowerCase().startsWith('zh') ? zhFallback : enFallback
+  if (vars) {
+    for (const [k, v] of Object.entries(vars)) {
+      tpl = tpl.replace(new RegExp(`\\{\\{\\s*${k}\\s*\\}\\}`, 'g'), String(v))
+    }
+  }
+  return tpl
+}
 
 function isZeroDate(d: Date): boolean {
   return d.getUTCFullYear() <= 1970

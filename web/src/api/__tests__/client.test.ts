@@ -6,6 +6,8 @@ import {
   clearAuth,
   embyFetch,
   getBackdropUrl,
+  getBifUrl,
+  getChapterImageUrl,
   getDeviceId,
   getImageUrl,
   getStoredAuth,
@@ -434,5 +436,59 @@ describe('api/client - 管理控制台全部 API 方法', () => {
       'POST /emby/LiveTv/ChannelMappings',
       'DELETE /emby/Playlists/pl-1/Items?EntryIds=entry-dup-2',
     ])
+  })
+
+  it('[C-01, M-18, L-11 & 3.2-5] getItemDeleteInfo、getChapterImageUrl/getBifUrl 避免冗余 api_key 泄露、resolveApiUrl 正确保留 #fragment 顺序与 getLiveTvPrograms 时间窗参数', async () => {
+    saveAuth(TEST_AUTH)
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input)
+      if (url.endsWith('/DeleteInfo')) {
+        return mockJsonResponse({ Paths: ['/media/movies/dune.mkv', '/media/movies/dune.nfo'] })
+      }
+      return mockJsonResponse({ Items: [], TotalRecordCount: 0 })
+    })
+
+    // C-01: getItemDeleteInfo
+    const delInfo = await api.getItemDeleteInfo('item-dune-2')
+    expect(delInfo.Paths).toEqual(['/media/movies/dune.mkv', '/media/movies/dune.nfo'])
+    expect(fetchSpy).toHaveBeenCalledWith(
+      '/emby/Items/item-dune-2/DeleteInfo',
+      expect.any(Object),
+    )
+
+    // M-18: getChapterImageUrl 生成公开可缓存 URL，不携带 api_key
+    const chapterUrl = getChapterImageUrl('item-dune-2', 3, 'etag-ch3', 480)
+    expect(chapterUrl).toBe('/emby/Items/item-dune-2/Images/Chapter/3?maxWidth=480&quality=85&tag=etag-ch3')
+    expect(chapterUrl).not.toContain('api_key=')
+
+    // M-18: getBifUrl 默认通过 Authorization 头鉴权，不在 URL 中冗余追加 api_key（显式 includeTokenQuery 时才追加）
+    const bifClean = getBifUrl('item-dune-2', 320, 'ms-1')
+    expect(bifClean).toBe('/emby/Videos/item-dune-2/index.bif?Width=320&MediaSourceId=ms-1')
+    expect(bifClean).not.toContain('api_key=')
+    const bifWithQuery = api.getBifUrl('item-dune-2', 320, 'ms-1', { includeTokenQuery: true })
+    expect(bifWithQuery).toContain('api_key=secret-token-123')
+
+    // L-11: resolveApiUrl 必须在 #fragment 之前插入 api_key，避免破坏 query 与锚点
+    expect(resolveApiUrl('/emby/Videos/1/stream?Static=true#t=120')).toBe(
+      '/emby/Videos/1/stream?Static=true&api_key=secret-token-123#t=120',
+    )
+    expect(resolveApiUrl('/emby/Videos/1/stream#t=45')).toBe(
+      '/emby/Videos/1/stream?api_key=secret-token-123#t=45',
+    )
+    expect(
+      resolveApiUrl('/emby/Videos/1/stream?api_key=already-set#t=45'),
+    ).toBe('/emby/Videos/1/stream?api_key=already-set#t=45')
+
+    // 3.2-5: getLiveTvPrograms 支持 minEndDate / maxStartDate 与大 Limit
+    await api.getLiveTvPrograms(['ch-1', 'ch-2'], 2000, {
+      minEndDate: '2026-11-27T00:00:00.000Z',
+      maxStartDate: '2026-11-28T00:00:00.000Z',
+    })
+    const lastUrl = String(fetchSpy.mock.calls[fetchSpy.mock.calls.length - 1]?.[0])
+    expect(lastUrl).toContain('/emby/LiveTv/Programs?')
+    expect(lastUrl).toContain('Limit=2000')
+    expect(lastUrl).toContain('ChannelIds=ch-1%2Cch-2')
+    expect(lastUrl).toContain('MinEndDate=2026-11-27T00%3A00%3A00.000Z')
+    expect(lastUrl).toContain('MaxStartDate=2026-11-28T00%3A00%3A00.000Z')
   })
 })

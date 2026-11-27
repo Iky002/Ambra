@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
@@ -365,7 +366,9 @@ func TestPartiesCurrentInfoMessagesBruteForceAndPurgeV0110(t *testing.T) {
 	listMsgReq = listMsgReq.WithContext(middleware.WithAuthContext(listMsgReq.Context(), host))
 	listMsgRec := httptest.NewRecorder()
 	h.HandleListPartyMessages(listMsgRec, listMsgReq)
-	if listMsgRec.Code != http.StatusOK || strings.TrimSpace(listMsgRec.Body.String()) != "[]" {
+	var emptyMsgRes dto.QueryResult[PartyMessage]
+	_ = json.Unmarshal(listMsgRec.Body.Bytes(), &emptyMsgRes)
+	if listMsgRec.Code != http.StatusOK || emptyMsgRes.TotalRecordCount != 0 || len(emptyMsgRes.Items) != 0 {
 		t.Fatalf("HandleListPartyMessages (not in party): %d %s", listMsgRec.Code, listMsgRec.Body.String())
 	}
 
@@ -483,10 +486,10 @@ func TestPartiesCurrentInfoMessagesBruteForceAndPurgeV0110(t *testing.T) {
 		}
 	}
 	msgsRes := doAuthReq(t, mux, member, http.MethodGet, "/Parties/Messages", nil)
-	var msgs []PartyMessage
-	_ = json.Unmarshal(msgsRes.Body.Bytes(), &msgs)
-	if len(msgs) != maxPartyMessagesPerRoom || msgs[0].UserName != "MemberBob" {
-		t.Fatalf("expected %d capped messages with UserName=MemberBob, got len=%d first=%+v", maxPartyMessagesPerRoom, len(msgs), msgs[0])
+	var msgsQR dto.QueryResult[PartyMessage]
+	_ = json.Unmarshal(msgsRes.Body.Bytes(), &msgsQR)
+	if msgsQR.TotalRecordCount != maxPartyMessagesPerRoom || len(msgsQR.Items) != maxPartyMessagesPerRoom || msgsQR.Items[0].UserName != "MemberBob" {
+		t.Fatalf("expected %d capped messages with UserName=MemberBob, got total=%d len=%d first=%+v", maxPartyMessagesPerRoom, msgsQR.TotalRecordCount, len(msgsQR.Items), msgsQR.Items[0])
 	}
 
 	// Host leaves via exported HandleLeaveCurrentParty -> ownership transfers to member!

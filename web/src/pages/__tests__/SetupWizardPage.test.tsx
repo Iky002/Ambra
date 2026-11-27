@@ -134,11 +134,11 @@ describe('SetupWizardPage - 首次运行 4 步初始化向导', () => {
     await user.clear(usernameInput)
     await user.type(usernameInput, 'cinema_admin')
 
-    // 密码长度不足 4 位校验
-    await user.type(passwordInput, '123')
-    await user.type(confirmInput, '123')
+    // 密码长度不足 6 位校验
+    await user.type(passwordInput, '12345')
+    await user.type(confirmInput, '12345')
     await user.click(screen.getByRole('button', { name: /创建并继续/i }))
-    expect(await screen.findByText('管理员密码长度至少为 4 位')).toBeInTheDocument()
+    expect(await screen.findByText('管理员密码长度至少为 6 位')).toBeInTheDocument()
 
     // 两次密码不一致校验
     await user.clear(passwordInput)
@@ -276,6 +276,98 @@ describe('SetupWizardPage - 首次运行 4 步初始化向导', () => {
 
     await waitFor(() => {
       expect(screen.getByText('Ambra 影院首页')).toBeInTheDocument()
+    })
+  })
+
+  it('[3.2-7] 提供全部 10 种刮削语言选项，且已有管理员点击「已登录，直接下一步」跳过 Step 2 时持久化语言与国家设置', async () => {
+    const user = userEvent.setup()
+    saveAuth({
+      accessToken: 'tok-existing-admin',
+      userId: 'u-admin-99',
+      serverId: 'srv-1',
+      userName: 'admin',
+      isAdmin: true,
+      deviceId: 'dev-1',
+    })
+
+    let setupCompleted = false
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input)
+      const method = (init?.method || 'GET').toUpperCase()
+      if (url === '/api/setup/status' && method === 'GET') {
+        return jsonRes({
+          completed: setupCompleted,
+          server_name: 'Ambra',
+          default_language: 'zh-CN',
+          has_users: true,
+          has_tmdb_key: false,
+        })
+      }
+      if (url === '/emby/Users/u-admin-99' && method === 'GET') {
+        return jsonRes({
+          Id: 'u-admin-99',
+          Name: 'admin',
+          ServerId: 'srv-1',
+          Policy: { IsAdministrator: true },
+        })
+      }
+      if (url === '/emby/System/Configuration' && method === 'POST') {
+        return jsonRes({})
+      }
+      if (url === '/api/setup/complete' && method === 'POST') {
+        setupCompleted = true
+        return jsonRes({ completed: true })
+      }
+      return jsonRes([])
+    })
+
+    renderWithRouter('/setup')
+    expect(await screen.findByText('第 1 步 · 服务器基础设置')).toBeInTheDocument()
+
+    const langSelect = screen.getByLabelText('首选刮削语言') as HTMLSelectElement
+    const optionValues = Array.from(langSelect.options).map((o) => o.value)
+    expect(optionValues).toEqual([
+      'zh-CN',
+      'zh-TW',
+      'en-US',
+      'ja-JP',
+      'ko-KR',
+      'es-ES',
+      'de-DE',
+      'fr-FR',
+      'pt-BR',
+      'th-TH',
+    ])
+
+    await user.selectOptions(langSelect, 'ko-KR')
+    await user.selectOptions(screen.getByLabelText('国家 / 地区'), 'KR')
+    await user.click(screen.getByRole('button', { name: /下一步：创建管理员/i }))
+
+    expect(await screen.findByText('第 2 步 · 创建管理员账号')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /已登录，直接下一步/i }))
+
+    expect(await screen.findByText('第 3 步 · 添加媒体库')).toBeInTheDocument()
+    const cfgCalls = fetchSpy.mock.calls.filter(
+      ([u, init]) =>
+        String(u) === '/emby/System/Configuration' &&
+        (init?.method || 'GET').toUpperCase() === 'POST',
+    )
+    expect(cfgCalls.length).toBeGreaterThanOrEqual(1)
+    expect(JSON.parse(String(cfgCalls[0]?.[1]?.body))).toMatchObject({
+      PreferredMetadataLanguage: 'ko-KR',
+      MetadataCountryCode: 'KR',
+      TMDBLanguage: 'ko-KR',
+    })
+
+    await user.click(screen.getByRole('button', { name: /暂时跳过|下一步：刮削设置/i }))
+    await user.click(screen.getByRole('button', { name: /完成初始化并进入 Ambra/i }))
+
+    expect(await screen.findByText('Ambra 影院首页')).toBeInTheDocument()
+    const completeCall = fetchSpy.mock.calls.find(([u]) => u === '/api/setup/complete')
+    expect(JSON.parse(String(completeCall?.[1]?.body))).toMatchObject({
+      language: 'ko-KR',
+      country: 'KR',
+      tmdb_language: 'ko-KR',
     })
   })
 })

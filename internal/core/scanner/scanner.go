@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ambra-media/ambra/internal/config"
@@ -49,6 +50,7 @@ type Scanner struct {
 	cancels        map[string]context.CancelFunc
 	progress       map[string]*LibraryScanProgress
 	libPathMu      map[string]*sync.Mutex
+	asyncInFlight  atomic.Int64
 
 	pauseMu  sync.Mutex
 	paused   bool
@@ -176,7 +178,9 @@ func preserveExistingItemOnRescan(existing, rec *sqlite.ItemRecord) {
 	if isFieldLocked(existing, "Artists") || (len(rec.Extra.Artists) == 0 && len(existing.Extra.Artists) > 0) {
 		rec.Extra.Artists = append([]string(nil), existing.Extra.Artists...)
 	}
-	if len(existing.Extra.ProviderIDs) > 0 {
+	if isFieldLocked(existing, "ProviderIds") {
+		rec.Extra.ProviderIDs = cloneStringMap(existing.Extra.ProviderIDs)
+	} else if len(existing.Extra.ProviderIDs) > 0 {
 		if rec.Extra.ProviderIDs == nil {
 			rec.Extra.ProviderIDs = make(map[string]string, len(existing.Extra.ProviderIDs))
 		}
@@ -239,7 +243,9 @@ func (s *Scanner) ScanAll(ctx context.Context) ([]ScanStats, error) {
 
 // ScanLibraryAsync starts an asynchronous scan for a single library (or all if libraryID == "").
 func (s *Scanner) ScanLibraryAsync(libraryID string) {
+	s.asyncInFlight.Add(1)
 	go func() {
+		defer s.asyncInFlight.Add(-1)
 		ctx := context.Background()
 		if libraryID == "" {
 			_, _ = s.ScanAll(ctx)
@@ -249,13 +255,22 @@ func (s *Scanner) ScanLibraryAsync(libraryID string) {
 	}()
 }
 
-// WaitIdle blocks until no library scan is in progress or ctx is done.
+// ScanPathAsync starts an asynchronous targeted scan for a specific path within libraryID.
+func (s *Scanner) ScanPathAsync(libraryID, targetPath string) {
+	s.asyncInFlight.Add(1)
+	go func() {
+		defer s.asyncInFlight.Add(-1)
+		_, _ = s.ScanPath(context.Background(), libraryID, targetPath)
+	}()
+}
+
+// WaitIdle blocks until no library or path scan is in progress or ctx is done.
 func (s *Scanner) WaitIdle(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		s.mu.Lock()
-		busy := len(s.scanning) > 0
+		busy := len(s.scanning) > 0 || s.asyncInFlight.Load() > 0
 		s.mu.Unlock()
 		if !busy {
 			return
@@ -1930,33 +1945,33 @@ func applyMetadataToItem(rec *sqlite.ItemRecord, meta *plugins.MetadataResult) {
 			rec.SortName = strings.ToLower(meta.Name)
 		}
 	}
-	if meta.OriginalTitle != "" {
+	if meta.OriginalTitle != "" && !isFieldLocked(rec, "OriginalTitle") {
 		rec.OriginalTitle = meta.OriginalTitle
 	}
-	if meta.Overview != "" {
+	if meta.Overview != "" && !isFieldLocked(rec, "Overview") {
 		rec.Extra.Overview = meta.Overview
 	}
-	if meta.Tagline != "" {
+	if meta.Tagline != "" && !isFieldLocked(rec, "Taglines") {
 		rec.Extra.Taglines = []string{meta.Tagline}
 	}
-	if meta.Year > 0 {
+	if meta.Year > 0 && !isFieldLocked(rec, "ProductionYear") {
 		y := meta.Year
 		rec.ProductionYear = &y
 	}
-	if meta.PremiereDate != "" {
+	if meta.PremiereDate != "" && !isFieldLocked(rec, "PremiereDate") {
 		if t, err := time.Parse("2006-01-02", meta.PremiereDate); err == nil {
 			unix := t.Unix()
 			rec.PremiereDate = &unix
 		}
 	}
-	if meta.CommunityRating > 0 {
+	if meta.CommunityRating > 0 && !isFieldLocked(rec, "CommunityRating") {
 		r := meta.CommunityRating
 		rec.CommunityRating = &r
 	}
-	if meta.OfficialRating != "" {
+	if meta.OfficialRating != "" && !isFieldLocked(rec, "OfficialRating") {
 		rec.OfficialRating = meta.OfficialRating
 	}
-	if len(meta.ProviderIDs) > 0 {
+	if len(meta.ProviderIDs) > 0 && !isFieldLocked(rec, "ProviderIds") {
 		rec.Extra.ProviderIDs = meta.ProviderIDs
 	}
 	if meta.LockData {

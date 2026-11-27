@@ -17,6 +17,7 @@ import (
 	"image/png"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/netip"
@@ -633,6 +634,10 @@ func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusNotFound, "media item not found")
 		return
 	}
+	if pol, _ := h.resolvePolicyForRequest(r.Context(), r); pol != nil && !pol.IsAdministrator && !pol.EnableMediaPlayback {
+		httpx.Error(w, http.StatusForbidden, "Media playback is disabled for this user")
+		return
+	}
 
 	item, mediaPath, err := h.resolveDLNAMediaPathForRequest(r.Context(), r, itemID)
 	if errors.Is(err, sqlite.ErrNotFound) {
@@ -768,6 +773,27 @@ func (h *Handler) resolveDLNAStrmTarget(ctx context.Context, realStrmPath string
 	return targetURL, headers, nil
 }
 
+func sanitizeDLNAProxyContentType(rawCT, targetURL string) string {
+	candidate := strings.TrimSpace(rawCT)
+	if candidate == "" {
+		if u, uErr := url.Parse(targetURL); uErr == nil {
+			candidate = dlnaMediaContentType(u.Path)
+		}
+	}
+	if candidate == "" {
+		return "application/octet-stream"
+	}
+	mediaType, _, err := mime.ParseMediaType(candidate)
+	if err != nil {
+		return "application/octet-stream"
+	}
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	if strings.HasPrefix(mediaType, "video/") || strings.HasPrefix(mediaType, "audio/") || mediaType == "application/octet-stream" {
+		return mediaType
+	}
+	return "application/octet-stream"
+}
+
 func (h *Handler) proxyDLNARemoteStream(w http.ResponseWriter, r *http.Request, targetURL string, headers map[string]string) {
 	upReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, nil)
 	if err != nil {
@@ -815,16 +841,9 @@ func (h *Handler) proxyDLNARemoteStream(w http.ResponseWriter, r *http.Request, 
 			w.Header().Set(hdr, val)
 		}
 	}
-	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
-	if ct == "" {
-		if u, uErr := url.Parse(targetURL); uErr == nil {
-			ct = dlnaMediaContentType(u.Path)
-		}
-	}
-	if ct == "" {
-		ct = "application/octet-stream"
-	}
-	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Content-Type", sanitizeDLNAProxyContentType(resp.Header.Get("Content-Type"), targetURL))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox")
 	w.Header().Set("SERVER", defaultServerHeader)
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(resp.StatusCode)
@@ -934,7 +953,9 @@ func (h *Handler) streamDLNATranscode(w http.ResponseWriter, r *http.Request, it
 	}
 
 	args = netutil.FilterFFmpegArgs(ffmpegPath, args)
-	cmd := exec.CommandContext(r.Context(), ffmpegPath, args...)
+	procCtx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	cmd := exec.CommandContext(procCtx, ffmpegPath, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to start dlna transcode")
@@ -946,6 +967,8 @@ func (h *Handler) streamDLNATranscode(w http.ResponseWriter, r *http.Request, it
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, stdout)
+	cancel()
+	_ = stdout.Close()
 	_ = cmd.Wait()
 }
 
@@ -1011,6 +1034,8 @@ func (h *Handler) isPathWithinRegisteredLibraries(ctx context.Context, realTarge
 
 func isRestrictedUserPolicy(p dto.UserPolicy) bool {
 	return !p.EnableAllFolders ||
+		!p.EnableMediaPlayback ||
+		!p.EnableLiveTvAccess ||
 		p.MaxParentalRating != nil ||
 		len(p.BlockedTags) > 0 ||
 		len(p.BlockUnratedItems) > 0 ||
@@ -1024,15 +1049,17 @@ func isRestrictedUserPolicy(p dto.UserPolicy) bool {
 //   - Intersection of non-empty AllowedTags sets.
 func buildStrictestIntersectionPolicy(users []*sqlite.UserRecord) (*dto.UserPolicy, bool) {
 	var (
-		hasRestricted bool
-		activeCount   int
-		folderInit    bool
-		folderSet     map[string]bool
-		minRating     *int
-		blockedTags   = make(map[string]string)
-		blockUnrated  = make(map[string]string)
-		allowedInit   bool
-		allowedSet    map[string]string
+		hasRestricted       bool
+		activeCount         int
+		enableMediaPlayback = true
+		enableLiveTvAccess  = true
+		folderInit          bool
+		folderSet           map[string]bool
+		minRating           *int
+		blockedTags         = make(map[string]string)
+		blockUnrated        = make(map[string]string)
+		allowedInit         bool
+		allowedSet          map[string]string
 	)
 	for _, u := range users {
 		if u == nil || u.IsDisabled {
@@ -1047,6 +1074,12 @@ func buildStrictestIntersectionPolicy(users []*sqlite.UserRecord) (*dto.UserPoli
 		}
 		hasRestricted = true
 		p := u.Policy
+		if !p.EnableMediaPlayback {
+			enableMediaPlayback = false
+		}
+		if !p.EnableLiveTvAccess {
+			enableLiveTvAccess = false
+		}
 		if !p.EnableAllFolders {
 			cur := make(map[string]bool, len(p.EnabledFolders))
 			for _, fid := range p.EnabledFolders {
@@ -1109,8 +1142,10 @@ func buildStrictestIntersectionPolicy(users []*sqlite.UserRecord) (*dto.UserPoli
 	}
 
 	out := dto.UserPolicy{
-		EnableAllFolders:  !folderInit,
-		MaxParentalRating: minRating,
+		EnableMediaPlayback: enableMediaPlayback,
+		EnableLiveTvAccess:  enableLiveTvAccess,
+		EnableAllFolders:    !folderInit,
+		MaxParentalRating:   minRating,
 	}
 	if folderInit {
 		out.EnabledFolders = make([]string, 0, len(folderSet))
@@ -1204,7 +1239,17 @@ func (h *Handler) resolveDefaultUserPolicy(ctx context.Context) (policy *dto.Use
 }
 
 func (h *Handler) isLibraryAllowedByPolicy(libID string, policy *dto.UserPolicy) bool {
-	if policy == nil || policy.EnableAllFolders {
+	return h.isLibraryAllowedByPolicyCtx(context.Background(), libID, policy)
+}
+
+func (h *Handler) isLibraryAllowedByPolicyCtx(ctx context.Context, libID string, policy *dto.UserPolicy) bool {
+	if policy == nil || policy.IsAdministrator {
+		return true
+	}
+	if h.libRepo != nil {
+		return h.libRepo.CanUserAccessLibrary(ctx, *policy, libID)
+	}
+	if policy.EnableAllFolders {
 		return true
 	}
 	normLib := guid.Normalize(libID)
@@ -1247,58 +1292,16 @@ func (h *Handler) isItemAllowedByPolicy(ctx context.Context, rec *sqlite.ItemRec
 	if rec == nil {
 		return false
 	}
-	if policy == nil {
+	if policy == nil || policy.IsAdministrator {
 		return true
 	}
-	if rec.LibraryID != "" && !strings.EqualFold(rec.Type, "Playlist") && !strings.EqualFold(rec.Type, "BoxSet") && !h.isLibraryAllowedByPolicy(rec.LibraryID, policy) {
+	if rec.LibraryID != "" && !strings.EqualFold(rec.Type, "Playlist") && !strings.EqualFold(rec.Type, "BoxSet") && !h.isLibraryAllowedByPolicyCtx(ctx, rec.LibraryID, policy) {
 		return false
 	}
-	if h.libRepo != nil && (policy.MaxParentalRating != nil || len(policy.BlockedTags) > 0) {
-		if blocked, err := h.libRepo.IsItemBlockedByParentalPolicy(ctx, rec, policy.MaxParentalRating, policy.BlockedTags); err != nil || blocked {
+	if h.libRepo != nil {
+		blocked, err := h.libRepo.IsItemBlockedByPolicy(ctx, rec, *policy)
+		if err != nil || blocked {
 			return false
-		}
-	}
-	if len(policy.BlockUnratedItems) > 0 && matchesDLNABlockUnrated(rec.Type, rec.MediaType, policy.BlockUnratedItems) {
-		rating := strings.TrimSpace(rec.OfficialRating)
-		if rating == "" && rec.SeriesID != "" && h.libRepo != nil {
-			if sRec, sErr := h.libRepo.GetItemRecordByID(ctx, rec.SeriesID); sErr == nil && sRec != nil {
-				rating = strings.TrimSpace(sRec.OfficialRating)
-			}
-		}
-		if rating == "" {
-			return false
-		}
-	}
-	if len(policy.AllowedTags) > 0 && h.libRepo != nil {
-		allowSet := make(map[string]bool, len(policy.AllowedTags))
-		for _, at := range policy.AllowedTags {
-			if s := strings.ToLower(strings.TrimSpace(at)); s != "" {
-				allowSet[s] = true
-			}
-		}
-		if len(allowSet) > 0 {
-			matched := false
-			checkIDs := []string{rec.ID}
-			if rec.SeriesID != "" {
-				checkIDs = append(checkIDs, rec.SeriesID)
-			}
-			for _, cid := range checkIDs {
-				_, _, tags, err := h.libRepo.GetTaxonomiesByItemID(ctx, cid)
-				if err == nil {
-					for _, tg := range tags {
-						if allowSet[strings.ToLower(strings.TrimSpace(tg))] {
-							matched = true
-							break
-						}
-					}
-				}
-				if matched {
-					break
-				}
-			}
-			if !matched {
-				return false
-			}
 		}
 	}
 	return true

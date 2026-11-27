@@ -385,4 +385,69 @@ describe('pgsRenderer - PgsCanvasRenderer 同步绘制与二分查找', () => {
 
     renderer.destroy()
   })
+
+  it('[M-16] parsePgsSup 仅保留压缩 RLE 与紧凑调色板，按需惰性解码 ImageData 并通过有界 LRU 缓存淘汰旧帧', () => {
+    const rle = new Uint8Array([0x00, 0x82, 0x01, 0x01, 0x01, 0x00, 0x00])
+    const segs: Uint8Array[] = []
+    for (let i = 0; i < 20; i++) {
+      const pts = i + 1
+      segs.push(
+        buildPgsSegment(
+          pts,
+          0x16,
+          buildPcsPayload({
+            width: 1920,
+            height: 1080,
+            state: 0x80,
+            paletteId: 0,
+            objects: [{ objectId: 1, windowId: 0, x: 10 + i, y: 900 }],
+          }),
+        ),
+        buildPgsSegment(pts, 0x17, buildWdsPayload([{ id: 0, x: 10 + i, y: 900, width: 4, height: 1 }])),
+        buildPgsSegment(pts, 0x14, buildPdsPayload(0, [{ id: 1, y: 235, cr: 128, cb: 128, a: 255 }])),
+        buildPgsSegment(pts, 0x15, buildSingleOdsPayload(1, 4, 1, rle)),
+        buildPgsSegment(pts, 0x80, new Uint8Array(0)),
+      )
+    }
+
+    const OrigImageData = globalThis.ImageData
+    let imageDataConstructCount = 0
+    if (typeof OrigImageData === 'function') {
+      class SpyImageData extends OrigImageData {
+        constructor(dataOrSw: any, swOrSh: any, sh?: any) {
+          if (sh !== undefined) super(dataOrSw, swOrSh, sh)
+          else super(dataOrSw, swOrSh)
+          imageDataConstructCount++
+        }
+      }
+      globalThis.ImageData = SpyImageData as typeof ImageData
+    }
+
+    try {
+      const displaySets = parsePgsSup(concatBytes(segs))
+      expect(displaySets).toHaveLength(20)
+      // 解析阶段不应提前构造任何未压缩 RGBA ImageData！
+      if (typeof OrigImageData === 'function') {
+        expect(imageDataConstructCount).toBe(0)
+      }
+
+      // 首次访问第 0 帧：按需惰性解码，同帧二次读取命中 LRU 缓存
+      const firstImgA = displaySets[0].objects[0].imageData
+      const firstImgB = displaySets[0].objects[0].imageData
+      expect(firstImgA).toBe(firstImgB)
+      expect(firstImgA.width).toBe(4)
+
+      // 连续访问后续 16 帧以溢出 12 条上限的 LRU 缓存
+      for (let i = 1; i <= 16; i++) {
+        expect(displaySets[i].objects[0].imageData.width).toBe(4)
+      }
+
+      // 再次读取第 0 帧：旧对象已被淘汰并重新按 RLE 解码出新实例
+      const firstImgRehydrated = displaySets[0].objects[0].imageData
+      expect(firstImgRehydrated).not.toBe(firstImgA)
+      expect(firstImgRehydrated.data[3]).toBe(255)
+    } finally {
+      globalThis.ImageData = OrigImageData
+    }
+  })
 })

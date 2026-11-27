@@ -1,19 +1,63 @@
 package middleware
 
 import (
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
-// CORS enables cross-origin requests for Emby Web, Infuse, SenPlayer, VidHub, and third-party clients.
-// Without an explicit origin allowlist, it reflects Origin WITHOUT setting Access-Control-Allow-Credentials.
-func CORS(next http.Handler) http.Handler {
-	return CORSWithOrigins(nil)(next)
+func normalizeOriginHost(hostPort, scheme string) string {
+	s := strings.ToLower(strings.TrimSpace(hostPort))
+	if s == "" {
+		return ""
+	}
+	if h, p, err := net.SplitHostPort(s); err == nil {
+		h = strings.Trim(h, "[]")
+		if (scheme == "http" && p == "80") || (scheme == "https" && p == "443") {
+			if strings.Contains(h, ":") {
+				return "[" + h + "]"
+			}
+			return h
+		}
+		if strings.Contains(h, ":") {
+			return "[" + h + "]:" + p
+		}
+		return h + ":" + p
+	}
+	return s
 }
 
-// CORSWithOrigins returns a CORS middleware with an optional explicit origin allowlist.
-// Access-Control-Allow-Credentials: true is only sent for origins matching an explicit allowlist entry.
-func CORSWithOrigins(allowed []string) func(http.Handler) http.Handler {
+// IsSameOrigin reports whether the Origin header represents the same host(:port) as r.Host
+// (and prevents http:// downgrade when r arrived over TLS).
+func IsSameOrigin(origin string, r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	raw := strings.TrimSpace(origin)
+	if raw == "" || strings.TrimSpace(r.Host) == "" {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return false
+	}
+	if u.Path != "" && u.Path != "/" {
+		return false
+	}
+	scheme := strings.ToLower(strings.TrimSpace(u.Scheme))
+	if scheme != "http" && scheme != "https" {
+		return false
+	}
+	if r.TLS != nil && scheme != "https" {
+		return false
+	}
+	originHost := normalizeOriginHost(u.Host, scheme)
+	reqHost := normalizeOriginHost(r.Host, scheme)
+	return originHost != "" && originHost == reqHost
+}
+
+func parseAllowedOrigins(allowed []string) (map[string]struct{}, bool) {
 	allowedSet := make(map[string]struct{}, len(allowed))
 	allowWildcard := false
 	for _, raw := range allowed {
@@ -27,31 +71,67 @@ func CORSWithOrigins(allowed []string) func(http.Handler) http.Handler {
 		}
 		allowedSet[norm] = struct{}{}
 	}
-	hasExplicitList := len(allowedSet) > 0 || allowWildcard
+	return allowedSet, allowWildcard
+}
 
+// IsOriginAllowed reports whether origin is empty, same-origin with r.Host, or permitted by allowed.
+// Used by setup/startup mutation endpoints to block cross-origin browser takeover.
+func IsOriginAllowed(origin string, r *http.Request, allowed []string) bool {
+	origin = strings.TrimSpace(origin)
+	if origin == "" {
+		return true
+	}
+	if IsSameOrigin(origin, r) {
+		return true
+	}
+	allowedSet, allowWildcard := parseAllowedOrigins(allowed)
+	if allowWildcard {
+		return true
+	}
+	normOrigin := strings.ToLower(strings.TrimRight(origin, "/"))
+	_, ok := allowedSet[normOrigin]
+	return ok
+}
+
+// CORS enables same-origin requests by default without reflecting arbitrary cross-origin headers.
+func CORS(next http.Handler) http.Handler {
+	return CORSWithOrigins(nil)(next)
+}
+
+// CORSWithOrigins returns a CORS middleware with an optional explicit origin allowlist.
+// Access-Control-Allow-Credentials: true is only sent for origins matching an explicit allowlist entry.
+func CORSWithOrigins(allowed []string) func(http.Handler) http.Handler {
+	copied := append([]string(nil), allowed...)
+	return CORSWithDynamicOrigins(func() []string {
+		return copied
+	})
+}
+
+// CORSWithDynamicOrigins returns a CORS middleware that evaluates getOrigins on each request
+// so AllowedOrigins updates take effect immediately via hot-reload.
+func CORSWithDynamicOrigins(getOrigins func() []string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var currentAllowed []string
+			if getOrigins != nil {
+				currentAllowed = getOrigins()
+			}
+			allowedSet, allowWildcard := parseAllowedOrigins(currentAllowed)
+
 			origin := strings.TrimSpace(r.Header.Get("Origin"))
-			if hasExplicitList {
-				if origin != "" {
-					normOrigin := strings.ToLower(strings.TrimRight(origin, "/"))
-					w.Header().Add("Vary", "Origin")
-					if _, ok := allowedSet[normOrigin]; ok {
-						w.Header().Set("Access-Control-Allow-Origin", origin)
-						w.Header().Set("Access-Control-Allow-Credentials", "true")
-					} else if allowWildcard {
-						w.Header().Set("Access-Control-Allow-Origin", origin)
-					}
+			if origin != "" {
+				normOrigin := strings.ToLower(strings.TrimRight(origin, "/"))
+				w.Header().Add("Vary", "Origin")
+				if _, ok := allowedSet[normOrigin]; ok {
+					w.Header().Set("Access-Control-Allow-Origin", origin)
+					w.Header().Set("Access-Control-Allow-Credentials", "true")
+				} else if IsSameOrigin(origin, r) {
+					w.Header().Set("Access-Control-Allow-Origin", origin)
 				} else if allowWildcard {
 					w.Header().Set("Access-Control-Allow-Origin", "*")
 				}
-			} else {
-				if origin != "" {
-					w.Header().Set("Access-Control-Allow-Origin", origin)
-					w.Header().Set("Vary", "Origin")
-				} else {
-					w.Header().Set("Access-Control-Allow-Origin", "*")
-				}
+			} else if allowWildcard {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
 			}
 
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD")

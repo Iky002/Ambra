@@ -275,10 +275,14 @@ describe('Stream 4 (v0.8.0): Web UI Home, Library, Admin & Demo Emby Parity', ()
     fireEvent.click(screen.getByRole('button', { name: '添加 EPG' }))
     await screen.findByText('https://epg.example.com/guide.xml')
 
-    // 独立渲染 LiveTvTab 验证删除按钮
+    // 独立渲染 LiveTvTab 验证删除按钮（兼容新增的确认删除调谐器弹窗）
     const deleteBtns = screen.getAllByRole('button', { name: '删除' })
     expect(deleteBtns.length).toBeGreaterThanOrEqual(2)
     fireEvent.click(deleteBtns[0])
+    const confirmTunerBtn = screen.queryByTestId('confirm-delete-tuner-btn')
+    if (confirmTunerBtn) {
+      fireEvent.click(confirmTunerBtn)
+    }
     await screen.findByText(/已删除直播源/)
   })
 

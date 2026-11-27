@@ -188,7 +188,7 @@ func TestHubFullLifecycleAndEvents(t *testing.T) {
 		t.Fatalf("expected LibraryChanged on conn2, got %q", m.MessageType)
 	}
 
-	// EventBus: EventUserDataChanged (value struct) -> user + apikey
+	// EventBus: EventUserDataChanged (value struct) -> only user u1 (L-02: API-key clients do not receive SendToUser)
 	bus.Publish(ctx, eventbus.Event{
 		Type:    eventbus.EventUserDataChanged,
 		Payload: session.UserDataChangedPayload{UserId: u1.ID},
@@ -196,20 +196,14 @@ func TestHubFullLifecycleAndEvents(t *testing.T) {
 	if m := readMsg(t, conn1); m.MessageType != "UserDataChanged" {
 		t.Fatalf("expected UserDataChanged on conn1, got %q", m.MessageType)
 	}
-	if m := readMsg(t, conn2); m.MessageType != "UserDataChanged" {
-		t.Fatalf("expected UserDataChanged on conn2, got %q", m.MessageType)
-	}
 
-	// EventBus: EventUserDataChanged (pointer struct)
+	// EventBus: EventUserDataChanged (pointer struct) -> only user u1
 	bus.Publish(ctx, eventbus.Event{
 		Type:    eventbus.EventUserDataChanged,
 		Payload: &session.UserDataChangedPayload{UserId: u1.ID},
 	})
 	if m := readMsg(t, conn1); m.MessageType != "UserDataChanged" {
 		t.Fatalf("expected UserDataChanged ptr on conn1, got %q", m.MessageType)
-	}
-	if m := readMsg(t, conn2); m.MessageType != "UserDataChanged" {
-		t.Fatalf("expected UserDataChanged ptr on conn2, got %q", m.MessageType)
 	}
 
 	// EventBus: EventUserDataChanged (unknown payload -> broadcast)

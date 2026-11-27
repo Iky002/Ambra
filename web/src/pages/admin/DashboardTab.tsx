@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   Activity,
+  AlertTriangle,
   ChevronLeft,
   ChevronRight,
   Cpu,
@@ -11,8 +12,10 @@ import {
   MonitorPlay,
   Pause,
   Play,
+  Power,
   Radio,
   RefreshCw,
+  RotateCcw,
   Search,
   Send,
   Server,
@@ -27,6 +30,7 @@ import { ScanProgressBar } from '../../components/ScanProgressBar'
 import { useI18n } from '../../i18n/I18nContext'
 import {
   AdminModal,
+  adminLabel,
   FeedbackBanner,
   formatDateTime,
   formatRelativeTime,
@@ -45,7 +49,7 @@ function matchesSeverity(severity: string | undefined, filter: SeverityFilter): 
 }
 
 export function DashboardTab() {
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const [autoRefresh, setAutoRefresh] = useState(true)
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
     null,
@@ -56,6 +60,9 @@ export function DashboardTab() {
   const [msgText, setMsgText] = useState('')
   const [msgError, setMsgError] = useState<string | null>(null)
   const [sendingMsg, setSendingMsg] = useState(false)
+  const [powerAction, setPowerAction] = useState<'restart' | 'shutdown' | null>(null)
+  const [executingPower, setExecutingPower] = useState(false)
+  const [powerError, setPowerError] = useState<string | null>(null)
 
   // 系统活动日志服务端过滤与分页
   const [logPage, setLogPage] = useState(0)
@@ -216,6 +223,53 @@ export function DashboardTab() {
     }
   }
 
+  const handleConfirmPowerAction = async () => {
+    if (!powerAction) return
+    setExecutingPower(true)
+    setPowerError(null)
+    setFeedback(null)
+    const endpoint = powerAction === 'restart' ? '/emby/System/Restart' : '/emby/System/Shutdown'
+    try {
+      await embyFetch<void>(endpoint, { method: 'POST' })
+      const doneAction = powerAction
+      setPowerAction(null)
+      setFeedback({
+        type: 'success',
+        message:
+          doneAction === 'restart'
+            ? adminLabel(
+                t,
+                locale,
+                'admin.dashboard.restartSentSuccess',
+                '已发送服务器重启指令，服务正在重新启动…',
+                'Server restart command sent; the server is restarting...',
+              )
+            : adminLabel(
+                t,
+                locale,
+                'admin.dashboard.shutdownSentSuccess',
+                '已发送服务器关闭指令，服务正在安全退出…',
+                'Server shutdown command sent; the server is shutting down...',
+              ),
+      })
+      void refetchSysInfo()
+    } catch (err) {
+      setPowerError(
+        err instanceof Error
+          ? err.message
+          : adminLabel(
+              t,
+              locale,
+              'admin.dashboard.powerActionFailed',
+              '执行服务器电源操作失败',
+              'Failed to execute server power action',
+            ),
+      )
+    } finally {
+      setExecutingPower(false)
+    }
+  }
+
   const severityOptions: Array<{ value: SeverityFilter; label: string }> = [
     { value: 'All', label: t('common.all') },
     { value: 'Info', label: 'Info' },
@@ -235,17 +289,61 @@ export function DashboardTab() {
 
       {/* 服务器状态卡片 */}
       <section className="space-y-4">
-        <div className="flex items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2 text-sm font-semibold text-zinc-200">
             <Server className="h-4 w-4 text-amber-400" />
             <span>{t('admin.dashboardOverview')}</span>
           </div>
-          <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-300">
-            <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-400" />
-            {sysInfo?.IsShuttingDown
-              ? t('admin.dashboard.statusShuttingDown')
-              : t('admin.dashboard.statusHealthy')}
-          </span>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-300">
+              <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-400" />
+              {sysInfo?.IsShuttingDown
+                ? t('admin.dashboard.statusShuttingDown')
+                : t('admin.dashboard.statusHealthy')}
+            </span>
+            <button
+              type="button"
+              data-testid="server-restart-btn"
+              disabled={Boolean(sysInfo?.IsShuttingDown)}
+              onClick={() => {
+                setPowerError(null)
+                setPowerAction('restart')
+              }}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/20 disabled:opacity-50"
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+              <span>
+                {adminLabel(
+                  t,
+                  locale,
+                  'admin.dashboard.restartServerBtn',
+                  '重启服务器',
+                  'Restart Server',
+                )}
+              </span>
+            </button>
+            <button
+              type="button"
+              data-testid="server-shutdown-btn"
+              disabled={Boolean(sysInfo?.IsShuttingDown)}
+              onClick={() => {
+                setPowerError(null)
+                setPowerAction('shutdown')
+              }}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/30 bg-red-500/10 px-2.5 py-1 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
+            >
+              <Power className="h-3.5 w-3.5" />
+              <span>
+                {adminLabel(
+                  t,
+                  locale,
+                  'admin.dashboard.shutdownServerBtn',
+                  '关闭服务器',
+                  'Shut Down',
+                )}
+              </span>
+            </button>
+          </div>
         </div>
 
         {sysLoading ? (
@@ -661,6 +759,148 @@ export function DashboardTab() {
             </button>
           </div>
         </form>
+      </AdminModal>
+
+      <AdminModal
+        open={Boolean(powerAction)}
+        title={
+          powerAction === 'shutdown'
+            ? adminLabel(
+                t,
+                locale,
+                'admin.dashboard.confirmShutdownTitle',
+                '确认关闭服务器',
+                'Confirm Server Shutdown',
+              )
+            : adminLabel(
+                t,
+                locale,
+                'admin.dashboard.confirmRestartTitle',
+                '确认重启服务器',
+                'Confirm Server Restart',
+              )
+        }
+        subtitle={sysInfo?.ServerName || 'Ambra'}
+        maxWidthClass="max-w-md"
+        onClose={() => {
+          if (!executingPower) {
+            setPowerAction(null)
+            setPowerError(null)
+          }
+        }}
+      >
+        <div className="space-y-4">
+          {powerError && (
+            <FeedbackBanner
+              message={powerError}
+              type="error"
+              onClose={() => setPowerError(null)}
+            />
+          )}
+
+          <div
+            data-testid="server-power-confirm-warning"
+            className={`flex items-start gap-3 rounded-xl border p-3.5 text-xs leading-relaxed ${
+              powerAction === 'shutdown'
+                ? 'border-red-500/30 bg-red-500/10 text-red-200'
+                : 'border-amber-500/30 bg-amber-500/10 text-amber-200'
+            }`}
+          >
+            <AlertTriangle
+              className={`mt-0.5 h-4 w-4 shrink-0 ${
+                powerAction === 'shutdown' ? 'text-red-400' : 'text-amber-400'
+              }`}
+            />
+            <div className="space-y-1">
+              <p className="font-semibold">
+                {powerAction === 'shutdown'
+                  ? adminLabel(
+                      t,
+                      locale,
+                      'admin.dashboard.confirmShutdownWarningTitle',
+                      '关闭后无法通过网页端远程唤醒',
+                      'Server cannot be started remotely from the Web UI once shut down',
+                    )
+                  : adminLabel(
+                      t,
+                      locale,
+                      'admin.dashboard.confirmRestartWarningTitle',
+                      '重启期间将中断所有正在进行的播放与任务',
+                      'Active playback streams and running tasks will be interrupted',
+                    )}
+              </p>
+              <p>
+                {powerAction === 'shutdown'
+                  ? adminLabel(
+                      t,
+                      locale,
+                      'admin.dashboard.confirmShutdownWarningDesc',
+                      '确定要立即安全停止 Ambra 服务器进程吗？当前共有 {{playing}} 个活跃播放会话将被断开；除非宿主机配置了守护进程自动拉起，否则需登录宿主机手动启动。',
+                      'Are you sure you want to shut down the Ambra server process? {{playing}} active playback stream(s) will be disconnected, and you will need host/container access to start it again.',
+                      { playing: playingCount },
+                    )
+                  : adminLabel(
+                      t,
+                      locale,
+                      'admin.dashboard.confirmRestartWarningDesc',
+                      '确定要重启 Ambra 服务器吗？当前共有 {{playing}} 个活跃播放会话，连接将在服务重启完成后恢复。',
+                      'Are you sure you want to restart the Ambra server? {{playing}} active playback stream(s) will be briefly interrupted until the server comes back online.',
+                      { playing: playingCount },
+                    )}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex justify-end gap-2 pt-2">
+            <button
+              type="button"
+              disabled={executingPower}
+              onClick={() => {
+                setPowerAction(null)
+                setPowerError(null)
+              }}
+              className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10 disabled:opacity-50"
+            >
+              {t('common.cancel')}
+            </button>
+            <button
+              type="button"
+              data-testid="confirm-server-power-btn"
+              disabled={executingPower}
+              onClick={() => void handleConfirmPowerAction()}
+              className={`inline-flex items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-semibold transition-colors disabled:opacity-60 ${
+                powerAction === 'shutdown'
+                  ? 'bg-red-500 text-white hover:bg-red-400'
+                  : 'bg-amber-500 text-zinc-950 hover:bg-amber-400'
+              }`}
+            >
+              {executingPower ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : powerAction === 'shutdown' ? (
+                <Power className="h-3.5 w-3.5" />
+              ) : (
+                <RotateCcw className="h-3.5 w-3.5" />
+              )}
+              <span>
+                {powerAction === 'shutdown'
+                  ? adminLabel(
+                      t,
+                      locale,
+                      'admin.dashboard.confirmShutdownBtn',
+                      '确认关机',
+                      'Confirm Shutdown',
+                    )
+                  : adminLabel(
+                      t,
+                      locale,
+                      'admin.dashboard.confirmRestartBtn',
+                      '确认重启',
+                      'Confirm Restart',
+                    )}
+              </span>
+            </button>
+          </div>
+        </div>
       </AdminModal>
     </div>
   )

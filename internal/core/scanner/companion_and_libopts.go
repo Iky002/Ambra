@@ -688,7 +688,7 @@ func (s *Scanner) handleCompanionFileChange(ctx context.Context, lib *sqlite.Lib
 			if nfoMeta == nil {
 				continue
 			}
-			applyRefreshMetadataToItem(rec, nfoMeta, true)
+			applyRefreshMetadataToItem(rec, nfoMeta, false)
 			rec.DateModified = time.Now().Unix()
 			rec.Etag = guid.New()[:16]
 			if err := s.repo.UpsertItem(ctx, rec); err == nil {

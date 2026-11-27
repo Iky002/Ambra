@@ -35,10 +35,29 @@ func (p extendedParentalPolicy) hasExtraPolicy() bool {
 	return len(p.blockUnratedItems) > 0 || len(p.allowedTags) > 0
 }
 
-func (h *Handler) userExtendedPolicyForRequest(r *http.Request, fallbackUserID string) extendedParentalPolicy {
+const maxQueryItemsLimit = 5000
+
+func clampQueryLimit(limit, defaultLimit, maxLimit int) int {
+	if limit <= 0 {
+		if defaultLimit > 0 {
+			return defaultLimit
+		}
+		return maxLimit
+	}
+	if maxLimit > 0 && limit > maxLimit {
+		return maxLimit
+	}
+	return limit
+}
+
+func (h *Handler) userPolicyForRequest(r *http.Request, fallbackUserID string) dto.UserPolicy {
 	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil {
 		if ac.IsAPIKey || ac.IsAdmin() {
-			return extendedParentalPolicy{}
+			return dto.UserPolicy{
+				IsAdministrator:    true,
+				EnableAllFolders:   true,
+				EnableLiveTvAccess: true,
+			}
 		}
 	}
 	uid := ""
@@ -57,27 +76,71 @@ func (h *Handler) userExtendedPolicyForRequest(r *http.Request, fallbackUserID s
 		u, err := h.userRepo.GetUserByID(r.Context(), uid)
 		if err != nil || u == nil {
 			zero := 0
-			return extendedParentalPolicy{maxRating: &zero}
+			return dto.UserPolicy{
+				EnableAllFolders:   false,
+				EnabledFolders:     []string{},
+				EnableLiveTvAccess: false,
+				MaxParentalRating:  &zero,
+			}
 		}
 		if u.IsAdmin || u.Policy.IsAdministrator {
-			return extendedParentalPolicy{}
+			return dto.UserPolicy{
+				IsAdministrator:    true,
+				EnableAllFolders:   true,
+				EnableLiveTvAccess: true,
+			}
 		}
-		return extendedParentalPolicy{
-			maxRating:         u.Policy.MaxParentalRating,
-			blockedTags:       u.Policy.BlockedTags,
-			blockUnratedItems: u.Policy.BlockUnratedItems,
-			allowedTags:       u.Policy.AllowedTags,
-		}
+		return u.Policy
 	}
 	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil {
-		return extendedParentalPolicy{
-			maxRating:         ac.User.Policy.MaxParentalRating,
-			blockedTags:       ac.User.Policy.BlockedTags,
-			blockUnratedItems: ac.User.Policy.BlockUnratedItems,
-			allowedTags:       ac.User.Policy.AllowedTags,
+		if ac.User.IsAdmin || ac.User.Policy.IsAdministrator {
+			return dto.UserPolicy{
+				IsAdministrator:    true,
+				EnableAllFolders:   true,
+				EnableLiveTvAccess: true,
+			}
+		}
+		return ac.User.Policy
+	}
+	return dto.UserPolicy{
+		IsAdministrator:    true,
+		EnableAllFolders:   true,
+		EnableLiveTvAccess: true,
+	}
+}
+
+func (h *Handler) playlistViewerForRequest(r *http.Request) (string, bool) {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.IsAdmin() {
+			return "", true
+		}
+		return guid.Normalize(ac.UserID()), false
+	}
+	if h.auth.UserIDFromCtx != nil {
+		callerID := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if callerID != "" {
+			if h.userRepo != nil {
+				if u, err := h.userRepo.GetUserByID(r.Context(), callerID); err == nil && u != nil && (u.IsAdmin || u.Policy.IsAdministrator) {
+					return callerID, true
+				}
+			}
+			return callerID, false
 		}
 	}
-	return extendedParentalPolicy{}
+	return "", true
+}
+
+func (h *Handler) userExtendedPolicyForRequest(r *http.Request, fallbackUserID string) extendedParentalPolicy {
+	pol := h.userPolicyForRequest(r, fallbackUserID)
+	if pol.IsAdministrator {
+		return extendedParentalPolicy{}
+	}
+	return extendedParentalPolicy{
+		maxRating:         pol.MaxParentalRating,
+		blockedTags:       pol.BlockedTags,
+		blockUnratedItems: pol.BlockUnratedItems,
+		allowedTags:       pol.AllowedTags,
+	}
 }
 
 func matchesBlockUnratedType(itemType, mediaType string, blockUnrated []string) bool {

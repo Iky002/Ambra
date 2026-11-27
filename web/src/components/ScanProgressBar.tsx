@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { CheckCircle2, FolderSync, Loader2, Pause, Play, Sparkles, XCircle } from 'lucide-react'
 import { api } from '../api/client'
 import type { LibraryScanProgress, ScanProgressSnapshot } from '../api/types'
+import { useI18n } from '../i18n/I18nContext'
 
 export interface ScanProgressBarProps {
   variant?: 'banner' | 'card'
@@ -10,16 +11,16 @@ export interface ScanProgressBarProps {
   className?: string
 }
 
-function getPhaseLabel(phase?: string): string {
+function getPhaseLabel(phase: string | undefined, t: (key: string) => string): string {
   switch (phase) {
     case 'discovering':
-      return '文件发现'
+      return t('scanBar.phaseDiscovering')
     case 'enriching':
-      return '元数据刮削与海报下载'
+      return t('scanBar.phaseEnriching')
     case 'completed':
-      return '扫描完成'
+      return t('scanBar.phaseCompleted')
     default:
-      return '媒体库扫描'
+      return t('scanBar.phaseDefault')
   }
 }
 
@@ -38,6 +39,7 @@ export function ScanProgressBar({
   enabled = true,
   className = '',
 }: ScanProgressBarProps) {
+  const { t } = useI18n()
   const queryClient = useQueryClient()
   const wasRunningRef = useRef(false)
   const lastActiveRef = useRef<ScanProgressSnapshot | null>(null)
@@ -113,7 +115,7 @@ export function ScanProgressBar({
   const isCompleted = !active.running
   const isPaused = typeof active.paused === 'boolean' ? active.paused : localPaused
   const pct = isCompleted ? 100 : clampPercentage(active.percentage, active.processed, active.total)
-  const phaseLabel = getPhaseLabel(active.phase)
+  const phaseLabel = getPhaseLabel(active.phase, t)
   const libraries: LibraryScanProgress[] = active.libraries || []
   const countText = active.total > 0 ? `${active.processed} / ${active.total}` : `${active.processed}`
 
@@ -182,10 +184,10 @@ export function ScanProgressBar({
 
             <span className="truncate text-zinc-200">
               {isCompleted
-                ? '媒体库扫描与元数据刮削已完成，已刷新最新片单与海报'
+                ? t('scanBar.bannerCompleted')
                 : active.current_item
-                  ? `当前：${active.current_item}`
-                  : active.current_action || '正在扫描媒体库...'}
+                  ? t('scanBar.currentItem', { item: active.current_item })
+                  : active.current_action || t('scanBar.scanningLibrary')}
             </span>
           </div>
 
@@ -242,7 +244,7 @@ export function ScanProgressBar({
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <h3 className="text-sm font-semibold text-zinc-100">
-                {isCompleted ? '媒体库扫描与刮削已完成' : '媒体库扫描与刮削进行中'}
+                {isCompleted ? t('scanBar.cardCompletedTitle') : t('scanBar.cardRunningTitle')}
               </h3>
               <span
                 className={`rounded-md px-2 py-0.5 text-[11px] font-medium ${
@@ -262,14 +264,16 @@ export function ScanProgressBar({
             </div>
             <p className="mt-1 truncate text-xs text-zinc-300">
               {isCompleted ? (
-                '已完成全部条目的索引与元数据刮削，页面数据已自动更新'
+                t('scanBar.cardCompletedDesc')
               ) : (
                 <>
                   {active.current_action ? (
                     <span className="text-zinc-400">{active.current_action} · </span>
                   ) : null}
                   <span>
-                    当前：{active.current_item || '正在准备扫描队列...'}
+                    {t('scanBar.currentItem', {
+                      item: active.current_item || t('scanBar.preparingQueue'),
+                    })}
                   </span>
                 </>
               )}
@@ -293,7 +297,7 @@ export function ScanProgressBar({
                 ) : (
                   <Pause className="h-3 w-3" />
                 )}
-                <span>{isPaused ? '恢复' : '暂停'}</span>
+                <span>{isPaused ? t('scanBar.resume') : t('scanBar.pause')}</span>
               </button>
               <button
                 type="button"
@@ -306,7 +310,7 @@ export function ScanProgressBar({
                 ) : (
                   <XCircle className="h-3 w-3" />
                 )}
-                <span>取消扫描</span>
+                <span>{t('scanBar.cancelScan')}</span>
               </button>
             </div>
           )}
@@ -334,13 +338,13 @@ export function ScanProgressBar({
 
       <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px]">
         <span className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-2 py-0.5 font-medium text-emerald-300">
-          新增 {active.added}
+          {t('scanBar.statAdded', { count: active.added })}
         </span>
         <span className="inline-flex items-center gap-1 rounded-lg border border-sky-500/25 bg-sky-500/10 px-2 py-0.5 font-medium text-sky-300">
-          更新 {active.updated}
+          {t('scanBar.statUpdated', { count: active.updated })}
         </span>
         <span className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2 py-0.5 font-medium text-zinc-300">
-          跳过 {active.skipped}
+          {t('scanBar.statSkipped', { count: active.skipped })}
         </span>
         <span
           className={`inline-flex items-center gap-1 rounded-lg border px-2 py-0.5 font-medium ${
@@ -349,7 +353,7 @@ export function ScanProgressBar({
               : 'border-white/10 bg-white/[0.04] text-zinc-400'
           }`}
         >
-          失败 {active.failed}
+          {t('scanBar.statFailed', { count: active.failed })}
         </span>
       </div>
 
@@ -357,7 +361,7 @@ export function ScanProgressBar({
         <div className="mt-3.5 space-y-2 border-t border-white/8 pt-3">
           <div className="flex items-center gap-1.5 text-[11px] font-medium text-zinc-400">
             <Sparkles className="h-3 w-3 text-amber-400" />
-            <span>各媒体库实时进度 ({libraries.length})</span>
+            <span>{t('scanBar.librariesProgress', { count: libraries.length })}</span>
           </div>
           <div className="grid gap-2 sm:grid-cols-2">
             {libraries.map((lib) => {
@@ -375,7 +379,7 @@ export function ScanProgressBar({
                   </div>
                   {lib.current_item && (
                     <p className="mt-0.5 truncate text-[11px] text-zinc-400">
-                      {getPhaseLabel(lib.phase)} · {lib.current_item}
+                      {getPhaseLabel(lib.phase, t)} · {lib.current_item}
                     </p>
                   )}
                   <div className="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-white/10">
