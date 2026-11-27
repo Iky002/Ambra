@@ -3,9 +3,38 @@ package middleware
 import (
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
+
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 )
+
+func isRequestHTTPS(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if r.TLS != nil {
+		return true
+	}
+	remoteHost := strings.TrimSpace(r.RemoteAddr)
+	if h, _, err := net.SplitHostPort(remoteHost); err == nil {
+		remoteHost = h
+	}
+	remoteHost = strings.Trim(remoteHost, "[]")
+	if remoteIP, err := netip.ParseAddr(remoteHost); err == nil {
+		if netutil.IsTrustedProxyIP(remoteIP.WithZone("").Unmap()) {
+			proto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto"))
+			if idx := strings.IndexByte(proto, ','); idx >= 0 {
+				proto = strings.TrimSpace(proto[:idx])
+			}
+			if strings.EqualFold(proto, "https") {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 func normalizeOriginHost(hostPort, scheme string) string {
 	s := strings.ToLower(strings.TrimSpace(hostPort))
@@ -29,7 +58,7 @@ func normalizeOriginHost(hostPort, scheme string) string {
 }
 
 // IsSameOrigin reports whether the Origin header represents the same host(:port) as r.Host
-// (and prevents http:// downgrade when r arrived over TLS).
+// (and prevents http:// downgrade when r arrived over TLS or via a TLS-terminating trusted proxy).
 func IsSameOrigin(origin string, r *http.Request) bool {
 	if r == nil {
 		return false
@@ -49,7 +78,7 @@ func IsSameOrigin(origin string, r *http.Request) bool {
 	if scheme != "http" && scheme != "https" {
 		return false
 	}
-	if r.TLS != nil && scheme != "https" {
+	if isRequestHTTPS(r) && scheme != "https" {
 		return false
 	}
 	originHost := normalizeOriginHost(u.Host, scheme)

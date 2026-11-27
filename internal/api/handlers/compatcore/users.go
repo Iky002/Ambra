@@ -105,6 +105,16 @@ func prunePasswordResetFiles(dataDir string, maxKeep int) {
 	}
 }
 
+func bucketLastAttempt(ts []time.Time) time.Time {
+	var latest time.Time
+	for _, t := range ts {
+		if t.After(latest) {
+			latest = t
+		}
+	}
+	return latest
+}
+
 func pruneRateBucketLocked(bucket map[string][]time.Time, cutoff time.Time, maxEntries int) {
 	for k, ts := range bucket {
 		kept := ts[:0]
@@ -119,24 +129,28 @@ func pruneRateBucketLocked(bucket map[string][]time.Time, cutoff time.Time, maxE
 			bucket[k] = kept
 		}
 	}
-	if maxEntries > 0 && len(bucket) > maxEntries {
-		excess := len(bucket) - maxEntries
-		for k := range bucket {
-			if excess <= 0 {
-				break
+	for maxEntries > 0 && len(bucket) > maxEntries {
+		var oldestKey string
+		var oldestTime time.Time
+		first := true
+		for k, ts := range bucket {
+			last := bucketLastAttempt(ts)
+			if first || last.Before(oldestTime) || (last.Equal(oldestTime) && k < oldestKey) {
+				oldestKey = k
+				oldestTime = last
+				first = false
 			}
-			delete(bucket, k)
-			excess--
 		}
+		if first {
+			break
+		}
+		delete(bucket, oldestKey)
 	}
 }
 
 func appendRateBucketLocked(bucket map[string][]time.Time, key string, now time.Time, maxEntries int) {
 	if _, exists := bucket[key]; !exists && maxEntries > 0 && len(bucket) >= maxEntries {
-		for k := range bucket {
-			delete(bucket, k)
-			break
-		}
+		return
 	}
 	bucket[key] = append(bucket[key], now)
 }
@@ -166,7 +180,8 @@ func (h *Handler) forgotPassword(w http.ResponseWriter, r *http.Request) {
 	}
 	pruneRateBucketLocked(h.forgotRates, now.Add(-forgotPasswordRateWindow), maxRateLimitBuckets)
 	if ip != "" {
-		if len(h.forgotRates[ip]) >= forgotPasswordRateLimit {
+		_, exists := h.forgotRates[ip]
+		if len(h.forgotRates[ip]) >= forgotPasswordRateLimit || (!exists && len(h.forgotRates) >= maxRateLimitBuckets) {
 			h.mu.Unlock()
 			httpx.Error(w, http.StatusTooManyRequests, "too many password reset requests")
 			return
@@ -270,7 +285,8 @@ func (h *Handler) checkIPRateLimit(bucket map[string][]time.Time, ip string, now
 		return true
 	}
 	pruneRateBucketLocked(bucket, now.Add(-window), maxRateLimitBuckets)
-	if len(bucket[ip]) >= limit {
+	_, exists := bucket[ip]
+	if len(bucket[ip]) >= limit || (!exists && len(bucket) >= maxRateLimitBuckets) {
 		return false
 	}
 	appendRateBucketLocked(bucket, ip, now, maxRateLimitBuckets)
@@ -420,27 +436,51 @@ func (h *Handler) isAuthByIDRateLimited(ip, uid string, now time.Time) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if loopback {
-		if h.loopbackAuthByIDRates == nil {
-			return false
+		cutoff := now.Add(-authByIDLoopbackRateWindow)
+		if h.loopbackAuthByIDRates != nil {
+			pruneRateBucketLocked(h.loopbackAuthByIDRates, cutoff, maxRateLimitBuckets)
+			if len(h.loopbackAuthByIDRates[compKey]) >= authByIDLoopbackRateLimit {
+				return true
+			}
+			if uid != "" && len(h.loopbackAuthByIDRates[ipKey]) >= authByIDLoopbackRateLimit {
+				return true
+			}
+			if _, exists := h.loopbackAuthByIDRates[compKey]; !exists && len(h.loopbackAuthByIDRates) >= maxRateLimitBuckets {
+				return true
+			}
 		}
-		pruneRateBucketLocked(h.loopbackAuthByIDRates, now.Add(-authByIDLoopbackRateWindow), maxRateLimitBuckets)
-		if len(h.loopbackAuthByIDRates[compKey]) >= authByIDLoopbackRateLimit {
-			return true
-		}
-		if uid != "" && len(h.loopbackAuthByIDRates[ipKey]) >= authByIDLoopbackRateLimit {
-			return true
+		if h.loopbackAuthByIDIPRates != nil {
+			pruneRateBucketLocked(h.loopbackAuthByIDIPRates, cutoff, maxRateLimitBuckets)
+			if len(h.loopbackAuthByIDIPRates[ipKey]) >= authByIDLoopbackIPRateLimit {
+				return true
+			}
+			if _, exists := h.loopbackAuthByIDIPRates[ipKey]; !exists && len(h.loopbackAuthByIDIPRates) >= maxRateLimitBuckets {
+				return true
+			}
 		}
 		return false
 	}
-	if h.authByIDRates == nil {
-		return false
+	cutoff := now.Add(-authByIDRateWindow)
+	if h.authByIDRates != nil {
+		pruneRateBucketLocked(h.authByIDRates, cutoff, maxRateLimitBuckets)
+		if len(h.authByIDRates[compKey]) >= authByIDRateLimit {
+			return true
+		}
+		if uid != "" && len(h.authByIDRates[ipKey]) >= authByIDRateLimit {
+			return true
+		}
+		if _, exists := h.authByIDRates[compKey]; !exists && len(h.authByIDRates) >= maxRateLimitBuckets {
+			return true
+		}
 	}
-	pruneRateBucketLocked(h.authByIDRates, now.Add(-authByIDRateWindow), maxRateLimitBuckets)
-	if len(h.authByIDRates[compKey]) >= authByIDRateLimit {
-		return true
-	}
-	if uid != "" && len(h.authByIDRates[ipKey]) >= authByIDRateLimit {
-		return true
+	if h.authByIDIPRates != nil {
+		pruneRateBucketLocked(h.authByIDIPRates, cutoff, maxRateLimitBuckets)
+		if len(h.authByIDIPRates[ipKey]) >= authByIDIPRateLimit {
+			return true
+		}
+		if _, exists := h.authByIDIPRates[ipKey]; !exists && len(h.authByIDIPRates) >= maxRateLimitBuckets {
+			return true
+		}
 	}
 	return false
 }
@@ -452,6 +492,7 @@ func (h *Handler) recordAuthByIDFailure(ip, uid string, now time.Time) {
 	}
 	loopback := isLoopbackIPString(ip)
 	compKey := normalizeAuthByIDRateKey(ip, uid)
+	ipKey := normalizeAuthByIDRateKey(ip, "")
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -459,15 +500,27 @@ func (h *Handler) recordAuthByIDFailure(ip, uid string, now time.Time) {
 		if h.loopbackAuthByIDRates == nil {
 			h.loopbackAuthByIDRates = make(map[string][]time.Time)
 		}
-		pruneRateBucketLocked(h.loopbackAuthByIDRates, now.Add(-authByIDLoopbackRateWindow), maxRateLimitBuckets)
+		if h.loopbackAuthByIDIPRates == nil {
+			h.loopbackAuthByIDIPRates = make(map[string][]time.Time)
+		}
+		cutoff := now.Add(-authByIDLoopbackRateWindow)
+		pruneRateBucketLocked(h.loopbackAuthByIDRates, cutoff, maxRateLimitBuckets)
+		pruneRateBucketLocked(h.loopbackAuthByIDIPRates, cutoff, maxRateLimitBuckets)
 		appendRateBucketLocked(h.loopbackAuthByIDRates, compKey, now, maxRateLimitBuckets)
+		appendRateBucketLocked(h.loopbackAuthByIDIPRates, ipKey, now, maxRateLimitBuckets)
 		return
 	}
 	if h.authByIDRates == nil {
 		h.authByIDRates = make(map[string][]time.Time)
 	}
-	pruneRateBucketLocked(h.authByIDRates, now.Add(-authByIDRateWindow), maxRateLimitBuckets)
+	if h.authByIDIPRates == nil {
+		h.authByIDIPRates = make(map[string][]time.Time)
+	}
+	cutoff := now.Add(-authByIDRateWindow)
+	pruneRateBucketLocked(h.authByIDRates, cutoff, maxRateLimitBuckets)
+	pruneRateBucketLocked(h.authByIDIPRates, cutoff, maxRateLimitBuckets)
 	appendRateBucketLocked(h.authByIDRates, compKey, now, maxRateLimitBuckets)
+	appendRateBucketLocked(h.authByIDIPRates, ipKey, now, maxRateLimitBuckets)
 }
 
 func (h *Handler) isGlobalRemoteAccessEnabled() bool {

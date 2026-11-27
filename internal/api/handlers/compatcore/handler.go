@@ -36,8 +36,10 @@ const (
 	forgotPasswordMaxPinFiles   = 10
 	forgotPinsMaxEntries        = 256
 	authByIDRateLimit           = 30
+	authByIDIPRateLimit         = 60
 	authByIDRateWindow          = time.Minute
 	authByIDLoopbackRateLimit   = 60
+	authByIDLoopbackIPRateLimit = 180
 	authByIDLoopbackRateWindow  = 5 * time.Minute
 	maxRateLimitBuckets         = 4096
 	maxCameraUploadsEntries     = 500
@@ -78,24 +80,26 @@ type Handler struct {
 	wsHub    WSSender
 	auth     AuthFuncs
 
-	mu                    sync.RWMutex
-	memKV                 map[string]string
-	forgotPins            map[string]forgotPinEntry
-	forgotRates           map[string][]time.Time
-	forgotPinRates        map[string][]time.Time
-	authByIDRates         map[string][]time.Time
-	loopbackAuthByIDRates map[string][]time.Time
-	restartRequested      bool
-	shutdownRequested     bool
-	onRestart             func()
-	onShutdown            func()
-	taskStopper           func(id string) bool
-	packageCanceller      func(id string) bool
-	pluginUninstaller     func(ctx context.Context, id string) error
-	onUserDeleted         func(ctx context.Context, userID string)
-	restoreHandler        http.HandlerFunc
-	partyLeaveHandler     http.HandlerFunc
-	partyMsgHandler       http.HandlerFunc
+	mu                      sync.RWMutex
+	memKV                   map[string]string
+	forgotPins              map[string]forgotPinEntry
+	forgotRates             map[string][]time.Time
+	forgotPinRates          map[string][]time.Time
+	authByIDRates           map[string][]time.Time
+	authByIDIPRates         map[string][]time.Time
+	loopbackAuthByIDRates   map[string][]time.Time
+	loopbackAuthByIDIPRates map[string][]time.Time
+	restartRequested        bool
+	shutdownRequested       bool
+	onRestart               func()
+	onShutdown              func()
+	taskStopper             func(id string) bool
+	packageCanceller        func(id string) bool
+	pluginUninstaller       func(ctx context.Context, id string) error
+	onUserDeleted           func(ctx context.Context, userID string)
+	restoreHandler          http.HandlerFunc
+	partyLeaveHandler       http.HandlerFunc
+	partyMsgHandler         http.HandlerFunc
 }
 
 // New constructs a compatcore Handler.
@@ -108,18 +112,20 @@ func New(
 	registry *plugins.Registry,
 ) *Handler {
 	return &Handler{
-		cfg:                   cfg,
-		store:                 store,
-		userRepo:              userRepo,
-		libRepo:               libRepo,
-		sessions:              sessions,
-		registry:              registry,
-		memKV:                 make(map[string]string),
-		forgotPins:            make(map[string]forgotPinEntry),
-		forgotRates:           make(map[string][]time.Time),
-		forgotPinRates:        make(map[string][]time.Time),
-		authByIDRates:         make(map[string][]time.Time),
-		loopbackAuthByIDRates: make(map[string][]time.Time),
+		cfg:                     cfg,
+		store:                   store,
+		userRepo:                userRepo,
+		libRepo:                 libRepo,
+		sessions:                sessions,
+		registry:                registry,
+		memKV:                   make(map[string]string),
+		forgotPins:              make(map[string]forgotPinEntry),
+		forgotRates:             make(map[string][]time.Time),
+		forgotPinRates:          make(map[string][]time.Time),
+		authByIDRates:           make(map[string][]time.Time),
+		authByIDIPRates:         make(map[string][]time.Time),
+		loopbackAuthByIDRates:   make(map[string][]time.Time),
+		loopbackAuthByIDIPRates: make(map[string][]time.Time),
 	}
 }
 

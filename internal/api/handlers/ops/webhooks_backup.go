@@ -1062,23 +1062,34 @@ func (h *Handler) restoreZipBackupLocked(ctx context.Context, srcZip string) (st
 			if err := json.Unmarshal(rawCfg, &cfgMap); err != nil || cfgMap == nil {
 				return "", &restoreValidationError{msg: "invalid config/ambra.json in backup archive"}
 			}
-			// Security (M-03): Never allow a backup archive to overwrite host executable paths.
+			// Security (M-03 / H-02): Never allow a backup archive to overwrite host executable or directory paths.
 			for k := range cfgMap {
-				if strings.EqualFold(k, "ffmpeg_path") || strings.EqualFold(k, "ffprobe_path") ||
-					strings.EqualFold(k, "ffmpegpath") || strings.EqualFold(k, "ffprobepath") {
+				switch strings.ToLower(strings.TrimSpace(k)) {
+				case "ffmpeg_path", "ffprobe_path", "ffmpegpath", "ffprobepath",
+					"web_dir", "webdir", "data_dir", "datadir":
 					delete(cfgMap, k)
 				}
 			}
-			var keepFFmpeg, keepFFprobe string
+			var keepFFmpeg, keepFFprobe, keepWebDir, keepDataDir string
 			existingCfgPath := filepath.Join(dataDir, "config", "ambra.json")
 			if existingRaw, exErr := os.ReadFile(existingCfgPath); exErr == nil {
 				var existingMap map[string]any
 				if json.Unmarshal(existingRaw, &existingMap) == nil && existingMap != nil {
-					if v, ok := existingMap["ffmpeg_path"].(string); ok && strings.TrimSpace(v) != "" {
-						keepFFmpeg = v
-					}
-					if v, ok := existingMap["ffprobe_path"].(string); ok && strings.TrimSpace(v) != "" {
-						keepFFprobe = v
+					for k, v := range existingMap {
+						s, ok := v.(string)
+						if !ok || strings.TrimSpace(s) == "" {
+							continue
+						}
+						switch strings.ToLower(strings.TrimSpace(k)) {
+						case "ffmpeg_path", "ffmpegpath":
+							keepFFmpeg = s
+						case "ffprobe_path", "ffprobepath":
+							keepFFprobe = s
+						case "web_dir", "webdir":
+							keepWebDir = s
+						case "data_dir", "datadir":
+							keepDataDir = s
+						}
 					}
 				}
 			}
@@ -1096,6 +1107,12 @@ func (h *Handler) restoreZipBackupLocked(ctx context.Context, srcZip string) (st
 			}
 			if keepFFprobe != "" {
 				cfgMap["ffprobe_path"] = keepFFprobe
+			}
+			if keepWebDir != "" {
+				cfgMap["web_dir"] = keepWebDir
+			}
+			if keepDataDir != "" {
+				cfgMap["data_dir"] = keepDataDir
 			}
 			sanitizedCfg, marshalErr := json.MarshalIndent(cfgMap, "", "  ")
 			if marshalErr != nil {

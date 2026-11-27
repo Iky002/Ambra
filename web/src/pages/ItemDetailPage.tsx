@@ -568,7 +568,7 @@ export function ItemDetailPage() {
     onSuccess: async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['item', userId, id] }),
-        queryClient.invalidateQueries({ queryKey: ['items'] }),
+        queryClient.invalidateQueries({ queryKey: ['libraryItems'] }),
         queryClient.invalidateQueries({ queryKey: ['latestItems'] }),
       ])
       showToast('success', t('itemDetailUi.versionsSplitSuccess', { name: item!.Name }))
@@ -618,9 +618,15 @@ export function ItemDetailPage() {
         targetPath = `/library/${item.ParentId}`
       }
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['items'] }),
+        queryClient.invalidateQueries({ queryKey: ['libraryItems'] }),
         queryClient.invalidateQueries({ queryKey: ['latestItems'] }),
         queryClient.invalidateQueries({ queryKey: ['resumeItems'] }),
+        queryClient.invalidateQueries({ queryKey: ['episodes'] }),
+        queryClient.invalidateQueries({ queryKey: ['seasons'] }),
+        queryClient.invalidateQueries({ queryKey: ['albumTracks'] }),
+        queryClient.invalidateQueries({ queryKey: ['artistTracks'] }),
+        queryClient.invalidateQueries({ queryKey: ['nextUp'] }),
+        queryClient.invalidateQueries({ queryKey: ['favorites'] }),
       ])
       setDeleteConfirmOpen(false)
       navigate(targetPath, { replace: true })

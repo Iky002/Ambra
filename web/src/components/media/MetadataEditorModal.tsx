@@ -167,7 +167,7 @@ export function MetadataEditorModal({
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['item'] }),
         queryClient.invalidateQueries({ queryKey: ['item', item.Id] }),
-        queryClient.invalidateQueries({ queryKey: ['items'] }),
+        queryClient.invalidateQueries({ queryKey: ['libraryItems'] }),
         queryClient.invalidateQueries({ queryKey: ['tags'] }),
         queryClient.invalidateQueries({ queryKey: ['latestItems'] }),
         queryClient.invalidateQueries({ queryKey: ['admin-metadata-items'] }),

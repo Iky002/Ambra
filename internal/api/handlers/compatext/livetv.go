@@ -20,6 +20,7 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
@@ -532,6 +533,23 @@ func (h *Handler) handleLiveRecordingStream(w http.ResponseWriter, r *http.Reque
 		httpx.Error(w, http.StatusNotFound, "recording file not found")
 		return
 	}
+	h.mu.RLock()
+	tcMgr := h.transcodeMgr
+	h.mu.RUnlock()
+	if r.Method != http.MethodHead && h.cfg != nil && tcMgr != nil {
+		limit := h.cfg.Snapshot().SimultaneousStreamLimit
+		if limit <= 0 {
+			limit = h.cfg.SimultaneousStreamLimit
+		}
+		if limit > 0 {
+			releaseSlot, allowed := tcMgr.TryAcquireStreamSlot(limit, "")
+			if !allowed {
+				httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
+				return
+			}
+			defer releaseSlot()
+		}
+	}
 	http.ServeFile(w, r, resolved)
 }
 
@@ -800,9 +818,18 @@ func (h *Handler) serveLiveRecordingDynamicHLS(
 		DurationSec:      durSec,
 	}
 
-	preservedQuery := make(url.Values)
+	preservedQuery := make(url.Values, len(q)+1)
+	hasAPIKey := false
 	for k, vals := range q {
 		preservedQuery[k] = append([]string(nil), vals...)
+		if strings.EqualFold(k, "api_key") && len(vals) > 0 && strings.TrimSpace(vals[0]) != "" {
+			hasAPIKey = true
+		}
+	}
+	if !hasAPIKey {
+		if tok := resolveLiveRecordingRequestToken(r, q); tok != "" {
+			preservedQuery.Set("api_key", tok)
+		}
 	}
 	plParams := transcode.PlaylistParams{
 		ItemID:           rec.Id,
@@ -1629,6 +1656,43 @@ func extractIDParam(r *http.Request) string {
 		}
 		if err := httpx.DecodeJSONLimit(r, &body, 0); err == nil && body.Id != "" {
 			return body.Id
+		}
+	}
+	return ""
+}
+
+func resolveLiveRecordingRequestToken(r *http.Request, q url.Values) string {
+	for k, vals := range q {
+		if (strings.EqualFold(k, "api_key") || strings.EqualFold(k, "X-Emby-Token")) && len(vals) > 0 {
+			if tok := strings.TrimSpace(vals[0]); tok != "" {
+				return tok
+			}
+		}
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && strings.TrimSpace(ac.Token) != "" {
+		return strings.TrimSpace(ac.Token)
+	}
+	for _, hdr := range []string{"X-Emby-Token", "X-MediaBrowser-Token"} {
+		if tok := strings.TrimSpace(r.Header.Get(hdr)); tok != "" {
+			return tok
+		}
+	}
+	for _, hdr := range []string{"Authorization", "X-Emby-Authorization"} {
+		raw := strings.TrimSpace(r.Header.Get(hdr))
+		if raw == "" {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(raw), "bearer ") {
+			if tok := strings.TrimSpace(raw[7:]); tok != "" {
+				return tok
+			}
+		}
+		lower := strings.ToLower(raw)
+		if idx := strings.Index(lower, `token="`); idx >= 0 {
+			rest := raw[idx+len(`token="`):]
+			if end := strings.IndexByte(rest, '"'); end > 0 {
+				return strings.TrimSpace(rest[:end])
+			}
 		}
 	}
 	return ""

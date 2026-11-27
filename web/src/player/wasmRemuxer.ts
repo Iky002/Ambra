@@ -502,6 +502,19 @@ export class WasmRemuxer {
             '启动 FFmpeg WASM Worker 超时，自动回退服务端 HLS',
           )
 
+          if (this.disposed || opts?.signal?.aborted) {
+            try {
+              ffmpeg.terminate()
+            } catch {
+              // ignore terminate error
+            }
+            for (const url of pendingBlobUrls) {
+              URL.revokeObjectURL(url)
+            }
+            pendingBlobUrls.length = 0
+            throw new WasmRemuxFallbackError('aborted', 'FFmpeg WASM 加载已取消')
+          }
+
           this.coreBlobUrls.push(...pendingBlobUrls)
           this.ffmpeg = ffmpeg
           this.loaded = true

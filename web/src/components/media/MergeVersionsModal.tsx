@@ -86,7 +86,6 @@ export function MergeVersionsModal({
         queryClient.invalidateQueries({ queryKey: ['seasons'] }),
         queryClient.invalidateQueries({ queryKey: ['libraryItems'] }),
         queryClient.invalidateQueries({ queryKey: ['latestItems'] }),
-        queryClient.invalidateQueries({ queryKey: ['items'] }),
         queryClient.invalidateQueries({ queryKey: ['admin-metadata-items'] }),
       ])
       onMerged?.(t('modal.merge.mergedSuccess', { count, name: item.Name }))

@@ -322,7 +322,7 @@ export function SettingsTab() {
         HardwareAccelerationMode: Number(hwAccelMode) || 0,
         EnableHardwareEncoding: enableHwEncoding,
         AllowHevcEncoding: allowHevcEncoding,
-        H264Crf: Math.min(51, Math.max(0, Math.round(Number(h264Crf) || 23))),
+        H264Crf: Math.min(51, Math.max(0, Math.round(Number.isFinite(Number(h264Crf)) ? Number(h264Crf) : 23))),
         H264Preset: h264Preset,
         EnableThrottling: enableThrottling,
         ThrottleBufferSize: Math.max(10, Math.round(Number(throttleBufferSize) || 120)),

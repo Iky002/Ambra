@@ -995,4 +995,157 @@ describe('Demo Mock 引擎 - Serverless 完整闭环测试', () => {
     expect(clearedDune.LockData).toBe(true)
     expect(clearedDune.LockedFields).toEqual(['Name', 'Overview'])
   })
+
+  it('Demo 新增管理员路由与 RBAC/Emby 语义对齐（System 电源、HDHomeRun 发现、Sync/Jobs、密码重置校验、LiveTV 权限、Webhook Secret 清理、媒体库刮削器持久）', async () => {
+    // 1. 管理员电源路由与活动日志
+    await loginAsDemo('admin')
+    await expect(embyFetch('/emby/System/Restart', { method: 'POST' })).resolves.toBeUndefined()
+    await expect(embyFetch('/emby/System/Shutdown', { method: 'POST' })).resolves.toBeUndefined()
+    const logs = await api.getActivityLogs(0, 20)
+    expect(logs.Items.some((e) => e.Type === 'ServerRestarting')).toBe(true)
+    expect(logs.Items.some((e) => e.Type === 'ServerShuttingDown')).toBe(true)
+
+    // 2. HDHomeRun 发现
+    const discovered = await embyFetch<Array<{ Type?: string; DeviceId?: string; Url: string }>>(
+      '/emby/LiveTv/Tuners/Discover',
+    )
+    expect(Array.isArray(discovered)).toBe(true)
+    expect(discovered.length).toBeGreaterThanOrEqual(1)
+    expect(discovered[0].Type).toBe('hdhomerun')
+    expect(discovered[0].Url).toMatch(/^http:\/\//)
+
+    // 3. Sync/Jobs 列表与取消
+    const syncList = await embyFetch<{ Items: Array<{ Id: string }>; TotalRecordCount: number }>(
+      '/emby/Sync/Jobs',
+    )
+    expect(syncList.Items.length).toBe(2)
+    expect(syncList.TotalRecordCount).toBe(2)
+    const firstJobId = syncList.Items[0].Id
+    await expect(
+      embyFetch(`/emby/Sync/Jobs/${encodeURIComponent(firstJobId)}`, { method: 'DELETE' }),
+    ).resolves.toBeUndefined()
+    const syncAfterDelete = await embyFetch<{
+      Items: Array<{ Id: string }>
+      TotalRecordCount: number
+    }>('/emby/Sync/Jobs')
+    expect(syncAfterDelete.Items.length).toBe(1)
+    expect(syncAfterDelete.Items.some((j) => j.Id === firstJobId)).toBe(false)
+
+    // 4. VirtualFolders POST 剥离 PathInfos 并保留其余刮削器选项
+    const createdLib = await embyFetch<{
+      ItemId: string
+      LibraryOptions?: Record<string, unknown>
+    }>('/emby/Library/VirtualFolders', {
+      method: 'POST',
+      body: JSON.stringify({
+        Name: '4K 剧集测试库',
+        CollectionType: 'tvshows',
+        Paths: ['/media/tv4k'],
+        LibraryOptions: {
+          PathInfos: [{ Path: '/media/tv4k' }],
+          SaveLocalMetadata: false,
+          MetadataFetcherOrder: ['TheTVDB', 'TheMovieDb'],
+          DisabledLocalMetadataReaders: ['Nfo'],
+        },
+      }),
+    })
+    expect(createdLib.LibraryOptions?.PathInfos).toBeUndefined()
+    expect(createdLib.LibraryOptions?.SaveLocalMetadata).toBe(false)
+    expect(createdLib.LibraryOptions?.MetadataFetcherOrder).toEqual(['TheTVDB', 'TheMovieDb'])
+    expect(createdLib.LibraryOptions?.DisabledLocalMetadataReaders).toEqual(['Nfo'])
+
+    // 5. Webhook 更新时若 origin+pathname 变化且未提供新 Secret，必须清除旧 Secret
+    const createdWh = await embyFetch<{ Id: string; HasSecret?: boolean }>('/emby/Webhooks', {
+      method: 'POST',
+      body: JSON.stringify({
+        Name: 'Secret Guard Hook',
+        Url: 'https://hooks.example.com/v1/notify?foo=1',
+        Secret: 'super-secret-value',
+        Events: ['*'],
+      }),
+    })
+    expect(createdWh.HasSecret).toBe(true)
+
+    // 仅 query 参数变化（origin+pathname 不变）保留旧 Secret
+    const sameEndpointWh = await embyFetch<{ Id: string; HasSecret?: boolean }>('/emby/Webhooks', {
+      method: 'POST',
+      body: JSON.stringify({
+        Id: createdWh.Id,
+        Name: 'Secret Guard Hook',
+        Url: 'https://hooks.example.com/v1/notify?foo=2',
+        Events: ['*'],
+      }),
+    })
+    expect(sameEndpointWh.HasSecret).toBe(true)
+
+    // origin+pathname 变化且未传新 Secret -> 清除旧 Secret
+    const changedEndpointWh = await embyFetch<{ Id: string; HasSecret?: boolean }>(
+      '/emby/Webhooks',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          Id: createdWh.Id,
+          Name: 'Secret Guard Hook',
+          Url: 'https://other.example.com/v2/hook',
+          Events: ['*'],
+        }),
+      },
+    )
+    expect(changedEndpointWh.HasSecret).toBe(false)
+
+    // 6. 为 guest 设置密码并关闭 EnableLiveTvAccess，验证非管理员 RBAC
+    const users = await api.getUsers()
+    const guestUser = users.find((u) => u.Name.toLowerCase() === 'guest')!
+    await api.updateUserPassword(guestUser.Id, { NewPw: 'guest-pass-123' })
+    await api.updateUserPolicy(guestUser.Id, {
+      ...(guestUser.Policy || {}),
+      EnableLiveTvAccess: false,
+    })
+
+    // 切换为 guest 登录（使用新密码）
+    const guestAuth = await api.authenticateByName('guest', 'guest-pass-123')
+    saveAuth({
+      accessToken: guestAuth.AccessToken,
+      userId: guestAuth.User.Id,
+      serverId: guestAuth.ServerId,
+      userName: guestAuth.User.Name,
+      isAdmin: false,
+      deviceId: 'demo-guest-dev',
+    })
+
+    // guest 访问管理员路由均返回 403
+    await expect(embyFetch('/emby/System/Restart', { method: 'POST' })).rejects.toMatchObject({
+      status: 403,
+    })
+    await expect(embyFetch('/emby/System/Shutdown', { method: 'POST' })).rejects.toMatchObject({
+      status: 403,
+    })
+    await expect(embyFetch('/emby/LiveTv/Tuners/Discover')).rejects.toMatchObject({ status: 403 })
+    await expect(embyFetch('/emby/Sync/Jobs')).rejects.toMatchObject({ status: 403 })
+    await expect(
+      embyFetch('/emby/Sync/Jobs/sync-job-demo-02', { method: 'DELETE' }),
+    ).rejects.toMatchObject({ status: 403 })
+
+    // guest 在 EnableLiveTvAccess === false 时访问 Programs/SeriesTimers/Timers/Recordings 均返回 403
+    await expect(embyFetch('/emby/LiveTv/Programs')).rejects.toMatchObject({ status: 403 })
+    await expect(embyFetch('/emby/LiveTv/SeriesTimers')).rejects.toMatchObject({ status: 403 })
+    await expect(embyFetch('/emby/LiveTv/Timers')).rejects.toMatchObject({ status: 403 })
+    await expect(embyFetch('/emby/LiveTv/Recordings')).rejects.toMatchObject({ status: 403 })
+
+    // guest 尝试绕过 CurrentPw 直接 ResetPassword 必须被 401 拒绝
+    await expect(
+      embyFetch(`/emby/Users/${encodeURIComponent(guestUser.Id)}/Password`, {
+        method: 'POST',
+        body: JSON.stringify({ ResetPassword: true, CurrentPw: 'wrong-pw' }),
+      }),
+    ).rejects.toMatchObject({ status: 401 })
+
+    // 提供正确 CurrentPw 后允许 ResetPassword
+    await expect(
+      embyFetch(`/emby/Users/${encodeURIComponent(guestUser.Id)}/Password`, {
+        method: 'POST',
+        body: JSON.stringify({ ResetPassword: true, CurrentPw: 'guest-pass-123' }),
+      }),
+    ).resolves.toBeUndefined()
+  })
 })

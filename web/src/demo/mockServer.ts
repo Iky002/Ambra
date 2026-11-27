@@ -441,9 +441,62 @@ function createInitialLiveTvChannels(): LiveTvChannelInfo[] {
   ]
 }
 
+interface DemoSyncJob {
+  Id: string
+  Name: string
+  Status: string
+  Progress: number
+  TargetId: string
+  TargetName: string
+  Quality: string
+  Profile: string
+  Bitrate: number
+  UserId: string
+  ItemCount: number
+  DateCreated: string
+  DateLastModified: string
+}
+
+function createInitialDemoSyncJobs(): DemoSyncJob[] {
+  const now = Date.now()
+  return [
+    {
+      Id: 'sync-job-demo-01',
+      Name: '星际穿越 (4K -> 1080p 离线缓存)',
+      Status: 'Converting',
+      Progress: 64,
+      TargetId: 'device-ipad-pro-demo',
+      TargetName: 'iPad Pro 13" (Offline)',
+      Quality: 'High',
+      Profile: '1080p H.264',
+      Bitrate: 8_000_000,
+      UserId: 'demo-user-admin',
+      ItemCount: 1,
+      DateCreated: new Date(now - 25 * 60_000).toISOString(),
+      DateLastModified: new Date(now - 2 * 60_000).toISOString(),
+    },
+    {
+      Id: 'sync-job-demo-02',
+      Name: '三体 S01 合集 (720p 移动端同步)',
+      Status: 'Completed',
+      Progress: 100,
+      TargetId: 'device-iphone-demo',
+      TargetName: 'iPhone 16 Pro',
+      Quality: 'Medium',
+      Profile: '720p H.264',
+      Bitrate: 4_000_000,
+      UserId: 'demo-user-admin',
+      ItemCount: 8,
+      DateCreated: new Date(now - 3 * 3600_000).toISOString(),
+      DateLastModified: new Date(now - 45 * 60_000).toISOString(),
+    },
+  ]
+}
+
 let demoTunerHosts: LiveTvTunerHostInfo[] = createInitialTunerHosts()
 let demoListingProviders: LiveTvListingProviderInfo[] = createInitialListingProviders()
 let demoLiveTvChannels: LiveTvChannelInfo[] = createInitialLiveTvChannels()
+let demoSyncJobs: DemoSyncJob[] = createInitialDemoSyncJobs()
 
 function createInitialLiveTvTimers(): LiveTvTimerInfo[] {
   const start = new Date(Date.now() + 3600_000)
@@ -751,7 +804,7 @@ function createInitialDemoNotifications(): DemoNotificationRecord[] {
     {
       Id: 'notif-demo-01',
       Date: new Date(now - 15 * 60_000).toISOString(),
-      Name: '欢迎体验 Ambra v0.11.2',
+      Name: '欢迎体验 Ambra v0.11.3',
       Description: '已上线应用内通知中心、家长控制分级过滤与 Quick Connect 设备授权码登录。',
       Level: 'Normal',
       readByUsers: new Set(),
@@ -864,6 +917,7 @@ export function resetDemoStore(): void {
   demoLiveTvSeriesTimers = createInitialLiveTvSeriesTimers()
   demoLiveTvChannelMappings = createInitialLiveTvChannelMappings()
   demoLiveTvRecordings = createInitialLiveTvRecordings()
+  demoSyncJobs = createInitialDemoSyncJobs()
   demoWebhooks = createInitialDemoWebhooks()
   demoBackups = createInitialDemoBackups()
   demoNotifications = createInitialDemoNotifications()
@@ -1874,6 +1928,18 @@ export async function demoFetch<T>(
     return { ...store.systemInfo } as T
   }
 
+  if (pathname === '/emby/System/Restart' && method === 'POST') {
+    requireDemoAdmin(caller)
+    pushActivity('管理员触发了服务器重启（Demo 模拟）', 'ServerRestarting', undefined, caller.userId)
+    return undefined as T
+  }
+
+  if (pathname === '/emby/System/Shutdown' && method === 'POST') {
+    requireDemoAdmin(caller)
+    pushActivity('管理员触发了服务器关闭（Demo 模拟）', 'ServerShuttingDown', undefined, caller.userId)
+    return undefined as T
+  }
+
   if (pathname === '/emby/Users/Public' && method === 'GET') {
     if (!demoServerConfig.EnableLoginUserList) {
       return [] as unknown as T
@@ -2060,17 +2126,17 @@ export async function demoFetch<T>(
     const rec = store.users.find((u) => u.user.Id === userId)
     if (!rec) throw new ApiError(404, '用户不存在')
     const body = parseJsonBody(options)
+    if (!caller.isAdmin && rec.password) {
+      const currentPw = String(body.CurrentPw ?? '')
+      if (currentPw !== rec.password) {
+        throw new ApiError(401, '当前密码不正确')
+      }
+    }
     if (body.ResetPassword) {
       rec.password = ''
       rec.user.HasPassword = false
       rec.user.HasConfiguredPassword = false
     } else {
-      if (!caller.isAdmin && rec.password) {
-        const currentPw = String(body.CurrentPw ?? '')
-        if (currentPw !== rec.password) {
-          throw new ApiError(401, '当前密码不正确')
-        }
-      }
       const nextPw = String(body.NewPw ?? '')
       rec.password = nextPw
       rec.user.HasPassword = nextPw.length > 0
@@ -3143,7 +3209,7 @@ export async function demoFetch<T>(
           UserId: sessionUserId,
           UserName: caller.user?.Name || sessionUserId,
           Client: 'Ambra Web',
-          ApplicationVersion: '0.11.2',
+          ApplicationVersion: '0.11.3',
           DeviceName: 'Web Browser (Demo)',
           DeviceId: `dev-web-${sessionUserId}`,
           LastActivityDate: new Date().toISOString(),
@@ -3979,12 +4045,15 @@ export async function demoFetch<T>(
       const paths = Array.isArray(body.Paths) ? body.Paths.map((p) => String(p)) : []
       if (!name) throw new ApiError(400, '媒体库名称不能为空')
       const incomingOpts = (body.LibraryOptions || {}) as Record<string, unknown>
+      const { PathInfos: _ignoredPathInfos, ...persistedOpts } = incomingOpts
+      void _ignoredPathInfos
       const newLib: VirtualFolderInfo = {
         ItemId: `lib-demo-${Date.now().toString(36)}`,
         Name: name,
         CollectionType: collectionType,
         Locations: paths,
         LibraryOptions: {
+          ...persistedOpts,
           SaveLocalMetadata:
             typeof incomingOpts.SaveLocalMetadata === 'boolean'
               ? incomingOpts.SaveLocalMetadata
@@ -4418,6 +4487,9 @@ export async function demoFetch<T>(
   }
 
   if (pathname === '/emby/LiveTv/Programs' && method === 'GET') {
+    if (caller.user?.Policy?.EnableLiveTvAccess === false) {
+      throw new ApiError(403, '当前账号无 Live TV 访问权限')
+    }
     const nowMs = Date.now()
     const halfHour = 30 * 60_000
     const oneHour = 60 * 60_000
@@ -4516,6 +4588,30 @@ export async function demoFetch<T>(
       : allPrograms
     const sliced = filtered.slice(0, limit)
     return { Items: sliced, TotalRecordCount: filtered.length } as T
+  }
+
+  if (pathname === '/emby/LiveTv/Tuners/Discover' && method === 'GET') {
+    requireDemoAdmin(caller)
+    return [
+      {
+        Id: 'hdhr-demo-108a3f21',
+        Url: 'http://192.168.1.58',
+        Type: 'hdhomerun',
+        DeviceId: '108A3F21',
+        FriendlyName: 'HDHomeRun FLEX 4K',
+        TunerCount: 4,
+        ImportFavoritesOnly: false,
+      },
+      {
+        Id: 'hdhr-demo-104c9b10',
+        Url: 'http://192.168.1.62',
+        Type: 'hdhomerun',
+        DeviceId: '104C9B10',
+        FriendlyName: 'HDHomeRun CONNECT DUO',
+        TunerCount: 2,
+        ImportFavoritesOnly: false,
+      },
+    ] as T
   }
 
   if (pathname === '/emby/LiveTv/TunerHosts') {
@@ -4692,6 +4788,9 @@ export async function demoFetch<T>(
   // Live TV DVR 系列录制规则 (SeriesTimers)
   if (pathname === '/emby/LiveTv/SeriesTimers') {
     if (method === 'GET') {
+      if (caller.user?.Policy?.EnableLiveTvAccess === false) {
+        throw new ApiError(403, '当前账号无 Live TV 访问权限')
+      }
       const items = demoLiveTvSeriesTimers.map((t) => ({
         ...t,
         Days: t.Days ? [...t.Days] : [],
@@ -4743,6 +4842,9 @@ export async function demoFetch<T>(
   // Live TV DVR 预约录制 (Timers)
   if (pathname === '/emby/LiveTv/Timers') {
     if (method === 'GET') {
+      if (caller.user?.Policy?.EnableLiveTvAccess === false) {
+        throw new ApiError(403, '当前账号无 Live TV 访问权限')
+      }
       const items = demoLiveTvTimers.map((t) => ({ ...t }))
       return { Items: items, TotalRecordCount: items.length } as T
     }
@@ -4801,6 +4903,9 @@ export async function demoFetch<T>(
   // Live TV DVR 已完成录制 (Recordings)
   if (pathname === '/emby/LiveTv/Recordings') {
     if (method === 'GET') {
+      if (caller.user?.Policy?.EnableLiveTvAccess === false) {
+        throw new ApiError(403, '当前账号无 Live TV 访问权限')
+      }
       const items = demoLiveTvRecordings.map((r) => ({ ...r }))
       return { Items: items, TotalRecordCount: items.length } as T
     }
@@ -4824,6 +4929,25 @@ export async function demoFetch<T>(
     if (idx >= 0) {
       const [removed] = demoLiveTvRecordings.splice(idx, 1)
       pushActivity(`已删除 DVR 录制文件「${removed.Name}」`, 'LiveTvRecordingDeleted', undefined, caller.userId)
+    }
+    return undefined as T
+  }
+
+  // 离线同步与转码任务 (Sync Jobs)
+  if (pathname === '/emby/Sync/Jobs' && method === 'GET') {
+    requireDemoAdmin(caller)
+    const items = demoSyncJobs.map((j) => ({ ...j }))
+    return { Items: items, TotalRecordCount: items.length } as T
+  }
+
+  const syncJobDeleteMatch = pathname.match(/^\/emby\/Sync\/Jobs\/([^/]+)$/)
+  if (syncJobDeleteMatch && method === 'DELETE') {
+    requireDemoAdmin(caller)
+    const id = decodeURIComponent(syncJobDeleteMatch[1])
+    const idx = demoSyncJobs.findIndex((j) => j.Id === id)
+    if (idx >= 0) {
+      const [removed] = demoSyncJobs.splice(idx, 1)
+      pushActivity(`已取消同步任务「${removed.Name}」`, 'SyncJobDeleted', undefined, caller.userId)
     }
     return undefined as T
   }
@@ -4854,7 +4978,18 @@ export async function demoFetch<T>(
 
       if (existingIdx >= 0) {
         const prev = demoWebhooks[existingIdx]
-        const nextSecret = clearSecret ? undefined : (incomingSecret ?? prev.Secret)
+        const endpointKey = (raw: string): string => {
+          try {
+            const parsed = new URL(raw)
+            return `${parsed.origin}${parsed.pathname}`
+          } catch {
+            return raw
+          }
+        }
+        const endpointChanged = endpointKey(prev.Url) !== endpointKey(urlVal)
+        const nextSecret = clearSecret
+          ? undefined
+          : (incomingSecret ?? (endpointChanged ? undefined : prev.Secret))
         const updated: WebhookInfo = {
           ...prev,
           Name: name,
@@ -6028,7 +6163,7 @@ export async function demoFetch<T>(
       DeviceId: 'dev-demo-web-01',
       DeviceName: 'Ambra Web Demo',
       AppName: 'Ambra Web',
-      AppVersion: '0.11.2',
+      AppVersion: '0.11.3',
       DateAdded: new Date().toISOString(),
     }
     demoQuickConnectSessions.set(secret, session)

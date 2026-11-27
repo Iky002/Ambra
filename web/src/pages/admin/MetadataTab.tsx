@@ -190,7 +190,7 @@ export function MetadataTab() {
         queryClient.invalidateQueries({ queryKey: ['rankings'] }),
         queryClient.invalidateQueries({ queryKey: ['trendingItems'] }),
         queryClient.invalidateQueries({ queryKey: ['admin-metadata-items'] }),
-        queryClient.invalidateQueries({ queryKey: ['items'] }),
+        queryClient.invalidateQueries({ queryKey: ['libraryItems'] }),
         queryClient.invalidateQueries({ queryKey: ['tags'] }),
       ])
       const parts = [
@@ -318,7 +318,7 @@ export function MetadataTab() {
       setDeletingItem(null)
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['admin-metadata-items'] }),
-        queryClient.invalidateQueries({ queryKey: ['items'] }),
+        queryClient.invalidateQueries({ queryKey: ['libraryItems'] }),
         queryClient.invalidateQueries({ queryKey: ['latestItems'] }),
       ])
       setFeedback({

@@ -13,21 +13,19 @@ type SearchTypeFilter = 'all' | 'Movie' | 'Series' | 'Music' | 'Person' | 'BoxSe
 
 const TYPE_PILLS: Array<{
   id: SearchTypeFilter
-  label: string
-  labelKey?: string
+  labelKey: string
   includeItemTypes: string
 }> = [
   {
     id: 'all',
-    label: '全部',
     labelKey: 'common.all',
     includeItemTypes: 'Movie,Series,Episode,BoxSet,Person,MusicArtist,MusicAlbum,Audio,Playlist',
   },
-  { id: 'Movie', label: '电影', includeItemTypes: 'Movie' },
-  { id: 'Series', label: '剧集', includeItemTypes: 'Series,Episode' },
-  { id: 'Music', label: '音乐', includeItemTypes: 'MusicAlbum,MusicArtist,Audio' },
-  { id: 'Person', label: '演职员', labelKey: 'detail.castAndCrew', includeItemTypes: 'Person' },
-  { id: 'BoxSet', label: '合集', labelKey: 'collections.boxSets', includeItemTypes: 'BoxSet' },
+  { id: 'Movie', labelKey: 'search.typeMovie', includeItemTypes: 'Movie' },
+  { id: 'Series', labelKey: 'search.typeSeries', includeItemTypes: 'Series,Episode' },
+  { id: 'Music', labelKey: 'search.typeMusic', includeItemTypes: 'MusicAlbum,MusicArtist,Audio' },
+  { id: 'Person', labelKey: 'detail.castAndCrew', includeItemTypes: 'Person' },
+  { id: 'BoxSet', labelKey: 'collections.boxSets', includeItemTypes: 'BoxSet' },
 ]
 
 function resolveSearchItemLink(item: BaseItemDto): string | undefined {
@@ -120,7 +118,7 @@ export function SearchPage() {
                     : 'border border-white/10 bg-white/[0.04] text-zinc-300 hover:bg-white/10 hover:text-white'
                 }`}
               >
-                {pill.labelKey ? t(pill.labelKey) : pill.label}
+                {t(pill.labelKey)}
               </button>
             )
           })}
@@ -129,7 +127,9 @@ export function SearchPage() {
 
       {!debounced ? (
         <div className="rounded-2xl border border-white/6 bg-white/[0.02] py-16 text-center text-sm text-zinc-500">
-          支持中英文及多关键词乱序搜索，随时按 <kbd className="rounded bg-white/10 px-1.5 py-0.5 text-zinc-300">⌘K</kbd> 快速唤起全局搜索
+          {t('search.multiKeywordHintPrefix')}{' '}
+          <kbd className="rounded bg-white/10 px-1.5 py-0.5 text-zinc-300">⌘K</kbd>{' '}
+          {t('search.multiKeywordHintSuffix')}
         </div>
       ) : isLoading ? (
         <div className="flex h-48 items-center justify-center">
@@ -138,7 +138,7 @@ export function SearchPage() {
       ) : isError ? (
         <QueryErrorState
           compact
-          title="搜索请求失败"
+          title={t('search.requestFailedTitle')}
           error={error}
           onRetry={() => void refetch()}
         />

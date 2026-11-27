@@ -117,23 +117,34 @@ func (h *Handler) syncFromRegistry() {
 func (h *Handler) findPlugin(id string) (plugins.Plugin, bool) {
 	if h.registry != nil {
 		if p, ok := h.registry.Get(id); ok && p != nil {
+			canonicalID := p.Manifest().ID
+			if canonicalID == "" {
+				canonicalID = id
+			}
 			h.mu.Lock()
-			h.tracked[id] = p
+			h.tracked[canonicalID] = p
 			h.mu.Unlock()
 			return p, true
 		}
 	}
-	h.mu.RLock()
-	p, ok := h.tracked[id]
-	h.mu.RUnlock()
-	if ok {
+	lookupTracked := func() (plugins.Plugin, bool) {
+		h.mu.RLock()
+		defer h.mu.RUnlock()
+		if p, ok := h.tracked[id]; ok && p != nil {
+			return p, true
+		}
+		for k, cand := range h.tracked {
+			if strings.EqualFold(k, id) && cand != nil {
+				return cand, true
+			}
+		}
+		return nil, false
+	}
+	if p, ok := lookupTracked(); ok {
 		return p, true
 	}
 	h.syncFromRegistry()
-	h.mu.RLock()
-	p, ok = h.tracked[id]
-	h.mu.RUnlock()
-	return p, ok
+	return lookupTracked()
 }
 
 // ApplySavedConfigs loads all persisted "plugin:<id>" entries from SQLite server_config
@@ -235,7 +246,11 @@ func (h *Handler) handleGetConfiguration(w http.ResponseWriter, r *http.Request)
 	}
 	h.cfgMu.RLock()
 	manifest := p.Manifest()
-	saved, err := h.loadSavedConfig(r.Context(), id)
+	canonicalID := manifest.ID
+	if canonicalID == "" {
+		canonicalID = id
+	}
+	saved, err := h.loadSavedConfig(r.Context(), canonicalID)
 	h.cfgMu.RUnlock()
 
 	out := map[string]any{
@@ -286,6 +301,10 @@ func (h *Handler) handleUpdateConfiguration(w http.ResponseWriter, r *http.Reque
 		httpx.Error(w, http.StatusNotFound, "plugin not found")
 		return
 	}
+	canonicalID := p.Manifest().ID
+	if canonicalID == "" {
+		canonicalID = id
+	}
 
 	var incoming map[string]any
 	if err := httpx.DecodeJSONLimit(r, &incoming, 0); err != nil {
@@ -297,7 +316,7 @@ func (h *Handler) handleUpdateConfiguration(w http.ResponseWriter, r *http.Reque
 	}
 
 	h.cfgMu.Lock()
-	prev, err := h.loadSavedConfig(r.Context(), id)
+	prev, err := h.loadSavedConfig(r.Context(), canonicalID)
 	if err != nil {
 		prev = map[string]any{}
 	}
@@ -327,7 +346,9 @@ func (h *Handler) handleUpdateConfiguration(w http.ResponseWriter, r *http.Reque
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	canonicalID := p.Manifest().ID
+	if mfID := p.Manifest().ID; mfID != "" {
+		canonicalID = mfID
+	}
 	if err := h.saveConfig(r.Context(), canonicalID, merged); err != nil {
 		_ = p.Configure(cloneMap(prev))
 		h.cfgMu.Unlock()
@@ -347,6 +368,10 @@ func (h *Handler) handleEnablePlugin(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusNotFound, "plugin not found")
 		return
 	}
+	canonicalID := p.Manifest().ID
+	if canonicalID == "" {
+		canonicalID = id
+	}
 
 	q := httpx.ParseQuery(r)
 	enabled := true
@@ -362,7 +387,7 @@ func (h *Handler) handleEnablePlugin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.cfgMu.Lock()
-	prev, err := h.loadSavedConfig(r.Context(), id)
+	prev, err := h.loadSavedConfig(r.Context(), canonicalID)
 	if err != nil {
 		prev = map[string]any{}
 	}
@@ -375,7 +400,9 @@ func (h *Handler) handleEnablePlugin(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	canonicalID := p.Manifest().ID
+	if mfID := p.Manifest().ID; mfID != "" {
+		canonicalID = mfID
+	}
 	if err := h.saveConfig(r.Context(), canonicalID, merged); err != nil {
 		_ = p.Configure(cloneMap(prev))
 		h.cfgMu.Unlock()
@@ -387,7 +414,7 @@ func (h *Handler) handleEnablePlugin(w http.ResponseWriter, r *http.Request) {
 
 	h.notifyConfigSaved(canonicalID, merged)
 	httpx.JSON(w, http.StatusOK, map[string]any{
-		"Id":      id,
+		"Id":      canonicalID,
 		"Enabled": enabledNow,
 	})
 }
@@ -435,24 +462,15 @@ func (h *Handler) UninstallPlugin(ctx context.Context, rawID string) error {
 	}
 	p, ok := h.findPlugin(id)
 	if !ok {
-		// Check case-insensitive match across tracked/registered plugins as well.
-		h.syncFromRegistry()
-		h.mu.RLock()
-		for k, cand := range h.tracked {
-			if strings.EqualFold(k, id) && cand != nil {
-				p = cand
-				ok = true
-				break
-			}
-		}
-		h.mu.RUnlock()
-	}
-	if !ok {
 		return sqlite.ErrNotFound
+	}
+	canonicalID := p.Manifest().ID
+	if canonicalID == "" {
+		canonicalID = id
 	}
 
 	h.cfgMu.Lock()
-	prev, err := h.loadSavedConfig(ctx, id)
+	prev, err := h.loadSavedConfig(ctx, canonicalID)
 	if err != nil {
 		prev = map[string]any{}
 	}
@@ -466,8 +484,11 @@ func (h *Handler) UninstallPlugin(ctx context.Context, rawID string) error {
 	}
 
 	mf := p.Manifest()
+	if mf.ID != "" {
+		canonicalID = mf.ID
+	}
 	if !mf.BuiltIn {
-		if err := h.removeExternalPluginBundle(mf.ID, id); err != nil {
+		if err := h.removeExternalPluginBundle(canonicalID, id); err != nil {
 			_ = p.Configure(cloneMap(prev))
 			h.cfgMu.Unlock()
 			return err
@@ -475,8 +496,8 @@ func (h *Handler) UninstallPlugin(ctx context.Context, rawID string) error {
 		if h.store != nil {
 			if _, err := h.store.Writer.ExecContext(ctx,
 				`DELETE FROM server_config WHERE LOWER(key) IN (LOWER(?), LOWER(?), LOWER(?), LOWER(?))`,
-				configKeyPrefix+mf.ID, configKeyPrefix+id,
-				"plugin:config:"+mf.ID, "plugin:config:"+id,
+				configKeyPrefix+canonicalID, configKeyPrefix+id,
+				"plugin:config:"+canonicalID, "plugin:config:"+id,
 			); err != nil {
 				_ = p.Configure(cloneMap(prev))
 				h.cfgMu.Unlock()
@@ -484,19 +505,19 @@ func (h *Handler) UninstallPlugin(ctx context.Context, rawID string) error {
 			}
 		}
 		if h.registry != nil {
-			h.registry.Unregister(mf.ID)
-			if !strings.EqualFold(mf.ID, id) {
+			h.registry.Unregister(canonicalID)
+			if !strings.EqualFold(canonicalID, id) {
 				h.registry.Unregister(id)
 			}
 		}
 		h.mu.Lock()
 		for k := range h.tracked {
-			if strings.EqualFold(k, mf.ID) || strings.EqualFold(k, id) {
+			if strings.EqualFold(k, canonicalID) || strings.EqualFold(k, id) {
 				delete(h.tracked, k)
 			}
 		}
 		for k := range h.configs {
-			if strings.EqualFold(k, mf.ID) || strings.EqualFold(k, id) {
+			if strings.EqualFold(k, canonicalID) || strings.EqualFold(k, id) {
 				delete(h.configs, k)
 			}
 		}
@@ -505,14 +526,14 @@ func (h *Handler) UninstallPlugin(ctx context.Context, rawID string) error {
 		return nil
 	}
 
-	if err := h.saveConfig(ctx, mf.ID, merged); err != nil {
+	if err := h.saveConfig(ctx, canonicalID, merged); err != nil {
 		_ = p.Configure(cloneMap(prev))
 		h.cfgMu.Unlock()
 		return err
 	}
 	h.cfgMu.Unlock()
 
-	h.notifyConfigSaved(mf.ID, merged)
+	h.notifyConfigSaved(canonicalID, merged)
 	return nil
 }
 

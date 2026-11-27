@@ -1479,9 +1479,10 @@ export function PlayerPage() {
     setLoadedFontCount(0)
 
     const cleanupEngines = async () => {
-      if (assRendererRef.current) {
-        await assRendererRef.current.destroy()
-        assRendererRef.current = null
+      const prevAss = assRendererRef.current
+      assRendererRef.current = null
+      if (prevAss) {
+        await prevAss.destroy()
       }
       if (pgsRendererRef.current) {
         pgsRendererRef.current.destroy()
@@ -1540,6 +1541,10 @@ export function PlayerPage() {
             fonts: fontUrls,
             timeOffset: subtitlePrefsRef.current.offsetSec,
           })
+          if (cancelled || assRendererRef.current !== renderer) {
+            await renderer.destroy()
+            return
+          }
         } else if (engine === 'pgs') {
           if (!pgsCanvasRef.current) return
           const renderer = new PgsCanvasRenderer(pgsCanvasRef.current)
