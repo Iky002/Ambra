@@ -360,6 +360,42 @@ var ErrUserExists = errors.New("user already exists")
 func purgeUserScopedStateTx(ctx context.Context, tx *sql.Tx, norm, rawID string) {
 	_, _ = tx.ExecContext(ctx, `DELETE FROM display_preferences WHERE user_id = ? OR user_id = ?`, norm, rawID)
 	_, _ = tx.ExecContext(ctx, `DELETE FROM camera_uploads WHERE user_id = ? OR user_id = ?`, norm, rawID)
+
+	// Delete playlists owned by the deleted user and all dependent index/visibility records.
+	var playlistIDs []string
+	if rows, err := tx.QueryContext(ctx, `
+		SELECT id FROM items
+		WHERE LOWER(type) = 'playlist'
+		  AND (
+		      (? != '' AND (LOWER(COALESCE(parent_id, '')) = LOWER(?) OR LOWER(REPLACE(COALESCE(parent_id, ''), '-', '')) = LOWER(?)))
+		      OR (? != '' AND LOWER(COALESCE(parent_id, '')) = LOWER(?))
+		  )`,
+		norm, norm, norm, rawID, rawID,
+	); err == nil {
+		for rows.Next() {
+			var pid string
+			if scanErr := rows.Scan(&pid); scanErr == nil && strings.TrimSpace(pid) != "" {
+				playlistIDs = append(playlistIDs, pid)
+			}
+		}
+		_ = rows.Close()
+	}
+	for _, pid := range playlistIDs {
+		normPID := guid.Normalize(pid)
+		_, _ = tx.ExecContext(ctx, `DELETE FROM item_collections WHERE container_id = ? OR item_id = ?`, pid, pid)
+		_, _ = tx.ExecContext(ctx, `DELETE FROM item_ancestors WHERE ancestor_id = ? OR descendant_id = ?`, pid, pid)
+		_, _ = tx.ExecContext(ctx, `DELETE FROM item_images WHERE item_id = ?`, pid)
+		_, _ = tx.ExecContext(ctx, `DELETE FROM item_taxonomies WHERE item_id = ?`, pid)
+		_, _ = tx.ExecContext(ctx, `DELETE FROM item_people WHERE item_id = ?`, pid)
+		_, _ = tx.ExecContext(ctx, `DELETE FROM user_item_data WHERE item_id = ?`, pid)
+		_, _ = tx.ExecContext(ctx, `DELETE FROM item_search_fts WHERE item_id = ?`, pid)
+		_, _ = tx.ExecContext(ctx, `DELETE FROM server_config WHERE key = ? OR key = ?`,
+			"item_visibility_"+normPID,
+			"item_visibility_"+strings.ToLower(strings.TrimSpace(pid)),
+		)
+		_, _ = tx.ExecContext(ctx, `DELETE FROM items WHERE id = ?`, pid)
+	}
+
 	for _, uid := range []string{norm, rawID} {
 		if strings.TrimSpace(uid) == "" {
 			continue

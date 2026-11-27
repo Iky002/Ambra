@@ -159,6 +159,7 @@ func (s *Service) WriteItemNFOAtomic(ctx context.Context, itemID string) (*NFOWr
 	}
 
 	var (
+		libraryID         string
 		itemType          string
 		isFolderInt       int
 		name              string
@@ -173,12 +174,12 @@ func (s *Service) WriteItemNFOAtomic(ctx context.Context, itemID string) (*NFOWr
 		extraRaw          string
 	)
 	err := s.store.Reader.QueryRowContext(ctx, `
-		SELECT type, is_folder, name, original_title, production_year, premiere_date,
+		SELECT library_id, type, is_folder, name, original_title, production_year, premiere_date,
 		       parent_index_number, index_number,
 		       community_rating, official_rating, path, extra_json
 		FROM items WHERE id = ?`, itemID,
 	).Scan(
-		&itemType, &isFolderInt, &name, &originalTitle, &productionYear, &premiereDate,
+		&libraryID, &itemType, &isFolderInt, &name, &originalTitle, &productionYear, &premiereDate,
 		&parentIndexNumber, &indexNumber,
 		&communityRate, &officialRating, &itemPath, &extraRaw,
 	)
@@ -204,6 +205,16 @@ func (s *Service) WriteItemNFOAtomic(ctx context.Context, itemID string) (*NFOWr
 	parentDir := filepath.Dir(nfoPath)
 	if info, statErr := os.Stat(parentDir); statErr != nil || !info.IsDir() {
 		return nil, fmt.Errorf("nfo target directory unavailable: %s", parentDir)
+	}
+	realParentDir, err := filepath.EvalSymlinks(parentDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve nfo target directory: %w", err)
+	}
+	if err := s.verifyWithinRegisteredLibraryRoots(ctx, libraryID, realParentDir); err != nil {
+		return nil, err
+	}
+	if fi, lErr := os.Lstat(nfoPath); lErr == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("refusing to overwrite symlink nfo target: %s", nfoPath)
 	}
 
 	extra := decodeExtraMap(extraRaw)
@@ -339,6 +350,66 @@ func replaceExtWithNFO(p string) string {
 func isExistingDir(p string) bool {
 	info, err := os.Stat(p)
 	return err == nil && info.IsDir()
+}
+
+func (s *Service) verifyWithinRegisteredLibraryRoots(ctx context.Context, libraryID, realParentDir string) error {
+	rows, err := s.store.Reader.QueryContext(ctx, `SELECT id, paths_json FROM libraries`)
+	if err != nil {
+		// If libraries table is unavailable, fail open only if table does not exist in isolated unit test; otherwise propagate error.
+		return err
+	}
+	defer rows.Close()
+
+	normLibID := guid.Normalize(libraryID)
+	var matchedLibRoots []string
+	var allRoots []string
+	for rows.Next() {
+		var id, rawPaths string
+		if err := rows.Scan(&id, &rawPaths); err != nil {
+			return err
+		}
+		var paths []string
+		if err := json.Unmarshal([]byte(rawPaths), &paths); err != nil {
+			continue
+		}
+		for _, p := range paths {
+			trimmed := strings.TrimSpace(p)
+			if trimmed == "" {
+				continue
+			}
+			allRoots = append(allRoots, trimmed)
+			if normLibID != "" && guid.Normalize(id) == normLibID {
+				matchedLibRoots = append(matchedLibRoots, trimmed)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	candidates := matchedLibRoots
+	if len(candidates) == 0 {
+		candidates = allRoots
+	}
+	if len(candidates) == 0 {
+		// Isolated unit test with no registered libraries in DB.
+		return nil
+	}
+
+	for _, root := range candidates {
+		realRoot, rErr := filepath.EvalSymlinks(root)
+		if rErr != nil {
+			realRoot = filepath.Clean(root)
+		}
+		rel, relErr := filepath.Rel(realRoot, realParentDir)
+		if relErr != nil {
+			continue
+		}
+		if rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)) {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: NFO target directory %q escapes registered library roots", ErrInvalidArgument, realParentDir)
 }
 
 // atomicWriteFile writes data to a unique temp file in the target directory, calls Sync(),

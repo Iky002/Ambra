@@ -790,22 +790,8 @@ func (r *LibraryRepo) GetContainerItemsWithPolicy(
 	maxParentalRating *int,
 	blockedTags []string,
 ) ([]PlaylistItemDto, int, error) {
-	pol := dto.UserPolicy{
-		EnableAllFolders:  allowedLibraryIDs == nil,
-		MaxParentalRating: maxParentalRating,
-		BlockedTags:       blockedTags,
-	}
-	if uid := guid.Normalize(userID); uid != "" {
-		if uPol, _, ok := r.loadRestrictedUserPolicy(ctx, uid); ok {
-			if len(uPol.BlockUnratedItems) > 0 {
-				pol.BlockUnratedItems = uPol.BlockUnratedItems
-			}
-			if len(uPol.AllowedTags) > 0 {
-				pol.AllowedTags = uPol.AllowedTags
-			}
-		}
-	}
-	return r.GetContainerItemsWithUserPolicy(ctx, serverID, userID, containerID, startIndex, limit, fields, allowedLibraryIDs, pol)
+	pol, libs := r.syntheticUserPolicyForLegacyCall(ctx, userID, allowedLibraryIDs, maxParentalRating, blockedTags)
+	return r.GetContainerItemsWithUserPolicy(ctx, serverID, userID, containerID, startIndex, limit, fields, libs, pol)
 }
 
 // GetContainerItemsWithUserPolicy returns ordered items belonging to a BoxSet or Playlist
@@ -826,12 +812,20 @@ func (r *LibraryRepo) GetContainerItemsWithUserPolicy(
 		}
 		return nil, 0, err
 	}
+	allowedLibraryIDs = r.excludeLiveTvFromAllowedLibraries(ctx, allowedLibraryIDs, policy)
 	if allowedLibraryIDs != nil && len(allowedLibraryIDs) == 0 {
 		return []PlaylistItemDto{}, 0, nil
 	}
 
+	uid := guid.Normalize(userID)
 	pPolicy := policyFromUserPolicy(policy)
 	policyConds, policyArgs := buildLibraryAndPolicyWhere("i", allowedLibraryIDs, pPolicy)
+	if !policy.IsAdministrator && uid != "" {
+		if plClause, plArgs := appendPlaylistVisibilitySQL("i", uid, false); plClause != "" {
+			policyConds = append(policyConds, plClause)
+			policyArgs = append(policyArgs, plArgs...)
+		}
+	}
 	policySQL := ""
 	if len(policyConds) > 0 {
 		policySQL = " AND " + strings.Join(policyConds, " AND ")
@@ -848,7 +842,6 @@ func (r *LibraryRepo) GetContainerItemsWithUserPolicy(
 		return nil, 0, err
 	}
 
-	uid := guid.Normalize(userID)
 	hasUser := uid != ""
 	var (
 		query string
@@ -1024,6 +1017,22 @@ func (e *ItemExtra) unmarshal(raw string) error {
 	return json.Unmarshal([]byte(raw), e)
 }
 
+// CountPlaylistsByOwner returns the number of Playlist items owned by userID.
+func (r *LibraryRepo) CountPlaylistsByOwner(ctx context.Context, userID string) (int, error) {
+	norm := guid.Normalize(userID)
+	if norm == "" {
+		return 0, nil
+	}
+	var cnt int
+	err := r.store.Reader.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM items
+		WHERE LOWER(type) = 'playlist'
+		  AND LOWER(REPLACE(TRIM(COALESCE(parent_id, '')), '-', '')) = ?`,
+		norm,
+	).Scan(&cnt)
+	return cnt, err
+}
+
 // GetSimilarItems finds items of the same type sharing genres with seedID, falling back to same-type items.
 func (r *LibraryRepo) GetSimilarItems(ctx context.Context, serverID, userID, seedID string, limit int, fields []string) ([]dto.BaseItemDto, int, error) {
 	return r.GetSimilarItemsWithPolicy(ctx, serverID, userID, seedID, limit, fields, nil, nil, nil)
@@ -1036,10 +1045,28 @@ func (r *LibraryRepo) isSeedAccessibleUnderPolicy(
 	maxParentalRating *int,
 	blockedTags []string,
 ) (bool, error) {
+	return r.isSeedAccessibleUnderUserPolicy(ctx, seedRec, allowedLibraryIDs, dto.UserPolicy{
+		EnableAllFolders:   allowedLibraryIDs == nil,
+		EnabledFolders:     allowedLibraryIDs,
+		EnableLiveTvAccess: true,
+		MaxParentalRating:  maxParentalRating,
+		BlockedTags:        blockedTags,
+	})
+}
+
+func (r *LibraryRepo) isSeedAccessibleUnderUserPolicy(
+	ctx context.Context,
+	seedRec *ItemRecord,
+	allowedLibraryIDs []string,
+	policy dto.UserPolicy,
+) (bool, error) {
 	if seedRec == nil {
 		return false, nil
 	}
-	if len(allowedLibraryIDs) > 0 && seedRec.LibraryID != "" &&
+	if policy.IsAdministrator {
+		return true, nil
+	}
+	if allowedLibraryIDs != nil && seedRec.LibraryID != "" &&
 		seedRec.LibraryID != "collections" && seedRec.LibraryID != "playlists" {
 		normLib := guid.Normalize(seedRec.LibraryID)
 		found := false
@@ -1053,7 +1080,7 @@ func (r *LibraryRepo) isSeedAccessibleUnderPolicy(
 			return false, nil
 		}
 	}
-	blocked, err := r.IsItemBlockedByParentalPolicy(ctx, seedRec, maxParentalRating, blockedTags)
+	blocked, err := r.IsItemBlockedByPolicy(ctx, seedRec, policy)
 	if err != nil {
 		return false, err
 	}
@@ -1070,6 +1097,20 @@ func (r *LibraryRepo) GetSimilarItemsWithPolicy(
 	maxParentalRating *int,
 	blockedTags []string,
 ) ([]dto.BaseItemDto, int, error) {
+	pol, libs := r.syntheticUserPolicyForLegacyCall(ctx, userID, allowedLibraryIDs, maxParentalRating, blockedTags)
+	return r.GetSimilarItemsWithUserPolicy(ctx, serverID, userID, seedID, limit, fields, libs, pol)
+}
+
+// GetSimilarItemsWithUserPolicy finds similar items while enforcing library RBAC and the full user policy.
+func (r *LibraryRepo) GetSimilarItemsWithUserPolicy(
+	ctx context.Context,
+	serverID, userID, seedID string,
+	limit int,
+	fields []string,
+	allowedLibraryIDs []string,
+	policy dto.UserPolicy,
+) ([]dto.BaseItemDto, int, error) {
+	allowedLibraryIDs = r.excludeLiveTvFromAllowedLibraries(ctx, allowedLibraryIDs, policy)
 	if allowedLibraryIDs != nil && len(allowedLibraryIDs) == 0 {
 		return []dto.BaseItemDto{}, 0, nil
 	}
@@ -1084,7 +1125,7 @@ func (r *LibraryRepo) GetSimilarItemsWithPolicy(
 	if err != nil {
 		return nil, 0, err
 	}
-	accessible, err := r.isSeedAccessibleUnderPolicy(ctx, seedRec, allowedLibraryIDs, maxParentalRating, blockedTags)
+	accessible, err := r.isSeedAccessibleUnderUserPolicy(ctx, seedRec, allowedLibraryIDs, policy)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1092,6 +1133,7 @@ func (r *LibraryRepo) GetSimilarItemsWithPolicy(
 		return []dto.BaseItemDto{}, 0, nil
 	}
 	seedType := seedRec.Type
+	pPol := policyFromUserPolicy(policy)
 
 	// Find genres of seed item
 	gRows, err := r.store.Reader.QueryContext(ctx, `
@@ -1124,8 +1166,10 @@ func (r *LibraryRepo) GetSimilarItemsWithPolicy(
 			ServerID:          serverID,
 			UserID:            userID,
 			AllowedLibraryIDs: allowedLibraryIDs,
-			MaxParentalRating: maxParentalRating,
-			BlockedTags:       blockedTags,
+			MaxParentalRating: pPol.MaxParentalRating,
+			BlockUnratedItems: pPol.BlockUnratedItems,
+			BlockedTags:       pPol.BlockedTags,
+			AllowedTags:       pPol.AllowedTags,
 			IncludeItemTypes:  []string{seedType},
 			Genres:            genres,
 			SortBy:            []string{"CommunityRating", "DateCreated"},
@@ -1153,8 +1197,10 @@ func (r *LibraryRepo) GetSimilarItemsWithPolicy(
 			ServerID:          serverID,
 			UserID:            userID,
 			AllowedLibraryIDs: allowedLibraryIDs,
-			MaxParentalRating: maxParentalRating,
-			BlockedTags:       blockedTags,
+			MaxParentalRating: pPol.MaxParentalRating,
+			BlockUnratedItems: pPol.BlockUnratedItems,
+			BlockedTags:       pPol.BlockedTags,
+			AllowedTags:       pPol.AllowedTags,
 			IncludeItemTypes:  []string{seedType},
 			SortBy:            []string{"DateCreated"},
 			SortOrder:         "Descending",
@@ -1196,6 +1242,20 @@ func (r *LibraryRepo) GetInstantMixWithPolicy(
 	maxParentalRating *int,
 	blockedTags []string,
 ) ([]dto.BaseItemDto, int, error) {
+	pol, libs := r.syntheticUserPolicyForLegacyCall(ctx, userID, allowedLibraryIDs, maxParentalRating, blockedTags)
+	return r.GetInstantMixWithUserPolicy(ctx, serverID, userID, seedID, limit, fields, libs, pol)
+}
+
+// GetInstantMixWithUserPolicy generates an instant mix while enforcing library RBAC and the full user policy.
+func (r *LibraryRepo) GetInstantMixWithUserPolicy(
+	ctx context.Context,
+	serverID, userID, seedID string,
+	limit int,
+	fields []string,
+	allowedLibraryIDs []string,
+	policy dto.UserPolicy,
+) ([]dto.BaseItemDto, int, error) {
+	allowedLibraryIDs = r.excludeLiveTvFromAllowedLibraries(ctx, allowedLibraryIDs, policy)
 	if allowedLibraryIDs != nil && len(allowedLibraryIDs) == 0 {
 		return []dto.BaseItemDto{}, 0, nil
 	}
@@ -1211,15 +1271,30 @@ func (r *LibraryRepo) GetInstantMixWithPolicy(
 	if err != nil {
 		return nil, 0, err
 	}
-	accessible, err := r.isSeedAccessibleUnderPolicy(ctx, seedRec, allowedLibraryIDs, maxParentalRating, blockedTags)
-	if err != nil {
-		return nil, 0, err
-	}
-	if !accessible {
-		return []dto.BaseItemDto{}, 0, nil
+	// Note: for Playlist seeds, Playlists themselves do not require AllowedTags unless tagged with BlockedTags;
+	// non-playlist seeds check full user policy.
+	if strings.EqualFold(seedRec.Type, "Playlist") && !policy.IsAdministrator {
+		playlistSeedPolicy := policy
+		playlistSeedPolicy.AllowedTags = nil
+		accessible, err := r.isSeedAccessibleUnderUserPolicy(ctx, seedRec, allowedLibraryIDs, playlistSeedPolicy)
+		if err != nil {
+			return nil, 0, err
+		}
+		if !accessible {
+			return []dto.BaseItemDto{}, 0, nil
+		}
+	} else {
+		accessible, err := r.isSeedAccessibleUnderUserPolicy(ctx, seedRec, allowedLibraryIDs, policy)
+		if err != nil {
+			return nil, 0, err
+		}
+		if !accessible {
+			return []dto.BaseItemDto{}, 0, nil
+		}
 	}
 	seedType := seedRec.Type
 	seedMediaType := seedRec.MediaType
+	pPol := policyFromUserPolicy(policy)
 
 	// Determine target playable item type
 	targetTypes := []string{"Audio"}
@@ -1242,7 +1317,7 @@ func (r *LibraryRepo) GetInstantMixWithPolicy(
 		}
 		genreConds = append(genreConds, fmt.Sprintf(`(i.library_id IN (%s) OR i.library_id IN ('', 'collections', 'playlists'))`, strings.Join(ph, ",")))
 	}
-	if pClauses, pArgs := appendParentalFilterSQL("i", maxParentalRating, blockedTags); len(pClauses) > 0 {
+	if pClauses, pArgs := appendParentalPolicySQL("i", pPol); len(pClauses) > 0 {
 		genreConds = append(genreConds, pClauses...)
 		genreArgs = append(genreArgs, pArgs...)
 	}
@@ -1288,8 +1363,10 @@ func (r *LibraryRepo) GetInstantMixWithPolicy(
 			ServerID:          serverID,
 			UserID:            userID,
 			AllowedLibraryIDs: allowedLibraryIDs,
-			MaxParentalRating: maxParentalRating,
-			BlockedTags:       blockedTags,
+			MaxParentalRating: pPol.MaxParentalRating,
+			BlockUnratedItems: pPol.BlockUnratedItems,
+			BlockedTags:       pPol.BlockedTags,
+			AllowedTags:       pPol.AllowedTags,
 			IncludeItemTypes:  targetTypes,
 			Genres:            genres,
 			SortBy:            []string{"Random"},
@@ -1312,8 +1389,10 @@ func (r *LibraryRepo) GetInstantMixWithPolicy(
 			ServerID:          serverID,
 			UserID:            userID,
 			AllowedLibraryIDs: allowedLibraryIDs,
-			MaxParentalRating: maxParentalRating,
-			BlockedTags:       blockedTags,
+			MaxParentalRating: pPol.MaxParentalRating,
+			BlockUnratedItems: pPol.BlockUnratedItems,
+			BlockedTags:       pPol.BlockedTags,
+			AllowedTags:       pPol.AllowedTags,
 			IncludeItemTypes:  targetTypes,
 			SortBy:            []string{"Random"},
 			Limit:             limit,
@@ -1355,6 +1434,20 @@ func (r *LibraryRepo) GetMovieRecommendationsWithPolicy(
 	maxParentalRating *int,
 	blockedTags []string,
 ) ([]RecommendationCategory, error) {
+	pol, libs := r.syntheticUserPolicyForLegacyCall(ctx, userID, allowedLibraryIDs, maxParentalRating, blockedTags)
+	return r.GetMovieRecommendationsWithUserPolicy(ctx, serverID, userID, categoryLimit, itemLimit, fields, libs, pol)
+}
+
+// GetMovieRecommendationsWithUserPolicy returns personalized movie recommendations while enforcing library RBAC and full user policy.
+func (r *LibraryRepo) GetMovieRecommendationsWithUserPolicy(
+	ctx context.Context,
+	serverID, userID string,
+	categoryLimit, itemLimit int,
+	fields []string,
+	allowedLibraryIDs []string,
+	policy dto.UserPolicy,
+) ([]RecommendationCategory, error) {
+	allowedLibraryIDs = r.excludeLiveTvFromAllowedLibraries(ctx, allowedLibraryIDs, policy)
 	if allowedLibraryIDs != nil && len(allowedLibraryIDs) == 0 {
 		return []RecommendationCategory{}, nil
 	}
@@ -1364,6 +1457,7 @@ func (r *LibraryRepo) GetMovieRecommendationsWithPolicy(
 	if itemLimit <= 0 {
 		itemLimit = 8
 	}
+	pPol := policyFromUserPolicy(policy)
 
 	buildPolicyScope := func(alias string) (string, []any) {
 		var conds []string
@@ -1376,7 +1470,7 @@ func (r *LibraryRepo) GetMovieRecommendationsWithPolicy(
 			}
 			conds = append(conds, fmt.Sprintf(`%s.library_id IN (%s)`, alias, strings.Join(ph, ",")))
 		}
-		if pClauses, pArgs := appendParentalFilterSQL(alias, maxParentalRating, blockedTags); len(pClauses) > 0 {
+		if pClauses, pArgs := appendParentalPolicySQL(alias, pPol); len(pClauses) > 0 {
 			conds = append(conds, pClauses...)
 			a = append(a, pArgs...)
 		}
@@ -1469,8 +1563,10 @@ func (r *LibraryRepo) GetMovieRecommendationsWithPolicy(
 				ServerID:          serverID,
 				UserID:            userID,
 				AllowedLibraryIDs: allowedLibraryIDs,
-				MaxParentalRating: maxParentalRating,
-				BlockedTags:       blockedTags,
+				MaxParentalRating: pPol.MaxParentalRating,
+				BlockUnratedItems: pPol.BlockUnratedItems,
+				BlockedTags:       pPol.BlockedTags,
+				AllowedTags:       pPol.AllowedTags,
 				IncludeItemTypes:  []string{"Movie"},
 				ExcludeItemIDs:    []string{seed.id},
 				Genres:            seedGenres,
@@ -1550,8 +1646,10 @@ func (r *LibraryRepo) GetMovieRecommendationsWithPolicy(
 				ServerID:          serverID,
 				UserID:            userID,
 				AllowedLibraryIDs: allowedLibraryIDs,
-				MaxParentalRating: maxParentalRating,
-				BlockedTags:       blockedTags,
+				MaxParentalRating: pPol.MaxParentalRating,
+				BlockUnratedItems: pPol.BlockUnratedItems,
+				BlockedTags:       pPol.BlockedTags,
+				AllowedTags:       pPol.AllowedTags,
 				IncludeItemTypes:  []string{"Movie"},
 				Genres:            []string{g.name},
 				SortBy:            []string{"CommunityRating", "DateCreated"},
@@ -1578,8 +1676,10 @@ func (r *LibraryRepo) GetMovieRecommendationsWithPolicy(
 			ServerID:          serverID,
 			UserID:            userID,
 			AllowedLibraryIDs: allowedLibraryIDs,
-			MaxParentalRating: maxParentalRating,
-			BlockedTags:       blockedTags,
+			MaxParentalRating: pPol.MaxParentalRating,
+			BlockUnratedItems: pPol.BlockUnratedItems,
+			BlockedTags:       pPol.BlockedTags,
+			AllowedTags:       pPol.AllowedTags,
 			IncludeItemTypes:  []string{"Movie"},
 			SortBy:            []string{"DateCreated"},
 			SortOrder:         "Descending",
@@ -1607,7 +1707,9 @@ type QueryFiltersFilter struct {
 	IncludeItemTypes  []string
 	AllowedLibraryIDs []string
 	MaxParentalRating *int
+	BlockUnratedItems []string
 	BlockedTags       []string
+	AllowedTags       []string
 }
 
 // QueryFiltersResult holds distinct filter dimensions for /Items/Filters and /Items/Filters2.
@@ -1657,7 +1759,12 @@ func (r *LibraryRepo) GetQueryFilters(ctx context.Context, f QueryFiltersFilter)
 		}
 		conds = append(conds, fmt.Sprintf(`i.library_id IN (%s)`, strings.Join(ph, ",")))
 	}
-	if pClauses, pArgs := appendParentalFilterSQL("i", f.MaxParentalRating, f.BlockedTags); len(pClauses) > 0 {
+	if pClauses, pArgs := appendParentalPolicySQL("i", parentalPolicy{
+		MaxParentalRating: f.MaxParentalRating,
+		BlockUnratedItems: f.BlockUnratedItems,
+		BlockedTags:       f.BlockedTags,
+		AllowedTags:       f.AllowedTags,
+	}); len(pClauses) > 0 {
 		conds = append(conds, pClauses...)
 		args = append(args, pArgs...)
 	}
@@ -1808,6 +1915,25 @@ func (r *LibraryRepo) ListFilterValuesWithPolicy(
 	maxParentalRating *int,
 	blockedTags []string,
 ) ([]dto.BaseItemDto, int, error) {
+	return r.ListFilterValuesWithUserPolicy(ctx, serverID, dimension, parentID, includeItemTypes, startIndex, limit, allowedLibraryIDs, dto.UserPolicy{
+		EnableAllFolders:   allowedLibraryIDs == nil,
+		EnabledFolders:     allowedLibraryIDs,
+		EnableLiveTvAccess: true,
+		MaxParentalRating:  maxParentalRating,
+		BlockedTags:        blockedTags,
+	})
+}
+
+// ListFilterValuesWithUserPolicy dynamically aggregates distinct filter values while enforcing library RBAC and the full user policy.
+func (r *LibraryRepo) ListFilterValuesWithUserPolicy(
+	ctx context.Context,
+	serverID, dimension, parentID string,
+	includeItemTypes []string,
+	startIndex, limit int,
+	allowedLibraryIDs []string,
+	policy dto.UserPolicy,
+) ([]dto.BaseItemDto, int, error) {
+	allowedLibraryIDs = r.excludeLiveTvFromAllowedLibraries(ctx, allowedLibraryIDs, policy)
 	if allowedLibraryIDs != nil && len(allowedLibraryIDs) == 0 {
 		return []dto.BaseItemDto{}, 0, nil
 	}
@@ -1815,6 +1941,7 @@ func (r *LibraryRepo) ListFilterValuesWithPolicy(
 		limit = 200
 	}
 	parentID = guid.Normalize(parentID)
+	pPol := policyFromUserPolicy(policy)
 
 	var (
 		query   string
@@ -1845,7 +1972,7 @@ func (r *LibraryRepo) ListFilterValuesWithPolicy(
 			}
 			conds = append(conds, fmt.Sprintf(`%s.library_id IN (%s)`, alias, strings.Join(ph, ",")))
 		}
-		if pClauses, pArgs := appendParentalFilterSQL(alias, maxParentalRating, blockedTags); len(pClauses) > 0 {
+		if pClauses, pArgs := appendParentalPolicySQL(alias, pPol); len(pClauses) > 0 {
 			conds = append(conds, pClauses...)
 			a = append(a, pArgs...)
 		}

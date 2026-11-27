@@ -1034,7 +1034,7 @@ func TestGovernanceRollbackAndErrorInjectionBranches(t *testing.T) {
 
 	// 4. Schema drop error paths for FTS, WriteItemNFOAtomic, ApproveAudit, RunLibraryAudit, collectLibraryStats, and closed store
 	mustExec(`PRAGMA foreign_keys = OFF;`)
-	nfoDir := t.TempDir()
+	nfoDir := lib.Paths[0]
 	m4 := &sqlite.ItemRecord{LibraryID: lib.ID, Type: "Movie", Name: "NFOErr", Path: filepath.Join(nfoDir, "m4.mkv")}
 	_ = repo.UpsertItem(ctx, m4)
 

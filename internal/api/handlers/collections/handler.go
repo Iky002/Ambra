@@ -101,7 +101,12 @@ func (h *Handler) resolveUserID(r *http.Request, q httpx.Query) string {
 		return guid.Normalize(uid)
 	}
 	if h.auth.UserIDFromCtx != nil {
-		return guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if uid := guid.Normalize(h.auth.UserIDFromCtx(r.Context())); uid != "" {
+			return uid
+		}
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil {
+		return guid.Normalize(ac.UserID())
 	}
 	return ""
 }
@@ -138,8 +143,8 @@ func (h *Handler) filterAccessibleItemIDs(r *http.Request, fallbackUserID string
 	}
 	isNonAdmin := h.isNonAdminCaller(r)
 	allowed := h.allowedLibrariesForRequest(r, fallbackUserID)
-	pol := h.userExtendedPolicyForRequest(r, fallbackUserID)
-	restricted := isNonAdmin || allowed != nil || pol.maxRating != nil || len(pol.blockedTags) > 0 || pol.hasExtraPolicy()
+	userPol := h.userPolicyForRequest(r, fallbackUserID)
+	restricted := isNonAdmin || !userPol.IsAdministrator || allowed != nil
 	filtered := make([]string, 0, len(ids))
 	for _, id := range ids {
 		rec, err := h.repo.GetItemRecordByID(r.Context(), id)
@@ -153,8 +158,13 @@ func (h *Handler) filterAccessibleItemIDs(r *http.Request, fallbackUserID string
 		if strings.EqualFold(rec.Type, "Playlist") {
 			continue
 		}
-		if !h.isChildVisibleToUser(r, rec, allowed, pol) {
+		if allowed != nil && rec.LibraryID != "" && rec.LibraryID != "collections" && !isLibraryAllowed(rec.LibraryID, allowed) {
 			continue
+		}
+		if !userPol.IsAdministrator {
+			if blocked, bErr := h.repo.IsItemBlockedByPolicy(r.Context(), rec, userPol); bErr != nil || blocked {
+				continue
+			}
 		}
 		filtered = append(filtered, id)
 	}
@@ -169,14 +179,19 @@ func (h *Handler) allowedLibrariesForRequest(r *http.Request, fallbackUserID str
 		if h.userRepo != nil {
 			return h.allowedLibrariesForUser(r.Context(), guid.Normalize(ac.UserID()))
 		}
-		if ac.User != nil && !ac.User.Policy.EnableAllFolders {
-			allowed := make([]string, 0, len(ac.User.Policy.EnabledFolders))
-			for _, fid := range ac.User.Policy.EnabledFolders {
-				if norm := guid.Normalize(fid); norm != "" {
-					allowed = append(allowed, norm)
-				}
+		if ac.User != nil {
+			if h.repo != nil {
+				return h.repo.AllowedLibraryIDsForPolicy(r.Context(), ac.User.Policy)
 			}
-			return allowed
+			if !ac.User.Policy.EnableAllFolders {
+				allowed := make([]string, 0, len(ac.User.Policy.EnabledFolders))
+				for _, fid := range ac.User.Policy.EnabledFolders {
+					if norm := guid.Normalize(fid); norm != "" {
+						allowed = append(allowed, norm)
+					}
+				}
+				return allowed
+			}
 		}
 		return nil
 	}
@@ -201,7 +216,13 @@ func (h *Handler) allowedLibrariesForUser(ctx context.Context, userID string) []
 	if err != nil || u == nil {
 		return []string{}
 	}
-	if u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableAllFolders {
+	if u.IsAdmin || u.Policy.IsAdministrator {
+		return nil
+	}
+	if h.repo != nil {
+		return h.repo.AllowedLibraryIDsForPolicy(ctx, u.Policy)
+	}
+	if u.Policy.EnableAllFolders {
 		return nil
 	}
 	allowed := make([]string, 0, len(u.Policy.EnabledFolders))
@@ -227,37 +248,11 @@ func isLibraryAllowed(libID string, allowed []string) bool {
 }
 
 func (h *Handler) userParentalPolicyForRequest(r *http.Request, fallbackUserID string) (*int, []string) {
-	ac, hasAC := middleware.AuthFromContext(r.Context())
-	if hasAC && ac != nil {
-		if ac.IsAPIKey || ac.IsAdmin() {
-			return nil, nil
-		}
+	pol := h.userPolicyForRequest(r, fallbackUserID)
+	if pol.IsAdministrator {
+		return nil, nil
 	}
-	uid := ""
-	if h.auth.UserIDFromCtx != nil {
-		uid = guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
-	}
-	if uid == "" && hasAC && ac != nil {
-		uid = guid.Normalize(ac.UserID())
-	}
-	if uid == "" {
-		uid = guid.Normalize(fallbackUserID)
-	}
-	if h.userRepo != nil && uid != "" {
-		u, err := h.userRepo.GetUserByID(r.Context(), uid)
-		if err != nil || u == nil {
-			zero := 0
-			return &zero, nil
-		}
-		if u.IsAdmin || u.Policy.IsAdministrator {
-			return nil, nil
-		}
-		return u.Policy.MaxParentalRating, u.Policy.BlockedTags
-	}
-	if hasAC && ac != nil && ac.User != nil {
-		return ac.User.Policy.MaxParentalRating, ac.User.Policy.BlockedTags
-	}
-	return nil, nil
+	return pol.MaxParentalRating, pol.BlockedTags
 }
 
 func (h *Handler) isPlaylistPublic(ctx context.Context, playlistID string) bool {
@@ -342,60 +337,39 @@ func (h *Handler) handleListCollections(w http.ResponseWriter, r *http.Request) 
 	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
-	pol := h.userExtendedPolicyForRequest(r, userID)
-	isRestrictedUser := allowed != nil || pol.maxRating != nil || len(pol.blockedTags) > 0 || pol.hasExtraPolicy()
-	startIndex := q.Int("StartIndex", 0)
-	limit := q.Int("Limit", 0)
+	userPol := h.userPolicyForRequest(r, userID)
+	startIndex := max(0, q.Int("StartIndex", 0))
+	limit := clampCollectionsLimit(q.Int("Limit", 0), maxCollectionsQueryLimit, maxCollectionsQueryLimit)
 
-	fetchStart, fetchLimit := startIndex, limit
-	if isRestrictedUser {
-		fetchStart, fetchLimit = 0, 0
+	var maxRating *int
+	var blockUnrated, blockedTags, allowedTags []string
+	if !userPol.IsAdministrator {
+		maxRating = userPol.MaxParentalRating
+		blockUnrated = userPol.BlockUnratedItems
+		blockedTags = userPol.BlockedTags
+		allowedTags = userPol.AllowedTags
 	}
 
 	items, total, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
 		ServerID:          h.serverID(),
 		UserID:            userID,
-		MaxParentalRating: pol.maxRating,
-		BlockUnratedItems: pol.blockUnratedItems,
-		BlockedTags:       pol.blockedTags,
-		AllowedTags:       pol.allowedTags,
+		AllowedLibraryIDs: allowed,
+		MaxParentalRating: maxRating,
+		BlockUnratedItems: blockUnrated,
+		BlockedTags:       blockedTags,
+		AllowedTags:       allowedTags,
 		IncludeItemTypes:  []string{"BoxSet"},
 		SearchTerm:        q.Get("SearchTerm"),
 		SortBy:            q.List("SortBy"),
 		SortOrder:         q.Get("SortOrder"),
-		StartIndex:        fetchStart,
-		Limit:             fetchLimit,
+		StartIndex:        startIndex,
+		Limit:             limit,
 		Fields:            q.List("Fields"),
 	})
 	if err != nil {
 		slog.Error("internal error in collections handler", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
-	}
-	if isRestrictedUser {
-		visible := make([]dto.BaseItemDto, 0, len(items))
-		for _, bs := range items {
-			if pol.hasExtraPolicy() {
-				if bsRec, rErr := h.repo.GetItemRecordByID(r.Context(), bs.Id); rErr == nil && bsRec != nil {
-					if h.isRecordBlockedByExtraPolicy(r.Context(), bsRec, pol) {
-						continue
-					}
-				}
-			}
-			if h.boxSetHasVisibleChild(r, userID, bs.Id, allowed, pol) {
-				visible = append(visible, bs)
-			}
-		}
-		total = len(visible)
-		if startIndex > len(visible) {
-			visible = []dto.BaseItemDto{}
-		} else if startIndex > 0 {
-			visible = visible[startIndex:]
-		}
-		if limit > 0 && len(visible) > limit {
-			visible = visible[:limit]
-		}
-		items = visible
 	}
 	if h.isNonAdminCaller(r) {
 		dto.SanitizeItemPathsSlice(items)
@@ -449,7 +423,7 @@ func (h *Handler) handleAddCollectionItems(w http.ResponseWriter, r *http.Reques
 	if _, ok := h.requireContainer(w, r, containerID, "BoxSet", false); !ok {
 		return
 	}
-	h.addItemsToContainer(w, r, true)
+	h.addItemsToContainerWithResp(w, r, true, false)
 }
 
 func (h *Handler) handleRemoveCollectionItems(w http.ResponseWriter, r *http.Request) {
@@ -473,56 +447,41 @@ func (h *Handler) handleListPlaylists(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := h.resolveUserID(r, q)
-	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
-	startIndex := q.Int("StartIndex", 0)
-	limit := q.Int("Limit", 0)
-	filterByOwner := h.isNonAdminCaller(r)
+	userPol := h.userPolicyForRequest(r, userID)
+	plViewerUID, plViewerAdmin := h.playlistViewerForRequest(r, userID)
+	startIndex := max(0, q.Int("StartIndex", 0))
+	limit := clampCollectionsLimit(q.Int("Limit", 0), maxCollectionsQueryLimit, maxCollectionsQueryLimit)
 
-	filter := sqlite.ItemFilter{
-		ServerID:          h.serverID(),
-		UserID:            userID,
-		MaxParentalRating: maxRating,
-		BlockedTags:       blockedTags,
-		IncludeItemTypes:  []string{"Playlist"},
-		SearchTerm:        q.Get("SearchTerm"),
-		SortBy:            q.List("SortBy"),
-		SortOrder:         q.Get("SortOrder"),
-		Fields:            q.List("Fields"),
-	}
-	if !filterByOwner {
-		filter.StartIndex = startIndex
-		filter.Limit = limit
+	var maxRating *int
+	var blockUnrated, blockedTags, allowedTags []string
+	if !userPol.IsAdministrator {
+		maxRating = userPol.MaxParentalRating
+		blockUnrated = userPol.BlockUnratedItems
+		blockedTags = userPol.BlockedTags
+		allowedTags = userPol.AllowedTags
 	}
 
-	items, total, err := h.repo.QueryItems(r.Context(), filter)
+	items, total, err := h.repo.QueryItems(r.Context(), sqlite.ItemFilter{
+		ServerID:              h.serverID(),
+		UserID:                userID,
+		PlaylistViewerUserID:  plViewerUID,
+		PlaylistViewerIsAdmin: plViewerAdmin,
+		MaxParentalRating:     maxRating,
+		BlockUnratedItems:     blockUnrated,
+		BlockedTags:           blockedTags,
+		AllowedTags:           allowedTags,
+		IncludeItemTypes:      []string{"Playlist"},
+		SearchTerm:            q.Get("SearchTerm"),
+		SortBy:                q.List("SortBy"),
+		SortOrder:             q.Get("SortOrder"),
+		StartIndex:            startIndex,
+		Limit:                 limit,
+		Fields:                q.List("Fields"),
+	})
 	if err != nil {
 		slog.Error("internal error in collections handler", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
-	}
-	if filterByOwner {
-		visible := make([]dto.BaseItemDto, 0, len(items))
-		for _, it := range items {
-			parentID := it.ParentId
-			if parentID == "" {
-				if rec, recErr := h.repo.GetItemRecordByID(r.Context(), it.Id); recErr == nil && rec != nil {
-					parentID = rec.ParentID
-				}
-			}
-			if h.canViewPlaylist(r, it.Id, parentID) {
-				visible = append(visible, it)
-			}
-		}
-		total = len(visible)
-		if startIndex > len(visible) {
-			visible = []dto.BaseItemDto{}
-		} else if startIndex > 0 {
-			visible = visible[startIndex:]
-		}
-		if limit > 0 && len(visible) > limit {
-			visible = visible[:limit]
-		}
-		items = visible
 	}
 	if h.isNonAdminCaller(r) {
 		dto.SanitizeItemPathsSlice(items)
@@ -576,6 +535,18 @@ func (h *Handler) handleCreatePlaylist(w http.ResponseWriter, r *http.Request) {
 	} else if userID == "" && h.auth.UserIDFromCtx != nil {
 		userID = guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
 	}
+	if h.isNonAdminCaller(r) && userID != "" {
+		ownedCount, cntErr := h.repo.CountPlaylistsByOwner(r.Context(), userID)
+		if cntErr != nil {
+			slog.Error("failed to check user playlist quota", "user_id", userID, "error", cntErr)
+			httpx.Error(w, http.StatusInternalServerError, "internal server error")
+			return
+		}
+		if ownedCount >= maxPlaylistsPerUser {
+			httpx.Error(w, http.StatusTooManyRequests, "playlist quota exceeded")
+			return
+		}
+	}
 	ids := q.List("Ids")
 	if len(ids) == 0 {
 		ids = body.Ids
@@ -596,7 +567,7 @@ func (h *Handler) handleAddPlaylistItems(w http.ResponseWriter, r *http.Request)
 	if _, ok := h.requireContainer(w, r, containerID, "Playlist", true); !ok {
 		return
 	}
-	h.addItemsToContainer(w, r, false)
+	h.addItemsToContainerWithResp(w, r, false, true)
 }
 
 func (h *Handler) handleRemovePlaylistItems(w http.ResponseWriter, r *http.Request) {
@@ -663,9 +634,9 @@ func (h *Handler) handlePlaylistInstantMix(w http.ResponseWriter, r *http.Reques
 	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
-	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
-	if maxRating != nil || len(blockedTags) > 0 {
-		blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags)
+	userPol := h.userPolicyForRequest(r, userID)
+	if !userPol.IsAdministrator {
+		blocked, bErr := h.repo.IsItemBlockedByPolicy(r.Context(), rec, userPol)
 		if bErr != nil {
 			slog.Error("failed to verify parental policy", "error", bErr)
 			httpx.Error(w, http.StatusInternalServerError, "failed to verify item access")
@@ -676,16 +647,16 @@ func (h *Handler) handlePlaylistInstantMix(w http.ResponseWriter, r *http.Reques
 			return
 		}
 	}
-	items, total, err := h.repo.GetInstantMixWithPolicy(
+	reqLimit := clampCollectionsLimit(q.Int("Limit", 50), 50, maxCollectionsQueryLimit)
+	items, total, err := h.repo.GetInstantMixWithUserPolicy(
 		r.Context(),
 		h.serverID(),
 		userID,
 		playlistID,
-		q.Int("Limit", 50),
+		reqLimit,
 		q.List("Fields"),
 		allowed,
-		maxRating,
-		blockedTags,
+		userPol,
 	)
 	if err != nil {
 		slog.Error("internal error in collections handler", "error", err)
@@ -732,9 +703,9 @@ func (h *Handler) handleGetContainerItems(expectedType string, checkPlaylistAcce
 
 		userID := h.resolveUserID(r, q)
 		allowed := h.allowedLibrariesForRequest(r, userID)
-		pol := h.userExtendedPolicyForRequest(r, userID)
-		if pol.maxRating != nil || len(pol.blockedTags) > 0 {
-			blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, pol.maxRating, pol.blockedTags)
+		userPol := h.userPolicyForRequest(r, userID)
+		if !userPol.IsAdministrator {
+			blocked, bErr := h.repo.IsItemBlockedByPolicy(r.Context(), rec, userPol)
 			if bErr != nil {
 				slog.Error("failed to check container parental policy", "container_id", containerID, "error", bErr)
 				httpx.Error(w, http.StatusInternalServerError, "failed to verify item access")
@@ -745,28 +716,25 @@ func (h *Handler) handleGetContainerItems(expectedType string, checkPlaylistAcce
 				return
 			}
 		}
-		if h.isRecordBlockedByExtraPolicy(r.Context(), rec, pol) {
-			httpx.Error(w, http.StatusForbidden, "access denied")
-			return
-		}
-		startIndex := q.Int("StartIndex", 0)
-		limit := q.Int("Limit", 0)
-		isNonAdmin := h.isNonAdminCaller(r)
-		needFilter := isNonAdmin || allowed != nil || pol.maxRating != nil || len(pol.blockedTags) > 0 || pol.hasExtraPolicy()
+		startIndex := max(0, q.Int("StartIndex", 0))
+		limit := clampCollectionsLimit(q.Int("Limit", 0), maxCollectionsQueryLimit, maxCollectionsQueryLimit)
 
-		fetchStart, fetchLimit := startIndex, limit
-		if needFilter {
-			fetchStart, fetchLimit = 0, 0
+		queryUserID := userID
+		if !userPol.IsAdministrator && queryUserID == "" {
+			plUID, _ := h.playlistViewerForRequest(r, userID)
+			queryUserID = plUID
 		}
 
-		items, total, err := h.repo.GetContainerItems(
+		items, total, err := h.repo.GetContainerItemsWithUserPolicy(
 			r.Context(),
 			h.serverID(),
-			userID,
+			queryUserID,
 			containerID,
-			fetchStart,
-			fetchLimit,
+			startIndex,
+			limit,
 			q.List("Fields"),
+			allowed,
+			userPol,
 		)
 		if errors.Is(err, sqlite.ErrNotFound) {
 			httpx.Error(w, http.StatusNotFound, "container not found")
@@ -776,29 +744,6 @@ func (h *Handler) handleGetContainerItems(expectedType string, checkPlaylistAcce
 			slog.Error("failed to get container items", "container_id", containerID, "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "failed to get container items")
 			return
-		}
-		if needFilter {
-			filtered := make([]sqlite.PlaylistItemDto, 0, len(items))
-			for _, it := range items {
-				itemRec, recErr := h.repo.GetItemRecordByID(r.Context(), it.Id)
-				if recErr != nil || itemRec == nil {
-					continue
-				}
-				if !h.isChildVisibleToUser(r, itemRec, allowed, pol) {
-					continue
-				}
-				filtered = append(filtered, it)
-			}
-			total = len(filtered)
-			if startIndex > len(filtered) {
-				filtered = []sqlite.PlaylistItemDto{}
-			} else if startIndex > 0 {
-				filtered = filtered[startIndex:]
-			}
-			if limit > 0 && len(filtered) > limit {
-				filtered = filtered[:limit]
-			}
-			items = filtered
 		}
 		if h.isNonAdminCaller(r) {
 			for i := range items {
@@ -812,7 +757,15 @@ func (h *Handler) handleGetContainerItems(expectedType string, checkPlaylistAcce
 	}
 }
 
+type playlistAddResult struct {
+	ItemAddedCount int `json:"ItemAddedCount"`
+}
+
 func (h *Handler) addItemsToContainer(w http.ResponseWriter, r *http.Request, deduplicate bool) {
+	h.addItemsToContainerWithResp(w, r, deduplicate, false)
+}
+
+func (h *Handler) addItemsToContainerWithResp(w http.ResponseWriter, r *http.Request, deduplicate bool, returnAddedCount bool) {
 	q := httpx.ParseQuery(r)
 	containerID := r.PathValue("Id")
 	ids := q.List("Ids")
@@ -825,13 +778,18 @@ func (h *Handler) addItemsToContainer(w http.ResponseWriter, r *http.Request, de
 		}
 	}
 	ids = h.filterAccessibleItemIDs(r, "", ids)
-	if _, err := h.repo.AddItemsToContainer(r.Context(), containerID, ids, deduplicate); err != nil {
+	added, err := h.repo.AddItemsToContainer(r.Context(), containerID, ids, deduplicate)
+	if err != nil {
 		if errors.Is(err, sqlite.ErrNotFound) {
 			httpx.Error(w, http.StatusNotFound, "container not found")
 			return
 		}
 		slog.Error("internal error in collections container operation", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	if returnAddedCount {
+		httpx.JSON(w, http.StatusOK, playlistAddResult{ItemAddedCount: added})
 		return
 	}
 	httpx.NoContent(w)

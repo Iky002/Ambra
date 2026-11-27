@@ -27,7 +27,7 @@ func TestScannerControlEndpointsAndWatcherHooks(t *testing.T) {
 	defer store.Close()
 
 	repo := sqlite.NewLibraryRepo(store)
-	cfg := config.Default(tmp)
+	cfg := config.Default(filepath.Join(tmp, "data"))
 	sc := scanner.New(repo, nil, nil, cfg)
 	sc.SetProber(nil)
 

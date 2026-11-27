@@ -5,9 +5,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -19,9 +23,13 @@ import (
 )
 
 const (
-	configKeyPrefix = "plugin:"
-	maskedSecret    = "********"
+	configKeyPrefix       = "plugin:"
+	maskedSecret          = "********"
+	maxUninstallManifestB = 1 << 20
 )
+
+// ErrInvalidPluginID indicates a malformed or path-traversal plugin identifier.
+var ErrInvalidPluginID = errors.New("invalid plugin id")
 
 // AuthFuncs decouples route registration from the concrete middleware package.
 type AuthFuncs struct {
@@ -37,6 +45,7 @@ type Handler struct {
 
 	cfgMu         sync.RWMutex
 	mu            sync.RWMutex
+	pluginsDir    string
 	tracked       map[string]plugins.Plugin
 	configs       map[string]map[string]any
 	onConfigSaved func(pluginID string, saved map[string]any)
@@ -54,6 +63,14 @@ func New(registry *plugins.Registry, store *sqlite.Store) *Handler {
 	}
 	h.syncFromRegistry()
 	return h
+}
+
+// SetPluginsDir configures the root external plugins directory (<DataDir>/plugins)
+// so external plugin uninstallation removes the plugin bundle from disk safely.
+func (h *Handler) SetPluginsDir(dir string) {
+	h.mu.Lock()
+	h.pluginsDir = strings.TrimSpace(dir)
+	h.mu.Unlock()
 }
 
 // Track explicitly registers additional plugin instances (e.g. custom or initially disabled plugins).
@@ -205,6 +222,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	handleAdmin("POST /Plugins/{Id}/Configuration", h.handleUpdateConfiguration)
 	handleAdmin("POST /Plugins/{Id}/Enable", h.handleEnablePlugin)
 	handleAdmin("DELETE /Plugins/{Id}", h.handleDeletePlugin)
+	handleAdmin("POST /Plugins/{Id}/Delete", h.handleDeletePlugin)
+	handleAdmin("POST /Plugins/{Id}/Uninstall", h.handleDeletePlugin)
 }
 
 func (h *Handler) handleGetConfiguration(w http.ResponseWriter, r *http.Request) {
@@ -373,16 +392,67 @@ func (h *Handler) handleEnablePlugin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func isValidPluginLookupID(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed == "." || trimmed == ".." {
+		return false
+	}
+	if strings.Contains(trimmed, "..") || strings.ContainsAny(trimmed, `/\`) {
+		return false
+	}
+	for _, r := range trimmed {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 func (h *Handler) handleDeletePlugin(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
+	if err := h.UninstallPlugin(r.Context(), id); err != nil {
+		if errors.Is(err, ErrInvalidPluginID) {
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if errors.Is(err, sqlite.ErrNotFound) {
+			httpx.Error(w, http.StatusNotFound, "plugin not found")
+			return
+		}
+		httpx.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	httpx.NoContent(w)
+}
+
+// UninstallPlugin disables built-in plugins (preserving saved keys) or completely uninstalls
+// external/WASM plugins (safely removing their <DataDir>/plugins/<dir> bundle from disk,
+// unregistering from the plugin registry, and deleting persisted configuration).
+func (h *Handler) UninstallPlugin(ctx context.Context, rawID string) error {
+	id := strings.TrimSpace(rawID)
+	if !isValidPluginLookupID(id) {
+		return ErrInvalidPluginID
+	}
 	p, ok := h.findPlugin(id)
 	if !ok {
-		httpx.Error(w, http.StatusNotFound, "plugin not found")
-		return
+		// Check case-insensitive match across tracked/registered plugins as well.
+		h.syncFromRegistry()
+		h.mu.RLock()
+		for k, cand := range h.tracked {
+			if strings.EqualFold(k, id) && cand != nil {
+				p = cand
+				ok = true
+				break
+			}
+		}
+		h.mu.RUnlock()
+	}
+	if !ok {
+		return sqlite.ErrNotFound
 	}
 
 	h.cfgMu.Lock()
-	prev, err := h.loadSavedConfig(r.Context(), id)
+	prev, err := h.loadSavedConfig(ctx, id)
 	if err != nil {
 		prev = map[string]any{}
 	}
@@ -392,22 +462,25 @@ func (h *Handler) handleDeletePlugin(w http.ResponseWriter, r *http.Request) {
 	if err := p.Configure(cloneMap(merged)); err != nil {
 		_ = p.Configure(cloneMap(prev))
 		h.cfgMu.Unlock()
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
-		return
+		return err
 	}
 
 	mf := p.Manifest()
 	if !mf.BuiltIn {
-		// External plugin: unregister from registry and purge persisted server_config entry.
+		if err := h.removeExternalPluginBundle(mf.ID, id); err != nil {
+			_ = p.Configure(cloneMap(prev))
+			h.cfgMu.Unlock()
+			return err
+		}
 		if h.store != nil {
-			if _, err := h.store.Writer.ExecContext(r.Context(),
-				`DELETE FROM server_config WHERE LOWER(key) = LOWER(?) OR LOWER(key) = LOWER(?)`,
+			if _, err := h.store.Writer.ExecContext(ctx,
+				`DELETE FROM server_config WHERE LOWER(key) IN (LOWER(?), LOWER(?), LOWER(?), LOWER(?))`,
 				configKeyPrefix+mf.ID, configKeyPrefix+id,
+				"plugin:config:"+mf.ID, "plugin:config:"+id,
 			); err != nil {
 				_ = p.Configure(cloneMap(prev))
 				h.cfgMu.Unlock()
-				httpx.Error(w, http.StatusInternalServerError, err.Error())
-				return
+				return err
 			}
 		}
 		if h.registry != nil {
@@ -429,20 +502,125 @@ func (h *Handler) handleDeletePlugin(w http.ResponseWriter, r *http.Request) {
 		}
 		h.mu.Unlock()
 		h.cfgMu.Unlock()
-		httpx.NoContent(w)
-		return
+		return nil
 	}
 
-	if err := h.saveConfig(r.Context(), mf.ID, merged); err != nil {
+	if err := h.saveConfig(ctx, mf.ID, merged); err != nil {
 		_ = p.Configure(cloneMap(prev))
 		h.cfgMu.Unlock()
-		httpx.Error(w, http.StatusInternalServerError, err.Error())
-		return
+		return err
 	}
 	h.cfgMu.Unlock()
 
 	h.notifyConfigSaved(mf.ID, merged)
-	httpx.NoContent(w)
+	return nil
+}
+
+func (h *Handler) removeExternalPluginBundle(canonicalID, requestedID string) error {
+	h.mu.RLock()
+	pluginsDir := h.pluginsDir
+	h.mu.RUnlock()
+	if pluginsDir == "" {
+		return nil
+	}
+
+	realRoot, err := filepath.EvalSymlinks(pluginsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("pluginadmin: resolve plugins dir: %w", err)
+	}
+	rootInfo, err := os.Stat(realRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if !rootInfo.IsDir() {
+		return nil
+	}
+
+	entries, err := os.ReadDir(realRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		candPath := filepath.Join(realRoot, entry.Name())
+		linfo, lerr := os.Lstat(candPath)
+		if lerr != nil || !linfo.IsDir() || linfo.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		realCand, rerr := filepath.EvalSymlinks(candPath)
+		if rerr != nil {
+			continue
+		}
+		if !isDirectChildDir(realRoot, realCand) {
+			continue
+		}
+		if !pluginDirMatchesID(realCand, entry.Name(), canonicalID, requestedID) {
+			continue
+		}
+		if err := os.RemoveAll(realCand); err != nil {
+			return fmt.Errorf("pluginadmin: remove plugin bundle %q: %w", entry.Name(), err)
+		}
+	}
+	return nil
+}
+
+func isDirectChildDir(realRoot, realCand string) bool {
+	rel, err := filepath.Rel(realRoot, realCand)
+	if err != nil {
+		return false
+	}
+	if rel == "" || rel == "." || rel == ".." || filepath.IsAbs(rel) {
+		return false
+	}
+	if strings.HasPrefix(rel, ".."+string(filepath.Separator)) || strings.ContainsRune(rel, filepath.Separator) {
+		return false
+	}
+	return true
+}
+
+func pluginDirMatchesID(realPluginDir, dirName, canonicalID, requestedID string) bool {
+	manifestPath := filepath.Join(realPluginDir, "manifest.json")
+	if linfo, err := os.Lstat(manifestPath); err == nil && linfo.Mode().IsRegular() {
+		if realManifest, rerr := filepath.EvalSymlinks(manifestPath); rerr == nil {
+			if rel, relErr := filepath.Rel(realPluginDir, realManifest); relErr == nil && rel == "manifest.json" {
+				if f, ferr := os.Open(realManifest); ferr == nil {
+					raw, readErr := io.ReadAll(io.LimitReader(f, maxUninstallManifestB+1))
+					_ = f.Close()
+					if readErr == nil && len(raw) <= maxUninstallManifestB {
+						var pm struct {
+							ID string `json:"Id"`
+						}
+						if json.Unmarshal(raw, &pm) == nil {
+							mID := strings.TrimSpace(pm.ID)
+							if mID == "" {
+								mID = dirName
+							}
+							return strings.EqualFold(mID, canonicalID) || strings.EqualFold(mID, requestedID)
+						}
+					}
+				}
+			}
+		}
+		return false
+	} else if err != nil && !os.IsNotExist(err) {
+		return false
+	} else if err == nil {
+		// Non-regular manifest.json (e.g. symlink or directory) — refuse match.
+		return false
+	}
+	return strings.EqualFold(dirName, canonicalID) || strings.EqualFold(dirName, requestedID)
 }
 
 func (h *Handler) loadSavedConfig(ctx context.Context, id string) (map[string]any, error) {

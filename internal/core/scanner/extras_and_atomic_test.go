@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
@@ -560,9 +561,17 @@ func TestScanPathSingleExtraReindexesParent(t *testing.T) {
 	}
 
 	// Verify LibraryChanged discovery events were published for both re-indexes.
-	evMu.Lock()
-	gotEvents := len(events)
-	evMu.Unlock()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	var gotEvents int
+	for {
+		evMu.Lock()
+		gotEvents = len(events)
+		evMu.Unlock()
+		if gotEvents >= 2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	if gotEvents < 2 {
 		t.Fatalf("expected at least 2 EventLibraryChanged events, got %d", gotEvents)
 	}

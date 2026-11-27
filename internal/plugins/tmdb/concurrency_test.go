@@ -82,7 +82,11 @@ func TestProvider_ConcurrentConfigureAndFetch_NoRace(t *testing.T) {
 				case 2:
 					_, _ = p.SearchCandidates(ctx, "Movie", "Test", 2020, "")
 				case 3:
-					_, _ = p.FetchImages(ctx, "Movie", "100")
+					_, _ = p.FetchImagesByTMDBID(ctx, "Movie", "100")
+					_, _ = p.FetchImages(ctx, plugins.MediaQuery{
+						ItemType:    "Movie",
+						ProviderIDs: map[string]string{"tmdb": "100"},
+					})
 				}
 			}
 		}(i)
