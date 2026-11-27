@@ -776,6 +776,9 @@ func (h *Handler) postDeviceCameraUploads(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Extend read deadline for potentially large camera uploads beyond the server's default ReadTimeout.
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(30 * time.Minute))
+
 	safeName, ext, err := validateCameraUploadFilename(q.Get("Name"))
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, err.Error())

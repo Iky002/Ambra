@@ -46,19 +46,19 @@ func TestDisabledUserNoOracleAndCaseInsensitiveUniqueCreate(t *testing.T) {
 		t.Fatalf("expected exactly 1 concurrent CreateUser to succeed, got %d", okCount)
 	}
 
-	// Disable Alice: wrong password (including empty password) MUST return ErrInvalidCredentials, NOT ErrUserDisabled!
+	// Disable Alice: wrong, empty, and valid passwords MUST all return ErrUserDisabled
+	// without verifying the stored password hash (no disabled-account password oracle).
 	u.IsDisabled = true
 	u.Policy.IsDisabled = true
 	if err := repo.UpdateUserPolicy(ctx, u.ID, u.Policy); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.AuthenticateByName(ctx, "Alice", "wrong-pass", "", ClientInfo{}); !errors.Is(err, ErrInvalidCredentials) {
-		t.Fatalf("disabled user with wrong password must return ErrInvalidCredentials, got %v", err)
+	if _, err := svc.AuthenticateByName(ctx, "Alice", "wrong-pass", "", ClientInfo{}); !errors.Is(err, ErrUserDisabled) {
+		t.Fatalf("disabled user with wrong password must return ErrUserDisabled (no password oracle), got %v", err)
 	}
-	if _, err := svc.AuthenticateByName(ctx, "Alice", "", "", ClientInfo{}); !errors.Is(err, ErrInvalidCredentials) {
-		t.Fatalf("disabled user with empty password must return ErrInvalidCredentials, got %v", err)
+	if _, err := svc.AuthenticateByName(ctx, "Alice", "", "", ClientInfo{}); !errors.Is(err, ErrUserDisabled) {
+		t.Fatalf("disabled user with empty password must return ErrUserDisabled (no password oracle), got %v", err)
 	}
-	// Disabled user with CORRECT password returns ErrUserDisabled.
 	if _, err := svc.AuthenticateByName(ctx, "Alice", "RealPass!1", "", ClientInfo{}); !errors.Is(err, ErrUserDisabled) {
 		t.Fatalf("disabled user with valid password must return ErrUserDisabled, got %v", err)
 	}

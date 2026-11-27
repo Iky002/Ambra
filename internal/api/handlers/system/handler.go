@@ -498,6 +498,7 @@ func (h *Handler) applyConfigurationUpdate(w http.ResponseWriter, r *http.Reques
 	}
 	tmdbChanged := false
 	strmChanged := false
+	remoteAccessChanged := false
 	proxiesChanged := false
 	subnetsChanged := false
 	originsChanged := false
@@ -575,6 +576,7 @@ func (h *Handler) applyConfigurationUpdate(w http.ResponseWriter, r *http.Reques
 		if v, ok := body["EnableRemoteAccess"].(bool); ok {
 			b := v
 			c.EnableRemoteAccessGlobal = &b
+			remoteAccessChanged = true
 		}
 		if raw, exists := body["AllowedOrigins"]; exists {
 			if list, ok := parseStringSliceField(raw); ok {
@@ -636,12 +638,17 @@ func (h *Handler) applyConfigurationUpdate(w http.ResponseWriter, r *http.Reques
 	if subnetsChanged {
 		netutil.SetLocalNetworkSubnets(newSubnets)
 	}
-	if originsChanged {
+	if originsChanged || remoteAccessChanged || subnetsChanged || proxiesChanged {
 		h.lifecycleMu.RLock()
 		wsHub := h.wsHub
 		h.lifecycleMu.RUnlock()
 		if wsHub != nil {
-			wsHub.SetAllowedOrigins(newOrigins)
+			if originsChanged {
+				wsHub.SetAllowedOrigins(newOrigins)
+			}
+			if remoteAccessChanged || subnetsChanged || proxiesChanged {
+				wsHub.DisconnectRemoteClients()
+			}
 		}
 	}
 
@@ -1086,14 +1093,20 @@ func (h *Handler) buildPublicInfo(r *http.Request) dto.PublicSystemInfo {
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
-	} else if strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
-		remoteHost := strings.TrimSpace(r.RemoteAddr)
-		if hPart, _, err := net.SplitHostPort(remoteHost); err == nil {
-			remoteHost = hPart
+	} else {
+		firstProto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto"))
+		if idx := strings.IndexByte(firstProto, ','); idx >= 0 {
+			firstProto = strings.TrimSpace(firstProto[:idx])
 		}
-		remoteHost = strings.Trim(remoteHost, "[]")
-		if addr, err := netip.ParseAddr(remoteHost); err == nil && netutil.IsTrustedProxyIP(addr) {
-			scheme = "https"
+		if strings.EqualFold(firstProto, "https") {
+			remoteHost := strings.TrimSpace(r.RemoteAddr)
+			if hPart, _, err := net.SplitHostPort(remoteHost); err == nil {
+				remoteHost = hPart
+			}
+			remoteHost = strings.Trim(remoteHost, "[]")
+			if addr, err := netip.ParseAddr(remoteHost); err == nil && netutil.IsTrustedProxyIP(addr) {
+				scheme = "https"
+			}
 		}
 	}
 	host := sanitizeRequestHost(r.Host, httpAddr)

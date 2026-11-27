@@ -34,7 +34,17 @@ const (
 	maxNotifications         = 500
 	maxAdminNotifications    = 200
 	notifHTTPDeliveryTimeout = 10 * time.Second
+	notifWorkerCount         = 4
+	notifQueueSize           = 128
 )
+
+type notifDispatchJob struct {
+	svc          configuredNotifService
+	evType       string
+	payloadBytes []byte
+	client       *http.Client
+	closeClient  bool
+}
 
 // AuthFuncs decouples route registration from the concrete middleware package.
 type AuthFuncs struct {
@@ -88,6 +98,7 @@ type Handler struct {
 	store            *sqlite.Store
 	auth             AuthFuncs
 	httpClient       *http.Client
+	publicHTTPClient *http.Client
 	customHTTPClient bool
 
 	dispatchMu     sync.Mutex
@@ -95,6 +106,7 @@ type Handler struct {
 	dispatchCtx    context.Context
 	dispatchCancel context.CancelFunc
 	dispatchWG     sync.WaitGroup
+	dispatchCh     chan notifDispatchJob
 
 	mu                   sync.RWMutex
 	state                notificationsState
@@ -106,12 +118,70 @@ func New(store *sqlite.Store) *Handler {
 	h := &Handler{
 		store:                store,
 		httpClient:           netutil.NewSafeHTTPClientNoLoopback(notifHTTPDeliveryTimeout, true),
+		publicHTTPClient:     netutil.NewSafeHTTPClient(notifHTTPDeliveryTimeout, false),
 		dispatchCtx:          ctx,
 		dispatchCancel:       cancel,
+		dispatchCh:           make(chan notifDispatchJob, notifQueueSize),
 		notifiedTaskFailures: make(map[string]struct{}),
 	}
+	h.startDispatchWorkersLocked()
 	h.loadState(context.Background())
 	return h
+}
+
+func (h *Handler) startDispatchWorkersLocked() {
+	if h.dispatchCh == nil || h.dispatchClosed {
+		return
+	}
+	ctx := h.dispatchCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ch := h.dispatchCh
+	h.dispatchWG.Add(notifWorkerCount)
+	for i := 0; i < notifWorkerCount; i++ {
+		go func() {
+			defer h.dispatchWG.Done()
+			for job := range ch {
+				if ctx.Err() != nil {
+					return
+				}
+				h.deliverNotificationJob(ctx, job)
+			}
+		}()
+	}
+}
+
+func (h *Handler) deliverNotificationJob(baseCtx context.Context, job notifDispatchJob) {
+	if job.closeClient && job.client != nil {
+		defer job.client.CloseIdleConnections()
+	}
+	client := job.client
+	if client == nil {
+		return
+	}
+	reqCtx, cancel := context.WithTimeout(baseCtx, notifHTTPDeliveryTimeout)
+	defer cancel()
+	targetURL := configuredServiceURL(job.svc.Options)
+	req, reqErr := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, bytes.NewReader(job.payloadBytes))
+	if reqErr != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Ambra-Notification", job.evType)
+	if secret := strings.TrimSpace(job.svc.Options["Secret"]); secret != "" {
+		mac := hmac.New(sha256.New, []byte(secret))
+		mac.Write(job.payloadBytes)
+		req.Header.Set("X-Ambra-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	} else if tok := strings.TrimSpace(job.svc.Options["Token"]); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	resp, doErr := client.Do(req)
+	if doErr != nil {
+		return
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 }
 
 // SetHTTPClient overrides the HTTP client used for outbound notification service delivery (primarily for testing).
@@ -135,10 +205,15 @@ func (h *Handler) Close() {
 	h.dispatchClosed = true
 	cancel := h.dispatchCancel
 	h.dispatchCancel = nil
+	ch := h.dispatchCh
+	h.dispatchCh = nil
 	h.dispatchMu.Unlock()
 
 	if cancel != nil {
 		cancel()
+	}
+	if ch != nil {
+		close(ch)
 	}
 	h.dispatchWG.Wait()
 }
@@ -620,14 +695,17 @@ func (h *Handler) dispatchConfiguredNotificationServices(ctx context.Context, n 
 	}
 
 	h.mu.RLock()
-	client := h.httpClient
+	adminClient := h.httpClient
+	publicClient := h.publicHTTPClient
 	customClient := h.customHTTPClient
 	h.mu.RUnlock()
-	if client == nil {
-		client = netutil.NewSafeHTTPClientNoLoopback(notifHTTPDeliveryTimeout, true)
-	}
 
-	var targets []configuredNotifService
+	type resolvedTarget struct {
+		svc         configuredNotifService
+		client      *http.Client
+		closeClient bool
+	}
+	var targets []resolvedTarget
 	for _, svc := range st.NotificationServices {
 		if !svc.Enabled {
 			continue
@@ -645,16 +723,40 @@ func (h *Handler) dispatchConfiguredNotificationServices(ctx context.Context, n 
 		if !matchesConfiguredEvents(svc.Events, eventName, n.Name) {
 			continue
 		}
+		isUserOwned := strings.TrimSpace(svc.UserId) != ""
+		var deliveryClient *http.Client
+		closeClient := false
 		if customClient {
 			if err := netutil.ValidateRemoteURL(targetURL, true); err != nil {
 				continue
+			}
+			deliveryClient = adminClient
+		} else if isUserOwned {
+			if err := netutil.ValidateRemoteURL(targetURL, false); err != nil {
+				continue
+			}
+			if publicClient != nil {
+				deliveryClient = publicClient
+			} else {
+				deliveryClient = netutil.NewSafeHTTPClient(notifHTTPDeliveryTimeout, false)
+				closeClient = true
 			}
 		} else {
 			if err := netutil.ValidateRemoteURLNoLoopback(targetURL, true); err != nil {
 				continue
 			}
+			if adminClient != nil {
+				deliveryClient = adminClient
+			} else {
+				deliveryClient = netutil.NewSafeHTTPClientNoLoopback(notifHTTPDeliveryTimeout, true)
+				closeClient = true
+			}
 		}
-		targets = append(targets, svc)
+		targets = append(targets, resolvedTarget{
+			svc:         svc,
+			client:      deliveryClient,
+			closeClient: closeClient,
+		})
 	}
 	if len(targets) == 0 {
 		return
@@ -683,41 +785,29 @@ func (h *Handler) dispatchConfiguredNotificationServices(ctx context.Context, n 
 		h.dispatchMu.Unlock()
 		return
 	}
-	baseCtx := h.dispatchCtx
-	if baseCtx == nil {
-		baseCtx = context.Background()
+	if h.dispatchCh == nil {
+		h.dispatchCh = make(chan notifDispatchJob, notifQueueSize)
+		h.startDispatchWorkersLocked()
 	}
-	h.dispatchWG.Add(len(targets))
+	ch := h.dispatchCh
+	for _, t := range targets {
+		job := notifDispatchJob{
+			svc:          t.svc,
+			evType:       evType,
+			payloadBytes: payloadBytes,
+			client:       t.client,
+			closeClient:  t.closeClient,
+		}
+		select {
+		case ch <- job:
+		default:
+			if t.closeClient && t.client != nil {
+				t.client.CloseIdleConnections()
+			}
+			slog.Warn("notifications: dispatch queue full; dropping outbound notification", "service_id", t.svc.Id, "event", evType)
+		}
+	}
 	h.dispatchMu.Unlock()
-
-	for _, svc := range targets {
-		svcCopy := svc
-		go func() {
-			defer h.dispatchWG.Done()
-			reqCtx, cancel := context.WithTimeout(baseCtx, notifHTTPDeliveryTimeout)
-			defer cancel()
-			targetURL := configuredServiceURL(svcCopy.Options)
-			req, reqErr := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, bytes.NewReader(payloadBytes))
-			if reqErr != nil {
-				return
-			}
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("X-Ambra-Notification", evType)
-			if secret := strings.TrimSpace(svcCopy.Options["Secret"]); secret != "" {
-				mac := hmac.New(sha256.New, []byte(secret))
-				mac.Write(payloadBytes)
-				req.Header.Set("X-Ambra-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
-			} else if tok := strings.TrimSpace(svcCopy.Options["Token"]); tok != "" {
-				req.Header.Set("Authorization", "Bearer "+tok)
-			}
-			resp, doErr := client.Do(req)
-			if doErr != nil {
-				return
-			}
-			defer resp.Body.Close()
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		}()
-	}
 }
 
 func (h *Handler) trimNotificationsLocked() {

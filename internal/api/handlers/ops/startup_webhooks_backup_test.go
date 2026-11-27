@@ -102,7 +102,18 @@ func TestOpsStartupWizardUnifiedStateMachineAndRateLimit(t *testing.T) {
 	if snap.ServerName != "Unified Ambra" || snap.TMDBLanguage != "ja-JP" || snap.IsGlobalRemoteAccessEnabled() {
 		t.Fatalf("expected global config updated from Startup endpoints, got %+v", snap)
 	}
-	getCfg := doAuthReq(t, mux, nil, http.MethodGet, "/Startup/Configuration", nil)
+	// WAN request to /Startup/Configuration must be denied (403) when EnableRemoteAccess=false
+	if wanRec := doAuthReq(t, mux, nil, http.MethodGet, "/Startup/Configuration", nil); wanRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for WAN GET /Startup/Configuration when EnableRemoteAccess=false, got %d", wanRec.Code)
+	}
+	localGetCfg := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/Startup/Configuration", nil)
+		req.RemoteAddr = "127.0.0.1:12345"
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec
+	}
+	getCfg := localGetCfg()
 	var gotStartup StartupConfiguration
 	_ = json.Unmarshal(getCfg.Body.Bytes(), &gotStartup)
 	if gotStartup.UICulture != "ja-JP" || gotStartup.MetadataCountryCode != "JP" {
@@ -111,7 +122,7 @@ func TestOpsStartupWizardUnifiedStateMachineAndRateLimit(t *testing.T) {
 
 	// 5. H-06: Even if 0 users exist, once IsStartupWizardCompleted is true, /Startup/* requires Admin (401 unauthenticated)
 	cfg.Update(func(c *config.Config) { c.IsStartupWizardCompleted = true })
-	if rec := doAuthReq(t, mux, nil, http.MethodGet, "/Startup/Configuration", nil); rec.Code != http.StatusUnauthorized {
+	if rec := localGetCfg(); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 when IsStartupWizardCompleted=true even with 0 users, got %d", rec.Code)
 	}
 }

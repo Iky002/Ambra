@@ -7,7 +7,9 @@ import (
 	"io"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -21,6 +23,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -1224,14 +1227,114 @@ func maskNotificationServiceConfig(svc NotificationServiceConfig) NotificationSe
 	return cp
 }
 
+func isNotificationURLOptionKey(k string) bool {
+	switch strings.ToLower(strings.TrimSpace(k)) {
+	case "url", "webhookurl", "endpoint":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizedNotificationURLOrigin(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return ""
+	}
+	port := u.Port()
+	if port == "" {
+		switch scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	}
+	if port != "" {
+		return scheme + "://" + net.JoinHostPort(host, port)
+	}
+	return scheme + "://" + host
+}
+
+func notificationOptionPrimaryOrigin(opts map[string]string) (string, bool) {
+	if opts == nil {
+		return "", false
+	}
+	for _, k := range []string{"Url", "url", "WebhookUrl", "webhookUrl", "Endpoint", "endpoint"} {
+		if v := strings.TrimSpace(opts[k]); v != "" && v != maskedOptionValue {
+			return normalizedNotificationURLOrigin(v), true
+		}
+	}
+	for k, v := range opts {
+		if isNotificationURLOptionKey(k) {
+			if trimmed := strings.TrimSpace(v); trimmed != "" && trimmed != maskedOptionValue {
+				return normalizedNotificationURLOrigin(trimmed), true
+			}
+		}
+	}
+	return "", false
+}
+
+func notificationOriginChanged(prev, incoming map[string]string) bool {
+	if prev == nil || incoming == nil {
+		return false
+	}
+	prevOrigin, prevHasURL := notificationOptionPrimaryOrigin(prev)
+	if !prevHasURL {
+		return false
+	}
+	for k, v := range incoming {
+		if !isNotificationURLOptionKey(k) {
+			continue
+		}
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" || trimmed == maskedOptionValue {
+			continue
+		}
+		incOrigin := normalizedNotificationURLOrigin(trimmed)
+		if incOrigin == "" || incOrigin != prevOrigin {
+			return true
+		}
+	}
+	return false
+}
+
+func validateNotificationServiceURLs(opts map[string]string, isAdmin bool) error {
+	for k, v := range opts {
+		if !isNotificationURLOptionKey(k) {
+			continue
+		}
+		u := strings.TrimSpace(v)
+		if u == "" {
+			continue
+		}
+		if isAdmin {
+			if err := netutil.ValidateRemoteURLNoLoopback(u, true); err != nil {
+				return err
+			}
+		} else {
+			if err := netutil.ValidateRemoteURL(u, false); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func mergeNotificationOptions(prev, incoming map[string]string) map[string]string {
 	if incoming == nil {
 		return nil
 	}
+	originChanged := notificationOriginChanged(prev, incoming)
 	out := make(map[string]string, len(incoming))
 	for k, v := range incoming {
 		if isSensitiveNotificationOptionKey(k) && strings.TrimSpace(v) == maskedOptionValue {
-			if prev != nil {
+			if !originChanged && prev != nil {
 				if oldVal := prev[k]; strings.TrimSpace(oldVal) != "" {
 					out[k] = oldVal
 				}
@@ -1241,6 +1344,32 @@ func mergeNotificationOptions(prev, incoming map[string]string) map[string]strin
 		out[k] = v
 	}
 	return out
+}
+
+// PurgeUser removes configured notification services owned by userID and persists the state.
+func (h *Handler) PurgeUser(ctx context.Context, userID string) {
+	norm := guid.Normalize(userID)
+	if norm == "" {
+		return
+	}
+	h.mu.Lock()
+	snapshot := cloneCompatExtState(h.state)
+	changed := false
+	kept := make([]NotificationServiceConfig, 0, len(h.state.NotificationServices))
+	for _, svc := range h.state.NotificationServices {
+		if svc.UserId != "" && guid.Normalize(svc.UserId) == norm {
+			changed = true
+			continue
+		}
+		kept = append(kept, svc)
+	}
+	if changed {
+		h.state.NotificationServices = kept
+		if err := h.saveStateLocked(ctx); err != nil {
+			h.state = snapshot
+		}
+	}
+	h.mu.Unlock()
 }
 
 func (h *Handler) handleGetConfiguredNotifications(w http.ResponseWriter, r *http.Request) {
@@ -1301,8 +1430,8 @@ func (h *Handler) handleSaveConfiguredNotification(w http.ResponseWriter, r *htt
 	}
 
 	h.mu.Lock()
-	snapshot := cloneCompatExtState(h.state)
-	updated := false
+	var prevOpts map[string]string
+	existingIdx := -1
 	for i := range h.state.NotificationServices {
 		if h.state.NotificationServices[i].Id == svc.Id {
 			if !isAdmin && callerID != "" && guid.Normalize(h.state.NotificationServices[i].UserId) != callerID {
@@ -1310,13 +1439,23 @@ func (h *Handler) handleSaveConfiguredNotification(w http.ResponseWriter, r *htt
 				httpx.Error(w, http.StatusForbidden, "access denied")
 				return
 			}
-			svc.Options = mergeNotificationOptions(h.state.NotificationServices[i].Options, svc.Options)
-			h.state.NotificationServices[i] = svc
-			updated = true
+			existingIdx = i
+			prevOpts = h.state.NotificationServices[i].Options
 			break
 		}
 	}
-	if !updated {
+	mergedOpts := mergeNotificationOptions(prevOpts, svc.Options)
+	if err := validateNotificationServiceURLs(mergedOpts, isAdmin); err != nil {
+		h.mu.Unlock()
+		httpx.Error(w, http.StatusBadRequest, "invalid notification service URL: "+err.Error())
+		return
+	}
+	svc.Options = mergedOpts
+
+	snapshot := cloneCompatExtState(h.state)
+	if existingIdx >= 0 {
+		h.state.NotificationServices[existingIdx] = svc
+	} else {
 		if len(h.state.NotificationServices) >= maxNotificationServices {
 			h.mu.Unlock()
 			httpx.Error(w, http.StatusBadRequest, "notification services limit reached")
@@ -1335,7 +1474,6 @@ func (h *Handler) handleSaveConfiguredNotification(w http.ResponseWriter, r *htt
 				return
 			}
 		}
-		svc.Options = mergeNotificationOptions(nil, svc.Options)
 		h.state.NotificationServices = append(h.state.NotificationServices, svc)
 	}
 	saveErr := h.saveStateLocked(r.Context())
