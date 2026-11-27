@@ -354,20 +354,21 @@ func StartLoopbackStreamProxy(opts LoopbackProxyOptions) (*LoopbackStreamProxy, 
 			}
 
 			sameHost := isSameOriginHost(subParsed, parsedTarget)
-			// Cross-origin sub-resources (e.g. #EXT-X-KEY pointing to 127.0.0.1:9999) must ALWAYS block loopback,
-			// even in unit tests where initial TargetURL is an httptest server on 127.0.0.1:<port>.
+			// Cross-origin sub-resources (e.g. #EXT-X-KEY or segment pointing to 127.0.0.1:9999 or RFC1918 LAN)
+			// must ALWAYS block both loopback and private LAN, even when opts.AllowPrivateLAN is true.
 			disallowSubLoopback := opts.DisallowLoopback || !sameHost
+			allowSubPrivateLAN := opts.AllowPrivateLAN && sameHost
 
 			subHTTPClient := client
 			if opts.Client == nil && !sameHost {
 				var subErr error
-				subHTTPClient, subErr = newSafeSubResourceClient(reqCtx, subHost, opts.AllowPrivateLAN, disallowSubLoopback, sanitizedHeaders)
+				subHTTPClient, subErr = newSafeSubResourceClient(reqCtx, subHost, allowSubPrivateLAN, disallowSubLoopback, sanitizedHeaders)
 				if subErr != nil {
 					http.Error(w, "blocked upstream sub-resource", http.StatusForbidden)
 					return
 				}
 				defer subHTTPClient.CloseIdleConnections()
-			} else if _, pinErr := resolveAndPinHost(reqCtx, subHost, opts.AllowPrivateLAN, !disallowSubLoopback); pinErr != nil {
+			} else if _, pinErr := resolveAndPinHost(reqCtx, subHost, allowSubPrivateLAN, !disallowSubLoopback); pinErr != nil {
 				http.Error(w, "blocked upstream sub-resource", http.StatusForbidden)
 				return
 			}
@@ -762,11 +763,6 @@ func newPinnedClientWithPublicFallback(ctx context.Context, initialHost string, 
 
 	baseCheckRedirect := baseClient.CheckRedirect
 	baseClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if baseCheckRedirect != nil {
-			if err := baseCheckRedirect(req, via); err != nil {
-				return err
-			}
-		}
 		if req.URL == nil {
 			return errors.New("redirect target url is nil")
 		}
@@ -774,6 +770,16 @@ func newPinnedClientWithPublicFallback(ctx context.Context, initialHost string, 
 			prev := via[len(via)-1].URL
 			if !strings.EqualFold(prev.Host, req.URL.Host) {
 				stripCrossHostRedirectHeaders(req, sanitizedHeaders)
+			}
+		}
+		if baseCheckRedirect != nil {
+			if err := baseCheckRedirect(req, via); err != nil {
+				return err
+			}
+		}
+		if len(via) > 0 && via[len(via)-1].URL != nil {
+			prev := via[len(via)-1].URL
+			if !strings.EqualFold(prev.Host, req.URL.Host) {
 				// Cross-host redirects must NEVER target private LAN, loopback, or cloud metadata.
 				if err := netutil.ValidateRemoteURLNoLoopback(req.URL.String(), false); err != nil {
 					return fmt.Errorf("blocked redirect to non-public address: %w", err)

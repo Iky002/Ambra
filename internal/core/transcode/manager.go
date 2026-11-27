@@ -1813,6 +1813,7 @@ func downloadRemoteSubtitleAtomic(rawURL, dst string, client *http.Client) error
 			return err
 		}
 		client = netutil.NewSafeHTTPClient(remoteSubtitleDownloadTimeout, true)
+		defer client.CloseIdleConnections()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), remoteSubtitleDownloadTimeout)
 	defer cancel()

@@ -194,4 +194,14 @@ printf 'AUDIO-TS-SEG-0' > "$dir/seg_0.ts"
 	if rec := doAs(http.MethodHead, "/Audio/"+song.ID+"/universal?Container=flac"); rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 on HEAD /Audio/{Id}/universal direct play when slot occupied, got %d", rec.Code)
 	}
+	if rec := doAs(http.MethodGet, "/Audio/"+song.ID+"/main.m3u8?AudioCodec=aac&PlaySessionId=second-sess"); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on GET /Audio/{Id}/main.m3u8 for second session when slot occupied, got %d", rec.Code)
+	}
+	if rec := doAs(http.MethodHead, "/Audio/"+song.ID+"/main.m3u8?AudioCodec=aac&PlaySessionId=second-sess"); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on HEAD /Audio/{Id}/main.m3u8 even when slot occupied, got %d", rec.Code)
+	}
+	if rec := doAs(http.MethodHead, "/Audio/"+song.ID+"/master.m3u8?AudioCodec=aac&PlaySessionId=second-sess"); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on HEAD /Audio/{Id}/master.m3u8 even when slot occupied, got %d", rec.Code)
+	}
 }
+

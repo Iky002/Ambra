@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/core/transcode"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
@@ -164,3 +165,163 @@ func TestAuditWave1_H03_H04_H05_H08_DLNAUserPolicyAndStrmProxyXSS(t *testing.T) 
 			okRec.Code, okRec.Header().Get("Content-Type"), okRec.Header().Get("Content-Security-Policy"))
 	}
 }
+
+func TestDLNATranscodePolicyModeTokenAndDirectStreamLimit(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(tmp, "dlna_tc_limits.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	libRepo := sqlite.NewLibraryRepo(store)
+	userRepo := sqlite.NewUserRepo(store)
+	cfg := config.Default(tmp)
+	cfg.EnableDLNA = true
+
+	mgr := transcode.NewManager(cfg, transcode.WithCapabilities(transcode.SoftwareOnlyCapabilities()))
+	defer mgr.Close()
+
+	mediaLib, _ := libRepo.CreateLibrary(ctx, "Media", "movies", []string{tmp})
+
+	vidFile := filepath.Join(tmp, "clip.mp4")
+	_ = os.WriteFile(vidFile, []byte("LOCAL-VIDEO-BYTES"), 0o644)
+	audFile := filepath.Join(tmp, "song.mp3")
+	_ = os.WriteFile(audFile, []byte("LOCAL-AUDIO-BYTES"), 0o644)
+	photoFile := filepath.Join(tmp, "pic.jpg")
+	_ = os.WriteFile(photoFile, []byte("LOCAL-PHOTO-BYTES"), 0o644)
+
+	upstreamStrm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write([]byte("REMOTE-STRM-BYTES"))
+	}))
+	defer upstreamStrm.Close()
+	strmFile := filepath.Join(tmp, "remote.strm")
+	_ = os.WriteFile(strmFile, []byte(upstreamStrm.URL+"/video.mp4\n"), 0o644)
+
+	vidItem := &sqlite.ItemRecord{
+		ID: guid.New(), LibraryID: mediaLib.ID, ParentID: mediaLib.ID,
+		Type: "Movie", MediaType: "Video", Name: "Clip", OfficialRating: "G", Container: "mp4", Path: vidFile,
+	}
+	audItem := &sqlite.ItemRecord{
+		ID: guid.New(), LibraryID: mediaLib.ID, ParentID: mediaLib.ID,
+		Type: "Audio", MediaType: "Audio", Name: "Song", OfficialRating: "G", Container: "mp3", Path: audFile,
+	}
+	photoItem := &sqlite.ItemRecord{
+		ID: guid.New(), LibraryID: mediaLib.ID, ParentID: mediaLib.ID,
+		Type: "Photo", MediaType: "Photo", Name: "Pic", OfficialRating: "G", Container: "jpg", Path: photoFile,
+	}
+	strmItem := &sqlite.ItemRecord{
+		ID: guid.New(), LibraryID: mediaLib.ID, ParentID: mediaLib.ID,
+		Type: "Movie", MediaType: "Video", Name: "Remote", OfficialRating: "G", IsStrm: true, Container: "strm", Path: strmFile,
+	}
+	for _, it := range []*sqlite.ItemRecord{vidItem, audItem, photoItem, strmItem} {
+		if err := libRepo.UpsertItem(ctx, it); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	noVidTC := sqlite.DefaultUserPolicy(false)
+	noVidTC.EnableVideoPlaybackTranscoding = false
+	noVidUser := &sqlite.UserRecord{ID: guid.New(), Name: "no_vid_tc", Policy: noVidTC, Config: sqlite.DefaultUserConfig()}
+
+	noAudTC := sqlite.DefaultUserPolicy(false)
+	noAudTC.EnableAudioPlaybackTranscoding = false
+	noAudUser := &sqlite.UserRecord{ID: guid.New(), Name: "no_aud_tc", Policy: noAudTC, Config: sqlite.DefaultUserConfig()}
+
+	_ = userRepo.CreateUser(ctx, noVidUser)
+	_ = userRepo.CreateUser(ctx, noAudUser)
+
+	h := New(cfg, libRepo, store)
+	h.SetUserRepo(userRepo)
+	h.SetTranscodeManager(mgr)
+	h.SetProxyClient(upstreamStrm.Client())
+	h.SetStreamResolverWithHeaders(func(_ context.Context, _ string) (*plugins.StreamResolveResult, error) {
+		return &plugins.StreamResolveResult{URL: upstreamStrm.URL + "/video.mp4"}, nil
+	})
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, AuthFuncs{})
+
+	exp := time.Now().UTC().Add(15 * time.Minute).Unix()
+	doDLNA := func(method, itemID, sig, extraQuery string) *httptest.ResponseRecorder {
+		u := fmt.Sprintf("/Dlna/srv-uuid/stream/%s?exp=%d&sig=%s%s", itemID, exp, sig, extraQuery)
+		req := httptest.NewRequest(method, u, nil)
+		req.RemoteAddr = "192.168.1.30:54321"
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. EnableVideoPlaybackTranscoding=false blocks video transcode=1 (403) while allowing direct video & audio transcode HEAD.
+	h.SetDefaultUserID(noVidUser.ID)
+	vidSig := h.signStreamToken(vidItem.ID, exp)
+	if rec := doDLNA(http.MethodGet, vidItem.ID, vidSig, ""); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 direct video when video transcoding disabled, got %d", rec.Code)
+	}
+	if rec := doDLNA(http.MethodGet, vidItem.ID, vidSig, "&transcode=1"); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 on video transcode=1 when EnableVideoPlaybackTranscoding=false, got %d", rec.Code)
+	}
+	audSig := h.signStreamToken(audItem.ID, exp)
+	if rec := doDLNA(http.MethodHead, audItem.ID, audSig, "&transcode=1"); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 HEAD on audio transcode=1 when EnableAudioPlaybackTranscoding=true, got %d", rec.Code)
+	}
+
+	// 2. EnableAudioPlaybackTranscoding=false blocks audio transcode=1 (403) while allowing direct audio.
+	h.SetDefaultUserID(noAudUser.ID)
+	if rec := doDLNA(http.MethodGet, audItem.ID, audSig, ""); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 direct audio when audio transcoding disabled, got %d", rec.Code)
+	}
+	if rec := doDLNA(http.MethodGet, audItem.ID, audSig, "&transcode=1"); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 on audio transcode=1 when EnableAudioPlaybackTranscoding=false, got %d", rec.Code)
+	}
+
+	// 3. Photo item rejects transcode=1 with 403 even for unrestricted admin/default policy.
+	h.SetDefaultUserID("")
+	h.SetUserRepo(nil)
+	photoSig := h.signStreamToken(photoItem.ID, exp)
+	if rec := doDLNA(http.MethodGet, photoItem.ID, photoSig, "&transcode=1"); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 on photo transcode=1, got %d", rec.Code)
+	}
+
+	// 4. Mode-scoped stream token enforces exact transcode flag when strict verification is used.
+	directOnlySig := h.signStreamTokenForMode(vidItem.ID, exp, false)
+	if !h.verifyStreamTokenForMode(vidItem.ID, fmt.Sprint(exp), directOnlySig, false, false) {
+		t.Fatal("expected direct-scoped token to pass direct verification")
+	}
+	if h.verifyStreamTokenForMode(vidItem.ID, fmt.Sprint(exp), directOnlySig, true, false) {
+		t.Fatal("expected direct-scoped token to reject transcode=true verification")
+	}
+	if rec := doDLNA(http.MethodGet, vidItem.ID, directOnlySig, "&transcode=1"); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when direct-only scoped token is used with transcode=1, got %d", rec.Code)
+	}
+
+	// 5. SimultaneousStreamLimit enforced on non-HEAD direct local file and .strm streams, while HEAD still passes.
+	cfg.SimultaneousStreamLimit = 1
+	relOccupied, ok := mgr.TryAcquireStreamSlot(1, "occupied-slot-1")
+	if !ok {
+		t.Fatal("failed to pre-acquire stream slot")
+	}
+	strmSig := h.signStreamToken(strmItem.ID, exp)
+	if rec := doDLNA(http.MethodGet, vidItem.ID, vidSig, ""); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on DLNA direct file GET when SimultaneousStreamLimit=1 full, got %d", rec.Code)
+	}
+	if rec := doDLNA(http.MethodGet, strmItem.ID, strmSig, ""); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on DLNA .strm proxy GET when SimultaneousStreamLimit=1 full, got %d", rec.Code)
+	}
+	if rec := doDLNA(http.MethodHead, vidItem.ID, vidSig, ""); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on DLNA direct file HEAD even when stream slots full, got %d", rec.Code)
+	}
+	if rec := doDLNA(http.MethodHead, strmItem.ID, strmSig, ""); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on DLNA .strm proxy HEAD even when stream slots full, got %d", rec.Code)
+	}
+	relOccupied()
+
+	if rec := doDLNA(http.MethodGet, vidItem.ID, vidSig, ""); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on DLNA direct file GET after slot released, got %d", rec.Code)
+	}
+	if rec := doDLNA(http.MethodGet, strmItem.ID, strmSig, ""); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on DLNA .strm proxy GET after slot released, got %d", rec.Code)
+	}
+}
+

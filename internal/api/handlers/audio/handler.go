@@ -975,13 +975,15 @@ func (h *Handler) handleAudioHLSPlaylist(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	if h.cfg != nil && h.transcodeMgr != nil {
-		if limit := h.cfg.Snapshot().SimultaneousStreamLimit; limit > 0 {
-			releaseSlot, allowed := h.transcodeMgr.TryAcquireStreamSlot(limit, transcode.SessionKey(params))
-			if !allowed {
-				httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
-				return
+		if r.Method != http.MethodHead {
+			if limit := h.cfg.Snapshot().SimultaneousStreamLimit; limit > 0 {
+				releaseSlot, allowed := h.transcodeMgr.TryAcquireStreamSlot(limit, transcode.SessionKey(params))
+				if !allowed {
+					httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
+					return
+				}
+				defer releaseSlot()
 			}
-			defer releaseSlot()
 		}
 		// [L-04] Do not pre-register idle transcode sessions on master.m3u8 or HEAD probes.
 		if playlistFile != "master.m3u8" && r.Method != http.MethodHead {
@@ -1509,6 +1511,7 @@ func (h *Handler) proxyRemoteAudioWithHeaders(w http.ResponseWriter, r *http.Req
 	client := h.httpClient
 	if client == nil {
 		client = netutil.NewSafeHTTPClient(0, true)
+		defer client.CloseIdleConnections()
 	}
 	resp, err := client.Do(upReq)
 	if err != nil {

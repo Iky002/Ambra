@@ -1150,7 +1150,12 @@ func (h *Handler) proxyRemoteMediaWithHeaders(w http.ResponseWriter, r *http.Req
 		upReq.Header.Set("User-Agent", ua)
 	}
 
-	resp, err := h.httpClient.Do(upReq)
+	client := h.httpClient
+	if client == nil {
+		client = netutil.NewSafeHTTPClient(0, true)
+		defer client.CloseIdleConnections()
+	}
+	resp, err := client.Do(upReq)
 	if err != nil {
 		slog.Error("upstream stream request failed", "url", targetURL, "error", err)
 		httpx.Error(w, http.StatusBadGateway, "upstream stream error")
