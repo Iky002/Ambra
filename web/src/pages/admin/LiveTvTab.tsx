@@ -344,6 +344,12 @@ export function LiveTvTab() {
           }),
         },
       )
+      setDraftMappings((prev) => {
+        if (!(tunerChannelId in prev)) return prev
+        const next = { ...prev }
+        delete next[tunerChannelId]
+        return next
+      })
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['admin', 'liveTv', 'channelMappingOptions'] }),
         queryClient.invalidateQueries({ queryKey: ['admin', 'liveTv', 'channels'] }),
@@ -966,7 +972,10 @@ export function LiveTvTab() {
                 <button
                   type="button"
                   data-testid="refresh-channel-mappings-btn"
-                  onClick={() => void refetchMappingOptions()}
+                  onClick={() => {
+                    setDraftMappings({})
+                    void refetchMappingOptions()
+                  }}
                   className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-amber-400/40 hover:text-amber-300"
                 >
                   <RefreshCw className={`h-3.5 w-3.5 ${mappingFetching ? 'animate-spin' : ''}`} />

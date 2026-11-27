@@ -10,6 +10,7 @@ import {
 } from 'react'
 import { api, getAudioStreamUrl, getStoredAuth } from '../api/client'
 import type { BaseItemDto } from '../api/types'
+import { useI18n } from '../i18n/I18nContext'
 import { useAuth } from './AuthContext'
 import { useWebSocket } from './WebSocketContext'
 
@@ -88,6 +89,9 @@ function isAbortError(err: unknown): boolean {
 export function AudioPlayerProvider({ children }: { children: ReactNode }) {
   const { auth } = useAuth()
   const { subscribePlaystate } = useWebSocket()
+  const { t } = useI18n()
+  const tRef = useRef(t)
+  tRef.current = t
   const authUserId = auth?.userId ?? null
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const playSeqRef = useRef<number>(0)
@@ -126,8 +130,8 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
           setIsPlaying(false)
           const msg =
             err instanceof Error && err.message
-              ? `音频播放失败：${err.message}`
-              : '音频播放被拦截或加载失败，请点击重试'
+              ? tRef.current('audio.playbackFailed', { message: err.message })
+              : tRef.current('audio.playbackBlockedOrFailed')
           setPlaybackError(msg)
         })
     } else {
@@ -704,7 +708,7 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
         onPause={() => setIsPlaying(false)}
         onError={() => {
           setIsPlaying(false)
-          setPlaybackError('音频流加载失败，请检查网络连接或点击重试')
+          setPlaybackError(tRef.current('audio.streamLoadFailed'))
         }}
         onEnded={handleEnded}
       />

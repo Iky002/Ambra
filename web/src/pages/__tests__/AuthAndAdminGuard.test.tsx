@@ -1,11 +1,11 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from '../../App'
-import { saveAuth } from '../../api/client'
-import { AuthProvider } from '../../context/AuthContext'
+import { getAuthStorageKey, saveAuth } from '../../api/client'
+import { AuthProvider, useAuth } from '../../context/AuthContext'
 import { LoginPage } from '../LoginPage'
 
 function jsonRes(data: unknown, status = 200) {
@@ -230,5 +230,83 @@ describe('App RBAC 路由守卫 - /admin 访问控制', () => {
     expect(screen.getByText('媒体库管理')).toBeInTheDocument()
     expect(await screen.findByText('Ambra Production')).toBeInTheDocument()
     expect(screen.queryByText('无权访问管理控制台')).not.toBeInTheDocument()
+  })
+
+  it('跨标签页 storage 事件轮换同一 userId 的 accessToken 时触发 refreshUser 且 userLoading 恢复为 false', async () => {
+    saveAuth({
+      accessToken: 'tok-v1',
+      userId: 'user-same-1',
+      serverId: 'srv-1',
+      userName: 'Alice',
+      isAdmin: false,
+      deviceId: 'dev-1',
+    })
+
+    let userFetchCount = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input)
+      if (url === '/emby/Users/user-same-1') {
+        userFetchCount += 1
+        return jsonRes({
+          Id: 'user-same-1',
+          Name: userFetchCount >= 2 ? 'Alice Refreshed' : 'Alice',
+          ServerId: 'srv-1',
+          Policy: { IsAdministrator: false },
+        })
+      }
+      return jsonRes({})
+    })
+
+    function AuthProbe() {
+      const { auth, user, userLoading } = useAuth()
+      return (
+        <div>
+          <span data-testid="probe-token">{auth?.accessToken ?? ''}</span>
+          <span data-testid="probe-user">{user?.Name ?? ''}</span>
+          <span data-testid="probe-loading">{String(userLoading)}</span>
+        </div>
+      )
+    }
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={qc}>
+        <AuthProvider>
+          <AuthProbe />
+        </AuthProvider>
+      </QueryClientProvider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-loading').textContent).toBe('false')
+      expect(screen.getByTestId('probe-user').textContent).toBe('Alice')
+    })
+    expect(userFetchCount).toBe(1)
+
+    // 模拟另一个标签页轮换同一 userId 的 accessToken 并触发 storage 事件
+    saveAuth({
+      accessToken: 'tok-v2-rotated',
+      userId: 'user-same-1',
+      serverId: 'srv-1',
+      userName: 'Alice',
+      isAdmin: false,
+      deviceId: 'dev-1',
+    })
+
+    act(() => {
+      window.dispatchEvent(
+        new StorageEvent('storage', {
+          key: getAuthStorageKey(),
+          newValue: localStorage.getItem(getAuthStorageKey()),
+        }),
+      )
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-token').textContent).toBe('tok-v2-rotated')
+      expect(screen.getByTestId('probe-user').textContent).toBe('Alice Refreshed')
+      expect(screen.getByTestId('probe-loading').textContent).toBe('false')
+    })
+    expect(userFetchCount).toBe(2)
   })
 })

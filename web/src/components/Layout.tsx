@@ -149,7 +149,7 @@ export function Layout() {
         <button
           type="button"
           onClick={() => setMobileOpen(false)}
-          aria-label="关闭侧边栏菜单"
+          aria-label={t('nav.closeSidebarMenu')}
           className="rounded-lg p-1.5 text-zinc-400 hover:bg-white/8 hover:text-zinc-100 lg:hidden"
         >
           <X className="h-5 w-5" />
@@ -345,7 +345,7 @@ export function Layout() {
             <button
               type="button"
               onClick={() => setMobileOpen(true)}
-              aria-label="打开导航菜单"
+              aria-label={t('nav.openNavMenu')}
               className="rounded-xl p-2 text-zinc-400 hover:bg-white/8 hover:text-zinc-100 lg:hidden"
             >
               <Menu className="h-5 w-5" />

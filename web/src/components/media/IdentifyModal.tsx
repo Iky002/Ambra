@@ -104,7 +104,7 @@ export function IdentifyModal({
         queryClient.invalidateQueries({ queryKey: ['item'] }),
         queryClient.invalidateQueries({ queryKey: ['item', item.Id] }),
         queryClient.invalidateQueries({ queryKey: ['item-images', item.Id] }),
-        queryClient.invalidateQueries({ queryKey: ['items'] }),
+        queryClient.invalidateQueries({ queryKey: ['libraryItems'] }),
         queryClient.invalidateQueries({ queryKey: ['latestItems'] }),
         queryClient.invalidateQueries({ queryKey: ['admin-metadata-items'] }),
       ])

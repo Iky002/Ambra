@@ -34,25 +34,25 @@ function resolveSafeInternalUrl(raw?: string): string | null {
   return null
 }
 
-function getLevelPresentation(level: string) {
+function getLevelPresentation(level: string, t: (key: string) => string) {
   switch (level) {
     case 'Error':
       return {
         icon: AlertCircle,
         iconClass: 'bg-red-500/15 text-red-400 ring-1 ring-red-500/30',
-        label: '严重告警',
+        label: t('notifications.levelCritical'),
       }
     case 'Warning':
       return {
         icon: AlertTriangle,
         iconClass: 'bg-amber-500/15 text-amber-400 ring-1 ring-amber-500/30',
-        label: '警告提醒',
+        label: t('notifications.levelWarning'),
       }
     default:
       return {
         icon: Info,
         iconClass: 'bg-sky-500/15 text-sky-400 ring-1 ring-sky-500/30',
-        label: '系统通知',
+        label: t('notifications.levelNormal'),
       }
   }
 }
@@ -118,7 +118,7 @@ export function NotificationBell() {
       await invalidateNotifications()
     },
     onError: (err) => {
-      setComposeError(err instanceof Error ? err.message : '发送公告失败，请稍后重试')
+      setComposeError(err instanceof Error ? err.message : t('notifications.sendFailed'))
     },
   })
 
@@ -163,7 +163,7 @@ export function NotificationBell() {
     e.preventDefault()
     const trimmedName = announceName.trim()
     if (!trimmedName) {
-      setComposeError('请输入公告标题')
+      setComposeError(t('notifications.errTitleRequired'))
       return
     }
     setComposeError(null)
@@ -214,7 +214,7 @@ export function NotificationBell() {
               <h2 className="text-sm font-semibold text-zinc-100">{t('notifications.title')}</h2>
               {unreadCount > 0 && (
                 <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-300">
-                  {unreadCount} 未读
+                  {t('notifications.unreadCount', { count: unreadCount })}
                 </span>
               )}
             </div>
@@ -234,7 +234,7 @@ export function NotificationBell() {
                   }`}
                 >
                   <Megaphone className="h-3.5 w-3.5" />
-                  <span>发送全员公告</span>
+                  <span>{t('notifications.sendBroadcast')}</span>
                 </button>
               )}
 
@@ -260,10 +260,12 @@ export function NotificationBell() {
               className="space-y-2.5 border-b border-white/8 bg-white/[0.02] p-3.5"
             >
               <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-amber-300">发送全员公告</span>
+                <span className="text-xs font-semibold text-amber-300">
+                  {t('notifications.sendBroadcast')}
+                </span>
                 <button
                   type="button"
-                  aria-label="关闭公告表单"
+                  aria-label={t('notifications.closeCompose')}
                   onClick={() => {
                     setComposeOpen(false)
                     setComposeError(null)
@@ -285,32 +287,32 @@ export function NotificationBell() {
 
               <input
                 type="text"
-                aria-label="公告标题"
+                aria-label={t('notifications.composeTitleLabel')}
                 value={announceName}
                 onChange={(e) => setAnnounceName(e.target.value)}
-                placeholder="输入公告标题 *"
+                placeholder={t('notifications.composeTitlePlaceholder')}
                 className="w-full rounded-lg border border-white/10 bg-zinc-900/90 px-3 py-1.5 text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
               />
 
               <textarea
                 rows={2}
-                aria-label="公告内容"
+                aria-label={t('notifications.composeContentLabel')}
                 value={announceDesc}
                 onChange={(e) => setAnnounceDesc(e.target.value)}
-                placeholder="输入公告详细内容（可选）"
+                placeholder={t('notifications.composeContentPlaceholder')}
                 className="w-full resize-none rounded-lg border border-white/10 bg-zinc-900/90 px-3 py-1.5 text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
               />
 
               <div className="flex items-center justify-between gap-2">
                 <select
-                  aria-label="通知级别"
+                  aria-label={t('notifications.composeLevelLabel')}
                   value={announceLevel}
                   onChange={(e) => setAnnounceLevel(e.target.value as NotificationLevel)}
                   className="rounded-lg border border-white/10 bg-[#14141c] px-2.5 py-1.5 text-xs text-zinc-200 outline-none focus:border-amber-400/60"
                 >
-                  <option value="Normal">普通 (Normal)</option>
-                  <option value="Warning">警告 (Warning)</option>
-                  <option value="Error">严重 (Error)</option>
+                  <option value="Normal">{t('notifications.levelOptionNormal')}</option>
+                  <option value="Warning">{t('notifications.levelOptionWarning')}</option>
+                  <option value="Error">{t('notifications.levelOptionError')}</option>
                 </select>
 
                 <button
@@ -323,7 +325,7 @@ export function NotificationBell() {
                   ) : (
                     <Send className="h-3.5 w-3.5" />
                   )}
-                  <span>发送公告</span>
+                  <span>{t('notifications.sendBtn')}</span>
                 </button>
               </div>
             </form>
@@ -337,7 +339,7 @@ export function NotificationBell() {
               </div>
             ) : listError ? (
               <div className="space-y-2 px-4 py-8 text-center text-xs text-zinc-400">
-                <p>加载通知列表失败</p>
+                <p>{t('notifications.loadFailed')}</p>
                 <button
                   type="button"
                   onClick={() => void refetchList()}
@@ -352,7 +354,7 @@ export function NotificationBell() {
               </div>
             ) : (
               notifications.map((item) => {
-                const { icon: LevelIcon, iconClass } = getLevelPresentation(item.Level)
+                const { icon: LevelIcon, iconClass } = getLevelPresentation(item.Level, t)
                 return (
                   <button
                     key={item.Id}
@@ -377,7 +379,7 @@ export function NotificationBell() {
                           <span
                             data-testid={`notification-unread-dot-${item.Id}`}
                             className="mt-1 h-2 w-2 shrink-0 rounded-full bg-amber-400"
-                            aria-label="未读"
+                            aria-label={t('notifications.unreadAria')}
                           />
                         )}
                       </div>
