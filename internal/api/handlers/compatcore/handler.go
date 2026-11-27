@@ -31,6 +31,7 @@ type AuthFuncs struct {
 
 const (
 	forgotPinMaxAttempts        = 5
+	forgotPinMaxFailedAttempts  = 5
 	forgotPasswordRateLimit     = 5
 	forgotPasswordRateWindow    = time.Minute
 	forgotPasswordMaxPinFiles   = 10
@@ -42,6 +43,7 @@ const (
 	authByIDLoopbackIPRateLimit = 180
 	authByIDLoopbackRateWindow  = 5 * time.Minute
 	maxRateLimitBuckets         = 4096
+	maxSubBucketsPerIP          = 8
 	maxCameraUploadsEntries     = 500
 	maxCameraUploadBytes        = 512 << 20 // 512 MiB
 	maxHomeSectionsEntries      = 500
@@ -55,11 +57,12 @@ const (
 )
 
 type forgotPinEntry struct {
-	UserID    string
-	UserName  string
-	Pin       string
-	PinFile   string
-	ExpiresAt time.Time
+	UserID         string
+	UserName       string
+	Pin            string
+	PinFile        string
+	ExpiresAt      time.Time
+	failedAttempts int
 }
 
 // WSSender pushes Emby WebSocket messages to connected user devices.
