@@ -172,6 +172,27 @@ func (h *Handler) handleUpdateStartupConfig(w http.ResponseWriter, r *http.Reque
 		httpx.Error(w, http.StatusBadRequest, "invalid startup configuration payload")
 		return
 	}
+	if auth.ContainsControlChar(req.ServerName) ||
+		auth.ContainsControlChar(req.UICulture) ||
+		auth.ContainsControlChar(req.MetadataCountryCode) ||
+		auth.ContainsControlChar(req.PreferredMetadataLanguage) {
+		httpx.Error(w, http.StatusBadRequest, "startup configuration must not contain control characters")
+		return
+	}
+	req.ServerName = strings.TrimSpace(req.ServerName)
+	req.UICulture = strings.TrimSpace(req.UICulture)
+	req.MetadataCountryCode = strings.TrimSpace(req.MetadataCountryCode)
+	req.PreferredMetadataLanguage = strings.TrimSpace(req.PreferredMetadataLanguage)
+	if len([]rune(req.ServerName)) > 128 {
+		httpx.Error(w, http.StatusBadRequest, "ServerName exceeds maximum length")
+		return
+	}
+	if len([]rune(req.UICulture)) > 32 ||
+		len([]rune(req.MetadataCountryCode)) > 32 ||
+		len([]rune(req.PreferredMetadataLanguage)) > 32 {
+		httpx.Error(w, http.StatusBadRequest, "locale or country code exceeds maximum length")
+		return
+	}
 	h.mu.Lock()
 	if req.ServerName != "" {
 		h.state.Startup.ServerName = req.ServerName
@@ -376,6 +397,11 @@ func (h *Handler) handleUpdateRemoteAccess(w http.ResponseWriter, r *http.Reques
 	h.saveSystemExtraLocked(r.Context(), extra)
 	_ = h.saveStateLocked(r.Context())
 	h.mu.Unlock()
+	if payload.EnableRemoteAccess != nil {
+		if hub := h.getWSHub(); hub != nil {
+			hub.DisconnectRemoteClients()
+		}
+	}
 	httpx.NoContent(w)
 }
 

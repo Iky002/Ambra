@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -606,6 +607,39 @@ func (h *Handler) recordAuthByIDFailure(ip, uid string, now time.Time) {
 	recordAuthByIDFailureBucketsLocked(h.authByIDRates, h.authByIDIPRates, compKey, ipKey, now, authByIDRateLimit, authByIDIPRateLimit)
 }
 
+const compatAuthFailLogThrottle = 15 * time.Second
+
+var (
+	compatAuthFailLogMu   sync.Mutex
+	compatAuthFailLogLast = make(map[string]time.Time)
+)
+
+func (h *Handler) shouldLogAuthFailure(ip, key string, now time.Time) bool {
+	mapKey := fmt.Sprintf("%p|%s|%s", h, strings.TrimSpace(ip), strings.ToLower(strings.TrimSpace(key)))
+	cutoff := now.Add(-compatAuthFailLogThrottle)
+
+	compatAuthFailLogMu.Lock()
+	defer compatAuthFailLogMu.Unlock()
+	if last, ok := compatAuthFailLogLast[mapKey]; ok && last.After(cutoff) {
+		return false
+	}
+	if len(compatAuthFailLogLast) >= maxRateLimitBuckets {
+		for k, t := range compatAuthFailLogLast {
+			if !t.After(cutoff) {
+				delete(compatAuthFailLogLast, k)
+			}
+		}
+		if len(compatAuthFailLogLast) >= maxRateLimitBuckets {
+			for k := range compatAuthFailLogLast {
+				delete(compatAuthFailLogLast, k)
+				break
+			}
+		}
+	}
+	compatAuthFailLogLast[mapKey] = now
+	return true
+}
+
 func (h *Handler) isGlobalRemoteAccessEnabled() bool {
 	if h.cfg != nil {
 		return h.cfg.Snapshot().IsGlobalRemoteAccessEnabled()
@@ -670,12 +704,14 @@ func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 			_, _ = auth.VerifyPassword(pw, u.PasswordHash)
 		}
 		h.recordAuthByIDFailure(ip, uid, now)
-		_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
-			Name:     u.Name + " failed to log in (remote access disabled)",
-			Type:     "AuthenticationFailed",
-			UserID:   u.ID,
-			Severity: "Warning",
-		})
+		if h.shouldLogAuthFailure(ip, uid, now) {
+			_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+				Name:     u.Name + " failed to log in (remote access disabled)",
+				Type:     "AuthenticationFailed",
+				UserID:   u.ID,
+				Severity: "Warning",
+			})
+		}
 		writeJSONError(w, r, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
@@ -687,20 +723,25 @@ func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case errors.Is(authErr, auth.ErrInvalidCredentials):
 				h.recordAuthByIDFailure(ip, uid, now)
-				_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
-					Name:     u.Name + " failed to log in",
-					Type:     "AuthenticationFailed",
-					UserID:   u.ID,
-					Severity: "Warning",
-				})
+				if h.shouldLogAuthFailure(ip, uid, now) {
+					_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+						Name:     u.Name + " failed to log in",
+						Type:     "AuthenticationFailed",
+						UserID:   u.ID,
+						Severity: "Warning",
+					})
+				}
 				writeJSONError(w, r, http.StatusUnauthorized, "invalid username or password")
 			case errors.Is(authErr, auth.ErrUserDisabled):
-				_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
-					Name:     u.Name + " failed to log in (account disabled)",
-					Type:     "AuthenticationFailed",
-					UserID:   u.ID,
-					Severity: "Warning",
-				})
+				h.recordAuthByIDFailure(ip, uid, now)
+				if h.shouldLogAuthFailure(ip, uid, now) {
+					_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+						Name:     u.Name + " failed to log in (account disabled)",
+						Type:     "AuthenticationFailed",
+						UserID:   u.ID,
+						Severity: "Warning",
+					})
+				}
 				writeJSONError(w, r, http.StatusForbidden, "user is disabled")
 			default:
 				httpx.Error(w, http.StatusInternalServerError, "authentication failed")
@@ -724,13 +765,23 @@ func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if u.IsDisabled || u.Policy.IsDisabled {
+		auth.DummyPasswordWork(pw)
+		h.recordAuthByIDFailure(ip, uid, now)
+		if h.shouldLogAuthFailure(ip, uid, now) {
+			_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+				Name:     u.Name + " failed to log in (account disabled)",
+				Type:     "AuthenticationFailed",
+				UserID:   u.ID,
+				Severity: "Warning",
+			})
+		}
+		writeJSONError(w, r, http.StatusForbidden, "user is disabled")
+		return
+	}
 	if !verifyUserPassword(u, pw, legacySHA1) {
 		h.recordAuthByIDFailure(ip, uid, now)
 		writeJSONError(w, r, http.StatusUnauthorized, "invalid username or password")
-		return
-	}
-	if u.IsDisabled || u.Policy.IsDisabled {
-		writeJSONError(w, r, http.StatusForbidden, "user is disabled")
 		return
 	}
 
@@ -2822,23 +2873,29 @@ func (h *Handler) serveUserImage(w http.ResponseWriter, r *http.Request, headOnl
 		writeJSONError(w, r, http.StatusForbidden, "Remote access is disabled")
 		return
 	}
+	isLocal := netutil.IsLocalOrLANRequest(r)
+	if !isLocal && !authed && !h.isGlobalRemoteAccessEnabled() {
+		writeJSONError(w, r, http.StatusForbidden, "Remote access is disabled")
+		return
+	}
 	if !authed && h.userRepo != nil {
 		if (h.cfg != nil && !h.cfg.Snapshot().EnableLoginUserList) || uid == "" {
 			writeJSONError(w, r, http.StatusNotFound, "user image not found")
 			return
 		}
 		u, err := h.userRepo.GetUserByID(r.Context(), uid)
-		if err != nil || u == nil || u.IsDisabled || u.Policy.IsDisabled || u.Policy.IsHidden {
+		if err != nil || u == nil || u.IsDisabled || u.Policy.IsDisabled || u.Policy.IsHidden || (!isLocal && !u.Policy.EnableRemoteAccess) {
 			writeJSONError(w, r, http.StatusNotFound, "user image not found")
 			return
 		}
-	} else if authed && !isAdmin && h.userRepo != nil && (uid == "" || guid.Normalize(callerID) != guid.Normalize(uid)) {
+	} else if authed && !isAdmin && h.userRepo != nil && (!isLocal || uid == "" || guid.Normalize(callerID) != guid.Normalize(uid)) {
 		if uid == "" {
 			writeJSONError(w, r, http.StatusNotFound, "user image not found")
 			return
 		}
 		u, err := h.userRepo.GetUserByID(r.Context(), uid)
-		if err != nil || u == nil || u.IsDisabled || u.Policy.IsDisabled || u.Policy.IsHidden {
+		isOther := guid.Normalize(callerID) != guid.Normalize(uid)
+		if err != nil || u == nil || (isOther && (u.IsDisabled || u.Policy.IsDisabled || u.Policy.IsHidden)) || (!isLocal && !u.Policy.EnableRemoteAccess) {
 			writeJSONError(w, r, http.StatusNotFound, "user image not found")
 			return
 		}
@@ -2937,9 +2994,14 @@ func (h *Handler) postUserImage(w http.ResponseWriter, r *http.Request) {
 	}
 	p := h.userImagePath(uid, "Primary", "0")
 
-	raw, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
+	const maxUserImageBytes = 10 << 20
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxUserImageBytes+1))
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, "failed to read image body")
+		return
+	}
+	if len(raw) > maxUserImageBytes {
+		httpx.Error(w, http.StatusRequestEntityTooLarge, "user image payload too large")
 		return
 	}
 	// Emby clients often POST base64-encoded image payloads.
@@ -2950,14 +3012,47 @@ func (h *Handler) postUserImage(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "unsupported image format")
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to prepare user image directory")
 		return
 	}
-	if err := os.WriteFile(p, raw, 0o644); err != nil {
+	tmp, err := os.CreateTemp(dir, ".avatar-*.tmp")
+	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "failed to save user image")
 		return
 	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		httpx.Error(w, http.StatusInternalServerError, "failed to save user image")
+		return
+	}
+	if _, err := tmp.Write(raw); err != nil {
+		_ = tmp.Close()
+		httpx.Error(w, http.StatusInternalServerError, "failed to save user image")
+		return
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		httpx.Error(w, http.StatusInternalServerError, "failed to save user image")
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to save user image")
+		return
+	}
+	if err := os.Rename(tmpPath, p); err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to save user image")
+		return
+	}
+	cleanup = false
 	httpx.NoContent(w)
 }
 

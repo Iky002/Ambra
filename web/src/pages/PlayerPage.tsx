@@ -303,6 +303,7 @@ export function PlayerPage() {
   const subtitleExplicitlyOffRef = useRef<boolean>(rawInitialSubtitle === 'off')
   const stopReportedRef = useRef<boolean>(false)
   const lastVideoTimeSecRef = useRef(0)
+  const activeSessionSnapshotRef = useRef<{ itemId: string; lastPositionSec: number } | null>(null)
   const lastSeekReportRef = useRef(0)
   const resumeSecRef = useRef<number | null>(null)
   const hlsRecoveryCountRef = useRef(0)
@@ -715,14 +716,21 @@ export function PlayerPage() {
     [audioStreams, effectiveAudioIndex],
   )
 
-  const selectedAudioOrdinal = useMemo(() => {
-    if (effectiveAudioIndex === undefined || audioStreams.length === 0) return undefined
-    const idx = audioStreams.findIndex((a) => a.Index === effectiveAudioIndex)
-    return idx >= 0 ? idx : undefined
-  }, [audioStreams, effectiveAudioIndex])
+  const embeddedAudioStreams = useMemo(
+    () => audioStreams.filter((a) => !a.IsExternal),
+    [audioStreams],
+  )
 
-  const selectedAudioOrdinalRef = useRef(selectedAudioOrdinal)
-  selectedAudioOrdinalRef.current = selectedAudioOrdinal
+  const selectedEmbeddedAudioOrdinal = useMemo(() => {
+    if (effectiveAudioIndex === undefined || embeddedAudioStreams.length === 0) return undefined
+    const idx = embeddedAudioStreams.findIndex((a) => a.Index === effectiveAudioIndex)
+    return idx >= 0 ? idx : undefined
+  }, [embeddedAudioStreams, effectiveAudioIndex])
+
+  const selectedEmbeddedAudioOrdinalRef = useRef(selectedEmbeddedAudioOrdinal)
+  selectedEmbeddedAudioOrdinalRef.current = selectedEmbeddedAudioOrdinal
+
+  const isExternalAudioSelected = Boolean(activeAudioStream?.IsExternal)
 
   const browserSupportsHls = useMemo(() => {
     if (Hls.isSupported()) return true
@@ -804,7 +812,7 @@ export function PlayerPage() {
     )
 
     const hlsUrl =
-      qualityPreset !== 'auto' || needsTrackSwitchRemux
+      qualityPreset !== 'auto' || needsTrackSwitchRemux || isExternalAudioSelected
         ? fallbackMasterHlsUrl
         : activeSource.TranscodingUrl
           ? resolveApiUrl(activeSource.TranscodingUrl)
@@ -834,7 +842,7 @@ export function PlayerPage() {
       !mkvStreamEligible &&
       audioStreams.length > 0
 
-    if (qualityPreset !== 'auto' || forceServerHls) {
+    if (qualityPreset !== 'auto' || forceServerHls || isExternalAudioSelected) {
       return {
         strategy: 'hls' as const,
         videoOnly: false,
@@ -987,6 +995,7 @@ export function PlayerPage() {
     forceServerHls,
     qualityPreset,
     needsTrackSwitchRemux,
+    isExternalAudioSelected,
     browserSupportsHls,
   ])
 
@@ -1074,9 +1083,9 @@ export function PlayerPage() {
       if (
         nativeAudioTracks &&
         nativeAudioTracks.length > 1 &&
-        selectedAudioOrdinalRef.current !== undefined
+        selectedEmbeddedAudioOrdinalRef.current !== undefined
       ) {
-        const targetOrd = selectedAudioOrdinalRef.current
+        const targetOrd = selectedEmbeddedAudioOrdinalRef.current
         for (let i = 0; i < nativeAudioTracks.length; i++) {
           nativeAudioTracks[i].enabled = i === targetOrd
         }
@@ -1177,7 +1186,7 @@ export function PlayerPage() {
           maxBytes: DEFAULT_WASM_MAX_BYTES,
           knownSizeBytes: activeSource?.Size,
           container: activeSource?.Container,
-          audioStreamIndex: selectedAudioOrdinal,
+          audioStreamIndex: selectedEmbeddedAudioOrdinal,
           signal: abortController.signal,
           onProgress: (stage, percent, detail) => {
             if (cancelled) return
@@ -1312,7 +1321,7 @@ export function PlayerPage() {
 
       void streamMkv
         .attach(video, remuxSourceUrl, buildAuthHeaders(remuxSourceUrl), {
-          audioTrackIndex: selectedAudioOrdinal,
+          audioTrackIndex: selectedEmbeddedAudioOrdinal,
           videoOnly: streamPlan.videoOnly,
           signal: abortController.signal,
           onError: (err) => {
@@ -1370,7 +1379,7 @@ export function PlayerPage() {
     useProxyDirect,
     forceServerHls,
     preferWasmRemux,
-    selectedAudioOrdinal,
+    selectedEmbeddedAudioOrdinal,
     retryNonce,
   ])
 
@@ -1645,15 +1654,42 @@ export function PlayerPage() {
         audioIndex?: number
         subtitleIndex?: number
         subtitleExplicitlyOff?: boolean
+        lastPositionSec?: number
       },
     ) => {
       const targetItemId = sessionOverride?.itemId ?? id
       const videoEl = videoRef.current
       if (!targetItemId || (!videoEl && type !== 'stop')) return
-      if (videoEl && Number.isFinite(videoEl.currentTime) && videoEl.currentTime >= 0) {
+      const hasActiveMedia = Boolean(
+        videoEl &&
+          renderedItemIdRef.current === targetItemId &&
+          (videoEl.hasAttribute('src') || videoEl.currentSrc !== ''),
+      )
+      if (hasActiveMedia && videoEl && Number.isFinite(videoEl.currentTime) && videoEl.currentTime >= 0) {
         lastVideoTimeSecRef.current = videoEl.currentTime
+        if (type === 'progress' && sessionOverride && renderedItemIdRef.current === sessionOverride.itemId) {
+          sessionOverride.lastPositionSec = videoEl.currentTime
+        }
       }
-      const curSec = videoEl ? videoEl.currentTime : lastVideoTimeSecRef.current
+      let curSec: number
+      if (type === 'stop') {
+        const activeVideoTime =
+          hasActiveMedia && videoEl && Number.isFinite(videoEl.currentTime) && videoEl.currentTime > 0
+            ? videoEl.currentTime
+            : 0
+        const snapshotPos = sessionOverride?.lastPositionSec ?? 0
+        curSec =
+          activeVideoTime > 0
+            ? activeVideoTime
+            : snapshotPos > 0
+              ? snapshotPos
+              : lastVideoTimeSecRef.current
+      } else {
+        curSec =
+          hasActiveMedia && videoEl && Number.isFinite(videoEl.currentTime)
+            ? videoEl.currentTime
+            : lastVideoTimeSecRef.current
+      }
       const {
         audioIndex: latestAudioIndex,
         subtitleIndex: latestSubtitleIndex,
@@ -1743,7 +1779,9 @@ export function PlayerPage() {
       audioIndex: playbackMetaRef.current.audioIndex,
       subtitleIndex: playbackMetaRef.current.subtitleIndex,
       subtitleExplicitlyOff: subtitleExplicitlyOffRef.current,
+      lastPositionSec: 0,
     }
+    activeSessionSnapshotRef.current = sessionSnapshot
     const syncSameEpisodeTracks = () => {
       if (renderedItemIdRef.current !== sessionSnapshot.itemId) return
       sessionSnapshot.initialStartTicks = Math.max(
@@ -1759,6 +1797,15 @@ export function PlayerPage() {
       if (playbackMetaRef.current.playSessionId) {
         sessionSnapshot.playSessionId = playbackMetaRef.current.playSessionId
       }
+      const v = videoRef.current
+      if (
+        v &&
+        (v.hasAttribute('src') || v.currentSrc !== '') &&
+        Number.isFinite(v.currentTime) &&
+        v.currentTime > 0
+      ) {
+        sessionSnapshot.lastPositionSec = v.currentTime
+      }
     }
 
     reportState('start', undefined, sessionSnapshot)
@@ -1771,6 +1818,9 @@ export function PlayerPage() {
       window.clearInterval(interval)
       syncSameEpisodeTracks()
       reportState('stop', undefined, sessionSnapshot)
+      if (activeSessionSnapshotRef.current === sessionSnapshot) {
+        activeSessionSnapshotRef.current = null
+      }
     }
   }, [hasPlaybackInfo, id, reportState])
 
@@ -1972,13 +2022,12 @@ export function PlayerPage() {
     pokeOsd()
   }, [pipSupported, pokeOsd])
 
-  // 订阅 WebSocket 远端播控指令 (Pause / Unpause / PlayPause / Stop / Seek)，校验 PlaySessionId
+  // 订阅 WebSocket 远端播控指令 (Pause / Unpause / PlayPause / Stop / Seek)，校验 PlaySessionId 与 ItemId
   useEffect(() => {
     return subscribePlaystate((cmd) => {
       if (
-        cmd.PlaySessionId &&
-        playbackMetaRef.current.playSessionId &&
-        cmd.PlaySessionId !== playbackMetaRef.current.playSessionId
+        (cmd.PlaySessionId && cmd.PlaySessionId !== playbackMetaRef.current.playSessionId) ||
+        (cmd.ItemId && cmd.ItemId !== id)
       ) {
         return
       }
@@ -2023,7 +2072,7 @@ export function PlayerPage() {
           break
       }
     })
-  }, [subscribePlaystate, togglePlay, reportState, handleExit, pokeOsd])
+  }, [id, subscribePlaystate, togglePlay, reportState, handleExit, pokeOsd])
 
   const handleSelectQuality = useCallback(
     (presetId: QualityPresetId) => {
@@ -2424,6 +2473,10 @@ export function PlayerPage() {
           const v = e.currentTarget
           if (Number.isFinite(v.currentTime) && v.currentTime >= 0) {
             lastVideoTimeSecRef.current = v.currentTime
+            const snap = activeSessionSnapshotRef.current
+            if (snap && renderedItemIdRef.current === snap.itemId) {
+              snap.lastPositionSec = v.currentTime
+            }
           }
           setCurrentTime(v.currentTime)
           if (v.buffered.length > 0) {

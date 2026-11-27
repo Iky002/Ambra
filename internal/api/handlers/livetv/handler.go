@@ -103,6 +103,7 @@ type ProgramInfo struct {
 	IsSeries      bool      `json:"IsSeries,omitempty"`
 	IsLive        bool      `json:"IsLive,omitempty"`
 	IsRepeat      bool      `json:"IsRepeat,omitempty"`
+	Source        string    `json:"Source,omitempty"`
 }
 
 type RecordingInfo struct {
@@ -201,6 +202,13 @@ type liveTVState struct {
 	ListingProviders []ListingProviderInfo `json:"listing_providers"`
 }
 
+const defaultLiveStreamLeaseTTL = 45 * time.Second
+
+type liveStreamLease struct {
+	release func()
+	timer   *time.Timer
+}
+
 type Handler struct {
 	store              *sqlite.Store
 	cfg                *config.Config
@@ -220,6 +228,11 @@ type Handler struct {
 	streamHub          *LiveStreamHub
 	auth               AuthFuncs
 
+	leaseMu      sync.Mutex
+	streamLeases map[string]*liveStreamLease
+	leaseTTL     time.Duration
+	closed       bool
+
 	mu    sync.RWMutex
 	state liveTVState
 }
@@ -238,6 +251,8 @@ func New(store *sqlite.Store, cfg *config.Config) *Handler {
 		publicStreamClient: netutil.NewSafeHTTPClientNoLoopback(0, false),
 		proxySecret:        secret,
 		streamHub:          newLiveStreamHub(),
+		streamLeases:       make(map[string]*liveStreamLease),
+		leaseTTL:           defaultLiveStreamLeaseTTL,
 	}
 	h.loadState(context.Background())
 	return h
@@ -292,11 +307,139 @@ func (h *Handler) SetStreamGracePeriod(d time.Duration) {
 	}
 }
 
-// Close releases any shared upstream live stream connections managed by this Handler.
+// Close releases any shared upstream live stream connections and active HLS stream leases managed by this Handler.
 func (h *Handler) Close() {
+	if h == nil {
+		return
+	}
+	h.leaseMu.Lock()
+	h.closed = true
+	releases := make([]func(), 0, len(h.streamLeases))
+	for k, lease := range h.streamLeases {
+		if lease.timer != nil {
+			lease.timer.Stop()
+		}
+		if lease.release != nil {
+			releases = append(releases, lease.release)
+		}
+		delete(h.streamLeases, k)
+	}
+	h.leaseMu.Unlock()
+	for _, rel := range releases {
+		rel()
+	}
 	if h.streamHub != nil {
 		h.streamHub.Close()
 	}
+}
+
+func (h *Handler) releaseStreamLeases() {
+	if h == nil {
+		return
+	}
+	h.leaseMu.Lock()
+	releases := make([]func(), 0, len(h.streamLeases))
+	for k, lease := range h.streamLeases {
+		if lease.timer != nil {
+			lease.timer.Stop()
+		}
+		if lease.release != nil {
+			releases = append(releases, lease.release)
+		}
+		delete(h.streamLeases, k)
+	}
+	h.leaseMu.Unlock()
+	for _, rel := range releases {
+		rel()
+	}
+}
+
+func (h *Handler) expireStreamLease(key string, target *liveStreamLease) {
+	h.leaseMu.Lock()
+	cur, ok := h.streamLeases[key]
+	if !ok || cur != target {
+		h.leaseMu.Unlock()
+		return
+	}
+	delete(h.streamLeases, key)
+	rel := cur.release
+	h.leaseMu.Unlock()
+	if rel != nil {
+		rel()
+	}
+}
+
+func (h *Handler) touchOrAcquireLiveStreamLease(r *http.Request, channelID string, sessionIAT int64, uid string) bool {
+	if h == nil || h.cfg == nil {
+		return true
+	}
+	mgr := h.getTranscodeManager()
+	if mgr == nil {
+		return true
+	}
+	limit := h.cfg.Snapshot().SimultaneousStreamLimit
+	if limit <= 0 {
+		return true
+	}
+
+	var leaseKey string
+	if normUID := guid.Normalize(uid); normUID != "" {
+		leaseKey = "livetv-lease:u:" + normUID + ":" + strings.TrimSpace(channelID)
+	} else if r != nil {
+		leaseKey = "livetv-lease:ip:" + netutil.ClientIP(r) + ":" + strings.TrimSpace(channelID)
+	} else if sessionIAT > 0 {
+		leaseKey = "livetv-lease:iat:" + strconv.FormatInt(sessionIAT, 10) + ":" + strings.TrimSpace(channelID)
+	} else {
+		leaseKey = "livetv-lease:ch:" + strings.TrimSpace(channelID)
+	}
+
+	h.leaseMu.Lock()
+	if h.closed {
+		h.leaseMu.Unlock()
+		return false
+	}
+	ttl := h.leaseTTL
+	if ttl <= 0 {
+		ttl = defaultLiveStreamLeaseTTL
+	}
+	if lease, ok := h.streamLeases[leaseKey]; ok {
+		if lease.timer != nil {
+			lease.timer.Reset(ttl)
+		}
+		h.leaseMu.Unlock()
+		return true
+	}
+	h.leaseMu.Unlock()
+
+	release, allowed := mgr.TryAcquireStreamSlot(limit, leaseKey)
+	if !allowed {
+		return false
+	}
+
+	h.leaseMu.Lock()
+	if h.closed {
+		h.leaseMu.Unlock()
+		release()
+		return false
+	}
+	if h.streamLeases == nil {
+		h.streamLeases = make(map[string]*liveStreamLease)
+	}
+	if existing, ok := h.streamLeases[leaseKey]; ok {
+		if existing.timer != nil {
+			existing.timer.Reset(ttl)
+		}
+		h.leaseMu.Unlock()
+		release()
+		return true
+	}
+	lease := &liveStreamLease{release: release}
+	lease.timer = time.AfterFunc(ttl, func() {
+		h.expireStreamLease(leaseKey, lease)
+	})
+	h.streamLeases[leaseKey] = lease
+	h.leaseMu.Unlock()
+	return true
 }
 
 // SetUserRepo attaches a UserRepo for Live TV user access listing.
@@ -599,11 +742,21 @@ func (h *Handler) DueRecordingJobs(ctx context.Context) ([]dvr.RecordingJob, err
 		}
 		t.Status = "InProgress"
 		changed = true
+		ua := ""
+		if c.ch.TunerHostId != "" {
+			for _, th := range h.state.TunerHosts {
+				if th.Id == c.ch.TunerHostId {
+					ua = strings.TrimSpace(th.UserAgent)
+					break
+				}
+			}
+		}
 		jobs = append(jobs, dvr.RecordingJob{
 			TimerID:        c.timerID,
 			ChannelName:    c.channelName,
 			ProgramName:    c.programName,
 			StreamURL:      c.streamURL,
+			UserAgent:      ua,
 			Duration:       c.duration,
 			DenyPrivateLAN: !c.allowPrivateLAN,
 		})
@@ -656,7 +809,8 @@ func (h *Handler) AddRecording(ctx context.Context, rec RecordingInfo) Recording
 }
 
 // OnRecordingFinished updates the matching timer status and, when the recording completed,
-// appends a RecordingInfo entry and persists Live TV state.
+// appends a RecordingInfo entry and persists Live TV state. If the timer was deleted while
+// recording, completed output is discarded rather than registered.
 func (h *Handler) OnRecordingFinished(ctx context.Context, state dvr.RecordingState) {
 	timerStatus := string(state.Status)
 	switch state.Status {
@@ -671,15 +825,18 @@ func (h *Handler) OnRecordingFinished(ctx context.Context, state dvr.RecordingSt
 	h.mu.Lock()
 	var (
 		changed      bool
+		timerFound   bool
 		channelID    string
 		channelName  = state.Job.ChannelName
 		programID    string
 		recName      = state.Job.ProgramName
 		newRecording *RecordingInfo
+		recorder     = h.recorder
 	)
 
 	for i := range h.state.Timers {
 		if h.state.Timers[i].Id == state.Job.TimerID {
+			timerFound = true
 			h.state.Timers[i].Status = timerStatus
 			channelID = h.state.Timers[i].ChannelId
 			if channelName == "" {
@@ -692,6 +849,17 @@ func (h *Handler) OnRecordingFinished(ctx context.Context, state dvr.RecordingSt
 			changed = true
 			break
 		}
+	}
+
+	// If the timer was deleted while the recording was in flight, discard completed output.
+	if !timerFound && strings.TrimSpace(state.Job.TimerID) != "" {
+		h.mu.Unlock()
+		if state.Status == dvr.StatusCompleted && strings.TrimSpace(state.OutputPath) != "" && recorder != nil {
+			if resolvedFile, ok := resolvePathWithinDir(recorder.RecordingsDir(), state.OutputPath); ok {
+				_ = os.Remove(resolvedFile)
+			}
+		}
+		return
 	}
 
 	if state.Status == dvr.StatusCompleted {
@@ -878,13 +1046,32 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, auth AuthFuncs) {
 	handleLiveTvAccess("GET /LiveTv/GuideInfo", h.handleGuideInfo)
 }
 
-func (h *Handler) hasValidSignedStreamTarget(r *http.Request) bool {
-	if r == nil {
+func (h *Handler) isSignedStreamUserAllowed(ctx context.Context, rawUID string) bool {
+	uid := guid.Normalize(rawUID)
+	if uid == "" {
+		return true
+	}
+	ur := h.getUserRepo()
+	if ur == nil {
+		return true
+	}
+	u, err := ur.GetUserByID(ctx, uid)
+	if err != nil || u == nil || u.IsDisabled || u.Policy.IsDisabled {
 		return false
+	}
+	if u.IsAdmin || u.Policy.IsAdministrator {
+		return true
+	}
+	return u.Policy.EnableLiveTvAccess && u.Policy.EnableMediaPlayback
+}
+
+func (h *Handler) validateSignedStreamTarget(r *http.Request) (valid bool, revoked bool) {
+	if r == nil {
+		return false, false
 	}
 	id := r.PathValue("Id")
 	if id == "" {
-		return false
+		return false, false
 	}
 	q := r.URL.Query()
 	target := strings.TrimSpace(q.Get("target"))
@@ -892,25 +1079,34 @@ func (h *Handler) hasValidSignedStreamTarget(r *http.Request) bool {
 	expStr := strings.TrimSpace(q.Get("exp"))
 	iatStr := strings.TrimSpace(q.Get("iat"))
 	lanParam := strings.TrimSpace(q.Get("lan"))
+	uidParam := strings.TrimSpace(q.Get("uid"))
 	if target == "" || sig == "" || expStr == "" || (lanParam != "0" && lanParam != "1") {
-		return false
+		return false, false
 	}
 	reqAllowLAN := lanParam == "1"
 	if iatStr != "" {
-		if _, _, ok := h.verifyProxyTargetWithIAT(id, target, reqAllowLAN, iatStr, expStr, sig); !ok {
-			return false
+		if _, _, ok := h.verifyProxyTargetWithIATAndUser(id, target, reqAllowLAN, iatStr, expStr, uidParam, sig); !ok {
+			return false, false
 		}
-	} else if !h.verifyProxyTarget(id, target, reqAllowLAN, expStr, sig) {
-		return false
+	} else if !h.verifyProxyTargetWithUser(id, target, reqAllowLAN, expStr, uidParam, sig) {
+		return false, false
 	}
 	ch, ok := h.GetChannelByID(id)
 	if !ok || ch.Disabled {
-		return false
+		return false, false
 	}
 	if reqAllowLAN && !h.channelAllowsPrivateLANForChannel(ch) {
-		return false
+		return false, false
 	}
-	return true
+	if uidParam != "" && !h.isSignedStreamUserAllowed(r.Context(), uidParam) {
+		return false, true
+	}
+	return true, false
+}
+
+func (h *Handler) hasValidSignedStreamTarget(r *http.Request) bool {
+	valid, _ := h.validateSignedStreamTarget(r)
+	return valid
 }
 
 func (h *Handler) canCallerPlayMedia(r *http.Request) bool {
@@ -962,7 +1158,12 @@ func (h *Handler) requireLiveTvStreamAccess(wrapAuth func(http.Handler) http.Han
 			next.ServeHTTP(w, r)
 		}))
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if h.hasValidSignedStreamTarget(r) {
+			valid, revoked := h.validateSignedStreamTarget(r)
+			if revoked {
+				httpx.Error(w, http.StatusForbidden, "Live TV stream access revoked for this user")
+				return
+			}
+			if valid {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -1196,11 +1397,15 @@ func (h *Handler) handleGetChannel(w http.ResponseWriter, r *http.Request) {
 const maxHLSPlaylistBytes = 2 << 20 // 2 MiB
 
 var (
-	hlsURIAttributeRe         = regexp.MustCompile(`(?i)\bURI="([^"]*)"`)
-	hlsUnquotedURIAttributeRe = regexp.MustCompile(`(?i)\bURI=([^",\s]+)`)
+	hlsHasURIAttributeRe = regexp.MustCompile(`(?i)\bURI\s*=`)
+	hlsURIAttributeRe    = regexp.MustCompile(`(?i)\bURI\s*=\s*(?:"([^"]*)"|([^",\s]+))`)
 )
 
 func (h *Handler) signProxyTarget(channelID, target string, allowPrivateLAN bool, exp int64) string {
+	return h.signProxyTargetWithUser(channelID, target, allowPrivateLAN, exp, "")
+}
+
+func (h *Handler) signProxyTargetWithUser(channelID, target string, allowPrivateLAN bool, exp int64, uid string) string {
 	lanFlag := "0"
 	if allowPrivateLAN {
 		lanFlag = "1"
@@ -1213,10 +1418,18 @@ func (h *Handler) signProxyTarget(channelID, target string, allowPrivateLAN bool
 	mac.Write([]byte(strconv.FormatInt(exp, 10)))
 	mac.Write([]byte{0})
 	mac.Write([]byte(target))
+	if normUID := guid.Normalize(uid); normUID != "" {
+		mac.Write([]byte{0})
+		mac.Write([]byte("uid=" + normUID))
+	}
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func (h *Handler) verifyProxyTarget(channelID, target string, allowPrivateLAN bool, expStr, sig string) bool {
+	return h.verifyProxyTargetWithUser(channelID, target, allowPrivateLAN, expStr, "", sig)
+}
+
+func (h *Handler) verifyProxyTargetWithUser(channelID, target string, allowPrivateLAN bool, expStr, uid, sig string) bool {
 	if len(h.proxySecret) == 0 {
 		return false
 	}
@@ -1228,22 +1441,19 @@ func (h *Handler) verifyProxyTarget(channelID, target string, allowPrivateLAN bo
 	if err != nil || len(got) != sha256.Size {
 		return false
 	}
-	lanFlag := "0"
-	if allowPrivateLAN {
-		lanFlag = "1"
+	expectedHex := h.signProxyTargetWithUser(channelID, target, allowPrivateLAN, exp, uid)
+	expected, err := hex.DecodeString(expectedHex)
+	if err != nil {
+		return false
 	}
-	mac := hmac.New(sha256.New, h.proxySecret)
-	mac.Write([]byte(channelID))
-	mac.Write([]byte{0})
-	mac.Write([]byte(lanFlag))
-	mac.Write([]byte{0})
-	mac.Write([]byte(strconv.FormatInt(exp, 10)))
-	mac.Write([]byte{0})
-	mac.Write([]byte(target))
-	return hmac.Equal(got, mac.Sum(nil))
+	return hmac.Equal(got, expected)
 }
 
 func (h *Handler) signProxyTargetWithIAT(channelID, target string, allowPrivateLAN bool, iat, exp int64) string {
+	return h.signProxyTargetWithIATAndUser(channelID, target, allowPrivateLAN, iat, exp, "")
+}
+
+func (h *Handler) signProxyTargetWithIATAndUser(channelID, target string, allowPrivateLAN bool, iat, exp int64, uid string) string {
 	lanFlag := "0"
 	if allowPrivateLAN {
 		lanFlag = "1"
@@ -1258,10 +1468,18 @@ func (h *Handler) signProxyTargetWithIAT(channelID, target string, allowPrivateL
 	mac.Write([]byte(strconv.FormatInt(exp, 10)))
 	mac.Write([]byte{0})
 	mac.Write([]byte(target))
+	if normUID := guid.Normalize(uid); normUID != "" {
+		mac.Write([]byte{0})
+		mac.Write([]byte("uid=" + normUID))
+	}
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func (h *Handler) verifyProxyTargetWithIAT(channelID, target string, allowPrivateLAN bool, iatStr, expStr, sig string) (int64, int64, bool) {
+	return h.verifyProxyTargetWithIATAndUser(channelID, target, allowPrivateLAN, iatStr, expStr, "", sig)
+}
+
+func (h *Handler) verifyProxyTargetWithIATAndUser(channelID, target string, allowPrivateLAN bool, iatStr, expStr, uid, sig string) (int64, int64, bool) {
 	if len(h.proxySecret) == 0 {
 		return 0, 0, false
 	}
@@ -1278,21 +1496,9 @@ func (h *Handler) verifyProxyTargetWithIAT(channelID, target string, allowPrivat
 	if err != nil || len(got) != sha256.Size {
 		return 0, 0, false
 	}
-	lanFlag := "0"
-	if allowPrivateLAN {
-		lanFlag = "1"
-	}
-	mac := hmac.New(sha256.New, h.proxySecret)
-	mac.Write([]byte(channelID))
-	mac.Write([]byte{0})
-	mac.Write([]byte(lanFlag))
-	mac.Write([]byte{0})
-	mac.Write([]byte(strconv.FormatInt(iat, 10)))
-	mac.Write([]byte{0})
-	mac.Write([]byte(strconv.FormatInt(exp, 10)))
-	mac.Write([]byte{0})
-	mac.Write([]byte(target))
-	if !hmac.Equal(got, mac.Sum(nil)) {
+	expectedHex := h.signProxyTargetWithIATAndUser(channelID, target, allowPrivateLAN, iat, exp, uid)
+	expected, err := hex.DecodeString(expectedHex)
+	if err != nil || !hmac.Equal(got, expected) {
 		return 0, 0, false
 	}
 	return iat, exp, true
@@ -1409,12 +1615,14 @@ func (h *Handler) handleStreamChannel(w http.ResponseWriter, r *http.Request) {
 	allowPrivateLAN := channelAllowLAN
 	var sessionIAT int64
 	var maxExp int64
+	var streamUID string
 	if target := strings.TrimSpace(r.URL.Query().Get("target")); target != "" {
 		q := r.URL.Query()
 		sig := strings.TrimSpace(q.Get("sig"))
 		expStr := strings.TrimSpace(q.Get("exp"))
 		iatStr := strings.TrimSpace(q.Get("iat"))
 		lanParam := strings.TrimSpace(q.Get("lan"))
+		uidParam := strings.TrimSpace(q.Get("uid"))
 		if lanParam != "0" && lanParam != "1" {
 			httpx.Error(w, http.StatusForbidden, "invalid or missing target scope")
 			return
@@ -1425,14 +1633,14 @@ func (h *Handler) handleStreamChannel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if iatStr != "" {
-			iat, _, valid := h.verifyProxyTargetWithIAT(id, target, reqAllowLAN, iatStr, expStr, sig)
+			iat, _, valid := h.verifyProxyTargetWithIATAndUser(id, target, reqAllowLAN, iatStr, expStr, uidParam, sig)
 			if !valid {
 				httpx.Error(w, http.StatusForbidden, "invalid, expired, or missing target signature")
 				return
 			}
 			sessionIAT = iat
 		} else {
-			if !h.verifyProxyTarget(id, target, reqAllowLAN, expStr, sig) {
+			if !h.verifyProxyTargetWithUser(id, target, reqAllowLAN, expStr, uidParam, sig) {
 				httpx.Error(w, http.StatusForbidden, "invalid, expired, or missing target signature")
 				return
 			}
@@ -1440,16 +1648,24 @@ func (h *Handler) handleStreamChannel(w http.ResponseWriter, r *http.Request) {
 				maxExp = parsedExp
 			}
 		}
+		if uidParam != "" && !h.isSignedStreamUserAllowed(r.Context(), uidParam) {
+			httpx.Error(w, http.StatusForbidden, "Live TV stream access revoked for this user")
+			return
+		}
 		if err := h.validateStreamURL(target, reqAllowLAN); err != nil {
 			httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("unsafe target stream url: %v", err))
 			return
 		}
 		streamURL = target
 		allowPrivateLAN = reqAllowLAN
+		streamUID = guid.Normalize(uidParam)
 	} else {
 		sessionIAT = h.nowUTC().Unix()
+		if callerID, _, hasAuth := h.callerAuthInfo(r); hasAuth && callerID != "" {
+			streamUID = guid.Normalize(callerID)
+		}
 	}
-	h.proxyChannelStreamWithSession(w, r, id, streamURL, allowPrivateLAN, sessionIAT, maxExp)
+	h.proxyChannelStreamWithSessionAndUser(w, r, id, streamURL, allowPrivateLAN, sessionIAT, maxExp, streamUID)
 }
 
 type flushWriter struct {
@@ -1558,6 +1774,18 @@ func (h *Handler) proxyChannelStreamWithOptions(w http.ResponseWriter, r *http.R
 }
 
 func (h *Handler) proxyChannelStreamWithSession(w http.ResponseWriter, r *http.Request, channelID, streamURL string, allowPrivateLAN bool, sessionIAT, maxExp int64) {
+	var streamUID string
+	if r != nil {
+		if qUID := strings.TrimSpace(r.URL.Query().Get("uid")); qUID != "" {
+			streamUID = guid.Normalize(qUID)
+		} else if callerID, _, hasAuth := h.callerAuthInfo(r); hasAuth && callerID != "" {
+			streamUID = guid.Normalize(callerID)
+		}
+	}
+	h.proxyChannelStreamWithSessionAndUser(w, r, channelID, streamURL, allowPrivateLAN, sessionIAT, maxExp, streamUID)
+}
+
+func (h *Handler) proxyChannelStreamWithSessionAndUser(w http.ResponseWriter, r *http.Request, channelID, streamURL string, allowPrivateLAN bool, sessionIAT, maxExp int64, streamUID string) {
 	trimmed := strings.TrimSpace(streamURL)
 	if err := h.validateStreamURL(trimmed, allowPrivateLAN); err != nil {
 		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("unsafe channel stream url: %v", err))
@@ -1572,13 +1800,21 @@ func (h *Handler) proxyChannelStreamWithSession(w http.ResponseWriter, r *http.R
 	}
 
 	isSignedSubTarget := r != nil && strings.TrimSpace(r.URL.Query().Get("target")) != ""
-	if (r == nil || r.Method != http.MethodHead) && !isSignedSubTarget {
-		releaseSlot, allowed := h.tryAcquireLiveStreamSlot(r, channelID)
-		if !allowed {
-			httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
-			return
+	isHLSStream := isSignedSubTarget || isHLSStreamURLForHub(trimmed)
+	if r == nil || r.Method != http.MethodHead {
+		if isHLSStream {
+			if !h.touchOrAcquireLiveStreamLease(r, channelID, sessionIAT, streamUID) {
+				httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
+				return
+			}
+		} else {
+			releaseSlot, allowed := h.tryAcquireLiveStreamSlot(r, channelID)
+			if !allowed {
+				httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
+				return
+			}
+			defer releaseSlot()
 		}
-		defer releaseSlot()
 	}
 
 	ua := h.channelUserAgent(channelID)
@@ -1587,7 +1823,7 @@ func (h *Handler) proxyChannelStreamWithSession(w http.ResponseWriter, r *http.R
 
 	// Multiplex continuous named channel streams across concurrent viewers via LiveStreamHub.
 	if h.streamHub != nil && strings.TrimSpace(channelID) != "" && !isSignedSubTarget && !isHLSStreamURLForHub(trimmed) {
-		h.serveMultiplexedStream(w, r, channelID, trimmed, ua, allowPrivateLAN, sessionIAT, maxExp, client)
+		h.serveMultiplexedStream(w, r, channelID, trimmed, ua, allowPrivateLAN, sessionIAT, maxExp, streamUID, client)
 		return
 	}
 
@@ -1647,7 +1883,7 @@ func (h *Handler) proxyChannelStreamWithSession(w http.ResponseWriter, r *http.R
 		}
 
 		proxyBase := computeHLSProxyBase(r, channelID)
-		rewritten := h.rewriteHLSPlaylistWithSession(string(raw), baseURL, channelID, proxyBase, "", allowPrivateLAN, sessionIAT, maxExp)
+		rewritten := h.rewriteHLSPlaylistWithSessionAndUser(string(raw), baseURL, channelID, proxyBase, "", allowPrivateLAN, sessionIAT, maxExp, streamUID)
 		safeCT := sanitizeLiveTVProxyContentType(ct, "application/vnd.apple.mpegurl")
 		w.Header().Set("Content-Type", safeCT)
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -1684,6 +1920,7 @@ func (h *Handler) serveMultiplexedStream(
 	channelID, streamURL, userAgent string,
 	allowPrivateLAN bool,
 	sessionIAT, maxExp int64,
+	streamUID string,
 	client *http.Client,
 ) {
 	key := streamKeyForChannel(channelID, streamURL, allowPrivateLAN)
@@ -1715,7 +1952,7 @@ func (h *Handler) serveMultiplexedStream(
 		}
 		if channelID != "" {
 			proxyBase := computeHLSProxyBase(r, channelID)
-			rewritten := h.rewriteHLSPlaylistWithSession(string(b.hlsRaw), b.baseURL, channelID, proxyBase, "", allowPrivateLAN, sessionIAT, maxExp)
+			rewritten := h.rewriteHLSPlaylistWithSessionAndUser(string(b.hlsRaw), b.baseURL, channelID, proxyBase, "", allowPrivateLAN, sessionIAT, maxExp, streamUID)
 			safeCT := sanitizeLiveTVProxyContentType(b.contentType, "application/vnd.apple.mpegurl")
 			w.Header().Set("Content-Type", safeCT)
 			w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -1848,6 +2085,10 @@ func (h *Handler) rewriteHLSPlaylistWithPolicyAndExp(playlist string, baseURL *u
 }
 
 func (h *Handler) rewriteHLSPlaylistWithSession(playlist string, baseURL *url.URL, channelID, proxyBase, token string, allowPrivateLAN bool, sessionIAT, maxExp int64) string {
+	return h.rewriteHLSPlaylistWithSessionAndUser(playlist, baseURL, channelID, proxyBase, token, allowPrivateLAN, sessionIAT, maxExp, "")
+}
+
+func (h *Handler) rewriteHLSPlaylistWithSessionAndUser(playlist string, baseURL *url.URL, channelID, proxyBase, token string, allowPrivateLAN bool, sessionIAT, maxExp int64, uid string) string {
 	if proxyBase == "" {
 		proxyBase = "Stream"
 	}
@@ -1866,6 +2107,7 @@ func (h *Handler) rewriteHLSPlaylistWithSession(playlist string, baseURL *url.UR
 	if allowPrivateLAN {
 		lanFlag = "1"
 	}
+	normUID := guid.Normalize(uid)
 	rewriteURI := func(rawURI string) (string, bool) {
 		trimmed := strings.TrimSpace(rawURI)
 		if trimmed == "" {
@@ -1889,11 +2131,19 @@ func (h *Handler) rewriteHLSPlaylistWithSession(playlist string, baseURL *url.UR
 		}
 		var proxied string
 		if sessionIAT > 0 {
-			sig := h.signProxyTargetWithIAT(channelID, resolvedStr, allowPrivateLAN, sessionIAT, exp)
-			proxied = proxyBase + "?target=" + url.QueryEscape(resolvedStr) + "&exp=" + strconv.FormatInt(exp, 10) + "&iat=" + strconv.FormatInt(sessionIAT, 10) + "&lan=" + lanFlag + "&sig=" + sig
+			sig := h.signProxyTargetWithIATAndUser(channelID, resolvedStr, allowPrivateLAN, sessionIAT, exp, normUID)
+			proxied = proxyBase + "?target=" + url.QueryEscape(resolvedStr) + "&exp=" + strconv.FormatInt(exp, 10) + "&iat=" + strconv.FormatInt(sessionIAT, 10) + "&lan=" + lanFlag
+			if normUID != "" {
+				proxied += "&uid=" + url.QueryEscape(normUID)
+			}
+			proxied += "&sig=" + sig
 		} else {
-			sig := h.signProxyTarget(channelID, resolvedStr, allowPrivateLAN, exp)
-			proxied = proxyBase + "?target=" + url.QueryEscape(resolvedStr) + "&exp=" + strconv.FormatInt(exp, 10) + "&lan=" + lanFlag + "&sig=" + sig
+			sig := h.signProxyTargetWithUser(channelID, resolvedStr, allowPrivateLAN, exp, normUID)
+			proxied = proxyBase + "?target=" + url.QueryEscape(resolvedStr) + "&exp=" + strconv.FormatInt(exp, 10) + "&lan=" + lanFlag
+			if normUID != "" {
+				proxied += "&uid=" + url.QueryEscape(normUID)
+			}
+			proxied += "&sig=" + sig
 		}
 		if token != "" {
 			proxied += "&api_key=" + url.QueryEscape(token)
@@ -1901,67 +2151,69 @@ func (h *Handler) rewriteHLSPlaylistWithSession(playlist string, baseURL *url.UR
 		return proxied, true
 	}
 
-	lines := strings.Split(playlist, "\n")
+	normalized := strings.ReplaceAll(strings.ReplaceAll(playlist, "\r\n", "\n"), "\r", "\n")
+	lines := strings.Split(normalized, "\n")
 	out := make([]string, 0, len(lines))
+	expectedProxyPrefix := proxyBase + "?target="
 	for _, line := range lines {
-		cr := ""
-		if strings.HasSuffix(line, "\r") {
-			cr = "\r"
-			line = strings.TrimSuffix(line, "\r")
-		}
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
-			out = append(out, line+cr)
+			out = append(out, line)
 			continue
 		}
 		if strings.HasPrefix(trimmed, "#") {
-			if strings.Contains(strings.ToUpper(line), "URI=") {
+			if hlsHasURIAttributeRe.MatchString(line) {
 				invalidURI := false
-				replaced := line
-				if strings.Contains(replaced, `"`) {
-					replaced = hlsURIAttributeRe.ReplaceAllStringFunc(replaced, func(match string) string {
-						if invalidURI {
-							return match
+				replaced := hlsURIAttributeRe.ReplaceAllStringFunc(line, func(match string) string {
+					if invalidURI {
+						return match
+					}
+					sub := hlsURIAttributeRe.FindStringSubmatch(match)
+					if len(sub) < 3 {
+						invalidURI = true
+						return match
+					}
+					rawURI := sub[1]
+					if !strings.Contains(match, `"`) {
+						rawURI = sub[2]
+					}
+					if strings.TrimSpace(rawURI) == "" {
+						invalidURI = true
+						return match
+					}
+					rewritten, ok := rewriteURI(rawURI)
+					if !ok {
+						invalidURI = true
+						return match
+					}
+					return `URI="` + rewritten + `"`
+				})
+				if !invalidURI && baseURL != nil {
+					// Fail closed if any URI= attribute remained unrewritten or points outside proxyBase.
+					allAttrs := hlsHasURIAttributeRe.FindAllStringIndex(replaced, -1)
+					matchedAttrs := hlsURIAttributeRe.FindAllStringSubmatch(replaced, -1)
+					if len(allAttrs) != len(matchedAttrs) {
+						invalidURI = true
+					} else {
+						for _, sub := range matchedAttrs {
+							val := sub[1]
+							if val == "" {
+								val = sub[2]
+							}
+							if !strings.HasPrefix(val, expectedProxyPrefix) {
+								invalidURI = true
+								break
+							}
 						}
-						sub := hlsURIAttributeRe.FindStringSubmatch(match)
-						if len(sub) < 2 {
-							return match
-						}
-						if strings.TrimSpace(sub[1]) == "" {
-							return match
-						}
-						rewritten, ok := rewriteURI(sub[1])
-						if !ok {
-							invalidURI = true
-							return match
-						}
-						return `URI="` + rewritten + `"`
-					})
-				}
-				if !invalidURI {
-					replaced = hlsUnquotedURIAttributeRe.ReplaceAllStringFunc(replaced, func(match string) string {
-						if invalidURI {
-							return match
-						}
-						sub := hlsUnquotedURIAttributeRe.FindStringSubmatch(match)
-						if len(sub) < 2 || strings.TrimSpace(sub[1]) == "" {
-							return match
-						}
-						rewritten, ok := rewriteURI(sub[1])
-						if !ok {
-							invalidURI = true
-							return match
-						}
-						return `URI="` + rewritten + `"`
-					})
+					}
 				}
 				if invalidURI {
 					continue
 				}
-				out = append(out, replaced+cr)
+				out = append(out, replaced)
 				continue
 			}
-			out = append(out, line+cr)
+			out = append(out, line)
 			continue
 		}
 		rewritten, ok := rewriteURI(trimmed)
@@ -1971,7 +2223,7 @@ func (h *Handler) rewriteHLSPlaylistWithSession(playlist string, baseURL *url.UR
 			}
 			continue
 		}
-		out = append(out, rewritten+cr)
+		out = append(out, rewritten)
 	}
 	return strings.Join(out, "\n")
 }
@@ -2303,15 +2555,56 @@ func (h *Handler) handleGetProgram(w http.ResponseWriter, r *http.Request) {
 	httpx.Error(w, http.StatusNotFound, "program not found")
 }
 
+func (h *Handler) callerUserPolicy(r *http.Request) (dto.UserPolicy, bool, bool) {
+	if r == nil {
+		return dto.UserPolicy{}, false, false
+	}
+	callerID, isAdmin, hasAuth := h.callerAuthInfo(r)
+	if !hasAuth {
+		return dto.UserPolicy{}, false, false
+	}
+	if isAdmin {
+		return dto.UserPolicy{IsAdministrator: true}, true, true
+	}
+	if ur := h.getUserRepo(); ur != nil && callerID != "" {
+		if u, err := ur.GetUserByID(r.Context(), guid.Normalize(callerID)); err == nil && u != nil {
+			return u.Policy, u.IsAdmin || u.Policy.IsAdministrator, true
+		}
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil {
+		return ac.User.Policy, ac.IsAdmin(), true
+	}
+	return dto.UserPolicy{}, false, true
+}
+
+func (h *Handler) canCallerAccessRecording(ctx context.Context, libRepo *sqlite.LibraryRepo, pol dto.UserPolicy, isAdmin, hasAuth bool, recordingID string) bool {
+	if !hasAuth || isAdmin || libRepo == nil {
+		return true
+	}
+	item, err := libRepo.GetItemRecordByID(ctx, recordingID)
+	if errors.Is(err, sqlite.ErrNotFound) || item == nil {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+	if item.LibraryID != "" && !libRepo.CanUserAccessLibrary(ctx, pol, item.LibraryID) {
+		return false
+	}
+	blocked, err := libRepo.IsItemBlockedByPolicy(ctx, item, pol)
+	return err == nil && !blocked
+}
+
 func (h *Handler) handleListRecordings(w http.ResponseWriter, r *http.Request) {
 	q := httpx.ParseQuery(r)
 	chID := q.Get("ChannelId")
 	status := strings.ToLower(q.Get("Status"))
-	_, isAdmin, hasAuth := h.callerAuthInfo(r)
+	pol, isAdmin, hasAuth := h.callerUserPolicy(r)
 	hidePath := hasAuth && !isAdmin
+	libRepo := h.resolveLibraryRepo()
 
 	h.mu.RLock()
-	filtered := make([]RecordingInfo, 0, len(h.state.Recordings))
+	candidates := make([]RecordingInfo, 0, len(h.state.Recordings))
 	for _, rec := range h.state.Recordings {
 		if chID != "" && rec.ChannelId != chID {
 			continue
@@ -2322,9 +2615,17 @@ func (h *Handler) handleListRecordings(w http.ResponseWriter, r *http.Request) {
 		if hidePath {
 			rec.Path = ""
 		}
-		filtered = append(filtered, rec)
+		candidates = append(candidates, rec)
 	}
 	h.mu.RUnlock()
+
+	filtered := make([]RecordingInfo, 0, len(candidates))
+	for _, rec := range candidates {
+		if !h.canCallerAccessRecording(r.Context(), libRepo, pol, isAdmin, hasAuth, rec.Id) {
+			continue
+		}
+		filtered = append(filtered, rec)
+	}
 
 	page, total := paginate(filtered, q.Int("StartIndex", 0), q.Int("Limit", 0))
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[RecordingInfo]{
@@ -2335,20 +2636,30 @@ func (h *Handler) handleListRecordings(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleGetRecording(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("Id")
-	_, isAdmin, hasAuth := h.callerAuthInfo(r)
+	pol, isAdmin, hasAuth := h.callerUserPolicy(r)
 	hidePath := hasAuth && !isAdmin
 	h.mu.RLock()
-	defer h.mu.RUnlock()
+	var found *RecordingInfo
 	for _, rec := range h.state.Recordings {
 		if rec.Id == id {
+			copyRec := rec
 			if hidePath {
-				rec.Path = ""
+				copyRec.Path = ""
 			}
-			httpx.JSON(w, http.StatusOK, rec)
-			return
+			found = &copyRec
+			break
 		}
 	}
-	httpx.Error(w, http.StatusNotFound, "recording not found")
+	h.mu.RUnlock()
+	if found == nil {
+		httpx.Error(w, http.StatusNotFound, "recording not found")
+		return
+	}
+	if !h.canCallerAccessRecording(r.Context(), h.resolveLibraryRepo(), pol, isAdmin, hasAuth, found.Id) {
+		httpx.Error(w, http.StatusForbidden, "access to this recording is denied")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, *found)
 }
 
 // DeleteRecording removes a recording by ID, persists state, and deletes its file if inside RecordingsDir.
@@ -3617,6 +3928,7 @@ func (h *Handler) DeleteTunerHost(ctx context.Context, id string) bool {
 			_ = recorder.CancelRecording(tid)
 		}
 	}
+	h.pruneOrphanedChannelMappings(ctx)
 	return true
 }
 
@@ -3691,7 +4003,7 @@ func (h *Handler) handleSaveListingProvider(w http.ResponseWriter, r *http.Reque
 		h.state.ListingProviders = append(h.state.ListingProviders, lp)
 	}
 	if guide != nil && len(guide.Programmes) > 0 {
-		mappings := h.loadManualChannelMappings(r.Context())
+		mappings := h.loadManualChannelMappingsForProvider(r.Context(), lp.Id)
 		h.applyXMLTVGuideWithMappingsLocked(guide, mappings)
 		for _, st := range h.state.SeriesTimers {
 			h.scheduleTimersForSeriesLocked(st)
@@ -4088,7 +4400,7 @@ func (h *Handler) DiscoverTuners(ctx context.Context, probeURL string) []TunerHo
 	return existing
 }
 
-func (h *Handler) loadManualChannelMappings(ctx context.Context) map[string][]string {
+func (h *Handler) loadManualChannelMappingsByProvider(ctx context.Context, activeProviderIDs map[string]struct{}) map[string]map[string][]string {
 	if h.store == nil {
 		return nil
 	}
@@ -4111,9 +4423,14 @@ func (h *Handler) loadManualChannelMappings(ctx context.Context) map[string][]st
 	if err := json.Unmarshal([]byte(raw), &parsed); err != nil || len(parsed.ChannelMappings) == 0 {
 		return nil
 	}
-	// Build lookup: lowercase ProviderChannelId -> []TunerChannelId
-	byProviderCh := make(map[string][]string)
-	for _, list := range parsed.ChannelMappings {
+	out := make(map[string]map[string][]string)
+	for provID, list := range parsed.ChannelMappings {
+		if activeProviderIDs != nil {
+			if _, ok := activeProviderIDs[provID]; !ok {
+				continue
+			}
+		}
+		byProviderCh := make(map[string][]string)
 		for _, m := range list {
 			tunerChID := strings.TrimSpace(m.Name)
 			provChID := strings.ToLower(strings.TrimSpace(m.Value))
@@ -4131,18 +4448,185 @@ func (h *Handler) loadManualChannelMappings(ctx context.Context) map[string][]st
 				byProviderCh[provChID] = append(byProviderCh[provChID], tunerChID)
 			}
 		}
+		if len(byProviderCh) > 0 {
+			out[provID] = byProviderCh
+		}
 	}
-	return byProviderCh
+	return out
 }
 
-// RefreshAllGuides reloads all configured XMLTV listing providers, applies manual ChannelMappings first,
+func (h *Handler) loadManualChannelMappingsForProvider(ctx context.Context, providerID string) map[string][]string {
+	if strings.TrimSpace(providerID) == "" {
+		return nil
+	}
+	byProv := h.loadManualChannelMappingsByProvider(ctx, map[string]struct{}{providerID: {}})
+	return byProv[providerID]
+}
+
+func (h *Handler) loadManualChannelMappingsLocked(ctx context.Context) map[string][]string {
+	activeIDs := make(map[string]struct{}, len(h.state.ListingProviders))
+	for _, lp := range h.state.ListingProviders {
+		activeIDs[lp.Id] = struct{}{}
+	}
+	byProv := h.loadManualChannelMappingsByProvider(ctx, activeIDs)
+	if len(byProv) == 0 {
+		return nil
+	}
+	merged := make(map[string][]string)
+	for _, m := range byProv {
+		for provChID, tunerIDs := range m {
+			for _, tid := range tunerIDs {
+				dup := false
+				for _, existing := range merged[provChID] {
+					if strings.EqualFold(existing, tid) {
+						dup = true
+						break
+					}
+				}
+				if !dup {
+					merged[provChID] = append(merged[provChID], tid)
+				}
+			}
+		}
+	}
+	return merged
+}
+
+func (h *Handler) loadManualChannelMappings(ctx context.Context) map[string][]string {
+	providers := h.SnapshotListingProviders()
+	activeIDs := make(map[string]struct{}, len(providers))
+	for _, lp := range providers {
+		activeIDs[lp.Id] = struct{}{}
+	}
+	byProv := h.loadManualChannelMappingsByProvider(ctx, activeIDs)
+	if len(byProv) == 0 {
+		return nil
+	}
+	merged := make(map[string][]string)
+	for _, m := range byProv {
+		for provChID, tunerIDs := range m {
+			for _, tid := range tunerIDs {
+				dup := false
+				for _, existing := range merged[provChID] {
+					if strings.EqualFold(existing, tid) {
+						dup = true
+						break
+					}
+				}
+				if !dup {
+					merged[provChID] = append(merged[provChID], tid)
+				}
+			}
+		}
+	}
+	return merged
+}
+
+func (h *Handler) pruneOrphanedChannelMappings(ctx context.Context) {
+	if h.store == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	h.mu.RLock()
+	activeProviders := make(map[string]struct{}, len(h.state.ListingProviders))
+	for _, lp := range h.state.ListingProviders {
+		activeProviders[lp.Id] = struct{}{}
+	}
+	activeChannels := make(map[string]struct{}, len(h.state.Channels))
+	for _, ch := range h.state.Channels {
+		activeChannels[ch.Id] = struct{}{}
+	}
+	h.mu.RUnlock()
+
+	var raw string
+	err := h.store.Reader.QueryRowContext(ctx,
+		`SELECT value_json FROM server_config WHERE key = ?`, "compatext:state",
+	).Scan(&raw)
+	if err != nil || strings.TrimSpace(raw) == "" {
+		return
+	}
+	var root map[string]any
+	if err := json.Unmarshal([]byte(raw), &root); err != nil || root == nil {
+		return
+	}
+	cmRaw, ok := root["channel_mappings"]
+	if !ok || cmRaw == nil {
+		return
+	}
+	cmBytes, err := json.Marshal(cmRaw)
+	if err != nil {
+		return
+	}
+	type mappingEntry struct {
+		Name  string `json:"Name"`
+		Value string `json:"Value"`
+	}
+	var cm map[string][]mappingEntry
+	if err := json.Unmarshal(cmBytes, &cm); err != nil || len(cm) == 0 {
+		return
+	}
+
+	modified := false
+	cleaned := make(map[string][]mappingEntry, len(cm))
+	for provID, list := range cm {
+		if _, exists := activeProviders[provID]; !exists {
+			modified = true
+			continue
+		}
+		kept := make([]mappingEntry, 0, len(list))
+		for _, m := range list {
+			tunerID := strings.TrimSpace(m.Name)
+			provCh := strings.TrimSpace(m.Value)
+			if tunerID == "" || provCh == "" {
+				modified = true
+				continue
+			}
+			if _, exists := activeChannels[tunerID]; !exists {
+				modified = true
+				continue
+			}
+			kept = append(kept, m)
+		}
+		if len(kept) == 0 {
+			if len(list) > 0 {
+				modified = true
+			}
+			continue
+		}
+		cleaned[provID] = kept
+	}
+	if !modified {
+		return
+	}
+	root["channel_mappings"] = cleaned
+	updated, err := json.Marshal(root)
+	if err != nil {
+		return
+	}
+	_, _ = h.store.Writer.ExecContext(ctx,
+		`INSERT INTO server_config (key, value_json, updated_at) VALUES (?, ?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+		"compatext:state", string(updated), time.Now().UTC().Unix(),
+	)
+}
+
+// RefreshAllGuides reloads all configured XMLTV listing providers, applies per-provider manual
+// ChannelMappings first, clears stale XMLTV programs for channels no longer matched,
 // prunes historical programs that ended more than 24 hours ago, reschedules SeriesTimers, and persists state.
 func (h *Handler) RefreshAllGuides(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	type fetchedGuide struct {
+		providerID   string
+		providerType string
+		rawPath      string
+		guide        *XMLTVGuide
+	}
 	providers := h.SnapshotListingProviders()
-	var guides []*XMLTVGuide
+	var guides []fetchedGuide
 	var firstErr error
 	for _, lp := range providers {
 		rawPath := strings.TrimSpace(lp.Path)
@@ -4161,19 +4645,57 @@ func (h *Handler) RefreshAllGuides(ctx context.Context) error {
 			continue
 		}
 		if g != nil && len(g.Programmes) > 0 {
-			guides = append(guides, g)
+			guides = append(guides, fetchedGuide{
+				providerID:   lp.Id,
+				providerType: lp.Type,
+				rawPath:      rawPath,
+				guide:        g,
+			})
 		}
 	}
-	mappings := h.loadManualChannelMappings(ctx)
 	cutoff := time.Now().UTC().Add(-24 * time.Hour)
 
 	h.mu.Lock()
 	snapshot := cloneLiveTVState(h.state)
 	changed := false
 
-	for _, g := range guides {
-		h.applyXMLTVGuideWithMappingsLocked(g, mappings)
-		changed = true
+	activeProviders := make(map[string]ListingProviderInfo, len(h.state.ListingProviders))
+	activeProviderIDs := make(map[string]struct{}, len(h.state.ListingProviders))
+	for _, lp := range h.state.ListingProviders {
+		activeProviders[lp.Id] = lp
+		activeProviderIDs[lp.Id] = struct{}{}
+	}
+	mappingsByProvider := h.loadManualChannelMappingsByProvider(ctx, activeProviderIDs)
+
+	allMatchedChannelIDs := make(map[string]struct{})
+	for _, fg := range guides {
+		curLP, exists := activeProviders[fg.providerID]
+		if !exists || !strings.EqualFold(curLP.Type, fg.providerType) || strings.TrimSpace(curLP.Path) != fg.rawPath {
+			continue
+		}
+		matched := h.applyXMLTVGuideWithMappingsLocked(fg.guide, mappingsByProvider[fg.providerID])
+		for chID := range matched {
+			allMatchedChannelIDs[chID] = struct{}{}
+		}
+		if len(matched) > 0 {
+			changed = true
+		}
+	}
+
+	// Clear stale XMLTV-sourced programs for channels no longer matched by any active listing provider
+	// (e.g. after unmapping a channel or removing a provider), only when all fetches succeeded.
+	if firstErr == nil && len(h.state.Programs) > 0 {
+		kept := make([]ProgramInfo, 0, len(h.state.Programs))
+		for _, p := range h.state.Programs {
+			if p.Source == "xmltv" {
+				if _, ok := allMatchedChannelIDs[p.ChannelId]; !ok {
+					changed = true
+					continue
+				}
+			}
+			kept = append(kept, p)
+		}
+		h.state.Programs = kept
 	}
 
 	// Prune historical EPG programs expired for more than 24 hours.
@@ -4211,12 +4733,12 @@ func (h *Handler) RefreshAllGuides(ctx context.Context) error {
 }
 
 func (h *Handler) applyXMLTVGuideLocked(guide *XMLTVGuide) {
-	h.applyXMLTVGuideWithMappingsLocked(guide, h.loadManualChannelMappings(context.Background()))
+	h.applyXMLTVGuideWithMappingsLocked(guide, h.loadManualChannelMappingsLocked(context.Background()))
 }
 
-func (h *Handler) applyXMLTVGuideWithMappingsLocked(guide *XMLTVGuide, manualByProviderCh map[string][]string) {
+func (h *Handler) applyXMLTVGuideWithMappingsLocked(guide *XMLTVGuide, manualByProviderCh map[string][]string) map[string]struct{} {
 	if guide == nil || len(guide.Programmes) == 0 || len(h.state.Channels) == 0 {
-		return
+		return nil
 	}
 
 	byTvgID := make(map[string]ChannelInfo, len(h.state.Channels))
@@ -4320,12 +4842,13 @@ func (h *Handler) applyXMLTVGuideWithMappingsLocked(guide *XMLTVGuide, manualByP
 				IsMovie:       isMovie,
 				IsSeries:      isSeries,
 				IsRepeat:      prog.PreviouslyShown,
+				Source:        "xmltv",
 			})
 		}
 	}
 
 	if len(matchedChannelIDs) == 0 {
-		return
+		return nil
 	}
 
 	kept := make([]ProgramInfo, 0, len(h.state.Programs)+len(newPrograms))
@@ -4336,9 +4859,10 @@ func (h *Handler) applyXMLTVGuideWithMappingsLocked(guide *XMLTVGuide, manualByP
 	}
 	kept = append(kept, newPrograms...)
 	h.state.Programs = kept
+	return matchedChannelIDs
 }
 
-// DeleteListingProvider removes a listing provider by ID and persists state.
+// DeleteListingProvider removes a listing provider by ID, prunes orphaned channel mappings, and persists state.
 func (h *Handler) DeleteListingProvider(ctx context.Context, id string) bool {
 	h.mu.Lock()
 	for i, lp := range h.state.ListingProviders {
@@ -4346,6 +4870,7 @@ func (h *Handler) DeleteListingProvider(ctx context.Context, id string) bool {
 			h.state.ListingProviders = append(h.state.ListingProviders[:i], h.state.ListingProviders[i+1:]...)
 			h.saveStateLocked(ctx)
 			h.mu.Unlock()
+			h.pruneOrphanedChannelMappings(ctx)
 			return true
 		}
 	}

@@ -230,3 +230,231 @@ func TestIncludeItemTypesLargeSetBindLimitSafety(t *testing.T) {
 		t.Fatalf("unexpected ListFilterValuesWithUserPolicy result: total=%d vals=%+v", totalVals, vals)
 	}
 }
+
+func TestPrivatePlaylistIsolationInLatestAndSimilar(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	repo := NewLibraryRepo(st)
+	userRepo := NewUserRepo(st)
+
+	lib, err := repo.CreateLibrary(ctx, "Movies", "movies", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mov := &ItemRecord{ID: guid.New(), LibraryID: lib.ID, ParentID: lib.ID, Type: "Movie", Name: "Matrix", SortName: "matrix"}
+	if err := repo.UpsertItem(ctx, mov); err != nil {
+		t.Fatal(err)
+	}
+
+	alice := &UserRecord{ID: guid.New(), Name: "alice_priv", Policy: DefaultUserPolicy(false), Config: DefaultUserConfig()}
+	bob := &UserRecord{ID: guid.New(), Name: "bob_priv", Policy: DefaultUserPolicy(false), Config: DefaultUserConfig()}
+	if err := userRepo.CreateUser(ctx, alice); err != nil {
+		t.Fatal(err)
+	}
+	if err := userRepo.CreateUser(ctx, bob); err != nil {
+		t.Fatal(err)
+	}
+
+	alicePriv, err := repo.CreatePlaylist(ctx, "Alice Private", "Video", alice.ID, []string{mov.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobSeed, err := repo.CreatePlaylist(ctx, "Bob Seed", "Video", bob.ID, []string{mov.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubPl, err := repo.CreatePlaylist(ctx, "Public Mix", "Video", alice.ID, []string{mov.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Writer.ExecContext(ctx,
+		`INSERT OR REPLACE INTO server_config(key, value_json, updated_at) VALUES(?, '{"IsPublic":true}', 1)`,
+		"item_visibility_"+guid.Normalize(pubPl.ID),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Bob must NEVER see Alice's private playlist in GetLatestItemsWithUserPolicy.
+	latestBob, err := repo.GetLatestItemsWithUserPolicy(ctx, "srv1", bob.ID, "", []string{"Playlist"}, 20, nil, nil, bob.Policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range latestBob {
+		if guid.Normalize(it.Id) == guid.Normalize(alicePriv.ID) {
+			t.Fatalf("Alice's private playlist leaked to Bob via GetLatestItemsWithUserPolicy")
+		}
+	}
+
+	// 2. Empty userID + non-admin policy must ONLY see public playlists in GetLatestItemsWithUserPolicy.
+	latestAnon, err := repo.GetLatestItemsWithUserPolicy(ctx, "srv1", "", "", []string{"Playlist"}, 20, nil, nil, DefaultUserPolicy(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range latestAnon {
+		if guid.Normalize(it.Id) == guid.Normalize(alicePriv.ID) || guid.Normalize(it.Id) == guid.Normalize(bobSeed.ID) {
+			t.Fatalf("private playlist %q leaked to unauthenticated non-admin GetLatestItemsWithUserPolicy", it.Name)
+		}
+	}
+
+	// 3. Bob must NEVER see Alice's private playlist in GetSimilarItemsWithUserPolicy.
+	similarBob, _, err := repo.GetSimilarItemsWithUserPolicy(ctx, "srv1", bob.ID, bobSeed.ID, 20, nil, nil, bob.Policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range similarBob {
+		if guid.Normalize(it.Id) == guid.Normalize(alicePriv.ID) {
+			t.Fatalf("Alice's private playlist leaked to Bob via GetSimilarItemsWithUserPolicy")
+		}
+	}
+
+	// 4. Empty userID + non-admin policy seeded from public playlist must NEVER see private playlists in GetSimilarItemsWithUserPolicy.
+	similarAnon, _, err := repo.GetSimilarItemsWithUserPolicy(ctx, "srv1", "", pubPl.ID, 20, nil, nil, DefaultUserPolicy(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range similarAnon {
+		if guid.Normalize(it.Id) == guid.Normalize(alicePriv.ID) || guid.Normalize(it.Id) == guid.Normalize(bobSeed.ID) {
+			t.Fatalf("private playlist %q leaked to unauthenticated non-admin GetSimilarItemsWithUserPolicy", it.Name)
+		}
+	}
+}
+
+func TestLocalExtrasParentPolicyInheritanceAndVirtualLibraryPolicy(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	repo := NewLibraryRepo(st)
+	userRepo := NewUserRepo(st)
+
+	lib, err := repo.CreateLibrary(ctx, "Movies", "movies", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gMovie := &ItemRecord{
+		ID:             guid.New(),
+		LibraryID:      lib.ID,
+		ParentID:       lib.ID,
+		Type:           "Movie",
+		Name:           "Kids Movie",
+		SortName:       "kids movie",
+		OfficialRating: "G",
+	}
+	rMovie := &ItemRecord{
+		ID:             guid.New(),
+		LibraryID:      lib.ID,
+		ParentID:       lib.ID,
+		Type:           "Movie",
+		Name:           "Adult Movie",
+		SortName:       "adult movie",
+		OfficialRating: "R",
+	}
+	gTrailer := &ItemRecord{
+		ID:        guid.New(),
+		LibraryID: lib.ID,
+		ParentID:  gMovie.ID,
+		Type:      "Video",
+		Name:      "Kids Trailer",
+		SortName:  "kids trailer",
+		Extra:     ItemExtra{ExtraType: "Trailer"},
+	}
+	rTrailer := &ItemRecord{
+		ID:        guid.New(),
+		LibraryID: lib.ID,
+		ParentID:  rMovie.ID,
+		Type:      "Video",
+		Name:      "Adult Trailer",
+		SortName:  "adult trailer",
+		Extra:     ItemExtra{ExtraType: "Trailer"},
+	}
+	for _, rec := range []*ItemRecord{gMovie, rMovie, gTrailer, rTrailer} {
+		if err := repo.UpsertItem(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repo.ReplaceItemTaxonomies(ctx, gMovie.ID, "tag", []string{"kids"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReplaceItemTaxonomies(ctx, rMovie.ID, "tag", []string{"gore"}); err != nil {
+		t.Fatal(err)
+	}
+
+	maxPG := ParseParentalRatingValue("PG")
+	kidsPol := dto.UserPolicy{
+		EnableAllFolders:   false,
+		EnabledFolders:     []string{lib.ID},
+		EnableLiveTvAccess: true,
+		MaxParentalRating:  &maxPG,
+		BlockUnratedItems:  []string{"All"},
+		AllowedTags:        []string{"kids"},
+		BlockedTags:        []string{"gore"},
+	}
+
+	// Trailer of R-rated movie must be blocked via parent inheritance.
+	if blocked, err := repo.IsItemBlockedByPolicy(ctx, rTrailer, kidsPol); err != nil || !blocked {
+		t.Fatalf("expected R-rated movie trailer to be blocked, got blocked=%v err=%v", blocked, err)
+	}
+	// Trailer of G-rated movie inherits "G" rating so it is NOT blocked by BlockUnratedItems=["All"] / MaxParentalRating=PG.
+	kidsRatingPol := kidsPol
+	kidsRatingPol.AllowedTags = nil
+	if blocked, err := repo.IsItemBlockedByPolicy(ctx, gTrailer, kidsRatingPol); err != nil || blocked {
+		t.Fatalf("expected G-rated trailer to inherit rating and be allowed under BlockUnratedItems=[All], got blocked=%v err=%v", blocked, err)
+	}
+	// Under strict AllowedTags allowlist, an untagged extra stays blocked until explicitly tagged.
+	if blocked, err := repo.IsItemBlockedByPolicy(ctx, gTrailer, kidsPol); err != nil || !blocked {
+		t.Fatalf("expected untagged extra to be blocked under strict AllowedTags, got blocked=%v err=%v", blocked, err)
+	}
+	if err := repo.ReplaceItemTaxonomies(ctx, gTrailer.ID, "tag", []string{"kids"}); err != nil {
+		t.Fatal(err)
+	}
+	if blocked, err := repo.IsItemBlockedByPolicy(ctx, gTrailer, kidsPol); err != nil || blocked {
+		t.Fatalf("expected G-rated kids-tagged trailer to be allowed, got blocked=%v err=%v", blocked, err)
+	}
+
+	// Virtual libraries "collections" and "playlists" must be accessible to folder-restricted users.
+	if !repo.CanUserAccessLibrary(ctx, kidsPol, "collections") || !repo.CanUserAccessLibrary(ctx, kidsPol, "playlists") {
+		t.Fatalf("expected virtual libraries collections/playlists to be accessible in CanUserAccessLibrary")
+	}
+
+	// Playlist container must NOT be falsely blocked by BlockUnratedItems=["All"] or AllowedTags=["kids"].
+	pl, err := repo.CreatePlaylist(ctx, "Kids Mix", "Video", "", []string{gMovie.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked, err := repo.IsItemBlockedByPolicy(ctx, pl, kidsPol); err != nil || blocked {
+		t.Fatalf("expected Playlist container not to be falsely blocked by BlockUnratedItems=[All]/AllowedTags, got blocked=%v err=%v", blocked, err)
+	}
+
+	// loadRestrictedUserPolicy must fail closed on missing user or corrupted policy_json.
+	_, missLibs, missRestricted := repo.loadRestrictedUserPolicy(ctx, guid.New())
+	if !missRestricted || missLibs == nil || len(missLibs) != 0 {
+		t.Fatalf("expected missing user to fail closed, got libs=%v restricted=%v", missLibs, missRestricted)
+	}
+	badUser := &UserRecord{ID: guid.New(), Name: "bad_json_user", Policy: DefaultUserPolicy(false)}
+	if err := userRepo.CreateUser(ctx, badUser); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Writer.ExecContext(ctx, `UPDATE users SET policy_json = '{not-json' WHERE id = ?`, badUser.ID); err != nil {
+		t.Fatal(err)
+	}
+	_, badLibs, badRestricted := repo.loadRestrictedUserPolicy(ctx, badUser.ID)
+	if !badRestricted || badLibs == nil || len(badLibs) != 0 {
+		t.Fatalf("expected corrupted policy_json to fail closed, got libs=%v restricted=%v", badLibs, badRestricted)
+	}
+
+	// QueryItems with empty UserID and IsPlayed=true / IsFavorite=true / IsResumable=true must return 0 items.
+	tr := true
+	for _, tc := range []struct {
+		name string
+		f    ItemFilter
+	}{
+		{"IsPlayed", ItemFilter{IsPlayed: &tr}},
+		{"IsFavorite", ItemFilter{IsFavorite: &tr}},
+		{"IsResumable", ItemFilter{IsResumable: &tr}},
+		{"IsLiked", ItemFilter{IsLiked: &tr}},
+	} {
+		items, total, err := repo.QueryItems(ctx, tc.f)
+		if err != nil || total != 0 || len(items) != 0 {
+			t.Fatalf("expected empty result for %s with empty UserID, got total=%d len=%d err=%v", tc.name, total, len(items), err)
+		}
+	}
+}
+

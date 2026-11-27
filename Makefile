@@ -2,7 +2,7 @@ APP_NAME      := ambra
 CMD_PKG       := ./cmd/ambra
 BIN_DIR       := bin
 DIST_DIR      := dist
-AMBRA_VERSION ?= v0.12.1
+AMBRA_VERSION ?= v0.12.2
 LDFLAGS       ?= -s -w -X github.com/ambra-media/ambra/internal/config.AmbraVersion=$(AMBRA_VERSION)
 
 PLATFORMS  := \
@@ -25,7 +25,7 @@ help:
 web:
 	cd web && (test -d node_modules || npm ci) && npm run build
 
-build:
+build: web
 	@mkdir -p $(BIN_DIR)
 	CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" -o $(BIN_DIR)/$(APP_NAME) $(CMD_PKG)
 
@@ -36,7 +36,7 @@ cover:
 	go test -count=1 -coverprofile=coverage.out ./...
 	@go tool cover -func=coverage.out | tail -n 1
 
-release-all:
+release-all: web
 	@rm -rf $(DIST_DIR)
 	@mkdir -p $(DIST_DIR)
 	@for target in $(PLATFORMS); do \

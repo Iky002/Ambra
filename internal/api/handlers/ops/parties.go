@@ -85,6 +85,10 @@ func (h *Handler) canAccessPartyItem(r *http.Request, explicitUserID, itemID str
 		return true
 	}
 	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		normExplicit := guid.Normalize(explicitUserID)
+		if normExplicit != "" && normExplicit != guid.Normalize(ac.UserID()) {
+			return h.canMemberAccessPartyItem(r, normExplicit, trimmedItem)
+		}
 		if ac.IsAdmin() {
 			return true
 		}
@@ -251,6 +255,42 @@ func (h *Handler) pushPartyWS(members []string, msg ws.Message) {
 	if hub := h.getWSHub(); hub != nil && len(members) > 0 {
 		hub.SendToUsers(members, msg)
 	}
+}
+
+func (h *Handler) pushPartyUpdatedWS(r *http.Request, members []string, eventParty Party) {
+	hub := h.getWSHub()
+	if hub == nil || len(members) == 0 {
+		return
+	}
+	if strings.TrimSpace(eventParty.State.ItemId) != "" && h.getItemAccessChecker() != nil {
+		var allowedMembers, scrubbedMembers []string
+		for _, m := range members {
+			if h.canMemberAccessPartyItem(r, m, eventParty.State.ItemId) {
+				allowedMembers = append(allowedMembers, m)
+			} else {
+				scrubbedMembers = append(scrubbedMembers, m)
+			}
+		}
+		if len(allowedMembers) > 0 {
+			hub.SendToUsers(allowedMembers, ws.Message{
+				MessageType: "PartyUpdated",
+				Data:        eventParty,
+			})
+		}
+		if len(scrubbedMembers) > 0 {
+			scrubbed := eventParty
+			scrubbed.State.ItemId = ""
+			hub.SendToUsers(scrubbedMembers, ws.Message{
+				MessageType: "PartyUpdated",
+				Data:        scrubbed,
+			})
+		}
+		return
+	}
+	hub.SendToUsers(members, ws.Message{
+		MessageType: "PartyUpdated",
+		Data:        eventParty,
+	})
 }
 
 func (h *Handler) handleListParties(w http.ResponseWriter, r *http.Request) {
@@ -573,10 +613,7 @@ func (h *Handler) handleLeaveCurrentParty(w http.ResponseWriter, r *http.Request
 	h.mu.Unlock()
 
 	for _, n := range notifyLists {
-		h.pushPartyWS(n.members, ws.Message{
-			MessageType: "PartyUpdated",
-			Data:        n.party,
-		})
+		h.pushPartyUpdatedWS(r, n.members, n.party)
 	}
 	httpx.NoContent(w)
 }
@@ -816,11 +853,17 @@ func (h *Handler) handleJoinParty(w http.ResponseWriter, r *http.Request) {
 				}
 				delete(h.partyJoinFails, failKey)
 			}
+			const maxPartyJoinVerifyRetries = 4
 			verifiedItemID := ""
-			for {
+			for attempt := 0; ; attempt++ {
 				partyItemID := strings.TrimSpace(p.State.ItemId)
 				if partyItemID == "" || partyItemID == verifiedItemID {
 					break
+				}
+				if attempt >= maxPartyJoinVerifyRetries {
+					h.mu.Unlock()
+					httpx.Error(w, http.StatusConflict, "party item changed concurrently; please retry")
+					return
 				}
 				if r.Context().Err() != nil {
 					h.mu.Unlock()
@@ -872,10 +915,7 @@ func (h *Handler) handleJoinParty(w http.ResponseWriter, r *http.Request) {
 			h.mu.Unlock()
 
 			if !exists {
-				h.pushPartyWS(members, ws.Message{
-					MessageType: "PartyUpdated",
-					Data:        eventParty,
-				})
+				h.pushPartyUpdatedWS(r, members, eventParty)
 			}
 			httpx.JSON(w, http.StatusOK, party)
 			return
@@ -958,10 +998,7 @@ func (h *Handler) handleLeaveParty(w http.ResponseWriter, r *http.Request) {
 			h.mu.Unlock()
 
 			if eventParty != nil {
-				h.pushPartyWS(notifyMembers, ws.Message{
-					MessageType: "PartyUpdated",
-					Data:        *eventParty,
-				})
+				h.pushPartyUpdatedWS(r, notifyMembers, *eventParty)
 			}
 			httpx.NoContent(w)
 			return

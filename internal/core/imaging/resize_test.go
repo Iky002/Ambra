@@ -409,13 +409,34 @@ func TestServiceDiskCacheSingleflightDegradationAndETag(t *testing.T) {
 		t.Fatalf("expected PNG disk cache hit without reprocessing")
 	}
 
-	// 5. Corrupted image graceful degradation (returns original bytes, no error)
+	// 5. Arbitrary non-image bytes must NOT be served via raw-byte fallback on resize failure.
+	if _, err := svc.GetImageWithOptions(ctx, badItemID, "Primary", 0, Options{MaxWidth: 50}); err == nil {
+		t.Fatalf("expected error for non-image bytes on resize fallback, got nil")
+	}
+
+	// 5b. Corrupted image with valid JPEG magic bytes degrades gracefully.
+	corruptJpegBytes := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00, 0x01, 0x01, 0x00, 0xFF}
+	if err := os.WriteFile(badPath, corruptJpegBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	badRes, err := svc.GetImageWithOptions(ctx, badItemID, "Primary", 0, Options{MaxWidth: 50})
 	if err != nil {
-		t.Fatalf("expected graceful degradation for corrupted image, got err: %v", err)
+		t.Fatalf("expected graceful degradation for corrupted JPEG with valid magic header, got err: %v", err)
 	}
-	if !bytes.Equal(badRes.Data, badBytes) {
-		t.Fatalf("expected original corrupted bytes on fallback")
+	if !bytes.Equal(badRes.Data, corruptJpegBytes) || badRes.ContentType != "image/jpeg" {
+		t.Fatalf("expected original corrupted JPEG bytes and image/jpeg on fallback, got ct=%s", badRes.ContentType)
+	}
+
+	// 5c. Post-scan escaping symlink must be rejected by readLimitedImageFile.
+	outsideFile := filepath.Join(t.TempDir(), "secret.jpg")
+	if err := os.WriteFile(outsideFile, origBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	escapingLink := filepath.Join(tmp, "escaping.jpg")
+	if err := os.Symlink(outsideFile, escapingLink); err == nil {
+		if _, err := readLimitedImageFile(escapingLink); err == nil {
+			t.Fatalf("expected escaping symlink %q to be rejected by readLimitedImageFile", escapingLink)
+		}
 	}
 
 	// 6. ServeHTTPWithOptions: 200 OK + ETag + 304 Not Modified

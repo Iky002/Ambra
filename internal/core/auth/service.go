@@ -176,6 +176,11 @@ func (s *Service) AuthenticateByName(ctx context.Context, username, password, le
 		return nil, err
 	}
 
+	if u.IsDisabled || u.Policy.IsDisabled {
+		dummyPasswordWork(password)
+		return nil, ErrUserDisabled
+	}
+
 	ok := false
 	if u.PasswordHash == "" {
 		// Empty password user: accept empty pw or SHA1("") from legacy clients
@@ -193,9 +198,6 @@ func (s *Service) AuthenticateByName(ctx context.Context, username, password, le
 	}
 	if !ok {
 		return nil, ErrInvalidCredentials
-	}
-	if u.IsDisabled || u.Policy.IsDisabled {
-		return nil, ErrUserDisabled
 	}
 
 	return s.IssueSessionForUser(ctx, u, client)

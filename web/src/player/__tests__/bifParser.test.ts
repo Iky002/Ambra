@@ -74,4 +74,36 @@ describe('bifParser (H-22)', () => {
     bad.set([0x00, 0x42, 0x49, 0x46])
     expect(() => parseBif(bad)).toThrow(/魔数头/)
   })
+
+  it('[Round2] sorts unsorted timestamps ascending, rejects header-overlapping offsets and zero next offsets', () => {
+    const fLate = new Uint8Array([0xff, 0xd8, 0x00, 0x20, 0xff, 0xd9])
+    const fEarly = new Uint8Array([0xff, 0xd8, 0x00, 0x05, 0xff, 0xd9])
+    const unsorted = buildBifBuffer(
+      [
+        { timestampIndex: 20, data: fLate },
+        { timestampIndex: 5, data: fEarly },
+      ],
+      1000,
+    )
+    const sortedArchive = parseBif(unsorted)
+    expect(sortedArchive.frameCount).toBe(2)
+    expect(sortedArchive.frames.map((f) => f.timestampMs)).toEqual([5000, 20000])
+    expect(sortedArchive.getFrameBytes(0)).toEqual(fEarly)
+    expect(sortedArchive.getFrameBytes(1)).toEqual(fLate)
+
+    // 篡改结束标记 offset 为 0 -> 拒绝该帧，绝不回退到 data.byteLength
+    const corruptedZeroEnd = unsorted.slice()
+    const view = new DataView(corruptedZeroEnd.buffer)
+    const endPos = 64 + 2 * 8
+    view.setUint32(endPos + 4, 0, true)
+    const zeroEndArchive = parseBif(corruptedZeroEnd)
+    expect(zeroEndArchive.frameCount).toBe(1)
+
+    // 篡改第一帧 offset 落入索引表区域 (< 64 + 3*8) -> 拒绝该帧
+    const corruptedOverlap = unsorted.slice()
+    const view2 = new DataView(corruptedOverlap.buffer)
+    view2.setUint32(64 + 4, 64, true)
+    const overlapArchive = parseBif(corruptedOverlap)
+    expect(overlapArchive.frameCount).toBe(1)
+  })
 })

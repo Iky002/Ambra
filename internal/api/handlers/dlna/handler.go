@@ -55,6 +55,7 @@ const (
 	dlnaSOAPRateWindow        = time.Minute
 	maxDLNARateBuckets        = 4096
 	maxDLNARequestedCount     = 500
+	maxDLNATranscodes         = 16
 	dlnaStreamTokenTTL        = 24 * time.Hour
 	defaultServerHeader       = "Ambra/4.10.2.0 UPnP/1.0 DLNADOC/1.50"
 )
@@ -137,6 +138,7 @@ type Handler struct {
 	subscriptions map[string]eventSubscription
 	systemUpdate  uint32
 	notifySem     chan struct{}
+	transcodeSem  chan struct{}
 }
 
 // New constructs a DLNA handler backed by LibraryRepo and optional SQLite Store for profile persistence.
@@ -163,6 +165,7 @@ func New(cfg *config.Config, libRepo *sqlite.LibraryRepo, store *sqlite.Store) *
 		subscriptions: make(map[string]eventSubscription),
 		systemUpdate:  1,
 		notifySem:     make(chan struct{}, 8),
+		transcodeSem:  make(chan struct{}, maxDLNATranscodes),
 	}
 	def := DefaultProfile()
 	h.profiles[def.Id] = def
@@ -604,9 +607,7 @@ func (h *Handler) serveIcon(w http.ResponseWriter, r *http.Request, filename str
 // --- Signed DLNA Media Streaming ---
 
 func (h *Handler) signStreamToken(itemID string, exp int64) string {
-	mac := hmac.New(sha256.New, h.streamSecret)
-	_, _ = fmt.Fprintf(mac, "%s:%d", guid.Normalize(itemID), exp)
-	return hex.EncodeToString(mac.Sum(nil))
+	return h.signStreamTokenForMode(itemID, exp, false)
 }
 
 func (h *Handler) signStreamTokenForMode(itemID string, exp int64, transcode bool) string {
@@ -620,7 +621,7 @@ func (h *Handler) signStreamTokenForMode(itemID string, exp int64, transcode boo
 }
 
 func (h *Handler) verifyStreamToken(itemID, expStr, sig string) bool {
-	return h.verifyStreamTokenForMode(itemID, expStr, sig, false, true)
+	return h.verifyStreamTokenForMode(itemID, expStr, sig, false, false)
 }
 
 func (h *Handler) verifyStreamTokenForMode(itemID, expStr, sig string, wantTranscode, allowLegacyUnscoped bool) bool {
@@ -639,7 +640,9 @@ func (h *Handler) verifyStreamTokenForMode(itemID, expStr, sig string, wantTrans
 		return true
 	}
 	if allowLegacyUnscoped {
-		expected := h.signStreamToken(itemID, exp)
+		mac := hmac.New(sha256.New, h.streamSecret)
+		_, _ = fmt.Fprintf(mac, "%s:%d", guid.Normalize(itemID), exp)
+		expected := hex.EncodeToString(mac.Sum(nil))
 		return hmac.Equal([]byte(expected), sigLower)
 	}
 	return false
@@ -681,7 +684,7 @@ func (h *Handler) canDLNATranscodeItem(r *http.Request, item *sqlite.ItemRecord)
 	return pol.EnableVideoPlaybackTranscoding
 }
 
-func (h *Handler) acquireDLNAStreamSlot() (func(), bool) {
+func (h *Handler) acquireDLNAStreamSlot(r *http.Request, itemID string, transcodeMode bool) (func(), bool) {
 	noop := func() {}
 	h.mu.RLock()
 	mgr := h.transcodeMgr
@@ -693,14 +696,24 @@ func (h *Handler) acquireDLNAStreamSlot() (func(), bool) {
 	if limit <= 0 {
 		return noop, true
 	}
-	return mgr.TryAcquireStreamSlot(limit, "dlna:"+guid.New())
+	var slotKey string
+	if transcodeMode {
+		slotKey = "dlna:tc:" + guid.New()
+	} else {
+		slotKey = "dlna:" + netutil.ClientIP(r) + ":" + guid.Normalize(itemID)
+	}
+	return mgr.TryAcquireStreamSlot(limit, slotKey)
 }
 
 func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(r.PathValue("Id"))
 	q := r.URL.Query()
 	explicitTranscode := q.Get("transcode") == "1" || strings.EqualFold(q.Get("transcode"), "true")
-	if !h.verifyStreamTokenForMode(itemID, q.Get("exp"), q.Get("sig"), explicitTranscode, true) {
+	validSig := h.verifyStreamTokenForMode(itemID, q.Get("exp"), q.Get("sig"), explicitTranscode, false)
+	if !validSig && !explicitTranscode && q.Get("profile") != "" {
+		validSig = h.verifyStreamTokenForMode(itemID, q.Get("exp"), q.Get("sig"), true, false)
+	}
+	if !validSig {
 		httpx.Error(w, http.StatusForbidden, "invalid or expired stream signature")
 		return
 	}
@@ -741,7 +754,7 @@ func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
 
 	wantTranscode := explicitTranscode
 	if !wantTranscode && q.Get("profile") != "" {
-		if !h.verifyStreamTokenForMode(itemID, q.Get("exp"), q.Get("sig"), true, true) {
+		if !h.verifyStreamTokenForMode(itemID, q.Get("exp"), q.Get("sig"), true, false) {
 			wantTranscode = false
 		} else {
 			wantTranscode = !h.profileSupportsContainer(q.Get("profile"), item, realPath)
@@ -764,7 +777,7 @@ func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if r.Method != http.MethodHead {
-			release, allowed := h.acquireDLNAStreamSlot()
+			release, allowed := h.acquireDLNAStreamSlot(r, itemID, false)
 			if !allowed {
 				httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
 				return
@@ -812,7 +825,7 @@ func (h *Handler) handleDLNAStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method != http.MethodHead {
-		release, allowed := h.acquireDLNAStreamSlot()
+		release, allowed := h.acquireDLNAStreamSlot(r, itemID, false)
 		if !allowed {
 			httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
 			return
@@ -1009,7 +1022,21 @@ func (h *Handler) streamDLNATranscode(w http.ResponseWriter, r *http.Request, it
 		return
 	}
 
-	release, allowed := h.acquireDLNAStreamSlot()
+	if h.transcodeSem != nil {
+		select {
+		case h.transcodeSem <- struct{}{}:
+			defer func() { <-h.transcodeSem }()
+		default:
+			httpx.Error(w, http.StatusTooManyRequests, "dlna transcode concurrency limit reached")
+			return
+		}
+	}
+
+	itemID := ""
+	if item != nil {
+		itemID = item.ID
+	}
+	release, allowed := h.acquireDLNAStreamSlot(r, itemID, true)
 	if !allowed {
 		httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
 		return

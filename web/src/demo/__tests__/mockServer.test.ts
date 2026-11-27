@@ -1000,10 +1000,32 @@ describe('Demo Mock 引擎 - Serverless 完整闭环测试', () => {
     // 1. 管理员电源路由与活动日志
     await loginAsDemo('admin')
     await expect(embyFetch('/emby/System/Restart', { method: 'POST' })).resolves.toBeUndefined()
+    const infoAfterRestart = await api.getSystemInfo()
+    expect(infoAfterRestart.HasPendingRestart).toBe(true)
     await expect(embyFetch('/emby/System/Shutdown', { method: 'POST' })).resolves.toBeUndefined()
+    const infoAfterShutdown = await api.getSystemInfo()
+    expect(infoAfterShutdown.IsShuttingDown).toBe(true)
     const logs = await api.getActivityLogs(0, 20)
     expect(logs.Items.some((e) => e.Type === 'ServerRestarting')).toBe(true)
     expect(logs.Items.some((e) => e.Type === 'ServerShuttingDown')).toBe(true)
+
+    // 1.5 删除 EPG ListingProvider 时同步清理对应频道映射
+    const epgProvider = await embyFetch<{ Id: string }>('/emby/LiveTv/ListingProviders', {
+      method: 'POST',
+      body: JSON.stringify({ Type: 'xmltv', Path: 'https://epg.example.com/guide.xml' }),
+    })
+    await api.setChannelMapping({
+      ProviderId: epgProvider.Id,
+      TunerChannelId: 'ch-demo-01',
+      ProviderChannelId: 'xmltv-temp-01',
+    })
+    const mappingsBeforeDel = await api.getChannelMappings(epgProvider.Id)
+    expect(mappingsBeforeDel.Mappings.some((m) => m.ProviderId === epgProvider.Id)).toBe(true)
+    await embyFetch(`/emby/LiveTv/ListingProviders?id=${encodeURIComponent(epgProvider.Id)}`, {
+      method: 'DELETE',
+    })
+    const mappingsAfterDel = await api.getChannelMappings(epgProvider.Id)
+    expect(mappingsAfterDel.Mappings.some((m) => m.ProviderId === epgProvider.Id)).toBe(false)
 
     // 2. HDHomeRun 发现
     const discovered = await embyFetch<Array<{ Type?: string; DeviceId?: string; Url: string }>>(
@@ -1121,10 +1143,22 @@ describe('Demo Mock 引擎 - Serverless 完整闭环测试', () => {
       status: 403,
     })
     await expect(embyFetch('/emby/LiveTv/Tuners/Discover')).rejects.toMatchObject({ status: 403 })
-    await expect(embyFetch('/emby/Sync/Jobs')).rejects.toMatchObject({ status: 403 })
+    // 非管理员 GET /emby/Sync/Jobs 允许访问但仅返回自身任务；删除他人任务返回 403
+    const guestSyncJobs = await embyFetch<{ Items: Array<{ Id: string }>; TotalRecordCount: number }>(
+      '/emby/Sync/Jobs',
+    )
+    expect(guestSyncJobs.Items).toEqual([])
+    expect(guestSyncJobs.TotalRecordCount).toBe(0)
     await expect(
       embyFetch('/emby/Sync/Jobs/sync-job-demo-02', { method: 'DELETE' }),
     ).rejects.toMatchObject({ status: 403 })
+
+    // 非管理员 GET /emby/Library/VirtualFolders 允许访问但剥离服务端本地路径 Locations
+    const guestVirtualFolders = await embyFetch<Array<{ ItemId: string; Locations: string[] }>>(
+      '/emby/Library/VirtualFolders',
+    )
+    expect(guestVirtualFolders.length).toBeGreaterThan(0)
+    expect(guestVirtualFolders.every((vf) => Array.isArray(vf.Locations) && vf.Locations.length === 0)).toBe(true)
 
     // guest 在 EnableLiveTvAccess === false 时访问 Programs/SeriesTimers/Timers/Recordings 均返回 403
     await expect(embyFetch('/emby/LiveTv/Programs')).rejects.toMatchObject({ status: 403 })

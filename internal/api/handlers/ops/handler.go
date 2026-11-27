@@ -358,6 +358,10 @@ func (h *Handler) requireSetupOrAdmin(wrapAdmin func(http.Handler) http.Handler)
 	return func(next http.Handler) http.Handler {
 		adminWrapped := wrapAdmin(next)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !netutil.IsLocalOrLANRequest(r) && h.cfg != nil && !h.cfg.Snapshot().IsGlobalRemoteAccessEnabled() {
+				httpx.Error(w, http.StatusForbidden, "Remote access is disabled on this server")
+				return
+			}
 			if !h.checkStartupIPRateLimit(netutil.ClientIP(r), time.Now().UTC()) {
 				httpx.Error(w, http.StatusTooManyRequests, "too many startup wizard requests")
 				return

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -53,6 +54,8 @@ type clientConn struct {
 	user     *sqlite.UserRecord
 	deviceID string
 	token    string
+	clientIP string
+	wasLocal bool
 	isAPIKey bool
 	isAdmin  bool
 	conn     *websocket.Conn
@@ -576,7 +579,9 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !id.IsAPIKey && !netutil.IsLocalOrLANRequest(r) {
+	isLocal := netutil.IsLocalOrLANRequest(r)
+	clientIP := netutil.ClientIP(r)
+	if !id.IsAPIKey && !isLocal {
 		if !h.isGlobalRemoteAccessEnabled() {
 			httpx.Error(w, http.StatusForbidden, "Remote access is disabled on this server")
 			return
@@ -620,6 +625,9 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Clear the HTTP server's ReadTimeout before hijacking into a long-lived WebSocket connection.
+	_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
+
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		OriginPatterns: originPatterns,
 	})
@@ -636,6 +644,8 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		user:     id.User,
 		deviceID: deviceID,
 		token:    id.Token,
+		clientIP: clientIP,
+		wasLocal: isLocal,
 		isAPIKey: id.IsAPIKey,
 		isAdmin:  isAdmin,
 		conn:     conn,
@@ -983,6 +993,43 @@ func (h *Hub) DisconnectToken(token string) {
 		c.stopTimers()
 		c.cancel()
 		_ = c.conn.Close(websocket.StatusPolicyViolation, "token revoked")
+	}
+}
+
+// DisconnectRemoteClients closes active non-API-key WebSocket connections that are no longer
+// permitted under current global remote access, per-user remote access, or local subnet policy.
+func (h *Hub) DisconnectRemoteClients() {
+	if h == nil {
+		return
+	}
+	globalRemoteEnabled := h.isGlobalRemoteAccessEnabled()
+
+	h.mu.Lock()
+	var targets []*clientConn
+	for id, c := range h.clients {
+		if c.isAPIKey {
+			continue
+		}
+		addr, err := netip.ParseAddr(strings.TrimSpace(c.clientIP))
+		isRemote := !c.wasLocal || err != nil || !netutil.IsLANIP(addr)
+		if !isRemote {
+			continue
+		}
+		if !globalRemoteEnabled || (c.user != nil && !c.user.Policy.EnableRemoteAccess) {
+			targets = append(targets, c)
+			delete(h.clients, id)
+		}
+	}
+	h.mu.Unlock()
+
+	for _, c := range targets {
+		c.stopTimers()
+		if c.cancel != nil {
+			c.cancel()
+		}
+		if c.conn != nil {
+			_ = c.conn.Close(websocket.StatusPolicyViolation, "remote access disabled")
+		}
 	}
 }
 

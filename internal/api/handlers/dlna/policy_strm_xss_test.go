@@ -256,30 +256,32 @@ func TestDLNATranscodePolicyModeTokenAndDirectStreamLimit(t *testing.T) {
 	// 1. EnableVideoPlaybackTranscoding=false blocks video transcode=1 (403) while allowing direct video & audio transcode HEAD.
 	h.SetDefaultUserID(noVidUser.ID)
 	vidSig := h.signStreamToken(vidItem.ID, exp)
+	vidTCSig := h.signStreamTokenForMode(vidItem.ID, exp, true)
 	if rec := doDLNA(http.MethodGet, vidItem.ID, vidSig, ""); rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 direct video when video transcoding disabled, got %d", rec.Code)
 	}
-	if rec := doDLNA(http.MethodGet, vidItem.ID, vidSig, "&transcode=1"); rec.Code != http.StatusForbidden {
+	if rec := doDLNA(http.MethodGet, vidItem.ID, vidTCSig, "&transcode=1"); rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 on video transcode=1 when EnableVideoPlaybackTranscoding=false, got %d", rec.Code)
 	}
-	audSig := h.signStreamToken(audItem.ID, exp)
-	if rec := doDLNA(http.MethodHead, audItem.ID, audSig, "&transcode=1"); rec.Code != http.StatusOK {
+	audDirectSig := h.signStreamToken(audItem.ID, exp)
+	audTCSig := h.signStreamTokenForMode(audItem.ID, exp, true)
+	if rec := doDLNA(http.MethodHead, audItem.ID, audTCSig, "&transcode=1"); rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 HEAD on audio transcode=1 when EnableAudioPlaybackTranscoding=true, got %d", rec.Code)
 	}
 
 	// 2. EnableAudioPlaybackTranscoding=false blocks audio transcode=1 (403) while allowing direct audio.
 	h.SetDefaultUserID(noAudUser.ID)
-	if rec := doDLNA(http.MethodGet, audItem.ID, audSig, ""); rec.Code != http.StatusOK {
+	if rec := doDLNA(http.MethodGet, audItem.ID, audDirectSig, ""); rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 direct audio when audio transcoding disabled, got %d", rec.Code)
 	}
-	if rec := doDLNA(http.MethodGet, audItem.ID, audSig, "&transcode=1"); rec.Code != http.StatusForbidden {
+	if rec := doDLNA(http.MethodGet, audItem.ID, audTCSig, "&transcode=1"); rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 on audio transcode=1 when EnableAudioPlaybackTranscoding=false, got %d", rec.Code)
 	}
 
 	// 3. Photo item rejects transcode=1 with 403 even for unrestricted admin/default policy.
 	h.SetDefaultUserID("")
 	h.SetUserRepo(nil)
-	photoSig := h.signStreamToken(photoItem.ID, exp)
+	photoSig := h.signStreamTokenForMode(photoItem.ID, exp, true)
 	if rec := doDLNA(http.MethodGet, photoItem.ID, photoSig, "&transcode=1"); rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 on photo transcode=1, got %d", rec.Code)
 	}

@@ -502,4 +502,111 @@ describe('wasmRemuxer - H-07 完整性校验、HTML/404 快速失败与 VFS 泄�
       ffmpegMockHooks.load = null
     }
   })
+
+  it('[Round2] 拒绝无 SHA-256 的协议相对/跨源 URL 与跨源重定向，AbortError 不污染探测缓存，且 Worker 超时不死锁互斥锁', async () => {
+    // 1. 无 expectedSha256 时拒绝协议相对 URL (//evil.example/...) 与跨源 URL
+    await expect(
+      fetchVerifiedCoreBlobUrl('//evil.example/ffmpeg/ffmpeg-core.js', 'text/javascript'),
+    ).rejects.toSatisfy(
+      (err: unknown) => err instanceof WasmRemuxFallbackError && err.reason === 'integrity_failed',
+    )
+    await expect(
+      fetchVerifiedCoreBlobUrl('https://evil.example/ffmpeg/ffmpeg-core.js', 'text/javascript'),
+    ).rejects.toSatisfy(
+      (err: unknown) => err instanceof WasmRemuxFallbackError && err.reason === 'integrity_failed',
+    )
+
+    // 2. 无 expectedSha256 时同源 URL 发生跨源重定向必须拒绝
+    const redirectedCore = new Response('export default function() {}', {
+      status: 200,
+      headers: { 'content-type': 'application/javascript' },
+    })
+    Object.defineProperty(redirectedCore, 'redirected', { value: true })
+    Object.defineProperty(redirectedCore, 'url', { value: 'https://evil.example/core.js' })
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(redirectedCore)
+    await expect(
+      fetchVerifiedCoreBlobUrl('/ffmpeg/ffmpeg-core.js', 'text/javascript'),
+    ).rejects.toSatisfy(
+      (err: unknown) => err instanceof WasmRemuxFallbackError && err.reason === 'integrity_failed',
+    )
+
+    // 3. probeLocalCoreAvailable 遇到 AbortError 不污染 localCoreProbeState 缓存，后续可探测成功；跨源重定向返回 false
+    resetLocalCoreProbeCache()
+    const abortCtrl = new AbortController()
+    abortCtrl.abort()
+    vi.spyOn(globalThis, 'fetch')
+      .mockRejectedValueOnce(new DOMException('Aborted', 'AbortError'))
+      .mockResolvedValueOnce(
+        new Response(null, {
+          status: 200,
+          headers: { 'content-type': 'application/javascript' },
+        }),
+      )
+    expect(await probeLocalCoreAvailable('/ffmpeg', abortCtrl.signal)).toBe(false)
+    expect(await probeLocalCoreAvailable('/ffmpeg')).toBe(true)
+
+    resetLocalCoreProbeCache()
+    const redirectedHead = new Response(null, {
+      status: 200,
+      headers: { 'content-type': 'application/javascript' },
+    })
+    Object.defineProperty(redirectedHead, 'redirected', { value: true })
+    Object.defineProperty(redirectedHead, 'url', { value: 'https://evil.example/ffmpeg-core.js' })
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(redirectedHead)
+    expect(await probeLocalCoreAvailable('/ffmpeg')).toBe(false)
+    resetLocalCoreProbeCache()
+
+    // 4. Worker exec 超时或中止时立即 terminate 并释放 remuxMutex，不阻塞后续任务
+    const terminateSpy = vi.fn()
+    const deleteFileSpy = vi.fn().mockImplementation(() => new Promise(() => {})) // 模拟卡死的 Worker
+    const fakeFfmpeg = {
+      writeFile: vi.fn().mockResolvedValue(true),
+      exec: vi.fn().mockRejectedValue(new WasmRemuxFallbackError('timeout', 'exec timeout')),
+      readFile: vi.fn(),
+      deleteFile: deleteFileSpy,
+      on: vi.fn(),
+      off: vi.fn(),
+      terminate: terminateSpy,
+    }
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async () =>
+        new Response(new Uint8Array([0x1a, 0x45, 0xdf, 0xa3]), {
+          status: 200,
+          headers: { 'content-length': '4' },
+        }),
+    )
+
+    const remuxer = new WasmRemuxer()
+    const internal = remuxer as unknown as { ffmpeg: unknown; loaded: boolean }
+    internal.ffmpeg = fakeFfmpeg
+    internal.loaded = true
+
+    await expect(
+      remuxer.remuxToMP4('/emby/Videos/stuck-1/stream', undefined, { container: 'mkv' }),
+    ).rejects.toSatisfy(
+      (err: unknown) => err instanceof WasmRemuxFallbackError && err.reason === 'timeout',
+    )
+    expect(terminateSpy).toHaveBeenCalledTimes(1)
+    expect(internal.ffmpeg).toBeNull()
+    expect(internal.loaded).toBe(false)
+    expect(deleteFileSpy).not.toHaveBeenCalled()
+
+    // 后续任务可立即获得互斥锁执行，不会永久死锁
+    const nextFfmpeg = {
+      writeFile: vi.fn().mockResolvedValue(true),
+      exec: vi.fn().mockResolvedValue(0),
+      readFile: vi.fn().mockResolvedValue(new Uint8Array([0x00, 0x00, 0x00, 0x18])),
+      deleteFile: vi.fn().mockResolvedValue(true),
+      on: vi.fn(),
+      off: vi.fn(),
+      terminate: vi.fn(),
+    }
+    internal.ffmpeg = nextFfmpeg
+    internal.loaded = true
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:after-timeout')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const ok = await remuxer.remuxToMP4('/emby/Videos/ok-2/stream', undefined, { container: 'mkv' })
+    expect(ok.url).toBe('blob:after-timeout')
+    remuxer.dispose()
+  })
 })

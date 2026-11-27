@@ -358,6 +358,12 @@ func TestCovV0112_CompatRoutesHLSImagesAudioBooksAndContainers(t *testing.T) {
 	router := h.BuildRouter(AuthFuncs{
 		RequireAuth:  authMW.RequireAuth,
 		RequireAdmin: authMW.RequireAdmin,
+		UserIDFromCtx: func(ctx context.Context) string {
+			if ac, ok := middleware.AuthFromContext(ctx); ok && ac != nil {
+				return ac.UserID()
+			}
+			return ""
+		},
 	})
 
 	doReq := func(token, remoteAddr, method, target, body string) *httptest.ResponseRecorder {

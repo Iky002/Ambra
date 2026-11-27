@@ -151,6 +151,10 @@ export function PluginsTab() {
         delete rest.enabled
         delete rest.Priority
         delete rest.priority
+        delete rest.Id
+        delete rest.id
+        delete rest.Name
+        delete rest.name
 
         if (isTmdbPlugin(plugin)) {
           const apiKeyVal =

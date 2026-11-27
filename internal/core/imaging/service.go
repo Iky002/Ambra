@@ -30,7 +30,37 @@ const (
 )
 
 func readLimitedImageFile(path string) ([]byte, error) {
-	f, err := os.Open(path)
+	lfi, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	openPath := path
+	if lfi.Mode()&os.ModeSymlink != 0 {
+		resolvedTarget, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return nil, err
+		}
+		resolvedDir, err := filepath.EvalSymlinks(filepath.Dir(path))
+		if err != nil {
+			return nil, err
+		}
+		rel, err := filepath.Rel(resolvedDir, resolvedTarget)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			return nil, fmt.Errorf("image symlink %q escapes parent directory", filepath.Base(path))
+		}
+		tfi, err := os.Stat(resolvedTarget)
+		if err != nil {
+			return nil, err
+		}
+		if !tfi.Mode().IsRegular() {
+			return nil, fmt.Errorf("image symlink target %q is not a regular file", filepath.Base(path))
+		}
+		openPath = resolvedTarget
+	} else if !lfi.Mode().IsRegular() {
+		return nil, fmt.Errorf("image path %q is not a regular file", filepath.Base(path))
+	}
+
+	f, err := os.Open(openPath)
 	if err != nil {
 		return nil, err
 	}
@@ -293,10 +323,14 @@ func (s *Service) getImageFromRecord(ctx context.Context, rec *sqlite.ImageRecor
 			if isWebP {
 				return nil, procErr
 			}
-			// Graceful degradation for corrupted non-WebP images: serve original bytes.
+			// Only fall back to original bytes when magic-byte sniffing confirms a safe raster image format.
+			detectedCT, ok := detectSafeRasterContentType(rawData)
+			if !ok {
+				return nil, procErr
+			}
 			return &ImagePayload{
 				Data:        rawData,
-				ContentType: origCT,
+				ContentType: detectedCT,
 				ETag:        etag,
 			}, nil
 		}
@@ -561,6 +595,20 @@ func isSafeRasterContentType(ct string) bool {
 	default:
 		return false
 	}
+}
+
+func detectSafeRasterContentType(data []byte) (string, bool) {
+	if len(data) == 0 {
+		return "", false
+	}
+	detected := http.DetectContentType(data)
+	if isSafeRasterContentType(detected) {
+		return detected, true
+	}
+	if len(data) >= 12 && string(data[4:8]) == "ftyp" && (string(data[8:12]) == "avif" || string(data[8:12]) == "avis") {
+		return "image/avif", true
+	}
+	return "", false
 }
 
 func contentTypeForImage(path string, data []byte) string {

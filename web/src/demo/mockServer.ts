@@ -766,14 +766,14 @@ function parseParentalRatingValue(raw?: string): number | null {
 function createInitialDemoBackups(): BackupFileInfo[] {
   return [
     {
-      Name: 'ambra-backup-20261124-030000.db',
-      Path: '/data/backups/ambra-backup-20261124-030000.db',
+      Name: 'ambra-backup-20261124-030000.zip',
+      Path: '/data/config/backups/ambra-backup-20261124-030000.zip',
       Size: 2_621_440,
       DateCreated: new Date(Date.now() - 8 * 3600_000).toISOString(),
     },
     {
-      Name: 'ambra-backup-20261123-030000.db',
-      Path: '/data/backups/ambra-backup-20261123-030000.db',
+      Name: 'ambra-backup-20261123-030000.zip',
+      Path: '/data/config/backups/ambra-backup-20261123-030000.zip',
       Size: 2_490_368,
       DateCreated: new Date(Date.now() - 32 * 3600_000).toISOString(),
     },
@@ -804,7 +804,7 @@ function createInitialDemoNotifications(): DemoNotificationRecord[] {
     {
       Id: 'notif-demo-01',
       Date: new Date(now - 15 * 60_000).toISOString(),
-      Name: '欢迎体验 Ambra v0.12.1',
+      Name: '欢迎体验 Ambra v0.12.2',
       Description: '已上线应用内通知中心、家长控制分级过滤与 Quick Connect 设备授权码登录。',
       Level: 'Normal',
       readByUsers: new Set(),
@@ -1930,12 +1930,14 @@ export async function demoFetch<T>(
 
   if (pathname === '/emby/System/Restart' && method === 'POST') {
     requireDemoAdmin(caller)
+    store.systemInfo.HasPendingRestart = true
     pushActivity('管理员触发了服务器重启（Demo 模拟）', 'ServerRestarting', undefined, caller.userId)
     return undefined as T
   }
 
   if (pathname === '/emby/System/Shutdown' && method === 'POST') {
     requireDemoAdmin(caller)
+    store.systemInfo.IsShuttingDown = true
     pushActivity('管理员触发了服务器关闭（Demo 模拟）', 'ServerShuttingDown', undefined, caller.userId)
     return undefined as T
   }
@@ -3209,7 +3211,7 @@ export async function demoFetch<T>(
           UserId: sessionUserId,
           UserName: caller.user?.Name || sessionUserId,
           Client: 'Ambra Web',
-          ApplicationVersion: '0.12.1',
+          ApplicationVersion: '0.12.2',
           DeviceName: 'Web Browser (Demo)',
           DeviceId: `dev-web-${sessionUserId}`,
           LastActivityDate: new Date().toISOString(),
@@ -4027,17 +4029,20 @@ export async function demoFetch<T>(
   }
 
   if (pathname === '/emby/Library/VirtualFolders') {
-    requireDemoAdmin(caller)
     if (method === 'GET') {
-      return store.libraries.map((l) => ({
+      const visibleLibs = caller.isAdmin
+        ? store.libraries
+        : getVisibleLibrariesForUser(caller.userId)
+      return visibleLibs.map((l) => ({
         ...l,
-        Locations: [...(l.Locations || [])],
+        Locations: caller.isAdmin ? [...(l.Locations || [])] : [],
         LibraryOptions: {
           SaveLocalMetadata: true,
           ...(l.LibraryOptions || {}),
         },
       })) as T
     }
+    requireDemoAdmin(caller)
     if (method === 'POST') {
       const body = parseJsonBody(options)
       const name = String(body.Name || qs.get('name') || '').trim()
@@ -4702,6 +4707,7 @@ export async function demoFetch<T>(
       const idx = demoListingProviders.findIndex((p) => p.Id === id)
       if (idx >= 0) {
         demoListingProviders.splice(idx, 1)
+        demoLiveTvChannelMappings = demoLiveTvChannelMappings.filter((m) => m.ProviderId !== id)
         pushActivity(`已删除 XMLTV EPG 节目单来源`, 'LiveTvEpgDeleted', undefined, caller.userId)
       }
       return undefined as T
@@ -4959,17 +4965,21 @@ export async function demoFetch<T>(
 
   // 离线同步与转码任务 (Sync Jobs)
   if (pathname === '/emby/Sync/Jobs' && method === 'GET') {
-    requireDemoAdmin(caller)
-    const items = demoSyncJobs.map((j) => ({ ...j }))
+    const visibleJobs = caller.isAdmin
+      ? demoSyncJobs
+      : demoSyncJobs.filter((j) => j.UserId === caller.userId)
+    const items = visibleJobs.map((j) => ({ ...j }))
     return { Items: items, TotalRecordCount: items.length } as T
   }
 
   const syncJobDeleteMatch = pathname.match(/^\/emby\/Sync\/Jobs\/([^/]+)$/)
   if (syncJobDeleteMatch && method === 'DELETE') {
-    requireDemoAdmin(caller)
     const id = decodeURIComponent(syncJobDeleteMatch[1])
     const idx = demoSyncJobs.findIndex((j) => j.Id === id)
     if (idx >= 0) {
+      if (!caller.isAdmin && demoSyncJobs[idx].UserId !== caller.userId) {
+        throw new ApiError(403, '无权取消其他用户的同步任务 (403 Forbidden)')
+      }
       const [removed] = demoSyncJobs.splice(idx, 1)
       pushActivity(`已取消同步任务「${removed.Name}」`, 'SyncJobDeleted', undefined, caller.userId)
     }
@@ -6020,7 +6030,7 @@ export async function demoFetch<T>(
   if (pathname === '/emby/BackupRestore/BackupInfo' && method === 'GET') {
     requireDemoAdmin(caller)
     const res: BackupInfoResponse = {
-      BackupDirectory: '/data/backups',
+      BackupDirectory: '/data/config/backups',
       Backups: demoBackups.map((b) => ({ ...b })),
     }
     return res as T
@@ -6031,10 +6041,10 @@ export async function demoFetch<T>(
     const now = new Date()
     const pad = (n: number) => String(n).padStart(2, '0')
     const stamp = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}-${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}`
-    const name = `ambra-backup-${stamp}-${Math.random().toString(36).slice(2, 5)}.db`
+    const name = `ambra-backup-${stamp}-${Math.random().toString(36).slice(2, 5)}.zip`
     const created: BackupFileInfo = {
       Name: name,
-      Path: `/data/backups/${name}`,
+      Path: `/data/config/backups/${name}`,
       Size: 2_684_354,
       DateCreated: now.toISOString(),
     }
@@ -6187,7 +6197,7 @@ export async function demoFetch<T>(
       DeviceId: 'dev-demo-web-01',
       DeviceName: 'Ambra Web Demo',
       AppName: 'Ambra Web',
-      AppVersion: '0.12.1',
+      AppVersion: '0.12.2',
       DateAdded: new Date().toISOString(),
     }
     demoQuickConnectSessions.set(secret, session)
