@@ -373,6 +373,16 @@ func (h *Handler) handleDirectStream(w http.ResponseWriter, r *http.Request) {
 		}
 		mediaPath = resolved
 	}
+	if r.Method != http.MethodHead && h.cfg != nil && h.transcodeMgr != nil {
+		if limit := h.cfg.Snapshot().SimultaneousStreamLimit; limit > 0 {
+			releaseSlot, allowed := h.transcodeMgr.TryAcquireStreamSlot(limit, "")
+			if !allowed {
+				httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
+				return
+			}
+			defer releaseSlot()
+		}
+	}
 	if isHTTPURL(mediaPath) {
 		h.proxyRemoteAudioWithHeaders(w, r, mediaPath, resolvedHeaders)
 		return
@@ -451,12 +461,22 @@ func (h *Handler) handleUniversal(w http.ResponseWriter, r *http.Request, urlExt
 	directContainerOK := isContainerAllowed(srcExt, allowedContainers) && (urlExt == "" || urlExt == srcExt)
 	extensionless302OK := isRemote && is302 && !forceProxy && len(resolvedHeaders) == 0 && srcExt == ""
 	if startTimeTicks <= 0 && bitrateOK && (directContainerOK || extensionless302OK) {
-		if isRemote {
-			if is302 && !forceProxy && len(resolvedHeaders) == 0 {
-				w.Header().Set("Cache-Control", "no-store")
-				http.Redirect(w, r, mediaPath, http.StatusFound)
-				return
+		if isRemote && is302 && !forceProxy && len(resolvedHeaders) == 0 {
+			w.Header().Set("Cache-Control", "no-store")
+			http.Redirect(w, r, mediaPath, http.StatusFound)
+			return
+		}
+		if r.Method != http.MethodHead && h.cfg != nil && h.transcodeMgr != nil {
+			if limit := h.cfg.Snapshot().SimultaneousStreamLimit; limit > 0 {
+				releaseSlot, allowed := h.transcodeMgr.TryAcquireStreamSlot(limit, "")
+				if !allowed {
+					httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
+					return
+				}
+				defer releaseSlot()
 			}
+		}
+		if isRemote {
 			h.proxyRemoteAudioWithHeaders(w, r, mediaPath, resolvedHeaders)
 			return
 		}
@@ -845,6 +865,9 @@ func (h *Handler) buildAudioHLSSessionParams(r *http.Request, itemID string) (tr
 	rawPS := strings.TrimSpace(q.Get("PlaySessionId"))
 	if rawPS == "" {
 		rawPS = strings.TrimSpace(r.PathValue("PlaylistId"))
+	}
+	if rawPS == "" {
+		rawPS = "main"
 	}
 	if rawPS != "" && !isAdmin && callerID != "" && !strings.HasPrefix(rawPS, callerID+":") {
 		rawPS = callerID + ":" + rawPS

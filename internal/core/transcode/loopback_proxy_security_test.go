@@ -430,3 +430,180 @@ func TestAuditWave1_H07_L04_L05_L07_ClampsSlotsTempPathFontsAndSeek(t *testing.T
 		}
 	}
 }
+
+func TestLoopbackStreamProxyChunkedManifestSniffingAndSSRF(t *testing.T) {
+	// Upstream server sends UTF-8 BOM, "#", and "EXTM3U..." in separate flushed chunks
+	// on an extensionless path with application/octet-stream so only payload sniffing detects HLS.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("expected http.Flusher")
+			return
+		}
+		_, _ = w.Write([]byte("\xef\xbb\xbf"))
+		flusher.Flush()
+		time.Sleep(5 * time.Millisecond)
+
+		_, _ = w.Write([]byte("#"))
+		flusher.Flush()
+		time.Sleep(5 * time.Millisecond)
+
+		_, _ = w.Write([]byte("EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n" +
+			"#EXT-X-KEY:METHOD=AES-128,URI=\"http://169.254.169.254/latest\"\n" +
+			"#EXTINF:6.0,\nseg0.ts\n#EXT-X-ENDLIST\n"))
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	proxy, err := StartLoopbackStreamProxy(LoopbackProxyOptions{
+		TargetURL: upstream.URL + "/stream",
+		Client:    upstream.Client(),
+	})
+	if err != nil {
+		t.Fatalf("StartLoopbackStreamProxy: %v", err)
+	}
+	defer proxy.Close()
+
+	resp, err := http.Get(proxy.URL())
+	if err != nil {
+		t.Fatalf("GET proxy: %v", err)
+	}
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 rewritten manifest, got %d (%s)", resp.StatusCode, string(bodyBytes))
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "mpegurl") {
+		t.Fatalf("expected mpegurl content-type after chunked sniffing, got %q", ct)
+	}
+	body := string(bodyBytes)
+	if strings.Contains(body, "169.254.169.254") {
+		t.Fatalf("SSRF metadata URI leaked in unrewritten manifest:\n%s", body)
+	}
+	var keySubURL string
+	sc := bufio.NewScanner(strings.NewReader(body))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if strings.HasPrefix(line, "#EXT-X-KEY:") {
+			if idx := strings.Index(line, `URI="`); idx >= 0 {
+				rest := line[idx+5:]
+				if end := strings.IndexByte(rest, '"'); end > 0 {
+					keySubURL = rest[:end]
+				}
+			}
+		}
+	}
+	if keySubURL == "" {
+		t.Fatalf("expected rewritten /sub URL for #EXT-X-KEY, got manifest:\n%s", body)
+	}
+	subResp, err := http.Get(keySubURL)
+	if err != nil {
+		t.Fatalf("GET rewritten /sub key URL: %v", err)
+	}
+	_, _ = io.ReadAll(subResp.Body)
+	_ = subResp.Body.Close()
+	if subResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 blocking SSRF metadata key URL, got %d", subResp.StatusCode)
+	}
+}
+
+func TestLoopbackStreamProxyCrossHostRedirectSecurity(t *testing.T) {
+	customHeaders := sanitizeUpstreamHeaders(map[string]string{
+		"X-Custom-Cloud-Token": "cloud-secret-xyz",
+		"User-Agent":           "AmbraCustomUA/1.0",
+	})
+
+	// (a) Verify X-Custom-Cloud-Token is sent to the initial host via LoopbackStreamProxy.
+	var sawInitialToken atomic.Bool
+	initialSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Custom-Cloud-Token") == "cloud-secret-xyz" {
+			sawInitialToken.Store(true)
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte("MEDIA-BYTES-PAYLOAD-0123456789"))
+	}))
+	defer initialSrv.Close()
+
+	proxy, err := StartLoopbackStreamProxy(LoopbackProxyOptions{
+		TargetURL: initialSrv.URL + "/video.mp4",
+		Headers: map[string]string{
+			"X-Custom-Cloud-Token": "cloud-secret-xyz",
+			"User-Agent":           "AmbraCustomUA/1.0",
+		},
+		Client: initialSrv.Client(),
+	})
+	if err != nil {
+		t.Fatalf("StartLoopbackStreamProxy: %v", err)
+	}
+	defer proxy.Close()
+
+	resp, err := http.Get(proxy.URL())
+	if err != nil {
+		t.Fatalf("GET proxy: %v", err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if !sawInitialToken.Load() {
+		t.Fatal("expected X-Custom-Cloud-Token to be sent to initial upstream host")
+	}
+
+	// (b) Verify both newPinnedSafeStreamClient and newSafeSubResourceClient:
+	//     1. Strip custom upstream headers (except User-Agent) on cross-host redirect.
+	//     2. Enforce strict public-only DialContext on cross-host dials (blocking private LAN & loopback
+	//        even when allowPrivateLAN=true and disallowLoopback=false).
+	ctx := context.Background()
+	streamClient, err := newPinnedSafeStreamClient("192.168.1.10", true, false, customHeaders)
+	if err != nil {
+		t.Fatalf("newPinnedSafeStreamClient: %v", err)
+	}
+	subClient, err := newSafeSubResourceClient(ctx, "192.168.1.10", true, true, customHeaders)
+	if err != nil {
+		t.Fatalf("newSafeSubResourceClient: %v", err)
+	}
+
+	for name, c := range map[string]*http.Client{
+		"pinnedStreamClient": streamClient,
+		"subResourceClient":  subClient,
+	} {
+		// Same-host redirect preserves X-Custom-Cloud-Token.
+		prevReq, _ := http.NewRequest(http.MethodGet, "http://192.168.1.10/start", nil)
+		sameHostReq, _ := http.NewRequest(http.MethodGet, "http://192.168.1.10/next", nil)
+		sameHostReq.Header.Set("X-Custom-Cloud-Token", "cloud-secret-xyz")
+		sameHostReq.Header.Set("User-Agent", "AmbraCustomUA/1.0")
+		if err := c.CheckRedirect(sameHostReq, []*http.Request{prevReq}); err != nil {
+			t.Fatalf("%s: expected same-host redirect allowed, got %v", name, err)
+		}
+		if sameHostReq.Header.Get("X-Custom-Cloud-Token") != "cloud-secret-xyz" {
+			t.Fatalf("%s: expected X-Custom-Cloud-Token preserved on same-host redirect", name)
+		}
+
+		// Cross-host redirect to public IP strips X-Custom-Cloud-Token while preserving User-Agent.
+		crossReq, _ := http.NewRequest(http.MethodGet, "http://93.184.216.34/cdn/video.mp4", nil)
+		crossReq.Header.Set("X-Custom-Cloud-Token", "cloud-secret-xyz")
+		crossReq.Header.Set("User-Agent", "AmbraCustomUA/1.0")
+		if err := c.CheckRedirect(crossReq, []*http.Request{prevReq}); err != nil {
+			t.Fatalf("%s: expected cross-host public redirect allowed, got %v", name, err)
+		}
+		if crossReq.Header.Get("X-Custom-Cloud-Token") != "" {
+			t.Fatalf("%s: expected X-Custom-Cloud-Token stripped on cross-host redirect, got %q", name, crossReq.Header.Get("X-Custom-Cloud-Token"))
+		}
+		if crossReq.Header.Get("User-Agent") != "AmbraCustomUA/1.0" {
+			t.Fatalf("%s: expected User-Agent preserved on cross-host redirect, got %q", name, crossReq.Header.Get("User-Agent"))
+		}
+
+		// Cross-host DialContext must strictly reject private LAN & loopback even when allowPrivateLAN=true.
+		tr, ok := c.Transport.(*http.Transport)
+		if !ok || tr == nil || tr.DialContext == nil {
+			t.Fatalf("%s: expected *http.Transport with DialContext", name)
+		}
+		if _, err := tr.DialContext(ctx, "tcp", "10.0.0.1:80"); err == nil {
+			t.Fatalf("%s: expected cross-host private LAN dial 10.0.0.1:80 to be blocked", name)
+		}
+		if _, err := tr.DialContext(ctx, "tcp", "127.0.0.1:80"); err == nil {
+			t.Fatalf("%s: expected cross-host loopback dial 127.0.0.1:80 to be blocked", name)
+		}
+	}
+}

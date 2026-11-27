@@ -109,3 +109,89 @@ func TestAuditWave1_H03_H04_H07_AudioHLSApiKeyCodecsAndHEAD(t *testing.T) {
 		t.Fatalf("3.1-6: expected api_key propagation in main.m3u8, got %d:\n%s", mainRec.Code, mainRec.Body.String())
 	}
 }
+
+func TestAudioHLSSessionKeyConsistencyAndDirectStreamLimit(t *testing.T) {
+	tmp := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(tmp, "audio_limit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	libRepo := sqlite.NewLibraryRepo(store)
+	userRepo := sqlite.NewUserRepo(store)
+	cfg := config.Default(tmp)
+	cfg.SimultaneousStreamLimit = 1
+
+	mockFFmpeg := filepath.Join(tmp, "mock-ffmpeg.sh")
+	ffScript := `#!/bin/sh
+for last; do true; done
+dir=$(dirname "$last")
+printf 'AUDIO-TS-SEG-0' > "$dir/seg_0.ts"
+`
+	if err := os.WriteFile(mockFFmpeg, []byte(ffScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg.FFmpegPath = mockFFmpeg
+
+	mgr := transcode.NewManager(cfg, transcode.WithCapabilities(transcode.SoftwareOnlyCapabilities()))
+	defer mgr.Close()
+
+	musicLib, _ := libRepo.CreateLibrary(ctx, "Music", "music", []string{tmp})
+	audioFile := filepath.Join(tmp, "track.flac")
+	_ = os.WriteFile(audioFile, []byte("fLaC-AUDIO-DATA"), 0o644)
+	rt := int64(30 * transcode.TicksPerSecond)
+
+	song := &sqlite.ItemRecord{
+		ID: guid.New(), LibraryID: musicLib.ID, ParentID: musicLib.ID,
+		Type: "Audio", MediaType: "Audio", Name: "Track", OfficialRating: "G", Path: audioFile, RuntimeTicks: &rt,
+	}
+	_ = libRepo.UpsertItem(ctx, song)
+
+	viewer := &sqlite.UserRecord{ID: guid.New(), Name: "viewer", Policy: sqlite.DefaultUserPolicy(false), Config: sqlite.DefaultUserConfig()}
+	_ = userRepo.CreateUser(ctx, viewer)
+
+	h := New(libRepo, cfg)
+	h.SetUserRepo(userRepo)
+	h.SetTranscodeManager(mgr)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, AuthFuncs{})
+
+	doAs := func(method, target string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, nil)
+		req = req.WithContext(middleware.WithAuthContext(req.Context(), &middleware.AuthContext{User: viewer}))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. Fetching main.m3u8 without PlaySessionId followed by hls1/main/0.ts must share the same SessionKey
+	//    and MUST NOT return 429 when SimultaneousStreamLimit == 1.
+	plRec := doAs(http.MethodGet, "/Audio/"+song.ID+"/main.m3u8?AudioCodec=aac")
+	if plRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on main.m3u8, got %d (%s)", plRec.Code, plRec.Body.String())
+	}
+	segRec := doAs(http.MethodGet, "/Audio/"+song.ID+"/hls1/main/0.ts?AudioCodec=aac")
+	if segRec.Code != http.StatusOK || segRec.Body.String() != "AUDIO-TS-SEG-0" {
+		t.Fatalf("expected 200 on hls1/main/0.ts without PlaySessionId (no 429 mismatch), got %d (%s)", segRec.Code, segRec.Body.String())
+	}
+	if got := mgr.ActiveSessionCount(); got != 1 {
+		t.Fatalf("expected 1 active HLS session (no orphaned session), got %d", got)
+	}
+
+	// 2. With SimultaneousStreamLimit == 1 occupied by that HLS session, direct stream & universal direct play return 429,
+	//    while HEAD requests still succeed with 200.
+	if rec := doAs(http.MethodGet, "/Audio/"+song.ID+"/stream.flac"); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on GET /Audio/{Id}/stream.flac when slot occupied, got %d", rec.Code)
+	}
+	if rec := doAs(http.MethodHead, "/Audio/"+song.ID+"/stream.flac"); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on HEAD /Audio/{Id}/stream.flac when slot occupied, got %d", rec.Code)
+	}
+	if rec := doAs(http.MethodGet, "/Audio/"+song.ID+"/universal?Container=flac"); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on GET /Audio/{Id}/universal direct play when slot occupied, got %d", rec.Code)
+	}
+	if rec := doAs(http.MethodHead, "/Audio/"+song.ID+"/universal?Container=flac"); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on HEAD /Audio/{Id}/universal direct play when slot occupied, got %d", rec.Code)
+	}
+}

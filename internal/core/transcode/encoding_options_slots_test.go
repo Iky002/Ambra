@@ -298,7 +298,7 @@ func TestV0110_LoopbackProxyPinningHeadersAndValidation(t *testing.T) {
 	}
 
 	// Direct newPinnedSafeStreamClient DialContext & CheckRedirect branches
-	safeClient, err := newPinnedSafeStreamClient("127.0.0.1", true, false)
+	safeClient, err := newPinnedSafeStreamClient("127.0.0.1", true, false, nil)
 	if err != nil {
 		t.Fatalf("newPinnedSafeStreamClient: %v", err)
 	}
