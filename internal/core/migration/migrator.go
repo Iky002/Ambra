@@ -16,6 +16,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/core/auth"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
@@ -152,6 +153,7 @@ type Migrator struct {
 	status         MigrationReport
 	wg             sync.WaitGroup
 	onUserUpdated  func(userID string)
+	onUserRevoked  func(ctx context.Context, userID string)
 	selfListenAddr string
 	selfServerID   string
 }
@@ -202,6 +204,18 @@ func (m *Migrator) SetOnUserUpdated(fn func(userID string)) {
 	}
 	m.mu.Lock()
 	m.onUserUpdated = fn
+	m.mu.Unlock()
+}
+
+// SetOnUserRevoked installs an optional callback invoked when an existing user's policy is disabled
+// or tightened (remote access or enabled folders restricted) during migration merge, allowing callers
+// to revoke tokens, sessions, and active WebSocket connections.
+func (m *Migrator) SetOnUserRevoked(fn func(ctx context.Context, userID string)) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.onUserRevoked = fn
 	m.mu.Unlock()
 }
 
@@ -626,17 +640,57 @@ func (m *Migrator) execute(ctx context.Context, client *SourceClient, req Migrat
 	return finish(StatusCompleted, nil)
 }
 
+func isPolicyTightened(prev, next dto.UserPolicy) bool {
+	if next.IsDisabled {
+		return true
+	}
+	if prev.EnableRemoteAccess && !next.EnableRemoteAccess {
+		return true
+	}
+	if prev.EnableAllFolders && !next.EnableAllFolders {
+		return true
+	}
+	if !prev.EnableAllFolders && !next.EnableAllFolders {
+		nextSet := make(map[string]struct{}, len(next.EnabledFolders))
+		for _, f := range next.EnabledFolders {
+			if norm := guid.Normalize(f); norm != "" {
+				nextSet[norm] = struct{}{}
+			}
+		}
+		for _, f := range prev.EnabledFolders {
+			if norm := guid.Normalize(f); norm != "" {
+				if _, ok := nextSet[norm]; !ok {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func (m *Migrator) resolveOrCreateUser(
 	ctx context.Context,
 	src SourceUser,
 	migrateUsers bool,
 	dryRun bool,
 ) (targetUserID string, matched bool, created bool, conflict *ConflictEntry, notice string, err error) {
+	if auth.ContainsControlChar(src.Name) {
+		return "", false, false, &ConflictEntry{
+			SourceItemID: src.ID,
+			Reason:       "source user name contains invalid control characters",
+		}, "", nil
+	}
 	name := strings.TrimSpace(src.Name)
 	if name == "" {
 		return "", false, false, &ConflictEntry{
 			SourceItemID: src.ID,
 			Reason:       "source user has empty name",
+		}, "", nil
+	}
+	if len([]rune(name)) > 128 {
+		return "", false, false, &ConflictEntry{
+			SourceItemID: src.ID,
+			Reason:       "source user name exceeds maximum length of 128 characters",
 		}, "", nil
 	}
 
@@ -662,6 +716,17 @@ func (m *Migrator) resolveOrCreateUser(
 			}
 			if err := m.userRepo.UpdateUserConfig(ctx, existing.ID, src.Configuration); err != nil {
 				return "", false, false, nil, "", err
+			}
+			if isPolicyTightened(existing.Policy, policy) {
+				if policy.IsDisabled {
+					_ = m.userRepo.DeleteTokensByUser(ctx, existing.ID)
+				}
+				m.mu.RLock()
+				revokeFn := m.onUserRevoked
+				m.mu.RUnlock()
+				if revokeFn != nil {
+					revokeFn(ctx, existing.ID)
+				}
 			}
 		}
 		return existing.ID, true, false, nil, notice, nil

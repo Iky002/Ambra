@@ -2,6 +2,7 @@ package system
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -143,31 +144,64 @@ func RegisterSetupRoutes(r chi.Router, authMW *middleware.Auth, h *Handler) {
 	})
 }
 
+func (h *Handler) persistBuiltinPluginConfig(pluginID string, updates map[string]any) {
+	if h.userRepo == nil || len(updates) == 0 {
+		return
+	}
+	key := "plugin:" + pluginID
+	h.extraConfigMu.Lock()
+	defer h.extraConfigMu.Unlock()
+	saved := make(map[string]any)
+	if raw, err := h.userRepo.GetServerConfig(context.Background(), key); err == nil && strings.TrimSpace(raw) != "" {
+		_ = json.Unmarshal([]byte(raw), &saved)
+	}
+	if saved == nil {
+		saved = make(map[string]any)
+	}
+	for k, v := range updates {
+		saved[k] = v
+	}
+	if raw, err := json.Marshal(saved); err == nil {
+		_ = h.userRepo.SetServerConfig(context.Background(), key, string(raw))
+	}
+}
+
 func (h *Handler) syncTMDBPlugin() {
-	if h.registry == nil || h.cfg == nil {
+	if h.cfg == nil {
 		return
 	}
 	snap := h.cfg.Snapshot()
 	apiKey := snap.TMDBApiKey
 	lang := snap.TMDBLanguage
-	if p, ok := h.registry.Get(tmdbPluginID); ok {
-		_ = p.Configure(map[string]any{
-			"api_key":  apiKey,
-			"language": lang,
-		})
+	if h.registry != nil {
+		if p, ok := h.registry.Get(tmdbPluginID); ok {
+			_ = p.Configure(map[string]any{
+				"api_key":  apiKey,
+				"language": lang,
+			})
+		}
 	}
+	h.persistBuiltinPluginConfig(tmdbPluginID, map[string]any{
+		"api_key":  apiKey,
+		"language": lang,
+	})
 }
 
 func (h *Handler) syncSTRMPlugin() {
-	if h.registry == nil || h.cfg == nil {
+	if h.cfg == nil {
 		return
 	}
 	enable302 := h.cfg.Snapshot().EnableSTRM302
-	if p, ok := h.registry.Get(strmPluginID); ok {
-		_ = p.Configure(map[string]any{
-			"enable_302": enable302,
-		})
+	if h.registry != nil {
+		if p, ok := h.registry.Get(strmPluginID); ok {
+			_ = p.Configure(map[string]any{
+				"enable_302": enable302,
+			})
+		}
 	}
+	h.persistBuiltinPluginConfig(strmPluginID, map[string]any{
+		"enable_302": enable302,
+	})
 }
 
 func (h *Handler) GetSetupStatus(w http.ResponseWriter, r *http.Request) {
@@ -196,6 +230,10 @@ func (h *Handler) GetSetupStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "private, no-store")
+	if !netutil.IsLocalOrLANRequest(r) && h.cfg != nil && !h.cfg.Snapshot().IsGlobalRemoteAccessEnabled() {
+		httpx.Error(w, http.StatusForbidden, "Remote access is disabled on this server")
+		return
+	}
 	if !h.checkSetupOrigin(r) {
 		httpx.Error(w, http.StatusForbidden, "cross-origin setup request forbidden")
 		return

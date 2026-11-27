@@ -3,6 +3,7 @@ package compatext
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -512,6 +513,31 @@ func (h *Handler) handleLiveStreamFile(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, target, http.StatusFound)
 }
 
+func (h *Handler) canAccessRecordingItem(r *http.Request, recordingID string) bool {
+	pol, isAdmin, hasAuth := h.callerPolicy(r)
+	if !hasAuth || isAdmin {
+		return true
+	}
+	h.mu.RLock()
+	libRepo := h.libRepo
+	h.mu.RUnlock()
+	if libRepo == nil {
+		return true
+	}
+	item, err := libRepo.GetItemRecordByID(r.Context(), recordingID)
+	if errors.Is(err, sqlite.ErrNotFound) || item == nil {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+	if item.LibraryID != "" && !libRepo.CanUserAccessLibrary(r.Context(), pol, item.LibraryID) {
+		return false
+	}
+	blocked, err := libRepo.IsItemBlockedByPolicy(r.Context(), item, pol)
+	return err == nil && !blocked
+}
+
 func (h *Handler) handleLiveRecordingStream(w http.ResponseWriter, r *http.Request) {
 	if !h.canPlayMedia(r) {
 		writeCompatExtForbidden(w, r, false, "Media playback is disabled for this user")
@@ -521,6 +547,10 @@ func (h *Handler) handleLiveRecordingStream(w http.ResponseWriter, r *http.Reque
 	rec, ok := h.lookupRecording(r.Context(), id)
 	if !ok || strings.TrimSpace(rec.Path) == "" {
 		httpx.Error(w, http.StatusNotFound, "live recording not found")
+		return
+	}
+	if !h.canAccessRecordingItem(r, rec.Id) {
+		writeCompatExtForbidden(w, r, r.Method == http.MethodHead, "Access to this recording is denied")
 		return
 	}
 	resolved, ok := h.resolveRecordingPath(rec.Path)
@@ -656,6 +686,10 @@ func (h *Handler) handleLiveRecordingHLS(headOnly bool) http.HandlerFunc {
 				return
 			}
 			httpx.Error(w, http.StatusNotFound, "live recording not found")
+			return
+		}
+		if !h.canAccessRecordingItem(r, rec.Id) {
+			writeCompatExtForbidden(w, r, headOnly, "Access to this recording is denied")
 			return
 		}
 		resolved, ok := h.resolveRecordingPath(rec.Path)
@@ -1569,26 +1603,41 @@ func (h *Handler) handleSetChannelMapping(w http.ResponseWriter, r *http.Request
 	}
 
 	mapping := ChannelMapping{
-		Name:  req.TunerChannelId,
-		Value: req.ProviderChannelId,
+		Name:  strings.TrimSpace(req.TunerChannelId),
+		Value: strings.TrimSpace(req.ProviderChannelId),
 	}
 
 	h.mu.Lock()
 	h.ensureMapsLocked()
 	snapshot := cloneCompatExtState(h.state)
 	list := append([]ChannelMapping(nil), h.state.ChannelMappings[req.ProviderId]...)
-	updated := false
-	for i := range list {
-		if list[i].Name == mapping.Name {
-			list[i].Value = mapping.Value
-			updated = true
-			break
+	if mapping.Value == "" {
+		// Unmap: remove existing mapping entry rather than persisting an empty Value.
+		kept := list[:0]
+		for _, m := range list {
+			if m.Name != mapping.Name {
+				kept = append(kept, m)
+			}
 		}
+		if len(kept) == 0 {
+			delete(h.state.ChannelMappings, req.ProviderId)
+		} else {
+			h.state.ChannelMappings[req.ProviderId] = kept
+		}
+	} else {
+		updated := false
+		for i := range list {
+			if list[i].Name == mapping.Name {
+				list[i].Value = mapping.Value
+				updated = true
+				break
+			}
+		}
+		if !updated && mapping.Name != "" {
+			list = append(list, mapping)
+		}
+		h.state.ChannelMappings[req.ProviderId] = list
 	}
-	if !updated && mapping.Name != "" {
-		list = append(list, mapping)
-	}
-	h.state.ChannelMappings[req.ProviderId] = list
 	err := h.saveStateLocked(r.Context())
 	if err != nil {
 		h.state = snapshot

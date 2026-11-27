@@ -784,10 +784,24 @@ func TestLiveTVHLSCaseInsensitiveAndUnquotedURIAndStreamSlots(t *testing.T) {
 		t.Fatal("expected rewritten signed segment URL in HLS manifest")
 	}
 
-	// Occupy the single global stream slot -> new initial GET returns 429, while HEAD and signed sub-target segment still succeed!
+	// Active HLS stream lease holds the 1 global slot across .m3u8 and .ts requests so another viewer cannot exceed SimultaneousStreamLimit=1.
+	if relBlocked, ok := mgr.TryAcquireStreamSlot(1, "other-user-video-transcode"); ok {
+		relBlocked()
+		t.Fatal("expected active LiveTV HLS lease to hold the single SimultaneousStreamLimit slot")
+	}
+
+	// Signed HLS sub-target segment refreshes the existing lease (200) without consuming an extra slot.
+	recSeg := httptest.NewRecorder()
+	mux.ServeHTTP(recSeg, httptest.NewRequest(http.MethodGet, signedSegPath, nil))
+	if recSeg.Code != http.StatusOK || recSeg.Body.String() != "HLS-SEG-DATA" {
+		t.Fatalf("expected signed HLS sub-target segment to reuse active lease (200), got %d %q", recSeg.Code, recSeg.Body.String())
+	}
+
+	// Once the HLS lease expires/releases, another stream can acquire the slot and block new LiveTV GET with 429 while HEAD still succeeds.
+	h.releaseStreamLeases()
 	relOccupied, ok := mgr.TryAcquireStreamSlot(1, "other-user-video-transcode")
 	if !ok {
-		t.Fatal("expected to acquire free stream slot after HLS manifest polls completed")
+		t.Fatal("expected to acquire free stream slot after HLS stream lease released")
 	}
 
 	recBlocked := httptest.NewRecorder()
@@ -800,12 +814,6 @@ func TestLiveTVHLSCaseInsensitiveAndUnquotedURIAndStreamSlots(t *testing.T) {
 	mux.ServeHTTP(recHead, httptest.NewRequest(http.MethodHead, "/LiveTv/Channels/ch-slot-hls/Stream", nil))
 	if recHead.Code != http.StatusOK {
 		t.Fatalf("expected 200 on LiveTV HEAD even when SimultaneousStreamLimit=1 full, got %d", recHead.Code)
-	}
-
-	recSeg := httptest.NewRecorder()
-	mux.ServeHTTP(recSeg, httptest.NewRequest(http.MethodGet, signedSegPath, nil))
-	if recSeg.Code != http.StatusOK || recSeg.Body.String() != "HLS-SEG-DATA" {
-		t.Fatalf("expected signed HLS sub-target segment not to consume extra slot (200), got %d %q", recSeg.Code, recSeg.Body.String())
 	}
 
 	relOccupied()

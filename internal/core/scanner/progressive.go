@@ -357,6 +357,11 @@ func (s *Scanner) CancelAll() {
 			cancel()
 		}
 	}
+	if s.baseCancel != nil {
+		s.baseCancel()
+		s.baseCtx = nil
+		s.baseCancel = nil
+	}
 	s.mu.Unlock()
 	s.Resume()
 }

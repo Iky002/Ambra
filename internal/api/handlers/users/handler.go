@@ -30,7 +30,6 @@ import (
 
 const (
 	authByNameRateLimit           = 30
-	authByNameUserRateLimit       = 30
 	authByNameIPRateLimit         = 60
 	authByNameRateWindow          = time.Minute
 	authByNameLoopbackRateLimit   = 60
@@ -38,6 +37,7 @@ const (
 	authByNameLoopbackRateWindow  = 5 * time.Minute
 	authRateMaxBuckets            = 4096
 	maxSubBucketsPerIP            = 8
+	authFailLogThrottle           = 15 * time.Second
 )
 
 type Handler struct {
@@ -53,6 +53,7 @@ type Handler struct {
 	authIPRates         map[string][]time.Time
 	loopbackAuthRates   map[string][]time.Time
 	loopbackAuthIPRates map[string][]time.Time
+	authFailLogLast     map[string]time.Time
 	onUserDeleted       func(ctx context.Context, userID string)
 }
 
@@ -73,7 +74,39 @@ func NewHandler(
 		authIPRates:         make(map[string][]time.Time),
 		loopbackAuthRates:   make(map[string][]time.Time),
 		loopbackAuthIPRates: make(map[string][]time.Time),
+		authFailLogLast:     make(map[string]time.Time),
 	}
+}
+
+func (h *Handler) shouldLogAuthFailure(ip, key string, now time.Time) bool {
+	ipKey := strings.TrimSpace(ip)
+	userKey := strings.ToLower(strings.TrimSpace(key))
+	mapKey := ipKey + "|" + userKey
+	cutoff := now.Add(-authFailLogThrottle)
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.authFailLogLast == nil {
+		h.authFailLogLast = make(map[string]time.Time)
+	}
+	if last, ok := h.authFailLogLast[mapKey]; ok && last.After(cutoff) {
+		return false
+	}
+	if len(h.authFailLogLast) >= authRateMaxBuckets {
+		for k, t := range h.authFailLogLast {
+			if !t.After(cutoff) {
+				delete(h.authFailLogLast, k)
+			}
+		}
+		if len(h.authFailLogLast) >= authRateMaxBuckets {
+			for k := range h.authFailLogLast {
+				delete(h.authFailLogLast, k)
+				break
+			}
+		}
+	}
+	h.authFailLogLast[mapKey] = now
+	return true
 }
 
 // SetLibraryRepo attaches a LibraryRepo to enforce library RBAC and parental controls on playback reports.
@@ -476,6 +509,11 @@ func RegisterRoutes(r chi.Router, authMW *middleware.Auth, h *Handler) {
 
 func (h *Handler) ListPublicUsers(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "private, no-store")
+	isLocal := netutil.IsLocalOrLANRequest(r)
+	if !isLocal && !h.isGlobalRemoteAccessEnabled() {
+		httpx.Error(w, http.StatusForbidden, "Remote access is disabled on this server")
+		return
+	}
 	if !h.isLoginUserListEnabled() {
 		httpx.JSON(w, http.StatusOK, []dto.UserDto{})
 		return
@@ -487,6 +525,9 @@ func (h *Handler) ListPublicUsers(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]dto.UserDto, 0, len(users))
 	for _, u := range users {
+		if !isLocal && !u.Policy.EnableRemoteAccess {
+			continue
+		}
 		d := h.authSvc.ToUserDto(u)
 		// Strip sensitive policy and configuration details from unauthenticated public responses.
 		d.Policy = dto.UserPolicy{
@@ -572,12 +613,14 @@ func (h *Handler) AuthenticateByName(w http.ResponseWriter, r *http.Request) {
 				_, _ = auth.VerifyPassword(req.Pw, u.PasswordHash)
 			}
 			h.recordLoginFailure(ip, req.Username, now)
-			_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
-				Name:     u.Name + " failed to log in (remote access disabled)",
-				Type:     "AuthenticationFailed",
-				UserID:   u.ID,
-				Severity: "Warning",
-			})
+			if h.shouldLogAuthFailure(ip, req.Username, now) {
+				_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+					Name:     u.Name + " failed to log in (remote access disabled)",
+					Type:     "AuthenticationFailed",
+					UserID:   u.ID,
+					Severity: "Warning",
+				})
+			}
 			httpx.Error(w, http.StatusUnauthorized, "Invalid username or password")
 			return
 		}
@@ -588,7 +631,7 @@ func (h *Handler) AuthenticateByName(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, auth.ErrInvalidCredentials):
 			h.recordLoginFailure(ip, req.Username, now)
-			if h.userRepo != nil {
+			if h.userRepo != nil && h.shouldLogAuthFailure(ip, req.Username, now) {
 				uname := strings.TrimSpace(req.Username)
 				if uname == "" {
 					uname = "unknown"
@@ -601,7 +644,8 @@ func (h *Handler) AuthenticateByName(w http.ResponseWriter, r *http.Request) {
 			}
 			httpx.Error(w, http.StatusUnauthorized, "Invalid username or password")
 		case errors.Is(err, auth.ErrUserDisabled):
-			if h.userRepo != nil {
+			h.recordLoginFailure(ip, req.Username, now)
+			if h.userRepo != nil && h.shouldLogAuthFailure(ip, req.Username, now) {
 				uname := strings.TrimSpace(req.Username)
 				if uname == "" {
 					uname = "unknown"
@@ -1479,9 +1523,14 @@ func (h *Handler) UpdateDisplayPreferences(w http.ResponseWriter, r *http.Reques
 		client = "emby"
 	}
 
-	raw, err := io.ReadAll(io.LimitReader(r.Body, 512<<10))
+	const maxDisplayPrefsBytes = 512 << 10
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxDisplayPrefsBytes+1))
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, "failed to read body")
+		return
+	}
+	if len(raw) > maxDisplayPrefsBytes {
+		httpx.Error(w, http.StatusRequestEntityTooLarge, "display preferences payload too large")
 		return
 	}
 	if len(raw) == 0 {

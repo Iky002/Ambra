@@ -548,7 +548,7 @@ exec sleep 10
 	}
 	defer st.Close()
 
-	customTemp := filepath.Join(dbTmp, "custom-transcode-temp")
+	customTemp := filepath.Join(t.TempDir(), "custom-transcode-temp")
 	ffRaw, _ := json.Marshal(map[string]any{
 		"HardwareAccelerationMode": 0,
 		"EnableHardwareEncoding":   false,

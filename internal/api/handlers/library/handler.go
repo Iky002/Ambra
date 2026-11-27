@@ -1761,12 +1761,17 @@ func (h *Handler) handleMediaUpdated(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.repo != nil {
+		const maxMediaUpdatedPathsPerLib = 256
 		if libs, err := h.repo.ListLibraries(r.Context()); err == nil {
 			type scanTarget struct {
 				libID string
 				path  string
 			}
 			seen := make(map[scanTarget]bool)
+			validPathsByLib := make(map[string][]string)
+			libOrder := make([]string, 0, len(libs))
+			libAdded := make(map[string]bool)
+
 			for _, updPath := range updatePaths {
 				resolvedUpd, symErr := filepath.EvalSymlinks(updPath)
 				if symErr == nil {
@@ -1776,15 +1781,22 @@ func (h *Handler) handleMediaUpdated(w http.ResponseWriter, r *http.Request) {
 				}
 				for _, lib := range libs {
 					for _, root := range lib.Paths {
-						resolvedRoot := filepath.Clean(root)
+						cleanRoot := filepath.Clean(root)
+						resolvedRoot := cleanRoot
 						if symR, symRErr := filepath.EvalSymlinks(root); symRErr == nil {
 							resolvedRoot = filepath.Clean(symR)
 						}
 						within := false
+						targetPath := updPath
 						if symErr == nil {
 							within = pathWithinRoot(resolvedUpd, resolvedRoot)
+							if within && !pathWithinRoot(updPath, cleanRoot) {
+								if rel, relErr := filepath.Rel(resolvedRoot, resolvedUpd); relErr == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+									targetPath = filepath.Clean(filepath.Join(cleanRoot, rel))
+								}
+							}
 						} else {
-							within = pathWithinRoot(updPath, root)
+							within = pathWithinRoot(updPath, cleanRoot)
 							if within {
 								if symParent, pErr := filepath.EvalSymlinks(filepath.Dir(updPath)); pErr == nil {
 									within = pathWithinRoot(filepath.Clean(symParent), resolvedRoot)
@@ -1792,14 +1804,29 @@ func (h *Handler) handleMediaUpdated(w http.ResponseWriter, r *http.Request) {
 							}
 						}
 						if within {
-							t := scanTarget{libID: lib.ID, path: updPath}
+							t := scanTarget{libID: lib.ID, path: targetPath}
 							if !seen[t] {
 								seen[t] = true
-								h.scanner.ScanPathAsync(lib.ID, updPath)
+								if !libAdded[lib.ID] {
+									libAdded[lib.ID] = true
+									libOrder = append(libOrder, lib.ID)
+								}
+								validPathsByLib[lib.ID] = append(validPathsByLib[lib.ID], targetPath)
 							}
 							break
 						}
 					}
+				}
+			}
+
+			for _, libID := range libOrder {
+				paths := validPathsByLib[libID]
+				if len(paths) > maxMediaUpdatedPathsPerLib {
+					h.scanner.ScanLibraryAsync(libID)
+					continue
+				}
+				for _, p := range paths {
+					h.scanner.ScanPathAsync(libID, p)
 				}
 			}
 		}

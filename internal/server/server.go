@@ -308,22 +308,29 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	pluginAdminH := pluginadmin.New(registry, store)
 	pluginAdminH.SetPluginsDir(pluginsDir)
 	pluginAdminH.SetOnConfigSaved(func(pluginID string, saved map[string]any) {
+		normSaved := make(map[string]any, len(saved))
+		for k, v := range saved {
+			nk := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(k), "_", ""))
+			if nk != "" {
+				normSaved[nk] = v
+			}
+		}
 		switch pluginID {
 		case "ambra.builtin.tmdb":
 			cfg.Update(func(c *config.Config) {
-				if v, ok := saved["api_key"].(string); ok {
+				if v, ok := normSaved["apikey"].(string); ok {
 					c.TMDBApiKey = strings.TrimSpace(v)
 				}
-				if v, ok := saved["language"].(string); ok && strings.TrimSpace(v) != "" {
+				if v, ok := normSaved["language"].(string); ok && strings.TrimSpace(v) != "" {
 					c.TMDBLanguage = strings.TrimSpace(v)
 				}
 			})
 			_ = cfg.Save()
 		case "ambra.builtin.strm":
 			cfg.Update(func(c *config.Config) {
-				if v, ok := saved["enable_302"].(bool); ok {
+				if v, ok := normSaved["enable302"].(bool); ok {
 					c.EnableSTRM302 = v
-				} else if v, ok := saved["enable_strm_302"].(bool); ok {
+				} else if v, ok := normSaved["enablestrm302"].(bool); ok {
 					c.EnableSTRM302 = v
 				}
 			})
@@ -531,10 +538,14 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		UserIDFromCtx: userIDFromCtx,
 	})
 
+	var compatExtSvc *compatext.Handler
 	purgeUserArtifacts := func(c context.Context, userID string) {
 		notifH.PurgeUser(c, userID)
 		opsH.PurgeUser(c, userID)
 		syncH.PurgeUser(c, userID)
+		if compatExtSvc != nil {
+			compatExtSvc.PurgeUser(c, userID)
+		}
 	}
 	usersHandler.SetOnUserDeleted(purgeUserArtifacts)
 
@@ -559,6 +570,12 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	migrator := migration.NewMigrator(store, userRepo)
 	migrator.SetSelfServer(snap.HTTPAddr, snap.ServerID)
 	migrator.SetOnUserUpdated(authSvc.InvalidateUserCache)
+	migrator.SetOnUserRevoked(func(c context.Context, userID string) {
+		_ = userRepo.DeleteTokensByUser(c, userID)
+		authSvc.InvalidateUserCache(userID)
+		sessionMgr.RemoveSessionsByUser(userID)
+		wsHub.DisconnectUser(userID)
+	})
 	migrationH := migrationhandler.New(migrator)
 	migrationH.RegisterRoutes(mediaMux, migrationhandler.AuthFuncs{
 		RequireAuth:  authMW.RequireAuth,
@@ -633,7 +650,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		RequireAdmin:  authMW.RequireAdmin,
 		UserIDFromCtx: userIDFromCtx,
 	})
-	compatExtSvc := compatext.New(store, cfg)
+	compatExtSvc = compatext.New(store, cfg)
 	compatExtSvc.SetLiveTV(livetvH)
 	compatExtSvc.SetSyncHandler(syncH)
 	compatExtSvc.SetTranscodeManager(transcodeMgr)
@@ -766,8 +783,14 @@ func applyPendingDatabaseRestore(dataDir, dbPath string) error {
 		slog.Warn("failed to stat pending database restore file", "path", restorePath, "error", err)
 		return fmt.Errorf("stat pending restore %s: %w", restorePath, err)
 	}
+	cleanupInvalidRestore := func() {
+		_ = os.Remove(restorePath)
+		_ = os.Remove(filepath.Join(dataDir, "config", "ambra.json.restore"))
+		_ = os.RemoveAll(filepath.Join(dataDir, "metadata.restore"))
+	}
 	if !info.Mode().IsRegular() || info.Size() == 0 {
-		slog.Warn("ignoring invalid, symlink, or empty pending database restore file", "path", restorePath, "size", info.Size())
+		slog.Warn("removing invalid, symlink, or empty pending database restore file", "path", restorePath, "size", info.Size())
+		cleanupInvalidRestore()
 		return nil
 	}
 
@@ -781,7 +804,8 @@ func applyPendingDatabaseRestore(dataDir, dbPath string) error {
 	_, readErr := io.ReadFull(rf, magic[:])
 	_ = rf.Close()
 	if readErr != nil || string(magic[:]) != sqliteMagicHeader {
-		slog.Warn("ignoring pending database restore with invalid SQLite magic header", "path", restorePath, "error", readErr)
+		slog.Warn("removing pending database restore with invalid SQLite magic header", "path", restorePath, "error", readErr)
+		cleanupInvalidRestore()
 		return nil
 	}
 
@@ -1150,9 +1174,10 @@ func buildWebHandler(webDir string) http.Handler {
 		}
 	}
 	if fsys == nil {
-		sub, err := fs.Sub(web.DistFS, "dist")
-		if err == nil {
-			fsys = sub
+		if sub, err := fs.Sub(web.DistFS, "dist"); err == nil {
+			if _, statErr := fs.Stat(sub, "index.html"); statErr == nil {
+				fsys = sub
+			}
 		}
 	}
 	if fsys == nil {

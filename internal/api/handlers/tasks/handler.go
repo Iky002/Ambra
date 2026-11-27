@@ -43,6 +43,89 @@ var extraTaskLocalizations = map[string]map[string][2]string{
 		"pt-BR": {"Gerar miniaturas BIF", "Gera arquivos de miniaturas BIF de pré-visualização para os vídeos da biblioteca."},
 		"th-TH": {"สร้างภาพขนาดย่อ BIF", "สร้างไฟล์ภาพขนาดย่อ BIF สำหรับแสดงตัวอย่างแถบเวลาของวิดีโอในคลังสื่อ"},
 	},
+	"RefreshGuide": {
+		"zh-CN": {"刷新节目指南", "从已配置的 EPG 源更新直播电视节目指南数据。"},
+		"zh-TW": {"重新整理節目指南", "從已設定的 EPG 來源更新直播電視節目指南資料。"},
+		"en-US": {"Refresh Guide", "Update Live TV electronic program guide (EPG) listings from configured guide providers."},
+		"ja-JP": {"番組表を更新", "設定済みの EPG プロバイダーからライブ TV 番組表データを更新します。"},
+		"ko-KR": {"편성표 새로고침", "구성된 EPG 공급자에서 라이브 TV 편성표 데이터를 업데이트합니다."},
+		"es-ES": {"Actualizar guía", "Actualiza la guía de programación (EPG) de TV en vivo desde los proveedores configurados."},
+		"de-DE": {"Programmführer aktualisieren", "Aktualisiert die Live-TV-Programmdaten (EPG) aus den konfigurierten Quellen."},
+		"fr-FR": {"Actualiser le guide", "Met à jour le guide des programmes (EPG) de la TV en direct depuis les fournisseurs configurés."},
+		"pt-BR": {"Atualizar guia", "Atualiza o guia de programação (EPG) da TV ao vivo a partir dos provedores configurados."},
+		"th-TH": {"รีเฟรชผังรายการ", "อัปเดตข้อมูลผังรายการทีวีสด (EPG) จากผู้ให้บริการที่ตั้งค่าไว้"},
+	},
+	"RefreshTunerHosts": {
+		"zh-CN": {"刷新调谐器频道", "重新同步已配置的 M3U 和 HDHomeRun 调谐器频道列表。"},
+		"zh-TW": {"重新整理調諧器頻道", "重新同步已設定的 M3U 與 HDHomeRun 調諧器頻道清單。"},
+		"en-US": {"Refresh Tuner Hosts", "Resynchronize channels from configured M3U and HDHomeRun tuner hosts."},
+		"ja-JP": {"チューナーホストを更新", "設定済みの M3U および HDHomeRun チューナーホストのチャンネルを再同期します。"},
+		"ko-KR": {"튜너 호스트 새로고침", "구성된 M3U 및 HDHomeRun 튜너 호스트의 채널을 다시 동기화합니다."},
+		"es-ES": {"Actualizar sintonizadores", "Resincroniza los canales de los sintonizadores M3U y HDHomeRun configurados."},
+		"de-DE": {"Tuner-Hosts aktualisieren", "Synchronisiert Kanäle der konfigurierten M3U- und HDHomeRun-Tuner neu."},
+		"fr-FR": {"Actualiser les tuners", "Resynchronise les chaînes des tuners M3U et HDHomeRun configurés."},
+		"pt-BR": {"Atualizar sintonizadores", "Ressincroniza os canais dos sintonizadores M3U e HDHomeRun configurados."},
+		"th-TH": {"รีเฟรชโฮสต์จูนเนอร์", "ซิงโครไนซ์ช่องรายการจากโฮสต์จูนเนอร์ M3U และ HDHomeRun ที่ตั้งค่าไว้ใหม่"},
+	},
+}
+
+var taskCategoryLocalizations = map[string]map[string]string{
+	"library": {
+		"zh-CN": "媒体库",
+		"zh-TW": "媒體庫",
+		"en-US": "Library",
+		"ja-JP": "ライブラリ",
+		"ko-KR": "라이브러리",
+		"es-ES": "Biblioteca",
+		"de-DE": "Mediathek",
+		"fr-FR": "Médiathèque",
+		"pt-BR": "Biblioteca",
+		"th-TH": "คลังสื่อ",
+	},
+	"maintenance": {
+		"zh-CN": "维护",
+		"zh-TW": "維護",
+		"en-US": "Maintenance",
+		"ja-JP": "メンテナンス",
+		"ko-KR": "유지 관리",
+		"es-ES": "Mantenimiento",
+		"de-DE": "Wartung",
+		"fr-FR": "Maintenance",
+		"pt-BR": "Manutenção",
+		"th-TH": "การบำรุงรักษา",
+	},
+	"livetv": {
+		"zh-CN": "直播电视",
+		"zh-TW": "直播電視",
+		"en-US": "Live TV",
+		"ja-JP": "ライブ TV",
+		"ko-KR": "라이브 TV",
+		"es-ES": "TV en vivo",
+		"de-DE": "Live-TV",
+		"fr-FR": "TV en direct",
+		"pt-BR": "TV ao vivo",
+		"th-TH": "ทีวีสด",
+	},
+}
+
+func localizeTaskCategory(category, locale string) string {
+	norm := strings.ToLower(strings.TrimSpace(category))
+	var canonical string
+	switch norm {
+	case "library", "媒体库", "媒體庫":
+		canonical = "library"
+	case "maintenance", "维护", "維護":
+		canonical = "maintenance"
+	case "livetv", "live tv", "直播电视", "直播電視", "电视直播":
+		canonical = "livetv"
+	default:
+		return category
+	}
+	byLocale := taskCategoryLocalizations[canonical]
+	if localized, ok := byLocale[locale]; ok {
+		return localized
+	}
+	return byLocale["en-US"]
 }
 
 // AuthFuncs decouples route registration from the concrete middleware package.
@@ -132,6 +215,9 @@ func (h *Handler) handleGetTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func localizeTaskInfo(info scheduler.TaskInfo, locale string) scheduler.TaskInfo {
+	if info.Category != "" {
+		info.Category = localizeTaskCategory(info.Category, locale)
+	}
 	key := info.Key
 	if key == "" {
 		key = info.Id
@@ -146,7 +232,7 @@ func localizeTaskInfo(info scheduler.TaskInfo, locale string) scheduler.TaskInfo
 		nameKey, descKey = "task.vacuum_db.name", "task.vacuum_db.desc"
 	case "SyncRankings":
 		nameKey, descKey = "task.sync_rankings.name", "task.sync_rankings.desc"
-	case "ExtractChapterImages", "GenerateBifThumbnails":
+	case "ExtractChapterImages", "GenerateBifThumbnails", "RefreshGuide", "RefreshTunerHosts":
 		if byLocale, ok := extraTaskLocalizations[key]; ok {
 			pair, okLoc := byLocale[locale]
 			if !okLoc {

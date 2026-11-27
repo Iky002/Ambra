@@ -184,8 +184,8 @@ describe('Stream 4 (v0.9.0): Multi-Select Batch Actions, Backup & Restore UI, Re
     renderWithProviders(<HealthAndAuditTab />, ['/admin/health'])
 
     await screen.findByText('数据库备份与恢复')
-    await screen.findByText('/data/backups')
-    await screen.findByText('ambra-backup-20261124-030000.db')
+    await screen.findByText('/data/config/backups')
+    await screen.findByText('ambra-backup-20261124-030000.zip')
 
     // 立即创建备份
     fireEvent.click(screen.getByRole('button', { name: '立即创建备份' }))
@@ -303,9 +303,9 @@ describe('Stream 4 (v0.9.0): Multi-Select Batch Actions, Backup & Restore UI, Re
 
     // 4. BackupRestore 闭环
     const infoBefore = await api.getBackupInfo()
-    expect(infoBefore.BackupDirectory).toBe('/data/backups')
+    expect(infoBefore.BackupDirectory).toBe('/data/config/backups')
     const created = await api.createBackup()
-    expect(created.Name).toMatch(/^ambra-backup-/)
+    expect(created.Name).toMatch(/^ambra-backup-.*\.zip$/)
     const restored = await api.restoreBackup(created.Name)
     expect(restored.Restored).toBe(true)
     expect(restored.RequiresRestart).toBe(true)

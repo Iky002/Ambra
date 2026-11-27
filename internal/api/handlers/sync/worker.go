@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	stdsync "sync"
 	"time"
 
 	"github.com/ambra-media/ambra/internal/api/dto"
@@ -21,6 +23,35 @@ import (
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
+
+type limitedSyncOutputBuffer struct {
+	mu    stdsync.Mutex
+	buf   bytes.Buffer
+	limit int
+}
+
+func (b *limitedSyncOutputBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.limit <= 0 {
+		return len(p), nil
+	}
+	rem := b.limit - b.buf.Len()
+	if rem > 0 {
+		if len(p) > rem {
+			_, _ = b.buf.Write(p[:rem])
+		} else {
+			_, _ = b.buf.Write(p)
+		}
+	}
+	return len(p), nil
+}
+
+func (b *limitedSyncOutputBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.buf.Bytes()...)
+}
 
 // SetBudget attaches a background budget Pool to throttle concurrent offline sync transcodes.
 func (h *Handler) SetBudget(pool *budget.Pool) {
@@ -518,7 +549,11 @@ func (h *Handler) processQueuedSyncItem(ctx context.Context, work *queuedSyncWor
 	args := netutil.FilterFFmpegArgs(ffmpegBin, buildSyncFFmpegArgs(ffInput, tmpOut, work.mediaType, work.bitrate))
 	cmd := exec.CommandContext(itemCtx, ffmpegBin, args...)
 	cmd.WaitDelay = 500 * time.Millisecond
-	outBytes, runErr := cmd.CombinedOutput()
+	outBuf := &limitedSyncOutputBuffer{limit: 64 * 1024}
+	cmd.Stdout = outBuf
+	cmd.Stderr = outBuf
+	runErr := cmd.Run()
+	outBytes := outBuf.Bytes()
 	if itemCtx.Err() != nil {
 		_ = os.Remove(tmpOut)
 		_ = os.Remove(finalOut)
@@ -750,7 +785,7 @@ func (h *Handler) OnLibraryItemAdded(ctx context.Context, itemIDs ...string) {
 		var jobUser *sqlite.UserRecord
 		if userRepo != nil && strings.TrimSpace(job.UserId) != "" {
 			u, err := userRepo.GetUserByID(ctx, guid.Normalize(job.UserId))
-			if err != nil || u == nil || u.IsDisabled {
+			if err != nil || u == nil || u.IsDisabled || u.Policy.IsDisabled {
 				continue
 			}
 			if !u.IsAdmin && !u.Policy.IsAdministrator && !u.Policy.EnableContentDownloading {
@@ -790,12 +825,14 @@ func (h *Handler) OnLibraryItemAdded(ctx context.Context, itemIDs ...string) {
 				if jobUser != nil && !jobUser.IsAdmin && !jobUser.Policy.IsAdministrator && !libRepo.CanUserAccessLibrary(ctx, jobUser.Policy, lib.ID) {
 					return
 				}
-				if items, _, qErr := libRepo.QueryItems(ctx, sqlite.ItemFilter{
+				libFilter := sqlite.ItemFilter{
 					ServerID:  serverID,
 					LibraryID: lib.ID,
 					Recursive: true,
 					Limit:     maxSyncJobItemIDs,
-				}); qErr == nil {
+				}
+				applySyncUserPolicyToFilter(ctx, libRepo, jobUser, &libFilter)
+				if items, _, qErr := libRepo.QueryItems(ctx, libFilter); qErr == nil {
 					for _, it := range items {
 						cRec, rErr := libRepo.GetItemRecordByID(ctx, it.Id)
 						if rErr != nil || cRec == nil || isSyncContainerType(cRec.Type) || cRec.IsStrm || strings.EqualFold(filepath.Ext(cRec.Path), ".strm") {
@@ -848,6 +885,9 @@ func (h *Handler) OnLibraryItemAdded(ctx context.Context, itemIDs ...string) {
 			}
 			itemDTO, err := libRepo.GetItemByID(ctx, serverID, job.UserId, cid)
 			if err != nil || itemDTO == nil || strings.EqualFold(filepath.Ext(itemDTO.Path), ".strm") {
+				continue
+			}
+			if wantTC && jobUser != nil && !canUserTranscodeSyncMedia(jobUser, itemDTO.MediaType) {
 				continue
 			}
 			if job.UnwatchedOnly && h.isItemWatchedByUser(ctx, libRepo, job.UserId, cid, itemDTO) {

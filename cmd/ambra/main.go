@@ -289,10 +289,16 @@ func stagePendingRestore(dataDir string) *pendingRestoreState {
 	if strings.TrimSpace(dataDir) == "" {
 		return nil
 	}
+	cfgDir := filepath.Join(dataDir, "config")
+	restoreCfg := filepath.Join(cfgDir, "ambra.json.restore")
+	restoreMeta := filepath.Join(dataDir, "metadata.restore")
 	restoreDBPath := filepath.Join(dataDir, "ambra.db.restore")
 	hasPendingDB, dbValid := validatePendingDBRestoreFile(restoreDBPath)
 	if hasPendingDB && !dbValid {
 		slog.Warn("aborting pending configuration and metadata restore: invalid ambra.db.restore", "path", restoreDBPath)
+		_ = os.Remove(restoreDBPath)
+		_ = os.Remove(restoreCfg)
+		_ = os.RemoveAll(restoreMeta)
 		return nil
 	}
 
@@ -312,40 +318,42 @@ func stagePendingRestore(dataDir string) *pendingRestoreState {
 		}
 	}
 
-	cfgDir := filepath.Join(dataDir, "config")
-	restoreCfg := filepath.Join(cfgDir, "ambra.json.restore")
-	if info, err := os.Lstat(restoreCfg); err == nil && info.Mode().IsRegular() && info.Size() > 0 && info.Size() <= (4<<20) {
-		target := filepath.Join(cfgDir, "ambra.json")
-		if raw, readErr := os.ReadFile(restoreCfg); readErr == nil {
-			if sanitized, ok := sanitizeRestoredConfigJSON(raw, target); ok {
-				_ = os.MkdirAll(cfgDir, 0o700)
-				bakPath := target + ".pre-restore.bak"
-				_ = os.Remove(bakPath)
-				hadExistingCfg := false
-				if _, stErr := os.Lstat(target); stErr == nil {
-					if renErr := os.Rename(target, bakPath); renErr == nil {
-						hadExistingCfg = true
+	if info, err := os.Lstat(restoreCfg); err == nil {
+		if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > (4<<20) {
+			slog.Warn("removing invalid or oversized pending configuration restore file", "path", restoreCfg, "mode", info.Mode().String(), "size", info.Size())
+			_ = os.Remove(restoreCfg)
+		} else {
+			target := filepath.Join(cfgDir, "ambra.json")
+			if raw, readErr := os.ReadFile(restoreCfg); readErr == nil {
+				if sanitized, ok := sanitizeRestoredConfigJSON(raw, target); ok {
+					_ = os.MkdirAll(cfgDir, 0o700)
+					bakPath := target + ".pre-restore.bak"
+					_ = os.Remove(bakPath)
+					hadExistingCfg := false
+					if _, stErr := os.Lstat(target); stErr == nil {
+						if renErr := os.Rename(target, bakPath); renErr == nil {
+							hadExistingCfg = true
+						}
 					}
-				}
-				if wErr := writeConfigFileAtomic(target, sanitized); wErr == nil {
+					if wErr := writeConfigFileAtomic(target, sanitized); wErr == nil {
+						_ = os.Remove(restoreCfg)
+						st.promotedCfg = true
+						st.cfgPath = target
+						st.cfgBakPath = bakPath
+						st.hadExistingCfg = hadExistingCfg
+						slog.Info("applied pending configuration restore", "path", target)
+					} else if hadExistingCfg {
+						_ = os.Rename(bakPath, target)
+					}
+				} else {
 					_ = os.Remove(restoreCfg)
-					st.promotedCfg = true
-					st.cfgPath = target
-					st.cfgBakPath = bakPath
-					st.hadExistingCfg = hadExistingCfg
-					slog.Info("applied pending configuration restore", "path", target)
-				} else if hadExistingCfg {
-					_ = os.Rename(bakPath, target)
 				}
 			} else {
 				_ = os.Remove(restoreCfg)
 			}
-		} else {
-			_ = os.Remove(restoreCfg)
 		}
 	}
 
-	restoreMeta := filepath.Join(dataDir, "metadata.restore")
 	if info, err := os.Lstat(restoreMeta); err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
 		targetUsersMeta := filepath.Join(dataDir, "metadata", "users")
 		stagedUsersMeta := filepath.Join(restoreMeta, "users")
@@ -452,6 +460,7 @@ func runServerInstance(
 		Addr:              snap.HTTPAddr,
 		Handler:           srv.Handler,
 		ReadHeaderTimeout: 15 * time.Second,
+		ReadTimeout:       60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}

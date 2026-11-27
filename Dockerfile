@@ -42,8 +42,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # ==============================================================================
 FROM alpine:3.21 AS runtime-lite
 
-ENV TZ=Asia/Shanghai \
-    AMBRA_HTTP_ADDR=:8096
+ENV TZ=Asia/Shanghai
 
 RUN apk add --no-cache ca-certificates curl setpriv tzdata \
     && addgroup -g 1000 -S ambra \
@@ -73,10 +72,7 @@ CMD ["/usr/local/bin/ambra", "-data", "/data"]
 FROM debian:bookworm-slim AS runtime-full
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    TZ=Asia/Shanghai \
-    AMBRA_HTTP_ADDR=:8096 \
-    AMBRA_FFMPEG_PATH=/usr/bin/ffmpeg \
-    AMBRA_FFPROBE_PATH=/usr/bin/ffprobe
+    TZ=Asia/Shanghai
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

@@ -35,8 +35,8 @@ const (
 )
 
 var (
-	reHLSTagQuotedURI   = regexp.MustCompile(`(?i)\bURI="([^"]*)"`)
-	reHLSTagUnquotedURI = regexp.MustCompile(`(?i)\bURI=([^",\s]+)`)
+	reHasHLSTagURI = regexp.MustCompile(`(?i)\bURI\s*=`)
+	reHLSTagURI    = regexp.MustCompile(`(?i)\bURI\s*=\s*(?:"([^"]*)"|([^",\s]+))`)
 )
 
 // LoopbackProxyOptions configures a local 127.0.0.1:0 stream proxy for external FFmpeg/FFprobe processes.
@@ -54,12 +54,13 @@ type LoopbackProxyOptions struct {
 // eliminating secondary DNS rebinding windows in external ffmpeg/ffprobe child processes and rewriting
 // HLS (.m3u8) sub-playlists, segments, #EXT-X-KEY, and #EXT-X-MAP URIs through an HMAC-signed /sub endpoint.
 type LoopbackStreamProxy struct {
-	proxyURL  string
-	ln        net.Listener
-	srv       *http.Server
-	baseCtx   context.Context
-	cancelCtx context.CancelFunc
-	closeOnce sync.Once
+	proxyURL    string
+	ln          net.Listener
+	srv         *http.Server
+	ownedClient *http.Client
+	baseCtx     context.Context
+	cancelCtx   context.CancelFunc
+	closeOnce   sync.Once
 }
 
 // URL returns the local loopback HTTP URL to pass to ffmpeg/ffprobe.
@@ -85,6 +86,9 @@ func (p *LoopbackStreamProxy) Close() error {
 		}
 		if p.ln != nil {
 			closeErr = p.ln.Close()
+		}
+		if p.ownedClient != nil {
+			p.ownedClient.CloseIdleConnections()
 		}
 	})
 	return closeErr
@@ -116,22 +120,31 @@ func StartLoopbackStreamProxy(opts LoopbackProxyOptions) (*LoopbackStreamProxy, 
 	sanitizedHeaders := sanitizeUpstreamHeaders(opts.Headers)
 
 	client := opts.Client
+	var ownedClient *http.Client
 	if client == nil {
 		var err error
 		client, err = newPinnedSafeStreamClient(targetHost, opts.AllowPrivateLAN, opts.DisallowLoopback, sanitizedHeaders)
 		if err != nil {
 			return nil, err
 		}
+		ownedClient = client
+	}
+	cleanupOwned := func() {
+		if ownedClient != nil {
+			ownedClient.CloseIdleConnections()
+		}
 	}
 
 	var tokBytes [32]byte
 	if _, err := rand.Read(tokBytes[:]); err != nil {
+		cleanupOwned()
 		return nil, fmt.Errorf("loopback proxy: generate token: %w", err)
 	}
 	token := hex.EncodeToString(tokBytes[:])
 
 	var hmacKey [32]byte
 	if _, err := rand.Read(hmacKey[:]); err != nil {
+		cleanupOwned()
 		return nil, fmt.Errorf("loopback proxy: generate hmac key: %w", err)
 	}
 
@@ -140,6 +153,7 @@ func StartLoopbackStreamProxy(opts LoopbackProxyOptions) (*LoopbackStreamProxy, 
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
+		cleanupOwned()
 		return nil, fmt.Errorf("loopback proxy: listen loopback: %w", err)
 	}
 	proxyOrigin := "http://" + ln.Addr().String()
@@ -147,7 +161,7 @@ func StartLoopbackStreamProxy(opts LoopbackProxyOptions) (*LoopbackStreamProxy, 
 	baseCtx, cancelCtx := context.WithCancel(context.Background())
 	var consumed atomic.Bool
 
-	serveUpstream := func(w http.ResponseWriter, r *http.Request, reqCtx context.Context, upstreamRawURL string, upstreamParsed *url.URL, httpClient *http.Client, forwardCustomHeaders bool) {
+	serveUpstream := func(w http.ResponseWriter, r *http.Request, reqCtx context.Context, upstreamRawURL string, upstreamParsed *url.URL, httpClient *http.Client, forwardCustomHeaders bool, parentSameOrigin bool) {
 		upReq, err := http.NewRequestWithContext(reqCtx, r.Method, upstreamRawURL, nil)
 		if err != nil {
 			http.Error(w, "bad upstream request", http.StatusBadGateway)
@@ -206,14 +220,18 @@ func StartLoopbackStreamProxy(opts LoopbackProxyOptions) (*LoopbackStreamProxy, 
 			return
 		}
 
-		// Peek initial bytes on 2xx responses to detect HLS (#EXTM3U) manifests reliably
-		// without buffering non-manifest media files.
+		// Peek initial bytes on 2xx responses to detect XML manifests (DASH/SmoothStreaming)
+		// and HLS (#EXTM3U) manifests reliably without buffering non-manifest media files.
 		var peekBuf []byte
 		var peekErr error
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			peekBuf, peekErr = sniffInitialBytes(resp.Body, manifestSniffBytes)
 			if peekErr != nil && !errors.Is(peekErr, io.EOF) && !errors.Is(peekErr, io.ErrUnexpectedEOF) && len(peekBuf) == 0 {
 				http.Error(w, "upstream stream read error", http.StatusBadGateway)
+				return
+			}
+			if isXMLManifestPayload(peekBuf) {
+				http.Error(w, "unsupported xml manifest format", http.StatusBadGateway)
 				return
 			}
 		}
@@ -239,7 +257,13 @@ func StartLoopbackStreamProxy(opts LoopbackProxyOptions) (*LoopbackStreamProxy, 
 				http.Error(w, "upstream hls manifest exceeds maximum size", http.StatusBadGateway)
 				return
 			}
-			rewritten, rwErr := rewriteHLSManifest(rawManifest, effectiveURL, proxyOrigin, hmacKey[:])
+			manifestOrigin := urlOriginString(effectiveURL)
+			if !parentSameOrigin || !isSameOriginHost(effectiveURL, parsedTarget) {
+				// Prevent a cross-origin redirected manifest (or its children) from ever being treated
+				// as same-origin with parsedTarget even if it references parsedTarget directly.
+				manifestOrigin = "cross-origin://untrusted:0"
+			}
+			rewritten, rwErr := rewriteHLSManifestWithOrigin(rawManifest, effectiveURL, proxyOrigin, hmacKey[:], manifestOrigin)
 			if rwErr != nil {
 				http.Error(w, "invalid upstream hls manifest", http.StatusBadGateway)
 				return
@@ -316,20 +340,31 @@ func StartLoopbackStreamProxy(opts LoopbackProxyOptions) (*LoopbackStreamProxy, 
 				http.Error(w, "token already consumed", http.StatusForbidden)
 				return
 			}
-			serveUpstream(w, r, reqCtx, rawTarget, parsedTarget, client, true)
+			serveUpstream(w, r, reqCtx, rawTarget, parsedTarget, client, true, true)
 			return
 		}
 
 		if r.URL.Path == "/sub" {
 			uParam := strings.TrimSpace(r.URL.Query().Get("u"))
+			oParam := strings.TrimSpace(r.URL.Query().Get("o"))
 			sigParam := strings.TrimSpace(r.URL.Query().Get("sig"))
-			if uParam == "" || sigParam == "" || !verifyLoopbackSubSig(hmacKey[:], uParam, sigParam) {
+			if uParam == "" || oParam == "" || sigParam == "" || !verifyLoopbackSubSig(hmacKey[:], uParam+"|"+oParam, sigParam) {
 				http.Error(w, "forbidden", http.StatusForbidden)
 				return
 			}
 			decodedBytes, decErr := decodeBase64URLParam(uParam)
 			if decErr != nil {
 				http.Error(w, "invalid target encoding", http.StatusBadRequest)
+				return
+			}
+			originBytes, origDecErr := decodeBase64URLParam(oParam)
+			if origDecErr != nil {
+				http.Error(w, "invalid origin encoding", http.StatusBadRequest)
+				return
+			}
+			manifestOriginURL, origParseErr := url.Parse(strings.TrimSpace(string(originBytes)))
+			if origParseErr != nil {
+				http.Error(w, "invalid origin url", http.StatusBadRequest)
 				return
 			}
 			subRaw := strings.TrimSpace(string(decodedBytes))
@@ -353,7 +388,7 @@ func StartLoopbackStreamProxy(opts LoopbackProxyOptions) (*LoopbackStreamProxy, 
 				return
 			}
 
-			sameHost := isSameOriginHost(subParsed, parsedTarget)
+			sameHost := isSameOriginHost(subParsed, parsedTarget) && isSameOriginHost(subParsed, manifestOriginURL)
 			// Cross-origin sub-resources (e.g. #EXT-X-KEY or segment pointing to 127.0.0.1:9999 or RFC1918 LAN)
 			// must ALWAYS block both loopback and private LAN, even when opts.AllowPrivateLAN is true.
 			disallowSubLoopback := opts.DisallowLoopback || !sameHost
@@ -372,7 +407,7 @@ func StartLoopbackStreamProxy(opts LoopbackProxyOptions) (*LoopbackStreamProxy, 
 				http.Error(w, "blocked upstream sub-resource", http.StatusForbidden)
 				return
 			}
-			serveUpstream(w, r, reqCtx, subRaw, subParsed, subHTTPClient, sameHost)
+			serveUpstream(w, r, reqCtx, subRaw, subParsed, subHTTPClient, sameHost, sameHost)
 			return
 		}
 
@@ -384,11 +419,12 @@ func StartLoopbackStreamProxy(opts LoopbackProxyOptions) (*LoopbackStreamProxy, 
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	p := &LoopbackStreamProxy{
-		proxyURL:  proxyOrigin + expectedPath,
-		ln:        ln,
-		srv:       srv,
-		baseCtx:   baseCtx,
-		cancelCtx: cancelCtx,
+		proxyURL:    proxyOrigin + expectedPath,
+		ln:          ln,
+		srv:         srv,
+		ownedClient: ownedClient,
+		baseCtx:     baseCtx,
+		cancelCtx:   cancelCtx,
 	}
 	go func() {
 		_ = srv.Serve(ln)
@@ -420,10 +456,22 @@ func decodeBase64URLParam(raw string) ([]byte, error) {
 	return base64.URLEncoding.DecodeString(raw)
 }
 
+func urlOriginString(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(strings.TrimSuffix(u.Hostname(), ".")) + ":" + effectiveURLPort(u)
+}
+
 func buildLoopbackSubURL(proxyOrigin, targetURL string, hmacKey []byte) string {
+	return buildLoopbackSubURLWithOrigin(proxyOrigin, targetURL, "", hmacKey)
+}
+
+func buildLoopbackSubURLWithOrigin(proxyOrigin, targetURL, manifestOrigin string, hmacKey []byte) string {
 	enc := base64.RawURLEncoding.EncodeToString([]byte(targetURL))
-	sig := computeLoopbackSubSig(hmacKey, enc)
-	return proxyOrigin + "/sub?u=" + enc + "&sig=" + sig
+	origEnc := base64.RawURLEncoding.EncodeToString([]byte(manifestOrigin))
+	sig := computeLoopbackSubSig(hmacKey, enc+"|"+origEnc)
+	return proxyOrigin + "/sub?u=" + enc + "&o=" + origEnc + "&sig=" + sig
 }
 
 func resolveHLSReferenceURI(baseURL *url.URL, rawRef string) (string, error) {
@@ -456,25 +504,32 @@ func resolveHLSReferenceURI(baseURL *url.URL, rawRef string) (string, error) {
 }
 
 func rewriteHLSManifest(raw []byte, baseURL *url.URL, proxyOrigin string, hmacKey []byte) ([]byte, error) {
+	return rewriteHLSManifestWithOrigin(raw, baseURL, proxyOrigin, hmacKey, "")
+}
+
+func rewriteHLSManifestWithOrigin(raw []byte, baseURL *url.URL, proxyOrigin string, hmacKey []byte, manifestOrigin string) ([]byte, error) {
 	if baseURL == nil {
 		return nil, errors.New("nil manifest base url")
 	}
+	if manifestOrigin == "" {
+		manifestOrigin = urlOriginString(baseURL)
+	}
 	text := string(raw)
 	text = strings.TrimPrefix(text, "\xef\xbb\xbf")
+	text = strings.ReplaceAll(strings.ReplaceAll(text, "\r\n", "\n"), "\r", "\n")
 	lines := strings.Split(text, "\n")
 
 	var out strings.Builder
 	out.Grow(len(text) + 256)
 
-	for i, rawLine := range lines {
-		line := strings.TrimRight(rawLine, "\r")
+	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
 
 		switch {
 		case trimmed == "":
 			out.WriteString(line)
 		case strings.HasPrefix(trimmed, "#"):
-			rewrittenTag, err := rewriteHLSTagURIs(line, baseURL, proxyOrigin, hmacKey)
+			rewrittenTag, err := rewriteHLSTagURIsWithOrigin(line, baseURL, proxyOrigin, manifestOrigin, hmacKey)
 			if err != nil {
 				return nil, err
 			}
@@ -484,7 +539,7 @@ func rewriteHLSManifest(raw []byte, baseURL *url.URL, proxyOrigin string, hmacKe
 			if err != nil {
 				return nil, err
 			}
-			out.WriteString(buildLoopbackSubURL(proxyOrigin, resolved, hmacKey))
+			out.WriteString(buildLoopbackSubURLWithOrigin(proxyOrigin, resolved, manifestOrigin, hmacKey))
 		}
 		if i < len(lines)-1 {
 			out.WriteByte('\n')
@@ -494,51 +549,54 @@ func rewriteHLSManifest(raw []byte, baseURL *url.URL, proxyOrigin string, hmacKe
 }
 
 func rewriteHLSTagURIs(line string, baseURL *url.URL, proxyOrigin string, hmacKey []byte) (string, error) {
-	if !strings.Contains(strings.ToUpper(line), "URI=") {
+	return rewriteHLSTagURIsWithOrigin(line, baseURL, proxyOrigin, urlOriginString(baseURL), hmacKey)
+}
+
+func rewriteHLSTagURIsWithOrigin(line string, baseURL *url.URL, proxyOrigin, manifestOrigin string, hmacKey []byte) (string, error) {
+	if !reHasHLSTagURI.MatchString(line) {
 		return line, nil
 	}
 	var firstErr error
-	// First rewrite quoted URI="..." attributes.
-	if strings.Contains(line, `"`) {
-		line = reHLSTagQuotedURI.ReplaceAllStringFunc(line, func(match string) string {
-			if firstErr != nil {
-				return match
-			}
-			sub := reHLSTagQuotedURI.FindStringSubmatch(match)
-			if len(sub) < 2 {
-				return match
-			}
-			resolved, err := resolveHLSReferenceURI(baseURL, sub[1])
-			if err != nil {
-				firstErr = err
-				return match
-			}
-			return `URI="` + buildLoopbackSubURL(proxyOrigin, resolved, hmacKey) + `"`
-		})
-		if firstErr != nil {
-			return "", firstErr
-		}
-	}
-	// Also handle unquoted URI=value attributes so unquoted schemes/URLs cannot bypass rewriting.
-	line = reHLSTagUnquotedURI.ReplaceAllStringFunc(line, func(match string) string {
+	rewritten := reHLSTagURI.ReplaceAllStringFunc(line, func(match string) string {
 		if firstErr != nil {
 			return match
 		}
-		sub := reHLSTagUnquotedURI.FindStringSubmatch(match)
-		if len(sub) < 2 {
+		sub := reHLSTagURI.FindStringSubmatch(match)
+		if len(sub) < 3 {
+			firstErr = errors.New("malformed hls tag uri")
 			return match
 		}
-		resolved, err := resolveHLSReferenceURI(baseURL, sub[1])
+		rawURI := sub[1]
+		if !strings.Contains(match, `"`) {
+			rawURI = sub[2]
+		}
+		resolved, err := resolveHLSReferenceURI(baseURL, rawURI)
 		if err != nil {
 			firstErr = err
 			return match
 		}
-		return `URI="` + buildLoopbackSubURL(proxyOrigin, resolved, hmacKey) + `"`
+		return `URI="` + buildLoopbackSubURLWithOrigin(proxyOrigin, resolved, manifestOrigin, hmacKey) + `"`
 	})
 	if firstErr != nil {
 		return "", firstErr
 	}
-	return line, nil
+	// Fail closed if any URI= attribute remained unrewritten or points outside proxyOrigin/sub.
+	expectedPrefix := proxyOrigin + "/sub?"
+	allAttrs := reHasHLSTagURI.FindAllStringIndex(rewritten, -1)
+	matchedAttrs := reHLSTagURI.FindAllStringSubmatch(rewritten, -1)
+	if len(allAttrs) != len(matchedAttrs) {
+		return "", errors.New("unrewritten hls tag uri attribute")
+	}
+	for _, sub := range matchedAttrs {
+		val := sub[1]
+		if val == "" {
+			val = sub[2]
+		}
+		if !strings.HasPrefix(val, expectedPrefix) {
+			return "", errors.New("hls tag uri points outside loopback proxy")
+		}
+	}
+	return rewritten, nil
 }
 
 func isHLSManifestPath(urlPath string) bool {
@@ -565,6 +623,54 @@ func isHLSManifestPayload(u *url.URL, contentType string, peek []byte) bool {
 	return false
 }
 
+// isXMLManifestPayload detects XML-based streaming manifests (DASH MPD / SmoothStreaming)
+// after stripping UTF-8/UTF-16 BOMs and leading whitespace so FFmpeg demuxers cannot
+// bypass the loopback proxy via <BaseURL> or external segment references.
+func isXMLManifestPayload(peek []byte) bool {
+	if len(peek) == 0 {
+		return false
+	}
+	var normalized []byte
+	switch {
+	case len(peek) >= 2 && peek[0] == 0xFF && peek[1] == 0xFE:
+		// UTF-16 LE BOM
+		body := peek[2:]
+		normalized = make([]byte, 0, len(body)/2)
+		for i := 0; i+1 < len(body); i += 2 {
+			if body[i+1] == 0 {
+				normalized = append(normalized, body[i])
+			} else {
+				normalized = append(normalized, '?')
+			}
+		}
+	case len(peek) >= 2 && peek[0] == 0xFE && peek[1] == 0xFF:
+		// UTF-16 BE BOM
+		body := peek[2:]
+		normalized = make([]byte, 0, len(body)/2)
+		for i := 0; i+1 < len(body); i += 2 {
+			if body[i] == 0 {
+				normalized = append(normalized, body[i+1])
+			} else {
+				normalized = append(normalized, '?')
+			}
+		}
+	default:
+		normalized = bytes.TrimPrefix(peek, []byte{0xEF, 0xBB, 0xBF})
+	}
+	trimmed := bytes.TrimLeft(normalized, " \t\r\n")
+	if len(trimmed) < 4 {
+		return false
+	}
+	headLen := len(trimmed)
+	if headLen > 32 {
+		headLen = 32
+	}
+	lower := bytes.ToLower(trimmed[:headLen])
+	return bytes.HasPrefix(lower, []byte("<?xml")) ||
+		bytes.HasPrefix(lower, []byte("<mpd")) ||
+		bytes.HasPrefix(lower, []byte("<smoothstreamingmedia"))
+}
+
 func effectiveURLPort(u *url.URL) string {
 	if u == nil {
 		return ""
@@ -586,7 +692,8 @@ func isSameOriginHost(a, b *url.URL) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	return strings.EqualFold(strings.TrimSuffix(a.Hostname(), "."), strings.TrimSuffix(b.Hostname(), ".")) &&
+	return strings.EqualFold(a.Scheme, b.Scheme) &&
+		strings.EqualFold(strings.TrimSuffix(a.Hostname(), "."), strings.TrimSuffix(b.Hostname(), ".")) &&
 		effectiveURLPort(a) == effectiveURLPort(b)
 }
 

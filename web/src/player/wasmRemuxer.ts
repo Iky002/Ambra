@@ -32,7 +32,12 @@ export function resolveLocalCoreBase(explicitBaseUrl?: string): string {
 }
 
 function isLocalCoreBase(base: string): boolean {
-  return base.startsWith('/') || base.startsWith('./') || base.startsWith('../')
+  return (
+    ((base.startsWith('/') && !base.startsWith('//')) ||
+      base.startsWith('./') ||
+      base.startsWith('../')) &&
+    isSameOriginUrl(base)
+  )
 }
 
 let localCoreProbeState: 'unknown' | 'available' | 'unavailable' = 'unknown'
@@ -44,9 +49,18 @@ export function resetLocalCoreProbeCache(): void {
 export async function probeLocalCoreAvailable(base: string, signal?: AbortSignal): Promise<boolean> {
   if (localCoreProbeState === 'available') return true
   if (localCoreProbeState === 'unavailable') return false
+  const probeUrl = `${base}/ffmpeg-core.js`
+  if (!isSameOriginUrl(probeUrl)) {
+    localCoreProbeState = 'unavailable'
+    return false
+  }
   try {
-    const res = await fetch(`${base}/ffmpeg-core.js`, { method: 'HEAD', signal })
+    const res = await fetch(probeUrl, { method: 'HEAD', signal })
     if (!res.ok) {
+      localCoreProbeState = 'unavailable'
+      return false
+    }
+    if (res.redirected && res.url && !isSameOriginUrl(res.url)) {
       localCoreProbeState = 'unavailable'
       return false
     }
@@ -57,7 +71,10 @@ export async function probeLocalCoreAvailable(base: string, signal?: AbortSignal
     }
     localCoreProbeState = 'available'
     return true
-  } catch {
+  } catch (err) {
+    if (signal?.aborted || (err instanceof DOMException && err.name === 'AbortError')) {
+      return false
+    }
     localCoreProbeState = 'unavailable'
     return false
   }
@@ -319,6 +336,13 @@ export async function fetchVerifiedCoreBlobUrl(
     signal?: AbortSignal
   },
 ): Promise<string> {
+  if (!opts?.expectedSha256 && !isSameOriginUrl(url)) {
+    throw new WasmRemuxFallbackError(
+      'integrity_failed',
+      `未提供 SHA-256 校验摘要时禁止拉取非同源 WASM 资产 (${url})`,
+    )
+  }
+
   let res: Response
   try {
     res = await fetch(url, { method: 'GET', signal: opts?.signal })
@@ -328,6 +352,13 @@ export async function fetchVerifiedCoreBlobUrl(
     }
     const msg = err instanceof Error ? err.message : '网络请求失败'
     throw new WasmRemuxFallbackError('load_failed', `拉取 WASM 资产失败 (${url}): ${msg}`)
+  }
+
+  if (!opts?.expectedSha256 && res.redirected && res.url && !isSameOriginUrl(res.url)) {
+    throw new WasmRemuxFallbackError(
+      'integrity_failed',
+      `未提供 SHA-256 校验摘要时禁止跨源重定向拉取 WASM 资产 (${url} -> ${res.url})`,
+    )
   }
 
   if (!res.ok) {
@@ -587,6 +618,7 @@ export class WasmRemuxer {
     const outputName = `output_${jobId}.mp4`
     let loadedFfmpeg: FFmpeg | null = null
     let vfsDirty = false
+    let execTimedOut = false
 
     try {
       if (signal?.aborted || this.disposed) {
@@ -663,6 +695,25 @@ export class WasmRemuxer {
           'timeout',
           '客户端 WASM 转封装超时，自动回退服务端 HLS',
         )
+      } catch (err) {
+        const isTimeoutOrAbort =
+          (err instanceof WasmRemuxFallbackError && err.reason === 'timeout') ||
+          Boolean(signal?.aborted) ||
+          (err instanceof DOMException && err.name === 'AbortError')
+        if (isTimeoutOrAbort) {
+          execTimedOut = true
+          try {
+            loadedFfmpeg.terminate()
+          } catch {
+            // ignore terminate error
+          }
+          if (this.ffmpeg === loadedFfmpeg) {
+            this.ffmpeg = null
+            this.loaded = false
+          }
+          vfsDirty = false
+        }
+        throw err
       } finally {
         ffmpeg.off('progress', onFfmpegProgress)
       }
@@ -705,11 +756,35 @@ export class WasmRemuxer {
       throw new WasmRemuxFallbackError('exec_failed', `客户端 WASM 转封装失败: ${message}`)
     } finally {
       // 无论成功、失败、抛错还是超时，均清理 WASM 虚拟文件系统中的唯一临时输入/输出文件，防止高达 150MB 内存泄漏
-      if (loadedFfmpeg && vfsDirty) {
-        await Promise.allSettled([
-          loadedFfmpeg.deleteFile(inputName),
-          loadedFfmpeg.deleteFile(outputName),
-        ])
+      if (loadedFfmpeg && vfsDirty && !execTimedOut) {
+        const cleanupFfmpeg = loadedFfmpeg
+        let cleanupTimer: number | undefined
+        try {
+          await Promise.race([
+            Promise.allSettled([
+              cleanupFfmpeg.deleteFile(inputName),
+              cleanupFfmpeg.deleteFile(outputName),
+            ]),
+            new Promise<void>((resolve) => {
+              cleanupTimer = window.setTimeout(() => {
+                try {
+                  cleanupFfmpeg.terminate()
+                } catch {
+                  // ignore terminate error
+                }
+                if (this.ffmpeg === cleanupFfmpeg) {
+                  this.ffmpeg = null
+                  this.loaded = false
+                }
+                resolve()
+              }, 2_000)
+            }),
+          ])
+        } finally {
+          if (cleanupTimer !== undefined) {
+            window.clearTimeout(cleanupTimer)
+          }
+        }
       }
       if (this.activeAbortController === localAbort) {
         this.activeAbortController = null

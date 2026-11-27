@@ -78,12 +78,8 @@ func TestSessionKeyUserIsolationMaxSessionsLRUAndActiveWorkDirs(t *testing.T) {
 	sess1 := mgr.sessions[s1.Key]
 	sess2 := mgr.sessions[s2.Key]
 	mgr.mu.Unlock()
-	sess1.mu.Lock()
-	sess1.lastAccess = time.Now().Add(-10 * time.Minute)
-	sess1.mu.Unlock()
-	sess2.mu.Lock()
-	sess2.lastAccess = time.Now()
-	sess2.mu.Unlock()
+	sess1.lastAccess.Store(time.Now().Add(-10 * time.Minute).UnixNano())
+	sess2.lastAccess.Store(time.Now().UnixNano())
 
 	s3, err := mgr.RegisterSession(SessionParams{UserID: "u3", PlaySessionID: "ps3", InputPath: filepath.Join(tmp, "3.mkv")})
 	if err != nil {

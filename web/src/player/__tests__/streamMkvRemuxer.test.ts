@@ -1324,4 +1324,68 @@ describe('StreamMkvRemuxer Controller (Range + MSE + Seek + Dispose)', () => {
     expect(typeof HTMLVideoElement.prototype.requestVideoFrameCallback).toBe('function')
     expect(typeof HTMLVideoElement.prototype.cancelVideoFrameCallback).toBe('function')
   })
+
+  it('[Round2] 拦截畸形 Xiph/EBML lacing，规范编码 >=108B AAC esds 描述符长度，并拒绝超限 CodecPrivate', () => {
+    // 1. 无终止符 (< 0xff) 的 Xiph lacing 必须安全返回空帧列表
+    const badXiphBlock = new Uint8Array([
+      0x81, // track 1
+      0x00, 0x00, // timecode 0
+      0x02, // flags: Xiph lacing (lacing = 1)
+      0x01, // 2 frames
+      0xff, 0xff, 0xff, // 无 < 0xff 终止字节
+    ])
+    const badXiphCluster = ebmlEl(
+      EBML_ID.Cluster,
+      ebmlEl(EBML_ID.Timecode, uintBytes(0)),
+      ebmlEl(EBML_ID.SimpleBlock, badXiphBlock),
+    )
+    expect(parseClusterFrames(badXiphCluster, { timecodeScale: 1_000_000 }).frames).toEqual([])
+
+    // 2. EBML lacing 负 delta 导致 prevSize < 0 时返回空帧列表
+    const negEbmlBlock = new Uint8Array([
+      0x81, // track 1
+      0x00, 0x00, // timecode 0
+      0x06, // flags: EBML lacing (lacing = 3)
+      0x02, // 3 frames
+      0x82, // firstSize = 2
+      0x80, // delta = 0 - 63 = -63 => prevSize = -61 < 0
+      0xaa, 0xbb,
+    ])
+    const negEbmlCluster = ebmlEl(
+      EBML_ID.Cluster,
+      ebmlEl(EBML_ID.Timecode, uintBytes(0)),
+      ebmlEl(EBML_ID.SimpleBlock, negEbmlBlock),
+    )
+    expect(parseClusterFrames(negEbmlCluster, { timecodeScale: 1_000_000 }).frames).toEqual([])
+
+    // 3. AAC CodecPrivate >= 108 字节时使用规范 4 字节 varint 长度编码，不截断/破坏 box 长度
+    const longCfg = new Uint8Array(160).fill(0x11)
+    const entry = buildAudioSampleEntry({
+      trackNumber: 2,
+      trackType: 'audio',
+      codecId: 'A_AAC',
+      sampleRate: 48000,
+      channels: 2,
+      codecPrivate: longCfg,
+    })
+    const entryView = new DataView(entry.buffer, entry.byteOffset, entry.byteLength)
+    expect(entryView.getUint32(0, false)).toBe(entry.byteLength)
+    // 验证 esds box 内部总长度合法
+    const esdsOffset = 8 + 28
+    expect(String.fromCharCode(...entry.subarray(esdsOffset + 4, esdsOffset + 8))).toBe('esds')
+    const esdsBoxSize = entryView.getUint32(esdsOffset, false)
+    expect(esdsOffset + esdsBoxSize).toBe(entry.byteLength)
+
+    // 4. 超限 CodecPrivate (> 4096 字节) 抛出 unsupported_codec 回退错误
+    expect(() =>
+      buildAudioSampleEntry({
+        trackNumber: 2,
+        trackType: 'audio',
+        codecId: 'A_AAC',
+        sampleRate: 48000,
+        channels: 2,
+        codecPrivate: new Uint8Array(4097),
+      }),
+    ).toThrow(StreamMkvFallbackError)
+  })
 })

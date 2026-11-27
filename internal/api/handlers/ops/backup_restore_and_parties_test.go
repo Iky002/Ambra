@@ -637,8 +637,20 @@ func TestBackupFileFallbackPackagesPartyStateAndClosedDBRollbacksV0110(t *testin
 	}); r.Code != http.StatusNoContent {
 		t.Fatalf("POST /Startup/RemoteAccess failed: %d", r.Code)
 	}
-	_ = doReq(t, mux, http.MethodPost, "/Startup/User", map[string]any{"Name": "wizadmin", "Password": "password1"})
-	if r := doReq(t, mux, http.MethodPost, "/Startup/Complete", nil); r.Code != http.StatusNoContent {
+	localPost := func(target string, body any) *httptest.ResponseRecorder {
+		var buf bytes.Buffer
+		if body != nil {
+			_ = json.NewEncoder(&buf).Encode(body)
+		}
+		req := httptest.NewRequest(http.MethodPost, target, &buf)
+		req.RemoteAddr = "127.0.0.1:12345"
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec
+	}
+	_ = localPost("/Startup/User", map[string]any{"Name": "wizadmin", "Password": "password1"})
+	if r := localPost("/Startup/Complete", nil); r.Code != http.StatusNoContent {
 		t.Fatalf("POST /Startup/Complete failed: %d", r.Code)
 	}
 
@@ -723,10 +735,10 @@ func TestBackupFileFallbackPackagesPartyStateAndClosedDBRollbacksV0110(t *testin
 	if r := doReq(t, mux, http.MethodDelete, "/Packages/Installing/"+inst2.Id, nil); r.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 on closed DB cancel install, got %d", r.Code)
 	}
-	if r := doReq(t, mux, http.MethodPost, "/Startup/User", map[string]any{"Name": "failuser", "Password": "password1"}); r.Code != http.StatusInternalServerError {
+	if r := localPost("/Startup/User", map[string]any{"Name": "failuser", "Password": "password1"}); r.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 on closed DB Startup/User, got %d", r.Code)
 	}
-	if r := doReq(t, mux, http.MethodPost, "/Startup/Complete", nil); r.Code != http.StatusInternalServerError {
+	if r := localPost("/Startup/Complete", nil); r.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 on closed DB Startup/Complete, got %d", r.Code)
 	}
 	if r := doReq(t, mux, http.MethodPost, "/Webhooks", map[string]any{"Url": "http://127.0.0.1:9999/rb2", "Enabled": true}); r.Code != http.StatusInternalServerError {

@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -110,6 +111,8 @@ type Manager struct {
 	saveTriggers          func(ctx context.Context, triggers map[string][]TaskTriggerInfo) error
 	activeTranscodeDirsFn func() []string
 	transcodeTempDirFn    func() string
+	dataDir               string
+	libraryPathsFn        func(ctx context.Context) ([]string, error)
 	tickInterval          time.Duration
 	nowFn                 func() time.Time
 	started               atomic.Bool
@@ -139,6 +142,22 @@ func (m *Manager) SetTranscodeTempDirFn(fn func() string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.transcodeTempDirFn = fn
+}
+
+// SetDataDir registers the application DataDir so CleanTranscodeCache never deletes DataDir
+// or any subdirectory inside DataDir outside cache/transcoding-temp.
+func (m *Manager) SetDataDir(dir string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dataDir = strings.TrimSpace(dir)
+}
+
+// SetLibraryPathsFn registers a callback returning configured media library root paths
+// so CleanTranscodeCache never cleans a directory overlapping any media library root.
+func (m *Manager) SetLibraryPathsFn(fn func(ctx context.Context) ([]string, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.libraryPathsFn = fn
 }
 
 // SetTickInterval configures how frequently Start polls task triggers (defaults to 15s).
@@ -466,6 +485,8 @@ func (m *Manager) RegisterBuiltinTasks(scanAll func(ctx context.Context) error, 
 			m.mu.RLock()
 			tempDirFn := m.transcodeTempDirFn
 			activeFn := m.activeTranscodeDirsFn
+			dataDir := m.dataDir
+			libPathsFn := m.libraryPathsFn
 			m.mu.RUnlock()
 
 			targetDir := strings.TrimSpace(transcodeTempDir)
@@ -478,7 +499,22 @@ func (m *Manager) RegisterBuiltinTasks(scanAll func(ctx context.Context) error, 
 				report(100)
 				return nil
 			}
-			if err := validateTranscodeCleanTargetDir(targetDir); err != nil {
+			if dataDir == "" {
+				if cleanStatic := filepath.Clean(strings.TrimSpace(transcodeTempDir)); filepath.Base(cleanStatic) == "transcoding-temp" && filepath.Base(filepath.Dir(cleanStatic)) == "cache" {
+					dataDir = filepath.Dir(filepath.Dir(cleanStatic))
+				}
+			}
+			var libraryRoots []string
+			if libPathsFn != nil {
+				paths, pErr := libPathsFn(ctx)
+				if pErr != nil {
+					return fmt.Errorf("failed to verify media library roots before transcode cleanup: %w", pErr)
+				}
+				libraryRoots = paths
+			} else if db != nil {
+				libraryRoots = loadLibraryRootsFromDB(ctx, db)
+			}
+			if err := validateTranscodeCleanTargetDirWithScope(targetDir, dataDir, libraryRoots); err != nil {
 				return err
 			}
 			entries, err := os.ReadDir(targetDir)
@@ -838,57 +874,122 @@ func snapshotLocked(mt *managedTask) TaskInfo {
 	}
 }
 
-func validateTranscodeCleanTargetDir(targetDir string) error {
-	trimmed := strings.TrimSpace(targetDir)
+func resolvePathCandidates(raw string) []string {
+	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" || trimmed == "." {
-		return fmt.Errorf("unsafe transcode clean target directory %q", targetDir)
+		return nil
 	}
 	cleanDir := filepath.Clean(trimmed)
 	if abs, err := filepath.Abs(cleanDir); err == nil {
 		cleanDir = filepath.Clean(abs)
 	}
-
 	candidates := []string{cleanDir}
 	if sym, err := filepath.EvalSymlinks(cleanDir); err == nil {
-		candidates = append(candidates, filepath.Clean(sym))
+		s := filepath.Clean(sym)
+		if s != cleanDir {
+			candidates = append(candidates, s)
+		}
 	} else if parentSym, pErr := filepath.EvalSymlinks(filepath.Dir(cleanDir)); pErr == nil {
-		candidates = append(candidates, filepath.Clean(filepath.Join(parentSym, filepath.Base(cleanDir))))
+		s := filepath.Clean(filepath.Join(parentSym, filepath.Base(cleanDir)))
+		if s != cleanDir {
+			candidates = append(candidates, s)
+		}
+	}
+	return candidates
+}
+
+func isPathEqualOrUnder(path, base string) bool {
+	p := filepath.Clean(path)
+	b := filepath.Clean(base)
+	if p == b {
+		return true
+	}
+	rel, err := filepath.Rel(b, p)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+func isPathStrictlyUnder(path, base string) bool {
+	p := filepath.Clean(path)
+	b := filepath.Clean(base)
+	if p == b {
+		return false
+	}
+	return isPathEqualOrUnder(p, b)
+}
+
+func loadLibraryRootsFromDB(ctx context.Context, db *sql.DB) []string {
+	if db == nil {
+		return nil
+	}
+	rows, err := db.QueryContext(ctx, `SELECT paths_json FROM libraries`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var roots []string
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			continue
+		}
+		var paths []string
+		if err := json.Unmarshal([]byte(raw), &paths); err == nil {
+			for _, p := range paths {
+				if trimmed := strings.TrimSpace(p); trimmed != "" {
+					roots = append(roots, trimmed)
+				}
+			}
+		}
+	}
+	return roots
+}
+
+func validateTranscodeCleanTargetDir(targetDir string) error {
+	trimmed := strings.TrimSpace(targetDir)
+	if trimmed == "" || trimmed == "." {
+		return fmt.Errorf("unsafe transcode clean target directory %q", targetDir)
+	}
+	candidates := resolvePathCandidates(trimmed)
+	if len(candidates) == 0 {
+		return fmt.Errorf("unsafe transcode clean target directory %q", targetDir)
 	}
 
 	forbiddenExact := map[string]struct{}{
-		"/":      {},
-		"/etc":   {},
-		"/usr":   {},
-		"/var":   {},
-		"/bin":   {},
-		"/sbin":  {},
-		"/lib":   {},
-		"/lib64": {},
-		"/home":  {},
-		"/root":  {},
-		"/dev":   {},
-		"/proc":  {},
-		"/sys":   {},
-		"/boot":  {},
+		"/":            {},
+		"/home":        {},
+		"/root":        {},
+		"/var/tmp":     {},
+		"/var/cache":   {},
+		"/var/folders": {},
 	}
-	addForbidden := func(raw string) {
-		raw = strings.TrimSpace(raw)
-		if raw == "" {
-			return
-		}
-		c := filepath.Clean(raw)
-		forbiddenExact[c] = struct{}{}
-		if abs, err := filepath.Abs(c); err == nil {
-			forbiddenExact[filepath.Clean(abs)] = struct{}{}
-		}
-		if sym, err := filepath.EvalSymlinks(c); err == nil {
-			forbiddenExact[filepath.Clean(sym)] = struct{}{}
+	addForbiddenExact := func(raw string) {
+		for _, c := range resolvePathCandidates(raw) {
+			forbiddenExact[c] = struct{}{}
 		}
 	}
-	addForbidden(os.TempDir())
+	addForbiddenExact(os.TempDir())
 	if homeDir, err := os.UserHomeDir(); err == nil {
-		addForbidden(homeDir)
+		addForbiddenExact(homeDir)
 	}
+
+	// Prefix-protected system directories (reject exact match and all descendants).
+	forbiddenPrefixes := []string{
+		"/etc",
+		"/usr",
+		"/bin",
+		"/sbin",
+		"/lib",
+		"/lib64",
+		"/boot",
+		"/proc",
+		"/sys",
+		"/dev",
+	}
+	// /var and its descendants are protected EXCEPT subdirectories strictly under /var/tmp, /var/cache, or /var/folders.
+	allowedVarSubtrees := []string{"/var/tmp", "/var/cache", "/var/folders"}
 
 	for _, cand := range candidates {
 		if cand == "" || cand == "." || filepath.Dir(cand) == cand {
@@ -897,6 +998,65 @@ func validateTranscodeCleanTargetDir(targetDir string) error {
 		if _, blocked := forbiddenExact[cand]; blocked {
 			return fmt.Errorf("refusing to clean protected directory %q", targetDir)
 		}
+		for _, prefix := range forbiddenPrefixes {
+			if isPathEqualOrUnder(cand, prefix) {
+				return fmt.Errorf("refusing to clean protected system directory %q", targetDir)
+			}
+		}
+		if isPathEqualOrUnder(cand, "/var") {
+			allowed := false
+			for _, sub := range allowedVarSubtrees {
+				if isPathStrictlyUnder(cand, sub) {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				return fmt.Errorf("refusing to clean protected /var directory %q", targetDir)
+			}
+		}
 	}
+	return nil
+}
+
+func validateTranscodeCleanTargetDirWithScope(targetDir, dataDir string, libraryRoots []string) error {
+	if err := validateTranscodeCleanTargetDir(targetDir); err != nil {
+		return err
+	}
+	targetCands := resolvePathCandidates(targetDir)
+
+	if strings.TrimSpace(dataDir) != "" {
+		dataCands := resolvePathCandidates(dataDir)
+		for _, tc := range targetCands {
+			for _, dc := range dataCands {
+				// Reject targetDir equal to DataDir or an ancestor of DataDir.
+				if isPathEqualOrUnder(dc, tc) {
+					return fmt.Errorf("refusing to clean DataDir or its ancestor %q", targetDir)
+				}
+				// Reject targetDir inside DataDir unless it is cache/transcoding-temp (or a subdirectory of it).
+				if isPathStrictlyUnder(tc, dc) {
+					allowedSub := filepath.Join(dc, "cache", "transcoding-temp")
+					if !isPathEqualOrUnder(tc, allowedSub) {
+						return fmt.Errorf("refusing to clean DataDir subdirectory %q outside cache/transcoding-temp", targetDir)
+					}
+				}
+			}
+		}
+	}
+
+	for _, libRoot := range libraryRoots {
+		if strings.TrimSpace(libRoot) == "" {
+			continue
+		}
+		libCands := resolvePathCandidates(libRoot)
+		for _, tc := range targetCands {
+			for _, lc := range libCands {
+				if isPathEqualOrUnder(tc, lc) || isPathEqualOrUnder(lc, tc) {
+					return fmt.Errorf("refusing to clean directory %q overlapping media library root %q", targetDir, libRoot)
+				}
+			}
+		}
+	}
+
 	return nil
 }

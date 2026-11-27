@@ -834,6 +834,7 @@ function parseBlockPayload(
   if (lacing === 2) {
     // Fixed-size lacing
     const remaining = block.length - offset
+    if (remaining < 0) return []
     const frameSize = Math.floor(remaining / frameCount)
     for (let i = 0; i < frameCount; i++) sizes.push(frameSize)
   } else if (lacing === 1) {
@@ -841,35 +842,46 @@ function parseBlockPayload(
     let total = 0
     for (let i = 0; i < frameCount - 1; i++) {
       let sz = 0
+      let terminated = false
       while (offset < block.length) {
         const b = block[offset++]
         sz += b
-        if (b !== 0xff) break
+        if (b !== 0xff) {
+          terminated = true
+          break
+        }
       }
+      if (!terminated) return []
       sizes.push(sz)
       total += sz
+      if (total < 0 || offset + total > block.length) return []
     }
-    sizes.push(Math.max(0, block.length - offset - total))
+    if (total < 0 || offset + total > block.length) return []
+    sizes.push(block.length - offset - total)
   } else if (lacing === 3) {
     // EBML lacing
     const firstSize = readVint(block, offset, false)
-    if (!firstSize || firstSize.isUnknown) return []
+    if (!firstSize || firstSize.isUnknown || firstSize.length > 7) return []
     offset += firstSize.length
     let prevSize = firstSize.value
+    if (prevSize < 0) return []
     sizes.push(prevSize)
     let total = prevSize
 
     for (let i = 1; i < frameCount - 1; i++) {
       const deltaVint = readVint(block, offset, false)
-      if (!deltaVint || deltaVint.isUnknown) return []
+      if (!deltaVint || deltaVint.isUnknown || deltaVint.length > 7) return []
       offset += deltaVint.length
       // Signed EBML VINT bias = 2^(7*len - 1) - 1
       const bias = Math.pow(2, 7 * deltaVint.length - 1) - 1
       prevSize += deltaVint.value - bias
+      if (prevSize < 0) return []
       sizes.push(prevSize)
       total += prevSize
+      if (total < 0 || offset + total > block.length) return []
     }
-    sizes.push(Math.max(0, block.length - offset - total))
+    if (total < 0 || offset + total > block.length) return []
+    sizes.push(block.length - offset - total)
   }
 
   const out: MkvFrame[] = []
@@ -966,47 +978,62 @@ function buildMvhdBox(timescale: number, durationTicks: number, nextTrackId: num
   return makeFullBox('mvhd', 0, 0, body)
 }
 
+function makeEsdsDescriptor(tag: number, ...payloads: Uint8Array[]): Uint8Array {
+  let payloadLen = 0
+  for (const p of payloads) payloadLen += p.byteLength
+  const out = new Uint8Array(5 + payloadLen)
+  out[0] = tag & 0xff
+  out[1] = 0x80 | ((payloadLen >> 21) & 0x7f)
+  out[2] = 0x80 | ((payloadLen >> 14) & 0x7f)
+  out[3] = 0x80 | ((payloadLen >> 7) & 0x7f)
+  out[4] = payloadLen & 0x7f
+  let o = 5
+  for (const p of payloads) {
+    out.set(p, o)
+    o += p.byteLength
+  }
+  return out
+}
+
 function buildEsdsBox(audioConfig?: Uint8Array): Uint8Array {
-  const cfg = audioConfig && audioConfig.byteLength > 0 ? audioConfig : new Uint8Array([0x12, 0x10]) // AAC-LC 44.1kHz Stereo fallback
-  const decSpecificLen = 2 + cfg.byteLength
-  const decConfigLen = 2 + 13 + decSpecificLen
-  const esDescLen = 2 + 3 + decConfigLen + 3
+  if (audioConfig && audioConfig.byteLength > 4096) {
+    throw new StreamMkvFallbackError(
+      'unsupported_codec',
+      `AAC CodecPrivate 体积过大 (${audioConfig.byteLength} 字节)，已安全回退服务端 HLS`,
+    )
+  }
+  const cfg =
+    audioConfig && audioConfig.byteLength > 0 ? audioConfig : new Uint8Array([0x12, 0x10]) // AAC-LC 44.1kHz Stereo fallback
+  // DecoderSpecificInfo (tag 0x05)
+  const decSpecificDesc = makeEsdsDescriptor(0x05, cfg)
+  // DecoderConfigDescriptor (tag 0x04)
+  const decConfigHeader = new Uint8Array([
+    0x40, // MPEG-4 Audio
+    0x15, // audio stream
+    0x00,
+    0x00,
+    0x00, // bufferSizeDB
+    0x00,
+    0x02,
+    0xee,
+    0x00, // maxBitrate 192kbps
+    0x00,
+    0x02,
+    0xee,
+    0x00, // avgBitrate
+  ])
+  const decConfigDesc = makeEsdsDescriptor(0x04, decConfigHeader, decSpecificDesc)
+  // SLConfigDescriptor (tag 0x06)
+  const slConfigDesc = makeEsdsDescriptor(0x06, new Uint8Array([0x02]))
+  // ES_Descriptor (tag 0x03)
+  const esHeader = new Uint8Array([
+    0x00,
+    0x01, // ES_ID
+    0x00, // flags
+  ])
+  const esDesc = makeEsdsDescriptor(0x03, esHeader, decConfigDesc, slConfigDesc)
 
-  const out = new Uint8Array(esDescLen)
-  let o = 0
-  // ES_Descriptor
-  out[o++] = 0x03
-  out[o++] = esDescLen - 2
-  out[o++] = 0x00
-  out[o++] = 0x01 // ES_ID
-  out[o++] = 0x00 // flags
-  // DecoderConfigDescriptor
-  out[o++] = 0x04
-  out[o++] = decConfigLen - 2
-  out[o++] = 0x40 // MPEG-4 Audio
-  out[o++] = 0x15 // audio stream
-  out[o++] = 0x00
-  out[o++] = 0x00
-  out[o++] = 0x00 // bufferSizeDB
-  out[o++] = 0x00
-  out[o++] = 0x02
-  out[o++] = 0xee
-  out[o++] = 0x00 // maxBitrate 192kbps
-  out[o++] = 0x00
-  out[o++] = 0x02
-  out[o++] = 0xee
-  out[o++] = 0x00 // avgBitrate
-  // DecoderSpecificInfo
-  out[o++] = 0x05
-  out[o++] = cfg.byteLength
-  out.set(cfg, o)
-  o += cfg.byteLength
-  // SLConfigDescriptor
-  out[o++] = 0x06
-  out[o++] = 0x01
-  out[o++] = 0x02
-
-  return makeFullBox('esds', 0, 0, out)
+  return makeFullBox('esds', 0, 0, esDesc)
 }
 
 export function buildAudioSampleEntry(track: MkvTrackInfo): Uint8Array {
@@ -1948,13 +1975,29 @@ export class StreamMkvRemuxer {
     })
   }
 
-  private removeFromBuffer(sb: SourceBuffer, start: number, end: number): Promise<void> {
-    if (this.disposed || typeof sb.remove !== 'function' || end <= start) {
+  private removeFromBuffer(
+    sb: SourceBuffer,
+    start: number,
+    end: number,
+    generation: number,
+    resolveEnd?: () => number,
+  ): Promise<void> {
+    if (
+      this.disposed ||
+      generation !== this.pumpGeneration ||
+      typeof sb.remove !== 'function' ||
+      end <= start
+    ) {
       return Promise.resolve()
     }
     return new Promise<void>((resolve) => {
       const doRemove = () => {
-        if (this.disposed) {
+        if (this.disposed || generation !== this.pumpGeneration) {
+          resolve()
+          return
+        }
+        const effectiveEnd = resolveEnd ? Math.min(end, resolveEnd()) : end
+        if (!Number.isFinite(effectiveEnd) || effectiveEnd <= start) {
           resolve()
           return
         }
@@ -1966,7 +2009,7 @@ export class StreamMkvRemuxer {
         sb.addEventListener('updateend', onDone, { once: true })
         sb.addEventListener('error', onDone, { once: true })
         try {
-          sb.remove(start, end)
+          sb.remove(start, effectiveEnd)
         } catch {
           sb.removeEventListener('updateend', onDone)
           sb.removeEventListener('error', onDone)
@@ -1982,20 +2025,26 @@ export class StreamMkvRemuxer {
   }
 
   /** 定期驱逐 currentTime - 30 之前的旧 MSE 缓冲，防止长片触发 QuotaExceededError */
-  private async evictOldBuffers(): Promise<void> {
-    if (this.disposed || !this.videoEl) return
-    const evictEnd = this.videoEl.currentTime - 30
-    if (!Number.isFinite(evictEnd) || evictEnd <= 0) return
+  private async evictOldBuffers(generation: number): Promise<void> {
+    if (this.disposed || generation !== this.pumpGeneration || !this.videoEl) return
 
     const buffers = [this.videoSb, this.audioSb].filter((sb): sb is SourceBuffer => Boolean(sb))
     for (const sb of buffers) {
-      if (this.disposed) return
+      if (this.disposed || generation !== this.pumpGeneration || !this.videoEl) return
       try {
+        const evictEnd = this.videoEl.currentTime - 30
+        if (!Number.isFinite(evictEnd) || evictEnd <= 0) return
         const buffered = sb.buffered
         if (!buffered || buffered.length === 0) continue
         const rangeStart = buffered.start(0)
         if (rangeStart < evictEnd - 1) {
-          await this.removeFromBuffer(sb, rangeStart, evictEnd)
+          await this.removeFromBuffer(
+            sb,
+            rangeStart,
+            evictEnd,
+            generation,
+            () => (this.videoEl ? this.videoEl.currentTime - 30 : 0),
+          )
         }
       } catch {
         // 忽略测试 stub 或浏览器缓冲驱逐竞态
@@ -2222,7 +2271,7 @@ export class StreamMkvRemuxer {
         if (generation !== this.pumpGeneration || this.disposed) break
 
         if (parsed.frames.length > 0) {
-          await this.evictOldBuffers()
+          await this.evictOldBuffers(generation)
           if (generation !== this.pumpGeneration || this.disposed) break
 
           let vFrames = this.videoTrack
@@ -2459,6 +2508,7 @@ export class StreamMkvRemuxer {
 
   private async evictForQuotaRecovery(targetSb: SourceBuffer): Promise<void> {
     if (this.disposed) return
+    const gen = this.pumpGeneration
     this.maxBufferAheadSec = Math.max(5, Math.floor(this.maxBufferAheadSec / 2))
     const curTime = this.videoEl?.currentTime ?? 0
     const evictEnd = curTime - 5
@@ -2468,13 +2518,13 @@ export class StreamMkvRemuxer {
       new Set([targetSb, this.videoSb, this.audioSb].filter((b): b is SourceBuffer => Boolean(b))),
     )
     for (const sb of buffers) {
-      if (this.disposed) return
+      if (this.disposed || gen !== this.pumpGeneration) return
       try {
         const buffered = sb.buffered
         if (!buffered || buffered.length === 0) continue
         const rangeStart = buffered.start(0)
         if (Number.isFinite(evictEnd) && evictEnd > rangeStart) {
-          await this.removeFromBuffer(sb, rangeStart, evictEnd)
+          await this.removeFromBuffer(sb, rangeStart, evictEnd, gen)
         }
         // 同时驱逐远端前向缓冲区间（例如用户在后续时间轴塞满 MSE 配额后 Seek 回到前 0~5s 时）
         const latestBuffered = sb.buffered
@@ -2485,7 +2535,7 @@ export class StreamMkvRemuxer {
             if (rEnd > curTime + 15) {
               const removeStart = Math.max(rStart, Math.min(forwardEvictStart, curTime + 15))
               if (rEnd > removeStart) {
-                await this.removeFromBuffer(sb, removeStart, rEnd)
+                await this.removeFromBuffer(sb, removeStart, rEnd, gen)
               }
             }
           }

@@ -36,7 +36,7 @@ const (
 	maxWebhooks                = 50
 	maxBackupZipEntries        = 10000
 	maxBackupRestoreTotalBytes = 2 << 30 // 2 GiB
-	maxBackupConfigFileBytes   = 16 << 20
+	maxBackupConfigFileBytes   = 4 << 20
 	maxBackupSingleMetaBytes   = 64 << 20
 )
 
@@ -1152,21 +1152,29 @@ func (h *Handler) restoreZipBackupLocked(ctx context.Context, srcZip string) (st
 	}
 
 	stagedDBDst := filepath.Join(dataDir, "ambra.db.restore")
+	stagedCfgDst := filepath.Join(dataDir, "config", "ambra.json.restore")
+	stagedMetaDst := filepath.Join(dataDir, "metadata.restore")
+	cleanupStaged := func() {
+		_ = os.Remove(stagedDBDst)
+		_ = os.Remove(stagedCfgDst)
+		_ = os.RemoveAll(stagedMetaDst)
+	}
 	if err := copyFileAtomic(stageDB, stagedDBDst, 0o600); err != nil {
+		cleanupStaged()
 		return "", err
 	}
-	stagedCfgDst := filepath.Join(dataDir, "config", "ambra.json.restore")
 	if hasConfig {
 		if err := copyFileAtomic(stageCfg, stagedCfgDst, 0o600); err != nil {
+			cleanupStaged()
 			return "", err
 		}
 	} else {
 		_ = os.Remove(stagedCfgDst)
 	}
-	stagedMetaDst := filepath.Join(dataDir, "metadata.restore")
 	_ = os.RemoveAll(stagedMetaDst)
 	if hasMetadata {
 		if err := os.Rename(stageMeta, stagedMetaDst); err != nil {
+			cleanupStaged()
 			return "", err
 		}
 	}

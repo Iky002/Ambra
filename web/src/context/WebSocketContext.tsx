@@ -12,6 +12,7 @@ export interface PlaystateCommand {
   ControllingUserId?: string
   PlaySessionId?: string
   ItemId?: string
+  PartyId?: string
 }
 
 export interface DisplayMessagePayload {
@@ -68,6 +69,11 @@ const LIBRARY_CHANGED_KEYS = [
   'libraryItems',
   'userViews',
   'collections',
+  'heroItems',
+  'item',
+  'seasons',
+  'episodes',
+  'trendingItems',
 ] as const
 
 export function WebSocketProvider({ children }: { children: React.ReactNode }) {
@@ -132,7 +138,9 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
 
       const rawTimeout = Number(payload.TimeoutMs)
       const timeoutMs =
-        Number.isFinite(rawTimeout) && rawTimeout > 0 ? rawTimeout : DEFAULT_TOAST_TIMEOUT_MS
+        Number.isFinite(rawTimeout) && rawTimeout > 0
+          ? Math.min(60_000, Math.max(1_000, rawTimeout))
+          : DEFAULT_TOAST_TIMEOUT_MS
       const id = `ws-toast-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
       setToasts((prev) => {

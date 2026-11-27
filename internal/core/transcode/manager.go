@@ -972,16 +972,19 @@ func (m *Manager) getOrCreateSession(params SessionParams) (*transcodeSession, e
 			ffmpegPath = m.cfg.FFmpegPath
 		}
 
+		sessionCtx, sessionCancel := context.WithCancel(context.Background())
 		sess := &transcodeSession{
 			mgr:              m,
 			key:              key,
 			ffmpegPath:       ffmpegPath,
 			params:           params,
 			workDir:          workDir,
+			sessionCtx:       sessionCtx,
+			sessionCancel:    sessionCancel,
 			startSeg:         -1,
 			lastRequestedSeg: 0,
-			lastAccess:       time.Now(),
 		}
+		sess.lastAccess.Store(time.Now().UnixNano())
 		m.sessions[key] = sess
 		m.mu.Unlock()
 
@@ -1269,6 +1272,8 @@ type transcodeSession struct {
 	params             SessionParams
 	workDir            string
 	segmentWaitTimeout time.Duration
+	sessionCtx         context.Context
+	sessionCancel      context.CancelFunc
 
 	mu               sync.Mutex
 	cmd              *exec.Cmd
@@ -1286,7 +1291,7 @@ type transcodeSession struct {
 	destroyed        bool
 	usingHW          bool
 	forceSoftware    bool
-	lastAccess       time.Time
+	lastAccess       atomic.Int64
 }
 
 func (s *transcodeSession) isDestroyed() bool {
@@ -1378,15 +1383,15 @@ func (s *transcodeSession) tryPromoteStagedInit() {
 }
 
 func (s *transcodeSession) touch() {
-	s.mu.Lock()
-	s.lastAccess = time.Now()
-	s.mu.Unlock()
+	s.lastAccess.Store(time.Now().UnixNano())
 }
 
 func (s *transcodeSession) lastAccessTime() time.Time {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.lastAccess
+	ns := s.lastAccess.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
 }
 
 func (s *transcodeSession) snapshot() SessionSnapshot {
@@ -1399,7 +1404,7 @@ func (s *transcodeSession) snapshot() SessionSnapshot {
 		ItemID:        s.params.ItemID,
 		StartSegment:  s.startSeg,
 		Running:       s.running,
-		LastAccess:    s.lastAccess,
+		LastAccess:    s.lastAccessTime(),
 		WorkDir:       s.workDir,
 	}
 }
@@ -1430,9 +1435,9 @@ func (s *transcodeSession) onSegmentRequested(segIndex int) {
 	} else {
 		encOpts = DefaultEncodingOptions()
 	}
+	s.touch()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.lastAccess = time.Now()
 	s.lastRequestedSeg = segIndex
 	if s.throttled && s.running && s.cmd != nil {
 		segDur := s.params.SegmentDuration
@@ -1566,7 +1571,10 @@ func (s *transcodeSession) getSegment(ctx context.Context, segIndex int, getCaps
 			s.mu.Lock()
 			continue
 		}
-		if err := s.startProcessLocked(segIndex, caps); err != nil {
+		if err := s.startProcessUnlockRelock(ctx, segIndex, caps); err != nil {
+			if errors.Is(err, errStartSuperseded) {
+				continue
+			}
 			s.mu.Unlock()
 			return "", err
 		}
@@ -1624,7 +1632,10 @@ func (s *transcodeSession) getInitSegment(ctx context.Context, getCaps func() *H
 				s.mu.Lock()
 				continue
 			}
-			if err := s.startProcessLocked(0, caps); err != nil {
+			if err := s.startProcessUnlockRelock(ctx, 0, caps); err != nil {
+				if errors.Is(err, errStartSuperseded) {
+					continue
+				}
 				s.mu.Unlock()
 				return "", err
 			}
@@ -1720,7 +1731,16 @@ func (s *transcodeSession) waitForFile(ctx context.Context, targetPath string, r
 					s.mu.Unlock()
 					continue
 				}
-				if err := s.startProcessLocked(restartSeg, SoftwareOnlyCapabilities()); err != nil {
+				if err := s.startProcessUnlockRelock(ctx, restartSeg, SoftwareOnlyCapabilities()); err != nil {
+					if errors.Is(err, errStartSuperseded) {
+						if s.destroyed || s.doneCh == nil {
+							s.mu.Unlock()
+							return "", ErrSessionClosed
+						}
+						doneCh = s.doneCh
+						s.mu.Unlock()
+						continue
+					}
 					s.mu.Unlock()
 					return "", err
 				}
@@ -1807,7 +1827,16 @@ func copyFileAtomic(src, dst string) error {
 	return out.Close()
 }
 
+var errStartSuperseded = errors.New("transcode start superseded")
+
 func downloadRemoteSubtitleAtomic(rawURL, dst string, client *http.Client) error {
+	return downloadRemoteSubtitleAtomicCtx(context.Background(), rawURL, dst, client)
+}
+
+func downloadRemoteSubtitleAtomicCtx(parentCtx context.Context, rawURL, dst string, client *http.Client) error {
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
 	if client == nil {
 		if err := netutil.ValidateRemoteURL(rawURL, true); err != nil {
 			return err
@@ -1815,7 +1844,7 @@ func downloadRemoteSubtitleAtomic(rawURL, dst string, client *http.Client) error
 		client = netutil.NewSafeHTTPClient(remoteSubtitleDownloadTimeout, true)
 		defer client.CloseIdleConnections()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), remoteSubtitleDownloadTimeout)
+	ctx, cancel := context.WithTimeout(parentCtx, remoteSubtitleDownloadTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
@@ -1866,6 +1895,13 @@ func downloadRemoteSubtitleAtomic(rawURL, dst string, client *http.Client) error
 }
 
 func extractRemoteEmbeddedSubtitle(ffmpegPath, mediaURL string, headers map[string]string, streamIndex int, subCodec, dst string) error {
+	return extractRemoteEmbeddedSubtitleCtx(context.Background(), ffmpegPath, mediaURL, headers, streamIndex, subCodec, dst)
+}
+
+func extractRemoteEmbeddedSubtitleCtx(parentCtx context.Context, ffmpegPath, mediaURL string, headers map[string]string, streamIndex int, subCodec, dst string) error {
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
 	if strings.TrimSpace(ffmpegPath) == "" {
 		ffmpegPath = "ffmpeg"
 	}
@@ -1887,7 +1923,7 @@ func extractRemoteEmbeddedSubtitle(ffmpegPath, mediaURL string, headers map[stri
 	}
 	defer closeProxy()
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultExtractTimeout)
+	ctx, cancel := context.WithTimeout(parentCtx, defaultExtractTimeout)
 	defer cancel()
 	args := netutil.FilterFFmpegArgs(ffmpegPath, BuildSubtitleExtractArgs(ffInput, streamIndex, ext, tmpPath))
 	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
@@ -1908,6 +1944,10 @@ func stageBurnInFiles(params SessionParams, workDir string) SessionParams {
 }
 
 func stageBurnInFilesWithDeps(params SessionParams, workDir, ffmpegPath string, httpClient *http.Client) SessionParams {
+	return stageBurnInFilesWithContext(context.Background(), params, workDir, ffmpegPath, httpClient)
+}
+
+func stageBurnInFilesWithContext(ctx context.Context, params SessionParams, workDir, ffmpegPath string, httpClient *http.Client) SessionParams {
 	if !strings.EqualFold(strings.TrimSpace(params.SubtitleMethod), "Encode") {
 		return params
 	}
@@ -1926,7 +1966,7 @@ func stageBurnInFilesWithDeps(params SessionParams, workDir, ffmpegPath string, 
 				params.SubtitlePath = dst
 				return params
 			}
-			if err := downloadRemoteSubtitleAtomic(subPath, dst, httpClient); err == nil {
+			if err := downloadRemoteSubtitleAtomicCtx(ctx, subPath, dst, httpClient); err == nil {
 				params.SubtitlePath = dst
 				return params
 			}
@@ -1956,7 +1996,7 @@ func stageBurnInFilesWithDeps(params SessionParams, workDir, ffmpegPath string, 
 				params.SubtitlePath = dst
 				return params
 			}
-			if err := extractRemoteEmbeddedSubtitle(ffmpegPath, inputPath, params.InputHeaders, *params.SubtitleStreamIndex, params.SubtitleCodec, dst); err == nil {
+			if err := extractRemoteEmbeddedSubtitleCtx(ctx, ffmpegPath, inputPath, params.InputHeaders, *params.SubtitleStreamIndex, params.SubtitleCodec, dst); err == nil {
 				params.SubtitlePath = dst
 				return params
 			}
@@ -1983,12 +2023,120 @@ func stageBurnInFilesWithDeps(params SessionParams, workDir, ffmpegPath string, 
 	return params
 }
 
+// startProcessUnlockRelock stages burn-in subtitles and starts any required LoopbackStreamProxy
+// OUTSIDE s.mu so blocking network/disk I/O never stalls unrelated session operations, then
+// re-acquires s.mu and verifies the session was neither destroyed nor superseded.
+// Caller MUST hold s.mu on entry; s.mu is always held on return.
+func (s *transcodeSession) startProcessUnlockRelock(ctx context.Context, startSeg int, caps *HWCapabilities) error {
+	if s.destroyed {
+		return ErrSessionClosed
+	}
+	expectedGen := s.procGen
+	params := s.params
+	workDir := s.workDir
+	ffmpegPath := s.ffmpegPath
+	sessCtx := s.sessionCtx
+	s.mu.Unlock()
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stageCtx, stageCancel := context.WithCancel(ctx)
+	var stopSessWatch func() bool
+	if sessCtx != nil {
+		stopSessWatch = context.AfterFunc(sessCtx, stageCancel)
+	}
+	defer func() {
+		if stopSessWatch != nil {
+			stopSessWatch()
+		}
+		stageCancel()
+	}()
+
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		s.mu.Lock()
+		if s.destroyed {
+			return ErrSessionClosed
+		}
+		return err
+	}
+
+	effectiveParams := stageBurnInFilesWithContext(stageCtx, params, workDir, ffmpegPath, nil)
+	if err := stageCtx.Err(); err != nil {
+		s.mu.Lock()
+		if s.destroyed {
+			return ErrSessionClosed
+		}
+		return err
+	}
+
+	// Route ALL remote HTTP(S) inputs (including .m3u8 HLS manifests) through LoopbackStreamProxy (H-06).
+	var streamProxy *LoopbackStreamProxy
+	rawIn := strings.TrimSpace(effectiveParams.InputPath)
+	if isHTTPInput(rawIn) {
+		proxy, proxyErr := StartLoopbackStreamProxy(LoopbackProxyOptions{
+			TargetURL:       rawIn,
+			Headers:         effectiveParams.InputHeaders,
+			AllowPrivateLAN: true,
+		})
+		if proxyErr != nil {
+			s.mu.Lock()
+			if s.destroyed {
+				return ErrSessionClosed
+			}
+			return fmt.Errorf("start loopback stream proxy: %w", proxyErr)
+		}
+		streamProxy = proxy
+		effectiveParams.InputPath = proxy.URL()
+	}
+
+	s.mu.Lock()
+	if s.destroyed {
+		if streamProxy != nil {
+			_ = streamProxy.Close()
+		}
+		return ErrSessionClosed
+	}
+	if s.procGen != expectedGen || s.running || s.cmd != nil || s.doneCh != nil {
+		if streamProxy != nil {
+			_ = streamProxy.Close()
+		}
+		return errStartSuperseded
+	}
+	return s.startProcessWithStagedLocked(startSeg, caps, effectiveParams, streamProxy)
+}
+
 func (s *transcodeSession) startProcessLocked(startSeg int, caps *HWCapabilities) error {
 	if s.destroyed {
 		return ErrSessionClosed
 	}
 	if err := os.MkdirAll(s.workDir, 0o755); err != nil {
 		return err
+	}
+	effectiveParams := stageBurnInFilesWithDeps(s.params, s.workDir, s.ffmpegPath, nil)
+	var streamProxy *LoopbackStreamProxy
+	rawIn := strings.TrimSpace(effectiveParams.InputPath)
+	if isHTTPInput(rawIn) {
+		proxy, proxyErr := StartLoopbackStreamProxy(LoopbackProxyOptions{
+			TargetURL:       rawIn,
+			Headers:         effectiveParams.InputHeaders,
+			AllowPrivateLAN: true,
+		})
+		if proxyErr != nil {
+			return fmt.Errorf("start loopback stream proxy: %w", proxyErr)
+		}
+		streamProxy = proxy
+		effectiveParams.InputPath = proxy.URL()
+	}
+	return s.startProcessWithStagedLocked(startSeg, caps, effectiveParams, streamProxy)
+}
+
+func (s *transcodeSession) startProcessWithStagedLocked(startSeg int, caps *HWCapabilities, effectiveParams SessionParams, streamProxy *LoopbackStreamProxy) error {
+	if s.destroyed {
+		if streamProxy != nil {
+			_ = streamProxy.Close()
+		}
+		return ErrSessionClosed
 	}
 	s.procGen++
 	ext := s.params.SegmentContainer
@@ -2023,29 +2171,11 @@ func (s *transcodeSession) startProcessLocked(startSeg int, caps *HWCapabilities
 		(!strings.EqualFold(s.params.VideoCodec, "copy") || strings.EqualFold(strings.TrimSpace(s.params.SubtitleMethod), "Encode")) &&
 		isHardwareEncoder(effectiveCaps.SelectVideoEncoder(vCodec))
 
-	effectiveParams := stageBurnInFilesWithDeps(s.params, s.workDir, s.ffmpegPath, nil)
-
 	// Avoid in-place O_TRUNC overwriting an active init.mp4 being read concurrently by clients (H-10).
 	s.activeInitGen = ""
 	if ext == "mp4" || ext == "m4s" {
 		s.activeInitGen = fmt.Sprintf("init_gen_%d.mp4", s.procGen)
 		effectiveParams.FMP4InitFilename = s.activeInitGen
-	}
-
-	// Route ALL remote HTTP(S) inputs (including .m3u8 HLS manifests) through LoopbackStreamProxy (H-06).
-	var streamProxy *LoopbackStreamProxy
-	rawIn := strings.TrimSpace(effectiveParams.InputPath)
-	if isHTTPInput(rawIn) {
-		proxy, proxyErr := StartLoopbackStreamProxy(LoopbackProxyOptions{
-			TargetURL:       rawIn,
-			Headers:         effectiveParams.InputHeaders,
-			AllowPrivateLAN: true,
-		})
-		if proxyErr != nil {
-			return fmt.Errorf("start loopback stream proxy: %w", proxyErr)
-		}
-		streamProxy = proxy
-		effectiveParams.InputPath = proxy.URL()
 	}
 
 	args := netutil.FilterFFmpegArgs(s.ffmpegPath, BuildFFmpegArgs(effectiveParams, startSeg, s.workDir, effectiveCaps))
@@ -2074,7 +2204,7 @@ func (s *transcodeSession) startProcessLocked(startSeg int, caps *HWCapabilities
 	s.running = true
 	s.usingHW = usingHW
 	s.lastErr = nil
-	s.lastAccess = time.Now()
+	s.touch()
 
 	go s.throttleMonitorLoop(doneCh)
 
@@ -2131,6 +2261,10 @@ func (s *transcodeSession) stopProcessLocked() {
 func (s *transcodeSession) destroy() {
 	s.mu.Lock()
 	s.destroyed = true
+	sessCancel := s.sessionCancel
+	if sessCancel != nil {
+		sessCancel()
+	}
 	s.stopProcessLocked()
 	workDir := s.workDir
 	s.mu.Unlock()

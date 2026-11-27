@@ -809,4 +809,104 @@ describe('Stream C: PlayerPage 综合修复 (P0-1/P0-2/P0-3/P1-10/P1-11/P0-5)', 
       expect(screen.queryByText('无法播放该媒体')).not.toBeInTheDocument()
     })
   })
+
+  it('[Round2] 外挂音轨路由至服务端 HLS (含 AudioStreamIndex)，且卸载 video.load() 清零 currentTime 后仍保留真实续播进度', async () => {
+    vi.spyOn(Hls, 'isSupported').mockReturnValue(true)
+    const loadedHlsUrls: string[] = []
+    vi.spyOn(Hls.prototype, 'loadSource').mockImplementation((url: string) => {
+      loadedHlsUrls.push(url)
+    })
+    vi.spyOn(Hls.prototype, 'attachMedia').mockImplementation(() => undefined)
+    vi.spyOn(Hls.prototype, 'on').mockImplementation(() => Hls.prototype)
+    vi.spyOn(Hls.prototype, 'destroy').mockImplementation(() => undefined)
+
+    const stoppedPayloads: Array<Record<string, unknown>> = []
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input)
+      if (url === '/emby/Users/u-1') {
+        return jsonRes({
+          Id: 'u-1',
+          Name: 'Tester',
+          ServerId: 'srv-1',
+          Policy: { IsAdministrator: true },
+        })
+      }
+      if (url === '/emby/Users/u-1/Items/ext-audio-1') {
+        return jsonRes({
+          Id: 'ext-audio-1',
+          Name: '外挂音轨测试',
+          Type: 'Movie',
+          RunTimeTicks: 3_600 * 10_000_000,
+        })
+      }
+      if (url.startsWith('/emby/Items/ext-audio-1/PlaybackInfo')) {
+        return jsonRes({
+          PlaySessionId: 'sess-ext-1',
+          MediaSources: [
+            {
+              Id: 'src-ext-1',
+              Container: 'mp4',
+              SupportsDirectPlay: true,
+              DirectStreamUrl: '/emby/Videos/ext-audio-1/stream?Static=true&MediaSourceId=src-ext-1',
+              DefaultAudioStreamIndex: 2,
+              MediaStreams: [
+                { Index: 0, Type: 'Video', Codec: 'h264', Width: 1920, Height: 1080 },
+                { Index: 1, Type: 'Audio', Codec: 'aac', Channels: 2, Language: 'eng', IsExternal: false },
+                { Index: 2, Type: 'Audio', Codec: 'aac', Channels: 2, Language: 'chi', IsExternal: true },
+              ],
+            },
+          ],
+        })
+      }
+      if (url === '/emby/Sessions/Playing/Stopped') {
+        if (init?.body) {
+          stoppedPayloads.push(JSON.parse(String(init.body)))
+        }
+        return { ok: true, status: 204, headers: new Headers(), json: async () => undefined, text: async () => '' } as Response
+      }
+      if (url.startsWith('/emby/Sessions/Playing')) {
+        return { ok: true, status: 204, headers: new Headers(), json: async () => undefined, text: async () => '' } as Response
+      }
+      return jsonRes({})
+    })
+
+    // 模拟真实浏览器 video.load() 会将 currentTime 重置为 0
+    vi.spyOn(HTMLMediaElement.prototype, 'load').mockImplementation(function (this: HTMLMediaElement) {
+      this.currentTime = 0
+    })
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { container, unmount } = render(
+      <QueryClientProvider client={qc}>
+        <AuthProvider>
+          <AudioPlayerProvider>
+            <MemoryRouter initialEntries={['/play/ext-audio-1?audio=2']}>
+              <Routes>
+                <Route path="/play/:id" element={<PlayerPage />} />
+              </Routes>
+            </MemoryRouter>
+          </AudioPlayerProvider>
+        </AuthProvider>
+      </QueryClientProvider>,
+    )
+
+    await waitFor(() => {
+      expect(loadedHlsUrls.some((u) => u.includes('/master.m3u8') && u.includes('AudioStreamIndex=2'))).toBe(true)
+    })
+
+    const video = container.querySelector('video') as HTMLVideoElement
+    video.currentTime = 245
+    fireEvent.timeUpdate(video)
+
+    // 卸载时 stream cleanup 先执行 video.load() 将 currentTime 归零，随后 session cleanup 触发 stop
+    unmount()
+
+    await waitFor(() => {
+      expect(stoppedPayloads.length).toBeGreaterThanOrEqual(1)
+    })
+    expect(stoppedPayloads[0]).toMatchObject({
+      ItemId: 'ext-audio-1',
+      PositionTicks: 245 * 10_000_000,
+    })
+  })
 })

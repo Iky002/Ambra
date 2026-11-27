@@ -156,12 +156,15 @@ func TestCovV0112_LANHDHomeRunAndRepeatHelpers(t *testing.T) {
 		t.Fatal("expected nil mappings when store is nil")
 	}
 	ctx := context.Background()
+	h.mu.Lock()
+	h.state.ListingProviders = []ListingProviderInfo{{Id: "prov1", Type: "xmltv"}}
+	h.mu.Unlock()
 	_, _ = store.Writer.ExecContext(ctx,
 		`INSERT OR REPLACE INTO server_config(key, value_json, updated_at) VALUES('compatext:state', ?, 1)`,
-		`{"channel_mappings":{"prov1":[{"Name":"ch-1","Value":"XML.1"},{"Name":"CH-1","Value":"xml.1"},{"Name":"","Value":"x"}]}}`,
+		`{"channel_mappings":{"prov1":[{"Name":"ch-1","Value":"XML.1"},{"Name":"CH-1","Value":"xml.1"},{"Name":"","Value":"x"}],"prov-orphan":[{"Name":"ch-2","Value":"xml.2"}]}}`,
 	)
 	mappings := h.loadManualChannelMappings(nil)
-	if len(mappings["xml.1"]) != 1 || mappings["xml.1"][0] != "ch-1" {
+	if len(mappings["xml.1"]) != 1 || mappings["xml.1"][0] != "ch-1" || len(mappings["xml.2"]) != 0 {
 		t.Fatalf("unexpected manual channel mappings: %+v", mappings)
 	}
 }

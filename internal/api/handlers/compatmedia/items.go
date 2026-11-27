@@ -1125,10 +1125,23 @@ func (h *Handler) handleItemAncestors(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			rows.Close()
+			allowedLibs := h.allowedLibrariesForRequest(r, userID)
+			userPol := h.userExtendedPolicyForRequest(r, userID)
 			for _, aid := range ids {
-				if it, err := h.repo.GetItemByID(r.Context(), h.serverID(), userID, aid); err == nil && it != nil {
-					ancestors = append(ancestors, *it)
+				if rec, err := h.repo.GetItemRecordByID(r.Context(), aid); err == nil && rec != nil {
+					if !h.canAccessItem(r, rec) {
+						continue
+					}
+					if it, err := h.repo.GetItemByID(r.Context(), h.serverID(), userID, aid); err == nil && it != nil {
+						ancestors = append(ancestors, *it)
+					}
 				} else if lib, err := h.repo.GetLibrary(r.Context(), aid); err == nil && lib != nil {
+					if !isLibraryAllowed(lib.ID, allowedLibs) {
+						continue
+					}
+					if !userPol.IsAdministrator && !h.repo.CanUserAccessLibrary(r.Context(), userPol, lib.ID) {
+						continue
+					}
 					ancestors = append(ancestors, dto.BaseItemDto{
 						Id:                lib.ID,
 						Name:              lib.Name,

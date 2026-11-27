@@ -435,7 +435,7 @@ func TestV0110_SOAPContainersTranscodeStreamAndGENANotify(t *testing.T) {
 	expStr := strconv.FormatInt(exp, 10)
 
 	// AVI with ?profile=mp4-only-tv triggers automatic transcoding to video/mp2t
-	sigAVI := h.signStreamToken(clipAVI.ID, exp)
+	sigAVI := h.signStreamTokenForMode(clipAVI.ID, exp, true)
 	rStreamV := httptest.NewRequest(http.MethodGet, "/Dlna/srv-1/stream/"+clipAVI.ID+"?exp="+expStr+"&sig="+sigAVI+"&profile=mp4-only-tv", nil)
 	rStreamV.RemoteAddr = "192.168.1.20:50000"
 	wStreamV := httptest.NewRecorder()
@@ -445,7 +445,7 @@ func TestV0110_SOAPContainersTranscodeStreamAndGENANotify(t *testing.T) {
 	}
 
 	// WMA audio with transcode=1 (HEAD and GET)
-	sigWMA := h.signStreamToken(trackWMA.ID, exp)
+	sigWMA := h.signStreamTokenForMode(trackWMA.ID, exp, true)
 	rHeadA := httptest.NewRequest(http.MethodHead, "/Dlna/srv-1/stream/"+trackWMA.ID+"?exp="+expStr+"&sig="+sigWMA+"&transcode=1", nil)
 	rHeadA.RemoteAddr = "192.168.1.20:50000"
 	wHeadA := httptest.NewRecorder()
@@ -644,7 +644,8 @@ func TestV0110_SOAPContainersTranscodeStreamAndGENANotify(t *testing.T) {
 	h.SetStreamResolverWithHeaders(func(ctx context.Context, rawPath string) (*plugins.StreamResolveResult, error) {
 		return &plugins.StreamResolveResult{URL: "http://192.168.1.250:65530/live.ts"}, nil
 	})
-	rStrmTC := httptest.NewRequest(http.MethodGet, "/Dlna/srv-1/stream/"+strmItem.ID+"?exp="+expStr+"&sig="+sigStrm+"&transcode=1", nil)
+	sigStrmTC := h.signStreamTokenForMode(strmItem.ID, exp, true)
+	rStrmTC := httptest.NewRequest(http.MethodGet, "/Dlna/srv-1/stream/"+strmItem.ID+"?exp="+expStr+"&sig="+sigStrmTC+"&transcode=1", nil)
 	rStrmTC.RemoteAddr = "192.168.1.20:50000"
 	wStrmTC := httptest.NewRecorder()
 	mux.ServeHTTP(wStrmTC, rStrmTC)
