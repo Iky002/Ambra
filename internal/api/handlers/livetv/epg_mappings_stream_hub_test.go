@@ -657,3 +657,122 @@ func TestLiveTVStreamHubHDHomeRunMappingsRefreshRecordNewOnlyAndMediaImport(t *t
 		t.Fatalf("expected completed DVR recording imported into LibraryRepo, got item=%+v err=%v", libItem, err)
 	}
 }
+
+func makeTSPacket(seq byte) []byte {
+	pkt := make([]byte, tsPacketSize)
+	pkt[0] = tsSyncByte
+	pkt[1] = seq
+	for i := 2; i < tsPacketSize; i++ {
+		pkt[i] = byte((int(seq) + i) % 251)
+		if pkt[i] == tsSyncByte {
+			pkt[i] = 0x48
+		}
+	}
+	return pkt
+}
+
+func joinChunks(chunks [][]byte) []byte {
+	var out []byte
+	for _, c := range chunks {
+		out = append(out, c...)
+	}
+	return out
+}
+
+func TestAlignRingReplayToTSSync(t *testing.T) {
+	t.Run("strips leading partial TS packet garbage across chunks to exact 188-byte boundary", func(t *testing.T) {
+		garbage := bytes.Repeat([]byte{0x11}, 73)
+		p1 := makeTSPacket(1)
+		p2 := makeTSPacket(2)
+		p3 := makeTSPacket(3)
+		full := append(append(append(append([]byte{}, garbage...), p1...), p2...), p3...)
+
+		// Split across multiple chunks so the first chunk is entirely garbage+partial and second chunk continues p1.
+		ring := [][]byte{
+			full[:50],
+			full[50:150],
+			full[150:400],
+			full[400:],
+		}
+		aligned := alignRingReplayToTSSync(ring)
+		if len(aligned) > len(ring) {
+			t.Fatalf("aligned chunk count %d exceeded input ring count %d", len(aligned), len(ring))
+		}
+		got := joinChunks(aligned)
+		want := append(append(append([]byte{}, p1...), p2...), p3...)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("aligned replay mismatch: got len=%d firstBytes=%x, want len=%d firstBytes=%x", len(got), got[:min(8, len(got))], len(want), want[:min(8, len(want))])
+		}
+	})
+
+	t.Run("skips false 0x47 inside leading garbage before real 3-packet sync sequence", func(t *testing.T) {
+		garbage := bytes.Repeat([]byte{0x22}, 60)
+		garbage[5] = tsSyncByte  // false 0x47
+		garbage[29] = tsSyncByte // another false 0x47
+		p1 := makeTSPacket(10)
+		p2 := makeTSPacket(20)
+		p3 := makeTSPacket(30)
+		full := append(append(append(append([]byte{}, garbage...), p1...), p2...), p3...)
+
+		ring := [][]byte{full[:120], full[120:]}
+		aligned := alignRingReplayToTSSync(ring)
+		got := joinChunks(aligned)
+		want := append(append(append([]byte{}, p1...), p2...), p3...)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("expected false 0x47 bytes skipped; got len=%d first=%x want len=%d first=%x", len(got), got[:min(8, len(got))], len(want), want[:min(8, len(want))])
+		}
+	})
+
+	t.Run("falls back to 2 consecutive sync bytes when buffer is shorter than 377 bytes", func(t *testing.T) {
+		garbage := bytes.Repeat([]byte{0x33}, 25)
+		garbage[3] = tsSyncByte // false 0x47
+		p1 := makeTSPacket(41)
+		p2Prefix := makeTSPacket(42)[:10] // total = 25 + 188 + 10 = 223 (< 377)
+		full := append(append(append([]byte{}, garbage...), p1...), p2Prefix...)
+
+		aligned := alignRingReplayToTSSync([][]byte{full})
+		got := joinChunks(aligned)
+		want := append(append([]byte{}, p1...), p2Prefix...)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("expected 2-sync fallback alignment; got len=%d want len=%d", len(got), len(want))
+		}
+	})
+
+	t.Run("non-TS stream data passes through unchanged", func(t *testing.T) {
+		chunk1 := bytes.Repeat([]byte("MPEGTS-NONSYNC-DATA-"), 15) // 300 bytes
+		chunk2 := bytes.Repeat([]byte("ANOTHER-CHUNK-PAYLOAD"), 15)
+		ring := [][]byte{chunk1, chunk2}
+
+		aligned := alignRingReplayToTSSync(ring)
+		if !bytes.Equal(joinChunks(aligned), joinChunks(ring)) {
+			t.Fatal("expected non-TS stream data to pass through unchanged")
+		}
+	})
+
+	t.Run("addSubscriber delivers TS-aligned replay to mid-stream joiner", func(t *testing.T) {
+		garbage := bytes.Repeat([]byte{0xAA}, 41)
+		garbage[7] = tsSyncByte
+		p1 := makeTSPacket(7)
+		p2 := makeTSPacket(8)
+		p3 := makeTSPacket(9)
+		full := append(append(append(append([]byte{}, garbage...), p1...), p2...), p3...)
+
+		b := &liveStreamBroadcaster{
+			subs: make(map[*liveStreamSubscriber]struct{}),
+			ring: [][]byte{full[:100], full[100:]},
+		}
+		sub, ok := b.addSubscriber()
+		if !ok || sub == nil {
+			t.Fatal("expected addSubscriber to succeed")
+		}
+		var replayed []byte
+		for len(sub.ch) > 0 {
+			replayed = append(replayed, <-sub.ch...)
+		}
+		want := append(append(append([]byte{}, p1...), p2...), p3...)
+		if !bytes.Equal(replayed, want) {
+			t.Fatalf("subscriber did not receive aligned TS replay: got len=%d first=%x want len=%d first=%x", len(replayed), replayed[:min(4, len(replayed))], len(want), want[:min(4, len(want))])
+		}
+	})
+}
+
