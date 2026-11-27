@@ -41,6 +41,7 @@ export function DevicesKeysTab() {
   const [appName, setAppName] = useState('')
   const [creatingKey, setCreatingKey] = useState(false)
   const [newlyCreatedKey, setNewlyCreatedKey] = useState<{
+    id?: string
     appName: string
     token: string
   } | null>(null)
@@ -48,6 +49,7 @@ export function DevicesKeysTab() {
   const [confirmApiKey, setConfirmApiKey] = useState<{
     revokeId: string
     appName: string
+    accessToken?: string
   } | null>(null)
   const [copiedKey, setCopiedKey] = useState<string | null>(null)
   const [revealedKeys, setRevealedKeys] = useState<Record<string, boolean>>({})
@@ -117,7 +119,11 @@ export function DevicesKeysTab() {
       await queryClient.invalidateQueries({ queryKey: ['admin', 'apiKeys'] })
       setAppName('')
       if (created?.AccessToken) {
-        setNewlyCreatedKey({ appName: created.AppName || trimmedApp, token: created.AccessToken })
+        setNewlyCreatedKey({
+          id: created.Id,
+          appName: created.AppName || trimmedApp,
+          token: created.AccessToken,
+        })
         const rowKey = created.Id || created.AccessToken
         setRevealedKeys((prev) => ({ ...prev, [rowKey]: true }))
       }
@@ -135,11 +141,31 @@ export function DevicesKeysTab() {
     }
   }
 
-  const handleDeleteApiKey = async (revokeId: string, name: string) => {
+  const handleDeleteApiKey = async (revokeId: string, name: string, accessToken?: string) => {
     setRevokingKey(revokeId)
     setFeedback(null)
     try {
       await api.deleteApiKey(revokeId)
+      setNewlyCreatedKey((prev) => {
+        if (!prev) return null
+        const matchedById = Boolean(prev.id && prev.id === revokeId)
+        const matchedByToken =
+          prev.token === revokeId || Boolean(accessToken && prev.token === accessToken)
+        const matchedByApp = !prev.id && Boolean(name && prev.appName === name)
+        if (matchedById || matchedByToken || matchedByApp) {
+          return null
+        }
+        return prev
+      })
+      setRevealedKeys((prev) => {
+        if (!(revokeId in prev)) return prev
+        const next = { ...prev }
+        delete next[revokeId]
+        return next
+      })
+      setCopiedKey((prev) =>
+        prev && (prev === revokeId || (accessToken && prev === accessToken)) ? null : prev,
+      )
       await queryClient.invalidateQueries({ queryKey: ['admin', 'apiKeys'] })
       setConfirmApiKey(null)
       setFeedback({
@@ -498,6 +524,7 @@ export function DevicesKeysTab() {
                           setConfirmApiKey({
                             revokeId,
                             appName: item.AppName || 'API Key',
+                            accessToken: item.AccessToken,
                           })
                         }
                         className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
@@ -579,7 +606,11 @@ export function DevicesKeysTab() {
             disabled={!confirmApiKey || revokingKey === confirmApiKey.revokeId}
             onClick={() => {
               if (confirmApiKey) {
-                void handleDeleteApiKey(confirmApiKey.revokeId, confirmApiKey.appName)
+                void handleDeleteApiKey(
+                  confirmApiKey.revokeId,
+                  confirmApiKey.appName,
+                  confirmApiKey.accessToken,
+                )
               }
             }}
             className="inline-flex items-center gap-2 rounded-xl bg-red-500 px-4 py-2 text-xs font-semibold text-white hover:bg-red-400 disabled:opacity-60"

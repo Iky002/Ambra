@@ -1,6 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { QueryClientContext } from '@tanstack/react-query'
-import { api, clearAuth, getAuthStorageKey, getDeviceId, getStoredAuth, saveAuth } from '../api/client'
+import { api, ApiError, clearAuth, getAuthStorageKey, getDeviceId, getStoredAuth, saveAuth } from '../api/client'
 import type { AuthSession, AuthenticationResult, UserDto } from '../api/types'
 import { isDemoMode } from '../demo/demoMode'
 import { syncPlaybackPrefsFromUserConfig } from '../player/playbackPrefs'
@@ -84,6 +84,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
     } catch (err) {
       if (seq !== refreshSeqRef.current || getStoredAuth()?.accessToken !== current.accessToken) {
+        return
+      }
+      if (err instanceof ApiError && err.status === 401) {
+        clearAuth()
+        queryClient?.clear()
+        setAuth(null)
+        setUser(null)
+        setUserError(null)
+        window.dispatchEvent(new CustomEvent('ambra:unauthorized'))
         return
       }
       // 401 失效时 embyFetch 会触发 ambra:unauthorized 事件清空 auth/user；

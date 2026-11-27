@@ -4,6 +4,7 @@ import { FolderPlus, Layers, ListVideo, Loader2, Plus } from 'lucide-react'
 import { api } from '../../api/client'
 import type { BaseItemDto } from '../../api/types'
 import { useAuth } from '../../context/AuthContext'
+import { useI18n } from '../../i18n/I18nContext'
 import { AdminModal, FeedbackBanner } from '../../pages/admin/adminUtils'
 
 type ContainerTab = 'BoxSet' | 'Playlist'
@@ -25,6 +26,7 @@ export function AddToCollectionModal({
   onClose,
   onSuccess,
 }: AddToCollectionModalProps) {
+  const { t } = useI18n()
   const { auth, isAdmin } = useAuth()
   const queryClient = useQueryClient()
   const userId = auth?.userId || ''
@@ -95,12 +97,15 @@ export function AddToCollectionModal({
     },
     onSuccess: async (target) => {
       await invalidateCollections()
-      const kind = effectiveTab === 'BoxSet' ? '合集' : '播放列表'
-      onSuccess?.(`已将 ${itemIds.length} 项加入${kind}「${target.Name}」`)
+      onSuccess?.(
+        effectiveTab === 'BoxSet'
+          ? t('modal.collection.addedToCollection', { count: itemIds.length, name: target.Name })
+          : t('modal.collection.addedToPlaylist', { count: itemIds.length, name: target.Name }),
+      )
       onClose()
     },
     onError: (err) => {
-      setError(err instanceof Error ? err.message : '加入失败，请稍后重试')
+      setError(err instanceof Error ? err.message : t('modal.collection.addError'))
     },
   })
 
@@ -113,12 +118,21 @@ export function AddToCollectionModal({
     },
     onSuccess: async (created) => {
       await invalidateCollections()
-      const kind = effectiveTab === 'BoxSet' ? '合集' : '播放列表'
-      onSuccess?.(`已新建${kind}「${created.Name}」并加入 ${itemIds.length} 项`)
+      onSuccess?.(
+        effectiveTab === 'BoxSet'
+          ? t('modal.collection.createdCollectionAndAdded', {
+              name: created.Name,
+              count: itemIds.length,
+            })
+          : t('modal.collection.createdPlaylistAndAdded', {
+              name: created.Name,
+              count: itemIds.length,
+            }),
+      )
       onClose()
     },
     onError: (err) => {
-      setError(err instanceof Error ? err.message : '新建失败，请稍后重试')
+      setError(err instanceof Error ? err.message : t('modal.collection.createError'))
     },
   })
 
@@ -130,11 +144,15 @@ export function AddToCollectionModal({
     e.preventDefault()
     const trimmed = newName.trim()
     if (!trimmed) {
-      setError(effectiveTab === 'BoxSet' ? '请输入新合集名称' : '请输入新播放列表名称')
+      setError(
+        effectiveTab === 'BoxSet'
+          ? t('modal.collection.enterCollectionName')
+          : t('modal.collection.enterPlaylistName'),
+      )
       return
     }
     if (itemIds.length === 0) {
-      setError('当前未选择任何媒体项')
+      setError(t('modal.collection.noItemsSelected'))
       return
     }
     setError(null)
@@ -144,8 +162,8 @@ export function AddToCollectionModal({
   return (
     <AdminModal
       open={open}
-      title={isAdmin ? '加入合集 / 播放列表' : '加入播放列表'}
-      subtitle={`目标媒体：${itemLabel}`}
+      title={isAdmin ? t('modal.collection.titleAdmin') : t('modal.collection.titleMember')}
+      subtitle={t('modal.collection.subtitle', { label: itemLabel })}
       maxWidthClass="max-w-lg"
       onClose={onClose}
     >
@@ -156,7 +174,7 @@ export function AddToCollectionModal({
         {isAdmin && (
           <div
             role="tablist"
-            aria-label="目标容器类型"
+            aria-label={t('modal.collection.tablistAria')}
             className="grid grid-cols-2 gap-1 rounded-xl border border-white/10 bg-zinc-950/80 p-1"
           >
             <button
@@ -174,7 +192,7 @@ export function AddToCollectionModal({
               }`}
             >
               <Layers className="h-3.5 w-3.5" />
-              <span>合集 (BoxSet)</span>
+              <span>{t('modal.collection.tabBoxSet')}</span>
             </button>
             <button
               type="button"
@@ -191,7 +209,7 @@ export function AddToCollectionModal({
               }`}
             >
               <ListVideo className="h-3.5 w-3.5" />
-              <span>播放列表 (Playlist)</span>
+              <span>{t('modal.collection.tabPlaylist')}</span>
             </button>
           </div>
         )}
@@ -199,7 +217,9 @@ export function AddToCollectionModal({
         {/* 选择现有容器 */}
         <div className="space-y-2">
           <p className="text-xs font-medium text-zinc-400">
-            选择现有{effectiveTab === 'BoxSet' ? '合集' : '播放列表'}
+            {effectiveTab === 'BoxSet'
+              ? t('modal.collection.selectExistingCollection')
+              : t('modal.collection.selectExistingPlaylist')}
           </p>
           <div className="max-h-56 space-y-1.5 overflow-y-auto pr-1">
             {isLoading ? (
@@ -208,7 +228,9 @@ export function AddToCollectionModal({
               </div>
             ) : list.length === 0 ? (
               <div className="rounded-xl border border-dashed border-white/10 bg-white/[0.02] py-6 text-center text-xs text-zinc-500">
-                暂无现有{effectiveTab === 'BoxSet' ? '合集' : '播放列表'}，可在下方直接新建
+                {effectiveTab === 'BoxSet'
+                  ? t('modal.collection.emptyCollections')
+                  : t('modal.collection.emptyPlaylists')}
               </div>
             ) : (
               list.map((target) => (
@@ -234,8 +256,8 @@ export function AddToCollectionModal({
                   </div>
                   <span className="shrink-0 text-xs font-medium text-amber-300">
                     {addExistingMutation.isPending && addExistingMutation.variables?.Id === target.Id
-                      ? '加入中...'
-                      : '加入'}
+                      ? t('modal.collection.adding')
+                      : t('modal.collection.addBtn')}
                   </span>
                 </button>
               ))
@@ -246,7 +268,9 @@ export function AddToCollectionModal({
         {/* 新建并加入 */}
         <form onSubmit={handleCreateSubmit} className="space-y-2 border-t border-white/8 pt-4">
           <label htmlFor="new-collection-name" className="block text-xs font-medium text-zinc-400">
-            或新建{effectiveTab === 'BoxSet' ? '合集' : '播放列表'}并加入
+            {effectiveTab === 'BoxSet'
+              ? t('modal.collection.orCreateCollection')
+              : t('modal.collection.orCreatePlaylist')}
           </label>
           <div className="flex items-center gap-2">
             <input
@@ -258,7 +282,9 @@ export function AddToCollectionModal({
                 if (error) setError(null)
               }}
               placeholder={
-                effectiveTab === 'BoxSet' ? '输入新合集名称...' : '输入新播放列表名称...'
+                effectiveTab === 'BoxSet'
+                  ? t('modal.collection.newCollectionPlaceholder')
+                  : t('modal.collection.newPlaylistPlaceholder')
               }
               className="flex-1 rounded-xl border border-white/10 bg-zinc-900/90 px-3.5 py-2 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
             />
@@ -272,7 +298,7 @@ export function AddToCollectionModal({
               ) : (
                 <Plus className="h-3.5 w-3.5" />
               )}
-              <span>新建并加入</span>
+              <span>{t('modal.collection.createAndAddBtn')}</span>
             </button>
           </div>
         </form>
@@ -280,14 +306,14 @@ export function AddToCollectionModal({
         <div className="flex items-center justify-between border-t border-white/8 pt-3 text-xs text-zinc-500">
           <span className="inline-flex items-center gap-1.5">
             <FolderPlus className="h-3.5 w-3.5 text-amber-400/80" />
-            <span>共 {itemIds.length} 个待添加条目</span>
+            <span>{t('modal.collection.pendingCount', { count: itemIds.length })}</span>
           </span>
           <button
             type="button"
             onClick={onClose}
             className="rounded-lg border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-zinc-300 hover:bg-white/10"
           >
-            关闭
+            {t('modal.collection.closeBtn')}
           </button>
         </div>
       </div>

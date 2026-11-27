@@ -835,6 +835,8 @@ const DEMO_IMDB_TOP250_TMDB_IDS = new Set([
   '335984', // 银翼杀手 2049
 ])
 
+const demoRevokedTokens = new Set<string>()
+
 /**
  * 重置 Demo 内存态数据（供单元测试与演示重置使用）
  */
@@ -842,6 +844,7 @@ export function resetDemoStore(): void {
   store = createInitialDemoState()
   demoTraktAccounts.clear()
   demoTokenUserMap.clear()
+  demoRevokedTokens.clear()
   seedInitialApiKeys()
   rankingsState = createInitialRankingsState()
   activeDemoScan = null
@@ -999,26 +1002,37 @@ function extractTokenFromAuthHeader(rawHeader: string | null): string | null {
   return null
 }
 
+function hasExplicitAuthCredentialHeader(rawHeader: string | null): boolean {
+  if (rawHeader === null) return false
+  const trimmed = rawHeader.trim()
+  if (!trimmed) return false
+  if (/Token\s*=/i.test(trimmed)) return true
+  if (!/^MediaBrowser\b/i.test(trimmed)) return true
+  return false
+}
+
 function extractDemoToken(options: RequestInit, qs: URLSearchParams): {
   token: string | null
   fromExplicitHeaderOrQuery: boolean
 } {
   const headers = new Headers(options.headers || {})
-  const stdAuthToken = extractTokenFromAuthHeader(headers.get('Authorization'))
-  if (stdAuthToken) {
+  const rawAuth = headers.get('Authorization')
+  const stdAuthToken = extractTokenFromAuthHeader(rawAuth)
+  if (stdAuthToken || hasExplicitAuthCredentialHeader(rawAuth)) {
     return { token: stdAuthToken, fromExplicitHeaderOrQuery: true }
   }
-  const embyAuthToken = extractTokenFromAuthHeader(headers.get('X-Emby-Authorization'))
-  if (embyAuthToken) {
+  const rawEmbyAuth = headers.get('X-Emby-Authorization')
+  const embyAuthToken = extractTokenFromAuthHeader(rawEmbyAuth)
+  if (embyAuthToken || hasExplicitAuthCredentialHeader(rawEmbyAuth)) {
     return { token: embyAuthToken, fromExplicitHeaderOrQuery: true }
   }
-  const directHeaderToken =
-    headers.get('X-Emby-Token')?.trim() || headers.get('X-MediaBrowser-Token')?.trim()
-  if (directHeaderToken) {
+  if (headers.has('X-Emby-Token') || headers.has('X-MediaBrowser-Token')) {
+    const directHeaderToken =
+      headers.get('X-Emby-Token')?.trim() || headers.get('X-MediaBrowser-Token')?.trim() || null
     return { token: directHeaderToken, fromExplicitHeaderOrQuery: true }
   }
-  const queryToken = qs.get('api_key')?.trim() || qs.get('ApiKey')?.trim()
-  if (queryToken) {
+  if (qs.has('api_key') || qs.has('ApiKey')) {
+    const queryToken = qs.get('api_key')?.trim() || qs.get('ApiKey')?.trim() || null
     return { token: queryToken, fromExplicitHeaderOrQuery: true }
   }
   const stored = getStoredAuth()
@@ -1037,100 +1051,53 @@ interface DemoCaller {
 }
 
 function resolveDemoCaller(options: RequestInit, qs: URLSearchParams): DemoCaller {
+  const unauthenticated: DemoCaller = {
+    token: null,
+    userId: '',
+    user: undefined,
+    isAdmin: false,
+  }
   const { token, fromExplicitHeaderOrQuery } = extractDemoToken(options, qs)
+  if (!token || demoRevokedTokens.has(token)) {
+    return unauthenticated
+  }
+
+  // 1. 仅精确匹配服务端签发的登录会话 Token
+  const mappedUserId = demoTokenUserMap.get(token)
+  if (mappedUserId) {
+    const rec = store.users.find((u) => u.user.Id === mappedUserId)
+    if (rec) {
+      return {
+        token,
+        userId: rec.user.Id,
+        user: rec.user,
+        isAdmin: Boolean(rec.user.Policy?.IsAdministrator),
+      }
+    }
+    return unauthenticated
+  }
+
+  // 2. 仅精确匹配服务端签发且未吊销的管理员 API Key
+  for (const apiKey of store.apiKeys) {
+    const raw = (apiKey.Id && demoRawApiKeys.get(apiKey.Id)) || apiKey.AccessToken
+    if (apiKey.IsActive !== false && raw && raw === token) {
+      const adminRec = store.users.find((u) => u.user.Policy?.IsAdministrator) || store.users[0]
+      return {
+        token,
+        userId: adminRec?.user.Id || 'user-demo-admin',
+        user: adminRec?.user,
+        isAdmin: true,
+        isApiKey: true,
+      }
+    }
+  }
+
   const stored = getStoredAuth()
 
-  if (token) {
-    // 1. 服务端签发的登录会话 Token
-    const mappedUserId = demoTokenUserMap.get(token)
-    if (mappedUserId) {
-      const rec = store.users.find((u) => u.user.Id === mappedUserId)
-      if (rec) {
-        return {
-          token,
-          userId: rec.user.Id,
-          user: rec.user,
-          isAdmin: Boolean(rec.user.Policy?.IsAdministrator),
-        }
-      }
-    }
-
-    // 2. 服务端签发的管理员 API Key
-    for (const apiKey of store.apiKeys) {
-      const raw = (apiKey.Id && demoRawApiKeys.get(apiKey.Id)) || apiKey.AccessToken
-      if (apiKey.IsActive !== false && raw && raw === token) {
-        const adminRec = store.users.find((u) => u.user.Policy?.IsAdministrator) || store.users[0]
-        return {
-          token,
-          userId: adminRec?.user.Id || 'user-demo-admin',
-          user: adminRec?.user,
-          isAdmin: true,
-          isApiKey: true,
-        }
-      }
-    }
-
-    // 3. Token 内嵌已知 userId（例如 reset 前后或单测构造的 demo_tok_<userId>）
-    for (const rec of store.users) {
-      if (token.includes(rec.user.Id)) {
-        return {
-          token,
-          userId: rec.user.Id,
-          user: rec.user,
-          isAdmin: Boolean(rec.user.Policy?.IsAdministrator),
-        }
-      }
-    }
-
-    // 4. 若与 localStorage 当前会话匹配，优先从 store.users 读取权威角色（杜绝篡改 localStorage 越权）
-    if (!fromExplicitHeaderOrQuery || (stored && stored.accessToken === token)) {
-      if (stored?.userId) {
-        const rec = store.users.find((u) => u.user.Id === stored.userId)
-        if (rec) {
-          return {
-            token,
-            userId: rec.user.Id,
-            user: rec.user,
-            isAdmin: Boolean(rec.user.Policy?.IsAdministrator),
-          }
-        }
-        // 兼容测试中构造的虚拟 userId（如 user-admin）
-        return {
-          token,
-          userId: stored.userId,
-          user: undefined,
-          isAdmin: Boolean(stored.isAdmin),
-        }
-      }
-    }
-
-    // 5. 显式传入的测试 Header Token 兜底（如 Authorization: MediaBrowser Token="guest-tok"）
-    const lowerTok = token.toLowerCase()
-    if (lowerTok.includes('guest')) {
-      const guestRec = store.users.find((u) => u.user.Id === 'user-demo-guest')
-      if (guestRec) {
-        return {
-          token,
-          userId: guestRec.user.Id,
-          user: guestRec.user,
-          isAdmin: Boolean(guestRec.user.Policy?.IsAdministrator),
-        }
-      }
-    }
-    if (lowerTok.includes('admin')) {
-      const adminRec = store.users.find((u) => u.user.Id === 'user-demo-admin')
-      if (adminRec) {
-        return {
-          token,
-          userId: adminRec.user.Id,
-          user: adminRec.user,
-          isAdmin: Boolean(adminRec.user.Policy?.IsAdministrator),
-        }
-      }
-    }
-
-    // 未知显式 Token 若 stored 存在且同源会话则回退
-    if (stored?.userId) {
+  // 3. 若显式携带了 Authorization / X-Emby-Token / api_key 凭证但未知或已吊销，
+  //    绝不回退到 localStorage 当前登录用户（仅当显式 Token 恰好等于当前有效会话 Token 时允许匹配）
+  if (fromExplicitHeaderOrQuery) {
+    if (stored && stored.accessToken === token && stored.userId) {
       const rec = store.users.find((u) => u.user.Id === stored.userId)
       if (rec) {
         return {
@@ -1147,14 +1114,30 @@ function resolveDemoCaller(options: RequestInit, qs: URLSearchParams): DemoCalle
         isAdmin: Boolean(stored.isAdmin),
       }
     }
+    return unauthenticated
   }
 
-  return {
-    token: null,
-    userId: '',
-    user: undefined,
-    isAdmin: false,
+  // 4. 未显式传入凭证时使用 localStorage 当前会话，并优先从 store.users 读取权威角色（杜绝篡改 localStorage 越权）
+  if (stored?.userId && stored.accessToken === token) {
+    const rec = store.users.find((u) => u.user.Id === stored.userId)
+    if (rec) {
+      return {
+        token,
+        userId: rec.user.Id,
+        user: rec.user,
+        isAdmin: Boolean(rec.user.Policy?.IsAdministrator),
+      }
+    }
+    // 兼容单元测试中构造的虚拟 userId（如 user-admin）
+    return {
+      token,
+      userId: stored.userId,
+      user: undefined,
+      isAdmin: Boolean(stored.isAdmin),
+    }
   }
+
+  return unauthenticated
 }
 
 function requireDemoAdmin(caller: DemoCaller): void {
@@ -1587,12 +1570,13 @@ export async function demoFetch<T>(
   }
 
   if (pathname === '/api/setup/admin' && method === 'POST') {
-    if (demoSetupCompleted && caller.token && !caller.isAdmin) {
-      throw new ApiError(403, '初始化向导已完成，普通用户无权重新配置管理员')
+    if (demoSetupCompleted && !caller.isAdmin) {
+      throw new ApiError(403, '初始化向导已完成，仅管理员可修改管理员配置')
     }
     const body = parseJsonBody(options)
     const serverName = String(body.server_name || '').trim()
     const language = String(body.language || '').trim()
+    const country = String(body.country || '').trim()
     const username = String(body.username || '').trim()
     const password = String(body.password ?? '')
 
@@ -1605,6 +1589,11 @@ export async function demoFetch<T>(
     }
     if (language) {
       demoDefaultLanguage = language
+      demoServerConfig.TMDBLanguage = language
+      demoServerConfig.PreferredMetadataLanguage = language
+    }
+    if (country) {
+      demoServerConfig.MetadataCountryCode = country
     }
 
     let rec = store.users.find((u) => u.user.Name.toLowerCase() === username.toLowerCase())
@@ -1656,15 +1645,27 @@ export async function demoFetch<T>(
   }
 
   if (pathname === '/api/setup/complete' && method === 'POST') {
-    if (demoSetupCompleted && caller.token && !caller.isAdmin) {
+    if (demoSetupCompleted && !caller.isAdmin) {
       throw new ApiError(403, '需要管理员权限')
     }
     const body = parseJsonBody(options)
     const serverName = String(body.server_name || '').trim()
+    const language = String(body.language || '').trim()
+    const country = String(body.country || '').trim()
     const tmdbLanguage = String(body.tmdb_language || '').trim()
     if (serverName) {
       store.systemInfo.ServerName = serverName
       demoServerConfig.ServerName = serverName
+    }
+    if (language) {
+      demoDefaultLanguage = language
+      demoServerConfig.PreferredMetadataLanguage = language
+      if (!tmdbLanguage) {
+        demoServerConfig.TMDBLanguage = language
+      }
+    }
+    if (country) {
+      demoServerConfig.MetadataCountryCode = country
     }
     if (tmdbLanguage) {
       demoDefaultLanguage = tmdbLanguage
@@ -1715,6 +1716,15 @@ export async function demoFetch<T>(
       if (typeof body.TMDBLanguage === 'string' && body.TMDBLanguage.trim()) {
         demoServerConfig.TMDBLanguage = body.TMDBLanguage.trim()
         demoDefaultLanguage = body.TMDBLanguage.trim()
+      }
+      if (
+        typeof body.PreferredMetadataLanguage === 'string' &&
+        body.PreferredMetadataLanguage.trim()
+      ) {
+        demoServerConfig.PreferredMetadataLanguage = body.PreferredMetadataLanguage.trim()
+      }
+      if (typeof body.MetadataCountryCode === 'string' && body.MetadataCountryCode.trim()) {
+        demoServerConfig.MetadataCountryCode = body.MetadataCountryCode.trim()
       }
       if (typeof body.EnableSTRM302 === 'boolean') {
         demoServerConfig.EnableSTRM302 = body.EnableSTRM302
@@ -1922,6 +1932,7 @@ export async function demoFetch<T>(
   if (pathname === '/emby/Sessions/Logout' && method === 'POST') {
     if (caller.token) {
       demoTokenUserMap.delete(caller.token)
+      demoRevokedTokens.add(caller.token)
     }
     return undefined as T
   }
@@ -4151,11 +4162,17 @@ export async function demoFetch<T>(
   }
 
   if (pathname === '/emby/Devices') {
-    requireDemoAdmin(caller)
     if (method === 'GET') {
-      return { Items: [...store.devices], TotalRecordCount: store.devices.length } as T
+      if (!caller.token || !caller.userId) {
+        throw new ApiError(401, '未登录或登录已过期')
+      }
+      const visibleDevices = caller.isAdmin
+        ? [...store.devices]
+        : store.devices.filter((d) => d.LastUserId === caller.userId)
+      return { Items: visibleDevices, TotalRecordCount: visibleDevices.length } as T
     }
     if (method === 'DELETE') {
+      requireDemoAdmin(caller)
       const devId = qs.get('id') || ''
       const idx = store.devices.findIndex((d) => d.Id === devId)
       if (idx >= 0) {
@@ -4217,8 +4234,10 @@ export async function demoFetch<T>(
       const raw = k.Id ? demoRawApiKeys.get(k.Id) : undefined
       const match =
         k.Id === key || k.AccessToken === key || k.MaskedToken === key || (raw && raw === key)
-      if (match && k.Id) {
-        demoRawApiKeys.delete(k.Id)
+      if (match) {
+        if (raw) demoRevokedTokens.add(raw)
+        if (k.AccessToken) demoRevokedTokens.add(k.AccessToken)
+        if (k.Id) demoRawApiKeys.delete(k.Id)
       }
       return !match
     })
@@ -4569,29 +4588,92 @@ export async function demoFetch<T>(
     }
   }
 
+  const canManageDvr = caller.isAdmin || Boolean(caller.user?.Policy?.EnableLiveTvManagement)
+
+  if (pathname === '/emby/LiveTv/ChannelMappingOptions' && method === 'GET') {
+    if (!canManageDvr) {
+      throw new ApiError(403, '需要管理员或 Live TV 管理权限 (403 Forbidden)')
+    }
+    const providerId =
+      qs.get('providerId') ||
+      qs.get('ProviderId') ||
+      demoListingProviders[0]?.Id ||
+      'epg-demo-01'
+    const activeMappings = demoLiveTvChannelMappings.filter(
+      (m) => !m.ProviderId || m.ProviderId === providerId,
+    )
+    const tunerChannels = demoLiveTvChannels.map((ch) => ({
+      Id: ch.Id,
+      Name: ch.Name,
+      Number: ch.Number,
+      ProviderChannelId:
+        activeMappings.find((m) => m.TunerChannelId === ch.Id)?.ProviderChannelId || undefined,
+    }))
+    const providerChannels = demoLiveTvChannels.map((ch, idx) => ({
+      Id: `xmltv-${ch.Id || idx + 1}`,
+      Name: `${ch.Name} (XMLTV)`,
+    }))
+    for (const m of activeMappings) {
+      if (m.ProviderChannelId && !providerChannels.some((p) => p.Id === m.ProviderChannelId)) {
+        providerChannels.push({
+          Id: m.ProviderChannelId,
+          Name: m.ProviderChannelName || m.ProviderChannelId,
+        })
+      }
+    }
+    return {
+      TunerChannels: tunerChannels,
+      ProviderChannels: providerChannels,
+      Mappings: activeMappings.map((m) => ({ ...m })),
+      ProviderName: providerId,
+    } as T
+  }
+
   if (pathname === '/emby/LiveTv/ChannelMappings') {
-    requireDemoAdmin(caller)
+    if (!canManageDvr) {
+      throw new ApiError(403, '需要管理员或 Live TV 管理权限 (403 Forbidden)')
+    }
     if (method === 'GET') {
       return demoLiveTvChannelMappings.map((m) => ({ ...m })) as T
     }
     if (method === 'POST') {
       const body = parseJsonBody(options)
       const tunerChannelId = String(body.TunerChannelId || '').trim()
-      const providerChannelId = String(body.ProviderChannelId || '').trim()
-      if (!tunerChannelId || !providerChannelId) {
-        throw new ApiError(400, 'TunerChannelId 与 ProviderChannelId 不能为空')
+      const providerChannelId = String(body.ProviderChannelId ?? '').trim()
+      const providerId = String(
+        body.ProviderId || demoListingProviders[0]?.Id || 'epg-demo-01',
+      ).trim()
+      if (!tunerChannelId) {
+        throw new ApiError(400, 'TunerChannelId 不能为空')
       }
       const ch = demoLiveTvChannels.find((c) => c.Id === tunerChannelId)
+      const existingIdx = demoLiveTvChannelMappings.findIndex(
+        (m) =>
+          m.TunerChannelId === tunerChannelId && (!m.ProviderId || m.ProviderId === providerId),
+      )
+      if (!providerChannelId) {
+        if (existingIdx >= 0) {
+          demoLiveTvChannelMappings.splice(existingIdx, 1)
+        }
+        pushActivity(
+          `已解除频道「${ch?.Name || tunerChannelId}」的 EPG 映射`,
+          'LiveTvChannelUnmapped',
+          undefined,
+          caller.userId,
+        )
+        return {
+          ProviderId: providerId,
+          TunerChannelId: tunerChannelId,
+          ProviderChannelId: '',
+        } as T
+      }
       const mapping: LiveTvChannelMapping = {
-        ProviderId: String(body.ProviderId || demoListingProviders[0]?.Id || 'epg-demo-01'),
+        ProviderId: providerId,
         TunerChannelId: tunerChannelId,
         TunerChannelName: String(body.TunerChannelName || ch?.Name || tunerChannelId),
         ProviderChannelId: providerChannelId,
         ProviderChannelName: String(body.ProviderChannelName || providerChannelId),
       }
-      const existingIdx = demoLiveTvChannelMappings.findIndex(
-        (m) => m.TunerChannelId === tunerChannelId,
-      )
       if (existingIdx >= 0) {
         demoLiveTvChannelMappings[existingIdx] = mapping
       } else {
@@ -4606,8 +4688,6 @@ export async function demoFetch<T>(
       return { ...mapping } as T
     }
   }
-
-  const canManageDvr = caller.isAdmin || Boolean(caller.user?.Policy?.EnableLiveTvManagement)
 
   // Live TV DVR 系列录制规则 (SeriesTimers)
   if (pathname === '/emby/LiveTv/SeriesTimers') {
@@ -5606,6 +5686,74 @@ export async function demoFetch<T>(
     return undefined as T
   }
 
+  const singleItemDeleteInfoMatch = pathname.match(/^\/emby\/Items\/([^/]+)\/DeleteInfo$/)
+  if (singleItemDeleteInfoMatch && method === 'GET') {
+    const itemId = decodeURIComponent(singleItemDeleteInfoMatch[1])
+    const item = store.items.get(itemId)
+    if (!item) throw new ApiError(404, '项目不存在')
+    if (!caller.isAdmin) {
+      const canUserDelete =
+        Boolean(caller.user?.Policy?.EnableContentDeletion) &&
+        canDemoUserAccessItem(caller.user, item)
+      if (!canUserDelete) {
+        throw new ApiError(403, '无权查看删除信息（需要管理员或 EnableContentDeletion 权限）')
+      }
+    }
+
+    const paths: string[] = []
+    const pushMediaWithSidecars = (target: BaseItemDto) => {
+      const primaryPath =
+        target.Path ||
+        target.MediaSources?.[0]?.Path ||
+        `/media/${target.Type.toLowerCase()}/${target.Name}.mkv`
+      if (primaryPath && !paths.includes(primaryPath)) {
+        paths.push(primaryPath)
+      }
+      if (target.Type !== 'Series' && target.Type !== 'Season' && target.Type !== 'MusicAlbum') {
+        const baseNoExt = primaryPath.replace(/\.[^/.]+$/, '')
+        const nfoPath = `${baseNoExt}.nfo`
+        if (!paths.includes(nfoPath)) {
+          paths.push(nfoPath)
+        }
+        const extSubs = (target.MediaSources?.[0]?.MediaStreams || []).filter(
+          (s) => s.Type === 'Subtitle' && s.IsExternal,
+        )
+        for (const sub of extSubs) {
+          const subExt = (sub.Codec || 'srt').toLowerCase()
+          const subLang = sub.Language || 'zh'
+          const subPath = `${baseNoExt}.${subLang}.${subExt}`
+          if (!paths.includes(subPath)) {
+            paths.push(subPath)
+          }
+        }
+      }
+    }
+
+    if (item.Type === 'Series') {
+      const seriesRoot = item.Path || `/media/tvshows/${item.Name}`
+      paths.push(`${seriesRoot}/tvshow.nfo`, `${seriesRoot}/poster.jpg`)
+      const seasons = store.seasonsBySeries.get(itemId) || []
+      for (const s of seasons) {
+        const eps = store.episodesBySeason.get(s.Id) || []
+        for (const ep of eps) {
+          pushMediaWithSidecars(ep)
+        }
+      }
+    } else if (item.Type === 'Season') {
+      if (item.Path) {
+        paths.push(`${item.Path}/season.nfo`)
+      }
+      const eps = store.episodesBySeason.get(itemId) || []
+      for (const ep of eps) {
+        pushMediaWithSidecars(ep)
+      }
+    } else {
+      pushMediaWithSidecars(item)
+    }
+
+    return { Paths: paths } as T
+  }
+
   const singleItemDeletePostMatch = pathname.match(/^\/emby\/Items\/([^/]+)\/Delete$/)
   const singleItemMutationMatch = pathname.match(/^\/emby\/Items\/([^/]+)$/)
   if (singleItemMutationMatch && method === 'POST') {
@@ -5624,21 +5772,19 @@ export async function demoFetch<T>(
     if (typeof body.SortName === 'string') {
       item.SortName = body.SortName
     }
-    if (
-      body.ProductionYear !== undefined &&
-      body.ProductionYear !== null &&
-      body.ProductionYear !== ''
-    ) {
+    if (body.ProductionYear === null || body.ProductionYear === '' || body.ProductionYear === 0) {
+      delete item.ProductionYear
+    } else if (body.ProductionYear !== undefined) {
       item.ProductionYear = Number(body.ProductionYear)
     }
-    if (
-      body.CommunityRating !== undefined &&
-      body.CommunityRating !== null &&
-      body.CommunityRating !== ''
-    ) {
+    if (body.CommunityRating === null || body.CommunityRating === '') {
+      delete item.CommunityRating
+    } else if (body.CommunityRating !== undefined) {
       item.CommunityRating = Number(body.CommunityRating)
     }
-    if (typeof body.OfficialRating === 'string') {
+    if (body.OfficialRating === null) {
+      item.OfficialRating = ''
+    } else if (typeof body.OfficialRating === 'string') {
       item.OfficialRating = body.OfficialRating
     }
     if (typeof body.Overview === 'string') {
@@ -5657,6 +5803,12 @@ export async function demoFetch<T>(
         if (val) nextProviders[k] = val
       }
       item.ProviderIds = nextProviders
+    }
+    if (typeof body.LockData === 'boolean') {
+      item.LockData = body.LockData
+    }
+    if (Array.isArray(body.LockedFields)) {
+      item.LockedFields = body.LockedFields.map((f) => String(f).trim()).filter(Boolean)
     }
     item.Etag = `etag-${Date.now().toString(36)}`
     pushActivity(`已更新「${item.Name}」的元数据`, 'ItemMetadataUpdated', undefined, caller.userId)

@@ -377,8 +377,12 @@ describe('Stream 3 (v0.9.2): LiveTv HLS/DVR/EPG, Cache Invalidation, InstantMix 
 
     invalidateSpy.mockClear()
 
-    // 删除直播源
+    // 删除直播源（兼容确认删除调谐器弹窗）
     fireEvent.click(screen.getByRole('button', { name: '删除' }))
+    const confirmTunerBtn = screen.queryByTestId('confirm-delete-tuner-btn')
+    if (confirmTunerBtn) {
+      fireEvent.click(confirmTunerBtn)
+    }
     await waitFor(() => {
       expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['liveTvInfo'] })
       expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['liveTv'] })

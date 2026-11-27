@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  AlertTriangle,
   Cpu,
   Eye,
   EyeOff,
@@ -16,7 +17,7 @@ import { api, embyFetch } from '../../api/client'
 import type { EncodingFfmpegOptions, ToneMapOptions } from '../../api/types'
 import { QueryErrorState } from '../../components/QueryErrorState'
 import { useI18n } from '../../i18n/I18nContext'
-import { FeedbackBanner, ToggleSwitch } from './adminUtils'
+import { adminLabel, FeedbackBanner, ToggleSwitch } from './adminUtils'
 
 const MASKED_SECRET = '********'
 
@@ -66,7 +67,7 @@ function parseListInput(raw: string): string[] {
 
 export function SettingsTab() {
   const queryClient = useQueryClient()
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
     null,
   )
@@ -126,19 +127,36 @@ export function SettingsTab() {
     retry: false,
   })
 
-  const { data: ffmpegOptions, refetch: refetchFfmpeg } = useQuery({
+  const {
+    data: ffmpegOptions,
+    isLoading: ffmpegLoading,
+    isFetching: ffmpegFetching,
+    isError: ffmpegIsError,
+    error: ffmpegError,
+    refetch: refetchFfmpeg,
+  } = useQuery({
     queryKey: ['admin', 'encodingFfmpegOptions'],
-    queryFn: () =>
-      embyFetch<EncodingFfmpegOptions>('/emby/Encoding/FfmpegOptions').catch(() => null),
+    queryFn: () => embyFetch<EncodingFfmpegOptions>('/emby/Encoding/FfmpegOptions'),
     retry: false,
   })
 
-  const { data: toneMapOptions, refetch: refetchToneMap } = useQuery({
+  const {
+    data: toneMapOptions,
+    isLoading: toneMapLoading,
+    isFetching: toneMapFetching,
+    isError: toneMapIsError,
+    error: toneMapError,
+    refetch: refetchToneMap,
+  } = useQuery({
     queryKey: ['admin', 'encodingToneMapOptions'],
-    queryFn: () =>
-      embyFetch<ToneMapOptions>('/emby/Encoding/FullToneMapOptions').catch(() => null),
+    queryFn: () => embyFetch<ToneMapOptions>('/emby/Encoding/FullToneMapOptions'),
     retry: false,
   })
+
+  const encodingLoading = ffmpegLoading || toneMapLoading
+  const encodingFetching = ffmpegFetching || toneMapFetching
+  const encodingLoadError = ffmpegIsError || toneMapIsError
+  const encodingErrorObj = ffmpegError ?? toneMapError
 
   useEffect(() => {
     if (!config) return
@@ -295,10 +313,12 @@ export function SettingsTab() {
 
   const handleSaveEncoding = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (encodingLoading || encodingLoadError) return
     setSavingEncoding(true)
     setFeedback(null)
     try {
       const ffmpegPayload: EncodingFfmpegOptions = {
+        ...(ffmpegOptions && typeof ffmpegOptions === 'object' ? ffmpegOptions : {}),
         HardwareAccelerationMode: Number(hwAccelMode) || 0,
         EnableHardwareEncoding: enableHwEncoding,
         AllowHevcEncoding: allowHevcEncoding,
@@ -309,6 +329,7 @@ export function SettingsTab() {
         TranscodingTempPath: transcodingTempPath.trim(),
       }
       const toneMapPayload: ToneMapOptions = {
+        ...(toneMapOptions && typeof toneMapOptions === 'object' ? toneMapOptions : {}),
         EnableToneMapping: enableToneMapping,
         ToneMappingAlgorithm: toneMappingAlgorithm,
       }
@@ -747,6 +768,51 @@ export function SettingsTab() {
               <p className="mt-0.5 text-xs text-zinc-400">{t('admin.settings.encodingDesc')}</p>
             </div>
 
+            {encodingLoadError && (
+              <div
+                role="alert"
+                data-testid="encoding-load-error"
+                className="flex flex-col gap-3 rounded-xl border border-red-500/35 bg-red-500/10 p-4 text-xs text-red-200 sm:flex-row sm:items-center sm:justify-between"
+              >
+                <div className="flex items-start gap-2.5">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-400" />
+                  <div className="space-y-1">
+                    <p className="font-semibold text-red-100">
+                      {adminLabel(
+                        t,
+                        locale,
+                        'admin.settings.encodingLoadErrorTitle',
+                        '无法加载转码与硬件加速配置，已禁止保存以防覆盖现有硬件加速与色调映射设置',
+                        'Failed to load transcoding configuration; saving is disabled to prevent overwriting hardware acceleration and tone mapping settings',
+                      )}
+                    </p>
+                    <p className="text-red-200/85">
+                      {encodingErrorObj instanceof Error
+                        ? encodingErrorObj.message
+                        : adminLabel(
+                            t,
+                            locale,
+                            'admin.settings.encodingLoadErrorDesc',
+                            '请检查服务器连接后点击重试',
+                            'Please check server connectivity and retry',
+                          )}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void refetchFfmpeg()
+                    void refetchToneMap()
+                  }}
+                  className="inline-flex shrink-0 items-center gap-1.5 self-end rounded-lg border border-red-400/35 bg-red-500/20 px-3 py-1.5 text-xs font-semibold text-red-100 transition-colors hover:bg-red-500/30 sm:self-center"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${encodingFetching ? 'animate-spin' : ''}`} />
+                  <span>{t('common.retry')}</span>
+                </button>
+              </div>
+            )}
+
             <div className="grid gap-4 sm:grid-cols-3">
               <div>
                 <label
@@ -901,8 +967,8 @@ export function SettingsTab() {
             <div className="flex justify-end pt-1">
               <button
                 type="submit"
-                disabled={savingEncoding}
-                className="inline-flex items-center gap-2 rounded-xl border border-amber-500/40 bg-amber-500/15 px-5 py-2.5 text-sm font-semibold text-amber-300 transition-all hover:bg-amber-500/25 disabled:opacity-60"
+                disabled={savingEncoding || encodingLoading || encodingLoadError}
+                className="inline-flex items-center gap-2 rounded-xl border border-amber-500/40 bg-amber-500/15 px-5 py-2.5 text-sm font-semibold text-amber-300 transition-all hover:bg-amber-500/25 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {savingEncoding ? (
                   <Loader2 className="h-4 w-4 animate-spin" />

@@ -1,6 +1,6 @@
 import { getCachedDemoServer, loadDemoServer } from '../demo/demoLoader'
 import { DEMO_AUTH_STORAGE_KEY, isDemoMode } from '../demo/demoMode'
-import { getActiveLocale } from '../i18n/I18nContext'
+import { getActiveLocale, translateForLocale } from '../i18n/I18nContext'
 import type {
   ActivityLogEntry,
   ApiKeyInfo,
@@ -162,7 +162,7 @@ export async function embyFetch<T>(
 
   const token = auth?.accessToken
   if (!token && requireAuth) {
-    throw new ApiError(401, '未登录或登录已过期')
+    throw new ApiError(401, translateForLocale(getActiveLocale(), 'api.error.notAuthenticated'))
   }
   if (!headers.has('Authorization')) {
     headers.set('Authorization', buildEmbyAuthHeader(token))
@@ -176,12 +176,18 @@ export async function embyFetch<T>(
   if (res.status === 401 && requireAuth) {
     clearAuth()
     window.dispatchEvent(new CustomEvent('ambra:unauthorized'))
-    throw new ApiError(401, '登录凭证已失效，请重新登录')
+    throw new ApiError(401, translateForLocale(getActiveLocale(), 'api.error.sessionExpired'))
   }
 
   if (!res.ok) {
     const text = await res.text().catch(() => '')
-    throw new ApiError(res.status, text || `请求失败 (${res.status})`)
+    throw new ApiError(
+      res.status,
+      text ||
+        translateForLocale(getActiveLocale(), 'api.error.requestFailedStatus', {
+          status: res.status,
+        }),
+    )
   }
 
   if (res.status === 204) {
@@ -214,11 +220,14 @@ export function resolveApiUrl(urlOrPath: string): string {
   if (!isSameOriginUrl(base)) {
     return base
   }
-  if (!token || base.includes('api_key=')) {
+  const hashIdx = base.indexOf('#')
+  const beforeHash = hashIdx >= 0 ? base.slice(0, hashIdx) : base
+  const hashPart = hashIdx >= 0 ? base.slice(hashIdx) : ''
+  if (!token || /(?:^|[?&])api_key=/.test(beforeHash)) {
     return base
   }
-  const sep = base.includes('?') ? '&' : '?'
-  return `${base}${sep}api_key=${encodeURIComponent(token)}`
+  const sep = beforeHash.includes('?') ? '&' : '?'
+  return `${beforeHash}${sep}api_key=${encodeURIComponent(token)}${hashPart}`
 }
 
 export function getImageUrl(
@@ -1097,6 +1106,9 @@ export const api = {
     )
   },
 
+  getItemDeleteInfo: (itemId: string) =>
+    embyFetch<{ Paths?: string[] }>(`/emby/Items/${encodeURIComponent(itemId)}/DeleteInfo`),
+
   deleteItem: (itemId: string) =>
     embyFetch<void>(`/emby/Items/${encodeURIComponent(itemId)}`, {
       method: 'DELETE',
@@ -1448,10 +1460,20 @@ export const api = {
       false,
     ),
 
-  getLiveTvPrograms: (channelIds?: string[], limit = 100) => {
+  getLiveTvPrograms: (
+    channelIds?: string[],
+    limit = 100,
+    options?: { minEndDate?: string; maxStartDate?: string },
+  ) => {
     const q = new URLSearchParams({ Limit: String(limit) })
     if (channelIds && channelIds.length > 0) {
       q.set('ChannelIds', channelIds.join(','))
+    }
+    if (options?.minEndDate) {
+      q.set('MinEndDate', options.minEndDate)
+    }
+    if (options?.maxStartDate) {
+      q.set('MaxStartDate', options.maxStartDate)
     }
     return embyFetch<
       QueryResult<{
@@ -1689,8 +1711,12 @@ export const api = {
       false,
     ),
 
-  getBifUrl: (itemId: string, width = 320, mediaSourceId?: string) =>
-    getBifUrl(itemId, width, mediaSourceId),
+  getBifUrl: (
+    itemId: string,
+    width = 320,
+    mediaSourceId?: string,
+    options?: { includeTokenQuery?: boolean },
+  ) => getBifUrl(itemId, width, mediaSourceId, options),
 
   getThumbnailSet: (itemId: string, width = 320, mediaSourceId?: string) => {
     const q = new URLSearchParams({ Width: String(width) })
@@ -1701,11 +1727,17 @@ export const api = {
   },
 }
 
-export function getBifUrl(itemId: string, width = 320, mediaSourceId?: string): string {
+export function getBifUrl(
+  itemId: string,
+  width = 320,
+  mediaSourceId?: string,
+  options?: { includeTokenQuery?: boolean },
+): string {
   if (!itemId) return ''
   const q = new URLSearchParams({ Width: String(width) })
   if (mediaSourceId) q.set('MediaSourceId', mediaSourceId)
-  return resolveApiUrl(`/emby/Videos/${encodeURIComponent(itemId)}/index.bif?${q.toString()}`)
+  const rawPath = `/emby/Videos/${encodeURIComponent(itemId)}/index.bif?${q.toString()}`
+  return options?.includeTokenQuery ? resolveApiUrl(rawPath) : rawPath
 }
 
 export function getLiveTvChannelStreamUrl(channelId: string): string {
@@ -1760,12 +1792,11 @@ export function getChapterImageUrl(
   tag?: string,
   maxWidth = 480,
 ): string {
+  if (!itemId) return ''
   if (isDemoMode()) {
     return getCachedDemoServer()?.getDemoImageUrl(itemId, 'Backdrop') ?? ''
   }
   const q = new URLSearchParams({ maxWidth: String(maxWidth), quality: '85' })
   if (tag) q.set('tag', tag)
-  return resolveApiUrl(
-    `/emby/Items/${encodeURIComponent(itemId)}/Images/Chapter/${chapterIndex}?${q.toString()}`,
-  )
+  return `/emby/Items/${encodeURIComponent(itemId)}/Images/Chapter/${chapterIndex}?${q.toString()}`
 }

@@ -312,13 +312,13 @@ export function MigrationTab() {
     }
     pollSeqRef.current += 1
     setStarting(true)
-    setStep(3)
     try {
       const rep = await embyFetch<MigrationReport>('/api/admin/migration/start', {
         method: 'POST',
         body: JSON.stringify(buildPayload(false)),
       })
       setLiveReport(rep)
+      setStep(3)
       setFeedback({
         type: 'success',
         message: t('admin.migration.startedSuccess'),

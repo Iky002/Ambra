@@ -4,6 +4,7 @@ import { Check, Film, GitMerge, Layers, Loader2, Search } from 'lucide-react'
 import { api, getFallbackImageUrl, getImageUrl } from '../../api/client'
 import type { BaseItemDto } from '../../api/types'
 import { useAuth } from '../../context/AuthContext'
+import { useI18n } from '../../i18n/I18nContext'
 import { AdminModal, FeedbackBanner } from '../../pages/admin/adminUtils'
 
 export interface MergeVersionsModalProps {
@@ -19,6 +20,7 @@ export function MergeVersionsModal({
   onClose,
   onMerged,
 }: MergeVersionsModalProps) {
+  const { t } = useI18n()
   const { auth } = useAuth()
   const queryClient = useQueryClient()
   const userId = auth?.userId || ''
@@ -78,32 +80,28 @@ export function MergeVersionsModal({
     onSuccess: async () => {
       if (!item) return
       const count = selectedIds.length + 1
-        await Promise.all([
-          queryClient.invalidateQueries({ queryKey: ['item'] }),
-          queryClient.invalidateQueries({ queryKey: ['episodes'] }),
-          queryClient.invalidateQueries({ queryKey: ['seasons'] }),
-          queryClient.invalidateQueries({ queryKey: ['libraryItems'] }),
-          queryClient.invalidateQueries({ queryKey: ['latestItems'] }),
-          queryClient.invalidateQueries({ queryKey: ['items'] }),
-          queryClient.invalidateQueries({ queryKey: ['admin-metadata-items'] }),
-        ])
-      onMerged?.(`已将 ${count} 个版本合并到「${item.Name}」`)
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['item'] }),
+        queryClient.invalidateQueries({ queryKey: ['episodes'] }),
+        queryClient.invalidateQueries({ queryKey: ['seasons'] }),
+        queryClient.invalidateQueries({ queryKey: ['libraryItems'] }),
+        queryClient.invalidateQueries({ queryKey: ['latestItems'] }),
+        queryClient.invalidateQueries({ queryKey: ['items'] }),
+        queryClient.invalidateQueries({ queryKey: ['admin-metadata-items'] }),
+      ])
+      onMerged?.(t('modal.merge.mergedSuccess', { count, name: item.Name }))
       onClose()
     },
     onError: (err) => {
-      setError(err instanceof Error ? err.message : '合并多版本失败')
+      setError(err instanceof Error ? err.message : t('modal.merge.mergeError'))
     },
   })
 
   return (
     <AdminModal
       open={open}
-      title="合并为多版本"
-      subtitle={
-        item
-          ? `选择要合并到「${item.Name}」的其他同类型媒体条目（合并后保留当前条目的主元数据）`
-          : undefined
-      }
+      title={t('modal.merge.title')}
+      subtitle={item ? t('modal.merge.subtitle', { name: item.Name }) : undefined}
       maxWidthClass="max-w-2xl"
       onClose={onClose}
     >
@@ -117,7 +115,7 @@ export function MergeVersionsModal({
             type="text"
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
-            placeholder="搜索片名、原名或年份，查找要合并的其他版本..."
+            placeholder={t('modal.merge.searchPlaceholder')}
             className="w-full rounded-xl border border-white/10 bg-zinc-900 py-2.5 pl-10 pr-4 text-sm text-zinc-100 outline-none focus:border-amber-400/60"
           />
           {isFetching && !isLoading && (
@@ -133,7 +131,7 @@ export function MergeVersionsModal({
             </div>
           ) : candidates.length === 0 ? (
             <div className="rounded-xl border border-dashed border-white/10 bg-white/[0.02] py-10 text-center text-xs text-zinc-400">
-              未找到可合并的候选条目，请尝试更换搜索关键词
+              {t('modal.merge.emptyCandidates')}
             </div>
           ) : (
             candidates.map((cand) => {
@@ -207,7 +205,7 @@ export function MergeVersionsModal({
                       {sourceCount > 1 && (
                         <span className="inline-flex items-center gap-1 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300">
                           <Layers className="h-2.5 w-2.5" />
-                          {sourceCount} 版本
+                          {t('modal.merge.versionCount', { count: sourceCount })}
                         </span>
                       )}
                     </div>
@@ -232,14 +230,12 @@ export function MergeVersionsModal({
         {/* 底部操作栏 */}
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/8 pt-4">
           <p className="text-xs text-zinc-400">
-            {selectedIds.length > 0 ? (
-              <>
-                已选择 <span className="font-semibold text-amber-300">{selectedIds.length}</span>{' '}
-                个候选条目，合并后共 {selectedIds.length + 1} 个条目归并
-              </>
-            ) : (
-              '请勾选至少 1 个候选条目进行合并'
-            )}
+            {selectedIds.length > 0
+              ? t('modal.merge.selectedSummary', {
+                  selected: selectedIds.length,
+                  total: selectedIds.length + 1,
+                })
+              : t('modal.merge.selectPrompt')}
           </p>
           <div className="flex items-center gap-2.5">
             <button
@@ -247,7 +243,7 @@ export function MergeVersionsModal({
               onClick={onClose}
               className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-sm font-medium text-zinc-300 transition-colors hover:bg-white/10"
             >
-              取消
+              {t('modal.merge.cancel')}
             </button>
             <button
               type="button"
@@ -260,7 +256,7 @@ export function MergeVersionsModal({
               ) : (
                 <GitMerge className="h-4 w-4" />
               )}
-              <span>确认合并</span>
+              <span>{t('modal.merge.confirmBtn')}</span>
             </button>
           </div>
         </div>

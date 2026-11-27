@@ -4,6 +4,7 @@ import { Link, useNavigate } from 'react-router-dom'
 import { getFallbackImageUrl, getImageUrl } from '../api/client'
 import type { BaseItemDto } from '../api/types'
 import { useAudioPlayer } from '../context/AudioPlayerContext'
+import { useI18n } from '../i18n/I18nContext'
 
 const TRENDING_TAGS = new Set(['trending', 'tmdb热门', '豆瓣热门电影', '豆瓣热门剧集'])
 
@@ -36,6 +37,7 @@ export function MediaCard({
   onHideFromResume,
   linkTo,
 }: MediaCardProps) {
+  const { t } = useI18n()
   const navigate = useNavigate()
   const { playTrack } = useAudioPlayer()
   const isLandscape = variant === 'landscape'
@@ -90,7 +92,7 @@ export function MediaCard({
         : item.ProductionYear
           ? String(item.ProductionYear)
           : item.Type === 'Series'
-            ? '剧集'
+            ? t('mediaCard.series')
             : ''
 
   const isAudioItem = item.Type === 'Audio'
@@ -101,8 +103,8 @@ export function MediaCard({
     showProgress && item.UserData?.PlaybackPositionTicks && item.UserData.PlaybackPositionTicks > 0
       ? `/play/${item.Id}?startTicks=${item.UserData.PlaybackPositionTicks}`
       : `/play/${item.Id}`
-  const hasDoubanTop250 = Boolean(item.Tags?.some((t) => t === '豆瓣Top250' || t === '豆瓣 Top250'))
-  const hasImdbTop250 = Boolean(item.Tags?.some((t) => t === 'IMDb Top250' || t === 'IMDb Top 250'))
+  const hasDoubanTop250 = Boolean(item.Tags?.some((tag) => tag === '豆瓣Top250' || tag === '豆瓣 Top250'))
+  const hasImdbTop250 = Boolean(item.Tags?.some((tag) => tag === 'IMDb Top250' || tag === 'IMDb Top 250'))
   const hasTrending = Boolean(item.Tags?.some(isTrendingTag))
   const hasProgressBar = (showProgress || progress > 0) && progress > 0
 
@@ -169,7 +171,7 @@ export function MediaCard({
           {/* 右上角选择复选框或已看/未看状态 */}
           {selectable ? (
             <div
-              aria-label={selected ? '已选中' : '未选中'}
+              aria-label={selected ? t('mediaCard.selected') : t('mediaCard.unselected')}
               className={`absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-full border-2 shadow-md transition-all ${
                 selected
                   ? 'border-amber-300 bg-amber-400 text-zinc-950 scale-105'
@@ -180,7 +182,7 @@ export function MediaCard({
             </div>
           ) : !(onMarkPlayed || onHideFromResume) && item.UserData?.Played ? (
             <div
-              title="已观看"
+              title={t('mediaCard.watched')}
               className="pointer-events-none absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-full bg-emerald-500/90 text-zinc-950 shadow-md"
             >
               <Check className="h-3.5 w-3.5 stroke-[3]" />
@@ -203,17 +205,17 @@ export function MediaCard({
               {hasTrending && (
                 <span className="inline-flex items-center gap-0.5 rounded-md border border-orange-400/55 bg-gradient-to-r from-orange-950/90 via-amber-900/85 to-orange-950/90 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-orange-200 shadow-[0_2px_8px_rgba(0,0,0,0.45)] backdrop-blur-md">
                   <Flame className="h-2.5 w-2.5 text-orange-400" />
-                  <span>热门</span>
+                  <span>{t('mediaCard.trending')}</span>
                 </span>
               )}
               {hasDoubanTop250 && (
                 <span className="inline-flex items-center rounded-md border border-emerald-400/50 bg-gradient-to-r from-emerald-950/90 via-emerald-900/85 to-teal-950/90 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-emerald-200 shadow-[0_2px_8px_rgba(0,0,0,0.45)] backdrop-blur-md">
-                  豆瓣 Top250
+                  {t('mediaCard.doubanTop250')}
                 </span>
               )}
               {hasImdbTop250 && (
                 <span className="inline-flex items-center rounded-md border border-amber-400/55 bg-gradient-to-r from-amber-950/90 via-yellow-900/80 to-amber-950/90 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-amber-200 shadow-[0_2px_8px_rgba(0,0,0,0.45)] backdrop-blur-md">
-                  IMDb Top250
+                  {t('mediaCard.imdbTop250')}
                 </span>
               )}
             </div>
@@ -234,8 +236,8 @@ export function MediaCard({
         {canDirectPlay && (
           <button
             type="button"
-            title="立即播放"
-            aria-label={`播放 ${item.Name}`}
+            title={t('mediaCard.playNow')}
+            aria-label={t('mediaCard.playItem', { name: item.Name })}
             onClick={(e) => {
               e.stopPropagation()
               if (isAudioItem) {
@@ -256,8 +258,8 @@ export function MediaCard({
             {onMarkPlayed && (
               <button
                 type="button"
-                title="标记已看"
-                aria-label="标记已看"
+                title={t('mediaCard.markPlayed')}
+                aria-label={t('mediaCard.markPlayed')}
                 onClick={(e) => {
                   e.stopPropagation()
                   onMarkPlayed(item)
@@ -270,8 +272,8 @@ export function MediaCard({
             {onHideFromResume && (
               <button
                 type="button"
-                title="从继续观看移除"
-                aria-label="从继续观看移除"
+                title={t('mediaCard.hideFromResume')}
+                aria-label={t('mediaCard.hideFromResume')}
                 onClick={(e) => {
                   e.stopPropagation()
                   onHideFromResume(item)

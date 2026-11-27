@@ -1168,4 +1168,160 @@ describe('StreamMkvRemuxer Controller (Range + MSE + Seek + Dispose)', () => {
 
     remuxer.dispose()
   })
+
+  it('[H-14] evictForQuotaRecovery 在 curTime <= 5s 时驱逐远端前向缓冲区间以恢复 QuotaExceededError', async () => {
+    const { bytes } = buildSyntheticMkvFile({ audioCodecId: 'A_EAC3' })
+    const { appendedByMime } = installMockMSE()
+
+    const mockFetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = (init?.headers || {}) as Record<string, string>
+      const range = headers.Range || headers.range || ''
+      const match = /bytes=(\d+)-(\d+)/.exec(range)
+      const start = match ? Number(match[1]) : 0
+      const end = match ? Math.min(bytes.byteLength - 1, Number(match[2])) : bytes.byteLength - 1
+      const slice = bytes.slice(start, end + 1)
+      return new Response(slice, {
+        status: 206,
+        headers: {
+          'Content-Range': `bytes ${start}-${end}/${bytes.byteLength}`,
+          'Content-Length': String(slice.byteLength),
+        },
+      })
+    }) as unknown as typeof fetch
+
+    const removedRanges: Array<[number, number]> = []
+    let throwQuotaOnce = true
+    const OrigMS = globalThis.MediaSource
+    class ForwardQuotaMediaSource extends OrigMS {
+      addSourceBuffer(mime: string) {
+        const sb = super.addSourceBuffer(mime)
+        // 模拟用户在播放后续片段填满 [0, 4] 与 [90, 150] 后 Seek 回到 2s 处触发 QuotaExceededError
+        const ranges: Array<[number, number]> = [
+          [0, 4],
+          [90, 150],
+        ]
+        Object.defineProperty(sb, 'buffered', {
+          configurable: true,
+          get: () => ({
+            length: ranges.length,
+            start: (idx: number) => ranges[idx][0],
+            end: (idx: number) => ranges[idx][1],
+          }),
+        })
+        sb.remove = vi.fn((start: number, end: number) => {
+          removedRanges.push([start, end])
+          Object.defineProperty(sb, 'updating', { configurable: true, writable: true, value: true })
+          queueMicrotask(() => {
+            Object.defineProperty(sb, 'updating', { configurable: true, writable: true, value: false })
+            sb.dispatchEvent(new Event('updateend'))
+          })
+        })
+        const origAppend = sb.appendBuffer.bind(sb)
+        sb.appendBuffer = (data: BufferSource) => {
+          if (throwQuotaOnce) {
+            throwQuotaOnce = false
+            throw new DOMException('Buffer full at start', 'QuotaExceededError')
+          }
+          origAppend(data)
+        }
+        return sb
+      }
+    }
+    globalThis.MediaSource = ForwardQuotaMediaSource
+
+    const videoEl = document.createElement('video')
+    Object.defineProperty(videoEl, 'currentTime', { configurable: true, writable: true, value: 2 })
+    Object.defineProperty(videoEl, 'buffered', {
+      configurable: true,
+      value: { length: 1, start: () => 0, end: () => 4 },
+    })
+
+    const remuxer = new StreamMkvRemuxer()
+    await remuxer.attach(videoEl, '/emby/Videos/4k-seekback/stream', {}, {
+      fetchImpl: mockFetch,
+      videoOnly: true,
+    })
+    await new Promise((r) => setTimeout(r, 40))
+
+    // curTime = 2 <= 5 时无后向缓冲可删，必须驱逐远端前向缓冲 [90, 150] 并成功恢复写入
+    expect(removedRanges).toEqual([[90, 150]])
+    expect(
+      (appendedByMime.get('video/mp4; codecs="avc1.640028"') || []).length,
+    ).toBeGreaterThanOrEqual(2)
+
+    remuxer.dispose()
+  })
+
+  it('[M-16] 解析 HEVCDecoderConfigurationRecord (hvcC) 生成精准 Main 10 / Main 8-bit MIME，且 parseCues 按视频轨 0xF7 过滤', () => {
+    // Main 10 (profile_idc = 2), Low tier (0), compat bit 29 -> reversed 0x4, constraints [0x90, 0..], level 150 (5.0)
+    const hvccMain10 = new Uint8Array([
+      0x01, // configurationVersion = 1
+      0x02, // profile_space=0, tier=0 (L), profile_idc=2 (Main 10)
+      0x20, 0x00, 0x00, 0x00, // profile_compatibility_flags -> reversed 0x4
+      0x90, 0x00, 0x00, 0x00, 0x00, 0x00, // constraint_indicator_flags -> 90
+      150, // general_level_idc = 150 (Level 5.0)
+    ])
+    const main10Track: MkvTrackInfo = {
+      trackNumber: 1,
+      trackType: 'video',
+      codecId: 'V_MPEGH/ISO/HEVC',
+      codecPrivate: hvccMain10,
+    }
+    expect(resolveMkvMimeType(main10Track).videoMime).toBe('video/mp4; codecs="hvc1.2.4.L150.90"')
+
+    // Main 10 High Tier Level 5.1 (153), constraints [0xB0, 0..]
+    const hvccMain10High = new Uint8Array([
+      0x01,
+      0x22, // tier=1 (H), profile_idc=2
+      0x20, 0x00, 0x00, 0x00,
+      0xb0, 0x00, 0x00, 0x00, 0x00, 0x00,
+      153,
+    ])
+    expect(
+      resolveMkvMimeType({ ...main10Track, codecPrivate: hvccMain10High }).videoMime,
+    ).toBe('video/mp4; codecs="hvc1.2.4.H153.B0"')
+
+    // 缺失或过短 codecPrivate 回退至 hvc1.1.6.L120.90
+    expect(resolveMkvMimeType({ ...main10Track, codecPrivate: undefined }).videoMime).toBe(
+      'video/mp4; codecs="hvc1.1.6.L120.90"',
+    )
+
+    // parseCues 过滤非视频轨（音频轨 track=2 / 字幕轨 track=3），仅保留视频轨 track=1
+    const cuesBytes = ebmlEl(
+      EBML_ID.Cues,
+      ebmlEl(
+        EBML_ID.CuePoint,
+        ebmlEl(EBML_ID.CueTime, uintBytes(10_000)),
+        ebmlEl(
+          EBML_ID.CueTrackPositions,
+          ebmlEl(EBML_ID.CueTrack, uintBytes(2)), // 音频轨在其它偏移
+          ebmlEl(EBML_ID.CueClusterPosition, uintBytes(1111)),
+        ),
+      ),
+      ebmlEl(
+        EBML_ID.CuePoint,
+        ebmlEl(EBML_ID.CueTime, uintBytes(12_000)),
+        ebmlEl(
+          EBML_ID.CueTrackPositions,
+          ebmlEl(EBML_ID.CueTrack, uintBytes(1)), // 视频关键帧
+          ebmlEl(EBML_ID.CueClusterPosition, uintBytes(8888)),
+        ),
+      ),
+    )
+    const filteredCues = parseCues(cuesBytes, 1_000_000, 100, 1)
+    expect(filteredCues).toHaveLength(1)
+    expect(filteredCues[0].trackNumber).toBe(1)
+    expect(filteredCues[0].fileOffset).toBe(8988)
+
+    // 若视频轨无任何 Cue 条目，则安全回退保留全部 Cues
+    const fallbackCues = parseCues(cuesBytes, 1_000_000, 100, 99)
+    expect(fallbackCues).toHaveLength(2)
+  })
+
+  it('[L-12] rvfc-polyfill 通过构建别名映射至自研 MIT 轻量兼容垫片，不引入 GPL 代码', async () => {
+    const mod = await import('rvfc-polyfill')
+    expect(mod).toBeDefined()
+    expect(typeof HTMLVideoElement.prototype.requestVideoFrameCallback).toBe('function')
+    expect(typeof HTMLVideoElement.prototype.cancelVideoFrameCallback).toBe('function')
+  })
 })

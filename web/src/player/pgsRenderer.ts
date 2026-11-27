@@ -21,8 +21,8 @@ interface PgsObject {
   id: number
   width: number
   height: number
-  /** 索引色调色板像素数组 (length = width * height) */
-  pixels: Uint8Array
+  /** 紧凑 PGS RLE 压缩位图负载（按需惰性解码，避免整片预解压占用数百 MB 内存） */
+  rleData: Uint8Array
 }
 
 interface PgsCompositionObject {
@@ -51,7 +51,7 @@ export interface PgsDisplaySet {
   height: number
   paletteId: number
   objects: Array<{
-    imageData: ImageData
+    readonly imageData: ImageData
     x: number
     y: number
   }>
@@ -67,6 +67,8 @@ const SEG_END = 0x80
 /** 限制单字幕帧最大像素数（4K 上限），防止恶意 .sup 字幕 OOM 炸弹 */
 export const MAX_PGS_FRAME_PIXELS = 4096 * 2160
 const MAX_PGS_ODS_BYTES = 16 * 1024 * 1024
+/** 最近解码 RGBA ImageData 的有界 LRU 缓存容量（仅保留最近活跃的少量字幕帧） */
+export const MAX_PGS_DECODED_CACHE_ENTRIES = 12
 
 function isValidPgsDimensions(width: number, height: number): boolean {
   return width > 0 && height > 0 && width * height <= MAX_PGS_FRAME_PIXELS
@@ -93,7 +95,7 @@ function ycbcrToRgba(y: number, cr: number, cb: number, a: number): PgsPaletteEn
 /**
  * 解码 PGS RLE 压缩位图数据为调色板索引数组
  */
-function decodePgsRle(
+export function decodePgsRle(
   data: Uint8Array,
   width: number,
   height: number,
@@ -152,13 +154,77 @@ function decodePgsRle(
   return pixels
 }
 
+function buildCompactPaletteTable(palette: Map<number, PgsPaletteEntry>): Uint8Array {
+  const table = new Uint8Array(256 * 4)
+  for (const [idx, entry] of palette.entries()) {
+    if (idx < 0 || idx > 255 || entry.a <= 0) continue
+    const off = idx * 4
+    table[off] = entry.r
+    table[off + 1] = entry.g
+    table[off + 2] = entry.b
+    table[off + 3] = entry.a
+  }
+  return table
+}
+
+function decodeLazyObjectImageData(
+  rleData: Uint8Array,
+  objWidth: number,
+  objHeight: number,
+  srcX: number,
+  srcY: number,
+  drawW: number,
+  drawH: number,
+  paletteTable: Uint8Array,
+): ImageData {
+  const pixels = decodePgsRle(rleData, objWidth, objHeight)
+  const rgba = new Uint8ClampedArray(drawW * drawH * 4)
+  for (let row = 0; row < drawH; row++) {
+    const objRowStart = (srcY + row) * objWidth + srcX
+    const outRowStart = row * drawW * 4
+    for (let col = 0; col < drawW; col++) {
+      const palOff = pixels[objRowStart + col] * 4
+      const alpha = paletteTable[palOff + 3]
+      if (alpha > 0) {
+        const dst = outRowStart + col * 4
+        rgba[dst] = paletteTable[palOff]
+        rgba[dst + 1] = paletteTable[palOff + 1]
+        rgba[dst + 2] = paletteTable[palOff + 2]
+        rgba[dst + 3] = alpha
+      }
+    }
+  }
+  return new ImageData(rgba, drawW, drawH)
+}
+
 /**
- * 解析完整 .sup PGS 二进制流为按 PTS 排序的 DisplaySet 列表
+ * 解析完整 .sup PGS 二进制流为按 PTS 排序的 DisplaySet 列表。
+ * 解析阶段仅保存紧凑 RLE 字节流与 1KB 调色板快照，在实际渲染/访问时按需惰性解码 RGBA ImageData 并受 LRU 容量约束。
  */
 export function parsePgsSup(buffer: ArrayBuffer): PgsDisplaySet[] {
   const view = new DataView(buffer)
   const bytes = new Uint8Array(buffer)
   const displaySets: PgsDisplaySet[] = []
+  const decodedLruCache = new Map<number, ImageData>()
+  let nextLazyObjectId = 1
+
+  const getCachedOrDecode = (key: number, factory: () => ImageData): ImageData => {
+    const hit = decodedLruCache.get(key)
+    if (hit) {
+      decodedLruCache.delete(key)
+      decodedLruCache.set(key, hit)
+      return hit
+    }
+    const decoded = factory()
+    if (decodedLruCache.size >= MAX_PGS_DECODED_CACHE_ENTRIES) {
+      const oldestKey = decodedLruCache.keys().next().value
+      if (oldestKey !== undefined) {
+        decodedLruCache.delete(oldestKey)
+      }
+    }
+    decodedLruCache.set(key, decoded)
+    return decoded
+  }
 
   const palettes = new Map<number, Map<number, PgsPaletteEntry>>()
   const objects = new Map<number, PgsObject>()
@@ -304,15 +370,21 @@ export function parsePgsSup(buffer: ArrayBuffer): PgsDisplaySet[] {
           pendingOds.delete(objectId)
           objects.delete(objectId)
         } else if (isLast) {
-          const pixels = decodePgsRle(rleSlice, width, height)
-          objects.set(objectId, { id: objectId, width, height, pixels })
+          if (rleSlice.length <= MAX_PGS_ODS_BYTES) {
+            objects.set(objectId, {
+              id: objectId,
+              width,
+              height,
+              rleData: rleSlice.slice(),
+            })
+          }
           pendingOds.delete(objectId)
         } else if (rleSlice.length <= MAX_PGS_ODS_BYTES) {
           pendingOds.set(objectId, {
             width,
             height,
             expectedLen: Math.max(0, dataLen - 4),
-            chunks: [rleSlice],
+            chunks: [rleSlice.slice()],
             totalLen: rleSlice.length,
           })
         }
@@ -323,7 +395,7 @@ export function parsePgsSup(buffer: ArrayBuffer): PgsDisplaySet[] {
           if (pending.totalLen + rleSlice.length > MAX_PGS_ODS_BYTES) {
             pendingOds.delete(objectId)
           } else {
-            pending.chunks.push(rleSlice)
+            pending.chunks.push(rleSlice.slice())
             pending.totalLen += rleSlice.length
 
             if (isLast) {
@@ -333,12 +405,11 @@ export function parsePgsSup(buffer: ArrayBuffer): PgsDisplaySet[] {
                 merged.set(c, writePos)
                 writePos += c.length
               }
-              const pixels = decodePgsRle(merged, pending.width, pending.height)
               objects.set(objectId, {
                 id: objectId,
                 width: pending.width,
                 height: pending.height,
-                pixels,
+                rleData: merged,
               })
               pendingOds.delete(objectId)
             }
@@ -356,6 +427,7 @@ export function parsePgsSup(buffer: ArrayBuffer): PgsDisplaySet[] {
           currentPcs.height === 0 ||
           isValidPgsDimensions(currentPcs.width, currentPcs.height))
       ) {
+        let paletteTable: Uint8Array | null = null
         for (const comp of currentPcs.compositionObjects) {
           const obj = objects.get(comp.objectId)
           if (!obj || !isValidPgsDimensions(obj.width, obj.height)) continue
@@ -366,27 +438,32 @@ export function parsePgsSup(buffer: ArrayBuffer): PgsDisplaySet[] {
           const drawH = comp.cropped ? Math.min(comp.cropHeight, obj.height - srcY) : obj.height
           if (!isValidPgsDimensions(drawW, drawH)) continue
 
-          const rgba = new Uint8ClampedArray(drawW * drawH * 4)
-          for (let row = 0; row < drawH; row++) {
-            const objRowStart = (srcY + row) * obj.width + srcX
-            const outRowStart = row * drawW * 4
-            for (let col = 0; col < drawW; col++) {
-              const colorIdx = obj.pixels[objRowStart + col]
-              const entry = palette.get(colorIdx)
-              if (entry && entry.a > 0) {
-                const dst = outRowStart + col * 4
-                rgba[dst] = entry.r
-                rgba[dst + 1] = entry.g
-                rgba[dst + 2] = entry.b
-                rgba[dst + 3] = entry.a
-              }
-            }
+          if (!paletteTable) {
+            paletteTable = buildCompactPaletteTable(palette)
           }
+          const snappedPalette = paletteTable
+          const snappedRle = obj.rleData
+          const snappedObjW = obj.width
+          const snappedObjH = obj.height
+          const cacheKey = nextLazyObjectId++
 
           renderedObjects.push({
-            imageData: new ImageData(rgba, drawW, drawH),
             x: comp.x,
             y: comp.y,
+            get imageData(): ImageData {
+              return getCachedOrDecode(cacheKey, () =>
+                decodeLazyObjectImageData(
+                  snappedRle,
+                  snappedObjW,
+                  snappedObjH,
+                  srcX,
+                  srcY,
+                  drawW,
+                  drawH,
+                  snappedPalette,
+                ),
+              )
+            },
           })
         }
       }

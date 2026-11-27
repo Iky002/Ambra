@@ -57,7 +57,7 @@ import { MetadataEditorModal } from '../components/media/MetadataEditorModal'
 import { RemoteSubtitleModal } from '../components/media/RemoteSubtitleModal'
 import { useAudioPlayer } from '../context/AudioPlayerContext'
 import { useAuth } from '../context/AuthContext'
-import { useI18n } from '../i18n/I18nContext'
+import { getActiveLocale, translateForLocale, useI18n } from '../i18n/I18nContext'
 import {
   loadPlaybackPrefs,
   pickPreferredAudioIndex,
@@ -109,7 +109,8 @@ function readFileAsBase64(file: File): Promise<string> {
       const base64 = result.includes(',') ? result.slice(result.indexOf(',') + 1) : result
       resolve(base64)
     }
-    reader.onerror = () => reject(new Error('读取字幕文件失败'))
+    reader.onerror = () =>
+      reject(new Error(translateForLocale(getActiveLocale(), 'itemDetailUi.errReadSubtitleFile')))
     reader.readAsDataURL(file)
   })
 }
@@ -383,7 +384,10 @@ export function ItemDetailPage() {
     const subTags = new Set<string>()
     for (const s of subtitleStreams) {
       const variant = detectChineseVariant(s)
-      if (variant) subTags.add(`${variant}字幕`)
+      if (variant === '双语') subTags.add(t('itemDetailUi.subBadgeBilingual'))
+      else if (variant === '简体') subTags.add(t('itemDetailUi.subBadgeChs'))
+      else if (variant === '繁体') subTags.add(t('itemDetailUi.subBadgeCht'))
+      else if (variant === '简繁') subTags.add(t('itemDetailUi.subBadgeChsCht'))
       const meta = getSubtitleMeta(s)
       if (meta.formatBadge === 'ASS' || meta.formatBadge === 'PGS') {
         subTags.add(meta.formatBadge)
@@ -391,7 +395,7 @@ export function ItemDetailPage() {
     }
     subTags.forEach((tag) => badges.push({ label: tag }))
     return badges
-  }, [videoStream, activeSource, subtitleStreams])
+  }, [videoStream, activeSource, subtitleStreams, t])
 
   const favMutation = useMutation({
     mutationFn: () => api.toggleFavorite(userId, item!.Id, Boolean(item!.UserData?.IsFavorite)),
@@ -419,17 +423,17 @@ export function ItemDetailPage() {
     const extMatch = file.name.toLowerCase().match(/\.([a-z0-9]+)$/)
     const ext = extMatch ? extMatch[1] : ''
     if (!ext || !ALLOWED_SUBTITLE_EXTENSIONS.has(ext)) {
-      return '仅支持上传 .srt / .vtt / .ass / .ssa / .sub / .sup 格式的字幕文件'
+      return t('itemDetailUi.errSubtitleFormat')
     }
     if (file.size > MAX_SUBTITLE_UPLOAD_BYTES) {
-      return '字幕文件过大，请选择不超过 20 MB 的字幕文件'
+      return t('itemDetailUi.errSubtitleTooLarge')
     }
     return null
   }
 
   const uploadSubtitleMutation = useMutation({
     mutationFn: async () => {
-      if (!item || !subFile) throw new Error('请选择要上传的字幕文件')
+      if (!item || !subFile) throw new Error(t('itemDetailUi.errSelectSubtitleFile'))
       const validationErr = validateSubtitleFile(subFile)
       if (validationErr) throw new Error(validationErr)
       const extMatch = subFile.name.toLowerCase().match(/\.([a-z0-9]+)$/)
@@ -450,10 +454,10 @@ export function ItemDetailPage() {
         subFileInputRef.current.value = ''
       }
       await queryClient.invalidateQueries({ queryKey: ['item'] })
-      showToast('success', '外挂字幕上传成功')
+      showToast('success', t('itemDetailUi.subtitleUploadedSuccess'))
     },
     onError: (err) => {
-      const msg = err instanceof Error ? err.message : '上传字幕失败'
+      const msg = err instanceof Error ? err.message : t('itemDetailUi.subtitleUploadFailed')
       setSubError(msg)
       showToast('error', msg)
     },
@@ -467,10 +471,10 @@ export function ItemDetailPage() {
         setSelectedSubIdx(undefined)
       }
       await queryClient.invalidateQueries({ queryKey: ['item'] })
-      showToast('success', '已删除外挂字幕')
+      showToast('success', t('itemDetailUi.subtitleDeletedSuccess'))
     },
     onError: (err) => {
-      const msg = err instanceof Error ? err.message : '删除字幕失败'
+      const msg = err instanceof Error ? err.message : t('itemDetailUi.subtitleDeleteFailed')
       setSubError(msg)
       showToast('error', msg)
     },
@@ -508,10 +512,22 @@ export function ItemDetailPage() {
       if (!selectedSeason) return
       const markAsUnplayed = seasonAllPlayed
       const targets = episodes.filter((ep) => Boolean(ep.UserData?.Played) === markAsUnplayed)
-      await Promise.all([
-        api.togglePlayed(userId, selectedSeason.Id, markAsUnplayed).catch(() => undefined),
-        ...targets.map((ep) => api.togglePlayed(userId, ep.Id, markAsUnplayed)),
-      ])
+      await api.togglePlayed(userId, selectedSeason.Id, markAsUnplayed).catch(() => undefined)
+      const concurrency = 6
+      let cursor = 0
+      const workers = Array.from(
+        { length: Math.min(concurrency, targets.length) },
+        async () => {
+          while (cursor < targets.length) {
+            const idx = cursor++
+            const ep = targets[idx]
+            if (ep) {
+              await api.togglePlayed(userId, ep.Id, markAsUnplayed)
+            }
+          }
+        },
+      )
+      await Promise.all(workers)
     },
     onSuccess: async () => {
       await Promise.all([
@@ -524,12 +540,15 @@ export function ItemDetailPage() {
       showToast(
         'success',
         seasonAllPlayed
-          ? `已将「${selectedSeason?.Name}」标记为未看`
-          : `已将「${selectedSeason?.Name}」标记为已看`,
+          ? t('itemDetailUi.seasonMarkedUnplayed', { name: selectedSeason?.Name || '' })
+          : t('itemDetailUi.seasonMarkedPlayed', { name: selectedSeason?.Name || '' }),
       )
     },
     onError: (err) => {
-      showToast('error', err instanceof Error ? err.message : '更新本季观看状态失败')
+      showToast(
+        'error',
+        err instanceof Error ? err.message : t('itemDetailUi.seasonPlayedUpdateFailed'),
+      )
     },
   })
 
@@ -537,10 +556,10 @@ export function ItemDetailPage() {
     mutationFn: () => api.refreshItemMetadata(item!.Id, false),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ['item', userId, id] })
-      showToast('success', `已触发「${item!.Name}」的元数据刷新`)
+      showToast('success', t('itemDetailUi.refreshMetadataTriggered', { name: item!.Name }))
     },
     onError: (err) => {
-      showToast('error', err instanceof Error ? err.message : '刷新元数据失败')
+      showToast('error', err instanceof Error ? err.message : t('admin.metadata.refreshFailed'))
     },
   })
 
@@ -552,10 +571,10 @@ export function ItemDetailPage() {
         queryClient.invalidateQueries({ queryKey: ['items'] }),
         queryClient.invalidateQueries({ queryKey: ['latestItems'] }),
       ])
-      showToast('success', `已拆分「${item!.Name}」的多版本为独立条目`)
+      showToast('success', t('itemDetailUi.versionsSplitSuccess', { name: item!.Name }))
     },
     onError: (err) => {
-      showToast('error', err instanceof Error ? err.message : '拆分多版本失败')
+      showToast('error', err instanceof Error ? err.message : t('itemDetailUi.versionsSplitFailed'))
     },
   })
 
@@ -565,14 +584,24 @@ export function ItemDetailPage() {
       const tracks = res?.Items || []
       if (tracks.length > 0) {
         playQueue(tracks, 0)
-        showToast('success', `已开启「${item!.Name}」即时混音（共 ${tracks.length} 首）`)
+        showToast(
+          'success',
+          t('itemDetailUi.instantMixStarted', { name: item!.Name, count: tracks.length }),
+        )
       } else {
-        showToast('error', '未找到可用于即时混音的曲目')
+        showToast('error', t('itemDetailUi.instantMixEmpty'))
       }
     },
     onError: (err) => {
-      showToast('error', err instanceof Error ? err.message : '获取即时混音失败')
+      showToast('error', err instanceof Error ? err.message : t('itemDetailUi.instantMixFailed'))
     },
+  })
+
+  const deleteInfoQuery = useQuery({
+    queryKey: ['itemDeleteInfo', item?.Id],
+    queryFn: () => api.getItemDeleteInfo(item!.Id),
+    enabled: Boolean(deleteConfirmOpen && item?.Id),
+    staleTime: 15_000,
   })
 
   const deleteItemMutation = useMutation({
@@ -598,7 +627,7 @@ export function ItemDetailPage() {
     },
     onError: (err) => {
       setDeleteConfirmOpen(false)
-      showToast('error', err instanceof Error ? err.message : '删除媒体失败')
+      showToast('error', err instanceof Error ? err.message : t('admin.metadata.deleteFailed'))
     },
   })
 
@@ -612,14 +641,14 @@ export function ItemDetailPage() {
 
   if (isError || !item) {
     const errorMsg =
-      error instanceof Error && error.message ? error.message : '未找到该媒体项目或加载失败'
+      error instanceof Error && error.message ? error.message : t('itemDetailUi.itemNotFoundOrFailed')
     return (
       <div className="flex min-h-[60vh] items-center justify-center px-4">
         <div className="w-full max-w-md rounded-2xl border border-white/10 bg-zinc-950/90 p-8 text-center shadow-2xl">
           <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-red-500/15 text-red-400 ring-1 ring-red-500/30">
             <AlertTriangle className="h-6 w-6" />
           </div>
-          <h2 className="text-lg font-semibold text-white">无法加载媒体详情</h2>
+          <h2 className="text-lg font-semibold text-white">{t('itemDetailUi.loadDetailErrorTitle')}</h2>
           <p className="mt-2 text-sm text-zinc-400">{errorMsg}</p>
           <div className="mt-6 flex items-center justify-center gap-3">
             <button
@@ -628,14 +657,14 @@ export function ItemDetailPage() {
               className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-5 py-2.5 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400"
             >
               <RefreshCw className="h-3.5 w-3.5" />
-              <span>重试</span>
+              <span>{t('common.retry')}</span>
             </button>
             <button
               type="button"
               onClick={() => navigate('/')}
               className="inline-flex items-center gap-1.5 rounded-xl border border-white/12 bg-white/[0.05] px-5 py-2.5 text-xs font-medium text-zinc-200 transition-colors hover:bg-white/10"
             >
-              <span>返回首页</span>
+              <span>{t('auth.backHome')}</span>
             </button>
           </div>
         </div>
@@ -694,7 +723,7 @@ export function ItemDetailPage() {
       return `S${String(ep.ParentIndexNumber).padStart(2, '0')}E${String(ep.IndexNumber).padStart(2, '0')}`
     }
     if (ep.IndexNumber != null) {
-      return `第 ${ep.IndexNumber} 集`
+      return t('itemDetailUi.episodeNumberLabel', { index: ep.IndexNumber })
     }
     return ep.Name
   }
@@ -704,9 +733,9 @@ export function ItemDetailPage() {
     ? (primarySeriesTarget.UserData?.PlaybackPositionTicks || 0) > 10_000_000 * 15 ||
       (primarySeriesTarget.IndexNumber != null && primarySeriesTarget.IndexNumber > 1) ||
       (primarySeriesTarget.ParentIndexNumber != null && primarySeriesTarget.ParentIndexNumber > 1)
-      ? `继续播放 ${formatEpisodeCode(primarySeriesTarget)}`
-      : `播放 ${formatEpisodeCode(primarySeriesTarget)}`
-    : '播放第 1 集'
+      ? t('itemDetailUi.resumeEpisodeBtn', { code: formatEpisodeCode(primarySeriesTarget) })
+      : t('itemDetailUi.playEpisodeBtn', { code: formatEpisodeCode(primarySeriesTarget) })
+    : t('itemDetailUi.playFirstEpisodeBtn')
 
   const hasTrendingBadge = Boolean(item.Tags?.some(isTrendingTag))
 
@@ -746,7 +775,7 @@ export function ItemDetailPage() {
     if (doubanId) {
       links.push({
         key: 'douban',
-        label: '豆瓣',
+        label: t('itemDetailUi.providerDouban'),
         href: `https://movie.douban.com/subject/${encodeURIComponent(doubanId)}/`,
       })
     }
@@ -830,7 +859,7 @@ export function ItemDetailPage() {
       setPathCopied(true)
       window.setTimeout(() => setPathCopied(false), 2000)
     } else {
-      showToast('error', '复制文件路径失败，请手动复制')
+      showToast('error', t('itemDetailUi.copyPathFailed'))
     }
   }
 
@@ -900,7 +929,7 @@ export function ItemDetailPage() {
                   <Link
                     to={buildFilterLink('year', String(item.ProductionYear))}
                     className="rounded-md px-1.5 py-0.5 transition-colors hover:bg-amber-500/15 hover:text-amber-300"
-                    title={`查看 ${item.ProductionYear} 年作品`}
+                    title={t('itemDetailUi.filterByYearTitle', { year: item.ProductionYear })}
                   >
                     {item.ProductionYear}
                   </Link>
@@ -916,7 +945,7 @@ export function ItemDetailPage() {
                     key={g}
                     to={buildFilterLink('genre', g)}
                     className="rounded-full bg-white/8 px-2.5 py-0.5 text-xs text-zinc-300 transition-colors hover:bg-amber-500/20 hover:text-amber-200"
-                    title={`按流派「${g}」筛选`}
+                    title={t('itemDetailUi.filterByGenreTitle', { genre: g })}
                   >
                     {g}
                   </Link>
@@ -932,7 +961,7 @@ export function ItemDetailPage() {
                       className="inline-flex items-center gap-1 rounded-md border border-orange-400/55 bg-gradient-to-r from-orange-950/90 via-amber-900/80 to-orange-950/90 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide text-orange-200 shadow-[0_0_12px_rgba(249,115,22,0.22)] transition-opacity hover:opacity-90"
                     >
                       <Flame className="h-3 w-3 text-orange-400" />
-                      <span>热门趋势</span>
+                      <span>{t('itemDetailUi.trendingBadge')}</span>
                     </Link>
                   )}
                   {item.Tags?.some((t) => t === '豆瓣Top250' || t === '豆瓣 Top250') && (
@@ -940,7 +969,7 @@ export function ItemDetailPage() {
                       to={buildFilterLink('tag', '豆瓣Top250')}
                       className="inline-flex items-center rounded-md border border-emerald-400/50 bg-gradient-to-r from-emerald-950/90 via-emerald-900/80 to-teal-950/90 px-2.5 py-0.5 text-[11px] font-semibold tracking-wide text-emerald-200 shadow-[0_0_12px_rgba(16,185,129,0.2)] transition-opacity hover:opacity-90"
                     >
-                      豆瓣 Top250
+                      {t('itemDetailUi.doubanTop250Badge')}
                     </Link>
                   )}
                   {item.Tags?.some((t) => t === 'IMDb Top250' || t === 'IMDb Top 250') && (
@@ -988,7 +1017,7 @@ export function ItemDetailPage() {
                         <Link
                           key={studio.Id || studio.Name}
                           to={buildFilterLink('studio', studio.Name)}
-                          title={`按制片厂「${studio.Name}」筛选`}
+                          title={t('itemDetailUi.filterByStudioTitle', { studio: studio.Name })}
                           className="rounded-full border border-white/10 bg-white/[0.05] px-2.5 py-0.5 text-zinc-200 transition-colors hover:border-amber-400/40 hover:bg-amber-500/15 hover:text-amber-200"
                         >
                           {studio.Name}
@@ -1066,7 +1095,7 @@ export function ItemDetailPage() {
                         onClick={() => handlePlay(item.Id, 0)}
                         className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-white/8 px-4 py-3 text-sm font-medium text-zinc-100 transition-all duration-200 hover:-translate-y-0.5 hover:bg-white/12 active:scale-[0.97]"
                       >
-                        从头播放
+                        {t('itemDetailUi.playFromBeginning')}
                       </button>
                     )}
                   </>
@@ -1098,7 +1127,7 @@ export function ItemDetailPage() {
                     ) : (
                       <Shuffle className="h-4 w-4" />
                     )}
-                    <span>即时混音</span>
+                    <span>{t('itemDetailUi.instantMixBtn')}</span>
                   </button>
                 )}
 
@@ -1128,7 +1157,11 @@ export function ItemDetailPage() {
                     ) : (
                       <Music className="h-4 w-4" />
                     )}
-                    <span>{themeSongPlaying ? '停止主题曲' : '播放主题曲'}</span>
+                    <span>
+                      {themeSongPlaying
+                        ? t('itemDetailUi.stopThemeSongBtn')
+                        : t('itemDetailUi.playThemeSongBtn')}
+                    </span>
                   </button>
                 )}
 
@@ -1262,7 +1295,7 @@ export function ItemDetailPage() {
                         className="inline-flex items-center gap-1.5 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-200 transition-colors hover:bg-amber-500/20 disabled:opacity-50"
                       >
                         <Split className="h-3.5 w-3.5" />
-                        <span>拆分多版本</span>
+                        <span>{t('itemDetailUi.splitVersionsBtn')}</span>
                       </button>
                     )}
                     {canDeleteItem && (
@@ -1286,7 +1319,7 @@ export function ItemDetailPage() {
                     <label className="block space-y-1.5">
                       <span className="flex items-center gap-1.5 text-xs font-medium text-zinc-400">
                         <Layers className="h-3.5 w-3.5 text-amber-400" />
-                        视频版本
+                        {t('itemDetailUi.videoVersionLabel')}
                       </span>
                       <select
                         value={activeSource?.Id || ''}
@@ -1345,7 +1378,9 @@ export function ItemDetailPage() {
                       }
                       className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
                     >
-                      {audioStreams.length === 0 && <option value="">默认音轨</option>}
+                      {audioStreams.length === 0 && (
+                        <option value="">{t('itemDetailUi.defaultAudioTrack')}</option>
+                      )}
                       {audioStreams.map((a) => (
                         <option key={a.Index} value={a.Index}>
                           {getAudioLabel(a)}
@@ -1370,7 +1405,7 @@ export function ItemDetailPage() {
                           className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[11px] font-medium text-amber-300 transition-colors hover:border-amber-400/40 hover:bg-amber-500/15"
                         >
                           <ScanSearch className="h-3 w-3" />
-                          <span>在线搜索字幕</span>
+                          <span>{t('itemDetailUi.searchSubtitlesOnlineBtn')}</span>
                         </button>
                         {isAdmin && (
                           <button
@@ -1430,9 +1465,9 @@ export function ItemDetailPage() {
             <div className="flex items-center gap-2">
               <Disc3 className="h-5 w-5 text-amber-400" />
               <h2 className="text-lg font-semibold text-zinc-100">
-                专辑曲目
+                {t('itemDetailUi.albumTracksTitle')}
                 <span className="ml-2 text-xs font-normal text-zinc-500">
-                  ({albumTracks.length} 首)
+                  {t('itemDetailUi.tracksCountParen', { count: albumTracks.length })}
                 </span>
               </h2>
             </div>
@@ -1443,7 +1478,7 @@ export function ItemDetailPage() {
                 className="inline-flex items-center gap-1.5 rounded-xl border border-amber-500/35 bg-amber-500/15 px-3.5 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/25"
               >
                 <Play className="h-3.5 w-3.5 fill-current" />
-                <span>顺序播放全部</span>
+                <span>{t('itemDetailUi.playAllSequentialBtn')}</span>
               </button>
             )}
           </div>
@@ -1454,7 +1489,7 @@ export function ItemDetailPage() {
             </div>
           ) : albumTracks.length === 0 ? (
             <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-12 text-center text-sm text-zinc-500">
-              当前专辑暂无音轨
+              {t('itemDetailUi.emptyAlbumTracks')}
             </div>
           ) : (
             <div className="overflow-hidden rounded-2xl border border-white/8 bg-white/[0.02]">
@@ -1462,17 +1497,20 @@ export function ItemDetailPage() {
                 <thead className="border-b border-white/8 text-[11px] uppercase tracking-wider text-zinc-500">
                   <tr>
                     <th className="w-14 px-4 py-3 text-center">#</th>
-                    <th className="px-3 py-3">曲目</th>
-                    <th className="hidden px-3 py-3 sm:table-cell">艺术家</th>
-                    <th className="w-24 px-4 py-3 text-right">时长</th>
-                    <th className="w-20 px-4 py-3 text-right">操作</th>
+                    <th className="px-3 py-3">{t('library.tracks')}</th>
+                    <th className="hidden px-3 py-3 sm:table-cell">{t('library.artists')}</th>
+                    <th className="w-24 px-4 py-3 text-right">{t('itemDetailUi.durationLabel')}</th>
+                    <th className="w-20 px-4 py-3 text-right">{t('common.actions')}</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-white/5">
                   {albumTracks.map((track, idx) => {
                     const isActive = currentTrack?.Id === track.Id
                     const artistLabel =
-                      track.Artists?.join(' / ') || track.AlbumArtist || item.AlbumArtist || '未知艺术家'
+                      track.Artists?.join(' / ') ||
+                      track.AlbumArtist ||
+                      item.AlbumArtist ||
+                      t('itemDetailUi.unknownArtist')
                     return (
                       <tr
                         key={track.Id}
@@ -1503,7 +1541,9 @@ export function ItemDetailPage() {
                             <span className="font-medium">{track.Name}</span>
                             {isActive && (
                               <span className="rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-300">
-                                {isAudioPlaying ? '正在播放' : '已暂停'}
+                                {isAudioPlaying
+                                  ? t('itemDetailUi.trackPlaying')
+                                  : t('itemDetailUi.trackPaused')}
                               </span>
                             )}
                           </div>
@@ -1519,7 +1559,11 @@ export function ItemDetailPage() {
                         <td className="px-4 py-3 text-right">
                           <button
                             type="button"
-                            aria-label={isActive && isAudioPlaying ? `暂停 ${track.Name}` : `播放 ${track.Name}`}
+                            aria-label={
+                              isActive && isAudioPlaying
+                                ? t('itemDetailUi.pauseTrackAria', { name: track.Name })
+                                : t('itemDetailUi.playTrackAria', { name: track.Name })
+                            }
                             onClick={(e) => {
                               e.stopPropagation()
                               if (isActive) {
@@ -1556,7 +1600,7 @@ export function ItemDetailPage() {
         <section className="mx-auto max-w-7xl space-y-8 px-4 pt-6 lg:px-8">
           <div className="space-y-4">
             <h2 className="text-lg font-semibold text-zinc-100">
-              专辑
+              {t('library.albums')}
               <span className="ml-2 text-xs font-normal text-zinc-500">
                 ({artistAlbums.length})
               </span>
@@ -1566,7 +1610,7 @@ export function ItemDetailPage() {
                 <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
               </div>
             ) : artistAlbums.length === 0 ? (
-              <p className="text-sm text-zinc-500">暂无收录专辑</p>
+              <p className="text-sm text-zinc-500">{t('itemDetailUi.emptyArtistAlbums')}</p>
             ) : (
               <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
                 {artistAlbums.map((album) => (
@@ -1578,7 +1622,7 @@ export function ItemDetailPage() {
 
           <div className="space-y-4">
             <h2 className="text-lg font-semibold text-zinc-100">
-              热门曲目
+              {t('itemDetailUi.popularTracksTitle')}
               <span className="ml-2 text-xs font-normal text-zinc-500">
                 ({artistTracks.length})
               </span>
@@ -1588,7 +1632,7 @@ export function ItemDetailPage() {
                 <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
               </div>
             ) : artistTracks.length === 0 ? (
-              <p className="text-sm text-zinc-500">暂无收录曲目</p>
+              <p className="text-sm text-zinc-500">{t('itemDetailUi.emptyArtistTracks')}</p>
             ) : (
               <div className="divide-y divide-white/5 overflow-hidden rounded-2xl border border-white/8 bg-white/[0.02]">
                 {artistTracks.map((track, idx) => {
@@ -1622,7 +1666,11 @@ export function ItemDetailPage() {
                         </span>
                         <button
                           type="button"
-                          aria-label={isActive && isAudioPlaying ? `暂停 ${track.Name}` : `播放 ${track.Name}`}
+                          aria-label={
+                            isActive && isAudioPlaying
+                              ? t('itemDetailUi.pauseTrackAria', { name: track.Name })
+                              : t('itemDetailUi.playTrackAria', { name: track.Name })
+                          }
                           onClick={(e) => {
                             e.stopPropagation()
                             if (isActive) toggleAudioPlay()
@@ -1699,7 +1747,10 @@ export function ItemDetailPage() {
                   <div className="flex flex-wrap items-center gap-2">
                     <h2 className="text-base font-semibold text-white">{selectedSeason.Name}</h2>
                     <span className="rounded-full bg-white/10 px-2 py-0.5 text-[11px] text-zinc-300">
-                      共 {episodes.length} 集 · 已看 {seasonPlayedCount} 集
+                      {t('itemDetailUi.seasonProgressBadge', {
+                        total: episodes.length,
+                        played: seasonPlayedCount,
+                      })}
                     </span>
                   </div>
                   {selectedSeason.Overview && (
@@ -1726,7 +1777,11 @@ export function ItemDetailPage() {
                   ) : (
                     <CheckCircle2 className="h-3.5 w-3.5" />
                   )}
-                  <span>{seasonAllPlayed ? '标记本季未看' : '标记本季已看'}</span>
+                  <span>
+                    {seasonAllPlayed
+                      ? t('itemDetailUi.markSeasonUnplayedBtn')
+                      : t('itemDetailUi.markSeasonPlayedBtn')}
+                  </span>
                 </button>
               )}
             </div>
@@ -1774,7 +1829,7 @@ export function ItemDetailPage() {
                       )}
                       {epPlayed && (
                         <div
-                          title="已观看"
+                          title={t('detail.watched')}
                           className="absolute right-1.5 top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-emerald-500 text-zinc-950 shadow-md"
                         >
                           <Check className="h-3 w-3 stroke-[3]" />
@@ -1819,8 +1874,8 @@ export function ItemDetailPage() {
                         <Link
                           to={`/item/${ep.Id}`}
                           onClick={(e) => e.stopPropagation()}
-                          title="查看本集详情"
-                          aria-label={`查看 ${ep.Name} 详情`}
+                          title={t('itemDetailUi.viewEpisodeDetailTitle')}
+                          aria-label={t('itemDetailUi.viewEpisodeDetailAria', { name: ep.Name })}
                           className="inline-flex items-center gap-1 rounded-lg bg-white/[0.04] px-2 py-1 text-[11px] text-zinc-300 transition-colors hover:bg-amber-500/15 hover:text-amber-200"
                         >
                           <Info className="h-3 w-3" />
@@ -1832,8 +1887,16 @@ export function ItemDetailPage() {
                             e.stopPropagation()
                             episodePlayedMutation.mutate(ep)
                           }}
-                          title={epPlayed ? '标记为未看' : '标记为已看'}
-                          aria-label={epPlayed ? `取消 ${ep.Name} 已看` : `标记 ${ep.Name} 已看`}
+                          title={
+                            epPlayed
+                              ? t('itemDetailUi.markAsUnplayedTitle')
+                              : t('itemDetailUi.markAsPlayedTitle')
+                          }
+                          aria-label={
+                            epPlayed
+                              ? t('itemDetailUi.unmarkEpisodePlayedAria', { name: ep.Name })
+                              : t('itemDetailUi.markEpisodePlayedAria', { name: ep.Name })
+                          }
                           className={`inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] transition-colors ${
                             epPlayed
                               ? 'bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
@@ -1841,7 +1904,11 @@ export function ItemDetailPage() {
                           }`}
                         >
                           <Check className="h-3 w-3" />
-                          <span>{epPlayed ? '已看' : '标已看'}</span>
+                          <span>
+                            {epPlayed
+                              ? t('itemDetailUi.epPlayedShort')
+                              : t('itemDetailUi.epMarkPlayedShort')}
+                          </span>
                         </button>
                         <button
                           type="button"
@@ -1849,8 +1916,14 @@ export function ItemDetailPage() {
                             e.stopPropagation()
                             episodeFavMutation.mutate(ep)
                           }}
-                          title={epFav ? '取消收藏' : '收藏本集'}
-                          aria-label={epFav ? `取消收藏 ${ep.Name}` : `收藏 ${ep.Name}`}
+                          title={
+                            epFav ? t('home.removeFavorite') : t('itemDetailUi.favEpisodeTitle')
+                          }
+                          aria-label={
+                            epFav
+                              ? t('itemDetailUi.unfavEpisodeAria', { name: ep.Name })
+                              : t('itemDetailUi.favEpisodeAria', { name: ep.Name })
+                          }
                           className={`rounded-lg p-1.5 transition-colors ${
                             epFav
                               ? 'bg-rose-500/15 text-rose-400 hover:bg-rose-500/25'
@@ -1887,12 +1960,14 @@ export function ItemDetailPage() {
               >
                 {showAllCast ? (
                   <>
-                    <span>收起演职员</span>
+                    <span>{t('itemDetailUi.collapseCastBtn')}</span>
                     <ChevronUp className="h-3.5 w-3.5" />
                   </>
                 ) : (
                   <>
-                    <span>展开全部演职员 ({item.People.length})</span>
+                    <span>
+                      {t('itemDetailUi.expandAllCastBtn', { count: item.People.length })}
+                    </span>
                     <ChevronDown className="h-3.5 w-3.5" />
                   </>
                 )}
@@ -1964,6 +2039,7 @@ export function ItemDetailPage() {
               const chapterThumbUrl = chapter.ImageTag
                 ? getChapterImageUrl(item.Id, idx, chapter.ImageTag)
                 : null
+              const chapterFallbackTitle = t('itemDetailUi.chapterNumberTitle', { index: idx + 1 })
               return (
                 <button
                   key={`${chapter.StartPositionTicks}-${idx}`}
@@ -1978,7 +2054,7 @@ export function ItemDetailPage() {
                       </div>
                       <img
                         src={chapterThumbUrl}
-                        alt={chapter.Name || `章节 ${idx + 1}`}
+                        alt={chapter.Name || chapterFallbackTitle}
                         loading="lazy"
                         onError={(e) => {
                           e.currentTarget.style.display = 'none'
@@ -1989,7 +2065,7 @@ export function ItemDetailPage() {
                   )}
                   <div className="flex flex-1 flex-col justify-between p-3.5">
                     <span className="line-clamp-2 text-xs font-semibold text-zinc-100 group-hover:text-amber-300">
-                      {chapter.Name || `章节 ${idx + 1}`}
+                      {chapter.Name || chapterFallbackTitle}
                     </span>
                     <span className="mt-2 inline-flex items-center gap-1 font-mono text-[11px] text-zinc-400">
                       <Play className="h-3 w-3 text-amber-400" />
@@ -2009,7 +2085,7 @@ export function ItemDetailPage() {
           <div className="flex items-center gap-2">
             <Film className="h-4 w-4 text-amber-400" />
             <h2 className="text-lg font-semibold text-zinc-100">
-              {locale === 'zh-CN' ? '花絮与特别收录' : t('detail.specialFeatures')}
+              {t('itemDetailUi.specialFeaturesTitle')}
               <span className="ml-2 text-xs font-normal text-zinc-500">
                 ({specialFeatures.length})
               </span>
@@ -2121,7 +2197,7 @@ export function ItemDetailPage() {
                         ) : (
                           <>
                             <Copy className="h-3 w-3" />
-                            <span>复制路径</span>
+                            <span>{t('itemDetailUi.copyPathBtn')}</span>
                           </>
                         )}
                       </button>
@@ -2148,7 +2224,9 @@ export function ItemDetailPage() {
                       </span>
                     </div>
                     <div className="rounded-xl border border-white/8 bg-white/[0.02] px-3.5 py-2.5">
-                      <span className="block text-[11px] text-zinc-500">时长</span>
+                      <span className="block text-[11px] text-zinc-500">
+                        {t('itemDetailUi.durationLabel')}
+                      </span>
                       <span className="mt-0.5 block font-mono text-xs font-semibold text-zinc-100">
                         {activeSource.RunTimeTicks || item.RunTimeTicks
                           ? formatTicks(activeSource.RunTimeTicks || item.RunTimeTicks)
@@ -2164,22 +2242,22 @@ export function ItemDetailPage() {
                     <table className="w-full text-left text-xs">
                       <thead className="border-b border-white/8 bg-white/[0.02] text-[11px] text-zinc-500">
                         <tr>
-                          <th className="px-3.5 py-2.5">轨道类型</th>
-                          <th className="px-3.5 py-2.5">编码</th>
-                          <th className="px-3.5 py-2.5">规格 / 语言</th>
-                          <th className="px-3.5 py-2.5">码率</th>
-                          <th className="px-3.5 py-2.5">标记</th>
+                          <th className="px-3.5 py-2.5">{t('itemDetailUi.streamColType')}</th>
+                          <th className="px-3.5 py-2.5">{t('itemDetailUi.streamColCodec')}</th>
+                          <th className="px-3.5 py-2.5">{t('itemDetailUi.streamColSpecLang')}</th>
+                          <th className="px-3.5 py-2.5">{t('itemDetailUi.streamColBitrate')}</th>
+                          <th className="px-3.5 py-2.5">{t('itemDetailUi.streamColFlags')}</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-white/5 text-zinc-200">
                         {streams.map((s) => {
                           const typeLabel =
                             s.Type === 'Video'
-                              ? '视频'
+                              ? t('itemDetailUi.streamTypeVideo')
                               : s.Type === 'Audio'
-                                ? '音频'
+                                ? t('itemDetailUi.streamTypeAudio')
                                 : s.Type === 'Subtitle'
-                                  ? '字幕'
+                                  ? t('detail.subtitleTrack')
                                   : s.Type
                           const specParts: string[] = []
                           if (s.Type === 'Video') {
@@ -2217,22 +2295,22 @@ export function ItemDetailPage() {
                                 <div className="flex flex-wrap items-center gap-1">
                                   {s.IsDefault && (
                                     <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300">
-                                      默认
+                                      {t('itemDetailUi.flagDefault')}
                                     </span>
                                   )}
                                   {s.IsForced && (
                                     <span className="rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-medium text-sky-300">
-                                      强制
+                                      {t('itemDetailUi.flagForced')}
                                     </span>
                                   )}
                                   {s.IsExternal && (
                                     <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300">
-                                      外挂
+                                      {t('itemDetailUi.flagExternal')}
                                     </span>
                                   )}
                                   {s.Type === 'Subtitle' && !s.IsExternal && (
                                     <span className="rounded bg-white/8 px-1.5 py-0.5 text-[10px] text-zinc-400">
-                                      内封
+                                      {t('itemDetailUi.flagEmbedded')}
                                     </span>
                                   )}
                                 </div>
@@ -2272,7 +2350,7 @@ export function ItemDetailPage() {
         onEnded={() => setThemeSongPlaying(false)}
         onError={() => {
           stopThemeSong()
-          showToast('error', '主题曲加载失败')
+          showToast('error', t('itemDetailUi.themeSongLoadFailed'))
         }}
       />
 
@@ -2291,7 +2369,7 @@ export function ItemDetailPage() {
         <AdminModal
           open={subModalOpen}
           title={t('detail.manageSubtitles')}
-          subtitle={`管理「${item.Name}」的内封与外挂字幕轨道`}
+          subtitle={t('itemDetailUi.manageSubtitlesSubtitle', { name: item.Name })}
           maxWidthClass="max-w-lg"
           onClose={() => setSubModalOpen(false)}
         >
@@ -2303,11 +2381,11 @@ export function ItemDetailPage() {
             {/* 当前字幕轨道列表 */}
             <div className="space-y-2">
               <h3 className="text-xs font-semibold text-zinc-300">
-                当前字幕轨道 ({subtitleStreams.length})
+                {t('itemDetailUi.currentSubtitleTracksCount', { count: subtitleStreams.length })}
               </h3>
               {subtitleStreams.length === 0 ? (
                 <p className="rounded-xl border border-dashed border-white/10 py-5 text-center text-xs text-zinc-500">
-                  暂无字幕轨道，可在下方上传外挂字幕
+                  {t('itemDetailUi.emptySubtitleTracksHint')}
                 </p>
               ) : (
                 <div className="max-h-56 space-y-1.5 overflow-y-auto">
@@ -2330,16 +2408,19 @@ export function ItemDetailPage() {
                                   : 'bg-white/10 text-zinc-400'
                               }`}
                             >
-                              {s.IsExternal ? '外挂' : '内封'}
+                              {s.IsExternal
+                                ? t('itemDetailUi.flagExternal')
+                                : t('itemDetailUi.flagEmbedded')}
                             </span>
                             {s.IsForced && (
                               <span className="shrink-0 rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-medium text-sky-300">
-                                强制
+                                {t('itemDetailUi.flagForced')}
                               </span>
                             )}
                           </div>
                           <p className="mt-0.5 truncate text-[11px] text-zinc-500">
-                            轨道 #{s.Index} · {(s.Codec || '-').toUpperCase()}
+                            {t('itemDetailUi.trackIndexPrefix', { index: s.Index })} ·{' '}
+                            {(s.Codec || '-').toUpperCase()}
                             {s.Language ? ` · ${s.Language}` : ''}
                           </p>
                         </div>
@@ -2351,7 +2432,7 @@ export function ItemDetailPage() {
                             className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-red-500/30 bg-red-500/10 px-2.5 py-1 text-[11px] font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
                           >
                             <Trash2 className="h-3 w-3" />
-                            <span>删除</span>
+                            <span>{t('common.delete')}</span>
                           </button>
                         )}
                       </div>
@@ -2369,17 +2450,19 @@ export function ItemDetailPage() {
               }}
               className="space-y-3 border-t border-white/10 pt-4"
             >
-              <h3 className="text-xs font-semibold text-zinc-300">上传外挂字幕</h3>
+              <h3 className="text-xs font-semibold text-zinc-300">
+                {t('itemDetailUi.uploadExternalSubtitleTitle')}
+              </h3>
 
               <label className="block space-y-1.5">
                 <span className="block text-[11px] text-zinc-400">
-                  选择字幕文件 (.srt, .vtt, .ass, .ssa, .sub, .sup，≤ 20 MB)
+                  {t('itemDetailUi.selectSubtitleFileHint')}
                 </span>
                 <input
                   ref={subFileInputRef}
                   type="file"
                   accept=".srt,.vtt,.ass,.ssa,.sub,.sup"
-                  aria-label="选择字幕文件"
+                  aria-label={t('itemDetailUi.selectSubtitleFileAria')}
                   onChange={(e) => {
                     const picked = e.target.files?.[0] || null
                     if (picked) {
@@ -2400,14 +2483,16 @@ export function ItemDetailPage() {
 
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <label className="block space-y-1.5">
-                  <span className="block text-[11px] text-zinc-400">字幕语言</span>
+                  <span className="block text-[11px] text-zinc-400">
+                    {t('itemDetailUi.subLanguageLabel')}
+                  </span>
                   <select
-                    aria-label="字幕语言"
+                    aria-label={t('itemDetailUi.subLanguageLabel')}
                     value={subLang}
                     onChange={(e) => setSubLang(e.target.value)}
                     className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
                   >
-                    <option value="chi">中文 (chi)</option>
+                    <option value="chi">{t('itemDetailUi.subLangChi')}</option>
                     <option value="chs">简体中文 (chs)</option>
                     <option value="cht">繁體中文 (cht)</option>
                     <option value="eng">English (eng)</option>
@@ -2422,7 +2507,7 @@ export function ItemDetailPage() {
                     onChange={(e) => setSubForced(e.target.checked)}
                     className="h-3.5 w-3.5 accent-amber-500"
                   />
-                  <span>强制字幕 (Forced)</span>
+                  <span>{t('itemDetailUi.forcedSubtitleCheckbox')}</span>
                 </label>
               </div>
 
@@ -2432,7 +2517,7 @@ export function ItemDetailPage() {
                   onClick={() => setSubModalOpen(false)}
                   className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10"
                 >
-                  关闭
+                  {t('common.close')}
                 </button>
                 <button
                   type="submit"
@@ -2444,7 +2529,7 @@ export function ItemDetailPage() {
                   ) : (
                     <Upload className="h-3.5 w-3.5" />
                   )}
-                  <span>上传字幕</span>
+                  <span>{t('itemDetailUi.uploadSubtitleBtn')}</span>
                 </button>
               </div>
             </form>
@@ -2493,28 +2578,78 @@ export function ItemDetailPage() {
       {canDeleteItem && (
         <AdminModal
           open={deleteConfirmOpen}
-          title="确认删除媒体"
-          subtitle="此操作不可撤销"
-          maxWidthClass="max-w-md"
+          title={t('admin.metadata.deleteModalTitle')}
+          subtitle={t('itemDetailUi.deletePhysicalModalSubtitle')}
+          maxWidthClass="max-w-lg"
           onClose={() => setDeleteConfirmOpen(false)}
         >
-          <div className="space-y-5">
-            <div className="flex items-start gap-3 rounded-xl border border-red-500/25 bg-red-500/10 p-4 text-sm text-red-200">
+          <div className="space-y-4">
+            <div
+              role="alert"
+              className="flex items-start gap-3 rounded-xl border border-red-500/40 bg-red-950/60 p-4 text-sm text-red-100"
+            >
               <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-red-400" />
-              <div>
-                <p className="font-semibold">确定要删除「{item.Name}」吗？</p>
-                <p className="mt-1 text-xs leading-relaxed text-red-200/80">
-                  将从媒体库索引中移除该条目的元数据、图片与关联记录，删除后将返回上一级媒体库。
+              <div className="space-y-1.5">
+                <p className="font-semibold text-red-200">
+                  {t('itemDetailUi.deletePhysicalWarnTitle', { name: item.Name })}
                 </p>
+                <p className="text-xs leading-relaxed text-red-200/90">
+                  {t('itemDetailUi.deletePhysicalWarnBody')}
+                </p>
+                {(item.Type === 'Series' || item.Type === 'Season') && (
+                  <p className="text-xs font-bold leading-relaxed text-red-300">
+                    {t('itemDetailUi.deleteSeriesRecursiveWarn')}
+                  </p>
+                )}
               </div>
             </div>
+
+            <div
+              data-testid="delete-info-paths-box"
+              className="rounded-xl border border-white/10 bg-black/40 p-3.5 text-xs"
+            >
+              {deleteInfoQuery.isLoading ? (
+                <div className="flex items-center gap-2 text-zinc-400">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-400" />
+                  <span>{t('itemDetailUi.deletePathsLoading')}</span>
+                </div>
+              ) : (deleteInfoQuery.data?.Paths?.length ?? 0) > 0 ? (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between text-zinc-300">
+                    <span className="font-medium">{t('itemDetailUi.deletePathsListTitle')}</span>
+                    <span className="rounded bg-red-500/20 px-2 py-0.5 font-mono text-[11px] font-semibold text-red-300">
+                      {t('itemDetailUi.deletePathsCountBadge', {
+                        count: deleteInfoQuery.data!.Paths!.length,
+                      })}
+                    </span>
+                  </div>
+                  <ul
+                    data-testid="delete-info-paths-list"
+                    className="max-h-44 space-y-1 overflow-y-auto rounded-lg border border-white/8 bg-zinc-950/90 p-2.5 font-mono text-[11px] text-zinc-300"
+                  >
+                    {deleteInfoQuery.data!.Paths!.map((p, idx) => (
+                      <li key={`${idx}-${p}`} className="break-all leading-relaxed">
+                        {p}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : (
+                <p className="leading-relaxed text-amber-200/90">
+                  {item.Path
+                    ? t('itemDetailUi.deletePathsFallbackWithItemPath', { path: item.Path })
+                    : t('itemDetailUi.deletePathsFallbackNoPath')}
+                </p>
+              )}
+            </div>
+
             <div className="flex items-center justify-end gap-3">
               <button
                 type="button"
                 onClick={() => setDeleteConfirmOpen(false)}
                 className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-sm font-medium text-zinc-300 hover:bg-white/10"
               >
-                取消
+                {t('common.cancel')}
               </button>
               <button
                 type="button"
@@ -2523,7 +2658,7 @@ export function ItemDetailPage() {
                 className="inline-flex items-center gap-2 rounded-xl bg-red-600 px-5 py-2 text-sm font-semibold text-white transition-colors hover:bg-red-500 disabled:opacity-60"
               >
                 {deleteItemMutation.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
-                <span>确认删除</span>
+                <span>{t('admin.users.confirmDelete')}</span>
               </button>
             </div>
           </div>

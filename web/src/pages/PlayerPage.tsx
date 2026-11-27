@@ -167,13 +167,21 @@ interface QualityPreset {
   id: QualityPresetId
   label: string
   shortLabel: string
+  labelKey?: string
+  shortLabelKey?: string
   maxBitrate?: number
   maxWidth?: number
   maxHeight?: number
 }
 
 const QUALITY_PRESETS: QualityPreset[] = [
-  { id: 'auto', label: '原画直连', shortLabel: '原画' },
+  {
+    id: 'auto',
+    label: 'Auto',
+    shortLabel: 'Auto',
+    labelKey: 'player.qualityAuto',
+    shortLabelKey: 'playerUi.qualityAutoShort',
+  },
   {
     id: '1080p8',
     label: '1080p · 8 Mbps',
@@ -200,18 +208,18 @@ const QUALITY_PRESETS: QualityPreset[] = [
   },
 ]
 
-const KEYBOARD_SHORTCUTS: Array<{ keys: string; desc: string }> = [
-  { keys: 'Space', desc: '播放 / 暂停' },
-  { keys: '← / →', desc: '快退 / 快进 10 秒' },
-  { keys: '↑ / ↓', desc: '音量增 / 减 10%' },
-  { keys: 'M', desc: '静音 / 取消静音' },
-  { keys: 'F', desc: '全屏 / 退出全屏' },
-  { keys: 'P', desc: '画中画 (PiP)' },
-  { keys: 'C', desc: '切换字幕' },
-  { keys: 'A', desc: '切换音轨' },
-  { keys: 'I', desc: '播放统计信息' },
-  { keys: '?', desc: '显示 / 隐藏快捷键说明' },
-  { keys: 'Esc', desc: '关闭面板 / 退出播放' },
+const KEYBOARD_SHORTCUTS: Array<{ keys: string; descKey: string }> = [
+  { keys: 'Space', descKey: 'playerUi.scPlayPause' },
+  { keys: '← / →', descKey: 'playerUi.scSeek10' },
+  { keys: '↑ / ↓', descKey: 'playerUi.scVolume10' },
+  { keys: 'M', descKey: 'playerUi.scMute' },
+  { keys: 'F', descKey: 'playerUi.scFullscreen' },
+  { keys: 'P', descKey: 'playerUi.scPip' },
+  { keys: 'C', descKey: 'playerUi.scCycleSubtitle' },
+  { keys: 'A', descKey: 'playerUi.scCycleAudio' },
+  { keys: 'I', descKey: 'player.stats' },
+  { keys: '?', descKey: 'playerUi.scToggleShortcuts' },
+  { keys: 'Esc', descKey: 'playerUi.scEsc' },
 ]
 
 function isStrmSource(source?: MediaSourceInfo): boolean {
@@ -243,6 +251,8 @@ export function PlayerPage() {
   const navigate = useNavigate()
   const { auth } = useAuth()
   const { locale, t } = useI18n()
+  const tRef = useRef(t)
+  tRef.current = t
   const { subscribePlaystate } = useWebSocket()
   const audioPlayer = useAudioPlayer()
   const userId = auth!.userId
@@ -292,12 +302,15 @@ export function PlayerPage() {
   const initializedSubSourceIdRef = useRef<string | null>(null)
   const subtitleExplicitlyOffRef = useRef<boolean>(rawInitialSubtitle === 'off')
   const stopReportedRef = useRef<boolean>(false)
+  const lastVideoTimeSecRef = useRef(0)
   const lastSeekReportRef = useRef(0)
   const resumeSecRef = useRef<number | null>(null)
   const hlsRecoveryCountRef = useRef(0)
   const searchParamsRef = useRef(searchParams)
   searchParamsRef.current = searchParams
   const prevIdRef = useRef<string | undefined>(id)
+  const renderedItemIdRef = useRef<string | undefined>(id)
+  renderedItemIdRef.current = id
 
   const [bifArchive, setBifArchive] = useState<BifArchive | null>(null)
   const [hoverSeek, setHoverSeek] = useState<{ timeSec: number; pct: number } | null>(null)
@@ -386,6 +399,7 @@ export function PlayerPage() {
     initializedAudioSourceIdRef.current = null
     initializedSubSourceIdRef.current = null
     stopReportedRef.current = false
+    lastVideoTimeSecRef.current = 0
     resumeSecRef.current = null
     hlsRecoveryCountRef.current = 0
     setNextUpCountdown(null)
@@ -892,7 +906,7 @@ export function PlayerPage() {
         isStrm,
         requiresRemux,
         withinWasmThreshold,
-        skipReason: '已切换非默认内封音轨，自动使用 HLS 音轨流',
+        skipReason: tRef.current('playerUi.skipNonDefaultAudioHls'),
       }
     }
 
@@ -935,11 +949,14 @@ export function PlayerPage() {
     let skipReason: string | null = null
     if (requiresRemux) {
       if (!preferWasmRemux) {
-        skipReason = '已关闭客户端解复用开关'
+        skipReason = tRef.current('playerUi.skipWasmToggleOff')
       } else if (!canUseWasmRemux()) {
-        skipReason = '当前浏览器不支持客户端流式解复用 / WebAssembly'
+        skipReason = tRef.current('playerUi.skipBrowserNoWasm')
       } else if (!withinWasmThreshold && sizeBytes !== undefined) {
-        skipReason = `文件体积 ${formatBytes(sizeBytes)} 超过 WASM 阈值 (${formatBytes(DEFAULT_WASM_MAX_BYTES)}) 且音视频编码不支持 MSE 直通`
+        skipReason = tRef.current('playerUi.skipSizeExceedsWasm', {
+          size: formatBytes(sizeBytes),
+          max: formatBytes(DEFAULT_WASM_MAX_BYTES),
+        })
       }
     }
 
@@ -1062,11 +1079,11 @@ export function PlayerPage() {
           nativeAudioTracks[i].enabled = i === targetOrd
         }
       }
-      video.play().catch(() => {
+      Promise.resolve(video.play()).catch(() => {
         // 浏览器自动播放策略阻止时保持暂停状态让用户点击
       })
       if (hybridAudio && streamPlan.strategy === 'stream-mkv' && streamPlan.videoOnly && hybridAudio.src) {
-        hybridAudio.play().catch(() => {
+        Promise.resolve(hybridAudio.play()).catch(() => {
           // 随主视频 onPlay 事件再次触发播放
         })
       }
@@ -1127,13 +1144,13 @@ export function PlayerPage() {
             }
           }
           setBuffering(false)
-          setPlayerError(`HLS 播放错误: ${data.details}`)
+          setPlayerError(tRef.current('playerUi.errHlsPlayback', { details: data.details }))
         })
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = url
         video.addEventListener('loadedmetadata', startPlayback, { once: true })
       } else {
-        setPlayerError('当前浏览器不支持 HLS 流播放')
+        setPlayerError(tRef.current('playerUi.errBrowserNoHls'))
       }
     }
 
@@ -1143,7 +1160,7 @@ export function PlayerPage() {
       setWasmProgress({
         stage: 'fetch',
         percent: 0,
-        detail: '正在准备客户端 WASM 零重编码转封装...',
+        detail: tRef.current('playerUi.wasmPreparingDetail'),
       })
 
       const remuxer = new WasmRemuxer()
@@ -1164,12 +1181,12 @@ export function PlayerPage() {
               detail:
                 detail ||
                 (stage === 'fetch'
-                  ? `正在拉取媒体流 (${percent}%)...`
+                  ? tRef.current('playerUi.wasmFetchingPercent', { percent })
                   : stage === 'init'
-                    ? '正在初始化 FFmpeg WASM 引擎...'
+                    ? tRef.current('playerUi.wasmInitEngine')
                     : stage === 'remux'
-                      ? `视频零重编码转封装中 (${percent}%)...`
-                      : '转封装完成'),
+                      ? tRef.current('playerUi.wasmRemuxingPercent', { percent })
+                      : tRef.current('playerUi.wasmDone')),
             })
           },
         })
@@ -1190,14 +1207,16 @@ export function PlayerPage() {
               ? err.message
               : err instanceof Error
                 ? err.message
-                : '客户端 WASM 转封装失败'
+                : tRef.current('playerUi.errWasmRemuxFailed')
           // 清理 WASM 内存后无感回退服务端 HLS master.m3u8，并同步锁定 forceServerHls 防止重复重试 WASM
           remuxer.dispose()
           if (wasmRemuxerRef.current === remuxer) {
             wasmRemuxerRef.current = null
           }
           captureResumePosition()
-          setWasmFallbackNotice(`${reasonMsg}，已自动切换服务端 HLS`)
+          setWasmFallbackNotice(
+            tRef.current('playerUi.fallbackToServerHlsReason', { reason: reasonMsg }),
+          )
           setForceServerHls(true)
         })
     }
@@ -1221,7 +1240,7 @@ export function PlayerPage() {
             ? err.message
             : typeof err === 'string'
               ? err
-              : '流式 MKV 解复用异常'
+              : tRef.current('playerUi.errStreamMkvDemux')
       const isFetchOrRedirectFailure =
         err instanceof StreamMkvFallbackError && err.reason === 'fetch_failed'
       if (
@@ -1232,10 +1251,14 @@ export function PlayerPage() {
         streamPlan.withinWasmThreshold &&
         canUseWasmRemux({ enabled: preferWasmRemux })
       ) {
-        setWasmFallbackNotice(`${reasonMsg}，已自动回退客户端 WASM 转封装`)
+        setWasmFallbackNotice(
+          tRef.current('playerUi.fallbackToWasmRemuxReason', { reason: reasonMsg }),
+        )
         mountWasmRemux()
       } else {
-        setWasmFallbackNotice(`${reasonMsg}，已自动切换服务端 HLS`)
+        setWasmFallbackNotice(
+          tRef.current('playerUi.fallbackToServerHlsReason', { reason: reasonMsg }),
+        )
         setForceServerHls(true)
       }
     }
@@ -1274,6 +1297,11 @@ export function PlayerPage() {
           userId,
         })
         hybridAudio.load()
+        const initRate = playbackRateRef.current
+        if (Number.isFinite(initRate) && initRate > 0) {
+          hybridAudio.defaultPlaybackRate = initRate
+          hybridAudio.playbackRate = initRate
+        }
       }
 
       void streamMkv
@@ -1480,7 +1508,22 @@ export function PlayerPage() {
               ? await api.getMediaAttachments(id, activeSource.Id)
               : []
           if (cancelled || !videoRef.current || !assCanvasRef.current) return
-          const fontUrls = attachments.map((att) => {
+          const validFontAttachments = attachments.filter((att) => {
+            const rawUrl = (att.Url || '').trim()
+            if (!rawUrl) return false
+            const cleanUrlPath = rawUrl.split(/[?#]/)[0]
+            const lastSeg = cleanUrlPath.slice(cleanUrlPath.lastIndexOf('/') + 1)
+            const urlHasExt = lastSeg.includes('.')
+            const validExtRe = /\.(ttf|otf|ttc|woff2?)$/i
+            const fileName = (att.FileName || '').trim()
+            if (fileName) {
+              if (!validExtRe.test(fileName)) return false
+              if (urlHasExt && !validExtRe.test(lastSeg)) return false
+              return true
+            }
+            return validExtRe.test(lastSeg)
+          })
+          const fontUrls = validFontAttachments.map((att) => {
             const rawPath =
               att.Url.startsWith('/emby/') ||
               /^https?:\/\//i.test(att.Url) ||
@@ -1508,7 +1551,9 @@ export function PlayerPage() {
           }
         } else {
           const res = await fetch(subUrl, { signal: controller.signal })
-          if (!res.ok) throw new Error(`加载文本字幕失败 (${res.status})`)
+          if (!res.ok) {
+            throw new Error(tRef.current('playerUi.errLoadTextSubtitleStatus', { status: res.status }))
+          }
           const raw = await res.text()
           if (!cancelled) {
             setTextCues(parseVttOrSrt(raw))
@@ -1516,7 +1561,9 @@ export function PlayerPage() {
         }
       } catch (err) {
         if (!cancelled && !controller.signal.aborted) {
-          setSubtitleError(err instanceof Error ? err.message : '字幕加载失败')
+          setSubtitleError(
+            err instanceof Error ? err.message : tRef.current('playerUi.errSubtitleLoadFailed'),
+          )
         }
       }
     }
@@ -1572,8 +1619,26 @@ export function PlayerPage() {
 
   // 上报播放状态 (/emby/Sessions/Playing, Progress, Stopped)
   const reportState = useCallback(
-    (type: 'start' | 'progress' | 'stop', eventName?: string) => {
-      if (!id || !videoRef.current) return
+    (
+      type: 'start' | 'progress' | 'stop',
+      eventName?: string,
+      sessionOverride?: {
+        itemId: string
+        mediaSourceId?: string
+        playSessionId?: string
+        initialStartTicks: number
+        audioIndex?: number
+        subtitleIndex?: number
+        subtitleExplicitlyOff?: boolean
+      },
+    ) => {
+      const targetItemId = sessionOverride?.itemId ?? id
+      const videoEl = videoRef.current
+      if (!targetItemId || (!videoEl && type !== 'stop')) return
+      if (videoEl && Number.isFinite(videoEl.currentTime) && videoEl.currentTime >= 0) {
+        lastVideoTimeSecRef.current = videoEl.currentTime
+      }
+      const curSec = videoEl ? videoEl.currentTime : lastVideoTimeSecRef.current
       const {
         audioIndex: latestAudioIndex,
         subtitleIndex: latestSubtitleIndex,
@@ -1582,25 +1647,37 @@ export function PlayerPage() {
         playSessionId: latestPlaySessionId,
         effectiveStartTicks: latestStartTicks,
       } = playbackMetaRef.current
-      let posTicks = Math.floor(videoRef.current.currentTime * 10_000_000)
-      if (
-        type === 'stop' &&
-        !initialSeekDoneRef.current &&
-        latestStartTicks > 0 &&
-        videoRef.current.currentTime < 1
-      ) {
-        posTicks = latestStartTicks
-      }
-      const reportedSubIndex =
-        latestSubtitleIndex !== undefined
+
+      const resolvedMediaSourceId = sessionOverride
+        ? sessionOverride.mediaSourceId
+        : latestMediaSourceId
+      const resolvedPlaySessionId = sessionOverride
+        ? sessionOverride.playSessionId
+        : latestPlaySessionId
+      const resolvedStartTicks = sessionOverride
+        ? sessionOverride.initialStartTicks
+        : latestStartTicks
+      const resolvedAudioIndex = sessionOverride ? sessionOverride.audioIndex : latestAudioIndex
+      const resolvedSubIndex = sessionOverride
+        ? sessionOverride.subtitleIndex !== undefined
+          ? sessionOverride.subtitleIndex
+          : sessionOverride.subtitleExplicitlyOff
+            ? -1
+            : undefined
+        : latestSubtitleIndex !== undefined
           ? latestSubtitleIndex
           : subtitleExplicitlyOffRef.current
             ? -1
             : undefined
+
+      let posTicks = Math.floor(curSec * 10_000_000)
+      if (!initialSeekDoneRef.current && resolvedStartTicks > 0 && curSec < 1) {
+        posTicks = resolvedStartTicks
+      }
       const base = {
-        ItemId: id,
-        MediaSourceId: latestMediaSourceId,
-        PlaySessionId: latestPlaySessionId,
+        ItemId: targetItemId,
+        MediaSourceId: resolvedMediaSourceId,
+        PlaySessionId: resolvedPlaySessionId,
         PositionTicks: posTicks,
       }
       if (type === 'stop') {
@@ -1608,8 +1685,8 @@ export function PlayerPage() {
         stopReportedRef.current = true
         void api.reportStopped({
           ...base,
-          AudioStreamIndex: latestAudioIndex,
-          SubtitleStreamIndex: reportedSubIndex,
+          AudioStreamIndex: resolvedAudioIndex,
+          SubtitleStreamIndex: resolvedSubIndex,
         })
         return
       }
@@ -1618,11 +1695,11 @@ export function PlayerPage() {
       }
       const full = {
         ...base,
-        IsPaused: videoRef.current.paused,
-        IsMuted: videoRef.current.muted,
-        VolumeLevel: Math.round(videoRef.current.volume * 100),
-        AudioStreamIndex: latestAudioIndex,
-        SubtitleStreamIndex: reportedSubIndex,
+        IsPaused: videoEl ? videoEl.paused : true,
+        IsMuted: videoEl ? videoEl.muted : mutedRef.current,
+        VolumeLevel: Math.round((videoEl ? videoEl.volume : volumeRef.current) * 100),
+        AudioStreamIndex: resolvedAudioIndex,
+        SubtitleStreamIndex: resolvedSubIndex,
         PlayMethod:
           latestPlayMethod === 'Server HLS'
             ? 'Transcode'
@@ -1642,46 +1719,88 @@ export function PlayerPage() {
   const hasPlaybackInfo = Boolean(playbackInfo)
 
   useEffect(() => {
-    if (!hasPlaybackInfo) return
-    reportState('start')
+    if (!hasPlaybackInfo || !id) return
+    const sessionSnapshot = {
+      itemId: id,
+      mediaSourceId: playbackMetaRef.current.mediaSourceId,
+      playSessionId: playbackMetaRef.current.playSessionId,
+      initialStartTicks: playbackMetaRef.current.effectiveStartTicks,
+      audioIndex: playbackMetaRef.current.audioIndex,
+      subtitleIndex: playbackMetaRef.current.subtitleIndex,
+      subtitleExplicitlyOff: subtitleExplicitlyOffRef.current,
+    }
+    const syncSameEpisodeTracks = () => {
+      if (renderedItemIdRef.current !== sessionSnapshot.itemId) return
+      sessionSnapshot.audioIndex = playbackMetaRef.current.audioIndex
+      sessionSnapshot.subtitleIndex = playbackMetaRef.current.subtitleIndex
+      sessionSnapshot.subtitleExplicitlyOff = subtitleExplicitlyOffRef.current
+      if (playbackMetaRef.current.mediaSourceId) {
+        sessionSnapshot.mediaSourceId = playbackMetaRef.current.mediaSourceId
+      }
+      if (playbackMetaRef.current.playSessionId) {
+        sessionSnapshot.playSessionId = playbackMetaRef.current.playSessionId
+      }
+    }
+
+    reportState('start', undefined, sessionSnapshot)
     const interval = window.setInterval(() => {
-      reportState('progress', 'TimeUpdate')
+      syncSameEpisodeTracks()
+      reportState('progress', 'TimeUpdate', sessionSnapshot)
     }, 10_000)
 
     return () => {
       window.clearInterval(interval)
-      reportState('stop')
+      syncSameEpisodeTracks()
+      reportState('stop', undefined, sessionSnapshot)
     }
-  }, [hasPlaybackInfo, reportState])
+  }, [hasPlaybackInfo, id, reportState])
 
   // 页面关闭或刷新时通过 keepalive 上报最新播放进度，避免丢失续播点
   useEffect(() => {
     if (!hasPlaybackInfo || !id || isDemoMode()) return
+    const sessionSnapshot = {
+      itemId: id,
+      mediaSourceId: playbackMetaRef.current.mediaSourceId,
+      playSessionId: playbackMetaRef.current.playSessionId,
+      initialStartTicks: playbackMetaRef.current.effectiveStartTicks,
+      audioIndex: playbackMetaRef.current.audioIndex,
+      subtitleIndex: playbackMetaRef.current.subtitleIndex,
+      subtitleExplicitlyOff: subtitleExplicitlyOffRef.current,
+    }
 
     let unloadReported = false
     const sendKeepaliveStop = () => {
-      if (unloadReported || stopReportedRef.current || !videoRef.current) return
+      if (unloadReported || stopReportedRef.current) return
+      const videoEl = videoRef.current
+      if (!videoEl && lastVideoTimeSecRef.current <= 0 && sessionSnapshot.initialStartTicks <= 0) {
+        return
+      }
       unloadReported = true
       stopReportedRef.current = true
       const storedAuth = getStoredAuth()
       const token = storedAuth?.accessToken
       if (!token) return
-      const {
-        audioIndex: latestAudioIndex,
-        subtitleIndex: latestSubtitleIndex,
-        mediaSourceId: latestMediaSourceId,
-        playSessionId: latestPlaySessionId,
-        effectiveStartTicks: latestStartTicks,
-      } = playbackMetaRef.current
+      if (renderedItemIdRef.current === sessionSnapshot.itemId) {
+        sessionSnapshot.audioIndex = playbackMetaRef.current.audioIndex
+        sessionSnapshot.subtitleIndex = playbackMetaRef.current.subtitleIndex
+        sessionSnapshot.subtitleExplicitlyOff = subtitleExplicitlyOffRef.current
+        if (playbackMetaRef.current.mediaSourceId) {
+          sessionSnapshot.mediaSourceId = playbackMetaRef.current.mediaSourceId
+        }
+        if (playbackMetaRef.current.playSessionId) {
+          sessionSnapshot.playSessionId = playbackMetaRef.current.playSessionId
+        }
+      }
       const reportedSubIndex =
-        latestSubtitleIndex !== undefined
-          ? latestSubtitleIndex
-          : subtitleExplicitlyOffRef.current
+        sessionSnapshot.subtitleIndex !== undefined
+          ? sessionSnapshot.subtitleIndex
+          : sessionSnapshot.subtitleExplicitlyOff
             ? -1
             : undefined
-      let posTicks = Math.floor(videoRef.current.currentTime * 10_000_000)
-      if (!initialSeekDoneRef.current && latestStartTicks > 0 && videoRef.current.currentTime < 1) {
-        posTicks = latestStartTicks
+      const curSec = videoEl ? videoEl.currentTime : lastVideoTimeSecRef.current
+      let posTicks = Math.floor(curSec * 10_000_000)
+      if (!initialSeekDoneRef.current && sessionSnapshot.initialStartTicks > 0 && curSec < 1) {
+        posTicks = sessionSnapshot.initialStartTicks
       }
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
@@ -1693,11 +1812,11 @@ export function PlayerPage() {
           method: 'POST',
           headers,
           body: JSON.stringify({
-            ItemId: id,
-            MediaSourceId: latestMediaSourceId,
-            PlaySessionId: latestPlaySessionId,
+            ItemId: sessionSnapshot.itemId,
+            MediaSourceId: sessionSnapshot.mediaSourceId,
+            PlaySessionId: sessionSnapshot.playSessionId,
             PositionTicks: posTicks,
-            AudioStreamIndex: latestAudioIndex,
+            AudioStreamIndex: sessionSnapshot.audioIndex,
             SubtitleStreamIndex: reportedSubIndex,
           }),
           keepalive: true,
@@ -1925,12 +2044,12 @@ export function PlayerPage() {
       if (endSec > startSec && currentTime >= startSec && currentTime < endSec) {
         return {
           targetTicks: nextChapter ? nextChapter.StartPositionTicks : Math.floor(endSec * 10_000_000),
-          label: name || '片头',
+          label: name || t('playerUi.introDefaultLabel'),
         }
       }
     }
     return null
-  }, [chapters, currentTime, effectiveDurationSec])
+  }, [chapters, currentTime, effectiveDurationSec, t])
 
   const seekToChapter = useCallback(
     (startTicks: number) => {
@@ -2157,11 +2276,11 @@ export function PlayerPage() {
     for (let i = 0; i < chapters.length; i++) {
       const startSec = chapters[i].StartPositionTicks / 10_000_000
       if (hoverSeek.timeSec >= startSec) {
-        matched = chapters[i].Name || `章节 ${i + 1}`
+        matched = chapters[i].Name || t('itemDetailUi.chapterNumberTitle', { index: i + 1 })
       }
     }
     return matched
-  }, [hoverSeek, chapters])
+  }, [hoverSeek, chapters, t])
 
   return (
     <div
@@ -2219,8 +2338,11 @@ export function PlayerPage() {
           }
         }}
         onSeeked={(e) => {
-          if (!isHybridVideoOnly || !hybridAudioRef.current || !id) return
           const targetSec = Math.max(0, e.currentTarget.currentTime || 0)
+          if (Number.isFinite(targetSec)) {
+            lastVideoTimeSecRef.current = targetSec
+          }
+          if (!isHybridVideoOnly || !hybridAudioRef.current || !id) return
           const a = hybridAudioRef.current
           const localSec = targetSec - hybridAudioBaseSecRef.current
           let withinBuffered = false
@@ -2234,6 +2356,10 @@ export function PlayerPage() {
           }
           if (withinBuffered) {
             a.currentTime = localSec
+            const rate = playbackRateRef.current
+            if (Number.isFinite(rate) && rate > 0) {
+              a.playbackRate = rate
+            }
             if (!e.currentTarget.paused) {
               a.play().catch(() => undefined)
             }
@@ -2247,6 +2373,11 @@ export function PlayerPage() {
               userId,
             })
             a.load()
+            const rate = playbackRateRef.current
+            if (Number.isFinite(rate) && rate > 0) {
+              a.defaultPlaybackRate = rate
+              a.playbackRate = rate
+            }
             if (!e.currentTarget.paused) {
               a.play().catch(() => undefined)
             }
@@ -2265,6 +2396,9 @@ export function PlayerPage() {
         }}
         onTimeUpdate={(e) => {
           const v = e.currentTarget
+          if (Number.isFinite(v.currentTime) && v.currentTime >= 0) {
+            lastVideoTimeSecRef.current = v.currentTime
+          }
           setCurrentTime(v.currentTime)
           if (v.buffered.length > 0) {
             setBufferedEnd(v.buffered.end(v.buffered.length - 1))
@@ -2309,7 +2443,7 @@ export function PlayerPage() {
             streamPlan?.proxyDirectUrl
           ) {
             captureResumePosition()
-            setWasmFallbackNotice('STRM 直连失败，正在切换服务端代理直出 (&proxy=1)...')
+            setWasmFallbackNotice(t('playerUi.fallbackStrmProxyNotice'))
             setUseProxyDirect(true)
             return
           }
@@ -2318,12 +2452,12 @@ export function PlayerPage() {
             captureResumePosition()
             setWasmFallbackNotice(
               playMethod === 'Proxy Direct'
-                ? '服务端代理直出解码失败，已自动回退服务端 HLS'
+                ? t('playerUi.fallbackProxyDirectDecodeFailed')
                 : playMethod === 'Stream MKV (MSE)'
-                  ? '流式 MKV (MSE) 解码异常，已自动回退服务端 HLS'
+                  ? t('playerUi.fallbackStreamMkvDecodeFailed')
                   : playMethod === 'Client WASM Remux'
-                    ? '客户端转封装流解码异常，已自动回退服务端 HLS'
-                    : '浏览器原生直连解码失败，已自动回退服务端 HLS',
+                    ? t('playerUi.fallbackWasmDecodeFailed')
+                    : t('playerUi.fallbackDirectDecodeFailed'),
             )
             setForceServerHls(true)
             return
@@ -2339,10 +2473,17 @@ export function PlayerPage() {
         ref={hybridAudioRef}
         data-testid="hybrid-audio-element"
         className="hidden"
+        onLoadedMetadata={(e) => {
+          const rate = playbackRateRef.current
+          if (Number.isFinite(rate) && rate > 0) {
+            e.currentTarget.defaultPlaybackRate = rate
+            e.currentTarget.playbackRate = rate
+          }
+        }}
         onError={() => {
           if (isHybridVideoOnly && !forceServerHls) {
             captureResumePosition()
-            setWasmFallbackNotice('独立音频转码流加载失败，已自动切换服务端 HLS')
+            setWasmFallbackNotice(t('playerUi.fallbackHybridAudioFailed'))
             setForceServerHls(true)
           }
         }}
@@ -2398,12 +2539,12 @@ export function PlayerPage() {
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-sm font-semibold text-white">
                     {wasmProgress.stage === 'fetch'
-                      ? '拉取媒体流'
+                      ? t('playerUi.wasmStageFetch')
                       : wasmProgress.stage === 'init'
-                        ? '启动 WASM 解复用引擎'
+                        ? t('playerUi.wasmStageInit')
                         : wasmProgress.stage === 'remux'
-                          ? '客户端零重编码转封装'
-                          : '转封装完成'}
+                          ? t('playerUi.wasmStageRemux')
+                          : t('playerUi.wasmDone')}
                   </span>
                   <span className="font-mono text-xs font-semibold text-amber-300">
                     {wasmProgress.percent}%
@@ -2423,18 +2564,18 @@ export function PlayerPage() {
             <div className="mt-3.5 flex items-center justify-between text-[11px] text-zinc-400">
               <span className="flex items-center gap-1.5">
                 <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-400" />
-                视频直通 (-c:v copy) · 减少服务端负载
+                {t('playerUi.wasmPassthroughHint')}
               </span>
               <button
                 type="button"
                 onClick={() => {
                   captureResumePosition()
-                  setWasmFallbackNotice('已手动切换至服务端 HLS')
+                  setWasmFallbackNotice(t('playerUi.switchedToServerHlsManual'))
                   setForceServerHls(true)
                 }}
                 className="rounded-lg border border-white/15 bg-white/5 px-2.5 py-1 text-[11px] font-medium text-zinc-200 transition-colors hover:bg-white/15"
               >
-                改用服务端 HLS
+                {t('playerUi.switchToServerHlsBtn')}
               </button>
             </div>
           </div>
@@ -2463,7 +2604,10 @@ export function PlayerPage() {
             <AlertTriangle className="mx-auto mb-3 h-10 w-10 text-red-400" />
             <h2 className="text-base font-semibold text-white">{t('player.cannotPlayTitle')}</h2>
             <p className="mt-2 text-xs text-zinc-400">
-              {playerError || (infoError instanceof Error ? infoError.message : '获取播放信息失败')}
+              {playerError ||
+                (infoError instanceof Error
+                  ? infoError.message
+                  : t('playerUi.errFetchPlaybackInfo'))}
             </p>
             <div className="mt-5 flex items-center justify-center gap-3">
               <button
@@ -2497,7 +2641,7 @@ export function PlayerPage() {
           className="absolute bottom-24 right-6 z-30 inline-flex items-center gap-2 rounded-xl border border-amber-400/50 bg-zinc-950/90 px-4 py-2.5 text-xs font-semibold text-amber-300 shadow-2xl backdrop-blur-xl transition-all hover:bg-amber-500 hover:text-zinc-950"
         >
           <SkipForward className="h-4 w-4" />
-          <span>跳过片头</span>
+          <span>{t('playerUi.skipIntroBtn')}</span>
         </button>
       )}
 
@@ -2508,17 +2652,19 @@ export function PlayerPage() {
           className="absolute bottom-28 right-6 z-30 w-80 max-w-[calc(100vw-3rem)] rounded-2xl border border-amber-500/35 bg-zinc-950/92 p-4 shadow-2xl backdrop-blur-xl"
         >
           <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-400">
-            {playlistId ? '即将播放播放列表下一项' : '即将播放下一集'}
+            {playlistId ? t('playerUi.upNextPlaylistHeader') : t('playerUi.upNextEpisodeHeader')}
           </p>
           <p className="mt-1 truncate text-sm font-semibold text-white">
             {nextQueueItem.ParentIndexNumber != null && nextQueueItem.IndexNumber != null
               ? `S${String(nextQueueItem.ParentIndexNumber).padStart(2, '0')}E${String(nextQueueItem.IndexNumber).padStart(2, '0')} `
               : nextQueueItem.IndexNumber != null
-                ? `第 ${nextQueueItem.IndexNumber} 集 `
+                ? `${t('itemDetailUi.episodeNumberLabel', { index: nextQueueItem.IndexNumber })} `
                 : ''}
             {nextQueueItem.Name}
           </p>
-          <p className="mt-1 text-xs text-zinc-400">{nextUpCountdown} 秒后自动播放</p>
+          <p className="mt-1 text-xs text-zinc-400">
+            {t('playerUi.autoPlayInSeconds', { seconds: nextUpCountdown })}
+          </p>
           <div className="mt-3 h-1 w-full overflow-hidden rounded-full bg-white/10">
             <div
               className="h-full bg-amber-400 transition-all duration-1000 ease-linear"
@@ -2531,7 +2677,7 @@ export function PlayerPage() {
               onClick={() => setNextUpCountdown(null)}
               className="rounded-xl border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-medium text-zinc-200 transition-colors hover:bg-white/15"
             >
-              取消
+              {t('common.cancel')}
             </button>
             <button
               type="button"
@@ -2542,7 +2688,7 @@ export function PlayerPage() {
               className="inline-flex items-center gap-1 rounded-xl bg-amber-500 px-3.5 py-1.5 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400"
             >
               <Play className="h-3.5 w-3.5 fill-current" />
-              <span>立即播放</span>
+              <span>{t('player.playNextNow')}</span>
             </button>
           </div>
         </div>
@@ -2569,36 +2715,42 @@ export function PlayerPage() {
           </div>
           <dl className="space-y-2 font-mono text-[11px]">
             <div className="flex items-center justify-between gap-3">
-              <dt className="text-zinc-400">播放模式</dt>
+              <dt className="text-zinc-400">{t('playerUi.statPlayMode')}</dt>
               <dd>
                 <PlayMethodBadge method={playMethod} />
               </dd>
             </div>
             <StatRow
-              label="客户端解复用"
+              label={t('playerUi.statClientDemux')}
               value={
                 playMethod === 'Stream MKV (MSE)'
                   ? isHybridVideoOnly
-                    ? 'MSE 视频零转码直通 + 同步 AAC 音轨'
-                    : '流式 Range + MSE（支持 GB 级 MKV）'
+                    ? t('playerUi.statDemuxHybridMse')
+                    : t('playerUi.statDemuxRangeMse')
                   : playMethod === 'Client WASM Remux'
-                    ? 'WASM 已启用（单线程兼容）'
+                    ? t('playerUi.statDemuxWasmActive')
                     : !wasmSupported
-                      ? '浏览器不支持'
+                      ? t('playerUi.statDemuxUnsupported')
                       : !preferWasmRemux
-                        ? '已关闭'
+                        ? t('playerUi.statDemuxDisabled')
                         : wasmFallbackNotice
-                          ? '已自动降级'
-                          : '待命（当前直连）'
+                          ? t('playerUi.statDemuxAutoDowngraded')
+                          : t('playerUi.statDemuxStandby')
               }
               highlight={playMethod === 'Stream MKV (MSE)' || playMethod === 'Client WASM Remux'}
             />
-            <StatRow label="容器格式" value={(activeSource?.Container || '-').toUpperCase()} />
+            <StatRow
+              label={t('detail.container')}
+              value={(activeSource?.Container || '-').toUpperCase()}
+            />
             {activeSource?.Size !== undefined && activeSource.Size > 0 && (
-              <StatRow label="文件体积" value={formatBytes(activeSource.Size)} />
+              <StatRow
+                label={t('playerUi.statFileVolume')}
+                value={formatBytes(activeSource.Size)}
+              />
             )}
             <StatRow
-              label="视频编码"
+              label={t('playerUi.statVideoCodec')}
               value={
                 videoStream
                   ? `${(videoStream.Codec || '-').toUpperCase()} ${videoStream.Width || ''}x${videoStream.Height || ''}`
@@ -2606,7 +2758,7 @@ export function PlayerPage() {
               }
             />
             <StatRow
-              label="音轨编码"
+              label={t('playerUi.statAudioCodec')}
               value={
                 activeAudioStream
                   ? `${(activeAudioStream.Codec || '-').toUpperCase()} ${activeAudioStream.Channels || ''}ch`
@@ -2614,27 +2766,41 @@ export function PlayerPage() {
               }
             />
             <StatRow
-              label="字幕引擎"
-              value={activeSubtitleMeta.engineLabel}
+              label={t('playerUi.statSubtitleEngine')}
+              value={
+                activeSubtitleMeta.engine === 'none'
+                  ? t('playerUi.statSubtitleNone')
+                  : activeSubtitleMeta.engineLabel
+              }
               highlight={activeSubtitleMeta.engine !== 'none'}
             />
             {activeSubtitleMeta.engine === 'ass' && loadedFontCount > 0 && (
-              <StatRow label="内封字体" value={`已挂载 ${loadedFontCount} 个`} highlight />
+              <StatRow
+                label={t('playerUi.statEmbeddedFonts')}
+                value={t('playerUi.statFontsMountedCount', { count: loadedFontCount })}
+                highlight
+              />
             )}
             {subtitlePrefs.offsetSec !== 0 && (
-              <StatRow label="字幕偏移" value={formatSubtitleOffset(subtitlePrefs.offsetSec)} highlight />
+              <StatRow
+                label={t('playerUi.statSubtitleOffset')}
+                value={formatSubtitleOffset(subtitlePrefs.offsetSec)}
+                highlight
+              />
             )}
             <StatRow
-              label="缓冲进度"
+              label={t('playerUi.statBufferProgress')}
               value={`${formatSeconds(bufferedEnd)} / ${formatSeconds(effectiveDurationSec)}`}
             />
             {wasmFallbackNotice && (
               <p className="rounded-lg border border-sky-400/20 bg-sky-500/10 px-2.5 py-1.5 font-sans text-[11px] leading-relaxed text-sky-200">
-                降级说明：{wasmFallbackNotice}
+                {t('playerUi.statFallbackNoticePrefix', { notice: wasmFallbackNotice })}
               </p>
             )}
             {subtitleError && (
-              <p className="pt-1 text-[11px] text-rose-400">字幕异常: {subtitleError}</p>
+              <p className="pt-1 text-[11px] text-rose-400">
+                {t('playerUi.statSubtitleErrorPrefix', { error: subtitleError })}
+              </p>
             )}
           </dl>
         </div>
@@ -2658,7 +2824,7 @@ export function PlayerPage() {
               <button
                 type="button"
                 onClick={() => setShowShortcuts(false)}
-                aria-label="关闭快捷键说明"
+                aria-label={t('playerUi.closeShortcutsAria')}
                 className="rounded-lg p-1 text-zinc-400 hover:bg-white/10 hover:text-white"
               >
                 <X className="h-4 w-4" />
@@ -2670,7 +2836,7 @@ export function PlayerPage() {
                   key={sc.keys}
                   className="flex items-center justify-between gap-2 rounded-xl border border-white/8 bg-white/[0.03] px-3 py-2"
                 >
-                  <dt className="text-zinc-300">{sc.desc}</dt>
+                  <dt className="text-zinc-300">{t(sc.descKey)}</dt>
                   <dd className="shrink-0 rounded-md border border-white/15 bg-white/10 px-1.5 py-0.5 font-mono text-[11px] font-semibold text-amber-300">
                     {sc.keys}
                   </dd>
@@ -2693,20 +2859,20 @@ export function PlayerPage() {
             type="button"
             onClick={handleExit}
             className="flex h-10 w-10 items-center justify-center rounded-xl bg-white/10 text-white backdrop-blur-md transition-colors hover:bg-white/20"
-            title="返回"
+            title={t('common.back')}
           >
             <ArrowLeft className="h-5 w-5" />
           </button>
           <div className="min-w-0">
             <h1 className="truncate text-base font-semibold text-white">
               {item?.SeriesName ? `${item.SeriesName} · ` : ''}
-              {item?.Name || '正在播放'}
+              {item?.Name || t('playerUi.nowPlayingFallback')}
             </h1>
             <div className="mt-0.5 flex items-center gap-2 text-[11px] text-zinc-300">
               <PlayMethodBadge method={playMethod} />
               {activeSubtitleMeta.engine !== 'none' && (
                 <span className="rounded bg-white/10 px-1.5 py-0.5 text-zinc-200">
-                  字幕: {activeSubtitleMeta.engineLabel}
+                  {t('playerUi.topSubtitleBadge', { label: activeSubtitleMeta.engineLabel })}
                 </span>
               )}
             </div>
@@ -2722,8 +2888,8 @@ export function PlayerPage() {
                 ? 'bg-amber-500 text-zinc-950'
                 : 'bg-white/10 text-zinc-200 hover:bg-white/20'
             }`}
-            title="快捷键说明 (?)"
-            aria-label="快捷键说明"
+            title={t('playerUi.shortcutsBtnTitle')}
+            aria-label={t('player.shortcuts')}
           >
             <HelpCircle className="h-4 w-4" />
             <span className="hidden sm:inline">?</span>
@@ -2737,10 +2903,10 @@ export function PlayerPage() {
                 ? 'bg-amber-500 text-zinc-950'
                 : 'bg-white/10 text-zinc-200 hover:bg-white/20'
             }`}
-            title="播放统计 (快捷键 I)"
+            title={t('playerUi.statsBtnTitle')}
           >
             <Activity className="h-4 w-4" />
-            <span className="hidden sm:inline">统计</span>
+            <span className="hidden sm:inline">{t('playerUi.statsBtnShort')}</span>
           </button>
         </div>
       </div>
@@ -2774,7 +2940,7 @@ export function PlayerPage() {
                 <img
                   data-testid="bif-preview-image"
                   src={hoverBifFrame.url}
-                  alt={`预览 ${formatSeconds(hoverSeek.timeSec)}`}
+                  alt={t('playerUi.bifPreviewAlt', { time: formatSeconds(hoverSeek.timeSec) })}
                   className="mb-1 block h-[90px] w-40 rounded-lg bg-black object-cover"
                 />
               )}
@@ -2804,11 +2970,12 @@ export function PlayerPage() {
                 if (!Number.isFinite(startSec) || startSec < 0 || startSec > effectiveDurationSec)
                   return null
                 const pct = (startSec / effectiveDurationSec) * 100
+                const chName = ch.Name || t('itemDetailUi.chapterNumberTitle', { index: idx + 1 })
                 return (
                   <span
                     key={`${ch.StartPositionTicks}-${idx}`}
                     data-testid="chapter-marker"
-                    title={`${ch.Name || `章节 ${idx + 1}`} (${formatSeconds(startSec)})`}
+                    title={`${chName} (${formatSeconds(startSec)})`}
                     className="pointer-events-none absolute inset-y-0 z-10 w-0.5 bg-white/75"
                     style={{ left: `${pct}%` }}
                   />
@@ -2855,8 +3022,12 @@ export function PlayerPage() {
                 type="button"
                 onClick={() => navigate(buildQueuePlayUrl(prevQueueItem.Id), { replace: true })}
                 className="rounded-lg p-2 text-zinc-200 hover:bg-white/10"
-                title={`${playlistId ? '上一项' : '上一集'}：${prevQueueItem.Name}`}
-                aria-label={playlistId ? '上一项' : '上一集'}
+                title={
+                  playlistId
+                    ? t('playerUi.prevPlaylistItemTitle', { name: prevQueueItem.Name })
+                    : t('playerUi.prevEpisodeTitle', { name: prevQueueItem.Name })
+                }
+                aria-label={playlistId ? t('playerUi.prevItemAria') : t('playerUi.prevEpisodeAria')}
               >
                 <SkipBack className="h-4 w-4" />
               </button>
@@ -2866,7 +3037,7 @@ export function PlayerPage() {
               type="button"
               onClick={togglePlay}
               className="flex h-10 w-10 items-center justify-center rounded-xl bg-amber-500 text-zinc-950 transition-colors hover:bg-amber-400"
-              title="播放/暂停 (Space)"
+              title={t('playerUi.playPauseTitle')}
             >
               {playing ? (
                 <Pause className="h-5 w-5 fill-current" />
@@ -2880,8 +3051,12 @@ export function PlayerPage() {
                 type="button"
                 onClick={() => navigate(buildQueuePlayUrl(nextQueueItem.Id), { replace: true })}
                 className="rounded-lg p-2 text-zinc-200 hover:bg-white/10"
-                title={`${playlistId ? '下一项' : '下一集'}：${nextQueueItem.Name}`}
-                aria-label={playlistId ? '下一项' : '下一集'}
+                title={
+                  playlistId
+                    ? t('playerUi.nextPlaylistItemTitle', { name: nextQueueItem.Name })
+                    : t('playerUi.nextEpisodeTitle', { name: nextQueueItem.Name })
+                }
+                aria-label={playlistId ? t('playerUi.nextItemAria') : t('playerUi.nextEpisodeAria')}
               >
                 <SkipForward className="h-4 w-4" />
               </button>
@@ -2891,7 +3066,7 @@ export function PlayerPage() {
               type="button"
               onClick={() => seekBy(-10)}
               className="rounded-lg p-2 text-zinc-200 hover:bg-white/10"
-              title="快退 10 秒 (←)"
+              title={t('playerUi.rewind10Title')}
             >
               <RotateCcw className="h-4 w-4" />
             </button>
@@ -2899,7 +3074,7 @@ export function PlayerPage() {
               type="button"
               onClick={() => seekBy(10)}
               className="rounded-lg p-2 text-zinc-200 hover:bg-white/10"
-              title="快进 10 秒 (→)"
+              title={t('playerUi.forward10Title')}
             >
               <RotateCw className="h-4 w-4" />
             </button>
@@ -2909,8 +3084,10 @@ export function PlayerPage() {
               <button
                 type="button"
                 onClick={toggleMute}
-                title="静音/取消静音 (M)"
-                aria-label={muted || volume === 0 ? '取消静音' : '静音'}
+                title={t('playerUi.muteToggleTitle')}
+                aria-label={
+                  muted || volume === 0 ? t('playerUi.unmuteAria') : t('playerUi.muteAria')
+                }
                 className="rounded-lg p-2 text-zinc-200 hover:bg-white/10"
               >
                 {muted || volume === 0 ? (
@@ -2961,16 +3138,16 @@ export function PlayerPage() {
                       ? 'bg-amber-500 text-zinc-950'
                       : 'bg-white/10 text-zinc-200 hover:bg-white/20'
                   }`}
-                  title="章节列表"
+                  title={t('playerUi.chapterListTitle')}
                 >
                   <Bookmark className="h-4 w-4" />
-                  <span className="hidden md:inline">章节</span>
+                  <span className="hidden md:inline">{t('player.chapters')}</span>
                 </button>
 
                 {activePanel === 'chapters' && (
                   <div className="absolute bottom-12 right-0 z-30 w-72 overflow-hidden rounded-2xl border border-white/15 bg-zinc-950/95 p-2 shadow-2xl backdrop-blur-xl">
                     <p className="px-2.5 py-1.5 text-[11px] font-semibold text-zinc-400">
-                      章节 ({chapters.length})
+                      {t('player.chapters')} ({chapters.length})
                     </p>
                     <div className="max-h-64 space-y-1 overflow-y-auto">
                       {chapters.map((ch, idx) => {
@@ -2987,7 +3164,9 @@ export function PlayerPage() {
                                 : 'text-zinc-200 hover:bg-white/8'
                             }`}
                           >
-                            <span className="truncate">{ch.Name || `章节 ${idx + 1}`}</span>
+                            <span className="truncate">
+                              {ch.Name || t('itemDetailUi.chapterNumberTitle', { index: idx + 1 })}
+                            </span>
                             <span className="shrink-0 font-mono text-[11px] text-zinc-400">
                               {formatSeconds(startSec)}
                             </span>
@@ -3011,17 +3190,19 @@ export function PlayerPage() {
                       ? 'bg-amber-500 text-zinc-950'
                       : 'bg-white/10 text-zinc-200 hover:bg-white/20'
                   }`}
-                  title="切换视频版本"
-                  aria-label="切换视频版本"
+                  title={t('playerUi.switchVersionTitle')}
+                  aria-label={t('playerUi.switchVersionTitle')}
                 >
                   <Layers className="h-4 w-4" />
-                  <span className="hidden md:inline">版本</span>
+                  <span className="hidden md:inline">{t('player.version')}</span>
                 </button>
 
                 {activePanel === 'version' && (
                   <div className="absolute bottom-12 right-0 z-30 w-64 overflow-hidden rounded-2xl border border-white/15 bg-zinc-950/95 p-2 shadow-2xl backdrop-blur-xl">
                     <p className="px-2.5 py-1.5 text-[11px] font-semibold text-zinc-400">
-                      选择视频版本 ({playbackInfo!.MediaSources.length})
+                      {t('playerUi.selectVersionCount', {
+                        count: playbackInfo!.MediaSources.length,
+                      })}
                     </p>
                     <div className="max-h-60 space-y-1 overflow-y-auto">
                       {playbackInfo!.MediaSources.map((src) => (
@@ -3107,19 +3288,24 @@ export function PlayerPage() {
                       ? 'bg-amber-500/20 text-amber-300 ring-1 ring-amber-400/40'
                       : 'bg-white/10 text-zinc-200 hover:bg-white/20'
                 }`}
-                title="切换画质"
+                title={t('playerUi.switchQualityTitle')}
               >
                 <Sparkles className="h-4 w-4" />
                 <span>
-                  {(QUALITY_PRESETS.find((q) => q.id === qualityPreset) || QUALITY_PRESETS[0])
-                    .shortLabel}
+                  {(() => {
+                    const activePreset =
+                      QUALITY_PRESETS.find((q) => q.id === qualityPreset) || QUALITY_PRESETS[0]
+                    return activePreset.shortLabelKey
+                      ? t(activePreset.shortLabelKey)
+                      : activePreset.shortLabel
+                  })()}
                 </span>
               </button>
 
               {activePanel === 'quality' && (
                 <div className="absolute bottom-12 right-0 z-30 w-52 overflow-hidden rounded-2xl border border-white/15 bg-zinc-950/95 p-2 shadow-2xl backdrop-blur-xl">
                   <p className="px-2.5 py-1.5 text-[11px] font-semibold text-zinc-400">
-                    画质 / 码率限制
+                    {t('playerUi.qualityBitrateLimitHeader')}
                   </p>
                   <div className="space-y-1">
                     {QUALITY_PRESETS.map((preset) => (
@@ -3133,7 +3319,7 @@ export function PlayerPage() {
                             : 'text-zinc-200 hover:bg-white/8'
                         }`}
                       >
-                        <span>{preset.label}</span>
+                        <span>{preset.labelKey ? t(preset.labelKey) : preset.label}</span>
                       </button>
                     ))}
                   </div>
@@ -3152,16 +3338,16 @@ export function PlayerPage() {
                       ? 'bg-amber-500 text-zinc-950'
                       : 'bg-white/10 text-zinc-200 hover:bg-white/20'
                   }`}
-                  title="切换音轨 (A)"
+                  title={t('playerUi.switchAudioTitle')}
                 >
                   <Volume2 className="h-4 w-4" />
-                  <span className="hidden md:inline">音轨</span>
+                  <span className="hidden md:inline">{t('player.audio')}</span>
                 </button>
 
                 {activePanel === 'audio' && (
                   <div className="absolute bottom-12 right-0 z-30 w-64 overflow-hidden rounded-2xl border border-white/15 bg-zinc-950/95 p-2 shadow-2xl backdrop-blur-xl">
                     <p className="px-2.5 py-1.5 text-[11px] font-semibold text-zinc-400">
-                      选择音轨
+                      {t('playerUi.selectAudioHeader')}
                     </p>
                     <div className="max-h-60 space-y-1 overflow-y-auto">
                       {audioStreams.map((a) => (
@@ -3197,18 +3383,20 @@ export function PlayerPage() {
                     ? 'bg-amber-500/20 text-amber-300 ring-1 ring-amber-400/40'
                     : 'bg-white/10 text-zinc-200 hover:bg-white/20'
                 }`}
-                title="切换字幕 (C)"
+                title={t('playerUi.switchSubtitleTitle')}
               >
                 <Subtitles className="h-4 w-4" />
                 <span className="hidden md:inline">
-                  {subtitleIndex !== undefined ? activeSubtitleMeta.formatBadge || '字幕' : '字幕'}
+                  {subtitleIndex !== undefined
+                    ? activeSubtitleMeta.formatBadge || t('player.subtitles')
+                    : t('player.subtitles')}
                 </span>
               </button>
 
               {activePanel === 'subtitle' && (
                 <div className="absolute bottom-12 right-0 z-30 w-80 overflow-hidden rounded-2xl border border-white/15 bg-zinc-950/95 p-2 shadow-2xl backdrop-blur-xl">
                   <p className="px-2.5 py-1.5 text-[11px] font-semibold text-zinc-400">
-                    客户端直出字幕（零转码）
+                    {t('playerUi.clientDirectSubtitlesHeader')}
                   </p>
                   <div className="max-h-72 space-y-1 overflow-y-auto">
                     <button
@@ -3260,7 +3448,7 @@ export function PlayerPage() {
                       className="flex w-full items-center justify-center gap-1.5 rounded-xl border border-amber-500/30 bg-amber-500/12 px-2.5 py-2 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
                     >
                       <Search className="h-3.5 w-3.5" />
-                      <span>在线搜索字幕</span>
+                      <span>{t('itemDetailUi.searchSubtitlesOnlineBtn')}</span>
                     </button>
                   </div>
                 </div>
@@ -3281,7 +3469,7 @@ export function PlayerPage() {
                       ? 'bg-amber-500/20 text-amber-300 ring-1 ring-amber-400/40'
                       : 'bg-white/10 text-zinc-200 hover:bg-white/20'
                 }`}
-                title="字幕微调（时间偏移 / 字号 / 边距 / 背景）"
+                title={t('playerUi.subtitleTweaksTitle')}
               >
                 <SlidersHorizontal className="h-4 w-4" />
                 <span className="hidden lg:inline">{t('player.subtitleTweaks')}</span>
@@ -3293,7 +3481,7 @@ export function PlayerPage() {
                     <div>
                       <p className="text-xs font-semibold text-white">{t('player.subtitleTweaks')}</p>
                       <p className="text-[10px] text-zinc-400">
-                        偏移同步作用于 ASS / PGS / VTT / SRT
+                        {t('playerUi.subtitleTweaksDesc')}
                       </p>
                     </div>
                     <button
@@ -3301,7 +3489,7 @@ export function PlayerPage() {
                       onClick={handleResetSubtitlePrefs}
                       className="rounded-lg border border-white/15 bg-white/5 px-2.5 py-1 text-[11px] font-medium text-zinc-300 transition-colors hover:bg-white/15 hover:text-white"
                     >
-                      重置
+                      {t('playerUi.resetBtn')}
                     </button>
                   </div>
 
@@ -3309,7 +3497,7 @@ export function PlayerPage() {
                     {/* 时间轴偏移 */}
                     <div>
                       <div className="mb-1.5 flex items-center justify-between text-[11px]">
-                        <span className="text-zinc-300">时间轴偏移</span>
+                        <span className="text-zinc-300">{t('playerUi.timelineOffsetLabel')}</span>
                         <span className="font-mono font-semibold text-amber-300">
                           {formatSubtitleOffset(subtitlePrefs.offsetSec)}
                         </span>
@@ -3365,7 +3553,7 @@ export function PlayerPage() {
                     {/* 字号缩放 */}
                     <div>
                       <div className="mb-1 flex items-center justify-between text-[11px]">
-                        <span className="text-zinc-300">字号缩放</span>
+                        <span className="text-zinc-300">{t('playerUi.fontScaleLabel')}</span>
                         <span className="font-mono text-zinc-200">
                           {Math.round(subtitlePrefs.fontScale * 100)}%
                         </span>
@@ -3386,7 +3574,7 @@ export function PlayerPage() {
                     {/* 底边距 */}
                     <div>
                       <div className="mb-1 flex items-center justify-between text-[11px]">
-                        <span className="text-zinc-300">底边距</span>
+                        <span className="text-zinc-300">{t('playerUi.bottomMarginLabel')}</span>
                         <span className="font-mono text-zinc-200">
                           {subtitlePrefs.bottomMarginPx}px
                         </span>
@@ -3407,7 +3595,7 @@ export function PlayerPage() {
                     {/* 背景透明度 */}
                     <div>
                       <div className="mb-1 flex items-center justify-between text-[11px]">
-                        <span className="text-zinc-300">背景透明度</span>
+                        <span className="text-zinc-300">{t('playerUi.bgOpacityLabel')}</span>
                         <span className="font-mono text-zinc-200">
                           {Math.round(subtitlePrefs.bgOpacity * 100)}%
                         </span>
@@ -3475,14 +3663,16 @@ export function PlayerPage() {
                     ? 'bg-amber-500 text-zinc-950'
                     : 'bg-white/10 text-zinc-200 hover:bg-white/20'
                 }`}
-                title="播放器设置"
+                title={t('playerUi.playerSettingsTitle')}
               >
                 <Settings className="h-4 w-4" />
               </button>
 
               {activePanel === 'settings' && (
                 <div className="absolute bottom-12 right-0 z-30 w-80 overflow-hidden rounded-2xl border border-white/15 bg-zinc-950/95 p-3 shadow-2xl backdrop-blur-xl">
-                  <p className="mb-2 text-[11px] font-semibold text-zinc-400">播放内核设置</p>
+                  <p className="mb-2 text-[11px] font-semibold text-zinc-400">
+                    {t('playerUi.engineSettingsHeader')}
+                  </p>
 
                   <button
                     type="button"
@@ -3494,12 +3684,14 @@ export function PlayerPage() {
                   >
                     <div className="min-w-0">
                       <div className="text-xs font-medium text-zinc-100">
-                        优先客户端 WASM 解复用（减少服务端转码）
+                        {t('playerUi.preferWasmToggleTitle')}
                       </div>
                       <p className="mt-1 text-[11px] leading-relaxed text-zinc-400">
                         {wasmSupported
-                          ? `对 MKV / TS / AC3 等格式优先在浏览器零重编码转封装，超出 ${formatBytes(DEFAULT_WASM_MAX_BYTES)} 或异常时自动回退服务端 HLS。`
-                          : '当前浏览器不支持 WebAssembly 或 Web Worker。'}
+                          ? t('playerUi.preferWasmSupportedDesc', {
+                              max: formatBytes(DEFAULT_WASM_MAX_BYTES),
+                            })
+                          : t('playerUi.preferWasmUnsupportedDesc')}
                       </p>
                     </div>
                     <span
@@ -3516,13 +3708,13 @@ export function PlayerPage() {
                   </button>
 
                   <div className="mt-2.5 flex items-center justify-between rounded-xl border border-white/8 bg-black/40 px-2.5 py-2 text-[11px] text-zinc-400">
-                    <span>运行环境</span>
+                    <span>{t('playerUi.runtimeEnvLabel')}</span>
                     <span className="font-mono text-zinc-300">
                       {!wasmSupported
-                        ? 'WASM 不可用'
+                        ? t('playerUi.runtimeWasmUnavailable')
                         : sabSupported
-                          ? 'WASM 就绪 (COI)'
-                          : '单线程兼容 (HTTP 局域网)'}
+                          ? t('playerUi.runtimeWasmReadyCoi')
+                          : t('playerUi.runtimeSingleThreadLan')}
                     </span>
                   </div>
                 </div>
@@ -3543,14 +3735,16 @@ export function PlayerPage() {
               }`}
               title={
                 aspectMode === 'contain'
-                  ? '画面比例：适应屏幕（点击切换填充铺满）'
-                  : '画面比例：填充铺满（点击切换适应屏幕）'
+                  ? t('playerUi.aspectContainTitle')
+                  : t('playerUi.aspectCoverTitle')
               }
-              aria-label="切换画面比例"
+              aria-label={t('playerUi.toggleAspectAria')}
               aria-pressed={aspectMode === 'cover'}
             >
               <Maximize2 className="h-4 w-4" />
-              <span className="hidden lg:inline">{aspectMode === 'cover' ? '填充' : '适应'}</span>
+              <span className="hidden lg:inline">
+                {aspectMode === 'cover' ? t('playerUi.aspectFillShort') : t('playerUi.aspectFitShort')}
+              </span>
             </button>
 
             {/* 画中画 (PiP) */}
@@ -3563,8 +3757,8 @@ export function PlayerPage() {
                     ? 'bg-amber-500 text-zinc-950'
                     : 'bg-white/10 text-zinc-200 hover:bg-white/20'
                 }`}
-                title="画中画 (P)"
-                aria-label="画中画"
+                title={t('playerUi.pipTitle')}
+                aria-label={t('playerUi.pipAria')}
               >
                 <PictureInPicture2 className="h-4 w-4" />
               </button>
@@ -3575,7 +3769,7 @@ export function PlayerPage() {
               type="button"
               onClick={toggleFullscreen}
               className="rounded-xl bg-white/10 p-2 text-zinc-200 hover:bg-white/20"
-              title="全屏 (F)"
+              title={t('playerUi.fullscreenTitle')}
             >
               {isFullscreen ? <Minimize className="h-4 w-4" /> : <Maximize className="h-4 w-4" />}
             </button>

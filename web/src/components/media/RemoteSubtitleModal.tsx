@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { CheckCircle2, Download, Globe, Loader2, Search, Star, Subtitles, X } from 'lucide-react'
 import { api } from '../../api/client'
 import type { RemoteSubtitleInfo } from '../../api/types'
+import { useI18n } from '../../i18n/I18nContext'
 
 interface RemoteSubtitleModalProps {
   open: boolean
@@ -13,15 +14,15 @@ interface RemoteSubtitleModalProps {
   onDownloaded?: (message: string) => void
 }
 
-const SUBTITLE_LANGUAGES: Array<{ code: string; label: string }> = [
-  { code: 'chi', label: '简体中文 (chi)' },
-  { code: 'zho', label: '繁體中文 (zho)' },
-  { code: 'eng', label: 'English (eng)' },
-  { code: 'jpn', label: '日本語 (jpn)' },
-  { code: 'kor', label: '한국어 (kor)' },
-  { code: 'fre', label: 'Français (fre)' },
-  { code: 'ger', label: 'Deutsch (ger)' },
-  { code: 'spa', label: 'Español (spa)' },
+const SUBTITLE_LANGUAGES: Array<{ code: string; labelKey: string }> = [
+  { code: 'chi', labelKey: 'modal.subtitles.langChi' },
+  { code: 'zho', labelKey: 'modal.subtitles.langZho' },
+  { code: 'eng', labelKey: 'modal.subtitles.langEng' },
+  { code: 'jpn', labelKey: 'modal.subtitles.langJpn' },
+  { code: 'kor', labelKey: 'modal.subtitles.langKor' },
+  { code: 'fre', labelKey: 'modal.subtitles.langFre' },
+  { code: 'ger', labelKey: 'modal.subtitles.langGer' },
+  { code: 'spa', labelKey: 'modal.subtitles.langSpa' },
 ]
 
 export function RemoteSubtitleModal({
@@ -32,6 +33,7 @@ export function RemoteSubtitleModal({
   onClose,
   onDownloaded,
 }: RemoteSubtitleModalProps) {
+  const { t } = useI18n()
   const queryClient = useQueryClient()
   const [language, setLanguage] = useState(initialLanguage)
   const [searchLanguage, setSearchLanguage] = useState(initialLanguage)
@@ -42,11 +44,19 @@ export function RemoteSubtitleModal({
   )
 
   useEffect(() => {
+    setDownloadedIds(new Set())
+    setLanguage(initialLanguage)
+    setSearchLanguage(initialLanguage)
+    setDownloadingId(null)
+    setFeedback(null)
+  }, [itemId, initialLanguage])
+
+  useEffect(() => {
     if (open) {
       setFeedback(null)
       setDownloadingId(null)
     }
-  }, [open, itemId])
+  }, [open])
 
   const {
     data: results = [],
@@ -78,14 +88,14 @@ export function RemoteSubtitleModal({
         queryClient.invalidateQueries({ queryKey: ['item'] }),
         queryClient.invalidateQueries({ queryKey: ['playbackInfo'] }),
       ])
-      const msg = `已下载外挂字幕「${sub.Name}」`
+      const msg = t('modal.subtitles.downloadSuccess', { name: sub.Name })
       setFeedback({ type: 'success', text: msg })
       onDownloaded?.(msg)
     },
     onError: (err) => {
       setFeedback({
         type: 'error',
-        text: err instanceof Error ? err.message : '下载在线字幕失败',
+        text: err instanceof Error ? err.message : t('modal.subtitles.downloadError'),
       })
     },
     onSettled: () => {
@@ -99,7 +109,7 @@ export function RemoteSubtitleModal({
     <div
       role="dialog"
       aria-modal="true"
-      aria-label="在线搜索字幕"
+      aria-label={t('modal.subtitles.title')}
       data-testid="remote-subtitle-modal"
       onClick={(e) => {
         e.stopPropagation()
@@ -121,17 +131,17 @@ export function RemoteSubtitleModal({
           <div className="min-w-0">
             <h2 className="flex items-center gap-2 text-base font-semibold text-white">
               <Subtitles className="h-4 w-4 text-amber-400" />
-              <span>在线搜索字幕</span>
+              <span>{t('modal.subtitles.title')}</span>
             </h2>
             {itemName && (
               <p className="mt-0.5 truncate text-xs text-zinc-400">
-                为「{itemName}」匹配并下载外挂字幕
+                {t('modal.subtitles.subtitle', { name: itemName })}
               </p>
             )}
           </div>
           <button
             type="button"
-            aria-label="关闭在线字幕弹窗"
+            aria-label={t('modal.subtitles.closeAria')}
             onClick={onClose}
             className="rounded-lg p-1.5 text-zinc-400 transition-colors hover:bg-white/10 hover:text-white"
           >
@@ -154,17 +164,17 @@ export function RemoteSubtitleModal({
             <label className="min-w-[180px] flex-1 space-y-1.5">
               <span className="flex items-center gap-1.5 text-xs font-medium text-zinc-300">
                 <Globe className="h-3.5 w-3.5 text-amber-400" />
-                <span>目标字幕语言</span>
+                <span>{t('modal.subtitles.targetLanguage')}</span>
               </span>
               <select
-                aria-label="在线字幕语言"
+                aria-label={t('modal.subtitles.selectLanguageAria')}
                 value={language}
                 onChange={(e) => setLanguage(e.target.value)}
                 className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
               >
                 {SUBTITLE_LANGUAGES.map((lang) => (
                   <option key={lang.code} value={lang.code}>
-                    {lang.label}
+                    {t(lang.labelKey)}
                   </option>
                 ))}
               </select>
@@ -180,7 +190,7 @@ export function RemoteSubtitleModal({
               ) : (
                 <Search className="h-3.5 w-3.5" />
               )}
-              <span>搜索字幕</span>
+              <span>{t('modal.subtitles.searchBtn')}</span>
             </button>
           </form>
 
@@ -203,11 +213,11 @@ export function RemoteSubtitleModal({
             </div>
           ) : isError ? (
             <div className="rounded-xl border border-red-500/25 bg-red-500/10 p-4 text-xs text-red-200">
-              {error instanceof Error ? error.message : '搜索在线字幕失败，请检查字幕插件配置'}
+              {error instanceof Error ? error.message : t('modal.subtitles.searchError')}
             </div>
           ) : results.length === 0 ? (
             <div className="rounded-xl border border-dashed border-white/10 py-10 text-center text-xs text-zinc-500">
-              未找到匹配的在线字幕，可尝试切换其他语言或确认已在后台启用字幕提供商插件
+              {t('modal.subtitles.emptyResults')}
             </div>
           ) : (
             <div className="divide-y divide-white/8 overflow-hidden rounded-xl border border-white/10 bg-white/[0.02]">
@@ -234,13 +244,17 @@ export function RemoteSubtitleModal({
                         )}
                         {sub.IsHashMatch && (
                           <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300">
-                            文件哈希匹配
+                            {t('modal.subtitles.hashMatch')}
                           </span>
                         )}
                       </div>
                       <div className="flex flex-wrap items-center gap-3 text-[11px] text-zinc-400">
                         {(sub.ThreeLetterISOLanguageName || sub.Language) && (
-                          <span>语言: {sub.ThreeLetterISOLanguageName || sub.Language}</span>
+                          <span>
+                            {t('modal.subtitles.metaLanguage', {
+                              lang: sub.ThreeLetterISOLanguageName || sub.Language || '',
+                            })}
+                          </span>
                         )}
                         {typeof sub.CommunityRating === 'number' && sub.CommunityRating > 0 && (
                           <span className="inline-flex items-center gap-0.5 text-amber-300">
@@ -249,7 +263,9 @@ export function RemoteSubtitleModal({
                           </span>
                         )}
                         {typeof sub.DownloadCount === 'number' && (
-                          <span>下载: {sub.DownloadCount}</span>
+                          <span>
+                            {t('modal.subtitles.metaDownloads', { count: sub.DownloadCount })}
+                          </span>
                         )}
                         {sub.Comment && <span className="truncate text-zinc-500">{sub.Comment}</span>}
                       </div>
@@ -272,7 +288,11 @@ export function RemoteSubtitleModal({
                       ) : (
                         <Download className="h-3.5 w-3.5" />
                       )}
-                      <span>{isDownloaded ? '已下载' : '下载'}</span>
+                      <span>
+                        {isDownloaded
+                          ? t('modal.subtitles.downloadedBtn')
+                          : t('modal.subtitles.downloadBtn')}
+                      </span>
                     </button>
                   </div>
                 )

@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom'
 import { api, getFallbackImageUrl, getImageUrl } from '../api/client'
 import type { SearchHint } from '../api/types'
 import { useAuth } from '../context/AuthContext'
+import { useI18n } from '../i18n/I18nContext'
 
 interface SearchModalProps {
   open: boolean
@@ -11,6 +12,7 @@ interface SearchModalProps {
 }
 
 export function SearchModal({ open, onClose }: SearchModalProps) {
+  const { t } = useI18n()
   const { auth } = useAuth()
   const navigate = useNavigate()
   const inputRef = useRef<HTMLInputElement>(null)
@@ -116,7 +118,7 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
       <div
         role="dialog"
         aria-modal="true"
-        aria-label="全局搜索"
+        aria-label={t('searchModal.ariaLabel')}
         className="animate-modal-enter w-full max-w-2xl overflow-hidden rounded-2xl border border-white/12 bg-zinc-950/95 shadow-2xl shadow-black/80"
         onClick={(e) => e.stopPropagation()}
         onKeyDown={handleKeyDown}
@@ -128,13 +130,13 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="搜索影片、剧集、演员（支持中英文乱序模糊匹配）..."
+            placeholder={t('searchModal.placeholder')}
             className="w-full bg-transparent text-base text-zinc-100 placeholder-zinc-500 outline-none"
           />
           {loading && <Loader2 className="h-4 w-4 animate-spin text-amber-400" />}
           <button
             type="button"
-            aria-label="关闭搜索弹窗"
+            aria-label={t('searchModal.closeAria')}
             onClick={onClose}
             className="rounded-lg p-1 text-zinc-400 hover:bg-white/10 hover:text-zinc-100"
           >
@@ -145,11 +147,11 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
         <div className="max-h-[60vh] overflow-y-auto p-2">
           {!query.trim() ? (
             <div className="px-4 py-10 text-center text-sm text-zinc-500">
-              输入关键词即可即时检索整个媒体库，支持按 ↑ ↓ 选择，Enter 直达详情页
+              {t('searchModal.emptyPrompt')}
             </div>
           ) : hints.length === 0 && !loading ? (
             <div className="px-4 py-10 text-center text-sm text-zinc-500">
-              未找到与 “{query}” 匹配的媒体
+              {t('searchModal.noResults', { query })}
             </div>
           ) : (
             <div className="space-y-1">
@@ -203,11 +205,11 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
                       <p className="mt-0.5 truncate text-xs text-zinc-400">
                         {[
                           hint.Type === 'Movie'
-                            ? '电影'
+                            ? t('searchModal.typeMovie')
                             : hint.Type === 'Series'
-                              ? '剧集'
+                              ? t('searchModal.typeSeries')
                               : hint.Type === 'Episode'
-                                ? hint.Series || '剧集单集'
+                                ? hint.Series || t('searchModal.typeEpisode')
                                 : hint.Type,
                           hint.ProductionYear,
                         ]
