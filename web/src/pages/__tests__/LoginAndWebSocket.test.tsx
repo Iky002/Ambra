@@ -398,8 +398,8 @@ describe('Stream 3 (v0.9.1): WS Cache Sync, String Seek, Theme Songs & Forgot Pa
       </QueryClientProvider>,
     )
 
-    // 验证 fallback 版本号已更新为当前 v0.11.x
-    expect(await screen.findByText(/v0\.11\.\d+/)).toBeInTheDocument()
+    // 验证 fallback 版本号已更新为当前 v0.12.x
+    expect(await screen.findByText(/v0\.12\.\d+/)).toBeInTheDocument()
 
     // 打开忘记密码弹窗
     await user.click(screen.getByRole('button', { name: '忘记密码？' }))

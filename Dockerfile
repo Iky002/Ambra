@@ -19,7 +19,7 @@ FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS go-builder
 
 ARG TARGETOS
 ARG TARGETARCH
-ARG AMBRA_VERSION=v0.11.3
+ARG AMBRA_VERSION=v0.12.0
 
 WORKDIR /src
 COPY go.mod go.sum ./

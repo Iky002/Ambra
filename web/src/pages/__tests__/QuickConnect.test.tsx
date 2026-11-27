@@ -117,9 +117,9 @@ describe('Stream 4 (v0.9.3): QuickConnect Login, Profile Device Authorization & 
       </Routes>,
     )
 
-    // 验证回退版本号更新为 v0.11.3，且默认隐藏公开用户列表时不渲染快捷选号区
+    // 验证回退版本号更新为 v0.12.0，且默认隐藏公开用户列表时不渲染快捷选号区
     await waitFor(() => {
-      expect(screen.getByText(/v0\.11\.3/)).toBeInTheDocument()
+      expect(screen.getByText(/v0\.12\.0/)).toBeInTheDocument()
     })
     expect(screen.queryByText('选择账号快速登录')).not.toBeInTheDocument()
 
