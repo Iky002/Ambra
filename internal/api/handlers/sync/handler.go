@@ -25,12 +25,14 @@ import (
 )
 
 const (
-	stateConfigKey     = "sync:state"
-	maxSyncJobItemIDs  = 500
-	maxSyncJobsPerUser = 100
-	maxSyncJobNameLen  = 256
-	maxSyncFieldLen    = 128
-	maxSyncQualityLen  = 64
+	stateConfigKey              = "sync:state"
+	maxSyncJobItemIDs           = 500
+	maxSyncJobsPerUser          = 100
+	maxSyncJobNameLen           = 256
+	maxSyncFieldLen             = 128
+	maxSyncQualityLen           = 64
+	maxSyncBitrate              = 200_000_000
+	defaultSyncTranscodeTimeout = 2 * time.Hour
 )
 
 func isValidSyncJobStatus(status string) bool {
@@ -158,6 +160,7 @@ type Handler struct {
 	userRepo                  *sqlite.UserRepo
 	budgetPool                *budget.Pool
 	ffmpegPath                string
+	transcodeTimeout          time.Duration
 	streamResolverWithHeaders func(ctx context.Context, rawPath string) (*plugins.StreamResolveResult, error)
 	auth                      AuthFuncs
 
@@ -174,11 +177,85 @@ type Handler struct {
 
 func New(store *sqlite.Store, cfg *config.Config) *Handler {
 	h := &Handler{
-		store: store,
-		cfg:   cfg,
+		store:            store,
+		cfg:              cfg,
+		transcodeTimeout: defaultSyncTranscodeTimeout,
 	}
 	h.loadState(context.Background())
 	return h
+}
+
+// SetTranscodeTimeout configures the per-item FFmpeg execution timeout for offline sync transcodes.
+func (h *Handler) SetTranscodeTimeout(d time.Duration) {
+	h.mu.Lock()
+	h.transcodeTimeout = d
+	h.mu.Unlock()
+}
+
+func (h *Handler) getTranscodeTimeout() time.Duration {
+	h.mu.RLock()
+	d := h.transcodeTimeout
+	h.mu.RUnlock()
+	if d <= 0 {
+		return defaultSyncTranscodeTimeout
+	}
+	return d
+}
+
+// PurgeUser removes all sync jobs, job items, active transcodes, and cached sync files belonging to userID.
+func (h *Handler) PurgeUser(ctx context.Context, userID string) {
+	normUID := guid.Normalize(userID)
+	if normUID == "" {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	h.mu.Lock()
+	removedJobIDs := make(map[string]struct{})
+	keptJobs := make([]SyncJob, 0, len(h.state.Jobs))
+	for _, j := range h.state.Jobs {
+		if guid.Normalize(j.UserId) == normUID {
+			removedJobIDs[j.Id] = struct{}{}
+			continue
+		}
+		keptJobs = append(keptJobs, j)
+	}
+	if len(removedJobIDs) == 0 {
+		h.mu.Unlock()
+		return
+	}
+
+	snapshot := cloneSyncState(h.state)
+	h.state.Jobs = keptJobs
+
+	keptItems := make([]SyncJobItem, 0, len(h.state.JobItems))
+	var removedItemIDs []string
+	var removedPaths []string
+	for _, ji := range h.state.JobItems {
+		if _, drop := removedJobIDs[ji.JobId]; !drop {
+			keptItems = append(keptItems, ji)
+			continue
+		}
+		removedItemIDs = append(removedItemIDs, ji.Id)
+		if ji.OutputPath != "" {
+			removedPaths = append(removedPaths, ji.OutputPath)
+		}
+	}
+	h.state.JobItems = keptItems
+	if err := h.saveStateLocked(ctx); err != nil {
+		h.state = snapshot
+		h.mu.Unlock()
+		return
+	}
+	h.mu.Unlock()
+
+	h.cancelActiveTranscodeItems(removedItemIDs...)
+	h.cleanupSyncCacheFiles(removedPaths...)
+	for jid := range removedJobIDs {
+		h.cleanupSyncJobCacheDir(jid)
+	}
 }
 
 // SetLibraryRepo attaches a LibraryRepo so sync jobs and ready items can hydrate real library metadata.
@@ -642,6 +719,9 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "Bitrate and ItemLimit must be non-negative")
 		return
 	}
+	if req.Bitrate > maxSyncBitrate {
+		req.Bitrate = maxSyncBitrate
+	}
 	if req.TargetId == "" {
 		req.TargetId = "local-device"
 	}
@@ -787,19 +867,9 @@ func (h *Handler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 					h.expandSyncContainer(r.Context(), libRepo, serverID, job.UserId, callerUser, pRec, visitedContainers, seenExpanded, &expandedIDs)
 				}
 			} else if pLib, lErr := libRepo.GetLibrary(r.Context(), pID); lErr == nil && pLib != nil {
-				if callerUser != nil && !callerUser.IsAdmin && !callerUser.Policy.IsAdministrator && !callerUser.Policy.EnableAllFolders {
-					normLib := guid.Normalize(pLib.ID)
-					allowed := false
-					for _, fid := range callerUser.Policy.EnabledFolders {
-						if guid.Normalize(fid) == normLib {
-							allowed = true
-							break
-						}
-					}
-					if !allowed {
-						httpx.Error(w, http.StatusForbidden, "access denied to requested library")
-						return
-					}
+				if callerUser != nil && !callerUser.IsAdmin && !callerUser.Policy.IsAdministrator && !libRepo.CanUserAccessLibrary(r.Context(), callerUser.Policy, pLib.ID) {
+					httpx.Error(w, http.StatusForbidden, "access denied to requested library")
+					return
 				}
 				if libItems, _, qErr := libRepo.QueryItems(r.Context(), sqlite.ItemFilter{
 					ServerID:  serverID,
@@ -988,6 +1058,17 @@ func (h *Handler) handleUpdateJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	callerID, isAdmin, hasAuth := callerAuth(r)
+	if hasAuth && !isAdmin {
+		callerUser, ok := h.resolveCallerUserForSync(r, callerID)
+		if !ok {
+			httpx.Error(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		if !callerUser.IsAdmin && !callerUser.Policy.IsAdministrator && !callerUser.Policy.EnableContentDownloading {
+			httpx.Error(w, http.StatusForbidden, "content downloading is disabled")
+			return
+		}
+	}
 
 	h.mu.Lock()
 	for i := range h.state.Jobs {
@@ -1005,7 +1086,11 @@ func (h *Handler) handleUpdateJob(w http.ResponseWriter, r *http.Request) {
 				h.state.Jobs[i].Quality = req.Quality
 			}
 			if req.Bitrate != nil {
-				h.state.Jobs[i].Bitrate = *req.Bitrate
+				br := *req.Bitrate
+				if br > maxSyncBitrate {
+					br = maxSyncBitrate
+				}
+				h.state.Jobs[i].Bitrate = br
 			}
 			if req.UnwatchedOnly != nil {
 				h.state.Jobs[i].UnwatchedOnly = *req.UnwatchedOnly
@@ -1320,56 +1405,29 @@ func (h *Handler) canUserAccessItemRecord(ctx context.Context, libRepo *sqlite.L
 				return false
 			}
 		}
-	} else if rec.LibraryID != "" && !callerUser.Policy.EnableAllFolders {
-		normLib := guid.Normalize(rec.LibraryID)
-		allowed := false
-		for _, fid := range callerUser.Policy.EnabledFolders {
-			if guid.Normalize(fid) == normLib {
-				allowed = true
-				break
+	} else if rec.LibraryID != "" {
+		if libRepo != nil {
+			if !libRepo.CanUserAccessLibrary(ctx, callerUser.Policy, rec.LibraryID) {
+				return false
 			}
-		}
-		if !allowed {
-			return false
-		}
-	}
-	if libRepo != nil {
-		blocked, err := libRepo.IsItemBlockedByParentalPolicy(ctx, rec, callerUser.Policy.MaxParentalRating, callerUser.Policy.BlockedTags)
-		if err != nil || blocked {
-			return false
-		}
-		if len(callerUser.Policy.BlockUnratedItems) > 0 && !isSyncContainerType(rec.Type) {
-			for _, bu := range callerUser.Policy.BlockUnratedItems {
-				t := strings.TrimSpace(bu)
-				if t == "*" || strings.EqualFold(t, "All") || strings.EqualFold(t, rec.Type) || (rec.MediaType != "" && strings.EqualFold(t, rec.MediaType)) {
-					if strings.TrimSpace(rec.OfficialRating) == "" {
-						return false
-					}
+		} else if !callerUser.Policy.EnableAllFolders {
+			normLib := guid.Normalize(rec.LibraryID)
+			allowed := false
+			for _, fid := range callerUser.Policy.EnabledFolders {
+				if guid.Normalize(fid) == normLib {
+					allowed = true
 					break
 				}
 			}
+			if !allowed {
+				return false
+			}
 		}
-		if len(callerUser.Policy.AllowedTags) > 0 {
-			allowSet := make(map[string]bool, len(callerUser.Policy.AllowedTags))
-			for _, at := range callerUser.Policy.AllowedTags {
-				if s := strings.ToLower(strings.TrimSpace(at)); s != "" {
-					allowSet[s] = true
-				}
-			}
-			if len(allowSet) > 0 {
-				matched := false
-				if _, _, tags, tErr := libRepo.GetTaxonomiesByItemID(ctx, rec.ID); tErr == nil {
-					for _, tg := range tags {
-						if allowSet[strings.ToLower(strings.TrimSpace(tg))] {
-							matched = true
-							break
-						}
-					}
-				}
-				if !matched {
-					return false
-				}
-			}
+	}
+	if libRepo != nil {
+		blocked, err := libRepo.IsItemBlockedByPolicy(ctx, rec, callerUser.Policy)
+		if err != nil || blocked {
+			return false
 		}
 	}
 	return true

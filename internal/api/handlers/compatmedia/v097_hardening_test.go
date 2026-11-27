@@ -29,7 +29,7 @@ func TestCompatMediaV097HardeningAndParity(t *testing.T) {
 	ctx := context.Background()
 	repo := sqlite.NewLibraryRepo(store)
 	userRepo := sqlite.NewUserRepo(store)
-	cfg := config.Default(tmp)
+	cfg := config.Default(filepath.Join(tmp, "data"))
 
 	authSvc := auth.NewService(userRepo, cfg)
 	_, _ = authSvc.CreateUser(ctx, "admin", "admin123", true)

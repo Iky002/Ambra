@@ -151,7 +151,17 @@ func (h *Handler) canAccessItem(r *http.Request, item *sqlite.ItemRecord) bool {
 	}
 	if h.userRepo == nil {
 		if strings.EqualFold(item.Type, "Playlist") && uid != "" {
-			return h.canViewPlaylist(r, item.ID, item.ParentID)
+			if !h.canViewPlaylist(r, item.ID, item.ParentID) {
+				return false
+			}
+		}
+		if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && ac.User != nil && !ac.IsAdmin() && h.repo != nil {
+			pol := ac.User.Policy
+			if !strings.EqualFold(item.Type, "Playlist") && item.LibraryID != "" && !h.repo.CanUserAccessLibrary(r.Context(), pol, item.LibraryID) {
+				return false
+			}
+			blocked, err := h.repo.IsItemBlockedByPolicy(r.Context(), item, pol)
+			return err == nil && !blocked
 		}
 		return true
 	}
@@ -169,52 +179,32 @@ func (h *Handler) canAccessItem(r *http.Request, item *sqlite.ItemRecord) bool {
 		if !h.canViewPlaylist(r, item.ID, item.ParentID) {
 			return false
 		}
-	} else if item.LibraryID != "" && !u.Policy.EnableAllFolders {
-		normLib := guid.Normalize(item.LibraryID)
-		allowed := false
-		for _, fid := range u.Policy.EnabledFolders {
-			if guid.Normalize(fid) == normLib {
-				allowed = true
-				break
+	} else if item.LibraryID != "" {
+		if h.repo != nil {
+			if !h.repo.CanUserAccessLibrary(r.Context(), u.Policy, item.LibraryID) {
+				return false
 			}
-		}
-		if !allowed {
-			return false
+		} else if !u.Policy.EnableAllFolders {
+			normLib := guid.Normalize(item.LibraryID)
+			allowed := false
+			for _, fid := range u.Policy.EnabledFolders {
+				if guid.Normalize(fid) == normLib {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				return false
+			}
 		}
 	}
 	if h.repo != nil {
-		blocked, err := h.repo.IsItemBlockedByParentalPolicy(r.Context(), item, u.Policy.MaxParentalRating, u.Policy.BlockedTags)
+		blocked, err := h.repo.IsItemBlockedByPolicy(r.Context(), item, u.Policy)
 		if err != nil || blocked {
-			return false
-		}
-		if h.isItemBlockedByExtraPolicy(r.Context(), item, u.Policy.BlockUnratedItems, u.Policy.AllowedTags) {
 			return false
 		}
 	}
 	return true
-}
-
-func (h *Handler) isItemBlockedByExtraPolicy(ctx context.Context, rec *sqlite.ItemRecord, blockUnrated, allowedTags []string) bool {
-	if rec == nil || h.repo == nil {
-		return false
-	}
-	if len(blockUnrated) > 0 && matchesUnratedType(rec.Type, rec.MediaType, blockUnrated) {
-		rating := strings.TrimSpace(rec.OfficialRating)
-		if rating == "" && rec.SeriesID != "" {
-			if sRec, err := h.repo.GetItemRecordByID(ctx, rec.SeriesID); err == nil && sRec != nil {
-				rating = strings.TrimSpace(sRec.OfficialRating)
-			}
-		}
-		if rating == "" {
-			return true
-		}
-	}
-	if len(allowedTags) > 0 {
-		if !itemHasAnyAllowedTag(ctx, h.repo, rec, allowedTags) {
-			return true
-		}
-	}
-	return false
 }
 
 func matchesUnratedType(itemType, mediaType string, blocked []string) bool {
@@ -235,40 +225,6 @@ func matchesUnratedType(itemType, mediaType string, blocked []string) bool {
 		if strings.EqualFold(t, "Music") && (strings.EqualFold(itemType, "Audio") || strings.EqualFold(itemType, "MusicAlbum") || strings.EqualFold(mediaType, "Audio")) {
 			return true
 		}
-	}
-	return false
-}
-
-func itemHasAnyAllowedTag(ctx context.Context, repo *sqlite.LibraryRepo, rec *sqlite.ItemRecord, allowedTags []string) bool {
-	allowSet := make(map[string]bool, len(allowedTags))
-	for _, t := range allowedTags {
-		if s := strings.ToLower(strings.TrimSpace(t)); s != "" {
-			allowSet[s] = true
-		}
-	}
-	if len(allowSet) == 0 {
-		return true
-	}
-	checkDTO := func(id string) bool {
-		if strings.TrimSpace(id) == "" {
-			return false
-		}
-		it, err := repo.GetItemByID(ctx, "", "", id)
-		if err != nil || it == nil {
-			return false
-		}
-		for _, tg := range it.Tags {
-			if allowSet[strings.ToLower(strings.TrimSpace(tg))] {
-				return true
-			}
-		}
-		return false
-	}
-	if checkDTO(rec.ID) {
-		return true
-	}
-	if rec.SeriesID != "" && checkDTO(rec.SeriesID) {
-		return true
 	}
 	return false
 }
@@ -300,13 +256,26 @@ func (h *Handler) callerPolicy(r *http.Request) (*dto.UserPolicy, bool) {
 	return nil, false
 }
 
-func (h *Handler) authorizeAndAcquireHLS(w http.ResponseWriter, r *http.Request, item *sqlite.ItemRecord, params transcode.SessionParams) bool {
+func (h *Handler) canPlayMedia(r *http.Request) bool {
+	pol, isAdmin := h.callerPolicy(r)
+	if isAdmin || pol == nil {
+		return true
+	}
+	return pol.EnableMediaPlayback
+}
+
+func (h *Handler) authorizeAndAcquireHLS(w http.ResponseWriter, r *http.Request, item *sqlite.ItemRecord, params transcode.SessionParams) (func(), bool) {
+	noop := func() {}
 	if pol, isAdmin := h.callerPolicy(r); !isAdmin && pol != nil {
+		if !pol.EnableMediaPlayback {
+			httpx.Error(w, http.StatusForbidden, "media playback is disabled for this user")
+			return nil, false
+		}
 		isAudio := item != nil && (strings.EqualFold(item.Type, "Audio") || strings.EqualFold(item.MediaType, "Audio"))
 		if isAudio {
 			if !pol.EnableAudioPlaybackTranscoding {
 				httpx.Error(w, http.StatusForbidden, "audio playback transcoding is disabled for this user")
-				return false
+				return nil, false
 			}
 		} else {
 			isRemuxOnly := strings.EqualFold(strings.TrimSpace(params.VideoCodec), "copy") &&
@@ -314,23 +283,25 @@ func (h *Handler) authorizeAndAcquireHLS(w http.ResponseWriter, r *http.Request,
 			if isRemuxOnly {
 				if !pol.EnablePlaybackRemuxing && !pol.EnableVideoPlaybackTranscoding {
 					httpx.Error(w, http.StatusForbidden, "playback remuxing and video transcoding are disabled for this user")
-					return false
+					return nil, false
 				}
 			} else if !pol.EnableVideoPlaybackTranscoding {
 				httpx.Error(w, http.StatusForbidden, "video playback transcoding is disabled for this user")
-				return false
+				return nil, false
 			}
 		}
 	}
-	if h.cfg != nil && h.mgr != nil {
+	if r.Method != http.MethodHead && h.cfg != nil && h.mgr != nil {
 		if limit := h.cfg.Snapshot().SimultaneousStreamLimit; limit > 0 {
-			if _, ok := h.mgr.TryAcquireStreamSlot(limit, transcode.SessionKey(params)); !ok {
+			release, ok := h.mgr.TryAcquireStreamSlot(limit, transcode.SessionKey(params))
+			if !ok {
 				httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
-				return false
+				return nil, false
 			}
+			return release, true
 		}
 	}
-	return true
+	return noop, true
 }
 
 func isRemoteClientRequest(r *http.Request, cfg *config.Config) bool {
@@ -445,9 +416,11 @@ func (h *Handler) handleMasterPlaylist(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadGateway, "failed to resolve stream url")
 		return
 	}
-	if !h.authorizeAndAcquireHLS(w, r, item, params) {
+	releaseSlot, ok := h.authorizeAndAcquireHLS(w, r, item, params)
+	if !ok {
 		return
 	}
+	defer releaseSlot()
 
 	width, height := extractVideoDimensions(src)
 	if params.MaxWidth > 0 && (width == 0 || params.MaxWidth < width) {
@@ -479,7 +452,9 @@ func (h *Handler) handleMasterPlaylist(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/x-mpegURL; charset=utf-8")
 	w.Header().Set("Cache-Control", "private, no-store")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(m3u8))
+	if r.Method != http.MethodHead {
+		_, _ = w.Write([]byte(m3u8))
+	}
 }
 
 func (h *Handler) handleMediaPlaylist(w http.ResponseWriter, r *http.Request) {
@@ -507,10 +482,12 @@ func (h *Handler) handleMediaPlaylist(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadGateway, "failed to resolve stream url")
 		return
 	}
-	if !h.authorizeAndAcquireHLS(w, r, item, params) {
+	releaseSlot, ok := h.authorizeAndAcquireHLS(w, r, item, params)
+	if !ok {
 		return
 	}
-	if h.mgr != nil {
+	defer releaseSlot()
+	if r.Method != http.MethodHead && h.mgr != nil {
 		_, _ = h.mgr.RegisterSession(params)
 	}
 
@@ -527,10 +504,16 @@ func (h *Handler) handleMediaPlaylist(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/x-mpegURL; charset=utf-8")
 	w.Header().Set("Cache-Control", "private, no-store")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(m3u8))
+	if r.Method != http.MethodHead {
+		_, _ = w.Write([]byte(m3u8))
+	}
 }
 
 func (h *Handler) handleSubtitlePlaylist(w http.ResponseWriter, r *http.Request) {
+	if !h.canPlayMedia(r) {
+		httpx.Error(w, http.StatusForbidden, "media playback is disabled for this user")
+		return
+	}
 	itemID := guid.Normalize(r.PathValue("Id"))
 	msID := guid.Normalize(r.PathValue("MediaSourceId"))
 	idx, err := strconv.Atoi(r.PathValue("Index"))
@@ -561,8 +544,18 @@ func (h *Handler) handleSubtitlePlaylist(w http.ResponseWriter, r *http.Request)
 
 	vttURI := "Stream.vtt"
 	q := httpx.ParseQuery(r)
-	if token := resolveRequestToken(r, q); token != "" {
+	addMap := true
+	if b := q.Bool("addVttTimeMap"); b != nil {
+		addMap = *b
+	}
+	token := resolveRequestToken(r, q)
+	switch {
+	case token != "" && addMap:
+		vttURI += "?api_key=" + url.QueryEscape(token) + "&addVttTimeMap=true"
+	case token != "":
 		vttURI += "?api_key=" + url.QueryEscape(token)
+	case addMap:
+		vttURI += "?addVttTimeMap=true"
 	}
 
 	durSec := float64(resolveRuntimeTicks(item, src)) / float64(transcode.TicksPerSecond)
@@ -571,7 +564,9 @@ func (h *Handler) handleSubtitlePlaylist(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Content-Type", "application/x-mpegURL; charset=utf-8")
 	w.Header().Set("Cache-Control", "private, no-store")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(m3u8))
+	if r.Method != http.MethodHead {
+		_, _ = w.Write([]byte(m3u8))
+	}
 }
 
 func hasTextSubtitleStream(src *sqlite.MediaSourceRecord, idx int) bool {
@@ -672,7 +667,20 @@ func (h *Handler) handleSegment(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadGateway, "failed to resolve stream url")
 		return
 	}
-	if !h.authorizeAndAcquireHLS(w, r, item, params) {
+	releaseSlot, ok := h.authorizeAndAcquireHLS(w, r, item, params)
+	if !ok {
+		return
+	}
+	defer releaseSlot()
+	if r.Method == http.MethodHead {
+		switch ext {
+		case "mp4", "m4s":
+			w.Header().Set("Content-Type", "video/mp4")
+		default:
+			w.Header().Set("Content-Type", "video/mp2t")
+		}
+		w.Header().Set("Cache-Control", "private, max-age=3600")
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 	params.SegmentContainer = ext
@@ -729,7 +737,15 @@ func (h *Handler) handleInitSegment(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadGateway, "failed to resolve stream url")
 		return
 	}
-	if !h.authorizeAndAcquireHLS(w, r, item, params) {
+	releaseSlot, ok := h.authorizeAndAcquireHLS(w, r, item, params)
+	if !ok {
+		return
+	}
+	defer releaseSlot()
+	if r.Method == http.MethodHead {
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Cache-Control", "private, max-age=3600")
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 	if sc := strings.ToLower(strings.TrimSpace(params.SegmentContainer)); sc != "mp4" && sc != "m4s" {
@@ -887,6 +903,10 @@ type liveStreamOpenResponse struct {
 }
 
 func (h *Handler) handleLiveStreamOpen(w http.ResponseWriter, r *http.Request) {
+	if !h.canPlayMedia(r) {
+		httpx.Error(w, http.StatusForbidden, "media playback is disabled for this user")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	var req liveStreamOpenRequest
 	if r.Body != nil {
@@ -1296,6 +1316,7 @@ func (h *Handler) buildSessionParamsChecked(r *http.Request, item *sqlite.ItemRe
 		AudioChannels:         audioChannels,
 		MaxWidth:              q.Int("MaxWidth", 0),
 		MaxHeight:             q.Int("MaxHeight", 0),
+		StartTimeTicks:        q.Int64("StartTimeTicks", 0),
 		AudioStreamIndex:      audioIdx,
 		SubtitleStreamIndex:   subIdx,
 		SubtitleRelativeIndex: subRelIdx,
@@ -1467,6 +1488,43 @@ func isBlockedStrmHost(host string) bool {
 		if addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() {
 			return true
 		}
+	}
+	return false
+}
+
+func itemHasAnyAllowedTag(ctx context.Context, repo *sqlite.LibraryRepo, rec *sqlite.ItemRecord, allowedTags []string) bool {
+	allowSet := make(map[string]bool, len(allowedTags))
+	for _, t := range allowedTags {
+		if s := strings.ToLower(strings.TrimSpace(t)); s != "" {
+			allowSet[s] = true
+		}
+	}
+	if len(allowSet) == 0 {
+		return true
+	}
+	if repo == nil || rec == nil {
+		return false
+	}
+	checkDTO := func(id string) bool {
+		if strings.TrimSpace(id) == "" {
+			return false
+		}
+		it, err := repo.GetItemByID(ctx, "", "", id)
+		if err != nil || it == nil {
+			return false
+		}
+		for _, tg := range it.Tags {
+			if allowSet[strings.ToLower(strings.TrimSpace(tg))] {
+				return true
+			}
+		}
+		return false
+	}
+	if checkDTO(rec.ID) {
+		return true
+	}
+	if rec.SeriesID != "" && checkDTO(rec.SeriesID) {
+		return true
 	}
 	return false
 }

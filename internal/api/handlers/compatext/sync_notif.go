@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
 	"os"
@@ -1037,7 +1038,21 @@ func (h *Handler) resolveSyncAdditionalSubtitle(
 	}
 
 	// Embedded subtitle extraction via transcode.Extractor.
-	if strings.TrimSpace(mediaPath) != "" && h.cfg != nil {
+	if trimmedMedia := strings.TrimSpace(mediaPath); trimmedMedia != "" && h.cfg != nil {
+		lowerMedia := strings.ToLower(trimmedMedia)
+		if strings.EqualFold(filepath.Ext(trimmedMedia), ".strm") ||
+			strings.HasPrefix(lowerMedia, "http://") ||
+			strings.HasPrefix(lowerMedia, "https://") {
+			return nil, "", false
+		}
+		realMedia, err := filepath.EvalSymlinks(trimmedMedia)
+		if err != nil {
+			return nil, "", false
+		}
+		realMedia = filepath.Clean(realMedia)
+		if !isPathWithinRegisteredLibraries(ctx, libRepo, realMedia) {
+			return nil, "", false
+		}
 		format := "webvtt"
 		ct := "text/vtt; charset=utf-8"
 		if reqExt == "srt" {
@@ -1052,7 +1067,7 @@ func (h *Handler) resolveSyncAdditionalSubtitle(
 			mediaSourceID = strings.TrimSpace(sources[0].ID)
 		}
 		ext := transcode.NewExtractor(h.cfg)
-		if outFile, err := ext.ExtractSubtitle(ctx, mediaPath, itemRec.ID, mediaSourceID, chosen.StreamIndex, format); err == nil && strings.TrimSpace(outFile) != "" {
+		if outFile, err := ext.ExtractSubtitle(ctx, realMedia, itemRec.ID, mediaSourceID, chosen.StreamIndex, format); err == nil && strings.TrimSpace(outFile) != "" {
 			if f, oErr := os.Open(outFile); oErr == nil {
 				data, rErr := io.ReadAll(io.LimitReader(f, maxSubtitleBytes))
 				_ = f.Close()
@@ -1397,7 +1412,16 @@ func (h *Handler) handleTestNotificationService(w http.ResponseWriter, r *http.R
 	}
 	// Record last test timestamp in memory without unconditional SQLite write on every test call.
 	h.state.LastTestNotifUnix = time.Now().UTC().Unix()
+	tester := h.notifTester
 	h.mu.Unlock()
+
+	if tester != nil {
+		if err := tester(r.Context(), "Ambra Test Notification", "This is a test notification from Ambra."); err != nil {
+			slog.Error("notification test delivery failed", "service_id", targetID, "error", err)
+			httpx.Error(w, http.StatusBadGateway, "notification test delivery failed")
+			return
+		}
+	}
 	httpx.NoContent(w)
 }
 

@@ -137,7 +137,13 @@ func (h *Handler) CanAccessLibrary(ctx context.Context, userID, libraryID string
 	if err != nil || u == nil {
 		return false
 	}
-	if u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableAllFolders {
+	if u.IsAdmin || u.Policy.IsAdministrator {
+		return true
+	}
+	if h.repo != nil {
+		return h.repo.CanUserAccessLibrary(ctx, u.Policy, libraryID)
+	}
+	if u.Policy.EnableAllFolders {
 		return true
 	}
 	normLib := guid.Normalize(libraryID)
@@ -185,6 +191,14 @@ func (h *Handler) callerPolicy(r *http.Request) (*dto.UserPolicy, string, bool) 
 	return nil, "", false
 }
 
+func (h *Handler) canPlayMedia(r *http.Request) bool {
+	pol, _, isAdmin := h.callerPolicy(r)
+	if isAdmin || pol == nil {
+		return true
+	}
+	return pol.EnableMediaPlayback
+}
+
 func matchesBlockUnratedAudio(itemType, mediaType string, blockUnrated []string) bool {
 	for _, b := range blockUnrated {
 		t := strings.TrimSpace(b)
@@ -196,41 +210,6 @@ func matchesBlockUnratedAudio(itemType, mediaType string, blockUnrated []string)
 		}
 		if strings.EqualFold(t, "Music") && (strings.EqualFold(itemType, "Audio") || strings.EqualFold(itemType, "MusicAlbum") || strings.EqualFold(itemType, "MusicArtist") || strings.EqualFold(mediaType, "Audio")) {
 			return true
-		}
-	}
-	return false
-}
-
-func (h *Handler) isBlockedByExtendedAudioPolicy(ctx context.Context, rec *sqlite.ItemRecord, pol dto.UserPolicy) bool {
-	if rec == nil || h.repo == nil {
-		return false
-	}
-	if len(pol.BlockUnratedItems) > 0 && matchesBlockUnratedAudio(rec.Type, rec.MediaType, pol.BlockUnratedItems) {
-		if strings.TrimSpace(rec.OfficialRating) == "" {
-			return true
-		}
-	}
-	if len(pol.AllowedTags) > 0 {
-		allowSet := make(map[string]bool, len(pol.AllowedTags))
-		for _, t := range pol.AllowedTags {
-			if s := strings.ToLower(strings.TrimSpace(t)); s != "" {
-				allowSet[s] = true
-			}
-		}
-		if len(allowSet) > 0 {
-			matched := false
-			_, _, tags, err := h.repo.GetTaxonomiesByItemID(ctx, rec.ID)
-			if err == nil {
-				for _, tg := range tags {
-					if allowSet[strings.ToLower(strings.TrimSpace(tg))] {
-						matched = true
-						break
-					}
-				}
-			}
-			if !matched {
-				return true
-			}
 		}
 	}
 	return false
@@ -277,24 +256,11 @@ func (h *Handler) canAccessItem(r *http.Request, itemID string) bool {
 				return false
 			}
 			pol := ac.User.Policy
-			if rec.LibraryID != "" && !pol.EnableAllFolders {
-				allowed := false
-				normLib := guid.Normalize(rec.LibraryID)
-				for _, fid := range pol.EnabledFolders {
-					if guid.Normalize(fid) == normLib {
-						allowed = true
-						break
-					}
-				}
-				if !allowed {
-					return false
-				}
-			}
-			blocked, err := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, pol.MaxParentalRating, pol.BlockedTags)
-			if err != nil || blocked {
+			if rec.LibraryID != "" && !h.repo.CanUserAccessLibrary(r.Context(), pol, rec.LibraryID) {
 				return false
 			}
-			return !h.isBlockedByExtendedAudioPolicy(r.Context(), rec, pol)
+			blocked, err := h.repo.IsItemBlockedByPolicy(r.Context(), rec, pol)
+			return err == nil && !blocked
 		}
 		return true
 	}
@@ -327,11 +293,8 @@ func (h *Handler) canAccessItem(r *http.Request, itemID string) bool {
 	if u.IsAdmin || u.Policy.IsAdministrator {
 		return true
 	}
-	blocked, err := h.repo.IsItemBlockedByParentalPolicy(r.Context(), rec, u.Policy.MaxParentalRating, u.Policy.BlockedTags)
-	if err != nil || blocked {
-		return false
-	}
-	return !h.isBlockedByExtendedAudioPolicy(r.Context(), rec, u.Policy)
+	blocked, err := h.repo.IsItemBlockedByPolicy(r.Context(), rec, u.Policy)
+	return err == nil && !blocked
 }
 
 // RegisterRoutes mounts all /Audio/* endpoints on mux.
@@ -371,6 +334,10 @@ func (h *Handler) handleAudioFile(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleDirectStream(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(r.PathValue("Id"))
+	if !h.canPlayMedia(r) {
+		httpx.Error(w, http.StatusForbidden, "media playback is disabled for this user")
+		return
+	}
 	if !h.canAccessItem(r, itemID) {
 		httpx.Error(w, http.StatusForbidden, "access denied")
 		return
@@ -415,6 +382,10 @@ func (h *Handler) handleDirectStream(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleUniversal(w http.ResponseWriter, r *http.Request, urlExt string) {
 	itemID := guid.Normalize(r.PathValue("Id"))
+	if !h.canPlayMedia(r) {
+		httpx.Error(w, http.StatusForbidden, "media playback is disabled for this user")
+		return
+	}
 	if !h.canAccessItem(r, itemID) {
 		httpx.Error(w, http.StatusForbidden, "access denied")
 		return
@@ -548,9 +519,15 @@ func (h *Handler) streamTranscodeAudio(w http.ResponseWriter, r *http.Request, m
 }
 
 func (h *Handler) streamTranscodeAudioWithHeaders(w http.ResponseWriter, r *http.Request, mediaPath string, inputHeaders map[string]string, targetContainer, targetCodec string, bitrate int, startTimeTicks int64, audioChannels, audioSampleRate int) {
-	if pol, _, isAdmin := h.callerPolicy(r); !isAdmin && pol != nil && !pol.EnableAudioPlaybackTranscoding {
-		httpx.Error(w, http.StatusForbidden, "audio playback transcoding is disabled for this user")
-		return
+	if pol, _, isAdmin := h.callerPolicy(r); !isAdmin && pol != nil {
+		if !pol.EnableMediaPlayback {
+			httpx.Error(w, http.StatusForbidden, "media playback is disabled for this user")
+			return
+		}
+		if !pol.EnableAudioPlaybackTranscoding {
+			httpx.Error(w, http.StatusForbidden, "audio playback transcoding is disabled for this user")
+			return
+		}
 	}
 
 	if isHTTPURL(mediaPath) {
@@ -635,8 +612,12 @@ func (h *Handler) streamTranscodeAudioWithHeaders(w http.ResponseWriter, r *http
 		}
 	}
 
+	// [M-08] Cancel child FFmpeg and close stdout pipe immediately when io.Copy returns
+	// so disconnected clients cannot block cmd.Wait() while holding transcodeSem / stream slots.
+	procCtx, cancel := context.WithCancel(r.Context())
+	defer cancel()
 	args := netutil.FilterFFmpegArgs(ffmpegPath, buildAudioFFmpegArgs(ffmpegInput, muxFmt, encoder, bitrate, startTimeTicks, audioChannels, audioSampleRate))
-	cmd := exec.CommandContext(r.Context(), ffmpegPath, args...)
+	cmd := exec.CommandContext(procCtx, ffmpegPath, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		slog.Error("failed to open ffmpeg stdout pipe", "error", err)
@@ -651,6 +632,8 @@ func (h *Handler) streamTranscodeAudioWithHeaders(w http.ResponseWriter, r *http
 
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, stdout)
+	cancel()
+	_ = stdout.Close()
 	_ = cmd.Wait()
 }
 
@@ -772,6 +755,71 @@ func (h *Handler) handleLyrics(w http.ResponseWriter, r *http.Request) {
 	httpx.Error(w, http.StatusNotFound, "lyrics not found")
 }
 
+func audioHLSCodecAttr(codec string) string {
+	switch strings.ToLower(strings.TrimSpace(codec)) {
+	case "mp3":
+		return "mp4a.40.34"
+	case "opus":
+		return "opus"
+	case "flac":
+		return "fLaC"
+	case "ac3":
+		return "ac-3"
+	case "eac3":
+		return "ec-3"
+	default:
+		return "mp4a.40.2"
+	}
+}
+
+func resolveAudioRequestToken(r *http.Request, q httpx.Query) string {
+	if tok := strings.TrimSpace(q.Get("api_key")); tok != "" {
+		return tok
+	}
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && strings.TrimSpace(ac.Token) != "" {
+		return strings.TrimSpace(ac.Token)
+	}
+	for _, hdr := range []string{"X-Emby-Token", "X-MediaBrowser-Token"} {
+		if tok := strings.TrimSpace(r.Header.Get(hdr)); tok != "" {
+			return tok
+		}
+	}
+	for _, hdr := range []string{"Authorization", "X-Emby-Authorization"} {
+		raw := strings.TrimSpace(r.Header.Get(hdr))
+		if raw == "" {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(raw), "bearer ") {
+			if tok := strings.TrimSpace(raw[7:]); tok != "" {
+				return tok
+			}
+		}
+		lower := strings.ToLower(raw)
+		if idx := strings.Index(lower, `token="`); idx >= 0 {
+			rest := raw[idx+len(`token="`):]
+			if end := strings.IndexByte(rest, '"'); end > 0 {
+				return strings.TrimSpace(rest[:end])
+			}
+		}
+	}
+	return ""
+}
+
+func preserveAudioQueryWithToken(raw url.Values, token string) url.Values {
+	out := make(url.Values, len(raw)+1)
+	hasAPIKey := false
+	for k, v := range raw {
+		out[k] = append([]string(nil), v...)
+		if strings.EqualFold(k, "api_key") && len(v) > 0 && strings.TrimSpace(v[0]) != "" {
+			hasAPIKey = true
+		}
+	}
+	if token != "" && !hasAPIKey {
+		out.Set("api_key", token)
+	}
+	return out
+}
+
 func (h *Handler) buildAudioHLSSessionParams(r *http.Request, itemID string) (transcode.SessionParams, *sqlite.ItemRecord, error) {
 	q := httpx.ParseQuery(r)
 	mediaSourceID := guid.Normalize(q.Get("MediaSourceId"))
@@ -806,12 +854,42 @@ func (h *Handler) buildAudioHLSSessionParams(r *http.Request, itemID string) (tr
 		segExt = "ts"
 	}
 	bitrate := q.Int("AudioBitrate", 192_000)
+	if bitrate <= 0 {
+		bitrate = 192_000
+	}
+	if bitrate > maxAudioBitrate {
+		bitrate = maxAudioBitrate
+	}
 	if h.cfg != nil {
 		snap := h.cfg.Snapshot()
 		if snap.RemoteClientBitrateLimit > 0 && !isLocalOrSubnetAudioRequest(r, snap.LocalNetworkSubnets) && bitrate > snap.RemoteClientBitrateLimit {
 			bitrate = snap.RemoteClientBitrateLimit
 		}
 	}
+	channels := q.Int("AudioChannels", 2)
+	if channels <= 0 {
+		channels = 2
+	}
+	if channels > maxAudioChannels {
+		channels = maxAudioChannels
+	}
+	segDur := q.Int("SegmentLength", transcode.DefaultSegmentDuration)
+	if segDur <= 0 {
+		segDur = transcode.DefaultSegmentDuration
+	}
+	if segDur < 2 {
+		segDur = 2
+	}
+	if segDur > 15 {
+		segDur = 15
+	}
+	audioCodec := strings.ToLower(strings.TrimSpace(firstNonEmptyAudio(q.Get("AudioCodec"), "aac")))
+	switch audioCodec {
+	case "aac", "mp3", "opus", "ac3", "eac3", "flac", "copy":
+	default:
+		audioCodec = "aac"
+	}
+
 	var durSec float64
 	if rec != nil && rec.RuntimeTicks != nil && *rec.RuntimeTicks > 0 {
 		durSec = float64(*rec.RuntimeTicks) / float64(ticksPerSecond)
@@ -828,10 +906,11 @@ func (h *Handler) buildAudioHLSSessionParams(r *http.Request, itemID string) (tr
 		InputPath:        mediaPath,
 		InputHeaders:     headers,
 		VideoCodec:       "none",
-		AudioCodec:       firstNonEmptyAudio(q.Get("AudioCodec"), "aac"),
+		AudioCodec:       audioCodec,
 		AudioBitrate:     bitrate,
-		AudioChannels:    q.Int("AudioChannels", 2),
-		SegmentDuration:  q.Int("SegmentLength", transcode.DefaultSegmentDuration),
+		AudioChannels:    channels,
+		StartTimeTicks:   q.Int64("StartTimeTicks", 0),
+		SegmentDuration:  segDur,
 		SegmentContainer: segExt,
 		DurationSec:      durSec,
 		AudioOnly:        true,
@@ -853,9 +932,15 @@ func (h *Handler) handleAudioHLSPlaylist(w http.ResponseWriter, r *http.Request,
 		httpx.Error(w, http.StatusForbidden, "access denied")
 		return
 	}
-	if pol, _, isAdmin := h.callerPolicy(r); !isAdmin && pol != nil && !pol.EnableAudioPlaybackTranscoding {
-		httpx.Error(w, http.StatusForbidden, "audio playback transcoding is disabled for this user")
-		return
+	if pol, _, isAdmin := h.callerPolicy(r); !isAdmin && pol != nil {
+		if !pol.EnableMediaPlayback {
+			httpx.Error(w, http.StatusForbidden, "media playback is disabled for this user")
+			return
+		}
+		if !pol.EnableAudioPlaybackTranscoding {
+			httpx.Error(w, http.StatusForbidden, "audio playback transcoding is disabled for this user")
+			return
+		}
 	}
 	params, _, err := h.buildAudioHLSSessionParams(r, itemID)
 	if errors.Is(err, sqlite.ErrNotFound) {
@@ -868,31 +953,37 @@ func (h *Handler) handleAudioHLSPlaylist(w http.ResponseWriter, r *http.Request,
 	}
 	if h.cfg != nil && h.transcodeMgr != nil {
 		if limit := h.cfg.Snapshot().SimultaneousStreamLimit; limit > 0 {
-			if _, allowed := h.transcodeMgr.TryAcquireStreamSlot(limit, transcode.SessionKey(params)); !allowed {
+			releaseSlot, allowed := h.transcodeMgr.TryAcquireStreamSlot(limit, transcode.SessionKey(params))
+			if !allowed {
 				httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
 				return
 			}
+			defer releaseSlot()
 		}
-		_, _ = h.transcodeMgr.RegisterSession(params)
+		// [L-04] Do not pre-register idle transcode sessions on master.m3u8 or HEAD probes.
+		if playlistFile != "master.m3u8" && r.Method != http.MethodHead {
+			_, _ = h.transcodeMgr.RegisterSession(params)
+		}
 	}
 
-	rawQuery := r.URL.RawQuery
+	q := httpx.ParseQuery(r)
+	token := resolveAudioRequestToken(r, q)
+	qVals := preserveAudioQueryWithToken(r.URL.Query(), token)
+	encodedQuery := qVals.Encode()
+
 	var body string
 	if playlistFile == "master.m3u8" {
 		target := "main.m3u8"
-		if rawQuery != "" {
-			target += "?" + rawQuery
+		if encodedQuery != "" {
+			target += "?" + encodedQuery
 		}
 		bw := params.AudioBitrate
 		if bw <= 0 {
 			bw = 192_000
 		}
-		body = fmt.Sprintf("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=%d,CODECS=\"mp4a.40.2\"\n%s\n", bw, target)
+		codecAttr := audioHLSCodecAttr(params.AudioCodec)
+		body = fmt.Sprintf("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=%d,CODECS=\"%s\"\n%s\n", bw, codecAttr, target)
 	} else {
-		var qVals url.Values
-		if rawQuery != "" {
-			qVals, _ = url.ParseQuery(rawQuery)
-		}
 		body = transcode.BuildMediaPlaylist(transcode.PlaylistParams{
 			ItemID:           itemID,
 			PlaylistID:       "main",
@@ -916,9 +1007,15 @@ func (h *Handler) handleAudioHLSSegment(w http.ResponseWriter, r *http.Request) 
 		httpx.Error(w, http.StatusForbidden, "access denied")
 		return
 	}
-	if pol, _, isAdmin := h.callerPolicy(r); !isAdmin && pol != nil && !pol.EnableAudioPlaybackTranscoding {
-		httpx.Error(w, http.StatusForbidden, "audio playback transcoding is disabled for this user")
-		return
+	if pol, _, isAdmin := h.callerPolicy(r); !isAdmin && pol != nil {
+		if !pol.EnableMediaPlayback {
+			httpx.Error(w, http.StatusForbidden, "media playback is disabled for this user")
+			return
+		}
+		if !pol.EnableAudioPlaybackTranscoding {
+			httpx.Error(w, http.StatusForbidden, "audio playback transcoding is disabled for this user")
+			return
+		}
 	}
 	if h.transcodeMgr == nil {
 		httpx.Error(w, http.StatusNotFound, "audio hls segment not available")
@@ -958,13 +1055,28 @@ func (h *Handler) handleAudioHLSSegment(w http.ResponseWriter, r *http.Request) 
 		httpx.Error(w, http.StatusBadGateway, "failed to resolve audio source")
 		return
 	}
+
+	ct := "audio/mp2t"
+	if isInit || segExt == "mp4" || segExt == "m4s" {
+		ct = "audio/mp4"
+	}
+	// [H-07] Return headers immediately on HEAD without spawning FFmpeg or allocating a transcode session.
+	if r.Method == http.MethodHead {
+		w.Header().Set("Content-Type", ct)
+		w.Header().Set("Cache-Control", "private, max-age=3600")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	params.SegmentContainer = segExt
 	if h.cfg != nil {
 		if limit := h.cfg.Snapshot().SimultaneousStreamLimit; limit > 0 {
-			if _, allowed := h.transcodeMgr.TryAcquireStreamSlot(limit, transcode.SessionKey(params)); !allowed {
+			releaseSlot, allowed := h.transcodeMgr.TryAcquireStreamSlot(limit, transcode.SessionKey(params))
+			if !allowed {
 				httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
 				return
 			}
+			defer releaseSlot()
 		}
 	}
 
@@ -988,10 +1100,6 @@ func (h *Handler) handleAudioHLSSegment(w http.ResponseWriter, r *http.Request) 
 	if err != nil || st.IsDir() {
 		httpx.Error(w, http.StatusNotFound, "audio segment missing")
 		return
-	}
-	ct := "audio/mp2t"
-	if isInit || segExt == "mp4" || segExt == "m4s" {
-		ct = "audio/mp4"
 	}
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Cache-Control", "private, max-age=3600")

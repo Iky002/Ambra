@@ -100,10 +100,6 @@ func startExtractorInputProxy(mediaPath string, headers map[string]string) (stri
 	if !isHTTPInput(mediaPath) {
 		return mediaPath, func() {}, nil
 	}
-	lowerNoQuery := strings.ToLower(strings.SplitN(mediaPath, "?", 2)[0])
-	if strings.HasSuffix(lowerNoQuery, ".m3u8") {
-		return mediaPath, func() {}, nil
-	}
 	proxy, err := StartLoopbackStreamProxy(LoopbackProxyOptions{
 		TargetURL:       mediaPath,
 		Headers:         headers,
@@ -218,6 +214,12 @@ func BuildSubtitleExtractArgs(mediaPath string, streamIndex int, targetExt, outP
 // ExtractFonts extracts embedded font attachments (e.g. TTF/OTF in MKV) for client-side ASS rendering (JASSUB).
 // Returns the list of extracted font file paths cached under cfg.SubtitleCacheDir()/fonts/<itemID>_<mediaSourceID>/.
 func (e *Extractor) ExtractFonts(ctx context.Context, mediaPath, itemID, mediaSourceID string) ([]string, error) {
+	return e.ExtractFontsWithHeaders(ctx, mediaPath, nil, itemID, mediaSourceID)
+}
+
+// ExtractFontsWithHeaders extracts embedded font attachments while forwarding optional upstream HTTP headers
+// (e.g. from StreamResolver for .strm cloud storage containers) via LoopbackStreamProxy.
+func (e *Extractor) ExtractFontsWithHeaders(ctx context.Context, mediaPath string, headers map[string]string, itemID, mediaSourceID string) ([]string, error) {
 	resolvedMedia, err := resolveMediaInputPath(mediaPath)
 	if err != nil {
 		return nil, err
@@ -251,7 +253,7 @@ func (e *Extractor) ExtractFonts(ctx context.Context, mediaPath, itemID, mediaSo
 		runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultExtractTimeout)
 		defer cancel()
 
-		ffInput, closeProxy, proxyErr := startExtractorInputProxy(resolvedMedia, nil)
+		ffInput, closeProxy, proxyErr := startExtractorInputProxy(resolvedMedia, headers)
 		if proxyErr != nil {
 			return nil, proxyErr
 		}
