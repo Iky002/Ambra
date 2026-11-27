@@ -2,7 +2,7 @@ APP_NAME      := ambra
 CMD_PKG       := ./cmd/ambra
 BIN_DIR       := bin
 DIST_DIR      := dist
-AMBRA_VERSION ?= v0.11.1
+AMBRA_VERSION ?= v0.11.2
 LDFLAGS       ?= -s -w -X github.com/ambra-media/ambra/internal/config.AmbraVersion=$(AMBRA_VERSION)
 
 PLATFORMS  := \
