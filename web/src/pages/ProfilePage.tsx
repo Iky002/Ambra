@@ -34,42 +34,42 @@ const ALLOWED_AVATAR_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/web
 const MAX_AVATAR_UPLOAD_BYTES = 5 * 1024 * 1024 // 5 MB
 
 const AUDIO_LANG_OPTIONS = [
-  { value: 'media', label: '跟随媒体默认' },
-  { value: 'auto', label: '跟随界面语言' },
-  { value: 'chi', label: '中文 (国语/粤语)' },
-  { value: 'eng', label: '英语 (English)' },
-  { value: 'jpn', label: '日语 (日本語)' },
-  { value: 'kor', label: '韩语 (한국어)' },
-  { value: 'spa', label: '西班牙语 (Español)' },
-  { value: 'ger', label: '德语 (Deutsch)' },
-  { value: 'fre', label: '法语 (Français)' },
-  { value: 'por', label: '葡萄牙语 (Português)' },
-  { value: 'tha', label: '泰语 (ไทย)' },
+  { value: 'media', labelKey: 'profile.langMediaDefault' },
+  { value: 'auto', labelKey: 'profile.langFollowUi' },
+  { value: 'chi', labelKey: 'profile.langChinese' },
+  { value: 'eng', labelKey: 'profile.langEnglish' },
+  { value: 'jpn', labelKey: 'profile.langJapanese' },
+  { value: 'kor', labelKey: 'profile.langKorean' },
+  { value: 'spa', labelKey: 'profile.langSpanish' },
+  { value: 'ger', labelKey: 'profile.langGerman' },
+  { value: 'fre', labelKey: 'profile.langFrench' },
+  { value: 'por', labelKey: 'profile.langPortuguese' },
+  { value: 'tha', labelKey: 'profile.langThai' },
 ]
 
 const SUBTITLE_LANG_OPTIONS = [
-  { value: 'auto', label: '跟随界面语言（默认）' },
-  { value: 'media', label: '跟随媒体默认' },
-  { value: 'chs', label: '简体中文优先' },
-  { value: 'cht', label: '繁体中文优先' },
-  { value: 'chi', label: '中文（不限简繁）' },
-  { value: 'eng', label: '英语 (English)' },
-  { value: 'jpn', label: '日语 (日本語)' },
-  { value: 'kor', label: '韩语 (한국어)' },
-  { value: 'spa', label: '西班牙语 (Español)' },
-  { value: 'ger', label: '德语 (Deutsch)' },
-  { value: 'fre', label: '法语 (Français)' },
-  { value: 'por', label: '葡萄牙语 (Português)' },
-  { value: 'tha', label: '泰语 (ไทย)' },
-  { value: 'off', label: '默认关闭字幕' },
+  { value: 'auto', labelKey: 'profile.langFollowUiDefault' },
+  { value: 'media', labelKey: 'profile.langMediaDefault' },
+  { value: 'chs', labelKey: 'profile.langChineseSimplified' },
+  { value: 'cht', labelKey: 'profile.langChineseTraditional' },
+  { value: 'chi', labelKey: 'profile.langChineseAny' },
+  { value: 'eng', labelKey: 'profile.langEnglish' },
+  { value: 'jpn', labelKey: 'profile.langJapanese' },
+  { value: 'kor', labelKey: 'profile.langKorean' },
+  { value: 'spa', labelKey: 'profile.langSpanish' },
+  { value: 'ger', labelKey: 'profile.langGerman' },
+  { value: 'fre', labelKey: 'profile.langFrench' },
+  { value: 'por', labelKey: 'profile.langPortuguese' },
+  { value: 'tha', labelKey: 'profile.langThai' },
+  { value: 'off', labelKey: 'profile.subOff' },
 ]
 
-const SUBTITLE_MODE_OPTIONS: { value: SubtitleModeOption; label: string }[] = [
-  { value: 'Default', label: '默认（按偏好自动匹配）' },
-  { value: 'Smart', label: '智能（仅非母语音轨时显示）' },
-  { value: 'OnlyForced', label: '仅强制字幕' },
-  { value: 'Always', label: '总是显示字幕' },
-  { value: 'None', label: '从不显示字幕' },
+const SUBTITLE_MODE_OPTIONS: { value: SubtitleModeOption; labelKey: string }[] = [
+  { value: 'Default', labelKey: 'profile.subModeDefault' },
+  { value: 'Smart', labelKey: 'profile.subModeSmart' },
+  { value: 'OnlyForced', labelKey: 'profile.subModeOnlyForced' },
+  { value: 'Always', labelKey: 'profile.subModeAlways' },
+  { value: 'None', labelKey: 'profile.subModeNone' },
 ]
 
 export function ProfilePage() {
@@ -130,7 +130,7 @@ export function ProfilePage() {
       const dataUrl = await new Promise<string>((resolve, reject) => {
         const reader = new FileReader()
         reader.onload = () => resolve(String(reader.result || ''))
-        reader.onerror = () => reject(new Error('读取图片文件失败'))
+        reader.onerror = () => reject(new Error(t('profile.errReadImage')))
         reader.readAsDataURL(file)
       })
       await api.uploadUserImage(userId, dataUrl, file.type || 'image/jpeg')
@@ -138,12 +138,12 @@ export function ProfilePage() {
     onSuccess: async () => {
       await refreshUser()
       setAvatarError(false)
-      setFeedback({ type: 'success', message: '头像已更新' })
+      setFeedback({ type: 'success', message: t('profile.avatarUpdated') })
     },
     onError: (err) => {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '上传头像失败',
+        message: err instanceof Error ? err.message : t('profile.avatarUploadFailed'),
       })
     },
   })
@@ -151,11 +151,11 @@ export function ProfilePage() {
   const handleAvatarFileSelected = (file?: File | null) => {
     if (!file) return
     if (!ALLOWED_AVATAR_MIME_TYPES.has((file.type || '').toLowerCase())) {
-      setFeedback({ type: 'error', message: '仅支持上传 JPG / PNG / WebP / GIF 格式的头像图片' })
+      setFeedback({ type: 'error', message: t('profile.errAvatarFormat') })
       return
     }
     if (file.size > MAX_AVATAR_UPLOAD_BYTES) {
-      setFeedback({ type: 'error', message: '头像图片大小不能超过 5 MB' })
+      setFeedback({ type: 'error', message: t('profile.errAvatarSize') })
       return
     }
     uploadAvatarMutation.mutate(file)
@@ -166,12 +166,12 @@ export function ProfilePage() {
     onSuccess: async () => {
       await refreshUser()
       setAvatarError(false)
-      setFeedback({ type: 'success', message: '已移除个人头像' })
+      setFeedback({ type: 'success', message: t('profile.avatarRemoved') })
     },
     onError: (err) => {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '移除头像失败',
+        message: err instanceof Error ? err.message : t('profile.avatarRemoveFailed'),
       })
     },
   })
@@ -186,17 +186,17 @@ export function ProfilePage() {
       setCurrentPw('')
       setNewPw('')
       setConfirmPw('')
-      setFeedback({ type: 'success', message: '登录密码已修改成功，其他设备会话已自动下线' })
+      setFeedback({ type: 'success', message: t('profile.passwordChangedSuccess') })
     },
     onError: (err) => {
       if (err instanceof ApiError && err.status === 401) {
-        setFeedback({ type: 'error', message: '当前登录会话已失效，请重新登录' })
+        setFeedback({ type: 'error', message: t('profile.sessionExpired') })
         navigate('/login', { replace: true })
         return
       }
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '修改密码失败，请检查当前密码',
+        message: err instanceof Error ? err.message : t('profile.passwordChangeFailed'),
       })
     },
   })
@@ -204,11 +204,11 @@ export function ProfilePage() {
   const handlePasswordSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     if (!newPw.trim()) {
-      setFeedback({ type: 'error', message: '请输入新密码' })
+      setFeedback({ type: 'error', message: t('profile.errNewPasswordRequired') })
       return
     }
     if (newPw !== confirmPw) {
-      setFeedback({ type: 'error', message: '两次输入的新密码不一致' })
+      setFeedback({ type: 'error', message: t('profile.errPasswordMismatch') })
       return
     }
     passwordMutation.mutate()
@@ -218,16 +218,16 @@ export function ProfilePage() {
     mutationFn: (code: string) => api.quickConnectAuthorize(code),
     onSuccess: (ok) => {
       if (ok === false) {
-        setQcFeedback({ type: 'error', message: '授权码无效或已过期，请核对后重试' })
+        setQcFeedback({ type: 'error', message: t('profile.qcInvalidOrExpired') })
         return
       }
       setQcCode('')
-      setQcFeedback({ type: 'success', message: '已成功授权该设备登录' })
+      setQcFeedback({ type: 'success', message: t('profile.qcAuthorizedSuccess') })
     },
     onError: (err) => {
       setQcFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '授权失败，请检查授权码是否正确或已过期',
+        message: err instanceof Error ? err.message : t('profile.qcAuthorizeFailed'),
       })
     },
   })
@@ -236,7 +236,7 @@ export function ProfilePage() {
     e.preventDefault()
     const trimmed = qcCode.trim()
     if (!trimmed) {
-      setQcFeedback({ type: 'error', message: '请输入 6 位 Quick Connect 授权码' })
+      setQcFeedback({ type: 'error', message: t('profile.errQcCodeRequired') })
       return
     }
     setQcFeedback(null)
@@ -260,7 +260,7 @@ export function ProfilePage() {
           if (!prefsQueueRef.current && currentTask.seq === prefsSeqRef.current) {
             await refreshUser()
             if (!prefsQueueRef.current && currentTask.seq === prefsSeqRef.current) {
-              setFeedback({ type: 'success', message: '播放偏好已保存并同步至账号' })
+              setFeedback({ type: 'success', message: t('profile.prefsSavedSuccess') })
             }
           }
         } catch (err) {
@@ -269,8 +269,8 @@ export function ProfilePage() {
               type: 'error',
               message:
                 err instanceof Error
-                  ? `播放偏好已保存本地，同步账号失败：${err.message}`
-                  : '播放偏好已保存本地，同步账号失败',
+                  ? t('profile.prefsSavedLocalSyncFailedMsg', { message: err.message })
+                  : t('profile.prefsSavedLocalSyncFailed'),
             })
           }
         } finally {
@@ -308,7 +308,7 @@ export function ProfilePage() {
 
   const hasAvatar = Boolean(user?.PrimaryImageTag) && !avatarError
   const avatarUrl = hasAvatar ? getUserImageUrl(userId, user?.PrimaryImageTag) : null
-  const displayName = user?.Name || auth?.userName || '用户'
+  const displayName = user?.Name || auth?.userName || t('profile.defaultUserName')
 
   return (
     <div className="mx-auto max-w-4xl space-y-6 px-4 pt-6 lg:px-8">
@@ -317,9 +317,7 @@ export function ProfilePage() {
           <UserIcon className="h-6 w-6 text-amber-400" />
           <span>{t('profile.title')}</span>
         </h1>
-        <p className="mt-1 text-xs text-zinc-400">
-          管理您的账号头像、登录密码与本机播放器偏好设置
-        </p>
+        <p className="mt-1 text-xs text-zinc-400">{t('profile.subtitle')}</p>
       </div>
 
       {feedback && (
@@ -361,11 +359,12 @@ export function ProfilePage() {
                 </span>
               </div>
               <p className="mt-1 text-xs text-zinc-400">
-                用户 ID：<span className="font-mono text-zinc-300">{userId}</span>
+                {t('profile.userIdLabel')}
+                <span className="font-mono text-zinc-300">{userId}</span>
               </p>
               {user?.LastLoginDate && (
                 <p className="mt-0.5 text-[11px] text-zinc-500">
-                  最近登录：{formatDateTime(user.LastLoginDate)}
+                  {t('profile.lastLoginLabel', { time: formatDateTime(user.LastLoginDate) })}
                 </p>
               )}
             </div>
@@ -376,7 +375,7 @@ export function ProfilePage() {
               ref={fileInputRef}
               type="file"
               accept="image/jpeg,image/png,image/webp,image/gif"
-              aria-label="选择头像图片"
+              aria-label={t('profile.selectAvatarAria')}
               className="hidden"
               onChange={(e) => {
                 handleAvatarFileSelected(e.target.files?.[0])
@@ -394,7 +393,7 @@ export function ProfilePage() {
               ) : (
                 <Camera className="h-3.5 w-3.5" />
               )}
-              <span>上传头像</span>
+              <span>{t('profile.uploadAvatar')}</span>
             </button>
             {user?.PrimaryImageTag && (
               <button
@@ -404,7 +403,7 @@ export function ProfilePage() {
                 className="inline-flex items-center gap-1.5 rounded-xl border border-red-500/30 bg-red-500/10 px-3.5 py-2 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
               >
                 <Trash2 className="h-3.5 w-3.5" />
-                <span>移除头像</span>
+                <span>{t('profile.removeAvatar')}</span>
               </button>
             )}
             <button
@@ -463,36 +462,36 @@ export function ProfilePage() {
 
           <form onSubmit={handlePasswordSubmit} className="space-y-4">
             <label className="block space-y-1.5">
-              <span className="text-xs font-medium text-zinc-300">当前密码</span>
+              <span className="text-xs font-medium text-zinc-300">{t('profile.currentPassword')}</span>
               <input
                 type="password"
                 value={currentPw}
                 onChange={(e) => setCurrentPw(e.target.value)}
-                placeholder="如未设置过密码可留空"
+                placeholder={t('profile.currentPasswordPlaceholder')}
                 autoComplete="current-password"
                 className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
               />
             </label>
 
             <label className="block space-y-1.5">
-              <span className="text-xs font-medium text-zinc-300">新密码</span>
+              <span className="text-xs font-medium text-zinc-300">{t('profile.newPassword')}</span>
               <input
                 type="password"
                 value={newPw}
                 onChange={(e) => setNewPw(e.target.value)}
-                placeholder="请输入新密码"
+                placeholder={t('profile.newPasswordPlaceholder')}
                 autoComplete="new-password"
                 className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
               />
             </label>
 
             <label className="block space-y-1.5">
-              <span className="text-xs font-medium text-zinc-300">确认新密码</span>
+              <span className="text-xs font-medium text-zinc-300">{t('profile.confirmNewPassword')}</span>
               <input
                 type="password"
                 value={confirmPw}
                 onChange={(e) => setConfirmPw(e.target.value)}
-                placeholder="再次输入新密码"
+                placeholder={t('profile.confirmNewPasswordPlaceholder')}
                 autoComplete="new-password"
                 className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
               />
@@ -508,7 +507,7 @@ export function ProfilePage() {
               ) : (
                 <CheckCircle2 className="h-4 w-4" />
               )}
-              <span>保存新密码</span>
+              <span>{t('profile.saveNewPassword')}</span>
             </button>
           </form>
         </section>
@@ -523,15 +522,13 @@ export function ProfilePage() {
           <div className="space-y-5">
             <div className="flex items-start justify-between gap-4 rounded-xl border border-white/8 bg-white/[0.03] p-3.5">
               <div>
-                <p className="text-sm font-medium text-zinc-100">剧集自动连播下一集</p>
-                <p className="mt-0.5 text-xs text-zinc-400">
-                  分集播放结束时显示 8 秒倒计时，自动衔接播放下一集
-                </p>
+                <p className="text-sm font-medium text-zinc-100">{t('profile.autoPlayNextTitle')}</p>
+                <p className="mt-0.5 text-xs text-zinc-400">{t('profile.autoPlayNextDesc')}</p>
               </div>
               <button
                 type="button"
                 role="switch"
-                aria-label="剧集自动连播下一集"
+                aria-label={t('profile.autoPlayNextTitle')}
                 aria-checked={prefs.autoPlayNextEpisode}
                 onClick={() =>
                   handlePrefsChange({ autoPlayNextEpisode: !prefs.autoPlayNextEpisode })
@@ -549,7 +546,7 @@ export function ProfilePage() {
             </div>
 
             <label className="block space-y-1.5">
-              <span className="text-xs font-medium text-zinc-300">首选音轨语言</span>
+              <span className="text-xs font-medium text-zinc-300">{t('profile.preferredAudioLang')}</span>
               <select
                 value={prefs.preferredAudioLang}
                 onChange={(e) => handlePrefsChange({ preferredAudioLang: e.target.value })}
@@ -557,14 +554,14 @@ export function ProfilePage() {
               >
                 {AUDIO_LANG_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.value}>
-                    {opt.label}
+                    {t(opt.labelKey)}
                   </option>
                 ))}
               </select>
             </label>
 
             <label className="block space-y-1.5">
-              <span className="text-xs font-medium text-zinc-300">首选字幕语言</span>
+              <span className="text-xs font-medium text-zinc-300">{t('profile.preferredSubtitleLang')}</span>
               <select
                 value={prefs.preferredSubtitleLang}
                 onChange={(e) => handlePrefsChange({ preferredSubtitleLang: e.target.value })}
@@ -572,14 +569,14 @@ export function ProfilePage() {
               >
                 {SUBTITLE_LANG_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.value}>
-                    {opt.label}
+                    {t(opt.labelKey)}
                   </option>
                 ))}
               </select>
             </label>
 
             <label className="block space-y-1.5">
-              <span className="text-xs font-medium text-zinc-300">字幕显示模式</span>
+              <span className="text-xs font-medium text-zinc-300">{t('profile.subtitleDisplayMode')}</span>
               <select
                 value={prefs.subtitleMode}
                 onChange={(e) =>
@@ -589,7 +586,7 @@ export function ProfilePage() {
               >
                 {SUBTITLE_MODE_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.value}>
-                    {opt.label}
+                    {t(opt.labelKey)}
                   </option>
                 ))}
               </select>
@@ -608,15 +605,12 @@ export function ProfilePage() {
             {locale === 'zh-CN' ? 'Quick Connect 授权新设备' : t('profile.quickConnect')}
           </h2>
         </div>
-        <p className="mb-4 text-xs text-zinc-400">
-          在电视、移动端或其他浏览器登录界面点击「Quick Connect 授权码登录」，将屏幕上显示的 6
-          位授权码输入下方即可免密授权登录。
-        </p>
+        <p className="mb-4 text-xs text-zinc-400">{t('profile.qcDesc')}</p>
 
         <form onSubmit={handleQuickConnectSubmit} className="space-y-3.5">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
             <label className="block flex-1 space-y-1.5">
-              <span className="text-xs font-medium text-zinc-300">6 位设备授权码</span>
+              <span className="text-xs font-medium text-zinc-300">{t('profile.qcCodeLabel')}</span>
               <input
                 type="text"
                 inputMode="numeric"
@@ -626,7 +620,7 @@ export function ProfilePage() {
                   setQcCode(e.target.value)
                   if (qcFeedback) setQcFeedback(null)
                 }}
-                placeholder="例如：123456"
+                placeholder={t('profile.qcCodePlaceholder')}
                 className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5 font-mono text-sm tracking-[0.25em] text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
               />
             </label>
@@ -641,7 +635,7 @@ export function ProfilePage() {
               ) : (
                 <CheckCircle2 className="h-4 w-4" />
               )}
-              <span>确认授权</span>
+              <span>{t('profile.qcConfirmBtn')}</span>
             </button>
           </div>
 

@@ -194,8 +194,8 @@ func preserveExistingItemOnRescan(existing, rec *sqlite.ItemRecord) {
 
 func New(repo *sqlite.LibraryRepo, registry *plugins.Registry, bus *eventbus.Bus, cfg *config.Config) *Scanner {
 	ffprobePath := "ffprobe"
-	if cfg != nil && cfg.FFprobePath != "" {
-		ffprobePath = cfg.FFprobePath
+	if snap := cfg.Snapshot(); snap.FFprobePath != "" {
+		ffprobePath = snap.FFprobePath
 	}
 	return &Scanner{
 		repo:          repo,
@@ -2118,8 +2118,8 @@ func cloneStringMap(src map[string]string) map[string]string {
 }
 
 func (s *Scanner) language() string {
-	if s.cfg != nil && s.cfg.TMDBLanguage != "" {
-		return s.cfg.TMDBLanguage
+	if snap := s.cfg.Snapshot(); snap.TMDBLanguage != "" {
+		return snap.TMDBLanguage
 	}
 	return "zh-CN"
 }

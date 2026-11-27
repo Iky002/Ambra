@@ -23,24 +23,24 @@ import { FeedbackBanner, formatDateTime, formatRelativeTime } from './admin/admi
 type TrendingViewMode = 'overview' | 'tmdb' | 'douban_movie' | 'douban_tv'
 type TmdbSubTypeFilter = 'Movie,Series' | 'Movie' | 'Series'
 
-const VIEW_TABS: Array<{ value: TrendingViewMode; label: string }> = [
-  { value: 'overview', label: '全部榜单（分栏总览）' },
-  { value: 'tmdb', label: 'TMDB 热门' },
-  { value: 'douban_movie', label: '豆瓣热门电影' },
-  { value: 'douban_tv', label: '豆瓣热门剧集' },
+const VIEW_TABS: Array<{ value: TrendingViewMode; labelKey: string }> = [
+  { value: 'overview', labelKey: 'trending.viewOverview' },
+  { value: 'tmdb', labelKey: 'trending.chartTmdb' },
+  { value: 'douban_movie', labelKey: 'trending.chartDoubanMovie' },
+  { value: 'douban_tv', labelKey: 'trending.chartDoubanTv' },
 ]
 
-const TMDB_TYPE_PILLS: Array<{ value: TmdbSubTypeFilter; label: string }> = [
-  { value: 'Movie,Series', label: '全部' },
-  { value: 'Movie', label: '电影' },
-  { value: 'Series', label: '剧集' },
+const TMDB_TYPE_PILLS: Array<{ value: TmdbSubTypeFilter; labelKey: string }> = [
+  { value: 'Movie,Series', labelKey: 'common.all' },
+  { value: 'Movie', labelKey: 'search.typeMovie' },
+  { value: 'Series', labelKey: 'search.typeSeries' },
 ]
 
 const SORT_OPTIONS = [
-  { value: 'CommunityRating', label: '评分最高' },
-  { value: 'DateCreated', label: '添加时间' },
-  { value: 'PremiereDate', label: '上映年份' },
-  { value: 'SortName', label: '名称排序' },
+  { value: 'CommunityRating', labelKey: 'trending.sortRating' },
+  { value: 'DateCreated', labelKey: 'trending.sortDateCreated' },
+  { value: 'PremiereDate', labelKey: 'trending.sortPremiereDate' },
+  { value: 'SortName', labelKey: 'trending.sortName' },
 ]
 
 type AccentTheme = 'orange' | 'emerald' | 'sky'
@@ -147,25 +147,27 @@ function TrendingSection({
             </span>
             {fallbackNotice && (
               <span className="rounded-full border border-white/10 bg-white/[0.06] px-2 py-0.5 text-[11px] text-zinc-300">
-                兼容旧版 Trending 标签
+                {t('trending.compatLegacyTag')}
               </span>
             )}
           </div>
           <p className="text-xs text-zinc-400">{subtitle}</p>
           <div className="flex flex-wrap items-center gap-2.5 pt-0.5 text-xs text-zinc-400">
             <span className="inline-flex items-center gap-1 rounded-lg bg-white/[0.06] px-2.5 py-1 text-zinc-200">
-              {t('trending.inLibrary')} <strong className={styles.countText}>{total}</strong> 部
+              {t('trending.inLibrary')} <strong className={styles.countText}>{total}</strong>{' '}
+              {t('trending.itemsUnit')}
             </span>
             {chart && (
               <>
                 <span className="rounded-lg bg-white/[0.04] px-2.5 py-1">
-                  榜单缓存：<span className="text-zinc-200">{chart.count}</span> 条
+                  {t('trending.cacheLabel')}
+                  <span className="text-zinc-200">{chart.count}</span> {t('trending.entriesUnit')}
                 </span>
                 <span
                   className="rounded-lg bg-white/[0.04] px-2.5 py-1"
                   title={formatDateTime(chart.updated_at)}
                 >
-                  最近更新：
+                  {t('trending.lastUpdatedLabel')}
                   <span className="text-zinc-200">{formatRelativeTime(chart.updated_at)}</span>
                 </span>
               </>
@@ -181,7 +183,7 @@ function TrendingSection({
               onClick={onViewAll}
               className={`inline-flex shrink-0 items-center gap-1.5 rounded-xl border px-3.5 py-2 text-xs font-semibold transition-colors ${styles.focusBtn}`}
             >
-              <span>查看该栏全部</span>
+              <span>{t('trending.viewSectionAll')}</span>
               <ArrowRight className="h-3.5 w-3.5" />
             </button>
           )}
@@ -195,17 +197,15 @@ function TrendingSection({
       ) : isError ? (
         <QueryErrorState
           compact
-          title={`无法加载${title}`}
+          title={t('trending.loadSectionFailed', { title })}
           error={error}
           onRetry={onRetry}
         />
       ) : items.length === 0 ? (
         <div className="rounded-2xl border border-dashed border-white/12 bg-black/20 px-6 py-10 text-center">
-          <p className="text-sm font-medium text-zinc-300">该榜单暂未匹配到库内作品</p>
+          <p className="text-sm font-medium text-zinc-300">{t('trending.emptySectionTitle')}</p>
           <p className="mx-auto mt-1.5 max-w-md text-xs text-zinc-400">
-            {isAdmin
-              ? '请点击页面右上角「立即同步热门榜」，系统将自动拉取最新榜单并为库内匹配的影片/剧集打标。'
-              : '请联系管理员同步最新热门榜单缓存。'}
+            {isAdmin ? t('trending.emptySectionAdminHint') : t('trending.emptySectionUserHint')}
           </p>
         </div>
       ) : (
@@ -327,39 +327,69 @@ export function TrendingPage() {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['rankings'] }),
         queryClient.invalidateQueries({ queryKey: ['trendingItems'] }),
-        queryClient.invalidateQueries({ queryKey: ['items'] }),
+        queryClient.invalidateQueries({ queryKey: ['libraryItems'] }),
         queryClient.invalidateQueries({ queryKey: ['tags'] }),
       ])
       const parts: string[] = []
-      if (res.tmdb_trending_count) parts.push(`TMDB 热门 ${res.tmdb_trending_count} 条`)
-      if (res.douban_trending_movie_count)
-        parts.push(`豆瓣热门电影 ${res.douban_trending_movie_count} 条`)
-      if (res.douban_trending_tv_count) parts.push(`豆瓣热门剧集 ${res.douban_trending_tv_count} 条`)
+      if (res.tmdb_trending_count) {
+        parts.push(
+          t('trending.syncPartCount', {
+            name: t('trending.chartTmdb'),
+            count: res.tmdb_trending_count,
+          }),
+        )
+      }
+      if (res.douban_trending_movie_count) {
+        parts.push(
+          t('trending.syncPartCount', {
+            name: t('trending.chartDoubanMovie'),
+            count: res.douban_trending_movie_count,
+          }),
+        )
+      }
+      if (res.douban_trending_tv_count) {
+        parts.push(
+          t('trending.syncPartCount', {
+            name: t('trending.chartDoubanTv'),
+            count: res.douban_trending_tv_count,
+          }),
+        )
+      }
       const summarySuffix = parts.length > 0 ? `（${parts.join(' / ')}）` : ''
       const partialErrors: string[] = []
-      if (res.tmdb_trending_error) partialErrors.push(`TMDB 热门：${res.tmdb_trending_error}`)
+      if (res.tmdb_trending_error)
+        partialErrors.push(`${t('trending.chartTmdb')}：${res.tmdb_trending_error}`)
       if (res.douban_trending_movie_error)
-        partialErrors.push(`豆瓣热门电影：${res.douban_trending_movie_error}`)
+        partialErrors.push(`${t('trending.chartDoubanMovie')}：${res.douban_trending_movie_error}`)
       if (res.douban_trending_tv_error)
-        partialErrors.push(`豆瓣热门剧集：${res.douban_trending_tv_error}`)
-      if (res.douban_error) partialErrors.push(`豆瓣 Top250：${res.douban_error}`)
+        partialErrors.push(`${t('trending.chartDoubanTv')}：${res.douban_trending_tv_error}`)
+      if (res.douban_error)
+        partialErrors.push(`${t('trending.chartDoubanTop250')}：${res.douban_error}`)
       if (res.imdb_error) partialErrors.push(`IMDb Top250：${res.imdb_error}`)
       if (partialErrors.length > 0) {
         setFeedback({
           type: 'error',
-          message: `部分榜单同步失败（${partialErrors.join('；')}）${summarySuffix}，库内命中 ${res.matched_items} 部媒体`,
+          message: t('trending.syncPartialFailed', {
+            errors: partialErrors.join('；'),
+            summary: summarySuffix,
+            matched: res.matched_items,
+          }),
         })
       } else {
         setFeedback({
           type: 'success',
-          message: `热门榜同步完成${summarySuffix}：库内命中 ${res.matched_items} 部媒体，新增打标 ${res.tags_added} 次`,
+          message: t('trending.syncCompleted', {
+            summary: summarySuffix,
+            matched: res.matched_items,
+            tagsAdded: res.tags_added,
+          }),
         })
       }
     },
     onError: (err) => {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '同步热门榜失败',
+        message: err instanceof Error ? err.message : t('trending.syncFailed'),
       })
     },
   })
@@ -407,7 +437,7 @@ export function TrendingPage() {
                 : 'text-zinc-400 hover:bg-white/[0.05] hover:text-zinc-100'
             }`}
           >
-            {pill.label}
+            {t(pill.labelKey)}
           </button>
         )
       })}
@@ -424,7 +454,7 @@ export function TrendingPage() {
           <div className="space-y-2">
             <div className="inline-flex items-center gap-1.5 rounded-full border border-orange-400/40 bg-orange-500/15 px-3 py-1 text-xs font-semibold text-orange-200">
               <Flame className="h-3.5 w-3.5 text-orange-400" />
-              <span>TMDB 全球热门 · 豆瓣热门电影 · 豆瓣热门剧集</span>
+              <span>{t('trending.heroBadge')}</span>
             </div>
             <h1 className="text-2xl font-bold tracking-tight text-white sm:text-3xl">
               {locale === 'zh-CN' ? '热门趋势' : t('trending.title')}
@@ -436,15 +466,19 @@ export function TrendingPage() {
             <div className="flex flex-wrap items-center gap-2.5 pt-1 text-xs text-zinc-400">
               <span className="inline-flex items-center gap-1.5 rounded-lg bg-white/[0.06] px-2.5 py-1 text-zinc-200">
                 <Sparkles className="h-3.5 w-3.5 text-amber-400" />
-                TMDB 热门 <strong className="text-amber-300">{tmdbTotal}</strong> 部
+                {t('trending.chartTmdb')} <strong className="text-amber-300">{tmdbTotal}</strong>{' '}
+                {t('trending.itemsUnit')}
               </span>
               <span className="inline-flex items-center gap-1.5 rounded-lg bg-white/[0.06] px-2.5 py-1 text-zinc-200">
                 <Film className="h-3.5 w-3.5 text-emerald-400" />
-                豆瓣热门电影 <strong className="text-emerald-300">{doubanMovieTotal}</strong> 部
+                {t('trending.chartDoubanMovie')}{' '}
+                <strong className="text-emerald-300">{doubanMovieTotal}</strong>{' '}
+                {t('trending.itemsUnit')}
               </span>
               <span className="inline-flex items-center gap-1.5 rounded-lg bg-white/[0.06] px-2.5 py-1 text-zinc-200">
                 <Tv className="h-3.5 w-3.5 text-sky-400" />
-                豆瓣热门剧集 <strong className="text-sky-300">{doubanTvTotal}</strong> 部
+                {t('trending.chartDoubanTv')}{' '}
+                <strong className="text-sky-300">{doubanTvTotal}</strong> {t('trending.itemsUnit')}
               </span>
             </div>
           </div>
@@ -461,7 +495,7 @@ export function TrendingPage() {
               />
               <span>
                 {refreshMutation.isPending
-                  ? '正在同步热门榜...'
+                  ? t('trending.syncing')
                   : locale === 'zh-CN'
                     ? '立即同步热门榜'
                     : t('trending.refreshNow')}
@@ -503,24 +537,24 @@ export function TrendingPage() {
                 {tab.value === 'tmdb' && <Flame className="h-3.5 w-3.5" />}
                 {tab.value === 'douban_movie' && <Film className="h-3.5 w-3.5" />}
                 {tab.value === 'douban_tv' && <Tv className="h-3.5 w-3.5" />}
-                <span>{tab.label}</span>
+                <span>{t(tab.labelKey)}</span>
               </button>
             )
           })}
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5">
-          {isAnyFetching && <span className="text-xs text-zinc-500">正在更新...</span>}
+          {isAnyFetching && <span className="text-xs text-zinc-500">{t('trending.updating')}</span>}
           <div className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs">
             <select
               value={sortBy}
               onChange={(e) => setSortBy(e.target.value)}
-              aria-label="排序方式"
+              aria-label={t('trending.sortByAria')}
               className="bg-transparent text-zinc-200 outline-none"
             >
               {SORT_OPTIONS.map((opt) => (
                 <option key={opt.value} value={opt.value} className="bg-zinc-900 text-zinc-100">
-                  按{opt.label}
+                  {t('trending.sortByPrefix', { label: t(opt.labelKey) })}
                 </option>
               ))}
             </select>
@@ -532,17 +566,17 @@ export function TrendingPage() {
               setSortOrder((prev) => (prev === 'Descending' ? 'Ascending' : 'Descending'))
             }
             className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs text-zinc-200 transition-colors hover:bg-white/10"
-            title="切换排序方向"
+            title={t('trending.toggleSortOrderTitle')}
           >
             {sortOrder === 'Descending' ? (
               <>
                 <ArrowDownWideNarrow className="h-3.5 w-3.5 text-amber-400" />
-                <span>降序</span>
+                <span>{t('trending.sortDesc')}</span>
               </>
             ) : (
               <>
                 <ArrowUpNarrowWide className="h-3.5 w-3.5 text-amber-400" />
-                <span>升序</span>
+                <span>{t('trending.sortAsc')}</span>
               </>
             )}
           </button>
@@ -553,12 +587,12 @@ export function TrendingPage() {
       {isOverview ? (
         <div className="space-y-6">
           <TrendingSection
-            title="TMDB 热门"
-            subtitle="同步 TMDB 全球每周热门电影与剧集趋势，覆盖海内外热映与热播作品"
+            title={t('trending.chartTmdb')}
+            subtitle={t('trending.tmdbDesc')}
             accent="orange"
             icon={<Flame className="h-4 w-4" />}
             chart={rankings?.tmdb_trending}
-            defaultSourceLabel="TMDB 全球热门榜"
+            defaultSourceLabel={t('trending.tmdbSource')}
             items={tmdbItems}
             total={tmdbTotal}
             isLoading={tmdbLoading}
@@ -571,12 +605,12 @@ export function TrendingPage() {
           />
 
           <TrendingSection
-            title="豆瓣热门电影"
-            subtitle="同步豆瓣实时热门电影榜单，聚焦中文影迷热议的新片与口碑佳作"
+            title={t('trending.chartDoubanMovie')}
+            subtitle={t('trending.doubanMovieDesc')}
             accent="emerald"
             icon={<Film className="h-4 w-4" />}
             chart={rankings?.douban_trending_movie}
-            defaultSourceLabel="豆瓣热门电影"
+            defaultSourceLabel={t('trending.chartDoubanMovie')}
             items={doubanMovieItems}
             total={doubanMovieTotal}
             isLoading={doubanMovieQuery.isLoading}
@@ -588,12 +622,12 @@ export function TrendingPage() {
           />
 
           <TrendingSection
-            title="豆瓣热门剧集"
-            subtitle="同步豆瓣实时热门电视剧与高分剧集，覆盖华语、日韩与欧美热播好剧"
+            title={t('trending.chartDoubanTv')}
+            subtitle={t('trending.doubanTvDesc')}
             accent="sky"
             icon={<Tv className="h-4 w-4" />}
             chart={rankings?.douban_trending_tv}
-            defaultSourceLabel="豆瓣热门剧集"
+            defaultSourceLabel={t('trending.chartDoubanTv')}
             items={doubanTvItems}
             total={doubanTvTotal}
             isLoading={doubanTvQuery.isLoading}
@@ -606,12 +640,12 @@ export function TrendingPage() {
         </div>
       ) : viewMode === 'tmdb' ? (
         <TrendingSection
-          title="TMDB 热门"
-          subtitle="TMDB 全球热门电影与剧集完整命中列表（最多展示 60 部）"
+          title={t('trending.chartTmdb')}
+          subtitle={t('trending.tmdbFullDesc')}
           accent="orange"
           icon={<Flame className="h-4 w-4" />}
           chart={rankings?.tmdb_trending}
-          defaultSourceLabel="TMDB 全球热门榜"
+          defaultSourceLabel={t('trending.tmdbSource')}
           items={tmdbItems}
           total={tmdbTotal}
           isLoading={tmdbLoading}
@@ -624,12 +658,12 @@ export function TrendingPage() {
         />
       ) : viewMode === 'douban_movie' ? (
         <TrendingSection
-          title="豆瓣热门电影"
-          subtitle="豆瓣热门电影完整命中列表（最多展示 60 部）"
+          title={t('trending.chartDoubanMovie')}
+          subtitle={t('trending.doubanMovieFullDesc')}
           accent="emerald"
           icon={<Film className="h-4 w-4" />}
           chart={rankings?.douban_trending_movie}
-          defaultSourceLabel="豆瓣热门电影"
+          defaultSourceLabel={t('trending.chartDoubanMovie')}
           items={doubanMovieItems}
           total={doubanMovieTotal}
           isLoading={doubanMovieQuery.isLoading}
@@ -640,12 +674,12 @@ export function TrendingPage() {
         />
       ) : (
         <TrendingSection
-          title="豆瓣热门剧集"
-          subtitle="豆瓣热门剧集完整命中列表（最多展示 60 部）"
+          title={t('trending.chartDoubanTv')}
+          subtitle={t('trending.doubanTvFullDesc')}
           accent="sky"
           icon={<Tv className="h-4 w-4" />}
           chart={rankings?.douban_trending_tv}
-          defaultSourceLabel="豆瓣热门剧集"
+          defaultSourceLabel={t('trending.chartDoubanTv')}
           items={doubanTvItems}
           total={doubanTvTotal}
           isLoading={doubanTvQuery.isLoading}

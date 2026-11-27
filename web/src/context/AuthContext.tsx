@@ -3,6 +3,7 @@ import { QueryClientContext } from '@tanstack/react-query'
 import { api, ApiError, clearAuth, getAuthStorageKey, getDeviceId, getStoredAuth, saveAuth } from '../api/client'
 import type { AuthSession, AuthenticationResult, UserDto } from '../api/types'
 import { isDemoMode } from '../demo/demoMode'
+import { useI18n } from '../i18n/I18nContext'
 import { syncPlaybackPrefsFromUserConfig } from '../player/playbackPrefs'
 
 const DEMO_LOGGED_OUT_KEY = 'ambra_demo_logged_out'
@@ -24,6 +25,9 @@ const AuthContext = createContext<AuthContextValue | null>(null)
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const queryClient = useContext(QueryClientContext)
+  const { t } = useI18n()
+  const tRef = useRef(t)
+  tRef.current = t
   const [auth, setAuth] = useState<AuthSession | null>(() => getStoredAuth())
   const [user, setUser] = useState<UserDto | null>(null)
   const [userLoading, setUserLoading] = useState<boolean>(() => Boolean(getStoredAuth()))
@@ -97,7 +101,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
       // 401 失效时 embyFetch 会触发 ambra:unauthorized 事件清空 auth/user；
       // 非 401 网络/500 错误保留既有已验证 user 与重试能力，仅记录错误状态
-      setUserError(err instanceof Error ? err.message : '用户信息加载失败')
+      setUserError(err instanceof Error ? err.message : tRef.current('auth.userLoadFailed'))
     } finally {
       if (seq === refreshSeqRef.current) {
         setUserLoading(false)
@@ -126,7 +130,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
       // 登录或切换账号时清空 React Query 内存缓存，防止跨账号数据残留
       queryClient?.clear()
-      skipNextRefreshUserIdRef.current = res.User.Id
+      skipNextRefreshUserIdRef.current = `${res.User.Id}:${res.AccessToken}`
       saveAuth(session)
       setAuth(session)
       setUser(res.User)
@@ -169,7 +173,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (auth?.userId) {
-      if (skipNextRefreshUserIdRef.current === auth.userId) {
+      const refreshKey = `${auth.userId}:${auth.accessToken ?? ''}`
+      if (skipNextRefreshUserIdRef.current === refreshKey) {
         skipNextRefreshUserIdRef.current = null
         return
       }
@@ -179,7 +184,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setUser(null)
       setUserLoading(false)
     }
-  }, [auth?.userId, refreshUser])
+  }, [auth?.userId, auth?.accessToken, refreshUser])
 
   useEffect(() => {
     const onUnauthorized = () => {

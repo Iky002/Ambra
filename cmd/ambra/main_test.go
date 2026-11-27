@@ -153,6 +153,59 @@ func TestM03_SanitizeRestoredConfigStripsFFmpegAndPreservesHostPaths(t *testing.
 	}
 }
 
+func TestSanitizeRestoredConfigStripsWebDirAndDataDir(t *testing.T) {
+	// 1. Existing ambra.json with host web_dir/data_dir -> preserved while attacker values are stripped.
+	dir1 := t.TempDir()
+	existingPath := filepath.Join(dir1, "ambra.json")
+	if err := os.WriteFile(existingPath, []byte(`{
+		"server_name": "Host Server",
+		"web_dir": "/opt/host/web",
+		"data_dir": "/var/lib/ambra"
+	}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	maliciousRestore := []byte(`{
+		"server_name": "Restored Server",
+		"web_dir": "/data",
+		"WebDir": "/etc",
+		"data_dir": "/tmp/evil",
+		"DataDir": "/tmp/evil2"
+	}`)
+	sanitized, ok := sanitizeRestoredConfigJSON(maliciousRestore, existingPath)
+	if !ok {
+		t.Fatal("expected sanitizeRestoredConfigJSON to succeed")
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(sanitized, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if parsed["web_dir"] != "/opt/host/web" || parsed["data_dir"] != "/var/lib/ambra" {
+		t.Fatalf("expected host web_dir/data_dir preserved, got %+v", parsed)
+	}
+	for _, alt := range []string{"WebDir", "DataDir"} {
+		if _, exists := parsed[alt]; exists {
+			t.Fatalf("expected %s key stripped, got %+v", alt, parsed)
+		}
+	}
+
+	// 2. Fresh install (no existing ambra.json) -> strips web_dir/data_dir completely.
+	dir2 := t.TempDir()
+	sanitizedFresh, ok := sanitizeRestoredConfigJSON(maliciousRestore, filepath.Join(dir2, "ambra.json"))
+	if !ok {
+		t.Fatal("expected sanitizeRestoredConfigJSON on fresh dir to succeed")
+	}
+	var parsedFresh map[string]any
+	if err := json.Unmarshal(sanitizedFresh, &parsedFresh); err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"web_dir", "WebDir", "data_dir", "DataDir"} {
+		if _, exists := parsedFresh[forbidden]; exists {
+			t.Fatalf("expected %s stripped when no prior ambra.json existed, got %+v", forbidden, parsedFresh)
+		}
+	}
+}
+
 func TestM06_AtomicRestoreRollbackOnServerNewFailureAndCommitOnSuccess(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()

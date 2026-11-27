@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -300,3 +301,48 @@ func TestAuditV0112_ProviderIdsLockCompanionNFOReplaceFalseAndScanPathAsync(t *t
 		t.Fatalf("expected locked ProviderIds['Tmdb']='999999' preserved on ReplaceAllMetadata refresh, got %+v", afterFullRefresh.Extra.ProviderIDs)
 	}
 }
+
+func TestScannerConfigSnapshotConcurrency(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := config.Default(tmp)
+	sc := New(nil, nil, nil, cfg)
+
+	var wg sync.WaitGroup
+	// Writer goroutines mutating config fields concurrently under cfg.Update
+	for w := 0; w < 2; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			langs := []string{"zh-CN", "en-US", "ja-JP", ""}
+			for i := 0; i < 500; i++ {
+				lang := langs[(i+id)%len(langs)]
+				dir := filepath.Join(tmp, "data", lang)
+				cfg.Update(func(c *config.Config) {
+					c.TMDBLanguage = lang
+					c.DataDir = dir
+					c.FFmpegPath = "/usr/bin/ffmpeg"
+					c.FFprobePath = "/usr/bin/ffprobe"
+				})
+			}
+		}(w)
+	}
+
+	// Reader goroutines calling Scanner.language() and Scanner.imageStorageDir() concurrently
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 500; i++ {
+				if lang := sc.language(); lang == "" {
+					t.Errorf("language() must never return empty string")
+				}
+				if dir := sc.imageStorageDir(); dir == "" {
+					t.Errorf("imageStorageDir() must never return empty string")
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -728,3 +729,127 @@ func TestV0110_ExtendedPolicyAndPostFiltersAndRoutes(t *testing.T) {
 		t.Fatalf("expected nil-repo Handler.canAccessItem to return true, got %v %v", ok, err)
 	}
 }
+
+func TestItemCountsExcludesOtherUsersPrivatePlaylists(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(tmp, "counts_playlists.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	repo := sqlite.NewLibraryRepo(store)
+	userRepo := sqlite.NewUserRepo(store)
+	cfg := config.Default(tmp)
+
+	libDir := filepath.Join(tmp, "movies")
+	_ = os.MkdirAll(libDir, 0o755)
+	lib, err := repo.CreateLibrary(ctx, "Movies", "movies", []string{libDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mov := &sqlite.ItemRecord{
+		ID:        guid.New(),
+		LibraryID: lib.ID,
+		ParentID:  lib.ID,
+		Type:      "Movie",
+		Name:      "Shared Film",
+		Path:      filepath.Join(libDir, "shared.mkv"),
+	}
+	if err := repo.UpsertItem(ctx, mov); err != nil {
+		t.Fatal(err)
+	}
+
+	admin := &sqlite.UserRecord{
+		ID:      guid.New(),
+		Name:    "admin",
+		IsAdmin: true,
+		Policy:  sqlite.DefaultUserPolicy(true),
+		Config:  sqlite.DefaultUserConfig(),
+	}
+	userA := &sqlite.UserRecord{
+		ID:     guid.New(),
+		Name:   "userA",
+		Policy: sqlite.DefaultUserPolicy(false),
+		Config: sqlite.DefaultUserConfig(),
+	}
+	userB := &sqlite.UserRecord{
+		ID:     guid.New(),
+		Name:   "userB",
+		Policy: sqlite.DefaultUserPolicy(false),
+		Config: sqlite.DefaultUserConfig(),
+	}
+	for _, u := range []*sqlite.UserRecord{admin, userA, userB} {
+		if err := userRepo.CreateUser(ctx, u); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Create a private playlist and a public playlist owned by userA.
+	_, err = repo.CreatePlaylist(ctx, "UserA Private Mix", "Video", userA.ID, []string{mov.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubPL, err := repo.CreatePlaylist(ctx, "UserA Public Mix", "Video", userA.ID, []string{mov.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.Writer.ExecContext(ctx,
+		`INSERT INTO server_config (key, value_json, updated_at) VALUES (?, ?, 1)`,
+		"item_visibility_"+guid.Normalize(pubPL.ID), `{"IsPublic":true}`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	h := New(repo, nil, cfg)
+	h.SetUserRepo(userRepo)
+	h.SetStore(store)
+	h.RegisterRoutes(mux, AuthFuncs{
+		UserIDFromCtx: func(c context.Context) string {
+			if ac, ok := middleware.AuthFromContext(c); ok && ac != nil {
+				return ac.UserID()
+			}
+			return ""
+		},
+	})
+
+	getCounts := func(u *sqlite.UserRecord) sqlite.ItemCounts {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/Items/Counts", nil)
+		req = req.WithContext(middleware.WithAuthContext(req.Context(), &middleware.AuthContext{User: u}))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /Items/Counts for %s status=%d body=%s", u.Name, rec.Code, rec.Body.String())
+		}
+		var out sqlite.ItemCounts
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	// Admin warms cachedItemCounts and sees Movie + UserA Private + UserA Public = 3 items.
+	adminCounts := getCounts(admin)
+	if adminCounts.MovieCount != 1 || adminCounts.ItemCount != 3 {
+		t.Fatalf("expected admin counts MovieCount=1 ItemCount=3, got %+v", adminCounts)
+	}
+
+	// User A owns the private playlist, so User A also sees Movie + Private + Public = 3 items.
+	userACounts := getCounts(userA)
+	if userACounts.MovieCount != 1 || userACounts.ItemCount != 3 {
+		t.Fatalf("expected userA counts MovieCount=1 ItemCount=3, got %+v", userACounts)
+	}
+
+	// User B must NOT see User A's private playlist (and must NOT receive admin's cachedItemCounts):
+	// Movie + UserA Public = 2 items.
+	userBCounts := getCounts(userB)
+	if userBCounts.MovieCount != 1 || userBCounts.ItemCount != 2 {
+		t.Fatalf("expected userB counts MovieCount=1 ItemCount=2 (excluding userA's private playlist), got %+v", userBCounts)
+	}
+}
+

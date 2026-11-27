@@ -43,8 +43,8 @@ func (s *Scanner) getHTTPClient() *http.Client {
 }
 
 func (s *Scanner) imageStorageDir() string {
-	if s.cfg != nil && strings.TrimSpace(s.cfg.DataDir) != "" {
-		return filepath.Join(s.cfg.DataDir, "metadata", "images")
+	if snap := s.cfg.Snapshot(); strings.TrimSpace(snap.DataDir) != "" {
+		return filepath.Join(snap.DataDir, "metadata", "images")
 	}
 	return filepath.Join(os.TempDir(), "ambra-metadata-images")
 }

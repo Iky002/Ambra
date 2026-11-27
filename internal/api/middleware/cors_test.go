@@ -77,3 +77,44 @@ func TestL01_ExtractClientInfoXEmbyTokenQueryFallback(t *testing.T) {
 		t.Fatalf("expected DeviceID=ios-1, got %q", info.DeviceID)
 	}
 }
+
+func TestIsSameOriginBehindTrustedTLSProxy(t *testing.T) {
+	// 1. Trusted reverse proxy (loopback 127.0.0.1 by default) with X-Forwarded-Proto: https
+	// MUST reject http:// Origin downgrade and allow https:// Origin.
+	reqProxyHTTP := httptest.NewRequest(http.MethodPost, "/api/setup/admin", nil)
+	reqProxyHTTP.Host = "example.com"
+	reqProxyHTTP.RemoteAddr = "127.0.0.1:54321"
+	reqProxyHTTP.Header.Set("X-Forwarded-Proto", "https")
+
+	if IsSameOrigin("http://example.com", reqProxyHTTP) {
+		t.Fatal("expected http:// Origin rejected when trusted proxy sends X-Forwarded-Proto: https")
+	}
+	if !IsSameOrigin("https://example.com", reqProxyHTTP) {
+		t.Fatal("expected https:// Origin allowed when trusted proxy sends X-Forwarded-Proto: https")
+	}
+	if !IsSameOrigin("https://example.com:443", reqProxyHTTP) {
+		t.Fatal("expected https://example.com:443 allowed when trusted proxy sends X-Forwarded-Proto: https")
+	}
+
+	// Comma-separated X-Forwarded-Proto header (e.g. "https, http") -> leftmost value is https.
+	reqProxyMulti := httptest.NewRequest(http.MethodPost, "/api/setup/admin", nil)
+	reqProxyMulti.Host = "example.com"
+	reqProxyMulti.RemoteAddr = "[::1]:54321"
+	reqProxyMulti.Header.Set("X-Forwarded-Proto", "https, http")
+	if IsSameOrigin("http://example.com", reqProxyMulti) {
+		t.Fatal("expected http:// Origin rejected when trusted IPv6 proxy sends X-Forwarded-Proto: https, http")
+	}
+	if !IsSameOrigin("https://example.com", reqProxyMulti) {
+		t.Fatal("expected https:// Origin allowed when trusted IPv6 proxy sends X-Forwarded-Proto: https, http")
+	}
+
+	// 2. Untrusted peer MUST NOT be able to spoof X-Forwarded-Proto: https.
+	reqUntrusted := httptest.NewRequest(http.MethodPost, "/api/setup/admin", nil)
+	reqUntrusted.Host = "example.com"
+	reqUntrusted.RemoteAddr = "203.0.113.50:54321"
+	reqUntrusted.Header.Set("X-Forwarded-Proto", "https")
+
+	if !IsSameOrigin("http://example.com", reqUntrusted) {
+		t.Fatal("expected untrusted peer X-Forwarded-Proto: https to be ignored on plain HTTP request")
+	}
+}

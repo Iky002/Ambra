@@ -31,6 +31,7 @@ interface ScraperEntry {
   alias: string
   labelZh: string
   labelEn: string
+  labelKey?: string
   enabled: boolean
 }
 
@@ -54,6 +55,7 @@ const BUILTIN_SCRAPER_DEFS: ScraperDef[] = [
     alias: 'nfo',
     labelZh: '本地 NFO 读取器 (Kodi / Emby NFO)',
     labelEn: 'Local NFO Reader (Kodi / Emby NFO)',
+    labelKey: 'admin.libraries.scraperLocalNfo',
   },
 ]
 
@@ -1629,7 +1631,11 @@ function ScraperPriorityEditor({
 
       <div className="divide-y divide-white/6 overflow-hidden rounded-xl border border-white/8 bg-black/30">
         {scrapers.map((scraper, idx) => {
-          const displayName = isZh ? scraper.labelZh : scraper.labelEn
+          const displayName = scraper.labelKey
+            ? t(scraper.labelKey)
+            : isZh
+              ? scraper.labelZh
+              : scraper.labelEn
           return (
             <div
               key={scraper.alias}

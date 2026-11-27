@@ -57,7 +57,7 @@ function HorizontalRow({
           <button
             type="button"
             onClick={() => scroll('left')}
-            aria-label={`向左滚动 ${title}`}
+            aria-label={t('home.scrollLeft', { title })}
             className="rounded-lg border border-white/10 bg-white/[0.04] p-1.5 text-zinc-300 transition-colors hover:bg-white/10"
           >
             <ChevronLeft className="h-4 w-4" />
@@ -65,7 +65,7 @@ function HorizontalRow({
           <button
             type="button"
             onClick={() => scroll('right')}
-            aria-label={`向右滚动 ${title}`}
+            aria-label={t('home.scrollRight', { title })}
             className="rounded-lg border border-white/10 bg-white/[0.04] p-1.5 text-zinc-300 transition-colors hover:bg-white/10"
           >
             <ChevronRight className="h-4 w-4" />
@@ -206,7 +206,7 @@ export function HomePage() {
   if (hasPrimaryError) {
     return (
       <QueryErrorState
-        title="无法加载首页内容"
+        title={t('home.loadErrorTitle')}
         error={primaryError}
         onRetry={handleRetryHome}
       />
@@ -219,7 +219,7 @@ export function HomePage() {
         <div className="px-4 pt-6 lg:px-8">
           <QueryErrorState
             compact
-            title="部分首页数据加载失败"
+            title={t('home.partialLoadErrorTitle')}
             error={primaryError}
             onRetry={handleRetryHome}
           />
@@ -260,7 +260,7 @@ export function HomePage() {
             <div key={activeHero.Id} className="animate-page-enter max-w-2xl space-y-4">
               <div className="flex flex-wrap items-center gap-2 text-xs font-medium">
                 <span className="rounded-md bg-amber-500/20 px-2 py-0.5 text-amber-300 ring-1 ring-amber-400/30">
-                  精选推荐
+                  {t('home.featuredBadge')}
                 </span>
                 {activeHero.CommunityRating ? (
                   <span className="flex items-center gap-1 rounded-md bg-black/50 px-2 py-0.5 text-amber-400 backdrop-blur-md">
@@ -329,7 +329,7 @@ export function HomePage() {
                   <button
                     key={it.Id}
                     type="button"
-                    aria-label={`切换到 ${it.Name}`}
+                    aria-label={t('home.switchToSlide', { name: it.Name })}
                     onClick={() => setHeroIdx(idx)}
                     className={`h-1.5 rounded-full transition-all ${
                       idx === heroIdx

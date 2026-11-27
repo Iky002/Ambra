@@ -890,4 +890,130 @@ describe('Admin Console Wave 1 Audit Remediation & Feature Completeness', () => 
       expect(screen.queryByText(/boot ok/)).not.toBeInTheDocument()
     })
   })
+
+  it('SettingsTab 保存 H264Crf = 0 时保持 0 而非回退为 23', async () => {
+    vi.spyOn(api, 'getServerConfig').mockResolvedValue({
+      ServerName: 'Ambra Lab',
+      EnableLoginUserList: true,
+    })
+    vi.spyOn(api, 'getUsers').mockResolvedValue([])
+    const embyFetchSpy = vi
+      .spyOn(clientModule, 'embyFetch')
+      .mockImplementation(async (path: string, init?: RequestInit) => {
+        if (path === '/emby/Encoding/FfmpegOptions' && (!init?.method || init.method === 'GET')) {
+          return {
+            HardwareAccelerationMode: 0,
+            EnableHardwareEncoding: false,
+            AllowHevcEncoding: false,
+            H264Crf: 23,
+            H264Preset: 'veryfast',
+            EnableThrottling: true,
+            ThrottleBufferSize: 120,
+            TranscodingTempPath: '/tmp/ambra',
+          }
+        }
+        if (
+          path === '/emby/Encoding/FullToneMapOptions' &&
+          (!init?.method || init.method === 'GET')
+        ) {
+          return {
+            EnableToneMapping: false,
+            ToneMappingAlgorithm: 'bt2390',
+          }
+        }
+        return undefined
+      })
+
+    renderAdmin(<SettingsTab />)
+
+    const crfInput = (await screen.findByLabelText(/H\.264 CRF|CRF/)) as HTMLInputElement
+    await waitFor(() => {
+      expect(crfInput.value).toBe('23')
+    })
+
+    fireEvent.change(crfInput, { target: { value: '0' } })
+    expect(crfInput.value).toBe('0')
+
+    fireEvent.submit(crfInput.closest('form')!)
+
+    await waitFor(() => {
+      const postCall = embyFetchSpy.mock.calls.find(
+        (c) => c[0] === '/emby/Encoding/FfmpegOptions' && c[1]?.method === 'POST',
+      )
+      expect(postCall).toBeDefined()
+      const payload = JSON.parse(String(postCall?.[1]?.body || '{}'))
+      expect(payload.H264Crf).toBe(0)
+    })
+  })
+
+  it('LiveTvTab 保存频道映射后清除已保存草稿，且点击刷新映射选项清空全部未保存草稿', async () => {
+    vi.spyOn(api, 'getTunerHosts').mockResolvedValue([])
+    vi.spyOn(api, 'getListingProviders').mockResolvedValue([
+      { Id: 'epg-1', Type: 'xmltv', Path: '/epg.xml' },
+    ])
+    vi.spyOn(api, 'getLiveTvChannels').mockResolvedValue({
+      Items: [
+        { Id: 'ch-1', Name: 'CCTV-1', Number: '1' },
+        { Id: 'ch-2', Name: 'CCTV-6', Number: '6' },
+      ],
+      TotalRecordCount: 2,
+    })
+
+    let serverMappedCh1 = 'xmltv-1'
+    const serverMappedCh2 = 'xmltv-6'
+    vi.spyOn(clientModule, 'embyFetch').mockImplementation(
+      async (path: string, init?: RequestInit) => {
+        if (path.startsWith('/emby/LiveTv/ChannelMappingOptions')) {
+          return {
+            TunerChannels: [
+              { Id: 'ch-1', Name: 'CCTV-1', Number: '1', ProviderChannelId: serverMappedCh1 },
+              { Id: 'ch-2', Name: 'CCTV-6', Number: '6', ProviderChannelId: serverMappedCh2 },
+            ],
+            ProviderChannels: [
+              { Id: 'xmltv-1', Name: 'CCTV-1 (XMLTV)' },
+              { Id: 'xmltv-1-alt', Name: 'CCTV-1 HD (XMLTV)' },
+              { Id: 'xmltv-6', Name: 'CCTV-6 (XMLTV)' },
+              { Id: 'xmltv-6-alt', Name: 'CCTV-6 HD (XMLTV)' },
+            ],
+            Mappings: [
+              { TunerChannelId: 'ch-1', ProviderChannelId: serverMappedCh1 },
+              { TunerChannelId: 'ch-2', ProviderChannelId: serverMappedCh2 },
+            ],
+          }
+        }
+        if (path === '/emby/LiveTv/ChannelMappings' && init?.method === 'POST') {
+          const body = JSON.parse(String(init.body || '{}'))
+          if (body.TunerChannelId === 'ch-1') {
+            serverMappedCh1 = body.ProviderChannelId
+          }
+          return body
+        }
+        return undefined
+      },
+    )
+
+    renderAdmin(<LiveTvTab />)
+
+    fireEvent.click(screen.getByTestId('toggle-channel-mapping-btn'))
+    const selectCh1 = (await screen.findByTestId('channel-mapping-select-ch-1')) as HTMLSelectElement
+    const selectCh2 = (await screen.findByTestId('channel-mapping-select-ch-2')) as HTMLSelectElement
+    expect(selectCh1.value).toBe('xmltv-1')
+    expect(selectCh2.value).toBe('xmltv-6')
+
+    // 修改 ch-1 并保存，然后模拟服务端返回新值，验证 draftMappings[ch-1] 已被清除不会遮蔽服务端值
+    fireEvent.change(selectCh1, { target: { value: 'xmltv-1-alt' } })
+    fireEvent.click(screen.getByTestId('save-channel-mapping-ch-1'))
+    await waitFor(() => {
+      expect(selectCh1.value).toBe('xmltv-1-alt')
+    })
+
+    // 修改 ch-2 但不保存，点击"刷新映射选项"后应重置为服务端映射值
+    fireEvent.change(selectCh2, { target: { value: 'xmltv-6-alt' } })
+    expect(selectCh2.value).toBe('xmltv-6-alt')
+
+    fireEvent.click(screen.getByTestId('refresh-channel-mappings-btn'))
+    await waitFor(() => {
+      expect(selectCh2.value).toBe('xmltv-6')
+    })
+  })
 })

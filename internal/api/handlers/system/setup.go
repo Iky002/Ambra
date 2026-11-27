@@ -22,7 +22,26 @@ const (
 	setupAdminRateLimit         = 30
 	setupAdminLoopbackRateLimit = 180
 	setupAdminRateWindow        = time.Minute
+	maxSetupRateBuckets         = 4096
 )
+
+func normalizeSetupRateKey(rawIP string) (key string, isLoopback bool) {
+	ip := strings.TrimSpace(rawIP)
+	if ip == "" {
+		return "", false
+	}
+	if addr, err := netip.ParseAddr(ip); err == nil {
+		addr = addr.WithZone("").Unmap()
+		if addr.IsLoopback() {
+			isLoopback = true
+		}
+		if addr.Is6() {
+			return netip.PrefixFrom(addr, 64).Masked().String(), isLoopback
+		}
+		return addr.String(), isLoopback
+	}
+	return ip, false
+}
 
 func (h *Handler) checkSetupOrigin(r *http.Request) bool {
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
@@ -37,12 +56,12 @@ func (h *Handler) checkSetupOrigin(r *http.Request) bool {
 }
 
 func (h *Handler) checkSetupRateLimit(r *http.Request) bool {
-	ip := strings.TrimSpace(netutil.ClientIP(r))
-	if ip == "" {
+	key, isLoopback := normalizeSetupRateKey(netutil.ClientIP(r))
+	if key == "" {
 		return true
 	}
 	limit := setupAdminRateLimit
-	if addr, err := netip.ParseAddr(ip); err == nil && addr.Unmap().IsLoopback() {
+	if isLoopback {
 		limit = setupAdminLoopbackRateLimit
 	}
 	now := time.Now().UTC()
@@ -66,10 +85,13 @@ func (h *Handler) checkSetupRateLimit(r *http.Request) bool {
 			h.setupRates[k] = kept
 		}
 	}
-	if len(h.setupRates[ip]) >= limit {
+	if len(h.setupRates[key]) >= limit {
 		return false
 	}
-	h.setupRates[ip] = append(h.setupRates[ip], now)
+	if _, exists := h.setupRates[key]; !exists && len(h.setupRates) >= maxSetupRateBuckets {
+		return false
+	}
+	h.setupRates[key] = append(h.setupRates[key], now)
 	return true
 }
 
@@ -178,6 +200,10 @@ func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusForbidden, "cross-origin setup request forbidden")
 		return
 	}
+	if h.cfg != nil && h.cfg.Snapshot().IsStartupWizardCompleted {
+		httpx.Error(w, http.StatusForbidden, "setup wizard is already completed")
+		return
+	}
 	if !h.checkSetupRateLimit(r) {
 		httpx.Error(w, http.StatusTooManyRequests, "too many setup attempts")
 		return
@@ -185,7 +211,7 @@ func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
 	h.setupMu.Lock()
 	defer h.setupMu.Unlock()
 
-	if h.cfg.Snapshot().IsStartupWizardCompleted {
+	if h.cfg != nil && h.cfg.Snapshot().IsStartupWizardCompleted {
 		httpx.Error(w, http.StatusForbidden, "setup wizard is already completed")
 		return
 	}

@@ -2,11 +2,13 @@ package users
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -164,5 +166,91 @@ func TestUsersV0103Hardening(t *testing.T) {
 	rec = doReq("", http.MethodPost, "/Users/AuthenticateByName", `{"Username":"nobody","Pw":"wrong"}`, ip)
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("expected 429 after rate limit exceeded, got %d", rec.Code)
+	}
+}
+
+func TestAuthenticateByNameIPAggregateAndDeterministicCap(t *testing.T) {
+	tmp := t.TempDir()
+	st, err := sqlite.Open(filepath.Join(tmp, "users_spray.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	cfg := config.Default(tmp)
+	userRepo := sqlite.NewUserRepo(st)
+	authSvc := auth.NewService(userRepo, cfg)
+	bus := eventbus.New()
+	sessMgr := session.NewManager(userRepo, cfg, bus)
+	wsHub := ws.NewHub(authSvc, sessMgr, bus)
+	h := NewHandler(authSvc, userRepo, sessMgr, wsHub, cfg)
+
+	r := chi.NewRouter()
+	authMW := middleware.NewAuth(authSvc, sessMgr)
+	RegisterRoutes(r, authMW, h)
+
+	// 1. Single IP spraying arbitrary distinct usernames MUST hit 429 at authByNameIPRateLimit (60).
+	sprayIP := "198.51.100.201:40000"
+	for i := 0; i < authByNameIPRateLimit; i++ {
+		body := fmt.Sprintf(`{"Username":"spray-%d","Pw":"wrong"}`, i)
+		req := httptest.NewRequest(http.MethodPost, "/Users/AuthenticateByName", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = sprayIP
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("spray attempt %d expected 401, got %d", i+1, rec.Code)
+		}
+	}
+	reqBlocked := httptest.NewRequest(http.MethodPost, "/Users/AuthenticateByName", strings.NewReader(`{"Username":"brand-new-user","Pw":"wrong"}`))
+	reqBlocked.Header.Set("Content-Type", "application/json")
+	reqBlocked.RemoteAddr = sprayIP
+	recBlocked := httptest.NewRecorder()
+	r.ServeHTTP(recBlocked, reqBlocked)
+	if recBlocked.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 after %d username-spray attempts from single IP, got %d", authByNameIPRateLimit, recBlocked.Code)
+	}
+
+	// 2. Bucket cap fail-closed: filling authRates to authRateMaxBuckets MUST NOT evict an existing
+	// ip|admin lockout bucket, and new (ip, user) pairs fail closed with 429.
+	now := time.Now().UTC()
+	hCap := NewHandler(authSvc, userRepo, sessMgr, wsHub, cfg)
+	adminIP := "203.0.113.55"
+	for i := 0; i < authByNameRateLimit; i++ {
+		hCap.recordLoginFailure(adminIP, "admin", now)
+	}
+	if !hCap.isLoginRateLimited(adminIP, "admin", now) {
+		t.Fatal("expected ip|admin to be locked out")
+	}
+	// Fill remaining buckets up to authRateMaxBuckets with distinct IPs/users.
+	for i := 0; i < authRateMaxBuckets+50; i++ {
+		ip := fmt.Sprintf("198.51.%d.%d", (i/250)%256, (i%250)+1)
+		hCap.recordLoginFailure(ip, fmt.Sprintf("u%d", i), now.Add(time.Millisecond))
+	}
+	// Existing ip|admin lockout bucket MUST still be intact and rate-limited!
+	if !hCap.isLoginRateLimited(adminIP, "admin", now.Add(2*time.Millisecond)) {
+		t.Fatal("expected ip|admin lockout bucket to remain intact and never be evicted")
+	}
+	// New unseen (ip, user) MUST fail closed (rate-limited = true) while map is at cap!
+	if !hCap.isLoginRateLimited("203.0.113.250", "freshuser", now.Add(2*time.Millisecond)) {
+		t.Fatal("expected fail-closed rate limit when authRates is at maxBuckets")
+	}
+
+	// 3. Deterministic eviction in pruneRateBucketsLocked: if map exceeds cap, evicts oldest last-attempt first.
+	over := make(map[string][]time.Time, authRateMaxBuckets+2)
+	over["oldest-bucket"] = []time.Time{now.Add(-30 * time.Second)}
+	over["recent-admin"] = []time.Time{now}
+	for i := 0; i < authRateMaxBuckets; i++ {
+		over[fmt.Sprintf("mid-%04d", i)] = []time.Time{now.Add(-10 * time.Second)}
+	}
+	pruneRateBucketsLocked(over, now.Add(-time.Minute))
+	if len(over) != authRateMaxBuckets {
+		t.Fatalf("expected len=%d after deterministic prune, got %d", authRateMaxBuckets, len(over))
+	}
+	if _, exists := over["oldest-bucket"]; exists {
+		t.Fatal("expected oldest-bucket to be evicted deterministically")
+	}
+	if _, exists := over["recent-admin"]; !exists {
+		t.Fatal("expected recent-admin bucket to be preserved")
 	}
 }

@@ -29,12 +29,14 @@ import (
 )
 
 const (
-	authByNameRateLimit          = 30
-	authByNameUserRateLimit      = 30
-	authByNameRateWindow         = time.Minute
-	authByNameLoopbackRateLimit  = 60
-	authByNameLoopbackRateWindow = 5 * time.Minute
-	authRateMaxBuckets           = 4096
+	authByNameRateLimit           = 30
+	authByNameUserRateLimit       = 30
+	authByNameIPRateLimit         = 60
+	authByNameRateWindow          = time.Minute
+	authByNameLoopbackRateLimit   = 60
+	authByNameLoopbackIPRateLimit = 180
+	authByNameLoopbackRateWindow  = 5 * time.Minute
+	authRateMaxBuckets            = 4096
 )
 
 type Handler struct {
@@ -45,10 +47,12 @@ type Handler struct {
 	wsHub      *ws.Hub
 	cfg        *config.Config
 
-	mu                sync.Mutex
-	authRates         map[string][]time.Time
-	loopbackAuthRates map[string][]time.Time
-	onUserDeleted     func(ctx context.Context, userID string)
+	mu                  sync.Mutex
+	authRates           map[string][]time.Time
+	authIPRates         map[string][]time.Time
+	loopbackAuthRates   map[string][]time.Time
+	loopbackAuthIPRates map[string][]time.Time
+	onUserDeleted       func(ctx context.Context, userID string)
 }
 
 func NewHandler(
@@ -59,13 +63,15 @@ func NewHandler(
 	cfg *config.Config,
 ) *Handler {
 	return &Handler{
-		authSvc:           authSvc,
-		userRepo:          userRepo,
-		sessionMgr:        sessionMgr,
-		wsHub:             wsHub,
-		cfg:               cfg,
-		authRates:         make(map[string][]time.Time),
-		loopbackAuthRates: make(map[string][]time.Time),
+		authSvc:             authSvc,
+		userRepo:            userRepo,
+		sessionMgr:          sessionMgr,
+		wsHub:               wsHub,
+		cfg:                 cfg,
+		authRates:           make(map[string][]time.Time),
+		authIPRates:         make(map[string][]time.Time),
+		loopbackAuthRates:   make(map[string][]time.Time),
+		loopbackAuthIPRates: make(map[string][]time.Time),
 	}
 }
 
@@ -90,6 +96,16 @@ func (h *Handler) getLibraryRepo() *sqlite.LibraryRepo {
 	return h.libRepo
 }
 
+func bucketLastAttempt(ts []time.Time) time.Time {
+	var latest time.Time
+	for _, t := range ts {
+		if t.After(latest) {
+			latest = t
+		}
+	}
+	return latest
+}
+
 func pruneRateBucketsLocked(buckets map[string][]time.Time, cutoff time.Time) {
 	for k, ts := range buckets {
 		kept := ts[:0]
@@ -104,16 +120,30 @@ func pruneRateBucketsLocked(buckets map[string][]time.Time, cutoff time.Time) {
 			buckets[k] = kept
 		}
 	}
-	if len(buckets) > authRateMaxBuckets {
-		excess := len(buckets) - authRateMaxBuckets
-		for k := range buckets {
-			if excess <= 0 {
-				break
+	for len(buckets) > authRateMaxBuckets {
+		var oldestKey string
+		var oldestTime time.Time
+		first := true
+		for k, ts := range buckets {
+			last := bucketLastAttempt(ts)
+			if first || last.Before(oldestTime) || (last.Equal(oldestTime) && k < oldestKey) {
+				oldestKey = k
+				oldestTime = last
+				first = false
 			}
-			delete(buckets, k)
-			excess--
 		}
+		if first {
+			break
+		}
+		delete(buckets, oldestKey)
 	}
+}
+
+func appendBoundedRateBucketLocked(buckets map[string][]time.Time, key string, now time.Time) {
+	if _, exists := buckets[key]; !exists && len(buckets) >= authRateMaxBuckets {
+		return
+	}
+	buckets[key] = append(buckets[key], now)
 }
 
 func isLoopbackClientIP(raw string) bool {
@@ -160,32 +190,56 @@ func (h *Handler) isLoginRateLimited(ip, username string, now time.Time) bool {
 	}
 	loopback := isLoopbackClientIP(ip)
 	key := normalizeLoginRateKey(ip, username)
-	emptyKey := normalizeLoginRateKey(ip, "")
+	ipKey := normalizeLoginRateKey(ip, "")
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if loopback {
-		if h.loopbackAuthRates == nil {
-			return false
+		cutoff := now.Add(-authByNameLoopbackRateWindow)
+		if h.loopbackAuthRates != nil {
+			pruneRateBucketsLocked(h.loopbackAuthRates, cutoff)
+			if len(h.loopbackAuthRates[key]) >= authByNameLoopbackRateLimit {
+				return true
+			}
+			if username != "" && len(h.loopbackAuthRates[ipKey]) >= authByNameLoopbackRateLimit {
+				return true
+			}
+			if _, exists := h.loopbackAuthRates[key]; !exists && len(h.loopbackAuthRates) >= authRateMaxBuckets {
+				return true
+			}
 		}
-		pruneRateBucketsLocked(h.loopbackAuthRates, now.Add(-authByNameLoopbackRateWindow))
-		if len(h.loopbackAuthRates[key]) >= authByNameLoopbackRateLimit {
-			return true
-		}
-		if username != "" && len(h.loopbackAuthRates[emptyKey]) >= authByNameLoopbackRateLimit {
-			return true
+		if h.loopbackAuthIPRates != nil {
+			pruneRateBucketsLocked(h.loopbackAuthIPRates, cutoff)
+			if len(h.loopbackAuthIPRates[ipKey]) >= authByNameLoopbackIPRateLimit {
+				return true
+			}
+			if _, exists := h.loopbackAuthIPRates[ipKey]; !exists && len(h.loopbackAuthIPRates) >= authRateMaxBuckets {
+				return true
+			}
 		}
 		return false
 	}
-	if h.authRates == nil {
-		return false
+	cutoff := now.Add(-authByNameRateWindow)
+	if h.authRates != nil {
+		pruneRateBucketsLocked(h.authRates, cutoff)
+		if len(h.authRates[key]) >= authByNameRateLimit {
+			return true
+		}
+		if username != "" && len(h.authRates[ipKey]) >= authByNameRateLimit {
+			return true
+		}
+		if _, exists := h.authRates[key]; !exists && len(h.authRates) >= authRateMaxBuckets {
+			return true
+		}
 	}
-	pruneRateBucketsLocked(h.authRates, now.Add(-authByNameRateWindow))
-	if len(h.authRates[key]) >= authByNameRateLimit {
-		return true
-	}
-	if username != "" && len(h.authRates[emptyKey]) >= authByNameRateLimit {
-		return true
+	if h.authIPRates != nil {
+		pruneRateBucketsLocked(h.authIPRates, cutoff)
+		if len(h.authIPRates[ipKey]) >= authByNameIPRateLimit {
+			return true
+		}
+		if _, exists := h.authIPRates[ipKey]; !exists && len(h.authIPRates) >= authRateMaxBuckets {
+			return true
+		}
 	}
 	return false
 }
@@ -197,6 +251,7 @@ func (h *Handler) recordLoginFailure(ip, username string, now time.Time) {
 	}
 	loopback := isLoopbackClientIP(ip)
 	key := normalizeLoginRateKey(ip, username)
+	ipKey := normalizeLoginRateKey(ip, "")
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -204,15 +259,27 @@ func (h *Handler) recordLoginFailure(ip, username string, now time.Time) {
 		if h.loopbackAuthRates == nil {
 			h.loopbackAuthRates = make(map[string][]time.Time)
 		}
-		pruneRateBucketsLocked(h.loopbackAuthRates, now.Add(-authByNameLoopbackRateWindow))
-		h.loopbackAuthRates[key] = append(h.loopbackAuthRates[key], now)
+		if h.loopbackAuthIPRates == nil {
+			h.loopbackAuthIPRates = make(map[string][]time.Time)
+		}
+		cutoff := now.Add(-authByNameLoopbackRateWindow)
+		pruneRateBucketsLocked(h.loopbackAuthRates, cutoff)
+		pruneRateBucketsLocked(h.loopbackAuthIPRates, cutoff)
+		appendBoundedRateBucketLocked(h.loopbackAuthRates, key, now)
+		appendBoundedRateBucketLocked(h.loopbackAuthIPRates, ipKey, now)
 		return
 	}
 	if h.authRates == nil {
 		h.authRates = make(map[string][]time.Time)
 	}
-	pruneRateBucketsLocked(h.authRates, now.Add(-authByNameRateWindow))
-	h.authRates[key] = append(h.authRates[key], now)
+	if h.authIPRates == nil {
+		h.authIPRates = make(map[string][]time.Time)
+	}
+	cutoff := now.Add(-authByNameRateWindow)
+	pruneRateBucketsLocked(h.authRates, cutoff)
+	pruneRateBucketsLocked(h.authIPRates, cutoff)
+	appendBoundedRateBucketLocked(h.authRates, key, now)
+	appendBoundedRateBucketLocked(h.authIPRates, ipKey, now)
 }
 
 func (h *Handler) canAccessItem(ctx context.Context, ac *middleware.AuthContext, itemID string) (bool, error) {

@@ -248,3 +248,101 @@ func TestDefaultConfigExportExternalUninstallAndOnConfigSavedHook(t *testing.T) 
 		t.Fatalf("expected 404 after external plugin uninstall, got %d", rec.Code)
 	}
 }
+
+func TestCaseInsensitivePluginIDPreservesSecretsAndCanonicalKey(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "pa_case_insensitive.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	reg := plugins.NewRegistry()
+	tp := tmdb.New("", "zh-CN")
+	reg.Register(tp)
+
+	h := New(reg, store)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, AuthFuncs{})
+
+	// Seed initial configuration with a real API key under canonical lowercase ID.
+	seedBody, _ := json.Marshal(map[string]any{
+		"api_key":  "super-secret-tmdb-key",
+		"language": "zh-CN",
+		"enabled":  true,
+	})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/Plugins/ambra.builtin.tmdb/Configuration", bytes.NewReader(seedBody)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("seed POST config status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 1. GET with uppercase ID returns masked saved secret and canonical ID.
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/Plugins/AMBRA.BUILTIN.TMDB/Configuration", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET uppercase config status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var gotGet map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &gotGet); err != nil {
+		t.Fatal(err)
+	}
+	if gotGet["Id"] != "ambra.builtin.tmdb" || gotGet["api_key"] != maskedSecret || gotGet["language"] != "zh-CN" {
+		t.Fatalf("GET uppercase config did not load canonical config: %+v", gotGet)
+	}
+
+	// 2. POST Configuration with uppercase ID updates language WITHOUT wiping api_key.
+	updBody, _ := json.Marshal(map[string]any{"language": "en-US"})
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/Plugins/AMBRA.BUILTIN.TMDB/Configuration", bytes.NewReader(updBody)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST uppercase config status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	checkPersistedSecret := func(step string, wantLang string) {
+		t.Helper()
+		var raw string
+		err := store.Reader.QueryRowContext(ctx, `SELECT value_json FROM server_config WHERE key = 'plugin:ambra.builtin.tmdb'`).Scan(&raw)
+		if err != nil {
+			t.Fatalf("%s: expected plugin:ambra.builtin.tmdb in server_config, err=%v", step, err)
+		}
+		var saved map[string]any
+		if err := json.Unmarshal([]byte(raw), &saved); err != nil {
+			t.Fatal(err)
+		}
+		if saved["api_key"] != "super-secret-tmdb-key" {
+			t.Fatalf("%s: api_key was wiped or altered: %+v", step, saved)
+		}
+		if saved["language"] != wantLang {
+			t.Fatalf("%s: expected language=%q, got %+v", step, wantLang, saved)
+		}
+		var dupCount int
+		_ = store.Reader.QueryRowContext(ctx, `SELECT COUNT(*) FROM server_config WHERE key = 'plugin:AMBRA.BUILTIN.TMDB'`).Scan(&dupCount)
+		if dupCount != 0 {
+			t.Fatalf("%s: unexpected uppercase server_config key created", step)
+		}
+	}
+	checkPersistedSecret("after uppercase POST Configuration", "en-US")
+
+	// 3. POST Enable with uppercase ID returns canonical Id and preserves api_key.
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/Plugins/AMBRA.BUILTIN.TMDB/Enable?enabled=false", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST uppercase Enable status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var gotEnable map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &gotEnable)
+	if gotEnable["Id"] != "ambra.builtin.tmdb" || gotEnable["Enabled"] != false {
+		t.Fatalf("unexpected uppercase Enable response: %+v", gotEnable)
+	}
+	checkPersistedSecret("after uppercase POST Enable", "en-US")
+
+	// 4. DELETE (disable built-in) with uppercase ID also preserves api_key.
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/Plugins/AMBRA.BUILTIN.TMDB", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE uppercase built-in status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	checkPersistedSecret("after uppercase DELETE built-in", "en-US")
+}
+

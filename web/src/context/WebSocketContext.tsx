@@ -3,6 +3,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { Bell, X } from 'lucide-react'
 import { api, ApiError, clearAuth, getDeviceId } from '../api/client'
 import { isDemoMode } from '../demo/demoMode'
+import { useI18n } from '../i18n/I18nContext'
 import { useAuth } from './AuthContext'
 
 export interface PlaystateCommand {
@@ -71,6 +72,9 @@ const LIBRARY_CHANGED_KEYS = [
 
 export function WebSocketProvider({ children }: { children: React.ReactNode }) {
   const { auth, refreshUser, logout } = useAuth()
+  const { t } = useI18n()
+  const tRef = useRef(t)
+  tRef.current = t
   const queryClient = useQueryClient()
   const [connected, setConnected] = useState(false)
   const [toasts, setToasts] = useState<ToastNotification[]>([])
@@ -132,7 +136,7 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
       const id = `ws-toast-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
       setToasts((prev) => {
-        const next = [...prev, { id, header: header || '系统消息', text }]
+        const next = [...prev, { id, header: header || tRef.current('ws.systemMessage'), text }]
         if (next.length > MAX_VISIBLE_TOASTS) {
           const removed = next.shift()
           if (removed) {
@@ -489,7 +493,7 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
               </div>
               <button
                 type="button"
-                aria-label="关闭通知"
+                aria-label={t('ws.closeNotification')}
                 onClick={() => dismissToast(toast.id)}
                 className="shrink-0 rounded-lg p-1 text-zinc-400 transition-colors hover:bg-white/10 hover:text-white"
               >

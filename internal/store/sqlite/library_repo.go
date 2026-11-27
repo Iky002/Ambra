@@ -2142,6 +2142,77 @@ func appendSafeIDSetSQL(col string, rawIDs []string, negate bool) (string, []any
 	return fmt.Sprintf(`%s %s (SELECT value FROM json_each(?))`, col, op), []any{string(rawJSON)}
 }
 
+func appendSafeStringSetSQL(colExpr string, values []string, negate bool, lowerCol bool) (string, []any) {
+	if len(values) == 0 {
+		return "", nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	dedup := make([]string, 0, len(values))
+	for _, v := range values {
+		if lowerCol {
+			v = strings.ToLower(strings.TrimSpace(v))
+		}
+		if _, dup := seen[v]; !dup {
+			seen[v] = struct{}{}
+			dedup = append(dedup, v)
+		}
+	}
+	if len(dedup) == 0 {
+		return "", nil
+	}
+	expr := colExpr
+	if lowerCol {
+		expr = fmt.Sprintf("lower(%s)", colExpr)
+	}
+	op := "IN"
+	if negate {
+		op = "NOT IN"
+	}
+	if len(dedup) <= sqliteMaxInlineIDPlaceholders {
+		ph := make([]string, len(dedup))
+		args := make([]any, len(dedup))
+		for i, v := range dedup {
+			ph[i] = "?"
+			args[i] = v
+		}
+		return fmt.Sprintf(`%s %s (%s)`, expr, op, strings.Join(ph, ",")), args
+	}
+	rawJSON, _ := json.Marshal(dedup)
+	return fmt.Sprintf(`%s %s (SELECT value FROM json_each(?))`, expr, op), []any{string(rawJSON)}
+}
+
+func appendSafeIntSetSQL(colExpr string, values []int, negate bool) (string, []any) {
+	if len(values) == 0 {
+		return "", nil
+	}
+	seen := make(map[int]struct{}, len(values))
+	dedup := make([]int, 0, len(values))
+	for _, v := range values {
+		if _, dup := seen[v]; !dup {
+			seen[v] = struct{}{}
+			dedup = append(dedup, v)
+		}
+	}
+	if len(dedup) == 0 {
+		return "", nil
+	}
+	op := "IN"
+	if negate {
+		op = "NOT IN"
+	}
+	if len(dedup) <= sqliteMaxInlineIDPlaceholders {
+		ph := make([]string, len(dedup))
+		args := make([]any, len(dedup))
+		for i, v := range dedup {
+			ph[i] = "?"
+			args[i] = v
+		}
+		return fmt.Sprintf(`%s %s (%s)`, colExpr, op, strings.Join(ph, ",")), args
+	}
+	rawJSON, _ := json.Marshal(dedup)
+	return fmt.Sprintf(`%s %s (SELECT value FROM json_each(?))`, colExpr, op), []any{string(rawJSON)}
+}
+
 func appendPlaylistVisibilitySQL(alias, viewerUserID string, viewerIsAdmin bool) (string, []any) {
 	if viewerIsAdmin {
 		return "", nil
@@ -2436,12 +2507,29 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 	if f.LibraryID != "" {
 		lid := guid.Normalize(f.LibraryID)
 		if f.GroupItemsIntoCollections {
+			childConds := []string{
+				"ic_lib.container_id = i.id",
+				"ch_lib.extra_type = ''",
+				"ch_lib.library_id = ?",
+			}
+			childArgs := []any{lid}
+			if len(f.AllowedLibraryIDs) > 0 {
+				if alClause, alArgs := appendSafeIDSetSQL("ch_lib.library_id", f.AllowedLibraryIDs, false); alClause != "" {
+					childConds = append(childConds, alClause)
+					childArgs = append(childArgs, alArgs...)
+				}
+			}
+			if pClauses, pArgs := appendParentalPolicySQL("ch_lib", pFilter); len(pClauses) > 0 {
+				childConds = append(childConds, pClauses...)
+				childArgs = append(childArgs, pArgs...)
+			}
 			where = append(where, `(i.library_id = ? OR (LOWER(i.type) = 'boxset' AND i.library_id = 'collections' AND EXISTS (
 				SELECT 1 FROM item_collections ic_lib
 				JOIN items ch_lib ON ch_lib.id = ic_lib.item_id
-				WHERE ic_lib.container_id = i.id AND ch_lib.extra_type = '' AND ch_lib.library_id = ?
+				WHERE `+strings.Join(childConds, " AND ")+`
 			)))`)
-			args = append(args, lid, lid)
+			args = append(args, lid)
+			args = append(args, childArgs...)
 		} else {
 			where = append(where, `i.library_id = ?`)
 			args = append(args, lid)
@@ -2462,29 +2550,49 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 	if f.ParentID != "" {
 		pid := guid.Normalize(f.ParentID)
 		if f.GroupItemsIntoCollections {
+			childConds := []string{
+				"ic_p.container_id = i.id",
+				"ch_p.extra_type = ''",
+			}
+			var childArgs []any
+			if len(f.AllowedLibraryIDs) > 0 {
+				if alClause, alArgs := appendSafeIDSetSQL("ch_p.library_id", f.AllowedLibraryIDs, false); alClause != "" {
+					childConds = append(childConds, alClause)
+					childArgs = append(childArgs, alArgs...)
+				}
+			}
+			if pClauses, pArgs := appendParentalPolicySQL("ch_p", pFilter); len(pClauses) > 0 {
+				childConds = append(childConds, pClauses...)
+				childArgs = append(childArgs, pArgs...)
+			}
 			if f.Recursive {
+				childConds = append(childConds, `(ch_p.library_id = ? OR ch_p.parent_id = ? OR EXISTS (
+					SELECT 1 FROM item_ancestors anc_p WHERE anc_p.descendant_id = ch_p.id AND anc_p.ancestor_id = ? AND anc_p.depth > 0
+				))`)
+				childArgs = append(childArgs, pid, pid, pid)
 				where = append(where, `(
 					EXISTS (SELECT 1 FROM item_ancestors anc WHERE anc.descendant_id = i.id AND anc.ancestor_id = ? AND anc.depth > 0)
 					OR (LOWER(i.type) = 'boxset' AND i.library_id = 'collections' AND EXISTS (
 						SELECT 1 FROM item_collections ic_p
 						JOIN items ch_p ON ch_p.id = ic_p.item_id
-						WHERE ic_p.container_id = i.id AND ch_p.extra_type = ''
-						  AND (ch_p.library_id = ? OR ch_p.parent_id = ? OR EXISTS (
-							  SELECT 1 FROM item_ancestors anc_p WHERE anc_p.descendant_id = ch_p.id AND anc_p.ancestor_id = ? AND anc_p.depth > 0
-						  ))
+						WHERE `+strings.Join(childConds, " AND ")+`
 					))
 				)`)
-				args = append(args, pid, pid, pid, pid)
+				args = append(args, pid)
+				args = append(args, childArgs...)
 			} else {
+				childConds = append(childConds, `(ch_p.parent_id = ? OR ch_p.library_id = ?)`)
+				childArgs = append(childArgs, pid, pid)
 				where = append(where, `(
 					i.parent_id = ?
 					OR (LOWER(i.type) = 'boxset' AND i.library_id = 'collections' AND EXISTS (
 						SELECT 1 FROM item_collections ic_p
 						JOIN items ch_p ON ch_p.id = ic_p.item_id
-						WHERE ic_p.container_id = i.id AND ch_p.extra_type = '' AND (ch_p.parent_id = ? OR ch_p.library_id = ?)
+						WHERE `+strings.Join(childConds, " AND ")+`
 					))
 				)`)
-				args = append(args, pid, pid, pid)
+				args = append(args, pid)
+				args = append(args, childArgs...)
 			}
 		} else if f.Recursive {
 			joins = append(joins, `INNER JOIN item_ancestors anc ON anc.descendant_id = i.id`)
@@ -2510,21 +2618,13 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 		}
 	}
 
-	if len(includeTypes) > 0 {
-		placeholders := make([]string, len(includeTypes))
-		for idx, t := range includeTypes {
-			placeholders[idx] = "?"
-			args = append(args, t)
-		}
-		where = append(where, fmt.Sprintf(`i.type IN (%s)`, strings.Join(placeholders, ",")))
+	if incClause, incArgs := appendSafeStringSetSQL("i.type", includeTypes, false, false); incClause != "" {
+		where = append(where, incClause)
+		args = append(args, incArgs...)
 	}
-	if len(f.ExcludeItemTypes) > 0 {
-		placeholders := make([]string, len(f.ExcludeItemTypes))
-		for idx, t := range f.ExcludeItemTypes {
-			placeholders[idx] = "?"
-			args = append(args, t)
-		}
-		where = append(where, fmt.Sprintf(`i.type NOT IN (%s)`, strings.Join(placeholders, ",")))
+	if excClause, excArgs := appendSafeStringSetSQL("i.type", f.ExcludeItemTypes, true, false); excClause != "" {
+		where = append(where, excClause)
+		args = append(args, excArgs...)
 	}
 	if f.GroupItemsIntoCollections {
 		boxSelfPolicy := parentalPolicy{
@@ -2554,13 +2654,9 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 		// Ensure BoxSets returned via GroupItemsIntoCollections contain >= 1 visible child (matching original IncludeItemTypes if specified).
 		visChildConds := []string{"ic_gvis.container_id = i.id", "ch_gvis.extra_type = ''"}
 		var visChildArgs []any
-		if len(f.AllowedLibraryIDs) > 0 {
-			ph := make([]string, len(f.AllowedLibraryIDs))
-			for idx, lid := range f.AllowedLibraryIDs {
-				ph[idx] = "?"
-				visChildArgs = append(visChildArgs, guid.Normalize(lid))
-			}
-			visChildConds = append(visChildConds, fmt.Sprintf("ch_gvis.library_id IN (%s)", strings.Join(ph, ",")))
+		if alClause, alArgs := appendSafeIDSetSQL("ch_gvis.library_id", f.AllowedLibraryIDs, false); alClause != "" {
+			visChildConds = append(visChildConds, alClause)
+			visChildArgs = append(visChildArgs, alArgs...)
 		}
 		if len(f.IncludeItemTypes) > 0 {
 			hasNonBoxSet := false
@@ -2572,12 +2668,10 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 				}
 			}
 			if hasNonBoxSet {
-				ph := make([]string, len(origTypes))
-				for idx, t := range origTypes {
-					ph[idx] = "?"
-					visChildArgs = append(visChildArgs, t)
+				if tClause, tArgs := appendSafeStringSetSQL("ch_gvis.type", origTypes, false, false); tClause != "" {
+					visChildConds = append(visChildConds, tClause)
+					visChildArgs = append(visChildArgs, tArgs...)
 				}
-				visChildConds = append(visChildConds, fmt.Sprintf("ch_gvis.type IN (%s)", strings.Join(ph, ",")))
 			}
 		}
 		if pClauses, pArgs := appendParentalPolicySQL("ch_gvis", pFilter); len(pClauses) > 0 {
@@ -2600,12 +2694,10 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 		}
 	}
 	if normMediaTypes := normalizeBlockedTags(f.MediaTypes); len(normMediaTypes) > 0 {
-		ph := make([]string, len(normMediaTypes))
-		for idx, mt := range normMediaTypes {
-			ph[idx] = "?"
-			args = append(args, mt)
+		if mtClause, mtArgs := appendSafeStringSetSQL(`lower(trim(COALESCE(i.media_type, '')))`, normMediaTypes, false, false); mtClause != "" {
+			where = append(where, mtClause)
+			args = append(args, mtArgs...)
 		}
-		where = append(where, fmt.Sprintf(`lower(trim(COALESCE(i.media_type, ''))) IN (%s)`, strings.Join(ph, ",")))
 	}
 	if len(f.Containers) > 0 {
 		var normContainers []string
@@ -2620,24 +2712,17 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 			}
 		}
 		if len(normContainers) > 0 {
-			ph := make([]string, len(normContainers))
-			cArgs := make([]any, 0, len(normContainers)*2)
-			for idx, c := range normContainers {
-				ph[idx] = "?"
-				cArgs = append(cArgs, c)
-			}
-			for _, c := range normContainers {
-				cArgs = append(cArgs, c)
-			}
-			inList := strings.Join(ph, ",")
+			itemCClause, itemCArgs := appendSafeStringSetSQL(`lower(trim(trim(COALESCE(i.container, '')), '.'))`, normContainers, false, false)
+			msCClause, msCArgs := appendSafeStringSetSQL(`lower(trim(trim(COALESCE(ms_cnt.container, '')), '.'))`, normContainers, false, false)
 			where = append(where, fmt.Sprintf(`(
-				lower(trim(trim(COALESCE(i.container, '')), '.')) IN (%s)
+				%s
 				OR EXISTS (
 					SELECT 1 FROM item_media_sources ms_cnt
-					WHERE ms_cnt.item_id = i.id AND lower(trim(trim(COALESCE(ms_cnt.container, '')), '.')) IN (%s)
+					WHERE ms_cnt.item_id = i.id AND %s
 				)
-			)`, inList, inList))
-			args = append(args, cArgs...)
+			)`, itemCClause, msCClause))
+			args = append(args, itemCArgs...)
+			args = append(args, msCArgs...)
 		}
 	}
 
@@ -2649,24 +2734,20 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 		where = append(where, exClause)
 		args = append(args, exArgs...)
 	}
-	if len(f.Years) > 0 {
-		placeholders := make([]string, len(f.Years))
-		for idx, y := range f.Years {
-			placeholders[idx] = "?"
-			args = append(args, y)
-		}
-		where = append(where, fmt.Sprintf(`i.production_year IN (%s)`, strings.Join(placeholders, ",")))
+	if yrClause, yrArgs := appendSafeIntSetSQL("i.production_year", f.Years, false); yrClause != "" {
+		where = append(where, yrClause)
+		args = append(args, yrArgs...)
 	}
 	if len(f.OfficialRatings) > 0 {
-		ph := make([]string, 0, len(f.OfficialRatings))
+		normRatings := make([]string, 0, len(f.OfficialRatings))
 		for _, or := range f.OfficialRatings {
 			if trimmed := strings.ToUpper(strings.TrimSpace(or)); trimmed != "" {
-				ph = append(ph, "?")
-				args = append(args, trimmed)
+				normRatings = append(normRatings, trimmed)
 			}
 		}
-		if len(ph) > 0 {
-			where = append(where, fmt.Sprintf(`upper(trim(COALESCE(i.official_rating, ''))) IN (%s)`, strings.Join(ph, ",")))
+		if orClause, orArgs := appendSafeStringSetSQL(`upper(trim(COALESCE(i.official_rating, '')))`, normRatings, false, false); orClause != "" {
+			where = append(where, orClause)
+			args = append(args, orArgs...)
 		}
 	}
 	if f.MinCommunityRating != nil {
@@ -2674,61 +2755,37 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 		args = append(args, *f.MinCommunityRating)
 	}
 
-	if len(f.Genres) > 0 {
-		ph := make([]string, len(f.Genres))
-		for idx, g := range f.Genres {
-			ph[idx] = "?"
-			args = append(args, g)
-		}
+	if gClause, gArgs := appendSafeStringSetSQL("tx.name", f.Genres, false, false); gClause != "" {
 		where = append(where, fmt.Sprintf(`EXISTS (
 			SELECT 1 FROM item_taxonomies it
 			JOIN taxonomies tx ON tx.id = it.taxonomy_id
-			WHERE it.item_id = i.id AND tx.kind = 'genre' AND tx.name IN (%s)
-		)`, strings.Join(ph, ",")))
+			WHERE it.item_id = i.id AND tx.kind = 'genre' AND %s
+		)`, gClause))
+		args = append(args, gArgs...)
 	}
-	if len(f.GenreIDs) > 0 {
-		ph := make([]string, 0, len(f.GenreIDs))
-		for _, gid := range f.GenreIDs {
-			if norm := guid.Normalize(gid); norm != "" {
-				ph = append(ph, "?")
-				args = append(args, norm)
-			}
-		}
-		if len(ph) > 0 {
-			where = append(where, fmt.Sprintf(`EXISTS (
-				SELECT 1 FROM item_taxonomies it
-				JOIN taxonomies tx ON tx.id = it.taxonomy_id
-				WHERE it.item_id = i.id AND tx.kind = 'genre' AND tx.id IN (%s)
-			)`, strings.Join(ph, ",")))
-		}
-	}
-	if len(f.Studios) > 0 {
-		ph := make([]string, len(f.Studios))
-		for idx, s := range f.Studios {
-			ph[idx] = "?"
-			args = append(args, s)
-		}
+	if gidClause, gidArgs := appendSafeIDSetSQL("tx.id", f.GenreIDs, false); gidClause != "" {
 		where = append(where, fmt.Sprintf(`EXISTS (
 			SELECT 1 FROM item_taxonomies it
 			JOIN taxonomies tx ON tx.id = it.taxonomy_id
-			WHERE it.item_id = i.id AND tx.kind = 'studio' AND tx.name IN (%s)
-		)`, strings.Join(ph, ",")))
+			WHERE it.item_id = i.id AND tx.kind = 'genre' AND %s
+		)`, gidClause))
+		args = append(args, gidArgs...)
 	}
-	if len(f.StudioIDs) > 0 {
-		ph := make([]string, 0, len(f.StudioIDs))
-		for _, sid := range f.StudioIDs {
-			if norm := guid.Normalize(sid); norm != "" {
-				ph = append(ph, "?")
-				args = append(args, norm)
-			}
-		}
-		if len(ph) > 0 {
-			where = append(where, fmt.Sprintf(`EXISTS (
-				SELECT 1 FROM item_taxonomies it
-				JOIN taxonomies tx ON tx.id = it.taxonomy_id
-				WHERE it.item_id = i.id AND tx.kind = 'studio' AND tx.id IN (%s)
-			)`, strings.Join(ph, ",")))
-		}
+	if sClause, sArgs := appendSafeStringSetSQL("tx.name", f.Studios, false, false); sClause != "" {
+		where = append(where, fmt.Sprintf(`EXISTS (
+			SELECT 1 FROM item_taxonomies it
+			JOIN taxonomies tx ON tx.id = it.taxonomy_id
+			WHERE it.item_id = i.id AND tx.kind = 'studio' AND %s
+		)`, sClause))
+		args = append(args, sArgs...)
+	}
+	if sidClause, sidArgs := appendSafeIDSetSQL("tx.id", f.StudioIDs, false); sidClause != "" {
+		where = append(where, fmt.Sprintf(`EXISTS (
+			SELECT 1 FROM item_taxonomies it
+			JOIN taxonomies tx ON tx.id = it.taxonomy_id
+			WHERE it.item_id = i.id AND tx.kind = 'studio' AND %s
+		)`, sidClause))
+		args = append(args, sidArgs...)
 	}
 	if f.IsHD != nil {
 		if *f.IsHD {
@@ -2780,40 +2837,34 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 		}
 	}
 	if normCodecs := expandStreamCodecAliases(f.VideoCodecs, "video"); len(normCodecs) > 0 {
-		ph := make([]string, len(normCodecs))
-		for idx, c := range normCodecs {
-			ph[idx] = "?"
-			args = append(args, c)
+		if vcClause, vcArgs := appendSafeStringSetSQL(`lower(trim(COALESCE(ms.codec, '')))`, normCodecs, false, false); vcClause != "" {
+			where = append(where, fmt.Sprintf(`EXISTS (
+				SELECT 1 FROM item_media_streams ms
+				WHERE ms.item_id = i.id AND lower(ms.stream_type) = 'video'
+				  AND %s
+			)`, vcClause))
+			args = append(args, vcArgs...)
 		}
-		where = append(where, fmt.Sprintf(`EXISTS (
-			SELECT 1 FROM item_media_streams ms
-			WHERE ms.item_id = i.id AND lower(ms.stream_type) = 'video'
-			  AND lower(trim(COALESCE(ms.codec, ''))) IN (%s)
-		)`, strings.Join(ph, ",")))
 	}
 	if normAudio := expandStreamCodecAliases(f.AudioCodecs, "audio"); len(normAudio) > 0 {
-		ph := make([]string, len(normAudio))
-		for idx, c := range normAudio {
-			ph[idx] = "?"
-			args = append(args, c)
+		if acClause, acArgs := appendSafeStringSetSQL(`lower(trim(COALESCE(ms.codec, '')))`, normAudio, false, false); acClause != "" {
+			where = append(where, fmt.Sprintf(`EXISTS (
+				SELECT 1 FROM item_media_streams ms
+				WHERE ms.item_id = i.id AND lower(ms.stream_type) = 'audio'
+				  AND %s
+			)`, acClause))
+			args = append(args, acArgs...)
 		}
-		where = append(where, fmt.Sprintf(`EXISTS (
-			SELECT 1 FROM item_media_streams ms
-			WHERE ms.item_id = i.id AND lower(ms.stream_type) = 'audio'
-			  AND lower(trim(COALESCE(ms.codec, ''))) IN (%s)
-		)`, strings.Join(ph, ",")))
 	}
 	if normSubs := expandStreamCodecAliases(f.SubtitleCodecs, "subtitle"); len(normSubs) > 0 {
-		ph := make([]string, len(normSubs))
-		for idx, c := range normSubs {
-			ph[idx] = "?"
-			args = append(args, c)
+		if scClause, scArgs := appendSafeStringSetSQL(`lower(trim(COALESCE(ms.codec, '')))`, normSubs, false, false); scClause != "" {
+			where = append(where, fmt.Sprintf(`EXISTS (
+				SELECT 1 FROM item_media_streams ms
+				WHERE ms.item_id = i.id AND lower(ms.stream_type) = 'subtitle'
+				  AND %s
+			)`, scClause))
+			args = append(args, scArgs...)
 		}
-		where = append(where, fmt.Sprintf(`EXISTS (
-			SELECT 1 FROM item_media_streams ms
-			WHERE ms.item_id = i.id AND lower(ms.stream_type) = 'subtitle'
-			  AND lower(trim(COALESCE(ms.codec, ''))) IN (%s)
-		)`, strings.Join(ph, ",")))
 	}
 	if vrClause, vrArgs := appendVideoRangesSQL("i", f.VideoRanges); vrClause != "" {
 		where = append(where, vrClause)
@@ -2832,53 +2883,39 @@ func (r *LibraryRepo) QueryItems(ctx context.Context, f ItemFilter) ([]dto.BaseI
 			)`)
 		}
 	}
-	if len(f.Tags) > 0 {
-		ph := make([]string, len(f.Tags))
-		for idx, t := range f.Tags {
-			ph[idx] = "?"
-			args = append(args, strings.ToLower(strings.TrimSpace(t)))
-		}
+	if tClause, tArgs := appendSafeStringSetSQL("tx.name", f.Tags, false, true); tClause != "" {
 		where = append(where, fmt.Sprintf(`EXISTS (
 			SELECT 1 FROM item_taxonomies it
 			JOIN taxonomies tx ON tx.id = it.taxonomy_id
-			WHERE it.item_id = i.id AND lower(tx.kind) = 'tag' AND lower(tx.name) IN (%s)
-		)`, strings.Join(ph, ",")))
+			WHERE it.item_id = i.id AND lower(tx.kind) = 'tag' AND %s
+		)`, tClause))
+		args = append(args, tArgs...)
 	}
 	if normExTags := normalizeBlockedTags(f.ExcludeTags); len(normExTags) > 0 {
-		ph := make([]string, len(normExTags))
-		for idx, t := range normExTags {
-			ph[idx] = "?"
-			args = append(args, t)
+		if etClause, etArgs := appendSafeStringSetSQL("lower(tx.name)", normExTags, false, false); etClause != "" {
+			where = append(where, fmt.Sprintf(`NOT EXISTS (
+				SELECT 1 FROM item_taxonomies it
+				JOIN taxonomies tx ON tx.id = it.taxonomy_id
+				WHERE it.item_id IN (i.id, COALESCE(i.series_id, ''))
+				  AND lower(tx.kind) = 'tag'
+				  AND %s
+			)`, etClause))
+			args = append(args, etArgs...)
 		}
-		where = append(where, fmt.Sprintf(`NOT EXISTS (
-			SELECT 1 FROM item_taxonomies it
-			JOIN taxonomies tx ON tx.id = it.taxonomy_id
-			WHERE it.item_id IN (i.id, COALESCE(i.series_id, ''))
-			  AND lower(tx.kind) = 'tag'
-			  AND lower(tx.name) IN (%s)
-		)`, strings.Join(ph, ",")))
 	}
-	if len(f.PersonIDs) > 0 {
-		ph := make([]string, len(f.PersonIDs))
-		for idx, p := range f.PersonIDs {
-			ph[idx] = "?"
-			args = append(args, guid.Normalize(p))
-		}
+	if pidClause, pidArgs := appendSafeIDSetSQL("ip.person_id", f.PersonIDs, false); pidClause != "" {
 		where = append(where, fmt.Sprintf(`EXISTS (
-			SELECT 1 FROM item_people ip WHERE ip.item_id = i.id AND ip.person_id IN (%s)
-		)`, strings.Join(ph, ",")))
+			SELECT 1 FROM item_people ip WHERE ip.item_id = i.id AND %s
+		)`, pidClause))
+		args = append(args, pidArgs...)
 	}
-	if len(f.Persons) > 0 {
-		ph := make([]string, len(f.Persons))
-		for idx, p := range f.Persons {
-			ph[idx] = "?"
-			args = append(args, p)
-		}
+	if pnClause, pnArgs := appendSafeStringSetSQL("p.name", f.Persons, false, false); pnClause != "" {
 		where = append(where, fmt.Sprintf(`EXISTS (
 			SELECT 1 FROM item_people ip
 			JOIN people p ON p.id = ip.person_id
-			WHERE ip.item_id = i.id AND p.name IN (%s)
-		)`, strings.Join(ph, ",")))
+			WHERE ip.item_id = i.id AND %s
+		)`, pnClause))
+		args = append(args, pnArgs...)
 	}
 
 	if userID != "" {
@@ -3704,12 +3741,19 @@ func (r *LibraryRepo) GetItemCountsFiltered(ctx context.Context, allowedLibraryI
 // allowedLibraryIDs and the full user parental policy (EnableLiveTvAccess, MaxParentalRating,
 // BlockUnratedItems, BlockedTags, AllowedTags, and BoxSet child visibility).
 func (r *LibraryRepo) GetItemCountsWithPolicy(ctx context.Context, allowedLibraryIDs []string, policy dto.UserPolicy) (*ItemCounts, error) {
+	return r.GetItemCountsForUser(ctx, "", true, allowedLibraryIDs, policy)
+}
+
+// GetItemCountsForUser counts items grouped by type and trailers while enforcing
+// playlist visibility for non-admin callers, allowedLibraryIDs, and the full user parental policy.
+func (r *LibraryRepo) GetItemCountsForUser(ctx context.Context, userID string, isAdmin bool, allowedLibraryIDs []string, policy dto.UserPolicy) (*ItemCounts, error) {
 	allowedLibraryIDs = r.excludeLiveTvFromAllowedLibraries(ctx, allowedLibraryIDs, policy)
 	if allowedLibraryIDs != nil && len(allowedLibraryIDs) == 0 {
 		return &ItemCounts{}, nil
 	}
 	pPolicy := policyFromUserPolicy(policy)
-	unfiltered := allowedLibraryIDs == nil && !pPolicy.hasRestriction()
+	plClause, plArgs := appendPlaylistVisibilitySQL("i", userID, isAdmin)
+	unfiltered := isAdmin && allowedLibraryIDs == nil && !pPolicy.hasRestriction() && plClause == ""
 	var epoch uint64
 	if unfiltered {
 		r.countMu.RLock()
@@ -3723,6 +3767,10 @@ func (r *LibraryRepo) GetItemCountsWithPolicy(ctx context.Context, allowedLibrar
 	}
 
 	filterClauses, filterArgs := buildLibraryAndPolicyWhere("i", allowedLibraryIDs, pPolicy)
+	if plClause != "" {
+		filterClauses = append(filterClauses, plClause)
+		filterArgs = append(filterArgs, plArgs...)
+	}
 	filterSuffix := ""
 	if len(filterClauses) > 0 {
 		filterSuffix = ` AND ` + strings.Join(filterClauses, " AND ")

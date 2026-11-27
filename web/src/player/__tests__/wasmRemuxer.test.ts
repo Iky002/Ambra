@@ -1,4 +1,25 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+const ffmpegMockHooks = vi.hoisted(() => ({
+  load: null as ((...args: unknown[]) => Promise<boolean>) | null,
+  terminate: vi.fn(),
+}))
+
+vi.mock('@ffmpeg/ffmpeg', () => ({
+  FFmpeg: class MockFFmpeg {
+    load = (...args: unknown[]) =>
+      ffmpegMockHooks.load ? ffmpegMockHooks.load(...args) : Promise.resolve(true)
+    terminate = () => {
+      ffmpegMockHooks.terminate()
+    }
+    on = vi.fn()
+    off = vi.fn()
+    writeFile = vi.fn()
+    exec = vi.fn()
+    readFile = vi.fn()
+    deleteFile = vi.fn()
+  },
+}))
 import {
   canUseWasmRemux,
   computeSha256Hex,
@@ -410,5 +431,75 @@ describe('wasmRemuxer - H-07 完整性校验、HTML/404 快速失败与 VFS 泄�
       (err: unknown) => err instanceof WasmRemuxFallbackError && err.reason === 'fetch_failed',
     )
     remuxer.dispose()
+  })
+
+  it('ensureLoaded 在 ffmpeg.load() 进行中调用 dispose() 时立即终止 Worker 并释放 Blob URLs', async () => {
+    const jsBytes = new TextEncoder().encode('export default function createFFmpegCore() {}')
+    const wasmBytes = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00])
+
+    let blobCounter = 0
+    const createdUrls: string[] = []
+    vi.spyOn(URL, 'createObjectURL').mockImplementation(() => {
+      const url = `blob:mid-load-${++blobCounter}`
+      createdUrls.push(url)
+      return url
+    })
+    const revokeSpy = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input)
+      if (url.endsWith('/ffmpeg-core.js')) {
+        return new Response(jsBytes, {
+          status: 200,
+          headers: { 'content-type': 'application/javascript' },
+        })
+      }
+      if (url.endsWith('/ffmpeg-core.wasm')) {
+        return new Response(wasmBytes, {
+          status: 200,
+          headers: { 'content-type': 'application/wasm' },
+        })
+      }
+      return new Response(new Uint8Array([0x1a, 0x45, 0xdf, 0xa3]), {
+        status: 200,
+        headers: { 'content-length': '4' },
+      })
+    })
+
+    ffmpegMockHooks.terminate.mockClear()
+    let resolveLoad!: (val: boolean) => void
+    const loadStarted = new Promise<void>((resolve) => {
+      ffmpegMockHooks.load = () => {
+        resolve()
+        return new Promise<boolean>((res) => {
+          resolveLoad = res
+        })
+      }
+    })
+
+    const remuxer = new WasmRemuxer()
+    const remuxPromise = remuxer.remuxToMP4('/emby/Videos/mid-dispose/stream', undefined, {
+      container: 'mkv',
+      coreBaseUrl: '/ffmpeg',
+    })
+
+    try {
+      // 等待进入 ffmpeg.load()，此时触发 dispose()，再让 load() 完成
+      await loadStarted
+      remuxer.dispose()
+      resolveLoad(true)
+
+      await expect(remuxPromise).rejects.toSatisfy(
+        (err: unknown) => err instanceof WasmRemuxFallbackError && err.reason === 'aborted',
+      )
+
+      expect(ffmpegMockHooks.terminate).toHaveBeenCalledTimes(1)
+      expect(createdUrls).toHaveLength(2)
+      for (const url of createdUrls) {
+        expect(revokeSpy).toHaveBeenCalledWith(url)
+      }
+    } finally {
+      ffmpegMockHooks.load = null
+    }
   })
 })

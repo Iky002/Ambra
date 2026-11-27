@@ -113,15 +113,15 @@ func StartLoopbackStreamProxy(opts LoopbackProxyOptions) (*LoopbackStreamProxy, 
 		return nil, errors.New("loopback proxy: target url host is empty")
 	}
 
+	sanitizedHeaders := sanitizeUpstreamHeaders(opts.Headers)
+
 	client := opts.Client
-	var crossOriginSubClient *http.Client
 	if client == nil {
 		var err error
-		client, err = newPinnedSafeStreamClient(targetHost, opts.AllowPrivateLAN, opts.DisallowLoopback)
+		client, err = newPinnedSafeStreamClient(targetHost, opts.AllowPrivateLAN, opts.DisallowLoopback, sanitizedHeaders)
 		if err != nil {
 			return nil, err
 		}
-		crossOriginSubClient = newSafeSubResourceClient(opts.AllowPrivateLAN)
 	}
 
 	var tokBytes [32]byte
@@ -144,7 +144,6 @@ func StartLoopbackStreamProxy(opts LoopbackProxyOptions) (*LoopbackStreamProxy, 
 	}
 	proxyOrigin := "http://" + ln.Addr().String()
 
-	sanitizedHeaders := sanitizeUpstreamHeaders(opts.Headers)
 	baseCtx, cancelCtx := context.WithCancel(context.Background())
 	var consumed atomic.Bool
 
@@ -210,24 +209,31 @@ func StartLoopbackStreamProxy(opts LoopbackProxyOptions) (*LoopbackStreamProxy, 
 		// Peek initial bytes on 2xx responses to detect HLS (#EXTM3U) manifests reliably
 		// without buffering non-manifest media files.
 		var peekBuf []byte
+		var peekErr error
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			tmp := make([]byte, manifestSniffBytes)
-			n, readErr := io.ReadAtLeast(resp.Body, tmp, 1)
-			if n > 0 {
-				peekBuf = tmp[:n]
-			}
-			if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) && n == 0 {
+			peekBuf, peekErr = sniffInitialBytes(resp.Body, manifestSniffBytes)
+			if peekErr != nil && !errors.Is(peekErr, io.EOF) && !errors.Is(peekErr, io.ErrUnexpectedEOF) && len(peekBuf) == 0 {
 				http.Error(w, "upstream stream read error", http.StatusBadGateway)
 				return
 			}
 		}
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 && isHLSManifestPayload(effectiveURL, upstreamCT, peekBuf) {
-			combined := io.MultiReader(bytes.NewReader(peekBuf), resp.Body)
-			rawManifest, readErr := io.ReadAll(io.LimitReader(combined, maxHLSManifestBytes+1))
-			if readErr != nil {
+			if peekErr != nil && !errors.Is(peekErr, io.EOF) && !errors.Is(peekErr, io.ErrUnexpectedEOF) {
 				http.Error(w, "failed to read upstream hls manifest", http.StatusBadGateway)
 				return
+			}
+			var rawManifest []byte
+			if errors.Is(peekErr, io.EOF) {
+				rawManifest = peekBuf
+			} else {
+				combined := io.MultiReader(bytes.NewReader(peekBuf), resp.Body)
+				var readErr error
+				rawManifest, readErr = io.ReadAll(io.LimitReader(combined, maxHLSManifestBytes+1))
+				if readErr != nil {
+					http.Error(w, "failed to read upstream hls manifest", http.StatusBadGateway)
+					return
+				}
 			}
 			if len(rawManifest) > maxHLSManifestBytes {
 				http.Error(w, "upstream hls manifest exceeds maximum size", http.StatusBadGateway)
@@ -268,6 +274,9 @@ func StartLoopbackStreamProxy(opts LoopbackProxyOptions) (*LoopbackStreamProxy, 
 			if canFlush {
 				flusher.Flush()
 			}
+		}
+		if peekErr != nil {
+			return
 		}
 		buf := make([]byte, 32*1024)
 		for {
@@ -348,14 +357,19 @@ func StartLoopbackStreamProxy(opts LoopbackProxyOptions) (*LoopbackStreamProxy, 
 			// Cross-origin sub-resources (e.g. #EXT-X-KEY pointing to 127.0.0.1:9999) must ALWAYS block loopback,
 			// even in unit tests where initial TargetURL is an httptest server on 127.0.0.1:<port>.
 			disallowSubLoopback := opts.DisallowLoopback || !sameHost
-			if _, pinErr := resolveAndPinHost(reqCtx, subHost, opts.AllowPrivateLAN, !disallowSubLoopback); pinErr != nil {
-				http.Error(w, "blocked upstream sub-resource", http.StatusForbidden)
-				return
-			}
 
 			subHTTPClient := client
-			if opts.Client == nil && !sameHost && crossOriginSubClient != nil {
-				subHTTPClient = crossOriginSubClient
+			if opts.Client == nil && !sameHost {
+				var subErr error
+				subHTTPClient, subErr = newSafeSubResourceClient(reqCtx, subHost, opts.AllowPrivateLAN, disallowSubLoopback, sanitizedHeaders)
+				if subErr != nil {
+					http.Error(w, "blocked upstream sub-resource", http.StatusForbidden)
+					return
+				}
+				defer subHTTPClient.CloseIdleConnections()
+			} else if _, pinErr := resolveAndPinHost(reqCtx, subHost, opts.AllowPrivateLAN, !disallowSubLoopback); pinErr != nil {
+				http.Error(w, "blocked upstream sub-resource", http.StatusForbidden)
+				return
 			}
 			serveUpstream(w, r, reqCtx, subRaw, subParsed, subHTTPClient, sameHost)
 			return
@@ -575,30 +589,53 @@ func isSameOriginHost(a, b *url.URL) bool {
 		effectiveURLPort(a) == effectiveURLPort(b)
 }
 
-func newSafeSubResourceClient(allowPrivateLAN bool) *http.Client {
-	c := netutil.NewSafeHTTPClientNoLoopback(0, allowPrivateLAN)
-	baseCheckRedirect := c.CheckRedirect
-	c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if baseCheckRedirect != nil {
-			if err := baseCheckRedirect(req, via); err != nil {
-				return err
-			}
-		}
-		if req.URL == nil {
-			return errors.New("redirect target url is nil")
-		}
-		if len(via) > 0 && via[len(via)-1].URL != nil {
-			prev := via[len(via)-1].URL
-			if !strings.EqualFold(prev.Host, req.URL.Host) {
-				req.Header.Del("Referer")
-				if err := netutil.ValidateRemoteURLNoLoopback(req.URL.String(), false); err != nil {
-					return fmt.Errorf("blocked redirect to non-public address: %w", err)
-				}
-			}
-		}
-		return nil
+func sniffInitialBytes(r io.Reader, maxBytes int) ([]byte, error) {
+	if maxBytes <= 0 {
+		return nil, nil
 	}
-	return c
+	targetMin := 64
+	if maxBytes < targetMin {
+		targetMin = maxBytes
+	}
+	buf := make([]byte, maxBytes)
+	total := 0
+	emptyReads := 0
+	for total < targetMin {
+		n, err := r.Read(buf[total:])
+		if n > 0 {
+			total += n
+			emptyReads = 0
+		}
+		if err != nil {
+			return buf[:total], err
+		}
+		if n == 0 {
+			emptyReads++
+			if emptyReads >= 10 {
+				return buf[:total], io.ErrNoProgress
+			}
+		}
+	}
+	return buf[:total], nil
+}
+
+func stripCrossHostRedirectHeaders(req *http.Request, sanitizedHeaders map[string]string) {
+	req.Header.Del("Referer")
+	req.Header.Del("Authorization")
+	req.Header.Del("Cookie")
+	for k := range sanitizedHeaders {
+		if strings.EqualFold(k, "User-Agent") {
+			continue
+		}
+		req.Header.Del(k)
+	}
+}
+
+func newSafeSubResourceClient(ctx context.Context, subHost string, allowPrivateLAN, disallowLoopback bool, sanitizedHeaders map[string]string) (*http.Client, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return newPinnedClientWithPublicFallback(ctx, subHost, allowPrivateLAN, disallowLoopback, sanitizedHeaders)
 }
 
 func resolveAndPinHost(ctx context.Context, host string, allowPrivateLAN, allowLoopback bool) ([]string, error) {
@@ -651,8 +688,12 @@ func resolveAndPinHost(ctx context.Context, host string, allowPrivateLAN, allowL
 	return pinned, nil
 }
 
-func newPinnedSafeStreamClient(initialHost string, allowPrivateLAN, disallowLoopback bool) (*http.Client, error) {
-	dnsCtx, cancel := context.WithTimeout(context.Background(), loopbackDNSLookupTimeout)
+func newPinnedSafeStreamClient(initialHost string, allowPrivateLAN, disallowLoopback bool, sanitizedHeaders map[string]string) (*http.Client, error) {
+	return newPinnedClientWithPublicFallback(context.Background(), initialHost, allowPrivateLAN, disallowLoopback, sanitizedHeaders)
+}
+
+func newPinnedClientWithPublicFallback(ctx context.Context, initialHost string, allowPrivateLAN, disallowLoopback bool, sanitizedHeaders map[string]string) (*http.Client, error) {
+	dnsCtx, cancel := context.WithTimeout(ctx, loopbackDNSLookupTimeout)
 	defer cancel()
 
 	pinnedIPs, err := resolveAndPinHost(dnsCtx, initialHost, allowPrivateLAN, !disallowLoopback)
@@ -665,6 +706,14 @@ func newPinnedSafeStreamClient(initialHost string, allowPrivateLAN, disallowLoop
 		baseClient = netutil.NewSafeHTTPClientNoLoopback(0, allowPrivateLAN)
 	} else {
 		baseClient = netutil.NewSafeHTTPClient(0, allowPrivateLAN)
+	}
+
+	// Cross-host redirects must ALWAYS use a strict public-only DialContext
+	// (disallowing both private LAN and loopback regardless of allowPrivateLAN).
+	publicOnlyClient := netutil.NewSafeHTTPClientNoLoopback(0, false)
+	var fallbackDial func(ctx context.Context, network, addr string) (net.Conn, error)
+	if pubTransport, ok := publicOnlyClient.Transport.(*http.Transport); ok && pubTransport != nil {
+		fallbackDial = pubTransport.DialContext
 	}
 
 	dialer := &net.Dialer{
@@ -683,7 +732,6 @@ func newPinnedSafeStreamClient(initialHost string, allowPrivateLAN, disallowLoop
 			ResponseHeaderTimeout: 30 * time.Second,
 		}
 	}
-	fallbackDial := transport.DialContext
 
 	normInitialHost := strings.ToLower(strings.TrimSuffix(initialHost, "."))
 	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -725,7 +773,7 @@ func newPinnedSafeStreamClient(initialHost string, allowPrivateLAN, disallowLoop
 		if len(via) > 0 && via[len(via)-1].URL != nil {
 			prev := via[len(via)-1].URL
 			if !strings.EqualFold(prev.Host, req.URL.Host) {
-				req.Header.Del("Referer")
+				stripCrossHostRedirectHeaders(req, sanitizedHeaders)
 				// Cross-host redirects must NEVER target private LAN, loopback, or cloud metadata.
 				if err := netutil.ValidateRemoteURLNoLoopback(req.URL.String(), false); err != nil {
 					return fmt.Errorf("blocked redirect to non-public address: %w", err)

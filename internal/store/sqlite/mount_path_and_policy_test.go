@@ -927,3 +927,151 @@ func TestCovV0112_PolicyPlaylistsCascadeUsersAndMigrations(t *testing.T) {
 		t.Fatalf("DeleteLibrary failed: %v", err)
 	}
 }
+
+func TestGroupItemsIntoCollectionsBoxSetParentalScopeIsolation(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	store, err := Open(filepath.Join(tmp, "boxset_scope_policy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	repo := NewLibraryRepo(store)
+	libADir := filepath.Join(tmp, "libA")
+	libBDir := filepath.Join(tmp, "libB")
+	_ = os.MkdirAll(libADir, 0o755)
+	_ = os.MkdirAll(libBDir, 0o755)
+
+	libA, err := repo.CreateLibrary(ctx, "Library A", "movies", []string{libADir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	libB, err := repo.CreateLibrary(ctx, "Library B", "movies", []string{libBDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	movieR := &ItemRecord{
+		ID:             guid.New(),
+		LibraryID:      libA.ID,
+		ParentID:       libA.ID,
+		Type:           "Movie",
+		Name:           "Adult Entry",
+		OfficialRating: "R",
+		Path:           filepath.Join(libADir, "adult.mkv"),
+	}
+	movieG := &ItemRecord{
+		ID:             guid.New(),
+		LibraryID:      libB.ID,
+		ParentID:       libB.ID,
+		Type:           "Movie",
+		Name:           "Family Entry",
+		OfficialRating: "G",
+		Path:           filepath.Join(libBDir, "family.mkv"),
+	}
+	for _, m := range []*ItemRecord{movieR, movieG} {
+		if err := repo.UpsertItem(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.ReplaceItemAncestors(ctx, m.ID, []AncestorLink{
+			{AncestorID: m.ID, Depth: 0},
+			{AncestorID: m.LibraryID, Depth: 1},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	box, err := repo.CreateCollection(ctx, "Cross-Library Saga", "", []string{movieR.ID, movieG.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	maxPG := 5
+	// Querying ParentID=libA (recursive & non-recursive) or LibraryID=libA must NOT leak the BoxSet,
+	// because its only child in libA is R-rated and blocked by the PG policy.
+	for _, tc := range []struct {
+		name   string
+		filter ItemFilter
+	}{
+		{
+			name: "ParentID=libA recursive",
+			filter: ItemFilter{
+				ServerID:                  "srv",
+				ParentID:                  libA.ID,
+				Recursive:                 true,
+				GroupItemsIntoCollections: true,
+				IncludeItemTypes:          []string{"Movie"},
+				MaxParentalRating:         &maxPG,
+			},
+		},
+		{
+			name: "ParentID=libA non-recursive",
+			filter: ItemFilter{
+				ServerID:                  "srv",
+				ParentID:                  libA.ID,
+				Recursive:                 false,
+				GroupItemsIntoCollections: true,
+				IncludeItemTypes:          []string{"Movie"},
+				MaxParentalRating:         &maxPG,
+			},
+		},
+		{
+			name: "LibraryID=libA",
+			filter: ItemFilter{
+				ServerID:                  "srv",
+				LibraryID:                 libA.ID,
+				Recursive:                 true,
+				GroupItemsIntoCollections: true,
+				IncludeItemTypes:          []string{"Movie"},
+				MaxParentalRating:         &maxPG,
+			},
+		},
+	} {
+		items, total, err := repo.QueryItems(ctx, tc.filter)
+		if err != nil {
+			t.Fatalf("%s: QueryItems failed: %v", tc.name, err)
+		}
+		if total != 0 || len(items) != 0 {
+			t.Fatalf("%s: expected 0 items (BoxSet must not leak into libA), got total=%d items=%+v", tc.name, total, items)
+		}
+	}
+
+	// Querying ParentID=libB and LibraryID=libB MUST still return the BoxSet because movieG is permitted.
+	for _, tc := range []struct {
+		name   string
+		filter ItemFilter
+	}{
+		{
+			name: "ParentID=libB recursive",
+			filter: ItemFilter{
+				ServerID:                  "srv",
+				ParentID:                  libB.ID,
+				Recursive:                 true,
+				GroupItemsIntoCollections: true,
+				IncludeItemTypes:          []string{"Movie"},
+				MaxParentalRating:         &maxPG,
+			},
+		},
+		{
+			name: "LibraryID=libB",
+			filter: ItemFilter{
+				ServerID:                  "srv",
+				LibraryID:                 libB.ID,
+				Recursive:                 true,
+				GroupItemsIntoCollections: true,
+				IncludeItemTypes:          []string{"Movie"},
+				MaxParentalRating:         &maxPG,
+			},
+		},
+	} {
+		items, total, err := repo.QueryItems(ctx, tc.filter)
+		if err != nil {
+			t.Fatalf("%s: QueryItems failed: %v", tc.name, err)
+		}
+		if total != 1 || len(items) != 1 || guid.Normalize(items[0].Id) != guid.Normalize(box.ID) {
+			t.Fatalf("%s: expected BoxSet %s in libB, got total=%d items=%+v", tc.name, box.ID, total, items)
+		}
+	}
+}
+

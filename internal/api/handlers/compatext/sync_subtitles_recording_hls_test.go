@@ -341,3 +341,82 @@ printf 'TS-SEGMENT-ZERO' > "$dir/seg_0.ts"
 		t.Fatalf("expected 200 HLS segment 0.ts via transcode.Manager, got %d %q", recSeg.Code, recSeg.Body.String())
 	}
 }
+
+func TestLiveRecordingHLSApiKeyPropagationAndDirectStreamLimit(t *testing.T) {
+	tmp := t.TempDir()
+	recDir := filepath.Join(tmp, "recordings")
+	_ = os.MkdirAll(recDir, 0o755)
+
+	store, err := sqlite.Open(filepath.Join(tmp, "ce_rec_limit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	cfg := config.Default(tmp)
+	cfg.SimultaneousStreamLimit = 1
+
+	tcMgr := transcode.NewManager(cfg)
+	defer tcMgr.Close()
+
+	userRepo := sqlite.NewUserRepo(store)
+	libRepo := sqlite.NewLibraryRepo(store)
+	authSvc := auth.NewService(userRepo, cfg)
+	_, _ = authSvc.CreateUser(ctx, "alice_rec", "pass1234", false)
+	aliceAuth, _ := authSvc.AuthenticateByName(ctx, "alice_rec", "pass1234", "", auth.ClientInfo{DeviceID: "d-rec"})
+
+	recFile := filepath.Join(recDir, "rec_tok.ts")
+	_ = os.WriteFile(recFile, []byte("RECORDING-STREAM-BYTES"), 0o644)
+
+	lt := livetv.New(store, cfg)
+	defer lt.Close()
+	addedRec := lt.AddRecording(ctx, livetv.RecordingInfo{
+		Id:   "rec-tok-1",
+		Name: "Recorded Show",
+		Path: recFile,
+	})
+
+	h := New(store, cfg)
+	h.SetLibraryRepo(libRepo)
+	h.SetUserRepo(userRepo)
+	h.SetLiveTV(lt)
+	h.SetTranscodeManager(tcMgr)
+
+	authMW := middleware.NewAuth(authSvc, nil)
+	router := h.BuildRouter(AuthFuncs{
+		RequireAuth:  authMW.RequireAuth,
+		RequireAdmin: authMW.RequireAdmin,
+	})
+	doReq := func(method, target string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, nil)
+		req.Header.Set("X-Emby-Token", aliceAuth.AccessToken)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. Request master.m3u8 with X-Emby-Token header only (no api_key query param):
+	//    returned playlist must propagate api_key=<token>.
+	wantQuery := "api_key=" + aliceAuth.AccessToken
+	masterRec := doReq(http.MethodGet, "/LiveTv/LiveRecordings/"+addedRec.Id+"/hls/master.m3u8")
+	if masterRec.Code != http.StatusOK || !strings.Contains(masterRec.Body.String(), wantQuery) {
+		t.Fatalf("expected 200 master.m3u8 containing %q, got %d:\n%s", wantQuery, masterRec.Code, masterRec.Body.String())
+	}
+
+	// 2. Request live.m3u8 with X-Emby-Token header only: segment URLs must also propagate api_key=<token>.
+	liveRec := doReq(http.MethodGet, "/LiveTv/LiveRecordings/"+addedRec.Id+"/hls/live.m3u8")
+	if liveRec.Code != http.StatusOK || !strings.Contains(liveRec.Body.String(), wantQuery) {
+		t.Fatalf("expected 200 live.m3u8 containing %q, got %d:\n%s", wantQuery, liveRec.Code, liveRec.Body.String())
+	}
+
+	// 3. Enforce SimultaneousStreamLimit == 1 on direct recording stream (/LiveTv/LiveRecordings/{Id}/stream):
+	//    the live.m3u8 call registered an active HLS session occupying the single slot, so GET stream returns 429,
+	//    while HEAD stream still returns 200.
+	if rec := doReq(http.MethodGet, "/LiveTv/LiveRecordings/"+addedRec.Id+"/stream"); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on GET /LiveTv/LiveRecordings/{Id}/stream when slot occupied, got %d", rec.Code)
+	}
+	if rec := doReq(http.MethodHead, "/LiveTv/LiveRecordings/"+addedRec.Id+"/stream"); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on HEAD /LiveTv/LiveRecordings/{Id}/stream when slot occupied, got %d", rec.Code)
+	}
+}

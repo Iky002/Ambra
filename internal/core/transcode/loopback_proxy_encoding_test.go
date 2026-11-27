@@ -102,7 +102,10 @@ func TestCovV0112_LoopbackProxyHelpersAndHTTPBranches(t *testing.T) {
 	}
 
 	// newSafeSubResourceClient CheckRedirect
-	subClient := newSafeSubResourceClient(true)
+	subClient, subErr := newSafeSubResourceClient(context.Background(), "192.168.1.10", true, true, nil)
+	if subErr != nil {
+		t.Fatalf("newSafeSubResourceClient: %v", subErr)
+	}
 	prevReq, _ := http.NewRequest(http.MethodGet, "http://192.168.1.10/a.ts", nil)
 	if err := subClient.CheckRedirect(&http.Request{URL: nil}, []*http.Request{prevReq}); err == nil {
 		t.Fatal("expected nil redirect URL rejected")

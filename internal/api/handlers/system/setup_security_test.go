@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -157,4 +159,73 @@ func TestH01M01M03_SetupOriginGuardLoopbackRateLimitFFmpegProtectionAndPendingRe
 		t.Fatal("expected loopback setup request exceeding setupAdminLoopbackRateLimit to be rate-limited")
 	}
 	_ = context.Background()
+}
+
+func TestSetupAdminRateLimitFastPathIPv6AndCap(t *testing.T) {
+	// 1. Post-setup fast-path: once IsStartupWizardCompleted=true, POST /api/setup/admin
+	// MUST return 403 Forbidden BEFORE touching h.setupRates (map must not grow).
+	cfgDone := config.Default(t.TempDir())
+	cfgDone.IsStartupWizardCompleted = true
+	hDone := NewHandler(cfgDone, nil, plugins.NewRegistry())
+
+	for i := 0; i < 10; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/setup/admin", bytes.NewBufferString(`{"username":"x","password":"y"}`))
+		req.RemoteAddr = fmt.Sprintf("203.0.113.%d:44444", i+1)
+		rec := httptest.NewRecorder()
+		hDone.SetupAdmin(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("post-setup request %d expected 403, got %d", i+1, rec.Code)
+		}
+	}
+	hDone.setupRateMu.Lock()
+	doneBuckets := len(hDone.setupRates)
+	hDone.setupRateMu.Unlock()
+	if doneBuckets != 0 {
+		t.Fatalf("expected setupRates to remain empty after wizard completion, got %d entries", doneBuckets)
+	}
+
+	// 2. IPv6 /64 normalization: distinct host addresses in the same /64 share one rate-limit bucket.
+	hIPv6 := NewHandler(config.Default(t.TempDir()), nil, plugins.NewRegistry())
+	for i := 0; i < setupAdminRateLimit; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/setup/admin", nil)
+		req.RemoteAddr = fmt.Sprintf("[2001:db8:abcd:1234::%x]:55555", i+1)
+		if !hIPv6.checkSetupRateLimit(req) {
+			t.Fatalf("expected IPv6 request %d/%d allowed", i+1, setupAdminRateLimit)
+		}
+	}
+	reqIPv6Over := httptest.NewRequest(http.MethodPost, "/api/setup/admin", nil)
+	reqIPv6Over.RemoteAddr = "[2001:db8:abcd:1234::ffff]:55555"
+	if hIPv6.checkSetupRateLimit(reqIPv6Over) {
+		t.Fatal("expected IPv6 address in same /64 to hit rate limit")
+	}
+	hIPv6.setupRateMu.Lock()
+	v6Buckets := len(hIPv6.setupRates)
+	hIPv6.setupRateMu.Unlock()
+	if v6Buckets != 1 {
+		t.Fatalf("expected all /64 IPv6 addresses collapsed into 1 bucket, got %d", v6Buckets)
+	}
+
+	// 3. Bucket cap fail-closed: once maxSetupRateBuckets active entries exist, new IPs fail closed (429).
+	hCap := NewHandler(config.Default(t.TempDir()), nil, plugins.NewRegistry())
+	now := time.Now().UTC()
+	hCap.setupRateMu.Lock()
+	hCap.setupRates = make(map[string][]time.Time, maxSetupRateBuckets)
+	for i := 0; i < maxSetupRateBuckets; i++ {
+		hCap.setupRates[fmt.Sprintf("198.51.%d.%d", i/256, i%256)] = []time.Time{now}
+	}
+	hCap.setupRateMu.Unlock()
+
+	reqNew := httptest.NewRequest(http.MethodPost, "/api/setup/admin", bytes.NewBufferString(`{"username":"a","password":"b"}`))
+	reqNew.RemoteAddr = "203.0.113.250:12345"
+	recNew := httptest.NewRecorder()
+	hCap.SetupAdmin(recNew, reqNew)
+	if recNew.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 fail-closed when setupRates is at cap, got %d", recNew.Code)
+	}
+	hCap.setupRateMu.Lock()
+	capLen := len(hCap.setupRates)
+	hCap.setupRateMu.Unlock()
+	if capLen != maxSetupRateBuckets {
+		t.Fatalf("expected setupRates to remain capped at %d, got %d", maxSetupRateBuckets, capLen)
+	}
 }

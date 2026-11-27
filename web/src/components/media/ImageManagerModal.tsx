@@ -89,7 +89,7 @@ export function ImageManagerModal({
       queryClient.invalidateQueries({ queryKey: ['item'] }),
       queryClient.invalidateQueries({ queryKey: ['item', itemId] }),
       queryClient.invalidateQueries({ queryKey: ['item-images', itemId] }),
-      queryClient.invalidateQueries({ queryKey: ['items'] }),
+      queryClient.invalidateQueries({ queryKey: ['libraryItems'] }),
       queryClient.invalidateQueries({ queryKey: ['latestItems'] }),
       queryClient.invalidateQueries({ queryKey: ['admin-metadata-items'] }),
     ])

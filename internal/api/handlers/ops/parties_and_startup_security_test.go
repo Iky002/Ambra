@@ -359,3 +359,113 @@ func TestOpsSecurityHardeningV0103(t *testing.T) {
 		t.Fatalf("expected 400 for symlink backup restore, got %d", r.Code)
 	}
 }
+
+func TestPartiesNonMemberMessagesRedacted(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default(dir)
+	st, err := sqlite.Open(cfg.DBPath())
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	h := New(st, cfg, sqlite.NewUserRepo(st), nil)
+	mux := http.NewServeMux()
+	authMW := middleware.NewAuth(nil, nil)
+	h.RegisterRoutes(mux, AuthFuncs{
+		RequireAuth:  authMW.RequireAuth,
+		RequireAdmin: authMW.RequireAdmin,
+	})
+
+	host := makeAuthCtx("host-msg-1", "host", false)
+	member := makeAuthCtx("member-msg-1", "member", false)
+	outsider := makeAuthCtx("outsider-msg-1", "outsider", false)
+	admin := makeAuthCtx("admin-msg-1", "admin", true)
+
+	// Host creates a public party and member joins it.
+	recCreate := doAuthReq(t, mux, host, http.MethodPost, "/Parties", map[string]any{
+		"Name":     "Movie Night",
+		"ItemId":   "item-1",
+		"IsPublic": true,
+	})
+	if recCreate.Code != http.StatusOK {
+		t.Fatalf("create party: %d %s", recCreate.Code, recCreate.Body.String())
+	}
+	var created Party
+	if err := json.Unmarshal(recCreate.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+
+	recJoin := doAuthReq(t, mux, member, http.MethodPost, "/Parties/"+created.Id+"/Join", map[string]any{})
+	if recJoin.Code != http.StatusOK {
+		t.Fatalf("member join: %d %s", recJoin.Code, recJoin.Body.String())
+	}
+
+	// Host sends a chat message in the party.
+	recMsg := doAuthReq(t, mux, host, http.MethodPost, "/Parties/Messages", map[string]any{
+		"PartyId": created.Id,
+		"Text":    "secret party chat",
+	})
+	if recMsg.Code != http.StatusNoContent {
+		t.Fatalf("send party message: %d %s", recMsg.Code, recMsg.Body.String())
+	}
+
+	// 1. Outsider MUST NOT see Messages on GET /Parties or GET /Parties/{Id}.
+	recOutList := doAuthReq(t, mux, outsider, http.MethodGet, "/Parties", nil)
+	if recOutList.Code != http.StatusOK {
+		t.Fatalf("outsider list parties: %d", recOutList.Code)
+	}
+	var outList []Party
+	if err := json.Unmarshal(recOutList.Body.Bytes(), &outList); err != nil {
+		t.Fatal(err)
+	}
+	if len(outList) != 1 || len(outList[0].Messages) != 0 {
+		t.Fatalf("expected outsider GET /Parties to redact Messages, got %+v", outList)
+	}
+
+	recOutGet := doAuthReq(t, mux, outsider, http.MethodGet, "/Parties/"+created.Id, nil)
+	if recOutGet.Code != http.StatusOK {
+		t.Fatalf("outsider get party: %d", recOutGet.Code)
+	}
+	var outParty Party
+	if err := json.Unmarshal(recOutGet.Body.Bytes(), &outParty); err != nil {
+		t.Fatal(err)
+	}
+	if len(outParty.Messages) != 0 {
+		t.Fatalf("expected outsider GET /Parties/{Id} to redact Messages, got %+v", outParty.Messages)
+	}
+
+	// 2. Host, member, and admin MUST still receive Messages on GET /Parties and GET /Parties/{Id}.
+	for _, tc := range []struct {
+		name string
+		ac   *middleware.AuthContext
+	}{
+		{name: "host", ac: host},
+		{name: "member", ac: member},
+		{name: "admin", ac: admin},
+	} {
+		recList := doAuthReq(t, mux, tc.ac, http.MethodGet, "/Parties", nil)
+		if recList.Code != http.StatusOK {
+			t.Fatalf("%s list parties: %d", tc.name, recList.Code)
+		}
+		var list []Party
+		if err := json.Unmarshal(recList.Body.Bytes(), &list); err != nil {
+			t.Fatal(err)
+		}
+		if len(list) != 1 || len(list[0].Messages) != 1 || list[0].Messages[0].Text != "secret party chat" {
+			t.Fatalf("expected %s GET /Parties to include Messages, got %+v", tc.name, list)
+		}
+
+		recGet := doAuthReq(t, mux, tc.ac, http.MethodGet, "/Parties/"+created.Id, nil)
+		if recGet.Code != http.StatusOK {
+			t.Fatalf("%s get party: %d", tc.name, recGet.Code)
+		}
+		var p Party
+		if err := json.Unmarshal(recGet.Body.Bytes(), &p); err != nil {
+			t.Fatal(err)
+		}
+		if len(p.Messages) != 1 || p.Messages[0].Text != "secret party chat" {
+			t.Fatalf("expected %s GET /Parties/{Id} to include Messages, got %+v", tc.name, p.Messages)
+		}
+	}
+}
