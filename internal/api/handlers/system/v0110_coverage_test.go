@@ -353,7 +353,7 @@ func TestConfigurationFieldsHostSanitizationAndHelpersV0110(t *testing.T) {
 	if _, hasKey := gotCfg["TMDBApiKey"]; hasKey {
 		t.Fatalf("expected empty TMDBApiKey to be omitted, got %v", gotCfg["TMDBApiKey"])
 	}
-	if gotCfg["DLNADefaultUserID"] != "u-dlna" || gotCfg["FFmpegPath"] != "/usr/local/bin/ffmpeg" || gotCfg["EnableRemoteAccess"] != false {
+	if gotCfg["DLNADefaultUserID"] != "u-dlna" || gotCfg["FFmpegPath"] != "ffmpeg" || gotCfg["FFprobePath"] != "ffprobe" || gotCfg["EnableRemoteAccess"] != false {
 		t.Fatalf("unexpected updated configuration: %#v", gotCfg)
 	}
 

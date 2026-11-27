@@ -672,13 +672,15 @@ export interface ItemMetadataUpdatePayload {
   Name?: string
   OriginalTitle?: string
   SortName?: string
-  ProductionYear?: number
-  CommunityRating?: number
-  OfficialRating?: string
+  ProductionYear?: number | null
+  CommunityRating?: number | null
+  OfficialRating?: string | null
   Overview?: string
   Genres?: string[]
   Tags?: string[]
   ProviderIds?: Record<string, string>
+  LockData?: boolean
+  LockedFields?: string[]
 }
 
 export interface ItemImageInfo {
@@ -820,6 +822,8 @@ export interface ThumbnailSetResponse {
 
 export interface SetupCompleteRequest {
   server_name?: string
+  language?: string
+  country?: string
   tmdb_api_key?: string
   tmdb_language?: string
   enable_strm_302?: boolean

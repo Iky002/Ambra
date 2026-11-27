@@ -31,7 +31,7 @@ func TestLibraryHandlerAllEndpointsExtra(t *testing.T) {
 	repo := sqlite.NewLibraryRepo(store)
 	reg := plugins.NewRegistry()
 	reg.Register(nfo.New())
-	cfg := config.Default(tmp)
+	cfg := config.Default(filepath.Join(tmp, "data"))
 	sc := scanner.New(repo, reg, nil, cfg)
 
 	// Nil cfg serverID check

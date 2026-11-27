@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -24,16 +25,19 @@ import (
 
 // Options configures the governance service dependencies.
 type Options struct {
-	Store      *sqlite.Store
-	Config     *config.Config
-	Scheduler  *scheduler.Manager
-	BudgetPool *budget.Pool
+	Store       *sqlite.Store
+	LibraryRepo *sqlite.LibraryRepo
+	Config      *config.Config
+	Scheduler   *scheduler.Manager
+	BudgetPool  *budget.Pool
 }
 
 // Service provides media governance, scrape audit queue, NFO atomic writeback,
 // library health auditing, and real-time system health diagnostics.
 type Service struct {
 	store      *sqlite.Store
+	mu         sync.RWMutex
+	libRepo    *sqlite.LibraryRepo
 	cfg        *config.Config
 	scheduler  *scheduler.Manager
 	budgetPool *budget.Pool
@@ -50,6 +54,7 @@ func NewService(opts Options) (*Service, error) {
 	}
 	s := &Service{
 		store:      opts.Store,
+		libRepo:    opts.LibraryRepo,
 		cfg:        opts.Config,
 		scheduler:  opts.Scheduler,
 		budgetPool: pool,
@@ -58,6 +63,19 @@ func NewService(opts Options) (*Service, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// SetLibraryRepo wires an optional LibraryRepo so CleanupOrphans invalidates cached item counts.
+func (s *Service) SetLibraryRepo(repo *sqlite.LibraryRepo) {
+	s.mu.Lock()
+	s.libRepo = repo
+	s.mu.Unlock()
+}
+
+func (s *Service) getLibraryRepo() *sqlite.LibraryRepo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.libRepo
 }
 
 func (s *Service) initSchema(ctx context.Context) error {
@@ -832,6 +850,43 @@ func (s *Service) CleanupOrphans(ctx context.Context, itemIDs []string) (*Orphan
 			continue
 		}
 
+		extraRows, exErr := tx.QueryContext(ctx, `SELECT id FROM items WHERE parent_id = ? AND extra_type != ''`, id)
+		if exErr != nil {
+			return nil, exErr
+		}
+		var childExtraIDs []string
+		for extraRows.Next() {
+			var eid string
+			if scanErr := extraRows.Scan(&eid); scanErr != nil {
+				_ = extraRows.Close()
+				return nil, scanErr
+			}
+			childExtraIDs = append(childExtraIDs, eid)
+		}
+		if err := extraRows.Err(); err != nil {
+			_ = extraRows.Close()
+			return nil, err
+		}
+		_ = extraRows.Close()
+
+		for _, eid := range childExtraIDs {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM item_images WHERE item_id = ?`, eid); err != nil {
+				return nil, err
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM item_search_fts WHERE item_id = ?`, eid); err != nil {
+				return nil, err
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM item_ancestors WHERE ancestor_id = ? OR descendant_id = ?`, eid, eid); err != nil {
+				return nil, err
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM scrape_audit_queue WHERE item_id = ?`, eid); err != nil {
+				return nil, err
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM items WHERE id = ?`, eid); err != nil {
+				return nil, err
+			}
+		}
+
 		if _, err := tx.ExecContext(ctx, `DELETE FROM item_images WHERE item_id = ?`, id); err != nil {
 			return nil, err
 		}
@@ -856,6 +911,11 @@ func (s *Service) CleanupOrphans(ctx context.Context, itemIDs []string) (*Orphan
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
+	}
+	if res.Deleted > 0 {
+		if lr := s.getLibraryRepo(); lr != nil {
+			lr.InvalidateCountCache()
+		}
 	}
 	return res, nil
 }

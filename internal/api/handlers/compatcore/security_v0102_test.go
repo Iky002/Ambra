@@ -2,7 +2,6 @@ package compatcore
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -100,14 +99,23 @@ func TestDeviceIDSpoofingAndPublicRateLimitBypassBlocked(t *testing.T) {
 		t.Fatalf("public IP spoofing X-Forwarded-For must be blocked with 403, got %d", recPubSpoof.Code)
 	}
 
-	// 2b. Untrusted LAN IP spoofing different X-Forwarded-For/X-Real-IP on every request MUST still hit 429
+	// 2b. Untrusted LAN IP sending X-Forwarded-For/X-Real-IP MUST be treated as non-LAN (403) per M-01,
+	// while direct LAN requests without forwarding headers MUST hit 429 after forgotPasswordRateLimit.
 	netutil.SetLocalNetworkSubnets([]string{"192.168.0.0/16"})
 	t.Cleanup(func() { netutil.SetLocalNetworkSubnets(nil) })
+
+	reqUntrustedProxy := httptest.NewRequest(http.MethodPost, "/Users/ForgotPassword", strings.NewReader(`{"EnteredUsername":"alice"}`))
+	reqUntrustedProxy.RemoteAddr = "192.168.1.88:50000"
+	reqUntrustedProxy.Header.Set("X-Forwarded-For", "203.0.113.99")
+	recUntrustedProxy := httptest.NewRecorder()
+	router.ServeHTTP(recUntrustedProxy, reqUntrustedProxy)
+	if recUntrustedProxy.Code != http.StatusForbidden {
+		t.Fatalf("untrusted LAN proxy carrying X-Forwarded-For must be rejected with 403, got %d", recUntrustedProxy.Code)
+	}
+
 	for i := 0; i < forgotPasswordRateLimit; i++ {
 		req := httptest.NewRequest(http.MethodPost, "/Users/ForgotPassword", strings.NewReader(`{"EnteredUsername":"alice"}`))
 		req.RemoteAddr = "192.168.1.88:50000"
-		req.Header.Set("X-Forwarded-For", fmt.Sprintf("192.168.1.%d", i+1))
-		req.Header.Set("X-Real-IP", fmt.Sprintf("192.168.1.%d", i+100))
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
@@ -116,10 +124,9 @@ func TestDeviceIDSpoofingAndPublicRateLimitBypassBlocked(t *testing.T) {
 	}
 	reqBlocked := httptest.NewRequest(http.MethodPost, "/Users/ForgotPassword", strings.NewReader(`{"EnteredUsername":"alice"}`))
 	reqBlocked.RemoteAddr = "192.168.1.88:50001"
-	reqBlocked.Header.Set("X-Forwarded-For", "192.168.1.250")
 	recBlocked := httptest.NewRecorder()
 	router.ServeHTTP(recBlocked, reqBlocked)
 	if recBlocked.Code != http.StatusTooManyRequests {
-		t.Fatalf("untrusted LAN IP spoofing X-Forwarded-For must still be rate-limited (429), got %d", recBlocked.Code)
+		t.Fatalf("direct LAN IP exceeding forgotPasswordRateLimit must be rate-limited (429), got %d", recBlocked.Code)
 	}
 }

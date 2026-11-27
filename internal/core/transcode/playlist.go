@@ -238,13 +238,6 @@ func BuildMediaPlaylist(p PlaylistParams) string {
 }
 
 func hlsCodecsAttr(videoCodec, audioCodec string) string {
-	v := "avc1.640028"
-	switch strings.ToLower(strings.TrimSpace(videoCodec)) {
-	case "hevc", "h265":
-		v = "hvc1.1.6.L120.90"
-	case "av1":
-		v = "av01.0.08M.08"
-	}
 	a := "mp4a.40.2"
 	switch strings.ToLower(strings.TrimSpace(audioCodec)) {
 	case "ac3":
@@ -255,6 +248,19 @@ func hlsCodecsAttr(videoCodec, audioCodec string) string {
 		a = "mp4a.40.34"
 	case "opus":
 		a = "opus"
+	case "flac":
+		a = "fLaC"
+	}
+	vc := strings.ToLower(strings.TrimSpace(videoCodec))
+	if vc == "none" {
+		return a
+	}
+	v := "avc1.640028"
+	switch vc {
+	case "hevc", "h265":
+		v = "hvc1.1.6.L120.90"
+	case "av1":
+		v = "av01.0.08M.08"
 	}
 	return v + "," + a
 }

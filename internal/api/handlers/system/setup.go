@@ -19,17 +19,31 @@ import (
 )
 
 const (
-	setupAdminRateLimit  = 30
-	setupAdminRateWindow = time.Minute
+	setupAdminRateLimit         = 30
+	setupAdminLoopbackRateLimit = 180
+	setupAdminRateWindow        = time.Minute
 )
+
+func (h *Handler) checkSetupOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	var allowed []string
+	if h.cfg != nil {
+		allowed = h.cfg.Snapshot().AllowedOrigins
+	}
+	return middleware.IsOriginAllowed(origin, r, allowed)
+}
 
 func (h *Handler) checkSetupRateLimit(r *http.Request) bool {
 	ip := strings.TrimSpace(netutil.ClientIP(r))
 	if ip == "" {
 		return true
 	}
+	limit := setupAdminRateLimit
 	if addr, err := netip.ParseAddr(ip); err == nil && addr.Unmap().IsLoopback() {
-		return true
+		limit = setupAdminLoopbackRateLimit
 	}
 	now := time.Now().UTC()
 	cutoff := now.Add(-setupAdminRateWindow)
@@ -52,7 +66,7 @@ func (h *Handler) checkSetupRateLimit(r *http.Request) bool {
 			h.setupRates[k] = kept
 		}
 	}
-	if len(h.setupRates[ip]) >= setupAdminRateLimit {
+	if len(h.setupRates[ip]) >= limit {
 		return false
 	}
 	h.setupRates[ip] = append(h.setupRates[ip], now)
@@ -160,6 +174,10 @@ func (h *Handler) GetSetupStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "private, no-store")
+	if !h.checkSetupOrigin(r) {
+		httpx.Error(w, http.StatusForbidden, "cross-origin setup request forbidden")
+		return
+	}
 	if !h.checkSetupRateLimit(r) {
 		httpx.Error(w, http.StatusTooManyRequests, "too many setup attempts")
 		return
@@ -286,6 +304,10 @@ func (h *Handler) SetupAdmin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) CompleteSetup(w http.ResponseWriter, r *http.Request) {
+	if !h.checkSetupOrigin(r) {
+		httpx.Error(w, http.StatusForbidden, "cross-origin setup request forbidden")
+		return
+	}
 	if h.userRepo != nil {
 		count, err := h.userRepo.CountUsers(r.Context())
 		if err == nil && count == 0 {

@@ -5,27 +5,38 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/middleware"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
-type extendedParentalPolicy struct {
-	maxRating         *int
-	blockedTags       []string
-	blockUnratedItems []string
-	allowedTags       []string
+const (
+	maxPlaylistsPerUser      = 500
+	maxCollectionsQueryLimit = 5000
+)
+
+func clampCollectionsLimit(requested, defaultVal, maxVal int) int {
+	if requested <= 0 {
+		if defaultVal > 0 {
+			return defaultVal
+		}
+		return maxVal
+	}
+	if maxVal > 0 && requested > maxVal {
+		return maxVal
+	}
+	return requested
 }
 
-func (p extendedParentalPolicy) hasExtraPolicy() bool {
-	return len(p.blockUnratedItems) > 0 || len(p.allowedTags) > 0
-}
-
-func (h *Handler) userExtendedPolicyForRequest(r *http.Request, fallbackUserID string) extendedParentalPolicy {
+// userPolicyForRequest resolves the full dto.UserPolicy for the request caller or target user.
+// Administrators, API keys, and unauthenticated unit-test requests return an unrestricted admin policy.
+// Missing/deleted users fail closed with MaxParentalRating = 0 and EnableLiveTvAccess = false.
+func (h *Handler) userPolicyForRequest(r *http.Request, fallbackUserID string) dto.UserPolicy {
 	ac, hasAC := middleware.AuthFromContext(r.Context())
 	if hasAC && ac != nil {
 		if ac.IsAPIKey || ac.IsAdmin() {
-			return extendedParentalPolicy{}
+			return sqlite.DefaultUserPolicy(true)
 		}
 	}
 	uid := ""
@@ -42,27 +53,82 @@ func (h *Handler) userExtendedPolicyForRequest(r *http.Request, fallbackUserID s
 		u, err := h.userRepo.GetUserByID(r.Context(), uid)
 		if err != nil || u == nil {
 			zero := 0
-			return extendedParentalPolicy{maxRating: &zero}
+			return dto.UserPolicy{
+				MaxParentalRating:  &zero,
+				EnableAllFolders:   false,
+				EnabledFolders:     []string{},
+				EnableLiveTvAccess: false,
+			}
 		}
 		if u.IsAdmin || u.Policy.IsAdministrator {
-			return extendedParentalPolicy{}
+			pol := u.Policy
+			pol.IsAdministrator = true
+			return pol
 		}
-		return extendedParentalPolicy{
-			maxRating:         u.Policy.MaxParentalRating,
-			blockedTags:       u.Policy.BlockedTags,
-			blockUnratedItems: u.Policy.BlockUnratedItems,
-			allowedTags:       u.Policy.AllowedTags,
-		}
+		return u.Policy
 	}
 	if hasAC && ac != nil && ac.User != nil {
-		return extendedParentalPolicy{
-			maxRating:         ac.User.Policy.MaxParentalRating,
-			blockedTags:       ac.User.Policy.BlockedTags,
-			blockUnratedItems: ac.User.Policy.BlockUnratedItems,
-			allowedTags:       ac.User.Policy.AllowedTags,
+		if ac.User.IsAdmin || ac.User.Policy.IsAdministrator {
+			pol := ac.User.Policy
+			pol.IsAdministrator = true
+			return pol
+		}
+		return ac.User.Policy
+	}
+	return sqlite.DefaultUserPolicy(true)
+}
+
+// playlistViewerForRequest resolves (viewerUserID, viewerIsAdmin) for SQL playlist visibility pushdown.
+func (h *Handler) playlistViewerForRequest(r *http.Request, fallbackUserID string) (string, bool) {
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.IsAdmin() {
+			return "", true
+		}
+		uid := guid.Normalize(ac.UserID())
+		if uid == "" {
+			uid = guid.Normalize(fallbackUserID)
+		}
+		if uid == "" {
+			uid = "__anonymous__"
+		}
+		return uid, false
+	}
+	if h.auth.UserIDFromCtx != nil {
+		callerID := guid.Normalize(h.auth.UserIDFromCtx(r.Context()))
+		if callerID != "" {
+			if h.userRepo != nil {
+				if u, err := h.userRepo.GetUserByID(r.Context(), callerID); err == nil && u != nil && (u.IsAdmin || u.Policy.IsAdministrator) {
+					return callerID, true
+				}
+			}
+			return callerID, false
 		}
 	}
-	return extendedParentalPolicy{}
+	return "", true
+}
+
+type extendedParentalPolicy struct {
+	maxRating         *int
+	blockedTags       []string
+	blockUnratedItems []string
+	allowedTags       []string
+}
+
+func (p extendedParentalPolicy) hasExtraPolicy() bool {
+	return len(p.blockUnratedItems) > 0 || len(p.allowedTags) > 0
+}
+
+func (h *Handler) userExtendedPolicyForRequest(r *http.Request, fallbackUserID string) extendedParentalPolicy {
+	pol := h.userPolicyForRequest(r, fallbackUserID)
+	if pol.IsAdministrator {
+		return extendedParentalPolicy{}
+	}
+	return extendedParentalPolicy{
+		maxRating:         pol.MaxParentalRating,
+		blockedTags:       pol.BlockedTags,
+		blockUnratedItems: pol.BlockUnratedItems,
+		allowedTags:       pol.AllowedTags,
+	}
 }
 
 func matchesBlockUnratedType(itemType, mediaType string, blockUnrated []string) bool {
@@ -178,37 +244,17 @@ func (h *Handler) isChildVisibleToUser(r *http.Request, itemRec *sqlite.ItemReco
 	} else if allowed != nil && itemRec.LibraryID != "" && !isLibraryAllowed(itemRec.LibraryID, allowed) {
 		return false
 	}
-	if pol.maxRating != nil || len(pol.blockedTags) > 0 {
-		if blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), itemRec, pol.maxRating, pol.blockedTags); bErr != nil || blocked {
-			return false
-		}
-		if itemRec.SeriesID != "" && itemRec.OfficialRating == "" && pol.maxRating != nil {
-			if seriesRec, sErr := h.repo.GetItemRecordByID(r.Context(), itemRec.SeriesID); sErr == nil && seriesRec != nil {
-				if blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(r.Context(), seriesRec, pol.maxRating, pol.blockedTags); bErr != nil || blocked {
-					return false
-				}
-			}
-		}
+	uPol := dto.UserPolicy{
+		EnableAllFolders:   allowed == nil,
+		EnabledFolders:     allowed,
+		EnableLiveTvAccess: true,
+		MaxParentalRating:  pol.maxRating,
+		BlockedTags:        pol.blockedTags,
+		BlockUnratedItems:  pol.blockUnratedItems,
+		AllowedTags:        pol.allowedTags,
 	}
-	if h.isRecordBlockedByExtraPolicy(r.Context(), itemRec, pol) {
+	if blocked, bErr := h.repo.IsItemBlockedByPolicy(r.Context(), itemRec, uPol); bErr != nil || blocked {
 		return false
 	}
 	return true
-}
-
-func (h *Handler) boxSetHasVisibleChild(r *http.Request, userID, boxSetID string, allowed []string, pol extendedParentalPolicy) bool {
-	children, _, err := h.repo.GetContainerItems(r.Context(), h.serverID(), userID, boxSetID, 0, 0, nil)
-	if err != nil || len(children) == 0 {
-		return false
-	}
-	for _, ch := range children {
-		rec, recErr := h.repo.GetItemRecordByID(r.Context(), ch.Id)
-		if recErr != nil || rec == nil {
-			continue
-		}
-		if h.isChildVisibleToUser(r, rec, allowed, pol) {
-			return true
-		}
-	}
-	return false
 }

@@ -5,6 +5,11 @@ export default defineConfig((env) =>
   mergeConfig(
     typeof viteConfig === 'function' ? viteConfig(env) : viteConfig,
     {
+      resolve: {
+        alias: {
+          'rvfc-polyfill': '/src/player/rvfcShim.ts',
+        },
+      },
       test: {
         environment: 'jsdom',
         setupFiles: ['./src/test/setup.ts'],

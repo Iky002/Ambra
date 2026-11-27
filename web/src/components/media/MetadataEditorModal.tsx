@@ -15,26 +15,27 @@ import {
 } from 'lucide-react'
 import { api } from '../../api/client'
 import type { BaseItemDto, ItemMetadataUpdatePayload } from '../../api/types'
+import { useI18n } from '../../i18n/I18nContext'
 import { AdminModal, FeedbackBanner } from '../../pages/admin/adminUtils'
 
 const LOCKABLE_FIELDS = [
-  { key: 'Name', label: '片名 (Name)' },
-  { key: 'Overview', label: '简介 (Overview)' },
-  { key: 'Genres', label: '流派 (Genres)' },
-  { key: 'Tags', label: '标签 (Tags)' },
-  { key: 'Cast', label: '演职员 (Cast)' },
+  { key: 'Name', labelKey: 'modal.metadata.lockFieldName' },
+  { key: 'Overview', labelKey: 'modal.metadata.lockFieldOverview' },
+  { key: 'Genres', labelKey: 'modal.metadata.lockFieldGenres' },
+  { key: 'Tags', labelKey: 'modal.metadata.lockFieldTags' },
+  { key: 'Cast', labelKey: 'modal.metadata.lockFieldCast' },
 ] as const
 
 const RANKING_QUICK_TAGS = [
   {
     value: '豆瓣Top250',
-    label: '豆瓣 Top250',
+    labelKey: 'modal.metadata.quickTagDouban',
     activeClass: 'border-emerald-400/60 bg-emerald-500/20 text-emerald-200',
     idleClass: 'border-white/10 bg-white/[0.03] text-zinc-400 hover:border-emerald-400/40 hover:text-emerald-200',
   },
   {
     value: 'IMDb Top250',
-    label: 'IMDb Top250',
+    labelKey: 'modal.metadata.quickTagImdb',
     activeClass: 'border-amber-400/60 bg-amber-500/20 text-amber-200',
     idleClass: 'border-white/10 bg-white/[0.03] text-zinc-400 hover:border-amber-400/40 hover:text-amber-200',
   },
@@ -53,6 +54,7 @@ export function MetadataEditorModal({
   onClose,
   onSaved,
 }: MetadataEditorModalProps) {
+  const { t } = useI18n()
   const queryClient = useQueryClient()
 
   const [name, setName] = useState('')
@@ -83,6 +85,11 @@ export function MetadataEditorModal({
   const prevOpenRef = useRef(false)
   const prevItemIdRef = useRef<string | null>(null)
 
+  const savedLockStateRef = useRef<{ lockData: boolean; lockedFieldsKey: string }>({
+    lockData: false,
+    lockedFieldsKey: '',
+  })
+
   useEffect(() => {
     if (!open || !item) {
       prevOpenRef.current = false
@@ -93,6 +100,8 @@ export function MetadataEditorModal({
     prevOpenRef.current = true
     prevItemIdRef.current = item.Id
     if (!shouldInitialize) return
+    const initLockedFields = [...(item.LockedFields || [])]
+    const initLockData = Boolean(item.LockData)
     setName(item.Name || '')
     setOriginalTitle(item.OriginalTitle || '')
     setSortName(item.SortName || '')
@@ -108,16 +117,50 @@ export function MetadataEditorModal({
     setTmdbId(item.ProviderIds?.Tmdb || '')
     setImdbId(item.ProviderIds?.Imdb || '')
     setDoubanId(item.ProviderIds?.Douban || '')
-    setLockedFields([...(item.LockedFields || [])])
-    setLockData(Boolean(item.LockData))
+    setLockedFields(initLockedFields)
+    setLockData(initLockData)
+    savedLockStateRef.current = {
+      lockData: initLockData,
+      lockedFieldsKey: [...initLockedFields].sort().join('|'),
+    }
     setError(null)
     setGovFeedback(null)
   }, [open, item])
 
+  const computeEffectiveLockedFields = () =>
+    lockData
+      ? Array.from(new Set([...lockedFields, ...LOCKABLE_FIELDS.map((f) => f.key)]))
+      : lockedFields
+
+  const isLockConfigDirty = () => {
+    const currentKey = [...lockedFields].sort().join('|')
+    return (
+      lockData !== savedLockStateRef.current.lockData ||
+      currentKey !== savedLockStateRef.current.lockedFieldsKey
+    )
+  }
+
   const saveMutation = useMutation({
-    mutationFn: async (payload: ItemMetadataUpdatePayload) => {
+    mutationFn: async ({
+      payload,
+      syncLocks,
+      fieldsToSave,
+      nextLockData,
+    }: {
+      payload: ItemMetadataUpdatePayload
+      syncLocks: boolean
+      fieldsToSave: string[]
+      nextLockData: boolean
+    }) => {
       if (!item) return
       await api.updateItemMetadata(item.Id, payload)
+      if (syncLocks) {
+        await api.lockItemFields(item.Id, fieldsToSave, nextLockData)
+        savedLockStateRef.current = {
+          lockData: nextLockData,
+          lockedFieldsKey: [...lockedFields].sort().join('|'),
+        }
+      }
     },
     onSuccess: async () => {
       if (!item) return
@@ -129,11 +172,11 @@ export function MetadataEditorModal({
         queryClient.invalidateQueries({ queryKey: ['latestItems'] }),
         queryClient.invalidateQueries({ queryKey: ['admin-metadata-items'] }),
       ])
-      onSaved?.(`已保存「${name.trim() || item.Name}」的元数据`)
+      onSaved?.(t('modal.metadata.savedSuccess', { name: name.trim() || item.Name }))
       onClose()
     },
     onError: (err) => {
-      setError(err instanceof Error ? err.message : '保存元数据失败')
+      setError(err instanceof Error ? err.message : t('modal.metadata.saveError'))
     },
   })
 
@@ -162,12 +205,12 @@ export function MetadataEditorModal({
   }
 
   const removeTag = (target: string) => {
-    setTags((prev) => prev.filter((t) => t !== target))
+    setTags((prev) => prev.filter((tagItem) => tagItem !== target))
   }
 
   const toggleQuickTag = (tagVal: string) => {
     setTags((prev) =>
-      prev.includes(tagVal) ? prev.filter((t) => t !== tagVal) : [...prev, tagVal],
+      prev.includes(tagVal) ? prev.filter((tagItem) => tagItem !== tagVal) : [...prev, tagVal],
     )
   }
 
@@ -182,10 +225,12 @@ export function MetadataEditorModal({
     setLocking(true)
     setGovFeedback(null)
     try {
-      const fieldsToSave = lockData
-        ? Array.from(new Set([...lockedFields, ...LOCKABLE_FIELDS.map((f) => f.key)]))
-        : lockedFields
+      const fieldsToSave = computeEffectiveLockedFields()
       await api.lockItemFields(item.Id, fieldsToSave, lockData)
+      savedLockStateRef.current = {
+        lockData,
+        lockedFieldsKey: [...lockedFields].sort().join('|'),
+      }
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['item'] }),
         queryClient.invalidateQueries({ queryKey: ['item', item.Id] }),
@@ -194,13 +239,13 @@ export function MetadataEditorModal({
       setGovFeedback({
         type: 'success',
         message: lockData
-          ? '已开启全局元数据锁定（刮削将跳过所有字段）'
-          : `已保存字段锁定（${fieldsToSave.length} 项）`,
+          ? t('modal.metadata.lockAllSaved')
+          : t('modal.metadata.lockFieldsSaved', { count: fieldsToSave.length }),
       })
     } catch (err) {
       setGovFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '保存字段锁定失败',
+        message: err instanceof Error ? err.message : t('modal.metadata.lockSaveError'),
       })
     } finally {
       setLocking(false)
@@ -216,12 +261,14 @@ export function MetadataEditorModal({
       const nfoPath = res?.NfoPath || res?.path
       setGovFeedback({
         type: 'success',
-        message: nfoPath ? `已原子回写 NFO：${nfoPath}` : `已成功回写「${item.Name}」的 .nfo 文件`,
+        message: nfoPath
+          ? t('modal.metadata.writeNfoSuccessPath', { path: nfoPath })
+          : t('modal.metadata.writeNfoSuccessItem', { name: item.Name }),
       })
     } catch (err) {
       setGovFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '回写 .nfo 失败',
+        message: err instanceof Error ? err.message : t('modal.metadata.writeNfoError'),
       })
     } finally {
       setWritingNfo(false)
@@ -233,13 +280,32 @@ export function MetadataEditorModal({
     if (!item) return
     const trimmedName = name.trim()
     if (!trimmedName) {
-      setError('中文片名不能为空')
+      setError(t('modal.metadata.nameRequired'))
       return
     }
     setError(null)
 
-    const parsedYear = productionYear.trim() ? Number(productionYear.trim()) : undefined
-    const parsedRating = communityRating.trim() ? Number(communityRating.trim()) : undefined
+    const trimmedYear = productionYear.trim()
+    const parsedYear = trimmedYear ? Number(trimmedYear) : undefined
+    const resolvedYear =
+      trimmedYear === ''
+        ? item.ProductionYear != null
+          ? null
+          : undefined
+        : Number.isFinite(parsedYear)
+          ? parsedYear
+          : undefined
+
+    const trimmedRating = communityRating.trim()
+    const parsedRating = trimmedRating ? Number(trimmedRating) : undefined
+    const resolvedRating =
+      trimmedRating === ''
+        ? item.CommunityRating != null
+          ? null
+          : undefined
+        : Number.isFinite(parsedRating)
+          ? parsedRating
+          : undefined
 
     const providerIds: Record<string, string> = { ...(item.ProviderIds || {}) }
     if (tmdbId.trim()) providerIds.Tmdb = tmdbId.trim()
@@ -260,26 +326,40 @@ export function MetadataEditorModal({
         ? trimmedName.toLowerCase()
         : trimmedSortName || trimmedName.toLowerCase()
 
+    const syncLocks = isLockConfigDirty()
+    const fieldsToSave = computeEffectiveLockedFields()
+
     const payload: ItemMetadataUpdatePayload = {
       Name: trimmedName,
       OriginalTitle: originalTitle.trim(),
       SortName: effectiveSortName,
-      ProductionYear: Number.isFinite(parsedYear) ? parsedYear : undefined,
-      CommunityRating: Number.isFinite(parsedRating) ? parsedRating : undefined,
+      ProductionYear: resolvedYear,
+      CommunityRating: resolvedRating,
       OfficialRating: officialRating.trim(),
       Overview: overview.trim(),
       Genres: genres,
       Tags: tags,
       ProviderIds: providerIds,
+      ...(syncLocks
+        ? {
+            LockData: lockData,
+            LockedFields: fieldsToSave,
+          }
+        : {}),
     }
 
-    saveMutation.mutate(payload)
+    saveMutation.mutate({
+      payload,
+      syncLocks,
+      fieldsToSave,
+      nextLockData: lockData,
+    })
   }
 
   return (
     <AdminModal
       open={open}
-      title="编辑元数据"
+      title={t('modal.metadata.title')}
       subtitle={item ? `${item.Name} · ${item.Type}` : undefined}
       maxWidthClass="max-w-2xl"
       onClose={onClose}
@@ -290,22 +370,26 @@ export function MetadataEditorModal({
         {/* 基础标题 */}
         <div className="grid gap-4 sm:grid-cols-2">
           <label className="block space-y-1.5">
-            <span className="text-xs font-medium text-zinc-300">中文片名 *</span>
+            <span className="text-xs font-medium text-zinc-300">
+              {t('modal.metadata.fieldName')}
+            </span>
             <input
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="例如：肖申克的救赎"
+              placeholder={t('modal.metadata.fieldNamePlaceholder')}
               className="w-full rounded-xl border border-white/10 bg-zinc-900/90 px-3.5 py-2 text-sm text-zinc-100 outline-none transition-colors focus:border-amber-400/60"
             />
           </label>
           <label className="block space-y-1.5">
-            <span className="text-xs font-medium text-zinc-300">原名（OriginalTitle）</span>
+            <span className="text-xs font-medium text-zinc-300">
+              {t('modal.metadata.fieldOriginalTitle')}
+            </span>
             <input
               type="text"
               value={originalTitle}
               onChange={(e) => setOriginalTitle(e.target.value)}
-              placeholder="例如：The Shawshank Redemption"
+              placeholder={t('modal.metadata.fieldOriginalTitlePlaceholder')}
               className="w-full rounded-xl border border-white/10 bg-zinc-900/90 px-3.5 py-2 text-sm text-zinc-100 outline-none transition-colors focus:border-amber-400/60"
             />
           </label>
@@ -313,7 +397,9 @@ export function MetadataEditorModal({
 
         <div className="grid gap-4 sm:grid-cols-4">
           <label className="block space-y-1.5 sm:col-span-2">
-            <span className="text-xs font-medium text-zinc-300">排序名（SortName）</span>
+            <span className="text-xs font-medium text-zinc-300">
+              {t('modal.metadata.fieldSortName')}
+            </span>
             <input
               type="text"
               value={sortName}
@@ -321,12 +407,14 @@ export function MetadataEditorModal({
                 setSortName(e.target.value)
                 setSortNameTouched(true)
               }}
-              placeholder="用于拼音/字母排序"
+              placeholder={t('modal.metadata.fieldSortNamePlaceholder')}
               className="w-full rounded-xl border border-white/10 bg-zinc-900/90 px-3.5 py-2 text-sm text-zinc-100 outline-none transition-colors focus:border-amber-400/60"
             />
           </label>
           <label className="block space-y-1.5">
-            <span className="text-xs font-medium text-zinc-300">上映年份</span>
+            <span className="text-xs font-medium text-zinc-300">
+              {t('modal.metadata.fieldYear')}
+            </span>
             <input
               type="number"
               min={1880}
@@ -338,7 +426,9 @@ export function MetadataEditorModal({
             />
           </label>
           <label className="block space-y-1.5">
-            <span className="text-xs font-medium text-zinc-300">社区评分</span>
+            <span className="text-xs font-medium text-zinc-300">
+              {t('modal.metadata.fieldRating')}
+            </span>
             <input
               type="number"
               step="0.1"
@@ -354,7 +444,9 @@ export function MetadataEditorModal({
 
         <div className="grid gap-4 sm:grid-cols-4">
           <label className="block space-y-1.5">
-            <span className="text-xs font-medium text-zinc-300">内容分级</span>
+            <span className="text-xs font-medium text-zinc-300">
+              {t('modal.metadata.fieldOfficialRating')}
+            </span>
             <input
               type="text"
               value={officialRating}
@@ -364,7 +456,9 @@ export function MetadataEditorModal({
             />
           </label>
           <label className="block space-y-1.5">
-            <span className="text-xs font-medium text-zinc-300">TMDB ID</span>
+            <span className="text-xs font-medium text-zinc-300">
+              {t('modal.metadata.fieldTmdbId')}
+            </span>
             <input
               type="text"
               value={tmdbId}
@@ -374,7 +468,9 @@ export function MetadataEditorModal({
             />
           </label>
           <label className="block space-y-1.5">
-            <span className="text-xs font-medium text-zinc-300">IMDb ID</span>
+            <span className="text-xs font-medium text-zinc-300">
+              {t('modal.metadata.fieldImdbId')}
+            </span>
             <input
               type="text"
               value={imdbId}
@@ -384,7 +480,9 @@ export function MetadataEditorModal({
             />
           </label>
           <label className="block space-y-1.5">
-            <span className="text-xs font-medium text-zinc-300">豆瓣 ID</span>
+            <span className="text-xs font-medium text-zinc-300">
+              {t('modal.metadata.fieldDoubanId')}
+            </span>
             <input
               type="text"
               value={doubanId}
@@ -397,19 +495,23 @@ export function MetadataEditorModal({
 
         {/* 剧情简介 */}
         <label className="block space-y-1.5">
-          <span className="text-xs font-medium text-zinc-300">剧情简介</span>
+          <span className="text-xs font-medium text-zinc-300">
+            {t('modal.metadata.fieldOverview')}
+          </span>
           <textarea
             rows={4}
             value={overview}
             onChange={(e) => setOverview(e.target.value)}
-            placeholder="输入影片或剧集简介..."
+            placeholder={t('modal.metadata.fieldOverviewPlaceholder')}
             className="w-full rounded-xl border border-white/10 bg-zinc-900/90 px-3.5 py-2.5 text-sm leading-relaxed text-zinc-100 outline-none transition-colors focus:border-amber-400/60"
           />
         </label>
 
         {/* 流派编辑 */}
         <div className="space-y-2 rounded-xl border border-white/8 bg-white/[0.02] p-3.5">
-          <span className="text-xs font-medium text-zinc-300">流派（Genres）</span>
+          <span className="text-xs font-medium text-zinc-300">
+            {t('modal.metadata.fieldGenres')}
+          </span>
           <div className="flex flex-wrap gap-1.5">
             {genres.map((g) => (
               <span
@@ -420,7 +522,7 @@ export function MetadataEditorModal({
                 <button
                   type="button"
                   onClick={() => removeGenre(g)}
-                  aria-label={`移除流派 ${g}`}
+                  aria-label={t('modal.metadata.removeGenreAria', { genre: g })}
                   className="rounded-full p-0.5 text-zinc-400 hover:bg-white/10 hover:text-white"
                 >
                   <X className="h-3 w-3" />
@@ -439,7 +541,7 @@ export function MetadataEditorModal({
                   addGenre()
                 }
               }}
-              placeholder="输入流派（逗号分隔可批量添加），如：科幻, 悬疑"
+              placeholder={t('modal.metadata.genreInputPlaceholder')}
               className="flex-1 rounded-lg border border-white/10 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-100 outline-none focus:border-amber-400/60"
             />
             <button
@@ -448,7 +550,7 @@ export function MetadataEditorModal({
               className="inline-flex items-center gap-1 rounded-lg border border-white/12 bg-white/6 px-3 py-1.5 text-xs font-medium text-zinc-200 hover:bg-white/12"
             >
               <Plus className="h-3.5 w-3.5" />
-              添加
+              {t('modal.metadata.addBtn')}
             </button>
           </div>
         </div>
@@ -458,11 +560,12 @@ export function MetadataEditorModal({
           <div className="flex flex-wrap items-center justify-between gap-2">
             <span className="flex items-center gap-1.5 text-xs font-medium text-zinc-300">
               <Tag className="h-3.5 w-3.5 text-amber-400" />
-              标签（Tags）
+              {t('modal.metadata.fieldTags')}
             </span>
             <div className="flex flex-wrap items-center gap-1.5">
               {RANKING_QUICK_TAGS.map((qt) => {
                 const active = tags.includes(qt.value)
+                const qtLabel = t(qt.labelKey)
                 return (
                   <button
                     key={qt.value}
@@ -473,7 +576,11 @@ export function MetadataEditorModal({
                     }`}
                   >
                     <Award className="h-3 w-3" />
-                    <span>{active ? `已标记 ${qt.label}` : `+ ${qt.label}`}</span>
+                    <span>
+                      {active
+                        ? t('modal.metadata.quickTagMarked', { label: qtLabel })
+                        : `+ ${qtLabel}`}
+                    </span>
                   </button>
                 )
               })}
@@ -481,17 +588,19 @@ export function MetadataEditorModal({
           </div>
 
           <div className="flex flex-wrap gap-1.5">
-            {tags.length === 0 && <span className="text-xs text-zinc-500">暂无标签</span>}
-            {tags.map((t) => (
+            {tags.length === 0 && (
+              <span className="text-xs text-zinc-500">{t('modal.metadata.noTags')}</span>
+            )}
+            {tags.map((tagItem) => (
               <span
-                key={t}
+                key={tagItem}
                 className="inline-flex items-center gap-1 rounded-full border border-amber-500/25 bg-amber-500/10 px-2.5 py-1 text-xs text-amber-200"
               >
-                {t}
+                {tagItem}
                 <button
                   type="button"
-                  onClick={() => removeTag(t)}
-                  aria-label={`移除标签 ${t}`}
+                  onClick={() => removeTag(tagItem)}
+                  aria-label={t('modal.metadata.removeTagAria', { tag: tagItem })}
                   className="rounded-full p-0.5 text-amber-300/70 hover:bg-amber-500/20 hover:text-amber-100"
                 >
                   <X className="h-3 w-3" />
@@ -511,7 +620,7 @@ export function MetadataEditorModal({
                   addTag()
                 }
               }}
-              placeholder="输入自定义标签后回车添加"
+              placeholder={t('modal.metadata.tagInputPlaceholder')}
               className="flex-1 rounded-lg border border-white/10 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-100 outline-none focus:border-amber-400/60"
             />
             <button
@@ -520,7 +629,7 @@ export function MetadataEditorModal({
               className="inline-flex items-center gap-1 rounded-lg border border-white/12 bg-white/6 px-3 py-1.5 text-xs font-medium text-zinc-200 hover:bg-white/12"
             >
               <Plus className="h-3.5 w-3.5" />
-              添加
+              {t('modal.metadata.addBtn')}
             </button>
           </div>
         </div>
@@ -534,7 +643,7 @@ export function MetadataEditorModal({
           >
             <span className="flex items-center gap-1.5 text-xs font-semibold text-amber-200">
               <Lock className="h-3.5 w-3.5 text-amber-400" />
-              <span>元数据锁定与 NFO 回写</span>
+              <span>{t('modal.metadata.governanceTitle')}</span>
             </span>
             {govExpanded ? (
               <ChevronUp className="h-4 w-4 text-zinc-400" />
@@ -567,7 +676,7 @@ export function MetadataEditorModal({
                       }`}
                     >
                       {isLocked ? <Lock className="h-3 w-3" /> : <Unlock className="h-3 w-3" />}
-                      <span>{field.label}</span>
+                      <span>{t(field.labelKey)}</span>
                     </button>
                   )
                 })}
@@ -582,7 +691,9 @@ export function MetadataEditorModal({
                   }`}
                 >
                   <Lock className="h-3 w-3" />
-                  <span>{lockData ? '已锁定全部 (LockData)' : '锁定全部字段'}</span>
+                  <span>
+                    {lockData ? t('modal.metadata.lockedAllBtn') : t('modal.metadata.lockAllBtn')}
+                  </span>
                 </button>
               </div>
 
@@ -598,7 +709,7 @@ export function MetadataEditorModal({
                   ) : (
                     <Lock className="h-3.5 w-3.5" />
                   )}
-                  <span>保存锁定配置</span>
+                  <span>{t('modal.metadata.saveLocksBtn')}</span>
                 </button>
 
                 <button
@@ -612,7 +723,7 @@ export function MetadataEditorModal({
                   ) : (
                     <FileCode2 className="h-3.5 w-3.5" />
                   )}
-                  <span>原子回写 .nfo</span>
+                  <span>{t('modal.metadata.writeNfoBtn')}</span>
                 </button>
               </div>
             </div>
@@ -626,7 +737,7 @@ export function MetadataEditorModal({
             onClick={onClose}
             className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-sm font-medium text-zinc-300 transition-colors hover:bg-white/10"
           >
-            取消
+            {t('modal.metadata.cancel')}
           </button>
           <button
             type="submit"
@@ -638,7 +749,9 @@ export function MetadataEditorModal({
             ) : (
               <Save className="h-4 w-4" />
             )}
-            <span>{saveMutation.isPending ? '保存中...' : '保存元数据'}</span>
+            <span>
+              {saveMutation.isPending ? t('modal.metadata.saving') : t('modal.metadata.saveBtn')}
+            </span>
           </button>
         </div>
       </form>

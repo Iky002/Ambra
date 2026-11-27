@@ -134,8 +134,8 @@ func TestCollectionsV0101SecurityAndBodyDelete(t *testing.T) {
 	}
 
 	if rec := doReq(aliceAuth.AccessToken, http.MethodPost, "/Playlists/"+created.Id+"/Items",
-		`{"Ids":["`+mSafe2.ID+`","`+mR.ID+`","`+mSecret.ID+`"]}`); rec.Code != http.StatusNoContent {
-		t.Fatalf("expected 204 adding items, got %d", rec.Code)
+		`{"Ids":["`+mSafe2.ID+`","`+mR.ID+`","`+mSecret.ID+`"]}`); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 adding items, got %d", rec.Code)
 	}
 	items, _, _ = repo.GetContainerItems(ctx, cfg.ServerID, alice.ID, created.Id, 0, 0, nil)
 	if len(items) != 2 {

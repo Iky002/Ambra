@@ -472,13 +472,13 @@ func TestMigratorFullMigrationDryRunAndIdempotency(t *testing.T) {
 			liveReport.PlayedMigrated, liveReport.FavoritesMigrated, liveReport.ResumeMigrated)
 	}
 
-	// Verify Alice policy updated & user_item_data rows
+	// Verify local admin Alice policy preserved (L-10) & user_item_data rows migrated
 	aliceRec, err := userRepo.GetUserByName(ctx, "Alice")
 	if err != nil {
 		t.Fatalf("get Alice: %v", err)
 	}
-	if aliceRec.Policy.EnableContentDownloading != false {
-		t.Fatalf("expected Alice policy updated")
+	if !aliceRec.Policy.EnableContentDownloading {
+		t.Fatalf("expected local admin Alice policy preserved (EnableContentDownloading=true)")
 	}
 	ud1, err := userRepo.GetUserItemData(ctx, aliceRec.ID, localIDs["inception"])
 	if err != nil || !ud1.Played || ud1.PlayCount != 2 || !ud1.IsFavorite || ud1.LastPlayedDate == nil {

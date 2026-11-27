@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -18,7 +20,9 @@ import (
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
+	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/transcode"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
@@ -167,7 +171,14 @@ func (h *Handler) registerLiveTVRoutes(r chi.Router, wrapAuth, wrapAdmin func(ht
 		r.Get("/LiveTv/ListingProviders/Default", h.handleListingProviderDefault)
 	})
 
-	// Admin LiveTv routes (16 routes)
+	// LiveTv management endpoints accessible to admins and users with EnableLiveTvManagement
+	r.Group(func(r chi.Router) {
+		r.Use(wrapAuth)
+		r.Get("/LiveTv/ChannelMappingOptions", h.handleChannelMappingOptions)
+		r.Post("/LiveTv/ChannelMappings", h.handleSetChannelMapping)
+	})
+
+	// Admin LiveTv routes (14 routes)
 	r.Group(func(r chi.Router) {
 		r.Use(wrapAdmin)
 
@@ -183,8 +194,6 @@ func (h *Handler) registerLiveTVRoutes(r chi.Router, wrapAuth, wrapAdmin func(ht
 		r.Get("/LiveTv/ListingProviders", h.handleGetListingProviders)
 		r.Post("/LiveTv/ListingProviders/Delete", h.handleDeleteListingProviderPost)
 		r.Get("/LiveTv/ListingProviders/Lineups", h.handleListingProviderLineups)
-		r.Get("/LiveTv/ChannelMappingOptions", h.handleChannelMappingOptions)
-		r.Post("/LiveTv/ChannelMappings", h.handleSetChannelMapping)
 		r.Get("/LiveTv/Tuners/Discover", h.handleDiscoverTuners)
 		r.Get("/LiveTv/Tuners/Discvover", h.handleDiscoverTuners) // Emby legacy typo alias
 	})
@@ -416,7 +425,71 @@ func appendRawQuery(targetPath, rawQuery string) string {
 	return targetPath + "?" + rawQuery
 }
 
+func sanitizeLiveRecVideoCodec(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "h264", "avc":
+		return "h264"
+	case "hevc", "h265":
+		return "hevc"
+	case "av1":
+		return "av1"
+	case "vp9":
+		return "vp9"
+	case "copy":
+		return "copy"
+	default:
+		return "h264"
+	}
+}
+
+func sanitizeLiveRecAudioCodec(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "aac":
+		return "aac"
+	case "mp3", "opus", "flac", "ac3", "eac3", "vorbis", "copy":
+		return strings.ToLower(strings.TrimSpace(raw))
+	default:
+		return "aac"
+	}
+}
+
+func isRemoteLiveTVClientRequest(r *http.Request, cfg *config.Config) bool {
+	if netutil.IsLocalOrLANRequest(r) {
+		return false
+	}
+	if cfg != nil {
+		subnets := cfg.Snapshot().LocalNetworkSubnets
+		if len(subnets) > 0 {
+			if ip, err := netip.ParseAddr(netutil.ClientIP(r)); err == nil {
+				ip = ip.Unmap()
+				for _, raw := range subnets {
+					s := strings.TrimSpace(raw)
+					if pfx, pErr := netip.ParsePrefix(s); pErr == nil && pfx.Contains(ip) {
+						return false
+					}
+					if a, aErr := netip.ParseAddr(s); aErr == nil && a.Unmap() == ip {
+						return false
+					}
+				}
+			}
+		}
+	}
+	return true
+}
+
+func writeCompatExtForbidden(w http.ResponseWriter, r *http.Request, headOnly bool, msg string) {
+	if headOnly || r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+	httpx.Error(w, http.StatusForbidden, msg)
+}
+
 func (h *Handler) handleLiveStreamFile(w http.ResponseWriter, r *http.Request) {
+	if !h.canPlayMedia(r) {
+		writeCompatExtForbidden(w, r, false, "Media playback is disabled for this user")
+		return
+	}
 	id := chi.URLParam(r, "Id")
 	ch, ok := h.lookupChannel(r.Context(), id)
 	if !ok || strings.TrimSpace(ch.StreamUrl) == "" {
@@ -439,6 +512,10 @@ func (h *Handler) handleLiveStreamFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleLiveRecordingStream(w http.ResponseWriter, r *http.Request) {
+	if !h.canPlayMedia(r) {
+		writeCompatExtForbidden(w, r, false, "Media playback is disabled for this user")
+		return
+	}
 	id := chi.URLParam(r, "Id")
 	rec, ok := h.lookupRecording(r.Context(), id)
 	if !ok || strings.TrimSpace(rec.Path) == "" {
@@ -501,6 +578,10 @@ func (h *Handler) resolveRecordingPath(target string) (string, bool) {
 
 func (h *Handler) handleLiveStreamHLS(headOnly bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !h.canPlayMedia(r) {
+			writeCompatExtForbidden(w, r, headOnly, "Media playback is disabled for this user")
+			return
+		}
 		id := chi.URLParam(r, "Id")
 		ch, ok := h.lookupChannel(r.Context(), id)
 		if !ok || strings.TrimSpace(ch.StreamUrl) == "" {
@@ -544,6 +625,10 @@ func (h *Handler) handleLiveStreamHLS(headOnly bool) http.HandlerFunc {
 
 func (h *Handler) handleLiveRecordingHLS(headOnly bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !h.canPlayMedia(r) {
+			writeCompatExtForbidden(w, r, headOnly, "Media playback is disabled for this user")
+			return
+		}
 		id := chi.URLParam(r, "Id")
 		rec, ok := h.lookupRecording(r.Context(), id)
 		if !ok || strings.TrimSpace(rec.Path) == "" {
@@ -604,29 +689,80 @@ func (h *Handler) serveLiveRecordingDynamicHLS(
 	resolvedPath string,
 	headOnly bool,
 ) {
+	isHead := headOnly || r.Method == http.MethodHead
 	q := r.URL.Query()
 	segContainer := strings.ToLower(strings.TrimSpace(q.Get("SegmentContainer")))
 	if segContainer != "mp4" && segContainer != "m4s" {
 		segContainer = "ts"
 	}
-	vCodec := strings.ToLower(strings.TrimSpace(q.Get("VideoCodec")))
-	if vCodec == "" {
-		vCodec = "h264"
+	vCodec := sanitizeLiveRecVideoCodec(q.Get("VideoCodec"))
+	aCodec := sanitizeLiveRecAudioCodec(q.Get("AudioCodec"))
+
+	pol, isAdminCaller, hasAuth := h.callerPolicy(r)
+	if hasAuth && !isAdminCaller {
+		if !pol.EnableMediaPlayback {
+			writeCompatExtForbidden(w, r, isHead, "Media playback is disabled for this user")
+			return
+		}
+		if vCodec == "copy" {
+			if !pol.EnablePlaybackRemuxing && !pol.EnableVideoPlaybackTranscoding {
+				writeCompatExtForbidden(w, r, isHead, "Playback remuxing is disabled for this user")
+				return
+			}
+		} else if !pol.EnableVideoPlaybackTranscoding {
+			writeCompatExtForbidden(w, r, isHead, "Video playback transcoding is disabled for this user")
+			return
+		}
 	}
-	aCodec := strings.ToLower(strings.TrimSpace(q.Get("AudioCodec")))
-	if aCodec == "" {
-		aCodec = "aac"
-	}
+
 	videoBR, _ := strconv.Atoi(strings.TrimSpace(q.Get("VideoBitrate")))
 	if videoBR <= 0 {
 		videoBR = 4_000_000
 	}
+	videoBR = min(max(64_000, videoBR), transcode.MaxVideoBitrate)
+
 	audioBR, _ := strconv.Atoi(strings.TrimSpace(q.Get("AudioBitrate")))
 	if audioBR <= 0 {
 		audioBR = 192_000
 	}
+	audioBR = min(max(32_000, audioBR), transcode.MaxAudioBitrate)
+
 	maxW, _ := strconv.Atoi(strings.TrimSpace(q.Get("MaxWidth")))
 	maxH, _ := strconv.Atoi(strings.TrimSpace(q.Get("MaxHeight")))
+	maxW = min(max(0, maxW), transcode.MaxVideoDimension)
+	maxH = min(max(0, maxH), transcode.MaxVideoDimension)
+
+	segDur, _ := strconv.Atoi(strings.TrimSpace(q.Get("SegmentLength")))
+	if segDur <= 0 {
+		segDur, _ = strconv.Atoi(strings.TrimSpace(q.Get("SegmentDuration")))
+	}
+	if segDur <= 0 {
+		segDur = transcode.DefaultSegmentDuration
+	}
+	segDur = min(max(2, segDur), 15)
+
+	if h.cfg != nil {
+		remoteLimit := h.cfg.Snapshot().RemoteClientBitrateLimit
+		if remoteLimit <= 0 {
+			remoteLimit = h.cfg.RemoteClientBitrateLimit
+		}
+		if remoteLimit > 0 && isRemoteLiveTVClientRequest(r, h.cfg) {
+			limit := min(remoteLimit, transcode.MaxVideoBitrate)
+			if audioBR >= limit {
+				audioBR = max(32_000, min(limit/4, 192_000))
+				if audioBR > limit {
+					audioBR = limit
+				}
+			}
+			maxAllowedV := max(64_000, limit-audioBR)
+			if maxAllowedV > limit {
+				maxAllowedV = limit
+			}
+			if videoBR > maxAllowedV {
+				videoBR = maxAllowedV
+			}
+		}
+	}
 
 	durSec := 0.0
 	if libRepo != nil {
@@ -659,7 +795,7 @@ func (h *Handler) serveLiveRecordingDynamicHLS(
 		AudioBitrate:     audioBR,
 		MaxWidth:         maxW,
 		MaxHeight:        maxH,
-		SegmentDuration:  transcode.DefaultSegmentDuration,
+		SegmentDuration:  segDur,
 		SegmentContainer: segContainer,
 		DurationSec:      durSec,
 	}
@@ -672,7 +808,7 @@ func (h *Handler) serveLiveRecordingDynamicHLS(
 		ItemID:           rec.Id,
 		PlaylistID:       "main",
 		DurationSec:      durSec,
-		SegmentDuration:  transcode.DefaultSegmentDuration,
+		SegmentDuration:  segDur,
 		SegmentContainer: segContainer,
 		Bandwidth:        videoBR + audioBR,
 		Width:            maxW,
@@ -686,16 +822,15 @@ func (h *Handler) serveLiveRecordingDynamicHLS(
 	lowerPath := strings.ToLower(r.URL.Path)
 
 	if segParam == "" && strings.HasSuffix(lowerPath, "/master.m3u8") {
-		_, _ = tcMgr.RegisterSession(sessParams)
-		master := transcode.BuildMasterPlaylist(plParams)
-		master = strings.Replace(master, "\nmain.m3u8", "\nlive.m3u8", 1)
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 		w.Header().Set("Cache-Control", "no-cache, no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		if headOnly {
+		if isHead {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+		master := transcode.BuildMasterPlaylist(plParams)
+		master = strings.Replace(master, "\nmain.m3u8", "\nlive.m3u8", 1)
 		w.Header().Set("Content-Length", strconv.Itoa(len(master)))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(master))
@@ -703,16 +838,30 @@ func (h *Handler) serveLiveRecordingDynamicHLS(
 	}
 
 	if (segParam == "" && strings.HasSuffix(lowerPath, "/live.m3u8")) || strings.EqualFold(segParam, "main.m3u8") || strings.EqualFold(segParam, "live.m3u8") {
-		_, _ = tcMgr.RegisterSession(sessParams)
-		mediaPL := transcode.BuildMediaPlaylist(plParams)
-		mediaPL = strings.ReplaceAll(mediaPL, "hls1/main/", "")
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 		w.Header().Set("Cache-Control", "no-cache, no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		if headOnly {
+		if isHead {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+		if h.cfg != nil {
+			limit := h.cfg.Snapshot().SimultaneousStreamLimit
+			if limit <= 0 {
+				limit = h.cfg.SimultaneousStreamLimit
+			}
+			if limit > 0 {
+				releaseSlot, allowed := tcMgr.TryAcquireStreamSlot(limit, transcode.SessionKey(sessParams))
+				if !allowed {
+					httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
+					return
+				}
+				defer releaseSlot()
+			}
+		}
+		_, _ = tcMgr.RegisterSession(sessParams)
+		mediaPL := transcode.BuildMediaPlaylist(plParams)
+		mediaPL = strings.ReplaceAll(mediaPL, "hls1/main/", "")
 		w.Header().Set("Content-Length", strconv.Itoa(len(mediaPL)))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(mediaPL))
@@ -720,14 +869,30 @@ func (h *Handler) serveLiveRecordingDynamicHLS(
 	}
 
 	if strings.EqualFold(segParam, "init.mp4") {
-		if headOnly {
+		if isHead {
 			w.Header().Set("Content-Type", "video/mp4")
+			w.Header().Set("X-Content-Type-Options", "nosniff")
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+		if h.cfg != nil {
+			limit := h.cfg.Snapshot().SimultaneousStreamLimit
+			if limit <= 0 {
+				limit = h.cfg.SimultaneousStreamLimit
+			}
+			if limit > 0 {
+				releaseSlot, allowed := tcMgr.TryAcquireStreamSlot(limit, transcode.SessionKey(sessParams))
+				if !allowed {
+					httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
+					return
+				}
+				defer releaseSlot()
+			}
+		}
 		initPath, err := tcMgr.GetInitSegment(r.Context(), sessParams)
 		if err != nil {
-			httpx.Error(w, http.StatusBadGateway, fmt.Sprintf("recording hls init segment failed: %v", err))
+			slog.Error("recording hls init segment failed", "recording_id", rec.Id, "error", err)
+			httpx.Error(w, http.StatusBadGateway, "recording hls init segment unavailable")
 			return
 		}
 		w.Header().Set("Content-Type", "video/mp4")
@@ -738,7 +903,7 @@ func (h *Handler) serveLiveRecordingDynamicHLS(
 
 	segIdx, segExt, parseErr := transcode.ParseSegmentID(segParam)
 	if parseErr != nil {
-		if headOnly {
+		if isHead {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -750,14 +915,30 @@ func (h *Handler) serveLiveRecordingDynamicHLS(
 	if segExt == "mp4" || segExt == "m4s" {
 		segCT = "video/mp4"
 	}
-	if headOnly {
+	if isHead {
 		w.Header().Set("Content-Type", segCT)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	if h.cfg != nil {
+		limit := h.cfg.Snapshot().SimultaneousStreamLimit
+		if limit <= 0 {
+			limit = h.cfg.SimultaneousStreamLimit
+		}
+		if limit > 0 {
+			releaseSlot, allowed := tcMgr.TryAcquireStreamSlot(limit, transcode.SessionKey(sessParams))
+			if !allowed {
+				httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
+				return
+			}
+			defer releaseSlot()
+		}
+	}
 	segPath, err := tcMgr.GetSegment(r.Context(), sessParams, segIdx)
 	if err != nil {
-		httpx.Error(w, http.StatusBadGateway, fmt.Sprintf("recording hls segment failed: %v", err))
+		slog.Error("recording hls segment failed", "recording_id", rec.Id, "segment", segIdx, "error", err)
+		httpx.Error(w, http.StatusBadGateway, "recording hls segment unavailable")
 		return
 	}
 	w.Header().Set("Content-Type", segCT)
@@ -1248,6 +1429,10 @@ func (h *Handler) handleListingProviderLineups(w http.ResponseWriter, r *http.Re
 }
 
 func (h *Handler) handleChannelMappingOptions(w http.ResponseWriter, r *http.Request) {
+	if !h.hasLiveTvManagement(r) {
+		httpx.Error(w, http.StatusForbidden, "Live TV management privileges required")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	providerID := q.Get("ProviderId")
 
@@ -1323,6 +1508,10 @@ func (h *Handler) handleChannelMappingOptions(w http.ResponseWriter, r *http.Req
 }
 
 func (h *Handler) handleSetChannelMapping(w http.ResponseWriter, r *http.Request) {
+	if !h.hasLiveTvManagement(r) {
+		httpx.Error(w, http.StatusForbidden, "Live TV management privileges required")
+		return
+	}
 	q := httpx.ParseQuery(r)
 	req := struct {
 		ProviderId        string `json:"ProviderId"`

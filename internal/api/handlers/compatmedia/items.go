@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -22,6 +24,7 @@ import (
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/middleware"
+	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/core/playback"
 	"github.com/ambra-media/ambra/internal/core/scanner"
 	"github.com/ambra-media/ambra/internal/core/transcode"
@@ -54,6 +57,26 @@ type itemUpdateRequest struct {
 	LockedFields      []string          `json:"LockedFields"`
 }
 
+func rawJSONKeyPresent(raw map[string]json.RawMessage, key string) (json.RawMessage, bool) {
+	if len(raw) == 0 {
+		return nil, false
+	}
+	if v, ok := raw[key]; ok {
+		return v, true
+	}
+	for k, v := range raw {
+		if strings.EqualFold(k, key) {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
+func isNullOrEmptyJSON(val json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(val))
+	return trimmed == "" || trimmed == "null" || trimmed == `""`
+}
+
 func (h *Handler) handleUpdateItem(w http.ResponseWriter, r *http.Request) {
 	itemID := guid.Normalize(chi.URLParam(r, "ItemId"))
 	if itemID == "" {
@@ -72,8 +95,14 @@ func (h *Handler) handleUpdateItem(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req itemUpdateRequest
+	var rawFields map[string]json.RawMessage
 	if r.Body != nil {
-		_ = httpx.DecodeJSONLimit(r, &req, 0)
+		const maxItemUpdateBytes = 1 << 20
+		bodyBytes, readErr := io.ReadAll(io.LimitReader(r.Body, maxItemUpdateBytes))
+		if readErr == nil && len(bodyBytes) > 0 {
+			_ = json.Unmarshal(bodyBytes, &req)
+			_ = json.Unmarshal(bodyBytes, &rawFields)
+		}
 	}
 
 	if s := strings.TrimSpace(req.Name); s != "" {
@@ -82,37 +111,71 @@ func (h *Handler) handleUpdateItem(w http.ResponseWriter, r *http.Request) {
 			rec.SortName = strings.ToLower(s)
 		}
 	}
-	if req.OriginalTitle != nil {
+	if rawVal, ok := rawJSONKeyPresent(rawFields, "OriginalTitle"); ok && isNullOrEmptyJSON(rawVal) {
+		rec.OriginalTitle = ""
+	} else if req.OriginalTitle != nil {
 		rec.OriginalTitle = *req.OriginalTitle
 	}
 	if req.SortName != "" {
 		rec.SortName = req.SortName
 	}
-	if req.Overview != nil {
+	if rawVal, ok := rawJSONKeyPresent(rawFields, "Overview"); ok && isNullOrEmptyJSON(rawVal) {
+		rec.Extra.Overview = ""
+	} else if req.Overview != nil {
 		rec.Extra.Overview = *req.Overview
 	}
 	if req.Taglines != nil {
 		rec.Extra.Taglines = req.Taglines
 	}
-	if req.OfficialRating != nil {
-		rec.OfficialRating = *req.OfficialRating
+	if rawVal, ok := rawJSONKeyPresent(rawFields, "OfficialRating"); ok {
+		if isNullOrEmptyJSON(rawVal) {
+			rec.OfficialRating = ""
+		} else if req.OfficialRating != nil {
+			rec.OfficialRating = strings.TrimSpace(*req.OfficialRating)
+		}
+	} else if req.OfficialRating != nil {
+		rec.OfficialRating = strings.TrimSpace(*req.OfficialRating)
 	}
-	if req.CommunityRating != nil {
+	if rawVal, ok := rawJSONKeyPresent(rawFields, "CommunityRating"); ok {
+		if isNullOrEmptyJSON(rawVal) || (req.CommunityRating != nil && *req.CommunityRating <= 0) {
+			rec.CommunityRating = nil
+		} else if req.CommunityRating != nil {
+			rec.CommunityRating = req.CommunityRating
+		}
+	} else if req.CommunityRating != nil {
 		rec.CommunityRating = req.CommunityRating
 	}
-	if req.CriticRating != nil {
+	if rawVal, ok := rawJSONKeyPresent(rawFields, "CriticRating"); ok {
+		if isNullOrEmptyJSON(rawVal) || (req.CriticRating != nil && *req.CriticRating <= 0) {
+			rec.CriticRating = nil
+		} else if req.CriticRating != nil {
+			rec.CriticRating = req.CriticRating
+		}
+	} else if req.CriticRating != nil {
 		rec.CriticRating = req.CriticRating
 	}
-	if req.ProductionYear != nil {
+	if rawVal, ok := rawJSONKeyPresent(rawFields, "ProductionYear"); ok {
+		if isNullOrEmptyJSON(rawVal) || (req.ProductionYear != nil && *req.ProductionYear <= 0) {
+			rec.ProductionYear = nil
+		} else if req.ProductionYear != nil {
+			rec.ProductionYear = req.ProductionYear
+		}
+	} else if req.ProductionYear != nil {
 		rec.ProductionYear = req.ProductionYear
 	}
-	if req.IndexNumber != nil {
+	if rawVal, ok := rawJSONKeyPresent(rawFields, "IndexNumber"); ok && isNullOrEmptyJSON(rawVal) {
+		rec.IndexNumber = nil
+	} else if req.IndexNumber != nil {
 		rec.IndexNumber = req.IndexNumber
 	}
-	if req.ParentIndexNumber != nil {
+	if rawVal, ok := rawJSONKeyPresent(rawFields, "ParentIndexNumber"); ok && isNullOrEmptyJSON(rawVal) {
+		rec.ParentIndexNumber = nil
+	} else if req.ParentIndexNumber != nil {
 		rec.ParentIndexNumber = req.ParentIndexNumber
 	}
-	if req.PremiereDate != "" {
+	if rawVal, ok := rawJSONKeyPresent(rawFields, "PremiereDate"); ok && isNullOrEmptyJSON(rawVal) {
+		rec.PremiereDate = nil
+	} else if req.PremiereDate != "" {
 		if ts, err := parseEmbyDate(req.PremiereDate); err == nil {
 			rec.PremiereDate = &ts
 		}
@@ -1163,6 +1226,24 @@ func (h *Handler) isItemBlockedByExtendedPolicy(ctx context.Context, item *sqlit
 	return false
 }
 
+func (h *Handler) filterItemsByPolicy(ctx context.Context, items []dto.BaseItemDto, pol dto.UserPolicy) []dto.BaseItemDto {
+	if h.repo == nil || pol.IsAdministrator || len(items) == 0 {
+		return items
+	}
+	filtered := make([]dto.BaseItemDto, 0, len(items))
+	for _, it := range items {
+		rec, err := h.repo.GetItemRecordByID(ctx, it.Id)
+		if err != nil || rec == nil {
+			continue
+		}
+		if blocked, bErr := h.repo.IsItemBlockedByPolicy(ctx, rec, pol); bErr != nil || blocked {
+			continue
+		}
+		filtered = append(filtered, it)
+	}
+	return filtered
+}
+
 func (h *Handler) canAccessItem(r *http.Request, item *sqlite.ItemRecord) bool {
 	if item == nil {
 		return true
@@ -1180,12 +1261,7 @@ func (h *Handler) canAccessItem(r *http.Request, item *sqlite.ItemRecord) bool {
 	if h.repo != nil {
 		pol := h.userExtendedPolicyForRequest(r, "")
 		if !pol.IsAdministrator {
-			if pol.MaxParentalRating != nil || len(pol.BlockedTags) > 0 {
-				if blocked, err := h.repo.IsItemBlockedByParentalPolicy(r.Context(), item, pol.MaxParentalRating, pol.BlockedTags); err != nil || blocked {
-					return false
-				}
-			}
-			if h.isItemBlockedByExtendedPolicy(r.Context(), item, pol) {
+			if blocked, err := h.repo.IsItemBlockedByPolicy(r.Context(), item, pol); err != nil || blocked {
 				return false
 			}
 		}
@@ -1321,22 +1397,35 @@ func (h *Handler) handleSimilar(w http.ResponseWriter, r *http.Request) {
 	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
-	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	pol := h.userExtendedPolicyForRequest(r, userID)
+	limit := q.Int("Limit", 12)
+	needsPostFilter := !pol.IsAdministrator && (len(pol.BlockUnratedItems) > 0 || len(pol.AllowedTags) > 0 || !pol.EnableLiveTvAccess)
+	fetchLimit := limit
+	if needsPostFilter && limit > 0 {
+		fetchLimit = max(limit*4, 100)
+	}
 	items, total, err := h.repo.GetSimilarItemsWithPolicy(
 		r.Context(),
 		h.serverID(),
 		userID,
 		seedID,
-		q.Int("Limit", 12),
+		fetchLimit,
 		q.List("Fields"),
 		allowed,
-		maxRating,
-		blockedTags,
+		pol.MaxParentalRating,
+		pol.BlockedTags,
 	)
 	if err != nil {
 		slog.Error("internal error in compatmedia item handler", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
+	}
+	if needsPostFilter {
+		items = h.filterItemsByPolicy(r.Context(), items, pol)
+		total = len(items)
+		if limit > 0 && len(items) > limit {
+			items = items[:limit]
+		}
 	}
 	h.sanitizeItemsPathsForCaller(r, items)
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
@@ -1358,22 +1447,35 @@ func (h *Handler) handleItemInstantMix(w http.ResponseWriter, r *http.Request) {
 	}
 	userID := h.resolveUserID(r, q)
 	allowed := h.allowedLibrariesForRequest(r, userID)
-	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
+	pol := h.userExtendedPolicyForRequest(r, userID)
+	limit := q.Int("Limit", 50)
+	needsPostFilter := !pol.IsAdministrator && (len(pol.BlockUnratedItems) > 0 || len(pol.AllowedTags) > 0 || !pol.EnableLiveTvAccess)
+	fetchLimit := limit
+	if needsPostFilter && limit > 0 {
+		fetchLimit = max(limit*4, 100)
+	}
 	items, total, err := h.repo.GetInstantMixWithPolicy(
 		r.Context(),
 		h.serverID(),
 		userID,
 		seedID,
-		q.Int("Limit", 50),
+		fetchLimit,
 		q.List("Fields"),
 		allowed,
-		maxRating,
-		blockedTags,
+		pol.MaxParentalRating,
+		pol.BlockedTags,
 	)
 	if err != nil {
 		slog.Error("internal error in compatmedia item handler", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
+	}
+	if needsPostFilter {
+		items = h.filterItemsByPolicy(r.Context(), items, pol)
+		total = len(items)
+		if limit > 0 && len(items) > limit {
+			items = items[:limit]
+		}
 	}
 	h.sanitizeItemsPathsForCaller(r, items)
 	httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{
@@ -1397,18 +1499,10 @@ func (h *Handler) filterExtrasByParentalPolicy(ctx context.Context, items []dto.
 	if h.repo == nil || (maxRating == nil && len(blockedTags) == 0) || len(items) == 0 {
 		return items
 	}
-	filtered := make([]dto.BaseItemDto, 0, len(items))
-	for _, it := range items {
-		rec, err := h.repo.GetItemRecordByID(ctx, it.Id)
-		if err != nil || rec == nil {
-			continue
-		}
-		if blocked, bErr := h.repo.IsItemBlockedByParentalPolicy(ctx, rec, maxRating, blockedTags); bErr != nil || blocked {
-			continue
-		}
-		filtered = append(filtered, it)
-	}
-	return filtered
+	pol := sqlite.DefaultUserPolicy(false)
+	pol.MaxParentalRating = maxRating
+	pol.BlockedTags = blockedTags
+	return h.filterItemsByPolicy(ctx, items, pol)
 }
 
 func (h *Handler) handleLocalTrailers(w http.ResponseWriter, r *http.Request) {
@@ -1433,8 +1527,8 @@ func (h *Handler) handleLocalTrailers(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
-	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
-	items = h.filterExtrasByParentalPolicy(r.Context(), items, maxRating, blockedTags)
+	pol := h.userExtendedPolicyForRequest(r, userID)
+	items = h.filterItemsByPolicy(r.Context(), items, pol)
 	if items == nil {
 		items = []dto.BaseItemDto{}
 	}
@@ -1464,8 +1558,8 @@ func (h *Handler) handleSpecialFeatures(w http.ResponseWriter, r *http.Request) 
 		httpx.Error(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
-	maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
-	items = h.filterExtrasByParentalPolicy(r.Context(), items, maxRating, blockedTags)
+	pol := h.userExtendedPolicyForRequest(r, userID)
+	items = h.filterItemsByPolicy(r.Context(), items, pol)
 	if items == nil {
 		items = []dto.BaseItemDto{}
 	}
@@ -1502,8 +1596,8 @@ func (h *Handler) serveThemeMediaByTypes(w http.ResponseWriter, r *http.Request,
 			httpx.Error(w, http.StatusInternalServerError, "internal server error")
 			return
 		}
-		maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
-		items = h.filterExtrasByParentalPolicy(r.Context(), items, maxRating, blockedTags)
+		pol := h.userExtendedPolicyForRequest(r, userID)
+		items = h.filterItemsByPolicy(r.Context(), items, pol)
 		if items == nil {
 			items = []dto.BaseItemDto{}
 		}
@@ -1537,8 +1631,8 @@ func (h *Handler) handleAllThemeMedia(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusInternalServerError, "internal server error")
 			return
 		}
-		maxRating, blockedTags := h.userParentalPolicyForRequest(r, userID)
-		allThemes = h.filterExtrasByParentalPolicy(r.Context(), allThemes, maxRating, blockedTags)
+		pol := h.userExtendedPolicyForRequest(r, userID)
+		allThemes = h.filterItemsByPolicy(r.Context(), allThemes, pol)
 		h.sanitizeItemsPathsForCaller(r, allThemes)
 		for _, it := range allThemes {
 			if strings.EqualFold(it.ExtraType, "ThemeSong") {
@@ -2323,11 +2417,18 @@ func (h *Handler) handleSubtitleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	format := strings.TrimPrefix(streamFile, "stream.")
 
+	q := httpx.ParseQuery(r)
 	var startTicks int64
 	if rawTicks := chi.URLParam(r, "StartPositionTicks"); rawTicks != "" {
 		startTicks, _ = strconv.ParseInt(rawTicks, 10, 64)
 	} else {
-		startTicks = httpx.ParseQuery(r).Int64("StartPositionTicks", 0)
+		startTicks = q.Int64("StartPositionTicks", 0)
+	}
+	addVttTimeMap := false
+	if b := q.Bool("addVttTimeMap"); b != nil {
+		addVttTimeMap = *b
+	} else if b := q.Bool("AddVttTimeMap"); b != nil {
+		addVttTimeMap = *b
 	}
 
 	if h.store == nil {
@@ -2394,7 +2495,7 @@ func (h *Handler) handleSubtitleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ct, data, err := playback.ServeSubtitle(subPath, format, startTicks)
+	ct, data, err := playback.ServeSubtitleWithVTTTimeMap(subPath, format, startTicks, addVttTimeMap)
 	if err != nil {
 		if errors.Is(err, os.ErrPermission) {
 			logAndWritePermissionDenied(w, subPath, err)
@@ -2563,13 +2664,13 @@ func (h *Handler) handleListVideoAttachments(w http.ResponseWriter, r *http.Requ
 		httpx.JSON(w, http.StatusOK, []videoAttachmentDTO{})
 		return
 	}
-	mediaPath, err := h.resolveExtractionMediaPath(r.Context(), mediaPath)
+	mediaPath, extractHeaders, err := h.resolveExtractionMediaTarget(r.Context(), mediaPath)
 	if err != nil {
 		slog.Error("failed to resolve strm for attachment listing", "item_id", itemID, "error", err)
 		httpx.Error(w, http.StatusBadGateway, "failed to resolve strm stream")
 		return
 	}
-	fonts, err := h.extractor.ExtractFonts(r.Context(), mediaPath, itemID, mediaSourceID)
+	fonts, err := h.extractor.ExtractFontsWithHeaders(r.Context(), mediaPath, extractHeaders, itemID, mediaSourceID)
 	if err != nil || len(fonts) == 0 {
 		httpx.JSON(w, http.StatusOK, []videoAttachmentDTO{})
 		return
@@ -2604,13 +2705,14 @@ func (h *Handler) handleVideoAttachmentStream(w http.ResponseWriter, r *http.Req
 		httpx.Error(w, http.StatusNotFound, "attachment stream not found")
 		return
 	}
-	mediaPath, err = h.resolveExtractionMediaPath(r.Context(), mediaPath)
+	var extractHeaders map[string]string
+	mediaPath, extractHeaders, err = h.resolveExtractionMediaTarget(r.Context(), mediaPath)
 	if err != nil {
 		slog.Error("failed to resolve strm for attachment stream", "item_id", itemID, "error", err)
 		httpx.Error(w, http.StatusBadGateway, "failed to resolve strm stream")
 		return
 	}
-	fonts, err := h.extractor.ExtractFonts(r.Context(), mediaPath, itemID, mediaSourceID)
+	fonts, err := h.extractor.ExtractFontsWithHeaders(r.Context(), mediaPath, extractHeaders, itemID, mediaSourceID)
 	if err != nil || idx >= len(fonts) {
 		httpx.Error(w, http.StatusNotFound, "attachment stream not found")
 		return
@@ -2756,7 +2858,65 @@ func parseCompatHLSSegmentName(raw string) (segIdx int, ext string, isInit bool,
 	return idx, ext, false, true
 }
 
+func sanitizeCompatVideoCodec(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return ""
+	case "h264", "avc":
+		return "h264"
+	case "hevc", "h265":
+		return "hevc"
+	case "av1":
+		return "av1"
+	case "vp9":
+		return "vp9"
+	case "copy":
+		return "copy"
+	default:
+		return "h264"
+	}
+}
+
+func sanitizeCompatAudioCodec(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "aac", "mp3", "opus", "flac", "ac3", "eac3", "vorbis", "copy":
+		return strings.ToLower(strings.TrimSpace(raw))
+	default:
+		return "aac"
+	}
+}
+
+func isCompatRemoteClientRequest(r *http.Request, cfg *config.Config) bool {
+	if netutil.IsLocalOrLANRequest(r) {
+		return false
+	}
+	if cfg != nil {
+		subnets := cfg.Snapshot().LocalNetworkSubnets
+		if len(subnets) > 0 {
+			if ip, err := netip.ParseAddr(netutil.ClientIP(r)); err == nil {
+				ip = ip.Unmap()
+				for _, raw := range subnets {
+					s := strings.TrimSpace(raw)
+					if pfx, pErr := netip.ParsePrefix(s); pErr == nil && pfx.Contains(ip) {
+						return false
+					}
+					if a, aErr := netip.ParseAddr(s); aErr == nil && a.Unmap() == ip {
+						return false
+					}
+				}
+			}
+		}
+	}
+	return true
+}
+
 func (h *Handler) serveCompatDynamicHLSSegment(w http.ResponseWriter, r *http.Request, audioOnly bool, notFoundMsg string) {
+	pol := h.userExtendedPolicyForRequest(r, "")
+	if !pol.IsAdministrator && !pol.EnableMediaPlayback {
+		httpx.Error(w, http.StatusForbidden, "media playback is disabled for this user")
+		return
+	}
+
 	itemID := guid.Normalize(chi.URLParam(r, "Id"))
 	if !h.canAccessItemID(r, itemID) {
 		httpx.Error(w, http.StatusNotFound, notFoundMsg)
@@ -2796,15 +2956,76 @@ func (h *Handler) serveCompatDynamicHLSSegment(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	pol := h.userExtendedPolicyForRequest(r, "")
+	vCodec := sanitizeCompatVideoCodec(q.Get("VideoCodec"))
+	aCodec := sanitizeCompatAudioCodec(nonEmpty(q.Get("AudioCodec"), "aac"))
 	if !pol.IsAdministrator {
 		if audioOnly && !pol.EnableAudioPlaybackTranscoding {
 			httpx.Error(w, http.StatusForbidden, "audio playback transcoding is disabled for this user")
 			return
 		}
-		if !audioOnly && !pol.EnableVideoPlaybackTranscoding {
-			httpx.Error(w, http.StatusForbidden, "video playback transcoding is disabled for this user")
-			return
+		if !audioOnly {
+			if vCodec == "copy" {
+				if !pol.EnablePlaybackRemuxing && !pol.EnableVideoPlaybackTranscoding {
+					httpx.Error(w, http.StatusForbidden, "playback remuxing is disabled for this user")
+					return
+				}
+			} else if !pol.EnableVideoPlaybackTranscoding {
+				httpx.Error(w, http.StatusForbidden, "video playback transcoding is disabled for this user")
+				return
+			}
+		}
+	}
+
+	ct := "video/mp2t"
+	if isInit || segExt == "mp4" || segExt == "m4s" {
+		if audioOnly {
+			ct = "audio/mp4"
+		} else {
+			ct = "video/mp4"
+		}
+	} else if audioOnly {
+		ct = "audio/mp2t"
+	}
+	if r.Method == http.MethodHead {
+		w.Header().Set("Content-Type", ct)
+		w.Header().Set("Cache-Control", "private, max-age=3600")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	vBitrate := min(max(0, q.Int("VideoBitrate", 0)), transcode.MaxVideoBitrate)
+	aBitrate := min(max(32_000, q.Int("AudioBitrate", 192_000)), transcode.MaxAudioBitrate)
+	aChannels := min(max(1, q.Int("TranscodingMaxAudioChannels", q.Int("AudioChannels", 2))), transcode.MaxAudioChannels)
+	maxW := min(max(0, q.Int("MaxWidth", 0)), transcode.MaxVideoDimension)
+	maxH := min(max(0, q.Int("MaxHeight", 0)), transcode.MaxVideoDimension)
+	segDur := min(max(1, q.Int("SegmentLength", transcode.DefaultSegmentDuration)), transcode.MaxSegmentDuration)
+	startTicks := max(int64(0), q.Int64("StartTimeTicks", 0))
+
+	if h.cfg != nil {
+		if remoteLimit := h.cfg.Snapshot().RemoteClientBitrateLimit; remoteLimit > 0 && isCompatRemoteClientRequest(r, h.cfg) {
+			limit := min(remoteLimit, transcode.MaxVideoBitrate)
+			if audioOnly {
+				if aBitrate > limit {
+					aBitrate = max(32_000, min(limit, transcode.MaxAudioBitrate))
+					if aBitrate > limit {
+						aBitrate = limit
+					}
+				}
+			} else {
+				if aBitrate >= limit {
+					aBitrate = max(32_000, min(limit/4, 192_000))
+					if aBitrate > limit {
+						aBitrate = limit
+					}
+				}
+				maxAllowedV := max(64_000, limit-aBitrate)
+				if maxAllowedV > limit {
+					maxAllowedV = limit
+				}
+				if vBitrate <= 0 || vBitrate > maxAllowedV {
+					vBitrate = maxAllowedV
+				}
+			}
 		}
 	}
 
@@ -2819,16 +3040,17 @@ func (h *Handler) serveCompatDynamicHLSSegment(w http.ResponseWriter, r *http.Re
 		MediaSourceID:    nonEmpty(mediaSourceID, itemID),
 		InputPath:        inputPath,
 		InputHeaders:     inputHeaders,
-		VideoCodec:       q.Get("VideoCodec"),
-		AudioCodec:       nonEmpty(q.Get("AudioCodec"), "aac"),
-		VideoBitrate:     q.Int("VideoBitrate", 0),
-		AudioBitrate:     q.Int("AudioBitrate", 192_000),
-		AudioChannels:    q.Int("TranscodingMaxAudioChannels", q.Int("AudioChannels", 2)),
-		MaxWidth:         q.Int("MaxWidth", 0),
-		MaxHeight:        q.Int("MaxHeight", 0),
-		SegmentDuration:  q.Int("SegmentLength", transcode.DefaultSegmentDuration),
+		VideoCodec:       vCodec,
+		AudioCodec:       aCodec,
+		VideoBitrate:     vBitrate,
+		AudioBitrate:     aBitrate,
+		AudioChannels:    aChannels,
+		MaxWidth:         maxW,
+		MaxHeight:        maxH,
+		SegmentDuration:  segDur,
 		SegmentContainer: segExt,
 		AudioOnly:        audioOnly,
+		StartTimeTicks:   startTicks,
 	}
 	if audioOnly {
 		params.VideoCodec = "none"
@@ -2836,10 +3058,12 @@ func (h *Handler) serveCompatDynamicHLSSegment(w http.ResponseWriter, r *http.Re
 
 	if h.cfg != nil {
 		if limit := h.cfg.Snapshot().SimultaneousStreamLimit; limit > 0 {
-			if _, allowed := h.transcodeMgr.TryAcquireStreamSlot(limit, transcode.SessionKey(params)); !allowed {
+			releaseSlot, allowed := h.transcodeMgr.TryAcquireStreamSlot(limit, transcode.SessionKey(params))
+			if !allowed {
 				httpx.Error(w, http.StatusTooManyRequests, "simultaneous stream limit reached")
 				return
 			}
+			defer releaseSlot()
 		}
 	}
 
@@ -2863,16 +3087,6 @@ func (h *Handler) serveCompatDynamicHLSSegment(w http.ResponseWriter, r *http.Re
 	if err != nil || st.IsDir() {
 		httpx.Error(w, http.StatusNotFound, notFoundMsg)
 		return
-	}
-	ct := "video/mp2t"
-	if isInit || segExt == "mp4" || segExt == "m4s" {
-		if audioOnly {
-			ct = "audio/mp4"
-		} else {
-			ct = "video/mp4"
-		}
-	} else if audioOnly {
-		ct = "audio/mp2t"
 	}
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Cache-Control", "private, max-age=3600")

@@ -184,7 +184,7 @@ func TestUsersAuthAndCRUD(t *testing.T) {
 	if rec := doReq(env.router, http.MethodPost, "/Users/nonexistent/Policy", env.adminTok, `{"IsDisabled":true}`); rec.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", rec.Code)
 	}
-	if rec := doReq(env.router, http.MethodPost, "/Users/"+charlie.Id+"/Policy", env.adminTok, `{"IsDisabled":true}`); rec.Code != http.StatusNoContent {
+	if rec := doReq(env.router, http.MethodPost, "/Users/"+charlie.Id+"/Policy", env.adminTok, `{"IsDisabled":true,"EnableRemoteAccess":true}`); rec.Code != http.StatusNoContent {
 		t.Fatalf("expected 204, got %d", rec.Code)
 	}
 	if rec := doReq(env.router, http.MethodPost, "/Users/AuthenticateByName", "", `{"Username":"charlie","Pw":"cpw"}`); rec.Code != http.StatusForbidden {

@@ -545,8 +545,9 @@ export function parseCues(
   data: Uint8Array,
   timecodeScale = DEFAULT_TIMECODE_SCALE_NS,
   segmentDataOffset = 0,
+  videoTrackNumber?: number,
 ): MkvCuePoint[] {
-  const cues: MkvCuePoint[] = []
+  const allCues: MkvCuePoint[] = []
   let pos = 0
   let end = data.length
 
@@ -594,10 +595,10 @@ export function parseCues(
         pPos = sub.endOffset
       }
 
-      if (cueTime >= 0) {
+      if (cueTime >= 0 && positions.length > 0) {
         const timeSec = (cueTime * timecodeScale) / 1_000_000_000
         for (const p of positions) {
-          cues.push({
+          allCues.push({
             cueTime,
             timeSec,
             trackNumber: p.trackNumber,
@@ -612,8 +613,14 @@ export function parseCues(
     pos = point.endOffset
   }
 
-  cues.sort((a, b) => a.timeSec - b.timeSec)
-  return cues
+  allCues.sort((a, b) => a.timeSec - b.timeSec)
+  if (videoTrackNumber !== undefined && videoTrackNumber > 0) {
+    const videoOnlyCues = allCues.filter((c) => c.trackNumber === videoTrackNumber)
+    if (videoOnlyCues.length > 0) {
+      return videoOnlyCues
+    }
+  }
+  return allCues
 }
 
 /**
@@ -1386,6 +1393,48 @@ export function isMkvContainer(container?: string): boolean {
   return tokens.includes('mkv') || tokens.includes('matroska')
 }
 
+/**
+ * 解析 ISO/IEC 14496-15 Annex E.3 HEVCDecoderConfigurationRecord (hvcC)，
+ * 生成精准的 `hvc1.<profile_space><profile_idc>.<compat_hex>.<tier><level_idc>.<constraints>` 字符串，
+ * 使 Main 10 (10-bit HDR/DV) 视频正确声明为 `hvc1.2.4.L...` 而非硬编码 8-bit `hvc1.1.6.L120.90`。
+ */
+export function buildHevcMimeCodec(codecPrivate?: Uint8Array): string {
+  if (!codecPrivate || codecPrivate.byteLength < 13 || codecPrivate[0] !== 1) {
+    return 'hvc1.1.6.L120.90'
+  }
+  const profileSpaceIdx = (codecPrivate[1] >> 6) & 0x03
+  const profileSpace = ['', 'A', 'B', 'C'][profileSpaceIdx] ?? ''
+  const tier = ((codecPrivate[1] >> 5) & 0x01) !== 0 ? 'H' : 'L'
+  const profileIdc = codecPrivate[1] & 0x1f
+
+  let compatReversed = 0
+  for (let bit = 0; bit < 32; bit++) {
+    const srcByte = codecPrivate[2 + (bit >> 3)]
+    const srcBit = (srcByte >> (7 - (bit & 7))) & 1
+    if (srcBit) {
+      compatReversed = (compatReversed | ((1 << bit) >>> 0)) >>> 0
+    }
+  }
+  if (compatReversed === 0 && profileIdc > 0 && profileIdc < 32) {
+    compatReversed = (1 << profileIdc) >>> 0
+  }
+  const compatHex = (compatReversed >>> 0).toString(16).toUpperCase()
+
+  const levelIdc = codecPrivate[12] || 120
+
+  let constraintEnd = 11
+  while (constraintEnd >= 6 && codecPrivate[constraintEnd] === 0) {
+    constraintEnd--
+  }
+  const constraintParts: string[] = []
+  for (let i = 6; i <= constraintEnd; i++) {
+    constraintParts.push(codecPrivate[i].toString(16).toUpperCase())
+  }
+  const constraintSuffix = constraintParts.length > 0 ? `.${constraintParts.join('.')}` : ''
+
+  return `hvc1.${profileSpace}${profileIdc}.${compatHex}.${tier}${levelIdc}${constraintSuffix}`
+}
+
 function mapVideoCodecToMime(codec?: string, codecPrivate?: Uint8Array): string | null {
   if (!codec) return null
   const c = codec.trim().toLowerCase()
@@ -1397,7 +1446,7 @@ function mapVideoCodecToMime(codec?: string, codecPrivate?: Uint8Array): string 
     return 'avc1.640028'
   }
   if (c === 'hevc' || c === 'h265' || c === 'hvc1' || c === 'hev1' || c === 'v_mpegh/iso/hevc') {
-    return 'hvc1.1.6.L120.90'
+    return buildHevcMimeCodec(codecPrivate)
   }
   return null
 }
@@ -1718,6 +1767,9 @@ export class StreamMkvRemuxer {
     this.pendingKeyframeSync = false
     this.pendingSeekTargetSec = null
 
+    this.videoTrack = tracks.find((t) => t.trackType === 'video')
+    const videoTrackNum = this.videoTrack?.trackNumber
+
     // 若 Cues 不在头部但 SeekHead 中记录了 Cues 偏移（常见于大体积 MKV 尾部），按需发起一次小 Range 拉取
     if (cues.length === 0) {
       const cuesSeek = seekEntries.find((s) => s.id === EBML_ID.Cues)
@@ -1725,15 +1777,19 @@ export class StreamMkvRemuxer {
         try {
           const cuesEnd = Math.min(this.totalBytes - 1, cuesSeek.fileOffset + 2 * 1024 * 1024 - 1)
           const cuesRes = await this.fetchRange(cuesSeek.fileOffset, cuesEnd, opts.signal)
-          cues = parseCues(cuesRes.data, this.timecodeScale, this.segmentDataOffset)
+          cues = parseCues(cuesRes.data, this.timecodeScale, this.segmentDataOffset, videoTrackNum)
         } catch {
           // Cues 拉取失败不影响正常顺序播放，仅降级为线性估算 Seek
         }
       }
+    } else if (videoTrackNum !== undefined && videoTrackNum > 0) {
+      const videoOnlyCues = cues.filter((c) => c.trackNumber === videoTrackNum)
+      if (videoOnlyCues.length > 0) {
+        cues = videoOnlyCues
+      }
     }
 
     this.cues = cues
-    this.videoTrack = tracks.find((t) => t.trackType === 'video')
     const audioTracks = tracks.filter((t) => t.trackType === 'audio')
     if (opts.videoOnly) {
       this.audioTrack = undefined
@@ -2406,6 +2462,8 @@ export class StreamMkvRemuxer {
     this.maxBufferAheadSec = Math.max(5, Math.floor(this.maxBufferAheadSec / 2))
     const curTime = this.videoEl?.currentTime ?? 0
     const evictEnd = curTime - 5
+    const forwardKeepSec = Math.max(15, Math.min(this.maxBufferAheadSec, 30))
+    const forwardEvictStart = curTime + forwardKeepSec
     const buffers = Array.from(
       new Set([targetSb, this.videoSb, this.audioSb].filter((b): b is SourceBuffer => Boolean(b))),
     )
@@ -2417,6 +2475,20 @@ export class StreamMkvRemuxer {
         const rangeStart = buffered.start(0)
         if (Number.isFinite(evictEnd) && evictEnd > rangeStart) {
           await this.removeFromBuffer(sb, rangeStart, evictEnd)
+        }
+        // 同时驱逐远端前向缓冲区间（例如用户在后续时间轴塞满 MSE 配额后 Seek 回到前 0~5s 时）
+        const latestBuffered = sb.buffered
+        if (latestBuffered && latestBuffered.length > 0) {
+          for (let i = latestBuffered.length - 1; i >= 0; i--) {
+            const rStart = latestBuffered.start(i)
+            const rEnd = latestBuffered.end(i)
+            if (rEnd > curTime + 15) {
+              const removeStart = Math.max(rStart, Math.min(forwardEvictStart, curTime + 15))
+              if (rEnd > removeStart) {
+                await this.removeFromBuffer(sb, removeStart, rEnd)
+              }
+            }
+          }
         }
       } catch {
         // 忽略缓冲驱逐竞态

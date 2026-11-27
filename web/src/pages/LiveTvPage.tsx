@@ -34,10 +34,11 @@ import {
 } from '../api/client'
 import type { LiveTvRecordingInfo, LiveTvSeriesTimerInfo } from '../api/types'
 import { QueryErrorState } from '../components/QueryErrorState'
+import { useAudioPlayer } from '../context/AudioPlayerContext'
 import { useAuth } from '../context/AuthContext'
 import { getCachedDemoServer, loadDemoServer } from '../demo/demoLoader'
 import { isDemoMode } from '../demo/demoMode'
-import { getActiveLocale, useI18n } from '../i18n/I18nContext'
+import { getActiveLocale, translateForLocale, useI18n } from '../i18n/I18nContext'
 
 type LiveTvSubTab = 'channels' | 'timers' | 'seriesTimers' | 'recordings' | 'mappings'
 
@@ -71,7 +72,7 @@ function formatTimeRange(startIso?: string, endIso?: string): string {
 }
 
 function formatDateTimeRange(startIso?: string, endIso?: string): string {
-  if (!startIso && !endIso) return '未知时间'
+  if (!startIso && !endIso) return translateForLocale(getActiveLocale(), 'liveTvUi.unknownTime')
   const fmt = (iso?: string) => {
     if (!iso) return '--'
     const d = new Date(iso)
@@ -97,8 +98,11 @@ function getProgramProgress(startIso?: string, endIso?: string, nowMs = Date.now
 
 export function LiveTvPage() {
   const { isAdmin, user } = useAuth()
+  const { pause: pauseGlobalAudio } = useAudioPlayer()
+  const pauseGlobalAudioRef = useRef(pauseGlobalAudio)
+  pauseGlobalAudioRef.current = pauseGlobalAudio
   const canManageLiveTv = isAdmin || Boolean(user?.Policy?.EnableLiveTvManagement)
-  const { locale, t } = useI18n()
+  const { t } = useI18n()
   const queryClient = useQueryClient()
   const [searchParams, setSearchParams] = useSearchParams()
   const [activeSubTab, setActiveSubTab] = useState<LiveTvSubTab>('channels')
@@ -150,10 +154,24 @@ export function LiveTvPage() {
   })
 
   const channels = useMemo(() => channelsData?.Items || [], [channelsData])
+  const channelIdsForEpg = useMemo(
+    () => channels.map((ch) => ch.Id).filter((id): id is string => Boolean(id)),
+    [channels],
+  )
 
   const { data: programsData } = useQuery({
-    queryKey: ['liveTv', 'programs'],
-    queryFn: () => api.getLiveTvPrograms(undefined, 200),
+    queryKey: ['liveTv', 'programs', channelIdsForEpg.length],
+    queryFn: () => {
+      const baseNow = Date.now()
+      const minEndDate = new Date(baseNow - 5 * 60_000).toISOString()
+      const maxStartDate = new Date(baseNow + 24 * 3_600_000).toISOString()
+      const limit = Math.max(2000, channelIdsForEpg.length * 16)
+      return api.getLiveTvPrograms(
+        channelIdsForEpg.length > 0 ? channelIdsForEpg : undefined,
+        limit,
+        { minEndDate, maxStartDate },
+      )
+    },
     enabled: channels.length > 0,
     staleTime: 60_000,
   })
@@ -175,7 +193,7 @@ export function LiveTvPage() {
   const timers = useMemo(() => timersData?.Items || [], [timersData])
 
   const scheduledProgramIds = useMemo(
-    () => timers.map((t) => t.ProgramId).filter((id): id is string => Boolean(id)),
+    () => timers.map((tm) => tm.ProgramId).filter((id): id is string => Boolean(id)),
     [timers],
   )
 
@@ -260,7 +278,9 @@ export function LiveTvPage() {
       setNewSeriesName('')
       setDvrFeedback({
         type: 'success',
-        message: `已创建系列追录「${payload.Name}」${payload.RecordNewOnly ? '（仅录新集）' : ''}`,
+        message: payload.RecordNewOnly
+          ? t('liveTvUi.seriesTimerCreatedNewOnly', { name: payload.Name || '' })
+          : t('liveTvUi.seriesTimerCreated', { name: payload.Name || '' }),
       })
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['liveTv', 'seriesTimers'] }),
@@ -270,7 +290,7 @@ export function LiveTvPage() {
     onError: (err) => {
       setDvrFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '创建系列追录失败，请稍后重试',
+        message: err instanceof Error ? err.message : t('liveTvUi.seriesTimerCreateFailed'),
       })
     },
     onSettled: () => {
@@ -281,13 +301,13 @@ export function LiveTvPage() {
   const deleteSeriesTimerMutation = useMutation({
     mutationFn: (seriesTimerId: string) => api.deleteSeriesTimer(seriesTimerId),
     onSuccess: async () => {
-      setDvrFeedback({ type: 'success', message: '已取消系列追录计划' })
+      setDvrFeedback({ type: 'success', message: t('liveTvUi.seriesTimerCancelled') })
       await queryClient.invalidateQueries({ queryKey: ['liveTv', 'seriesTimers'] })
     },
     onError: (err) => {
       setDvrFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '取消系列追录失败，请稍后重试',
+        message: err instanceof Error ? err.message : t('liveTvUi.seriesTimerCancelFailed'),
       })
     },
   })
@@ -307,17 +327,27 @@ export function LiveTvPage() {
       setSavingMappingChannelId(payload.tunerChannelId)
       setDvrFeedback(null)
     },
-    onSuccess: async () => {
-      setDvrFeedback({ type: 'success', message: '已保存频道 EPG 映射' })
+    onSuccess: async (_res, payload) => {
+      setDvrFeedback({
+        type: 'success',
+        message: payload.providerChannelId
+          ? t('liveTvUi.epgMappingSaved')
+          : t('liveTvUi.epgMappingCleared'),
+      })
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['liveTv', 'channelMappings'] }),
         queryClient.invalidateQueries({ queryKey: ['liveTv', 'programs'] }),
       ])
+      setDraftMappings((prev) => {
+        const next = { ...prev }
+        delete next[payload.tunerChannelId]
+        return next
+      })
     },
     onError: (err) => {
       setDvrFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '保存频道映射失败',
+        message: err instanceof Error ? err.message : t('liveTvUi.epgMappingSaveFailed'),
       })
     },
     onSettled: () => {
@@ -354,14 +384,14 @@ export function LiveTvPage() {
     onSuccess: async (_created, { program: prog }) => {
       setDvrFeedback({
         type: 'success',
-        message: `已预约录制「${prog.Name}」`,
+        message: t('liveTvUi.timerScheduledSuccess', { name: prog.Name }),
       })
       await queryClient.invalidateQueries({ queryKey: ['liveTv', 'timers'] })
     },
     onError: (err) => {
       setDvrFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '预约录制失败，请稍后重试',
+        message: err instanceof Error ? err.message : t('liveTvUi.timerScheduleFailed'),
       })
     },
     onSettled: () => {
@@ -372,13 +402,13 @@ export function LiveTvPage() {
   const deleteTimerMutation = useMutation({
     mutationFn: (timerId: string) => api.deleteLiveTvTimer(timerId),
     onSuccess: async () => {
-      setDvrFeedback({ type: 'success', message: '已取消录制预约' })
+      setDvrFeedback({ type: 'success', message: t('liveTvUi.timerCancelledSuccess') })
       await queryClient.invalidateQueries({ queryKey: ['liveTv', 'timers'] })
     },
     onError: (err) => {
       setDvrFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '取消预约失败，请稍后重试',
+        message: err instanceof Error ? err.message : t('liveTvUi.timerCancelFailed'),
       })
     },
   })
@@ -387,13 +417,13 @@ export function LiveTvPage() {
     mutationFn: (recordingId: string) => api.deleteLiveTvRecording(recordingId),
     onSuccess: async (_data, recordingId) => {
       setPlayingRecording((prev) => (prev?.Id === recordingId ? null : prev))
-      setDvrFeedback({ type: 'success', message: '已删除录制文件' })
+      setDvrFeedback({ type: 'success', message: t('liveTvUi.recordingDeletedSuccess') })
       await queryClient.invalidateQueries({ queryKey: ['liveTv', 'recordings'] })
     },
     onError: (err) => {
       setDvrFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '删除录制失败，请稍后重试',
+        message: err instanceof Error ? err.message : t('liveTvUi.recordingDeleteFailed'),
       })
     },
   })
@@ -425,6 +455,7 @@ export function LiveTvPage() {
   }, [activeChannel?.Id])
 
   const handleSelectChannel = (channelId: string) => {
+    pauseGlobalAudio()
     setPlaybackError(null)
     setForceHls(false)
     mediaRecoveryCountRef.current = 0
@@ -434,6 +465,7 @@ export function LiveTvPage() {
   }
 
   const handleRetryStream = () => {
+    pauseGlobalAudio()
     setPlaybackError(null)
     mediaRecoveryCountRef.current = 0
     setStreamRetryTick((tick) => tick + 1)
@@ -497,6 +529,7 @@ export function LiveTvPage() {
     const video = videoRef.current
     if (!video || !activeChannel) return
 
+    pauseGlobalAudioRef.current()
     setPlaybackError(null)
     mediaRecoveryCountRef.current = 0
 
@@ -549,18 +582,18 @@ export function LiveTvPage() {
         if (data.fatal) {
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
             destroyHls()
-            setPlaybackError('直播流网络连接失败，请检查直播源可用性或稍后重试')
+            setPlaybackError(t('liveTvUi.errHlsNetwork'))
           } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
             if (mediaRecoveryCountRef.current < MAX_HLS_MEDIA_RECOVERIES) {
               mediaRecoveryCountRef.current += 1
               hls?.recoverMediaError()
             } else {
               destroyHls()
-              setPlaybackError('直播流媒体解码多次失败，请点击重试或切换频道')
+              setPlaybackError(t('liveTvUi.errHlsMediaDecode'))
             }
           } else {
             destroyHls()
-            setPlaybackError('直播流解码异常，尝试切换频道或检查流格式')
+            setPlaybackError(t('liveTvUi.errHlsFatal'))
           }
         }
       })
@@ -574,7 +607,7 @@ export function LiveTvPage() {
       video.pause()
       video.removeAttribute('src')
     }
-  }, [activeChannel, activeLooksLikeHls, activeStreamUrl, activeSubTab, demoActive, forceHls, streamRetryTick])
+  }, [activeChannel, activeLooksLikeHls, activeStreamUrl, activeSubTab, demoActive, forceHls, streamRetryTick, t])
 
   const shouldUseRecordingHls = Boolean(
     activeSubTab === 'recordings' &&
@@ -632,7 +665,7 @@ export function LiveTvPage() {
   if (channelsError) {
     return (
       <QueryErrorState
-        title="无法加载电视频道"
+        title={t('liveTvUi.loadChannelsError')}
         error={channelsErr}
         onRetry={() => void refetchChannels()}
         backTo="/"
@@ -656,7 +689,7 @@ export function LiveTvPage() {
             <span>{t('livetv.title')}</span>
           </h1>
           <p className="mt-1 text-xs text-zinc-400">
-            共 {channels.length} 个在线频道 · 支持 HLS 直播、实时 EPG 节目单与 DVR 预约录制
+            {t('liveTvUi.headerSubtitle', { count: channels.length })}
           </p>
         </div>
 
@@ -664,36 +697,36 @@ export function LiveTvPage() {
           {/* 子标签切换：直播频道 / 预约计划 / 系列追录 / 已录节目 / 频道映射 */}
           <div
             role="tablist"
-            aria-label="电视直播功能标签"
+            aria-label={t('liveTvUi.subTabsAria')}
             className="inline-flex flex-wrap items-center gap-1 rounded-xl border border-white/10 bg-zinc-950/80 p-1"
           >
             {(
               [
                 {
                   key: 'channels' as LiveTvSubTab,
-                  label: locale === 'zh-CN' ? '直播频道' : t('livetv.channels'),
+                  label: t('liveTvUi.tabChannels'),
                   icon: Tv,
                 },
                 {
                   key: 'timers' as LiveTvSubTab,
-                  label: locale === 'zh-CN' ? '预约计划' : t('livetv.timers'),
+                  label: t('liveTvUi.tabTimers'),
                   icon: CalendarClock,
                 },
                 {
                   key: 'seriesTimers' as LiveTvSubTab,
-                  label: '系列追录',
+                  label: t('liveTvUi.tabSeriesTimers'),
                   icon: Repeat,
                 },
                 {
                   key: 'recordings' as LiveTvSubTab,
-                  label: locale === 'zh-CN' ? '已录节目' : t('livetv.recordings'),
+                  label: t('liveTvUi.tabRecordings'),
                   icon: Film,
                 },
                 ...(canManageLiveTv
                   ? [
                       {
                         key: 'mappings' as LiveTvSubTab,
-                        label: '频道映射',
+                        label: t('liveTvUi.tabMappings'),
                         icon: Link2,
                       },
                     ]
@@ -730,7 +763,7 @@ export function LiveTvPage() {
               className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2 text-xs font-medium text-zinc-300 transition-colors hover:border-amber-400/40 hover:text-amber-300"
             >
               <Settings className="h-3.5 w-3.5" />
-              <span>管理直播源</span>
+              <span>{t('liveTvUi.manageSourcesBtn')}</span>
             </Link>
           )}
         </div>
@@ -758,7 +791,7 @@ export function LiveTvPage() {
             onClick={() => setDvrFeedback(null)}
             className="text-[11px] opacity-75 hover:opacity-100"
           >
-            关闭
+            {t('common.close')}
           </button>
         </div>
       )}
@@ -769,9 +802,9 @@ export function LiveTvPage() {
             <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-amber-500/15 text-amber-400 ring-1 ring-amber-500/30">
               <Radio className="h-7 w-7" />
             </div>
-            <h2 className="text-lg font-semibold text-white">暂无可观看的电视频道</h2>
+            <h2 className="text-lg font-semibold text-white">{t('liveTvUi.noChannelsTitle')}</h2>
             <p className="mt-2 text-xs leading-relaxed text-zinc-400">
-              当前服务器尚未导入 M3U 直播源或频道列表为空。您仍可切换到「预约计划」或「已录节目」查看历史记录。
+              {t('liveTvUi.noChannelsDesc')}
             </p>
             {isAdmin && (
               <Link
@@ -779,7 +812,7 @@ export function LiveTvPage() {
                 className="mt-6 inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-5 py-2.5 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400"
               >
                 <Settings className="h-3.5 w-3.5" />
-                <span>前往配置直播源</span>
+                <span>{t('liveTvUi.goConfigureSourcesBtn')}</span>
               </Link>
             )}
           </div>
@@ -815,7 +848,7 @@ export function LiveTvPage() {
                       setForceHls(true)
                       return
                     }
-                    setPlaybackError('直播流加载失败，请确认直播源地址有效且支持浏览器播放')
+                    setPlaybackError(t('liveTvUi.errStreamLoad'))
                   }}
                   className="h-full w-full bg-black object-contain"
                 />
@@ -847,7 +880,7 @@ export function LiveTvPage() {
                     className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-red-400/35 bg-red-500/15 px-2.5 py-1 text-[11px] font-medium text-red-100 transition-colors hover:bg-red-500/25"
                   >
                     <RefreshCw className="h-3 w-3" />
-                    <span>重试</span>
+                    <span>{t('common.retry')}</span>
                   </button>
                 </div>
               )}
@@ -864,33 +897,35 @@ export function LiveTvPage() {
                     <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-500/15 font-mono text-xs font-bold text-amber-300 ring-1 ring-amber-500/30">
                       {activeChannel.Number || 'TV'}
                     </div>
-                      <div>
-                        <h2 className="text-base font-semibold text-white">{activeChannel.Name}</h2>
-                        <p className="text-[11px] text-zinc-400">
-                          {activeChannel.ChannelType || 'TV'}
-                          {demoActive ? ' · Demo 离线演示流' : ' · 实时直播流'}
-                        </p>
-                      </div>
+                    <div>
+                      <h2 className="text-base font-semibold text-white">{activeChannel.Name}</h2>
+                      <p className="text-[11px] text-zinc-400">
+                        {activeChannel.ChannelType || 'TV'} ·{' '}
+                        {demoActive
+                          ? t('liveTvUi.demoOfflineStream')
+                          : t('liveTvUi.realtimeLiveStream')}
+                      </p>
                     </div>
-                    {canManageLiveTv && (
-                      <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1 text-[11px] text-zinc-300">
-                        <input
-                          type="checkbox"
-                          checked={recordNewOnlyPref}
-                          onChange={(e) => setRecordNewOnlyPref(e.target.checked)}
-                          className="h-3.5 w-3.5 accent-amber-500"
-                        />
-                        <span>追录仅限新集</span>
-                      </label>
-                    )}
                   </div>
+                  {canManageLiveTv && (
+                    <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1 text-[11px] text-zinc-300">
+                      <input
+                        type="checkbox"
+                        checked={recordNewOnlyPref}
+                        onChange={(e) => setRecordNewOnlyPref(e.target.checked)}
+                        className="h-3.5 w-3.5 accent-amber-500"
+                      />
+                      <span>{t('liveTvUi.recordNewOnlyPref')}</span>
+                    </label>
+                  )}
+                </div>
 
                 {currentProgram ? (
                   <div className="space-y-2.5">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="flex items-center gap-2">
                         <span className="rounded-md bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-300">
-                          正在播出
+                          {t('liveTvUi.nowPlayingBadge')}
                         </span>
                         <span className="text-sm font-semibold text-zinc-100">
                           {currentProgram.Name}
@@ -928,8 +963,8 @@ export function LiveTvPage() {
                               )}
                               <span>
                                 {scheduledProgramIds.includes(currentProgram.Id)
-                                  ? '已预约'
-                                  : '预约录制'}
+                                  ? t('liveTvUi.scheduledBadge')
+                                  : t('liveTvUi.scheduleRecordBtn')}
                               </span>
                             </button>
 
@@ -963,8 +998,8 @@ export function LiveTvPage() {
                               )}
                               <span>
                                 {scheduledSeriesNames.has(currentProgram.Name.trim().toLowerCase())
-                                  ? '已追录'
-                                  : '系列追录'}
+                                  ? t('liveTvUi.seriesScheduledBadge')
+                                  : t('liveTvUi.tabSeriesTimers')}
                               </span>
                             </button>
                           </div>
@@ -987,7 +1022,7 @@ export function LiveTvPage() {
                 ) : (
                   <div className="flex items-center gap-2 text-xs text-zinc-500">
                     <CalendarClock className="h-4 w-4 text-zinc-600" />
-                    <span>暂无当前频道的 EPG 节目单信息</span>
+                    <span>{t('liveTvUi.noEpgForChannel')}</span>
                   </div>
                 )}
 
@@ -995,7 +1030,7 @@ export function LiveTvPage() {
                   <div className="space-y-2 border-t border-white/8 pt-3">
                     <h3 className="flex items-center gap-1.5 text-xs font-semibold text-zinc-300">
                       <CalendarClock className="h-3.5 w-3.5 text-amber-400" />
-                      <span>即将播出</span>
+                      <span>{t('liveTvUi.upNextTitle')}</span>
                     </h3>
                     <div className="divide-y divide-white/6 rounded-xl border border-white/8 bg-black/20">
                       {upcomingPrograms.slice(0, 5).map((prog) => {
@@ -1041,7 +1076,11 @@ export function LiveTvPage() {
                                     ) : (
                                       <CircleDot className="h-3 w-3" />
                                     )}
-                                    <span>{isScheduled ? '已预约' : '预约录制'}</span>
+                                    <span>
+                                      {isScheduled
+                                        ? t('liveTvUi.scheduledBadge')
+                                        : t('liveTvUi.scheduleRecordBtn')}
+                                    </span>
                                   </button>
 
                                   <button
@@ -1074,8 +1113,8 @@ export function LiveTvPage() {
                                     )}
                                     <span>
                                       {scheduledSeriesNames.has(prog.Name.trim().toLowerCase())
-                                        ? '已追录'
-                                        : '追录'}
+                                        ? t('liveTvUi.seriesScheduledBadge')
+                                        : t('liveTvUi.followRecordShortBtn')}
                                     </span>
                                   </button>
                                 </div>
@@ -1107,10 +1146,10 @@ export function LiveTvPage() {
               <Search className="pointer-events-none absolute top-1/2 left-3 h-3.5 w-3.5 -translate-y-1/2 text-zinc-500" />
               <input
                 type="text"
-                aria-label="搜索频道"
+                aria-label={t('liveTvUi.searchChannelsAria')}
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="搜索频道名称或频道号..."
+                placeholder={t('liveTvUi.searchChannelsPlaceholder')}
                 className="w-full rounded-xl border border-white/10 bg-zinc-900/90 py-2 pr-3 pl-8 text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
               />
             </div>
@@ -1121,7 +1160,7 @@ export function LiveTvPage() {
             >
               {filteredChannels.length === 0 ? (
                 <div className="py-10 text-center text-xs text-zinc-500">
-                  没有匹配「{searchQuery}」的频道
+                  {t('liveTvUi.noMatchingChannels', { query: searchQuery })}
                 </div>
               ) : (
                 filteredChannels.map((ch) => {
@@ -1151,7 +1190,9 @@ export function LiveTvPage() {
                       <div className="min-w-0 flex-1">
                         <p className="truncate text-xs font-semibold">{ch.Name}</p>
                         <p className="mt-0.5 truncate text-[11px] text-zinc-400">
-                          {chCurrent ? `正在播出：${chCurrent.Name}` : ch.ChannelType || 'TV'}
+                          {chCurrent
+                            ? t('liveTvUi.channelNowPlaying', { name: chCurrent.Name })
+                            : ch.ChannelType || 'TV'}
                         </p>
                       </div>
                     </button>
@@ -1171,7 +1212,7 @@ export function LiveTvPage() {
           <div className="flex items-center justify-between gap-3 border-b border-white/8 pb-3">
             <h2 className="flex items-center gap-2 text-sm font-semibold text-zinc-100">
               <CalendarClock className="h-4 w-4 text-amber-400" />
-              <span>DVR 预约计划</span>
+              <span>{t('liveTvUi.dvrTimersTitle')}</span>
               <span className="rounded-md bg-white/8 px-2 py-0.5 font-mono text-[11px] text-zinc-400">
                 {timers.length}
               </span>
@@ -1182,7 +1223,7 @@ export function LiveTvPage() {
               className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-xs text-zinc-300 hover:border-amber-400/40 hover:text-amber-300"
             >
               <RefreshCw className="h-3 w-3" />
-              <span>刷新</span>
+              <span>{t('common.refresh')}</span>
             </button>
           </div>
 
@@ -1192,13 +1233,13 @@ export function LiveTvPage() {
             </div>
           ) : timersError ? (
             <QueryErrorState
-              title="无法加载预约计划"
+              title={t('liveTvUi.loadTimersError')}
               error={timersErr}
               onRetry={() => void refetchTimers()}
             />
           ) : timers.length === 0 ? (
             <div className="py-12 text-center text-xs text-zinc-500">
-              暂无录制预约，可在「直播频道」的 EPG 节目单中点击「预约录制」创建
+              {t('liveTvUi.emptyTimersHint')}
             </div>
           ) : (
             <div className="divide-y divide-white/6 rounded-xl border border-white/8 bg-black/20">
@@ -1242,7 +1283,7 @@ export function LiveTvPage() {
                       ) : (
                         <Trash2 className="h-3.5 w-3.5" />
                       )}
-                      <span>取消预约</span>
+                      <span>{t('liveTvUi.cancelTimerBtn')}</span>
                     </button>
                   )}
                 </div>
@@ -1260,7 +1301,7 @@ export function LiveTvPage() {
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/8 pb-3">
             <h2 className="flex items-center gap-2 text-sm font-semibold text-zinc-100">
               <Repeat className="h-4 w-4 text-amber-400" />
-              <span>系列追录规则</span>
+              <span>{t('liveTvUi.seriesTimersTitle')}</span>
               <span className="rounded-md bg-white/8 px-2 py-0.5 font-mono text-[11px] text-zinc-400">
                 {seriesTimers.length}
               </span>
@@ -1271,7 +1312,7 @@ export function LiveTvPage() {
               className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-xs text-zinc-300 hover:border-amber-400/40 hover:text-amber-300"
             >
               <RefreshCw className="h-3 w-3" />
-              <span>刷新</span>
+              <span>{t('common.refresh')}</span>
             </button>
           </div>
 
@@ -1292,26 +1333,30 @@ export function LiveTvPage() {
               className="flex flex-wrap items-end gap-3 rounded-xl border border-white/8 bg-black/25 p-4"
             >
               <label className="min-w-[200px] flex-1 space-y-1 text-xs">
-                <span className="block text-[11px] text-zinc-400">追录节目名称匹配</span>
+                <span className="block text-[11px] text-zinc-400">
+                  {t('liveTvUi.seriesMatchNameLabel')}
+                </span>
                 <input
                   type="text"
-                  aria-label="追录节目名称"
+                  aria-label={t('liveTvUi.seriesMatchNameAria')}
                   value={newSeriesName}
                   onChange={(e) => setNewSeriesName(e.target.value)}
-                  placeholder="输入要自动追录的剧集或栏目名称..."
+                  placeholder={t('liveTvUi.seriesMatchNamePlaceholder')}
                   className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/50"
                 />
               </label>
 
               <label className="min-w-[160px] space-y-1 text-xs">
-                <span className="block text-[11px] text-zinc-400">限定频道</span>
+                <span className="block text-[11px] text-zinc-400">
+                  {t('liveTvUi.limitChannelLabel')}
+                </span>
                 <select
-                  aria-label="追录频道范围"
+                  aria-label={t('liveTvUi.limitChannelAria')}
                   value={newSeriesChannelId}
                   onChange={(e) => setNewSeriesChannelId(e.target.value)}
                   className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
                 >
-                  <option value="">任意频道</option>
+                  <option value="">{t('liveTvUi.anyChannel')}</option>
                   {channels.map((ch) => (
                     <option key={ch.Id} value={ch.Id}>
                       {ch.Name}
@@ -1323,12 +1368,12 @@ export function LiveTvPage() {
               <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-200">
                 <input
                   type="checkbox"
-                  aria-label="仅录制新集"
+                  aria-label={t('liveTvUi.recordNewOnlyAria')}
                   checked={newSeriesRecordNewOnly}
                   onChange={(e) => setNewSeriesRecordNewOnly(e.target.checked)}
                   className="h-3.5 w-3.5 accent-amber-500"
                 />
-                <span>仅录新集 (RecordNewOnly)</span>
+                <span>{t('liveTvUi.recordNewOnlyCheckbox')}</span>
               </label>
 
               <button
@@ -1341,7 +1386,7 @@ export function LiveTvPage() {
                 ) : (
                   <Plus className="h-3.5 w-3.5" />
                 )}
-                <span>添加追录</span>
+                <span>{t('liveTvUi.addSeriesTimerBtn')}</span>
               </button>
             </form>
           )}
@@ -1352,20 +1397,20 @@ export function LiveTvPage() {
             </div>
           ) : seriesTimersError ? (
             <QueryErrorState
-              title="无法加载系列追录计划"
+              title={t('liveTvUi.loadSeriesTimersError')}
               error={seriesTimersErr}
               onRetry={() => void refetchSeriesTimers()}
             />
           ) : seriesTimers.length === 0 ? (
             <div className="py-12 text-center text-xs text-zinc-500">
-              暂无系列追录规则，可在「直播频道」节目单点击「系列追录」或在上方添加
+              {t('liveTvUi.emptySeriesTimersHint')}
             </div>
           ) : (
             <div className="divide-y divide-white/6 rounded-xl border border-white/8 bg-black/20">
               {seriesTimers.map((st, idx) => {
                 const channelLabel = st.ChannelId
                   ? channels.find((c) => c.Id === st.ChannelId)?.Name || st.ChannelId
-                  : '任意频道'
+                  : t('liveTvUi.anyChannel')
                 return (
                   <div
                     key={st.Id || `${st.Name}-${idx}`}
@@ -1384,7 +1429,9 @@ export function LiveTvPage() {
                               : 'bg-white/10 text-zinc-300'
                           }`}
                         >
-                          {st.RecordNewOnly ? '仅录新集' : '包含重播'}
+                          {st.RecordNewOnly
+                            ? t('liveTvUi.newEpisodesOnlyBadge')
+                            : t('liveTvUi.includeRerunsBadge')}
                         </span>
                       </div>
                       {st.Overview && (
@@ -1407,7 +1454,7 @@ export function LiveTvPage() {
                         ) : (
                           <Trash2 className="h-3.5 w-3.5" />
                         )}
-                        <span>取消追录</span>
+                        <span>{t('liveTvUi.cancelSeriesTimerBtn')}</span>
                       </button>
                     )}
                   </div>
@@ -1426,13 +1473,15 @@ export function LiveTvPage() {
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/8 pb-3">
             <div className="flex items-center gap-2">
               <Link2 className="h-4 w-4 text-amber-400" />
-              <h2 className="text-sm font-semibold text-zinc-100">EPG 频道映射配置</h2>
+              <h2 className="text-sm font-semibold text-zinc-100">
+                {t('liveTvUi.epgMappingTitle')}
+              </h2>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
               {listingProviders.length > 0 && (
                 <select
-                  aria-label="选择节目单源"
+                  aria-label={t('liveTvUi.selectListingProviderAria')}
                   value={selectedMappingProviderId}
                   onChange={(e) => setSelectedMappingProviderId(e.target.value)}
                   className="rounded-xl border border-white/10 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
@@ -1450,7 +1499,7 @@ export function LiveTvPage() {
                 className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-xs text-zinc-300 hover:border-amber-400/40 hover:text-amber-300"
               >
                 <RefreshCw className="h-3 w-3" />
-                <span>刷新</span>
+                <span>{t('common.refresh')}</span>
               </button>
             </div>
           </div>
@@ -1461,7 +1510,7 @@ export function LiveTvPage() {
             </div>
           ) : mappingsError ? (
             <QueryErrorState
-              title="无法加载频道映射选项"
+              title={t('liveTvUi.loadMappingsError')}
               error={mappingsErr}
               onRetry={() => void refetchMappings()}
             />
@@ -1482,7 +1531,7 @@ export function LiveTvPage() {
               if (tunerList.length === 0) {
                 return (
                   <div className="py-12 text-center text-xs text-zinc-500">
-                    暂无可映射的调谐器频道，请先导入 M3U 直播源与 XMLTV 节目单
+                    {t('liveTvUi.emptyTunerChannelsForMapping')}
                   </div>
                 )
               }
@@ -1490,12 +1539,14 @@ export function LiveTvPage() {
               return (
                 <div className="divide-y divide-white/6 rounded-xl border border-white/8 bg-black/20">
                   {tunerList.map((tunerCh) => {
-                    const currentMapped =
-                      draftMappings[tunerCh.Id] ??
+                    const initialMapped =
                       existingMap.get(tunerCh.Id) ??
                       ('ProviderChannelId' in tunerCh && tunerCh.ProviderChannelId
                         ? tunerCh.ProviderChannelId
                         : '')
+                    const hasDraft = Object.prototype.hasOwnProperty.call(draftMappings, tunerCh.Id)
+                    const currentMapped = hasDraft ? draftMappings[tunerCh.Id] : initialMapped
+                    const isMappingDirty = currentMapped !== initialMapped
                     const isSaving = savingMappingChannelId === tunerCh.Id
                     return (
                       <div
@@ -1514,7 +1565,9 @@ export function LiveTvPage() {
                         <div className="flex flex-wrap items-center gap-2">
                           {providerChannelOptions.length > 0 ? (
                             <select
-                              aria-label={`${tunerCh.Name} EPG 频道映射`}
+                              aria-label={t('liveTvUi.channelEpgMappingAria', {
+                                name: tunerCh.Name,
+                              })}
                               value={currentMapped}
                               onChange={(e) =>
                                 setDraftMappings((prev) => ({
@@ -1524,7 +1577,7 @@ export function LiveTvPage() {
                               }
                               className="min-w-[200px] rounded-xl border border-white/10 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
                             >
-                              <option value="">-- 未绑定 EPG 频道 --</option>
+                              <option value="">{t('liveTvUi.unassignedEpgOption')}</option>
                               {providerChannelOptions.map((opt) => (
                                 <option key={opt.Id} value={opt.Id}>
                                   {opt.Name} ({opt.Id})
@@ -1534,7 +1587,9 @@ export function LiveTvPage() {
                           ) : (
                             <input
                               type="text"
-                              aria-label={`${tunerCh.Name} EPG 频道映射`}
+                              aria-label={t('liveTvUi.channelEpgMappingAria', {
+                                name: tunerCh.Name,
+                              })}
                               value={currentMapped}
                               onChange={(e) =>
                                 setDraftMappings((prev) => ({
@@ -1542,14 +1597,14 @@ export function LiveTvPage() {
                                   [tunerCh.Id]: e.target.value,
                                 }))
                               }
-                              placeholder="输入 XMLTV EPG 频道 ID..."
+                              placeholder={t('liveTvUi.xmltvChannelIdPlaceholder')}
                               className="min-w-[200px] rounded-xl border border-white/10 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/50"
                             />
                           )}
 
                           <button
                             type="button"
-                            disabled={!currentMapped || isSaving}
+                            disabled={!isMappingDirty || isSaving}
                             onClick={() =>
                               setChannelMappingMutation.mutate({
                                 providerId: selectedMappingProviderId,
@@ -1564,7 +1619,7 @@ export function LiveTvPage() {
                             ) : (
                               <Save className="h-3.5 w-3.5" />
                             )}
-                            <span>保存映射</span>
+                            <span>{t('liveTvUi.saveMappingBtn')}</span>
                           </button>
                         </div>
                       </div>
@@ -1619,7 +1674,7 @@ export function LiveTvPage() {
                 </div>
                 <button
                   type="button"
-                  aria-label="关闭录像播放器"
+                  aria-label={t('liveTvUi.closeRecordingPlayerAria')}
                   onClick={() => {
                     setPlayingRecording(null)
                     setRecordingPlaybackError(null)
@@ -1627,14 +1682,14 @@ export function LiveTvPage() {
                   className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1 text-[11px] font-medium text-zinc-300 transition-colors hover:bg-white/10 hover:text-white"
                 >
                   <X className="h-3.5 w-3.5" />
-                  <span>关闭</span>
+                  <span>{t('common.close')}</span>
                 </button>
               </div>
 
               <div className="aspect-video w-full bg-zinc-950">
                 <video
                   ref={recordingVideoRef}
-                  key={playingRecording.Id}
+                  key={`${playingRecording.Id}-${recordingFallbackDirect ? 'direct' : 'hls'}`}
                   data-testid="dvr-recording-video"
                   controls
                   playsInline
@@ -1654,11 +1709,9 @@ export function LiveTvPage() {
                         ? MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED
                         : MEDIA_ERR_SRC_NOT_SUPPORTED
                     if (errCode === srcNotSupported) {
-                      setRecordingPlaybackError(
-                        '当前浏览器不支持直接播放此录制格式（如 MKV/TS），请点击右侧按钮直接下载观看',
-                      )
+                      setRecordingPlaybackError(t('liveTvUi.errRecordingUnsupportedFormat'))
                     } else {
-                      setRecordingPlaybackError('录制视频加载失败，可尝试直接下载录制文件')
+                      setRecordingPlaybackError(t('liveTvUi.errRecordingLoadFailed'))
                     }
                   }}
                   className="h-full w-full bg-black object-contain"
@@ -1680,7 +1733,7 @@ export function LiveTvPage() {
                     className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-amber-400/40 bg-amber-500/20 px-3 py-1 text-[11px] font-semibold text-amber-100 transition-colors hover:bg-amber-500/30"
                   >
                     <Download className="h-3.5 w-3.5" />
-                    <span>直接下载录制文件</span>
+                    <span>{t('liveTvUi.downloadRecordingBtn')}</span>
                   </a>
                 </div>
               )}
@@ -1693,12 +1746,14 @@ export function LiveTvPage() {
             </div>
           ) : recordingsError ? (
             <QueryErrorState
-              title="无法加载已录节目"
+              title={t('liveTvUi.loadRecordingsError')}
               error={recordingsErr}
               onRetry={() => void refetchRecordings()}
             />
           ) : recordings.length === 0 ? (
-            <div className="py-12 text-center text-xs text-zinc-500">暂无已录制的电视节目</div>
+            <div className="py-12 text-center text-xs text-zinc-500">
+              {t('liveTvUi.emptyRecordings')}
+            </div>
           ) : (
             <div className="divide-y divide-white/6 rounded-xl border border-white/8 bg-black/20">
               {recordings.map((rec) => (
@@ -1737,6 +1792,7 @@ export function LiveTvPage() {
                       <button
                         type="button"
                         onClick={() => {
+                          pauseGlobalAudio()
                           setRecordingPlaybackError(null)
                           setRecordingFallbackDirect(false)
                           setPlayingRecording(rec)
@@ -1763,7 +1819,7 @@ export function LiveTvPage() {
                         ) : (
                           <Trash2 className="h-3.5 w-3.5" />
                         )}
-                        <span>删除录制</span>
+                        <span>{t('liveTvUi.deleteRecordingBtn')}</span>
                       </button>
                     )}
                   </div>

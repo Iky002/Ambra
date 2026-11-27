@@ -73,15 +73,16 @@ type Options struct {
 }
 
 type recordingEntry struct {
-	state     RecordingState
-	cmd       *exec.Cmd
-	proxy     *transcode.LoopbackStreamProxy
-	stdinMu   sync.Mutex
-	stdin     io.WriteCloser
-	cancel    context.CancelFunc
-	stopOnce  sync.Once
-	cancelled bool
-	done      chan struct{}
+	state           RecordingState
+	cmd             *exec.Cmd
+	proxy           *transcode.LoopbackStreamProxy
+	stdinMu         sync.Mutex
+	stdin           io.WriteCloser
+	cancel          context.CancelFunc
+	stopOnce        sync.Once
+	cancelled       bool
+	deadlineReached bool
+	done            chan struct{}
 }
 
 func (e *recordingEntry) closeStdin() {
@@ -119,6 +120,7 @@ type Recorder struct {
 	logger          *slog.Logger
 	argsBuilder     func(job RecordingJob, outFile string) []string
 	gracefulTimeout time.Duration
+	deadlinePad     time.Duration
 
 	mu         sync.RWMutex
 	entries    map[string]*recordingEntry
@@ -172,6 +174,7 @@ func NewRecorder(opts Options) *Recorder {
 		logger:          logger,
 		argsBuilder:     argsBuilder,
 		gracefulTimeout: defaultGracefulStopTimeout,
+		deadlinePad:     2 * time.Minute,
 		entries:         make(map[string]*recordingEntry),
 	}
 }
@@ -201,24 +204,19 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 		return nil, fmt.Errorf("dvr: create recordings dir: %w", err)
 	}
 
-	// Launch a loopback stream proxy for non-HLS continuous HTTP streams so FFmpeg never performs
-	// secondary DNS resolution on the remote host (HLS .m3u8 manifests use relative segment URLs
-	// and keep direct validated URL with -max_redirects 0).
-	var streamProxy *transcode.LoopbackStreamProxy
-	jobForArgs := job
-	lowerStream := strings.ToLower(strings.SplitN(job.StreamURL, "?", 2)[0])
-	if !strings.HasSuffix(lowerStream, ".m3u8") {
-		proxy, proxyErr := transcode.StartLoopbackStreamProxy(transcode.LoopbackProxyOptions{
-			TargetURL:        job.StreamURL,
-			AllowPrivateLAN:  !job.DenyPrivateLAN,
-			DisallowLoopback: true,
-		})
-		if proxyErr != nil {
-			return nil, fmt.Errorf("%w: invalid stream URL: %v", ErrInvalidJob, proxyErr)
-		}
-		streamProxy = proxy
-		jobForArgs.StreamURL = proxy.URL()
+	// Route ALL remote streams (including .m3u8 HLS manifests) through LoopbackStreamProxy
+	// so FFmpeg never performs secondary DNS resolution or fetches untrusted HLS sub-URIs directly (H-06).
+	proxy, proxyErr := transcode.StartLoopbackStreamProxy(transcode.LoopbackProxyOptions{
+		TargetURL:        job.StreamURL,
+		AllowPrivateLAN:  !job.DenyPrivateLAN,
+		DisallowLoopback: true,
+	})
+	if proxyErr != nil {
+		return nil, fmt.Errorf("%w: invalid stream URL: %v", ErrInvalidJob, proxyErr)
 	}
+	streamProxy := proxy
+	jobForArgs := job
+	jobForArgs.StreamURL = proxy.URL()
 
 	now := time.Now().UTC()
 	outFile := filepath.Join(r.recordingsDir, buildOutputFilename(job, now))
@@ -242,14 +240,14 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	var (
-		recCtx context.Context
-		cancel context.CancelFunc
-	)
+	recCtx, cancel := context.WithCancel(ctx)
+	var maxWallClock time.Duration
 	if job.Duration > 0 {
-		recCtx, cancel = context.WithTimeout(ctx, job.Duration+2*time.Minute)
-	} else {
-		recCtx, cancel = context.WithCancel(ctx)
+		pad := r.deadlinePad
+		if pad <= 0 {
+			pad = 2 * time.Minute
+		}
+		maxWallClock = job.Duration + pad
 	}
 	args := netutil.FilterFFmpegArgs(r.ffmpegPath, r.argsBuilder(jobForArgs, outFile))
 	cmd := exec.Command(r.ffmpegPath, args...)
@@ -297,18 +295,34 @@ func (r *Recorder) StartRecording(ctx context.Context, job RecordingJob) (*Recor
 	snapshot := entry.state
 	r.mu.Unlock()
 
-	go r.watchCancel(recCtx, entry)
+	go r.watchCancel(recCtx, entry, maxWallClock)
 	go r.waitRecording(recCtx, cmd, entry)
 
 	return &snapshot, nil
 }
 
-func (r *Recorder) watchCancel(recCtx context.Context, entry *recordingEntry) {
+func (r *Recorder) watchCancel(recCtx context.Context, entry *recordingEntry, maxWallClock time.Duration) {
 	defer r.wg.Done()
+	if maxWallClock <= 0 {
+		select {
+		case <-entry.done:
+			return
+		case <-recCtx.Done():
+			r.gracefulStop(entry)
+		}
+		return
+	}
+	timer := time.NewTimer(maxWallClock)
+	defer timer.Stop()
 	select {
 	case <-entry.done:
 		return
 	case <-recCtx.Done():
+		r.gracefulStop(entry)
+	case <-timer.C:
+		r.mu.Lock()
+		entry.deadlineReached = true
+		r.mu.Unlock()
 		r.gracefulStop(entry)
 	}
 }
@@ -344,6 +358,11 @@ func (r *Recorder) gracefulStop(entry *recordingEntry) {
 	})
 }
 
+func hasNonEmptyOutputFile(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && !fi.IsDir() && fi.Size() > 0
+}
+
 func (r *Recorder) waitRecording(recCtx context.Context, cmd *exec.Cmd, entry *recordingEntry) {
 	defer r.wg.Done()
 	defer entry.cancel()
@@ -355,15 +374,26 @@ func (r *Recorder) waitRecording(recCtx context.Context, cmd *exec.Cmd, entry *r
 
 	err := cmd.Wait()
 	endedAt := time.Now().UTC()
+	hasOutput := hasNonEmptyOutputFile(entry.state.OutputPath)
 
 	r.mu.Lock()
 	entry.state.EndedAt = endedAt
 	wasCancelled := entry.cancelled || recCtx.Err() != nil
+	wasDeadline := entry.deadlineReached && !wasCancelled
 	switch {
 	case wasCancelled:
 		entry.state.Status = StatusCancelled
 		if err != nil {
 			entry.state.Error = err.Error()
+		}
+	case wasDeadline && hasOutput:
+		entry.state.Status = StatusCompleted
+	case wasDeadline && !hasOutput:
+		entry.state.Status = StatusFailed
+		if err != nil {
+			entry.state.Error = err.Error()
+		} else {
+			entry.state.Error = "recording reached duration deadline with empty output"
 		}
 	case err != nil:
 		entry.state.Status = StatusFailed

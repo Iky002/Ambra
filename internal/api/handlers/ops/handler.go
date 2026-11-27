@@ -16,17 +16,20 @@ import (
 	"github.com/ambra-media/ambra/internal/api/httpx"
 	"github.com/ambra-media/ambra/internal/api/ws"
 	"github.com/ambra-media/ambra/internal/config"
+	"github.com/ambra-media/ambra/internal/core/auth"
+	"github.com/ambra-media/ambra/internal/core/session"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
 const (
-	stateConfigKey        = "ops:state"
-	systemExtraConfigKey  = "system:config_extra"
-	startupRateLimit      = 30
-	startupRateWindow     = time.Minute
-	startupRateMaxBuckets = 2048
+	stateConfigKey           = "ops:state"
+	systemExtraConfigKey     = "system:config_extra"
+	startupRateLimit         = 30
+	startupLoopbackRateLimit = 180
+	startupRateWindow        = time.Minute
+	startupRateMaxBuckets    = 2048
 )
 
 // AuthFuncs decouples route registration from the concrete middleware package.
@@ -67,14 +70,17 @@ type UIView struct {
 }
 
 type Handler struct {
-	store            *sqlite.Store
-	cfg              *config.Config
-	userRepo         *sqlite.UserRepo
-	bus              *eventbus.Bus
-	wsHub            *ws.Hub
-	httpClient       *http.Client
-	customHTTPClient bool
-	auth             AuthFuncs
+	store             *sqlite.Store
+	cfg               *config.Config
+	userRepo          *sqlite.UserRepo
+	bus               *eventbus.Bus
+	wsHub             *ws.Hub
+	authSvc           *auth.Service
+	sessionMgr        *session.Manager
+	itemAccessChecker func(ctx context.Context, user *sqlite.UserRecord, itemID string) bool
+	httpClient        *http.Client
+	customHTTPClient  bool
+	auth              AuthFuncs
 
 	backupMu      sync.Mutex
 	setupMu       sync.Mutex
@@ -143,6 +149,56 @@ func (h *Handler) getWSHub() *ws.Hub {
 	hub := h.wsHub
 	h.mu.RUnlock()
 	return hub
+}
+
+// SetAuthService attaches the AuthService for token revocation and cache invalidation on startup user updates.
+func (h *Handler) SetAuthService(authSvc *auth.Service) {
+	h.mu.Lock()
+	h.authSvc = authSvc
+	h.mu.Unlock()
+}
+
+func (h *Handler) getAuthService() *auth.Service {
+	h.mu.RLock()
+	svc := h.authSvc
+	h.mu.RUnlock()
+	return svc
+}
+
+// SetSessionManager attaches the SessionManager for session cleanup on startup user password updates.
+func (h *Handler) SetSessionManager(sm *session.Manager) {
+	h.mu.Lock()
+	h.sessionMgr = sm
+	h.mu.Unlock()
+}
+
+func (h *Handler) getSessionManager() *session.Manager {
+	h.mu.RLock()
+	sm := h.sessionMgr
+	h.mu.RUnlock()
+	return sm
+}
+
+// SetAuthDeps Convenience setter attaching both AuthService and SessionManager.
+func (h *Handler) SetAuthDeps(authSvc *auth.Service, sm *session.Manager) {
+	h.mu.Lock()
+	h.authSvc = authSvc
+	h.sessionMgr = sm
+	h.mu.Unlock()
+}
+
+// SetItemAccessChecker configures an optional RBAC and parental-control item access callback for Watch Parties.
+func (h *Handler) SetItemAccessChecker(fn func(ctx context.Context, user *sqlite.UserRecord, itemID string) bool) {
+	h.mu.Lock()
+	h.itemAccessChecker = fn
+	h.mu.Unlock()
+}
+
+func (h *Handler) getItemAccessChecker() func(ctx context.Context, user *sqlite.UserRecord, itemID string) bool {
+	h.mu.RLock()
+	fn := h.itemAccessChecker
+	h.mu.RUnlock()
+	return fn
 }
 
 // SetHTTPClient overrides the HTTP client used for webhook delivery (primarily for testing).
@@ -254,10 +310,11 @@ func (h *Handler) checkStartupIPRateLimit(ip string, now time.Time) bool {
 	if s == "" {
 		return true
 	}
+	limit := startupRateLimit
 	if addr, err := netip.ParseAddr(s); err == nil {
 		addr = addr.WithZone("").Unmap()
 		if addr.IsLoopback() {
-			return true
+			limit = startupLoopbackRateLimit
 		}
 		if addr.Is6() {
 			s = netip.PrefixFrom(addr, 64).Masked().String()
@@ -284,7 +341,7 @@ func (h *Handler) checkStartupIPRateLimit(ip string, now time.Time) bool {
 			h.startupRates[k] = kept
 		}
 	}
-	if len(h.startupRates[s]) >= startupRateLimit {
+	if len(h.startupRates[s]) >= limit {
 		return false
 	}
 	if _, ok := h.startupRates[s]; !ok && len(h.startupRates) >= startupRateMaxBuckets {

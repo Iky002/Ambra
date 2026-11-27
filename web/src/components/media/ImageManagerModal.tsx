@@ -11,6 +11,7 @@ import {
 } from 'lucide-react'
 import { api, getFallbackImageUrl, getImageUrl } from '../../api/client'
 import type { BaseItemDto } from '../../api/types'
+import { useI18n } from '../../i18n/I18nContext'
 import { AdminModal, FeedbackBanner } from '../../pages/admin/adminUtils'
 
 type ModalTab = 'current' | 'remote' | 'upload'
@@ -32,6 +33,7 @@ export function ImageManagerModal({
   onClose,
   onUpdated,
 }: ImageManagerModalProps) {
+  const { t } = useI18n()
   const queryClient = useQueryClient()
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const mountedRef = useRef(true)
@@ -101,16 +103,19 @@ export function ImageManagerModal({
       const lower = vars.type.toLowerCase()
       const label =
         lower === 'backdrop'
-          ? '剧照 (Backdrop)'
+          ? t('modal.images.typeBackdropParen')
           : lower === 'primary'
-            ? '海报 (Primary)'
+            ? t('modal.images.typePrimaryParen')
             : vars.type
-      const msg = `已删除 ${label}`
+      const msg = t('modal.images.deleteSuccess', { label })
       setFeedback({ type: 'success', message: msg })
       onUpdated?.(msg)
     },
     onError: (err) => {
-      setFeedback({ type: 'error', message: err instanceof Error ? err.message : '删除图片失败' })
+      setFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : t('modal.images.deleteError'),
+      })
     },
   })
 
@@ -119,12 +124,18 @@ export function ImageManagerModal({
       api.downloadRemoteImage(itemId, type, url),
     onSuccess: async (_, vars) => {
       await invalidateAll()
-      const msg = `已将候选图片设为当前${vars.type === 'Backdrop' ? '剧照' : '海报'}`
+      const msg =
+        vars.type === 'Backdrop'
+          ? t('modal.images.downloadSuccessBackdrop')
+          : t('modal.images.downloadSuccessPrimary')
       setFeedback({ type: 'success', message: msg })
       onUpdated?.(msg)
     },
     onError: (err) => {
-      setFeedback({ type: 'error', message: err instanceof Error ? err.message : '下载替换图片失败' })
+      setFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : t('modal.images.downloadError'),
+      })
     },
   })
 
@@ -140,12 +151,18 @@ export function ImageManagerModal({
     }) => api.uploadItemImage(itemId, type, base64, contentType),
     onSuccess: async (_, vars) => {
       await invalidateAll()
-      const msg = `已上传并替换${vars.type === 'Backdrop' ? '剧照' : '海报'}`
+      const msg =
+        vars.type === 'Backdrop'
+          ? t('modal.images.uploadSuccessBackdrop')
+          : t('modal.images.uploadSuccessPrimary')
       setFeedback({ type: 'success', message: msg })
       onUpdated?.(msg)
     },
     onError: (err) => {
-      setFeedback({ type: 'error', message: err instanceof Error ? err.message : '上传图片失败' })
+      setFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : t('modal.images.uploadError'),
+      })
     },
   })
 
@@ -155,23 +172,29 @@ export function ImageManagerModal({
     onSuccess: async (_, vars) => {
       await invalidateAll()
       setCustomUrl('')
-      const msg = `已通过 URL 替换${vars.type === 'Backdrop' ? '剧照' : '海报'}`
+      const msg =
+        vars.type === 'Backdrop'
+          ? t('modal.images.urlSuccessBackdrop')
+          : t('modal.images.urlSuccessPrimary')
       setFeedback({ type: 'success', message: msg })
       onUpdated?.(msg)
     },
     onError: (err) => {
-      setFeedback({ type: 'error', message: err instanceof Error ? err.message : 'URL 替换失败' })
+      setFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : t('modal.images.urlError'),
+      })
     },
   })
 
   const handleFile = (file?: File | null) => {
     if (!file) return
     if (!ALLOWED_IMAGE_MIME_TYPES.has((file.type || '').toLowerCase())) {
-      setFeedback({ type: 'error', message: '请选择有效的图片文件（JPG / PNG / WebP / GIF）' })
+      setFeedback({ type: 'error', message: t('modal.images.invalidFileType') })
       return
     }
     if (file.size > MAX_POSTER_UPLOAD_BYTES) {
-      setFeedback({ type: 'error', message: '图片文件过大，请选择不超过 15 MB 的图片' })
+      setFeedback({ type: 'error', message: t('modal.images.fileTooLarge') })
       return
     }
     activeReaderRef.current?.abort()
@@ -182,7 +205,7 @@ export function ImageManagerModal({
       activeReaderRef.current = null
       const result = typeof reader.result === 'string' ? reader.result : ''
       if (!result) {
-        setFeedback({ type: 'error', message: '读取本地图片失败' })
+        setFeedback({ type: 'error', message: t('modal.images.readFileError') })
         return
       }
       uploadMutation.mutate({
@@ -194,7 +217,7 @@ export function ImageManagerModal({
     reader.onerror = () => {
       if (!mountedRef.current || activeReaderRef.current !== reader) return
       activeReaderRef.current = null
-      setFeedback({ type: 'error', message: '读取本地图片失败' })
+      setFeedback({ type: 'error', message: t('modal.images.readFileError') })
     }
     reader.readAsDataURL(file)
   }
@@ -203,7 +226,7 @@ export function ImageManagerModal({
     e.preventDefault()
     const trimmed = customUrl.trim()
     if (!trimmed) {
-      setFeedback({ type: 'error', message: '请输入有效的图片 URL' })
+      setFeedback({ type: 'error', message: t('modal.images.invalidUrl') })
       return
     }
     urlMutation.mutate({ type: uploadType, url: trimmed })
@@ -212,8 +235,8 @@ export function ImageManagerModal({
   return (
     <AdminModal
       open={open}
-      title="图片与海报管理"
-      subtitle={item ? `${item.Name} · 管理海报（Primary）与剧照（Backdrop）` : undefined}
+      title={t('modal.images.title')}
+      subtitle={item ? t('modal.images.subtitle', { name: item.Name }) : undefined}
       maxWidthClass="max-w-4xl"
       onClose={onClose}
     >
@@ -221,9 +244,9 @@ export function ImageManagerModal({
         {/* Tab 切换栏 */}
         <div className="flex flex-wrap gap-2 border-b border-white/8 pb-3">
           {[
-            { id: 'current' as const, label: '当前图片', icon: ImageIcon },
-            { id: 'remote' as const, label: '远端选取（TMDB 候选）', icon: CloudDownload },
-            { id: 'upload' as const, label: '上传 / URL 替换', icon: Upload },
+            { id: 'current' as const, label: t('modal.images.tabCurrent'), icon: ImageIcon },
+            { id: 'remote' as const, label: t('modal.images.tabRemote'), icon: CloudDownload },
+            { id: 'upload' as const, label: t('modal.images.tabUpload'), icon: Upload },
           ].map((tab) => {
             const Icon = tab.icon
             const active = activeTab === tab.id
@@ -264,10 +287,8 @@ export function ImageManagerModal({
             ) : currentImages.length === 0 ? (
               <div className="rounded-2xl border border-dashed border-white/12 bg-white/[0.02] py-12 text-center">
                 <ImageIcon className="mx-auto h-8 w-8 text-zinc-600" />
-                <p className="mt-2 text-sm text-zinc-400">当前条目暂无海报或剧照图片</p>
-                <p className="mt-1 text-xs text-zinc-500">
-                  可切换至「远端选取」或「上传 / URL 替换」快速补充图片
-                </p>
+                <p className="mt-2 text-sm text-zinc-400">{t('modal.images.emptyCurrentTitle')}</p>
+                <p className="mt-1 text-xs text-zinc-500">{t('modal.images.emptyCurrentHint')}</p>
               </div>
             ) : (
               <div className="grid gap-4 sm:grid-cols-2">
@@ -291,9 +312,9 @@ export function ImageManagerModal({
                     isBackdrop ? 'Backdrop' : 'Primary',
                   )
                   const typeLabel = isBackdrop
-                    ? '剧照 · Backdrop'
+                    ? t('modal.images.badgeBackdrop')
                     : lowerType === 'primary'
-                      ? '海报 · Primary'
+                      ? t('modal.images.badgePrimary')
                       : rawType
                   return (
                     <div
@@ -325,7 +346,9 @@ export function ImageManagerModal({
                             {img.Filename || `${img.ImageType}.jpg`}
                           </p>
                           <p className="mt-0.5 text-[11px] text-zinc-500">
-                            {img.Width && img.Height ? `${img.Width} × ${img.Height}` : '已缓存'}
+                            {img.Width && img.Height
+                              ? `${img.Width} × ${img.Height}`
+                              : t('modal.images.cached')}
                           </p>
                         </div>
                         <button
@@ -340,7 +363,7 @@ export function ImageManagerModal({
                           className="inline-flex items-center gap-1.5 rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
                         >
                           <Trash2 className="h-3.5 w-3.5" />
-                          删除
+                          {t('modal.images.deleteBtn')}
                         </button>
                       </div>
                     </div>
@@ -356,23 +379,25 @@ export function ImageManagerModal({
           <div className="space-y-4">
             <div className="flex items-center justify-between gap-3">
               <div className="inline-flex rounded-xl border border-white/10 bg-zinc-950 p-1">
-                {(['Primary', 'Backdrop'] as const).map((t) => (
+                {(['Primary', 'Backdrop'] as const).map((kind) => (
                   <button
-                    key={t}
+                    key={kind}
                     type="button"
-                    onClick={() => setRemoteType(t)}
+                    onClick={() => setRemoteType(kind)}
                     className={`rounded-lg px-3.5 py-1.5 text-xs font-semibold transition-all ${
-                      remoteType === t
+                      remoteType === kind
                         ? 'bg-amber-500 text-zinc-950'
                         : 'text-zinc-400 hover:text-zinc-100'
                     }`}
                   >
-                    {t === 'Primary' ? '海报 (Primary)' : '剧照 (Backdrop)'}
+                    {kind === 'Primary'
+                      ? t('modal.images.typePrimaryParen')
+                      : t('modal.images.typeBackdropParen')}
                   </button>
                 ))}
               </div>
               <span className="text-xs text-zinc-500">
-                共 {remoteResult?.TotalRecordCount ?? 0} 张候选图片
+                {t('modal.images.remoteCount', { count: remoteResult?.TotalRecordCount ?? 0 })}
               </span>
             </div>
 
@@ -382,7 +407,7 @@ export function ImageManagerModal({
               </div>
             ) : !remoteResult?.Images?.length ? (
               <div className="rounded-2xl border border-dashed border-white/12 bg-white/[0.02] py-12 text-center text-sm text-zinc-400">
-                未检索到远端候选图片
+                {t('modal.images.emptyRemote')}
               </div>
             ) : (
               <div
@@ -404,7 +429,7 @@ export function ImageManagerModal({
                     >
                       <img
                         src={img.ThumbnailUrl || img.Url}
-                        alt={`候选图片 ${idx + 1}`}
+                        alt={t('modal.images.candidateAlt', { index: idx + 1 })}
                         loading="lazy"
                         className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
                       />
@@ -435,7 +460,7 @@ export function ImageManagerModal({
                         ) : (
                           <Check className="h-3.5 w-3.5" />
                         )}
-                        <span>设为当前</span>
+                        <span>{t('modal.images.setAsCurrent')}</span>
                       </button>
                     </div>
                   </div>
@@ -449,20 +474,24 @@ export function ImageManagerModal({
         {activeTab === 'upload' && (
           <div className="space-y-5">
             <div className="flex items-center gap-3">
-              <span className="text-xs font-medium text-zinc-400">目标图片类型：</span>
+              <span className="text-xs font-medium text-zinc-400">
+                {t('modal.images.targetTypeLabel')}
+              </span>
               <div className="inline-flex rounded-xl border border-white/10 bg-zinc-950 p-1">
-                {(['Primary', 'Backdrop'] as const).map((t) => (
+                {(['Primary', 'Backdrop'] as const).map((kind) => (
                   <button
-                    key={t}
+                    key={kind}
                     type="button"
-                    onClick={() => setUploadType(t)}
+                    onClick={() => setUploadType(kind)}
                     className={`rounded-lg px-3.5 py-1.5 text-xs font-semibold transition-all ${
-                      uploadType === t
+                      uploadType === kind
                         ? 'bg-amber-500 text-zinc-950'
                         : 'text-zinc-400 hover:text-zinc-100'
                     }`}
                   >
-                    {t === 'Primary' ? '海报 (Primary)' : '剧照 (Backdrop)'}
+                    {kind === 'Primary'
+                      ? t('modal.images.typePrimaryParen')
+                      : t('modal.images.typeBackdropParen')}
                   </button>
                 ))}
               </div>
@@ -503,11 +532,12 @@ export function ImageManagerModal({
                 <Upload className="h-8 w-8 text-amber-400" />
               )}
               <p className="mt-3 text-sm font-medium text-zinc-100">
-                拖拽本地图片到此处，或点击选择文件
+                {t('modal.images.dropzoneTitle')}
               </p>
               <p className="mt-1 text-xs text-zinc-500">
-                支持 JPG / PNG / WebP / GIF（≤ 15MB），选择后立即上传替换当前
-                {uploadType === 'Backdrop' ? '剧照' : '海报'}
+                {uploadType === 'Backdrop'
+                  ? t('modal.images.dropzoneHintBackdrop')
+                  : t('modal.images.dropzoneHintPrimary')}
               </p>
             </div>
 
@@ -518,7 +548,7 @@ export function ImageManagerModal({
             >
               <label className="flex items-center gap-1.5 text-xs font-medium text-zinc-300">
                 <Link2 className="h-3.5 w-3.5 text-amber-400" />
-                通过图片 URL 一键替换
+                {t('modal.images.urlFormLabel')}
               </label>
               <div className="flex flex-col gap-2 sm:flex-row">
                 <input
@@ -534,7 +564,7 @@ export function ImageManagerModal({
                   className="inline-flex items-center justify-center gap-2 rounded-xl bg-amber-500 px-5 py-2 text-sm font-semibold text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-60"
                 >
                   {urlMutation.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
-                  <span>URL 替换</span>
+                  <span>{t('modal.images.urlSubmitBtn')}</span>
                 </button>
               </div>
             </form>

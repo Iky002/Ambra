@@ -410,14 +410,28 @@ func normalizeAuthByIDRateKey(ip, uid string) string {
 
 func (h *Handler) isAuthByIDRateLimited(ip, uid string, now time.Time) bool {
 	ip = strings.TrimSpace(ip)
-	if ip == "" || isLoopbackIPString(ip) {
+	if ip == "" {
 		return false
 	}
+	loopback := isLoopbackIPString(ip)
 	compKey := normalizeAuthByIDRateKey(ip, uid)
 	ipKey := normalizeAuthByIDRateKey(ip, "")
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if loopback {
+		if h.loopbackAuthByIDRates == nil {
+			return false
+		}
+		pruneRateBucketLocked(h.loopbackAuthByIDRates, now.Add(-authByIDLoopbackRateWindow), maxRateLimitBuckets)
+		if len(h.loopbackAuthByIDRates[compKey]) >= authByIDLoopbackRateLimit {
+			return true
+		}
+		if uid != "" && len(h.loopbackAuthByIDRates[ipKey]) >= authByIDLoopbackRateLimit {
+			return true
+		}
+		return false
+	}
 	if h.authByIDRates == nil {
 		return false
 	}
@@ -433,13 +447,22 @@ func (h *Handler) isAuthByIDRateLimited(ip, uid string, now time.Time) bool {
 
 func (h *Handler) recordAuthByIDFailure(ip, uid string, now time.Time) {
 	ip = strings.TrimSpace(ip)
-	if ip == "" || isLoopbackIPString(ip) {
+	if ip == "" {
 		return
 	}
+	loopback := isLoopbackIPString(ip)
 	compKey := normalizeAuthByIDRateKey(ip, uid)
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if loopback {
+		if h.loopbackAuthByIDRates == nil {
+			h.loopbackAuthByIDRates = make(map[string][]time.Time)
+		}
+		pruneRateBucketLocked(h.loopbackAuthByIDRates, now.Add(-authByIDLoopbackRateWindow), maxRateLimitBuckets)
+		appendRateBucketLocked(h.loopbackAuthByIDRates, compKey, now, maxRateLimitBuckets)
+		return
+	}
 	if h.authByIDRates == nil {
 		h.authByIDRates = make(map[string][]time.Time)
 	}
@@ -459,6 +482,11 @@ func (h *Handler) isGlobalRemoteAccessEnabled() bool {
 
 func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "private, no-store")
+	isLocal := netutil.IsLocalOrLANRequest(r)
+	if !isLocal && !h.isGlobalRemoteAccessEnabled() {
+		writeJSONError(w, r, http.StatusForbidden, "Remote access is disabled on this server")
+		return
+	}
 	now := time.Now().UTC()
 	ip := netutil.ClientIP(r)
 	uid := h.resolveUserID(r, "Id")
@@ -484,54 +512,40 @@ func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 	}
 	u, err := h.userRepo.GetUserByID(r.Context(), uid)
 	if err != nil {
+		auth.DummyPasswordWork(body.Pw)
 		h.recordAuthByIDFailure(ip, uid, now)
 		writeJSONError(w, r, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
 
-	globalRemoteAllowed := h.isGlobalRemoteAccessEnabled()
+	pw := body.Pw
+	legacySHA1 := body.Password
+	if pw == "" && body.Password != "" && u.PasswordHash != "" {
+		pw = body.Password
+	}
+
+	// Security (M-02): When per-user remote access is disabled on a remote request,
+	// perform uniform Argon2id work, record login failure, and return 401 (never 403)
+	// so attackers cannot enumerate local users or probe passwords remotely.
+	if !isLocal && !u.Policy.EnableRemoteAccess {
+		if u.PasswordHash == "" {
+			auth.DummyPasswordWork(pw)
+		} else {
+			_, _ = auth.VerifyPassword(pw, u.PasswordHash)
+		}
+		h.recordAuthByIDFailure(ip, uid, now)
+		_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
+			Name:     u.Name + " failed to log in (remote access disabled)",
+			Type:     "AuthenticationFailed",
+			UserID:   u.ID,
+			Severity: "Warning",
+		})
+		writeJSONError(w, r, http.StatusUnauthorized, "invalid username or password")
+		return
+	}
+
 	client := middleware.ExtractClientInfo(r)
 	if h.authSvc != nil {
-		pw := body.Pw
-		legacySHA1 := body.Password
-		if pw == "" && body.Password != "" && u.PasswordHash != "" {
-			pw = body.Password
-		}
-		if (!globalRemoteAllowed || !u.Policy.EnableRemoteAccess) && !netutil.IsLocalOrLANRequest(r) {
-			if !verifyUserPassword(u, pw, legacySHA1) {
-				h.recordAuthByIDFailure(ip, uid, now)
-				_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
-					Name:     u.Name + " failed to log in",
-					Type:     "AuthenticationFailed",
-					UserID:   u.ID,
-					Severity: "Warning",
-				})
-				writeJSONError(w, r, http.StatusUnauthorized, "invalid username or password")
-				return
-			}
-			if u.IsDisabled || u.Policy.IsDisabled {
-				_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
-					Name:     u.Name + " failed to log in (account disabled)",
-					Type:     "AuthenticationFailed",
-					UserID:   u.ID,
-					Severity: "Warning",
-				})
-				writeJSONError(w, r, http.StatusForbidden, "user is disabled")
-				return
-			}
-			_ = h.userRepo.CreateActivityLog(r.Context(), &sqlite.ActivityLogRecord{
-				Name:     u.Name + " failed to log in (remote access disabled)",
-				Type:     "AuthenticationFailed",
-				UserID:   u.ID,
-				Severity: "Warning",
-			})
-			if !globalRemoteAllowed {
-				writeJSONError(w, r, http.StatusForbidden, "Remote access is disabled on this server")
-			} else {
-				writeJSONError(w, r, http.StatusForbidden, "Remote access is disabled for this user")
-			}
-			return
-		}
 		res, authErr := h.authSvc.AuthenticateByName(r.Context(), u.Name, pw, legacySHA1, client)
 		if authErr != nil {
 			switch {
@@ -574,11 +588,6 @@ func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pw := body.Pw
-	legacySHA1 := body.Password
-	if pw == "" && body.Password != "" && u.PasswordHash != "" {
-		pw = body.Password
-	}
 	if !verifyUserPassword(u, pw, legacySHA1) {
 		h.recordAuthByIDFailure(ip, uid, now)
 		writeJSONError(w, r, http.StatusUnauthorized, "invalid username or password")
@@ -586,14 +595,6 @@ func (h *Handler) authenticateUserByID(w http.ResponseWriter, r *http.Request) {
 	}
 	if u.IsDisabled || u.Policy.IsDisabled {
 		writeJSONError(w, r, http.StatusForbidden, "user is disabled")
-		return
-	}
-	if (!globalRemoteAllowed || !u.Policy.EnableRemoteAccess) && !netutil.IsLocalOrLANRequest(r) {
-		if !globalRemoteAllowed {
-			writeJSONError(w, r, http.StatusForbidden, "Remote access is disabled on this server")
-		} else {
-			writeJSONError(w, r, http.StatusForbidden, "Remote access is disabled for this user")
-		}
 		return
 	}
 
@@ -1448,42 +1449,89 @@ func (h *Handler) moveUserHomeSection(w http.ResponseWriter, r *http.Request) {
 	httpx.NoContent(w)
 }
 
-func (h *Handler) userPolicyForRequest(r *http.Request, targetUID string) (allowedLibs []string, maxRating *int, blockedTags []string) {
+func (h *Handler) fullUserPolicyForUser(r *http.Request, uid string) ([]string, dto.UserPolicy) {
 	if h.userRepo == nil {
-		return nil, nil, nil
+		return nil, dto.UserPolicy{IsAdministrator: true}
 	}
-	uid := guid.Normalize(targetUID)
-	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
-		if ac.IsAdmin() {
-			if uid == "" || uid == guid.Normalize(ac.UserID()) {
-				return nil, nil, nil
-			}
-		} else {
-			uid = guid.Normalize(ac.UserID())
-		}
+	normUID := guid.Normalize(uid)
+	if normUID == "" {
+		return []string{}, dto.UserPolicy{}
 	}
-	if uid == "" {
-		return []string{}, nil, nil
-	}
-	u, err := h.userRepo.GetUserByID(r.Context(), uid)
+	u, err := h.userRepo.GetUserByID(r.Context(), normUID)
 	if err != nil || u == nil {
-		return []string{}, nil, nil
+		return []string{}, dto.UserPolicy{}
 	}
 	if u.IsAdmin || u.Policy.IsAdministrator {
-		return nil, nil, nil
+		pol := u.Policy
+		pol.IsAdministrator = true
+		return nil, pol
 	}
-	if !u.Policy.EnableAllFolders {
-		allowedLibs = make([]string, 0, len(u.Policy.EnabledFolders))
-		for _, fid := range u.Policy.EnabledFolders {
+	pol := u.Policy
+	pol.IsAdministrator = false
+	var allowedLibs []string
+	if h.libRepo != nil {
+		allowedLibs = h.libRepo.AllowedLibraryIDsForPolicy(r.Context(), pol)
+	} else if !pol.EnableAllFolders {
+		allowedLibs = make([]string, 0, len(pol.EnabledFolders))
+		for _, fid := range pol.EnabledFolders {
 			if norm := guid.Normalize(fid); norm != "" {
 				allowedLibs = append(allowedLibs, norm)
 			}
 		}
 	}
-	return allowedLibs, u.Policy.MaxParentalRating, u.Policy.BlockedTags
+	return allowedLibs, pol
 }
 
-func (h *Handler) preferredGenresForUser(ctx context.Context, uid string, allowedLibs []string, maxRating *int, blockedTags []string) []string {
+func (h *Handler) fullUserPolicyForRequest(r *http.Request, targetUID string) ([]string, dto.UserPolicy) {
+	if h.userRepo == nil {
+		return nil, dto.UserPolicy{IsAdministrator: true}
+	}
+	uid := guid.Normalize(targetUID)
+	if ac, ok := middleware.AuthFromContext(r.Context()); ok && ac != nil && (ac.User != nil || ac.IsAPIKey) {
+		if ac.IsAdmin() {
+			if uid == "" || uid == guid.Normalize(ac.UserID()) {
+				return nil, dto.UserPolicy{IsAdministrator: true}
+			}
+		} else {
+			uid = guid.Normalize(ac.UserID())
+		}
+	}
+	return h.fullUserPolicyForUser(r, uid)
+}
+
+func (h *Handler) userPolicyForRequest(r *http.Request, targetUID string) (allowedLibs []string, maxRating *int, blockedTags []string) {
+	libs, pol := h.fullUserPolicyForRequest(r, targetUID)
+	if pol.IsAdministrator {
+		return nil, nil, nil
+	}
+	return libs, pol.MaxParentalRating, pol.BlockedTags
+}
+
+func (h *Handler) postFilterItemsByPolicy(ctx context.Context, items []dto.BaseItemDto, pol dto.UserPolicy) ([]dto.BaseItemDto, int) {
+	if h.libRepo == nil || pol.IsAdministrator || len(items) == 0 {
+		return items, 0
+	}
+	if len(pol.BlockUnratedItems) == 0 && len(pol.AllowedTags) == 0 {
+		return items, 0
+	}
+	filtered := make([]dto.BaseItemDto, 0, len(items))
+	removed := 0
+	for _, it := range items {
+		rec, err := h.libRepo.GetItemRecordByID(ctx, it.Id)
+		if err != nil || rec == nil {
+			removed++
+			continue
+		}
+		if blocked, bErr := h.libRepo.IsItemBlockedByPolicy(ctx, rec, pol); bErr != nil || blocked {
+			removed++
+			continue
+		}
+		filtered = append(filtered, it)
+	}
+	return filtered, removed
+}
+
+func (h *Handler) preferredGenresForUser(ctx context.Context, uid string, allowedLibs []string, pol dto.UserPolicy) []string {
 	if h.libRepo == nil || uid == "" {
 		return nil
 	}
@@ -1504,8 +1552,10 @@ func (h *Handler) preferredGenresForUser(ctx context.Context, uid string, allowe
 		UserID:            uid,
 		Recursive:         true,
 		AllowedLibraryIDs: allowedLibs,
-		MaxParentalRating: maxRating,
-		BlockedTags:       blockedTags,
+		MaxParentalRating: pol.MaxParentalRating,
+		BlockedTags:       pol.BlockedTags,
+		BlockUnratedItems: pol.BlockUnratedItems,
+		AllowedTags:       pol.AllowedTags,
 		IsFavorite:        &trueVal,
 		Fields:            []string{"Genres"},
 		Limit:             20,
@@ -1517,8 +1567,10 @@ func (h *Handler) preferredGenresForUser(ctx context.Context, uid string, allowe
 		UserID:            uid,
 		Recursive:         true,
 		AllowedLibraryIDs: allowedLibs,
-		MaxParentalRating: maxRating,
-		BlockedTags:       blockedTags,
+		MaxParentalRating: pol.MaxParentalRating,
+		BlockedTags:       pol.BlockedTags,
+		BlockUnratedItems: pol.BlockUnratedItems,
+		AllowedTags:       pol.AllowedTags,
 		IsPlayed:          &trueVal,
 		SortBy:            []string{"DatePlayed"},
 		SortOrder:         "Descending",
@@ -1657,7 +1709,7 @@ func (h *Handler) getUserSectionItems(w http.ResponseWriter, r *http.Request) {
 		httpx.JSON(w, http.StatusOK, dto.QueryResult[dto.BaseItemDto]{Items: []dto.BaseItemDto{}, TotalRecordCount: 0})
 		return
 	}
-	allowedLibs, maxRating, blockedTags := h.userPolicyForRequest(r, uid)
+	allowedLibs, pol := h.fullUserPolicyForRequest(r, uid)
 	hiddenPlaylists := h.hiddenPrivatePlaylistIDs(r)
 	sectionID := strings.ToLower(strings.TrimSpace(chi.URLParam(r, "SectionId")))
 	parentID := guid.Normalize(q.Get("ParentId"))
@@ -1671,9 +1723,9 @@ func (h *Handler) getUserSectionItems(w http.ResponseWriter, r *http.Request) {
 	)
 	switch sectionID {
 	case "resume":
-		items, total, err = h.libRepo.GetResumeItemsWithPolicy(
+		items, total, err = h.libRepo.GetResumeItemsWithUserPolicy(
 			r.Context(), h.serverID(), uid, parentID, includeTypes, startIndex, limit, fields,
-			allowedLibs, maxRating, blockedTags,
+			allowedLibs, pol,
 		)
 	case "latestmedia", "latest":
 		items, total, err = h.libRepo.QueryItems(r.Context(), sqlite.ItemFilter{
@@ -1684,8 +1736,10 @@ func (h *Handler) getUserSectionItems(w http.ResponseWriter, r *http.Request) {
 			IncludeItemTypes:  includeTypes,
 			ExcludeItemIDs:    hiddenPlaylists,
 			AllowedLibraryIDs: allowedLibs,
-			MaxParentalRating: maxRating,
-			BlockedTags:       blockedTags,
+			MaxParentalRating: pol.MaxParentalRating,
+			BlockedTags:       pol.BlockedTags,
+			BlockUnratedItems: pol.BlockUnratedItems,
+			AllowedTags:       pol.AllowedTags,
 			Fields:            fields,
 			SortBy:            []string{"DateCreated"},
 			SortOrder:         "Descending",
@@ -1702,8 +1756,10 @@ func (h *Handler) getUserSectionItems(w http.ResponseWriter, r *http.Request) {
 			IncludeItemTypes:  includeTypes,
 			ExcludeItemIDs:    hiddenPlaylists,
 			AllowedLibraryIDs: allowedLibs,
-			MaxParentalRating: maxRating,
-			BlockedTags:       blockedTags,
+			MaxParentalRating: pol.MaxParentalRating,
+			BlockedTags:       pol.BlockedTags,
+			BlockUnratedItems: pol.BlockUnratedItems,
+			AllowedTags:       pol.AllowedTags,
 			IsFavorite:        &fav,
 			Fields:            fields,
 			StartIndex:        startIndex,
@@ -1712,11 +1768,19 @@ func (h *Handler) getUserSectionItems(w http.ResponseWriter, r *http.Request) {
 	case "nextup":
 		seriesID := guid.Normalize(q.Get("SeriesId"))
 		var allNextUp []dto.BaseItemDto
-		allNextUp, total, err = h.libRepo.GetNextUpEpisodesWithPolicy(
+		allNextUp, total, err = h.libRepo.GetNextUpEpisodesWithUserPolicy(
 			r.Context(), h.serverID(), uid, seriesID, startIndex+limit, fields,
-			allowedLibs, maxRating, blockedTags,
+			allowedLibs, pol,
 		)
 		if err == nil {
+			var policyRemoved int
+			allNextUp, policyRemoved = h.postFilterItemsByPolicy(r.Context(), allNextUp, pol)
+			if policyRemoved > 0 {
+				total -= policyRemoved
+				if total < 0 {
+					total = 0
+				}
+			}
 			if startIndex >= len(allNextUp) {
 				items = []dto.BaseItemDto{}
 			} else {
@@ -1736,8 +1800,10 @@ func (h *Handler) getUserSectionItems(w http.ResponseWriter, r *http.Request) {
 			IncludeItemTypes:  includeTypes,
 			ExcludeItemIDs:    hiddenPlaylists,
 			AllowedLibraryIDs: allowedLibs,
-			MaxParentalRating: maxRating,
-			BlockedTags:       blockedTags,
+			MaxParentalRating: pol.MaxParentalRating,
+			BlockedTags:       pol.BlockedTags,
+			BlockUnratedItems: pol.BlockUnratedItems,
+			AllowedTags:       pol.AllowedTags,
 			Fields:            fields,
 			StartIndex:        startIndex,
 			Limit:             limit,
@@ -1749,6 +1815,16 @@ func (h *Handler) getUserSectionItems(w http.ResponseWriter, r *http.Request) {
 	}
 	if items == nil {
 		items = []dto.BaseItemDto{}
+	}
+	if sectionID != "nextup" {
+		var policyRemoved int
+		items, policyRemoved = h.postFilterItemsByPolicy(r.Context(), items, pol)
+		if policyRemoved > 0 {
+			total -= policyRemoved
+			if total < 0 {
+				total = 0
+			}
+		}
 	}
 	var removed int
 	items, removed = h.filterVisiblePlaylists(r, items)
@@ -1790,11 +1866,11 @@ func (h *Handler) getUserSuggestions(w http.ResponseWriter, r *http.Request) {
 		limit = 500
 	}
 	itemTypes := q.List("Type")
-	allowedLibs, maxRating, blockedTags := h.userPolicyForRequest(r, uid)
+	allowedLibs, pol := h.fullUserPolicyForRequest(r, uid)
 	hiddenPlaylists := h.hiddenPrivatePlaylistIDs(r)
 	unplayed := true
 
-	preferredGenres := h.preferredGenresForUser(r.Context(), uid, allowedLibs, maxRating, blockedTags)
+	preferredGenres := h.preferredGenresForUser(r.Context(), uid, allowedLibs, pol)
 	if len(preferredGenres) > 0 {
 		fetchLimit := startIndex + limit
 		matched, _, err := h.libRepo.QueryItems(r.Context(), sqlite.ItemFilter{
@@ -1804,8 +1880,10 @@ func (h *Handler) getUserSuggestions(w http.ResponseWriter, r *http.Request) {
 			IncludeItemTypes:  itemTypes,
 			ExcludeItemIDs:    hiddenPlaylists,
 			AllowedLibraryIDs: allowedLibs,
-			MaxParentalRating: maxRating,
-			BlockedTags:       blockedTags,
+			MaxParentalRating: pol.MaxParentalRating,
+			BlockedTags:       pol.BlockedTags,
+			BlockUnratedItems: pol.BlockUnratedItems,
+			AllowedTags:       pol.AllowedTags,
 			Genres:            preferredGenres,
 			IsUnplayed:        &unplayed,
 			SortBy:            []string{"CommunityRating", "DateCreated"},
@@ -1830,8 +1908,10 @@ func (h *Handler) getUserSuggestions(w http.ResponseWriter, r *http.Request) {
 				IncludeItemTypes:  itemTypes,
 				ExcludeItemIDs:    hiddenPlaylists,
 				AllowedLibraryIDs: allowedLibs,
-				MaxParentalRating: maxRating,
-				BlockedTags:       blockedTags,
+				MaxParentalRating: pol.MaxParentalRating,
+				BlockedTags:       pol.BlockedTags,
+				BlockUnratedItems: pol.BlockUnratedItems,
+				AllowedTags:       pol.AllowedTags,
 				IsUnplayed:        &unplayed,
 				SortBy:            []string{"CommunityRating", "DateCreated"},
 				SortOrder:         "Descending",
@@ -1846,6 +1926,7 @@ func (h *Handler) getUserSuggestions(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		merged, _ = h.postFilterItemsByPolicy(r.Context(), merged, pol)
 		merged, _ = h.filterVisiblePlaylists(r, merged)
 		total := len(merged)
 		if startIndex > total {
@@ -1870,8 +1951,10 @@ func (h *Handler) getUserSuggestions(w http.ResponseWriter, r *http.Request) {
 		IncludeItemTypes:  itemTypes,
 		ExcludeItemIDs:    hiddenPlaylists,
 		AllowedLibraryIDs: allowedLibs,
-		MaxParentalRating: maxRating,
-		BlockedTags:       blockedTags,
+		MaxParentalRating: pol.MaxParentalRating,
+		BlockedTags:       pol.BlockedTags,
+		BlockUnratedItems: pol.BlockUnratedItems,
+		AllowedTags:       pol.AllowedTags,
 		IsUnplayed:        &unplayed,
 		SortBy:            []string{"CommunityRating", "DateCreated"},
 		SortOrder:         "Descending",
@@ -1890,8 +1973,10 @@ func (h *Handler) getUserSuggestions(w http.ResponseWriter, r *http.Request) {
 			IncludeItemTypes:  itemTypes,
 			ExcludeItemIDs:    hiddenPlaylists,
 			AllowedLibraryIDs: allowedLibs,
-			MaxParentalRating: maxRating,
-			BlockedTags:       blockedTags,
+			MaxParentalRating: pol.MaxParentalRating,
+			BlockedTags:       pol.BlockedTags,
+			BlockUnratedItems: pol.BlockUnratedItems,
+			AllowedTags:       pol.AllowedTags,
 			SortBy:            []string{"CommunityRating", "DateCreated"},
 			SortOrder:         "Descending",
 			StartIndex:        startIndex,
@@ -1904,6 +1989,14 @@ func (h *Handler) getUserSuggestions(w http.ResponseWriter, r *http.Request) {
 	}
 	if items == nil {
 		items = []dto.BaseItemDto{}
+	}
+	var policyRemoved int
+	items, policyRemoved = h.postFilterItemsByPolicy(r.Context(), items, pol)
+	if policyRemoved > 0 {
+		total -= policyRemoved
+		if total < 0 {
+			total = 0
+		}
 	}
 	var removed int
 	items, removed = h.filterVisiblePlaylists(r, items)
@@ -1994,11 +2087,19 @@ func (h *Handler) allowedLibrariesForUser(ctx context.Context, userID string) []
 	if err != nil || u == nil {
 		return []string{}
 	}
-	if u.IsAdmin || u.Policy.IsAdministrator || u.Policy.EnableAllFolders {
+	if u.IsAdmin || u.Policy.IsAdministrator {
 		return nil
 	}
-	allowed := make([]string, 0, len(u.Policy.EnabledFolders))
-	for _, fid := range u.Policy.EnabledFolders {
+	pol := u.Policy
+	pol.IsAdministrator = false
+	if h.libRepo != nil {
+		return h.libRepo.AllowedLibraryIDsForPolicy(ctx, pol)
+	}
+	if pol.EnableAllFolders {
+		return nil
+	}
+	allowed := make([]string, 0, len(pol.EnabledFolders))
+	for _, fid := range pol.EnabledFolders {
 		if norm := guid.Normalize(fid); norm != "" {
 			allowed = append(allowed, norm)
 		}
@@ -2030,15 +2131,18 @@ func (h *Handler) canAccessItem(r *http.Request, targetUID, itemID string) bool 
 	if err != nil || rec == nil {
 		return false
 	}
-	allowedLibs, maxRating, blockedTags := h.userPolicyForRequest(r, targetUID)
+	allowedLibs, pol := h.fullUserPolicyForRequest(r, targetUID)
+	if pol.IsAdministrator {
+		return true
+	}
 	if strings.EqualFold(rec.Type, "Playlist") {
 		if !h.canViewPlaylist(r, rec.ID, rec.ParentID) {
 			return false
 		}
-	} else if !isLibraryAllowed(rec.LibraryID, allowedLibs) {
+	} else if !strings.EqualFold(rec.Type, "BoxSet") && !strings.EqualFold(rec.LibraryID, "collections") && !isLibraryAllowed(rec.LibraryID, allowedLibs) {
 		return false
 	}
-	if blocked, bErr := h.libRepo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags); bErr != nil || blocked {
+	if blocked, bErr := h.libRepo.IsItemBlockedByPolicy(r.Context(), rec, pol); bErr != nil || blocked {
 		return false
 	}
 	return true
@@ -2065,19 +2169,21 @@ func (h *Handler) serveUserItemExtras(w http.ResponseWriter, r *http.Request, ex
 		httpx.Error(w, http.StatusInternalServerError, "failed to load item")
 		return
 	}
-	allowedLibs, maxRating, blockedTags := h.userPolicyForRequest(r, uid)
-	if strings.EqualFold(rec.Type, "Playlist") {
-		if !h.canViewPlaylist(r, rec.ID, rec.ParentID) {
+	allowedLibs, pol := h.fullUserPolicyForRequest(r, uid)
+	if !pol.IsAdministrator {
+		if strings.EqualFold(rec.Type, "Playlist") {
+			if !h.canViewPlaylist(r, rec.ID, rec.ParentID) {
+				writeJSONError(w, r, http.StatusForbidden, "access denied")
+				return
+			}
+		} else if !strings.EqualFold(rec.Type, "BoxSet") && !strings.EqualFold(rec.LibraryID, "collections") && !isLibraryAllowed(rec.LibraryID, allowedLibs) {
 			writeJSONError(w, r, http.StatusForbidden, "access denied")
 			return
 		}
-	} else if !isLibraryAllowed(rec.LibraryID, allowedLibs) {
-		writeJSONError(w, r, http.StatusForbidden, "access denied")
-		return
-	}
-	if blocked, bErr := h.libRepo.IsItemBlockedByParentalPolicy(r.Context(), rec, maxRating, blockedTags); bErr != nil || blocked {
-		writeJSONError(w, r, http.StatusForbidden, "access denied")
-		return
+		if blocked, bErr := h.libRepo.IsItemBlockedByPolicy(r.Context(), rec, pol); bErr != nil || blocked {
+			writeJSONError(w, r, http.StatusForbidden, "access denied")
+			return
+		}
 	}
 	items, err := h.libRepo.GetItemExtras(r.Context(), h.serverID(), uid, itemID, extraTypes)
 	if err != nil {
@@ -2085,14 +2191,18 @@ func (h *Handler) serveUserItemExtras(w http.ResponseWriter, r *http.Request, ex
 		httpx.Error(w, http.StatusInternalServerError, "failed to load item extras")
 		return
 	}
-	if (maxRating != nil || len(blockedTags) > 0) && len(items) > 0 {
+	hasContentPolicy := !pol.IsAdministrator && (pol.MaxParentalRating != nil ||
+		len(pol.BlockedTags) > 0 ||
+		len(pol.BlockUnratedItems) > 0 ||
+		len(pol.AllowedTags) > 0)
+	if hasContentPolicy && len(items) > 0 {
 		filtered := make([]dto.BaseItemDto, 0, len(items))
 		for _, it := range items {
 			exRec, rErr := h.libRepo.GetItemRecordByID(r.Context(), it.Id)
 			if rErr != nil || exRec == nil {
 				continue
 			}
-			if blocked, bErr := h.libRepo.IsItemBlockedByParentalPolicy(r.Context(), exRec, maxRating, blockedTags); bErr != nil || blocked {
+			if blocked, bErr := h.libRepo.IsItemBlockedByPolicy(r.Context(), exRec, pol); bErr != nil || blocked {
 				continue
 			}
 			filtered = append(filtered, it)

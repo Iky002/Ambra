@@ -43,18 +43,18 @@ import { formatTicks } from '../player/subtitleUtils'
 import { FeedbackBanner } from './admin/adminUtils'
 
 const SORT_OPTIONS = [
-  { value: 'DateCreated', zhLabel: '按添加时间', i18nKey: 'library.sortDateAdded' },
-  { value: 'SortName', zhLabel: '按名称排序', i18nKey: 'library.sortName' },
-  { value: 'CommunityRating', zhLabel: '按评分最高', i18nKey: 'library.sortRating' },
-  { value: 'PremiereDate', zhLabel: '按上映年份', i18nKey: 'library.sortReleaseDate' },
-  { value: 'PlayCount', zhLabel: '按播放次数', i18nKey: 'library.sortPlayCount' },
+  { value: 'DateCreated', i18nKey: 'libraryUi.sortDateCreated' },
+  { value: 'SortName', i18nKey: 'libraryUi.sortByName' },
+  { value: 'CommunityRating', i18nKey: 'libraryUi.sortByRating' },
+  { value: 'PremiereDate', i18nKey: 'libraryUi.sortByYear' },
+  { value: 'PlayCount', i18nKey: 'libraryUi.sortByPlayCount' },
 ]
 
 const FILTER_OPTIONS = [
-  { value: '', zhLabel: '全部状态', i18nKey: 'library.filterAll' },
-  { value: 'IsUnplayed', zhLabel: '仅看未播', i18nKey: 'library.filterUnplayed' },
-  { value: 'IsPlayed', zhLabel: '仅看已播', i18nKey: 'library.filterPlayed' },
-  { value: 'IsFavorite', zhLabel: '仅看收藏', i18nKey: 'library.filterFavorite' },
+  { value: '', i18nKey: 'library.filterAll' },
+  { value: 'IsUnplayed', i18nKey: 'libraryUi.filterOnlyUnplayed' },
+  { value: 'IsPlayed', i18nKey: 'libraryUi.filterOnlyPlayed' },
+  { value: 'IsFavorite', i18nKey: 'libraryUi.filterOnlyFavorite' },
 ]
 
 type MusicSubTab = 'MusicAlbum' | 'MusicArtist' | 'Audio'
@@ -70,7 +70,7 @@ const VIRTUALIZE_GRID_THRESHOLD = 120
 const ESTIMATED_GRID_ROW_HEIGHT = 320
 const VIRTUAL_OVERSCAN_ROWS = 3
 const VIEW_MODE_STORAGE_KEY = 'ambra_library_view_mode'
-const ALPHABET_LETTERS = ['全部', '#', ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('')] as const
+const ALPHABET_LETTERS = ['ALL', '#', ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('')] as const
 
 function extractFilterString(entry: string | NameIdPair | number | null | undefined): string {
   if (entry === null || entry === undefined) return ''
@@ -105,7 +105,7 @@ export function LibraryPage() {
   const { id } = useParams<{ id: string }>()
   const [searchParams, setSearchParams] = useSearchParams()
   const { auth } = useAuth()
-  const { locale, t } = useI18n()
+  const { t } = useI18n()
   const { currentTrack } = useAudioPlayer()
   const queryClient = useQueryClient()
   const userId = auth!.userId
@@ -453,17 +453,20 @@ export function LibraryPage() {
         queryClient.invalidateQueries({ queryKey: ['collections'] }),
       ])
 
-      const actionLabel = markAsPlayed ? '已看' : '未看'
       if (failed === 0) {
         setBatchFeedback({
           type: 'success',
-          message: `已将 ${succeeded} 项标记为${actionLabel}`,
+          message: markAsPlayed
+            ? t('libraryUi.batchMarkedPlayedSuccess', { count: succeeded })
+            : t('libraryUi.batchMarkedUnplayedSuccess', { count: succeeded }),
         })
         setSelectedIds(new Set())
       } else {
         setBatchFeedback({
           type: 'error',
-          message: `批量标记${actionLabel}完成：成功 ${succeeded} 项，失败 ${failed} 项`,
+          message: markAsPlayed
+            ? t('libraryUi.batchMarkedPlayedPartial', { succeeded, failed })
+            : t('libraryUi.batchMarkedUnplayedPartial', { succeeded, failed }),
         })
       }
     } finally {
@@ -486,7 +489,8 @@ export function LibraryPage() {
             {libraryInfo?.Name || t('nav.libraries')}
           </h1>
           <p className="mt-1 text-xs text-zinc-400">
-            共 {total} 部媒体{isFetching && !isLoading ? ' · 正在更新...' : ''}
+            {t('libraryUi.totalItemsCount', { count: total })}
+            {isFetching && !isLoading ? ` · ${t('libraryUi.updating')}` : ''}
           </p>
         </div>
 
@@ -495,7 +499,7 @@ export function LibraryPage() {
           <div className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs">
             <Tags className="h-3.5 w-3.5 text-amber-400" />
             <select
-              aria-label="按流派筛选"
+              aria-label={t('libraryUi.filterByGenreAria')}
               value={genreFilter}
               onChange={(e) => {
                 setGenreFilter(e.target.value)
@@ -504,7 +508,7 @@ export function LibraryPage() {
               className="max-w-[120px] bg-transparent text-zinc-200 outline-none"
             >
               <option value="" className="bg-zinc-900 text-zinc-100">
-                {locale === 'zh-CN' ? '全部流派' : `${t('common.all')} · ${t('library.filterGenre')}`}
+                {t('libraryUi.allGenres')}
               </option>
               {genreOptions.map((g) => (
                 <option key={g} value={g} className="bg-zinc-900 text-zinc-100">
@@ -518,7 +522,7 @@ export function LibraryPage() {
           <div className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs">
             <Calendar className="h-3.5 w-3.5 text-amber-400" />
             <select
-              aria-label="按年份筛选"
+              aria-label={t('libraryUi.filterByYearAria')}
               value={yearFilter}
               onChange={(e) => {
                 setYearFilter(e.target.value)
@@ -527,7 +531,7 @@ export function LibraryPage() {
               className="max-w-[100px] bg-transparent text-zinc-200 outline-none"
             >
               <option value="" className="bg-zinc-900 text-zinc-100">
-                {locale === 'zh-CN' ? '全部年份' : `${t('common.all')} · ${t('library.filterYear')}`}
+                {t('libraryUi.allYears')}
               </option>
               {yearOptions.map((y) => (
                 <option key={y} value={y} className="bg-zinc-900 text-zinc-100">
@@ -541,7 +545,7 @@ export function LibraryPage() {
           <div className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs">
             <Tag className="h-3.5 w-3.5 text-amber-400" />
             <select
-              aria-label="按标签筛选"
+              aria-label={t('libraryUi.filterByTagAria')}
               value={tagFilter}
               onChange={(e) => {
                 setTagFilter(e.target.value)
@@ -550,11 +554,11 @@ export function LibraryPage() {
               className="max-w-[130px] bg-transparent text-zinc-200 outline-none"
             >
               <option value="" className="bg-zinc-900 text-zinc-100">
-                {locale === 'zh-CN' ? '全部标签' : `${t('common.all')} · ${t('library.filterTag')}`}
+                {t('libraryUi.allTags')}
               </option>
-              {tagOptions.map((t) => (
-                <option key={t} value={t} className="bg-zinc-900 text-zinc-100">
-                  {t}
+              {tagOptions.map((tagOpt) => (
+                <option key={tagOpt} value={tagOpt} className="bg-zinc-900 text-zinc-100">
+                  {tagOpt}
                 </option>
               ))}
             </select>
@@ -564,7 +568,7 @@ export function LibraryPage() {
           <div className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs">
             <Filter className="h-3.5 w-3.5 text-amber-400" />
             <select
-              aria-label="按观看状态筛选"
+              aria-label={t('libraryUi.filterByStatusAria')}
               value={statusFilter}
               onChange={(e) => {
                 setStatusFilter(e.target.value)
@@ -574,7 +578,7 @@ export function LibraryPage() {
             >
               {FILTER_OPTIONS.map((opt) => (
                 <option key={opt.value} value={opt.value} className="bg-zinc-900 text-zinc-100">
-                  {locale === 'zh-CN' ? opt.zhLabel : t(opt.i18nKey)}
+                  {t(opt.i18nKey)}
                 </option>
               ))}
             </select>
@@ -583,7 +587,7 @@ export function LibraryPage() {
           {/* 排序字段 */}
           <div className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs">
             <select
-              aria-label="排序方式"
+              aria-label={t('libraryUi.sortOrderAria')}
               value={sortBy}
               onChange={(e) => {
                 setSortBy(e.target.value)
@@ -593,7 +597,7 @@ export function LibraryPage() {
             >
               {SORT_OPTIONS.map((opt) => (
                 <option key={opt.value} value={opt.value} className="bg-zinc-900 text-zinc-100">
-                  {locale === 'zh-CN' ? opt.zhLabel : t(opt.i18nKey)}
+                  {t(opt.i18nKey)}
                 </option>
               ))}
             </select>
@@ -607,17 +611,17 @@ export function LibraryPage() {
               setPage(0)
             }}
             className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs text-zinc-200 transition-colors hover:bg-white/10"
-            title="切换排序方向"
+            title={t('libraryUi.toggleSortDirection')}
           >
             {sortOrder === 'Descending' ? (
               <>
                 <ArrowDownWideNarrow className="h-3.5 w-3.5 text-amber-400" />
-                <span>降序</span>
+                <span>{t('libraryUi.sortDesc')}</span>
               </>
             ) : (
               <>
                 <ArrowUpNarrowWide className="h-3.5 w-3.5 text-amber-400" />
-                <span>升序</span>
+                <span>{t('libraryUi.sortAsc')}</span>
               </>
             )}
           </button>
@@ -625,14 +629,14 @@ export function LibraryPage() {
           {/* 网格/列表视图切换 */}
           <div
             role="group"
-            aria-label="视图切换"
+            aria-label={t('libraryUi.viewSwitcherAria')}
             className="inline-flex items-center rounded-xl border border-white/10 bg-white/[0.04] p-0.5"
           >
             <button
               type="button"
-              aria-label="网格视图"
+              aria-label={t('libraryUi.gridView')}
               aria-pressed={viewMode === 'grid'}
-              title="网格视图"
+              title={t('libraryUi.gridView')}
               onClick={() => handleSetViewMode('grid')}
               className={`rounded-lg p-1.5 transition-colors ${
                 viewMode === 'grid'
@@ -644,9 +648,9 @@ export function LibraryPage() {
             </button>
             <button
               type="button"
-              aria-label="列表视图"
+              aria-label={t('libraryUi.listView')}
               aria-pressed={viewMode === 'list'}
-              title="列表视图"
+              title={t('libraryUi.listView')}
               onClick={() => handleSetViewMode('list')}
               className={`rounded-lg p-1.5 transition-colors ${
                 viewMode === 'list'
@@ -670,7 +674,7 @@ export function LibraryPage() {
             }`}
           >
             <CheckSquare className="h-3.5 w-3.5" />
-            <span>{locale === 'zh-CN' ? '多选' : t('library.multiSelect')}</span>
+            <span>{t('libraryUi.multiSelectShort')}</span>
           </button>
 
           {/* 高级筛选折叠开关 */}
@@ -686,7 +690,7 @@ export function LibraryPage() {
             }`}
           >
             <SlidersHorizontal className="h-3.5 w-3.5 text-amber-400" />
-            <span>高级筛选</span>
+            <span>{t('libraryUi.advancedFilters')}</span>
             {advancedActiveCount > 0 && (
               <span className="rounded-full bg-amber-500 px-1.5 py-0.2 text-[10px] font-bold text-zinc-950">
                 {advancedActiveCount}
@@ -702,7 +706,7 @@ export function LibraryPage() {
           {/* 每页容量切换（支持大画幅虚拟滚动浏览） */}
           <div className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-xs">
             <select
-              aria-label="每页数量"
+              aria-label={t('libraryUi.pageSizeAria')}
               value={pageSize}
               onChange={(e) => {
                 setPageSize(Number(e.target.value) || PAGE_SIZE)
@@ -711,13 +715,13 @@ export function LibraryPage() {
               className="bg-transparent text-zinc-200 outline-none"
             >
               <option value={36} className="bg-zinc-900 text-zinc-100">
-                36 / 页
+                {t('libraryUi.perPageOption', { size: 36 })}
               </option>
               <option value={150} className="bg-zinc-900 text-zinc-100">
-                150 / 页
+                {t('libraryUi.perPageOption', { size: 150 })}
               </option>
               <option value={300} className="bg-zinc-900 text-zinc-100">
-                300 / 页
+                {t('libraryUi.perPageOption', { size: 300 })}
               </option>
             </select>
           </div>
@@ -725,12 +729,10 @@ export function LibraryPage() {
           {studioFilter && (
             <span className="inline-flex items-center gap-1.5 rounded-xl border border-amber-400/35 bg-amber-500/15 px-3 py-1.5 text-xs font-medium text-amber-200">
               <Building2 className="h-3.5 w-3.5 text-amber-400" />
-              <span>
-                {t('library.filterStudio')}：{studioFilter}
-              </span>
+              <span>{t('libraryUi.studioFilterBadge', { studio: studioFilter })}</span>
               <button
                 type="button"
-                aria-label="清除制片厂筛选"
+                aria-label={t('libraryUi.clearStudioFilterAria')}
                 onClick={() => {
                   setStudioFilter('')
                   updateUrlParam('studio', '')
@@ -749,7 +751,7 @@ export function LibraryPage() {
               className="flex items-center gap-1 rounded-xl border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
             >
               <RotateCcw className="h-3 w-3" />
-              <span>{locale === 'zh-CN' ? '重置' : t('library.clearFilters')}</span>
+              <span>{t('libraryUi.resetFiltersBtn')}</span>
             </button>
           )}
         </div>
@@ -762,9 +764,11 @@ export function LibraryPage() {
           className="grid grid-cols-1 gap-3 rounded-2xl border border-amber-500/20 bg-zinc-950/75 p-4 backdrop-blur-md sm:grid-cols-2 lg:grid-cols-6"
         >
           <label className="space-y-1 text-xs">
-            <span className="block text-[11px] font-medium text-zinc-400">流派</span>
+            <span className="block text-[11px] font-medium text-zinc-400">
+              {t('libraryUi.genreLabel')}
+            </span>
             <select
-              aria-label="高级筛选流派"
+              aria-label={t('libraryUi.advFilterGenreAria')}
               value={genreFilter}
               onChange={(e) => {
                 setGenreFilter(e.target.value)
@@ -772,7 +776,7 @@ export function LibraryPage() {
               }}
               className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
             >
-              <option value="">全部流派</option>
+              <option value="">{t('libraryUi.allGenres')}</option>
               {genreOptions.map((g) => (
                 <option key={g} value={g}>
                   {g}
@@ -782,9 +786,11 @@ export function LibraryPage() {
           </label>
 
           <label className="space-y-1 text-xs">
-            <span className="block text-[11px] font-medium text-zinc-400">年份</span>
+            <span className="block text-[11px] font-medium text-zinc-400">
+              {t('library.filterYear')}
+            </span>
             <select
-              aria-label="高级筛选年份"
+              aria-label={t('libraryUi.advFilterYearAria')}
               value={yearFilter}
               onChange={(e) => {
                 setYearFilter(e.target.value)
@@ -792,7 +798,7 @@ export function LibraryPage() {
               }}
               className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
             >
-              <option value="">全部年份</option>
+              <option value="">{t('libraryUi.allYears')}</option>
               {yearOptions.map((y) => (
                 <option key={y} value={y}>
                   {y}
@@ -802,9 +808,11 @@ export function LibraryPage() {
           </label>
 
           <label className="space-y-1 text-xs">
-            <span className="block text-[11px] font-medium text-zinc-400">分辨率规格</span>
+            <span className="block text-[11px] font-medium text-zinc-400">
+              {t('libraryUi.resolutionLabel')}
+            </span>
             <select
-              aria-label="按分辨率筛选"
+              aria-label={t('libraryUi.filterByResolutionAria')}
               value={resolutionFilter}
               onChange={(e) => {
                 setResolutionFilter((e.target.value as '' | '4K' | 'HD') || '')
@@ -812,16 +820,18 @@ export function LibraryPage() {
               }}
               className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
             >
-              <option value="">全部分辨率</option>
-              <option value="4K">4K 超高清 (UHD)</option>
-              <option value="HD">高清 (HD 1080p/720p)</option>
+              <option value="">{t('libraryUi.allResolutions')}</option>
+              <option value="4K">{t('libraryUi.res4kUhd')}</option>
+              <option value="HD">{t('libraryUi.resHd')}</option>
             </select>
           </label>
 
           <label className="space-y-1 text-xs">
-            <span className="block text-[11px] font-medium text-zinc-400">视频编码</span>
+            <span className="block text-[11px] font-medium text-zinc-400">
+              {t('libraryUi.videoCodecLabel')}
+            </span>
             <select
-              aria-label="按视频编码筛选"
+              aria-label={t('libraryUi.filterByCodecAria')}
               value={videoCodecFilter}
               onChange={(e) => {
                 setVideoCodecFilter(e.target.value)
@@ -829,7 +839,7 @@ export function LibraryPage() {
               }}
               className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
             >
-              <option value="">全部编码</option>
+              <option value="">{t('libraryUi.allCodecs')}</option>
               {codecOptions.map((codec) => (
                 <option key={codec} value={codec}>
                   {codec.toUpperCase()}
@@ -839,9 +849,11 @@ export function LibraryPage() {
           </label>
 
           <label className="space-y-1 text-xs">
-            <span className="block text-[11px] font-medium text-zinc-400">最低评分</span>
+            <span className="block text-[11px] font-medium text-zinc-400">
+              {t('libraryUi.minRatingLabel')}
+            </span>
             <select
-              aria-label="按最低评分筛选"
+              aria-label={t('libraryUi.filterByMinRatingAria')}
               value={minRatingFilter}
               onChange={(e) => {
                 setMinRatingFilter(e.target.value)
@@ -849,11 +861,11 @@ export function LibraryPage() {
               }}
               className="w-full rounded-xl border border-white/10 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 outline-none focus:border-amber-400/50"
             >
-              <option value="">不限评分</option>
-              <option value="9">≥ 9.0 分</option>
-              <option value="8">≥ 8.0 分</option>
-              <option value="7">≥ 7.0 分</option>
-              <option value="6">≥ 6.0 分</option>
+              <option value="">{t('libraryUi.anyRating')}</option>
+              <option value="9">{t('libraryUi.minRatingOption', { score: '9.0' })}</option>
+              <option value="8">{t('libraryUi.minRatingOption', { score: '8.0' })}</option>
+              <option value="7">{t('libraryUi.minRatingOption', { score: '7.0' })}</option>
+              <option value="6">{t('libraryUi.minRatingOption', { score: '6.0' })}</option>
             </select>
           </label>
 
@@ -891,7 +903,7 @@ export function LibraryPage() {
               }`}
             >
               <Heart className={`h-3.5 w-3.5 ${likedOnly ? 'fill-current' : ''}`} />
-              <span>已赞</span>
+              <span>{t('libraryUi.likedOnly')}</span>
             </button>
           </div>
         </div>
@@ -900,11 +912,11 @@ export function LibraryPage() {
       {/* 字母快速索引条 */}
       <div
         role="navigation"
-        aria-label="字母索引"
+        aria-label={t('libraryUi.alphabetNavAria')}
         className="no-scrollbar flex items-center gap-1 overflow-x-auto pb-1"
       >
         {ALPHABET_LETTERS.map((letter) => {
-          const value = letter === '全部' ? '' : letter
+          const value = letter === 'ALL' ? '' : letter
           const active = letterFilter === value
           return (
             <button
@@ -921,7 +933,7 @@ export function LibraryPage() {
                   : 'border border-white/8 bg-white/[0.03] text-zinc-400 hover:border-white/15 hover:text-zinc-100'
               }`}
             >
-              {letter === '全部' ? t('library.allItems') : letter}
+              {letter === 'ALL' ? t('library.allItems') : letter}
             </button>
           )
         })}
@@ -931,7 +943,7 @@ export function LibraryPage() {
       {isMusicLibrary && (
         <div
           role="tablist"
-          aria-label="音乐库分类"
+          aria-label={t('libraryUi.musicCategoryAria')}
           className="inline-flex items-center gap-1 rounded-xl border border-white/10 bg-zinc-950/80 p-1"
         >
           {MUSIC_SUB_TABS.map((tab) => {
@@ -968,14 +980,14 @@ export function LibraryPage() {
         </div>
       ) : isError ? (
         <QueryErrorState
-          title="无法加载媒体库内容"
+          title={t('libraryUi.loadErrorTitle')}
           error={error}
           onRetry={() => void refetch()}
           backTo="/"
         />
       ) : items.length === 0 ? (
         <div className="rounded-2xl border border-white/8 bg-white/[0.02] py-20 text-center text-sm text-zinc-500">
-          {locale === 'zh-CN' ? '当前筛选条件下没有找到媒体项目' : t('library.emptyResult')}
+          {t('libraryUi.emptyFilteredItems')}
         </div>
       ) : viewMode === 'list' ? (
         <div
@@ -1031,7 +1043,7 @@ export function LibraryPage() {
             {t('common.prev')}
           </button>
           <span className="text-xs text-zinc-400">
-            第 {page + 1} / {totalPages} 页
+            {t('libraryUi.pageIndicator', { page: page + 1, totalPages })}
           </span>
           <button
             type="button"
@@ -1051,7 +1063,7 @@ export function LibraryPage() {
       {selectMode && (
         <div
           role="region"
-          aria-label="批量操作栏"
+          aria-label={t('libraryUi.batchActionBarAria')}
           data-testid="batch-action-bar"
           className={`fixed left-1/2 z-40 flex max-w-[calc(100vw-2rem)] -translate-x-1/2 flex-wrap items-center gap-2 rounded-2xl border border-amber-400/35 bg-zinc-950/92 px-4 py-2.5 text-xs text-zinc-100 shadow-[0_12px_40px_rgba(0,0,0,0.75)] backdrop-blur-xl transition-all ${
             currentTrack ? 'bottom-40 lg:bottom-24' : 'bottom-6'
@@ -1068,7 +1080,7 @@ export function LibraryPage() {
             disabled={items.length === 0 || batchBusy}
             className="rounded-lg border border-white/10 bg-white/[0.05] px-2.5 py-1.5 font-medium text-zinc-200 transition-colors hover:bg-white/10 disabled:opacity-40"
           >
-            全选本页
+            {t('libraryUi.selectAllPage')}
           </button>
           <button
             type="button"
@@ -1076,7 +1088,7 @@ export function LibraryPage() {
             disabled={selectedIds.size === 0 || batchBusy}
             className="rounded-lg border border-white/10 bg-white/[0.05] px-2.5 py-1.5 font-medium text-zinc-200 transition-colors hover:bg-white/10 disabled:opacity-40"
           >
-            {locale === 'zh-CN' ? '清空' : t('common.clear')}
+            {t('libraryUi.clearSelection')}
           </button>
 
           <span className="h-4 w-px bg-white/15" />
@@ -1110,7 +1122,7 @@ export function LibraryPage() {
             className="inline-flex items-center gap-1 rounded-lg bg-amber-500 px-3 py-1.5 font-semibold text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-40"
           >
             <FolderPlus className="h-3.5 w-3.5" />
-            <span>{locale === 'zh-CN' ? '加入合集/片单' : t('detail.addToCollection')}</span>
+            <span>{t('libraryUi.addToCollectionCompact')}</span>
           </button>
 
           <button
@@ -1128,7 +1140,7 @@ export function LibraryPage() {
       <AddToCollectionModal
         open={collectionModalOpen}
         itemIds={Array.from(selectedIds)}
-        itemLabel={`已选的 ${selectedIds.size} 个媒体项`}
+        itemLabel={t('libraryUi.selectedItemsLabel', { count: selectedIds.size })}
         mediaType={isMusicLibrary ? 'Audio' : 'Video'}
         onClose={() => setCollectionModalOpen(false)}
         onSuccess={(msg) => {
@@ -1242,6 +1254,7 @@ function LibraryListRow({
   selected?: boolean
   onToggleSelect?: (item: BaseItemDto) => void
 }) {
+  const { t } = useI18n()
   const isMusicItem =
     item.Type === 'Audio' || item.Type === 'MusicAlbum' || item.Type === 'MusicArtist'
   const imgUrl = item.ImageTags?.Primary
@@ -1278,7 +1291,7 @@ function LibraryListRow({
     >
       {selectable && (
         <div
-          aria-label={selected ? '已选中' : '未选中'}
+          aria-label={selected ? t('libraryUi.itemSelectedAria') : t('libraryUi.itemUnselectedAria')}
           className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-colors ${
             selected
               ? 'border-amber-400 bg-amber-400 text-zinc-950'
@@ -1319,11 +1332,11 @@ function LibraryListRow({
           </p>
           {item.UserData?.Played && (
             <span
-              title="已观看"
+              title={t('detail.watched')}
               className="inline-flex shrink-0 items-center gap-0.5 rounded-full bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-300 ring-1 ring-emerald-500/35"
             >
               <Check className="h-2.5 w-2.5 stroke-[3]" />
-              <span>已看</span>
+              <span>{t('libraryUi.watchedShortBadge')}</span>
             </span>
           )}
         </div>

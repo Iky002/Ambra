@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ambra-media/ambra/internal/api/dto"
 	"github.com/ambra-media/ambra/internal/core/budget"
@@ -98,6 +100,9 @@ func needsSyncTranscode(quality string, bitrate int) (bool, int) {
 		return false, 0
 	}
 	if bitrate > 0 {
+		if bitrate > maxSyncBitrate {
+			bitrate = maxSyncBitrate
+		}
 		return true, bitrate
 	}
 	switch q {
@@ -109,6 +114,9 @@ func needsSyncTranscode(quality string, bitrate int) (bool, int) {
 		return true, 1_500_000
 	default:
 		if n, err := strconv.Atoi(q); err == nil && n > 0 {
+			if n > maxSyncBitrate {
+				n = maxSyncBitrate
+			}
 			return true, n
 		}
 		return true, 4_000_000
@@ -437,7 +445,7 @@ func (h *Handler) processQueuedSyncItem(ctx context.Context, work *queuedSyncWor
 		return
 	}
 
-	itemCtx, itemCancel := context.WithCancel(ctx)
+	itemCtx, itemCancel := context.WithTimeout(ctx, h.getTranscodeTimeout())
 	h.registerActiveCancel(work.jobItem.Id, itemCancel)
 	defer func() {
 		h.unregisterActiveCancel(work.jobItem.Id)
@@ -509,10 +517,18 @@ func (h *Handler) processQueuedSyncItem(ctx context.Context, work *queuedSyncWor
 
 	args := netutil.FilterFFmpegArgs(ffmpegBin, buildSyncFFmpegArgs(ffInput, tmpOut, work.mediaType, work.bitrate))
 	cmd := exec.CommandContext(itemCtx, ffmpegBin, args...)
+	cmd.WaitDelay = 500 * time.Millisecond
 	outBytes, runErr := cmd.CombinedOutput()
 	if itemCtx.Err() != nil {
 		_ = os.Remove(tmpOut)
 		_ = os.Remove(finalOut)
+		if errors.Is(itemCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+			slog.Warn("sync: background ffmpeg transcode timed out",
+				"job_id", work.job.Id,
+				"job_item_id", work.jobItem.Id,
+			)
+			h.markSyncItemFailed(ctx, work.job.Id, work.jobItem.Id, "sync transcode timed out")
+		}
 		return
 	}
 	if runErr != nil {
@@ -608,6 +624,9 @@ func buildSyncFFmpegArgs(inputPath, outPath, mediaType string, targetBitrate int
 	}
 
 	const audioBitrate = 128_000
+	if targetBitrate > maxSyncBitrate {
+		targetBitrate = maxSyncBitrate
+	}
 	videoBitrate := targetBitrate - audioBitrate
 	if videoBitrate < 250_000 {
 		videoBitrate = 250_000
@@ -768,18 +787,8 @@ func (h *Handler) OnLibraryItemAdded(ctx context.Context, itemIDs ...string) {
 			}
 			// Root might be a Library ID (not in items table).
 			if lib, libErr := libRepo.GetLibrary(ctx, rootID); libErr == nil && lib != nil {
-				if jobUser != nil && !jobUser.IsAdmin && !jobUser.Policy.IsAdministrator && !jobUser.Policy.EnableAllFolders {
-					normLib := guid.Normalize(lib.ID)
-					allowed := false
-					for _, fid := range jobUser.Policy.EnabledFolders {
-						if guid.Normalize(fid) == normLib {
-							allowed = true
-							break
-						}
-					}
-					if !allowed {
-						return
-					}
+				if jobUser != nil && !jobUser.IsAdmin && !jobUser.Policy.IsAdministrator && !libRepo.CanUserAccessLibrary(ctx, jobUser.Policy, lib.ID) {
+					return
 				}
 				if items, _, qErr := libRepo.QueryItems(ctx, sqlite.ItemFilter{
 					ServerID:  serverID,

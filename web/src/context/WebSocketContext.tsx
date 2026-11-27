@@ -44,6 +44,7 @@ export const WebSocketContext = createContext<WebSocketContextValue>(defaultWebS
 
 const INITIAL_RECONNECT_DELAY_MS = 1_000
 const MAX_RECONNECT_DELAY_MS = 30_000
+const STABLE_CONNECTION_THRESHOLD_MS = 10_000
 const KEEPALIVE_INTERVAL_MS = 30_000
 const DEFAULT_TOAST_TIMEOUT_MS = 5_000
 const MAX_VISIBLE_TOASTS = 5
@@ -69,10 +70,15 @@ const LIBRARY_CHANGED_KEYS = [
 ] as const
 
 export function WebSocketProvider({ children }: { children: React.ReactNode }) {
-  const { auth } = useAuth()
+  const { auth, refreshUser, logout } = useAuth()
   const queryClient = useQueryClient()
   const [connected, setConnected] = useState(false)
   const [toasts, setToasts] = useState<ToastNotification[]>([])
+
+  const refreshUserRef = useRef(refreshUser)
+  refreshUserRef.current = refreshUser
+  const logoutRef = useRef(logout)
+  logoutRef.current = logout
 
   const playstateListenersRef = useRef<Set<(cmd: PlaystateCommand) => void>>(new Set())
   const toastTimersRef = useRef<Map<string, number>>(new Map())
@@ -228,7 +234,7 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
     return () => window.removeEventListener('ambra:ws-mock', onMockEvent)
   }, [demoActive, handleIncomingPayload])
 
-  // 连接 /embywebsocket（含指数退避重连 + 30s KeepAlive 心跳 + 连续握手失败鉴权探测）
+  // 连接 /embywebsocket（含 10s 稳定期指数退避重连 + 30s KeepAlive 心跳 + 1008 策略违规即时鉴权校验）
   useEffect(() => {
     const token = auth?.accessToken
     const userId = auth?.userId
@@ -241,7 +247,9 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
     let ws: WebSocket | null = null
     let reconnectTimer: number | null = null
     let keepAliveTimer: number | null = null
+    let stabilityTimer: number | null = null
     let reconnectDelay = INITIAL_RECONNECT_DELAY_MS
+    let retryCount = 0
     let consecutiveHandshakeFailures = 0
     let probingAuth = false
 
@@ -252,11 +260,28 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
+    const clearStabilityTimer = () => {
+      if (stabilityTimer !== null) {
+        window.clearTimeout(stabilityTimer)
+        stabilityTimer = null
+      }
+    }
+
     const clearReconnect = () => {
       if (reconnectTimer !== null) {
         window.clearTimeout(reconnectTimer)
         reconnectTimer = null
       }
+    }
+
+    const invalidateLocalAuth = () => {
+      disposed = true
+      clearReconnect()
+      clearKeepAlive()
+      clearStabilityTimer()
+      clearAuth()
+      logoutRef.current()
+      window.dispatchEvent(new CustomEvent('ambra:unauthorized'))
     }
 
     const scheduleNextReconnect = () => {
@@ -270,35 +295,67 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
       reconnectTimer = window.setTimeout(connect, delay)
     }
 
-    const handleDisconnect = (openedDuringAttempt: boolean) => {
+    const probeAuthAndMaybeReconnect = (reconnectIfValid: boolean) => {
+      if (probingAuth || disposed) return
+      probingAuth = true
+      void refreshUserRef.current()
+      const probePromise = userId ? api.getUser(userId) : api.getSystemInfo()
+      void probePromise
+        .then((res) => {
+          probingAuth = false
+          if (disposed) return
+          if (
+            res &&
+            typeof res === 'object' &&
+            'Policy' in res &&
+            (res as { Policy?: { IsDisabled?: boolean } }).Policy?.IsDisabled
+          ) {
+            invalidateLocalAuth()
+            return
+          }
+          if (reconnectIfValid) {
+            scheduleNextReconnect()
+          }
+        })
+        .catch((err: unknown) => {
+          probingAuth = false
+          if (disposed) return
+          if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+            invalidateLocalAuth()
+            return
+          }
+          if (reconnectIfValid) {
+            scheduleNextReconnect()
+          }
+        })
+    }
+
+    const handleDisconnect = (openedDuringAttempt: boolean, wasStable: boolean, closeCode?: number) => {
       clearKeepAlive()
+      clearStabilityTimer()
       setConnected(false)
       if (disposed) return
 
-      if (!openedDuringAttempt) {
-        consecutiveHandshakeFailures += 1
-        if (consecutiveHandshakeFailures >= AUTH_PROBE_FAILURE_THRESHOLD && !probingAuth) {
-          probingAuth = true
-          const probePromise = userId ? api.getUser(userId) : api.getSystemInfo()
-          void probePromise
-            .then(() => {
-              probingAuth = false
-              scheduleNextReconnect()
-            })
-            .catch((err: unknown) => {
-              probingAuth = false
-              if (disposed) return
-              if (err instanceof ApiError && err.status === 401) {
-                disposed = true
-                clearReconnect()
-                clearKeepAlive()
-                clearAuth()
-                window.dispatchEvent(new CustomEvent('ambra:unauthorized'))
-                return
-              }
-              scheduleNextReconnect()
-            })
-          return
+      // 1008 Policy Violation（改密、禁用账号、踢出设备等）：立即重验登录态，严禁盲目重连
+      if (closeCode === 1008) {
+        retryCount += 1
+        reconnectDelay = Math.min(MAX_RECONNECT_DELAY_MS, reconnectDelay * 2)
+        probeAuthAndMaybeReconnect(false)
+        return
+      }
+
+      if (wasStable) {
+        reconnectDelay = INITIAL_RECONNECT_DELAY_MS
+        retryCount = 0
+        consecutiveHandshakeFailures = 0
+      } else {
+        retryCount += 1
+        if (!openedDuringAttempt) {
+          consecutiveHandshakeFailures += 1
+          if (consecutiveHandshakeFailures >= AUTH_PROBE_FAILURE_THRESHOLD) {
+            probeAuthAndMaybeReconnect(true)
+            return
+          }
         }
       }
 
@@ -308,17 +365,19 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
     const connect = () => {
       if (disposed) return
       clearKeepAlive()
+      clearStabilityTimer()
 
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
       const deviceId = auth.deviceId || getDeviceId()
       const wsUrl = `${protocol}//${window.location.host}/embywebsocket?api_key=${encodeURIComponent(token)}&deviceId=${encodeURIComponent(deviceId)}`
 
       let openedDuringAttempt = false
+      let openedAt: number | null = null
 
       try {
         ws = new WebSocket(wsUrl)
       } catch {
-        handleDisconnect(false)
+        handleDisconnect(false, false)
         return
       }
 
@@ -328,9 +387,15 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
           return
         }
         openedDuringAttempt = true
-        consecutiveHandshakeFailures = 0
+        openedAt = Date.now()
         setConnected(true)
-        reconnectDelay = INITIAL_RECONNECT_DELAY_MS
+        clearStabilityTimer()
+        stabilityTimer = window.setTimeout(() => {
+          stabilityTimer = null
+          reconnectDelay = INITIAL_RECONNECT_DELAY_MS
+          retryCount = 0
+          consecutiveHandshakeFailures = 0
+        }, STABLE_CONNECTION_THRESHOLD_MS)
         clearKeepAlive()
         keepAliveTimer = window.setInterval(() => {
           if (ws && ws.readyState === WebSocket.OPEN) {
@@ -353,8 +418,13 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
         setConnected(false)
       }
 
-      ws.onclose = () => {
-        handleDisconnect(openedDuringAttempt)
+      ws.onclose = (event: CloseEvent) => {
+        const wasStable =
+          openedDuringAttempt &&
+          openedAt !== null &&
+          Date.now() - openedAt >= STABLE_CONNECTION_THRESHOLD_MS
+        void retryCount
+        handleDisconnect(openedDuringAttempt, wasStable, event?.code)
       }
     }
 
@@ -364,6 +434,7 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
       disposed = true
       clearReconnect()
       clearKeepAlive()
+      clearStabilityTimer()
       clearPendingInvalidations()
       if (ws) {
         ws.onopen = null

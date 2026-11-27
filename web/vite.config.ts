@@ -8,6 +8,11 @@ export default defineConfig(({ mode }) => {
   return {
     base: env.VITE_BASE_PATH || './',
     plugins: [react(), tailwindcss()],
+    resolve: {
+      alias: {
+        'rvfc-polyfill': '/src/player/rvfcShim.ts',
+      },
+    },
     optimizeDeps: {
       exclude: ['jassub', '@ffmpeg/ffmpeg', '@ffmpeg/util'],
     },

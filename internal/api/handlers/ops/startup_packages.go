@@ -150,7 +150,23 @@ func (h *Handler) handleGetStartupConfig(w http.ResponseWriter, r *http.Request)
 	httpx.JSON(w, http.StatusOK, stCfg)
 }
 
+func (h *Handler) checkStartupOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	var allowed []string
+	if h.cfg != nil {
+		allowed = h.cfg.Snapshot().AllowedOrigins
+	}
+	return middleware.IsOriginAllowed(origin, r, allowed)
+}
+
 func (h *Handler) handleUpdateStartupConfig(w http.ResponseWriter, r *http.Request) {
+	if !h.checkStartupOrigin(r) {
+		httpx.Error(w, http.StatusForbidden, "cross-origin startup request forbidden")
+		return
+	}
 	var req StartupConfiguration
 	if err := httpx.DecodeJSONLimit(r, &req, 64<<10); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid startup configuration payload")
@@ -212,6 +228,10 @@ func (h *Handler) handleGetStartupUser(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleUpdateStartupUser(w http.ResponseWriter, r *http.Request) {
+	if !h.checkStartupOrigin(r) {
+		httpx.Error(w, http.StatusForbidden, "cross-origin startup request forbidden")
+		return
+	}
 	var req struct {
 		Name     string `json:"Name"`
 		Password string `json:"Password"`
@@ -255,28 +275,55 @@ func (h *Handler) handleUpdateStartupUser(w http.ResponseWriter, r *http.Request
 			}
 		}
 
-		hash, err := auth.HashPassword(req.Password)
-		if err != nil {
-			httpx.Error(w, http.StatusInternalServerError, "failed to hash password")
-			return
-		}
 		existing, err := h.userRepo.GetUserByName(r.Context(), name)
 		if err == nil && existing != nil {
-			if err := h.userRepo.UpdateUserPassword(r.Context(), existing.ID, hash); err != nil {
-				httpx.Error(w, http.StatusInternalServerError, "failed to update user password")
-				return
+			if authSvc := h.getAuthService(); authSvc != nil {
+				if err := authSvc.ChangePassword(r.Context(), existing.ID, "", req.Password, true); err != nil {
+					httpx.Error(w, http.StatusInternalServerError, "failed to update user password")
+					return
+				}
+				authSvc.InvalidateUserCache(existing.ID)
+			} else {
+				hash, hashErr := auth.HashPassword(req.Password)
+				if hashErr != nil {
+					httpx.Error(w, http.StatusInternalServerError, "failed to hash password")
+					return
+				}
+				if err := h.userRepo.UpdateUserPassword(r.Context(), existing.ID, hash); err != nil {
+					httpx.Error(w, http.StatusInternalServerError, "failed to update user password")
+					return
+				}
+				_ = h.userRepo.DeleteTokensByUser(r.Context(), existing.ID)
+			}
+			if sm := h.getSessionManager(); sm != nil {
+				sm.RemoveSessionsByUser(existing.ID)
+			}
+			if hub := h.getWSHub(); hub != nil {
+				hub.DisconnectUser(existing.ID)
 			}
 		} else if errors.Is(err, sqlite.ErrNotFound) {
-			u := &sqlite.UserRecord{
-				Name:         name,
-				PasswordHash: hash,
-				IsAdmin:      true,
-				Policy:       sqlite.DefaultUserPolicy(true),
-				Config:       sqlite.DefaultUserConfig(),
-			}
-			if err := h.userRepo.CreateUser(r.Context(), u); err != nil {
-				httpx.Error(w, http.StatusInternalServerError, "failed to create startup admin user")
-				return
+			if authSvc := h.getAuthService(); authSvc != nil {
+				if _, cErr := authSvc.CreateUser(r.Context(), name, req.Password, true); cErr != nil {
+					httpx.Error(w, http.StatusInternalServerError, "failed to create startup admin user")
+					return
+				}
+			} else {
+				hash, hashErr := auth.HashPassword(req.Password)
+				if hashErr != nil {
+					httpx.Error(w, http.StatusInternalServerError, "failed to hash password")
+					return
+				}
+				u := &sqlite.UserRecord{
+					Name:         name,
+					PasswordHash: hash,
+					IsAdmin:      true,
+					Policy:       sqlite.DefaultUserPolicy(true),
+					Config:       sqlite.DefaultUserConfig(),
+				}
+				if err := h.userRepo.CreateUser(r.Context(), u); err != nil {
+					httpx.Error(w, http.StatusInternalServerError, "failed to create startup admin user")
+					return
+				}
 			}
 		} else if err != nil {
 			httpx.Error(w, http.StatusInternalServerError, "failed to lookup user")
@@ -295,6 +342,10 @@ func (h *Handler) handleUpdateStartupUser(w http.ResponseWriter, r *http.Request
 }
 
 func (h *Handler) handleUpdateRemoteAccess(w http.ResponseWriter, r *http.Request) {
+	if !h.checkStartupOrigin(r) {
+		httpx.Error(w, http.StatusForbidden, "cross-origin startup request forbidden")
+		return
+	}
 	var payload struct {
 		EnableRemoteAccess         *bool `json:"EnableRemoteAccess"`
 		EnableAutomaticPortMapping *bool `json:"EnableAutomaticPortMapping"`
@@ -329,6 +380,10 @@ func (h *Handler) handleUpdateRemoteAccess(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *Handler) handleStartupComplete(w http.ResponseWriter, r *http.Request) {
+	if !h.checkStartupOrigin(r) {
+		httpx.Error(w, http.StatusForbidden, "cross-origin startup request forbidden")
+		return
+	}
 	if h.userRepo == nil {
 		httpx.Error(w, http.StatusBadRequest, "at least one user must be created before completing startup wizard")
 		return
@@ -438,24 +493,44 @@ func (h *Handler) handleInstallPackage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handler) handleCancelInstall(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("Id")
+func (h *Handler) cancelPackageInstall(ctx context.Context, id string) (bool, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false, nil
+	}
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	for i, inst := range h.state.Installations {
-		if inst.Id == id {
+		if inst.Id == id || strings.EqualFold(inst.Id, id) {
 			snapshot := cloneOpsState(h.state)
 			h.state.Installations = append(h.state.Installations[:i], h.state.Installations[i+1:]...)
-			if err := h.saveStateLocked(r.Context()); err != nil {
+			if err := h.saveStateLocked(ctx); err != nil {
 				h.state = snapshot
-				h.mu.Unlock()
-				httpx.Error(w, http.StatusInternalServerError, "failed to persist cancellation")
-				return
+				return true, err
 			}
-			h.mu.Unlock()
-			httpx.NoContent(w)
-			return
+			return true, nil
 		}
 	}
-	h.mu.Unlock()
-	httpx.Error(w, http.StatusNotFound, "installation task not found")
+	return false, nil
+}
+
+// CancelPackageInstall removes an active/queued package installation entry by ID and persists ops state.
+// Returns true if a matching installation was found and removed.
+func (h *Handler) CancelPackageInstall(id string) bool {
+	found, err := h.cancelPackageInstall(context.Background(), id)
+	return found && err == nil
+}
+
+func (h *Handler) handleCancelInstall(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("Id")
+	found, err := h.cancelPackageInstall(r.Context(), id)
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "failed to persist cancellation")
+		return
+	}
+	if !found {
+		httpx.Error(w, http.StatusNotFound, "installation task not found")
+		return
+	}
+	httpx.NoContent(w)
 }

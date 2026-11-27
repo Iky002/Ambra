@@ -91,7 +91,7 @@ func TestCollectionsAndPlaylistsExtraBranches(t *testing.T) {
 	addBody, _ := json.Marshal(map[string]any{"Ids": []string{m1.ID}})
 	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/Playlists/"+plRes.Id+"/Items", bytes.NewReader(addBody)))
-	if rec.Code != http.StatusNoContent {
+	if rec.Code != http.StatusOK {
 		t.Fatalf("POST /Playlists/{Id}/Items failed: %d", rec.Code)
 	}
 

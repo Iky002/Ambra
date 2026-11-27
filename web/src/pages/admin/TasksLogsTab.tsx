@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  AlertTriangle,
+  ArrowDownToLine,
   CalendarClock,
   Clock,
   Download,
@@ -15,11 +17,28 @@ import {
   Terminal,
   Trash2,
 } from 'lucide-react'
-import { api } from '../../api/client'
-import type { ScheduledTaskInfo, ServerLogFile, TaskTriggerInfo } from '../../api/types'
+import { ApiError, api, embyFetch } from '../../api/client'
+import type { QueryResult, ScheduledTaskInfo, ServerLogFile, TaskTriggerInfo } from '../../api/types'
 import { QueryErrorState } from '../../components/QueryErrorState'
+import { isDemoMode } from '../../demo/demoMode'
 import { useI18n, type TranslationVars } from '../../i18n/I18nContext'
-import { AdminModal, FeedbackBanner, formatBytes, formatDateTime } from './adminUtils'
+import { AdminModal, adminLabel, FeedbackBanner, formatBytes, formatDateTime } from './adminUtils'
+
+interface SyncJobItem {
+  Id: string
+  Name?: string
+  Status?: string
+  Progress?: number
+  TargetId?: string
+  TargetName?: string
+  Quality?: string
+  Profile?: string
+  Bitrate?: number
+  UserId?: string
+  ItemCount?: number
+  DateCreated?: string
+  DateLastModified?: string
+}
 
 const TICKS_PER_MINUTE = 60 * 10_000_000
 const TICKS_PER_HOUR = 3600 * 10_000_000
@@ -76,7 +95,8 @@ function formatTriggerLabel(
 }
 
 export function TasksLogsTab() {
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
+  const queryClient = useQueryClient()
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
     null,
   )
@@ -84,6 +104,11 @@ export function TasksLogsTab() {
   const [stoppingTaskId, setStoppingTaskId] = useState<string | null>(null)
   const [selectedLog, setSelectedLog] = useState<string | null>(null)
   const [logFilter, setLogFilter] = useState('')
+  const deferredLogFilter = useDeferredValue(logFilter)
+
+  // Sync / 离线转码任务状态
+  const [confirmCancelSyncJob, setConfirmCancelSyncJob] = useState<SyncJobItem | null>(null)
+  const [deletingSyncJobId, setDeletingSyncJobId] = useState<string | null>(null)
 
   // 多触发规则列表管理状态
   const [editingTriggersTask, setEditingTriggersTask] = useState<ScheduledTaskInfo | null>(null)
@@ -125,6 +150,39 @@ export function TasksLogsTab() {
   })
 
   const tasks: ScheduledTaskInfo[] = Array.isArray(rawTasks) ? rawTasks : []
+
+  const {
+    data: syncJobs = [],
+    isLoading: syncJobsLoading,
+    isFetching: syncJobsFetching,
+    isError: syncJobsIsError,
+    error: syncJobsError,
+    refetch: refetchSyncJobs,
+  } = useQuery({
+    queryKey: ['admin', 'syncJobs'],
+    queryFn: async (): Promise<SyncJobItem[]> => {
+      try {
+        const res = await embyFetch<QueryResult<SyncJobItem> | SyncJobItem[]>('/emby/Sync/Jobs')
+        if (Array.isArray(res)) return res
+        if (res && Array.isArray(res.Items)) return res.Items
+        return []
+      } catch (err) {
+        if (isDemoMode() && err instanceof ApiError && err.status === 404) {
+          return []
+        }
+        throw err
+      }
+    },
+    retry: false,
+    refetchInterval: (query) =>
+      Array.isArray(query.state.data) &&
+      query.state.data.some((job) => {
+        const st = (job.Status || '').toLowerCase()
+        return st === 'converting' || st === 'transferring' || st === 'queued'
+      })
+        ? 3000
+        : false,
+  })
 
   const {
     data: rawLogFiles,
@@ -293,14 +351,52 @@ export function TasksLogsTab() {
     }
   }
 
+  const handleDeleteSyncJob = async (job: SyncJobItem) => {
+    setDeletingSyncJobId(job.Id)
+    setFeedback(null)
+    try {
+      await embyFetch<void>(`/emby/Sync/Jobs/${encodeURIComponent(job.Id)}`, {
+        method: 'DELETE',
+      })
+      setConfirmCancelSyncJob(null)
+      await queryClient.invalidateQueries({ queryKey: ['admin', 'syncJobs'] })
+      setFeedback({
+        type: 'success',
+        message: adminLabel(
+          t,
+          locale,
+          'admin.tasks.syncJobDeletedSuccess',
+          '已取消并移除同步/离线转码任务「{{name}}」',
+          'Cancelled and removed sync job "{{name}}"',
+          { name: job.Name || job.Id },
+        ),
+      })
+    } catch (err) {
+      setFeedback({
+        type: 'error',
+        message:
+          err instanceof Error
+            ? err.message
+            : adminLabel(
+                t,
+                locale,
+                'admin.tasks.syncJobDeleteFailed',
+                '取消同步任务失败',
+                'Failed to cancel sync job',
+              ),
+      })
+    } finally {
+      setDeletingSyncJobId(null)
+    }
+  }
+
+  const rawLogLines = useMemo(() => (rawLogText ? rawLogText.split('\n') : []), [rawLogText])
+
   const filteredLogText = useMemo(() => {
-    if (!logFilter.trim()) return rawLogText
-    const keyword = logFilter.trim().toLowerCase()
-    return rawLogText
-      .split('\n')
-      .filter((line) => line.toLowerCase().includes(keyword))
-      .join('\n')
-  }, [rawLogText, logFilter])
+    const keyword = deferredLogFilter.trim().toLowerCase()
+    if (!keyword) return rawLogText
+    return rawLogLines.filter((line) => line.toLowerCase().includes(keyword)).join('\n')
+  }, [rawLogText, rawLogLines, deferredLogFilter])
 
   return (
     <div className="space-y-8">
@@ -459,6 +555,229 @@ export function TasksLogsTab() {
                         <span>{t('admin.tasks.runNowBtn')}</span>
                       </button>
                     </div>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </section>
+
+      {/* Sync / 离线转码任务监控 */}
+      <section data-testid="sync-jobs-section" className="space-y-4">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h2 className="flex items-center gap-2 text-base font-semibold text-zinc-100">
+              <ArrowDownToLine className="h-4 w-4 text-amber-400" />
+              <span>
+                {adminLabel(
+                  t,
+                  locale,
+                  'admin.tasks.syncJobsTitle',
+                  '同步与离线转码任务',
+                  'Sync / Offline Transcode Jobs',
+                )}
+              </span>
+              <span className="rounded-md bg-white/8 px-2 py-0.5 text-xs font-medium text-zinc-300">
+                {syncJobs.length}
+              </span>
+            </h2>
+            <p className="mt-1 text-xs text-zinc-400">
+              {adminLabel(
+                t,
+                locale,
+                'admin.tasks.syncJobsSubtitle',
+                '监控客户端离线下载与后台转码同步队列，支持随时取消或清理异常任务。',
+                'Monitor client offline download and background sync transcode jobs, and cancel or clean up stalled jobs.',
+              )}
+            </p>
+          </div>
+          <button
+            type="button"
+            data-testid="refresh-sync-jobs-btn"
+            onClick={() => void refetchSyncJobs()}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-amber-400/40 hover:text-amber-300"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${syncJobsFetching ? 'animate-spin' : ''}`} />
+            <span>
+              {adminLabel(
+                t,
+                locale,
+                'admin.tasks.refreshSyncJobsBtn',
+                '刷新同步队列',
+                'Refresh Sync Jobs',
+              )}
+            </span>
+          </button>
+        </div>
+
+        {syncJobsLoading ? (
+          <div className="flex h-24 items-center justify-center rounded-2xl border border-white/8 bg-white/[0.02]">
+            <Loader2 className="h-5 w-5 animate-spin text-amber-400" />
+          </div>
+        ) : syncJobsIsError ? (
+          <div
+            data-testid="sync-jobs-error"
+            className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-red-500/25 bg-red-500/10 px-4 py-3 text-xs text-red-200"
+          >
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="h-4 w-4 shrink-0 text-red-400" />
+              <span>
+                {adminLabel(
+                  t,
+                  locale,
+                  'admin.tasks.syncJobsLoadError',
+                  '加载同步任务失败：{{error}}',
+                  'Failed to load sync jobs: {{error}}',
+                  {
+                    error:
+                      syncJobsError instanceof Error ? syncJobsError.message : 'Unknown error',
+                  },
+                )}
+              </span>
+            </div>
+            <button
+              type="button"
+              data-testid="retry-sync-jobs-btn"
+              onClick={() => void refetchSyncJobs()}
+              className="rounded-lg border border-red-400/30 bg-red-500/15 px-2.5 py-1 text-xs font-medium text-red-200 hover:bg-red-500/25"
+            >
+              {adminLabel(
+                t,
+                locale,
+                'admin.tasks.retrySyncJobsBtn',
+                '重试同步队列',
+                'Retry Sync Jobs',
+              )}
+            </button>
+          </div>
+        ) : syncJobs.length === 0 ? (
+          <div
+            data-testid="sync-jobs-empty"
+            className="rounded-2xl border border-white/8 bg-white/[0.02] py-8 text-center text-xs text-zinc-500"
+          >
+            {adminLabel(
+              t,
+              locale,
+              'admin.tasks.syncJobsEmpty',
+              '当前暂无同步或离线转码任务',
+              'No active or queued sync / offline transcode jobs',
+            )}
+          </div>
+        ) : (
+          <div className="divide-y divide-white/6 overflow-hidden rounded-2xl border border-white/8 bg-white/[0.02]">
+            {syncJobs.map((job) => {
+              const status = job.Status || 'Queued'
+              const statusLower = status.toLowerCase()
+              const isActive =
+                statusLower === 'converting' ||
+                statusLower === 'transferring' ||
+                statusLower === 'queued' ||
+                statusLower === 'readytotransfer'
+              const isFailed = statusLower === 'failed' || statusLower === 'cancelled'
+              const progressPct =
+                typeof job.Progress === 'number'
+                  ? Math.min(100, Math.max(0, Math.round(job.Progress)))
+                  : null
+              const isDeleting = deletingSyncJobId === job.Id
+
+              return (
+                <div
+                  key={job.Id}
+                  data-testid={`sync-job-row-${job.Id}`}
+                  className="flex flex-col gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between"
+                >
+                  <div className="min-w-0 flex-1 space-y-1.5">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="truncate text-sm font-semibold text-zinc-100">
+                        {job.Name || job.Id}
+                      </p>
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ring-1 ${
+                          isFailed
+                            ? 'bg-red-500/15 text-red-300 ring-red-500/30'
+                            : isActive
+                              ? 'bg-amber-500/20 text-amber-300 ring-amber-500/40'
+                              : 'bg-emerald-500/15 text-emerald-300 ring-emerald-500/30'
+                        }`}
+                      >
+                        {status}
+                      </span>
+                      {(job.Quality || job.Profile) && (
+                        <span className="rounded bg-white/8 px-1.5 py-0.5 font-mono text-[10px] text-zinc-300">
+                          {[job.Profile, job.Quality].filter(Boolean).join(' · ')}
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-400">
+                      {(job.TargetName || job.TargetId) && (
+                        <span>
+                          {adminLabel(
+                            t,
+                            locale,
+                            'admin.tasks.syncJobTarget',
+                            '目标设备: {{target}}',
+                            'Target: {{target}}',
+                            { target: job.TargetName || job.TargetId || '-' },
+                          )}
+                        </span>
+                      )}
+                      {typeof job.ItemCount === 'number' && (
+                        <span>
+                          {adminLabel(
+                            t,
+                            locale,
+                            'admin.tasks.syncJobItems',
+                            '共 {{count}} 项',
+                            '{{count}} item(s)',
+                            { count: job.ItemCount },
+                          )}
+                        </span>
+                      )}
+                      {job.DateCreated && (
+                        <span className="font-mono text-[11px] text-zinc-500">
+                          {formatDateTime(job.DateCreated)}
+                        </span>
+                      )}
+                    </div>
+
+                    {progressPct !== null && (
+                      <div className="flex items-center gap-2.5 pt-0.5">
+                        <div className="h-1.5 max-w-xs flex-1 overflow-hidden rounded-full bg-white/10">
+                          <div
+                            className="h-full rounded-full bg-amber-500 transition-all"
+                            style={{ width: `${progressPct}%` }}
+                          />
+                        </div>
+                        <span className="font-mono text-[11px] text-zinc-300">{progressPct}%</span>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex shrink-0 items-center justify-end">
+                    <button
+                      type="button"
+                      data-testid={`cancel-sync-job-${job.Id}`}
+                      disabled={isDeleting}
+                      onClick={() => setConfirmCancelSyncJob(job)}
+                      className="inline-flex items-center gap-1 rounded-lg border border-red-500/25 bg-red-500/10 px-2.5 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
+                    >
+                      {isDeleting ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Trash2 className="h-3.5 w-3.5" />
+                      )}
+                      <span>
+                        {adminLabel(
+                          t,
+                          locale,
+                          'admin.tasks.cancelSyncJobBtn',
+                          '取消 / 移除',
+                          'Cancel / Remove',
+                        )}
+                      </span>
+                    </button>
                   </div>
                 </div>
               )
@@ -768,6 +1087,81 @@ export function TasksLogsTab() {
                 <Save className="h-3.5 w-3.5" />
               )}
               <span>{t('admin.tasks.saveRulesBtn')}</span>
+            </button>
+          </div>
+        </div>
+      </AdminModal>
+
+      {/* 取消/移除离线转码同步任务确认弹窗 */}
+      <AdminModal
+        open={Boolean(confirmCancelSyncJob)}
+        title={adminLabel(
+          t,
+          locale,
+          'admin.tasks.confirmCancelSyncJobTitle',
+          '确认取消并移除同步任务',
+          'Confirm Sync Job Removal',
+        )}
+        subtitle={confirmCancelSyncJob?.Name || confirmCancelSyncJob?.Id}
+        maxWidthClass="max-w-md"
+        onClose={() => {
+          if (!deletingSyncJobId) {
+            setConfirmCancelSyncJob(null)
+          }
+        }}
+      >
+        <div className="space-y-4">
+          <div
+            data-testid="confirm-cancel-sync-job-warning"
+            className="flex items-start gap-3 rounded-xl border border-red-500/30 bg-red-500/10 p-3.5 text-xs leading-relaxed text-red-200"
+          >
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-400" />
+            <p>
+              {adminLabel(
+                t,
+                locale,
+                'admin.tasks.confirmCancelSyncJobDesc',
+                '确定要取消并删除同步/离线转码任务「{{name}}」吗？进行中的后台转码与已生成的临时缓存文件将被清理。',
+                'Are you sure you want to cancel and remove sync job "{{name}}"? Any running offline transcode process and temporary files for this job will be cleaned up.',
+                { name: confirmCancelSyncJob?.Name || confirmCancelSyncJob?.Id || '' },
+              )}
+            </p>
+          </div>
+
+          <div className="flex justify-end gap-2 pt-2">
+            <button
+              type="button"
+              disabled={Boolean(deletingSyncJobId)}
+              onClick={() => setConfirmCancelSyncJob(null)}
+              className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10 disabled:opacity-50"
+            >
+              {t('common.cancel')}
+            </button>
+            <button
+              type="button"
+              data-testid="confirm-cancel-sync-job-btn"
+              disabled={Boolean(deletingSyncJobId) || !confirmCancelSyncJob}
+              onClick={() => {
+                if (confirmCancelSyncJob) {
+                  void handleDeleteSyncJob(confirmCancelSyncJob)
+                }
+              }}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-red-500 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-red-400 disabled:opacity-60"
+            >
+              {deletingSyncJobId ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Trash2 className="h-3.5 w-3.5" />
+              )}
+              <span>
+                {adminLabel(
+                  t,
+                  locale,
+                  'admin.tasks.confirmCancelSyncJobBtn',
+                  '确认移除任务',
+                  'Remove Sync Job',
+                )}
+              </span>
             </button>
           </div>
         </div>

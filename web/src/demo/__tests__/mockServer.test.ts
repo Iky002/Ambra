@@ -894,4 +894,105 @@ describe('Demo Mock 引擎 - Serverless 完整闭环测试', () => {
     )
     expect(remoteSubs.length).toBeGreaterThan(0)
   })
+
+  it('[H-15, C-01, 3.2-5, 3.2-6 & 3.2-9] 阻断 admin 子串提权与未知/吊销显式凭证回退、保护已完成初始化向导、支持 DeleteInfo / ChannelMappingOptions 解绑与普通用户查询自身设备', async () => {
+    // H-15 Fix #1: 包含 "admin" 子串的伪造 Token 绝不能提权
+    clearAuth()
+    await expect(
+      embyFetch('/emby/Users', {
+        headers: { 'X-Emby-Token': 'forged-admin-escalation-token' },
+      }),
+    ).rejects.toMatchObject({ status: 401 })
+
+    // H-15 Fix #3: demoSetupCompleted 为 true 时，匿名调用 /api/setup/admin 或 /api/setup/complete 必须返回 403
+    await expect(
+      api.setupAdmin({
+        server_name: 'Hijacked',
+        language: 'en-US',
+        username: 'attacker',
+        password: 'password123',
+      }),
+    ).rejects.toMatchObject({ status: 403 })
+    await expect(
+      embyFetch('/api/setup/complete', { method: 'POST', body: JSON.stringify({}) }, false),
+    ).rejects.toMatchObject({ status: 403 })
+
+    // H-15 Fix #2: 即使 localStorage 已登录管理员，显式传入未知或已注销凭证也必须立即返回 401，绝不回退 localStorage
+    const adminSession = await loginAsDemo('admin')
+    await expect(
+      embyFetch('/emby/System/Info', {
+        headers: { 'X-Emby-Token': 'unknown-explicit-token-999' },
+      }),
+    ).rejects.toMatchObject({ status: 401 })
+    await expect(
+      embyFetch('/emby/System/Info?api_key=invalid-query-key-888'),
+    ).rejects.toMatchObject({ status: 401 })
+
+    // 注销会话后，旧 Token 即使显式携带也立即失效 (401)
+    const oldToken = adminSession.AccessToken
+    await api.logout()
+    clearAuth()
+    await expect(
+      embyFetch('/emby/System/Info', {
+        headers: { Authorization: `MediaBrowser Token="${oldToken}"` },
+      }),
+    ).rejects.toMatchObject({ status: 401 })
+
+    // 3.2-9: 普通已认证用户访问 GET /emby/Devices 允许通过并仅返回自身设备，DELETE /emby/Devices 仍返回 403
+    const guestSession = await loginAsDemo('guest')
+    const guestDevices = await api.getDevices()
+    expect(guestDevices.Items.every((d) => d.LastUserId === guestSession.User.Id)).toBe(true)
+    await expect(api.deleteDevice('dev-demo-01')).rejects.toMatchObject({ status: 403 })
+
+    // 切换回管理员验证 C-01 DeleteInfo、3.2-9 ChannelMappingOptions 与 3.2-5 解绑、3.2-6 字段清空
+    const adminAgain = await loginAsDemo('admin')
+    const movieDelInfo = await api.getItemDeleteInfo('item-dune-2')
+    expect(movieDelInfo.Paths && movieDelInfo.Paths.length).toBeGreaterThanOrEqual(2)
+    expect(movieDelInfo.Paths?.some((p) => p.endsWith('.nfo'))).toBe(true)
+
+    const seriesDelInfo = await api.getItemDeleteInfo('item-three-body')
+    expect(seriesDelInfo.Paths && seriesDelInfo.Paths.length).toBeGreaterThanOrEqual(4)
+    expect(seriesDelInfo.Paths?.some((p) => p.endsWith('tvshow.nfo'))).toBe(true)
+
+    const mapOpts = await api.getChannelMappings('epg-demo-01')
+    expect(mapOpts.TunerChannels.length).toBeGreaterThan(0)
+    expect(mapOpts.ProviderChannels.length).toBeGreaterThan(0)
+
+    await api.setChannelMapping({
+      ProviderId: 'epg-demo-01',
+      TunerChannelId: mapOpts.TunerChannels[0].Id,
+      ProviderChannelId: 'xmltv-custom-01',
+    })
+    const afterBind = await api.getChannelMappings('epg-demo-01')
+    expect(
+      afterBind.Mappings.find((m) => m.TunerChannelId === mapOpts.TunerChannels[0].Id)
+        ?.ProviderChannelId,
+    ).toBe('xmltv-custom-01')
+
+    // 解绑（空 ProviderChannelId）
+    await api.setChannelMapping({
+      ProviderId: 'epg-demo-01',
+      TunerChannelId: mapOpts.TunerChannels[0].Id,
+      ProviderChannelId: '',
+    })
+    const afterUnbind = await api.getChannelMappings('epg-demo-01')
+    expect(
+      afterUnbind.Mappings.find((m) => m.TunerChannelId === mapOpts.TunerChannels[0].Id),
+    ).toBeUndefined()
+
+    // 3.2-6: 显式传 null 清空年份与评分
+    await api.updateItemMetadata('item-dune-2', {
+      ProductionYear: null,
+      CommunityRating: null,
+      OfficialRating: '',
+      LockData: true,
+      LockedFields: ['Name', 'Overview'],
+    })
+    const clearedDune = await api.getItem(adminAgain.User.Id, 'item-dune-2')
+    expect(clearedDune.ProductionYear).toBeUndefined()
+    expect(clearedDune.CommunityRating).toBeUndefined()
+    expect(clearedDune.OfficialRating).toBe('')
+    expect(clearedDune.LockData).toBe(true)
+    expect(clearedDune.LockedFields).toEqual(['Name', 'Overview'])
+  })
 })

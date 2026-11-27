@@ -2,6 +2,7 @@ package playback
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"path/filepath"
@@ -14,6 +15,9 @@ import (
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
+
+// ErrPlaybackForbidden is returned when a non-administrator user has EnableMediaPlayback disabled.
+var ErrPlaybackForbidden = errors.New("media playback is disabled for this user")
 
 // PlayMethod enumerates the 5-tier playback decision outcomes.
 type PlayMethod string
@@ -126,6 +130,18 @@ func (e *Engine) ResolveStream(ctx context.Context, rawPath string) (*plugins.St
 
 // Decide evaluates the 5-tier playback strategy for all (or the requested) MediaSources of an item.
 func (e *Engine) Decide(ctx context.Context, itemID string, req PlaybackInfoRequest) (*dto.PlaybackInfoResponse, []DecisionDetail, error) {
+	var userCfg *dto.UserConfiguration
+	var userData *sqlite.UserItemDataRecord
+	if e.userRepo != nil && strings.TrimSpace(req.UserID) != "" {
+		if u, uErr := e.userRepo.GetUserByID(ctx, req.UserID); uErr == nil && u != nil {
+			if !u.IsAdmin && !u.Policy.IsAdministrator && !u.Policy.EnableMediaPlayback {
+				return nil, nil, ErrPlaybackForbidden
+			}
+			cfgCopy := u.Config
+			userCfg = &cfgCopy
+		}
+	}
+
 	itemID = guid.Normalize(itemID)
 	item, err := e.repo.GetItemRecordByID(ctx, itemID)
 	if err != nil {
@@ -150,13 +166,7 @@ func (e *Engine) Decide(ctx context.Context, itemID string, req PlaybackInfoRequ
 		}}
 	}
 
-	var userCfg *dto.UserConfiguration
-	var userData *sqlite.UserItemDataRecord
 	if e.userRepo != nil && strings.TrimSpace(req.UserID) != "" {
-		if u, uErr := e.userRepo.GetUserByID(ctx, req.UserID); uErr == nil && u != nil {
-			cfgCopy := u.Config
-			userCfg = &cfgCopy
-		}
 		if ud, udErr := e.userRepo.GetUserItemData(ctx, req.UserID, item.ID); udErr == nil && ud != nil {
 			userData = ud
 		}

@@ -121,24 +121,29 @@ export function CollectionsPage() {
   const createMutation = useMutation({
     mutationFn: async () => {
       const trimmed = newName.trim()
-      if (!trimmed) throw new Error('请输入名称')
+      if (!trimmed) throw new Error(t('collectionsUi.errNameRequired'))
       if (createType === 'Playlist') {
         return api.createPlaylist(trimmed, userId)
       }
       return api.createCollection(trimmed)
     },
     onSuccess: async (created) => {
-      const label = createType === 'Playlist' ? '播放列表' : '合集'
       setNewName('')
       setCreateOpen(false)
       setActiveTab(createType)
       await queryClient.invalidateQueries({ queryKey: ['collections', userId] })
-      setFeedback({ type: 'success', message: `已创建${label}「${created.Name}」` })
+      setFeedback({
+        type: 'success',
+        message:
+          createType === 'Playlist'
+            ? t('collectionsUi.createdPlaylistSuccess', { name: created.Name })
+            : t('collectionsUi.createdCollectionSuccess', { name: created.Name }),
+      })
     },
     onError: (err) => {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '创建失败',
+        message: err instanceof Error ? err.message : t('collectionsUi.createFailed'),
       })
     },
   })
@@ -155,7 +160,10 @@ export function CollectionsPage() {
     onSuccess: async (target) => {
       setDeleteTarget(null)
       await queryClient.invalidateQueries({ queryKey: ['collections', userId] })
-      setFeedback({ type: 'success', message: `已删除「${target.Name}」` })
+      setFeedback({
+        type: 'success',
+        message: t('collectionsUi.deletedSuccess', { name: target.Name }),
+      })
       if (selectedId === target.Id) {
         navigate('/collections', { replace: true })
       }
@@ -164,7 +172,7 @@ export function CollectionsPage() {
       setDeleteTarget(null)
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '删除失败',
+        message: err instanceof Error ? err.message : t('collectionsUi.deleteFailed'),
       })
     },
   })
@@ -191,12 +199,12 @@ export function CollectionsPage() {
         queryClient.invalidateQueries({ queryKey: ['collectionItems', selectedId] }),
         queryClient.invalidateQueries({ queryKey: ['collections', userId] }),
       ])
-      setFeedback({ type: 'success', message: '已将该作品移出列表' })
+      setFeedback({ type: 'success', message: t('collectionsUi.removedMemberSuccess') })
     },
     onError: (err) => {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '移出失败',
+        message: err instanceof Error ? err.message : t('collectionsUi.removeMemberFailed'),
       })
     },
   })
@@ -212,7 +220,7 @@ export function CollectionsPage() {
     onError: (err) => {
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : '调整排序失败',
+        message: err instanceof Error ? err.message : t('collectionsUi.reorderFailed'),
       })
     },
   })
@@ -230,11 +238,11 @@ export function CollectionsPage() {
       return (
         <div className="px-4 pt-6 lg:px-8">
           <QueryErrorState
-            title="无法加载合集或播放列表详情"
+            title={t('collectionsUi.loadDetailError')}
             error={containerErr}
             onRetry={() => void refetchContainer()}
             backTo="/collections"
-            backLabel="返回合集与播放列表"
+            backLabel={t('collectionsUi.backToCollections')}
           />
         </div>
       )
@@ -250,7 +258,7 @@ export function CollectionsPage() {
               className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-400 transition-colors hover:text-amber-300"
             >
               <ArrowLeft className="h-3.5 w-3.5" />
-              <span>返回合集与播放列表</span>
+              <span>{t('collectionsUi.backToCollections')}</span>
             </Link>
             <div className="flex items-center gap-2.5">
               {isSelectedPlaylist ? (
@@ -263,7 +271,9 @@ export function CollectionsPage() {
               </h1>
               <span className="rounded-full bg-white/10 px-2.5 py-0.5 text-xs text-zinc-300">
                 {isSelectedPlaylist ? t('collections.playlists') : t('collections.boxSets')} ·{' '}
-                {memberData?.TotalRecordCount ?? members.length} 部
+                {t('collectionsUi.itemsCountBadge', {
+                  count: memberData?.TotalRecordCount ?? members.length,
+                })}
               </span>
             </div>
             {selectedContainer?.Overview && (
@@ -309,7 +319,11 @@ export function CollectionsPage() {
                   className="inline-flex items-center gap-1.5 rounded-xl border border-red-500/30 bg-red-500/10 px-3.5 py-2 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20"
                 >
                   <Trash2 className="h-3.5 w-3.5" />
-                  <span>删除{isSelectedPlaylist ? '播放列表' : '合集'}</span>
+                  <span>
+                    {isSelectedPlaylist
+                      ? t('collectionsUi.deletePlaylistBtn')
+                      : t('collectionsUi.deleteCollectionBtn')}
+                  </span>
                 </button>
               )}
             </div>
@@ -331,18 +345,18 @@ export function CollectionsPage() {
         ) : membersError ? (
           <QueryErrorState
             compact
-            title="无法加载列表成员"
+            title={t('collectionsUi.loadMembersError')}
             error={membersErr}
             onRetry={() => void refetchMembers()}
             backTo="/collections"
-            backLabel="返回合集与播放列表"
+            backLabel={t('collectionsUi.backToCollections')}
           />
         ) : members.length === 0 ? (
           <div className="rounded-2xl border border-dashed border-white/12 bg-white/[0.02] px-6 py-20 text-center">
-            <p className="text-sm font-medium text-zinc-300">当前列表还没有任何作品</p>
-            <p className="mt-1.5 text-xs text-zinc-500">
-              在任意影片或剧集详情页点击「加入合集 / 片单」即可快速添加。
+            <p className="text-sm font-medium text-zinc-300">
+              {t('collectionsUi.emptyMembersTitle')}
             </p>
+            <p className="mt-1.5 text-xs text-zinc-500">{t('collectionsUi.emptyMembersDesc')}</p>
           </div>
         ) : (
           <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
@@ -366,8 +380,8 @@ export function CollectionsPage() {
                           e.stopPropagation()
                           moveMemberMutation.mutate({ itemId: memberEntryId, newIndex: idx - 1 })
                         }}
-                        title="上移"
-                        aria-label={`上移 ${member.Name}`}
+                        title={t('collectionsUi.moveUp')}
+                        aria-label={t('collectionsUi.moveUpItemAria', { name: member.Name })}
                         className="flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-200 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-amber-500 hover:text-zinc-950 disabled:opacity-35"
                       >
                         <ArrowUp className="h-3.5 w-3.5" />
@@ -380,8 +394,8 @@ export function CollectionsPage() {
                           e.stopPropagation()
                           moveMemberMutation.mutate({ itemId: memberEntryId, newIndex: idx + 1 })
                         }}
-                        title="下移"
-                        aria-label={`下移 ${member.Name}`}
+                        title={t('collectionsUi.moveDown')}
+                        aria-label={t('collectionsUi.moveDownItemAria', { name: member.Name })}
                         className="flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-200 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-amber-500 hover:text-zinc-950 disabled:opacity-35"
                       >
                         <ArrowDown className="h-3.5 w-3.5" />
@@ -397,8 +411,8 @@ export function CollectionsPage() {
                         e.stopPropagation()
                         removeMemberMutation.mutate(member)
                       }}
-                      title="移出列表"
-                      aria-label={`移出 ${member.Name}`}
+                      title={t('collectionsUi.removeFromList')}
+                      aria-label={t('collectionsUi.removeItemAria', { name: member.Name })}
                       className="absolute right-2 top-2 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-200 opacity-100 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-red-500 hover:text-white [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/member:opacity-100 [@media(hover:hover)]:focus:opacity-100"
                     >
                       <X className="h-3.5 w-3.5" />
@@ -412,14 +426,18 @@ export function CollectionsPage() {
 
         <AdminModal
           open={Boolean(deleteTarget)}
-          title={`确认删除${deleteTarget?.Type === 'Playlist' ? '播放列表' : '合集'}`}
-          subtitle="仅移除合集分组，不会删除媒体库中的原始影片"
+          title={
+            deleteTarget?.Type === 'Playlist'
+              ? t('collectionsUi.confirmDeletePlaylistTitle')
+              : t('collectionsUi.confirmDeleteCollectionTitle')
+          }
+          subtitle={t('collectionsUi.confirmDeleteSubtitle')}
           maxWidthClass="max-w-md"
           onClose={() => setDeleteTarget(null)}
         >
           <div className="space-y-5">
-            <p className="text-sm text-zinc-300">
-              确定要删除「<strong className="text-white">{deleteTarget?.Name}</strong>」吗？
+            <p className="text-sm font-medium text-zinc-200">
+              {t('collectionsUi.confirmDeletePrompt', { name: deleteTarget?.Name || '' })}
             </p>
             <div className="flex justify-end gap-2.5">
               <button
@@ -427,7 +445,7 @@ export function CollectionsPage() {
                 onClick={() => setDeleteTarget(null)}
                 className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10"
               >
-                取消
+                {t('common.cancel')}
               </button>
               <button
                 type="button"
@@ -435,7 +453,7 @@ export function CollectionsPage() {
                 onClick={() => deleteTarget && deleteContainerMutation.mutate(deleteTarget)}
                 className="rounded-xl bg-red-500 px-4 py-2 text-xs font-semibold text-white hover:bg-red-400 disabled:opacity-50"
               >
-                确认删除
+                {t('collectionsUi.confirmDeleteBtn')}
               </button>
             </div>
           </div>
@@ -467,9 +485,7 @@ export function CollectionsPage() {
             <Library className="h-6 w-6 text-amber-400" />
             <span>{t('collections.title')}</span>
           </h1>
-          <p className="mt-1 text-xs text-zinc-400">
-            浏览系列电影合集（BoxSet）与自定义播放列表，点击即可管理列表内的全部作品
-          </p>
+          <p className="mt-1 text-xs text-zinc-400">{t('collectionsUi.pageSubtitle')}</p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5">
@@ -549,7 +565,11 @@ export function CollectionsPage() {
         </div>
       ) : activeIsError ? (
         <QueryErrorState
-          title={activeTab === 'BoxSet' ? '无法加载合集列表' : '无法加载播放列表'}
+          title={
+            activeTab === 'BoxSet'
+              ? t('collectionsUi.loadCollectionsError')
+              : t('collectionsUi.loadPlaylistsError')
+          }
           error={activeError}
           onRetry={() => void activeRefetch()}
           backTo="/"
@@ -564,14 +584,16 @@ export function CollectionsPage() {
             )}
           </div>
           <h2 className="text-base font-semibold text-zinc-200">
-            {activeTab === 'BoxSet' ? '暂无媒体合集' : '暂无播放列表'}
+            {activeTab === 'BoxSet'
+              ? t('collectionsUi.emptyCollectionsTitle')
+              : t('collectionsUi.emptyPlaylistsTitle')}
           </h2>
           <p className="mx-auto mt-2 max-w-md text-xs leading-relaxed text-zinc-400">
             {activeTab === 'BoxSet'
               ? isAdmin
-                ? '点击右上角「新建合集」，将系列电影或主题影片归类管理。'
-                : '当前服务器暂无系列电影合集，可切换至「播放列表」创建您的专属片单。'
-              : '点击右上角「新建播放列表」，创建您的专属片单。'}
+                ? t('collectionsUi.emptyCollectionsAdminDesc')
+                : t('collectionsUi.emptyCollectionsMemberDesc')
+              : t('collectionsUi.emptyPlaylistsDesc')}
           </p>
         </div>
       ) : (
@@ -582,7 +604,7 @@ export function CollectionsPage() {
                 <MediaCard item={col} linkTo={`/collections/${col.Id}`} />
                 {typeof col.ChildCount === 'number' && col.ChildCount > 0 && (
                   <div className="pointer-events-none absolute left-2 top-2 rounded-full bg-black/75 px-2 py-0.5 text-[10px] font-semibold text-amber-300 ring-1 ring-amber-400/40 backdrop-blur-md">
-                    {col.ChildCount} 部
+                    {t('collectionsUi.itemsCountBadge', { count: col.ChildCount })}
                   </div>
                 )}
                 {(col.Type === 'Playlist' || isAdmin) && (
@@ -593,8 +615,8 @@ export function CollectionsPage() {
                       e.stopPropagation()
                       setDeleteTarget(col)
                     }}
-                    title={`删除 ${col.Name}`}
-                    aria-label={`删除 ${col.Name}`}
+                    title={t('collectionsUi.deleteItemAria', { name: col.Name })}
+                    aria-label={t('collectionsUi.deleteItemAria', { name: col.Name })}
                     className="absolute right-2 top-2 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-black/75 text-zinc-300 opacity-100 ring-1 ring-white/20 backdrop-blur-md transition-all hover:bg-red-500 hover:text-white [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/col:opacity-100 [@media(hover:hover)]:focus:opacity-100"
                   >
                     <Trash2 className="h-3.5 w-3.5" />
@@ -619,7 +641,10 @@ export function CollectionsPage() {
               >
                 {isFetching && <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-400" />}
                 <span>
-                  加载更多（已显示 {activeItems.length} / {activeTotal}）
+                  {t('collectionsUi.loadMoreCount', {
+                    shown: activeItems.length,
+                    total: activeTotal,
+                  })}
                 </span>
               </button>
             </div>
@@ -637,8 +662,8 @@ export function CollectionsPage() {
         }
         subtitle={
           createType === 'BoxSet'
-            ? '创建一个新的系列合集（BoxSet）'
-            : '创建一个新的自定义播放列表'
+            ? t('collectionsUi.createCollectionModalSub')
+            : t('collectionsUi.createPlaylistModalSub')
         }
         maxWidthClass="max-w-md"
         onClose={() => setCreateOpen(false)}
@@ -661,7 +686,7 @@ export function CollectionsPage() {
                     : 'border-white/10 bg-white/[0.03] text-zinc-400 hover:text-zinc-200'
                 }`}
               >
-                合集 (BoxSet)
+                {t('collectionsUi.typeBoxSetBtn')}
               </button>
               <button
                 type="button"
@@ -672,20 +697,24 @@ export function CollectionsPage() {
                     : 'border-white/10 bg-white/[0.03] text-zinc-400 hover:text-zinc-200'
                 }`}
               >
-                播放列表 (Playlist)
+                {t('collectionsUi.typePlaylistBtn')}
               </button>
             </div>
           )}
 
           <label className="block space-y-1.5">
-            <span className="text-xs font-medium text-zinc-300">名称</span>
+            <span className="text-xs font-medium text-zinc-300">{t('collectionsUi.nameLabel')}</span>
             <input
               type="text"
               autoFocus
               required
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
-              placeholder={createType === 'BoxSet' ? '例如：诺兰科幻三部曲' : '例如：周末必看片单'}
+              placeholder={
+                createType === 'BoxSet'
+                  ? t('collectionsUi.collectionNamePlaceholder')
+                  : t('collectionsUi.playlistNamePlaceholder')
+              }
               className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60"
             />
           </label>
@@ -696,7 +725,7 @@ export function CollectionsPage() {
               onClick={() => setCreateOpen(false)}
               className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10"
             >
-              取消
+              {t('common.cancel')}
             </button>
             <button
               type="submit"
@@ -704,7 +733,7 @@ export function CollectionsPage() {
               className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 hover:bg-amber-400 disabled:opacity-50"
             >
               {createMutation.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-              <span>创建</span>
+              <span>{t('collectionsUi.createSubmitBtn')}</span>
             </button>
           </div>
         </form>
@@ -713,14 +742,18 @@ export function CollectionsPage() {
       {/* 删除确认弹窗 */}
       <AdminModal
         open={Boolean(deleteTarget)}
-        title={`确认删除${deleteTarget?.Type === 'Playlist' ? '播放列表' : '合集'}`}
-        subtitle="仅移除合集分组，不会删除媒体库中的原始影片"
+        title={
+          deleteTarget?.Type === 'Playlist'
+            ? t('collectionsUi.confirmDeletePlaylistTitle')
+            : t('collectionsUi.confirmDeleteCollectionTitle')
+        }
+        subtitle={t('collectionsUi.confirmDeleteSubtitle')}
         maxWidthClass="max-w-md"
         onClose={() => setDeleteTarget(null)}
       >
         <div className="space-y-5">
-          <p className="text-sm text-zinc-300">
-            确定要删除「<strong className="text-white">{deleteTarget?.Name}</strong>」吗？
+          <p className="text-sm font-medium text-zinc-200">
+            {t('collectionsUi.confirmDeletePrompt', { name: deleteTarget?.Name || '' })}
           </p>
           <div className="flex justify-end gap-2.5">
             <button
@@ -728,7 +761,7 @@ export function CollectionsPage() {
               onClick={() => setDeleteTarget(null)}
               className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10"
             >
-              取消
+              {t('common.cancel')}
             </button>
             <button
               type="button"
@@ -736,7 +769,7 @@ export function CollectionsPage() {
               onClick={() => deleteTarget && deleteContainerMutation.mutate(deleteTarget)}
               className="rounded-xl bg-red-500 px-4 py-2 text-xs font-semibold text-white hover:bg-red-400 disabled:opacity-50"
             >
-              确认删除
+              {t('collectionsUi.confirmDeleteBtn')}
             </button>
           </div>
         </div>

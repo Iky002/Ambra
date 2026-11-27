@@ -203,6 +203,24 @@ func (s *Service) acquireDecodeSlot(ctx context.Context) (func(), error) {
 	}
 }
 
+func isWebPDataOrContentType(ct string, data []byte) bool {
+	if strings.EqualFold(strings.TrimSpace(ct), "image/webp") {
+		return true
+	}
+	return len(data) >= 12 && string(data[0:4]) == "RIFF" && string(data[8:12]) == "WEBP"
+}
+
+func validateWebPPayload(data []byte) error {
+	cfg, err := DecodeWebPConfig(bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("invalid webp image: %w", err)
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 || int64(cfg.Width)*int64(cfg.Height) > maxSourcePixels {
+		return fmt.Errorf("source image dimensions %dx%d exceed safety limit", cfg.Width, cfg.Height)
+	}
+	return nil
+}
+
 func (s *Service) getImageFromRecord(ctx context.Context, rec *sqlite.ImageRecord, opts Options) (*ImagePayload, error) {
 	opts = opts.Normalized()
 	if opts.IsZero() {
@@ -213,6 +231,11 @@ func (s *Service) getImageFromRecord(ctx context.Context, rec *sqlite.ImageRecor
 				return nil, err
 			}
 			ct := contentTypeForImage(rec.Path, data)
+			if isWebPDataOrContentType(ct, data) {
+				if err := validateWebPPayload(data); err != nil {
+					return nil, err
+				}
+			}
 			return &ImagePayload{
 				Data:        data,
 				ContentType: ct,
@@ -250,18 +273,27 @@ func (s *Service) getImageFromRecord(ctx context.Context, rec *sqlite.ImageRecor
 			return nil, err
 		}
 		origCT := contentTypeForImage(rec.Path, rawData)
-
-		// Pre-check image dimensions before full decode to guard against pixel bombs.
-		if cfg, _, cfgErr := image.DecodeConfig(bytes.NewReader(rawData)); cfgErr == nil {
-			if cfg.Width <= 0 || cfg.Height <= 0 || int64(cfg.Width)*int64(cfg.Height) > maxSourcePixels {
-				return nil, fmt.Errorf("source image dimensions %dx%d exceed safety limit", cfg.Width, cfg.Height)
+		isWebP := isWebPDataOrContentType(origCT, rawData)
+		if isWebP {
+			if err := validateWebPPayload(rawData); err != nil {
+				return nil, err
+			}
+		} else {
+			// Pre-check image dimensions before full decode to guard against pixel bombs.
+			if cfg, _, cfgErr := image.DecodeConfig(bytes.NewReader(rawData)); cfgErr == nil {
+				if cfg.Width <= 0 || cfg.Height <= 0 || int64(cfg.Width)*int64(cfg.Height) > maxSourcePixels {
+					return nil, fmt.Errorf("source image dimensions %dx%d exceed safety limit", cfg.Width, cfg.Height)
+				}
 			}
 		}
 
 		s.processCount.Add(1)
 		outData, outCT, transformed, procErr := ProcessImage(rawData, origCT, opts)
 		if procErr != nil {
-			// Graceful degradation for corrupted or undecodable images: serve original bytes.
+			if isWebP {
+				return nil, procErr
+			}
+			// Graceful degradation for corrupted non-WebP images: serve original bytes.
 			return &ImagePayload{
 				Data:        rawData,
 				ContentType: origCT,

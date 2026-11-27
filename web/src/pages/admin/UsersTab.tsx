@@ -17,6 +17,7 @@ import { useAuth } from '../../context/AuthContext'
 import { useI18n } from '../../i18n/I18nContext'
 import {
   AdminModal,
+  adminLabel,
   FeedbackBanner,
   formatDateTime,
   formatRelativeTime,
@@ -32,7 +33,7 @@ const UNRATED_ITEM_TYPES = [
 
 export function UsersTab() {
   const { auth, refreshUser } = useAuth()
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const queryClient = useQueryClient()
 
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
@@ -237,6 +238,7 @@ export function UsersTab() {
     setDraftPolicy({
       ...p,
       IsAdministrator: Boolean(p.IsAdministrator),
+      IsHidden: Boolean(p.IsHidden),
       IsDisabled: Boolean(p.IsDisabled),
       EnableAllFolders: p.EnableAllFolders ?? true,
       EnabledFolders: Array.isArray(p.EnabledFolders) ? [...p.EnabledFolders] : [],
@@ -691,6 +693,44 @@ export function UsersTab() {
           />
 
           <ToggleSwitch
+            checked={Boolean(draftPolicy.IsHidden)}
+            onChange={(v) => setDraftPolicy((p) => ({ ...p, IsHidden: v }))}
+            label={adminLabel(
+              t,
+              locale,
+              'admin.users.isHiddenLabel',
+              '在登录页隐藏账号 (IsHidden)',
+              'Hide user from public login screen (IsHidden)',
+            )}
+            description={adminLabel(
+              t,
+              locale,
+              'admin.users.isHiddenDesc',
+              '开启后该账号不会显示在公开登录页的用户选择列表中，仍可手动输入用户名登录',
+              'Hides this account from the public login screen user list while still allowing manual username sign-in',
+            )}
+          />
+
+          <ToggleSwitch
+            checked={draftPolicy.EnableRemoteAccess !== false}
+            onChange={(v) => setDraftPolicy((p) => ({ ...p, EnableRemoteAccess: v }))}
+            label={adminLabel(
+              t,
+              locale,
+              'admin.users.remoteAccessLabel',
+              '允许远程网络访问 (EnableRemoteAccess)',
+              'Allow remote WAN connections (EnableRemoteAccess)',
+            )}
+            description={adminLabel(
+              t,
+              locale,
+              'admin.users.remoteAccessDesc',
+              '允许该账号从局域网以外的远程公网连接服务器',
+              'Allow this user to connect from remote WAN networks outside the local LAN',
+            )}
+          />
+
+          <ToggleSwitch
             checked={Boolean(draftPolicy.EnableAllFolders)}
             onChange={(v) => setDraftPolicy((p) => ({ ...p, EnableAllFolders: v }))}
             label={t('admin.users.allFoldersLabel')}
@@ -733,10 +773,67 @@ export function UsersTab() {
           )}
 
           <ToggleSwitch
+            checked={draftPolicy.EnableMediaPlayback !== false}
+            onChange={(v) => setDraftPolicy((p) => ({ ...p, EnableMediaPlayback: v }))}
+            label={adminLabel(
+              t,
+              locale,
+              'admin.users.mediaPlaybackLabel',
+              '允许媒体播放 (EnableMediaPlayback)',
+              'Allow media playback (EnableMediaPlayback)',
+            )}
+            description={adminLabel(
+              t,
+              locale,
+              'admin.users.mediaPlaybackDesc',
+              '允许该账号播放服务器中的视频与音频媒体内容',
+              'Allow this user to play video and audio media streams',
+            )}
+          />
+
+          <ToggleSwitch
             checked={Boolean(draftPolicy.EnableVideoPlaybackTranscoding)}
             onChange={(v) => setDraftPolicy((p) => ({ ...p, EnableVideoPlaybackTranscoding: v }))}
             label={t('admin.users.videoTranscodeLabel')}
             description={t('admin.users.videoTranscodeDesc')}
+          />
+
+          <ToggleSwitch
+            checked={draftPolicy.EnableAudioPlaybackTranscoding !== false}
+            onChange={(v) => setDraftPolicy((p) => ({ ...p, EnableAudioPlaybackTranscoding: v }))}
+            label={adminLabel(
+              t,
+              locale,
+              'admin.users.audioTranscodeLabel',
+              '允许音频转码 (EnableAudioPlaybackTranscoding)',
+              'Allow audio transcoding (EnableAudioPlaybackTranscoding)',
+            )}
+            description={adminLabel(
+              t,
+              locale,
+              'admin.users.audioTranscodeDesc',
+              '当客户端不支持原始音轨编码（如 TrueHD / DTS）时允许服务端实时转码音频',
+              'Allow real-time audio transcoding when client does not support original audio codec',
+            )}
+          />
+
+          <ToggleSwitch
+            checked={draftPolicy.EnablePlaybackRemuxing !== false}
+            onChange={(v) => setDraftPolicy((p) => ({ ...p, EnablePlaybackRemuxing: v }))}
+            label={adminLabel(
+              t,
+              locale,
+              'admin.users.remuxingLabel',
+              '允许容器无损重封装 (EnablePlaybackRemuxing)',
+              'Allow container remuxing (EnablePlaybackRemuxing)',
+            )}
+            description={adminLabel(
+              t,
+              locale,
+              'admin.users.remuxingDesc',
+              '允许在不重新编码视频流的前提下将 MKV / TS 等容器实时重封装为客户端兼容格式',
+              'Allow lossless container remuxing without video re-encoding',
+            )}
           />
 
           <ToggleSwitch

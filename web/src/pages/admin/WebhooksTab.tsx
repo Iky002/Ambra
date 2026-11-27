@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  AlertTriangle,
   CheckCircle2,
   Edit3,
   Loader2,
@@ -15,7 +16,16 @@ import { api } from '../../api/client'
 import type { WebhookInfo, WebhookTestResult } from '../../api/types'
 import { QueryErrorState } from '../../components/QueryErrorState'
 import { useI18n } from '../../i18n/I18nContext'
-import { AdminModal, FeedbackBanner, ToggleSwitch } from './adminUtils'
+import { AdminModal, adminLabel, FeedbackBanner, ToggleSwitch } from './adminUtils'
+
+function isSameWebhookOriginAndPath(oldRaw: string, newRaw: string): boolean {
+  const mOld = oldRaw.trim().match(/^([a-zA-Z][a-zA-Z\d+\-.]*):\/\/([^/?#]+)([^?#]*)/)
+  const mNew = newRaw.trim().match(/^([a-zA-Z][a-zA-Z\d+\-.]*):\/\/([^/?#]+)([^?#]*)/)
+  if (!mOld || !mNew) return false
+  if (mOld[1].toLowerCase() !== mNew[1].toLowerCase()) return false
+  if (mOld[2].toLowerCase() !== mNew[2].toLowerCase()) return false
+  return mOld[3] === mNew[3]
+}
 
 export const WEBHOOK_EVENT_OPTIONS = [
   { id: '*', labelKey: 'admin.webhooks.eventAllLabel', descKey: 'admin.webhooks.eventAllDesc' },
@@ -58,7 +68,7 @@ export const WEBHOOK_EVENT_OPTIONS = [
 
 export function WebhooksTab() {
   const queryClient = useQueryClient()
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
 
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
     null,
@@ -66,6 +76,7 @@ export function WebhooksTab() {
 
   const [modalOpen, setModalOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [editingOriginalUrl, setEditingOriginalUrl] = useState('')
   const [editingHasSecret, setEditingHasSecret] = useState(false)
   const [name, setName] = useState('')
   const [url, setUrl] = useState('')
@@ -99,6 +110,7 @@ export function WebhooksTab() {
 
   const openCreateModal = () => {
     setEditingId(null)
+    setEditingOriginalUrl('')
     setEditingHasSecret(false)
     setName('')
     setUrl('')
@@ -112,6 +124,7 @@ export function WebhooksTab() {
 
   const openEditModal = (wh: WebhookInfo) => {
     setEditingId(wh.Id)
+    setEditingOriginalUrl(wh.Url)
     setEditingHasSecret(Boolean(wh.HasSecret || wh.Secret))
     setName(wh.Name)
     setUrl(wh.Url)
@@ -530,47 +543,93 @@ export function WebhooksTab() {
             >
               {t('admin.webhooks.secretLabel')}
             </label>
-            <input
-              id="webhook-secret-input"
-              type="password"
-              value={secret}
-              disabled={clearSecret}
-              onChange={(e) => setSecret(e.target.value)}
-              placeholder={
-                editingId && editingHasSecret
-                  ? clearSecret
-                    ? t('admin.webhooks.secretClearedPlaceholder')
-                    : t('admin.webhooks.secretConfiguredPlaceholder')
-                  : t('admin.webhooks.secretEmptyPlaceholder')
-              }
-              className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60 disabled:cursor-not-allowed disabled:opacity-50"
-            />
-            {editingId && editingHasSecret && (
-              <div className="mt-2 space-y-1.5">
-                <label
-                  htmlFor="webhook-clear-secret"
-                  className="inline-flex cursor-pointer items-center gap-2 text-xs text-zinc-300"
-                >
+            {(() => {
+              const urlOriginOrPathChanged =
+                Boolean(editingId) &&
+                Boolean(editingOriginalUrl) &&
+                !isSameWebhookOriginAndPath(editingOriginalUrl, url)
+              const secretWillClearOnUrlChange =
+                Boolean(editingId) &&
+                editingHasSecret &&
+                !clearSecret &&
+                urlOriginOrPathChanged &&
+                !secret.trim()
+
+              return (
+                <>
                   <input
-                    id="webhook-clear-secret"
-                    type="checkbox"
-                    checked={clearSecret}
-                    onChange={(e) => {
-                      const next = e.target.checked
-                      setClearSecret(next)
-                      if (next) setSecret('')
-                    }}
-                    className="h-3.5 w-3.5 rounded accent-amber-500"
+                    id="webhook-secret-input"
+                    type="password"
+                    value={secret}
+                    disabled={clearSecret}
+                    onChange={(e) => setSecret(e.target.value)}
+                    placeholder={
+                      editingId && editingHasSecret
+                        ? clearSecret
+                          ? t('admin.webhooks.secretClearedPlaceholder')
+                          : urlOriginOrPathChanged
+                            ? adminLabel(
+                                t,
+                                locale,
+                                'admin.webhooks.secretUrlChangedPlaceholder',
+                                '目标 URL 域名或路径已变更，留空将自动清空原密钥',
+                                'Target URL origin/path changed; leaving blank clears existing secret',
+                              )
+                            : t('admin.webhooks.secretConfiguredPlaceholder')
+                        : t('admin.webhooks.secretEmptyPlaceholder')
+                    }
+                    className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-400/60 disabled:cursor-not-allowed disabled:opacity-50"
                   />
-                  <span>{t('admin.webhooks.clearSecretLabel')}</span>
-                </label>
-                <p className="text-[11px] text-amber-300/80">
-                  {clearSecret
-                    ? t('admin.webhooks.clearSecretActiveHint')
-                    : t('admin.webhooks.clearSecretKeepHint')}
-                </p>
-              </div>
-            )}
+                  {editingId && editingHasSecret && (
+                    <div className="mt-2 space-y-1.5">
+                      <label
+                        htmlFor="webhook-clear-secret"
+                        className="inline-flex cursor-pointer items-center gap-2 text-xs text-zinc-300"
+                      >
+                        <input
+                          id="webhook-clear-secret"
+                          type="checkbox"
+                          checked={clearSecret}
+                          onChange={(e) => {
+                            const next = e.target.checked
+                            setClearSecret(next)
+                            if (next) setSecret('')
+                          }}
+                          className="h-3.5 w-3.5 rounded accent-amber-500"
+                        />
+                        <span>{t('admin.webhooks.clearSecretLabel')}</span>
+                      </label>
+                      {clearSecret ? (
+                        <p className="text-[11px] text-amber-300/80">
+                          {t('admin.webhooks.clearSecretActiveHint')}
+                        </p>
+                      ) : secretWillClearOnUrlChange ? (
+                        <div
+                          role="status"
+                          data-testid="webhook-secret-url-change-warning"
+                          className="flex items-start gap-2 rounded-lg border border-red-500/35 bg-red-500/12 px-3 py-2 text-[11px] leading-relaxed text-red-200"
+                        >
+                          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-400" />
+                          <span>
+                            {adminLabel(
+                              t,
+                              locale,
+                              'admin.webhooks.secretUrlChangeWarnHint',
+                              '安全提示：修改目标推送 URL 的域名（Origin）或路径（Path）后，若不填写新的签名密钥，原有 HMAC 签名密钥将在保存时自动清除（防止旧密钥泄露给新端点）。',
+                              'Security Warning: Changing the target URL origin or path clears the existing signing secret unless a new secret is entered.',
+                            )}
+                          </span>
+                        </div>
+                      ) : (
+                        <p className="text-[11px] text-amber-300/80">
+                          {t('admin.webhooks.clearSecretKeepHint')}
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </>
+              )
+            })()}
           </div>
 
           <ToggleSwitch

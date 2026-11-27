@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/ambra-media/ambra/internal/plugins"
 )
 
 func TestTMDBSearchCandidatesMovieAndSeries(t *testing.T) {
@@ -151,7 +153,7 @@ func TestTMDBFetchImages(t *testing.T) {
 
 	// Empty key / empty tmdbID
 	emptyProv := New("", "zh-CN")
-	if imgs, err := emptyProv.FetchImages(context.Background(), "Movie", "438631"); err != nil || imgs != nil {
+	if imgs, err := emptyProv.FetchImagesByTMDBID(context.Background(), "Movie", "438631"); err != nil || imgs != nil {
 		t.Fatalf("expected nil, nil for empty apiKey, got %v, %v", imgs, err)
 	}
 
@@ -159,14 +161,14 @@ func TestTMDBFetchImages(t *testing.T) {
 	p.SetHTTPClient(srv.Client())
 	_ = p.Configure(map[string]any{"base_url": srv.URL, "api_key": "test-key"})
 
-	if imgs, err := p.FetchImages(context.Background(), "Movie", ""); err != nil || imgs != nil {
+	if imgs, err := p.FetchImagesByTMDBID(context.Background(), "Movie", ""); err != nil || imgs != nil {
 		t.Fatalf("expected nil, nil for empty tmdbID, got %v, %v", imgs, err)
 	}
 
 	// Default imageBaseURL -> w342 for poster thumb, w500 for backdrop thumb
-	imgs, err := p.FetchImages(context.Background(), "Movie", "438631")
+	imgs, err := p.FetchImagesByTMDBID(context.Background(), "Movie", "438631")
 	if err != nil {
-		t.Fatalf("FetchImages movie: %v", err)
+		t.Fatalf("FetchImagesByTMDBID movie: %v", err)
 	}
 	if len(imgs) != 2 {
 		t.Fatalf("expected 2 images (empty paths skipped), got %d: %+v", len(imgs), imgs)
@@ -184,18 +186,27 @@ func TestTMDBFetchImages(t *testing.T) {
 		t.Fatalf("unexpected backdrop image: %+v", imgs[1])
 	}
 
+	// Verify plugins.ImageProvider FetchImages method as well
+	hits, err := p.FetchImages(context.Background(), plugins.MediaQuery{
+		ItemType:    "Movie",
+		ProviderIDs: map[string]string{"Tmdb": "438631"},
+	})
+	if err != nil || len(hits) != 2 || hits[0].URL != defaultImageBaseURL+"/poster_zh.jpg" {
+		t.Fatalf("ImageProvider FetchImages got (%+v, %v)", hits, err)
+	}
+
 	// Series with custom image_base_url
 	_ = p.Configure(map[string]any{"image_base_url": "https://img.local/tmdb"})
-	tvImgs, err := p.FetchImages(context.Background(), "Series", "1396")
+	tvImgs, err := p.FetchImagesByTMDBID(context.Background(), "Series", "1396")
 	if err != nil {
-		t.Fatalf("FetchImages series: %v", err)
+		t.Fatalf("FetchImagesByTMDBID series: %v", err)
 	}
 	if len(tvImgs) != 1 || tvImgs[0].Url != "https://img.local/tmdb/tv_poster.jpg" || tvImgs[0].ThumbnailUrl != "https://img.local/tmdb/tv_poster.jpg" {
 		t.Fatalf("unexpected series image: %+v", tvImgs)
 	}
 
 	// 404 error
-	if _, err := p.FetchImages(context.Background(), "Movie", "999999"); err == nil {
+	if _, err := p.FetchImagesByTMDBID(context.Background(), "Movie", "999999"); err == nil {
 		t.Fatal("expected error for 404 images endpoint")
 	}
 }

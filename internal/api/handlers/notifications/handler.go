@@ -528,6 +528,23 @@ func (h *Handler) appendNotification(ctx context.Context, n Notification) error 
 	return h.appendNotificationWithEvent(ctx, n, "")
 }
 
+// SendTestNotification records a test notification for userID (or AdminOnly when userID is empty)
+// and dispatches any matching configured HTTP notification channels.
+func (h *Handler) SendTestNotification(ctx context.Context, userID, title, description string) error {
+	normUID := guid.Normalize(userID)
+	n := Notification{
+		Id:          guid.New(),
+		UserId:      normUID,
+		Date:        time.Now().UTC(),
+		IsRead:      false,
+		Name:        title,
+		Description: description,
+		Level:       "Normal",
+		AdminOnly:   normUID == "",
+	}
+	return h.appendNotificationWithEvent(ctx, n, "NotificationTest")
+}
+
 func (h *Handler) appendNotificationWithEvent(ctx context.Context, n Notification, eventName string) error {
 	if n.Id == "" {
 		n.Id = guid.New()

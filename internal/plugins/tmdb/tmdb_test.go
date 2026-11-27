@@ -374,8 +374,11 @@ func TestTMDBV4BearerLogoAndOfficialRating(t *testing.T) {
 	if cands, err := p.SearchCandidates(context.Background(), "Movie", "Fight Club", 1999, "zh-CN"); err != nil || cands != nil {
 		t.Fatalf("expected disabled SearchCandidates to skip, got (%v, %v)", cands, err)
 	}
-	if imgs, err := p.FetchImages(context.Background(), "Movie", "550"); err != nil || imgs != nil {
-		t.Fatalf("expected disabled FetchImages to skip, got (%v, %v)", imgs, err)
+	if imgs, err := p.FetchImagesByTMDBID(context.Background(), "Movie", "550"); err != nil || imgs != nil {
+		t.Fatalf("expected disabled FetchImagesByTMDBID to skip, got (%v, %v)", imgs, err)
+	}
+	if hits, err := p.FetchImages(context.Background(), plugins.MediaQuery{ItemType: "Movie", ProviderIDs: map[string]string{"Tmdb": "550"}}); err != nil || hits != nil {
+		t.Fatalf("expected disabled FetchImages to skip, got (%v, %v)", hits, err)
 	}
 }
 

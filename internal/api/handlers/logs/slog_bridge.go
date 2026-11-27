@@ -37,6 +37,7 @@ type multiLogSink struct {
 	lastPruneDate string
 	retentionDays int
 	rotatable     bool
+	closed        bool
 	file          *os.File
 }
 
@@ -115,10 +116,11 @@ func (h *MultiSlogHandler) SetLogsHandler(lh *Handler) {
 	h.sink.mu.Unlock()
 }
 
-// Close closes the underlying persistent log file if it was opened.
+// Close closes the underlying persistent log file if it was opened and prevents any subsequent reopen.
 func (h *MultiSlogHandler) Close() error {
 	h.sink.mu.Lock()
 	defer h.sink.mu.Unlock()
+	h.sink.closed = true
 	if h.sink.file == nil {
 		return nil
 	}
@@ -147,7 +149,7 @@ func (h *MultiSlogHandler) Handle(_ context.Context, r slog.Record) error {
 	if h.sink.logsHandler != nil {
 		h.sink.logsHandler.AppendRuntimeLog(line)
 	}
-	if h.sink.logFilePath != "" {
+	if !h.sink.closed && h.sink.logFilePath != "" {
 		recTime := r.Time
 		if recTime.IsZero() {
 			recTime = time.Now().UTC()

@@ -29,7 +29,7 @@ const QUICK_CONNECT_TIMEOUT_MS = 5 * 60 * 1000
 
 export function LoginPage() {
   const { login, applyAuthResult } = useAuth()
-  const { locale, t, formatDateTime } = useI18n()
+  const { t, formatDateTime } = useI18n()
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const rawRedirect = searchParams.get('redirect') || ''
@@ -102,10 +102,10 @@ export function LoginPage() {
       } catch (err) {
         qcAuthenticatingRef.current = false
         setQcAuthenticating(false)
-        setQcError(err instanceof Error ? err.message : 'Quick Connect 登录失败，请重新获取授权码')
+        setQcError(err instanceof Error ? err.message : t('loginUi.qcAuthFailed'))
       }
     },
-    [applyAuthResult, clearQcPollTimer, navigate, safeRedirect],
+    [applyAuthResult, clearQcPollTimer, navigate, safeRedirect, t],
   )
 
   const startQuickConnect = useCallback(async () => {
@@ -126,13 +126,13 @@ export function LoginPage() {
       setQcResult(res)
     } catch (err) {
       if (controller.signal.aborted) return
-      setQcError(err instanceof Error ? err.message : '获取 Quick Connect 授权码失败，请稍后重试')
+      setQcError(err instanceof Error ? err.message : t('loginUi.qcInitFailed'))
     } finally {
       if (!controller.signal.aborted) {
         setQcLoading(false)
       }
     }
-  }, [clearQcPollTimer])
+  }, [clearQcPollTimer, t])
 
   useEffect(() => {
     if (!qcOpen || !qcResult?.Secret || qcResult.Authenticated || qcExpired) {
@@ -146,7 +146,7 @@ export function LoginPage() {
       if (Date.now() - startedAt >= QUICK_CONNECT_TIMEOUT_MS) {
         clearQcPollTimer()
         setQcExpired(true)
-        setQcError('Quick Connect 授权码已超时过期，请点击「重新生成」获取新授权码')
+        setQcError(t('loginUi.qcTimeoutExpired'))
         return
       }
       qcPollAbortRef.current?.abort()
@@ -166,7 +166,7 @@ export function LoginPage() {
           if (err instanceof ApiError && (err.status === 404 || err.status === 410)) {
             clearQcPollTimer()
             setQcExpired(true)
-            setQcError('Quick Connect 授权码已过期或失效，请点击「重新生成」')
+            setQcError(t('loginUi.qcCodeInvalidOrExpired'))
           }
           // 轮询期间忽略瞬时网络错误
         })
@@ -180,7 +180,7 @@ export function LoginPage() {
       qcPollAbortRef.current?.abort()
       qcPollAbortRef.current = null
     }
-  }, [qcOpen, qcResult?.Secret, qcResult?.Authenticated, qcExpired, clearQcPollTimer, completeQcLogin])
+  }, [qcOpen, qcResult?.Secret, qcResult?.Authenticated, qcExpired, clearQcPollTimer, completeQcLogin, t])
 
   useEffect(() => {
     return () => {
@@ -214,7 +214,7 @@ export function LoginPage() {
         await completeQcLogin(qcResult.Secret)
       }
     } catch (err) {
-      setQcError(err instanceof Error ? err.message : 'Demo 模拟授权失败')
+      setQcError(err instanceof Error ? err.message : t('loginUi.demoQcFailed'))
     }
   }
 
@@ -253,7 +253,7 @@ export function LoginPage() {
     e.preventDefault()
     const targetUser = forgotUsername.trim()
     if (!targetUser) {
-      setForgotError('请输入需要重置密码的用户名')
+      setForgotError(t('loginUi.forgotUsernameRequired'))
       return
     }
     setForgotError('')
@@ -264,7 +264,7 @@ export function LoginPage() {
       setForgotPinExpiration(res?.PinExpirationDate || '')
       setForgotStep(2)
     } catch (err) {
-      setForgotError(err instanceof Error ? err.message : '发起密码重置失败，请稍后重试')
+      setForgotError(err instanceof Error ? err.message : t('loginUi.forgotInitFailed'))
     } finally {
       setForgotLoading(false)
     }
@@ -274,7 +274,7 @@ export function LoginPage() {
     e.preventDefault()
     const trimmedPin = forgotPin.trim()
     if (!trimmedPin) {
-      setForgotError('请输入 6 位重置 PIN 码')
+      setForgotError(t('loginUi.forgotPinRequired'))
       return
     }
     setForgotError('')
@@ -282,7 +282,7 @@ export function LoginPage() {
     try {
       const res = await api.forgotPasswordPin(trimmedPin)
       if (!res?.Success) {
-        setForgotError('PIN 码无效或已过期，请重新检查后输入')
+        setForgotError(t('loginUi.forgotPinInvalid'))
         return
       }
       if (forgotUsername.trim()) {
@@ -290,10 +290,10 @@ export function LoginPage() {
       }
       setPassword('')
       setError('')
-      setResetSuccessMessage('密码已重置，请使用空密码或新密码登录')
+      setResetSuccessMessage(t('loginUi.resetSuccessMsg'))
       closeForgotModal()
     } catch (err) {
-      setForgotError(err instanceof Error ? err.message : '验证 PIN 码失败，请检查后重试')
+      setForgotError(err instanceof Error ? err.message : t('loginUi.forgotVerifyFailed'))
     } finally {
       setForgotLoading(false)
     }
@@ -306,7 +306,7 @@ export function LoginPage() {
       await login(role, '')
       navigate(safeRedirect, { replace: true })
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Demo 一键登录失败')
+      setError(err instanceof Error ? err.message : t('loginUi.demoLoginFailed'))
     } finally {
       setSubmitting(false)
     }
@@ -352,7 +352,7 @@ export function LoginPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!username.trim()) {
-      setError('请输入用户名')
+      setError(t('loginUi.usernameRequired'))
       return
     }
     setError('')
@@ -361,7 +361,7 @@ export function LoginPage() {
       await login(username.trim(), password)
       navigate(safeRedirect, { replace: true })
     } catch (err) {
-      setError(err instanceof Error ? err.message : '登录失败，请检查用户名或密码')
+      setError(err instanceof Error ? err.message : t('loginUi.loginFailed'))
     } finally {
       setSubmitting(false)
     }
@@ -391,7 +391,7 @@ export function LoginPage() {
             <Server className="h-3.5 w-3.5 text-amber-400/80" />
             <span>
               {sysInfo?.ProductName || 'Ambra'}{' '}
-              {sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.11.1')}
+              {sysInfo?.AmbraVersion || (sysInfo?.Version ? `v${sysInfo.Version}` : 'v0.11.2')}
             </span>
           </p>
         </div>
@@ -399,7 +399,9 @@ export function LoginPage() {
         {/* 公开用户快速选择 */}
         {publicUsers && publicUsers.length > 0 && (
           <div className="mb-6">
-            <p className="mb-2.5 text-center text-xs font-medium text-zinc-400">选择账号快速登录</p>
+            <p className="mb-2.5 text-center text-xs font-medium text-zinc-400">
+              {t('loginUi.quickPickAccount')}
+            </p>
             <div className="flex flex-wrap justify-center gap-3">
               {publicUsers.map((u) => {
                 const selected = username === u.Name
@@ -455,7 +457,7 @@ export function LoginPage() {
                   autoComplete="username"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
-                  placeholder={locale === 'zh-CN' ? '输入用户名' : t('auth.username')}
+                  placeholder={t('loginUi.usernamePlaceholder')}
                   className="w-full rounded-xl border border-white/10 bg-white/[0.04] py-2.5 pl-10 pr-4 text-sm text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-amber-400/60 focus:bg-white/[0.06]"
                 />
               </div>
@@ -472,7 +474,7 @@ export function LoginPage() {
                   autoComplete="current-password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  placeholder={locale === 'zh-CN' ? '留空表示无密码账号' : t('auth.password')}
+                  placeholder={t('loginUi.passwordPlaceholder')}
                   className="w-full rounded-xl border border-white/10 bg-white/[0.04] py-2.5 pl-10 pr-4 text-sm text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-amber-400/60 focus:bg-white/[0.06]"
                 />
               </div>
@@ -500,7 +502,7 @@ export function LoginPage() {
               {submitting ? (
                 <>
                   <Loader2 className="h-4 w-4 animate-spin" />
-                  <span>{locale === 'zh-CN' ? '正在连接影院...' : t('auth.signingIn')}</span>
+                  <span>{t('loginUi.connectingCinema')}</span>
                 </>
               ) : (
                 <>
@@ -522,7 +524,7 @@ export function LoginPage() {
               className="flex w-full items-center justify-center gap-2 rounded-xl border border-amber-400/30 bg-amber-500/10 py-2.5 text-sm font-semibold text-amber-200 transition-colors hover:border-amber-400/50 hover:bg-amber-500/20 disabled:opacity-60"
             >
               <QrCode className="h-4 w-4 text-amber-300" />
-              <span>{locale === 'zh-CN' ? 'Quick Connect 授权码登录' : t('auth.quickConnect')}</span>
+              <span>{t('loginUi.qcLoginBtn')}</span>
             </button>
           </div>
         )}
@@ -535,7 +537,7 @@ export function LoginPage() {
             className="inline-flex items-center gap-1.5 text-xs font-medium text-zinc-400 transition-colors hover:text-amber-300"
           >
             <KeyRound className="h-3.5 w-3.5" />
-            <span>{locale === 'zh-CN' ? `${t('auth.forgotPassword')}？` : t('auth.forgotPassword')}</span>
+            <span>{t('loginUi.forgotPasswordBtn')}</span>
           </button>
         </div>
 
@@ -544,7 +546,7 @@ export function LoginPage() {
           <div className="mt-4 rounded-2xl border border-amber-500/25 bg-amber-500/[0.06] p-4 backdrop-blur-xl">
             <div className="mb-3 flex items-center gap-1.5 text-xs font-semibold text-amber-300">
               <Sparkles className="h-3.5 w-3.5" />
-              <span>Serverless Demo 一键体验（无需密码）</span>
+              <span>{t('loginUi.demoQuickTitle')}</span>
             </div>
             <div className="grid grid-cols-2 gap-2.5">
               <button
@@ -554,7 +556,7 @@ export function LoginPage() {
                 className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-amber-500/20 px-3 py-2 text-xs font-semibold text-amber-200 ring-1 ring-amber-400/35 transition-colors hover:bg-amber-500/30 disabled:opacity-50"
               >
                 <ShieldCheck className="h-3.5 w-3.5" />
-                <span>管理员 (admin)</span>
+                <span>{t('loginUi.demoRoleAdmin')}</span>
               </button>
               <button
                 type="button"
@@ -563,7 +565,7 @@ export function LoginPage() {
                 className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-white/[0.06] px-3 py-2 text-xs font-medium text-zinc-200 ring-1 ring-white/12 transition-colors hover:bg-white/12 disabled:opacity-50"
               >
                 <UserCheck className="h-3.5 w-3.5" />
-                <span>普通用户 (guest)</span>
+                <span>{t('loginUi.demoRoleGuest')}</span>
               </button>
             </div>
           </div>
@@ -588,17 +590,15 @@ export function LoginPage() {
             <div className="mb-4 flex items-start justify-between gap-3">
               <div>
                 <h2 id="forgot-password-title" className="text-base font-semibold text-zinc-50">
-                  找回密码（第 {forgotStep} / 2 步）
+                  {t('loginUi.forgotModalTitle', { step: forgotStep })}
                 </h2>
                 <p className="mt-1 text-xs text-zinc-400">
-                  {forgotStep === 1
-                    ? '输入用户名后，服务器将在数据目录生成一次性重置 PIN 文件'
-                    : '请在服务器数据目录查看重置 PIN 文件，并在下方输入 6 位 PIN 码'}
+                  {forgotStep === 1 ? t('loginUi.forgotStep1Desc') : t('loginUi.forgotStep2Desc')}
                 </p>
               </div>
               <button
                 type="button"
-                aria-label="关闭找回密码弹窗"
+                aria-label={t('loginUi.closeForgotModal')}
                 disabled={forgotLoading}
                 onClick={() => {
                   if (!forgotLoading) closeForgotModal()
@@ -623,14 +623,14 @@ export function LoginPage() {
                     htmlFor="forgot-username-input"
                     className="mb-1.5 block text-xs font-medium text-zinc-400"
                   >
-                    用户名
+                    {t('auth.username')}
                   </label>
                   <input
                     id="forgot-username-input"
                     type="text"
                     value={forgotUsername}
                     onChange={(e) => setForgotUsername(e.target.value)}
-                    placeholder="输入需要重置密码的用户名"
+                    placeholder={t('loginUi.forgotUsernamePlaceholder')}
                     autoFocus
                     className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-amber-400/60"
                   />
@@ -641,7 +641,7 @@ export function LoginPage() {
                     onClick={closeForgotModal}
                     className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10"
                   >
-                    取消
+                    {t('common.cancel')}
                   </button>
                   <button
                     type="submit"
@@ -649,14 +649,14 @@ export function LoginPage() {
                     className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-60"
                   >
                     {forgotLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                    <span>下一步</span>
+                    <span>{t('loginUi.nextStep')}</span>
                   </button>
                 </div>
               </form>
             ) : (
               <form onSubmit={handleForgotStep2} className="space-y-4">
                 <div className="space-y-1.5 rounded-xl border border-amber-500/25 bg-amber-500/[0.07] p-3.5 text-xs text-amber-200">
-                  <p className="font-medium">请在服务器数据目录查看重置 PIN 文件</p>
+                  <p className="font-medium">{t('loginUi.checkPinFileHint')}</p>
                   {forgotPinFile && (
                     <code className="block break-all rounded-lg bg-black/40 px-2.5 py-1.5 font-mono text-[11px] text-amber-300">
                       {forgotPinFile}
@@ -664,7 +664,7 @@ export function LoginPage() {
                   )}
                   {forgotPinExpiration && (
                     <p className="text-[11px] text-amber-200/75">
-                      有效期至：{formatPinExpiration(forgotPinExpiration)}
+                      {t('loginUi.pinExpiresAt', { time: formatPinExpiration(forgotPinExpiration) })}
                     </p>
                   )}
                 </div>
@@ -674,7 +674,7 @@ export function LoginPage() {
                     htmlFor="forgot-pin-input"
                     className="mb-1.5 block text-xs font-medium text-zinc-400"
                   >
-                    6 位重置 PIN 码
+                    {t('loginUi.pinInputLabel')}
                   </label>
                   <input
                     id="forgot-pin-input"
@@ -685,7 +685,7 @@ export function LoginPage() {
                     maxLength={12}
                     value={forgotPin}
                     onChange={(e) => setForgotPin(e.target.value)}
-                    placeholder="输入 6 位 PIN 码"
+                    placeholder={t('loginUi.pinInputPlaceholder')}
                     autoFocus
                     className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2.5 font-mono text-sm tracking-widest text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-amber-400/60"
                   />
@@ -700,7 +700,7 @@ export function LoginPage() {
                     }}
                     className="rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10"
                   >
-                    返回上一步
+                    {t('loginUi.prevStep')}
                   </button>
                   <button
                     type="submit"
@@ -708,7 +708,7 @@ export function LoginPage() {
                     className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-60"
                   >
                     {forgotLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                    <span>验证并重置密码</span>
+                    <span>{t('loginUi.verifyAndResetBtn')}</span>
                   </button>
                 </div>
               </form>
@@ -739,15 +739,13 @@ export function LoginPage() {
                   className="flex items-center gap-2 text-base font-semibold text-zinc-50"
                 >
                   <QrCode className="h-4 w-4 text-amber-400" />
-                  <span>Quick Connect 授权码登录</span>
+                  <span>{t('loginUi.qcLoginBtn')}</span>
                 </h2>
-                <p className="mt-1 text-xs text-zinc-400">
-                  在已登录的 Ambra 网页端「个人中心 → Quick Connect」输入此授权码
-                </p>
+                <p className="mt-1 text-xs text-zinc-400">{t('loginUi.qcModalDesc')}</p>
               </div>
               <button
                 type="button"
-                aria-label="关闭 Quick Connect 弹窗"
+                aria-label={t('loginUi.closeQcModal')}
                 disabled={qcAuthenticating}
                 onClick={() => {
                   if (!qcAuthenticating) closeQcModal()
@@ -768,13 +766,13 @@ export function LoginPage() {
             {qcLoading ? (
               <div className="flex flex-col items-center justify-center gap-3 py-8 text-xs text-zinc-400">
                 <Loader2 className="h-6 w-6 animate-spin text-amber-400" />
-                <span>正在生成 6 位 Quick Connect 授权码...</span>
+                <span>{t('loginUi.qcGenerating')}</span>
               </div>
             ) : qcResult ? (
               <div className="space-y-4">
                 <div className="rounded-2xl border border-amber-400/25 bg-gradient-to-b from-amber-500/10 to-white/[0.02] px-4 py-6 text-center">
                   <p className="mb-2 text-[11px] font-medium uppercase tracking-widest text-amber-300/80">
-                    一次性设备授权码
+                    {t('loginUi.qcOneTimeCodeLabel')}
                   </p>
                   <div
                     data-testid="quick-connect-code"
@@ -788,17 +786,17 @@ export function LoginPage() {
                   {qcAuthenticating ? (
                     <>
                       <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-400" />
-                      <span className="text-emerald-300">授权已确认，正在登录影院...</span>
+                      <span className="text-emerald-300">{t('loginUi.qcApprovedLoggingIn')}</span>
                     </>
                   ) : qcExpired ? (
                     <>
                       <AlertCircle className="h-3.5 w-3.5 text-amber-400" />
-                      <span className="text-amber-300">授权码已过期，请点击下方重新生成</span>
+                      <span className="text-amber-300">{t('loginUi.qcExpiredRegenerateHint')}</span>
                     </>
                   ) : (
                     <>
                       <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-400" />
-                      <span>等待已登录设备确认授权中（每 2 秒自动检查）...</span>
+                      <span>{t('loginUi.qcWaitingApproval')}</span>
                     </>
                   )}
                 </div>
@@ -810,7 +808,7 @@ export function LoginPage() {
                     className="flex w-full items-center justify-center gap-1.5 rounded-xl border border-emerald-500/35 bg-emerald-500/15 px-4 py-2 text-xs font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/25"
                   >
                     <CheckCircle2 className="h-3.5 w-3.5" />
-                    <span>Demo 模拟立即授权登录</span>
+                    <span>{t('loginUi.demoApproveNowBtn')}</span>
                   </button>
                 )}
 
@@ -822,7 +820,7 @@ export function LoginPage() {
                     className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10 disabled:opacity-50"
                   >
                     <RefreshCw className="h-3.5 w-3.5" />
-                    <span>重新生成</span>
+                    <span>{t('loginUi.regenerateBtn')}</span>
                   </button>
                   <button
                     type="button"
@@ -830,7 +828,7 @@ export function LoginPage() {
                     onClick={closeQcModal}
                     className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10 disabled:opacity-50"
                   >
-                    取消
+                    {t('common.cancel')}
                   </button>
                 </div>
               </div>
@@ -841,7 +839,7 @@ export function LoginPage() {
                   onClick={closeQcModal}
                   className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10"
                 >
-                  关闭
+                  {t('common.close')}
                 </button>
                 <button
                   type="button"
@@ -849,7 +847,7 @@ export function LoginPage() {
                   className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400"
                 >
                   <RefreshCw className="h-3.5 w-3.5" />
-                  <span>重试</span>
+                  <span>{t('common.retry')}</span>
                 </button>
               </div>
             )}

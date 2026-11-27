@@ -6,10 +6,12 @@ import { api, getFallbackImageUrl, getImageUrl } from '../api/client'
 import { MediaCard } from '../components/MediaCard'
 import { QueryErrorState } from '../components/QueryErrorState'
 import { useAuth } from '../context/AuthContext'
+import { useI18n } from '../i18n/I18nContext'
 
 type MediaFilter = 'ALL' | 'Movie' | 'Series'
 
 export function PersonDetailPage() {
+  const { t } = useI18n()
   const { id } = useParams<{ id: string }>()
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
@@ -94,12 +96,20 @@ export function PersonDetailPage() {
     for (const work of allWorks) {
       for (const p of work.People || []) {
         if (p.Id === decodedId || p.Name === displayName) {
-          if (p.Type) types.add(p.Type === 'Director' ? '导演' : p.Type === 'Actor' ? '演员' : p.Type)
+          if (p.Type) {
+            types.add(
+              p.Type === 'Director'
+                ? t('personDetail.roleDirector')
+                : p.Type === 'Actor'
+                  ? t('personDetail.roleActor')
+                  : p.Type,
+            )
+          }
         }
       }
     }
     return Array.from(types)
-  }, [allWorks, decodedId, displayName])
+  }, [allWorks, decodedId, displayName, t])
 
   const avatarUrl =
     !avatarFailed && decodedId
@@ -122,7 +132,7 @@ export function PersonDetailPage() {
           className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-amber-400/40 hover:bg-white/10 hover:text-zinc-100"
         >
           <ArrowLeft className="h-3.5 w-3.5" />
-          <span>返回上一页</span>
+          <span>{t('personDetail.backPrev')}</span>
         </button>
       </div>
 
@@ -176,7 +186,7 @@ export function PersonDetailPage() {
                 ))
               ) : (
                 <span className="rounded-full border border-white/12 bg-white/[0.05] px-2.5 py-0.5 text-xs font-medium text-zinc-300">
-                  演职员
+                  {t('personDetail.roleCastAndCrew')}
                 </span>
               )}
             </div>
@@ -184,23 +194,23 @@ export function PersonDetailPage() {
             <div className="flex flex-wrap items-center justify-center gap-3 text-xs text-zinc-400 sm:justify-start">
               <span className="inline-flex items-center gap-1.5">
                 <Film className="h-3.5 w-3.5 text-amber-400" />
-                电影 {movieCount} 部
+                {t('personDetail.movieCount', { count: movieCount })}
               </span>
               <span className="inline-flex items-center gap-1.5">
                 <Tv className="h-3.5 w-3.5 text-amber-400" />
-                剧集 {seriesCount} 部
+                {t('personDetail.seriesCount', { count: seriesCount })}
               </span>
             </div>
 
             {personLoading ? (
-              <p className="text-xs text-zinc-500">正在加载演职员资料...</p>
+              <p className="text-xs text-zinc-500">{t('personDetail.loadingProfile')}</p>
             ) : personItem?.Overview ? (
               <p className="max-w-3xl text-sm leading-relaxed text-zinc-300">
                 {personItem.Overview}
               </p>
             ) : (
               <p className="max-w-2xl text-xs leading-relaxed text-zinc-500">
-                下方展示当前媒体库中与「{displayName}」相关的全部电影与剧集作品。
+                {t('personDetail.fallbackOverview', { name: displayName })}
               </p>
             )}
           </div>
@@ -211,16 +221,18 @@ export function PersonDetailPage() {
       <section className="space-y-5">
         <div className="flex flex-col gap-3 border-b border-white/8 pb-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <h2 className="text-lg font-semibold text-zinc-100">库内相关作品</h2>
-            <p className="mt-0.5 text-xs text-zinc-400">共 {filteredWorks.length} 部媒体</p>
+            <h2 className="text-lg font-semibold text-zinc-100">{t('personDetail.worksHeading')}</h2>
+            <p className="mt-0.5 text-xs text-zinc-400">
+              {t('personDetail.worksTotal', { count: filteredWorks.length })}
+            </p>
           </div>
 
           <div className="inline-flex items-center gap-1 rounded-xl border border-white/10 bg-zinc-950/80 p-1">
             {(
               [
-                { value: 'ALL', label: `全部 (${allWorks.length})` },
-                { value: 'Movie', label: `电影 (${movieCount})` },
-                { value: 'Series', label: `剧集 (${seriesCount})` },
+                { value: 'ALL', label: t('personDetail.filterAll', { count: allWorks.length }) },
+                { value: 'Movie', label: t('personDetail.filterMovie', { count: movieCount }) },
+                { value: 'Series', label: t('personDetail.filterSeries', { count: seriesCount }) },
               ] as const
             ).map((opt) => (
               <button
@@ -246,13 +258,13 @@ export function PersonDetailPage() {
         ) : worksError ? (
           <QueryErrorState
             compact
-            title="无法加载相关作品"
+            title={t('personDetail.loadErrorTitle')}
             error={worksErr}
             onRetry={() => void refetchWorks()}
           />
         ) : filteredWorks.length === 0 ? (
           <div className="rounded-2xl border border-dashed border-white/10 bg-white/[0.02] py-16 text-center text-sm text-zinc-500">
-            媒体库中暂未找到该分类下与「{displayName}」相关的作品
+            {t('personDetail.emptyWorks', { name: displayName })}
           </div>
         ) : (
           <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">

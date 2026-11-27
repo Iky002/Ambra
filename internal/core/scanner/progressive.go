@@ -16,11 +16,15 @@ import (
 	"github.com/ambra-media/ambra/internal/core/budget"
 	"github.com/ambra-media/ambra/internal/pkg/eventbus"
 	"github.com/ambra-media/ambra/internal/pkg/guid"
+	"github.com/ambra-media/ambra/internal/pkg/netutil"
 	"github.com/ambra-media/ambra/internal/plugins"
 	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
-const phaseABatchSize = 500
+const (
+	phaseABatchSize             = 500
+	maxExtractedAudioCoverBytes = 32 << 20 // 32 MiB
+)
 
 type pendingPhaseAItem struct {
 	input           sqlite.BatchItemInput
@@ -1229,23 +1233,24 @@ func (s *Scanner) extractAudioAttachedPic(ctx context.Context, rec *sqlite.ItemR
 	extractCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(
-		extractCtx,
-		ffmpegPath,
+	rawArgs := []string{
 		"-hide_banner",
 		"-loglevel", "error",
 		"-y",
 		"-protocol_whitelist", probeLocalProtocolWhitelist,
+		"-max_redirects", "0",
 		"-i", absMedia,
 		"-map", "0:v:0",
 		"-frames:v", "1",
 		tmpPath,
-	)
+	}
+	safeArgs := netutil.FilterFFmpegArgs(ffmpegPath, rawArgs)
+	cmd := exec.CommandContext(extractCtx, ffmpegPath, safeArgs...)
 	if err := cmd.Run(); err != nil {
 		return false
 	}
 	tmpInfo, err := os.Stat(tmpPath)
-	if err != nil || tmpInfo.IsDir() || tmpInfo.Size() == 0 {
+	if err != nil || tmpInfo.IsDir() || tmpInfo.Size() == 0 || tmpInfo.Size() > maxExtractedAudioCoverBytes {
 		return false
 	}
 	if linfo, lerr := os.Lstat(destPath); lerr == nil && (linfo.IsDir() || linfo.Mode()&os.ModeSymlink != 0) {
@@ -1510,7 +1515,7 @@ func applyOnlineMetadataToItem(rec *sqlite.ItemRecord, meta *plugins.MetadataRes
 	if meta.OfficialRating != "" && rec.OfficialRating == "" && !isFieldLocked(rec, "OfficialRating") {
 		rec.OfficialRating = meta.OfficialRating
 	}
-	if len(meta.ProviderIDs) > 0 {
+	if len(meta.ProviderIDs) > 0 && !isFieldLocked(rec, "ProviderIds") {
 		if rec.Extra.ProviderIDs == nil {
 			rec.Extra.ProviderIDs = make(map[string]string)
 		}

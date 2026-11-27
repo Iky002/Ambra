@@ -395,8 +395,9 @@ func (h *Handler) handleSearch(ctx context.Context, r *http.Request, params map[
 			Limit:            fetchLimit,
 		}
 		if policy != nil {
-			if !policy.EnableAllFolders {
-				if len(policy.EnabledFolders) == 0 {
+			allowedLibs := h.libRepo.AllowedLibraryIDsForPolicy(ctx, *policy)
+			if allowedLibs != nil {
+				if len(allowedLibs) == 0 {
 					didl := `<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"></DIDL-Lite>`
 					h.mu.RLock()
 					uid := h.systemUpdate
@@ -406,7 +407,7 @@ func (h *Handler) handleSearch(ctx context.Context, r *http.Request, params map[
 						xmlEscape(didl), uid,
 					), nil
 				}
-				filter.AllowedLibraryIDs = policy.EnabledFolders
+				filter.AllowedLibraryIDs = allowedLibs
 			}
 			filter.MaxParentalRating = policy.MaxParentalRating
 			filter.BlockedTags = policy.BlockedTags
@@ -415,7 +416,7 @@ func (h *Handler) handleSearch(ctx context.Context, r *http.Request, params map[
 		}
 		if containerID != "0" {
 			if _, libErr := h.libRepo.GetLibrary(ctx, containerID); libErr == nil {
-				if !h.isLibraryAllowedByPolicy(containerID, policy) {
+				if !h.isLibraryAllowedByPolicyCtx(ctx, containerID, policy) {
 					didl := `<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"></DIDL-Lite>`
 					h.mu.RLock()
 					uid := h.systemUpdate
@@ -598,7 +599,7 @@ func (h *Handler) browseMetadataForRequest(ctx context.Context, r *http.Request,
 		return "", fmt.Errorf("object not found")
 	}
 	if lib, err := h.libRepo.GetLibrary(ctx, objectID); err == nil {
-		if !h.isLibraryAllowedByPolicy(lib.ID, policy) {
+		if !h.isLibraryAllowedByPolicyCtx(ctx, lib.ID, policy) {
 			return "", fmt.Errorf("object not found")
 		}
 		return libraryToDIDL(*lib), nil
@@ -643,7 +644,7 @@ func (h *Handler) browseDirectChildrenForRequest(ctx context.Context, r *http.Re
 		}
 		libs := make([]sqlite.LibraryRecord, 0, len(allLibs))
 		for _, lib := range allLibs {
-			if h.isLibraryAllowedByPolicy(lib.ID, policy) {
+			if h.isLibraryAllowedByPolicyCtx(ctx, lib.ID, policy) {
 				libs = append(libs, lib)
 			}
 		}
@@ -672,7 +673,7 @@ func (h *Handler) browseDirectChildrenForRequest(ctx context.Context, r *http.Re
 		return out, total, nil
 	}
 
-	if _, libErr := h.libRepo.GetLibrary(ctx, objectID); libErr == nil && !h.isLibraryAllowedByPolicy(objectID, policy) {
+	if _, libErr := h.libRepo.GetLibrary(ctx, objectID); libErr == nil && !h.isLibraryAllowedByPolicyCtx(ctx, objectID, policy) {
 		return nil, 0, fmt.Errorf("object not found")
 	}
 	if rec, recErr := h.libRepo.GetItemRecordByID(ctx, objectID); recErr == nil && rec != nil {
@@ -739,11 +740,12 @@ func (h *Handler) browseDirectChildrenForRequest(ctx context.Context, r *http.Re
 		Limit:          fetchLimit,
 	}
 	if policy != nil {
-		if !policy.EnableAllFolders {
-			if len(policy.EnabledFolders) == 0 {
+		allowedLibs := h.libRepo.AllowedLibraryIDsForPolicy(ctx, *policy)
+		if allowedLibs != nil {
+			if len(allowedLibs) == 0 {
 				return nil, 0, nil
 			}
-			baseFilter.AllowedLibraryIDs = policy.EnabledFolders
+			baseFilter.AllowedLibraryIDs = allowedLibs
 		}
 		baseFilter.MaxParentalRating = policy.MaxParentalRating
 		baseFilter.BlockedTags = policy.BlockedTags

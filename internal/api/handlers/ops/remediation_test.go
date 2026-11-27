@@ -405,6 +405,15 @@ func TestOpsPartiesFullWatchTogetherLoopAndPurgeUser(t *testing.T) {
 		t.Fatalf("dial ws: %v", err)
 	}
 	defer wsConn.Close(websocket.StatusNormalClosure, "done")
+	{
+		initCtx, initCancel := context.WithTimeout(ctx, 2*time.Second)
+		var initMsg ws.Message
+		if err := wsjson.Read(initCtx, wsConn, &initMsg); err != nil {
+			initCancel()
+			t.Fatalf("read initial ws greeting: %v", err)
+		}
+		initCancel()
+	}
 
 	readWSMsg := func() ws.Message {
 		t.Helper()

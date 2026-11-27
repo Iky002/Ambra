@@ -1,6 +1,8 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  AlertTriangle,
+  ArrowDown,
   ArrowUp,
   Check,
   ChevronRight,
@@ -16,12 +18,265 @@ import {
   Trash2,
   X,
 } from 'lucide-react'
-import { api } from '../../api/client'
-import type { VirtualFolderInfo } from '../../api/types'
+import { api, embyFetch } from '../../api/client'
+import type { PluginInfo, VirtualFolderInfo } from '../../api/types'
 import { QueryErrorState } from '../../components/QueryErrorState'
 import { ScanProgressBar } from '../../components/ScanProgressBar'
+import { isDemoMode } from '../../demo/demoMode'
 import { useI18n } from '../../i18n/I18nContext'
-import { AdminModal, FeedbackBanner, ToggleSwitch } from './adminUtils'
+import { AdminModal, adminLabel, FeedbackBanner, ToggleSwitch } from './adminUtils'
+
+interface ScraperEntry {
+  id: string
+  alias: string
+  labelZh: string
+  labelEn: string
+  enabled: boolean
+}
+
+type ScraperDef = Omit<ScraperEntry, 'enabled'>
+
+const BUILTIN_SCRAPER_DEFS: ScraperDef[] = [
+  {
+    id: 'TheMovieDb',
+    alias: 'tmdb',
+    labelZh: 'TheMovieDb (TMDB)',
+    labelEn: 'TheMovieDb (TMDB)',
+  },
+  {
+    id: 'TheTVDB',
+    alias: 'tvdb',
+    labelZh: 'TheTVDB',
+    labelEn: 'TheTVDB',
+  },
+  {
+    id: 'Nfo',
+    alias: 'nfo',
+    labelZh: '本地 NFO 读取器 (Kodi / Emby NFO)',
+    labelEn: 'Local NFO Reader (Kodi / Emby NFO)',
+  },
+]
+
+function normalizeScraperAlias(raw: string): string {
+  const s = raw.trim().toLowerCase()
+  if (
+    s === 'themoviedb' ||
+    s === 'tmdb' ||
+    s === 'the movie db' ||
+    s === 'ambra.builtin.tmdb' ||
+    s === 'ambra.metadata.tmdb'
+  ) {
+    return 'tmdb'
+  }
+  if (
+    s === 'thetvdb' ||
+    s === 'tvdb' ||
+    s === 'the tvdb' ||
+    s === 'thetvdb scraper' ||
+    s === 'ambra.builtin.tvdb' ||
+    s === 'ambra.metadata.tvdb'
+  ) {
+    return 'tvdb'
+  }
+  if (
+    s === 'nfo' ||
+    s === 'local nfo' ||
+    s === 'localnfo' ||
+    s === 'kodi nfo' ||
+    s === 'ambra.builtin.nfo'
+  ) {
+    return 'nfo'
+  }
+  return s
+}
+
+function readStringArray(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return []
+  const out: string[] = []
+  for (const elem of raw) {
+    if (typeof elem === 'string' && elem.trim()) {
+      out.push(elem.trim())
+    }
+  }
+  return out
+}
+
+function extractFetcherOptionState(raw: unknown): {
+  present: boolean
+  enabled: string[]
+  disabled: string[]
+  order: string[]
+} {
+  if (!Array.isArray(raw)) {
+    return { present: false, enabled: [], disabled: [], order: [] }
+  }
+  const enabled: string[] = []
+  const disabled: string[] = []
+  const order: string[] = []
+  let hasObj = false
+  for (const elem of raw) {
+    if (typeof elem === 'string' && elem.trim()) {
+      enabled.push(elem.trim())
+      order.push(elem.trim())
+    } else if (elem && typeof elem === 'object') {
+      hasObj = true
+      const obj = elem as Record<string, unknown>
+      const name = String(obj.Name ?? obj.Id ?? '').trim()
+      if (!name) continue
+      order.push(name)
+      const isEn = typeof obj.Enabled === 'boolean' ? obj.Enabled : true
+      if (isEn) enabled.push(name)
+      else disabled.push(name)
+    }
+  }
+  return {
+    present: true,
+    enabled,
+    disabled: hasObj ? disabled : [],
+    order,
+  }
+}
+
+function parseLibraryScrapers(
+  opts: Record<string, unknown> | undefined,
+  defs: ScraperDef[],
+): ScraperEntry[] {
+  if (!opts) {
+    return defs.map((d) => ({ ...d, enabled: true }))
+  }
+
+  let hasExplicit = false
+  const enabledAliases = new Set<string>()
+  const disabledAliases = new Set<string>()
+  let orderRaw: string[] = []
+
+  const topFetchers = extractFetcherOptionState(opts.MetadataFetchers)
+  if (topFetchers.present) {
+    hasExplicit = true
+    for (const s of topFetchers.enabled) enabledAliases.add(normalizeScraperAlias(s))
+    for (const s of topFetchers.disabled) disabledAliases.add(normalizeScraperAlias(s))
+    if (topFetchers.order.length > 0) orderRaw = topFetchers.order
+  }
+
+  for (const d of readStringArray(opts.DisabledMetadataFetchers)) {
+    disabledAliases.add(normalizeScraperAlias(d))
+  }
+  for (const d of readStringArray(opts.DisabledLocalMetadataReaders)) {
+    disabledAliases.add(normalizeScraperAlias(d))
+  }
+  const topOrder = readStringArray(opts.MetadataFetcherOrder)
+  if (topOrder.length > 0) {
+    orderRaw = topOrder
+  }
+
+  if (!hasExplicit && disabledAliases.size === 0 && orderRaw.length === 0 && Array.isArray(opts.TypeOptions)) {
+    const firstType = opts.TypeOptions.find((entry) => entry && typeof entry === 'object') as
+      | Record<string, unknown>
+      | undefined
+    if (firstType) {
+      const tf = extractFetcherOptionState(firstType.MetadataFetchers)
+      if (tf.present) {
+        hasExplicit = true
+        for (const s of tf.enabled) enabledAliases.add(normalizeScraperAlias(s))
+        for (const s of tf.disabled) disabledAliases.add(normalizeScraperAlias(s))
+        if (tf.order.length > 0) orderRaw = tf.order
+      }
+      for (const d of readStringArray(firstType.DisabledMetadataFetchers)) {
+        disabledAliases.add(normalizeScraperAlias(d))
+      }
+      const to = readStringArray(firstType.MetadataFetcherOrder)
+      if (to.length > 0) orderRaw = to
+    }
+  }
+
+  const rankMap = new Map<string, number>()
+  orderRaw.forEach((rawName, idx) => {
+    const alias = normalizeScraperAlias(rawName)
+    if (alias && !rankMap.has(alias)) {
+      rankMap.set(alias, idx)
+    }
+  })
+
+  const sortedDefs = [...defs].sort((a, b) => {
+    const ra = rankMap.get(a.alias)
+    const rb = rankMap.get(b.alias)
+    if (ra !== undefined && rb !== undefined) return ra - rb
+    if (ra !== undefined) return -1
+    if (rb !== undefined) return 1
+    return 0
+  })
+
+  return sortedDefs.map((def) => {
+    let isEnabled = true
+    if (disabledAliases.has(def.alias)) {
+      isEnabled = false
+    } else if (hasExplicit) {
+      // Matches scanner.metadataProvidersForLibrary: NFO stays enabled unless explicitly disabled
+      isEnabled = def.alias === 'nfo' ? true : enabledAliases.has(def.alias)
+    }
+    return { ...def, enabled: isEnabled }
+  })
+}
+
+function buildLibraryOptionsPayload(
+  scrapers: ScraperEntry[],
+  saveLocal: boolean,
+  collectionType: string,
+  existingOpts?: Record<string, unknown>,
+): Record<string, unknown> {
+  const orderedIds = scrapers.map((s) => s.id)
+  const enabledIds = scrapers.filter((s) => s.enabled).map((s) => s.id)
+  const disabledIds = scrapers.filter((s) => !s.enabled).map((s) => s.id)
+  const nfoDisabled = scrapers.some((s) => s.alias === 'nfo' && !s.enabled)
+
+  const targetItemTypes =
+    collectionType === 'movies'
+      ? ['Movie']
+      : collectionType === 'tvshows'
+        ? ['Series']
+        : collectionType === 'mixed'
+          ? ['Movie', 'Series']
+          : []
+
+  const prevTypeOpts = Array.isArray(existingOpts?.TypeOptions)
+    ? (existingOpts!.TypeOptions as Array<Record<string, unknown>>)
+    : []
+  const updatedTypes = new Set<string>()
+  const nextTypeOptions: Array<Record<string, unknown>> = prevTypeOpts
+    .filter((entry) => entry && typeof entry === 'object')
+    .map((entry) => {
+      const tName = String(entry.Type || '').trim()
+      if (tName) updatedTypes.add(tName.toLowerCase())
+      return {
+        ...entry,
+        MetadataFetchers: enabledIds,
+        DisabledMetadataFetchers: disabledIds,
+        MetadataFetcherOrder: orderedIds,
+      }
+    })
+
+  for (const itemType of targetItemTypes) {
+    if (!updatedTypes.has(itemType.toLowerCase())) {
+      nextTypeOptions.push({
+        Type: itemType,
+        MetadataFetchers: enabledIds,
+        DisabledMetadataFetchers: disabledIds,
+        MetadataFetcherOrder: orderedIds,
+      })
+    }
+  }
+
+  return {
+    ...(existingOpts || {}),
+    SaveLocalMetadata: saveLocal,
+    MetadataSavers: saveLocal ? ['Nfo'] : [],
+    MetadataFetchers: enabledIds,
+    DisabledMetadataFetchers: disabledIds,
+    DisabledLocalMetadataReaders: nfoDisabled ? ['Nfo'] : [],
+    MetadataFetcherOrder: orderedIds,
+    ...(nextTypeOptions.length > 0 ? { TypeOptions: nextTypeOptions } : {}),
+  }
+}
 
 function getParentPath(path: string): string {
   const normalized = path.replace(/\\/g, '/').replace(/\/+$/, '')
@@ -36,7 +291,7 @@ function getParentPath(path: string): string {
 }
 
 export function LibrariesTab() {
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const queryClient = useQueryClient()
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
     null,
@@ -54,6 +309,9 @@ export function LibrariesTab() {
   const [manualPath, setManualPath] = useState('')
   const [refreshAfterCreate, setRefreshAfterCreate] = useState(true)
   const [saveLocalMetadata, setSaveLocalMetadata] = useState(true)
+  const [createScrapers, setCreateScrapers] = useState<ScraperEntry[]>(() =>
+    BUILTIN_SCRAPER_DEFS.map((d) => ({ ...d, enabled: true })),
+  )
   const [creating, setCreating] = useState(false)
 
   const [showBrowser, setShowBrowser] = useState(false)
@@ -63,12 +321,17 @@ export function LibrariesTab() {
   const [editName, setEditName] = useState('')
   const [editLocations, setEditLocations] = useState<string[]>([])
   const [editSaveLocalMetadata, setEditSaveLocalMetadata] = useState(true)
+  const [editScrapers, setEditScrapers] = useState<ScraperEntry[]>(() =>
+    BUILTIN_SCRAPER_DEFS.map((d) => ({ ...d, enabled: true })),
+  )
   const [savingOptions, setSavingOptions] = useState(false)
+  const [savingScrapers, setSavingScrapers] = useState(false)
   const [editNewPath, setEditNewPath] = useState('')
   const [editShowBrowser, setEditShowBrowser] = useState(false)
   const [editBrowsePath, setEditBrowsePath] = useState('')
   const [renaming, setRenaming] = useState(false)
   const [pathBusy, setPathBusy] = useState<string | null>(null)
+  const [confirmRemovePath, setConfirmRemovePath] = useState<string | null>(null)
 
   const [deleteTarget, setDeleteTarget] = useState<VirtualFolderInfo | null>(null)
   const [deleting, setDeleting] = useState(false)
@@ -92,6 +355,31 @@ export function LibrariesTab() {
     queryKey: ['admin', 'virtualFolders'],
     queryFn: () => api.getVirtualFolders(),
   })
+
+  const { data: plugins = [] } = useQuery({
+    queryKey: ['admin', 'plugins', 'libraryScrapers'],
+    queryFn: () => api.getPlugins().catch((): PluginInfo[] => []),
+    staleTime: 60_000,
+  })
+
+  const availableScraperDefs = useMemo<ScraperDef[]>(() => {
+    const out = [...BUILTIN_SCRAPER_DEFS]
+    const seenAliases = new Set(out.map((d) => d.alias))
+    for (const p of plugins) {
+      const isMeta = (p.Kinds || []).some((k) => k.toLowerCase() === 'metadata')
+      if (!isMeta) continue
+      const alias = normalizeScraperAlias(p.Id || p.Name)
+      if (!alias || seenAliases.has(alias)) continue
+      seenAliases.add(alias)
+      out.push({
+        id: p.Id || p.Name,
+        alias,
+        labelZh: p.Name || p.Id,
+        labelEn: p.Name || p.Id,
+      })
+    }
+    return out
+  }, [plugins])
 
   const activeBrowsePath = editTarget ? editBrowsePath : browsePath
   const browserActive =
@@ -146,6 +434,36 @@ export function LibrariesTab() {
     setPaths((prev) => (prev.includes(cleaned) ? prev : [...prev, cleaned]))
   }
 
+  const toggleScraperInList = (
+    setter: React.Dispatch<React.SetStateAction<ScraperEntry[]>>,
+    alias: string,
+  ) => {
+    setter((prev) =>
+      prev.map((item) => (item.alias === alias ? { ...item, enabled: !item.enabled } : item)),
+    )
+  }
+
+  const moveScraperInList = (
+    setter: React.Dispatch<React.SetStateAction<ScraperEntry[]>>,
+    index: number,
+    direction: -1 | 1,
+  ) => {
+    setter((prev) => {
+      const targetIndex = index + direction
+      if (targetIndex < 0 || targetIndex >= prev.length) return prev
+      const next = [...prev]
+      const [moved] = next.splice(index, 1)
+      next.splice(targetIndex, 0, moved)
+      return next
+    })
+  }
+
+  const openCreateModal = () => {
+    setModalFeedback(null)
+    setCreateScrapers(availableScraperDefs.map((d) => ({ ...d, enabled: true })))
+    setCreateOpen(true)
+  }
+
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!libName.trim()) {
@@ -164,13 +482,32 @@ export function LibrariesTab() {
     setCreating(true)
     setModalFeedback(null)
     try {
-      await api.createVirtualFolder({
-        Name: libName.trim(),
-        CollectionType: libType,
-        Paths: finalPaths,
-        refreshLibrary: refreshAfterCreate,
-        saveLocalMetadata,
+      const trimmedLibName = libName.trim()
+      const libraryOptions = {
+        PathInfos: finalPaths.map((p) => ({ Path: p })),
+        ...buildLibraryOptionsPayload(createScrapers, saveLocalMetadata, libType),
+      }
+      const q = new URLSearchParams({
+        name: trimmedLibName,
+        collectionType: libType,
+        refreshLibrary: String(refreshAfterCreate),
       })
+      const created = await embyFetch<VirtualFolderInfo>(
+        `/emby/Library/VirtualFolders?${q.toString()}`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            Name: trimmedLibName,
+            CollectionType: libType,
+            Paths: finalPaths,
+            LibraryOptions: libraryOptions,
+          }),
+        },
+      )
+      if (isDemoMode() && created?.ItemId) {
+        const { PathInfos: _ignored, ...persistedOptions } = libraryOptions
+        await api.updateVirtualFolderOptions(created.ItemId, persistedOptions)
+      }
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['admin', 'virtualFolders'] }),
         queryClient.invalidateQueries({ queryKey: ['userViews'] }),
@@ -180,7 +517,7 @@ export function LibrariesTab() {
       ])
       setFeedback({
         type: 'success',
-        message: t('admin.libraries.createdSuccess', { name: libName.trim() }),
+        message: t('admin.libraries.createdSuccess', { name: trimmedLibName }),
       })
       setModalFeedback(null)
       setCreateOpen(false)
@@ -189,6 +526,7 @@ export function LibrariesTab() {
       setPaths([])
       setManualPath('')
       setSaveLocalMetadata(true)
+      setCreateScrapers(availableScraperDefs.map((d) => ({ ...d, enabled: true })))
       setShowBrowser(false)
       setBrowsePath('')
     } catch (err) {
@@ -206,9 +544,11 @@ export function LibrariesTab() {
     setEditName(lib.Name)
     setEditLocations([...(lib.Locations || [])])
     setEditSaveLocalMetadata(lib.LibraryOptions?.SaveLocalMetadata ?? true)
+    setEditScrapers(parseLibraryScrapers(lib.LibraryOptions, availableScraperDefs))
     setEditNewPath('')
     setEditShowBrowser(false)
     setEditBrowsePath('')
+    setConfirmRemovePath(null)
     setModalFeedback(null)
   }
 
@@ -218,10 +558,12 @@ export function LibrariesTab() {
     setSavingOptions(true)
     setModalFeedback(null)
     try {
-      const nextOptions = {
-        ...(editTarget.LibraryOptions || {}),
-        SaveLocalMetadata: next,
-      }
+      const nextOptions = buildLibraryOptionsPayload(
+        editScrapers,
+        next,
+        editTarget.CollectionType || 'mixed',
+        editTarget.LibraryOptions,
+      )
       await api.updateVirtualFolderOptions(editTarget.ItemId, nextOptions)
       setEditTarget({ ...editTarget, LibraryOptions: nextOptions })
       await queryClient.invalidateQueries({ queryKey: ['admin', 'virtualFolders'] })
@@ -239,6 +581,41 @@ export function LibrariesTab() {
       })
     } finally {
       setSavingOptions(false)
+    }
+  }
+
+  const handleSaveEditScrapers = async () => {
+    if (!editTarget || savingScrapers) return
+    setSavingScrapers(true)
+    setModalFeedback(null)
+    try {
+      const nextOptions = buildLibraryOptionsPayload(
+        editScrapers,
+        editSaveLocalMetadata,
+        editTarget.CollectionType || 'mixed',
+        editTarget.LibraryOptions,
+      )
+      await api.updateVirtualFolderOptions(editTarget.ItemId, nextOptions)
+      setEditTarget({ ...editTarget, LibraryOptions: nextOptions })
+      await queryClient.invalidateQueries({ queryKey: ['admin', 'virtualFolders'] })
+      setModalFeedback({
+        type: 'success',
+        message: adminLabel(
+          t,
+          locale,
+          'admin.libraries.scrapersSavedSuccess',
+          '已更新「{{name}}」的元数据刮削器与优先级配置',
+          'Updated metadata scrapers and priority order for "{{name}}"',
+          { name: editTarget.Name },
+        ),
+      })
+    } catch (err) {
+      setModalFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : t('admin.libraries.optionsUpdateFailed'),
+      })
+    } finally {
+      setSavingScrapers(false)
     }
   }
 
@@ -312,12 +689,14 @@ export function LibrariesTab() {
     try {
       await api.removeVirtualFolderPath(editTarget.Name, loc, editTarget.ItemId)
       setEditLocations((prev) => prev.filter((item) => item !== loc))
+      setConfirmRemovePath(null)
       await queryClient.invalidateQueries({ queryKey: ['admin', 'virtualFolders'] })
       setModalFeedback({
         type: 'success',
         message: t('admin.libraries.pathRemovedSuccess', { name: editTarget.Name, path: loc }),
       })
     } catch (err) {
+      setConfirmRemovePath(null)
       setModalFeedback({
         type: 'error',
         message: err instanceof Error ? err.message : t('admin.libraries.pathRemoveFailed'),
@@ -381,10 +760,7 @@ export function LibrariesTab() {
 
           <button
             type="button"
-            onClick={() => {
-              setModalFeedback(null)
-              setCreateOpen(true)
-            }}
+            onClick={openCreateModal}
             className="inline-flex items-center gap-2 rounded-xl bg-amber-500 px-4 py-2 text-sm font-semibold text-zinc-950 shadow-lg shadow-amber-500/20 transition-colors hover:bg-amber-400"
           >
             <FolderPlus className="h-4 w-4" />
@@ -729,6 +1105,15 @@ export function LibrariesTab() {
             )}
           </div>
 
+          <ScraperPriorityEditor
+            scrapers={createScrapers}
+            locale={locale}
+            t={t}
+            testId="create-library-scrapers"
+            onToggle={(alias) => toggleScraperInList(setCreateScrapers, alias)}
+            onMove={(idx, dir) => moveScraperInList(setCreateScrapers, idx, dir)}
+          />
+
           <ToggleSwitch
             checked={saveLocalMetadata}
             onChange={setSaveLocalMetadata}
@@ -854,7 +1239,7 @@ export function LibrariesTab() {
                     <button
                       type="button"
                       disabled={pathBusy !== null}
-                      onClick={() => void handleRemoveEditPath(loc)}
+                      onClick={() => setConfirmRemovePath(loc)}
                       aria-label={t('admin.libraries.removePathAria', { path: loc })}
                       className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-red-500/20 bg-red-500/10 px-2 py-1 text-[11px] font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
                     >
@@ -997,7 +1382,7 @@ export function LibrariesTab() {
             )}
           </div>
 
-          <div className="space-y-2.5 border-t border-white/8 pt-4">
+          <div className="space-y-3 border-t border-white/8 pt-4">
             <label className="block text-xs font-medium text-zinc-400">
               {t('admin.libraries.metaOptionsLabel')}
             </label>
@@ -1007,6 +1392,38 @@ export function LibrariesTab() {
               label={t('admin.libraries.saveLocalMetaLabel')}
               description={t('admin.libraries.saveLocalMetaDesc')}
             />
+
+            <ScraperPriorityEditor
+              scrapers={editScrapers}
+              locale={locale}
+              t={t}
+              testId="edit-library-scrapers"
+              onToggle={(alias) => toggleScraperInList(setEditScrapers, alias)}
+              onMove={(idx, dir) => moveScraperInList(setEditScrapers, idx, dir)}
+              actionSlot={
+                <button
+                  type="button"
+                  disabled={savingScrapers}
+                  onClick={() => void handleSaveEditScrapers()}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-semibold text-zinc-950 transition-colors hover:bg-amber-400 disabled:opacity-50"
+                >
+                  {savingScrapers ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Save className="h-3.5 w-3.5" />
+                  )}
+                  <span>
+                    {adminLabel(
+                      t,
+                      locale,
+                      'admin.libraries.saveScrapersBtn',
+                      '保存刮削器配置',
+                      'Save Scraper Settings',
+                    )}
+                  </span>
+                </button>
+              }
+            />
           </div>
 
           <div className="flex justify-end border-t border-white/8 pt-3">
@@ -1014,11 +1431,103 @@ export function LibrariesTab() {
               type="button"
               onClick={() => {
                 setEditTarget(null)
+                setConfirmRemovePath(null)
                 setModalFeedback(null)
               }}
               className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
             >
               {t('admin.libraries.doneBtn')}
+            </button>
+          </div>
+        </div>
+      </AdminModal>
+
+      {/* Confirm Remove Mounted Path Modal */}
+      <AdminModal
+        open={Boolean(confirmRemovePath)}
+        title={adminLabel(
+          t,
+          locale,
+          'admin.libraries.removePathModalTitle',
+          '确认移除挂载目录',
+          'Confirm Remove Mounted Folder',
+        )}
+        subtitle={
+          editTarget
+            ? adminLabel(
+                t,
+                locale,
+                'admin.libraries.removePathModalSubtitle',
+                '所属媒体库：{{name}}',
+                'Library: {{name}}',
+                { name: editTarget.Name },
+              )
+            : undefined
+        }
+        maxWidthClass="max-w-md"
+        onClose={() => {
+          if (pathBusy === null) setConfirmRemovePath(null)
+        }}
+      >
+        <div className="space-y-4">
+          <div
+            role="alert"
+            data-testid="confirm-remove-library-path"
+            className="flex items-start gap-3 rounded-xl border border-amber-500/35 bg-amber-500/10 p-3.5 text-xs leading-relaxed text-amber-100"
+          >
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+            <div className="min-w-0 space-y-1.5">
+              <p className="font-semibold">
+                {adminLabel(
+                  t,
+                  locale,
+                  'admin.libraries.removePathWarnTitle',
+                  '确定要从该媒体库移除此挂载路径吗？',
+                  'Remove this mounted folder path from the library?',
+                )}
+              </p>
+              <p className="break-all rounded bg-black/35 px-2.5 py-1.5 font-mono text-[11px] text-amber-200">
+                {confirmRemovePath}
+              </p>
+              <p className="text-amber-200/85">
+                {adminLabel(
+                  t,
+                  locale,
+                  'admin.libraries.removePathWarnDesc',
+                  '移除后将停止监听该目录，下次扫描媒体库时将清理该路径下的索引记录（不会删除磁盘上的原始媒体文件）。',
+                  'File watching for this folder will stop, and indexed items under this path will be removed on the next scan (original disk files are not deleted).',
+                )}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex justify-end gap-2 pt-2">
+            <button
+              type="button"
+              disabled={pathBusy !== null}
+              onClick={() => setConfirmRemovePath(null)}
+              className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5 disabled:opacity-50"
+            >
+              {t('common.cancel')}
+            </button>
+            <button
+              type="button"
+              disabled={pathBusy !== null || !confirmRemovePath}
+              onClick={() => confirmRemovePath && void handleRemoveEditPath(confirmRemovePath)}
+              className="inline-flex items-center gap-2 rounded-xl bg-red-600 px-4 py-2 text-xs font-semibold text-white hover:bg-red-500 disabled:opacity-60"
+            >
+              {pathBusy === `remove:${confirmRemovePath}` && (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              )}
+              <span>
+                {adminLabel(
+                  t,
+                  locale,
+                  'admin.libraries.confirmRemovePathBtn',
+                  '确认移除',
+                  'Confirm Remove',
+                )}
+              </span>
             </button>
           </div>
         </div>
@@ -1067,6 +1576,124 @@ export function LibrariesTab() {
           </div>
         </div>
       </AdminModal>
+    </div>
+  )
+}
+
+function ScraperPriorityEditor({
+  scrapers,
+  locale,
+  t,
+  testId,
+  onToggle,
+  onMove,
+  actionSlot,
+}: {
+  scrapers: ScraperEntry[]
+  locale: string
+  t: ReturnType<typeof useI18n>['t']
+  testId: string
+  onToggle: (alias: string) => void
+  onMove: (index: number, direction: -1 | 1) => void
+  actionSlot?: React.ReactNode
+}) {
+  const isZh = locale.toLowerCase().startsWith('zh')
+  return (
+    <div
+      data-testid={testId}
+      className="space-y-2.5 rounded-xl border border-white/8 bg-white/[0.02] p-3.5"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <p className="text-xs font-semibold text-zinc-200">
+            {adminLabel(
+              t,
+              locale,
+              'admin.libraries.scrapersTitle',
+              '元数据刮削器与优先级顺序',
+              'Metadata Scrapers & Priority Order',
+            )}
+          </p>
+          <p className="mt-0.5 text-[11px] text-zinc-400">
+            {adminLabel(
+              t,
+              locale,
+              'admin.libraries.scrapersDesc',
+              '勾选需要在此媒体库启用的刮削器，并通过上移/下移调整刮削优先级（越靠上越优先）',
+              'Enable or disable metadata scrapers for this library and reorder their priority (top runs first)',
+            )}
+          </p>
+        </div>
+        {actionSlot}
+      </div>
+
+      <div className="divide-y divide-white/6 overflow-hidden rounded-xl border border-white/8 bg-black/30">
+        {scrapers.map((scraper, idx) => {
+          const displayName = isZh ? scraper.labelZh : scraper.labelEn
+          return (
+            <div
+              key={scraper.alias}
+              data-testid={`scraper-row-${scraper.alias}`}
+              className="flex items-center justify-between gap-3 px-3 py-2 text-xs"
+            >
+              <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2.5">
+                <span className="inline-flex h-5 w-6 shrink-0 items-center justify-center rounded bg-amber-500/15 font-mono text-[10px] font-bold text-amber-300">
+                  #{idx + 1}
+                </span>
+                <input
+                  type="checkbox"
+                  checked={scraper.enabled}
+                  onChange={() => onToggle(scraper.alias)}
+                  aria-label={displayName}
+                  className="h-4 w-4 rounded accent-amber-500"
+                />
+                <span
+                  className={`truncate font-medium ${
+                    scraper.enabled ? 'text-zinc-100' : 'text-zinc-500 line-through'
+                  }`}
+                >
+                  {displayName}
+                </span>
+              </label>
+
+              <div className="flex shrink-0 items-center gap-1">
+                <button
+                  type="button"
+                  disabled={idx === 0}
+                  onClick={() => onMove(idx, -1)}
+                  aria-label={adminLabel(
+                    t,
+                    locale,
+                    'admin.libraries.moveScraperUpAria',
+                    '上移 {{name}}',
+                    'Move {{name}} up',
+                    { name: displayName },
+                  )}
+                  className="rounded-lg border border-white/10 bg-white/[0.04] p-1 text-zinc-300 transition-colors hover:border-amber-400/40 hover:text-amber-300 disabled:cursor-not-allowed disabled:opacity-35"
+                >
+                  <ArrowUp className="h-3.5 w-3.5" />
+                </button>
+                <button
+                  type="button"
+                  disabled={idx === scrapers.length - 1}
+                  onClick={() => onMove(idx, 1)}
+                  aria-label={adminLabel(
+                    t,
+                    locale,
+                    'admin.libraries.moveScraperDownAria',
+                    '下移 {{name}}',
+                    'Move {{name}} down',
+                    { name: displayName },
+                  )}
+                  className="rounded-lg border border-white/10 bg-white/[0.04] p-1 text-zinc-300 transition-colors hover:border-amber-400/40 hover:text-amber-300 disabled:cursor-not-allowed disabled:opacity-35"
+                >
+                  <ArrowDown className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
+          )
+        })}
+      </div>
     </div>
   )
 }

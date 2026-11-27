@@ -1,6 +1,7 @@
 package compatcore
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -18,6 +19,8 @@ import (
 	"github.com/ambra-media/ambra/internal/api/ws"
 	"github.com/ambra-media/ambra/internal/config"
 	"github.com/ambra-media/ambra/internal/pkg/netutil"
+	"github.com/ambra-media/ambra/internal/plugins"
+	"github.com/ambra-media/ambra/internal/store/sqlite"
 )
 
 // --- /System ---
@@ -165,9 +168,72 @@ func (h *Handler) getPluginThumb(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(pluginThumbSVG))
 }
 
+func (h *Handler) findRegisteredPlugin(id string) (plugins.Plugin, bool) {
+	if h.registry == nil || id == "" {
+		return nil, false
+	}
+	if p, ok := h.registry.Get(id); ok {
+		return p, true
+	}
+	for _, mf := range h.registry.List() {
+		if strings.EqualFold(mf.ID, id) {
+			if p, ok := h.registry.Get(mf.ID); ok {
+				return p, true
+			}
+		}
+	}
+	return nil, false
+}
+
 func (h *Handler) deletePlugin(w http.ResponseWriter, r *http.Request) {
 	pluginID := strings.TrimSpace(chi.URLParam(r, "Id"))
+	h.mu.RLock()
+	uninstallFn := h.pluginUninstaller
+	h.mu.RUnlock()
+
+	if uninstallFn != nil {
+		if err := uninstallFn(r.Context(), pluginID); err != nil {
+			lowerErr := strings.ToLower(err.Error())
+			if errors.Is(err, sqlite.ErrNotFound) || strings.Contains(lowerErr, "not found") {
+				writeJSONError(w, r, http.StatusNotFound, "plugin not found")
+				return
+			}
+			if strings.Contains(lowerErr, "invalid") {
+				writeJSONError(w, r, http.StatusBadRequest, err.Error())
+				return
+			}
+			httpx.Error(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		httpx.NoContent(w)
+		return
+	}
+
 	if pluginID != "" {
+		if p, ok := h.findRegisteredPlugin(pluginID); ok {
+			mf := p.Manifest()
+			_ = p.Configure(map[string]any{"enabled": false})
+			if !mf.BuiltIn {
+				if h.store != nil && h.store.Writer != nil {
+					_, _ = h.store.Writer.ExecContext(r.Context(),
+						`DELETE FROM server_config WHERE LOWER(key) = LOWER(?) OR LOWER(key) = LOWER(?)`,
+						"plugin:config:"+mf.ID, "plugin:config:"+pluginID,
+					)
+				}
+				h.registry.Unregister(mf.ID)
+				if !strings.EqualFold(mf.ID, pluginID) {
+					h.registry.Unregister(pluginID)
+				}
+			} else {
+				var saved map[string]any
+				_, _ = h.loadKV(r.Context(), "plugin:config:"+mf.ID, &saved)
+				if saved == nil {
+					saved = map[string]any{}
+				}
+				saved["enabled"] = false
+				_ = h.saveKV(r.Context(), "plugin:config:"+mf.ID, saved)
+			}
+		}
 		_ = h.saveKV(r.Context(), "plugin_uninstalled:"+pluginID, map[string]any{
 			"Id":            pluginID,
 			"UninstalledAt": time.Now().UTC().Format(time.RFC3339),
@@ -376,6 +442,17 @@ func (h *Handler) getEnvironmentNetworkDevices(w http.ResponseWriter, r *http.Re
 
 func (h *Handler) deleteInstallingPackage(w http.ResponseWriter, r *http.Request) {
 	pkgID := strings.TrimSpace(chi.URLParam(r, "Id"))
+	h.mu.RLock()
+	cancelFn := h.packageCanceller
+	h.mu.RUnlock()
+	if cancelFn != nil {
+		if !cancelFn(pkgID) {
+			writeJSONError(w, r, http.StatusNotFound, "installation task not found")
+			return
+		}
+		httpx.NoContent(w)
+		return
+	}
 	if pkgID != "" {
 		_ = h.deleteKV(r.Context(), "package_installing:"+pkgID)
 	}

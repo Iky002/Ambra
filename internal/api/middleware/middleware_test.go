@@ -181,13 +181,22 @@ func TestAuthMiddlewareRBAC(t *testing.T) {
 		t.Fatalf("apikey /admin-only: expected 200, got %d", rec.Code)
 	}
 
-	// CORS preflight OPTIONS -> 204
+	// CORS preflight OPTIONS (same-origin allowed by default; cross-origin not reflected) -> 204
 	req = httptest.NewRequest(http.MethodOptions, "/me", nil)
+	req.Host = "localhost:3000"
 	req.Header.Set("Origin", "http://localhost:3000")
 	rec = httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNoContent || rec.Header().Get("Access-Control-Allow-Origin") != "http://localhost:3000" {
-		t.Fatalf("CORS preflight failed: status=%d header=%q", rec.Code, rec.Header().Get("Access-Control-Allow-Origin"))
+		t.Fatalf("CORS same-origin preflight failed: status=%d header=%q", rec.Code, rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+	reqCross := httptest.NewRequest(http.MethodOptions, "/me", nil)
+	reqCross.Host = "localhost:8096"
+	reqCross.Header.Set("Origin", "http://evil.example")
+	recCross := httptest.NewRecorder()
+	r.ServeHTTP(recCross, reqCross)
+	if recCross.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("CORS cross-origin preflight should not reflect origin by default, got %q", recCross.Header().Get("Access-Control-Allow-Origin"))
 	}
 
 	// Global EnableRemoteAccess=false blocks external non-APIKey requests while allowing LAN and APIKey (C-01)
