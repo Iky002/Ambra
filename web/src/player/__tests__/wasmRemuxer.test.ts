@@ -609,4 +609,67 @@ describe('wasmRemuxer - H-07 完整性校验、HTML/404 快速失败与 VFS 泄�
     expect(ok.url).toBe('blob:after-timeout')
     remuxer.dispose()
   })
+
+  it('ensureLoaded 在某候选源 load 失败/超时后先 terminate() 当前 Worker 实例再回退下一候选源', async () => {
+    const jsBytes = new TextEncoder().encode('export default function createFFmpegCore() {}')
+    const wasmBytes = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00])
+    const events: string[] = []
+
+    vi.spyOn(URL, 'createObjectURL').mockImplementation(() => `blob:fallback-${Math.random()}`)
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input)
+      if (url.startsWith('/ffmpeg-broken/')) {
+        if (url.endsWith('/ffmpeg-core.js')) {
+          events.push('fetch:base1-js')
+          return new Response(jsBytes, {
+            status: 200,
+            headers: { 'content-type': 'application/javascript' },
+          })
+        }
+        if (url.endsWith('/ffmpeg-core.wasm')) {
+          events.push('fetch:base1-wasm')
+          return new Response(wasmBytes, {
+            status: 200,
+            headers: { 'content-type': 'application/wasm' },
+          })
+        }
+      }
+      events.push(`fetch:fallback:${url}`)
+      return new Response(null, { status: 503 })
+    })
+
+    ffmpegMockHooks.terminate.mockClear()
+    ffmpegMockHooks.terminate.mockImplementation(() => {
+      events.push('terminate')
+    })
+    ffmpegMockHooks.load = async () => {
+      events.push('load:base1')
+      throw new WasmRemuxFallbackError('timeout', 'worker boot timeout')
+    }
+
+    const remuxer = new WasmRemuxer()
+    try {
+      await expect(
+        remuxer.ensureLoaded({ coreBaseUrl: '/ffmpeg-broken' }),
+      ).rejects.toSatisfy(
+        (err: unknown) => err instanceof WasmRemuxFallbackError && err.reason === 'load_failed',
+      )
+
+      const loadIdx = events.indexOf('load:base1')
+      const terminateIdx = events.indexOf('terminate')
+      const firstFallbackFetchIdx = events.findIndex((e) => e.startsWith('fetch:fallback:'))
+
+      expect(loadIdx).toBeGreaterThanOrEqual(0)
+      expect(terminateIdx).toBeGreaterThan(loadIdx)
+      expect(firstFallbackFetchIdx).toBeGreaterThan(terminateIdx)
+      // 每个失败候选源的独立 FFmpeg 实例均被 terminate()
+      expect(ffmpegMockHooks.terminate.mock.calls.length).toBeGreaterThanOrEqual(2)
+    } finally {
+      ffmpegMockHooks.load = null
+      ffmpegMockHooks.terminate.mockReset()
+      remuxer.dispose()
+    }
+  })
 })

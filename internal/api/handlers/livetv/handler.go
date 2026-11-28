@@ -225,8 +225,9 @@ type Handler struct {
 	nowFn              func() time.Time
 	recorder           *dvr.Recorder
 	transcodeMgr       *transcode.Manager
-	streamHub          *LiveStreamHub
-	auth               AuthFuncs
+	streamHub              *LiveStreamHub
+	auth                   AuthFuncs
+	onPruneChannelMappings func(ctx context.Context, activeProviders, activeChannels map[string]struct{})
 
 	leaseMu      sync.Mutex
 	streamLeases map[string]*liveStreamLease
@@ -276,6 +277,14 @@ func (h *Handler) nowUTC() time.Time {
 func (h *Handler) SetLibraryRepo(r *sqlite.LibraryRepo) {
 	h.mu.Lock()
 	h.libRepo = r
+	h.mu.Unlock()
+}
+
+// SetOnPruneChannelMappings registers a synchronized callback to prune orphaned channel mappings
+// from both in-memory and persisted compatext state when providers or channels are removed.
+func (h *Handler) SetOnPruneChannelMappings(fn func(ctx context.Context, activeProviders, activeChannels map[string]struct{})) {
+	h.mu.Lock()
+	h.onPruneChannelMappings = fn
 	h.mu.Unlock()
 }
 
@@ -1774,18 +1783,18 @@ func (h *Handler) proxyChannelStreamWithOptions(w http.ResponseWriter, r *http.R
 }
 
 func (h *Handler) proxyChannelStreamWithSession(w http.ResponseWriter, r *http.Request, channelID, streamURL string, allowPrivateLAN bool, sessionIAT, maxExp int64) {
+	h.proxyChannelStreamWithSessionAndUser(w, r, channelID, streamURL, allowPrivateLAN, sessionIAT, maxExp, "")
+}
+
+func (h *Handler) proxyChannelStreamWithSessionAndUser(w http.ResponseWriter, r *http.Request, channelID, streamURL string, allowPrivateLAN bool, sessionIAT, maxExp int64, verifiedUID string) {
 	var streamUID string
-	if r != nil {
-		if qUID := strings.TrimSpace(r.URL.Query().Get("uid")); qUID != "" {
-			streamUID = guid.Normalize(qUID)
-		} else if callerID, _, hasAuth := h.callerAuthInfo(r); hasAuth && callerID != "" {
+	if v := strings.TrimSpace(verifiedUID); v != "" {
+		streamUID = guid.Normalize(v)
+	} else if r != nil {
+		if callerID, _, hasAuth := h.callerAuthInfo(r); hasAuth && callerID != "" {
 			streamUID = guid.Normalize(callerID)
 		}
 	}
-	h.proxyChannelStreamWithSessionAndUser(w, r, channelID, streamURL, allowPrivateLAN, sessionIAT, maxExp, streamUID)
-}
-
-func (h *Handler) proxyChannelStreamWithSessionAndUser(w http.ResponseWriter, r *http.Request, channelID, streamURL string, allowPrivateLAN bool, sessionIAT, maxExp int64, streamUID string) {
 	trimmed := strings.TrimSpace(streamURL)
 	if err := h.validateStreamURL(trimmed, allowPrivateLAN); err != nil {
 		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("unsafe channel stream url: %v", err))
@@ -4523,9 +4532,6 @@ func (h *Handler) loadManualChannelMappings(ctx context.Context) map[string][]st
 }
 
 func (h *Handler) pruneOrphanedChannelMappings(ctx context.Context) {
-	if h.store == nil {
-		return
-	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -4538,7 +4544,16 @@ func (h *Handler) pruneOrphanedChannelMappings(ctx context.Context) {
 	for _, ch := range h.state.Channels {
 		activeChannels[ch.Id] = struct{}{}
 	}
+	onPrune := h.onPruneChannelMappings
 	h.mu.RUnlock()
+
+	if onPrune != nil {
+		onPrune(ctx, activeProviders, activeChannels)
+		return
+	}
+	if h.store == nil {
+		return
+	}
 
 	var raw string
 	err := h.store.Reader.QueryRowContext(ctx,
@@ -4626,6 +4641,7 @@ func (h *Handler) RefreshAllGuides(ctx context.Context) error {
 		guide        *XMLTVGuide
 	}
 	providers := h.SnapshotListingProviders()
+	initialXMLTVProviders := make(map[string]ListingProviderInfo)
 	var guides []fetchedGuide
 	var firstErr error
 	for _, lp := range providers {
@@ -4633,6 +4649,7 @@ func (h *Handler) RefreshAllGuides(ctx context.Context) error {
 		if !strings.EqualFold(lp.Type, "xmltv") || rawPath == "" {
 			continue
 		}
+		initialXMLTVProviders[lp.Id] = lp
 		allowPrivateLAN := lp.AllowPrivateNetwork
 		if !lp.NetworkPolicySet {
 			allowPrivateLAN = allowPrivateLAN || isStrictPrivateLANURL(rawPath, h.hasCustomHTTPClient())
@@ -4658,12 +4675,20 @@ func (h *Handler) RefreshAllGuides(ctx context.Context) error {
 	h.mu.Lock()
 	snapshot := cloneLiveTVState(h.state)
 	changed := false
+	providersMutated := false
 
 	activeProviders := make(map[string]ListingProviderInfo, len(h.state.ListingProviders))
 	activeProviderIDs := make(map[string]struct{}, len(h.state.ListingProviders))
 	for _, lp := range h.state.ListingProviders {
 		activeProviders[lp.Id] = lp
 		activeProviderIDs[lp.Id] = struct{}{}
+		rawPath := strings.TrimSpace(lp.Path)
+		if strings.EqualFold(lp.Type, "xmltv") && rawPath != "" {
+			initLP, existed := initialXMLTVProviders[lp.Id]
+			if !existed || !strings.EqualFold(initLP.Type, lp.Type) || strings.TrimSpace(initLP.Path) != rawPath {
+				providersMutated = true
+			}
+		}
 	}
 	mappingsByProvider := h.loadManualChannelMappingsByProvider(ctx, activeProviderIDs)
 
@@ -4671,6 +4696,7 @@ func (h *Handler) RefreshAllGuides(ctx context.Context) error {
 	for _, fg := range guides {
 		curLP, exists := activeProviders[fg.providerID]
 		if !exists || !strings.EqualFold(curLP.Type, fg.providerType) || strings.TrimSpace(curLP.Path) != fg.rawPath {
+			providersMutated = true
 			continue
 		}
 		matched := h.applyXMLTVGuideWithMappingsLocked(fg.guide, mappingsByProvider[fg.providerID])
@@ -4683,8 +4709,9 @@ func (h *Handler) RefreshAllGuides(ctx context.Context) error {
 	}
 
 	// Clear stale XMLTV-sourced programs for channels no longer matched by any active listing provider
-	// (e.g. after unmapping a channel or removing a provider), only when all fetches succeeded.
-	if firstErr == nil && len(h.state.Programs) > 0 {
+	// (e.g. after unmapping a channel or removing a provider), only when all fetches succeeded
+	// and listing providers were not concurrently mutated during the fetch window.
+	if firstErr == nil && !providersMutated && len(h.state.Programs) > 0 {
 		kept := make([]ProgramInfo, 0, len(h.state.Programs))
 		for _, p := range h.state.Programs {
 			if p.Source == "xmltv" {

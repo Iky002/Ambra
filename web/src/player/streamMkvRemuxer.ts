@@ -2243,7 +2243,8 @@ export class StreamMkvRemuxer {
             this.totalBytes > 0
           ) {
             const elementFileStart = this.currentByteOffset - remainingLen
-            const skipOffset = elementFileStart + oversizedEl.endOffset
+            const elementTotalBytes = oversizedEl.headerSize + oversizedEl.size
+            const skipOffset = elementFileStart + elementTotalBytes
             if (skipOffset > this.currentByteOffset && skipOffset <= this.totalBytes) {
               this.currentByteOffset = skipOffset
               leftover = new Uint8Array(0)
@@ -2333,7 +2334,7 @@ export class StreamMkvRemuxer {
                 ? Math.max(defaultVideoDur * (sortedPts.length - 1), sortedPts[sortedPts.length - 1] - sortedPts[0])
                 : 0
             this.nextVideoDtsMs = segStartDts + segSpan + defaultVideoDur
-            await this.appendToBuffer(this.videoSb, seg)
+            await this.appendToBuffer(this.videoSb, seg, generation)
             if (generation !== this.pumpGeneration || this.disposed) break
           }
 
@@ -2345,7 +2346,7 @@ export class StreamMkvRemuxer {
                 ? Math.max(1, Math.round(this.audioTrack.defaultDurationNs / 1_000_000))
                 : 21,
             })
-            await this.appendToBuffer(this.audioSb, seg)
+            await this.appendToBuffer(this.audioSb, seg, generation)
           }
         }
 
@@ -2506,9 +2507,12 @@ export class StreamMkvRemuxer {
     return name === 'QuotaExceededError' || code === 22 || /quotaexceeded/i.test(msg)
   }
 
-  private async evictForQuotaRecovery(targetSb: SourceBuffer): Promise<void> {
-    if (this.disposed) return
-    const gen = this.pumpGeneration
+  private async evictForQuotaRecovery(
+    targetSb: SourceBuffer,
+    generation?: number,
+  ): Promise<void> {
+    if (this.disposed || (generation !== undefined && generation !== this.pumpGeneration)) return
+    const gen = generation ?? this.pumpGeneration
     this.maxBufferAheadSec = Math.max(5, Math.floor(this.maxBufferAheadSec / 2))
     const curTime = this.videoEl?.currentTime ?? 0
     const evictEnd = curTime - 5
@@ -2526,10 +2530,12 @@ export class StreamMkvRemuxer {
         if (Number.isFinite(evictEnd) && evictEnd > rangeStart) {
           await this.removeFromBuffer(sb, rangeStart, evictEnd, gen)
         }
+        if (this.disposed || gen !== this.pumpGeneration) return
         // 同时驱逐远端前向缓冲区间（例如用户在后续时间轴塞满 MSE 配额后 Seek 回到前 0~5s 时）
         const latestBuffered = sb.buffered
         if (latestBuffered && latestBuffered.length > 0) {
           for (let i = latestBuffered.length - 1; i >= 0; i--) {
+            if (this.disposed || gen !== this.pumpGeneration) return
             const rStart = latestBuffered.start(i)
             const rEnd = latestBuffered.end(i)
             if (rEnd > curTime + 15) {
@@ -2546,11 +2552,17 @@ export class StreamMkvRemuxer {
     }
   }
 
-  private appendBufferOnce(sb: SourceBuffer, data: Uint8Array): Promise<void> {
-    if (this.disposed) return Promise.resolve()
+  private appendBufferOnce(
+    sb: SourceBuffer,
+    data: Uint8Array,
+    generation?: number,
+  ): Promise<void> {
+    if (this.disposed || (generation !== undefined && generation !== this.pumpGeneration)) {
+      return Promise.resolve()
+    }
     return new Promise<void>((resolve, reject) => {
       const doAppend = () => {
-        if (this.disposed) {
+        if (this.disposed || (generation !== undefined && generation !== this.pumpGeneration)) {
           resolve()
           return
         }
@@ -2585,18 +2597,28 @@ export class StreamMkvRemuxer {
     })
   }
 
-  private async appendToBuffer(sb: SourceBuffer, data: Uint8Array): Promise<void> {
-    if (this.disposed) return
+  private async appendToBuffer(
+    sb: SourceBuffer,
+    data: Uint8Array,
+    generation?: number,
+  ): Promise<void> {
+    const isStale = () =>
+      this.disposed || (generation !== undefined && generation !== this.pumpGeneration)
+    if (isStale()) return
     try {
-      await this.appendBufferOnce(sb, data)
+      await this.appendBufferOnce(sb, data, generation)
     } catch (err) {
-      if (!this.disposed && this.isQuotaExceeded(err)) {
-        await this.evictForQuotaRecovery(sb)
+      if (isStale()) return
+      if (this.isQuotaExceeded(err)) {
+        await this.evictForQuotaRecovery(sb, generation)
+        if (isStale()) return
         await this.waitForBufferIdle(sb)
+        if (isStale()) return
         try {
-          await this.appendBufferOnce(sb, data)
+          await this.appendBufferOnce(sb, data, generation)
           return
         } catch (retryErr) {
+          if (isStale()) return
           if (retryErr instanceof StreamMkvFallbackError) throw retryErr
           throw new StreamMkvFallbackError(
             'mse_error',

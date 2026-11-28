@@ -75,6 +75,7 @@ AMBRA_FAKE_FFPROBE_PROXY_HELPER=1 AMBRA_FAKE_FFPROBE_BODY_LOG=%q exec %q -test.r
 	defer srv.Close()
 
 	prober := NewProber(fakeProbe)
+	prober.allowLoopback = true
 
 	// 1. 302 redirect to cloud metadata IP must be blocked by LoopbackStreamProxy before ffprobe receives media bytes.
 	if res, err := prober.Probe(context.Background(), srv.URL+"/redirect.mp4"); err == nil || res != nil {
@@ -100,5 +101,25 @@ AMBRA_FAKE_FFPROBE_PROXY_HELPER=1 AMBRA_FAKE_FFPROBE_BODY_LOG=%q exec %q -test.r
 	}
 	if !strings.Contains(argsStr, "http://127.0.0.1:") || !strings.Contains(argsStr, "/stream/") {
 		t.Fatalf("expected ffprobe target to be LoopbackStreamProxy URL, got:\n%s", argsStr)
+	}
+}
+
+func TestProbeRejectsLoopbackByDefault(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write([]byte("LOOPBACK-SECRET"))
+	}))
+	defer srv.Close()
+
+	prober := NewProber("ffprobe")
+	localhostURL := strings.Replace(srv.URL, "127.0.0.1", "localhost", 1)
+	for _, target := range []string{
+		srv.URL + "/secret.mp4",
+		localhostURL + "/secret.mp4",
+	} {
+		res, err := prober.Probe(context.Background(), target)
+		if err == nil || res != nil {
+			t.Fatalf("expected default Prober to reject loopback URL %q, got res=%+v err=%v", target, res, err)
+		}
 	}
 }

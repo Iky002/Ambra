@@ -1522,13 +1522,18 @@ func (h *Handler) handleTestNotificationService(w http.ResponseWriter, r *http.R
 
 	callerID, isAdmin := h.callerIdentity(r)
 	h.mu.Lock()
-	if !isAdmin && callerID != "" {
-		if targetUserID != "" && guid.Normalize(targetUserID) != callerID {
+	if !isAdmin {
+		if targetID == "" {
 			h.mu.Unlock()
-			httpx.Error(w, http.StatusForbidden, "access denied")
+			httpx.Error(w, http.StatusForbidden, "admin access required to test global notification services")
 			return
 		}
-		if targetID != "" {
+		if callerID != "" {
+			if targetUserID != "" && guid.Normalize(targetUserID) != callerID {
+				h.mu.Unlock()
+				httpx.Error(w, http.StatusForbidden, "access denied")
+				return
+			}
 			found := false
 			for _, svc := range h.state.NotificationServices {
 				if svc.Id == targetID {

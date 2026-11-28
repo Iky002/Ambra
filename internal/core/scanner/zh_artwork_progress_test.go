@@ -208,13 +208,13 @@ func TestRemoteArtworkDownloadPersistAndSkipCached(t *testing.T) {
 		switch r.URL.Path {
 		case "/poster.jpg":
 			w.Header().Set("Content-Type", "image/jpeg")
-			_, _ = w.Write([]byte("fake-jpeg-bytes"))
+			_, _ = w.Write([]byte("\xff\xd8\xff\xe0fake-jpeg-bytes"))
 		case "/backdrop.png":
 			w.Header().Set("Content-Type", "image/png")
-			_, _ = w.Write([]byte("fake-png-bytes"))
+			_, _ = w.Write([]byte("\x89PNG\r\n\x1a\nfake-png-bytes"))
 		case "/logo.webp":
 			w.Header().Set("Content-Type", "image/webp")
-			_, _ = w.Write([]byte("fake-webp-bytes"))
+			_, _ = w.Write([]byte("RIFF\x18\x00\x00\x00WEBPVP8 fake-webp"))
 		case "/html.jpg":
 			w.Header().Set("Content-Type", "text/html")
 			_, _ = w.Write([]byte("<html>error</html>"))
@@ -358,7 +358,7 @@ func TestRescanUnchangedBackfillsMissingPosterAndTitle(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/jpeg")
-		_, _ = w.Write([]byte("poster-bytes"))
+		_, _ = w.Write([]byte("\xff\xd8\xff\xe0poster-bytes"))
 	}))
 	defer srv.Close()
 
@@ -573,3 +573,46 @@ func TestScanProgressLifecycleAndMultiLibrary(t *testing.T) {
 	}
 	sc.finishLibraryProgress("lib-b")
 }
+
+func TestFetchRemoteImageValidatesRasterMagicBytes(t *testing.T) {
+	payloads := map[string][]byte{
+		"/jpeg":   []byte("\xff\xd8\xff\xe0\x00\x10JFIF"),
+		"/png":    []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"),
+		"/webp":   []byte("RIFF\x18\x00\x00\x00WEBPVP8 "),
+		"/gif":    []byte("GIF89a\x01\x00\x01\x00"),
+		"/bmp":    []byte("BM\x36\x00\x00\x00\x00\x00"),
+		"/avif":   []byte("\x00\x00\x00\x1cftypavif\x00\x00\x00\x00"),
+		"/avis":   []byte("\x00\x00\x00\x1cftypavis\x00\x00\x00\x00"),
+		"/mif1":   []byte("\x00\x00\x00\x1cftypmif1\x00\x00\x00\x00"),
+		"/html":   []byte("<html><body><script>alert(1)</script></body></html>"),
+		"/svg":    []byte(`<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>`),
+		"/binary": []byte{0x7f, 'E', 'L', 'F', 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, ok := payloads[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		// Spoof image/jpeg on all responses so acceptance depends on magic-byte verification.
+		w.Header().Set("Content-Type", "image/jpeg")
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	for _, path := range []string{"/jpeg", "/png", "/webp", "/gif", "/bmp", "/avif", "/avis", "/mif1"} {
+		data, _, ok := fetchRemoteImage(ctx, srv.Client(), srv.URL+path)
+		if !ok || len(data) == 0 {
+			t.Fatalf("expected valid raster payload %s to be accepted", path)
+		}
+	}
+	for _, path := range []string{"/html", "/svg", "/binary"} {
+		data, _, ok := fetchRemoteImage(ctx, srv.Client(), srv.URL+path)
+		if ok || data != nil {
+			t.Fatalf("expected non-image payload %s to be rejected, got ok=%v len=%d", path, ok, len(data))
+		}
+	}
+}
+

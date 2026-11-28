@@ -458,3 +458,190 @@ func TestLocalExtrasParentPolicyInheritanceAndVirtualLibraryPolicy(t *testing.T)
 	}
 }
 
+func TestGetItemCountsForUserTrailerParentPolicyAndEmptyUserPlaylistVisibility(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	repo := NewLibraryRepo(st)
+
+	libAllowed, err := repo.CreateLibrary(ctx, "AllowedMovies", "movies", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	libSecret, err := repo.CreateLibrary(ctx, "SecretMovies", "movies", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gMovie := &ItemRecord{
+		ID:             guid.New(),
+		LibraryID:      libAllowed.ID,
+		ParentID:       libAllowed.ID,
+		Type:           "Movie",
+		MediaType:      "Video",
+		Name:           "Family Adventure",
+		SortName:       "family adventure",
+		OfficialRating: "G",
+	}
+	rMovie := &ItemRecord{
+		ID:             guid.New(),
+		LibraryID:      libAllowed.ID,
+		ParentID:       libAllowed.ID,
+		Type:           "Movie",
+		MediaType:      "Video",
+		Name:           "Restricted Action",
+		SortName:       "restricted action",
+		OfficialRating: "R",
+	}
+	taggedMovie := &ItemRecord{
+		ID:             guid.New(),
+		LibraryID:      libAllowed.ID,
+		ParentID:       libAllowed.ID,
+		Type:           "Movie",
+		MediaType:      "Video",
+		Name:           "Tagged Horror",
+		SortName:       "tagged horror",
+		OfficialRating: "G",
+	}
+	secretMovie := &ItemRecord{
+		ID:             guid.New(),
+		LibraryID:      libSecret.ID,
+		ParentID:       libSecret.ID,
+		Type:           "Movie",
+		MediaType:      "Video",
+		Name:           "Secret Movie",
+		SortName:       "secret movie",
+		OfficialRating: "G",
+	}
+
+	// Unrated local trailers attached to each movie.
+	gTrailer := &ItemRecord{
+		ID:        guid.New(),
+		LibraryID: libAllowed.ID,
+		ParentID:  gMovie.ID,
+		Type:      "Video",
+		MediaType: "Video",
+		Extra:     ItemExtra{ExtraType: "Trailer"},
+		Name:      "Family Trailer",
+		SortName:  "family trailer",
+	}
+	rTrailer := &ItemRecord{
+		ID:        guid.New(),
+		LibraryID: libAllowed.ID,
+		ParentID:  rMovie.ID,
+		Type:      "Video",
+		MediaType: "Video",
+		Extra:     ItemExtra{ExtraType: "Trailer"},
+		Name:      "Restricted Trailer",
+		SortName:  "restricted trailer",
+	}
+	taggedTrailer := &ItemRecord{
+		ID:        guid.New(),
+		LibraryID: libAllowed.ID,
+		ParentID:  taggedMovie.ID,
+		Type:      "Video",
+		MediaType: "Video",
+		Extra:     ItemExtra{ExtraType: "Trailer"},
+		Name:      "Tagged Trailer",
+		SortName:  "tagged trailer",
+	}
+	secretTrailer := &ItemRecord{
+		ID:        guid.New(),
+		LibraryID: libAllowed.ID, // even if library_id matches, parent is in libSecret
+		ParentID:  secretMovie.ID,
+		Type:      "Video",
+		MediaType: "Video",
+		Extra:     ItemExtra{ExtraType: "Trailer"},
+		Name:      "Secret Trailer",
+		SortName:  "secret trailer",
+	}
+
+	for _, rec := range []*ItemRecord{gMovie, rMovie, taggedMovie, secretMovie, gTrailer, rTrailer, taggedTrailer, secretTrailer} {
+		if err := repo.UpsertItem(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repo.ReplaceItemTaxonomies(ctx, taggedMovie.ID, "tag", []string{"horror"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create one private playlist owned by ownerID and one public playlist owned by ownerID.
+	ownerID := guid.New()
+	privPl, err := repo.CreatePlaylist(ctx, "Owner Private Mix", "Video", ownerID, []string{gMovie.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubPl, err := repo.CreatePlaylist(ctx, "Public Mix", "Video", ownerID, []string{gMovie.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Writer.ExecContext(ctx,
+		`INSERT OR REPLACE INTO server_config(key, value_json, updated_at) VALUES(?, '{"IsPublic":true}', 1)`,
+		"item_visibility_"+guid.Normalize(pubPl.ID),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Restricted user policy: maxParentalRating=G(1), BlockedTags=["horror"], allowedLibraryIDs=[libAllowed.ID].
+	// Only gMovie's trailer should be counted in TrailerCount (rTrailer, taggedTrailer, secretTrailer excluded).
+	maxG := 1
+	restrictedPol := dto.UserPolicy{
+		IsAdministrator:    false,
+		EnableAllFolders:   false,
+		EnabledFolders:     []string{libAllowed.ID},
+		EnableLiveTvAccess: true,
+		MaxParentalRating:  &maxG,
+		BlockedTags:        []string{"horror"},
+	}
+	counts, err := repo.GetItemCountsForUser(ctx, ownerID, false, []string{libAllowed.ID}, restrictedPol)
+	if err != nil {
+		t.Fatalf("GetItemCountsForUser restricted: %v", err)
+	}
+	if counts.MovieCount != 1 {
+		t.Fatalf("expected MovieCount=1, got %d", counts.MovieCount)
+	}
+	if counts.TrailerCount != 1 {
+		t.Fatalf("expected TrailerCount=1 (only permitted movie's trailer), got %d", counts.TrailerCount)
+	}
+
+	// 2. Non-admin with empty userID must hide private playlists in GetItemCountsForUser (only public playlist counted).
+	anonPol := dto.UserPolicy{
+		IsAdministrator:    false,
+		EnableAllFolders:   true,
+		EnableLiveTvAccess: true,
+	}
+	anonCounts, err := repo.GetItemCountsForUser(ctx, "", false, nil, anonPol)
+	if err != nil {
+		t.Fatalf("GetItemCountsForUser empty userID: %v", err)
+	}
+	ownerCounts, err := repo.GetItemCountsForUser(ctx, ownerID, false, nil, anonPol)
+	if err != nil {
+		t.Fatalf("GetItemCountsForUser owner: %v", err)
+	}
+	if ownerCounts.ItemCount != anonCounts.ItemCount+1 {
+		t.Fatalf("expected owner to see 1 more item (private playlist) than empty-userID non-admin: owner=%d anon=%d",
+			ownerCounts.ItemCount, anonCounts.ItemCount)
+	}
+
+	// 3. GetContainerItemsWithUserPolicy with empty userID and !IsAdministrator must hide private playlists
+	// inside a container while still returning public playlists.
+	box, err := repo.CreateCollection(ctx, "Mixed Container", "", []string{privPl.ID, pubPl.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	anonItems, anonTotal, err := repo.GetContainerItemsWithUserPolicy(ctx, "srv1", "", box.ID, 0, 50, nil, nil, anonPol)
+	if err != nil {
+		t.Fatalf("GetContainerItemsWithUserPolicy empty userID: %v", err)
+	}
+	if anonTotal != 1 || len(anonItems) != 1 || guid.Normalize(anonItems[0].Id) != guid.Normalize(pubPl.ID) {
+		t.Fatalf("expected only public playlist %s for empty-userID non-admin, got total=%d items=%+v", pubPl.ID, anonTotal, anonItems)
+	}
+	ownerItems, ownerTotal, err := repo.GetContainerItemsWithUserPolicy(ctx, "srv1", ownerID, box.ID, 0, 50, nil, nil, anonPol)
+	if err != nil {
+		t.Fatalf("GetContainerItemsWithUserPolicy owner: %v", err)
+	}
+	if ownerTotal != 2 || len(ownerItems) != 2 {
+		t.Fatalf("expected owner to see both playlists (2), got total=%d len=%d", ownerTotal, len(ownerItems))
+	}
+}
+
+

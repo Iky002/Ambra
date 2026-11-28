@@ -340,6 +340,14 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	if err := pluginAdminH.ApplySavedConfigs(ctx); err != nil {
 		slog.Warn("some saved plugin configs failed to apply", "error", err)
 	}
+	if cfg.IsTMDBKeyEnvOverridden() {
+		if p, ok := registry.Get("ambra.builtin.tmdb"); ok {
+			curSnap := cfg.Snapshot()
+			_ = p.Configure(map[string]any{
+				"api_key": curSnap.TMDBApiKey,
+			})
+		}
+	}
 
 	systemHandler := system.NewHandler(cfg, userRepo, registry).WithSetupDeps(system.SetupDeps{
 		Auth: authSvc,
@@ -652,6 +660,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	})
 	compatExtSvc = compatext.New(store, cfg)
 	compatExtSvc.SetLiveTV(livetvH)
+	livetvH.SetOnPruneChannelMappings(compatExtSvc.PruneOrphanedChannelMappings)
 	compatExtSvc.SetSyncHandler(syncH)
 	compatExtSvc.SetTranscodeManager(transcodeMgr)
 	compatExtSvc.SetDVR(dvrRec)
@@ -659,16 +668,20 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	compatExtSvc.SetUserRepo(userRepo)
 	compatExtSvc.SetNotificationTester(func(c context.Context, title, description string) error {
 		callerID := userIDFromCtx(c)
-		payload := plugins.NotificationPayload{
-			Event:   "NotificationTest",
-			Title:   title,
-			Message: description,
-			Level:   "Normal",
-			UserID:  callerID,
-		}
-		for _, n := range registry.Notifiers() {
-			if err := n.Notify(c, payload); err != nil {
-				return err
+		ac, ok := middleware.AuthFromContext(c)
+		isAdmin := ok && ac != nil && ac.IsAdmin()
+		if isAdmin {
+			payload := plugins.NotificationPayload{
+				Event:   "NotificationTest",
+				Title:   title,
+				Message: description,
+				Level:   "Normal",
+				UserID:  callerID,
+			}
+			for _, n := range registry.Notifiers() {
+				if err := n.Notify(c, payload); err != nil {
+					return err
+				}
 			}
 		}
 		return notifH.SendTestNotification(c, callerID, title, description)

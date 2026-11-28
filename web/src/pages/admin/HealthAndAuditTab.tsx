@@ -204,6 +204,7 @@ export function HealthAndAuditTab() {
   const [backupLoading, setBackupLoading] = useState(true)
   const [creatingBackup, setCreatingBackup] = useState(false)
   const [restoreTarget, setRestoreTarget] = useState<BackupFileInfo | null>(null)
+  const [restoreModalError, setRestoreModalError] = useState<string | null>(null)
   const [restoringBackup, setRestoringBackup] = useState(false)
   const [backupFeedback, setBackupFeedback] = useState<{
     type: 'success' | 'error'
@@ -318,9 +319,11 @@ export function HealthAndAuditTab() {
     if (!restoreTarget) return
     setRestoringBackup(true)
     setBackupFeedback(null)
+    setRestoreModalError(null)
     try {
       const res = await api.restoreBackup(restoreTarget.Name)
       setRestoreTarget(null)
+      setRestoreModalError(null)
       setBackupFeedback({
         type: 'success',
         message: t('admin.health.backupStagedSuccess', {
@@ -330,9 +333,11 @@ export function HealthAndAuditTab() {
       })
       await fetchBackupInfo()
     } catch (err) {
+      const msg = err instanceof Error ? err.message : t('admin.health.backupRestoreFailed')
+      setRestoreModalError(msg)
       setBackupFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : t('admin.health.backupRestoreFailed'),
+        message: msg,
       })
     } finally {
       setRestoringBackup(false)
@@ -1150,7 +1155,10 @@ export function HealthAndAuditTab() {
                   </div>
                   <button
                     type="button"
-                    onClick={() => setRestoreTarget(backup)}
+                    onClick={() => {
+                      setRestoreModalError(null)
+                      setRestoreTarget(backup)
+                    }}
                     className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-500/20"
                   >
                     <RotateCcw className="h-3.5 w-3.5" />
@@ -1173,10 +1181,18 @@ export function HealthAndAuditTab() {
         }
         maxWidthClass="max-w-md"
         onClose={() => {
-          if (!restoringBackup) setRestoreTarget(null)
+          if (!restoringBackup) {
+            setRestoreTarget(null)
+            setRestoreModalError(null)
+          }
         }}
       >
         <div className="space-y-4">
+          <FeedbackBanner
+            type="error"
+            message={restoreModalError || undefined}
+            onClose={() => setRestoreModalError(null)}
+          />
           <div className="flex items-start gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3.5 text-xs leading-relaxed text-amber-200">
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
             <div>
@@ -1201,7 +1217,10 @@ export function HealthAndAuditTab() {
             <button
               type="button"
               disabled={restoringBackup}
-              onClick={() => setRestoreTarget(null)}
+              onClick={() => {
+                setRestoreTarget(null)
+                setRestoreModalError(null)
+              }}
               className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10 disabled:opacity-50"
             >
               {t('common.cancel')}

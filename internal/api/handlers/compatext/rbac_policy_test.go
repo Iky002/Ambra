@@ -213,7 +213,8 @@ func TestAuditWave1_CompatExtHardeningAndRBAC(t *testing.T) {
 		t.Fatal("M-10: FFmpeg was invoked on symlink-escaped file outside registered library roots!")
 	}
 
-	// 5. 3.1-8: SetNotificationTester dispatches real test notification and propagates errors as 502!
+	// 5. 3.1-8: SetNotificationTester dispatches real test notification and propagates errors as 502;
+	// non-admin empty-body global test is rejected with 403!
 	var notifCalls atomic.Int32
 	h.SetNotificationTester(func(_ context.Context, title, desc string) error {
 		notifCalls.Add(1)
@@ -222,13 +223,19 @@ func TestAuditWave1_CompatExtHardeningAndRBAC(t *testing.T) {
 		}
 		return nil
 	})
-	if code := call(dvrMgrLogin.AccessToken, "", http.MethodPost, "/Notifications/Services/Test", `{}`).Code; code != http.StatusNoContent || notifCalls.Load() != 1 {
+	if code := call(dvrMgrLogin.AccessToken, "", http.MethodPost, "/Notifications/Services/Test", `{}`).Code; code != http.StatusForbidden || notifCalls.Load() != 0 {
+		t.Fatalf("expected 403 and 0 calls for non-admin global notification test, got code=%d calls=%d", code, notifCalls.Load())
+	}
+	if rec := call(dvrMgrLogin.AccessToken, "", http.MethodPost, "/Notifications/Services/Configured", `{"Id":"svc-dvrmgr","Name":"My Hook","Enabled":true}`); rec.Code != http.StatusOK {
+		t.Fatalf("failed to configure own notification service: %d %s", rec.Code, rec.Body.String())
+	}
+	if code := call(dvrMgrLogin.AccessToken, "", http.MethodPost, "/Notifications/Services/Test", `{"Id":"svc-dvrmgr"}`).Code; code != http.StatusNoContent || notifCalls.Load() != 1 {
 		t.Fatalf("3.1-8: expected 204 and 1 notification tester invocation, got code=%d calls=%d", code, notifCalls.Load())
 	}
 	h.SetNotificationTester(func(_ context.Context, _, _ string) error {
 		return errors.New("webhook unreachable")
 	})
-	if code := call(dvrMgrLogin.AccessToken, "", http.MethodPost, "/Notifications/Services/Test", `{}`).Code; code != http.StatusBadGateway {
+	if code := call(dvrMgrLogin.AccessToken, "", http.MethodPost, "/Notifications/Services/Test", `{"Id":"svc-dvrmgr"}`).Code; code != http.StatusBadGateway {
 		t.Fatalf("3.1-8: expected 502 when notification tester fails, got %d", code)
 	}
 

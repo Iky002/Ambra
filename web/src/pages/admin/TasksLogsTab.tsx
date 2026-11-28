@@ -108,10 +108,12 @@ export function TasksLogsTab() {
 
   // Sync / 离线转码任务状态
   const [confirmCancelSyncJob, setConfirmCancelSyncJob] = useState<SyncJobItem | null>(null)
+  const [cancelSyncJobModalError, setCancelSyncJobModalError] = useState<string | null>(null)
   const [deletingSyncJobId, setDeletingSyncJobId] = useState<string | null>(null)
 
   // 多触发规则列表管理状态
   const [editingTriggersTask, setEditingTriggersTask] = useState<ScheduledTaskInfo | null>(null)
+  const [triggersModalError, setTriggersModalError] = useState<string | null>(null)
   const [draftTriggers, setDraftTriggers] = useState<TaskTriggerInfo[]>([])
   const [newTriggerType, setNewTriggerType] = useState<
     'DailyTrigger' | 'WeeklyTrigger' | 'IntervalTrigger' | 'StartupTrigger'
@@ -263,6 +265,7 @@ export function TasksLogsTab() {
   }
 
   const handleOpenTriggers = (task: ScheduledTaskInfo) => {
+    setTriggersModalError(null)
     setEditingTriggersTask(task)
     // 深拷贝完整保留所有现有触发器（如 StartupTrigger、DailyTrigger、自定义触发器等），绝不截断为单条
     setDraftTriggers(
@@ -332,6 +335,7 @@ export function TasksLogsTab() {
     if (!editingTriggersTask) return
     setSavingTriggers(true)
     setFeedback(null)
+    setTriggersModalError(null)
     try {
       const triggersPayload = draftTriggers.map((item) => ({ ...item }))
       await api.updateTaskTriggers(editingTriggersTask.Id, triggersPayload)
@@ -340,11 +344,14 @@ export function TasksLogsTab() {
         message: t('admin.tasks.triggersSavedSuccess', { name: editingTriggersTask.Name }),
       })
       setEditingTriggersTask(null)
+      setTriggersModalError(null)
       void refetchTasks()
     } catch (err) {
+      const msg = err instanceof Error ? err.message : t('admin.tasks.triggersSaveFailed')
+      setTriggersModalError(msg)
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : t('admin.tasks.triggersSaveFailed'),
+        message: msg,
       })
     } finally {
       setSavingTriggers(false)
@@ -354,11 +361,13 @@ export function TasksLogsTab() {
   const handleDeleteSyncJob = async (job: SyncJobItem) => {
     setDeletingSyncJobId(job.Id)
     setFeedback(null)
+    setCancelSyncJobModalError(null)
     try {
       await embyFetch<void>(`/emby/Sync/Jobs/${encodeURIComponent(job.Id)}`, {
         method: 'DELETE',
       })
       setConfirmCancelSyncJob(null)
+      setCancelSyncJobModalError(null)
       await queryClient.invalidateQueries({ queryKey: ['admin', 'syncJobs'] })
       setFeedback({
         type: 'success',
@@ -372,18 +381,20 @@ export function TasksLogsTab() {
         ),
       })
     } catch (err) {
+      const msg =
+        err instanceof Error
+          ? err.message
+          : adminLabel(
+              t,
+              locale,
+              'admin.tasks.syncJobDeleteFailed',
+              '取消同步任务失败',
+              'Failed to cancel sync job',
+            )
+      setCancelSyncJobModalError(msg)
       setFeedback({
         type: 'error',
-        message:
-          err instanceof Error
-            ? err.message
-            : adminLabel(
-                t,
-                locale,
-                'admin.tasks.syncJobDeleteFailed',
-                '取消同步任务失败',
-                'Failed to cancel sync job',
-              ),
+        message: msg,
       })
     } finally {
       setDeletingSyncJobId(null)
@@ -760,7 +771,10 @@ export function TasksLogsTab() {
                       type="button"
                       data-testid={`cancel-sync-job-${job.Id}`}
                       disabled={isDeleting}
-                      onClick={() => setConfirmCancelSyncJob(job)}
+                      onClick={() => {
+                        setCancelSyncJobModalError(null)
+                        setConfirmCancelSyncJob(job)
+                      }}
                       className="inline-flex items-center gap-1 rounded-lg border border-red-500/25 bg-red-500/10 px-2.5 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
                     >
                       {isDeleting ? (
@@ -936,9 +950,17 @@ export function TasksLogsTab() {
         title={t('admin.tasks.triggersModalTitle', { name: editingTriggersTask?.Name || '' })}
         subtitle={t('admin.tasks.triggersModalSubtitle')}
         maxWidthClass="max-w-lg"
-        onClose={() => setEditingTriggersTask(null)}
+        onClose={() => {
+          setEditingTriggersTask(null)
+          setTriggersModalError(null)
+        }}
       >
         <div className="space-y-5">
+          <FeedbackBanner
+            type="error"
+            message={triggersModalError || undefined}
+            onClose={() => setTriggersModalError(null)}
+          />
           {/* 已有触发规则列表（保留 StartupTrigger 等所有既有规则并支持增删多条） */}
           <div className="space-y-2">
             <p className="text-xs font-medium text-zinc-400">
@@ -1070,7 +1092,10 @@ export function TasksLogsTab() {
           <div className="flex justify-end gap-2 pt-2">
             <button
               type="button"
-              onClick={() => setEditingTriggersTask(null)}
+              onClick={() => {
+                setEditingTriggersTask(null)
+                setTriggersModalError(null)
+              }}
               className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10"
             >
               {t('common.cancel')}
@@ -1107,10 +1132,16 @@ export function TasksLogsTab() {
         onClose={() => {
           if (!deletingSyncJobId) {
             setConfirmCancelSyncJob(null)
+            setCancelSyncJobModalError(null)
           }
         }}
       >
         <div className="space-y-4">
+          <FeedbackBanner
+            type="error"
+            message={cancelSyncJobModalError || undefined}
+            onClose={() => setCancelSyncJobModalError(null)}
+          />
           <div
             data-testid="confirm-cancel-sync-job-warning"
             className="flex items-start gap-3 rounded-xl border border-red-500/30 bg-red-500/10 p-3.5 text-xs leading-relaxed text-red-200"
@@ -1132,7 +1163,10 @@ export function TasksLogsTab() {
             <button
               type="button"
               disabled={Boolean(deletingSyncJobId)}
-              onClick={() => setConfirmCancelSyncJob(null)}
+              onClick={() => {
+                setConfirmCancelSyncJob(null)
+                setCancelSyncJobModalError(null)
+              }}
               className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10 disabled:opacity-50"
             >
               {t('common.cancel')}

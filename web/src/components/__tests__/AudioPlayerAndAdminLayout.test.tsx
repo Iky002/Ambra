@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -7,6 +7,7 @@ import { saveAuth } from '../../api/client'
 import type { BaseItemDto } from '../../api/types'
 import { AudioPlayerProvider, useAudioPlayer } from '../../context/AudioPlayerContext'
 import { AuthProvider, useAuth } from '../../context/AuthContext'
+import { WebSocketContext, type PlaystateCommand } from '../../context/WebSocketContext'
 import { setDemoModeOverride } from '../../demo/demoMode'
 import { resetDemoStore } from '../../demo/mockServer'
 import { AdminPage } from '../../pages/AdminPage'
@@ -286,5 +287,73 @@ describe('Batch 4C Web UI 功能测试 (Admin Tab 滚动保持 + 全局音乐播
     await waitFor(() => {
       expect(screen.queryByTestId('audio-player-bar')).not.toBeInTheDocument()
     })
+  })
+
+  it('HashRouter 视频播放页 (#/play/movie-1) 下忽略未携带 PlaySessionId 的远端 Playstate 指令', async () => {
+    const user = userEvent.setup()
+    const pauseSpy = vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => undefined)
+    const listeners = new Set<(cmd: PlaystateCommand) => void>()
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const testTracks: BaseItemDto[] = [
+      {
+        Id: 'track-hash-1',
+        Name: 'Hash Route Track',
+        Type: 'Audio',
+        MediaType: 'Audio',
+        RunTimeTicks: 180 * 10_000_000,
+      },
+    ]
+
+    const prevHash = window.location.hash
+    try {
+      render(
+        <QueryClientProvider client={qc}>
+          <AuthProvider>
+            <WebSocketContext.Provider
+              value={{
+                connected: true,
+                subscribePlaystate: (cb) => {
+                  listeners.add(cb)
+                  return () => {
+                    listeners.delete(cb)
+                  }
+                },
+              }}
+            >
+              <AudioPlayerProvider>
+                <MemoryRouter initialEntries={['/']}>
+                  <AudioTriggerHarness tracks={testTracks} />
+                  <AudioPlayerBar />
+                </MemoryRouter>
+              </AudioPlayerProvider>
+            </WebSocketContext.Provider>
+          </AuthProvider>
+        </QueryClientProvider>,
+      )
+
+      await user.click(screen.getByRole('button', { name: '启动测试播放队列' }))
+      expect(await screen.findByTestId('audio-player-bar')).toBeInTheDocument()
+      pauseSpy.mockClear()
+
+      // HashRouter 处于视频播放路由 #/play/movie-1：无 PlaySessionId 的 Pause 指令应被抑制
+      window.location.hash = '#/play/movie-1'
+      act(() => {
+        for (const cb of listeners) {
+          cb({ Command: 'Pause' })
+        }
+      })
+      expect(pauseSpy).not.toHaveBeenCalled()
+
+      // 离开视频播放路由后，同样无 PlaySessionId 的 Pause 指令正常生效
+      window.location.hash = '#/music'
+      act(() => {
+        for (const cb of listeners) {
+          cb({ Command: 'Pause' })
+        }
+      })
+      expect(pauseSpy).toHaveBeenCalledTimes(1)
+    } finally {
+      window.location.hash = prevHash
+    }
   })
 })

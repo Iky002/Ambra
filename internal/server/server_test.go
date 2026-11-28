@@ -711,3 +711,46 @@ func TestApplyPendingDatabaseRestoreSymlinkAndSidecars(t *testing.T) {
 		t.Fatalf("expected 200 or 301 for /index.html, got %d", rec.Code)
 	}
 }
+
+func TestServerTMDBEnvKeyPrecedenceOverSavedPluginConfig(t *testing.T) {
+	dir := t.TempDir()
+	// Pre-seed SQLite with a saved plugin:ambra.builtin.tmdb api_key.
+	store, err := sqlite.Open(filepath.Join(dir, "ambra.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	userRepo := sqlite.NewUserRepo(store)
+	if err := userRepo.SetServerConfig(context.Background(), "plugin:ambra.builtin.tmdb", `{"api_key":"db-saved-key","language":"fr-FR"}`); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	_ = store.Close()
+
+	t.Setenv("AMBRA_TMDB_API_KEY", "env-priority-key")
+	cfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	defer func() { _ = srv.Close() }()
+
+	p, ok := srv.Registry.Get("ambra.builtin.tmdb")
+	if !ok {
+		t.Fatal("expected ambra.builtin.tmdb registered")
+	}
+	tmdbProvider, ok := p.(*tmdb.Provider)
+	if !ok {
+		t.Fatalf("expected *tmdb.Provider, got %T", p)
+	}
+	defCfg := tmdbProvider.DefaultConfig()
+	if gotKey, _ := defCfg["api_key"].(string); gotKey != "env-priority-key" {
+		t.Fatalf("expected AMBRA_TMDB_API_KEY env key to take precedence over SQLite saved key, got %q", gotKey)
+	}
+	if gotLang, _ := defCfg["language"].(string); gotLang != "fr-FR" {
+		t.Fatalf("expected saved language fr-FR preserved alongside env key, got %q", gotLang)
+	}
+}
+

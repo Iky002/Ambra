@@ -64,6 +64,7 @@ export function LiveTvTab() {
   const [refreshingTunerIds, setRefreshingTunerIds] = useState<Record<string, boolean>>({})
   const [deletingTunerId, setDeletingTunerId] = useState<string | null>(null)
   const [confirmDeleteTuner, setConfirmDeleteTuner] = useState<LiveTvTunerHostInfo | null>(null)
+  const [deleteTunerModalError, setDeleteTunerModalError] = useState<string | null>(null)
 
   const [discoveringTuners, setDiscoveringTuners] = useState(false)
   const [discoveredTuners, setDiscoveredTuners] = useState<DiscoveredTunerHost[] | null>(null)
@@ -301,9 +302,11 @@ export function LiveTvTab() {
   const handleDeleteTuner = async (id: string, name?: string) => {
     setDeletingTunerId(id)
     setFeedback(null)
+    setDeleteTunerModalError(null)
     try {
       await api.deleteTunerHost(id)
       setConfirmDeleteTuner(null)
+      setDeleteTunerModalError(null)
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['admin', 'liveTv', 'tunerHosts'] }),
         queryClient.invalidateQueries({ queryKey: ['admin', 'liveTv', 'channels'] }),
@@ -316,9 +319,11 @@ export function LiveTvTab() {
         message: t('admin.livetv.tunerDeletedSuccess', { name: name || id }),
       })
     } catch (err) {
+      const msg = err instanceof Error ? err.message : t('admin.livetv.tunerDeleteFailed')
+      setDeleteTunerModalError(msg)
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : t('admin.livetv.tunerDeleteFailed'),
+        message: msg,
       })
     } finally {
       setDeletingTunerId(null)
@@ -769,7 +774,10 @@ export function LiveTvTab() {
                     <button
                       type="button"
                       disabled={deletingTunerId === host.Id || Boolean(refreshingTunerIds[host.Id])}
-                      onClick={() => setConfirmDeleteTuner(host)}
+                      onClick={() => {
+                        setDeleteTunerModalError(null)
+                        setConfirmDeleteTuner(host)
+                      }}
                       className="inline-flex items-center gap-1 rounded-lg border border-red-500/25 bg-red-500/10 px-2.5 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
                     >
                       {deletingTunerId === host.Id ? (
@@ -1236,10 +1244,16 @@ export function LiveTvTab() {
         onClose={() => {
           if (!deletingTunerId) {
             setConfirmDeleteTuner(null)
+            setDeleteTunerModalError(null)
           }
         }}
       >
         <div className="space-y-4">
+          <FeedbackBanner
+            type="error"
+            message={deleteTunerModalError || undefined}
+            onClose={() => setDeleteTunerModalError(null)}
+          />
           <div
             data-testid="confirm-delete-tuner-warning"
             className="flex items-start gap-3 rounded-xl border border-red-500/30 bg-red-500/10 p-3.5 text-xs leading-relaxed text-red-200"
@@ -1277,7 +1291,10 @@ export function LiveTvTab() {
             <button
               type="button"
               disabled={Boolean(deletingTunerId)}
-              onClick={() => setConfirmDeleteTuner(null)}
+              onClick={() => {
+                setConfirmDeleteTuner(null)
+                setDeleteTunerModalError(null)
+              }}
               className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/10 disabled:opacity-50"
             >
               {t('common.cancel')}

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/netip"
@@ -196,6 +197,10 @@ func StartLoopbackStreamProxy(opts LoopbackProxyOptions) (*LoopbackStreamProxy, 
 			effectiveURL = resp.Request.URL
 		}
 		upstreamCT := resp.Header.Get("Content-Type")
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 && isXMLManifestContentType(upstreamCT) {
+			http.Error(w, "unsupported xml manifest format", http.StatusBadGateway)
+			return
+		}
 
 		if r.Method == http.MethodHead {
 			isManifest := isHLSManifestURLOrContentType(effectiveURL, upstreamCT)
@@ -623,6 +628,26 @@ func isHLSManifestPayload(u *url.URL, contentType string, peek []byte) bool {
 	return false
 }
 
+func isXMLManifestContentType(contentType string) bool {
+	ct := strings.TrimSpace(contentType)
+	if ct == "" {
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		if semi := strings.IndexByte(ct, ';'); semi >= 0 {
+			ct = ct[:semi]
+		}
+		mediaType = strings.TrimSpace(ct)
+	}
+	mediaType = strings.ToLower(mediaType)
+	switch mediaType {
+	case "application/dash+xml", "application/vnd.ms-sstr+xml", "application/xml", "text/xml":
+		return true
+	}
+	return strings.HasSuffix(mediaType, "+xml")
+}
+
 // isXMLManifestPayload detects XML-based streaming manifests (DASH MPD / SmoothStreaming)
 // after stripping UTF-8/UTF-16 BOMs and leading whitespace so FFmpeg demuxers cannot
 // bypass the loopback proxy via <BaseURL> or external segment references.
@@ -658,17 +683,23 @@ func isXMLManifestPayload(peek []byte) bool {
 		normalized = bytes.TrimPrefix(peek, []byte{0xEF, 0xBB, 0xBF})
 	}
 	trimmed := bytes.TrimLeft(normalized, " \t\r\n")
-	if len(trimmed) < 4 {
-		return false
+	if len(trimmed) == 0 {
+		// Fail closed if the entire sniffed buffer is ASCII whitespace (e.g., >512 bytes of
+		// leading whitespace padding before <MPD>) or BOM-only.
+		return true
 	}
-	headLen := len(trimmed)
-	if headLen > 32 {
-		headLen = 32
-	}
-	lower := bytes.ToLower(trimmed[:headLen])
-	return bytes.HasPrefix(lower, []byte("<?xml")) ||
+	lower := bytes.ToLower(trimmed)
+	if bytes.HasPrefix(lower, []byte("<!--")) ||
+		bytes.HasPrefix(lower, []byte("<!doctype")) ||
+		bytes.HasPrefix(lower, []byte("<?xml")) ||
 		bytes.HasPrefix(lower, []byte("<mpd")) ||
-		bytes.HasPrefix(lower, []byte("<smoothstreamingmedia"))
+		bytes.HasPrefix(lower, []byte("<smoothstreamingmedia")) {
+		return true
+	}
+	return bytes.Contains(lower, []byte("<mpd")) ||
+		bytes.Contains(lower, []byte("<smoothstreamingmedia")) ||
+		bytes.Contains(lower, []byte("<?xml")) ||
+		bytes.Contains(lower, []byte("<!doctype"))
 }
 
 func effectiveURLPort(u *url.URL) string {

@@ -725,10 +725,19 @@ func (h *Handler) UpdateNamedConfiguration(w http.ResponseWriter, r *http.Reques
 		h.UpdateConfigurationPartial(w, r)
 		return
 	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "failed to read request body")
-		return
+	const maxNamedConfigBytes = 1 << 20
+	var raw []byte
+	if r.Body != nil {
+		var err error
+		raw, err = io.ReadAll(io.LimitReader(r.Body, maxNamedConfigBytes+1))
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, "failed to read request body")
+			return
+		}
+		if len(raw) > maxNamedConfigBytes {
+			httpx.Error(w, http.StatusRequestEntityTooLarge, "configuration payload too large")
+			return
+		}
 	}
 	if len(raw) == 0 {
 		raw = []byte("{}")

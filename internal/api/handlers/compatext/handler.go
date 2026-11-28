@@ -118,6 +118,56 @@ func (h *Handler) SetLiveTV(lt *livetv.Handler) {
 	h.mu.Unlock()
 }
 
+// PruneOrphanedChannelMappings removes channel mappings referencing deleted listing providers
+// or tuner channels from in-memory state and persists the updated state to SQLite if modified.
+func (h *Handler) PruneOrphanedChannelMappings(ctx context.Context, activeProviders, activeChannels map[string]struct{}) {
+	if h == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.state.ChannelMappings) == 0 {
+		return
+	}
+	modified := false
+	cleaned := make(map[string][]ChannelMapping, len(h.state.ChannelMappings))
+	for provID, list := range h.state.ChannelMappings {
+		if _, exists := activeProviders[provID]; !exists {
+			modified = true
+			continue
+		}
+		kept := make([]ChannelMapping, 0, len(list))
+		for _, m := range list {
+			tunerID := strings.TrimSpace(m.Name)
+			provCh := strings.TrimSpace(m.Value)
+			if tunerID == "" || provCh == "" {
+				modified = true
+				continue
+			}
+			if _, exists := activeChannels[tunerID]; !exists {
+				modified = true
+				continue
+			}
+			kept = append(kept, m)
+		}
+		if len(kept) == 0 {
+			if len(list) > 0 {
+				modified = true
+			}
+			continue
+		}
+		cleaned[provID] = kept
+	}
+	if !modified {
+		return
+	}
+	h.state.ChannelMappings = cleaned
+	_ = h.saveStateLocked(ctx)
+}
+
 // SetSyncHandler wires the primary Sync handler to unify in-memory and SQLite sync state.
 func (h *Handler) SetSyncHandler(s *syncapi.Handler) {
 	h.mu.Lock()

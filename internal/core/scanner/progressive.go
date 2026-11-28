@@ -567,7 +567,22 @@ func (s *Scanner) ScanPath(ctx context.Context, libraryID, targetPath string) (S
 		if policy == SymlinkFollowDirect && hops > 1 {
 			return stats, nil
 		}
-		if !isPathWithinRoot(root, cleanTarget) {
+		cleanRoot := filepath.Clean(root)
+		existingAncestor := filepath.Dir(cleanTarget)
+		for {
+			if _, statErr := os.Lstat(existingAncestor); statErr == nil {
+				break
+			}
+			if existingAncestor == cleanRoot {
+				break
+			}
+			parent := filepath.Dir(existingAncestor)
+			if parent == existingAncestor {
+				break
+			}
+			existingAncestor = parent
+		}
+		if !isPathWithinRoot(root, existingAncestor) {
 			return stats, fmt.Errorf("scanner: path %q escapes library %s root", cleanTarget, lib.ID)
 		}
 	}

@@ -2044,7 +2044,11 @@ func (s *transcodeSession) startProcessUnlockRelock(ctx context.Context, startSe
 	stageCtx, stageCancel := context.WithCancel(ctx)
 	var stopSessWatch func() bool
 	if sessCtx != nil {
-		stopSessWatch = context.AfterFunc(sessCtx, stageCancel)
+		if sessCtx.Err() != nil {
+			stageCancel()
+		} else {
+			stopSessWatch = context.AfterFunc(sessCtx, stageCancel)
+		}
 	}
 	defer func() {
 		if stopSessWatch != nil {
@@ -2053,10 +2057,27 @@ func (s *transcodeSession) startProcessUnlockRelock(ctx context.Context, startSe
 		stageCancel()
 	}()
 
-	if err := os.MkdirAll(workDir, 0o755); err != nil {
+	cleanupDestroyed := func() error {
+		s.mu.Unlock()
+		if workDir != "" {
+			_ = os.RemoveAll(workDir)
+		}
+		s.mu.Lock()
+		return ErrSessionClosed
+	}
+
+	if err := stageCtx.Err(); err != nil {
 		s.mu.Lock()
 		if s.destroyed {
 			return ErrSessionClosed
+		}
+		return err
+	}
+
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		s.mu.Lock()
+		if s.destroyed {
+			return cleanupDestroyed()
 		}
 		return err
 	}
@@ -2065,7 +2086,7 @@ func (s *transcodeSession) startProcessUnlockRelock(ctx context.Context, startSe
 	if err := stageCtx.Err(); err != nil {
 		s.mu.Lock()
 		if s.destroyed {
-			return ErrSessionClosed
+			return cleanupDestroyed()
 		}
 		return err
 	}
@@ -2082,7 +2103,7 @@ func (s *transcodeSession) startProcessUnlockRelock(ctx context.Context, startSe
 		if proxyErr != nil {
 			s.mu.Lock()
 			if s.destroyed {
-				return ErrSessionClosed
+				return cleanupDestroyed()
 			}
 			return fmt.Errorf("start loopback stream proxy: %w", proxyErr)
 		}
@@ -2095,7 +2116,7 @@ func (s *transcodeSession) startProcessUnlockRelock(ctx context.Context, startSe
 		if streamProxy != nil {
 			_ = streamProxy.Close()
 		}
-		return ErrSessionClosed
+		return cleanupDestroyed()
 	}
 	if s.procGen != expectedGen || s.running || s.cmd != nil || s.doneCh != nil {
 		if streamProxy != nil {

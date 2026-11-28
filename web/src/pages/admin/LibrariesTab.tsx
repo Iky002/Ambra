@@ -1164,6 +1164,7 @@ export function LibrariesTab() {
         }
         maxWidthClass="max-w-2xl"
         onClose={() => {
+          if (confirmRemovePath || pathBusy !== null) return
           setEditTarget(null)
           setModalFeedback(null)
         }}

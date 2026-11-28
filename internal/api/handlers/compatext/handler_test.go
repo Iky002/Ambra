@@ -96,7 +96,7 @@ var all59Routes = []routeSpec{
 	{http.MethodGet, "/Notifications/Services/Configured", false, false, ""},
 	{http.MethodPost, "/Notifications/Services/Configured", false, false, `{"Name":"Webhook","Enabled":true}`},
 	{http.MethodGet, "/Notifications/Services/Defaults", false, false, ""},
-	{http.MethodPost, "/Notifications/Services/Test", false, false, `{}`},
+	{http.MethodPost, "/Notifications/Services/Test", true, false, `{}`},
 	{http.MethodDelete, "/Notifications/Services/Configured?Id=nonexistent", false, false, ""},
 }
 
@@ -801,3 +801,60 @@ func TestLiveStreamFileHLSRewriteAndSignedProxy(t *testing.T) {
 		t.Fatalf("expected resolved signed segment %q to return COMPAT_HLS_SEG0, got %d %q", resolved.RequestURI(), segRec.Code, segRec.Body.String())
 	}
 }
+
+func TestPruneOrphanedChannelMappingsSyncsMemoryAndSQLite(t *testing.T) {
+	dir := t.TempDir()
+	store, err := sqlite.Open(filepath.Join(dir, "compatext_prune.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Default(dir)
+	h := New(store, cfg)
+	h.mu.Lock()
+	h.state.ChannelMappings = map[string][]ChannelMapping{
+		"lp-active": {
+			{Name: "ch-active", Value: "epg-1"},
+			{Name: "ch-deleted", Value: "epg-2"},
+		},
+		"lp-deleted": {
+			{Name: "ch-active", Value: "epg-3"},
+		},
+	}
+	if err := h.saveStateLocked(context.Background()); err != nil {
+		h.mu.Unlock()
+		t.Fatal(err)
+	}
+	h.mu.Unlock()
+
+	h.PruneOrphanedChannelMappings(
+		context.Background(),
+		map[string]struct{}{"lp-active": {}},
+		map[string]struct{}{"ch-active": {}},
+	)
+
+	// Verify in-memory state is pruned.
+	h.mu.RLock()
+	if _, exists := h.state.ChannelMappings["lp-deleted"]; exists {
+		h.mu.RUnlock()
+		t.Fatal("expected lp-deleted removed from in-memory ChannelMappings")
+	}
+	gotList := h.state.ChannelMappings["lp-active"]
+	h.mu.RUnlock()
+	if len(gotList) != 1 || gotList[0].Name != "ch-active" || gotList[0].Value != "epg-1" {
+		t.Fatalf("unexpected in-memory ChannelMappings for lp-active: %+v", gotList)
+	}
+
+	// Verify reloaded handler from SQLite sees the exact same pruned mappings.
+	h2 := New(store, cfg)
+	h2.mu.RLock()
+	defer h2.mu.RUnlock()
+	if _, exists := h2.state.ChannelMappings["lp-deleted"]; exists {
+		t.Fatal("expected lp-deleted removed from persisted SQLite ChannelMappings")
+	}
+	if len(h2.state.ChannelMappings["lp-active"]) != 1 || h2.state.ChannelMappings["lp-active"][0].Name != "ch-active" {
+		t.Fatalf("unexpected persisted ChannelMappings: %+v", h2.state.ChannelMappings)
+	}
+}
+

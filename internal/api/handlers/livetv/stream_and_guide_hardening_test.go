@@ -189,3 +189,158 @@ func TestLiveTVSignedSubTargetRevocationAndRecordingRBAC(t *testing.T) {
 		t.Fatalf("expected orphaned output file to be removed, stat err=%v", err)
 	}
 }
+
+func TestProxyChannelStreamIgnoresUnsignedUIDParam(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.0,\nseg0.ts\n"))
+	}))
+	defer upstream.Close()
+
+	h := New(nil, config.Default(t.TempDir()))
+	defer h.Close()
+	h.SetHTTPClient(upstream.Client())
+	h.streamClient = upstream.Client()
+	h.customStreamClient = true
+
+	viewerID := guid.Normalize("viewer-user-id-1111")
+	adminID := guid.Normalize("admin-user-id-9999")
+	chID := "ch-uid-test"
+	h.mu.Lock()
+	h.state.Channels = append(h.state.Channels, ChannelInfo{
+		Id:        chID,
+		Name:      "News",
+		StreamUrl: upstream.URL + "/index.m3u8",
+	})
+	h.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/LiveTv/Channels/"+chID+"/Stream?uid="+adminID, nil)
+	ac := &middleware.AuthContext{
+		User: &sqlite.UserRecord{
+			ID:     viewerID,
+			Name:   "viewer",
+			Policy: sqlite.DefaultUserPolicy(false),
+		},
+	}
+	req = req.WithContext(middleware.WithAuthContext(req.Context(), ac))
+	rec := httptest.NewRecorder()
+
+	h.ProxyChannelStream(rec, req, chID, upstream.URL+"/index.m3u8")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "uid="+adminID) {
+		t.Fatalf("unsigned ?uid= admin override leaked into rewritten playlist:\n%s", body)
+	}
+	if !strings.Contains(body, "uid="+viewerID) {
+		t.Fatalf("expected rewritten playlist sub-targets bound to authenticated caller uid=%s, got:\n%s", viewerID, body)
+	}
+}
+
+func TestRefreshAllGuidesConcurrentProviderMutationSkipsStaleSweep(t *testing.T) {
+	fetchStarted := make(chan struct{})
+	releaseFetch := make(chan struct{})
+	now := time.Now().UTC()
+	xmlStart := now.Add(-10 * time.Minute).Format("20060102150405 -0700")
+	xmlStop := now.Add(50 * time.Minute).Format("20060102150405 -0700")
+
+	epgSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(fetchStarted)
+		<-releaseFetch
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>
+<tv>
+  <channel id="epg-a"><display-name>Ch A</display-name></channel>
+  <programme start="` + xmlStart + `" stop="` + xmlStop + `" channel="epg-a">
+    <title>Show A</title>
+  </programme>
+</tv>`))
+	}))
+	defer epgSrv.Close()
+
+	h := New(nil, config.Default(t.TempDir()))
+	defer h.Close()
+	h.SetHTTPClient(epgSrv.Client())
+
+	h.mu.Lock()
+	h.state.Channels = []ChannelInfo{
+		{Id: "ch-a", Name: "Ch A", Number: "1"},
+		{Id: "ch-b", Name: "Ch B", Number: "2"},
+	}
+	h.state.ListingProviders = []ListingProviderInfo{
+		{Id: "lp-a", Type: "xmltv", Path: epgSrv.URL + "/a.xml", AllowPrivateNetwork: true, NetworkPolicySet: true},
+	}
+	h.state.Programs = []ProgramInfo{
+		{
+			Id:        "prog-b",
+			ChannelId: "ch-b",
+			Name:      "Show B From Concurrent Provider",
+			StartDate: now.Add(-5 * time.Minute),
+			EndDate:   now.Add(45 * time.Minute),
+			Source:    "xmltv",
+		},
+	}
+	h.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- h.RefreshAllGuides(context.Background())
+	}()
+
+	<-fetchStarted
+	// Concurrently add a second XMLTV provider while RefreshAllGuides is fetching lp-a.
+	h.mu.Lock()
+	h.state.ListingProviders = append(h.state.ListingProviders, ListingProviderInfo{
+		Id: "lp-b", Type: "xmltv", Path: epgSrv.URL + "/b.xml", AllowPrivateNetwork: true, NetworkPolicySet: true,
+	})
+	h.mu.Unlock()
+	close(releaseFetch)
+
+	if err := <-done; err != nil {
+		t.Fatalf("RefreshAllGuides: %v", err)
+	}
+
+	h.mu.RLock()
+	var foundB bool
+	for _, p := range h.state.Programs {
+		if p.Id == "prog-b" {
+			foundB = true
+			break
+		}
+	}
+	h.mu.RUnlock()
+	if !foundB {
+		t.Fatal("expected prog-b to be preserved when listing providers mutated concurrently during RefreshAllGuides")
+	}
+}
+
+func TestPruneOrphanedChannelMappingsUsesCallback(t *testing.T) {
+	h := New(nil, config.Default(t.TempDir()))
+	defer h.Close()
+
+	h.mu.Lock()
+	h.state.ListingProviders = []ListingProviderInfo{{Id: "lp-live", Type: "xmltv"}}
+	h.state.Channels = []ChannelInfo{{Id: "ch-live", Name: "Live 1"}}
+	h.mu.Unlock()
+
+	var called bool
+	var gotProviders, gotChannels map[string]struct{}
+	h.SetOnPruneChannelMappings(func(_ context.Context, activeProviders, activeChannels map[string]struct{}) {
+		called = true
+		gotProviders = activeProviders
+		gotChannels = activeChannels
+	})
+
+	h.pruneOrphanedChannelMappings(context.Background())
+	if !called {
+		t.Fatal("expected onPruneChannelMappings callback to be invoked")
+	}
+	if _, ok := gotProviders["lp-live"]; !ok {
+		t.Fatalf("expected lp-live in activeProviders, got %+v", gotProviders)
+	}
+	if _, ok := gotChannels["ch-live"]; !ok {
+		t.Fatalf("expected ch-live in activeChannels, got %+v", gotChannels)
+	}
+}
+

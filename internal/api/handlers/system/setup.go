@@ -181,10 +181,13 @@ func (h *Handler) syncTMDBPlugin() {
 			})
 		}
 	}
-	h.persistBuiltinPluginConfig(tmdbPluginID, map[string]any{
-		"api_key":  apiKey,
+	updates := map[string]any{
 		"language": lang,
-	})
+	}
+	if !h.cfg.IsTMDBKeyEnvOverridden() {
+		updates["api_key"] = apiKey
+	}
+	h.persistBuiltinPluginConfig(tmdbPluginID, updates)
 }
 
 func (h *Handler) syncSTRMPlugin() {
