@@ -176,18 +176,32 @@ func TestAuditV0112_DynamicDLNA_LiveTVWSFilter_NotifBridge_AndHooks(t *testing.T
 		t.Fatal("H-04: expected WS LibraryChanged event for livetv library dropped when EnableLiveTvAccess=false")
 	}
 
-	// 3. 3.1-8: POST /Notifications/Services/Test dispatches to registry.Notifiers() & records notification
+	// 3. 3.1-8: POST /Notifications/Services/Test:
+	// - Non-admin with empty Id -> 403 (must NOT trigger global registry.Notifiers())
+	// - Non-admin with own configured Id -> 204 & records user notification, WITHOUT triggering global registry.Notifiers()
+	// - Admin with empty Id -> 204 & dispatches to registry.Notifiers() (and 502 on plugin error)
 	np := &testNotifierPlugin{id: "ext.test.notifier"}
 	srv.Registry.Register(np)
 	userLogin, err := srv.Auth.AuthenticateByName(ctx, "allfolders_notv", "pw123456", "", auth.ClientInfo{DeviceID: "d-notif"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if w := doJSON(userLogin.AccessToken, http.MethodPost, "/Notifications/Services/Test", map[string]any{}); w.Code != http.StatusNoContent {
-		t.Fatalf("POST /Notifications/Services/Test expected 204, got %d %s", w.Code, w.Body.String())
+	if w := doJSON(userLogin.AccessToken, http.MethodPost, "/Notifications/Services/Test", map[string]any{}); w.Code != http.StatusForbidden {
+		t.Fatalf("non-admin global POST /Notifications/Services/Test expected 403, got %d %s", w.Code, w.Body.String())
 	}
-	if np.calls.Load() != 1 {
-		t.Fatalf("expected 1 notifier plugin call, got %d", np.calls.Load())
+	if np.calls.Load() != 0 {
+		t.Fatalf("expected 0 global notifier plugin calls for non-admin empty-body test, got %d", np.calls.Load())
+	}
+	if w := doJSON(userLogin.AccessToken, http.MethodPost, "/Notifications/Services/Configured", map[string]any{
+		"Id": "svc-user-own", "Name": "User Notif", "Enabled": true,
+	}); w.Code != http.StatusOK {
+		t.Fatalf("configure user notification service expected 200, got %d %s", w.Code, w.Body.String())
+	}
+	if w := doJSON(userLogin.AccessToken, http.MethodPost, "/Notifications/Services/Test", map[string]any{"Id": "svc-user-own"}); w.Code != http.StatusNoContent {
+		t.Fatalf("non-admin own-service POST /Notifications/Services/Test expected 204, got %d %s", w.Code, w.Body.String())
+	}
+	if np.calls.Load() != 0 {
+		t.Fatalf("expected 0 global notifier plugin calls for non-admin own-service test, got %d", np.calls.Load())
 	}
 	wSummary := doJSON(userLogin.AccessToken, http.MethodGet, "/Notifications/"+allFoldersNoTV.ID+"/Summary", nil)
 	if wSummary.Code != http.StatusOK {
@@ -201,8 +215,15 @@ func TestAuditV0112_DynamicDLNA_LiveTVWSFilter_NotifBridge_AndHooks(t *testing.T
 		t.Fatalf("expected test notification recorded in user notifications, unread=%d", summary.UnreadCount)
 	}
 
+	if w := doJSON(adminToken, http.MethodPost, "/Notifications/Services/Test", map[string]any{}); w.Code != http.StatusNoContent {
+		t.Fatalf("admin POST /Notifications/Services/Test expected 204, got %d %s", w.Code, w.Body.String())
+	}
+	if np.calls.Load() != 1 {
+		t.Fatalf("expected 1 notifier plugin call for admin, got %d", np.calls.Load())
+	}
+
 	np.err = errors.New("notifier downstream failure")
-	if w := doJSON(userLogin.AccessToken, http.MethodPost, "/Notifications/Services/Test", map[string]any{}); w.Code != http.StatusBadGateway {
+	if w := doJSON(adminToken, http.MethodPost, "/Notifications/Services/Test", map[string]any{}); w.Code != http.StatusBadGateway {
 		t.Fatalf("expected 502 when notifier plugin fails, got %d", w.Code)
 	}
 	srv.Registry.Unregister(np.id)

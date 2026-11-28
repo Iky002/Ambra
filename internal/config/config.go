@@ -24,7 +24,7 @@ const (
 )
 
 // AmbraVersion is the Ambra application release version (overridden at build time via -ldflags).
-var AmbraVersion = "v0.12.2"
+var AmbraVersion = "v0.12.3"
 
 type envOverrideFlags struct {
 	httpAddr            bool
@@ -431,6 +431,16 @@ func (c Config) IsGlobalRemoteAccessEnabled() bool {
 		return true
 	}
 	return *c.EnableRemoteAccessGlobal
+}
+
+// IsTMDBKeyEnvOverridden reports whether TMDBApiKey is currently overridden by AMBRA_TMDB_API_KEY.
+func (c *Config) IsTMDBKeyEnvOverridden() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.envFlags.tmdbKey
 }
 
 func (c *Config) Save() error {

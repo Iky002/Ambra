@@ -804,7 +804,7 @@ function createInitialDemoNotifications(): DemoNotificationRecord[] {
     {
       Id: 'notif-demo-01',
       Date: new Date(now - 15 * 60_000).toISOString(),
-      Name: '欢迎体验 Ambra v0.12.2',
+      Name: '欢迎体验 Ambra v0.12.3',
       Description: '已上线应用内通知中心、家长控制分级过滤与 Quick Connect 设备授权码登录。',
       Level: 'Normal',
       readByUsers: new Set(),
@@ -889,6 +889,7 @@ const DEMO_IMDB_TOP250_TMDB_IDS = new Set([
 ])
 
 const demoRevokedTokens = new Set<string>()
+const demoPlaylistOwners = new Map<string, string>()
 
 /**
  * 重置 Demo 内存态数据（供单元测试与演示重置使用）
@@ -898,6 +899,7 @@ export function resetDemoStore(): void {
   demoTraktAccounts.clear()
   demoTokenUserMap.clear()
   demoRevokedTokens.clear()
+  demoPlaylistOwners.clear()
   seedInitialApiKeys()
   rankingsState = createInitialRankingsState()
   activeDemoScan = null
@@ -2785,6 +2787,9 @@ export async function demoFetch<T>(
 
   if (pathname === '/emby/Playlists' && method === 'POST') {
     const body = parseJsonBody(options)
+    const requestedUserId = String(qs.get('UserId') || body.UserId || '').trim()
+    if (requestedUserId) requireSelfOrAdmin(caller, requestedUserId)
+    const ownerUserId = requestedUserId || caller.userId
     const name = String(qs.get('Name') || body.Name || '').trim()
     if (!name) throw new ApiError(400, '播放列表名称不能为空')
     const idsRaw = qs.get('Ids') || (Array.isArray(body.Ids) ? body.Ids.join(',') : '')
@@ -2806,6 +2811,7 @@ export async function demoFetch<T>(
     }
     store.items.set(id, dto)
     store.libraryItems.set(id, Array.from(new Set(ids)))
+    demoPlaylistOwners.set(id, ownerUserId)
     pushActivity(`已创建播放列表「${name}」`, 'PlaylistCreated', undefined, caller.userId)
     return { Id: id, Name: name } as T
   }
@@ -2821,6 +2827,8 @@ export async function demoFetch<T>(
     if (!container || container.Type !== 'Playlist') {
       throw new ApiError(404, '播放列表不存在')
     }
+    const ownerUserId = demoPlaylistOwners.get(playlistId)
+    if (ownerUserId) requireSelfOrAdmin(caller, ownerUserId)
     const list = [...(store.libraryItems.get(playlistId) || [])]
     const fromIdx = list.indexOf(itemId)
     if (fromIdx < 0) {
@@ -2838,7 +2846,10 @@ export async function demoFetch<T>(
     const containerKind = containerItemsMatch[1]
     const containerId = decodeURIComponent(containerItemsMatch[2])
     const container = store.items.get(containerId)
-    if (!container) throw new ApiError(404, '合集或播放列表不存在')
+    const expectedType = containerKind === 'Collections' ? 'BoxSet' : 'Playlist'
+    if (!container || container.Type !== expectedType) {
+      throw new ApiError(404, '合集或播放列表不存在')
+    }
     if (method === 'GET') {
       const qUserId = qs.get('UserId') || caller.userId
       if (qs.get('UserId')) requireSelfOrAdmin(caller, qUserId)
@@ -2852,7 +2863,12 @@ export async function demoFetch<T>(
       return { Items: items, TotalRecordCount: items.length } as T
     }
     if (method === 'POST') {
-      if (containerKind === 'Collections') requireDemoAdmin(caller)
+      if (containerKind === 'Collections') {
+        requireDemoAdmin(caller)
+      } else {
+        const ownerUserId = demoPlaylistOwners.get(containerId)
+        if (ownerUserId) requireSelfOrAdmin(caller, ownerUserId)
+      }
       const body = parseJsonBody(options)
       const idsRaw = qs.get('Ids') || (Array.isArray(body.Ids) ? body.Ids.join(',') : '')
       const toAdd = idsRaw
@@ -2866,7 +2882,12 @@ export async function demoFetch<T>(
       return undefined as T
     }
     if (method === 'DELETE') {
-      if (containerKind === 'Collections') requireDemoAdmin(caller)
+      if (containerKind === 'Collections') {
+        requireDemoAdmin(caller)
+      } else {
+        const ownerUserId = demoPlaylistOwners.get(containerId)
+        if (ownerUserId) requireSelfOrAdmin(caller, ownerUserId)
+      }
       const idsRaw = qs.get('EntryIds') || qs.get('Ids') || ''
       const toRemove = new Set(
         idsRaw
@@ -2884,16 +2905,24 @@ export async function demoFetch<T>(
 
   const deleteContainerMatch = pathname.match(/^\/emby\/(Collections|Playlists)\/([^/]+)$/)
   if (deleteContainerMatch && method === 'DELETE') {
-    if (deleteContainerMatch[1] === 'Collections') {
+    const containerKind = deleteContainerMatch[1]
+    if (containerKind === 'Collections') {
       requireDemoAdmin(caller)
     }
     const containerId = decodeURIComponent(deleteContainerMatch[2])
     const container = store.items.get(containerId)
-    if (container) {
-      store.items.delete(containerId)
-      store.libraryItems.delete(containerId)
-      pushActivity(`已删除「${container.Name}」`, 'ContainerDeleted', undefined, caller.userId)
+    const expectedType = containerKind === 'Collections' ? 'BoxSet' : 'Playlist'
+    if (!container || container.Type !== expectedType) {
+      throw new ApiError(404, '合集或播放列表不存在')
     }
+    if (containerKind === 'Playlists') {
+      const ownerUserId = demoPlaylistOwners.get(containerId)
+      if (ownerUserId) requireSelfOrAdmin(caller, ownerUserId)
+    }
+    store.items.delete(containerId)
+    store.libraryItems.delete(containerId)
+    demoPlaylistOwners.delete(containerId)
+    pushActivity(`已删除「${container.Name}」`, 'ContainerDeleted', undefined, caller.userId)
     return undefined as T
   }
 
@@ -3211,7 +3240,7 @@ export async function demoFetch<T>(
           UserId: sessionUserId,
           UserName: caller.user?.Name || sessionUserId,
           Client: 'Ambra Web',
-          ApplicationVersion: '0.12.2',
+          ApplicationVersion: '0.12.3',
           DeviceName: 'Web Browser (Demo)',
           DeviceId: `dev-web-${sessionUserId}`,
           LastActivityDate: new Date().toISOString(),
@@ -6197,7 +6226,7 @@ export async function demoFetch<T>(
       DeviceId: 'dev-demo-web-01',
       DeviceName: 'Ambra Web Demo',
       AppName: 'Ambra Web',
-      AppVersion: '0.12.2',
+      AppVersion: '0.12.3',
       DateAdded: new Date().toISOString(),
     }
     demoQuickConnectSessions.set(secret, session)

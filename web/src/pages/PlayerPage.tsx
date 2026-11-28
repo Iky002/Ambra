@@ -568,7 +568,7 @@ export function PlayerPage() {
         subtitleStreamIndex: subtitleIndex,
         startTimeTicks: initialStartTicks,
       }),
-    enabled: Boolean(id),
+    enabled: Boolean(id) && episodeIdSynced === id,
     staleTime: 0,
     placeholderData: (prev, prevQuery) => (prevQuery?.queryKey[1] === id ? prev : undefined),
   })

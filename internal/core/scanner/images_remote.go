@@ -231,7 +231,27 @@ func fetchRemoteImage(ctx context.Context, client *http.Client, rawURL string) (
 	if err != nil || len(data) == 0 || len(data) > maxRemoteImageBytes {
 		return nil, "", false
 	}
+	if !isValidRasterImageBytes(data) {
+		return nil, "", false
+	}
 	return data, ct, true
+}
+
+func isValidRasterImageBytes(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	switch http.DetectContentType(data) {
+	case "image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp":
+		return true
+	}
+	if len(data) >= 12 && string(data[4:8]) == "ftyp" {
+		switch string(data[8:12]) {
+		case "avif", "avis", "mif1":
+			return true
+		}
+	}
+	return false
 }
 
 func detectImageExtension(contentType, rawURL string) string {

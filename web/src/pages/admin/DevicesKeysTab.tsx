@@ -38,6 +38,7 @@ export function DevicesKeysTab() {
 
   const [revokingDeviceId, setRevokingDeviceId] = useState<string | null>(null)
   const [confirmDevice, setConfirmDevice] = useState<{ id: string; name: string } | null>(null)
+  const [kickModalError, setKickModalError] = useState<string | null>(null)
   const [appName, setAppName] = useState('')
   const [creatingKey, setCreatingKey] = useState(false)
   const [newlyCreatedKey, setNewlyCreatedKey] = useState<{
@@ -51,6 +52,7 @@ export function DevicesKeysTab() {
     appName: string
     accessToken?: string
   } | null>(null)
+  const [revokeKeyModalError, setRevokeKeyModalError] = useState<string | null>(null)
   const [copiedKey, setCopiedKey] = useState<string | null>(null)
   const [revealedKeys, setRevealedKeys] = useState<Record<string, boolean>>({})
 
@@ -84,6 +86,7 @@ export function DevicesKeysTab() {
   const handleDeleteDevice = async (deviceId: string, deviceName: string) => {
     setRevokingDeviceId(deviceId)
     setFeedback(null)
+    setKickModalError(null)
     try {
       await api.deleteDevice(deviceId)
       await Promise.all([
@@ -91,14 +94,17 @@ export function DevicesKeysTab() {
         queryClient.invalidateQueries({ queryKey: ['admin', 'sessions'] }),
       ])
       setConfirmDevice(null)
+      setKickModalError(null)
       setFeedback({
         type: 'success',
         message: t('admin.devices.kickedSuccess', { name: deviceName || deviceId }),
       })
     } catch (err) {
+      const msg = err instanceof Error ? err.message : t('admin.devices.kickFailed')
+      setKickModalError(msg)
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : t('admin.devices.kickFailed'),
+        message: msg,
       })
     } finally {
       setRevokingDeviceId(null)
@@ -144,6 +150,7 @@ export function DevicesKeysTab() {
   const handleDeleteApiKey = async (revokeId: string, name: string, accessToken?: string) => {
     setRevokingKey(revokeId)
     setFeedback(null)
+    setRevokeKeyModalError(null)
     try {
       await api.deleteApiKey(revokeId)
       setNewlyCreatedKey((prev) => {
@@ -168,14 +175,17 @@ export function DevicesKeysTab() {
       )
       await queryClient.invalidateQueries({ queryKey: ['admin', 'apiKeys'] })
       setConfirmApiKey(null)
+      setRevokeKeyModalError(null)
       setFeedback({
         type: 'success',
         message: t('admin.devices.revokedSuccess', { name: name || 'API Key' }),
       })
     } catch (err) {
+      const msg = err instanceof Error ? err.message : t('admin.devices.revokeFailed')
+      setRevokeKeyModalError(msg)
       setFeedback({
         type: 'error',
-        message: err instanceof Error ? err.message : t('admin.devices.revokeFailed'),
+        message: msg,
       })
     } finally {
       setRevokingKey(null)
@@ -300,7 +310,10 @@ export function DevicesKeysTab() {
                 <button
                   type="button"
                   disabled={revokingDeviceId === dev.Id}
-                  onClick={() => setConfirmDevice({ id: dev.Id, name: dev.Name || dev.Id })}
+                  onClick={() => {
+                    setKickModalError(null)
+                    setConfirmDevice({ id: dev.Id, name: dev.Name || dev.Id })
+                  }}
                   className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
                 >
                   {revokingDeviceId === dev.Id ? (
@@ -520,13 +533,14 @@ export function DevicesKeysTab() {
                       <button
                         type="button"
                         disabled={revokingKey === revokeId}
-                        onClick={() =>
+                        onClick={() => {
+                          setRevokeKeyModalError(null)
                           setConfirmApiKey({
                             revokeId,
                             appName: item.AppName || 'API Key',
                             accessToken: item.AccessToken,
                           })
-                        }
+                        }}
                         className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
                       >
                         {revokingKey === revokeId ? (
@@ -551,15 +565,28 @@ export function DevicesKeysTab() {
         title={t('admin.devices.kickModalTitle')}
         subtitle={t('admin.devices.kickModalSubtitle')}
         maxWidthClass="max-w-md"
-        onClose={() => setConfirmDevice(null)}
+        onClose={() => {
+          setConfirmDevice(null)
+          setKickModalError(null)
+        }}
       >
-        <p className="text-sm text-zinc-300">
-          {t('admin.devices.kickConfirmPrompt', { name: confirmDevice?.name || '' })}
-        </p>
+        <div className="space-y-4">
+          <FeedbackBanner
+            type="error"
+            message={kickModalError || undefined}
+            onClose={() => setKickModalError(null)}
+          />
+          <p className="text-sm text-zinc-300">
+            {t('admin.devices.kickConfirmPrompt', { name: confirmDevice?.name || '' })}
+          </p>
+        </div>
         <div className="mt-6 flex justify-end gap-2">
           <button
             type="button"
-            onClick={() => setConfirmDevice(null)}
+            onClick={() => {
+              setConfirmDevice(null)
+              setKickModalError(null)
+            }}
             className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
           >
             {t('common.cancel')}
@@ -588,15 +615,28 @@ export function DevicesKeysTab() {
         title={t('admin.devices.revokeModalTitle')}
         subtitle={t('admin.devices.revokeModalSubtitle')}
         maxWidthClass="max-w-md"
-        onClose={() => setConfirmApiKey(null)}
+        onClose={() => {
+          setConfirmApiKey(null)
+          setRevokeKeyModalError(null)
+        }}
       >
-        <p className="text-sm text-zinc-300">
-          {t('admin.devices.revokeConfirmPrompt', { name: confirmApiKey?.appName || '' })}
-        </p>
+        <div className="space-y-4">
+          <FeedbackBanner
+            type="error"
+            message={revokeKeyModalError || undefined}
+            onClose={() => setRevokeKeyModalError(null)}
+          />
+          <p className="text-sm text-zinc-300">
+            {t('admin.devices.revokeConfirmPrompt', { name: confirmApiKey?.appName || '' })}
+          </p>
+        </div>
         <div className="mt-6 flex justify-end gap-2">
           <button
             type="button"
-            onClick={() => setConfirmApiKey(null)}
+            onClick={() => {
+              setConfirmApiKey(null)
+              setRevokeKeyModalError(null)
+            }}
             className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
           >
             {t('common.cancel')}

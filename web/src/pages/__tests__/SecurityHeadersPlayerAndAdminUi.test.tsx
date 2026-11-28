@@ -768,7 +768,7 @@ describe('v0.10.7 Audit 5 Web 全量修复回归测试', () => {
     })
   })
 
-  it('M-19: Demo Mock 同步 v0.12.2 版本号、默认隐藏公开用户列表、ChapterCachePath/BifCachePath、264MB 缓存、/Attachments 与 /index.bif', async () => {
+  it('M-19: Demo Mock 同步 v0.12.3 版本号、默认隐藏公开用户列表、ChapterCachePath/BifCachePath、264MB 缓存、/Attachments 与 /index.bif', async () => {
     setDemoModeOverride(true)
     // 默认 EnableLoginUserList=false，匿名获取公开用户列表应返回空数组 []
     const pubBefore = await api.getPublicUsers()
@@ -793,7 +793,7 @@ describe('v0.10.7 Audit 5 Web 全量修复回归测试', () => {
     await api.updateServerConfig({ EnableLoginUserList: false })
 
     const sysInfo = await api.getSystemInfo()
-    expect(sysInfo.Version).toBe('0.12.2-demo')
+    expect(sysInfo.Version).toBe('0.12.3-demo')
     expect(sysInfo.ChapterCachePath).toBe('/var/lib/ambra/cache/chapters')
     expect(sysInfo.BifCachePath).toBe('/var/lib/ambra/cache/bif')
 

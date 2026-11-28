@@ -562,8 +562,11 @@ export function AudioPlayerProvider({ children }: { children: ReactNode }) {
       if (cmd.PlaySessionId && cmd.PlaySessionId !== activeSessionId) {
         return
       }
+      const hashPath =
+        typeof window !== 'undefined' ? (window.location?.hash || '').replace(/^#/, '') : ''
+      const pathName = typeof window !== 'undefined' ? window.location?.pathname || '' : ''
       const onVideoPlayerRoute =
-        typeof window !== 'undefined' && window.location?.pathname?.startsWith('/play/')
+        hashPath.startsWith('/play/') || /(?:^|\/)play\//.test(pathName)
       if (onVideoPlayerRoute && (!cmd.PlaySessionId || cmd.PlaySessionId !== activeSessionId)) {
         return
       }

@@ -679,3 +679,28 @@ func TestSystemInfoPathMaskingNamedConfigRBACAndConcurrency(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestUpdateNamedConfigurationNilBodyAndPayloadLimit(t *testing.T) {
+	r, _, _, _, adminTok, _ := setupSystemHandler(t)
+
+	// Nil body should be treated as empty JSON object and succeed with 204.
+	reqNil := httptest.NewRequest(http.MethodPost, "/System/Configuration/customkey", nil)
+	reqNil.Body = nil
+	reqNil.Header.Set("X-Emby-Token", adminTok)
+	recNil := httptest.NewRecorder()
+	r.ServeHTTP(recNil, reqNil)
+	if recNil.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for nil body on UpdateNamedConfiguration, got %d %s", recNil.Code, recNil.Body.String())
+	}
+
+	// Payload exceeding 1 MiB must return 413 Request Entity Too Large.
+	oversized := `{"pad":"` + strings.Repeat("a", (1<<20)+16) + `"}`
+	reqBig := httptest.NewRequest(http.MethodPost, "/System/Configuration/customkey", strings.NewReader(oversized))
+	reqBig.Header.Set("X-Emby-Token", adminTok)
+	recBig := httptest.NewRecorder()
+	r.ServeHTTP(recBig, reqBig)
+	if recBig.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 for oversized UpdateNamedConfiguration payload, got %d %s", recBig.Code, recBig.Body.String())
+	}
+}
+

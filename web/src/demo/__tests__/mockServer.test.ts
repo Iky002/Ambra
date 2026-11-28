@@ -1182,4 +1182,64 @@ describe('Demo Mock 引擎 - Serverless 完整闭环测试', () => {
       }),
     ).resolves.toBeUndefined()
   })
+
+  it('合集与播放列表接口严格校验容器类型 (404) 与播放列表归属权 (403)', async () => {
+    const adminAuth = await loginAsDemo('admin')
+    const adminId = adminAuth.User.Id
+
+    const col = await embyFetch<{ Id: string }>('/emby/Collections', {
+      method: 'POST',
+      body: JSON.stringify({ Name: '管理员合集', Ids: ['item-dune-2'] }),
+    })
+    const adminPl = await api.createPlaylist('管理员私密片单', adminId, ['item-dune-2'], 'Video')
+
+    // 跨类型操作：用 Playlists 端点操作 BoxSet 或用 Collections 端点操作 Playlist 均返回 404
+    await expect(
+      embyFetch(`/emby/Playlists/${encodeURIComponent(col.Id)}/Items?Ids=item-oppenheimer`, {
+        method: 'POST',
+      }),
+    ).rejects.toMatchObject({ status: 404 })
+    await expect(
+      embyFetch(`/emby/Playlists/${encodeURIComponent(col.Id)}`, { method: 'DELETE' }),
+    ).rejects.toMatchObject({ status: 404 })
+    await expect(
+      embyFetch(`/emby/Collections/${encodeURIComponent(adminPl.Id)}/Items?Ids=item-oppenheimer`, {
+        method: 'POST',
+      }),
+    ).rejects.toMatchObject({ status: 404 })
+    await expect(
+      embyFetch(`/emby/Collections/${encodeURIComponent(adminPl.Id)}`, { method: 'DELETE' }),
+    ).rejects.toMatchObject({ status: 404 })
+
+    // 切换为普通用户 guest：无法修改、排序或删除管理员创建的播放列表 (403)
+    const guestAuth = await loginAsDemo('guest')
+    const guestId = guestAuth.User.Id
+    await expect(
+      embyFetch(`/emby/Playlists/${encodeURIComponent(adminPl.Id)}/Items?Ids=item-oppenheimer`, {
+        method: 'POST',
+      }),
+    ).rejects.toMatchObject({ status: 403 })
+    await expect(
+      embyFetch(`/emby/Playlists/${encodeURIComponent(adminPl.Id)}/Items?EntryIds=item-dune-2`, {
+        method: 'DELETE',
+      }),
+    ).rejects.toMatchObject({ status: 403 })
+    await expect(api.movePlaylistItem(adminPl.Id, 'item-dune-2', 0)).rejects.toMatchObject({
+      status: 403,
+    })
+    await expect(
+      embyFetch(`/emby/Playlists/${encodeURIComponent(adminPl.Id)}`, { method: 'DELETE' }),
+    ).rejects.toMatchObject({ status: 403 })
+
+    // guest 可以正常创建、修改并删除自己的播放列表
+    const guestPl = await api.createPlaylist('访客自己的片单', guestId, ['item-dune-2'], 'Video')
+    await expect(
+      embyFetch(`/emby/Playlists/${encodeURIComponent(guestPl.Id)}/Items?Ids=item-oppenheimer`, {
+        method: 'POST',
+      }),
+    ).resolves.toBeUndefined()
+    await expect(
+      embyFetch(`/emby/Playlists/${encodeURIComponent(guestPl.Id)}`, { method: 'DELETE' }),
+    ).resolves.toBeUndefined()
+  })
 })
