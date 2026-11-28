@@ -1388,4 +1388,83 @@ describe('StreamMkvRemuxer Controller (Range + MSE + Seek + Dispose)', () => {
       }),
     ).toThrow(StreamMkvFallbackError)
   })
+
+  it('skips oversized (>32MB) non-media EBML element starting at consumedBytes > 0 using exact headerSize + size offset', async () => {
+    const { bytes, cluster1Offset, cluster2Offset } = buildSyntheticMkvFile()
+    const headerPrefix = bytes.subarray(0, cluster1Offset)
+    const cluster1 = bytes.subarray(cluster1Offset, cluster2Offset)
+    const cluster2 = bytes.subarray(cluster2Offset)
+
+    // 构造位于 Cluster 1 之后的 33MB Void (0xEC) 非媒体元素头，使同一分块内 consumedBytes = cluster1.byteLength > 0
+    const voidPayloadSize = 33 * 1024 * 1024
+    const voidHeader = concat(encodeId(0xec), encodeVintSize(voidPayloadSize))
+    const voidFileStart = headerPrefix.byteLength + cluster1.byteLength
+    const expectedSkipOffset = voidFileStart + voidHeader.byteLength + voidPayloadSize
+    const virtualTotalBytes = expectedSkipOffset + cluster2.byteLength
+
+    const requestedStarts: number[] = []
+    const mockFetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = (init?.headers || {}) as Record<string, string>
+      const range = headers.Range || headers.range || ''
+      const match = /bytes=(\d+)-(\d+)/.exec(range)
+      const start = match ? Number(match[1]) : 0
+      const end = match ? Math.min(virtualTotalBytes - 1, Number(match[2])) : virtualTotalBytes - 1
+      requestedStarts.push(start)
+
+      const len = Math.max(0, end - start + 1)
+      const out = new Uint8Array(len)
+
+      // 将虚拟文件中的各段按区间拷贝到响应缓冲
+      const copySegment = (segStart: number, seg: Uint8Array) => {
+        const segEnd = segStart + seg.byteLength
+        const overlapStart = Math.max(start, segStart)
+        const overlapEnd = Math.min(start + len, segEnd)
+        if (overlapEnd > overlapStart) {
+          out.set(
+            seg.subarray(overlapStart - segStart, overlapEnd - segStart),
+            overlapStart - start,
+          )
+        }
+      }
+      copySegment(0, headerPrefix)
+      copySegment(headerPrefix.byteLength, cluster1)
+      copySegment(voidFileStart, voidHeader)
+      copySegment(expectedSkipOffset, cluster2)
+
+      return new Response(out, {
+        status: 206,
+        headers: {
+          'Content-Range': `bytes ${start}-${end}/${virtualTotalBytes}`,
+          'Content-Length': String(len),
+        },
+      })
+    }) as unknown as typeof fetch
+
+    const { appendedByMime } = installMockMSE()
+    const onError = vi.fn()
+    const videoEl = document.createElement('video')
+    Object.defineProperty(videoEl, 'buffered', {
+      configurable: true,
+      value: { length: 0, start: () => 0, end: () => 0 },
+    })
+
+    const remuxer = new StreamMkvRemuxer()
+    await remuxer.attach(videoEl, '/emby/Videos/oversized-void/stream', {}, {
+      fetchImpl: mockFetch,
+      initialHeaderBytes: headerPrefix.byteLength + 16,
+      chunkSizeBytes: 64 * 1024,
+      onError,
+    })
+
+    await new Promise((r) => setTimeout(r, 80))
+
+    expect(onError).not.toHaveBeenCalled()
+    // 跳过 33MB Void 后必须精确落到 expectedSkipOffset（未重复累加 consumedBytes）
+    expect(requestedStarts).toContain(expectedSkipOffset)
+    const videoChunks = appendedByMime.get('video/mp4; codecs="avc1.640028"') || []
+    // init segment + cluster1 + cluster2
+    expect(videoChunks.length).toBeGreaterThanOrEqual(3)
+
+    remuxer.dispose()
+  })
 })

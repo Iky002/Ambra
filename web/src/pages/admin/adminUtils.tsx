@@ -1,4 +1,4 @@
-import React, { useEffect, useId } from 'react'
+import React, { useEffect, useId, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { AlertCircle, CheckCircle2, X } from 'lucide-react'
 import { getActiveLocale, translateForLocale, type TranslationVars } from '../../i18n/I18nContext'
@@ -137,6 +137,8 @@ interface AdminModalProps {
   children: React.ReactNode
 }
 
+const openModalStack: symbol[] = []
+
 export function AdminModal({
   open,
   title,
@@ -146,15 +148,25 @@ export function AdminModal({
   children,
 }: AdminModalProps) {
   const titleId = useId()
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
 
   useEffect(() => {
     if (!open) return
+    const modalId = Symbol('AdminModal')
+    openModalStack.push(modalId)
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
+      if (e.key === 'Escape' && openModalStack[openModalStack.length - 1] === modalId) {
+        onCloseRef.current()
+      }
     }
     window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [open, onClose])
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+      const idx = openModalStack.lastIndexOf(modalId)
+      if (idx >= 0) openModalStack.splice(idx, 1)
+    }
+  }, [open])
 
   if (!open) return null
 

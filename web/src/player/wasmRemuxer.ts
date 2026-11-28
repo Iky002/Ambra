@@ -482,7 +482,6 @@ export class WasmRemuxer {
 
     this.loadingPromise = (async () => {
       opts?.onProgress?.('init', 10, '正在初始化 FFmpeg WASM 引擎...')
-      const ffmpeg = new FFmpeg()
       const defaultLocalBase = resolveLocalCoreBase()
       let bases: string[]
       if (opts?.coreBaseUrl) {
@@ -499,6 +498,7 @@ export class WasmRemuxer {
         if (opts?.signal?.aborted || this.disposed) {
           throw new WasmRemuxFallbackError('aborted', '已取消 WASM 引擎加载')
         }
+        const ffmpeg = new FFmpeg()
         const isLocalBase = isLocalCoreBase(base)
         const loadTimeoutMs = isLocalBase ? DEFAULT_LOCAL_LOAD_TIMEOUT_MS : DEFAULT_CDN_LOAD_TIMEOUT_MS
         const pendingBlobUrls: string[] = []
@@ -534,15 +534,6 @@ export class WasmRemuxer {
           )
 
           if (this.disposed || opts?.signal?.aborted) {
-            try {
-              ffmpeg.terminate()
-            } catch {
-              // ignore terminate error
-            }
-            for (const url of pendingBlobUrls) {
-              URL.revokeObjectURL(url)
-            }
-            pendingBlobUrls.length = 0
             throw new WasmRemuxFallbackError('aborted', 'FFmpeg WASM 加载已取消')
           }
 
@@ -552,6 +543,11 @@ export class WasmRemuxer {
           opts?.onProgress?.('init', 100, 'WASM 引擎就绪')
           return
         } catch (err) {
+          try {
+            ffmpeg.terminate()
+          } catch {
+            // ignore terminate error
+          }
           for (const url of pendingBlobUrls) {
             URL.revokeObjectURL(url)
           }

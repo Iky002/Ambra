@@ -408,6 +408,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
+          context: git
           images: ghcr.io/${{ github.repository }}
           tags: ${{ steps.validate-tag.outputs.tags }}
 
