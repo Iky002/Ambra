@@ -461,3 +461,54 @@ func TestSetupErrorPaths(t *testing.T) {
 		t.Fatalf("expected 500 on closed DB CreateUser, got %d", rec.Code)
 	}
 }
+
+func TestSyncTMDBPluginPreservesSQLiteKeyWhenEnvOverridden(t *testing.T) {
+	t.Setenv("AMBRA_TMDB_API_KEY", "env-tmdb-override-key")
+	dir := t.TempDir()
+	cfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlite.Open(filepath.Join(dir, "tmdb_env.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	userRepo := sqlite.NewUserRepo(store)
+
+	// Seed existing SQLite plugin config with a saved key.
+	if err := userRepo.SetServerConfig(context.Background(), "plugin:"+tmdbPluginID, `{"api_key":"saved-db-key","language":"en-US"}`); err != nil {
+		t.Fatal(err)
+	}
+
+	reg := plugins.NewRegistry()
+	spy := &spyTMDBPlugin{}
+	reg.Register(spy)
+
+	h := NewHandler(cfg, userRepo, reg)
+	cfg.Update(func(c *config.Config) {
+		c.TMDBLanguage = "fr-FR"
+	})
+	h.syncTMDBPlugin()
+
+	calls, liveKey, liveLang := spy.snapshot()
+	if calls != 1 || liveKey != "env-tmdb-override-key" || liveLang != "fr-FR" {
+		t.Fatalf("expected live plugin configured with env key and fr-FR, got calls=%d key=%q lang=%q", calls, liveKey, liveLang)
+	}
+
+	raw, err := userRepo.GetServerConfig(context.Background(), "plugin:"+tmdbPluginID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved map[string]any
+	if err := json.Unmarshal([]byte(raw), &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved["api_key"] != "saved-db-key" {
+		t.Fatalf("expected SQLite api_key preserved as saved-db-key, got %v", saved["api_key"])
+	}
+	if saved["language"] != "fr-FR" {
+		t.Fatalf("expected SQLite language updated to fr-FR, got %v", saved["language"])
+	}
+}
+

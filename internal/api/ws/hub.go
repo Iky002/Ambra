@@ -3,6 +3,7 @@ package ws
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -53,9 +54,11 @@ type clientConn struct {
 	userID   string
 	user     *sqlite.UserRecord
 	deviceID string
-	token    string
-	clientIP string
-	wasLocal bool
+	token           string
+	clientIP        string
+	remotePeerIP    string
+	hasProxyHeaders bool
+	wasLocal        bool
 	isAPIKey bool
 	isAdmin  bool
 	conn     *websocket.Conn
@@ -581,6 +584,16 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	isLocal := netutil.IsLocalOrLANRequest(r)
 	clientIP := netutil.ClientIP(r)
+	remotePeerIP := strings.TrimSpace(r.RemoteAddr)
+	if host, _, err := net.SplitHostPort(remotePeerIP); err == nil {
+		remotePeerIP = strings.Trim(host, "[]")
+	} else {
+		remotePeerIP = strings.Trim(remotePeerIP, "[]")
+	}
+	hasProxyHeaders := strings.TrimSpace(r.Header.Get("X-Forwarded-For")) != "" ||
+		strings.TrimSpace(r.Header.Get("Forwarded")) != "" ||
+		strings.TrimSpace(r.Header.Get("X-Real-IP")) != "" ||
+		strings.TrimSpace(r.Header.Get("CF-Connecting-IP")) != ""
 	if !id.IsAPIKey && !isLocal {
 		if !h.isGlobalRemoteAccessEnabled() {
 			httpx.Error(w, http.StatusForbidden, "Remote access is disabled on this server")
@@ -639,18 +652,20 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	client := &clientConn{
-		id:       guid.New(),
-		userID:   userID,
-		user:     id.User,
-		deviceID: deviceID,
-		token:    id.Token,
-		clientIP: clientIP,
-		wasLocal: isLocal,
-		isAPIKey: id.IsAPIKey,
-		isAdmin:  isAdmin,
-		conn:     conn,
-		sendCh:   make(chan Message, 64),
-		cancel:   cancel,
+		id:              guid.New(),
+		userID:          userID,
+		user:            id.User,
+		deviceID:        deviceID,
+		token:           id.Token,
+		clientIP:        clientIP,
+		remotePeerIP:    remotePeerIP,
+		hasProxyHeaders: hasProxyHeaders,
+		wasLocal:        isLocal,
+		isAPIKey:        id.IsAPIKey,
+		isAdmin:         isAdmin,
+		conn:            conn,
+		sendCh:          make(chan Message, 64),
+		cancel:          cancel,
 	}
 
 	if !h.tryRegister(client, limit, perUserLimit) {
@@ -1012,6 +1027,12 @@ func (h *Hub) DisconnectRemoteClients() {
 		}
 		addr, err := netip.ParseAddr(strings.TrimSpace(c.clientIP))
 		isRemote := !c.wasLocal || err != nil || !netutil.IsLANIP(addr)
+		if !isRemote && c.hasProxyHeaders {
+			peerAddr, peerErr := netip.ParseAddr(strings.TrimSpace(c.remotePeerIP))
+			if peerErr != nil || !netutil.IsTrustedProxyIP(peerAddr) {
+				isRemote = true
+			}
+		}
 		if !isRemote {
 			continue
 		}

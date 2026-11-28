@@ -200,3 +200,63 @@ func TestTranscodeSessionAtomicLastAccessLockFree(t *testing.T) {
 	wg.Wait()
 	sess.mu.Unlock()
 }
+
+func TestLoopbackStreamProxyRejectsXMLManifestBypasses(t *testing.T) {
+	cases := []struct {
+		name        string
+		contentType string
+		body        string
+	}{
+		{
+			name:        "comment_before_mpd",
+			contentType: "application/octet-stream",
+			body:        `<!-- leading comment padding --><MPD xmlns="urn:mpeg:dash:schema:mpd:2011"><BaseURL>http://127.0.0.1/</BaseURL></MPD>`,
+		},
+		{
+			name:        "doctype_before_mpd",
+			contentType: "application/octet-stream",
+			body:        `<!DOCTYPE mpd SYSTEM "http://127.0.0.1/evil.dtd"><MPD></MPD>`,
+		},
+		{
+			name:        "dash_xml_content_type",
+			contentType: "application/dash+xml; charset=utf-8",
+			body:        `not-even-xml-prefix-bytes-0123456789`,
+		},
+		{
+			name:        "leading_whitespace_exceeding_sniff_window",
+			contentType: "application/octet-stream",
+			body:        strings.Repeat(" ", 600) + `<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer upstream.Close()
+
+			proxy, err := StartLoopbackStreamProxy(LoopbackProxyOptions{
+				TargetURL:       upstream.URL + "/stream.bin",
+				AllowPrivateLAN: true,
+				Client:          upstream.Client(),
+			})
+			if err != nil {
+				t.Fatalf("StartLoopbackStreamProxy: %v", err)
+			}
+			defer proxy.Close()
+
+			resp, err := http.Get(proxy.URL())
+			if err != nil {
+				t.Fatalf("GET proxy: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadGateway {
+				t.Fatalf("expected 502 Bad Gateway for %s, got %d", tc.name, resp.StatusCode)
+			}
+		})
+	}
+}
+

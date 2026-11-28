@@ -433,6 +433,16 @@ func (c Config) IsGlobalRemoteAccessEnabled() bool {
 	return *c.EnableRemoteAccessGlobal
 }
 
+// IsTMDBKeyEnvOverridden reports whether TMDBApiKey is currently overridden by AMBRA_TMDB_API_KEY.
+func (c *Config) IsTMDBKeyEnvOverridden() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.envFlags.tmdbKey
+}
+
 func (c *Config) Save() error {
 	c.saveMu.Lock()
 	defer c.saveMu.Unlock()

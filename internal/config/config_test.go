@@ -560,3 +560,45 @@ func containsString(s, substr string) bool {
 	}
 	return false
 }
+
+func TestIsTMDBKeyEnvOverridden(t *testing.T) {
+	var nilCfg *Config
+	if nilCfg.IsTMDBKeyEnvOverridden() {
+		t.Fatal("nil Config must report IsTMDBKeyEnvOverridden=false")
+	}
+
+	t.Setenv("AMBRA_TMDB_API_KEY", "")
+	cfgNoEnv, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfgNoEnv.IsTMDBKeyEnvOverridden() {
+		t.Fatal("expected IsTMDBKeyEnvOverridden=false when AMBRA_TMDB_API_KEY is unset")
+	}
+
+	t.Setenv("AMBRA_TMDB_API_KEY", "env-key-123")
+	cfgEnv, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfgEnv.IsTMDBKeyEnvOverridden() {
+		t.Fatal("expected IsTMDBKeyEnvOverridden=true when AMBRA_TMDB_API_KEY is set")
+	}
+
+	// Updating unrelated field keeps env override active.
+	cfgEnv.Update(func(c *Config) {
+		c.TMDBLanguage = "ja-JP"
+	})
+	if !cfgEnv.IsTMDBKeyEnvOverridden() {
+		t.Fatal("expected IsTMDBKeyEnvOverridden=true after updating TMDBLanguage")
+	}
+
+	// Explicitly changing TMDBApiKey clears the env override flag.
+	cfgEnv.Update(func(c *Config) {
+		c.TMDBApiKey = "explicit-new-key"
+	})
+	if cfgEnv.IsTMDBKeyEnvOverridden() {
+		t.Fatal("expected IsTMDBKeyEnvOverridden=false after explicitly updating TMDBApiKey")
+	}
+}
+
