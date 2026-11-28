@@ -247,6 +247,83 @@ func TestScannerSymlinkEscapeBlockedInScanPathLibraryAndExtras(t *testing.T) {
 	}
 }
 
+func TestScanPathDeletesStaleItemInsideValidSymlinkedSubdir(t *testing.T) {
+	tmp := t.TempDir()
+	libRoot := filepath.Join(tmp, "library")
+	realSub := filepath.Join(libRoot, "real_storage", "action")
+	outside := filepath.Join(tmp, "outside")
+	if err := os.MkdirAll(realSub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	validLink := filepath.Join(libRoot, "linked_action")
+	if err := os.Symlink(realSub, validLink); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+	escapeLink := filepath.Join(libRoot, "escaped_dir")
+	if err := os.Symlink(outside, escapeLink); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+
+	realFile := filepath.Join(realSub, "Inception (2010).mkv")
+	if err := os.WriteFile(realFile, []byte("video"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	linkedFile := filepath.Join(validLink, "Inception (2010).mkv")
+
+	cfg, err := config.Load(filepath.Join(tmp, "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlite.Open(cfg.DBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	repo := sqlite.NewLibraryRepo(store)
+	sc := New(repo, plugins.NewRegistry(), eventbus.New(), cfg)
+	sc.SetProber(nil)
+	ctx := context.Background()
+
+	lib, err := repo.CreateLibrary(ctx, "Movies", "movies", []string{libRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Index the file via ScanPath through the valid depth-1 symlinked subdirectory.
+	if _, err := sc.ScanPath(ctx, lib.ID, linkedFile); err != nil {
+		t.Fatalf("ScanPath index inside valid symlinked subdir failed: %v", err)
+	}
+	if item, err := repo.FindItemByPath(ctx, lib.ID, linkedFile); err != nil || item == nil {
+		t.Fatalf("expected item at %q to be indexed, err=%v", linkedFile, err)
+	}
+
+	// Delete the underlying file and invoke ScanPath on the symlinked path.
+	if err := os.Remove(realFile); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := sc.ScanPath(ctx, lib.ID, linkedFile)
+	if err != nil {
+		t.Fatalf("ScanPath incremental deletion inside valid symlinked subdir failed: %v", err)
+	}
+	if stats.ItemsDeleted != 1 {
+		t.Fatalf("expected ItemsDeleted=1, got %+v", stats)
+	}
+	if item, _ := repo.FindItemByPath(ctx, lib.ID, linkedFile); item != nil {
+		t.Fatalf("expected stale DB record for %q to be deleted, still found %+v", linkedFile, item)
+	}
+
+	// Deleting a nonexistent file inside an escaping symlinked directory must still be rejected.
+	escapedDeletedFile := filepath.Join(escapeLink, "Missing (2024).mkv")
+	if _, err := sc.ScanPath(ctx, lib.ID, escapedDeletedFile); err == nil {
+		t.Fatalf("expected ScanPath to reject nonexistent path under escaping symlink %q", escapedDeletedFile)
+	}
+}
+
 func TestScannerNFOLockDataAndSetCreatesBoxSet(t *testing.T) {
 	tmp := t.TempDir()
 	libRoot := filepath.Join(tmp, "movies")

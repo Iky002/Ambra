@@ -3874,7 +3874,8 @@ func (r *LibraryRepo) GetItemCountsForUser(ctx context.Context, userID string, i
 		return &ItemCounts{}, nil
 	}
 	pPolicy := policyFromUserPolicy(policy)
-	plClause, plArgs := appendPlaylistVisibilitySQL("i", userID, isAdmin, false)
+	publicOnly := !isAdmin && guid.Normalize(userID) == ""
+	plClause, plArgs := appendPlaylistVisibilitySQL("i", userID, isAdmin, publicOnly)
 	unfiltered := isAdmin && allowedLibraryIDs == nil && !pPolicy.hasRestriction() && plClause == ""
 	var epoch uint64
 	if unfiltered {
@@ -3944,7 +3945,18 @@ func (r *LibraryRepo) GetItemCountsForUser(ctx context.Context, userID string, i
 
 	var extraTrailers int
 	trailerQuery := `SELECT COUNT(*) FROM items i WHERE LOWER(i.extra_type) = 'trailer'` + filterSuffix
-	if err := r.store.Reader.QueryRowContext(ctx, trailerQuery, filterArgs...).Scan(&extraTrailers); err != nil {
+	trailerArgs := filterArgs
+	if allowedLibraryIDs != nil || pPolicy.hasRestriction() {
+		parentClauses, parentArgs := buildLibraryAndPolicyWhere("p", allowedLibraryIDs, pPolicy)
+		if len(parentClauses) > 0 {
+			trailerQuery = `SELECT COUNT(*) FROM items i LEFT JOIN items p ON p.id = i.parent_id WHERE LOWER(i.extra_type) = 'trailer'` + filterSuffix +
+				` AND (COALESCE(TRIM(i.parent_id), '') = '' OR i.parent_id = i.library_id OR (p.id IS NOT NULL AND ` + strings.Join(parentClauses, " AND ") + `))`
+			trailerArgs = make([]any, 0, len(filterArgs)+len(parentArgs))
+			trailerArgs = append(trailerArgs, filterArgs...)
+			trailerArgs = append(trailerArgs, parentArgs...)
+		}
+	}
+	if err := r.store.Reader.QueryRowContext(ctx, trailerQuery, trailerArgs...).Scan(&extraTrailers); err != nil {
 		return nil, err
 	}
 	c.TrailerCount += extraTrailers

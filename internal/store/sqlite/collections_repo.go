@@ -820,8 +820,8 @@ func (r *LibraryRepo) GetContainerItemsWithUserPolicy(
 	uid := guid.Normalize(userID)
 	pPolicy := policyFromUserPolicy(policy)
 	policyConds, policyArgs := buildLibraryAndPolicyWhere("i", allowedLibraryIDs, pPolicy)
-	if !policy.IsAdministrator && uid != "" {
-		if plClause, plArgs := appendPlaylistVisibilitySQL("i", uid, false, false); plClause != "" {
+	if !policy.IsAdministrator {
+		if plClause, plArgs := appendPlaylistVisibilitySQL("i", uid, false, uid == ""); plClause != "" {
 			policyConds = append(policyConds, plClause)
 			policyArgs = append(policyArgs, plArgs...)
 		}

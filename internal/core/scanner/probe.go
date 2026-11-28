@@ -6,8 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/netip"
-	"net/url"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -93,10 +91,11 @@ type ProbeResult struct {
 
 // Prober executes ffprobe to extract real media metadata from local video files.
 type Prober struct {
-	mu          sync.RWMutex
-	ffprobePath string
-	timeout     time.Duration
-	disabled    bool
+	mu            sync.RWMutex
+	ffprobePath   string
+	timeout       time.Duration
+	disabled      bool
+	allowLoopback bool
 }
 
 // NewProber creates a Prober using the provided ffprobe executable path.
@@ -148,6 +147,7 @@ func (p *Prober) Probe(ctx context.Context, filePath string) (*ProbeResult, erro
 	disabled := p.disabled
 	ffprobePath := p.ffprobePath
 	timeout := p.timeout
+	allowLoopback := p.allowLoopback
 	p.mu.RUnlock()
 
 	if disabled || strings.TrimSpace(ffprobePath) == "" {
@@ -165,11 +165,10 @@ func (p *Prober) Probe(ctx context.Context, filePath string) (*ProbeResult, erro
 	isRemote := strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
 	whitelist := probeLocalProtocolWhitelist
 	if isRemote {
-		disallowLoopback := !isLoopbackHost(trimmed)
 		proxy, err := transcode.StartLoopbackStreamProxy(transcode.LoopbackProxyOptions{
 			TargetURL:        trimmed,
 			AllowPrivateLAN:  true,
-			DisallowLoopback: disallowLoopback,
+			DisallowLoopback: !allowLoopback,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("ffprobe: invalid remote url %q: %w", filePath, err)
@@ -217,23 +216,6 @@ func (p *Prober) Probe(ctx context.Context, filePath string) (*ProbeResult, erro
 		return nil, fmt.Errorf("ffprobe %q: output exceeds maximum size of %d bytes", filePath, maxProbeOutputBytes)
 	}
 	return ParseFFprobeJSON(stdout.buf.Bytes())
-}
-
-func isLoopbackHost(rawURL string) bool {
-	u, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil {
-		return false
-	}
-	host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(u.Hostname()), "."))
-	if host == "localhost" {
-		return true
-	}
-	addr, err := netip.ParseAddr(host)
-	if err != nil {
-		return false
-	}
-	unmapped := addr.WithZone("").Unmap()
-	return unmapped == netip.MustParseAddr("127.0.0.1") || unmapped == netip.MustParseAddr("::1")
 }
 
 type ffprobeOutput struct {
